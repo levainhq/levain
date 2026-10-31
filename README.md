@@ -435,6 +435,35 @@ What to know:
 
 For hosts that render MCP Apps (and only those), `pip install 'levain[app]'` adds what `levain serve-app` needs to run: a read-only in-host view served over stdio. `levain serve` needs nothing beyond the base install.
 
+## The coordinator: wakes, replies and the ladder
+
+The coordinator is the session that holds the coordinator role (`levain coord status` shows who, and what the next drop would do). Words you drop (from the cockpit, the phone or `levain drop`) wake it when nobody holds the role. This section says what a wake is, where the coordinator's answers show, and how a question climbs from the band to your phone.
+
+**A wake is a turn nobody is waiting on.** A wake's first prompt begins `[levain wake ln-...]`, naming that launch. Levain treats a turn as a wake only when the first line is exactly the marker of a coordinator launch that is unbound or bound to this session, and the session is bound to no other launch (a first prompt arrives before Levain binds the session, so the marker names the launch); the same line typed on any other session is your own message. On a wake Levain shows the coordinator no NEEDS YOU band, records no view and spends no "closed" notice, and the Stop check does not demand a band in the reply. The coordinator acts and records; if something needs you, it escalates a seat's question (`levain coord escalate N`) or asks about its own work (`levain ask`) rather than narrating it. The session transcript the cockpit shows labels these turns `wake` and `wake reply`, not as your words. The coordinator's brief asks it to end every turn, a wake included, with one status line beginning `coordinator:`, so an agent view of a quiet wake does not look like a dead coordinator.
+
+**A reply turn is one you started.** When you type into the coordinator's own session, Levain renders its block ahead of the reply and checks the reply carries it. The block has two parts, kept apart:
+
+- *The work delta*, headed `since your last message (Levain's record`: what changed in the coordinator's store since your last verified reply: replies, launch events, lease events, ready moves and chat messages, in the store's own order, at most five record lines, then `+N more: levain coord log --since GSEQ` (GSEQ is the last line shown, so the command lists the rest). Drops with no reply (below) follow as lines of their own, up to five more. Levain writes it, never the model. Thread splits and state changes are not in it (`levain thread list` shows them). A store that cannot be read says `! not read`.
+- *The band*, the NEEDS YOU list with its own `since your last message` line.
+
+The cursor for both belongs to the coordinator role, not to one session, and moves only when the reply that carried the block passes the Stop check. A turn that was interrupted or never verified leaves it where it was, so the next reply repeats the delta: a repeat is the cheap error.
+
+**Where a reply shows.**
+
+- *In the session*, the reply to words you typed there, followed by that block.
+- *On the Coordinator panel*, for words you dropped from the cockpit or the phone. Those have no terminal to answer in, so the coordinator runs `levain coord reply DROP_ID --text ... --token N` (N is the lease token `levain coord claim` prints for it; or `--text-file PATH`, or `--stdin`). The store accepts one reply per drop, only for a drop that exists and only within 24 hours of it; anything else is refused. The panel shows the reply with the block Levain froze at the moment it was written, and that block is never re-rendered. A reply on the panel counts as delivered when written, so your next terminal reply's work delta names it (`1 reply to your phone message at 14:02 ...: on the Coordinator panel`).
+- *Not pushed to the phone.* Nothing sends a drop reply to the phone as a message of its own; the panel is where it shows.
+
+**Silence is not "heard".** A drop from the cockpit or the phone with no reply after 10 minutes shows on the panel, and in the coordinator's next work delta, as `drop ... (14:02, phone): no reply yet`. Once the 24 hours are over it reads `no reply, window closed` and stays for 7 days after the drop, then goes. Only drops from the cockpit and the phone are listed: a drop made with `levain drop` in a terminal is never listed as unreplied, though it can wake the coordinator, and words typed into the coordinator's own session are not drops.
+
+**The ladder.** How far a question travels depends on who filed it and what kind of row it is:
+
+1. *Ambient.* What a wake writes, the work delta and the `wake` transcript lines. None of these is pushed (a question a wake files goes up the rungs below). They show on the panel and the board, in `levain coord log`, and in the next reply's block.
+2. *The band, then a ping of kind `question`.* A seat's `levain ask` lands on the band every attended seat, the cockpit and the phone panel show. While a coordinator holds a live lease, the ping is held so it can read the question first, unless the question is open-ended, is tied to a consent request, or was asked by the coordinator's own session: those ping at once. A held ping is sent when the coordinator has not read the question in 10 minutes, as kind `question` (the coordinator did not judge that it needs you), or when the coordinator escalates it, which sends kind `attention` instead (next rung). A `question` ping follows your presence words (`levain ping status` says why a ping is or is not pushed): `levain ping quiet` and `levain ping sleep` mute it, and `levain ping away`, `remote` and `loud` push it.
+3. *A ping of kind `attention`.* The coordinator puts a row in front of you by `levain coord escalate` on a held question, by a question it asks about its own work with `levain ask` (never held behind its own first read, unless tied to a consent request, which keeps its own kind), and Levain files one when the coordinator stops after three deaths in a row. These ping as `attention`, which is urgent like the consent gate's `consent`, `push` and `reping` (`presence.URGENT_KINDS` lists them): it passes `levain ping quiet`, and `levain ping sleep` holds it. Only `levain ping loud` pushes through `sleep`.
+
+A consent request keeps its own kind and its own rung; the coordinator cannot raise it.
+
 ## Keep it running (macOS and Linux)
 
 ```

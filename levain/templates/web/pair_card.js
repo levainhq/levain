@@ -123,8 +123,10 @@
   async function pingsStep(ui) {
     const key = PUSH_OK ? await pushKey() : "";
     if (!key) {
-      const why = PUSH_OK ? "This cockpit does not send pings." : "Pings need the Levain app on the Home Screen (or a browser that offers them on this address).";
-      draw(ui, "Paired", "This device is paired. " + why, [button("Continue", true, finish)]);
+      let why = PUSH_OK ? "This cockpit does not send pings." : noPushWords();
+      // the Devices panel's pings row says the Home Screen words once; a second copy on the same page would only repeat them
+      if (!PUSH_OK && why === HOME_SCREEN_SAY && document.querySelector(".dev-pings:not([hidden])")) why = "";
+      draw(ui, "Paired", ("This device is paired. " + why).trim(), [button("Continue", true, finish)]);
       return;
     }
     let out = null;
@@ -142,7 +144,14 @@
         if (old) await old.unsubscribe().catch(() => {});
         sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
         const j = sub.toJSON();
-        const subbed = await api("POST", "/webpush/subscribe", { endpoint: j.endpoint, keys: j.keys });
+        let subbed;
+        try { subbed = await api("POST", "/webpush/subscribe", { endpoint: j.endpoint, keys: j.keys }); }
+        catch (_) {
+          // the request may have reached the cockpit: keep the browser's subscription, and do not say nothing changed
+          sub = null;
+          say(SUBSCRIBE_LOST);
+          return;
+        }
         if (subbed.status !== 200) {
           await sub.unsubscribe().catch(() => {});
           say("Could not turn pings on (" + ((subbed.data && subbed.data.message) || subbed.status) + ").");
@@ -154,7 +163,7 @@
         btn.textContent = "Test again";
       } catch (e) {
         if (sub) await sub.unsubscribe().catch(() => {});
-        say("Could not turn pings on: " + ((e && e.message) || e));
+        say(turnOnFailed(e));
       } finally { btn.disabled = false; }
     };
     const say = (m) => { out.textContent = m; out.hidden = !m; };
@@ -231,7 +240,38 @@
     return draining;
   }
 
-  window.levainPairCard = { claim: claim, drainOpened: drainOpened, fold: fold };
+  // One copy of the page's push environment and of the words about it, so every surface says the same thing.
+  // WebKit (every iOS and iPadOS browser) offers Notification and PushManager only to a web app opened from the Home Screen.
+  function onApple() {
+    const ua = String(navigator.userAgent || "");
+    return /iPhone|iPod|iPad/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);   // iPadOS desktop mode reports a Mac
+  }
+  function installedApp() {
+    try { if (navigator.standalone === true) return true; } catch (_) { /* no such property */ }
+    try { return !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches); } catch (_) { return false; }
+  }
+  const HOME_SCREEN_SAY = "On iPhone and iPad, pings work in the Levain app on your Home Screen: open the Share menu (in Safari, the square with an arrow), choose Add to Home Screen, open Levain from your Home Screen, pair it once with a code, then tap Turn on there. If your browser has no Add to Home Screen, open this address in Safari.";
+  const APPLE_OLD_SAY = "Pings need iOS or iPadOS 16.4 or later, with Lockdown Mode off.";
+  const NO_PINGS_SAY = "This browser does not offer pings.";
+  const NO_PINGS_DEVICE_SAY = "This device does not offer pings.";
+  // the words for a page with no push API
+  function noPushWords() {
+    const installed = installedApp();
+    if (onApple()) return installed ? APPLE_OLD_SAY : HOME_SCREEN_SAY;
+    return installed ? NO_PINGS_DEVICE_SAY : NO_PINGS_SAY;
+  }
+  const SUBSCRIBE_LOST = "Pings may have been turned on, but no answer came back. Check the Devices panel before trying again.";
+  function turnOnFailed(e) { return "Could not turn pings on. Nothing was changed; try again, or reload the page. (" + ((e && e.message) || e) + ")"; }
+  // Only the iOS Home Screen app keeps its storage apart from the browser's, so only it signs in once of its own: the pair card says so.
+  // A code comes from the Devices panel of a device that is already paired.
+  function installedNote() {
+    let ios = false;
+    try { ios = navigator.standalone === true; } catch (_) { /* no such property */ }
+    return ios ? "This Home Screen app keeps its own sign-in, so it needs one pairing code: get one from the Devices panel on any device that is already paired." : "";
+  }
+
+  window.levainPairCard = { claim: claim, drainOpened: drainOpened, fold: fold, installedNote: installedNote,
+    env: () => ({ installed: installedApp(), apple: onApple() }), noPushWords: noPushWords, turnOnFailed: turnOnFailed, subscribeLost: SUBSCRIBE_LOST };
 
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") drainOpened(); });
   if ("serviceWorker" in navigator) {
