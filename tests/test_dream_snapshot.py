@@ -666,3 +666,36 @@ def test_low_take_refuses_a_store_with_no_readable_id(scratch, tmp_path, monkeyp
     monkeypatch.setattr(Store, "store_id", "", raising=False)
     with Store(str(scratch), section_schema=None) as s, pytest.raises(sn.SnapshotRefused, match="store id"):
         sn.take(s, tmp_path / "occ")
+
+
+# --------------------------------------------------------------------------------------------------- fix4 (L3 round 3)
+
+def test_g3_the_drill_chooses_its_snapshot_under_the_same_wrap_lock_it_copies_under(scratch, monkeypatch):
+    from levain import wrap as w
+    two_dreams(scratch)
+    real = sn.snapshots
+    seen = []
+
+    def probe(root):
+        if Path(root) != scratch.parent / "dream":
+            return real(root)
+        h = w._lock_wrap_file(scratch.parent / "wrap.lock")           # a second taker while the drill selects
+        seen.append(h is w._ANOTHER_WRAP_RUNNING)
+        if h is not w._ANOTHER_WRAP_RUNNING:
+            w._unlock_wrap(h)
+        return real(root)
+    monkeypatch.setattr(sn, "snapshots", probe)
+    assert sn.drill(scratch, scratch.parent / "dream").outcome == "ok"
+    assert seen == [True]
+
+
+def test_g3_a_held_lock_defers_the_drill_before_it_looks_at_any_snapshot(scratch, monkeypatch):
+    from levain import wrap as w
+    two_dreams(scratch)
+    monkeypatch.setattr(sn, "snapshots", lambda root: pytest.fail("a snapshot was selected without the lock"))
+    fd = w._lock_wrap_file(scratch.parent / "wrap.lock")
+    try:
+        res = sn.drill(scratch, scratch.parent / "dream")
+    finally:
+        w._unlock_wrap(fd)
+    assert res.outcome == "deferred" and sn.last_drill(scratch.parent / "dream") is None
