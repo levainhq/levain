@@ -1329,6 +1329,14 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             tok = store.coord_claim(args.launch, args.session)
             _emit(out, args.json, {"token": tok}, f"claimed: token {tok}")
             return 0
+        if cmd in ("close", "open", "handoff"):
+            from levain.coordinator import seam_verbs
+
+            if cmd == "close":
+                return seam_verbs.run_close(args, out, store)
+            if cmd == "open":
+                return seam_verbs.run_open(args, out, store)
+            return seam_verbs.run_handoff_show(args, out, store)
         if cmd == "agent":
             return _coord_agent(args, out, store)
         if cmd in ("questions", "answer", "escalate"):
@@ -1766,6 +1774,8 @@ def review_modes() -> tuple[str, ...]:
 
 
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
+    from levain.coordinator import seam_handoffs as _seam_handoffs
+
     qdir_help = "The consent directory holding dispatch.db (default: the consent queue's)."
 
     def common(p: argparse.ArgumentParser) -> None:
@@ -2008,6 +2018,33 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "UNDECIDED for his morning card, and files a KNOW saying so. Leaving away takes his signature.")
     caw.add_argument("drop_id", metavar="DROP", help="The drop whose words say he is away.")
     caw.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
+    ccl = c_sub.add_parser(
+        "close", help="Leave a handoff for the next coordinator (a rotation, the operator leaving, a dream).",
+        description="Appends one seam handoff from a JSON body file with every key (state_line, in_flight, next, "
+                    "contingencies, notes, attested_operator_present, attested_walked; an empty list is []). A retry "
+                    "with the same --request-id returns the same handoff. Names the latest handoff you saw as "
+                    "--prev-handoff-id (omit it when none exists): a late close behind a newer one is refused. "
+                    "The operator-walk checklist (--plan) is not built.")
+    ccl.add_argument("--kind", required=True, choices=_seam_handoffs.KINDS)
+    ccl.add_argument("--body-file", dest="body_file", type=Path, required=True, metavar="PATH")
+    ccl.add_argument("--request-id", dest="request_id", required=True, metavar="ID")
+    ccl.add_argument("--prev-handoff-id", dest="prev_handoff_id", type=int, default=None, metavar="H")
+    ccl.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
+    cop = c_sub.add_parser(
+        "open", help="The brief for a seam, built from the stores; with --ack, acknowledge it.",
+        description="Prints the open built for you (the one your launch was started with, else one for the latest "
+                    "rotation handoff) and, last, the command that acknowledges it. With no live coordinator lease "
+                    "(no --token, or the operator's) it prints the brief read-only and says it cannot be "
+                    "acknowledged. --ack OPEN_ID is the coordinator's fenced acknowledgement: the Since window moves "
+                    "only then. A rotation or dream open needs --read-back-file, your restatement of the handoff.")
+    cop.add_argument("--ack", type=int, default=None, metavar="OPEN_ID")
+    cop.add_argument("--read-back-file", dest="read_back_file", type=Path, default=None, metavar="PATH")
+    cop.add_argument("--token", type=int, default=None, help="Your coordinator lease token.")
+    chn = c_sub.add_parser("handoff", help="Read the handoffs coordinators left.")
+    chn_sub = chn.add_subparsers(dest="handoff_cmd", required=True)
+    chs = chn_sub.add_parser("show", help="The latest handoff, or the one named.")
+    chs.add_argument("handoff_id", nargs="?", type=int, default=None, metavar="HANDOFF_ID")
+    chs.add_argument("--md", action="store_true", help="Render as markdown.")
     cbu = c_sub.add_parser(
         "budget", help="Each thread's budget against what its sessions used (Q13's counts): the gauge.",
         description="The budget is the thread's head envelope's; usage is Q13's count of the worker sessions pinned to "
@@ -2039,7 +2076,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     for p in (rvl, rvc, rvo, rvf):
         common(p)
         p.set_defaults(func=run_coord)
-    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, cbu, clg, crp):
+    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, cbu, clg, crp, ccl, cop, chs):
         common(p)
         p.set_defaults(func=run_coord)
 

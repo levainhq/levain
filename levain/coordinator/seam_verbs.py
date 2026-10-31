@@ -1,0 +1,214 @@
+"""The seam verbs (C15 S3): ``levain coord close``, ``coord open`` (and ``--ack``) and ``coord handoff show``, over the
+writers and readers underneath (:mod:`seam_handoffs`, :mod:`seam_build`, :mod:`seam_open`, :mod:`seam`). Each ``run_*``
+takes the parsed arguments, the output stream and the store, prints, and returns the exit code; a refusal is a
+:class:`CoordError` the caller (``cli._run_coord``) prints and turns into exit 1, as every other coord verb's.
+
+``coord close --plan`` (the operator-walk checklist) is not here: no read computes the walk's checklist yet, so the flag
+does not exist rather than print an invented one.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+from pathlib import Path
+from typing import Any
+
+from levain.autonomic.durable_sqlite import read_transaction
+from levain.coordinator import lease as _leases
+from levain.coordinator import seam_handoffs, seam_open
+from levain.coordinator.seam import open_brief
+from levain.coordinator.seam_build import build
+from levain.coordinator.store import CoordError, StoreAbsent
+
+__all__ = ["open_kind", "run_close", "run_handoff_show", "run_open"]
+
+_BODY_FILE_MAX = seam_handoffs.MAX_BODY_BYTES * 4      # the file may be loosely written; the writer holds the real cap
+_READ_BACK_FILE_MAX = 32768
+
+
+def _once(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in seen:
+            raise ValueError(f"key {k!r} appears twice")
+        seen[k] = v
+    return seen
+
+
+def _emit(out: Any, as_json: bool, obj: Any, text: str) -> None:
+    out.write((json.dumps(obj, ensure_ascii=False, indent=2) if as_json else text) + "\n")
+
+
+def open_kind(store: Any) -> str:
+    """The seam kind a coordinator starting now opens: the latest handoff's kind, or ``light`` when there is none."""
+    h = seam_handoffs.latest(store)
+    return "light" if h is None else h.seam_kind
+
+
+def _tail(args: argparse.Namespace) -> str:
+    return f" --queue-dir {shlex.quote(str(args.queue_dir.expanduser()))}" if args.queue_dir is not None else ""
+
+
+def _prev_line(handoff: Any) -> str:
+    if handoff is None:
+        return "no handoff exists yet: your close names no --prev-handoff-id (omit the flag)"
+    return f"your next close names --prev-handoff-id {handoff.handoff_id}"
+
+
+def run_close(args: argparse.Namespace, out: Any, store: Any) -> int:
+    from levain.coordinator.cli import _read_file
+
+    text = _read_file(args.body_file, _BODY_FILE_MAX, "the handoff body")
+    try:
+        body = json.loads(text, object_pairs_hook=_once)
+    except ValueError as exc:
+        raise CoordError(f"the handoff body {args.body_file} is not one JSON object with each key once "
+                         f"({str(exc)[:120]}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}") from None
+    h = seam_handoffs.close(store, kind=args.kind, body=body, request_id=args.request_id,
+                            prev_handoff_id=args.prev_handoff_id, token=args.token)
+    _emit(out, args.json, {"handoff_id": h.handoff_id, "kind": h.seam_kind, "writer": h.writer, "gseq": h.gseq,
+                           "covers_gseq": h.covers_gseq, "prev_handoff_id": h.prev_handoff_id},
+          f"closed: handoff {h.handoff_id} ({h.seam_kind}) written by {h.writer}, covering counted rows through gseq "
+          f"{h.covers_gseq}\nthe next coordinator opens from it (levain coord open); a retry of this close names "
+          f"request id {h.close_key!r} again")
+    return 0
+
+
+def _active(store: Any, token: Any) -> tuple[Any, str]:
+    """``(launch, why)``: the active coordinator launch holding the live lease under ``token``, or ``(None, why)``. A
+    read: nothing is written, so the answer is only what the printing process may assume (a write re-fences)."""
+    if token is None:
+        return None, "no --token was given"
+    try:
+        with read_transaction(store.open_readonly) as conn:
+            now = store._stamp()
+            held = _leases.lease(conn, now)
+            if held is None or held.token != token or not held.live:
+                return None, f"token {token} is not a live coordinator lease's"
+            if held.holder == "operator":
+                return None, "the lease is the operator's (`coord take`), and an operator token never acknowledges"
+            ln = _leases._launch_by_key(conn, held.holder)
+            if ln is None or ln.role != "coordinator" or ln.state != "active":
+                return None, f"the lease holder {held.holder} is not an active coordinator launch"
+            return ln, ""
+    except StoreAbsent:
+        return None, "there is no coordinator store here"
+
+
+def _own_launch_build(store: Any, launch: Any) -> Any:
+    """The build the cold start made for this launch (signal ``launch``), or None."""
+    from contextlib import closing
+
+    with closing(store._connect()) as conn:
+        if not seam_open.open_tables_present(conn):
+            return None
+        row = conn.execute("SELECT seam_kind FROM open_builds WHERE signal_kind = 'launch' AND signal_key = ?",
+                           (launch.launch_id,)).fetchone()
+        return None if row is None else seam_open.stored_build(conn, row[0], "launch", launch.launch_id)
+
+
+def _readonly_text(store: Any, args: argparse.Namespace) -> tuple[str, Any]:
+    brief = open_brief(store, args.queue_dir, open_kind(store), store._clock())
+    return brief.text, brief
+
+
+def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
+    if args.ack is not None:
+        return _ack(args, out, store)
+    if args.read_back_file is not None:
+        raise CoordError("--read-back-file goes with --ack OPEN_ID: it is the read-back an acknowledgement carries")
+    launch, why = _active(store, args.token)
+    tail = _tail(args)
+    handoff = seam_handoffs.latest(store)
+    built = None
+    note = ""
+    if launch is not None:
+        built = _own_launch_build(store, launch)
+        if built is None and handoff is not None and handoff.seam_kind == "rotation":
+            built = build(store, kind="rotation", signal_kind="rotation", signal_key=str(handoff.handoff_id),
+                          queue_dir=args.queue_dir, token=args.token)
+        if built is None:
+            note = ("no open is built for this launch and the latest handoff is "
+                    f"{'absent' if handoff is None else handoff.seam_kind + ' (its builder is a later slice)'}: "
+                    "printed read-only, so it cannot be acknowledged")
+    else:
+        note = f"printed read-only and cannot be acknowledged ({why})"
+    if built is None:
+        text, brief = _readonly_text(store, args)
+        _emit(out, args.json, {"open_id": None, "acknowledgeable": False, "why": note, "body": text,
+                               "prev_handoff_id": None if handoff is None else handoff.handoff_id},
+              f"{text}\n\n--\n{note}\n{_prev_line(handoff)}")
+        return 0
+    seam_open.record_delivery(store, built.open_id, "light_verb", recipient=launch.launch_id)
+    needs = " --read-back-file PATH" if built.seam_kind in ("rotation", "dream") else ""
+    ack = f"levain coord open --ack {built.open_id}{needs} --token {args.token}{tail}"
+    more = ("; PATH holds your restatement of the handoff in your own words (required on a "
+            f"{built.seam_kind} open)") if needs else ""
+    _emit(out, args.json, {"open_id": built.open_id, "kind": built.seam_kind, "acknowledgeable": True, "body": built.body,
+                           "ack": ack, "prev_handoff_id": None if handoff is None else handoff.handoff_id},
+          f"{built.body}\n\n--\nopen {built.open_id} ({built.seam_kind}), built {built.built_at}\n"
+          f"acknowledge it, which moves the Since window past what it showed: {ack}{more}\n{_prev_line(handoff)}")
+    return 0
+
+
+def _ack(args: argparse.Namespace, out: Any, store: Any) -> int:
+    from levain.coordinator.cli import _read_file
+
+    if args.token is None:
+        raise CoordError("an acknowledgement is the coordinator's: add --token N (the lease token `coord claim` "
+                         "printed); nothing was written")
+    read_back = None if args.read_back_file is None else _read_file(args.read_back_file, _READ_BACK_FILE_MAX,
+                                                                    "the read-back")
+    try:
+        open_id, session, newly = seam_open.acknowledge(store, args.ack, token=args.token, read_back=read_back)
+    except CoordError as exc:
+        if read_back is None and "read-back" in str(exc):
+            raise CoordError(f"{exc}; write your restatement to a file and add --read-back-file PATH") from None
+        raise
+    with read_transaction(store.open_readonly) as conn:
+        cursor, _held_by = seam_open.acked_cursor(conn)
+    _emit(out, args.json, {"open_id": open_id, "reader_session": session, "newly": newly, "cursor_gseq": cursor},
+          (f"acknowledged open {open_id} as {session}: the Since window now starts after gseq {cursor}" if newly else
+           f"open {open_id} was already acknowledged by {session}; nothing changed (the window starts after gseq "
+           f"{cursor})"))
+    return 0
+
+
+def _render_md(h: Any, body: dict[str, Any]) -> str:
+    L = [f"# Handoff {h.handoff_id} ({h.seam_kind})", "",
+         f"- written {h.written_at} by {h.writer}; covers counted rows through gseq {h.covers_gseq}",
+         f"- previous handoff: {h.prev_handoff_id if h.prev_handoff_id is not None else 'none'}",
+         f"- attested: operator present {body['attested_operator_present']}, walked {body['attested_walked']}", "",
+         "## State", "", body["state_line"], "", "## In flight", ""]
+    L += [f"- {e['item']} (owner {e['owner']}): {e['why']}" for e in body["in_flight"]] or ["(none)"]
+    L += ["", "## Next", "", body["next"] or "(none)", "", "## Contingencies", ""]
+    L += [f"- if {e['if']}: {e['then']}" for e in body["contingencies"]] or ["(none)"]
+    L += ["", "## Notes", "", body["notes"] or "(none)"]
+    return "\n".join(L)
+
+
+def _render_plain(h: Any, body: dict[str, Any]) -> str:
+    L = [f"handoff {h.handoff_id} ({h.seam_kind}), written {h.written_at} by {h.writer}",
+         f"covers counted rows through gseq {h.covers_gseq}; previous handoff "
+         f"{h.prev_handoff_id if h.prev_handoff_id is not None else 'none'}",
+         f"attested: operator present {body['attested_operator_present']}, walked {body['attested_walked']}",
+         f"state: {body['state_line']}", "in flight:"]
+    L += [f"  - {e['item']} (owner {e['owner']}): {e['why']}" for e in body["in_flight"]] or ["  (none)"]
+    L += [f"next: {body['next'] or '(none)'}", "contingencies:"]
+    L += [f"  - if {e['if']}: {e['then']}" for e in body["contingencies"]] or ["  (none)"]
+    L += [f"notes: {body['notes'] or '(none)'}"]
+    return "\n".join(L)
+
+
+def run_handoff_show(args: argparse.Namespace, out: Any, store: Any) -> int:
+    h = seam_handoffs.latest(store) if args.handoff_id is None else seam_handoffs.get(store, args.handoff_id)
+    if h is None:
+        raise CoordError("no handoff exists yet (a coordinator writes one with `levain coord close`)"
+                         if args.handoff_id is None else
+                         f"there is no handoff {args.handoff_id} (`levain coord handoff show` shows the latest)")
+    body = json.loads(h.body)
+    _emit(out, args.json, {"handoff_id": h.handoff_id, "kind": h.seam_kind, "written_at": h.written_at,
+                           "writer": h.writer, "covers_gseq": h.covers_gseq, "prev_handoff_id": h.prev_handoff_id,
+                           "body": body}, (_render_md if args.md else _render_plain)(h, body))
+    return 0

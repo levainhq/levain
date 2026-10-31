@@ -33,7 +33,7 @@ from levain.coordinator.seam_open import active_coordinator_fence
 from levain.coordinator.store import CoordError, CoordStore, StoreAbsent, _append_only, next_gseq
 
 __all__ = ["BODY_KEYS", "KINDS", "LIST_MAX", "MAX_BODY_BYTES", "SEAM_HANDOFF_SCHEMA", "SeamHandoff", "close",
-           "latest"]
+           "get", "latest"]
 
 #: a handoff is written at these seams; ``light`` is an open with no handoff, never a row
 KINDS = ("rotation", "operator", "dream")
@@ -97,6 +97,23 @@ class SeamHandoff:
 
 def _row(r: Any) -> SeamHandoff | None:
     return None if r is None else SeamHandoff(*r)
+
+
+def get(store: CoordStore, handoff_id: int) -> SeamHandoff | None:
+    """The handoff with this id, or None: :func:`latest`'s read, by id."""
+    from levain.coordinator.ready import _absent
+
+    try:
+        with read_transaction(store.open_readonly) as conn:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'seam_handoffs'").fetchone() \
+                    is None:
+                return None
+            return _row(conn.execute(f"SELECT {_COLUMNS} FROM seam_handoffs WHERE handoff_id = ?",
+                                     (handoff_id,)).fetchone())
+    except StoreAbsent:
+        if _absent(store):
+            return None
+        raise
 
 
 def latest(store: CoordStore) -> SeamHandoff | None:

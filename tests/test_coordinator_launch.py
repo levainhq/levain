@@ -224,7 +224,9 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     # matches a rule against the command's own spelling: a bare `levain` would be asked about, 1021+11's real launch)
     prefixes = [r.removeprefix("Bash(").removesuffix(":*)") for r in inst.coordinator_allow(sys.executable)]
     commands = [c for c in re.findall(r"`([^`]+)`", text) if "-m levain" in c or c.startswith("levain")]
-    assert len(commands) >= 8 and "levain coord" not in text.replace(f"{lv} coord", "")
+    # the embedded open is indented data (the card's own lines name a verb in its bare spelling), not a command given
+    given = "\n".join(line for line in text.splitlines() if not line.startswith("    "))
+    assert len(commands) >= 8 and "levain coord" not in given.replace(f"{lv} coord", "")
     for command in commands:
         assert any(command.startswith(p + " ") for p in prefixes), command
     # the active session holds the bootstrap lease for a full TTL, and claims it as the brief says
