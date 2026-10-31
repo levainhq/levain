@@ -4340,6 +4340,8 @@ def run_web_server(
     max_iterations: int | None = None,
     turn_seconds: float | None = None,
     install_class: str | None = None,
+    sign_queue_dir: "Path | None" = None,
+    sign_host: str | None = None,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -4357,9 +4359,20 @@ def run_web_server(
     (:class:`levain.chat.ChatHost`); unlike the dashboard, that drives an agent with hands, read-only
     or not.
 
+    ``sign_queue_dir`` with ``sign_host`` (``--sign-queue-dir``, ``--sign-host``) hosts the cockpit's passkey signing
+    pages over that consent queue: a :class:`levain.consent.sign.Signer` for the https name a reverse proxy on this
+    machine serves on 443 (:func:`_serve_signer`; the page origin is ``https://NAME``, the only origin a consent or
+    dispatch sheet accepts a signature from), handed to ``make_server`` with that name as its ``extra_hosts``. The
+    Signer writes to its queue when it is built (it settles orphaned sign attempts), so everything that would refuse
+    it is refused first: a name a browser's address bar would not show, ``--chat``, a read-only serve (the last two in
+    ``make_server``'s own words, whose checks stay as they are), and a queue that is not an existing readable
+    directory (never created here). The start-up line says whether the consent and grant sheets are on, read from
+    the server ``make_server`` built. Without the pair, nothing differs from a serve that never had them.
+
     Returns nonzero only if the store is unreachable before the server starts, a ``--chat``
     entity is refused, or the bind fails (e.g. the port is in use) — mirroring ``levain dashboard`` /
-    ``serve-app``. A degraded sub-tier renders visibly and is not a startup
+    ``serve-app`` — and, with the signing pages, 1 for a refused queue, name or signer, and 2 for a queue without
+    a name or a name without one. A degraded sub-tier renders visibly and is not a startup
     failure. Blocks in ``serve_forever`` until interrupted (Ctrl+C → clean exit 0).
     """
     # `serve` ALWAYS resolves an install-bearing source (SubstrateSource.local sets
@@ -4384,6 +4397,38 @@ def run_web_server(
         )
         return 1
 
+    # kept beside the CLI's own pairing check: a library caller reaches run_web_server without the parser
+    if (sign_queue_dir is None) != (sign_host is None):
+        print("--sign-queue-dir and --sign-host go together: pass both or neither", file=sys.stderr)
+        return 2
+    signer = None
+    if sign_host is not None and sign_queue_dir is not None:
+        # every refusal before the Signer, whose constructor writes to the queue (it settles orphaned attempts)
+        from levain.consent.passkey import is_host_name
+
+        if not is_host_name(sign_host):
+            # never normalised: a passkey is made for one exact name
+            print(f"refusing --sign-host {sign_host!r}: --sign-host is the name as the browser address bar shows "
+                  "it: lowercase, no trailing dot, no port (and a DNS name: a passkey is never made for an IP "
+                  "address)", file=sys.stderr)
+            return 1
+        if chat:
+            # make_server's own words for a proxied name beside a chat host (tests pin them equal)
+            print("refusing extra_hosts with --chat: a proxied name reaches this server from off the box, and chat "
+                  "drives an entity's hands with no off-box auth", file=sys.stderr)
+            return 1
+        if not write:
+            # make_server's own words for a proxied name on a server with no surface token: a read-only serve has none
+            print("refusing extra_hosts: every request through a proxied name needs a surface token, reads included, "
+                  "and this server has no surface token (a read-only source given no write_token or surface_tokens); "
+                  "pass a write_token", file=sys.stderr)
+            return 1
+        try:
+            signer = _serve_signer(sign_queue_dir, sign_host)
+        except (ValueError, OSError, RuntimeError) as exc:     # RuntimeError: Path.resolve() on a symlink loop, Python 3.12
+            print(f"refusing the signing pages: {exc}", file=sys.stderr)
+            return 1
+
     chat_host = None
     if chat:
         chat_host, chat_err = _build_chat_host(
@@ -4393,11 +4438,14 @@ def run_web_server(
             print(chat_err, file=sys.stderr)
             return 1
 
+    sign_kw: dict[str, Any] = {} if signer is None else {"signer": signer, "extra_hosts": frozenset({sign_host})}
     try:
         # the Coordinator panel's verbs exactly when the watcher below runs beside this server
         httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,
-                            coordinator_verbs=write)
-    except ValueError as exc:  # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback
+                            coordinator_verbs=write, **sign_kw)
+    # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback — or
+    # make_server's own refusal of the signer or its name
+    except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except OSError as exc:
@@ -4444,6 +4492,11 @@ def run_web_server(
         print("  the owner key works only on loopback; pair a device: levain cockpit pair --short", flush=True)
     if unlocked != url:
         print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
+    if signer is not None:
+        # make_server wires the consent family only when this queue is the one the cockpit's consent cards come from
+        sheets = ("consent and grant sheets on" if httpd.consent_sheet is not None else
+                  "consent and grant sheets off: this queue is not the one the cockpit's consent cards are read from")
+        print(f"  signing: {signer.page_origin} (queue {signer.queue_dir}; {sheets})", flush=True)
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in
@@ -4471,6 +4524,30 @@ def run_web_server(
             if watcher is not None:      # stopped last, and whatever the closes above raised
                 watcher.stop()
     return 0
+
+
+def _serve_signer(queue_dir: Path, host: str) -> "Signer":
+    """The Signer ``levain serve --sign-queue-dir DIR --sign-host NAME`` hosts: the consent queue's sign requests, no
+    namespaces (this cockpit signs consent and sign-request cards, not foreign statements), the passkeys enrolled on
+    ``host`` in that queue's cockpit, and the page origin a browser writes for the proxied name on 443,
+    ``https://NAME`` (a browser leaves the default port out and levain refuses it written; the consent and dispatch
+    sheets accept a signature from that origin only). ``queue_dir`` must be an existing, readable directory and is
+    never created: else ``ValueError`` naming it, before the Signer (which writes to it) is built. A name or origin
+    ``make_server`` cannot take is its ``ValueError``, raised there."""
+    import os
+
+    from levain.consent.sign import Signer as _Signer, passkey_key_source
+
+    qdir = Path(queue_dir).expanduser().resolve()
+    if not qdir.exists():
+        raise ValueError(f"--sign-queue-dir {qdir} does not exist (the consent queue is never created here)")
+    if not qdir.is_dir():
+        raise ValueError(f"--sign-queue-dir {qdir} is not a directory")
+    if not os.access(qdir, os.R_OK | os.W_OK | os.X_OK):   # the Signer settles orphaned attempts in it at construction
+        raise ValueError(f"--sign-queue-dir {qdir} is not readable and writable")
+    signer = _Signer(qdir, (), host, passkey_key_source(qdir, host))
+    signer.page_origin = f"https://{host}"
+    return signer
 
 
 def _build_chat_host(
