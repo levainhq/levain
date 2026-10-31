@@ -88,9 +88,9 @@ def test_a_retry_returns_the_same_handoff_even_after_another_counted_row_landed(
 
 def test_the_same_request_id_with_other_words_is_refused(store):
     _close(store)
-    with pytest.raises(CoordError, match="already closed handoff 1 with other words"):
+    with pytest.raises(CoordError, match="already closed handoff 1 by another writer or with other words"):
         _close(store, body=_body(notes="changed"))
-    with pytest.raises(CoordError, match="already closed handoff 1 with other words"):
+    with pytest.raises(CoordError, match="already closed handoff 1 by another writer or with other words"):
         _close(store, kind="dream")
     assert _count(store) == 1
 
@@ -135,11 +135,81 @@ def test_an_unknown_body_key_and_a_bad_shape_are_refused(store):
     assert _count(store) == 0
 
 
-@pytest.mark.parametrize("line", ["", "   \n", None, 7])
+@pytest.mark.parametrize("line", ["", "   \n", " 　", None, 7])   # NBSP, U+3000: the writer's, not the trigger's
 def test_an_empty_state_line_is_refused(store, line):
     with pytest.raises(CoordError, match="state_line is non-empty text"):
         _close(store, body=_body(state_line=line))
     assert _count(store) == 0
+
+
+def test_a_lone_surrogate_or_a_non_text_key_is_the_same_refusal(store):
+    import json
+
+    lone = json.loads('"\\ud800"')                 # what a JSON reader hands over for an unpaired \ud800
+    with pytest.raises(CoordError, match="encodes as UTF-8"):
+        _close(store, body=_body(notes=lone))
+    with pytest.raises(CoordError, match="encodes as UTF-8"):
+        _close(store, body=_body(in_flight=[{"item": lone, "owner": "o", "why": "w"}]))
+    with pytest.raises(CoordError, match="every key is text"):
+        _close(store, body={**_body(), 1: "x"})
+    assert _count(store) == 0
+
+
+def test_a_retry_after_the_lease_lapsed_is_refused_by_the_fence(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    class Clock:
+        now = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+    d = tmp_path / "d"
+    d.mkdir(mode=0o700)
+    s = CoordStore(d, clock=clock)
+    s.coord_set_agent("claude", cwd=str(tmp_path))
+    s.accept_drop("first", surface="cli")
+    a = s.coord_status()["launches"][0]
+    assert s.launch_activate(a["launch_id"], harness_session_id="probe-A")[1] is None
+    tok_a = _token(s)
+    first = sh.close(s, kind="rotation", body=_body(), request_id="r1", prev_handoff_id=None, token=tok_a)
+    clock.now += timedelta(minutes=31)                          # past LEASE_TTL: the lease lapses
+    with pytest.raises(LeaseRefused, match="past its until"):   # the fence runs before the stored row is looked up
+        sh.close(s, kind="rotation", body=_body(), request_id="r1", prev_handoff_id=None, token=tok_a)
+    # a second coordinator: A ends, a drop launches B, B holds the lease and reuses A's request id with A's words
+    s.launch_end(a["launch_id"], "ended", "rotated")
+    s.accept_drop("second", surface="cli")
+    b = [ln for ln in s.coord_status()["launches"] if ln["state"] == "pending"][0]
+    got, why = s.launch_activate(b["launch_id"], harness_session_id="probe-B")
+    assert why is None and got.session_key != first.writer
+    tok_b = _token(s)
+    with pytest.raises(CoordError, match="already closed handoff 1 by another writer or with other words"):
+        sh.close(s, kind="rotation", body=_body(), request_id="r1", prev_handoff_id=None, token=tok_b)
+    assert _count(s) == 1 and sh.latest(s) == first
+
+
+def test_latest_is_a_read_that_makes_nothing(tmp_path, store):
+    missing = CoordStore(tmp_path / "nowhere")
+    assert sh.latest(missing) is None and not (tmp_path / "nowhere").exists()
+    bare = tmp_path / "bare"
+    bare.mkdir(mode=0o700)
+    assert sh.latest(CoordStore(bare)) is None and not CoordStore(bare).path.exists()
+    assert sh.latest(store) is None                             # a store with the table and no handoff
+    h = _close(store)
+    assert sh.latest(store) == h
+    c = sqlite3.connect(store.path)
+    try:
+        c.execute("DROP TABLE seam_handoffs")                   # the store as S0 left it
+        c.commit()
+    finally:
+        c.close()
+    assert sh.latest(CoordStore(store.directory)) is None
+    c = sqlite3.connect(store.path)
+    try:                                                        # the read made no table back
+        assert c.execute("SELECT 1 FROM sqlite_master WHERE name = 'seam_handoffs'").fetchone() is None
+    finally:
+        c.close()
 
 
 def test_an_empty_body_is_every_key_with_empty_lists(store):
@@ -205,6 +275,9 @@ def test_the_table_refuses_what_the_writer_refuses_and_is_append_only(store):
         crowd = ",".join(["1"] * (sh.LIST_MAX + 1))
         for kwargs, msg in (({"kind": "light"}, "kind rotation, operator or dream"),
                             ({"body": '{"state_line":" "}'}, "needs a state_line"),
+                            ({"body": '{"state_line":"\\n"}'}, "needs a state_line"),
+                            ({"body": '{"state_line":"\\t "}'}, "needs a state_line"),
+                            ({"body": '{"state_line":"\\u000b\\f\\r"}'}, "needs a state_line"),
                             ({"body": "{}"}, "needs a state_line"),
                             ({"body": "not json"}, "needs a state_line"),
                             ({"body": '{"state_line":"%s"}' % big}, "over its size cap"),

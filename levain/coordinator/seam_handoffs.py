@@ -3,7 +3,8 @@
 A handoff is what a coordinator leaves at a seam (a rotation, the operator leaving, a dream) so the next one starts
 from a cut rather than a guess. The C13 pattern (``ready.py``): an append-only table, written by one lease-fenced
 writer, with triggers that refuse what the writer already refuses. ``coord close`` (the CLI) is a later slice; this is
-the Python API under it.
+the Python API under it. The ``state_line`` trigger is a floor, not an equal: it refuses a line that is empty after
+ASCII whitespace, and the writer refuses one that is empty after any Unicode whitespace.
 
 * the cut: ``covers_gseq`` is the highest COUNTED ``gseq`` (``seam_classes``) read at the start of the close's own write
   transaction. A number read from the store, never a clock.
@@ -28,7 +29,7 @@ from levain.autonomic.durable_sqlite import read_transaction
 from levain.contracts.canon import canonical
 from levain.coordinator import seam_classes
 from levain.coordinator.lease import LeaseRefused, lease as _lease, _launch_by_key
-from levain.coordinator.store import CoordError, CoordStore, _append_only, next_gseq
+from levain.coordinator.store import CoordError, CoordStore, StoreAbsent, _append_only, next_gseq
 
 __all__ = ["BODY_KEYS", "KINDS", "LIST_MAX", "MAX_BODY_BYTES", "SEAM_HANDOFF_SCHEMA", "SeamHandoff", "close",
            "latest"]
@@ -59,10 +60,12 @@ SEAM_HANDOFF_SCHEMA: tuple[str, ...] = (
     "BEGIN SELECT RAISE(ABORT, 'a seam handoff is never replaced'); END",
     f"CREATE TRIGGER IF NOT EXISTS seam_handoffs_kind BEFORE INSERT ON seam_handoffs WHEN NEW.seam_kind NOT IN "
     f"({_KINDS_SQL}) BEGIN SELECT RAISE(ABORT, 'a seam handoff is of kind rotation, operator or dream'); END",
-    # CASE, not OR: SQLite does not promise to skip json_type on a body json_valid has refused
+    # CASE, not OR: SQLite does not promise to skip json_type on a body json_valid has refused. The trim set is ASCII
+    # whitespace (space, tab, LF, VT, FF, CR): this trigger is the floor, and the writer's ``str.strip()`` is the full
+    # check (it also strips NBSP, U+3000 and the rest of Unicode whitespace, which SQLite's trim cannot name)
     "CREATE TRIGGER IF NOT EXISTS seam_handoffs_state_line BEFORE INSERT ON seam_handoffs WHEN CASE WHEN "
     "json_valid(NEW.body) THEN COALESCE(json_type(NEW.body, '$.state_line'), '') != 'text' "
-    "OR length(trim(json_extract(NEW.body, '$.state_line'))) = 0 ELSE 1 END "
+    "OR length(trim(json_extract(NEW.body, '$.state_line'), ' ' || char(9, 10, 11, 12, 13))) = 0 ELSE 1 END "
     "BEGIN SELECT RAISE(ABORT, 'a seam handoff needs a state_line'); END",
     f"CREATE TRIGGER IF NOT EXISTS seam_handoffs_size BEFORE INSERT ON seam_handoffs WHEN "
     f"length(CAST(NEW.body AS BLOB)) > {MAX_BODY_BYTES} OR CASE WHEN json_valid(NEW.body) THEN "
@@ -96,9 +99,23 @@ def _row(r: Any) -> SeamHandoff | None:
 
 
 def latest(store: CoordStore) -> SeamHandoff | None:
-    """The newest handoff, or None. A read: no lease, no lock."""
-    with read_transaction(store._connect) as conn:
-        return _row(conn.execute(f"SELECT {_COLUMNS} FROM seam_handoffs ORDER BY handoff_id DESC LIMIT 1").fetchone())
+    """The newest handoff, or None. A read on :meth:`CoordStore.open_readonly` (``mode=ro``, ``query_only``, no write
+    lock, no lease): it makes and migrates nothing. None when there is no store (no directory or no file) and when the
+    store predates S1 (no ``seam_handoffs`` table: a writer's open makes it). A store that is there but cannot be read
+    (:class:`StoreAbsent` with something in the way) raises, never None."""
+    from levain.coordinator.ready import _absent
+
+    try:
+        with read_transaction(store.open_readonly) as conn:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'seam_handoffs'").fetchone() \
+                    is None:
+                return None
+            return _row(conn.execute(f"SELECT {_COLUMNS} FROM seam_handoffs ORDER BY handoff_id DESC LIMIT 1"
+                                     ).fetchone())
+    except StoreAbsent:
+        if _absent(store):
+            return None
+        raise
 
 
 def _text(name: str, value: Any, *, empty: bool) -> str:
@@ -110,6 +127,8 @@ def _text(name: str, value: Any, *, empty: bool) -> str:
 def _check_body(body: Any) -> dict:
     if not isinstance(body, dict):
         raise CoordError("a handoff body is a mapping")
+    if not all(isinstance(k, str) for k in body):
+        raise CoordError(f"a handoff body has exactly the keys {', '.join(BODY_KEYS)} (empty is []); every key is text")
     missing = [k for k in BODY_KEYS if k not in body]
     extra = sorted(set(body) - set(BODY_KEYS))
     if missing or extra:
@@ -132,7 +151,10 @@ def _check_body(body: Any) -> dict:
                 raise CoordError(f"each {key} entry has exactly the keys {', '.join(fields)}")
             for f in fields:
                 _text(f"{key}.{f}", entry[f], empty=False)
-    size = len(canonical(body).encode("utf-8"))
+    try:
+        size = len(canonical(body).encode("utf-8"))
+    except UnicodeEncodeError:      # a lone surrogate (json.loads of "\ud800") has no UTF-8 form
+        raise CoordError("a handoff body is text that encodes as UTF-8 (a lone surrogate does not)") from None
     if size > MAX_BODY_BYTES:
         raise CoordError(f"a handoff body is at most {MAX_BODY_BYTES} bytes, not {size}")
     return body
@@ -182,8 +204,8 @@ def close(store: CoordStore, *, kind: Any, body: Any, request_id: Any, prev_hand
                                    (request_id,)).fetchone())
         if stored is not None:
             if stored.request_digest != digest:
-                raise CoordError(f"request id {request_id!r} already closed handoff {stored.handoff_id} with other "
-                                 "words; a changed close takes a new request id")
+                raise CoordError(f"request id {request_id!r} already closed handoff {stored.handoff_id} by another "
+                                 "writer or with other words; a changed close takes a new request id")
             return stored
         head = conn.execute("SELECT MAX(handoff_id) FROM seam_handoffs").fetchone()[0]
         if prev_handoff_id != head:
