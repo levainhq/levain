@@ -139,7 +139,10 @@
     if (fig === null) return null;
     const n = isNum(c.tokens_skipped) && c.tokens_skipped > 0 ? c.tokens_skipped : 0;
     const note = n ? n + (n === 1 ? " lane" : " lanes") + " not read" : "";
-    return { fig: fig + (n ? "+" : ""), note: note, text: fig + (n ? "+" : "") + " tokens today" + (note ? " (" + note + ")" : "") };
+    // cache reads, when the provider reports them (an embedding cockpit may): shown beside the fresh figure, never added into it
+    const cr = fmtTokens(c.cache_read_today), cache = cr === null ? "" : cr + " cache reads";
+    return { fig: fig + (n ? "+" : ""), note: note, cache: cache,
+             text: fig + (n ? "+" : "") + " tokens today" + (note ? " (" + note + ")" : "") + (cache ? ", plus " + cache : "") };
   }
   function fmtUsd(n) { return isNum(n) ? "$" + n.toFixed(2) : null; }
   function clock(iso) {
@@ -353,7 +356,7 @@
     const tk = tokensToday(v.counts);
     const t = el("span", "tv-stat tv-right" + (tk === null ? " dim" : ""));
     t.dataset.k = "tokens";
-    if (tk === null) { t.textContent = "tokens today \u2014"; t.title = "no session transcript could be read"; } else { t.append(el("b", null, tk.fig), " tokens today" + (tk.note ? " (" + tk.note + ")" : "")); t.title = tk.text; }
+    if (tk === null) { t.textContent = "tokens today \u2014"; t.title = "no session transcript could be read"; } else { t.append(el("b", null, tk.fig), " tokens today" + (tk.note ? " (" + tk.note + ")" : "") + (tk.cache ? " \u00b7 " + tk.cache : "")); t.title = tk.text; }
     row.appendChild(t);
     return row;
   }
@@ -387,8 +390,8 @@
       m("running", "running", String(running), "sessions running now"),
       m("waiting", "waiting on you", String(waiting), "sessions waiting on a decision or an answer from you", waiting ? "hot" : ""),
       m("tokens", "tokens today", tkN, tkN === null ? noTk
-        : (tk.note ? "At least this many (" + tk.note + "). " : "") + "Fresh tokens since local midnight, from the message timestamps in " + (isNum(counts.tokens_read) ? counts.tokens_read : "the") + " session transcripts: input + output + cache writes (Codex: input - cached + output). Cache reads are not counted.",
-        "", [tk && tk.note, unread ? unread + (unread === 1 ? " session" : " sessions") + " not read" : ""].filter(Boolean).join(" \u00b7 ")));
+        : (tk.note ? "At least this many (" + tk.note + "). " : "") + "Fresh tokens since local midnight, from the message timestamps in " + (isNum(counts.tokens_read) ? counts.tokens_read : "the") + " session transcripts: input + output + cache writes (Codex: input - cached + output). Cache reads are not counted" + (tk.cache ? " in it; the provider reports " + tk.cache + " beside it." : "."),
+        "", [tk && tk.note, tk && tk.cache, unread ? unread + (unread === 1 ? " session" : " sessions") + " not read" : ""].filter(Boolean).join(" \u00b7 ")));
     const conflicts = Array.isArray(v.conflicts) ? v.conflicts : null;
     if (conflicts && conflicts.length) { const n = conflictCount(v); row.appendChild(m("conflicts", n === 1 ? "file conflict" : "file conflicts", String(n), "files two live sessions are both writing", "warn")); }
     return row;
