@@ -58,8 +58,8 @@ def _scroll_of(root_sel: str) -> str:
 # the body that scrolls the row: the nearest bounded ancestor that has somewhere to scroll
 SCROLLER = ("(r) => { for (let n = r.parentElement; n; n = n.parentElement) "
             "if (n.matches('.pbody, .modal-body') && n.scrollHeight - n.clientHeight > 40) return n; return null; }")
-COUNT_RENDERS = ("window.__r = 0; const L = window.LevainDashboard, o = L.render; "
-                 "L.render = function () { try { return o.apply(this, arguments); } finally { window.__r++; } }; 1")
+COUNT_RENDERS = ("window.__r = 0; if (!window.__rWrapped) { window.__rWrapped = 1; const L = window.LevainDashboard, o = L.render; "
+                 "L.render = function () { try { return o.apply(this, arguments); } finally { window.__r++; } }; } 1")   # a second use only resets the count
 BOARD = "#board"
 # the fixture rows are capped to a 160-character title: they clamp only on a narrow card (a lone card now stretches to the page width)
 NARROW = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}

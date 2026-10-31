@@ -23,7 +23,7 @@
     vendor_tool_call: "tool", vendor_tool_result: "tool result", vendor_approval_request: "approval",
     vendor_approval_resolved: "approval answered", vendor_turn_started: "turn started", vendor_turn_ended: "turn ended",
     vendor_error: "error", vendor_gap: "gap", reply_receipt: "receipt", reply_sign: "sign", reply_answer: "answer",
-    reply_know: "know", envelope_bound: "envelope"
+    reply_know: "know", reply_coordinator: "reply", envelope_bound: "envelope"
   };
 
   function own(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }

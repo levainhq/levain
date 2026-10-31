@@ -9,6 +9,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Added
 - **Groundwork: AgentSpec, the registration refusals and the lifecycle axes.** `levain agents register|list|show|pause|resume|retire|zone` over immutable, content-hashed agent specs (`stop_at` required), refusing what the agent design's rules 1-6 and five refinements refuse. A file registers whole or not at all (a feeder group is judged together and written in one transaction), and `--warn` writes nothing, not even a new store. A pause stays on its agent through a same-content re-register, a `--revise` and a retire, and only `resume` clears it; a retire followed by a new register of the name is a new agent (a new `agent_id`) that starts active. `--warn` over an audit file echoes the audit's own verdicts and checks each row is coherent; it does not run the refusals, which are exercised by the spec fixture's tests. The build plan's "diff is empty" check cannot hold literally (the output carries fields the expected file does not); the test compares every row's verdict, class, refinement and review flag. Nothing runs an agent yet.
 - **Groundwork: one sleep reconciler over both stores.** `awake.sync` now re-reads the coordinator's working threads AND the agents' live occurrences (`agent_occurrences` in state `admitted` or `launched`) under the one `awake.json` lock, whichever side calls it, and releases the holder only when both are empty; `levain doctor`'s host-sleep row names the source (coordinator, agent, or both) and the occurrence holding the host. Nothing starts an agent occurrence yet.
+- **The coordinator now answers words you drop from the cockpit or the phone, and silence no longer reads as "heard".** `levain coord reply DROP_ID --text ... --token N` files a reply bound to that drop: one reply per drop, within 24 hours of it, and nothing else (a drop that does not exist, a second reply, an old drop, or a drop whose time cannot be read is refused by the store itself). The Coordinator panel shows the reply with the block Levain froze when it was written (what changed since your last message, and the question band), and that block never changes after. A drop with no reply after 10 minutes shows on the panel, and in the coordinator's next reply block, as `drop ... (14:02, phone): no reply yet`; once the 24 hours are over it reads `drop ... (2026-10-31 14:02, phone): no reply, window closed` and stays for 7 days after the drop, then goes. The reply counts as delivered when written, and your next terminal reply names it. A store from before this is upgraded in place and keeps every earlier reply.
 - **The coordinator's reply carries what changed in its store.** Ahead of the NEEDS YOU band, a coordinator session's
   reply block now has a work delta rendered by Levain (never model-written) from the coordinator store's records that carry
   its `gseq`: replies, launch events, lease events, ready moves and chat messages. At most 5 lines in `gseq` order, then
@@ -379,6 +380,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Changed
 - **"Add an envelope" is one organized form, not a window in a window.** The sign sheet now fills the cockpit's modal (wide on a laptop, full screen on a phone, two columns then one) with no inner card or second title. The repo is a picker over the folders the coordinator knows ("Another folder…" takes a path), landing is three plain choices with "don't land" the default, and the size is Quick, Standard or Long (or Custom, with each limit explained and never sent blank as 0). Before the button, the server's own reading of the envelope is shown as you change the form, so the usual path is open, check, one tap, passkey. What is signed is unchanged.
+- **Revoked devices move to their own tab.** The cockpit's Devices panel now lists only the devices that still hold a key.
+  Revoked ones sit under a "Revoked (N)" tab, newest-revoked first, each with the same details as before. The count is
+  always shown, the tab appears only once something is revoked, and the tab you picked stays through the panel's refreshes.
+  Revoking itself is unchanged.
 - **The ping puts what you act on first.** A question ping is now the question, its options, the answer command, and
   only then the blocks, which take the room left and end "(full text on the card)" when cut. The room is measured in
   the bytes the phone push carries (emoji and accented text take more than one), and the question and the option
@@ -472,6 +477,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   on a real phone or a real push.
 
 ### Fixed
+- **The cockpit's Work view now does something when you click it.** A worker in the Work lens opens its agent page, as a node in the Agents graph does, and an open loop opens its row in the Open loops panel (scrolled to, unfolded if folded, and lit for a moment).
 - **The cockpit's tokens-today figure no longer leaves out subagent lanes on a busy session.** It read only the first 64
   subagent transcripts by file name, so on a heavy session the later lanes were silently missing. It now reads every
   lane written since local midnight, newest first, and a lane it could not read in time (the read budget ran out) is

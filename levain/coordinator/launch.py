@@ -394,6 +394,12 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "Levain shows you no band on it and does not check your reply for one. Act and record; if something needs him, "
         "file it (`coord escalate`), never narrate it.",
         "",
+        "Words he dropped from the cockpit or the phone have no terminal for your reply, so answer each one you have "
+        f"read with `{lv} coord reply DROP_ID --text-file PATH --token N {tail}` (`--stdin` reads it from stdin; one "
+        "reply per drop, within 24 hours). Levain freezes its own block (what changed, and the band) onto that reply "
+        "and shows it where he reads it; you do not write the block. A drop with no reply after ten minutes shows on "
+        "the Coordinator panel as `no reply yet`.",
+        "",
         "## How your turn ends",
         "",
         "Your words are the last thing in a session the operator may see in his agent view, where a question or "
@@ -582,18 +588,8 @@ def _stop_episode(store: CoordStore) -> str | None:
     from levain.autonomic.durable_sqlite import read_transaction
 
     with read_transaction(store.open_readonly) as conn:
-        looked = lease_mod._looked(conn)
-        first = None
-        # newest end first; the run ends at the first launch that did not die, and one nobody tried to start is skipped
-        for (launch_id,) in conn.execute(
-                "SELECT l.launch_id FROM launches l WHERE l.role = 'coordinator' AND l.gseq > ? ORDER BY "
-                "(SELECT MAX(e.gseq) FROM launch_events e WHERE e.launch_id = l.launch_id) DESC", (looked,)).fetchall():
-            death = lease_mod.launch_death(conn, lease_mod._launch_row(conn, "launch_id", launch_id))
-            if death is False:
-                break
-            if death:
-                first = launch_id
-        return first
+        run = lease_mod.death_run(conn)         # newest end first: the first death of the run is the last
+        return run[-1][0] if run else None
 
 
 def _note_stopped(store: CoordStore) -> None:

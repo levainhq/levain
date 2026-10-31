@@ -141,6 +141,12 @@ _LATCHED_LIVE = ("(SELECT kind FROM chat_launch_checks WHERE launch_id = NEW.lau
                  "chat_launch_checks WHERE launch_id = NEW.launch_id AND kind = 'not_live' AND gseq > "
                  f"{_LAST_REENABLE})")
 
+# the one mapping of a reply's stored kind to its timeline kind (``col`` is the kind column's name in the query); the
+# chat_timeline view and timeline()'s "before" query both use it, and thread_view.js labels every kind it yields
+REPLY_KIND_CASE = ("CASE {col} WHEN 'drop_receipt' THEN 'reply_receipt' WHEN 'sign' THEN 'reply_sign' "
+                   "WHEN 'answer' THEN 'reply_answer' WHEN 'know' THEN 'reply_know' "
+                   "WHEN 'coordinator_reply' THEN 'reply_coordinator' END")
+
 CHAT_SCHEMA: tuple[str, ...] = (
     # §2.1: what a principal said, once. launch_id = the recipient worker launch; NULL = the coordinator / the thread
     "CREATE TABLE IF NOT EXISTS chat_messages (message_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE, "
@@ -285,8 +291,7 @@ CHAT_SCHEMA: tuple[str, ...] = (
     "END, e.source, e.vendor_event_key, e.launch_id, NULL, e.body, e.at, x.message_id "
     "FROM chat_events e JOIN launches l ON l.launch_id = e.launch_id JOIN json_each(l.threads) j "
     "LEFT JOIN chat_echoes x ON x.launch_id = e.launch_id AND x.vendor_event_key = e.vendor_event_key "
-    "UNION ALL SELECT r.thread_id, r.gseq, CASE r.kind WHEN 'drop_receipt' THEN 'reply_receipt' "
-    "WHEN 'sign' THEN 'reply_sign' WHEN 'answer' THEN 'reply_answer' WHEN 'know' THEN 'reply_know' END, "
+    f"UNION ALL SELECT r.thread_id, r.gseq, {REPLY_KIND_CASE.format(col='r.kind')}, "
     "'levain', r.reply_id, NULL, NULL, r.body, r.at, NULL FROM replies r "
     "WHERE r.gseq IS NOT NULL AND r.thread_id IS NOT NULL "
     "UNION ALL SELECT b.thread_id, b.gseq, 'envelope_bound', 'levain', b.envelope_id, NULL, NULL, NULL, b.at, NULL "
@@ -643,8 +648,7 @@ def timeline(conn: sqlite3.Connection, thread_id: str) -> tuple[list[TimelineRow
             "SELECT 1 FROM threads WHERE thread_id = ?", (thread_id,)).fetchone() is None:
         raise CoordError(f"no thread {str(thread_id)[:40]!r}")
     before = [TimelineRow(None, k, "levain", rid, None, None, body, at) for rid, k, body, at in conn.execute(
-        "SELECT reply_id, CASE kind WHEN 'drop_receipt' THEN 'reply_receipt' WHEN 'sign' THEN 'reply_sign' "
-        "WHEN 'answer' THEN 'reply_answer' WHEN 'know' THEN 'reply_know' END, body, at FROM replies "
+        f"SELECT reply_id, {REPLY_KIND_CASE.format(col='kind')}, body, at FROM replies "
         "WHERE thread_id = ? AND gseq IS NULL ORDER BY at, rowid", (thread_id,))]
     echo = "echo_of" if "echo_of" in {r[1] for r in conn.execute("PRAGMA table_info(chat_timeline)")} else "NULL"
     merged = [TimelineRow(*r) for r in conn.execute(
