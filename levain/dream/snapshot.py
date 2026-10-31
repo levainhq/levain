@@ -204,6 +204,9 @@ def take(store: Any, occ_dir: Path | None) -> dict[str, Any]:
                               f"{SUPPORTED_FORMAT} has a proven rollback, so the dream will not consolidate it")
     if store.get_wrap_started_at():
         raise SnapshotRefused("a wrap is open on this store; a snapshot now would capture a half-made wrap")
+    if not str(getattr(store, "store_id", "") or ""):
+        raise SnapshotRefused("the store has no readable store id, so no rollback of it could ever be matched to it; "
+                              "the dream will not consolidate it")
     snap = occ_dir / SNAP_DIR
     if (snap / MANIFEST).exists():
         raise SnapshotRefused(f"{snap} already holds a snapshot: one occurrence takes one")
@@ -327,7 +330,8 @@ def prune_snapshots(root: Path | str, *, keep: int = KEEP_SNAPSHOTS, protect: st
 @dataclass
 class RollbackResult:
     """``outcome`` is ``rolled-back``, ``finished`` (an interrupted rollback completed), ``nothing`` (the live text is
-    already the snapshot's) or ``refused``. A refusal names its ``code``."""
+    already the snapshot's), ``already-reverted`` (a rerun after a finished rollback: nothing changed, the card is
+    rebuilt from rollback.json) or ``refused``. A refusal names its ``code``."""
     outcome: str
     message: str
     code: str | None = None
@@ -435,6 +439,14 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
     if why:
         return _refused("store-mismatch", why)
     if m.get("reverted_at"):
+        rec = _read_json(occ_dir / ROLLBACK_RECORD)
+        if rec and rec.get("at"):
+            # the card is rebuilt from the durable record, so a crash after `reverted_at` but before the card reached
+            # the operator costs nothing: every rerun shows the same card
+            card = _rollback_card(occ_dir, str(rec.get("who") or who), str(rec["at"]), list(rec.get("files") or []))
+            return RollbackResult("already-reverted", f"already-reverted: this dream was already rolled back at "
+                                  f"{m['reverted_at']}; nothing was changed. {LIMIT}", code="already-reverted",
+                                  restored=list(rec.get("files") or []), undo_dir=str(occ_dir / UNDO_DIR), card=card)
         return _refused("already-reverted", f"this dream was already rolled back at {m['reverted_at']}.")
     if _wrap_open(db):
         return _refused("wrap-open", "a wrap is open on this store (or its state cannot be read); rolling back now "
@@ -491,6 +503,11 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
     return _finish(occ_dir, m, who, restored, file_card, finished=False)
 
 
+def _rollback_card(occ_dir: Path, who: str, at: str, restored: list[str]) -> dict[str, Any]:
+    return {"kind": "rolled-back", "dedupe_key": f"dream-rollback:{occ_dir.name}", "occurrence": occ_dir.name,
+            "who": who, "at": at, "files": restored, "limit": LIMIT}
+
+
 def _finish(occ_dir: Path, m: dict[str, Any], who: str, restored: list[str],
             file_card: Callable[[dict[str, Any]], Any] | None, *, finished: bool) -> RollbackResult:
     # ``reverted_at`` is the LAST durable marker: it says the record and the card are both out. A rerun after a crash
@@ -504,8 +521,7 @@ def _finish(occ_dir: Path, m: dict[str, Any], who: str, restored: list[str],
         at = _now()
         _write_json(rec_path, {"who": who, "at": at, "files": restored,
                                "finished_an_interrupted_rollback": finished, "limit": LIMIT})
-    card = {"kind": "rolled-back", "dedupe_key": f"dream-rollback:{occ_dir.name}", "occurrence": occ_dir.name,
-            "who": who, "at": at, "files": restored, "limit": LIMIT}
+    card = _rollback_card(occ_dir, who, at, restored)
     res = RollbackResult("finished" if finished else "rolled-back", "", restored=restored,
                          undo_dir=str(occ_dir / UNDO_DIR), card=card)
     res.message = (f"{'finished the interrupted rollback of' if finished else 'rolled back'} {occ_dir.name}: "
@@ -595,25 +611,28 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
         if handle is _w._ANOTHER_WRAP_RUNNING:
             return _deferred(res, "a consolidate holds the store's wrap lock, so the live store cannot be copied "
                                   "consistently")
+        socc = scratch / "occs" / name
+        (socc / SNAP_DIR).mkdir(parents=True)
         try:
+            # the live store AND the snapshot files are copied under the same lock: a dream finishing meanwhile could
+            # otherwise prune the snapshot between the two copies
             copy_db = _copy_store(db, sdir)
+            for e in m["files"].values():
+                if e["sha256"] is not None:
+                    shutil.copy2(snap / e["name"], socc / SNAP_DIR / e["name"])
         except (OSError, sqlite3.Error) as exc:
-            _step(res, "restore", "failed", f"the live store could not be copied: {type(exc).__name__}: {exc}")
+            _step(res, "restore", "failed", f"the live store or the snapshot could not be copied: "
+                                            f"{type(exc).__name__}: {exc}")
             return _drill_done(res, root, write_result, failed=True)
         finally:
             _w._unlock_wrap(handle)
-        socc = scratch / "occs" / name
-        (socc / SNAP_DIR).mkdir(parents=True)
-        for e in m["files"].values():
-            if e["sha256"] is not None:
-                shutil.copy2(snap / e["name"], socc / SNAP_DIR / e["name"])
         # the revert markers stay as the real manifest has them: a finished rollback then refuses on the copy as
         # ``already-reverted`` (skipped), instead of the copy reading "nothing to roll back" (a false failure)
         _write_manifest(socc, {**m, "store_db": str(copy_db)})
         rb = rollback(copy_db, socc, who="drill")
         if rb.outcome == "refused" and rb.code in ("wrap-open", "lock-held"):
             return _deferred(res, f"{rb.code}: a dream is running on the store")
-        if rb.outcome == "refused" and rb.code in ("foreign-write", "later-dream", "already-reverted"):
+        if rb.code in ("foreign-write", "later-dream", "already-reverted"):
             _step(res, "restore", "skipped", f"{rb.code}: the live store is past this dream, and the rollback guard "
                                              f"refused it on the copy (as designed). {rb.message}")
             _step(res, "open", "skipped", "no restored copy")

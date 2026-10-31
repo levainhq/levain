@@ -178,12 +178,23 @@ def run_dream_run(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
+_OCC_FORMS = ("an occurrence id (a plain name under <store>/dream/), an absolute path, a path starting with ./ or "
+              "~/, or a path containing a separator")
+
+
 def _occurrence_dir(store_path: Path, occurrence: str) -> tuple[Path | None, str]:
-    """The occurrence dir named by ``occurrence`` (an id under ``<store dir>/dream/``, or a path), refused if it
-    resolves inside the operator's live store."""
-    # A bare name is an id under the store's dream dir, never a directory of the same name in the working dir. Only an
-    # argument that looks like a path (a separator, or a leading . or ~) is read as one.
-    if os.sep in occurrence or (os.altsep and os.altsep in occurrence) or occurrence[:1] in (".", "~"):
+    """The occurrence dir named by ``occurrence``, refused if it resolves inside the operator's live store. A path only
+    when it is absolute, starts with ``./`` or ``~/``, or contains a separator; anything else is an id under
+    ``<store dir>/dream/``, never a directory of that name in the working dir. ``.``, ``..`` and any ``..`` component
+    are refused outright."""
+    seps = [x for x in (os.sep, os.altsep, "/") if x]
+    parts = [occurrence]
+    for sep in seps:
+        parts = [q for part in parts for q in part.split(sep)]
+    if not occurrence.strip() or occurrence in (".", "~") or ".." in parts:
+        return None, f"{occurrence!r} is not an occurrence. Accepted: {_OCC_FORMS}."
+    is_path = os.path.isabs(occurrence) or occurrence.startswith("~/") or any(x in occurrence for x in seps)
+    if is_path:
         occ = Path(occurrence).expanduser().resolve()
     else:
         occ = (store_path.parent / "dream" / occurrence).resolve()
@@ -219,6 +230,8 @@ def run_dream_rollback(args: argparse.Namespace) -> int:
                           "card": res.card}, sort_keys=True))
     else:
         print(f"levain dream rollback: {res.message}")
+        if res.card:
+            print(f"  card to file: {json.dumps(res.card, sort_keys=True)}")
     return 0 if res.ok else 1
 
 

@@ -115,8 +115,9 @@ def _names_occurrence(argv: Any, occ_dir: Path) -> bool:
 def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = TERM_WAIT_S,
                      kill_wait: float = KILL_WAIT_S) -> tuple[str, list[str]]:
     """End the compose child ``progress.json`` names, if it outlived its fire. A signal goes to a process whose
-    identity was checked just before it, never to a stored integer: SIGTERM to the group, then (identity re-checked)
-    SIGKILL (while the group still exists), and only ``ProcessLookupError`` on the group counts as ended. Returns ``(state, notes)``, ``state`` one of
+    identity was checked just before it, never to a stored integer: SIGTERM to the group, then SIGKILL only while the
+    leader is still verified to be the recorded process (a group whose leader has exited is never signalled by number),
+    and only ``ProcessLookupError`` on the group counts as ended. Returns ``(state, notes)``, ``state`` one of
     ``none-recorded``, ``ended`` (no process of ours is left), ``not-confirmed`` (no signal could safely be sent, or the
     group was not seen gone)."""
     pid = prog.get("child_pid")
@@ -151,9 +152,10 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = 
     deadline = time.monotonic() + term_wait
     while time.monotonic() < deadline and _group_gone(pid) is not True:
         time.sleep(0.05)
-    if _group_gone(pid) is False:
-        # the group id is held while any member lives, so it still names the group that took the TERM even when its
-        # leader has exited and a member ignored the signal
+    if _group_gone(pid) is False and _identity_matches(pid, started, argv, occ_dir) is True:
+        # the leader is still the recorded process, so its number is still its own and the group id cannot belong to
+        # anyone else. Once the leader has gone nothing here reserves the number (recovery holds no handle to it), so
+        # the group is never signalled by number again: it is reported not seen gone and recovery stays retryable
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signal.SIGKILL)
     if _group_gone(pid) is not True:
@@ -163,7 +165,8 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = 
     if _group_gone(pid) is True:
         notes.append(f"child pid {pid}: ended")
         return "ended", notes
-    return "not-confirmed", [f"child pid {pid}: signalled but its group was not seen gone"]
+    return "not-confirmed", [f"child pid {pid}: signalled but its group was not seen gone (a group whose leader has "
+                             "exited is not signalled by number; end its members by hand, then rerun recover)"]
 
 
 # --------------------------------------------------------------------------------------------------------- recover
@@ -352,8 +355,16 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
     if not moved:
         res.ending, res.reason = ("stopped", "wrap-cleared") if stopped else ("failed", WRAP_CLEARED)
         return _record(occ_dir, res)
+    if not token:
+        # no recorded token means no way to tell this dream's commit from another writer's, whatever the text hash says
+        res.reason, res.settled = UNKNOWN_COMMIT, False
+        res.card = _card("failed", UNKNOWN_COMMIT, occ, his=[
+            f"anneal completed wrap(s) {[w for w, *_ in moved]} after this dream began, and this occurrence never "
+            "recorded its wrap token, so ownership cannot be proven. Nothing was adopted and no rollback is offered."])
+        res.notes.append("no wrap token was recorded: a completed wrap is never adopted without one")
+        return res
     composed = prog.get("composed_sha256")
-    ours = [w for w, h, pid in moved if _is_ours(h, pid, composed, token, len(moved))]
+    ours = [w for w, h, pid in moved if _is_ours(h, pid, composed, token)]
     if len(ours) > 1:
         res.reason, res.settled = UNKNOWN_COMMIT, False
         res.card = _card("failed", UNKNOWN_COMMIT, occ, his=[
@@ -398,16 +409,13 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
     return _record(occ_dir, res)
 
 
-def _is_ours(content_hash: str | None, pair_id: str | None, composed: Any, token: Any, n_moved: int) -> bool:
+def _is_ours(content_hash: str | None, pair_id: str | None, composed: Any, token: Any) -> bool:
     """Is this completed wrap this dream's commit? Its text hash must be the composed hash, AND its commit identity must
-    be ours: anneal's pair id starts with the first 12 of the wrap token. A row with no pair id (a legacy store) counts
-    only when it is the sole wrap since the dream began. A hash alone is not identity: another writer can save the same
-    text."""
-    if not (composed and content_hash == composed):
+    be ours: anneal's pair id starts with the first 12 of the wrap token. A hash alone is never identity (another
+    writer can save the same text), so a row with no pair id (a legacy store) is not adopted either."""
+    if not (composed and content_hash == composed and token and pair_id):
         return False
-    if pair_id:
-        return bool(token) and str(pair_id).startswith(f"{str(token)[:12]}-")
-    return n_moved == 1
+    return str(pair_id).startswith(f"{str(token)[:12]}-")
 
 
 def _recover_saved(db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverResult, stopped: bool,
@@ -417,7 +425,10 @@ def _recover_saved(db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverRe
     if m is not None and not m.get("post_files"):
         if not prog.get("composed_sha256"):
             res.notes.append("post files not recorded: progress.json holds no composed text hash, so the live text "
-                             "cannot be shown to be the dream's")
+                             "cannot be shown to be the dream's; recovery is not settled, so a rerun can finish once "
+                             "the hash is restored")
+            res.reason, res.settled = (COMMITTED_AFTER_STOP if stopped else DIED_BEFORE_CARD), False
+            return res
         else:
             try:
                 _sn.record_post_for(db, occ_dir, prog.get("wrap_id"), composed_sha256=prog.get("composed_sha256"))
