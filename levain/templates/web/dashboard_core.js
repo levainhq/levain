@@ -6952,6 +6952,7 @@
     const note = !body ? (r && r.why) || "The coordinator could not be read."
       : !ui.storeRead ? (typeof body.coord_note === "string" && body.coord_note ? body.coord_note : "Still reading which Levain answers here; reload.")
       : typeof body.coord_note === "string" ? body.coord_note : "";
+    ui.note = note;
     ui.say.textContent = note;
     ui.say.classList.toggle("bad", !ui.can);
     ui.send.disabled = ui.env.disabled = ui.words.disabled = ui.working || !ui.can;
@@ -7009,9 +7010,16 @@
     const host = document.getElementById("ck-drop");
     const ui = host && host._drop;
     if (!ui || host.hidden) return !!openDropSheet(words);
+    // a box that cannot take words now says why on its card; words put in a disabled box would look sent-ready and be lost
+    if (ui.working || !ui.can) {
+      ui.say.textContent = ui.working ? "The drop box is busy" : "The drop box is off" + (ui.note ? ": " + ui.note : "");
+      ui.say.classList.add("bad");
+      return false;
+    }
     if (document.getElementById("levain-modal")) closeModal();      // a focus view stands over the box
     const box = ui.words;
     box.value = box.value.trim() ? box.value.replace(/\s+$/, "") + "\n\n" + words : words;
+    dropPrefillClear();      // a handoff to the sheet left earlier is stale now that these words are in the box
     dropGrow(box);
     try { box.scrollIntoView({ block: "center" }); } catch (e) { /* scrolling is a convenience */ }
     try { box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length); } catch (e) { /* focus is a convenience */ }

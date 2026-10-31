@@ -8,6 +8,7 @@ never numbers an item). A source that cannot be read is named in ``unreadable``,
 never made is ``queue: "none"`` ("no queue yet"). ``build`` never raises."""
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -75,10 +76,16 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
     return cards, None
 
 
-def build(store_dir: Path | str | None, question_store: Any = None, *, generated: str | None = None) -> dict[str, Any]:
+def build(store_dir: Path | str | None, question_store: Any = None, *, generated: str | None = None,
+          drop_dir: Path | str | None = None) -> dict[str, Any]:
     """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], unreadable, band_hint, note,
     journal_as_of_read}``. KNOWN EDGE: the items and the journal are two read transactions (C13 exposes no single
-    snapshot), so a card's journal line is "as of read": it may be newer than the card's column for one poll."""
+    snapshot), so a card's journal line is "as of read": it may be newer than the card's column for one poll.
+
+    ``drop_dir`` is accepted and ignored for one more release (the value no longer carries ``tell``); it warns."""
+    if drop_dir is not None:
+        warnings.warn("board.build(drop_dir=) is ignored and will be removed: the board value no longer carries `tell`",
+                      DeprecationWarning, stacklevel=2)
     unreadable: list[str] = []
     items: list[Mapping[str, Any]] = []
     journal: dict[str, Mapping[str, Any]] = {}

@@ -186,3 +186,45 @@ def test_drop_about_this_card_opens_the_drop_box_with_that_cards_words(tmp_path:
     assert value == want and focused is True and start == end == len(want) and label == "Drop about this card"
     assert v[-1] == want.rstrip() + "\n\nAbout card levain:d (Later D): "       # earlier words kept, the new ones after them
     assert out["posts"] == [] and sheet.dropped == []                            # a click posts nothing: it is a drop the operator sends
+
+
+@needs_browser
+def test_a_board_whose_drop_files_to_another_coordinator_draws_no_drop_button(tmp_path: Path, lh) -> None:  # noqa: F811
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _seed(lh)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (url, httpd):
+        httpd.coord_sheet = _Sheet(tmp_path / "another-queue")                  # the drop route files elsewhere than the board reads
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{BUILTIN} && {BUILTIN}.querySelectorAll('.bd-row').length === 6 && 1"},
+            {"eval": f"{BUILTIN}.querySelectorAll('.bd-drop').length"},
+        ])
+    assert out["values"][-1] == 0
+
+
+@needs_browser
+def test_compose_drop_refuses_a_box_that_is_busy_or_off_and_clears_a_stale_handoff_on_success(tmp_path: Path, lh) -> None:  # noqa: F811
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _seed(lh)
+    _root, src, _ids = _install(tmp_path)
+    host, box = "document.getElementById('ck-drop')", "document.getElementById('ck-drop-words')"
+    state = (f"JSON.stringify([{box}.value, {host}._drop.say.textContent, sessionStorage.getItem('levain-drop-prefill')])")
+    with _serve(src, write_token=TOKEN) as (url, httpd):
+        httpd.coord_sheet = _Sheet(lh)
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{BUILTIN} && {box} && !{box}.disabled && 1"},
+            {"eval": "sessionStorage.setItem('levain-drop-prefill', 'stale'); 1"},
+            {"eval": f"{host}._drop.working = true; [LevainDashboard.composeDrop('x'), {state}]"},        # a send in flight
+            {"eval": f"{host}._drop.working = false; {host}._drop.can = false; {host}._drop.note = 'no store'; "
+                     f"[LevainDashboard.composeDrop('x'), {state}]"},                                       # the box is off
+            {"eval": f"{host}._drop.can = true; [LevainDashboard.composeDrop('About: '), {state}]"},       # a box that takes words
+        ])
+    busy, off, ok = (json.loads(x) if isinstance(x, str) else x for x in out["values"][-3:])
+    assert busy[0] is False and json.loads(busy[1])[0] == "" and json.loads(busy[1])[1] == "The drop box is busy"
+    assert json.loads(busy[1])[2] == "stale"                                   # a refusal leaves the handoff alone
+    assert off[0] is False and json.loads(off[1])[1] == "The drop box is off: no store" and json.loads(off[1])[0] == ""
+    assert ok[0] is True and json.loads(ok[1])[0] == "About: " and json.loads(ok[1])[2] is None   # the stale handoff is cleared

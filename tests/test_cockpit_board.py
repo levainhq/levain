@@ -6,6 +6,7 @@ import http.client
 import json
 import shutil
 import subprocess
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -280,3 +281,73 @@ def test_the_panels_read_of_the_board_carries_no_clock_stamp_so_its_etag_moves_o
     a, b = _board_value(server, stamped=False), _board_value(server, stamped=False)
     assert a["generated"] is None and a == b                                  # the panel's is not, and is stable
     assert sum(len(c["cards"]) for c in a["columns"]) == 3                    # and it still holds the work
+
+
+# --- the drop route and the board: one coordinator -----------------------------------------------------
+
+def test_drop_here_is_true_only_when_the_drop_route_files_to_the_directory_the_board_reads(filled, tmp_path):
+    from levain.web_server import _board_value
+    other = tmp_path / "other-queue"
+    other.mkdir()
+
+    def value(sheet_dir, **kw):
+        sheet = SimpleNamespace(queue_dir=sheet_dir) if sheet_dir is not None else None
+        server = SimpleNamespace(consent_reader=SimpleNamespace(directory=filled), question_store=None, coord_sheet=sheet)
+        return _board_value(server, **kw)["drop_here"]
+
+    assert value(filled) is True
+    assert value(str(filled) + "/../" + filled.name) is True       # the same directory spelled another way
+    assert value(other) is False                                   # a different queue: the drop would file elsewhere
+    assert value(None) is False                                    # no drop route at all
+    assert value(filled, stamped=False) is True                    # the panel's read says it too
+    bare = SimpleNamespace(consent_reader=SimpleNamespace(), question_store=None, coord_sheet=SimpleNamespace(queue_dir=filled))
+    assert _board_value(bare)["drop_here"] is False                # no board directory to compare
+
+
+def test_the_board_route_carries_drop_here(tmp_path, lh):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, httpd):
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["drop_here"] is False       # no coord sheet here
+        httpd.coord_sheet = SimpleNamespace(queue_dir=lh, close=lambda: None)
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["drop_here"] is True
+        httpd.coord_sheet = SimpleNamespace(queue_dir=tmp_path / "elsewhere", close=lambda: None)
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["drop_here"] is False
+
+
+def test_build_still_accepts_the_removed_drop_dir_and_ignores_it_with_a_warning(qdir):
+    plain = board.build(qdir, generated="t")
+    with pytest.warns(DeprecationWarning, match="drop_dir"):
+        got = board.build(qdir, generated="t", drop_dir=qdir)
+    assert got == plain and "tell" not in got
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        board.build(qdir, generated="t")                           # no warning without it
+
+
+def _panel_kinds(base):
+    got = json.loads(_raw(base, "/cockpit/manifest.json")[2])
+    return {pid: m["kind"] for pid, m in got["panels"].items()}
+
+
+def test_make_server_draws_the_work_board_unless_told_not_to(tmp_path, lh):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        assert _panel_kinds(base).get("work_board") == "board"
+    with _serve(src, write_token=TOKEN, work_board=False) as (base, _h):
+        assert [p for p, k in _panel_kinds(base).items() if k == "board"] == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_no_drop_button_is_drawn_when_the_board_says_the_drop_files_elsewhere():
+    d = _harness_run()["dropHere"]
+    assert d == {"absent": 3, "true": 3, "false": 0, "falseCols": 0}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_1000_character_title_cannot_push_a_cards_drop_past_the_drop_routes_cap():
+    from levain.coordinator.store import WORDS_MAX, check_words
+    words = _harness_run()["longTitleWords"]
+    assert len(words) >= 1000 and len(words) <= 2 * board.TEXT_MAX + 100
+    assert check_words(words) == words and len(words) < WORDS_MAX

@@ -227,7 +227,7 @@ def test_a_board_registered_before_the_attach_is_the_only_board() -> None:
     assert _boards(ck) == ["b"]
 
 
-def test_a_board_registered_after_the_attach_replaces_the_kernels_and_the_kernels_does_not_return() -> None:
+def test_a_board_registered_after_the_attach_replaces_the_kernels_and_a_second_attach_adds_none_beside_it() -> None:
     ck = Cockpit()
     _attach(ck)
     ck.register(ProviderSpec(id="b", kind="board", title="Provider board", priority="feed", read=lambda c: Read(value=_value())))
@@ -236,13 +236,79 @@ def test_a_board_registered_after_the_attach_replaces_the_kernels_and_the_kernel
     assert _boards(ck) == ["b"]
 
 
-def test_a_failed_attach_leaves_no_kernel_board_behind() -> None:
+def _provider_board(pid: str = "b") -> ProviderSpec:
+    return ProviderSpec(id=pid, kind="board", title="Provider board", priority="feed", region="operate",
+                        read=lambda c: Read(value=_value()))
+
+
+def test_the_kernels_board_returns_when_the_last_board_panel_is_unregistered() -> None:
     from levain.cockpit.engine import BOARD_DEFAULT_ID
     ck = Cockpit()
-    ck.register(ProviderSpec(BOARD_DEFAULT_ID, "line", "Taken", "gauge", lambda c: Read(value={"lines": []})))    # the id is taken: the board's registration refuses
+    _attach(ck)
+    here = {"on": True}
+    ck.discover(lambda ctx: [_provider_board("disc")] if here["on"] else [], retire=True)
+    assert _boards(ck) == ["disc"]                    # the discovered board replaced the kernel's
+    here["on"] = False
+    assert _boards(ck) == [BOARD_DEFAULT_ID]          # its owner stopped returning it: no board left, so the kernel's is back
+    here["on"] = True
+    assert _boards(ck) == ["disc"]                    # and a board brought again replaces it again
+
+
+def test_the_kernels_board_does_not_return_while_another_board_is_left() -> None:
+    ck = Cockpit()
+    _attach(ck)
+    ck.register(_provider_board("kept"))
+    here = {"on": True}
+    ck.discover(lambda ctx: [_provider_board("disc")] if here["on"] else [], retire=True)
+    assert sorted(_boards(ck)) == ["disc", "kept"]
+    here["on"] = False
+    assert _boards(ck) == ["kept"]
+
+
+def test_the_kernels_board_id_never_blocks_an_embedder() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    ck.register(ProviderSpec(BOARD_DEFAULT_ID, "line", "Mine", "gauge", lambda c: Read(value={"lines": []})))    # an embedder holds the id
+    _attach(ck)                                       # the server still starts: the built-in is not drawn
+    assert _boards(ck) == [] and not ck._board_yields
+    assert ck.manifest(CRED)["panels"][BOARD_DEFAULT_ID]["title"] == "Mine"
+
+
+def test_an_embedder_board_under_the_kernels_id_replaces_the_kernels_board() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    _attach(ck)
+    ck.register(ProviderSpec(BOARD_DEFAULT_ID, "board", "Theirs", "feed", lambda c: Read(value=_value()), region="operate"))
+    panels = ck.manifest(CRED)["panels"]
+    assert _boards(ck) == [BOARD_DEFAULT_ID] and panels[BOARD_DEFAULT_ID]["title"] == "Theirs"
+    assert not ck._board_yields                       # theirs does not yield to anything
+
+
+def test_an_invalid_board_under_the_kernels_id_is_refused_and_leaves_the_kernels_board() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    _attach(ck)
+    with pytest.raises(CockpitRegistrationError):
+        ck.register(ProviderSpec(BOARD_DEFAULT_ID, "board", "Bad", "nonsense", lambda c: Read(value=_value()), region="operate"))
+    assert ck.manifest(CRED)["panels"][BOARD_DEFAULT_ID]["title"] == "Work board"
+
+
+def test_no_board_is_drawn_when_the_server_attaches_none() -> None:
+    ck = Cockpit()
+    ck.attach_server(None, lambda now: None, board=None)
+    assert _boards(ck) == []
+
+
+def test_a_failed_attach_leaves_no_kernel_board_behind(monkeypatch) -> None:
+    ck = Cockpit()
+
+    def refuse(spec: ProviderSpec) -> None:
+        raise CockpitRegistrationError("refused")
+
+    monkeypatch.setattr(ck, "_register_locked", refuse)
     with pytest.raises(CockpitRegistrationError):
         ck.attach_server(None, lambda now: None, board=lambda: _value())
-    assert _boards(ck) == [] and not ck._board_yields
+    assert _boards(ck) == [] and not ck._board_yields and ck._board_read is None
 
 
 # --- the page ------------------------------------------------------------------------------------

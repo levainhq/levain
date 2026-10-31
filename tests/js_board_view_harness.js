@@ -75,8 +75,30 @@ function dropButtons() {
   out.words = globalThis.LevainBoardView.dropWords({ id: "x:1", title: "T" });
   return out;
 }
+// drop_here: absent (a provider's board) and true draw the buttons; false draws none, in both bodies. A 1000-char title (and id)
+// is the longest a validated card can carry: the words a drop starts with are measured.
+function dropHere() {
+  globalThis.LevainDashboard = { composeDrop: () => true };
+  load();
+  const V = globalThis.LevainBoardView;
+  const count = (extra) => {
+    const model = V.boardModel(Object.assign({}, BODY, extra));
+    const g = node("div"), c = node("div");
+    V.renderGrouped(doc, g, model);
+    V.renderBoard(doc, c, model);
+    return [walk(g).filter((n) => n.className === "bd-drop").length, walk(c).filter((n) => n.className === "bd-drop").length];
+  };
+  const a = count({}), t = count({ drop_here: true }), f = count({ drop_here: false });
+  delete globalThis.LevainDashboard;
+  load();
+  return { absent: a[0], true: t[0], false: f[0], falseCols: f[1] };
+}
+const hereOut = dropHere();
+const longTitleWords = globalThis.LevainBoardView.dropWords({ id: "i".repeat(1000), title: "t".repeat(1000) });
 load();
 const V = globalThis.LevainBoardView;
 const out = { exports: Object.keys(V).sort(), filtering: filtering(V), grouped: grouped(V) };
 out.drop = dropButtons();
+out.dropHere = hereOut;
+out.longTitleWords = longTitleWords;
 console.log(JSON.stringify(out));

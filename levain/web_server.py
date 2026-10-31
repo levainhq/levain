@@ -1134,7 +1134,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/card_format.js": ("card_format.js", "text/javascript; charset=utf-8"),
     # The thread view (CH-U1a): the Build tab's Threads zone, over GET /cockpit/threads.json and /cockpit/thread/<id>.json.
     "/thread_view.js": ("thread_view.js", "text/javascript; charset=utf-8"),
-    # The read-only ready-queue board (C12): the Board tab's zone, over GET /cockpit/board.json.
+    # The board painters (C12): the board-kind panel's grouped tab and its six columns draw with these. GET /cockpit/board.json
+    # is served for external readers; no page zone reads it.
     "/board_view.js": ("board_view.js", "text/javascript; charset=utf-8"),
 }
 
@@ -1463,7 +1464,21 @@ def _board_value(server: Any, *, stamped: bool = True) -> dict[str, Any]:
 
         directory = reader.directory if reader.directory is not None else default_queue_dir()
     value = cockpit_board.build(directory, getattr(server, "question_store", None))
+    value["drop_here"] = _drop_files_here(server, directory)
     return value if stamped else {**value, "generated": None}
+
+
+def _drop_files_here(server: Any, directory: Any) -> bool:
+    """Whether "Drop about this card" files to the coordinator that reads THIS board's store: the drop route posts through the
+    coord sheet's queue, the board reads the consent reader's, and the two can differ (see where the grant route is decided).
+    No coord sheet, no board directory, or two different directories: False."""
+    sheet = getattr(server, "coord_sheet", None)
+    if sheet is None or directory is None:
+        return False
+    try:
+        return Path(directory).resolve() == Path(sheet.queue_dir).resolve()
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 class _LevainHTTPServer(ThreadingHTTPServer):
@@ -1543,6 +1558,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # the consent family's answer and ruling (OS-2), built by make_server beside grant_phone, under its condition; None
     # serves no consent signing route
     consent_sheet: "ConsentSheet | None" = None
+    # whether the cockpit draws levain's own Work board when no provider brings one (make_server's work_board)
+    work_board: bool = True
     # the dispatch family's sign, cancel and authorise (OS-2), built by make_server beside the Signer; None serves no
     # dispatch signing route
     dispatch_sheet: "DispatchSheet | None" = None
@@ -1605,7 +1622,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                     edits=broker.edits if broker is not None else None,
                     decision_rows=broker.decision_rows if broker is not None else None,
                     questions=getattr(self, "question_store", None), notes=getattr(self, "note_store", None),
-                    board=lambda: _board_value(self, stamped=False))
+                    board=(lambda: _board_value(self, stamped=False)) if self.work_board else None)
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -3774,6 +3791,7 @@ def make_server(
     extra_hosts: "Iterable[str] | None" = None,
     compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None,
     coordinator_verbs: bool = False,
+    work_board: bool = True,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -3810,6 +3828,9 @@ def make_server(
     downstream T2/T3 verb applies through, and its ``canonical_effect``), which the broker fires. One
     naming a verb outside ``extra_verbs`` or a kernel verb, or failing ``Broker.check_downstream``,
     raises ``ValueError`` before binding. A T2/T3 downstream verb with none answers ``not_built``.
+
+    ``work_board=False`` draws no Work board of levain's own: an embedder with no board of its own gets none (a board a
+    provider registers still draws; the built-in is only the default when none does).
 
     ``coordinator_verbs`` says a coordinator watcher runs beside this server: only then, over a write scope, are the
     Coordinator panel's Start / Stop / Hold registered (a caller's verb or effect under one of their names is then a
@@ -4148,6 +4169,7 @@ def make_server(
     # Its start() (refresher threads) is the caller's when it passes its own. Nothing is attached to it
     # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
+    httpd.work_board = work_board
     httpd.verb_registry = verb_registry
     httpd._cockpit_lock = threading.Lock()
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
@@ -4294,7 +4316,8 @@ def make_server(
                 decision_rows=broker.decision_rows if broker is not None else None,
                 questions=httpd.question_store,                 # and the questions they ask him (Q-2b)
                 notes=httpd.note_store,                         # and what they tell him (notes)
-                board=lambda: _board_value(httpd, stamped=False))              # the Work board, unless a provider brings its own
+                # the Work board, unless a provider brings its own or the embedder asked for none (work_board=False)
+                board=(lambda: _board_value(httpd, stamped=False)) if httpd.work_board else None)
     except BaseException:
         # the cockpit put itself back (attach_server); this server's pin is released: it never served
         try:

@@ -29,6 +29,9 @@
       queue: body.queue || "none",
       note: body.note || "",
       hint: body.band_hint || "levain band",
+      // false only when levain's own board says its drop route files to another coordinator than the one this board reads; a
+      // provider's board is the coordinator's own work and says nothing, which reads as true
+      dropHere: body.drop_here !== false,
       unreadable: Array.isArray(body.unreadable) ? body.unreadable.map(String) : [],
       columns: ORDER.map(function (name) {
         var c = cols[name] || { cards: [] };
@@ -111,7 +114,8 @@
     b.addEventListener("click", function () { D.composeDrop(dropWords(k)); });
     return b;
   }
-  function drawDrop(doc, host, k) {
+  function drawDrop(doc, host, k, model) {
+    if (model && model.dropHere === false) return;      // the drop box would file to a coordinator that is not this board's
     var b = dropButton(doc, k);
     if (b) host.appendChild(b);
   }
@@ -154,7 +158,7 @@
         if (k.malformed) row.appendChild(el(doc, "div", "bd-held", "not well formed (no done line or tier)"));
         if (k.unknownCategory) row.appendChild(el(doc, "div", "bd-held", "unknown category: " + k.unknownCategory));
         if (!k.band && k.journal) row.appendChild(el(doc, "div", "bd-journal", k.journal));
-        drawDrop(doc, row, k);
+        drawDrop(doc, row, k, model);
         wrap.appendChild(row);
       });
     });
@@ -186,7 +190,7 @@
         if (k.malformed) card.appendChild(el(doc, "div", "bd-held", "not well formed (no done line or tier)"));
         if (k.unknownCategory) card.appendChild(el(doc, "div", "bd-held", "unknown category: " + k.unknownCategory));
         if (!k.band && k.journal) card.appendChild(el(doc, "div", "bd-journal", k.journal));
-        drawDrop(doc, card, k);
+        drawDrop(doc, card, k, model);
         c.appendChild(card);
       });
       wrap.appendChild(c);
