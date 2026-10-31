@@ -220,7 +220,8 @@ class CoordPhone:
 
     def listing(self) -> dict[str, Any]:
         """The ``coord_*`` keys of ``/consent.json``: the newest phone drops with their receipts, the repos an
-        envelope may name, and who may sign one. A store that cannot be read is ``coord_note``, never an empty list
+        envelope may name (``coord_repos``: the open threads' folders by their latest activity, newest first, then
+        the folders the newest drops came from), and who may sign one. A store that cannot be read is ``coord_note``, never an empty list
         alone; no store yet is no drops and no note."""
         signers, signer_note = self._signers()
         # coord_store_read False: the identity is unknown, and the page sends nothing until it reads one
@@ -236,7 +237,13 @@ class CoordPhone:
             drops = [d for d in store.drops(limit=200) if d.surface == "phone"][:DROPS_SHOWN]
             out["coord_drops"] = [self.drop_record(store, d.drop_id) for d in drops]
             repos: list[str] = []
-            for t in store.threads():
+            # the threads' folders newest activity first (the latest of a thread's creation, revisions, events and
+            # replies; a tie keeps the newer thread first): a page that offers the first folder as its default offers
+            # the folder of the thread most recently active
+            active = store.thread_activity()
+            threads = list(enumerate(store.threads()))
+            threads.sort(key=lambda it: (active.get(it[1].thread_id, it[1].created_at), it[0]), reverse=True)
+            for _i, t in threads:
                 if t.repo and t.repo not in repos:
                     repos.append(t.repo)
             for d in store.drops(limit=200):
@@ -433,8 +440,9 @@ class CoordPhone:
             self._reviews[review_id] = {"device": device, "body": body, "outbox_id": req["outbox_id"],
                                         "signer_fp": key.fingerprint, "store_id": bound,
                                         "until": now + REVIEW_TTL}
+        # stop_at: the hard stop as this review computed it (from now, not from Sign), which the form shows in local time
         return {"review_id": review_id, "body_text": text, "digest": env.envelope_digest(body), "rp_id": self.rp_id,
-                "view": ccli._view(body, store, words=words).split("\n"),
+                "view": ccli._view(body, store, words=words).split("\n"), "stop_at": body["stop_at"],
                 "store_id": bound, "store_created": created}
 
     def _challenge(self, req: dict[str, Any], device: str) -> dict[str, Any]:

@@ -8,13 +8,19 @@
 //
 // A review can create the store: on a fresh install the first review makes it, and only its reply carries the store's identity.
 // So while o.storeId() is null reviews are asked one at a time (the next goes out only after the one in flight returned), and a
-// 409 other_store is asked once more after o.refreshStore() has let the page adopt the identity it was missing.
+// 409 other_store to a review sent with NO store id is asked once more after o.refreshStore() has let the page adopt the identity
+// it was missing. A review sent WITH a store id that draws other_store is never retried: the page was opened for another store,
+// and taking the one answering now would sign into a store the person never chose. The form says so and stops asking.
+//
+// The hard stop is computed by the server when it reads the review, so the summary says the time it lands on, and a summary that
+// has stood for REVIEW_MAX_AGE_MS is read again (never while signing, and never by the Sign tap itself: an await before the
+// passkey call can cost the browser's user activation).
 //
 // The page passes:
 //   o.words        the textarea of the person's words (the page owns it); o.wordsGroup: draw it inside a "Your words" group here
 //   o.left, o.right  where the groups go (the same element for one column)
 //   o.repos        the known folders; setRepos() takes a later listing
-//   o.review({words, spec})  a promise of {ok, status, body}, the server's reading; o.why(reply): its refusal in words
+//   o.review({words, spec})  a promise of {ok, status, body}, the server's reading (body.view, body.stop_at); o.why(reply): its refusal in words
 //   o.storeId()    the store identity the page holds now, or null on a fresh install; o.refreshStore(): a promise, the page re-reads it
 //   o.blocked()    "" or the reason nothing can be signed (shown as the summary)
 //   o.sign         the sign button. It is enabled only while ALL of these hold: no signing is under way (lock(true) not called),
@@ -50,6 +56,33 @@
   const OTHER = "\u0000other";
   const baseName = (p) => p.replace(/\/+$/, "").split("/").pop() || p;
   const whyDefault = (r) => ((r.body && typeof r.body.message === "string" && r.body.message.replace(/[.\s]+$/, "")) || ("refused (HTTP " + r.status + ")"));
+  // the server ends a refusal with what did not happen; before any signing that is always so, and the form says what to do instead
+  const bare = (m) => String(m).replace(/[.\s]+$/, "").replace(/\s*[:;,]\s*(nothing was signed|the drop was not delivered)$/i, "").replace(/[.\s]+$/, "");
+  const REVIEW_MAX_AGE_MS = 5 * 60000;
+  const AGE_CHECK_MS = 10000;
+  const MOVED = "This sheet was opened for a different Levain store than the one answering now. Reload the page to see the current store; nothing was signed.";
+  const NO_STORE = "Levain has not said which store answers here yet. Reload the page to read it again; nothing was signed.";
+  const EMPTY = "The server sent an empty summary; nothing can be signed. Change anything to ask again.";
+  const NO_ANSWER = "The cockpit did not answer; change anything to ask again.";
+  // a promise of what f returns; a throw becomes a rejection, so a caller's handlers see it
+  const attempt = (f) => { try { return Promise.resolve(f()); } catch (e) { return Promise.reject(e); } };
+  // the server's fixed-width UTC stamp ("2026-10-31T12:00:00.000000Z") as a Date, read field by field so no browser's parser decides
+  const stampDate = (t) => {
+    const m = typeof t === "string" ? /^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?Z$/.exec(t) : null;
+    return m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6])) : null;
+  };
+  // the stop in the person's own clock: "14:05", or "14:05 tomorrow"
+  const localStop = (d) => {
+    const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return d.toDateString() === new Date(Date.now()).toDateString() ? hm : hm + (d.getTime() > Date.now() ? " tomorrow" : "");
+  };
+  // the server's reading as lines to show, or null when there is nothing to show (an empty, null or missing view)
+  const viewText = (view) => {
+    if (typeof view === "string") return view.trim() ? view : null;
+    if (!Array.isArray(view) || !view.length || !view.every((x) => typeof x === "string")) return null;
+    const t = view.join("\n");
+    return t.trim() ? t : null;
+  };
 
   function create(o) {
     const words = o.words;
@@ -63,6 +96,8 @@
     let working = false;
     let seq = 0, timer = null;
     let inflight = false, waiting = null;
+    let stuck = "";                 // set once the store answering is not the one this sheet was opened for: nothing is asked again
+    let ageTimer = null;            // the one timer that re-reads a summary older than REVIEW_MAX_AGE_MS
     let started = false;
     let touchedRepo = false;
     let n = 0;
@@ -94,6 +129,7 @@
       if (current) return "";
       if (state.kind === "bad") return state.text;
       if (state.kind === "refused") return "The server refused this envelope; its message is on the form.";
+      if (state.kind === "stuck") return stuck;
       return "Waiting for the server's reading of what you would sign.";
     };
     const syncSign = () => {
@@ -128,14 +164,17 @@
     describe(repo, repoHint.id);
     repoOther.append(repo, repoHint);
     const pickHolder = el("div", "");
-    // the pre-pick (the folder of the newest thread) is said aloud until the person chooses or types
-    const repoDefault = el("p", "env-hint", "Pre-picked: the folder of your newest thread. Change it if that's wrong.");
+    // the pre-pick (the listing's first folder: the most recently active thread's) is named aloud until the person chooses or types
+    const repoDefault = el("p", "env-hint", "");
     repoDefault.id = "env-repo-default";
     gRepo.append(pickHolder, repoDefault, repoOther);
     let repoList = [];
     let repoSel = OTHER;
     let repoPaint = () => undefined;
-    const paintDefault = () => { repoDefault.hidden = touchedRepo || !repoList.length || repoSel === OTHER; };
+    const paintDefault = () => {
+      repoDefault.hidden = touchedRepo || !repoList.length || repoSel === OTHER;
+      repoDefault.textContent = repoDefault.hidden ? "" : "Pre-picked: " + baseName(repoSel) + " (" + repoSel + "), the folder of your most recently active thread. Change it if that's wrong.";
+    };
     const setRepo = (v) => { repoSel = v; repoOther.hidden = v !== OTHER; repoPaint(); paintDefault(); };
     const pick = (v) => { touchedRepo = true; setRepo(v); changed(); };
     // the folders again (a page that reads its listing more than once): drawn only when they changed, the choice kept while it
@@ -179,7 +218,7 @@
           pickHolder.appendChild(sel);
         }
       }
-      // the listing puts the threads' own folders first; the only one is the first
+      // the listing puts the threads' own folders first, the most recently active first; the pick is the first
       const keep = repoSel === OTHER ? touchedRepo : repoList.indexOf(repoSel) >= 0;
       const before = repoSel;
       setRepo(keep ? repoSel : (repoList.length ? repoList[0] : OTHER));
@@ -255,7 +294,7 @@
       custom.appendChild(w);
       return w;
     };
-    infield("drop-stop", "Hard stop after", "this long after you sign, it stops no matter what", stop);
+    infield("drop-stop", "Hard stop after", "counted from when the summary is read, not from when you sign; it stops no matter what", stop);
     for (const h of STOPS) stop.appendChild(el("option", "", h));
     for (const [k, key, label, noun, hint] of [
       ["hours", "hours", "Active hours", "active hours", "time agents are actually working, not the clock"],
@@ -381,65 +420,100 @@
       summary.textContent = z.length ? text + "\n\nWarning: " + z.join("; ") + "." : text;
       summary.classList.toggle("env-wait", !!wait);
     };
+    const noAge = () => { clearInterval(ageTimer); ageTimer = null; };
+    // a summary over REVIEW_MAX_AGE_MS old is read again, so the hard stop it states is never long past; never while signing
+    const watchAge = () => {
+      noAge();
+      ageTimer = setInterval(() => {
+        if (working || !current) { noAge(); return; }
+        if (Date.now() - current.readAt >= REVIEW_MAX_AGE_MS) { noAge(); queue(0); }
+      }, AGE_CHECK_MS);
+    };
+    window.addEventListener("pagehide", noAge);
+    const stopLine = (c, v) => {
+      const at = stampDate(c.body.stop_at);
+      return at ? "Hard stop at " + localStop(at) + ": set when this summary was read, " + v.spec.stop + " from then (a summary over 5 minutes old is read again)." : "";
+    };
+    const say = (kind, text) => { state = { kind: kind, text: text }; showReview(text, true); syncSign(); };
     // any change to the form: the review in hand is no longer the form's, and a new one is asked for once the typing settles
     function queue(ms) {
       current = null;
+      noAge();
       seq += 1;
       waiting = null;
       clearTimeout(timer);
       clearErrs();
       live.textContent = "";
+      if (stuck) { say("stuck", stuck); return; }
       const b = blocked();
       if (working || b) { state = { kind: "bad", text: "" }; showReview(b, true); syncSign(); return; }
       const v = specNow();
-      if (v.bad) { state = { kind: "bad", text: v.bad }; showReview(v.bad, true); syncSign(); return; }
+      if (v.bad) { say("bad", v.bad); return; }
       state = { kind: "reading" };
       showReview("Reading what you would sign…", true);
       syncSign();
       const mineSeq = seq;
-      timer = setTimeout(() => { if (!working && mineSeq === seq) ask(v, mineSeq, false); }, ms === undefined ? (o.debounce === undefined ? 500 : o.debounce) : ms);
+      timer = setTimeout(() => { if (!working && mineSeq === seq) ask(v, mineSeq); }, ms === undefined ? (o.debounce === undefined ? 500 : o.debounce) : ms);
     }
     function next() {
       inflight = false;
-      if (waiting) { const w = waiting; waiting = null; ask(w.v, w.mineSeq, false); }
+      if (waiting) { const w = waiting; waiting = null; ask(w.v, w.mineSeq); }
     }
-    function ask(v, mineSeq, retried) {
-      if (mineSeq !== seq) return;
+    function ask(v, mineSeq) {
+      if (mineSeq !== seq) { if (!inflight && waiting) next(); return; }
       if (inflight && storeNull()) { waiting = { v: v, mineSeq: mineSeq }; return; }      // one at a time until the store has an identity
       inflight = true;
-      o.review({ words: v.words, spec: v.spec }).then((c) => {
-        if (mineSeq !== seq) { next(); return; }          // the form moved on while this was read: the newer one speaks
-        if (!c.ok && c.status === 409 && c.body && c.body.error === "other_store" && !retried) {
-          // the page named a store identity that was not yet the store's (a first drop or review made it): adopt it, ask once more
-          Promise.resolve(typeof o.refreshStore === "function" ? o.refreshStore() : null).then(() => { inflight = false; ask(v, mineSeq, true); }, () => { inflight = false; ask(v, mineSeq, true); });
-          return;
+      // the slot is released once, after every way this request (and its one retry) can end, a throw included
+      send(v, mineSeq, false).catch(() => { if (mineSeq === seq) say("bad", NO_ANSWER); }).finally(next);
+    }
+    // one review request and what its reply means; resolves when it (and any retry) is done
+    function send(v, mineSeq, retried) {
+      const sentNull = storeNull();         // read in the same turn the page reads its store id for the request
+      return attempt(() => o.review({ words: v.words, spec: v.spec })).then((c) => {
+        if (mineSeq !== seq) return undefined;          // the form moved on while this was read: the newer one speaks
+        if (!c || typeof c !== "object" || !c.body || typeof c.body !== "object") { say("bad", c && c.ok ? EMPTY : NO_ANSWER); return undefined; }
+        if (!c.ok && c.status === 409 && c.body.error === "other_store") {
+          // sent with a store id: the store answering is another one. Refused, and never asked again from this sheet
+          if (!sentNull) { stuck = MOVED; say("stuck", stuck); return undefined; }
+          // sent with none (a fresh install whose store was made meanwhile): read the store's identity, then ask once more
+          if (retried) { stuck = NO_STORE; say("stuck", stuck); return undefined; }
+          const read = typeof o.refreshStore === "function" ? attempt(() => o.refreshStore()) : Promise.resolve();
+          return read.then(() => undefined, () => undefined).then(() => {
+            if (mineSeq !== seq) return undefined;
+            if (storeNull()) { stuck = NO_STORE; say("stuck", stuck); return undefined; }      // asking again would draw the same 409
+            return send(v, mineSeq, true);
+          });
         }
         if (!c.ok) {
-          const m = why(c);
+          const m = bare(why(c));
           state = { kind: "refused" };
           showReview("This cannot be signed yet.", true);
           const g = namedGroup(c.body) || gSum;
-          g.err.textContent = (g === gSum ? "The server refused this envelope: " : "") + m;
+          const down = c.status === 0 || c.status >= 500;      // the cockpit's own fault: asking again may work
+          g.err.textContent = down ? "The cockpit could not read this envelope (" + m + "); change anything to ask again."
+            : (g === gSum ? "The server refused this envelope: " : "") + m;
           g.err.hidden = false;
           syncSign();
           if (typeof g.scrollIntoView === "function") g.scrollIntoView({ block: "nearest" });
-          next();
-          return;
+          return undefined;
         }
-        const text = Array.isArray(c.body.view) ? c.body.view.join("\n") : "";
-        current = { id: c.body.review_id, body_text: c.body.body_text, digest: c.body.digest, words: v.words, spec: v.spec, reply: c };
-        showReview(text, false);
+        // nothing is signed on a reading the person was not shown
+        const text = viewText(c.body.view);
+        if (text === null || typeof c.body.review_id !== "string" || !c.body.review_id) { say("bad", EMPTY); return undefined; }
+        current = { id: c.body.review_id, body_text: c.body.body_text, digest: c.body.digest, words: v.words, spec: v.spec, reply: c, readAt: Date.now() };
+        const sl = stopLine(c, v);
+        showReview(sl ? text + "\n\n" + sl : text, false);
         live.textContent = summary.textContent;
         syncSign();
-        next();
-      }, () => {
-        if (mineSeq === seq) { state = { kind: "bad", text: "The cockpit did not answer; change anything to ask again." }; showReview(state.text, true); syncSign(); }
-        next();
-      });
+        watchAge();
+        return undefined;
+      }, () => { if (mineSeq === seq) say("bad", NO_ANSWER); return undefined; });
     }
     // a control held still while a signing is under way; the page says when
     function lock(on) {
       working = on;
+      if (on) noAge();
+      else if (current) watchAge();
       for (const root of lockRoots) for (const x of root.querySelectorAll("input, select, textarea")) x.disabled = on;
       syncSign();
     }

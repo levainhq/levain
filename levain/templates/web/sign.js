@@ -807,7 +807,8 @@
     const form = window.LevainEnvelopeForm.create({
       words: words, wordsGroup: true, left: colL, right: colR, lockRoots: [grid], repos: got.coord_repos, sign: sign, signWhy: signWhy, why: why,
       storeId: () => storeId,
-      refreshStore: () => readDrops().then((g) => { if (g && typeof g.coord_store_id === "string") storeId = g.coord_store_id; }),
+      // asked only after a review sent with no store id: a store identity the page already holds is never replaced
+      refreshStore: () => readDrops().then((g) => { if (storeId === null && g && typeof g.coord_store_id === "string") storeId = g.coord_store_id; }),
       blocked: () => (cannot ? "Envelope: " + cannot : why0),
       review: (req) => {
         const k = keyNow();
@@ -832,9 +833,11 @@
     let pending = null;            // a signed drop whose reply did not come back: sent again unchanged, never re-signed
     const queue = (ms) => form.queue(ms);
     const changed = () => form.changed();
+    let ksel = null;               // the signing key's picker, when this device holds several
     const lock = (on) => {
       working = on;
       send.disabled = on;
+      if (ksel) ksel.disabled = on;          // the key a signing under way uses is the one shown
       words.disabled = on;
       form.lock(on);
     };
@@ -891,7 +894,8 @@
         const dd = Array.isArray(g.coord_drops) ? g.coord_drops : [];
         list.textContent = dd.map(dropLine).join("\n");
         list.hidden = !dd.length;
-        if (typeof g.coord_store_id === "string") storeId = g.coord_store_id;
+        // the store this sheet is bound to is kept: a listing that names another one never re-binds it
+        if (storeId === null && typeof g.coord_store_id === "string") storeId = g.coord_store_id;
       });
     };
     const refusal = (a, nothing) => say(nothing + ": " + why(a), "bad");
@@ -961,7 +965,7 @@
     const pool = known.length ? known : signers;
     let keyFp = pool[0];
     if (pool.length > 1) {
-      const ksel = el("select");
+      ksel = el("select");
       ksel.id = "drop-key";
       ksel.setAttribute("aria-label", "the passkey to sign with");
       for (const fp of pool) { const o = el("option", "", fp.slice(0, 18) + "…"); o.value = fp; o.title = fp; ksel.appendChild(o); }

@@ -29,7 +29,7 @@ def test_the_size_table_lives_only_in_the_envelope_form() -> None:
 
 
 REPOS = ["/work/alpha", "/work/beta", "/work/gamma"]
-VIEW_LINES = ["envelope ev-test", "it may work in the folder you chose"]
+VIEW_LINES = ["envelope ev-test", "it may work in the folder you chose", "digest sha256:" + "0123456789abcdef" * 12]   # one long unbroken line
 
 # The page's two reads are answered inside it. CFG sets how the fake server behaves: store (the listing's store id, None for a fresh
 # install), hold (how many first reviews are held until the test releases them), strict (a review that names no store while another
@@ -45,15 +45,26 @@ INIT_JS = """(() => {
   top.__conflicts = top.__conflicts || 0;
   top.__holdLeft = top.__holdLeft === undefined ? CFG.hold : top.__holdLeft;
   top.__nullOut = top.__nullOut || 0;
+  top.__forced = top.__forced || 0;
+  top.__frameLists = top.__frameLists || 0;
+  top.__heldList = top.__heldList || [];
+  top.__skew = top.__skew || 0;
+  const realNow = Date.now.bind(Date);
+  Date.now = () => realNow() + (top.__skew || 0);
   const reply = (status, o) => new Response(JSON.stringify(o), {status: status, headers: {'Content-Type': 'application/json'}});
   const json = (o) => Promise.resolve(reply(200, o));
   try { navigator.credentials.get = () => new Promise(() => undefined); } catch (e) { /* the page's own */ }
   window.fetch = (u, o) => {
     const url = String(u);
     if (url.indexOf('/cockpit/coord/drops.json') >= 0) {
-      return json({coord_drops: [], coord_note: null, coord_repos: __REPOS__, coord_store_id: CFG.store, coord_store_read: true,
-                   coord_signers: ['SHA256:abcdefabcdefabcdefabcdef'], coord_signer_note: null, origin: location.origin,
-                   rp_id: location.hostname, credentials: {}});
+      const sheet = window !== top;
+      if (sheet) top.__frameLists += 1;
+      const later = sheet && top.__frameLists > 1;
+      const body = {coord_drops: [], coord_note: null, coord_repos: __REPOS__, coord_store_id: later && 'storeAfter' in CFG ? CFG.storeAfter : CFG.store,
+                    coord_store_read: true, coord_signers: ['SHA256:abcdefabcdefabcdefabcdef'], coord_signer_note: null, origin: location.origin,
+                    rp_id: location.hostname, credentials: {}};
+      if (later && CFG.holdList) return new Promise((r) => top.__heldList.push(() => r(reply(200, body))));
+      return json(body);
     }
     if (url.indexOf('/cockpit/coord/envelope-challenge') >= 0) {
       top.__challenges.push(JSON.parse(o.body));
@@ -69,9 +80,24 @@ INIT_JS = """(() => {
         top.__conflicts += 1;
         return Promise.resolve(reply(409, {error: 'other_store', message: 'this page read another Levain store'}));
       }
-      if (CFG.refuse) return Promise.resolve(reply(422, Object.assign({error: 'refused', message: CFG.refuse.message}, CFG.refuse.extra || {})));
-      const ok = () => ({review_id: 'rv-' + n, body_text: 'BODY' + n, digest: 'dg', rp_id: location.hostname,
-        view: __VIEW__.concat(['review ' + n]), store_id: nullStore ? 'st-new' : b.store_id, store_created: nullStore});
+      if (top.__forced < (CFG.conflictFirst || 0) || (CFG.serverStore && typeof b.store_id === 'string' && b.store_id !== CFG.serverStore)) {
+        top.__forced += 1;
+        top.__conflicts += 1;
+        return Promise.resolve(reply(409, {error: 'other_store', message: 'this page read another Levain store'}));
+      }
+      if (CFG.refuse) return Promise.resolve(reply(CFG.refuse.status || 422, Object.assign({error: 'refused', message: CFG.refuse.message}, CFG.refuse.extra || {})));
+      const bad = n <= (CFG.badFirst || 0);
+      if (bad && 'rawBody' in CFG) return Promise.resolve(new Response(CFG.rawBody, {status: 200, headers: {'Content-Type': 'application/json'}}));
+      // the hard stop as the server computes it: from the review, in its fixed-width UTC form
+      const hours = parseInt((b.spec && b.spec.stop) || '2', 10);
+      const stopAt = new Date(Date.now() + hours * 3600000).toISOString().slice(0, 19) + '.000000Z';
+      top.__lastStopAt = stopAt;
+      const ok = () => {
+        const r = {review_id: 'rv-' + n, body_text: 'BODY' + n, digest: 'dg', rp_id: location.hostname, stop_at: stopAt,
+                   view: __VIEW__.concat(['review ' + n]), store_id: nullStore ? 'st-new' : b.store_id, store_created: nullStore};
+        if (bad && 'view' in CFG) { if (CFG.view === 'missing') delete r.view; else r.view = CFG.view; }
+        return r;
+      };
       if (nullStore) top.__nullOut += 1;
       if (top.__holdLeft > 0) {
         top.__holdLeft -= 1;
@@ -85,8 +111,11 @@ INIT_JS = """(() => {
 })()"""
 
 
-def make_init(store: "str | None" = "st-1", hold: int = 0, strict: bool = False, refuse: "dict | None" = None, challenge: str = "ok") -> str:
-    cfg = {"store": store, "hold": hold, "strict": strict, "refuse": refuse, "challenge": challenge}
+def make_init(store: "str | None" = "st-1", hold: int = 0, strict: bool = False, refuse: "dict | None" = None, challenge: str = "ok", **more) -> str:
+    # more: conflictFirst (the first n reviews are refused other_store), serverStore (a review naming another store is refused
+    # other_store), storeAfter (the sheet's later listing reads name this store), holdList (those reads are held until released),
+    # badFirst with view (the first n reviews carry this view; "missing" leaves it out) or rawBody (they answer 200 with this text)
+    cfg = {"store": store, "hold": hold, "strict": strict, "refuse": refuse, "challenge": challenge, **more}
     return (INIT_JS.replace("__CFG__", json.dumps(cfg)).replace("__REPOS__", json.dumps(REPOS)).replace("__VIEW__", json.dumps(VIEW_LINES)))
 
 
@@ -229,7 +258,7 @@ def test_each_size_and_landing_sends_exactly_its_spec_and_custom_starts_from_the
     t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
     assert t["standard"]["spec"] == STANDARD and t["standard"]["n"] == 1, t["standard"]
     assert t["btn0"]["disabled"] is False and t["btn0"]["text"] == "Sign with your passkey" and t["btn0"]["custom"] is True, t["btn0"]
-    assert t["btn0"]["review"] == "\n".join(VIEW_LINES + ["review 1"]), t["btn0"]                    # the server's reading, as sent
+    assert t["btn0"]["review"].startswith("\n".join(VIEW_LINES + ["review 1"]) + "\n\nHard stop at "), t["btn0"]   # the server's reading, as sent
     assert t["quick"]["spec"] == {**STANDARD, "stop": "2h", "budget": {"tool_calls": 200, "tokens": 2000000, "hours": 1}}, t["quick"]
     assert t["long"]["spec"] == {**STANDARD, "stop": "24h", "budget": {"tool_calls": 2500, "tokens": 25000000, "hours": 8}}, t["long"]
     assert t["main"]["spec"]["lands"] == [{"repo": "/work/alpha", "onto": "main"}], t["main"]
@@ -427,7 +456,7 @@ def test_the_form_says_what_each_limit_counts_and_what_happens_next(tmp_path: Pa
     text = _tagged(_run(tmp_path, monkeypatch, "1280", steps))["text"]["text"]
     for want in ("An envelope is a permission slip you sign: which folder it may work in, whether it may land, for how long, and how much it may do.",
                  "The limits count across the whole thread, all its workers together; extending sets a new total.",
-                 "Hard stop after", "this long after you sign, it stops no matter what",
+                 "Hard stop after", "counted from when the summary is read, not from when you sign",
                  "fresh tokens: input, output and new cache writes (cache reads don't count)",
                  "These numbers are starting points",
                  "Reaching a limit: no new workers start until you extend. Nothing running is killed.",
@@ -445,13 +474,19 @@ def test_a_refusal_goes_where_the_server_named_it_else_under_the_summary_and_the
              "btn: d.getElementById('drop-sign').disabled, why: d.getElementById('drop-sign-why').textContent,"
              "by: d.getElementById('drop-sign').getAttribute('aria-describedby')};")
     msg = "budget.tokens is an integer from 0 to 1000000000"
-    for name, refuse, parent in (("plain", {"message": msg}, "env-sum"), ("named", {"message": msg, "extra": {"field": "budget"}}, "env-size")):
+    # the server's words end in its own ": nothing was signed", which the form does not repeat; a 5xx is the cockpit's fault, so
+    # the person is told how to ask again
+    for name, refuse, parent in (("plain", {"message": msg + ": nothing was signed."}, "env-sum"),
+                                 ("named", {"message": msg, "extra": {"field": "budget"}}, "env-size"),
+                                 ("down", {"message": msg + ": the drop was not delivered", "status": 503}, "env-sum")):
         sub = tmp_path / name
         sub.mkdir()
         steps = _open_from_cockpit("1280", make_init(refuse=refuse), wait=False) + [
             {"until": _in(FD, "return /cannot be signed/.test(" + SUMMARY + ");"), "ms": 10000}, _tag("refused", FD, probe)]
         r = _tagged(_run(sub, monkeypatch, "1280", steps))["refused"]
         assert len(r["where"]) == 1 and r["where"][0].startswith(parent + ": ") and msg in r["where"][0], r
+        assert "nothing was signed" not in r["where"][0] and "was not delivered" not in r["where"][0], r
+        assert ("change anything to ask again" in r["where"][0]) is (name == "down"), r
         assert r["btn"] is True and r["why"] and r["by"] == "drop-sign-why", r
     steps = _open_from_cockpit("1280") + [_set(FD, "#drop-words", ""), _tag("empty", FD, probe)]
     sub = tmp_path / "empty"
@@ -480,7 +515,113 @@ def test_the_repo_default_is_said_aloud_until_the_person_chooses_or_types(tmp_pa
         sub = tmp_path / name
         sub.mkdir()
         t = _tagged(_run(sub, monkeypatch, "1280", _open_from_cockpit("1280") + [_tag("before", FD, probe), step, _tag("after", FD, probe)]))
-        assert t["before"]["text"] == "Pre-picked: the folder of your newest thread. Change it if that's wrong." and t["before"]["shown"], t["before"]
+        # the listing's first folder is the most recently active thread's; the hint names it
+        assert t["before"]["text"] == "Pre-picked: alpha (/work/alpha), the folder of your most recently active thread. Change it if that's wrong." and t["before"]["shown"], t["before"]
         assert t["after"]["shown"] is False, t["after"]
         if name == "typed":
             assert t["after"]["checked"] == ["/work/alpha"], t["after"]      # typing marks the choice as the person's, it does not move the pick
+
+
+# ---- the store a sheet is bound to, a reply that cannot be signed, a stuck "Reading…", and the hard stop's time ----
+
+def _top_eval(js: str) -> dict:
+    return {"eval": "(() => { " + js + " })()"}
+
+
+STORES = "window.__reviews.map((r) => r.store_id)"
+SIGN_OFF = "d.getElementById('drop-sign').disabled"
+
+
+@needs_browser
+@needs_ssh
+def test_a_fresh_install_whose_first_review_meets_a_store_reads_it_and_asks_once_more(tmp_path: Path, monkeypatch) -> None:
+    # sent with no store id: the store was made meanwhile, so the page reads its identity and asks again, once
+    steps = _open_from_cockpit("1280", make_init(store=None, conflictFirst=1, storeAfter="st-b"), wait=False) + [
+        SIGN_ON,
+        _top("end", f"return {{stores: {STORES}, conflicts: window.__conflicts, lists: window.__frameLists}};"),
+        _tag("shown", FD, "return {review: " + SUMMARY + "};")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["end"]["stores"] == [None, "st-b"] and t["end"]["conflicts"] == 1 and t["end"]["lists"] == 2, t["end"]
+    assert "review 2" in t["shown"]["review"], t["shown"]
+
+
+@needs_browser
+@needs_ssh
+def test_a_sheet_bound_to_one_store_never_rebinds_to_another_and_never_signs_into_it(tmp_path: Path, monkeypatch) -> None:
+    # opened for store A; store B answers now. B refuses A's review, and the sheet says so and stays off: it never reads B's
+    # identity and asks again (that would sign into a store the person never opened the sheet for)
+    moved = "different Levain store"
+    probe = ("return {review: " + SUMMARY + ", btn: " + SIGN_OFF + ", why: d.getElementById('drop-sign-why').textContent};")
+    steps = _open_from_cockpit("1280", make_init(store="st-a", serverStore="st-b", storeAfter="st-b"), wait=False) + [
+        {"until": _in(FD, "return /" + moved + "/.test(" + SUMMARY + ");"), "ms": 10000},
+        _sleep(800),
+        _top("after", f"return {{stores: {STORES}, lists: window.__frameLists}};"),
+        _tag("refused", FD, probe),
+        _set(FD, "#drop-words", "tidy the changelog, and the readme"), _sleep(1500),
+        _top("edited", f"return {{stores: {STORES}, lists: window.__frameLists}};"),
+        _tag("still", FD, probe)]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["after"] == {"t": "after", "stores": ["st-a"], "lists": 1}, t["after"]          # no retry, no re-read of the store
+    r = t["refused"]
+    assert r["review"].startswith("This sheet was opened for a different Levain store than the one answering now. Reload the page "
+                                  "to see the current store; nothing was signed."), r
+    assert r["btn"] is True and moved in r["why"], r
+    assert t["edited"] == {"t": "edited", "stores": ["st-a"], "lists": 1}, t["edited"]     # an edit does not ask the other store either
+    assert t["still"]["btn"] is True and moved in t["still"]["review"], t["still"]
+
+
+@needs_browser
+@needs_ssh
+def test_an_edit_while_the_store_is_read_again_is_asked_for_once_the_read_returns(tmp_path: Path, monkeypatch) -> None:
+    # the 409 retry's read of the store is slow; an edit made meanwhile waits its turn, and when the read returns the retry is
+    # stale: the edit is the one asked for, never left waiting on "Reading…"
+    steps = _open_from_cockpit("1280", make_init(store=None, conflictFirst=1, storeAfter="st-b", holdList=True), wait=False) + [
+        {"until": "(window.__heldList || []).length >= 1", "ms": 10000},
+        _set(FD, "#drop-words", "tidy the changelog, and the readme"), _sleep(1200),
+        _top("mid", f"return {{stores: {STORES}}};"),
+        _top_eval("const f = window.__heldList.shift(); f(); return 1;"),
+        SIGN_ON,
+        _top("end", f"return {{stores: {STORES}, words: window.__reviews.map((r) => r.words)}};"),
+        _tag("shown", FD, "return {review: " + SUMMARY + "};")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["mid"]["stores"] == [None], t["mid"]                                               # the edit waits for the store
+    assert t["end"]["stores"] == [None, "st-b"], t["end"]
+    assert t["end"]["words"] == ["tidy the changelog", "tidy the changelog, and the readme"], t["end"]
+    assert "review 2" in t["shown"]["review"], t["shown"]
+
+
+@needs_browser
+@needs_ssh
+def test_a_reply_with_no_summary_never_enables_sign_and_never_stalls_the_form(tmp_path: Path, monkeypatch) -> None:
+    # a 200 whose view is empty, null or missing, or whose body is not an object, shows nothing to sign; on a fresh install (one
+    # review at a time) the next edit is still asked for
+    empty = "The server sent an empty summary; nothing can be signed. Change anything to ask again."
+    for name, more in (("empty", {"view": []}), ("null", {"view": None}), ("missing", {"view": "missing"}), ("text", {"rawBody": '"hello"'})):
+        sub = tmp_path / name
+        sub.mkdir()
+        steps = _open_from_cockpit("1280", make_init(store=None, badFirst=1, **more), wait=False) + [
+            {"until": _in(FD, "return /empty summary/.test(" + SUMMARY + ");"), "ms": 10000},
+            _sleep(300),
+            _tag("bad", FD, "return {review: " + SUMMARY + ", btn: " + SIGN_OFF + "};"),
+            _set(FD, "#drop-words", "tidy the changelog, and the readme"), _reviews(2), SIGN_ON,
+            _tag("next", FD, "return {review: " + SUMMARY + "};")]
+        t = _tagged(_run(sub, monkeypatch, "1280", steps))
+        assert t["bad"]["review"] == empty and t["bad"]["btn"] is True, (name, t["bad"])
+        assert "review 2" in t["next"]["review"], (name, t["next"])
+
+
+@needs_browser
+@needs_ssh
+def test_the_summary_says_when_the_hard_stop_is_and_a_summary_over_five_minutes_old_is_read_again(tmp_path: Path, monkeypatch) -> None:
+    # the stop is computed when the summary is read, so the summary says the time it lands on, and an old one is read again
+    steps = _open_from_cockpit("1280") + [
+        _tag("stop", FD, "const at = new Date(Date.parse(window.top.__lastStopAt));"
+                         "return {review: " + SUMMARY + ", hm: at.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})};"),
+        _top_eval("window.__skew = 6 * 60000; return 1;"),
+        {"until": f"{REVIEWS}.length >= 2", "ms": 25000}, SIGN_ON,
+        _top("again", "return {n: window.__reviews.length};"),
+        _tag("fresh", FD, "return {review: " + SUMMARY + "};")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    s = t["stop"]
+    assert ("Hard stop at " + s["hm"]) in s["review"] and "set when this summary was read" in s["review"], s
+    assert t["again"]["n"] == 2 and "review 2" in t["fresh"]["review"], t

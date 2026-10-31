@@ -740,3 +740,22 @@ def test_f5_the_store_a_fresh_install_s_review_made_is_the_one_its_challenge_bin
     with pytest.raises(CoordRefused) as exc:
         cp.step("envelope-challenge", {"review_id": r["review_id"]}, device=DEV)
     assert (exc.value.status, exc.value.error) == (409, "other_store")
+
+
+# --- 11. the envelope form's pre-pick is the first folder listed: the folder of the most recently active thread --------
+
+def test_coord_repos_lists_the_folder_of_the_most_recently_active_thread_first(world) -> None:
+    cp = coord_for(world)
+    d = drop(cp, "an old job and a new one", "ph-" + "e2" * 16)["drop"]
+    clock = _Clock(datetime.now(timezone.utc))
+    store = EnvelopeStore(world["qdir"], clock=clock)
+    old, new = store.split(d["drop_id"], [Part(kind="work", title="the old job"), Part(kind="work", title="the new job")])
+    clock.t += timedelta(minutes=1)
+    store.set_field(old.thread_id, "repo", "/work/old")
+    clock.t += timedelta(minutes=1)
+    store.set_field(new.thread_id, "repo", "/work/current")
+    assert cp.listing()["coord_repos"] == ["/work/current", "/work/old"]       # the newer activity first, not the older row
+    # activity, not creation: the older thread touched last is first
+    clock.t += timedelta(minutes=1)
+    store.set_field(old.thread_id, "title", "the old job, picked up again")
+    assert cp.listing()["coord_repos"] == ["/work/old", "/work/current"]
