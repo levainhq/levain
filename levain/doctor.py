@@ -5282,6 +5282,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
     results.append(_check_band_server(
         ".mcp.json", servers.get("levain_band") if isinstance(servers, dict) else None, "claude_code"))
     results.append(_check_band_hooks(install, "claude_code"))
+    results.append(_check_user_band_hooks())
     results.append(_check_dispatch_server(
         install, servers.get("levain_dispatch") if isinstance(servers, dict) else None))
 
@@ -5290,6 +5291,26 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
 
 BAND_ROW = "levain_band MCP registered"
 BAND_HOOKS_ROW = "NEEDS YOU band hooks"
+USER_BAND_ROW = "NEEDS YOU band (user level)"
+USER_BAND_FIX = "levain band hooks install"
+
+
+def _check_user_band_hooks() -> CheckResult:
+    """The opt-in user-level band (Q17-COLD A, `levain band hooks install`): not installed is INFO (the operator never
+    asked for it), installed and working passes, installed but broken (a missing event, no receipt, an interpreter that
+    cannot import `levain.band_view`) FAILS: a session outside any install would be shown no band and nothing would say so."""
+    from levain import band_hook
+
+    try:
+        state, detail = band_hook.user_band_state()
+    except Exception as exc:  # noqa: BLE001 - a check that cannot run is said, not a pass
+        return CheckResult(USER_BAND_ROW, False, f"not checked ({type(exc).__name__}: {str(exc)[:200]})", USER_BAND_FIX)
+    if state == "installed":
+        return CheckResult(USER_BAND_ROW, True, f"installed: {detail}")
+    if state == "broken":
+        return CheckResult(USER_BAND_ROW, False, f"installed but broken: {detail}", USER_BAND_FIX)
+    return CheckResult(USER_BAND_ROW, True, f"not installed (opt-in: sessions outside an install show no band; "
+                       f"`{USER_BAND_FIX}`)", neutral=True)
 
 
 def _band_hook_python(install: Path, agent: str, codex_home: Path | None = None) -> str | None:
@@ -5324,10 +5345,12 @@ def _band_import_problem(python: str) -> str | None:
 
     if not _python_resolvable(python):
         return f"{python} is not a runnable interpreter"
+    from levain.launch import child_env
+
     try:
         with tempfile.TemporaryDirectory() as empty:
             r = subprocess.run([python, "-c", "import levain.band_view"], cwd=empty, capture_output=True,
-                               text=True, timeout=_BAND_PROBE_TIMEOUT)
+                               text=True, timeout=_BAND_PROBE_TIMEOUT, env=child_env())
     except subprocess.TimeoutExpired:
         return f"{python} did not import levain.band_view within {_BAND_PROBE_TIMEOUT:.0f}s"
     except OSError as exc:

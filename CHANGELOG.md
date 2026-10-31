@@ -30,6 +30,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `levain question show --json` carry `open_ended`. The cockpit's page script is routed separately.
 
 ### Changed
+- **`levain band hooks install | remove | status`: the NEEDS YOU band in every session, opt-in.** Writes band-only
+  SessionStart, UserPromptSubmit and Stop hooks to your user-level Claude Code settings (`$CLAUDE_CONFIG_DIR` or
+  `~/.claude`), merged beside your own hooks, with a receipt (`<levain home>/band_hooks.json`). They carry no posture,
+  spores, recall or consent, and stand down inside an install whose band hooks are wired and for autonomous seats.
+  `remove` takes out exactly what was added; a settings file that does not parse is refused untouched. After install the
+  Codex hooks also show the band outside their install (the coordinator's workspace). `levain doctor` has a row for it
+  (not installed is info, installed but broken fails) and the Coordinator panel names the command when the Codex band
+  cannot render. This is the one exception to "Levain never touches your global Claude Code configuration".
 - **The coordinator will not start without a working NEEDS YOU band, and `levain doctor` fails when the band cannot
   render.** The coordinator launch (Claude Code and Codex) now refuses, before it starts anything, when the install's
   band hook scripts are missing or stale or the interpreter the hooks run cannot import `levain.band_view` (the hooks

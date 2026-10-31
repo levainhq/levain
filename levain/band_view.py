@@ -2002,6 +2002,16 @@ def run_band(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_band_hooks(args: argparse.Namespace) -> int:
+    """``levain band hooks install|remove|status`` (:mod:`levain.band_hook`)."""
+    from levain import band_hook
+
+    code, text = {"install": band_hook.install, "remove": band_hook.remove,
+                  "status": band_hook.status}[args.hooks_verb]()
+    print(text, file=sys.stderr if code else sys.stdout)
+    return code
+
+
 def run_band_answer(args: argparse.Namespace) -> int:
     """``levain band answer "<line>"``: the same parser and path as the seat hook, channel ``cli`` and via ``cli``,
     bound to the view ``levain band`` last printed. Refused inside any agent session (Q1 (a)); the whole line must
@@ -2039,3 +2049,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     a.add_argument("--queue-dir", dest="queue_dir", type=Path, default=argparse.SUPPRESS,
                    help="The consent directory holding questions.db.")
     a.set_defaults(func=run_band_answer)
+    hk = sub.add_parser("hooks", help="Opt in to the NEEDS YOU band in every Claude Code session (band-only hooks in "
+                                      "your user-level settings): install, remove, status.")
+    hsub = hk.add_subparsers(dest="hooks_cmd", required=True)
+    for name, text in (("install", "Write the band-only hooks to the user-level Claude Code settings, with a receipt."),
+                       ("remove", "Take exactly those hooks out again (nothing else in the settings is touched)."),
+                       ("status", "Read the receipt and the live settings.")):
+        hsub.add_parser(name, help=text).set_defaults(func=run_band_hooks, hooks_verb=name)

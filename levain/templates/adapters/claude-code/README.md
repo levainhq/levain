@@ -10,8 +10,15 @@ exposes both hook events the activation mechanism needs (`SessionStart`,
 The adapter is **project-scoped**: everything lives inside one directory — the
 operator's partnership working directory — and the hooks, the MCP server, and
 the memory store are all wired relative to it. It never touches the operator's
-global Claude Code configuration, and a second Levain install on the same
-machine is fully independent of the first.
+global Claude Code configuration, with one exception that is the operator's own
+choice: `levain band hooks install` writes three **band-only** hooks (the NEEDS
+YOU band, nothing else: no posture, spores, recall or consent) into your
+user-level Claude Code settings so the band shows in every session, not only
+inside an install. It is opt-in, it keeps a receipt under the Levain home, those
+hooks stand down inside an install whose own band hooks are wired (the band
+never shows twice), and `levain band hooks remove` takes out exactly what it
+added. Apart from that, a second Levain install on the same machine is fully
+independent of the first.
 
 **Supported platforms:** macOS, Linux, and WSL. Native Windows is not supported
 in v1 — the hook commands use POSIX shell form. (A Windows template is a
