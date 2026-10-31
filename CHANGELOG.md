@@ -659,6 +659,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   any other user but `_levain_dispatch` exits 77. On Linux, exits 77 and 78 are not restarted, and every Levain service
   unit stays down after a wrong-user exit (77) instead of restarting every few seconds. Its lockfile is created 0600
   under any umask. It launches no dispatch runs yet.
+- Groundwork for the dream: `levain.dream.executor.consolidate_store` is the consolidate that `levain wrap` ran, lifted to take a store path, a compose mind and two hooks, and returning a typed result for every outcome instead of raising. `levain wrap` now calls it with one compose and no change to its messages or exit codes. The new core adds a re-compose loop (each draft checked first on a scratch copy of the store, up to three composes, every refusal fed back verbatim), a `claude -p` mind and an Ollama mind, a per-run dollar limit with a start rule, and `progress.json` and `usage.json`. The one command is `levain dream run --store-dir <copy> --mind claude|ollama`, for a COPY of a store; it refuses `~/.anneal-memory`, and the Claude route refuses to compose until a price row for the model is added. Nothing runs it on a schedule.
 
 ## [0.11.26] — 2026-10-25
 

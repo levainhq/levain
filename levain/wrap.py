@@ -132,13 +132,17 @@ def _lock_wrap(entity_dir: Path) -> "int | None | object":
     Returns the held fd (release via :func:`_unlock_wrap`), ``None`` when ``fcntl`` is unavailable
     (Windows — best-effort proceed; the token-owned cancel is the point-of-use fallback), or
     :data:`_ANOTHER_WRAP_RUNNING` when a concurrent consolidate holds it."""
+    return _lock_wrap_file(entity_dir / ENTITY_STORE_SUBDIR / "wrap.lock")
+
+
+def _lock_wrap_file(lock_path: Path) -> "int | None | object":
+    """:func:`_lock_wrap` for a lock FILE path (the store-path core takes ``<store dir>/wrap.lock``, which for an entity
+    is ``<entity>/.levain/wrap.lock``). Same return values."""
     try:
         import fcntl
     except ImportError:
         return None
-    fd = os.open(
-        str(entity_dir / ENTITY_STORE_SUBDIR / "wrap.lock"), os.O_RDWR | os.O_CREAT, 0o644
-    )
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -673,445 +677,49 @@ def _consolidate(
         )
         return 2
 
-    try:
-        from anneal_memory import (
-            FLOW_SCHEMA,
-            AnnealMemoryError,
-            name_for_schema,
-            CrystalStore,
-            Store,
-            WrapInProgressError,
-            WrapOwnershipError,
-        )
-        from anneal_memory.continuity import (
-            format_wrap_package_text,
-            prepare_wrap,
-            validated_save_continuity,
-        )
+    # The consolidate itself is the store-path core (D1-1a): `levain.dream.executor.consolidate_store` holds the lock,
+    # the orphan self-heal, the prepare, the compose and the fail-closed save, and returns a typed result. This
+    # command keeps the entity guard above and the entity's constitution, runs ONE compose with no check on a
+    # copy (`max_composes=1`), and returns the core's exit code, so its messages and codes are unchanged. The
+    # caller (`wrap_entity`) bounds the whole consolidate, so the core arms no deadline of its own.
+    from levain.dream.executor import ComposeRequest, ComposeResult, consolidate_store
 
-        from levain.manifest import ANNEAL_SESSION_ID
-    except ImportError as exc:  # anneal-memory is a BASE dep, so this is a broken install
-        print(f"levain wrap: anneal-memory is not importable ({exc}). Reinstall levain.")
-        return 2
+    class _WrapMind:
+        """The entity's own model through `_compose`, looked up at call time (so a patched `_compose` is honoured)."""
+        name = "ollama"
+        source = "wrap"
+        unit = "tokens"
+        model = _resolve_model(composer)
 
-    # section_schema=None preserves the store's PERSISTED schema (partnership/FLOW-6, set at init);
-    # audit defaults on — the consolidate is the gated single-writer path the audit chain is FOR
-    # (unlike the high-frequency afferent capture, which opens audit=False). project_name is the
-    # entity's own handle so the compose package header reads as ITS memory, not the generic "Agent".
-    # A corrupt / locked / newer-schema store is a clean exit-2 here, not a raw traceback (the
-    # honesty floor the rest of the command holds).
-    try:
-        store = Store(
-            str(episodic_path), project_name=entity_dir.name, section_schema=None
-        )
-    except AnnealMemoryError as exc:
-        print(
-            f"levain wrap: could not open {entity_dir.name}'s memory store "
-            f"({type(exc).__name__}: {exc})."
-        )
-        return 2
+        def compose(self, req: ComposeRequest) -> ComposeResult:
+            text = _compose(req.package_text, req.constitution, composer=composer, base_url=base_url,
+                            api_key=api_key, instructions=req.instructions)
+            return ComposeResult(text=text, unit="tokens")
 
-    # SINGLE-WRITER: hold the per-entity wrap lock across the whole prepare→compose→save lifecycle so
-    # a concurrent `levain wrap` on this entity can't race the wrap state (apparatus L3).
-    lock = _lock_wrap(entity_dir)
-    if lock is _ANOTHER_WRAP_RUNNING:
-        store.close()
-        print(
-            "levain wrap: another consolidate is already running on this entity "
-            f"({entity_dir / ENTITY_STORE_SUBDIR / 'wrap.lock'} is held). "
-            "Wait for it to finish, then re-run."
-        )
-        return 2
+    result = consolidate_store(
+        episodic_path,
+        mind=_WrapMind(),
+        composer=_resolve_model(composer),
+        max_seconds=max_seconds,
+        max_composes=1,
+        save_reserve=0.0,
+        dry_run=dry_run,
+        reset=reset,
+        unattended=unattended,
+        own_deadline=False,
+        label="levain wrap",
+        project_name=entity_dir.name,
+        constitution=_entity_constitution(entity_dir),
+        report=lambda saved: _report(saved, entity_dir),
+        acquire_lock=lambda: _lock_wrap(entity_dir),
+        read_wrap_schema=_read_wrap_schema,
+    )
+    return result.exit_code
 
-    # Minted BEFORE the try and handed to anneal, so every cleanup path holds the token that will
-    # name our wrap even if an out-of-band exit lands inside `prepare_wrap`, and every cancel is a
-    # token compare. `prepare_entered` says whether anneal could have opened a wrap yet.
-    wrap_token = uuid.uuid4().hex
-    prepare_entered = False
 
-    try:
-        # A partnership entity's store MUST be on the partnership schema — an ops-schema store cannot
-        # hold the compose, and a clear message here beats a cryptic save-time rejection. Compared on
-        # REQUIRED headings: anneal 0.9.28 added an optional Durable Facts to FLOW_SCHEMA, and a store
-        # persisted before it keeps six headings; an exact compare refused every such entity
-        # (codex, the 0.5.6 L3, reproduced with `levain wrap --dry-run`).
-        # anneal's own name for the schema: it compares the ordered required (heading, role) pairs
-        # and ignores optional sections (codex, the 0.5.6 round: a heading-only compare passed a
-        # schema whose Understanding had lost its timeless role, which disables the shrink gate).
-        headings = [s["heading"] for s in store.section_schema]
-        expected = [s["heading"] for s in FLOW_SCHEMA if not s.get("optional")]
-        if name_for_schema(store.section_schema) != "partnership":
-            from levain.manifest import anneal_invocation
-
-            print(
-                "levain wrap: this entity's store is not on the partnership schema, "
-                "so it cannot consolidate.\n"
-                f"  got:      {headings}\n  required: {expected}\n"
-                f"  Fix:  {anneal_invocation('--db', str(episodic_path), 'set-schema', 'partnership')}"
-            )
-            return 2
-
-        # A wrap already in progress means a PRIOR consolidate crashed mid-flight (this command does
-        # prepare→compose→save in one process, so it can't be a concurrent one). Refuse rather than
-        # stack a second wrap; --reset discards the orphan and starts fresh (episodes are safe).
-        #
-        # ⚠ AN UNATTENDED SEAT DISCARDS THE ORPHAN AUTOMATICALLY, AND THIS IS A CORRECTNESS
-        # REQUIREMENT RATHER THAN A CONVENIENCE — found while wiring the bound, not by review.
-        # The wall-clock bound's LAYER 2 is a hard `os._exit`, which by design skips every cleanup
-        # path including the cancel below. So one backstop firing during a consolidate leaves a wrap
-        # in progress permanently. With the human-facing rule applied to a seat, EVERY subsequent
-        # consolidate then exits 2 asking a human to pass `--reset` — on a machine with no human.
-        # The seat keeps taking turns, keeps capturing episodes, and NEVER METABOLIZES AGAIN, behind
-        # a unit that still reports installed and loaded. That is precisely the
-        # `absence_of_signal_rendered_as_health` class this keystone exists to close, re-entering
-        # through the very mechanism that makes the bound trustworthy.
-        #
-        # It is SAFE, and the safety is structural rather than optimistic: we hold the exclusive
-        # non-blocking `wrap.lock` (taken above — a live peer would have exited at
-        # `_ANOTHER_WRAP_RUNNING`), so any wrap in progress at this point is definitionally an
-        # ORPHAN of a dead process, never a peer's live work. Discarding it loses nothing: the
-        # frozen episodes return to this wrap.
-        # ⚠ THE SAFETY ARGUMENT IS CONDITIONAL ON ACTUALLY HOLDING THE LOCK, so the code asks rather
-        # than assuming. `_lock_wrap` returns None when `fcntl` is unavailable (Windows) and we
-        # proceed UNLOCKED as a best effort — and on that path "an in-progress wrap must be an
-        # orphan" is simply false, because a live peer could be mid-wrap right now. Auto-discarding
-        # there would cancel a concurrent peer's live work: the loser-cancels-winner race that
-        # `_cancel_if_ours` was written to prevent, reintroduced by the convenience that fixes the
-        # unattended case. Without a lock we fall back to the conservative refusal, which costs an
-        # unattended seat one skipped consolidate (recoverable) instead of destroying a live wrap
-        # (not). `invariant_must_fire_at_the_point_of_use`.
-        holds_lock = isinstance(lock, int)
-        prior_token, started = _observe_prior_wrap(store)
-        # BOTH halves must hold before an unattended seat discards someone else's in-progress wrap:
-        # the LOCK (no live Levain peer) and the AGE (no live NON-Levain writer — an anneal CLI/MCP
-        # caller never takes our lock). See `_orphan_is_stale`.
-        may_self_heal = unattended and holds_lock and _orphan_is_stale(started, max_seconds)
-        if started:
-            if not reset and not may_self_heal:
-                extra = ""
-                if unattended and holds_lock and not _orphan_is_stale(started, max_seconds):
-                    extra = (
-                        "\n  (This seat would normally discard the orphan itself, but that wrap is "
-                        "too RECENT to be provably dead — another writer may still be mid-consolidate "
-                        "on this store. It will be discarded on a later run once it ages past the "
-                        "bound; refusing now is the safe side.)"
-                    )
-                elif unattended and not holds_lock:
-                    # SAY WHY the unattended self-heal did not apply, or this reads as the feature
-                    # simply not working — and a seat that silently stops metabolizing is the exact
-                    # thing this keystone exists to make impossible.
-                    extra = (
-                        "\n  (This seat would normally discard the orphan itself, but no wrap lock "
-                        "could be taken on this platform, so it cannot prove the wrap is not a live "
-                        "peer's. Refusing is the safe side.)"
-                    )
-                print(
-                    f"levain wrap: a prior wrap is still in progress (started {started}).\n"
-                    "  A previous consolidate did not finish. Re-run with --reset to discard it and "
-                    "start fresh — your captured episodes are safe (they return to the next wrap)."
-                    + extra
-                )
-                return 2
-            try:
-                discarded = _discard_prior_wrap(store, prior_token)
-            except WrapOwnershipError:
-                from levain.manifest import anneal_invocation
-
-                print("levain wrap: the prior wrap was not cleared: another consolidate replaced it, "
-                      "or its metadata cannot be read. Nothing was changed. Re-run in a moment; if "
-                      "it persists, look at it with\n"
-                      f"  {anneal_invocation('--db', str(episodic_path), 'wrap-status')}\n"
-                      "and clear it ONLY once you have confirmed it is dead: a wrap in partial state "
-                      "with\n"
-                      f"  {anneal_invocation('--db', str(episodic_path), 'wrap-cancel', '--partial')}\n"
-                      "or a readable one with that same command and `--wrap-token <its token>` in "
-                      "place of `--partial`. If the status shows a token that is not 32 hex "
-                      "characters, anneal will not take it as `--wrap-token`: the same command with "
-                      "no flag then clears whatever wrap is current, so run it straight after "
-                      "wrap-status and only if that wrap is the dead one. Keep the `--db` shown "
-                      "here: without it anneal reads ~/.anneal-memory.")
-                return 2
-            if not discarded:
-                print("levain wrap: the prior wrap was already gone; continuing.")
-            elif unattended and not reset:
-                # SAID, not silent: a seat that keeps self-healing is a seat whose consolidates keep
-                # dying, and the log is the only place an operator can notice that pattern.
-                print(
-                    f"levain wrap: discarded an ORPHANED wrap from a prior run (started {started}) "
-                    "and continued — no human is present to be asked.\n"
-                    "  Episodes are safe (they return to this wrap). If this recurs every run, the "
-                    "consolidate is dying repeatedly: check the seat's log for a bound being hit."
-                )
-            else:
-                print(f"levain wrap: discarded an unfinished prior wrap (started {started}).")
-
-        # THE CRYSTALLIZATION BOUND, APPLIED AT THE POINT OF USE (`invariant_must_fire_at_the_point
-        # _of_use`). An unattended consolidate gets a store it can READ and cannot WRITE, so it
-        # metabolizes its working neocortex — the entire point of [6] — while the always-loaded
-        # bedrock tier stays unreachable without a human. The shrink gate keeps its crystallization
-        # credit and the composer still SEES its candidates and may still propose them in the text;
-        # only EXECUTING a promotion is refused. Wrapping here rather than at drive-resolution time
-        # is deliberate: the credential-floor slice paid for the other ordering the day before, when
-        # one policy resolved in one place and consumed in two produced a split-brain floor.
-        crystal = CrystalStore(crystal_path)
-        if unattended:
-            crystal = refuse_crystallization(crystal)  # type: ignore[assignment]
-        # A store with no baton policy gets NO session_id — that engages the embedder's parallel-convo
-        # consolidate-efferent gate (spore-194), which is meaningless for a single sovereign entity:
-        # one entity, one wrap, no baton. A store anneal 1.0's `init` created IS baton-protected
-        # (KL-19), and there prepare and save refuse a call that names no session; `levain init`
-        # claimed the baton for ANNEAL_SESSION_ID, so the wrap runs as that session (the MCP
-        # launcher's `serve --session-id` does the same).
-        session_id = ANNEAL_SESSION_ID if store.consolidate_requires_baton() else None
-        prepare_entered = True
-        result = prepare_wrap(store, crystal_store=crystal, wrap_token=wrap_token, session_id=session_id)
-        status = result.get("status")
-        if status == "empty":
-            print(
-                "levain wrap: nothing to consolidate — no new episodes since the last wrap.\n"
-                "  Talk to the entity with `levain run` to accumulate experience, then wrap."
-            )
-            return 0
-        if status != "ready":
-            if status == "downgraded":
-                # anneal declined and left the store untouched: no wrap of ours exists, so there is
-                # nothing to cancel (and a failed cancel would claim a wrap that was never opened).
-                print(f"levain wrap: anneal declined to start a wrap — {result.get('message') or status}")
-                return 1
-            # A status this levain does not know may have opened one: cancel by our token, which
-            # clears our wrap if it exists and never a peer's.
-            print(f"levain wrap: prepare_wrap returned an unexpected status {status!r} — aborting.")
-            if not _cancel_if_ours(store, wrap_token):
-                print(_CANCEL_FAILED)
-            return 1
-
-        # THE AUTHORITATIVE SCHEMA CHECK, at the point of use. The check above runs before the wrap
-        # exists, so another process could change the schema in between (codex, the 0.5.6 fix-diff
-        # round, reproduced: the wrap saved under the ops schema). The schema read here is the one
-        # anneal froze for this wrap, which the save validates against, and the compose prompt is
-        # built from this object. anneal itself refuses a schema that moved while it built the
-        # package (a "downgraded" result), so this check is the guard for a schema that was never
-        # partnership. A store error reading it is handled by the outer AnnealMemoryError clause,
-        # which cancels by token now that a wrap exists.
-        wrap_schema = store.section_schema_for_wrap()
-        if name_for_schema(wrap_schema) != "partnership":
-            cancelled = _cancel_if_ours(store, wrap_token)
-            print(
-                "levain wrap: this entity's store changed off the partnership schema while the "
-                "consolidate was starting, so it was stopped; nothing was saved.\n"
-                f"  got:      {[s['heading'] for s in wrap_schema]}\n  required: {expected}"
-            )
-            if not cancelled:
-                print(_CANCEL_FAILED)
-            return 2
-        package_text = format_wrap_package_text(result)
-        episode_count = result.get("episode_count")
-
-        if dry_run:
-            # A prepared-but-unsaved wrap would strand the store, so cancel it — --dry-run changes
-            # NOTHING (a plan is not a result). The episodes stay unwrapped for the real run.
-            # A cancel that failed left the wrap open, which is a change, so it is not a success.
-            cancelled = _cancel_if_ours(store, wrap_token)
-            print(
-                f"levain wrap: DRY RUN — {episode_count} episode(s) are ready to consolidate "
-                f"(wrap_token {wrap_token}). Nothing was composed or saved.\n"
-            )
-            print(package_text)
-            if not cancelled:
-                print(_CANCEL_FAILED)
-                return 1
-            return 0
-
-        print(
-            f"levain wrap: consolidating {episode_count} episode(s) into "
-            f"{entity_dir.name}'s memory with {_resolve_model(composer)} …"
-        )
-
-        # COMPOSE — the entity's own mind (or the --composer override) metabolizes its episodes.
-        try:
-            neocortex = _compose(
-                package_text,
-                _entity_constitution(entity_dir),
-                composer=composer,
-                base_url=base_url,
-                api_key=api_key,
-                instructions=_compose_instructions(wrap_schema),
-            )
-        except _ComposeUnavailable as exc:
-            cancelled = _cancel_if_ours(store, wrap_token)  # never composed → don't strand the wrap
-            print(f"levain wrap: {exc}")
-            if not cancelled:
-                print(_CANCEL_FAILED)
-            return 2
-        except Exception as exc:  # noqa: BLE001 — a model/endpoint failure is a run failure, not a crash
-            cancelled = _cancel_if_ours(store, wrap_token)  # self-clean so a plain re-run works
-            print(
-                f"levain wrap: the compose model failed ({type(exc).__name__}: {exc}).\n"
-                "  Nothing was saved; the entity's memory is unchanged and its episodes are safe. "
-                "Check --composer / --base-url and re-run."
-            )
-            if not cancelled:
-                print(_CANCEL_FAILED)
-            return 1
-
-        if not neocortex.strip():
-            cancelled = _cancel_if_ours(store, wrap_token)
-            print(
-                "levain wrap: the compose model returned no usable memory text; nothing saved. "
-                "Re-run (a stronger --composer may help a weak model)."
-            )
-            if not cancelled:
-                print(_CANCEL_FAILED)
-            return 1
-
-        # SAVE — the gated efferent write. FAIL-CLOSED: validated_save_continuity REFUSES (raises) a
-        # malformed neocortex BEFORE writing, so a broken identity is never persisted.
-        # The affect flags are a deprecated pass-through: anneal no longer tags associations, so the state is
-        # never built or sent. The one line saying so is printed at argument handling (cli.py), before any compose.
-        # Read while OUR wrap is open (nothing else can complete a wrap now except by clearing ours
-        # first), immediately before the save. Read before `prepare_wrap` it raced an ordinary peer
-        # wrap completing in the gap, and a plain refused compose then looked like a peer's commit.
-        last_wrap_before = _last_wrap_id(store)
-        try:
-            saved = validated_save_continuity(
-                store,
-                neocortex,
-                wrap_token=wrap_token,
-                crystal_store=crystal,
-                allow_shrink=False,
-                session_id=session_id,
-            )
-        except Exception as exc:  # noqa: BLE001 — anneal raises ValueError (validation) / StoreError
-            # WHAT THE STORE ESTABLISHES, and nothing inferred from the absence of a flag. anneal
-            # validates + shrink-gates BEFORE any write (a malformed compose raises here with NOTHING
-            # committed and the wrap still in progress), but a VALID compose COMMITS the DB in
-            # Phase 2 and only THEN renames the continuity sidecar in Phase 3, so a Phase-3 failure
-            # raises POST-commit. Neither the exception type nor the in-progress flag says which
-            # happened: with no wrap in progress, either our save committed, or another program
-            # cleared or completed our wrap. So:
-            #  · COMMITTED needs positive evidence: the last completed wrap id moved since before
-            #    the save AND anneal's own Phase-3 text ("preserved at <tmp>") is in the error.
-            #  · NOT saved is claimed only when the id did not move AND our episodes are still
-            #    unconsolidated, or when our wrap is still in progress (a refused compose).
-            #  · anything else is said to be unknown, with the command that settles it.
-            last_wrap_after = _last_wrap_id(store)
-            if (last_wrap_before is not None and last_wrap_after is not None
-                    and last_wrap_after != last_wrap_before and "preserved at" in str(exc)):
-                # The DB COMMITTED but the file externalization (Phase-3 rename) failed — the wrap IS
-                # recorded (recoverable from the ``.tmp`` the exception names) and the episodes are
-                # NOT re-wrappable. Do NOT cancel (nothing is in progress) and do NOT say "re-run".
-                print(
-                    f"levain wrap: the memory COMMITTED but writing it to disk did not finish "
-                    f"({type(exc).__name__}: {exc}).\n"
-                    "  The consolidate IS recorded — follow the recovery hint in the message above to "
-                    "move the preserved .tmp into place. Do NOT re-run; these episodes are already "
-                    "consolidated."
-                )
-                return 1
-            if last_wrap_before is None or last_wrap_after is None:
-                cancelled = _cancel_if_ours(store, wrap_token)   # a wrap of ours, if open, is not left
-                print(_SAVE_UNREADABLE.format(kind=type(exc).__name__, exc=exc))
-                if not cancelled:
-                    print(_CANCEL_FAILED)
-                return 1
-            if _wrap_in_progress(store):
-                # Nothing committed — the identity is unchanged. Cancel OUR wrap (token-owned, so a
-                # concurrent peer's live wrap is never collateral-cancelled) and let the operator re-run.
-                debug_path = _dump_rejected(entity_dir, wrap_token, neocortex)
-                cancelled = _cancel_if_ours(store, wrap_token)
-                # anneal 0.9.33's hard maximum raises a ContinuityValidationError carrying `bound`.
-                why = (
-                    "The composed memory is LONGER than the schema's hard maximum; the message above "
-                    "names what to cut."
-                    + (" Levain cancelled its wrap, so ignore the 'save again' line: re-run."
-                       if cancelled else "")
-                    if type(getattr(exc, "bound", None)) is int else
-                    "The compose model most likely dropped a required section, mis-cited an episode, "
-                    "or (on a later wrap) produced a too-small memory that the catastrophic-shrink "
-                    "gate refused."
-                )
-                print(
-                    f"levain wrap: the composed memory was REFUSED — NOT saved "
-                    f"({type(exc).__name__}: {exc}).\n"
-                    f"  The entity's identity is unchanged. {why}\n"
-                    f"  The rejected draft was saved for inspection: {debug_path}\n"
-                    "  Re-run to try again (a stronger --composer may help)."
-                )
-                if not cancelled:
-                    print(_CANCEL_FAILED)
-                return 1
-            if last_wrap_after == last_wrap_before and _unwrapped_count(store):
-                print(
-                    f"levain wrap: the wrap was cleared by another program while the memory was being "
-                    f"composed, so it was NOT saved ({type(exc).__name__}: {exc}).\n"
-                    "  The entity's identity is unchanged and its episodes are still unconsolidated. "
-                    "Re-run."
-                )
-                return 1
-            print(_SAVE_UNKNOWN.format(kind=type(exc).__name__, exc=exc))
-            return 1
-
-        try:
-            _report(saved, entity_dir)
-        except Exception as exc:  # noqa: BLE001 — the memory is already saved; showing it is not the consolidate
-            _say(
-                f"levain wrap: consolidated: the memory was SAVED, but showing the result failed "
-                f"({type(exc).__name__}: {exc}).\n"
-                "  Nothing from this wrap is left to re-run."
-            )
-        return 0
-    except WrapInProgressError as exc:
-        # A concurrent `levain wrap` on the SAME entity won the prepare race after our
-        # get_wrap_started_at pre-check (anneal's structural AM-PREPARE-GUARD refused the second
-        # wrap). Integrity is safe — the other wrap is untouched. Do NOT blindly --reset (that would
-        # cancel a peer's live wrap); guide the operator to check first.
-        print(
-            f"levain wrap: a wrap is already in progress ({exc}).\n"
-            "  Another consolidate may be running, or a prior one crashed. If nothing else is "
-            "running, re-run with --reset to discard the stale wrap (episodes are safe)."
-        )
-        return 2
-    except AnnealMemoryError as exc:
-        # A store/crystal failure. Before prepare_wrap is entered (schema read, wrap-state read)
-        # no wrap of ours can exist. From the call on one may be open, even if prepare_wrap itself
-        # raised, and returning without cancelling stranded it (codex, the 0.5.6 hunk look), so any
-        # wrap carrying our token is cancelled first.
-        # A wall-clock stop landing INSIDE this handler is a BaseException, which the sibling
-        # clause below cannot see (a sibling does not catch what a handler raises), so the cancel
-        # is guarded here as well.
-        try:
-            cancelled = _cancel_if_ours(store, wrap_token) if prepare_entered else True
-        except BaseException as stop:
-            _note_cancel_outcome(stop, _cancel_our_wrap(store, wrap_token))
-            raise
-        print(
-            f"levain wrap: the consolidate could not read {entity_dir.name}'s store "
-            f"({type(exc).__name__}: {exc})."
-        )
-        if not cancelled:
-            print(_CANCEL_FAILED)
-        return 2
-    except BaseException as exc:
-        # THE OUT-OF-BAND EXITS — and this clause exists because the two that matter are deliberately
-        # NOT `Exception` subclasses, so every handler above is blind to them by design:
-        # `TurnTimeout` (the wall-clock bound), `CrystallizationRefused`, and `KeyboardInterrupt`.
-        #
-        # Without this, an interrupted consolidate unwinds straight to the `finally`, which closes
-        # the store and releases the lock while leaving the wrap IN PROGRESS — so the next
-        # consolidate refuses. For a human that is a `--reset` away; for a seat it was permanent
-        # death until the auto-discard above, and relying on that discard alone would be leaving a
-        # known mess for a later run to clean rather than not making it.
-        #
-        # Cancelling is safe because it is a compare against the token Levain minted: it clears the
-        # wrap only if that wrap is ours, whatever other program is using the store (`wrap.lock`
-        # keeps other Levain processes out and says nothing about them). Nothing partial can have
-        # been written — the save fails closed — so the frozen episodes simply return to the next
-        # wrap.
-        _note_cancel_outcome(exc, _cancel_our_wrap(store, wrap_token))
-        raise
-    finally:
-        store.close()
-        _unlock_wrap(lock)
+def _read_wrap_schema(store: object) -> list:
+    """The section schema anneal froze for the open wrap, read from THIS module (the store-path core calls it)."""
+    return store.section_schema_for_wrap()  # type: ignore[attr-defined]
 
 
 def _entity_constitution(entity_dir: Path) -> str | None:
