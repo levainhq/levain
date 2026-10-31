@@ -14,16 +14,23 @@ brief stands. A failure never reads as an empty answer. The unit of Since is the
 kind-classed tables, never summed and never called an event.
 
 **Truncation is from the tail.** Header, handoff, the unsequenced class, unacknowledged opens, the board, the band and
-the card are never cut; the Since detail (one line per counted row, in gseq order) fills what the body cap leaves, and
-``shown_through_gseq`` is the gseq of the last row actually rendered, so an acknowledgement advances the window no
-further and the rows not shown return in the next brief. The unsequenced class is one line per table and is never cut.
+the card are never cut; the Since detail (one line per counted row, in gseq order; gseq is one store-wide sequence, so
+no two counted rows share one) fills what the body cap leaves, and ``shown_through_gseq`` is the gseq of the last row
+actually rendered, so an acknowledgement advances the window no further and the rows not shown return in the next
+brief. A cut brief ends its detail with one omitted-rows line, whose exact bytes are counted against the cap; a brief
+that shows every row keeps nothing back. The unsequenced class is one line per table and is never cut.
 
-**A degraded brief is shown, never stored.** When the store read fails (the whole read, or the Since window) the brief
-says so and carries ``degraded``; the writers refuse it, so a retry reads again rather than finding a stub for good.
+**A degraded brief is shown, never stored.** A brief is ``degraded`` whenever a part the successor must see could not
+be read: the whole read (a coordinator directory its ownership or mode rule refuses among the causes), the cut it
+stands on (the counted head, the acknowledged cursor and cuts, the latest handoff row), Since, the Handoff section, the
+unsequenced class, or the unacknowledged opens. The brief says so and carries ``degraded``; the writers refuse it, so
+a retry reads again rather than finding a stub for good. A Board, Band or Card failure is shown and the brief still
+stores: the board is a display of work state, and the band and card read the queue side, which no cut covers.
 
 Known edges: a ``body_cap`` barely above the never-cut size fits no detail line, so the brief shows none and its ack
 cannot move the cursor; a brief whose never-cut sections exceed the cap (:class:`BriefTooBig`) is never built, so
-its signal never opens and its caller (S3) must surface that.
+its signal never opens and its caller (S3) must surface that; a build under a stale token pays one full render before
+the fence refuses it.
 
 This module reads and renders; it writes nothing (the band read is the non-recording one). Stdlib only.
 """
@@ -42,6 +49,7 @@ from levain.coordinator import morning, ready, review, seam_classes
 from levain.coordinator.seam_handoffs import _COLUMNS as _HANDOFF_COLUMNS, _counted_head, _row as _handoff_row
 from levain.coordinator.seam_open import BODY_CAP, SEAM_KINDS, acked_cursor, acked_cuts, open_tables_present
 from levain.coordinator.store import GSEQ_TABLES, CoordError, CoordStore, StoreAbsent
+from levain.dispatch import DispatchError
 
 __all__ = ["Brief", "BriefTooBig", "DETAIL_ROWS_MAX", "NOT_BUILT", "open_brief"]
 
@@ -50,11 +58,14 @@ DETAIL_ROWS_MAX = 1000
 NOT_BUILT = "dreaming (D1) and memory freshness are not built"
 _LIST_LINES = 30           # a board, a band, a card: never the whole of a long one
 _LINE = 240
-_RESERVE = 160             # bytes kept back for the omitted-rows line
 
 
 class BriefTooBig(CoordError):
     """The sections a brief never cuts do not fit in its byte cap."""
+
+
+class _Unread(CoordError):
+    """The cut the brief stands on could not be read: the brief is the store-failed one."""
 
 
 @dataclass(frozen=True)
@@ -67,8 +78,8 @@ class Brief:
     handoff_id: int | None
     unsequenced_cuts: dict[str, int] = field(default_factory=dict)    # table -> highest unsequenced rowid shown
     omitted_rows: int = 0            # counted rows in the window the detail did not reach
-    # the store read that failed, and why; None when the cut and the window were read. A degraded brief may be shown,
-    # never stored: a stored build is returned for its signal for good, so a retry must be free to read again
+    # the first read the successor must see that failed, and why; None when every such read succeeded. A degraded
+    # brief may be shown, never stored: a stored build is returned for its signal for good, so a retry must read again
     degraded: str | None = None
 
 
@@ -87,12 +98,18 @@ def _age(now: datetime, stamp: str) -> str:
     return f"{h}h{rem // 60:02d}m ago" if h else f"{rem // 60}m ago"
 
 
-def _guard(name: str, fn: Any) -> list[str]:
-    """A section's lines, or its ``cannot-derive`` line: one section failing never takes the brief with it."""
+def _guard(name: str, fn: Any, failed: list[str], *, critical: bool = False, fallback: Any = None) -> Any:
+    """What ``fn`` returns, or, when it raises, its section's ``cannot-derive`` line (as ``[line]``, or as
+    ``fallback(line)`` for a read that returns more than lines): one section failing never takes the brief with it.
+    A ``critical`` read is one the successor must see: its failure line also goes in ``failed``, and a brief with any
+    such failure is degraded. The ONE place a read's failure is caught inside the store transaction."""
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001 - named in the brief, the rest of it stands
-        return [f"{name}: cannot-derive ({type(exc).__name__}: {_cap(exc, 160)})"]
+        line = f"{name}: cannot-derive ({type(exc).__name__}: {_cap(exc, 160)})"
+        if critical:
+            failed.append(line)
+        return [line] if fallback is None else fallback(line)
 
 
 def open_brief(store: CoordStore, queue_dir: Path | str | None, kind: str, now: datetime, *,
@@ -113,7 +130,8 @@ def open_brief(store: CoordStore, queue_dir: Path | str | None, kind: str, now: 
             return _render(store, conn, qdir, kind, now, read_at, body_cap)
     except BriefTooBig:
         raise
-    except (StoreAbsent, sqlite3.Error, OSError, CoordError) as exc:
+    # what can still escape the guarded reads: the connection, the read transaction, the directory rule
+    except (StoreAbsent, sqlite3.Error, OSError, CoordError, DispatchError) as exc:
         absent = isinstance(exc, StoreAbsent) and ready._absent(store)
         reason = _cap(exc, 200)
     why = "absent: there is no coordinator store here" if absent else f"cannot-derive: {reason}"
@@ -131,72 +149,99 @@ def _scope_line(read_at: str) -> str:
 def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, now: datetime, read_at: str,
             body_cap: int) -> Brief:
     present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    head = _counted_head(conn)
-    floor, floor_open = acked_cursor(conn)
-    floor = min(floor, head)
-    handoff = _latest_handoff(conn, present)
+    failed: list[str] = []
+    cut = _guard("Cut", lambda: _cut(conn, present), failed, critical=True)
+    if failed:
+        raise _Unread(failed[0])            # no header can be written without the cut: the brief is the stub
+    head, floor, floor_open, handoff, cuts_floor = cut
     sources = [(t, seam_classes.KIND_CLASSES.get(t, {}).get("COUNTED")) for t in sorted(seam_classes.COUNTED & present)]
 
     head_lines = _header(conn, kind, read_at, head, floor, floor_open, handoff)
-    handoff_lines = _guard("Handoff", lambda: _handoff_section(conn, handoff, sources, head))
-    counts: dict[str, int] = {}
-    rows: list[tuple[int, str]] = []
-    since_failed = False
-    try:
-        # the counts and the detail are one read of the window: either failing leaves the window unread
-        counts = _counts(conn, sources, floor, head)
-        since_lines = _since_lines(floor, head, counts)
-        if counts:
-            rows = _detail(conn, sources, floor, head)
-    except Exception as exc:  # noqa: BLE001 - named in the brief and in `degraded`, which a writer refuses to store
-        since_failed = True
-        counts, rows = {}, []
-        since_lines = [f"Since: cannot-derive ({type(exc).__name__}: {_cap(exc, 160)})"]
-    total = sum(counts.values())
-    unseq_lines, cuts = _unsequenced(conn, present, acked_cuts(conn))
-    band_lines = _guard("Band", lambda: _band(store, conn, qdir, now, read_at))
+    handoff_lines = _guard("Handoff section", lambda: _handoff_section(conn, handoff, sources, head), failed,
+                           critical=True)
+    # the counts and the detail are one read of the window: either failing leaves the window unread
+    counts, rows, since_lines = _guard("Since", lambda: _since(conn, sources, floor, head), failed, critical=True,
+                                       fallback=lambda line: (None, [], [line]))
+    since_failed = counts is None
+    total = 0 if since_failed else sum(counts.values())
+    unseq_lines, cuts = _guard("Unsequenced (rows written by an older release)",
+                               lambda: _unsequenced(conn, present, cuts_floor), failed, critical=True,
+                               fallback=lambda line: ([line], {}))
+    band_lines = _guard("Band", lambda: _band(store, conn, qdir, now, read_at), failed)
     # the card reads a queue directory it cannot open as "not away, nothing undecided": with the band unread, its queue
     # parts are unknown, and the brief says that rather than print the empty answers
     card_lines = (["Card: cannot-derive (the queue directory could not be read, so the away, undecided and waiting "
                    "parts are unknown)"] if band_lines[0].startswith("Band: cannot-derive")
-                  else _guard("Card", lambda: _card(store, conn, qdir, now)))
+                  else _guard("Card", lambda: _card(store, conn, qdir, now), failed))
     rest = [
-        *_guard("Unacknowledged", lambda: _unacknowledged(conn, now)),
-        *_guard("Board", lambda: _board(store, conn, read_at)),
+        *_guard("Unacknowledged", lambda: _unacknowledged(conn, now), failed, critical=True),
+        *_guard("Board", lambda: _board(store, conn, read_at), failed),
         *band_lines,
         *card_lines,
         "Missing close: not derived by this release (S4)",
         f"Not built: {NOT_BUILT}",
     ]
     fixed = [*head_lines, *handoff_lines, *since_lines, *unseq_lines, *rest, _scope_line(read_at)]
-    budget = body_cap - len("\n".join(fixed).encode("utf-8")) - _RESERVE
-    if budget < 0:
-        raise BriefTooBig(f"the brief's never-cut sections need {body_cap - budget} bytes, over the cap of "
-                         f"{body_cap}")
+    fixed_bytes = len("\n".join(fixed).encode("utf-8"))
+    if fixed_bytes > body_cap:
+        raise BriefTooBig(f"the brief's never-cut sections need {fixed_bytes} bytes, over the cap of {body_cap}")
     detail: list[str] = []
     shown = head
     omitted = 0
-    if total and not since_failed:
-        used = 0
-        last = floor
-        for g, label in rows:
-            line = f"  gseq {g} {label}"
-            need = len(line.encode("utf-8")) + 1
-            if used + need > budget:
-                break
-            detail.append(line)
-            used += need
-            last = g
-        omitted = total - len(detail)
+    if total:
+        detail, last, omitted = _fit(rows, total, floor, body_cap - fixed_bytes, body_cap)
         if omitted:
             shown = last
-            detail.append(f"  ... {omitted} more counted row(s) not shown; the next open shows them after this one is "
-                          f"acknowledged (this open's ack reaches gseq {last})")
     elif since_failed:
         shown = floor            # nothing was read of the window: an ack moves nothing
     text_lines = [*head_lines, *handoff_lines, *since_lines, *detail, *unseq_lines, *rest, _scope_line(read_at)]
     return Brief(kind, "\n".join(text_lines), read_at, head, shown, None if handoff is None else handoff.handoff_id,
-                 cuts, omitted, degraded=since_lines[0] if since_failed else None)
+                 cuts, omitted, degraded=failed[0] if failed else None)
+
+
+def _cut(conn: sqlite3.Connection, present: set[str]) -> tuple[int, int, int | None, Any, dict[str, int]]:
+    """The reads every section stands on: the counted head, the acknowledged cursor (never past the head), the latest
+    handoff row, and the acknowledged unsequenced cuts."""
+    head = _counted_head(conn)
+    floor, floor_open = acked_cursor(conn)
+    return head, min(floor, head), floor_open, _latest_handoff(conn, present), acked_cuts(conn)
+
+
+def _since(conn: sqlite3.Connection, sources: list, floor: int, head: int
+           ) -> tuple[dict[str, int], list[tuple[int, str]], list[str]]:
+    counts = _counts(conn, sources, floor, head)
+    return counts, (_detail(conn, sources, floor, head) if counts else []), _since_lines(floor, head, counts)
+
+
+def _omitted_line(omitted: int, last: int) -> str:
+    return (f"  ... {omitted} more counted row(s) not shown; the next open shows them after this one is acknowledged "
+            f"(this open's ack reaches gseq {last})")
+
+
+def _fit(rows: list[tuple[int, str]], total: int, floor: int, room: int, body_cap: int) -> tuple[list[str], int, int]:
+    """``(detail lines, last gseq shown, omitted)``: the most leading rows that fit in ``room`` bytes (each line costs
+    its bytes and a newline), with the omitted-rows line's own exact bytes, for that omitted count and last gseq,
+    counted in. Every row fitting keeps nothing back for that line. :class:`BriefTooBig` when not even the omitted
+    line alone fits."""
+    lines = [f"  gseq {g} {label}" for g, label in rows]
+    sizes = [len(ln.encode("utf-8")) + 1 for ln in lines]
+    if len(rows) == total and sum(sizes) <= room:
+        return lines, rows[-1][0] if rows else floor, 0
+    best: tuple[int, int] | None = None          # (rows shown, the omitted line's bytes)
+    used = 0
+    for k in range(min(len(rows), total - 1) + 1):
+        used += sizes[k - 1] if k else 0
+        if used > room:
+            break
+        tail = len(_omitted_line(total - k, rows[k - 1][0] if k else floor).encode("utf-8")) + 1
+        if used + tail <= room:
+            best = (k, tail)
+    if best is None:
+        raise BriefTooBig(f"the brief's never-cut sections and its omitted-rows line need more than the cap of "
+                         f"{body_cap} bytes")
+    k = best[0]
+    last = rows[k - 1][0] if k else floor
+    return [*lines[:k], _omitted_line(total - k, last)], last, total - k
 
 
 def _latest_handoff(conn: sqlite3.Connection, present: set[str]) -> Any:
@@ -279,7 +324,7 @@ def _detail(conn: sqlite3.Connection, sources: list, floor: int, head: int) -> l
         params.extend((floor, head))
     if not parts:
         return []
-    sql = " UNION ALL ".join(parts) + " ORDER BY 1 LIMIT ?"
+    sql = " UNION ALL ".join(parts) + " ORDER BY 1, 2 LIMIT ?"
     return [(g, label) for g, label in conn.execute(sql, (*params, DETAIL_ROWS_MAX))]
 
 
@@ -288,32 +333,30 @@ def _unsequenced(conn: sqlite3.Connection, present: set[str], cuts_floor: dict[s
     (an older release's), above the highest rowid an acknowledged open showed. Its own class, never cut."""
     head = "Unsequenced (rows written by an older release)"
     if "gseq_migration_bounds" not in present:
-        return [f"{head}: cannot-derive (the store was never migrated: no gseq_migration_bounds)"], {}
+        raise CoordError("the store was never migrated: no gseq_migration_bounds")
     lines: list[str] = []
     cuts: dict[str, int] = {}
-    try:
-        bounds = conn.execute("SELECT table_name, baseline_rowid FROM gseq_migration_bounds ORDER BY table_name"
-                              ).fetchall()
-        for table, base in bounds:
-            if table not in GSEQ_TABLES or table not in present:
-                continue
-            lo = max(base, cuts_floor.get(table, 0))
-            n, top = conn.execute(f"SELECT COUNT(*), MAX(rowid) FROM {table} WHERE gseq IS NULL AND rowid > ?",
-                                  (lo,)).fetchone()
-            if n:
-                cuts[table] = top
-                lines.append(f"  {table}: {n} row(s) written by an older release (rowids {lo + 1} to {top})")
-    except sqlite3.Error as exc:
-        return [f"{head}: cannot-derive ({_cap(exc, 160)})"], {}
+    bounds = conn.execute("SELECT table_name, baseline_rowid FROM gseq_migration_bounds ORDER BY table_name").fetchall()
+    for table, base in bounds:
+        if table not in GSEQ_TABLES or table not in present:
+            continue
+        lo = max(base, cuts_floor.get(table, 0))
+        n, top = conn.execute(f"SELECT COUNT(*), MAX(rowid) FROM {table} WHERE gseq IS NULL AND rowid > ?",
+                              (lo,)).fetchone()
+        if n:
+            cuts[table] = top
+            lines.append(f"  {table}: {n} row(s) written by an older release (rowids {lo + 1} to {top})")
     return ([f"{head}: 0"] if not lines else [f"{head}:", *lines]), cuts
 
 
 def _unacknowledged(conn: sqlite3.Connection, now: datetime) -> list[str]:
     if not open_tables_present(conn):
         return ["Unacknowledged: absent (this store has no open tables: nothing was ever built)"]
-    rows = conn.execute("SELECT b.open_id, b.seam_kind, b.built_at, (SELECT group_concat(surface) FROM "
-                        "open_deliveries d WHERE d.open_id = b.open_id) FROM open_builds b WHERE NOT EXISTS (SELECT 1 "
-                        "FROM open_acks a WHERE a.open_id = b.open_id) ORDER BY b.open_id DESC LIMIT ?",
+    # group_concat over an ordered subquery: SQLite promises no aggregate input order otherwise, and the text is a hash
+    rows = conn.execute("SELECT b.open_id, b.seam_kind, b.built_at, (SELECT group_concat(surface) FROM (SELECT "
+                        "DISTINCT d.surface FROM open_deliveries d WHERE d.open_id = b.open_id ORDER BY d.surface)) "
+                        "FROM open_builds b WHERE NOT EXISTS (SELECT 1 FROM open_acks a WHERE a.open_id = b.open_id) "
+                        "ORDER BY b.open_id DESC LIMIT ?",
                         (_LIST_LINES + 1,)).fetchall()
     if not rows:
         return ["Unacknowledged: 0"]

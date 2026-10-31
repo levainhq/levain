@@ -71,7 +71,7 @@ def _build(s, key="k1", kind="operator", **kw):
 def _ack(s, open_id, deliver=True, **kw):
     # an acknowledgement is of a brief that was handed over: the helper delivers first unless told not to
     if deliver:
-        seam_open.record_delivery(s, open_id, "light_verb")
+        seam_open.record_delivery(s, open_id, "light_verb", recipient=s.launch_id)
     return seam_open.acknowledge(s, open_id, token=_token(s), **kw)
 
 
@@ -167,8 +167,8 @@ def test_a_build_never_acked_does_not_move_since(world):
     again = _brief(world)
     assert f"Since (gseq 0 to {before.cursor_gseq})" in again.text            # still the window from the start
     assert f"open {b.open_id} (operator) built 0m ago, never acknowledged; never delivered" in again.text
-    assert seam_open.record_delivery(world, b.open_id, "launch_brief") is True
-    assert seam_open.record_delivery(world, b.open_id, "launch_brief") is False
+    assert seam_open.record_delivery(world, b.open_id, "launch_brief", recipient=world.launch_id) is True
+    assert seam_open.record_delivery(world, b.open_id, "launch_brief", recipient=world.launch_id) is False
     delivered = _brief(world)
     assert "delivered via launch_brief" in delivered.text and f"Since (gseq 0 to {before.cursor_gseq})" in delivered.text
     _ack(world, b.open_id)
@@ -333,9 +333,9 @@ def test_the_reader_session_is_derived_and_a_read_back_is_required_on_rotation_a
 def test_a_delivery_surface_is_one_of_two(world):
     b = _build(world)
     with pytest.raises(CoordError, match="launch_brief, light_verb"):
-        seam_open.record_delivery(world, b.open_id, "email")
+        seam_open.record_delivery(world, b.open_id, "email", recipient=world.launch_id)
     with pytest.raises(CoordError, match="no open build"):
-        seam_open.record_delivery(world, 99, "light_verb")
+        seam_open.record_delivery(world, 99, "light_verb", recipient=world.launch_id)
 
 
 # --- the starter path -----------------------------------------------------------------------------------------------
@@ -432,7 +432,7 @@ def test_an_arrival_signal_is_one_per_agent_and_mark_and_is_counted(world):
 def test_every_open_table_is_append_only_and_the_build_is_bounded(world):
     b = _build(world)
     _ack(world, b.open_id)
-    seam_open.record_delivery(world, b.open_id, "light_verb")
+    seam_open.record_delivery(world, b.open_id, "light_verb", recipient=world.launch_id)
     with world._write("coordinator", _token(world)) as (conn, now):
         seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
     for table, col in (("open_builds", "seam_kind"), ("open_deliveries", "surface"), ("open_acks", "reader_session"),
@@ -476,7 +476,7 @@ def _fail_once(monkeypatch, module, name, exc):
 def test_a_brief_whose_store_read_failed_is_never_stored_and_a_retry_builds_it_whole(world, monkeypatch):
     _fail_once(monkeypatch, seam, "_counted_head", sqlite3.OperationalError("disk I/O error"))
     before = _counts(world)
-    with pytest.raises(CoordError, match="store: cannot-derive: disk I/O error"):
+    with pytest.raises(CoordError, match=r"store: cannot-derive: Cut: cannot-derive \(OperationalError: disk I/O error\)"):
         _build(world, "flaky")
     assert _counts(world) == before
     b = _build(world, "flaky")
@@ -514,26 +514,6 @@ def test_an_ack_of_a_build_never_delivered_is_refused(world):
     with pytest.raises(CoordError, match="never delivered"):
         _ack(world, b.open_id, deliver=False)
     assert _counts(world) == before
-
-
-def test_an_ack_of_another_launchs_build_is_refused(world):
-    other = "ln-" + "0" * 32
-    b = seam_build.build(world, kind="operator", signal_kind="launch", signal_key=other, queue_dir=world.qdir,
-                         token=_token(world))
-    seam_open.record_delivery(world, b.open_id, "launch_brief")
-    before = _counts(world)
-    with pytest.raises(CoordError, match=f"built for launch {other}"):
-        _ack(world, b.open_id, deliver=False)
-    assert _counts(world) == before
-
-
-def test_a_delivered_build_of_the_acking_launch_moves_the_cursor(world):
-    b = seam_build.build(world, kind="operator", signal_kind="launch", signal_key=world.launch_id,
-                         queue_dir=world.qdir, token=_token(world))
-    seam_open.record_delivery(world, b.open_id, "launch_brief")
-    assert _ack(world, b.open_id, deliver=False) == (b.open_id, world.session_key, True)
-    with sqlite3.connect(world.path) as c:
-        assert seam_open.acked_cursor(c) == (b.shown_through_gseq, b.open_id) and b.shown_through_gseq > 0
 
 
 def test_an_arrival_outside_a_write_transaction_is_refused(world):
@@ -643,7 +623,7 @@ def test_a_live_lease_held_by_an_active_worker_writes_no_open_record(world):
     got, why = world.launch_activate(wl.launch_id, harness_session_id="probe-W")
     assert why is None and got.state == "active" and got.role == "worker"
     b = _build(world, "w")
-    seam_open.record_delivery(world, b.open_id, "light_verb")
+    seam_open.record_delivery(world, b.open_id, "light_verb", recipient=world.launch_id)
     c = sqlite3.connect(world.path)
     try:
         with c:
@@ -659,3 +639,247 @@ def test_a_live_lease_held_by_an_active_worker_writes_no_open_record(world):
     with pytest.raises(LeaseRefused, match="active coordinator launch"):
         seam_build.build(world, kind="light", signal_kind="silence", signal_key="w2", queue_dir=world.qdir, token=tok)
     assert _counts(world) == before
+
+
+# --- review fixes 2: one degraded rule, one input bound, the same build, the recipient, the exact cap ---------------
+def _malformed_handoff(s, body='{"state_line": "a handoff with no other key"}'):
+    # a raw row the writer would refuse but the triggers let through: its body passes the state_line floor only
+    c = sqlite3.connect(s.path)
+    try:
+        with c:
+            g = c.execute("INSERT INTO gseq (at) VALUES ('2026-10-31T11:00:00Z')").lastrowid
+            c.execute("INSERT INTO seam_handoffs (close_key, seam_kind, written_at, writer, gseq, covers_gseq, "
+                      "prev_handoff_id, request_digest, body) VALUES ('raw', 'rotation', 't', 'w', ?, 0, NULL, 'd', ?)",
+                      (g, body))
+    finally:
+        c.close()
+
+
+def test_a_handoff_that_does_not_parse_degrades_the_brief_and_the_build_refuses_it(world):
+    _malformed_handoff(world)
+    b = _brief(world, kind="rotation")
+    assert b.degraded and b.degraded.startswith("Handoff section: cannot-derive (KeyError")
+    assert b.degraded in b.text.splitlines()
+    before = _counts(world)
+    with pytest.raises(CoordError, match="degraded brief is never stored"):
+        _build(world, "h", kind="rotation")
+    assert _counts(world) == before
+
+
+@pytest.mark.parametrize("name, exc", [("acked_cuts", TypeError("a malformed cut")),
+                                       ("acked_cursor", sqlite3.OperationalError("database is locked")),
+                                       ("_latest_handoff", sqlite3.OperationalError("disk I/O error")),
+                                       ("_unsequenced", TypeError("NULL baseline")),
+                                       ("_unacknowledged", sqlite3.OperationalError("database is locked"))])
+def test_a_read_the_successor_must_see_that_fails_degrades_the_brief(world, monkeypatch, name, exc):
+    def broken(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(seam, name, broken)
+    b = _brief(world)
+    assert b.degraded and str(exc) in b.degraded and str(exc) in b.text
+    with pytest.raises(CoordError, match="degraded brief is never stored"):
+        seam_build._storable(b, seam_open.BODY_CAP)
+
+
+def test_a_band_or_card_failure_is_shown_and_the_brief_still_stores(world, tmp_path):
+    afile = tmp_path / "afile"
+    afile.write_text("not a directory")
+    b = seam.open_brief(world, afile, "operator", NOW)
+    assert any(ln.startswith("Band: cannot-derive (") for ln in b.text.splitlines()) and b.degraded is None
+
+
+def test_a_coordinator_directory_open_to_others_is_a_degraded_brief_never_a_crash(world):
+    os.chmod(world.directory, 0o755)
+    try:
+        b = _brief(world)
+        assert b.degraded and "reachable by group or others" in b.degraded and b.cursor_gseq == 0
+        with pytest.raises(CoordError, match="degraded brief is never stored"):
+            seam_build._storable(b, seam_open.BODY_CAP)
+    finally:
+        os.chmod(world.directory, 0o700)
+    assert _sql(world, "SELECT COUNT(*) FROM open_builds") == [(0,)]
+
+
+def test_a_read_back_is_bounded_in_bytes_and_a_lone_surrogate_is_a_coord_error(world):
+    b = _build(world, "rb", kind="rotation")
+    seam_open.record_delivery(world, b.open_id, "light_verb", recipient=world.launch_id)
+    before = _counts(world)
+    for text in ("x" * 8193, "€" * 2731, "a lone surrogate \ud800"):         # 2731 euro signs are 8193 bytes
+        with pytest.raises(CoordError, match="read_back"):
+            seam_open.acknowledge(world, b.open_id, token=_token(world), read_back=text)
+    assert _counts(world) == before
+    assert seam_open.acknowledge(world, b.open_id, token=_token(world), read_back="€" * 2730 + "xx")[2] is True
+
+
+def test_every_caller_text_is_checked_before_the_write_opens(world):
+    before = _counts(world)
+    with pytest.raises(CoordError, match="signal key"):
+        _build(world, "a lone surrogate \ud800")
+    with pytest.raises(CoordError, match="agent"):
+        with world._write("coordinator", _token(world)) as (conn, now):
+            seam_open.record_arrival(conn, now, agent="\udfff", mark_id=1, queue_id="q")
+    with pytest.raises(CoordError, match="queue_id"):
+        with world._write("coordinator", _token(world)) as (conn, now):
+            seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q\ud800")
+    assert _counts(world) == before                    # a refusal inside a write rolls its fence record back too
+    for name, value in (("signal key", "\ud800"), ("read_back", "\ud800")):
+        with pytest.raises(CoordError, match=name):
+            seam_open.checked_text(value, name)
+
+
+def _no_render(*a, **kw):
+    raise AssertionError("a signal already built is returned before anything is rendered")
+
+
+def test_a_built_signal_is_returned_before_anything_renders(world, monkeypatch):
+    a = _build(world, "same")
+    monkeypatch.setattr(seam_build, "open_brief", _no_render)
+    assert _build(world, "same") == a
+    with pytest.raises(CoordError, match="operator"):
+        _build(world, "same", kind="rotation")                           # the kind mismatch is still refused
+
+
+def test_a_cold_start_already_built_is_returned_before_anything_renders(pending, monkeypatch):
+    pending.launch_claim_spawn(pending.launch_id, os.getpid())
+    b = _starter(pending)
+    monkeypatch.setattr(seam_build, "open_brief", _no_render)
+    assert _starter(pending) == b
+    with pytest.raises(LeaseRefused, match="claimed by pid"):           # the preconditions still come first
+        _starter(pending, pid=os.getpid() + 1)
+
+
+def test_a_launch_signal_is_the_starters_alone(world):
+    before = _counts(world)
+    with pytest.raises(CoordError, match="starter_build"):
+        seam_build.build(world, kind="operator", signal_kind="launch", signal_key=world.launch_id,
+                         queue_dir=world.qdir, token=_token(world))
+    assert _counts(world) == before
+
+
+def _worker_launch(s):
+    from levain.coordinator.store import Part
+
+    d = s.accept_drop("work for a worker", surface="cli")[0]
+    (t,) = s.split(d.drop_id, [Part("work", "w")])
+    return s.launch_request(_token(s), harness="claude", role="worker", threads=[t.thread_id]).launch_id
+
+
+def test_a_delivery_names_its_recipient_and_only_that_launch_acknowledges(world):
+    other = _worker_launch(world)
+    b = _build(world, "to-other")
+    assert seam_open.record_delivery(world, b.open_id, "launch_brief", recipient=other) is True
+    assert _sql(world, "SELECT recipient_launch_id FROM open_deliveries WHERE open_id = ?", (b.open_id,)) == [(other,)]
+    before = _counts(world)
+    with pytest.raises(CoordError, match=f"delivered to launch {other}, not to launch {world.launch_id}"):
+        _ack(world, b.open_id, deliver=False)
+    assert _counts(world) == before
+    assert seam_open.record_delivery(world, b.open_id, "launch_brief", recipient=world.launch_id) is True
+    assert _ack(world, b.open_id, deliver=False) == (b.open_id, world.session_key, True)
+    with sqlite3.connect(world.path) as c:
+        assert seam_open.acked_cursor(c) == (b.shown_through_gseq, b.open_id) and b.shown_through_gseq > 0
+
+
+def test_a_delivery_to_an_unknown_launch_is_refused(world):
+    b = _build(world, "nobody")
+    before = _counts(world)
+    for who in ("ln-" + "0" * 32, None, 7):
+        with pytest.raises(CoordError, match="launch"):
+            seam_open.record_delivery(world, b.open_id, "light_verb", recipient=who)
+    assert _counts(world) == before
+
+
+def test_a_brief_with_no_omitted_rows_reserves_nothing(world):
+    full = _brief(world)
+    exact = _brief(world, body_cap=len(full.text.encode("utf-8")))
+    assert exact == full and exact.omitted_rows == 0
+    with pytest.raises(seam.BriefTooBig):
+        _brief(world, body_cap=len(full.text.encode("utf-8")) - len(full.text.splitlines()[-1]) - 400)
+
+
+def test_a_cut_brief_fits_its_cap_exactly_and_leaves_no_room_for_another_row(world):
+    _raw(world, "INSERT INTO gseq (gseq, at) VALUES (1000000000000000000, 't')")    # wide gseqs: a long omitted line
+    _counted_rows(world, 60)
+    full = _brief(world, body_cap=10 * seam_open.BODY_CAP)
+    rows = [ln for ln in full.text.splitlines() if ln.startswith("  gseq ")]
+    base = len(full.text.encode("utf-8")) - 1200
+    for cap in range(base, base + 40):
+        b = _brief(world, body_cap=cap)
+        size = len(b.text.encode("utf-8"))
+        shown = [ln for ln in b.text.splitlines() if ln.startswith("  gseq ")]
+        assert size <= cap and 10 <= b.omitted_rows <= 99, cap
+        assert size + len(rows[len(shown)].encode("utf-8")) + 1 > cap, cap   # one row more would not have fitted
+
+
+def test_a_body_over_the_callers_cap_is_never_stored(world, monkeypatch):
+    monkeypatch.setattr(seam_build, "open_brief", lambda *a, **kw: seam.Brief("operator", "x" * 5000, "t", 0, 0, None))
+    before = _counts(world)
+    with pytest.raises(CoordError, match="over the cap of 4096"):
+        _build(world, "capped", body_cap=4096)
+    assert _counts(world) == before
+
+
+def _counted_gseqs(s):
+    from levain.coordinator import seam_classes
+
+    c = sqlite3.connect(s.path)
+    try:
+        present = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        out = []
+        for t in sorted(seam_classes.COUNTED & present):
+            out += [(g, t) for (g,) in c.execute(f"SELECT gseq FROM {t} WHERE gseq IS NOT NULL")]
+        return out
+    finally:
+        c.close()
+
+
+def _shared(gseqs):
+    from collections import Counter
+
+    return sorted(g for g, n in Counter(g for g, _ in gseqs).items() if n > 1)
+
+
+def test_no_two_counted_rows_share_a_gseq_after_a_mixed_run(world):
+    _close(world)
+    world.accept_drop("a second drop", surface="cli")
+    with world._write("coordinator", _token(world)) as (conn, now):
+        seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
+    _worker_launch(world)
+    b = _build(world, "mixed")
+    _ack(world, b.open_id)
+    world.coord_take()
+    gseqs = _counted_gseqs(world)
+    assert len({t for _, t in gseqs}) >= 6 and _shared(gseqs) == []
+    # the probe fails on the shape it guards against: a second table's row reusing a gseq
+    g = _sql(world, "SELECT gseq FROM drops ORDER BY gseq LIMIT 1")[0][0]
+    _raw(world, "INSERT INTO arrival_signals (agent, mark_id, queue_id, ingested_at, gseq) VALUES ('b', 2, 'q', 't', ?)",
+         (g,))
+    assert _shared(_counted_gseqs(world))
+
+
+def test_the_delivery_surfaces_are_listed_in_order(world):
+    b = _build(world, "both")
+    seam_open.record_delivery(world, b.open_id, "light_verb", recipient=world.launch_id)
+    seam_open.record_delivery(world, b.open_id, "launch_brief", recipient=world.launch_id)
+    other = _worker_launch(world)
+    seam_open.record_delivery(world, b.open_id, "light_verb", recipient=other)
+    assert f"  open {b.open_id} (operator) built 0m ago, never acknowledged; delivered via launch_brief,light_verb" \
+        in _brief(world).text.splitlines()
+
+
+def test_the_card_renders_its_real_lines_in_the_brief(world):
+    QuestionStore(world.qdir).file(agent="claude_code", agent_session_id="s", what="Which?",
+                                   options=[("a", "A"), ("b", "B")], rec="a", blocks="x", cwd="/tmp")
+    lines = _brief(world).text.splitlines()
+    card = lines.index("Card (store parts in the cut, queue parts read at the brief's time):")
+    assert lines[card + 1:card + 4] == ["  NEEDS YOU: see Band above", "  away: off", "  undecided (0):"]
+    assert "  review queue: 0 open item(s)" in lines and not any(ln.startswith("Card: cannot-derive") for ln in lines)
+
+
+def test_an_arrival_on_a_store_without_the_open_tables_is_refused(world):
+    _raw(world, "DROP TABLE arrival_signals")
+    with sqlite3.connect(world.path) as c:
+        assert seam_open.open_tables_present(c) is False
+    with pytest.raises(CoordError, match="open tables"):
+        with world._write("coordinator", _token(world)) as (conn, now):
+            seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
