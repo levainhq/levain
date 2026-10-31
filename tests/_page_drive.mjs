@@ -26,6 +26,8 @@
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
 //   {"motion": "reduce"|"no-preference"}    the phone's reduce-motion setting (prefers-reduced-motion); it keeps a scheme step's setting
+//   {"init": "<js source>"}                 runs before the page's own scripts on every later load, then reloads the page once (a
+//                                            faked user agent, a deleted Notification); nothing is collected
 //   {"shot": "<abs path.png>", "full": <bool>}   saves a PNG screenshot there (the whole page when full); collected as {"shot": path}
 //   {"authenticator": {"rpId", "privateKey", "credentialId", "userHandle"}}   a virtual platform authenticator (user
 //                                            verification on) holding that one resident P-256 credential (base64
@@ -86,10 +88,11 @@ for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`h
 if (!targets) { console.error("chrome never answered"); done(2); }
 const ws = new WebSocket(targets.find((t) => t.type === "page").webSocketDebuggerUrl);
 await new Promise((r) => ws.addEventListener("open", r));
-let id = 0; let navStarts = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
+let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
+  if (d.method === "Page.loadEventFired") loads++;
   if (trail.length > 50) trail.shift();          // a page refused in a loop keeps its last 50
   if (d.method === "Page.javascriptDialogOpening") dialogs.push(`${d.params.type}: ${String(d.params.message)}`);
   if (d.method === "Page.frameStartedLoading" || d.method === "Page.frameRequestedNavigation" || d.method === "Page.frameNavigated") navStarts++;
@@ -167,6 +170,30 @@ for (const s of steps) {
     if (!authenticatorId) throw new Error("user_verified needs an authenticator step before it");
     const set = await send("WebAuthn.setUserVerified", { authenticatorId, isUserVerified: !!s.user_verified });
     if (set.error) throw new Error("user verification was not set: " + JSON.stringify(set.error));
+  } else if (s.init !== undefined) {
+    // a script that runs before the page's own scripts on every load from now on, then one reload so it applies to this page
+    const added = await send("Page.addScriptToEvaluateOnNewDocument", { source: s.init });
+    if (added.error) throw new Error("the init script was not added: " + JSON.stringify(added.error));
+    // the first load must be over before the count is read, or its late event would read as the reload's; then the reload's own load
+    // event, not a fixed pause (the old document's readyState can still read "complete" just after the call). Any stall is a setup failure.
+    for (const end = Date.now() + scaled(15000);;) {
+      if (await evaluate("document.readyState") === "complete") break;
+      if (Date.now() >= end) throw new Error("init: the first load did not complete");
+      await sleep(100);
+    }
+    await evaluate("window.__driveOldDocument = true");   // a mark the reloaded document will not carry
+    const loadsBefore = loads;
+    const reloaded = await send("Page.reload", {});
+    if (reloaded.error) throw new Error("init: the reload was refused: " + JSON.stringify(reloaded.error));
+    for (const end = Date.now() + scaled(15000); loads === loadsBefore;) {
+      if (Date.now() >= end) throw new Error("init: the reload did not complete");
+      await sleep(50);
+    }
+    for (const end = Date.now() + scaled(15000);;) {
+      if (await evaluate("document.readyState === 'complete' && window.__driveOldDocument === undefined") === true) break;
+      if (Date.now() >= end) throw new Error("init: the reloaded page did not become ready");
+      await sleep(100);
+    }
   } else if (s.emulate !== undefined) {
     await send("Emulation.setDeviceMetricsOverride", { width: s.emulate.w, height: s.emulate.h, deviceScaleFactor: s.emulate.dpr || 1, mobile: !!s.emulate.mobile });
     await sleep(600);

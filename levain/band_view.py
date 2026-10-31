@@ -60,7 +60,7 @@ from levain.consent.questions import (HOOK_BUSY_MS, Question, QuestionStore, _no
                                      read_deadline)
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
-           "band_hooks_state", "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed",
+           "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed", "session_band_state",
            "run_band", "run_band_answer", "AnswerCommitted", "AuthorityItem", "BandSnapshot", "PickNotOffered",
            "QUESTION_VERSION_FIELDS", "VersionMoved", "VersionedQuestionStore", "answer_item", "answerable",
            "subject_for", "subject_version", "summary"]
@@ -1881,29 +1881,11 @@ def _stop_turn(directory: Path | str, fact: TurnFact, rec: dict | None, payload:
     return _reprint_reason(missing)
 
 
-BAND_MARK = "levain.band_view"
-
-
-def band_hooks_state(hooks_dir: Path | str, agent: str = "claude_code") -> tuple[str, list[str]]:
-    """``(state, scripts lacking the band)`` of an install's ``activation/hooks``: ``wired`` (every required script
-    calls :mod:`levain.band_view`), ``stale`` (some do: an older copy beside a newer one; ``levain update`` fixes it)
-    or ``absent`` (none, or no directory). Required, for Claude Code and Codex alike: SessionStart, UserPromptSubmit and
-    the Stop verifier (a Stop hook of either can block once with ``{"decision": "block", "reason": ...}``)."""
-    names = ["session_start.py", "user_prompt_submit.py", "stop.py"]
-    lacking = []
-    for n in names:
-        try:
-            has = BAND_MARK in (Path(hooks_dir) / n).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            has = False
-        if not has:
-            lacking.append(n)
-    return ("wired" if not lacking else "absent" if len(lacking) == len(names) else "stale"), lacking
-
-
-def _codex_hooks_dir(environ: Mapping[str, str], cwd: str | None) -> Path | None:
-    """The ``activation/hooks`` directory Codex's own ``hooks.json`` names for UserPromptSubmit: ``$CODEX_HOME`` (or
-    ``~/.codex``), then a ``.codex/hooks.json`` of the working directory or a parent. ``None``: none names one."""
+def _codex_hooks_dir(environ: Mapping[str, str], cwd: str | None) -> tuple[Path, Path] | None:
+    """``(activation/hooks directory, the hooks.json naming it)`` for the first of Codex's own ``hooks.json`` files
+    whose UserPromptSubmit names one: ``$CODEX_HOME`` (or ``~/.codex``), then a ``.codex/hooks.json`` of the working
+    directory or a parent. The file comes back so the install's wiring is read from the file it was found in.
+    ``None``: none names one."""
     import shlex
 
     home = Path(environ.get("CODEX_HOME") or Path.home() / ".codex")
@@ -1918,7 +1900,7 @@ def _codex_hooks_dir(environ: Mapping[str, str], cwd: str | None) -> Path | None
                 for h in entry.get("hooks") or []:
                     for tok in shlex.split(str(h.get("command", ""))):
                         if tok.endswith("user_prompt_submit.py"):
-                            return Path(tok).parent
+                            return Path(tok).parent, f
         except Exception:
             continue
     return None
@@ -1929,7 +1911,8 @@ def _find_hooks_dir(agent: str, cwd: str | None, environ: Mapping[str, str]) -> 
     ``CLAUDE_PROJECT_DIR`` or the working directory and its parents; Codex's own hooks.json (never a neighbouring
     Claude install: those scripts do not run in Codex)."""
     if agent == "codex":
-        return _codex_hooks_dir(environ, cwd)
+        found = _codex_hooks_dir(environ, cwd)
+        return found[0] if found else None
     cands: list[Path] = []
     if environ.get("CLAUDE_PROJECT_DIR"):
         cands.append(Path(environ["CLAUDE_PROJECT_DIR"]))
@@ -1940,6 +1923,29 @@ def _find_hooks_dir(agent: str, cwd: str | None, environ: Mapping[str, str]) -> 
         if (c / "activation" / "hooks" / "user_prompt_submit.py").is_file():
             return c / "activation" / "hooks"
     return None
+
+
+def session_band_state(agent: str, cwd: str | None, environ: Mapping[str, str]) -> str:
+    """``wired`` | ``stale`` | ``absent``: whether the band hooks of the install a session would run are wired for that
+    session, answered by :func:`levain.doctor.install_band_wiring` (the one answer). The install is found as
+    :func:`_find_hooks_dir` finds it: for Claude Code from the project dir (``CLAUDE_PROJECT_DIR``, else ``cwd``),
+    which also decides which project settings Claude Code loads; for Codex from its own hooks.json, for a session
+    in ``cwd``, its wiring read from the hooks.json the install was found in."""
+    from levain.doctor import install_band_wiring
+
+    source: Path | None = None
+    if agent == "codex":
+        found = _codex_hooks_dir(environ, cwd)
+        hooks, source = found if found else (None, None)
+        project = cwd
+        home: Path | None = Path(environ.get("CODEX_HOME") or Path.home() / ".codex")
+    else:
+        project = environ.get("CLAUDE_PROJECT_DIR") or cwd
+        hooks = _find_hooks_dir(agent, project, {})
+        home = None
+    if hooks is None or not project:
+        return "absent"
+    return install_band_wiring(hooks.parent.parent, project, agent, home, source).state
 
 
 def gate_notice(directory: Path | str, agent: str, session: str | None, cwd: str | None,
@@ -1958,10 +1964,6 @@ def gate_notice(directory: Path | str, agent: str, session: str | None, cwd: str
             return None
         if is_autonomous(session, directory, env):
             return None
-        hooks = _find_hooks_dir(agent, cwd, env)
-        state = band_hooks_state(hooks, agent)[0] if hooks is not None else "absent"
-        if state == "wired":
-            return None
         store = QuestionStore(directory)
         items, _, _ = _read(store)
         n = len(items)
@@ -1973,6 +1975,9 @@ def gate_notice(directory: Path | str, agent: str, session: str | None, cwd: str
         except Exception:                     # an unreadable authority source: the questions still count, said so
             partial = True
         if n == 0:
+            return None
+        state = session_band_state(agent, cwd, env)       # after the count: nothing open is the common case
+        if state == "wired":
             return None
         if not _claim_retry(directory, viewer, 1):
             return None
@@ -2000,6 +2005,16 @@ def run_band(args: argparse.Namespace) -> int:
     except Exception:
         pass
     return 0
+
+
+def run_band_hooks(args: argparse.Namespace) -> int:
+    """``levain band hooks install|remove|status`` (:mod:`levain.band_hook`)."""
+    from levain import band_hook
+
+    code, text = {"install": band_hook.install, "remove": band_hook.remove,
+                  "status": band_hook.status}[args.hooks_verb]()
+    print(text, file=sys.stderr if code else sys.stdout)
+    return code
 
 
 def run_band_answer(args: argparse.Namespace) -> int:
@@ -2039,3 +2054,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     a.add_argument("--queue-dir", dest="queue_dir", type=Path, default=argparse.SUPPRESS,
                    help="The consent directory holding questions.db.")
     a.set_defaults(func=run_band_answer)
+    hk = sub.add_parser("hooks", help="Opt in to the NEEDS YOU band in every Claude Code session (band-only hooks in "
+                                      "your user-level settings): install, remove, status.")
+    hsub = hk.add_subparsers(dest="hooks_cmd", required=True)
+    for name, text in (("install", "Write the band-only hooks to the user-level Claude Code settings, with a receipt."),
+                       ("remove", "Take levain's band hook handlers (found by their module) out again; the "
+                                  "rest of the settings file is left as it was."),
+                       ("status", "Read the receipt and the live settings (and probe the recorded interpreter).")):
+        hsub.add_parser(name, help=text).set_defaults(func=run_band_hooks, hooks_verb=name)
