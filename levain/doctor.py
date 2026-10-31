@@ -1893,9 +1893,10 @@ def _check_slot_services(*, host: str | None = None, store: Path | None = None, 
 def _check_host_awake() -> list[CheckResult]:
     """Why this host will or will not sleep (C7, P6s): whether the idle-sleep assertion is held, and for which source: a
     working work thread (coordinator store) or a live agent occurrence (agents store), each live occurrence with its
-    state and age so a stuck one is visible. Advisory: no row until a coordinator store or a live occurrence exists
-    (both read only, never created here), a warn row when one exists and cannot be read; never a failure, because
-    sleeping with nothing working is the machine's own setting."""
+    state and age so a stuck one is visible. Advisory: no row until a coordinator store, a live occurrence or an
+    ``awake.json`` record exists (all read only, never created here; a record whose holder is alive is described by its
+    last-sync state even when nothing is live now), a warn row when one exists and cannot be read; never a failure,
+    because sleeping with nothing working is the machine's own setting."""
     from levain.install import _consent_queue_dir
 
     name = "host sleep"
@@ -1905,11 +1906,17 @@ def _check_host_awake() -> list[CheckResult]:
         from levain.coordinator.door import readonly_store
 
         store = readonly_store(qdir)          # a doctor reads: it never creates the store or its tables
-        occ = awake.live_occurrence_details()   # the agents' live occurrences hold the host too (P6s), read-only
-        if store is None and not occ:
+        agent_unreadable = False
+        try:                                  # a separate read: an unreadable agents store must not hide the coordinator side
+            occ = awake.live_occurrence_details()   # the agents' live occurrences hold the host too (P6s), read-only
+        except Exception:      # noqa: BLE001
+            occ, agent_unreadable = None, True
+        if store is None and not occ and not agent_unreadable and not (Path(qdir) / awake.FILE).exists():
             return []
         n = len(awake.working(store)) if store is not None else 0
-        ok, line = awake.describe(qdir, working_count=n, occurrence_count=len(occ), occurrences=occ)
+        ok, line = awake.describe(qdir, working_count=n, occurrence_count=len(occ or []), occurrences=occ)
+        if agent_unreadable:
+            ok, line = False, f"{line} (agent store unreadable)"
     except Exception as exc:      # noqa: BLE001 - a doctor row never crashes the run
         return [CheckResult(name, True, f"not read: {exc}", warn=True)]
     return [CheckResult(name, True, line, warn=not ok)]

@@ -295,3 +295,112 @@ def test_an_unreadable_coordinator_store_still_takes_the_agents_hold_and_both_un
               q, adir)
     assert "could not sync" in out and "coordinator and agent" in out and awake._ours(rec(q))
     assert rec(q)["pid"] == held["pid"]
+
+
+# ---- fix round 1 (L3 r1): absence is only a confirmed FileNotFoundError; directory= is required without a store ----
+
+def _in_process(monkeypatch):
+    monkeypatch.setattr(awake, "_IN_TESTS", True)
+    monkeypatch.setattr(awake, "holder_command", lambda *a, **k: [shutil.which("sleep"), "90"])
+    monkeypatch.delenv("LEVAIN_NO_IDLE_ASSERTION", raising=False)
+
+
+def _holder_survives(q, adir, held):
+    out = awake.sync(directory=q, agent_dir=adir)
+    assert "could not sync" in out["why"] and out["unknown"] == ["agent"], out
+    assert awake._ours(rec(q)) and rec(q)["pid"] == held["pid"], "the holder was released with the agents store unreadable"
+
+
+def test_an_unsearchable_agent_store_parent_is_unknown_and_the_holder_stays(world, monkeypatch):
+    q, adir = world
+    run(AGENT, q, adir, "occ-1", "start", NOW)
+    held = rec(q)
+    _in_process(monkeypatch)
+    adir.chmod(0)
+    try:
+        if os.access(adir / DB_NAME, os.F_OK):
+            pytest.skip("this uid ignores directory permissions (root)")
+        with pytest.raises(PermissionError):
+            awake.live_occurrence_details(adir)
+        _holder_survives(q, adir, held)
+    finally:
+        adir.chmod(0o700)
+
+
+def test_a_broken_symlink_for_the_agent_store_is_unknown_and_the_holder_stays(world, monkeypatch, tmp_path):
+    q, adir = world
+    run(AGENT, q, adir, "occ-1", "start", NOW)
+    held = rec(q)
+    _in_process(monkeypatch)
+    (adir / DB_NAME).rename(adir / "aside.db")
+    (adir / DB_NAME).symlink_to(tmp_path / "nowhere.db")
+    with pytest.raises(OSError):
+        awake.live_occurrence_details(adir)
+    _holder_survives(q, adir, held)
+
+
+def test_a_directory_in_place_of_the_agent_store_is_unknown_and_the_holder_stays(world, monkeypatch):
+    q, adir = world
+    run(AGENT, q, adir, "occ-1", "start", NOW)
+    held = rec(q)
+    _in_process(monkeypatch)
+    (adir / DB_NAME).rename(adir / "aside.db")
+    (adir / DB_NAME).mkdir()
+    with pytest.raises(OSError, match="not a regular file"):
+        awake.live_occurrence_details(adir)
+    _holder_survives(q, adir, held)
+
+
+def test_only_a_confirmed_absence_is_empty(tmp_path):
+    assert awake.live_occurrence_details(tmp_path) == []                 # the directory exists, the file does not
+    assert awake.live_occurrence_details(tmp_path / "no" / "such") == []   # nor does the directory: still FileNotFoundError
+
+
+def test_sync_without_a_store_or_a_directory_names_the_missing_directory_and_touches_nothing(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    _in_process(monkeypatch)
+    from levain.consent.queue import default_queue_dir
+
+    dq = default_queue_dir()
+    dq.mkdir(parents=True, mode=0o700)          # it exists, so a silent fall back would take a lock here
+    out = awake.sync(agent_dir=tmp_path)
+    assert out["held"] is False and "no coordinator queue directory was given" in out["why"], out
+    assert list(dq.iterdir()) == [], "the default queue directory was used"
+    assert not list(tmp_path.glob("awake.*"))
+
+
+def test_the_doctor_row_describes_a_live_holder_with_nothing_left_and_no_coordinator_store(world, monkeypatch):
+    from levain import install
+    from levain.doctor import _check_host_awake
+
+    q, adir = world
+    monkeypatch.setattr(install, "_consent_queue_dir", lambda: q)
+    run(AGENT, q, adir, "occ-1", "start", NOW)
+    c = sqlite3.connect(adir / DB_NAME, isolation_level=None)             # terminal, and the process died before its sync
+    c.execute("UPDATE agent_occurrences SET state='skipped-budget', reason='x', ended_at=? WHERE occurrence_id='occ-1'", (NOW,))
+    c.close()
+    assert (q / "awake.json").exists() and awake._ours(rec(q))
+    [row] = _check_host_awake()
+    assert row.ok and not row.warn and "holder alive with no current work seen" in row.detail, row.detail
+
+
+def test_the_doctor_row_keeps_the_coordinator_side_when_the_agent_store_is_unreadable(world, monkeypatch, tmp_path):
+    from levain import install
+    from levain.doctor import _check_host_awake
+
+    q, adir = world
+    monkeypatch.setattr(install, "_consent_queue_dir", lambda: q)
+    drop, thread = run(COORD, q, "work", tmp_path).split()
+    (adir / DB_NAME).write_bytes(b"not a database" * 100)
+    [row] = _check_host_awake()
+    assert "agent store unreadable" in row.detail and row.warn and "1 work thread(s) working" in row.detail, row.detail
+    assert "not read" not in row.detail
+
+
+def test_a_held_line_never_renders_an_empty_who(tmp_path, monkeypatch):
+    monkeypatch.setattr(awake, "_ours", lambda r: True)
+    (tmp_path / awake.FILE).write_text(json.dumps({"pid": 77, "until": time.time() + 99, "threads": [],
+                                                   "occurrences": [], "source": "coordinator"}))
+    ok, line = awake.describe(tmp_path, working_count=0, occurrence_count=0, occurrences=[])
+    assert ok and "no live work seen now" in line and ": at its" not in line and ":  " not in line, line

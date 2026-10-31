@@ -173,15 +173,24 @@ def live_occurrence_details(agent_dir: Path | str | None = None) -> list[dict[st
     row's ``launched_at`` for a launched one, else its ``admitted_at``. Writes no row. The open is read-only
     (``mode=ro``), but a read-only open of a WAL store (the real agents store is one) may create its ``-wal`` / ``-shm``
     sidecars, as any reader does; no other file is created. No store, or one with no agent table, is an empty list. A
-    store that exists and cannot be read raises, so a caller never takes unreadable for empty."""
+    store that exists and cannot be read raises, so a caller never takes unreadable for empty: only a confirmed
+    ``FileNotFoundError`` is empty, while any other lookup failure (an unsearchable parent, a broken symlink, EACCES) or a
+    path that is not a regular file raises. A doctor run as another uid can leave root-owned WAL sidecars that the normal
+    user then cannot open."""
     import sqlite3
+    import stat
     from urllib.parse import quote
 
     from levain.autonomic.db import DB_NAME, default_store_dir
 
     path = (Path(agent_dir) if agent_dir is not None else default_store_dir()) / DB_NAME
-    if not path.is_file():
+    try:
+        os.lstat(path)                 # absence is confirmed on the name itself, never on where a symlink leads
+    except FileNotFoundError:
         return []
+    mode = os.stat(path).st_mode       # a broken symlink, an unsearchable parent, EACCES: all raise
+    if not stat.S_ISREG(mode):
+        raise OSError(f"{path} exists but is not a regular file")
     conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=5.0, isolation_level=None)
     try:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_occurrences'").fetchone() is None:
@@ -215,24 +224,22 @@ def sync(store: Any = None, *, directory: Path | str | None = None,
     with ``directory``, the coordinator queue directory that holds ``awake.json``); whichever calls, both sources are
     re-read here under the lock and nothing the caller saw is trusted. An unreadable source is UNKNOWN, never empty:
     the hold is still taken when the other source has work, and the holder is never released (nor renewed) while a
-    source is unknown and the other has none. With neither ``store`` nor ``directory`` the lock and ``awake.json`` fall
-    back to :func:`~levain.consent.queue.default_queue_dir`, so an agent-side caller must pass ``directory=`` (P6-5)
-    to name the coordinator queue directory it means. Never raises: a host that cannot hold one is reported by
+    source is unknown and the other has none. ``directory=`` is REQUIRED whenever ``store`` is None: with neither, the
+    sync takes no lock, writes nothing and returns ``held`` False with a reason naming the missing directory, because a
+    silent fall back to the default queue directory could take a different lock and ``awake.json`` than the
+    coordinator. ``agent_dir=`` is a TEST SEAM: production callers use the default agent store (the queue directory and
+    the agent store are one pairing in 1.0). Never raises: a host that cannot hold one is reported by
     :func:`describe`."""
     if os.environ.get("LEVAIN_NO_IDLE_ASSERTION") or (os.environ.get("PYTEST_CURRENT_TEST") and not _IN_TESTS):
         # a test run that moves threads must not leave a real holder on the developer's machine
         return {"held": False, "why": "disabled by the environment (LEVAIN_NO_IDLE_ASSERTION or a test run)"}
     if fcntl is None:
         return {"held": False, "why": _NO_LOCKS}
+    if store is None and directory is None:
+        return {"held": False, "why": "could not sync: no coordinator queue directory was given (pass directory= "
+                                      "when there is no store), so no lock or awake.json was touched"}
     try:
-        if store is not None:
-            where = Path(store.directory)
-        elif directory is not None:
-            where = Path(directory)
-        else:
-            from levain.consent.queue import default_queue_dir
-
-            where = default_queue_dir()
+        where = Path(store.directory) if store is not None else Path(directory)
         fd = os.open(where / LOCK, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -375,9 +382,12 @@ def _describe(directory: Path | str, working_count: int | None, occurrence_count
         who = (f"{n} work thread(s) working" if n else "") + (" and " if n and occ_text else "")
         if occ_text:
             who += f"agent occurrence(s) live: {occ_text}"
-        return True, (f"idle sleep is held off (pid {pid}, held by {cur.get('source') or 'coordinator'}: {who} at its "
-                      f"last sync); it releases when none is left, and by itself within {HOLD_SECONDS // 60} minutes "
-                      "if Levain stops"), True
+        by = f"pid {pid}, held by {cur.get('source') or 'coordinator'}"
+        tail = f"it releases when none is left, and by itself within {HOLD_SECONDS // 60} minutes if Levain stops"
+        if not who:                  # alive on a record whose work has since gone (a crash before the closing sync)
+            return True, (f"idle sleep is held off ({by}): holder alive with no current work seen (no live work seen "
+                          f"now); the next sync releases it, and it ends by itself within {HOLD_SECONDS // 60} minutes"), True
+        return True, f"idle sleep is held off ({by}: {who} at its last sync); {tail}", True
     parts = []
     if working_count:
         parts.append(f"{working_count} work thread(s) are working")
