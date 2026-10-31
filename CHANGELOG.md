@@ -10,6 +10,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **Groundwork: AgentSpec, the registration refusals and the lifecycle axes.** `levain agents register|list|show|pause|resume|retire|zone` over immutable, content-hashed agent specs (`stop_at` required), refusing what the agent design's rules 1-6 and five refinements refuse. A file registers whole or not at all (a feeder group is judged together and written in one transaction), and `--warn` writes nothing, not even a new store. A pause stays on its agent through a same-content re-register, a `--revise` and a retire, and only `resume` clears it; a retire followed by a new register of the name is a new agent (a new `agent_id`) that starts active. `--warn` over an audit file echoes the audit's own verdicts and checks each row is coherent; it does not run the refusals, which are exercised by the spec fixture's tests. The build plan's "diff is empty" check cannot hold literally (the output carries fields the expected file does not); the test compares every row's verdict, class, refinement and review flag. Nothing runs an agent yet.
 - **Groundwork: one sleep reconciler over both stores.** `awake.sync` now re-reads the coordinator's working threads AND the agents' live occurrences (`agent_occurrences` in state `admitted` or `launched`) under the one `awake.json` lock, whichever side calls it, and releases the holder only when both are empty; `levain doctor`'s host-sleep row names the source (coordinator, agent, or both) and the occurrence holding the host. Nothing starts an agent occurrence yet.
 - **The coordinator now answers words you drop from the cockpit or the phone, and silence no longer reads as "heard".** `levain coord reply DROP_ID --text ... --token N` (N is the lease token `levain coord claim` prints) files a reply bound to that drop: one reply per drop, within 24 hours of it, and nothing else (a drop that does not exist, a second reply, an old drop, or a drop whose time cannot be read is refused by the store itself). The Coordinator panel shows the reply with the block Levain froze when it was written (what changed since your last message, and the question band), and that block never changes after. A drop from the cockpit or the phone (not one made with `levain drop`) with no reply after 10 minutes shows on the panel, and in the coordinator's next reply block, as `drop ... (14:02, phone): no reply yet`; once the 24 hours are over it reads `drop ... (2026-10-31 14:02, phone): no reply, window closed` and stays for 7 days after the drop, then goes. The reply counts as delivered when written, and your next terminal reply names it. A store from before this is upgraded in place and keeps every earlier reply.
+- **The cockpit's home page has a drop card: one place to write to the coordinator and read what it said back.** A box
+  under the Needs-you row ("words for the coordinator") with Send, which posts to the cockpit's `/cockpit/coord/drop` with
+  the same request the drop sheet sends (kept in the browser before it is posted, so a drop whose answer was lost is
+  counted as "not confirmed", and sending it again unchanged finds out whether it arrived). A browser holding no cockpit token says "Sign in to send" and sends
+  nothing. "Add an envelope" opens the sign sheet with the words, because an envelope is signed with the passkey there
+  only. Under the box, one thread holds your drops (from the terminal, the phone and the cockpit) and the coordinator's
+  replies, newest first: eight rows, then "show N more", each a one-line preview that opens to the full text, and a
+  filter box once there are two or more. The listing reads the newest 200 drops and says "Older drops are not shown
+  here" when more exist. The Board's desk-thread panel is no longer drawn on its own; its rows are in this thread, and a
+  panel that cannot be read leaves your drops and one line saying so. Covered by tests, including browser tests; I did
+  not run it by hand against a real coordinator.
 - **The coordinator's reply carries what changed in its store.** Ahead of the NEEDS YOU band, a coordinator session's
   reply block now has a work delta rendered by Levain (never model-written) from the coordinator store's records that carry
   its `gseq`: replies, launch events, lease events, ready moves and chat messages. At most 5 lines in `gseq` order, then
@@ -335,7 +346,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   interrupted replace or puts the old store back. On an install where keys never ran, the replace also holds keys off.
 - **The cockpit answers an agent's consent request with your passkey.** On the Needs-you card, Allow and Deny open the
   sign sheet with that answer picked, and an undecided request can be ruled from the decisions panel. The checks are the
-  phone page's own. An answer a passkey cannot give here (allowing a T3 request) stays a terminal command, and a cockpit
+  same code the old phone port ran for an answer (the cockpit calls it; there is no second copy). An answer a passkey cannot give here (allowing a T3 request) stays a terminal command, and a cockpit
   served on a port says where the request can be answered instead of asking for a passkey. A ruling is confirmed as soon
   as it is recorded; its delivery to the session continues on its own.
 - **The consent sheet treats a request as changed when the words an option shows, or the exact line it signs, change.**
@@ -379,6 +390,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   command line includes `--guard <guard.json>`.
 
 ### Changed
+- **Editing the State section from the plane goes through anneal's own section write when the entity has a store, and
+  its undo is bound to that section's version.** An edit and its undo call `Store.replace_section` when the entity's
+  anneal store owns the continuity file and the installed anneal has that method; otherwise the file edit runs as
+  before, and audit rows of the store route carry `via: store`. The edit records the section version anneal returned for
+  the body it wrote, never a later read of the file, and undo succeeds only while State is unchanged since that write: a
+  wrap that rewrote State refuses it as stale, and a wrap that left State alone does not (undo then replaces State only,
+  and the wrap's other sections stand). If the write committed but its audit row could not be written, the plane says
+  the change COMMITTED, tells you not to retry, and keeps and names the backup. Covered by tests; I did not run it
+  against a live wrap.
 - **`levain band hooks install | remove | status`: the NEEDS YOU band in every session, opt-in.** Writes band-only
   SessionStart, UserPromptSubmit and Stop hooks to your user-level Claude Code settings (`$CLAUDE_CONFIG_DIR` or
   `~/.claude`), merged beside your own hooks, with a receipt (`<levain home>/band_hooks.json`). They carry no posture,
@@ -523,9 +543,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   revoke it and pair it again if it asks for a pairing code.
 - **The cockpit's Work view now does something when you click it.** A worker in the Work lens opens its agent page, as a node in the Agents graph does, and an open loop opens its row in the Open loops panel (scrolled to, unfolded if folded, and lit for a moment).
 - **The cockpit's tokens-today figure no longer leaves out subagent lanes on a busy session.** It read only the first 64
-  subagent transcripts by file name, so on a heavy session the later lanes were silently missing. It now reads every
-  lane written since local midnight, newest first, and a lane it could not read in time (the read budget ran out) is
-  counted and shown in the panel's "not read" line instead of dropped.
+  subagent transcripts by file name, so on a heavy session the later lanes were silently missing. It now reads the
+  lanes written since local midnight, newest first, up to 512 of them, and a lane it could not read in time (the read
+  budget ran out), could not be read, or that lay past the 512 is counted and shown in the panel's "not read" line instead
+  of dropped. When the figure is unchanged but a lane has been appended to under an idle session, it is read again.
+- **The tokens-today figure can show cache reads beside the fresh tokens, never added into them.** When the cockpit's
+  provider reports `counts.cache_read_today`, the Work strip and the Agents lens say it as "850M cache reads" next to
+  the fresh figure (the validator takes the field as optional; absent or null shows nothing). Levain's own default
+  provider does not report it, so a stock install shows no change.
 - **A coordinator may run the `levain coord log` line its reply block hands it.** When more than five records are new, the
   work delta ends with `+N more: levain coord log --since G`; the coordinator's workspace refused that command as the
   operator's. `coord log` only displays, so it is now admitted there. The presence word is also written whole when the
@@ -680,6 +705,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - Groundwork for the session-start brief: the morning card takes an optional `now` (no wall-clock read, no band numbering when given), the band can be read without recording a view or numbering an item, and the ready board can be read on a connection the caller already holds. Every default is unchanged, and nothing in `levain` passes them yet, so there is no change you can see.
+- Groundwork for automations that write a document: `levain.autonomic.hands_exec.HandsExecutor` is the executor for two actions, `write_document` and `undo_document`, run only as the entity's separate hands user (never in your process). It writes into the hands user's own workspace and never over an existing name; undo moves the file aside only while its bytes are the recorded ones. A run holds the hands lock, checks the setup afresh from the operating system, and reports done only when the child exited 0, every process of the hands user was then stopped and shown gone, and the disk shows the one expected result; anything after the child started that cannot be shown is an unknown outcome, never a success. Nothing builds or calls it yet, so there is no change you can see. The one visible change beside it: the check that no session of the entity is live now lives in one module (`levain.hands_live`) that the workspace-git code and this executor share, and a refusal from the session lock names an automation as well as a session.
+- Groundwork for graduation cards: the cockpit's proposals payload can carry a `graduations` part, the cards for graduation steps no live signed policy covers (the binding, the rung change, the counts, which clause failed, and the one `levain binding policy create` line that would cover it, narrowed to that binding's family, for 30 days) and the newest 20 graduation steps read from the autonomic store without creating or migrating it. The page never signs. Nothing gives the cockpit a store or an engine yet, so the part is never sent and the Decisions view shows no card; `levain binding graduate` uses the same card text for the line it prints.
 - Groundwork for named agents: a role registry. `levain agents role add <file>` registers a role (name, brief template with typed slots, ceiling, model, harness, executor) under a content hash and a version, and refuses a file with an unknown field, naming it; `levain agents role show <name>` prints it. Nothing runs a role yet, and no role is signed: authorisation comes through the agent link.
 - Groundwork for chat approvals: the store now has tables for each approval request a chat session raises and everything that happens to it (asked, decided, answered, cancelled), kept in the same append-only style as the rest of the chat record. Nothing in `levain` writes to them yet, so there is no change you can see. A store from 0.11.25 or later is brought up to date the first time it is opened for writing, keeping every row it already had; opening one read-only changes nothing.
 - **A contained-shell grant can answer a Levain chat launch's Bash calls.** It answers only a chat call carrying the
