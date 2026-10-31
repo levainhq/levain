@@ -23,11 +23,12 @@ from typing import Any, NamedTuple
 from levain.cockpit.consent import utc_stamp
 from levain.coordinator.store import CoordStore, _append_only
 
-__all__ = ["MAX_LINES", "OPERATOR_VIEWS_SCHEMA", "WorkBlock", "WorkDelta", "advance", "read_block", "render", "watermark",
-           "work_delta"]
+__all__ = ["HEAD", "MAX_LINES", "OPERATOR_VIEWS_SCHEMA", "WorkBlock", "WorkDelta", "advance", "read_block", "render",
+           "watermark", "work_delta"]
 
 MAX_LINES = 5
 _FIELD_MAX = 60
+HEAD = "since your last message (Levain's record"     # every block's first line starts so (the Stop's retry names it)
 UNREAD = "! not read (the coordinator store could not be read just now)"
 
 OPERATOR_VIEWS_SCHEMA: tuple[str, ...] = (
@@ -172,7 +173,7 @@ def render(delta: WorkDelta) -> str:
     if delta.unordered:
         note = (f"; {delta.unordered} older reply carries no order and is not listed" if delta.unordered == 1
                 else f"; {delta.unordered} older replies carry no order and are not listed")
-    out = [f"since your last message (Levain's record, {len(shown)} of {delta.total}{note}):"]
+    out = [f"{HEAD}, {len(shown)} of {delta.total}{note}):"]
     out.extend(f"  {text}" for _g, text in shown)
     more = delta.total - len(shown)
     if more > 0:
@@ -182,35 +183,51 @@ def render(delta: WorkDelta) -> str:
 
 class WorkBlock(NamedTuple):
     """``text``: the block (``""`` for nothing to say; the ``! not read`` line for a store that could not be read).
-    ``through``: the cursor a verified reply would advance to (0 when it must not move)."""
+    ``through``: the cursor a verified reply would advance to (0 when it must not move). ``store_id``: the
+    ``meta.store_id`` of the store it was read from (``""`` when none was read), which :func:`advance` requires."""
     text: str
     through: int
+    store_id: str = ""
+
+
+def _store_id(conn: sqlite3.Connection) -> str:
+    row = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
+    return "" if row is None or row[0] is None else str(row[0])
 
 
 def read_block(directory: Path | str | None, viewer: str, busy_s: float) -> WorkBlock:
-    """The viewer's block from the coordinator store in ``directory``, waiting at most ``busy_s`` on a lock. Never
-    raises and never answers a store it could not read with an empty block: that is the ``! not read`` line, and the
-    cursor stays where it was."""
+    """The viewer's block from the coordinator store in ``directory``, waiting at most ``busy_s`` on a lock. The
+    cursor, the store's id and the records come from ONE read snapshot. Never raises and never answers a store it
+    could not read with an empty block: that is the ``! not read`` line, and the cursor stays where it was."""
     try:
         conn = CoordStore(directory).open_readonly(busy_s=max(0.0, busy_s))
     except Exception:                                            # noqa: BLE001 - said, not swallowed
-        return WorkBlock(f"since your last message (Levain's record): {UNREAD}", 0)
+        return WorkBlock(f"{HEAD}): {UNREAD}", 0)
     try:
-        since = watermark(conn, viewer)
-        delta = work_delta(conn, since)
+        conn.execute("BEGIN")
+        try:
+            since = watermark(conn, viewer)
+            store_id = _store_id(conn)
+            delta = work_delta(conn, since)                      # inside this snapshot (it opens none of its own)
+        finally:
+            conn.execute("ROLLBACK")
     except Exception:                                            # noqa: BLE001 - a busy store, a table that will not read
-        return WorkBlock(f"since your last message (Levain's record): {UNREAD}", 0)
+        return WorkBlock(f"{HEAD}): {UNREAD}", 0)
     finally:
         conn.close()
-    return WorkBlock(render(delta), delta.through if delta.total else 0)
+    return WorkBlock(render(delta), delta.through if delta.total else 0, store_id)
 
 
-def advance(directory: Path | str | None, viewer: str, through: int, busy_s: float) -> bool:
+def advance(directory: Path | str | None, viewer: str, through: int, busy_s: float, store_id: str) -> bool:
     """Append ``operator_views(viewer, through, now)`` when ``through`` is past the viewer's cursor: one bounded write,
-    called only after the reply that carried the block verified. ``False`` (and nothing written) for a store without
-    the table (no coordinator writer has migrated it yet: the next reply repeats the delta, the cheap error), a cursor
-    already there, a busy store or any other failure. Never raises."""
-    if not isinstance(through, int) or through <= 0:
+    called only after the reply that carried the block verified. ``store_id`` is the one the block was read from
+    (:attr:`WorkBlock.store_id`): a store whose ``meta.store_id`` is another (``dispatch.db`` replaced between the read
+    and the Stop) is refused, so another store's records are never skipped by this store's cursor. A store from before
+    the table gets it here, inside the same ``BEGIN IMMEDIATE`` (:data:`OPERATOR_VIEWS_SCHEMA`, the table and its
+    triggers), so its cursor moves at the first verified reply; the reader path never makes it. ``False`` (and nothing
+    written) for another store, a cursor already there, a busy store or any other failure: the next reply repeats the
+    delta, the cheap error. Never raises."""
+    if not isinstance(through, int) or through <= 0 or not isinstance(store_id, str) or not store_id:
         return False
     try:
         store = CoordStore(directory)
@@ -226,7 +243,13 @@ def advance(directory: Path | str | None, viewer: str, through: int, busy_s: flo
         conn.execute("PRAGMA synchronous = FULL")
         conn.execute("BEGIN IMMEDIATE")
         try:
-            if "operator_views" not in _tables(conn) or watermark(conn, viewer) >= through:
+            if _store_id(conn) != store_id:
+                conn.execute("ROLLBACK")
+                return False
+            if "operator_views" not in _tables(conn):
+                for stmt in OPERATOR_VIEWS_SCHEMA:
+                    conn.execute(stmt)
+            elif watermark(conn, viewer) >= through:
                 conn.execute("ROLLBACK")
                 return False
             now = utc_stamp(datetime.now(timezone.utc))

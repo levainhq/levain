@@ -24,6 +24,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -1578,7 +1579,7 @@ def _coord_log(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
         return 0
     conn = store.open_readonly()
     try:
-        delta = work_delta.work_delta(conn, args.since, max(1, args.limit))
+        delta = work_delta.work_delta(conn, args.since, args.limit)     # both in range: the parser's types
     finally:
         conn.close()
     shown = delta.lines
@@ -1588,6 +1589,24 @@ def _coord_log(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     _emit(out, args.json, {"records": [{"gseq": g, "text": t} for g, t in shown], "total": delta.total,
                            "through": delta.through}, text)
     return 0
+
+
+LOG_LIMIT_MAX = 500
+_GSEQ_MAX = 2 ** 63 - 1                     # SQLite's INTEGER: a larger value is an OverflowError at the bind
+
+
+def _int_in(low: int, high: int) -> Callable[[str], int]:
+    """An argparse type for a whole number in ``low..high``: anything else is argparse's one-line refusal (exit 2)."""
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{text[:40]!r} is not a whole number") from None
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"must be {low}..{high}, got {text[:40]}")
+        return value
+
+    return parse
 
 
 def _coord_c6(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
@@ -1952,8 +1971,10 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         "log", help="The coordinator store's records after a gseq, oldest first (what a reply's +N more points at).",
         description="Replies, launch events, lease events, ready moves and chat messages, in the store-wide order. "
                     "Thread splits and state changes carry no gseq and are not here (levain thread list shows them).")
-    clg.add_argument("--since", type=int, required=True, metavar="GSEQ", help="List records with a greater gseq.")
-    clg.add_argument("--limit", type=int, default=50, metavar="N", help="At most N records (default 50).")
+    clg.add_argument("--since", type=_int_in(0, _GSEQ_MAX), required=True, metavar="GSEQ",
+                     help="List records with a greater gseq.")
+    clg.add_argument("--limit", type=_int_in(1, LOG_LIMIT_MAX), default=50, metavar="N",
+                     help=f"At most N records, 1..{LOG_LIMIT_MAX} (default 50).")
     caw = c_sub.add_parser(
         "away", help="Read a drop as the operator's word that he is away: set away ON (never off).",
         description="Sets away ON for both agents through `levain consent away on`'s own path, so every SIGN waits "

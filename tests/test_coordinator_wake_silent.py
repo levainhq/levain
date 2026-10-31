@@ -77,9 +77,25 @@ class Rig:
 WORK_HEAD = "since your last message (Levain's record"
 
 
-def block_of(ctx: str) -> str:
-    """The block a coordinator reply reprints (C11 S3): the work delta when the turn carried one, then the band."""
+def pending_work(qdir: Path) -> bool:
+    """Whether the coordinator store holds records after the operator's work cursor (a reply block must then lead with
+    the work delta)."""
+    from levain.coordinator import work_delta
+
+    conn = CoordStore(qdir).open_readonly()
+    try:
+        return work_delta.work_delta(conn, work_delta.watermark(conn, band_view.COORDINATOR_VIEWER)).total > 0
+    finally:
+        conn.close()
+
+
+def block_of(ctx: str, rig: "Rig | None" = None) -> str:
+    """The block a coordinator reply reprints (C11 S3): the work delta when the turn carried one, then the band. With
+    the ``rig``, the work head must be there when its store holds records after the cursor (call it before the Stop
+    that would advance it); only a store with none slices at ``NEEDS YOU``."""
     i = ctx.find(WORK_HEAD)
+    if rig is not None:
+        assert (i >= 0) == pending_work(rig.qdir), ctx
     return ctx[i if i >= 0 else ctx.find("NEEDS YOU"):]
 
 
@@ -97,7 +113,7 @@ def test_f1_a_wake_spends_no_delta(rig):
     q1 = rig.ask("Pick a DB")
     first = rig.ups("hello coordinator")
     assert "first band on this seat" in first
-    assert rig.stop(block_of(first)) == ""      # S2: a coordinator's view commits at its verified Stop
+    assert rig.stop(block_of(first, rig)) == ""      # S2: a coordinator's view commits at its verified Stop
     rig.qs.answer(q1.id, option="a", channel="cli")
     rig.ask("Ship it?")
     ctx = rig.ups(rig.wake)
