@@ -10,6 +10,7 @@ import sqlite3
 
 import pytest
 
+from levain.autonomic import agent_tables
 from levain.autonomic import db as vdb
 from levain.autonomic import schema3 as s
 from levain.autonomic.db import AutonomicDB
@@ -47,6 +48,8 @@ def test_a_fresh_store_and_ddl_v3_over_a_populated_v2_store_share_one_sqlite_mas
     c = sqlite3.connect(d / vdb.DB_NAME, isolation_level=None)
     try:
         c.execute("BEGIN IMMEDIATE")
+        for table in reversed(agent_tables.AGENT_TABLES):    # a /2 store before the agent tables (A0 §3.5; R-A3)
+            c.execute(f"DROP TABLE {table}")
         s.ddl_v3(c)
         s.triggers_v3(c)
         assert _master(c) == want
