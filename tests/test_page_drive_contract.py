@@ -82,6 +82,15 @@ def test_act_until_awaits_a_promise_condition_on_a_re_run(tmp_path: Path) -> Non
 
 
 @needs_browser
+def test_an_action_declaring_var_runs_the_same_on_every_run(tmp_path: Path) -> None:
+    # a re-run scopes the action exactly as the first run did: a declaration never collides with the driver's own names
+    r = _drive(tmp_path, [{"do": "var c = (window.__n || 0) + 1; window.__n = c; 1", "until": "window.__n >= 3",
+                           "ms": 8000, "every": 200}, {"eval": "window.__n"}])
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["values"][1] >= 3, r.stdout
+
+
+@needs_browser
 def test_an_action_returning_done_true_does_not_end_the_step(tmp_path: Path) -> None:
     # an action's own value is never read as the driver's re-run result
     r = _drive(tmp_path, [{"do": "window.__n = (window.__n || 0) + 1; ({done: true, v: 1})", "until": "window.__n >= 2",

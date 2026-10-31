@@ -212,19 +212,23 @@ for (const s of steps) {
     // the action; a `posts` re-run checks the driver's own POST count right before it acts
     // The action's source is inlined, never passed to an in-page eval: a page CSP without 'unsafe-eval' blocks
     // eval once the evaluation has awaited anything, and the condition is awaited (a promise condition is read for its value,
-    // as `check` reads it). An expression `do` is awaited as a plain evaluation awaits it; a statement list runs as statements.
+    // as `check` reads it). An expression `do` is awaited; a statement list runs as statements in its own block (its
+    // completion value is not awaited). EVERY run, the first included, goes through this one wrapper, so a re-run never
+    // scopes or awaits the action differently from the first run; only the re-run checks the condition first.
     // The result carries the driver's own key, so an action that happens to return {done: true} is never read as a result.
-    const guarded = s.posts !== undefined ? null :
-      `(async () => { let c = null; try { c = await (${s.until}\n); } catch (e) { c = null; } ` +
-      `if (c) return { ${GUARD_KEY}: true, v: c }; ` +
-      (isExpression(s.do) ? `await (${s.do}\n);` : `{ ${s.do}\n; }`) + ` return { ${GUARD_KEY}: false }; })()`;
+    const act = isExpression(s.do) ? `await (${s.do}\n);` : `{ ${s.do}\n; }`;
+    const cond = s.posts !== undefined ? "" :
+      `try { ${GUARD_KEY}c = await (${s.until}\n); } catch (e) { ${GUARD_KEY}c = null; } ` +
+      `if (${GUARD_KEY}c) return { ${GUARD_KEY}: true, v: ${GUARD_KEY}c }; `;
+    const wrap = (checkFirst) =>
+      `(async () => { let ${GUARD_KEY}c = null; ${checkFirst ? cond : ""}${act} return { ${GUARD_KEY}: false }; })()`;
+    const firstRun = wrap(false), reRun = wrap(true);
     for (;;) {
       if (Date.now() >= nextDo) {
         if (ran > 0 && Date.now() >= deadline) break;
         if (ran > 0 && s.posts !== undefined && posts.length >= s.posts) { v = true; break; }
-        const viaGuard = ran > 0 && guarded !== null;
-        const a = await evaluateOutcome(viaGuard ? guarded : s.do, slice());
-        if (viaGuard && !("error" in a) && a.value && a.value[GUARD_KEY] === true) { v = a.value.v; break; }
+        const a = await evaluateOutcome(ran > 0 ? reRun : firstRun, slice());
+        if (!("error" in a) && a.value && a.value[GUARD_KEY] === true) { v = a.value.v; break; }
         ran++; if ("error" in a) lastDoError = a.error;
         nextDo = Date.now() + every;
       }
