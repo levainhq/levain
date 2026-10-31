@@ -159,7 +159,8 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
     note = ""
     if launch is not None:
         built = _own_launch_build(store, launch)
-        if built is None and handoff is not None and handoff.writer == launch.session_key:
+        if (built is None and handoff is not None and handoff.seam_kind in seam_open.PREDECESSOR_HANDOFF_SEAMS
+                and handoff.writer == launch.session_key):
             note = (f"a coordinator cannot acknowledge its own handoff (this launch wrote handoff {handoff.handoff_id}): "
                     "printed read-only; the coordinator after you opens it")
         elif built is None and handoff is not None and handoff.seam_kind == "rotation":
@@ -185,7 +186,7 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
                              "acknowledged")
         return 0
     seam_open.record_delivery(store, built.open_id, "light_verb", recipient=launch.launch_id)
-    needs = " --read-back-file PATH" if built.seam_kind in ("rotation", "dream") else ""
+    needs = " --read-back-file PATH" if built.seam_kind in seam_open.PREDECESSOR_HANDOFF_SEAMS else ""
     ack = f"{_lv(launch)} coord open --ack {built.open_id}{needs} --token {args.token}{tail}"
     more = ("; PATH holds your restatement of the handoff in your own words (required on a "
             f"{built.seam_kind} open)") if needs else ""
@@ -285,7 +286,7 @@ def run_handoff_show(args: argparse.Namespace, out: Any, store: Any) -> int:
             raise ValueError(f"the body is JSON {type(body).__name__}, not an object")
         # rendered whatever the format, so a body the text views cannot read is refused in --json too
         text = render(_Shown(h), _marked(body))
-    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
         reason = f"missing key {exc}" if isinstance(exc, KeyError) else f"{type(exc).__name__}: {exc}"
         raise CoordError(f"handoff {h.handoff_id} body is unreadable: "
                          f"{unshowable.mark(reason, allow='')[:160]}") from None

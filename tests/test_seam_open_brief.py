@@ -855,11 +855,6 @@ def _shared(gseqs):
 
 def test_no_two_counted_rows_share_a_gseq_after_a_mixed_run(world):
     _close(world)
-    # the handoff is an earlier session's: a launch never acknowledges a build of the handoff it wrote itself
-    for (name,) in _sql(world, "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'seam_handoffs' "
-                               "AND sql LIKE '%UPDATE%'"):
-        _raw(world, f"DROP TRIGGER {name}")
-    _raw(world, "UPDATE seam_handoffs SET writer = 'earlier-session'")
     world.accept_drop("a second drop", surface="cli")
     with world._write("coordinator", _token(world)) as (conn, now):
         seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")

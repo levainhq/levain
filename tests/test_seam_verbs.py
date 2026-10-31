@@ -630,3 +630,48 @@ def test_g8_an_existing_launch_build_is_what_open_prints(pending, qdir, capsys):
     assert "SEAM OPEN light" in out and f"coord open --ack 1 --token {tok} --queue-dir" in out
     assert "open 1 (light)" in out and "no open is built" not in out
     assert sql(pending, "SELECT COUNT(*) FROM open_builds") == [(1,)]
+
+
+# --- review fixes (L3 r3) ---------------------------------------------------------------------------------------------
+def test_k1_a_light_open_is_acknowledged_by_the_writer_of_the_handoff_it_mentions(world, qdir, tmp_path, capsys):
+    from levain.coordinator import seam_build
+
+    run(qdir, capsys, "close", "--kind", "operator", "--body-file", str(body_file(tmp_path)), "--request-id", "r1",
+        "--token", str(world.token))
+    assert sql(world, "SELECT writer FROM seam_handoffs") == [(world.launch.session_key,)]
+    b = seam_build.build(world, kind="light", signal_kind="silence", signal_key="s1", queue_dir=qdir,
+                         token=world.token)
+    assert sql(world, "SELECT handoff_id FROM open_builds") == [(1,)]       # the light brief does mention it
+    seam_open.record_delivery(world, b.open_id, "light_verb", recipient=world.launch.launch_id)
+    assert run(qdir, capsys, "open", "--ack", str(b.open_id), "--token", str(world.token)).out.startswith("acknowledged")
+    assert sql(world, "SELECT COUNT(*) FROM open_acks") == [(1,)]
+
+
+def test_k1_the_rotation_self_ack_stays_refused_at_both_places(world, qdir, tmp_path, capsys):
+    assert seam_open.PREDECESSOR_HANDOFF_SEAMS == ("rotation", "dream")
+    _rotation_close(world, qdir, tmp_path, capsys, writer=None)
+    out = run(qdir, capsys, "open", "--token", str(world.token)).out                       # the open-time check
+    assert "a coordinator cannot acknowledge its own handoff" in out and "coord open --ack" not in out
+    test_g7_an_ack_by_the_handoffs_own_writer_is_refused(world, qdir, tmp_path, capsys)   # the ack-time check
+
+
+def test_k2_a_handoff_body_nested_past_the_recursion_limit_is_unreadable_not_a_traceback(world, qdir, tmp_path, capsys):
+    run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path)), "--request-id", "r1",
+        "--token", str(world.token))
+    _rewrite_writer(world, "previous-session")
+    sql(world, "UPDATE seam_handoffs SET body = ?", "[" * 60000)
+    assert "handoff 1 body is unreadable" in run(qdir, capsys, "handoff", "show", rc=1).err
+    deep = json.dumps({"state_line": "x", "notes": "n"})[:-1] + ', "z": ' + "[" * 900 + "]" * 900 + "}"
+    sql(world, "UPDATE seam_handoffs SET body = ?", deep)
+    assert "handoff 1 body is unreadable" in run(qdir, capsys, "handoff", "show", "--json", rc=1).err
+
+
+def test_k3_a_literal_bracket_is_ordinary_text_to_the_cut():
+    from levain.coordinator import seam
+
+    label = seam._detail_label("t", 1, "w", "\u27e8" + "x" * 80, None, True)
+    assert label.count("x") > 40 and label.endswith("…")                      # the cut keeps the text to its limit
+    assert seam._cap("prefix \u27e8" + "x" * 300).startswith("prefix \u27e8xxx")
+    assert seam._trim("ab\u27e8cdef", 4) == "ab\u27e8c"
+    assert seam._trim("ab\u27e8U+00", 6) == "ab\u27e8U+0"                # never completed: not a mark
+    assert seam._trim("ab\u27e8U+0001\u27e9z", 6) == "ab"                 # a real mark cut inside

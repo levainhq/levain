@@ -50,6 +50,7 @@ This module reads and renders; it writes nothing (the band read is the non-recor
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -105,13 +106,18 @@ def _cap(line: str, n: int = _LINE) -> str:
     return text if len(text) <= n else _trim(text, n - 1) + "…"
 
 
+_MARK = re.compile("\u27e8U\\+[0-9A-F]{4,6}\u27e9")     # the form unshowable.mark writes
+
+
 def _trim(text: str, n: int) -> str:
-    """``text[:n]``, except a cut that lands inside a ``⟨U+XXXX⟩`` mark is moved back to before the mark's opening
-    bracket, so a mark is shown whole or not at all."""
+    """``text[:n]``, except a cut that lands inside a real ``⟨U+XXXX⟩`` mark is moved back to before the mark's
+    opening bracket, so a mark is shown whole or not at all. A ``⟨`` that does not open a mark is ordinary text."""
     head = text[:n]
     start = head.rfind("\u27e8")
-    if start != -1 and "\u27e9" not in head[start:]:
-        return head[:start]
+    if start != -1:
+        found = _MARK.match(text, start)
+        if found is not None and found.end() > n:
+            return head[:start]
     return head
 
 
