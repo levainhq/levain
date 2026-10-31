@@ -27,9 +27,9 @@ from levain.coordinator import lease as _leases
 from levain.coordinator.lease import Launch, Lease, LeaseRefused
 from levain.coordinator.store import GSEQ_TABLES, CoordError, CoordStore, _append_only, next_gseq
 
-__all__ = ["BODY_CAP", "DELIVERY_SURFACES", "LAUNCH_SIGNALS", "OPEN_SCHEMA", "OpenBuild", "SEAM_KINDS",
-           "SIGNAL_KINDS", "acked_cursor", "acked_cuts", "acknowledge", "active_coordinator_fence", "checked_text",
-           "open_tables_present", "record_arrival", "record_delivery", "stored_build"]
+__all__ = ["BODY_CAP", "DELIVERY_SURFACES", "LAUNCH_SIGNALS", "OPEN_SCHEMA", "OpenBuild", "READ_BACK_MAX",
+           "SEAM_KINDS", "SIGNAL_KINDS", "acked_cursor", "acked_cuts", "acknowledge", "active_coordinator_fence",
+           "checked_text", "open_tables_present", "record_arrival", "record_delivery", "stored_build"]
 
 #: the seams an open is built for; ``light`` is an open with no handoff behind it
 SEAM_KINDS = ("rotation", "operator", "dream", "light")
@@ -40,7 +40,9 @@ LAUNCH_SIGNALS = ("launch",)
 DELIVERY_SURFACES = ("launch_brief", "light_verb")
 #: the rendered brief, in bytes. Levain's own number, a guess until a coordinator has read a real one
 BODY_CAP = 65536
-_READ_BACK_MAX = 8192
+#: a read-back, in bytes (its column CHECK holds the same number)
+READ_BACK_MAX = 8192
+_READ_BACK_MAX = READ_BACK_MAX
 
 _SEAMS_SQL = ", ".join(repr(k) for k in SEAM_KINDS)
 _SIGNALS_SQL = ", ".join(repr(k) for k in SIGNAL_KINDS)

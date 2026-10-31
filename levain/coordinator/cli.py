@@ -2024,6 +2024,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "contingencies, notes, attested_operator_present, attested_walked; an empty list is []). A retry "
                     "with the same --request-id returns the same handoff. Names the latest handoff you saw as "
                     "--prev-handoff-id (omit it when none exists): a late close behind a newer one is refused. "
+                    "In the body, name rows by id (dr-..., item keys), never by ordinal: the next coordinator "
+                    "sees ids, not your order. Each field is one line (a newline or control is refused). "
                     "The operator-walk checklist (--plan) is not built.")
     ccl.add_argument("--kind", required=True, choices=_seam_handoffs.KINDS)
     ccl.add_argument("--body-file", dest="body_file", type=Path, required=True, metavar="PATH")
@@ -2036,13 +2038,18 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "rotation handoff) and, last, the command that acknowledges it. With no live coordinator lease "
                     "(no --token, or the operator's) it prints the brief read-only and says it cannot be "
                     "acknowledged. --ack OPEN_ID is the coordinator's fenced acknowledgement: the Since window moves "
-                    "only then. A rotation or dream open needs --read-back-file, your restatement of the handoff.")
+                    "only then. A rotation or dream open needs --read-back-file, your restatement of the handoff. "
+                    "A --token that is given and refused exits 1 after printing the read-only open.")
     cop.add_argument("--ack", type=int, default=None, metavar="OPEN_ID")
+    cop.add_argument("--verbose", action="store_true",
+                     help="Also print what the open does not derive or build, and its read scope.")
     cop.add_argument("--read-back-file", dest="read_back_file", type=Path, default=None, metavar="PATH")
     cop.add_argument("--token", type=int, default=None, help="Your coordinator lease token.")
     chn = c_sub.add_parser("handoff", help="Read the handoffs coordinators left.")
     chn_sub = chn.add_subparsers(dest="handoff_cmd", required=True)
-    chs = chn_sub.add_parser("show", help="The latest handoff, or the one named.")
+    chs = chn_sub.add_parser("show", help="The latest handoff, or the one named.",
+                             description="Prints the latest handoff, or the one named. A handoff names rows by "
+                                         "id (dr-..., item keys), never by ordinal.")
     chs.add_argument("handoff_id", nargs="?", type=int, default=None, metavar="HANDOFF_ID")
     chs.add_argument("--md", action="store_true", help="Render as markdown.")
     cbu = c_sub.add_parser(

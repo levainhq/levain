@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import shlex
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ from typing import Any
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.coordinator import lease as _leases
 from levain.coordinator import seam_handoffs, seam_open
-from levain.coordinator.seam import open_brief
+from levain.coordinator.seam import open_brief, verbose_lines
 from levain.coordinator.seam_build import build
 from levain.coordinator.store import CoordError, StoreAbsent
 
@@ -46,6 +47,27 @@ def open_kind(store: Any) -> str:
     return "light" if h is None else h.seam_kind
 
 
+def _lv(launch: Any) -> str:
+    """How the commands these verbs print spell levain: the launch brief's own spelling, from the one rule
+    (:func:`levain.coordinator.launch.coordinator_command`), for the active coordinator launch's directory, else for
+    the directory this runs in (a coordinator's session runs its commands from its own install)."""
+    from levain.coordinator.launch import coordinator_command
+
+    if launch is not None:
+        return coordinator_command(launch.cwd)
+    try:
+        return coordinator_command(Path.cwd())
+    except OSError:                  # a directory removed under the process: no install to read the rule from
+        return coordinator_command(None)
+
+
+def _fenced(body: str) -> str:
+    """The open's body between a fence this print makes up: stored text cannot know the fence, so nothing inside can
+    close the block and pass for a line outside it."""
+    fence = secrets.token_hex(4)
+    return f"~~~ OPEN {fence}\n{body}\n~~~ END OPEN {fence}"
+
+
 def _tail(args: argparse.Namespace) -> str:
     return f" --queue-dir {shlex.quote(str(args.queue_dir.expanduser()))}" if args.queue_dir is not None else ""
 
@@ -67,10 +89,11 @@ def run_close(args: argparse.Namespace, out: Any, store: Any) -> int:
                          f"({str(exc)[:120]}); write it with keys {', '.join(seam_handoffs.BODY_KEYS)}") from None
     h = seam_handoffs.close(store, kind=args.kind, body=body, request_id=args.request_id,
                             prev_handoff_id=args.prev_handoff_id, token=args.token)
+    lv = _lv(_active(store, args.token)[0])
     _emit(out, args.json, {"handoff_id": h.handoff_id, "kind": h.seam_kind, "writer": h.writer, "gseq": h.gseq,
                            "covers_gseq": h.covers_gseq, "prev_handoff_id": h.prev_handoff_id},
           f"closed: handoff {h.handoff_id} ({h.seam_kind}) written by {h.writer}, covering counted rows through gseq "
-          f"{h.covers_gseq}\nthe next coordinator opens from it (levain coord open); a retry of this close names "
+          f"{h.covers_gseq}\nthe next coordinator opens from it ({lv} coord open); a retry of this close names "
           f"request id {h.close_key!r} again")
     return 0
 
@@ -134,20 +157,26 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
                     "printed read-only, so it cannot be acknowledged")
     else:
         note = f"printed read-only and cannot be acknowledged ({why})"
+    extra = "".join(f"\n{ln}" for ln in verbose_lines()) if getattr(args, "verbose", False) else ""
     if built is None:
         text, brief = _readonly_text(store, args)
         _emit(out, args.json, {"open_id": None, "acknowledgeable": False, "why": note, "body": text,
                                "prev_handoff_id": None if handoff is None else handoff.handoff_id},
-              f"{text}\n\n--\n{note}\n{_prev_line(handoff)}")
+              f"{_fenced(text)}{extra}\n\n--\n{note}\n{_prev_line(handoff)}")
+        if args.token is not None and launch is None:
+            # the operator's plain read (no --token) is not a refusal; a token given and not honoured is one
+            raise CoordError(f"--token {args.token} was refused: {why}; the open above is read-only and cannot be "
+                             "acknowledged")
         return 0
     seam_open.record_delivery(store, built.open_id, "light_verb", recipient=launch.launch_id)
     needs = " --read-back-file PATH" if built.seam_kind in ("rotation", "dream") else ""
-    ack = f"levain coord open --ack {built.open_id}{needs} --token {args.token}{tail}"
+    ack = f"{_lv(launch)} coord open --ack {built.open_id}{needs} --token {args.token}{tail}"
     more = ("; PATH holds your restatement of the handoff in your own words (required on a "
             f"{built.seam_kind} open)") if needs else ""
     _emit(out, args.json, {"open_id": built.open_id, "kind": built.seam_kind, "acknowledgeable": True, "body": built.body,
                            "ack": ack, "prev_handoff_id": None if handoff is None else handoff.handoff_id},
-          f"{built.body}\n\n--\nopen {built.open_id} ({built.seam_kind}), built {built.built_at}\n"
+          f"{_fenced(built.body)}{extra}\n\n--\nopen {built.open_id} ({built.seam_kind}), built {built.built_at}; it "
+          "is the open stored for you, so running coord open again prints it unchanged\n"
           f"acknowledge it, which moves the Since window past what it showed: {ack}{more}\n{_prev_line(handoff)}")
     return 0
 
@@ -204,9 +233,10 @@ def _render_plain(h: Any, body: dict[str, Any]) -> str:
 def run_handoff_show(args: argparse.Namespace, out: Any, store: Any) -> int:
     h = seam_handoffs.latest(store) if args.handoff_id is None else seam_handoffs.get(store, args.handoff_id)
     if h is None:
-        raise CoordError("no handoff exists yet (a coordinator writes one with `levain coord close`)"
+        lv = _lv(None)
+        raise CoordError(f"no handoff exists yet (a coordinator writes one with `{lv} coord close`)"
                          if args.handoff_id is None else
-                         f"there is no handoff {args.handoff_id} (`levain coord handoff show` shows the latest)")
+                         f"there is no handoff {args.handoff_id} (`{lv} coord handoff show` shows the latest)")
     body = json.loads(h.body)
     _emit(out, args.json, {"handoff_id": h.handoff_id, "kind": h.seam_kind, "written_at": h.written_at,
                            "writer": h.writer, "covers_gseq": h.covers_gseq, "prev_handoff_id": h.prev_handoff_id,

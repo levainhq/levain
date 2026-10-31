@@ -20,6 +20,15 @@ actually rendered, so an acknowledgement advances the window no further and the 
 brief. A cut brief ends its detail with one omitted-rows line, whose exact bytes are counted against the cap; a brief
 that shows every row keeps nothing back. The unsequenced class is one line per table and is never cut.
 
+**A detail row names its row**: ``gseq N  table[:kind]  row id  who  label`` for the tables in :data:`DETAIL_FIELDS`
+(the label is the first line of its stored text, at most 60 characters), read in the same transaction as the counts.
+A section that is exactly its own "nothing here" line is folded into one ``Empty (0 each)`` line; a section that could
+not be read is never folded. What is not derived, what is not built and the read scope are :func:`verbose_lines`,
+printed by ``coord open --verbose`` and never part of the stored body.
+
+**One stored field is one line**: :func:`_clean` marks every C0, C1 and Unicode line separator, so no stored text can
+begin a line of the brief; every line begins with text this module writes.
+
 **A degraded brief is shown, never stored.** A brief is ``degraded`` whenever a part the successor must see could not
 be read: the whole read (a coordinator directory its ownership or mode rule refuses among the causes), the cut it
 stands on (the counted head, the acknowledged cursor and cuts, the latest handoff row), Since, the Handoff section, the
@@ -56,7 +65,7 @@ from levain.coordinator.store import GSEQ_TABLES, CoordError, CoordStore, StoreA
 from levain import unshowable
 from levain.dispatch import DispatchError
 
-__all__ = ["Brief", "BriefTooBig", "DETAIL_ROWS_MAX", "NOT_BUILT", "open_brief"]
+__all__ = ["Brief", "BriefTooBig", "DETAIL_FIELDS", "DETAIL_ROWS_MAX", "NOT_BUILT", "open_brief", "verbose_lines"]
 
 #: the most Since detail rows one brief reads, whatever the byte cap leaves
 DETAIL_ROWS_MAX = 1000
@@ -96,10 +105,12 @@ def _cap(line: str, n: int = _LINE) -> str:
 
 
 def _clean(text: str) -> str:
-    """The one render-side cleaner: every stored text that enters the brief passes here, so the renderer never emits a
-    character the writers' ``checked_text`` refuses (a NUL in a stored body would otherwise block the whole brief on
-    every retry). Each unshowable character becomes a visible ``⟨U+XXXX⟩`` mark; newline and tab stay."""
-    return unshowable.mark(text)
+    """The one render-side cleaner: every line of the brief passes here, so the renderer never emits a character the
+    writers' ``checked_text`` refuses (a NUL in a stored body would otherwise block the whole brief on every retry).
+    Each unshowable character becomes a visible ``⟨U+XXXX⟩`` mark, newline and tab included and every other C0, C1
+    and Unicode line or paragraph separator with them: one stored field can never become two lines of the brief, so
+    no stored text can start a line of its own."""
+    return unshowable.mark(text, allow="")
 
 
 def _age(now: datetime, stamp: str) -> str:
@@ -152,9 +163,59 @@ def open_brief(store: CoordStore, queue_dir: Path | str | None, kind: str, now: 
     return Brief(kind, text, read_at, 0, 0, None, degraded=f"store: {why}")
 
 
-def _scope_line(read_at: str) -> str:
+def _scope_line(read_at: str | None = None) -> str:
+    at = read_at if read_at is not None else "the time the open's first line names"
     return (f"Scope: store sections are one read and covered by the cut; queue-side sections (away, requests, budgets, "
-            f"band) were read at {read_at} and are not covered by it.")
+            f"band) were read at {at} and are not covered by it.")
+
+
+def verbose_lines() -> list[str]:
+    """What the brief leaves out and ``coord open --verbose`` adds: the parts not derived or not built, and the read
+    scope. Constant text, so a stored open needs nothing more to print them."""
+    return ["Missing close: not derived by this release (S4)", f"Not built: {NOT_BUILT}", _scope_line()]
+
+
+_UNSEQ_HEAD = "Unsequenced (rows written by an older release)"
+_CARD_HEAD = "Card (store parts in the cut, queue parts read at the brief's time):"
+# the card's lines that say nothing is there, as ``_card`` renders them, and the name each takes in the one empty
+# line; "see Band above" points at a section and is dropped (the band is shown, or named empty, either way)
+_CARD_ZEROS = {"  NEEDS YOU: see Band above": "", "  undecided (0):": "undecided", "  thread budgets (0):":
+               "thread budgets", "  waiting on you: 0": "waiting on you", "  review queue: 0 open item(s)":
+               "review queue items"}
+_AWAY_OFF = "  away: off"
+
+
+def _collapse_zeros(read_at: str, *sections: list[str]) -> list[str]:
+    """The never-cut sections after Since, with every section that is exactly its own "nothing here" line folded into
+    one ``Empty`` line. A section that could not be read is never empty: its cannot-derive line matches no zero form,
+    so it is always shown whole."""
+    unseq, unack, board, band, card = sections
+    zero_forms = ((unseq, f"{_UNSEQ_HEAD}: 0", "unsequenced rows"),
+                  (unack, "Unacknowledged: 0", "unacknowledged opens"),
+                  (board, "Board: 0 items", "board items"),
+                  (band, f"Band (queue side, read {read_at}): 0 open items",
+                   f"band items (queue side, read {read_at})"))
+    out: list[str] = []
+    empty: list[str] = []
+    for lines, zero, name in zero_forms:
+        if lines == [zero]:
+            empty.append(name)
+        else:
+            out += lines
+    away_off = False
+    if card[:1] == [_CARD_HEAD]:
+        kept = [ln for ln in card[1:] if ln not in _CARD_ZEROS and ln != _AWAY_OFF]
+        empty += [_CARD_ZEROS[ln] for ln in card[1:] if _CARD_ZEROS.get(ln)]
+        away_off = _AWAY_OFF in card[1:]
+        out += [_CARD_HEAD, *kept] if kept else []
+    else:
+        out += card
+    tail = "; away: off" if away_off else ""
+    if empty:
+        out.append(f"Empty (0 each): {', '.join(empty)}{tail}")
+    elif away_off:
+        out.append("away: off")
+    return out
 
 
 # --- the store read ------------------------------------------------------------------------------------------------
@@ -185,19 +246,13 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
     card_lines = (["Card: cannot-derive (the queue directory could not be read, so the away, undecided and waiting "
                    "parts are unknown)"] if band_lines[0].startswith("Band: cannot-derive")
                   else _guard("Card", lambda: _card(store, conn, qdir, now), failed))
-    rest = [
-        *_guard("Unacknowledged", lambda: _unacknowledged(conn, now), failed, critical=True),
-        *_guard("Board", lambda: _board(store, conn, read_at), failed),
-        *band_lines,
-        *card_lines,
-        "Missing close: not derived by this release (S4)",
-        f"Not built: {NOT_BUILT}",
-    ]
-    head_lines, handoff_lines, since_lines, unseq_lines, rest = ([_clean(ln) for ln in part] for part in
-                                                                 (head_lines, handoff_lines, since_lines, unseq_lines,
-                                                                  rest))
+    rest = _collapse_zeros(read_at, unseq_lines,
+                           _guard("Unacknowledged", lambda: _unacknowledged(conn, now), failed, critical=True),
+                           _guard("Board", lambda: _board(store, conn, read_at), failed), band_lines, card_lines)
+    head_lines, handoff_lines, since_lines, rest = ([_clean(ln) for ln in part] for part in
+                                                    (head_lines, handoff_lines, since_lines, rest))
     rows = [(g, _clean(label)) for g, label in rows]
-    fixed = [*head_lines, *handoff_lines, *since_lines, *unseq_lines, *rest, _scope_line(read_at)]
+    fixed = [*head_lines, *handoff_lines, *since_lines, *rest]
     fixed_bytes = len("\n".join(fixed).encode("utf-8"))
     if fixed_bytes > body_cap:
         raise BriefTooBig(f"the brief's never-cut sections need {fixed_bytes} bytes, over the cap of {body_cap}")
@@ -210,7 +265,7 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
             shown = last
     elif since_failed:
         shown = floor            # nothing was read of the window: an ack moves nothing
-    text_lines = [*head_lines, *handoff_lines, *since_lines, *detail, *unseq_lines, *rest, _scope_line(read_at)]
+    text_lines = [*head_lines, *handoff_lines, *since_lines, *detail, *rest]
     return Brief(kind, "\n".join(text_lines), read_at, head, shown, None if handoff is None else handoff.handoff_id,
                  cuts, omitted, degraded=failed[0] if failed else None)
 
@@ -239,7 +294,7 @@ def _fit(rows: list[tuple[int, str]], total: int, floor: int, room: int, body_ca
     its bytes and a newline), with the omitted-rows line's own exact bytes, for that omitted count and last gseq,
     counted in. Every row fitting keeps nothing back for that line. :class:`BriefTooBig` when not even the omitted
     line alone fits."""
-    lines = [f"  gseq {g} {label}" for g, label in rows]
+    lines = [f"  gseq {g}  {label}" for g, label in rows]
     sizes = [len(ln.encode("utf-8")) + 1 for ln in lines]
     if len(rows) == total and sum(sizes) <= room:
         return lines, rows[-1][0] if rows else floor, 0
@@ -326,28 +381,64 @@ def _since_lines(floor: int, head: int, counts: dict[str, int]) -> list[str]:
             *[f"  {label}: {n}" for label, n in sorted(counts.items())]]
 
 
+_REPLY_TEXT = ("CASE WHEN json_valid(body) AND json_type(body, '$.text') = 'text' THEN json_extract(body, '$.text') "
+               "ELSE '' END")
+#: what a Since detail row names, per table: (row id, who, text whose first line is the label, the row it answers).
+#: A table not here is named by its table (and kind) alone: it has no id a coordinator acts on
+DETAIL_FIELDS: dict[str, tuple[str, str, str, str]] = {
+    "drops": ("drop_id", "surface", "words", "NULL"),
+    "replies": ("reply_id", "kind", _REPLY_TEXT, "ref_id"),
+    "ready_journal": ("id", "who", "COALESCE(from_status, 'new') || ' -> ' || to_status", "NULL"),
+    "launch_events": ("launch_id", "NULL", "cause", "NULL"),
+    "lease_events": ("'token ' || COALESCE(token, '-')", "holder", "cause", "NULL"),
+}
+_LABEL = 60
+
+
+def _detail_label(tag: str, row_id: Any, who: Any, text: Any, ref: Any, named: bool) -> str:
+    """One detail row's fields after its gseq, two spaces apart: ``table[:kind]  row id  who  label``. The label is the
+    first non-blank line of the stored text, cleaned, then cut to :data:`_LABEL` characters; cleaning first means a
+    hidden separator shows as its mark rather than ending the label silently."""
+    if not named:
+        return tag
+    first = next((ln for ln in str(text or "").split("\n") if ln.strip()), "")
+    label = _clean(first.strip())
+    if ref is not None:
+        label = f"re {_clean(str(ref))}" + (f": {label}" if label else "")
+    if len(label) > _LABEL:
+        label = label[: _LABEL - 1] + "…"
+    fields = [tag, _clean(str(row_id)) if row_id is not None else "-", _clean(str(who)) if who is not None else "-"]
+    return "  ".join([*fields, label] if label else fields)
+
+
 def _detail(conn: sqlite3.Connection, sources: list, floor: int, head: int) -> list[tuple[int, str]]:
+    """The window's rows, oldest first (the cursor needs a contiguous prefix), each with what names it. Called inside
+    the brief's one read transaction, beside the counts, so both are of one snapshot."""
     parts: list[str] = []
     params: list[Any] = []
     for table, kinds in sources:
+        rid, who, text, ref = DETAIL_FIELDS.get(table, ("NULL", "NULL", "NULL", "NULL"))
+        named = 1 if table in DETAIL_FIELDS else 0
+        cols = f"{rid}, {who}, {text}, {ref}, {named}"
         if kinds is None:
-            parts.append(f"SELECT gseq, '{table}' FROM {table} WHERE gseq > ? AND gseq <= ?")
+            parts.append(f"SELECT gseq, '{table}', {cols} FROM {table} WHERE gseq > ? AND gseq <= ?")
         else:
             marks = ", ".join("?" * len(kinds))
-            parts.append(f"SELECT gseq, '{table}:' || kind FROM {table} WHERE kind IN ({marks}) AND gseq > ? "
+            parts.append(f"SELECT gseq, '{table}:' || kind, {cols} FROM {table} WHERE kind IN ({marks}) AND gseq > ? "
                          f"AND gseq <= ?")
             params.extend(kinds)
         params.extend((floor, head))
     if not parts:
         return []
     sql = " UNION ALL ".join(parts) + " ORDER BY 1, 2 LIMIT ?"
-    return [(g, label) for g, label in conn.execute(sql, (*params, DETAIL_ROWS_MAX))]
+    return [(g, _detail_label(tag, rid, who, text, ref, bool(named)))
+            for g, tag, rid, who, text, ref, named in conn.execute(sql, (*params, DETAIL_ROWS_MAX))]
 
 
 def _unsequenced(conn: sqlite3.Connection, present: set[str], cuts_floor: dict[str, int]) -> tuple[list[str], dict[str, int]]:
     """The class "unsequenced": rows of a migrated table with no gseq written after the migration bounded the table
     (an older release's), above the highest rowid an acknowledged open showed. Its own class, never cut."""
-    head = "Unsequenced (rows written by an older release)"
+    head = _UNSEQ_HEAD
     if "gseq_migration_bounds" not in present:
         raise CoordError("the store was never migrated: no gseq_migration_bounds")
     lines: list[str] = []
@@ -420,8 +511,9 @@ def _band(store: CoordStore, conn: sqlite3.Connection, qdir: Path, now: datetime
 def _card(store: CoordStore, conn: sqlite3.Connection, qdir: Path, now: datetime) -> list[str]:
     card = morning.card(store, queue_dir=qdir, conn=conn, now=now)
     card["band"] = {"text": "NEEDS YOU: see Band above", "shown": [], "error": None}
-    lines = ["Card (store parts in the cut, queue parts read at the brief's time):"]
-    body = morning.render(card).splitlines()[1:]
+    lines = [_CARD_HEAD]
+    # split on newline only: a separator inside a stored text is marked by the cleaner, never a line of its own
+    body = morning.render(card).split("\n")[1:]
     lines += [_cap("  " + ln.strip()) for ln in body[:_LIST_LINES]]
     if len(body) > _LIST_LINES:
         lines.append(f"  ... {len(body) - _LIST_LINES} more card line(s) not listed")

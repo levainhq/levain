@@ -188,6 +188,21 @@ def rows(qdir, sql, *args):
         c.close()
 
 
+def outside_the_fence(text):
+    """The lines of ``text`` that are not inside an embedded open: every line from ``~~~ OPEN <hex>`` through the
+    matching ``~~~ END OPEN <hex>`` is dropped, and nothing else. An open fence never closed drops the rest."""
+    out, fence = [], None
+    for line in text.splitlines():
+        m = re.fullmatch(r"~~~ OPEN ([0-9a-f]{8})", line)
+        if fence is None and m:
+            fence = m.group(1)
+        elif fence is not None and line == f"~~~ END OPEN {fence}":
+            fence = None
+        elif fence is None:
+            out.append(line)
+    return out
+
+
 # --- run_c3b_first_b: the spawn, the read back by name, activation ---------------------------------------------
 def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_hook, qdir, workdir):
     launch_id = woken(store, "please fix the flaky test")
@@ -223,10 +238,12 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     # every levain command the brief gives is one the coordinator install's allow rules match as written (Claude Code
     # matches a rule against the command's own spelling: a bare `levain` would be asked about, 1021+11's real launch)
     prefixes = [r.removeprefix("Bash(").removesuffix(":*)") for r in inst.coordinator_allow(sys.executable)]
-    commands = [c for c in re.findall(r"`([^`]+)`", text) if "-m levain" in c or c.startswith("levain")]
-    # the embedded open is indented data (the card's own lines name a verb in its bare spelling), not a command given
-    given = "\n".join(line for line in text.splitlines() if not line.startswith("    "))
-    assert len(commands) >= 8 and "levain coord" not in given.replace(f"{lv} coord", "")
+    # the embedded open is stored data between its fence lines (the card's own lines name a verb in its bare
+    # spelling), not a command given: exactly those lines are skipped, and the fence itself is checked to be there
+    given = outside_the_fence(text)
+    assert len(given) < len(text.splitlines()) - 3
+    commands = [c for c in re.findall(r"`([^`]+)`", "\n".join(given)) if "-m levain" in c or c.startswith("levain")]
+    assert len(commands) >= 8 and "levain coord" not in "\n".join(given).replace(f"{lv} coord", "")
     for command in commands:
         assert any(command.startswith(p + " ") for p in prefixes), command
     # the active session holds the bootstrap lease for a full TTL, and claims it as the brief says

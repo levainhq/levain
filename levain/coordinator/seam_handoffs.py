@@ -26,6 +26,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from levain import unshowable
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.contracts.canon import canonical
 from levain.coordinator import seam_classes
@@ -141,6 +142,16 @@ def _text(name: str, value: Any, *, empty: bool) -> str:
         raise CoordError(f"{name} is {'text' if empty else 'non-empty text'}")
     if "\x00" in value:       # SQLite's length() ends a string at a NUL: the triggers would read a different text
         raise CoordError(f"{name} holds a NUL character")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:      # a lone surrogate: the one refusal whatever field holds it
+        raise CoordError("a handoff body is text that encodes as UTF-8 (a lone surrogate does not)") from None
+    # each field is one line of the next coordinator's brief: a newline, a C0 or C1 control or a Unicode line
+    # separator would let it start a line of its own
+    bad = unshowable.describe(value)
+    if bad is not None:
+        raise CoordError(f"{name} holds {bad}: each handoff field is one line of shown text (a newline, a control "
+                         "or a line separator is refused); nothing was written")
     return value
 
 
