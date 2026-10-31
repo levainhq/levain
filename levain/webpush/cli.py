@@ -136,7 +136,7 @@ def _word(args: argparse.Namespace) -> int:
         from levain.webpush import held
 
         held.flush_if_due(qdir, throttle=False)
-    except Exception:  # noqa: BLE001 - the word is written; the next gate call or the server tick flushes
+    except Exception:  # noqa: BLE001 - the word is written; the next gate call flushes
         pass
     print(presence.describe(qdir))
     return 0

@@ -419,10 +419,13 @@ def test_a_tabbed_card_folds_as_a_whole_by_its_card_key(tmp_path: Path) -> None:
     """P1: fold is stored by CARD key and every panel of the card is folded, whichever tab shows."""
     out = _run(tmp_path, [
         {"eval": f"{PANEL % 'keep'}.dataset.ckCard = 'now'; 1"},                      # keep joins now's card: a two-panel card
-        {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE,
+        {"eval": f"{PANEL % 'now'}.querySelector('.ck-lay-fold').click(); 1"},
+        # wait on the state the next read asserts (both panels folded, the fold stored), not on a fixed settle
+        {"until": f"{PANEL % 'now'}.classList.contains('ck-collapsed') && {PANEL % 'keep'}.classList.contains('ck-collapsed') && (({STORED}) || {{}}).collapsed?.includes('now')"},
         {"eval": f"[{PANEL % 'now'}.classList.contains('ck-collapsed'), {PANEL % 'keep'}.classList.contains('ck-collapsed'), {STORED}]"},
         {"eval": f"{PANEL % 'keep'}.querySelector('.ck-lay-fold').getAttribute('aria-expanded')"},
-        {"eval": f"{PANEL % 'keep'}.querySelector('.ck-lay-fold').click(); 1"}, SETTLE,
+        {"eval": f"{PANEL % 'keep'}.querySelector('.ck-lay-fold').click(); 1"},
+        {"until": f"!{PANEL % 'now'}.classList.contains('ck-collapsed') && !{PANEL % 'keep'}.classList.contains('ck-collapsed') && !((({STORED}) || {{}}).collapsed || []).length"},
         {"eval": f"[{PANEL % 'now'}.classList.contains('ck-collapsed'), {PANEL % 'keep'}.classList.contains('ck-collapsed'), {STORED}]"},
     ])
     assert out[3] == [True, True, {"v": 1, "zones": {}, "collapsed": ["now"]}], out[3]
