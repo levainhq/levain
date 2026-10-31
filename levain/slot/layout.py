@@ -131,6 +131,8 @@ def base_store_rows(host: HostOS, operator: str) -> list[Row]:
         # could read none of them. Re-applied by every setup and repair (``row_steps``: the chown, then the mode).
         Row(L / "routes" / "dispatch", "_levain_control", "_levain_keys", 0o2750),
         Row(L / "routes" / "verifiers", "_levain_control", "_levain_control", 0o700),
+        # R7 (macOS): the vendor-running accounts' home, root's and empty (vendor_home_rows).
+        *vendor_home_rows(host),
     ]
 
 
@@ -162,10 +164,27 @@ def _store_dir_rows(host: HostOS) -> Mapping[tuple, Row]:
                                    if r.kind == "dir"})
 
 
+def vendor_home(host: HostOS) -> Path | None:
+    """``L/vendorhome`` (macOS only): the directory-record home of the accounts that exec a vendor CLI
+    (``accounts.vendor_home_of``). Codex syncs its managed preferences at config load and treats a failed sync as
+    fatal; with a ``/var/empty`` home that sync fails (R7). Root's and empty, so no slot uid can write it."""
+    return STORE[host] / "vendorhome" if host == "darwin" else None
+
+
+def vendor_home_rows(host: HostOS) -> list[Row]:
+    """``L/vendorhome``, ``Library`` and ``Library/Preferences``, each root 0755 (macOS; Linux has none)."""
+    home = vendor_home(host)
+    if home is None:
+        return []
+    return [_root(host, home, 0o755), _root(host, home / "Library", 0o755),
+            _root(host, home / "Library" / "Preferences", 0o755)]
+
+
 def policy_rows(host: HostOS) -> list[Row]:
-    """What ``setup`` needs before it writes the operator record: the store root and policy dir."""
+    """What ``setup`` makes before any account: the store root, the policy dir and (macOS) the vendor home the
+    vendor-running accounts' records name (:func:`vendor_home_rows`), so no record ever names a dir not there yet."""
     L = STORE[host]
-    return [_root(host, L, 0o755), _root(host, L / "policy", 0o755)]
+    return [_root(host, L, 0o755), _root(host, L / "policy", 0o755), *vendor_home_rows(host)]
 
 
 def slot_store_rows(host: HostOS, slot: SlotId) -> list[Row]:

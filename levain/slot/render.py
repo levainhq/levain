@@ -86,6 +86,12 @@ READSET_ATTRIBUTES = b"* -text -eol -crlf -ident -filter -working-tree-encoding\
 TOKEN_ENV = {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}
 #: The names that must be ABSENT from a vendor session's env, rendered or added at exec (:func:`check_env_absent`).
 ABSENT_ENV: Mapping[str, frozenset] = {"claude": frozenset({"ANTHROPIC_API_KEY"}), "codex": frozenset()}
+#: R7 (1030+24): a macOS Codex session's TLS roots. Codex loads them with rustls-native-certs; from the slot the
+#: platform store is not reachable (the profile denies ``com.apple.SecurityServer``), and on r3c10-vm 10-30 every
+#: chatgpt.com tunnel ended ``broken`` with 171 bytes up. rustls-native-certs reads ``SSL_CERT_FILE`` instead of the
+#: platform store when it is set; with the file the OS ships named here a passthrough turn ran (the profile is not
+#: widened).
+CODEX_CA_FILE = {"darwin": "/etc/ssl/cert.pem"}
 QUEUE_CAP_ENV = "LEVAIN_QUEUE_CAP"         # §3.2, added at exec like the token
 QUEUE_SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"   # §3.2, not a secret: rendered
 #: DECISION: the provider id Codex's brokered block is filed under (runs/macos-RB 1e measured the shape as "lv").
@@ -504,6 +510,8 @@ def _render_env(blob: RenderBlob, facts: RenderFacts) -> dict[str, dict[str, str
     brokered = _brokered_route(blob, facts)
     if brokered is not None and facts.vendor == "claude":
         env["ANTHROPIC_BASE_URL"] = f"{proxy}/r/{brokered}"
+    if facts.vendor == "codex" and facts.host in CODEX_CA_FILE:
+        env["SSL_CERT_FILE"] = CODEX_CA_FILE[facts.host]
     if "levain_queue" in blob.hooks:                  # §5.3: levain_queue = the queue grant
         env[QUEUE_SOCKET_ENV] = f"{facts.R}/qb/slot{facts.slot.index}/q.sock"
     return {"slot": env}

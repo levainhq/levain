@@ -315,8 +315,9 @@ def test_levain_coord_cli(qdir, capsys):
         assert got == rc, (argv, out.out, out.err)
         return out
 
-    assert "nobody holds" in run("coord", "status").out
+    assert "no coordinator store here" in run("coord", "status").out and list(qdir.iterdir()) == []
     did = json.loads(run("drop", "hello", "--json").out)["drop_id"]
+    assert "nobody holds" in run("coord", "status").out
     # no coordinator agent set (C3b): the drop only queued, nothing was asked for (test_coordinator_launch drives a
     # drop that launches)
     assert "next drop: unset" in run("coord", "status").out

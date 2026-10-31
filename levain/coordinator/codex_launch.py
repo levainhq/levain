@@ -540,7 +540,8 @@ def watch_once(store: CoordStore) -> list[str]:
                     got = store.coord_service_beat(held.token)
                     lines.append(f"lease {held.token} held by {holder.launch_id}: beat to {got.until}" if got else
                                  f"lease {held.token} held by {holder.launch_id}: it wrote nothing as coordinator in "
-                                 f"{int(lease_mod.SERVICE_BEAT_WINDOW.total_seconds() // 60)} min, not beaten "
+                                 f"the last {int(lease_mod.SERVICE_BEAT_WINDOW.total_seconds() // 60)} min (the "
+                                 f"watcher beats only a holder that wrote within that window), not beaten "
                                  f"(the lease lapses at {held.until})")
                 except (CoordError, sqlite3.Error) as exc:
                     lines.append(f"lease {held.token}: not beaten ({exc})")

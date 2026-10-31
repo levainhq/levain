@@ -693,7 +693,7 @@ def test_a_listed_working_holder_silent_past_two_ttls_lapses(store, fake, live_h
         assert any(line.startswith(f"lease {token} held by {ln.launch_id}: beat") for line in cl.watch_once(store))
     clock[0] += timedelta(minutes=20)                   # t+80: silent 80 min, listed and working all along
     lines = cl.watch_once(store)
-    assert any("it wrote nothing as coordinator in 60 min, not beaten" in line for line in lines), lines
+    assert any("it wrote nothing as coordinator in the last 60 min" in line for line in lines), lines
     clock[0] += timedelta(minutes=20)                   # past the until the t+60 beat gave
     assert not store.coord_lease().live
     assert not any("beat to" in line for line in cl.watch_once(store))
@@ -1255,6 +1255,7 @@ def test_the_watcher_removes_the_brief_once_its_launch_is_over(store, fake, live
 
 # --- the pin (C0 §3.4) -----------------------------------------------------------------------------------------
 from tests.test_coordinator_envelope import _lease, ctx, keys, repo, snapshot, structured_thread  # noqa: E402,F401
+from tests.test_coordinator_first_reader import band  # noqa: E402,F401
 
 
 def test_a_one_thread_worker_is_pinned_to_its_threads_head_envelope(ctx, structured_thread):
@@ -1377,3 +1378,621 @@ def test_every_levain_verb_the_brief_names_passes_the_coordinators_door(store, f
     assert {("coord", "questions"), ("coord", "answer"), ("coord", "escalate"), ("coord", "claim")} <= paths
     refused = sorted(p for p in paths if p not in door.DOOR)
     assert not refused, f"the brief names verbs the coordinator's door refuses: {refused}"
+
+
+# --- a drop that lands while a done coordinator idles (1030-42; the shadow day, 10-30 17:33) --------------------
+def _released_and_done(store, fake, clock):
+    """The measured case: a coordinator woke on drop 1, split it, released its lease and sits listed, state done."""
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d1, _ = store.accept_drop("first drop", surface="cli")
+    store.split(d1.drop_id, [Part("work", "w1")], by="coordinator", token=token)
+    store.coord_release(token, by="coordinator")
+    fake.flag("done")
+    clock[0] += timedelta(minutes=3)
+    return ln
+
+
+def test_a_drop_after_a_done_coordinator_released_gets_a_fresh_coordinator_in_one_pass(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)
+    d2, _ = store.accept_drop("drop after the release", surface="cli")
+    assert store.coord_status()["wake"] == "idle" and store.coord_status()["lease"] is None     # the measured state
+    clock[0] += timedelta(seconds=30)
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {ln.launch_id} ended: {lease.REPLACED}") for line in lines), lines
+    assert any(line.startswith(f"launch {ln.launch_id} ended ({lease.REPLACED}): claude stop {HID}") for line in lines)
+    assert len(fake.spawns()) == 2
+    fresh = [x for x in store.launches_active() if x.launch_id != ln.launch_id]
+    assert len(fresh) == 1 and store.launch(ln.launch_id).state == "ended"
+    brief = cl.brief_path(fresh[0]).read_text()
+    assert d2.drop_id in brief and "drop after the release" in brief          # its brief quotes the waiting drop
+    # the fresh one has not yet written and the drop is older than its activation: later passes leave it alone
+    for _ in range(2):
+        clock[0] += timedelta(seconds=30)
+        cl.watch_once(store)
+    assert len(fake.spawns()) == 2 and [x.launch_id for x in store.launches_active()] == [fresh[0].launch_id]
+
+
+def test_a_replaced_coordinator_that_wrote_is_no_death(store, fake, live_hook, clock):
+    from levain.coordinator import lease as lease_mod
+
+    ln = _released_and_done(store, fake, clock)
+    store.accept_drop("drop after the release", surface="cli")
+    cl.watch_once(store)
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease_mod.launch_death(conn, lease_mod.launch(conn, ln.launch_id)) is False
+    finally:
+        conn.close()
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_a_working_coordinator_without_the_lease_is_not_replaced(store, fake, live_hook, clock):
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    store.coord_release(token, by="coordinator")                        # the fake lists it working (no done flag)
+    store.accept_drop("a drop while it works", surface="cli")
+    lines = cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and fake.stops() == []
+    assert store.launch(ln.launch_id).state == "active" and not any(lease.REPLACED in x for x in lines)
+
+
+def test_a_done_coordinator_that_already_saw_every_drop_is_not_replaced(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)         # drop 1 was split before the release: nothing unseen waits
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and store.launch(ln.launch_id).state == "active"
+
+
+def test_a_drop_the_done_coordinator_never_saw_is_replaced_even_with_its_lease_live(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    store.coord_claim(ln.launch_id, ln.session_key)      # it holds a live lease and went done without releasing
+    fake.flag("done")
+    clock[0] += timedelta(minutes=2)
+    store.accept_drop("a drop for the done holder", surface="cli")
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended" and len(fake.spawns()) == 2
+
+
+# --- L3 r1 (1030-42): the unseen rule, the replacement is no death, the uncapped in-transaction check -------------
+def test_a_coordinator_that_never_wrote_then_done_is_replaced_and_its_successor_starts(store, fake, live_hook, clock):
+    # codex HIGH 1's reproduction: active, never claimed or wrote, done, then a drop it never saw
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=2)
+    store.accept_drop("a drop for the silent coordinator", surface="cli")
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).cause == lease.REPLACED, lines
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease.launch_death(conn, lease.launch(conn, ln.launch_id)) is False
+    finally:
+        conn.close()
+    fresh = [x for x in store.launches_active() if x.launch_id != ln.launch_id]
+    assert len(fresh) == 1 and len(fake.spawns()) == 2, lines
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_a_coordinator_writing_after_the_drop_without_reading_it_is_still_replaced(store, fake, live_hook, clock):
+    # codex HIGH 2 / complement MED 1: a later beat or release is no evidence the drop was seen
+    from datetime import timedelta
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    clock[0] += timedelta(seconds=10)
+    store.accept_drop("lands mid-turn", surface="cli")
+    clock[0] += timedelta(seconds=10)
+    store.coord_beat(token)
+    store.coord_release(token, by="coordinator")
+    fake.flag("done")
+    clock[0] += timedelta(seconds=10)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).cause == lease.REPLACED and len(fake.spawns()) == 2
+
+
+def test_one_replacement_per_drop_a_replacement_that_leaves_the_drop_unsplit_is_not_replaced(
+        store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    a = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    d, _ = store.accept_drop("the drop after A", surface="cli")
+    cl.watch_once(store)
+    (b,) = [x for x in store.launches_active() if x.launch_id != a.launch_id]
+    assert store.launch(a.launch_id).cause == lease.REPLACED
+    # B went done too and never split d (the fake still lists the one session done): d is older than B's start
+    for _ in range(3):
+        clock[0] += timedelta(minutes=1)
+        lines = cl.watch_once(store)
+        assert not any(lease.REPLACED in x and "ended:" in x for x in lines), lines
+    assert store.launch(b.launch_id).state == "active" and len(fake.spawns()) == 2
+    assert not any(r.body.get("stage") == "split" for r in store.drop_receipts(d.drop_id))
+
+
+def test_the_unseen_check_is_uncapped_201_drops_the_oldest_unsplit(store, fake, live_hook, clock):
+    # codex MED 3: the newest 200 split by you, the oldest (after the coordinator's start) left unsplit
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    fake.flag("done")
+    drops = []
+    for i in range(201):
+        clock[0] += timedelta(milliseconds=5)
+        drops.append(store.accept_drop(f"drop {i}", surface="cli")[0])
+    for d in drops[1:]:
+        store.split(d.drop_id, [Part("note", "n")])
+    got = store.launch_replace_done(ln.launch_id)
+    assert got is not None and got[0].cause == lease.REPLACED
+
+
+def test_a_split_between_the_listing_and_the_transaction_ends_nothing(store, fake, live_hook, clock, monkeypatch):
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    d, _ = store.accept_drop("split by you at the last moment", surface="cli")
+    real = store.launch_replace_done
+
+    def split_first(launch_id, **kw):
+        store.split(d.drop_id, [Part("work", "w")])          # you split it after the watcher read the listing
+        return real(launch_id, **kw)
+
+    monkeypatch.setattr(store, "launch_replace_done", split_first)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active" and len(fake.spawns()) == 1 and fake.stops() == []
+
+
+def test_replacing_stops_at_the_first_fresh_launch(monkeypatch):
+    # complement LOW 3: two done coordinators, one fresh launch: the second is never ended with none to follow it
+    from types import SimpleNamespace
+
+    a = SimpleNamespace(launch_id="ln-a", role="coordinator", harness_session_id="sa")
+    b = SimpleNamespace(launch_id="ln-b", role="coordinator", harness_session_id="sb")
+    asked: list[str] = []
+
+    def replace(launch_id, **kw):
+        asked.append(launch_id)
+        return SimpleNamespace(launch_id=launch_id, cause=lease.REPLACED), SimpleNamespace(launch_id="ln-new",
+                                                                                           harness="claude")
+
+    st = SimpleNamespace(launch_replace_done=replace)
+    lines: list[str] = []
+    fresh = cl._replace_done(st, [a, b], {"sa": {"state": "done"}, "sb": {"state": "done"}}, lines)
+    assert fresh == ["ln-new"] and asked == ["ln-a"]
+
+
+def test_a_fault_starting_the_fresh_coordinator_is_a_line_and_the_briefs_still_go(store, fake, live_hook, clock,
+                                                                                   monkeypatch):
+    # complement LOW 2
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    store.accept_drop("a drop", surface="cli")
+    brief = cl.brief_path(ln)
+    assert brief.exists()
+
+    def boom(st, launch_id):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(cl, "launch_session", boom)
+    lines = cl.watch_once(store)
+    assert any("not started: the start faulted (OperationalError" in x for x in lines), lines
+    assert not brief.exists() and f"launch {ln.launch_id} ended: its brief removed" in lines
+
+
+# --- levain coord wake reaches an idle released coordinator (desk 1 / flow-shadow addendum) ----------------------
+def test_coord_wake_replaces_a_done_coordinator_running_without_the_lease(store, qdir, fake, live_hook, clock, capsys):
+    ln = _released_and_done(store, fake, clock)
+    assert store.coord_status()["wake"] == "idle"
+    out = _main(qdir, capsys, "coord", "wake")
+    assert f"launch {ln.launch_id} ended: {lease.REPLACED} (claude stop {HID}: stopped {HID})" in out.out, out.out
+    assert f"claude attach {HID}" in out.out
+    assert store.launch(ln.launch_id).cause == lease.REPLACED and len(fake.spawns()) == 2
+    assert [c for c in fake.stops()] == [["stop", HID]]
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_coord_wake_leaves_a_working_coordinator_and_names_the_way_out(store, qdir, fake, live_hook, clock, capsys):
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    store.coord_release(token, by="coordinator")                 # the fake lists it working
+    out = _main(qdir, capsys, "coord", "wake", rc=1)
+    assert "no launch asked for:" in out.out and "not done" in out.out and "levain coord release" in out.out
+    assert store.launch(ln.launch_id).state == "active" and len(fake.spawns()) == 1 and fake.stops() == []
+
+
+def test_coord_wake_with_an_unreadable_listing_says_so(store, qdir, fake, live_hook, clock, capsys):
+    ln = _released_and_done(store, fake, clock)
+    fake.flag("agents_fail")
+    out = _main(qdir, capsys, "coord", "wake", rc=1)
+    assert "could not be read" in out.out and "levain coord release" in out.out
+    assert store.launch(ln.launch_id).state == "active"
+
+
+# --- the turn's last line, and a drop that needs nothing (1030-42 brief lane) ------------------------------------
+def test_the_written_brief_ends_the_turn_on_a_coordinator_status_line(store, fake, live_hook):
+    """Shadow 10-30: a coordinator that ended on "escalated questions #2-#5 ... each waits on you" sat in the agent
+    view as waiting for the operator. The brief carries the end-of-turn rule, quoted."""
+    got = cl.launch_session(store, woken(store))
+    text = cl.brief_path(store.launch(got.launch_id)).read_text()
+    assert "ONE status line beginning `coordinator:`" in text
+    assert "never a question, never \"waits on you\"" in text
+    assert "coord escalate" in text.split("## How your turn ends")[1].split("##")[0]
+    assert "release the lease" in text
+
+
+def test_a_noted_drop_is_not_unseen_not_requoted_and_shows_noted(store, qdir, fake, live_hook, clock, capsys):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d2, _ = store.accept_drop("fyi: nothing to do here", surface="cli")
+    store.note(d2.drop_id, "an fyi, nothing to act on", token=token)
+    store.coord_release(token, by="coordinator")
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease.unseen_drop(conn, lease.launch(conn, ln.launch_id)) is None
+    finally:
+        conn.close()
+    clock[0] += timedelta(seconds=30)
+    lines = cl.watch_once(store)
+    assert not any(lease.REPLACED in line for line in lines) and len(fake.spawns()) == 1       # no replacement
+    assert d2.drop_id not in cl._brief_text(store, ln)                                          # not re-quoted
+    out = _main(qdir, capsys, "drops", "list")
+    assert f"{d2.drop_id}" in out.out and '[noted: "an fyi, nothing to act on"]' in out.out
+    out = _main(qdir, capsys, "drops", "show", d2.drop_id)
+    assert "noted" in out.out and "an fyi, nothing to act on" in out.out
+
+
+def test_only_the_lease_holder_notes_and_split_and_noted_exclude_each_other(store, qdir, fake, live_hook, clock, capsys):
+    from levain.coordinator.store import CoordError, Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "why", token=token + 1)                      # not the live lease's token
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "why", token=None)
+    store.split(d2.drop_id, [Part("work", "w")], by="coordinator", token=token)
+    with pytest.raises(CoordError, match="already split"):
+        store.note(d2.drop_id, "why", token=token)                          # a split drop is not noted
+    store.note(d1.drop_id, "read it", token=token)
+    with pytest.raises(CoordError, match="already noted"):
+        store.note(d1.drop_id, "again", token=token)
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--why", "x", "--token", str(token), rc=1)
+    assert "already noted" in out.err
+    store.coord_release(token, by="coordinator")
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "after release", token=token)               # a lapsed lease writes nothing
+
+
+def test_the_briefs_release_line_runs_as_the_coordinator_and_ends_the_lease(store, qdir, fake, live_hook, capsys):
+    """L3 r1: the end-of-turn rule named a bare `coord release` (defaults --by operator, no token, no --queue-dir)."""
+    got = cl.launch_session(store, woken(store))
+    ln = store.launch(got.launch_id)
+    text = cl.brief_path(ln).read_text()
+    section = text.split("## How your turn ends")[1].split("##")[0]
+    cmd = re.search(r"`([^`]*coord release[^`]*)`", section).group(1)
+    argv = shlex.split(cmd)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    argv = [str(token) if a == "N" else a for a in argv]
+    from levain.cli import main
+
+    assert main(argv[argv.index("coord"):]) == 0, capsys.readouterr()
+    held = store.coord_status()["lease"]
+    assert held is None or not held["live"]
+
+
+def test_drops_list_is_one_snapshot_and_a_store_error_is_a_refusal(store, qdir, monkeypatch, capsys):
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    opens = []
+    real = store._connect
+    monkeypatch.setattr(store, "_connect", lambda *a, **k: (opens.append(1), real(*a, **k))[1])
+    pairs = store.drops_noted(limit=10)
+    assert len(opens) == 1 and [d.drop_id for d, _ in pairs] == [d2.drop_id, d1.drop_id]
+    from levain.coordinator.store import CoordStore as CS
+
+    def boom(self, limit=50):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(CS, "drops_noted", boom)
+    out = _main(qdir, capsys, "drops", "list", rc=1)
+    assert "levain drops list:" in out.err and "Traceback" not in out.err
+
+
+def test_drops_show_escapes_a_noted_why_and_survives_a_receipt_with_no_why(store, qdir, capsys):
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    with store._write() as (conn, now):
+        store._reply(conn, None, "drop_receipt", "drops", d1.drop_id,
+                     {"stage": "noted", "drop_id": d1.drop_id, "why": "x\x1b[2Jy"}, now)
+        store._reply(conn, None, "drop_receipt", "drops", d2.drop_id, {"stage": "noted", "drop_id": d2.drop_id}, now)
+    out = _main(qdir, capsys, "drops", "show", d1.drop_id)
+    assert "\x1b" not in out.out and "noted" in out.out
+    out = _main(qdir, capsys, "drops", "show", d2.drop_id)
+    assert "noted" in out.out
+
+
+# --- quoting-free coordinator verbs (1030-42 verbs; shadow 10-30: two of three real coordinators misfired) -----------
+HOSTILE = "it's \"quoted\" $HOME `date` \\ backslash; ünïcode ✓ 日本"
+
+
+def _held(store):
+    ln = started(store)
+    return store.coord_claim(ln.launch_id, ln.session_key)
+
+
+def test_a_hostile_note_why_goes_through_a_file_and_stdin_as_typed(store, qdir, fake, live_hook, capsys, tmp_path,
+                                                                    monkeypatch):
+    import io
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(f), "--by", "coordinator", "--token", str(token))
+    assert [r.body["why"] for r in store.drop_receipts(d1.drop_id) if r.body.get("stage") == "noted"] == [HOSTILE]
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO((HOSTILE + "\n").encode("utf-8"))))
+    _main(qdir, capsys, "drops", "note", d2.drop_id, "--stdin", "--by", "coordinator", "--token", str(token))
+    assert [r.body["why"] for r in store.drop_receipts(d2.drop_id) if r.body.get("stage") == "noted"] == [HOSTILE]
+
+
+def test_an_oversized_or_two_way_text_is_refused_by_the_same_limits(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 201, encoding="utf-8")                                   # the --why limit is 200
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(big), "--token", str(token), rc=1)
+    assert "1 to 200 characters" in out.err
+    huge = tmp_path / "huge.txt"
+    huge.write_text("x" * 100_000, encoding="utf-8")                              # the read itself is bounded
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(huge), "--token", str(token), rc=1)
+    assert "holds more than" in out.err
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--why", "a", "--text-file", str(big), "--token", str(token),
+                rc=1)
+    assert "name the text once" in out.err
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--token", str(token), rc=1)
+    assert "say why" in out.err
+    bad = tmp_path / "bad.bin"
+    bad.write_bytes(b"\xff\xfe")
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(bad), "--token", str(token), rc=1)
+    assert "not UTF-8" in out.err
+
+
+def test_a_whole_split_is_one_json_document_with_hostile_titles(store, qdir, fake, live_hook, capsys, tmp_path,
+                                                                 monkeypatch):
+    """The 10-30 misfire: three splits in one shell line with the flags in a variable zsh did not split."""
+    import io
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    doc = tmp_path / "split.json"
+    doc.write_text(json.dumps({"drop_id": d1.drop_id,
+                               "threads": [{"kind": "work", "title": HOSTILE}, {"kind": "note", "title": "n", "about": "@1"}]}),
+                   encoding="utf-8")
+    out = _main(qdir, capsys, "drops", "split", "--json-file", str(doc), "--by", "coordinator", "--token", str(token))
+    assert "split into 2 threads" in out.out
+    titles = {t.title for t in store.threads()}
+    assert HOSTILE in titles and "n" in titles
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(json.dumps(
+        {"threads": [{"kind": "note", "title": HOSTILE + " 2"}]}).encode("utf-8"))))
+    out = _main(qdir, capsys, "drops", "split", d2.drop_id, "--stdin", "--by", "coordinator", "--token", str(token))
+    assert "split into 1 thread" in out.out and HOSTILE + " 2" in {t.title for t in store.threads()}
+
+
+def test_a_json_split_is_refused_by_the_same_checks_as_the_flags(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    doc = tmp_path / "split.json"
+    for body, why in ((json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "work", "title": "x" * 201}]}), "1 to 200"),
+                      (json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "bogus", "title": "x"}]}), "exactly one of"),
+                      ("{not json", "not JSON"),
+                      (json.dumps({"drop_id": d1.drop_id, "extra": 1}), "only"),
+                      (json.dumps({"threads": []}), "drop_id")):
+        doc.write_text(body, encoding="utf-8")
+        out = _main(qdir, capsys, "drops", "split", "--json-file", str(doc), "--by", "coordinator", "--token", str(token),
+                    rc=1)
+        assert why in out.err, (body, out.err)
+    out = _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:t", "--json-file", str(doc),
+                "--by", "coordinator", "--token", str(token), rc=1)
+    assert "carries every thread itself" in out.err
+    assert store.threads() == []                                                   # nothing was written
+
+
+def test_the_old_flags_still_work_unchanged(store, qdir, fake, live_hook, capsys):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:Shadow probe", "--by", "coordinator",
+          "--token", str(token))
+    _main(qdir, capsys, "drops", "note", d2.drop_id, "--why", "fyi", "--by", "coordinator", "--token", str(token))
+    t = store.threads()[0]
+    _main(qdir, capsys, "thread", "set", t.thread_id, "title", "renamed", "--by", "coordinator", "--token", str(token))
+    _main(qdir, capsys, "thread", "state", t.thread_id, "done", "--cause", "done", "--by", "coordinator",
+          "--token", str(token))
+    assert store.thread_view(t.thread_id)[0].title == "renamed"
+
+
+def test_thread_set_state_and_add_take_hostile_text_from_a_file(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:first", "--by", "coordinator", "--token", str(token))
+    t = store.threads()[0]
+    f = tmp_path / "v.txt"
+    f.write_text(HOSTILE, encoding="utf-8")
+    _main(qdir, capsys, "thread", "set", t.thread_id, "title", "--text-file", str(f), "--by", "coordinator",
+          "--token", str(token))
+    assert store.thread_view(t.thread_id)[0].title == HOSTILE
+    out = _main(qdir, capsys, "thread", "set", t.thread_id, "title", "--by", "coordinator", "--token", str(token), rc=1)
+    assert "give the new value" in out.err
+    c = tmp_path / "c.txt"
+    c.write_text("because " + HOSTILE, encoding="utf-8")
+    _main(qdir, capsys, "thread", "state", t.thread_id, "done", "--cause-file", str(c), "--by", "coordinator",
+          "--token", str(token))
+    f.write_text("note:" + HOSTILE + " added", encoding="utf-8")
+    _main(qdir, capsys, "thread", "add", d1.drop_id, "--text-file", str(f), "--by", "coordinator", "--token", str(token))
+    assert HOSTILE + " added" in {x.title for x in store.threads()}
+
+
+def test_escalate_and_answer_take_their_text_from_a_file(store, qdir, tmp_path, monkeypatch):
+    import argparse
+
+    from levain.coordinator import cli as ccli
+
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    ns = argparse.Namespace(text_file=f, stdin=False)
+    assert ccli._text_input(ns, None, "--why") == HOSTILE and ccli._text_input(
+        argparse.Namespace(text_file=None, stdin=False), "inline", "--why") == "inline"
+    p = argparse.ArgumentParser()
+    ccli.add_parsers(p.add_subparsers(dest="command"))
+    for argv in (["coord", "escalate", "6", "--text-file", str(f), "--token", "1"],
+                 ["coord", "escalate", "6", "--stdin", "--token", "1"],
+                 ["coord", "answer", "6", "--text-file", str(f), "--token", "1"],
+                 ["coord", "answer", "6", "--stdin", "--token", "1"]):
+        got = p.parse_args(argv)
+        assert got.coord_cmd in ("escalate", "answer")
+
+
+def test_the_brief_leads_with_the_quoting_free_forms_and_one_unmistakable_release_rule(store, fake, live_hook):
+    got = cl.launch_session(store, woken(store))
+    text = cl.brief_path(store.launch(got.launch_id)).read_text()
+    assert "Prefer the forms that need no shell quoting" in text
+    assert "never keep flags in a shell variable (zsh does not split it)" in text
+    writes = text.split("## Your writes")[1].split("##")[0]
+    assert writes.index("--json-file PATH") < writes.index("the older quoted forms still work")
+    assert f"drops note DROP_ID --text-file PATH --by coordinator --token N --queue-dir " in writes
+    lease_part = text.split("## The lease")[1].split("## Your writes")[0]
+    assert "ONLY as the very last step and as its own command, after every split, note and escalate has returned" in lease_part
+
+
+# --- L3 r2 LOWs on the brief branch (1030-42 verbs) ---------------------------------------------------------------
+def test_a_drop_split_after_it_was_noted_no_longer_lists_as_noted(store, qdir, fake, live_hook, capsys):
+    from levain.coordinator.store import Part
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    store.note(d1.drop_id, "read it", token=token)
+    store.note(d2.drop_id, "read it too", token=token)
+    store.split(d1.drop_id, [Part("work", "changed my mind")], by="coordinator", token=token)
+    whys = {d.drop_id: w for d, w in store.drops_noted(limit=10) if d.drop_id in (d1.drop_id, d2.drop_id)}
+    assert whys == {d1.drop_id: None, d2.drop_id: "read it too"}
+    out = _main(qdir, capsys, "drops", "list").out
+    assert f"{d2.drop_id}" in out and out.count("[noted:") == 1
+
+
+def test_note_returns_the_saved_why_and_the_cli_echoes_that(store, qdir, fake, live_hook, capsys):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    assert store.note(d1.drop_id, "  padded  ", token=token) == "  padded  "
+    saved = [r.body["why"] for r in store.drop_receipts(d1.drop_id) if r.body.get("stage") == "noted"]
+    assert saved == ["  padded  "]
+
+
+def test_a_noted_receipt_renders_as_noted_on_the_phone_not_as_zero_threads():
+    from levain.coordinator import phone as ph
+
+    r = type("R", (), {"body": {"stage": "noted", "why": "an fyi", "threads": []}, "at": "2026-10-30T10:00:00Z"})()
+    row = ph.CoordPhone._receipt(r) if hasattr(ph, "CoordPhone") else None
+    assert row is not None and row["stage"] == "noted" and row["why"] == "an fyi"
+    js = (Path(__file__).parent.parent / "levain" / "templates" / "web" / "phone.js").read_text()
+    assert 'noted: "noted"' in js
+    assert 'if (!receipts.some((r) => r.stage === "split" || r.stage === "noted"))' in js
+
+
+# --- L3 r1 (1030-47) on the JSON split and the text files ------------------------------------------------------------
+def _split_refused(body, why):
+    from levain.coordinator import cli as ccli
+    from levain.coordinator.store import CoordError
+
+    with pytest.raises(CoordError, match=why):
+        ccli._split_doc(body, None)
+
+
+def test_a_json_split_refuses_a_key_named_twice_at_any_level():
+    _split_refused('{"drop_id": "D", "threads": [], "threads": []}', "twice")
+    _split_refused('{"drop_id": "D", "threads": [{"kind": "note", "title": "a", "title": "b"}]}', "'title' twice")
+
+
+def test_a_deeply_nested_json_split_is_a_refusal_not_a_traceback():
+    _split_refused("[" * 100_000, "nested too deeply")
+
+
+def test_a_json_split_row_kind_is_exactly_a_kind_and_a_colon_cannot_mangle_it():
+    _split_refused('{"drop_id": "D", "threads": [{"kind": "note:x", "title": "t"}]}', "exactly one of")
+    _split_refused('{"drop_id": "D", "attach": [{"kind": "note:x", "thread": "T"}]}', "exactly one of")
+    _split_refused('{"drop_id": "D", "attach": [{"kind": "note", "thread": "a:b"}]}', 'without ":"')
+    from levain.coordinator import cli as ccli
+
+    _, parts = ccli._split_doc('{"drop_id": "D", "threads": [{"kind": "note", "title": "a: b"}]}', None)
+    assert parts[0].title == "a: b"
+
+
+def test_a_json_split_with_no_parts_is_refused_by_name():
+    _split_refused('{"drop_id": "D"}', "names no threads")
+    _split_refused('{"drop_id": "D", "threads": []}', "names no threads")
+
+
+def test_a_json_split_names_the_field_with_a_wrong_type():
+    for row, why in (({"kind": "note", "title": 5}, '"title"'), ({"kind": "note", "title": ""}, '"title"'),
+                     ({"kind": "note", "title": "t", "about": 3}, '"about"'),
+                     ({"kind": "note", "title": "t", "about": ""}, '"about"')):
+        _split_refused(json.dumps({"drop_id": "D", "threads": [row]}), why)
+    _split_refused(json.dumps({"drop_id": "D", "attach": [{"kind": "note", "thread": 7}]}), '"thread"')
+
+
+def test_a_utf8_bom_in_an_input_file_is_dropped(tmp_path):
+    from levain.coordinator import cli as ccli
+
+    f = tmp_path / "bom.json"
+    f.write_bytes(b"\xef\xbb\xbf" + b'{"drop_id": "D", "threads": [{"kind": "note", "title": "t"}]}\n')
+    assert ccli._split_doc(ccli._read_input(f), None)[0] == "D"
+
+
+def test_escalate_with_a_hostile_text_file_stores_it_as_typed(band, monkeypatch, tmp_path, capsys):
+    from levain.cli import main
+    from levain.coordinator import cli as ccli
+
+    q = band.ask()
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    monkeypatch.setattr(ccli, "_store", lambda args: band.store)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-coord")
+    from levain.coordinator import door
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    door.record(ws)
+    monkeypatch.chdir(ws)
+    rc = main(["coord", "escalate", str(q.n), "--text-file", str(f), "--token", str(band.token),
+               "--queue-dir", str(band.store.directory)])
+    assert rc == 0, capsys.readouterr().err
+    bodies = [json.loads(r[0]) for r in band.c.rows("SELECT body FROM replies WHERE kind = 'answer'")]
+    assert [b["why"] for b in bodies] == [HOSTILE]

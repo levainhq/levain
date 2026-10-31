@@ -56,7 +56,8 @@ from levain.slot.intent import (INSTALL_LOCK, INTENT_PATH, Intent, install_lock,
 from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Group, account_steps, accounts_of,
                                   membership_pairs, membership_steps, revive_steps,
                                   shared_group_steps, shared_groups_of, member_state, group_state, uid_retires,
-                                  account_state, remove_member_steps, remove_group_steps, remove_account_steps)
+                                  account_state, remove_member_steps, remove_group_steps, remove_account_steps,
+                                  vendor_home_steps)
 from levain.slot.grammar import (KEY_TYPE_NAMES, LEASE_EXEMPT, PUBLIC_KEY_RE, ROUTES_REPLACE_INTENT, SESSION_RE, VERBS,
                                  InstallCommand, check_roots, parse_install_argv)
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
@@ -71,7 +72,8 @@ from levain.slot.layout import (STORE, Row, base_routes_steps, base_run_rows, ba
                                 parse_pool_config, policy_limits_path, policy_rows, pool_config_row, pool_config_steps,
                                 pool_config_undo_steps, reserve_row, reserve_steps, roots_steps, row_steps,
                                 run_dir_undo_steps, single_filesystem_steps, slot_rows, tmpfiles_steps,
-                                tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps)
+                                tmpfiles_undo_steps, ungroup_steps, entry_state, remove_entry_steps,
+                                vendor_home_rows)
 from levain.slot.sudoers import (INSTALL_SUDOERS, RUNTIME_SUDOERS, config_check_step, dropin_state,
                                  remove_dropin_steps, sudoers_paths, sudoers_steps)
 
@@ -1037,6 +1039,8 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
         alloc = allocate(host, egress=new["egress"], verifier=new["none"], used=facts.used_ids,
                          retired=facts.retired)
     made = accounts_of(alloc)
+    # R7 (macOS): the home the new vendor accounts' records name, made before them, as setup and repair make it.
+    home_rows = vendor_home_rows(host)
     rows = slot_rows(host, alloc.slots)
     resumed = set(alloc.slots)
     in_service = tuple(s for s in (SlotId(cls, i) for cls in ("egress", "none") for i in live.get(cls, ()))  # type: ignore[arg-type]
@@ -1056,6 +1060,7 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
     steps = [
         # FIRST (§25): the slots this run makes, so a run that dies part-way resumes them, never spends more.
         intent_write_step(host, intent),
+        *row_steps(host, home_rows),
         *account_steps(host, made),
         *membership_steps(host, membership_pairs(made, None)),
         *row_steps(host, rows),
@@ -1069,7 +1074,7 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
         intent_remove_step(host),   # LAST, after the confinement steps
     ]
     check_tools(facts, steps, verb="replenish")
-    return InstallPlan("replenish", host, tuple(steps), alloc, made, (), tuple(rows), (), facts.retired,
+    return InstallPlan("replenish", host, tuple(steps), alloc, made, (), tuple(home_rows + rows), (), facts.retired,
                        intent=intent)
 
 
@@ -1736,7 +1741,9 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
     steps += F("R7", [*membership_steps(host, missing_pairs),                                     # R7
                       *removals("R7")])             # R1b: members, then groups (gid retired first), then accounts
     steps += F("R8", [*removals("R8"),              # R1b: the confinement kinds' removals first, then the re-render
-                      *row_steps(host, rows), *reserve_steps(host), *base_routes_steps(host),     # R8
+                      # R7 (macOS): the vendor accounts re-pointed at L/vendorhome once the rows have made it
+                      *row_steps(host, rows), *vendor_home_steps(host, slots),
+                      *reserve_steps(host), *base_routes_steps(host),     # R8
                       *base_routes_merge_steps(host),
                       *single_filesystem_steps(host, slots), *confinement])
     if rf.current != target:
