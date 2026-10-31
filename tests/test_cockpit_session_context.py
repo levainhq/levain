@@ -223,3 +223,65 @@ def test_an_exhausted_budget_says_how_many_lanes_it_left_out(tmp_path, monkeypat
     monkeypatch.setattr(session_context, "_SPEND_CAP", t.stat().st_size + 3 * one)
     got, why, skipped = session_context.tokens_since_detail(t, "claude_code", since)
     assert (got, why, skipped) == (30, "", 7)
+
+
+def _bump(f, text, when=None):
+    with open(f, "a") as fh:
+        fh.write(text)
+    if when:
+        os.utime(f, (when, when))
+
+
+def test_a_lane_appending_while_the_parent_is_idle_is_read_again(tmp_path):
+    t, since = _busy_session(tmp_path, {"agent-069.jsonl"})
+    first = session_context.tokens_since_detail(t, "claude_code", since)[0]
+    lane = tmp_path / "s" / "subagents" / "agent-069.jsonl"
+    _bump(lane, _stamped("late", 100, "2026-01-02T10:00:00Z"))
+    assert session_context.tokens_since_detail(t, "claude_code", since)[0] == first + 100
+
+
+def test_a_parent_written_before_since_still_reads_a_lane_written_after(tmp_path):
+    t, since = _busy_session(tmp_path, set())
+    old = since.timestamp() - 3600
+    os.utime(t, (old, old))
+    assert session_context.tokens_since_detail(t, "claude_code", since)[0] == 0
+    lane = tmp_path / "s" / "subagents" / "agent-000.jsonl"
+    _bump(lane, _stamped("new", 7, "2026-01-02T10:00:00Z"), since.timestamp() + 60)
+    assert session_context.tokens_since_detail(t, "claude_code", since)[0] == 7
+
+
+def test_the_lane_count_is_bounded_and_the_rest_counted(tmp_path, monkeypatch):
+    late = {f"agent-{i:03d}.jsonl" for i in range(60, 70)}
+    t, since = _busy_session(tmp_path, late)
+    monkeypatch.setattr(session_context, "_LANE_FILES", 4)
+    opened = []
+    real = session_context._lines_of
+    monkeypatch.setattr(session_context, "_lines_of", lambda f, b: (opened.append(f.name), real(f, b))[1])
+    got, why, skipped = session_context.tokens_since_detail(t, "claude_code", since)
+    assert (got, why, skipped) == (40, "", 6)
+    assert len(opened) == 5
+
+
+def test_an_unlistable_lane_directory_counts_as_one_skipped(tmp_path, monkeypatch):
+    t, since = _busy_session(tmp_path, set())
+    def boom(*a, **k):
+        raise PermissionError("no")
+    monkeypatch.setattr(session_context.os, "scandir", boom)
+    assert session_context.tokens_since_detail(t, "claude_code", since)[2] == 1
+
+
+def test_a_lane_that_will_not_stat_counts_as_skipped(tmp_path, monkeypatch):
+    t, since = _busy_session(tmp_path, {"agent-069.jsonl"})
+    class E:
+        def __init__(self, e): self._e, self.name = e, e.name
+        def stat(self):
+            if self.name == "agent-069.jsonl":
+                raise FileNotFoundError("gone")
+            return self._e.stat()
+    real_scandir = os.scandir
+    class S:
+        def __init__(self, p): self._c = real_scandir(p)
+        def __enter__(self): return (E(e) for e in self._c.__enter__())
+        def __exit__(self, *a): return self._c.__exit__(*a)
+    monkeypatch.setattr(session_context.os, "scandir", S)
+    assert session_context.tokens_since_detail(t, "claude_code", since)[2] == 1

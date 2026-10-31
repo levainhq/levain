@@ -23,6 +23,9 @@ compaction reports 0 input tokens; it is skipped, and a ``compacted`` record new
 
 The meter shows the main transcript's last record only: a subagent's transcript is a separate context and does not add to
 the session's live context. Spend is different (every call is paid for), hence ``include_subagents`` on the iterator.
+
+Known edges of tokens-today: a lane copied with its mtime preserved (a restore, a sync tool) reads as old and its fresh
+records can be hidden. A file that grows more than 1 MiB between its stat and its open is read only to its size at open.
 """
 from __future__ import annotations
 
@@ -48,6 +51,7 @@ _SPEND_CAP = 256 << 20      # a file larger than this is not read for spend
 _CACHE_MAX = 256
 _LINE_CAP = 4 << 20         # a spend-scan line longer than this is skipped, never held whole
 _SUBAGENT_FILES = 64        # subagent transcripts iter_usage reads for spend; more are counted as skipped
+_LANE_FILES = 512           # subagent transcripts tokens_since_detail reads (newest first); the rest are counted as skipped
 _MODEL_CAP = 64
 _DAY_DIRS = 30              # date directories walked for a Codex rollout, newest first
 _cache: dict[tuple[str, str], tuple[tuple[int, ...], Any]] = {}
@@ -473,7 +477,7 @@ def _stamp(v: Any) -> datetime | None:
     return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc)
 
 
-_day_cache: dict[tuple[str, str, int, int, str], tuple[int | None, str, int]] = {}
+_day_cache: dict[tuple[str, str, int, int, str, tuple[int, int, int, int]], tuple[int | None, str, int]] = {}
 
 
 def tokens_since(path: Path | str, agent: str, since: datetime) -> tuple[int | None, str]:
@@ -483,33 +487,75 @@ def tokens_since(path: Path | str, agent: str, since: datetime) -> tuple[int | N
 
 
 def tokens_since_detail(path: Path | str, agent: str, since: datetime) -> tuple[int | None, str, int]:
-    """``(tokens, why, skipped)``: ``skipped`` is how many subagent transcripts written since ``since`` were left out
-    (the byte budget ran out, or one would not read), so the figure is then a floor. Fresh tokens a transcript spent at or after ``since`` (an aware time), by each record's own ``timestamp``:
-    ``(tokens, "")``, or ``(None, why)`` when it cannot be told (unreadable, oversized, or a usage record with no stamp).
+    """``(tokens, why, skipped)``.
+
+    ``tokens`` is the fresh tokens a transcript spent at or after ``since`` (an aware time), by each record's own
+    ``timestamp``: ``(tokens, "")``, or ``(None, why)`` when it cannot be told (unreadable, oversized, or a usage record
+    with no stamp). ``skipped`` is how many subagent transcripts written since ``since`` were left out (more than
+    ``_LANE_FILES`` of them, the byte budget ran out, one would not read or stat, or the directory could not be listed),
+    so the figure is then a floor.
+
     The unit is the one :func:`spend_step` counts: Claude Code input + output + cache write (each message id at the MAX
     across its records, subagent transcripts included); Codex input - cached input + output (its cumulative
-    ``total_token_usage`` now, less its value at the last record before ``since``). A transcript last written before
-    ``since`` spent nothing since, and is not opened."""
+    ``total_token_usage`` now, less its value at the last record before ``since``).
+
+    A Claude Code transcript last written before ``since`` whose subagent transcripts were all written before it too
+    spent nothing since, and is not opened (a Codex rollout has no subagent files). The cache is keyed on the parent and
+    on the selected subagent files (their count, newest mtime and total size), so a lane still appending while the
+    parent is idle is read again."""
     p = Path(path)
     opened = _open_regular(p)
     if opened is None:
         return None, "unreadable", 0
     fd, st = opened
     os.close(fd)
-    key = (str(p), agent, st.st_mtime_ns, st.st_size, since.isoformat())
+    lanes: list[tuple[int, int, str, Path]] = []
+    extra = 0
+    if agent != "codex":
+        lanes, extra = _lanes(p, since)
+    state = (len(lanes), max((m for m, _, _, _ in lanes), default=0), sum(z for _, z, _, _ in lanes), extra)
+    key = (str(p), agent, st.st_mtime_ns, st.st_size, since.isoformat(), state)
     if key in _day_cache:
         return _day_cache[key]
-    if st.st_mtime < since.timestamp():
-        got: tuple[int | None, str, int] = (0, "", 0)
+    if st.st_mtime < since.timestamp() and not lanes:
+        got: tuple[int | None, str, int] = (0, "", extra)
     else:
         try:
-            got = (*_codex_since(p, since), 0) if agent == "codex" else _claude_since(p, since)
+            got = (*_codex_since(p, since), 0) if agent == "codex" else _claude_since(p, since, lanes, extra)
         except OSError:
             got = (None, "unreadable", 0)
     if len(_day_cache) >= _CACHE_MAX:
         _day_cache.pop(next(iter(_day_cache)))
     _day_cache[key] = got
     return got
+
+
+def _lanes(p: Path, since: datetime) -> tuple[list[tuple[int, int, str, Path]], int]:
+    """The subagent transcripts of ``p`` written at or after ``since``, newest first and at most ``_LANE_FILES`` of
+    them as ``(mtime_ns, size, name, path)``, and how many more were left out: the ones past the count, a file that
+    would not stat, or (as 1) a directory that could not be listed. Every entry is statted; only the selection is read."""
+    sub = p.with_suffix("") / "subagents"
+    floor = since.timestamp()
+    fresh: list[tuple[int, int, str, Path]] = []
+    left = 0
+    try:
+        with os.scandir(sub) as it:
+            for e in it:
+                if not e.name.endswith(".jsonl"):
+                    continue
+                try:
+                    est = e.stat()
+                except OSError:
+                    left += 1
+                    continue
+                if est.st_mtime >= floor:
+                    fresh.append((est.st_mtime_ns, est.st_size, e.name, sub / e.name))
+    except (FileNotFoundError, NotADirectoryError):
+        pass                                # no lanes were ever written
+    except (OSError, ValueError):
+        left += 1                           # the lanes could not be listed
+    fresh.sort(reverse=True)
+    return fresh[:_LANE_FILES], left + max(0, len(fresh) - _LANE_FILES)
 
 
 def _lines_of(f: Path, budget: int) -> Iterator[bytes]:
@@ -540,28 +586,17 @@ def _lines_of(f: Path, budget: int) -> Iterator[bytes]:
         os.close(fd)
 
 
-def _claude_since(p: Path, since: datetime) -> tuple[int | None, str, int]:
-    """Tokens at or after ``since`` over the transcript and its subagent transcripts, and how many of those could not
-    be read. Records are appended, so a subagent file last written before ``since`` holds nothing at or after it and is
-    not opened; every one written since is read, newest first, until the byte budget runs out, and the rest are
-    counted in the third value, never dropped silently."""
-    files: list[Path] = []
-    try:
-        fresh: list[tuple[float, str, Path]] = []
-        for f in (p.with_suffix("") / "subagents").glob("*.jsonl"):
-            try:
-                mt = f.stat().st_mtime
-            except OSError:
-                continue
-            if mt >= since.timestamp():
-                fresh.append((mt, f.name, f))
-        files = [f for _, _, f in sorted(fresh, reverse=True)]
-    except (OSError, ValueError):
-        pass
-    files.insert(0, p)
+def _claude_since(p: Path, since: datetime, lanes: list[tuple[int, int, str, Path]],
+                  extra: int = 0) -> tuple[int | None, str, int]:
+    """Tokens at or after ``since`` over the transcript and the selected subagent transcripts ``lanes`` (see
+    :func:`_lanes`: written since ``since``, newest first, at most ``_LANE_FILES``), and how many could not be read.
+    Records are appended, so a subagent file last written before ``since`` holds nothing at or after it and is not
+    opened. The selected ones are read newest first until the byte budget runs out; the rest, and the ``extra`` the
+    selection left out, are counted in the third value, never dropped silently."""
+    files = [p] + [f for _, _, _, f in lanes]
     best: dict[str, list[Any]] = {}       # message id -> [first stamp, input, cache write, output]
     budget = _SPEND_CAP
-    skipped = 0
+    skipped = extra
     for f in files:
         try:
             size = f.stat().st_size
