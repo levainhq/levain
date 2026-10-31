@@ -400,13 +400,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   cannot render. This is the one exception to "Levain never touches your global Claude Code configuration".
 - **The coordinator will not start without a working NEEDS YOU band, and `levain doctor` fails when the band cannot
   render.** The coordinator launch (Claude Code and Codex) now refuses, before it starts anything, when the install's
-  SessionStart, UserPromptSubmit or Stop band hook is not registered, its band scripts are missing or differ from the
+  SessionStart, UserPromptSubmit or Stop band hook is not registered (a handler carrying `if`, or of a type other
+  than `command`, does not count: Claude Code never runs it on these events), its band scripts are missing or differ from the
   package, or the interpreter the hooks run, started as the hook starts it, cannot import the band (the hooks swallow
   a failed import, so the band used to vanish silently). The refusal names what is missing and the fix
   (`levain update --path <install>`). A Codex coordinator whose workspace is outside the install whose hooks Codex
   runs is refused until the user-level band is installed (`levain band hooks install`). Doctor's "NEEDS YOU band
   hooks" row is a FAIL, not a warning, in those cases, and
-  the cockpit's Coordinator panel shows one line with the fix command.
+  the cockpit's Coordinator panel shows one line with the fix command (or "cannot check" with the reason when its
+  Codex workspace check could not run).
 - **The ping puts what you act on first.** A question ping is now the question, its options, the answer command, and
   only then the blocks, which take the room left and end "(full text on the card)" when cut. The room is measured in
   the bytes the phone push carries (emoji and accented text take more than one), and the question and the option
@@ -498,6 +500,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   gate hook on every call and by the send child after each push, so a ping released by a quiet running out (or the desk
   going idle) waits for the next gate-hook call or push, and stays held while no agent calls. Covered by tests; not run
   on a real phone or a real push.
+- **`levain.band_view.band_hooks_state`.** It judged an install's band hooks by a text match that a script's comment
+  satisfied. Use `levain.doctor.install_band_wiring(install, project_dir)`, which returns `wired`, `stale` or
+  `absent` from the settings the session loads, the three registrations and the scripts' freshness.
 
 ### Fixed
 - **The cockpit's tokens-today figure no longer leaves out subagent lanes on a busy session.** It read only the first 64

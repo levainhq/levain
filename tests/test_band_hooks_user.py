@@ -630,6 +630,8 @@ def test_a_blank_settings_file_comes_back_byte_for_byte(rig, text):
 @pytest.fixture
 def locked():
     """chmod a directory read-only for the test, and back."""
+    if os.geteuid() == 0:
+        pytest.skip("chmod does not stop root from writing")
     held = []
 
     def lock(d):
@@ -739,3 +741,126 @@ def test_a_codex_coordinator_outside_the_owning_install_needs_the_user_band(rig,
     assert cx.workspace_band_problem(owner, owner / "sub") is None        # inside: the install's own check answers
     assert band_hook.install(python=str(rig.py))[0] == 0
     assert cx.global_hook_live(ws)[0]
+
+
+# --- round 3 ---------------------------------------------------------------------------------------------------
+def _band_handlers(doc, event, script):
+    return [h for g in doc["hooks"][event] for h in g["hooks"] if script in h.get("command", "")]
+
+
+@pytest.mark.parametrize("change", [{"if": "Bash(*)"}, {"type": "prompt"}, {"type": "http"}, {"type": None}],
+                         ids=["if-conditioned", "prompt-type", "http-type", "no-type"])
+def test_a_band_handler_claude_code_would_not_run_is_not_wired(rig, change):
+    # Claude Code skips a handler with an `if` on these events, and only a "command" handler runs a script: a
+    # registration whose command names the script is not enough
+    inst = rig.make_install()
+    assert doctor.install_band_wiring(inst).state == "wired"
+    f = inst / ".claude" / "settings.json"
+    doc = json.loads(f.read_text())
+    handlers = _band_handlers(doc, "UserPromptSubmit", "user_prompt_submit.py")
+    assert handlers
+    for h in handlers:
+        h.update(change)
+        if h["type"] is None:
+            del h["type"]
+    f.write_text(json.dumps(doc, indent=2))
+    w = doctor.install_band_wiring(inst)
+    assert w.state == "stale" and w.detail.startswith("UserPromptSubmit is not registered")
+    assert not doctor._check_band_hooks(inst, "claude_code").ok
+
+
+def test_a_codex_install_wired_through_a_project_hooks_file_stands_the_user_band_down(rig, capsys):
+    # the install is found through the project's .codex/hooks.json, so that is the file its wiring is read from
+    from levain.band_view import session_band_state
+
+    inst = rig.make_install("codex")
+    user = rig.codex / "hooks.json"
+    project = inst / ".codex" / "hooks.json"
+    project.parent.mkdir(exist_ok=True)
+    project.write_text(user.read_text())
+    user.write_text("{}")
+    assert session_band_state("codex", str(inst), rig.env) == "wired"
+    assert band_hook.inside_wired_install("codex", str(inst), rig.env)
+    rig.ask()
+    assert band_hook.install(python=str(rig.py))[0] == 0
+    capsys.readouterr()
+    band_hook.codex_standalone("UserPromptSubmit", {"session_id": "pj-1", "cwd": str(inst), "prompt": "hi"}, rig.env)
+    assert capsys.readouterr().out == ""                                   # one band: the install's own
+
+
+def test_a_global_codex_install_shows_its_own_band_in_an_outside_workspace(rig, monkeypatch):
+    # a global-scope install's hooks take their full branch everywhere (should_fire), which renders the band, so an
+    # outside workspace with no user-level receipt is not a bandless launch
+    import importlib.util
+
+    from levain.coordinator import codex_launch as cx
+
+    owner = rig.make_install("codex")
+    (owner / ".levain" / "config.json").write_text(json.dumps({"scope": "global"}))
+    monkeypatch.setattr(cx, "codex_home", lambda: rig.codex)
+    assert band_hook.read_receipt() is None
+    assert cx.workspace_band_problem(owner, rig.outside) is None
+    spec = importlib.util.spec_from_file_location("_levain_hook_globalchk",
+                                                  owner / "activation" / "hooks" / "_levain_hook.py")
+    hookmod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hookmod)
+    monkeypatch.chdir(rig.outside)
+    assert hookmod.install_root() == owner.resolve() and hookmod.should_fire()
+    (owner / ".levain" / "config.json").write_text(json.dumps({"scope": "install"}))
+    assert not hookmod.should_fire() and cx.workspace_band_problem(owner, rig.outside) is not None
+
+
+def test_two_threads_inside_band_probe_once_keep_their_own_results(rig, monkeypatch):
+    import threading
+
+    runs = []
+
+    def fake_probe(python, flags, modules):
+        runs.append(python)
+        return f"result {len(runs)}"
+
+    monkeypatch.setattr(doctor, "_run_band_probe", fake_probe)
+    a_in, b_done = threading.Event(), threading.Event()
+    seen = {}
+
+    def a():
+        with doctor.band_probe_once():
+            seen["a1"] = doctor._band_import_problem("/py")
+            a_in.set()
+            b_done.wait(10)
+            seen["a2"] = doctor._band_import_problem("/py")
+
+    def b():
+        a_in.wait(10)
+        with doctor.band_probe_once():
+            seen["b1"] = doctor._band_import_problem("/py")
+            seen["b2"] = doctor._band_import_problem("/py")
+        b_done.set()
+
+    ts = [threading.Thread(target=a), threading.Thread(target=b)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(20)
+    assert seen == {"a1": "result 1", "a2": "result 1", "b1": "result 2", "b2": "result 2"}
+    with doctor.band_probe_once():                           # this thread had none open: its own, fresh
+        assert doctor._band_import_problem("/py") == "result 3"
+    assert doctor._band_import_problem("/py") == "result 4"  # outside any block nothing is kept
+
+
+def test_the_panel_says_when_the_codex_workspace_check_could_not_run(rig, monkeypatch, tmp_path):
+    from levain.cockpit import coordinator_status as cs
+    from levain.coordinator import codex_launch
+
+    owner = tmp_path / "owner"
+    owner.mkdir()
+    monkeypatch.setattr(cs, "_band_install", lambda setting: (owner, "codex"))
+    monkeypatch.setattr(cs, "_band_cache", {})
+    monkeypatch.setattr("levain.coordinator.launch.band_failure", lambda *a, **k: None)
+
+    def broken(owner, work):
+        raise OSError("hooks.json unreadable")
+
+    monkeypatch.setattr(codex_launch, "workspace_band_problem", broken)
+    row = cs.band_row({"agent": "codex", "cwd": str(rig.outside)})
+    assert row is not None and "cannot check: OSError: hooks.json unreadable" in row.body

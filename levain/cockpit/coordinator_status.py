@@ -166,8 +166,8 @@ def band_row(setting: dict[str, Any] | None, now: float | None = None) -> RowIn 
         work = Path((setting or {}).get("cwd") or codex_launch.default_directory())
         try:
             outside = codex_launch.workspace_band_problem(Path(install), work)
-        except Exception:
-            outside = None
+        except Exception as exc:  # noqa: BLE001 - a check that could not run is said, never shown as a working band
+            return _row("band", "NEEDS YOU band", f"cannot check: {type(exc).__name__}: {str(exc)[:200]}")
         if outside is not None:
             return _row("band", "NEEDS YOU band cannot render", outside, f" · fix: {band_hook.INSTALL_COMMAND}")
     key, t = f"{install}|{agent}", time.monotonic() if now is None else now

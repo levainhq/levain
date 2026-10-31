@@ -1881,9 +1881,11 @@ def _stop_turn(directory: Path | str, fact: TurnFact, rec: dict | None, payload:
     return _reprint_reason(missing)
 
 
-def _codex_hooks_dir(environ: Mapping[str, str], cwd: str | None) -> Path | None:
-    """The ``activation/hooks`` directory Codex's own ``hooks.json`` names for UserPromptSubmit: ``$CODEX_HOME`` (or
-    ``~/.codex``), then a ``.codex/hooks.json`` of the working directory or a parent. ``None``: none names one."""
+def _codex_hooks_dir(environ: Mapping[str, str], cwd: str | None) -> tuple[Path, Path] | None:
+    """``(activation/hooks directory, the hooks.json naming it)`` for the first of Codex's own ``hooks.json`` files
+    whose UserPromptSubmit names one: ``$CODEX_HOME`` (or ``~/.codex``), then a ``.codex/hooks.json`` of the working
+    directory or a parent. The file comes back so the install's wiring is read from the file it was found in.
+    ``None``: none names one."""
     import shlex
 
     home = Path(environ.get("CODEX_HOME") or Path.home() / ".codex")
@@ -1898,7 +1900,7 @@ def _codex_hooks_dir(environ: Mapping[str, str], cwd: str | None) -> Path | None
                 for h in entry.get("hooks") or []:
                     for tok in shlex.split(str(h.get("command", ""))):
                         if tok.endswith("user_prompt_submit.py"):
-                            return Path(tok).parent
+                            return Path(tok).parent, f
         except Exception:
             continue
     return None
@@ -1909,7 +1911,8 @@ def _find_hooks_dir(agent: str, cwd: str | None, environ: Mapping[str, str]) -> 
     ``CLAUDE_PROJECT_DIR`` or the working directory and its parents; Codex's own hooks.json (never a neighbouring
     Claude install: those scripts do not run in Codex)."""
     if agent == "codex":
-        return _codex_hooks_dir(environ, cwd)
+        found = _codex_hooks_dir(environ, cwd)
+        return found[0] if found else None
     cands: list[Path] = []
     if environ.get("CLAUDE_PROJECT_DIR"):
         cands.append(Path(environ["CLAUDE_PROJECT_DIR"]))
@@ -1927,11 +1930,13 @@ def session_band_state(agent: str, cwd: str | None, environ: Mapping[str, str]) 
     session, answered by :func:`levain.doctor.install_band_wiring` (the one answer). The install is found as
     :func:`_find_hooks_dir` finds it: for Claude Code from the project dir (``CLAUDE_PROJECT_DIR``, else ``cwd``),
     which also decides which project settings Claude Code loads; for Codex from its own hooks.json, for a session
-    in ``cwd``."""
+    in ``cwd``, its wiring read from the hooks.json the install was found in."""
     from levain.doctor import install_band_wiring
 
+    source: Path | None = None
     if agent == "codex":
-        hooks = _codex_hooks_dir(environ, cwd)
+        found = _codex_hooks_dir(environ, cwd)
+        hooks, source = found if found else (None, None)
         project = cwd
         home: Path | None = Path(environ.get("CODEX_HOME") or Path.home() / ".codex")
     else:
@@ -1940,7 +1945,7 @@ def session_band_state(agent: str, cwd: str | None, environ: Mapping[str, str]) 
         home = None
     if hooks is None or not project:
         return "absent"
-    return install_band_wiring(hooks.parent.parent, project, agent, home).state
+    return install_band_wiring(hooks.parent.parent, project, agent, home, source).state
 
 
 def gate_notice(directory: Path | str, agent: str, session: str | None, cwd: str | None,

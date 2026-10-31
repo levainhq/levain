@@ -25,6 +25,7 @@ install is otherwise indistinguishable from a working one.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import os
 import re
@@ -5343,11 +5344,15 @@ BAND_EVENTS = (("SessionStart", "session_start.py"), ("UserPromptSubmit", "user_
                ("Stop", "stop.py"))
 
 
-def _band_settings_files(project: Path, agent: str, codex_home: Path | None) -> list[Path]:
+def _band_settings_files(project: Path, agent: str, codex_home: Path | None,
+                         codex_hooks_file: Path | None = None) -> list[Path]:
     """The files whose hooks the agent loads for a session in ``project``: Claude Code's project settings for a
     session started there (:func:`levain.host_guard.cc_project_settings_files`: ``settings.json`` from that folder
-    only, ``settings.local.json`` at the repository root); Codex's one ``hooks.json``."""
+    only, ``settings.local.json`` at the repository root); for Codex the ``hooks.json`` its install was found
+    through (``codex_hooks_file``: a project's ``.codex/hooks.json``), else ``$CODEX_HOME``'s."""
     if agent == "codex":
+        if codex_hooks_file is not None:
+            return [Path(codex_hooks_file)]
         home = codex_home if codex_home is not None else Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
         return [home / "hooks.json"]
     from levain.host_guard import cc_project_settings_files
@@ -5358,7 +5363,9 @@ def _band_settings_files(project: Path, agent: str, codex_home: Path | None) -> 
 
 def _band_registration(hooks: Any, event: str, script: Path, project: Path) -> str | None:
     """The first command under ``event`` that runs ``script`` (resolved; ``${CLAUDE_PROJECT_DIR}`` read as
-    ``project``, as Claude Code expands it), else ``None``. A SessionStart group must match a fresh start."""
+    ``project``, as Claude Code expands it), else ``None``. A SessionStart group must match a fresh start. Only a
+    ``"type": "command"`` handler with no ``if`` counts: another type never runs the script, and Claude Code skips
+    a handler carrying ``if`` on these events."""
     entries = hooks.get(event) if isinstance(hooks, dict) else None
     for group in entries if isinstance(entries, list) else []:
         if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
@@ -5370,6 +5377,8 @@ def _band_registration(hooks: Any, event: str, script: Path, project: Path) -> s
         for h in group["hooks"]:
             if not isinstance(h, dict) or not isinstance(h.get("command"), str):
                 continue
+            if h.get("type") != "command" or "if" in h:
+                continue
             try:
                 tokens = shlex.split(h["command"])
             except ValueError:
@@ -5380,12 +5389,13 @@ def _band_registration(hooks: Any, event: str, script: Path, project: Path) -> s
 
 
 def install_band_wiring(install: Path | str, project_dir: Path | str | None = None, agent: str = "claude_code",
-                        codex_home: Path | None = None) -> BandWiring:
+                        codex_home: Path | None = None, codex_hooks_file: Path | None = None) -> BandWiring:
     """THE answer to "is this install's NEEDS YOU band wired for a session in ``project_dir``?" (default: the
     install itself), from facts only: the settings the agent loads there (:func:`_band_settings_files`) register
     SessionStart, UserPromptSubmit and Stop to run this install's ``session_start.py``, ``user_prompt_submit.py``
     and ``stop.py``, and those scripts match the package (:func:`_hook_freshness`, the one freshness check). A Codex
-    install's hooks do nothing for a session outside it unless its scope is global. ``wired`` | ``stale`` (part of
+    install's hooks do nothing for a session outside it unless its scope is global; ``codex_hooks_file`` names the
+    ``hooks.json`` the install was found through when that is not ``$CODEX_HOME``'s. ``wired`` | ``stale`` (part of
     it: ``levain update`` fixes it) | ``absent`` (none of it applies there). Doctor's band row, the coordinator
     launch, the user-level band's stand-down and the gate's notice all ask this; none derives it again."""
     install = Path(install)
@@ -5403,7 +5413,7 @@ def install_band_wiring(install: Path | str, project_dir: Path | str | None = No
                 return BandWiring("absent", f"{project} is outside {install}, and its Codex hooks do nothing there")
     found: dict[str, str] = {}
     where: Path | None = None
-    files = _band_settings_files(project, agent, codex_home)
+    files = _band_settings_files(project, agent, codex_home, codex_hooks_file)
     for f in files:
         try:
             tree = json.loads(f.read_text(encoding="utf-8"))
@@ -5468,21 +5478,23 @@ def band_probe_spec(command: str) -> tuple[str, tuple[str, ...], tuple[str, ...]
 
 
 _BAND_PROBE_TIMEOUT = 20.0
-_PROBE_CACHE: list[dict[tuple[Any, ...], str | None]] = []
+# Per context, so a launch on one thread never reads or ends another thread's cache.
+_PROBE_CACHE: contextvars.ContextVar[dict[tuple[Any, ...], str | None] | None] = contextvars.ContextVar(
+    "levain_band_probe_cache", default=None)
 
 
 @contextlib.contextmanager
 def band_probe_once():
     """Within this block each distinct import probe runs once (a coordinator launch checks the band more than once).
-    Nested inside another, it keeps the outer one's results."""
-    if _PROBE_CACHE:
+    Nested inside another in the same context, it keeps the outer one's results; another thread has its own."""
+    if _PROBE_CACHE.get() is not None:
         yield
         return
-    _PROBE_CACHE.append({})
+    token = _PROBE_CACHE.set({})
     try:
         yield
     finally:
-        _PROBE_CACHE.pop()
+        _PROBE_CACHE.reset(token)
 
 
 def _band_import_problem(python: str, flags: Sequence[str] = (), modules: Sequence[str] = ("levain.band_view",)
@@ -5492,11 +5504,12 @@ def _band_import_problem(python: str, flags: Sequence[str] = (), modules: Sequen
     directory never stands in for an install) with the caller's environment, as a hook sees it, bounded by a
     timeout. Inside :func:`band_probe_once` a probe already run is answered from its result."""
     key = (python, tuple(flags), tuple(modules))
-    if _PROBE_CACHE and key in _PROBE_CACHE[-1]:
-        return _PROBE_CACHE[-1][key]
+    cache = _PROBE_CACHE.get()
+    if cache is not None and key in cache:
+        return cache[key]
     problem = _run_band_probe(python, tuple(flags), tuple(modules))
-    if _PROBE_CACHE:
-        _PROBE_CACHE[-1][key] = problem
+    if cache is not None:
+        cache[key] = problem
     return problem
 
 
