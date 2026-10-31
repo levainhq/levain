@@ -7,6 +7,18 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **The coordinator's reply carries what changed in its store.** Ahead of the NEEDS YOU band, a coordinator session's
+  reply block now has a work delta rendered by Levain (never model-written) from the coordinator store's records that carry
+  its `gseq`: replies, launch events, lease events, ready moves and chat messages. At most 5 lines in `gseq` order, then
+  `+N more: levain coord log --since GSEQ`; a store that cannot be read says `! not read` and moves nothing. The
+  reprint check at Stop covers its lines (a block of work with an empty band is verified too, and the one retry names
+  the work lines as well as the band), and the operator's cursor, an append-only `operator_views` table, advances only
+  at that Stop, so an interrupted or unverified reply repeats the delta. A verified reply advances it past every record
+  the block counted, the five shown AND the `+N more`: the block names `levain coord log --since GSEQ` for those, so a
+  backlog is read with that command, not drained five lines per reply. A store from before the table gets it at its
+  first verified reply, and a store replaced between the prompt and the Stop (another `store_id`) is left alone.
+  Replies written before `replies` had a `gseq` have no place in the order and are counted in the header, not listed.
+  New: `levain coord log --since GSEQ [--limit N]` (`N` 1..500), a read of the same records.
 - **An OPEN question: `levain ask --open`.** A question filed with no options and no recommendation, answered only in the
   operator's own words (`levain question answer N --text`, the cockpit's write-in box, band shorthand
   `N: words`). `--open` takes no `--option`, no `--rec` and no `--would-push` (each refused beside it); the `ask` MCP tool takes `open: true`

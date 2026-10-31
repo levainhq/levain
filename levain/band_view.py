@@ -1373,12 +1373,25 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
     except Exception:
         return echo, _no_commit
     block = text                             # the band as the seat reads it (the delta line in): what Stop compares
+    work_through, work_store = 0, ""
+    if coord:
+        # the work delta rides ahead of the band, inside the one block Stop verifies; its cursor commits with the view
+        try:
+            from levain.coordinator import work_delta
+
+            work = work_delta.read_block(directory, viewer, deadline - time.monotonic())
+            work_text, work_through, work_store = work.text, work.through, work.store_id
+        except Exception:                 # never an empty block for a delta that could not be built
+            work_text = "since your last message (Levain's record): ! not read (the work delta could not be built)"
+        if work_text:
+            block = work_text + ("\n" + block if block else "")
+    text = block
     if echo:
         text = echo + ("\n" + text if text else "")
 
     def commit() -> None:
         if coord:                             # the coordinator's view is the Stop hook's to commit, after the reply verifies
-            _stage_view(directory, session, r, block)
+            _stage_view(directory, session, r, block, work_through, work_store)
             return
         try:
             mark_closed_shown(store, r.closed)
@@ -1486,13 +1499,16 @@ def _remove_if(f: Path, expect: bytes | None) -> None:
         pass
 
 
-def _stage_view(directory: Path | str, session: str, r: "Rendered", block: str) -> None:
+def _stage_view(directory: Path | str, session: str, r: "Rendered", block: str, work: int = 0,
+                store_id: str = "") -> None:
     """Keep the view a coordinator turn was just shown for its Stop hook to commit: one record per SESSION (two
-    coordinator sessions alive at once never share one), replaced atomically. Never raises."""
+    coordinator sessions alive at once never share one), replaced atomically. ``work``: the work cursor
+    (:mod:`levain.coordinator.work_delta`) that commits with the view (0: it does not move), and ``store_id`` the
+    coordinator store it was read from (the advance refuses another). Never raises."""
     try:
         _replace(_session_file(directory, session, "staged"),
                  json.dumps({"session": session, "hwm": r.hwm, "shown": list(r.shown), "gen": r.gen,
-                             "closed": list(r.closed), "block": block}))
+                             "closed": list(r.closed), "block": block, "work": work, "store_id": store_id}))
     except Exception:
         pass
 
@@ -1510,7 +1526,8 @@ def _read_staged(directory: Path | str, session: str) -> tuple[dict, bytes] | No
         if rec["session"] != session:
             return None
         return ({"hwm": int(rec["hwm"]), "shown": [int(n) for n in rec["shown"]], "gen": int(rec["gen"]),
-                 "closed": [int(n) for n in rec["closed"]], "block": str(rec["block"])}, raw)
+                 "closed": [int(n) for n in rec["closed"]], "block": str(rec["block"]),
+                 "work": int(rec.get("work", 0)), "store_id": str(rec.get("store_id") or "")}, raw)
     except Exception:
         return None
 
@@ -1520,8 +1537,11 @@ def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, 
     """The coordinator viewer's Stop: the view this session's prompt hook staged commits only once the reply reprints
     it (:func:`_reprint_check`), so a turn that never produced a verified reply leaves the cursor where it was and the
     next reply repeats the delta. A view with nothing open still verifies when it carries a block (``NEEDS YOU · 0
-    open`` and its delta). One block per view, as on every seat; the continuation that carries the reprint commits.
-    The stage is removed by compare-and-delete: only the record this Stop read."""
+    open`` and its delta), and so does a block of work lines alone (the early return on an empty band never applied to
+    this viewer). The work delta (:mod:`levain.coordinator.work_delta`) is the front of the stored block, so the same
+    check covers its lines, and the operator's work cursor advances in this commit and nowhere else. One block per view,
+    as on every seat; the continuation that carries the reprint commits. The stage is removed by compare-and-delete:
+    only the record this Stop read."""
     session = payload["session_id"]
     got = _read_staged(directory, session)
     if got is None:
@@ -1541,18 +1561,39 @@ def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, 
             record_view(store, viewer, st["hwm"], st["shown"], deadline=deadline, gen=st["gen"], block=st["block"])
         except Exception:
             pass
+        if st["work"] > 0:                    # the work cursor moves with the view, only now the block was reprinted
+            from levain.coordinator import work_delta
+
+            left = HOOK_BUSY_MS / 1000 if deadline is None else deadline - time.monotonic()
+            work_delta.advance(directory, viewer, st["work"], left, st["store_id"])
         _clear_staged(directory, session, raw)
         return None
     if payload.get("stop_hook_active") or not _claim_retry(directory, viewer, st["gen"]):
         return None
-    return _reprint_reason(missing)
+    from levain.coordinator import work_delta
+
+    # the check wants the work lines at the front of the block: a retry that named only the band would fail it again
+    work = st["block"].startswith(work_delta.HEAD)
+    return _reprint_reason(missing, work=work, band=not work or "\nNEEDS YOU · " in st["block"])
 
 
-def _reprint_reason(missing: list[int]) -> str:
+def _reprint_reason(missing: list[int], *, work: bool = False, band: bool = True) -> str:
+    """The one retry's words, naming what :func:`_reprint_check` checks: the band, and with ``work`` the coordinator's
+    work lines ahead of it (``band`` False: a block of work lines alone)."""
     what = ("the items " + ", ".join(str(n) for n in missing)) if missing else "the band as given (header line or items altered)"
-    return (f"[Levain NEEDS YOU band] Your reply dropped {what} of the NEEDS YOU band you were given. Reprint the "
-            "whole band once, exactly as Levain gave it (the band@ line and every numbered item, unchanged), at "
-            "the end of your reply. Do not answer or renumber any item.")
+    if not work:
+        return (f"[Levain NEEDS YOU band] Your reply dropped {what} of the NEEDS YOU band you were given. Reprint the "
+                "whole band once, exactly as Levain gave it (the band@ line and every numbered item, unchanged), at "
+                "the end of your reply. Do not answer or renumber any item.")
+    from levain.coordinator import work_delta
+
+    if not missing:
+        what = "the block as given (its work lines" + (", the band's header line or items" if band else "") + " altered)"
+    lines = f'the work lines, from the "{work_delta.HEAD}" line through the last of them'
+    order = f"{lines}, then the band@ line and every numbered item" if band else lines
+    return (f"[Levain NEEDS YOU band] Your reply dropped {what} of the block Levain gave you. Reprint the whole block "
+            f"once, exactly as Levain gave it ({order}, all unchanged and in that order), at the end of your reply. "
+            "Do not answer or renumber any item.")
 
 
 def _prompt_sha(prompt: Any) -> str | None:
