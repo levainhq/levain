@@ -45,7 +45,18 @@ def _type(words: str) -> dict:
     return {"eval": f"(() => {{ {BOX}.value = {json.dumps(words)}; {BOX}.dispatchEvent(new Event('input', {{bubbles: true}})); return 1; }})()"}
 
 
-CLICK_SEND = {"eval": "document.querySelector('#ck-drop [data-coord-drop=send]').click(); 1"}
+CLICK_SEND_JS = "document.querySelector('#ck-drop [data-coord-drop=send]').click(); 1"
+
+
+def _send(words: str | None = None, *, posts: int | None = None, until: str | None = None, ms: int = 15000, every: int = 1500) -> dict:
+    """Type the words (when given) and press Send, retried together with the wait for its effect. A press whose handler
+    returned early (a repaint replaced the button or the box between the readiness check and the click) is done again
+    after `every` ms; a repeat is safe because the outbox id makes it the same request, which these tests assert. (A test that
+    sends several different drops in a row passes a longer `every`, so a slow first reply is not mistaken for a lost click.)"""
+    do = (_type(words)["eval"].rstrip(";") + "; " if words is not None else "") + CLICK_SEND_JS
+    return {"do": do, "ms": ms, "every": every, **({"posts": posts} if posts is not None else {"until": until})}
+
+
 RECEIPT_DONE = "(document.querySelector('#ck-drop .drop-receipt') || {}).textContent && /^(Sent|Already|The drop|Not sure)/.test(document.querySelector('#ck-drop .drop-receipt').textContent)"
 
 
@@ -117,7 +128,7 @@ def test_send_writes_the_drop_through_the_one_route_clears_the_box_and_says_what
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}",
                      [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-                      _type("tell the coordinator: land c-12"), CLICK_SEND, {"posts": 1, "ms": 15000},
+                      _send("tell the coordinator: land c-12", posts=1),
                       {"until": RECEIPT_DONE + " && document.querySelectorAll('#ck-drop .drop-recent-row').length === 1", "ms": 20000},
                       {"eval": after}, _shot(tmp_path, "1280_sent")])
     a = _tagged(out)["after"]
@@ -155,7 +166,7 @@ def test_recent_drops_list_collapses_past_three_and_no_drop_row_is_left_in_the_c
     rig = FullRig(tmp_path, monkeypatch)
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}]
     for i in range(4):
-        steps += [_type(f"drop number {i}"), CLICK_SEND, {"until": RECEIPT_DONE + f" && {BOX}.value === '' && !{BOX}.disabled", "ms": 20000}]
+        steps += [_send(f"drop number {i}", until=RECEIPT_DONE + f" && {BOX}.value === '' && !{BOX}.disabled", ms=20000, every=4000)]
     steps += [{"until": "document.querySelectorAll('#ck-drop .drop-recent-row').length >= 3 && document.querySelector('#ck-drop .drop-more')", "ms": 20000},
               {"eval": "JSON.stringify({t: 'collapsed', rows: [...document.querySelectorAll('#ck-drop .drop-recent-row')].map(r => r.textContent), more: document.querySelector('#ck-drop .drop-more').textContent})"},
               {"eval": "document.querySelector('#ck-drop .drop-more').click(); 1"},
@@ -183,7 +194,7 @@ def test_an_expanded_recent_list_taller_than_the_composer_does_not_move_the_comp
     rig = FullRig(tmp_path, monkeypatch)
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}]
     for i in range(4):
-        steps += [_type(f"drop number {i}"), CLICK_SEND, {"until": RECEIPT_DONE + f" && {BOX}.value === '' && !{BOX}.disabled", "ms": 20000}]
+        steps += [_send(f"drop number {i}", until=RECEIPT_DONE + f" && {BOX}.value === '' && !{BOX}.disabled", ms=20000, every=4000)]
     fill = ("(() => { const h = document.getElementById('ck-drop'); h.querySelector('.drop-earlier').textContent = '1 earlier drop not confirmed.'; return 1; })()")
     # the clones go in and the gaps are read in ONE evaluation, so a redraw of the list cannot land between them
     grow = ("(() => { const r = document.querySelector('#ck-drop .drop-recent'); const row = r.querySelector('.drop-recent-row');"
@@ -244,8 +255,8 @@ def _posted(out: dict) -> list:
 def test_a_send_whose_reply_was_lost_goes_again_as_the_same_request_and_files_once(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": LOSE_FIRST_REPLY}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-             _type("land c-14"), CLICK_SEND, {"posts": 1, "ms": 15000}, {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
-             {"eval": "new Promise(r => setTimeout(r, 1100)).then(() => 1)"}, CLICK_SEND, {"posts": 2, "ms": 15000},
+             _send("land c-14", posts=1), {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
+             {"eval": "new Promise(r => setTimeout(r, 1100)).then(() => 1)"}, _send(posts=2),
              {"until": "/^Already delivered/.test(document.querySelector('#ck-drop .drop-receipt').textContent) && document.querySelectorAll('#ck-drop .drop-recent-row').length === 1", "ms": 20000}]
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
@@ -259,7 +270,7 @@ def test_a_kept_request_from_an_earlier_visit_is_resent_whole_envelope_and_store
     rig = FullRig(tmp_path, monkeypatch)
     seed = {"words": "signed earlier", "outbox_id": "ph-" + "ab" * 16, "sent_at": "2026-10-30T12:00:00.123000Z", "store_id": "store-from-before", "envelope": {"kind": "kept"}}
     init = f"localStorage.setItem({PEND}, {json.dumps(json.dumps(seed))});"
-    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": init}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, CLICK_SEND, {"posts": 1, "ms": 15000}]
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": init}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, _send(posts=1)]
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
     assert _posted(out) == [seed], _posted(out)
@@ -270,8 +281,8 @@ def test_a_kept_request_from_an_earlier_visit_is_resent_whole_envelope_and_store
 def test_words_edited_after_a_lost_reply_are_a_new_drop_not_the_old_id(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": LOSE_FIRST_REPLY}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-             _type("words A"), CLICK_SEND, {"posts": 1, "ms": 15000}, {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
-             _type("words B"), CLICK_SEND, {"posts": 2, "ms": 15000}, {"until": "/^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000}]
+             _send("words A", posts=1), {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
+             _send("words B", posts=2), {"until": "/^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000}]
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
     a, b = _posted(out)
@@ -306,7 +317,7 @@ def test_a_late_older_read_never_overwrites_the_list_a_send_just_drew(tmp_path: 
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": GET_STALE_ONCE}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
              {"eval": f"new Promise(r => setTimeout(r, {wait})).then(() => 1)"},
              {"eval": "window.__slowGet = true; document.dispatchEvent(new Event('visibilitychange')); 1"}, {"eval": "new Promise(r => setTimeout(r, 800)).then(() => 1)"},
-             _type("drawn once"), CLICK_SEND, {"posts": 1, "ms": 15000},
+             _send("drawn once", posts=1),
              {"until": "document.querySelectorAll('#ck-drop .drop-recent-row').length === 1", "ms": 15000},
              {"eval": "new Promise(r => setTimeout(r, 6500)).then(() => 1)"},
              {"eval": "JSON.stringify({t: 'late', rows: document.querySelectorAll('#ck-drop .drop-recent-row').length})"}]
@@ -321,7 +332,7 @@ def test_storage_that_throws_does_not_block_the_send_and_the_receipt_says_a_relo
     rig = FullRig(tmp_path, monkeypatch)
     init = "Storage.prototype.setItem = function () { throw new DOMException('quota', 'QuotaExceededError'); };" + LOSE_FIRST_REPLY
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": init}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-             _type("no storage"), CLICK_SEND, {"posts": 1, "ms": 15000}, {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
+             _send("no storage", posts=1), {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
              {"eval": "JSON.stringify({t: 'r', receipt: document.querySelector('#ck-drop .drop-receipt').textContent})"}]
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
@@ -398,8 +409,8 @@ KEYS = "JSON.stringify({t: 'keys', keys: Object.keys(localStorage).filter(k => k
 def test_a_new_drop_never_overwrites_a_restored_signed_pending_one_and_the_signed_one_comes_back_whole(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _seed(SIGNED)}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-             _type("something else entirely"), CLICK_SEND, {"posts": 1, "ms": 15000}, {"until": "/^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
-             {"eval": KEYS}, CLICK_SEND, {"posts": 2, "ms": 15000}]
+             _send("something else entirely", posts=1), {"until": "/^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
+             {"eval": KEYS}, _send(posts=2)]
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
     new, again = _posted(out)
@@ -415,7 +426,7 @@ def test_a_new_drop_never_overwrites_a_restored_signed_pending_one_and_the_signe
 def test_an_unanswered_new_drop_leaves_the_older_pending_one_kept_and_counted(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _seed(SIGNED) + LOSE_FIRST_REPLY}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-             _type("lost reply"), CLICK_SEND, {"posts": 1, "ms": 15000}, {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
+             _send("lost reply", posts=1), {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
              {"eval": KEYS}]
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
@@ -438,7 +449,7 @@ def _reply(envelope: dict) -> str:
 def test_a_resent_signed_request_says_what_became_of_its_envelope_not_words_only(envelope: dict, says: str, bad: bool, tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _seed(SIGNED) + _reply(envelope)}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-             CLICK_SEND, {"until": "/^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
+             _send(until="/^Sent/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", ms=20000),
              {"eval": "JSON.stringify({t: 'r', text: document.querySelector('#ck-drop .drop-receipt').textContent, bad: document.querySelector('#ck-drop .drop-receipt').classList.contains('bad')})"}]
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
@@ -567,9 +578,9 @@ def test_a_read_that_fails_after_a_lost_reply_does_not_leave_send_dead(tmp_path:
            " return f.apply(this, arguments); };"
            " t.headers = function () { if (armed === 1) { armed = 2; throw new Error('read failed'); } return h(); }; })();")
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, {"eval": arm + " 1"},
-             _type("land c-15"), CLICK_SEND, {"posts": 1, "ms": 15000},
+             _send("land c-15", posts=1),
              {"until": RECEIPT_DONE + " && /^Not sure/.test(document.querySelector('#ck-drop .drop-receipt').textContent)", "ms": 20000},
-             {"eval": "new Promise(r => setTimeout(r, 600)).then(() => 1)"}, CLICK_SEND, {"posts": 2, "ms": 15000}]
+             {"eval": "new Promise(r => setTimeout(r, 600)).then(() => 1)"}, _send(posts=2)]
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
     assert len(_posted(out)) == 2, out["posts"]

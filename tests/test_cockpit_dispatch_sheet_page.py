@@ -161,8 +161,8 @@ def test_the_decisions_view_lists_the_job_and_its_sign_button_opens_the_sheet_wi
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
             {"until": "!!(window.LevainNeeds && window.LevainNeeds.history)", "ms": 30000},
-            {"eval": "window.LevainNeeds.history() || 1"},
-            {"until": f"{sign} && 1", "ms": 30000},
+            # the history read is retried with the wait for its button: a read started before the page could take it draws nothing
+            {"do": "window.LevainNeeds.history() || 1", "until": f"{sign} && 1", "ms": 30000},
             {"eval": f"{sign}.click() || 1"},
             {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state", "ms": 30000},
             {"eval": f"{FRAME}.getAttribute('src')"},
@@ -172,13 +172,13 @@ def test_the_decisions_view_lists_the_job_and_its_sign_button_opens_the_sheet_wi
                       f"{IN}.getElementById('sheet-note').textContent", "ms": 30000},
         ])
     v = out["values"]
-    assert v[4] == "open", v
-    assert v[5].startswith(f"/sign/dispatch/{rig.job.id}#v=") and v[5].endswith("&choice=sign"), v
+    assert v[3] == "open", v
+    assert v[4].startswith(f"/sign/dispatch/{rig.job.id}#v=") and v[4].endswith("&choice=sign"), v
     # the version the card passes is exactly the form the sheet's picker binds: the row's sha256, its first 16 hex
-    vv = v[5].split("#v=", 1)[1].split("&", 1)[0]
+    vv = v[4].split("#v=", 1)[1].split("&", 1)[0]
     assert len(vv) == 16 and all(ch in "0123456789abcdef" for ch in vv), v
-    assert v[6] == "Sign (sign)", v
-    assert str(v[8]).startswith("signed (signed)"), v
+    assert v[5] == "Sign (sign)", v
+    assert str(v[7]).startswith("signed (signed)"), v
     assert rig.state() == "signed"
 
 

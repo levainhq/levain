@@ -138,11 +138,13 @@ def test_a_token_changed_in_this_page_updates_the_zone_without_a_reload(tmp_path
     with _serve(src, write_token=TOKEN) as (base, _h):
         out = _drive(tmp_path, base + "/", [
             {"until": "document.querySelector('[data-mode-tab=board]')"},
-            {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); location.reload(); 1"},
-            {"until": "document.querySelector('.th-zone') && document.querySelector('[data-mode-tab=build]')"},
+            # the sentinel is set on the document that is about to go: only the reloaded one lacks it, so the next wait cannot be
+            # satisfied by the old page
+            {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__pre = 1; location.reload(); 1"},
+            {"until": "!window.__pre && document.querySelector('.th-zone') && document.querySelector('[data-mode-tab=build]')"},
             {"eval": _COUNT},
-            {"eval": "document.querySelector('[data-mode-tab=build]').click(); 1"},
-            {"until": "document.querySelector('.th-zone .tv-row')"},
+            # the Build click is retried with its result: a click the page was not yet ready for opens nothing
+            {"do": "document.querySelector('[data-mode-tab=build]').click(); 1", "until": "document.querySelector('.th-zone .tv-row')"},
             # a rotated token: the page's own read path meets the rejection and drops the stored token in this document
             {"eval": "localStorage.setItem('levain_write_token', 'rotated-away'); window.prompt = () => ''; "
                      "LevainCockpitTransport.readJson('/cockpit/threads.json').catch(() => 0).then(() => 1)"},
@@ -151,7 +153,7 @@ def test_a_token_changed_in_this_page_updates_the_zone_without_a_reload(tmp_path
             {"eval": "window.__th0 = window.__th(); new Promise(r => setTimeout(() => r(window.__th() - window.__th0), 4500))"},
         ])
     v = out["values"]
-    token_after_rejection, hidden, reads_after = v[7], v[8], v[9]
+    token_after_rejection, hidden, reads_after = v[6], v[7], v[8]
     assert token_after_rejection in (None, "")
     assert hidden is True
     assert reads_after == 0

@@ -67,8 +67,8 @@ def test_the_focus_view_draws_the_long_item_whole_and_decides_there(tmp_path: Pa
     open_long = (f"(() => {{ const r = {ROWS}.find(x => /rec b/.test(x.textContent)); r.click(); return 1; }})()")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         vals = _drive(tmp_path, f"{url}/#write_token=T", [{"emulate": SIZES[0][1]}, {"until": READY, "ms": 20000},
-            {"eval": open_long},
-            {"until": "document.querySelectorAll('#levain-modal .needs-question .question-option').length === 3"},
+            # the open is retried with its assertion: a click on a row a repaint replaced (or one not drawn yet) opens nothing
+            {"do": open_long, "until": "document.querySelectorAll('#levain-modal .needs-question .question-option').length === 3"},
             {"eval": "JSON.stringify({text: document.querySelector('#levain-modal .needs-q-title').textContent,"
                      " opts: [...document.querySelectorAll('#levain-modal .question-option')].map(b => b.textContent),"
                      " rec: /REC\\s+b/.test(document.querySelector('#levain-modal .needs-card').innerText),"
