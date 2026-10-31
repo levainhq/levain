@@ -367,7 +367,7 @@
       return c;
     };
     const evN = isNum(counts.events_today) ? counts.events_today : null;
-    const tkN = fmtTokens(counts.tokens_today), unread = isNum(counts.tokens_unread) ? counts.tokens_unread : 0;
+    const tkN = fmtTokens(counts.tokens_today), unread = (isNum(counts.tokens_unread) ? counts.tokens_unread : 0) + (isNum(counts.tokens_skipped) ? counts.tokens_skipped : 0);
     const noTk = past ? "not kept for the past: a session's tokens are read from its transcript as it is now"
       : "no session transcript could be read" + (unread ? " (" + unread + " not read)" : "");
     row.append(

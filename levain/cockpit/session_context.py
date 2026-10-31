@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, NamedTuple
 
 __all__ = ["CONTEXT_WARN_TOKENS", "Context", "find_transcript", "last_context", "iter_usage", "spend_step",
-           "context_chip", "tokens_since", "recent_rate"]
+           "context_chip", "tokens_since", "tokens_since_detail", "recent_rate"]
 
 # The operator's rotation line for a lane, not any model's window: past it a session is dearer per turn than it is worth.
 CONTEXT_WARN_TOKENS = 200_000
@@ -47,7 +47,7 @@ _CAP = 8 << 20              # the widest window; a usage record further back tha
 _SPEND_CAP = 256 << 20      # a file larger than this is not read for spend
 _CACHE_MAX = 256
 _LINE_CAP = 4 << 20         # a spend-scan line longer than this is skipped, never held whole
-_SUBAGENT_FILES = 64        # subagent transcripts read for spend; more are counted as skipped
+_SUBAGENT_FILES = 64        # subagent transcripts iter_usage reads for spend; more are counted as skipped
 _MODEL_CAP = 64
 _DAY_DIRS = 30              # date directories walked for a Codex rollout, newest first
 _cache: dict[tuple[str, str], tuple[tuple[int, ...], Any]] = {}
@@ -473,11 +473,18 @@ def _stamp(v: Any) -> datetime | None:
     return t.replace(tzinfo=timezone.utc) if t.tzinfo is None else t.astimezone(timezone.utc)
 
 
-_day_cache: dict[tuple[str, str, int, int, str], tuple[int | None, str]] = {}
+_day_cache: dict[tuple[str, str, int, int, str], tuple[int | None, str, int]] = {}
 
 
 def tokens_since(path: Path | str, agent: str, since: datetime) -> tuple[int | None, str]:
-    """Fresh tokens a transcript spent at or after ``since`` (an aware time), by each record's own ``timestamp``:
+    """:func:`tokens_since_detail` without the count of subagent transcripts it could not read."""
+    got, why, _skipped = tokens_since_detail(path, agent, since)
+    return got, why
+
+
+def tokens_since_detail(path: Path | str, agent: str, since: datetime) -> tuple[int | None, str, int]:
+    """``(tokens, why, skipped)``: ``skipped`` is how many subagent transcripts written since ``since`` were left out
+    (the byte budget ran out, or one would not read), so the figure is then a floor. Fresh tokens a transcript spent at or after ``since`` (an aware time), by each record's own ``timestamp``:
     ``(tokens, "")``, or ``(None, why)`` when it cannot be told (unreadable, oversized, or a usage record with no stamp).
     The unit is the one :func:`spend_step` counts: Claude Code input + output + cache write (each message id at the MAX
     across its records, subagent transcripts included); Codex input - cached input + output (its cumulative
@@ -486,19 +493,19 @@ def tokens_since(path: Path | str, agent: str, since: datetime) -> tuple[int | N
     p = Path(path)
     opened = _open_regular(p)
     if opened is None:
-        return None, "unreadable"
+        return None, "unreadable", 0
     fd, st = opened
     os.close(fd)
     key = (str(p), agent, st.st_mtime_ns, st.st_size, since.isoformat())
     if key in _day_cache:
         return _day_cache[key]
     if st.st_mtime < since.timestamp():
-        got: tuple[int | None, str] = (0, "")
+        got: tuple[int | None, str, int] = (0, "", 0)
     else:
         try:
-            got = _codex_since(p, since) if agent == "codex" else _claude_since(p, since)
+            got = (*_codex_since(p, since), 0) if agent == "codex" else _claude_since(p, since)
         except OSError:
-            got = (None, "unreadable")
+            got = (None, "unreadable", 0)
     if len(_day_cache) >= _CACHE_MAX:
         _day_cache.pop(next(iter(_day_cache)))
     _day_cache[key] = got
@@ -533,23 +540,44 @@ def _lines_of(f: Path, budget: int) -> Iterator[bytes]:
         os.close(fd)
 
 
-def _claude_since(p: Path, since: datetime) -> tuple[int | None, str]:
-    files = [p]
+def _claude_since(p: Path, since: datetime) -> tuple[int | None, str, int]:
+    """Tokens at or after ``since`` over the transcript and its subagent transcripts, and how many of those could not
+    be read. Records are appended, so a subagent file last written before ``since`` holds nothing at or after it and is
+    not opened; every one written since is read, newest first, until the byte budget runs out, and the rest are
+    counted in the third value, never dropped silently."""
+    files: list[Path] = []
     try:
-        files += sorted((p.with_suffix("") / "subagents").glob("*.jsonl"))[:_SUBAGENT_FILES]
+        fresh: list[tuple[float, str, Path]] = []
+        for f in (p.with_suffix("") / "subagents").glob("*.jsonl"):
+            try:
+                mt = f.stat().st_mtime
+            except OSError:
+                continue
+            if mt >= since.timestamp():
+                fresh.append((mt, f.name, f))
+        files = [f for _, _, f in sorted(fresh, reverse=True)]
     except (OSError, ValueError):
         pass
+    files.insert(0, p)
     best: dict[str, list[Any]] = {}       # message id -> [first stamp, input, cache write, output]
     budget = _SPEND_CAP
+    skipped = 0
     for f in files:
         try:
-            budget -= f.stat().st_size
+            size = f.stat().st_size
         except OSError:
             if f is p:
-                return None, "unreadable"
+                return None, "unreadable", 0
+            skipped += 1
             continue
+        if size > budget:
+            if f is p:
+                return None, "oversized", 0
+            skipped += 1
+            continue
+        budget -= size
         try:
-            for line in _lines_of(f, _SPEND_CAP):
+            for line in _lines_of(f, size + (1 << 20)):
                 if b'"usage"' not in line:
                     continue
                 d = _json(line)
@@ -558,7 +586,7 @@ def _claude_since(p: Path, since: datetime) -> tuple[int | None, str]:
                     continue
                 at = _stamp(d.get("timestamp"))
                 if at is None:
-                    return None, "a usage record has no timestamp"
+                    return None, "a usage record has no timestamp", 0
                 u = m["usage"]
                 mid = m["id"] if isinstance(m.get("id"), str) else f"{f.name}:{d.get('uuid') or len(best)}"
                 row = [at, _num(u.get("input_tokens")), _num(u.get("cache_creation_input_tokens")), _num(u.get("output_tokens"))]
@@ -568,9 +596,9 @@ def _claude_since(p: Path, since: datetime) -> tuple[int | None, str]:
                 best[mid] = row
         except OSError as exc:
             if f is p:
-                return None, str(exc)
-            continue                     # a subagent file that cannot be read is left out, as spend_step leaves it
-    return sum(r[1] + r[2] + r[3] for r in best.values() if r[0] >= since), ""
+                return None, str(exc), 0
+            skipped += 1                 # a subagent file that cannot be read is left out, and counted
+    return sum(r[1] + r[2] + r[3] for r in best.values() if r[0] >= since), "", skipped
 
 
 def _codex_since(p: Path, since: datetime) -> tuple[int | None, str]:

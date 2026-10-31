@@ -170,3 +170,56 @@ def test_a_recorded_transcript_over_the_length_cap_or_with_a_nul_is_not_trusted(
     for bad in ("/" + "a" * 1100 + ".jsonl", "/t/a\0b.jsonl"):
         path, _why = find_transcript({"agent": "claude_code", "session_id": "s", "cwd": "/w", "transcript": bad}, env)
         assert path == tmp_path / "projects" / "-w" / "s.jsonl"
+
+
+# --- tokens today over a busy session's subagent lanes ----------------------------------------------------------
+
+def _stamped(mid: str, out: int, at: str) -> str:
+    return json.dumps({"type": "assistant", "timestamp": at, "message": {"id": mid, "usage": {
+        "input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": out}}}) + "\n"
+
+
+def _busy_session(tmp_path, today_names):
+    """A transcript with 70 subagent lanes; those in ``today_names`` carry 10 tokens stamped today, the rest are
+    old (stamp and mtime)."""
+    from datetime import datetime, timezone
+    since = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    t = tmp_path / "s.jsonl"
+    t.write_text(_stamped("main", 1, "2026-01-01T10:00:00Z"))
+    sub = tmp_path / "s" / "subagents"
+    sub.mkdir(parents=True)
+    old = since.timestamp() - 86400
+    for i in range(70):
+        name = f"agent-{i:03d}.jsonl"
+        f = sub / name
+        if name in today_names:
+            f.write_text(_stamped(f"m{i}", 10, "2026-01-02T09:00:00Z"))
+        else:
+            f.write_text(_stamped(f"m{i}", 10, "2026-01-01T09:00:00Z"))
+            os.utime(f, (old, old))
+    return t, since
+
+
+def test_tokens_today_counts_every_subagent_lane_not_the_first_64_by_name(tmp_path):
+    late = {f"agent-{i:03d}.jsonl" for i in range(66, 70)}      # sort after position 64
+    t, since = _busy_session(tmp_path, late)
+    assert session_context.tokens_since(t, "claude_code", since) == (40, "")
+    assert session_context.tokens_since_detail(t, "claude_code", since) == (40, "", 0)
+
+
+def test_a_subagent_file_last_written_before_since_is_not_read(tmp_path, monkeypatch):
+    t, since = _busy_session(tmp_path, {"agent-069.jsonl"})
+    opened = []
+    real = session_context._lines_of
+    monkeypatch.setattr(session_context, "_lines_of", lambda f, b: (opened.append(f.name), real(f, b))[1])
+    assert session_context.tokens_since_detail(t, "claude_code", since)[0] == 10
+    assert sorted(opened) == ["agent-069.jsonl", "s.jsonl"]
+
+
+def test_an_exhausted_budget_says_how_many_lanes_it_left_out(tmp_path, monkeypatch):
+    late = {f"agent-{i:03d}.jsonl" for i in range(60, 70)}
+    t, since = _busy_session(tmp_path, late)
+    one = (tmp_path / "s" / "subagents" / "agent-069.jsonl").stat().st_size
+    monkeypatch.setattr(session_context, "_SPEND_CAP", t.stat().st_size + 3 * one)
+    got, why, skipped = session_context.tokens_since_detail(t, "claude_code", since)
+    assert (got, why, skipped) == (30, "", 7)

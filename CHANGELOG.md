@@ -94,6 +94,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   on a real phone or a real push.
 
 ### Fixed
+- **The cockpit's tokens-today figure no longer leaves out subagent lanes on a busy session.** It read only the first 64
+  subagent transcripts by file name, so on a heavy session the later lanes were silently missing. It now reads every
+  lane written since local midnight, newest first, and a lane it could not read in time (the read budget ran out) is
+  counted and shown in the panel's "not read" line instead of dropped.
 - **The morning card marks a presence word whose quote was not verified.** `_presence` dropped the `verified` flag the
   quote check puts on every word an agent sets, so the card showed an agent's word as if it were the operator's. The
   card's presence block now carries `verified` (true only when the quote was found in what he wrote; a record from before
