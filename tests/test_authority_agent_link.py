@@ -238,6 +238,7 @@ def test_a_revoke_agent_removing_two_links_signs_at_rank_1(tmp_path):
     other = create(world, 3, agent=OTHER_AGENT)
     # the key class that can sign only a one-grant revoke (rank 1) signs the two-link revoke, and only that agent's
     # links go
+    assert auth._ranks()["presence"] == 1 < auth._DELTA_RANK[auth.TIGHTEN]   # the class is below a TIGHTEN's rank
     after = world.link(revoke_agent(), "presence")
     assert auth.agent_links(after, AGENT, STORE) == [] and auth.agent_links(other, OTHER_AGENT, STORE)
     assert set(after.policy.grants) == {"al-000000000003"}
