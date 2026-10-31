@@ -78,7 +78,42 @@ def _read_status(store: Any, now: datetime) -> dict[str, Any]:
                 st["wake"], st["why"] = lease.wake_state(scratch, stamp)
             finally:
                 scratch.close()
+        try:
+            st["drop_replies"] = _drop_replies(conn, stamp)
+        except Exception:                                  # noqa: BLE001 - a store without the tables shows no reply rows
+            st["drop_replies"] = None
         return st
+
+
+#: how many of the newest coordinator replies the panel draws, each with its frozen block
+REPLIES_SHOWN = 3
+
+
+def _drop_replies(conn: Any, stamp: str) -> dict[str, Any]:
+    """The reply rows' data (C11 S4), from the snapshot the status was read from: the newest coordinator replies as they
+    were stored (the block is the frozen one, never re-rendered), and the drops with no reply yet."""
+    from levain.coordinator import drop_reply
+
+    return {"replies": drop_reply.replies(conn, REPLIES_SHOWN), "unreplied": drop_reply.unreplied(conn, stamp)}
+
+
+def _reply_rows(data: dict[str, Any] | None) -> list[RowIn]:
+    """One row per unreplied drop (the derived ``no reply yet`` line),
+    then each reply with the lines of its frozen block under it."""
+    from levain.cockpit.coordinator_panels import _row
+    from levain.coordinator import drop_reply
+
+    if not data:
+        return []
+    rows = [_row(f"noreply:{d}", "No reply yet", drop_reply.unreplied_line(d, surface, at))
+            for d, surface, at in data["unreplied"]]
+    for r in data["replies"]:
+        rows.append(_row(f"reply:{r.reply_id}", "Reply",
+                         f"to drop {r.drop_id} ({r.received_at[11:16]}, {r.surface}): {r.text}"))
+        for i, line in enumerate(r.block.splitlines()):
+            if line.strip():
+                rows.append(_row(f"reply:{r.reply_id}:block:{i}", "Levain's block", line.strip()))
+    return rows
 
 
 def _lease_body(held: dict[str, Any] | None) -> str:
@@ -123,6 +158,7 @@ def status_rows(st: dict[str, Any], now: datetime | None = None) -> tuple[RowIn,
             _row("lease", "Lease", _lease_body(st["lease"])),
             _row("setting", "Setting", _setting_body(st["setting"]))]
     rows += [_row(f"launch:{ln['launch_id']}", f"Launch · {ln['state']}", _launch_body(ln, stamp)) for ln in st["launches"]]
+    rows += _reply_rows(st.get("drop_replies"))
     return tuple(rows)
 
 
