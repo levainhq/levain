@@ -13,15 +13,17 @@
 // and taking the one answering now would sign into a store the person never chose. The form says so and stops asking.
 //
 // The hard stop is computed by the server when it reads the review, so the summary says the time it lands on, and a summary that
-// has stood for REVIEW_MAX_AGE_MS since the server read it (body.reviewed_at) is read again (never while signing, and never by
+// has stood for REVIEW_MAX_AGE_MS since it arrived is read again (never while signing, and never by
 // the Sign tap itself: an await before the passkey call can cost the browser's user activation). A reply that does not say when
 // it stops is not signable. Once the sheet is stopped (another store, or none named) nothing is asked again, waiting edits included.
+// Known edges: a review is aged from its arrival; the fetch abort bounds how old it can be on arrival, so the device clock never
+// has to agree with the server's.
 //
 // The page passes:
 //   o.words        the textarea of the person's words (the page owns it); o.wordsGroup: draw it inside a "Your words" group here
 //   o.left, o.right  where the groups go (the same element for one column)
 //   o.repos        the known folders; setRepos() takes a later listing
-//   o.review({words, spec})  a promise of {ok, status, body}, the server's reading (body.view, body.stop_at, body.reviewed_at); o.why(reply): its refusal in words
+//   o.review({words, spec})  a promise of {ok, status, body}, the server's reading (body.view, body.stop_at); o.why(reply): its refusal in words
 //   o.storeId()    the store identity the page holds now, or null on a fresh install; o.refreshStore(): a promise, the page re-reads it
 //   o.blocked()    "" or the reason nothing can be signed (shown as the summary)
 //   o.sign         the sign button. It is enabled only while ALL of these hold: no signing is under way (lock(true) not called),
@@ -67,7 +69,6 @@
   const EMPTY = "The server sent an empty summary; nothing can be signed. Change anything to ask again.";
   const NO_ANSWER = "The cockpit did not answer; change anything to ask again.";
   const NO_STOP = "The server did not say when this envelope would stop; nothing can be signed. Change anything to ask again.";
-  const STALE = "The server's summary was over 5 minutes old when it arrived, twice (this device's clock may be off); nothing can be signed. Change anything to ask again.";
   // a promise of what f returns; a throw becomes a rejection, so a caller's handlers see it
   const attempt = (f) => { try { return Promise.resolve(f()); } catch (e) { return Promise.reject(e); } };
   // the server's fixed-width UTC stamp ("2026-10-31T12:00:00.000000Z") as a Date, read field by field so no browser's parser decides
@@ -101,7 +102,6 @@
     let seq = 0, timer = null;
     let inflight = false, waiting = null;
     let stuck = "";                 // set once the store answering is not the one this sheet was opened for, or none is named: nothing is asked again
-    let reasked = false;            // the last review was re-asked because it arrived already too old: a second such one is not re-asked
     let ageTimer = null;            // the one timer that re-reads a summary older than REVIEW_MAX_AGE_MS
     let started = false;
     let touchedRepo = false;
@@ -520,18 +520,7 @@
         if (text === null || typeof c.body.review_id !== "string" || !c.body.review_id) { say("bad", EMPTY); return undefined; }
         // nor on one that does not say when it stops: the stop is part of what is signed
         if (!stampDate(c.body.stop_at)) { say("bad", NO_STOP); return undefined; }
-        // aged from when the server read it (a slow reply arrives already old); from its arrival only when the server did not say
-        const readOn = stampDate(c.body.reviewed_at);
-        const readAt = readOn ? readOn.getTime() : Date.now();
-        if (Date.now() - readAt >= REVIEW_MAX_AGE_MS) {
-          // too old to sign on arrival: asked again at once, but only once in a row, so a device whose clock is off never loops
-          if (reasked) { reasked = false; say("bad", STALE); return undefined; }
-          reasked = true;
-          queue(0);
-          return undefined;
-        }
-        reasked = false;
-        current = { id: c.body.review_id, body_text: c.body.body_text, digest: c.body.digest, words: v.words, spec: v.spec, reply: c, readAt: readAt };
+        current = { id: c.body.review_id, body_text: c.body.body_text, digest: c.body.digest, words: v.words, spec: v.spec, reply: c, readAt: Date.now() };
         const sl = stopLine(c, v);
         showReview(text + "\n\n" + sl, false);
         live.textContent = summary.textContent;

@@ -440,12 +440,10 @@ class CoordPhone:
             self._reviews[review_id] = {"device": device, "body": body, "outbox_id": req["outbox_id"],
                                         "signer_fp": key.fingerprint, "store_id": bound,
                                         "until": now + REVIEW_TTL}
-        # stop_at: the hard stop as this review computed it (from now, not from Sign), which the form shows in local time;
-        # reviewed_at: the instant it was computed from (the body's issued_at, the same clock read), so the form ages the
-        # review from the server's reading and not from when a slow reply happened to arrive
+        # stop_at: the hard stop as this review computed it (from now, not from Sign), which the form shows in local time
         return {"review_id": review_id, "body_text": text, "digest": env.envelope_digest(body), "rp_id": self.rp_id,
                 "view": ccli._view(body, store, words=words).split("\n"), "stop_at": body["stop_at"],
-                "reviewed_at": body["issued_at"], "store_id": bound, "store_created": created}
+                "store_id": bound, "store_created": created}
 
     def _challenge(self, req: dict[str, Any], device: str) -> dict[str, Any]:
         """Sign tapped: the payload over the KEPT body, signed_at now (L3 r1 codex MED: a long read of the sheet is

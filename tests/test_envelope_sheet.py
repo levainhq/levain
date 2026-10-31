@@ -104,13 +104,15 @@ INIT_JS = """(() => {
       // the hard stop as the server computes it: from the review, in its fixed-width UTC form
       const hours = parseInt((b.spec && b.spec.stop) || '2', 10);
       const stamp = (ms) => new Date(ms).toISOString().slice(0, 19) + '.000000Z';
-      const readMs = Date.now() - (n === 1 || CFG.readAgoAll ? (CFG.readAgoFirst || 0) : 0);
+      const readMs = Date.now() + (CFG.serverOffset || 0);       // the server's own clock, which may differ from the page's
       const stopAt = stamp(readMs + hours * 3600000);
       top.__lastStopAt = stopAt;
       const ok = () => {
         const r = {review_id: 'rv-' + n, body_text: 'BODY' + n, digest: 'dg', rp_id: location.hostname, stop_at: stopAt,
-                   reviewed_at: stamp(readMs), view: __VIEW__.concat(['review ' + n]), store_id: nullStore ? 'st-new' : b.store_id,
+                   view: __VIEW__.concat(['review ' + n]), store_id: nullStore ? 'st-new' : b.store_id,
                    store_created: nullStore};
+        // the server's own reading of its clock, in case a form ever ages a review from it: none may
+        if (CFG.serverOffset) r.reviewed_at = stamp(readMs);
         if (bad && 'view' in CFG) { if (CFG.view === 'missing') delete r.view; else r.view = CFG.view; }
         if (bad && 'stopAt' in CFG) { if (CFG.stopAt === 'missing') delete r.stop_at; else r.stop_at = CFG.stopAt; }
         return r;
@@ -132,8 +134,8 @@ def make_init(store: "str | None" = "st-1", hold: int = 0, strict: bool = False,
     # more: conflictFirst (the first n reviews are refused other_store), serverStore (a review naming another store is refused
     # other_store), storeAfter (the sheet's later listing reads name this store), holdList (those reads are held until released),
     # badFirst with view (the first n reviews carry this view; "missing" leaves it out) or rawBody (they answer 200 with this text)
-    # or stopAt (their stop_at is this text; "missing" leaves it out), readAgoFirst (ms: the first review, or every one with
-    # readAgoAll, was read that long before it answered), pending (a drop bound to st-a is kept unanswered) with dropStore (the store a drop's answer names)
+    # or stopAt (their stop_at is this text; "missing" leaves it out), serverOffset (ms: the server's clock reads that far from the page's; a negative one is a page running ahead),
+    # pending (a drop bound to st-a is kept unanswered) with dropStore (the store a drop's answer names)
     cfg = {"store": store, "hold": hold, "strict": strict, "refuse": refuse, "challenge": challenge, **more}
     return (INIT_JS.replace("__CFG__", json.dumps(cfg)).replace("__REPOS__", json.dumps(REPOS)).replace("__VIEW__", json.dumps(VIEW_LINES)))
 
@@ -697,29 +699,15 @@ def test_a_store_still_unnamed_after_the_read_stops_asking_even_when_edited_mean
 
 @needs_browser
 @needs_ssh
-def test_a_summary_the_server_read_over_five_minutes_ago_is_read_again_at_once(tmp_path: Path, monkeypatch) -> None:
-    # its age is the server's: a reply that took six minutes to arrive is already too old to sign
-    steps = _open_from_cockpit("1280", make_init(readAgoFirst=6 * 60000), wait=False) + [
-        _sleep(2500),
-        _top("again", "return {n: window.__reviews.length};"),
-        SIGN_ON,
-        _tag("fresh", FD, "return {review: " + SUMMARY + "};")]
-    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
-    assert t["again"]["n"] == 2 and "review 2" in t["fresh"]["review"], t
-
-
-@needs_browser
-@needs_ssh
-def test_replies_that_always_arrive_too_old_are_asked_again_once_and_never_loop(tmp_path: Path, monkeypatch) -> None:
-    # a device whose clock runs ahead of the server's sees every reply as old: one more ask, then the sheet says so and waits
-    stale = "The server's summary was over 5 minutes old when it arrived, twice (this device's clock may be off); nothing can be signed."
-    steps = _open_from_cockpit("1280", make_init(readAgoFirst=6 * 60000, readAgoAll=True), wait=False) + [
-        _sleep(3000),
+def test_a_device_clock_far_ahead_of_the_server_still_signs(tmp_path: Path, monkeypatch) -> None:
+    # a review is aged from its arrival, so a server whose clock reads three hours behind the page's changes nothing: one
+    # review, signable, no second ask
+    steps = _open_from_cockpit("1280", make_init(serverOffset=-3 * 3600000), wait=False) + [
+        _sleep(2500), SIGN_ON,
         _top("asked", "return {n: window.__reviews.length};"),
-        _tag("shown", FD, "return {review: " + SUMMARY + ", btn: " + SIGN_OFF + "};")]
+        _tag("shown", FD, "return {review: " + SUMMARY + "};")]
     t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
-    assert t["asked"]["n"] == 2, t["asked"]
-    assert t["shown"]["review"].startswith(stale) and t["shown"]["btn"] is True, t["shown"]
+    assert t["asked"]["n"] == 1 and "review 1" in t["shown"]["review"], t
 
 
 @needs_browser

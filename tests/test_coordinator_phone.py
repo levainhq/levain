@@ -763,7 +763,7 @@ def test_coord_repos_lists_the_folder_of_the_most_recently_active_thread_first(w
 
 # --- 11. L3 r2 codex: the review says when the server read it, from the clock read that set its hard stop -------------
 
-def test_f6_the_review_reply_carries_the_instant_its_stop_was_computed(world, monkeypatch) -> None:
+def test_f6_the_review_reply_carries_the_stop_computed_from_the_read(world, monkeypatch) -> None:
     from levain.cockpit.consent import utc_stamp
     from levain.coordinator import cli as ccli
 
@@ -772,6 +772,5 @@ def test_f6_the_review_reply_carries_the_instant_its_stop_was_computed(world, mo
     cp = coord_for(world)
     r = review(world, cp, "read at a known instant", "ph-" + "a6" * 16, _land_spec(str(world["repo"][0])))
     read = at.replace(microsecond=0)
-    assert r["reviewed_at"] == utc_stamp(read), r["reviewed_at"]
     assert r["stop_at"] == utc_stamp(read + timedelta(hours=2)), r["stop_at"]
-    assert json.loads(r["body_text"])["issued_at"] == r["reviewed_at"]
+    assert json.loads(r["body_text"])["issued_at"] == utc_stamp(read)
