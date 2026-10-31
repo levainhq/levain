@@ -136,10 +136,18 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = 
         return "not-confirmed", [f"child pid {pid}: the process table could not be read; no signal was sent"]
     if m is False:
         from levain.consent.delivery import process_identity
-        if process_identity(pid) is not None:
-            # a live process holds the number, and POSIX hands a pid out only when no process group still has that id:
-            # so the recorded group has ended, whatever the stranger is
+        ident = process_identity(pid)
+        if ident is not None and isinstance(started, str) and started and \
+                " ".join(started.split()) != " ".join(str(ident[0]).split()):
+            # a live process holds the number and started at another time than the recorded child: positive evidence
+            # of a different process, and POSIX hands a pid out only when no process group still has that id, so the
+            # recorded group has ended. A matching start time with a different command line proves nothing of the
+            # kind (the recorded argv can be truncated or shaped differently by ps), so that case is not "ended"
             return "ended", [f"child pid {pid}: another process holds that number now, so the recorded group is gone"]
+        if ident is not None:
+            return "not-confirmed", [f"child pid {pid}: a live process holds that number with the recorded start time "
+                                     f"but not the recorded command line; no signal was sent. "
+                                     f"{_by_hand(pid, occ_dir.name)}"]
         if _group_gone(pid):
             return "ended", [f"child pid {pid}: no longer running"]
         return "not-confirmed", [f"child pid {pid}: the leader is gone but its process group is not seen gone; no "
@@ -274,7 +282,9 @@ def recover(store_path: Path | str, occ_dir: Path | str, *, state: str = "launch
         line = (f"The compose child (process group {pid}) was not confirmed ended and was not signalled by number. "
                 f"{_by_hand(pid, occ_dir.name)}.") if type(pid) is int else \
             "The compose child was not confirmed ended; check what is running, then rerun `levain dream recover`."
-        if res.card is None:
+        if res.card is None and card_filed:
+            pass                               # this occurrence's card exists already: no second one
+        elif res.card is None:
             res.card = _card("failed", "child-not-confirmed", occ_dir.name, his=[line])
         else:
             res.card = {**res.card, "his": [*res.card.get("his", []), line]}
@@ -418,8 +428,13 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
         _sn.record_post_for(db, occ_dir, wrap_id, composed_sha256=composed)
     except _sn.SnapshotRefused as exc:
         m = _sn.read_manifest(occ_dir)
-        if not (m and m.get("post_files")):  # already recorded is fine; anything else is a note, not a failure
-            res.notes.append(f"post files not recorded: {exc}")
+        if not (m and m.get("post_files")):  # already recorded is fine; anything else leaves recovery unsettled
+            res.notes.append(f"post files not recorded: {exc}; recovery is not settled, so a rerun can finish")
+            res.ending, res.reason = ("stopped" if stopped else "done"), (COMMITTED_AFTER_STOP if stopped
+                                                                         else COMMITTED_NOT_RECORDED)
+            res.card = _card("consolidated", res.reason, occ)
+            res.settled = False
+            return res
     except Exception as exc:  # noqa: BLE001 — a write that failed leaves the commit unrecorded: retry, do not trace
         res.notes.append(f"post files could not be written ({type(exc).__name__}: {exc}); rerun recover")
         res.reason, res.settled = (COMMITTED_AFTER_STOP if stopped else COMMITTED_NOT_RECORDED), False

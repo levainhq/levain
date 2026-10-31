@@ -699,3 +699,23 @@ def test_g3_a_held_lock_defers_the_drill_before_it_looks_at_any_snapshot(scratch
     finally:
         w._unlock_wrap(fd)
     assert res.outcome == "deferred" and sn.last_drill(scratch.parent / "dream") is None
+
+
+# --------------------------------------------------------------------------------------------------- fix5 (L3 round 4)
+
+def test_k4_the_drill_releases_the_wrap_lock_before_it_hashes_and_checks_integrity(scratch, monkeypatch):
+    from levain import wrap as w
+    two_dreams(scratch)
+    seen = []
+    real_hash = sn.sha256_file
+
+    def probe(path):
+        if Path(path).name == sn.DB_BACKUP and not seen:
+            h = w._lock_wrap_file(scratch.parent / "wrap.lock")
+            seen.append(h is not w._ANOTHER_WRAP_RUNNING)       # True: the drill no longer holds the lock here
+            if h is not w._ANOTHER_WRAP_RUNNING:
+                w._unlock_wrap(h)
+        return real_hash(path)
+    monkeypatch.setattr(sn, "sha256_file", probe)
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "ok" and seen == [True]

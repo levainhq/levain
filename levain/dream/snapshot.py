@@ -595,18 +595,46 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
         occ = root / name
         res.snapshot, res.outcome = name, "ok"
         snap = occ / SNAP_DIR
+        # the lock covers only choosing, reading and copying: the hash and the integrity check run on the scratch
+        # copies after it is released, so a large store does not hold every dream off for that long
+        scratch = Path(tempfile.mkdtemp(prefix="levain-dream-drill-"))
+        sdir = scratch / "store"
+        sdir.mkdir()
+        socc = scratch / "occs" / name
+        (socc / SNAP_DIR).mkdir(parents=True)
+        bdir = scratch / "backup"
+        bdir.mkdir()
+        copy_db: Path | None = None
+        copy_err: str | None = None
         try:
-            bad = [e["name"] for e in m["files"].values() if e["sha256"] is not None
-                   and sha256_file(snap / e["name"]) != e["sha256"]]
-            if sha256_file(snap / DB_BACKUP) != m.get("db_backup_sha256"):
-                bad.append(DB_BACKUP)
+            for e in m["files"].values():
+                if e["sha256"] is not None:
+                    shutil.copy2(snap / e["name"], socc / SNAP_DIR / e["name"])
+            shutil.copy2(snap / DB_BACKUP, bdir / DB_BACKUP)
+        except OSError as exc:
+            copy_err = f"{type(exc).__name__}: {exc}"
+        if copy_err is None and m.get("post_files"):
+            try:
+                copy_db = _copy_store(db, sdir)
+            except (OSError, sqlite3.Error) as exc:
+                _step(res, "restore", "failed", f"the live store could not be copied: {type(exc).__name__}: {exc}")
+                return _drill_done(res, root, write_result, failed=True)
+        release()
+        try:
+            if copy_err is not None:
+                bad = [copy_err]
+            else:
+                bad = [e["name"] for e in m["files"].values() if e["sha256"] is not None
+                       and sha256_file(socc / SNAP_DIR / e["name"]) != e["sha256"]]
+                if sha256_file(bdir / DB_BACKUP) != m.get("db_backup_sha256"):
+                    bad.append(DB_BACKUP)
         except OSError as exc:
             bad = [f"{type(exc).__name__}: {exc}"]
         if _step(res, "hash", "failed" if bad else "ok", f"does not match the manifest: {bad}" if bad
                  else "every snapshot file and the db backup match their manifest hashes") == "failed":
             return _drill_done(res, root, write_result, failed=True)
         try:
-            con = sqlite3.connect(f"file:{snap / DB_BACKUP}?mode=ro", uri=True)
+            con = sqlite3.connect(f"file:{bdir / DB_BACKUP}?mode=ro", uri=True)
             try:
                 verdict = [r[0] for r in con.execute("pragma integrity_check")]
             finally:
@@ -616,26 +644,10 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
         ok = verdict == ["ok"]
         if _step(res, "integrity", "ok" if ok else "failed", "integrity_check: ok" if ok else f"{verdict[:3]}") == "failed":
             return _drill_done(res, root, write_result, failed=True)
-        if not m.get("post_files"):
+        if not m.get("post_files") or copy_db is None:
             _step(res, "restore", "skipped", "the snapshot has no post-save record, so a rollback of it is refused by design")
             _step(res, "open", "skipped", "no restored copy")
             return _drill_done(res, root, write_result)
-        scratch = Path(tempfile.mkdtemp(prefix="levain-dream-drill-"))
-        sdir = scratch / "store"
-        sdir.mkdir()
-        socc = scratch / "occs" / name
-        (socc / SNAP_DIR).mkdir(parents=True)
-        try:
-            copy_db = _copy_store(db, sdir)
-            for e in m["files"].values():
-                if e["sha256"] is not None:
-                    shutil.copy2(snap / e["name"], socc / SNAP_DIR / e["name"])
-        except (OSError, sqlite3.Error) as exc:
-            _step(res, "restore", "failed", f"the live store or the snapshot could not be copied: "
-                                            f"{type(exc).__name__}: {exc}")
-            return _drill_done(res, root, write_result, failed=True)
-        finally:
-            release()
         # the revert markers stay as the real manifest has them: a finished rollback then refuses on the copy as
         # ``already-reverted`` (skipped), instead of the copy reading "nothing to roll back" (a false failure)
         _write_manifest(socc, {**m, "store_db": str(copy_db)})

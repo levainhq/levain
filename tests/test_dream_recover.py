@@ -353,7 +353,10 @@ def test_a_command_line_that_is_another_occurrences_is_a_mismatch(scratch, tmp_p
         elsewhere.mkdir(parents=True)
         (elsewhere / "progress.json").write_text(json.dumps(prog(scratch, "o1")))
         res = rc.recover(scratch, elsewhere, term_wait=0.3, kill_wait=0.3)        # recorded argv names o1, not o9
-        assert res.child == "ended" and alive(child)                              # never signalled
+        # same start time, only the command line disagrees: no positive evidence of another process, so it is not
+        # "ended" (the live child could simply have a truncated argv); never signalled, and the remedy is named
+        assert res.child == "not-confirmed" and alive(child) and not res.settled
+        assert f"kill -KILL -{child}" in " ".join(res.notes)
     finally:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(child, signal.SIGKILL)
@@ -496,7 +499,7 @@ def test_h4_an_occurrence_whose_name_is_a_prefix_of_anothers_never_matches_it(sc
         argv = ["sh", "-c", "sleep 300; true", "sh", "--add-dir", str(occ(scratch, "o10"))]
         _record_child(scratch, "o1", p, argv)                          # o1's progress names o10's live process
         res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.3, kill_wait=0.3)
-        assert res.child == "ended" and p.poll() is None               # not o1's process: unsignalled, o10's child lives
+        assert res.child == "not-confirmed" and p.poll() is None         # argv-only mismatch: unsignalled, not "ended"
     finally:
         os.killpg(p.pid, signal.SIGKILL)
 
@@ -714,3 +717,53 @@ def test_g2_the_card_and_note_name_the_group_and_the_exact_commands(scratch, tmp
     finally:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(p.pid, signal.SIGKILL)
+
+
+# --------------------------------------------------------------------------------------------------- fix5 (L3 round 4)
+
+def test_k1_a_start_time_that_differs_is_a_stranger_but_the_same_start_time_with_other_argv_is_not_ended(scratch):
+    argv = ["sleep", "300"]
+    p = subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _record_child(scratch, "o1", p, argv)
+        set_prog(scratch, "o1", child_argv=["sleep", "999"])                       # start time right, argv wrong
+        prog_ = prog(scratch, "o1")
+        kind, notes = rc.end_orphan_child(prog_, occ(scratch, "o1"), term_wait=0.2, kill_wait=0.2)
+        assert kind == "not-confirmed" and p.poll() is None and f"kill -KILL -{p.pid}" in " ".join(notes)
+        kind, _ = rc.end_orphan_child({**prog_, "child_started_at": "Mon Jan  1 00:00:00 2001"}, occ(scratch, "o1"),
+                                      term_wait=0.2, kill_wait=0.2)
+        assert kind == "ended" and p.poll() is None
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_k2_a_saving_phase_refusal_leaves_recovery_unsettled_and_a_rerun_finishes_it(scratch, monkeypatch):
+    _saving_without_proof(scratch)
+    real = sn.record_post_for
+
+    def refuse(*a, **k):
+        raise sn.SnapshotRefused("refused for the test")
+    monkeypatch.setattr(sn, "record_post_for", refuse)
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert not res.settled and "post files not recorded" in " ".join(res.notes)
+    assert not (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists()
+    assert not sn.read_manifest(occ(scratch, "o1"))["post_files"]
+    monkeypatch.setattr(sn, "record_post_for", real)
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert res.settled and (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists()
+    assert sn.read_manifest(occ(scratch, "o1"))["post_files"]
+
+
+def test_k3_a_card_already_filed_is_not_rebuilt_for_a_child_not_confirmed(scratch, monkeypatch):
+    occ(scratch, "o1").mkdir(parents=True)
+    (occ(scratch, "o1") / "progress.json").write_text(json.dumps(
+        {"phase": "composing", "wrap_token": uuid.uuid4().hex, "child_pid": 2 ** 22 + 777,
+         "child_started_at": "Mon Jan  1 00:00:00 2001", "child_argv": ["x"]}))
+    monkeypatch.setattr("levain.consent.delivery.process_identity", lambda pid: None)
+    monkeypatch.setattr(rc, "_identity_matches", lambda *a: False)
+    monkeypatch.setattr(rc, "_group_gone", lambda pg: False)
+    first = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.1, kill_wait=0.1)
+    assert first.child == "not-confirmed" and first.card["reason"] == "child-not-confirmed"
+    again = rc.recover(scratch, occ(scratch, "o1"), card_filed=True, term_wait=0.1, kill_wait=0.1)
+    assert again.child == "not-confirmed" and again.card is None
