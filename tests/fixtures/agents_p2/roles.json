@@ -1,0 +1,73 @@
+{
+ "local-role": {
+  "name": "local-role",
+  "brief": {
+   "template": "run",
+   "slots": {}
+  },
+  "ceiling": {
+   "lands": [
+    "local data"
+   ]
+  },
+  "model": "",
+  "harness": "",
+  "executor": "dream"
+ },
+ "notify-role": {
+  "name": "notify-role",
+  "brief": {
+   "template": "run",
+   "slots": {}
+  },
+  "ceiling": {
+   "pushes": [
+    "phone"
+   ]
+  },
+  "model": "",
+  "harness": "",
+  "executor": "dream"
+ },
+ "model-role": {
+  "name": "model-role",
+  "brief": {
+   "template": "run",
+   "slots": {}
+  },
+  "ceiling": {
+   "lands": [
+    "local data"
+   ]
+  },
+  "model": "sonnet",
+  "harness": "claude",
+  "executor": "session"
+ },
+ "empty-role": {
+  "name": "empty-role",
+  "brief": {
+   "template": "run",
+   "slots": {}
+  },
+  "ceiling": {},
+  "model": "",
+  "harness": "",
+  "executor": "dream"
+ },
+ "all-role": {
+  "name": "all-role",
+  "brief": {
+   "template": "run",
+   "slots": {}
+  },
+  "ceiling": {
+   "publishes": [
+    "all"
+   ]
+  },
+  "model": "",
+  "harness": "",
+  "executor": "dream"
+ }
+}
