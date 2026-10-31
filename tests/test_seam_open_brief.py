@@ -883,3 +883,20 @@ def test_an_arrival_on_a_store_without_the_open_tables_is_refused(world):
     with pytest.raises(CoordError, match="open tables"):
         with world._write("coordinator", _token(world)) as (conn, now):
             seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
+
+
+# --- a NUL in stored text never blocks the brief; a caller's NUL is still refused --------------------------------
+def test_a_nul_in_stored_text_is_marked_in_the_brief_and_the_brief_still_builds(world):
+    body = '{"state_line": "ok\\u0000bad", "in_flight": [], "next": "", "contingencies": [], "notes": "n\\u0000", ' \
+           '"attested_operator_present": false, "attested_walked": false}'
+    _malformed_handoff(world, body)
+    b = _brief(world, kind="rotation")
+    assert "\x00" not in b.text and "ok⟨U+0000⟩bad" in b.text and b.degraded is None
+    built = _build(world, "nul", kind="rotation")
+    stored = _sql(world, "SELECT body FROM open_builds")[0][0]
+    stored = stored.decode() if isinstance(stored, bytes) else stored
+    assert "\x00" not in stored and "ok⟨U+0000⟩bad" in stored
+    assert _sql(world, "SELECT COUNT(*) FROM open_builds") == [(1,)]
+    seam_open.record_delivery(world, built.open_id, "light_verb", recipient=world.launch_id)
+    with pytest.raises(CoordError, match="read_back"):
+        seam_open.acknowledge(world, built.open_id, token=_token(world), read_back="a\x00b")

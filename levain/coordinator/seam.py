@@ -27,7 +27,11 @@ unsequenced class, or the unacknowledged opens. The brief says so and carries ``
 a retry reads again rather than finding a stub for good. A Board, Band or Card failure is shown and the brief still
 stores: the board is a display of work state, and the band and card read the queue side, which no cut covers.
 
-Known edges: a ``body_cap`` barely above the never-cut size fits no detail line, so the brief shows none and its ack
+Known edges: (a) a store created by an earlier commit of this unreleased branch keeps the earlier
+``open_deliveries`` shape and cannot deliver; such stores exist only in test scratch, so drop them; (b)
+``record_delivery`` checks that the recipient launch exists, not that it is an active coordinator: the fenced ack plus
+the recipient match bind it; (c) a read-only brief of a store that has not been migrated reads degraded (writers
+migrate on connect); a ``body_cap`` barely above the never-cut size fits no detail line, so the brief shows none and its ack
 cannot move the cursor; a brief whose never-cut sections exceed the cap (:class:`BriefTooBig`) is never built, so
 its signal never opens and its caller (S3) must surface that; a build under a stale token pays one full render before
 the fence refuses it.
@@ -49,6 +53,7 @@ from levain.coordinator import morning, ready, review, seam_classes
 from levain.coordinator.seam_handoffs import _COLUMNS as _HANDOFF_COLUMNS, _counted_head, _row as _handoff_row
 from levain.coordinator.seam_open import BODY_CAP, SEAM_KINDS, acked_cursor, acked_cuts, open_tables_present
 from levain.coordinator.store import GSEQ_TABLES, CoordError, CoordStore, StoreAbsent
+from levain import unshowable
 from levain.dispatch import DispatchError
 
 __all__ = ["Brief", "BriefTooBig", "DETAIL_ROWS_MAX", "NOT_BUILT", "open_brief"]
@@ -88,6 +93,13 @@ def _cap(line: str, n: int = _LINE) -> str:
     indent = text[: len(text) - len(text.lstrip())] if "\n" not in text else ""
     text = indent + " ".join(text.split())
     return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _clean(text: str) -> str:
+    """The one render-side cleaner: every stored text that enters the brief passes here, so the renderer never emits a
+    character the writers' ``checked_text`` refuses (a NUL in a stored body would otherwise block the whole brief on
+    every retry). Each unshowable character becomes a visible ``⟨U+XXXX⟩`` mark; newline and tab stay."""
+    return unshowable.mark(text)
 
 
 def _age(now: datetime, stamp: str) -> str:
@@ -133,7 +145,7 @@ def open_brief(store: CoordStore, queue_dir: Path | str | None, kind: str, now: 
     # what can still escape the guarded reads: the connection, the read transaction, the directory rule
     except (StoreAbsent, sqlite3.Error, OSError, CoordError, DispatchError) as exc:
         absent = isinstance(exc, StoreAbsent) and ready._absent(store)
-        reason = _cap(exc, 200)
+        reason = _clean(_cap(exc, 200))
     why = "absent: there is no coordinator store here" if absent else f"cannot-derive: {reason}"
     text = "\n".join([f"SEAM OPEN {kind}, read {read_at}", f"store: {why}", "cursor: none (no cut was read)",
                       _scope_line(read_at), f"Not built: {NOT_BUILT}"])
@@ -181,6 +193,10 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
         "Missing close: not derived by this release (S4)",
         f"Not built: {NOT_BUILT}",
     ]
+    head_lines, handoff_lines, since_lines, unseq_lines, rest = ([_clean(ln) for ln in part] for part in
+                                                                 (head_lines, handoff_lines, since_lines, unseq_lines,
+                                                                  rest))
+    rows = [(g, _clean(label)) for g, label in rows]
     fixed = [*head_lines, *handoff_lines, *since_lines, *unseq_lines, *rest, _scope_line(read_at)]
     fixed_bytes = len("\n".join(fixed).encode("utf-8"))
     if fixed_bytes > body_cap:
