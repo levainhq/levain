@@ -48,7 +48,7 @@ handle it was given, and an attempt is loud instead of green. ``structural_invar
 it", and that was an OVERCLAIM (glm, L3).** This is not an in-process security boundary, and it
 cannot be one. Two concrete routes around it: an allow-listed read returns a BOUND METHOD whose
 ``__self__`` is the raw store, and — decisively — ``CrystalStore`` is constructible from a path that
-any code in this process can derive, exactly as :func:`levain.wrap._consolidate` derives it. **No
+any code in this process can derive, exactly as :func:`levain.dream.executor.consolidate_store` derives it. **No
 wrapper can defend against in-process code that goes looking for the underlying object**, so
 pretending otherwise would be a check that cannot name the world it fails in.
 
