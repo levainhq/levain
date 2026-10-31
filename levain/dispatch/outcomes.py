@@ -601,8 +601,7 @@ def panel(cells: Mapping[tuple, Cell], *, min_n: int) -> Panel:
     built with would print a rate the cell line withholds).
 
     Rows whose answering model was not recorded are grouped and marked, never merged with an answered model. The
-    gateway-side field that would fill ``model_answered`` is intended work (F5, dated 2026-10-19); until it lands
-    those rows are the common case, not an error."""
+    rows with no ``model_answered`` are the common case, not an error."""
     if type(min_n) is not int or min_n < 1:
         raise DispatchError("min_n must be a positive integer")
     if any(c.min_n != min_n for c in cells.values()):

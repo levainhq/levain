@@ -126,7 +126,7 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         # Snapshots are per-request; never let a browser cache a stale one. A route that serves a
         # revalidatable, per-credential body (the cockpit's ETag'd reads) sets ``_cache_control``
-        # for that one response through ``_send(cache_control=...)``; nothing else does.
+        # for that one response through ``_send(cache_control=...)``.
         self.send_header("Cache-Control", getattr(self, "_cache_control", None) or "no-store")
         super().end_headers()
 
