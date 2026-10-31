@@ -158,9 +158,16 @@ time.sleep(120)
 """
 
 
-def _processes_naming(profile: str) -> list[str]:
-    out = subprocess.run(["ps", "-Ao", "pid,command"], capture_output=True, text=True).stdout
-    return [ln for ln in out.splitlines() if profile in ln]
+def _group_alive(pgid: int) -> bool:
+    """Whether any process is left in Chrome's process group (it leads its own group). Read by pid, never by a
+    command line: ps output on Linux CI does not reliably carry Chrome's full argv."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _start_child(tmp_path: Path):
@@ -172,13 +179,13 @@ def _start_child(tmp_path: Path):
     if not line or line[0] == "None":
         p.kill(); p.wait()
         pytest.skip("the shared Chrome could not start here")
-    return p, line[1]
+    return p, line[1], int(line[2])
 
 
-def _gone(profile: str, bound: float = 15.0) -> bool:
+def _gone(profile: str, pgid: int, bound: float = 15.0) -> bool:
     end = time.monotonic() + bound
     while time.monotonic() < end:
-        if not _processes_naming(profile) and not os.path.exists(profile):
+        if not _group_alive(pgid) and not os.path.exists(profile):
             return True
         time.sleep(0.25)
     return False
@@ -187,12 +194,12 @@ def _gone(profile: str, bound: float = 15.0) -> bool:
 @needs_browser
 def test_a_sigkilled_pytest_leaves_no_shared_chrome_and_no_profile(tmp_path: Path) -> None:
     """The watchdog case: nothing in the dead process runs, yet within the bound no process names the profile and the directory is gone."""
-    p, profile = _start_child(tmp_path)
+    p, profile, pgid = _start_child(tmp_path)
     try:
-        assert _processes_naming(profile), "the child's Chrome should be running before the kill"
+        assert _group_alive(pgid), "the child's Chrome should be running before the kill"
         p.send_signal(signal.SIGKILL)
         p.wait()
-        assert _gone(profile), _processes_naming(profile)
+        assert _gone(profile, pgid), "Chrome or its profile outlived the kill"
     finally:
         if p.poll() is None:
             p.kill(); p.wait()
@@ -201,12 +208,12 @@ def test_a_sigkilled_pytest_leaves_no_shared_chrome_and_no_profile(tmp_path: Pat
 @needs_browser
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
 def test_a_terminated_pytest_cleans_up_in_process(tmp_path: Path, sig: int) -> None:
-    p, profile = _start_child(tmp_path)
+    p, profile, pgid = _start_child(tmp_path)
     try:
         p.send_signal(sig)
         p.wait(timeout=20)
         assert p.returncode == -sig, p.returncode   # ended by the signal, as it would have without the handler
-        assert _gone(profile, bound=5.0), _processes_naming(profile)
+        assert _gone(profile, pgid, bound=5.0), "Chrome or its profile outlived the signal"
     finally:
         if p.poll() is None:
             p.kill(); p.wait()
