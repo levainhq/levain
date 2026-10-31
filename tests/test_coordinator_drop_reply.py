@@ -105,6 +105,32 @@ def test_a_reply_after_the_window_is_refused_and_one_inside_it_is_not(qdir, toke
     _insert(qdir, expired, _stamp(received + timedelta(hours=REPLY_WINDOW_HOURS - 1)))   # the same drop, inside it
 
 
+def _raw_drop(qdir, drop_id, received_at) -> None:
+    c = sqlite3.connect(qdir / "dispatch.db", isolation_level=None)
+    try:
+        c.execute("INSERT INTO drops (drop_id, surface, outbox_id, words, words_sha256, sent_at, received_at, "
+                  "source_how) VALUES (?, 'cli', ?, 'w', 'h', ?, ?, 'none')",
+                  (drop_id, "o-" + drop_id, received_at, received_at))
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("received", ["", "not a time"])
+def test_a_drop_with_an_unreadable_received_at_takes_no_reply(qdir, store, received) -> None:
+    store.accept_drop("x", surface="phone")                    # makes the file
+    _raw_drop(qdir, "d-bad", received)
+    with pytest.raises(sqlite3.IntegrityError, match="within the window"):
+        _insert(qdir, "d-bad", "2026-10-31T14:00:00Z")
+
+
+def test_a_reply_dated_before_its_drop_is_refused(qdir, store) -> None:
+    store.accept_drop("x", surface="phone")
+    _raw_drop(qdir, "d-late", "2026-10-31T14:00:00Z")
+    with pytest.raises(sqlite3.IntegrityError, match="within the window"):
+        _insert(qdir, "d-late", "2026-10-31T13:59:00Z")
+    _insert(qdir, "d-late", "2026-10-31T14:00:00Z")            # the same instant is not before it
+
+
 def test_a_lease_token_that_is_not_the_live_one_writes_nothing(qdir, store, token, capsys) -> None:
     d = _drop(store)
     code, _out, err = _cli(qdir, d, "x", token + 1, capsys)

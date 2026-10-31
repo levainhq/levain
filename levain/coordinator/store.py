@@ -142,8 +142,11 @@ REPLY_BOUND: tuple[str, ...] = (
                  "AND ref_id = NEW.ref_id)",
                  "a drop has one coordinator reply"),
     _reply_bound("replies_bound_window",
-                 "julianday(NEW.at) IS NULL OR (julianday(NEW.at) - (SELECT julianday(received_at) FROM drops WHERE "
-                 f"drop_id = NEW.ref_id)) * 24 > {REPLY_WINDOW_HOURS}",
+                 # an unparseable or empty stamp on either side makes the age NULL, and a NULL condition lets the row in:
+                 # each is refused by its own arm (a missing drop is the first trigger's). A reply dated before its drop has a negative age and is refused too
+                 "EXISTS (SELECT 1 FROM drops WHERE drop_id = NEW.ref_id) AND (julianday(NEW.at) IS NULL OR "
+                 "(SELECT julianday(received_at) FROM drops WHERE drop_id = NEW.ref_id) IS NULL OR (julianday(NEW.at) - (SELECT julianday(received_at) FROM drops WHERE "
+                 f"drop_id = NEW.ref_id)) * 24 NOT BETWEEN 0 AND {REPLY_WINDOW_HOURS})",
                  "a coordinator reply comes within the window of its drop"),
 )
 
