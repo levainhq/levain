@@ -697,3 +697,15 @@ def test_the_held_stop_and_doctors_commands_carry_the_one_recovery_note(env, cap
     env.held = SimpleNamespace(name="agent held sessions", ok=False, detail="1 stuck mid-end: s1 at stop")
     rc, out = env.run(capsys, no_pip=True)
     assert rc == 3 and doctor.REAP_HELD_NOTE in out
+
+
+def test_upgrade_holds_no_second_copy_of_the_recovery_note(monkeypatch):
+    """spore-1549: one producer. `_held_note` is doctor's text whole, even from a doctor read as a stub, and the
+    narrow fallback sentence upgrade once carried is nowhere in upgrade.py."""
+    from levain import doctor
+
+    assert U._held_note() == doctor.REAP_HELD_NOTE
+    monkeypatch.setattr(doctor, "REAP_HELD_NOTE", "ONE TEXT", raising=True)
+    assert U._held_note() == "ONE TEXT"
+    src = Path(U.__file__).read_text()
+    assert "still run 4 and 5" not in src and "REAP_HELD_NOTE" in src
