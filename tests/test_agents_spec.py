@@ -272,3 +272,94 @@ def test_cli_verbs_round_trip(tmp_path, capsys):
     assert main([*d, "register", "--from", str(f), "--warn"]) == 0
     assert "pass     job_push_check" in capsys.readouterr().out
     assert main([*d, "list"]) == 0 and capsys.readouterr().out == ""            # --warn stored nothing
+
+
+# ---- L3 round 1 -----------------------------------------------------------------------------------------------
+def test_a_retired_id_acts_on_itself_never_on_the_live_successor_or_its_group(store, capsys):
+    old, *_ = reg(store, "job_push_check")
+    retire_agent(store, old)
+    reg(store, "job_sync_check")
+    new, *_ = reg(store, "job_push_check", feeds=["job_sync_check"])          # same name, a new agent in a group
+    assert [g["agent_id"] for g in feeder_group(store, old)] == [old]
+    assert [(a["agent_id"], changed) for a, changed in set_operation(store, old, "paused")] == [(old, True)]
+    assert axes(store, new) == ("registered", "active") and axes(store, "job_sync_check") == ("registered", "active")
+    assert axes(store, old) == ("retired", "paused")
+    assert main(["agents", "--store-dir", str(store.directory), "resume", old]) == 0
+    assert capsys.readouterr().out.strip().splitlines() == [f"job_push_check {old}: active"]
+    assert {g["agent_id"] for g in feeder_group(store, new)} == {new, get_agent(store, "job_sync_check")["agent_id"]}
+
+
+@pytest.mark.parametrize("where", ["name", "feeds"])
+def test_a_name_of_the_agent_id_shape_is_refused(where):
+    shaped = "ag-" + "ab" * 16
+    kw = {"name": shaped} if where == "name" else {"feeds": [shaped]}
+    with pytest.raises(SpecError, match=r"shape of an agent_id \(ag-<32 hex>\)"):
+        spec("job_sync_check", **kw)
+    assert spec("job_sync_check", name="ag-" + "ab" * 15)["name"] == "ag-" + "ab" * 15     # not the id shape
+
+
+def _tamper(store, name, text):
+    """Rewrite a stored spec under the freeze trigger, then put the trigger back so the store still opens."""
+    with store.write() as conn:
+        ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'agent_specs_frozen'").fetchone()[0]
+        conn.execute("DROP TRIGGER agent_specs_frozen")
+        conn.execute("UPDATE agent_specs SET spec = ? WHERE agent_id = (SELECT agent_id FROM agents WHERE name = ?)",
+                     (text, name))
+        conn.execute(ddl)
+
+
+def test_a_corrupt_row_in_the_group_walk_is_a_refusal_not_a_traceback(store, capsys):
+    reg(store, "job_sync_check")
+    reg(store, "job_push_check")
+    _tamper(store, "job_sync_check", "x")
+    for fn in (lambda: set_operation(store, "job_push_check", "paused"), lambda: feeder_group(store, "job_push_check"),
+               lambda: retire_agent(store, "job_push_check")):
+        with pytest.raises(SpecError, match="not valid JSON"):
+            fn()
+    assert main(["agents", "--store-dir", str(store.directory), "pause", "job_push_check"]) == 1
+    assert "not valid JSON" in capsys.readouterr().err and axes(store, "job_push_check") == ("registered", "active")
+
+
+def test_a_stored_feeds_that_is_not_a_list_is_refused_never_iterated(store):
+    reg(store, "job_sync_check")
+    reg(store, "job_push_check")
+    raw = copy.deepcopy(get_agent(store, "job_sync_check")["spec"])
+    raw["feeds"] = "job_push_check"
+    _tamper(store, "job_sync_check", json.dumps(raw))
+    with pytest.raises(SpecError, match="feeds must be a list"):
+        feeder_group(store, "job_push_check")
+
+
+def test_a_corpus_moment_blank_or_absent_is_one_stored_text_and_one_hash():
+    out = dict(SPECS["job_corpus_reader"]["output"])
+    win = {"kind": "verifier", "check": "x"}
+    absent = finalize_spec(spec("job_corpus_reader", win=win, output=out), ZONE)
+    blank = finalize_spec(spec("job_corpus_reader", win=win, output={**out, "moment": ""}), ZONE)
+    assert blank["output"]["moment"] == absent["output"]["moment"] == "when asked"
+    assert spec_hash(AID, blank) == spec_hash(AID, absent)
+
+
+def test_a_zone_is_stored_in_its_canonical_spelling(store):
+    got = spec("job_push_check", trigger={"kind": "schedule", "cron": "0 7 * * *", "zone": "america/new_york"})
+    assert got["trigger"]["zone"] == "America/New_York"
+    with pytest.raises(SpecError, match="trigger.zone"):
+        spec("job_push_check", trigger={"kind": "schedule", "cron": "0 7 * * *", "zone": "america/nowhere"})
+
+
+def test_an_invalid_stored_default_zone_is_refused_naming_the_verb(store, tmp_path, capsys):
+    with store.write() as conn:
+        conn.execute("INSERT INTO agent_settings (key, value) VALUES ('default_zone', 'Mars/Olympus')")
+    raw = copy.deepcopy(SPECS["job_sync_check"])
+    del raw["trigger"]["zone"]
+    raw["role"]["role_hash"] = role_hash(ROLES["local-role"])
+    f = tmp_path / "s.json"
+    f.write_text(json.dumps(raw))
+    for extra in ([], ["--warn"]):
+        assert main(["agents", "--store-dir", str(store.directory), "register", "--from", str(f), *extra]) == 1
+        err = capsys.readouterr().err
+        assert "'Mars/Olympus'" in err and "levain agents zone" in err
+    assert stored_specs(store) == {}
+    assert main(["agents", "--store-dir", str(store.directory), "zone"]) == 1
+    assert "levain agents zone" in capsys.readouterr().err
+    with pytest.raises(SpecError, match="levain agents zone"):
+        finalize_spec(spec("job_sync_check", trigger={"kind": "schedule", "cron": "0 7 * * *"}), "Mars/Olympus")

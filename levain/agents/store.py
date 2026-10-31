@@ -16,16 +16,17 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from functools import lru_cache
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 from levain.autonomic.agent_tables import agent_marker, check_agent_schema, create_agent_objects, has_agent_object
-from levain.autonomic.db import DB_NAME, AutonomicDB, default_store_dir, store_marker
+from levain.autonomic.db import (DB_NAME, STORE_FORMAT_V1, STORE_FORMAT_V2, AutonomicDB, StoreFormatError,
+                                 default_store_dir, store_marker)
 
 __all__ = ["AgentStore", "AgentStoreRefused", "AgentStoreView", "open_agent_store", "open_agent_store_view",
-           "STORE_V3_REASON","valid_zone", "get_default_zone",
-           "set_default_zone"]
+           "STORE_V3_REASON", "valid_zone", "canonical_zone", "get_default_zone", "set_default_zone"]
 
 STORE_V3 = "levain-autonomic/3"
 STORE_V3_REASON = "agents need the /3 agent-proof slice (R15-5)"
@@ -134,6 +135,21 @@ class AgentStoreView:
         yield  # pragma: no cover
 
 
+def _store_format_view(conn: sqlite3.Connection) -> bool:
+    """The opener's store-format refusals, read-only: a database holding tables but no format marker is not an
+    autonomic store, and a marker other than ``/1`` (which the opener migrates) or ``/2`` is not this binary's.
+    True when the database holds no table at all (the opener would make it a new, empty store)."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table'").fetchone() is None:
+        return True
+    marker = store_marker(conn)
+    if marker is None:
+        raise StoreFormatError("the database holds tables but no store format marker: it is not an autonomic "
+                               "store, and is not taken over")
+    if marker not in (STORE_FORMAT_V1, STORE_FORMAT_V2):
+        raise StoreFormatError(f"store format {marker!r} is not {STORE_FORMAT_V2!r}")
+    return False
+
+
 def open_agent_store_view(store_dir: Path | str | None = None) -> AgentStoreView:
     """The read-only counterpart of :func:`open_agent_store`: the same refusals, and nothing created or changed."""
     directory = Path(store_dir).expanduser() if store_dir is not None else default_store_dir()
@@ -144,10 +160,12 @@ def open_agent_store_view(store_dir: Path | str | None = None) -> AgentStoreView
         raise AgentStoreRefused(STORE_V3_REASON)
     view = AgentStoreView(path)
     with view.read() as conn:
-        if agent_marker(conn) is None and not has_agent_object(conn):
+        if _store_format_view(conn):
+            return AgentStoreView(None)
+        marker = agent_marker(conn)
+        if marker is None and not has_agent_object(conn):
             return AgentStoreView(None)
         reason = check_agent_schema(conn)
-        marker = agent_marker(conn)
     if reason is not None:
         raise AgentStoreRefused(_refusal(reason, marker))
     return view
@@ -157,29 +175,55 @@ ZONE_KEY = "default_zone"
 _ZONE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+){0,2}")
 
 
-def valid_zone(zone: object) -> bool:
-    """True when ``zone`` is an IANA zone name this host's tz database loads."""
+@lru_cache(maxsize=1)
+def _zones() -> dict[str, str]:
+    from zoneinfo import available_timezones
+    return {z.casefold(): z for z in available_timezones()}
+
+
+def canonical_zone(zone: object) -> str | None:
+    """The tz database's own spelling of ``zone`` (matched case-insensitively), or None when it is not an IANA zone
+    this host knows. A case-insensitive filesystem loads ``america/new_york`` too; storing that spelling would fail on
+    a case-sensitive host, so what is stored is the canonical one."""
     if not isinstance(zone, str) or not _ZONE_NAME.fullmatch(zone):
-        return False
+        return None
+    name = _zones().get(zone.casefold())
+    if name is None:
+        return None
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
     try:
-        ZoneInfo(zone)
+        ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError, OSError):
-        return False
-    return True
+        return None
+    return name
+
+
+def valid_zone(zone: object) -> bool:
+    """True when ``zone`` is an IANA zone name this host's tz database knows (see :func:`canonical_zone`)."""
+    return canonical_zone(zone) is not None
 
 
 def get_default_zone(store: AgentStore) -> str | None:
-    """The install's one default zone (A0 r6 §3.6: the ``agent_settings`` row ``default_zone``), or None if unset."""
+    """The install's one default zone (A0 r6 §3.6: the ``agent_settings`` row ``default_zone``), or None if unset.
+    A stored value that is not a zone this host knows is refused (ValueError naming the verb that sets it), so it is
+    never written into a spec."""
     with store.read() as conn:
         row = conn.execute("SELECT value FROM agent_settings WHERE key = ?", (ZONE_KEY,)).fetchone()
-    return row[0] if row else None
+    if row is None or row[0] is None:
+        return None
+    if canonical_zone(row[0]) != row[0]:
+        raise ValueError(f"the stored default zone {str(row[0])[:60]!r} is not an IANA zone name this host knows: set "
+                         f"it again with `levain agents zone <IANA>`")
+    return row[0]
 
 
-def set_default_zone(store: AgentStore, zone: str) -> None:
-    """Set the default zone; raise ValueError naming it when it is not an IANA zone."""
-    if not valid_zone(zone):
+def set_default_zone(store: AgentStore, zone: str) -> str:
+    """Set the default zone to the canonical spelling of ``zone`` and return it; raise ValueError naming it when it
+    is not an IANA zone."""
+    name = canonical_zone(zone)
+    if name is None:
         raise ValueError(f"{str(zone)[:60]!r} is not an IANA zone name this host knows (e.g. America/New_York)")
     with store.write() as conn:
         conn.execute("INSERT INTO agent_settings (key, value) VALUES (?, ?) "
-                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (ZONE_KEY, zone))
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (ZONE_KEY, name))
+    return name

@@ -12,9 +12,10 @@ import argparse
 import json
 import sqlite3
 import sys
+from collections import Counter
 from pathlib import Path
 
-from levain.agents.role import MAX_VERSION, RoleError, add_role, get_role, latest_version, parse_role_text
+from levain.agents.role import MAX_VERSION, RoleError, add_role, get_role, latest_version, parse_role_text, role_by_hash
 from levain.agents.refuse import AuditError, audit_verdicts, check_spec, derived_flags, refinement_of
 from levain.agents.spec import (SpecError, finalize_spec, find_revert, get_agent, list_agents, load_json,
                                 parse_spec, register_specs, retire_agent, set_operation, stored_specs)
@@ -191,13 +192,6 @@ def _fail(verb: str, exc: Exception) -> int:
     return 1
 
 
-def _role_by_hash(store, digest: str):
-    with store.read() as conn:
-        row = conn.execute("SELECT spec FROM agent_roles WHERE role_hash = ?", (digest,)).fetchone()
-    try:
-        return parse_role_text(row[0]) if row else None
-    except RoleError:
-        return None
 
 
 def _specs_from(doc):
@@ -231,7 +225,7 @@ def run_register(args: argparse.Namespace) -> int:
         raw = _specs_from(doc)
         default_zone = get_default_zone(store)
         stored = stored_specs(store)
-    except (SpecError, sqlite3.Error, StoreFormatError) as exc:
+    except (SpecError, ValueError, sqlite3.Error, StoreFormatError) as exc:
         return _fail("register", str(exc))
     # phase 1: judge EVERY spec against the stored state plus the rest of the file (a feeder group's members see one
     # another as registered); phase 2: write them all in one transaction, or nothing when any one is refused
@@ -242,7 +236,8 @@ def run_register(args: argparse.Namespace) -> int:
         except SpecError as exc:
             rows.append((_label_of(obj, i), None, [f"rule 3: {exc}"], {}))
     names = [s["name"] for _, s, _, _ in rows if s is not None]
-    twice = {n for n in names if names.count(n) > 1}
+    counts = Counter(names)
+    twice = {n for n, c in counts.items() if c > 1}
     lookup = {**stored, **{s["name"]: s for _, s, _, _ in rows if s is not None}}
     for label, spec, reasons, info in rows:
         if spec is None:
@@ -255,13 +250,18 @@ def run_register(args: argparse.Namespace) -> int:
         revert = find_revert(store, spec, default_zone)
         if args.revise or same or revert:
             held.discard(spec["name"])
-        role = _role_by_hash(store, spec["role"]["role_hash"])
+        try:
+            role, bad_row = role_by_hash(store, spec["role"]["role_hash"]), None
+        except RoleError as exc:        # a stored role that fails its own checks is not a role this spec may pin
+            role, bad_row = None, f"rule 3: the store's role row is refused: {exc}"
+            reasons.append(bad_row)
+        # with the row refused, rule 3's own "not registered" would misname the cause, so only the refusal stands
         reasons += [str(r) for r in check_spec(spec, role=role, default_zone=default_zone, names_held=held,
-                                               lookup=lookup)]
+                                               lookup=lookup) if not (bad_row and r.rule == "3")]
         if revert:
             reasons.append("rule 4: " + revert)
         if spec["name"] in twice:
-            reasons.append(f"rule 4: name {spec['name']!r} appears {names.count(spec['name'])} times in this file: a "
+            reasons.append(f"rule 4: name {spec['name']!r} appears {counts[spec['name']]} times in this file: a "
                            f"registration writes one version of a name (a feeder group names each member once)")
         info["refinement"] = refinement_of(spec)
         if role is not None:
@@ -285,8 +285,13 @@ def run_register(args: argparse.Namespace) -> int:
             for (_, _, entry), (agent_id, digest, version, created) in zip(entries, written):
                 entry.update(agent_id=agent_id, spec_hash=digest, version=version, created=created)
     out_rows: dict = {}
+    seen: Counter = Counter()
     for label, _, entry in entries:
-        out_rows[label if label not in out_rows else f"{label}#{len(out_rows)}"] = entry
+        key = label
+        while key in out_rows:          # a per-label counter, skipping any key the file itself already took
+            seen[label] += 1
+            key = f"{label}#{seen[label]}"
+        out_rows[key] = entry
     _print_verdicts({"jobs": out_rows}, args.json, audit=False)
     code = 1 if any(e["verdict"] == "refused" for e in out_rows.values()) else 0
     return 0 if args.warn else code
@@ -334,14 +339,17 @@ def run_show(args: argparse.Namespace) -> int:
         return _fail("show", str(exc))
     except (sqlite3.Error, StoreFormatError) as exc:
         return _fail("show", f"the store refused it: {exc}")
-    role = _role_by_hash(store, a["spec"]["role"]["role_hash"])
+    try:
+        role, why = role_by_hash(store, a["spec"]["role"]["role_hash"]), "role not resolvable"
+    except RoleError as exc:
+        role, why = None, f"role refused: {exc}"
     flags = derived_flags(role) if role else None
     head = (f"agent {a['name']} {a['agent_id']} v{a['version']} (versions {a['versions']}) {a['spec_hash']}\n"
             f"registration: {a['registration']}  operation: {a['operation']}  arming: derived from the authority "
             f"log (P5a), not stored here  failure_streak: {a['failure_streak']}\n"
             + (f"review: {'required' if flags['review_required'] else 'not required'} "
                f"(calls_model={flags['calls_model']}, acts_outward={flags['acts_outward']}); the date is the link's "
-               f"expires_at\n" if flags else "review: role not resolvable\n"))
+               f"expires_at\n" if flags else f"review: {why}\n"))
     try:
         print(head + json.dumps(a["spec"], indent=2, sort_keys=True, ensure_ascii=False))
     except UnicodeEncodeError as exc:
@@ -397,10 +405,10 @@ def run_zone(args: argparse.Namespace) -> int:
             zone = get_default_zone(store)
             print(zone if zone else "unset (set one with: levain agents zone <IANA>)")
             return 0
-        set_default_zone(store, args.iana)
+        zone = set_default_zone(store, args.iana)
     except ValueError as exc:
         return _fail("zone", str(exc))
     except (sqlite3.Error, StoreFormatError) as exc:
         return _fail("zone", f"the store refused it: {exc}")
-    print(f"default zone: {args.iana}")
+    print(f"default zone: {zone}")
     return 0

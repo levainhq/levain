@@ -30,6 +30,13 @@ derived from the authority log (P5a) and is never stored here. On the agent it w
 same-content re-register, a ``--revise`` (a new version) and a retire; only :func:`set_operation` with ``active``
 (resume) clears it, and nothing else in this module writes ``operation``. A retire followed by a register of the same
 name is NOT that agent: it mints a new ``agent_id`` (DESIGN §3.2) whose operation axis starts ``active``.
+
+Known edges (not built):
+
+- two concurrent ``register --revise`` runs can each pass the feeder-cycle check against the graph as it was before
+  either wrote; one operator's CLI does not run two at once, so this is not reachable in real use.
+- on a console that cannot encode the verdict text (non-UTF-8), ``register`` raises UnicodeEncodeError after the
+  transaction has committed: the specs are registered though the exit code says otherwise.
 """
 from __future__ import annotations
 
@@ -38,10 +45,11 @@ import hashlib
 import json
 import re
 import secrets
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
-from levain.agents.store import AgentStore, valid_zone
+from levain.agents.store import AgentStore, canonical_zone
 from levain.authority import _canonical
 
 __all__ = ["SpecError", "SPEC_FIELDS", "parse_spec", "parse_spec_text", "load_json", "finalize_spec", "spec_hash",
@@ -103,6 +111,11 @@ def _name(value: Any, where: str) -> str:
     value = _str(value, where)
     if not NAME.fullmatch(value):
         raise SpecError(f"{where} {value[:60]!r} does not match [a-z][a-z0-9_-]{{0,63}}")
+    if AGENT_ID.fullmatch(value):
+        # an agent is named by its id or its name, and a ref of the id shape is always read as an id: a name of
+        # that shape could never be addressed by name, and would stand in for another agent's id
+        raise SpecError(f"{where} {value!r} has the shape of an agent_id (ag-<32 hex>): a name may not, since "
+                        f"names and ids address agents in one namespace")
     return value
 
 
@@ -146,9 +159,10 @@ def _trigger(value: Any) -> dict[str, Any]:
         raise SpecError("missing field 'cron' in trigger")
     zone = t.get("zone")
     if zone is not None:
-        zone = _str(zone, "trigger.zone")
-        if not valid_zone(zone):
-            raise SpecError(f"trigger.zone {zone[:60]!r} is not an IANA zone this host knows")
+        typed = _str(zone, "trigger.zone")
+        zone = canonical_zone(typed)
+        if zone is None:
+            raise SpecError(f"trigger.zone {typed[:60]!r} is not an IANA zone this host knows")
     window = t.get("window")
     if window is not None:
         w = _exact(window, ("start", "end"), "trigger.window")
@@ -269,8 +283,12 @@ def finalize_spec(spec: dict[str, Any], default_zone: str | None) -> dict[str, A
     moment written as "when asked". Raise :class:`SpecError` when something refuse.py would refuse is still unset."""
     spec = copy.deepcopy(parse_spec(spec))
     if spec["trigger"]["zone"] is None:
+        if default_zone is not None and canonical_zone(default_zone) != default_zone:
+            raise SpecError(f"the default zone {str(default_zone)[:60]!r} is not an IANA zone name this host knows: "
+                            f"set it again with `levain agents zone <IANA>`")
         spec["trigger"]["zone"] = default_zone
-    if spec["output"] is not None and spec["output"]["class"] == "corpus" and spec["output"]["moment"] is None:
+    # a corpus output's "" and its absence are one intent, so one stored text and one hash
+    if spec["output"] is not None and spec["output"]["class"] == "corpus" and not spec["output"]["moment"]:
         spec["output"]["moment"] = WHEN_ASKED
     missing = [k for k in ("input", "output", "win", "stop_at") if spec[k] is None]
     if spec["trigger"]["zone"] is None:
@@ -392,7 +410,7 @@ def register_specs(store: AgentStore, specs: list[dict[str, Any]], default_zone:
     :class:`SpecError` or a store error from any of them rolls the whole batch back). Two specs of one name in a
     batch are refused before anything is written."""
     names = [s["name"] for s in specs]
-    dup = sorted({n for n in names if names.count(n) > 1})
+    dup = sorted(n for n, c in Counter(names).items() if c > 1)
     if dup:
         raise SpecError(f"rule 4: {', '.join(repr(n) for n in dup)} appears more than once in one registration")
     with store.write() as conn:
@@ -466,8 +484,12 @@ def can_fire(registration: str, armed: bool, operation: str) -> bool:
 
 
 def _group(conn: Any, agent: dict[str, Any]) -> list[dict[str, Any]]:
+    """The agent and the registered agents joined to it through ``feeds``. Feeder groups are live names, so an agent
+    that is not the live holder of its name (a retired one) is a group of itself: its name may now belong to a new
+    agent, and walking from the name would reach that agent and its group. Every row read is re-checked
+    (:func:`_check_row`), so a corrupt row is a :class:`SpecError`, never a guess."""
     rows = conn.execute("SELECT a.agent_id, a.name, a.current_version, a.registration, a.operation, "
-                        "a.failure_streak, a.created_at, s.spec FROM agents a JOIN agent_specs s "
+                        "a.failure_streak, a.created_at, s.spec_hash, s.spec FROM agents a JOIN agent_specs s "
                         "ON s.agent_id = a.agent_id AND s.version = a.current_version "
                         "WHERE a.registration = 'registered'").fetchall()
     by_name: dict[str, dict[str, Any]] = {}
@@ -475,11 +497,12 @@ def _group(conn: Any, agent: dict[str, Any]) -> list[dict[str, Any]]:
     for r in rows:
         by_name[r[1]] = _agent_dict(r[:7])
         edges.setdefault(r[1], set())
-        for f in json.loads(r[7]).get("feeds", []):
+        for f in _check_row(r[0], r[1], r[7], r[8])["feeds"]:
             edges[r[1]].add(f)
             edges.setdefault(f, set()).add(r[1])
     seen: set[str] = set()
-    todo = [agent["name"]] if agent["name"] in by_name else []
+    live = by_name.get(agent["name"])
+    todo = [agent["name"]] if live is not None and live["agent_id"] == agent["agent_id"] else []
     while todo:
         n = todo.pop()
         if n not in seen and n in by_name:
