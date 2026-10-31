@@ -33,6 +33,26 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   still refuses. Covered by tests of the spawn argv and the setting.
 
 ### Fixed
+- **The coordinator's verbs take their text without shell quoting.** Shadow 10-30: two of three real coordinators
+  misfired on their own shell lines (flags kept in a variable that zsh does not split, then a `coord release` run in the
+  same batch as the writes, which ended the lease under them). `drops note`, `coord escalate`, `coord answer`, `thread
+  set` and `thread add` take `--text-file PATH` or `--stdin` (strict UTF-8, one trailing newline dropped, read under a
+  byte cap, then the verb's own limit); `thread state` and `thread set` take `--cause-file PATH`; `drops split` takes
+  the whole split as one JSON document (`--json-file PATH` or `--stdin`:
+  `{"drop_id", "threads": [{"kind", "title", "about"?}], "attach": [{"kind", "thread"}]}`) through the same checks as
+  `--thread` and `--attach`. Every old flag works as before. The coordinator brief shows these forms first, says never
+  to keep flags in a shell variable, and says to release the lease only as the last step, as its own command. The JSON
+  split refuses a key named twice at any level, a document nested too deeply, a `kind` that is not exactly one of the
+  kinds, an empty split, and a wrong-typed `title`/`thread`/`about`, each by name; input files and stdin drop a UTF-8 BOM.
+- **A coordinator's turn ends on a status line, and a drop that needs nothing gets a receipt.** The coordinator brief
+  now carries an end-of-turn rule: the last line of its words is one `coordinator:` status line (what it did, how many
+  items it escalated), never a question or "waits on you" (a coordinator that ended on an escalation sat in the agent
+  view as "waiting for answers" for ~50 minutes); escalations go through `levain coord escalate` or the band's ask
+  tool. New verb `levain drops note DROP_ID --why "one line" --by coordinator --token N` writes an append-only `noted`
+  drop receipt (lease-fenced, refused on a split drop). A noted drop is not re-quoted in a brief, not counted as unseen
+  (no replacement coordinator), not a "Drop not split" review item, and shows `[noted: why]` in `levain drops list` and
+  `drops show`. The `levain coord watch` line for a silent holder now says its window is the service-beat window, not a
+  bare "60 min".
 - **A drop that lands while a coordinator sits done is acted on at the next watcher pass, not an hour later.** A
   coordinator that split its drop, released the lease and stayed listed (`claude --bg`, state `done`) kept the
   coordinator slot as `idle`, so drops filed after it sat unread until `LEASE_TTL + IDLE_GRACE`. `levain coord watch`

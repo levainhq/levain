@@ -771,7 +771,7 @@ def _drop_stuck(conn: sqlite3.Connection, drop_id: str, now: datetime, after: ti
     row = conn.execute("SELECT received_at FROM drops WHERE drop_id = ?", (drop_id,)).fetchone()
     if row is None or now - parse_stamp(row[0]) < after:
         return False
-    return "split" not in {json.loads(b).get("stage") for (b,) in conn.execute(
+    return not {"split", "noted"} & {json.loads(b).get("stage") for (b,) in conn.execute(
         "SELECT body FROM replies WHERE kind = 'drop_receipt' AND ref_id = ?", (drop_id,)).fetchall()}
 
 

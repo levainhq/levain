@@ -197,6 +197,8 @@ class CoordPhone:
         out = {"stage": b.get("stage"), "at": r.at, "envelope_refused": visible(b.get("envelope_refused")),
                "threads": [{"thread_id": t.get("thread_id"), "kind": t.get("kind"), "title": visible(t.get("title"))}
                            for t in b.get("threads", []) if isinstance(t, dict)]}
+        if b.get("stage") == "noted":          # a drop read with nothing to do (levain drops note): no threads, a why
+            out.update(why=visible(b.get("why")))
         if b.get("stage") == "woken":          # how the coordinator launch this drop asked for went (record_wake)
             out.update(launch_id=b.get("launch_id"), started=b.get("started") is True, said=visible(b.get("said")))
         return out

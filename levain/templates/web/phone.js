@@ -1859,7 +1859,7 @@
       return card;
     }));
   }
-  const RECEIPT = { delivered: "delivered", split: "split", resplit: "regrouped", woken: "coordinator" };
+  const RECEIPT = { delivered: "delivered", split: "split", resplit: "regrouped", noted: "noted", woken: "coordinator" };
   function dropCard(d) {
     const card = el("article", "row drop sent");
     card.dataset.drop = d.drop_id;
@@ -1876,11 +1876,12 @@
       const named = threads.map((t) => String(t.kind || "").toUpperCase() + " " + (t.title || t.thread_id)).join("; ");
       let line = "receipt: " + (RECEIPT[r.stage] || r.stage) + " " + readable(r.at);
       if (r.stage === "woken") line += " · launch " + r.launch_id + (r.started ? " started: " : " not started: ") + (r.said || "");
+      else if (r.stage === "noted") line += " · nothing to do: " + (r.why || "");
       else if (r.stage !== "delivered") line += " · " + threads.length + (threads.length === 1 ? " thread" : " threads") + (named ? ": " + named : "");
       if (r.envelope_refused) line += " · envelope not taken: " + r.envelope_refused;
       card.appendChild(el("div", "where receipt" + (r.stage === "woken" && !r.started ? " bad" : ""), line));
     }
-    if (!receipts.some((r) => r.stage === "split")) card.appendChild(el("div", "where", "not split into threads yet"));
+    if (!receipts.some((r) => r.stage === "split" || r.stage === "noted")) card.appendChild(el("div", "where", "not split into threads yet"));
     return card;
   }
   function drawDrops(data, seq) {

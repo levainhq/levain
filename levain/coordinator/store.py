@@ -717,6 +717,23 @@ class CoordStore:
             self._split_done(conn, drop_id, touched, now)
             return [self._thread(conn, t) for t in touched]
 
+    def note(self, drop_id: str, why: str, *, token: object) -> str:
+        """The coordinator's terminal "read, nothing to do" for a drop: an append-only ``noted`` drop receipt carrying
+        ``why`` (one line), written under the lease like a split. It stands in for a split everywhere a drop is
+        counted as unseen or queued, and the drop stays visible with its reason. A drop already split or already
+        noted is refused; a later split of a noted drop is still allowed (the operator or coordinator changed its
+        mind), and shows both receipts."""
+        why = _one_line("a drop's why", why, _TITLE_MAX)
+        with self._write("coordinator", token) as (conn, now):
+            self._must_drop(conn, drop_id)
+            if self._receipts(conn, drop_id, "split"):
+                raise CoordError(f"drop {drop_id} is already split; a split drop is not noted")
+            if self._receipts(conn, drop_id, "noted"):
+                raise CoordError(f"drop {drop_id} is already noted")
+            self._reply(conn, None, "drop_receipt", "drops", drop_id,
+                        {"stage": "noted", "drop_id": drop_id, "why": why, "threads": []}, now)
+        return why
+
     def add(self, drop_id: str, part: Part, *, by: str = "operator", token: object = None) -> Thread:
         """Put an already-split drop into one more thread (a new one, or an existing open one): the receipt's one-tap
         fix for a split that missed an intent, and how a later drop joins work in flight. Writes a ``resplit``
@@ -1110,6 +1127,23 @@ class CoordStore:
         with read_transaction(self._connect) as conn:
             ids = [r[0] for r in conn.execute("SELECT drop_id FROM drops ORDER BY rowid DESC LIMIT ?", (limit,))]
             return [self._drop(conn, d) for d in ids]
+
+    def drops_noted(self, limit: int = 50) -> list[tuple[Drop, str | None]]:
+        """The newest ``limit`` drops, each with the why of its ``noted`` receipt (None when not noted), read in ONE
+        transaction: one snapshot, one open."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise CoordError("limit is 1 to 1000")
+        with read_transaction(self._connect) as conn:
+            ids = [r[0] for r in conn.execute("SELECT drop_id FROM drops ORDER BY rowid DESC LIMIT ?", (limit,))]
+            out: list[tuple[Drop, str | None]] = []
+            for d in ids:
+                got = self._receipts(conn, d, None)
+                # noted, and not split since: a drop the coordinator later split is a split drop, not a noted one
+                why = next((str(r.body.get("why", "")) for r in got if r.body.get("stage") == "noted"), None)
+                if any(r.body.get("stage") in ("split", "resplit") for r in got):
+                    why = None
+                out.append((self._drop(conn, d), why))
+            return out
 
     def thread(self, thread_id: str) -> Thread:
         with read_transaction(self._connect) as conn:

@@ -601,7 +601,7 @@ def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch |
 
 
 def unseen_drop(conn: sqlite3.Connection, ln: Launch) -> str | None:
-    """The oldest drop ``ln``'s session never saw, or None: a drop with no ``split`` receipt (yours or a
+    """The oldest drop ``ln``'s session never saw, or None: a drop with no ``split`` or ``noted`` receipt (yours or a
     coordinator's) delivered AFTER the launch's spawn claim, in the store-wide order (gseq, never a clock). Its brief
     is written after that claim and quotes every unsplit drop delivered before it, so only a later drop is one it may
     never have read. A fresh launch's claim is newer than the drop that replaced its predecessor, so the same drop
@@ -616,7 +616,7 @@ def unseen_drop(conn: sqlite3.Connection, ln: Launch) -> str | None:
         "SELECT r.ref_id FROM replies r WHERE r.ref_store = 'drops' AND r.kind = 'drop_receipt' "
         "AND json_extract(r.body, '$.stage') = 'delivered' AND r.gseq > ? AND NOT EXISTS (SELECT 1 FROM replies s "
         "WHERE s.ref_store = 'drops' AND s.ref_id = r.ref_id AND s.kind = 'drop_receipt' "
-        "AND json_extract(s.body, '$.stage') = 'split') ORDER BY r.gseq LIMIT 1", (start,)).fetchone()
+        "AND json_extract(s.body, '$.stage') IN ('split', 'noted')) ORDER BY r.gseq LIMIT 1", (start,)).fetchone()
     return None if row is None else row[0]
 
 

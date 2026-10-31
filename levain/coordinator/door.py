@@ -49,7 +49,7 @@ DOOR: frozenset[tuple[str, ...]] = frozenset({
     ("coord", "questions"), ("coord", "answer"), ("coord", "escalate"),
     # away ON from a drop (fenced by the lease token), and the budget gauge and morning card it reads (C6)
     ("coord", "away"), ("coord", "budget"), ("coord", "morning"),
-    ("drops", "list"), ("drops", "show"), ("drops", "split"),
+    ("drops", "list"), ("drops", "show"), ("drops", "split"), ("drops", "note"),
     ("thread", "list"), ("thread", "show"), ("thread", "state"), ("thread", "merge"), ("thread", "detach"),
     ("thread", "add"), ("thread", "set"),
     ("team", "draft", "add"), ("team", "draft", "list"), ("team", "draft", "show"),
