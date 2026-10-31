@@ -226,28 +226,6 @@ def test_a_note_row_cannot_be_answered_and_a_question_row_cannot_be_dismissed(tm
 # --- the phone ---------------------------------------------------------------------------------------------------
 
 
-def test_the_phone_lists_open_notes_and_dismisses_one_without_delivery(tmp_path, monkeypatch):
-    from levain.consent import band
-    from tests.test_phone_questions import _call, _serving
-
-    monkeypatch.setattr(band, "deliver_answer", lambda *a, **k: pytest.fail("a dismiss must deliver nothing"))
-    qdir = tmp_path / "consent"
-    qdir.mkdir(mode=0o700)
-    n = _file(NoteStore(qdir))
-    with _serving(qdir) as base:
-        status, listing = _call(f"{base}/consent.json")
-        assert status == 200
-        (row,) = listing["notes"]
-        assert (row["n"], row["what"], row["detail"], row["agent"]) == (n.n, WHAT, DETAIL, "claude_code")
-        assert listing["notes_overflow"] == 0 and listing["notes_note"] == ""
-        assert _call(f"{base}/note/{n.n}/dismiss", {}, token=None)[0] == 403
-        assert _call(f"{base}/note/{n.n}/dismiss", {}) == (200, {"dismissed": n.n})
-        assert _call(f"{base}/consent.json")[1]["notes"] == []
-        assert _call(f"{base}/note/{n.n}/dismiss", {})[0] == 409
-        assert _call(f"{base}/note/99/dismiss", {})[0] == 404
-        assert _call(f"{base}/question/{n.n}/answer", {"text": "ok"})[0] == 404   # a note's number is no question
-    assert NoteStore(qdir).get(n.n).dismissed.channel == "phone"
-    assert not (qdir / "questions.db").exists()
 
 
 # --- L3 r1: the open bound (F1) ----------------------------------------------------------------------------------
@@ -343,18 +321,6 @@ def test_open_page_reads_one_page_and_the_surfaces_say_how_many_they_left_out(tm
         assert panel["status"] == "partial" and f"{over} more notes are waiting than are shown" in panel["note"]
 
 
-def test_the_phone_says_how_many_notes_it_left_out(tmp_path):
-    from levain.consent.listing import PENDING_CAP
-    from tests.test_phone_questions import _call as _phone, _serving
-
-    qdir = tmp_path / "consent"
-    qdir.mkdir(mode=0o700)
-    _file(NoteStore(qdir))
-    over = 2
-    _prefill(qdir, PENDING_CAP + over - 1)
-    with _serving(qdir) as base:
-        status, listing = _phone(f"{base}/consent.json")
-    assert status == 200 and len(listing["notes"]) == PENDING_CAP and listing["notes_overflow"] == over
 
 
 # --- L3 r1: a kernel row is a decisions row with its facet (F2) ---------------------------------------------------

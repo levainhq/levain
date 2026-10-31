@@ -1,6 +1,6 @@
 // levain pair.js — the new device's half of per-device cockpit pairing (PAIR_DESIGN.md REV 1-6).
 //
-// A paired device's "Pair a device" button shows a link `/pair#code=<one-time code>`. This page takes the code from the
+// A paired device's "Make a link" button shows a link `/pair#code=<one-time code>`. This page takes the code from the
 // FRAGMENT (never sent to a server, never in a log or a Referer), scrubs it from the address bar at once, spends it with a
 // credential-less POST /cockpit/pair/claim {code} (the label was typed on the offering device, RP-6: the claim accepts the
 // code and nothing else), keeps the returned token where the cockpit already keeps its own (localStorage
@@ -90,7 +90,7 @@
       // G3: after a Try again the first try may have spent the code and lost only its answer; say so, in one line
       say("This pairing code did not work", again
         ? "The first try may have used this code. If this device is not paired, make a new code on a paired device."
-        : "This pairing code is used, expired or wrong; make a new one on a paired device.", false);
+        : "This pairing code is used, expired or wrong; make a new one on a paired device. If you did not use it, revoke the newest device in Devices.", false);
       return;
     }
     if (res.status >= 500) {
@@ -195,7 +195,7 @@
   function run() {
     const code = takeCode();
     if (!code) {
-      say("No pairing code", "Open this page from the link on a paired device (Devices, then Pair a device).", true);
+      say("No pairing code", "Open this page from the link on a paired device (Devices, then Make a link).", true);
       return;
     }
     if (storedToken()) {

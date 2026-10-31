@@ -19,7 +19,7 @@ from levain.dispatch import cli as dispatch_cli
 from levain.dispatch import sign as dispatch_sign
 from levain.slot import Refused
 from levain.slot import runtime_grammar
-from levain.webpush import devices
+from levain.cockpit.firejournal import PairingError, _clean_label
 
 
 def _unassigned() -> str:
@@ -175,7 +175,9 @@ def test_mark_formats_each_hidden_character() -> None:
 
 def test_strip_sites_keep_words_apart_and_strip_the_rest() -> None:
     assert publish._clean("a b　c​d") == "a b cd"         # a space becomes a space, not nothing
-    assert devices._label("ph​one‮") == "phone"
+    # a device label (the cockpit's pairing journal) REFUSES a hidden character; the phone port's registry stripped it
+    with pytest.raises(PairingError):
+        _clean_label("ph​one‮")
 
 
 def test_the_cockpit_row_carries_the_servers_hidden_flag() -> None:

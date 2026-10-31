@@ -42,8 +42,8 @@ class DeviceNotLive(PushStoreError):
 
 # A subscription the cockpit stored is under its paired device's credential name, ``paired-<id>``
 # (:data:`levain.cockpit.firejournal.PAIRED_PREFIX`; a test pins the two equal), and its ``journal`` column holds the
-# cockpit's data root, whose pairing journal is that device's one authority. Every other subscription's device is a
-# row of this store's own ``devices`` table.
+# cockpit's data root, whose pairing journal is that device's one authority. A subscription under any other device id
+# is never live and never stored (W1b: the phone port's own device registry is gone).
 PAIRED_PREFIX = "paired-"
 _JOURNAL_DB = "cockpit.db"     # levain.cockpit.firejournal.DB_NAME (pinned equal by the same test)
 _JOURNAL_WAIT_S = 0.25         # a gate reads liveness: a journal writer must not stall it
@@ -68,25 +68,25 @@ def paired_device_live(journal: "str | Path | None", device_id: str) -> bool:
     return row is not None and row[0] is None
 
 
-def live_rows(conn: sqlite3.Connection, *, first: bool = False) -> list[dict[str, Any]]:
+def live_rows(conn: sqlite3.Connection, *, first: bool = False, device: str | None = None) -> list[dict[str, Any]]:
     """The live subscriptions, by the one rule every reader uses (the gate's :func:`levain.webpush.live` and the
-    send's :meth:`PushStore.live_subscriptions`): not retired, and its device live in its own authority, a row of
-    ``devices`` not revoked, or for a ``paired-`` device, unrevoked in the cockpit journal the row names, asked now.
-    A device no authority holds is not live. ``first`` stops at the first live one."""
+    send's :meth:`PushStore.live_subscriptions`): not retired, and a ``paired-`` device unrevoked in the cockpit
+    journal the row names, asked now. Any other device (a row a retired phone port wrote) is never live. ``first``
+    stops at the first live one; ``device`` keeps only that device's rows, so only they reach the per-device
+    liveness check."""
     out: list[dict[str, Any]] = []
     asked: dict[tuple[Any, str], bool] = {}
-    for r in conn.execute("SELECT s.*, d.id AS _dev, d.revoked_at AS _dev_revoked FROM subscriptions s "
-                          "LEFT JOIN devices d ON d.id = s.device_id WHERE s.retired_at IS NULL ORDER BY s.id"):
+    for r in conn.execute("SELECT s.* FROM subscriptions s WHERE s.retired_at IS NULL "
+                          + ("" if device is None else "AND s.device_id = ? ") + "ORDER BY s.id",
+                          () if device is None else (device,)):
         row = dict(r)
-        dev, dev_revoked = row.pop("_dev"), row.pop("_dev_revoked")
-        device = row.get("device_id") or ""
-        if device.startswith(PAIRED_PREFIX):
-            key = (row.get("journal"), device)
+        owner = row.get("device_id") or ""
+        ok = False
+        if owner.startswith(PAIRED_PREFIX):
+            key = (row.get("journal"), owner)
             if key not in asked:
-                asked[key] = paired_device_live(row.get("journal"), device)
+                asked[key] = paired_device_live(row.get("journal"), owner)
             ok = asked[key]
-        else:
-            ok = dev is not None and dev_revoked is None
         if ok:
             out.append(row)
             if first:
@@ -115,16 +115,6 @@ _SCHEMA: tuple[str, ...] = (
     # a signed VAPID token per push-service origin, reused until it nears expiry (Apple asks for no more than
     # one new token an hour)
     "CREATE TABLE IF NOT EXISTS vapid_tokens (aud TEXT PRIMARY KEY, jwt TEXT NOT NULL, exp INTEGER NOT NULL)",
-    # the pairing/device logic is levain.webpush.devices; this module only creates the tables
-    "CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, label TEXT, token_hash TEXT UNIQUE NOT NULL, "
-    "created TEXT, last_seen TEXT, revoked_at TEXT)",
-    "CREATE TABLE IF NOT EXISTS pairings (code_hash TEXT PRIMARY KEY, device_label TEXT, expires TEXT NOT NULL, "
-    "used_at TEXT)",
-    # the short code the operator types into the installed app, and the wrong guesses that lock it out; both are
-    # additive tables, so an existing store gains them on its next open with no format change
-    "CREATE TABLE IF NOT EXISTS short_pairings (code_hash TEXT PRIMARY KEY, device_label TEXT, expires TEXT NOT NULL, "
-    "used_at TEXT)",
-    "CREATE TABLE IF NOT EXISTS redeem_failures (at TEXT NOT NULL)",
     # ``subscribed`` is the subscribe order, moved up on every re-subscribe: the caps retire by it
     "CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT, "
     "endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created TEXT NOT NULL, "
@@ -222,7 +212,7 @@ class PushStore:
             raise
 
     def connection(self) -> sqlite3.Connection:
-        """A plain connection for ``levain.webpush.devices``: default isolation (``with conn:`` commits), the
+        """A plain connection: default isolation (``with conn:`` commits), the
         store's durability PRAGMAs, schema ensured. The caller closes it."""
         self._connect().close()
         conn = open_durable(self.path)
@@ -245,45 +235,29 @@ class PushStore:
         """Store (or revive, with fresh keys) the subscription for ``endpoint`` under ``device_id``; returns its id.
         A revived row takes the device that subscribed it now, so it is never live under a device revoked before.
         Live subscriptions are capped per device and overall: the least recently subscribed retire first, never the
-        one just stored. A ``paired-`` device needs ``journal``, its cockpit data root, and is asked again there
-        inside this write: one revoked since its credential was read raises :class:`DeviceNotLive`, nothing
-        stored (the send asks the journal again, :func:`live_rows`, so this bounds the window, it is not the
-        guard)."""
-        if not isinstance(device_id, str) or not device_id:
-            raise ValueError("a subscription is always stored under a device")
-        if device_id.startswith(PAIRED_PREFIX) and not journal:
+        one just stored. The device must be a ``paired-`` one (anything else raises :class:`ValueError`: no other
+        writer exists, so the store refuses what the send would never reach) and needs ``journal``, its cockpit data
+        root, where it is asked again inside this write: one revoked since its credential was read raises
+        :class:`DeviceNotLive`, nothing stored (the send asks the journal again, :func:`live_rows`, so this bounds
+        the window, it is not the guard)."""
+        if not isinstance(device_id, str) or not device_id.startswith(PAIRED_PREFIX):
+            raise ValueError("a subscription is stored only under a paired device")
+        if not journal:
             raise ValueError("a paired device's subscription names its pairing journal")
         with self.write() as c:
-            if device_id.startswith(PAIRED_PREFIX) and not paired_device_live(journal, device_id):
+            if not paired_device_live(journal, device_id):
                 raise DeviceNotLive(f"{device_id} is not a live paired device")
-            return _subscribe(c, endpoint, p256dh, auth, device_id,
-                              journal=str(journal) if device_id.startswith(PAIRED_PREFIX) else None)
-
-    def subscribe_unowned(self, endpoint: str, p256dh: str, auth: str, label: Any,
-                          now: datetime) -> tuple[int, tuple[str, str] | None]:
-        """A run-token subscribe, in one transaction: an endpoint a live device already owns stays that device's and
-        nothing is minted; otherwise a new device is minted and owns it. Returns ``(subscription id, (device_id,
-        device_token) or None)``."""
-        from levain.webpush import devices
-
-        with self.write() as c:
-            row = c.execute("SELECT s.device_id FROM subscriptions s JOIN devices d ON d.id = s.device_id "
-                            "WHERE s.endpoint = ? AND d.revoked_at IS NULL", (endpoint,)).fetchone()
-            minted = None
-            if row is None:
-                minted = devices._insert_device(c, label, now)
-            owner = row[0] if row is not None else minted[0]
-            return _subscribe(c, endpoint, p256dh, auth, owner), minted
+            return _subscribe(c, endpoint, p256dh, auth, device_id, journal=str(journal))
 
     def retire_subscription(self, endpoint: str) -> bool:
         with self.write() as c:
             return c.execute("UPDATE subscriptions SET retired_at = ? WHERE endpoint = ? AND retired_at IS NULL",
                              (now_stamp(), endpoint)).rowcount > 0
 
-    def live_subscriptions(self) -> list[dict[str, Any]]:
+    def live_subscriptions(self, *, device: str | None = None) -> list[dict[str, Any]]:
         # a subscription whose device was revoked is not live even if a revoke left its row unretired (live_rows)
         with self.read() as c:
-            return live_rows(c)
+            return live_rows(c, device=device)
 
     # --- the record ----------------------------------------------------------------------------------
     def add_ping(self, kind: str, ref: str | None, title: str, body: str, command: bool | None = None, *,
@@ -343,7 +317,9 @@ class PushStore:
         with self.write() as c:
             if c.execute("SELECT 1 FROM pings WHERE id = ?", (ping_id,)).fetchone() is None:
                 return False
-            c.execute("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)", (ping_id, device_id, now_stamp()))
+            # idempotent per (ping, device): two cockpit tabs may drain the same tap, and the second answers like the first
+            if c.execute("SELECT 1 FROM opens WHERE ping_id = ? AND device_id IS ?", (ping_id, device_id)).fetchone() is None:
+                c.execute("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)", (ping_id, device_id, now_stamp()))
             return True
 
     def record(self, limit: int = 100) -> list[dict[str, Any]]:

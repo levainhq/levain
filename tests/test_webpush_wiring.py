@@ -3,21 +3,20 @@ from __future__ import annotations
 
 import shutil
 import time
-from datetime import datetime, timezone
 
 from levain import webpush
 from levain.consent import delivery
 from levain.consent.adapters import claude_code
 from levain.webpush import sender
 from levain.webpush.store import DIR_NAME, PushStore
+from tests._push_fixtures import phone, revoke
 
 FCM = "https://fcm.googleapis.com/fcm/send/wire-test"
 
 
 def _phone(qdir):
-    store = PushStore(qdir)
-    store.subscribe_unowned(FCM, "p", "a", "phone", datetime.now(timezone.utc))
-    return store
+    phone(qdir, FCM)
+    return PushStore(qdir)
 
 
 def _spy(monkeypatch):
@@ -58,8 +57,7 @@ def test_a_ruling_ping_reaches_the_phone_without_a_notify_command(tmp_path, monk
 
 def test_a_revoked_phone_is_not_live(tmp_path):
     store = _phone(tmp_path)
-    with store.write() as c:
-        c.execute("UPDATE devices SET revoked_at = '2026-10-19T00:00:00Z'")
+    revoke(store)
     assert webpush.live(tmp_path) is False
 
 
@@ -187,6 +185,5 @@ def test_a_command_only_ping_pushes_to_no_phone_even_if_a_subscription_appears_b
 
 def test_a_revoked_device_whose_subscription_was_left_unretired_is_not_sent_to(tmp_path):
     store = _phone(tmp_path)
-    with store.write() as c:
-        c.execute("UPDATE devices SET revoked_at = '2026-10-19T00:00:00Z'")
+    revoke(store)
     assert store.live_subscriptions() == []

@@ -22,6 +22,7 @@ from levain.writes import WriteScope
 from tests.test_cockpit_sign_origin import NS, PINNED, RP, _file, _Passkey
 
 TOK = "sign-routes-token"
+FC = "sign-routes-surface-token-0123456789"   # a named surface: honoured proxied, where the owner key is not (W1b L-1)
 RID = "np-sign-route-0001"
 
 
@@ -33,7 +34,8 @@ def _source(root: Path) -> SubstrateSource:
 
 @contextmanager
 def _serving(root: Path, **kw: Any) -> Iterator[tuple[str, Any]]:
-    httpd = make_server(_source(root), host="127.0.0.1", port=0, write_token=TOK, **kw)
+    kw.setdefault("surface_tokens", {"browser": TOK, "flowconnect": FC})
+    httpd = make_server(_source(root), host="127.0.0.1", port=0, **kw)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -367,9 +369,10 @@ def test_a_request_through_an_extra_host_is_off_box_for_the_read_gate(tmp_path: 
                 st, body = _call(url, path, token=None, host=host)
                 assert st == 403 and "token" in body["message"], (path, host, st)
                 assert _call(url, path, token="wrong", host=host)[0] == 403, (path, host)
-                assert _call(url, path, host=host)[0] == 200, (path, host)
+                assert _call(url, path, host=host)[0] == 403, (path, host)         # the owner key opens nothing proxied
+                assert _call(url, path, token=FC, host=host)[0] == 200, (path, host)
         assert _call(url, "/", token=None, host=name)[0] == 200
-        st, sub = _call(url, "/substrate.json", host=name)
+        st, sub = _call(url, "/substrate.json", token=FC, host=name)
         assert sub["write_token_required"] is True           # the page keeps sending the token through the proxy
 
 
@@ -532,13 +535,15 @@ def test_a_proxy_header_makes_a_loopback_host_off_box_for_every_route(cockpit) -
             for path in reads:
                 st, body = _call(url, path, token=None, host=host, extra=proxy)
                 assert st == 403 and "token" in body["message"], (proxy, host, path, st, body)
-                assert _call(url, path, host=host, extra=proxy)[0] == 200, (proxy, host, path)
+                assert _call(url, path, host=host, extra=proxy)[0] == 403, (proxy, host, path)   # owner key: refused proxied
+                assert _call(url, path, token=FC, host=host, extra=proxy)[0] == 200, (proxy, host, path)
             for path, req in posts.items():
                 assert _call(url, path, req, token=None, host=host, extra=proxy)[0] == 403, (proxy, host, path)
-                assert _call(url, path, req, host=host, extra=proxy)[0] != 403, (proxy, host, path)
+                assert _call(url, path, req, host=host, extra=proxy)[0] == 403, (proxy, host, path)
+                assert _call(url, path, req, token=FC, host=host, extra=proxy)[0] != 403, (proxy, host, path)
     for path in reads[:3]:
         assert _call(url, path, token=None, host="127.0.0.1")[0] == 200, path      # today's local reads
-    st, sub = _call(url, "/substrate.json", extra=_PROXY_HEADERS[0])
+    st, sub = _call(url, "/substrate.json", token=FC, extra=_PROXY_HEADERS[0])
     assert sub["write_token_required"] is True
 
 
@@ -549,8 +554,8 @@ def _read_only(root: Path) -> SubstrateSource:
 def test_a_read_only_source_through_an_extra_host_needs_the_token(tmp_path: Path) -> None:
     """codex item 7 (L3 r2): off-box is off-box whether or not the source is writable. A read-only source served
     through an extra host (or with a proxy header) needs the surface token on every route, reads included."""
-    httpd = make_server(_read_only(tmp_path), host="127.0.0.1", port=0, surface_tokens={"browser": TOK},
-                        extra_hosts=[RP])
+    httpd = make_server(_read_only(tmp_path), host="127.0.0.1", port=0,
+                        surface_tokens={"browser": TOK, "flowconnect": FC}, extra_hosts=[RP])
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -560,10 +565,11 @@ def test_a_read_only_source_through_an_extra_host_needs_the_token(tmp_path: Path
             for host, extra in ((RP, None), (f"{RP}:8447", None), ("127.0.0.1", _PROXY_HEADERS[0])):
                 st, body = _call(url, path, token=None, host=host, extra=extra)
                 assert st == 403 and "token" in body["message"], (path, host, st, body)
-                assert _call(url, path, host=host, extra=extra)[0] == 200, (path, host)
+                assert _call(url, path, host=host, extra=extra)[0] == 403, (path, host)   # the owner key: refused proxied
+                assert _call(url, path, token=FC, host=host, extra=extra)[0] == 200, (path, host)
         # a write route on a read-only source: the token first off-box, then its own read-only refusal
         assert _call(url, "/edit", {}, token=None, host=RP)[0] == 403
-        assert _call(url, "/edit", {}, host=RP)[0] == 422
+        assert _call(url, "/edit", {}, token=FC, host=RP)[0] == 422
         assert _call(url, "/", token=None, host=RP)[0] == 200                         # the app shell stays open
     finally:
         httpd.shutdown()
@@ -588,7 +594,8 @@ def test_the_read_only_mesh_carve_out_does_not_reach_a_proxied_request(tmp_path:
 
 def test_a_proxied_request_to_a_read_only_mesh_bind_needs_the_token(tmp_path: Path) -> None:
     """The bare read-only mesh bind is token-free (spore-220); a request to it carrying a proxy header is not."""
-    httpd = make_server(_read_only(tmp_path), host="127.0.0.1", port=0, surface_tokens={"browser": TOK})
+    httpd = make_server(_read_only(tmp_path), host="127.0.0.1", port=0,
+                        surface_tokens={"browser": TOK, "flowconnect": FC})
     httpd.is_loopback_bind = False                          # what a real tailnet bind sets (no mesh interface here)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -598,7 +605,8 @@ def test_a_proxied_request_to_a_read_only_mesh_bind_needs_the_token(tmp_path: Pa
         assert _call(url, "/edit", {}, token=None)[0] == 422                            # its honest read_only refusal
         for proxy in _PROXY_HEADERS:
             assert _call(url, "/substrate.json", token=None, extra=proxy)[0] == 403, proxy
-            assert _call(url, "/substrate.json", extra=proxy)[0] == 200, proxy
+            assert _call(url, "/substrate.json", extra=proxy)[0] == 403, proxy             # the owner key, off-box
+            assert _call(url, "/substrate.json", token=FC, extra=proxy)[0] == 200, proxy
     finally:
         httpd.shutdown()
         httpd.server_close()

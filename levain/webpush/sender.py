@@ -135,25 +135,28 @@ def _post(req: urllib.request.Request) -> int:
 
 
 def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
-         command: bool | None = None, push: bool = True, hold: str | None = None) -> list[tuple[int, int]]:
+         command: bool | None = None, push: bool = True, hold: str | None = None,
+         device: str | None = None) -> list[tuple[int, int]]:
     """Record the ping (``command``: whether the notify command started for it, None when none is set), push it to each live subscription concurrently; returns (subscription id, HTTP status)
     pairs (status 0: no answer; :data:`UNKNOWN`: none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription, and so does a refusal that names the key (:class:`_Dead`). Every
     store write happens in this thread; the workers only talk to the push services. ``push=False`` pushes nothing; with
     ``hold`` (the reason, see :meth:`PushStore.add_ping`) the recorded ping also waits in the held queue for
-    :func:`levain.webpush.held.flush`."""
+    :func:`levain.webpush.held.flush`. ``device`` (a ``paired-`` name) sends to that device's subscriptions only; the
+    default is every live one."""
     qdir = Path(queue_dir)
     store = PushStore(qdir)
     # the ping row and its held row are one transaction: a ping is never recorded as held-for-later and then lost
     ping_id = store.add_ping(kind, ref, title, body, command, hold=(url, hold) if hold and not push else None)
     if not push:   # the caller saw no live phone, or the presence rule held the push
         return []
-    return deliver(qdir, store, ping_id, kind=kind, ref=ref, title=title, body=body, url=url)
+    return deliver(qdir, store, ping_id, kind=kind, ref=ref, title=title, body=body, url=url, device=device)
 
 
 def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str | None, title: str, body: str,
-            url: str) -> list[tuple[int, int]]:
-    """Push the already recorded ping ``ping_id`` to each live subscription and record each answer."""
-    subs = store.live_subscriptions()
+            url: str, device: str | None = None) -> list[tuple[int, int]]:
+    """Push the already recorded ping ``ping_id`` to each live subscription (``device``: that device's only) and
+    record each answer."""
+    subs = store.live_subscriptions(device=device)
     data = build_payload(title, body, ref or kind, url, ping_id)
     topic = topic_for(ref)
     reqs = [(sub, _prepare(qdir, sub, data, topic)) for sub in subs]

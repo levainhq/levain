@@ -14,9 +14,6 @@ import hashlib
 import json
 import shutil
 import struct
-import threading
-import urllib.error
-import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator
@@ -337,109 +334,16 @@ def install(home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
 _TOK = "k8a-run-token"
 
 
-def _serve(qdir: Path) -> tuple[str, Any]:
-    from levain.phone_server import make_phone_server
-
-    httpd = make_phone_server(qdir, "localhost", port=0, token=_TOK)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return f"http://localhost:{httpd.server_address[1]}", httpd
 
 
-def _call(base: str, path: str, body: dict | None = None, token: str | None = _TOK, *,
-          timeout: float = 60) -> tuple[int, dict]:
-    from levain.phone_server import PHONE_TOKEN_HEADER
-
-    headers = {"Content-Type": "application/json", "Origin": base} if body is not None else {}
-    if token is not None:
-        headers[PHONE_TOKEN_HEADER] = token
-    req = urllib.request.Request(base + path, method="POST" if body is not None else "GET", headers=headers,
-                                 data=json.dumps(body).encode() if body is not None else None)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read() or b"{}")
 
 
-def _fire(base: str, body: dict) -> tuple[int, dict]:
-    """The laptop page's envelope: a dry run previews the tier and gesture, the fire names them with an intent."""
-    status, dry = _call(base, "/cockpit/verb", {**body, "dry_run": True})
-    if status != 200:
-        return status, dry
-    assert dry["gesture"] == "sign", dry            # a device's write is always signed
-    return _call(base, "/cockpit/verb", {**body, "intent": "sign", "tier_seen": dry["tier"],
-                                         "gesture_seen": dry["gesture"]})
 
 
-def _tray_row(base: str) -> dict:
-    status, board = _call(base, "/app/board.json")
-    assert status == 200, board
-    return next(p for p in board["panels"] if p["id"] == "tray")["rows"][0]
 
 
-def test_the_phone_edits_a_tray_item_end_to_end_signed_by_a_virtual_passkey(install):
-    w = install
-    base, httpd = _serve(w.qdir)
-    try:
-        row = _tray_row(base)
-        verb = {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray", "row_id": row["id"],
-                "row_version": row["version"], "params": {"text": "from the phone"}}
-        assert _call(base, "/cockpit/verb", verb, token=None)[0] == 403          # the transport gate holds
-        status, out = _fire(base, verb)
-        assert status == 200 and out["state"] == "WAITING", out
-        assert SporeStore(w.store).get(row["id"].split(":", 1)[1])["text"] == "tray one"
-        status, pend = _call(base, f"/cockpit/pending/{out['pending_id']}")
-        assert status == 200 and pend["record_text"] == out["record"] and pend["rp_id"] == "localhost"
-        # the challenge is the server's, from the stored record, in the phone namespace
-        assert _unb64u(pend["challenge"]) == P.challenge(pend["record_text"].encode(), COCKPIT_PHONE_NAMESPACE)
-        ad, cdj, der = w.phone.assertion(_unb64u(pend["challenge"]), origin=base)
-        assertion = {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad),
-                     "client_data_json": _b64u(cdj), "signature": _b64u(der)}
-        status, done = _call(base, f"/cockpit/pending/{out['pending_id']}/signature", assertion)
-        assert status == 200 and done["state"] == "COMMITTED", done
-        assert SporeStore(w.store).get(row["id"].split(":", 1)[1])["text"] == "from the phone"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
-def test_the_phone_port_refuses_what_the_kernel_keeps_on_the_laptop_and_answers_standby(install):
-    w = install
-    base, httpd = _serve(w.qdir)
-    try:
-        row = _tray_row(base)
-        fp = w.phone.fingerprint
-        status, out = _call(base, "/cockpit/verb", {"fingerprint": fp, "verb": "spore_touch", "panel_id": "tray",
-                                                   "row_id": row["id"], "row_version": row["version"]})
-        assert (status, out["error"]) == (403, "laptop_only"), out
-        status, out = _call(base, "/cockpit/verb", {"fingerprint": fp, "verb": "operator_state", "panel_id": "state",
-                                                   "params": {"text": "x"}})
-        assert status in (403, 404) and out["error"] in ("laptop_only", "not_offered"), out
-        # a no-UV assertion is refused at conversion, before the broker
-        status, out = _fire(base, {"fingerprint": fp, "verb": "spore_update", "panel_id": "tray",
-                                                   "row_id": row["id"], "row_version": row["version"],
-                                                   "params": {"text": "no uv"}})
-        assert status == 200 and out["state"] == "WAITING", out
-        pend = _call(base, f"/cockpit/pending/{out['pending_id']}")[1]
-        ad, cdj, der = w.phone.assertion(_unb64u(pend["challenge"]), origin=base, uv=False)
-        status, bad = _call(base, f"/cockpit/pending/{out['pending_id']}/signature",
-                            {"fingerprint": fp, "authenticator_data": _b64u(ad), "client_data_json": _b64u(cdj),
-                             "signature": _b64u(der)})
-        assert status == 422 and "verify the user" in bad["message"], bad
-        # while another broker (the laptop's cockpit) holds the write lock, the phone's write is standby
-        holder = Broker(w.root, stores={"spores": SporeEffectStore(w.store)}, store_paths=[w.store],
-                        install_class="reported")
-        holder.start()
-        try:
-            status, out = _fire(base, {"fingerprint": fp, "verb": "spore_update", "panel_id": "tray",
-                                                       "row_id": row["id"], "row_version": row["version"],
-                                                       "params": {"text": "held"}})
-            assert (status, out["error"]) == (503, "standby"), out
-        finally:
-            holder.stop()
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
 # --- K8a fix 1: B6's three fixes and the L3 round 1 findings (k-reviews/K8a_FIX1.md) -------------------------------
@@ -555,67 +459,8 @@ def test_a_device_c1_marked_reported_is_refused_on_the_broker(world):
         assert conn.execute("SELECT COUNT(*) FROM pendings").fetchone()[0] == 0
 
 
-def test_a_device_c1_marked_reported_is_refused_over_the_phone_port(install):
-    i = install
-    base, httpd = _serve(i.qdir)
-    try:
-        row = _tray_row(base)
-        body = {"fingerprint": i.phone.fingerprint, "verb": "spore_update", "panel_id": "tray", "row_id": row["id"],
-                "row_version": row["version"], "params": {"text": "reported"}}
-        status, dry = _call(base, "/cockpit/verb", {**body, "dry_run": True})
-        assert status == 200 and dry["gesture"] == "sign", dry
-        status, out = _call(base, "/cockpit/verb", {**body, "intent": "reported", "tier_seen": dry["tier"],
-                                                    "gesture_seen": dry["gesture"]})
-        assert status in (400, 403) and out["error"] in ("refused", "bad_request"), out
-        db = CockpitDB(i.root)
-        with db.read() as conn:
-            assert conn.execute("SELECT COUNT(*) FROM pendings").fetchone()[0] == 0
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
-def test_a_slow_signature_check_does_not_hold_the_phones_reads(install, monkeypatch):
-    # L-4 (glm): ssh-keygen runs twice, 10 s each at most; the board and pending reads answer meanwhile
-    import levain.cockpit.broker as broker_mod
-
-    w = install
-    entered, release = threading.Event(), threading.Event()
-    real = broker_mod.verify_cockpit_signature
-
-    def slow(*a: Any, **kw: Any) -> Any:
-        entered.set()
-        release.wait(20)
-        return real(*a, **kw)
-
-    monkeypatch.setattr(broker_mod, "verify_cockpit_signature", slow)
-    base, httpd = _serve(w.qdir)
-    try:
-        row = _tray_row(base)
-        status, out = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
-                                   "row_id": row["id"], "row_version": row["version"], "params": {"text": "slow"}})
-        assert status == 200, out
-        pend = _call(base, f"/cockpit/pending/{out['pending_id']}")[1]
-        ad, cdj, der = w.phone.assertion(_unb64u(pend["challenge"]), origin=base)
-        done: dict = {}
-        t = threading.Thread(target=lambda: done.update(r=_call(
-            base, f"/cockpit/pending/{out['pending_id']}/signature",
-            {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad), "client_data_json": _b64u(cdj),
-             "signature": _b64u(der)})))
-        t.start()
-        try:
-            assert entered.wait(20)
-            status, board = _call(base, "/app/board.json", timeout=3)
-            assert status == 200, board
-            status, again = _call(base, f"/cockpit/pending/{out['pending_id']}", timeout=3)
-            assert status == 200 and again["state"] == "WAITING", again
-        finally:
-            release.set()
-            t.join(30)
-        assert done["r"][0] == 200 and done["r"][1]["state"] == "COMMITTED", done
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
 def test_the_broker_pins_a_localhost_passkey_to_the_phone_ports_origin(world):
@@ -631,96 +476,10 @@ def test_the_broker_pins_a_localhost_passkey_to_the_phone_ports_origin(world):
     assert done["state"] == "COMMITTED"
 
 
-def test_a_run_tokens_transport_names_its_run(install):
-    # L-6 (codex): a restart's fresh run token is a fresh transport (its own cap and idempotency namespace)
-    from levain.phone_app import transport_of
-
-    a, b = transport_of("run", None, run_token="token-a"), transport_of("run", None, run_token="token-a")
-    assert a == b and a != transport_of("run", None, run_token="token-b") and a.startswith("run-")
-    assert "token" not in a and Broker.principal_base_of({"class": "device", "fingerprint": "SHA256:x",
-                                                           "transport": a}) == f"device:SHA256:x@{a}"
-    w = install
-    base, httpd = _serve(w.qdir)
-    try:
-        row = _tray_row(base)
-        status, out = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
-                                   "row_id": row["id"], "row_version": row["version"], "params": {"text": "run"}})
-        assert status == 200, out
-        assert CockpitDB(w.root).load(out["pending_id"]).principal \
-            == f"device:{w.phone.fingerprint}@{transport_of('run', None, run_token=_TOK)}"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
-def test_the_pending_read_answers_effective_state_and_the_persisted_signer(install, monkeypatch):
-    # L-1 (codex MED + complement LOW): an expired or decided pending gets no challenge; the signature's answer
-    # names the signer the journal persisted
-    import time
-
-    import levain.cockpit.broker as broker_mod
-    from datetime import timedelta
-
-    w = install
-    base, httpd = _serve(w.qdir)
-    try:
-        row = _tray_row(base)
-        verb = {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray", "row_id": row["id"],
-                "row_version": row["version"], "params": {"text": "signed"}}
-        status, out = _fire(base, verb)
-        assert status == 200, out
-        pend = _call(base, f"/cockpit/pending/{out['pending_id']}")[1]
-        ad, cdj, der = w.phone.assertion(_unb64u(pend["challenge"]), origin=base)
-        status, done = _call(base, f"/cockpit/pending/{out['pending_id']}/signature",
-                             {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad),
-                              "client_data_json": _b64u(cdj), "signature": _b64u(der)})
-        assert status == 200 and done["state"] == "COMMITTED" and done["signer_fp"] == w.phone.fingerprint, done
-        status, after = _call(base, f"/cockpit/pending/{out['pending_id']}")
-        assert status == 200 and after["state"] == "COMMITTED" and "challenge" not in after, after
-        # an expired pending, still stored WAITING while no broker ran, reads EXPIRED with no challenge
-        monkeypatch.setattr(broker_mod, "PENDING_TTL", timedelta(seconds=1))
-        row = _tray_row(base)
-        status, out = _fire(base, {**verb, "row_version": row["version"], "params": {"text": "late"}})
-        assert status == 200, out
-        time.sleep(1.2)
-        status, late = _call(base, f"/cockpit/pending/{out['pending_id']}")
-        assert status == 200 and late["state"] == "EXPIRED" and "challenge" not in late, late
-        ad, cdj, der = w.phone.assertion(P.challenge(late["record_text"].encode(), COCKPIT_PHONE_NAMESPACE),
-                                         origin=base)
-        status, done = _call(base, f"/cockpit/pending/{out['pending_id']}/signature",
-                             {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad),
-                              "client_data_json": _b64u(cdj), "signature": _b64u(der)})
-        assert status == 200 and done["state"] == "EXPIRED" and done["signer_fp"] is None, done
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
-def test_the_pending_read_keeps_one_journal_reader(install, monkeypatch):
-    # L-7 (complement): one journal reader for the port's pending reads, never a new opener (and schema check) per GET
-    import levain.cockpit.firejournal as fj
-
-    w = install
-    made: list = []
-
-    class Counting(fj.CockpitDB):
-        def __init__(self, *a: Any, **kw: Any) -> None:
-            made.append(a[0] if a else kw.get("data_root"))
-            super().__init__(*a, **kw)
-
-    base, httpd = _serve(w.qdir)
-    try:
-        row = _tray_row(base)
-        status, out = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
-                                   "row_id": row["id"], "row_version": row["version"], "params": {"text": "x"}})
-        assert status == 200, out
-        monkeypatch.setattr(fj, "CockpitDB", Counting)
-        for _ in range(3):
-            assert _call(base, f"/cockpit/pending/{out['pending_id']}")[0] == 200
-        assert len(made) <= 1, made
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
 # --- K8a L3 round 1 fixes (k8a/L3_r1_TRIAGE.md K-1..K-7) ------------------------------------------------------------
@@ -740,117 +499,8 @@ def test_a_cancel_from_another_transport_never_takes_the_reserved_slot(world):
     assert w.b.cancel(phones[0], credential=w.dev)["state"] == "WAITING"
 
 
-def test_a_retried_signature_after_a_revoke_answers_the_persisted_outcome(install, monkeypatch):
-    # K-4 (codex MED): the signature committed but its answer was lost on the phone's network; before the retry the
-    # passkey is revoked, or the authority cannot be read. The retry of the same assertion gets the persisted terminal
-    # outcome and signer, applying nothing and verifying nothing new; a WAITING pending still needs the full check
-    from levain.phone_app import PhoneApp, PhoneAppError
-    from tests.cockpit_authority_rig import revoke_any
-
-    w = install
-    base, httpd = _serve(w.qdir)
-    try:
-        row = _tray_row(base)
-        status, out = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
-                                   "row_id": row["id"], "row_version": row["version"], "params": {"text": "once"}})
-        assert status == 200, out
-        pid = out["pending_id"]
-        pend = _call(base, f"/cockpit/pending/{pid}")[1]
-        ad, cdj, der = w.phone.assertion(_unb64u(pend["challenge"]), origin=base)
-        body = {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad), "client_data_json": _b64u(cdj),
-                "signature": _b64u(der)}
-        status, first = _call(base, f"/cockpit/pending/{pid}/signature", body)
-        assert status == 200 and first["state"] == "COMMITTED", first
-        # a second WAITING pending, signed only after the revoke: refused, nothing applied
-        row = _tray_row(base)
-        status, late = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
-                                    "row_id": row["id"], "row_version": row["version"], "params": {"text": "late"}})
-        assert status == 200, late
-        lpend = _call(base, f"/cockpit/pending/{late['pending_id']}")[1]
-        revoke_any(CockpitDB(w.root), w.phone)                              # type: ignore[arg-type]
-        status, again = _call(base, f"/cockpit/pending/{pid}/signature", body)
-        assert status == 200 and again["state"] == "COMMITTED" and again["replay"] is True, again
-        assert again["signer_fp"] == w.phone.fingerprint, again
-        ad, cdj, der = w.phone.assertion(_unb64u(lpend["challenge"]), origin=base)
-        status, no = _call(base, f"/cockpit/pending/{late['pending_id']}/signature",
-                           {**body, "authenticator_data": _b64u(ad), "client_data_json": _b64u(cdj),
-                            "signature": _b64u(der)})
-        assert status == 422 and no["error"] == "no_passkey", no
-        assert _call(base, f"/cockpit/pending/{late['pending_id']}")[1]["state"] == "WAITING"
-
-        # an authority that cannot be read now: the terminal retry still answers, the WAITING one is a 503
-        def unreadable(self: Any, cockpit: Any) -> None:
-            raise PhoneAppError(503, "authority_unreadable", "cannot be read now")
-
-        monkeypatch.setattr(PhoneApp, "_governed_refusal", unreadable)
-        status, again = _call(base, f"/cockpit/pending/{pid}/signature", body)
-        assert status == 200 and again["state"] == "COMMITTED" and again["signer_fp"] == w.phone.fingerprint, again
-        status, no = _call(base, f"/cockpit/pending/{late['pending_id']}/signature",
-                           {**body, "authenticator_data": _b64u(ad), "client_data_json": _b64u(cdj),
-                            "signature": _b64u(der)})
-        assert status == 503 and no["error"] == "authority_unreadable", no
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
-def test_concurrent_signatures_never_take_the_read_slots(install, monkeypatch):
-    # K-3 (codex MED, complement LOW 4): signatures for several pendings at once each held a read slot while waiting on
-    # the write lock, so the board answered 503 for as long as ssh-keygen ran. A cockpit write now runs one at a time on
-    # its own gate, never a read slot, and a queued writer waits a bounded time, then answers busy (503)
-    import time
-
-    import levain.cockpit.broker as broker_mod
-    import levain.phone_server as ps
-
-    monkeypatch.setattr(ps, "_WRITE_WAIT", 1.0)
-    w = install
-    entered, release = threading.Event(), threading.Event()
-    real = broker_mod.verify_cockpit_signature
-
-    def slow(*a: Any, **kw: Any) -> Any:
-        entered.set()
-        release.wait(20)
-        return real(*a, **kw)
-
-    base, httpd = _serve(w.qdir)
-    try:
-        bodies = []
-        for i in range(ps._MAX_INFLIGHT + 1):
-            row = _tray_row(base)
-            status, out = _fire(base, {"fingerprint": w.phone.fingerprint, "verb": "spore_update", "panel_id": "tray",
-                                       "row_id": row["id"], "row_version": row["version"], "params": {"text": f"c{i}"}})
-            assert status == 200, out
-            pend = _call(base, f"/cockpit/pending/{out['pending_id']}")[1]
-            ad, cdj, der = w.phone.assertion(_unb64u(pend["challenge"]), origin=base)
-            bodies.append((out["pending_id"], {"fingerprint": w.phone.fingerprint, "authenticator_data": _b64u(ad),
-                                               "client_data_json": _b64u(cdj), "signature": _b64u(der)}))
-        monkeypatch.setattr(broker_mod, "verify_cockpit_signature", slow)
-        got: dict = {}
-        threads = [threading.Thread(target=lambda p=p, b=b: got.update({p: _call(base, f"/cockpit/pending/{p}/signature",
-                                                                                     b)})) for p, b in bodies]
-        for t in threads:
-            t.start()
-        try:
-            assert entered.wait(20)
-            time.sleep(0.3)                    # the other signatures reach their wait
-            for _ in range(3):
-                status, board = _call(base, "/app/board.json", timeout=3)
-                assert status == 200, board
-            # each queued writer is answered busy within its bound while the first still verifies
-            deadline = time.monotonic() + 10
-            while len(got) < len(bodies) - 1 and time.monotonic() < deadline:
-                time.sleep(0.1)
-            busy = [r for r in got.values() if r[0] == 503]
-            assert len(busy) == len(bodies) - 1 and all(r[1]["error"] == "busy" for r in busy), got
-        finally:
-            release.set()
-            for t in threads:
-                t.join(30)
-        assert sum(1 for r in got.values() if r[0] == 200 and r[1]["state"] == "COMMITTED") == 1, got
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
 def test_levainsign_signs_once_tells_unknown_after_a_send_and_holds_an_open_review():

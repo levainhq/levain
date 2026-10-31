@@ -162,106 +162,18 @@ def test_a_stale_cockpit_answer_redraws_the_band_says_why_and_records_nothing(tm
 
 # --- the phone's Needs-you list -----------------------------------------------------------------------------------------
 
-from contextlib import contextmanager  # noqa: E402
-import threading  # noqa: E402
 
-from levain.phone_server import make_phone_server  # noqa: E402
-from tests.test_phone_server import _TOK  # noqa: E402
 
 PHONE_READY = "document.getElementById('status').textContent !== 'reading the queue…' && 1"
 PHONE_ROWS = "document.querySelectorAll('#requests [data-band-row]').length"
 
 
-@contextmanager
-def _phone(qdir: Path):
-    httpd = make_phone_server(qdir, "localhost", port=0, token=_TOK, dispatch_dir=qdir)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://localhost:{httpd.server_address[1]}"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=5)
 
 
-@needs_browser
-def test_the_phone_lists_the_band_by_number_and_the_shorthand_box_answers_it(tmp_path: Path, lh) -> None:
-    shots = _shot_dir(tmp_path)
-    store = QuestionStore(lh)
-    q1, q2 = _file(store, "Which retry policy?"), _file(store, "Ship the sweep fix tonight?", rec="fix")
-    with _phone(lh) as url:
-        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
-            PHONE,
-            {"until": PHONE_READY},
-            {"until": f"{PHONE_ROWS} === 2 && 1", "ms": 30000},
-            {"shot": str(shots / "phone_needs_band.png"), "full": True},
-            {"eval": "[...document.querySelectorAll('#requests [data-band-row]')].map(r => r.querySelector('.band-num').textContent)"},
-            {"eval": "[...document.querySelectorAll('#requests .ask .band-num')].map(b => b.textContent)"},
-            {"eval": "document.documentElement.scrollWidth <= window.innerWidth"},
-            {"eval": "(() => { const b = document.querySelector('.band-box'); b.value = '1b'; b.dispatchEvent(new Event('input')); document.querySelector('[data-band] .band-send').click(); return 1; })()"},
-            {"until": "/recorded/.test((document.querySelector('[data-band] .note') || {}).textContent || '') && 1", "ms": 30000},
-            {"until": f"{PHONE_ROWS} === 1 && 1", "ms": 30000},
-            {"shot": str(shots / "phone_needs_band_after.png"), "full": True},
-        ])
-    v = out["values"]
-    assert v[3] == ["1", "2"] and v[4] == ["1", "2"], v           # the band numbers lead, on the band and on the question cards
-    assert v[5] is True, v
-    a = _answer(store, q1.n)
-    assert (a.kind, a.value, a.channel) == ("option", "exp", "phone")
-    assert _answer(store, q2.n) is None
-    with sqlite3.connect(store.path) as c:
-        assert c.execute("SELECT via, viewer FROM answer_context WHERE question_id = ?", (q1.id,)).fetchone() == ("phone", "phone:run")
 
 
-@needs_browser
-def test_a_phone_answer_from_a_stale_view_redraws_the_list_and_says_why(tmp_path: Path, lh) -> None:
-    shots = _shot_dir(tmp_path)
-    store = QuestionStore(lh)
-    q1 = _file(store, "Which retry policy?")
-    with _phone(lh) as url:
-        def other_tab() -> None:
-            import time
-            time.sleep(7)
-            _file(store, "A newer question arrives?")
-            band_view.band_payload(store, "phone:run")
-        t = threading.Thread(target=other_tab, daemon=True)
-        t.start()
-        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
-            PHONE,
-            {"until": PHONE_READY},
-            {"until": f"{PHONE_ROWS} === 1 && 1", "ms": 30000},
-            {"eval": "(() => { const b = document.querySelector('.band-box'); b.focus(); b.value = '1a'; b.dispatchEvent(new Event('input')); return 1; })()"},   # typing holds the page's own refresh
-            {"eval": "new Promise(r => setTimeout(r, 9500)).then(() => 1)"},
-            {"eval": "(document.querySelector('[data-band] .band-send').click(), 1)"},
-            {"until": "/changed since it was shown/.test((document.querySelector('[data-band] .note') || {}).textContent || '') && 1", "ms": 30000},
-            {"until": f"{PHONE_ROWS} === 2 && 1", "ms": 30000},
-            {"shot": str(shots / "phone_needs_band_stale.png"), "full": True},
-            {"eval": "document.querySelector('.band-box').value"},
-            {"eval": "(document.querySelector('[data-band] .band-send').click(), 1)"},
-            {"until": f"{PHONE_ROWS} === 1 && 1", "ms": 30000},
-        ])
-        t.join(timeout=5)
-    assert out["values"][8] == "1a", out["values"]                  # the words are kept across the redraw
-    assert _answer(store, q1.n).value == "fix"                       # the second send, from the fresh view
 
 
-@needs_browser
-def test_the_old_question_card_still_answers_an_item_with_no_band_number(tmp_path: Path, lh) -> None:
-    """The per-question routes stay: a question the page was never shown a band number for (the band could not be
-    recorded, here a view-less listing) is still answered by its own card."""
-    store = QuestionStore(lh)
-    q1 = _file(store, "Which retry policy?")
-    with _phone(lh) as url:
-        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
-            PHONE,
-            {"until": PHONE_READY},
-            {"until": "document.querySelector('#requests .ask') && 1", "ms": 30000},
-            {"eval": "(() => { const b = [...document.querySelectorAll('#requests .ask button')].find(x => /fail loud/.test(x.textContent)); b.click(); return 1; })()"},
-            {"until": "/answered/.test((document.querySelector('#requests .ask .note') || {}).textContent || '') && 1", "ms": 30000},
-        ])
-    assert out["values"][-1] is not None
-    assert _answer(store, q1.n).value == "none"
 
 
 # --- L3 r2 fix round: a success reply that carries refusals or sheets is not read as plain success -------------------------
@@ -327,74 +239,10 @@ def test_a_cockpit_sheets_only_answer_does_not_read_as_success_and_frees_the_con
     assert v[-1] is False, v                                         # re-enabled without waiting on a redraw that failed
 
 
-@needs_browser
-def test_a_phone_mixed_answer_names_the_authority_item_and_keeps_its_words(tmp_path: Path, lh) -> None:
-    store = QuestionStore(lh)
-    q1, q2 = _file(store, "Which retry policy?"), _authority(store)
-    with _phone(lh) as url:
-        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
-            PHONE,
-            {"until": PHONE_READY},
-            {"until": f"{PHONE_ROWS} === 2 && 1", "ms": 30000},
-            {"eval": TYPE_AND_SEND % (".band-box", "1a 2a", "[data-band] .band-send")},
-            {"until": "/recorded/.test((document.querySelector('[data-band] .note') || {}).textContent || '') && 1", "ms": 30000},
-            {"eval": "new Promise(r => setTimeout(r, 1500)).then(() => 1)"},
-            {"eval": "(document.querySelector('[data-band] .note') || {}).textContent"},
-            {"eval": "document.querySelector('.band-box').value"},
-        ])
-    v = out["values"]
-    assert _answer(store, q1.n).value == "fix" and _answer(store, q2.n) is None
-    assert "recorded: 1a" in v[-2] and "2 needs your signature" in v[-2] and "sign sheet" in v[-2], v
-    assert "2a" in v[-1] and "1a" not in v[-1], v
 
 
-@needs_browser
-def test_a_phone_sheets_only_answer_does_not_read_as_success(tmp_path: Path, lh) -> None:
-    store = QuestionStore(lh)
-    _authority(store)
-    with _phone(lh) as url:
-        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
-            PHONE,
-            {"until": PHONE_READY},
-            {"until": f"{PHONE_ROWS} === 1 && 1", "ms": 30000},
-            {"eval": TYPE_AND_SEND % (".band-box", "1a", "[data-band] .band-send")},
-            {"until": "/nothing recorded/.test((document.querySelector('[data-band] .note') || {}).textContent || '') && 1", "ms": 30000},
-            {"eval": "(document.querySelector('[data-band] .note') || {}).textContent"},
-            {"eval": "document.querySelector('[data-band] .note').className"},
-            {"eval": "document.querySelector('.band-box').value"},
-        ])
-    v = out["values"]
-    assert "1 needs your signature" in v[-3], v
-    assert "ok" not in v[-2].split(), v                              # never the success style
-    assert v[-1] == "1a", v
 
 
-@needs_browser
-def test_a_phone_stale_answer_frees_the_controls_even_when_the_redraw_fails(tmp_path: Path, lh) -> None:
-    store = QuestionStore(lh)
-    _file(store, "Which retry policy?")
-    with _phone(lh) as url:
-        def other_tab() -> None:
-            import time
-            time.sleep(7)
-            _file(store, "A newer question arrives?")
-            band_view.band_payload(store, "phone:run")
-        t = threading.Thread(target=other_tab, daemon=True)
-        t.start()
-        out = _drive(tmp_path, f"{url}/#phone_token={_TOK}", [
-            PHONE,
-            {"until": PHONE_READY},
-            {"until": f"{PHONE_ROWS} === 1 && 1", "ms": 30000},
-            {"eval": "(() => { const b = document.querySelector('.band-box'); b.focus(); b.value = '1a'; b.dispatchEvent(new Event('input')); return 1; })()"},
-            {"eval": "new Promise(r => setTimeout(r, 9500)).then(() => 1)"},
-            {"eval": BLOCK_READS},
-            {"eval": "(document.querySelector('[data-band] .band-send').click(), 1)"},
-            {"until": "/changed since it was shown/.test((document.querySelector('[data-band] .note') || {}).textContent || '') && 1", "ms": 30000},
-            {"eval": "new Promise(r => setTimeout(r, 1500)).then(() => 1)"},
-            {"eval": "document.querySelector('.band-box').disabled || document.querySelector('[data-band] .band-send').disabled"},
-        ])
-        t.join(timeout=5)
-    assert out["values"][-1] is False, out["values"]
 
 
 @needs_browser

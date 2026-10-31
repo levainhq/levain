@@ -12,9 +12,8 @@ import pytest
 from levain.coordinator import morning, review
 from levain.coordinator.envelopes import EnvelopeStore
 from levain.coordinator.phone import REVIEW_CLEARED_SHOWN, REVIEW_OPEN_SHOWN
-from tests.test_coordinator_phone import coord_for, device_token, sid
+from tests.test_coordinator_phone import coord_for, sid
 from tests.test_dispatch_phone import repo, world  # noqa: F401  (fixtures)
-from tests.test_phone_dispatch import _serve
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -105,7 +104,7 @@ def test_a_queue_or_card_that_cannot_be_read_is_its_own_note_and_never_an_empty_
     assert listed["coord_store_read"] is True and listed["coord_store_id"] == store.store_id()
 
 
-def test_the_phone_port_writes_the_queue_only_through_its_device_route() -> None:
+def test_no_phone_module_calls_the_stores_review_transitions_and_the_verb_kernel_is_plain_only() -> None:
     """The one review write on the phone port is ``coord_review`` (a paired device: c4mut,
     tests/test_review_clear_paths.py), and it is only a transport: the clear and the reopen are the cockpit verb
     kernel's (``levain.cockpit.verbs``, through ``PhoneApp.fire``: c4mut fix r1 F1). Neither the phone port, the phone
@@ -119,36 +118,12 @@ def test_the_phone_port_writes_the_queue_only_through_its_device_route() -> None
     for mod in (phone, phone_server, phone_app):
         src = Path(mod.__file__).read_text(encoding="utf-8")
         assert "clear_item" not in src and "reopen_item" not in src, mod.__name__
-    assert "fire(" in inspect.getsource(phone_server._PhoneServer.coord_review)
     assert "plain_only=True" in inspect.getsource(verbs._review_fire)
 
 
 # --- L3 r1 fixes (c4c-fix) -----------------------------------------------------------------------------------------
 
 
-def test_the_consent_poll_carries_no_coordinator_view_and_the_queue_is_read_on_its_own_route(world) -> None:
-    """Poll cost (codex HIGH): /consent.json is what it was; /coord.json is asked for only while the tab is shown."""
-    store = EnvelopeStore(world["qdir"])
-    _item(store, 1)
-    dev = device_token(world["qdir"])
-    with _serve(world["qdir"], world["qdir"]) as (base, _):
-        import json
-        import urllib.error
-        import urllib.request
-
-        def get(route: str, token: str | None):
-            req = urllib.request.Request(base + route, headers={"X-Levain-Phone-Token": token} if token else {})
-            try:
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    return r.status, json.loads(r.read())
-            except urllib.error.HTTPError as exc:
-                return exc.code, json.loads(exc.read() or b"{}")
-
-        status, consent = get("/consent.json", dev)
-        assert status == 200 and not [k for k in consent if k.startswith(("coord_review", "coord_morning"))], list(consent)
-        status, coord = get("/coord.json", dev)
-        assert status == 200 and coord["coord_review"]["open_total"] == 1 and coord["coord_morning"]["review_open"] == 1
-        assert get("/coord.json", None)[0] == 403 and get("/coord.json", "not-a-token")[0] == 403
 
 
 def test_the_listing_does_not_read_the_queue(world, monkeypatch) -> None:

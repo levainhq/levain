@@ -62,8 +62,9 @@ def _call(port: int, method: str, path: str, body: Any = None, token: str | None
 
 
 def _pair(port: int, token: str = T, label: str = "ipad", proxied: bool = False) -> tuple[str, str]:
+    # the owner key mints on loopback only (W1b L-1); a paired token mints through the proxy
     st, off, _ = _call(port, "POST", "/cockpit/pair/offer", {"label": label}, token=token,
-                       headers=PROXY if proxied else None)
+                       headers=PROXY if proxied and token != T else None)
     assert st == 200, off
     st, cl, hdrs = _call(port, "POST", "/cockpit/pair/claim", {"code": off["code"]},
                          headers=PROXY if proxied else None)
@@ -128,7 +129,7 @@ def test_rp10_1_offer_revoke_and_list_need_a_token_loopback_and_proxied_and_the_
 def test_rp10_2_a_paired_token_makes_a_c1_write_and_a_broker_backed_t2(src) -> None:
     """RP-1's class: a ':' in the credential name would 500 every broker write while reads looked healthy."""
     with _serve(src) as (port, _h):
-        device, tok = _pair(port, proxied=True)
+        device, tok = _pair(port)       # the owner key pairs on loopback only (L-1); the paired token then travels proxied
         st, man, _ = _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)
         assert st == 200 and man["credential"]["name"] == PAIRED_PREFIX + device
         row = _tray_row(port, tok)
@@ -237,8 +238,8 @@ def test_rt1_ru2_a_paired_request_through_every_gate_class_in_standby_is_503_wit
             assert (st, out.get("error")) == (503, "broker_unavailable"), (path, st, out)
             assert "token" not in json.dumps(out).lower(), out
             assert hdrs.get("retry-after") == "2" and hdrs.get("connection") == "close", hdrs   # RU-2
-        # a surface token is unaffected by the standby broker
-        assert _call(port, "GET", "/cockpit/manifest.json", token=T, headers=PROXY)[0] == 200
+        # a surface token is unaffected by the standby broker (the owner key, on loopback: it is refused proxied, L-1)
+        assert _call(port, "GET", "/cockpit/manifest.json", token=T)[0] == 200
 
 
 def test_ru5_the_cockpit_read_path_with_its_inner_catch_answers_503_not_500(src, quick_wait, monkeypatch) -> None:
@@ -280,7 +281,8 @@ def test_ru1_where_paired_tokens_cannot_exist_a_junk_header_is_a_plain_miss(src,
 # --- RT-3 ----------------------------------------------------------------------------------------------------------
 
 def test_rt3_a_misshapen_header_is_never_looked_up_and_a_full_lookup_set_is_503(src, monkeypatch) -> None:
-    with _serve(src) as (port, httpd):
+    surface = "flowconnect-surface-token-0123456789abcdef"      # a named surface: the owner key is refused proxied (L-1)
+    with _serve(src, surface_tokens={"browser": T, "flowconnect": surface}) as (port, httpd):
         _d, tok = _pair(port)
         db = httpd.broker.active_db()
         looked: list[str] = []
@@ -299,7 +301,7 @@ def test_rt3_a_misshapen_header_is_never_looked_up_and_a_full_lookup_set_is_503(
         try:
             st, out, _ = _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)
             assert (st, out.get("error")) == (503, "broker_unavailable")
-            assert _call(port, "GET", "/cockpit/manifest.json", token=T, headers=PROXY)[0] == 200
+            assert _call(port, "GET", "/cockpit/manifest.json", token=surface, headers=PROXY)[0] == 200
         finally:
             for _ in range(web_server._PAIR_VERIFY_SLOTS):
                 httpd.pair_verify_gate.release()
@@ -403,9 +405,10 @@ def test_rp7_rs5_box_side_pair_and_revoke_all(src, capsys) -> None:
 
     with _serve(src) as (port, httpd):
         root = httpd.broker.data_root
-        assert main(["cockpit", "pair", "--data-root", str(root)]) == 1      # no journal yet: refused, nothing made
+        assert main(["cockpit", "pair", "--data-root", str(root), "--revoke-all"]) == 1   # no journal: nothing to end
         assert "no cockpit journal" in capsys.readouterr().err and not (root / "cockpit.db").exists()
-        assert _call(port, "GET", "/cockpit/manifest.json")[0] == 200       # the serve's first use opens it
+        # W1b L3 A: a mint on a root no serve has opened yet starts the journal itself (the box's mint is an
+        # off-loopback cockpit's first credential), and the running serve then opens that journal as its own
         assert main(["cockpit", "pair", "--data-root", str(root), "--label", "phone", "--print",
                      "--url", f"http://127.0.0.1:{port}/"]) == 0
         link = capsys.readouterr().out.strip()
