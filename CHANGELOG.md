@@ -16,14 +16,19 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Removed
 - **The phone port's run token and its device registry.** `levain consent phone` serves only the redirect page now and
-  refuses without `--redirect-to`; `--token-file` is gone and `--link-file` holds `{page, pid}` with no token. The
+  refuses without `--redirect-to`; `--token-file`, `--queue-dir` and `--sign-namespace` are gone from it (argparse
+  refuses them), and `--link-file` holds `{page, pid}` with no token, so a script's statement is no longer signed on
+  the phone port. The
   token-gated phone routes, `/webpush/pair`, `/webpush/pair/redeem`, the `?pair=` rewrite of `/app.webmanifest` and
   `levain ping pair`, `levain ping devices` and `levain ping revoke` are gone; pair a phone to the cockpit with
   `levain cockpit pair`. A push subscription is stored only under a paired cockpit device, a row under any other
   device is never sent to, and `POST /webpush/subscribe` with no device is 403. The service worker holds no credential: a
   tap writes the ping's id into its own `levain-sw-2` database and the page records the open; activating it deletes the
-  old `levain-sw` database (the phone token's) and every `levain-` Cache Storage name it does not keep. The held-question
-  ticker that ran inside the phone server no longer has a host. Covered by tests; not run on a real phone or a real push.
+  old `levain-sw` database (the phone token's) and every `levain-` Cache Storage name it does not keep. The periodic
+  ticker that released held pings from inside the phone server is retired with it: release is event-driven, run by the
+  gate hook on every call and by the send child after each push, so a ping released by a quiet running out (or the desk
+  going idle) waits for the next gate-hook call or push, and stays held while no agent calls. Covered by tests; not run
+  on a real phone or a real push.
 
 ### Fixed
 - **A cockpit with no question store no longer draws the Needs you band, or a note that it could not be recorded.** An

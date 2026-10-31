@@ -73,6 +73,23 @@ def test_a_subscribe_with_no_device_is_403_and_the_store_refuses_a_device_that_i
     assert status == 403 and store.live_subscriptions() == []
 
 
+def test_a_paired_device_subscribe_with_no_journal_is_a_caller_fault_not_a_403(tmp_path: Path) -> None:
+    """Reproduced red on 69834363 (L3 r1, deepseek MED): the route's one ``except ValueError`` answered a paired
+    device whose caller passed no pairing journal with 403 "only a paired device turns pings on", the same words a
+    phone with no pairing gets. A missing journal is the caller's bug: a 500 with its own code and words."""
+    status, data, _ = routes.handle("POST", "/webpush/subscribe", {}, _sub(3), queue_dir=tmp_path, authorized=True,
+                                    device_id="paired-d1")
+    body = json.loads(data)
+    assert status == 500 and body["error"] == "no_pairing_journal", (status, body)
+    assert "journal" in body["message"]
+    status, data, _ = routes.handle("POST", "/webpush/subscribe", {}, _sub(4), queue_dir=tmp_path, authorized=True,
+                                    device_id="d-abc", journal=tmp_path)
+    body = json.loads(data)
+    assert (status, body["error"], body["message"]) == (403, "credential_required",
+                                                        "only a paired device turns pings on")
+    assert PushStore(tmp_path).live_subscriptions() == []
+
+
 def test_a_subscription_row_under_a_device_that_is_not_paired_is_never_live_or_sent_to(tmp_path: Path,
                                                                                        monkeypatch) -> None:
     """Reproduced red on a69ac9c8: ``live_rows`` joined the phone port's own ``devices`` table, so a probe row under a

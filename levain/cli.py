@@ -2642,18 +2642,6 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                                "`tailscale serve` line. Changes nothing in Tailscale itself.")
     cs_phone.add_argument("--port", type=int, default=None,
                           help=f"The loopback port (default {_phone_port_default()}).")
-    cs_phone.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
-                          help=queue_help + " Dispatch jobs are read from the same directory: file them with "
-                          "`levain dispatch file --dispatch-dir` set to it.")
-    cs_phone.add_argument("--sign-namespace", dest="sign_namespaces", action="append", default=None,
-                          type=_sign_namespace, metavar="NS",
-                          help="Also list the sign requests filed in the queue's sign/ directory in namespace NS "
-                               "(repeatable), for a user-verified passkey signature (Face ID, Touch ID or the device "
-                               "passcode, as the authenticator reports it). levain checks user verification; a "
-                               "caller's `ssh-keygen -Y verify -n NS` checks the key, the message and the namespace "
-                               "only. The queue dir's claude_code.json must name the cockpit (cockpit_data_root). A "
-                               "namespace beginning 'levain', one levain verifies in, or git, file or email is "
-                               "refused.")
     cs_phone.add_argument("--link-file", dest="link_file", type=Path, default=None,
                           help="Also write the cockpit origin this run redirects to into FILE (JSON "
                                "{page, pid}, mode 0600, no token), for a caller that builds a sign link onto it; "
@@ -2662,7 +2650,7 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                           help="Serve ONLY a redirect: every link the phone already holds for this port opens on "
                                "the cockpit at ORIGIN (https://<name>:<port>), a sign link on that request's sheet "
                                "(/sign/<id>), its token dropped and never forwarded. Nothing else is served and no "
-                               "token is made. Required. Takes no --queue-dir or --sign-namespace.")
+                               "token is made. Required.")
     cs_phone.set_defaults(func=_cmd_consent_phone)
 
     from levain.consent.sign_setting import add_parser as add_signed_answers_parser
@@ -2722,15 +2710,6 @@ def _phone_port_default() -> int:
     return DEFAULT_PHONE_PORT
 
 
-def _sign_namespace(text: str) -> str:
-    from levain.consent.sign import namespace_problem
-
-    problem = namespace_problem(text)
-    if problem is not None:
-        raise argparse.ArgumentTypeError(problem)
-    return text
-
-
 def _cmd_consent_phone(args: argparse.Namespace) -> int:
     from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_redirect
 
@@ -2738,11 +2717,6 @@ def _cmd_consent_phone(args: argparse.Namespace) -> int:
         print("levain consent phone serves only the redirect now: pass --redirect-to <the cockpit's origin>. The "
               "phone port's run token is gone; pair a phone to the cockpit with `levain cockpit pair`.",
               file=sys.stderr)
-        return 2
-    full = [flag for flag, given in (("--queue-dir", args.queue_dir), ("--sign-namespace", args.sign_namespaces))
-            if given]
-    if full:
-        print(f"--redirect-to serves only the redirect: drop {', '.join(full)}", file=sys.stderr)
         return 2
     return run_phone_redirect(args.redirect_to, name=args.name, tailscale=args.tailscale,
                               port=DEFAULT_PHONE_PORT if args.port is None else args.port,

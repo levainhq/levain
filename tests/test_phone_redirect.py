@@ -209,12 +209,16 @@ def test_the_old_run_token_is_refused_consent_phone_needs_redirect_to(capsys) ->
     capsys.readouterr()
 
 
-def test_the_cli_refuses_redirect_with_the_full_ports_options(capsys) -> None:
+def test_the_full_ports_options_no_longer_parse(capsys) -> None:
+    """L3 r1 (complement LOW): --queue-dir and --sign-namespace only ever answered exit 2 after W1b; they are gone
+    from the parser, so argparse refuses them (exit 2, "unrecognized arguments") before anything runs."""
     from levain.cli import main
 
     for extra in (["--sign-namespace", "flow-np"], ["--queue-dir", "/tmp"]):
-        assert main(["consent", "phone", "--name", "b.ts.net", "--redirect-to", "https://b.ts.net:8443", *extra]) == 2
-        assert "--redirect-to" in capsys.readouterr().err
+        with pytest.raises(SystemExit) as parsed:
+            main(["consent", "phone", "--name", "b.ts.net", "--redirect-to", "https://b.ts.net:8443", *extra])
+        assert parsed.value.code == 2
+        assert "unrecognized arguments" in capsys.readouterr().err
 
 
 # -- the redirect in a browser --------------------------------------------------------------------------------------

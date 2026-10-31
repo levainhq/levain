@@ -15,7 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from levain.webpush import ece, vapid
-from levain.webpush.store import DeviceNotLive, PushStore
+from levain.webpush.store import PAIRED_PREFIX, DeviceNotLive, PushStore
 
 STATIC = Path(__file__).resolve().parent / "static"
 _STATIC_FILES = {
@@ -139,15 +139,17 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
         if refusal is not None:
             return refusal
         endpoint, p256dh, auth = obj["endpoint"], obj["keys"]["p256dh"], obj["keys"]["auth"]
-        if device_id is None:
+        if not isinstance(device_id, str) or not device_id.startswith(PAIRED_PREFIX):
             # only a paired device subscribes: no credential without a device (the owner key included) becomes one
             return _err(403, "credential_required", "only a paired device turns pings on")
+        if not journal:
+            # the device is paired; the caller failed to say which pairing journal holds it (a server bug, not the
+            # phone's fault, so not the 403 a phone with no pairing gets)
+            return _err(500, "no_pairing_journal", "the server named no pairing journal for this paired device")
         try:
             return _json(200, {"id": store.add_subscription(endpoint, p256dh, auth, device_id, journal=journal)})
         except DeviceNotLive:
             return _err(403, "credential_required", "this device was revoked")
-        except ValueError:
-            return _err(403, "credential_required", "only a paired device turns pings on")
     if method == "POST" and path == "/webpush/unsubscribe":
         obj = _body_json(body)
         endpoint = valid_endpoint(obj.get("endpoint")) if obj else None

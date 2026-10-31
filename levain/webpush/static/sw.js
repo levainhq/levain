@@ -89,10 +89,15 @@ self.addEventListener('notificationclick', (e) => {
     }
     await self.clients.openWindow(url);
   })();
-  // the mark is local and best effort: a failed write loses one open's record, never the page
+  // the mark is local and best effort: a failed write loses one open's record, never the page. It is said on the
+  // console, not swallowed: a VersionError means the page opened `levain-sw-2` at a version other than this pin (1)
   const mark = (async () => {
     if (data.ping === undefined || data.ping === null) return;
-    try { await markOpened(data.ping); } catch (_) { return; }
+    try { await markOpened(data.ping); } catch (err) {
+      const why = err && err.name === 'VersionError' ? `${DB} is not at version 1 (the page/worker pin)` : String(err);
+      console.warn(`levain sw: the open of ping ${data.ping} was not recorded: ${why}`);
+      return;
+    }
     // after the write commits: a nudge only, no data; the page reads the store itself
     const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     for (const c of wins) c.postMessage({ type: 'levain-opened' });
