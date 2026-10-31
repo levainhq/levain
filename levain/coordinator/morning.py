@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from levain.autonomic.durable_sqlite import read_transaction
+from levain.cockpit.consent import utc_stamp
 from levain.coordinator import budget, deliver, review
 from levain.coordinator.store import CoordError, CoordStore
 
@@ -153,7 +155,7 @@ def _thread_of(conn: sqlite3.Connection, store: CoordStore, request_id: str, ses
     return ln.threads[0] if ln is not None and ln.role == "worker" and len(ln.threads) == 1 else None
 
 
-def _band(qdir: Path, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+def _band(qdir: Path, conn: sqlite3.Connection | None = None, numbering: bool = True) -> dict[str, Any]:
     """The NEEDS YOU band as the card carries it: ``{"text", "shown", "error"}``. Showing the band numbers its items
     (a first show, as ``levain band`` does); a band that cannot be rendered is said, never an empty band. ``conn``:
     the card's own coordinator snapshot, so the band and "waiting on you" are read from the same one."""
@@ -161,7 +163,7 @@ def _band(qdir: Path, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
     from levain.consent.questions import QuestionStore
 
     try:
-        r = band_view.render_full(QuestionStore(qdir), coord_conn=conn)
+        r = band_view.render_full(QuestionStore(qdir), coord_conn=conn, numbering=numbering)
     except Exception as exc:  # noqa: BLE001 - named on the card
         return {"text": "", "shown": [], "error": f"{type(exc).__name__}: {exc}"[:_FIELD]}
     return {"text": r.text, "shown": r.shown, "error": None}
@@ -170,7 +172,7 @@ def _band(qdir: Path, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
 PRESENCE_WINDOW_SECS = 24 * 3600
 
 
-def _presence(qdir: Path) -> dict[str, Any] | None:
+def _presence(qdir: Path, now: float | None = None) -> dict[str, Any] | None:
     """What an agent did to his presence word: the standing word when a seat or the coordinator set it, and the refusals
     in the last :data:`PRESENCE_WINDOW_SECS` from the presence log. ``None`` when there is neither."""
     import time
@@ -178,7 +180,8 @@ def _presence(qdir: Path) -> dict[str, Any] | None:
     from levain.webpush import presence
 
     word = presence.read_word(qdir)
-    now = time.time()
+    if now is None:
+        now = time.time()
     setter = word if word is not None and "by" in word and not presence.is_expired(word, now) else None
     cutoff = now - PRESENCE_WINDOW_SECS
     recent = [r for r in presence.read_log(qdir) if r["ts"] >= cutoff and isinstance(r.get("by"), dict)]
@@ -194,16 +197,19 @@ def _presence(qdir: Path) -> dict[str, Any] | None:
 
 
 def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Sequence[review.Item] | None = None,
-         review_total: int | None = None, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+         review_total: int | None = None, conn: sqlite3.Connection | None = None,
+         now: datetime | None = None) -> dict[str, Any]:
     """The morning card's data (display only; see the module docstring). Every section of the coordinator's store is
     read inside ONE read transaction on one read-only connection: ``conn`` when the caller holds one (its response is
     then made from its snapshot), else the card's own. ``items`` is a review queue the caller has already read
     (``review.list_items(store, include_cleared=True)`` or the open ones): the card shows its open items and does not
     read the queue again. ``review_total`` is the queue's open count when ``items`` is only a page of it (the card
-    then counts the queue, not the page)."""
+    then counts the queue, not the page). ``now`` (an aware datetime; default ``None`` = the store's clock and the
+    wall clock, as ever): the card stamps from it and the presence window is read at it, so the card is a pure
+    function of what it reads; given, the band is read WITHOUT numbering its items (nothing is written)."""
     if conn is None:
         with read_transaction(store.open_readonly) as own:
-            return card(store, queue_dir=queue_dir, items=items, review_total=review_total, conn=own)
+            return card(store, queue_dir=queue_dir, items=items, review_total=review_total, conn=own, now=now)
     qdir = Path(queue_dir) if queue_dir is not None else Path(store.directory)
     errors: list[str] = []
     try:
@@ -220,7 +226,15 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
         undecided = []
         errors.append(f"undecided: {exc}"[:_FIELD])
     budgets: list[dict[str, Any]] = []
-    now = store._stamp()
+    if now is None:
+        stamp = store._stamp()
+        epoch = None
+    else:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise CoordError("card(now=) must be an aware datetime")
+        stamp = utc_stamp(now)
+        epoch = now.timestamp()
+    now = stamp
     # one statement: a thread is open unless its latest state event says closed (as Thread.state reads it)
     open_threads = [r[0] for r in conn.execute(
         "SELECT t.thread_id FROM threads t WHERE COALESCE((SELECT e.value FROM thread_events e WHERE e.thread_id = "
@@ -248,9 +262,9 @@ def card(store: CoordStore, *, queue_dir: Path | str | None = None, items: Seque
     items_out = [{"item_id": i.item_id, "feed": i.feed, "thread_id": i.thread_id,
                   "authority_relevant": i.authority_relevant, "text": str(i.body.get("text", ""))[:_FIELD]}
                  for i in queue]
-    band = _band(qdir, conn)
+    band = _band(qdir, conn, numbering=epoch is None)
     try:
-        pres = _presence(qdir)
+        pres = _presence(qdir, epoch)
     except Exception as exc:  # noqa: BLE001 - named on the card
         pres = None
         errors.append(f"presence: {type(exc).__name__}: {exc}"[:_FIELD])

@@ -452,17 +452,21 @@ _READ_ERRORS = (StoreAbsent, sqlite3.Error, OSError, ValueError, CoordError, Dis
 
 
 def list_ready(store: CoordStore | Path | str, *, all: bool = False, repo: str | None = None,
-               sources: Mapping[str, Any] | None = None, generated: str | None = None) -> dict:
+               sources: Mapping[str, Any] | None = None, generated: str | None = None,
+               conn: sqlite3.Connection | None = None) -> dict:
     """The ready queue (SCHEMA §3 shape): the store's items plus any caller-read ``sources`` (the band's open rows,
     the seat roster, CI waits: C12 reads those), derived. Without ``all``, only effectively-ready items. A store that
-    cannot be read is named in ``unreadable`` (never "nothing waiting"); a store that was never made is no items."""
+    cannot be read is named in ``unreadable`` (never "nothing waiting"); a store that was never made is no items.
+    ``conn``: a read-only connection whose read transaction the caller already holds; the board is read on it (no
+    second open, one snapshot with the caller's other sections). Default ``None``: the board opens its own."""
     st = _store_of(store)
     merged: dict[str, Any] = dict(sources or {})
     given = merged.pop("unreadable", ())
     unreadable = [given] if isinstance(given, str) else [*given]
     rows: builtins.list = []
     try:
-        rows, diverged = _read(st, lambda conn: (_current(conn), _diverged(conn)))
+        read = lambda c: (_current(c), _diverged(c))  # noqa: E731
+        rows, diverged = read(conn) if conn is not None else _read(st, read)
         unreadable.extend(d.tag for d in diverged)      # shown at its state, and named: a write to it will refuse
     except StoreAbsent:
         if not _absent(st):

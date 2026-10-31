@@ -289,20 +289,22 @@ def _extra_lines(label: str, e: Extra, compact: bool) -> list[str]:
 
 
 def render_full(store: QuestionStore | None = None, *, deadline: float | None = None,
-                coord_conn: sqlite3.Connection | None = None) -> Rendered:
+                coord_conn: sqlite3.Connection | None = None, numbering: bool = True) -> Rendered:
     """:func:`render_with_closed` plus what the view row needs (:class:`Rendered`). ``deadline``
     (``time.monotonic()``; default now + HOOK_BUSY_MS) bounds EVERY wait of the render: the question snapshots, the
     authority sources' stores and a first-time setup of the question store; a store held past it is said ("! not
     read") or leaves numbers pending, never a stalled prompt. ``coord_conn``: a coordinator snapshot the caller holds
-    (the morning card's), read instead of a second one."""
+    (the morning card's), read instead of a second one. ``numbering=False``: a pure read: an item with no number yet is
+    listed ``new (number pending):`` and nothing is written (the default numbers it, one bounded write)."""
     store = store if store is not None else QuestionStore()
     gen = time.time_ns()                      # before the snapshot: a later render has a greater gen
     deadline = deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000
     with read_deadline(deadline):
-        return _render_full(store, gen, deadline, coord_conn)
+        return _render_full(store, gen, deadline, coord_conn, numbering)
 
 
-def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sqlite3.Connection | None) -> Rendered:
+def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sqlite3.Connection | None,
+                 numbering: bool = True) -> Rendered:
     items, numbers, closed = _read(store)
     foreign = _foreign(store)
     try:
@@ -325,7 +327,7 @@ def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sq
         filed[e.band_key] = e.filed
     new = [k for k, _ in entries if (numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)) is None]
     new.sort(key=lambda k: filed.get(k, ""))              # each source's own filed time; a stable sort keeps ties
-    if new:
+    if new and numbering:
         got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline)
         numbers = {**numbers, **{k: v for k, v in got.items() if isinstance(k, str)}}
         extra_numbers = {**extra_numbers, **{k: v for k, v in got.items() if isinstance(k, tuple)}}
@@ -893,7 +895,7 @@ def _finish(entries: list[tuple[dict[str, str], dict[str, Any]]], *, unread: boo
                         read_only)
 
 
-def _snapshot(store: Any, *, writable: bool, deadline: float | None = None) -> BandSnapshot:
+def _snapshot(store: Any, *, writable: bool, deadline: float | None = None, numbering: bool = True) -> BandSnapshot:
     """Read the open items once. It takes no viewer: recording a view is ``band_payload``'s, after this, so nothing
     viewer-dependent can reach ``queue``. Numbers the items that have none (D3: a headline is a show)."""
     gen = time.time_ns()                      # before the reads: a later snapshot has a greater gen
@@ -901,7 +903,7 @@ def _snapshot(store: Any, *, writable: bool, deadline: float | None = None) -> B
     with read_deadline(deadline):
         if _foreign(store):
             return _foreign_snapshot(store, writable, gen)
-        return _native_snapshot(store, writable, gen, deadline)
+        return _native_snapshot(store, writable, gen, deadline, numbering)
 
 
 def _foreign_snapshot(store: Any, writable: bool, gen: int) -> BandSnapshot:
@@ -923,7 +925,8 @@ def _foreign_snapshot(store: Any, writable: bool, gen: int) -> BandSnapshot:
                    hwm=max(nums, default=0), gen=gen, read_only=not (writable and can))
 
 
-def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: float) -> BandSnapshot:
+def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: float,
+                     numbering: bool = True) -> BandSnapshot:
     items, numbers, closed = _read(store)
     try:
         extras = read_extras(store.directory, store._clock, deadline=deadline)
@@ -943,7 +946,7 @@ def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: f
         filed[e.band_key] = e.filed
     new = [k for k, _ in order_in if (numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)) is None]
     new.sort(key=lambda k: filed.get(k, ""))
-    if new:                                   # a queue that is all numbered takes no write lock
+    if new and numbering:                     # a queue that is all numbered takes no write lock
         try:
             got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline)
         except Exception:  # noqa: BLE001 - those items stay unnumbered and the snapshot says so, as number_for_ping does
@@ -1011,6 +1014,17 @@ def band_payload(store: Any, viewer: str, deadline: float | None = None, writabl
                 "note": "the band could not be recorded just now", "queue": snap.queue, "read_only": snap.read_only}
     return {"seen_through": snap.hwm, "store_id": snap.store_id, "view_id": view_id, "items": snap.numbered(),
             "note": snap.note, "queue": snap.queue, "read_only": snap.read_only}
+
+
+def band_snapshot_readonly(store: Any, deadline: float | None = None) -> dict[str, Any]:
+    """The band as :func:`band_payload` reads it, with NO write to any store: no view is recorded (``view_id`` is
+    ``None``: nothing here binds an answer), no item is numbered (an open item with no number yet is listed with
+    ``n`` ``None`` and ``pending`` true), no store is set up. Every open item that could be read is in ``items``
+    (numbered or not), with no answer actions (``read_only``). ``queue`` is the same hash ``band_payload`` carries."""
+    snap = _snapshot(store, writable=False, deadline=deadline, numbering=False)
+    return {"seen_through": snap.hwm if snap.shown else None, "store_id": snap.store_id, "view_id": None,
+            "items": [it for _, it in snap.entries], "note": snap.note, "queue": snap.queue,
+            "pending": snap.pending, "failed": snap.failed, "read_only": True}
 
 
 def _foreign_payload(store: Any, snap: BandSnapshot) -> dict[str, Any]:
