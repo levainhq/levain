@@ -1,10 +1,19 @@
-"""levain.coordinator.awake: keep the host from idle-sleeping only while a WORK thread works (C7; gap 6).
+"""levain.coordinator.awake: keep the host from idle-sleeping while a WORK thread works or an agent occurrence is live
+(C7; gap 6; P6s).
 
-The rule: an assertion is taken when a store write finds at least one thread of kind ``work`` in state ``working``, and
-released by the write that finds none. It is held only as long as the holder lives (:data:`HOLD_SECONDS`) and is renewed
-only by a committed coordinator-store write that lands in the last half of that life: there is no timer, so a working
-thread whose store stays quiet for that stretch (a beat cadence longer than half the hold, with no ``levain coord
-watch`` pass writing) loses the hold until the next write, while ``levain doctor`` reports the gap honestly.
+The rule: ONE reconcile, :func:`sync`, reads BOTH sources under the lock beside the coordinator store: the coordinator's
+threads (kind ``work``, state ``working``) and the agents' live occurrences (state ``admitted`` or ``launched``, A0
+contract 2.5). An assertion is taken when either has work and released only by a sync that finds both empty. Either
+side can run the sync (the coordinator store after a committed write; the agent side with ``directory=`` the
+coordinator queue directory that holds ``awake.json``). A source that cannot be read is UNKNOWN, never empty: the hold
+is still taken when the other source has work, and the holder is never released while a source is unknown.
+
+The holder is held only as long as it lives (:data:`HOLD_SECONDS`) and is renewed only by a sync that lands in the
+last half of that life, from either side: there is no timer, so a hold whose stores stay quiet for that stretch (a
+beat cadence longer than half the hold, with no ``levain coord watch`` pass writing, no agent tick syncing) loses the
+hold until the next sync, while ``levain doctor`` reports the gap honestly. Nothing here closes a stale ``admitted`` /
+``launched`` row (the reaper and the tick do, A0 2.5), so a stuck one holds the host until they run; doctor shows each
+live occurrence's state and age.
 
 It is an IDLE-sleep assertion only (macOS ``caffeinate -i``, Linux ``systemd-inhibit --what=idle``); Levain
 never writes the machine's power settings and never uses sudo. Whether it keeps a closed lid awake on battery is a
@@ -14,10 +23,10 @@ against lid-close sleep (see :data:`LID_NOTE`).
 The holder is a process that expires by itself (``-t``), so a Levain that dies releases the host within
 :data:`HOLD_SECONDS` with no cleanup. It is started through a short-lived intermediate that exits at once, so the
 holder belongs to the system's init, never to the Levain process that asked for it: a long-lived Levain process never
-carries a finished holder as a zombie. :func:`sync` is the one reconcile, meant to follow every committed store write:
-it runs under an exclusive lock beside the store, reads the working set under that lock, and renews a holder that is
-running low. The holder is recorded in ``awake.json`` by pid, start time and exact argv, and is signalled only
-when a process matches all three: a pid the system has since given to something else is never ours to stop.
+carries a finished holder as a zombie. :func:`sync` runs under an exclusive lock beside the store and re-reads both
+sources under that lock (nothing the caller saw is trusted). The holder is recorded in ``awake.json`` by pid, start
+time and exact argv, and is signalled only when a process matches all three: a pid the system has since given to
+something else is never ours to stop.
 
 A host without ``fcntl`` file locks gets no assertion: :func:`sync` says so and :func:`describe` names it.
 """
@@ -40,7 +49,8 @@ from typing import Any
 
 from levain.launch import child_env
 
-__all__ = ["HOLD_SECONDS", "describe", "live_occurrences", "holder_command", "process_started", "sync"]
+__all__ = ["HOLD_SECONDS", "describe", "live_occurrences", "live_occurrence_details", "holder_command",
+           "process_started", "sync"]
 
 HOLD_SECONDS = 1800
 FILE = "awake.json"
@@ -67,7 +77,7 @@ def holder_command(seconds: int | None = None, *, platform: str | None = None) -
         return [exe, "-i", "-t", str(seconds)] if exe else None
     if platform.startswith("linux"):
         exe = shutil.which("systemd-inhibit")
-        return [exe, "--what=idle", "--who=levain", "--why=a work thread is working", "--mode=block",
+        return [exe, "--what=idle", "--who=levain", "--why=a work thread is working or an agent occurrence is live", "--mode=block",
                 "sleep", str(seconds)] if exe else None
     return None
 
@@ -157,10 +167,13 @@ def working(store: Any) -> list[str]:
     return [t.thread_id for t in store.threads() if t.kind == "work" and t.state == "working"]
 
 
-def live_occurrences(agent_dir: Path | str | None = None) -> list[str]:
-    """Ids of the agents' live occurrences (state ``admitted`` or ``launched``, A0 §2.5) in the autonomic store under
-    ``agent_dir`` (default: the levain home's). Read-only, creates nothing: no store, or one with no agent table, is
-    an empty list. A store that exists and cannot be read raises, so a caller never takes unreadable for empty."""
+def live_occurrence_details(agent_dir: Path | str | None = None) -> list[dict[str, Any]]:
+    """The agents' live occurrences (state ``admitted`` or ``launched``, A0 2.5) in the autonomic store under
+    ``agent_dir`` (default: the levain home's), as ``{"id", "state", "since"}`` in occurrence-id order; ``since`` is the
+    row's ``launched_at`` for a launched one, else its ``admitted_at``. Writes no row. The open is read-only
+    (``mode=ro``), but a read-only open of a WAL store (the real agents store is one) may create its ``-wal`` / ``-shm``
+    sidecars, as any reader does; no other file is created. No store, or one with no agent table, is an empty list. A
+    store that exists and cannot be read raises, so a caller never takes unreadable for empty."""
     import sqlite3
     from urllib.parse import quote
 
@@ -173,10 +186,17 @@ def live_occurrences(agent_dir: Path | str | None = None) -> list[str]:
     try:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_occurrences'").fetchone() is None:
             return []
-        return [r[0] for r in conn.execute(
-            "SELECT occurrence_id FROM agent_occurrences WHERE state IN ('admitted','launched') ORDER BY occurrence_id")]
+        return [{"id": r[0], "state": r[1], "since": (r[3] if r[1] == "launched" and r[3] else r[2])}
+                for r in conn.execute("SELECT occurrence_id, state, admitted_at, launched_at FROM agent_occurrences "
+                                      "WHERE state IN ('admitted','launched') ORDER BY occurrence_id")]
     finally:
         conn.close()
+
+
+def live_occurrences(agent_dir: Path | str | None = None) -> list[str]:
+    """Ids of the agents' live occurrences: :func:`live_occurrence_details` without the state and age (same reads, same
+    sidecar note, same raise on an unreadable store)."""
+    return [o["id"] for o in live_occurrence_details(agent_dir)]
 
 
 def _coordinator_working(store: Any, directory: Path) -> list[str]:
@@ -193,8 +213,12 @@ def sync(store: Any = None, *, directory: Path | str | None = None,
     """The ONE reconcile over both sources: held while a work thread works OR an agent occurrence is live, released
     only when both are empty. Both sides call it (the coordinator store after a write with ``store``; the agent side
     with ``directory``, the coordinator queue directory that holds ``awake.json``); whichever calls, both sources are
-    re-read here under the lock and nothing the caller saw is trusted. An unreadable source raises into the catch
-    below and leaves the holder as it was. Never raises: a host that cannot hold one is reported by :func:`describe`."""
+    re-read here under the lock and nothing the caller saw is trusted. An unreadable source is UNKNOWN, never empty:
+    the hold is still taken when the other source has work, and the holder is never released (nor renewed) while a
+    source is unknown and the other has none. With neither ``store`` nor ``directory`` the lock and ``awake.json`` fall
+    back to :func:`~levain.consent.queue.default_queue_dir`, so an agent-side caller must pass ``directory=`` (P6-5)
+    to name the coordinator queue directory it means. Never raises: a host that cannot hold one is reported by
+    :func:`describe`."""
     if os.environ.get("LEVAIN_NO_IDLE_ASSERTION") or (os.environ.get("PYTEST_CURRENT_TEST") and not _IN_TESTS):
         # a test run that moves threads must not leave a real holder on the developer's machine
         return {"held": False, "why": "disabled by the environment (LEVAIN_NO_IDLE_ASSERTION or a test run)"}
@@ -221,10 +245,26 @@ def sync(store: Any = None, *, directory: Path | str | None = None,
 
 def _reconcile(store: Any, directory: Path, agent_dir: Path | str | None) -> dict[str, Any]:
     path = directory / FILE
-    ids = _coordinator_working(store, directory)    # both read under the lock: never a set another reconcile moved
-    occ = live_occurrences(agent_dir)
+    unknown: list[str] = []        # a source that cannot be read is UNKNOWN, never empty
+    errors: list[str] = []
+    try:                           # both read under the lock: never a set another reconcile moved
+        ids = _coordinator_working(store, directory)
+    except Exception as exc:       # noqa: BLE001 - an unreadable source is unknown, not a failure of the whole sync
+        ids = []
+        unknown.append("coordinator")
+        errors.append(f"coordinator: {exc}")
+    try:
+        occ = live_occurrences(agent_dir)
+    except Exception as exc:       # noqa: BLE001
+        occ = []
+        unknown.append("agent")
+        errors.append(f"agent: {exc}")
     cur = _read(path)
     if not ids and not occ:
+        if unknown:                # nothing known to hold for, and not known to be free: leave the holder as it is
+            return {"held": bool(_ours(cur) and cur.get("until", 0) > time.time()), "unknown": unknown,
+                    "why": f"could not sync: the {' and '.join(unknown)} source could not be read ({'; '.join(errors)[:300]}), "
+                           "so the holder is left as it was"}
         if cur:
             _stop(cur)
             path.unlink(missing_ok=True)
@@ -232,13 +272,18 @@ def _reconcile(store: Any, directory: Path, agent_dir: Path | str | None) -> dic
     source = "+".join(n for n, v in (("coordinator", ids), ("agent", occ)) if v)
     why = {"coordinator": "a work thread is working", "agent": "an agent occurrence is live"}.get(
         source, "a work thread is working and an agent occurrence is live")
+    if unknown:
+        why += f" (the {' and '.join(unknown)} source could not be read)"
+    extra = {"unknown": unknown} if unknown else {}
     argv = holder_command()
     if argv is None:
         return {"held": False, "why": "this host has no idle-sleep tool (caffeinate / systemd-inhibit)"}
     if _ours(cur) and cur.get("until", 0) - time.time() > HOLD_SECONDS / 2:
-        if cur.get("threads") != ids or cur.get("occurrences") != occ:      # keep the record naming the source
-            _write(path, {**cur, "threads": ids, "occurrences": occ, "source": source})
-        return {"held": True, "pid": cur["pid"], "threads": ids, "occurrences": occ, "source": source, "why": why}
+        if cur.get("threads") != ids or cur.get("occurrences") != occ or (cur.get("unknown") or []) != unknown:
+            _write(path, {**{k: v for k, v in cur.items() if k != "unknown"}, "threads": ids, "occurrences": occ,
+                          "source": source, **extra})      # keep the record naming the source
+        return {"held": True, "pid": cur["pid"], "threads": ids, "occurrences": occ, "source": source, "why": why,
+                **extra}
     pid = _spawn(argv)
     ident = _identify(pid)
     if ident is None:
@@ -249,19 +294,61 @@ def _reconcile(store: Any, directory: Path, agent_dir: Path | str | None) -> dic
             pass
         return {"held": False, "why": f"could not sync: the new holder (pid {pid}) could not be identified by ps"}
     rec = {"pid": pid, "started": ident[0], "argv": argv, "until": time.time() + HOLD_SECONDS, "threads": ids,
-           "occurrences": occ, "source": source}
+           "occurrences": occ, "source": source, **extra}
     try:
         _write(path, rec)
     except BaseException:
         _stop(rec)              # an unrecorded holder could never be stopped or recognised by a later sync
         raise
     _stop(cur)                  # the old holder goes only once the new one is recorded
-    return {"held": True, "pid": pid, "threads": ids, "occurrences": occ, "source": source, "why": why}
+    return {"held": True, "pid": pid, "threads": ids, "occurrences": occ, "source": source, "why": why, **extra}
 
 
-def describe(directory: Path | str, *, working_count: int | None = None, occurrence_count: int | None = None) -> tuple[bool, str]:
-    """(ok, one line) for ``levain doctor``: is the assertion held, and why or why not. Read-only."""
-    ok, line, holding = _describe(directory, working_count, occurrence_count)
+def _age(since: Any, now: float) -> str | None:
+    """How long ago an ISO timestamp (``...Z``) was, as ``42s`` / ``7m`` / ``3h12m`` / ``2d4h``; None when unreadable."""
+    from datetime import datetime, timezone
+
+    try:
+        dt = datetime.fromisoformat(str(since).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        secs = max(0, int(now - dt.timestamp()))
+    except (ValueError, OverflowError, OSError):
+        return None
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h{secs % 3600 // 60:02d}m"
+    return f"{secs // 86400}d{secs % 86400 // 3600}h"
+
+
+def _occ_text(occurrences: list[dict[str, Any]], now: float) -> str:
+    """Up to three live occurrences as ``id (state, age)`` plus the oldest one's age, so a stuck row shows."""
+    aged = [(o, _age(o.get("since"), now)) for o in occurrences]
+    shown = ", ".join(f"{o.get('id')} ({o.get('state')}, {a or 'age unknown'})" for o, a in aged[:3])
+    if len(aged) > 3:
+        shown += f" +{len(aged) - 3} more"
+    known = [(now - _epoch(o.get("since")), a) for o, a in aged if a is not None]
+    oldest = max(known)[1] if known else None
+    return f"{shown}; oldest live: {oldest}" if oldest else shown
+
+
+def _epoch(since: Any) -> float:
+    from datetime import datetime, timezone
+
+    dt = datetime.fromisoformat(str(since).replace("Z", "+00:00"))
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def describe(directory: Path | str, *, working_count: int | None = None, occurrence_count: int | None = None,
+             occurrences: list[dict[str, Any]] | None = None, now: float | None = None) -> tuple[bool, str]:
+    """(ok, one line) for ``levain doctor``: is the assertion held, and why or why not. Read-only. ``occurrences`` (the
+    rows of :func:`live_occurrence_details`) lets the line name each live occurrence's state and age and the oldest one's,
+    so a row stuck in ``admitted`` / ``launched`` is visible; without it only the recorded ids are named."""
+    ok, line, holding = _describe(directory, working_count, occurrence_count, occurrences,
+                                  time.time() if now is None else now)
     return ok, f"{line}; {LID_NOTE}" if holding and _is_darwin() else line
 
 
@@ -270,29 +357,40 @@ def _is_darwin() -> bool:
     return sys.platform == "darwin"
 
 
-def _describe(directory: Path | str, working_count: int | None, occurrence_count: int | None = None) -> tuple[bool, str, bool]:
+def _describe(directory: Path | str, working_count: int | None, occurrence_count: int | None,
+              occurrences: list[dict[str, Any]] | None, now: float) -> tuple[bool, str, bool]:
     """(ok, line, whether a hold is held or about to be): only then does the lid note apply."""
     cur = _read(Path(directory) / FILE)
     pid = cur.get("pid")
-    held = _ours(cur) and cur.get("until", 0) > time.time()
+    held = _ours(cur) and cur.get("until", 0) > now
+    n_occ = occurrence_count if occurrence_count is not None else (len(occurrences) if occurrences is not None else 0)
     if held:
-        n, occ = len(cur.get("threads") or []), cur.get("occurrences") or []
-        who = (f"{n} work thread(s) working" if n else "") + (" and " if n and occ else "")
-        if occ:
-            who += f"agent occurrence(s) live: {', '.join(map(str, occ[:3]))}" + (f" +{len(occ) - 3} more" if len(occ) > 3 else "")
+        n = len(cur.get("threads") or [])
+        if occurrences is not None:
+            live = occurrences                                  # what is live now: state and age
+            occ_text = _occ_text(live, now) if live else ""
+        else:
+            ids = cur.get("occurrences") or []                  # the ids the last sync recorded
+            occ_text = ", ".join(map(str, ids[:3])) + (f" +{len(ids) - 3} more" if len(ids) > 3 else "")
+        who = (f"{n} work thread(s) working" if n else "") + (" and " if n and occ_text else "")
+        if occ_text:
+            who += f"agent occurrence(s) live: {occ_text}"
         return True, (f"idle sleep is held off (pid {pid}, held by {cur.get('source') or 'coordinator'}: {who} at its "
                       f"last sync); it releases when none is left, and by itself within {HOLD_SECONDS // 60} minutes "
                       "if Levain stops"), True
-    if occurrence_count and not working_count:
-        return False, (f"{occurrence_count} agent occurrence(s) are live and no assertion is held (it is set on the "
-                       "next sync)"), True
+    parts = []
     if working_count:
+        parts.append(f"{working_count} work thread(s) are working")
+    if n_occ:
+        parts.append(f"{n_occ} agent occurrence(s) are live" + (f" ({_occ_text(occurrences, now)})" if occurrences else ""))
+    if parts:
+        what = " and ".join(parts)
         if fcntl is None:
-            return False, f"{working_count} work thread(s) are working but {_NO_LOCKS}; it may sleep under them", False
+            return False, f"{what} but {_NO_LOCKS}; it may sleep under them", False
         if holder_command() is None:
-            return False, (f"{working_count} work thread(s) are working but this host has no idle-sleep tool, so it "
-                           "may sleep under them (macOS: caffeinate; Linux: systemd-inhibit)"), False
-        return (False, f"{working_count} work thread(s) are working and no assertion is held (it is set on the next "
-                       "sync)", True)
-    return True, ("no work thread is working, so nothing holds the host awake; it sleeps by your own power settings"
+            return False, (f"{what} but this host has no idle-sleep tool, so it may sleep under them "
+                           "(macOS: caffeinate; Linux: systemd-inhibit)"), False
+        return False, f"{what} and no assertion is held (it is set on the next sync)", True
+    return True, ("no work thread is working and no agent occurrence is live, so nothing holds the host awake; it sleeps "
+                  "by your own power settings"
                   + ("" if holder_command() else " (and this host has no idle-sleep tool for when one works)")), False

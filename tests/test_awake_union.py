@@ -137,7 +137,7 @@ def test_no_agent_store_or_table_reads_as_no_occurrence(tmp_path):
     c.execute("CREATE TABLE other (x)")
     c.close()
     assert awake.live_occurrences(tmp_path) == []
-    assert sorted(os.listdir(tmp_path)) == [DB_NAME]      # read-only: no journal or other file was created
+    assert sorted(os.listdir(tmp_path)) == [DB_NAME]      # a rollback-journal store: a read leaves no other file
 
 
 def test_doctor_line_names_the_source_and_the_occurrence(tmp_path, monkeypatch):
@@ -149,3 +149,149 @@ def test_doctor_line_names_the_source_and_the_occurrence(tmp_path, monkeypatch):
     (tmp_path / awake.FILE).unlink()
     ok, line = awake.describe(tmp_path, working_count=0, occurrence_count=2)
     assert not ok and "2 agent occurrence(s) are live" in line, line
+
+
+def _insert(adir, oid, launched=None):
+    """A claim (admitted), then the launch transition when ``launched`` is given: the triggers allow no other path."""
+    c = sqlite3.connect(adir / DB_NAME, isolation_level=None)
+    try:
+        c.execute("INSERT INTO agent_occurrences (occurrence_id, agent_id, kind, key, state, window_key, spec_hash,"
+                  " binding_id, run_id, admitted_at) VALUES (?, 'ag-1', 'scheduled', ?, 'admitted', 'w', 's', 'b', ?, ?)",
+                  (oid, oid, "run-" + oid, NOW))
+        if launched:
+            c.execute("UPDATE agent_occurrences SET state='launched', launch_epoch=0, link_id='l', link_incarnation='i',"
+                      " launched_at=? WHERE occurrence_id=?", (launched, oid))
+    finally:
+        c.close()
+
+
+def test_a_read_of_the_real_wal_store_writes_no_row_and_adds_only_sidecars(tmp_path):
+    adir = tmp_path / "autonomic"
+    with AutonomicDB(adir).write():          # the store the way levain/agents makes it
+        pass
+    c = sqlite3.connect(adir / DB_NAME)
+    assert c.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    c.close()
+    _insert(adir, "occ-1")
+    _insert(adir, "occ-2", launched="2026-10-31T10:05:00Z")
+    before_files, before_bytes = set(os.listdir(adir)), (adir / DB_NAME).read_bytes()
+    got = awake.live_occurrence_details(adir)
+    assert [(o["id"], o["state"], o["since"]) for o in got] == [
+        ("occ-1", "admitted", NOW), ("occ-2", "launched", "2026-10-31T10:05:00Z")]
+    assert awake.live_occurrences(adir) == ["occ-1", "occ-2"]
+    assert (adir / DB_NAME).read_bytes() == before_bytes                      # no content change in the main file
+    assert set(os.listdir(adir)) - before_files <= {DB_NAME + "-wal", DB_NAME + "-shm"}   # sidecars, nothing else
+    c = sqlite3.connect(f"file:{adir / DB_NAME}?mode=ro", uri=True)
+    assert c.execute("SELECT occurrence_id, state FROM agent_occurrences ORDER BY 1").fetchall() == [
+        ("occ-1", "admitted"), ("occ-2", "launched")]                         # the same two rows, none added
+    c.close()
+
+
+def test_doctor_line_names_each_occurrences_state_and_age_and_the_oldest(tmp_path, monkeypatch):
+    monkeypatch.setattr(awake, "_ours", lambda r: True)
+    now = awake._epoch("2026-10-31T13:12:00Z")
+    live = [{"id": "occ-a", "state": "launched", "since": "2026-10-31T10:00:00Z"},
+            {"id": "occ-b", "state": "admitted", "since": "2026-10-31T13:11:30Z"},
+            {"id": "occ-c", "state": "admitted", "since": "not a time"}]
+    (tmp_path / awake.FILE).write_text(json.dumps({"pid": 77, "until": now + 99, "threads": [], "occurrences": ["occ-a"],
+                                                   "source": "agent"}))
+    ok, line = awake.describe(tmp_path, working_count=0, occurrence_count=3, occurrences=live, now=now)
+    assert ok and "occ-a (launched, 3h12m)" in line and "occ-b (admitted, 30s)" in line, line
+    assert "occ-c (admitted, age unknown)" in line and "oldest live: 3h12m" in line, line
+    (tmp_path / awake.FILE).unlink()                                       # not held: the same state and age still show
+    ok, line = awake.describe(tmp_path, working_count=0, occurrence_count=3, occurrences=live, now=now)
+    assert not ok and "3 agent occurrence(s) are live" in line and "occ-a (launched, 3h12m)" in line, line
+
+
+def test_the_occurrence_only_branch_makes_the_same_two_checks_as_the_work_branch(tmp_path, monkeypatch):
+    monkeypatch.setattr(awake, "holder_command", lambda *a, **k: ["caffeinate"])
+    monkeypatch.setattr(awake, "fcntl", None)
+    for kw in ({"working_count": 0, "occurrence_count": 2}, {"working_count": 1, "occurrence_count": 0}):
+        ok, line = awake.describe(tmp_path, **kw)
+        assert not ok and "no POSIX file locks" in line and "may sleep under them" in line, line
+    monkeypatch.setattr(awake, "fcntl", object())
+    monkeypatch.setattr(awake, "holder_command", lambda *a, **k: None)
+    for kw in ({"working_count": 0, "occurrence_count": 2}, {"working_count": 1, "occurrence_count": 0}):
+        ok, line = awake.describe(tmp_path, **kw)
+        assert not ok and "no idle-sleep tool" in line and "may sleep under them" in line, line
+    monkeypatch.setattr(awake, "holder_command", lambda *a, **k: ["caffeinate"])
+    ok, line = awake.describe(tmp_path, working_count=0, occurrence_count=2)
+    assert not ok and "set on the next sync" in line, line
+
+
+def test_a_dead_or_expired_holder_with_a_live_occurrence_is_respawned(world):
+    q, adir = world
+    run(AGENT, q, adir, "occ-1", "start", NOW)
+    first = rec(q)
+    os.kill(first["pid"], 15)                                                # the holder dies; awake.json is stale
+    for _ in range(100):
+        if not awake._ours(first):
+            break
+        time.sleep(0.05)
+    assert not awake._ours(first)
+    run(AGENT, q, adir, "occ-2", "start", NOW)
+    second = rec(q)
+    assert second["pid"] != first["pid"] and awake._ours(second) and second["occurrences"] == ["occ-1", "occ-2"]
+    (q / "awake.json").write_text(json.dumps({**second, "until": time.time() - 5}))    # alive but past its record
+    run(AGENT, q, adir, "occ-3", "start", NOW)
+    third = rec(q)
+    assert third["pid"] != second["pid"] and awake._ours(third) and third["occurrences"] == ["occ-1", "occ-2", "occ-3"]
+    for _ in range(100):                                                     # the replaced holder is stopped
+        if not awake._ours(second):
+            break
+        time.sleep(0.05)
+    assert not awake._ours(second)
+
+
+def test_the_same_live_holder_is_rewritten_when_the_lists_change(world):
+    q, adir = world
+    run(AGENT, q, adir, "occ-1", "start", NOW)
+    first = rec(q)
+    run(AGENT, q, adir, "occ-2", "start", NOW)                               # same holder, record now names both
+    second = rec(q)
+    assert second["pid"] == first["pid"] and second["started"] == first["started"] and awake._ours(second)
+    assert second["occurrences"] == ["occ-1", "occ-2"] and second["until"] == first["until"]
+    run(AGENT, q, adir, "occ-1", "end", NOW)
+    third = rec(q)
+    assert third["pid"] == first["pid"] and third["occurrences"] == ["occ-2"] and third["source"] == "agent"
+
+
+def test_the_doctor_row_names_the_source_the_occurrence_its_state_and_age(world, monkeypatch):
+    from levain import install
+    from levain.doctor import _check_host_awake
+
+    q, adir = world
+    monkeypatch.setattr(install, "_consent_queue_dir", lambda: q)
+    run(AGENT, q, adir, "occ-1", "start", NOW)
+    [row] = _check_host_awake()
+    assert row.ok and not row.warn, row
+    assert "held by agent" in row.detail and "occ-1 (admitted, " in row.detail and "oldest live: " in row.detail, row.detail
+    run(AGENT, q, adir, "occ-1", "end", NOW)
+    assert _check_host_awake() == []                                        # nothing live, no coordinator store: no row
+
+
+def test_an_unreadable_agents_store_still_takes_the_coordinators_hold(world, tmp_path):
+    q, adir = world
+    (adir / DB_NAME).write_bytes(b"not a database" * 100)
+    drop, thread = run(COORD, q, "work", tmp_path).split()                  # the coordinator side has work, agents unknown
+    held = rec(q)
+    assert awake._ours(held) and held["source"] == "coordinator" and held["threads"] == [thread]
+    assert held["unknown"] == ["agent"]
+    out = run(COORD, q, "end", thread, drop)                                 # its work ends; the agents store is still unknown
+    assert awake._ours(rec(q)) and rec(q)["pid"] == held["pid"], "the holder was released with a source unknown"
+
+
+def test_an_unreadable_coordinator_store_still_takes_the_agents_hold_and_both_unknown_holds_nothing_new(world):
+    q, adir = world
+    (q / "dispatch.db").write_bytes(b"not a database" * 100)
+    out = run(AGENT, q, adir, "occ-1", "start", NOW)
+    assert "'held': True" in out and "'unknown': ['coordinator']" in out, out
+    held = rec(q)
+    assert awake._ours(held) and held["source"] == "agent" and held["unknown"] == ["coordinator"]
+    run(AGENT, q, adir, "occ-1", "end", NOW)                                 # the occurrence ends: coordinator still unknown
+    assert awake._ours(rec(q)) and rec(q)["pid"] == held["pid"]
+    (adir / DB_NAME).write_bytes(b"not a database" * 100)                    # now both are unreadable
+    out = run(PRELUDE + "from pathlib import Path\nprint(awake.sync(directory=Path(sys.argv[1]), agent_dir=Path(sys.argv[2])))",
+              q, adir)
+    assert "could not sync" in out and "coordinator and agent" in out and awake._ours(rec(q))
+    assert rec(q)["pid"] == held["pid"]
