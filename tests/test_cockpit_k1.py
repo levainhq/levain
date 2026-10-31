@@ -384,7 +384,8 @@ class TestHttpRoutes:
         from levain.writes import WriteScope
         gated = SubstrateSource(anneal=src.anneal, write_scope=WriteScope(
             anneal=src.anneal, ledger_root=root / ".levain", install_root=None), context_json=src.context_json)
-        with _serve(gated, write_token="tok") as (base, httpd):
+        # off-box the owner key opens nothing (W1b L-1): the credential is a named surface's token
+        with _serve(gated, surface_tokens={"flowconnect": "tok"}) as (base, httpd):
             httpd.is_loopback_bind = False  # what a real off-box bind sets (see TestOffBoxWriteToken)
             assert _http(f"{base}/cockpit/manifest.json")[0] == 403
             assert _http(f"{base}/cockpit/panel/tray.json")[0] == 403

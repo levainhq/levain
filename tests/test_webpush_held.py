@@ -10,6 +10,7 @@ from levain.webpush import held, presence, sender
 from levain.webpush.presence import ACTIVE_WINDOW_SECS, set_word
 from levain.webpush.store import PushStore
 from tests._h4 import h4_env, h4_home
+from tests._push_fixtures import phone
 
 NOW = 1_000_000.0
 ACTIVE, INACTIVE = 10.0, ACTIVE_WINDOW_SECS + 1.0
@@ -24,8 +25,7 @@ def _as_operator(monkeypatch):
 
 
 def _phone(qdir):
-    PushStore(qdir).subscribe_unowned("https://fcm.googleapis.com/fcm/send/held-test", "p", "a", "phone",
-                                      datetime.now(timezone.utc))
+    phone(qdir, "https://fcm.googleapis.com/fcm/send/held-test")
 
 
 def _hold(qdir, reason, kind="ruling", ref="question:1", body="b"):
@@ -446,10 +446,8 @@ def test_e1_a_ping_is_released_only_when_every_device_answered_or_was_retired(tm
 def test_e1_a_device_with_unusable_keys_is_a_retirement_not_a_failure(tmp_path, monkeypatch):
     import urllib.request
 
-    store = PushStore(tmp_path)
     for n in (1, 2):
-        store.subscribe_unowned(f"https://fcm.googleapis.com/fcm/send/e1-{n}", "p", "a", f"phone{n}",
-                                datetime.now(timezone.utc))
+        phone(tmp_path, f"https://fcm.googleapis.com/fcm/send/e1-{n}", f"phone{n}")
     _hold(tmp_path, "active")
     monkeypatch.setattr(sender, "_prepare", lambda qdir, sub, data, topic:
                         None if sub["endpoint"].endswith("e1-2") else urllib.request.Request("https://x/", data=b""))

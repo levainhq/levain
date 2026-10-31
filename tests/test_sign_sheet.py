@@ -18,7 +18,7 @@ from levain.consent.sign import Signer
 from levain.http_guards import _CSP
 
 from tests.test_cockpit_sign_origin import NS, PINNED, RP, _file, _Passkey
-from tests.test_cockpit_sign_routes import RID, TOK, _serving
+from tests.test_cockpit_sign_routes import FC, RID, TOK, _serving
 
 SHEET = f"/sign/{RID}"
 SELF_CSP = _CSP.replace("frame-ancestors 'none'", "frame-ancestors 'self'")
@@ -136,7 +136,8 @@ def test_the_shell_is_token_free_off_box_while_its_data_is_not(sheet) -> None:
     assert _raw(sheet["url"], SHEET, headers=proxied)[0] == 200
     assert _raw(sheet["url"], "/sign.js", headers=proxied)[0] == 200
     assert _raw(sheet["url"], f"/cockpit/sign/{RID}.json", headers=proxied)[0] == 403
-    assert _raw(sheet["url"], f"/cockpit/sign/{RID}.json", headers={**proxied, "X-Levain-Write-Token": TOK})[0] == 200
+    assert _raw(sheet["url"], f"/cockpit/sign/{RID}.json", headers={**proxied, "X-Levain-Write-Token": FC})[0] == 200
+    assert _raw(sheet["url"], f"/cockpit/sign/{RID}.json", headers={**proxied, "X-Levain-Write-Token": TOK})[0] == 403   # the owner key, proxied (L-1)
 
 
 def test_a_link_opened_from_another_site_reaches_the_sheet_and_nothing_else(sheet) -> None:

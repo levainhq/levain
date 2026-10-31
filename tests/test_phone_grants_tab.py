@@ -11,22 +11,17 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import sqlite3
 import subprocess
-import threading
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from cryptography.hazmat.primitives import serialization
 
 from levain import authority as auth
-from levain.consent.grants import create_grant, grant_listing
+from levain.consent.grants import create_grant
 from levain.consent.ledger import Ledger
 from levain.consent import policy
 from levain.consent.queue import ConsentQueue, authority_source
-from levain.phone_server import make_phone_server
-from tests.test_cockpit_flip_parity import _drive as _page_drive, needs_browser
 from tests.test_grant_phone import ORIGIN, RP, _now, world  # noqa: F401  (world is a fixture)
 from tests._h4 import h4_home
 
@@ -149,35 +144,6 @@ def test_the_l3_r1_fixes_hold_on_the_grants_tab():
 _SHEET = "document.querySelectorAll('#grants-list .sheet').length"
 
 
-@needs_browser
-def test_a_tab_switch_in_the_phone_app_drops_an_open_revoke_sheet(world, tmp_path):
-    """M17 L3 r1 M-3, through the real tabs (phone_app.js's show) in headless Chrome against a real phone port.
-    Reproduced red on 7ae3def0's phone.js + phone_app.js: after the Board tap the sheet was still in the hidden
-    Grants view (1), and back on Grants the card's revoke button was still disabled (the list held)."""
-    _grant(world, "cg-0000000000aa", "Write")
-    httpd = make_phone_server(world.qdir, RP, port=0, token=_TOK, dispatch_dir=world.qdir)
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
-    t.start()
-    try:
-        url = f"http://127.0.0.1:{httpd.server_address[1]}/?view=grants#phone_token={_TOK}"
-        out = _page_drive(tmp_path, url, [
-            {"until": "document.querySelectorAll('#grants-list article').length === 1"},
-            {"eval": "document.querySelector('#grants-list article .deny').click(), 1"},
-            {"until": "!!document.querySelector('#grants-list .sheet pre.line')"},
-            {"eval": "document.querySelector('#tabs button[data-view=\"board\"]').click(), 1"},
-            {"eval": f"new Promise(r => setTimeout(() => r({_SHEET}), 300))"},
-            {"eval": "document.querySelector('#tabs button[data-view=\"grants\"]').click(), 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(document.querySelector('#grants-list article .deny').disabled), 2500))"},
-        ])
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        t.join(timeout=5)
-    sheet_after_leave, button_disabled = out["values"][-3], out["values"][-1]
-    assert sheet_after_leave == 0 and button_disabled is False, out["values"]
-    # nothing was signed: the only write was the challenge
-    assert [p for p in out["posts"] if "/grant/" in str(p)] and all("revoke-challenge" in str(p)
-                                                                    for p in out["posts"] if "/grant/" in str(p)), out
 
 
 def _grant(world, gid: str, tool: str) -> None:
@@ -205,42 +171,6 @@ def _answered(world, tool: str, name: str, outcome: str) -> str:
     return d.grant_id
 
 
-@needs_node
-def test_the_page_revokes_a_grant_through_a_real_phone_port_and_the_log_takes_it(world):
-    """End to end: phone.js's fetch reaches a real phone port; the revoke the page signs lands as a link the replay
-    verifies (real ssh-keygen over a webauthn-sk SSHSIG in levain-authority)."""
-    _grant(world, "cg-0000000000aa", "Write")
-    _grant(world, "cg-0000000000bb", "Edit")
-    assert _answered(world, "Write", "a.txt", "accepted") == "cg-0000000000aa"
-    assert _answered(world, "Edit", "b.txt", "accepted") == "cg-0000000000bb"
-    assert _answered(world, "Edit", "c.txt", "refused") == "cg-0000000000bb"
-    pem = world.root.parent / "phone-key.pem"
-    pem.write_bytes(world.phone.priv.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                                                   serialization.NoEncryption()))
-    httpd = make_phone_server(world.qdir, RP, port=0, token=_TOK, dispatch_dir=world.qdir)
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
-    t.start()
-    try:
-        got = _drive("live", f"http://127.0.0.1:{httpd.server_address[1]}", _TOK, str(pem), RP, ORIGIN, "cg-0000000000bb")
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        t.join(timeout=5)
-    # the grant whose call was refused led the list, its refused call first
-    assert got["before"]["order"] == ["cg-0000000000bb", "cg-0000000000aa"], got
-    assert got["before"]["calls"][0].startswith("refused · Edit"), got
-    line = json.loads(got["line"][0])
-    assert line["op"] == "revoke_grant" and line["grant_id"] == "cg-0000000000bb" and got["promptsBeforeTap"] == 0, got
-    assert any(t.startswith("revoked") for t in got["said"]) or "revoked cg-0000000000bb" in got["status"], got
-    assert got["after"] == ["cg-0000000000aa"], got
-    conn = sqlite3.connect(world.root / "cockpit.db", isolation_level=None)
-    try:
-        snap = auth.snapshot(conn, cache=auth.ReplayCache())     # a fresh replay verifies every link again
-    finally:
-        conn.close()
-    assert "cg-0000000000bb" not in snap.policy.grants and "cg-0000000000aa" in snap.policy.grants
-    assert snap.seq == line["seq"]
-    assert [g.id for g in grant_listing(world.root, now=_now())[0]] == ["cg-0000000000aa"]
 
 
 @needs_node
@@ -284,32 +214,3 @@ _OPEN_REVIEW = """(() => {
 })()"""
 
 
-@needs_browser
-def test_a_tab_switch_in_the_phone_app_dismisses_an_open_review(world, tmp_path):
-    """L3 r4 (codex MED): the view switch phone_app.js's show(v) makes, reached by a real tab tap in headless Chrome,
-    dismisses an open K8 review through levainViewChanged -> levainDismissReviews. Red with that one call removed from
-    levainViewChanged (m17k8a/wire_red.txt): the page stayed held, the sheet was never told and done never answered."""
-    httpd = make_phone_server(world.qdir, RP, port=0, token=_TOK, dispatch_dir=world.qdir)
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
-    t.start()
-    try:
-        url = f"http://127.0.0.1:{httpd.server_address[1]}/?view=needs#phone_token={_TOK}"
-        out = _page_drive(tmp_path, url, [
-            {"until": "typeof window.levainSign === 'function' && !!document.querySelector('#tabs button[data-view=\"board\"]')"},
-            {"eval": _OPEN_REVIEW},
-            {"until": "window.__k.reviewed === 1"},
-            {"eval": "window.__k.probe()"},
-            {"eval": "document.querySelector('#tabs button[data-view=\"board\"]').click(), 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(JSON.stringify({ closed: window.__k.closed, "
-                     "done: window.__k.done.map(a => a.body && a.body.state), said: window.__k.said.slice(-1) })), 300))"},
-            {"eval": "window.__k.probe()"},
-        ])
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        t.join(timeout=5)
-    held_before, told, free_after = out["values"][3], json.loads(out["values"][5]), out["values"][6]
-    assert held_before is False, out["values"]          # the open review holds the page: a second write is not filed
-    assert told["closed"] == ["dismissed"] and told["done"] == ["DISMISSED"], told
-    assert "dismissed" in told["said"][0][0], told
-    assert free_after is True, out["values"]

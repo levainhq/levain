@@ -525,8 +525,12 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Box-side pairing (the recovery path when no paired device or surface token is at hand): mints a "
             "one-time code straight into the cockpit journal, minted by 'box', valid for 10 minutes, and prints the "
-            "pair link here, never to a log. Open it on the new device. --revoke-all ends every paired device "
-            "instead (each one's waiting pendings are cancelled)."),
+            "pair link here, never to a log. Open it on the new device. --short mints a typed code instead (for a "
+            "Home Screen app, which cannot open a link): XXXX-XXXX, one use, valid 10 minutes, and it replaces any "
+            "short code shown before. --list shows the paired devices; --revoke ID [ID ...] revokes those devices and "
+            "every device they paired; --revoke-all ends every paired device (each one's waiting pendings are "
+            "cancelled). --list, --revoke and --revoke-all read and write the journal directly: no cockpit "
+            "credential is needed."),
     )
     _ck_common(ck_pair)
     ck_pair.add_argument("--label", default=None,
@@ -536,9 +540,16 @@ def main(argv: list[str] | None = None) -> int:
                               "without it the link is printed as a path to append to that address.")
     ck_pair.add_argument("--revoke-all", action="store_true", dest="revoke_all",
                          help="Revoke every paired device instead of minting a code.")
+    ck_pair.add_argument("--short", action="store_true",
+                         help="Mint a typed code (XXXX-XXXX) instead of a link.")
+    ck_pair.add_argument("--list", action="store_true", dest="list_devices",
+                         help="List the paired devices (id, label, who paired it, created, last seen, revoked); "
+                              "never a token.")
+    ck_pair.add_argument("--revoke", nargs="+", default=None, metavar="ID",
+                         help="Revoke these paired devices and every device they paired.")
     ck_pair.add_argument("--print", action="store_true", dest="print_link",
-                         help="Print the pair link even when stdout is not a terminal (a pipe, a file, a log): "
-                              "without it the link is refused there, since anyone who reads it can pair.")
+                         help="Print the pair link or code even when stdout is not a terminal (a pipe, a file, a "
+                              "log): without it the link is refused there, since anyone who reads it can pair.")
     ck_pair.set_defaults(func=_cmd_cockpit_pair)
     ck_pending = ck_sub.add_parser("pending", help="List the cockpit's waiting pendings (read-only, no server).")
     _ck_common(ck_pending)
@@ -2621,15 +2632,12 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                            help="An install directory whose ledger's cockpit/ is that data root (as --data-root).")
     cs_answer.set_defaults(func=_cmd_consent_answer)
     cs_phone = cs_sub.add_parser(
-        "phone", help="Answer consent requests from a phone with a passkey (serves the phone port).",
-        description="Serve a small consent page on its own loopback port, for an https proxy you run (for example "
-                    "`tailscale serve`) to put on your tailnet. From the phone you see what each agent asked and "
-                    "answer it with a passkey, which the queue verifies like a terminal answer. A passkey is a "
-                    "display-phone key: it can allow a T2 request and deny any; a T3 allow stays on the laptop. "
-                    "The page also makes the phone's passkey and shows the laptop command that enrols it (a "
-                    "passkey never enrols itself). Nothing else is served there: not the cockpit, not your "
-                    "install. The printed link carries this server's token; anyone holding it can read the "
-                    "waiting requests until it stops, and none can answer without an enrolled passkey.")
+        "phone", help="Serve the old phone port's redirect to the cockpit (--redirect-to is required).",
+        description="Serve ONLY a redirect page on its own loopback port, for an https proxy you run (for example "
+                    "`tailscale serve`): every link the phone already holds for this port opens on the cockpit "
+                    "at --redirect-to. The phone port's run token and its token-gated data routes are gone "
+                    "(W1b): a phone pairs to the cockpit with `levain cockpit pair`. Without --redirect-to this "
+                    "command refuses.")
     cs_phone.add_argument("--name", default=None,
                           help="The https name your proxy serves the phone port on (it becomes the passkey's "
                                "name, so keep it: a passkey made on one name never answers on another).")
@@ -2638,31 +2646,15 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                                "`tailscale serve` line. Changes nothing in Tailscale itself.")
     cs_phone.add_argument("--port", type=int, default=None,
                           help=f"The loopback port (default {_phone_port_default()}).")
-    cs_phone.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None,
-                          help=queue_help + " Dispatch jobs are read from the same directory: file them with "
-                          "`levain dispatch file --dispatch-dir` set to it.")
-    cs_phone.add_argument("--sign-namespace", dest="sign_namespaces", action="append", default=None,
-                          type=_sign_namespace, metavar="NS",
-                          help="Also list the sign requests filed in the queue's sign/ directory in namespace NS "
-                               "(repeatable), for a user-verified passkey signature (Face ID, Touch ID or the device "
-                               "passcode, as the authenticator reports it). levain checks user verification; a "
-                               "caller's `ssh-keygen -Y verify -n NS` checks the key, the message and the namespace "
-                               "only. The queue dir's claude_code.json must name the cockpit (cockpit_data_root). A "
-                               "namespace beginning 'levain', one levain verifies in, or git, file or email is "
-                               "refused.")
     cs_phone.add_argument("--link-file", dest="link_file", type=Path, default=None,
-                          help="Also write this run's page link and phone token to FILE (JSON, mode 0600), for a "
-                               "caller that builds a link straight onto one sign request's card (#sign=<id>); removed "
-                               "when this run stops. Its token changes every run unless --token-file keeps it.")
-    cs_phone.add_argument("--token-file", dest="token_file", type=Path, default=None,
-                          help="Keep the phone token in FILE (mode 0600): read it from there when FILE exists, else "
-                               "make one and write it, so a restart keeps the links the phone already holds.")
+                          help="Also write the cockpit origin this run redirects to into FILE (JSON "
+                               "{page, pid}, mode 0600, no token), for a caller that builds a sign link onto it; "
+                               "removed when this run stops.")
     cs_phone.add_argument("--redirect-to", dest="redirect_to", default=None, metavar="ORIGIN",
                           help="Serve ONLY a redirect: every link the phone already holds for this port opens on "
                                "the cockpit at ORIGIN (https://<name>:<port>), a sign link on that request's sheet "
-                               "(/sign/<id>), its token dropped and never forwarded. Nothing else is served, no "
-                               "token is made, and --link-file then holds {page: ORIGIN/} only. Takes no "
-                               "--queue-dir, --sign-namespace or --token-file.")
+                               "(/sign/<id>), its token dropped and never forwarded. Nothing else is served and no "
+                               "token is made. Required.")
     cs_phone.set_defaults(func=_cmd_consent_phone)
 
     from levain.consent.sign_setting import add_parser as add_signed_answers_parser
@@ -2722,37 +2714,17 @@ def _phone_port_default() -> int:
     return DEFAULT_PHONE_PORT
 
 
-def _sign_namespace(text: str) -> str:
-    from levain.consent.sign import namespace_problem
-
-    problem = namespace_problem(text)
-    if problem is not None:
-        raise argparse.ArgumentTypeError(problem)
-    return text
-
-
 def _cmd_consent_phone(args: argparse.Namespace) -> int:
-    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_redirect, run_phone_server
+    from levain.phone_server import DEFAULT_PHONE_PORT, run_phone_redirect
 
-    from levain.consent.queue import default_queue_dir
-
-    if args.redirect_to is not None:
-        full = [flag for flag, given in (("--queue-dir", args.queue_dir), ("--sign-namespace", args.sign_namespaces),
-                                         ("--token-file", args.token_file)) if given]
-        if full:
-            print(f"--redirect-to serves only the redirect: drop {', '.join(full)}", file=sys.stderr)
-            return 2
-        return run_phone_redirect(args.redirect_to, name=args.name, tailscale=args.tailscale,
-                                  port=DEFAULT_PHONE_PORT if args.port is None else args.port,
-                                  link_file=args.link_file.expanduser() if args.link_file is not None else None)
-
-    # the phone port may start before any agent has filed a request: a queue with no database yet lists nothing
-    qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
-    return run_phone_server(qdir, name=args.name, tailscale=args.tailscale,
-                            port=DEFAULT_PHONE_PORT if args.port is None else args.port,
-                            sign_namespaces=tuple(dict.fromkeys(args.sign_namespaces or ())),
-                            link_file=args.link_file.expanduser() if args.link_file is not None else None,
-                            token_file=args.token_file.expanduser() if args.token_file is not None else None)
+    if args.redirect_to is None:
+        print("levain consent phone serves only the redirect now: pass --redirect-to <the cockpit's origin>. The "
+              "phone port's run token is gone; pair a phone to the cockpit with `levain cockpit pair`.",
+              file=sys.stderr)
+        return 2
+    return run_phone_redirect(args.redirect_to, name=args.name, tailscale=args.tailscale,
+                              port=DEFAULT_PHONE_PORT if args.port is None else args.port,
+                              link_file=args.link_file.expanduser() if args.link_file is not None else None)
 
 
 def _consent_queue_dir(args: argparse.Namespace) -> Path:
@@ -3960,13 +3932,29 @@ def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
     user (its file permissions are the authority), minted by ``box``."""
     from levain.cockpit.firejournal import CockpitDB, PairingError
 
+    modes = [name for name, on in (("--short", args.short), ("--list", args.list_devices),
+                                   ("--revoke", args.revoke is not None), ("--revoke-all", args.revoke_all)) if on]
+    if len(modes) > 1:
+        print(f"pair: {' and '.join(modes)} cannot be combined", file=sys.stderr)
+        return 2
     try:
         root = _cockpit_root(args)
-        if not (root / "cockpit.db").is_file():
-            print(f"pair: no cockpit journal under {root}: start `levain serve --write` once first", file=sys.stderr)
+        minting = not (args.list_devices or args.revoke is not None or args.revoke_all)
+        if not minting and not (root / "cockpit.db").is_file():
+            print(f"pair: no cockpit journal under {root}: nothing is paired here yet", file=sys.stderr)
             return 1
         db = CockpitDB(root)
         now = _utc_now()
+        if args.list_devices:
+            for d in db.list_devices():
+                print(_term_safe(f"{d['id']}  {d['label']}  by {d['paired_by']}  created {d['created']}  "
+                                 f"last seen {d['last_seen'] or '-'}  "
+                                 + (f"revoked {d['revoked_at']}" if d["revoked_at"] else "live")))
+            return 0
+        if args.revoke is not None:
+            gone = db.revoke_devices(args.revoke, by="box", now=now)
+            print(f"revoked {len(gone)} paired device(s)" + (": " + ", ".join(gone) if gone else ""))
+            return 0
         if args.revoke_all:
             gone = db.revoke_devices(None, by="box", now=now)
             print(f"revoked {len(gone)} paired device(s)" + (": " + ", ".join(gone) if gone else ""))
@@ -3976,15 +3964,65 @@ def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
             print("pair: stdout is not a terminal, so the one-time link is not printed (anyone who reads it can "
                   "pair a device); run it in a terminal, or pass --print to print it anyway", file=sys.stderr)
             return 1
-        code = db.mint_offer(label=args.label, minted_by="box", now=now)
+        if not (root / "cockpit.db").is_file():
+            # the box's mint is the first credential an off-loopback cockpit can have (the owner key opens nothing
+            # there), so it does not wait on a first `serve --write`: the journal starts here, as the broker starts it
+            refused = _pair_start_journal(root)
+            if refused is not None:
+                print(f"pair: {refused}", file=sys.stderr)
+                return 1
+        if args.short:
+            code = db.mint_short_offer(label=args.label, minted_by="box", now=now)
+        else:
+            code = db.mint_offer(label=args.label, minted_by="box", now=now)
     except (PairingError, *_cockpit_refusals()) as exc:
         print(f"pair: {_term_safe(exc)}", file=sys.stderr)
         return 1
+    if args.short:
+        print(code)
+        print("one use, valid 10 minutes; type it into the app's pair card (a newer code replaces it)", file=sys.stderr)
+        return 0
     path = f"/pair#code={code}"
     print(f"{args.url.rstrip('/')}{path}" if args.url else path)
     print("one use, valid 10 minutes" + ("" if args.url else "; append the path to the cockpit's address"),
           file=sys.stderr)
     return 0
+
+
+def _pair_start_journal(root: Path) -> str | None:
+    """Start a fresh cockpit journal at ``root`` for the box's first mint, by the broker's own start steps: the
+    install check (a governed marker refuses: that root is the root helper's), the network-filesystem check, the data
+    root made ``0700``, then ``cockpit.lock`` taken non-blocking while the schema is written. A held lock is a server
+    starting there, which makes the journal itself: refused, retry. The install class is left for the first
+    ``serve --write`` to set, as it sets it on any fresh journal. None when the journal stands; else why not."""
+    import fcntl
+
+    from levain.cockpit.broker import LOCK_NAME
+    from levain.cockpit.firejournal import DB_NAME, CockpitDB
+    from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
+
+    decision = decide_install(REPORTED, root)
+    if decision.install_class is None:
+        return f"no cockpit journal under {root}, and none is started here: {decision.reason}"
+    problem = network_fs_problem([root])
+    if problem is not None:
+        return problem
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(root / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        return f"data root {root}: {exc}"
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return f"a cockpit server is starting under {root}: try again in a moment"
+        if not (root / DB_NAME).is_file():
+            with CockpitDB(root, owns_lock=True).write():
+                pass            # the first open writes the schema and the format marker
+    finally:
+        os.close(fd)
+    return None
 
 
 def _cmd_cockpit_pending(args: argparse.Namespace) -> int:

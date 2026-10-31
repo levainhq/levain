@@ -523,46 +523,6 @@ def test_nothing_that_decides_authority_reads_the_facts_store() -> None:
 # --- the phone page's key-line --------------------------------------------------------------------------------------
 
 # dash72.example: its rpIdHash starts 0xFB, so the creation's base64url starts with "-" (verify r1 N1)
-@pytest.mark.parametrize("rp", [RP, "dash72.example"])
-def test_the_key_line_puts_a_checked_creation_on_the_enrol_command_and_records_nothing(tmp_path: Path, capsys,
-                                                                                    monkeypatch, rp) -> None:
-    import shlex
-
-    from levain import cli
-    from levain.cockpit import install
-    from levain.phone_server import PhoneError, make_phone_server
-
-    monkeypatch.setattr(install, "marker_dir", lambda: tmp_path / "m")
-    root, laptop = _cockpit(tmp_path)
-    q = tmp_path / "q"
-    q.mkdir()
-    (q / "claude_code.json").write_text(json.dumps({"cockpit_data_root": str(root)}))
-    pk = Passkey(rp=rp)
-    assert _b64u(pk.creation).startswith("-") == (rp != RP)
-    srv = make_phone_server(q, rp, port=0)
-    try:
-        plain = srv.key_line({"spki": _b64u(pk.spki)})
-        assert all("--attested" not in c for c in plain["commands"])
-        with pytest.raises(PhoneError) as bad:
-            srv.key_line({"spki": _b64u(pk.spki), "authenticator_data": _b64u(Passkey(rp=rp).creation)})
-        assert bad.value.status == 422 and "not the key being enrolled" in str(bad.value)
-        with pytest.raises(PhoneError) as extra:
-            srv.key_line({"spki": _b64u(pk.spki), "raw_id": _b64u(pk.cred)})
-        assert extra.value.status == 400
-        got = srv.key_line({"spki": _b64u(pk.spki), "authenticator_data": _b64u(pk.creation) + "=="})
-    finally:
-        srv.server_close()
-    assert keyfacts.read(root) == {}                                     # the page's call records nothing
-    enrol = [c for c in got["commands"] if c.startswith("levain cockpit enroll")]
-    assert enrol, got
-    argv = shlex.split(enrol[0])
-    attested = [a for a in argv if a.startswith("--attested")]
-    assert len(attested) == 1 and attested[0].split("=", 1) == ["--attested", _b64u(pk.creation)]
-    (tmp_path / got["file"]).write_text(got["public_key"] + "\n")
-    argv[argv.index(got["file"])] = str(tmp_path / got["file"])
-    argv[argv.index("YOUR_LAPTOP_PRESENCE_KEY")] = str(laptop.path)
-    assert cli.main(argv[1:]) == 0, capsys.readouterr().err
-    assert keyfacts.read(root)[got["fingerprint"]].credential_id == _b64u(pk.cred)
 
 
 # --- the cockpit's sign listing ---------------------------------------------------------------------------------------

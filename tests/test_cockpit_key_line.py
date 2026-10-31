@@ -19,7 +19,7 @@ from levain.consent.passkey import public_key_line
 from tests.test_cockpit_dispatch_sheet import RP, _serve, _signer, world  # noqa: F401  (world is a fixture)
 from tests.test_cockpit_sign_routes import _call, _serving
 from tests.test_dispatch_phone import repo  # noqa: F401  (a fixture the world needs)
-from tests.test_phone_server import _SPKI, _b64u
+from tests._phone_fixtures import _SPKI, _b64u
 
 ROUTE = "/cockpit/passkey/key-line"
 

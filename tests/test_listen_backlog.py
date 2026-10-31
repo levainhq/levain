@@ -19,7 +19,7 @@ from levain.dashboard import SubstrateSource
 from levain.docs_server import _DocsServer
 from levain.http_guards import LISTEN_BACKLOG
 from levain.init_server import _InitServer
-from levain.phone_server import _PhoneServer
+from levain.phone_server import _RedirectServer
 from levain.team.view import _ViewServer
 from levain.web_server import _LevainHTTPServer, make_server
 from tests.test_dashboard import _make_levain_install
@@ -27,7 +27,7 @@ from tests.test_dashboard import _make_levain_install
 BURST = 48
 
 
-@pytest.mark.parametrize("cls", [_LevainHTTPServer, _PhoneServer, _InitServer, _DocsServer, _ViewServer])
+@pytest.mark.parametrize("cls", [_LevainHTTPServer, _RedirectServer, _InitServer, _DocsServer, _ViewServer])
 def test_every_levain_http_server_takes_the_shared_backlog(cls: type) -> None:
     assert cls.request_queue_size == LISTEN_BACKLOG
     assert LISTEN_BACKLOG >= BURST

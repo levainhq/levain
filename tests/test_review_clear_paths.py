@@ -53,6 +53,7 @@ def test_a_plain_reopen_of_a_yours_to_clear_item_is_allowed(tmp_path: Path) -> N
 from levain.cockpit.coordinator_panels import REVIEW_ID  # noqa: E402
 from tests.test_cockpit_k2a import _install  # noqa: E402
 from tests.test_cockpit_pairing_http import PROXY, T, _call, _pair, _serve  # noqa: E402
+FC = "review-paths-surface-token-0123456789"      # a named surface (the shared token that never clears), honoured proxied (W1b L-1)
 
 
 @pytest.fixture
@@ -67,7 +68,7 @@ def served(tmp_path: Path, monkeypatch):
     plain, _ = review.file_item(store, "seat", {"text": "seat lane-a died"}, dedupe_key="a")
     mine, _ = review.file_item(store, "doubt", {"text": "the receipt does not match"}, dedupe_key="b",
                                authority_relevant=True)
-    with _serve(src) as (port, _httpd):
+    with _serve(src, surface_tokens={"browser": T, "flowconnect": FC}) as (port, _httpd):
         yield port, store, plain, mine
 
 
@@ -101,8 +102,8 @@ def test_the_review_rows_name_their_state_and_offer_clear_only_on_a_plain_open_i
 
 def test_the_shared_surface_token_never_clears_and_says_why(served) -> None:
     port, store, plain, _mine = served
-    row = _rows(port, T)[f"review:{plain.item_id}"]
-    st, out = _fire(port, T, "review_clear", row)
+    row = _rows(port, FC)[f"review:{plain.item_id}"]
+    st, out = _fire(port, FC, "review_clear", row)
     assert (st, out.get("error")) == (403, "device_required"), out
     assert "paired device" in out["message"]
     assert review.get_item(store, plain.item_id).state == "open"
@@ -146,7 +147,7 @@ def test_a_forced_device_clear_of_a_yours_to_clear_item_is_refused_and_writes_no
 # (over a real `levain init` install: the phone's review writes go through the phone app's kernel write, which needs
 # the install its consent hook names; test_review_clear_fix1 holds the fixture)
 
-from tests.test_review_clear_fix1 import _drawn as _version, install, phone  # noqa: E402,F401  (fixtures)
+from tests.test_review_clear_fix1 import _drawn as _version, install  # noqa: E402,F401  (fixtures)
 
 
 def _drawn(base, token, item_id):
@@ -154,63 +155,12 @@ def _drawn(base, token, item_id):
     return {"version": _version(base, token, item_id)}
 
 
-def test_the_phone_clears_and_reopens_a_plain_item_from_a_paired_device(phone) -> None:
-    from tests.test_coordinator_phone import _post
-
-    base, store, plain, dev, _inst = phone
-    drawn = _drawn(base, dev, plain.item_id)
-    status, got = _post(base, f"/coord/review/{plain.item_id}/clear", drawn, dev)
-    assert (status, got.get("state")) == (200, "cleared"), got
-    assert review.get_item(store, plain.item_id).last[:3] == ("cleared", "manual", "operator")
-    status, got = _post(base, f"/coord/review/{plain.item_id}/clear", drawn, dev)
-    assert status == 409, got                          # the item moved since that version was drawn
-    status, got = _post(base, f"/coord/review/{plain.item_id}/reopen", _drawn(base, dev, plain.item_id), dev)
-    assert (status, got.get("state")) == (200, "open"), got
 
 
-def test_the_phone_run_token_never_clears(phone) -> None:
-    from tests.test_coordinator_phone import _post
-
-    base, store, plain, _dev, _inst = phone
-    tok = "run-token-for-test"
-    status, got = _post(base, f"/coord/review/{plain.item_id}/clear", _drawn(base, tok, plain.item_id), tok)
-    assert status == 403 and got["error"] == "device_required", got
-    assert review.get_item(store, plain.item_id).state == "open"
 
 
-def test_the_phone_never_clears_a_yours_to_clear_item(phone) -> None:
-    from tests.test_coordinator_phone import _post
-
-    base, store, _plain, dev, _inst = phone
-    mine, _ = review.file_item(store, "doubt", {"text": "x"}, dedupe_key="b", authority_relevant=True)
-    status, got = _post(base, f"/coord/review/{mine.item_id}/clear", _drawn(base, dev, mine.item_id), dev)
-    # the kernel offers no Clear on a "yours to clear" row (and the store would refuse one: plain_only); the card says
-    # where it is cleared (test_phone_page_review)
-    assert (status, got.get("error")) == (409, "stale") and "no longer offers 'review_clear'" in got["message"], got
-    assert review.get_item(store, mine.item_id).state == "open"
 
 
-def test_the_phone_review_route_takes_only_a_version_and_no_store_is_404(install) -> None:
-    import threading
-
-    from levain.phone_server import make_phone_server
-    from tests.test_coordinator_phone import _post, device_token
-
-    _inst, qdir = install
-    dev = device_token(qdir)
-    item = "rv-" + "0" * 32
-    httpd = make_phone_server(qdir, "localhost", port=0, token="run-token-for-test", dispatch_dir=qdir)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{httpd.server_address[1]}"
-    try:
-        status, got = _post(base, f"/coord/review/{item}/clear", {"version": "x"}, dev)
-        assert (status, got.get("error")) == (404, "not_found"), got   # no coordinator store: nothing made
-        assert not (qdir / "dispatch.db").exists()
-        status, got = _post(base, f"/coord/review/{item}/clear", {"version": "x", "mode": "coordinator"}, dev)
-        assert status == 400, got
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
 
 
 # --- the two pages, driven in headless Chrome --------------------------------------------------------------------
@@ -218,29 +168,6 @@ def test_the_phone_review_route_takes_only_a_version_and_no_store_is_404(install
 from tests.test_cockpit_flip_parity import _drive, needs_browser  # noqa: E402
 
 
-@needs_browser
-def test_the_phone_page_clears_a_plain_item_with_one_tap(phone, tmp_path: Path) -> None:
-    import os
-
-    shots = Path(os.environ.get("LEVAIN_SHOT_DIR") or tmp_path)
-    base, store, plain, dev, _inst = phone
-    review.file_item(store, "doubt", {"text": "x"}, dedupe_key="b", authority_relevant=True)
-    url = base.replace("127.0.0.1", "localhost")
-    out = _drive(tmp_path, f"{url}/#phone_token={dev}", [
-        {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
-        {"until": "document.getElementById('status').textContent !== 'reading the queue…' && 1"},
-        {"eval": "document.getElementById('tab-review').click() || 1"},
-        {"until": "document.querySelectorAll('#review-list .review-item').length === 2 && 1"},
-        {"shot": str(shots / "c4mut_phone_before.png"), "full": True},
-        {"eval": "[...document.querySelectorAll('#review-list button')].find(b => b.textContent === 'Clear').click() || 1"},
-        {"until": "document.querySelectorAll('#review-cleared .review-item').length === 1 && 1"},
-        {"shot": str(shots / "c4mut_phone_after.png"), "full": True},
-        {"eval": "[...document.querySelectorAll('#review-cleared button')].map(b => b.textContent)"},
-    ])
-    posts = [p for p in out["posts"] if "/coord/review/" in p]
-    assert len(posts) == 1 and posts[0].startswith(f"/coord/review/{plain.item_id}/clear"), out["posts"]
-    assert out["values"][-1] == ["Reopen"], out["values"]
-    assert review.get_item(store, plain.item_id).last[:3] == ("cleared", "manual", "operator")
 
 
 REVIEW_BTN = ("[...document.querySelectorAll('[data-ck-verb]')].find(b => b.textContent === 'clear' "

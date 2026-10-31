@@ -318,6 +318,7 @@ def test_a_signed_clear_lands_on_a_store_made_before_r4(tmp_path: Path, monkeypa
 from levain.cockpit.coordinator_panels import REVIEW_ID  # noqa: E402
 from tests.test_cockpit_k2a import _install  # noqa: E402
 from tests.test_cockpit_pairing_http import PROXY, T, _call, _pair, _serve  # noqa: E402
+FC = "review-clear-surface-token-0123456789"      # a named surface: honoured proxied, where the owner key is not (W1b L-1)
 from tests.test_cockpit_sign_origin import PINNED  # noqa: E402
 
 
@@ -342,12 +343,12 @@ def cockpit(tmp_path: Path, monkeypatch):
         asked.append(verb)
         raise ValueError("flow composes send_inbox only")
 
-    with _serve(src, signer=signer, compose_signer=flow_compose, extra_hosts=[RP]) as (port, httpd):
+    with _serve(src, surface_tokens={"browser": T, "flowconnect": FC}, signer=signer, compose_signer=flow_compose, extra_hosts=[RP]) as (port, httpd):
         yield {"port": port, "store": store, "plain": plain, "mine": mine, "pk": pk, "qdir": home / "consent",
                "asked": asked}
 
 
-def _row(c: dict, item: review.Item, token: str = T) -> dict:
+def _row(c: dict, item: review.Item, token: str = FC) -> dict:
     st, panel, _ = _call(c["port"], "GET", f"/cockpit/panel/{REVIEW_ID}.json?profile=full", token=token, headers=PROXY)
     assert st == 200, panel
     return next(r for r in panel["rows"] if r["id"] == f"review:{item.item_id}")
@@ -356,23 +357,23 @@ def _row(c: dict, item: review.Item, token: str = T) -> dict:
 def _compose(c: dict, item: review.Item, txn: str = "draft-0001") -> tuple[int, dict]:
     st, out, _ = _call(c["port"], "POST", "/cockpit/sign/compose",
                        {"verb": "review_clear_signed", "params": {"item": item.item_id}, "client_txn": txn},
-                       token=T, headers=PROXY)
+                       token=FC, headers=PROXY)
     return st, out
 
 
 def _ceremony(c: dict, rid: str) -> None:
-    st, one, _ = _call(c["port"], "GET", f"/cockpit/sign/{rid}.json", token=T, headers=PROXY)
+    st, one, _ = _call(c["port"], "GET", f"/cockpit/sign/{rid}.json", token=FC, headers=PROXY)
     assert st == 200 and one["request"]["message"].startswith("levain review clear "), one
     fp = c["pk"].key.fingerprint
     st, ch, _ = _call(c["port"], "POST", f"/cockpit/sign/{rid}/challenge",
-                      {"signer_fp": fp, "request_sha256": one["request"]["sha256"]}, token=T, headers=PROXY)
+                      {"signer_fp": fp, "request_sha256": one["request"]["sha256"]}, token=FC, headers=PROXY)
     assert st == 200, ch
     st, ans, _ = _call(c["port"], "POST", f"/cockpit/sign/{rid}/answer", c["pk"].assertion(ch["challenge"], PINNED),
-                       token=T, headers=PROXY)
+                       token=FC, headers=PROXY)
     assert st == 200, ans
 
 
-def _send(c: dict, item: review.Item, rid: "str | None", txn: str = "draft-0001", token: str = T) -> tuple[int, dict]:
+def _send(c: dict, item: review.Item, rid: "str | None", txn: str = "draft-0001", token: str = FC) -> tuple[int, dict]:
     row = _row(c, item, token)
     params = {"item": item.item_id} if rid is None else {"item": item.item_id, "sign_request": rid}
     st, out, _ = _call(c["port"], "POST", "/cockpit/verb",
@@ -448,67 +449,10 @@ def test_a_paired_device_sends_the_signed_clear_too(cockpit) -> None:
 from tests.test_dispatch_phone import repo, world  # noqa: E402,F401  (fixtures)
 
 
-def _phone_sign(base: str, port: int, world: dict, row: dict, dev: str) -> None:
-    from tests.test_coordinator_phone import _post
-
-    origin = f"http://localhost:{port}"
-    st, ch = _post(base, f"/sign/{row['id']}/challenge", {"signer_fp": world["phone"].fp,
-                                                           "request_sha256": row["sha256"]}, dev)
-    assert st == 200, ch
-    st, ans = _post(base, f"/sign/{row['id']}/answer", world["phone"].assertion(ch["challenge"], origin), dev)
-    assert st == 200 and ans["namespace"] == REVIEW_CLEAR_NAMESPACE, ans
 
 
-def test_the_phone_files_signs_and_clears_a_yours_to_clear_item_signed(world) -> None:
-    from tests.test_coordinator_phone import _post, device_token
-    from tests.test_phone_dispatch import _serve
-
-    store = CoordStore(world["qdir"])
-    mine = _mine(store)
-    dev = device_token(world["qdir"])
-    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
-        st, got = _post(base, f"/coord/review/{mine.item_id}/sign-request", {}, dev)
-        assert st == 200 and got["request"]["message"] == review.clear_message(mine), got
-        assert got["signers"] == [world["phone"].fp]
-        # the run token never files one, nor clears with one
-        from tests.test_phone_server import _TOK
-
-        assert _post(base, f"/coord/review/{mine.item_id}/sign-request", {}, _TOK)[0] == 403
-        rid = got["request"]["id"]
-        st, out = _post(base, f"/coord/review/{mine.item_id}/clear", {"sign_request": rid}, dev)
-        assert (st, out.get("error")) == (403, "sign_required"), out             # filed, not yet signed
-        _phone_sign(base, httpd.server_address[1], world, got["request"], dev)
-        st, out = _post(base, f"/coord/review/{mine.item_id}/clear", {"sign_request": rid}, dev)
-        assert (st, out.get("state"), out.get("mode")) == (200, "cleared", "signed"), out
-    assert _events(store, mine.item_id) == [("cleared", "signed", "operator", rid)]
 
 
-def test_the_phone_refuses_a_denied_or_older_version_signature(world) -> None:
-    from tests.test_coordinator_phone import _post, device_token
-    from tests.test_phone_dispatch import _serve
-
-    store = CoordStore(world["qdir"])
-    mine = _mine(store)
-    dev = device_token(world["qdir"])
-    with _serve(world["qdir"], world["qdir"]) as (base, httpd):
-        got = _post(base, f"/coord/review/{mine.item_id}/sign-request", {}, dev)[1]
-        st, _ = _post(base, f"/sign/{got['request']['id']}/deny", {"request_sha256": got["request"]["sha256"]}, dev)
-        assert st == 200
-        st, out = _post(base, f"/coord/review/{mine.item_id}/clear", {"sign_request": got["request"]["id"]}, dev)
-        assert (st, out.get("error")) == (403, "sign_required") and "denied" in out["message"], out
-        got = _post(base, f"/coord/review/{mine.item_id}/sign-request", {}, dev)[1]
-        _phone_sign(base, httpd.server_address[1], world, got["request"], dev)
-        review.clear_item(store, mine.item_id)
-        review.reopen_item(store, mine.item_id)
-        st, out = _post(base, f"/coord/review/{mine.item_id}/clear", {"sign_request": got["request"]["id"]}, dev)
-        assert (st, out.get("error")) == (409, "stale"), out
-        # a plain item files no request; a reopen takes no sign request
-        plain, _ = review.file_item(store, "seat", {"text": "x"}, dedupe_key="p")
-        st, out = _post(base, f"/coord/review/{plain.item_id}/sign-request", {}, dev)
-        assert st == 409 and "not yours to clear" in out["message"], out
-        st, out = _post(base, f"/coord/review/{mine.item_id}/reopen", {"sign_request": "lv-x"}, dev)
-        assert st == 400, out
-    assert review.get_item(store, mine.item_id).state == "open"
 
 
 # --- both pages, in headless Chrome, with a CDP virtual authenticator holding the enrolled passkey ------------------
@@ -579,31 +523,3 @@ def test_the_cockpit_page_clears_a_yours_to_clear_item_with_the_passkey(tmp_path
     assert len(ev) == 1 and ev[0][:3] == ("cleared", "signed", "operator") and ev[0][3].startswith("lv-"), ev
 
 
-@needs_browser
-def test_the_phone_page_clears_a_yours_to_clear_item_with_the_passkey(world, tmp_path: Path) -> None:
-    from tests.test_coordinator_phone import device_token
-    from tests.test_phone_dispatch import _serve
-
-    shots = Path(os.environ.get("LEVAIN_SHOT_DIR") or tmp_path)
-    store = CoordStore(world["qdir"])
-    mine = _mine(store)
-    dev = device_token(world["qdir"])
-    with _serve(world["qdir"], world["qdir"]) as (base, _):
-        url = base.replace("127.0.0.1", "localhost")
-        out = _drive(tmp_path, f"{url}/#phone_token={dev}", [
-            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, _authenticator(world["phone"].priv),
-            {"until": "document.getElementById('status').textContent !== 'reading the queue…' && 1"},
-            {"eval": "document.getElementById('tab-review').click() || 1"},
-            {"until": "[...document.querySelectorAll('#review-list button')].some(b => b.textContent === "
-                      "'Clear with passkey') && 1"},
-            {"shot": str(shots / "c4mut2_phone_before.png"), "full": True},
-            {"eval": "[...document.querySelectorAll('#review-list button')].find(b => b.textContent === "
-                     "'Clear with passkey').click() || 1"},
-            {"until": "document.querySelectorAll('#review-cleared .review-item').length === 1 && 1", "ms": 30000},
-            {"shot": str(shots / "c4mut2_phone_after.png"), "full": True},
-        ])
-    posts = [p for p in out["posts"] if "/coord/review/" in p or "/sign/" in p]
-    ends = [p.split(" ")[0].rsplit("/", 1)[-1] for p in posts]
-    assert ends == ["sign-request", "challenge", "answer", "clear"], posts
-    ev = _events(store, mine.item_id)
-    assert len(ev) == 1 and ev[0][:3] == ("cleared", "signed", "operator"), ev
