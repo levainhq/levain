@@ -20,6 +20,7 @@ from levain.cockpit.broker import Broker, Lifecycle
 from levain.cockpit.firejournal import PAIRED_PREFIX
 from levain.dashboard import SubstrateSource
 from levain.web_server import make_server
+from tests._waits import scaled
 from tests.test_cockpit_k2a import _install
 
 T = "pairing-browser-token"
@@ -85,7 +86,7 @@ def src(tmp_path: Path) -> SubstrateSource:
 
 @pytest.fixture
 def quick_wait(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(web_server, "_PAIR_WAIT_S", 0.3)
+    monkeypatch.setattr(web_server, "_PAIR_WAIT_S", scaled(0.3))   # the settle wait is scaled, so a loaded runner gets longer to leave ACTIVATING
 
 
 @contextmanager
@@ -507,7 +508,7 @@ def test_f5_every_pair_503_carries_retry_after_and_the_claims_closes(src, quick_
         st, out, hdrs = _call(port, "POST", "/cockpit/pair/claim", {"code": "x" * 22})
         assert (st, hdrs.get("retry-after"), hdrs.get("connection")) == (503, "2", "close"), (out, hdrs)
     with _serve(src) as (port, httpd):
-        assert httpd.broker.start() is Lifecycle.ACTIVE      # quick_wait is 0.3 s: a still-ACTIVATING broker answers 503 on a loaded runner
+        assert httpd.broker.start() is Lifecycle.ACTIVE      # quick_wait is short: a still-ACTIVATING broker answers 503 on a loaded runner (hence the scale)
         for gate, path, body in ((httpd.pair_claim_gate, "/cockpit/pair/claim", {"code": "x"}),
                                  (httpd.request_gate, "/cockpit/pair/offer", {})):
             held = 0

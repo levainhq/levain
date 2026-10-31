@@ -15,6 +15,7 @@ import pytest
 
 from levain.broker import creds
 from levain.broker import ledger as L
+from tests._waits import scaled
 from tests.ledger_support import (AMOUNT, CAP, SCOPE, FlushCtl, Owner, file_lines, kinds, ledger_path, until,
                                   wait_thread)
 
@@ -595,8 +596,12 @@ def test_hung_flush_marks_unhealthy(tmp_path, monkeypatch, caplog):
 def test_slow_writer_does_not_fault(tmp_path, monkeypatch, caplog):
     path = ledger_path(tmp_path)
     ctl = FlushCtl()
-    ctl.delay = 0.3
-    monkeypatch.setattr(L, "DURABLE_TIMEOUT_S", 0.4)
+    # the delay must sit between half the timeout (the last hold waits on a second flush, so its durable() times out)
+    # and the timeout (no flush stalls past it, so no fault): 0.7 of it keeps a wide margin on each side, and the
+    # pair is scaled together so a slow runner stretches both and the ratio holds
+    timeout = scaled(1.0)
+    ctl.delay = 0.7 * timeout
+    monkeypatch.setattr(L, "DURABLE_TIMEOUT_S", timeout)
 
     async def main():
         led = await _opened(path, monkeypatch, ctl)
@@ -606,7 +611,7 @@ def test_slow_writer_does_not_fault(tmp_path, monkeypatch, caplog):
             rest = [await Owner(led).start() for _ in range(5)]
             last = rest[-1].hold
             with pytest.raises(L.LedgerUnavailable):
-                await last.durable()                    # a flush returned within the last 0.4 s: no fault
+                await last.durable()                    # a flush returned within the last timeout: no fault
             assert led.healthy and led.fault_reason is None and _errors(caplog) == []
             assert last.state is L.RESOLVING and last.outcome == ("released",)
             for o in [first] + rest[:-1]:

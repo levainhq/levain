@@ -402,7 +402,9 @@ def test_the_live_retry_after_a_failure_issues_a_new_read_and_never_shows_the_un
 @needs_browser
 def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_path, monkeypatch):
     out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"},
-                                            {"eval": "document.querySelector('#h6 [data-tv=work]').click(); 1"}, SLEEP(300), {"eval": H_INFO},   # the precondition: the host card is in replay, badged
+                                            {"eval": "document.querySelector('#h6 [data-tv=work]').click(); 1"},
+                                            # the precondition: the host card is in replay, badged (waited for on that state, not a fixed sleep)
+                                            {"until": "window.LevainTopologyView.replaying() && window.__resumes === 1 && !!document.querySelector('#h6 .tv-rbadge')"}, {"eval": H_INFO},
                                             {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE},
                                             # nothing here repaints the card: the badge leaves only if production's own repaint (when the live read applies) redraws it
                                             {"until": "!document.querySelector('#h6 .tv-rbadge')", "ms": 8000}, {"eval": H_INFO}])
