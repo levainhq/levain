@@ -112,6 +112,12 @@ def _names_occurrence(argv: Any, occ_dir: Path) -> bool:
     return False
 
 
+def _by_hand(pgid: int, occ: str) -> str:
+    """The exact manual remedy for a compose group recovery will not signal by number."""
+    return (f"Check process group {pgid} with `ps -g {pgid} -o pid,command`; if it still lists the compose program, "
+            f"end it with `kill -KILL -{pgid}`; then rerun `levain dream recover {occ}`")
+
+
 def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = TERM_WAIT_S,
                      kill_wait: float = KILL_WAIT_S) -> tuple[str, list[str]]:
     """End the compose child ``progress.json`` names, if it outlived its fire. A signal goes to a process whose
@@ -129,11 +135,15 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = 
     if m is None:
         return "not-confirmed", [f"child pid {pid}: the process table could not be read; no signal was sent"]
     if m is False:
-        gone = _group_gone(pid)
-        if gone:
+        from levain.consent.delivery import process_identity
+        if process_identity(pid) is not None:
+            # a live process holds the number, and POSIX hands a pid out only when no process group still has that id:
+            # so the recorded group has ended, whatever the stranger is
+            return "ended", [f"child pid {pid}: another process holds that number now, so the recorded group is gone"]
+        if _group_gone(pid):
             return "ended", [f"child pid {pid}: no longer running"]
-        return "not-confirmed", [f"child pid {pid}: the leader is gone or is another program now, but its process "
-                                 "group is not seen gone; no signal was sent (the leader cannot be identified)"]
+        return "not-confirmed", [f"child pid {pid}: the leader is gone but its process group is not seen gone; no "
+                                 f"signal was sent. {_by_hand(pid, occ_dir.name)}"]
     try:
         leads = os.getpgid(pid) == pid
     except ProcessLookupError:
@@ -166,7 +176,7 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, term_wait: float = 
         notes.append(f"child pid {pid}: ended")
         return "ended", notes
     return "not-confirmed", [f"child pid {pid}: signalled but its group was not seen gone (a group whose leader has "
-                             "exited is not signalled by number; end its members by hand, then rerun recover)"]
+                             f"exited is not signalled by number). {_by_hand(pid, occ_dir.name)}"]
 
 
 # --------------------------------------------------------------------------------------------------------- recover
@@ -256,9 +266,19 @@ def recover(store_path: Path | str, occ_dir: Path | str, *, state: str = "launch
         return RecoverResult("none", "lock-held", notes=["a run holds the store's wrap lock: it may be live; nothing "
                                                          "was changed"], settled=False)
     try:
-        return _recover_locked(db, occ_dir, prog, state, card_filed, term_wait, kill_wait)
+        res = _recover_locked(db, occ_dir, prog, state, card_filed, term_wait, kill_wait)
     finally:
         _w._unlock_wrap(handle)
+    if res.child == "not-confirmed":
+        pid = prog.get("child_pid")
+        line = (f"The compose child (process group {pid}) was not confirmed ended and was not signalled by number. "
+                f"{_by_hand(pid, occ_dir.name)}.") if type(pid) is int else \
+            "The compose child was not confirmed ended; check what is running, then rerun `levain dream recover`."
+        if res.card is None:
+            res.card = _card("failed", "child-not-confirmed", occ_dir.name, his=[line])
+        else:
+            res.card = {**res.card, "his": [*res.card.get("his", []), line]}
+    return res
 
 
 def _recover_locked(db: Path, occ_dir: Path, prog: dict[str, Any], state: str, card_filed: bool, term_wait: float,
@@ -433,7 +453,16 @@ def _recover_saved(db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverRe
             try:
                 _sn.record_post_for(db, occ_dir, prog.get("wrap_id"), composed_sha256=prog.get("composed_sha256"))
             except _sn.SnapshotRefused as exc:
-                res.notes.append(f"post files not recorded: {exc}")
+                # the same state the saving phase leaves when the live text is not the composed text: unsettled, so a
+                # rerun can finish once the text is right, and no terminal record for a save that was not recorded
+                res.notes.append(f"post files not recorded: {exc}; recovery is not settled, so a rerun can finish")
+                again = _sn.read_manifest(occ_dir)
+                if not (again and again.get("post_files")):
+                    reason = COMMITTED_AFTER_STOP if stopped else DIED_BEFORE_CARD
+                    res.ending, res.reason = ("stopped" if stopped else "done"), reason
+                    res.card = None if card_filed else _card("consolidated", reason, occ)
+                    res.settled = False
+                    return res
             except Exception as exc:  # noqa: BLE001
                 res.notes.append(f"post files could not be written ({type(exc).__name__}: {exc}); rerun recover")
                 res.settled = False

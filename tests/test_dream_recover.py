@@ -326,7 +326,9 @@ def test_a_stranger_at_the_recorded_pids_place_is_never_signalled(scratch, tmp_p
     try:
         set_prog(scratch, "o1", child_started_at="Mon Jan  1 00:00:00 2001")     # a different start time: another process
         res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.3, kill_wait=0.3)
-        assert res.child == "not-confirmed" and alive(child)                      # no signal was sent
+        # a live stranger holds the recorded number, so the recorded group has ended (a pid is never handed out while
+        # a group still has that id); the stranger is not signalled and recovery settles
+        assert res.child == "ended" and alive(child) and res.settled
         assert res.ending == "failed" and res.wrap == "cancelled"
     finally:
         with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -351,7 +353,7 @@ def test_a_command_line_that_is_another_occurrences_is_a_mismatch(scratch, tmp_p
         elsewhere.mkdir(parents=True)
         (elsewhere / "progress.json").write_text(json.dumps(prog(scratch, "o1")))
         res = rc.recover(scratch, elsewhere, term_wait=0.3, kill_wait=0.3)        # recorded argv names o1, not o9
-        assert res.child == "not-confirmed" and alive(child)
+        assert res.child == "ended" and alive(child)                              # never signalled
     finally:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(child, signal.SIGKILL)
@@ -494,7 +496,7 @@ def test_h4_an_occurrence_whose_name_is_a_prefix_of_anothers_never_matches_it(sc
         argv = ["sh", "-c", "sleep 300; true", "sh", "--add-dir", str(occ(scratch, "o10"))]
         _record_child(scratch, "o1", p, argv)                          # o1's progress names o10's live process
         res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.3, kill_wait=0.3)
-        assert res.child == "not-confirmed" and p.poll() is None       # no signal: o10's child lives
+        assert res.child == "ended" and p.poll() is None               # not o1's process: unsignalled, o10's child lives
     finally:
         os.killpg(p.pid, signal.SIGKILL)
 
@@ -538,16 +540,15 @@ def test_m3_a_post_record_write_that_fails_is_unsettled_not_a_traceback(scratch,
     assert not res.settled and "read-only" in " ".join(res.notes)
 
 
-def test_m4_a_child_not_seen_ended_keeps_recovery_retryable_and_the_rerun_ends_it(scratch, tmp_path):
+def test_m4_a_child_not_seen_ended_keeps_recovery_retryable_and_the_rerun_ends_it(scratch, tmp_path, monkeypatch):
     child = fire_killed_mid_compose(scratch, "o1", tmp_path)
     try:
-        good = prog(scratch, "o1")["child_started_at"]
-        set_prog(scratch, "o1", child_started_at="Mon Jan  1 00:00:00 2001")
-        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.3, kill_wait=0.3)
+        with monkeypatch.context() as mp:
+            mp.setattr("levain.consent.delivery.process_identity", lambda pid: None)    # the process table is unreadable
+            res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.3, kill_wait=0.3)
         assert res.child == "not-confirmed" and res.wrap == "cancelled" and not res.settled
         assert not (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists() and alive(child)
-        set_prog(scratch, "o1", child_started_at=good)                 # the process table is readable again
-        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=3, kill_wait=3)
+        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=3, kill_wait=3)       # readable again
         assert res.child == "ended" and res.settled and (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists()
         assert not alive(child)
     finally:
@@ -646,3 +647,70 @@ def test_f2_a_legacy_row_without_a_pair_id_is_never_proof_even_with_a_token(scra
     res = rc.recover(scratch, occ(scratch, "o1"))
     assert res.reason == rc.UNKNOWN_COMMIT and res.card["his"]
     assert not sn.read_manifest(occ(scratch, "o1"))["post_files"]
+
+
+# --------------------------------------------------------------------------------------------------- fix4 (L3 round 3)
+
+def test_g4_a_saved_phase_refusal_leaves_recovery_unsettled_and_a_rerun_finishes_it(scratch):
+    dream(scratch, "o1", _VALID)
+    m = sn.read_manifest(occ(scratch, "o1"))
+    m["post_files"], m["wrap_id"] = None, None
+    sn._write_manifest(occ(scratch, "o1"), m)
+    good = (scratch.parent / "memory.continuity.md").read_text()
+    (scratch.parent / "memory.continuity.md").write_text(good + "\nlater edit\n")   # the live text is no longer the composed one
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert not res.settled and "post files not recorded" in " ".join(res.notes)
+    assert not (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists()
+    assert not sn.read_manifest(occ(scratch, "o1"))["post_files"]
+    (scratch.parent / "memory.continuity.md").write_text(good)                     # the text is right again
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert res.settled and (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists()
+    assert sn.read_manifest(occ(scratch, "o1"))["post_files"]
+
+
+def test_g1_a_stranger_reusing_the_recorded_pid_proves_the_group_ended_and_settles(scratch, tmp_path, monkeypatch):
+    # fake the probes: the recorded process is not what holds the number (a live stranger does), and the group probe
+    # still answers "exists" because the probe itself sees the stranger's own group
+    p = subprocess.Popen(["sleep", "300"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _record_child(scratch, "o1", p, ["sleep", "300"])
+        set_prog(scratch, "o1", child_started_at="Mon Jan  1 00:00:00 2001")
+        sent = []
+        monkeypatch.setattr(os, "killpg", lambda pg, sig: sent.append((pg, sig)) if sig else None)
+        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.2, kill_wait=0.2)
+        assert res.child == "ended" and res.settled and sent == []
+        assert p.poll() is None
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_g1_no_holder_of_the_number_but_the_group_still_seen_stays_not_confirmed(scratch, monkeypatch):
+    occ(scratch, "o1").mkdir(parents=True)
+    (occ(scratch, "o1") / "progress.json").write_text(json.dumps(
+        {"phase": "composing", "wrap_token": uuid.uuid4().hex, "child_pid": 2 ** 22 + 777,
+         "child_started_at": "Mon Jan  1 00:00:00 2001", "child_argv": ["x"]}))
+    monkeypatch.setattr("levain.consent.delivery.process_identity", lambda pid: None)
+    monkeypatch.setattr(rc, "_identity_matches", lambda *a: False)
+    monkeypatch.setattr(rc, "_group_gone", lambda pg: False)
+    res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.1, kill_wait=0.1)
+    assert res.child == "not-confirmed" and not res.settled
+
+
+def test_g2_the_card_and_note_name_the_group_and_the_exact_commands(scratch, tmp_path):
+    argv = ["sh", "-c", '(trap "" TERM; sleep 300) & trap "exit 0" TERM; wait', "sh", "--add-dir",
+            str(occ(scratch, "o1"))]
+    p = _spawn_leader(argv, tmp_path)
+    try:
+        _record_child(scratch, "o1", p, argv)
+        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=1.0, kill_wait=0.5)
+        pg = p.pid
+        notes = " ".join(res.notes)
+        card = " ".join(res.card["his"])
+        for text in (notes, card):
+            assert f"ps -g {pg} -o pid,command" in text and f"kill -KILL -{pg}" in text
+            assert "levain dream recover o1" in text
+        assert res.card["reason"] == "child-not-confirmed"
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(p.pid, signal.SIGKILL)
