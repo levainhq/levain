@@ -613,29 +613,32 @@ def _transcript_rate(rec: dict[str, Any], now: datetime) -> float | None:
 def _today_counts(install_root: Path, recs: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
     """The header's day figures. ``tokens_today``: fresh tokens (input + output + cache write; Codex input - cached +
     output) the sessions' transcripts spent since LOCAL midnight, by each record's own timestamp, summed over the
-    transcripts that read; ``tokens_unread`` names how many did not (null total when none read). ``events_today``:
+    transcripts that read; ``tokens_unread`` names how many did not (null total when none read); ``tokens_skipped`` counts subagent
+    transcripts of the ones that read that were left out (the total is then a floor). ``events_today``:
     logged hook events since local midnight (``events_partial``: a log rotated past midnight, so a floor)."""
-    from levain.cockpit.session_context import find_transcript, tokens_since
+    from levain.cockpit.session_context import find_transcript, tokens_since_detail
 
     midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-    total, read, unread = 0, 0, 0
+    total, read, unread, skipped = 0, 0, 0, 0
     events, logs, partial = 0, 0, False
     for rec in recs:
         try:
             path, _why = find_transcript(rec)
-            got, _why = tokens_since(path, rec["agent"], midnight) if path is not None else (None, "no transcript")
+            got, _why, left = (tokens_since_detail(path, rec["agent"], midnight) if path is not None
+                               else (None, "no transcript", 0))
         except Exception:  # noqa: BLE001
-            got = None
+            got, left = None, 0
         if got is None:
             unread += 1
         else:
-            total, read = total + got, read + 1
+            total, read, skipped = total + got, read + 1, skipped + left
         stem = rec.get("_stem")
         if isinstance(stem, str) and _STEM.fullmatch(stem):
             ev = _events_since(install_root, stem, midnight, now)
             if ev is not None:
                 events, logs, partial = events + ev[0], logs + 1, partial or not ev[1]
     return {"tokens_today": total if read else None, "tokens_read": read, "tokens_unread": unread,
+            "tokens_skipped": skipped,
             "events_today": events if logs else None, "events_partial": partial}
 
 

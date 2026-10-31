@@ -262,3 +262,38 @@ def test_cli_words_write_the_word_and_status_says_why(tmp_path, capsys, monkeypa
     for w in ("sleep", "away", "remote", "back"):
         assert _cli(tmp_path, w) == 0
     assert _cli(tmp_path, "status") == 0
+
+
+def test_a_short_write_does_not_truncate_the_word(tmp_path, monkeypatch):
+    """The word is replaced whole from a temp file; a write that takes only part of the bytes must be continued, not
+    renamed into place as a half-written (unreadable) word."""
+    real = os.write
+
+    def short(fd, data):
+        return real(fd, bytes(data)[:3])
+
+    monkeypatch.setattr(presence.os, "write", short)
+    presence._write(tmp_path, {"word": "away", "ts": NOW})
+    monkeypatch.undo()
+    assert presence.read_word(tmp_path) is not None
+    assert presence.read_word(tmp_path)["word"] == "away"
+
+
+def test_a_failed_write_keeps_the_word_and_leaves_no_temp_file(tmp_path, monkeypatch):
+    """A write that fails part way (a full disk) raises, keeps the word already in place, and removes its temp file."""
+    presence._write(tmp_path, {"word": "away", "ts": NOW})
+    real = os.write
+    calls = []
+
+    def fails_second(fd, data):
+        calls.append(1)
+        if len(calls) > 1:
+            raise OSError(28, "No space left on device")
+        return real(fd, bytes(data)[:3])
+
+    monkeypatch.setattr(presence.os, "write", fails_second)
+    with pytest.raises(presence.PresenceError):
+        presence._write(tmp_path, {"word": "sleep", "ts": NOW})
+    monkeypatch.undo()
+    assert presence.read_word(tmp_path)["word"] == "away"
+    assert [p.name for p in tmp_path.rglob("*.tmp")] == []
