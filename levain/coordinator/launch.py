@@ -394,6 +394,12 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "Levain shows you no band on it and does not check your reply for one. Act and record; if something needs him, "
         "file it (`coord escalate`), never narrate it.",
         "",
+        "Words he dropped from the cockpit or the phone have no terminal for your reply, so answer each one you have "
+        f"read with `{lv} coord reply DROP_ID --text-file PATH --token N {tail}` (`--stdin` reads it from stdin; one "
+        "reply per drop, within 24 hours). Levain freezes its own block (what changed, and the band) onto that reply "
+        "and shows it where he reads it; you do not write the block. A drop with no reply after ten minutes shows on "
+        "the Coordinator panel as `no reply yet`.",
+        "",
         "## How your turn ends",
         "",
         "Your words are the last thing in a session the operator may see in his agent view, where a question or "
