@@ -104,7 +104,7 @@ def test_a_store_made_before_the_index_is_read_and_gains_it_at_its_first_writer(
     with review.read_transaction(CoordStore(d).open_readonly) as conn:
         assert review.queue_page(conn, open_limit=10, cleared_limit=10).open_total == 1
     review.reopen_item(CoordStore(d), items[0].item_id)
-    assert indexes() == ["review_events_one_signature"]
+    assert sorted(indexes()) == ["review_events_gseq", "review_events_one_signature"]      # R4's, then S0's
 
 
 # --- F3: one open request per item version on the phone; none filed with no signer -----------------------------------

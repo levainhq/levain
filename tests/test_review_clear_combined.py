@@ -33,11 +33,32 @@ def _snapshot(path: Path) -> dict:
         return {
             "events": conn.execute("SELECT rowid, item_id, seq, op, mode, by, at FROM review_events "
                                    "ORDER BY rowid").fetchall(),
-            "items": conn.execute("SELECT rowid, * FROM review_items ORDER BY rowid").fetchall(),
+            # S0's gseq column is NULL on every row the migration found: the rest of the row is what is compared
+            "items": conn.execute("SELECT rowid, item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at "
+                                  "FROM review_items ORDER BY rowid").fetchall(),
             "triggers": conn.execute("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' "
-                                     "ORDER BY name").fetchall(),
+                                     "AND name NOT LIKE '%gseq%' ORDER BY name").fetchall(),
             "columns": [r[1] for r in conn.execute("PRAGMA table_info(review_events)")],
         }
+    finally:
+        conn.close()
+
+
+def _strip_s0(path: Path) -> None:
+    """Make the file what a store made before C15's S0 holds: no ``gseq`` column, index or trigger on any table the S0
+    migration reaches except ``replies`` (which had its own, CH-D1 §2.8), and no ``gseq_migration_bounds``. The helper
+    below builds its "old" store with the current code, whose ensure path adds them; every row is kept as it was."""
+    from levain.coordinator.store import GSEQ_TABLES
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("DROP TABLE gseq_migration_bounds")
+        for table in GSEQ_TABLES:
+            if table == "replies":
+                continue
+            conn.execute(f"DROP TRIGGER {table}_gseq_no_replace")
+            conn.execute(f"DROP INDEX {table}_gseq")
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN gseq")
     finally:
         conn.close()
 
@@ -64,6 +85,7 @@ def _pre_r4_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path
         review.clear_item(store, c.item_id)
         tok = store.coord_take()
         review.clear_item(store, d.item_id, mode="coordinator", token=tok)
+        _strip_s0(store.path)
         assert _snapshot(store.path)["columns"] == ["item_id", "seq", "op", "mode", "by", "at"]
     copy_dir = _dir(tmp_path, "upgraded")
     src, dst = sqlite3.connect(store.path), sqlite3.connect(copy_dir / "dispatch.db")
@@ -84,7 +106,8 @@ def test_any_writer_opening_a_pre_r4_store_migrates_it_and_keeps_every_row(tmp_p
     assert len(before["events"]) == 5
     CoordStore(d)._connect().close()               # the opener every write takes; no review call at all
     after = _snapshot(d / "dispatch.db")
-    assert after["columns"] == ["item_id", "seq", "op", "mode", "by", "at", "sign_request_id"]
+    # R4's column, then S0's: the rebuild runs first, and the gseq column is added to the rebuilt table
+    assert after["columns"] == ["item_id", "seq", "op", "mode", "by", "at", "sign_request_id", "gseq"]
     assert after["events"] == before["events"]     # every row, its rowid (the cleared page's order) included
     assert after["items"] == before["items"]
     assert after["triggers"] == before["triggers"]

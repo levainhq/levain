@@ -96,7 +96,7 @@ from typing import Any
 
 from levain.autonomic.durable_sqlite import read_transaction, write_transaction
 from levain.coordinator.review import _REF_STORE
-from levain.coordinator.store import CoordError, CoordStore, _append_only
+from levain.coordinator.store import CoordError, CoordStore, _append_only, next_gseq
 
 __all__ = ["FIRST_READER_SCHEMA", "UNREAD_AFTER", "Reading", "answer", "claim_held", "claim_knows", "escalate",
            "hold_ping", "is_coordinator_session", "read_band", "verdict"]
@@ -333,8 +333,8 @@ def _answer_once(store: Any, ref: Any, option: str | None, text: str | None, tok
                                                  "what": q.what, "envelope_id": got.envelope_id},
                              dedupe_key=f"know:question:{q.id}", thread_id=got.thread_id, authority_relevant=True,
                              by="coordinator")
-        conn.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at) VALUES (?, 'know', ?, ?)",
-                     (q.id, reply_id, now))
+        conn.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at, gseq) VALUES (?, 'know', ?, ?, ?)",
+                     (q.id, reply_id, now, next_gseq(conn, now)))
         return item, reply_id
 
 
@@ -365,8 +365,8 @@ def escalate(store: Any, ref: Any, why: str, *, token: object) -> str:
         reply_id = same[0] if same is not None else store._reply(
             conn, thread_id, "answer", _REF_STORE["answer"], q.id,
             {"text": f"question #{q.n}: {q.what}"[:_TEXT_MAX], "why": why, "by": "coordinator"}, now)
-        conn.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at) VALUES (?, 'escalated', ?, ?)",
-                     (q.id, reply_id, now))
+        conn.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at, gseq) "
+                     "VALUES (?, 'escalated', ?, ?, ?)", (q.id, reply_id, now, next_gseq(conn, now)))
         return reply_id
 
 
@@ -523,8 +523,8 @@ def claim_held(directory: Path | str, *, after: timedelta | None = None) -> list
                         {"text": f"question #{q.n}: {q.what}"[:_TEXT_MAX], "by": "service",
                          "why": f"the coordinator had not read it {int(after.total_seconds() // 60)} minutes "
                                 "after it was filed"}, now)
-                conn.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at) "
-                             "VALUES (?, 'escalated', ?, ?)", (q.id, reply_id, now))
+                conn.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at, gseq) "
+                             "VALUES (?, 'escalated', ?, ?, ?)", (q.id, reply_id, now, next_gseq(conn, now)))
             if cause != "answered":
                 out.append((q, cause))
     return out

@@ -174,22 +174,68 @@ SCHEMA: tuple[str, ...] = (
 )
 
 
+# C15 S0: per table the gseq migration reached, the largest rowid it held when it was first migrated (written in the
+# migration's own transaction, once): a row past it with no gseq came from a binary that does not know the column.
+# ADDITIVE like the lifecycle tables (:meth:`CoordStore._statements`): a writer's ensure path makes it; a display's gate
+# does not ask for it, so a store a writer has not brought current is still read
+SEAM_SCHEMA: tuple[str, ...] = (
+    "CREATE TABLE IF NOT EXISTS gseq_migration_bounds (table_name TEXT PRIMARY KEY, baseline_rowid INTEGER NOT NULL)",
+    *_append_only("gseq_migration_bounds", "a migration bound"),
+    "CREATE TRIGGER IF NOT EXISTS gseq_migration_bounds_no_replace BEFORE INSERT ON gseq_migration_bounds WHEN EXISTS "
+    "(SELECT 1 FROM gseq_migration_bounds WHERE table_name = NEW.table_name) "
+    "BEGIN SELECT RAISE(ABORT, 'a migration bound is never replaced'); END",
+)
+
+
 def next_gseq(conn: sqlite3.Connection, now: str) -> int:
     """The next number of the store-wide sequence, taken inside the caller's writing transaction."""
     return conn.execute("INSERT INTO gseq (at) VALUES (?)", (now,)).lastrowid
 
 
+#: the tables the S0 migration puts in the store-wide order (C15 §2): table -> what one row is called in the trigger's
+#: refusal. ``replies`` is the CH-D1 §2.8 precedent; the rest gain the column the same way. A row written before the
+#: column, or by a binary that does not know it, holds NULL (counted by :func:`levain.coordinator.seam_classes.unsequenced`).
+GSEQ_TABLES: dict[str, str] = {
+    "replies": "a reply", "drops": "a drop", "threads": "a thread", "thread_revisions": "a thread revision",
+    "thread_events": "a thread event", "review_items": "a review item", "review_events": "a review event",
+    "first_reads": "a first read", "team_drafts": "a team draft", "team_draft_events": "a team draft event",
+}
+
+
+def _add_gseq(conn: sqlite3.Connection, table: str, what: str | None = None) -> None:
+    """The additive migration (CH-D1 §2.8), for any table: ``table`` gains ``gseq``, NULL on every row written before it,
+    so a row can take its place in the store-wide order. SQLite adds no UNIQUE column, so uniqueness is an index, and a
+    replacing INSERT that reuses a gseq is refused by its own trigger (an INSERT OR REPLACE on a unique index deletes
+    the other row without firing a delete trigger). The table's bound (``gseq_migration_bounds``: the largest rowid it
+    held when it was first migrated) is written in the same transaction, once and never moved, so a later reader can
+    tell a row the migration found (legacy) from a row an old binary wrote after it. Runs in the opener's schema
+    transaction; the table is a name from :data:`GSEQ_TABLES`, never caller text."""
+    if table not in GSEQ_TABLES:
+        raise CoordError(f"{table} is not a table that takes a gseq")
+    what = what or GSEQ_TABLES[table]
+    if "gseq" not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN gseq INTEGER")
+    conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_gseq ON {table} (gseq)")
+    conn.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_gseq_no_replace BEFORE INSERT ON {table} WHEN NEW.gseq IS NOT "
+                 f"NULL AND EXISTS (SELECT 1 FROM {table} WHERE gseq = NEW.gseq) "
+                 f"BEGIN SELECT RAISE(ABORT, '{what} is never replaced'); END")
+    if conn.execute("SELECT 1 FROM gseq_migration_bounds WHERE table_name = ?", (table,)).fetchone() is None:
+        conn.execute("INSERT INTO gseq_migration_bounds (table_name, baseline_rowid) VALUES (?, ?)",
+                     (table, conn.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]))
+
+
 def _replies_gseq(conn: sqlite3.Connection) -> None:
-    """The additive migration (CH-D1 §2.8): ``replies`` gains ``gseq``, NULL on every reply written before it, so the
-    chat timeline can merge a reply into the store-wide order. SQLite adds no UNIQUE column, so uniqueness is an index,
-    and a replacing INSERT that reuses a gseq is refused by its own trigger (an INSERT OR REPLACE on a unique index
-    deletes the other row without firing a delete trigger). Runs in the opener's schema transaction."""
-    if "gseq" not in {r[1] for r in conn.execute("PRAGMA table_info(replies)")}:
-        conn.execute("ALTER TABLE replies ADD COLUMN gseq INTEGER")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS replies_gseq ON replies (gseq)")
-    conn.execute("CREATE TRIGGER IF NOT EXISTS replies_gseq_no_replace BEFORE INSERT ON replies WHEN NEW.gseq IS NOT "
-                 "NULL AND EXISTS (SELECT 1 FROM replies WHERE gseq = NEW.gseq) "
-                 "BEGIN SELECT RAISE(ABORT, 'a reply is never replaced'); END")
+    """``replies``' sequence (CH-D1 §2.8): :func:`_add_gseq` for the one table. Kept as the name the ensure path and its
+    tests know."""
+    _add_gseq(conn, "replies")
+
+
+def _all_gseq(conn: sqlite3.Connection) -> None:
+    """Every table in :data:`GSEQ_TABLES` in the store-wide order: ``replies`` through its own name, then the rest."""
+    _replies_gseq(conn)
+    for table in GSEQ_TABLES:
+        if table != "replies":
+            _add_gseq(conn, table)
 
 
 _CREATES = re.compile(r"CREATE (?:UNIQUE )?(?:TABLE|INDEX|TRIGGER|VIEW) IF NOT EXISTS (\w+)")
@@ -367,7 +413,7 @@ class CoordStore:
     # --- store ---------------------------------------------------------------------------------------------------
     def _statements(self, *, base: bool = False, lifecycle: bool = True) -> tuple[str, ...]:
         """The schema this opener makes. ``base`` is the plain coordinator's alone, without a subclass's added tables.
-        ``lifecycle=False`` leaves out the additive tables, C13's and the operator's work cursor
+        ``lifecycle=False`` leaves out the additive tables, C13's, the operator's work cursor and S0's migration bounds
         (:meth:`_schema_current`'s reader gate)."""
         from levain.coordinator.lease import LEASE_SCHEMA
         from levain.coordinator.first_reader import FIRST_READER_SCHEMA
@@ -379,7 +425,7 @@ class CoordStore:
         # the lease is checked by every opener's coordinator writes, so its tables are every opener's; C13's lifecycle
         # tables (ready items + their journal) are additive, IF NOT EXISTS, like every statement here
         return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA,
-                *((*LIFECYCLE_SCHEMA, *OPERATOR_VIEWS_SCHEMA) if lifecycle else ()))
+                *((*LIFECYCLE_SCHEMA, *OPERATOR_VIEWS_SCHEMA, *SEAM_SCHEMA) if lifecycle else ()))
 
     def _connect(self, *, create: bool = True) -> sqlite3.Connection:
         """A connection with this opener's schema ensured, once per store object (:meth:`_ensure`). ``create=False``
@@ -398,7 +444,8 @@ class CoordStore:
     def _ensure(self, conn: sqlite3.Connection, *, create: bool) -> None:
         """The ONE ensure-schema path: in one ``BEGIN IMMEDIATE``, R4's ``review_events`` rebuild
         (:func:`levain.coordinator.review.migrate_events`), every statement of this opener's schema, the review events'
-        one-signature index (:func:`levain.coordinator.review.ensure_one_signature`), the replies' sequence; after a
+        one-signature index (:func:`levain.coordinator.review.ensure_one_signature`), the store-wide sequence of
+        every table in :data:`GSEQ_TABLES` (``replies`` first: :func:`_all_gseq`); after a
         rebuild, ``PRAGMA integrity_check`` must answer ``ok`` before the transaction commits (any failure rolls all of
         it back). ``create=False``: a file holding no coordinator store is :class:`StoreAbsent`,
         decided under the write lock, and nothing is made."""
@@ -416,7 +463,7 @@ class CoordStore:
             for stmt in self._statements():
                 conn.execute(stmt)
             ensure_one_signature(conn)
-            _replies_gseq(conn)
+            _all_gseq(conn)
             from levain.coordinator.lease import migrate_settings
             migrate_settings(conn)
             if rebuilt:
@@ -554,6 +601,8 @@ class CoordStore:
         the ready reader reads their absence as no items (:mod:`levain.coordinator.ready`)."""
         from levain.dispatch.jobs import _SCHEMA as JOB_SCHEMA, FORMAT
 
+        # only ``replies``' sequence gates a reader: the S0 columns (:data:`GSEQ_TABLES`) are read by no display yet, so a
+        # store a writer has not brought current is still read, as a store made before R4's index is
         if not schema_present(conn, (*JOB_SCHEMA, *self._statements(base=base, lifecycle=not base))) or "gseq" not in {
                 r[1] for r in conn.execute("PRAGMA table_info(replies)")} \
                 or not {"replies_gseq", "replies_gseq_no_replace"} <= _names(conn):
@@ -660,10 +709,10 @@ class CoordStore:
             raise CoordError("an envelope id is ev- and 32 hex")
         conn.execute(
             "INSERT INTO drops (drop_id, surface, outbox_id, words, words_sha256, sent_at, received_at, "
-            "source_repo, source_ref, source_head, source_how, envelope_id, prior_envelope_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            "source_repo, source_ref, source_head, source_how, envelope_id, prior_envelope_id, gseq) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
             (drop_id, surface, outbox_id, words, sha, sent_at, now, source.repo, source.ref, source.head,
-             source.how, envelope_id))
+             source.how, envelope_id, next_gseq(conn, now)))
         self._reply(conn, None, "drop_receipt", "drops", drop_id,
                     {"stage": "delivered", "drop_id": drop_id, "outbox_id": outbox_id, **(receipt or {})}, now)
         from levain.coordinator.lease import wake
@@ -1299,8 +1348,8 @@ class CoordStore:
                 raise CoordError(f"about names an open work thread ({target.thread_id} is {target.kind}, "
                                  f"{target.state})")
         thread_id = "th-" + secrets.token_hex(16)
-        conn.execute("INSERT INTO threads (thread_id, created_at, about) VALUES (?, ?, ?)",
-                     (thread_id, now, part.about))
+        conn.execute("INSERT INTO threads (thread_id, created_at, about, gseq) VALUES (?, ?, ?, ?)",
+                     (thread_id, now, part.about, next_gseq(conn, now)))
         self._revise(conn, thread_id, {drop_id}, "split" if first else "resplit", now)
         self._event(conn, thread_id, "state", "open", "split", by, now)
         self._event(conn, thread_id, "kind", part.kind, "split", by, now)
@@ -1356,17 +1405,18 @@ class CoordStore:
                                  "joins it")
         rev = conn.execute("SELECT COALESCE(MAX(rev), 0) + 1 FROM thread_revisions WHERE thread_id = ?",
                            (thread_id,)).fetchone()[0]
-        conn.execute("INSERT INTO thread_revisions (thread_id, rev, members, members_sha256, cause, at) "
-                     "VALUES (?, ?, ?, ?, ?, ?)", (thread_id, rev, canonical(ordered), members_sha256(ordered),
-                                                   cause, now))
+        conn.execute("INSERT INTO thread_revisions (thread_id, rev, members, members_sha256, cause, at, gseq) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?)", (thread_id, rev, canonical(ordered), members_sha256(ordered),
+                                                      cause, now, next_gseq(conn, now)))
 
     @staticmethod
     def _event(conn: sqlite3.Connection, thread_id: str, field: str, value: str, cause: str, by: str,
                now: str) -> None:
         seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM thread_events WHERE thread_id = ?",
                            (thread_id,)).fetchone()[0]
-        conn.execute("INSERT INTO thread_events (thread_id, seq, field, value, cause, by, at) "
-                     "VALUES (?, ?, ?, ?, ?, ?, ?)", (thread_id, seq, field, value, cause, by, now))
+        conn.execute("INSERT INTO thread_events (thread_id, seq, field, value, cause, by, at, gseq) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (thread_id, seq, field, value, cause, by, now,
+                                                         next_gseq(conn, now)))
 
     @staticmethod
     def _reply(conn: sqlite3.Connection, thread_id: str | None, kind: str, ref_store: str, ref_id: str,
