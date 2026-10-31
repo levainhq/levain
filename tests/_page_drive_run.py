@@ -14,6 +14,7 @@ shot: one that skips this reaping leaves a headless Chrome under PID 1 that macO
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -29,7 +30,7 @@ def run(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[s
     process group is killed and its scratch directory removed before this returns or raises."""
     scratch = tempfile.mkdtemp(prefix="levain-run-")
     proc = subprocess.Popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            start_new_session=True, env={**os.environ, "TMPDIR": scratch})
+                            start_new_session=True, env={**os.environ, "TMPDIR": scratch, **_shared_env(argv)})
     try:
         out, err = proc.communicate(timeout=timeout)
     except BaseException:
@@ -56,6 +57,33 @@ def run(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[s
         return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _extra_flags() -> bool:
+    """True when LEVAIN_DRIVE_CHROME_FLAGS names flags (an empty JSON list names none, as the driver reads it)."""
+    raw = os.environ.get("LEVAIN_DRIVE_CHROME_FLAGS")
+    if not raw:
+        return False
+    try:
+        return bool(json.loads(raw))
+    except ValueError:
+        return True
+
+
+def _shared_env(argv: Sequence[str]) -> dict[str, str]:
+    """The one place a driver call learns of the session's shared Chrome: for a call of ``_page_drive.mjs`` while
+    ``LEVAIN_DRIVE_SHARE=1`` (set by the test session's own fixture, never by default) and no flags that only a new process can
+    take, ask ``tests/_shared_chrome.py`` for a port, which starts that Chrome on first need. Any other call gets nothing."""
+    if os.environ.get("LEVAIN_DRIVE_SHARE") != "1" or _extra_flags():
+        return {}
+    if not any(os.path.basename(str(a)) == "_page_drive.mjs" for a in argv):
+        return {}
+    try:
+        from tests import _shared_chrome
+        shared = _shared_chrome.port()
+    except Exception:   # no shared Chrome is never a failure: the driver launches its own
+        return {}
+    return {"LEVAIN_DRIVE_CDP_PORT": str(shared)} if shared is not None else {}
 
 
 def _sweep(pgid: int) -> None:

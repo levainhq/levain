@@ -38,9 +38,14 @@
 //                                            a cancelled Face ID as the page sees it); nothing is collected
 //   {"key": "<key>"}                        one trusted key press (down, then up) to the focused element; nothing is collected
 // App content that loads asynchronously is not waited for: put an `until` step before the `shot`.
+// LEVAIN_DRIVE_CDP_PORT: the port of an already running headless Chrome (the test session's shared one). The drive then runs in a
+// fresh browser context of that Chrome (its own cookies, storage and cache) and disposes the context on every exit, instead of
+// launching a Chrome of its own: each launch costs macOS keychain calls that no flag removes. A call that passes
+// LEVAIN_DRIVE_CHROME_FLAGS (flags only a new process can take) ignores the port and spawns, exactly as without it.
+// LEVAIN_DRIVE_LAUNCH_LOG: a file that gets one "spawn" line per Chrome this driver launches (a count for a measurement).
 // A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...], "dialogs": ["<type>: <message>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,22 +63,64 @@ const parseScale = (raw) => {
 const WAIT_SCALE = parseScale(process.env.LEVAIN_TEST_WAIT_SCALE ?? "");
 const scaled = (ms) => Math.round(ms * WAIT_SCALE);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
-const prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
 const chromeFlags = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "chrome_flags.json"), "utf8")).flags;
 // LEVAIN_DRIVE_CHROME_FLAGS: a JSON array of extra Chrome flags (a test that must reach the server under a proxied name)
 const extraFlags = process.env.LEVAIN_DRIVE_CHROME_FLAGS ? JSON.parse(process.env.LEVAIN_DRIVE_CHROME_FLAGS) : [];
-const chrome = spawn(chromePath, [...chromeFlags, ...extraFlags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
-  "--no-first-run", "--window-size=1440,1000", "about:blank"], { stdio: "ignore" });
+let sharedPort = /^[0-9]+$/.test(process.env.LEVAIN_DRIVE_CDP_PORT ?? "") && extraFlags.length === 0 ? Number(process.env.LEVAIN_DRIVE_CDP_PORT) : null;
+// a Chrome of our own: this process owns it, its port and its profile (also the way out when the shared Chrome fails to set up)
+let prof = null; let port = null;
+let chrome = { exitCode: 0, signalCode: null, kill() {}, once() {} };   // nothing of ours to kill while the Chrome belongs to the session
+const startSpawn = async () => {
+  port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
+  prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
+  if (process.env.LEVAIN_DRIVE_LAUNCH_LOG) { try { appendFileSync(process.env.LEVAIN_DRIVE_LAUNCH_LOG, "spawn\n"); } catch {} }
+  chrome = spawn(chromePath, [...chromeFlags, ...extraFlags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
+    "--no-first-run", "--window-size=1440,1000", "about:blank"], { stdio: "ignore" });
+};
+if (!sharedPort) await startSpawn();
 // the Python runner gives the driver its own TMPDIR (levain-run-*); a parent that died leaves that for the driver to remove
 const scratch = /\/levain-run-[^/]+\/?$/.test(tmpdir()) ? tmpdir() : null;
 const rm = (d) => { try { rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch {} };
+// a wait that gives up: every setup step against the shared Chrome is bounded, and a refusal there falls back to a Chrome of our own
+const SETUP_MS = 8000;
+const within = (p, ms, what) => Promise.race([p, sleep(ms).then(() => { throw new Error(`${what}: no answer within ${ms}ms`); })]);
+// pending commands of one websocket: all of them are rejected when the socket closes or errors, never left waiting
+const failPending = (map, why) => { for (const { rej } of [...map.values()]) rej(new Error(why)); map.clear(); };
+const openSocket = (url, what) => new Promise((res, rej) => {
+  const w = new WebSocket(url);
+  w.addEventListener("open", () => res(w));
+  w.addEventListener("error", () => rej(new Error(`${what}: the connection failed`)));
+  w.addEventListener("close", () => rej(new Error(`${what}: the connection closed`)));
+});
+// shared Chrome: the browser connection that owns this drive's context, and the context to dispose
+let bws = null; let contextId = null; let bid = 0; const bpend = new Map();
+const bsend = (method, params = {}) => new Promise((res, rej) => {
+  if (!bws || bws.readyState !== 1) return rej(new Error("the browser connection is not open"));
+  const i = ++bid; bpend.set(i, { res, rej });
+  try { bws.send(JSON.stringify({ id: i, method, params })); } catch (e) { bpend.delete(i); rej(e); }
+});
+const disposeContext = async () => {
+  if (!bws || !contextId) return;
+  const c = contextId; contextId = null;
+  // bounded: a wedged browser must not hold the exit; disposeOnDetach closes the context when this connection drops anyway
+  await Promise.race([bsend("Target.disposeBrowserContext", { browserContextId: c }), sleep(2000)]);
+};
 // remove the profile only once Chrome is gone: a live Chrome writes into it again
+let exiting = false;
 const done = (code) => {
-  const fin = () => { rm(prof); if (scratch) rm(scratch); process.exit(code); };
+  if (exiting) return;   // the first exit reason stands; later calls (a signal during a normal exit) change nothing
+  exiting = true;
+  if (sharedPort) {
+    const fin = () => { if (scratch) rm(scratch); process.exit(code); };
+    setTimeout(fin, 3000); disposeContext().then(fin, fin);
+    return;
+  }
+  const fin = () => { if (prof) rm(prof); if (scratch) rm(scratch); process.exit(code); };
   if (chrome.exitCode !== null || chrome.signalCode !== null) return fin();
   chrome.once("exit", fin); setTimeout(fin, 3000); chrome.kill("SIGKILL");
 };
+// done(), then stop here: the exit is scheduled, not immediate, and nothing after it may run
+const giveUp = async (code) => { done(code); await new Promise(() => {}); };
 // Chrome must not outlive this process on any exit node can see: a signal, a thrown error, or the normal exit.
 // (SIGKILL is invisible to node; the Python runner owns that case by killing the whole process group, and a parent
 // that died without doing so is noticed below: node is then adopted by PID 1.)
@@ -83,11 +130,44 @@ process.on("unhandledRejection", (e) => { console.error(e && e.stack || String(e
 process.on("exit", () => { try { chrome.kill(); } catch {} });
 const parent = process.ppid;
 setInterval(() => { if (process.ppid !== parent) done(130); }, 1000).unref();
-let targets = null;
-for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json(); } catch { await sleep(250); } }
-if (!targets) { console.error("chrome never answered"); done(2); }
-const ws = new WebSocket(targets.find((t) => t.type === "page").webSocketDebuggerUrl);
-await new Promise((r) => ws.addEventListener("open", r));
+let pageWsUrl = null;
+const setupShared = async () => {
+  let version = null;
+  for (const end = Date.now() + 5000; Date.now() < end && !version;) {
+    try { version = await (await fetch(`http://127.0.0.1:${sharedPort}/json/version`, { signal: AbortSignal.timeout(3000) })).json(); } catch { await sleep(250); }
+  }
+  if (!version?.webSocketDebuggerUrl) throw new Error("the shared chrome never answered");
+  bws = await within(openSocket(version.webSocketDebuggerUrl, "the shared chrome"), SETUP_MS, "the shared chrome's websocket");
+  bws.addEventListener("message", (m) => { const d = JSON.parse(m.data); if (d.id && bpend.has(d.id)) { const e = bpend.get(d.id); bpend.delete(d.id); e.res(d); } });
+  bws.addEventListener("close", () => failPending(bpend, "the shared chrome closed the connection"));
+  bws.addEventListener("error", () => failPending(bpend, "the shared chrome's connection failed"));
+  const ctx = await within(bsend("Target.createBrowserContext", { disposeOnDetach: true }), SETUP_MS, "createBrowserContext");
+  contextId = ctx.result?.browserContextId;
+  if (!contextId) throw new Error("no browser context: " + JSON.stringify(ctx.error || ctx.result));
+  // newWindow: the width and height apply to a target only when it gets a window of its own
+  const made = await within(bsend("Target.createTarget", { url: "about:blank", browserContextId: contextId, width: 1440, height: 1000, newWindow: true }), SETUP_MS, "createTarget");
+  if (!made.result?.targetId) throw new Error("no target: " + JSON.stringify(made.error || made.result));
+  pageWsUrl = `ws://127.0.0.1:${sharedPort}/devtools/page/${made.result.targetId}`;
+  return await within(openSocket(pageWsUrl, "the shared chrome's page"), SETUP_MS, "the page websocket");
+};
+let ws = null;
+if (sharedPort) {
+  try { ws = await setupShared(); } catch (e) {
+    // a setup failure is never a test failure: this drive runs on a Chrome of its own, as without a shared one
+    console.error(`shared chrome unusable (${e && e.message || e}); launching a Chrome of its own`);
+    const b = bws; bws = null; contextId = null; sharedPort = null;   // the context goes with the connection (disposeOnDetach)
+    try { b && b.close(); } catch {}
+    failPending(bpend, "abandoned");
+    await startSpawn();
+  }
+}
+if (!ws) {
+  let targets = null;
+  for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json(); } catch { await sleep(250); } }
+  if (!targets) { console.error("chrome never answered"); await giveUp(2); }
+  pageWsUrl = targets.find((t) => t.type === "page").webSocketDebuggerUrl;
+  ws = await within(openSocket(pageWsUrl, "chrome's page"), 15000, "the page websocket");
+}
 let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
@@ -102,9 +182,15 @@ ws.addEventListener("message", (m) => {
   }
   // a prompt (the write-token ask) is declined, as an operator who has no token would
   if (d.method === "Page.javascriptDialogOpening") ws.send(JSON.stringify({ id: ++id, method: "Page.handleJavaScriptDialog", params: { accept: false } }));
-  if (d.id && pend.has(d.id)) { pend.get(d.id)(d); pend.delete(d.id); }
+  if (d.id && pend.has(d.id)) { const e = pend.get(d.id); pend.delete(d.id); e.res(d); }
 });
-const send = (method, params = {}) => new Promise((r) => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
+ws.addEventListener("close", () => failPending(pend, "the page connection closed"));
+ws.addEventListener("error", () => failPending(pend, "the page connection failed"));
+const send = (method, params = {}) => new Promise((res, rej) => {
+  if (ws.readyState !== 1) return rej(new Error("the page connection is not open"));
+  const i = ++id; pend.set(i, { res, rej });
+  try { ws.send(JSON.stringify({ id: i, method, params })); } catch (e) { pend.delete(i); rej(e); }
+});
 await send("Page.enable"); await send("Network.enable");
 await send("Page.navigate", { url });
 const values = [];

@@ -57,3 +57,15 @@ def test_the_guard_flags_a_launch_site_that_types_its_own_flags():
     mjs_stripped = "spawn(chrome, ['--headless=new', '--user-data-dir=x'])"
     assert offending_sites({"tests/a.py": good}) == []
     assert offending_sites({"tests/a.py": stripped, "tests/b.mjs": mjs_stripped}) == ["tests/a.py", "tests/b.mjs"]
+
+
+def test_the_shared_session_chrome_launch_site_is_scanned_and_spreads_the_flags():
+    """The session Chrome's launcher names launch markers, so the scan covers it; it must spread the shared flags itself."""
+    files = _tracked_sources()
+    name = "tests/_shared_chrome.py"
+    assert name in files, "the session Chrome launcher is not a tracked source the scan reads"
+    text = files[name]
+    assert any(m in text for m in LAUNCH_MARKERS)
+    assert "*CHROME_SAFE_FLAGS" in text
+    assert offending_sites({name: text}) == []
+    assert offending_sites({name: text.replace("CHROME_SAFE_FLAGS", "X")}) == [name]

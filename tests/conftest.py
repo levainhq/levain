@@ -263,6 +263,31 @@ def pytest_configure(config):
 def pytest_unconfigure(config):
     while _SESSION_HOME:
         shutil.rmtree(_SESSION_HOME.pop(), ignore_errors=True)
+    from tests import _shared_chrome
+    _shared_chrome.shutdown()
+
+
+# Modules that test the driver's own launch and reaping, and tests that need a process of their own, stay on the driver's
+# spawn path (one line why each): the module's file name, or a test's node id suffix.
+SPAWN_PATH_MODULES = {
+    "test_page_drive_reap.py": "tests the driver's Chrome launch and reaping itself",
+    "test_page_drive_contract.py": "tests the driver's launch and its own contract",
+    "test_page_drive_shared.py": "tests the shared Chrome and the driver's fallback from it, and starts its own",
+}
+SPAWN_PATH_TESTS: dict[str, str] = {}
+
+
+@pytest.fixture(autouse=True)
+def _shared_chrome_for_page_drive(request, monkeypatch):
+    """Every driver call goes through tests/_page_drive_run.py, which asks for the session's shared Chrome (and starts it on
+    first need) when LEVAIN_DRIVE_SHARE=1. This fixture only says whether a test may share: it never reads test sources, and
+    removes any ambient port, so a test that does not drive a page never starts the Chrome."""
+    monkeypatch.delenv("LEVAIN_DRIVE_CDP_PORT", raising=False)
+    monkeypatch.delenv("LEVAIN_DRIVE_SHARE", raising=False)
+    path = getattr(request.module, "__file__", None)
+    if not path or os.path.basename(path) in SPAWN_PATH_MODULES or request.node.name.split("[")[0] in SPAWN_PATH_TESTS:
+        return
+    monkeypatch.setenv("LEVAIN_DRIVE_SHARE", "1")
 
 
 @pytest.fixture(autouse=True)
