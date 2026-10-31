@@ -31,27 +31,66 @@ def test_the_size_table_lives_only_in_the_envelope_form() -> None:
 REPOS = ["/work/alpha", "/work/beta", "/work/gamma"]
 VIEW_LINES = ["envelope ev-test", "it may work in the folder you chose"]
 
-INIT = """(() => {
+# The page's two reads are answered inside it. CFG sets how the fake server behaves: store (the listing's store id, None for a fresh
+# install), hold (how many first reviews are held until the test releases them), strict (a review that names no store while another
+# such review is still unanswered is refused 409 other_store, as the real store refuses it), refuse (a review is refused 422, with
+# the given extra keys in the body), challenge ("ok" or "gone").
+INIT_JS = """(() => {
+  const CFG = __CFG__;
   const real = window.fetch.bind(window);
   const top = window.top;
   top.__reviews = top.__reviews || [];
-  const json = (o) => Promise.resolve(new Response(JSON.stringify(o), {status: 200, headers: {'Content-Type': 'application/json'}}));
+  top.__challenges = top.__challenges || [];
+  top.__held = top.__held || [];
+  top.__conflicts = top.__conflicts || 0;
+  top.__holdLeft = top.__holdLeft === undefined ? CFG.hold : top.__holdLeft;
+  top.__nullOut = top.__nullOut || 0;
+  const reply = (status, o) => new Response(JSON.stringify(o), {status: status, headers: {'Content-Type': 'application/json'}});
+  const json = (o) => Promise.resolve(reply(200, o));
+  try { navigator.credentials.get = () => new Promise(() => undefined); } catch (e) { /* the page's own */ }
   window.fetch = (u, o) => {
     const url = String(u);
     if (url.indexOf('/cockpit/coord/drops.json') >= 0) {
-      return json({coord_drops: [], coord_note: null, coord_repos: %(repos)s, coord_store_id: 'st-1', coord_store_read: true,
+      return json({coord_drops: [], coord_note: null, coord_repos: __REPOS__, coord_store_id: CFG.store, coord_store_read: true,
                    coord_signers: ['SHA256:abcdefabcdefabcdefabcdef'], coord_signer_note: null, origin: location.origin,
                    rp_id: location.hostname, credentials: {}});
+    }
+    if (url.indexOf('/cockpit/coord/envelope-challenge') >= 0) {
+      top.__challenges.push(JSON.parse(o.body));
+      if (CFG.challenge === 'gone') return Promise.resolve(reply(409, {error: 'review_gone', message: 'this envelope review is no longer held here'}));
+      return json({challenge: 'AAAA', payload: {}, rp_id: location.hostname, line: '', store_id: 'st-1', store_created: false});
     }
     if (url.indexOf('/cockpit/coord/envelope-review') >= 0) {
       const b = JSON.parse(o.body);
       top.__reviews.push(b);
-      return json({review_id: 'rv-' + top.__reviews.length, body_text: 'BODY', digest: 'dg', rp_id: location.hostname,
-                   view: %(view)s, store_id: 'st-1', store_created: false});
+      const n = top.__reviews.length;
+      const nullStore = b.store_id === null;
+      if (CFG.strict && nullStore && top.__nullOut > 0) {
+        top.__conflicts += 1;
+        return Promise.resolve(reply(409, {error: 'other_store', message: 'this page read another Levain store'}));
+      }
+      if (CFG.refuse) return Promise.resolve(reply(422, Object.assign({error: 'refused', message: CFG.refuse.message}, CFG.refuse.extra || {})));
+      const ok = () => ({review_id: 'rv-' + n, body_text: 'BODY' + n, digest: 'dg', rp_id: location.hostname,
+        view: __VIEW__.concat(['review ' + n]), store_id: nullStore ? 'st-new' : b.store_id, store_created: nullStore});
+      if (nullStore) top.__nullOut += 1;
+      if (top.__holdLeft > 0) {
+        top.__holdLeft -= 1;
+        return new Promise((r) => top.__held.push(() => { if (nullStore) top.__nullOut -= 1; r(reply(200, ok())); }));
+      }
+      if (nullStore) top.__nullOut -= 1;
+      return json(ok());
     }
     return real(u, o);
   };
-})()""" % {"repos": json.dumps(REPOS), "view": json.dumps(VIEW_LINES)}
+})()"""
+
+
+def make_init(store: "str | None" = "st-1", hold: int = 0, strict: bool = False, refuse: "dict | None" = None, challenge: str = "ok") -> str:
+    cfg = {"store": store, "hold": hold, "strict": strict, "refuse": refuse, "challenge": challenge}
+    return (INIT_JS.replace("__CFG__", json.dumps(cfg)).replace("__REPOS__", json.dumps(REPOS)).replace("__VIEW__", json.dumps(VIEW_LINES)))
+
+
+INIT = make_init()
 
 FR = "document.getElementById('levain-sign-sheet-frame')"
 FD = f"({FR} && {FR}.contentDocument)"
@@ -85,13 +124,14 @@ def _tag(t: str, doc: str, js: str) -> dict:
     return {"eval": f"JSON.stringify(Object.assign({{t: {json.dumps(t)}}}, {_in(doc, js)}))"}
 
 
-def _open_from_cockpit(view: str) -> list:
+def _open_from_cockpit(view: str, init: str = INIT, wait: bool = True) -> list:
     emu = {"emulate": {"w": 1280, "h": 900, "dpr": 1}} if view == "1280" else None
     pre = [emu] if emu else list(PHONE_TOUCH)
-    return pre + [{"init": INIT}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
+    return pre + [{"init": init}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
                   _type("tidy the changelog"),
                   {"eval": "document.querySelector('#ck-drop [data-coord-drop=envelope]').click(); 1"},
-                  {"until": _in(FD, "return !!d.getElementById('drop-review') && /ev-test/.test(d.getElementById('drop-review').textContent);"), "ms": 30000}]
+                  {"until": _in(FD, "return !!d.getElementById('drop-review') && /ev-test/.test(d.getElementById('drop-review').textContent);") if wait
+                   else _in(FD, "return !!d.getElementById('drop-review') && " + REVIEWS + ".length >= 1;"), "ms": 30000}]
 
 
 STANDARD = {"where": [{"repo": "/work/alpha", "paths": ["."]}], "lands": [], "stop": "8h",
@@ -189,7 +229,7 @@ def test_each_size_and_landing_sends_exactly_its_spec_and_custom_starts_from_the
     t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
     assert t["standard"]["spec"] == STANDARD and t["standard"]["n"] == 1, t["standard"]
     assert t["btn0"]["disabled"] is False and t["btn0"]["text"] == "Sign with your passkey" and t["btn0"]["custom"] is True, t["btn0"]
-    assert t["btn0"]["review"] == "\n".join(VIEW_LINES), t["btn0"]                    # the server's reading, as sent
+    assert t["btn0"]["review"] == "\n".join(VIEW_LINES + ["review 1"]), t["btn0"]                    # the server's reading, as sent
     assert t["quick"]["spec"] == {**STANDARD, "stop": "2h", "budget": {"tool_calls": 200, "tokens": 2000000, "hours": 1}}, t["quick"]
     assert t["long"]["spec"] == {**STANDARD, "stop": "24h", "budget": {"tool_calls": 2500, "tokens": 25000000, "hours": 8}}, t["long"]
     assert t["main"]["spec"]["lands"] == [{"repo": "/work/alpha", "onto": "main"}], t["main"]
@@ -231,7 +271,7 @@ def test_the_phone_sheet_keeps_its_card_with_the_same_plain_fields_in_one_column
         {"eval": "(() => { const w = document.getElementById('drop-words'); w.value = 'phone words'; w.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"},
         {"until": "(window.__reviews || []).length >= 1", "ms": 20000},
         {"eval": "JSON.stringify({t: 'p', embedded: document.body.classList.contains('sheet-embedded'), brand: document.querySelector('.pair-brand').getClientRects().length > 0, "
-                 "pick: document.querySelectorAll('#drop-repo-pick input').length, seg: document.querySelectorAll('#drop-size .env-seg-btn').length, "
+                 "pick: document.querySelectorAll('#drop-repo-pick input').length, seg: document.querySelectorAll('#drop-size input[type=radio]').length, "
                  "land: document.querySelectorAll('input[name=drop-land]').length, over: document.documentElement.scrollWidth > window.innerWidth, "
                  "oneColumn: document.getElementById('env-size').getBoundingClientRect().left === document.getElementById('env-words').getBoundingClientRect().left, "
                  "spec: window.__reviews[0].spec})"}]
@@ -240,3 +280,207 @@ def test_the_phone_sheet_keeps_its_card_with_the_same_plain_fields_in_one_column
     p = _tagged(out)["p"]
     assert not p["embedded"] and p["brand"] and p["pick"] == 4 and p["seg"] == 4 and p["land"] == 3, p
     assert not p["over"] and p["oneColumn"] and p["spec"] == STANDARD, p
+
+
+# ---- the review's life: stale replies, the store's first identity, a gone review, and what the person is told ----
+
+def _sleep(ms: int) -> dict:
+    return {"eval": f"new Promise((r) => setTimeout(() => r(1), {ms}))"}
+
+
+def _release() -> dict:
+    return {"eval": "(() => { const f = window.__held.shift(); if (!f) return 'none'; f(); return 1; })()"}
+
+
+def _top(t: str, js: str) -> dict:
+    return {"eval": "JSON.stringify(Object.assign({t: " + json.dumps(t) + "}, (() => { " + js + " })()))"}
+
+
+SIGN_ON = {"until": _in(FD, "return !d.getElementById('drop-sign').disabled;"), "ms": 10000}
+SUMMARY = "d.getElementById('drop-review').textContent"
+
+
+@needs_browser
+@needs_ssh
+def test_a_fresh_install_asks_one_review_at_a_time_until_the_store_has_an_identity(tmp_path: Path, monkeypatch) -> None:
+    # the first review makes the store: a second one that still names no store would be refused other_store and leave the form stuck
+    steps = _open_from_cockpit("1280", make_init(store=None, hold=1, strict=True), wait=False) + [
+        _set(FD, "#drop-words", "tidy the changelog, and the readme"),
+        _sleep(1500),
+        _top("mid", "return {n: window.__reviews.length, conflicts: window.__conflicts};"),
+        _release(), _reviews(2), SIGN_ON,
+        _top("end", "return {n: window.__reviews.length, conflicts: window.__conflicts, stores: window.__reviews.map((r) => r.store_id)};"),
+        _tag("shown", FD, "return {review: " + SUMMARY + ", errs: [...d.querySelectorAll('.env-err')].filter((e) => !e.hidden).length};")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["mid"] == {"t": "mid", "n": 1, "conflicts": 0}, t["mid"]                       # the second waits for the first
+    assert t["end"]["conflicts"] == 0 and t["end"]["stores"] == [None, "st-new"], t["end"]  # and then names the store the first made
+    assert "review 2" in t["shown"]["review"] and t["shown"]["errs"] == 0, t["shown"]
+
+
+@needs_browser
+@needs_ssh
+def test_a_late_review_never_enables_or_shows_for_a_form_that_has_moved_on(tmp_path: Path, monkeypatch) -> None:
+    steps = _open_from_cockpit("1280", make_init(hold=2), wait=False) + [
+        _set(FD, "#drop-words", "tidy the changelog, and the readme"), _reviews(2),
+        _release(),                                                                         # review 1 answers late, after the edit
+        _sleep(300),
+        _tag("late", FD, "return {btn: d.getElementById('drop-sign').disabled, review: " + SUMMARY + ", live: d.getElementById('env-live').textContent};"),
+        _click(FD, "#drop-sign"), _sleep(300),
+        _top("noTap", "return {challenges: window.__challenges.length};"),                  # a disabled button posts nothing
+        _release(), SIGN_ON,
+        _tag("current", FD, "return {review: " + SUMMARY + ", live: d.getElementById('env-live').textContent};"),
+        {"eval": _in(FD, "const b = d.getElementById('drop-sign'); b.click(); b.click(); return 1;")},
+        _sleep(800),
+        _top("tapped", "return {challenges: window.__challenges};")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["late"]["btn"] is True and "Reading" in t["late"]["review"] and "review 1" not in t["late"]["review"], t["late"]
+    assert t["late"]["live"] == "", t["late"]                                              # the late reply is not announced either
+    assert t["noTap"]["challenges"] == 0, t["noTap"]
+    assert "review 2" in t["current"]["review"] and t["current"]["live"] == t["current"]["review"], t["current"]
+    assert t["tapped"]["challenges"] == [{"review_id": "rv-2"}], t["tapped"]               # the review in hand, once, for a double tap
+
+
+@needs_browser
+@needs_ssh
+def test_a_review_the_server_no_longer_holds_is_asked_for_again(tmp_path: Path, monkeypatch) -> None:
+    steps = _open_from_cockpit("1280", make_init(challenge="gone")) + [
+        _click(FD, "#drop-sign"), _reviews(2), SIGN_ON,
+        _top("end", "return {n: window.__reviews.length, challenges: window.__challenges};")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["end"]["n"] == 2 and t["end"]["challenges"] == [{"review_id": "rv-1"}], t["end"]
+
+
+@needs_browser
+@needs_ssh
+def test_the_selected_size_does_nothing_when_pressed_and_custom_numbers_are_whole_numbers_within_the_servers_bounds(tmp_path: Path, monkeypatch) -> None:
+    fields = "const f = (k) => d.getElementById('drop-' + k);"
+    steps = _open_from_cockpit("1280") + [
+        _click(FD, "#drop-size-standard"), _sleep(1300),
+        _top("same", "return {n: window.__reviews.length};"),
+        _tag("stops", FD, "const F = d.defaultView.LevainEnvelopeForm; const opts = [...d.querySelectorAll('#drop-stop option')].map((o) => o.value);"
+                          "return {ok: Object.values(F.SIZES).every((s) => opts.indexOf(s.stop) >= 0), opts: opts};"),
+        _click(FD, "#drop-size-custom"), _reviews(2),
+        _tag("attrs", FD, fields + "return {step: f('calls').step, max: [f('hours').max, f('calls').max, f('tokens').max], min: f('calls').min};"),
+        _set(FD, "#drop-calls", "2.5"),
+        _tag("frac", FD, "return {review: " + SUMMARY + ", btn: d.getElementById('drop-sign').disabled};"),
+        _set(FD, "#drop-calls", "100001"),
+        _tag("big", FD, "return {review: " + SUMMARY + ", btn: d.getElementById('drop-sign').disabled};"),
+        _set(FD, "#drop-hours", "25"),
+        _tag("hours", FD, "return {review: " + SUMMARY + "};"),
+        _set(FD, "#drop-hours", "1"), _set(FD, "#drop-calls", "0"), _reviews(3),
+        {"until": _in(FD, "return /nothing can start/.test(" + SUMMARY + ");"), "ms": 10000},
+        _tag("zero", FD, fields + "const w = f('calls-warn');"
+                         "return {warn: w ? w.textContent : null, shown: !!w && w.getClientRects().length > 0, review: " + SUMMARY + ", btn: d.getElementById('drop-sign').disabled};")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["same"]["n"] == 1, t["same"]                                                  # pressing the chosen size retires no review
+    assert t["stops"]["ok"] is True, t["stops"]                                            # every preset's stop is a Custom choice
+    assert t["attrs"] == {"t": "attrs", "step": "1", "max": ["24", "100000", "1000000000"], "min": "0"}, t["attrs"]
+    assert t["frac"]["btn"] is True and "budget.tool_calls is an integer from 0 to 100000" in t["frac"]["review"], t["frac"]
+    assert t["big"]["btn"] is True and "budget.tool_calls is an integer from 0 to 100000" in t["big"]["review"], t["big"]
+    assert "budget.hours is an integer from 0 to 24" in t["hours"]["review"], t["hours"]
+    assert t["zero"]["warn"] == "0 tool calls means nothing can start" and t["zero"]["shown"], t["zero"]
+    assert "0 tool calls means nothing can start" in t["zero"]["review"] and t["zero"]["btn"] is False, t["zero"]   # a warning, not a block
+
+
+def test_the_forms_client_side_bounds_are_the_servers() -> None:
+    from levain.coordinator.envelope import BUDGET_MAX
+
+    src = (WEB / "envelope_form.js").read_text()
+    m = re.search(r"const BUDGET_MAX = \{([^}]*)\}", src)
+    assert m, "the form keeps the server's bounds in one BUDGET_MAX table"
+    mine = {k: int(v) for k, v in re.findall(r"(\w+)\s*:\s*(\d+)", m.group(1))}
+    assert mine == {k: BUDGET_MAX[k] for k in ("tool_calls", "tokens", "hours")}, mine
+
+
+@needs_browser
+@needs_ssh
+def test_the_form_is_native_radios_with_hints_tied_to_their_inputs_and_only_a_settled_review_is_announced(tmp_path: Path, monkeypatch) -> None:
+    steps = _open_from_cockpit("1280") + [
+        _tag("a11y", FD, """
+          const ids = (e) => (e.getAttribute('aria-describedby') || '').split(' ').filter(Boolean);
+          const tied = (e) => { const t = ids(e).map((i) => d.getElementById(i)); return t.length > 0 && t.every((n) => !!n && n.textContent.length > 0); };
+          const fields = [...d.querySelectorAll('.env-field')].map((f) => f.querySelector('input, select'));
+          const groups = [...d.querySelectorAll('fieldset.env-group')].filter((g) => g.querySelector(':scope > .env-hint'));
+          const live = d.getElementById('env-live');
+          return {radios: [...d.querySelectorAll('#drop-size input[type=radio]')].map((r) => r.value), roleRadio: d.querySelectorAll('[role=radio]').length,
+                  labelled: d.querySelectorAll('fieldset [role=radiogroup][aria-label]').length,
+                  fieldsTied: fields.every(tied), fieldN: fields.length, groupsTied: groups.every(tied), groupN: groups.length,
+                  repoPath: tied(d.getElementById('drop-repo')), summaryLive: d.getElementById('drop-review').hasAttribute('aria-live') || d.getElementById('drop-review').closest('[aria-live]').getAttribute('aria-live') !== 'off',
+                  liveAttr: live.getAttribute('aria-live'), liveText: live.textContent, review: """ + SUMMARY + """};"""),
+        _set(FD, "#drop-words", "tidy the changelog, and the readme"),
+        _tag("reading", FD, "return {live: d.getElementById('env-live').textContent, review: " + SUMMARY + "};"),
+        _reviews(2), SIGN_ON,
+        _tag("settled", FD, "return {live: d.getElementById('env-live').textContent, review: " + SUMMARY + "};")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    a = t["a11y"]
+    assert a["radios"] == ["quick", "standard", "long", "custom"] and a["roleRadio"] == 0 and a["labelled"] == 0, a
+    assert a["fieldN"] == 4 and a["fieldsTied"] and a["groupN"] == 3 and a["groupsTied"] and a["repoPath"], a
+    assert a["summaryLive"] is False and a["liveAttr"] == "polite" and a["liveText"] == a["review"], a
+    assert t["reading"]["live"] == "" and "Reading" in t["reading"]["review"], t["reading"]   # the wait is never announced
+    assert t["settled"]["live"] == t["settled"]["review"] and "review 2" in t["settled"]["live"], t["settled"]
+
+
+@needs_browser
+@needs_ssh
+def test_the_form_says_what_each_limit_counts_and_what_happens_next(tmp_path: Path, monkeypatch) -> None:
+    steps = _open_from_cockpit("1280") + [_tag("text", FD, "return {text: d.body.textContent.replace(/\\s+/g, ' ')};")]
+    text = _tagged(_run(tmp_path, monkeypatch, "1280", steps))["text"]["text"]
+    for want in ("An envelope is a permission slip you sign: which folder it may work in, whether it may land, for how long, and how much it may do.",
+                 "The limits count across the whole thread, all its workers together; extending sets a new total.",
+                 "Hard stop after", "this long after you sign, it stops no matter what",
+                 "fresh tokens: input, output and new cache writes (cache reads don't count)",
+                 "These numbers are starting points",
+                 "Reaching a limit: no new workers start until you extend. Nothing running is killed.",
+                 "Hard stop: it ends at this time regardless.",
+                 "sends your words with no limits attached",
+                 "then the coordinator may start work inside these limits"):
+        assert want.lower() in text.lower(), want
+    assert "Ends by" not in text and "pauses new work" not in text
+
+
+@needs_browser
+@needs_ssh
+def test_a_refusal_goes_where_the_server_named_it_else_under_the_summary_and_the_button_says_why(tmp_path: Path, monkeypatch) -> None:
+    probe = ("return {where: [...d.querySelectorAll('.env-err')].filter((e) => !e.hidden).map((e) => e.parentElement.id + ': ' + e.textContent),"
+             "btn: d.getElementById('drop-sign').disabled, why: d.getElementById('drop-sign-why').textContent,"
+             "by: d.getElementById('drop-sign').getAttribute('aria-describedby')};")
+    msg = "budget.tokens is an integer from 0 to 1000000000"
+    for name, refuse, parent in (("plain", {"message": msg}, "env-sum"), ("named", {"message": msg, "extra": {"field": "budget"}}, "env-size")):
+        sub = tmp_path / name
+        sub.mkdir()
+        steps = _open_from_cockpit("1280", make_init(refuse=refuse), wait=False) + [
+            {"until": _in(FD, "return /cannot be signed/.test(" + SUMMARY + ");"), "ms": 10000}, _tag("refused", FD, probe)]
+        r = _tagged(_run(sub, monkeypatch, "1280", steps))["refused"]
+        assert len(r["where"]) == 1 and r["where"][0].startswith(parent + ": ") and msg in r["where"][0], r
+        assert r["btn"] is True and r["why"] and r["by"] == "drop-sign-why", r
+    steps = _open_from_cockpit("1280") + [_set(FD, "#drop-words", ""), _tag("empty", FD, probe)]
+    sub = tmp_path / "empty"
+    sub.mkdir()
+    e = _tagged(_run(sub, monkeypatch, "1280", steps))["empty"]
+    assert e["btn"] is True and "words" in e["why"], e
+
+
+@needs_browser
+@needs_ssh
+def test_at_phone_width_the_sign_button_is_reachable_without_scrolling(tmp_path: Path, monkeypatch) -> None:
+    steps = _open_from_cockpit("390") + [
+        _tag("sticky", FD, "d.defaultView.scrollTo(0, 0); const b = d.getElementById('drop-sign').getBoundingClientRect();"
+                           "return {bottom: b.bottom, top: b.top, h: d.defaultView.innerHeight, tall: d.documentElement.scrollHeight};"),
+        _shot(tmp_path, "sticky_390")]
+    s = _tagged(_run(tmp_path, monkeypatch, "390", steps))["sticky"]
+    assert s["tall"] > s["h"] and 0 <= s["top"] and s["bottom"] <= s["h"], s
+
+
+@needs_browser
+@needs_ssh
+def test_the_repo_default_is_said_aloud_until_the_person_chooses_or_types(tmp_path: Path, monkeypatch) -> None:
+    probe = ("const h = d.getElementById('env-repo-default');"
+             "return {text: h ? h.textContent : null, shown: !!h && h.getClientRects().length > 0, checked: [...d.querySelectorAll('#drop-repo-pick input')].filter((r) => r.checked).map((r) => r.value)};")
+    for name, step in (("typed", _set(FD, "#drop-repo", "/elsewhere")), ("picked", _click(FD, "#drop-repo-pick label:nth-child(2) input"))):
+        sub = tmp_path / name
+        sub.mkdir()
+        t = _tagged(_run(sub, monkeypatch, "1280", _open_from_cockpit("1280") + [_tag("before", FD, probe), step, _tag("after", FD, probe)]))
+        assert t["before"]["text"] == "Pre-picked: the folder of your newest thread. Change it if that's wrong." and t["before"]["shown"], t["before"]
+        assert t["after"]["shown"] is False, t["after"]
+        if name == "typed":
+            assert t["after"]["checked"] == ["/work/alpha"], t["after"]      # typing marks the choice as the person's, it does not move the pick

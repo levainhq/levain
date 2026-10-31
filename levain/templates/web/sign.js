@@ -792,12 +792,22 @@
     sign.id = "drop-sign";
     sign.disabled = true;
     acts.append(sign, send);
+    // beside the buttons: why Sign is off, what each button does, and what comes after signing
+    const signWhy = el("p", "env-hint env-why");
+    signWhy.id = "drop-sign-why";
+    const buttonNotes = el("div", "env-notes");
+    const sendNote = el("p", "env-hint", "Send words only: sends your words with no limits attached.");
+    sendNote.id = "drop-send-note";
+    send.setAttribute("aria-describedby", sendNote.id);
+    buttonNotes.append(sendNote, el("p", "env-hint", "Sign, then the coordinator may start work inside these limits."));
     let oid = newOutboxId();       // held for these words: a resend after a lost reply files once, never twice
     let cannot = "";
     const why0 = !storeRead ? "still reading which Levain answers here; reload" : "";
     // the fields, the spec and the review are the shared form's (envelope_form.js); this page passes how a review is asked for
     const form = window.LevainEnvelopeForm.create({
-      words: words, wordsGroup: true, left: colL, right: colR, lockRoots: [grid], repos: got.coord_repos, sign: sign, why: why,
+      words: words, wordsGroup: true, left: colL, right: colR, lockRoots: [grid], repos: got.coord_repos, sign: sign, signWhy: signWhy, why: why,
+      storeId: () => storeId,
+      refreshStore: () => readDrops().then((g) => { if (g && typeof g.coord_store_id === "string") storeId = g.coord_store_id; }),
       blocked: () => (cannot ? "Envelope: " + cannot : why0),
       review: (req) => {
         const k = keyNow();
@@ -809,7 +819,12 @@
         });
       },
     });
-    colR.append(keyBox, acts, $("sheet-note"));
+    const bar = el("div", "env-bar");      // the reason and the buttons, kept together (and held at the bottom of a phone-width page)
+    bar.append(signWhy, acts);
+    form.foot.append(keyBox, bar, buttonNotes, $("sheet-note"));
+    // the sheet is a live region for its progress lines; the form inside it is not, or "Reading…" would be read out on every keystroke (the form announces a settled review itself)
+    grid.setAttribute("aria-live", "off");
+    $("sheet-note").setAttribute("aria-live", "polite");
     body.appendChild(list);
     if (words.value) grow(words);      // sized once it is in the page: a box that is not laid out yet measures nothing
     $("sheet").dataset.state = "open";
@@ -938,7 +953,7 @@
       : origin !== window.location.origin ? "this page cannot use your passkey: sign on " + (origin || "the cockpit's https page")
       : typeof got.elsewhere === "string" && got.elsewhere ? got.elsewhere
       : !signers.length ? (got.coord_signer_note || "no passkey enrolled for " + rp + " can sign an envelope") : "";
-    if (cannot) { const n = el("p", "ext-meta", "Envelope: " + cannot); n.id = "drop-sign-note"; colR.insertBefore(n, acts); sign.disabled = true; }
+    if (cannot) { const n = el("p", "ext-meta", "Envelope: " + cannot); n.id = "drop-sign-note"; form.foot.insertBefore(n, bar); sign.disabled = true; }
 
     // ---- the passkey this device signs with: the one it holds; a choice only when it holds several ----
     const localKeys = mine(rp);
