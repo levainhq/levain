@@ -476,6 +476,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   on a real phone or a real push.
 
 ### Fixed
+- **Turn on for pings no longer does nothing on an iPhone or iPad.** Safari and Chrome on iOS and iPadOS offer the push API only to
+  an app opened from the Home Screen, so in a browser tab the button threw "Can't find variable: Notification". The Devices panel
+  now hides the button there and says how to get pings (Share, Add to Home Screen, open Levain from the Home Screen, pair once
+  with a code, then Turn on); other browsers without the API say "This browser does not offer pings."; a Turn on failure reads as
+  plain words with the reason. The pair card of a Home Screen app adds that it needs one pairing code of its own. The Devices
+  panel's device ages ("paired", "last seen") now read as times again instead of raw numbers.
+- **The Devices panel no longer reads a stranded device as connected.** The tab is now "Paired (N)" (it counts keys held, not
+  connections), and a paired device not seen for more than a day shows "not seen for N days" (or "never seen") with the line to
+  revoke it and pair it again if it asks for a pairing code.
 - **The cockpit's Work view now does something when you click it.** A worker in the Work lens opens its agent page, as a node in the Agents graph does, and an open loop opens its row in the Open loops panel (scrolled to, unfolded if folded, and lit for a moment).
 - **The cockpit's tokens-today figure no longer leaves out subagent lanes on a busy session.** It read only the first 64
   subagent transcripts by file name, so on a heavy session the later lanes were silently missing. It now reads every
