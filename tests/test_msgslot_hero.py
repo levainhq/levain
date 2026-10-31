@@ -64,6 +64,7 @@ def test_the_drop_sits_directly_under_the_needs_you_row_above_the_work_regions(v
         out = _drive_view(view, tmp_path, f"{rig.origin}/#write_token={TOK}",
                           [{"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, SETTLE, {"eval": probe}, _shot(tmp_path, f"{view}_home")])
     p = _tagged(out)["pos"]
+    assert p["needs"] is not None and p["bandBottom"] is not None and p["drop"] is not None, p   # a hidden Needs-you row fails here, not as a TypeError below
     assert p["afterNeeds"] and not p["insideHero"] and not p["over"], p                    # the next element after the strip in the document, outside the hero
     assert p["bandBottom"] <= p["needs"] and p["needsBottom"] <= p["drop"], p               # under the band, and under the strip (the document order is the narrow order too)
     assert p["drop"] < p["tray"], p                                                         # above the work regions...
@@ -71,6 +72,40 @@ def test_the_drop_sits_directly_under_the_needs_you_row_above_the_work_regions(v
     assert p["sky"] is None or (p["sky"] < p["needs"] if view == "1280" else p["needs"] < p["sky"]), p   # the desktop sky card sits above the strip; the narrow page draws it after
     assert p["boxW"] >= (0.55 if view == "1280" else 0.85) * p["hostW"] and p["boxH"] >= 150, p   # the free-text rule: the box fills its card (a side column of drops beside it from 1100px), ~8 rows
     assert p["buttons"][:2] == ["Send", "Add an envelope"], p
+
+
+@needs_browser
+@needs_ssh
+def test_a_hidden_drop_paints_nothing_at_desktop_width(tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    probe = ("(() => { const d = document.getElementById('ck-drop'); const was = d.hidden; d.hidden = true; const cs = getComputedStyle(d);"
+             " const r = JSON.stringify({t: 'hid', was, display: cs.display, h: d.getBoundingClientRect().height}); d.hidden = was; return r; })()")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}",
+                     [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, SETTLE, {"eval": probe}])
+    h = _tagged(out)["hid"]
+    assert h["was"] is False and h["display"] == "none" and h["h"] == 0, h   # a [hidden] card does not paint as an empty frame at >=1100px
+
+
+@needs_browser
+@needs_ssh
+@pytest.mark.parametrize("bad_view", ["null", "'not a view'"])
+def test_the_drop_leaves_with_the_ke_page_and_returns_with_the_next_ke_render(bad_view: str, tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    state = ("(() => { const d = document.getElementById('ck-drop'); const b = document.getElementById('ck-drop-words');"
+             " return JSON.stringify({t: 'TAG', hidden: d.hidden, display: getComputedStyle(d).display, shown: d.getClientRects().length > 0,"
+             " send: !!document.querySelector('#ck-drop [data-coord-drop=send]'), box: !!b}); })()")
+    away = f"window.LevainDashboard.render({bad_view}); 1"
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}",
+                     [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, SETTLE,
+                      {"eval": state.replace("TAG", "on")}, {"eval": away}, {"eval": state.replace("TAG", "away")},
+                      {"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"},
+                      {"until": "!document.getElementById('ck-drop').hidden", "ms": 20000}, SETTLE, {"eval": state.replace("TAG", "back")}])
+    t = _tagged(out)
+    assert t["on"]["hidden"] is False and t["on"]["shown"] is True, t["on"]
+    assert t["away"]["hidden"] is True and t["away"]["display"] == "none" and t["away"]["shown"] is False, t["away"]   # not drawn, so Send cannot be clicked on stale state
+    assert t["back"]["hidden"] is False and t["back"]["shown"] is True and t["back"]["send"] is True, t["back"]
 
 
 @needs_browser
@@ -301,10 +336,10 @@ def test_the_hero_box_and_its_typed_words_survive_the_cockpit_re_render(tmp_path
     redrawn = "(() => { const w = document.getElementById('ck-when'); return w && w.firstChild && !w.firstChild.__gen; })()"
     steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, _type("typed, not sent"), {"eval": mark},
              {"eval": "document.dispatchEvent(new Event('visibilitychange')); 1"}, {"until": redrawn, "ms": 20000}, SETTLE,
-             {"eval": f"JSON.stringify({{t: 'kept', same: {BOX}.__mark === 1, value: {BOX}.value, inHero: !!document.querySelector('#ck-needs + #ck-drop')}})"}]
+             {"eval": f"JSON.stringify({{t: 'kept', same: {BOX}.__mark === 1, value: {BOX}.value, afterNeeds: !!document.querySelector('#ck-needs + #ck-drop')}})"}]
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
-    assert _tagged(out)["kept"] == {"t": "kept", "same": True, "value": "typed, not sent", "inHero": True}, _tagged(out)["kept"]
+    assert _tagged(out)["kept"] == {"t": "kept", "same": True, "value": "typed, not sent", "afterNeeds": True}, _tagged(out)["kept"]
 
 
 def test_the_sheet_and_the_hero_derive_the_one_kept_key_the_same_way() -> None:

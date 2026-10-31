@@ -597,6 +597,8 @@
     const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
     if (!hero || !brief || !widgets) return;
     hero.hidden = brief.hidden = widgets.hidden = !on;
+    const dropHost = document.getElementById("ck-drop");
+    if (dropHost && !on) dropHost.hidden = true;   // the Send box sits outside the hero now: it leaves with the KE page, and the next KE render (renderDropHero) shows it again
     const needsHost = document.getElementById("ck-needs");
     if (needsHost && !on) clearNeeds(needsHost);   // the strip is drawn only by the KE page, and only while something waits (renderNeeds)
     const notesHost = document.getElementById("ck-notes");

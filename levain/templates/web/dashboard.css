@@ -2868,7 +2868,7 @@ body .state-input { font-size: 16px; }
    so the box keeps a typing measure and the card stays one box tall, not one box plus a list. */
 body.ke .ck-drop.frame { box-sizing: border-box; padding: var(--sp-6); margin-inline: var(--gutter-ke); margin-top: var(--sec); display: flex; flex-direction: column; gap: var(--sp-4);
   background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); }
-body.ke .ck-drop[hidden] { display: none; }
+body.ke .ck-drop.frame[hidden] { display: none; }   /* one class more than the display:flex/grid rules of the frame, so no later media rule can paint a hidden card */
 body.ke .ck-drop .needs-headline h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
 body.ke .ck-drop .drop-note.bad { color: var(--bad); }
 body.ke .ck-drop .drop-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
@@ -2882,7 +2882,7 @@ body.ke .ck-drop .drop-earlier { margin: 0; overflow-wrap: anywhere; }
 body.ke .ck-drop .drop-earlier:empty { display: none; }
 body.ke .ck-drop .drop-recent { display: flex; flex-direction: column; }
 body.ke .ck-drop .drop-recent:empty { display: none; }
-body.ke .ck-drop .drop-recent-row { display: grid; grid-template-columns: 14ch minmax(0, 1fr) auto; gap: var(--sp-4); align-items: baseline; padding: var(--sp-3) 0; border-top: 1px solid var(--hair); }   /* one fixed time column: the words start at one x on every row */
+body.ke .ck-drop .drop-recent-row { display: grid; grid-template-columns: 17ch minmax(0, 1fr) auto; gap: var(--sp-4); align-items: baseline; padding: var(--sp-3) 0; border-top: 1px solid var(--hair); }   /* one fixed time column: the words start at one x on every row */
 body.ke .ck-drop .drop-when { font-variant-numeric: tabular-nums; }
 body.ke .ck-drop .drop-words-first { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 body.ke .ck-drop .drop-more { align-self: flex-start; margin-top: var(--sp-3); }
@@ -2892,7 +2892,7 @@ body.ke .ck-drop .drop-more { align-self: flex-start; margin-top: var(--sp-3); }
   body.ke .ck-drop.frame > .drop-receipt:empty { margin-top: 0; }
   body.ke .ck-drop.frame:has(> .drop-recent:empty) { grid-template-columns: minmax(0, 1fr); }
   body.ke .ck-drop.frame > * { grid-column: 1; }
-  body.ke .ck-drop.frame > .drop-recent { grid-column: 2; grid-row: 1 / span 6; margin-left: var(--sp-6); padding-left: var(--sp-6); border-left: 1px solid var(--hair); }
+  body.ke .ck-drop.frame > .drop-recent { grid-column: 2; grid-row: 1 / span 12; margin-left: var(--sp-6); padding-left: var(--sp-6); border-left: 1px solid var(--hair); }
   body.ke .ck-drop .drop-recent-row { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "w w" "t s"; gap: var(--sp-1) var(--sp-4); }
   body.ke .ck-drop .drop-recent-row:first-child { border-top: 0; padding-top: 0; }
   body.ke .ck-drop .drop-words-first { grid-area: w; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
