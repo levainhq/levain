@@ -118,8 +118,11 @@
   }
   // W1b: the pair card, for a page whose server will not take the owner key (off the box). It asks for the short code a paired
   // device or the desk shows and hands it to pair_card.js, which claims it; the card never holds a token itself.
+  // A pair card already up is left as it is (a later 403 in the same load, or a passive re-read, would wipe the typed code);
+  // the unpaired card, which has no form, is replaced.
   function showPairCard() {
     const old = document.getElementById("ck-unpaired");
+    if (old && old.querySelector(".pair-form")) return;
     if (old) old.remove();
     const veil = document.createElement("div");
     veil.id = "ck-unpaired";

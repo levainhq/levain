@@ -27,9 +27,10 @@
     if (text !== undefined) n.textContent = text;
     return n;
   }
-  // the typed code as the server reads it: no spaces or hyphens, upper case, the look-alikes O, I and L as 0, 1, 1
+  // the typed code as the server reads it (levain/cockpit/shortcode.py normalize_short): no spaces, hyphens, or invisible
+  // format and control characters (Cf, Cc: a zero-width space, a soft hyphen), upper case, the look-alikes O, I and L as 0, 1, 1
   function fold(text) {
-    return String(text || "").replace(/[\s‐-―−-]/g, "").toUpperCase().replace(/O/g, "0").replace(/[IL]/g, "1");
+    return String(text || "").replace(/[\s‐-―−\-\p{Cf}\p{Cc}]/gu, "").toUpperCase().replace(/O/g, "0").replace(/[IL]/g, "1");
   }
   async function api(method, path, body) {
     const headers = {};
@@ -64,6 +65,10 @@
     if (res.status === 503) return "The cockpit is busy. Try again in a moment.";
     return "Could not pair (" + ((res.data && res.data.message) || res.status) + ").";
   }
+  // A claim that may have spent its code without this page keeping the key: the POST went out and its answer was lost, or the
+  // key came back and storage refused it. A later refusal then says so, as pair.js does after a lost answer.
+  let maybeSpent = false;
+  const MAYBE_SPENT = "The code may have worked: a device may be paired without this one holding its key. Ask for a new code, and revoke the newest device in Devices.";
   // Returns true when this device is now paired.
   async function claim(typed, ui) {
     const say = (m) => { ui.message.textContent = m; ui.message.hidden = !m; };
@@ -71,13 +76,18 @@
     if (code.length !== 8) { say("Type all eight characters of the code."); return false; }
     let res;
     try { res = await api("POST", "/cockpit/pair/claim", { short: code }); }
-    catch (_) { say("Could not reach the cockpit."); return false; }
-    if (res.status !== 200) { say(refusal(res)); return false; }
+    catch (_) { maybeSpent = true; say("Could not reach the cockpit. If the code reached it, it may already be used."); return false; }
+    if (res.status !== 200) { say(res.status === 403 && maybeSpent ? MAYBE_SPENT : refusal(res)); return false; }
     const tok = res.data && res.data.token;
     res = null;
     if (typeof tok !== "string" || !/^[\x21-\x7e]+$/.test(tok)) { say("The cockpit did not hand back a usable key. Ask for a new code."); return false; }
     try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); }
-    catch (_) { say("This browser will not keep the key (storage is blocked here). The code is spent: ask for a new one."); return false; }
+    catch (_) {
+      maybeSpent = true;
+      say("This browser will not keep the key (storage is blocked here). The code is spent: ask for a new one, and revoke the newest device in Devices.");
+      return false;
+    }
+    maybeSpent = false;
     try { window.localStorage.setItem(PAIRED_MARK_KEY, "1"); } catch (_) { /* the key is kept; the mark is not */ }
     purgeOldPhoneKeys();
     try { window.dispatchEvent(new Event("levain:write-token-change")); } catch (_) { /* no events */ }
@@ -118,6 +128,7 @@
       return;
     }
     let out = null;
+    // every way out of the handler (a refusal, a failed subscribe, a throw, the test ping) gives the button back for another tap
     const turnOn = async (btn) => {
       btn.disabled = true; out.hidden = true;
       let sub = null;
@@ -140,13 +151,11 @@
         sub = null;
         const test = await api("POST", "/webpush/test", {});
         say(test.status === 200 ? testWords(test.data) : "Pings are on, but the test ping was refused (" + ((test.data && test.data.message) || test.status) + ").");
-        btn.textContent = "Test again"; btn.disabled = false;
-        return;
+        btn.textContent = "Test again";
       } catch (e) {
         if (sub) await sub.unsubscribe().catch(() => {});
         say("Could not turn pings on: " + ((e && e.message) || e));
-      }
-      btn.disabled = false;
+      } finally { btn.disabled = false; }
     };
     const say = (m) => { out.textContent = m; out.hidden = !m; };
     out = draw(ui, "Paired", "Pings are not on yet. Nothing reaches this phone until you turn them on.",
@@ -184,9 +193,19 @@
       t.oncomplete = () => ok(); t.onerror = () => ok(); t.onabort = () => ok();
     });
   }
-  let draining = null, again = false;
-  // One drain at a time; a trigger that arrives meanwhile asks for one more pass. A 2xx or a 4xx settles the key; a network
-  // failure keeps it for the next trigger.
+  let draining = null, again = false, onlineArmed = false;
+  // A failed post waits for the network: one listener, removed by its own firing, and the visibilitychange trigger below.
+  function retryWhenOnline() {
+    if (onlineArmed) return;
+    onlineArmed = true;
+    window.addEventListener("online", () => { onlineArmed = false; drainOpened(); }, { once: true });
+  }
+  // What an answer does to the pending key: a 2xx or a 4xx settles it, except a 429 (asked to wait) and a 401 / 403 (this key
+  // is refused, and a re-paired key can still record the open); those, a 3xx and a 5xx keep it. A kept key stops the pass.
+  function settles(status) {
+    return (status >= 200 && status < 300) || (status >= 400 && status < 500 && status !== 401 && status !== 403 && status !== 429);
+  }
+  // One drain at a time; a trigger that arrives meanwhile asks for one more pass.
   function drainOpened() {
     if (!token() || !("indexedDB" in window)) return Promise.resolve();
     if (draining) { again = true; return draining; }
@@ -198,9 +217,12 @@
           db = await openDb();
           for (const key of await keys(db)) {
             const ping = Number(key);
+            if (!Number.isFinite(ping)) { await remove(db, key); continue; }   // not a ping id: {"ping": null} records nothing
             let res = null;
-            try { res = await api("POST", "/webpush/opened", { ping: ping }); } catch (_) { break; }   // offline: keep it for the next trigger
-            if (res.status < 500) await remove(db, key);
+            try { res = await api("POST", "/webpush/opened", { ping: ping }); }
+            catch (_) { retryWhenOnline(); break; }   // offline: keep it until the network or the page comes back
+            if (!settles(res.status)) break;
+            await remove(db, key);
           }
           db.close(); db = null;
         } while (again);

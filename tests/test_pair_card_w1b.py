@@ -121,8 +121,11 @@ def test_no_postmessage_carries_a_token_and_the_worker_hand_off_is_gone() -> Non
 
 
 @needs_browser
-def test_a_pending_open_is_posted_with_the_pages_key_and_kept_only_while_the_network_is_down(tmp_path, monkeypatch) -> None:
+def test_a_pending_open_is_posted_with_the_pages_key_retried_online_and_kept_on_429_401_403(tmp_path, monkeypatch) -> None:
+    # L3 r1: an offline tap waited for the next visibilitychange (no retry when the network came back); any 4xx dropped the key,
+    # even a 403 a re-pair could still record; a key that is not a number was posted as {"ping": null}
     _root, src, _ids = _install(tmp_path)
+    drain_keys = "window.levainPairCard.drainOpened().then(() => window.__keys())"
     with _serve(src) as (port, _h):
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/", [
             {"until": "window.levainPairCard", "ms": 15000},
@@ -132,19 +135,103 @@ def test_a_pending_open_is_posted_with_the_pages_key_and_kept_only_while_the_net
                      " window.fetch = (u, o) => { if (String(u) !== '/webpush/opened') return f(u, o);"
                      "   window.__seen.push(JSON.parse(o.body).ping + ':' + o.headers['X-Levain-Write-Token']);"
                      "   return window.__mode === 'offline' ? Promise.reject(new TypeError('offline')) : Promise.resolve(new Response('{}', { status: window.__mode })); };"
-                     " const db = await new Promise((ok, no) => { const q = indexedDB.open('levain-sw-2', 1);"
+                     " const open = () => new Promise((ok, no) => { const q = indexedDB.open('levain-sw-2', 1);"
                      "   q.onupgradeneeded = () => q.result.createObjectStore('opened'); q.onsuccess = () => ok(q.result); q.onerror = no; });"
-                     " await new Promise((ok) => { const t = db.transaction('opened', 'readwrite'); t.objectStore('opened').put(1, '7'); t.oncomplete = ok; });"
-                     " db.close(); return 1; })()"},
-            {"eval": "window.levainPairCard.drainOpened().then(() => new Promise((ok) => { const q = indexedDB.open('levain-sw-2', 1);"
-                     " q.onsuccess = () => { const g = q.result.transaction('opened').objectStore('opened').getAllKeys(); g.onsuccess = () => { q.result.close(); ok(JSON.stringify(g.result)); }; }; }))"},
-            {"eval": "(() => { window.__mode = 403; return window.levainPairCard.drainOpened().then(() => new Promise((ok) => { const q = indexedDB.open('levain-sw-2', 1);"
-                     " q.onsuccess = () => { const g = q.result.transaction('opened').objectStore('opened').getAllKeys(); g.onsuccess = () => { q.result.close(); ok(JSON.stringify(g.result)); }; }; })); })()"},
+                     " window.__put = async (k) => { const db = await open(); await new Promise((ok) => { const t = db.transaction('opened', 'readwrite');"
+                     "   t.objectStore('opened').put(1, k); t.oncomplete = ok; }); db.close(); };"
+                     " window.__keys = async () => { const db = await open(); const r = await new Promise((ok) => {"
+                     "   const g = db.transaction('opened').objectStore('opened').getAllKeys(); g.onsuccess = () => ok(g.result); }); db.close(); return JSON.stringify(r); };"
+                     " await window.__put('7'); await window.__put('x'); return 1; })()"},
+            {"eval": drain_keys},                                                     # offline: both kept
+            {"eval": "(() => { window.__mode = 200; window.dispatchEvent(new Event('online')); return 1; })()"},
+            {"until": "window.__keys().then((k) => k === '[]')", "ms": 5000},       # the network came back: posted, no other trigger
+            {"eval": "window.__put('8').then(() => { window.__mode = 403; return " + drain_keys + "; })"},
+            {"eval": "(() => { window.__mode = 401; return " + drain_keys + "; })()"},
+            {"eval": "(() => { window.__mode = 429; return " + drain_keys + "; })()"},
+            {"eval": "(() => { window.__mode = 404; return " + drain_keys + "; })()"},
             {"eval": "JSON.stringify(window.__seen)"},
         ])
-    kept_offline, kept_after_refusal, seen = (json.loads(v) for v in out["values"][-3:])
-    assert kept_offline == ["7"] and kept_after_refusal == [], (kept_offline, kept_after_refusal)   # a 4xx settles the key, a dead network does not
-    assert seen == ["7:TKN", "7:TKN"], seen
+    v = out["values"]
+    assert json.loads(v[2]) == ["7", "x"], v[2]
+    assert [json.loads(x) for x in v[5:9]] == [["8"], ["8"], ["8"], []], v[5:9]   # 403, 401, 429 keep the key; another 4xx settles it
+    assert json.loads(v[9]) == ["7:TKN", "7:TKN", "8:TKN", "8:TKN", "8:TKN", "8:TKN"], v[10]   # "x" is dropped unposted, never {"ping": null}
+
+
+@needs_browser
+def test_turn_on_pings_can_be_tapped_again_after_a_refusal_or_a_failed_subscribe(tmp_path, monkeypatch) -> None:
+    _root, src, _ids = _install(tmp_path)
+    btn = "[...document.querySelectorAll('#ck-unpaired button')].find((b) => b.textContent === 'Turn on pings')"
+    msg = "(document.querySelector('#ck-unpaired .pair-msg') || {}).textContent || ''"
+    with _serve(src, extra_hosts=[NAME]) as (port, _h):
+        code = _short(port)
+        out = _drive(tmp_path, monkeypatch, f"http://{NAME}:{port}/", [
+            {"until": CARD, "ms": 15000},
+            {"eval": "(() => { const f = window.fetch.bind(window); window.__perm = 'denied';"
+                     " window.fetch = (u, o) => String(u) === '/webpush/key' ? Promise.resolve(new Response(JSON.stringify({ key: 'AAAA' }), { status: 200 }))"
+                     "   : String(u) === '/webpush/subscribe' ? Promise.resolve(new Response('{\"message\": \"no\"}', { status: 500 })) : f(u, o);"
+                     " Notification.requestPermission = () => Promise.resolve(window.__perm);"
+                     " const sub = { toJSON: () => ({ endpoint: 'https://push.invalid/x', keys: {} }), unsubscribe: () => Promise.resolve(true) };"
+                     " const reg = { pushManager: { getSubscription: () => Promise.resolve(null), subscribe: () => Promise.resolve(sub) } };"
+                     " navigator.serviceWorker.register = () => Promise.resolve(reg);"
+                     " Object.defineProperty(navigator.serviceWorker, 'ready', { configurable: true, get: () => Promise.resolve(reg) }); return 1; })()"},
+            _type_and_submit(code),
+            {"until": btn, "ms": 15000},
+            {"eval": f"{btn}.click()"},
+            {"until": f"({msg}).startsWith('Pings stay off')", "ms": 10000},
+            {"eval": f"{btn}.disabled"},
+            {"eval": f"(() => {{ window.__perm = 'granted'; {btn}.click(); return 1; }})()"},
+            {"until": f"({msg}).startsWith('Could not turn pings on (')", "ms": 10000},
+            {"eval": f"{btn}.disabled"},
+        ], _offbox_flags(port))
+    assert out["values"][6] is False and out["values"][9] is False, out["values"]
+
+
+@needs_browser
+def test_the_pair_card_keeps_typed_text_folds_invisible_characters_and_says_a_lost_answer_may_have_paired(tmp_path, monkeypatch) -> None:
+    _root, src, _ids = _install(tmp_path)
+    msg = "(document.querySelector('#ck-unpaired .pair-msg') || {}).textContent || ''"
+    with _serve(src, extra_hosts=[NAME]) as (port, _h):
+        code = _short(port)
+        out = _drive(tmp_path, monkeypatch, f"http://{NAME}:{port}/", [
+            {"until": CARD, "ms": 15000},
+            # a passive re-read (the page coming back into view) must not rebuild the card under the operator's typing
+            {"eval": f"(() => {{ window.__inp = {CARD}; window.__inp.value = 'ab'; document.dispatchEvent(new Event('visibilitychange')); return 1; }})()"},
+            {"eval": "new Promise((ok) => setTimeout(() => ok(1), 2000))"},
+            {"eval": f"JSON.stringify({{same: {CARD} === window.__inp, value: {CARD}.value}})"},
+            # the server drops Cf / Cc characters (a zero-width space, a soft hyphen) before it validates; the page does the same
+            {"eval": "window.levainPairCard.fold('ab\\u200bcd-\\u00adef\\u0007gh')"},
+            # the claim reaches the cockpit and its answer is lost: the retry's refusal must say the first try may have paired
+            {"eval": "(() => { const f = window.fetch.bind(window); window.__lose = true;"
+                     " window.fetch = (u, o) => String(u) === '/cockpit/pair/claim' && window.__lose"
+                     "   ? f(u, o).then(() => { throw new TypeError('lost'); }) : f(u, o); return 1; })()"},
+            _type_and_submit(code),
+            {"until": f"({msg}).startsWith('Could not reach')", "ms": 10000},
+            {"eval": "(() => { window.__lose = false; document.querySelector('#ck-unpaired .pair-form').requestSubmit(); return 1; })()"},
+            {"until": f"!({msg}).startsWith('Could not reach') && ({msg})", "ms": 10000},
+        ], _offbox_flags(port))
+    v = out["values"]
+    assert json.loads(v[3]) == {"same": True, "value": "ab"}, v[3]
+    assert v[4] == "ABCDEFGH", v[4]
+    assert "may have worked" in v[-1] and "revoke the newest device" in v[-1], v[-1]
+
+
+@needs_browser
+def test_make_a_link_and_show_a_code_are_both_disabled_while_either_offer_is_in_flight(tmp_path, monkeypatch) -> None:
+    _root, src, _ids = _install(tmp_path)
+    both = "JSON.stringify([...document.querySelectorAll('.dev-offer .dev-btn')].map((b) => b.disabled))"
+    with _serve(src) as (port, _h):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": "document.querySelector('.dev-zone') && !document.querySelector('.dev-zone').hidden && document.querySelector('.dev-offer .dev-btn')", "ms": 20000},
+            {"eval": "(() => { const f = window.fetch.bind(window); window.__rel = null;"
+                     " window.fetch = (u, o) => String(u) === '/cockpit/pair/offer' ? new Promise((ok) => { window.__rel = () =>"
+                     "   ok(new Response(JSON.stringify({ short: 'ABCD-EFGH', short_ttl_seconds: 600 }), { status: 200 })); }) : f(u, o);"
+                     " [...document.querySelectorAll('.dev-offer .dev-btn')].find((b) => b.textContent === 'Show a code').click(); return 1; })()"},
+            {"until": "!!window.__rel", "ms": 5000},
+            {"eval": both},
+            {"eval": "(() => { window.__rel(); return 1; })()"},
+            {"until": "[...document.querySelectorAll('.dev-offer .dev-btn')].every((b) => !b.disabled)", "ms": 5000},
+        ])
+    assert json.loads(out["values"][3]) == [True, True], out["values"][3]
 
 
 @needs_browser

@@ -9,7 +9,7 @@
   "use strict";
   const WRITE_TOKEN_KEY = "levain_write_token";
   const H = "X-Levain-Write-Token";
-  let section = null, list = null, offerBox = null, note = null, labelIn = null;
+  let section = null, list = null, offerBox = null, note = null, labelIn = null, offerBtns = [];
   // L3 r2 G1: ONE shared in-flight read. A caller that finds one running gets that promise back and queues exactly one
   // re-run (so a change made while it was in flight is read afterwards); reads run one at a time, so what paints is always
   // the newest read. No flag can stick: `running` is cleared in the same step the promise settles, and a read has a timeout.
@@ -102,9 +102,10 @@
     go.type = "submit";
     const code = el("button", "dev-btn", "Show a code");
     code.type = "button";
-    code.addEventListener("click", () => offer(code, true));
+    offerBtns = [go, code];
+    code.addEventListener("click", () => offer(true));
     form.appendChild(labelIn); form.appendChild(go); form.appendChild(code);
-    form.addEventListener("submit", (e) => { e.preventDefault(); offer(go, false); });
+    form.addEventListener("submit", (e) => { e.preventDefault(); offer(false); });
     body.appendChild(form);
     offerBox = el("div", "dev-link"); offerBox.hidden = true;
     body.appendChild(offerBox);
@@ -273,8 +274,12 @@
     return running;
   }
 
-  async function offer(btn, short) {
-    btn.disabled = true; say("");
+  // Both offer buttons are off while either request is in flight: the server keeps one live short code, and a second request
+  // would replace what the first is about to show.
+  async function offer(short) {
+    if (offerBtns.some((b) => b.disabled)) return;            // one request at a time, whatever called it
+    for (const b of offerBtns) b.disabled = true;
+    say("");
     const what = short ? "a pairing code" : "a pairing link";
     try {
       const label = (labelIn.value || "").trim();
@@ -292,7 +297,7 @@
       refresh();
     } catch (_) {
       say("Could not reach the cockpit.");
-    } finally { btn.disabled = false; }
+    } finally { for (const b of offerBtns) b.disabled = false; }
   }
 
   // The short code, large, with a countdown; a new one replaces any code shown before (the server keeps one live code).
