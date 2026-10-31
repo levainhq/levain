@@ -35,6 +35,7 @@ from typing import Any
 
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import parse_stamp
+from levain.consent.questions import open_ended_of
 from levain.coordinator import review
 from levain.coordinator.first_reader import _HARNESS_OF
 from levain.coordinator.store import CoordError, CoordStore
@@ -81,7 +82,7 @@ def _asker_rec(q: Any) -> str:
     never past :data:`review._REC_MAX` (a long label is cut, never the record refused), ``none`` when the question
     names no rec it has."""
     keys = [k for k, _ in q.options]
-    if q.open_ended:
+    if open_ended_of(q):
         head = "none: an open question, answered in words"
     elif q.rec in keys and keys.index(q.rec) < 6:
         i = keys.index(q.rec)
