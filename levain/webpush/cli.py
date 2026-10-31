@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -158,11 +159,16 @@ def _test(args: argparse.Namespace) -> int:
 
     qdir = _qdir(args)
     device = args.device
-    if device is not None and not device.startswith("paired-"):
+    if device is not None:
+        if re.fullmatch(r"d-[0-9a-f]{12}", device) is None:
+            print(f"levain ping test: --device {device!r} is not a device id (d- and 12 hex digits, as "
+                  "`levain cockpit pair --list` prints it)")
+            return 2
         device = "paired-" + device
     results = sender.send(qdir, kind="test", ref=None, title=args.title, body=args.body, device=device)
     if not results:
-        print("no live subscription: turn notifications on from the phone page first")
+        print("no live subscription for that device" if device is not None
+              else "no live subscription: turn notifications on from the phone page first")
         return 1
     for sub_id, status in results:
         print(f"subscription {sub_id}: {_said(status)}")

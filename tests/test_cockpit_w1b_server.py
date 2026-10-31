@@ -243,3 +243,163 @@ def test_a_test_ping_creates_deliveries_only_for_the_caller(rig, monkeypatch) ->
         (ping,) = [p for p in PushStore(qdir).record(limit=10) if p["kind"] == "test"]
         assert ping["ref"] == PAIRED_PREFIX + one["device_id"]
         assert [d["subscription_id"] for d in ping["deliveries"]] == [one["id"]]
+
+
+# --- L3 r1 fixes (project_memory/1030-47_L3_w1ba_r1.txt) ---------------------------------------------------------------
+
+def test_box_short_mint_on_a_fresh_data_root_starts_the_journal(tmp_path: Path, capsys) -> None:
+    """A (codex HIGH): an off-loopback cockpit with no journal yet has no credential but the box's mint."""
+    from levain.cli import main
+
+    root = tmp_path / "never-served" / "cockpit"
+    assert main(["cockpit", "pair", "--data-root", str(root), "--list"]) == 1      # nothing to list: no journal made
+    assert not (root / "cockpit.db").exists()
+    assert main(["cockpit", "pair", "--data-root", str(root), "--short", "--print"]) == 0
+    code = capsys.readouterr().out.strip()
+    assert len(code) == 9 and code[4] == "-", code
+    assert (root.stat().st_mode & 0o777) == 0o700
+    got = CockpitDB(root).redeem_short(code, now=datetime.now(timezone.utc))
+    assert got is not None and got[0].startswith("d-")
+    # the first serve sets the class, as on any fresh journal
+    assert CockpitDB(root, install_class="reported").set_install_class("reported") == "reported"
+
+
+def test_box_mint_is_refused_while_a_server_holds_the_lock_on_a_fresh_root(tmp_path: Path, capsys) -> None:
+    import fcntl
+    import os
+
+    from levain.cli import main
+
+    root = tmp_path / "cockpit"
+    root.mkdir(mode=0o700)
+    fd = os.open(root / "cockpit.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert main(["cockpit", "pair", "--data-root", str(root), "--short", "--print"]) == 1
+        assert "try again" in capsys.readouterr().err
+        assert not (root / "cockpit.db").exists()
+    finally:
+        os.close(fd)
+
+
+def test_a_claim_racing_a_new_mint_adds_no_miss_to_the_new_code(tmp_path: Path) -> None:
+    """B (codex MED): the claim read code A, a mint replaced it with B before the claim's write lock; the try was
+    against A, so B keeps all its tries, and A is dead."""
+    root = tmp_path / "cockpit"
+    root.mkdir(mode=0o700)
+    now = datetime.now(timezone.utc)
+    db, other = CockpitDB(root), CockpitDB(root)
+    a = db.mint_short_offer(label=None, minted_by="box", now=now)
+    minted: list[str] = []
+    real_write = db.write
+
+    @contextmanager
+    def mint_then_write() -> Iterator[Any]:
+        minted.append(other.mint_short_offer(label=None, minted_by="box", now=now))
+        with real_write() as conn:
+            yield conn
+
+    db.write = mint_then_write                                   # type: ignore[method-assign]
+    for typed in ("0000-0000", a):                               # a wrong try, then A itself (right when it was read)
+        assert db.redeem_short(typed, now=now) is None
+    db.write = real_write                                        # type: ignore[method-assign]
+    with other.read() as conn:
+        assert conn.execute("SELECT misses FROM pair_short_offer").fetchone()[0] == 0
+    assert db.redeem_short(minted[-1], now=now) is not None
+
+
+def test_the_owner_key_proxied_is_no_credential_even_while_the_broker_is_on_standby(src) -> None:
+    """C (codex MED): with the ledger locked elsewhere a paired lookup answers 503; the owner key off the box must
+    never reach it, so it is the plain no-credential 403."""
+    import fcntl
+    import os
+
+    with _serve(src) as (port, httpd):
+        root = Path(httpd.broker.data_root)
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(root / "cockpit.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for method, path, body in (("GET", "/cockpit/manifest.json", None), ("POST", "/cockpit/pair/offer", {})):
+                st, out, _ = _call(port, method, path, body, token=T, headers=PROXY)
+                assert (st, out.get("auth")) == (403, "pair"), (path, st, out)
+        finally:
+            os.close(fd)
+
+
+def test_every_separately_gated_read_names_what_would_help_and_keeps_its_headers(rig) -> None:
+    """D (codex MED): the reads gated past _route answer the same 403 as every other gate, Vary and no-store kept."""
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _h):
+        # the grant listing shares the sign listing's gate (_sign_read_admitted) and is unrouted on this server
+        for path in ("/webpush/key", "/webpush/record", "/cockpit/sign.json", "/cockpit/consent/x.json", "/cockpit/question/1.json", "/cockpit/note/1.json",
+                     "/cockpit/band.json", "/cockpit/threads.json", "/cockpit/board.json", "/cockpit/session/x.json"):
+            st, out, hdrs = _call(port, "GET", path)
+            assert (st, out.get("auth")) == (403, "owner"), (path, st, out)
+            assert "token" in out["message"] and hdrs.get("cache-control") == "private, no-store", (path, hdrs)
+            assert "X-Levain-Write-Token" in hdrs.get("vary", ""), (path, hdrs)
+            st, out, _ = _call(port, "GET", path, token=T, headers=PROXY)
+            assert (st, out.get("auth")) == (403, "pair"), (path, st, out)
+
+
+def test_a_loopback_server_with_no_owner_key_offers_none(src) -> None:
+    """E (codex MED): only a named surface configured, so there is no owner key to ask for."""
+    with _serve(src, surface_tokens={"flowconnect": FC}) as (port, _h):
+        assert _call(port, "GET", "/cockpit/manifest.json", token=FC)[1]["transport"]["owner_key"] is False
+        st, out, _ = _call(port, "POST", "/cockpit/pair/offer", {})
+        assert (st, out.get("auth")) == (403, "pair"), out
+    with _serve(src) as (port, _h):
+        assert _call(port, "GET", "/cockpit/manifest.json", token=T)[1]["transport"]["owner_key"] is True
+
+
+def test_ping_test_with_a_device_says_so_and_refuses_a_malformed_id(rig, capsys) -> None:
+    """G (complement LOW)."""
+    from levain.cli import main
+
+    _src, qdir = rig
+    for bad in ("d-typo", "paired-d-0123456789ab", "D-0123456789AB"):
+        assert main(["ping", "test", "--queue-dir", str(qdir), "--device", bad]) == 2, bad
+        assert "not a device id" in capsys.readouterr().out
+    assert main(["ping", "test", "--queue-dir", str(qdir), "--device", "d-0123456789ab"]) == 1
+    assert capsys.readouterr().out.strip() == "no live subscription for that device"
+
+
+def test_a_short_code_minted_by_a_device_then_revoked_cannot_redeem_for_the_minters_revoke(tmp_path: Path) -> None:
+    """H3 (deepseek): ``minted_by`` is ``paired-d-...``; the redeem's own revoked-minter check reads past the prefix,
+    so the code dies even where the revoke's expiry UPDATE did not reach it."""
+    root = tmp_path / "cockpit"
+    root.mkdir(mode=0o700)
+    now = datetime.now(timezone.utc)
+    db = CockpitDB(root)
+    dev = db.redeem_short(db.mint_short_offer(label="ipad", minted_by="box", now=now), now=now)[0]
+    code = db.mint_short_offer(label=None, minted_by=PAIRED_PREFIX + dev, now=now)
+    db.revoke_devices([dev], by="box", now=now)
+    with db.write() as conn:      # undo the revoke's expiry, so only the redeem's check stands between
+        conn.execute("UPDATE pair_short_offer SET expires = ?", ("2999-01-01T00:00:00Z",))
+    assert db.redeem_short(code, now=now) is None
+    with db.read() as conn:
+        assert tuple(conn.execute("SELECT misses, used_at FROM pair_short_offer").fetchone()) == (0, None)
+
+
+def test_a_loopback_server_reached_through_a_proxy_header_refuses_the_owner_key(src) -> None:
+    """I (deepseek LOW): a loopback bind is no exemption; an X-Forwarded-For makes the request proxied."""
+    with _serve(src) as (port, _h):
+        st, out, _ = _call(port, "POST", "/cockpit/pair/offer", {"label": "x"}, token=T, headers=PROXY)
+        assert (st, out.get("auth")) == (403, "pair"), out
+
+
+def test_a_refused_short_claim_says_guessed_out_apart_from_expired(src) -> None:
+    """The ruled known edge (5 wrong tries kill the code) stands; its words now tell a guesser from a timeout."""
+    with _serve(src) as (port, httpd):
+        code = _short(port)
+        wrong = "0000-0000" if code != "0000-0000" else "1111-1111"
+        for _ in range(4):
+            assert "check it and try again" in _call(port, "POST", "/cockpit/pair/claim", {"short": wrong})[1]["message"]
+        assert "5 wrong tries were made" in _call(port, "POST", "/cockpit/pair/claim", {"short": wrong})[1]["message"]
+        assert "5 wrong tries were made" in _call(port, "POST", "/cockpit/pair/claim", {"short": code})[1]["message"]
+        expired = _short(port)
+        conn = sqlite3.connect(httpd.broker.data_root / "cockpit.db")
+        conn.execute("UPDATE pair_short_offer SET expires = '2000-01-01T00:00:00Z'")
+        conn.commit()
+        conn.close()
+        assert "has expired" in _call(port, "POST", "/cockpit/pair/claim", {"short": expired})[1]["message"]

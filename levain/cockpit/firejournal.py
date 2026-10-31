@@ -1177,7 +1177,9 @@ class CockpitDB:
     def redeem_short(self, code: Any, *, now: datetime) -> "tuple[str, str] | None":
         """Spend the live short code: ``(device_id, token)``, or None for anything else. A malformed code, and a
         journal with no live short row, are answered from a read (no write lock). Under the write lock the row is
-        re-read and re-checked; a wrong code adds one miss, and the ``SHORT_MAX_FAILURES``th kills the code."""
+        re-read and re-checked; a wrong code adds one miss, and the ``SHORT_MAX_FAILURES``th kills the code. A row
+        whose code changed between the read and the lock (a newer mint replaced it) takes no miss: the try was made
+        against the code it replaced."""
         import hmac
         import secrets
 
@@ -1186,19 +1188,21 @@ class CockpitDB:
             return None
         stamp = utc_stamp(now)
         with self.read() as conn:
-            seen = conn.execute("SELECT used_at, expires, misses FROM pair_short_offer WHERE slot = 1").fetchone()
+            seen = conn.execute("SELECT code_hash, used_at, expires, misses FROM pair_short_offer "
+                                "WHERE slot = 1").fetchone()
         if seen is None or seen["used_at"] is not None or seen["expires"] <= stamp or seen["misses"] >= SHORT_MAX_FAILURES:
             return None
         with self.write() as conn:
             row = conn.execute("SELECT code_hash, label, minted_by, expires, used_at, misses FROM pair_short_offer "
                                "WHERE slot = 1").fetchone()
-            if (row is None or row["used_at"] is not None or row["expires"] <= stamp
-                    or row["misses"] >= SHORT_MAX_FAILURES):
+            if (row is None or row["code_hash"] != seen["code_hash"] or row["used_at"] is not None
+                    or row["expires"] <= stamp or row["misses"] >= SHORT_MAX_FAILURES):
                 return None
             if _device_revoked(conn, row["minted_by"]):
                 return None
             if not hmac.compare_digest(_sha256(typed), row["code_hash"]):
-                conn.execute("UPDATE pair_short_offer SET misses = misses + 1 WHERE slot = 1")
+                conn.execute("UPDATE pair_short_offer SET misses = misses + 1 WHERE slot = 1 AND code_hash = ?",
+                             (row["code_hash"],))
                 return None
             conn.execute("UPDATE pair_short_offer SET used_at = ? WHERE slot = 1", (stamp,))
             token = secrets.token_urlsafe(32)
@@ -1207,6 +1211,23 @@ class CockpitDB:
                          "paired_by) VALUES (?, ?, ?, ?, NULL, NULL, ?)",
                          (device_id, row["label"], _sha256(token), stamp, row["minted_by"]))
         return device_id, token
+
+    def short_offer_state(self, *, now: datetime) -> str:
+        """Why the short code is not live, or that it is, for a refusal's words only (a read; it decides nothing):
+        ``"none"`` (never minted), ``"used"``, ``"guessed_out"`` (killed by ``SHORT_MAX_FAILURES`` wrong tries),
+        ``"expired"`` (its ``SHORT_PAIRING_TTL`` ran out, or a revoke of its minter expired it) or ``"live"``."""
+        stamp = utc_stamp(now)
+        with self.read() as conn:
+            row = conn.execute("SELECT used_at, expires, misses FROM pair_short_offer WHERE slot = 1").fetchone()
+        if row is None:
+            return "none"
+        if row["used_at"] is not None:
+            return "used"
+        if row["misses"] >= SHORT_MAX_FAILURES:
+            return "guessed_out"
+        if row["expires"] <= stamp:
+            return "expired"
+        return "live"
 
     def verify_device(self, token: str, *, now: datetime) -> str | None:
         """The id of the unrevoked device ``token`` belongs to, or None (unknown or revoked): one indexed lookup of

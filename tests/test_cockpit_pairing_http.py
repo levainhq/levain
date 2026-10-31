@@ -405,9 +405,10 @@ def test_rp7_rs5_box_side_pair_and_revoke_all(src, capsys) -> None:
 
     with _serve(src) as (port, httpd):
         root = httpd.broker.data_root
-        assert main(["cockpit", "pair", "--data-root", str(root)]) == 1      # no journal yet: refused, nothing made
+        assert main(["cockpit", "pair", "--data-root", str(root), "--revoke-all"]) == 1   # no journal: nothing to end
         assert "no cockpit journal" in capsys.readouterr().err and not (root / "cockpit.db").exists()
-        assert _call(port, "GET", "/cockpit/manifest.json")[0] == 200       # the serve's first use opens it
+        # W1b L3 A: a mint on a root no serve has opened yet starts the journal itself (the box's mint is an
+        # off-loopback cockpit's first credential), and the running serve then opens that journal as its own
         assert main(["cockpit", "pair", "--data-root", str(root), "--label", "phone", "--print",
                      "--url", f"http://127.0.0.1:{port}/"]) == 0
         link = capsys.readouterr().out.strip()

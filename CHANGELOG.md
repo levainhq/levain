@@ -40,7 +40,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `--revoke <id> [<id> ...]` revokes devices and the devices they paired, both reading the journal directly with no
   cockpit credential. `GET /cockpit/pair/devices.json` rows carry `subscribed`. `POST /webpush/test` sends a test
   ping to the calling paired device's subscriptions only, and `levain ping test --device d-...` does the same from the
-  box. Covered by tests; not run against a real phone.
+  box. `levain cockpit pair --short` (or the link form) on a data root no server has started yet starts its cockpit
+  journal first, so an off-loopback cockpit's first code needs no loopback visit. A refused short code says whether it
+  was used up by wrong tries, expired, or already used. Covered by tests; not run against a real phone.
 - **Every presence word an agent sets, replaces or is refused now leaves a row you can read.** `levain ping log` prints
   `<queue dir>/webpush/presence.log.jsonl` (who, which role, the word, the quote, the word it found, the outcome); an agent's
   write is not made when its row cannot be written, your own word always goes through. `levain coord morning` adds a

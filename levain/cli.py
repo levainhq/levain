@@ -3974,8 +3974,9 @@ def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
         return 2
     try:
         root = _cockpit_root(args)
-        if not (root / "cockpit.db").is_file():
-            print(f"pair: no cockpit journal under {root}: start `levain serve --write` once first", file=sys.stderr)
+        minting = not (args.list_devices or args.revoke is not None or args.revoke_all)
+        if not minting and not (root / "cockpit.db").is_file():
+            print(f"pair: no cockpit journal under {root}: nothing is paired here yet", file=sys.stderr)
             return 1
         db = CockpitDB(root)
         now = _utc_now()
@@ -3998,6 +3999,13 @@ def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
             print("pair: stdout is not a terminal, so the one-time link is not printed (anyone who reads it can "
                   "pair a device); run it in a terminal, or pass --print to print it anyway", file=sys.stderr)
             return 1
+        if not (root / "cockpit.db").is_file():
+            # the box's mint is the first credential an off-loopback cockpit can have (the owner key opens nothing
+            # there), so it does not wait on a first `serve --write`: the journal starts here, as the broker starts it
+            refused = _pair_start_journal(root)
+            if refused is not None:
+                print(f"pair: {refused}", file=sys.stderr)
+                return 1
         if args.short:
             code = db.mint_short_offer(label=args.label, minted_by="box", now=now)
         else:
@@ -4014,6 +4022,42 @@ def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
     print("one use, valid 10 minutes" + ("" if args.url else "; append the path to the cockpit's address"),
           file=sys.stderr)
     return 0
+
+
+def _pair_start_journal(root: Path) -> str | None:
+    """Start a fresh cockpit journal at ``root`` for the box's first mint, by the broker's own start steps: the
+    install check (a governed marker refuses: that root is the root helper's), the network-filesystem check, the data
+    root made ``0700``, then ``cockpit.lock`` taken non-blocking while the schema is written. A held lock is a server
+    starting there, which makes the journal itself: refused, retry. The install class is left for the first
+    ``serve --write`` to set, as it sets it on any fresh journal. None when the journal stands; else why not."""
+    import fcntl
+
+    from levain.cockpit.broker import LOCK_NAME
+    from levain.cockpit.firejournal import DB_NAME, CockpitDB
+    from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
+
+    decision = decide_install(REPORTED, root)
+    if decision.install_class is None:
+        return f"no cockpit journal under {root}, and none is started here: {decision.reason}"
+    problem = network_fs_problem([root])
+    if problem is not None:
+        return problem
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(root / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        return f"data root {root}: {exc}"
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return f"a cockpit server is starting under {root}: try again in a moment"
+        if not (root / DB_NAME).is_file():
+            with CockpitDB(root, owns_lock=True).write():
+                pass            # the first open writes the schema and the format marker
+    finally:
+        os.close(fd)
+    return None
 
 
 def _cmd_cockpit_pending(args: argparse.Namespace) -> int:
