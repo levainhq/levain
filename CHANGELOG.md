@@ -38,7 +38,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   schema now requires only `what` and `blocks` (options and rec are required unless `open` is true, checked in code).
 - **`levain ask` takes a whole analysis.** A question's `--blocks` text now holds up to 6,000 characters (was 300) and an option
   label up to 600 (was 200). The caps are sized from the longest items a real caller filed (4,933 and 525 characters), and
-  the cockpit, the phone page and the band show a question's text whole. Still refused: a block or label with a line break,
+  the cockpit and the band show a question's text whole. Still refused: a block or label with a line break,
   fewer than 2 or more than 6 options.
 - **An open question says so on the cockpit.** A question filed with `--open` (no options, no rec) now reads
   "open question: answer in your own words" where the cockpit said a dangling "recommends ",
