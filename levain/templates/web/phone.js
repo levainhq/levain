@@ -466,6 +466,7 @@
       const blocks = Array.isArray(it.blocks) ? it.blocks.join(", ") : (typeof it.blocks === "string" ? it.blocks : "");
       if (blocks) row.appendChild(el("div", "where", "blocks: " + blocks));
       const acts = el("div", "actions");
+      if (it.open_ended) row.appendChild(el("div", "where", "open question: answer in words in the box below"));
       for (const o of (Array.isArray(it.options) ? it.options : [])) {
         const label = String(o && o.letter) + " · " + (o && typeof o.label === "string" ? o.label : "") + (o && o.letter === it.rec ? " (rec)" : "");
         if (authority) { acts.appendChild(el("div", "where", label)); continue; }
@@ -475,7 +476,7 @@
         buttons.push(b);
         acts.appendChild(b);
       }
-      row.appendChild(acts);
+      if (!it.open_ended) row.appendChild(acts);
       card.appendChild(row);
     }
     if (typeof band.note === "string" && band.note) card.appendChild(el("div", "where", band.note));
@@ -569,7 +570,10 @@
     buttons.push(go);
     const sendRow = el("div", "actions");
     sendRow.appendChild(go);
-    card.append(leads, actions, words, sendRow, note);
+    if (q.open_ended === true) {   // no options: the empty actions row is not drawn, and "or" has no buttons to follow
+      words.placeholder = "your answer, in words";
+      card.append(leads, el("div", "where", "open question: your answer, in words"), words, sendRow, note);
+    } else card.append(leads, actions, words, sendRow, note);
     return card;
   }
 

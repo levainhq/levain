@@ -4571,7 +4571,7 @@
     } else {
       parts.push(el("pre", "consent-display", sv(b.what)));
       const facts = el("div", "consent-facts");
-      facts.appendChild(el("span", "ext-meta", "recommends " + sv(b.rec)));
+      facts.appendChild(el("span", "ext-meta", b.open_ended || !sv(b.rec) ? "open question: answer in your own words" : "recommends " + sv(b.rec)));
       const formatted = questionText(sv(b.blocks), null, options, sv(b.rec));
       if (formatted) facts.appendChild(formatted);
       else facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
@@ -4628,7 +4628,7 @@
     const words = el("textarea", "question-words");
     words.rows = 2;
     words.maxLength = 4000;
-    words.placeholder = card ? "or your own words" : "or answer in your own words";
+    words.placeholder = b.open_ended ? "your answer, in your own words" : card ? "or your own words" : "or answer in your own words";
     if (questionDrafts.has(q.id)) { words.value = questionDrafts.get(q.id); questionDrafts.delete(q.id); }
     const sendWords = el("button", "undo-btn question-send", "send words");
     sendWords.type = "button";
@@ -4811,7 +4811,7 @@
     head.appendChild(bandTag);
     head.appendChild(el("span", "consent-agent", q.agent || "agent"));
     head.appendChild(el("b", "consent-tool", "question #" + q.n));
-    head.appendChild(el("span", "ext-meta", q.options + " options"));
+    head.appendChild(el("span", "ext-meta", q.options === 0 ? "open question" : q.options + " options"));
     head.appendChild(el("span", "consent-audit", q.state));
     if (q.age) head.appendChild(el("span", "ext-meta", "filed " + q.age));
     if (!open && q.decidedAge) head.appendChild(el("span", "ext-meta", "answered " + q.decidedAge));
