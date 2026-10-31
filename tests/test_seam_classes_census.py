@@ -224,3 +224,29 @@ def test_every_insert_into_a_gseq_table_names_gseq() -> None:
     broken = sources[victim].replace(", gseq)", ")", 1)
     reported = _insert_sites_without_gseq(broken)
     assert len(reported) == 1 and reported[0][0] in GSEQ_TABLES and "gseq" not in reported[0][1]
+
+
+def test_no_insert_into_a_gseq_table_hides_its_column_list_or_lives_outside_the_coordinator() -> None:
+    pkg = _COORD_SRC.parent                                      # the whole levain package, not only coordinator/
+    bare = re.compile(r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+(?:" + "|".join(GSEQ_TABLES) + r")\s*(?!\s*\()(?=VALUES|SELECT|\s)", re.I)
+    outside = []
+    for path in sorted(pkg.rglob("*.py")):
+        text = path.read_text()
+        if re.search(r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+(?:" + "|".join(GSEQ_TABLES) + r")\b", text):
+            if _COORD_SRC not in path.parents:
+                outside.append(path.name)
+            elif bare.search(text):
+                outside.append(f"{path.name}: positional insert")
+    assert outside == []
+
+
+def test_a_locked_bounds_read_is_not_reported_as_never_migrated(tmp_path) -> None:
+    import sqlite3
+    from levain.coordinator import seam_classes
+
+    class _Locked:
+        def execute(self, *_a):
+            raise sqlite3.OperationalError("database schema is locked")
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        seam_classes.unsequenced(_Locked(), "drops")            # type: ignore[arg-type]

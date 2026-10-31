@@ -77,6 +77,8 @@ def unsequenced(conn: sqlite3.Connection, table: str) -> int:
     try:
         row = conn.execute("SELECT baseline_rowid FROM gseq_migration_bounds WHERE table_name = ?", (table,)).fetchone()
     except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):      # a lock held by the migrating writer is retryable, not "never migrated"
+            raise
         raise SeamClassError(f"{table}: the store has not been migrated (no gseq_migration_bounds)") from exc
     if row is None:
         raise SeamClassError(f"{table} has no gseq migration bound: it was never migrated")

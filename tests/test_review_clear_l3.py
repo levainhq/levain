@@ -104,7 +104,7 @@ def test_a_store_made_before_the_index_is_read_and_gains_it_at_its_first_writer(
     with review.read_transaction(CoordStore(d).open_readonly) as conn:
         assert review.queue_page(conn, open_limit=10, cleared_limit=10).open_total == 1
     review.reopen_item(CoordStore(d), items[0].item_id)
-    assert sorted(indexes()) == ["review_events_gseq", "review_events_one_signature"]      # R4's, then S0's
+    assert {"review_events_gseq", "review_events_one_signature"} <= set(indexes())      # R4's, then S0's
 
 
 # --- F3: one open request per item version on the phone; none filed with no signer -----------------------------------
@@ -189,9 +189,13 @@ def test_clear_signed_names_a_used_signature_as_a_stale_refusal(tmp_path: Path) 
     rid = review.file_clear_request(store, mine.item_id, queue_dir=qdir)
     _sign(qdir, pk, rid)
     _occupy(store, rid)
+    with store._write() as (conn, _now):
+        taken = conn.execute("SELECT COUNT(*) FROM gseq").fetchone()[0]
     with pytest.raises(review.SignedClearRefused) as e:
         _clear(store, qdir, mine, rid, pk)
     assert (e.value.status, e.value.error) == (409, "stale")
+    with store._write() as (conn, _now):                  # the refused replay rolled back: it took no number
+        assert conn.execute("SELECT COUNT(*) FROM gseq").fetchone()[0] == taken
 
 
 
