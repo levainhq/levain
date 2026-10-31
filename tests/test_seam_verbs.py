@@ -678,9 +678,17 @@ def test_r5_a_body_deeper_than_the_bound_is_refused_in_every_format_and_the_writ
     # nested just under the interpreter's limit: deep enough that an encoder with a deeper wrapper would overflow
     deep = json.dumps({"state_line": "x", "notes": "n"})[:-1] + ', "z": ' + "[" * 993 + '"z"' + "]" * 993 + "}"
     sql(world, "UPDATE seam_handoffs SET body = ?", deep)
+    shallow = json.dumps({"state_line": "x", "notes": "n"})[:-1] + ', "z": ' + "[" * 20 + '"z"' + "]" * 20 + "}"
+    for body, why in ((deep, None), (shallow, "nests deeper than")):
+        sql(world, "UPDATE seam_handoffs SET body = ?", body)
+        if why:                                  # under every decoder's limit: the bound itself refuses it
+            assert why in run(qdir, capsys, "handoff", "show", "--json", rc=1).err
+    sql(world, "UPDATE seam_handoffs SET body = ?", deep)
     for fmt in ((), ("--md",), ("--json",)):
         err = run(qdir, capsys, "handoff", "show", *fmt, rc=1).err
-        assert "nests deeper than" in err and "Traceback" not in err
+        # the decoder itself may refuse first (CPython 3.12 guards every nested array): either way it is a refusal
+        assert "body is unreadable" in err and "Traceback" not in err
+        assert "nests deeper than" in err or "RecursionError" in err
 
 
 def test_k3_a_literal_bracket_is_ordinary_text_to_the_cut():
