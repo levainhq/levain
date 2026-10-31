@@ -2782,6 +2782,145 @@ def coordinator_allow(python_path: str) -> tuple[str, ...]:
     return tuple(f"Bash({command} {verb}:*)" for verb in COORDINATOR_VERBS)
 
 
+# A bare `Read` (np-5396be49 "5b", 1030-42): the coordinator starts without the user layer, so the user's own `Read`
+# allow is not loaded and a Read outside the workspace stopped at a prompt nobody answers. Read only: Write, Edit,
+# WebFetch and Bash outside the three verbs above still ask. Held apart from coordinator_allow, which is the Bash
+# rules the brief and the Codex rule file spell.
+COORDINATOR_READ_ALLOW = ("Read",)
+
+
+def _coordinator_settings(install: Path) -> tuple[str, Any, str]:
+    """``(text, document, problem)`` of the coordinator install's ``.claude/settings.json``. ``problem`` is "" when
+    the rules can be merged into it (a JSON object whose ``permissions``, if present, is an object and whose
+    ``permissions.allow``, if present, is a list); otherwise it says why, and the file is never written."""
+    path = install / ".claude" / "settings.json"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return "", None, f"{path} cannot be read ({e.strerror or e})"
+    except UnicodeError as e:                    # a non-UTF-8 file: the same problem, never a crash (L3 readrule r2)
+        return "", None, f"{path} cannot be read (not UTF-8: {type(e).__name__})"
+    try:
+        doc = json.loads(text)
+    except (ValueError, RecursionError) as e:
+        return text, None, f"{path} is not valid JSON ({type(e).__name__})"
+    if not isinstance(doc, dict):
+        return text, None, f"{path} is not a JSON object"
+    perms = doc.get("permissions", {})
+    if not isinstance(perms, dict):
+        return text, doc, f"{path}: permissions is not an object"
+    if not isinstance(perms.get("allow", []), list):
+        return text, doc, f"{path}: permissions.allow is not a list"
+    return text, doc, ""
+
+
+def coordinator_read_rule_state(install: Path) -> tuple[bool, str]:
+    """``(pending, problem)`` for ``install``. ``pending`` is True when it is a Claude Code coordinator install whose
+    project settings do not carry every rule :data:`COORDINATOR_READ_ALLOW` names (an install an earlier release
+    made, a settings file with no ``permissions.allow``, or one that cannot be read). ``problem`` is non-empty when
+    the rule cannot be merged in (:func:`add_coordinator_read_rule` refuses): the file wants a hand fix. Any other
+    install is ``(False, "")``."""
+    if persisted_role(install) != "coordinator" or effective_adapter(install) != "claude-code":
+        return False, ""
+    _, doc, problem = _coordinator_settings(install)
+    if problem:
+        return True, problem
+    allow = doc.get("permissions", {}).get("allow", [])
+    return any(rule not in allow for rule in COORDINATOR_READ_ALLOW), ""
+
+
+def coordinator_read_rule_pending(install: Path) -> bool:
+    """:func:`coordinator_read_rule_state`'s ``pending``: `levain update --path` or `levain coord agent claude`
+    brings a mergeable one."""
+    return coordinator_read_rule_state(install)[0]
+
+
+def _json_scan_ws(s: str, i: int) -> int:
+    while i < len(s) and s[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def _json_container_items(s: str, start: int) -> tuple[list[tuple[str | None, int, int, int]], int]:
+    """The members of the JSON object or array opening at ``s[start]``: ``(key or None, item start, value start,
+    value end)`` each, and the index of its closing bracket. ``s`` is known to parse (the caller loaded it)."""
+    dec = json.JSONDecoder()
+    is_obj, close = s[start] == "{", "}" if s[start] == "{" else "]"
+    items: list[tuple[str | None, int, int, int]] = []
+    i = _json_scan_ws(s, start + 1)
+    if s[i] == close:
+        return items, i
+    while True:
+        item_start, key = i, None
+        if is_obj:
+            key, i = dec.raw_decode(s, i)
+            i = _json_scan_ws(s, i) + 1          # the ':'
+            i = _json_scan_ws(s, i)
+        _, end = dec.raw_decode(s, i)
+        items.append((key, item_start, i, end))
+        i = _json_scan_ws(s, end)
+        if s[i] == close:
+            return items, i
+        i = _json_scan_ws(s, i + 1)              # the ','
+
+
+def _json_insert_last(s: str, start: int, member: str) -> str:
+    """``s`` with ``member`` appended to the container opening at ``s[start]``, written with the separator its own
+    members already use; every other byte kept."""
+    items, close = _json_container_items(s, start)
+    if not items:
+        return s[:start + 1] + member + s[start + 1:]
+    sep = s[items[-2][3]:items[-1][1]] if len(items) > 1 else "," + s[start + 1:items[0][1]]
+    return s[:items[-1][3]] + sep + member + s[items[-1][3]:]
+
+
+def _json_member_value(s: str, start: int, key: str) -> int | None:
+    """The value start of the LAST ``key`` member of the object opening at ``s[start]`` (the one ``json.loads``
+    keeps), else None."""
+    found = [vs for k, _, vs, _ in _json_container_items(s, start)[0] if k == key]
+    return found[-1] if found else None
+
+
+def add_coordinator_read_rule(install: Path) -> bool:
+    """Merge the missing :data:`COORDINATOR_READ_ALLOW` rules into a coordinator install's ``.claude/settings.json``
+    ``permissions.allow`` (made when absent), under the install lock, with an atomic write that keeps every other
+    byte of the file: an operator's own rules, keys and formatting stay. Nothing else of the install is touched, so a
+    hand-edited or receipt-less settings file gets the rule too. Returns whether it wrote; a second run is a no-op.
+    Raises :class:`InitError` (never writing) when the file cannot be read or merged, :class:`InstallLockError` when
+    another levain process writes the install."""
+    with install_lock(install, create=False):
+        text, doc, problem = _coordinator_settings(install)
+        if problem:
+            raise InitError(f"{problem}; add {', '.join(COORDINATOR_READ_ALLOW)} to permissions.allow by hand")
+        perms = doc.get("permissions")
+        allow = perms.get("allow", []) if perms is not None else []
+        missing = [rule for rule in COORDINATOR_READ_ALLOW if rule not in allow]
+        if not missing:
+            return False
+        root = _json_scan_ws(text, 0)
+        listed = ", ".join(json.dumps(rule) for rule in missing)
+        p_at = _json_member_value(text, root, "permissions")
+        if p_at is None:
+            new = _json_insert_last(text, root, f'"permissions": {{"allow": [{listed}]}}')
+        else:
+            a_at = _json_member_value(text, p_at, "allow")
+            if a_at is None:
+                new = _json_insert_last(text, p_at, f'"allow": [{listed}]')
+            else:
+                new = text
+                for rule in missing:
+                    new = _json_insert_last(new, a_at, json.dumps(rule))
+        expected = {**doc, "permissions": {**(perms or {}), "allow": [*allow, *missing]}}
+        if json.loads(new) != expected:          # the scan is checked against the parser before anything is written
+            raise InitError(f"{install / '.claude' / 'settings.json'} could not be merged safely; add "
+                            f"{', '.join(missing)} to permissions.allow by hand")
+        try:
+            _atomic_write_text(install / ".claude" / "settings.json", new)
+        except OSError as e:
+            raise InitError(f"could not write {install / '.claude' / 'settings.json'} ({e})") from e
+        return True
+
+
 def coordinator_deny() -> tuple[str, ...]:
     """The coordinator's Claude Code deny rules: no edit of its own record (the file that marks its workspace for
     the door) or that file's lock, wherever the door reads one. Claude Code consults ``Edit(path)`` rules for every
@@ -2953,7 +3092,7 @@ def _apply_role(settings_text: str, role: str | None, python_path: str) -> str:
     allow = perms.setdefault("allow", []) if isinstance(perms, dict) else None
     if not isinstance(allow, list):
         raise InitError("the rendered Claude Code settings carry a permissions.allow that is not a list")
-    allow.extend(rule for rule in coordinator_allow(python_path) if rule not in allow)
+    allow.extend(rule for rule in (*coordinator_allow(python_path), *COORDINATOR_READ_ALLOW) if rule not in allow)
     deny = perms.setdefault("deny", [])
     if not isinstance(deny, list):
         raise InitError("the rendered Claude Code settings carry a permissions.deny that is not a list")
@@ -3616,6 +3755,15 @@ def refresh_adapter(
     out = _refresh_adapter(install, apply=apply, emit=emit, carrier=carrier, messaging=messaging)
     if out.stopped_local:
         return out  # the local-file check stopped the refresh: no re-pin, no consent settings
+    if apply and coordinator_read_rule_pending(install.resolve()):
+        # a hand-edited or receipt-less coordinator settings file is staged above, never written: the one rule is
+        # merged into the live file instead (the pin covers its hooks and messaging, not permissions)
+        try:
+            if add_coordinator_read_rule(install.resolve()):
+                emit(f"  added the {', '.join(COORDINATOR_READ_ALLOW)} allow rule to .claude/settings.json "
+                     "(coordinator)")
+        except InitError as e:
+            emit(f"  the coordinator's Read allow rule is still missing: {e}")
     if pin_before is not None:
         host_guard.repin_after_levain_write(install.resolve(), pin_before)
     if apply:

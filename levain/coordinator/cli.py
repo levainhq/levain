@@ -19,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -86,6 +87,16 @@ def _store(args: argparse.Namespace) -> EnvelopeStore:
     return EnvelopeStore(d)
 
 
+NO_STORE = "no coordinator store here"
+
+
+def _no_store(store: EnvelopeStore) -> bool:
+    """True when no coordinator store is here (:meth:`CoordStore.coordinator_present`, which opens nothing for
+    writing): a read-only verb says so and makes nothing (no directory, no dispatch.db, no awake.lock, no tables in a
+    dispatch-only file)."""
+    return not store.coordinator_present()
+
+
 def _drop_row(d: Drop) -> dict[str, Any]:
     return {"drop_id": d.drop_id, "surface": d.surface, "outbox_id": d.outbox_id, "words": d.words,
             "words_sha256": d.words_sha256, "sent_at": d.sent_at, "received_at": d.received_at,
@@ -133,6 +144,49 @@ def _read_words(args: argparse.Namespace) -> str:
             raise CoordError("stdin is not UTF-8 text") from None
         return text[:-1] if text.endswith("\n") else text
     return " ".join(args.words)
+
+
+def _read_input(path: Path | None) -> str:
+    """All of a file (``path``) or of stdin (``None``) as strict UTF-8 text, read under the byte cap a WORDS_MAX-character
+    text can take (the verb's own validator then applies its own, smaller limit), one trailing newline dropped, so
+    ``echo why | levain ... --stdin`` gives the same text as ``--why why``."""
+    cap = WORDS_MAX * 4 + 2
+    if path is None:
+        raw = sys.stdin.buffer.read(cap + 1)
+    else:
+        with open(path, "rb") as fh:
+            raw = fh.read(cap + 1)
+    if len(raw) > cap:
+        raise CoordError(f"{'stdin' if path is None else str(path)} holds more than {WORDS_MAX} characters")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise CoordError(f"{'stdin' if path is None else str(path)} is not UTF-8 text") from None
+    if text.endswith("\r\n"):
+        return text[:-2]
+    return text[:-1] if text.endswith("\n") else text
+
+
+def _text_input(args: argparse.Namespace, inline: str | None, flag: str) -> str | None:
+    """A verb's one free-text value: the inline ``flag`` as typed, or ``--text-file PATH`` / ``--stdin`` (no shell
+    quoting). Naming two of the three is refused; naming none returns ``None`` (the caller says what is missing)."""
+    path = getattr(args, "text_file", None)
+    use_stdin = bool(getattr(args, "stdin", False))
+    given = [n for n, v in ((flag, inline is not None), ("--text-file", path is not None), ("--stdin", use_stdin)) if v]
+    if len(given) > 1:
+        raise CoordError(f"name the text once: {', '.join(given)} were all given")
+    if path is not None:
+        return _read_input(path)
+    if use_stdin:
+        return _read_input(None)
+    return inline
+
+
+def _text_flags(p: argparse.ArgumentParser | Any) -> None:
+    """``--text-file`` and ``--stdin``: the quoting-free spellings of a verb's free text (a group or a parser)."""
+    p.add_argument("--text-file", dest="text_file", type=Path, default=None, metavar="PATH",
+                   help="Read the text from this file (no shell quoting).")
+    p.add_argument("--stdin", action="store_true", help="Read the text from stdin (no shell quoting).")
 
 
 def run_drop(args: argparse.Namespace, out: Any = None) -> int:
@@ -951,24 +1005,106 @@ def _parse_attach(spec: str) -> Part:
     return Part(kind=kind, attach=thread_id)
 
 
+def _no_dup_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in seen:
+            raise CoordError(f"the split document names {k!r} twice")
+        seen[k] = v
+    return seen
+
+
+def _split_doc(text: str, positional: str | None) -> tuple[str, list[Part]]:
+    """One JSON document for a whole split: ``{"drop_id": ID, "threads": [{"kind", "title", "about"?}, ...],
+    "attach": [{"kind", "thread"}, ...]}``. Each entry goes through the same checks as ``--thread KIND:TITLE`` and
+    ``--attach KIND:THREAD``; ``about`` is a thread id or ``@N`` as for ``--about``. A key named twice, at any level, is
+    refused."""
+    try:
+        doc = json.loads(text, object_pairs_hook=_no_dup_keys)
+    except RecursionError:
+        raise CoordError("the split document is nested too deeply") from None
+    except ValueError as exc:
+        raise CoordError(f"the split document is not JSON: {str(exc)[:120]}") from None
+    if not isinstance(doc, dict) or set(doc) - {"drop_id", "threads", "attach"}:
+        raise CoordError('the split document is an object with only "drop_id", "threads" and "attach"')
+    drop_id = doc.get("drop_id", positional)
+    if not isinstance(drop_id, str) or not drop_id or (positional is not None and drop_id != positional):
+        raise CoordError('the split document names its drop as "drop_id" (and it must match DROP_ID when both are given)')
+    parts: list[Part] = []
+    for key, fields in (("threads", ("kind", "title", "about")), ("attach", ("kind", "thread"))):
+        rows = doc.get(key, [])
+        if not isinstance(rows, list):
+            raise CoordError(f'"{key}" is a list')
+        for row in rows:
+            if not isinstance(row, dict) or set(row) - set(fields):
+                raise CoordError(f'each of "{key}" is an object with {", ".join(fields)} (kind required)')
+            kind = row.get("kind")
+            if not isinstance(kind, str) or kind not in KINDS:
+                raise CoordError(f'"kind" in "{key}" is exactly one of {", ".join(KINDS)} (got {str(kind)[:80]!r})')
+            if key == "threads":
+                title = row.get("title")
+                if not isinstance(title, str) or not title.strip():
+                    raise CoordError('"title" is a non-empty string')
+                about = row.get("about")
+                if about is not None:
+                    if not isinstance(about, str) or not about:
+                        raise CoordError('"about" is a thread id or @N (a non-empty string)')
+                    if kind == "work":
+                        raise CoordError('"about" applies to a new ask, note or relay thread, not a work thread')
+                parts.append(Part(kind, title.strip(), about=about))
+            else:
+                thread = row.get("thread")
+                if not isinstance(thread, str) or not thread or ":" in thread:
+                    raise CoordError('"thread" is a thread id (a non-empty string without ":")')
+                parts.append(Part(kind=kind, attach=thread))
+    if not parts:
+        raise CoordError('the split document names no threads: give "threads" or "attach" at least one entry')
+    return drop_id, parts
+
+
 def run_split(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
         store = _store(args)
-        parts = [_parse_part(s) for s in args.thread]
-        if args.about is not None:
+        drop_id = args.drop_id
+        if args.json_file is not None or args.stdin:
+            if args.thread or args.attach or args.about is not None:
+                raise CoordError("a JSON split carries every thread itself; leave out --thread, --attach and --about")
+            if args.json_file is not None and args.stdin:
+                raise CoordError("name the JSON once: --json-file or --stdin")
+            drop_id, parts = _split_doc(_read_input(args.json_file), args.drop_id)
+        elif args.drop_id is None:
+            raise CoordError("name the drop (DROP_ID), or give the whole split as JSON (--json-file PATH or --stdin)")
+        else:
+            parts = [_parse_part(s) for s in args.thread]
+        if args.json_file is None and not args.stdin and args.about is not None:
             if all(p.kind == "work" for p in parts):
                 raise CoordError("--about applies to a new ask, note or relay thread; this split names none")
             parts = [Part(p.kind, p.title, about=None if p.kind == "work" else args.about) for p in parts]
         parts += [_parse_attach(a) for a in args.attach]
-        threads = store.split(args.drop_id, parts, by=args.by, token=args.token)
+        threads = store.split(drop_id, parts, by=args.by, token=args.token)
     except _REFUSED as exc:
         print(f"levain drops split: {exc}", file=sys.stderr)
         return 1
     n = len(threads)
     _emit(out, args.json, [_thread_row(t) for t in threads],
-          f"drop receipt: {args.drop_id} split into {n} thread{'s' if n != 1 else ''}\n"
+          f"drop receipt: {drop_id} split into {n} thread{'s' if n != 1 else ''}\n"
           + "\n".join(_thread_line(t) for t in threads))
+    return 0
+
+
+def run_note(args: argparse.Namespace, out: Any = None) -> int:
+    out = out or sys.stdout
+    try:
+        why = _text_input(args, args.why, "--why")
+        if why is None:
+            raise CoordError("say why: --why TEXT, --text-file PATH or --stdin")
+        why = _store(args).note(args.drop_id, why, token=args.token)
+    except _REFUSED as exc:
+        print(f"levain drops note: {exc}", file=sys.stderr)
+        return 1
+    _emit(out, args.json, {"drop_id": args.drop_id, "stage": "noted", "why": why},
+          f"drop receipt: {args.drop_id} noted: {why}")
     return 0
 
 
@@ -976,6 +1112,9 @@ def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
         store = _store(args)
+        if _no_store(store):
+            print(f"levain drops show: {NO_STORE}", file=sys.stderr)
+            return 1
         drop, threads, receipts = store.drop_view(args.drop_id)
     except _REFUSED as exc:
         print(f"levain drops show: {exc}", file=sys.stderr)
@@ -985,7 +1124,9 @@ def run_drop_show(args: argparse.Namespace, out: Any = None) -> int:
     text = (f"{drop.drop_id}  {drop.surface}  received {drop.received_at}, {_where(drop)}\n"
             f"  words (verbatim, data): {_shown(drop.words)}\n"
             + ("\n".join(_thread_line(t) for t in threads) if threads else "  not split yet")
-            + "\n  drop receipts: " + ", ".join(f"{r.body.get('stage')} {r.at}" for r in receipts))
+            + "\n  drop receipts: " + ", ".join(
+                f"{r.body.get('stage')} {r.at}" + (f" ({_shown(str(r.body.get('why', '')))})" if r.body.get("stage") == "noted" else "")
+                for r in receipts))
     _emit(out, args.json, obj, text)
     return 0
 
@@ -1041,12 +1182,19 @@ def _chat_subparsers(subparsers: argparse._SubParsersAction) -> argparse._SubPar
 def run_drop_list(args: argparse.Namespace, out: Any = None) -> int:
     out = out or sys.stdout
     try:
-        drops = _store(args).drops(limit=args.limit)
+        store = _store(args)
+        if _no_store(store):
+            _emit(out, args.json, [], NO_STORE)
+            return 0
+        pairs = store.drops_noted(limit=args.limit)
     except _REFUSED as exc:
         print(f"levain drops list: {exc}", file=sys.stderr)
         return 1
-    _emit(out, args.json, [_drop_row(d) for d in drops],
-          "\n".join(f"{d.drop_id}  {d.received_at}  {_shown(d.words[:80])}" for d in drops)
+    drops = [d for d, _ in pairs]
+    whys = {d.drop_id: w for d, w in pairs}
+    _emit(out, args.json, [{**_drop_row(d), "noted": whys[d.drop_id]} for d in drops],
+          "\n".join(f"{d.drop_id}  {d.received_at}  {_shown(d.words[:80])}"
+                     + ("" if whys[d.drop_id] is None else f"  [noted: {_shown(whys[d.drop_id])}]") for d in drops)
           or "no drops")
     return 0
 
@@ -1056,6 +1204,12 @@ def run_thread(args: argparse.Namespace, out: Any = None) -> int:
     try:
         store = _store(args)
         cmd = args.thread_cmd
+        if cmd in ("list", "show") and _no_store(store):
+            if cmd == "show":
+                print(f"levain thread show: {NO_STORE}", file=sys.stderr)
+                return 1
+            _emit(out, args.json, [], NO_STORE)
+            return 0
         if cmd == "list":
             threads = store.threads(include_closed=args.all)
             _emit(out, args.json, [_thread_row(t) for t in threads],
@@ -1072,6 +1226,10 @@ def run_thread(args: argparse.Namespace, out: Any = None) -> int:
                     + "\n".join(f"    #{e[0]} {e[1]} = {e[2]}  [{e[4]}: {e[3]}]" for e in events))
             _emit(out, args.json, obj, text)
             return 0
+        if cmd in ("state", "set") and getattr(args, "cause_file", None) is not None:
+            if args.cause:
+                raise CoordError("name the cause once: --cause or --cause-file")
+            args.cause = _read_input(args.cause_file)
         if cmd == "state":
             t = store.set_state(args.thread_id, args.state, by=args.by, cause=args.cause, token=args.token)
         elif cmd == "merge":
@@ -1081,13 +1239,18 @@ def run_thread(args: argparse.Namespace, out: Any = None) -> int:
         elif cmd == "add":
             if args.about is not None and args.attach:
                 raise CoordError("--about names what a NEW thread concerns; an attach joins an existing one")
-            part = _parse_attach(args.attach) if args.attach else _parse_part(args.thread)
+            spec = _text_input(args, args.thread, "--thread") if not args.attach else None
+            if args.attach and (args.text_file is not None or args.stdin):
+                raise CoordError("name the thread once: --attach, or --thread / --text-file / --stdin")
+            part = _parse_attach(args.attach) if args.attach else _parse_part(spec or "")
             if args.about is not None:
                 part = Part(part.kind, part.title, about=args.about)
             t = store.add(args.drop_id, part, by=args.by, token=args.token)
         else:   # set
-            t = store.set_field(args.thread_id, args.field, args.value, by=args.by, cause=args.cause,
-                                token=args.token)
+            value = _text_input(args, args.value, "VALUE")
+            if value is None:
+                raise CoordError("give the new value: VALUE, --text-file PATH or --stdin")
+            t = store.set_field(args.thread_id, args.field, value, by=args.by, cause=args.cause, token=args.token)
     except _REFUSED as exc:
         print(f"levain thread {args.thread_cmd}: {exc}", file=sys.stderr)
         return 1
@@ -1197,6 +1360,20 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
                 from levain.coordinator.launch import launch_session
 
                 got = launch_session(store, ln.launch_id)
+            elif store.coord_status()["wake"] == "idle":
+                # a coordinator running without the lease: you asked, so a done one is replaced (the watcher's listing)
+                from levain.coordinator.launch import wake_idle
+
+                got, line = wake_idle(store)
+                st = store.coord_status()
+                st["started"] = None if got is None else {"started": got.started, "attach": got.attach,
+                                                          "refusal": got.refusal, "remedy": got.remedy}
+                if got is None:
+                    st["why"] = line
+                    _emit(out, args.json, st, f"no launch asked for: {line}")
+                    return 1
+                _emit(out, args.json, st, f"{line}\n{_outcome_text(got)}")
+                return 0 if got.started else 1
             st = store.coord_status()
             st["started"] = None if got is None else {"started": got.started, "attach": got.attach,
                                                       "refusal": got.refusal, "remedy": got.remedy}
@@ -1217,11 +1394,31 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             except KeyboardInterrupt:
                 return 0
             return 0
+        if _no_store(store):
+            _emit(out, args.json, {"store": None, "lease": None, "wake": "unset", "why": NO_STORE, "setting": None,
+                                   "launches": []}, NO_STORE)
+            return 0
         st = store.coord_status()
     except _REFUSED as exc:
         print(f"levain coord {cmd}: {exc}", file=sys.stderr)
         return 1
     lines = [_lease_line(st["lease"]), f"next drop: {st['wake']} ({st['why']})"]
+    st["install_upgrade_pending"], st["install_settings_problem"] = False, None
+    if st.get("setting"):
+        lines.append(user_layer_text(st["setting"]))
+        if st["setting"].get("agent") == "claude":
+            from levain.coordinator.launch import default_coordinator_dir
+            from levain.install import coordinator_read_rule_state
+
+            cwd = st["setting"].get("cwd") or str(default_coordinator_dir())
+            pending, problem = coordinator_read_rule_state(Path(cwd))
+            st["install_upgrade_pending"], st["install_settings_problem"] = pending, problem or None
+            if problem:
+                lines.append(f"coordinator install: settings unreadable ({problem}), so its Read allow rule cannot be "
+                             "added and a read outside its workspace waits on a prompt; fix that file by hand")
+            elif pending:
+                lines.append(f"coordinator install: upgrade pending (no Read allow rule, so a read outside its "
+                             f"workspace waits on a prompt); run: levain update --path {shlex.quote(str(cwd))}")
     for ln in st["launches"]:
         lines.append(f"  {ln['launch_id']}  {ln['role']}  {ln['harness']}  {ln['state']} ({ln['cause']})  "
                      f"session {ln['session_key']}  asked {ln['at']}")
@@ -1229,13 +1426,48 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
     return 0
 
 
+def user_layer_text(setting: Any) -> str:
+    """The setting's user-layer line, as ``coord agent`` and ``coord status`` say it (a Setting or its dict)."""
+    agent, on = (setting["agent"], setting.get("user_scope")) if isinstance(setting, dict) else (
+        setting.agent, setting.user_scope)
+    if agent != "claude":
+        return "user layer: not applicable (not a claude coordinator)"
+    if on:
+        return "user layer: on (the coordinator loads your user settings, hooks and CLAUDE.md)"
+    return "user layer: off (project settings only)"
+
+
 def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     """``levain coord agent``: for claude, the directory is made a Levain install for Claude Code first when it is not
     one (``levain init``, non-interactive), and the setting is recorded only once its consent hook is live; codex is
     :func:`_coord_agent_codex`. Either workspace goes in the coordinator record before the setting names it."""
-    if args.agent == "none":
+    user_scope = None if args.user_scope is None else args.user_scope == "on"
+    if args.agent is None:
+        # `levain coord agent --user-scope on|off` alone: the standing setting is kept whole, only the layer choice moves
+        if user_scope is None:
+            raise CoordError("name an agent (claude, codex or none), or give --user-scope on|off to change only that")
         if args.cwd is not None or args.model is not None:
-            raise CoordError("agent none takes no --model and no --cwd")
+            raise CoordError("--user-scope alone keeps the agent, model and directory; name the agent to change them")
+        checked = None
+        if user_scope:
+            # turning it on: the hook check the next launch runs, now, so the refusal is this command's and not every
+            # launch's (a user-level disableAllHooks the off setting was not consulting)
+            from levain.coordinator.launch import hook_live
+
+            was = store.coord_setting()
+            if was is not None and was.agent == "claude":
+                live, detail = hook_live(Path(was.cwd), user_scope=True)
+                if not live:
+                    raise CoordError(f"not set: with your user layer the consent hook is not live in {was.cwd}: "
+                                     f"{detail}")
+                checked = was.cwd
+        got = store.coord_set_user_scope(user_scope, cwd=checked)
+        _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "user_scope": got.user_scope},
+              f"coordinator agent: {got.agent}; {user_layer_text(got)}")
+        return 0
+    if args.agent == "none":
+        if args.cwd is not None or args.model is not None or user_scope is not None:
+            raise CoordError("agent none takes no --model, no --cwd and no --user-scope")
         store.coord_set_agent("none")
         _emit(out, args.json, {"agent": "none"}, "coordinator agent: none (drops queue for you; nothing launches)")
         return 0
@@ -1250,8 +1482,10 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     from levain.coordinator.launch import default_coordinator_dir, setup_install, trust_remedy
 
     log = sys.stderr if args.json else out
+    standing = store.coord_setting()
+    effective = user_scope if user_scope is not None else (standing is not None and standing.user_scope)
     target, live, detail = setup_install(args.cwd or default_coordinator_dir(),
-                                         emit=lambda line: print(line, file=log, flush=True))
+                                         emit=lambda line: print(line, file=log, flush=True), user_scope=effective)
     if not live:
         raise CoordError(f"not set: the consent hook is not live in {target}: {detail}")
     if not door.marked(target):
@@ -1263,10 +1497,12 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
                          f"workspace; leave out --cwd to use {default_coordinator_dir()}, or name a missing or empty "
                          "directory for Levain to set up")
     _record_workspace(target)
-    got = store.coord_set_agent("claude", model=args.model, cwd=str(target))
+    got = store.coord_set_agent("claude", model=args.model, cwd=str(target), user_scope=user_scope)
     remedy = trust_remedy(target)
-    _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "trust": remedy},
+    _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "user_scope": got.user_scope,
+                           "trust": remedy},
           f"coordinator agent: claude{f' ({got.model})' if got.model else ''} in {got.cwd}\n"
+          f"{user_layer_text(got)}\n"
           "Claude Code starts a session only in a directory you trusted; run this once and accept the trust prompt:\n"
           f"{remedy}")
     return 0
@@ -1289,7 +1525,10 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
     if cmd == "escalate":
         from levain.consent.band import release_held_pings
 
-        reply_id = fr.escalate(store, args.ref, args.why, token=args.token)
+        why = _text_input(args, args.why, "--why")
+        if why is None:
+            raise CoordError("say why: --why TEXT, --text-file PATH or --stdin")
+        reply_id = fr.escalate(store, args.ref, why, token=args.token)
         released = release_held_pings(store.directory)        # a ping held for it goes now (C5-1)
         _emit(out, args.json, {"reply_id": reply_id, "pings": released},
               f"escalated: question {args.ref} waits on the operator (ANSWER {reply_id}); the question is untouched"
@@ -1316,7 +1555,8 @@ def _coord_first_reader(args: argparse.Namespace, out: Any, store: EnvelopeStore
         head = _head_reader(args, store)
     except _faults():
         head = None
-    item, reply_id = fr.answer(store, args.ref, option=args.option, text=args.text, token=args.token,
+    item, reply_id = fr.answer(store, args.ref, option=args.option,
+                           text=_text_input(args, args.text, "--text"), token=args.token,
                                authority_source=(lambda: _band_snapshot(args, store)[0]) if head is not None
                                else (lambda: None), authority_head=head)
     _emit(out, args.json, {"item_id": item.item_id, "reply_id": reply_id},
@@ -1439,11 +1679,13 @@ def _coord_agent_codex(args: argparse.Namespace, out: Any, store: EnvelopeStore)
     operator's own Codex install, never his hooks file), then it is recorded and the setting written."""
     from levain.coordinator import codex_launch
 
+    if args.user_scope is not None:
+        raise CoordError("--user-scope is for a claude coordinator (a Codex coordinator loads its own config)")
     target, ready, detail = codex_launch.setup(args.cwd)
     if not ready:
         raise CoordError(f"not set: {detail}")
     _record_workspace(target)
-    got = store.coord_set_agent("codex", model=args.model, cwd=str(target))
+    got = store.coord_set_agent("codex", model=args.model, cwd=str(target), user_scope=False)
     _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "detail": detail},
           f"coordinator agent: codex{f' ({got.model})' if got.model else ''} in {got.cwd}\n{detail}")
     return 0
@@ -1499,7 +1741,12 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ds = subparsers.add_parser("drops", help="Your drops: list, show, and split (the coordinator's door).")
     d_sub = ds.add_subparsers(dest="drops_cmd", required=True)
     sp = d_sub.add_parser("split", help="Name the threads a drop becomes (the coordinator's door).")
-    sp.add_argument("drop_id")
+    sp.add_argument("drop_id", nargs="?", default=None,
+                    help="The drop (or leave it out and name it as drop_id in the JSON).")
+    sp.add_argument("--json-file", dest="json_file", type=Path, default=None, metavar="PATH",
+                    help='The whole split as one JSON document read from this file (no shell quoting): '
+                         '{"drop_id": ID, "threads": [{"kind", "title", "about"?}], "attach": [{"kind", "thread"}]}.')
+    sp.add_argument("--stdin", action="store_true", help="The same JSON document, read from stdin.")
     sp.add_argument("--thread", action="append", default=[], metavar="KIND:TITLE",
                     help=f"A new thread holding the drop; KIND is one of {', '.join(KINDS)}. Repeatable.")
     sp.add_argument("--attach", action="append", default=[], metavar="KIND:THREAD",
@@ -1511,6 +1758,15 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     token(sp)
     common(sp)
     sp.set_defaults(func=run_split)
+
+    nt = d_sub.add_parser("note", help="Mark a drop read with nothing to do (the coordinator's terminal receipt).")
+    nt.add_argument("drop_id")
+    nt.add_argument("--why", default=None, metavar="ONE_LINE", help="Why it needs nothing; shown beside the drop.")
+    _text_flags(nt)
+    nt.add_argument("--by", default="coordinator", choices=("coordinator",))
+    token(nt)
+    common(nt)
+    nt.set_defaults(func=run_note)
 
     sh = d_sub.add_parser("show", help="One drop: its words, its threads, its drop receipts.")
     sh.add_argument("drop_id")
@@ -1536,6 +1792,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     tst.add_argument("--by", default="operator", choices=("operator", "coordinator"))
     token(tst)
     tst.add_argument("--cause", default="")
+    tst.add_argument("--cause-file", dest="cause_file", type=Path, default=None, metavar="PATH",
+                     help="Read the cause from this file (no shell quoting).")
     common(tst)
     tm = t_sub.add_parser("merge", help="Fold OTHER into INTO (one intent the split cut in two).")
     tm.add_argument("into")
@@ -1554,6 +1812,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     g = ta.add_mutually_exclusive_group(required=True)
     g.add_argument("--thread", metavar="KIND:TITLE")
     g.add_argument("--attach", metavar="KIND:THREAD")
+    _text_flags(g)
     ta.add_argument("--about", default=None, metavar="THREAD")
     ta.add_argument("--by", default="operator", choices=("operator", "coordinator"))
     token(ta)
@@ -1561,10 +1820,13 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     tf = t_sub.add_parser("set", help="Re-kind, re-title or set the repo of a thread.")
     tf.add_argument("thread_id")
     tf.add_argument("field", choices=("kind", "title", "repo"))
-    tf.add_argument("value")
+    tf.add_argument("value", nargs="?", default=None)
+    _text_flags(tf)
     tf.add_argument("--by", default="operator", choices=("operator", "coordinator"))
     token(tf)
     tf.add_argument("--cause", default="")
+    tf.add_argument("--cause-file", dest="cause_file", type=Path, default=None, metavar="PATH",
+                    help="Read the cause from this file (no shell quoting).")
     common(tf)
     for p in (tl, ts, tst, tm, td, ta, tf):
         p.set_defaults(func=run_thread)
@@ -1595,7 +1857,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     cc = c_sub.add_parser("claim", help="An active coordinator session claims a lease nobody holds.")
     cc.add_argument("--launch", required=True, metavar="LAUNCH_ID")
     cc.add_argument("--session", required=True, metavar="SESSION_KEY")
-    cw = c_sub.add_parser("wake", help="Ask for a coordinator now, by the rules a drop runs (after a backoff).")
+    cw = c_sub.add_parser("wake", help="Ask for a coordinator now, by the rules a drop runs (after a backoff); a "
+                                       "claude coordinator running without the lease whose session is done is "
+                                       "ended and a fresh one started.")
     ca = c_sub.add_parser(
         "agent", help="Choose the coordinator a drop launches: claude or codex (each in its own workspace), or none.",
         description="claude: drops with no coordinator start a Claude Code session in DIR (default "
@@ -1605,7 +1869,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "--adapter codex). Either workspace is put in Levain's coordinator record, which the coordinator's "
                     "door reads. none: drops only queue for you. Levain never edits a harness's trust list: run the "
                     "printed line once and trust the directory.")
-    ca.add_argument("agent", choices=("claude", "codex", "none"))
+    ca.add_argument("agent", nargs="?", default=None, choices=("claude", "codex", "none"))
+    ca.add_argument("--user-scope", choices=("on", "off"), default=None, dest="user_scope",
+                    help="claude: whether the coordinator also loads your user-level Claude Code settings, hooks, "
+                         "CLAUDE.md (default off: it loads the project and local layers only). Alone "
+                         "(no agent) it changes only this and keeps the standing agent, model and directory.")
     ca.add_argument("--cwd", type=Path, default=None, metavar="DIR",
                     help="The directory the coordinator runs in (default: <levain home>/coordinator, or "
                          "coordinator-codex): a missing or empty one, which Levain sets up, or a coordinator "
@@ -1641,11 +1909,15 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     pick = can.add_mutually_exclusive_group(required=True)
     pick.add_argument("--option", default=None, help="The option KEY you pick.")
     pick.add_argument("--text", default=None, help="Your answer in your own words.")
+    pick.add_argument("--text-file", dest="text_file", type=Path, default=None, metavar="PATH",
+                      help="Your answer, read from this file (no shell quoting).")
+    pick.add_argument("--stdin", action="store_true", help="Your answer, read from stdin.")
     can.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
     can.add_argument("--data-root", dest="data_root", type=Path, default=None, help=band_root)
     ces = c_sub.add_parser("escalate", help="Leave a seat's question to the operator (an ANSWER waiting on him).")
     ces.add_argument("ref", help="The question's number or id.")
-    ces.add_argument("--why", required=True, help="Why it is the operator's, one line.")
+    ces.add_argument("--why", default=None, help="Why it is the operator's, one line.")
+    _text_flags(ces)
     ces.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
     cmo = c_sub.add_parser(
         "morning", help="The morning card: away, what waits UNDECIDED, thread budgets, what waits on you.",

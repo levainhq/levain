@@ -415,6 +415,8 @@ class CoordStore:
                 conn.execute(stmt)
             ensure_one_signature(conn)
             _replies_gseq(conn)
+            from levain.coordinator.lease import migrate_settings
+            migrate_settings(conn)
             if rebuilt:
                 check = conn.execute("PRAGMA integrity_check").fetchall()
                 if check != [("ok",)]:
@@ -515,6 +517,34 @@ class CoordStore:
             conn.close()
             raise
         return conn
+
+    def coordinator_present(self) -> bool:
+        """Whether a coordinator store is here, read without making or migrating anything: the directory rule read
+        with ``lstat``, the file opened ``mode=ro`` and ``query_only``, True when it holds the coordinator's
+        ``threads`` table (an older format still counts: a writer brings it current). False for no directory, no file,
+        or a dispatch-only file; a directory that breaks the rule raises, as every opener's does."""
+        try:
+            self._check_directory_readonly()
+        except StoreAbsent:
+            return False
+        if not self.path.exists():
+            return False
+        # measured: a mode=ro open of a WAL file with no -wal beside it makes -wal and -shm. With none there, nothing
+        # is uncommitted outside the main file, so it is read immutable (no lock, no side file); with one there, a
+        # connection is or was open, and the plain read-only open reads through it
+        live = Path(str(self.path) + "-wal").exists()
+        try:
+            conn = sqlite3.connect(self.path.resolve().as_uri() + ("?mode=ro" if live else "?mode=ro&immutable=1"),
+                                   uri=True, timeout=BUSY_WAIT_S, isolation_level=None)
+        except sqlite3.OperationalError:
+            if not self.path.exists():          # removed between the check and the open
+                return False
+            raise
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            return "threads" in _names(conn)
+        finally:
+            conn.close()
 
     def _schema_current(self, conn: sqlite3.Connection, *, base: bool = False) -> bool:
         """``base`` (every display's gate, and a non-creating write's): the lifecycle tables are ADDITIVE, so a store
@@ -686,6 +716,23 @@ class CoordStore:
             self._drop_receipt(conn, drop_id, "split", now)
             self._split_done(conn, drop_id, touched, now)
             return [self._thread(conn, t) for t in touched]
+
+    def note(self, drop_id: str, why: str, *, token: object) -> str:
+        """The coordinator's terminal "read, nothing to do" for a drop: an append-only ``noted`` drop receipt carrying
+        ``why`` (one line), written under the lease like a split. It stands in for a split everywhere a drop is
+        counted as unseen or queued, and the drop stays visible with its reason. A drop already split or already
+        noted is refused; a later split of a noted drop is still allowed (the operator or coordinator changed its
+        mind), and shows both receipts."""
+        why = _one_line("a drop's why", why, _TITLE_MAX)
+        with self._write("coordinator", token) as (conn, now):
+            self._must_drop(conn, drop_id)
+            if self._receipts(conn, drop_id, "split"):
+                raise CoordError(f"drop {drop_id} is already split; a split drop is not noted")
+            if self._receipts(conn, drop_id, "noted"):
+                raise CoordError(f"drop {drop_id} is already noted")
+            self._reply(conn, None, "drop_receipt", "drops", drop_id,
+                        {"stage": "noted", "drop_id": drop_id, "why": why, "threads": []}, now)
+        return why
 
     def add(self, drop_id: str, part: Part, *, by: str = "operator", token: object = None) -> Thread:
         """Put an already-split drop into one more thread (a new one, or an existing open one): the receipt's one-tap
@@ -873,12 +920,22 @@ class CoordStore:
         with self._write() as (conn, now):
             return lease.wake(conn, now)
 
-    def coord_set_agent(self, agent: str, *, model: str | None = None, cwd: str | None = None) -> Any:
-        """Your coordinator setting: the agent a wake launches, its model, the (resolved) directory it runs in."""
+    def coord_set_agent(self, agent: str, *, model: str | None = None, cwd: str | None = None,
+                        user_scope: bool | None = None) -> Any:
+        """Your coordinator setting: the agent a wake launches, its model, the (resolved) directory it runs in, and
+        whether the session also loads your user-level Claude Code settings (None keeps the standing choice)."""
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
-            return lease.set_agent(conn, now, agent, model=model, cwd=cwd)
+            return lease.set_agent(conn, now, agent, model=model, cwd=cwd, user_scope=user_scope)
+
+    def coord_set_user_scope(self, user_scope: bool, *, cwd: str | None = None) -> Any:
+        """Only the standing claude setting's user-layer choice, read and replaced in one transaction
+        (:func:`levain.coordinator.lease.set_user_scope`)."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.set_user_scope(conn, now, user_scope, cwd=cwd)
 
     def coord_setting(self) -> Any:
         from levain.coordinator import lease
@@ -1008,6 +1065,19 @@ class CoordStore:
         with self._write() as (conn, now):
             return lease.end_unlisted(conn, now, launch_id)
 
+    def launch_replace_done(self, launch_id: str, *, asked: bool = False) -> Any:
+        """``launch_id``'s session was listed done (:func:`levain.coordinator.lease.replace_done`; ``asked``: your
+        ``levain coord wake``, which needs no unseen drop): ``(ended launch, the fresh coordinator launch the same
+        transaction asked for or None)``, or None when nothing was replaced. The unseen-drop check, the end and the
+        wake are one transaction, so a split or a second drop cannot slip between them."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            ended = lease.replace_done(conn, now, launch_id, asked=asked)
+            if ended is None:
+                return None
+            return ended, lease.wake(conn, now)
+
     def coord_lease(self) -> Any:
         """The lease as it stands (live or past its until), or None; nothing written."""
         from levain.coordinator import lease
@@ -1057,6 +1127,23 @@ class CoordStore:
         with read_transaction(self._connect) as conn:
             ids = [r[0] for r in conn.execute("SELECT drop_id FROM drops ORDER BY rowid DESC LIMIT ?", (limit,))]
             return [self._drop(conn, d) for d in ids]
+
+    def drops_noted(self, limit: int = 50) -> list[tuple[Drop, str | None]]:
+        """The newest ``limit`` drops, each with the why of its ``noted`` receipt (None when not noted), read in ONE
+        transaction: one snapshot, one open."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise CoordError("limit is 1 to 1000")
+        with read_transaction(self._connect) as conn:
+            ids = [r[0] for r in conn.execute("SELECT drop_id FROM drops ORDER BY rowid DESC LIMIT ?", (limit,))]
+            out: list[tuple[Drop, str | None]] = []
+            for d in ids:
+                got = self._receipts(conn, d, None)
+                # noted, and not split since: a drop the coordinator later split is a split drop, not a noted one
+                why = next((str(r.body.get("why", "")) for r in got if r.body.get("stage") == "noted"), None)
+                if any(r.body.get("stage") in ("split", "resplit") for r in got):
+                    why = None
+                out.append((self._drop(conn, d), why))
+            return out
 
     def thread(self, thread_id: str) -> Thread:
         with read_transaction(self._connect) as conn:

@@ -60,10 +60,14 @@ Known edges: a trust refusal or a session never listed is a death, so three in a
 or release (the first real run will likely meet it). A refusal before the spawn claim (the hook not live, the briefs
 directory refused, claude not on PATH) is no death: the launch stays pending, each start says why, and it expires unspawned. The consent
 queue's settings file is created once: when your main install made it, the coordinator's install keeps it, and its
-grants verify against that install's cockpit (init warns and continues). Your user-scope Claude Code settings, hooks
-and CLAUDE.md imports load into the coordinator's session too (doctor checks the install's wiring and that no settings
-file turns hooks off, not the rest of the effective settings). Drops that arrive while a done coordinator still holds
-the lease wait up to LEASE_TTL + IDLE_GRACE; handing a new drop into a running session is not built. A crashed spawn
+grants verify against that install's cockpit (init warns and continues). The coordinator's session loads only the project
+and local Claude Code layers and has auto-memory off (``--setting-sources project,local``, see :func:`_layer_args`); your
+user-level settings, hooks and CLAUDE.md do not reach it unless ``levain coord agent --user-scope on`` (doctor then
+checks the user file too for ``disableAllHooks``, otherwise it says that file is not consulted). A drop delivered after a
+claude coordinator's spawn claim, still unsplit when its session is listed done, waits at most one watch pass: the watcher
+ends that coordinator and starts a fresh one, whose brief quotes the drop; `levain coord wake` does the same at once for a
+done coordinator running without the lease. A Codex coordinator, and a drop with no watcher running, still wait up to
+LEASE_TTL + IDLE_GRACE; handing a drop into a running session is not built. A crashed spawn
 winner is not retried: its launch expires at LAUNCH_TTL and counts as a death. A session the read back listed in
 another directory than the launch's is not stopped (a name alone is not Levain's evidence); the launch fails and that
 session is yours to look at. The coordinator's directory under the levain home is one the hands floor denies by name
@@ -100,7 +104,7 @@ from levain.coordinator.store import CoordError, CoordStore
 
 __all__ = ["BRIEF_DROPS", "HOOK_ROW", "READBACK_DELAY", "READBACK_TRIES", "UNLISTED_RECHECK", "WORKER_KINDS", "Outcome",
            "brief_path", "default_coordinator_dir", "hook_live", "launch_session", "session_name", "setup_install",
-           "trust_remedy", "watch", "watch_once", "worker_kind"]
+           "trust_remedy", "wake_idle", "watch", "watch_once", "worker_kind"]
 
 HOOK_ROW = "Claude Code consent hook"
 _HOOK_LIVE = "wired to this install"
@@ -162,10 +166,35 @@ def brief_path(launch: Any) -> Path:
 
 
 # --- the hook check (L2) and the install -------------------------------------------------------------------------
-def hook_live(directory: Path) -> tuple[bool, str]:
+_PROJECT_LAYERS = "project,local"
+
+
+def _layer_args(user_scope: bool) -> list[str]:
+    """The Claude Code flags that keep your user layer (user settings, hooks, CLAUDE.md) out of a session
+    Levain starts: none when ``user_scope`` is on. The one home of the rule, for the coordinator and later a worker."""
+    if user_scope:
+        return []
+    # both forms (one comma-joined argument, inline JSON) were accepted by four real `claude --bg` runs on Claude Code
+    # 2.1.314 (1030-42 dietrun). Measured 10-30 on 2.1.314: with `--setting-sources project,local` those four runs
+    # answered NOT IN CONTEXT for a fact only in the user's ~/.claude/CLAUDE.md and for a canary string, so the user
+    # CLAUDE.md was not injected. Re-measure after a Claude Code upgrade.
+    return ["--setting-sources", _PROJECT_LAYERS, "--settings", '{"autoMemoryEnabled":false}']
+
+
+def _user_settings_files() -> set[Path]:
+    """The user-level Claude Code settings files (``$CLAUDE_CONFIG_DIR`` and ``~/.claude``), resolved: doctor also
+    lists the same file by its real path when the workspace sits under a symlinked home."""
+    dirs = ([Path(os.environ["CLAUDE_CONFIG_DIR"])] if os.environ.get("CLAUDE_CONFIG_DIR") else []) + [
+        Path.home() / ".claude"]
+    return {(d / "settings.json").resolve() for d in dirs}
+
+
+def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
     """Doctor's own Claude Code check of ``directory`` (never a re-derivation): ``(True, detail)`` when its
     ``Claude Code consent hook`` row reads "wired to this install" AND no ``Claude Code hooks`` row of the same check
-    fails "turned off by" (``disableAllHooks``); else ``(False, why)``."""
+    fails "turned off by" (``disableAllHooks``); else ``(False, why)``. With ``user_scope`` False (the coordinator's
+    default) the session never loads your user settings file, so a ``disableAllHooks`` only there is not consulted and
+    the detail says so; no refusal is added or removed for any other file."""
     from levain import doctor
 
     if not (Path(directory) / "CLAUDE.md").is_file():
@@ -177,13 +206,24 @@ def hook_live(directory: Path) -> tuple[bool, str]:
     # ruled (L3 r1 G1): a wired hook is not a running one. doctor reports an effective `disableAllHooks: true` (any
     # settings file a session there loads) as a later failing "Claude Code hooks" row, "turned off by ..."
     off = next((r for r in rows if r.name == _HOOKS_ROW and not r.ok and r.detail.startswith(_HOOKS_OFF)), None)
+    layers = "all layers (user, project, local)" if user_scope else f"{_PROJECT_LAYERS} only"
+    note = f"; the coordinator loads {layers}"
+    if off is not None and not user_scope:
+        # doctor has no public form of this lookup; a rename there raises here (AttributeError, tested), never a
+        # silent refusal. An OSError resolving a listed file (a symlink loop) leaves doctor's row standing: a refusal.
+        try:
+            files = {f.resolve() for f in doctor._hooks_off_files(Path(directory), "claude-code")}
+        except OSError:
+            files = set()
+        if files and files <= _user_settings_files():
+            off, note = None, note + " (user-level disableAllHooks is not consulted)"
     for row in rows:
         if row.name == HOOK_ROW:
             if not row.detail.startswith(_HOOK_LIVE):
                 return False, f"{HOOK_ROW}: {row.detail}"
             if off is not None:
                 return False, f"{HOOK_ROW}: {row.detail}, but {_HOOKS_ROW}: {off.detail}"
-            return True, row.detail
+            return True, row.detail + note
     failed = next((r for r in rows if not r.ok), None)
     why = f"{failed.name}: {failed.detail}" if failed is not None else "doctor reports no consent hook row"
     return False, f"{directory}: the consent hook is not checked ({why})"
@@ -213,7 +253,23 @@ def _install_answers() -> dict[str, str]:
     return answers
 
 
-def setup_install(directory: Path, *, emit: Callable[[str], None] = print) -> tuple[Path, bool, str]:
+def _bring_read_rule(target: Path, emit: Callable[[str], None]) -> None:
+    """A coordinator install an earlier release made lacks the bare ``Read`` allow rule: only that rule is merged
+    into its ``.claude/settings.json`` (:func:`levain.install.add_coordinator_read_rule`, under the install's lock,
+    every other byte kept), never a whole adapter refresh. Said once, through ``emit``; a merge that cannot run leaves
+    the rule pending and ``coord status`` says so."""
+    from levain import install as inst
+
+    try:
+        inst.add_coordinator_read_rule(target)
+    except inst.InitError as exc:
+        emit(f"the Read allow rule is still missing from {target}'s project settings: {str(exc)[:300]}")
+        return
+    emit(f"added the Read allow rule to {target}'s project settings")
+
+
+def setup_install(directory: Path, *, emit: Callable[[str], None] = print,
+                  user_scope: bool = False) -> tuple[Path, bool, str]:
     """Make ``directory`` a Levain install for Claude Code unless its consent hook is live already:
     ``(resolved directory, hook live, detail)``. A directory that holds anything and is not a live install is never
     installed over (no ``--force``). Init runs in this process with an answer file (non-interactive: it asks nothing),
@@ -222,8 +278,10 @@ def setup_install(directory: Path, *, emit: Callable[[str], None] = print) -> tu
     from levain import install as inst
 
     target = Path(directory).expanduser().resolve()
-    live, detail = hook_live(target)
+    live, detail = hook_live(target, user_scope=user_scope)
     if live:
+        if inst.coordinator_read_rule_pending(target):
+            _bring_read_rule(target, emit)
         return target, True, detail
     if not inst._is_safe_install_target(target):
         return target, False, (f"{target} holds files and is not a Levain install with a live consent hook "
@@ -243,7 +301,7 @@ def setup_install(directory: Path, *, emit: Callable[[str], None] = print) -> tu
     target = target.resolve()
     if code != 0:
         return target, False, f"levain init into {target} did not settle (exit {code}; its output is above)"
-    live, detail = hook_live(target)
+    live, detail = hook_live(target, user_scope=user_scope)
     return target, live, detail
 
 
@@ -254,10 +312,10 @@ def trust_remedy(directory: str | Path) -> str:
 
 # --- the brief (L8) ----------------------------------------------------------------------------------------------
 def _queued(store: CoordStore) -> list[Any]:
-    """The newest drops not yet split, oldest first, at most BRIEF_DROPS."""
+    """The newest drops neither split nor noted, oldest first, at most BRIEF_DROPS."""
     out = []
     for d in store.drops(limit=200):
-        if not any(r.body.get("stage") == "split" for r in store.drop_receipts(d.drop_id)):
+        if not any(r.body.get("stage") in ("split", "noted") for r in store.drop_receipts(d.drop_id)):
             out.append(d)
         if len(out) == BRIEF_DROPS:
             break
@@ -288,14 +346,29 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         f"- Keep it while you work: `{lv} coord beat --token N {tail}` (each beat holds it "
         f"{int(LEASE_TTL.total_seconds() // 60)} more minutes).",
         f"- See it: `{lv} coord status {tail}`.",
-        f"- Hand it back when you stop: `{lv} coord release --by coordinator --token N {tail}`.",
+        f"- Hand it back when you stop, ONLY as the very last step and as its own command, after every split, note and "
+        f"escalate has returned (never between them, never in the same batch of commands): "
+        f"`{lv} coord release --by coordinator --token N {tail}`. A release run beside the writes ends your lease under "
+        "them and they are refused.",
         "",
         "## Your writes",
         "",
-        f"Every write goes `--by coordinator --token N {tail}`:",
+        f"Every write goes `--by coordinator --token N {tail}`. Prefer the forms that need no shell quoting: write the "
+        "text to a file with your Write tool (inside your workspace) or pipe it on stdin, then run ONE short command. "
+        "Type each flag out in full on the command; never keep flags in a shell variable (zsh does not split it).",
         "",
+        f"- split a drop, quoting-free: write `{{\"drop_id\": \"DROP_ID\", \"threads\": [{{\"kind\": \"note\", "
+        f"\"title\": \"one line\"}}]}}` to a file, then `{lv} drops split --json-file PATH --by coordinator "
+        f"--token N {tail}` (or the same JSON on stdin: `--stdin`);",
+        f"- note, quoting-free: `{lv} drops note DROP_ID --text-file PATH --by coordinator --token N {tail}` "
+        "(`--stdin` reads it from stdin); `coord escalate N`, `coord answer N`, `thread set ID FIELD` and `thread add "
+        "DROP_ID` take the same `--text-file PATH` / `--stdin`, and `thread state ID STATE` takes `--cause-file PATH`;",
+        "- the older quoted forms still work:",
         f"- split a drop into threads: `{lv} drops split DROP_ID --thread KIND:TITLE --by coordinator --token N "
         f"{tail}` (KIND is work, ask, note or relay; one intent per thread);",
+        f"- a drop that needs nothing (read, nothing to do): `{lv} drops note DROP_ID --why \"one line\" --by "
+        f"coordinator --token N {tail}`; it is never quoted again and never counts as unseen. A split drop is not "
+        "noted;",
         f"- move or fix a thread: `{lv} thread state|set|merge|detach|add ... --by coordinator --token N {tail}`;",
         f"- read: `{lv} drops list {tail}`, `{lv} drops show DROP_ID {tail}`, `{lv} thread list {tail}`.",
         "",
@@ -319,8 +392,19 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "",
         "A wake is the exception: your first prompt begins `[levain wake ln-...]`. Nobody is waiting on that turn, so "
         "Levain shows you no band on it and does not check your reply for one. Act and record; if something needs him, "
-        "file it (`coord escalate`), never narrate it. End a wake with ONE status line (for example "
-        "`wake: split d-41 into 2 threads; nothing needs you`).",
+        "file it (`coord escalate`), never narrate it.",
+        "",
+        "## How your turn ends",
+        "",
+        "Your words are the last thing in a session the operator may see in his agent view, where a question or "
+        "\"waits on you\" reads as a blocker that reached no surface he answers from. So the last line of your own "
+        "words, on every turn, is ONE status line beginning `coordinator:` that says what you did and how many items "
+        "you escalated, for example `coordinator: split d-41 into 2 threads, noted d-42; 1 escalated`. It is never a "
+        "message to the operator, never a question, never \"waits on you\". Every escalation goes through the verb "
+        f"that pings (`{lv} coord escalate`, or the band's ask tool), never through your last line. When the work is "
+        f"done, release the lease (`{lv} coord release --by coordinator --token N {tail}`) and end your turn with "
+        "that line"
+        " (on an attended turn the band Levain gave you follows it, unchanged).",
         "",
         "## Away and budgets",
         "",
@@ -590,7 +674,8 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
 
     if not ln.cwd or not Path(ln.cwd).is_dir():
         return left(f"the launch's directory {ln.cwd!r} is not a directory")
-    live, detail = hook_live(Path(ln.cwd))
+    user_scope = ln.user_scope       # the choice the launch was asked under (L3 r1), never the setting's now
+    live, detail = hook_live(Path(ln.cwd), user_scope=user_scope)
     if not live:
         return left(f"the consent hook is not live in {ln.cwd}: {detail}")
     try:
@@ -640,7 +725,7 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
         brief = _write_brief(store, got)
         name = session_name(got)
         argv = [exe, "--bg", "-n", name, "--permission-mode", "default",
-                *(["--model", got.model] if got.model else []), _prompt(got, brief)]
+                *(["--model", got.model] if got.model else []), *_layer_args(user_scope), _prompt(got, brief)]
         argv_sha = "sha256:" + hashlib.sha256(canonical_bytes(argv)).hexdigest()
         try:
             cp = _run(argv, cwd=cwd, env=env, timeout=_SPAWN_TIMEOUT)
@@ -784,6 +869,11 @@ def watch_once(store: CoordStore) -> list[str]:
       (b) an ``active`` claude launch whose session ``claude agents --json`` lists in neither of two reads
           :data:`UNLISTED_RECHECK` seconds apart is written ``ended``: ``0 turns`` for a coordinator that wrote
           nothing as coordinator since it went active (a death), else ``gone``;
+      (b2) an ``active`` coordinator whose row is ``done`` while an unsplit drop was delivered after its spawn claim
+          (after its brief was built, so it may never have read it) is ended (cause ``replaced while done``, no
+          death) and a fresh coordinator asked for in that transaction (:func:`_replace_done`); the fresh one is
+          started at the end of the pass, once (d) stopped the done one. The fresh launch is newer than that drop, so
+          the drop never replaces it: one replacement per drop;
       (c) the coordinator holding the live lease gets a SERVICE beat only while its session is listed, its row's
           ``state`` is not ``done`` (a finished turn stays listed, idle and done, until stopped), and it wrote as
           coordinator within ``SERVICE_BEAT_WINDOW`` (the store checks that in the beat's transaction). Listed is
@@ -927,6 +1017,7 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
             continue
         if ended is not None:
             lines.append(f"launch {ln.launch_id} ended: {ended.cause} (its session is no longer listed)")
+    fresh = _replace_done(store, active, listed, lines)
     held = store.coord_lease()
     if held is not None and held.live and held.holder != "operator":
         holder = next((ln for ln in active if ln.session_key == held.holder), None)
@@ -940,7 +1031,8 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
                     got = store.coord_service_beat(held.token)
                     lines.append(f"lease {held.token} held by {holder.launch_id}: beat to {got.until}" if got else
                                  f"lease {held.token} held by {holder.launch_id}: it wrote nothing as coordinator "
-                                 f"in {_minutes(lease_mod.SERVICE_BEAT_WINDOW)} min, not beaten (the lease lapses "
+                                 f"in the last {_minutes(lease_mod.SERVICE_BEAT_WINDOW)} min (the watcher beats "
+                                 f"only a holder that wrote within that window), not beaten (the lease lapses "
                                  f"at {held.until})")
                 except (CoordError, sqlite3.Error) as exc:          # it moved on since it was read: nothing to keep
                     lines.append(f"lease {held.token}: not beaten ({exc})")
@@ -958,8 +1050,87 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
         stopped.add(hid)
         lines.append(f"launch {ln.launch_id} {ln.state} ({ln.cause}): "
                      f"{_stop(exe, hid, cwd=str(store.directory), env=env)}")
+    # the fresh coordinators start after (d) stopped the done ones they replace; a fault starting one is a line, so
+    # the briefs below are still removed
+    for launch_id in fresh:
+        try:
+            got = launch_session(store, launch_id)
+        except (CoordError, sqlite3.Error, OSError) as exc:
+            lines.append(f"launch {launch_id} not started: the start faulted ({type(exc).__name__}: "
+                         f"{str(exc)[:300]})")
+            continue
+        lines.append(f"launch {got.launch_id} started: {got.attach}" if got.started
+                     else f"launch {got.launch_id} not started: {got.refusal}"
+                          + (f" (run once: {got.remedy})" if got.remedy else ""))
     # again after this pass's own ends, so a session found gone above loses its brief in the same pass (L3 r2)
     lines.extend(_remove_briefs(store))
+
+
+def _replace_done(store: CoordStore, active: list[Any], listed: dict[str, dict[str, Any]], lines: list[str]) -> list[str]:
+    """Step (b2) of :func:`watch_once`: an ``active`` coordinator whose listed row is ``done`` while a drop it never
+    saw waits (:func:`levain.coordinator.lease.unseen_drop`, checked in the end's own transaction) is ended
+    (:meth:`CoordStore.launch_replace_done`, cause :data:`levain.coordinator.lease.REPLACED`) and a fresh coordinator
+    asked for in the same transaction. Stops at the first fresh launch, so no second done coordinator is ended with
+    none to follow it. Returns the fresh launch's id, for the pass to start once (d) has stopped the done session. A
+    coordinator not ``done`` (mid-turn, may claim again) is never touched."""
+    done = [ln for ln in active if ln.role == "coordinator" and
+            (listed.get(ln.harness_session_id) or {}).get("state") == "done"]
+    for ln in done:
+        try:
+            got = store.launch_replace_done(ln.launch_id)
+        except (CoordError, sqlite3.Error) as exc:
+            lines.append(f"launch {ln.launch_id}: done, and whether a drop it never saw waits could not be settled "
+                         f"({exc})")
+            continue
+        if got is None:
+            continue
+        ended, new = got
+        lines.append(f"launch {ended.launch_id} ended: {ended.cause} (its session is done and a drop it never saw "
+                     "waits)")
+        if new is None:
+            continue
+        if new.harness == "claude":
+            return [new.launch_id]
+        lines.append(f"launch {new.launch_id}: a {new.harness} launch, left pending for its starter")
+        return []
+    return []
+
+
+def wake_idle(store: CoordStore) -> tuple[Outcome | None, str]:
+    """``levain coord wake`` when the store answered ``idle`` (a coordinator still running without the lease): the
+    same ``claude agents --json`` listing the watcher reads; a coordinator whose row is ``done`` is ended (cause
+    :data:`levain.coordinator.lease.REPLACED`; you asked, so no unseen drop is needed), its session stopped and the
+    fresh coordinator the same transaction asked for started. ``(outcome, line)``: the outcome None and the line why
+    when nothing was replaced (a row not done, a listing that cannot be read, a Codex coordinator)."""
+    way_out = "`levain coord release` ends it"
+    idle = [ln for ln in store.launches_active() if ln.role == "coordinator"]
+    if not idle:
+        return None, "no coordinator is running; nothing to replace"
+    ln = idle[-1]
+    if ln.harness != "claude" or not ln.harness_session_id:
+        return None, (f"coordinator launch {ln.launch_id} is a {ln.harness} coordinator, whose done state is not read "
+                      f"here (a known edge); {way_out}")
+    exe, env = _harness()
+    if exe is None:
+        return None, f"claude is not on PATH, so coordinator launch {ln.launch_id} could not be read; {way_out}"
+    mgmt = str(store.directory)
+    rows = _observed(exe, env, mgmt)
+    if rows is None:
+        return None, f"claude agents --json could not be read for coordinator launch {ln.launch_id}; {way_out}"
+    row = _by_session(rows).get(ln.harness_session_id)
+    if row is None or row.get("state") != "done":
+        how = "not listed" if row is None else f"listed {row.get('state')!r}, not done"
+        return None, f"coordinator launch {ln.launch_id} is {how}, so it may claim again; {way_out}"
+    got = store.launch_replace_done(ln.launch_id, asked=True)
+    if got is None:
+        return None, f"coordinator launch {ln.launch_id} moved on meanwhile; levain coord status says where it is"
+    ended, new = got
+    hid = _harness_id(row)
+    stopped = "its session is listed without a usable id" if hid is None else _stop(exe, hid, cwd=mgmt, env=env)
+    line = f"launch {ended.launch_id} ended: {ended.cause} ({stopped})"
+    if new is None:
+        return None, f"{line}; no fresh coordinator was asked for: {store.coord_status()['why']}"
+    return launch_session(store, new.launch_id), f"{line}\nasked for coordinator launch {new.launch_id}"
 
 
 def _minutes(delta: Any) -> int:

@@ -68,7 +68,7 @@ def workdir(tmp_path):
 
 @pytest.fixture
 def live_hook(monkeypatch):
-    monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (True, "wired to this install"))
 
 
 @pytest.fixture

@@ -56,6 +56,9 @@ def register(subparsers) -> None:
                        help="Run inside an agent session: the words the operator told you, quoted (required there, "
                             "recorded beside the word). Which words an agent may set: presence.SEAT_WORDS and "
                             "COORDINATOR_WORDS. (Use --said=\"-text\" if the quote starts with a dash.)")
+        w.add_argument("--drop", default=None, metavar="DROP_ID",
+                       help="The coordinator only: the drop that holds the words quoted by --said (a drop reaches the "
+                            "coordinator in its brief file, not as a prompt, so it is the evidence for the quote).")
         w.set_defaults(func=_word, word=word)
     common(sub.add_parser("status", help="Whether a ping is pushed now, and why.")).set_defaults(func=_status)
     lg = common(sub.add_parser("log", help="Every presence word set or refused: who, which role, the quote, the outcome."))
@@ -97,13 +100,39 @@ def _setter(qdir: Path) -> dict | None:
     return {"agent": agent, "session": session, "role": role}
 
 
+def _evidence(by: dict, said: str | None, qdir: Path, drop: str | None):
+    """Whether ``said`` is in what the operator typed to the setter's session (or, for the coordinator, in the drop it
+    names): a :class:`levain.webpush.quote.Match`, never an error."""
+    import os
+    import time
+
+    from levain.webpush import quote
+
+    try:
+        cwd = os.getcwd()
+    except OSError:   # the working directory was removed: that root is dropped
+        cwd = None
+    roots = [Path(p) for p in (os.environ.get("CLAUDE_PROJECT_DIR"), cwd) if p and os.path.isabs(p)]
+    try:
+        return quote.match(by["agent"], by["session"], said or "", now=time.time(), roots=roots, directory=qdir,
+                           drop=drop if by["role"] == "coordinator" else None)
+    except (OSError, RuntimeError, ValueError) as e:
+        return quote.Match(False, None, f"transcript check failed ({type(e).__name__})")
+
+
 def _word(args: argparse.Namespace) -> int:
     from levain.webpush import presence
 
     qdir = _qdir(args)
+    drop = getattr(args, "drop", None)
     try:
-        presence.set_word(qdir, args.word, duration=getattr(args, "duration", None), by=_setter(qdir),
-                          said=getattr(args, "said", None))
+        by = _setter(qdir)
+        if drop and (by is None or by["role"] != "coordinator"):
+            raise presence.PresenceError("--drop is the coordinator's evidence for its quote; "
+                                         "the operator's own word and a seat's need none")
+        presence.set_word(qdir, args.word, duration=getattr(args, "duration", None), by=by,
+                          said=getattr(args, "said", None),
+                          match=None if by is None else _evidence(by, getattr(args, "said", None), qdir, drop))
     except presence.PresenceError as e:
         print(f"levain ping {args.word}: {e}")
         return 2

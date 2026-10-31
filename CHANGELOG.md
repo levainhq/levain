@@ -28,8 +28,74 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   label up to 600 (was 200). The caps are sized from the longest items a real caller filed (4,933 and 525 characters), and
   the cockpit, the phone page and the band show a question's text whole. Still refused: a block or label with a line break,
   fewer than 2 or more than 6 options.
+### Changed
+- **The Claude Code coordinator's own install now allows `Read`.** With your user layer left out, the `Read` rule in
+  your own settings is gone too, so a read of a file outside the coordinator's workspace stopped at a prompt nobody
+  answers. Its install's project settings now carry a bare `Read` allow, so it can read any file your own account can.
+  Write, Edit, WebFetch and every shell command other than its own `coord`, `drops` and `thread` verbs still ask. Only
+  the coordinator's own install gets the rule; a `levain init` for your sessions does not. The rule is the same with
+  `--user-scope on`, where your own rules apply as well. An older coordinator install gets the rule the next time
+  `levain coord agent claude` runs, or from `levain update --path <the coordinator directory>`: only the one entry is
+  added to `permissions.allow` (made if missing), every other byte of the file kept, a hand-edited one included, and a
+  second run changes nothing. Until then `levain coord status` says `coordinator install: upgrade pending` (and
+  `install_upgrade_pending` in `--json`). A settings file that is missing or unreadable (not UTF-8 included), is not a JSON object, or whose
+  `permissions` is not an object or `permissions.allow` not a list, is never written: `coord status` says `coordinator install: settings unreadable` with the reason (and
+  `install_settings_problem` in `--json`), and the rule is yours to add by hand.
+- **The Claude Code coordinator no longer loads your user-level Claude Code layer.** A coordinator session now starts
+  with `--setting-sources project,local` and auto-memory off, so your `~/.claude` settings, hooks, `CLAUDE.md` and
+  memory stay out of its context (measured on a cold turn: about 53K new cache tokens and $0.214 before, 9K and $0.038
+  with the flag). Its own install's project and local settings, including the consent hook, still apply. To put your
+  layer back, run `levain coord agent --user-scope on` (it keeps the agent, model and directory; `--user-scope off`
+  returns to the default, and `levain coord agent claude --user-scope on` sets both at once). `levain coord status`
+  and its `--json` show the choice (`user layer: off (project settings only)`). A launch keeps the choice it was asked
+  under: changing it while a launch waits to start changes the next one. `--user-scope` alone needs a claude
+  coordinator, and turning it on refuses, with the reason, when a `disableAllHooks` in your user settings would stop
+  every launch. A store from before this change reads as off. With the layer off, a `disableAllHooks` that lives only in your user settings no longer refuses the coordinator
+  launch, since the session never reads that file; `disableAllHooks` in the coordinator's own or an ancestor project
+  still refuses. Covered by tests of the spawn argv and the setting.
 
 ### Fixed
+- **The coordinator's verbs take their text without shell quoting.** Shadow 10-30: two of three real coordinators
+  misfired on their own shell lines (flags kept in a variable that zsh does not split, then a `coord release` run in the
+  same batch as the writes, which ended the lease under them). `drops note`, `coord escalate`, `coord answer`, `thread
+  set` and `thread add` take `--text-file PATH` or `--stdin` (strict UTF-8, one trailing newline dropped, read under a
+  byte cap, then the verb's own limit); `thread state` and `thread set` take `--cause-file PATH`; `drops split` takes
+  the whole split as one JSON document (`--json-file PATH` or `--stdin`:
+  `{"drop_id", "threads": [{"kind", "title", "about"?}], "attach": [{"kind", "thread"}]}`) through the same checks as
+  `--thread` and `--attach`. Every old flag works as before. The coordinator brief shows these forms first, says never
+  to keep flags in a shell variable, and says to release the lease only as the last step, as its own command. The JSON
+  split refuses a key named twice at any level, a document nested too deeply, a `kind` that is not exactly one of the
+  kinds, an empty split, and a wrong-typed `title`/`thread`/`about`, each by name; input files and stdin drop a UTF-8 BOM.
+- **A coordinator's turn ends on a status line, and a drop that needs nothing gets a receipt.** The coordinator brief
+  now carries an end-of-turn rule: the last line of its words is one `coordinator:` status line (what it did, how many
+  items it escalated), never a question or "waits on you" (a coordinator that ended on an escalation sat in the agent
+  view as "waiting for answers" for ~50 minutes); escalations go through `levain coord escalate` or the band's ask
+  tool. New verb `levain drops note DROP_ID --why "one line" --by coordinator --token N` writes an append-only `noted`
+  drop receipt (lease-fenced, refused on a split drop). A noted drop is not re-quoted in a brief, not counted as unseen
+  (no replacement coordinator), not a "Drop not split" review item, and shows `[noted: why]` in `levain drops list` and
+  `drops show`. The `levain coord watch` line for a silent holder now says its window is the service-beat window, not a
+  bare "60 min".
+- **A drop that lands while a coordinator sits done is acted on at the next watcher pass, not an hour later.** A
+  coordinator that split its drop, released the lease and stayed listed (`claude --bg`, state `done`) kept the
+  coordinator slot as `idle`, so drops filed after it sat unread until `LEASE_TTL + IDLE_GRACE`. `levain coord watch`
+  (its serve thread included) now ends a `done` claude coordinator when an unsplit drop was delivered after its spawn
+  claim (its brief quotes every drop before that), with cause `replaced while done`, never a death, stops its session
+  and starts a fresh coordinator in the same pass, whose brief quotes the drop. The fresh launch is newer than the drop,
+  so one drop replaces at most one coordinator. `levain coord wake` does the same at once for a done claude
+  coordinator running without the lease (no drop needed), and otherwise says why and names `levain coord release`. A
+  coordinator not `done` is untouched; a Codex coordinator and a drop with no watcher running still wait out the grace.
+  A question filed with no live lease was never held, so it pings at filing (no ten-minute escalation applies to it).
+  `levain coord status`, `drops list|show` and `thread list|show` no longer create `dispatch.db` or `awake.lock`, or
+  add tables to a dispatch-only `dispatch.db`; they print `no coordinator store here` (`coord status --json` keeps its
+  keys, with `"store": null`).
+- **On macOS, a Codex session signed in with a ChatGPT subscription runs in a slot instead of failing with
+  `account/read -32603`.** Codex syncs its managed preferences at start, and a slot account whose home was `/var/empty`
+  could not. The slot accounts that run vendor CLIs now have a root-owned, empty home, `L/vendorhome`, made by setup,
+  repair and replenish; the session also gets `SSL_CERT_FILE=/etc/ssl/cert.pem`, so Codex's TLS reaches chatgpt.com from
+  inside the slot. `levain doctor` gains an `agent slot homes` row: an install from before this change reports upgrade
+  pending (and exits that way) until `levain upgrade --no-pip` runs; a wrong owner, mode or a non-empty
+  `Library/Preferences` reports broken. Run once in a macOS test VM with a real ChatGPT login (two turns answered); not
+  run on Linux, where nothing changes.
 - **A cockpit with no question store no longer draws the Needs you band, or a note that it could not be recorded.** An
   absent `questions.db` (no file, or an empty one) draws nothing in the band: no heading and no note, because nothing was
   ever filed. A store that has content but cannot be read, is locked or lacks its identity row keeps its "the band could
@@ -53,6 +119,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   write is not made when its row cannot be written, your own word always goes through. `levain coord morning` adds a
   `presence:` line when an agent set the standing word or was refused in the last 24 hours. What presence does is unchanged.
   Covered by tests; not run on a real machine.
+- **An agent's `--said` quote is now checked against what you typed to it, and decides whether it may replace a word you set.**
+  `levain ping away|remote|quiet|sleep --said "..."` from an agent session looks for the quote (at least 12 characters) in the
+  last 20 turns you typed to that session in the past 6 hours; a message another session relayed, a notification or a tool
+  result is not a turn you typed. A quote found there is recorded verified, with when you typed it; one not found still sets
+  over no word or another agent's word and shows "(unverified)" in `levain ping status` and `levain ping log`, but it never
+  replaces a word you set yourself, and a verified quote replaces your word only if you typed it after that word. The
+  coordinator can name the drop that holds your words (`--drop DROP_ID`), since a drop reaches it in its brief file and not
+  as a prompt. Reads Claude Code and Codex transcripts; checked against this machine's real ones, not on a released build.
 - **An agent session can set your `away` or `remote` presence, only when it quotes your words.** `levain ping away`
   or `remote` run inside an agent session needs `--said "<what you told it>"` (the coordinator needs it for every
   word it may set); with no words, or with words over 300 characters, the command is refused and nothing changes. The record keeps the agent, its session and the quote, and `levain ping status` adds

@@ -163,7 +163,7 @@ def workdir(tmp_path):
 @pytest.fixture
 def live_hook(monkeypatch):
     """The hook check passes (the real check against a real install is test_coord_agent_sets_up_the_install)."""
-    monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (True, "wired to this install"))
 
 
 @pytest.fixture
@@ -204,7 +204,9 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     assert not any("please fix the flaky test" in a for a in argv)
     # exactly the measured argv, plus the model, plus the prompt naming the brief; never --session-id or a bypass
     assert argv[:7] == ["--bg", "-n", name, "--permission-mode", "default", "--model", "haiku"]
-    assert len(argv) == 8 and str(brief) in argv[7]
+    # the default: the user layer stays out (project + local settings only, auto-memory off), flags before the prompt
+    assert argv[7:11] == ["--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
+    assert len(argv) == 12 and str(brief) in argv[11]
     assert not any(a in ("--session-id", "--bare", "--dangerously-skip-permissions") or "bypass" in a for a in argv)
     spawn = next(c for c in fake.calls() if c["argv"][:1] == ["--bg"])
     assert spawn["cwd"] == str(workdir.resolve())
@@ -357,7 +359,7 @@ def test_a_directory_whose_hook_is_not_live_refuses(qdir, tmp_path, fake, monkey
     assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
     assert rows(qdir, "SELECT count(*) FROM launch_spawns") == [(0,)]
     # fixed while it is still pending, the same launch starts
-    monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (True, "wired to this install"))
     assert cl.launch_session(store, launch_id).started
 
 
@@ -693,7 +695,7 @@ def test_a_listed_working_holder_silent_past_two_ttls_lapses(store, fake, live_h
         assert any(line.startswith(f"lease {token} held by {ln.launch_id}: beat") for line in cl.watch_once(store))
     clock[0] += timedelta(minutes=20)                   # t+80: silent 80 min, listed and working all along
     lines = cl.watch_once(store)
-    assert any("it wrote nothing as coordinator in 60 min, not beaten" in line for line in lines), lines
+    assert any("it wrote nothing as coordinator in the last 60 min" in line for line in lines), lines
     clock[0] += timedelta(minutes=20)                   # past the until the t+60 beat gave
     assert not store.coord_lease().live
     assert not any("beat to" in line for line in cl.watch_once(store))
@@ -1104,7 +1106,7 @@ def test_a_session_found_gone_loses_its_brief_in_the_same_pass(store, fake, live
 
 
 def test_a_refusal_before_the_spawn_claim_is_one_line_too(store, fake, monkeypatch):
-    monkeypatch.setattr(cl, "hook_live", lambda d: (False, "first line\nsecond\tline ‮"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (False, "first line\nsecond\tline ‮"))
     got = cl.launch_session(store, woken(store))
     assert "\n" not in got.refusal and "first line second line" in got.refusal and "‮" not in got.refusal
 
@@ -1131,9 +1133,10 @@ def test_hooks_turned_off_by_a_settings_file_refuse_the_launch(tmp_home, qdir, f
     # G1: doctor's real check of a real install; the consent hook row still reads "wired", a later row says off
     from levain import doctor
 
-    _main(qdir, capsys, "coord", "agent", "claude")
+    # a user-level file reaches the coordinator only with --user-scope on (the default no longer loads it)
+    _main(qdir, capsys, "coord", "agent", "claude", *(["--user-scope", "on"] if scope == "user" else []))
     target = (tmp_home / ".levain" / "coordinator").resolve()
-    assert cl.hook_live(target)[0]
+    assert cl.hook_live(target, user_scope=True)[0]
     f = tmp_home / ".claude" / "settings.json" if scope == "user" else target / ".claude" / "settings.local.json"
     f.parent.mkdir(parents=True, exist_ok=True)
     data = json.loads(f.read_text()) if f.is_file() else {}
@@ -1141,7 +1144,7 @@ def test_hooks_turned_off_by_a_settings_file_refuse_the_launch(tmp_home, qdir, f
     checked = doctor._check_claude_code(target)
     (hook,) = [r for r in checked if r.name == cl.HOOK_ROW]
     assert hook.detail.startswith("wired to this install")          # the trap: wired, and still not running
-    live, why = cl.hook_live(target)
+    live, why = cl.hook_live(target, user_scope=True)
     assert not live and "turned off by" in why and str(f) in why
     store = CoordStore(qdir)
     d, _ = store.accept_drop("hooks are off", surface="cli")
@@ -1255,6 +1258,7 @@ def test_the_watcher_removes_the_brief_once_its_launch_is_over(store, fake, live
 
 # --- the pin (C0 §3.4) -----------------------------------------------------------------------------------------
 from tests.test_coordinator_envelope import _lease, ctx, keys, repo, snapshot, structured_thread  # noqa: E402,F401
+from tests.test_coordinator_first_reader import band  # noqa: E402,F401
 
 
 def test_a_one_thread_worker_is_pinned_to_its_threads_head_envelope(ctx, structured_thread):
@@ -1377,3 +1381,1119 @@ def test_every_levain_verb_the_brief_names_passes_the_coordinators_door(store, f
     assert {("coord", "questions"), ("coord", "answer"), ("coord", "escalate"), ("coord", "claim")} <= paths
     refused = sorted(p for p in paths if p not in door.DOOR)
     assert not refused, f"the brief names verbs the coordinator's door refuses: {refused}"
+
+
+# --- 1030-42: the coordinator spawns without your user layer unless --user-scope on -----------------------------
+def _spawn_argv_and_sha(store, fake, qdir):
+    launch_id = woken(store, "layers")
+    assert cl.launch_session(store, launch_id).started
+    argv = fake.spawns()[-1]
+    (sha,) = rows(qdir, "SELECT argv_sha256 FROM launch_events WHERE launch_id = ? AND kind = 'active'", launch_id)
+    return argv, sha[0]
+
+
+def test_user_scope_off_is_the_default_and_on_restores_the_old_argv(store, fake, live_hook, qdir, workdir):
+    assert store.coord_setting().user_scope is False
+    off_argv, off_sha = _spawn_argv_and_sha(store, fake, qdir)
+    assert off_argv.index("--setting-sources") < off_argv.index("--settings") < len(off_argv) - 1
+    assert off_argv[off_argv.index("--setting-sources") + 1] == "project,local"
+    assert off_argv[off_argv.index("--settings") + 1] == '{"autoMemoryEnabled":false}'
+    assert len(off_argv) == 12 and off_sha.startswith("sha256:")
+
+
+def test_user_scope_on_spawns_with_neither_flag(qdir, workdir, fake, live_hook):
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    argv, _sha = _spawn_argv_and_sha(s, fake, qdir)
+    assert argv[:7] == ["--bg", "-n", argv[2], "--permission-mode", "default", "--model", "haiku"]
+    assert len(argv) == 8 and "--setting-sources" not in argv and "--settings" not in argv
+
+
+def test_the_recorded_argv_sha_differs_between_on_and_off(qdir, workdir, fake, live_hook, tmp_path):
+    shas = {}
+    for scope in (False, True):
+        q = tmp_path / f"q-{scope}"
+        q.mkdir(mode=0o700)
+        s = CoordStore(q)
+        s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=scope)
+        argv, sha = _spawn_argv_and_sha(s, fake, q)
+        shas[scope] = (argv, sha)
+    assert "--setting-sources" in shas[False][0] and "--settings" in shas[False][0]
+    assert "--setting-sources" not in shas[True][0] and "--settings" not in shas[True][0]
+    assert shas[False][1] != shas[True][1]
+
+
+def test_a_pre_existing_store_reads_as_off_and_keeps_its_row(tmp_path):
+    q = tmp_path / "old"
+    q.mkdir(mode=0o700)
+    s = CoordStore(q)
+    s.coord_setting()                                   # makes the store with the current schema
+    c = sqlite3.connect(q / "dispatch.db")
+    try:
+        # coord_settings as it was before user_scope: no column, one standing row (its triggers go with the table)
+        c.execute("DROP TABLE coord_settings")
+        # the production DDL minus only the new column, so the agent/cwd and by CHECKs are the real ones
+        (prod,) = [d for d in lease.LEASE_SCHEMA if "TABLE IF NOT EXISTS coord_settings" in d]
+        col = "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), "
+        assert col in prod
+        c.execute(prod.replace(col, "").replace("IF NOT EXISTS ", ""))
+        c.execute("INSERT INTO gseq (at) VALUES ('2026-01-01T00:00:00Z')")
+        c.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, by, at) VALUES (1, 'claude', 'haiku', '/x', "
+                  "'operator', '2026-01-01T00:00:00Z')")
+        c.commit()
+        row = lease.setting(c)                          # a reader on the old format, before any writer migrates it
+    finally:
+        c.close()
+    assert (row.agent, row.model, row.user_scope) == ("claude", "haiku", False)
+    fresh = CoordStore(q)                               # a writer's opener migrates, the old row reads off
+    got = fresh.coord_setting()
+    assert (got.agent, got.model, got.user_scope) == ("claude", "haiku", False)
+    assert fresh.coord_set_agent("claude", model="haiku", cwd="/x", user_scope=True).user_scope is True
+    assert fresh.coord_set_agent("claude", model="sonnet", cwd="/x").user_scope is True      # None keeps the choice
+    assert fresh.coord_set_agent("none").user_scope is False
+
+
+def test_coord_status_says_the_user_layer(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    text = _main(qdir, capsys, "coord", "status").out
+    assert "user layer: off (project settings only)" in text
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["setting"]["user_scope"] is False
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--user-scope", "on").out
+    assert "user layer: on" in out and "auto-memory" not in out       # auto-memory was never measured under --bg
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["setting"]["user_scope"] is True
+    s = CoordStore(qdir).coord_setting()
+    # --user-scope alone keeps the agent, model and directory
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")
+    t = CoordStore(qdir).coord_setting()
+    assert (t.agent, t.model, t.cwd, t.user_scope) == (s.agent, s.model, s.cwd, False)
+    # a bad value, no agent and nothing, and --user-scope on none, are refused
+    with pytest.raises(SystemExit) as bad:
+        _main(qdir, capsys, "coord", "agent", "claude", "--user-scope", "maybe")
+    assert bad.value.code == 2
+    _main(qdir, capsys, "coord", "agent", rc=1)
+    _main(qdir, capsys, "coord", "agent", "none", "--user-scope", "on", rc=1)
+
+
+def test_a_user_level_disable_all_hooks_is_not_consulted_without_user_scope(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    user = tmp_home / ".claude"
+    user.mkdir(exist_ok=True)
+    (user / "settings.json").write_text('{"disableAllHooks": true}')
+    live, detail = cl.hook_live(target, user_scope=True)
+    assert not live and "turned off by" in detail
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert live, detail
+    assert "project,local only" in detail and "user-level disableAllHooks is not consulted" in detail
+    # a project-level file still refuses, with or without the user layer
+    (target / ".claude" / "settings.local.json").write_text('{"disableAllHooks": true}')
+    assert not cl.hook_live(target, user_scope=False)[0]
+
+
+# --- 1030-42 L3 r1 fixes ---------------------------------------------------------------------------------------
+def test_the_layer_flags_are_the_comma_form_as_one_argument():
+    # measured accepted by a real `claude --bg` on Claude Code 2.1.314 (1030-42 dietrun): one comma argument, inline JSON
+    assert cl._layer_args(False) == ["--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
+    assert cl._layer_args(True) == []
+
+
+@pytest.mark.parametrize("asked", [False, True])
+def test_a_pending_launch_spawns_with_the_layer_it_was_asked_under(qdir, workdir, fake, live_hook, asked):
+    # codex r1 HIGH: a drop wakes under one choice, the operator flips it before the watcher starts the launch
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=asked)
+    launch_id = woken(s, "race")
+    assert s.launch(launch_id).user_scope is asked
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=not asked)
+    assert cl.launch_session(s, launch_id).started
+    argv = fake.spawns()[-1]
+    assert ("--setting-sources" in argv) is (not asked) and ("--settings" in argv) is (not asked)
+
+
+def test_a_launch_asked_for_before_the_column_reads_as_off(qdir, workdir):
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    launch_id = woken(s, "old")
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        c.execute("ALTER TABLE launches DROP COLUMN user_scope")        # launches as it was before the column
+        c.commit()
+        assert lease.launch(c, launch_id).user_scope is False           # a reader before any writer migrates it
+    finally:
+        c.close()
+    fresh = CoordStore(qdir)                                            # a writer's opener adds it, 0 on the old row
+    assert fresh.launch(launch_id).user_scope is False
+    assert rows(qdir, "SELECT user_scope FROM launches WHERE launch_id = ?", launch_id) == [(0,)]
+
+
+def test_user_scope_never_sticks_to_a_non_claude_setting(qdir, workdir, capsys):
+    s = CoordStore(qdir)
+    s.coord_set_agent("codex", cwd=str(workdir.resolve()))
+    out = _main(qdir, capsys, "coord", "agent", "--user-scope", "on", rc=1)
+    assert "claude" in out.err and s.coord_setting().user_scope is False
+    # the store never writes a 1 on a non-claude row, so a later `coord agent claude` has nothing to inherit
+    assert s.coord_set_agent("codex", cwd=str(workdir.resolve()), user_scope=True).user_scope is False
+    assert rows(qdir, "SELECT user_scope FROM coord_settings ORDER BY seq DESC LIMIT 1") == [(0,)]
+    assert s.coord_set_agent("claude", cwd=str(workdir.resolve())).user_scope is False
+    # a codex row that carries a 1 anyway (written before this fix) reads as off and is not inherited
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        c.execute("INSERT INTO gseq (at) VALUES ('2026-01-01T00:00:00Z')")
+        g = c.execute("SELECT MAX(rowid) FROM gseq").fetchone()[0]
+        c.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, by, at) VALUES "
+                  "(?, 'codex', NULL, ?, 1, 'operator', '2026-01-01T00:00:00Z')", (g, str(workdir.resolve())))
+        c.commit()
+    finally:
+        c.close()
+    assert s.coord_setting().user_scope is False
+    assert s.coord_set_agent("claude", cwd=str(workdir.resolve())).user_scope is False
+
+
+def test_a_scope_only_change_never_undoes_a_concurrent_change(qdir, workdir, capsys, monkeypatch):
+    # codex r1 MED: the scope-only write read the row in one transaction and wrote its replacement in another
+    CoordStore(qdir).coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    real, fired = lease.setting, []
+
+    def interleave(conn):
+        got = real(conn)
+        if not fired:
+            fired.append(threading.Thread(target=lambda: CoordStore(qdir).coord_set_agent("none")))
+            fired[0].start()
+            fired[0].join(1.0)          # finishes at once unless the scope change holds the write lock
+        return got
+
+    monkeypatch.setattr(lease, "setting", interleave)
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")
+    fired[0].join(30)
+    monkeypatch.setattr(lease, "setting", real)
+    # the later `agent none` stands (a stale scope-only copy would have re-enabled the claude coordinator)
+    assert rows(qdir, "SELECT agent, user_scope FROM coord_settings ORDER BY seq") == [
+        ("claude", 1), ("claude", 0), ("none", 0)]
+
+
+def test_turning_the_layer_on_refuses_when_a_user_level_file_turns_hooks_off(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    out = _main(qdir, capsys, "coord", "agent", "--user-scope", "on", rc=1)
+    assert "turned off by" in out.err and CoordStore(qdir).coord_setting().user_scope is False
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")      # turning it off checks nothing new
+
+
+def test_a_user_level_disable_all_hooks_through_a_symlinked_home_is_not_consulted(tmp_path, tmp_home, qdir, fake,
+                                                                                 capsys, monkeypatch):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    link = tmp_path / "home-link"
+    link.symlink_to(tmp_home)
+    monkeypatch.setenv("HOME", str(link))
+    target = (link / ".levain" / "coordinator").resolve()
+    (link / ".claude").mkdir(exist_ok=True)
+    (link / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert live, detail
+    assert not cl.hook_live(target, user_scope=True)[0]
+
+
+def test_a_missing_hooks_off_helper_fails_loud_not_as_a_refusal(tmp_path, tmp_home, qdir, fake, capsys, monkeypatch):
+    from levain import doctor
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    assert cl.hook_live(target, user_scope=False)[0]                    # user-only file: not consulted
+    rows_now = doctor._check_claude_code(target)                         # doctor's own rows survive the rename
+    monkeypatch.setattr(doctor, "_check_claude_code", lambda _d: rows_now)
+    monkeypatch.delattr(doctor, "_hooks_off_files")                      # a rename in doctor
+    with pytest.raises(AttributeError):
+        cl.hook_live(target, user_scope=False)
+
+
+def test_the_coordinator_install_allows_a_bare_read_and_no_other_file_tool(tmp_home, qdir, tmp_path, capsys):
+    # 1030-42 (np-5396be49 "5b"): under --setting-sources project,local the user's own `Read` allow is gone and a Read
+    # outside the workspace stopped at a prompt nobody answers; the coordinator install's project settings carry it
+    from levain import install as inst
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    rules = allow(target)
+    assert rules.count("Read") == 1
+    assert not [r for r in rules if r.split("(")[0] in ("Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Bash")
+                and not r.startswith("Bash(")], rules
+    assert not [r for r in rules if r.startswith("Bash(") and not r.endswith(":*)")], rules
+    # a plain `levain init` never gains it
+    plain = tmp_path / "plain"
+    answers = tmp_path / "answers.json"
+    answers.write_text(json.dumps(cl._install_answers()))
+    assert inst.run_init(plain, "claude-code", force=False, answers_file=answers, default_grants="no") == 0
+    assert "Read" not in allow(plain.resolve())
+    assert inst.coordinator_read_rule_pending(plain.resolve()) is False       # not a coordinator: nothing pending
+    assert inst.coordinator_read_rule_pending(target) is False
+
+
+def test_an_older_coordinator_install_is_brought_to_the_read_rule_once(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    with monkeypatch.context() as m:
+        m.setattr(inst, "COORDINATOR_READ_ALLOW", ())                          # the install as an earlier release made it
+        _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    assert "Read" not in allow(target)
+    assert inst.coordinator_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "upgrade pending" in status and "levain update --path" in status
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["install_upgrade_pending"] is True
+    # an operator's own rule survives, and `coord agent claude` (the path a coordinator launch setup takes) adds Read once
+    doc = json.loads((target / ".claude" / "settings.json").read_text())
+    _main(qdir, capsys, "coord", "agent", "claude")
+    got = allow(target)
+    assert got.count("Read") == 1 and inst.coordinator_read_rule_pending(target) is False
+    assert all(r in got for r in doc["permissions"]["allow"])
+    assert "upgrade pending" not in _main(qdir, capsys, "coord", "status").out
+    again = (target / ".claude" / "settings.json").read_bytes()
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert (target / ".claude" / "settings.json").read_bytes() == again        # the second run changes nothing
+    assert allow(target).count("Read") == 1
+
+
+# --- 1030-47 L3 r1 fixes (the Read rule) ---------------------------------------------------------------------------
+def _older_coordinator(qdir, capsys, monkeypatch, tmp_home):
+    """A coordinator install as a release before the Read rule made it."""
+    from levain import install as inst
+
+    with monkeypatch.context() as m:
+        m.setattr(inst, "COORDINATOR_READ_ALLOW", ())
+        _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    assert "Read" not in (target / ".claude" / "settings.json").read_text()
+    return target
+
+
+def _only_inserted(old: str, new: str) -> str:
+    """What ``new`` adds to ``old`` when it is ``old`` with one span inserted (every other byte kept), else fail."""
+    i = 0
+    while i < len(old) and old[i] == new[i]:
+        i += 1
+    ins = new[:len(new) - (len(old) - i)][i:]
+    assert old[:i] + ins + old[i:] == new, (old, new)
+    return ins
+
+
+def test_an_edited_older_coordinator_install_gets_read_and_keeps_every_other_byte(tmp_home, qdir, monkeypatch, capsys):
+    # codex MED + complement MED: a hand-edited settings.json differs from the receipt, so the adapter refresh staged
+    # the package's version and the coordinator launched without Read; the launch now merges the one rule
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    doc = json.loads(f.read_text())
+    doc["permissions"]["allow"].append("Bash(make test:*)")              # the operator's own rule
+    doc["operatorKey"] = {"kept": 1.50, "as": "written"}
+    f.write_text(json.dumps(doc, indent=4) + "\n")                         # and his own formatting
+    old = f.read_text()
+    out =_main(qdir, capsys, "coord", "agent", "claude")
+    new = f.read_text()
+    assert _only_inserted(old, new).strip(" ,\n") == '"Read"'
+    assert json.loads(new)["permissions"]["allow"] == [*doc["permissions"]["allow"], "Read"]
+    assert not list((target / ".levain").glob("pending/**/settings.json"))  # nothing staged: no adapter refresh ran
+    assert out.out.count("Read allow rule") + out.err.count("Read allow rule") == 1      # said once
+    assert inst.coordinator_read_rule_pending(target) is False
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert f.read_text() == new                                            # the second run changes nothing
+
+
+def test_a_receipt_less_older_coordinator_install_gets_read(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    target.joinpath(*inst.ADAPTER_RECEIPT_REL).unlink()
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert json.loads((target / ".claude" / "settings.json").read_text())["permissions"]["allow"].count("Read") == 1
+    assert inst.coordinator_read_rule_pending(target) is False
+
+
+def test_levain_update_brings_an_edited_older_coordinator_install_to_read(tmp_home, qdir, monkeypatch, capsys):
+    # the remedy coord status names must clear it, an edited file included
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    doc = json.loads(f.read_text())
+    doc["permissions"]["allow"].append("Bash(make test:*)")
+    f.write_text(json.dumps(doc, indent=2) + "\n")
+    with inst.install_lock(target, create=False):
+        inst.refresh_adapter(target, apply=True, emit=lambda _l: None, carrier=False)
+    got = json.loads(f.read_text())["permissions"]["allow"]
+    assert got.count("Read") == 1 and "Bash(make test:*)" in got
+    assert inst.coordinator_read_rule_pending(target) is False
+
+
+@pytest.mark.parametrize("text, merged", [
+    ('{"hooks": {}}\n', ["Read"]),                                        # no permissions key
+    ('{"permissions": {"deny": ["Edit(x)"]}}\n', ["Read"]),                 # no allow key
+    ('{}', ["Read"]),
+])
+def test_settings_with_no_allow_list_are_pending_and_the_merge_creates_it(tmp_home, qdir, monkeypatch, capsys, text,
+                                                                         merged):
+    # codex MED: a coordinator whose settings had no permissions/allow read as not pending
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    assert inst.coordinator_read_rule_pending(target) is True
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["install_upgrade_pending"] is True
+    assert inst.add_coordinator_read_rule(target) is True
+    after = json.loads(f.read_text())
+    assert after["permissions"]["allow"] == merged
+    assert {k: v for k, v in after.items() if k != "permissions"} == {k: v for k, v in json.loads(text).items()
+                                                                       if k != "permissions"}
+    assert inst.coordinator_read_rule_pending(target) is False
+    assert inst.add_coordinator_read_rule(target) is False                 # nothing left to add
+
+
+@pytest.mark.parametrize("text, why", [
+    ("{not json", "not valid JSON"),
+    ("[1, 2]", "not a JSON object"),
+    ("[" * 200000 + "]" * 200000, "not valid JSON"),                      # deep nesting: RecursionError
+    ('{"permissions": {"allow": "Read"}}', "not a list"),
+    ('{"permissions": ["Read"]}', "not an object"),
+], ids=["bad-json", "array", "deep", "allow-string", "permissions-array"])
+def test_settings_that_cannot_be_merged_are_pending_reported_and_never_overwritten(tmp_home, qdir, monkeypatch,
+                                                                                  capsys, text, why):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    assert inst.coordinator_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "coordinator install: settings unreadable" in status and why in status, status
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True and why in js["install_settings_problem"]
+    with pytest.raises(inst.InitError):
+        inst.add_coordinator_read_rule(target)
+    assert f.read_text() == text                                           # never overwritten
+
+
+@pytest.mark.parametrize("text", [
+    '{"permissions":{"allow":["Bash(a:*)"]},"x":[1,{"y":"]}"}]}',                   # minified, brackets in strings
+    '{"permissions": {"allow": []}, "z": 1}',
+    '{"permissions": {"allow": ["old"]}, "permissions": {"allow": ["kept"]}}',     # json.loads keeps the last
+    '{\n\t"permissions": {\n\t\t"allow": [\n\t\t\t"a",\n\t\t\t"b"\n\t\t]\n\t}\n}\n',
+])
+def test_the_merge_inserts_one_entry_into_any_layout(tmp_home, qdir, monkeypatch, capsys, text):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    before = json.loads(text)
+    assert inst.add_coordinator_read_rule(target) is True
+    new = f.read_text()
+    assert _only_inserted(text, new).strip(" ,\n\t") == '"Read"'
+    assert json.loads(new)["permissions"]["allow"] == [*before["permissions"]["allow"], "Read"]
+
+
+def test_a_non_utf8_settings_file_is_pending_reported_and_never_written(tmp_home, qdir, monkeypatch, capsys):
+    # L3 readrule r2 (complement + codex): a non-UTF-8 file raised UnicodeDecodeError out of the reader and crashed
+    # coord status, the launch setup and the update refresh
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_bytes(b"\xff\xfe")
+    assert inst.coordinator_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "coordinator install: settings unreadable" in status and "cannot be read" in status, status
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True and "cannot be read" in js["install_settings_problem"]
+    with pytest.raises(inst.InitError):
+        inst.add_coordinator_read_rule(target)
+    # the launch setup: doctor's hook check reads the same file first and refuses (no live hook), never a traceback
+    out = _main(qdir, capsys, "coord", "agent", "claude", rc=1)
+    assert "consent hook is not live" in out.err and "Traceback" not in out.err
+    from levain.coordinator.launch import _bring_read_rule
+    said: list[str] = []
+    _bring_read_rule(target, said.append)                                  # the merge step itself says, never raises
+    assert len(said) == 1 and "Read allow rule is still missing" in said[0] and "cannot be read" in said[0]
+    # the update refresh's Read-rule step. host_guard.agent_pin_status reads the same file first and raises
+    # UnicodeDecodeError there too (not this module's reader; routed), so it is stubbed to reach the step
+    from levain import host_guard
+    monkeypatch.setattr(host_guard, "agent_pin_status", lambda _root: None)
+    said = []
+    with inst.install_lock(target, create=False):
+        inst.refresh_adapter(target, apply=True, emit=said.append, carrier=False)
+    assert any("Read allow rule is still missing" in s for s in said), said
+    assert f.read_bytes() == b"\xff\xfe"                                   # never written
+
+
+def test_a_missing_settings_file_is_pending_and_never_created(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    (target / ".claude" / "settings.json").unlink()
+    assert inst.coordinator_read_rule_pending(target) is True
+    assert "settings unreadable" in _main(qdir, capsys, "coord", "status").out
+    with pytest.raises(inst.InitError):
+        inst.add_coordinator_read_rule(target)
+    assert not (target / ".claude" / "settings.json").exists()
+
+
+def test_coord_status_checks_the_default_directory_when_no_cwd_is_stored(tmp_home, qdir, monkeypatch, capsys):
+    # complement LOW 4: a setting with no stored cwd launches into default_coordinator_dir()
+    # (coord_settings' CHECK refuses a claude row with no cwd, so this is defence only: the status is faked)
+    _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    real = CoordStore.coord_status
+
+    def no_cwd(self):
+        st = real(self)
+        st["setting"] = {**st["setting"], "cwd": None}
+        return st
+
+    monkeypatch.setattr(CoordStore, "coord_status", no_cwd)
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True
+
+
+def test_an_oserror_resolving_a_hooks_off_file_refuses_and_never_crashes(tmp_path, tmp_home, qdir, fake, capsys,
+                                                                         monkeypatch):
+    # complement LOW 6 / deepseek MED-2: a rename still fails loud (the test above), an I/O error does not
+    from levain import doctor
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+
+    class Broken:
+        def resolve(self):
+            raise OSError(40, "Too many levels of symbolic links")
+
+    monkeypatch.setattr(doctor, "_hooks_off_files", lambda *_a, **_k: [Broken()])
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert not live and "turned off by" in detail                       # doctor's row stands: a refusal, not a pass
+
+# --- a drop that lands while a done coordinator idles (1030-42; the shadow day, 10-30 17:33) --------------------
+def _released_and_done(store, fake, clock):
+    """The measured case: a coordinator woke on drop 1, split it, released its lease and sits listed, state done."""
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d1, _ = store.accept_drop("first drop", surface="cli")
+    store.split(d1.drop_id, [Part("work", "w1")], by="coordinator", token=token)
+    store.coord_release(token, by="coordinator")
+    fake.flag("done")
+    clock[0] += timedelta(minutes=3)
+    return ln
+
+
+def test_a_drop_after_a_done_coordinator_released_gets_a_fresh_coordinator_in_one_pass(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)
+    d2, _ = store.accept_drop("drop after the release", surface="cli")
+    assert store.coord_status()["wake"] == "idle" and store.coord_status()["lease"] is None     # the measured state
+    clock[0] += timedelta(seconds=30)
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {ln.launch_id} ended: {lease.REPLACED}") for line in lines), lines
+    assert any(line.startswith(f"launch {ln.launch_id} ended ({lease.REPLACED}): claude stop {HID}") for line in lines)
+    assert len(fake.spawns()) == 2
+    fresh = [x for x in store.launches_active() if x.launch_id != ln.launch_id]
+    assert len(fresh) == 1 and store.launch(ln.launch_id).state == "ended"
+    brief = cl.brief_path(fresh[0]).read_text()
+    assert d2.drop_id in brief and "drop after the release" in brief          # its brief quotes the waiting drop
+    # the fresh one has not yet written and the drop is older than its activation: later passes leave it alone
+    for _ in range(2):
+        clock[0] += timedelta(seconds=30)
+        cl.watch_once(store)
+    assert len(fake.spawns()) == 2 and [x.launch_id for x in store.launches_active()] == [fresh[0].launch_id]
+
+
+def test_a_replaced_coordinator_that_wrote_is_no_death(store, fake, live_hook, clock):
+    from levain.coordinator import lease as lease_mod
+
+    ln = _released_and_done(store, fake, clock)
+    store.accept_drop("drop after the release", surface="cli")
+    cl.watch_once(store)
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease_mod.launch_death(conn, lease_mod.launch(conn, ln.launch_id)) is False
+    finally:
+        conn.close()
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_a_working_coordinator_without_the_lease_is_not_replaced(store, fake, live_hook, clock):
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    store.coord_release(token, by="coordinator")                        # the fake lists it working (no done flag)
+    store.accept_drop("a drop while it works", surface="cli")
+    lines = cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and fake.stops() == []
+    assert store.launch(ln.launch_id).state == "active" and not any(lease.REPLACED in x for x in lines)
+
+
+def test_a_done_coordinator_that_already_saw_every_drop_is_not_replaced(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)         # drop 1 was split before the release: nothing unseen waits
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and store.launch(ln.launch_id).state == "active"
+
+
+def test_a_drop_the_done_coordinator_never_saw_is_replaced_even_with_its_lease_live(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    store.coord_claim(ln.launch_id, ln.session_key)      # it holds a live lease and went done without releasing
+    fake.flag("done")
+    clock[0] += timedelta(minutes=2)
+    store.accept_drop("a drop for the done holder", surface="cli")
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended" and len(fake.spawns()) == 2
+
+
+# --- L3 r1 (1030-42): the unseen rule, the replacement is no death, the uncapped in-transaction check -------------
+def test_a_coordinator_that_never_wrote_then_done_is_replaced_and_its_successor_starts(store, fake, live_hook, clock):
+    # codex HIGH 1's reproduction: active, never claimed or wrote, done, then a drop it never saw
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=2)
+    store.accept_drop("a drop for the silent coordinator", surface="cli")
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).cause == lease.REPLACED, lines
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease.launch_death(conn, lease.launch(conn, ln.launch_id)) is False
+    finally:
+        conn.close()
+    fresh = [x for x in store.launches_active() if x.launch_id != ln.launch_id]
+    assert len(fresh) == 1 and len(fake.spawns()) == 2, lines
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_a_coordinator_writing_after_the_drop_without_reading_it_is_still_replaced(store, fake, live_hook, clock):
+    # codex HIGH 2 / complement MED 1: a later beat or release is no evidence the drop was seen
+    from datetime import timedelta
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    clock[0] += timedelta(seconds=10)
+    store.accept_drop("lands mid-turn", surface="cli")
+    clock[0] += timedelta(seconds=10)
+    store.coord_beat(token)
+    store.coord_release(token, by="coordinator")
+    fake.flag("done")
+    clock[0] += timedelta(seconds=10)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).cause == lease.REPLACED and len(fake.spawns()) == 2
+
+
+def test_one_replacement_per_drop_a_replacement_that_leaves_the_drop_unsplit_is_not_replaced(
+        store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    a = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    d, _ = store.accept_drop("the drop after A", surface="cli")
+    cl.watch_once(store)
+    (b,) = [x for x in store.launches_active() if x.launch_id != a.launch_id]
+    assert store.launch(a.launch_id).cause == lease.REPLACED
+    # B went done too and never split d (the fake still lists the one session done): d is older than B's start
+    for _ in range(3):
+        clock[0] += timedelta(minutes=1)
+        lines = cl.watch_once(store)
+        assert not any(lease.REPLACED in x and "ended:" in x for x in lines), lines
+    assert store.launch(b.launch_id).state == "active" and len(fake.spawns()) == 2
+    assert not any(r.body.get("stage") == "split" for r in store.drop_receipts(d.drop_id))
+
+
+def test_the_unseen_check_is_uncapped_201_drops_the_oldest_unsplit(store, fake, live_hook, clock):
+    # codex MED 3: the newest 200 split by you, the oldest (after the coordinator's start) left unsplit
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    fake.flag("done")
+    drops = []
+    for i in range(201):
+        clock[0] += timedelta(milliseconds=5)
+        drops.append(store.accept_drop(f"drop {i}", surface="cli")[0])
+    for d in drops[1:]:
+        store.split(d.drop_id, [Part("note", "n")])
+    got = store.launch_replace_done(ln.launch_id)
+    assert got is not None and got[0].cause == lease.REPLACED
+
+
+def test_a_split_between_the_listing_and_the_transaction_ends_nothing(store, fake, live_hook, clock, monkeypatch):
+    from datetime import timedelta
+
+    from levain.coordinator.store import Part
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    d, _ = store.accept_drop("split by you at the last moment", surface="cli")
+    real = store.launch_replace_done
+
+    def split_first(launch_id, **kw):
+        store.split(d.drop_id, [Part("work", "w")])          # you split it after the watcher read the listing
+        return real(launch_id, **kw)
+
+    monkeypatch.setattr(store, "launch_replace_done", split_first)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active" and len(fake.spawns()) == 1 and fake.stops() == []
+
+
+def test_replacing_stops_at_the_first_fresh_launch(monkeypatch):
+    # complement LOW 3: two done coordinators, one fresh launch: the second is never ended with none to follow it
+    from types import SimpleNamespace
+
+    a = SimpleNamespace(launch_id="ln-a", role="coordinator", harness_session_id="sa")
+    b = SimpleNamespace(launch_id="ln-b", role="coordinator", harness_session_id="sb")
+    asked: list[str] = []
+
+    def replace(launch_id, **kw):
+        asked.append(launch_id)
+        return SimpleNamespace(launch_id=launch_id, cause=lease.REPLACED), SimpleNamespace(launch_id="ln-new",
+                                                                                           harness="claude")
+
+    st = SimpleNamespace(launch_replace_done=replace)
+    lines: list[str] = []
+    fresh = cl._replace_done(st, [a, b], {"sa": {"state": "done"}, "sb": {"state": "done"}}, lines)
+    assert fresh == ["ln-new"] and asked == ["ln-a"]
+
+
+def test_a_fault_starting_the_fresh_coordinator_is_a_line_and_the_briefs_still_go(store, fake, live_hook, clock,
+                                                                                   monkeypatch):
+    # complement LOW 2
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    store.accept_drop("a drop", surface="cli")
+    brief = cl.brief_path(ln)
+    assert brief.exists()
+
+    def boom(st, launch_id):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(cl, "launch_session", boom)
+    lines = cl.watch_once(store)
+    assert any("not started: the start faulted (OperationalError" in x for x in lines), lines
+    assert not brief.exists() and f"launch {ln.launch_id} ended: its brief removed" in lines
+
+
+# --- levain coord wake reaches an idle released coordinator (desk 1 / flow-shadow addendum) ----------------------
+def test_coord_wake_replaces_a_done_coordinator_running_without_the_lease(store, qdir, fake, live_hook, clock, capsys):
+    ln = _released_and_done(store, fake, clock)
+    assert store.coord_status()["wake"] == "idle"
+    out = _main(qdir, capsys, "coord", "wake")
+    assert f"launch {ln.launch_id} ended: {lease.REPLACED} (claude stop {HID}: stopped {HID})" in out.out, out.out
+    assert f"claude attach {HID}" in out.out
+    assert store.launch(ln.launch_id).cause == lease.REPLACED and len(fake.spawns()) == 2
+    assert [c for c in fake.stops()] == [["stop", HID]]
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_coord_wake_leaves_a_working_coordinator_and_names_the_way_out(store, qdir, fake, live_hook, clock, capsys):
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    store.coord_release(token, by="coordinator")                 # the fake lists it working
+    out = _main(qdir, capsys, "coord", "wake", rc=1)
+    assert "no launch asked for:" in out.out and "not done" in out.out and "levain coord release" in out.out
+    assert store.launch(ln.launch_id).state == "active" and len(fake.spawns()) == 1 and fake.stops() == []
+
+
+def test_coord_wake_with_an_unreadable_listing_says_so(store, qdir, fake, live_hook, clock, capsys):
+    ln = _released_and_done(store, fake, clock)
+    fake.flag("agents_fail")
+    out = _main(qdir, capsys, "coord", "wake", rc=1)
+    assert "could not be read" in out.out and "levain coord release" in out.out
+    assert store.launch(ln.launch_id).state == "active"
+
+
+# --- the turn's last line, and a drop that needs nothing (1030-42 brief lane) ------------------------------------
+def test_the_written_brief_ends_the_turn_on_a_coordinator_status_line(store, fake, live_hook):
+    """Shadow 10-30: a coordinator that ended on "escalated questions #2-#5 ... each waits on you" sat in the agent
+    view as waiting for the operator. The brief carries the end-of-turn rule, quoted."""
+    got = cl.launch_session(store, woken(store))
+    text = cl.brief_path(store.launch(got.launch_id)).read_text()
+    assert "ONE status line beginning `coordinator:`" in text
+    assert "never a question, never \"waits on you\"" in text
+    assert "coord escalate" in text.split("## How your turn ends")[1].split("##")[0]
+    assert "release the lease" in text
+
+
+def test_a_noted_drop_is_not_unseen_not_requoted_and_shows_noted(store, qdir, fake, live_hook, clock, capsys):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d2, _ = store.accept_drop("fyi: nothing to do here", surface="cli")
+    store.note(d2.drop_id, "an fyi, nothing to act on", token=token)
+    store.coord_release(token, by="coordinator")
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease.unseen_drop(conn, lease.launch(conn, ln.launch_id)) is None
+    finally:
+        conn.close()
+    clock[0] += timedelta(seconds=30)
+    lines = cl.watch_once(store)
+    assert not any(lease.REPLACED in line for line in lines) and len(fake.spawns()) == 1       # no replacement
+    assert d2.drop_id not in cl._brief_text(store, ln)                                          # not re-quoted
+    out = _main(qdir, capsys, "drops", "list")
+    assert f"{d2.drop_id}" in out.out and '[noted: "an fyi, nothing to act on"]' in out.out
+    out = _main(qdir, capsys, "drops", "show", d2.drop_id)
+    assert "noted" in out.out and "an fyi, nothing to act on" in out.out
+
+
+def test_only_the_lease_holder_notes_and_split_and_noted_exclude_each_other(store, qdir, fake, live_hook, clock, capsys):
+    from levain.coordinator.store import CoordError, Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "why", token=token + 1)                      # not the live lease's token
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "why", token=None)
+    store.split(d2.drop_id, [Part("work", "w")], by="coordinator", token=token)
+    with pytest.raises(CoordError, match="already split"):
+        store.note(d2.drop_id, "why", token=token)                          # a split drop is not noted
+    store.note(d1.drop_id, "read it", token=token)
+    with pytest.raises(CoordError, match="already noted"):
+        store.note(d1.drop_id, "again", token=token)
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--why", "x", "--token", str(token), rc=1)
+    assert "already noted" in out.err
+    store.coord_release(token, by="coordinator")
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "after release", token=token)               # a lapsed lease writes nothing
+
+
+def test_the_briefs_release_line_runs_as_the_coordinator_and_ends_the_lease(store, qdir, fake, live_hook, capsys):
+    """L3 r1: the end-of-turn rule named a bare `coord release` (defaults --by operator, no token, no --queue-dir)."""
+    got = cl.launch_session(store, woken(store))
+    ln = store.launch(got.launch_id)
+    text = cl.brief_path(ln).read_text()
+    section = text.split("## How your turn ends")[1].split("##")[0]
+    cmd = re.search(r"`([^`]*coord release[^`]*)`", section).group(1)
+    argv = shlex.split(cmd)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    argv = [str(token) if a == "N" else a for a in argv]
+    from levain.cli import main
+
+    assert main(argv[argv.index("coord"):]) == 0, capsys.readouterr()
+    held = store.coord_status()["lease"]
+    assert held is None or not held["live"]
+
+
+def test_drops_list_is_one_snapshot_and_a_store_error_is_a_refusal(store, qdir, monkeypatch, capsys):
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    opens = []
+    real = store._connect
+    monkeypatch.setattr(store, "_connect", lambda *a, **k: (opens.append(1), real(*a, **k))[1])
+    pairs = store.drops_noted(limit=10)
+    assert len(opens) == 1 and [d.drop_id for d, _ in pairs] == [d2.drop_id, d1.drop_id]
+    from levain.coordinator.store import CoordStore as CS
+
+    def boom(self, limit=50):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(CS, "drops_noted", boom)
+    out = _main(qdir, capsys, "drops", "list", rc=1)
+    assert "levain drops list:" in out.err and "Traceback" not in out.err
+
+
+def test_drops_show_escapes_a_noted_why_and_survives_a_receipt_with_no_why(store, qdir, capsys):
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    with store._write() as (conn, now):
+        store._reply(conn, None, "drop_receipt", "drops", d1.drop_id,
+                     {"stage": "noted", "drop_id": d1.drop_id, "why": "x\x1b[2Jy"}, now)
+        store._reply(conn, None, "drop_receipt", "drops", d2.drop_id, {"stage": "noted", "drop_id": d2.drop_id}, now)
+    out = _main(qdir, capsys, "drops", "show", d1.drop_id)
+    assert "\x1b" not in out.out and "noted" in out.out
+    out = _main(qdir, capsys, "drops", "show", d2.drop_id)
+    assert "noted" in out.out
+
+
+# --- quoting-free coordinator verbs (1030-42 verbs; shadow 10-30: two of three real coordinators misfired) -----------
+HOSTILE = "it's \"quoted\" $HOME `date` \\ backslash; ünïcode ✓ 日本"
+
+
+def _held(store):
+    ln = started(store)
+    return store.coord_claim(ln.launch_id, ln.session_key)
+
+
+def test_a_hostile_note_why_goes_through_a_file_and_stdin_as_typed(store, qdir, fake, live_hook, capsys, tmp_path,
+                                                                    monkeypatch):
+    import io
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(f), "--by", "coordinator", "--token", str(token))
+    assert [r.body["why"] for r in store.drop_receipts(d1.drop_id) if r.body.get("stage") == "noted"] == [HOSTILE]
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO((HOSTILE + "\n").encode("utf-8"))))
+    _main(qdir, capsys, "drops", "note", d2.drop_id, "--stdin", "--by", "coordinator", "--token", str(token))
+    assert [r.body["why"] for r in store.drop_receipts(d2.drop_id) if r.body.get("stage") == "noted"] == [HOSTILE]
+
+
+def test_an_oversized_or_two_way_text_is_refused_by_the_same_limits(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 201, encoding="utf-8")                                   # the --why limit is 200
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(big), "--token", str(token), rc=1)
+    assert "1 to 200 characters" in out.err
+    huge = tmp_path / "huge.txt"
+    huge.write_text("x" * 100_000, encoding="utf-8")                              # the read itself is bounded
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(huge), "--token", str(token), rc=1)
+    assert "holds more than" in out.err
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--why", "a", "--text-file", str(big), "--token", str(token),
+                rc=1)
+    assert "name the text once" in out.err
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--token", str(token), rc=1)
+    assert "say why" in out.err
+    bad = tmp_path / "bad.bin"
+    bad.write_bytes(b"\xff\xfe")
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(bad), "--token", str(token), rc=1)
+    assert "not UTF-8" in out.err
+
+
+def test_a_whole_split_is_one_json_document_with_hostile_titles(store, qdir, fake, live_hook, capsys, tmp_path,
+                                                                 monkeypatch):
+    """The 10-30 misfire: three splits in one shell line with the flags in a variable zsh did not split."""
+    import io
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    doc = tmp_path / "split.json"
+    doc.write_text(json.dumps({"drop_id": d1.drop_id,
+                               "threads": [{"kind": "work", "title": HOSTILE}, {"kind": "note", "title": "n", "about": "@1"}]}),
+                   encoding="utf-8")
+    out = _main(qdir, capsys, "drops", "split", "--json-file", str(doc), "--by", "coordinator", "--token", str(token))
+    assert "split into 2 threads" in out.out
+    titles = {t.title for t in store.threads()}
+    assert HOSTILE in titles and "n" in titles
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(json.dumps(
+        {"threads": [{"kind": "note", "title": HOSTILE + " 2"}]}).encode("utf-8"))))
+    out = _main(qdir, capsys, "drops", "split", d2.drop_id, "--stdin", "--by", "coordinator", "--token", str(token))
+    assert "split into 1 thread" in out.out and HOSTILE + " 2" in {t.title for t in store.threads()}
+
+
+def test_a_json_split_is_refused_by_the_same_checks_as_the_flags(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    doc = tmp_path / "split.json"
+    for body, why in ((json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "work", "title": "x" * 201}]}), "1 to 200"),
+                      (json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "bogus", "title": "x"}]}), "exactly one of"),
+                      ("{not json", "not JSON"),
+                      (json.dumps({"drop_id": d1.drop_id, "extra": 1}), "only"),
+                      (json.dumps({"threads": []}), "drop_id")):
+        doc.write_text(body, encoding="utf-8")
+        out = _main(qdir, capsys, "drops", "split", "--json-file", str(doc), "--by", "coordinator", "--token", str(token),
+                    rc=1)
+        assert why in out.err, (body, out.err)
+    out = _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:t", "--json-file", str(doc),
+                "--by", "coordinator", "--token", str(token), rc=1)
+    assert "carries every thread itself" in out.err
+    assert store.threads() == []                                                   # nothing was written
+
+
+def test_the_old_flags_still_work_unchanged(store, qdir, fake, live_hook, capsys):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:Shadow probe", "--by", "coordinator",
+          "--token", str(token))
+    _main(qdir, capsys, "drops", "note", d2.drop_id, "--why", "fyi", "--by", "coordinator", "--token", str(token))
+    t = store.threads()[0]
+    _main(qdir, capsys, "thread", "set", t.thread_id, "title", "renamed", "--by", "coordinator", "--token", str(token))
+    _main(qdir, capsys, "thread", "state", t.thread_id, "done", "--cause", "done", "--by", "coordinator",
+          "--token", str(token))
+    assert store.thread_view(t.thread_id)[0].title == "renamed"
+
+
+def test_thread_set_state_and_add_take_hostile_text_from_a_file(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:first", "--by", "coordinator", "--token", str(token))
+    t = store.threads()[0]
+    f = tmp_path / "v.txt"
+    f.write_text(HOSTILE, encoding="utf-8")
+    _main(qdir, capsys, "thread", "set", t.thread_id, "title", "--text-file", str(f), "--by", "coordinator",
+          "--token", str(token))
+    assert store.thread_view(t.thread_id)[0].title == HOSTILE
+    out = _main(qdir, capsys, "thread", "set", t.thread_id, "title", "--by", "coordinator", "--token", str(token), rc=1)
+    assert "give the new value" in out.err
+    c = tmp_path / "c.txt"
+    c.write_text("because " + HOSTILE, encoding="utf-8")
+    _main(qdir, capsys, "thread", "state", t.thread_id, "done", "--cause-file", str(c), "--by", "coordinator",
+          "--token", str(token))
+    f.write_text("note:" + HOSTILE + " added", encoding="utf-8")
+    _main(qdir, capsys, "thread", "add", d1.drop_id, "--text-file", str(f), "--by", "coordinator", "--token", str(token))
+    assert HOSTILE + " added" in {x.title for x in store.threads()}
+
+
+def test_escalate_and_answer_take_their_text_from_a_file(store, qdir, tmp_path, monkeypatch):
+    import argparse
+
+    from levain.coordinator import cli as ccli
+
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    ns = argparse.Namespace(text_file=f, stdin=False)
+    assert ccli._text_input(ns, None, "--why") == HOSTILE and ccli._text_input(
+        argparse.Namespace(text_file=None, stdin=False), "inline", "--why") == "inline"
+    p = argparse.ArgumentParser()
+    ccli.add_parsers(p.add_subparsers(dest="command"))
+    for argv in (["coord", "escalate", "6", "--text-file", str(f), "--token", "1"],
+                 ["coord", "escalate", "6", "--stdin", "--token", "1"],
+                 ["coord", "answer", "6", "--text-file", str(f), "--token", "1"],
+                 ["coord", "answer", "6", "--stdin", "--token", "1"]):
+        got = p.parse_args(argv)
+        assert got.coord_cmd in ("escalate", "answer")
+
+
+def test_the_brief_leads_with_the_quoting_free_forms_and_one_unmistakable_release_rule(store, fake, live_hook):
+    got = cl.launch_session(store, woken(store))
+    text = cl.brief_path(store.launch(got.launch_id)).read_text()
+    assert "Prefer the forms that need no shell quoting" in text
+    assert "never keep flags in a shell variable (zsh does not split it)" in text
+    writes = text.split("## Your writes")[1].split("##")[0]
+    assert writes.index("--json-file PATH") < writes.index("the older quoted forms still work")
+    assert f"drops note DROP_ID --text-file PATH --by coordinator --token N --queue-dir " in writes
+    lease_part = text.split("## The lease")[1].split("## Your writes")[0]
+    assert "ONLY as the very last step and as its own command, after every split, note and escalate has returned" in lease_part
+
+
+# --- L3 r2 LOWs on the brief branch (1030-42 verbs) ---------------------------------------------------------------
+def test_a_drop_split_after_it_was_noted_no_longer_lists_as_noted(store, qdir, fake, live_hook, capsys):
+    from levain.coordinator.store import Part
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    store.note(d1.drop_id, "read it", token=token)
+    store.note(d2.drop_id, "read it too", token=token)
+    store.split(d1.drop_id, [Part("work", "changed my mind")], by="coordinator", token=token)
+    whys = {d.drop_id: w for d, w in store.drops_noted(limit=10) if d.drop_id in (d1.drop_id, d2.drop_id)}
+    assert whys == {d1.drop_id: None, d2.drop_id: "read it too"}
+    out = _main(qdir, capsys, "drops", "list").out
+    assert f"{d2.drop_id}" in out and out.count("[noted:") == 1
+
+
+def test_note_returns_the_saved_why_and_the_cli_echoes_that(store, qdir, fake, live_hook, capsys):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    assert store.note(d1.drop_id, "  padded  ", token=token) == "  padded  "
+    saved = [r.body["why"] for r in store.drop_receipts(d1.drop_id) if r.body.get("stage") == "noted"]
+    assert saved == ["  padded  "]
+
+
+def test_a_noted_receipt_renders_as_noted_on_the_phone_not_as_zero_threads():
+    from levain.coordinator import phone as ph
+
+    r = type("R", (), {"body": {"stage": "noted", "why": "an fyi", "threads": []}, "at": "2026-10-30T10:00:00Z"})()
+    row = ph.CoordPhone._receipt(r) if hasattr(ph, "CoordPhone") else None
+    assert row is not None and row["stage"] == "noted" and row["why"] == "an fyi"
+    js = (Path(__file__).parent.parent / "levain" / "templates" / "web" / "phone.js").read_text()
+    assert 'noted: "noted"' in js
+    assert 'if (!receipts.some((r) => r.stage === "split" || r.stage === "noted"))' in js
+
+
+# --- L3 r1 (1030-47) on the JSON split and the text files ------------------------------------------------------------
+def _split_refused(body, why):
+    from levain.coordinator import cli as ccli
+    from levain.coordinator.store import CoordError
+
+    with pytest.raises(CoordError, match=why):
+        ccli._split_doc(body, None)
+
+
+def test_a_json_split_refuses_a_key_named_twice_at_any_level():
+    _split_refused('{"drop_id": "D", "threads": [], "threads": []}', "twice")
+    _split_refused('{"drop_id": "D", "threads": [{"kind": "note", "title": "a", "title": "b"}]}', "'title' twice")
+
+
+def test_a_deeply_nested_json_split_is_a_refusal_not_a_traceback():
+    _split_refused("[" * 100_000, "nested too deeply")
+
+
+def test_a_json_split_row_kind_is_exactly_a_kind_and_a_colon_cannot_mangle_it():
+    _split_refused('{"drop_id": "D", "threads": [{"kind": "note:x", "title": "t"}]}', "exactly one of")
+    _split_refused('{"drop_id": "D", "attach": [{"kind": "note:x", "thread": "T"}]}', "exactly one of")
+    _split_refused('{"drop_id": "D", "attach": [{"kind": "note", "thread": "a:b"}]}', 'without ":"')
+    from levain.coordinator import cli as ccli
+
+    _, parts = ccli._split_doc('{"drop_id": "D", "threads": [{"kind": "note", "title": "a: b"}]}', None)
+    assert parts[0].title == "a: b"
+
+
+def test_a_json_split_with_no_parts_is_refused_by_name():
+    _split_refused('{"drop_id": "D"}', "names no threads")
+    _split_refused('{"drop_id": "D", "threads": []}', "names no threads")
+
+
+def test_a_json_split_names_the_field_with_a_wrong_type():
+    for row, why in (({"kind": "note", "title": 5}, '"title"'), ({"kind": "note", "title": ""}, '"title"'),
+                     ({"kind": "note", "title": "t", "about": 3}, '"about"'),
+                     ({"kind": "note", "title": "t", "about": ""}, '"about"')):
+        _split_refused(json.dumps({"drop_id": "D", "threads": [row]}), why)
+    _split_refused(json.dumps({"drop_id": "D", "attach": [{"kind": "note", "thread": 7}]}), '"thread"')
+
+
+def test_a_utf8_bom_in_an_input_file_is_dropped(tmp_path):
+    from levain.coordinator import cli as ccli
+
+    f = tmp_path / "bom.json"
+    f.write_bytes(b"\xef\xbb\xbf" + b'{"drop_id": "D", "threads": [{"kind": "note", "title": "t"}]}\n')
+    assert ccli._split_doc(ccli._read_input(f), None)[0] == "D"
+
+
+def test_escalate_with_a_hostile_text_file_stores_it_as_typed(band, monkeypatch, tmp_path, capsys):
+    from levain.cli import main
+    from levain.coordinator import cli as ccli
+
+    q = band.ask()
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    monkeypatch.setattr(ccli, "_store", lambda args: band.store)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-coord")
+    from levain.coordinator import door
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    door.record(ws)
+    monkeypatch.chdir(ws)
+    rc = main(["coord", "escalate", str(q.n), "--text-file", str(f), "--token", str(band.token),
+               "--queue-dir", str(band.store.directory)])
+    assert rc == 0, capsys.readouterr().err
+    bodies = [json.loads(r[0]) for r in band.c.rows("SELECT body FROM replies WHERE kind = 'answer'")]
+    assert [b["why"] for b in bodies] == [HOSTILE]
