@@ -7,6 +7,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **Groundwork: AgentSpec, the registration refusals and the lifecycle axes.** `levain agents register|list|show|pause|resume|retire|zone` over immutable, content-hashed agent specs (`stop_at` required), refusing what the agent design's rules 1-6 and five refinements refuse; a pause survives everything but `resume`. Nothing runs an agent yet.
 - **Groundwork: one sleep reconciler over both stores.** `awake.sync` now re-reads the coordinator's working threads AND the agents' live occurrences (`agent_occurrences` in state `admitted` or `launched`) under the one `awake.json` lock, whichever side calls it, and releases the holder only when both are empty; `levain doctor`'s host-sleep row names the source (coordinator, agent, or both) and the occurrence holding the host. Nothing starts an agent occurrence yet.
 - **The coordinator's reply carries what changed in its store.** Ahead of the NEEDS YOU band, a coordinator session's
   reply block now has a work delta rendered by Levain (never model-written) from the coordinator store's records that carry

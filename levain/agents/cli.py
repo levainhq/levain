@@ -1,6 +1,7 @@
 """levain.agents.cli — ``levain agents``: the seam (A0 r6 §3.7). It opens the agent store through
 :func:`levain.agents.store.open_agent_store` and says whether the agent schema is the one this levain writes. The
-verbs of §3.6 arrive with their slices; so far ``role add`` and ``role show`` (the RoleSpec registry, P1) exist.
+verbs of §3.6 arrive with their slices; so far ``role add|show`` (P1) and ``register|list|show|pause|resume|retire|zone``
+(P2) exist.
 
 Exit 0: done (bare ``agents``: the agent schema is this levain's). Exit 1: refused, the reason on stderr.
 ``--store-dir`` belongs to ``agents`` and goes before ``role``.
