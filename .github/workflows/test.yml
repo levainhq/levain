@@ -92,6 +92,8 @@ jobs:
         # node ids, a file in no shard or two, an empty shard. Each command's exit is checked (bash -e, pipefail),
         # and the files go to pytest as one quoted array, so no path is word-split or globbed and an empty list
         # fails here instead of running the whole suite.
+        # basetemp sits outside $HOME on purpose: runner.temp is under /home/runner, and tests/test_hermetic_home.py
+        # fails any scratch home that lives under the real one (CI 2026-10-31, shard 0 on 1356d3df)
         env:
           # one scale for every wait the tests make (a shared runner is slower than a laptop): see tests/_waits.py
           LEVAIN_TEST_WAIT_SCALE: "2"
@@ -101,7 +103,7 @@ jobs:
           python tests/ci/shard.py pick --shards "$TEST_SHARDS" --shard "${{ matrix.shard }}" < "$RUNNER_TEMP/nodes.txt" > "$RUNNER_TEMP/files.txt"
           mapfile -t files < "$RUNNER_TEMP/files.txt"
           test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
-          pytest -q --basetemp="${{ runner.temp }}/pt" "${files[@]}"
+          pytest -q --basetemp=/tmp/levain-pt "${files[@]}"
 
       - name: Keep what the page showed at a failed wait
         # the page driver writes timeout-step-<n>.png / .txt beside its steps file, under pytest's basetemp; reading them is how a
@@ -112,8 +114,8 @@ jobs:
         with:
           name: page-timeouts-pytest-py${{ matrix.python-version }}-shard${{ matrix.shard }}
           path: |
-            ${{ runner.temp }}/pt/**/timeout-step-*.png
-            ${{ runner.temp }}/pt/**/timeout-step-*.txt
+            /tmp/levain-pt/**/timeout-step-*.png
+            /tmp/levain-pt/**/timeout-step-*.txt
           if-no-files-found: ignore
 
   root-py39:
@@ -255,6 +257,7 @@ jobs:
           pip install -e ".[dev,openhands]" hatchling
 
       - name: Run the browser tests
+        # basetemp outside $HOME, as in the pytest job above (tests/test_hermetic_home.py)
         env:
           CHROME: ${{ steps.chrome.outputs.chrome-path }}
           LEVAIN_TEST_WAIT_SCALE: "2"      # one scale for every wait the tests and the page driver make (tests/_waits.py)
@@ -269,7 +272,7 @@ jobs:
           echo "$files"
           test -n "$files" || { echo "shard ${{ matrix.shard }} holds no test file"; exit 1; }
           set -o pipefail
-          pytest -q -rs --basetemp="${{ runner.temp }}/pt" $files 2>&1 | tee browser.log
+          pytest -q -rs --basetemp=/tmp/levain-pt $files 2>&1 | tee browser.log
           # ANY skip is a failure here, whatever its reason: the whole point of this job is that these tests run
           if grep -q -E "^SKIPPED|[0-9]+ skipped" browser.log; then
             echo "a test skipped in the browser job (reasons above, from -rs)"
@@ -285,8 +288,8 @@ jobs:
         with:
           name: page-timeouts-browser-shard${{ matrix.shard }}
           path: |
-            ${{ runner.temp }}/pt/**/timeout-step-*.png
-            ${{ runner.temp }}/pt/**/timeout-step-*.txt
+            /tmp/levain-pt/**/timeout-step-*.png
+            /tmp/levain-pt/**/timeout-step-*.txt
           if-no-files-found: ignore
 
   isolation:
