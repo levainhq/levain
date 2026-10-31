@@ -627,6 +627,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   internal error, or an event number too large for a float, now reads as a kill Levain could not evaluate, so the
   guard is refused at signing instead of the check crashing.
 
+### Docs
+- **The README says what a coordinator wake is, where its replies show, and the ladder.** A new section, *The coordinator:
+  wakes, replies and the ladder*, covers the wake marker and why a wake shows no band, the reply block (work delta, then
+  the band), `levain coord reply` and the Coordinator panel, the unreplied-drop line, and how a question climbs from the
+  band to a `question` ping to an `attention` ping. No behaviour changes.
+
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - Groundwork for the session-start brief: the morning card takes an optional `now` (no wall-clock read, no band numbering when given), the band can be read without recording a view or numbering an item, and the ready board can be read on a connection the caller already holds. Every default is unchanged, and nothing in `levain` passes them yet, so there is no change you can see.
 - Groundwork for named agents: a role registry. `levain agents role add <file>` registers a role (name, brief template with typed slots, ceiling, model, harness, executor) under a content hash and a version, and refuses a file with an unknown field, naming it; `levain agents role show <name>` prints it. Nothing runs a role yet, and no role is signed: authorisation comes through the agent link.
