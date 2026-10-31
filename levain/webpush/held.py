@@ -14,9 +14,11 @@ succeeded (:meth:`PushStore.release_held`): a failed push, a raised error or a f
 taken again once the lease (:data:`levain.webpush.store.HELD_LEASE_SECS`) ends, so delivery is at-least-once and a
 duplicate is bounded by the lease. One flush runs at a time (:func:`_single_flight`).
 
-Nothing here needs a daemon: the gate hook runs :func:`flush_if_due` on every call and a detached send child runs
-:func:`flush` after each push, so the next notify or tool call delivers what is due; the phone server's tick
-(:func:`levain.phone_server.run_phone_server`, through :func:`tick`) only makes that prompt when no agent is calling.
+Release is event-driven; no periodic thread runs it. The gate hook runs :func:`flush_if_due` on every call and a
+detached send child runs :func:`flush` after each push, so the next notify or tool call delivers what is due. A ping
+whose hold ends with no event (a quiet that runs out, the desk going idle) waits for the next gate-hook call or push:
+with no agent calling, it stays held. The periodic ticker that once covered that gap (:func:`tick`, hosted by the
+phone port's server) is retired with that server; nothing calls :func:`tick`.
 
 Stdlib only.
 """
@@ -279,7 +281,7 @@ def flush_if_due(queue_dir: Path | str | None, *, throttle: bool = True) -> bool
 
 
 def tick(queue_dir: Path | str, stop, *, every: float = TICK_SECS) -> None:
-    """Run :func:`flush` every ``every`` seconds until the ``threading.Event`` ``stop`` is set: the long-lived phone
-    server's own thread, so a held ping is delivered when the desk goes idle even if no agent calls the gate."""
+    """Run :func:`flush` every ``every`` seconds until the ``threading.Event`` ``stop`` is set. Retired: its one host
+    (the phone port's server) is gone and nothing calls it; release is event-driven (the module docstring)."""
     while not stop.wait(every):
         flush(queue_dir)

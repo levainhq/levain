@@ -217,8 +217,7 @@ def test_a_pending_record_is_never_dropped_for_its_age(tmp_path: Path, passkey) 
         os.close(fd)
 
 
-def test_both_ports_route_the_attempt_read() -> None:
-    from levain import phone_server, web_server
+def test_the_cockpit_routes_the_attempt_read() -> None:
+    from levain import web_server
 
-    assert phone_server._sign_route("/sign/np-att0001-aa11/attempt") == (RID, "attempt")
     assert web_server._sign_route("/cockpit/sign/np-att0001-aa11/attempt") == (RID, "attempt")

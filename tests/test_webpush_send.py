@@ -8,7 +8,6 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
 
 import pytest
 from cryptography.hazmat.primitives import hashes
@@ -17,22 +16,14 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from levain.webpush import ece, record, sender, vapid
 from levain.webpush.store import PushStore
+from tests._push_fixtures import owned_devices
 
 
 @pytest.fixture(autouse=True)
 def _owned_devices(monkeypatch):
-    """Every device a test here subscribes under is a row of the store's ``devices`` table, as every production
-    subscribe's is: a subscription is live only under a device its authority holds (``store.live_rows``)."""
-    real = PushStore.add_subscription
-
-    def add(self, endpoint, p256dh, auth, device_id, **kw):
-        if isinstance(device_id, str) and device_id and not device_id.startswith("paired-"):
-            with self.write() as c:
-                c.execute("INSERT OR IGNORE INTO devices (id, label, token_hash, created) VALUES (?,?,?,?)",
-                          (device_id, None, "test-" + device_id, "2026-10-27T00:00:00Z"))
-        return real(self, endpoint, p256dh, auth, device_id, **kw)
-
-    monkeypatch.setattr(PushStore, "add_subscription", add)
+    """Every device a test here subscribes under is a paired device of a journal beside the queue, as every production
+    subscribe's is: a subscription is live only under a paired device its journal holds (``store.live_rows``)."""
+    owned_devices(monkeypatch)
 
 FCM = "https://fcm.googleapis.com/fcm/send/abc"
 
@@ -171,12 +162,6 @@ def test_s5_a_send_child_exception_lands_in_a_bounded_log_and_exits_nonzero(tmp_
     assert child.main(["send", "--queue-dir", str(tmp_path), "--kind", "test"]) != 0
     lines = log.read_text().splitlines()
     assert len(lines) == 200 and "store exploded" in lines[-1]
-
-
-def test_s6_the_service_worker_opens_first_and_bounds_the_record():
-    js = (__import__("pathlib").Path(sender.__file__).parent / "static" / "sw.js").read_text()
-    click = js[js.index("notificationclick"):]
-    assert click.index("openWindow") < click.index("fetch(") and "AbortController" in click and "allSettled" in click
 
 
 def test_s7_ping_record_cli_carries_the_outcome(tmp_path, capsys):

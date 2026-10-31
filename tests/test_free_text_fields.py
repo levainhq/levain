@@ -12,10 +12,7 @@ import pytest
 
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_sign_card import OPEN_Q, _Rig, needs_ssh
-from tests.test_phone_card_format import ROWS, _file, _page, port  # noqa: F401  (port: fixture)
-from tests.test_phone_sign_preselect import _Port
 
-LONG = ROWS["np-ab37059b"]
 VIEWS = {"390": {"emulate": {"w": 390, "h": 844, "dpr": 1, "mobile": True}}, "1280": {"emulate": {"w": 1280, "h": 900, "dpr": 1}}}
 
 
@@ -67,17 +64,3 @@ def test_the_drop_box_and_the_cockpit_write_in_are_full_width_and_tall_enough(vi
     _wide(drop, rows=True)
     assert grows is True, "the box grows as lines are typed"
     _wide(write_in, rows=False)
-
-
-@needs_browser
-@needs_ssh
-@pytest.mark.parametrize("view", ["390", "1280"])
-def test_the_phone_write_in_is_full_width_at_16px(view: str, tmp_path: Path, port: _Port) -> None:  # noqa: F811
-    rid = _file(port, LONG)
-    p = port.qdir / "sign" / f"{rid}.json"
-    body = json.loads(p.read_text())
-    body["write_in"] = True
-    p.write_text(json.dumps(body))
-    out = _drive(tmp_path, _page(port), [VIEWS[view], port.authenticator(), {"until": "document.querySelector('.req.sign input.write-in')"},
-                                          {"eval": _measure(".req.sign input.write-in")}, _shot(tmp_path, f"phone_write_in_{view}")])
-    _wide([x for x in out["values"] if not (isinstance(x, dict) and "shot" in x)][-1], rows=False)

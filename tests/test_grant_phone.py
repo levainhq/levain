@@ -28,7 +28,7 @@ from levain.consent.ledger import Ledger
 from levain.consent.passkey import challenge
 from levain.consent.queue import ConsentQueue, authority_source
 from tests.test_dispatch_phone import SoftPasskey, _b64u
-from tests.test_phone_server import _enrol
+from tests._phone_fixtures import _enrol
 from tests._h4 import h4_home
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
@@ -154,7 +154,7 @@ def test_the_grants_read_shows_what_each_grant_answered_and_a_revoke_line_of_one
     def route(token: bool) -> tuple[int, dict]:
         h = wsrv._Handler.__new__(wsrv._Handler)
         sent: list = []
-        h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=wsrv._ConsentReader(world.qdir))
+        h.server = SimpleNamespace(request_gate=threading.Lock(), surface_tokens={}, is_loopback_bind=True, consent_reader=wsrv._ConsentReader(world.qdir))
         h._off_box_token_valid = lambda: token
         h._send = lambda body, ctype, **kw: sent.append((kw.get("status", 200), json.loads(body)))
         h._serve_consent_body("/cockpit/consent/grants.json", head=False)

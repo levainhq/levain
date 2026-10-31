@@ -4,14 +4,13 @@ from __future__ import annotations
 import json
 import os
 import stat
-from datetime import datetime, timezone
 
 import pytest
 
 from levain.consent.adapters import claude_code
 from levain.webpush import presence, sender
 from levain.webpush.presence import ACTIVE_WINDOW_SECS, AWAY_GRACE_SECS, PresenceError, decide, set_word
-from levain.webpush.store import PushStore
+from tests._push_fixtures import phone
 
 NOW = 1_000_000.0
 ACTIVE, INACTIVE = 10.0, ACTIVE_WINDOW_SECS + 1.0   # idle seconds
@@ -181,8 +180,7 @@ def test_should_push_reads_a_fault_as_push(tmp_path):
 # --- the wiring: claude_code.notify -----------------------------------------------------------------------------------
 
 def _phone(qdir):
-    PushStore(qdir).subscribe_unowned("https://fcm.googleapis.com/fcm/send/presence-test", "p", "a", "phone",
-                                      datetime.now(timezone.utc))
+    phone(qdir, "https://fcm.googleapis.com/fcm/send/presence-test")
 
 
 def _spy(monkeypatch, idle_seconds):

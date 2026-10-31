@@ -225,28 +225,6 @@ def test_a_missing_item_at_the_write_is_404_on_the_cockpit(served, monkeypatch) 
 from tests.test_phone_app import _raise_on_the_laptop, install  # noqa: E402,F401  (fixture)
 
 
-@pytest.fixture
-def phone(install):
-    """A real phone port over a `levain init` install whose consent queue holds a coordinator store with one plain
-    item: (base url, store, plain item, paired device token, install root)."""
-    import threading
-
-    from levain.phone_server import make_phone_server
-    from tests.test_coordinator_phone import device_token
-
-    inst, qdir = install
-    store = CoordStore(qdir)
-    plain, _ = review.file_item(store, "seat", {"text": "seat lane-a died"}, dedupe_key="a")
-    dev = device_token(qdir)
-    httpd = make_phone_server(qdir, "localhost", port=0, token="run-token-for-test", dispatch_dir=qdir)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{httpd.server_address[1]}", store, plain, dev, inst
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=5)
 
 
 def _drawn(base: str, token: str, item_id: str) -> "str | None":
@@ -264,89 +242,11 @@ def _body(version: "str | None") -> dict:
     return {"version": version} if version is not None else {}
 
 
-def test_a_signed_raise_of_review_clear_refuses_the_phone_clear(phone, tmp_path: Path) -> None:
-    """F1: the phone's Clear is tiered by the cockpit's kernel under the install's signed standing policy, as the
-    cockpit's is."""
-    from tests.test_coordinator_phone import _post
-
-    base, store, plain, dev, inst = phone
-    _raise_on_the_laptop(inst, tmp_path, "review_clear")
-    status, got = _post(base, f"/coord/review/{plain.item_id}/clear", _body(_drawn(base, dev, plain.item_id)), dev)
-    assert (status, got.get("error")) == (403, "review_raised"), got     # fix-r1 ruling 3
-    assert "T2" in got["message"], got
-    assert review.get_item(store, plain.item_id).state == "open"
 
 
-def test_an_unreadable_authority_log_refuses_the_phone_clear(phone, tmp_path: Path) -> None:
-    """F1, fail closed: a log the kernel cannot read tiers every verb T3, so the phone clears nothing."""
-    from tests.test_coordinator_phone import _post
-
-    base, store, plain, dev, inst = phone
-    root = _raise_on_the_laptop(inst, tmp_path, "spore_note")
-    drawn = _drawn(base, dev, plain.item_id)
-    (root / "cockpit.db").write_bytes(b"not a database")
-    status, got = _post(base, f"/coord/review/{plain.item_id}/clear", _body(drawn), dev)
-    assert status in (403, 503), got
-    assert review.get_item(store, plain.item_id).state == "open"
 
 
-def test_the_phone_clear_carries_the_version_it_drew_and_a_stale_one_is_409(phone) -> None:
-    from tests.test_coordinator_phone import _post
-
-    base, store, plain, dev, _inst = phone
-    drawn = _drawn(base, dev, plain.item_id)
-    assert isinstance(drawn, str) and drawn
-    status, got = _post(base, f"/coord/review/{plain.item_id}/clear", {}, dev)
-    assert status == 400, got                                           # no version: never a blind write
-    review.clear_item(store, plain.item_id)
-    review.reopen_item(store, plain.item_id)                             # open again, but not the item it drew
-    status, got = _post(base, f"/coord/review/{plain.item_id}/clear", {"version": drawn}, dev)
-    assert (status, got.get("error")) == (409, "stale"), got
-    assert review.get_item(store, plain.item_id).state == "open"
-    status, got = _post(base, f"/coord/review/{plain.item_id}/clear", {"version": _drawn(base, dev, plain.item_id)}, dev)
-    assert (status, got.get("state")) == (200, "cleared"), got
-    assert review.get_item(store, plain.item_id).last[:3] == ("cleared", "manual", "operator")
 
 
-def test_a_phone_revoked_after_its_token_was_checked_clears_nothing(phone, monkeypatch) -> None:
-    """F3: the paired device is asked again inside the store's write, so a revoke that landed after the token was
-    checked (here: just before the write opens) refuses it."""
-    from datetime import datetime, timezone
-
-    from levain.webpush import devices
-    from levain.webpush.store import PushStore
-    from tests.test_coordinator_phone import _post
-
-    base, store, plain, dev, _inst = phone
-    qdir = store.directory
-    real = review.clear_item
-
-    def revoke_then_clear(*a, **k):
-        conn = PushStore(qdir).connection()
-        try:
-            now = datetime.now(timezone.utc)
-            devices.revoke(conn, devices.verify(conn, dev, now), now)
-        finally:
-            conn.close()
-        return real(*a, **k)
-
-    drawn = _drawn(base, dev, plain.item_id)
-    monkeypatch.setattr(review, "clear_item", revoke_then_clear)
-    status, got = _post(base, f"/coord/review/{plain.item_id}/clear", _body(drawn), dev)
-    assert (status, got.get("error")) == (403, "device_revoked"), got
-    assert review.get_item(store, plain.item_id).state == "open"
 
 
-def test_the_phone_run_token_reaches_no_review_write_even_through_the_app(phone) -> None:
-    """The phone app's kernel write is the one path, and the run token's request names no paired device, so the
-    review verbs refuse it whichever door it comes in by."""
-    from levain.cockpit.coordinator_panels import review_version
-    from levain.phone_app import PhoneApp, PhoneAppError
-
-    _base, store, plain, _dev, _inst = phone
-    app = PhoneApp(store.directory)
-    with pytest.raises(PhoneAppError) as exc:
-        app.fire({"verb": "review_clear", "panel_id": REVIEW_ID, "row_id": f"review:{plain.item_id}",
-                  "row_version": review_version(review.get_item(store, plain.item_id)), "params": {}})
-    assert (exc.value.status, exc.value.error) == (403, "device_required"), exc.value
-    assert review.get_item(store, plain.item_id).state == "open"

@@ -526,7 +526,7 @@ class TestHttp:
         root, src = _install(tmp_path)
         gated = SubstrateSource(anneal=src.anneal, write_scope=WriteScope(
             anneal=src.anneal, ledger_root=root / ".levain", install_root=None), context_json=src.context_json)
-        with _serving(gated, write_token="tok") as (port, httpd):
+        with _serving(gated, surface_tokens={"flowconnect": "tok"}) as (port, httpd):   # off-box the owner key opens nothing (L-1)
             httpd.is_loopback_bind = False   # what a real off-box bind sets
             c, r = _open(port)
             panel = http.client.HTTPConnection("127.0.0.1", port, timeout=5)

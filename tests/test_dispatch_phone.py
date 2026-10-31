@@ -32,7 +32,7 @@ from levain.dispatch.adopt import artifact_digest
 from levain.dispatch.jobs import DB_NAME, JobStore
 from levain.dispatch.phone import DispatchPhone, DispatchRefused
 from tests.test_dispatch_contract import POLICY, make_repo, registry, submission
-from tests.test_phone_server import _enrol
+from tests._phone_fixtures import _enrol
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 

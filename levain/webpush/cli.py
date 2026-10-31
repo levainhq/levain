@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
+import re
 from pathlib import Path
 
 
 def register(subparsers) -> None:
     p = subparsers.add_parser(
-        "ping", help="Web push to the phone page: keys, a test ping, the notification record, paired devices, pairing.",
+        "ping", help="Web push to paired phones: keys, a test ping, the notification record, presence.",
         description="Web push for the phone page. A push is a nudge that opens the page; it authorises nothing.")
     sub = p.add_subparsers(dest="ping_cmd", required=True)
 
@@ -26,18 +26,14 @@ def register(subparsers) -> None:
     t = common(sub.add_parser("test", help="Send a test ping to every live subscription."))
     t.add_argument("--title", default="levain ping test")
     t.add_argument("--body", default="This is a test from `levain ping test`; it asks nothing of you.")
+    t.add_argument("--device", default=None, metavar="d-ID",
+                   help="Send only to this paired device's subscriptions (a cockpit device id, as `levain cockpit "
+                        "pair --list` prints it).")
     t.set_defaults(func=_test)
     r = common(sub.add_parser("record", help="The notification record: pings, their deliveries and opens."))
     r.add_argument("--json", action="store_true")
     r.add_argument("--limit", type=int, default=100)
     r.set_defaults(func=_record)
-    common(sub.add_parser("devices", help="List paired phones.")).set_defaults(func=_devices)
-    rv = common(sub.add_parser("revoke", help="Revoke a paired phone: its token and subscriptions stop working."))
-    rv.add_argument("device_id")
-    rv.set_defaults(func=_revoke)
-    pr = common(sub.add_parser("pair", help="Print a short pairing code to type into the installed phone app."))
-    pr.add_argument("--label", default=None, help="What to call the phone in `levain ping devices` (default: phone).")
-    pr.set_defaults(func=_pair)
     from levain.webpush import presence
 
     for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), except urgent ones; one summary and the held "
@@ -183,9 +179,17 @@ def _test(args: argparse.Namespace) -> int:
     from levain.webpush import sender
 
     qdir = _qdir(args)
-    results = sender.send(qdir, kind="test", ref=None, title=args.title, body=args.body)
+    device = args.device
+    if device is not None:
+        if re.fullmatch(r"d-[0-9a-f]{12}", device) is None:
+            print(f"levain ping test: --device {device!r} is not a device id (d- and 12 hex digits, as "
+                  "`levain cockpit pair --list` prints it)")
+            return 2
+        device = "paired-" + device
+    results = sender.send(qdir, kind="test", ref=None, title=args.title, body=args.body, device=device)
     if not results:
-        print("no live subscription: turn notifications on from the phone page first")
+        print("no live subscription for that device" if device is not None
+              else "no live subscription: turn notifications on from the phone page first")
         return 1
     for sub_id, status in results:
         print(f"subscription {sub_id}: {_said(status)}")
@@ -214,50 +218,4 @@ def _record(args: argparse.Namespace) -> int:
         opened = f"opened {p['opens'][0]['at']}" if p["opens"] else "not opened"
         print(f"#{p['id']} {p['at']} {p['kind']} {p['ref'] or '-'}: {p['title']} [{deliveries}] {opened}; "
               f"{p['outcome']['words']}")
-    return 0
-
-
-def _devices(args: argparse.Namespace) -> int:
-    from levain.webpush import devices
-    from levain.webpush.store import PushStore
-
-    conn = PushStore(_qdir(args)).connection()
-    try:
-        rows = devices.list_devices(conn)
-    finally:
-        conn.close()
-    if not rows:
-        print("no paired device")
-    for d in rows:
-        state = f"revoked {d['revoked_at']}" if d["revoked_at"] else f"last seen {d['last_seen']}"
-        print(f"{d['id']}  {d['label']}  paired {d['created']}  {state}")
-    return 0
-
-
-def _revoke(args: argparse.Namespace) -> int:
-    from levain.webpush import devices
-    from levain.webpush.store import PushStore
-
-    conn = PushStore(_qdir(args)).connection()
-    try:
-        done = devices.revoke(conn, args.device_id, datetime.now(timezone.utc))
-    finally:
-        conn.close()
-    print(f"revoked {args.device_id}" if done else f"no live device {args.device_id}")
-    return 0 if done else 1
-
-
-def _pair(args: argparse.Namespace) -> int:
-    from levain.webpush import devices
-    from levain.webpush.store import PushStore
-
-    conn = PushStore(_qdir(args)).connection()
-    try:
-        code = devices.mint_short_pairing(conn, args.label, datetime.now(timezone.utc))
-    finally:
-        conn.close()
-    minutes = int(devices.SHORT_PAIRING_TTL.total_seconds() // 60)
-    print(f"pairing code: {code}\n"
-          f"type it in the phone app's Pairing code box within {minutes} minutes; it works once, and a newer code "
-          "replaces it")
     return 0
