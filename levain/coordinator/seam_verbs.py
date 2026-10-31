@@ -286,10 +286,12 @@ def run_handoff_show(args: argparse.Namespace, out: Any, store: Any) -> int:
             raise ValueError(f"the body is JSON {type(body).__name__}, not an object")
         # rendered whatever the format, so a body the text views cannot read is refused in --json too
         text = render(_Shown(h), _marked(body))
+        if args.json:
+            json.dumps(body)         # a body too deep for the encoder is refused here, never a traceback from _emit
     except (ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
         reason = f"missing key {exc}" if isinstance(exc, KeyError) else f"{type(exc).__name__}: {exc}"
         raise CoordError(f"handoff {h.handoff_id} body is unreadable: "
-                         f"{unshowable.mark(reason, allow='')[:160]}") from None
+                         f"{unshowable.mark(reason[:160], allow='')}") from None
     _emit(out, args.json, {"handoff_id": h.handoff_id, "kind": h.seam_kind, "written_at": h.written_at,
                            "writer": h.writer, "covers_gseq": h.covers_gseq, "prev_handoff_id": h.prev_handoff_id,
                            "body": body}, text)

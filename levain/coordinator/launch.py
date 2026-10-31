@@ -372,9 +372,9 @@ def _open_section(store: CoordStore, launch: Any, lv: str, tail: str) -> list[st
                 f"Levain could not build your open: {_plain(str(exc))}. This does not stop you: act on the rest of this "
                 f"brief. `{lv} coord open --token N {tail}` prints a read-only open once you hold the lease, and a "
                 "read-only open cannot be acknowledged.", ""]
-    from levain.coordinator.seam_open import READ_BACK_MAX
+    from levain.coordinator.seam_open import PREDECESSOR_HANDOFF_SEAMS, READ_BACK_MAX
 
-    needs = " --read-back-file PATH" if built.seam_kind in ("rotation", "dream") else ""
+    needs = " --read-back-file PATH" if built.seam_kind in PREDECESSOR_HANDOFF_SEAMS else ""
     more = (f" PATH holds your restatement of the handoff in your own words: it is kept with your acknowledgement as "
             "the proof, for whoever opens after you, that you took the handoff in. Levain checks only that it is "
             f"there and at most {READ_BACK_MAX} bytes, never what it says; a {built.seam_kind} open is acknowledged "
