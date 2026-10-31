@@ -63,6 +63,12 @@ def _reply_line(kind: str, ref_store: str, ref_id: str, body: str) -> str:
         b = {}
     if kind == "drop_receipt":
         return f"drop {_short_id(b.get('drop_id') or ref_id)} receipt: {_clean(b.get('stage'), 20) or 'recorded'}"
+    if kind == "coordinator_reply":
+        # delivered when written, so no terminal reply carried it: the next one names it (DESIGN 3.4)
+        at = _clean(b.get("received_at"), 40)
+        hhmm = at[11:16] if len(at) >= 16 else at
+        return (f"1 reply to your {_clean(b.get('surface'), 12) or 'drop'} message at {hhmm} "
+                f"(drop {_short_id(b.get('drop_id') or ref_id)}): on the Coordinator panel")
     if kind == "know":
         n = b.get("question_n")
         if isinstance(n, int):
