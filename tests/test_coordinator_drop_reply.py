@@ -76,8 +76,10 @@ def test_a_reply_to_a_drop_that_does_not_exist_is_refused_by_the_trigger(qdir, s
 
 def test_a_reply_that_names_something_other_than_a_drop_is_refused(qdir, store, token) -> None:
     d = _drop(store)
+    # the drop is received on the wall clock (`store` has no clock), so the reply is stamped on it too: a fixed NOW past
+    # the drop's time makes the window trigger refuse first (failed every run after 2026-10-31 14:00 UTC)
     with pytest.raises(sqlite3.IntegrityError, match="names a drop that exists"):
-        _insert(qdir, d, _stamp(NOW), ref_store="questions")
+        _insert(qdir, d, _stamp(datetime.now(timezone.utc)), ref_store="questions")
 
 
 def test_a_second_reply_to_one_drop_is_refused_by_the_trigger(qdir, store, token, capsys) -> None:
