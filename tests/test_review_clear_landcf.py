@@ -19,7 +19,8 @@ from levain.coordinator.store import CoordStore
 from tests.test_cockpit_sign_origin import RP, _Passkey
 from tests.test_review_clear_signed import (ORIGIN, _compose, _events, _mine, _q, _send, cockpit,  # noqa: F401
                                             _phone_sign)
-from tests.test_cockpit_pairing_http import PROXY, T, _call
+from tests.test_cockpit_pairing_http import PROXY, _call
+from tests.test_review_clear_signed import FC
 from tests.test_cockpit_sign_origin import PINNED
 from tests.test_dispatch_phone import repo, world  # noqa: F401  (fixtures)
 
@@ -51,16 +52,16 @@ def test_a_listing_still_drops_the_challenge_of_a_request_no_longer_open(tmp_pat
 def test_the_cockpit_poll_between_challenge_and_answer_does_not_cost_the_signed_clear(cockpit) -> None:  # noqa: F811
     c = cockpit
     rid = _compose(c, c["mine"])[1]["request"]
-    st, one, _ = _call(c["port"], "GET", f"/cockpit/sign/{rid}.json", token=T, headers=PROXY)
+    st, one, _ = _call(c["port"], "GET", f"/cockpit/sign/{rid}.json", token=FC, headers=PROXY)
     assert st == 200, one
     fp = c["pk"].key.fingerprint
     st, ch, _ = _call(c["port"], "POST", f"/cockpit/sign/{rid}/challenge",
-                      {"signer_fp": fp, "request_sha256": one["request"]["sha256"]}, token=T, headers=PROXY)
+                      {"signer_fp": fp, "request_sha256": one["request"]["sha256"]}, token=FC, headers=PROXY)
     assert st == 200, ch
-    st, listed, _ = _call(c["port"], "GET", "/cockpit/sign.json", token=T, headers=PROXY)    # the page's poll
+    st, listed, _ = _call(c["port"], "GET", "/cockpit/sign.json", token=FC, headers=PROXY)    # the page's poll
     assert st == 200 and all(r["id"] != rid for r in listed["requests"]), listed
     st, ans, _ = _call(c["port"], "POST", f"/cockpit/sign/{rid}/answer", c["pk"].assertion(ch["challenge"], PINNED),
-                       token=T, headers=PROXY)
+                       token=FC, headers=PROXY)
     assert st == 200, ans
     st, done = _send(c, c["mine"], rid)
     assert (st, done.get("mode")) == (200, "signed"), done

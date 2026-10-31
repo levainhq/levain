@@ -307,7 +307,7 @@ def test_the_at_read_rides_the_panel_route_and_its_gate(tmp_path):
         assert _http(f"{base}/cockpit/panel/topology.json?at=2026-10-20T11:30:15Z")[0] == 400
     gated = SubstrateSource(anneal=src.anneal, write_scope=WriteScope(
         anneal=src.anneal, ledger_root=root / ".levain", install_root=None), context_json=src.context_json)
-    with _serve(gated, write_token="tok") as (base, httpd):
+    with _serve(gated, surface_tokens={"flowconnect": "tok"}) as (base, httpd):   # the owner key opens nothing off-box (L-1)
         httpd.is_loopback_bind = False           # an off-box bind: the live read needs the token, so does the past one
         assert _http(f"{base}/cockpit/panel/topology.json")[0] == 403
         assert _http(f"{base}/cockpit/panel/topology.json?at={at}")[0] == 403

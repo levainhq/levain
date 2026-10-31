@@ -7,6 +7,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Changed
+<<<<<<< HEAD
 - **The Claude Code coordinator's own install now allows `Read`.** With your user layer left out, the `Read` rule in
   your own settings is gone too, so a read of a file outside the coordinator's workspace stopped at a prompt nobody
   answers. Its install's project settings now carry a bare `Read` allow, so it can read any file your own account can.
@@ -31,6 +32,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   every launch. A store from before this change reads as off. With the layer off, a `disableAllHooks` that lives only in your user settings no longer refuses the coordinator
   launch, since the session never reads that file; `disableAllHooks` in the coordinator's own or an ancestor project
   still refuses. Covered by tests of the spawn argv and the setting.
+=======
+- **The cockpit's owner key opens nothing off the box.** On a server bound to anything but loopback, and on a loopback
+  server reached through a proxy (an extra host, a forwarded-for or Tailscale header), a request carrying the owner
+  key is answered as if it carried no credential. Its 403 now says `"auth": "pair"` (a loopback request says
+  `"auth": "owner"`), and the manifest's `transport` gains `owner_key`, so a page knows to ask for a pairing code
+  rather than the key. `levain serve` no longer prints the owner key or puts it in the unlocked link on an
+  off-loopback bind; it prints how to pair a device instead. Not run by hand against a real proxied cockpit.
+>>>>>>> origin/seat/1030-34-w1ba
 
 ### Fixed
 - **The coordinator's verbs take their text without shell quoting.** Shadow 10-30: two of three real coordinators
@@ -92,6 +101,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   refusal says to. Other routes (brokered, Codex) are not checked.
 
 ### Added
+- **Short pairing codes for the cockpit, and a test ping.** `POST /cockpit/pair/offer {"short": true}` mints a typed
+  code (`XXXX-XXXX`, one use, 10 minutes, five wrong tries kill it, a newer short code replaces it) and
+  `POST /cockpit/pair/claim {"short": "<typed>"}` spends it; the link form is unchanged and a code of one kind never
+  redeems as the other. `levain cockpit pair --short` mints one on the box; `--list` shows the paired devices and
+  `--revoke <id> [<id> ...]` revokes devices and the devices they paired, both reading the journal directly with no
+  cockpit credential. `GET /cockpit/pair/devices.json` rows carry `subscribed`. `POST /webpush/test` sends a test
+  ping to the calling paired device's subscriptions only, and `levain ping test --device d-...` does the same from the
+  box. `levain cockpit pair --short` (or the link form) on a data root no server has started yet starts its cockpit
+  journal first, so an off-loopback cockpit's first code needs no loopback visit. A refused short code says whether it
+  was used up by wrong tries, expired, or already used. Covered by tests; not run against a real phone.
 - **Every presence word an agent sets, replaces or is refused now leaves a row you can read.** `levain ping log` prints
   `<queue dir>/webpush/presence.log.jsonl` (who, which role, the word, the quote, the word it found, the outcome); an agent's
   write is not made when its row cannot be written, your own word always goes through. `levain coord morning` adds a

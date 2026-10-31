@@ -318,6 +318,7 @@ def test_a_signed_clear_lands_on_a_store_made_before_r4(tmp_path: Path, monkeypa
 from levain.cockpit.coordinator_panels import REVIEW_ID  # noqa: E402
 from tests.test_cockpit_k2a import _install  # noqa: E402
 from tests.test_cockpit_pairing_http import PROXY, T, _call, _pair, _serve  # noqa: E402
+FC = "review-clear-surface-token-0123456789"      # a named surface: honoured proxied, where the owner key is not (W1b L-1)
 from tests.test_cockpit_sign_origin import PINNED  # noqa: E402
 
 
@@ -342,12 +343,12 @@ def cockpit(tmp_path: Path, monkeypatch):
         asked.append(verb)
         raise ValueError("flow composes send_inbox only")
 
-    with _serve(src, signer=signer, compose_signer=flow_compose, extra_hosts=[RP]) as (port, httpd):
+    with _serve(src, surface_tokens={"browser": T, "flowconnect": FC}, signer=signer, compose_signer=flow_compose, extra_hosts=[RP]) as (port, httpd):
         yield {"port": port, "store": store, "plain": plain, "mine": mine, "pk": pk, "qdir": home / "consent",
                "asked": asked}
 
 
-def _row(c: dict, item: review.Item, token: str = T) -> dict:
+def _row(c: dict, item: review.Item, token: str = FC) -> dict:
     st, panel, _ = _call(c["port"], "GET", f"/cockpit/panel/{REVIEW_ID}.json?profile=full", token=token, headers=PROXY)
     assert st == 200, panel
     return next(r for r in panel["rows"] if r["id"] == f"review:{item.item_id}")
@@ -356,23 +357,23 @@ def _row(c: dict, item: review.Item, token: str = T) -> dict:
 def _compose(c: dict, item: review.Item, txn: str = "draft-0001") -> tuple[int, dict]:
     st, out, _ = _call(c["port"], "POST", "/cockpit/sign/compose",
                        {"verb": "review_clear_signed", "params": {"item": item.item_id}, "client_txn": txn},
-                       token=T, headers=PROXY)
+                       token=FC, headers=PROXY)
     return st, out
 
 
 def _ceremony(c: dict, rid: str) -> None:
-    st, one, _ = _call(c["port"], "GET", f"/cockpit/sign/{rid}.json", token=T, headers=PROXY)
+    st, one, _ = _call(c["port"], "GET", f"/cockpit/sign/{rid}.json", token=FC, headers=PROXY)
     assert st == 200 and one["request"]["message"].startswith("levain review clear "), one
     fp = c["pk"].key.fingerprint
     st, ch, _ = _call(c["port"], "POST", f"/cockpit/sign/{rid}/challenge",
-                      {"signer_fp": fp, "request_sha256": one["request"]["sha256"]}, token=T, headers=PROXY)
+                      {"signer_fp": fp, "request_sha256": one["request"]["sha256"]}, token=FC, headers=PROXY)
     assert st == 200, ch
     st, ans, _ = _call(c["port"], "POST", f"/cockpit/sign/{rid}/answer", c["pk"].assertion(ch["challenge"], PINNED),
-                       token=T, headers=PROXY)
+                       token=FC, headers=PROXY)
     assert st == 200, ans
 
 
-def _send(c: dict, item: review.Item, rid: "str | None", txn: str = "draft-0001", token: str = T) -> tuple[int, dict]:
+def _send(c: dict, item: review.Item, rid: "str | None", txn: str = "draft-0001", token: str = FC) -> tuple[int, dict]:
     row = _row(c, item, token)
     params = {"item": item.item_id} if rid is None else {"item": item.item_id, "sign_request": rid}
     st, out, _ = _call(c["port"], "POST", "/cockpit/verb",

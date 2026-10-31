@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from tests.test_cockpit_consent_sheet import RP, _signer, home  # noqa: F401  (home is a fixture)
-from tests.test_cockpit_sign_routes import TOK, _call, _serving
+from tests.test_cockpit_sign_routes import FC, _call, _serving
 from tests.test_grant_phone import world  # noqa: F401  (world is a fixture)
 from tests.test_phone_redirect import RID, SECRET, V, _calls
 
@@ -23,7 +23,7 @@ LEGACY = __import__("pathlib").Path(__file__).resolve().parents[1] / "levain" / 
 RUN = __import__("pathlib").Path(__file__).with_name("_redirect_script_run.mjs")
 
 
-def _get(url: str, path: str, *, token: "str | None" = TOK) -> "tuple[int, str]":
+def _get(url: str, path: str, *, token: "str | None" = FC) -> "tuple[int, str]":
     headers = {"Host": RP}          # the name a proxy forwards, no port
     if token is not None:
         headers["X-Levain-Write-Token"] = token
@@ -65,10 +65,10 @@ def test_every_old_phone_path_has_a_landing_on_the_cockpits_one_origin(home, tmp
                     "/passkey/key-line", f"/sign/{RID}/challenge", f"/sign/{RID}/answer", f"/sign/{RID}/deny",
                     f"/sign/{RID}/attempt", "/dispatch/dj-" + "0" * 32 + "/challenge", "/coord/drop",
                     "/coord/envelope-review", "/grant/x/revoke"):
-            assert _call(url, old, {}, host=RP)[0] == 404, old
+            assert _call(url, old, {}, token=FC, host=RP)[0] == 404, old
         # the phone port's own pairing is not served here: the cockpit pairs through /pair
         for pair in ("/webpush/pair", "/webpush/pair/redeem"):
-            assert _call(url, pair, {}, host=RP)[0] == 404, pair
+            assert _call(url, pair, {}, token=FC, host=RP)[0] == 404, pair
         # the one family of names both servers answer: web push, here behind the cockpit's own credential
         assert _get(url, "/webpush/key", token=None)[0] == 403 and _get(url, "/webpush/key")[0] == 200
         # the sign sheet's page is where an old sign link lands

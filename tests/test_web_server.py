@@ -63,11 +63,12 @@ _TOK = "test-surface-token"
 _TOK_HEADER = "X-Levain-Write-Token"
 
 
-def _set_token(httpd, token: str | None) -> None:
-    """Re-key a RUNNING server's browser surface token (the off-box tests flip the bind class after
-    start, so they re-key after start too). ``write_token`` and ``surface_tokens`` move together."""
+def _set_offbox_token(httpd, token: str | None) -> None:
+    """Re-key a RUNNING server (the off-box tests flip the bind class after start, so they re-key after start too).
+    Off-box the owner key (the ``browser`` surface) opens nothing (W1b L-1), so the server is keyed with a NAMED
+    surface (a program like flowConnect), which every bind honours. ``write_token`` and ``surface_tokens`` move together."""
     httpd.write_token = token
-    httpd.surface_tokens = {"browser": token} if token else {}
+    httpd.surface_tokens = {"flowconnect": token} if token else {}
 
 
 @contextmanager
@@ -1731,7 +1732,7 @@ class TestOffBoxWriteToken:
         # frontend keeps attaching it). The predicate + compare mirror do_POST via the shared helpers.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            _set_token(httpd, "s3cret")
+            _set_offbox_token(httpd, "s3cret")
             assert _get_h(base + "/substrate.json")[0] == 403
             assert _get_h(base + "/substrate.json", headers={"X-Levain-Write-Token": "wrong"})[0] == 403
             st, body = _get_h(base + "/substrate.json", headers={"X-Levain-Write-Token": "s3cret"})
@@ -1743,7 +1744,7 @@ class TestOffBoxWriteToken:
         # HEAD → 403 (no substrate framing leaked); WITH the token it reaches the route → 200.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            _set_token(httpd, "s3cret")
+            _set_offbox_token(httpd, "s3cret")
             assert _get_h(base + "/substrate.json", method="HEAD")[0] == 403
             assert _get_h(base + "/substrate.json", method="HEAD",
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
@@ -1752,7 +1753,7 @@ class TestOffBoxWriteToken:
         # spore-220: /recall.json (episode keyword search = substrate content) is gated identically.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            _set_token(httpd, "s3cret")
+            _set_offbox_token(httpd, "s3cret")
             assert _get_h(base + "/recall.json?keyword=x")[0] == 403
             assert _get_h(base + "/recall.json?keyword=x",
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
@@ -1763,7 +1764,7 @@ class TestOffBoxWriteToken:
         # (no runtime → 'unknown', still 200).
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            _set_token(httpd, "s3cret")
+            _set_offbox_token(httpd, "s3cret")
             assert _get_h(base + "/job.json?id=x")[0] == 403
             assert _get_h(base + "/job.json?id=x",
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
@@ -1773,7 +1774,7 @@ class TestOffBoxWriteToken:
         # bootstrap and THEN supply the token on the data fetches. It carries NO substrate data.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            _set_token(httpd, "s3cret")
+            _set_offbox_token(httpd, "s3cret")
             for path in ("/", "/dashboard.css", "/dashboard_core.js", "/dashboard_boot.js"):
                 assert _get_h(base + path)[0] == 200, path
 
@@ -1785,7 +1786,7 @@ class TestOffBoxWriteToken:
         # not exist there, so they answer 404 before the gate; every other path still answers 403.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            _set_token(httpd, "s3cret")
+            _set_offbox_token(httpd, "s3cret")
             for path in ("/chat.json", "/chat/session.json", "/chat/job.json"):
                 assert _get_h(base + path)[0] == 404, path
             assert _get_h(base + "/no-such-path")[0] == 403
@@ -1796,7 +1797,7 @@ class TestOffBoxWriteToken:
         # treating it as a hard read failure.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            _set_token(httpd, "s3cret")
+            _set_offbox_token(httpd, "s3cret")
             st, body = _get_h(base + "/substrate.json")
             assert st == 403
             assert json.loads(body)["message"] == "missing or invalid write token"
@@ -1824,7 +1825,7 @@ class TestOffBoxWriteToken:
             extra_json={"/fleet.json": lambda: b'{"fleet":[]}'},
         ) as (base, httpd):
             httpd.is_loopback_bind = False
-            _set_token(httpd, "s3cret")
+            _set_offbox_token(httpd, "s3cret")
             assert _get_h(base + "/fleet.json")[0] == 403
             assert _get_h(base + "/fleet.json",
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
@@ -1836,7 +1837,7 @@ class TestOffBoxWriteToken:
         # verb layer, where this no-install source yields some OTHER outcome, never the token message).
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            _set_token(httpd, "s3cret")
+            _set_offbox_token(httpd, "s3cret")
             st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"}, token=None)
             assert st == 403 and resp["message"] == "missing or invalid write token"
             st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"}, token="wrong")
@@ -1849,7 +1850,7 @@ class TestOffBoxWriteToken:
         # to BIND that, but do_POST must not TRUST that) refuses every write, fail-closed.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            _set_token(httpd, None)
+            _set_offbox_token(httpd, None)
             st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
                              token="anything")
             assert st == 403 and resp["message"] == "missing or invalid write token"

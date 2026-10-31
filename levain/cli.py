@@ -525,8 +525,12 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Box-side pairing (the recovery path when no paired device or surface token is at hand): mints a "
             "one-time code straight into the cockpit journal, minted by 'box', valid for 10 minutes, and prints the "
-            "pair link here, never to a log. Open it on the new device. --revoke-all ends every paired device "
-            "instead (each one's waiting pendings are cancelled)."),
+            "pair link here, never to a log. Open it on the new device. --short mints a typed code instead (for a "
+            "Home Screen app, which cannot open a link): XXXX-XXXX, one use, valid 10 minutes, and it replaces any "
+            "short code shown before. --list shows the paired devices; --revoke ID [ID ...] revokes those devices and "
+            "every device they paired; --revoke-all ends every paired device (each one's waiting pendings are "
+            "cancelled). --list, --revoke and --revoke-all read and write the journal directly: no cockpit "
+            "credential is needed."),
     )
     _ck_common(ck_pair)
     ck_pair.add_argument("--label", default=None,
@@ -536,9 +540,16 @@ def main(argv: list[str] | None = None) -> int:
                               "without it the link is printed as a path to append to that address.")
     ck_pair.add_argument("--revoke-all", action="store_true", dest="revoke_all",
                          help="Revoke every paired device instead of minting a code.")
+    ck_pair.add_argument("--short", action="store_true",
+                         help="Mint a typed code (XXXX-XXXX) instead of a link.")
+    ck_pair.add_argument("--list", action="store_true", dest="list_devices",
+                         help="List the paired devices (id, label, who paired it, created, last seen, revoked); "
+                              "never a token.")
+    ck_pair.add_argument("--revoke", nargs="+", default=None, metavar="ID",
+                         help="Revoke these paired devices and every device they paired.")
     ck_pair.add_argument("--print", action="store_true", dest="print_link",
-                         help="Print the pair link even when stdout is not a terminal (a pipe, a file, a log): "
-                              "without it the link is refused there, since anyone who reads it can pair.")
+                         help="Print the pair link or code even when stdout is not a terminal (a pipe, a file, a "
+                              "log): without it the link is refused there, since anyone who reads it can pair.")
     ck_pair.set_defaults(func=_cmd_cockpit_pair)
     ck_pending = ck_sub.add_parser("pending", help="List the cockpit's waiting pendings (read-only, no server).")
     _ck_common(ck_pending)
@@ -3956,13 +3967,29 @@ def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
     user (its file permissions are the authority), minted by ``box``."""
     from levain.cockpit.firejournal import CockpitDB, PairingError
 
+    modes = [name for name, on in (("--short", args.short), ("--list", args.list_devices),
+                                   ("--revoke", args.revoke is not None), ("--revoke-all", args.revoke_all)) if on]
+    if len(modes) > 1:
+        print(f"pair: {' and '.join(modes)} cannot be combined", file=sys.stderr)
+        return 2
     try:
         root = _cockpit_root(args)
-        if not (root / "cockpit.db").is_file():
-            print(f"pair: no cockpit journal under {root}: start `levain serve --write` once first", file=sys.stderr)
+        minting = not (args.list_devices or args.revoke is not None or args.revoke_all)
+        if not minting and not (root / "cockpit.db").is_file():
+            print(f"pair: no cockpit journal under {root}: nothing is paired here yet", file=sys.stderr)
             return 1
         db = CockpitDB(root)
         now = _utc_now()
+        if args.list_devices:
+            for d in db.list_devices():
+                print(_term_safe(f"{d['id']}  {d['label']}  by {d['paired_by']}  created {d['created']}  "
+                                 f"last seen {d['last_seen'] or '-'}  "
+                                 + (f"revoked {d['revoked_at']}" if d["revoked_at"] else "live")))
+            return 0
+        if args.revoke is not None:
+            gone = db.revoke_devices(args.revoke, by="box", now=now)
+            print(f"revoked {len(gone)} paired device(s)" + (": " + ", ".join(gone) if gone else ""))
+            return 0
         if args.revoke_all:
             gone = db.revoke_devices(None, by="box", now=now)
             print(f"revoked {len(gone)} paired device(s)" + (": " + ", ".join(gone) if gone else ""))
@@ -3972,15 +3999,65 @@ def _cmd_cockpit_pair(args: argparse.Namespace) -> int:
             print("pair: stdout is not a terminal, so the one-time link is not printed (anyone who reads it can "
                   "pair a device); run it in a terminal, or pass --print to print it anyway", file=sys.stderr)
             return 1
-        code = db.mint_offer(label=args.label, minted_by="box", now=now)
+        if not (root / "cockpit.db").is_file():
+            # the box's mint is the first credential an off-loopback cockpit can have (the owner key opens nothing
+            # there), so it does not wait on a first `serve --write`: the journal starts here, as the broker starts it
+            refused = _pair_start_journal(root)
+            if refused is not None:
+                print(f"pair: {refused}", file=sys.stderr)
+                return 1
+        if args.short:
+            code = db.mint_short_offer(label=args.label, minted_by="box", now=now)
+        else:
+            code = db.mint_offer(label=args.label, minted_by="box", now=now)
     except (PairingError, *_cockpit_refusals()) as exc:
         print(f"pair: {_term_safe(exc)}", file=sys.stderr)
         return 1
+    if args.short:
+        print(code)
+        print("one use, valid 10 minutes; type it into the app's pair card (a newer code replaces it)", file=sys.stderr)
+        return 0
     path = f"/pair#code={code}"
     print(f"{args.url.rstrip('/')}{path}" if args.url else path)
     print("one use, valid 10 minutes" + ("" if args.url else "; append the path to the cockpit's address"),
           file=sys.stderr)
     return 0
+
+
+def _pair_start_journal(root: Path) -> str | None:
+    """Start a fresh cockpit journal at ``root`` for the box's first mint, by the broker's own start steps: the
+    install check (a governed marker refuses: that root is the root helper's), the network-filesystem check, the data
+    root made ``0700``, then ``cockpit.lock`` taken non-blocking while the schema is written. A held lock is a server
+    starting there, which makes the journal itself: refused, retry. The install class is left for the first
+    ``serve --write`` to set, as it sets it on any fresh journal. None when the journal stands; else why not."""
+    import fcntl
+
+    from levain.cockpit.broker import LOCK_NAME
+    from levain.cockpit.firejournal import DB_NAME, CockpitDB
+    from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
+
+    decision = decide_install(REPORTED, root)
+    if decision.install_class is None:
+        return f"no cockpit journal under {root}, and none is started here: {decision.reason}"
+    problem = network_fs_problem([root])
+    if problem is not None:
+        return problem
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(root / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        return f"data root {root}: {exc}"
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return f"a cockpit server is starting under {root}: try again in a moment"
+        if not (root / DB_NAME).is_file():
+            with CockpitDB(root, owns_lock=True).write():
+                pass            # the first open writes the schema and the format marker
+    finally:
+        os.close(fd)
+    return None
 
 
 def _cmd_cockpit_pending(args: argparse.Namespace) -> int:

@@ -99,6 +99,7 @@ from typing import TYPE_CHECKING, Any, Iterable
 
 from levain.cockpit.broker import Broker, BrokerError, Lifecycle
 from levain.cockpit.firejournal import OFFER_TTL, PAIRED_PREFIX, DeviceRevoked, PairingError
+from levain.cockpit.shortcode import SHORT_MAX_FAILURES, SHORT_PAIRING_TTL
 from levain.cockpit.anneal_effects import (
     EPISODES,
     SECTIONS,
@@ -1124,6 +1125,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/pair": ("pair.html", "text/html; charset=utf-8"),
     "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
+    "/pair_card.js": ("pair_card.js", "text/javascript; charset=utf-8"),
     # An old phone link (the phone port shared this origin before the cockpit took it): see the file's header.
     "/legacy_phone_link.js": ("legacy_phone_link.js", "text/javascript; charset=utf-8"),
     # The sign sheet's script (OS-1): its page is GET /sign/<id>, served by _route beside a Signer.
@@ -1143,9 +1145,22 @@ _ASSETS: dict[str, tuple[str, str]] = {
 # token on every bind; the phone port's own pairing (/webpush/pair, /webpush/pair/redeem) is not served here: this
 # origin pairs through /pair.
 _PUSH_GET = frozenset({"/webpush/key", "/webpush/record"})
-_PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened"})
+_PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test"})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
+_PUSH_TEST = "/webpush/test"
 _PUSH_PREFIX = "/webpush/"
+# A refused short-code claim, by the short row's state after it (``CockpitDB.short_offer_state``): "used up by wrong
+# tries" and "expired" read differently, so an operator can tell a guesser from a slow walk to the phone. "live" (the
+# code is live and this one was wrong) and "none" share the wrong-code words.
+_SHORT_WRONG = (f"this pairing code is not valid: check it and try again ({SHORT_MAX_FAILURES} wrong tries kill a "
+                "code), or mint a new one")
+_SHORT_REFUSED = {
+    "guessed_out": f"this pairing code is used up: {SHORT_MAX_FAILURES} wrong tries were made against it; mint a new one",
+    "expired": "this pairing code has expired; mint a new one",
+    "used": "this pairing code was already used; mint a new one",
+    "live": _SHORT_WRONG,
+    "none": _SHORT_WRONG,
+}
 
 
 def _push_static() -> frozenset[str]:
@@ -1721,6 +1736,35 @@ class _Handler(GuardedHandler):
             return True
         return not self.server.is_loopback_bind and self.server.levain_source.write_scope is not None
 
+    def _owner_key_accepted(self) -> bool:
+        """Whether the owner key (the ``browser`` surface's token) is honoured on THIS request: only on a loopback
+        bind, and only when the request is not proxied (``_write_token_required``). The one predicate: the
+        credential pass, the token-403's ``auth`` and the manifest's ``owner_key`` all call it. A server with no
+        ``browser`` token (only named surfaces) has no owner key to accept."""
+        return (bool(self.server.surface_tokens.get("browser")) and self.server.is_loopback_bind
+                and not self._write_token_required())
+
+    def _token_403(self, error: str, *, close: bool = True, head: bool = False,
+                   message: str = "missing or invalid write token", headers: "list[tuple[str, str]] | None" = None,
+                   cache_control: "str | None" = None) -> None:
+        """The one 403 for a missing or invalid write token, every gate's (the separately gated reads pass their own
+        ``message``, ``Vary`` and ``Cache-Control``). ``auth`` says what would help: ``"owner"`` (this request accepts
+        the owner key, so a prompt can ask for it) or ``"pair"`` (it does not: pair this device). Every ``message``
+        keeps the word "token": the frontends match ``/token/i``."""
+        if close:
+            self.close_connection = True
+        self._send(json.dumps({"error": error, "message": message,
+                               "auth": "owner" if self._owner_key_accepted() else "pair"}).encode("utf-8"),
+                   "application/json; charset=utf-8", status=403, head=head, headers=headers,
+                   cache_control=cache_control)
+
+    def _gated_read_403(self, needs: str, *, head: bool) -> None:
+        """A separately gated read's token 403 (``needs``: what needs the token, with its verb): :meth:`_token_403`
+        with ``Vary`` on the token header and ``private, no-store``, the connection kept (a GET has no body)."""
+        self._token_403("forbidden", close=False, head=head,
+                        message=f"{needs} this page's write token, sent as {_WRITE_TOKEN_HEADER}",
+                        headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
     def _credential(self, *, required: "bool | None" = None) -> dict[str, Any]:
         """The credential THIS request carries, verified here and never claimed (design §5.1), computed once per
         request (RS-1: the cache is reset in ``handle_one_request``). First a surface token, compared in constant
@@ -1757,14 +1801,24 @@ class _Handler(GuardedHandler):
         raw = self.headers.get(_WRITE_TOKEN_HEADER, "")
         supplied = raw.encode("utf-8")
         name = None
+        owner_refused = False
+        owner_ok = self._owner_key_accepted()
         for n, tok in sorted(self.server.surface_tokens.items()):
             # RQ-6: make_server refuses a surface name with the paired prefix; this holds it at the point of use
             if n.startswith(PAIRED_PREFIX):
                 raise RuntimeError(f"surface token name {n!r} is in the paired namespace")
-            if tok and hmac.compare_digest(supplied, tok.encode("utf-8")) and name is None:
+            matched = bool(tok) and hmac.compare_digest(supplied, tok.encode("utf-8"))
+            if n == "browser" and not owner_ok:
+                # L-1: the owner key opens nothing off the box. Compared all the same (no early exit), and a match is
+                # the no-credential answer here: it never reaches the paired lookup (no broker start, no 503)
+                owner_refused = owner_refused or matched
+                continue
+            if matched and name is None:
                 name = n
         if name is not None:
             return {"class": "token", "name": name, "device_class": None}
+        if owner_refused:
+            return {"class": "none", "device_class": None}
         if raw:
             device = self._paired_device(raw)
             if device is not None:
@@ -1832,7 +1886,8 @@ class _Handler(GuardedHandler):
     def _transport(self) -> dict[str, bool]:
         """The manifest's ``transport``: the same two flags ``/substrate.json`` carries."""
         return {"writable": self.server.levain_source.write_scope is not None,
-                "write_token_required": self._write_token_required() or self._writes_need_credential()}
+                "write_token_required": self._write_token_required() or self._writes_need_credential(),
+                "owner_key": self._owner_key_accepted()}
 
     def _writes_need_credential(self) -> bool:
         """K2a: a writable surface needs a credential on every write, on every bind."""
@@ -1875,10 +1930,7 @@ class _Handler(GuardedHandler):
         from urllib.parse import unquote
 
         if not self._off_box_token_valid():
-            self._send(json.dumps({"error": "forbidden", "message": (
-                f"a consent request's details need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
-            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
-                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            self._gated_read_403("a consent request's details need", head=head)
             return
         request_id = unquote(path[len(_CONSENT_BODY_PREFIX):-len(_CONSENT_BODY_SUFFIX)])
         status, payload = 404, {"error": "not_found", "message": "no such consent request listed"}
@@ -1959,10 +2011,7 @@ class _Handler(GuardedHandler):
         on every bind, judged by the one compare every token check here uses, before the id is looked at. Read-only:
         an id that is not 1 to 12 digits, or names no question, is 404, and no ``questions.db`` is ever created."""
         if not self._off_box_token_valid():
-            self._send(json.dumps({"error": "forbidden", "message": (
-                f"a question's details need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
-            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
-                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            self._gated_read_403("a question's details need", head=head)
             return
         n = urllib.parse.unquote(path[len(_QUESTION_BODY_PREFIX):-len(_CONSENT_BODY_SUFFIX)])
         status, payload = 404, {"error": "not_found", "message": "no such question"}
@@ -1997,10 +2046,7 @@ class _Handler(GuardedHandler):
         surface token on every bind. Without a question store, 404."""
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if not self._off_box_token_valid():
-            self._send(json.dumps({"error": "forbidden", "message": (
-                f"the band needs this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
-            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
-                cache_control="private, no-store")
+            self._gated_read_403("the band needs", head=head)
             return
         store = getattr(self.server, "question_store", None)
         if store is None:
@@ -2109,10 +2155,7 @@ class _Handler(GuardedHandler):
                        cache_control="private, no-store")
             return False
         if not self._off_box_token_valid():
-            self._send(json.dumps({"error": "forbidden", "message": (
-                f"{what} need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}).encode("utf-8"),
-                "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
-                cache_control="private, no-store")
+            self._gated_read_403(f"{what} need", head=head)
             return False
         if not self.server.request_gate.acquire(blocking=False):
             self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
@@ -2157,8 +2200,23 @@ class _Handler(GuardedHandler):
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
             return self._pair_and_subscribe(raw, name)
+        if route == _PUSH_TEST:
+            return self._push_test(name)
         got = self._push_handle(route, raw, name)
         return got[1], got[0]
+
+    def _push_test(self, name: str) -> "tuple[dict[str, Any], int]":
+        """``POST /webpush/test``: a test ping to the CALLER's own subscriptions and no other device's, sent inside the
+        request (a paired device only: any other credential has no phone to ping). The reply is each delivery's
+        status, for the card to say in words."""
+        if not name.startswith(PAIRED_PREFIX):
+            return {"error": "device_required",
+                    "message": "only a paired device sends a test ping: pair this browser first"}, 403
+        from levain.webpush import sender
+
+        sent = sender.send(self.server.signer.queue_dir, kind="test", ref=name, title="Levain test ping",
+                           body="Pings are on for this device. It asks nothing of you.", device=name)
+        return {"deliveries": [{"subscription": sid, "status": status} for sid, status in sent]}, 200
 
     def _push_handle(self, route: str, raw: bytes, device_id: str) -> "tuple[int, bytes, str]":
         from levain.webpush import routes as push_routes
@@ -2596,10 +2654,7 @@ class _Handler(GuardedHandler):
         """``GET /cockpit/note/<n>.json``: one note's body (what, detail, agent, filed_at, and its dismissal if any),
         behind exactly the question body's gate. Read-only: a bad id or no such note is 404, no ``notes.db`` is made."""
         if not self._off_box_token_valid():
-            self._send(json.dumps({"error": "forbidden", "message": (
-                f"a note's words need this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
-            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
-                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            self._gated_read_403("a note's words need", head=head)
             return
         n = urllib.parse.unquote(path[len(_NOTE_BODY_PREFIX):-len(_CONSENT_BODY_SUFFIX)])
         status, payload = 404, {"error": "not_found", "message": "no such note"}
@@ -2633,10 +2688,7 @@ class _Handler(GuardedHandler):
         directory, resolved as the egress reading resolves it: a reader whose ``directory`` is None reads the default
         queue, as the egress reading does; a reader with no ``directory`` attribute reads nothing."""
         if not self._off_box_token_valid():
-            self._send(json.dumps({"error": "forbidden", "message": (
-                f"the thread record needs this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
-            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
-                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            self._gated_read_403("the thread record needs", head=head)
             return
         reader = self.server.consent_reader
         if not hasattr(reader, "directory"):
@@ -2662,10 +2714,7 @@ class _Handler(GuardedHandler):
         no live coordinator is needed; a store never made is ``queue: "none"``, one that cannot be read is named in
         ``unreadable``. No POST reaches it (the write routes are a closed set)."""
         if not self._off_box_token_valid():
-            self._send(json.dumps({"error": "forbidden", "message": (
-                f"the board needs this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
-            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
-                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            self._gated_read_403("the board needs", head=head)
             return
         if not self.server.request_gate.acquire(blocking=False):
             self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
@@ -2694,10 +2743,7 @@ class _Handler(GuardedHandler):
         ``_credential``, before the stem is even looked at. Read-only; a bad stem, a missing or foreign record and a
         server with no install root are all 404."""
         if not self._off_box_token_valid():
-            self._send(json.dumps({"error": "forbidden", "message": (
-                f"a session's transcript needs this page's write token, sent as {_WRITE_TOKEN_HEADER}")}
-            ).encode("utf-8"), "application/json; charset=utf-8", status=403, head=head,
-                headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+            self._gated_read_403("a session's transcript needs", head=head)
             return
         stem = path[len(_SESSION_LOG_PREFIX):-len(_SESSION_LOG_SUFFIX)]
         status, payload = 404, {"error": "not_found", "message": "no such session recorded"}
@@ -2823,12 +2869,27 @@ class _Handler(GuardedHandler):
     def _serve_pair_list(self, *, head: bool) -> None:
         """``GET /cockpit/pair/devices.json``: the paired devices (never a hash), behind a token on every bind."""
         if not self._off_box_token_valid():
-            self.close_connection = True
-            self._send(json.dumps({"error": "credential_required", "message": "missing or invalid write token"})
-                       .encode("utf-8"), "application/json; charset=utf-8", status=403, head=head)
+            self._token_403("credential_required", head=head)
             return
         payload, status = self._pair_call(lambda db: {"devices": db.list_devices()})
+        if status == 200:
+            on = self._devices_with_pings()
+            for d in payload["devices"]:
+                d["subscribed"] = PAIRED_PREFIX + str(d["id"]) in on
         self._pair_send(payload, status, head=head)
+
+    def _devices_with_pings(self) -> "set[str]":
+        """The ``paired-<id>`` names holding a live push subscription (the send's own rule, ``live_rows``); empty
+        where there is no push store or it cannot be read: a display only."""
+        if self.server.signer is None:
+            return set()
+        from levain.webpush.store import PushStore
+
+        try:
+            return {str(r["device_id"]) for r in PushStore(self.server.signer.queue_dir).live_subscriptions()}
+        except Exception:  # noqa: BLE001 - "pings off" on an unreadable store is a display, never a failed list
+            _log.debug("pair list: push subscriptions unreadable", exc_info=True)
+            return set()
 
     def _pair_send(self, payload: "dict[str, Any]", status: int, *, head: bool = False,
                    cache_control: "str | None" = None) -> None:
@@ -3007,14 +3068,7 @@ class _Handler(GuardedHandler):
             # ⚠ CROSS-REPO COUPLING: the frontends (dashboard_boot.js + an embedder's own frontend) match
             # ``/token/i`` on this "token" wording to trigger the prompt — keep the word "token" here
             # AND in do_POST's identical message if ever reworded (spore-129/220, two repos).
-            self._send(
-                json.dumps(
-                    {"error": "forbidden", "message": "missing or invalid write token"}
-                ).encode("utf-8"),
-                "application/json; charset=utf-8",
-                status=403,
-                head=head,
-            )
+            self._token_403("forbidden", close=False, head=head)
             return
 
         if path.startswith(_CONSENT_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
@@ -3339,12 +3393,12 @@ class _Handler(GuardedHandler):
             return self._pair_claim()
         if route in _PAIR_AUTHED_POST:
             if not self._off_box_token_valid():
-                return self._pair_refuse(403, "credential_required", "missing or invalid write token")
+                return self._token_403("credential_required")
             return self._pair_authed_post(route)
         if _is_write_route(route) and self._writes_need_credential() and not self._off_box_token_valid():
             # K2a (design §4.3): every write carries a credential on every bind, loopback included;
             # refused before a byte of the body is read
-            return self._reject(403, "credential_required", "missing or invalid write token")
+            return self._token_403("credential_required")
         # A sign route (DESIGN_SIGN D4) needs a surface token on every bind whatever the source's write scope: its
         # gesture is the operator's passkey, and the page that carries it must be this cockpit's own.
         sign = _sign_route(route) if self.server.signer is not None else None
@@ -3366,9 +3420,9 @@ class _Handler(GuardedHandler):
         push = route in _PUSH_POST and self.server.signer is not None
         if (sign is not None or compose or grant is not None or consent is not None or dispatch is not None
                 or coord is not None or push or key_line) and not self._off_box_token_valid():
-            return self._reject(403, "credential_required", "missing or invalid write token")
+            return self._token_403("credential_required")
         if self._write_token_required() and not self._off_box_token_valid():
-            return self._reject(403, "forbidden", "missing or invalid write token")
+            return self._token_403("forbidden")
         # CSRF layer 2: require application/json (a cross-origin page cannot send it
         # without a CORS preflight this server never answers).
         if self._refuse_non_json():
@@ -3585,17 +3639,28 @@ class _Handler(GuardedHandler):
             req = self._pair_body()
             if req is None:
                 return
-            unknown = sorted(set(req) - {"code"})
-            if unknown:
-                self._send_json({"error": "bad_request", "message": f"unknown request keys {unknown}"}, 400)
+            keys = set(req)
+            if keys not in ({"code"}, {"short"}):
+                self._send_json({"error": "bad_request",
+                                 "message": "send exactly one of 'code' or 'short'"
+                                 if keys <= {"code", "short"} else f"unknown request keys {sorted(keys - {'code', 'short'})}"},
+                                400)
                 return
             now = datetime.now(timezone.utc)
-            payload, status = self._pair_call(lambda db: {"claimed": db.redeem_offer(req.get("code"), now=now)})
+            short = "short" in req
+            def claim(db: Any) -> dict[str, Any]:
+                if not short:
+                    return {"claimed": db.redeem_offer(req["code"], now=now)}
+                got = db.redeem_short(req["short"], now=now)
+                return {"claimed": got, "state": None if got is not None else db.short_offer_state(now=now)}
+
+            payload, status = self._pair_call(claim)
             if status == 200:
                 claimed = payload["claimed"]
                 if claimed is None:
-                    payload, status = {"error": "pair_refused",
-                                       "message": "this pairing code is not valid: used, expired or unknown"}, 403
+                    message = (_SHORT_REFUSED.get(payload["state"], _SHORT_REFUSED["live"]) if short
+                               else "this pairing code is not valid: used, expired or unknown")
+                    payload, status = {"error": "pair_refused", "message": message}, 403
                 else:
                     payload = {"device_id": claimed[0], "token": claimed[1]}
             if status == 503:
@@ -3620,12 +3685,18 @@ class _Handler(GuardedHandler):
             minted_by = str(cred["name"])
             now = datetime.now(timezone.utc)
             if route == _PAIR_OFFER:
-                unknown = sorted(set(req) - {"label"})
+                unknown = sorted(set(req) - {"label", "short"})
                 if unknown:
                     self._send_json({"error": "bad_request", "message": f"unknown request keys {unknown}"}, 400)
                     return
+                if "short" in req and req["short"] is not True:
+                    self._send_json({"error": "bad_request", "message": "short is true or absent"}, 400)
+                    return
 
                 def mint(db: Any) -> dict[str, Any]:
+                    if req.get("short"):     # one credential per request: a short mint never makes a link too
+                        return {"short": db.mint_short_offer(label=req.get("label"), minted_by=minted_by, now=now),
+                                "short_ttl_seconds": int(SHORT_PAIRING_TTL.total_seconds())}
                     code = db.mint_offer(label=req.get("label"), minted_by=minted_by, now=now)
                     return {"code": code, "pair_path": f"/pair#code={code}",
                             "expires_in_s": int(OFFER_TTL.total_seconds())}
@@ -4362,12 +4433,15 @@ def run_web_server(
         unlocked = f"{url}#chat_token={httpd.chat_token}"
     else:
         unlocked = url
-    if httpd.write_token:
+    if httpd.write_token and httpd.is_loopback_bind:
         # K2a: every write carries the browser surface's token, loopback included. Same fragment
         # discipline as the chat token: never sent to the server, taken and stripped by the page.
         print(f"  write token (send as {_WRITE_TOKEN_HEADER}; valid until this server stops): "
               f"{httpd.write_token}", flush=True)
         unlocked += ("&" if "#" in unlocked else "#") + "write_token=" + urllib.parse.quote(httpd.write_token, safe="")
+    elif httpd.write_token:
+        # L-1: the owner key opens nothing on an off-loopback bind, so it is neither printed nor put in the link
+        print("  the owner key works only on loopback; pair a device: levain cockpit pair --short", flush=True)
     if unlocked != url:
         print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
 
