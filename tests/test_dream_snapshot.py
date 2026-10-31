@@ -198,6 +198,31 @@ def test_rollback_restores_every_file_to_the_manifests_pre_and_keeps_what_it_rep
     assert not list(scratch.parent.glob(".*.rb-*"))              # no temp debris beside the store
 
 
+def test_a_rollback_keeps_every_capture_made_before_during_and_after_the_dream(scratch):
+    """The rollback never touches the db, so a seat's capture survives it. Written from a live run: 170 captures from a
+    second process while a dream ran, then a rollback, 0 missing. Here the captures come from a second connection."""
+    made: list[str] = []
+
+    class Capturing(Fake):
+        def compose(self, req):                                   # seats keep capturing while the mind composes
+            with Store(str(scratch), section_schema=None) as s:
+                made.extend(s.record(content=f"seat {i}", episode_type="observation", source="seat").id
+                            for i in range(5))
+            return super().compose(req)
+
+    on_snap, on_saved = sn.hooks()
+    r = ex.consolidate_store(scratch, mind=Capturing(text_n(1)), occurrence_dir=occ(scratch, "o1"), max_seconds=3000,
+                             on_snapshot=on_snap, on_saved=on_saved)
+    assert r.outcome == "saved"
+    add_episode(scratch, "after the save")
+    assert sn.rollback(scratch, occ(scratch, "o1")).ok
+    con = sqlite3.connect(str(scratch))
+    have = {row[0] for row in con.execute("SELECT id FROM episodes")}
+    con.close()
+    assert len(made) == 5 and set(made) <= have
+    assert len(have) == 3 + 5 + 1
+
+
 def test_the_next_dream_is_accepted_after_a_rollback_and_the_rolled_back_episodes_are_not_re_offered(scratch):
     two_dreams(scratch)
     assert sn.rollback(scratch, occ(scratch, "o2")).ok
