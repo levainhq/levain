@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +49,34 @@ MAX_PATTERNS = 3  # precision bias — matches the flow recall hook's per-prompt
 # Episodes accumulated since the last consolidate before the session-end wrap-nudge fires. A
 # coarse "memory is piling up unmetabolized" signal — the human runs the gated consolidate.
 DEFAULT_WRAP_NUDGE_THRESHOLD = 12
+
+
+# Episode identity: the three metadata keys a per-agent episode carries. Recall filters on ``agent`` after a
+# time read, so the stamp is the whole of an agent's memory boundary; a malformed one is refused at the
+# door rather than stored as an episode no recall will ever find.
+IDENTITY_AGENT_KEY = "agent"
+IDENTITY_ROLE_KEY = "role"
+IDENTITY_RUN_KEY = "run"
+IDENTITY_KEYS = (IDENTITY_AGENT_KEY, IDENTITY_ROLE_KEY, IDENTITY_RUN_KEY)
+_IDENT_AGENT = re.compile(r"ag-[0-9a-f]{32}|@spawn/[a-z][a-z0-9-]{0,47}")
+_IDENT_ROLE = re.compile(r"[0-9a-f]{64}")
+_IDENT_RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
+def episode_identity(agent: str, run: str, role: str | None = None) -> dict[str, str]:
+    """The metadata stamp for one agent's episode: ``agent`` (an ``ag-<32 hex>`` id or ``@spawn/<role>``),
+    ``run`` (the occurrence or launch id) and, when the agent runs a role, ``role`` (its 64-hex hash).
+    Raises ``ValueError`` on a malformed field: a stamp recall cannot match is data loss in waiting."""
+    if not isinstance(agent, str) or not _IDENT_AGENT.fullmatch(agent):
+        raise ValueError("agent must be ag-<32 hex> or @spawn/<role name>")
+    if not isinstance(run, str) or not _IDENT_RUN.fullmatch(run):
+        raise ValueError("run must be 1-128 characters of [A-Za-z0-9._:-], starting alphanumeric")
+    out = {IDENTITY_AGENT_KEY: agent, IDENTITY_RUN_KEY: run}
+    if role is not None:
+        if not isinstance(role, str) or not _IDENT_ROLE.fullmatch(role):
+            raise ValueError("role must be a 64-hex role hash")
+        out[IDENTITY_ROLE_KEY] = role
+    return out
 
 
 def _refuse_in_entity_process() -> None:
@@ -212,8 +241,17 @@ class AnnealFiring:
         crystal_path: Path | None = None,
         max_patterns: int = MAX_PATTERNS,
         episodic_path: Path | None = None,
+        identity: dict[str, str] | None = None,
     ) -> None:
         self.constitution = constitution
+        # The identity is validated now and re-stamped over whatever metadata a capture carries, so a caller
+        # cannot write an episode as another agent. Not serialized across a fork (the child rebuilds
+        # defaults), the same limit the constitution has.
+        self._identity = (
+            episode_identity(identity.get(IDENTITY_AGENT_KEY), identity.get(IDENTITY_RUN_KEY),
+                             identity.get(IDENTITY_ROLE_KEY))
+            if identity is not None else None
+        )
         self._crystal_path = crystal_path  # None → resolve per-inject (env / default)
         self._max_patterns = max_patterns
         self._episodic_path = episodic_path  # None → resolve per-capture (env / default)
@@ -316,6 +354,10 @@ class AnnealFiring:
             # wraps table), so persist the adapter's session id as metadata provenance instead of
             # dropping it silently.
             meta = dict(req.metadata or {})
+            if self._identity is not None:
+                for key in IDENTITY_KEYS:  # the firing's stamp wins; a stale key from the caller is dropped
+                    meta.pop(key, None)
+                meta.update(self._identity)
             if req.session_id:
                 meta.setdefault("vagus_session_id", req.session_id)
 
