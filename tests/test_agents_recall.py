@@ -173,6 +173,7 @@ def test_k3_a_writer_between_reads_never_duplicates(tmp_path, monkeypatch):
     fa = AnnealFiring(episodic_path=db, identity={"agent": A, "run": "r1"})
     for i in range(12):
         _cap(fa, f"a{i}")
+    monkeypatch.setattr(recall_mod, "_PAGE", 5, raising=False)  # a paged read would page here; the one-snapshot read ignores it
     calls = _insert_between_pages(monkeypatch, db)
     got = recall_agent_episodes_at(db, A, limit=50).episodes
     ids = [e.id for e in got]
@@ -184,7 +185,7 @@ def test_k3_a_writer_between_reads_never_duplicates(tmp_path, monkeypatch):
 
 def test_r2_bad_arguments_refused_on_both_entry_points_and_deep_metadata_is_unreadable(tmp_path):
     missing = tmp_path / "nowhere.db"
-    for bad in ({"limit": 0}, {"limit": 2.5}, {"max_scan": True}, {"window_days": "3"}):
+    for bad in ({"limit": 0}, {"limit": 2.5}, {"max_scan": True}, {"window_days": "3"}, {"window_days": 10**9}):
         with pytest.raises(ValueError):
             recall_agent_episodes_at(missing, A, **bad)
     db = _store_path(tmp_path)

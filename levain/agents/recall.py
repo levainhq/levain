@@ -63,12 +63,17 @@ def _metadata_of(ep: Any) -> Mapping | None:
     return meta
 
 
+MAX_WINDOW_DAYS = 3650   # far past any memory window; keeps the date arithmetic inside datetime's range
+
+
 def _checked(agent: str, window_days: Any, limit: Any, max_scan: Any, now: Any) -> datetime:
     """Every argument check, in one place for both entry points; returns the window's end in UTC."""
     episode_identity(agent, "x")  # validates the agent id's shape; the run is a placeholder
     for v in (window_days, limit, max_scan):
         if not isinstance(v, int) or isinstance(v, bool) or v < 1:
             raise ValueError("window_days, limit and max_scan must each be an integer of at least 1")
+    if window_days > MAX_WINDOW_DAYS:
+        raise ValueError(f"window_days is at most {MAX_WINDOW_DAYS}")
     end = now if now is not None else datetime.now(timezone.utc)
     if not isinstance(end, datetime) or end.tzinfo is None:
         raise ValueError("now must be a timezone-aware datetime")
