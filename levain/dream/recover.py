@@ -82,6 +82,12 @@ def _identity_matches(pid: int, started: Any, argv: Any, occ_dir: Path) -> bool 
 
     ident = process_identity(pid)
     if ident is None:
+        try:
+            os.kill(pid, 0)          # a probe, never a signal: no process there at all is a definite "ended"
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pass
         return None
     if not (isinstance(started, str) and started and " ".join(started.split()) == ident[0]):
         return False
