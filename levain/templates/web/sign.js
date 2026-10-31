@@ -134,8 +134,8 @@
   function unpaired(refused) {
     head(refused ? "This device's key was not accepted" : "This device is not paired",
          paired() || refused
-           ? "Pair it again from a paired device: open the cockpit there, then Devices, Pair a device, and open the link here."
-           : "Open the cockpit on this device first (its link carries the key), or pair it from a paired device: Devices, Pair a device.");
+           ? "Pair it again from a paired device: open the cockpit there, then Devices, Make a link, and open the link here."
+           : "Open the cockpit on this device first (its link carries the key), or pair it from a paired device: Devices, Make a link.");
     $("sheet").dataset.state = "unpaired";
   }
 

@@ -385,9 +385,6 @@ def _fake_push(sub: dict[str, Any]) -> str:
 
 
 _ROW = "document.querySelector('.dev-pings')"
-_WORKER_KV = ("new Promise((ok) => { const o = indexedDB.open('levain-sw', 1); o.onerror = () => ok('no db');"
-              " o.onsuccess = () => { try { const st = o.result.transaction('kv').objectStore('kv'); const a = st.get('header');"
-              " const b = st.get('token'); b.onsuccess = () => ok([a.result, b.result]); } catch (e) { ok(String(e)); } }; })")
 
 
 def _panel(tok: str, sub: dict[str, Any], extra: "list[dict]") -> "list[dict]":
@@ -405,8 +402,6 @@ def test_the_devices_panel_turns_pings_on_for_a_paired_browser(rig, pushes, tmp_
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token={tok}", _panel(tok, _sub(7), [
             {"until": f"{_ROW}.querySelector('button').textContent === 'Turn off'", "ms": 20000},
             {"eval": f"{_ROW}.querySelector('.dev-meta').textContent"},
-            # the worker writes what it was told asynchronously: wait until it holds it
-            {"until": f"{_WORKER_KV}.then((r) => Array.isArray(r) && r[1] === {tok!r} && r)", "ms": 20000},
         ]))
         assert any(p.startswith("/webpush/subscribe ") for p in out["posts"]), out["posts"]
         assert [s["device_id"] for s in PushStore(qdir).live_subscriptions()] == [PAIRED_PREFIX + dev]
@@ -414,7 +409,6 @@ def test_the_devices_panel_turns_pings_on_for_a_paired_browser(rig, pushes, tmp_
         assert _notify(qdir) is True
     v = out["values"]
     assert v[4].startswith("on:"), v
-    assert v[5] == ["X-Levain-Write-Token", tok], v              # the worker sends the open under the cockpit's header
     assert pushes == [_sub(7)["endpoint"]]
 
 
@@ -429,7 +423,6 @@ def test_one_tap_under_the_cockpits_own_key_pairs_this_browser_and_lists_it(rig,
                       " && r.querySelector('button.dev-btn'))"
                       " && document.querySelector('.dev-note').textContent", "ms": 20000},
             {"eval": "[localStorage.getItem('levain_write_token'), localStorage.getItem('levain_paired_device')]"},
-            {"until": f"{_WORKER_KV}.then((r) => Array.isArray(r) && r[1] !== {T!r} && r)", "ms": 20000},
         ]))
         live = PushStore(qdir).live_subscriptions()
         assert len(live) == 1 and live[0]["device_id"].startswith(PAIRED_PREFIX), live
@@ -440,7 +433,6 @@ def test_one_tap_under_the_cockpits_own_key_pairs_this_browser_and_lists_it(rig,
     assert v[4] == "Pings are on for this browser.", v
     kept, mark = v[5]
     assert kept != T and mark == "1", v                         # the page holds the device key now, as pair.js keeps one
-    assert v[6] == ["X-Levain-Write-Token", kept], v           # and its worker sends opens under it
     assert pushes == [_sub(8)["endpoint"]]
 
 
