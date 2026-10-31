@@ -26,8 +26,10 @@ counter and is not hashed. The stored ``spec`` column is the canonical text of t
 defaults written out), so what was signed is what is read back.
 
 Lifecycle (DESIGN §3.4): ``registration`` registered|retired, ``operation`` active|paused, and ``arming``, which is
-derived from the authority log (P5a) and is never stored here. A pause survives everything but :func:`set_operation`
-with ``active`` (resume): nothing else in this module (register, a new version, retire) writes ``operation``.
+derived from the authority log (P5a) and is never stored here. On the agent it was set on, a pause survives a
+same-content re-register, a ``--revise`` (a new version) and a retire; only :func:`set_operation` with ``active``
+(resume) clears it, and nothing else in this module writes ``operation``. A retire followed by a register of the same
+name is NOT that agent: it mints a new ``agent_id`` (DESIGN §3.2) whose operation axis starts ``active``.
 """
 from __future__ import annotations
 
@@ -60,8 +62,12 @@ WHEN_ASKED = "when asked"
 DEFAULT_PAUSE_AFTER = 2
 
 _CRON_BOUNDS = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
-_CRON_NAMES = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10,
-               "nov": 11, "dec": 12, "sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+# names are legal only in their own field: month names in month (index 3), day names in day-of-week (index 4)
+_CRON_NAMES = ({}, {}, {},
+               {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10,
+                "nov": 11, "dec": 12},
+               {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6})
+_CRON_FIELDS = ("minute", "hour", "day-of-month", "month", "day-of-week")
 
 
 class SpecError(ValueError):
@@ -104,7 +110,7 @@ def _cron(text: str) -> str:
     parts = text.split()
     if len(parts) != 5:
         raise SpecError(f"trigger.cron {text[:60]!r} must have 5 fields (minute hour day month weekday)")
-    for part, (lo, hi) in zip(parts, _CRON_BOUNDS):
+    for part, (lo, hi), names, field in zip(parts, _CRON_BOUNDS, _CRON_NAMES, _CRON_FIELDS):
         for item in part.split(","):
             m = re.fullmatch(r"(\*|[0-9a-z]+(?:-[0-9a-z]+)?)(?:/([0-9]+))?", item.lower())
             if not m:
@@ -113,7 +119,11 @@ def _cron(text: str) -> str:
                 raise SpecError(f"trigger.cron field {part!r} has a zero step")
             if m.group(1) != "*":
                 for end in m.group(1).split("-"):
-                    n = _CRON_NAMES.get(end, int(end) if end.isdigit() else None)
+                    if not end.isdigit() and end not in names:
+                        raise SpecError(f"trigger.cron {field} field {part!r}: {end!r} is not a number"
+                                        + (" or a name this field takes" if names else
+                                           " (names are legal only in the month and day-of-week fields)"))
+                    n = names.get(end, int(end) if end.isdigit() else None)
                     if n is None or not lo <= n <= hi:
                         raise SpecError(f"trigger.cron field {part!r}: {end!r} is outside {lo}-{hi}")
     return " ".join(parts)
@@ -489,16 +499,18 @@ def feeder_group(store: AgentStore, ref: str) -> list[dict[str, Any]]:
 
 def set_operation(store: AgentStore, ref: str, operation: str) -> list[tuple[dict[str, Any], bool]]:
     """``pause`` / ``resume`` the agent and its whole feeder group together (DESIGN §3.2). Return
-    ``[(agent, changed)]``. Setting ``active`` is resume, the only writer of it, and resets the failure streak."""
+    ``[(agent, changed)]``. Setting ``active`` is resume, the only writer of it, and resets the failure streak of each
+    member it moves from paused; a member whose operation does not change is not touched (its streak stands)."""
     if operation not in ("paused", "active"):
         raise SpecError("operation is paused or active")
     out = []
     with store.write() as conn:
         for member in _group(conn, resolve_agent(conn, ref)):
             changed = member["operation"] != operation
-            if operation == "active":
+            if changed and operation == "active":
                 conn.execute("UPDATE agents SET operation = 'active', failure_streak = 0 WHERE agent_id = ?",
                              (member["agent_id"],))
+                member = {**member, "failure_streak": 0}
             elif changed:
                 conn.execute("UPDATE agents SET operation = 'paused' WHERE agent_id = ?", (member["agent_id"],))
             out.append(({**member, "operation": operation}, changed))

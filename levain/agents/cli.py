@@ -18,7 +18,8 @@ from levain.agents.role import MAX_VERSION, RoleError, add_role, get_role, lates
 from levain.agents.refuse import AuditError, audit_verdicts, check_spec, derived_flags, refinement_of
 from levain.agents.spec import (SpecError, finalize_spec, find_revert, get_agent, list_agents, load_json,
                                 parse_spec, register_specs, retire_agent, set_operation, stored_specs)
-from levain.agents.store import AgentStoreRefused, get_default_zone, open_agent_store, set_default_zone
+from levain.agents.store import (AgentStoreRefused, get_default_zone, open_agent_store, open_agent_store_view,
+                                 set_default_zone)
 from levain.autonomic.agent_tables import AGENT_SCHEMA
 from levain.autonomic.db import StoreFormatError
 
@@ -82,6 +83,16 @@ def _open(args: argparse.Namespace):
         print(f"levain agents: {exc}", file=sys.stderr)
     except (StoreFormatError, sqlite3.Error, OSError) as exc:
         print(f"levain agents: cannot open the autonomic store: {exc}", file=sys.stderr)
+    return None
+
+
+def _open_view(args: argparse.Namespace):
+    try:
+        return open_agent_store_view(args.store_dir)
+    except AgentStoreRefused as exc:
+        print(f"levain agents: {exc}", file=sys.stderr)
+    except (StoreFormatError, sqlite3.Error, OSError) as exc:
+        print(f"levain agents: cannot read the autonomic store: {exc}", file=sys.stderr)
     return None
 
 
@@ -213,7 +224,7 @@ def run_register(args: argparse.Namespace) -> int:
             return _fail("register", f"{args.source}: {exc}")
         _print_verdicts(verdicts, args.json, audit=True)
         return 0
-    store = _open(args)
+    store = _open_view(args) if args.warn else _open(args)     # --warn writes nothing, not even a new store file
     if store is None:
         return 1
     try:

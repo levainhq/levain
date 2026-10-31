@@ -20,10 +20,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from levain.autonomic.agent_tables import agent_marker, check_agent_schema
+from levain.autonomic.agent_tables import agent_marker, check_agent_schema, create_agent_objects, has_agent_object
 from levain.autonomic.db import DB_NAME, AutonomicDB, default_store_dir, store_marker
 
-__all__ = ["AgentStore", "AgentStoreRefused", "open_agent_store", "STORE_V3_REASON", "valid_zone", "get_default_zone",
+__all__ = ["AgentStore", "AgentStoreRefused", "AgentStoreView", "open_agent_store", "open_agent_store_view",
+           "STORE_V3_REASON","valid_zone", "get_default_zone",
            "set_default_zone"]
 
 STORE_V3 = "levain-autonomic/3"
@@ -101,6 +102,55 @@ def open_agent_store(store_dir: Path | str | None = None) -> AgentStore:
     if reason is not None:
         raise AgentStoreRefused(_refusal(reason, marker))
     return AgentStore(db)
+
+
+class AgentStoreView:
+    """A look at the agent tables that writes NOTHING (``register --warn``): :meth:`read` is a read-only connection
+    to the store file, or, when there is no store file (or a store with no agent object yet, which the real opener
+    would give empty tables), an in-memory database holding empty agent tables. No store file or directory is
+    created and the database file is never written. A read of a WAL database needs SQLite's ``-shm`` index, so an
+    existing store may be left with empty ``-wal``/``-shm`` sidecars (``immutable=1`` would avoid them but would
+    also miss commits still in the WAL)."""
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+
+    @contextmanager
+    def read(self) -> Iterator[sqlite3.Connection]:
+        if self.path is None:
+            conn = sqlite3.connect(":memory:", isolation_level=None)
+            create_agent_objects(conn)
+        else:
+            conn = sqlite3.connect(self.path.absolute().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+        try:
+            conn.execute("BEGIN")
+            yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def write(self) -> Iterator[sqlite3.Connection]:
+        raise AgentStoreRefused("a read-only view of the agent store writes nothing")
+        yield  # pragma: no cover
+
+
+def open_agent_store_view(store_dir: Path | str | None = None) -> AgentStoreView:
+    """The read-only counterpart of :func:`open_agent_store`: the same refusals, and nothing created or changed."""
+    directory = Path(store_dir).expanduser() if store_dir is not None else default_store_dir()
+    path = directory / DB_NAME
+    if not path.is_file():
+        return AgentStoreView(None)
+    if _store_format_ro(path) == STORE_V3:
+        raise AgentStoreRefused(STORE_V3_REASON)
+    view = AgentStoreView(path)
+    with view.read() as conn:
+        if agent_marker(conn) is None and not has_agent_object(conn):
+            return AgentStoreView(None)
+        reason = check_agent_schema(conn)
+        marker = agent_marker(conn)
+    if reason is not None:
+        raise AgentStoreRefused(_refusal(reason, marker))
+    return view
 
 
 ZONE_KEY = "default_zone"

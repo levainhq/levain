@@ -91,7 +91,7 @@ def test_a_corpus_reader_is_the_query_path_read_when_asked(store):
 def test_a_still_leaves_the_win_rule_standing(store):
     # the audit's finding: (a) clears the reader and the moment, check 1 'no win' stays
     got = verdict(store, "email_event_reconciler")
-    assert [(r.rule, r.message) for r in got] == [("1", "no win")]
+    assert [r.rule for r in got] == ["1"] and got[0].message.startswith("no win: the spec has no `win` field; add")
     assert refinement_of(parse_spec(row(store, "email_event_reconciler"))) == "a"
 
 
@@ -292,7 +292,7 @@ def test_a_feeder_group_registers_whole_or_not_at_all(store, tmp_path, capsys):
     assert main([*d, put(tmp_path, [sensor, classifier, reconciler])]) == 1      # the reconciler has no win
     got = json.loads(capsys.readouterr().out)["jobs"]
     assert got["email_classifier_argus"]["reasons"][0].startswith("held back: its own checks pass")
-    assert got["email_event_reconciler"]["reasons"] == ["rule 1: no win"]
+    assert got["email_event_reconciler"]["reasons"][0].startswith("rule 1: no win: the spec has no `win` field")
     assert stored_specs(store) == {}                                              # nothing written, no dangling feeds
     reconciler["win"] = {"kind": "verifier", "check": "attestation checked"}
     assert main([*d, put(tmp_path, [sensor, classifier, reconciler])]) == 0
@@ -310,6 +310,78 @@ def test_a_cycle_in_a_file_writes_nothing(store, tmp_path, capsys):
     assert any("feeder cycle: c -> b -> c" in r for r in got["c"]["reasons"])
     assert got["a"]["reasons"][0].startswith("held back")                         # a is not in the cycle
     assert stored_specs(store) == {}
+
+
+def test_warn_writes_nothing_and_creates_no_store(tmp_path, capsys):
+    spec = copy.deepcopy(SPECS["vendored_sync_check"])
+    spec["role"]["role_hash"] = "0" * 64
+    f = tmp_path / "s.json"
+    f.write_text(json.dumps(spec))
+    fresh = tmp_path / "fresh"
+    assert main(["agents", "--store-dir", str(fresh), "register", "--warn", "--from", str(f)]) == 0
+    assert "is not registered" in capsys.readouterr().out and not fresh.exists()
+    s = open_agent_store(tmp_path / "store")
+    spec["role"]["role_hash"] = role_hash(s, "local-role")
+    f.write_text(json.dumps(spec))
+    db = tmp_path / "store" / "autonomic.db"
+    before = db.read_bytes()
+    assert main(["agents", "--store-dir", str(tmp_path / "store"), "register", "--warn", "--from", str(f)]) == 0
+    assert capsys.readouterr().out.startswith("pass")
+    assert db.read_bytes() == before and stored_specs(s) == {}
+
+
+def test_b_a_chain_must_end_in_a_real_win(store):
+    up = row(store, "email_sensor_argus")
+    up["feeds"] = ["down"]
+    down = row(store, "email_sensor_argus")
+    down.update(name="down", feeds=[])
+    lookup = {"down": parse_spec(down)}
+    got_up = verdict(store, up, lookup=lookup)
+    assert [r.rule for r in got_up] == ["1"] and "whose own win is inherited and which feeds nothing" in got_up[0].message
+    got_down = verdict(store, down, lookup={"up": parse_spec(up)})
+    assert any("feeds is empty" in r.message for r in got_down)
+
+
+@pytest.mark.parametrize("entry", ["everything", "ANY", "anything", ".", "./", "~", "$HOME", "/*", "/", "**"])
+@pytest.mark.parametrize("where", ["lands", "pushes", "publishes", "repo", "paths"])
+def test_rule_5_spellings_of_all(entry, where):
+    from levain.agents.refuse import ceiling_problem
+    if where == "repo":
+        ceiling = {"where": [{"repo": entry, "paths": ["src"]}]}
+    elif where == "paths":
+        ceiling = {"where": [{"repo": "levain", "paths": [entry]}]}
+    else:
+        ceiling = {"lands": ["local data"], where: [entry]}
+    problem = ceiling_problem(ceiling)
+    assert problem and ("spelling of 'all'" in problem or "says 'all'" in problem), (entry, where, problem)
+
+
+def test_rule_5_blank_entries():
+    from levain.agents.refuse import ceiling_problem
+    assert ceiling_problem({"lands": [""]}) == "the role's ceiling is empty"         # blank is not something named
+    assert ceiling_problem({"pushes": ["  "], "where": [{"repo": "", "paths": []}]}) == "the role's ceiling is empty"
+    assert ceiling_problem({"lands": ["local data", ""]}) == "the role's ceiling.lands[1] has an empty entry"
+    assert "paths[0] has an empty entry" in ceiling_problem({"where": [{"repo": "levain", "paths": [""]}]})
+    assert ceiling_problem({"lands": ["local data"], "where": [{"repo": "levain", "paths": ["src"]}]}) is None
+
+
+def test_messages_name_the_fix(store, tmp_path, capsys):
+    held = verdict(store, "disk_floor", held={"disk_floor"})
+    assert "retire it (`levain agents retire disk_floor`), or pass --revise to write its next version" in held[0].message
+    unreg = check_spec(parse_spec(row(store, "disk_floor")), role=None, default_zone=ZONE)
+    assert "`levain agents role add <role file>`" in unreg[0].message
+    no_win = verdict(store, "disk_floor", mutate=drop("win"))
+    assert "`win` field" in no_win[0].message and '"kind": "verifier" or "human"' in no_win[0].message
+    good = row(store, "disk_floor")
+    named_bad = {**good, "colour": "red"}
+    nameless = {"stop_at": 1}
+    weird = {"name": 7}
+    assert main(["agents", "--store-dir", str(store.directory), "register", "--warn", "--json", "--from",
+                 put(tmp_path, [good, named_bad, nameless, weird])]) == 0
+    got = json.loads(capsys.readouterr().out)["jobs"]
+    assert set(got) == {"disk_floor", "disk_floor#1", "spec[2]", "spec[3]"}
+    assert "unknown field 'colour'" in got["disk_floor#1"]["reasons"][0]
+    assert got["spec[2]"]["reasons"] == ["rule 3: missing field 'name'"]
 
 
 @pytest.mark.parametrize("role,needle", [("empty-role", "empty"), ("all-role", "says 'all'")])

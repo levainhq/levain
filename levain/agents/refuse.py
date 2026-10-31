@@ -12,7 +12,8 @@ is rule 3's first half: an unknown field or a wrong type raises there. Here:
 3. a role that does not resolve (the first half is the parse).
 4. a name held by a live (not retired) agent. A spawned instance holds a name in ``@spawn/``; F0 has no table for
    instances, so that half of the rule has nothing to read and is not enforced here.
-5. an empty ceiling, or one that says "all" (the role's ceiling).
+5. an empty ceiling, or one that says "all" (the role's ceiling): any spelling in ``_ALL`` (everything, any, ``*``,
+   ``/``, ``.``, ``~``, ``$HOME`` ...) or a blank entry, in ``lands``, ``pushes``, ``publishes`` or ``where``.
 6. a schedule with no zone while the install has no default zone (the message names ``levain agents zone``); a feeder
    cycle.
 (d) review is a DERIVED flag: required when the role calls a model or acts outward (``pushes`` or ``publishes`` of its
@@ -35,7 +36,9 @@ __all__ = ["Refusal", "check_spec", "refinement_of", "derived_flags", "ceiling_p
            "AuditError", "ZONE_VERB"]
 
 ZONE_VERB = "levain agents zone <IANA>"
-_ALL = ("all", "*", "**")
+# the spellings of "all" rule 5 refuses (compared stripped and case-folded); a blank entry is refused beside them
+_ALL = frozenset({"all", "*", "**", "/", "/*", "/**", "everything", "any", "anything", ".", "./", "~", "~/",
+                  "$home", "$home/", "${home}"})
 
 
 @dataclass(frozen=True)
@@ -69,24 +72,47 @@ def derived_flags(role: Mapping[str, Any]) -> dict[str, bool]:
     return {"calls_model": model, "acts_outward": outward, "review_required": model or outward}
 
 
+def _says_all(value: Any) -> str | None:
+    """Why one ceiling entry is refused: blank (it names nothing, and reads as everything) or a spelling of 'all'."""
+    text = str(value).strip().lower()
+    if not text:
+        return "has an empty entry"
+    if text == "all":
+        return "says 'all'"
+    if text in _ALL:
+        return f"says {str(value).strip()!r}, a spelling of 'all'"
+    return None
+
+
 def ceiling_problem(ceiling: Mapping[str, Any] | None) -> str | None:
-    """Rule 5: None when the ceiling names something and does not say "all"."""
-    if not ceiling or not any(ceiling.get(k) for k in ("where", "lands", "pushes", "publishes")):
+    """Rule 5: None when the ceiling names something and does not say "all". A blank entry is not something named:
+    a ceiling of blank entries only is empty, and a blank entry beside real ones is refused like 'all'."""
+    ceiling = ceiling or {}
+    named = any(str(v).strip() for k in ("lands", "pushes", "publishes") for v in ceiling.get(k) or [])
+    named = named or any(str(w.get("repo", "")).strip() for w in ceiling.get("where") or [])
+    if not named:
         return "the role's ceiling is empty"
     for key in ("lands", "pushes", "publishes"):
-        if any(str(v).strip().lower() in _ALL for v in ceiling.get(key) or []):
-            return f"the role's ceiling.{key} says 'all'"
+        for i, v in enumerate(ceiling.get(key) or []):
+            why = _says_all(v)
+            if why:
+                return f"the role's ceiling.{key}[{i}] {why}"
     for i, w in enumerate(ceiling.get("where") or []):
-        if str(w.get("repo", "")).strip().lower() in _ALL or any(str(p).strip().lower() in _ALL + ("/",)
-                                                                  for p in w.get("paths") or []):
-            return f"the role's ceiling.where[{i}] says 'all'"
+        why = _says_all(w.get("repo", ""))
+        if why:
+            return f"the role's ceiling.where[{i}].repo {why}"
+        for j, p in enumerate(w.get("paths") or []):
+            why = _says_all(p)
+            if why:
+                return f"the role's ceiling.where[{i}].paths[{j}] {why}"
     return None
 
 
 def _win_problem(spec: Mapping[str, Any]) -> str | None:
     win = spec.get("win")
     if not win:
-        return "no win"
+        return ('no win: the spec has no `win` field; add {"kind": "verifier" or "human", "check": what is '
+                'checked} (a feeder-group stage may declare "inherited")')
     if win["kind"] != "inherited" and not win["check"].strip():
         return "win.check is empty (a win is a typed verifier or a named human verdict surface)"
     return None
@@ -104,6 +130,9 @@ def _chain_problem(name: str, spec: Mapping[str, Any], lookup: Mapping[str, Mapp
         if _win_problem(other):
             return f"inherited win ends at {down}, which has no win"
         if other["win"]["kind"] == "inherited":
+            if not other.get("feeds"):
+                return (f"inherited win ends at {down}, whose own win is inherited and which feeds nothing: a chain "
+                        f"must end in an agent whose own win is real, not inherited")
             sub = _chain_problem(down, other, lookup, seen + (down,))
             if sub:
                 return sub
@@ -177,12 +206,14 @@ def check_spec(spec: Mapping[str, Any], *, role: Mapping[str, Any] | None, defau
 
     # rule 4
     if name in names_held:
-        out.append(Refusal("4", f"name {name!r} is held by an agent that is not retired"))
+        out.append(Refusal("4", f"name {name!r} is held by an agent that is not retired: retire it "
+                                f"(`levain agents retire {name}`), or pass --revise to write its next version"))
 
     # rule 3 (resolution) and rule 5
     pinned = spec["role"]
     if role is None:
-        out.append(Refusal("3", f"role {pinned['name']!r} ({pinned['role_hash'][:12]}) is not registered"))
+        out.append(Refusal("3", f"role {pinned['name']!r} ({pinned['role_hash'][:12]}) is not registered: register "
+                                f"it with `levain agents role add <role file>` and pin the role_hash it prints"))
     else:
         if role.get("name") != pinned["name"]:
             out.append(Refusal("3", f"role.name {pinned['name']!r} does not match the role its role_hash "

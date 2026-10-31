@@ -84,6 +84,17 @@ def test_bad_cron_is_refused(cron):
         spec("disk_floor", trigger={"kind": "schedule", "cron": cron, "zone": ZONE})
 
 
+@pytest.mark.parametrize("cron", ["mon jan * * *", "0 jan * * *", "0 0 mon * *", "0 0 * mon *", "0 0 * * jan"])
+def test_cron_names_only_in_their_own_field(cron):
+    with pytest.raises(SpecError, match="cron"):
+        spec("disk_floor", trigger={"kind": "schedule", "cron": cron, "zone": ZONE})
+
+
+def test_cron_names_where_they_belong_parse():
+    assert spec("disk_floor", trigger={"kind": "schedule", "cron": "0 7 * jan-mar mon-fri", "zone": ZONE})[
+        "trigger"]["cron"] == "0 7 * jan-mar mon-fri"
+
+
 def test_window_and_zone_are_checked():
     ok = spec("disk_floor", trigger={"kind": "schedule", "cron": "*/20 22-23,0-3 * * *", "zone": ZONE,
                                      "window": {"start": "22:00", "end": "04:00"}})
@@ -172,6 +183,25 @@ def test_resume_is_the_only_clear_and_resets_the_failure_streak(store):
     set_operation(store, a, "active")
     got = get_agent(store, a)
     assert (got["operation"], got["failure_streak"]) == ("active", 0)
+
+
+def test_resume_touches_only_members_it_moves(store):
+    feeder_store(store)
+    with store.write() as conn:
+        conn.execute("UPDATE agents SET operation='paused', failure_streak=2 WHERE name='email_sensor_argus'")
+        conn.execute("UPDATE agents SET failure_streak=1 WHERE name='email_classifier_argus'")   # active, not paused
+    out = {a["name"]: changed for a, changed in set_operation(store, "email_sensor_argus", "active")}
+    assert out == {"email_sensor_argus": True, "email_classifier_argus": False, "email_event_reconciler": False}
+    assert get_agent(store, "email_classifier_argus")["failure_streak"] == 1      # untouched
+    assert get_agent(store, "email_sensor_argus")["failure_streak"] == 0          # moved from paused: reset
+
+
+def test_a_retire_and_re_register_is_a_new_agent_that_starts_active(store):
+    a, *_ = reg(store, "disk_floor")
+    set_operation(store, "disk_floor", "paused")
+    retire_agent(store, a)
+    b, *_ = reg(store, "disk_floor")
+    assert b != a and axes(store, b) == ("registered", "active") and axes(store, a) == ("retired", "paused")
 
 
 def test_can_fire_needs_all_three_axes():
