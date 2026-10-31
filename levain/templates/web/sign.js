@@ -46,6 +46,7 @@
 // phone's own. The bytes signed are the server's; the line shown is the challenge's own `line`.
 (function () {
   "use strict";
+  if (window.LevainCardFormat && typeof window.LevainCardFormat.installFieldGrow === "function") window.LevainCardFormat.installFieldGrow();
 
   const WRITE_TOKEN_KEY = "levain_write_token";     // dashboard_boot.js's key: the cockpit's own token in this browser
   const PAIRED_MARK_KEY = "levain_paired_device";   // pair.js's mark: this browser holds a paired device's key
@@ -268,7 +269,7 @@
     // NPCard); its signed text stays whole, one tap away, above the controls. Any other message, and any needs-phill
     // message parseMessage does not read exactly (it returns null), is one visible block.
     const F = window.LevainCardFormat;
-    const card = !dispatch && !consent && F && typeof F.drawHead === "function" ? F.parseMessage(r.message, r) : null;
+    const card = !dispatch && !consent && F && typeof F.drawHead === "function" ? (F.parseMessage(r.message, r) || (typeof F.looseCard === "function" ? F.looseCard(r.message, r) : null)) : null;
     cardView = card;
     $("sheet-actions").classList.toggle("card-rows", !!card);
     if (card) drawCardHead(body, card, msg);
@@ -760,6 +761,12 @@
     words.placeholder = "your words";
     words.setAttribute("aria-label", "your words");
     body.appendChild(words);
+    const grow = (t) => { const f = window.LevainCardFormat; if (f && typeof f.grow === "function") f.grow(t); };      // a programmatic value fires no input event
+    // words typed in the cockpit's drop box and handed over by "Add an envelope" (dashboard_core.js openDropSheet): read once
+    try {
+      const pre = window.sessionStorage.getItem("levain-drop-prefill");
+      if (pre) { words.value = pre; grow(words); window.sessionStorage.removeItem("levain-drop-prefill"); }
+    } catch (e) { /* the sheet opens empty */ }
     const det = el("details", "");
     det.id = "drop-env";
     det.appendChild(el("summary", "", "sign an envelope"));
@@ -801,14 +808,33 @@
     // a drop whose answer is not known is kept in this browser BEFORE it is posted (as the phone's outbox keeps it), so a
     // closed sheet loses nothing: the next open sends it again, unchanged (the same outbox id files once), and it leaves
     // only on a definite answer
+    // one record per outbox id, so a new drop never overwrites one whose answer is unknown (the cockpit's hero keeps the same way)
     const PEND_KEY = "levain-drop-pending:" + window.location.hostname;
-    const keep = (req) => { try { window.localStorage.setItem(PEND_KEY, JSON.stringify(req)); } catch (e) { /* kept in this visit only */ } };
-    const drop0 = () => { try { window.localStorage.removeItem(PEND_KEY); } catch (e) { /* nothing kept */ } };
-    const kept = () => {
+    const pendKey = (id) => PEND_KEY + ":" + id;
+    const keep = (req) => { try { window.localStorage.setItem(pendKey(req.outbox_id), JSON.stringify(req)); } catch (e) { /* kept in this visit only */ } };
+    const drop0 = (req) => {
+      try { window.localStorage.removeItem(pendKey(req.outbox_id)); } catch (e) { /* nothing kept */ }
       try {
-        const v = JSON.parse(window.localStorage.getItem(PEND_KEY) || "null");
-        return v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string" ? v : null;
-      } catch (e) { return null; }
+        const old = JSON.parse(window.localStorage.getItem(PEND_KEY) || "null");      // a record an earlier build kept under the bare key
+        if (old && old.outbox_id === req.outbox_id) window.localStorage.removeItem(PEND_KEY);
+      } catch (e) { /* a malformed legacy value is left alone */ }
+    };
+    // the newest unresolved one; the others stay kept, for the cockpit's hero
+    const kept = () => {
+      const seen = new Map();
+      let n = 0;
+      try { n = window.localStorage.length; } catch (e) { return null; }
+      for (let i = 0; i < n; i++) {
+        try {
+          const k = window.localStorage.key(i);
+          if (k !== PEND_KEY && !(k && k.indexOf(PEND_KEY + ":") === 0)) continue;
+          const v = JSON.parse(window.localStorage.getItem(k) || "null");      // a malformed value is skipped, never the scan
+          if (v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string" && !seen.has(v.outbox_id)) seen.set(v.outbox_id, v);
+        } catch (e) { /* this entry only */ }
+      }
+      const all = Array.from(seen.values());
+      all.sort((a, b) => String(b.sent_at || "").localeCompare(String(a.sent_at || "")));
+      return all.length ? all[0] : null;
     };
     let signedLine = "";
     const done = (a, plain) => {
@@ -868,7 +894,7 @@
       };
       return post("drop", req).then((a) => {
         if (a.ok) {
-          drop0();
+          drop0(req);
           unsure = false;
           if (signed) { ended(); if (signedLine) signing(signedLine, "server", "Signed"); else relabel("Signed"); $("sheet").dataset.state = "signed"; }
           return done(a, !signed);
@@ -876,7 +902,7 @@
         if (a.status >= 400 && a.status < 500) {
           // refused: nothing was delivered with this request (a stale signature is signed again from the review); the
           // controls come back with the words, whether this was the first send or a retry
-          drop0();
+          drop0(req);
           if (signed) { relabel("Not signed"); ended(); }
           restore();
           return refusal(a, signed ? "the signed drop was not delivered; review and sign again, or send the words alone" : "the drop was not delivered");
@@ -967,6 +993,7 @@
     const left = kept();
     if (left) {
       words.value = left.words;
+      grow(words);
       oid = left.outbox_id;
       say("A drop from earlier was not confirmed; asking whether it landed…");
       sendDrop(left);

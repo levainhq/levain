@@ -301,7 +301,7 @@ def test_a_drop_is_kept_before_its_post_and_the_close_and_the_store_are_guarded(
     assert send.index("keep(req)") < send.index('post("drop", req)')
     assert "const left = kept();" in sign and "sendDrop(left)" in sign
     assert "coord && (flight || unsure)" in sign
-    assert "restore();" in send and "drop0();" in send
+    assert "restore();" in send and "drop0(req);" in send
     done = sign[sign.index("const done = (a, plain)"):]
     assert done.index("storeId = a.body.store_id") < done.index("lock(false)")
     assert 'list.id = "drop-recent"' in sign and "if (drops.length) {\n      const list" not in sign

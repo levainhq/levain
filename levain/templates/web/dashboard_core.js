@@ -26,6 +26,7 @@
 
 (function () {
   "use strict";
+  if (window.LevainCardFormat && typeof window.LevainCardFormat.installFieldGrow === "function") window.LevainCardFormat.installFieldGrow();
 
   // ---- tiny DOM helpers (textContent only — never innerHTML on store data) ----
   const el = (tag, cls, text) => {
@@ -596,6 +597,8 @@
     const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
     if (!hero || !brief || !widgets) return;
     hero.hidden = brief.hidden = widgets.hidden = !on;
+    const dropHost = document.getElementById("ck-drop");
+    if (dropHost && !on) dropHost.hidden = true;   // the Send box sits under the Needs-you row, outside #ck-hero: it leaves with the KE page, and the next KE render (renderDropHero) shows it again
     const needsHost = document.getElementById("ck-needs");
     if (needsHost && !on) clearNeeds(needsHost);   // the strip is drawn only by the KE page, and only while something waits (renderNeeds)
     const notesHost = document.getElementById("ck-notes");
@@ -1563,6 +1566,7 @@
     for (const old of document.querySelectorAll("#ck-hero > .ck-region-err")) old.remove();   // a clean hero render clears its last error line
     guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreHero);
     guardRegion("the brief", () => renderBriefRegion(view, byId), regionErr("ck-brief", true), restoreState);
+    guardRegion("the coordinator drop", () => renderDropHero(), regionErr("ck-drop", false));
     guardRegion("the needs strip", () => renderNeeds(view), regionErr("ck-needs", true));
     guardRegion("the notes strip", () => renderNotes(view), regionErr("ck-notes", true));
     guardRegion("the widgets", () => renderWidgets(view, byId), regionErr("ck-widgets", true));
@@ -3766,7 +3770,7 @@
           if (remember === true) composePick[pickKey] = now;
           chipAddr();
         }
-        // the person's pick (a chip click or a picker change, the only callers): the one place the card's need for a choice is answered
+        // the person's pick: the one place the card's need for a choice is answered
         function userPick(values) {
           ctl.needsChoice = false;
           setTo(values, true);
@@ -4531,6 +4535,13 @@
     }
     return t;
   }
+  // a question's long text drawn by card_format.js: headed sections, lists, and the options once as rows (text only); null when
+  // the module is not loaded or throws, and the caller draws the one line it drew before
+  function questionText(text, dropping, options, rec) {
+    const F = window.LevainCardFormat;
+    if (!F || typeof F.drawBody !== "function" || !text) return null;
+    try { return F.drawBody(el("div", "card-body needs-q-body"), text, dropping, options, rec); } catch (e) { return null; }
+  }
   // `card` (the Needs-you strip's card) draws the mock's anatomy: the question as a bold title, "blocks: ...", then "REC key. words";
   // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
   function drawQuestionBody(q, slot, b, card) {
@@ -4549,7 +4560,7 @@
     if (card) {
       parts.push(el("div", "needs-q-title", sv(b.what)));
       const more = blocksBeyondTitle(sv(b.what), sv(b.blocks));
-      if (more) parts.push(el("div", "ext-meta needs-q-blocks", "blocks: " + more));
+      if (more) parts.push(questionText(more, null, options, sv(b.rec)) || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       const recOpt = options.find((o) => o && sv(o.key) === sv(b.rec));
       if (sv(b.rec)) {
         const rl = el("div", "needs-rec");
@@ -4561,7 +4572,9 @@
       parts.push(el("pre", "consent-display", sv(b.what)));
       const facts = el("div", "consent-facts");
       facts.appendChild(el("span", "ext-meta", "recommends " + sv(b.rec)));
-      facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
+      const formatted = questionText(sv(b.blocks), null, options, sv(b.rec));
+      if (formatted) facts.appendChild(formatted);
+      else facts.appendChild(el("span", "ext-meta", "blocks: " + sv(b.blocks)));
       parts.push(facts);
     }
     const a = b.answer && typeof b.answer === "object" ? b.answer : null;
@@ -5247,7 +5260,7 @@
   function signCardOf(r) {
     const F = window.LevainCardFormat;
     if (!F || typeof F.parseMessage !== "function" || typeof F.drawHead !== "function") return null;
-    try { return F.parseMessage(r.message, r); } catch (e) { return null; }
+    try { return F.parseMessage(r.message, r) || (typeof F.looseCard === "function" ? F.looseCard(r.message, r) : null); } catch (e) { return null; }
   }
   // the card's part for request `id`: a note line, then the request's own buttons, filled once the listing answers.
   // `head`: the focus view's question lines a needs-phill card replaces (signCardOf), else none
@@ -5579,6 +5592,7 @@
     if (signSheetWatch) { signSheetWatch.disconnect(); signSheetWatch = null; }
     for (const n of signSheetInerted) n.inert = false;
     signSheetInerted = [];
+    dropPrefillClear();      // words handed to a drop sheet that never read them are not left for the next one
     if (veil) veil.remove();
     if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
     if (signSheetLease) { signSheetLease = false; signBusy--; }
@@ -5607,6 +5621,7 @@
       // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
       dispatchStale();
       rereadBoard();
+      dropReload();      // a drop the sheet filed or could not confirm (either may have made the store): the drop card reads again, not from its cache
     }
   });
   window.LevainSignSheet = { open: openSignSheet, openConsent: openConsentSheet, openDispatch: openDispatchSheet, openDrop: openDropSheet, close: closeSignSheet };
@@ -6627,51 +6642,282 @@
     return openSheet("/sign/dispatch/" + encodeURIComponent(id), version, choice, "dispatch job");
   }
   // OS-2: the sheet over a coordinator drop (/sign/drop): words, and optionally an envelope the passkey signs there
-  function openDropSheet() {
-    return openSheet("/sign/drop", "", "", "coordinator drop");
+  function openDropSheet(words) {
+    // the typed words reach the sheet through this tab's session storage (same origin, no length limit, never in the address);
+    // the sheet reads them once and removes them
+    // (set after openSheet, which closes any sheet first and so clears the key; the frame loads later than this returns;
+    // closeSignSheet and an edit of the box clear it again, so a sheet that never reads it leaves nothing behind)
+    const got = openSheet("/sign/drop", "", "", "coordinator drop");
+    if (got && typeof words === "string" && words) { try { window.sessionStorage.setItem(DROP_PREFILL_KEY, words); } catch (e) { /* the sheet opens empty */ } }
+    return got;
   }
-  // the drop card: shown only while /cockpit/coord/drops.json reads (a token, a Signer, a store that answers); the Send a drop
-  // button opens the sheet, which sends and signs nothing from this page
-  // the coordinator read goes through the shared bounded read queue and is held for a moment, as the dispatch read is: rapid
-  // redraws share one read
-  let dropRead = null, dropAt = 0, dropSlotNow = null;
-  function dropFetch(headers) {
-    if (dropRead && Date.now() - dropAt < PROPOSAL_TTL_MS) return dropRead;
+  function dropPrefillClear() { try { window.sessionStorage.removeItem(DROP_PREFILL_KEY); } catch (e) { /* nothing kept */ } }
+  // ---- the coordinator drop: a card on the home page (Phill 10-30), drawn under the Needs-you row, outside #ck-hero. An inline
+  // composer, not a button that opens a sheet. Send posts through /cockpit/coord/drop, the route the /sign/drop sheet posts to,
+  // with the same request (words, outbox_id, sent_at, store_id) and the same kept-before-posted rule; an envelope needs the
+  // passkey, which signs on the sheet only, so "Add an envelope" opens the sheet with the words.
+  const DROP_PREFILL_KEY = "levain-drop-prefill";
+  // one record per outbox id under the sheet's own prefix (a test holds both derivations equal), so a new drop never overwrites
+  // one whose answer is unknown
+  const dropPendKey = () => "levain-drop-pending:" + window.location.hostname;
+  const dropPendKeyOf = (id) => dropPendKey() + ":" + id;
+  const dropGrow = (t) => { const f = window.LevainCardFormat; if (f && typeof f.grow === "function") f.grow(t); };   // a programmatic value fires no input event
+  // every kept request, newest first (a record an earlier build kept under the bare key counts too)
+  const dropKeptAll = () => {
+    const seen = new Map();
+    let n = 0;
+    try { n = window.localStorage.length; } catch (e) { return []; }
+    const pre = dropPendKey();
+    for (let i = 0; i < n; i++) {
+      try {
+        const k = window.localStorage.key(i);
+        if (k !== pre && !(k && k.indexOf(pre + ":") === 0)) continue;
+        const v = JSON.parse(window.localStorage.getItem(k) || "null");      // one malformed value is skipped (left in place), never the scan
+        if (v && typeof v === "object" && typeof v.outbox_id === "string" && typeof v.words === "string" && !seen.has(v.outbox_id)) seen.set(v.outbox_id, v);   // the bare key and the :id key of one request count once
+      } catch (e) { /* this entry only */ }
+    }
+    return Array.from(seen.values()).sort((a, b) => String(b.sent_at || "").localeCompare(String(a.sent_at || "")));
+  };
+  // true when the request is kept; false when storage refuses (quota, disabled, a private window): the send goes on, and the
+  // request is held in the page (ui.req) for as long as it lives
+  const dropKeep = (req) => { try { window.localStorage.setItem(dropPendKeyOf(req.outbox_id), JSON.stringify(req)); return true; } catch (e) { return false; } };
+  const dropForget = (req) => {
+    try { window.localStorage.removeItem(dropPendKeyOf(req.outbox_id)); } catch (e) { /* nothing kept */ }
+    try {
+      const old = JSON.parse(window.localStorage.getItem(dropPendKey()) || "null");
+      if (old && old.outbox_id === req.outbox_id) window.localStorage.removeItem(dropPendKey());
+    } catch (e) { /* a malformed legacy value is left alone */ }
+  };
+  // what the sheet says of the envelope the reply carries
+  const dropHow = (req, b) => {
+    if (!req.envelope) return { text: "words only", ok: true };
+    const e = b && b.envelope;
+    return e && e.taken ? { text: "envelope " + String(e.envelope_id || "") + " taken", ok: true }
+      : { text: "envelope NOT taken: " + String((e && e.refused) || "no envelope in the reply"), ok: false };
+  };
+  const dropStamp = () => new Date().toISOString().replace(/\.(\d{3})Z$/, ".$1000Z");   // the store's fixed-width UTC form
+  const dropOutboxId = () => {
+    const b = new Uint8Array(16);
+    crypto.getRandomValues(b);
+    return "ph-" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  };
+  const DROP_RECENT_SHOWN = 3;
+  // the read goes through the shared bounded read queue and is held for a moment: rapid redraws share one read. Resolves to
+  // {body} or {why} (one line saying what is missing), never to nothing.
+  // A read that failed is held for DROP_FAIL_TTL_MS only. A render older than that drops the cache (renderKe), a drop filed on
+  // the sheet drops it (dropReload), and dropSeq / dropDrawn keep a late older answer from redrawing over a newer one.
+  const DROP_FAIL_TTL_MS = 3000;
+  let dropRead = null, dropAt = 0, dropTtl = PROPOSAL_TTL_MS, dropSeq = 0, dropDrawn = 0;
+  function dropFetch(headers, fresh) {
+    if (!fresh && dropRead && Date.now() - dropAt < dropTtl) return dropRead;
     dropAt = Date.now();
+    dropTtl = PROPOSAL_TTL_MS;
+    const failed = (g) => { if (dropRead === g) dropTtl = DROP_FAIL_TTL_MS; };
     const got = consentQueued(() => fetchBounded("/cockpit/coord/drops.json", { cache: "no-store", headers: headers },
-      (res) => (res.ok ? res.json().then((b) => (b && Array.isArray(b.coord_drops) ? b : null), () => null) : null),
-      () => null), "the drops could not be read").then((b) => {
-        if (!b || !Array.isArray(b.coord_drops)) { if (dropRead === got) dropRead = null; return null; }
-        return b;
-      });
+      (res) => {
+        if (res.status === 404) return { why: "This cockpit has no coordinator store to send to (no signing is set up here)." };
+        if (res.status === 403) return { why: "Sign in to send: this cockpit refused this browser's token." };
+        if (!res.ok) return { why: "The coordinator could not be read (HTTP " + res.status + ")." };
+        return res.json().then((b) => (b && Array.isArray(b.coord_drops) ? { body: b } : { why: "The coordinator's answer was not a drop list." }),
+                               () => ({ why: "The coordinator's answer could not be read." }));
+      },
+      () => ({ why: "The coordinator could not be reached." })), "the drops could not be read").then((r) => {
+        const out = r && (r.body || r.why) ? r : { why: ((r && r.error) || "The coordinator could not be read") + "." };
+        if (!out.body) failed(got);      // a failed read is asked again within seconds, not held for the TTL
+        return out;
+      }, () => { failed(got); return { why: "The coordinator could not be read." }; });
     dropRead = got;
     return got;
   }
-  function dropSlot() {
-    const slot = el("div", "coord-drop-slot");
+  function dropWhen(d) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(typeof d.sent_at === "string" ? d.sent_at : "");
+    return m ? m[2] + "-" + m[3] + " " + m[4] + ":" + m[5] + "Z" : "";
+  }
+  function dropRow(d) {
+    if (!d || typeof d !== "object") return null;      // one malformed entry is skipped, never the whole list
+    const row = el("div", "drop-recent-row");
+    row.dataset.dropId = typeof d.drop_id === "string" ? d.drop_id : "";
+    row.appendChild(el("span", "drop-when ext-meta", dropWhen(d)));
+    const first = typeof d.words === "string" ? d.words.split("\n")[0].slice(0, 100) : "";
+    row.appendChild(el("span", "drop-words-first", first));
+    const stages = Array.isArray(d.receipts) ? d.receipts.map((r) => r && r.stage).filter((x) => typeof x === "string") : [];
+    const how = d.envelope_id ? "signed" : d.envelope_refused ? "envelope not taken" : "unsigned";
+    row.appendChild(el("span", "drop-state ext-meta", how + " · " + (stages.join(", ") || "no receipt yet")));
+    return row;
+  }
+  function dropHeroBuild(host) {
+    const ui = { req: null, storeId: null, storeRead: false, can: false, shown: false, working: false, drops: [] };
+    const head = el("div", "needs-headline");
+    head.appendChild(el("h3", null, "Drop to the coordinator"));
+    ui.say = el("span", "needs-gloss drop-note", "");
+    head.appendChild(ui.say);
+    const words = el("textarea", "drop-words");
+    words.id = "ck-drop-words";
+    words.placeholder = "words for the coordinator";
+    words.setAttribute("aria-label", "your words for the coordinator");
+    words.addEventListener("input", dropPrefillClear);      // words changed since a handoff: that handoff is stale
+    const acts = el("div", "needs-actions drop-actions");
+    const send = el("button", "needs-btn needs-primary", "Send");
+    send.type = "button";
+    send.dataset.coordDrop = "send";
+    const env = el("button", "needs-btn", "Add an envelope");
+    env.type = "button";
+    env.dataset.coordDrop = "envelope";
+    env.title = "sign an envelope with your passkey: opens the drop sheet with these words";
+    acts.append(send, env);
+    ui.receipt = el("p", "drop-receipt ext-meta", "");
+    ui.receipt.setAttribute("role", "status");
+    ui.earlier = el("p", "drop-earlier ext-meta", "");
+    ui.recent = el("div", "drop-recent");
+    const main = el("div", "drop-main");      // the composer is one left-column element, so the card's grid has two children whatever the list's length
+    main.append(head, words, acts, ui.receipt, ui.earlier);
+    host.replaceChildren(main, ui.recent);
+    Object.assign(ui, { words, send, env });
+    // what is still unconfirmed besides the request in the box: each stays retryable through the same Send, one at a time,
+    // newest first (the next one comes into the box when the one in it is answered)
+    const earlierLine = () => {
+      const mine = ui.req ? ui.req.outbox_id : null;
+      const n = dropKeptAll().filter((r) => r.outbox_id !== mine).length;
+      const inBox = ui.fromKeep && ui.req && ui.req.words === words.value ? "The drop in the box was not confirmed earlier: send it again, unchanged, to find out. " : "";
+      ui.earlier.textContent = inBox + (n ? n + " earlier drop" + (n > 1 ? "s" : "") + " not confirmed." : "");
+    };
+    const resume = (msg) => {
+      const next = dropKeptAll()[0];
+      if (!next) return false;
+      words.value = next.words;
+      dropGrow(words);
+      ui.req = next;
+      ui.fromKeep = true;
+      if (msg) paint(msg, true);
+      return true;
+    };
+    ui.earlierLine = earlierLine;
+    const paint = (msg, bad) => { ui.receipt.textContent = msg; ui.receipt.classList.toggle("bad", !!bad); };
+    const lock = (on) => { ui.working = on; send.disabled = env.disabled = words.disabled = on || !ui.can; };
+    ui.paint = paint;
+    ui.lock = lock;
+    env.addEventListener("click", () => { if (ui.can) openDropSheet(words.value); });
+    send.addEventListener("click", () => {
+      if (ui.working || !ui.can) return;
+      if (ui.reading) { ui.reading.then(() => send.click()); return; }      // the read that names the store is still out
+      const w = words.value;
+      if (!w.trim()) { paint("Type your words first.", true); words.focus(); return; }
+      const t = window.LevainCockpitTransport;
+      const headers = Object.assign({}, t && typeof t.headers === "function" ? t.headers() : {}, { "Content-Type": "application/json" });
+      // the retained request (words, id, time, store, and an envelope a sheet attached) goes again as it was, so a send whose
+      // answer was lost files once; words edited since are a new drop with a new id
+      // (a new drop is kept under its own id: the one it replaces in the box stays kept, never overwritten)
+      if (!(ui.req && ui.req.words === w)) ui.fromKeep = false;
+      const req = ui.req && ui.req.words === w ? ui.req : { words: w, outbox_id: dropOutboxId(), sent_at: dropStamp(), store_id: ui.storeId };
+      ui.req = req;
+      const kept = dropKeep(req);
+      lock(true);
+      paint("Sending…", false);
+      const unsure = (why) => {
+        paint("Not sure the drop was delivered (" + why + "). Send again, unchanged, to find out."
+          + (kept ? "" : " This browser cannot keep it, so reloading before it is confirmed may send it twice."), true);
+        earlierLine();
+        lock(false);
+        // the drop may have made the store: new words must name it, so a send waits for this read (ui.reading)
+        const clear = () => { if (ui.reading === reading) ui.reading = null; };      // on both outcomes: a read that fails never leaves Send waiting
+        const reading = ui.reading = Promise.resolve().then(() => dropRefresh(host, true)).then(clear, clear);
+      };
+      fetchBounded("/cockpit/coord/drop", { method: "POST", cache: "no-store", headers: headers, body: JSON.stringify(req) },
+        (res) => res.json().then((b) => ({ status: res.status, ok: res.ok, body: b && typeof b === "object" ? b : {} }),
+                                 () => ({ status: res.status, ok: res.ok, body: {} })),
+        () => ({ status: 0, ok: false, body: {} })).then((a) => {
+        if (a.ok) {
+          dropForget(req);
+          ui.req = null;
+          if (typeof a.body.store_id === "string") ui.storeId = a.body.store_id;
+          const d = a.body.drop || {};
+          const first = w.split("\n")[0].trim().slice(0, 80) + (w.length > 80 || w.includes("\n") ? "…" : "");
+          const how = dropHow(req, a.body);
+          words.value = "";
+          words.style.height = "";
+          paint((a.body.created === false ? "Already delivered: " : "Sent to the coordinator: ") + "“" + first + "” · " + how.text + " · " + String(d.drop_id || ""), !how.ok);
+          resume();      // an earlier unconfirmed drop comes into the box, to send unchanged
+          earlierLine();
+          lock(false);
+          words.focus();
+          dropRefresh(host, true);
+        } else if (a.status >= 400 && a.status < 500) {
+          dropForget(req);     // refused: nothing was delivered with this request; the words stay
+          ui.req = null;
+          const m = typeof a.body.message === "string" && a.body.message ? a.body.message.replace(/[.\s]+$/, "") : "refused (HTTP " + a.status + ")";
+          paint("The drop was not delivered: " + m + ".", true);
+          earlierLine();
+          lock(false);
+        } else {
+          unsure(a.status ? "HTTP " + a.status : "no reply");
+        }
+      });
+    });
+    // a drop from an earlier visit whose answer never came: the newest is in the box, to send unchanged; any older stays kept
+    resume("A drop from earlier was not confirmed. Send it again, unchanged, to find out.");
+    earlierLine();
+    host._drop = ui;
+    host.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && ev.target === words) { ev.preventDefault(); send.click(); } });      // after the commit above, so a failed build leaves none
+    return ui;
+  }
+  // one draw of the drop card from one read; the box and its words are never rebuilt under the reader
+  function dropHeroDraw(host, r) {
+    const ui = host._drop;
+    const body = r && r.body ? r.body : null;
+    ui.storeRead = !!body && body.coord_store_read === true;
+    ui.storeId = body && typeof body.coord_store_id === "string" ? body.coord_store_id : null;
+    ui.can = ui.storeRead;
+    const note = !body ? (r && r.why) || "The coordinator could not be read."
+      : !ui.storeRead ? (typeof body.coord_note === "string" && body.coord_note ? body.coord_note : "Still reading which Levain answers here; reload.")
+      : typeof body.coord_note === "string" ? body.coord_note : "";
+    ui.say.textContent = note;
+    ui.say.classList.toggle("bad", !ui.can);
+    ui.send.disabled = ui.env.disabled = ui.words.disabled = ui.working || !ui.can;
+    host.classList.toggle("drop-off", !ui.can);
+    const drops = body ? body.coord_drops : [];
+    ui.drops = drops;
+    const rows = drops.map(dropRow).filter(Boolean);
+    const shown = ui.shown ? rows : rows.slice(0, DROP_RECENT_SHOWN);
+    const kids = shown.slice();
+    if (rows.length > DROP_RECENT_SHOWN) {
+      const more = el("button", "needs-history drop-more", ui.shown ? "show fewer" : "show " + (rows.length - DROP_RECENT_SHOWN) + " more");
+      more.type = "button";
+      more.addEventListener("click", () => { ui.shown = !ui.shown; dropHeroDraw(host, r); });
+      kids.push(more);
+    }
+    ui.recent.replaceChildren(...kids);
+  }
+  function dropRefresh(host, fresh) {
     const t = window.LevainCockpitTransport;
     const headers = t && typeof t.headers === "function" ? t.headers() : {};
-    if (!headers["X-Levain-Write-Token"]) return slot;
-    dropSlotNow = slot;
-    dropFetch(headers).then((b) => {
-        if (!b || slot !== dropSlotNow) return;     // only the slot the latest render made is filled; an older one is gone
-        const row = el("div", "row consent-row coord-drop-row");
-        const head = el("div", "consent-head");
-        head.appendChild(el("b", "consent-tool", "drop"));
-        head.appendChild(el("span", "ext-meta", b.coord_drops.length + " recent from the phone port or this cockpit"));
-        row.appendChild(head);
-        const acts = el("div", "needs-actions");
-        const btn = el("button", "needs-btn", "Send a drop");
-        btn.type = "button";
-        btn.dataset.coordDrop = "open";
-        btn.title = "send words to the coordinator, optionally with an envelope your passkey signs, in the sign sheet";
-        btn.addEventListener("click", () => openDropSheet());
-        acts.appendChild(btn);
-        row.appendChild(acts);
-        if (typeof b.coord_note === "string" && b.coord_note) row.appendChild(el("div", "consent-note ext-meta", b.coord_note));
-        slot.replaceChildren(el("div", "ext-grouphead", "coordinator drop"), row);
-      }).catch(() => {});
-    return slot;
+    if (!headers["X-Levain-Write-Token"]) {
+      dropHeroDraw(host, { why: "Sign in to send: this browser holds no cockpit token." });
+      return Promise.resolve();
+    }
+    const mine = ++dropSeq;
+    return dropFetch(headers, fresh).then((r) => {
+      if (!host.isConnected || mine < dropDrawn) return;      // a newer ask already drew: this older answer must not redraw over it
+      dropDrawn = mine;
+      dropHeroDraw(host, r);
+    }).catch(() => {});
+  }
+  // the drop card reads again now (a drop was filed on the sheet, which may have made the store)
+  function dropReload() {
+    dropRead = null;
+    const host = document.getElementById("ck-drop");
+    if (host && host._drop) dropRefresh(host, true);
+  }
+  // drawn on every KE render, whatever the read says: the drop card (under the Needs-you row, outside #ck-hero) is never silently absent
+  function renderDropHero() {
+    const host = document.getElementById("ck-drop");
+    if (!host) return;
+    for (const old of host.querySelectorAll(":scope > .ck-region-err")) old.remove();
+    const fresh = !host._drop;
+    if (fresh) dropHeroBuild(host);
+    host.hidden = false;
+    if (fresh) dropGrow(host._drop.words);      // restored words are sized once the box is laid out, not while the host was hidden
+    if (dropRead && Date.now() - dropAt >= DROP_FAIL_TTL_MS) dropRead = null;      // a render reads again once the last read is a few seconds old
+    dropRefresh(host, false);
   }
   const DISPATCH_VERB = { sign: "Sign", cancel: "Cancel job", authorise: "Authorise" };
   function dispatchCard(r) {
@@ -6730,7 +6976,7 @@
   // the Decisions history's standing-rule slots (and the dispatch jobs), drawn together wherever the proposals are
   function standingSlots() {
     const f = document.createDocumentFragment();
-    f.append(proposalSlot(), grantSlot(), dispatchSlot(), dropSlot());
+    f.append(proposalSlot(), grantSlot(), dispatchSlot());   // the drop is its own card under the Needs-you row (renderDropHero), not a slot here
     return f;
   }
 
@@ -7303,7 +7549,8 @@
   }
 
   // OS-3, the narrow page's strip: one tap goes to the phone view's content. Needs you, Board and Notifications are blocks on this
-  // page; Grants and Drop are drawn inside the Decisions view, so their tabs open it and take the reader to their own slot. That
+  // page, and so is Drop (the card under the Needs-you row: its tab scrolls there and focuses the box); Grants are drawn inside the
+  // Decisions view, so that tab opens it and takes the reader to its own slot. That
   // view fills as its reads answer (queued, each up to the fetch deadline), so the wait is for the POPULATED node, bounded by a
   // deadline a little past the read's own; a view with nothing to show (no standing grant, a read that failed) is left where the
   // slot is, or at its top when it has none.
@@ -7314,12 +7561,8 @@
   };
   const PHONE_JUMP_WAIT_MS = CONSENT_FETCH_TIMEOUT_MS + 5000, PHONE_JUMP_STEP_MS = 150, PHONE_JUMP_STEADY = 2;
   // `slot`: where the tab's section sits once it is drawn; `filled`: the same node once its read has filled it (the grants heading
-  // exists only with a grant under it; the drop slot exists empty from the first paint and holds its row after its read)
+  // exists only with a grant under it)
   function phoneJumpFind(which, overlay) {
-    if (which === "drop") {
-      const slot = overlay.querySelector(".coord-drop-slot");
-      return { slot: slot, filled: slot && slot.querySelector(".coord-drop-row") ? slot : null };
-    }
     const head = Array.from(overlay.querySelectorAll(".ext-grouphead")).find((h) => /standing grants/i.test(h.textContent)) || null;
     return { slot: head, filled: head };
   }
@@ -7349,7 +7592,18 @@
   }
   function phoneJump(which, opener) {
     const run = ++phoneJumpRun;
-    if (which === "grants" || which === "drop") {
+    if (which === "drop") {       // the drop is a card under the Needs-you row: the tab scrolls to its box, no view to open
+      const host = document.getElementById("ck-drop");
+      if (!host) return;
+      window.requestAnimationFrame(() => {
+        if (run !== phoneJumpRun) return;
+        host.scrollIntoView({ block: "start" });
+        const ta = host._drop && host._drop.words;
+        if (ta && !ta.disabled) ta.focus({ preventScroll: true });
+      });
+      return;
+    }
+    if (which === "grants") {
       if (!document.getElementById("levain-modal") && !openDecisionsHistory(opener)) return;
       const overlay = document.getElementById("levain-modal");
       // opening can close a view it could not build, which ends the run: the wait starts from the run as it stands once the view is up
