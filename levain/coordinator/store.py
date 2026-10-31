@@ -303,6 +303,21 @@ def migrate_reply_kinds(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def refresh_timeline_view(conn: sqlite3.Connection) -> bool:
+    """A ``chat_timeline`` view whose stored text predates ``coordinator_reply`` (its CASE has no arm for it, so a
+    threaded coordinator reply would read back with a NULL kind) is dropped and made again from the current
+    ``CHAT_SCHEMA`` statement. Runs in ``_ensure``'s transaction; True when it did. No view, or a current one: nothing."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'chat_timeline'").fetchone()
+    if row is None or "coordinator_reply" in row[0]:
+        return False
+    from levain.coordinator.chat import CHAT_SCHEMA
+
+    create = next(stmt for stmt in CHAT_SCHEMA if stmt.startswith("CREATE VIEW IF NOT EXISTS chat_timeline "))
+    conn.execute("DROP VIEW chat_timeline")
+    conn.execute(create)
+    return True
+
+
 def _dangling_after(conn: sqlite3.Connection, rebuilt: Sequence[str]) -> list[tuple]:
     """``PRAGMA foreign_key_check`` of the rebuilt tables and of every table whose foreign keys name one of them, and of
     nothing else: a dangling row elsewhere in the file is not this rebuild's and must not block it for ever."""
@@ -553,6 +568,7 @@ class CoordStore:
                     rebuilt.append("replies")
                 for stmt in self._statements():
                     conn.execute(stmt)
+                refresh_timeline_view(conn)
                 ensure_one_signature(conn)
                 _all_gseq(conn)
                 from levain.coordinator.lease import migrate_settings

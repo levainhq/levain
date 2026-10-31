@@ -38,6 +38,7 @@ __all__ = ["REPLY_MAX", "DropReply", "Unreplied", "VIEWER", "replies", "unreplie
 #: the operator's work cursor is the coordinator viewer's: the one the terminal reply's block advances
 VIEWER = "coordinator"
 REPLY_MAX = 4000
+UNREADABLE = "(unreadable body)"
 
 
 @dataclass(frozen=True)
@@ -55,20 +56,27 @@ class DropReply:
 
 
 def _band_text(directory: Any) -> str:
-    """The question band as the operator would read it now, rendered without taking a view (no cursor moves)."""
+    """The question band as the operator would read it now: no view recorded, no item numbered (an item with no number
+    yet reads ``new (number pending)``), so a reply that is refused has touched nothing."""
     try:
         from levain.band_view import render_full
         from levain.consent.questions import QuestionStore
 
-        return render_full(QuestionStore(directory)).text or ""
+        return render_full(QuestionStore(directory), numbering=False).text or ""
     except Exception:                                      # noqa: BLE001 - said in the block, never an empty claim
         return "NEEDS YOU: ! not read (the question band could not be read just now)"
 
 
 def _from_row(row: tuple[Any, ...]) -> DropReply:
     reply_id, ref_id, at, body, gseq = row
-    b = json.loads(body)
-    covers = b.get("covers") or {}
+    try:
+        b = json.loads(body)
+    except (TypeError, ValueError):
+        b = None
+    if not isinstance(b, dict):                  # a raw writer's row: shown, never allowed to hide the others
+        return DropReply(reply_id, ref_id, gseq, at, "", "", UNREADABLE, "", 0, 0)
+    covers = b.get("covers")
+    covers = covers if isinstance(covers, dict) else {}
     return DropReply(reply_id, ref_id, gseq, at, b.get("surface", ""), b.get("received_at", ""), b.get("text", ""),
                      b.get("block", ""), covers.get("after", 0), covers.get("through", 0))
 
@@ -125,13 +133,14 @@ class Unreplied(NamedTuple):
 
 
 def unreplied(conn: sqlite3.Connection, now: str, exclude: str | None = None) -> list[Unreplied]:
-    """Each drop with no coordinator reply that is past :data:`UNREPLIED_AFTER_MINUTES` and not older than
+    """Each drop sent from the cockpit or the phone (the terminal's words were answered in the session) with no
+    coordinator reply that is past :data:`UNREPLIED_AFTER_MINUTES` and not older than
     :data:`UNREPLIED_SHOWN_DAYS`, oldest first: ``closed`` once past the reply window, which stays on the line for the
     rest of those days (silence must not read as heard because a window ran out). ``now``: a store stamp. ``exclude``:
     a drop being answered right now. The one derivation the panel and the work delta both read."""
     rows = conn.execute(
         "SELECT d.drop_id, d.surface, d.received_at, (julianday(?) - julianday(d.received_at)) * 24 > ? "
-        "FROM drops d WHERE NOT EXISTS (SELECT 1 FROM replies r WHERE "
+        "FROM drops d WHERE d.surface != 'cli' AND NOT EXISTS (SELECT 1 FROM replies r WHERE "
         "r.kind = 'coordinator_reply' AND r.ref_store = 'drops' AND r.ref_id = d.drop_id) AND d.drop_id IS NOT ? "
         "AND (julianday(?) - julianday(d.received_at)) * 1440 > ? "
         "AND (julianday(?) - julianday(d.received_at)) <= ? ORDER BY d.rowid",

@@ -50,12 +50,12 @@ def _cli(qdir, drop_id, text, token, capsys, *extra):
     return code, cap.out, cap.err
 
 
-def _insert(qdir, drop_id, at, kind="coordinator_reply", ref_store="drops"):
+def _insert(qdir, drop_id, at, kind="coordinator_reply", ref_store="drops", body="{}"):
     c = sqlite3.connect(qdir / "dispatch.db")
     try:
         c.execute("INSERT INTO replies (reply_id, thread_id, kind, ref_store, ref_id, body, at, gseq) "
-                  "VALUES (?, NULL, ?, ?, ?, '{}', ?, (SELECT COALESCE(MAX(gseq), 0) + 1 FROM replies))",
-                  (f"rp-{abs(hash((drop_id, at, kind))):x}", kind, ref_store, drop_id, at))
+                  "VALUES (?, NULL, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(gseq), 0) + 1 FROM replies))",
+                  (f"rp-{abs(hash((drop_id, at, kind))):x}", kind, ref_store, drop_id, body, at))
         c.commit()
     finally:
         c.close()
@@ -440,3 +440,111 @@ def test_the_panel_shows_the_reply_with_its_frozen_block_and_the_unreplied_drop_
     assert f"noreply:{replied}" not in rows
     early = status_reader(lambda: qdir, lambda: NOW + timedelta(minutes=2))(ReadContext(NOW))
     assert not any(r.id.startswith("noreply:") for r in early.rows)       # inside the quiet minutes: no line yet
+
+
+# ---------------------------------------------------------------------------------------------- r2 review fixes
+def _old_view(qdir) -> None:
+    """Put the chat_timeline view back to the text of a store from before ``coordinator_reply``."""
+    c = sqlite3.connect(qdir / "dispatch.db", isolation_level=None)
+    try:
+        sql = c.execute("SELECT sql FROM sqlite_master WHERE name = 'chat_timeline'").fetchone()[0]
+        old = sql.replace(" WHEN 'coordinator_reply' THEN 'reply_coordinator'", "")
+        assert old != sql
+        c.execute("DROP VIEW chat_timeline")
+        c.execute(old)
+    finally:
+        c.close()
+
+
+def test_an_old_view_is_made_current_when_the_replies_table_is_rebuilt(qdir, store) -> None:
+    d = _drop(store)
+    (thread,) = store.split(d, [Part(kind="work", title="t")], by="operator")
+    ChatStore(EnvelopeStore(qdir))._connect().close()
+    _downgrade(qdir)
+    _old_view(qdir)
+    upgraded = CoordStore(qdir)                                # no ChatStore opens: only the coordinator store runs
+    drop_reply.write_reply(upgraded, d, "on it", token=upgraded.coord_take())
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        kinds = [r[0] for r in c.execute("SELECT kind FROM chat_timeline WHERE thread_id = ?", (thread.thread_id,))]
+    finally:
+        c.close()
+    assert "reply_coordinator" in kinds and None not in kinds
+
+
+def test_an_old_view_over_a_current_replies_table_is_made_current_too(qdir, store) -> None:
+    d = _drop(store)
+    store.split(d, [Part(kind="work", title="t")], by="operator")
+    ChatStore(EnvelopeStore(qdir))._connect().close()
+    _old_view(qdir)
+    CoordStore(qdir).coord_take()
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        assert "coordinator_reply" in c.execute("SELECT sql FROM sqlite_master WHERE name = 'chat_timeline'").fetchone()[0]
+    finally:
+        c.close()
+
+
+def test_every_reply_kind_maps_in_the_one_sql_fragment_and_has_a_label_in_the_thread_view() -> None:
+    from pathlib import Path
+
+    import levain
+    from levain.coordinator.chat import REPLY_KIND_CASE
+
+    js = (Path(levain.__file__).parent / "templates" / "web" / "thread_view.js").read_text()
+    c = sqlite3.connect(":memory:")
+    for kind in REPLY_KINDS:
+        (mapped,) = c.execute("SELECT " + REPLY_KIND_CASE.format(col="'" + kind + "'")).fetchone()
+        assert mapped is not None, kind
+        assert f"{mapped}:" in js, kind
+
+
+def test_a_refused_reply_numbers_nothing_in_the_band(qdir, store, token) -> None:
+    from levain.consent.questions import QuestionStore
+
+    d = _drop(store)
+    QuestionStore(qdir).file(agent="claude_code", agent_session_id="s", what="Which?", options=(("a", "A"), ("b", "B")), rec="a",
+                             blocks="x", cwd="/tmp")
+
+    def numbered() -> int:
+        c = sqlite3.connect(qdir / "questions.db")
+        try:
+            return c.execute("SELECT count(*) FROM band_items").fetchone()[0] if c.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'band_items'").fetchone() else 0
+        finally:
+            c.close()
+
+    assert numbered() == 0
+    with pytest.raises(CoordError):
+        drop_reply.write_reply(store, d, "x", token=token + 1)
+    assert numbered() == 0
+
+
+def test_a_drop_typed_in_the_terminal_is_never_unreplied(qdir) -> None:
+    store, _box = _clocked(qdir, NOW)
+    _drop(store, "from the terminal", surface="cli")
+    phone = _drop(store, "from the phone", surface="phone")
+    cockpit = _drop(store, "from the cockpit", surface="cockpit")
+    for late in (NOW + timedelta(minutes=UNREPLIED_AFTER_MINUTES + 1), NOW + timedelta(hours=REPLY_WINDOW_HOURS + 1)):
+        c = sqlite3.connect(qdir / "dispatch.db")
+        try:
+            assert {u.drop_id for u in drop_reply.unreplied(c, _stamp(late))} == {phone, cockpit}
+        finally:
+            c.close()
+
+
+def test_a_malformed_reply_body_is_shown_unreadable_and_hides_no_other_reply(qdir) -> None:
+    store, _box = _clocked(qdir, NOW)
+    token = store.coord_take()
+    good, bad, notobj = _drop(store, "a"), _drop(store, "b"), _drop(store, "c")
+    drop_reply.write_reply(store, good, "fine", token=token)
+    _insert(qdir, bad, _stamp(NOW), body="not json")
+    _insert(qdir, notobj, _stamp(NOW), body="[1]")
+    conn = store.open_readonly()
+    try:
+        got = {r.drop_id: r for r in drop_reply.replies(conn)}
+    finally:
+        conn.close()
+    assert set(got) == {good, bad, notobj}
+    assert got[good].text == "fine"
+    assert got[bad].text == got[notobj].text == "(unreadable body)"
