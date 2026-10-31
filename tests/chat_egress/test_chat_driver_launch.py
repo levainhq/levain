@@ -321,8 +321,8 @@ def test_one_ca_per_service_and_the_default_srt_prefix_reach_every_start(tmp_pat
     calls = []
     monkeypatch.setattr(lm, "start_egress", lambda **kw: calls.append(kw) or SimpleNamespace(launch_id=kw["launch_id"]))
     svc = cd.ChatEgressService(state_dir=tmp_path / "state", store=_store(), queue_dir=tmp_path / "q", now=NOW)
-    a = svc.launch(**_launch_kw(tmp_path, "L1"))
-    b = svc.launch(**_launch_kw(tmp_path, "L2"))
+    a = svc.launch(**_launch_kw(tmp_path, "L1"), now=NOW)     # the service minted its CA at NOW: the wall clock would re-mint
+    b = svc.launch(**_launch_kw(tmp_path, "L2"), now=NOW)
     assert minted == [1] and [c["launch_id"] for c in calls] == ["L1", "L2"]
     assert calls[0]["ca_pem"] == calls[1]["ca_pem"] == svc.ca.glue_pem()
     assert b"PRIVATE KEY" in calls[0]["ca_pem"]
@@ -467,8 +467,8 @@ def test_the_renew_ping_reads_the_settings_of_the_harness_that_drives_the_chat(t
     calls = []
     monkeypatch.setattr(lm, "start_egress", lambda **kw: calls.append(kw) or SimpleNamespace(launch_id=kw["launch_id"]))
     svc = cd.ChatEgressService(state_dir=tmp_path / "state", store=_store(), queue_dir=q, now=NOW)
-    svc.launch(**{**_launch_kw(tmp_path, "L1"), "harness": "codex"})
-    svc.launch(**{**_launch_kw(tmp_path, "L2"), "harness": "claude-code"})
+    svc.launch(**{**_launch_kw(tmp_path, "L1"), "harness": "codex"}, now=NOW)
+    svc.launch(**{**_launch_kw(tmp_path, "L2"), "harness": "claude-code"}, now=NOW)
     calls[0]["on_renew_due"]("L1", [_due("k-codex", "a.example", 1)])
     calls[1]["on_renew_due"]("L2", [_due("k-claude", "b.example", 1)])
     codex_lines, claude_lines = _wait_lines(codex_got, 1), _wait_lines(claude_got, 1)
