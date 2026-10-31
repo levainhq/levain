@@ -6,6 +6,19 @@
 //                                            carries "may_timeout": true, which collects {"timeout": ...} instead
 //   {"posts": <n>, "ms": <n>}                waits until n POSTs have been sent; fewer by the deadline FAILS the drive
 //                                            (same rule and same "may_timeout": true opt-out as `until`)
+//   {"do": "<expr>", "until": "<expr>", "ms": <n>, "every": <m>}   act until: runs `do`, polls the condition every 100 ms, and
+//   {"do": "<expr>", "posts": <n>, "ms": <n>, "every": <m>}        runs `do` AGAIN every `every` ms (default 1500) while the condition
+//                                            is false, until the deadline. For an action whose effect can be lost (a click on a node a repaint
+//                                            replaced, a click before the handler is bound): the action is retried together with its assertion.
+//                                            Only for an action that is safe to repeat. A throw inside `do` is retried, and the last one is named
+//                                            in the failure message. Fails, and opts out with "may_timeout", exactly as `until` / `posts` do;
+//                                            the `until` form collects the condition's value, the `posts` form collects nothing.
+// An `eval` that throws (a null element, a syntax error, a rejected promise) FAILS the drive: stderr names the step and the error, and
+// the timeout-step-<n> files are saved as for a wait. A step that expects the error carries "may_error": true, and then the
+// error is collected as {"error": "..."} in place of a value.
+// Every deadline here (`ms` of until / posts / act-until / shot, the 20000 default, the page-load gate) is multiplied by the
+// LEVAIN_TEST_WAIT_SCALE environment variable (a float, default 1; a value below 1 counts as 1), so a slow runner is one setting.
+// The fixed settle sleeps (emulate / scheme / motion / key) are not scaled.
 // A failing wait also saves timeout-step-<n>.png (+ .txt, the page text) beside the steps file and names it on stderr.
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
@@ -31,6 +44,9 @@ import { createServer } from "node:net";
 const [chromePath, url, stepsPath] = process.argv.slice(2);
 const steps = JSON.parse(readFileSync(stepsPath, "utf8"));
 const media = {};   // the emulated media features set so far: each setEmulatedMedia call replaces the whole list
+// the one environment scale for every deadline (never below 1: a fast machine does not shorten what a test asked for)
+const WAIT_SCALE = Math.max(1, parseFloat(process.env.LEVAIN_TEST_WAIT_SCALE ?? "") || 1);
+const scaled = (ms) => Math.round(ms * WAIT_SCALE);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
 const prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
@@ -95,7 +111,7 @@ const evaluate = async (expression) => {
   return "error" in o ? { error: o.error } : o.value;
 };
 // Page.navigate returns at commit: wait (bounded) for the load before the first step, or an early shot sees a blank page
-for (const end = Date.now() + 15000; Date.now() < end;) {
+for (const end = Date.now() + scaled(15000); Date.now() < end;) {
   if (await evaluate("document.readyState") === "complete") break;
   await sleep(100);
 }
@@ -117,7 +133,8 @@ const shotOnTimeout = async (n) => {
 };
 let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)
 for (const s of steps) {
-  const deadline = Date.now() + (s.ms || 20000);
+  const waitMs = scaled(s.ms || 20000);
+  const deadline = Date.now() + waitMs;
   if (s.authenticator !== undefined) {
     await send("WebAuthn.enable", { enableUI: false });
     const made = await send("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal",
@@ -162,10 +179,37 @@ for (const s of steps) {
     if (!r.result?.data) throw new Error("screenshot failed: " + JSON.stringify(r.error || r.result));
     writeFileSync(s.shot, Buffer.from(r.result.data, "base64"));
     values.push({ shot: s.shot });
+  } else if (s.do !== undefined) {
+    // act until: the action is repeated with its assertion (see the header); one poll slice bounds an action that never answers
+    const every = s.every || 1500, n = steps.indexOf(s);
+    const slice = () => Math.min(Math.max(deadline - Date.now(), 250), 3000);
+    let v = null, lastError = null, lastDoError = null, nextDo = 0, ran = 0;
+    for (;;) {
+      if (Date.now() >= nextDo) {
+        const a = await evaluateOutcome(s.do, slice());
+        ran++; if ("error" in a) lastDoError = a.error;
+        nextDo = Date.now() + every;
+      }
+      if (s.posts !== undefined) v = posts.length >= s.posts;
+      else {
+        const o = await evaluateOutcome(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`, slice());
+        if ("error" in o) { lastError = o.error; v = null; } else v = o.value;
+      }
+      if (v || Date.now() >= deadline) break;
+      await sleep(100);
+    }
+    if (!v && !s.may_timeout) {
+      console.error(`step ${n}: ${s.posts !== undefined ? `posts never reached ${s.posts}` : `until never came true`} within ${waitMs}ms ` +
+        `after the action ran ${ran} time(s)` + (s.posts !== undefined ? ` (saw ${posts.length})` : `: ${s.until}`) +
+        (lastDoError ? ` (last error from the action: ${lastDoError})` : "") + (lastError ? ` (last error: ${lastError})` : ""));
+      await shotOnTimeout(n);
+      done(1); await sleep(10000);
+    }
+    if (s.posts === undefined) values.push(v || { timeout: s.until });
   } else if (s.posts !== undefined) {
     while (posts.length < s.posts && Date.now() < deadline) await sleep(100);
     if (posts.length < s.posts && !s.may_timeout) {
-      console.error(`step ${steps.indexOf(s)}: posts never reached ${s.posts} within ${s.ms || 20000}ms (saw ${posts.length})`);
+      console.error(`step ${steps.indexOf(s)}: posts never reached ${s.posts} within ${waitMs}ms (saw ${posts.length})`);
       await shotOnTimeout(steps.indexOf(s));
       done(1); await sleep(10000);
     }
@@ -182,14 +226,20 @@ for (const s of steps) {
       await sleep(100);
     }
     if (!v && !s.may_timeout) {
-      console.error(`step ${steps.indexOf(s)}: until never came true within ${s.ms || 20000}ms: ${s.until}` +
+      console.error(`step ${steps.indexOf(s)}: until never came true within ${waitMs}ms: ${s.until}` +
         (lastError ? ` (last error: ${lastError})` : ""));
       await shotOnTimeout(steps.indexOf(s));
       done(1); await sleep(10000);
     }
     values.push(v || { timeout: s.until });
   } else {
-    values.push(await evaluate(s.eval));
+    const o = await evaluateOutcome(s.eval);
+    if ("error" in o && !s.may_error) {
+      console.error(`step ${steps.indexOf(s)}: eval failed: ${o.error}: ${s.eval}`);
+      await shotOnTimeout(steps.indexOf(s));
+      done(1); await sleep(10000);
+    }
+    values.push("error" in o ? { error: o.error } : o.value);
   }
 }
 process.stdout.write(JSON.stringify({ values, posts, dialogs }));
