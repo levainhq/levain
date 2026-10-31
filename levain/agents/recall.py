@@ -54,13 +54,25 @@ def _metadata_of(ep: Any) -> Mapping | None:
     if isinstance(meta, str):
         try:
             meta = json.loads(meta)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise ValueError("metadata is not JSON") from None
     if meta is None:
         return None
     if not isinstance(meta, Mapping):
         raise ValueError("metadata is not a mapping")
     return meta
+
+
+def _checked(agent: str, window_days: Any, limit: Any, max_scan: Any, now: Any) -> datetime:
+    """Every argument check, in one place for both entry points; returns the window's end in UTC."""
+    episode_identity(agent, "x")  # validates the agent id's shape; the run is a placeholder
+    for v in (window_days, limit, max_scan):
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            raise ValueError("window_days, limit and max_scan must each be an integer of at least 1")
+    end = now if now is not None else datetime.now(timezone.utc)
+    if not isinstance(end, datetime) or end.tzinfo is None:
+        raise ValueError("now must be a timezone-aware datetime")
+    return end.astimezone(timezone.utc)
 
 
 def recall_agent_episodes(
@@ -74,14 +86,7 @@ def recall_agent_episodes(
 ) -> AgentRecall:
     """Recall ``agent``'s episodes from an open anneal ``Store`` (read-only is enough). ``now`` must be
     timezone-aware (any zone; it is converted to UTC): a naive one is refused, not guessed at."""
-    episode_identity(agent, "x")  # validates the agent id's shape; the run is a placeholder
-    if (not isinstance(window_days, int) or isinstance(window_days, bool) or window_days < 1
-            or limit < 1 or max_scan < 1):
-        raise ValueError("window_days, limit and max_scan must each be an integer of at least 1")
-    end = now if now is not None else datetime.now(timezone.utc)
-    if not isinstance(end, datetime) or end.tzinfo is None:
-        raise ValueError("now must be a timezone-aware datetime")
-    end = end.astimezone(timezone.utc)
+    end = _checked(agent, window_days, limit, max_scan, now)
     since = (end - timedelta(days=window_days)).strftime(_STAMP)
     until = end.strftime(_STAMP)
     res = store.recall(since=since, until=until, limit=max_scan)
@@ -106,6 +111,8 @@ def recall_agent_episodes_at(episodic_path: Path, agent: str, **kwargs: Any) -> 
     from anneal_memory import Store
 
     path = Path(episodic_path)
+    _checked(agent, kwargs.get("window_days", DEFAULT_WINDOW_DAYS), kwargs.get("limit", DEFAULT_LIMIT),
+             kwargs.get("max_scan", DEFAULT_MAX_SCAN), kwargs.get("now"))
     if not path.exists():
         return AgentRecall(episodes=(), scanned=0, truncated=False)
     with Store(path, read_only=True) as store:

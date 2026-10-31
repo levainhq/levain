@@ -1,6 +1,7 @@
 """P4: episode identity stamped at capture, and per-agent recall read back from a shared store."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -164,6 +165,7 @@ def _insert_between_pages(monkeypatch, db):
         return out
 
     monkeypatch.setattr(Store, "recall", wrapped)
+    return state
 
 
 def test_k3_a_writer_between_reads_never_duplicates(tmp_path, monkeypatch):
@@ -171,12 +173,28 @@ def test_k3_a_writer_between_reads_never_duplicates(tmp_path, monkeypatch):
     fa = AnnealFiring(episodic_path=db, identity={"agent": A, "run": "r1"})
     for i in range(12):
         _cap(fa, f"a{i}")
-    monkeypatch.setattr(recall_mod, "_PAGE", 5, raising=False)  # the old paged read; unused by the one-snapshot read
-    _insert_between_pages(monkeypatch, db)
+    calls = _insert_between_pages(monkeypatch, db)
     got = recall_agent_episodes_at(db, A, limit=50).episodes
     ids = [e.id for e in got]
     assert len(ids) == len(set(ids))
     assert [e.content for e in got] == [f"a{i}" for i in range(11, -1, -1)]
+    assert calls["n"] == 1                                  # one snapshot: a paged read would query again
+    assert "recorded mid-scan" not in [e.content for e in got]
+
+
+def test_r2_bad_arguments_refused_on_both_entry_points_and_deep_metadata_is_unreadable(tmp_path):
+    missing = tmp_path / "nowhere.db"
+    for bad in ({"limit": 0}, {"limit": 2.5}, {"max_scan": True}, {"window_days": "3"}):
+        with pytest.raises(ValueError):
+            recall_agent_episodes_at(missing, A, **bad)
+    db = _store_path(tmp_path)
+    fa = AnnealFiring(episodic_path=db, identity={"agent": A, "run": "r1"})
+    _cap(fa, "kept")
+    deep = json.dumps("[" * 5000 + "]" * 5000)          # a double-encoded string nested past the parser's limit
+    with _raw_store(db) as st:
+        st.record("deep", "observation", source="t", metadata=deep)
+    got = recall_agent_episodes_at(db, A)
+    assert [e.content for e in got.episodes] == ["kept"] and got.unreadable >= 1
 
 
 def test_k4_window_is_bounded_on_both_ends(tmp_path):
