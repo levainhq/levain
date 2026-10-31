@@ -21,6 +21,7 @@ from levain.coordinator.first_reader import FIRST_READER_SCHEMA
 from levain.coordinator.lease import LAUNCH_KINDS, LEASE_KINDS, LEASE_SCHEMA
 from levain.coordinator.ready import LIFECYCLE_SCHEMA
 from levain.coordinator.review import REVIEW_SCHEMA
+from levain.coordinator.seam_handoffs import SEAM_HANDOFF_SCHEMA
 from levain.coordinator.store import GSEQ_TABLES, SCHEMA, SEAM_SCHEMA
 from levain.coordinator.teamdrafts import DRAFT_SCHEMA
 from levain.coordinator.work_delta import OPERATOR_VIEWS_SCHEMA
@@ -63,7 +64,7 @@ def test_the_classes_do_not_overlap() -> None:
 def test_every_table_of_the_maximal_database_is_in_exactly_one_class(maximal: Path) -> None:
     tables = _tables(maximal)
     assert "sqlite_sequence" in tables and sc.EXEMPT["sqlite_sequence"] == "SQLite's own"
-    assert len(tables) == 56 and len(set(tables)) == 56           # 54 of the census, SQLite's own, and S0's bounds table
+    assert len(tables) == 57 and len(set(tables)) == 57           # 54 of the census, SQLite's own, S0's bounds table and S1's handoffs
     # `_r4` is the transient name of the review events' rebuild: gone by commit, so a finished store holds none
     assert not [t for t in tables if t.endswith("_r4")]
     known = sc.COUNTED | sc.INFRASTRUCTURE | set(sc.EXEMPT)
@@ -132,6 +133,7 @@ _DISPATCH_DB_LISTS = {
     "teamdrafts.DRAFT_SCHEMA": DRAFT_SCHEMA, "review.REVIEW_SCHEMA": REVIEW_SCHEMA,
     "first_reader.FIRST_READER_SCHEMA": FIRST_READER_SCHEMA, "ready.LIFECYCLE_SCHEMA": LIFECYCLE_SCHEMA,
     "work_delta.OPERATOR_VIEWS_SCHEMA": OPERATOR_VIEWS_SCHEMA, "store.SEAM_SCHEMA": SEAM_SCHEMA,
+    "seam_handoffs.SEAM_HANDOFF_SCHEMA": SEAM_HANDOFF_SCHEMA,
     "envelopes.ENVELOPE_SCHEMA": ENVELOPE_SCHEMA, "chat.CHAT_SCHEMA": CHAT_SCHEMA,
     "chat_egress.EGRESS_SCHEMA": EGRESS_SCHEMA,
 }
@@ -147,12 +149,13 @@ def _declared(statements: tuple[str, ...]) -> list[tuple[str, str]]:
 
 
 def test_the_name_scan_reads_every_statement_and_catches_a_seeded_duplicate() -> None:
-    # the lists as measured: every statement names an object (239 in all), so the scan below skips nothing
+    # the lists as measured: every statement names an object (247 in all), so the scan below skips nothing
     assert {k: (len(v), len(_declared(v))) for k, v in _DISPATCH_DB_LISTS.items()} == {
         "dispatch.jobs._SCHEMA": (57, 57), "store.SCHEMA": (25, 25), "lease.LEASE_SCHEMA": (29, 29),
         "teamdrafts.DRAFT_SCHEMA": (9, 9), "review.REVIEW_SCHEMA": (15, 15),
         "first_reader.FIRST_READER_SCHEMA": (16, 16), "ready.LIFECYCLE_SCHEMA": (10, 10),
         "work_delta.OPERATOR_VIEWS_SCHEMA": (4, 4), "store.SEAM_SCHEMA": (4, 4),
+        "seam_handoffs.SEAM_HANDOFF_SCHEMA": (8, 8),
         "envelopes.ENVELOPE_SCHEMA": (12, 12), "chat.CHAT_SCHEMA": (52, 52), "chat_egress.EGRESS_SCHEMA": (6, 6)}
     # IF NOT EXISTS hides a second declaration from the database: the scan must see it in the source
     assert _declared(("CREATE TABLE IF NOT EXISTS replies (a)", "CREATE UNIQUE INDEX IF NOT EXISTS i ON t (a)",

@@ -52,6 +52,8 @@ EXEMPT: dict[str, str] = {
     "sqlite_sequence": "SQLite's own",
     "gseq_migration_bounds": "C15's own table (S0): the largest rowid each migrated table held when it was first "
                              "migrated; it records the migration, it is not a record of the work",
+    "seam_handoffs": "the seam tables are the cut itself (C15 S1): a handoff records a seam, it is not work the next "
+                     "open reports as having happened since you left",
     **{name: _DISPATCH for name in (
         "artifact_take_failures", "artifact_takes", "authorise_signatures", "cancel_signatures", "event_cursor",
         "handoffs", "job_envelopes", "job_filers", "job_threads", "jobs", "meta", "run_records", "signatures",

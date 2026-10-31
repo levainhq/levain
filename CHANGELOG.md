@@ -695,6 +695,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   unit stays down after a wrong-user exit (77) instead of restarting every few seconds. Its lockfile is created 0600
   under any umask. It launches no dispatch runs yet.
 
+### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- Groundwork for seam handoffs: the coordinator store gains an append-only `seam_handoffs` table and one lease-fenced writer for it, so a coordinator can leave a handoff (state, work in flight, next step, contingencies) at a rotation, an operator leave or a dream. A retry of the same request returns the stored handoff, and a late close behind a newer one is refused. Nothing calls it yet, so there is no change you can see. A store from before this is brought up to date the first time it is opened for writing, keeping every row it had.
+
 ## [0.11.26] — 2026-10-25
 
 ### Added
