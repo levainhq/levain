@@ -2908,3 +2908,50 @@ body.ke .ck-drop .drop-more { align-self: flex-start; margin-top: var(--sp-3); }
   body.ke .ck-drop .needs-btn { min-height: var(--hit-min); }
   body.ke .ck-drop .drop-actions .needs-btn { flex: 1 1 0; }
 }
+
+/* The envelope form (sign.js drop sheet). Inside the cockpit's modal the page IS the modal body: no card, no brand line, the full
+   width, two columns from 760px and one below it. Opened on its own (the phone) it is the card, in one column. */
+.env-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-5); margin: 0 0 var(--sp-4); }
+.env-col { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }
+.env-group { margin: 0; padding: 0; border: 0; min-width: 0; }
+.env-label { padding: 0; margin: 0 0 var(--sp-2); font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); }
+.env-group > .env-hint, .env-field .env-hint, .env-other .env-hint { margin: 0 0 var(--sp-3); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--meta); }
+.pair-card .env-hint { margin: 0 0 var(--sp-3); font-size: var(--fs-meta); color: var(--meta); }
+.env-err { margin: 0 0 var(--sp-3); color: var(--bad); font: var(--fw-semibold) var(--fs-meta)/1.5 var(--sans); overflow-wrap: anywhere; }
+.pair-card .env-err { font-size: var(--fs-meta); color: var(--bad); }
+.env-err[hidden], .env-other[hidden], .env-custom[hidden], .env-keybox[hidden] { display: none; }
+.env-opts { display: flex; flex-direction: column; gap: var(--sp-2); }
+.env-opt { display: flex; align-items: flex-start; gap: var(--sp-3); min-height: 36px; box-sizing: border-box; padding: var(--sp-2) var(--sp-4); background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); cursor: pointer; color: var(--text); font: var(--fw-regular) var(--fs-body)/1.4 var(--sans); }
+.env-opt:has(input:checked) { border-color: var(--label); background: var(--card-2); }
+.env-opt input { flex: none; margin: 2px 0 0; }
+@media (pointer: coarse) { .env-opt { min-height: var(--hit-min); padding: var(--sp-3) var(--sp-4); } }
+body.sheet-embedded #drop-words { min-height: 7em; }
+.env-opt-t { display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
+.env-opt-name { font-weight: var(--fw-semibold); }
+.env-other { margin: var(--sp-3) 0 0; }
+.env-group input[type=text], .env-group input[type=number], .env-group select { display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box; min-height: var(--hit-min); padding: var(--sp-3) var(--sp-4); font-size: 16px; color: var(--text); background: var(--bg); border: 1px solid var(--hair-2); border-radius: var(--r-md); font-family: var(--sans); }
+.env-seg { display: flex; gap: var(--sp-2); padding: 3px; background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); }
+.env-seg-btn { flex: 1 1 0; min-height: var(--hit-min); padding: var(--sp-2) var(--sp-3); font: var(--fw-semibold) var(--fs-body)/1 var(--sans); color: var(--label); background: none; border: 1px solid transparent; border-radius: var(--r-sm); cursor: pointer; }
+.env-seg-btn[aria-checked=true] { color: var(--text); background: var(--card-2); border-color: var(--label); }
+.env-seg-btn:disabled { opacity: .5; cursor: default; }
+.env-custom { display: flex; flex-direction: column; gap: var(--sp-3); margin: 0 0 var(--sp-3); }
+.env-field { display: flex; flex-direction: column; gap: var(--sp-1); }
+.env-flabel { font: var(--fw-semibold) var(--fs-meta) var(--sans); color: var(--text); }
+.env-summary { margin: 0; padding: var(--sp-4); background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); min-height: 4em; }
+.env-summary.env-wait { color: var(--meta); font-family: var(--sans); }
+.env-keybox { display: flex; flex-direction: column; gap: var(--sp-1); }
+.env-col > .pair-actions { margin: 0; }
+.env-col > #sheet-note { margin: 0; }
+.sheet-embedded.pair-body { display: block; min-height: 0; padding: 0; background: transparent; }
+.sheet-embedded .pair-card { width: 100%; max-width: none; box-sizing: border-box; border: 0; border-radius: 0; background: transparent; padding: var(--sp-5) var(--sp-6) var(--sp-6); }
+.sheet-embedded .pair-brand, .sheet-embedded #sheet-title { display: none; }
+@media (min-width: 760px) {
+  .sheet-embedded .env-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--sp-6); }
+}
+@media (max-width: 759px) {
+  .sheet-embedded .pair-card { padding: var(--sp-4); }
+}
+/* the cockpit's modal for this sheet: wide on a laptop, and the frame is its body (the sheet's page scrolls itself, never a box in a box) */
+.modal.modal-sheet { width: min(1100px, 100%); height: min(92vh, 860px); max-height: 92vh; }
+.modal.modal-sheet > iframe { flex: 1 1 auto; min-height: 0; }
+@media (max-width: 760px) { .modal.modal-sheet { height: 100dvh; max-height: 100dvh; } }
