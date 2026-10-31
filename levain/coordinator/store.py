@@ -72,6 +72,9 @@ REPLY_KINDS = ("drop_receipt", "sign", "answer", "know", "coordinator_reply")
 REPLY_WINDOW_HOURS = 24
 #: C11 S4: a drop with no coordinator reply after this many minutes shows the "no reply yet" line (derived, never stored)
 UNREPLIED_AFTER_MINUTES = 10
+#: C11 S4: a drop that never got a reply keeps showing (as "no reply, window closed") this many days after the drop, then
+#: ages out; the end of the reply window must not make the silence disappear
+UNREPLIED_SHOWN_DAYS = 7
 _REVISION_CAUSES = ("split", "attach", "resplit", "rescope")
 _EVENT_FIELDS = ("state", "kind", "title", "repo")
 

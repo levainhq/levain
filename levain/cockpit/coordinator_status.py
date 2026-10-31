@@ -105,8 +105,8 @@ def _reply_rows(data: dict[str, Any] | None) -> list[RowIn]:
 
     if not data:
         return []
-    rows = [_row(f"noreply:{d}", "No reply yet", drop_reply.unreplied_line(d, surface, at))
-            for d, surface, at in data["unreplied"]]
+    rows = [_row(f"noreply:{u.drop_id}", "No reply, window closed" if u.closed else "No reply yet", drop_reply.unreplied_line(u))
+            for u in data["unreplied"]]
     for r in data["replies"]:
         rows.append(_row(f"reply:{r.reply_id}", "Reply",
                          f"to drop {r.drop_id} ({r.received_at[11:16]}, {r.surface}): {r.text}"))

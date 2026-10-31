@@ -119,11 +119,14 @@ _SOURCES: tuple[_Source, ...] = (
 class WorkDelta(NamedTuple):
     """``lines``: ``(gseq, text)`` of the earliest ``limit`` records after ``since``, in ``gseq`` order. ``total``: how
     many records are after ``since`` in all. ``through``: the greatest ``gseq`` among them (``since`` when none).
-    ``unordered``: replies with no ``gseq``, which no cursor can place."""
+    ``unordered``: replies with no ``gseq``, which no cursor can place. ``unreplied``: the drops with no coordinator
+    reply (:func:`levain.coordinator.drop_reply.unreplied`), a derived section: not a ``gseq`` record, so in neither
+    ``total`` nor ``through``, and shown even when nothing else is new."""
     lines: list[tuple[int, str]]
     total: int
     through: int
     unordered: int
+    unreplied: tuple = ()
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -138,8 +141,10 @@ def watermark(conn: sqlite3.Connection, viewer: str) -> int:
     return conn.execute("SELECT COALESCE(MAX(gseq), 0) FROM operator_views WHERE viewer = ?", (viewer,)).fetchone()[0]
 
 
-def work_delta(conn: sqlite3.Connection, since: int, limit: int = MAX_LINES) -> WorkDelta:
-    """Every source's records after ``since``, read in ONE read snapshot. A source whose table this store lacks (a
+def work_delta(conn: sqlite3.Connection, since: int, limit: int = MAX_LINES, *, now: str | None = None,
+               exclude_drop: str | None = None) -> WorkDelta:
+    """Every source's records after ``since``, read in ONE read snapshot. With ``now`` (a store stamp) the drops with no
+    reply are derived as well, bar ``exclude_drop`` (the one being answered). A source whose table this store lacks (a
     plain coordinator store has no chat tables) contributes nothing. Raises SQLite's errors (a busy store); the caller
     says ``! not read``."""
     own = not conn.in_transaction
@@ -163,20 +168,26 @@ def work_delta(conn: sqlite3.Connection, since: int, limit: int = MAX_LINES) -> 
                 lines.append((row[0], s.line(*row[1:])))
         unordered = (conn.execute("SELECT COUNT(*) FROM replies WHERE gseq IS NULL").fetchone()[0]
                      if "replies" in have else 0)
+        silent: tuple = ()
+        if now is not None and {"drops", "replies"} <= have:
+            from levain.coordinator import drop_reply            # it imports this module: read at call time
+
+            silent = tuple(drop_reply.unreplied(conn, now, exclude_drop))
     finally:
         if own:
             conn.execute("ROLLBACK")              # a read snapshot: nothing to commit
     lines.sort(key=lambda g: g[0])
-    return WorkDelta(lines[:limit], total, through, unordered)
+    return WorkDelta(lines[:limit], total, through, unordered, silent)
 
 
 def render(delta: WorkDelta) -> str:
-    """The block as the operator reads it; ``""`` when nothing is after the cursor."""
-    if not delta.total:
+    """The block as the operator reads it; ``""`` when nothing is after the cursor and no drop is waiting for a reply.
+    The unreplied-drop lines follow the records (and stand alone, under a ``0 of 0`` head, when there are none)."""
+    if not delta.total and not delta.unreplied:
         return ""
     shown = delta.lines
     note = ""
-    if delta.unordered:
+    if delta.unordered and delta.total:
         note = (f"; {delta.unordered} older reply carries no order and is not listed" if delta.unordered == 1
                 else f"; {delta.unordered} older replies carry no order and are not listed")
     out = [f"{HEAD}, {len(shown)} of {delta.total}{note}):"]
@@ -184,6 +195,11 @@ def render(delta: WorkDelta) -> str:
     more = delta.total - len(shown)
     if more > 0:
         out.append(f"  +{more} more: levain coord log --since {shown[-1][0]}")
+    from levain.coordinator import drop_reply
+
+    out.extend(f"  {drop_reply.unreplied_line(u)}" for u in delta.unreplied[:MAX_LINES])
+    if len(delta.unreplied) > MAX_LINES:
+        out.append(f"  +{len(delta.unreplied) - MAX_LINES} more drops with no reply")
     return "\n".join(out)
 
 
@@ -214,7 +230,8 @@ def read_block(directory: Path | str | None, viewer: str, busy_s: float) -> Work
         try:
             since = watermark(conn, viewer)
             store_id = _store_id(conn)
-            delta = work_delta(conn, since)                      # inside this snapshot (it opens none of its own)
+            now = utc_stamp(datetime.now(timezone.utc))
+            delta = work_delta(conn, since, now=now)             # inside this snapshot (it opens none of its own)
         finally:
             conn.execute("ROLLBACK")
     except Exception:                                            # noqa: BLE001 - a busy store, a table that will not read

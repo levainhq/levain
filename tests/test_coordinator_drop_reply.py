@@ -17,7 +17,8 @@ from levain.cockpit.engine import ReadContext
 from levain.coordinator import drop_reply, work_delta
 from levain.coordinator.chat import ChatStore, timeline
 from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import CoordError, REPLY_KINDS, REPLY_WINDOW_HOURS, UNREPLIED_AFTER_MINUTES, CoordStore, Part
+from levain.coordinator.store import (REPLY_KINDS, REPLY_WINDOW_HOURS, UNREPLIED_AFTER_MINUTES, UNREPLIED_SHOWN_DAYS,
+                                      CoordError, CoordStore, Part)
 
 NOW = datetime(2026, 10, 31, 14, 0, tzinfo=timezone.utc)
 
@@ -144,13 +145,13 @@ def test_the_block_is_frozen_at_write_and_unchanged_after_more_work_lands(qdir, 
     code, out, _err = _cli(qdir, d, "heard", token, capsys, "--json")
     assert code == 0
     said = json.loads(out)
-    assert said["covers"]["through"] == said["gseq"] and said["block"].startswith(work_delta.HEAD)
+    assert said["covers"]["through"] < said["gseq"] and said["block"].startswith(work_delta.HEAD)
     for i in range(3):                                          # more records land after the reply
         _drop(store, f"later word {i}")
     conn = store.open_readonly()
     try:
         (stored,) = drop_reply.replies(conn)
-        assert stored.block == said["block"] and (stored.after, stored.through) == (said["covers"]["after"], said["gseq"])
+        assert stored.block == said["block"] and (stored.after, stored.through) == (said["covers"]["after"], said["covers"]["through"])
         fresh = work_delta.render(work_delta.work_delta(conn, stored.after))
         assert fresh != stored.block                           # a re-render would have moved: the stored text did not
     finally:
@@ -350,6 +351,77 @@ def test_an_integrity_failure_names_the_table_that_was_rebuilt(qdir, store) -> N
             CoordStore(qdir)._ensure(Bad(), create=False)
     finally:
         c.close()
+
+
+# ---------------------------------------------------------------------------------------------- unreplied drops
+def _clocked(qdir, at):
+    box = [at]
+    return CoordStore(qdir, clock=lambda: box[0]), box
+
+
+def _delta(qdir, now, since=0):
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        return work_delta.work_delta(c, since, now=_stamp(now))
+    finally:
+        c.close()
+
+
+def test_the_work_delta_prints_an_unreplied_drop_even_with_nothing_else_new(qdir) -> None:
+    store, box = _clocked(qdir, NOW)
+    d = _drop(store)
+    late = NOW + timedelta(minutes=UNREPLIED_AFTER_MINUTES + 1)
+    first = _delta(qdir, late)
+    assert first.total >= 1                                    # the receipt is news the first time
+    caught_up = _delta(qdir, late, since=first.through)
+    assert caught_up.total == 0 and caught_up.through == first.through      # no gseq record, no cursor movement
+    text = work_delta.render(caught_up)
+    assert text.startswith(work_delta.HEAD) and f"drop {d} (14:00, phone): no reply yet" in text
+    assert work_delta.render(_delta(qdir, NOW + timedelta(minutes=2), since=first.through)) == ""   # not yet quiet-minutes
+
+
+def test_an_unreplied_drop_shows_closed_after_the_window_and_ages_out_after_seven_days(qdir) -> None:
+    store, box = _clocked(qdir, NOW)
+    d = _drop(store)
+    closed = NOW + timedelta(hours=REPLY_WINDOW_HOURS + 1)
+    text = work_delta.render(_delta(qdir, closed, since=10**6))
+    assert f"drop {d} (2026-10-31 14:00, phone): no reply, window closed" in text
+    still = NOW + timedelta(days=UNREPLIED_SHOWN_DAYS) - timedelta(minutes=1)
+    assert "window closed" in work_delta.render(_delta(qdir, still, since=10**6))
+    gone = NOW + timedelta(days=UNREPLIED_SHOWN_DAYS, minutes=1)
+    assert work_delta.render(_delta(qdir, gone, since=10**6)) == ""
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        assert [u.closed for u in drop_reply.unreplied(c, _stamp(closed))] == [True]
+        assert drop_reply.unreplied(c, _stamp(gone)) == []
+    finally:
+        c.close()
+    rows = status_reader(lambda: qdir, lambda: closed)(ReadContext(closed)).rows
+    assert any(r.id == f"noreply:{d}" and r.body.endswith("no reply, window closed") for r in rows)
+
+
+def test_the_frozen_block_leaves_out_the_drop_it_answers_but_names_the_others(qdir) -> None:
+    store, box = _clocked(qdir, NOW)
+    answered, other = _drop(store, "one"), _drop(store, "two")
+    box[0] = NOW + timedelta(minutes=UNREPLIED_AFTER_MINUTES + 1)
+    got = drop_reply.write_reply(store, answered, "heard", token=store.coord_take())
+    assert f"drop {answered} (" not in got.block              # its own "no reply yet" line
+    assert f"drop {other} (14:00, phone): no reply yet" in got.block
+    assert got.through < got.gseq                              # covers what the block covers, not the reply itself
+
+
+def test_the_stored_block_carries_the_unreplied_lines_the_stop_check_verifies(qdir) -> None:
+    from levain import band_view
+
+    store, _box = _clocked(qdir, datetime.now(timezone.utc) - timedelta(minutes=30))
+    d = _drop(store)
+    block = work_delta.read_block(qdir, "v", 5.0)
+    line = f"drop {d} ({_stamp(datetime.now(timezone.utc) - timedelta(minutes=30))[11:16]}, phone): no reply yet"
+    assert line in block.text
+    view = band_view.View(0, (), None)
+    assert band_view._reprint_check(view, block.text, block.text) == ([], False)
+    dropped = "\n".join(ln for ln in block.text.splitlines() if "no reply yet" not in ln)
+    assert band_view._reprint_check(view, block.text, dropped)[1] is True
 
 
 # ---------------------------------------------------------------------------------------------- the panel

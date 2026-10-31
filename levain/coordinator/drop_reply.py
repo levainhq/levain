@@ -11,20 +11,29 @@ covers. Every later view of the reply shows that stored text, never a re-render.
 work cursor to the last record the block covered: a reply on these surfaces has no receipt, so it counts as delivered
 when written (DESIGN section 8). The reply's own row stays after the cursor, so the next terminal block names it.
 
-"No reply yet" is derived, never stored: a drop inside the window with no coordinator reply after
-:data:`UNREPLIED_AFTER_MINUTES` (:func:`unreplied`)."""
+"No reply yet" is derived, never stored: a drop with no coordinator reply after :data:`UNREPLIED_AFTER_MINUTES`
+(:func:`unreplied`). It stays after the reply window closes, as ``no reply, window closed``, for
+:data:`UNREPLIED_SHOWN_DAYS` days, so the end of the window never turns silence into "heard". The panel and the work
+delta both print it.
+
+Known edges, not built against:
+- a drop never split into a thread stores its reply with ``thread_id`` NULL, so thread views never show it (the panel
+  and the work delta do);
+- a multi-thread drop's reply binds to its first thread;
+- a raw-SQL writer can backdate ``at``: the store's trigger cannot see the clock."""
 from __future__ import annotations
 
 import json
 import secrets
 import sqlite3
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from levain.coordinator import work_delta
-from levain.coordinator.store import (REPLY_WINDOW_HOURS, UNREPLIED_AFTER_MINUTES, CoordError, CoordStore, next_gseq)
+from levain.coordinator.store import (REPLY_WINDOW_HOURS, UNREPLIED_AFTER_MINUTES, UNREPLIED_SHOWN_DAYS, CoordError,
+                                      CoordStore, next_gseq)
 
-__all__ = ["REPLY_MAX", "DropReply", "VIEWER", "replies", "unreplied", "unreplied_line", "write_reply"]
+__all__ = ["REPLY_MAX", "DropReply", "Unreplied", "VIEWER", "replies", "unreplied", "unreplied_line", "write_reply"]
 
 #: the operator's work cursor is the coordinator viewer's: the one the terminal reply's block advances
 VIEWER = "coordinator"
@@ -76,12 +85,14 @@ def write_reply(store: CoordStore, drop_id: str, text: str, *, token: object) ->
         with store._write("coordinator", token) as (conn, now):
             drop = conn.execute("SELECT surface, received_at FROM drops WHERE drop_id = ?", (drop_id,)).fetchone()
             since = work_delta.watermark(conn, VIEWER)
-            delta = work_delta.work_delta(conn, since)     # inside this write's transaction: one snapshot
+            # inside this write's transaction: one snapshot. The drop being answered is not "unreplied" in its own
+            # block: the block is built before its reply row exists
+            delta = work_delta.work_delta(conn, since, now=now, exclude_drop=drop_id)
             block = "\n".join(p for p in (work_delta.render(delta), band) if p)
             gseq = next_gseq(conn, now)
             body = {"text": text, "drop_id": drop_id, "surface": drop[0] if drop else "",
                     "received_at": drop[1] if drop else "", "block": block,
-                    "covers": {"after": since, "through": gseq}}
+                    "covers": {"after": since, "through": delta.through}}
             threads = store._threads_of(conn, drop_id) if drop else []
             reply_id = "rp-" + secrets.token_hex(16)
             # the trigger decides here: nothing is checked first, so the refusal is the store's own
@@ -95,7 +106,7 @@ def write_reply(store: CoordStore, drop_id: str, text: str, *, token: object) ->
                              (VIEWER, delta.through, now))
     except sqlite3.IntegrityError as exc:
         raise CoordError(f"refused: {exc}") from exc
-    return DropReply(reply_id, drop_id, gseq, now, body["surface"], body["received_at"], text, block, since, gseq)
+    return DropReply(reply_id, drop_id, gseq, now, body["surface"], body["received_at"], text, block, since, delta.through)
 
 
 def replies(conn: sqlite3.Connection, limit: int = 5) -> list[DropReply]:
@@ -105,18 +116,32 @@ def replies(conn: sqlite3.Connection, limit: int = 5) -> list[DropReply]:
         "ORDER BY gseq DESC LIMIT ?", (limit,))]
 
 
-def unreplied(conn: sqlite3.Connection, now: str) -> list[tuple[str, str, str]]:
-    """``(drop_id, surface, received_at)`` of each drop with no coordinator reply that is past
-    :data:`UNREPLIED_AFTER_MINUTES` and still inside the reply window (after it the store would refuse a reply, so
-    the line would name something nobody can do), oldest first. ``now``: a store stamp."""
-    return conn.execute(
-        "SELECT d.drop_id, d.surface, d.received_at FROM drops d WHERE NOT EXISTS (SELECT 1 FROM replies r WHERE "
-        "r.kind = 'coordinator_reply' AND r.ref_store = 'drops' AND r.ref_id = d.drop_id) "
+class Unreplied(NamedTuple):
+    """A drop with no coordinator reply. ``closed``: the reply window is over, so no reply can be written any more."""
+    drop_id: str
+    surface: str
+    received_at: str
+    closed: bool
+
+
+def unreplied(conn: sqlite3.Connection, now: str, exclude: str | None = None) -> list[Unreplied]:
+    """Each drop with no coordinator reply that is past :data:`UNREPLIED_AFTER_MINUTES` and not older than
+    :data:`UNREPLIED_SHOWN_DAYS`, oldest first: ``closed`` once past the reply window, which stays on the line for the
+    rest of those days (silence must not read as heard because a window ran out). ``now``: a store stamp. ``exclude``:
+    a drop being answered right now. The one derivation the panel and the work delta both read."""
+    rows = conn.execute(
+        "SELECT d.drop_id, d.surface, d.received_at, (julianday(?) - julianday(d.received_at)) * 24 > ? "
+        "FROM drops d WHERE NOT EXISTS (SELECT 1 FROM replies r WHERE "
+        "r.kind = 'coordinator_reply' AND r.ref_store = 'drops' AND r.ref_id = d.drop_id) AND d.drop_id IS NOT ? "
         "AND (julianday(?) - julianday(d.received_at)) * 1440 > ? "
-        "AND (julianday(?) - julianday(d.received_at)) * 24 <= ? ORDER BY d.rowid",
-        (now, UNREPLIED_AFTER_MINUTES, now, REPLY_WINDOW_HOURS)).fetchall()
+        "AND (julianday(?) - julianday(d.received_at)) <= ? ORDER BY d.rowid",
+        (now, REPLY_WINDOW_HOURS, exclude, now, UNREPLIED_AFTER_MINUTES, now, UNREPLIED_SHOWN_DAYS)).fetchall()
+    return [Unreplied(d, surface, at, bool(closed)) for d, surface, at, closed in rows]
 
 
-def unreplied_line(drop_id: str, surface: str, received_at: str) -> str:
-    """``drop dr-.. (14:02, phone): no reply yet``: the silence made visible (DESIGN 3.3)."""
-    return f"drop {drop_id} ({received_at[11:16]}, {surface}): no reply yet"
+def unreplied_line(u: Unreplied) -> str:
+    """``drop dr-.. (14:02, phone): no reply yet``, or once the window is closed ``drop dr-.. (2026-10-31 14:02, phone):
+    no reply, window closed``: the silence made visible (DESIGN 3.3)."""
+    if u.closed:
+        return f"drop {u.drop_id} ({u.received_at[:10]} {u.received_at[11:16]}, {u.surface}): no reply, window closed"
+    return f"drop {u.drop_id} ({u.received_at[11:16]}, {u.surface}): no reply yet"
