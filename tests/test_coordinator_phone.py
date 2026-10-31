@@ -774,3 +774,40 @@ def test_f6_the_review_reply_carries_the_stop_computed_from_the_read(world, monk
     read = at.replace(microsecond=0)
     assert r["stop_at"] == utc_stamp(read + timedelta(hours=2)), r["stop_at"]
     assert json.loads(r["body_text"])["issued_at"] == utc_stamp(read)
+
+
+def test_the_listing_carries_every_surface_he_drops_from_newest_first(world) -> None:
+    cp = coord_for(world)
+    ids = [drop(cp, f"word {i}", "ph-" + f"{i:032d}")["drop"]["drop_id"] for i in range(15)]
+    store = EnvelopeStore(world["qdir"])
+    store.accept_drop("typed at a terminal", surface="cli", outbox_id="cli-" + "0" * 32)
+    store.accept_drop("from the cockpit surface", surface="cockpit", outbox_id="ck-" + "0" * 32)
+    got = cp.listing()
+    listed = [d["words"] for d in got["coord_drops"]]
+    assert listed == ["from the cockpit surface", "typed at a terminal"] + [f"word {i}" for i in reversed(range(15))], listed
+    assert len(ids) == 15 and got["coord_drops_more"] is False
+
+
+def test_the_listing_says_when_older_drops_are_not_in_it(world) -> None:
+    from levain.coordinator import phone
+    cp = coord_for(world)
+    store = EnvelopeStore(world["qdir"])
+    for i in range(phone.DROPS_SCANNED + 1):
+        store.accept_drop(f"w{i}", surface="phone", outbox_id="ph-" + f"{i:032d}")
+    got = cp.listing()
+    assert len(got["coord_drops"]) == phone.DROPS_SCANNED and got["coord_drops_more"] is True
+    assert got["coord_drops"][0]["words"] == f"w{phone.DROPS_SCANNED}"
+
+
+def test_exactly_the_scan_bound_of_drops_says_nothing_is_older(world) -> None:
+    from levain.coordinator import phone
+    cp = coord_for(world)
+    store = EnvelopeStore(world["qdir"])
+    for i in range(phone.DROPS_SCANNED):
+        store.accept_drop(f"w{i}", surface="phone", outbox_id="ph-" + f"{i:032d}")
+    got = cp.listing()
+    assert len(got["coord_drops"]) == phone.DROPS_SCANNED and got["coord_drops_more"] is False
+    store.accept_drop("one more", surface="phone", outbox_id="ph-" + "f" * 32)
+    got = cp.listing()
+    assert len(got["coord_drops"]) == phone.DROPS_SCANNED and got["coord_drops_more"] is True
+    assert got["coord_drops"][0]["words"] == "one more" and got["coord_drops"][-1]["words"] == "w1"

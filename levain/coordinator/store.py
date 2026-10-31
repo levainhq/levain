@@ -1346,6 +1346,34 @@ class CoordStore:
             return (drop, [self._thread(conn, t) for t in self._threads_of(conn, drop_id)],
                     self._receipts(conn, drop_id, None))
 
+    def drop_views(self, limit: int = 50) -> list[tuple[Drop, list[Thread], list[Reply]]]:
+        """The newest ``limit`` drops (newest first), each as :meth:`drop_view` gives it, all read in ONE transaction:
+        one snapshot and one open however many drops there are."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise CoordError("limit is 1 to 1000")
+        with read_transaction(self._connect) as conn:
+            ids = [r[0] for r in conn.execute("SELECT drop_id FROM drops ORDER BY rowid DESC LIMIT ?", (limit,))]
+            wanted = set(ids)
+            # one pass over the current revisions answers every drop's threads (creation order), instead of one pass per drop
+            of: dict[str, list[str]] = {}
+            for thread_id, members in conn.execute(
+                    "SELECT r.thread_id, r.members FROM thread_revisions r JOIN threads t ON t.thread_id = r.thread_id "
+                    "WHERE r.rev = (SELECT MAX(rev) FROM thread_revisions l WHERE l.thread_id = r.thread_id) "
+                    "ORDER BY t.rowid"):
+                for drop_id in wanted.intersection(json.loads(members)):
+                    of.setdefault(drop_id, []).append(thread_id)
+            built: dict[str, Thread] = {}
+            for thread_id in dict.fromkeys(t for ts in of.values() for t in ts):
+                built[thread_id] = self._thread(conn, thread_id)
+            receipts: dict[str, list[Reply]] = {d: [] for d in ids}
+            for at in range(0, len(ids), 400):
+                chunk = ids[at:at + 400]
+                for r in conn.execute("SELECT reply_id, thread_id, kind, ref_store, ref_id, body, at FROM replies "
+                                      f"WHERE ref_store = 'drops' AND kind = 'drop_receipt' AND ref_id IN ({','.join('?' * len(chunk))}) "
+                                      "ORDER BY rowid", chunk):
+                    receipts[r[4]].append(Reply(r[0], r[1], r[2], r[3], r[4], json.loads(r[5]), r[6]))
+            return [(self._drop(conn, d), [built[t] for t in of.get(d, [])], receipts[d]) for d in ids]
+
     def thread_view(self, thread_id: str) -> tuple[Thread, list[tuple[int, tuple[str, ...], str, str]],
                                                    list[tuple[int, str, str, str, str, str]]]:
         """A thread with every revision and event, read in ONE transaction."""

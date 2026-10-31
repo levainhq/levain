@@ -90,11 +90,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-__all__ = ["DROPS_SHOWN", "REVIEWS_KEPT", "REVIEW_CLEARED_SHOWN", "REVIEW_OPEN_SHOWN", "REVIEW_TTL", "CoordPhone",
+from levain.coordinator.store import SURFACES
+
+__all__ = ["REVIEWS_KEPT", "REVIEW_CLEARED_SHOWN", "REVIEW_OPEN_SHOWN", "REVIEW_TTL", "CoordPhone",
            "CoordRefused"]
 
-# phone drops a listing shows, newest first
-DROPS_SHOWN = 10
+# the drops a listing shows, newest first, are those of these surfaces: every surface the store records. A drop typed
+# at a terminal is his words as much as one sent from the phone or the cockpit, so no surface is left out of his thread
+HIS_SURFACES = SURFACES
+# how many of the newest drops one listing scans: a bound on the per-poll cost; coord_drops_more says aloud that older drops exist beyond the newest DROPS_SCANNED
+DROPS_SCANNED = 200
 # review items a listing shows: the open ones (oldest first, as the queue lists them) and the newest cleared ones
 REVIEW_OPEN_SHOWN = 50
 REVIEW_CLEARED_SHOWN = 10
@@ -203,12 +208,13 @@ class CoordPhone:
             out.update(launch_id=b.get("launch_id"), started=b.get("started") is True, said=visible(b.get("said")))
         return out
 
-    def drop_record(self, store: Any, drop_id: str) -> dict[str, Any]:
+    def drop_record(self, store: Any, drop_id: str, view: tuple[Any, list[Any], list[Any]] | None = None) -> dict[str, Any]:
         """One drop as the sheet shows it: its words (display-safe), when, its outbox id, its envelope, every drop
-        receipt (delivered, split, resplit) and the threads it is in now."""
+        receipt (delivered, split, resplit) and the threads it is in now. ``view`` is the drop's already-read
+        ``store.drop_view`` triple (a listing reads many in one transaction); absent, it is read here."""
         from levain.cockpit.display_safe import visible
 
-        drop, threads, receipts = store.drop_view(drop_id)
+        drop, threads, receipts = view if view is not None else store.drop_view(drop_id)
         refused = next((r.body["envelope_refused"] for r in receipts
                         if r.body.get("stage") == "delivered" and "envelope_refused" in r.body), None)
         return {"drop_id": drop.drop_id, "outbox_id": drop.outbox_id, "surface": drop.surface,
@@ -219,14 +225,15 @@ class CoordPhone:
                             for t in threads]}
 
     def listing(self) -> dict[str, Any]:
-        """The ``coord_*`` keys of ``/consent.json``: the newest phone drops with their receipts, the repos an
-        envelope may name (``coord_repos``: the open threads' folders by their latest activity, newest first, then
-        the folders the newest drops came from), and who may sign one. A store that cannot be read is ``coord_note``, never an empty list
+        """The ``coord_*`` keys of ``/consent.json``: his drops (the newest ``DROPS_SCANNED``; ``coord_drops_more`` is true only
+        when older drops exist beyond them) with their receipts, the repos an envelope may name (``coord_repos``: the open
+        threads' folders by their latest activity, newest first, then the folders the newest drops came from), and who may sign
+        one. A store that cannot be read is ``coord_note``, never an empty list
         alone; no store yet is no drops and no note."""
         signers, signer_note = self._signers()
         # coord_store_read False: the identity is unknown, and the page sends nothing until it reads one
         out: dict[str, Any] = {"coord_drops": [], "coord_note": None, "coord_repos": [], "coord_store_id": None,
-                               "coord_store_read": False, "coord_signers": signers, "coord_signer_note": signer_note}
+                               "coord_store_read": False, "coord_drops_more": False, "coord_signers": signers, "coord_signer_note": signer_note}
         try:
             store = self._store(create=False)
             if store is None:
@@ -234,8 +241,11 @@ class CoordPhone:
                 return out
             out["coord_store_id"] = store.store_id()
             out["coord_store_read"] = True
-            drops = [d for d in store.drops(limit=200) if d.surface == "phone"][:DROPS_SHOWN]
-            out["coord_drops"] = [self.drop_record(store, d.drop_id) for d in drops]
+            views = store.drop_views(limit=DROPS_SCANNED + 1)      # newest first, ONE read; the extra row only says whether older drops exist
+            out["coord_drops_more"] = len(views) > DROPS_SCANNED
+            views = views[:DROPS_SCANNED]
+            scanned = [v[0] for v in views]
+            out["coord_drops"] = [self.drop_record(store, v[0].drop_id, v) for v in views if v[0].surface in HIS_SURFACES]
             repos: list[str] = []
             # the threads' folders newest activity first (the latest of a thread's creation, revisions, events and
             # replies; a tie keeps the newer thread first): a page that offers the first folder as its default offers
@@ -246,7 +256,7 @@ class CoordPhone:
             for _i, t in threads:
                 if t.repo and t.repo not in repos:
                     repos.append(t.repo)
-            for d in store.drops(limit=200):
+            for d in scanned:
                 if d.source.repo and d.source.repo not in repos:
                     repos.append(d.source.repo)
             out["coord_repos"] = repos[:_REPOS_SHOWN]
