@@ -140,7 +140,7 @@ def test_a_token_changed_in_this_page_updates_the_zone_without_a_reload(tmp_path
             {"until": "document.querySelector('[data-mode-tab=board]')"},
             # the sentinel is set on the document that is about to go: only the reloaded one lacks it, so the next wait cannot be
             # satisfied by the old page
-            {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__pre = 1; location.reload(); 1"},
+            {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__pre = 1; location.reload(); 1", "may_error": True},   # the reload can destroy the context before the eval answers
             {"until": "!window.__pre && document.querySelector('.th-zone') && document.querySelector('[data-mode-tab=build]')"},
             {"eval": _COUNT},
             # the Build click is retried with its result: a click the page was not yet ready for opens nothing
