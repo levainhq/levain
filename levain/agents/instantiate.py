@@ -18,8 +18,7 @@ worker launch:
    store in the same transaction as the write.
 
 BEFORE S1 NOTHING HERE IS AUTHORITY. The scope this module computes is what the worker's brief states and what a
-reader sees; no code path reads it to allow anything (``tests/test_agents_spawn.py`` pins the callers of the
-envelope-authority readers). A pre-S1 worker is a Claude Code session under the consent hook, so each gated tool call
+reader sees; no code path reads it to allow anything, and a test pins the callers of the envelope-authority readers. A pre-S1 worker is a Claude Code session under the consent hook, so each gated tool call
 stays a per-call consent request. Narrowing that WRITES (a ``drop_effect`` row per effect the role's ceiling lacks) is
 :func:`record_narrowing`, which uses the envelope store's own append-only narrowing and so can only narrow.
 
