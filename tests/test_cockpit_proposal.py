@@ -197,7 +197,7 @@ def _route(monkeypatch, seed, *, token: bool) -> tuple[int, dict]:
     monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
     h = ws._Handler.__new__(ws._Handler)
     sent: list = []
-    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=ws._ConsentReader(seed.dir))
+    h.server = SimpleNamespace(request_gate=threading.Lock(), consent_reader=ws._ConsentReader(seed.dir), surface_tokens={})
     h._off_box_token_valid = lambda: token
     h._send = lambda body, ctype, **kw: sent.append((kw.get("status", 200), json.loads(body)))
     h._serve_consent_body("/cockpit/consent/proposals.json", head=False)
