@@ -39,8 +39,8 @@ Notes a provider relies on:
   manifest's verb labels (`Snoozed · spore-1238`). A verb with no label renders as its raw name.
 - **`ambient`**: the kernel stores and serves the events as sent. The renderer owns the encoding.
 - **`board`**: the ready queue as derived columns, the value levain's own `GET /cockpit/board.json` serves
-  (`levain.cockpit.board.build`); a downstream's panel declares `kind="board"` and sends that value. It is a SHAPE check:
-  the kernel parses and executes nothing, and any key it does not name (`band_hint`, `tell`, `journal_as_of_read`, a
+  (`levain.cockpit.board.build`); a downstream's panel declares `kind="board"` and sends that value. With no board panel registered the cockpit draws its own (`work_board`, "Work board"; the id is reserved for it, and an embedder's panel that already holds the id is never refused for it: the built-in is simply not drawn); a board panel registered or discovered later replaces it, even one under that id: the kernel draws its built-in board only while no provider board is registered, and providers own their boards (two provider boards both draw). When the last board panel goes (unregistered, or a discoverer stops returning it) the built-in returns. Each `attach_server` re-points the built-in at the attaching server's board (`work_board=False` removes it). An embedder that wants no board of levain's passes `make_server(..., work_board=False)`. The built-in's value carries `drop_here` (a boolean): false when "Drop about this card" would file to a different coordinator than the one the board reads, and the page then draws no such button; a board without the key (a provider's) draws it. It is a SHAPE check:
+  the kernel parses and executes nothing, and any key it does not name (`band_hint`, `journal_as_of_read`, a
   card's `held_reason`, `well_formed`, `rank`, `band`, `number`, `source`, `blocks`) is accepted and left alone.
   `queue` is `ok` (read whole), `none` (no queue made yet) or `unreadable`; `unreadable` lists the sources it could not read
   and `note` says why, so a board that could not be read is never drawn as an empty one. Each column's `category` is one

@@ -6,6 +6,7 @@ import http.client
 import json
 import shutil
 import subprocess
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -165,29 +166,6 @@ def test_route_with_no_store_is_200_no_queue_and_creates_nothing(tmp_path, lh):
         assert json.loads(_raw(base, board.BOARD_PATH)[2])["queue"] == "ok"
 
 
-def test_the_tell_box_is_offered_only_when_the_drop_writes_where_the_board_reads(tmp_path, qdir):
-    other = tmp_path / "other"
-    other.mkdir()
-    assert board.build(qdir, None, drop_dir=qdir)["tell"]["offered"] is True
-    off = board.build(qdir, None, drop_dir=other)["tell"]
-    assert off["offered"] is False and "different queue" in off["why"]
-    assert board.build(qdir, None)["tell"]["offered"] is False
-    assert board.build(None, None, drop_dir=qdir)["tell"]["offered"] is False
-
-
-def test_route_pins_the_tell_to_the_board_directory(tmp_path, lh):
-    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
-    other = tmp_path / "other"
-    other.mkdir()
-    _root, src, _ids = _install(tmp_path)
-    with _serve(src, write_token=TOKEN) as (base, httpd):
-        assert json.loads(_raw(base, board.BOARD_PATH)[2])["tell"]["offered"] is False       # no drop route here
-        httpd.coord_sheet = SimpleNamespace(queue_dir=other, close=lambda: None)
-        assert json.loads(_raw(base, board.BOARD_PATH)[2])["tell"]["offered"] is False       # a different queue
-        httpd.coord_sheet = SimpleNamespace(queue_dir=lh, close=lambda: None)
-        assert json.loads(_raw(base, board.BOARD_PATH)[2])["tell"]["offered"] is True        # the same one
-
-
 @pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH"])
 def test_no_write_reaches_the_board(tmp_path, lh, method):
     lh.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -213,28 +191,10 @@ def test_the_view_script_is_served_as_app_shell(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_the_tell_box_behaves_under_node():
-    """The box's behaviour, run: only the drop endpoint is posted to, and only on a click that passes every gate."""
-    root = Path(__file__).resolve().parent.parent
-    run = subprocess.run(["node", str(root / "tests" / "js_board_tell_harness.js"),
-                          str(root / "levain" / "templates" / "web" / "board_view.js")],
-                         capture_output=True, text=True, timeout=60, check=True)
-    out = json.loads(run.stdout)
-    assert out["not_offered"]["posts"] == [] and out["not_offered"]["reads"] == 0 and out["not_offered"]["wordsHidden"]
-    assert out["unreadable"]["posts"] == [] and "store locked" in out["unreadable"]["say"]      # unreadable is not "no store"
-    assert len(out["double_click"]["posts"]) == 1 and out["double_click"]["reads"] == 1          # locked before the await
-    assert len(out["no_store_yet"]["posts"]) == 1 and out["no_store_yet"]["posts"][0]["store_id"] is None
-    edited = out["edited_pending"]["posts"]
-    assert len(edited) == 1 and edited[0]["words"] == "B" and edited[0]["outbox_id"] != "ph-old"   # edited words: new id
-    same = out["same_pending"]["posts"]
-    assert len(same) == 1 and same[0]["outbox_id"] == "ph-old" and out["same_pending"]["reads"] == 0
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
 def test_the_tab_lists_cards_grouped_under_column_headings_and_the_modal_draws_the_columns():
     """One model feeds both: `renderGrouped` (the Board tab) draws one `grp-head` per column with its count and the cards as
-    rows, no `bd-cols` body; `renderBoard` (the modal) still draws the six `bd-col`. The mounted tab holds the grouped list."""
-    g = _tell_run()["grouped"]
+    rows, no `bd-cols` body; `renderBoard` (the modal) still draws the six `bd-col`."""
+    g = _harness_run()["grouped"]
     assert g["heads"] == ["backlog 1", "ready 0", "running 1", "waiting 0", "needs-you 1", "done 0"]
     assert g["rowIds"] == ["levain:c", "levain:a", "q-1"]
     assert g["groupedColsBody"] == 0                                              # no columns body in the panel
@@ -242,151 +202,16 @@ def test_the_tab_lists_cards_grouped_under_column_headings_and_the_modal_draws_t
     assert any("held: depends on levain:a" in t and "levain · sonnet · levain:c" in t for t in g["rowText"])
     assert any("seat-9" in t and "ready → running" in t for t in g["rowText"])    # a card's journal line
     assert any(t.startswith("3. Ship the sweep fix") for t in g["rowText"])       # the band card's number leads
-    assert g["mountedGroupHeads"] == 6 and g["mountedColsBody"] == 0              # the mounted tab is the grouped list
     note = "This column is the Needs you band. Answer there (`levain band`)."     # ONE sentence, both renderers draw the same one
     assert g["glossGrouped"] == [note] and g["glossBoard"] == [note]
-    assert g["mountedButtons"] == 1                                               # the tell box's Send is the only button in the host
-    assert g["modelBefore"] is None and g["modelAfter"] == ORDER_COUNTS           # the handle's model() is the last pull
 
 
-ORDER_COUNTS = ["backlog:1", "ready:0", "running:1", "waiting:0", "needs-you:1", "done:0"]
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_the_watchers_belong_to_the_page_and_a_failed_read_tells_them():
-    """L3 r1 (session A). The page's watchers and last model live on a bus every mounted view shares: stopping one view drops
-    no watcher, and the next view's pull reaches them. A failed read (403, 5xx, network) tells every watcher `(null, true)`
-    and clears the model; the next good pull restores it; a stopped view tells nobody; a watcher that throws wipes nothing."""
-    b = _tell_run()["bus"]
-    cols = ",".join(ORDER_COUNTS)
-    assert b["afterFirst"] == [cols]                      # the throwing watcher did not stop the first one hearing it
-    assert b["watchersAfterStop"] == 2                    # stop() dropped no watcher
-    assert b["afterRemount"] == [cols, cols]              # the new view's pull reached the old subscription
-    for bad in ("403", "500", "net"):
-        assert b["steps"][bad]["last"] == "FAILED" and b["steps"][bad]["model"] is None and b["steps"][bad]["failed"] is True, b["steps"][bad]
-    assert b["steps"]["ok"]["last"] == cols and b["steps"]["ok"]["failed"] is False and b["steps"]["ok"]["heads"] == 6, b["steps"]["ok"]
-    assert b["stoppedPullCalls"] == 0
-    assert b["stoppedPullSeqMoved"] is False              # L3 r2: a stopped view's pull takes no sequence number
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_a_failed_read_retires_the_send_box_keeps_the_typed_words_and_the_next_good_read_offers_it_again():
-    """L3 r1 (codex MED). The Send box is offered only over a board that was just read: a 403, a 5xx or no network hides it with
-    the reason, the words already typed stay in the field, and the next good read offers it again."""
-    t = _tell_run()["tellFollows"]
-    assert t["good"]["hidden"] is False and t["good"]["sendHidden"] is False and t["good"]["gateHidden"] is True
-    for bad in ("403", "500", "net"):
-        s = t[bad]
-        assert s["hidden"] is True and s["sendHidden"] is True and s["gateHidden"] is False, (bad, s)
-        assert "the board could not be read just now" in s["gate"], (bad, s)
-        assert s["typed"] == "re levain:a: please hold", (bad, s)                      # the operator's words are kept
-    assert t["again"]["hidden"] is False and t["again"]["sendHidden"] is False and t["again"]["typed"] == "re levain:a: please hold"
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_a_late_response_never_overwrites_a_newer_one():
-    """L3 r1 (complement LOW #1). Two overlapping pulls resolve out of order: the older response (good or failed) is dropped, so a
-    late 403/500 does not call `busFail` over a newer good read, and a late good read does not undo a newer failure."""
-    late = _tell_run()["late"]
-    newer = "backlog:0,ready:1,running:0,waiting:0,needs-you:0,done:0"        # the newer body's one card; the older BODY draws ORDER_COUNTS
-    for name in ("lateGood", "lateFail403", "lateFail500"):
-        r = late[name]
-        assert r["mid"]["model"] == newer and r["mid"]["failed"] is False, (name, r["mid"])
-        assert r["end"]["model"] == newer and r["end"]["failed"] is False, (name, r["end"])      # the late one changed nothing
-        assert r["end"]["calls"] == r["mid"]["calls"] == [newer], (name, r["end"])             # and told nobody
-        assert r["end"]["hidden"] is False, (name, r["end"])                                   # the box stays offered
-    g = late["lateGoodAfterFail"]
-    assert g["mid"]["failed"] is True and g["end"]["failed"] is True and g["end"]["model"] == "none", g
-    assert g["end"]["calls"] == ["FAILED"] and g["end"]["hidden"] is True, g
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_the_token_removed_fails_the_bus_and_its_return_clears_it():
-    """L3 r1 (complement LOW #2). Removing the write token fails the page's bus (an open modal says so, once); giving it back
-    clears `failed` and tells the watchers `(null, false)` (the modal says it has not read yet, never the stale line); a
-    failure that came from a bad READ is not cleared by a sync that merely sees the token."""
-    t = _tell_run()["token"]
-    assert t["start"]["failed"] is False and t["start"]["calls"] == ["model"]
-    assert t["removed"]["failed"] is True and t["removed"]["model"] is None and t["removed"]["calls"] == ["model", "FAILED"]
-    assert t["removedAgain"]["calls"] == ["model", "FAILED"]
-    assert t["returned"]["failed"] is False and t["returned"]["model"] is None and t["returned"]["calls"] == ["model", "FAILED", "null"]
-    assert t["readFailureKept"] == {"failed": True, "calls": []}
-    assert t["readFailureSurvivesTokenCycle"] == {"failed": True, "calls": []}      # L3 r2: the token did not cause that failure
-
-
-def _tell_run():
+def _harness_run():
     root = Path(__file__).resolve().parent.parent
-    run = subprocess.run(["node", str(root / "tests" / "js_board_tell_harness.js"),
+    run = subprocess.run(["node", str(root / "tests" / "js_board_view_harness.js"),
                           str(root / "levain" / "templates" / "web" / "board_view.js")],
                          capture_output=True, text=True, timeout=60, check=True)
     return json.loads(run.stdout)
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_a_compose_fragment_prefills_the_words_and_posts_nothing_by_itself():
-    """`#board&compose=re%20<id>%3A%20` starts the box's words: editable, focused, cursor at the end, nothing posted or read."""
-    out = _tell_run()
-    p = out["prefill"]
-    assert p["pre"]["value"] == "re c-12: " and p["pre"]["focused"] == 1 and p["pre"]["sel"] == [9, 9]
-    assert p["posts"] == [] and p["reads"] == 0 and p["pre"]["posts"] == 0 and p["pre"]["reads"] == 0   # no send by itself
-    assert out["prefill_plus"]["pre"]["value"] == "re c-12: "          # the address rewritten with "+" for spaces reads the same
-    e = out["prefill_edit"]                                             # the operator's edit goes out through the one drop route
-    assert len(e["posts"]) == 1 and e["posts"][0]["words"] == "re c-12: do it" and e["posts"][0]["outbox_id"].startswith("ph-")
-    assert out["no_hash"]["pre"]["value"] == "" and out["no_hash"]["pre"]["focused"] == 0
-    assert out["kept_wins"]["pre"]["value"] == "A"                      # an undelivered earlier drop is never overwritten
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_the_prefill_reads_no_storage_and_no_token():
-    """A token beside the fragment is not read specially; the prefill path touches only the box's own pending key."""
-    out = _tell_run()
-    t = out["prefill_token"]
-    assert t["pre"]["value"] == "re x: " and "SECRET123" not in json.dumps({k: v for k, v in t.items() if k not in ("hash", "hashAfterMount")})
-    assert t["hash"] == "#write_token=SECRET123"          # the token part of the address is left exactly as it was
-    assert set(t["keysRead"]) <= {"levain-board-drop-pending"} and t["posts"] == []
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_a_hostile_fragment_stays_inert_plain_text():
-    """Markup is a value, never parsed; a long value is cut; a malformed % and control characters do not throw."""
-    out = _tell_run()
-    assert out["hostile_markup"]["pre"]["value"] == "<img src=x onerror=alert(1)>" and out["hostile_markup"]["posts"] == []
-    assert len(out["hostile_long"]["pre"]["value"]) == 300
-    assert isinstance(out["hostile_malformed"]["pre"]["value"], str) and out["hostile_malformed"]["posts"] == []
-    assert out["hostile_control"]["pre"]["value"] == "a b c"
-    src = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "board_view.js").read_text()
-    assert "innerHTML" not in src
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_the_compose_fragment_is_forgotten_only_when_the_box_is_offered_and_only_that_segment():
-    """A hidden box keeps the link in the address; an offered one drops just `compose=...`, byte-identical elsewhere."""
-    out = _tell_run()
-    assert out["board_fails"]["hash"] == "#board&compose=re%20x%3A%20"          # a 403 board read: the words are not lost
-    assert out["not_offered_hash"]["hash"] == "#board&compose=re%20x%3A%20"     # telling off: the link stays for later
-    assert out["hash_other_params"]["hash"] == "#board&write_token=a%2Bb+c&z"   # nothing else re-encoded, no `board=`
-    assert out["hash_bare_board"]["hash"] == "#board"
-    assert out["hash_only_compose"]["hash"] == ""
-    assert out["hash_bare_board"]["hashAfterMount"] == "#board"                 # forgotten once offered (the mount's await)
-    assert out["kept_wins_hash"]["hash"] == "#board" and out["kept_wins_hash"]["pre"]["value"] == "A"   # beaten by kept words: spent too
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_the_prefill_does_not_steal_focus_and_never_splits_a_surrogate_pair():
-    out = _tell_run()
-    assert out["focus_elsewhere"]["pre"]["focused"] == 0 and out["focus_elsewhere"]["pre"]["value"] == "re x: "
-    assert out["focus_body"]["pre"]["focused"] == 1
-    v = out["surrogate"]["pre"]["value"]
-    assert v == "a" * 299 + "\U0001F600"          # 300 code points, the emoji whole (301 UTF-16 units)
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
-def test_a_compose_link_followed_in_an_open_cockpit_fills_only_an_idle_empty_box():
-    out = _tell_run()
-    assert out["hashchange_fill"]["pre"]["value"] == "re y: " and out["hashchange_fill"]["hash"] == "#board"
-    assert out["hashchange_edited"]["pre"]["value"] == "mine"                   # unsent edits are never overwritten
-    assert out["hashchange_kept"]["pre"]["value"] == "A"                        # nor kept words
-    assert out["hashchange_fill"]["handlers"] == 1
 
 
 def test_a_card_field_is_made_display_safe_and_bounded_at_the_source_so_the_kernel_validator_never_refuses_the_board():
@@ -409,7 +234,7 @@ def test_a_card_field_is_made_display_safe_and_bounded_at_the_source_so_the_kern
 def test_the_filter_matches_folded_text_with_every_term_and_counts_cards_and_a_card_with_no_journal_says_nothing():
     """The filter narrows cards (never columns) by case- and accent-folded text, every term must hit; its count is the board's
     size, or "k of n" under a query; a blank query is no query; a card with no journal draws no journal line."""
-    f = _tell_run()["filtering"]
+    f = _harness_run()["filtering"]
     assert f["none"] == {"label": "3 cards", "ids": ["levain:c", "levain:a", "q-1"], "cols": 6, "same": True}
     assert f["blank"]["label"] == "3 cards" and f["blank"]["same"] is True
     assert f["folded"]["ids"] == ["levain:c"] and f["folded"]["label"] == "1 of 3" and f["folded"]["cols"] == 6
@@ -421,3 +246,108 @@ def test_the_filter_matches_folded_text_with_every_term_and_counts_cards_and_a_c
     g = f["folded2"]
     assert g["marks"] == 1 and g["deps"] == ["x", "5"] and g["label"] == 1 and g["after"] == 1, g
     assert g["colKeys"] == ["cards", "category"], g                    # a filtered column keeps every key the model gave it
+
+
+def test_the_board_value_carries_no_tell_field_and_the_page_has_no_ready_queue_zone(tmp_path, lh):
+    """One board per cockpit: the board's read no longer offers a second messaging box, and the script that painted the
+    standalone zone is gone (what is left is the painters the board kind uses)."""
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        body = json.loads(_raw(base, board.BOARD_PATH)[2])
+        js = _raw(base, "/board_view.js", token=None)[2].decode()
+    assert "tell" not in body
+    for gone in ("ready-board", "Ready queue", "bd-tell", "mountTell", "/cockpit/coord/drop", "bd-zone"):
+        assert gone not in js, gone
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_every_card_has_a_drop_button_that_asks_the_cockpits_box_for_its_words():
+    """`Drop about this card` is drawn on every card of both bodies when the cockpit offers its drop box, hands that box
+    `About card <id> (<title>): ` on a click, and reads or posts nothing itself; a page with no such box draws none."""
+    d = _harness_run()["drop"]
+    assert d["grouped"] == [["levain:c", "Drop about this card", "button"], ["levain:a", "Drop about this card", "button"],
+                            ["q-1", "Drop about this card", "button"]] and d["cols"] == 3
+    assert d["asked"] == ["About card levain:a (Land A): ", "About card q-1 (Ship the sweep fix): "]
+    assert d["fetched"] == 0 and d["withoutCockpit"] == 0 and d["words"] == "About card x:1 (T): "
+
+
+def test_the_panels_read_of_the_board_carries_no_clock_stamp_so_its_etag_moves_only_with_the_work(filled):
+    """The board.json route stamps the read; the Work board panel must not: a changing stamp would change the panel's etag on
+    every read and announce a change on the change stream while nothing had moved."""
+    from levain.web_server import _board_value
+    server = SimpleNamespace(consent_reader=SimpleNamespace(directory=filled), question_store=None)
+    assert _board_value(server)["generated"]                                  # the route's read is stamped
+    a, b = _board_value(server, stamped=False), _board_value(server, stamped=False)
+    assert a["generated"] is None and a == b                                  # the panel's is not, and is stable
+    assert sum(len(c["cards"]) for c in a["columns"]) == 3                    # and it still holds the work
+
+
+# --- the drop route and the board: one coordinator -----------------------------------------------------
+
+def test_drop_here_is_true_only_when_the_drop_route_files_to_the_directory_the_board_reads(filled, tmp_path):
+    from levain.web_server import _board_value
+    other = tmp_path / "other-queue"
+    other.mkdir()
+
+    def value(sheet_dir, **kw):
+        sheet = SimpleNamespace(queue_dir=sheet_dir) if sheet_dir is not None else None
+        server = SimpleNamespace(consent_reader=SimpleNamespace(directory=filled), question_store=None, coord_sheet=sheet)
+        return _board_value(server, **kw)["drop_here"]
+
+    assert value(filled) is True
+    assert value(str(filled) + "/../" + filled.name) is True       # the same directory spelled another way
+    assert value(other) is False                                   # a different queue: the drop would file elsewhere
+    assert value(None) is False                                    # no drop route at all
+    assert value(filled, stamped=False) is True                    # the panel's read says it too
+    bare = SimpleNamespace(consent_reader=SimpleNamespace(), question_store=None, coord_sheet=SimpleNamespace(queue_dir=filled))
+    assert _board_value(bare)["drop_here"] is False                # no board directory to compare
+
+
+def test_the_board_route_carries_drop_here(tmp_path, lh):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, httpd):
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["drop_here"] is False       # no coord sheet here
+        httpd.coord_sheet = SimpleNamespace(queue_dir=lh, close=lambda: None)
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["drop_here"] is True
+        httpd.coord_sheet = SimpleNamespace(queue_dir=tmp_path / "elsewhere", close=lambda: None)
+        assert json.loads(_raw(base, board.BOARD_PATH)[2])["drop_here"] is False
+
+
+def test_build_still_accepts_the_removed_drop_dir_and_ignores_it_with_a_warning(qdir):
+    plain = board.build(qdir, generated="t")
+    with pytest.warns(DeprecationWarning, match="drop_dir"):
+        got = board.build(qdir, generated="t", drop_dir=qdir)
+    assert got == plain and "tell" not in got
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        board.build(qdir, generated="t")                           # no warning without it
+
+
+def _panel_kinds(base):
+    got = json.loads(_raw(base, "/cockpit/manifest.json")[2])
+    return {pid: m["kind"] for pid, m in got["panels"].items()}
+
+
+def test_make_server_draws_the_work_board_unless_told_not_to(tmp_path, lh):
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        assert _panel_kinds(base).get("work_board") == "board"
+    with _serve(src, write_token=TOKEN, work_board=False) as (base, _h):
+        assert [p for p, k in _panel_kinds(base).items() if k == "board"] == []
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_no_drop_button_is_drawn_when_the_board_says_the_drop_files_elsewhere():
+    d = _harness_run()["dropHere"]
+    assert d == {"absent": 3, "true": 3, "false": 0, "falseCols": 0}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_1000_character_title_cannot_push_a_cards_drop_past_the_drop_routes_cap():
+    from levain.coordinator.store import WORDS_MAX, check_words
+    words = _harness_run()["longTitleWords"]
+    assert len(words) >= 1000 and len(words) <= 2 * board.TEXT_MAX + 100
+    assert check_words(words) == words and len(words) < WORDS_MAX
