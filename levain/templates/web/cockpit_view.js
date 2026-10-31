@@ -313,6 +313,8 @@
           if (typeof r.id === "string" && /^session:[0-9a-f]{24}$/.test(r.id)) line.session = r.id.slice("session:".length);
         }
         if (typeof r.id === "string" && r.id) line.key = r.id;
+        // the coordinator thread the drop card hosts reads each row whole: its one-line title, its full text, its instant and its source
+        if (head.id === "desk-thread") line.thread = { title: r.title, body: r.body, at: (r.facets || {}).at, source: (r.facets || {}).source };
         if (grouped) line.grp = grp;
         if (nowRows) { line.grp = nowRows.label.get(r.id) || ""; line.meta = ""; }
         if (head.id === "jobs") {

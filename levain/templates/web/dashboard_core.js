@@ -366,6 +366,7 @@
     if (view.ke) renderKe(view, board);
     let lastZone = null;
     for (const entry of view.ke ? [] : layout) {
+      if (entry.id === DROP_THREAD_PANEL) continue;   // drawn inside the drop card, never as its own panel
       // In the "All" view, drop a zone separator before each zone's first panel.
       if (entry.zone !== lastZone) {
         const lbl = (ZONE_LABELS.find((z) => z[0] === entry.zone) || [entry.zone, entry.zone])[1];
@@ -1562,11 +1563,11 @@
   };
   function renderKe(view, board) {
     const byId = new Map();
-    for (const e of view.layout) byId.set(e.id, e);
+    for (const e of view.layout) if (e.id !== DROP_THREAD_PANEL) byId.set(e.id, e);   // the drop card hosts that panel: no zone, tile or hero draws it
     for (const old of document.querySelectorAll("#ck-hero > .ck-region-err")) old.remove();   // a clean hero render clears its last error line
     guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreHero);
     guardRegion("the brief", () => renderBriefRegion(view, byId), regionErr("ck-brief", true), restoreState);
-    guardRegion("the coordinator drop", () => renderDropHero(), regionErr("ck-drop", false));
+    guardRegion("the coordinator drop", () => renderDropHero(view), regionErr("ck-drop", false));
     guardRegion("the needs strip", () => renderNeeds(view), regionErr("ck-needs", true));
     guardRegion("the notes strip", () => renderNotes(view), regionErr("ck-notes", true));
     guardRegion("the widgets", () => renderWidgets(view, byId), regionErr("ck-widgets", true));
@@ -6783,7 +6784,10 @@
     crypto.getRandomValues(b);
     return "ph-" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
   };
-  const DROP_RECENT_SHOWN = 3;
+  // The panel id a provider registers to supply the coordinator's side of the conversation (its replies and receipts). The drop
+  // card hosts that panel's rows in its own thread, so the page draws it nowhere else (and its compose box never mounts).
+  const DROP_THREAD_PANEL = "desk-thread";
+  const DROP_RECENT_SHOWN = 8;
   // the read goes through the shared bounded read queue and is held for a moment: rapid redraws share one read. Resolves to
   // {body} or {why} (one line saying what is missing), never to nothing.
   // A read that failed is held for DROP_FAIL_TTL_MS only. A render older than that drops the cache (renderKe), a drop filed on
@@ -6811,24 +6815,77 @@
     dropRead = got;
     return got;
   }
-  function dropWhen(d) {
-    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(typeof d.sent_at === "string" ? d.sent_at : "");
-    return m ? m[2] + "-" + m[3] + " " + m[4] + ":" + m[5] + "Z" : "";
-  }
-  function dropRow(d) {
-    if (!d || typeof d !== "object") return null;      // one malformed entry is skipped, never the whole list
-    const row = el("div", "drop-recent-row");
-    row.dataset.dropId = typeof d.drop_id === "string" ? d.drop_id : "";
-    row.appendChild(el("span", "drop-when ext-meta", dropWhen(d)));
-    const first = typeof d.words === "string" ? d.words.split("\n")[0].slice(0, 100) : "";
-    row.appendChild(el("span", "drop-words-first", first));
+  const dropText = (x) => (typeof x === "string" ? x : "");
+  const DROP_PREVIEW_CHARS = 100;
+  const dropPreview = (t) => {
+    const first = t.split("\n")[0].trim();
+    return first.length > DROP_PREVIEW_CHARS ? first.slice(0, DROP_PREVIEW_CHARS - 1) + "…" : first;
+  };
+  const dropInstant = (iso) => { const ms = typeof iso === "string" ? Date.parse(iso) : NaN; return Number.isFinite(ms) ? ms : null; };
+  // local time, short: "MM-DD HH:MM"; an unreadable instant draws nothing
+  const dropWhenOf = (ms) => {
+    if (ms === null) return "";
+    const d = new Date(ms), z = (n) => String(n).padStart(2, "0");
+    return z(d.getMonth() + 1) + "-" + z(d.getDate()) + " " + z(d.getHours()) + ":" + z(d.getMinutes());
+  };
+  // one thread item from one of his drops; null for a malformed entry (skipped, never the whole list)
+  function dropItem(d) {
+    if (!d || typeof d !== "object") return null;
+    const words = dropText(d.words);
     const stages = Array.isArray(d.receipts) ? d.receipts.map((r) => r && r.stage).filter((x) => typeof x === "string") : [];
     const how = d.envelope_id ? "signed" : d.envelope_refused ? "envelope not taken" : "unsigned";
-    row.appendChild(el("span", "drop-state ext-meta", how + " · " + (stages.join(", ") || "no receipt yet")));
+    return { key: "drop:" + dropText(d.drop_id), mine: true, who: "you", at: dropInstant(d.sent_at), iso: dropText(d.sent_at),
+             preview: dropPreview(words), full: words, meta: how + " · " + (stages.join(", ") || "no receipt yet") };
+  }
+  // one thread item from one of the desk panel's lines (cockpit_view.js keeps the row's own title, body, instant and source on it)
+  function deskItem(l, i) {
+    if (!l || typeof l !== "object") return null;
+    const t = l.thread && typeof l.thread === "object" ? l.thread : {};
+    const full = dropText(t.body) || dropText(l.text) || dropText(t.title);
+    const prev = dropText(t.title) || full;
+    const who = dropText(t.source).trim() || dropText(l.addr && l.addr.source).trim() || "desk";
+    return { key: "desk:" + (dropText(l.key) || i), mine: false, who: who, at: dropInstant(t.at), iso: dropText(t.at),
+             preview: dropPreview(prev), full: full, meta: "" };
+  }
+  // both sources, newest first; an unreadable instant sorts oldest, and equal instants keep the order they arrived in
+  function dropThread(drops, view) {
+    const items = [];
+    for (const d of Array.isArray(drops) ? drops : []) { try { const it = dropItem(d); if (it) items.push(it); } catch (e) { /* skipped */ } }
+    const panel = view && view.extra_panels ? view.extra_panels[DROP_THREAD_PANEL] : null;
+    let fault = "";
+    if (panel && typeof panel === "object") {
+      if (panel.error) fault = String(panel.error);
+      else (Array.isArray(panel.lines) ? panel.lines : []).forEach((l, i) => { try { const it = deskItem(l, i); if (it) items.push(it); } catch (e) { /* skipped */ } });
+    }
+    const seen = new Set();
+    const uniq = items.filter((it) => { if (seen.has(it.key)) { it.key += "#" + seen.size; } seen.add(it.key); return true; });
+    return { fault: fault, items: uniq.map((it, i) => [it, i]).sort((a, b) => ((b[0].at === null ? -Infinity : b[0].at) - (a[0].at === null ? -Infinity : a[0].at)) || (a[1] - b[1])).map((x) => x[0]) };
+  }
+  function dropRow(it, ui) {
+    const row = el("div", "drop-recent-row" + (it.mine ? " drop-mine" : " drop-desk"));
+    row.dataset.dropKey = it.key;
+    if (it.key.indexOf("drop:") === 0) row.dataset.dropId = it.key.slice(5);
+    const head = el("button", "drop-row-head");
+    head.type = "button";
+    head.dataset.dropKey = it.key;
+    const when = el("span", "drop-when ext-meta", dropWhenOf(it.at));
+    if (it.iso) when.title = it.iso;
+    head.append(el("span", "drop-who", it.who), when, el("span", "drop-words-first", it.preview));
+    if (it.meta) head.appendChild(el("span", "drop-state ext-meta", it.meta));
+    let full = null;
+    const set = (on) => {
+      head.setAttribute("aria-expanded", on ? "true" : "false");
+      row.classList.toggle("is-open", on);
+      if (on && !full) { full = el("div", "drop-full"); full.textContent = it.full; row.appendChild(full); }
+      if (!on && full) { full.remove(); full = null; }
+    };
+    head.addEventListener("click", () => { const on = !ui.open.has(it.key); if (on) ui.open.add(it.key); else ui.open.delete(it.key); set(on); });
+    row.appendChild(head);
+    set(ui.open.has(it.key));
     return row;
   }
   function dropHeroBuild(host) {
-    const ui = { req: null, storeId: null, storeRead: false, can: false, shown: false, working: false, drops: [] };
+    const ui = { req: null, storeId: null, storeRead: false, can: false, shown: false, working: false, drops: [], open: new Set(), q: "", sig: null, view: null, read: null };
     const head = el("div", "needs-headline");
     head.appendChild(el("h3", null, "Drop to the coordinator"));
     ui.say = el("span", "needs-gloss drop-note", "");
@@ -6851,6 +6908,18 @@
     ui.receipt.setAttribute("role", "status");
     ui.earlier = el("p", "drop-earlier ext-meta", "");
     ui.recent = el("div", "drop-recent");
+    ui.recent.hidden = true;
+    ui.fault = el("p", "drop-fault ext-meta bad", "");
+    ui.fault.hidden = true;
+    ui.filter = el("input", "drop-filter");
+    ui.filter.type = "search";
+    ui.filter.placeholder = "filter the thread";
+    ui.filter.setAttribute("aria-label", "filter the thread");
+    ui.filter.hidden = true;
+    ui.list = el("div", "drop-list");
+    ui.moreHost = el("div", "drop-more-host");
+    ui.recent.append(ui.fault, ui.filter, ui.list, ui.moreHost);
+    ui.filter.addEventListener("input", () => { ui.q = ui.filter.value; dropThreadDraw(host); });
     const main = el("div", "drop-main");      // the composer is one left-column element, so the card's grid has two children whatever the list's length
     main.append(head, words, acts, ui.receipt, ui.earlier);
     host.replaceChildren(main, ui.recent);
@@ -6956,18 +7025,38 @@
     ui.say.classList.toggle("bad", !ui.can);
     ui.send.disabled = ui.env.disabled = ui.words.disabled = ui.working || !ui.can;
     host.classList.toggle("drop-off", !ui.can);
-    const drops = body ? body.coord_drops : [];
-    ui.drops = drops;
-    const rows = drops.map(dropRow).filter(Boolean);
-    const shown = ui.shown ? rows : rows.slice(0, DROP_RECENT_SHOWN);
-    const kids = shown.slice();
-    if (rows.length > DROP_RECENT_SHOWN) {
+    ui.drops = body ? body.coord_drops : [];
+    ui.read = r;
+    dropThreadDraw(host);
+  }
+  // the thread: his drops and the desk's replies in one list. Only the list is replaced: the filter box keeps its focus and the
+  // composer is never touched. A redraw that would change nothing leaves the DOM alone, so selected text stays selected.
+  function dropThreadDraw(host) {
+    const ui = host._drop;
+    const t = dropThread(ui.drops, ui.view);
+    const q = ui.q.trim().toLowerCase();
+    const hit = (it) => (it.who + "\n" + it.preview + "\n" + it.full).toLowerCase().indexOf(q) >= 0;
+    const rows = q ? t.items.filter(hit) : t.items;
+    const shown = ui.shown || q ? rows : rows.slice(0, DROP_RECENT_SHOWN);
+    const sig = JSON.stringify([t.fault, ui.shown, q, t.items.length > 1, shown.map((it) => [it.key, it.at, it.who, it.preview, it.full, it.meta]), rows.length]);
+    if (sig === ui.sig) return;
+    ui.sig = sig;
+    const key = document.activeElement && ui.list.contains(document.activeElement) ? document.activeElement.dataset.dropKey : null;
+    ui.fault.textContent = t.fault ? "The desk's replies could not be read: " + t.fault : "";
+    ui.fault.hidden = !t.fault;
+    ui.filter.hidden = t.items.length < 2;
+    ui.list.replaceChildren(...shown.map((it) => dropRow(it, ui)));
+    if (q && !rows.length) ui.list.appendChild(el("p", "drop-none ext-meta", "nothing in the thread matches"));
+    const kids = [];
+    if (!q && rows.length > DROP_RECENT_SHOWN) {
       const more = el("button", "needs-history drop-more", ui.shown ? "show fewer" : "show " + (rows.length - DROP_RECENT_SHOWN) + " more");
       more.type = "button";
-      more.addEventListener("click", () => { ui.shown = !ui.shown; dropHeroDraw(host, r); });
+      more.addEventListener("click", () => { ui.shown = !ui.shown; dropThreadDraw(host); });
       kids.push(more);
     }
-    ui.recent.replaceChildren(...kids);
+    ui.moreHost.replaceChildren(...kids);
+    ui.recent.hidden = !(t.fault || t.items.length);
+    if (key) { const again = Array.from(ui.list.querySelectorAll(".drop-row-head")).find((b) => b.dataset.dropKey === key); if (again) again.focus(); }
   }
   function dropRefresh(host, fresh) {
     const t = window.LevainCockpitTransport;
@@ -6990,13 +7079,15 @@
     if (host && host._drop) dropRefresh(host, true);
   }
   // drawn on every KE render, whatever the read says: the drop card (under the Needs-you row, outside #ck-hero) is never silently absent
-  function renderDropHero() {
+  function renderDropHero(view) {
     const host = document.getElementById("ck-drop");
     if (!host) return;
     for (const old of host.querySelectorAll(":scope > .ck-region-err")) old.remove();
     const fresh = !host._drop;
     if (fresh) dropHeroBuild(host);
     host.hidden = false;
+    host._drop.view = view || null;
+    if (host._drop.read) dropThreadDraw(host);      // the desk's side may have changed with this view, whatever the drop read does next
     if (fresh) dropGrow(host._drop.words);      // restored words are sized once the box is laid out, not while the host was hidden
     if (dropRead && Date.now() - dropAt >= DROP_FAIL_TTL_MS) dropRead = null;      // a render reads again once the last read is a few seconds old
     dropRefresh(host, false);

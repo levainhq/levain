@@ -169,24 +169,31 @@ def test_add_an_envelope_opens_the_drop_sheet_with_the_typed_words(tmp_path: Pat
     assert out["posts"] == [], out["posts"]                 # the cockpit page sent nothing: the passkey signs on the sheet only
 
 
+def _many_drops_init(n: int) -> str:
+    """An init script that answers the drops read with `n` drops (drop number 0 the oldest), one minute apart."""
+    body = {"coord_store_read": True, "coord_store_id": "s1", "coord_drops": [
+        {"drop_id": f"d{i}", "words": f"drop number {i}", "sent_at": f"2026-10-30T12:{i:02d}:00.000000Z", "receipts": []} for i in range(n)]}
+    return ("(() => { const f = window.fetch; window.fetch = function (u, o) { const url = typeof u === 'string' ? u : (u && u.url) || '';"
+            " if (url.indexOf('/cockpit/coord/drops.json') >= 0) return Promise.resolve(new Response(" + json.dumps(json.dumps(body)) + ", {status: 200, headers: {'Content-Type': 'application/json'}}));"
+            " return f.apply(this, arguments); }; })();")
+
+
 @needs_browser
 @needs_ssh
-def test_recent_drops_list_collapses_past_three_and_no_drop_row_is_left_in_the_consent_strip(tmp_path: Path, monkeypatch) -> None:
+def test_recent_drops_list_collapses_past_eight_and_no_drop_row_is_left_in_the_consent_strip(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
-    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}]
-    for i in range(4):
-        steps += [*_sent(f"drop number {i}", until=RECEIPT_DONE + f" && {BOX}.value === '' && !{BOX}.disabled", ms=20000)]
-    steps += [{"until": "document.querySelectorAll('#ck-drop .drop-recent-row').length >= 3 && document.querySelector('#ck-drop .drop-more')", "ms": 20000},
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _many_drops_init(9)}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}]
+    steps += [{"until": "document.querySelectorAll('#ck-drop .drop-recent-row').length >= 8 && document.querySelector('#ck-drop .drop-more')", "ms": 20000},
               {"eval": "JSON.stringify({t: 'collapsed', rows: [...document.querySelectorAll('#ck-drop .drop-recent-row')].map(r => r.textContent), more: document.querySelector('#ck-drop .drop-more').textContent})"},
               {"eval": "document.querySelector('#ck-drop .drop-more').click(); 1"},
               {"eval": "JSON.stringify({t: 'opened', n: document.querySelectorAll('#ck-drop .drop-recent-row').length})"},
               {"eval": OPEN_DECISIONS}, {"until": "document.querySelector('#levain-modal [data-consent-grant]')", "ms": 30000}, SETTLE,
               {"eval": "JSON.stringify({t: 'strip', slot: document.querySelectorAll('.coord-drop-slot, .coord-drop-row, [data-coord-drop=open]').length, hero: document.querySelectorAll('#ck-drop').length})"}]
     with rig.serving():
-        got = _tagged(_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", steps))
-    assert len(got["collapsed"]["rows"]) == 3 and got["collapsed"]["more"] == "show 1 more", got["collapsed"]
-    assert "drop number 3" in got["collapsed"]["rows"][0] and "drop number 1" in got["collapsed"]["rows"][2], got["collapsed"]   # newest first
-    assert got["opened"]["n"] == 4, got["opened"]
+        got = _tagged(drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps))
+    assert len(got["collapsed"]["rows"]) == 8 and got["collapsed"]["more"] == "show 1 more", got["collapsed"]
+    assert "drop number 8" in got["collapsed"]["rows"][0] and "drop number 1" in got["collapsed"]["rows"][7], got["collapsed"]   # newest first
+    assert got["opened"]["n"] == 9, got["opened"]
     assert got["strip"] == {"t": "strip", "slot": 0, "hero": 1}, got["strip"]      # the Decisions view holds no drop row; the hero is the one copy
 
 
@@ -201,17 +208,15 @@ GAPS = ("(() => { const h = document.getElementById('ck-drop'); const s = ['.nee
 def test_an_expanded_recent_list_taller_than_the_composer_does_not_move_the_composers_rows(tmp_path: Path, monkeypatch) -> None:
     """The recent column is one of the card's two children, so however tall it grows the left column's gaps are what they were."""
     rig = FullRig(tmp_path, monkeypatch)
-    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}]
-    for i in range(4):
-        steps += [*_sent(f"drop number {i}", until=RECEIPT_DONE + f" && {BOX}.value === '' && !{BOX}.disabled", ms=20000)]
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _many_drops_init(9)}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}]
     fill = ("(() => { const h = document.getElementById('ck-drop'); h.querySelector('.drop-earlier').textContent = '1 earlier drop not confirmed.'; return 1; })()")
     # the clones go in and the gaps are read in ONE evaluation, so a redraw of the list cannot land between them
-    grow = ("(() => { const r = document.querySelector('#ck-drop .drop-recent'); const row = r.querySelector('.drop-recent-row');"
-            " for (let i = 0; i < 12; i++) r.insertBefore(row.cloneNode(true), r.querySelector('.drop-more')); return " + GAPS.replace("TAG", "after") + "; })()")
+    grow = ("(() => { const r = document.querySelector('#ck-drop .drop-list'); const row = r.querySelector('.drop-recent-row');"
+            " for (let i = 0; i < 12; i++) r.appendChild(row.cloneNode(true)); return " + GAPS.replace("TAG", "after") + "; })()")
     steps += [{"until": "document.querySelector('#ck-drop .drop-more')", "ms": 20000}, {"eval": fill}, {"eval": GAPS.replace("TAG", "before")},
               {"eval": "document.querySelector('#ck-drop .drop-more').click(); 1"}, {"eval": grow}]
     with rig.serving():
-        got = _tagged(_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", steps))
+        got = _tagged(drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps))
     before, after = got["before"], got["after"]
     assert after["recent"] > after["left"] + 200, got                  # the list really is taller than the composer
     assert after["gaps"] == before["gaps"] and after["left"] == before["left"], got   # ...and the composer's rows did not move

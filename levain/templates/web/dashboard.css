@@ -2893,26 +2893,32 @@ body.ke .ck-drop .drop-receipt:empty { min-height: 0; margin-top: calc(-1 * var(
 body.ke .ck-drop .drop-receipt.bad { color: var(--bad); }
 body.ke .ck-drop .drop-earlier { margin: 0; overflow-wrap: anywhere; }
 body.ke .ck-drop .drop-earlier:empty { display: none; }
-body.ke .ck-drop .drop-recent { display: flex; flex-direction: column; }
-body.ke .ck-drop .drop-recent:empty { display: none; }
-body.ke .ck-drop .drop-recent-row { display: grid; grid-template-columns: 13ch minmax(0, 1fr) auto; gap: var(--sp-4); align-items: baseline; padding: var(--sp-3) 0; border-top: 1px solid var(--hair); }   /* one fixed time column: the words start at one x on every row */
-body.ke .ck-drop .drop-when { font-variant-numeric: tabular-nums; }
-body.ke .ck-drop .drop-words-first { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+body.ke .ck-drop .drop-recent { display: flex; flex-direction: column; min-width: 0; }
+body.ke .ck-drop .drop-recent[hidden], body.ke .ck-drop .drop-fault[hidden], body.ke .ck-drop .drop-filter[hidden] { display: none; }
+body.ke .ck-drop .drop-fault { margin: 0 0 var(--sp-3); overflow-wrap: anywhere; }
+body.ke .ck-drop .drop-filter { width: 100%; box-sizing: border-box; margin-bottom: var(--sp-3); min-height: var(--hit-min); }
+body.ke .ck-drop .drop-none { margin: var(--sp-3) 0 0; }
+body.ke .ck-drop .drop-recent-row { padding: var(--sp-3) 0; border-top: 1px solid var(--hair); min-width: 0; }
+body.ke .ck-drop .drop-list > .drop-recent-row:first-child { border-top: 0; padding-top: 0; }
+body.ke .ck-drop .drop-recent-row.drop-mine { border-left: 2px solid var(--accent); padding-left: var(--sp-4); }
+body.ke .ck-drop .drop-row-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "who when state" "prev prev prev"; gap: var(--sp-1) var(--sp-4); align-items: baseline;
+  width: 100%; margin: 0; padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; min-width: 0; }
+body.ke .ck-drop .drop-row-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+body.ke .ck-drop .drop-who { grid-area: who; font-weight: var(--fw-bold); }
+body.ke .ck-drop .drop-mine .drop-who { color: var(--accent); }
+body.ke .ck-drop .drop-when { grid-area: when; font-variant-numeric: tabular-nums; }
+body.ke .ck-drop .drop-state { grid-area: state; text-align: right; }
+body.ke .ck-drop .drop-words-first { grid-area: prev; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+body.ke .ck-drop .is-open .drop-words-first { color: var(--dim, inherit); }
+body.ke .ck-drop .drop-full { margin-top: var(--sp-3); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; min-width: 0; }
 body.ke .ck-drop .drop-more { align-self: flex-start; margin-top: var(--sp-3); }
-@media (min-width: 1100px) {
-  body.ke .ck-drop.frame { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 30%); gap: 0; align-items: start; align-content: start; }
-  body.ke .ck-drop.frame:has(> .drop-recent:empty) { grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 760px) {
+  body.ke .ck-drop.frame { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 40%); gap: 0; align-items: start; align-content: start; }
+  body.ke .ck-drop.frame:has(> .drop-recent[hidden]) { grid-template-columns: minmax(0, 1fr); }
   body.ke .ck-drop.frame > .drop-recent { margin-left: var(--sp-6); padding-left: var(--sp-6); border-left: 1px solid var(--hair); }
-  body.ke .ck-drop .drop-recent-row { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "w w" "t s"; gap: var(--sp-1) var(--sp-4); }
-  body.ke .ck-drop .drop-recent-row:first-child { border-top: 0; padding-top: 0; }
-  body.ke .ck-drop .drop-words-first { grid-area: w; white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
-  body.ke .ck-drop .drop-when { grid-area: t; }
-  body.ke .ck-drop .drop-state { grid-area: s; }
 }
 @media (max-width: 720px) {
   body.ke .ck-drop.frame { padding: var(--sp-5); }
-  body.ke .ck-drop .drop-recent-row { grid-template-columns: minmax(0, 1fr) auto; }
-  body.ke .ck-drop .drop-recent-row .drop-when { grid-column: 1 / -1; }
   body.ke .ck-drop .needs-btn { min-height: var(--hit-min); }
   body.ke .ck-drop .drop-actions .needs-btn { flex: 1 1 0; }
 }
