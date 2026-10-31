@@ -30,6 +30,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   `levain question show --json` carry `open_ended`. The cockpit's page script is routed separately.
 
 ### Changed
+- **Revoked devices move to their own tab.** The cockpit's Devices panel now lists only the devices that still hold a key.
+  Revoked ones sit under a "Revoked (N)" tab, newest-revoked first, each with the same details as before. The count is
+  always shown, the tab appears only once something is revoked, and the tab you picked stays through the panel's refreshes.
+  Revoking itself is unchanged.
 - **The ping puts what you act on first.** A question ping is now the question, its options, the answer command, and
   only then the blocks, which take the room left and end "(full text on the card)" when cut. The room is measured in
   the bytes the phone push carries (emoji and accented text take more than one), and the question and the option

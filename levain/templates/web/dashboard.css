@@ -2619,6 +2619,8 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .dev-grid { display: grid; grid-template-columns: minmax(0, 1fr); }
 .dev-body { padding: var(--sp-2) var(--sp-6) var(--sp-6); }
 .dev-list { display: flex; flex-direction: column; }
+.dev-tabs { margin: var(--sp-2) 0 var(--sp-3); }
+.dev-tabs[hidden] { display: none; }
 .dev-row { display: flex; align-items: center; gap: var(--sp-4); padding: var(--sp-4) 0; border-bottom: 1px solid var(--hair); }
 .dev-row:last-child { border-bottom: 0; }
 .dev-main { flex: 1 1 auto; min-width: 0; }
@@ -2643,7 +2645,8 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .dev-link-w { color: var(--text); }
 @media (max-width: 640px) {
   .dev-body { padding-inline: var(--sp-5); }
-  .dev-btn, .dev-label, .dev-url { min-height: var(--hit-min, 44px); }
+  .dev-btn, .dev-label, .dev-url, .dev-tabs .ck-tab { min-height: var(--hit-min, 44px); }
+  .dev-tabs .ck-tab { flex: 1 1 0; }
   .dev-offer .dev-btn { flex: 1 1 100%; }
 }
 
