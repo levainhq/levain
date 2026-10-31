@@ -12,6 +12,7 @@ import math
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 
@@ -36,9 +37,13 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     r.add_argument("--api-key-env", default=None, help="ollama: the NAME of the env var holding the key.")
     r.add_argument("--instructions", default=None, help="A file of consolidate instructions (else anneal's package).")
     r.add_argument("--max-seconds", type=float, default=None,
-                   help="Wall bound in seconds (default 3000; must be positive: a run is never unbounded).")
+                   help="Wall bound in seconds on the COMPOSE and the checks (default 3000; must be positive). It does "
+                        "NOT bound the final save, which runs after the bound is disarmed on purpose (a hard exit "
+                        "mid-save would be worse; the saving-phase journal is the recovery); no compose starts unless "
+                        "the save's time reserve is left.")
     r.add_argument("--occurrence-dir", default=None, help="Where progress.json and usage.json go "
-                                                          "(default <store dir>/dream/<new id>).")
+                                                          "(default <store dir>/dream/<time>-<random id>); never "
+                                                          "inside ~/.anneal-memory.")
     r.add_argument("--dry-run", action="store_true", help="Prepare and print the package, compose nothing.")
     r.add_argument("--json", action="store_true", help="Print the typed result as JSON on stdout.")
     r.set_defaults(func=run_dream_run)
@@ -50,32 +55,39 @@ def run_dream(args: argparse.Namespace) -> int:
     return 1
 
 
-def _resolve_store(store_dir: str) -> tuple[Path | None, str]:
-    """The store's ``memory.db`` under ``store_dir``, or a refusal. Every path the run writes is RESOLVED (symlinks
-    followed) and refused if it lands inside ``~/.anneal-memory`` (case-insensitive): the dir, the candidate db, its
-    own dir (a ``.levain`` symlink), every ``<stem>*`` sibling there (continuity text, crystal, WAL, audit) and the
-    ``wrap.lock`` beside it. A copy dir whose ``memory.db`` is a symlink to the live db is the live store."""
+def _refused(p: Path) -> str | None:
+    """Why ``p`` may not be written by a dream run, or None: it RESOLVES (symlinks followed) inside the operator's
+    live store ``~/.anneal-memory`` (case-insensitive)."""
     from levain.firing.isolation import _is_within_ci, flow_store_dir
 
-    live = flow_store_dir().resolve()
+    r = p.resolve()
+    if _is_within_ci(r, flow_store_dir().resolve()):
+        return (f"{p} resolves to {r}, inside the operator's live store (~/.anneal-memory): `levain dream run` "
+                "is for a COPY. Refused.")
+    return None
 
-    def refused(p: Path) -> str | None:
-        r = p.resolve()
-        if _is_within_ci(r, live):
-            return (f"{p} resolves to {r}, inside the operator's live store (~/.anneal-memory): `levain dream run` "
-                    "is for a COPY. Refused.")
-        return None
 
+def _resolve_store(store_dir: str) -> tuple[Path | None, str]:
+    """The store's RESOLVED ``memory.db`` under ``store_dir``, or a refusal. The db is returned canonical (symlinks
+    followed), so the lock, crystal, continuity text and default occurrence dir the core derives from it sit beside
+    the file SQLite actually writes, never beside an alias. Every path the run writes is refused if it resolves inside
+    ``~/.anneal-memory``: the dir, the candidate db, its canonical dir, every ``<stem>*`` sibling there (continuity
+    text, crystal, WAL, audit) and the ``wrap.lock`` beside it. A copy dir whose ``memory.db`` is a symlink to the live
+    db is the live store."""
     base = Path(store_dir).expanduser()
-    why = refused(base)
+    why = _refused(base)
     if why:
         return None, why
     base = base.resolve()
-    for cand in (base / "memory.db", base / ".levain" / "memory.db"):
-        if not cand.is_file():
+    for alias in (base / "memory.db", base / ".levain" / "memory.db"):
+        if not alias.is_file():
             continue
-        for p in (cand, cand.parent, cand.parent / "wrap.lock"):
-            why = refused(p)
+        why = _refused(alias)
+        if why:
+            return None, why
+        cand = alias.resolve()
+        for p in (cand.parent, cand.parent / "wrap.lock"):
+            why = _refused(p)
             if why:
                 return None, why
         try:
@@ -83,7 +95,7 @@ def _resolve_store(store_dir: str) -> tuple[Path | None, str]:
         except OSError as exc:
             return None, f"{cand.parent} cannot be listed ({type(exc).__name__}: {exc}); refused."
         for p in siblings:
-            why = refused(p)
+            why = _refused(p)
             if why:
                 return None, why
         return cand, ""
@@ -103,11 +115,20 @@ def run_dream_run(args: argparse.Namespace) -> int:
     if store_path is None:
         print(f"levain dream run: {err}", file=sys.stderr)
         return 2
+    # Absolute once, here (the core does it again): the package, the child's cwd, --add-dir and the prompt must all
+    # name the same dir. A default id carries a random suffix: one-second ids collide and overwrite a prior record.
+    occ = (Path(args.occurrence_dir).expanduser() if args.occurrence_dir else
+           store_path.parent / "dream" / f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}").resolve()
+    why = _refused(occ)
+    if why:
+        print(f"levain dream run: --occurrence-dir {why}", file=sys.stderr)
+        return 2
     if args.mind == "claude":
         model = args.model or ex.DEFAULT_CLAUDE_MODEL
         mind: object = ex.ClaudeMind(model, claude_bin=args.claude_bin)
         budget: ex.Budget | None = ex.Budget.for_model(model)
-        if budget.m_usd_micros is None:
+        # A dry run composes nothing and spends nothing: it needs no price row.
+        if budget.m_usd_micros is None and not args.dry_run:
             print(f"levain dream run: no price row for {model!r} in levain.dream.executor.PRICE_TABLE, so the "
                   "one-call ceiling M is unknown and the Claude mind refuses to compose.", file=sys.stderr)
             return 2
@@ -115,9 +136,7 @@ def run_dream_run(args: argparse.Namespace) -> int:
         key = os.environ.get(args.api_key_env) if args.api_key_env else None
         mind = ex.OllamaMind(args.model or _w.DEFAULT_COMPOSE_MODEL, base_url=args.base_url, api_key=key)
         budget = None
-    occ = Path(args.occurrence_dir).expanduser() if args.occurrence_dir else \
-        store_path.parent / "dream" / time.strftime("%Y%m%dT%H%M%S")
-    result =ex.consolidate_store(
+    result = ex.consolidate_store(
         store_path, mind=mind, composer=getattr(mind, "model", None), max_seconds=max_seconds, budget=budget,
         instructions_path=args.instructions, occurrence_dir=occ, dry_run=args.dry_run,
         hard_exit_code=_w.EXIT_TIMEOUT, label="levain dream run")

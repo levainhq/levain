@@ -68,8 +68,13 @@ STUB = textwrap.dedent('''\
     occ=""; prev=""
     for a in "$@"; do [ "$prev" = "--add-dir" ] && occ="$a"; prev="$a"; done
     cp "$occ/progress.json" "$D/seen-$n.progress"
+    pk=$(sed -n 's/.*consolidation package is the file \\(.*\\)\\. Read it.*/\\1/p' "$D/stdin-$n")
+    [ -f "$pk" ] && echo ok > "$D/pkg-$n"
     [ -f "$D/sleep-$n" ] && sleep "$(cat "$D/sleep-$n")"
     cat "$D/result-$n.json" 2>/dev/null
+    rc=$?
+    [ -f "$D/exit-$n" ] && exit "$(cat "$D/exit-$n")"
+    exit $rc
     ''')
 
 
@@ -879,3 +884,279 @@ def test_K_usage_tokens_are_none_not_zero_when_unreadable_on_the_dollar_route(sc
     use = json.loads((tmp_path / "occ" / "usage.json").read_text())
     assert use["readable"] is True and use["actual_usd_micros"] == 1_500_000
     assert use["input_tokens"] is None and use["output_tokens"] is None
+
+
+# ---------- review fixes (D1-1a r3): each from a hand run on a scratch store ----------
+
+def _fake_home(tmp_path, monkeypatch) -> Path:
+    home = tmp_path / "home"
+    (home / ".anneal-memory").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    return home / ".anneal-memory"
+
+
+def test_r3_1_a_relative_occurrence_dir_names_one_dir_for_the_package_cwd_and_prompt(scratch, stub, tmp_path,
+                                                                                     monkeypatch):
+    from levain import cli
+
+    monkeypatch.setitem(ex.PRICE_TABLE, PINNED, TEST_ROW)
+    monkeypatch.chdir(tmp_path)
+    stub.result(1)
+    assert cli.main(["dream", "run", "--store-dir", str(scratch.parent), "--mind", "claude", "--model", PINNED,
+                     "--claude-bin", str(stub.bin), "--occurrence-dir", "occ-rel"]) == 0
+    assert (stub.dir / "pkg-1").read_text().strip() == "ok"       # the child (cwd = occ) read its package
+    assert stub.argv(1)[stub.argv(1).index("--add-dir") + 1] == str(tmp_path / "occ-rel")
+    assert not (tmp_path / "occ-rel" / "occ-rel").exists()
+    other = tmp_path / "s2"                                        # the core resolves a relative dir on its own
+    other.mkdir()
+    with Store(str(other / "memory.db"), section_schema=FLOW_SCHEMA) as s:
+        s.record(content="one", episode_type="observation", source="t")
+    stub.result(2)
+    r = ex.consolidate_store(other / "memory.db", mind=_claude(stub), budget=_budget(), max_seconds=3000,
+                             occurrence_dir="occ-core")
+    assert r.outcome == "saved" and (stub.dir / "pkg-2").read_text().strip() == "ok"
+
+
+def test_r3_2_an_occurrence_dir_in_the_live_store_is_refused_and_default_ids_never_collide(scratch, tmp_path,
+                                                                                         monkeypatch, capsys):
+    from levain import cli
+    from levain.dream import cli as dcli
+
+    live = _fake_home(tmp_path, monkeypatch)
+    link = tmp_path / "occ-link"
+    link.symlink_to(live)
+    for occ in (live / "x", link / "y"):
+        assert cli.main(["dream", "run", "--store-dir", str(scratch.parent), "--mind", "ollama",
+                         "--occurrence-dir", str(occ)]) == 2
+        assert "inside the operator's live store" in capsys.readouterr().err
+    assert list(live.iterdir()) == [] and _store_state(scratch) == (None, 0, 3)
+    monkeypatch.setattr(dcli.time, "strftime", lambda *a, **k: "20261031T000000")   # two runs in one second
+    for _ in range(2):
+        assert cli.main(["dream", "run", "--store-dir", str(scratch.parent), "--mind", "ollama", "--dry-run"]) == 0
+    runs = sorted((scratch.parent / "dream").iterdir())
+    assert len(runs) == 2 and all(p.name.startswith("20261031T000000-") for p in runs)
+    assert all((p / "progress.json").exists() and (p / "usage.json").exists() for p in runs)
+
+
+def test_r3_3_a_symlinked_db_resolves_and_every_sibling_sits_beside_the_real_file(tmp_path, monkeypatch, capsys):
+    from levain import cli
+    from levain.dream.cli import _resolve_store
+
+    _fake_home(tmp_path, monkeypatch)
+    real = tmp_path / "copy-real"
+    real.mkdir()
+    with Store(str(real / "memory.db"), section_schema=FLOW_SCHEMA) as s:
+        s.record(content="copy", episode_type="observation", source="t")
+    alias = tmp_path / "copy-link"
+    alias.mkdir()
+    (alias / "memory.db").symlink_to(real / "memory.db")
+    assert _resolve_store(str(alias)) == (real / "memory.db", "")
+    monkeypatch.setattr(ex.OllamaMind, "_default_client",
+                        lambda self, s, u: _Resp(_VALID, {"prompt_tokens": 1, "completion_tokens": 1}))
+    assert cli.main(["dream", "run", "--store-dir", str(alias), "--mind", "ollama"]) == 0
+    assert (real / "wrap.lock").exists() and (real / "memory.continuity.md").exists() and (real / "dream").is_dir()
+    assert sorted(p.name for p in alias.iterdir()) == ["memory.db"]   # nothing derived from the alias
+
+
+def test_r3_4_a_dry_run_on_the_claude_mind_needs_no_price_row_and_spends_nothing(scratch, stub, tmp_path, capsys):
+    from levain import cli
+
+    assert cli.main(["dream", "run", "--store-dir", str(scratch.parent), "--mind", "claude", "--model", "unpriced",
+                     "--claude-bin", str(stub.bin), "--dry-run", "--occurrence-dir", str(tmp_path / "o1")]) == 0
+    for budget in (ex.Budget.for_model("unpriced"), None):
+        r = ex.consolidate_store(scratch, mind=ex.ClaudeMind("unpriced", claude_bin=str(stub.bin)), budget=budget,
+                                 max_seconds=3000, dry_run=True, occurrence_dir=tmp_path / "o2")
+        assert (r.outcome, r.exit_code) == ("dry-run", 0)
+    assert stub.calls() == 0 and _store_state(scratch) == (None, 0, 3)
+    r = ex.consolidate_store(scratch, mind=ex.ClaudeMind("unpriced", claude_bin=str(stub.bin)),
+                             budget=ex.Budget.for_model("unpriced"), max_seconds=3000)
+    assert (r.outcome, r.exit_code) == ("budget", 2)              # a real run still refuses with no row
+
+
+def test_r3_5_a_failing_mkdtemp_takes_the_copy_failure_route(scratch, stub, tmp_path, monkeypatch):
+    def no_space(**k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ex.tempfile, "mkdtemp", no_space)
+    assert ex.check_on_copy(scratch, _VALID, wrap_token="c" * 32, session_id=None, project_name="x") is None
+    stub.result(1)
+    r = _run(scratch, tmp_path, _claude(stub), budget=_budget())   # the check is skipped, the real save decides
+    assert r.outcome == "saved" and stub.calls() == 1
+
+
+def test_r3_7_a_success_json_from_a_child_that_exits_nonzero_is_not_accepted(scratch, stub, tmp_path):
+    stub.result(1)
+    (stub.dir / "exit-1").write_text("1")
+    r = _run(scratch, tmp_path, _claude(stub), budget=_budget(), max_composes=1)
+    assert (r.outcome, r.exit_code) == ("compose-failed", 1) and _store_state(scratch) == (None, 0, 3)
+    (row,) = r.composes
+    assert row["error"].startswith("child-exit-1") and row["usd_micros"] == 1_500_000 and row["input_tokens"] == 12
+    raw = (stub.dir / "result-1.json").read_bytes()
+    assert ex.ClaudeMind(PINNED).parse(raw, 0, 0.1).text and ex.ClaudeMind(PINNED).parse(raw, None, 0.1).error
+
+
+class _Raises(_Never):
+    def compose(self, req):
+        raise RuntimeError("endpoint down")
+
+
+class _Gone(_Never):
+    def compose(self, req):
+        raise ex.ComposeUnavailable("no extra")
+
+
+class _Bad(_Never):
+    def compose(self, req):
+        return ex.ComposeResult(text="## State\nbroken")
+
+
+class _Stalls(_Never):
+    def compose(self, req):
+        time.sleep(10)
+
+
+def test_r3_8_progress_after_every_non_saved_end_names_no_save(scratch, stub, tmp_path, monkeypatch):
+    import anneal_memory.continuity as ac
+
+    def progress(occ):
+        return json.loads((occ / "progress.json").read_text())
+
+    def unsaved(occ):
+        p = progress(occ)
+        return (p["phase"], p["wrap_token"], p["composed_sha256"]) == (None, None, None)
+
+    cases = {
+        "refused": dict(mind=_Bad(), max_composes=1),
+        "compose-failed": dict(mind=_Raises()),
+        "compose-unavailable": dict(mind=_Gone()),
+        "dry-run": dict(mind=_Never(), dry_run=True),
+        "deadline": dict(mind=_Stalls(), max_seconds=1, save_reserve=0.0),
+    }
+    for want, kw in cases.items():
+        occ = tmp_path / f"occ-{want}"
+        r = ex.consolidate_store(scratch, occurrence_dir=occ, **kw)
+        assert r.outcome == want and unsaved(occ), (want, progress(occ))
+    stub.result(1, "## State\nx", cost=17.5)                        # budget: an overshoot closes the run
+    r = _run(scratch, tmp_path, _claude(stub), budget=_budget(), occurrence_dir=tmp_path / "occ-budget")
+    assert r.outcome == "budget" and unsaved(tmp_path / "occ-budget")
+    real_save = ac.validated_save_continuity                     # unknown: the save raised, the store unreadable
+    monkeypatch.setattr(ac, "validated_save_continuity", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr(wrapmod, "_last_wrap_id", lambda s: None)
+    r = ex.consolidate_store(scratch, mind=ex.OllamaMind(client=lambda s, u: _Resp(_VALID, None)), max_composes=1,
+                             occurrence_dir=tmp_path / "occ-unknown")
+    assert r.outcome == "unknown" and unsaved(tmp_path / "occ-unknown")
+    monkeypatch.setattr(ac, "validated_save_continuity", real_save)
+    monkeypatch.undo()
+    monkeypatch.setattr(wrapmod, "_cancel_if_ours", lambda store, token: False)   # a cancel that FAILED
+    r = ex.consolidate_store(scratch, mind=_Bad(), max_composes=1, occurrence_dir=tmp_path / "occ-kept")
+    p = progress(tmp_path / "occ-kept")
+    assert r.outcome == "refused" and p["phase"] == "saving" and p["wrap_token"] == r.wrap_token
+    monkeypatch.undo()
+    with Store(str(scratch), section_schema=None) as s:            # clear the wrap the failed cancel left open
+        s.wrap_cancelled(expect_token=r.wrap_token)
+    r = ex.consolidate_store(scratch, mind=ex.OllamaMind(client=lambda s, u: _Resp(_VALID, None)),
+                             occurrence_dir=tmp_path / "occ-saved")
+    p = progress(tmp_path / "occ-saved")
+    assert r.outcome == "saved" and p["phase"] == "saved" and p["composed_sha256"] and p["wrap_token"]
+
+
+def test_r3_8_a_save_that_committed_then_raised_on_an_unreadable_store_keeps_saving(scratch, tmp_path, monkeypatch):
+    import anneal_memory.continuity as ac
+
+    real_save = ac.validated_save_continuity
+
+    def commit_then_raise(*a, **k):
+        real_save(*a, **k)
+        raise OSError("raised after the commit")
+
+    monkeypatch.setattr(ac, "validated_save_continuity", commit_then_raise)
+    monkeypatch.setattr(wrapmod, "_last_wrap_id", lambda s: None)
+    occ = tmp_path / "occ"
+    r = ex.consolidate_store(scratch, mind=ex.OllamaMind(client=lambda s, u: _Resp(_VALID, None)), max_composes=1,
+                             occurrence_dir=occ)
+    p = json.loads((occ / "progress.json").read_text())
+    assert r.outcome == "unknown" and _store_state(scratch)[1] == 1   # it DID commit
+    assert p["phase"] == "saving" and p["composed_sha256"] and p["wrap_token"] == r.wrap_token
+
+
+def test_r3_9_the_child_key_clear_is_retried_once_then_fails_the_run(scratch, stub, tmp_path, monkeypatch):
+    real = ex.Progress.update
+    fails = {"left": 1}
+
+    def update(self, **v):
+        if "child_pid" in v and v["child_pid"] is None and "phase" not in v and fails["left"]:
+            fails["left"] -= 1
+            self.data.update(v)
+            self.write_error = "OSError: injected"
+            return False
+        return real(self, **v)
+
+    monkeypatch.setattr(ex.Progress, "update", update)
+    stub.result(1)
+    r = _run(scratch, tmp_path, _claude(stub), budget=_budget())   # one failure: the retry clears it
+    assert r.outcome == "saved" and json.loads((tmp_path / "occ" / "progress.json").read_text())["child_pid"] is None
+    fails["left"] = 2
+    other = tmp_path / "s2"
+    other.mkdir()
+    with Store(str(other / "memory.db"), section_schema=FLOW_SCHEMA) as s:
+        s.record(content="one", episode_type="observation", source="t")
+    stub.result(2)
+    stub.result(3)
+    r = _run(other / "memory.db", tmp_path, _claude(stub), budget=_budget(), occurrence_dir=tmp_path / "occ2")
+    assert (r.outcome, r.exit_code) == ("failed", 1) and "still names the reaped compose child" in r.detail
+    assert len(r.composes) == 1 and r.composes[0]["usd_micros"] == 1_500_000 and stub.calls() == 2
+    assert _store_state(other / "memory.db") == (None, 0, 1)
+
+
+def test_r3_10_the_wrap_route_starts_its_compose_whatever_the_core_clock_says(tmp_path, monkeypatch):
+    import types
+
+    from levain.wrap import wrap_entity
+
+    seen = []
+
+    class Rec(_Never):
+        def compose(self, req):
+            seen.append(req.timeout_s)
+            return ex.ComposeResult(text=_VALID)
+
+    r = ex.consolidate_store(_store_in(tmp_path / "a"), mind=Rec(), max_seconds=1e-6, save_reserve=0.0,
+                             own_deadline=False, max_composes=1)
+    assert r.outcome == "saved" and seen == [None]
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    (ent / ".levain" / "config.json").write_text(json.dumps({"adapter": "openhands"}))
+    _store_in(ent / ".levain")
+    ticks = iter([0.0])
+    clock = types.SimpleNamespace(**{k: getattr(time, k) for k in dir(time) if not k.startswith("_")})
+    clock.monotonic = lambda: next(ticks, 10_000.0)               # the core sees 10000 s gone, past max_seconds
+    monkeypatch.setattr(ex, "time", clock)
+    composed = []
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: (composed.append(1), _VALID)[1])
+    assert wrap_entity(ent, max_seconds=30) == 0 and composed == [1]
+
+
+def _store_in(d: Path) -> Path:
+    d.mkdir(parents=True, exist_ok=True)
+    with Store(str(d / "memory.db"), section_schema=FLOW_SCHEMA) as s:
+        for i in range(2):
+            s.record(content=f"Turn {i}: helped.", episode_type="observation", source="t")
+    return d / "memory.db"
+
+
+def test_r3_12_the_dream_routes_unclassified_save_text_is_its_own_and_exc_is_never_renamed(scratch, monkeypatch,
+                                                                                          capsys):
+    import anneal_memory.continuity as ac
+
+    def boom(*a, **k):
+        raise RuntimeError("raised from levain wrap internals")
+
+    monkeypatch.setattr(ac, "validated_save_continuity", boom)
+    monkeypatch.setattr(wrapmod, "_last_wrap_id", lambda s: None)
+    mind = ex.OllamaMind(client=lambda s, u: _Resp(_VALID, None))
+    assert ex.consolidate_store(scratch, mind=mind, max_composes=1).outcome == "unknown"
+    out = capsys.readouterr().out
+    assert "raised from levain wrap internals" in out             # exc untouched
+    assert "levain dream: the save failed" in out and "wrap-status" in out and "--dry-run" not in out
+    assert ex.WRAP_REMEDIES.save_unreadable == wrapmod._SAVE_UNREADABLE   # wrap keeps its own text
+    assert ex.WRAP_REMEDIES.save_unknown == wrapmod._SAVE_UNKNOWN
