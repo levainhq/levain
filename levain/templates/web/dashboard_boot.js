@@ -174,7 +174,7 @@
       finally { if (go.isConnected) go.disabled = false; }
     });
     card.append(brand, h, p);
-    // pair_card.js knows whether this page runs as an installed app; one extra line then, nothing otherwise
+    // an installed app keeps its own sign-in: one extra line then, nothing otherwise (read now, when the card is drawn)
     const pc = window.levainPairCard;
     const installed = pc && typeof pc.installedNote === "function" ? pc.installedNote() : "";
     if (installed) {

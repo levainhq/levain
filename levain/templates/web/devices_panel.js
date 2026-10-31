@@ -27,13 +27,14 @@
   // notification and pair_card.js, which holds the page's key, records the open.
   const PAIRED_MARK_KEY = "levain_paired_device";   // MUST equal pair.js / dashboard_boot.js PAIRED_MARK_KEY
   const PUSH_OK = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
-  // The detection helper and the words about a page with no push API live in pair_card.js (one copy), read when used.
+  // One copy of the push environment for every surface, so the words cannot drift; read at the moment they are drawn,
+  // never kept from an earlier look.
   const shared = () => window.levainPairCard || {};
   // the words for a page with no push API (the plain-http case has its own, INSECURE_SAY)
   function noPushSay() {
     if (window.isSecureContext === false) return INSECURE_SAY;
     const f = shared().noPushWords;
-    return f ? f() : "This browser does not offer pings.";
+    return typeof f === "function" ? f() : "This browser does not offer pings.";
   }
   let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
   const b64uToBytes = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
@@ -62,15 +63,22 @@
       return { status: res.status, data: data };
     } finally { if (timer) clearTimeout(timer); }
   }
-  function when(iso) {
+  // ONE reading of a stamp, in milliseconds: ISO text, or an epoch number in seconds or milliseconds. NaN when it is none of those
+  // (empty, null, text that is not a date), so each caller decides what an unreadable stamp means.
+  function stampMs(v) {
+    if (typeof v === "number") return Number.isFinite(v) ? (Math.abs(v) < 1e11 ? v * 1000 : v) : NaN;
+    if (typeof v !== "string" || !v) return NaN;
+    return Date.parse(v);
+  }
+  function when(iso, now) {
     if (!iso) return "never";
-    const d = new Date(iso);
-    if (isNaN(d.getTime())) return iso;
-    const s = Math.max(0, (Date.now() - d.getTime()) / 1000);
+    const t = stampMs(iso);
+    if (Number.isNaN(t)) return iso;
+    const s = Math.max(0, ((now === undefined ? Date.now() : now) - t) / 1000);
     if (s < 90) return "just now";
     if (s < 5400) return Math.round(s / 60) + " min ago";
     if (s < 129600) return Math.round(s / 3600) + " h ago";
-    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   }
 
   function build() {
@@ -168,28 +176,29 @@
   // "" for a device seen (or, never seen, paired) within the day; otherwise the chip's words
   const DAY_MS = 86400000;
   const STALE_FIX = "If this device asks for a pairing code, revoke it here and pair it again.";
-  function quietFor(d) {
-    const seen = d.last_seen ? Date.parse(d.last_seen) : NaN;
+  function quietFor(d, now) {
+    const seen = stampMs(d.last_seen);
     if (!Number.isNaN(seen)) {
-      const days = Math.floor((Date.now() - seen) / DAY_MS);
+      const days = Math.floor((now - seen) / DAY_MS);
       return days >= 1 ? "not seen for " + days + (days === 1 ? " day" : " days") : "";
     }
-    const made = Date.parse(d.created);
-    return !Number.isNaN(made) && Date.now() - made > DAY_MS ? "never seen" : "";
+    const made = stampMs(d.created);
+    return !Number.isNaN(made) && now - made > DAY_MS ? "never seen" : "";
   }
 
-  function row(d) {
+  // `now` and `quiet` come from the one paint that draws this row, so the tab's fix line and the chip agree
+  function row(d, now, quiet) {
     const r = el("div", "dev-row" + (d.revoked_at ? " dev-revoked" : ""));
     const main = el("div", "dev-main");
     const name = el("div", "dev-name", d.label || d.id);
     name.dir = "auto";                                              // the label alone: its own direction
     main.appendChild(name);
-    const meta = el("div", "dev-meta", "paired " + when(d.created) + " · last seen " + when(d.last_seen) + (d.paired_by ? " · by " + d.paired_by : "") + " · ");
+    const meta = el("div", "dev-meta", "paired " + when(d.created, now) + " · last seen " + when(d.last_seen, now) + (d.paired_by ? " · by " + d.paired_by : "") + " · ");
     meta.appendChild(el("span", "dev-id", shortId(d.id)));          // no-wrap: the id never breaks at its hyphen on a phone
     main.appendChild(meta);
     r.appendChild(main);
     if (d.revoked_at) {
-      r.appendChild(el("span", "pill dev-pill", "revoked " + when(d.revoked_at)));
+      r.appendChild(el("span", "pill dev-pill", "revoked " + when(d.revoked_at, now)));
     } else {
       const b = el("button", "dev-btn", "Revoke");
       b.type = "button";
@@ -199,7 +208,6 @@
       // from devices.json `subscribed`: any live push subscription under this device
       meta.appendChild(document.createTextNode(" · " + (d.subscribed ? "pings on" : "pings off")));
       // A key the server holds is not a device that is using it: one that moved origin or lost its storage still reads paired
-      const quiet = quietFor(d);
       if (quiet) {
         r.appendChild(el("span", "pill dev-pill dev-stale", quiet));
       }
@@ -209,14 +217,14 @@
 
   // Draws the chosen tab from the last read. Active devices newest-paired first; revoked ones newest-revoked first. The Revoked
   // tab exists only while something is revoked, and its count rides its label, so a long history is never hidden silently.
-  // A stamp as a number (ISO text or epoch seconds); one that does not parse sorts last.
+  // A stamp as milliseconds for sorting; one that does not parse sorts last.
   // (named apart from when(), the readable age: a second `when` here would replace it for every caller)
   function stamp(v) {
-    if (typeof v === "number") return v;
-    const t = Date.parse(v);
+    const t = stampMs(v);
     return Number.isNaN(t) ? 0 : t;
   }
   function paint() {
+    const now = Date.now();
     const live = lastDevs.filter((d) => !d.revoked_at).sort((a, b) => stamp(b.created) - stamp(a.created));
     const gone_ = lastDevs.filter((d) => d.revoked_at).sort((a, b) => stamp(b.revoked_at) - stamp(a.revoked_at));
     if (!gone_.length) tab = "active";
@@ -235,8 +243,9 @@
     if (!lastDevs.length) list.appendChild(el("p", "dev-none", "No device is paired yet. Pair one below: it gets its own key, and you can revoke it here."));
     else if (!shown.length) list.appendChild(el("p", "dev-none", "No active device. Pair one below: it gets its own key, and you can revoke it here."));
     // one line for the whole tab, not one per row: how to fix a device that holds a key it can no longer use
-    if (tab !== "revoked" && shown.some((d) => quietFor(d))) list.insertBefore(el("p", "dev-none dev-stale-note", STALE_FIX), list.firstChild);
-    for (const d of shown) list.appendChild(row(d));
+    const quiet = new Map(shown.map((d) => [d, d.revoked_at ? "" : quietFor(d, now)]));
+    if (tab !== "revoked" && [...quiet.values()].some((q) => q)) list.insertBefore(el("p", "dev-none dev-stale-note", STALE_FIX), list.firstChild);
+    for (const d of shown) list.appendChild(row(d, now, quiet.get(d)));
   }
 
   // One read and one paint. Resolves true when the panel is as current as it can be (including "nothing to show here"),
@@ -279,8 +288,8 @@
       pushAsked = true;
       try {
         const res = await api("GET", "/webpush/key", undefined, READ_TIMEOUT_MS);
-        if (res.status === 200 && typeof res.data.key === "string") pushKey = res.data.key;
-        else if (res.status !== 200 && res.status !== 404) { pushAsked = false; return; }   // a 5xx or odd answer: ask again on the next read
+        if (res.status === 200 && typeof res.data.key === "string" && res.data.key) pushKey = res.data.key;
+        else if (res.status !== 404) { pushAsked = false; return; }   // a 5xx, an odd answer or a 200 with no key: ask again on the next read
       } catch (_) { pushAsked = false; return; }      // no answer: ask again on the next read
     }
     if (!pushKey) return;                               // this cockpit serves no web push: no row
@@ -315,7 +324,14 @@
       if (old) await old.unsubscribe().catch(() => {});
       sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(pushKey) });
       const j = sub.toJSON();
-      const res = await api("POST", "/webpush/subscribe", { endpoint: j.endpoint, keys: j.keys });
+      let res;
+      try { res = await api("POST", "/webpush/subscribe", { endpoint: j.endpoint, keys: j.keys }); }
+      catch (_) {
+        // the request may have reached the cockpit: keep the browser's subscription, and do not say nothing changed
+        sub = null;
+        say(shared().subscribeLost || "Pings may have been turned on, but no answer came back. Check the Devices panel before trying again.");
+        return;
+      }
       if (res.status !== 200) {
         // a browser subscription the cockpit does not hold would read "on" and never ping
         await sub.unsubscribe().catch(() => {});

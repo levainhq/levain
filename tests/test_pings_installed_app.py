@@ -5,6 +5,7 @@ page's own scripts run (the driver's ``init`` step)."""
 from __future__ import annotations
 
 import json
+import re
 import os
 from typing import Any
 
@@ -165,3 +166,82 @@ def test_the_pair_card_note_is_for_the_ios_home_screen_app_only(tmp_path, monkey
         ], flags)
     assert other["values"][-1] is True, other["values"]      # an installed app that is not iOS shares the browser's sign-in: no note
 
+
+
+def test_the_shared_push_helper_loads_before_either_script_that_reads_it() -> None:
+    # plain scripts run in the order written; a 403 that answers at once must find the helper already defined
+    from levain.web_server import load_web_asset
+
+    html = load_web_asset("dashboard.html")
+    at = {n: html.index(f'<script src="/{n}.js"></script>') for n in ("pair_card", "dashboard_boot", "devices_panel")}
+    assert at["pair_card"] < at["dashboard_boot"] and at["pair_card"] < at["devices_panel"], at
+    assert not re.search(r"<script[^>]*src=\"/(pair_card|dashboard_boot|devices_panel)\.js\"[^>]*(async|defer)", html)
+
+
+def test_the_stale_sub_note_style_outranks_the_empty_state_block() -> None:
+    from levain.web_server import load_web_asset
+
+    css = load_web_asset("dashboard.css")
+    assert css.index(".dev-none.dev-stale-note") > css.index("\n.dev-none {")
+
+
+FAKE_SUBSCRIBE = ("(() => { window.__unsubs = 0; Notification.requestPermission = async () => 'granted';"
+                  " const fake = { endpoint: 'https://push.invalid/x', toJSON: () => ({ endpoint: 'https://push.invalid/x', keys: {} }),"
+                  " unsubscribe: async () => { window.__unsubs++; return true; } };"
+                  " PushManager.prototype.subscribe = async () => fake; PushManager.prototype.getSubscription = async () => null;"
+                  " const f = window.fetch.bind(window);"
+                  " window.fetch = (u, o) => String(u).includes('/webpush/subscribe') ? %s : f(u, o); return 1; })()")
+LOST = "Promise.reject(new TypeError('network'))"
+REFUSED = "Promise.resolve(new Response(JSON.stringify({message: 'not now'}), {status: 400}))"
+NOTE = "document.querySelector('.dev-note').textContent"
+
+
+def _turn_on_with(tmp_path, rig, answer: str):
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _):
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token={T}", [
+            {"until": f"{_ROW} && !{_ROW}.hidden", "ms": 20000},
+            {"eval": FAKE_SUBSCRIBE % answer},
+            {"eval": f"{_ROW}.querySelector('button').click() || 1"},
+            {"until": f"{NOTE}.length > 0", "ms": 20000},
+            {"eval": NOTE},
+            {"eval": "window.__unsubs"},
+        ])
+    return out["values"][-2], out["values"][-1]
+
+
+@needs_browser
+def test_a_lost_subscribe_answer_keeps_the_subscription_and_does_not_claim_nothing_changed(rig, tmp_path) -> None:
+    note, unsubs = _turn_on_with(tmp_path, rig, LOST)
+    assert unsubs == 0, unsubs
+    assert "Nothing was changed" not in note and "Devices panel" in note, note
+
+
+@needs_browser
+def test_a_clear_subscribe_refusal_still_undoes_the_subscription(rig, tmp_path) -> None:
+    note, unsubs = _turn_on_with(tmp_path, rig, REFUSED)
+    assert unsubs == 1 and note == "Could not turn pings on (not now).", (note, unsubs)
+
+
+def _devices_json(last_seen: object, created: str) -> str:
+    dev = {"id": "d-abc123", "label": "Tablet", "created": created, "last_seen": last_seen, "revoked_at": None, "subscribed": False, "paired_by": None}
+    return ("(() => { const f = window.fetch.bind(window); window.fetch = (u, o) => String(u).endsWith('/cockpit/pair/devices.json')"
+            f" ? Promise.resolve(new Response({json.dumps(json.dumps({'devices': [dev]}))}, {{status: 200}})) : f(u, o); return 1; }})()")
+
+
+@needs_browser
+def test_an_epoch_last_seen_reads_the_same_as_iso_text(rig, tmp_path) -> None:
+    import time
+
+    src, qdir = rig
+    three_days = int(time.time()) - 3 * 86400
+    chips = []
+    for seen in (three_days, three_days * 1000):   # seconds, then milliseconds
+        with _signed(src, qdir) as (port, _):
+            out = _drive(tmp_path, f"http://localhost:{port}/#write_token={T}", [
+                {"init": _devices_json(seen, "2020-01-01T00:00:00+00:00")},
+                {"until": "document.querySelector('.dev-list .dev-row')", "ms": 20000},
+                {"eval": "(document.querySelector('.dev-list .dev-stale') || {}).textContent || ''"},
+            ])
+        chips.append(out["values"][-1])
+    assert chips == ["not seen for 3 days"] * 2, chips

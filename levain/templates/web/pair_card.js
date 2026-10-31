@@ -144,7 +144,14 @@
         if (old) await old.unsubscribe().catch(() => {});
         sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
         const j = sub.toJSON();
-        const subbed = await api("POST", "/webpush/subscribe", { endpoint: j.endpoint, keys: j.keys });
+        let subbed;
+        try { subbed = await api("POST", "/webpush/subscribe", { endpoint: j.endpoint, keys: j.keys }); }
+        catch (_) {
+          // the request may have reached the cockpit: keep the browser's subscription, and do not say nothing changed
+          sub = null;
+          say(SUBSCRIBE_LOST);
+          return;
+        }
         if (subbed.status !== 200) {
           await sub.unsubscribe().catch(() => {});
           say("Could not turn pings on (" + ((subbed.data && subbed.data.message) || subbed.status) + ").");
@@ -233,7 +240,7 @@
     return draining;
   }
 
-  // The one copy of the page's push environment and of the words about it; devices_panel.js reads them from window.levainPairCard.
+  // One copy of the page's push environment and of the words about it, so every surface says the same thing.
   // WebKit (every iOS and iPadOS browser) offers Notification and PushManager only to a web app opened from the Home Screen.
   function onApple() {
     const ua = String(navigator.userAgent || "");
@@ -253,6 +260,7 @@
     if (onApple()) return installed ? APPLE_OLD_SAY : HOME_SCREEN_SAY;
     return installed ? NO_PINGS_DEVICE_SAY : NO_PINGS_SAY;
   }
+  const SUBSCRIBE_LOST = "Pings may have been turned on, but no answer came back. Check the Devices panel before trying again.";
   function turnOnFailed(e) { return "Could not turn pings on. Nothing was changed; try again, or reload the page. (" + ((e && e.message) || e) + ")"; }
   // Only the iOS Home Screen app keeps its storage apart from the browser's, so only it signs in once of its own: the pair card says so.
   // A code comes from the Devices panel of a device that is already paired.
@@ -263,7 +271,7 @@
   }
 
   window.levainPairCard = { claim: claim, drainOpened: drainOpened, fold: fold, installedNote: installedNote,
-    env: () => ({ installed: installedApp(), apple: onApple() }), noPushWords: noPushWords, turnOnFailed: turnOnFailed };
+    env: () => ({ installed: installedApp(), apple: onApple() }), noPushWords: noPushWords, turnOnFailed: turnOnFailed, subscribeLost: SUBSCRIBE_LOST };
 
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") drainOpened(); });
   if ("serviceWorker" in navigator) {
