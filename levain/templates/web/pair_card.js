@@ -123,7 +123,9 @@
   async function pingsStep(ui) {
     const key = PUSH_OK ? await pushKey() : "";
     if (!key) {
-      const why = PUSH_OK ? "This cockpit does not send pings." : "Pings need the Levain app on the Home Screen (or a browser that offers them on this address).";
+      const why = PUSH_OK ? "This cockpit does not send pings."
+        : installedApp() ? "This device does not offer pings."
+        : "Pings need the Levain app on the Home Screen (or a browser that offers them on this address).";
       draw(ui, "Paired", "This device is paired. " + why, [button("Continue", true, finish)]);
       return;
     }
@@ -231,7 +233,16 @@
     return draining;
   }
 
-  window.levainPairCard = { claim: claim, drainOpened: drainOpened, fold: fold };
+  // A Home Screen app keeps its storage apart from the browser's, so it signs in once of its own: the pair card says so.
+  function installedApp() {
+    try { if (navigator.standalone === true) return true; } catch (_) { /* no such property */ }
+    try { return !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches); } catch (_) { return false; }
+  }
+  function installedNote() {
+    return installedApp() ? "This Home Screen app keeps its own sign-in, so it needs one pairing code: get one from the Devices panel in the cockpit on another device." : "";
+  }
+
+  window.levainPairCard = { claim: claim, drainOpened: drainOpened, fold: fold, installedNote: installedNote };
 
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") drainOpened(); });
   if ("serviceWorker" in navigator) {

@@ -27,6 +27,25 @@
   // notification and pair_card.js, which holds the page's key, records the open.
   const PAIRED_MARK_KEY = "levain_paired_device";   // MUST equal pair.js / dashboard_boot.js PAIRED_MARK_KEY
   const PUSH_OK = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+  // WebKit (every iOS and iPadOS browser) offers Notification and PushManager only to a web app opened from the Home Screen;
+  // in a browser tab the globals do not exist. So "no push API" there means "install first", not "this browser cannot".
+  function onApple() {
+    const ua = String(navigator.userAgent || "");
+    return /iPhone|iPod|iPad/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);   // iPadOS desktop mode reports a Mac
+  }
+  function installedApp() {
+    try { if (navigator.standalone === true) return true; } catch (_) { /* no such property */ }
+    try { return !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches); } catch (_) { return false; }
+  }
+  function pushEnv() { return { push: PUSH_OK, installed: installedApp(), apple: onApple() }; }
+  const HOME_SCREEN_SAY = "On iPhone and iPad, pings work in the Levain app on your Home Screen. Tap the Share button, then Add to Home Screen, open Levain from the Home Screen, pair it once with a code, then tap Turn on there.";
+  const NO_PINGS_SAY = "This browser does not offer pings.";
+  // the words for a page with no push API (the plain-http case has its own, INSECURE_SAY)
+  function noPushSay() {
+    if (window.isSecureContext === false) return INSECURE_SAY;
+    const e = pushEnv();
+    return e.apple && !e.installed ? HOME_SCREEN_SAY : NO_PINGS_SAY;
+  }
   let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
   const b64uToBytes = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
                                              (c) => c.charCodeAt(0));
@@ -157,6 +176,18 @@
   // A label inside a sentence, bidi-isolated (FSI ... PDI) so right-to-left text cannot reorder the words around it
   function named(d) { return "\u2068" + (d.label || d.id) + "\u2069"; }
 
+  // "" for a device seen (or, never seen, paired) within the day; otherwise the chip's words
+  const DAY_MS = 86400000;
+  function quietFor(d) {
+    const seen = d.last_seen ? Date.parse(d.last_seen) : NaN;
+    if (!Number.isNaN(seen)) {
+      const days = Math.floor((Date.now() - seen) / DAY_MS);
+      return days >= 1 ? "not seen for " + days + (days === 1 ? " day" : " days") : "";
+    }
+    const made = Date.parse(d.created);
+    return !Number.isNaN(made) && Date.now() - made > DAY_MS ? "never seen" : "";
+  }
+
   function row(d) {
     const r = el("div", "dev-row" + (d.revoked_at ? " dev-revoked" : ""));
     const main = el("div", "dev-main");
@@ -177,6 +208,12 @@
       r.appendChild(b);
       // from devices.json `subscribed`: any live push subscription under this device
       meta.appendChild(document.createTextNode(" · " + (d.subscribed ? "pings on" : "pings off")));
+      // A key the server holds is not a device that is using it: one that moved origin or lost its storage still reads paired
+      const quiet = quietFor(d);
+      if (quiet) {
+        r.appendChild(el("span", "pill dev-pill dev-stale", quiet));
+        main.appendChild(el("div", "dev-meta dev-stale-note", "If this device asks for a pairing code, revoke it here and pair it again."));
+      }
     }
     return r;
   }
@@ -184,17 +221,19 @@
   // Draws the chosen tab from the last read. Active devices newest-paired first; revoked ones newest-revoked first. The Revoked
   // tab exists only while something is revoked, and its count rides its label, so a long history is never hidden silently.
   // A stamp as a number (ISO text or epoch seconds); one that does not parse sorts last.
-  function when(v) {
+  // (named apart from when(), the readable age: a second `when` here would replace it for every caller)
+  function stamp(v) {
     if (typeof v === "number") return v;
     const t = Date.parse(v);
     return Number.isNaN(t) ? 0 : t;
   }
   function paint() {
-    const live = lastDevs.filter((d) => !d.revoked_at).sort((a, b) => when(b.created) - when(a.created));
-    const gone_ = lastDevs.filter((d) => d.revoked_at).sort((a, b) => when(b.revoked_at) - when(a.revoked_at));
+    const live = lastDevs.filter((d) => !d.revoked_at).sort((a, b) => stamp(b.created) - stamp(a.created));
+    const gone_ = lastDevs.filter((d) => d.revoked_at).sort((a, b) => stamp(b.revoked_at) - stamp(a.revoked_at));
     if (!gone_.length) tab = "active";
     tabsNav.hidden = !gone_.length;
-    tabBtns.active.textContent = "Active (" + live.length + ")";
+    // "Paired", not "Active": it counts the devices that hold a key, which is not the same as being connected
+    tabBtns.active.textContent = "Paired (" + live.length + ")";
     tabBtns.revoked.textContent = "Revoked (" + gone_.length + ")";
     for (const k of ["active", "revoked"]) {
       tabBtns[k].setAttribute("aria-selected", k === tab ? "true" : "false");
@@ -245,7 +284,6 @@
   // still shows when the cockpit serves push, and says why, instead of vanishing or a toggle that cannot work
   const INSECURE_SAY = "off: this browser only offers pings on https or localhost, and this address is neither. Open the cockpit at its https address.";
   async function pings() {
-    if (!PUSH_OK && window.isSecureContext !== false) return;
     if (!pushAsked) {
       pushAsked = true;
       try {
@@ -256,7 +294,13 @@
     }
     if (!pushKey) return;                               // this cockpit serves no web push: no row
     pingRow.hidden = false;
-    if (!PUSH_OK) { pingBtn.disabled = true; pingState.textContent = INSECURE_SAY; return; }
+    if (!PUSH_OK) {
+      // no live Turn on without the push API: the words say what to do instead
+      pingBtn.hidden = true; pingBtn.dataset.on = "";   // hidden, not disabled: a click that still arrives reaches turnOn(), which answers in words
+      pingState.textContent = noPushSay();
+      return;
+    }
+    pingBtn.hidden = false;
     const reg = await registration();
     const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
     pingBtn.dataset.on = sub ? "1" : "";
@@ -267,6 +311,7 @@
       : "off: turn on to be pinged here when the cockpit needs you";
   }
   async function turnOn() {
+    if (!PUSH_OK) { say(noPushSay()); return; }   // no Notification here: calling it would throw
     pingBtn.disabled = true; say("");
     let sub = null;
     try {
@@ -300,7 +345,7 @@
       if (minted) refresh();
     } catch (e) {
       if (sub) await sub.unsubscribe().catch(() => {});
-      say("Could not turn pings on: " + ((e && e.message) || e));
+      say("Could not turn pings on. Nothing was changed; try again, or reload the page. (" + ((e && e.message) || e) + ")");
     } finally { pingBtn.disabled = false; pings(); }
   }
   async function turnOff() {

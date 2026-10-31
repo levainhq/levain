@@ -26,6 +26,8 @@
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
 //   {"motion": "reduce"|"no-preference"}    the phone's reduce-motion setting (prefers-reduced-motion); it keeps a scheme step's setting
+//   {"init": "<js source>"}                 runs before the page's own scripts on every later load, then reloads the page once (a
+//                                            faked user agent, a deleted Notification); nothing is collected
 //   {"shot": "<abs path.png>", "full": <bool>}   saves a PNG screenshot there (the whole page when full); collected as {"shot": path}
 //   {"authenticator": {"rpId", "privateKey", "credentialId", "userHandle"}}   a virtual platform authenticator (user
 //                                            verification on) holding that one resident P-256 credential (base64
@@ -167,6 +169,16 @@ for (const s of steps) {
     if (!authenticatorId) throw new Error("user_verified needs an authenticator step before it");
     const set = await send("WebAuthn.setUserVerified", { authenticatorId, isUserVerified: !!s.user_verified });
     if (set.error) throw new Error("user verification was not set: " + JSON.stringify(set.error));
+  } else if (s.init !== undefined) {
+    // a script that runs before the page's own scripts on every load from now on, then one reload so it applies to this page
+    const added = await send("Page.addScriptToEvaluateOnNewDocument", { source: s.init });
+    if (added.error) throw new Error("the init script was not added: " + JSON.stringify(added.error));
+    await send("Page.reload", {});
+    await sleep(400);
+    for (const end = Date.now() + scaled(15000); Date.now() < end;) {
+      if (await evaluate("document.readyState") === "complete") break;
+      await sleep(100);
+    }
   } else if (s.emulate !== undefined) {
     await send("Emulation.setDeviceMetricsOverride", { width: s.emulate.w, height: s.emulate.h, deviceScaleFactor: s.emulate.dpr || 1, mobile: !!s.emulate.mobile });
     await sleep(600);

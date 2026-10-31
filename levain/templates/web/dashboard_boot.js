@@ -173,7 +173,17 @@
       try { await claimer.claim(input.value, { card: card, form: form, message: msg }); }
       finally { if (go.isConnected) go.disabled = false; }
     });
-    card.append(brand, h, p, form);
+    card.append(brand, h, p);
+    // pair_card.js knows whether this page runs as an installed app; one extra line then, nothing otherwise
+    const pc = window.levainPairCard;
+    const installed = pc && typeof pc.installedNote === "function" ? pc.installedNote() : "";
+    if (installed) {
+      const n = document.createElement("p");
+      n.className = "pair-installed";
+      n.textContent = installed;
+      card.appendChild(n);
+    }
+    card.appendChild(form);
     veil.appendChild(card);
     document.body.appendChild(veil);
     try { input.focus(); } catch (_) { /* no focus */ }
