@@ -793,7 +793,7 @@ def _question_fields(q: Question) -> dict[str, Any]:
 
 def _question_kind(q: Question) -> str:
     """``authority`` for a question with a ``link`` or a ``sign_request`` (it signs on its own card), else ``information``."""
-    return "authority" if q.link is not None or q.sign_request is not None else "information"
+    return "authority" if getattr(q, "link", None) is not None or getattr(q, "sign_request", None) is not None else "information"
 
 
 def subject_version(q: Question) -> str:
@@ -820,7 +820,7 @@ def _sheet_href(prefix: str, ident: Any) -> str:
 
 
 def _question_sign_action(q: Question) -> dict[str, Any]:
-    if q.sign_request is not None:
+    if getattr(q, "sign_request", None) is not None:
         return {"do": "sign", "ceremony": "sign", "href": _sheet_href("/sign/", q.sign_request)}
     return {"do": "sign", "ceremony": "question_rule", "href": None}      # a linked option signs on the phone sheet
 
