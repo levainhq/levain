@@ -1,0 +1,132 @@
+{
+ "jobs": [
+  {
+   "id": "job_sync_check",
+   "name": "Sync check",
+   "machine": "host-a",
+   "class": "push",
+   "refinement": null,
+   "review": {
+    "required": false,
+    "calls_model": false,
+    "acts_outward": false,
+    "basis": []
+   },
+   "verdict": "pass",
+   "reasons": []
+  },
+  {
+   "id": "job_push_check",
+   "name": "Push check",
+   "machine": "host-a",
+   "class": "push",
+   "refinement": null,
+   "review": {
+    "required": true,
+    "calls_model": false,
+    "acts_outward": true,
+    "basis": [
+     "acts outward: the output's destination names 'push'"
+    ]
+   },
+   "verdict": "pass",
+   "reasons": []
+  },
+  {
+   "id": "job_corpus_reader",
+   "name": "Corpus reader",
+   "machine": "host-b",
+   "class": "corpus",
+   "refinement": "a",
+   "review": {
+    "required": false,
+    "calls_model": false,
+    "acts_outward": false,
+    "basis": []
+   },
+   "verdict": "refused",
+   "reasons": [
+    [
+     "1",
+     "no win"
+    ]
+   ]
+  },
+  {
+   "id": "job_feeder_member",
+   "name": "Feeder member",
+   "machine": "host-b",
+   "class": "push",
+   "refinement": "b",
+   "review": {
+    "required": false,
+    "calls_model": false,
+    "acts_outward": false,
+    "basis": []
+   },
+   "verdict": "refused",
+   "reasons": [
+    [
+     "1",
+     "inherited win ends at job_corpus_reader, which has no win"
+    ]
+   ]
+  },
+  {
+   "id": "job_snapshot",
+   "name": "Snapshot (restore-verified)",
+   "machine": "host-a",
+   "class": "recovery",
+   "refinement": "c",
+   "review": {
+    "required": true,
+    "calls_model": false,
+    "acts_outward": true,
+    "basis": [
+     "acts outward: the output's destination names 'scp'"
+    ]
+   },
+   "verdict": "pass",
+   "reasons": []
+  },
+  {
+   "id": "job_composer",
+   "name": "Composer (model-backed)",
+   "machine": "host-a",
+   "class": "push",
+   "refinement": null,
+   "review": {
+    "required": true,
+    "calls_model": true,
+    "acts_outward": false,
+    "basis": [
+     "calls a model: the script runs a model CLI"
+    ]
+   },
+   "verdict": "pass",
+   "reasons": []
+  },
+  {
+   "id": "job_proposer",
+   "name": "Proposer (propose-only)",
+   "machine": "host-a",
+   "class": "corpus",
+   "refinement": "a",
+   "review": {
+    "required": true,
+    "calls_model": true,
+    "acts_outward": false,
+    "basis": [
+     "calls a model: the script names a model lane"
+    ]
+   },
+   "verdict": "refused",
+   "reasons": [
+    [
+     "1",
+     "win does not exist: its own check says 'nothing invokes it'"
+    ]
+   ]
+  }
+ ]
+}

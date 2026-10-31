@@ -7,6 +7,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **Groundwork: AgentSpec, the registration refusals and the lifecycle axes.** `levain agents register|list|show|pause|resume|retire|zone` over immutable, content-hashed agent specs (`stop_at` required), refusing what the agent design's rules 1-6 and five refinements refuse. A file registers whole or not at all (a feeder group is judged together and written in one transaction), and `--warn` writes nothing, not even a new store. A pause stays on its agent through a same-content re-register, a `--revise` and a retire, and only `resume` clears it; a retire followed by a new register of the name is a new agent (a new `agent_id`) that starts active. `--warn` over an audit file echoes the audit's own verdicts and checks each row is coherent; it does not run the refusals, which are exercised by the spec fixture's tests. The build plan's "diff is empty" check cannot hold literally (the output carries fields the expected file does not); the test compares every row's verdict, class, refinement and review flag. Nothing runs an agent yet.
 - **Groundwork: one sleep reconciler over both stores.** `awake.sync` now re-reads the coordinator's working threads AND the agents' live occurrences (`agent_occurrences` in state `admitted` or `launched`) under the one `awake.json` lock, whichever side calls it, and releases the holder only when both are empty; `levain doctor`'s host-sleep row names the source (coordinator, agent, or both) and the occurrence holding the host. Nothing starts an agent occurrence yet.
 - **The coordinator's reply carries what changed in its store.** Ahead of the NEEDS YOU band, a coordinator session's
   reply block now has a work delta rendered by Levain (never model-written) from the coordinator store's records that carry
@@ -471,6 +472,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   on a real phone or a real push.
 
 ### Fixed
+- **The cockpit's tokens-today figure no longer leaves out subagent lanes on a busy session.** It read only the first 64
+  subagent transcripts by file name, so on a heavy session the later lanes were silently missing. It now reads every
+  lane written since local midnight, newest first, and a lane it could not read in time (the read budget ran out) is
+  counted and shown in the panel's "not read" line instead of dropped.
 - **A coordinator may run the `levain coord log` line its reply block hands it.** When more than five records are new, the
   work delta ends with `+N more: levain coord log --since G`; the coordinator's workspace refused that command as the
   operator's. `coord log` only displays, so it is now admitted there. The presence word is also written whole when the
