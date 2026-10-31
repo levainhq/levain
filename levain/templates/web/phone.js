@@ -1894,6 +1894,7 @@
     $("drop-recent-meta").textContent = note ? "can't read the coordinator's store: " + note : drops.length ? "newest first" : "none yet";
     list.replaceChildren(...drops.map(dropCard));
     const repos = Array.isArray(data.coord_repos) ? data.coord_repos : [];
+    $("drop-repos").replaceChildren(...repos.map((r) => { const o = el("option"); o.value = r; return o; }));
     if (dropLast && !$("drop-note").textContent) dropSay(dropLast, "ok");
     // the identity is taken only from a listing that read the store (an unreadable store says nothing about it), and
     // only when this page has not learned the identity from a reply since the listing was asked for: that listing read
@@ -1903,7 +1904,6 @@
       storeId = typeof data.coord_store_id === "string" ? data.coord_store_id : null;
       store.set("localStorage", STORE_KEY, storeId === null ? "" : storeId);
     }
-    if (envForm) { envForm.setRepos(repos); envBlockedMoved(); }
     drawOutbox();
     flush();
   }
@@ -1918,78 +1918,39 @@
     const sid = boundStore();
     if (sid === undefined) return dropSay("still reading which Levain answers here; send it in a moment", "bad");
     $("drop-words").value = "";
-    if (envForm) envForm.changed();
     dropSay("in the outbox; sending…");
     enqueue({ outbox_id: outboxId(), words: words, sent_at: stamp(), state: "waiting", envelope: null, store_id: sid });
   });
-  // the envelope form is the shared one (envelope_form.js): it owns the fields, the spec and the review, whose reading is the
-  // summary this page shows. This page says how a review is asked for and signs the one that is current
-  let envForm = null;
-  let envId = null;             // the outbox id the review in hand is for (made when first needed): the server refuses one already delivered
-  const envOid = () => envId || (envId = outboxId());
-  let envBlockedWas = null;
-  function envSigners() { return dropData && Array.isArray(dropData.coord_signers) ? dropData.coord_signers : []; }
-  // the passkey the review is made for: the one this phone made, else the first enrolled (the same rule `start` uses for one)
-  function envFp() {
-    const signers = envSigners(), local = mine();
-    const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(local, fp));
-    return (known.length ? known : signers)[0] || null;
-  }
-  function envBlocked() {
-    if (!usable) return "this browser cannot use a passkey here (needs https)";
-    if (!dropData) return "reading what this phone may sign…";
-    if (!envSigners().length) return dropData.coord_signer_note || "no passkey enrolled for this name can sign an envelope";
-    if (boundStore() === undefined) return "still reading which Levain answers here; sign it in a moment";
-    return "";
-  }
-  // a listing that changes what blocks signing asks again; one that does not leaves the review in hand alone
-  function envBlockedMoved() {
-    const now = envBlocked();
-    if (envBlockedWas !== now) { envBlockedWas = now; envForm.queue(0); }
-  }
-  function envReview(req) {
-    const fp = envFp();
-    return call("POST", "/coord/envelope-review", { words: req.words, outbox_id: envOid(), spec: req.spec, signer_fp: fp, store_id: boundStore() }).then((c) => {
-      // a fresh install's review made the store: only then does a null identity take the reply's
-      const rsid = c.ok && typeof c.body.store_id === "string" ? c.body.store_id : null;
-      if (rsid !== null && c.body.store_created === true) adoptStore(rsid).then(drawOutbox);
-      return c;
-    });
-  }
-  if ($("drop-env") && window.LevainEnvelopeForm) {
-    envForm = window.LevainEnvelopeForm.create({
-      words: $("drop-words"), wordsGroup: false, left: $("drop-env"), right: $("drop-env"), repos: [], sign: $("drop-sign"),
-      summaryId: "drop-summary", why: why, blocked: envBlocked, review: envReview,
-    });
-    envBlockedWas = envBlocked();
-    envForm.start();
+  function dropSpec() {
+    const repo = $("drop-repo").value.trim(), onto = $("drop-onto").value.trim();
+    if (!repo) return null;
+    const n = (id) => { const v = $(id).value.trim(); return v === "" ? 0 : Number(v); };
+    const spec = { where: [{ repo: repo, paths: ["."] }], lands: onto ? [{ repo: repo, onto: onto }] : [],
+                   stop: $("drop-stop").value, budget: { tool_calls: n("drop-calls"), tokens: n("drop-tokens"), hours: n("drop-hours") } };
+    return spec;
   }
   let closeSheet = null;      // the open envelope sheet's dismiss (it holds busy while it is up)
   if ($("drop-sign")) $("drop-sign").addEventListener("click", () => {
     const words = dropWords();
     if (words === null) return;
-    const cur = envForm && envForm.current();
-    if (!cur) return dropSay("the envelope is not ready to sign yet; read it first", "bad");
-    const signers = envSigners();
+    const spec = dropSpec();
+    if (!spec) { $("drop-env").open = true; return dropSay("name the repo the envelope lets it work in", "bad"); }
+    const signers = dropData && Array.isArray(dropData.coord_signers) ? dropData.coord_signers : [];
     if (!usable) return dropSay("this browser cannot use a passkey here (needs https)", "bad");
     if (!signers.length) return dropSay((dropData && dropData.coord_signer_note) || "no passkey enrolled for this name can sign an envelope", "bad");
-    const fp0 = envFp();
-    // the review was made for one passkey: signing with it is one tap; another one picked is a new review, shown for its tap
-    start(null, null, signers, dropSay, $("drop-acts"), false,
-          (fp, rawId) => (fp === fp0 ? envelopeSheet(fp, rawId, words, cur.spec, null, { c: cur.reply, id: envOid() }) : envelopeSheet(fp, rawId, words, cur.spec, null)),
-          "to SIGN this drop's envelope");
+    start(null, null, signers, dropSay, $("drop-acts"), false, (fp, rawId) => envelopeSheet(fp, rawId, words, spec, null), "to SIGN this drop's envelope");
   });
   // the review (the server keeps the body it shows), then Sign: the server mints the payload, signed_at now, and the
   // passkey signs its challenge. `again` is the outbox id of a refused signed drop being signed again (same words)
-  function envelopeSheet(fp, rawId, words, spec, again, pre) {
+  function envelopeSheet(fp, rawId, words, spec, again) {
     if (busy || closeSheet) return;
     let sid = again ? (outboxRead().find((x) => x.outbox_id === again) || {}).store_id : boundStore();
     if (sid === undefined) return dropSay("still reading which Levain answers here; sign it in a moment", "bad");
     busy++;
-    const id = again || (pre ? pre.id : outboxId());      // picked before the review: the server refuses one already delivered
+    const id = again || outboxId();      // picked before the review: the server refuses one already delivered
     const box = $("drop-review");
     const text = $("drop-words");
-    if (!pre) dropSay(again ? "building the envelope to sign again…" : "building the envelope to sign…");
+    dropSay(again ? "building the envelope to sign again…" : "building the envelope to sign…");
     let signing = false, closed = false;
     const close = () => {
       if (closed) return;
@@ -1999,28 +1960,25 @@
       box.hidden = true;
       box.replaceChildren();
       text.disabled = false;
-      $("drop-send").disabled = false;
-      if (envForm) envForm.lock(false); else $("drop-sign").disabled = false;
+      $("drop-send").disabled = $("drop-sign").disabled = false;
       busy--;
     };
     // the review carries the identity this page read and the server holds it to the drop's rule: a name that now
     // answers for another store refuses it (other_store), so nothing is signed for a store this page did not read
-    const reviewed = pre ? Promise.resolve(pre.c) : call("POST", "/coord/envelope-review", { words: words, outbox_id: id, spec: spec, signer_fp: fp, store_id: sid });
-    reviewed.then((c) => {
+    call("POST", "/coord/envelope-review", { words: words, outbox_id: id, spec: spec, signer_fp: fp, store_id: sid }).then((c) => {
       if (!c.ok) { close(); return dropSay("nothing to sign: " + why(c), "bad"); }
       // a fresh install's review made the store: only then does a null identity take the reply's (a non-null one the
       // page read is never replaced from a reply)
       const rsid = typeof c.body.store_id === "string" ? c.body.store_id : null;
       const made = rsid !== null && c.body.store_created === true;
-      if (made && !pre) adoptStore(rsid).then(drawOutbox);     // a review the form asked for adopted it when it came back
-      if (pre) sid = again ? sid : boundStore();
+      if (made) adoptStore(rsid).then(drawOutbox);
       if (sid === null && made) sid = rsid;
       closeSheet = close;
       openReviews.add(close);   // a view change or a hidden page dismisses it (window.levainViewChanged)
       text.disabled = true;     // the words the envelope names are frozen while it is reviewed
       // and the sheet's own Sign / Dismiss are the only acts: a Send now would file the same words a second time
-      $("drop-send").disabled = true;
-      if (envForm) envForm.lock(true);
+      $("drop-send").disabled = $("drop-sign").disabled = true;
+      $("drop-env").open = true;
       const view = Array.isArray(c.body.view) ? c.body.view.join("\n") : "";
       const acts = el("div", "acts");
       const sign = el("button", "go", "Sign with passkey");
@@ -2028,15 +1986,12 @@
       const dismiss = el("button", null, "Dismiss");
       dismiss.type = "button";
       dismiss.addEventListener("click", () => { if (!signing) { close(); dropSay("not signed; your words are still here"); } });
-      // a review the form already showed is signed from the form's own button, so there is no second sheet; a refusal there
-      // closes the hold, and the form reads again when the server no longer holds the review
-      const undo = (again2) => { signing = false; if (pre) { close(); if (again2 && envForm) envForm.queue(0); } };
-      const doSign = () => {
+      sign.addEventListener("click", () => {
         if (signing || closed) return;
         signing = true;
         dropSay("confirm with your passkey to sign the envelope…");
         call("POST", "/coord/envelope-challenge", { review_id: c.body.review_id }).then((ch) => {
-          if (!ch.ok) { undo(ch.status === 409); return dropSay("nothing was signed: " + why(ch), "bad"); }
+          if (!ch.ok) { signing = false; return dropSay("nothing was signed: " + why(ch), "bad"); }
           const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
           if (rawId) pk.allowCredentials = [{ type: "public-key", id: unb64u(rawId) }];
           return navigator.credentials.get({ publicKey: pk }).then((cred) => {
@@ -2046,19 +2001,15 @@
             signing = false;
             close();
             if (!again) text.value = "";
-            if (pre) envId = null;       // the next review is for a new drop
-            if (envForm && !again) envForm.changed();
             dropSay("signed; in the outbox, sending…");
             const prior = again ? outboxRead().find((x) => x.outbox_id === again) : null;
             // Sign again keeps its item's binding, unless the review made the store it was made without
             const bound = prior ? (prior.store_id === null && c.body.store_created === true ? rsid : prior.store_id) : sid;
             enqueue({ outbox_id: id, words: words, sent_at: stamp(), state: "waiting", envelope: envelope,
                       store_id: bound, spec: spec, signer_fp: fp, raw_id: rawId || null });
-          }, (e) => { undo(false); dropSay(declined(e, pre ? "nothing was signed; sign again" : "nothing was signed; sign again or dismiss"), "bad"); });
-        }, () => { undo(false); dropSay("the phone port could not be reached; nothing was signed", "bad"); });
-      };
-      sign.addEventListener("click", doSign);
-      if (pre) return doSign();
+          }, (e) => { signing = false; dropSay(declined(e, "nothing was signed; sign again or dismiss"), "bad"); });
+        }, () => { signing = false; dropSay("the phone port could not be reached; nothing was signed", "bad"); });
+      });
       acts.append(sign, dismiss);
       box.replaceChildren(el("h2", null, "what your passkey signs"), el("pre", "display", view),
                           digestLine("envelope digest", c.body.digest), acts);

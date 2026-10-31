@@ -111,29 +111,3 @@ button.go { background: var(--accent); color: var(--on-accent); border-color: va
 /* five tabs (the Drop tab): the row scrolls sideways inside itself before a word breaks or the page widens */
 .tabs { overflow-x: auto; }
 .tabs button { padding-inline: 6px; }
-/* The envelope form (envelope_form.js, shared with the sign sheet), one column, in this page's own tokens. */
-.drop-sheet .env-col { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; margin-top: var(--sp-5); }
-.drop-sheet .env-group { margin: 0; padding: 0; border: 0; min-width: 0; }
-.drop-sheet .env-label { padding: 0; margin: 0 0 var(--sp-2); font: 700 15px/1.3 var(--round); color: var(--text); }
-.drop-sheet .env-hint { margin: 0 0 var(--sp-3); font: 13px/1.5 var(--sans); color: var(--meta); }
-.drop-sheet .env-err { margin: 0 0 var(--sp-3); color: var(--bad); font: 600 13px/1.5 var(--sans); overflow-wrap: anywhere; }
-.drop-sheet .env-opts { display: flex; flex-direction: column; gap: var(--sp-2); }
-.drop-sheet .env-opt { display: flex; align-items: flex-start; gap: var(--sp-3); min-height: var(--hit-min); box-sizing: border-box;
-  padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); color: var(--text);
-  font: 15px/1.4 var(--sans); margin-top: var(--sp-2); }
-.drop-sheet .env-opt:has(input:checked) { border-color: var(--label); background: var(--card-2); }
-.drop-sheet .env-opt input { flex: none; width: auto; min-height: 0; margin: 2px 0 0; padding: 0; }
-.drop-sheet .env-opt-t { display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
-.drop-sheet .env-opt-name { font-weight: 600; }
-.drop-sheet .env-opt-sub { font-size: 12px; color: var(--meta); }
-.drop-sheet .env-other { margin: var(--sp-3) 0 0; }
-.drop-sheet .env-seg { display: flex; gap: var(--sp-2); padding: 3px; background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); }
-.drop-sheet .env-seg-btn { flex: 1 1 0; min-width: 0; min-height: var(--hit-min); padding: var(--sp-2) var(--sp-3); font: 600 14px/1 var(--sans);
-  color: var(--label); background: none; border: 1px solid transparent; border-radius: var(--r-sm); }
-.drop-sheet .env-seg-btn[aria-checked=true] { color: var(--text); background: var(--card-2); border-color: var(--label); }
-.drop-sheet .env-custom { display: flex; flex-direction: column; gap: var(--sp-3); margin: var(--sp-3) 0; }
-.drop-sheet .env-field { display: flex; flex-direction: column; gap: var(--sp-2); }
-.drop-sheet .env-flabel { font: 600 13px/1.3 var(--sans); color: var(--text); }
-.drop-sheet .env-summary { margin: 0; padding: var(--sp-4); background: var(--card-2); border: 1px solid var(--hair); border-radius: var(--r-md);
-  min-height: 4em; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; font: 13px/1.5 var(--mono); }
-.drop-sheet .env-summary.env-wait { color: var(--meta); font-family: var(--sans); }

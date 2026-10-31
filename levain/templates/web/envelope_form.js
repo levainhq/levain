@@ -1,5 +1,5 @@
-// levain envelope form: the one form a person fills in to sign an envelope, shared by the sign sheet (sign.js, the cockpit's
-// "Add an envelope" and the sheet's own page) and the phone app (phone.js). It owns the size presets, the repo picker, the
+// levain envelope form: the one form a person fills in to sign an envelope. Its one consumer is the sign sheet (sign.js): the
+// cockpit's "Add an envelope" modal, and /sign/drop as its own page, which is also what a phone sees. It owns the size presets, the repo picker, the
 // landing choice, the Custom fields, the spec the server reads, and the debounced review whose reading is the summary the
 // person signs. A page passes in what differs: where the fields go, how a review is asked for, and the button it signs with.
 // It decides nothing about signing: the spec keys and shapes (where, lands, stop, budget) are the ones the review route has

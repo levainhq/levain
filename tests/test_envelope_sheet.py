@@ -1,4 +1,4 @@
-"""The envelope form (sign.js's drop sheet, opened from the cockpit's "Add an envelope" and on its own as the phone's sheet).
+"""The envelope form (sign.js's drop sheet, opened from the cockpit's "Add an envelope" and on its own at /sign/drop, which a phone sees).
 
 The page runs in headless Chrome over the cockpit rig. The two reads the form depends on are answered inside the page: the listing
 (three known folders and one passkey that may sign) and the server's review (a canned reading), so every request the form sends to
@@ -8,10 +8,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
+import levain
 from tests.test_cockpit_narrow_layout_rig import NEEDS, PHONE_TOUCH, TOK, FullRig, drive_touch, needs_browser, needs_ssh
 from tests.test_msgslot_hero import READY, _tagged, _type
+
+WEB = Path(levain.__file__).parent / "templates" / "web"
+
+
+def test_the_size_table_lives_only_in_the_envelope_form() -> None:
+    table = re.compile(r"\bquick\s*:\s*\{[^}]*tool_calls")
+    form = (WEB / "envelope_form.js").read_text()
+    assert table.search(form) and "judged by levain 7" in form
+    for name in ("sign.js", "card_format.js"):
+        text = (WEB / name).read_text()
+        assert not table.search(text) and "SIZES" not in text and "tool_calls: 800" not in text and "tokens: 8000000" not in text, name
+    assert "LevainEnvelopeForm" in (WEB / "sign.js").read_text()
+
 
 REPOS = ["/work/alpha", "/work/beta", "/work/gamma"]
 VIEW_LINES = ["envelope ev-test", "it may work in the folder you chose"]
