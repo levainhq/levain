@@ -2634,6 +2634,9 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .dev-meta { margin-top: var(--sp-1); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); overflow-wrap: anywhere; }
 .dev-revoked .dev-name { color: var(--label); text-decoration: line-through; text-decoration-color: var(--faint); }
 .dev-pill { flex: none; }
+/* a quiet chip: the muted warning tone, never the red of a refusal */
+.dev-stale { color: var(--warn); }
+.dev-stale-note { padding-top: 0; font-size: var(--fs-micro); }
 .dev-none { margin: 0; padding: var(--sp-4) 0; color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
 .dev-offer { display: flex; gap: var(--sp-3); margin-top: var(--sp-5); flex-wrap: wrap; }
 .dev-label, .dev-url { flex: 1 1 220px; min-width: 0; min-height: 38px; box-sizing: border-box; padding: var(--sp-2) var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-sm); background: var(--base); color: var(--text); font: var(--fw-regular) var(--fs-meta) var(--sans); }

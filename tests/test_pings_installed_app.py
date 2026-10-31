@@ -24,8 +24,16 @@ def _ua(ua: str) -> str:
     return f"Object.defineProperty(navigator, 'userAgent', {{ get: () => {json.dumps(ua)}, configurable: true }});"
 
 
-HOME_WORDS = ("On iPhone and iPad, pings work in the Levain app on your Home Screen. Tap the Share button, then Add to Home Screen, "
-              "open Levain from the Home Screen, pair it once with a code, then tap Turn on there.")
+HOME_WORDS = ("On iPhone and iPad, pings work in the Levain app on your Home Screen: open the Share menu (in Safari, the square with an arrow), "
+              "choose Add to Home Screen, open Levain from your Home Screen, pair it once with a code, then tap Turn on there. "
+              "If your browser has no Add to Home Screen, open this address in Safari.")
+OLD_APPLE_WORDS = "Pings need iOS or iPadOS 16.4 or later, with Lockdown Mode off."
+IPADOS_DESKTOP_MODE = ("Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel', configurable: true });"
+                       " Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 5, configurable: true });")
+# only the display-mode query says standalone: what Android Chrome and desktop installs report (navigator.standalone is iOS-only)
+DISPLAY_MODE_ONLY = ("const __mm = window.matchMedia.bind(window); window.matchMedia = (q) => /display-mode: standalone/.test(q)"
+                     " ? { matches: true, media: q, addEventListener() {}, removeEventListener() {} } : __mm(q);")
+IN_PANEL = "document.querySelector('.dev-zone').textContent"
 SHOTS = os.environ.get("LEVAIN_PINGS_SHOTS", "")
 # errors the page raises on its own (an uncaught throw, a rejected promise) are collected here
 WATCH = ("(() => { window.__errs = []; window.addEventListener('error', (e) => window.__errs.push(String(e.message)));"
@@ -49,14 +57,14 @@ def test_an_ipad_tab_with_no_push_api_gets_the_home_screen_words_and_no_live_tur
             {"eval": STATE},
             {"eval": BTN_LIVE},
             {"eval": f"{_ROW}.querySelector('button').click() || 1"},          # even a forced click must not throw
-            {"eval": "new Promise((ok) => setTimeout(() => ok(JSON.stringify([window.__errs, document.querySelector('.dev-note').textContent])), 500))"},
+            {"eval": f"new Promise((ok) => setTimeout(() => ok(JSON.stringify([window.__errs, document.querySelector('.dev-note').textContent, {IN_PANEL}.split({json.dumps(HOME_WORDS)}).length - 1])), 500))"},
             *_shot("ipad-no-push.png"),
         ])
     v = out["values"]
     assert v[2] == HOME_WORDS, v[2]
     assert v[3] is False, v[3]
-    errs, note = json.loads(v[5])
-    assert errs == [] and note == HOME_WORDS, (errs, note)
+    errs, note, times = json.loads(v[5])
+    assert errs == [] and note == "" and times == 1, (errs, note, times)   # a forced click adds no second copy of the sentence
 
 
 @needs_browser
@@ -68,9 +76,11 @@ def test_a_home_screen_app_with_push_turns_pings_on_as_before(rig, tmp_path) -> 
             *_panel(T, _sub(21), [
                 {"until": f"{_ROW}.querySelector('button').textContent === 'Turn off'", "ms": 20000},
                 {"eval": STATE},
+                {"eval": "JSON.stringify(window.levainPairCard.env())"},     # the detection the words hang on: false here would send an installed app to the Home Screen words
             ]),
         ])
-    assert out["values"][-1].startswith("on:"), out["values"]
+    assert out["values"][-2].startswith("on:"), out["values"]
+    assert json.loads(out["values"][-1]) == {"installed": True, "apple": True}, out["values"]
     assert any(p.startswith("/webpush/subscribe ") for p in out["posts"]), out["posts"]
 
 
@@ -92,7 +102,7 @@ def test_a_non_apple_browser_with_no_push_api_says_so_plainly(rig, tmp_path) -> 
 
 
 @needs_browser
-def test_the_pair_card_of_a_home_screen_app_says_it_needs_its_own_code(tmp_path, monkeypatch) -> None:
+def test_the_pair_card_of_an_ios_home_screen_app_says_it_needs_its_own_code_and_where_it_comes_from(tmp_path, monkeypatch) -> None:
     _root, src, _ids = _install(tmp_path)
     card = "document.querySelector('#ck-unpaired .pair-installed')"
     with _serve(src, extra_hosts=[w1b.NAME]) as (port, _h):
@@ -108,5 +118,50 @@ def test_the_pair_card_of_a_home_screen_app_says_it_needs_its_own_code(tmp_path,
             {"eval": f"{card} === null"},
         ], flags)
     assert installed["values"][-1] == ("This Home Screen app keeps its own sign-in, so it needs one pairing code: get one from the "
-                                       "Devices panel in the cockpit on another device."), installed["values"]
+                                       "Devices panel on any device that is already paired."), installed["values"]
     assert browser_tab["values"][-1] is True, browser_tab["values"]
+
+
+def _words_for(tmp_path, rig, init: str) -> str:
+    src, qdir = rig
+    with _signed(src, qdir) as (port, _):
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token={T}", [
+            {"init": init},
+            {"until": f"{_ROW} && !{_ROW}.hidden && {STATE}", "ms": 20000},
+            {"eval": STATE},
+            {"eval": BTN_LIVE},
+        ])
+    assert out["values"][-1] is False, out["values"]
+    return out["values"][-2]
+
+
+@needs_browser
+def test_ipados_desktop_mode_with_no_push_api_gets_the_home_screen_words(rig, tmp_path) -> None:
+    # no iPad in the user agent: a Mac platform with a touch screen is how iPadOS desktop mode reports itself
+    assert _words_for(tmp_path, rig, _ua(DESKTOP) + IPADOS_DESKTOP_MODE + NO_PUSH) == HOME_WORDS
+
+
+@needs_browser
+def test_an_installed_apple_app_with_no_push_api_names_the_os_version(rig, tmp_path) -> None:
+    assert _words_for(tmp_path, rig, _ua(IPAD) + STANDALONE + NO_PUSH) == OLD_APPLE_WORDS
+
+
+@needs_browser
+def test_an_installed_non_apple_app_with_no_push_api_says_device_not_browser(rig, tmp_path) -> None:
+    assert _words_for(tmp_path, rig, _ua(DESKTOP) + DISPLAY_MODE_ONLY + NO_PUSH) == "This device does not offer pings."
+
+
+@needs_browser
+def test_the_pair_card_note_is_for_the_ios_home_screen_app_only(tmp_path, monkeypatch) -> None:
+    _root, src, _ids = _install(tmp_path)
+    card = "document.querySelector('#ck-unpaired .pair-installed')"
+    with _serve(src, extra_hosts=[w1b.NAME]) as (port, _h):
+        url = f"http://{w1b.NAME}:{port}/"
+        flags = w1b._offbox_flags(port)
+        other = w1b._drive(tmp_path, monkeypatch, url, [
+            {"init": DISPLAY_MODE_ONLY},
+            {"until": w1b.CARD, "ms": 15000},
+            {"eval": f"{card} === null"},
+        ], flags)
+    assert other["values"][-1] is True, other["values"]      # an installed app that is not iOS shares the browser's sign-in: no note
+

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -132,17 +133,45 @@ def test_a_paired_row_not_seen_for_days_says_so_and_how_to_fix_it(tmp_path, monk
         db.commit()
         db.close()
         rows = ("JSON.stringify(Object.fromEntries([...document.querySelectorAll('.dev-list .dev-row')].map((r) => [r.querySelector('.dev-name').textContent,"
-                " [(r.querySelector('.dev-stale') || {}).textContent || '', (r.querySelector('.dev-stale-note') || {}).textContent || '']])))")
+                " [(r.querySelector('.dev-stale') || {}).textContent || '', r.querySelector('.dev-meta').textContent]])))")
+        fixes = "document.querySelectorAll('.dev-zone .dev-stale-note').length"
+        fix_line = "(document.querySelector('.dev-list').firstChild.className + '|' + document.querySelector('.dev-list').firstChild.textContent)"
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
             {"until": READY, "ms": 20000},
             {"eval": TABS},
             {"eval": rows},
+            {"eval": fixes},
+            {"eval": fix_line},
             *([{"shot": os.path.join(shots, "paired-stale-row.png"), "full": True}] if shots else []),
         ])
     v = out["values"]
     assert json.loads(v[1])[0] == ["Paired (3)", "true"], v[1]
     fix = "If this device asks for a pairing code, revoke it here and pair it again."
     got = json.loads(v[2])
-    assert got["Stale iPad"] == ["not seen for 3 days", fix], got
-    assert got["Never used"] == ["never seen", fix], got
-    assert got["Fresh phone"] == ["", ""], got
+    assert got["Stale iPad"][0] == "not seen for 3 days" and got["Never used"][0] == "never seen" and got["Fresh phone"][0] == "", got
+    # the fix is ONE line at the top of the tab for two stale rows, and no row carries it
+    assert v[3] == 1, v[3]
+    assert v[4] == "dev-none dev-stale-note|" + fix, v[4]
+    assert all(fix not in meta for _chip, meta in got.values()), got
+    # when(): a known row reads in dates and ages, never a raw stamp
+    month_day = r"[A-Z][a-z]{2} \d{1,2}"
+    assert re.fullmatch(rf"paired {month_day} · last seen {month_day} · by \w+ · \S+ · pings off", got["Stale iPad"][1]), got["Stale iPad"][1]
+    assert re.fullmatch(rf"paired {month_day} · last seen (just now|\d+ min ago) · by \w+ · \S+ · pings off", got["Fresh phone"][1]), got["Fresh phone"][1]
+    assert not any(re.search(r"\d{10,}", meta) for _chip, meta in got.values()), got
+
+
+@needs_browser
+def test_no_fix_line_when_every_paired_row_is_fresh(tmp_path, monkeypatch) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src) as (port, httpd):
+        ids = {label: _pair(port, label=label)[0] for label in ("One", "Two")}
+        db = sqlite3.connect(str(Path(httpd.broker.data_root) / "cockpit.db"))
+        _stamp(db, ids, "One", seen=timedelta(minutes=5), made=timedelta(days=9))
+        _stamp(db, ids, "Two", seen=timedelta(hours=2), made=timedelta(hours=3))
+        db.commit()
+        db.close()
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": READY, "ms": 20000},
+            {"eval": "document.querySelectorAll('.dev-zone .dev-stale-note, .dev-zone .dev-stale').length"},
+        ])
+    assert out["values"][-1] == 0, out["values"]

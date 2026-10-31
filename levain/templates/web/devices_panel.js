@@ -27,24 +27,13 @@
   // notification and pair_card.js, which holds the page's key, records the open.
   const PAIRED_MARK_KEY = "levain_paired_device";   // MUST equal pair.js / dashboard_boot.js PAIRED_MARK_KEY
   const PUSH_OK = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
-  // WebKit (every iOS and iPadOS browser) offers Notification and PushManager only to a web app opened from the Home Screen;
-  // in a browser tab the globals do not exist. So "no push API" there means "install first", not "this browser cannot".
-  function onApple() {
-    const ua = String(navigator.userAgent || "");
-    return /iPhone|iPod|iPad/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);   // iPadOS desktop mode reports a Mac
-  }
-  function installedApp() {
-    try { if (navigator.standalone === true) return true; } catch (_) { /* no such property */ }
-    try { return !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches); } catch (_) { return false; }
-  }
-  function pushEnv() { return { push: PUSH_OK, installed: installedApp(), apple: onApple() }; }
-  const HOME_SCREEN_SAY = "On iPhone and iPad, pings work in the Levain app on your Home Screen. Tap the Share button, then Add to Home Screen, open Levain from the Home Screen, pair it once with a code, then tap Turn on there.";
-  const NO_PINGS_SAY = "This browser does not offer pings.";
+  // The detection helper and the words about a page with no push API live in pair_card.js (one copy), read when used.
+  const shared = () => window.levainPairCard || {};
   // the words for a page with no push API (the plain-http case has its own, INSECURE_SAY)
   function noPushSay() {
     if (window.isSecureContext === false) return INSECURE_SAY;
-    const e = pushEnv();
-    return e.apple && !e.installed ? HOME_SCREEN_SAY : NO_PINGS_SAY;
+    const f = shared().noPushWords;
+    return f ? f() : "This browser does not offer pings.";
   }
   let pingRow = null, pingState = null, pingBtn = null, pushKey = "", pushAsked = false;
   const b64uToBytes = (t) => Uint8Array.from(atob(t.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((t.length + 3) % 4)),
@@ -178,6 +167,7 @@
 
   // "" for a device seen (or, never seen, paired) within the day; otherwise the chip's words
   const DAY_MS = 86400000;
+  const STALE_FIX = "If this device asks for a pairing code, revoke it here and pair it again.";
   function quietFor(d) {
     const seen = d.last_seen ? Date.parse(d.last_seen) : NaN;
     if (!Number.isNaN(seen)) {
@@ -212,7 +202,6 @@
       const quiet = quietFor(d);
       if (quiet) {
         r.appendChild(el("span", "pill dev-pill dev-stale", quiet));
-        main.appendChild(el("div", "dev-meta dev-stale-note", "If this device asks for a pairing code, revoke it here and pair it again."));
       }
     }
     return r;
@@ -245,6 +234,8 @@
     const shown = tab === "revoked" ? gone_ : live;
     if (!lastDevs.length) list.appendChild(el("p", "dev-none", "No device is paired yet. Pair one below: it gets its own key, and you can revoke it here."));
     else if (!shown.length) list.appendChild(el("p", "dev-none", "No active device. Pair one below: it gets its own key, and you can revoke it here."));
+    // one line for the whole tab, not one per row: how to fix a device that holds a key it can no longer use
+    if (tab !== "revoked" && shown.some((d) => quietFor(d))) list.insertBefore(el("p", "dev-none dev-stale-note", STALE_FIX), list.firstChild);
     for (const d of shown) list.appendChild(row(d));
   }
 
@@ -311,7 +302,7 @@
       : "off: turn on to be pinged here when the cockpit needs you";
   }
   async function turnOn() {
-    if (!PUSH_OK) { say(noPushSay()); return; }   // no Notification here: calling it would throw
+    if (!PUSH_OK) { pings(); return; }   // no Notification here: calling it would throw; the pings row already holds the words, once
     pingBtn.disabled = true; say("");
     let sub = null;
     try {
@@ -345,7 +336,7 @@
       if (minted) refresh();
     } catch (e) {
       if (sub) await sub.unsubscribe().catch(() => {});
-      say("Could not turn pings on. Nothing was changed; try again, or reload the page. (" + ((e && e.message) || e) + ")");
+      say(shared().turnOnFailed ? shared().turnOnFailed(e) : "Could not turn pings on. (" + ((e && e.message) || e) + ")");
     } finally { pingBtn.disabled = false; pings(); }
   }
   async function turnOff() {

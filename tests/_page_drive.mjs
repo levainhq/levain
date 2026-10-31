@@ -88,10 +88,11 @@ for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`h
 if (!targets) { console.error("chrome never answered"); done(2); }
 const ws = new WebSocket(targets.find((t) => t.type === "page").webSocketDebuggerUrl);
 await new Promise((r) => ws.addEventListener("open", r));
-let id = 0; let navStarts = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
+let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
+  if (d.method === "Page.loadEventFired") loads++;
   if (trail.length > 50) trail.shift();          // a page refused in a loop keeps its last 50
   if (d.method === "Page.javascriptDialogOpening") dialogs.push(`${d.params.type}: ${String(d.params.message)}`);
   if (d.method === "Page.frameStartedLoading" || d.method === "Page.frameRequestedNavigation" || d.method === "Page.frameNavigated") navStarts++;
@@ -173,8 +174,10 @@ for (const s of steps) {
     // a script that runs before the page's own scripts on every load from now on, then one reload so it applies to this page
     const added = await send("Page.addScriptToEvaluateOnNewDocument", { source: s.init });
     if (added.error) throw new Error("the init script was not added: " + JSON.stringify(added.error));
+    // the reload's own load event, not a fixed pause: the old document's readyState can still read "complete" just after the call
+    const loadsBefore = loads;
     await send("Page.reload", {});
-    await sleep(400);
+    for (const end = Date.now() + scaled(15000); loads === loadsBefore && Date.now() < end;) await sleep(50);
     for (const end = Date.now() + scaled(15000); Date.now() < end;) {
       if (await evaluate("document.readyState") === "complete") break;
       await sleep(100);
