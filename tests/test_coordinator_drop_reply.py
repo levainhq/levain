@@ -17,7 +17,7 @@ from levain.cockpit.engine import ReadContext
 from levain.coordinator import drop_reply, work_delta
 from levain.coordinator.chat import ChatStore, timeline
 from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import REPLY_KINDS, REPLY_WINDOW_HOURS, UNREPLIED_AFTER_MINUTES, CoordStore, Part
+from levain.coordinator.store import CoordError, REPLY_KINDS, REPLY_WINDOW_HOURS, UNREPLIED_AFTER_MINUTES, CoordStore, Part
 
 NOW = datetime(2026, 10, 31, 14, 0, tzinfo=timezone.utc)
 
@@ -167,6 +167,7 @@ def _downgrade(qdir) -> list[tuple]:
     c = sqlite3.connect(qdir / "dispatch.db", isolation_level=None)
     try:
         c.execute("PRAGMA foreign_keys = OFF")
+        c.execute("PRAGMA legacy_alter_table = ON")            # a view over replies must not stop the old shape being built
         sql = c.execute("SELECT sql FROM sqlite_master WHERE name = 'replies'").fetchone()[0]
         old = sql.replace(", 'coordinator_reply'", "").replace("TABLE replies", "TABLE replies_old", 1)
         assert "coordinator_reply" not in old
@@ -213,6 +214,116 @@ def test_an_upgraded_store_keeps_every_reply_row_and_its_gseq(qdir, store, token
         c.close()
     tok = upgraded.coord_take()
     assert drop_reply.write_reply(upgraded, d, "after the upgrade", token=tok).drop_id == d
+
+
+def test_an_upgrade_of_a_store_holding_the_chat_timeline_view_keeps_everything(qdir, store, token) -> None:
+    d = _drop(store)
+    store.split(d, [Part(kind="work", title="t")], by="operator")
+    ChatStore(EnvelopeStore(qdir))._connect().close()          # builds chat_timeline the way chat.py does
+    c = sqlite3.connect(qdir / "dispatch.db", isolation_level=None)
+    c.execute("INSERT INTO replies (rowid, reply_id, thread_id, kind, ref_store, ref_id, body, at, gseq) VALUES "
+              "(4000, 'rp-high', NULL, 'know', 'questions', 'q-1', '{}', '2026-10-31T10:00:00Z', "
+              "(SELECT COALESCE(MAX(gseq), 0) + 1 FROM replies))")
+    c.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at) VALUES ('q-1', 'know', 'rp-high', 'x')")
+    assert c.execute("SELECT count(*) FROM sqlite_master WHERE name = 'chat_timeline'").fetchone() == (1,)
+    c.close()
+    before = _downgrade(qdir)
+    assert any(r[0] == 4000 for r in before)
+    CoordStore(qdir).coord_take()                              # the open runs the upgrade
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        after = c.execute("SELECT rowid, reply_id, kind, ref_id, body, at, gseq FROM replies ORDER BY rowid").fetchall()
+        assert after == before
+        assert c.execute("SELECT reply_id FROM first_reads").fetchone() == ("rp-high",)
+        assert c.execute("PRAGMA foreign_key_check").fetchall() == []
+        c.execute("SELECT * FROM chat_timeline").fetchall()           # the view still resolves
+        assert {"replies_bound_drop", "replies_bound_once", "replies_bound_window", "replies_gseq_no_replace",
+                "replies_frozen"} <= {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
+        assert "replies_ref" in {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+        assert "coordinator_reply" in c.execute("SELECT sql FROM sqlite_master WHERE name = 'replies'").fetchone()[0]
+    finally:
+        c.close()
+
+
+def _old_store(qdir, store) -> None:
+    d = _drop(store)
+    store.split(d, [Part(kind="work", title="t")], by="operator")
+    _downgrade(qdir)
+
+
+def _raw(qdir, keys: int):
+    c = sqlite3.connect(qdir / "dispatch.db", isolation_level=None, timeout=0.2)
+    c.execute(f"PRAGMA foreign_keys = {keys}")
+    return c
+
+
+@pytest.mark.parametrize("keys", [0, 1])
+def test_the_upgrade_puts_foreign_keys_back_to_what_the_connection_had(qdir, store, keys) -> None:
+    _old_store(qdir, store)
+    c = _raw(qdir, keys)
+    try:
+        CoordStore(qdir)._ensure(c, create=False)
+        assert c.execute("PRAGMA foreign_keys").fetchone() == (keys,)
+        assert "coordinator_reply" in c.execute("SELECT sql FROM sqlite_master WHERE name = 'replies'").fetchone()[0]
+    finally:
+        c.close()
+
+
+def test_a_busy_store_during_the_upgrade_does_not_leave_foreign_keys_off(qdir, store) -> None:
+    _old_store(qdir, store)
+    holder = sqlite3.connect(qdir / "dispatch.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    c = _raw(qdir, 1)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            CoordStore(qdir)._ensure(c, create=True)
+        assert c.execute("PRAGMA foreign_keys").fetchone() == (1,)
+    finally:
+        c.close()
+        holder.execute("ROLLBACK")
+        holder.close()
+
+
+def test_a_dangling_row_elsewhere_does_not_block_the_upgrade(qdir, store) -> None:
+    _old_store(qdir, store)
+    c = _raw(qdir, 0)
+    c.execute("CREATE TABLE stray (x TEXT REFERENCES nowhere(id))")
+    c.execute("INSERT INTO stray VALUES ('lost')")
+    assert c.execute("PRAGMA foreign_key_check").fetchall()
+    try:
+        CoordStore(qdir)._ensure(c, create=False)
+        assert "coordinator_reply" in c.execute("SELECT sql FROM sqlite_master WHERE name = 'replies'").fetchone()[0]
+    finally:
+        c.close()
+
+
+def test_a_dangling_row_under_replies_blocks_the_upgrade_and_changes_nothing(qdir, store) -> None:
+    _old_store(qdir, store)
+    c = _raw(qdir, 0)
+    c.execute("INSERT INTO first_reads (question_id, outcome, reply_id, at) VALUES ('q', 'know', 'rp-missing', 'x')")
+    try:
+        with pytest.raises(CoordError, match="replies rebuild.*dangling"):
+            CoordStore(qdir)._ensure(c, create=False)
+        assert "coordinator_reply" not in c.execute("SELECT sql FROM sqlite_master WHERE name = 'replies'").fetchone()[0]
+    finally:
+        c.close()
+
+
+def test_an_integrity_failure_names_the_table_that_was_rebuilt(qdir, store) -> None:
+    _old_store(qdir, store)
+    c = _raw(qdir, 1)
+
+    class Bad:
+        def execute(self, sql, *a):
+            if sql == "PRAGMA integrity_check":
+                return sqlite3.connect(":memory:").execute("SELECT 'broken'")
+            return c.execute(sql, *a)
+
+    try:
+        with pytest.raises(CoordError, match="the replies rebuild left .* integrity check"):
+            CoordStore(qdir)._ensure(Bad(), create=False)
+    finally:
+        c.close()
 
 
 # ---------------------------------------------------------------------------------------------- the panel

@@ -286,8 +286,28 @@ def migrate_reply_kinds(conn: sqlite3.Connection) -> bool:
     cols = ", ".join(old)
     conn.execute(f"INSERT INTO replies_r5 (rowid, {cols}) SELECT rowid, {cols} FROM replies")
     conn.execute("DROP TABLE replies")
-    conn.execute("ALTER TABLE replies_r5 RENAME TO replies")
+    # a modern RENAME re-parses every view and fails on one that names the table just dropped (chat_timeline does);
+    # the legacy mode renames the table alone, the views keep their text and resolve again by name
+    legacy = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    conn.execute("PRAGMA legacy_alter_table = ON")
+    try:
+        conn.execute("ALTER TABLE replies_r5 RENAME TO replies")
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table = {'ON' if legacy else 'OFF'}")
     return True
+
+
+def _dangling_after(conn: sqlite3.Connection, rebuilt: Sequence[str]) -> list[tuple]:
+    """``PRAGMA foreign_key_check`` of the rebuilt tables and of every table whose foreign keys name one of them, and of
+    nothing else: a dangling row elsewhere in the file is not this rebuild's and must not block it for ever."""
+    scope = set(rebuilt)
+    for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall():
+        if any(fk[2] in rebuilt for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")').fetchall()):
+            scope.add(table)
+    broken: list[tuple] = []
+    for table in sorted(scope):
+        broken.extend(conn.execute(f'PRAGMA foreign_key_check("{table}")').fetchall())
+    return broken
 
 
 _CREATES = re.compile(r"CREATE (?:UNIQUE )?(?:TABLE|INDEX|TRIGGER|VIEW) IF NOT EXISTS (\w+)")
@@ -510,40 +530,44 @@ class CoordStore:
         from levain.coordinator.review import ensure_one_signature, migrate_events
 
         # a constraint rebuild of a table other tables point at runs with foreign keys off (a no-op inside a
-        # transaction, so it is set here), and the keys are checked again before the commit
+        # transaction, so it is set here), and the keys are checked again before the commit. The setting is put back
+        # to what the connection had, whatever happens, including a BEGIN that finds the store busy
         old_replies = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'replies'").fetchone()
         rebuild_replies = old_replies is not None and "coordinator_reply" not in old_replies[0]
-        if rebuild_replies:
-            conn.execute("PRAGMA foreign_keys = OFF")
-        conn.execute("BEGIN IMMEDIATE")
+        keys_before = conn.execute("PRAGMA foreign_keys").fetchone()[0]
         try:
-            if not create and "threads" not in _names(conn):
-                raise StoreAbsent(f"{self.path} holds no coordinator store")
-            rebuilt = migrate_events(conn)
-            if rebuild_replies and migrate_reply_kinds(conn):
-                rebuilt = True
-            for stmt in self._statements():
-                conn.execute(stmt)
-            ensure_one_signature(conn)
-            _all_gseq(conn)
-            from levain.coordinator.lease import migrate_settings
-            migrate_settings(conn)
-            if rebuilt:
-                broken = conn.execute("PRAGMA foreign_key_check").fetchall()
-                if broken:
-                    raise CoordError(f"the replies rebuild left {self.path} with a dangling reference "
-                                     f"({broken[:3]}); nothing was changed")
-                check = conn.execute("PRAGMA integrity_check").fetchall()
-                if check != [("ok",)]:
-                    raise CoordError(f"the review_events rebuild left {self.path} failing its integrity check "
-                                     f"({check[:3]}); nothing was changed")
-            conn.execute("COMMIT")
-        except BaseException:
-            _rollback(conn)
-            raise
+            if rebuild_replies:
+                conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if not create and "threads" not in _names(conn):
+                    raise StoreAbsent(f"{self.path} holds no coordinator store")
+                rebuilt: list[str] = ["review_events"] if migrate_events(conn) else []
+                if rebuild_replies and migrate_reply_kinds(conn):
+                    rebuilt.append("replies")
+                for stmt in self._statements():
+                    conn.execute(stmt)
+                ensure_one_signature(conn)
+                _all_gseq(conn)
+                from levain.coordinator.lease import migrate_settings
+                migrate_settings(conn)
+                if rebuilt:
+                    what = " and ".join(rebuilt)
+                    broken = _dangling_after(conn, rebuilt)
+                    if broken:
+                        raise CoordError(f"the {what} rebuild left {self.path} with a dangling reference "
+                                         f"({broken[:3]}); nothing was changed")
+                    check = conn.execute("PRAGMA integrity_check").fetchall()
+                    if check != [("ok",)]:
+                        raise CoordError(f"the {what} rebuild left {self.path} failing its integrity check "
+                                         f"({check[:3]}); nothing was changed")
+                conn.execute("COMMIT")
+            except BaseException:
+                _rollback(conn)
+                raise
         finally:
             if rebuild_replies:
-                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute(f"PRAGMA foreign_keys = {'ON' if keys_before else 'OFF'}")
 
     def _open_existing(self) -> sqlite3.Connection:
         """A read-write connection to the coordinator's file that never makes it: the directory rule read with
