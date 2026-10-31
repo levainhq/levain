@@ -141,16 +141,13 @@ def _with_line(message: str, at: int, line: str) -> str:
 
 @needs_browser
 @needs_ssh
-@pytest.mark.parametrize("case", ["effect_line", "duplicate_asked", "rec_disagrees"])
+@pytest.mark.parametrize("case", ["duplicate_asked"])
 def test_a_needs_phill_message_the_card_cannot_read_exactly_is_drawn_whole_and_visible(
         case: str, tmp_path: Path, monkeypatch) -> None:
-    """L3 r1 (codex HIGH, complement MED#2, deepseek MED#4): the old parser made a card of each of these, showing a
-    reading that differs from what is signed (the effect line or the first asked hidden behind the collapsed signed text;
-    the JSON rec marked against the signed one). Each is now the pre-card sheet: the whole message, visible, no card."""
+    """L3 r1 (codex HIGH, complement MED#2, deepseek MED#4): a message with a key twice has no reading that is not a
+    guess (neither the strict nor the loose card reads it): the pre-card sheet, the whole message, visible, no card."""
     rig = _Rig(tmp_path, monkeypatch)
-    row = {"effect_line": dict(SHORT, message=_with_line(SHORT["message"], 6, "effect: delete production data")),
-           "duplicate_asked": dict(SHORT, message=_with_line(SHORT["message"], 4, "asked: harmless")),
-           "rec_disagrees": dict(SHORT, rec="b")}[case]
+    row = {"duplicate_asked": dict(SHORT, message=_with_line(SHORT["message"], 4, "asked: harmless"))}[case]
     rid = _file_card(rig, row)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
@@ -163,6 +160,32 @@ def test_a_needs_phill_message_the_card_cannot_read_exactly_is_drawn_whole_and_v
     v = out["values"][2:]
     assert v[0] == 0, v
     assert v[1] == row["message"] and v[2] is True and v[3] is False, v
+
+
+@needs_browser
+@needs_ssh
+@pytest.mark.parametrize("case", ["effect_line", "rec_disagrees"])
+def test_a_strict_refused_message_is_a_loose_card_with_the_exact_signed_text_open(
+        case: str, tmp_path: Path, monkeypatch) -> None:
+    """The strict grammar still refuses an effect line or a rec the request disagrees with (what is signed is
+    unchanged); the sheet now draws its headline and sections anyway, with the exact signed text OPEN and whole, and no
+    option marked where the signed text and the request name different recommendations."""
+    rig = _Rig(tmp_path, monkeypatch)
+    row = {"effect_line": dict(SHORT, message=_with_line(SHORT["message"], 6, "effect: delete production data")),
+           "rec_disagrees": dict(SHORT, rec="b")}[case]
+    rid = _file_card(rig, row)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            PHONE, rig.authenticator(), *_open(rig, rid),
+            {"eval": "!!document.getElementById('sheet-headline')"},
+            {"eval": "document.getElementById('sheet-signed').open"},
+            {"eval": "document.querySelector('#sheet-signed .sheet-message').textContent"},
+            {"eval": "document.querySelectorAll('#sheet-actions .sheet-rec').length"},
+            {"eval": "document.documentElement.scrollWidth <= window.innerWidth"},
+        ])
+    v = out["values"][2:]
+    assert v[0] is True and v[1] is True and v[2] == row["message"], v
+    assert v[3] == (0 if case == "rec_disagrees" else 1) and v[4] is True, v
 
 
 @needs_browser

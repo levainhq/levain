@@ -350,7 +350,7 @@ def test_d6_5_a_signed_question_and_a_signed_message_end_to_end(tmp_path, monkey
                      ".map(b => b.textContent), unsigned: !!document.querySelector('#levain-modal .needs-question "
                      ".question-words'), lines: [...document.querySelectorAll('#levain-modal .needs-question .sign-line')]"
                      ".map(x => x.textContent), blocks: getComputedStyle(document.querySelector('#levain-modal "
-                     ".needs-q-blocks')).whiteSpace})"},
+                     ".needs-q-body .card-p')).overflowWrap})"},
             # 1. a cancelled passkey on the write-in: nothing signed, the words stay and the box is usable again
             {"user_verified": False},
             {"eval": f"(() => {{ const i = {WRITE_IN}; i.value = 'only after the backup'; "
@@ -383,7 +383,7 @@ def test_d6_5_a_signed_question_and_a_signed_message_end_to_end(tmp_path, monkey
     shown = json.loads(v[1])
     assert shown["opts"][:2] == ["(a) Ship it tonight", "(b) Hold for the morning"], shown
     assert shown["opts"][2] == "(*) sign my words" and not shown["unsigned"], shown
-    assert shown["lines"][0] == "levain-sign-choice/1 chosen (a): Ship it tonight" and shown["blocks"] == "pre-wrap", shown
+    assert shown["lines"][0] == "levain-sign-choice/1 chosen (a): Ship it tonight" and shown["blocks"] == "anywhere", shown
     cancelled, kept = v[4], v[5]
     assert cancelled.startswith("the passkey did not sign (NotAllowedError); nothing was signed"), cancelled
     assert kept == "only after the backup", kept

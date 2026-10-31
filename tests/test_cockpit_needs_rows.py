@@ -105,7 +105,8 @@ def test_blocks_that_begin_with_the_title_show_only_the_remainder(tmp_path: Path
     assert got["Ship the fix now?"] == "blocks: The release waits on this.", got
     assert got["flow: Cut the second slice?"] == "", got            # nothing remains: the row has no second line
     f = json.loads(vals[-1])
-    assert f["blocks"] == ["blocks: The release waits on this."], f
+    assert f["blocks"] == [], f                                # the card draws the remainder as prose (card_format.js); .needs-q-blocks is only the no-module fallback
+    assert "The release waits on this." in f["text"] and "blocks:" not in f["text"], f
     assert f["text"].count("Ship the fix now?") == 1, f       # the title is drawn once
 
 
