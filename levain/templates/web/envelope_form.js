@@ -13,14 +13,15 @@
 // and taking the one answering now would sign into a store the person never chose. The form says so and stops asking.
 //
 // The hard stop is computed by the server when it reads the review, so the summary says the time it lands on, and a summary that
-// has stood for REVIEW_MAX_AGE_MS is read again (never while signing, and never by the Sign tap itself: an await before the
-// passkey call can cost the browser's user activation).
+// has stood for REVIEW_MAX_AGE_MS since the server read it (body.reviewed_at) is read again (never while signing, and never by
+// the Sign tap itself: an await before the passkey call can cost the browser's user activation). A reply that does not say when
+// it stops is not signable. Once the sheet is stopped (another store, or none named) nothing is asked again, waiting edits included.
 //
 // The page passes:
 //   o.words        the textarea of the person's words (the page owns it); o.wordsGroup: draw it inside a "Your words" group here
 //   o.left, o.right  where the groups go (the same element for one column)
 //   o.repos        the known folders; setRepos() takes a later listing
-//   o.review({words, spec})  a promise of {ok, status, body}, the server's reading (body.view, body.stop_at); o.why(reply): its refusal in words
+//   o.review({words, spec})  a promise of {ok, status, body}, the server's reading (body.view, body.stop_at, body.reviewed_at); o.why(reply): its refusal in words
 //   o.storeId()    the store identity the page holds now, or null on a fresh install; o.refreshStore(): a promise, the page re-reads it
 //   o.blocked()    "" or the reason nothing can be signed (shown as the summary)
 //   o.sign         the sign button. It is enabled only while ALL of these hold: no signing is under way (lock(true) not called),
@@ -30,7 +31,8 @@
 //   o.signWhy      a paragraph beside the button: while the button is disabled it says why (the button is tied to it by aria-describedby)
 //   o.lockRoots    the elements whose inputs, selects and textareas lock(true) holds still during a signing (default: left and right)
 //   o.summaryId    the summary box's id; o.debounce: ms the typing settles for before a review is asked
-// create() returns {foot, current, queue, changed, lock, syncSign, setRepos, start}; `foot` is the element holding the summary, where
+// create() returns {foot, current, queue, changed, lock, syncSign, setRepos, start, stop}; stop(text) halts the sheet as a store
+// mismatch does, with the page's words; `foot` is the element holding the summary, where
 // the page puts the buttons beneath it so they stay together.
 (function () {
   "use strict";
@@ -64,6 +66,8 @@
   const NO_STORE = "Levain has not said which store answers here yet. Reload the page to read it again; nothing was signed.";
   const EMPTY = "The server sent an empty summary; nothing can be signed. Change anything to ask again.";
   const NO_ANSWER = "The cockpit did not answer; change anything to ask again.";
+  const NO_STOP = "The server did not say when this envelope would stop; nothing can be signed. Change anything to ask again.";
+  const STALE = "The server's summary was over 5 minutes old when it arrived, twice (this device's clock may be off); nothing can be signed. Change anything to ask again.";
   // a promise of what f returns; a throw becomes a rejection, so a caller's handlers see it
   const attempt = (f) => { try { return Promise.resolve(f()); } catch (e) { return Promise.reject(e); } };
   // the server's fixed-width UTC stamp ("2026-10-31T12:00:00.000000Z") as a Date, read field by field so no browser's parser decides
@@ -96,7 +100,8 @@
     let working = false;
     let seq = 0, timer = null;
     let inflight = false, waiting = null;
-    let stuck = "";                 // set once the store answering is not the one this sheet was opened for: nothing is asked again
+    let stuck = "";                 // set once the store answering is not the one this sheet was opened for, or none is named: nothing is asked again
+    let reasked = false;            // the last review was re-asked because it arrived already too old: a second such one is not re-asked
     let ageTimer = null;            // the one timer that re-reads a summary older than REVIEW_MAX_AGE_MS
     let started = false;
     let touchedRepo = false;
@@ -430,10 +435,9 @@
       }, AGE_CHECK_MS);
     };
     window.addEventListener("pagehide", noAge);
-    const stopLine = (c, v) => {
-      const at = stampDate(c.body.stop_at);
-      return at ? "Hard stop at " + localStop(at) + ": set when this summary was read, " + v.spec.stop + " from then (a summary over 5 minutes old is read again)." : "";
-    };
+    // only called on a reply whose stop_at reads as a time
+    const stopLine = (c, v) => "Hard stop at " + localStop(stampDate(c.body.stop_at)) + ": set when this summary was read, " + v.spec.stop
+      + " from then (a summary over 5 minutes old is read again).";
     const say = (kind, text) => { state = { kind: kind, text: text }; showReview(text, true); syncSign(); };
     // any change to the form: the review in hand is no longer the form's, and a new one is asked for once the typing settles
     function queue(ms) {
@@ -455,35 +459,49 @@
       const mineSeq = seq;
       timer = setTimeout(() => { if (!working && mineSeq === seq) ask(v, mineSeq); }, ms === undefined ? (o.debounce === undefined ? 500 : o.debounce) : ms);
     }
+    // the sheet stops for good: whatever was in hand or waiting is dropped, and nothing is asked again until a reload
+    function halt(text) {
+      stuck = text;
+      current = null;
+      waiting = null;
+      clearTimeout(timer);
+      noAge();
+      say("stuck", stuck);
+    }
     function next() {
       inflight = false;
+      if (stuck) { waiting = null; return; }
       if (waiting) { const w = waiting; waiting = null; ask(w.v, w.mineSeq); }
     }
     function ask(v, mineSeq) {
+      if (stuck) { waiting = null; return; }
       if (mineSeq !== seq) { if (!inflight && waiting) next(); return; }
       if (inflight && storeNull()) { waiting = { v: v, mineSeq: mineSeq }; return; }      // one at a time until the store has an identity
       inflight = true;
       // the slot is released once, after every way this request (and its one retry) can end, a throw included
-      send(v, mineSeq, false).catch(() => { if (mineSeq === seq) say("bad", NO_ANSWER); }).finally(next);
+      send(v, mineSeq, false).catch(() => { if (mineSeq === seq && !stuck) say("bad", NO_ANSWER); }).finally(next);
     }
     // one review request and what its reply means; resolves when it (and any retry) is done
     function send(v, mineSeq, retried) {
       const sentNull = storeNull();         // read in the same turn the page reads its store id for the request
       return attempt(() => o.review({ words: v.words, spec: v.spec })).then((c) => {
-        if (mineSeq !== seq) return undefined;          // the form moved on while this was read: the newer one speaks
-        if (!c || typeof c !== "object" || !c.body || typeof c.body !== "object") { say("bad", c && c.ok ? EMPTY : NO_ANSWER); return undefined; }
-        if (!c.ok && c.status === 409 && c.body.error === "other_store") {
+        if (stuck) return undefined;                    // the sheet has stopped: no reply speaks after that
+        // which store answers is a fact about the sheet, not about one form: it is acted on even for a reply the form has moved past
+        if (c && typeof c === "object" && !c.ok && c.status === 409 && c.body && typeof c.body === "object" && c.body.error === "other_store") {
           // sent with a store id: the store answering is another one. Refused, and never asked again from this sheet
-          if (!sentNull) { stuck = MOVED; say("stuck", stuck); return undefined; }
+          if (!sentNull) { halt(MOVED); return undefined; }
           // sent with none (a fresh install whose store was made meanwhile): read the store's identity, then ask once more
-          if (retried) { stuck = NO_STORE; say("stuck", stuck); return undefined; }
+          if (retried) { halt(NO_STORE); return undefined; }
           const read = typeof o.refreshStore === "function" ? attempt(() => o.refreshStore()) : Promise.resolve();
           return read.then(() => undefined, () => undefined).then(() => {
-            if (mineSeq !== seq) return undefined;
-            if (storeNull()) { stuck = NO_STORE; say("stuck", stuck); return undefined; }      // asking again would draw the same 409
+            if (stuck) return undefined;
+            if (storeNull()) { halt(NO_STORE); return undefined; }      // asking again, for this form or a newer one, would draw the same 409
+            if (mineSeq !== seq) return undefined;                       // the newer form is asked for next, with the identity now held
             return send(v, mineSeq, true);
           });
         }
+        if (mineSeq !== seq) return undefined;          // the form moved on while this was read: the newer one speaks
+        if (!c || typeof c !== "object" || !c.body || typeof c.body !== "object") { say("bad", c && c.ok ? EMPTY : NO_ANSWER); return undefined; }
         if (!c.ok) {
           const m = bare(why(c));
           state = { kind: "refused" };
@@ -500,14 +518,27 @@
         // nothing is signed on a reading the person was not shown
         const text = viewText(c.body.view);
         if (text === null || typeof c.body.review_id !== "string" || !c.body.review_id) { say("bad", EMPTY); return undefined; }
-        current = { id: c.body.review_id, body_text: c.body.body_text, digest: c.body.digest, words: v.words, spec: v.spec, reply: c, readAt: Date.now() };
+        // nor on one that does not say when it stops: the stop is part of what is signed
+        if (!stampDate(c.body.stop_at)) { say("bad", NO_STOP); return undefined; }
+        // aged from when the server read it (a slow reply arrives already old); from its arrival only when the server did not say
+        const readOn = stampDate(c.body.reviewed_at);
+        const readAt = readOn ? readOn.getTime() : Date.now();
+        if (Date.now() - readAt >= REVIEW_MAX_AGE_MS) {
+          // too old to sign on arrival: asked again at once, but only once in a row, so a device whose clock is off never loops
+          if (reasked) { reasked = false; say("bad", STALE); return undefined; }
+          reasked = true;
+          queue(0);
+          return undefined;
+        }
+        reasked = false;
+        current = { id: c.body.review_id, body_text: c.body.body_text, digest: c.body.digest, words: v.words, spec: v.spec, reply: c, readAt: readAt };
         const sl = stopLine(c, v);
-        showReview(sl ? text + "\n\n" + sl : text, false);
+        showReview(text + "\n\n" + sl, false);
         live.textContent = summary.textContent;
         syncSign();
         watchAge();
         return undefined;
-      }, () => { if (mineSeq === seq) say("bad", NO_ANSWER); return undefined; });
+      }, () => { if (mineSeq === seq && !stuck) say("bad", NO_ANSWER); return undefined; });
     }
     // a control held still while a signing is under way; the page says when
     function lock(on) {
@@ -518,7 +549,7 @@
       syncSign();
     }
     return {
-      words: words, foot: foot, current: () => current, queue: queue, changed: changed, lock: lock, syncSign: syncSign, setRepos: setRepos,
+      words: words, foot: foot, current: () => current, queue: queue, changed: changed, lock: lock, syncSign: syncSign, setRepos: setRepos, stop: halt,
       start: () => { started = true; queue(); },
     };
   }

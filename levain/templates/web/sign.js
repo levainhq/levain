@@ -803,18 +803,33 @@
     let oid = newOutboxId();       // held for these words: a resend after a lost reply files once, never twice
     let cannot = "";
     const why0 = !storeRead ? "still reading which Levain answers here; reload" : "";
+    // The store this sheet is bound to. Every reply that names a store passes through here: a reply may SET the identity only
+    // while the page holds none, and a different one named while one is held stops the sheet (it is never re-bound: that
+    // would sign into, or send to, a store the person never opened the sheet for).
+    const MOVED = "This sheet was opened for a different Levain store than the one answering now. Reload the page to see the current store; nothing more can be signed or sent here.";
+    let moved = "";
+    const otherStore = (id) => typeof id === "string" && storeId !== null && id !== storeId;
+    const refuseOther = () => { moved = MOVED; form.stop(MOVED); };
     // the fields, the spec and the review are the shared form's (envelope_form.js); this page passes how a review is asked for
     const form = window.LevainEnvelopeForm.create({
       words: words, wordsGroup: true, left: colL, right: colR, lockRoots: [grid], repos: got.coord_repos, sign: sign, signWhy: signWhy, why: why,
       storeId: () => storeId,
       // asked only after a review sent with no store id: a store identity the page already holds is never replaced
-      refreshStore: () => readDrops().then((g) => { if (storeId === null && g && typeof g.coord_store_id === "string") storeId = g.coord_store_id; }),
-      blocked: () => (cannot ? "Envelope: " + cannot : why0),
+      refreshStore: () => readDrops().then((g) => {
+        if (!g || typeof g.coord_store_id !== "string") return;
+        if (storeId === null) storeId = g.coord_store_id;
+        else if (otherStore(g.coord_store_id)) refuseOther();
+      }),
+      blocked: () => moved || (cannot ? "Envelope: " + cannot : why0),
       review: (req) => {
         const k = keyNow();
         return post("envelope-review", { words: req.words, outbox_id: oid, spec: req.spec, signer_fp: k.fp, store_id: storeId }).then((c) => {
           // a fresh install's review made the store: only then does a null identity take the reply's
           if (c.ok && storeId === null && c.body.store_created === true && typeof c.body.store_id === "string") storeId = c.body.store_id;
+          else if (c.ok && otherStore(c.body.store_id)) {
+            refuseOther();
+            return { ok: false, status: 409, body: { error: "other_store", message: MOVED }, k: k };
+          }
           c.k = k;
           return c;
         });
@@ -876,8 +891,12 @@
     const done = (a, plain) => {
       const d = a.body.drop || {};
       const e = a.body.envelope;
-      // a fresh store's first drop made it: its identity is held before the controls unlock, so a fast second send names it
-      if (typeof a.body.store_id === "string") storeId = a.body.store_id;
+      // a fresh store's first drop made it: its identity is held before the controls unlock, so a fast second send names it.
+      // A drop answered by a store other than the one held (a kept drop sent again after the store changed) is reported as
+      // delivered there, and the sheet stops: it is never re-bound to the store that answered
+      const other = otherStore(a.body.store_id);
+      if (storeId === null && typeof a.body.store_id === "string") storeId = a.body.store_id;
+      if (other) refuseOther();
       busy = false;
       lock(false);
       oid = newOutboxId();
@@ -887,15 +906,17 @@
       queue(0);
       const msg = (a.body.created === false ? "already delivered" : "delivered") + " as " + String(d.drop_id || "") + " · by "
         + (plain ? "words only" : e && e.taken ? "envelope " + e.envelope_id + " taken" : "envelope NOT taken: " + String((e && e.refused) || "no envelope in the reply"));
-      say(msg, plain || (e && e.taken) ? "ok" : "bad");
+      if (other) say(msg + "; but by a different Levain store than this sheet was opened for. Reload the page to see the current store; nothing more can be signed or sent here.", "bad");
+      else say(msg, plain || (e && e.taken) ? "ok" : "bad");
       tell("signed");
       return readDrops().then((g) => {
         if (g.unpaired || g.error) return;
         const dd = Array.isArray(g.coord_drops) ? g.coord_drops : [];
         list.textContent = dd.map(dropLine).join("\n");
         list.hidden = !dd.length;
-        // the store this sheet is bound to is kept: a listing that names another one never re-binds it
+        // the store this sheet is bound to is kept: a listing that names another one never re-binds it, and stops the sheet
         if (storeId === null && typeof g.coord_store_id === "string") storeId = g.coord_store_id;
+        else if (otherStore(g.coord_store_id) && !moved) refuseOther();
       });
     };
     const refusal = (a, nothing) => say(nothing + ": " + why(a), "bad");
@@ -950,6 +971,7 @@
       const w = wordsOf();
       if (w === null) return;
       if (why0) return say(why0, "bad");
+      if (moved) return say(moved, "bad");
       sendDrop({ words: w, outbox_id: oid, sent_at: stamp(), store_id: storeId });
     });
     // what the envelope needs, said before any tap: never a ceremony that cannot verify
@@ -992,6 +1014,7 @@
       const stop1 = (m, again) => { relabel("Not signed"); ended(); say(m, "bad"); busy = false; lock(false); if (again) queue(0); };
       post("envelope-challenge", { review_id: c.id }).then((ch) => {
         if (!ch.ok) return stop1("Not signed: " + why(ch) + "; nothing was signed.", ch.status === 409);
+        if (otherStore(ch.body.store_id)) { stop1("Not signed: the challenge came from a different Levain store than this sheet was opened for; nothing was signed."); return refuseOther(); }
         if (!decodable(ch.body.challenge)) return stop1("The cockpit sent a malformed challenge; nothing was signed.");
         const line = typeof ch.body.line === "string" ? ch.body.line : "";
         if (line) signing(line, "server", "Signing");

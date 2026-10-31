@@ -53,6 +53,12 @@ INIT_JS = """(() => {
   Date.now = () => realNow() + (top.__skew || 0);
   const reply = (status, o) => new Response(JSON.stringify(o), {status: status, headers: {'Content-Type': 'application/json'}});
   const json = (o) => Promise.resolve(reply(200, o));
+  // a drop an earlier visit kept unanswered, bound to store st-a: the sheet sends it again when it opens
+  if (CFG.pending && window !== top && !top.__seeded) {
+    top.__seeded = 1;
+    try { localStorage.setItem('levain-drop-pending:' + location.hostname + ':ob-old',
+      JSON.stringify({words: 'an earlier drop', outbox_id: 'ob-old', sent_at: '2026-10-31T10:00:00.000000Z', store_id: 'st-a'})); } catch (e) { /* none kept */ }
+  }
   try { navigator.credentials.get = () => new Promise(() => undefined); } catch (e) { /* the page's own */ }
   window.fetch = (u, o) => {
     const url = String(u);
@@ -65,6 +71,13 @@ INIT_JS = """(() => {
                     rp_id: location.hostname, credentials: {}};
       if (later && CFG.holdList) return new Promise((r) => top.__heldList.push(() => r(reply(200, body))));
       return json(body);
+    }
+    if (url.indexOf('/cockpit/coord/drop') >= 0 && 'dropStore' in CFG) {
+      const b = JSON.parse(o.body);
+      top.__drops = top.__drops || [];
+      top.__drops.push(b);
+      return json({created: false, drop: {drop_id: 'dr-old', words: b.words, sent_at: b.sent_at, receipts: []}, envelope: null,
+                   woken: null, store_id: CFG.dropStore});
     }
     if (url.indexOf('/cockpit/coord/envelope-challenge') >= 0) {
       top.__challenges.push(JSON.parse(o.body));
@@ -90,12 +103,16 @@ INIT_JS = """(() => {
       if (bad && 'rawBody' in CFG) return Promise.resolve(new Response(CFG.rawBody, {status: 200, headers: {'Content-Type': 'application/json'}}));
       // the hard stop as the server computes it: from the review, in its fixed-width UTC form
       const hours = parseInt((b.spec && b.spec.stop) || '2', 10);
-      const stopAt = new Date(Date.now() + hours * 3600000).toISOString().slice(0, 19) + '.000000Z';
+      const stamp = (ms) => new Date(ms).toISOString().slice(0, 19) + '.000000Z';
+      const readMs = Date.now() - (n === 1 || CFG.readAgoAll ? (CFG.readAgoFirst || 0) : 0);
+      const stopAt = stamp(readMs + hours * 3600000);
       top.__lastStopAt = stopAt;
       const ok = () => {
         const r = {review_id: 'rv-' + n, body_text: 'BODY' + n, digest: 'dg', rp_id: location.hostname, stop_at: stopAt,
-                   view: __VIEW__.concat(['review ' + n]), store_id: nullStore ? 'st-new' : b.store_id, store_created: nullStore};
+                   reviewed_at: stamp(readMs), view: __VIEW__.concat(['review ' + n]), store_id: nullStore ? 'st-new' : b.store_id,
+                   store_created: nullStore};
         if (bad && 'view' in CFG) { if (CFG.view === 'missing') delete r.view; else r.view = CFG.view; }
+        if (bad && 'stopAt' in CFG) { if (CFG.stopAt === 'missing') delete r.stop_at; else r.stop_at = CFG.stopAt; }
         return r;
       };
       if (nullStore) top.__nullOut += 1;
@@ -115,6 +132,8 @@ def make_init(store: "str | None" = "st-1", hold: int = 0, strict: bool = False,
     # more: conflictFirst (the first n reviews are refused other_store), serverStore (a review naming another store is refused
     # other_store), storeAfter (the sheet's later listing reads name this store), holdList (those reads are held until released),
     # badFirst with view (the first n reviews carry this view; "missing" leaves it out) or rawBody (they answer 200 with this text)
+    # or stopAt (their stop_at is this text; "missing" leaves it out), readAgoFirst (ms: the first review, or every one with
+    # readAgoAll, was read that long before it answered), pending (a drop bound to st-a is kept unanswered) with dropStore (the store a drop's answer names)
     cfg = {"store": store, "hold": hold, "strict": strict, "refuse": refuse, "challenge": challenge, **more}
     return (INIT_JS.replace("__CFG__", json.dumps(cfg)).replace("__REPOS__", json.dumps(REPOS)).replace("__VIEW__", json.dumps(VIEW_LINES)))
 
@@ -625,3 +644,97 @@ def test_the_summary_says_when_the_hard_stop_is_and_a_summary_over_five_minutes_
     s = t["stop"]
     assert ("Hard stop at " + s["hm"]) in s["review"] and "set when this summary was read" in s["review"], s
     assert t["again"]["n"] == 2 and "review 2" in t["fresh"]["review"], t
+
+
+@needs_browser
+@needs_ssh
+def test_a_kept_drop_answered_by_another_store_never_rebinds_the_sheet(tmp_path: Path, monkeypatch) -> None:
+    # opened for store A, the sheet sends a drop an earlier visit kept; store B answers it as delivered. The answer's store id
+    # is never taken over the one held: the sheet says so and nothing more is asked of, or signed into, either store
+    moved = "different Levain store"
+    probe = ("return {review: " + SUMMARY + ", btn: " + SIGN_OFF + ", note: d.getElementById('sheet-note').textContent};")
+    opened = _open_from_cockpit("1280", make_init(store="st-a", pending=True, dropStore="st-b"), wait=False)[:-1]
+    steps = opened + [
+        {"until": "(window.__drops || []).length >= 1", "ms": 20000},
+        _sleep(1500),
+        _top("after", f"return {{drops: window.__drops.map((d) => d.store_id), stores: {STORES}}};"),
+        _tag("shown", FD, probe),
+        _set(FD, "#drop-words", "tidy the changelog, and the readme"), _sleep(1500),
+        _top("edited", f"return {{drops: window.__drops.length, stores: {STORES}}};"),
+        _tag("still", FD, probe)]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["after"]["drops"] == ["st-a"] and "st-b" not in t["after"]["stores"], t["after"]
+    assert t["edited"]["drops"] == 1 and "st-b" not in t["edited"]["stores"], t["edited"]  # never re-bound to the store that answered
+    s = t["shown"]
+    assert "delivered as dr-old" in s["note"] and moved in s["note"], s                    # what happened, and what it means
+    assert s["btn"] is True and moved in s["review"], s
+    assert t["still"]["btn"] is True and moved in t["still"]["review"], t["still"]
+
+
+@needs_browser
+@needs_ssh
+def test_a_store_still_unnamed_after_the_read_stops_asking_even_when_edited_meanwhile(tmp_path: Path, monkeypatch) -> None:
+    # sent with no store id and refused other_store; the person edits while the store is read again; the read names no
+    # store. The sheet stops: the edit waiting its turn is not sent, and a later edit sends nothing either
+    no_store = "Levain has not said which store answers here yet"
+    probe = "return {review: " + SUMMARY + ", btn: " + SIGN_OFF + "};"
+    steps = _open_from_cockpit("1280", make_init(store=None, conflictFirst=9, holdList=True), wait=False) + [
+        {"until": "(window.__heldList || []).length >= 1", "ms": 10000},
+        _set(FD, "#drop-words", "tidy the changelog, and the readme"), _sleep(1200),
+        _top_eval("const f = window.__heldList.shift(); f(); return 1;"),
+        _sleep(1500),
+        _top("read", "return {n: window.__reviews.length, conflicts: window.__conflicts};"),
+        _tag("stuck", FD, probe),
+        _set(FD, "#drop-words", "tidy the changelog, the readme and the notes"), _sleep(1500),
+        _top("edited", "return {n: window.__reviews.length, conflicts: window.__conflicts};"),
+        _tag("still", FD, probe)]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["read"] == {"t": "read", "n": 1, "conflicts": 1}, t["read"]
+    assert no_store in t["stuck"]["review"] and t["stuck"]["btn"] is True, t["stuck"]
+    assert t["edited"] == {"t": "edited", "n": 1, "conflicts": 1}, t["edited"]
+    assert no_store in t["still"]["review"] and t["still"]["btn"] is True, t["still"]
+
+
+@needs_browser
+@needs_ssh
+def test_a_summary_the_server_read_over_five_minutes_ago_is_read_again_at_once(tmp_path: Path, monkeypatch) -> None:
+    # its age is the server's: a reply that took six minutes to arrive is already too old to sign
+    steps = _open_from_cockpit("1280", make_init(readAgoFirst=6 * 60000), wait=False) + [
+        _sleep(2500),
+        _top("again", "return {n: window.__reviews.length};"),
+        SIGN_ON,
+        _tag("fresh", FD, "return {review: " + SUMMARY + "};")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["again"]["n"] == 2 and "review 2" in t["fresh"]["review"], t
+
+
+@needs_browser
+@needs_ssh
+def test_replies_that_always_arrive_too_old_are_asked_again_once_and_never_loop(tmp_path: Path, monkeypatch) -> None:
+    # a device whose clock runs ahead of the server's sees every reply as old: one more ask, then the sheet says so and waits
+    stale = "The server's summary was over 5 minutes old when it arrived, twice (this device's clock may be off); nothing can be signed."
+    steps = _open_from_cockpit("1280", make_init(readAgoFirst=6 * 60000, readAgoAll=True), wait=False) + [
+        _sleep(3000),
+        _top("asked", "return {n: window.__reviews.length};"),
+        _tag("shown", FD, "return {review: " + SUMMARY + ", btn: " + SIGN_OFF + "};")]
+    t = _tagged(_run(tmp_path, monkeypatch, "1280", steps))
+    assert t["asked"]["n"] == 2, t["asked"]
+    assert t["shown"]["review"].startswith(stale) and t["shown"]["btn"] is True, t["shown"]
+
+
+@needs_browser
+@needs_ssh
+def test_a_reply_with_no_usable_stop_never_enables_sign(tmp_path: Path, monkeypatch) -> None:
+    words = "The server did not say when this envelope would stop; nothing can be signed. Change anything to ask again."
+    for name, stop in (("missing", "missing"), ("garbage", "tomorrow-ish")):
+        sub = tmp_path / name
+        sub.mkdir()
+        steps = _open_from_cockpit("1280", make_init(badFirst=1, stopAt=stop), wait=False) + [
+            {"until": _in(FD, "return /did not say when/.test(" + SUMMARY + ");"), "ms": 10000},
+            _sleep(300),
+            _tag("bad", FD, "return {review: " + SUMMARY + ", btn: " + SIGN_OFF + "};"),
+            _set(FD, "#drop-words", "tidy the changelog, and the readme"), _reviews(2), SIGN_ON,
+            _tag("next", FD, "return {review: " + SUMMARY + "};")]
+        t = _tagged(_run(sub, monkeypatch, "1280", steps))
+        assert t["bad"]["review"] == words and t["bad"]["btn"] is True, (name, t["bad"])
+        assert "review 2" in t["next"]["review"], (name, t["next"])
