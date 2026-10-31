@@ -47,6 +47,36 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     r.add_argument("--dry-run", action="store_true", help="Prepare and print the package, compose nothing.")
     r.add_argument("--json", action="store_true", help="Print the typed result as JSON on stdout.")
     r.set_defaults(func=run_dream_run)
+    rb = sub.add_parser("rollback", allow_abbrev=False, help="Restore the memory text a dream replaced (one step).",
+                        description="Restore the memory TEXT the dream replaced, from its snapshot. One step: only the "
+                                    "newest dream, only if the live text is what it saved or replaced. memory.db is "
+                                    "never restored, so the day's episodes stay counted as consolidated.")
+    _store_and_occurrence(rb)
+    rb.add_argument("--who", default="operator", help="Recorded in rollback.json.")
+    rb.add_argument("--json", action="store_true")
+    rb.set_defaults(func=run_dream_rollback)
+    rc = sub.add_parser("recover", allow_abbrev=False, help="Settle the store side of a dream that did not end cleanly.",
+                        description="Cancel an unfinished wrap by token, end an orphaned compose child after an identity "
+                                    "check, and record a committed save that was never recorded. Refuses while a run "
+                                    "holds the store lock.")
+    _store_and_occurrence(rc)
+    rc.add_argument("--state", choices=("launched", "stopped"), default="launched",
+                    help="The occurrence's state as the supervisor knows it.")
+    rc.add_argument("--card-filed", action="store_true", help="The occurrence's card already exists.")
+    rc.add_argument("--json", action="store_true")
+    rc.set_defaults(func=run_dream_recover)
+    dr = sub.add_parser("drill", allow_abbrev=False, help="Prove the latest snapshot restores, on a scratch copy.",
+                        description="Hash the latest snapshot, integrity-check its db backup, run the real rollback on a "
+                                    "scratch copy of the store and open the result. Never touches the store itself.")
+    dr.add_argument("--store-dir", required=True, help="A directory holding memory.db (or .levain/memory.db).")
+    dr.add_argument("--root", default=None, help="The occurrences dir (default <store dir>/dream).")
+    dr.add_argument("--json", action="store_true")
+    dr.set_defaults(func=run_dream_drill)
+
+
+def _store_and_occurrence(p: argparse.ArgumentParser) -> None:
+    p.add_argument("occurrence", help="An occurrence id under <store dir>/dream/, or the path of its dir.")
+    p.add_argument("--store-dir", required=True, help="A directory holding memory.db (or .levain/memory.db).")
 
 
 def run_dream(args: argparse.Namespace) -> int:
@@ -136,10 +166,97 @@ def run_dream_run(args: argparse.Namespace) -> int:
         key = os.environ.get(args.api_key_env) if args.api_key_env else None
         mind = ex.OllamaMind(args.model or _w.DEFAULT_COMPOSE_MODEL, base_url=args.base_url, api_key=key)
         budget = None
+    from levain.dream import snapshot as snap
+
+    on_snapshot, on_saved = snap.hooks()
     result = ex.consolidate_store(
-        store_path, mind=mind, composer=getattr(mind, "model", None), max_seconds=max_seconds, budget=budget,
+        store_path, mind=mind, on_snapshot=on_snapshot, on_saved=on_saved, composer=getattr(mind, "model", None), max_seconds=max_seconds, budget=budget,
         instructions_path=args.instructions, occurrence_dir=occ, dry_run=args.dry_run,
         hard_exit_code=_w.EXIT_TIMEOUT, label="levain dream run")
     if args.json:
         print(json.dumps(result.as_dict(), sort_keys=True, default=str))
     return result.exit_code
+
+
+def _occurrence_dir(store_path: Path, occurrence: str) -> tuple[Path | None, str]:
+    """The occurrence dir named by ``occurrence`` (an id under ``<store dir>/dream/``, or a path), refused if it
+    resolves inside the operator's live store."""
+    if os.sep in occurrence or Path(occurrence).expanduser().is_dir():
+        occ = Path(occurrence).expanduser().resolve()
+    else:
+        occ = (store_path.parent / "dream" / occurrence).resolve()
+    why = _refused(occ)
+    if why:
+        return None, why
+    if not occ.is_dir():
+        return None, f"{occ} is not a directory: no such occurrence."
+    return occ, ""
+
+
+def _store_and_occ(verb: str, args: argparse.Namespace) -> tuple[Path, Path] | None:
+    store_path, err = _resolve_store(args.store_dir)
+    if store_path is None:
+        print(f"levain dream {verb}: {err}", file=sys.stderr)
+        return None
+    occ, err = _occurrence_dir(store_path, args.occurrence)
+    if occ is None:
+        print(f"levain dream {verb}: {err}", file=sys.stderr)
+        return None
+    return store_path, occ
+
+
+def run_dream_rollback(args: argparse.Namespace) -> int:
+    from levain.dream import snapshot as snap
+
+    got = _store_and_occ("rollback", args)
+    if got is None:
+        return 2
+    res = snap.rollback(got[0], got[1], who=args.who)
+    if args.json:
+        print(json.dumps({"outcome": res.outcome, "code": res.code, "message": res.message, "restored": res.restored,
+                          "card": res.card}, sort_keys=True))
+    else:
+        print(f"levain dream rollback: {res.message}")
+    return 0 if res.ok else 1
+
+
+def run_dream_recover(args: argparse.Namespace) -> int:
+    from levain.dream import recover as rec
+
+    got = _store_and_occ("recover", args)
+    if got is None:
+        return 2
+    res = rec.recover(got[0], got[1], state=args.state, card_filed=args.card_filed)
+    if args.json:
+        print(json.dumps(res.as_dict(), sort_keys=True))
+    else:
+        print(f"levain dream recover: ends {res.ending!r} ({res.reason or 'no change'}); child {res.child}; "
+              f"wrap {res.wrap}")
+        for n in res.notes:
+            print(f"  {n}")
+        if res.card:
+            print(f"  card to file: {res.card['kind']} / {res.card['reason']}  (remedy: {res.card['remedy']})")
+    return 0 if res.ending != "none" else 1
+
+
+def run_dream_drill(args: argparse.Namespace) -> int:
+    from levain.dream import snapshot as snap
+
+    store_path, err = _resolve_store(args.store_dir)
+    if store_path is None:
+        print(f"levain dream drill: {err}", file=sys.stderr)
+        return 2
+    root = (Path(args.root).expanduser() if args.root else store_path.parent / "dream").resolve()
+    why = _refused(root)
+    if why:
+        print(f"levain dream drill: --root {why}", file=sys.stderr)
+        return 2
+    res = snap.drill(store_path, root)
+    if args.json:
+        print(json.dumps(res.as_dict(), sort_keys=True))
+    else:
+        print(f"levain dream drill: {res.outcome}" + (f" (snapshot {res.snapshot})" if res.snapshot else
+                                                       " (no snapshot yet: not a failure)"))
+        for st in res.steps:
+            print(f"  {st['name']:10s} {st['status']:8s} {st['detail']}")
+    return 1 if res.outcome == "failed" else 0
