@@ -2398,6 +2398,13 @@
     if (N && N.history()) mark(12);
     else applyMode("board", true);
   }
+  // The Work lens's open loop: its row in the Open loops panel (on the tab that shows that panel), scrolled to and lit.
+  function openLoop(sporeId) {
+    const L = root.LevainLoops, panel = document.querySelector('[data-ck-panel="loops"]');
+    if (!L || !panel) return;
+    revealTab(panel);
+    L.go(sporeId);
+  }
   // The topology panel's state, read once for the header lens and the Sessions card alike. The panel is hidden on the page (the header draws it), so a
   // fault is the header's to say, three ways: a failed fetch (ts.fault), an error record the kernel sent (data.error), or the page's own
   // "unavailable" card (an external panel, no state of its own).
@@ -2469,7 +2476,7 @@
     if (I.tv) {
       // the Replay strip rides the page's own read path (LevainCockpitTransport.readJson: its auth headers and token handling); resume re-reads the live topology
       const replay = I.canReplay ? { readJson: root.LevainCockpitTransport.readJson, resume: () => refetchPanel("topology") } : undefined;
-      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, replay }); } catch (e) { fail = true; }
+      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, openLoop, replay }); } catch (e) { fail = true; }
     }
     if (body) { host.replaceChildren(body); return; }
     // a fault, or a throw while drawing: said in words with the switch beside it, so the Event graph is one click away

@@ -2065,7 +2065,7 @@
     // the spore id is the common reference handle (how flow tracks + you name it,
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
-    if (s.id) row.appendChild(el("span", "sid", s.id));
+    if (s.id) { row.appendChild(el("span", "sid", s.id)); row.dataset.spore = String(s.id); }   // the Work lens finds a loop's row by this
     // Tray badges the disposition; Open Loops the tier; Keep is mixed — a note badges
     // "note" (reference), a pinned-dormant loop badges its tier ("parked").
     let badge;
@@ -6215,6 +6215,23 @@
     return true;
   }
 
+  // An open loop the Work lens names goes to its row in the Open loops panel: a collapsed card is expanded, a row the list folded away is shown,
+  // and the row is scrolled to and outlined (tv-lit) for a moment. False when the page has no such panel or row.
+  function loopGo(id) {
+    if (!id) return false;
+    const panel = document.querySelector('[data-ck-panel="loops"]');
+    if (!panel) return false;
+    const row = Array.prototype.find.call(panel.querySelectorAll(".row[data-spore]"), (n) => n.dataset.spore === id);
+    if (!row) return false;
+    if (panel.classList.contains("ck-collapsed")) { const f = panel.querySelector(".ck-lay-fold"); if (f && !f.disabled) f.click(); }
+    if (row.dataset.folded) { row.style.display = ""; delete row.dataset.folded; }
+    for (const n of document.querySelectorAll(".tv-lit[data-spore]")) n.classList.remove("tv-lit");
+    if (typeof row.scrollIntoView === "function") row.scrollIntoView({ block: "center", behavior: "smooth" });
+    row.classList.add("tv-lit");
+    window.setTimeout(() => row.classList.remove("tv-lit"), 2600);
+    return true;
+  }
+
   // A session's transcript (Q8): the Sessions modal's row button fetches /cockpit/session/<stem>.json with the token this
   // page holds, as the consent details do, and draws it as text only (textContent, never HTML: the prompts and replies are
   // whatever an agent said). The record shows the events the hooks kept (cut ones marked) with the session's consent
@@ -7629,5 +7646,6 @@
 
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
+  window.LevainLoops = { go: loopGo };
   window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

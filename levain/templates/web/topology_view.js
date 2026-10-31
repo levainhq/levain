@@ -424,16 +424,55 @@
   }
 
   // ---- the Work lens ----
-  function workerChip(n, lost) {
+  // The one move that opens an agent's page: the Agents graph's node and the Work lens's worker chip both make it. False (nothing opened) when
+  // the page is absent, so each caller falls back as its own surface does.
+  function agentPageOpens() { const A = root.LevainAgentPage; return !!A && typeof A.open === "function"; }
+  function openAgentPage(v, n, anchor, tip) {
+    if (!agentPageOpens()) return false;
+    // a seat's own node names its seat to the page, which offers a message box addressed to it: the graph passes the full roster name,
+    // which is its GROUP's label (the node's own label is only the tail). Only the seat's own node does: its lanes sit in the seat's group
+    // with that node as parent, and a label shared by two groups names no one seat. Each of those opens its page with no box.
+    const grp = arr(v.groups).find((q) => q && q.id === n.group);
+    const own = n.parent == null || n.parent === "";
+    const unique = grp && typeof grp.label === "string" && arr(v.groups).filter((q) => q && typeof q.label === "string" && q.label.trim() === grp.label.trim()).length === 1;
+    const seat = own && unique ? grp.label.trim() : "";
+    if (typeof tip === "function") tip();
+    root.LevainAgentPage.open({ id: n.id, label: n.label, rows: tipRows(n, v.as_of), session: typeof n.session === "string" ? n.session : "", seat: seat }, anchor);
+    return true;
+  }
+
+  function workerChip(n, lost, v) {
     const c = el("span", "tv-chip");
     c.dataset.node = n.id;
     c.title = [n.agent, n.model || "model unknown"].filter(Boolean).join(" · ");
     c.append(dot(n.state), n.label);
     const risk = riskMark(lost.get(n.id));
     if (risk) c.appendChild(risk);
+    // with the agent page present the chip opens it, as the node does in the Agents graph; the card's own click is not also made
+    if (agentPageOpens()) {
+      c.classList.add("tv-open");
+      c.setAttribute("role", "button");
+      c.tabIndex = 0;
+      c.title = c.title + " \u00b7 open its page";
+      c.addEventListener("click", (ev) => { ev.stopPropagation(); openAgentPage(v, n, c); });
+      c.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); ev.stopPropagation(); openAgentPage(v, n, c); } });
+    }
     return c;
   }
-  function taskCard(t, byId, lost, opts) {
+  // an open loop opens its row in the page's Open loops panel, through the page's own callback (this file knows no page DOM)
+  function openLoopCard(node, t, opts) {
+    if (!opts || typeof opts.openLoop !== "function" || typeof t.id !== "string" || t.id.indexOf("spore:") !== 0 || t.id.length <= 6) return;
+    const sid = t.id.slice(6);
+    node.classList.add("tv-open");
+    node.setAttribute("role", "button");
+    node.tabIndex = 0;
+    node.dataset.loop = sid;
+    node.title = "open this loop in Open loops";
+    const go = () => opts.openLoop(sid);
+    node.addEventListener("click", (ev) => { if (!(ev.target.closest && ev.target.closest("a,button:not(.tv-open)"))) go(); });
+    node.addEventListener("keydown", (ev) => { if (ev.target === node && (ev.key === "Enter" || ev.key === " ")) { ev.preventDefault(); go(); } });
+  }
+  function taskCard(t, byId, lost, opts, v) {
     const c = el("article", "tv-task " + t.state + (t.kind === "unattached" ? " tv-loose" : ""));
     c.dataset.task = t.id;
     c.dataset.kind = t.kind;
@@ -452,7 +491,7 @@
     const foot = el("div", "tv-task-f");
     if (t.kind !== "unattached") foot.appendChild(el("span", "tv-kind", KIND_WORDS[t.kind] || t.kind));
     const workers = arr(t.workers).map((id) => byId.get(id)).filter(Boolean);
-    for (const n of workers) foot.appendChild(workerChip(n, lost));
+    for (const n of workers) foot.appendChild(workerChip(n, lost, v));
     const waits = arr(t.waits_on);
     if (!workers.length && t.kind !== "unattached") foot.appendChild(el("span", "tv-none", "no agent attached"));
     if (t.kind === "unattached") foot.appendChild(el("span", "tv-none", "no task record, none guessed"));
@@ -464,6 +503,7 @@
     if (t.kind !== "unattached") foot.appendChild(el("span", "tv-cost" + (costText(t.cost) === "cost not tracked" ? " dim" : ""), costText(t.cost)));
     if (foot.children.length) c.appendChild(foot);
     if (t.state === "waiting") openable(c, t.card, opts);
+    else if (t.kind === "spore") openLoopCard(c, t, opts);
     return c;
   }
   function outcomeList(t) {
@@ -547,7 +587,7 @@
       const folds = t.kind !== "unattached" && t.state !== "waiting" && t.state !== "failed";
       const idx = folds ? (seen.set(t.state, (seen.get(t.state) || 0) + 1), seen.get(t.state)) : 0;
       const hide = folds && idx > GROUP_CAP && !shownAll.has(t.state);
-      const c = taskCard(t, byId, lost, opts);
+      const c = taskCard(t, byId, lost, opts, v);
       const o = outcomeList(t);
       c.hidden = hide;
       if (o) o.hidden = hide;
@@ -1409,16 +1449,7 @@
     const openPage = (g, n, x, y) => {
       if (!n) { toggle(null); return; }
       if (g.classList.contains("tv-open")) return;
-      // a seat's own node names its seat to the page, which offers a message box addressed to it: the graph passes the full roster name,
-      // which is its GROUP's label (the node's own label is only the tail). Only the seat's own node does: its lanes sit in the seat's group
-      // with that node as parent, and a label shared by two groups names no one seat. Each of those opens its page with no box.
-      const grp = arr(v.groups).find((q) => q && q.id === n.group);
-      const own = n.parent == null || n.parent === "";
-      const unique = grp && typeof grp.label === "string" && arr(v.groups).filter((q) => q && typeof q.label === "string" && q.label.trim() === grp.label.trim()).length === 1;
-      const seat = own && unique ? grp.label.trim() : "";
-      const A = root.LevainAgentPage;
-      if (A && typeof A.open === "function") { hideTip(); A.open({ id: n.id, label: n.label, rows: tipRows(n, v.as_of), session: typeof n.session === "string" ? n.session : "", seat: seat }, g); }
-      else toggle(n, x, y);
+      if (!openAgentPage(v, n, g, hideTip)) toggle(n, x, y);
     };
     // the card stays on its node through every layout (a live relayout moves the node, a resize moves the whole graph), not only a stage replacement
     reanchorPin = () => {
@@ -1807,7 +1838,7 @@
   }
 
   // ---- the body ----
-  // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to,
+  // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to, openLoop(sporeId): open an open loop's row,
   // replay: {readJson(url, signal), resume()} when the panel head says `replay: true`}
   function render(v, opts) {
     const o0 = opts || {};

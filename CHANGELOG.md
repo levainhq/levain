@@ -470,6 +470,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   on a real phone or a real push.
 
 ### Fixed
+- **The cockpit's Work view now does something when you click it.** A worker in the Work lens opens its agent page, as a node in the Agents graph does, and an open loop opens its row in the Open loops panel (scrolled to, unfolded if folded, and lit for a moment).
 - **A coordinator may run the `levain coord log` line its reply block hands it.** When more than five records are new, the
   work delta ends with `+N more: levain coord log --since G`; the coordinator's workspace refused that command as the
   operator's. `coord log` only displays, so it is now admitted there. The presence word is also written whole when the

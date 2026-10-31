@@ -298,3 +298,97 @@ def test_a_transcript_cost_reads_as_tokens_from_transcripts_never_a_price(tmp_pa
     probe = ("JSON.stringify(Object.fromEntries([...%s.querySelectorAll('.tv-task')].map(t => [t.dataset.task, (t.querySelector('.tv-cost') || {textContent: null}).textContent])))") % TV
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])
     assert json.loads(out[-1])["t-stuck"] == "706K tokens from transcripts", out[-1]
+
+
+# --- the Work lens's click targets: a worker opens its page, an open loop opens its row -----------------------------------
+
+
+def _work_value() -> dict:
+    v = _value()
+    v["tasks"] += [{"id": "spore:spore-017", "kind": "spore", "label": "tighten the rounding guard", "state": "open", "waits_on": [], "card": None,
+                    "outcomes": [], "cost": {"usd": None, "tokens": None, "source": None}, "workers": ["n2"], "opened": None, "age_days": 3, "heat": "hot"}]
+    return v
+
+
+def _paint_with(value: dict, page: bool, loop: bool) -> str:
+    """Draw the Work lens for a literal value with a stub agent page (or none) and an openLoop callback (or none); both record what they were handed."""
+    opts = "{lens: 'work', openCard: (id) => { window.__opened = id; }" + (", openLoop: (id) => { window.__loop = id; }" if loop else "") + "}"
+    stub = "window.LevainAgentPage = {open: (n, a) => { window.__page = n.id; }};" if page else "window.LevainAgentPage = undefined;"
+    return ("(() => { %s window.__page = null; window.__loop = null; window.__opened = null; const h = document.getElementById('ck-hlens'); h.hidden = false; "
+            "h.replaceChildren(window.LevainTopologyView.render(%s, %s)); return 1; })()") % (stub, json.dumps(value), opts)
+
+
+CHIP = TV + ".querySelector('.tv-task[data-task=\"spore:spore-017\"] .tv-chip')"
+LOOP = TV + ".querySelector('.tv-task[data-task=\"spore:spore-017\"]')"
+KEY = "new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true})"
+
+
+@needs_browser
+def test_a_worker_chip_opens_its_agent_page_and_not_its_cards_click(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = ("JSON.stringify({role: %s.getAttribute('role'), tab: %s.tabIndex, open: %s.classList.contains('tv-open'), page: window.__page, "
+             "loop: window.__loop, card: window.__opened})") % (CHIP, CHIP, CHIP)
+    out = _run(tmp_path, src, [{"eval": _paint_with(_work_value(), True, True)}, {"eval": CHIP + ".click(); 1"}, {"eval": probe},
+                               {"eval": "window.__page = null; " + CHIP + ".dispatchEvent(" + KEY + "); 1"}, {"eval": "window.__page"}])
+    got = json.loads(out[-3])
+    assert got == {"role": "button", "tab": 0, "open": True, "page": "n2", "loop": None, "card": None}, got    # the loop card's own click did not fire
+    assert out[-1] == "n2", out                                                                                # Enter on the chip does the same as a click
+
+
+@needs_browser
+def test_without_the_agent_page_a_chip_stays_a_plain_span(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = "JSON.stringify([...%s.querySelectorAll('.tv-chip')].map(c => [c.getAttribute('role'), c.tabIndex, c.classList.contains('tv-open')]))" % TV
+    out = _run(tmp_path, src, [{"eval": _paint_with(_work_value(), False, True)}, {"eval": probe}])
+    got = json.loads(out[-1])
+    assert got and all(g == [None, -1, False] for g in got), got
+
+
+@needs_browser
+def test_an_open_loop_card_calls_open_loop_with_its_spore_id_by_click_and_by_key(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = "JSON.stringify({role: %s.getAttribute('role'), tab: %s.tabIndex, loop: window.__loop})" % (LOOP, LOOP)
+    out = _run(tmp_path, src, [{"eval": _paint_with(_work_value(), True, True)}, {"eval": LOOP + ".click(); 1"}, {"eval": probe},
+                               {"eval": "window.__loop = null; " + LOOP + ".dispatchEvent(" + KEY + "); 1"}, {"eval": "window.__loop"}])
+    assert json.loads(out[-3]) == {"role": "button", "tab": 0, "loop": "spore-017"}, out
+    assert out[-1] == "spore-017", out
+
+
+@needs_browser
+def test_an_open_loop_card_is_inert_when_the_page_passes_no_open_loop(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = ("JSON.stringify({role: %s.getAttribute('role'), open: %s.classList.contains('tv-open'), "
+             "any: !!%s.querySelector('.tv-task[data-kind=spore].tv-open')})") % (LOOP, LOOP, TV)
+    out = _run(tmp_path, src, [{"eval": _paint_with(_work_value(), True, False)}, {"eval": LOOP + ".click(); 1"}, {"eval": probe}, {"eval": "window.__loop"}])
+    assert json.loads(out[-2]) == {"role": None, "open": False, "any": False}, out
+    assert out[-1] is None, out
+
+
+@needs_browser
+def test_a_waiting_card_still_opens_its_needs_you_card_and_the_loop_card_does_not_take_its_click(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    sel = TV + ".querySelector('.tv-task.waiting.tv-open')"
+    out = _run(tmp_path, src, [{"eval": _paint_with(_work_value(), True, True)}, {"eval": sel + ".click(); 1"},
+                               {"eval": "JSON.stringify([window.__opened, window.__loop, window.__page])"}])
+    assert json.loads(out[-1]) == ["dispatch:s1", None, None], out
+
+
+@needs_browser
+def test_the_work_lens_open_loop_scrolls_to_and_lights_the_row_in_open_loops(tmp_path, monkeypatch):
+    """Through the real page: the Work lens's loop card lights the row carrying that spore's data-spore in the Open loops panel."""
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    row = "document.querySelector('[data-ck-panel=\"loops\"] .row[data-spore]')"
+    out = _run(tmp_path, src, [
+        {"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
+        {"until": TV + " && " + TV + ".querySelector('.tv-task[data-kind=spore].tv-open')"},
+        {"until": row},
+        {"eval": "JSON.stringify({spore: " + row + ".dataset.spore, lit: " + row + ".classList.contains('tv-lit'), "
+                 "card: " + TV + ".querySelector('.tv-task[data-kind=spore]').dataset.loop})"},
+        {"eval": TV + ".querySelector('.tv-task[data-kind=spore]').click(); 1"},
+        {"until": row + ".classList.contains('tv-lit')"},
+        {"eval": "JSON.stringify([" + row + ".dataset.spore, " + row + ".classList.contains('tv-lit')])"}])
+    before = json.loads(out[-4])
+    assert before["lit"] is False and before["spore"] and before["card"] == before["spore"], before
+    assert "timeout" not in json.dumps(out[-2]), out
+    assert json.loads(out[-1]) == [before["spore"], True], out
