@@ -73,12 +73,14 @@ def _from_row(row: tuple[Any, ...]) -> DropReply:
         b = json.loads(body)
     except (TypeError, ValueError):
         b = None
-    if not isinstance(b, dict):                  # a raw writer's row: shown, never allowed to hide the others
+    covers = b.get("covers", {}) if isinstance(b, dict) else None
+    strs = [b.get(k, "") for k in ("surface", "received_at", "text", "block")] if isinstance(b, dict) else None
+    nums = [covers.get(k, 0) for k in ("after", "through")] if isinstance(covers, dict) else None
+    # a raw writer's row (not JSON, not an object, or a field of the wrong type): shown, never allowed to hide the others
+    if (strs is None or nums is None or not all(isinstance(s, str) for s in strs)
+            or not all(isinstance(n, int) and not isinstance(n, bool) for n in nums)):
         return DropReply(reply_id, ref_id, gseq, at, "", "", UNREADABLE, "", 0, 0)
-    covers = b.get("covers")
-    covers = covers if isinstance(covers, dict) else {}
-    return DropReply(reply_id, ref_id, gseq, at, b.get("surface", ""), b.get("received_at", ""), b.get("text", ""),
-                     b.get("block", ""), covers.get("after", 0), covers.get("through", 0))
+    return DropReply(reply_id, ref_id, gseq, at, *strs, *nums)
 
 
 def write_reply(store: CoordStore, drop_id: str, text: str, *, token: object) -> DropReply:

@@ -536,15 +536,17 @@ def test_a_drop_typed_in_the_terminal_is_never_unreplied(qdir) -> None:
 def test_a_malformed_reply_body_is_shown_unreadable_and_hides_no_other_reply(qdir) -> None:
     store, _box = _clocked(qdir, NOW)
     token = store.coord_take()
-    good, bad, notobj = _drop(store, "a"), _drop(store, "b"), _drop(store, "c")
+    good, bad, notobj, typed, cov = (_drop(store, k) for k in "abcde")
     drop_reply.write_reply(store, good, "fine", token=token)
     _insert(qdir, bad, _stamp(NOW), body="not json")
     _insert(qdir, notobj, _stamp(NOW), body="[1]")
+    _insert(qdir, typed, _stamp(NOW), body=json.dumps({"text": "x", "block": []}))           # an object, a field of the wrong type
+    _insert(qdir, cov, _stamp(NOW), body=json.dumps({"text": "x", "covers": {"after": "1"}}))
     conn = store.open_readonly()
     try:
         got = {r.drop_id: r for r in drop_reply.replies(conn)}
     finally:
         conn.close()
-    assert set(got) == {good, bad, notobj}
+    assert set(got) == {good, bad, notobj, typed, cov}
     assert got[good].text == "fine"
-    assert got[bad].text == got[notobj].text == "(unreadable body)"
+    assert got[bad].text == got[notobj].text == got[typed].text == got[cov].text == "(unreadable body)"
