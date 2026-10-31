@@ -12,7 +12,6 @@ import shutil
 import sqlite3
 from dataclasses import replace
 from datetime import timedelta
-from pathlib import Path
 
 import pytest
 
