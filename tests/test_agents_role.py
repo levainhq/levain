@@ -9,7 +9,7 @@ import pytest
 
 from levain.agents import cli as agents_cli
 from levain.agents.role import (RoleError, add_role, get_role, instance_ceiling, parse_role, parse_role_text,
-                                role_hash)
+                                role_hash, spawn_namespace)
 from levain.agents.store import open_agent_store
 from levain.authority import _canonical
 from levain.cli import main
@@ -133,17 +133,24 @@ def test_stored_text_is_rehashed(tmp_path):
         get_role(store, "scribe")
 
 
-def test_nested_placeholder_in_a_format_spec_is_refused():
-    r = copy.deepcopy(ROLE)
-    r["brief"]["template"] = "Write {topic:{width}}"
-    with pytest.raises(RoleError, match=r"'topic'.*nested placeholders are not allowed"):
-        parse_role(r)
-    r["brief"]["slots"]["width"] = "int"  # declaring the inner name does not make it legal
-    with pytest.raises(RoleError, match="nested placeholders are not allowed"):
-        parse_role(r)
-    r["brief"]["template"] = "Write {topic:>10} {{literal}}"  # a plain spec stays legal
-    r["brief"]["slots"].pop("width")
-    assert parse_role(r)["brief"]["template"].startswith("Write {topic:>10}")
+def test_a_placeholder_is_exactly_the_slot_no_spec_no_conversion():
+    def with_template(t, **slots):
+        r = copy.deepcopy(ROLE)
+        r["brief"]["template"] = t
+        r["brief"]["slots"].update(slots)
+        return r
+
+    for bad, needle in (("Write {topic!z}", r"'topic'.*conversion !z"), ("Write {topic:d}", r"'topic'.*format spec :d"),
+                        ("Write {topic!r}", r"'topic'.*conversion !r"), ("Write {topic:>10}", "format spec :>10"),
+                        ("Write {topic:{width}}", r"'topic'.*a placeholder is exactly \{slot\}")):
+        with pytest.raises(RoleError, match=needle):
+            parse_role(with_template(bad))
+        with pytest.raises(RoleError, match="a placeholder is exactly"):  # declaring the inner name changes nothing
+            parse_role(with_template(bad, width="int"))
+    # the checks can pass: a plain slot and escaped braces stay legal, and the template renders
+    for ok in ("Write {topic}", "Write {topic} {{literal braces}}"):
+        parse_role(with_template(ok))
+    assert parse_role(with_template("Write {topic} {{x}}"))["brief"]["template"].format(topic="t") == "Write t {x}"
 
 
 def test_lone_surrogate_and_huge_integer_are_refusals_not_tracebacks(tmp_path, capsys):
@@ -204,3 +211,110 @@ def test_cli_store_errors_are_one_line_refusals(tmp_path, capsys, monkeypatch):
         assert _run(tmp_path, "role", "add", str(f)) == 1
         err = capsys.readouterr().err
         assert err.count("the store refused it") == 2 and "Traceback" not in err
+
+
+def _show(tmp_path, *argv):
+    return _run(tmp_path, "role", "show", *argv)
+
+
+def test_show_version_out_of_range_and_surrogate_name_are_refusals(tmp_path, capsys):
+    assert _run(tmp_path, "role", "add", str(_file(tmp_path, ROLE))) == 0
+    capsys.readouterr()
+    for v in ("99999999999999999999", "0", "-3"):
+        with pytest.raises(SystemExit) as ei:  # argparse's own usage refusal
+            _show(tmp_path, "scribe", "--version", v)
+        assert ei.value.code == 2
+        assert "a version is an integer from 1 to" in capsys.readouterr().err
+    store = open_agent_store(tmp_path / "store")
+    for bad in (0, -1, 2**63, 10**30, True, "1"):
+        with pytest.raises(RoleError, match="version must be an integer"):
+            get_role(store, "scribe", bad)
+    assert get_role(store, "scribe", 1)[1] == 1
+    assert _show(tmp_path, "\udcff") == 1
+    err = capsys.readouterr().err
+    assert "lone surrogate" in err and "Traceback" not in err
+    with pytest.raises(RoleError, match="lone surrogate"):
+        get_role(store, "\udcff")
+    assert _show(tmp_path, "scribe", "--version", str(2**63 - 1)) == 1  # in range, simply not registered
+    assert "no role named" in capsys.readouterr().err
+
+
+def test_show_on_a_stdout_that_cannot_encode_is_a_one_line_refusal(tmp_path, capsys, monkeypatch):
+    import io
+    import sys
+    assert _run(tmp_path, "role", "add", str(_file(tmp_path, dict(ROLE, model="caf\u00e9")))) == 0
+    capsys.readouterr()
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="ascii"))
+    assert _show(tmp_path, "scribe") == 1
+    sys.stdout.flush()
+    assert raw.getvalue() == b""  # nothing half-printed
+    err = capsys.readouterr().err
+    assert "cannot encode" in err and "Traceback" not in err
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="utf-8"))  # the check can pass
+    assert _show(tmp_path, "scribe") == 0
+    sys.stdout.flush()
+    assert "caf\u00e9".encode() in raw.getvalue()
+
+
+def test_add_on_a_corrupt_row_is_a_refusal_not_already_registered(tmp_path, capsys):
+    store = open_agent_store(tmp_path / "store")
+    _, digest, _, _ = add_role(store, ROLE)
+    assert add_role(store, ROLE)[3] is False  # an intact row is still "already registered"
+    with store.write() as conn:  # same role_hash, changed spec
+        conn.execute("UPDATE agent_roles SET spec = ? WHERE role_hash = ?",
+                     (_canonical(dict(ROLE, model="swapped")), digest))
+    with pytest.raises(RoleError, match="does not hash"):
+        add_role(store, ROLE)
+    capsys.readouterr()
+    assert _run(tmp_path, "role", "add", str(_file(tmp_path, ROLE))) == 1
+    err = capsys.readouterr().err
+    assert "does not hash" in err and "Traceback" not in err
+    with store.write() as conn:  # a mismatched name column on the hit
+        conn.execute("UPDATE agent_roles SET spec = ?, name = 'impostor' WHERE role_hash = ?",
+                     (_canonical(ROLE), digest))
+    with pytest.raises(RoleError, match="names 'scribe', not 'impostor'"):
+        add_role(store, ROLE)
+
+
+def test_a_blob_spec_is_refused_on_get_and_on_the_add_hash_hit(tmp_path, capsys):
+    store = open_agent_store(tmp_path / "store")
+    add_role(store, ROLE)
+    with store.write() as conn:
+        conn.execute("UPDATE agent_roles SET spec = X'FF'")
+    with pytest.raises(RoleError, match="bytes, not text"):
+        get_role(store, "scribe")
+    with pytest.raises(RoleError, match="bytes, not text"):
+        add_role(store, ROLE)
+    capsys.readouterr()
+    assert _show(tmp_path, "scribe") == 1
+    err = capsys.readouterr().err
+    assert "not text" in err and "Traceback" not in err
+
+
+def test_public_functions_refuse_a_non_string_name_with_role_error():
+    r = copy.deepcopy(ROLE)
+    r["brief"]["slots"] = {1: "str"}
+    with pytest.raises(RoleError, match="slot name 1"):
+        parse_role(r)
+    for bad in (None, 7, b"scribe"):
+        with pytest.raises(RoleError, match="must be a string"):
+            spawn_namespace(bad)
+    assert spawn_namespace("scribe") == "@spawn/scribe"
+    with pytest.raises(RoleError, match="missing field"):
+        instance_ceiling({})
+    with pytest.raises(RoleError, match="missing field"):
+        instance_ceiling({"ceiling": "x"})
+
+
+def test_store_write_holds_the_write_lock_so_add_role_is_serialised(tmp_path):
+    import sqlite3
+    store = open_agent_store(tmp_path / "store")
+    with store.write() as conn:
+        assert conn.in_transaction
+        other = sqlite3.connect(store.path, timeout=0, isolation_level=None)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                other.execute("BEGIN IMMEDIATE")
+        finally:
+            other.close()

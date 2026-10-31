@@ -13,10 +13,20 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from levain.agents.role import RoleError, add_role, get_role, latest_version, parse_role_text
+from levain.agents.role import MAX_VERSION, RoleError, add_role, get_role, latest_version, parse_role_text
 from levain.agents.store import AgentStoreRefused, open_agent_store
 from levain.autonomic.agent_tables import AGENT_SCHEMA
 from levain.autonomic.db import StoreFormatError
+
+
+def _version_arg(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text[:40]!r} is not an integer") from None
+    if not 1 <= value <= MAX_VERSION:
+        raise argparse.ArgumentTypeError(f"a version is an integer from 1 to {MAX_VERSION}")
+    return value
 
 
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
@@ -43,7 +53,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                              description="Print a role, its version and its role_hash. --store-dir goes before "
                                          "`role`: levain agents --store-dir DIR role show NAME.")
     show.add_argument("name", help="The role name.")
-    show.add_argument("--version", type=int, default=None, help="A version (default: the latest).")
+    show.add_argument("--version", type=_version_arg, default=None, help="A version (default: the latest).")
     show.set_defaults(func=run_role_show)
 
 
@@ -84,6 +94,9 @@ def run_role_add(args: argparse.Namespace) -> int:
         return 1
     try:
         name, digest, version, created = add_role(store, role)
+    except RoleError as exc:
+        print(f"levain agents role add: {exc}", file=sys.stderr)
+        return 1
     except (sqlite3.Error, StoreFormatError) as exc:
         print(f"levain agents role add: the store refused it: {exc}", file=sys.stderr)
         return 1
@@ -92,7 +105,7 @@ def run_role_add(args: argparse.Namespace) -> int:
         return 0
     try:
         latest = latest_version(store, name)
-    except (sqlite3.Error, StoreFormatError):
+    except (RoleError, sqlite3.Error, StoreFormatError):
         latest = version
     if latest is not None and latest != version:
         print(f"role {name} v{version} already registered: {digest}; v{version} is registered but the latest is "
@@ -114,6 +127,10 @@ def run_role_show(args: argparse.Namespace) -> int:
     except (sqlite3.Error, StoreFormatError) as exc:
         print(f"levain agents role show: the store refused it: {exc}", file=sys.stderr)
         return 1
-    print(f"role {args.name} v{version} {digest}")
-    print(json.dumps(role, indent=2, sort_keys=True, ensure_ascii=False))
+    try:  # one write of the whole text, so a stdout that cannot encode it prints nothing
+        print(f"role {args.name} v{version} {digest}\n" + json.dumps(role, indent=2, sort_keys=True, ensure_ascii=False))
+    except UnicodeEncodeError as exc:
+        print(f"levain agents role show: stdout cannot encode the role ({exc.encoding}); "
+              f"set PYTHONIOENCODING=utf-8", file=sys.stderr)
+        return 1
     return 0

@@ -4,7 +4,8 @@ A role is a plain mapping with exactly these fields (anything else is refused, n
 
 - ``name``      ``[a-z][a-z0-9-]{0,47}``; the spawned namespace is ``@spawn/<name>``.
 - ``brief``     ``{"template": str, "slots": {slot name: "str" | "int" | "path"}}``. The template's ``{slot}``
-                placeholders must be exactly the declared slots (``{{`` and ``}}`` are literal braces).
+                placeholders must be exactly the declared slots, each written ``{slot}`` with no conversion and no format
+                spec (``{{`` and ``}}`` are literal braces).
 - ``ceiling``   a closed mapping, any of ``where`` (list of ``{"repo": str, "paths": [str]}``) and ``lands`` /
                 ``pushes`` / ``publishes`` (lists of str): the envelope vocabulary (A0 §3.2). A0 names no shape for
                 a role's ceiling; this is the decision, kept to what the link's ``capabilities`` already speak.
@@ -43,6 +44,7 @@ EXECUTORS = ("session", "dream")
 HARNESSES = ("claude", "codex")
 SLOT_TYPES = ("str", "int", "path")
 CEILING_LISTS = ("lands", "pushes", "publishes")
+MAX_VERSION = 2**63 - 1  # SQLite's INTEGER ceiling
 
 
 class RoleError(ValueError):
@@ -85,7 +87,7 @@ def _brief(value: Any) -> dict[str, Any]:
     if not isinstance(slots, dict):
         raise RoleError("brief.slots must be an object")
     for slot, kind in slots.items():
-        if not re.fullmatch(r"[a-z][a-z0-9_]*", slot):
+        if not isinstance(slot, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", slot):
             raise RoleError(f"brief.slots: slot name {slot!r} is not [a-z][a-z0-9_]*")
         if kind not in SLOT_TYPES:
             raise RoleError(f"brief.slots.{slot}: type {kind!r} is not one of {', '.join(SLOT_TYPES)}")
@@ -93,10 +95,11 @@ def _brief(value: Any) -> dict[str, Any]:
         parsed = list(string.Formatter().parse(template))
     except ValueError as exc:
         raise RoleError(f"brief.template is not a valid template: {exc}") from None
-    for _, field, spec, _ in parsed:
-        if field is not None and spec and "{" in spec:
-            raise RoleError(f"brief.template: placeholder {field!r} has a nested placeholder in its format spec "
-                            f"{spec!r}; nested placeholders are not allowed")
+    for _, field, spec, conv in parsed:
+        if field is not None and (spec or conv is not None):
+            raise RoleError(f"brief.template: placeholder {field!r} carries a "
+                            f"{'conversion !' + conv if conv is not None else 'format spec :' + spec}; "
+                            f"a placeholder is exactly {{slot}}")
     used = {f for _, f, _, _ in parsed if f is not None}
     if used - set(slots):
         raise RoleError(f"brief.template uses undeclared slot {sorted(used - set(slots))[0]!r}")
@@ -181,13 +184,36 @@ def role_hash(role: dict[str, Any]) -> str:
 
 def instance_ceiling(role: dict[str, Any]) -> dict[str, Any]:
     """The ceiling an instance carries: a deep copy, so no instance shares a list or dict with the role's."""
-    return copy.deepcopy(role["ceiling"])
+    return copy.deepcopy(parse_role(role)["ceiling"])
 
 
 def spawn_namespace(name: str) -> str:
+    name = _str(name, "name")
     if not ROLE_NAME.fullmatch(name):
         raise RoleError(f"name {name!r} does not match [a-z][a-z0-9-]{{0,47}}")
     return f"@spawn/{name}"
+
+
+def _check_row(column_name: Any, digest: str, version: Any, text: Any) -> dict[str, Any]:
+    """The checks every read of a stored role passes: the spec is text, it parses as a role, it hashes to its key
+    and is that role's canonical text, and it names the row's name column. Raise :class:`RoleError` otherwise."""
+    if not isinstance(text, str):
+        raise RoleError(f"role {column_name!r} v{version}: the stored spec is a {type(text).__name__}, not text")
+    role = parse_role_text(text)
+    if role_hash(role) != digest or _canonical(role) != text:
+        raise RoleError(f"role {column_name!r} v{version}: the stored text does not hash to its role_hash")
+    if role["name"] != column_name:
+        raise RoleError(f"role {column_name!r} v{version}: the stored text names {role['name']!r}, "
+                        f"not {column_name!r}")
+    return role
+
+
+def _version(version: Any) -> int | None:
+    if version is None:
+        return None
+    if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= MAX_VERSION:
+        raise RoleError(f"version must be an integer from 1 to {MAX_VERSION}")
+    return version
 
 
 def add_role(store: AgentStore, role: dict[str, Any]) -> tuple[str, str, int, bool]:
@@ -197,8 +223,9 @@ def add_role(store: AgentStore, role: dict[str, Any]) -> tuple[str, str, int, bo
     text = _canonical(role)
     digest = role_hash(role)
     with store.write() as conn:
-        row = conn.execute("SELECT name, version FROM agent_roles WHERE role_hash = ?", (digest,)).fetchone()
+        row = conn.execute("SELECT name, version, spec FROM agent_roles WHERE role_hash = ?", (digest,)).fetchone()
         if row is not None:
+            _check_row(row[0], digest, row[1], row[2])
             return row[0], digest, row[1], False
         top = conn.execute("SELECT MAX(version) FROM agent_roles WHERE name = ?", (role["name"],)).fetchone()[0]
         version = (top or 0) + 1
@@ -211,6 +238,8 @@ def add_role(store: AgentStore, role: dict[str, Any]) -> tuple[str, str, int, bo
 def get_role(store: AgentStore, name: str, version: int | None = None) -> tuple[str, int, dict[str, Any]]:
     """The role ``name`` (latest version unless ``version``), as ``(role_hash, version, role)``. The stored text is
     re-hashed: a row whose text does not hash to its key is refused."""
+    name = _str(name, "name")
+    version = _version(version)
     with store.read() as conn:
         if version is None:
             row = conn.execute("SELECT role_hash, version, spec FROM agent_roles WHERE name = ? "
@@ -221,15 +250,11 @@ def get_role(store: AgentStore, name: str, version: int | None = None) -> tuple[
     if row is None:
         raise RoleError(f"no role named {name!r}" + (f" at version {version}" if version is not None else ""))
     digest, ver, text = row
-    role = parse_role_text(text)
-    if role_hash(role) != digest or _canonical(role) != text:
-        raise RoleError(f"role {name!r} v{ver}: the stored text does not hash to its role_hash")
-    if role["name"] != name:
-        raise RoleError(f"role {name!r} v{ver}: the stored text names {role['name']!r}, not {name!r}")
-    return digest, ver, role
+    return digest, ver, _check_row(name, digest, ver, text)
 
 
 def latest_version(store: AgentStore, name: str) -> int | None:
     """The newest registered version of ``name``, or None when the name is unknown."""
+    name = _str(name, "name")
     with store.read() as conn:
         return conn.execute("SELECT MAX(version) FROM agent_roles WHERE name = ?", (name,)).fetchone()[0]
