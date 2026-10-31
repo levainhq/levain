@@ -58,13 +58,13 @@ def test_act_until_posts_form_and_a_failure_names_the_last_error_of_the_action(t
 
 @needs_browser
 def test_the_wait_scale_multiplies_a_deadline_and_never_shortens_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    steps = [{"eval": "setTimeout(() => { window.__late = 1; }, 1500); 1"}, {"until": "window.__late", "ms": 1000}]
+    steps = [{"eval": "setTimeout(() => { window.__late = 1; }, 3000); 1"}, {"until": "window.__late", "ms": 2500}]
     monkeypatch.delenv("LEVAIN_TEST_WAIT_SCALE", raising=False)
     r = _drive(tmp_path, steps)
-    assert r.returncode == 1 and "until never came true within 1000ms" in r.stderr, (r.returncode, r.stderr)
+    assert r.returncode == 1 and "until never came true within 2500ms" in r.stderr, (r.returncode, r.stderr)
     monkeypatch.setenv("LEVAIN_TEST_WAIT_SCALE", "2")
     r = _drive(tmp_path, steps)
     assert r.returncode == 0, r.stderr
     monkeypatch.setenv("LEVAIN_TEST_WAIT_SCALE", "0.1")                  # below 1 counts as 1
     r = _drive(tmp_path, steps)
-    assert r.returncode == 1 and "within 1000ms" in r.stderr, (r.returncode, r.stderr)
+    assert r.returncode == 1 and "within 2500ms" in r.stderr, (r.returncode, r.stderr)
