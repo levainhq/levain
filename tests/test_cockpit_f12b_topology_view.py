@@ -298,3 +298,38 @@ def test_a_transcript_cost_reads_as_tokens_from_transcripts_never_a_price(tmp_pa
     probe = ("JSON.stringify(Object.fromEntries([...%s.querySelectorAll('.tv-task')].map(t => [t.dataset.task, (t.querySelector('.tv-cost') || {textContent: null}).textContent])))") % TV
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])
     assert json.loads(out[-1])["t-stuck"] == "706K tokens from transcripts", out[-1]
+
+
+def _tokens_probe() -> str:
+    """The Work strip's tokens stat (bold figure apart from the whole text, plus its tooltip) and the Agents metric (bold figure, sub-line, tooltip)."""
+    return ("JSON.stringify({stat: (() => { const s = %s.querySelector('.tv-stat[data-k=tokens]'); return s ? {text: s.textContent.replace(/\\s+/g, ' '), "
+            "bold: s.querySelector('b').textContent, title: s.title} : null; })(), "
+            "metric: (() => { const m = %s.querySelector('.tv-m[data-k=tokens]'); return m ? {bold: m.querySelector('b').textContent, "
+            "sub: (m.querySelector('.tv-msub') || {textContent: ''}).textContent, title: m.title} : null; })()})") % (TV, TV)
+
+
+@needs_browser
+def test_the_cache_reads_a_provider_reports_ride_beside_the_fresh_tokens_never_added_into_them(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    v = _value()
+    v["counts"] = {"tokens_today": 19_700_000, "cache_read_today": 850_000_000}
+    out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": _tokens_probe()}, {"eval": _paint(v, "agents")}, {"eval": _tokens_probe()}])
+    work, agents = json.loads(out[-3]), json.loads(out[-1])
+    assert work["stat"]["bold"] == "19.7M", work                                          # the bold figure is the fresh figure alone
+    assert "19.7M tokens today" in work["stat"]["text"] and "850.0M cache reads" in work["stat"]["text"], work
+    assert "869.7M" not in work["stat"]["text"], work   # never the sum of the two
+    assert "850.0M cache reads" in work["stat"]["title"], work
+    assert agents["metric"]["bold"] == "19.7M" and "850.0M cache reads" in agents["metric"]["sub"], agents
+    assert "the provider reports 850.0M cache reads beside it" in agents["metric"]["title"], agents
+
+
+@needs_browser
+def test_a_provider_that_sends_no_cache_reads_draws_none(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    v = _value()
+    v["counts"] = {"tokens_today": 19_700_000}
+    out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": _tokens_probe()}, {"eval": _paint(v, "agents")}, {"eval": _tokens_probe()}])
+    work, agents = json.loads(out[-3]), json.loads(out[-1])
+    assert work["stat"]["bold"] == "19.7M" and agents["metric"]["bold"] == "19.7M", (work, agents)
+    for text in (work["stat"]["text"], work["stat"]["title"], agents["metric"]["sub"], agents["metric"]["title"]):
+        assert "cache reads" not in text, (text, work, agents)
