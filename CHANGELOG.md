@@ -116,14 +116,18 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Added
 - **`levain serve` can serve the passkey signing pages.** `levain serve --write --sign-queue-dir DIR --sign-host NAME`
   hosts the cockpit's sign pages over the consent queue at `DIR`, for the https name `NAME` your reverse proxy serves
-  (a `tailscale serve` name); that name is the one the passkey is made for and the one extra Host the server admits.
-  `--sign-port PORT` gives the name's port when it is not 443 (the page origin leaves 443 out, `https://NAME:PORT`
-  otherwise). The queue and the name go together, a port needs the name, and a cockpit without `--write` or with
-  `--chat` refuses them with the server's own words. The start-up text gains one line, `signing: <origin> (queue
-  <dir>)`; without the options nothing changes. Nothing is enrolled and no key or trust root is touched, and the
-  phone reaches the pages with a paired device's token (the owner key opens nothing through a proxied name). Covered
-  by tests, including a real request to a running `serve`; I did not run a passkey ceremony from a real phone through a
-  real proxy.
+  on 443 (a `tailscale serve --https=443` name); that name is the one the passkey is made for and the one extra Host
+  the server admits, and the page origin is `https://NAME`, the only origin the consent and dispatch sheets take a
+  signature from. The queue and the name go together. Before anything is built, a cockpit without `--write` or with
+  `--chat` refuses them with the server's own words, a name the browser's address bar would not show (uppercase, a
+  trailing dot, a port) is refused in plain words and never rewritten, and `DIR` must be an existing readable
+  directory, never created. The start-up text gains one line, `signing: <origin> (queue <dir>; consent and grant
+  sheets on)`, or `off` with the reason when `DIR` is not the queue the cockpit's consent cards are read from;
+  without the options nothing changes. Starting the signing pages publishes this cockpit's origin in the queue's
+  `cockpit-origin.json` (replacing a value already there; a stop withdraws only its own) and settles orphaned sign
+  attempts in the queue. Nothing is enrolled and no key or trust root is touched, and the phone reaches the pages
+  with a paired device's token (the owner key opens nothing through a proxied name). Covered by tests, including a
+  real request to a running `serve`; I did not run a passkey ceremony from a real phone through a real proxy.
 - **Short pairing codes for the cockpit, and a test ping.** `POST /cockpit/pair/offer {"short": true}` mints a typed
   code (`XXXX-XXXX`, one use, 10 minutes, five wrong tries kill it, a newer short code replaces it) and
   `POST /cockpit/pair/claim {"short": "<typed>"}` spends it; the link form is unchanged and a code of one kind never

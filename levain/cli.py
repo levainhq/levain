@@ -33,17 +33,6 @@ def _positive_int(text: str) -> int:
     return value
 
 
-def _port_number(text: str) -> int:
-    """An argparse type for a TCP port, 1-65535."""
-    try:
-        value = int(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
-    if not 1 <= value <= 65535:
-        raise argparse.ArgumentTypeError(f"must be a port from 1 to 65535, got {value}")
-    return value
-
-
 def _positive_seconds(text: str) -> float:
     """An argparse type for a wall-clock bound: a finite number of seconds above 0 that a thread can
     wait for. ``nan`` and ``inf`` are refused because both read as a bound and neither ever fires;
@@ -1068,9 +1057,9 @@ def main(argv: list[str] | None = None) -> int:
         dest="sign_queue_dir",
         metavar="DIR",
         help=(
-            "Serve the cockpit's passkey signing pages over the consent queue at DIR, so a request in it can be "
-            "answered from the phone. Goes with --sign-host, needs --write (the pages ride the write token), and "
-            "is refused beside --chat."
+            "Serve the cockpit's passkey signing pages over the consent queue at DIR (an existing directory, "
+            "never created), so a request in it can be answered from the phone. Goes with --sign-host, needs "
+            "--write (the pages ride the write token), and is refused beside --chat."
         ),
     )
     web_p.add_argument(
@@ -1079,20 +1068,10 @@ def main(argv: list[str] | None = None) -> int:
         dest="sign_host",
         metavar="NAME",
         help=(
-            "With --sign-queue-dir: the https name a reverse proxy on this machine serves the cockpit on (a "
-            "`tailscale serve` name). A passkey is made for one name, so this is the name it is made for and "
-            "the Host this server admits besides loopback."
-        ),
-    )
-    web_p.add_argument(
-        "--sign-port",
-        type=_port_number,
-        default=None,
-        dest="sign_port",
-        metavar="PORT",
-        help=(
-            "With --sign-host: the port of that https name (default 443, which the page origin leaves out; any "
-            "other port is part of it, https://NAME:PORT)."
+            "With --sign-queue-dir: the https name a reverse proxy on this machine serves the cockpit on, on 443 "
+            "(a `tailscale serve --https=443` name), as the browser address bar shows it: lowercase, no trailing "
+            "dot, no port. A passkey is made for one name, so this is the name it is made for and the Host this "
+            "server admits besides loopback."
         ),
     )
     web_p.set_defaults(func=_cmd_serve)
@@ -1588,12 +1567,10 @@ def main(argv: list[str] | None = None) -> int:
         # otherwise drop the key silently instead of rejecting it (L3 r2).
         parser.error("unrecognized arguments: --api-key")
     if getattr(args, "func", None) is _cmd_serve:
-        # the signing pages are one unit: a queue without a name, or a name without a queue (or a port without a name),
-        # would start a cockpit that serves none, so it is refused before anything binds
+        # the signing pages are one unit: a queue without a name, or a name without a queue, would start a cockpit
+        # that serves none, so it is refused before anything binds
         if (args.sign_queue_dir is None) != (args.sign_host is None):
             parser.error("--sign-queue-dir and --sign-host go together: pass both or neither")
-        if args.sign_port is not None and args.sign_host is None:
-            parser.error("--sign-port needs --sign-host")
     # inside the coordinator's workspace the CLI keeps to the coordinator's door, in every tree
     # (levain.coordinator.door): decided by where this runs, never by a session variable
     from levain.coordinator.door import refusal
@@ -4351,7 +4328,6 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         install_class=args.install_class,
         sign_queue_dir=args.sign_queue_dir,
         sign_host=args.sign_host,
-        sign_port=args.sign_port if args.sign_port is not None else 443,
     )
 
 
