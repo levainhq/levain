@@ -1,7 +1,6 @@
 """The needs-phill card's display formatter (card_format.js drawBody / drawDetail / looseCard): headed sections, lists and
 option rows from six REAL rows (tests/card_prose_cases.json, each with the message flow's build_message made for it).
-The logic runs in node (tests/card_prose_check.js, a fake DOM); the browser half is test_phone_card_format.py and
-test_cockpit_card_format.py. Display only: the strict grammar stays the authority for a signed message."""
+The logic runs in node (tests/card_prose_check.js, a fake DOM); the browser half is test_cockpit_card_format.py. Display only: the strict grammar stays the authority for a signed message."""
 from __future__ import annotations
 
 import re
