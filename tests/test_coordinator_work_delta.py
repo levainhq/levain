@@ -404,11 +404,14 @@ def test_every_command_the_work_delta_prints_passes_the_coordinators_door(store,
 
     _cursor_to_now(store)
     _moves(store, token, 7)
-    tail = _read(store).text.splitlines()[-1]
-    printed = [re.search(r"more: (levain .*)$", tail).group(1)]
+    found = re.findall(r"more: (levain coord log\b.*)$", _read(store).text, re.M)
+    assert len(found) == 1, _read(store).text
+    printed = list(found)
     qd = ["--queue-dir", str(store.directory)]
     main(["coord", "log", "--since", "0", "--limit", "2", *qd])
-    printed.append(re.search(r"more: (levain .*)$", capsys.readouterr().out.splitlines()[-1]).group(1))
+    found = re.findall(r"more: (levain coord log\b.*)$", capsys.readouterr().out, re.M)
+    assert len(found) == 1
+    printed += found
     assert len(printed) == 2 and all(p.startswith("levain coord log") for p in printed)
 
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))

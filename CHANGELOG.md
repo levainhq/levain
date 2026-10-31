@@ -470,6 +470,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   on a real phone or a real push.
 
 ### Fixed
+- **A coordinator may run the `levain coord log` line its reply block hands it.** When more than five records are new, the
+  work delta ends with `+N more: levain coord log --since G`; the coordinator's workspace refused that command as the
+  operator's. `coord log` only displays, so it is now admitted there. The presence word is also written whole when the
+  disk takes it in pieces, and a failed write no longer leaves a temporary file in the queue directory.
 - **The morning card marks a presence word whose quote was not verified.** `_presence` dropped the `verified` flag the
   quote check puts on every word an agent sets, so the card showed an agent's word as if it were the operator's. The
   card's presence block now carries `verified` (true only when the quote was found in what he wrote; a record from before
