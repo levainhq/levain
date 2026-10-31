@@ -74,6 +74,15 @@ class Rig:
         return out
 
 
+WORK_HEAD = "since your last message (Levain's record"
+
+
+def block_of(ctx: str) -> str:
+    """The block a coordinator reply reprints (C11 S3): the work delta when the turn carried one, then the band."""
+    i = ctx.find(WORK_HEAD)
+    return ctx[i if i >= 0 else ctx.find("NEEDS YOU"):]
+
+
 @pytest.fixture(params=["claude_code", "codex"])
 def rig(request, tmp_path):
     return Rig(tmp_path, request.param)
@@ -88,7 +97,7 @@ def test_f1_a_wake_spends_no_delta(rig):
     q1 = rig.ask("Pick a DB")
     first = rig.ups("hello coordinator")
     assert "first band on this seat" in first
-    assert rig.stop(first[first.find("NEEDS YOU"):]) == ""      # S2: a coordinator's view commits at its verified Stop
+    assert rig.stop(block_of(first)) == ""      # S2: a coordinator's view commits at its verified Stop
     rig.qs.answer(q1.id, option="a", channel="cli")
     rig.ask("Ship it?")
     ctx = rig.ups(rig.wake)

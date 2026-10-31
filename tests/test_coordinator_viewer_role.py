@@ -11,13 +11,13 @@ import pytest
 from levain import band_view
 from levain.coordinator import launch as cl
 from levain.coordinator.store import CoordStore
-from tests.test_coordinator_wake_silent import SID, Rig
+from tests.test_coordinator_wake_silent import SID, Rig, block_of
 
 SID_B = "sess-coord-launch-b"
 
 
 def band_of(ctx: str) -> str:
-    return ctx[ctx.find("NEEDS YOU"):]
+    return block_of(ctx)
 
 
 def second_launch(rig: Rig, sid: str = SID_B) -> None:
