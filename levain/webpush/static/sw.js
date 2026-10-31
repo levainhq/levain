@@ -1,34 +1,59 @@
-// Levain's push service worker (the phone port's, and the cockpit's since ONESURFACE OS-4): show a pushed nudge, and
-// on a tap open the page and record the open. A service worker cannot read localStorage, so the page hands its
-// credential over with postMessage and the worker keeps it in IndexedDB; the credential is only ever sent back to this
-// origin, under the header the page named (the cockpit's write-token header; the phone port's when none is named).
-const DB = 'levain-sw', STORE = 'kv';
-const HEADERS = ['X-Levain-Phone-Token', 'X-Levain-Write-Token'];
+// Levain's push service worker (the cockpit's, since W1b): show a pushed nudge, and on a tap open the page and mark the
+// tap. The worker holds NO credential and makes no network call in a tap: it writes the tapped ping's id into its own
+// IndexedDB and nudges the page, which holds the token and records the open (pair_card.js). The page/worker contract:
+// IndexedDB `levain-sw-2` version 1, object store `opened` (key = the ping id as a string, value = the tap time in ms),
+// window message {type: 'levain-opened'}. The page opens the same database with the same version and upgrade, so
+// whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
+const DB = 'levain-sw-2', STORE = 'opened';
+// Cache Storage names this worker keeps. W1b keeps none; a later row (W5b) adds its own versioned names here.
+const CACHES_KEEP = [];
 
-function kv(mode, fn) {
+function open() {
   return new Promise((resolve, reject) => {
-    const open = indexedDB.open(DB, 1);
-    open.onupgradeneeded = () => open.result.createObjectStore(STORE);
-    open.onerror = () => reject(open.error);
-    open.onsuccess = () => {
-      const tx = open.result.transaction(STORE, mode);
-      const req = fn(tx.objectStore(STORE));
-      tx.oncomplete = () => { open.result.close(); resolve(req && req.result); };
-      tx.onerror = () => reject(tx.error);
-    };
+    const req = indexedDB.open(DB, 1);
+    req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains(STORE)) req.result.createObjectStore(STORE); };
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => resolve(req.result);
   });
 }
 
-self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+// the ping id, as a string key, with the tap's time
+async function markOpened(ping) {
+  const db = await open();
+  try {
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put(Date.now(), String(ping));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  } finally { db.close(); }
+}
 
-self.addEventListener('message', (e) => {
-  const d = e.data || {};
-  if (d.type === 'levain-token' && typeof d.token === 'string') {
-    const header = HEADERS.includes(d.header) ? d.header : HEADERS[0];
-    e.waitUntil(kv('readwrite', (s) => { s.put(header, 'header'); return s.put(d.token, 'token'); }));
-  }
-});
+// the retired phone-port database (it held the phone token) is deleted whole; a blocked delete stays queued in the
+// browser and completes when the last connection closes, so activation never waits on it
+function dropOldDatabase() {
+  return new Promise((resolve) => {
+    let req;
+    try { req = indexedDB.deleteDatabase('levain-sw'); } catch (_) { resolve(); return; }
+    req.onsuccess = () => resolve();
+    req.onerror = () => resolve();
+    req.onblocked = () => resolve();
+  });
+}
+
+async function dropOldCaches() {
+  if (typeof caches === 'undefined') return;
+  const names = await caches.keys();
+  await Promise.all(names.filter((n) => n.startsWith('levain-') && !CACHES_KEEP.includes(n)).map((n) => caches.delete(n)));
+}
+
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil((async () => {
+  await Promise.allSettled([dropOldDatabase(), dropOldCaches()]);
+  await self.clients.claim();
+})()));
 
 self.addEventListener('push', (e) => {
   let d = {};
@@ -53,7 +78,7 @@ self.addEventListener('notificationclick', (e) => {
   // a cross-origin (or unparseable) url is never opened: the push body is the server's, the tap is the page's
   if (!u || u.origin !== self.location.origin) u = new URL('/', self.location.origin);
   const url = u.href;
-  const open = (async () => {
+  const opened = (async () => {
     const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     for (const c of all) {
       if (new URL(c.url).origin === self.location.origin) {
@@ -64,24 +89,13 @@ self.addEventListener('notificationclick', (e) => {
     }
     await self.clients.openWindow(url);
   })();
-  // the open is a record, never a reason to wait on the network or to skip opening the page
-  const record = (async () => {
-    if (data.ping === undefined) return;
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 4000);
-    try {
-      const token = await kv('readonly', (s) => s.get('token'));
-      const named = await kv('readonly', (s) => s.get('header'));
-      const header = HEADERS.includes(named) ? named : HEADERS[0];
-      const r = await fetch('/webpush/opened', {
-        method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' }, token ? { [header]: token } : {}),
-        body: JSON.stringify({ ping: data.ping }),
-        signal: ctl.signal,
-      });
-      // a refused credential (revoked device): stop sending it; the page hands a fresh one over after re-pairing
-      if (r.status === 403) await kv('readwrite', (s) => s.delete('token'));
-    } catch (_) { /* best effort */ } finally { clearTimeout(timer); }
+  // the mark is local and best effort: a failed write loses one open's record, never the page
+  const mark = (async () => {
+    if (data.ping === undefined || data.ping === null) return;
+    try { await markOpened(data.ping); } catch (_) { return; }
+    // after the write commits: a nudge only, no data; the page reads the store itself
+    const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    for (const c of wins) c.postMessage({ type: 'levain-opened' });
   })();
-  e.waitUntil(Promise.allSettled([open, record]));
+  e.waitUntil(Promise.allSettled([opened, mark]));
 });
