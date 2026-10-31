@@ -14,6 +14,7 @@ Later slices add their read and write code here.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -22,7 +23,8 @@ from pathlib import Path
 from levain.autonomic.agent_tables import agent_marker, check_agent_schema
 from levain.autonomic.db import DB_NAME, AutonomicDB, default_store_dir, store_marker
 
-__all__ = ["AgentStore", "AgentStoreRefused", "open_agent_store", "STORE_V3_REASON"]
+__all__ = ["AgentStore", "AgentStoreRefused", "open_agent_store", "STORE_V3_REASON", "valid_zone", "get_default_zone",
+           "set_default_zone"]
 
 STORE_V3 = "levain-autonomic/3"
 STORE_V3_REASON = "agents need the /3 agent-proof slice (R15-5)"
@@ -99,3 +101,35 @@ def open_agent_store(store_dir: Path | str | None = None) -> AgentStore:
     if reason is not None:
         raise AgentStoreRefused(_refusal(reason, marker))
     return AgentStore(db)
+
+
+ZONE_KEY = "default_zone"
+_ZONE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+){0,2}")
+
+
+def valid_zone(zone: object) -> bool:
+    """True when ``zone`` is an IANA zone name this host's tz database loads."""
+    if not isinstance(zone, str) or not _ZONE_NAME.fullmatch(zone):
+        return False
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return False
+    return True
+
+
+def get_default_zone(store: AgentStore) -> str | None:
+    """The install's one default zone (A0 r6 §3.6: the ``agent_settings`` row ``default_zone``), or None if unset."""
+    with store.read() as conn:
+        row = conn.execute("SELECT value FROM agent_settings WHERE key = ?", (ZONE_KEY,)).fetchone()
+    return row[0] if row else None
+
+
+def set_default_zone(store: AgentStore, zone: str) -> None:
+    """Set the default zone; raise ValueError naming it when it is not an IANA zone."""
+    if not valid_zone(zone):
+        raise ValueError(f"{str(zone)[:60]!r} is not an IANA zone name this host knows (e.g. America/New_York)")
+    with store.write() as conn:
+        conn.execute("INSERT INTO agent_settings (key, value) VALUES (?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (ZONE_KEY, zone))

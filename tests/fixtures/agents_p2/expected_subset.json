@@ -1,0 +1,46 @@
+{
+ "jobs": {
+  "vendored_sync_check": {
+   "verdict": "pass",
+   "class": "push",
+   "refinement": null,
+   "review_required": false
+  },
+  "disk_floor": {
+   "verdict": "pass",
+   "class": "push",
+   "refinement": null,
+   "review_required": true
+  },
+  "email_event_reconciler": {
+   "verdict": "refused",
+   "class": "corpus",
+   "refinement": "a",
+   "review_required": false
+  },
+  "email_sensor_argus": {
+   "verdict": "refused",
+   "class": "push",
+   "refinement": "b",
+   "review_required": false
+  },
+  "memory_snapshot": {
+   "verdict": "pass",
+   "class": "recovery",
+   "refinement": "c",
+   "review_required": true
+  },
+  "harness_proposer": {
+   "verdict": "refused",
+   "class": "corpus",
+   "refinement": "a",
+   "review_required": true
+  },
+  "dream": {
+   "verdict": "pass",
+   "class": "push",
+   "refinement": null,
+   "review_required": true
+  }
+ }
+}

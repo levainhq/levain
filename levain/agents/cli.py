@@ -14,7 +14,10 @@ import sys
 from pathlib import Path
 
 from levain.agents.role import MAX_VERSION, RoleError, add_role, get_role, latest_version, parse_role_text
-from levain.agents.store import AgentStoreRefused, open_agent_store
+from levain.agents.refuse import AuditError, audit_verdicts, check_spec, derived_flags, refinement_of
+from levain.agents.spec import (SpecError, finalize_spec, get_agent, list_agents, load_json, parse_spec,
+                                register_spec, retire_agent, set_operation, stored_specs)
+from levain.agents.store import AgentStoreRefused, get_default_zone, open_agent_store, set_default_zone
 from levain.autonomic.agent_tables import AGENT_SCHEMA
 from levain.autonomic.db import StoreFormatError
 
@@ -55,6 +58,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     show.add_argument("name", help="The role name.")
     show.add_argument("--version", type=_version_arg, default=None, help="A version (default: the latest).")
     show.set_defaults(func=run_role_show)
+    _add_p2_parsers(verbs)
 
 
 def run_agents(args: argparse.Namespace) -> int:
@@ -133,4 +137,235 @@ def run_role_show(args: argparse.Namespace) -> int:
         print(f"levain agents role show: stdout cannot encode the role ({exc.encoding}); "
               f"set PYTHONIOENCODING=utf-8", file=sys.stderr)
         return 1
+    return 0
+
+
+# ---- P2: register, list, show, pause, resume, retire, zone -----------------------------------------------------
+
+def _add_p2_parsers(verbs: argparse._SubParsersAction) -> None:
+    reg = verbs.add_parser("register", help="Register AgentSpec(s) from JSON; refuses what DESIGN 4.1 refuses.",
+                           allow_abbrev=False,
+                           description="Register one spec, a JSON list of specs (a feeder group goes in one file), or, "
+                                       "with --warn only, an audit file. --warn judges and stores nothing and exits 0. "
+                                       "Give --store-dir before `register`.")
+    reg.add_argument("--from", dest="source", type=Path, required=True, help="The spec / audit file (JSON).")
+    reg.add_argument("--warn", action="store_true", help="Report verdicts, store nothing, exit 0.")
+    reg.add_argument("--json", action="store_true", help="Verdicts as JSON.")
+    reg.add_argument("--revise", action="store_true",
+                     help="A name a live agent holds with new content writes that agent's next version.")
+    reg.set_defaults(func=run_register)
+    lst = verbs.add_parser("list", help="List agents (retired ones with --all).", allow_abbrev=False)
+    lst.add_argument("--all", action="store_true", help="Include retired agents.")
+    lst.set_defaults(func=run_list)
+    show = verbs.add_parser("show", help="Print an agent: axes, version, spec_hash, spec.", allow_abbrev=False)
+    show.add_argument("agent", help="An agent name (not retired) or agent_id.")
+    show.add_argument("--version", type=_version_arg, default=None, help="A version (default: the current one).")
+    show.set_defaults(func=run_show)
+    for verb, fn, text in (("pause", run_pause, "Pause an agent and its feeder group (only resume clears it)."),
+                           ("resume", run_resume, "Resume an agent and its feeder group (the only clear of a pause)."),
+                           ("retire", run_retire, "Retire an agent; lists its readers and feeder group.")):
+        p = verbs.add_parser(verb, help=text, allow_abbrev=False)
+        p.add_argument("agent", help="An agent name (not retired) or agent_id.")
+        p.set_defaults(func=fn)
+    zone = verbs.add_parser("zone", help="Show or set the install's default IANA zone.", allow_abbrev=False,
+                            description="The install's one default zone (agent_settings row default_zone). While it "
+                                        "is unset, register refuses a schedule that carries no zone.")
+    zone.add_argument("iana", nargs="?", default=None, help="An IANA zone, e.g. America/New_York.")
+    zone.set_defaults(func=run_zone)
+
+
+def _fail(verb: str, exc: Exception) -> int:
+    print(f"levain agents {verb}: {exc}", file=sys.stderr)
+    return 1
+
+
+def _role_by_hash(store, digest: str):
+    with store.read() as conn:
+        row = conn.execute("SELECT spec FROM agent_roles WHERE role_hash = ?", (digest,)).fetchone()
+    try:
+        return parse_role_text(row[0]) if row else None
+    except RoleError:
+        return None
+
+
+def _specs_from(doc):
+    if isinstance(doc, dict):
+        return [doc]
+    if isinstance(doc, list) and doc:
+        return doc
+    raise SpecError("the file holds neither a spec nor a non-empty list of specs")
+
+
+def run_register(args: argparse.Namespace) -> int:
+    try:
+        doc = load_json(args.source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        return _fail("register", f"cannot read {args.source}: {exc}")
+    except SpecError as exc:
+        return _fail("register", f"{args.source}: {exc}")
+    if isinstance(doc, dict) and isinstance(doc.get("jobs"), list):
+        if not args.warn:
+            return _fail("register", "an audit file holds verdicts, not AgentSpecs: use --warn")
+        try:
+            verdicts = audit_verdicts(doc)
+        except AuditError as exc:
+            return _fail("register", f"{args.source}: {exc}")
+        _print_verdicts(verdicts, args.json, audit=True)
+        return 0
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        raw = _specs_from(doc)
+        default_zone = get_default_zone(store)
+        stored = stored_specs(store)
+    except (SpecError, sqlite3.Error, StoreFormatError) as exc:
+        return _fail("register", str(exc))
+    parsed: list[tuple[dict | None, list[str]]] = []
+    for obj in raw:
+        try:
+            parsed.append((parse_spec(obj), []))
+        except SpecError as exc:
+            parsed.append((None, [f"rule 3: {exc}"]))
+    batch = {s["name"]: s for s, _ in parsed if s is not None}
+    lookup = {**stored, **batch}
+    rows: list[tuple[dict | None, list[str], dict]] = []
+    for spec, reasons in parsed:
+        info: dict = {}
+        if spec is not None:
+            held = set(stored)
+            try:
+                same = stored.get(spec["name"]) == finalize_spec(spec, default_zone)
+            except SpecError:
+                same = False
+            if args.revise or same:
+                held.discard(spec["name"])
+            role = _role_by_hash(store, spec["role"]["role_hash"])
+            reasons = [str(r) for r in check_spec(spec, role=role, default_zone=default_zone, names_held=held,
+                                                  lookup=lookup)]
+            info = {"refinement": refinement_of(spec)}
+            if role is not None:
+                info["review_required"] = derived_flags(role)["review_required"]
+        rows.append((spec, reasons, info))
+    out_rows, code = {}, 0
+    for spec, reasons, info in rows:
+        label = spec["name"] if spec else "(unparsed)"
+        entry = {"verdict": "refused" if reasons else "pass", "reasons": reasons, **info}
+        if spec and not reasons and not args.warn:
+            try:
+                agent_id, digest, version, created = register_spec(store, spec, default_zone, revise=args.revise)
+            except (SpecError, sqlite3.Error, StoreFormatError) as exc:
+                entry.update(verdict="refused", reasons=[str(exc)])
+            else:
+                entry.update(agent_id=agent_id, spec_hash=digest, version=version, created=created)
+        if entry["verdict"] == "refused":
+            code = 1
+        out_rows[label if label not in out_rows else f"{label}#{len(out_rows)}"] = entry
+    _print_verdicts({"jobs": out_rows}, args.json, audit=False)
+    return 0 if args.warn else code
+
+
+def _print_verdicts(verdicts: dict, as_json: bool, *, audit: bool) -> None:
+    if as_json:
+        print(json.dumps(verdicts, indent=1, ensure_ascii=False))
+        return
+    for name, v in verdicts["jobs"].items():
+        reason = v["reason"] if audit else "; ".join(v["reasons"])
+        extra = "" if audit or not v.get("agent_id") else \
+            f" {v['agent_id']} v{v['version']} {'registered' if v['created'] else 'already registered'}"
+        print(f"{v['verdict']:8} {name}" + (f": {reason}" if reason else "") + extra)
+
+
+def run_list(args: argparse.Namespace) -> int:
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        rows = list_agents(store, include_retired=args.all)
+    except (sqlite3.Error, StoreFormatError) as exc:
+        return _fail("list", f"the store refused it: {exc}")
+    for a in rows:
+        print(f"{a['name']}  {a['agent_id']}  v{a['current_version']}  {a['registration']}  {a['operation']}")
+    return 0
+
+
+def run_show(args: argparse.Namespace) -> int:
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        a = get_agent(store, args.agent, args.version)
+    except SpecError as exc:
+        return _fail("show", str(exc))
+    except (sqlite3.Error, StoreFormatError) as exc:
+        return _fail("show", f"the store refused it: {exc}")
+    role = _role_by_hash(store, a["spec"]["role"]["role_hash"])
+    flags = derived_flags(role) if role else None
+    head = (f"agent {a['name']} {a['agent_id']} v{a['version']} (versions {a['versions']}) {a['spec_hash']}\n"
+            f"registration: {a['registration']}  operation: {a['operation']}  arming: derived from the authority "
+            f"log (P5a), not stored here  failure_streak: {a['failure_streak']}\n"
+            + (f"review: {'required' if flags['review_required'] else 'not required'} "
+               f"(calls_model={flags['calls_model']}, acts_outward={flags['acts_outward']}); the date is the link's "
+               f"expires_at\n" if flags else "review: role not resolvable\n"))
+    try:
+        print(head + json.dumps(a["spec"], indent=2, sort_keys=True, ensure_ascii=False))
+    except UnicodeEncodeError as exc:
+        return _fail("show", f"stdout cannot encode the spec ({exc.encoding}); set PYTHONIOENCODING=utf-8")
+    return 0
+
+
+def _run_operation(args: argparse.Namespace, verb: str, operation: str) -> int:
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        members = set_operation(store, args.agent, operation)
+    except SpecError as exc:
+        return _fail(verb, str(exc))
+    except (sqlite3.Error, StoreFormatError) as exc:
+        return _fail(verb, f"the store refused it: {exc}")
+    for agent, changed in members:
+        print(f"{agent['name']} {agent['agent_id']}: {operation}" + ("" if changed else " (already)"))
+    return 0
+
+
+def run_pause(args: argparse.Namespace) -> int:
+    return _run_operation(args, "pause", "paused")
+
+
+def run_resume(args: argparse.Namespace) -> int:
+    return _run_operation(args, "resume", "active")
+
+
+def run_retire(args: argparse.Namespace) -> int:
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        agent, reader, group = retire_agent(store, args.agent)
+    except SpecError as exc:
+        return _fail("retire", str(exc))
+    except (sqlite3.Error, StoreFormatError) as exc:
+        return _fail("retire", f"the store refused it: {exc}")
+    print(f"{agent['name']} {agent['agent_id']}: retired (operation stays {agent['operation']})")
+    print(f"reader the output named: {reader or '(none)'}")
+    print("feeder group left behind: " + (", ".join(group) if group else "(none)"))
+    return 0
+
+
+def run_zone(args: argparse.Namespace) -> int:
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        if args.iana is None:
+            zone = get_default_zone(store)
+            print(zone if zone else "unset (set one with: levain agents zone <IANA>)")
+            return 0
+        set_default_zone(store, args.iana)
+    except ValueError as exc:
+        return _fail("zone", str(exc))
+    except (sqlite3.Error, StoreFormatError) as exc:
+        return _fail("zone", f"the store refused it: {exc}")
+    print(f"default zone: {args.iana}")
     return 0

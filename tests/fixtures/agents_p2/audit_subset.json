@@ -1,0 +1,132 @@
+{
+ "jobs": [
+  {
+   "id": "vendored_sync_check",
+   "name": "Vendored Cross-Repo Sync Check",
+   "machine": "laptop",
+   "class": "push",
+   "refinement": null,
+   "review": {
+    "required": false,
+    "calls_model": false,
+    "acts_outward": false,
+    "basis": []
+   },
+   "verdict": "pass",
+   "reasons": []
+  },
+  {
+   "id": "disk_floor",
+   "name": "Disk Floor (free-space alarm)",
+   "machine": "laptop",
+   "class": "push",
+   "refinement": null,
+   "review": {
+    "required": true,
+    "calls_model": false,
+    "acts_outward": true,
+    "basis": [
+     "acts outward: the output's destination names 'push'"
+    ]
+   },
+   "verdict": "pass",
+   "reasons": []
+  },
+  {
+   "id": "email_event_reconciler",
+   "name": "Email Event Reconciler",
+   "machine": "argus",
+   "class": "corpus",
+   "refinement": "a",
+   "review": {
+    "required": false,
+    "calls_model": false,
+    "acts_outward": false,
+    "basis": []
+   },
+   "verdict": "refused",
+   "reasons": [
+    [
+     "1",
+     "no win"
+    ]
+   ]
+  },
+  {
+   "id": "email_sensor_argus",
+   "name": "Email Sensor (argushub IMAP envelope poller)",
+   "machine": "argus",
+   "class": "push",
+   "refinement": "b",
+   "review": {
+    "required": false,
+    "calls_model": false,
+    "acts_outward": false,
+    "basis": []
+   },
+   "verdict": "refused",
+   "reasons": [
+    [
+     "1",
+     "inherited win ends at email_event_reconciler, which has no win"
+    ]
+   ]
+  },
+  {
+   "id": "memory_snapshot",
+   "name": "Memory Snapshot (neocortex + episodic + spores, restore-verified)",
+   "machine": "laptop",
+   "class": "recovery",
+   "refinement": "c",
+   "review": {
+    "required": true,
+    "calls_model": false,
+    "acts_outward": true,
+    "basis": [
+     "acts outward: the output's destination names 'scp'"
+    ]
+   },
+   "verdict": "pass",
+   "reasons": []
+  },
+  {
+   "id": "dream",
+   "name": "Dream (autonomous consolidation)",
+   "machine": "laptop",
+   "class": "push",
+   "refinement": null,
+   "review": {
+    "required": true,
+    "calls_model": true,
+    "acts_outward": false,
+    "basis": [
+     "calls a model: the script mentions 'claude -p'"
+    ]
+   },
+   "verdict": "pass",
+   "reasons": []
+  },
+  {
+   "id": "harness_proposer",
+   "name": "Self-improving harness (propose-only)",
+   "machine": "laptop",
+   "class": "corpus",
+   "refinement": "a",
+   "review": {
+    "required": true,
+    "calls_model": true,
+    "acts_outward": false,
+    "basis": [
+     "calls a model: the script mentions 'credit_lane'"
+    ]
+   },
+   "verdict": "refused",
+   "reasons": [
+    [
+     "1",
+     "win does not exist: its own check says 'nothing invokes it'"
+    ]
+   ]
+  }
+ ]
+}
