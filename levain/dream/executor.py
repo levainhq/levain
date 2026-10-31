@@ -6,8 +6,22 @@ of a store this caller owns), a compose ``mind`` and the effect's hooks, and run
     lock → (orphan self-heal) → snapshot hook → prepare → compose loop (check on a scratch copy, re-prompt with every
     refusal, §2.4's start rule) → progress.json ``saving`` → save → on_saved hook → usage.json
 
-``levain wrap`` calls it with one compose and no check (``max_composes=1``), and keeps the entity guard and the
-entity constitution; its messages, exit codes and compose route are unchanged.
+``levain wrap`` calls it with one compose and no check (``max_composes=1``), and keeps the entity guard, the entity
+constitution, its exit codes, its compose route and its remedies (``levain wrap --reset``, passed in as
+:class:`Remedies`). **Some of its operator-visible strings did change** when the body moved here, because the core
+names a STORE, not an entity or a seat: the lock-held line says "on this store" (was "on this entity"); the
+orphan-refusal notes say "This run would normally" (was "This seat would normally"); the schema lines say "this
+store" (was "this entity's store"); the self-heal line says "check the log" (was "check the seat's log"); the
+compose-failed, refused-save and cleared-wrap lines say "the memory" / "The identity" (were "the entity's memory" /
+"The entity's identity").
+
+Known edges:
+
+- **One gate per compose.** ``validated_save_continuity`` raises at its FIRST refusing gate and has no mode that
+  reports them all (run by hand on a scratch store, anneal 1.0.2: a draft both missing ``## Decisions`` and over the
+  hard maximum was refused only for the missing section). So :func:`check_on_copy` returns one refusal per draft, and
+  a draft with two defects costs two composes: the 10-21 / 10-23 night loss, bounded here by ``max_composes`` and by
+  feeding every refusal so far back verbatim, not removed.
 
 ``consolidate_store`` never raises for an outcome it can name (the journal poisons an effect that raises): it returns a
 :class:`ConsolidateResult` whose ``outcome`` is one of :data:`OUTCOMES`. Out-of-band exits (``TurnTimeout`` from a
@@ -42,9 +56,8 @@ from pathlib import Path
 from typing import Any
 
 from levain import wrap as _w
-from levain.firing.crystallization import refuse_crystallization
+from levain.firing.crystallization import CrystallizationRefused, refuse_crystallization
 from levain.firing.deadline import TurnDeadline, TurnTimeout
-from levain.firing.isolation import IsolationError  # noqa: F401  (re-exported for callers building a guard)
 
 _log = logging.getLogger("levain.dream.executor")
 
@@ -100,15 +113,17 @@ def one_call_ceiling(model: str, table: Mapping[str, PriceRow] | None = None) ->
 @dataclass(frozen=True)
 class Budget:
     """The dollar bound of a Claude-route run (§2.4): ``limit`` is ``R``, ``m`` the one-call ceiling (``None``: no price
-    row, nothing may start). Pure arithmetic, no I/O."""
+    row, nothing may start), ``model`` the model id ``m`` was read for (``consolidate_store`` refuses a budget whose
+    model is not the mind's: another model's ``M`` bounds nothing). Pure arithmetic, no I/O."""
     limit_usd_micros: int = PER_RUN_LIMIT_USD_MICROS
     m_usd_micros: int | None = None
     min_compose_usd_micros: int = MIN_COMPOSE_USD_MICROS
+    model: str | None = None
 
     @classmethod
     def for_model(cls, model: str, table: Mapping[str, PriceRow] | None = None,
                   limit_usd_micros: int = PER_RUN_LIMIT_USD_MICROS) -> "Budget":
-        return cls(limit_usd_micros=limit_usd_micros, m_usd_micros=one_call_ceiling(model, table))
+        return cls(limit_usd_micros=limit_usd_micros, m_usd_micros=one_call_ceiling(model, table), model=model)
 
     def next_cap(self, spent_usd_micros: int) -> int | None:
         """``R − M − spent`` when a compose may start on it (at least the cheapest compose measured), else ``None``."""
@@ -165,7 +180,9 @@ class Progress:
 
 # ------------------------------------------------------------------------------------------------ hooks (§2.2)
 
-#: ``on_snapshot(store, occ_dir) -> manifest``: D1-1b's snapshot. Raising refuses the effect before ``prepare``.
+#: ``on_snapshot(store, occ_dir) -> manifest``: D1-1b's snapshot. Raising refuses the effect before ``prepare``: this
+#: run's wrap is never opened, but an orphaned prior wrap the self-heal already discarded stays discarded (the store
+#: was written by that discard).
 SnapshotHook = Callable[[Any, "Path | None"], Any]
 #: ``on_saved(store, occ_dir, wrap_id) -> post_files``: D1-1b's record-post. Raising is recorded, never fatal.
 SavedHook = Callable[[Any, "Path | None", Any], Any]
@@ -182,9 +199,59 @@ def _no_saved(store: Any, occ_dir: Path | None, wrap_id: Any) -> Any:
 # ------------------------------------------------------------------------------------------------ the typed result
 
 OUTCOMES = ("saved", "refused", "budget", "empty", "lock-held", "snapshot-refused", "deadline", "dry-run",
-            "precondition", "compose-unavailable", "compose-failed", "committed-unwritten", "unknown", "failed")
+            "precondition", "compose-unavailable", "compose-failed", "committed-unwritten", "unknown", "failed",
+            "child-alive")
 
-_ZERO_OUTCOMES = ("saved", "empty", "dry-run")
+
+@dataclass(frozen=True)
+class Remedies:
+    """The commands the core's messages tell an operator to run, so every caller prints only a command that exists
+    on ITS route. Each is a ``str.format`` template; the fields it may use: ``{store}`` (the ``memory.db`` path),
+    ``{token}`` (this run's wrap token), ``{status}`` (anneal's ``wrap-status`` on this store) and ``{cancel}``
+    (anneal's ``wrap-cancel --wrap-token <this run's token>`` on this store). ``levain wrap`` passes its own
+    (``levain wrap --reset``); the default is the dream route's, which has no ``--reset``."""
+    cancel_failed: str
+    prior_wrap: str
+    wrap_in_progress: str
+    empty: str
+    #: The route's flag that picks the compose model, named by "a stronger … may help" (plain text, not formatted).
+    composer_flag: str = "--model"
+
+
+DREAM_REMEDIES = Remedies(
+    cancel_failed=("  ⚠ The prepared wrap could NOT be cancelled: the store {store} is left with wrap {token} in "
+                   "progress, and the next run will refuse on it. Once nothing else is using this store, look at it "
+                   "with\n    {status}\n  and, if it is still this run's wrap {token}, clear it with\n    {cancel}\n"
+                   "  The episodes are safe."),
+    prior_wrap=("  A previous consolidate did not finish. Look at it with\n    {status}\n  and clear it ONLY once you "
+                "have confirmed it is dead, with the same anneal command as `wrap-cancel --wrap-token <its token>` "
+                "(or `wrap-cancel --partial` when the status shows no readable token), keeping the `--db {store}`: "
+                "without it anneal reads ~/.anneal-memory. Your captured episodes are safe (they return to the next "
+                "wrap)."),
+    wrap_in_progress=("  Another consolidate may be running, or a prior one crashed. Look at it with\n    {status}\n"
+                      "  and if nothing else is running clear it as that status says (`wrap-cancel --wrap-token "
+                      "<its token>` on the same `--db`); the episodes are safe."),
+    empty="  The store {store} has no episodes since its last wrap; a run has nothing to do until some are recorded.",
+)
+
+WRAP_REMEDIES = Remedies(
+    cancel_failed=_w._CANCEL_FAILED,
+    prior_wrap=("  A previous consolidate did not finish. Re-run with --reset to discard it and start fresh — "
+                "your captured episodes are safe (they return to the next wrap)."),
+    wrap_in_progress=("  Another consolidate may be running, or a prior one crashed. If nothing else is running, re-run "
+                      "with --reset to discard the stale wrap (episodes are safe)."),
+    empty="  Talk to the entity with `levain run` to accumulate experience, then wrap.",
+    composer_flag="--composer",
+)
+
+
+def _remedy(template: str, store_path: Path, wrap_token: str) -> str:
+    from levain.manifest import anneal_invocation
+
+    db = str(store_path)
+    return template.format(store=db, token=wrap_token,
+                           status=anneal_invocation("--db", db, "wrap-status"),
+                           cancel=anneal_invocation("--db", db, "wrap-cancel", "--wrap-token", wrap_token))
 
 
 @dataclass
@@ -238,6 +305,9 @@ class ComposeResult:
     unit: str = "none"                   # "usd_list" | "tokens"
     error: str | None = None             # set when no text came back (budget, timeout, child failure)
     warnings: list[str] = field(default_factory=list)
+    #: Set when the RUN must end here, with this outcome, and no further compose may start: ``child-alive`` (the
+    #: child was not confirmed gone, its progress.json record kept) or ``failed`` (its start could not be recorded).
+    fatal_outcome: str | None = None
 
 
 def _int_or_none(v: Any) -> int | None:
@@ -283,6 +353,23 @@ def end_child(leader: Any, *, term_wait: float = CHILD_TERM_WAIT_S, group_wait: 
     return bool(leader.reap(timeout=group_wait))
 
 
+def _end_unled(proc: subprocess.Popen, wait: float = CHILD_GROUP_WAIT_S) -> bool:
+    """End a child whose ``_Leader`` could not be built: SIGKILL its group while the leader is still unreaped (so the
+    number is still this group's), poll the group gone, then reap the leader LAST, as :func:`end_child` does. True
+    once the group was seen gone and the leader reaped."""
+    from levain.firing.confinement import group_gone_proc
+
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    if not group_gone_proc(proc.pid, timeout=wait):
+        return False
+    try:
+        proc.wait(timeout=wait)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
 class ClaudeMind:
     """The ``claude -p`` mind (§2.3): flow's argv, started as an unreaped ``Popen`` that leads its own process group.
 
@@ -295,6 +382,10 @@ class ClaudeMind:
     name = "claude"
     source = "dream:claude-p"
     unit = "usd_list"
+    #: ``consolidate_store`` refuses this mind without a positive ``max_seconds`` (a hung child is otherwise
+    #: unbounded) and without a :class:`Budget` built for its model.
+    has_child = True
+    needs_budget = True
 
     def __init__(self, model: str = DEFAULT_CLAUDE_MODEL, *, claude_bin: str = "claude",
                  env: Mapping[str, str] | None = None) -> None:
@@ -340,53 +431,80 @@ class ClaudeMind:
         started = time.monotonic()
         with open(stderr_path, "wb") as err:
             try:
+                # cwd = the occurrence dir: the child's Read/Glob/Grep must not reach the fire's own cwd.
                 proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
-                                        start_new_session=True, env=self.env)
+                                        start_new_session=True, env=self.env, cwd=str(occ))
             except OSError as exc:
                 raise ComposeUnavailable(f"cannot start {self.claude_bin!r}: {type(exc).__name__}: {exc}") from exc
-        leader = _Leader(proc)
+        leader: Any = None
         chunks: list[bytes] = []
         threads: list[threading.Thread] = []
+        exited = False
+        ended = False
+        record_error: str | None = None
+        warnings: list[str] = []
+        seconds = 0.0
         try:
+            # Inside the try: a constructor that raises must still leave the child killed and reaped (finally).
+            leader = _Leader(proc)
             ident = process_identity(proc.pid)
-            if req.progress is not None:
-                req.progress.update(child_pid=proc.pid, child_started_at=ident[0] if ident else None,
-                                    child_argv=argv)
-            data = self.prompt(req, package_path).encode("utf-8")
+            if req.progress is not None and not req.progress.update(
+                    child_pid=proc.pid, child_started_at=ident[0] if ident else None, child_argv=argv):
+                # A child stop() cannot find is a child nobody can end after a fire death: end it now, fail closed.
+                record_error = req.progress.write_error or "progress.json not written"
+            else:
+                data = self.prompt(req, package_path).encode("utf-8")
 
-            def _feed() -> None:
-                try:
-                    proc.stdin.write(data)
-                except (BrokenPipeError, OSError):
-                    pass
-                finally:
-                    with contextlib.suppress(OSError):
-                        proc.stdin.close()
+                def _feed() -> None:
+                    try:
+                        proc.stdin.write(data)
+                    except (BrokenPipeError, OSError):
+                        pass
+                    finally:
+                        with contextlib.suppress(OSError):
+                            proc.stdin.close()
 
-            def _drain() -> None:
-                with contextlib.suppress(OSError, ValueError):
-                    chunks.append(proc.stdout.read())
+                def _drain() -> None:
+                    with contextlib.suppress(OSError, ValueError):
+                        chunks.append(proc.stdout.read())
 
-            for fn in (_feed, _drain):
-                t = threading.Thread(target=fn, daemon=True)
-                t.start()
-                threads.append(t)
-            exited = leader.wait(req.timeout_s if req.timeout_s is not None else 10 ** 9)
-            if exited:
-                threads[1].join(timeout=CHILD_GROUP_WAIT_S)
+                for fn in (_feed, _drain):
+                    t = threading.Thread(target=fn, daemon=True)
+                    t.start()
+                    threads.append(t)
+                exited = leader.wait(req.timeout_s if req.timeout_s is not None else 10 ** 9)
+                if exited:
+                    threads[1].join(timeout=CHILD_GROUP_WAIT_S)
             seconds = time.monotonic() - started
         finally:
-            ended = end_child(leader)
-            if ended and req.progress is not None:
-                req.progress.update(child_pid=None, child_started_at=None, child_argv=None)
-            for t in threads:
-                t.join(timeout=1.0)
-            for stream in (proc.stdin, proc.stdout):
-                with contextlib.suppress(Exception):
-                    stream.close()
+            ended = _end_unled(proc) if leader is None else end_child(leader)
+            if ended:
+                if req.progress is not None and not req.progress.update(
+                        child_pid=None, child_started_at=None, child_argv=None):
+                    # The next progress.json write carries the cleared keys (update() sets them first); the
+                    # 'saving' write fails the run closed if it cannot be made.
+                    warnings.append(f"progress.json child keys not cleared ({req.progress.write_error})")
+                for t in threads:
+                    t.join(timeout=1.0)
+                for stream in (proc.stdin, proc.stdout):
+                    with contextlib.suppress(Exception):
+                        stream.close()
+            # Not ended: the child_* keys stay for stop()/recovery, and the pipes stay open: closing stdout under a
+            # drain thread still blocked in read() can hang this thread on the stream's lock.
+        if not ended:
+            return ComposeResult(model=self.model, seconds=seconds, unit=self.unit, warnings=warnings,
+                                 error=f"the compose child (pid {proc.pid}) could not be confirmed gone",
+                                 fatal_outcome="child-alive")
+        if record_error is not None:
+            return ComposeResult(model=self.model, seconds=seconds, unit=self.unit, warnings=warnings,
+                                 error=f"progress.json could not record the compose child ({record_error})",
+                                 fatal_outcome="failed")
         if not exited:
-            return ComposeResult(model=self.model, seconds=seconds, unit=self.unit, error="timeout")
-        return self.parse(b"".join(chunks), leader.status, seconds)
+            return ComposeResult(model=self.model, seconds=seconds, unit=self.unit, error="timeout",
+                                 warnings=warnings)
+        out = self.parse(b"".join(chunks), leader.status, seconds)
+        out.warnings.extend(warnings)
+        return out
 
     def parse(self, raw: bytes, status: int | None, seconds: float) -> ComposeResult:
         out = ComposeResult(model=self.model, seconds=seconds, unit=self.unit)
@@ -513,8 +631,9 @@ def check_on_copy(store_path: Path, text: str, *, wrap_token: str, session_id: s
                   unattended: bool = True) -> str | None:
     """Flow's ``save --check``, ported: run the WHOLE save (``validated_save_continuity``) on a scratch copy of the
     store, writing nothing to the real one. Returns None when the copy accepted ``text``, else the refusal text,
-    verbatim. A copy that cannot be made returns None (the real save fails closed on its own)."""
-    from anneal_memory import CrystalStore, Store
+    verbatim. A copy that cannot be made returns None (the real save fails closed on its own). A copy that was made but
+    cannot be OPENED returns that failure as the refusal (never an escape)."""
+    from anneal_memory import AnnealMemoryError, CrystalStore, Store
     from anneal_memory.continuity import validated_save_continuity
 
     tmp = Path(tempfile.mkdtemp(prefix="levain-dream-check-"))
@@ -524,14 +643,18 @@ def check_on_copy(store_path: Path, text: str, *, wrap_token: str, session_id: s
         except (OSError, sqlite3.Error) as exc:
             _log.warning("check on a copy skipped, the copy could not be made (%s: %s)", type(exc).__name__, exc)
             return None
-        crystal = CrystalStore(copy_db.with_name(copy_db.stem + ".crystal.json"))
-        if unattended:
-            crystal = refuse_crystallization(crystal)  # type: ignore[assignment]
-        cstore = Store(str(copy_db), project_name=project_name, section_schema=None)
+        try:
+            crystal = CrystalStore(copy_db.with_name(copy_db.stem + ".crystal.json"))
+            if unattended:
+                crystal = refuse_crystallization(crystal)  # type: ignore[assignment]
+            cstore = Store(str(copy_db), project_name=project_name, section_schema=None)
+        except (CrystallizationRefused, AnnealMemoryError, OSError, sqlite3.Error) as exc:
+            return f"the check could not open its scratch copy of the store: {type(exc).__name__}: {exc}"
         try:
             validated_save_continuity(cstore, text, wrap_token=wrap_token, crystal_store=crystal,
                                       allow_shrink=False, session_id=session_id)
-        except Exception as exc:  # noqa: BLE001 — every refusal is the check's answer
+        except (Exception, CrystallizationRefused) as exc:  # noqa: BLE001 — every refusal is the check's answer
+            # (CrystallizationRefused is a BaseException: on the COPY it is this draft's refusal, never an escape)
             return f"{type(exc).__name__}: {exc}"
         finally:
             cstore.close()
@@ -557,22 +680,26 @@ class _Ctx:
         self.spent = 0
         self.outcome: str | None = None
         self.instructions_sha256: str | None = None
+        #: True once this run holds the store lock and owns the occurrence dir: before that, progress.json and
+        #: usage.json may belong to a LIVE run and are never written (a lock-held exit writes neither).
+        self.owns_occ = False
 
 
 def _write_usage(ctx: _Ctx) -> None:
-    if ctx.occ_dir is None:
+    if ctx.occ_dir is None or not ctx.owns_occ:
         return
     unit = getattr(ctx.mind, "unit", "tokens")
-    readable = all(c["usd_micros"] is not None for c in ctx.composes) if unit == "usd_list" else \
-        all(c["input_tokens"] is not None and c["output_tokens"] is not None for c in ctx.composes)
+    tokens_readable = all(c["input_tokens"] is not None and c["output_tokens"] is not None for c in ctx.composes)
+    readable = all(c["usd_micros"] is not None for c in ctx.composes) if unit == "usd_list" else tokens_readable
     doc: dict[str, Any] = {
         "occurrence": ctx.occ_dir.name, "unit": unit,
         "reserved_usd_micros": ctx.budget.limit_usd_micros if ctx.budget is not None else None,
         "actual_usd_micros": (sum(c["usd_micros"] for c in ctx.composes) if unit == "usd_list" and readable
                               else None),
         "usd_mapped": unit == "usd_list",
-        "input_tokens": sum(c["input_tokens"] or 0 for c in ctx.composes) if readable else None,
-        "output_tokens": sum(c["output_tokens"] or 0 for c in ctx.composes) if readable else None,
+        # A count that could not be read is None, never 0, on either route.
+        "input_tokens": sum(c["input_tokens"] for c in ctx.composes) if tokens_readable else None,
+        "output_tokens": sum(c["output_tokens"] for c in ctx.composes) if tokens_readable else None,
         "readable": readable, "composes": ctx.composes, "outcome": ctx.outcome,
         "instructions_sha256": ctx.instructions_sha256,
         "source": getattr(ctx.mind, "source", "dream:unknown"),
@@ -597,6 +724,35 @@ def _crystal_path(store_path: Path) -> Path:
 
 def _lock_path(store_path: Path) -> Path:
     return store_path.parent / "wrap.lock"
+
+
+_CHILD_KEYS = ("child_pid", "child_started_at", "child_argv")
+
+
+def _live_run_record(occ_dir: Path) -> str | None:
+    """Why ``<occ_dir>/progress.json`` must not be overwritten, or None. A record naming a child (any ``child_*`` key
+    set) is a run stop()/recovery may still have to end; a record that cannot be read cannot prove it names none."""
+    path = occ_dir / "progress.json"
+    if not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return f"its progress.json cannot be read ({type(exc).__name__}: {exc})"
+    if not isinstance(doc, dict):
+        return "its progress.json is not a progress record"
+    named = [k for k in _CHILD_KEYS if doc.get(k) is not None]
+    if named:
+        return f"its progress.json names a compose child ({', '.join(named)} set, child_pid {doc.get('child_pid')})"
+    return None
+
+
+def _has_fcntl() -> bool:
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _default_report(saved: Mapping[str, object]) -> None:
@@ -634,6 +790,8 @@ def consolidate_store(
     report: Callable[[Mapping[str, object]], None] | None = None,
     acquire_lock: Callable[[], Any] | None = None,
     read_wrap_schema: Callable[[Any], Any] | None = None,
+    remedies: Remedies | None = None,
+    require_lock: bool = True,
 ) -> ConsolidateResult:
     """One consolidate on the store at ``store_path`` (a ``memory.db``). See the module docstring.
 
@@ -646,15 +804,18 @@ def consolidate_store(
     ``acquire_lock() -> handle`` and ``read_wrap_schema(store) -> schema`` are ``levain wrap``'s own seams: it passes
     functions defined in ``levain/wrap.py``, so the patch points its existing tests use (``wrap._lock_wrap``, a store
     read made from a ``levain.wrap`` frame) still bind. The defaults are the store-path core's own.
+
+    ``remedies`` are the commands the messages name (default :data:`DREAM_REMEDIES`; ``levain wrap`` passes
+    :data:`WRAP_REMEDIES`). ``require_lock`` refuses a run whose lock seam returns no handle on a platform that has
+    ``fcntl`` (the dream's single-writer is the lock); ``levain wrap`` passes False and keeps its documented
+    best-effort proceed. ``progress.json`` and ``usage.json`` are written only once the store lock is held and the
+    occurrence dir holds no live run record.
     """
     store_path = Path(store_path)
     occ_dir = None if occurrence_dir is None else Path(occurrence_dir)
     ctx = _Ctx(occ_dir, mind, budget)
     progress = Progress(occ_dir)
     try:
-        if occ_dir is not None:
-            occ_dir.mkdir(parents=True, exist_ok=True)
-            progress.update()
         res = _consolidate_store(
             ctx, progress, store_path, mind=mind, composer=composer, max_seconds=max_seconds,
             save_reserve=save_reserve, budget=budget, instructions_path=instructions_path,
@@ -662,7 +823,8 @@ def consolidate_store(
             dry_run=dry_run, reset=reset, unattended=unattended, own_deadline=own_deadline,
             hard_exit_code=hard_exit_code, label=label, project_name=project_name or store_path.parent.name,
             constitution=constitution, report=report or _default_report,
-            acquire_lock=acquire_lock, read_wrap_schema=read_wrap_schema)
+            acquire_lock=acquire_lock, read_wrap_schema=read_wrap_schema,
+            remedies=remedies or DREAM_REMEDIES, require_lock=require_lock)
         ctx.outcome = res.outcome
         res.composes = list(ctx.composes)
         res.spent_usd_micros = ctx.spent
@@ -678,12 +840,39 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                        hard_exit_code: int, label: str, project_name: str, constitution: str | None,
                        report: Callable[[Mapping[str, object]], None],
                        acquire_lock: Callable[[], Any] | None, read_wrap_schema: Callable[[Any], Any] | None,
+                       remedies: Remedies, require_lock: bool,
                        ) -> ConsolidateResult:
     started = time.monotonic()
     occ_dir = ctx.occ_dir
     crystal_path = _crystal_path(store_path)
     name = project_name
     L = label
+
+    # Before ANY store effect: the bounds a mind needs (C, D). A refusal here opens nothing and writes nothing.
+    if getattr(mind, "has_child", False) and not (
+            isinstance(max_seconds, (int, float)) and not isinstance(max_seconds, bool)
+            and math.isfinite(max_seconds) and max_seconds > 0):
+        print(f"{L}: the {getattr(mind, 'name', '?')} mind runs a child process and needs a positive max_seconds "
+              f"(got {max_seconds!r}): an unbounded run leaves a hung child unbounded. Refused; nothing was opened.")
+        return ConsolidateResult("precondition", 2, f"max_seconds must be positive with a child mind: {max_seconds!r}")
+    mind_model = getattr(mind, "model", None)
+    if budget is None and getattr(mind, "needs_budget", False):
+        print(f"{L}: the {getattr(mind, 'name', '?')} mind spends dollars and was given no budget. Refused; nothing "
+              "was opened.")
+        return ConsolidateResult("budget", 2, "a dollar-spending mind needs a budget")
+    if budget is not None:
+        if budget.model != mind_model:
+            print(f"{L}: the budget was built for {budget.model!r}, not the mind's model {mind_model!r}, so its "
+                  "one-call ceiling M bounds nothing. Refused; nothing was opened.")
+            return ConsolidateResult("budget", 2, f"budget model {budget.model!r} is not the mind's {mind_model!r}")
+        if budget.m_usd_micros is None:
+            print(f"{L}: no price row for {mind_model!r} in levain.dream.executor.PRICE_TABLE, so the one-call "
+                  "ceiling M is unknown and no compose may start. Refused; nothing was opened.")
+            return ConsolidateResult("budget", 2, f"no price row for {mind_model!r}")
+        if budget.next_cap(0) is None:
+            print(f"{L}: the per-run limit less M leaves no compose a cap of at least the cheapest compose measured. "
+                  "Refused; nothing was opened.")
+            return ConsolidateResult("budget", 2, "R - M is below the cheapest compose")
 
     if not store_path.exists():
         print(f"{L}: {store_path.parent} has no memory store yet ({store_path} is missing) — nothing to consolidate.")
@@ -724,26 +913,55 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
         print(f"{L}: could not open {name}'s memory store ({type(exc).__name__}: {exc}).")
         return ConsolidateResult("precondition", 2, "store unopenable")
 
-    lock = acquire_lock() if acquire_lock is not None else _w._lock_wrap_file(_lock_path(store_path))
-    if lock is _w._ANOTHER_WRAP_RUNNING:
-        store.close()
-        print(f"{L}: another consolidate is already running on this store ({_lock_path(store_path)} is held). "
-              "Wait for it to finish, then re-run.")
-        return ConsolidateResult("lock-held", 2, "another consolidate running")
-
     wrap_token = uuid.uuid4().hex
     prepare_entered = False
+    lock: Any = None
     stack = contextlib.ExitStack()
     deadline: TurnDeadline | None = None
-    if own_deadline and max_seconds:
-        deadline = TurnDeadline(max_seconds, hard_exit_code=hard_exit_code,
-                                hard_report=lambda s: _w.format_wrap_timeout_report(s, hard=True))
-        stack.enter_context(deadline)
 
     def _fail(outcome: str, code: int, detail: str, **kw: Any) -> ConsolidateResult:
         return ConsolidateResult(outcome, code, detail, wrap_token=wrap_token if prepare_entered else None, **kw)
 
+    def _cancel_failed() -> str:
+        return _remedy(remedies.cancel_failed, store_path, wrap_token)
+
     try:
+        if own_deadline and max_seconds:
+            deadline = TurnDeadline(max_seconds, hard_exit_code=hard_exit_code,
+                                    hard_report=lambda s: _w.format_wrap_timeout_report(s, hard=True))
+            stack.enter_context(deadline)
+        # Step 1, inside the try: whatever the lock seam raises, the store is closed in `finally`.
+        try:
+            lock = acquire_lock() if acquire_lock is not None else _w._lock_wrap_file(_lock_path(store_path))
+        except OSError as exc:
+            print(f"{L}: the wrap lock {_lock_path(store_path)} could not be taken ({type(exc).__name__}: {exc}); "
+                  "nothing was started.")
+            return _fail("precondition", 2, f"wrap lock unobtainable: {type(exc).__name__}: {exc}")
+        if lock is _w._ANOTHER_WRAP_RUNNING:
+            print(f"{L}: another consolidate is already running on this store ({_lock_path(store_path)} is held). "
+                  "Wait for it to finish, then re-run.")
+            return _fail("lock-held", 2, "another consolidate running")
+        if lock is None and require_lock and _has_fcntl():
+            print(f"{L}: no single-writer lock was taken on {_lock_path(store_path)} although this platform has "
+                  "fcntl; an unattended consolidate does not run without it. Refused; nothing was started.")
+            return _fail("precondition", 2, "no lock handle on a platform with fcntl")
+        if occ_dir is not None:
+            try:
+                occ_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                print(f"{L}: the occurrence dir {occ_dir} cannot be made ({type(exc).__name__}: {exc}).")
+                return _fail("precondition", 2, f"occurrence dir unmakeable: {type(exc).__name__}: {exc}")
+            live = _live_run_record(occ_dir)
+            if live is not None:
+                print(f"{L}: occurrence dir already holds a live run record: {occ_dir} — {live}. A run there may "
+                      "still have a child to end; nothing was started and its record was left as it is.")
+                return _fail("precondition", 2, f"occurrence dir already holds a live run record: {live}")
+            if not progress.update():
+                print(f"{L}: progress.json could not be written in {occ_dir} ({progress.write_error}); nothing was "
+                      "started.")
+                return _fail("precondition", 2, f"progress.json unwritable: {progress.write_error}")
+            ctx.owns_occ = True
+
         headings = [s["heading"] for s in store.section_schema]
         expected = [s["heading"] for s in FLOW_SCHEMA if not s.get("optional")]
         if name_for_schema(store.section_schema) != "partnership":
@@ -769,8 +987,7 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                              "on this platform, so it cannot prove the wrap is not a live peer's. Refusing is the safe "
                              "side.)")
                 print(f"{L}: a prior wrap is still in progress (started {started_at}).\n"
-                      "  A previous consolidate did not finish. Re-run with --reset to discard it and start fresh — "
-                      "your captured episodes are safe (they return to the next wrap)." + extra)
+                      + _remedy(remedies.prior_wrap, store_path, wrap_token) + extra)
                 return _fail("precondition", 2, "prior wrap in progress")
             try:
                 discarded = _w._discard_prior_wrap(store, prior_token)
@@ -807,7 +1024,8 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
         if not dry_run:
             try:
                 manifest = on_snapshot(store, occ_dir)
-            except Exception as exc:  # noqa: BLE001 — a refused snapshot is a named outcome, nothing written yet
+            except Exception as exc:  # noqa: BLE001 — a refused snapshot is a named outcome; this run's wrap was
+                # never opened (an orphan discarded above stays discarded: that discard did write the store)
                 print(f"{L}: the snapshot was refused ({type(exc).__name__}: {exc}); nothing was prepared or saved.")
                 return _fail("snapshot-refused", 2, f"{type(exc).__name__}: {exc}")
 
@@ -817,7 +1035,7 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
         status = result.get("status")
         if status == "empty":
             print(f"{L}: nothing to consolidate — no new episodes since the last wrap.\n"
-                  "  Talk to the entity with `levain run` to accumulate experience, then wrap.")
+                  + _remedy(remedies.empty, store_path, wrap_token))
             return _fail("empty", 0, "no new episodes", manifest=manifest)
         if status != "ready":
             if status == "downgraded":
@@ -825,7 +1043,7 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                 return ConsolidateResult("failed", 1, f"anneal declined: {result.get('message') or status}")
             print(f"{L}: prepare_wrap returned an unexpected status {status!r} — aborting.")
             if not _w._cancel_if_ours(store, wrap_token):
-                print(_w._CANCEL_FAILED)
+                print(_cancel_failed())
             return _fail("failed", 1, f"unexpected prepare status {status!r}", manifest=manifest)
 
         wrap_schema = read_wrap_schema(store) if read_wrap_schema is not None else store.section_schema_for_wrap()
@@ -835,7 +1053,7 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                   f"stopped; nothing was saved.\n  got:      {[s['heading'] for s in wrap_schema]}\n"
                   f"  required: {expected}")
             if not cancelled:
-                print(_w._CANCEL_FAILED)
+                print(_cancel_failed())
             return _fail("precondition", 2, "schema changed under the wrap", manifest=manifest)
         package_text = format_wrap_package_text(result)
         episode_count = result.get("episode_count")
@@ -846,12 +1064,17 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                   "Nothing was composed or saved.\n")
             print(package_text)
             if not cancelled:
-                print(_w._CANCEL_FAILED)
+                print(_cancel_failed())
                 return _fail("failed", 1, "dry-run wrap could not be cancelled")
             return _fail("dry-run", 0, f"{episode_count} episode(s) ready")
 
-        progress.update(wrap_token=wrap_token, phase="composing")
-        instructions = instructions_override if instructions_override is not None else \
+        if not progress.update(wrap_token=wrap_token, phase="composing"):
+            cancelled = _w._cancel_if_ours(store, wrap_token)
+            print(f"{L}: progress.json could not record the wrap ({progress.write_error}); nothing composed or saved.")
+            if not cancelled:
+                print(_cancel_failed())
+            return _fail("failed", 1, f"progress.json unwritable: {progress.write_error}", manifest=manifest)
+        instructions =instructions_override if instructions_override is not None else \
             _w._compose_instructions(wrap_schema)
         ctx.instructions_sha256 = _sha256(instructions.encode("utf-8"))
         print(f"{L}: consolidating {episode_count} episode(s) into {name}'s memory with "
@@ -888,19 +1111,29 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                 cancelled = _w._cancel_if_ours(store, wrap_token)
                 print(f"{L}: {exc}")
                 if not cancelled:
-                    print(_w._CANCEL_FAILED)
+                    print(_cancel_failed())
                 return _fail("compose-unavailable", 2, str(exc))
             except Exception as exc:  # noqa: BLE001 — a model/endpoint failure is a run failure, not a crash
                 cancelled = _w._cancel_if_ours(store, wrap_token)
                 print(f"{L}: the compose model failed ({type(exc).__name__}: {exc}).\n"
                       "  Nothing was saved; the memory is unchanged and its episodes are safe. "
-                      "Check --composer / --base-url and re-run.")
+                      f"Check {remedies.composer_flag} / --base-url and re-run.")
                 if not cancelled:
-                    print(_w._CANCEL_FAILED)
+                    print(_cancel_failed())
                 return _fail("compose-failed", 1, f"{type(exc).__name__}: {exc}")
             ctx.composes.append(_compose_row(attempt, res))
             if cap is not None:
                 ctx.spent += charged_after(cap, budget.m_usd_micros if budget else None, res.usd_micros)
+            if res.fatal_outcome is not None:
+                # Terminal for the whole run: no further compose starts (child-alive keeps its child_* record).
+                cancelled = _w._cancel_if_ours(store, wrap_token)
+                keep = ("\n  Its pid and identity stay in progress.json for stop()/recovery to end it."
+                        if res.fatal_outcome == "child-alive" else "")
+                print(f"{L}: {res.error}; no further compose was started and nothing was saved.{keep}")
+                if not cancelled:
+                    print(_cancel_failed())
+                return _fail(res.fatal_outcome, 1, res.error or res.fatal_outcome, refusals=refusals,
+                             manifest=manifest)
             last_error = res.error or (None if res.text.strip() else "empty")
             last_was_check_refusal = False
             if last_error:
@@ -937,10 +1170,10 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                 outcome = "budget"
             else:
                 print(f"{L}: the compose model returned no usable memory text; nothing saved. "
-                      "Re-run (a stronger --composer may help a weak model).")
+                      f"Re-run (a stronger {remedies.composer_flag} may help a weak model).")
                 outcome = "compose-failed"
             if not cancelled:
-                print(_w._CANCEL_FAILED)
+                print(_cancel_failed())
             return _fail(outcome, 1, refusals[-1] if refusals else (stopped_by or "no text"),
                          refusals=refusals, manifest=manifest)
 
@@ -956,7 +1189,7 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
             cancelled = _w._cancel_if_ours(store, wrap_token)
             print(f"{L}: progress.json could not be written ({progress.write_error}); nothing saved.")
             if not cancelled:
-                print(_w._CANCEL_FAILED)
+                print(_cancel_failed())
             return _fail("failed", 1, f"progress.json unwritable: {progress.write_error}", manifest=manifest)
 
         try:
@@ -964,7 +1197,7 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                                               allow_shrink=False, session_id=session_id)
         except Exception as exc:  # noqa: BLE001 — anneal raises ValueError (validation) / StoreError
             return _classify_failed_save(store, exc, wrap_token, last_wrap_before, neocortex, store_path, L,
-                                         refusals, manifest)
+                                         refusals, manifest, _cancel_failed(), remedies.composer_flag)
 
         wrap_id = saved.get("wrap_id") if isinstance(saved, Mapping) else None
         progress.update(phase="saved", wrap_id=wrap_id)
@@ -983,8 +1216,7 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
         return out
     except WrapInProgressError as exc:
         print(f"{L}: a wrap is already in progress ({exc}).\n"
-              "  Another consolidate may be running, or a prior one crashed. If nothing else is running, re-run "
-              "with --reset to discard the stale wrap (episodes are safe).")
+              + _remedy(remedies.wrap_in_progress, store_path, wrap_token))
         return _fail("precondition", 2, f"wrap in progress: {exc}")
     except AnnealMemoryError as exc:
         try:
@@ -994,7 +1226,7 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
             raise
         print(f"{L}: the consolidate could not read {name}'s store ({type(exc).__name__}: {exc}).")
         if not cancelled:
-            print(_w._CANCEL_FAILED)
+            print(_cancel_failed())
         return _fail("precondition", 2, f"{type(exc).__name__}: {exc}")
     except TurnTimeout as exc:
         if deadline is None:
@@ -1014,9 +1246,15 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
 
 
 def _classify_failed_save(store: Any, exc: Exception, wrap_token: str, last_wrap_before: int | None, neocortex: str,
-                          store_path: Path, L: str, refusals: list[str], manifest: Any) -> ConsolidateResult:
+                          store_path: Path, L: str, refusals: list[str], manifest: Any,
+                          cancel_failed_text: str, composer_flag: str = "--model") -> ConsolidateResult:
     """``wrap.py``'s oracle, unchanged: what the STORE establishes after a save that raised, never the file's sha and
-    never the absence of a flag. ``fn`` returns the classification; it never raises for a refused save."""
+    never the absence of a flag. ``fn`` returns the classification; it never raises for a refused save.
+    ``cancel_failed_text`` is the route's own remedy (:class:`Remedies`)."""
+
+    def _cancel_failed() -> str:
+        return cancel_failed_text
+
     last_wrap_after = _w._last_wrap_id(store)
     base = dict(wrap_token=wrap_token, manifest=manifest)
     if (last_wrap_before is not None and last_wrap_after is not None and last_wrap_after != last_wrap_before
@@ -1030,7 +1268,7 @@ def _classify_failed_save(store: Any, exc: Exception, wrap_token: str, last_wrap
         cancelled = _w._cancel_if_ours(store, wrap_token)
         print(_w._SAVE_UNREADABLE.format(kind=type(exc).__name__, exc=exc).replace("levain wrap", L))
         if not cancelled:
-            print(_w._CANCEL_FAILED)
+            print(_cancel_failed())
         return ConsolidateResult("unknown", 1, f"save unreadable: {type(exc).__name__}: {exc}", refusals=refusals,
                                  **base)
     if _w._wrap_in_progress(store):
@@ -1048,9 +1286,9 @@ def _classify_failed_save(store: Any, exc: Exception, wrap_token: str, last_wrap
         print(f"{L}: the composed memory was REFUSED — NOT saved ({type(exc).__name__}: {exc}).\n"
               f"  The identity is unchanged. {why}\n"
               f"  The rejected draft was saved for inspection: {debug_path}\n"
-              "  Re-run to try again (a stronger --composer may help).")
+              f"  Re-run to try again (a stronger {composer_flag} may help).")
         if not cancelled:
-            print(_w._CANCEL_FAILED)
+            print(_cancel_failed())
         return ConsolidateResult("refused", 1, f"{type(exc).__name__}: {exc}", refusals=refusals + [str(exc)], **base)
     if last_wrap_after == last_wrap_before and _w._unwrapped_count(store):
         print(f"{L}: the wrap was cleared by another program while the memory was being composed, so it was NOT saved "

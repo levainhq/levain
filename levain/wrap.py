@@ -64,11 +64,10 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
-from levain.firing.crystallization import CrystallizationRefused, refuse_crystallization
+from levain.firing.crystallization import CrystallizationRefused
 from levain.firing.deadline import HARD_EXIT_GRACE_SECONDS, TurnDeadline, TurnTimeout
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
@@ -568,8 +567,8 @@ def wrap_entity(
       :func:`~levain.firing.crystallization.refuse_crystallization`): metabolize yes, promote into
       the always-loaded tier never.
     - **An orphaned prior wrap is discarded automatically** instead of refusing and asking a human
-      to pass ``--reset``. See :func:`_consolidate` — this is a correctness requirement, not a
-      convenience.
+      to pass ``--reset``. See the self-heal in :func:`levain.dream.executor._consolidate_store` and
+      :func:`_orphan_is_stale` — this is a correctness requirement, not a convenience.
 
     ⚠ ``EXIT_TIMEOUT`` is checked and returned by the CALLER of the bound, never derived from an
     error message — the same authority-not-description discipline as ``TurnResult.timed_out``.
@@ -609,8 +608,9 @@ def wrap_entity(
                 max_seconds=max_seconds,
             )
     except TurnTimeout as exc:
-        # `TurnTimeout` is a BaseException, so `_consolidate`'s `except Exception` clauses never see
-        # it; its own BaseException handler has already tried to cancel our in-progress wrap on the
+        # `TurnTimeout` is a BaseException, so the store-path core's `except Exception` clauses never
+        # see it; the core's own TurnTimeout handler (`levain.dream.executor._consolidate_store`, which
+        # `_consolidate` calls with `own_deadline=False`) has already tried to cancel our in-progress wrap on the
         # way out and recorded what that cancel found (`levain_wrap_cancel`). A stop that never reached
         # that handler left no record, and is reported as such, not as clean and not as failed.
         print(
@@ -648,7 +648,9 @@ def _consolidate(
     unattended: bool,
     max_seconds: float | None,
 ) -> int:
-    """The consolidate itself. :func:`wrap_entity` bounds this body in wall-clock time.
+    """The entity guard, then one call into the store-path core
+    (:func:`levain.dream.executor.consolidate_store`), which holds the lock, the self-heal, the
+    prepare, the compose and the save. :func:`wrap_entity` bounds this body in wall-clock time.
 
     Split out for the same reason ``levain.run._drive_task`` is: the bound is a property of the
     PROCESS, and reading the work should not require reading past the machinery that bounds it.
@@ -680,9 +682,11 @@ def _consolidate(
     # The consolidate itself is the store-path core (D1-1a): `levain.dream.executor.consolidate_store` holds the lock,
     # the orphan self-heal, the prepare, the compose and the fail-closed save, and returns a typed result. This
     # command keeps the entity guard above and the entity's constitution, runs ONE compose with no check on a
-    # copy (`max_composes=1`), and returns the core's exit code, so its messages and codes are unchanged. The
-    # caller (`wrap_entity`) bounds the whole consolidate, so the core arms no deadline of its own.
-    from levain.dream.executor import ComposeRequest, ComposeResult, consolidate_store
+    # copy (`max_composes=1`), and returns the core's exit code, so its exit codes and remedies (`--reset`,
+    # `WRAP_REMEDIES`) are unchanged; some message wording now names the store rather than the entity (the
+    # executor's module docstring lists each). The caller (`wrap_entity`) bounds the whole consolidate, so the
+    # core arms no deadline of its own; `require_lock=False` keeps the documented best-effort proceed with no fcntl.
+    from levain.dream.executor import WRAP_REMEDIES, ComposeRequest, ComposeResult, consolidate_store
 
     class _WrapMind:
         """The entity's own model through `_compose`, looked up at call time (so a patched `_compose` is honoured)."""
@@ -713,6 +717,8 @@ def _consolidate(
         report=lambda saved: _report(saved, entity_dir),
         acquire_lock=lambda: _lock_wrap(entity_dir),
         read_wrap_schema=_read_wrap_schema,
+        remedies=WRAP_REMEDIES,
+        require_lock=False,
     )
     return result.exit_code
 
@@ -818,17 +824,6 @@ def _extract_neocortex(raw: str) -> str:
         if line.strip() == "## State":
             return "\n".join(lines[i:]).strip()
     return text.strip()
-
-
-def _dump_rejected(entity_dir: Path, wrap_token: object, neocortex: str) -> Path:
-    """Persist a refused compose next to the store for inspection (why the save was rejected). In the
-    ENTITY tree — never a shared temp dir — so it stays with the sovereign entity. Best-effort."""
-    path = entity_dir / ".levain" / f"rejected-wrap.{wrap_token}.md"
-    try:
-        path.write_text(neocortex, encoding="utf-8")
-    except Exception as exc:  # noqa: BLE001 — a debug dump must not mask the real failure
-        _log.debug("could not write rejected-wrap draft (%s): %s", type(exc).__name__, exc)
-    return path
 
 
 def _report(saved: Mapping[str, object], entity_dir: Path) -> None:

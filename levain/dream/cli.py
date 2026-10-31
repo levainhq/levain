@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -34,7 +35,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     r.add_argument("--base-url", default="http://localhost:11434", help="ollama: the endpoint.")
     r.add_argument("--api-key-env", default=None, help="ollama: the NAME of the env var holding the key.")
     r.add_argument("--instructions", default=None, help="A file of consolidate instructions (else anneal's package).")
-    r.add_argument("--max-seconds", type=float, default=None, help="Wall bound (default 3000; 0 = unbounded).")
+    r.add_argument("--max-seconds", type=float, default=None,
+                   help="Wall bound in seconds (default 3000; must be positive: a run is never unbounded).")
     r.add_argument("--occurrence-dir", default=None, help="Where progress.json and usage.json go "
                                                           "(default <store dir>/dream/<new id>).")
     r.add_argument("--dry-run", action="store_true", help="Prepare and print the package, compose nothing.")
@@ -49,15 +51,42 @@ def run_dream(args: argparse.Namespace) -> int:
 
 
 def _resolve_store(store_dir: str) -> tuple[Path | None, str]:
+    """The store's ``memory.db`` under ``store_dir``, or a refusal. Every path the run writes is RESOLVED (symlinks
+    followed) and refused if it lands inside ``~/.anneal-memory`` (case-insensitive): the dir, the candidate db, its
+    own dir (a ``.levain`` symlink), every ``<stem>*`` sibling there (continuity text, crystal, WAL, audit) and the
+    ``wrap.lock`` beside it. A copy dir whose ``memory.db`` is a symlink to the live db is the live store."""
     from levain.firing.isolation import _is_within_ci, flow_store_dir
 
-    base = Path(store_dir).expanduser().resolve()
-    if _is_within_ci(base, flow_store_dir().resolve()):
-        return None, (f"{base} is inside the operator's live store (~/.anneal-memory): `levain dream run` is for a "
-                      "COPY. Refused.")
+    live = flow_store_dir().resolve()
+
+    def refused(p: Path) -> str | None:
+        r = p.resolve()
+        if _is_within_ci(r, live):
+            return (f"{p} resolves to {r}, inside the operator's live store (~/.anneal-memory): `levain dream run` "
+                    "is for a COPY. Refused.")
+        return None
+
+    base = Path(store_dir).expanduser()
+    why = refused(base)
+    if why:
+        return None, why
+    base = base.resolve()
     for cand in (base / "memory.db", base / ".levain" / "memory.db"):
-        if cand.is_file():
-            return cand, ""
+        if not cand.is_file():
+            continue
+        for p in (cand, cand.parent, cand.parent / "wrap.lock"):
+            why = refused(p)
+            if why:
+                return None, why
+        try:
+            siblings = [p for p in cand.parent.iterdir() if p.name.startswith(cand.stem)]
+        except OSError as exc:
+            return None, f"{cand.parent} cannot be listed ({type(exc).__name__}: {exc}); refused."
+        for p in siblings:
+            why = refused(p)
+            if why:
+                return None, why
+        return cand, ""
     return None, f"no memory.db under {base} (looked in the dir and in .levain/)."
 
 
@@ -65,6 +94,11 @@ def run_dream_run(args: argparse.Namespace) -> int:
     from levain import wrap as _w
     from levain.dream import executor as ex
 
+    max_seconds = ex.DREAM_BUDGET_S if args.max_seconds is None else args.max_seconds
+    if not (math.isfinite(max_seconds) and max_seconds > 0):
+        print(f"levain dream run: --max-seconds must be a positive number of seconds (got {args.max_seconds!r}); "
+              "an unbounded run leaves a hung compose child unbounded.", file=sys.stderr)
+        return 2
     store_path, err = _resolve_store(args.store_dir)
     if store_path is None:
         print(f"levain dream run: {err}", file=sys.stderr)
@@ -83,8 +117,7 @@ def run_dream_run(args: argparse.Namespace) -> int:
         budget = None
     occ = Path(args.occurrence_dir).expanduser() if args.occurrence_dir else \
         store_path.parent / "dream" / time.strftime("%Y%m%dT%H%M%S")
-    max_seconds = ex.DREAM_BUDGET_S if args.max_seconds is None else (args.max_seconds or None)
-    result = ex.consolidate_store(
+    result =ex.consolidate_store(
         store_path, mind=mind, composer=getattr(mind, "model", None), max_seconds=max_seconds, budget=budget,
         instructions_path=args.instructions, occurrence_dir=occ, dry_run=args.dry_run,
         hard_exit_code=_w.EXIT_TIMEOUT, label="levain dream run")

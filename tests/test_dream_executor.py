@@ -341,9 +341,18 @@ def test_the_one_call_ceiling_is_w_times_p_in_plus_o_times_p_out_rounded_up():
     assert ex.one_call_ceiling("unpriced", {PINNED: TEST_ROW}) is None
 
 
-def test_the_shipped_price_table_invents_no_price():
-    assert ex.PRICE_TABLE == {}                                   # rows are added by whoever reads the price page
-    assert ex.Budget.for_model(ex.DEFAULT_CLAUDE_MODEL).m_usd_micros is None
+def test_the_shipped_price_table_invents_no_price(scratch, stub, tmp_path, monkeypatch):
+    import re
+
+    for model, row in ex.PRICE_TABLE.items():                    # every row a person read off the published page
+        assert row.source.startswith("https://"), (model, row.source)
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", row.read_on), (model, row.read_on)
+    # with no row for the default model (as shipped, or once a row is removed) it refuses before any store effect
+    monkeypatch.delitem(ex.PRICE_TABLE, ex.DEFAULT_CLAUDE_MODEL, raising=False)
+    b = ex.Budget.for_model(ex.DEFAULT_CLAUDE_MODEL)
+    assert b.m_usd_micros is None
+    r = _run(scratch, tmp_path, ex.ClaudeMind(claude_bin=str(stub.bin)), budget=b)
+    assert (r.outcome, r.exit_code) == ("budget", 2) and stub.calls() == 0
 
 
 def test_start_rule_is_r_minus_m_minus_spent_and_floors_at_the_cheapest_compose():
@@ -393,8 +402,11 @@ def test_an_unreadable_cost_stops_the_run_and_usage_says_unreadable(scratch, stu
 
 def test_a_model_id_with_no_price_row_is_refused_and_no_child_starts(scratch, stub, tmp_path):
     b = ex.Budget.for_model("unpriced-model", {PINNED: TEST_ROW})
-    r = _run(scratch, tmp_path, ex.ClaudeMind("unpriced-model", claude_bin=str(stub.bin)), budget=b)
-    assert r.outcome == "budget" and stub.calls() == 0 and _store_state(scratch)[0] is None
+    snaps = []
+    r = _run(scratch, tmp_path, ex.ClaudeMind("unpriced-model", claude_bin=str(stub.bin)), budget=b,
+             on_snapshot=lambda s, o: snaps.append(1))
+    assert (r.outcome, r.exit_code) == ("budget", 2) and stub.calls() == 0 and _store_state(scratch)[0] is None
+    assert snaps == [] and not (tmp_path / "occ").exists()        # D: refused before the snapshot or any write
     # and the mind itself refuses without a cap, whoever calls it
     with pytest.raises(ex.ComposeUnavailable, match="no price row"):
         _claude(stub).compose(ex.ComposeRequest("p", "i", occ_dir=tmp_path / "occ"))
@@ -589,3 +601,281 @@ def test_dream_run_refuses_the_live_store_dir_and_a_model_with_no_row(scratch, t
     assert _store_state(scratch) == (None, 0, 3)
     assert cli.main(["dream"]) == 1                                # the bare command is still "not built"
     assert "not built" in capsys.readouterr().err
+
+
+# ---------- review fixes (D1-1a r2): each from a hand run on a scratch store ----------
+
+class _Never:
+    name, source, unit, model = "x", "x", "tokens", "x"
+
+    def compose(self, req):
+        raise AssertionError("must not compose")
+
+
+class _PopenSpy:
+    """Records the kwargs and the process of every Popen of the stub ``claude`` (``ps`` runs from
+    ``process_identity`` are passed through unrecorded), then calls the real one."""
+
+    def __init__(self, monkeypatch):
+        import subprocess
+
+        self.calls: list[dict] = []
+        self.procs: list = []
+        real = subprocess.Popen
+
+        def spy(*a, **k):
+            p = real(*a, **k)
+            argv = a[0] if a else k.get("args")
+            if isinstance(argv, list) and str(argv[0]).endswith("/claude"):
+                self.calls.append(k)
+                self.procs.append(p)
+            return p
+
+        monkeypatch.setattr(ex.subprocess, "Popen", spy)
+
+
+def test_A_dream_run_refuses_a_copy_whose_db_or_levain_symlinks_into_the_live_store(tmp_path, monkeypatch, capsys):
+    from levain import cli
+
+    fake_home = tmp_path / "home"
+    live = fake_home / ".anneal-memory"
+    live.mkdir(parents=True)
+    with Store(str(live / "memory.db"), section_schema=FLOW_SCHEMA) as s:
+        s.record(content="the live store", episode_type="observation", source="t")
+    before = (live / "memory.db").read_bytes()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    db_link = tmp_path / "copy-db"
+    db_link.mkdir()
+    (db_link / "memory.db").symlink_to(live / "memory.db")         # shape 1: memory.db -> the live db
+    dir_link = tmp_path / "copy-dir"
+    dir_link.mkdir()
+    (dir_link / ".levain").symlink_to(live)                        # shape 2: .levain -> the live dir
+    side = tmp_path / "copy-side"                                  # shape 3: a real db, its text tier in live
+    side.mkdir()
+    with Store(str(side / "memory.db"), section_schema=FLOW_SCHEMA) as s:
+        s.record(content="copy", episode_type="observation", source="t")
+    (side / "memory.continuity.md").symlink_to(live / "memory.continuity.md")
+    for d in (db_link, dir_link, side):
+        assert cli.main(["dream", "run", "--store-dir", str(d), "--mind", "ollama"]) == 2
+        err = capsys.readouterr().err
+        assert "inside the operator's live store" in err and "COPY" in err, err
+    assert (live / "memory.db").read_bytes() == before and not (live / "memory.continuity.md").exists()
+
+
+def test_B_a_second_run_on_a_live_occurrence_dir_refuses_and_leaves_both_records(scratch, tmp_path):
+    occ = tmp_path / "occ"
+    occ.mkdir()
+    rec = dict.fromkeys(ex.PROGRESS_KEYS)
+    rec.update(phase="composing", wrap_token="a" * 32, child_pid=4242, child_started_at="Sat Oct 31 01:00:00 2026",
+               child_argv=["claude", "-p"])
+    (occ / "progress.json").write_text(json.dumps(rec))
+    (occ / "usage.json").write_text('{"live": true}')
+    before = {p.name: p.read_bytes() for p in occ.iterdir()}
+    r = ex.consolidate_store(scratch, mind=_Never(), occurrence_dir=occ)
+    assert (r.outcome, r.exit_code) == ("precondition", 2)
+    assert "occurrence dir already holds a live run record" in r.detail
+    assert {p.name: p.read_bytes() for p in occ.iterdir()} == before   # child_* and usage untouched
+    assert _store_state(scratch) == (None, 0, 3)
+    (occ / "progress.json").write_text("{not json")                # unreadable: cannot prove it names no child
+    assert ex.consolidate_store(scratch, mind=_Never(), occurrence_dir=occ).outcome == "precondition"
+
+
+def test_B_a_lock_held_exit_writes_neither_progress_nor_usage(scratch, tmp_path):
+    occ = tmp_path / "occ"
+    occ.mkdir()
+    (occ / "progress.json").write_text(json.dumps(dict.fromkeys(ex.PROGRESS_KEYS) | {"phase": "composing"}))
+    (occ / "usage.json").write_text('{"live": true}')
+    before = {p.name: p.read_bytes() for p in occ.iterdir()}
+    fresh = tmp_path / "fresh-occ"
+    fd = wrapmod._lock_wrap_file(scratch.parent / "wrap.lock")
+    try:
+        assert ex.consolidate_store(scratch, mind=_Never(), occurrence_dir=occ).outcome == "lock-held"
+        assert ex.consolidate_store(scratch, mind=_Never(), occurrence_dir=fresh).outcome == "lock-held"
+    finally:
+        wrapmod._unlock_wrap(fd)
+    assert {p.name: p.read_bytes() for p in occ.iterdir()} == before
+    assert not fresh.exists()
+
+
+def test_C_a_child_mind_without_a_positive_max_seconds_is_refused(scratch, stub, tmp_path, monkeypatch, capsys):
+    from levain import cli
+
+    for bad in (None, 0, -5, float("nan"), float("inf")):
+        r = _run(scratch, tmp_path, _claude(stub), budget=_budget(), max_seconds=bad)
+        assert (r.outcome, r.exit_code) == ("precondition", 2), bad
+    assert stub.calls() == 0 and _store_state(scratch) == (None, 0, 3) and not (tmp_path / "occ").exists()
+    monkeypatch.setitem(ex.PRICE_TABLE, PINNED, TEST_ROW)
+    for flag in ("0", "-1"):
+        assert cli.main(["dream", "run", "--store-dir", str(scratch.parent), "--mind", "claude", "--model", PINNED,
+                         "--claude-bin", str(stub.bin), "--max-seconds", flag]) == 2
+        assert "--max-seconds must be a positive" in capsys.readouterr().err
+    assert stub.calls() == 0
+
+
+def test_D_a_budget_for_another_model_or_none_refuses_before_any_store_effect(scratch, stub, tmp_path):
+    snaps = []
+    other = ex.Budget.for_model("other-model", {"other-model": TEST_ROW})
+    r = _run(scratch, tmp_path, _claude(stub), budget=other, on_snapshot=lambda s, o: snaps.append(1))
+    assert (r.outcome, r.exit_code) == ("budget", 2) and "not the mind's" in r.detail
+    r = _run(scratch, tmp_path, _claude(stub), budget=None, on_snapshot=lambda s, o: snaps.append(1))
+    assert (r.outcome, r.exit_code) == ("budget", 2)
+    unpinned = ex.Budget(m_usd_micros=M)                          # a budget naming no model ties to no mind
+    assert _run(scratch, tmp_path, _claude(stub), budget=unpinned).outcome == "budget"
+    assert snaps == [] and stub.calls() == 0 and _store_state(scratch) == (None, 0, 3)
+    assert not (tmp_path / "occ").exists()
+
+
+def test_E_the_claude_child_runs_in_the_occurrence_dir(scratch, stub, tmp_path, monkeypatch):
+    spy = _PopenSpy(monkeypatch)
+    stub.result(1)
+    assert _run(scratch, tmp_path, _claude(stub), budget=_budget()).outcome == "saved"
+    (kw,) = spy.calls
+    assert kw["cwd"] == str(tmp_path / "occ") and kw["start_new_session"] is True
+    assert stub.argv(1)[stub.argv(1).index("--add-dir") + 1] == str(tmp_path / "occ")   # --add-dir kept
+
+
+def test_F_a_raising_lock_seam_is_typed_and_closes_the_store(scratch, tmp_path, monkeypatch):
+    closes = []
+    real_close = Store.close
+    monkeypatch.setattr(Store, "close", lambda self: (closes.append(1), real_close(self))[1])
+
+    def raiser():
+        raise PermissionError(13, "Permission denied")
+
+    r = ex.consolidate_store(scratch, mind=_Never(), acquire_lock=raiser, occurrence_dir=tmp_path / "occ")
+    assert (r.outcome, r.exit_code) == ("precondition", 2) and "PermissionError" in r.detail
+    assert closes and not (tmp_path / "occ").exists()
+
+
+def test_F_a_none_lock_handle_is_refused_where_fcntl_exists_unless_best_effort(scratch, tmp_path):
+    r = ex.consolidate_store(scratch, mind=_Never(), acquire_lock=lambda: None)
+    assert (r.outcome, r.exit_code) == ("precondition", 2) and "no lock handle" in r.detail
+    assert _store_state(scratch) == (None, 0, 3)
+    r = ex.consolidate_store(scratch, mind=_Never(), acquire_lock=lambda: None, require_lock=False, dry_run=True)
+    assert r.outcome == "dry-run"                                 # levain wrap's best-effort proceed is kept
+
+
+def test_F_check_on_copy_maps_an_open_failure_to_a_refusal_never_an_escape(scratch, monkeypatch):
+    import anneal_memory
+
+    from levain.firing.crystallization import CrystallizationRefused
+
+    def boom(*a, **k):
+        raise anneal_memory.AnnealMemoryError("copy unopenable")
+
+    monkeypatch.setattr(anneal_memory, "Store", boom)
+    got = ex.check_on_copy(scratch, _VALID, wrap_token="c" * 32, session_id=None, project_name="x")
+    assert got.startswith("the check could not open its scratch copy") and "copy unopenable" in got
+    monkeypatch.undo()
+
+    def refuse(crystal):
+        raise CrystallizationRefused("open")
+
+    monkeypatch.setattr(ex, "refuse_crystallization", refuse)
+    got = ex.check_on_copy(scratch, _VALID, wrap_token="c" * 32, session_id=None, project_name="x")
+    assert got.startswith("the check could not open") and "CrystallizationRefused" in got
+
+
+def test_G_a_leader_constructor_failure_still_kills_and_reaps_the_child(tmp_path, stub, monkeypatch):
+    import levain.firing.confinement as conf
+
+    spy = _PopenSpy(monkeypatch)
+    (stub.dir / "sleep-1").write_text("30")
+
+    def broken(proc):
+        raise OSError("kqueue: too many open files")
+
+    monkeypatch.setattr(conf, "_Leader", broken)
+    occ = tmp_path / "occ"
+    occ.mkdir()
+    with pytest.raises(OSError, match="kqueue"):
+        _claude(stub).compose(ex.ComposeRequest("p", "i", occ_dir=occ, cap_usd_micros=1_000_000, timeout_s=5))
+    (proc,) = spy.procs
+    assert proc.returncode is not None                            # reaped by us
+    with pytest.raises(ProcessLookupError):
+        os.killpg(proc.pid, 0)
+
+
+def test_G_an_unconfirmed_child_end_is_terminal_and_keeps_the_record(scratch, stub, tmp_path, monkeypatch):
+    spy = _PopenSpy(monkeypatch)
+    real_end = ex.end_child
+    held = []
+    monkeypatch.setattr(ex, "end_child", lambda leader, **k: (held.append(leader), False)[1])
+    stub.result(1, "## State\nx")
+    stub.result(2)
+    try:
+        r = _run(scratch, tmp_path, _claude(stub), budget=_budget())
+        assert (r.outcome, r.exit_code) == ("child-alive", 1) and stub.calls() == 1   # no second compose
+        rec = json.loads((tmp_path / "occ" / "progress.json").read_text())
+        assert rec["child_pid"] == spy.procs[0].pid and rec["child_argv"] and rec["child_started_at"]
+        assert _store_state(scratch) == (None, 0, 3)              # our wrap cancelled
+    finally:
+        for leader in held:
+            real_end(leader)
+
+
+def test_G_a_child_start_that_cannot_be_recorded_ends_the_child_and_fails_closed(scratch, stub, tmp_path,
+                                                                                monkeypatch):
+    spy = _PopenSpy(monkeypatch)
+    real = ex.Progress.update
+
+    def update(self, **v):
+        if v.get("child_pid") is not None:
+            self.data.update(v)
+            self.write_error = "OSError: read-only file system"
+            return False
+        return real(self, **v)
+
+    monkeypatch.setattr(ex.Progress, "update", update)
+    stub.result(1)
+    stub.result(2)
+    r = _run(scratch, tmp_path, _claude(stub), budget=_budget())
+    assert (r.outcome, r.exit_code) == ("failed", 1) and len(r.composes) == 1
+    assert "could not record the compose child" in r.detail
+    with pytest.raises(ProcessLookupError):
+        os.killpg(spy.procs[0].pid, 0)
+    assert _store_state(scratch) == (None, 0, 3)
+
+
+def test_I_the_dream_remedies_name_only_commands_that_exist_and_run(scratch, tmp_path, monkeypatch, capsys):
+    import shlex
+    import subprocess
+
+    monkeypatch.setattr(wrapmod, "_cancel_if_ours", lambda store, token: False)
+    r = ex.consolidate_store(scratch, mind=_Never(), dry_run=True)
+    out = capsys.readouterr().out
+    assert r.outcome == "failed" and "--reset" not in out and "levain wrap" not in out
+    line = next(ln.strip() for ln in out.splitlines() if "wrap-cancel" in ln)
+    assert line.endswith(f"wrap-cancel --wrap-token {r.wrap_token}")
+    monkeypatch.undo()
+    assert _store_state(scratch)[0] is not None                   # the wrap really was left open
+    done = subprocess.run(shlex.split(line), capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert _store_state(scratch)[0] is None                       # the printed command cleared it
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with Store(str(empty / "memory.db"), section_schema=FLOW_SCHEMA):
+        pass
+    assert ex.consolidate_store(empty / "memory.db", mind=_Never()).outcome == "empty"
+    out = capsys.readouterr().out
+    assert "levain run" not in out and "no episodes since its last wrap" in out
+    assert ex.WRAP_REMEDIES.cancel_failed == wrapmod._CANCEL_FAILED          # wrap keeps its own text
+
+    class Bad(_Never):
+        def compose(self, req):
+            return ex.ComposeResult(text="## State\nbroken")
+
+    assert ex.consolidate_store(scratch, mind=Bad(), max_composes=1).outcome == "refused"
+    out = capsys.readouterr().out
+    assert "a stronger --model may help" in out and "--composer" not in out   # dream run has --model
+
+
+def test_K_usage_tokens_are_none_not_zero_when_unreadable_on_the_dollar_route(scratch, stub, tmp_path):
+    stub.result(1)
+    doc = json.loads((stub.dir / "result-1.json").read_text())
+    del doc["usage"]
+    (stub.dir / "result-1.json").write_text(json.dumps(doc))
+    assert _run(scratch, tmp_path, _claude(stub), budget=_budget()).outcome == "saved"
+    use = json.loads((tmp_path / "occ" / "usage.json").read_text())
+    assert use["readable"] is True and use["actual_usd_micros"] == 1_500_000
+    assert use["input_tokens"] is None and use["output_tokens"] is None
