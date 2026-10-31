@@ -39,7 +39,7 @@ def _delay(pred: str, ms: int) -> str:
 @needs_browser
 def test_a_scrub_in_flight_says_loading_over_the_live_value_and_live_paused_only_over_the_value_that_is_t(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _delay("s.includes('at=')", 1200)}, {"eval": _scrub(0.5)}, SLEEP(300), {"eval": INFO},
+    out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _delay("s.includes('at=')", 1200)}, {"eval": _scrub(0.5)}, {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.startsWith('loading replay ')"}, {"eval": INFO},
                                {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')", "ms": 8000}, {"eval": INFO}])
     mid, done = json.loads(out[-3]), json.loads(out[-1])
     assert mid["badge"] and mid["badge"].startswith("loading replay ") and "live paused" not in mid["badge"] and "showing live" in mid["badge"], mid
@@ -52,7 +52,7 @@ def test_a_scrub_in_flight_says_loading_over_the_live_value_and_live_paused_only
 def test_a_second_scrub_keeps_the_first_frame_labelled_while_it_loads(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _scrub(0.3)}, {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')"},
-                               {"eval": INFO}, {"eval": _delay("s.includes('at=')", 1200)}, {"eval": _scrub(0.6)}, SLEEP(300), {"eval": INFO},
+                               {"eval": INFO}, {"eval": _delay("s.includes('at=')", 1200)}, {"eval": _scrub(0.6)}, {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.startsWith('loading replay ')"}, {"eval": INFO},
                                {"until": "(document.querySelector('#ck-hlens .tv-rbadge') || {textContent: ''}).textContent.includes('live paused')", "ms": 8000}, {"eval": INFO}])
     first, mid, last = json.loads(out[-7]), json.loads(out[-3]), json.loads(out[-1])
     assert mid["badge"].startswith("loading replay ") and "live paused" not in mid["badge"], mid
@@ -132,9 +132,13 @@ def test_leaving_for_the_memory_tab_stops_the_stream_loop_and_leaves_replay(tmp_
 @needs_browser
 def test_a_tab_switch_to_memory_drops_replay_and_the_topology_polls_again(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    refetch = "window.LevainCockpitView.refetchPanel('topology').then(r => String(r))"
+    # the tab switch starts a live read of its own; a refetch that lands while that one is out settles "superseded" by design, so the
+    # test's refetch asks again until a read settles it (at most 5 times) and the assertion is on that settled answer
+    refetch = ("(async () => { let r; for (let i = 0; i < 5; i++) { r = String(await window.LevainCockpitView.refetchPanel('topology')); "
+               "if (r !== 'superseded') break; } return r; })()")
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": "(window.__urls = [], 1)"},
-                               {"eval": "document.querySelector('[data-mode-tab=memory]').click(); 1"}, SLEEP(300), {"eval": INFO}, {"eval": refetch}, {"eval": INFO},
+                               {"eval": "document.querySelector('[data-mode-tab=memory]').click(); 1"},
+                               {"until": "!window.LevainTopologyView.replaying() && !window.LevainTopologyView.paused()"}, {"eval": INFO}, {"eval": refetch}, {"eval": INFO},
                                {"eval": "document.querySelector('[data-mode-tab=build]').click(); 1"}, {"until": STRIP}, SLEEP(300), {"eval": INFO}])
     after_tab, after_refetch, back = json.loads(out[-7]), json.loads(out[-5]), json.loads(out[-1])
     assert after_tab["replaying"] is False and after_tab["paused"] is False, after_tab
@@ -461,7 +465,8 @@ def test_a_scrub_that_supersedes_a_return_clears_the_returns_timer(tmp_path, mon
            "window.clearTimeout = (id) => { window.__clr.push(id); return c(id); }; return 1; })()")
     scrub2 = H_SCRUB.replace("0.4", "0.7") if "0.4" in H_SCRUB else H_SCRUB
     out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"}, {"eval": spy}, {"eval": H_LIVE}, SLEEP(100),
-                                            {"eval": scrub2}, SLEEP(300), {"eval": "JSON.stringify({set: window.__set, clr: window.__clr})"}])
+                                            {"eval": scrub2},
+                                            {"until": "window.__set.length > 0 && window.__clr.includes(window.__set[window.__set.length - 1])"}, {"eval": "JSON.stringify({set: window.__set, clr: window.__clr})"}])
     got = json.loads(out[-1])
     assert got["set"] and got["set"][-1] in got["clr"], got                  # the return's timer was cleared by the scrub, not left to fire into a dead token
 

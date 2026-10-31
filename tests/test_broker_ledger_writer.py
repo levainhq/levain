@@ -649,8 +649,12 @@ def test_adverse_order_flushed_but_unapplied_is_not_a_stall(tmp_path, monkeypatc
     or no stamp at all, this test faults (a_mutate.py, set `writer`)."""
     path = ledger_path(tmp_path)
     ctl = FlushCtl()
-    ctl.delay = 0.3
-    monkeypatch.setattr(L, "DURABLE_TIMEOUT_S", 0.5)
+    # the flush must return before the hold's timeout (its stamp is then set and its `_durable` is held back) and the stall
+    # check must find that stamp recent: a delay of 0.6 of the timeout does both with a wide margin, and the pair is scaled
+    # together so a slow runner stretches both and the ratio holds
+    timeout = scaled(1.0)
+    ctl.delay = 0.6 * timeout
+    monkeypatch.setattr(L, "DURABLE_TIMEOUT_S", timeout)
 
     async def main():
         led = await _opened(path, monkeypatch, ctl)
