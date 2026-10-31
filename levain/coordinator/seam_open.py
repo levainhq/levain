@@ -27,12 +27,15 @@ from levain.coordinator import lease as _leases
 from levain.coordinator.lease import Launch, Lease, LeaseRefused
 from levain.coordinator.store import GSEQ_TABLES, CoordError, CoordStore, _append_only, next_gseq
 
-__all__ = ["BODY_CAP", "DELIVERY_SURFACES", "LAUNCH_SIGNALS", "OPEN_SCHEMA", "OpenBuild", "SEAM_KINDS",
-           "SIGNAL_KINDS", "acked_cursor", "acked_cuts", "acknowledge", "active_coordinator_fence", "checked_text",
-           "open_tables_present", "record_arrival", "record_delivery", "stored_build"]
+__all__ = ["BODY_CAP", "DELIVERY_SURFACES", "LAUNCH_SIGNALS", "OPEN_SCHEMA", "OpenBuild", "READ_BACK_MAX",
+           "PREDECESSOR_HANDOFF_SEAMS", "SEAM_KINDS", "SIGNAL_KINDS", "acked_cursor", "acked_cuts", "acknowledge", "active_coordinator_fence",
+           "checked_text", "open_tables_present", "record_arrival", "record_delivery", "stored_build"]
 
 #: the seams an open is built for; ``light`` is an open with no handoff behind it
 SEAM_KINDS = ("rotation", "operator", "dream", "light")
+#: the seams whose open hands the reader a PREDECESSOR's handoff to restate (the ones whose ack carries a read-back);
+#: a ``light`` or ``operator`` build only mentions the latest handoff, whoever wrote it
+PREDECESSOR_HANDOFF_SEAMS = ("rotation", "dream")
 #: what fired a build; (signal_kind, signal_key) is unique, so one signal is one build
 SIGNAL_KINDS = ("launch", "away_off", "silence", "rotation", "dream")
 #: the signal kinds whose key is a launch id: only the starter's build (``seam_build.starter_build``) makes one
@@ -40,7 +43,9 @@ LAUNCH_SIGNALS = ("launch",)
 DELIVERY_SURFACES = ("launch_brief", "light_verb")
 #: the rendered brief, in bytes. Levain's own number, a guess until a coordinator has read a real one
 BODY_CAP = 65536
-_READ_BACK_MAX = 8192
+#: a read-back, in bytes (its column CHECK holds the same number)
+READ_BACK_MAX = 8192
+_READ_BACK_MAX = READ_BACK_MAX
 
 _SEAMS_SQL = ", ".join(repr(k) for k in SEAM_KINDS)
 _SIGNALS_SQL = ", ".join(repr(k) for k in SIGNAL_KINDS)
@@ -238,9 +243,14 @@ def acknowledge(store: CoordStore, open_id: Any, *, token: Any, read_back: Any =
         _held, launch = active_coordinator_fence(conn, now, token, "an acknowledgement")
         if not open_tables_present(conn):
             raise CoordError("this store holds no open builds")
-        built = conn.execute("SELECT seam_kind FROM open_builds WHERE open_id = ?", (open_id,)).fetchone()
+        built = conn.execute("SELECT seam_kind, handoff_id FROM open_builds WHERE open_id = ?", (open_id,)).fetchone()
         if built is None:
             raise CoordError(f"there is no open build {open_id}")
+        wrote = None if built[1] is None or built[0] not in PREDECESSOR_HANDOFF_SEAMS else conn.execute("SELECT writer FROM seam_handoffs WHERE handoff_id = ?",
+                                                           (built[1],)).fetchone()
+        if wrote is not None and wrote[0] == launch.session_key:
+            raise CoordError("a coordinator cannot acknowledge its own handoff (this launch wrote the handoff open "
+                             f"{open_id} was built from); nothing was written")
         recipients = [r[0] for r in conn.execute("SELECT DISTINCT recipient_launch_id FROM open_deliveries WHERE "
                                                  "open_id = ? ORDER BY recipient_launch_id", (open_id,))]
         if not recipients:
@@ -253,7 +263,7 @@ def acknowledge(store: CoordStore, open_id: Any, *, token: Any, read_back: Any =
         if conn.execute("SELECT 1 FROM open_acks WHERE open_id = ? AND reader_session = ?",
                         (open_id, launch.session_key)).fetchone() is not None:
             return open_id, launch.session_key, False
-        if built[0] in ("rotation", "dream") and not text.strip():
+        if built[0] in PREDECESSOR_HANDOFF_SEAMS and not text.strip():
             raise CoordError(f"a {built[0]} open is acknowledged with a read-back of the handoff; nothing was written")
         conn.execute("INSERT INTO open_acks (open_id, reader_session, read_back, acknowledged_at) VALUES (?, ?, ?, ?)",
                      (open_id, launch.session_key, text, now))

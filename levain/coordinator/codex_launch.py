@@ -495,6 +495,7 @@ def launch(store: CoordStore, ln: Any) -> Any:
             return fail(f"turn {turn_id} read back {str(status.get('type') or 'no status')[:60]} on thread {tid}, "
                         f"not active (a turn that ended before the read back, or never ran); {stop_ours()}")
         try:
+            cl.record_brief_delivery(store, launch_id)
             _active, refused = store.launch_activate(launch_id, harness_session_id=tid, argv_sha256=argv_sha)
         except LeaseRefused as exc:
             return fail(f"activation refused ({exc}); {stop_ours()}")

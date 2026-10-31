@@ -26,6 +26,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from levain import unshowable
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.contracts.canon import canonical
 from levain.coordinator import seam_classes
@@ -33,7 +34,7 @@ from levain.coordinator.seam_open import active_coordinator_fence
 from levain.coordinator.store import CoordError, CoordStore, StoreAbsent, _append_only, next_gseq
 
 __all__ = ["BODY_KEYS", "KINDS", "LIST_MAX", "MAX_BODY_BYTES", "SEAM_HANDOFF_SCHEMA", "SeamHandoff", "close",
-           "latest"]
+           "get", "latest"]
 
 #: a handoff is written at these seams; ``light`` is an open with no handoff, never a row
 KINDS = ("rotation", "operator", "dream")
@@ -99,6 +100,23 @@ def _row(r: Any) -> SeamHandoff | None:
     return None if r is None else SeamHandoff(*r)
 
 
+def get(store: CoordStore, handoff_id: int) -> SeamHandoff | None:
+    """The handoff with this id, or None: :func:`latest`'s read, by id."""
+    from levain.coordinator.ready import _absent
+
+    try:
+        with read_transaction(store.open_readonly) as conn:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'seam_handoffs'").fetchone() \
+                    is None:
+                return None
+            return _row(conn.execute(f"SELECT {_COLUMNS} FROM seam_handoffs WHERE handoff_id = ?",
+                                     (handoff_id,)).fetchone())
+    except StoreAbsent:
+        if _absent(store):
+            return None
+        raise
+
+
 def latest(store: CoordStore) -> SeamHandoff | None:
     """The newest handoff, or None. A read on :meth:`CoordStore.open_readonly` (``mode=ro``, ``query_only``, no write
     lock, no lease): it makes and migrates nothing. None when there is no store (no directory or no file) and when the
@@ -124,6 +142,16 @@ def _text(name: str, value: Any, *, empty: bool) -> str:
         raise CoordError(f"{name} is {'text' if empty else 'non-empty text'}")
     if "\x00" in value:       # SQLite's length() ends a string at a NUL: the triggers would read a different text
         raise CoordError(f"{name} holds a NUL character")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:      # a lone surrogate: the one refusal whatever field holds it
+        raise CoordError("a handoff body is text that encodes as UTF-8 (a lone surrogate does not)") from None
+    # each field is one line of the next coordinator's brief: a newline, a C0 or C1 control or a Unicode line
+    # separator would let it start a line of its own
+    bad = unshowable.describe(value)
+    if bad is not None:
+        raise CoordError(f"{name} holds {bad}: each handoff field is one line of shown text (a newline, a control "
+                         "or a line separator is refused); nothing was written")
     return value
 
 

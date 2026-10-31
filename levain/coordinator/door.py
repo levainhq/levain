@@ -53,6 +53,8 @@ DOOR: frozenset[tuple[str, ...]] = frozenset({
     ("coord", "reply"),
     # the display-only list a work delta's "+N more" line points at; it makes nothing
     ("coord", "log"),
+    # the seam (C15 S3): its open and the acknowledgement of it, the handoff it leaves, and reading one back
+    ("coord", "open"), ("coord", "close"), ("coord", "handoff", "show"),
     ("drops", "list"), ("drops", "show"), ("drops", "split"), ("drops", "note"),
     ("thread", "list"), ("thread", "show"), ("thread", "state"), ("thread", "merge"), ("thread", "detach"),
     ("thread", "add"), ("thread", "set"),
