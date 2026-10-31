@@ -200,6 +200,11 @@ def _check_row(column_name: Any, digest: str, version: Any, text: Any) -> dict[s
     and is that role's canonical text, and it names the row's name column. Raise :class:`RoleError` otherwise."""
     if not isinstance(text, str):
         raise RoleError(f"role {column_name!r} v{version}: the stored spec is a {type(text).__name__}, not text")
+    try:
+        _version(version)
+    except RoleError:
+        raise RoleError(f"role {column_name!r}: the stored version {version!r} is not an integer from 1 to "
+                        f"{MAX_VERSION}") from None
     role = parse_role_text(text)
     if role_hash(role) != digest or _canonical(role) != text:
         raise RoleError(f"role {column_name!r} v{version}: the stored text does not hash to its role_hash")

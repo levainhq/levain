@@ -83,6 +83,8 @@ def derived_flags(role: Mapping[str, Any]) -> dict[str, bool]:
 def all_spelling(value: Any) -> bool:
     """True when one non-blank ceiling entry says "all": a word for it, or only wildcard and root characters after
     collapsing runs of ``*`` and stripping trailing slashes and dots, optionally behind a home or drive root."""
+    if not str(value).strip():
+        return False   # a blank entry is its own refusal (see _says_all), not a spelling of "all"
     text = re.sub(r"\*+", "*", str(value).strip().casefold()).rstrip("/\\.")
     if text in _ALL_WORDS:
         return True

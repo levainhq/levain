@@ -192,8 +192,6 @@ def _fail(verb: str, exc: Exception) -> int:
     return 1
 
 
-
-
 def _specs_from(doc):
     if isinstance(doc, dict):
         return [doc]

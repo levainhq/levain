@@ -460,6 +460,27 @@ def test_a_tampered_role_row_is_refused_like_role_show_refuses_it(store, tmp_pat
     assert stored_specs(store) == {}
 
 
+def test_a_role_row_with_a_tampered_version_is_refused(store, tmp_path, capsys):
+    spec = row(store, "job_sync_check")
+    with store.write() as conn:
+        for (t,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'agent_roles'"
+                                 ).fetchall():
+            conn.execute(f'DROP TRIGGER "{t}"')
+        conn.execute("UPDATE agent_roles SET version = 'x' WHERE role_hash = ?", (spec["role"]["role_hash"],))
+    f = tmp_path / "s.json"
+    f.write_text(json.dumps(spec))
+    assert main(["agents", "--store-dir", str(store.directory), "register", "--from", str(f)]) == 1
+    out = capsys.readouterr().out
+    assert "rule 3: the store's role row is refused" in out and "stored version 'x'" in out
+    assert stored_specs(store) == {}
+
+
+def test_a_blank_entry_is_not_a_spelling_of_all():
+    from levain.agents.refuse import all_spelling, ceiling_problem
+    assert all_spelling("") is False and all_spelling("   ") is False
+    assert "has an empty entry" in ceiling_problem({"lands": ["local data"], "pushes": [" "]})
+
+
 @pytest.mark.parametrize("patch,needle", [
     (lambda r: r.update(review=None), "review is a NoneType"),
     (lambda r: r["review"].pop("calls_model"), "review.calls_model"),

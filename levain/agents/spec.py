@@ -37,6 +37,10 @@ Known edges (not built):
   either wrote; one operator's CLI does not run two at once, so this is not reachable in real use.
 - on a console that cannot encode the verdict text (non-UTF-8), ``register`` raises UnicodeEncodeError after the
   transaction has committed: the specs are registered though the exit code says otherwise.
+- the lifecycle verbs read every live row through the full row check, so one corrupt live row refuses pause, resume
+  and retire for every agent (a loud refusal naming the row, never a guess about which group it belonged to).
+- a row written before names of the agent-id shape were refused, or before zones were stored in their canonical
+  spelling, fails the row check when read. No such row exists outside a pre-release build of this registry.
 """
 from __future__ import annotations
 
