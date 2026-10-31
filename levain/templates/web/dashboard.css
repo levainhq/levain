@@ -2902,6 +2902,8 @@ body.ke .ck-drop .drop-none { margin: var(--sp-3) 0 0; }
 body.ke .ck-drop .drop-recent-row { padding: var(--sp-3) 0; border-top: 1px solid var(--hair); min-width: 0; }
 body.ke .ck-drop .drop-list > .drop-recent-row:first-child { border-top: 0; padding-top: 0; }
 body.ke .ck-drop .drop-recent-row.drop-mine { border-left: 2px solid var(--accent); padding-left: var(--sp-4); }
+body.ke .ck-drop .drop-older-note { margin: var(--sp-3) 0 0; }
+body.ke .ck-drop .drop-older-note[hidden] { display: none; }
 body.ke .ck-drop .drop-sub { margin: 0 0 var(--sp-3); }
 body.ke .ck-drop .drop-list { max-height: 60vh; overflow: auto; overscroll-behavior: contain; min-width: 0; }
 body.ke .ck-drop .drop-live { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
@@ -2929,4 +2931,4 @@ body.ke .ck-drop .drop-more { align-self: flex-start; margin-top: var(--sp-3); }
   body.ke .ck-drop .drop-actions .needs-btn { flex: 1 1 0; }
 }
 /* the drop sheet's list of his drops grows with his history: it scrolls inside the sheet */
-#drop-recent { max-height: 40vh; overflow: auto; }
+body.ke #drop-recent { max-height: 40vh; overflow: auto; }

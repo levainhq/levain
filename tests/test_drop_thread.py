@@ -22,7 +22,7 @@ DESK_ROWS = [
 PANEL_ID = "desk-thread"
 
 
-def _init(rows, *, drops=DROPS, panel=True, panel_error=None) -> str:
+def _init(rows, *, drops=DROPS, panel=True, panel_error=None, ke=True) -> str:
     """An init script: the manifest gains the desk panel in a zone of its own, the Work zone, and the widgets; its payload and the
     drops read are answered here."""
     head = {"id": PANEL_ID, "kind": "list", "title": "Desk thread", "priority": "normal", "rank": 5, "status": "ok", "count": len(rows),
@@ -35,12 +35,13 @@ def _init(rows, *, drops=DROPS, panel=True, panel_error=None) -> str:
     return ("(() => { const f = window.fetch; const J = (o) => new Response(JSON.stringify(o), {status: 200, headers: {'Content-Type': 'application/json'}});"
             f" const PID = {json.dumps(PANEL_ID)}, HEAD = {json.dumps(head)}, PANEL = {json.dumps(panel)}; window.__body = {json.dumps(body)}; window.__drops = {json.dumps(drops)};"
             " window.fetch = function (u, o) { const url = typeof u === 'string' ? u : (u && u.url) || '';"
-            " if (url.indexOf('/cockpit/coord/drops.json') >= 0) return Promise.resolve(window.__fail ? new Response('{}', {status: 500}) : J(window.__drops));"
+            " if (url.indexOf('/cockpit/coord/drops.json') >= 0) return Promise.resolve(window.__fail ? new Response('{}', {status: window.__fail === true ? 500 : window.__fail}) : J(window.__drops));"
             " if (PANEL && url.indexOf('/cockpit/panel/' + PID + '.json') >= 0) return Promise.resolve(J(window.__body));"
             " if (PANEL && url.indexOf('/cockpit/manifest.json') >= 0) return f.apply(this, arguments).then((r) => r.json()).then((m) => {"
             "  m.panels[PID] = HEAD; const R = m.regions; R.widgets.push(PID); R.header.push(PID);"
             "  const op = R.zones.find((z) => z.id === 'operate'); op.panels.push(PID); op.cards.push({panels: [PID], size: 'medium', span: 1, tabs: null});"
             "  R.zones.push({id: 'deskonly', title: 'Desk only', grid: 3, panels: [PID], cards: [{panels: [PID], size: 'medium', span: 1, tabs: null}]});"
+            f"  if (!{json.dumps(ke)}) m.regions.hero = null;"
             "  return J(m); });"
             " return f.apply(this, arguments); }; })();")
 
@@ -303,3 +304,130 @@ def test_at_390_a_long_unbroken_source_name_wraps_without_a_sideways_scroll(tmp_
     (state,) = _all(_run(tmp_path, monkeypatch, steps))
     assert next(r for r in state["rows"] if r["key"] == "desk:r-w")["who"] == "W" * 40
     assert state["over"] is False, state
+
+
+def _keys() -> str:
+    return ("JSON.stringify({t: 'thread', rows: [...document.querySelectorAll('#ck-drop .drop-recent-row')].map(r => ({key: r.dataset.dropKey, id: r.dataset.dropId || null,"
+            " open: r.querySelector('.drop-row-head').getAttribute('aria-expanded'), when: r.querySelector('.drop-when').textContent})),"
+            " note: document.querySelector('#ck-drop .drop-note').textContent, older: !(document.querySelector('#ck-drop .drop-older-note') || {hidden: true}).hidden,"
+            " filterShown: !document.querySelector('#ck-drop .drop-filter').hidden, filterValue: document.querySelector('#ck-drop .drop-filter').value,"
+            " none: !!document.querySelector('#ck-drop .drop-none'), live: document.querySelector('#ck-drop .drop-live').textContent,"
+            " panelNodes: document.querySelectorAll('[data-ck-panel=\"desk-thread\"]').length})")
+
+
+def _set_q(q: str) -> dict:
+    return {"eval": f"(() => {{ const q = document.querySelector('#ck-drop .drop-filter'); q.value = {json.dumps(q)}; q.dispatchEvent(new Event('input', {{bubbles: true}})); return 1; }})()"}
+
+
+@needs_browser
+@needs_ssh
+def test_a_refused_token_clears_the_thread_but_a_transient_failure_keeps_it(tmp_path: Path, monkeypatch) -> None:
+    steps = _boot(_init(DESK_ROWS), [{"eval": _keys()},
+                                      {"eval": "window.__fail = 500; 1"}, REDRAW, SETTLE2, {"eval": _keys()},          # a server fault: the last read stays
+                                      {"eval": "window.__fail = 403; 1"}, REDRAW, SETTLE2, {"eval": _keys()}])        # a refused token: nothing stays
+    first, transient, refused = _all(_run(tmp_path / "a", monkeypatch, steps))
+    assert len(first["rows"]) == 4 and len(transient["rows"]) == 4 and "last read" in transient["note"], transient
+    assert refused["rows"] == [] and "last read" not in refused["note"] and "Sign in" in refused["note"], refused
+    gone = "(() => { window.LevainCockpitTransport.headers = () => ({}); return 1; })()"
+    steps = _boot(_init(DESK_ROWS), [{"eval": gone}, REDRAW, SETTLE2, {"eval": _keys()}])        # no token at all
+    (nothing,) = _all(_run(tmp_path / "b", monkeypatch, steps))
+    assert nothing["rows"] == [] and "no cockpit token" in nothing["note"], nothing
+
+
+@needs_browser
+@needs_ssh
+def test_the_card_says_when_older_drops_are_not_in_the_read(tmp_path: Path, monkeypatch) -> None:
+    for name, drops, want in (("more", {**DROPS, "coord_drops_more": True}, True), ("all", DROPS, False)):
+        steps = _boot(_init(DESK_ROWS, drops=drops), [{"eval": _keys()}])
+        (got,) = _all(_run(tmp_path / name, monkeypatch, steps))
+        assert got["older"] is want, (name, got)
+
+
+@needs_browser
+@needs_ssh
+def test_a_manifest_that_is_not_the_ke_page_still_draws_the_desk_thread_panel(tmp_path: Path, monkeypatch) -> None:
+    # no KE regions, so no Needs row and no drop card to wait for: the page is settled once the page has drawn its panels
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"init": _init(DESK_ROWS, ke=False)}, {"until": "document.querySelectorAll('.panel').length > 0", "ms": 30000}, SETTLE,
+             {"eval": "JSON.stringify({t: 'thread', panelNodes: document.querySelectorAll('[data-panel-id=\"desk-thread\"]').length, ke: document.body.classList.contains('ke')})"}]
+    (got,) = _all(_run(tmp_path, monkeypatch, steps))
+    assert got["ke"] is False and got["panelNodes"] >= 1, got
+
+
+@needs_browser
+@needs_ssh
+def test_two_identical_replies_keep_their_keys_and_open_state_when_another_row_arrives(tmp_path: Path, monkeypatch) -> None:
+    twin = {"title": "same words", "body": "same words", "facets": {"at": "2026-10-30T10:00:00Z", "source": "desk"}}
+    drops = {**DROPS, "coord_drops": [*DROPS["coord_drops"], {"drop_id": "dup", "words": "dup one", "sent_at": "2026-10-30T09:00:00.000000Z", "receipts": []},
+                                       {"drop_id": "dup", "words": "dup two", "sent_at": "2026-10-30T09:01:00.000000Z", "receipts": []}]}
+    steps = _boot(_init([twin, dict(twin)], drops=drops), [{"eval": _keys()}])
+    (first,) = _all(_run(tmp_path / "a", monkeypatch, steps))
+    twins = [r["key"] for r in first["rows"] if r["key"].startswith("desk:")]
+    assert len(set(twins)) == 2 and twins[1] == twins[0] + "#2", first["rows"]
+    assert [r["id"] for r in first["rows"] if r["key"].startswith("drop:dup")] == ["dup", "dup"], first["rows"]       # the real id, never a suffixed one
+    steps = _boot(_init([twin, dict(twin)], drops=drops), [_click(twins[1]), {"eval": _more_drop("d3", "newer", "2026-10-30T13:00:00.000000Z")}, REDRAW, SETTLE2, {"eval": _keys()}])
+    (after,) = _all(_run(tmp_path / "b", monkeypatch, steps))
+    row = next(r for r in after["rows"] if r["key"] == twins[1])
+    assert row["open"] == "true" and after["rows"][0]["key"] == "drop:d3" and after["live"] == "", after
+
+
+@needs_browser
+@needs_ssh
+def test_a_filter_cannot_stay_set_while_its_box_is_hidden(tmp_path: Path, monkeypatch) -> None:
+    one = {**DROPS, "coord_drops": DROPS["coord_drops"][:1]}
+    steps = _boot(_init(DESK_ROWS), [_set_q("zzz-no-match"), {"eval": _keys()},
+                                      {"eval": f"window.__drops = {json.dumps(one)}; window.__body.rows = []; 1"}, REDRAW, SETTLE2, {"eval": _keys()}])
+    set_, after = _all(_run(tmp_path, monkeypatch, steps))
+    assert set_["filterShown"] and set_["none"] and set_["rows"] == [], set_
+    assert not after["filterShown"] and after["filterValue"] == "" and [r["key"] for r in after["rows"]] == ["drop:d1"] and not after["none"], after
+
+
+@needs_browser
+@needs_ssh
+def test_a_rebuild_keeps_the_lists_scroll_position(tmp_path: Path, monkeypatch) -> None:
+    probe = "JSON.stringify({t: 'thread', rows: [], top: document.querySelector('#ck-drop .drop-list').scrollTop})"
+    add = {"eval": "window.__body.rows.push({id: 'r-late', title: 'late', body: 'late', facets: {at: '2026-10-31T09:00:00Z', source: 'desk'}}); window.__body.count += 1; 1"}
+    steps = _boot(_init(_many(40)), [{"eval": "document.querySelector('#ck-drop .drop-more').click(); document.querySelector('#ck-drop .drop-list').scrollTop = 240; 1"}, {"eval": probe},
+                                      add, REDRAW, SETTLE2, {"eval": probe}, {"eval": _keys()}])
+    before, after, keys = _all(_run(tmp_path, monkeypatch, steps))
+    assert before["top"] > 100 and keys["rows"][0]["key"] == "desk:r-late", (before, keys["rows"][:1])       # the rows really were rebuilt
+    assert after["top"] == before["top"], (before, after)
+
+
+@needs_browser
+@needs_ssh
+def test_the_filter_finds_a_row_by_its_receipt_stage_and_its_time_words(tmp_path: Path, monkeypatch) -> None:
+    steps = _boot(_init(DESK_ROWS), [_set_q("landed"), {"eval": _keys()}])
+    (got,) = _all(_run(tmp_path, monkeypatch, steps))
+    assert [r["key"] for r in got["rows"]] == ["drop:d2"], got
+
+
+@needs_browser
+@needs_ssh
+def test_today_becomes_yesterday_after_midnight_without_any_new_data(tmp_path: Path, monkeypatch) -> None:
+    now = {"eval": ("window.__drops = Object.assign({}, window.__drops, {coord_drops: window.__drops.coord_drops.concat([{drop_id: 'dnow', words: 'just now', "
+                    "sent_at: new Date().toISOString(), receipts: []}])}); 1")}
+    day = {"eval": "(() => { const n = Date.now; Date.now = () => n() + 86400000; return 1; })()"}
+    steps = _boot(_init(DESK_ROWS), [now, REDRAW, SETTLE2, {"eval": _keys()}, day, REDRAW, SETTLE2, {"eval": _keys()}])
+    before, after = _all(_run(tmp_path, monkeypatch, steps))
+    pick = lambda g: next(r["when"] for r in g["rows"] if r["key"] == "drop:dnow")
+    assert pick(before).startswith("today") and pick(after).startswith("yesterday"), (pick(before), pick(after))
+
+
+@needs_browser
+@needs_ssh
+def test_a_desk_row_with_no_text_is_skipped_and_the_others_still_show(tmp_path: Path, monkeypatch) -> None:
+    blank = {"id": "r-blank", "title": "", "body": "", "facets": {"at": "2026-10-30T12:40:00Z", "source": "desk"}}
+    steps = _boot(_init([*DESK_ROWS, blank]), [{"eval": _keys()}])
+    (got,) = _all(_run(tmp_path, monkeypatch, steps))
+    assert [r["key"] for r in got["rows"]] == ["drop:d2", "desk:r-short", "desk:r-long", "drop:d1"], got
+
+
+def test_the_sheet_scroll_cap_is_scoped_to_the_page_it_belongs_to_and_the_announcement_timer_is_single() -> None:
+    root = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
+    css = (root / "dashboard.css").read_text()
+    lines = [ln for ln in css.splitlines() if "#drop-recent" in ln]
+    assert lines and all(ln.startswith("body.ke #drop-recent") for ln in lines), lines
+    media = css[css.index("@media (max-width: 720px) {\n  body.ke .ck-drop.frame"):]
+    assert "#drop-recent" not in media.split("}\n", 3)[0]      # the phone query does not restate it
+    core = (root / "dashboard_core.js").read_text()
+    assert "clearTimeout(ui.liveTid)" in core

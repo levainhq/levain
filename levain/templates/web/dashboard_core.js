@@ -366,7 +366,6 @@
     if (view.ke) renderKe(view, board);
     let lastZone = null;
     for (const entry of view.ke ? [] : layout) {
-      if (entry.id === DROP_THREAD_PANEL) continue;   // drawn inside the drop card, never as its own panel
       // In the "All" view, drop a zone separator before each zone's first panel.
       if (entry.zone !== lastZone) {
         const lbl = (ZONE_LABELS.find((z) => z[0] === entry.zone) || [entry.zone, entry.zone])[1];
@@ -6804,7 +6803,7 @@
     const got = consentQueued(() => fetchBounded("/cockpit/coord/drops.json", { cache: "no-store", headers: headers },
       (res) => {
         if (res.status === 404) return { why: "This cockpit has no coordinator store to send to (no signing is set up here)." };
-        if (res.status === 403) return { why: "Sign in to send: this cockpit refused this browser's token." };
+        if (res.status === 401 || res.status === 403) return { why: "Sign in to send: this cockpit refused this browser's token.", auth: true };
         if (!res.ok) return { why: "The coordinator could not be read (HTTP " + res.status + ")." };
         return res.json().then((b) => (b && Array.isArray(b.coord_drops) ? { body: b } : { why: "The coordinator's answer was not a drop list." }),
                                () => ({ why: "The coordinator's answer could not be read." }));
@@ -6853,7 +6852,7 @@
     const words = dropText(d.words);
     const stages = Array.isArray(d.receipts) ? d.receipts.map((r) => r && r.stage).filter((x) => typeof x === "string") : [];
     const how = d.envelope_id ? "signed" : d.envelope_refused ? "envelope not taken" : "unsigned";
-    return { key: "drop:" + dropText(d.drop_id), mine: true, who: "you", at: dropInstant(d.sent_at), iso: dropText(d.sent_at),
+    return { key: "drop:" + dropText(d.drop_id), dropId: dropText(d.drop_id), mine: true, who: "you", at: dropInstant(d.sent_at), iso: dropText(d.sent_at),
              preview: dropPreview(words), full: words, meta: how + " · " + (stages.join(", ") || "no receipt yet") };
   }
   // one thread item from one of the desk panel's lines (cockpit_view.js keeps the row's own title, body, instant and source on it)
@@ -6861,6 +6860,7 @@
     if (!l || typeof l !== "object") return null;
     const t = l.thread && typeof l.thread === "object" ? l.thread : {};      // the mapper sets it on every line of this panel
     const full = dropText(t.body) || dropText(t.title);
+    if (!full) return null;      // nothing to read: skipped, never a blank row
     const prev = dropText(t.title) || full;
     const src = dropText(t.source).trim();
     // a row an older send of his own filed through the desk's thread is his, whatever case or detail its source carries
@@ -6878,15 +6878,16 @@
       if (panel.error) fault = String(panel.error);
       else (Array.isArray(panel.lines) ? panel.lines : []).forEach((l) => { try { const it = deskItem(l); if (it) items.push(it); } catch (e) { /* skipped */ } });
     }
-    const seen = new Set();
-    const uniq = items.filter((it) => { if (seen.has(it.key)) { it.key += "#" + seen.size; } seen.add(it.key); return true; });
-    return { fault: fault, seen: !!panel && typeof panel === "object" && !panel.error, items: uniq.map((it, i) => [it, i]).sort((a, b) => ((b[0].at === null ? -Infinity : b[0].at) - (a[0].at === null ? -Infinity : a[0].at)) || (a[1] - b[1])).map((x) => x[0]) };
+    // a repeated key is numbered by its own occurrence among rows of that key, so another row arriving never renumbers it
+    const count = new Map();
+    for (const it of items) { const n = (count.get(it.key) || 0) + 1; count.set(it.key, n); if (n > 1) it.key += "#" + n; }
+    return { fault: fault, seen: !!panel && typeof panel === "object" && !panel.error, items: items.map((it, i) => [it, i]).sort((a, b) => ((b[0].at === null ? -Infinity : b[0].at) - (a[0].at === null ? -Infinity : a[0].at)) || (a[1] - b[1])).map((x) => x[0]) };
   }
   let dropRowSeq = 0;
   function dropRow(it, ui) {
     const row = el("div", "drop-recent-row" + (it.mine ? " drop-mine" : " drop-desk"));
     row.dataset.dropKey = it.key;
-    if (it.key.indexOf("drop:") === 0) row.dataset.dropId = it.key.slice(5);
+    if (it.dropId) row.dataset.dropId = it.dropId;      // the real drop id, whatever suffix the row's key carries
     const head = el("button", "drop-row-head");
     head.type = "button";
     head.dataset.dropKey = it.key;
@@ -6950,6 +6951,8 @@
     ui.filter.hidden = true;
     ui.list = el("div", "drop-list");
     ui.moreHost = el("div", "drop-more-host");
+    ui.olderNote = el("p", "drop-older-note ext-meta", "Older drops are not shown here.");      // the listing reads a bounded number of the newest
+    ui.olderNote.hidden = true;
     ui.sub = el("p", "drop-sub ext-meta", "Your drops and the coordinator's replies");
     ui.live = el("p", "drop-live");      // announces a new reply; never holds anything else
     ui.live.setAttribute("role", "status");
@@ -6959,7 +6962,7 @@
     ui.more.hidden = true;
     ui.more.addEventListener("click", () => { ui.shown = !ui.shown; dropThreadDraw(host); });
     ui.moreHost.appendChild(ui.more);
-    ui.recent.append(ui.sub, ui.fault, ui.filter, ui.list, ui.moreHost, ui.live);
+    ui.recent.append(ui.sub, ui.fault, ui.filter, ui.list, ui.olderNote, ui.moreHost, ui.live);
     ui.filter.addEventListener("input", () => { ui.q = ui.filter.value; dropThreadDraw(host); });
     const main = el("div", "drop-main");      // the composer is one left-column element, so the card's grid has two children whatever the list's length
     main.append(head, words, acts, ui.receipt, ui.earlier);
@@ -7066,8 +7069,10 @@
     ui.say.classList.toggle("bad", !ui.can);
     ui.send.disabled = ui.env.disabled = ui.words.disabled = ui.working || !ui.can;
     host.classList.toggle("drop-off", !ui.can);
-    // a read that failed (or read no store) leaves the rows already drawn; the note above says why
-    if (body && ui.storeRead) ui.drops = body.coord_drops;
+    // A transient failure (network, 5xx, no store read) leaves the rows already drawn; the note above says why. A refused or
+    // missing token leaves nothing of the thread: neither his drops nor the desk's cached rows outlive the authority to read them.
+    if (!body && r && r.auth) { ui.drops = []; ui.older = false; ui.denied = true; }
+    else if (body && ui.storeRead) { ui.drops = Array.isArray(body.coord_drops) ? body.coord_drops : []; ui.older = body.coord_drops_more === true; ui.denied = false; }
     else if (ui.drops.length) { ui.say.textContent += " Showing the drops last read."; }
     ui.read = r;
     dropThreadDraw(host);
@@ -7076,20 +7081,27 @@
   // composer is never touched. A redraw that would change nothing leaves the DOM alone, so selected text stays selected.
   function dropThreadDraw(host) {
     const ui = host._drop;
-    const t = dropThread(ui.drops, ui.view);
+    const t = dropThread(ui.drops, ui.denied ? null : ui.view);
+    // a filter is only ever set while its box can be seen: with the box hidden it could not be cleared
+    if (t.items.length < 2 && ui.q) { ui.q = ""; ui.filter.value = ""; }
     const q = ui.q.trim().toLowerCase();
-    const hit = (it) => (it.who + "\n" + it.preview + "\n" + it.full).toLowerCase().indexOf(q) >= 0;
+    const now = Date.now();
+    const hit = (it) => (it.who + "\n" + it.preview + "\n" + it.full + "\n" + it.meta + "\n" + dropWhenOf(it.at, now) + "\n" + dropSentOf(it.at)).toLowerCase().indexOf(q) >= 0;
     const rows = q ? t.items.filter(hit) : t.items;
     const shown = ui.shown || q ? rows : rows.slice(0, DROP_RECENT_SHOWN);
     announceDesk(ui, t);
-    const sig = JSON.stringify([t.fault, ui.shown, q, t.items.length > 1, shown.map((it) => [it.key, it.at, it.who, it.preview, it.full, it.meta]), rows.length]);
+    const today = new Date(now);      // the day is in the signature: "today" and "yesterday" change words at midnight
+    const sig = JSON.stringify([today.getFullYear() + "-" + dropZ(today.getMonth() + 1) + "-" + dropZ(today.getDate()), ui.older === true, t.fault, ui.shown, q, t.items.length > 1, shown.map((it) => [it.key, it.at, it.who, it.preview, it.full, it.meta]), rows.length]);
     if (sig === ui.sig) return;
     ui.sig = sig;
     const key = document.activeElement && ui.list.contains(document.activeElement) ? document.activeElement.dataset.dropKey : null;
     ui.fault.textContent = t.fault ? "The desk's replies could not be read: " + t.fault : "";
     ui.fault.hidden = !t.fault;
     ui.filter.hidden = t.items.length < 2;
+    const scrolled = ui.list.scrollTop;      // a rebuild must not send him back to the top of what he is reading
     ui.list.replaceChildren(...shown.map((it) => dropRow(it, ui)));
+    ui.list.scrollTop = scrolled;
+    ui.olderNote.hidden = ui.older !== true;
     if (q && !rows.length) ui.list.appendChild(el("p", "drop-none ext-meta", "nothing in the thread matches"));
     ui.more.hidden = !(!q && rows.length > DROP_RECENT_SHOWN);
     ui.more.textContent = ui.shown ? "show fewer" : "show " + (rows.length - DROP_RECENT_SHOWN) + " more";
@@ -7110,13 +7122,14 @@
     ui.seen = new Set([...(ui.seen || []), ...keys]);
     if (!fresh.length) return;
     ui.live.textContent = "";
-    setTimeout(() => { ui.live.textContent = "The coordinator replied."; }, 30);      // emptied first, so a second reply is spoken again
+    if (ui.liveTid) clearTimeout(ui.liveTid);      // one pending announcement at a time
+    ui.liveTid = setTimeout(() => { ui.live.textContent = "The coordinator replied."; }, 30);      // emptied first, so a second reply is spoken again
   }
   function dropRefresh(host, fresh) {
     const t = window.LevainCockpitTransport;
     const headers = t && typeof t.headers === "function" ? t.headers() : {};
     if (!headers["X-Levain-Write-Token"]) {
-      dropHeroDraw(host, { why: "Sign in to send: this browser holds no cockpit token." });
+      dropHeroDraw(host, { why: "Sign in to send: this browser holds no cockpit token.", auth: true });
       return Promise.resolve();
     }
     const mine = ++dropSeq;
