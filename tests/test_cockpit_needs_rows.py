@@ -64,7 +64,7 @@ def test_every_row_is_one_height_and_holds_no_answer_control(tmp_path: Path, mon
 def test_the_focus_view_draws_the_long_item_whole_and_decides_there(tmp_path: Path, monkeypatch) -> None:
     _file(tmp_path, monkeypatch)
     _root, src, _ids = _install(tmp_path)
-    open_long = (f"(() => {{ const r = {ROWS}.find(x => /rec b/.test(x.textContent)); r.click(); return 1; }})()")
+    open_long = (f"(() => {{ if (document.querySelector('#levain-modal .needs-question')) return 1; const r = {ROWS}.find(x => /rec b/.test(x.textContent)); r.click(); return 1; }})()")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         vals = _drive(tmp_path, f"{url}/#write_token=T", [{"emulate": SIZES[0][1]}, {"until": READY, "ms": 20000},
             # the open is retried with its assertion: a click on a row a repaint replaced (or one not drawn yet) opens nothing
