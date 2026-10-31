@@ -378,3 +378,218 @@ def test_the_recover_verb_prints_the_ending_and_returns_nonzero_only_when_nothin
     (occ(scratch, "o2") / "progress.json").write_text("{bad")
     ns.occurrence = "o2"
     assert dcli.run_dream_recover(ns) == 1
+
+
+# =========================================================================== L3 r1 fixes (fix2): one test per finding
+
+def _spawn_leader(argv, tmp_path):
+    """A child that leads its own group, reaped in a thread so a dead one is gone, not a zombie."""
+    import threading
+    p = subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    threading.Thread(target=p.wait, daemon=True).start()
+    time.sleep(0.4)
+    return p
+
+
+def _record_child(db, name, p, argv):
+    from levain.consent.delivery import process_identity
+    ident = process_identity(p.pid)
+    occ(db, name).mkdir(parents=True, exist_ok=True)
+    pf = occ(db, name) / "progress.json"
+    doc = json.loads(pf.read_text()) if pf.exists() else {"phase": "composing", "wrap_token": uuid.uuid4().hex}
+    doc.update(child_pid=p.pid, child_started_at=ident[0], child_argv=argv)
+    pf.write_text(json.dumps(doc))
+
+
+def test_h1_no_token_recorded_and_a_wrap_open_leaves_the_occurrence_unsettled_with_a_card(scratch):
+    open_wrap(scratch, uuid.uuid4().hex)                              # a wrap the dream opened before it wrote a token
+    occ(scratch, "o1").mkdir(parents=True)
+    (occ(scratch, "o1") / "progress.json").write_text(json.dumps({"phase": "composing"}))
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert not res.settled and res.reason == rc.WRAP_OPEN_UNATTRIBUTED and res.ending == "none"
+    assert res.card["his"] and "ownership" in " ".join(res.notes)
+    assert store_state(scratch)[0] is not None                        # nothing was cancelled
+    assert not (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists()
+    # the saving phase without a token is the same
+    set_prog_file = occ(scratch, "o1") / "progress.json"
+    set_prog_file.write_text(json.dumps({"phase": "saving", "last_wrap_before": 0}))
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert not res.settled and res.reason == rc.WRAP_OPEN_UNATTRIBUTED
+
+
+def test_h1_no_token_and_an_unreadable_wrap_state_is_unsettled_and_an_idle_store_settles(scratch, monkeypatch):
+    occ(scratch, "o1").mkdir(parents=True)
+    (occ(scratch, "o1") / "progress.json").write_text(json.dumps({"phase": "composing"}))
+    real = Store.get_wrap_started_at
+
+    def boom(self):
+        raise RuntimeError("db locked")
+    monkeypatch.setattr(Store, "get_wrap_started_at", boom)
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert not res.settled and res.reason == rc.WRAP_OPEN_UNATTRIBUTED and res.wrap == "unreadable"
+    monkeypatch.setattr(Store, "get_wrap_started_at", real)
+    res = rc.recover(scratch, occ(scratch, "o1"))                     # nothing open: it settles as before
+    assert res.settled and (res.ending, res.reason) == ("failed", rc.KILLED_BEFORE_SAVE)
+
+
+def test_h2_a_later_wrap_with_identical_text_is_not_adopted_as_the_dreams_save(scratch):
+    dream(scratch, "o1", _VALID)
+    m = sn.read_manifest(occ(scratch, "o1"))
+    m["post_files"], m["wrap_id"] = None, None
+    sn._write_manifest(occ(scratch, "o1"), m)
+    set_prog(scratch, "o1", phase="saving", wrap_id=None)
+    add_episode(scratch, "later")
+    assert dream(scratch, "o2", _VALID).outcome == "saved"            # another writer, the SAME text: same hash
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert res.reason == rc.UNKNOWN_COMMIT and res.card["his"]
+    assert not sn.read_manifest(occ(scratch, "o1"))["post_files"]
+    assert sn.rollback(scratch, occ(scratch, "o1")).code in ("no-post", "later-dream")
+
+
+def test_h2_the_commit_identity_picks_our_wrap_among_identical_hashes_and_two_matches_stay_unsettled(scratch):
+    import sqlite3
+    dream(scratch, "o1", _VALID)
+    m = sn.read_manifest(occ(scratch, "o1"))
+    m["post_files"], m["wrap_id"] = None, None
+    sn._write_manifest(occ(scratch, "o1"), m)
+    set_prog(scratch, "o1", phase="saving", wrap_id=None)
+    tok12 = prog(scratch, "o1")["wrap_token"][:12]
+    con = sqlite3.connect(scratch)
+    for (name,) in con.execute("select name from sqlite_master where type = 'trigger' and tbl_name = 'wraps'").fetchall():
+        con.execute(f"drop trigger {name}")                          # scratch copy: the guards need anneal's functions
+    con.execute("update wraps set pair_id = ? where id = 1", (f"{tok12}-aaaaaaaa",))
+    con.execute("insert into wraps (id, wrapped_at, episodes_compressed, graduations_validated, graduations_demoted, "
+                "citation_reuse_max, continuity_chars, patterns_extracted, unattended, model, associations_formed, "
+                "associations_strengthened, associations_decayed, content_hash, pair_id) "
+                "select 2, wrapped_at, 0, 0, 0, 0, continuity_chars, 0, unattended, model, 0, 0, 0, content_hash, ? "
+                "from wraps where id = 1", (f"{tok12}-bbbbbbbb",))
+    con.commit()
+    con.close()
+    res = rc.recover(scratch, occ(scratch, "o1"))                     # two wraps carry our token AND our hash
+    assert not res.settled and res.reason == rc.UNKNOWN_COMMIT and res.card["his"]
+    assert not (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists()
+    assert not sn.read_manifest(occ(scratch, "o1"))["post_files"]
+
+
+def test_h3_recovery_refuses_a_snapshot_with_no_store_id_before_it_touches_anything(scratch):
+    tok = uuid.uuid4().hex
+    dream(scratch, "o1", _VALID)
+    m = sn.read_manifest(occ(scratch, "o1"))
+    m["store_id"] = ""
+    sn._write_manifest(occ(scratch, "o1"), m)
+    add_episode(scratch, "open")
+    open_wrap(scratch, tok)                                           # a wrap of ours that recovery would cancel
+    set_prog(scratch, "o1", phase="saving", wrap_token=tok)
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert not res.settled and res.reason == rc.STORE_MISMATCH
+    assert store_state(scratch)[0] is not None and res.wrap == "untouched"
+    m["store_id"] = "someone-elses"
+    sn._write_manifest(occ(scratch, "o1"), m)
+    assert rc.recover(scratch, occ(scratch, "o1")).reason == rc.STORE_MISMATCH
+
+
+def test_h4_an_occurrence_whose_name_is_a_prefix_of_anothers_never_matches_it(scratch, tmp_path):
+    p = _spawn_leader(["sh", "-c", "sleep 300; true", "sh", "--add-dir", str(occ(scratch, "o10"))], tmp_path)
+    try:
+        argv = ["sh", "-c", "sleep 300; true", "sh", "--add-dir", str(occ(scratch, "o10"))]
+        _record_child(scratch, "o1", p, argv)                          # o1's progress names o10's live process
+        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.3, kill_wait=0.3)
+        assert res.child == "not-confirmed" and p.poll() is None       # no signal: o10's child lives
+    finally:
+        os.killpg(p.pid, signal.SIGKILL)
+
+
+def test_m1_the_verb_exits_zero_only_when_settled_and_prints_the_next_step(scratch, monkeypatch, capsys):
+    import argparse
+    from levain.dream import cli as dcli
+    crashed_before_rename(scratch, "o1", _VALID, monkeypatch)
+    capsys.readouterr()
+    ns = argparse.Namespace(occurrence="o1", store_dir=str(scratch.parent), state="launched", card_filed=False,
+                            json=False)
+    assert dcli.run_dream_recover(ns) == 1                             # committed, text not landed: ending is "done"
+    out = capsys.readouterr().out
+    assert "UNSETTLED" in out and "dream recover o1" in out and "mv" in out
+
+
+def test_m3_a_recovery_record_that_cannot_be_written_is_not_settled(scratch, monkeypatch):
+    dream(scratch, "o1", _VALID)
+    set_prog(scratch, "o1", phase="saving")
+    real = sn._write_json
+
+    def full_disk(path, doc):
+        if path.name == rc.RECOVERY_RECORD:
+            raise OSError(28, "No space left on device")
+        return real(path, doc)
+    monkeypatch.setattr(sn, "_write_json", full_disk)
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert not res.settled and "No space left" in " ".join(res.notes)
+    monkeypatch.setattr(sn, "_write_json", real)
+    assert rc.recover(scratch, occ(scratch, "o1")).settled            # the rerun records
+
+
+def test_m3_a_post_record_write_that_fails_is_unsettled_not_a_traceback(scratch, monkeypatch):
+    dream(scratch, "o1", _VALID)
+    m = sn.read_manifest(occ(scratch, "o1"))
+    m["post_files"], m["wrap_id"] = None, None
+    sn._write_manifest(occ(scratch, "o1"), m)
+    set_prog(scratch, "o1", phase="saving", wrap_id=None)
+    monkeypatch.setattr(sn, "_write_manifest", lambda *a: (_ for _ in ()).throw(PermissionError("read-only")))
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert not res.settled and "read-only" in " ".join(res.notes)
+
+
+def test_m4_a_child_not_seen_ended_keeps_recovery_retryable_and_the_rerun_ends_it(scratch, tmp_path):
+    child = fire_killed_mid_compose(scratch, "o1", tmp_path)
+    try:
+        good = prog(scratch, "o1")["child_started_at"]
+        set_prog(scratch, "o1", child_started_at="Mon Jan  1 00:00:00 2001")
+        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.3, kill_wait=0.3)
+        assert res.child == "not-confirmed" and res.wrap == "cancelled" and not res.settled
+        assert not (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists() and alive(child)
+        set_prog(scratch, "o1", child_started_at=good)                 # the process table is readable again
+        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=3, kill_wait=3)
+        assert res.child == "ended" and res.settled and (occ(scratch, "o1") / rc.RECOVERY_RECORD).exists()
+        assert not alive(child)
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(child, signal.SIGKILL)
+
+
+def test_m7_a_child_that_is_not_a_group_leader_is_never_reported_ended(scratch, tmp_path):
+    import threading
+    argv = ["sh", "-c", "sleep 300; true", "sh", "--add-dir", str(occ(scratch, "o1"))]
+    p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)   # same group as the test
+    threading.Thread(target=p.wait, daemon=True).start()
+    time.sleep(0.4)
+    try:
+        _record_child(scratch, "o1", p, argv)
+        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.3, kill_wait=0.3)
+        assert res.child == "not-confirmed" and "not a process-group leader" in " ".join(res.notes)
+        assert p.poll() is None                                          # alive, and unsignalled
+    finally:
+        p.kill()
+
+
+def test_m7_a_group_that_ignores_term_is_killed_while_it_still_exists_and_then_confirmed_gone(scratch, tmp_path):
+    argv = ["sh", "-c", 'trap "" TERM; sleep 300', "sh", "--add-dir", str(occ(scratch, "o1"))]
+    p = _spawn_leader(argv, tmp_path)
+    try:
+        _record_child(scratch, "o1", p, argv)
+        res = rc.recover(scratch, occ(scratch, "o1"), term_wait=0.5, kill_wait=3)
+        assert res.child == "ended" and p.poll() is not None
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(p.pid, signal.SIGKILL)
+
+
+def test_low_a_saved_phase_without_a_composed_hash_records_nothing(scratch):
+    dream(scratch, "o1", _VALID)
+    m = sn.read_manifest(occ(scratch, "o1"))
+    m["post_files"], m["wrap_id"] = None, None
+    sn._write_manifest(occ(scratch, "o1"), m)
+    p = prog(scratch, "o1")
+    p.pop("composed_sha256")
+    (occ(scratch, "o1") / "progress.json").write_text(json.dumps(p))
+    res = rc.recover(scratch, occ(scratch, "o1"))
+    assert "no composed text hash" in " ".join(res.notes)
+    assert not sn.read_manifest(occ(scratch, "o1"))["post_files"]

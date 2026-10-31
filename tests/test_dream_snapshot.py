@@ -476,3 +476,152 @@ def test_the_verbs_refuse_the_live_store_and_exist_in_the_parser(monkeypatch, tm
     assert ns.func is dcli.run_dream_rollback
     assert top.parse_args(["dream", "recover", "o1", "--store-dir", "x", "--state", "stopped"]).state == "stopped"
     assert top.parse_args(["dream", "drill", "--store-dir", "x"]).func is dcli.run_dream_drill
+
+
+# =========================================================================== L3 r1 fixes (fix2)
+
+def test_h3_rollback_refuses_when_either_store_id_is_missing_or_different_before_reading_the_live_files(scratch,
+                                                                                                        monkeypatch):
+    two_dreams(scratch)
+    m = sn.read_manifest(occ(scratch, "o2"))
+    seen = []
+    real = sn.tier_hashes
+    monkeypatch.setattr(sn, "tier_hashes", lambda d: seen.append(d) or real(d))
+    for bad in ("", None):                                             # the snapshot records no id
+        m["store_id"] = bad
+        sn._write_manifest(occ(scratch, "o2"), m)
+        r = sn.rollback(scratch, occ(scratch, "o2"))
+        assert r.code == "store-mismatch" and "no store id" in r.message
+    m["store_id"] = "someone-elses"
+    sn._write_manifest(occ(scratch, "o2"), m)
+    assert sn.rollback(scratch, occ(scratch, "o2")).code == "store-mismatch"
+    m["store_id"] = sn._store_id(scratch)
+    sn._write_manifest(occ(scratch, "o2"), m)
+    monkeypatch.setattr(sn, "_store_id", lambda db: None)             # the store's own id cannot be read
+    r = sn.rollback(scratch, occ(scratch, "o2"))
+    assert r.code == "store-mismatch" and "cannot be read" in r.message
+    assert seen == []                                                  # no live file was read before the refusals
+
+
+def test_m2_a_rollback_that_dies_before_its_record_is_finished_by_a_rerun(scratch, monkeypatch):
+    two_dreams(scratch)
+    real = sn._write_json
+
+    def dies(path, doc):
+        if path.name == sn.ROLLBACK_RECORD:
+            raise OSError(28, "No space left on device")
+        return real(path, doc)
+    monkeypatch.setattr(sn, "_write_json", dies)
+    with pytest.raises(OSError):
+        sn.rollback(scratch, occ(scratch, "o2"))
+    monkeypatch.setattr(sn, "_write_json", real)
+    assert not sn.read_manifest(occ(scratch, "o2")).get("reverted_at")   # the marker is last: not set
+    r = sn.rollback(scratch, occ(scratch, "o2"), file_card=lambda c: None)
+    assert r.outcome == "finished" and r.card["dedupe_key"] == "dream-rollback:o2"
+    assert (occ(scratch, "o2") / sn.ROLLBACK_RECORD).exists()
+    assert sn.read_manifest(occ(scratch, "o2"))["reverted_at"]
+    assert sn.rollback(scratch, occ(scratch, "o2")).code == "already-reverted"
+
+
+def test_m2_a_card_that_was_not_filed_is_refiled_by_a_rerun_with_the_same_record(scratch):
+    two_dreams(scratch)
+    calls = []
+
+    def flaky(card):
+        calls.append(card["at"])
+        if len(calls) == 1:
+            raise RuntimeError("review store down")
+    first = sn.rollback(scratch, occ(scratch, "o2"), file_card=flaky)
+    assert first.ok and first.card_error and not sn.read_manifest(occ(scratch, "o2")).get("reverted_at")
+    at = json.loads((occ(scratch, "o2") / sn.ROLLBACK_RECORD).read_text())["at"]
+    second = sn.rollback(scratch, occ(scratch, "o2"), file_card=flaky)
+    assert second.outcome == "finished" and second.card_error is None
+    assert calls == [at, at]                                           # the same card, the same stamp
+    assert sn.read_manifest(occ(scratch, "o2"))["reverted_at"] == at
+
+
+def test_m5_the_drill_after_a_real_rollback_skips_instead_of_failing(scratch):
+    two_dreams(scratch)
+    assert sn.rollback(scratch, occ(scratch, "o2")).ok
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "ok" and [s["status"] for s in res.steps] == ["ok", "ok", "skipped", "skipped"]
+    assert "already-reverted" in res.steps[2]["detail"]
+
+
+def test_m5_the_drill_defers_while_a_wrap_is_open_and_records_nothing(scratch):
+    from anneal_memory.continuity import prepare_wrap
+    two_dreams(scratch)
+    add_episode(scratch, "w")
+    with Store(str(scratch), section_schema=None) as s:
+        prepare_wrap(s, wrap_token=TOK)                                # a dream composing, no lock needed to show it
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "deferred" and "wrap-open" in res.steps[-1]["detail"]
+    assert sn.last_drill(scratch.parent / "dream") is None and sn.drill_due(scratch.parent / "dream")
+
+
+def test_m6_the_drill_copies_under_the_wrap_lock_and_defers_when_it_is_held(scratch, monkeypatch):
+    from levain import wrap as w
+    from levain.dream import executor as ex_
+    two_dreams(scratch)
+    monkeypatch.setattr(ex_, "_copy_store", lambda *a: pytest.fail("the live store was copied without the lock"))
+    fd = w._lock_wrap_file(scratch.parent / "wrap.lock")
+    try:
+        res = sn.drill(scratch, scratch.parent / "dream")
+    finally:
+        w._unlock_wrap(fd)
+    assert res.outcome == "deferred" and "wrap lock" in res.steps[-1]["detail"]
+    assert sn.last_drill(scratch.parent / "dream") is None
+
+
+def test_m6_the_drill_holds_the_lock_while_it_copies(scratch, monkeypatch):
+    from levain import wrap as w
+    from levain.dream import executor as ex_
+    two_dreams(scratch)
+    real = ex_._copy_store
+    held = []
+
+    def probe(src, dest):
+        h = w._lock_wrap_file(scratch.parent / "wrap.lock")           # a second taker while the drill copies
+        held.append(h is w._ANOTHER_WRAP_RUNNING)
+        if h is not w._ANOTHER_WRAP_RUNNING:
+            w._unlock_wrap(h)
+        return real(src, dest)
+    monkeypatch.setattr(ex_, "_copy_store", probe)
+    assert sn.drill(scratch, scratch.parent / "dream").outcome == "ok"
+    assert held == [True]
+
+
+def test_low_snapshots_order_by_instant_not_by_the_text_of_a_local_offset_stamp(scratch):
+    two_dreams(scratch)
+    # across a fall-back change, "01:30-04:00" (earlier) sorts AFTER "01:10-05:00" (later) as text
+    for name, stamp in (("o1", "2026-11-01T01:30:00-04:00"), ("o2", "2026-11-01T01:10:00-05:00")):
+        m = sn.read_manifest(occ(scratch, name))
+        m["taken_at"] = stamp
+        sn._write_manifest(occ(scratch, name), m)
+    assert [n for n, _ in sn.snapshots(scratch.parent / "dream")] == ["o1", "o2"]
+
+
+def test_low_a_settled_failed_save_stops_pinning_its_snapshot(scratch, monkeypatch):
+    two_dreams(scratch)
+    root = scratch.parent / "dream"
+    # an old occurrence whose save died: a snapshot with no post record, progress still `saving`
+    m = sn.read_manifest(occ(scratch, "o1"))
+    m["post_files"], m["wrap_id"] = None, None
+    sn._write_manifest(occ(scratch, "o1"), m)
+    p = json.loads((occ(scratch, "o1") / "progress.json").read_text())
+    p["phase"] = "saving"
+    (occ(scratch, "o1") / "progress.json").write_text(json.dumps(p))
+    assert "o1" not in sn.prune_snapshots(root)                        # unsettled: recovery still needs it
+    (occ(scratch, "o1") / "recovery.json").write_text(json.dumps({"ending": "failed"}))
+    assert "o1" in sn.prune_snapshots(root)                            # settled: debris
+
+
+def test_low_a_bare_occurrence_id_is_never_read_as_a_directory_of_the_working_dir(scratch, tmp_path, monkeypatch):
+    two_dreams(scratch)
+    here = tmp_path / "cwd"
+    (here / "o2").mkdir(parents=True)                                  # a look-alike, with no snapshot in it
+    monkeypatch.chdir(here)
+    got, err = dcli._occurrence_dir(scratch, "o2")
+    assert got == (scratch.parent / "dream" / "o2").resolve()
+    got, err = dcli._occurrence_dir(scratch, "./o2")                   # an explicit path is still a path
+    assert got == (here / "o2").resolve()

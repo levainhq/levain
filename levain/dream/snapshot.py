@@ -499,7 +499,6 @@ def _finish(occ_dir: Path, m: dict[str, Any], who: str, restored: list[str],
     prior = _read_json(rec_path)
     if prior and prior.get("at"):
         at, restored = str(prior["at"]), list(prior.get("files") or [])
-        finished = bool(prior.get("finished_an_interrupted_rollback", finished))
         who = str(prior.get("who") or who)
     else:
         at = _now()
