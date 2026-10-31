@@ -101,7 +101,7 @@
   }
 
   // The words a drop about one card starts with; the cursor goes after them.
-  function dropWords(k) { return "About card " + k.id + " (" + k.title + "): "; }
+  function dropWords(k) { return "About card " + k.id + (k.title ? " (" + k.title + ")" : "") + ": "; }
 
   // The card's one way to talk back: the cockpit's drop box, filled with the words above. Without the cockpit's opener (a page
   // that is not the cockpit) the button is not drawn: it would do nothing.

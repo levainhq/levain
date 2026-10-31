@@ -465,3 +465,39 @@ def test_a_board_kind_panel_carries_a_filter_and_a_count_and_draws_no_line_for_a
     assert modal_all["deps"] == ["after: flow:a"] and len(modal_all["done"]) == 5, modal_all
     assert modal_all["rows"] == 5 and modal_all["journal"] == 0 and modal_all["heads"] == 6 and modal_all["count"] == "5 cards", modal_all
     assert modal_narrow["rows"] == 1 and modal_narrow["heads"] == 6 and modal_narrow["count"] == "1 of 5", modal_narrow   # folds case
+
+
+# --- fix2: re-attach, discovered replacement, direct unregister ----------------------------------
+
+def test_a_second_attach_points_the_kernels_board_at_the_new_server_and_work_board_false_removes_it() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    _attach(ck, _value(ready=[_card("levain:a")]))
+    _attach(ck, _value(ready=[_card("levain:b")]))
+    assert ck.panel(BOARD_DEFAULT_ID)["value"]["columns"][1]["cards"][0]["id"] == "levain:b"
+    ck.attach_server(None, lambda now: None, board=None)
+    assert _boards(ck) == []
+
+
+def test_a_discovered_board_under_the_kernels_id_replaces_it_and_the_kernel_returns_when_it_goes() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    _attach(ck)
+    here = {"on": True}
+    ck.discover(lambda ctx: [ProviderSpec(BOARD_DEFAULT_ID, "board", "Theirs", "feed", lambda c: Read(value=_value()),
+                                          region="operate")] if here["on"] else [], retire=True)
+    assert ck.manifest(CRED)["panels"][BOARD_DEFAULT_ID]["title"] == "Theirs" and not ck._board_yields
+    here["on"] = False
+    assert ck.manifest(CRED)["panels"][BOARD_DEFAULT_ID]["title"] == "Work board"
+
+
+def test_the_kernels_board_returns_after_a_direct_unregister_of_the_last_board() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    _attach(ck)
+    ck.register(_provider_board("b"))
+    ck.register(_provider_board("c"))
+    ck.unregister("b")
+    assert _boards(ck) == ["c"]
+    ck.unregister("c")
+    assert _boards(ck) == [BOARD_DEFAULT_ID]

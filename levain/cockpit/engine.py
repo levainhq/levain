@@ -688,6 +688,8 @@ class Cockpit:
                 if notes is not None:
                     self._attach_note_rows_locked(notes)
                 self._board_read = board         # None: this cockpit draws no board of its own (an embedder with none)
+                for o in [o for o in self._board_yields if o in self._specs]:
+                    self._unregister_locked(o)   # a built-in an earlier attach made reads that server's board: this attach's replaces it
                 if board is not None:
                     self._attach_board_locked(board)
             except BaseException:
@@ -848,7 +850,7 @@ class Cockpit:
         self._dec.spec = spec
 
     def _attach_board_locked(self, read: Callable[[], Any]) -> None:
-        """ONE board per cockpit: with no board-kind panel registered, the kernel's own ``Work board`` (``read()`` returns the
+        """The kernel draws its own board only while no provider board is registered (providers own theirs): with no board-kind panel registered, the kernel's own ``Work board`` (``read()`` returns the
         value :func:`levain.cockpit.board.build` makes) is registered, marked as yielding, so a board panel registered or
         discovered later replaces it instead of standing beside it."""
         if BOARD_DEFAULT_ID in self._specs or any(o.kind == "board" for o in self._specs.values()):
@@ -857,6 +859,22 @@ class Cockpit:
             id=BOARD_DEFAULT_ID, kind="board", title="Work board", priority="feed", region="operate",
             read=lambda ctx: Read(value=read())))
         self._board_yields.add(BOARD_DEFAULT_ID)
+
+    def _replaces_builtin_board(self, sid: str, kind: str) -> bool:
+        """The ONE rule: a board-kind panel under the id of the kernel's own (yielding) board replaces it."""
+        return kind == "board" and sid in self._board_yields
+
+    def _drop_panel_locked(self, sid: str) -> None:
+        """Unregister a panel, then bring the kernel's own board back if that was the last board (every removal path)."""
+        self._unregister_locked(sid)
+        self._restore_board_locked()
+
+    def unregister(self, sid: str) -> None:
+        """Remove a registered panel; the kernel's own board returns when it was the last board panel."""
+        with self._lock:
+            if sid not in self._specs:
+                raise CockpitRegistrationError(f"{sid!r} is not a registered panel")
+            self._drop_panel_locked(sid)
 
     def _restore_board_locked(self) -> None:
         """The kernel's own board comes back when the last board-kind panel has gone (a discoverer stopped returning it), so a
@@ -977,7 +995,7 @@ class Cockpit:
             # a downstream's own decisions panel is exactly today's: the broker's rows leave with the kernel's
             self._unregister_locked(sid)
             self._dec.spec = None
-        yielding = spec.kind == "board" and sid in self._board_yields     # a board under the built-in's id replaces it, below
+        yielding = self._replaces_builtin_board(sid, spec.kind)     # a board under the built-in's id replaces it, below
         if not sid or (sid in self._specs and not yielding) or sid == NOW_ID:
             raise CockpitRegistrationError(f"panel id {sid!r} is empty, reserved or already registered")
         if spec.kind not in KINDS:
@@ -1032,7 +1050,7 @@ class Cockpit:
                 raise CockpitRegistrationError(
                     f"{sid}: row set {spec.rowset!r} already belongs to panel {owner!r} (one panel per row set)"
                 )
-        if spec.kind == "board":         # one board: the kernel's own yields to a provider's, validated whole like the hero's
+        if spec.kind == "board":         # the kernel's own board yields to a provider's, validated whole like the hero's
             for o in [o for o in self._board_yields if o in self._specs]:
                 self._unregister_locked(o)
         if spec.region == HERO:          # validated whole: only now does a yielding default leave the slot
@@ -1990,7 +2008,7 @@ class Cockpit:
                 returned.add(spec.id)
                 with self._lock:
                     have = self._specs.get(spec.id)
-                    if have is None:
+                    if have is None or self._replaces_builtin_board(spec.id, spec.kind):
                         try:
                             if spec.refresh_every_s is not None:
                                 raise CockpitRegistrationError("a discovered panel cannot carry a refresher")
@@ -2024,9 +2042,8 @@ class Cockpit:
                 # a panel its owner no longer returns keeps its provider (it reads Absent) and offers nothing
                 for pid in [p for p, o in self._discovered.items() if o == i and p not in returned]:
                     if i in self._retiring:
-                        self._unregister_locked(pid)
                         self._discovered = {k: v for k, v in self._discovered.items() if k != pid}
-                        self._restore_board_locked()
+                        self._drop_panel_locked(pid)
                     elif self._specs[pid].verbs:
                         self._set_verbs_locked(pid, ())
         return errors

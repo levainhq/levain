@@ -7018,6 +7018,7 @@
     }
     if (document.getElementById("levain-modal")) closeModal();      // a focus view stands over the box
     const box = ui.words;
+    ui.say.textContent = ""; ui.say.classList.remove("bad");      // an earlier refusal's line is stale now
     box.value = box.value.trim() ? box.value.replace(/\s+$/, "") + "\n\n" + words : words;
     dropPrefillClear();      // a handoff to the sheet left earlier is stale now that these words are in the box
     dropGrow(box);
