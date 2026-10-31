@@ -10,8 +10,8 @@ A policy link is classified by RECOMPUTE: the declared op is applied to the repl
 difference is classified on its own (:func:`classify`). A declared op that disagrees with the computed
 delta is refused, and so is a link that changes nothing.
 
-A link is written :data:`FORMAT` or, when it needs a rule an older replay does not have, :data:`FORMAT_V2` or
-:data:`FORMAT_V3`; each link has one form (:func:`_link_format`), and the replay refuses the others.
+A link is written :data:`FORMAT` or, when it needs a rule an older replay does not have, :data:`FORMAT_V2`,
+:data:`FORMAT_V3` or :data:`FORMAT_V4`; each link has one form (:func:`_link_format`), and the replay refuses the others.
 
 The anchor (``anchor/authority.anchor`` in the store's data root, its directory excluded from Time Machine
 so a restore of the data root cannot roll it back with the log) is written only after a commit, so it lags
@@ -53,10 +53,10 @@ from levain.authority_sig import (_WEBAUTHN_SIG_TYPE, NAMESPACE, AuthorityError,
 from levain.trust_anchor import DEFAULT_SSH_KEYGEN
 
 __all__ = [
-    "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_MCP_FIELD_KINDS",
+    "AGENT_LINK_KIND", "AGENT_LINK_MAX", "ANCHOR_DIR", "ANCHOR_NAME", "CONSENT_AGENTS", "CONSENT_GRANT_KIND", "CONSENT_MCP_FIELD_KINDS",
     "CONSENT_MCP_GRANT_KIND", "CONSENT_MCP_READ_ONLY_TOOLS",
     "CONSENT_GRANTABLE_TOOLS", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
-    "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3",
+    "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3", "FORMAT_V4",
     "GRADUATION_CREATE_RANK",
     "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
     "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
@@ -67,6 +67,7 @@ __all__ = [
     "CONSENT_CONTAINED_SHELL_KIND", "contained_shell_grant",
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
+    "agent_last_revoke", "agent_link", "agent_link_arms", "agent_link_incarnation", "agent_links",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
     "custody_problem", "egress_key_conflicts", "egress_key_host_problem", "egress_key_incarnation", "egress_key_live",
     "egress_key_record", "egress_key_repo_problem", "graduation_grant", "graduation_incarnation", "graduation_links",
@@ -88,6 +89,13 @@ FORMAT_V2 = "levain-authority/2"
 # R13-12), whoever signs it. A replay that knows only /1 and /2 stops at it (its format check) rather than read a
 # policy whose guard it would not see; the guard is fixed with the policy's other terms, so no later link alters it.
 FORMAT_V3 = "levain-authority/3"
+# The format of a link that brings in an ``agent-link`` or carries ``revoke_agent`` (A0 §3.2, §3.3). A replay that
+# knows only /1 to /3 stops at it, so it never reads as inert a record that authorises an agent, and it cannot append
+# any link after it either: every levain that reads this log must be the build that knows the agent kinds before one
+# is signed.
+FORMAT_V4 = "levain-authority/4"
+# the formats this replay takes; one named place, so a test can stand an older replay up by narrowing it
+_KNOWN_FORMATS = (FORMAT, FORMAT_V2, FORMAT_V3, FORMAT_V4)
 RESET_FORMAT = "levain-authority-reset/1"
 RESET_NAMESPACE = "levain-authority-reset"
 ANCHOR_NAME = "authority.anchor"
@@ -220,7 +228,9 @@ NOOP, TIGHTEN, LOOSEN, RENEW, GRANT_REVOKE = "noop", "tighten", "loosen", "renew
 _DELTA_RANK = {TIGHTEN: 2, RENEW: 2, LOOSEN: 3, GRANT_REVOKE: 1}
 # what each declared policy op must compute to
 _OP_DELTAS = {"raise": {TIGHTEN}, "revoke_grant": {GRANT_REVOKE}, "renew": {RENEW}, "loosen": {LOOSEN},
-              "create_grant": {LOOSEN}, "timeouts": {TIGHTEN, LOOSEN}}
+              "create_grant": {LOOSEN}, "timeouts": {TIGHTEN, LOOSEN},
+              # classify gives TIGHTEN for two or more removed grants; the op's own rank rule is in _step
+              "revoke_agent": {GRANT_REVOKE, TIGHTEN}}
 
 _BASE_FIELDS = frozenset({"format", "store_id", "seq", "at", "op"})
 # per op: (required fields, optional fields), beyond the base
@@ -230,6 +240,8 @@ _OP_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "raise": (frozenset({"verb", "tier"}), frozenset()),
     "loosen": (frozenset({"policy"}), frozenset()),
     "revoke_grant": (frozenset({"grant_id"}), frozenset()),
+    # ``agent_store_id``, never ``store_id``: that name is a base field, which ``prepare`` refuses in an op
+    "revoke_agent": (frozenset({"agent_id", "agent_store_id"}), frozenset()),
     "renew": (frozenset({"grant_id", "expires_at", "signed_at"}), frozenset()),
     "create_grant": (frozenset({"grant"}), frozenset()),
     "timeouts": (frozenset({"timeouts"}), frozenset()),
@@ -688,6 +700,9 @@ class AuthoritySnapshot:
     grant_born: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}), compare=False, repr=False)
     # the signer fingerprint of every link, by seq - 1 (as ``_hashes``): :func:`graduation_links` reads it
     link_signers: tuple[str, ...] = field(default=(), compare=False, repr=False)
+    # per ``(agent_id, agent_store_id)``, the seq of the last ``revoke_agent`` (:func:`agent_last_revoke`); absent: none
+    agent_revoked: Mapping[tuple[str, str], int] = field(default_factory=lambda: MappingProxyType({}), compare=False,
+                                                         repr=False)
 
     def key(self, fingerprint: str) -> AuthorityKey | None:
         return self.keys.get(fingerprint)
@@ -1310,6 +1325,17 @@ def _apply_policy_op(policy: StandingPolicy, rec: Mapping[str, Any]) -> Standing
         if kind is not _EGRESS_KIND and kind.expires and _parse_stamp(grant["expires_at"], "expires_at") <= at:
             raise AuthorityError(f"a {str(grant['kind'])[:40]} grant must expire after the link that creates it")
         data["grants"][grant["id"]] = grant
+    elif op == "revoke_agent":
+        aid, sid = rec["agent_id"], rec["agent_store_id"]
+        if not isinstance(aid, str) or not _AGENT_ID.fullmatch(aid):
+            raise AuthorityError("revoke_agent.agent_id must be ag- and 32 lowercase hex digits")
+        if not isinstance(sid, str) or not _AGENT_STORE_ID.fullmatch(sid):
+            raise AuthorityError("revoke_agent.agent_store_id must be store- and 32 lowercase hex digits")
+        # exactly the agent's links go and nothing else changes, so the op's rank (1) is proved by construction; a
+        # policy with none of them is unchanged, and _step refuses it as a link that changes nothing
+        for gid in [g for g, grant in data["grants"].items()
+                    if agent_link(grant) and grant["agent_id"] == aid and grant["store_id"] == sid]:
+            del data["grants"][gid]
     elif op in ("revoke_grant", "renew"):
         gid = rec["grant_id"]
         if not isinstance(gid, str) or gid not in data["grants"]:
@@ -1460,6 +1486,167 @@ def _graduation_phone_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: 
     raise AuthorityError(_GRADUATION_PHONE_FIXED)
 
 
+# An agent link (A0 §3.2): the signed authority for one named agent at one spec version. Its terms are fixed under its
+# id; the only change is a renew (only a later expiry, which is also its review date: no ``review_by`` is stored, since
+# a stored one would move the incarnation on every renew). It lasts at most AGENT_LINK_MAX past its link, and a renew
+# at most that past its own. ``store_id`` here is the AUTONOMIC store's id (the record's own base ``store_id`` is the
+# cockpit's); a reader holds it to the store it reads. ``guard`` is the guard itself, not a hash. Nothing here reads
+# the autonomic store: whether a link is live for a launch is a reader's question (levain.agent_authority).
+AGENT_LINK_KIND = "agent-link"
+AGENT_LINK_MAX = _CONSENT_GRANT_MAX
+_AGENT_LINK_FIELDS = frozenset({"id", "kind", "agent_id", "store_id", "spec_hash", "role_hash", "binding_id",
+                                "capabilities", "budget_run_usd_micros", "budget_window_usd_micros", "run_ceiling",
+                                "expires_at", "guard"})
+_AGENT_LINK_ID = re.compile(r"al-[0-9a-f]{12}")
+_AGENT_ID = re.compile(r"ag-[0-9a-f]{32}")
+# an agent link's store id has the shape of a graduation policy's
+_AGENT_STORE_ID = _GRADUATION_STORE
+# the binding id is the seal of the compiled binding (levain.autonomic.agent_bind, a later slice); its shape is not
+# fixed yet, so the record holds it only to one printable token
+_AGENT_BINDING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_AGENT_CAP_KEYS = frozenset({"harness", "model", "where", "lands", "pushes", "publishes"})
+_AGENT_CAP_LISTS = ("lands", "pushes", "publishes")
+_AGENT_HARNESSES = ("", "claude", "codex")
+_AGENT_LIST_MAX = 64
+_AGENT_TEXT_MAX = 1024
+_AGENT_PATH_MAX = 4096
+# money in integer micro-dollars and counts: bounded so a typo cannot sign an effectively unlimited gauge
+_AGENT_INT_MAX = 10**12
+_AGENT_LINK_FIXED = "an agent link's terms are fixed: sign a new link"
+
+
+def _agent_text(value: Any, what: str, high: int, *, empty: bool = False) -> str:
+    """One line of showable text of at most ``high`` characters (the card shows these bytes, so no hidden one)."""
+    from levain import unshowable
+    if not isinstance(value, str) or len(value) > high or (not empty and not value):
+        raise AuthorityError(f"{what} must be text of {'0' if empty else '1'} to {high} characters")
+    if value and unshowable.first_hidden(value, allow="", selectors=False) is not None:
+        raise AuthorityError(f"{what} must be one line of showable text")
+    return value
+
+
+def _agent_list(value: Any, what: str, *, empty: bool) -> list[Any]:
+    if not isinstance(value, (list, tuple)) or len(value) > _AGENT_LIST_MAX or (not empty and not value):
+        raise AuthorityError(f"{what} must be a list of {'0' if empty else '1'} to {_AGENT_LIST_MAX} entries")
+    return list(value)
+
+
+def _agent_capabilities(caps: Any, what: str) -> None:
+    """A link's ``capabilities``: a closed mapping of exactly :data:`_AGENT_CAP_KEYS`, each present. ``harness`` is
+    ``claude``, ``codex`` or empty (a non-session executor), ``model`` text (empty for one), ``where`` a list of
+    absolute repos each with a non-empty list of repo-relative paths in their normal form, and the three effect lists
+    lists of text. What an effect string means is the compiler's; here each is bounded and showable."""
+    if not isinstance(caps, Mapping) or set(caps) != _AGENT_CAP_KEYS:
+        raise AuthorityError(f"{what} must carry exactly {', '.join(sorted(_AGENT_CAP_KEYS))}")
+    if caps["harness"] not in _AGENT_HARNESSES:
+        raise AuthorityError(f"{what}.harness must be one of claude, codex or empty")
+    _agent_text(caps["model"], f"{what}.model", _AGENT_TEXT_MAX, empty=True)
+    seen_repos: set[str] = set()
+    for i, w in enumerate(_agent_list(caps["where"], f"{what}.where", empty=True)):
+        if not isinstance(w, Mapping) or set(w) != {"repo", "paths"}:
+            raise AuthorityError(f"{what}.where[{i}] must carry exactly paths, repo")
+        repo = _agent_text(w["repo"], f"{what}.where[{i}].repo", _AGENT_PATH_MAX)
+        if not repo.startswith("/") or "\\" in repo or any(seg in ("", ".", "..") for seg in repo[1:].split("/")):
+            raise AuthorityError(f"{what}.where[{i}].repo is an absolute path in its normal form")
+        if repo in seen_repos:
+            raise AuthorityError(f"{what}.where names a repo twice")
+        seen_repos.add(repo)
+        paths = [_agent_text(p, f"{what}.where[{i}].paths", _AGENT_PATH_MAX)
+                 for p in _agent_list(w["paths"], f"{what}.where[{i}].paths", empty=False)]
+        for p in paths:
+            parts = p[:-1].split("/") if p.endswith("/") else p.split("/")
+            if p != "." and (p.startswith("/") or "\\" in p or any(s in ("", ".", "..") for s in parts)
+                             or any(s.casefold() == ".git" for s in parts)):
+                raise AuthorityError(f"{what}.where[{i}].paths names {p[:80]!r}: a path is relative to its repo, in "
+                                     "its normal form, and never reaches into .git")
+        if len(set(paths)) != len(paths) or ("." in paths and len(paths) != 1):
+            raise AuthorityError(f"{what}.where[{i}].paths names a path twice, or '.' beside another")
+    for name in _AGENT_CAP_LISTS:
+        for entry in _agent_list(caps[name], f"{what}.{name}", empty=True):
+            _agent_text(entry, f"{what}.{name}", _AGENT_TEXT_MAX)
+
+
+def _validate_agent_link(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """An agent link's shape (:data:`AGENT_LINK_KIND`): exactly :data:`_AGENT_LINK_FIELDS` (a ``review_by`` or any
+    other field is unknown and refused), every id and hash in its form, money and counts integers (a float or a bool
+    is no integer here), an expiry at most :data:`AGENT_LINK_MAX` past the link's ``at``, and a ``guard`` that is a
+    list of objects. What the guard's entries must say is an append rule, not a replay rule (as for a graduation
+    policy), so a replay never refuses the log over a guard's contents."""
+    if set(grant) != _AGENT_LINK_FIELDS:
+        raise AuthorityError(f"{what} (an agent link) must carry exactly {', '.join(sorted(_AGENT_LINK_FIELDS))}")
+    if grant["kind"] != AGENT_LINK_KIND:
+        raise AuthorityError(f"{what}.kind must be {AGENT_LINK_KIND!r}")
+    for name, pattern, shape in (("id", _AGENT_LINK_ID, "al- and 12 lowercase hex digits"),
+                                 ("agent_id", _AGENT_ID, "ag- and 32 lowercase hex digits"),
+                                 ("store_id", _AGENT_STORE_ID, "store- and 32 lowercase hex digits"),
+                                 ("spec_hash", _SHA256_HEX, "64 lowercase hex digits"),
+                                 ("role_hash", _SHA256_HEX, "64 lowercase hex digits"),
+                                 ("binding_id", _AGENT_BINDING_ID, "one printable token")):
+        if not isinstance(grant[name], str) or not pattern.fullmatch(grant[name]):
+            raise AuthorityError(f"{what}.{name} must be {shape}")
+    _agent_capabilities(grant["capabilities"], f"{what}.capabilities")
+    for name in ("budget_run_usd_micros", "budget_window_usd_micros", "run_ceiling"):
+        value = grant[name]
+        if type(value) is not int or not 0 <= value <= _AGENT_INT_MAX:
+            raise AuthorityError(f"{what}.{name} must be an integer from 0 to {_AGENT_INT_MAX} (no floats)")
+    expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    if at is not None and expires - at > AGENT_LINK_MAX:
+        raise AuthorityError(f"{what} may last at most {AGENT_LINK_MAX.days} days past its link's time")
+    guard = grant["guard"]
+    if not isinstance(guard, (list, tuple)) or not all(isinstance(g, Mapping) for g in guard):
+        raise AuthorityError(f"{what}.guard must be a list of objects")
+    return _thaw(grant)
+
+
+def _agent_link_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
+    """An agent link's change: ``renew`` when only its expiry moved later; anything else is refused (its terms are
+    fixed under its id, at append and at replay)."""
+    rest = lambda g: _canonical({k: v for k, v in g.items() if k != "expires_at"})   # noqa: E731
+    if rest(o) == rest(n) and n_exp > o_exp:
+        return "renew"
+    raise AuthorityError(_AGENT_LINK_FIXED)
+
+
+def agent_link(grant: Any) -> bool:
+    """Whether ``grant`` is an agent link this levain knows (:data:`AGENT_LINK_KIND`)."""
+    return isinstance(grant, Mapping) and grant.get("kind") == AGENT_LINK_KIND \
+        and _grant_kind(grant) is _GRANT_KINDS[AGENT_LINK_KIND]
+
+
+def agent_links(state: AuthoritySnapshot, agent_id: str, agent_store_id: str) -> list[str]:
+    """The ids of the agent links ``state`` holds for ``(agent_id, agent_store_id)``, sorted: present, whether lapsed
+    or signed by a since-revoked key (presence, not liveness: it is what a ``revoke_agent`` removes)."""
+    return sorted(gid for gid, g in state.policy.grants.items()
+                  if agent_link(g) and g["agent_id"] == agent_id and g["store_id"] == agent_store_id)
+
+
+def agent_last_revoke(state: AuthoritySnapshot, agent_id: str, agent_store_id: str) -> int:
+    """The log seq of the last ``revoke_agent`` for ``(agent_id, agent_store_id)`` in ``state``, or 0 for none."""
+    return state.agent_revoked.get((agent_id, agent_store_id), 0)
+
+
+def agent_link_arms(state: AuthoritySnapshot, link_id: str, *, closed_bar_revoke_seq: int = 0) -> bool:
+    """Invariant 2 (A0 §3.2): whether link ``link_id`` was born after its agent's last ``revoke_agent`` and after
+    ``closed_bar_revoke_seq`` (the highest ``revoke_seq`` of a closed bar of that agent, the caller's to read: the bar
+    is local state, not the log's). Fails closed: False for an id that is no standing agent link, or one with no born
+    seq. Says nothing of expiry or signer standing; those are the reader's."""
+    grant, born = state.policy.grants.get(link_id), state.grant_born.get(link_id)
+    if not agent_link(grant) or born is None or type(closed_bar_revoke_seq) is not int:
+        return False
+    return born > agent_last_revoke(state, grant["agent_id"], grant["store_id"]) and born > closed_bar_revoke_seq
+
+
+def agent_link_incarnation(state: AuthoritySnapshot, link_id: str) -> str | None:
+    """The incarnation of agent link ``link_id`` in ``state``, or None when ``state`` holds no such link: the seq of
+    the link that brought the id into the policy, and a sha256 of everything it says but its expiry (the shape of
+    :func:`graduation_incarnation`). A renew keeps it; a revoke and a later create of the same id gives another."""
+    grant, born = state.policy.grants.get(link_id), state.grant_born.get(link_id)
+    if not agent_link(grant) or born is None:
+        return None
+    meaning = _canonical(_thaw({k: v for k, v in grant.items() if k != "expires_at"}))
+    return f"{born}:{hashlib.sha256(meaning.encode()).hexdigest()}"
+
+
 def _refuse_unknown_kind(grants: list[Any]) -> None:
     """At append: this levain writes no grant of a kind it does not know (it holds one a newer levain wrote, inert)."""
     for grant in grants:
@@ -1517,6 +1704,8 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
                                 passkey_revocable=True, max_life=GRADUATION_GRANT_MAX, fixed=_GRADUATION_FIXED),
     GRADUATION_PHONE_KIND: _GrantKind(validate=_validate_graduation_phone, change=_graduation_phone_change,
                                       passkey_revocable=True, expires=False, fixed=_GRADUATION_PHONE_FIXED),
+    AGENT_LINK_KIND: _GrantKind(validate=_validate_agent_link, change=_agent_link_change, passkey_revocable=True,
+                                max_life=AGENT_LINK_MAX, fixed=_AGENT_LINK_FIXED),
 })
 
 
@@ -1604,8 +1793,9 @@ def _parse_record(row: _Row) -> dict[str, Any]:
         raise ReplayError(seq, "the record is nested too deeply") from None
     if not canonical:
         raise ReplayError(seq, "the record is not a canonical JSON object")
-    if rec.get("format") not in (FORMAT, FORMAT_V2, FORMAT_V3):
-        raise ReplayError(seq, f"the record's format is not {FORMAT}, {FORMAT_V2} or {FORMAT_V3}")
+    if rec.get("format") not in _KNOWN_FORMATS:
+        raise ReplayError(seq, "the record's format is not " + ", ".join(_KNOWN_FORMATS[:-1]) + " or "
+                          + _KNOWN_FORMATS[-1])
     op = rec.get("op")
     if not isinstance(op, str) or op not in _OP_FIELDS:
         raise ReplayError(seq, f"unknown op {op!r}")
@@ -1721,7 +1911,8 @@ def _graduation_step_checks(old: StandingPolicy, new: StandingPolicy, keys: Mapp
 
 def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody: str) -> str:
     """The one format a link carrying ``rec`` (its op fields), signed by a key of ``signer_custody``, is written in
-    after ``policy``: :data:`FORMAT_V3` for a link that brings in a graduation policy carrying a ``guard`` (by
+    after ``policy``: :data:`FORMAT_V4` for a link that brings in an agent link or carries ``revoke_agent``, tested
+    before every other; else :data:`FORMAT_V3` for a link that brings in a graduation policy carrying a ``guard`` (by
     create_grant or loosen, whoever signs it); else :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a
     link that brings in a graduation opt-in; :data:`FORMAT` for every other. :func:`prepare` writes it and the replay
     holds every link to it. A guard enters the log only by a ``/3`` link and never changes after it (a graduation
@@ -1737,6 +1928,9 @@ def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody:
         brought = [g for gid, g in grants.items() if gid not in policy.grants] if isinstance(grants, Mapping) else []
     else:
         brought = []
+    # first, before /3: a replay that stops at /3 must stop at any link that authorises or revokes an agent
+    if op == "revoke_agent" or any(isinstance(g, Mapping) and g.get("kind") == AGENT_LINK_KIND for g in brought):
+        return FORMAT_V4
     if any(isinstance(g, Mapping) and g.get("kind") == GRADUATION_KIND and "guard" in g for g in brought):
         return FORMAT_V3
     if signer_custody == PASSKEY and op in ("renew", "create_grant"):
@@ -1788,6 +1982,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
     policy = genesis_policy() if state is None else state.policy
     grant_seqs = {} if state is None else dict(state.grant_seqs)
     grant_born = {} if state is None else dict(state.grant_born)
+    agent_revoked = {} if state is None else dict(state.agent_revoked)
     quarantined_history = False
     try:
         if state is None:
@@ -1831,7 +2026,11 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                     raise AuthorityError(f"this {op} changes nothing")
                 if delta not in _OP_DELTAS[op]:
                     raise AuthorityError(f"a {op} link computes to a {delta} change")
-                rank = _DELTA_RANK[delta]
+                # a revoke_agent is rank 1 whatever classify computed (two or more links removed is TIGHTEN, rank 2):
+                # _apply_policy_op proved that only that agent's links went
+                rank = 1 if op == "revoke_agent" else _DELTA_RANK[delta]
+                if op == "revoke_agent":
+                    agent_revoked[(rec["agent_id"], rec["agent_store_id"])] = seq
                 grant_seqs = {gid: (grant_seqs.get(gid, seq) if gid in policy.grants and _canonical(
                     _thaw(policy.grants[gid])) == _canonical(_thaw(g)) else seq) for gid, g in need.grants.items()}
                 grant_born = {gid: (grant_born.get(gid, seq) if gid in policy.grants else seq) for gid in need.grants}
@@ -1877,7 +2076,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
     signers = (() if state is None else state.link_signers) + (row.signer_fp,)
     return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at,
                              grant_seqs=MappingProxyType(grant_seqs), grant_born=MappingProxyType(grant_born),
-                             link_signers=signers)
+                             link_signers=signers, agent_revoked=MappingProxyType(agent_revoked))
 
 
 def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],
