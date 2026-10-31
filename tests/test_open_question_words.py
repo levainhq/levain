@@ -1,8 +1,8 @@
-"""The words an OPEN question (`levain ask --open`: no options, no rec) draws on the cockpit and the phone sheet, beside an
+"""The words an OPEN question (`levain ask --open`: no options, no rec) draws on the cockpit, beside an
 ordinary two-option question drawn through the same code. Words only: the open question says it is open and asks for words,
 and never draws a dangling "recommends ", "0 options" or "or" with no buttons before it; the ordinary question is what it was
 (the REC line, "recommends X", "N options", "or your own words"). Real runs in headless Chrome; the string-level tests pin the
-same sources when no browser is installed."""
+same source when no browser is installed."""
 from __future__ import annotations
 
 import json
@@ -16,12 +16,10 @@ import pytest
 from levain.consent.questions import QuestionStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
-from tests.test_phone_sign_preselect import TOK, _Port
 
 HERE = Path(__file__).resolve().parent
 WEB = HERE.parent / "levain" / "templates" / "web"
 DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
-PHONE = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
 OPEN_WHAT = "What should the release note say about the sweep?"
 ORD_WHAT = "Ship the sweep fix tonight or hold it?"
 
@@ -109,54 +107,6 @@ def test_the_decisions_row_says_open_question_for_none_and_keeps_n_options_and_r
     assert "recommends hold" in a["facts"] and a["placeholder"] == "or answer in your own words" and a["options"] == 2, a
 
 
-# --- the phone: the question card and the band item -------------------------------------------------------
-
-
-@pytest.fixture
-def port(tmp_path: Path):
-    (tmp_path / "q").mkdir(mode=0o700)
-    p = _Port(tmp_path / "q")
-    try:
-        yield p
-    finally:
-        p.srv.shutdown()
-        p.srv.server_close()
-
-
-@needs_browser
-def test_the_phone_question_card_says_open_question_and_keeps_its_words_box(port: _Port) -> None:
-    ordinary_n, open_n = _file_both(port.qdir)
-    cards = "[...document.querySelectorAll('article.req')].filter(c => /question #/.test(c.innerText))"
-    out = _drive(port.qdir.parent, port.url + f"#phone_token={TOK}", [
-        PHONE, {"until": f"{cards}.length === 2"},
-        {"eval": f"JSON.stringify({cards}.map(c => ({{ n: (/question #(\\d+)/.exec(c.innerText) || [])[1], text: c.innerText,"
-                 " placeholder: c.querySelector('textarea.words').placeholder, buttons: [...c.querySelectorAll('button')].map(b => b.textContent),"
-                 " emptyActions: [...c.querySelectorAll('.actions')].filter(a => a.children.length === 0).length })))"}])["values"]
-    got = {c["n"]: c for c in json.loads(next(v for v in out if isinstance(v, str) and v.startswith("[{")))}
-    o, a = got[str(open_n)], got[str(ordinary_n)]
-    assert "open question: your answer, in words" in o["text"], o
-    assert o["buttons"] == ["Send words"] and o["emptyActions"] == 0, o
-    assert o["placeholder"] == "your answer, in words", o
-    assert "open question" not in a["text"] and a["placeholder"] == "or your own words", a
-    assert any(b.startswith("Ship it tonight") for b in a["buttons"]) and "Send words" in a["buttons"], a
-
-
-@needs_browser
-def test_the_phone_band_item_for_an_open_question_says_so_and_draws_no_empty_actions_row(port: _Port) -> None:
-    ordinary_n, open_n = _file_both(port.qdir)
-    items = "[...document.querySelectorAll('.band-item')]"
-    out = _drive(port.qdir.parent, port.url + f"#phone_token={TOK}", [
-        PHONE, {"until": f"{items}.length === 2"},
-        {"eval": f"JSON.stringify({items}.map(i => ({{ text: i.innerText, actions: i.querySelectorAll('.actions').length,"
-                 " buttons: i.querySelectorAll('.actions button').length })))"}])["values"]
-    rows = json.loads(next(v for v in out if isinstance(v, str) and v.startswith("[{")))
-    open_row = next(r for r in rows if OPEN_WHAT in r["text"])
-    ordinary = next(r for r in rows if ORD_WHAT in r["text"])
-    assert "open question: type " in open_row["text"] and ": and your words in the box below" in open_row["text"], open_row
-    assert open_row["actions"] == 0, open_row
-    assert ordinary["actions"] == 1 and ordinary["buttons"] == 2 and "open question" not in ordinary["text"], ordinary
-
-
 # --- the sources, string level (run with no browser) ------------------------------------------------------
 
 
@@ -168,16 +118,10 @@ def test_the_cockpit_source_carries_the_four_open_question_words_and_the_old_one
             ': "or answer in your own words";') in core
 
 
-def test_the_phone_source_carries_the_open_question_words_and_keeps_the_ordinary_placeholder() -> None:
-    phone = (WEB / "phone.js").read_text()
-    assert '"open question: type " + String(it.n) + ": and your words in the box below"' in phone and "if (!it.open_ended) row.appendChild(acts);" in phone
-    assert '"open question: your answer, in words"' in phone and 'words.placeholder = "or your own words";' in phone
-
-
 def test_the_changed_files_parse() -> None:
     node = shutil.which("node")
     if node is None:
         pytest.skip("needs node")
-    for name in ("dashboard_core.js", "phone.js"):
+    for name in ("dashboard_core.js",):
         r = subprocess.run([node, "--check", str(WEB / name)], capture_output=True, text=True, timeout=30)
         assert r.returncode == 0, r.stderr
