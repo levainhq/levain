@@ -1142,12 +1142,12 @@ class CoordStore:
             return lease.claim_spawn(conn, now, launch_id, pid)
 
     def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
-                       model: str | None = None, cwd: str | None = None) -> Any:
+                       model: str | None = None, cwd: str | None = None, role_ref: str | None = None) -> Any:
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
             return lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
-                                        cwd=cwd)
+                                        cwd=cwd, role_ref=role_ref)
 
     def launch_activate(self, launch_id: str, *, harness_session_id: str, argv_sha256: str | None = None) -> Any:
         from levain.coordinator import lease

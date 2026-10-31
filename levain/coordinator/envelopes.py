@@ -47,8 +47,8 @@ from levain.coordinator.store import (
 from levain.dispatch.adopt import GitFault, branch_problem
 from levain.dispatch.contract import MAX_LIFETIME, git_env
 
-__all__ = ["ATTENUATIONS", "ENVELOPE_SCHEMA", "NOT_IN_FORCE", "Envelope", "EnvelopeConflict", "EnvelopeStale",
-           "EnvelopeStore"]
+__all__ = ["ATTENUATIONS", "ENVELOPE_SCHEMA", "NARROW_KEYS", "NOT_IN_FORCE", "Envelope", "EnvelopeConflict",
+           "EnvelopeStale", "EnvelopeStore", "dropped_effects", "narrow_scope"]
 
 ATTENUATIONS = ("kill", "stop_earlier", "drop_effect", "thread_done")
 NOT_IN_FORCE = ("before S1 places the control principal the coordinator grants nothing (C0 §2): this effect is a "
@@ -84,6 +84,86 @@ ENVELOPE_SCHEMA: tuple[str, ...] = (
     "EXISTS (SELECT 1 FROM envelope_attenuations WHERE gseq = NEW.gseq OR rowid = NEW.rowid) "
     "BEGIN SELECT RAISE(ABORT, 'an attenuation is never replaced'); END",
 )
+
+
+NARROW_KEYS = ("where", *env.EFFECT_LISTS)
+
+
+def _effect_target(kind: str, effect: Mapping[str, Any]) -> str:
+    """The one name a role's ceiling string matches an effect by: a land's or push's repo, a publish's package."""
+    return effect["package"] if kind == "publishes" else effect["repo"]
+
+
+def _narrow_paths(have: Sequence[str], allowed: Sequence[str]) -> list[str]:
+    """The paths both lists cover, each as the narrower of the two that meet. A ceiling path that is not a signed-body
+    path shape is skipped, which can only narrow."""
+    out: list[str] = []
+    for c in allowed:
+        try:
+            if env._rel_path(c, "a ceiling path") != c:
+                continue
+        except env.EnvelopeError:
+            continue
+        for p in have:
+            pick = c if env.path_within(c, (p,)) else p if env.path_within(p, (c,)) else None
+            if pick is not None and pick not in out:
+                out.append(pick)
+    return out
+
+
+def narrow_scope(scope: Mapping[str, Any], ceiling: Mapping[str, Any]) -> dict[str, Any]:
+    """``scope`` (an effective envelope: its ``where`` and its ``lands`` / ``pushes`` / ``publishes``) cut down to a
+    role's ceiling, key by key, and never widened (a pure function; it reads no store and grants nothing).
+
+    - ``where``: a ceiling that names it keeps only the repos it names, each with the paths both cover; a ceiling that
+      does not name it leaves ``where`` as the envelope has it (the role has no opinion on place).
+    - ``lands`` / ``pushes`` / ``publishes``: an irreversible effect stays only when the ceiling names its repo (its
+      package, for a publish); a list the ceiling does not name is emptied, so a role that never mentions an effect is
+      never granted it.
+    - any other key of ``scope`` passes through, and a ceiling key outside :data:`NARROW_KEYS` is refused.
+
+    The result is checked against ``scope`` before it is returned: whatever a future edit does above, a narrowing that
+    held a repo, a path or an effect the envelope lacks is a :class:`CoordError`, not a wider grant."""
+    unknown = set(ceiling) - set(NARROW_KEYS)
+    if unknown:
+        raise CoordError(f"a role ceiling names {sorted(unknown)[0]!r}, which is not one of {list(NARROW_KEYS)}")
+    out = {k: v for k, v in scope.items()}
+    if "where" in ceiling:
+        by_repo = {w["repo"]: list(w["paths"]) for w in ceiling["where"]}
+        where = []
+        for w in scope.get("where", []):
+            if w["repo"] not in by_repo:
+                continue
+            paths = _narrow_paths(w["paths"], by_repo[w["repo"]])
+            if paths:
+                where.append({"repo": w["repo"], "paths": paths})
+        out["where"] = where
+    for kind in env.EFFECT_LISTS:
+        named = set(ceiling.get(kind, ()))
+        out[kind] = [e for e in scope.get(kind, []) if _effect_target(kind, e) in named]
+    _assert_not_wider(scope, out)
+    return out
+
+
+def _assert_not_wider(scope: Mapping[str, Any], out: Mapping[str, Any]) -> None:
+    held = {w["repo"]: tuple(w["paths"]) for w in scope.get("where", [])}
+    for w in out.get("where", []):
+        if w["repo"] not in held or any(not env.path_within(p, held[w["repo"]]) for p in w["paths"]):
+            raise CoordError(f"a narrowing named {w['repo'][:120]!r} beyond the envelope: refused")
+    for kind in env.EFFECT_LISTS:
+        have = [env.effect_identity(kind, e) for e in scope.get(kind, [])]
+        if any(env.effect_identity(kind, e) not in have for e in out.get(kind, [])):
+            raise CoordError(f"a narrowing held a {kind} effect the envelope lacks: refused")
+
+
+def dropped_effects(scope: Mapping[str, Any], narrowed: Mapping[str, Any]) -> list[str]:
+    """The effect identities ``scope`` holds that ``narrowed`` does not: the values of the ``drop_effect`` rows that
+    record a narrowing in the envelope's own append-only table (:meth:`EnvelopeStore.attenuate`)."""
+    out = []
+    for kind in env.EFFECT_LISTS:
+        keep = {env.effect_identity(kind, e) for e in narrowed.get(kind, [])}
+        out += [i for i in (env.effect_identity(kind, e) for e in scope.get(kind, [])) if i not in keep]
+    return out
 
 
 class EnvelopeConflict(CoordError):

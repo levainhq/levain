@@ -48,6 +48,7 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import timedelta
+from typing import Any
 
 from levain import unshowable
 from levain.cockpit.consent import parse_stamp, utc_stamp
@@ -55,11 +56,12 @@ from levain.contracts.canon import canonical
 from levain.coordinator.store import CoordError, _append_only, next_gseq
 
 __all__ = [
-    "BACKOFF", "HARNESSES", "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
+    "BACKOFF", "HARNESSES", "MAX_SPAWNS_LIVE", "MAX_SPAWN_DEPTH", "SPAWN_PREFIX",
+    "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
     "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat",
     "check_model", "claim", "by_harness_session", "claim_spawn", "end_launch", "end_unlisted", "fence", "launch",
     "lease", "launches", "LaunchThread", "mark_swept", "over_unswept", "record_thread", "record_write", "release",
-    "request_launch", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
+    "request_launch", "spawn_record", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
     "wake_state",
 ]
 
@@ -121,7 +123,10 @@ LEASE_SCHEMA: tuple[str, ...] = (
     "token INTEGER NOT NULL, placement TEXT NOT NULL, at TEXT NOT NULL, "
     # the setting's user-layer choice when the launch was asked for, as model and cwd are (L3 r1: never the setting at
     # spawn time); a store from before it gains the column with 0 (off) on every row (:func:`migrate_settings`)
-    "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)))",
+    "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), "
+    # a spawned worker's role: the canonical text of its spawn record (:func:`spawn_record`), NULL for any other
+    # launch; a store from before it gains the column as NULL on every row (:func:`migrate_settings`)
+    "role_ref TEXT)",
     # harness_session_id and argv_sha256 are known only once the process is spawned: they ride the active row
     "CREATE TABLE IF NOT EXISTS launch_events (launch_id TEXT NOT NULL REFERENCES launches(launch_id), "
     f"seq INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL CHECK ({_in('kind', LAUNCH_KINDS)}), "
@@ -228,6 +233,7 @@ class Launch:
     at: str
     pinned_envelope_id: str | None = None   # the envelope a one-thread worker was activated under (§3.4)
     user_scope: bool = False     # the user-layer choice it was asked under: the spawn reads this, never the setting
+    role_ref: str | None = None  # a spawned worker's spawn record (:func:`spawn_record`); None for every other launch
 
 
 @dataclass(frozen=True)
@@ -399,15 +405,61 @@ def take(conn: sqlite3.Connection, now: str, *, hold: timedelta = LEASE_TTL) -> 
 
 
 # --- launches ------------------------------------------------------------------------------------------------------
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return column in {c[1] for c in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def _has_user_scope(conn: sqlite3.Connection, table: str) -> bool:
     """A store made before user_scope has no such column until a writer's opener migrates it: it reads as OFF."""
-    return "user_scope" in {c[1] for c in conn.execute(f"PRAGMA table_info({table})")}
+    return _has_column(conn, table, "user_scope")
+
+
+# --- a spawned worker's role (P3) ----------------------------------------------------------------------------------
+SPAWN_PREFIX = "@spawn/"
+# [seat] the spawn caps: a worker spawning a worker is depth 2, and no deeper; and at most this many spawned workers
+# are asked for or running at once, so a loop of spawns is bounded by a count, not by anyone noticing it
+MAX_SPAWN_DEPTH = 2
+MAX_SPAWNS_LIVE = 4
+ROLE_REF_MAX = 16 * 1024
+_SPAWN_KEYS = frozenset({"spawn", "role_hash", "depth", "inline", "role", "slots", "done"})
+
+
+def spawn_record(text: object) -> dict[str, Any]:
+    """The parsed spawn record a launch's ``role_ref`` holds, or a :class:`LeaseRefused` naming what is wrong. The
+    shape only: that ``role_hash`` is the role's hash is :func:`levain.agents.instantiate.verified_record`'s check."""
+    if not isinstance(text, str) or len(text) > ROLE_REF_MAX:
+        raise _refused(f"a launch's role_ref is text of at most {ROLE_REF_MAX} bytes")
+    try:
+        rec = json.loads(text)
+    except ValueError:
+        raise _refused("a launch's role_ref is JSON") from None
+    if not isinstance(rec, dict) or set(rec) != _SPAWN_KEYS:
+        raise _refused(f"a launch's role_ref has exactly the keys {sorted(_SPAWN_KEYS)}")
+    if not isinstance(rec["spawn"], str) or not rec["spawn"].startswith(SPAWN_PREFIX) \
+            or not isinstance(rec["role_hash"], str) or re.fullmatch(r"[0-9a-f]{64}", rec["role_hash"]) is None \
+            or type(rec["depth"]) is not int or rec["depth"] < 1 or type(rec["inline"]) is not bool \
+            or not isinstance(rec["role"], dict) or not isinstance(rec["slots"], dict) \
+            or not (rec["done"] is None or isinstance(rec["done"], str)):
+        raise _refused("a launch's role_ref names an @spawn/ role, its 64-hex hash, a depth from 1, inline or not, "
+                       "the role, its slot values and the DONE line (or null)")
+    return rec
+
+
+def _spawn_caps(conn: sqlite3.Connection, now: str, rec: dict[str, Any]) -> None:
+    if rec["depth"] > MAX_SPAWN_DEPTH:
+        raise _refused(f"a spawn is at most {MAX_SPAWN_DEPTH} deep (this one is {rec['depth']})")
+    _expire_pending(conn, now)
+    live = sum(1 for state in ("pending", "active") for ln in _in_state(conn, state, "worker") if ln.role_ref)
+    if live >= MAX_SPAWNS_LIVE:
+        raise _refused(f"{live} spawned workers are asked for or running, and at most {MAX_SPAWNS_LIVE} are allowed "
+                       "at once")
 
 
 def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | None:
     col = "user_scope" if _has_user_scope(conn, "launches") else "0"
-    r = conn.execute(f"SELECT launch_id, session_key, harness, role, threads, model, cwd, token, placement, at, {col} "
-                     f"FROM launches WHERE {where} = ?", (arg,)).fetchone()
+    ref = "role_ref" if _has_column(conn, "launches", "role_ref") else "NULL"
+    r = conn.execute(f"SELECT launch_id, session_key, harness, role, threads, model, cwd, token, placement, at, {col}, "
+                     f"{ref} FROM launches WHERE {where} = ?", (arg,)).fetchone()
     if r is None:
         return None
     events = conn.execute("SELECT kind, until, harness_session_id, cause, pinned_envelope_id FROM launch_events "
@@ -415,7 +467,7 @@ def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | N
     until = next((e[1] for e in events if e[0] == "pending"), None)
     hsid, pin = next(((e[2], e[4]) for e in events if e[0] == "active"), (None, None))
     return Launch(r[0], r[1], r[2], r[3], tuple(json.loads(r[4])), r[5], r[6], r[7], r[8], events[-1][0], until,
-                  hsid, events[-1][3], r[9], pin, bool(r[10]))
+                  hsid, events[-1][3], r[9], pin, bool(r[10]), r[11])
 
 
 def _launch_by_key(conn: sqlite3.Connection, session_key: str) -> Launch | None:
@@ -462,7 +514,7 @@ def _line(name: str, value: object) -> str | None:
 
 def _pending(conn: sqlite3.Connection, now: str, *, token: int, harness: str, role: str, threads: Sequence[str],
              model: str | None, cwd: str | None, cause: str, session_key: str | None = None,
-             user_scope: bool = False) -> Launch:
+             user_scope: bool = False, role_ref: str | None = None) -> Launch:
     if harness not in HARNESSES:
         raise _refused(f"a launch's harness is one of {', '.join(HARNESSES)}")
     if role not in ROLES:
@@ -478,19 +530,25 @@ def _pending(conn: sqlite3.Connection, now: str, *, token: int, harness: str, ro
     for t in threads:
         if conn.execute("SELECT 1 FROM threads WHERE thread_id = ?", (t,)).fetchone() is None:
             raise _refused(f"no thread {t}")
+    if role_ref is not None:
+        if role != "worker":
+            raise _refused("only a worker launch carries a spawned role")
+        _spawn_caps(conn, now, spawn_record(role_ref))
     launch_id = "ln-" + secrets.token_hex(16)
     session_key = session_key or "s-" + secrets.token_hex(8)
     # before S1 places principals a session runs as your uid and the launch grants nothing (C0 §2, §7 L5)
     conn.execute("INSERT INTO launches (launch_id, gseq, session_key, harness, role, threads, model, cwd, token, "
-                 "placement, at, user_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'operator-uid', ?, ?)",
+                 "placement, at, user_scope, role_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'operator-uid', ?, ?, ?)",
                  (launch_id, next_gseq(conn, now), session_key, harness, role, canonical(sorted(threads)),
-                  _line("model", model), _line("cwd", cwd), token, now, int(bool(user_scope) and harness == "claude")))
+                  _line("model", model), _line("cwd", cwd), token, now, int(bool(user_scope) and harness == "claude"),
+                  role_ref))
     _launch_event(conn, now, launch_id, "pending", cause, until=_plus(now, LAUNCH_TTL))
     return _launch_row(conn, "launch_id", launch_id)
 
 
 def request_launch(conn: sqlite3.Connection, now: str, token: object, *, harness: str, role: str = "worker",
-                   threads: Sequence[str] = (), model: str | None = None, cwd: str | None = None) -> Launch:
+                   threads: Sequence[str] = (), model: str | None = None, cwd: str | None = None,
+                   role_ref: str | None = None) -> Launch:
     """The lease holder asks for a launch: written ``pending`` under its token, activated only while that token is
     still the live lease's. A coordinator launch asked for while a lease is held is a rotation. A worker holds
     exactly one thread (:data:`SEVERAL_THREADS`): refused here with nothing written."""
@@ -499,7 +557,7 @@ def request_launch(conn: sqlite3.Connection, now: str, token: object, *, harness
     if role == "worker" and len(threads) > 1:
         raise _refused(_several(len(threads)))
     return _pending(conn, now, token=token, harness=harness, role=role, threads=threads, model=model, cwd=cwd,
-                    cause="requested")
+                    cause="requested", role_ref=role_ref)
 
 
 def _several(n: int) -> str:
@@ -776,11 +834,13 @@ def setting(conn: sqlite3.Connection) -> Setting | None:
 
 def migrate_settings(conn: sqlite3.Connection) -> None:
     """The additive migration: ``coord_settings`` and ``launches`` gain ``user_scope``, 0 (off) on every row written
-    before it. Runs in the opener's schema transaction, like the replies' sequence."""
+    before it, and ``launches`` gains ``role_ref``, NULL on every row. Runs in the opener's schema transaction, like the replies' sequence."""
     for table in ("coord_settings", "launches"):
         if not _has_user_scope(conn, table):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN user_scope INTEGER NOT NULL DEFAULT 0 "
                          "CHECK (user_scope IN (0, 1))")
+    if not _has_column(conn, "launches", "role_ref"):
+        conn.execute("ALTER TABLE launches ADD COLUMN role_ref TEXT")
 
 
 def check_model(model: object) -> str | None:
