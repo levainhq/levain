@@ -404,10 +404,11 @@ The keys directory (`<levain home>/keys`) is denied to an entity's bash and file
 
 ### Answer an agent from your phone
 
-An agent's consent request can be answered from your phone with a passkey. `levain consent phone` serves a small consent page on its own loopback port (7428), separate from the cockpit; you put an https proxy you trust in front of that port, never in front of the cockpit. With Tailscale:
+An agent's consent request can be answered from your phone with a passkey, in the cockpit: pair the phone to it, open its sheets there and sign. `levain cockpit pair --short` prints an 8-character code to type on the phone. `levain consent phone --redirect-to <the cockpit's origin>` still serves one redirect page on the old phone port (7428) so a link the phone already holds opens on the cockpit; it serves nothing else, mints no token and `levain consent phone` without `--redirect-to` refuses. You put an https proxy you trust in front of the cockpit or the redirect, never in front of anything else. With Tailscale:
 
 ```
-levain consent phone --tailscale     # finds this machine's tailnet name; prints the phone link and the next line
+levain cockpit pair --short                                          # a code to type on the phone
+levain consent phone --tailscale --redirect-to https://<name>:<port>    # optional: old phone links land on the cockpit
 tailscale serve --bg --https=443 http://127.0.0.1:7428
 ```
 
@@ -415,16 +416,14 @@ Any other https proxy works the same way with `--name <its https name>`. Open th
 
 ![Two phone-width screens: the cockpit's Decisions view with the proposal card, and the phone consent page showing one waiting request and, before a passkey is enrolled, a button to make one.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-phone.png)
 
-*Left: the Decisions view at phone width. Right: the page `levain consent phone` serves, as it looks before a passkey is enrolled on that phone. Demo install, invented content.*
+*Left: the Decisions view at phone width. Right: the phone consent page as it looked before a passkey is enrolled on that phone (the cockpit serves it now). Demo install, invented content.*
 
 What to know:
 
 - A passkey is made for one https name. Rename the machine or the tailnet and you make and enrol a new one.
 - On the phone page the passkey's origin must be exactly `https://<name>`, with no port (so the https proxy serves on 443); levain checks it. A grant revoke is the one exception: the authority log also takes it from `https://<name>:<port>`, so a cockpit served on a port signs one. On `localhost` it is the phone port's own `http://localhost:<port>`, so serving the port as `--name localhost --port 80` rejects every assertion (browsers drop the default port).
-- `levain consent phone --sign-namespace NS` also lists statements your own scripts file in the queue directory's `sign/` folder, for you to sign with the passkey (Face ID, Touch ID or the device passcode, as the authenticator reports it). levain checks user verification; a script's `ssh-keygen -Y verify -n NS` checks only the key, the message and the namespace. A namespace beginning `levain`, one in a family levain itself verifies in, or `git`, `file` or `email` is refused.
 - The passkey prompt shows no request text. The page shows what you are answering; the signature covers exactly that request.
-- The phone port serves the consent page, the waiting requests and the passkey routes (answers and late rulings), the questions an agent filed with `levain ask` (an answer to a question is unsigned and authorises nothing), the dispatch jobs an agent filed with `levain dispatch`, for you to sign or cancel with a passkey, web push and phone pairing (`levain ping`), and, for the phone app, your state line and your Tray, open loops and Keep from the install the consent hooks name. It does not serve the cockpit page. From the phone you can set your state line and resolve or snooze a Tray item; anything the cockpit would want a signature for stays on the laptop.
-- Anyone who holds the phone link and reaches the name can read the waiting requests, your Tray, open loops and Keep and your state line, and can set the state line and resolve or snooze a Tray item, and can answer an open `levain ask` question in words (unsigned), until the phone port stops. The link also lets its holder pair a phone: a paired phone's token keeps working on later phone ports until you end it (`levain ping devices` lists paired phones, `levain ping revoke` ends one). Only an enrolled passkey can answer a request or rule on it, including the one tap on a question tied to a push.
+- Anyone who holds a paired device's token can use the cockpit as that device until you revoke it: `levain cockpit pair --list` shows the devices and `levain cockpit pair --revoke <id>` ends one family of them. The old phone port's run token and its own device registry no longer exist, and `levain ping devices`, `revoke` and `pair` are gone with them.
 - The page you read is served by your own user account, as the terminal you answer in is. Levain does not confine a Claude Code or Codex session, so an agent running as you could stop the phone port, serve its own page on that port and show you one request while asking you to sign another. Answer only on a phone port you started, and turn the proxy off when you stop it (`tailscale serve reset`).
 
 For hosts that render MCP Apps (and only those), `pip install 'levain[app]'` adds what `levain serve-app` needs to run: a read-only in-host view served over stdio. `levain serve` needs nothing beyond the base install.

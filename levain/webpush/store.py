@@ -317,7 +317,9 @@ class PushStore:
         with self.write() as c:
             if c.execute("SELECT 1 FROM pings WHERE id = ?", (ping_id,)).fetchone() is None:
                 return False
-            c.execute("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)", (ping_id, device_id, now_stamp()))
+            # idempotent per (ping, device): two cockpit tabs may drain the same tap, and the second answers like the first
+            if c.execute("SELECT 1 FROM opens WHERE ping_id = ? AND device_id IS ?", (ping_id, device_id)).fetchone() is None:
+                c.execute("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)", (ping_id, device_id, now_stamp()))
             return True
 
     def record(self, limit: int = 100) -> list[dict[str, Any]]:
