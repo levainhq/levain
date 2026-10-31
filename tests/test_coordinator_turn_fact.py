@@ -56,7 +56,7 @@ def test_the_first_prompt_before_activation_is_a_wake(rig, monkeypatch):
     it), read back, then activate."""
     rig.ask("Pick a DB")
     first = rig.ups("hello coordinator")
-    assert rig.stop(band_of(first)) == ""                         # launch A's view, committed
+    assert rig.stop(band_of(first, rig)) == ""                    # launch A's view, committed
     rig.ask("Ship it?")
     store = CoordStore(rig.qdir)
     store.coord_release()
