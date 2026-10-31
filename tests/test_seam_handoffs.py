@@ -337,6 +337,9 @@ def test_a_prev_that_names_no_handoff_does_not_read_as_a_newer_one(store):
     first = _close(store, "r1")
     with pytest.raises(CoordError, match="the close named previous handoff 9; the latest is 1"):
         _close(store, "r2", prev=9)
+    for bad in (0, -3):
+        with pytest.raises(CoordError, match=f"the close named previous handoff {bad}; the latest is 1"):
+            _close(store, "r2", prev=bad)
     assert first.handoff_id == 1
 
 
