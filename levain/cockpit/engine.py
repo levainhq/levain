@@ -597,6 +597,9 @@ def _note_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     return [_note_row_in(n, total) for n in shown.values()], max(total - len(open_), 0)
 
 
+_UNSET: Any = object()      # attach_server's "board not given", distinct from an explicit None
+
+
 class Cockpit:
     def __init__(
         self,
@@ -664,10 +667,11 @@ class Cockpit:
                       capture: Callable[[datetime], RequestAuthority] | None = None,
                       edits: Callable[[int], Any] | None = None, decision_rows: Callable[[datetime], Any] | None = None,
                       questions: Any = None, notes: Any = None,
-                      board: Callable[[], Any] | None = None) -> None:
+                      board: Any = _UNSET) -> None:
         """Every attach a server makes (``make_server``), as ONE transaction under the cockpit's lock: the verb view
         (:meth:`attach_verbs`), the broker's capture, edits reader and decisions rows when given, the consent reader,
-        then the question and note stores and the kernel's own board when given. One that raises puts back exactly what this call found, then
+        then the question and note stores and the kernel's own board when given (``board`` omitted leaves the current reader and
+        built-in as they are; an explicit ``None`` removes the built-in). One that raises puts back exactly what this call found, then
         raises. Nothing else registers while the lock is held, so a panel another thread registers before this call or
         after it is kept: the undo removes only this server's attaches."""
         with self._lock:
@@ -687,11 +691,12 @@ class Cockpit:
                     self._attach_question_rows_locked(questions)
                 if notes is not None:
                     self._attach_note_rows_locked(notes)
-                self._board_read = board         # None: this cockpit draws no board of its own (an embedder with none)
-                for o in [o for o in self._board_yields if o in self._specs]:
-                    self._unregister_locked(o)   # a built-in an earlier attach made reads that server's board: this attach's replaces it
-                if board is not None:
-                    self._attach_board_locked(board)
+                if board is not _UNSET:
+                    self._board_read = board     # None: this cockpit draws no board of its own (an embedder with none)
+                    for o in [o for o in self._board_yields if o in self._specs]:
+                        self._unregister_locked(o)   # a built-in an earlier attach made reads that server's board: this attach's replaces it
+                    if board is not None:
+                        self._attach_board_locked(board)
             except BaseException:
                 # the registry is copy-on-write, so the dicts taken are the ones a reader held then; the row-set
                 # owners and hero yields, changed in place, are put back in place
@@ -861,8 +866,8 @@ class Cockpit:
         self._board_yields.add(BOARD_DEFAULT_ID)
 
     def _replaces_builtin_board(self, sid: str, kind: str) -> bool:
-        """The ONE rule: a board-kind panel under the id of the kernel's own (yielding) board replaces it."""
-        return kind == "board" and sid in self._board_yields
+        """The ONE rule: a panel of any kind under the id of the kernel's own (yielding) board replaces it."""
+        return sid in self._board_yields
 
     def _drop_panel_locked(self, sid: str) -> None:
         """Unregister a panel, then bring the kernel's own board back if that was the last board (every removal path)."""
@@ -874,6 +879,9 @@ class Cockpit:
         with self._lock:
             if sid not in self._specs:
                 raise CockpitRegistrationError(f"{sid!r} is not a registered panel")
+            if sid in self._discovered:
+                raise CockpitRegistrationError(
+                    f"panel {sid} is owned by a discoverer; it goes when the discoverer stops returning it")
             self._drop_panel_locked(sid)
 
     def _restore_board_locked(self) -> None:
@@ -1050,7 +1058,7 @@ class Cockpit:
                 raise CockpitRegistrationError(
                     f"{sid}: row set {spec.rowset!r} already belongs to panel {owner!r} (one panel per row set)"
                 )
-        if spec.kind == "board":         # the kernel's own board yields to a provider's, validated whole like the hero's
+        if spec.kind == "board" or yielding:     # the kernel's own board yields to a provider's (or to any panel under its id), validated whole like the hero's
             for o in [o for o in self._board_yields if o in self._specs]:
                 self._unregister_locked(o)
         if spec.region == HERO:          # validated whole: only now does a yielding default leave the slot

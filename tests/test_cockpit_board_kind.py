@@ -501,3 +501,51 @@ def test_the_kernels_board_returns_after_a_direct_unregister_of_the_last_board()
     assert _boards(ck) == ["c"]
     ck.unregister("c")
     assert _boards(ck) == [BOARD_DEFAULT_ID]
+
+
+# --- fix3: discovered ownership, any kind under the built-in's id, omitted board ------------------
+
+def test_unregister_refuses_a_discovered_panel_and_the_refresh_still_works() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    _attach(ck)
+    here = {"on": True}
+    ck.discover(lambda ctx: [_provider_board("disc")] if here["on"] else [], retire=True)
+    assert _boards(ck) == ["disc"]
+    with pytest.raises(CockpitRegistrationError, match="owned by a discoverer"):
+        ck.unregister("disc")
+    assert _boards(ck) == ["disc"]                    # still there, and the next refresh raises nothing
+    assert ck.manifest(CRED)["panels"]["disc"]["kind"] == "board"
+    here["on"] = False
+    assert _boards(ck) == [BOARD_DEFAULT_ID]          # it goes when its discoverer drops it; the built-in returns
+
+
+def test_any_kind_registered_under_the_kernels_board_id_replaces_it_after_the_attach() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    _attach(ck)
+    with pytest.raises(CockpitRegistrationError):     # validated first: a bad one leaves the built-in
+        ck.register(ProviderSpec(BOARD_DEFAULT_ID, "line", "Bad", "nonsense", lambda c: Read(value={"lines": []})))
+    assert ck.manifest(CRED)["panels"][BOARD_DEFAULT_ID]["title"] == "Work board"
+    ck.register(ProviderSpec(BOARD_DEFAULT_ID, "line", "Mine", "gauge", lambda c: Read(value={"lines": []})))
+    assert ck.manifest(CRED)["panels"][BOARD_DEFAULT_ID]["title"] == "Mine" and not ck._board_yields
+    assert _boards(ck) == []
+
+
+def test_an_attach_that_omits_board_leaves_the_reader_and_the_builtin_and_none_removes_it() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    _attach(ck, _value(ready=[_card("levain:a")]))
+    ck.attach_server(None, lambda now: None)          # board omitted
+    assert _boards(ck) == [BOARD_DEFAULT_ID]
+    assert ck.panel(BOARD_DEFAULT_ID)["value"]["columns"][1]["cards"][0]["id"] == "levain:a"
+    ck.attach_server(None, lambda now: None, board=None)
+    assert _boards(ck) == []
+
+
+def test_a_board_none_attach_after_a_board_attach_changes_only_the_builtin() -> None:
+    ck = Cockpit()
+    _attach(ck)
+    n = len(ck.manifest(CRED)["panels"])
+    ck.attach_server(None, lambda now: None, board=None)
+    assert len(ck.manifest(CRED)["panels"]) == n - 1 and _boards(ck) == []

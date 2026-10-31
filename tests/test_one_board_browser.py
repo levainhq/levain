@@ -221,10 +221,11 @@ def test_compose_drop_refuses_a_box_that_is_busy_or_off_and_clears_a_stale_hando
             {"eval": f"{host}._drop.working = true; [LevainDashboard.composeDrop('x'), {state}]"},        # a send in flight
             {"eval": f"{host}._drop.working = false; {host}._drop.can = false; {host}._drop.note = 'no store'; "
                      f"[LevainDashboard.composeDrop('x'), {state}]"},                                       # the box is off
-            {"eval": f"{host}._drop.can = true; [LevainDashboard.composeDrop('About: '), {state}]"},       # a box that takes words
+            {"eval": f"{host}._drop.can = true; {host}._drop.note = 'queue is read-only'; [LevainDashboard.composeDrop('About: '), {state}]"},       # a box that takes words
         ])
     busy, off, ok = (json.loads(x) if isinstance(x, str) else x for x in out["values"][-3:])
     assert busy[0] is False and json.loads(busy[1])[0] == "" and json.loads(busy[1])[1] == "The drop box is busy"
     assert json.loads(busy[1])[2] == "stale"                                   # a refusal leaves the handoff alone
     assert off[0] is False and json.loads(off[1])[1] == "The drop box is off: no store" and json.loads(off[1])[0] == ""
     assert ok[0] is True and json.loads(ok[1])[0] == "About: " and json.loads(ok[1])[2] is None   # the stale handoff is cleared
+    assert json.loads(ok[1])[1] == "queue is read-only"                    # a coordinator note is not hidden by a successful compose
