@@ -49,6 +49,8 @@ DOOR: frozenset[tuple[str, ...]] = frozenset({
     ("coord", "questions"), ("coord", "answer"), ("coord", "escalate"),
     # away ON from a drop (fenced by the lease token), and the budget gauge and morning card it reads (C6)
     ("coord", "away"), ("coord", "budget"), ("coord", "morning"),
+    # the display-only list a work delta's "+N more" line points at; it makes nothing
+    ("coord", "log"),
     ("drops", "list"), ("drops", "show"), ("drops", "split"), ("drops", "note"),
     ("thread", "list"), ("thread", "show"), ("thread", "state"), ("thread", "merge"), ("thread", "detach"),
     ("thread", "add"), ("thread", "set"),

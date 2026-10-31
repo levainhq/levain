@@ -30,135 +30,6 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   held behind the coordinator's first read. The JSON of the band, the cockpit's question body and
   `levain question show --json` carry `open_ended`. The cockpit's page script is routed separately.
 
-### Changed
-- **The ping puts what you act on first.** A question ping is now the question, its options, the answer command, and
-  only then the blocks, which take the room left and end "(full text on the card)" when cut. The room is measured in
-  the bytes the phone push carries (emoji and accented text take more than one), and the question and the option
-  labels are shortened when even they would not fit, so the options and the answer line always arrive. Before, a long
-  blocks text (now up to 6,000 characters) could push the options and the answer line past what a notification keeps.
-  The store and every card still hold the whole text. The `ask` MCP tool's
-  schema now requires only `what` and `blocks` (options and rec are required unless `open` is true, checked in code).
-- **`levain ask` takes a whole analysis.** A question's `--blocks` text now holds up to 6,000 characters (was 300) and an option
-  label up to 600 (was 200). The caps are sized from the longest items a real caller filed (4,933 and 525 characters), and
-  the cockpit and the band show a question's text whole. Still refused: a block or label with a line break,
-  fewer than 2 or more than 6 options.
-- **An open question says so on the cockpit.** A question filed with `--open` (no options, no rec) now reads
-  "open question: answer in your own words" where the cockpit said a dangling "recommends ",
-  "open question" in the Decisions row where it said "0 options", and its words box asks "your answer, in your
-  own words". A question with options draws exactly as before.
-### Changed
-- **The Claude Code coordinator's own install now allows `Read`.** With your user layer left out, the `Read` rule in
-  your own settings is gone too, so a read of a file outside the coordinator's workspace stopped at a prompt nobody
-  answers. Its install's project settings now carry a bare `Read` allow, so it can read any file your own account can.
-  Write, Edit, WebFetch and every shell command other than its own `coord`, `drops` and `thread` verbs still ask. Only
-  the coordinator's own install gets the rule; a `levain init` for your sessions does not. The rule is the same with
-  `--user-scope on`, where your own rules apply as well. An older coordinator install gets the rule the next time
-  `levain coord agent claude` runs, or from `levain update --path <the coordinator directory>`: only the one entry is
-  added to `permissions.allow` (made if missing), every other byte of the file kept, a hand-edited one included, and a
-  second run changes nothing. Until then `levain coord status` says `coordinator install: upgrade pending` (and
-  `install_upgrade_pending` in `--json`). A settings file that is missing or unreadable (not UTF-8 included), is not a JSON object, or whose
-  `permissions` is not an object or `permissions.allow` not a list, is never written: `coord status` says `coordinator install: settings unreadable` with the reason (and
-  `install_settings_problem` in `--json`), and the rule is yours to add by hand.
-- **The Claude Code coordinator no longer loads your user-level Claude Code layer.** A coordinator session now starts
-  with `--setting-sources project,local` and auto-memory off, so your `~/.claude` settings, hooks, `CLAUDE.md` and
-  memory stay out of its context (measured on a cold turn: about 53K new cache tokens and $0.214 before, 9K and $0.038
-  with the flag). Its own install's project and local settings, including the consent hook, still apply. To put your
-  layer back, run `levain coord agent --user-scope on` (it keeps the agent, model and directory; `--user-scope off`
-  returns to the default, and `levain coord agent claude --user-scope on` sets both at once). `levain coord status`
-  and its `--json` show the choice (`user layer: off (project settings only)`). A launch keeps the choice it was asked
-  under: changing it while a launch waits to start changes the next one. `--user-scope` alone needs a claude
-  coordinator, and turning it on refuses, with the reason, when a `disableAllHooks` in your user settings would stop
-  every launch. A store from before this change reads as off. With the layer off, a `disableAllHooks` that lives only in your user settings no longer refuses the coordinator
-  launch, since the session never reads that file; `disableAllHooks` in the coordinator's own or an ancestor project
-  still refuses. Covered by tests of the spawn argv and the setting.
-- **The cockpit's owner key opens nothing off the box.** On a server bound to anything but loopback, and on a loopback
-  server reached through a proxy (an extra host, a forwarded-for or Tailscale header), a request carrying the owner
-  key is answered as if it carried no credential. Its 403 now says `"auth": "pair"` (a loopback request says
-  `"auth": "owner"`), and the manifest's `transport` gains `owner_key`, so a page knows to ask for a pairing code
-  rather than the key. `levain serve` no longer prints the owner key or puts it in the unlocked link on an
-  off-loopback bind; it prints how to pair a device instead. Not run by hand against a real proxied cockpit.
-
-### Removed
-- **The phone port's run token and its device registry.** `levain consent phone` serves only the redirect page now and
-  refuses without `--redirect-to`; `--token-file`, `--queue-dir` and `--sign-namespace` are gone from it (argparse
-  refuses them), and `--link-file` holds `{page, pid}` with no token, so a script's statement is no longer signed on
-  the phone port. The
-  token-gated phone routes, `/webpush/pair`, `/webpush/pair/redeem`, the `?pair=` rewrite of `/app.webmanifest` and
-  `levain ping pair`, `levain ping devices` and `levain ping revoke` are gone; pair a phone to the cockpit with
-  `levain cockpit pair`. A push subscription is stored only under a paired cockpit device, a row under any other
-  device is never sent to, and `POST /webpush/subscribe` with no device is 403. The service worker holds no credential: a
-  tap writes the ping's id into its own `levain-sw-2` database and the page records the open; activating it deletes the
-  old `levain-sw` database (the phone token's) and every `levain-` Cache Storage name it does not keep. The periodic
-  ticker that released held pings from inside the phone server is retired with it: release is event-driven, run by the
-  gate hook on every call and by the send child after each push, so a ping released by a quiet running out (or the desk
-  going idle) waits for the next gate-hook call or push, and stays held while no agent calls. Covered by tests; not run
-  on a real phone or a real push.
-
-### Fixed
-- **The morning card marks a presence word whose quote was not verified.** `_presence` dropped the `verified` flag the
-  quote check puts on every word an agent sets, so the card showed an agent's word as if it were the operator's. The
-  card's presence block now carries `verified` (true only when the quote was found in what he wrote; a record from before
-  the check reads as not verified), and `levain coord morning` appends `(unverified)` after the quote, as `levain ping
-  status` does. No setter: the block is unchanged.
-- **The coordinator's verbs take their text without shell quoting.** Shadow 10-30: two of three real coordinators
-  misfired on their own shell lines (flags kept in a variable that zsh does not split, then a `coord release` run in the
-  same batch as the writes, which ended the lease under them). `drops note`, `coord escalate`, `coord answer`, `thread
-  set` and `thread add` take `--text-file PATH` or `--stdin` (strict UTF-8, one trailing newline dropped, read under a
-  byte cap, then the verb's own limit); `thread state` and `thread set` take `--cause-file PATH`; `drops split` takes
-  the whole split as one JSON document (`--json-file PATH` or `--stdin`:
-  `{"drop_id", "threads": [{"kind", "title", "about"?}], "attach": [{"kind", "thread"}]}`) through the same checks as
-  `--thread` and `--attach`. Every old flag works as before. The coordinator brief shows these forms first, says never
-  to keep flags in a shell variable, and says to release the lease only as the last step, as its own command. The JSON
-  split refuses a key named twice at any level, a document nested too deeply, a `kind` that is not exactly one of the
-  kinds, an empty split, and a wrong-typed `title`/`thread`/`about`, each by name; input files and stdin drop a UTF-8 BOM.
-- **A coordinator's turn ends on a status line, and a drop that needs nothing gets a receipt.** The coordinator brief
-  now carries an end-of-turn rule: the last line of its words is one `coordinator:` status line (what it did, how many
-  items it escalated), never a question or "waits on you" (a coordinator that ended on an escalation sat in the agent
-  view as "waiting for answers" for ~50 minutes); escalations go through `levain coord escalate` or the band's ask
-  tool. New verb `levain drops note DROP_ID --why "one line" --by coordinator --token N` writes an append-only `noted`
-  drop receipt (lease-fenced, refused on a split drop). A noted drop is not re-quoted in a brief, not counted as unseen
-  (no replacement coordinator), not a "Drop not split" review item, and shows `[noted: why]` in `levain drops list` and
-  `drops show`. The `levain coord watch` line for a silent holder now says its window is the service-beat window, not a
-  bare "60 min".
-- **A drop that lands while a coordinator sits done is acted on at the next watcher pass, not an hour later.** A
-  coordinator that split its drop, released the lease and stayed listed (`claude --bg`, state `done`) kept the
-  coordinator slot as `idle`, so drops filed after it sat unread until `LEASE_TTL + IDLE_GRACE`. `levain coord watch`
-  (its serve thread included) now ends a `done` claude coordinator when an unsplit drop was delivered after its spawn
-  claim (its brief quotes every drop before that), with cause `replaced while done`, never a death, stops its session
-  and starts a fresh coordinator in the same pass, whose brief quotes the drop. The fresh launch is newer than the drop,
-  so one drop replaces at most one coordinator. `levain coord wake` does the same at once for a done claude
-  coordinator running without the lease (no drop needed), and otherwise says why and names `levain coord release`. A
-  coordinator not `done` is untouched; a Codex coordinator and a drop with no watcher running still wait out the grace.
-  A question filed with no live lease was never held, so it pings at filing (no ten-minute escalation applies to it).
-  `levain coord status`, `drops list|show` and `thread list|show` no longer create `dispatch.db` or `awake.lock`, or
-  add tables to a dispatch-only `dispatch.db`; they print `no coordinator store here` (`coord status --json` keeps its
-  keys, with `"store": null`).
-- **On macOS, a Codex session signed in with a ChatGPT subscription runs in a slot instead of failing with
-  `account/read -32603`.** Codex syncs its managed preferences at start, and a slot account whose home was `/var/empty`
-  could not. The slot accounts that run vendor CLIs now have a root-owned, empty home, `L/vendorhome`, made by setup,
-  repair and replenish; the session also gets `SSL_CERT_FILE=/etc/ssl/cert.pem`, so Codex's TLS reaches chatgpt.com from
-  inside the slot. `levain doctor` gains an `agent slot homes` row: an install from before this change reports upgrade
-  pending (and exits that way) until `levain upgrade --no-pip` runs; a wrong owner, mode or a non-empty
-  `Library/Preferences` reports broken. Run once in a macOS test VM with a real ChatGPT login (two turns answered); not
-  run on Linux, where nothing changes.
-- **A cockpit with no question store no longer draws the Needs you band, or a note that it could not be recorded.** An
-  absent `questions.db` (no file, or an empty one) draws nothing in the band: no heading and no note, because nothing was
-  ever filed. A store that has content but cannot be read, is locked or lacks its identity row keeps its "the band could
-  not be recorded just now" line. The band also says it may be missing items when an authority source could not be read, when a second
-  read of an item failed, or when a question row or an authority item's record cannot be decoded; such a read is never
-  drawn as an absent store. The Board tab's Needs you column likewise reports nothing, instead of "could not be read",
-  for a cockpit that hosts no question store, or whose store file is absent or empty; a store that exists but fails to
-  read is still reported. Covered by tests,
-  including a real-browser test for the absent and unreadable cases; not run by hand on a real machine.
-- **`levain upgrade` run from a source tree with no installed `dist-info` refuses with "Could not tell how Levain was
-  installed"** (its message says to upgrade it your usual way, then run `levain upgrade --no-pip`) instead of printing `internal error:
-  PackageNotFoundError`. Covered by a test; not run by hand.
-- **A Claude passthrough route without `platform.claude.com` is refused when the session's routes load, naming the
-  host and the route.** The login refresh goes to that host through the route's tunnel; your own passthrough route
-  replaces the shipped one, so one without it made every refresh fail. Levain never adds the host to your route; the
-  refusal says to. Other routes (brokered, Codex) are not checked.
-
-### Added
 - **`levain serve` can serve the passkey signing pages.** `levain serve --write --sign-queue-dir DIR --sign-host NAME`
   hosts the cockpit's sign pages over the consent queue at `DIR`, for the https name `NAME` your reverse proxy serves
   on 443 (a `tailscale serve --https=443` name); that name is the one the passkey is made for and the one extra Host
@@ -507,6 +378,52 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   command line includes `--guard <guard.json>`.
 
 ### Changed
+- **The ping puts what you act on first.** A question ping is now the question, its options, the answer command, and
+  only then the blocks, which take the room left and end "(full text on the card)" when cut. The room is measured in
+  the bytes the phone push carries (emoji and accented text take more than one), and the question and the option
+  labels are shortened when even they would not fit, so the options and the answer line always arrive. Before, a long
+  blocks text (now up to 6,000 characters) could push the options and the answer line past what a notification keeps.
+  The store and every card still hold the whole text. The `ask` MCP tool's
+  schema now requires only `what` and `blocks` (options and rec are required unless `open` is true, checked in code).
+- **`levain ask` takes a whole analysis.** A question's `--blocks` text now holds up to 6,000 characters (was 300) and an option
+  label up to 600 (was 200). The caps are sized from the longest items a real caller filed (4,933 and 525 characters), and
+  the cockpit and the band show a question's text whole. Still refused: a block or label with a line break,
+  fewer than 2 or more than 6 options.
+- **An open question says so on the cockpit.** A question filed with `--open` (no options, no rec) now reads
+  "open question: answer in your own words" where the cockpit said a dangling "recommends ",
+  "open question" in the Decisions row where it said "0 options", and its words box asks "your answer, in your
+  own words". A question with options draws exactly as before.
+- **The Claude Code coordinator's own install now allows `Read`.** With your user layer left out, the `Read` rule in
+  your own settings is gone too, so a read of a file outside the coordinator's workspace stopped at a prompt nobody
+  answers. Its install's project settings now carry a bare `Read` allow, so it can read any file your own account can.
+  Write, Edit, WebFetch and every shell command other than its own `coord`, `drops` and `thread` verbs still ask. Only
+  the coordinator's own install gets the rule; a `levain init` for your sessions does not. The rule is the same with
+  `--user-scope on`, where your own rules apply as well. An older coordinator install gets the rule the next time
+  `levain coord agent claude` runs, or from `levain update --path <the coordinator directory>`: only the one entry is
+  added to `permissions.allow` (made if missing), every other byte of the file kept, a hand-edited one included, and a
+  second run changes nothing. Until then `levain coord status` says `coordinator install: upgrade pending` (and
+  `install_upgrade_pending` in `--json`). A settings file that is missing or unreadable (not UTF-8 included), is not a JSON object, or whose
+  `permissions` is not an object or `permissions.allow` not a list, is never written: `coord status` says `coordinator install: settings unreadable` with the reason (and
+  `install_settings_problem` in `--json`), and the rule is yours to add by hand.
+- **The Claude Code coordinator no longer loads your user-level Claude Code layer.** A coordinator session now starts
+  with `--setting-sources project,local` and auto-memory off, so your `~/.claude` settings, hooks, `CLAUDE.md` and
+  memory stay out of its context (measured on a cold turn: about 53K new cache tokens and $0.214 before, 9K and $0.038
+  with the flag). Its own install's project and local settings, including the consent hook, still apply. To put your
+  layer back, run `levain coord agent --user-scope on` (it keeps the agent, model and directory; `--user-scope off`
+  returns to the default, and `levain coord agent claude --user-scope on` sets both at once). `levain coord status`
+  and its `--json` show the choice (`user layer: off (project settings only)`). A launch keeps the choice it was asked
+  under: changing it while a launch waits to start changes the next one. `--user-scope` alone needs a claude
+  coordinator, and turning it on refuses, with the reason, when a `disableAllHooks` in your user settings would stop
+  every launch. A store from before this change reads as off. With the layer off, a `disableAllHooks` that lives only in your user settings no longer refuses the coordinator
+  launch, since the session never reads that file; `disableAllHooks` in the coordinator's own or an ancestor project
+  still refuses. Covered by tests of the spawn argv and the setting.
+- **The cockpit's owner key opens nothing off the box.** On a server bound to anything but loopback, and on a loopback
+  server reached through a proxy (an extra host, a forwarded-for or Tailscale header), a request carrying the owner
+  key is answered as if it carried no credential. Its 403 now says `"auth": "pair"` (a loopback request says
+  `"auth": "owner"`), and the manifest's `transport` gains `owner_key`, so a page knows to ask for a pairing code
+  rather than the key. `levain serve` no longer prints the owner key or puts it in the unlocked link on an
+  off-loopback bind; it prints how to pair a device instead. Not run by hand against a real proxied cockpit.
+
 - **The consent queue's store moves to format 5, one way.** The first consent hook call or `levain` command that opens
   it migrates it in place (from format 3 or 4), keeping every request, signed answer and receipt. An older levain then
   refuses that store: its hook makes no decision (the agent's own permission dialog asks), standing grants stop
@@ -537,7 +454,90 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **The gateway's log line for a refused connection names the host that was asked for,** when it is a valid host name or
   a plainly written address.
 
+### Removed
+- **The phone port's run token and its device registry.** `levain consent phone` serves only the redirect page now and
+  refuses without `--redirect-to`; `--token-file`, `--queue-dir` and `--sign-namespace` are gone from it (argparse
+  refuses them), and `--link-file` holds `{page, pid}` with no token, so a script's statement is no longer signed on
+  the phone port. The
+  token-gated phone routes, `/webpush/pair`, `/webpush/pair/redeem`, the `?pair=` rewrite of `/app.webmanifest` and
+  `levain ping pair`, `levain ping devices` and `levain ping revoke` are gone; pair a phone to the cockpit with
+  `levain cockpit pair`. A push subscription is stored only under a paired cockpit device, a row under any other
+  device is never sent to, and `POST /webpush/subscribe` with no device is 403. The service worker holds no credential: a
+  tap writes the ping's id into its own `levain-sw-2` database and the page records the open; activating it deletes the
+  old `levain-sw` database (the phone token's) and every `levain-` Cache Storage name it does not keep. The periodic
+  ticker that released held pings from inside the phone server is retired with it: release is event-driven, run by the
+  gate hook on every call and by the send child after each push, so a ping released by a quiet running out (or the desk
+  going idle) waits for the next gate-hook call or push, and stays held while no agent calls. Covered by tests; not run
+  on a real phone or a real push.
+
 ### Fixed
+- **A coordinator may run the `levain coord log` line its reply block hands it.** When more than five records are new, the
+  work delta ends with `+N more: levain coord log --since G`; the coordinator's workspace refused that command as the
+  operator's. `coord log` only displays, so it is now admitted there. The presence word is also written whole when the
+  disk takes it in pieces, and a failed write no longer leaves a temporary file in the queue directory.
+- **The morning card marks a presence word whose quote was not verified.** `_presence` dropped the `verified` flag the
+  quote check puts on every word an agent sets, so the card showed an agent's word as if it were the operator's. The
+  card's presence block now carries `verified` (true only when the quote was found in what he wrote; a record from before
+  the check reads as not verified), and `levain coord morning` appends `(unverified)` after the quote, as `levain ping
+  status` does. No setter: the block is unchanged.
+- **The coordinator's verbs take their text without shell quoting.** Shadow 10-30: two of three real coordinators
+  misfired on their own shell lines (flags kept in a variable that zsh does not split, then a `coord release` run in the
+  same batch as the writes, which ended the lease under them). `drops note`, `coord escalate`, `coord answer`, `thread
+  set` and `thread add` take `--text-file PATH` or `--stdin` (strict UTF-8, one trailing newline dropped, read under a
+  byte cap, then the verb's own limit); `thread state` and `thread set` take `--cause-file PATH`; `drops split` takes
+  the whole split as one JSON document (`--json-file PATH` or `--stdin`:
+  `{"drop_id", "threads": [{"kind", "title", "about"?}], "attach": [{"kind", "thread"}]}`) through the same checks as
+  `--thread` and `--attach`. Every old flag works as before. The coordinator brief shows these forms first, says never
+  to keep flags in a shell variable, and says to release the lease only as the last step, as its own command. The JSON
+  split refuses a key named twice at any level, a document nested too deeply, a `kind` that is not exactly one of the
+  kinds, an empty split, and a wrong-typed `title`/`thread`/`about`, each by name; input files and stdin drop a UTF-8 BOM.
+- **A coordinator's turn ends on a status line, and a drop that needs nothing gets a receipt.** The coordinator brief
+  now carries an end-of-turn rule: the last line of its words is one `coordinator:` status line (what it did, how many
+  items it escalated), never a question or "waits on you" (a coordinator that ended on an escalation sat in the agent
+  view as "waiting for answers" for ~50 minutes); escalations go through `levain coord escalate` or the band's ask
+  tool. New verb `levain drops note DROP_ID --why "one line" --by coordinator --token N` writes an append-only `noted`
+  drop receipt (lease-fenced, refused on a split drop). A noted drop is not re-quoted in a brief, not counted as unseen
+  (no replacement coordinator), not a "Drop not split" review item, and shows `[noted: why]` in `levain drops list` and
+  `drops show`. The `levain coord watch` line for a silent holder now says its window is the service-beat window, not a
+  bare "60 min".
+- **A drop that lands while a coordinator sits done is acted on at the next watcher pass, not an hour later.** A
+  coordinator that split its drop, released the lease and stayed listed (`claude --bg`, state `done`) kept the
+  coordinator slot as `idle`, so drops filed after it sat unread until `LEASE_TTL + IDLE_GRACE`. `levain coord watch`
+  (its serve thread included) now ends a `done` claude coordinator when an unsplit drop was delivered after its spawn
+  claim (its brief quotes every drop before that), with cause `replaced while done`, never a death, stops its session
+  and starts a fresh coordinator in the same pass, whose brief quotes the drop. The fresh launch is newer than the drop,
+  so one drop replaces at most one coordinator. `levain coord wake` does the same at once for a done claude
+  coordinator running without the lease (no drop needed), and otherwise says why and names `levain coord release`. A
+  coordinator not `done` is untouched; a Codex coordinator and a drop with no watcher running still wait out the grace.
+  A question filed with no live lease was never held, so it pings at filing (no ten-minute escalation applies to it).
+  `levain coord status`, `drops list|show` and `thread list|show` no longer create `dispatch.db` or `awake.lock`, or
+  add tables to a dispatch-only `dispatch.db`; they print `no coordinator store here` (`coord status --json` keeps its
+  keys, with `"store": null`).
+- **On macOS, a Codex session signed in with a ChatGPT subscription runs in a slot instead of failing with
+  `account/read -32603`.** Codex syncs its managed preferences at start, and a slot account whose home was `/var/empty`
+  could not. The slot accounts that run vendor CLIs now have a root-owned, empty home, `L/vendorhome`, made by setup,
+  repair and replenish; the session also gets `SSL_CERT_FILE=/etc/ssl/cert.pem`, so Codex's TLS reaches chatgpt.com from
+  inside the slot. `levain doctor` gains an `agent slot homes` row: an install from before this change reports upgrade
+  pending (and exits that way) until `levain upgrade --no-pip` runs; a wrong owner, mode or a non-empty
+  `Library/Preferences` reports broken. Run once in a macOS test VM with a real ChatGPT login (two turns answered); not
+  run on Linux, where nothing changes.
+- **A cockpit with no question store no longer draws the Needs you band, or a note that it could not be recorded.** An
+  absent `questions.db` (no file, or an empty one) draws nothing in the band: no heading and no note, because nothing was
+  ever filed. A store that has content but cannot be read, is locked or lacks its identity row keeps its "the band could
+  not be recorded just now" line. The band also says it may be missing items when an authority source could not be read, when a second
+  read of an item failed, or when a question row or an authority item's record cannot be decoded; such a read is never
+  drawn as an absent store. The Board tab's Needs you column likewise reports nothing, instead of "could not be read",
+  for a cockpit that hosts no question store, or whose store file is absent or empty; a store that exists but fails to
+  read is still reported. Covered by tests,
+  including a real-browser test for the absent and unreadable cases; not run by hand on a real machine.
+- **`levain upgrade` run from a source tree with no installed `dist-info` refuses with "Could not tell how Levain was
+  installed"** (its message says to upgrade it your usual way, then run `levain upgrade --no-pip`) instead of printing `internal error:
+  PackageNotFoundError`. Covered by a test; not run by hand.
+- **A Claude passthrough route without `platform.claude.com` is refused when the session's routes load, naming the
+  host and the route.** The login refresh goes to that host through the route's tunnel; your own passthrough route
+  replaces the shipped one, so one without it made every refresh fail. Levain never adds the host to your route; the
+  refusal says to. Other routes (brokered, Codex) are not checked.
+
 - **A login that ended without a yes on a slot that already holds a login no longer sticks.** The session used to end
   HELD and keep its slot leased for good. Now the stored login is left as it was, the new one is kept with the
   session's retained work instead, and the slot is released. A session already stuck this way is released by the
@@ -618,6 +618,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   guard is refused at signing instead of the check crashing.
 
 ### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
+- Groundwork for the session-start brief: the morning card takes an optional `now` (no wall-clock read, no band numbering when given), the band can be read without recording a view or numbering an item, and the ready board can be read on a connection the caller already holds. Every default is unchanged, and nothing in `levain` passes them yet, so there is no change you can see.
 - Groundwork for named agents: a role registry. `levain agents role add <file>` registers a role (name, brief template with typed slots, ceiling, model, harness, executor) under a content hash and a version, and refuses a file with an unknown field, naming it; `levain agents role show <name>` prints it. Nothing runs a role yet, and no role is signed: authorisation comes through the agent link.
 - Groundwork for chat approvals: the store now has tables for each approval request a chat session raises and everything that happens to it (asked, decided, answered, cancelled), kept in the same append-only style as the rest of the chat record. Nothing in `levain` writes to them yet, so there is no change you can see. A store from 0.11.25 or later is brought up to date the first time it is opened for writing, keeping every row it already had; opening one read-only changes nothing.
 - **A contained-shell grant can answer a Levain chat launch's Bash calls.** It answers only a chat call carrying the
@@ -699,8 +700,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   under any umask. It launches no dispatch runs yet.
 - Groundwork for the dream: `levain.dream.executor.consolidate_store` is the consolidate that `levain wrap` ran, lifted to take a store path, a compose mind and two hooks, and returning a typed result for every outcome instead of raising. `levain wrap` now calls it with one compose; its exit codes and its `--reset` remedies are unchanged, but some messages now name the store rather than the entity or the seat: "already running on this store" (was "this entity"), "This run would normally discard the orphan" (was "This seat"), "this store is not on / changed off the partnership schema" (was "this entity's store"), "check the log" (was "the seat's log"), and "the memory is unchanged" / "The identity is unchanged" (were "the entity's memory" / "The entity's identity"). The new core adds a re-compose loop (each draft checked first on a scratch copy of the store, up to three composes, every refusal fed back verbatim), a `claude -p` mind and an Ollama mind, a per-run dollar limit with a start rule, and `progress.json` and `usage.json`. The one command is `levain dream run --store-dir <copy> --mind claude|ollama`, for a COPY of a store; it refuses any store whose db, dir, text-tier files or lock resolve (symlinks followed) into `~/.anneal-memory`, refuses a non-positive `--max-seconds`, writes `progress.json` and `usage.json` only once it holds the store lock and never over a record that names a live compose child, and the Claude route refuses to compose until a price row for the model is added. Its messages name only commands that exist (anneal's `wrap-status` / `wrap-cancel --wrap-token` on the store, never `--reset`). Nothing runs it on a schedule. `--max-seconds` bounds the compose and its checks, not the final save, which runs after the bound is disarmed on purpose (the saving-phase journal is the recovery). The run works on the store's RESOLVED `memory.db` (a symlinked db no longer splits the lock and text files from the file SQLite writes); the occurrence dir is made absolute (a relative one names the same dir for the child's package, cwd and `--add-dir`), is refused inside `~/.anneal-memory` like the store, and a default one carries a random suffix so two runs in one second never share it. `--dry-run` needs no price row. A `claude` child that prints a success result and exits non-zero is not accepted (its cost is still counted). After a run that did not save and whose wrap was cancelled, `progress.json` names no wrap (`phase`, `wrap_token` and `composed_sha256` back to null).
 
-### Groundwork (not reachable from a `levain` command yet, except where an entry says so)
 - Groundwork for seam handoffs: the coordinator store gains an append-only `seam_handoffs` table and one lease-fenced writer for it, so a coordinator can leave a handoff (state, work in flight, next step, contingencies) at a rotation, an operator leave or a dream. A retry of the same request returns the stored handoff, and a late close behind a newer one is refused. Nothing calls it yet, so there is no change you can see. A store from before this is brought up to date the first time it is opened for writing, keeping every row it had.
+
 
 ## [0.11.26] — 2026-10-25
 
