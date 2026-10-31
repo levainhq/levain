@@ -6217,7 +6217,7 @@
 
   // The Open loops panel on the PAGE: the focus view (a .modal) draws a copy of the same rows, which is not where the Work lens means to go.
   function loopsPanel() {
-    return Array.prototype.find.call(document.querySelectorAll('[data-ck-panel="loops"]'), (p) => !p.closest(".modal")) || null;
+    return Array.prototype.find.call(document.querySelectorAll('.panel[data-ck-panel="loops"]'), (p) => !p.closest(".modal")) || null;
   }
   function loopRowIn(panel, id) {
     return Array.prototype.find.call(panel.querySelectorAll(".row[data-spore]"), (n) => n.dataset.spore === id && !n.closest(".modal")) || null;
@@ -6234,10 +6234,20 @@
     if (!input || !input.value) return null;
     const kept = input.value;
     input.value = "";
+    // the bar applies its query synchronously on this event, so the second lookup needs no frame's wait
     input.dispatchEvent(new Event("input", { bubbles: true }));
     row = loopRowIn(panel, id);
     if (!row) { input.value = kept; input.dispatchEvent(new Event("input", { bubbles: true })); }
+    else loopCleared = { id, kept, input };
     return row;
+  }
+  // the query a successful lookup cleared, for a jump that then fails to put it back; and why the last jump failed ("absent", "edit", "hidden")
+  let loopCleared = null;
+  let loopWhy = "";
+  function loopRestore(id) {
+    const c = loopCleared;
+    loopCleared = null;
+    if (c && c.id === id && c.input.isConnected && !c.input.value) { c.input.value = c.kept; c.input.dispatchEvent(new Event("input", { bubbles: true })); }
   }
   // one highlight at a time: a second tap re-arms the same timer instead of racing the first one's end
   let loopLitTimer = 0;
@@ -6245,14 +6255,16 @@
   // list folded away is shown through the fold's own pin, and the row is scrolled to, focused and outlined (tv-lit) for a moment.
   // True only when the row is on screen afterwards; false (nothing lit) when the page has no such row or the panel refused to unfold.
   function loopGo(id) {
+    loopWhy = "";
     const row = loopFind(id);
-    if (!row) return false;
+    if (!row) { loopWhy = "absent"; return false; }
     const panel = row.closest(".panel[data-ck-panel]");
+    if (!panel) { loopRestore(id); loopWhy = "hidden"; return false; }
     if (panel.classList.contains("ck-collapsed")) {
       const f = panel.querySelector(".ck-lay-fold");
       if (f && !f.disabled) f.click();
       // an unsaved edit refuses the fold: the card stays shut, and a row inside it is not lit
-      if (panel.classList.contains("ck-collapsed")) return false;
+      if (panel.classList.contains("ck-collapsed")) { loopRestore(id); loopWhy = "edit"; return false; }
     }
     const body = row.closest(".pbody");
     if (row.dataset.folded || row.style.display === "none") {
@@ -6260,12 +6272,17 @@
       setExpanded(row, true);
       if (body) measureOverflow(body);
     }
-    if (!row.getClientRects().length) return false;
+    if (!row.getClientRects().length) { loopRestore(id); loopWhy = "hidden"; return false; }
+    loopCleared = null;
     for (const n of document.querySelectorAll(".tv-lit[data-spore]")) n.classList.remove("tv-lit");
     row.classList.add("tv-lit");
     window.clearTimeout(loopLitTimer);
     loopLitTimer = window.setTimeout(() => row.classList.remove("tv-lit"), 2600);
-    row.tabIndex = -1;
+    // a row that already has a tab stop (the writable page's verbs) keeps it; one without gets a temporary -1 that blur takes away
+    if (!row.hasAttribute("tabindex")) {
+      row.tabIndex = -1;
+      row.addEventListener("blur", () => { if (row.getAttribute("tabindex") === "-1") row.removeAttribute("tabindex"); }, { once: true });
+    }
     if (typeof row.focus === "function") row.focus({ preventScroll: true });
     const calm = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
     const scroll = () => { if (typeof row.scrollIntoView === "function") row.scrollIntoView({ block: "center", behavior: calm ? "auto" : "smooth" }); };
@@ -7464,8 +7481,13 @@
       rf = Array.prototype.find.call(document.querySelectorAll(".ck-card.w.w-open"), (n) => n.dataset.ckPanel === rf.dataset.ckPanel) || null;
     }
     // a repaint of the Work lens replaces the chip that opened the agent page: its successor is found by the node it names
+    // (the node AND its task's card: one worker on two tasks has a chip on each, and only the one that opened the page is its successor)
     if (rf && !document.body.contains(rf) && rf.dataset && rf.dataset.node && rf.classList.contains("tv-chip")) {
-      rf = Array.prototype.find.call(document.querySelectorAll(".tv-chip.tv-open"), (n) => n.dataset.node === rf.dataset.node) || null;
+      const was = rf.closest(".tv-task"), wasTask = was && was.dataset ? was.dataset.task : null;
+      rf = wasTask == null ? null : Array.prototype.find.call(document.querySelectorAll(".tv-chip.tv-open"), (n) => {
+        const t = n.closest(".tv-task");
+        return n.dataset.node === rf.dataset.node && !!t && t.dataset.task === wasTask;
+      }) || null;
     }
     // restore focus to the ⤢ trigger if it's still in the DOM (an intervening board
     // re-render may have replaced it — then focus simply falls to <body>, acceptable).
@@ -7698,6 +7720,6 @@
 
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
-  window.LevainLoops = { find: loopFind, go: loopGo };
+  window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
   window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

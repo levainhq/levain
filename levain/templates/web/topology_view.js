@@ -469,10 +469,10 @@
     const said = "open this loop in Open loops";
     node.title = said;
     // the title is the one focusable control (a card that is itself a button would hold the worker chips inside a button); a tap anywhere else
-    // on the card still opens it. The page says whether the row was there: false = not in Open loops now, null = it would not unfold.
+    // on the card still opens it. The page says whether the row was there: false = not in Open loops now, null = an unsaved edit kept it shut, any other value = it could not be shown.
     const go = () => {
       const r = opts.openLoop(sid);
-      node.title = r === false ? "not in Open loops now" : r === null ? "finish the open edit first" : said;
+      node.title = r === false ? "not in Open loops now" : r === null ? "finish the open edit first" : r === true || r === undefined ? said : "could not open it in Open loops";
     };
     if (title) {
       title.setAttribute("role", "button");
@@ -481,7 +481,7 @@
     }
     node.addEventListener("click", (ev) => {
       const hit = ev.target.closest && ev.target.closest(".tv-chip, a, button, [role=button]");
-      if (!hit || hit === title) go();
+      if (!hit || hit === title || hit === node || !node.contains(hit)) go();
     });
   }
   function taskCard(t, byId, lost, opts, v) {

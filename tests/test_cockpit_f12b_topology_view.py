@@ -496,7 +496,7 @@ def test_a_second_tap_keeps_the_full_highlight_and_focus_lands_on_the_row(tmp_pa
         {"eval": "(async () => { " + CARD + ".click(); await " + wait % 1300 + "; " + CARD + ".click(); await " + wait % 1400 + "; "
                  "return JSON.stringify([" + PAGE_ROW + ".classList.contains('tv-lit'), document.activeElement === " + PAGE_ROW + ", " + PAGE_ROW + ".tabIndex]); })()"},
         {"eval": "(async () => { await " + wait % 1500 + "; return " + PAGE_ROW + ".classList.contains('tv-lit'); })()"}])
-    assert json.loads(out[0]) == [True, True, -1], out    # lit at 2.7 s: the first tap's timer (2.6 s) did not end it
+    assert json.loads(out[0]) == [True, True, 0], out     # (a writable page's row keeps its own stop) lit at 2.7 s: the first tap's timer (2.6 s) did not end it
     assert out[1] is False, out                           # and it does end
 
 
@@ -523,3 +523,85 @@ def test_focus_returns_to_the_live_chip_when_the_agent_page_closes_after_a_repai
         {"eval": "(document.getElementById('levain-modal') || document).dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); "
                  "JSON.stringify([document.body.contains(window.__old), document.activeElement === " + chip + "])"}])
     assert json.loads(out[-1]) == [False, True], out
+
+
+# --- round 2: the panel itself, the exact chip, the row's own tabindex, the filter kept on a failed jump -----------------
+
+
+@needs_browser
+def test_a_card_carrying_the_loops_panel_id_does_not_steal_the_jump(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    out = _to_work(tmp_path, src, [
+        {"eval": "window.__id = " + PAGE_ROW + ".dataset.spore; const c = document.createElement('div'); c.className = 'ck-card w'; "
+                 "c.setAttribute('data-ck-panel', 'loops'); document.body.insertBefore(c, document.body.firstChild); "
+                 "JSON.stringify([window.LevainLoops.go(window.__id), " + PAGE_ROW + ".classList.contains('tv-lit')])"}])
+    assert json.loads(out[0]) == [True, True], out
+
+
+@needs_browser
+def test_a_rows_own_tabindex_is_kept_and_a_temporary_one_is_removed_on_blur(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    out = _to_work(tmp_path, src, [
+        {"eval": "window.__id = " + PAGE_ROW + ".dataset.spore; " + PAGE_ROW + ".tabIndex = 0; window.LevainLoops.go(window.__id); " + PAGE_ROW + ".tabIndex"},
+        {"eval": "(async () => { const wait = () => new Promise(r => setTimeout(r, 120)); const r = " + PAGE_ROW + "; r.blur(); await wait(); r.removeAttribute('tabindex'); await wait(); "
+                 "window.LevainLoops.go(window.__id); const during = r.getAttribute('tabindex'); const was = document.activeElement === r; r.dispatchEvent(new FocusEvent('blur')); await wait(); "
+                 "return JSON.stringify([during, r.getAttribute('tabindex'), was]); })()"}])
+    assert out[0] == 0, out
+    assert json.loads(out[1]) == ["-1", None, True], out
+
+
+@needs_browser
+def test_a_filter_is_put_back_when_the_jump_fails_after_clearing_it(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    inp = LOOPS + ".querySelector('.ep-search-input')"
+    out = _to_work(tmp_path, src, [
+        {"eval": "window.__id = " + PAGE_ROW + ".dataset.spore; " + LOOPS + ".style.display = 'none'; "   # a panel that cannot show the row once found
+                 + inp + ".value = 'zzz-no-such'; " + inp + ".dispatchEvent(new Event('input', {bubbles: true})); 1"},
+        {"eval": "JSON.stringify([window.LevainLoops.go(window.__id), " + inp + ".value])"}])
+    assert json.loads(out[1]) == [False, "zzz-no-such"], out
+
+
+@needs_browser
+def test_the_card_says_the_edit_reason_only_for_the_edit_refusal(tmp_path, monkeypatch):
+    root, src = _sessions_fixture(tmp_path, monkeypatch)
+    _spore(root)
+    out = _to_work(tmp_path, src, [
+        {"eval": LOOPS + ".querySelector('.ck-lay-fold').click(); " + LOOPS + ".querySelector('.ck-lay-fold').disabled = true; " + CARD + ".click(); " + CARD + ".title"},
+        {"eval": LOOPS + ".querySelector('.ck-lay-fold').disabled = false; " + LOOPS + ".querySelector('.ck-lay-fold').click(); "
+                 "document.querySelector('.tv-task-t'); " + PAGE_ROW + ".style.display = 'none'; " + PAGE_ROW + ".dataset.folded = ''; delete " + PAGE_ROW + ".dataset.folded; "
+                 + LOOPS + ".style.display = 'none'; " + CARD + ".click(); " + CARD + ".title"}])
+    assert out[0] == "finish the open edit first", out
+    assert out[1] == "could not open it in Open loops", out
+
+
+@needs_browser
+def test_a_card_inside_a_button_still_opens_and_the_chip_returns_to_its_own_card(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    spore_chip = TV + ".querySelector('.tv-task[data-task=\"spore:spore-017\"] .tv-chip')"
+    out = _run(tmp_path, src, [
+        {"eval": "window.LevainAgentPage = {open: (n) => { window.__pg = n.id; }}; " + _paint_with(_work_value(), True, True)},
+        {"eval": "const h = document.getElementById('ck-hlens'); const b = document.createElement('div'); b.setAttribute('role', 'button'); "
+                 "while (h.firstChild) b.appendChild(h.firstChild); h.appendChild(b); " + LOOP + ".click(); window.__loop"},
+    ])
+    assert out[-1] == "spore-017", out
+    # the focus return: one worker on two cards, the later card's chip opened the page, a repaint replaced both
+    out = _run(tmp_path, src, [
+        {"eval": _paint(_work_value())}, {"eval": "window.__old = " + spore_chip + "; window.__old.click(); 1"},
+        {"until": "document.querySelector('.agent-page')"},
+        {"eval": _paint(_work_value())},
+        {"eval": "(document.getElementById('levain-modal') || document).dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); "
+                 "JSON.stringify([document.body.contains(window.__old), document.activeElement === " + spore_chip + "])"},
+        {"eval": "document.querySelector('.agent-page') ? 1 : 0"},
+    ])
+    assert json.loads(out[-2]) == [False, True], out
+    # and when that exact card is gone the focus goes to nothing, not to the other card's chip
+    out = _run(tmp_path, src, [
+        {"eval": _paint(_work_value())}, {"eval": "window.__old = " + spore_chip + "; window.__old.click(); 1"},
+        {"until": "document.querySelector('.agent-page')"},
+        {"eval": _paint(_value())},
+        {"eval": "(document.getElementById('levain-modal') || document).dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); "
+                 "JSON.stringify([document.activeElement && document.activeElement.classList.contains('tv-chip')])"}])
+    assert json.loads(out[-1]) == [False], out
