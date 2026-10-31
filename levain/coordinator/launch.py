@@ -189,16 +189,18 @@ def _user_settings_files() -> set[Path]:
     return {(d / "settings.json").resolve() for d in dirs}
 
 
-def band_failure(rows: list | None, directory: Path, agent: str) -> tuple[str, str] | None:
+def band_failure(rows: list | None, directory: Path, agent: str,
+                 codex_home: Path | None = None) -> tuple[str, str] | None:
     """``(what is wrong, the command that fixes it)`` when a coordinator in ``directory`` could not show the NEEDS YOU
     band, else ``None``: doctor's own ``NEEDS YOU band hooks`` row (taken from ``rows`` when the check ran it, else
-    run here; never a second checker) failing."""
+    run here; never a second checker) failing. ``codex_home``: the Codex home whose hooks.json names the interpreter
+    (the one the Codex launcher uses)."""
     from levain import doctor
 
     row = next((r for r in rows or () if r.name == doctor.BAND_HOOKS_ROW), None)
     if row is None:
         try:
-            row = doctor._check_band_hooks(Path(directory), agent)
+            row = doctor._check_band_hooks(Path(directory), agent, codex_home)
         except Exception as exc:  # noqa: BLE001 - a check that cannot run is a refusal, never a pass
             return (f"{doctor.BAND_HOOKS_ROW}: not checked ({type(exc).__name__}: {str(exc)[:200]})",
                     f"levain doctor --path {directory}")

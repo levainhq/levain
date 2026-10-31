@@ -44,7 +44,7 @@ class Rig:
                     "LEVAIN_HOME": str(self.lv), "PATH": os.environ["PATH"], "PYTHONPATH": str(SRC)}
         for k, v in self.env.items():
             monkeypatch.setenv(k, v)
-        for k in ("LEVAIN_SEAT", "LEVAIN_HOOK_SUPPRESS", "LEVAIN_SCOPE", "CLAUDE_PROJECT_DIR"):
+        for k in ("LEVAIN_SEAT", "LEVAIN_HOOK_SUPPRESS", "LEVAIN_SCOPE", "CLAUDE_PROJECT_DIR", "CLAUDE_CODE_ENTRYPOINT"):
             monkeypatch.delenv(k, raising=False)
         self.settings = self.cfg / "settings.json"
 
@@ -67,6 +67,7 @@ class Rig:
     def run_entry(self, event, payload, cwd, env_more=None):
         """The band-only entry as the user-settings command runs it (the command read back from the settings file)."""
         cmd = shlex.split(band_hook.live_commands()[event])
+        cmd = cmd[:cmd.index(event) + 1]                                       # the shell tail is the shell's
         cmd = [sys.executable if i == 0 else ("-P" if a == "-EP" else a) for i, a in enumerate(cmd)]   # keep PYTHONPATH
         return self._run(cmd, payload, cwd, env_more)
 
@@ -172,6 +173,88 @@ def test_status_reads_the_receipt_and_the_live_settings(rig, capsys):
     assert rig.verb("status") == 1 and "broken" in capsys.readouterr().err
 
 
+def test_a_symlinked_settings_file_stays_a_symlink_and_its_target_is_edited(rig):
+    dot = rig.tmp / "dotfiles"
+    dot.mkdir()
+    target = dot / "claude-settings.json"
+    original = json.dumps(UNRELATED, indent=2) + "\n"
+    target.write_text(original)
+    target.chmod(0o640)
+    rig.settings.symlink_to(target)
+    assert rig.verb("install") == 0
+    assert rig.settings.is_symlink() and os.readlink(rig.settings) == str(target)
+    assert set(band_hook.live_commands()) == set(band_hook.EVENTS)
+    assert "levain.band_hook" in target.read_text()
+    assert target.stat().st_mode & 0o777 == 0o640
+    assert json.loads((rig.lv / "band_hooks.json").read_text())["settings"] == os.path.realpath(target)
+    assert sorted(p.name for p in dot.iterdir()) == [target.name]            # no temp file left beside it
+    assert sorted(p.name for p in rig.cfg.iterdir()) == ["settings.json"]
+    assert rig.verb("remove") == 0
+    assert rig.settings.is_symlink() and os.readlink(rig.settings) == str(target)
+    assert target.read_text() == original and target.stat().st_mode & 0o777 == 0o640
+
+
+def test_install_twice_then_remove_leaves_what_was_there(rig):
+    assert not rig.settings.exists()
+    for _ in range(2):
+        assert rig.verb("install") == 0
+    assert json.loads((rig.lv / "band_hooks.json").read_text())["created_file"] is True
+    assert rig.verb("remove") == 0 and not rig.settings.exists()            # never a {} the operator did not have
+    for text in ("{}\n", json.dumps(UNRELATED, indent=2) + "\n"):
+        rig.settings.write_text(text)
+        for _ in range(2):
+            assert rig.verb("install") == 0
+        assert rig.verb("remove") == 0 and rig.settings.read_text() == text
+
+
+def test_remove_also_cleans_the_current_settings_file_when_the_receipt_names_another(rig, monkeypatch):
+    assert rig.verb("install") == 0
+    old = rig.settings
+    moved = rig.tmp / "claude-cfg-2"
+    moved.mkdir()
+    doc = json.loads(old.read_text())
+    doc["theme"] = "light"
+    (moved / "settings.json").write_text(json.dumps(doc, indent=2) + "\n")     # the operator copied the file across
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(moved))
+    assert rig.verb("remove") == 0
+    assert not old.exists()                                                   # the receipt's file: install created it
+    assert json.loads((moved / "settings.json").read_text()) == {"theme": "light"}
+
+
+def test_the_command_is_quiet_when_its_interpreter_or_module_is_gone(rig):
+    gone = rig.tmp / "venv-moved" / "bin" / "python"
+    no_module = rig.tmp / "bare" / "python"
+    no_module.parent.mkdir()
+    no_module.write_text("#!/bin/sh\necho \"No module named levain\" >&2\nexit 1\n")
+    no_module.chmod(0o755)
+    for py in (gone, no_module):
+        cmd = band_hook.command_for(str(py), "UserPromptSubmit")
+        assert band_hook.is_ours({"type": "command", "command": cmd})          # still found by remove
+        p = subprocess.run(["/bin/sh", "-c", cmd], input='{"session_id": "x"}', capture_output=True, text=True,
+                           env=rig.env, cwd=str(rig.outside), timeout=30)
+        assert (p.returncode, p.stdout, p.stderr) == (0, "", "")
+        # doctor still FAILS the row: the interpreter is probed, not trusted
+        assert band_hook.install(python=str(py))[0] == 0
+        row = doctor._check_user_band_hooks()
+        assert not row.ok and row.hint == "levain band hooks install"
+        assert ("not a runnable interpreter" if py == gone else "cannot import levain.band_view") in row.detail
+    # the check can fail: the command without its tail is the notice Claude Code would show
+    bare = band_hook.command_for(str(gone), "UserPromptSubmit").replace(band_hook.QUIET_TAIL, "")
+    p = subprocess.run(["/bin/sh", "-c", bare], input="{}", capture_output=True, text=True, timeout=30)
+    assert p.returncode != 0 and p.stderr
+
+
+def test_update_rewrites_the_recorded_interpreter_only_when_installed(rig):
+    assert band_hook.refresh_after_update() is None and not rig.settings.exists()     # not opted in: untouched
+    assert band_hook.install(python="/old/venv/bin/python")[0] == 0
+    line = band_hook.refresh_after_update()
+    assert line and sys.executable in line
+    r = json.loads((rig.lv / "band_hooks.json").read_text())
+    assert r["python"] == sys.executable and r["created_file"] is True
+    assert all(shlex.split(c)[0] == sys.executable for c in band_hook.live_commands().values())
+    assert "/old/venv" not in rig.settings.read_text()
+
+
 # --- the band-only entry -------------------------------------------------------------------------------------
 def test_the_entry_renders_the_band_outside_any_install_and_its_stop_verifies(rig):
     rig.ask()
@@ -228,24 +311,78 @@ def test_the_entry_is_silent_for_an_autonomous_seat_and_a_suppressed_spawn(rig):
     assert rig.run_entry("UserPromptSubmit", {"prompt": "hi"}, rig.outside, {"LEVAIN_SEAT": "attended"}) != ""
 
 
-def test_a_worker_launch_row_is_autonomous_for_the_entry(rig):
+def _coordinator_row(rig, sid):
     from levain.coordinator.store import CoordStore
 
-    rig.ask()
-    rig.verb("install")
     store = CoordStore(rig.qdir)
     store.coord_set_agent("claude", model="haiku", cwd=str(rig.outside))
     d, _ = store.accept_drop("do a thing", surface="cli")
-    lid = store.woken_launch(d.drop_id)
-    store.launch_activate(lid, harness_session_id=SID)
-    ln = store.launch_by_harness_session(SID)
-    from levain import band_view
+    store.launch_activate(store.woken_launch(d.drop_id), harness_session_id=sid)
+    assert store.launch_by_harness_session(sid).role == "coordinator"
 
-    if ln.role == "worker":
-        assert rig.run_entry("UserPromptSubmit", {"prompt": "hi"}, rig.outside) == ""
-    else:                                                                      # a coordinator row is attended
-        assert band_view.is_autonomous(SID, rig.qdir, {}) is False
-        assert rig.run_entry("UserPromptSubmit", {"prompt": "hi"}, rig.outside) != ""
+
+def _worker_row(rig, sid):
+    from levain.coordinator.store import CoordStore, Part
+
+    store = CoordStore(rig.qdir)
+    store.coord_set_agent("none")
+    token = store.coord_take()
+    drop = store.accept_drop("fix the build", surface="cli")[0]
+    thread = store.split(drop.drop_id, [Part("work", "fix the build")])[0]
+    ln = store.launch_request(token, harness="claude", role="worker", threads=[thread.thread_id])
+    got, why = store.launch_activate(ln.launch_id, harness_session_id=sid)
+    assert why is None and store.launch_by_harness_session(sid).role == "worker"
+
+
+def _three(rig, sid, env_more=None, cwd=None):
+    """SessionStart, UserPromptSubmit and a Stop whose reply dropped the band, in one session, as Claude Code runs them."""
+    cwd = rig.outside if cwd is None else cwd
+    return [rig.run_entry("SessionStart", {"session_id": sid, "source": "startup"}, cwd, env_more),
+            rig.run_entry("UserPromptSubmit", {"session_id": sid, "prompt": "hi"}, cwd, env_more),
+            rig.run_entry("Stop", {"session_id": sid, "last_assistant_message": "nothing", "stop_hook_active": False},
+                          cwd, env_more)]
+
+
+def test_a_worker_launch_row_is_autonomous_for_the_entry(rig):
+    rig.ask()
+    rig.verb("install")
+    assert "NEEDS YOU" in ctx(_three(rig, "w-1")[1])           # the same seat with no row is shown the band
+    _worker_row(rig, "w-1")
+    assert _three(rig, "w-1") == ["", "", ""]
+    assert _three(rig, "w-1", {"CLAUDE_CODE_ENTRYPOINT": "cli"}) == ["", "", ""]   # the row decides, not the entrypoint
+
+
+def test_a_headless_session_without_a_launch_row_is_left_alone(rig):
+    rig.ask()
+    rig.verb("install")
+    before = rig.views()
+    assert _three(rig, "h-1", {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}) == ["", "", ""]
+    assert rig.views() == before                                  # no view was taken
+    out = _three(rig, "h-2", {"CLAUDE_CODE_ENTRYPOINT": "cli"})  # interactive or --bg: the band
+    assert "NEEDS YOU band" in ctx(out[0]) and ctx(out[1]).startswith("NEEDS YOU · 1 open")
+    assert json.loads(out[2])["decision"] == "block"
+    _coordinator_row(rig, "c-1")                                  # a coordinator Levain launched headless: the band
+    out = _three(rig, "c-1", {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"})
+    assert "NEEDS YOU" in ctx(out[1])
+    assert band_hook.stands_down("h-1", {**rig.env, "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}) is True
+    assert band_hook.stands_down("h-1", {**rig.env, "CLAUDE_CODE_ENTRYPOINT": ""}) is False   # absent: as before
+    assert band_hook.stands_down("c-1", {**rig.env, "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}) is False
+
+
+def test_the_entry_stands_down_when_the_project_dir_is_a_wired_install_whatever_the_cwd(rig):
+    rig.ask()
+    rig.verb("install")
+    inst = rig.make_install(wired=True)
+    proj = inst / "work"
+    proj.mkdir()
+    assert _three(rig, "p-1", {"CLAUDE_PROJECT_DIR": str(proj)}) == ["", "", ""]
+    assert _three(rig, "p-2", {"CLAUDE_PROJECT_DIR": str(inst)}) == ["", "", ""]
+    # the check can fail: a project dir that is no install, and one whose band scripts are stale, get the band
+    assert "NEEDS YOU" in ctx(_three(rig, "p-3", {"CLAUDE_PROJECT_DIR": str(rig.home)})[1])
+    for n in ("session_start.py", "user_prompt_submit.py", "stop.py"):
+        f = inst / "activation" / "hooks" / n
+        f.write_text(f.read_text().replace("levain.band_view", "levain.gone"))
+    assert "NEEDS YOU" in ctx(_three(rig, "p-4", {"CLAUDE_PROJECT_DIR": str(proj)})[1])
 
 
 # --- Codex ---------------------------------------------------------------------------------------------------
@@ -311,3 +448,29 @@ def test_the_panel_line_names_the_install_command_for_a_codex_workspace_outside_
     rig.verb("install")
     monkeypatch.setattr("levain.coordinator.launch.band_failure", lambda *a, **k: None)
     assert cs.band_row(setting) is None
+
+
+def test_the_panel_holds_a_failed_band_check_for_the_ttl_and_passes_the_launchers_codex_home(rig, monkeypatch, tmp_path):
+    from levain.cockpit import coordinator_status as cs
+    from levain.coordinator import codex_launch
+
+    owner = tmp_path / "owner"
+    owner.mkdir()
+    monkeypatch.setattr(cs, "_band_install", lambda setting: (owner, "codex"))
+    monkeypatch.setattr(cs, "_band_cache", {})
+    rig.verb("install")                                  # the workspace line is not the subject here
+    calls = []
+
+    def slow_then_raises(rows, directory, agent, codex_home=None):
+        calls.append(codex_home)
+        raise TimeoutError("probe ran out of time")
+
+    monkeypatch.setattr("levain.coordinator.launch.band_failure", slow_then_raises)
+    launcher_home = tmp_path / "launcher-codex-home"
+    monkeypatch.setattr(codex_launch, "codex_home", lambda: launcher_home)
+    setting = {"agent": "codex", "cwd": str(owner)}
+    for t in (100.0, 110.0, 159.0):
+        assert cs.band_row(setting, now=t) is None       # a check that could not run: no line, and not re-run
+    assert calls == [launcher_home]
+    cs.band_row(setting, now=161.0)                      # past the TTL: checked again
+    assert calls == [launcher_home, launcher_home]

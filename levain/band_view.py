@@ -2053,6 +2053,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                                       "your user-level settings): install, remove, status.")
     hsub = hk.add_subparsers(dest="hooks_cmd", required=True)
     for name, text in (("install", "Write the band-only hooks to the user-level Claude Code settings, with a receipt."),
-                       ("remove", "Take exactly those hooks out again (nothing else in the settings is touched)."),
-                       ("status", "Read the receipt and the live settings.")):
+                       ("remove", "Take levain's band hook handlers (found by their module) out again; the "
+                                  "rest of the settings file is left as it was."),
+                       ("status", "Read the receipt and the live settings (and probe the recorded interpreter).")):
         hsub.add_parser(name, help=text).set_defaults(func=run_band_hooks, hooks_verb=name)

@@ -2574,3 +2574,29 @@ def test_band_problem_reads_doctors_row_for_codex_too(tmp_path):
     for n in ("session_start.py", "user_prompt_submit.py", "stop.py"):
         (hooks / n).write_text("from levain.band_view import x\n")
     assert cl.band_problem(None, tmp_path, "codex") is None
+
+
+def test_a_stale_band_install_is_refused_naming_levain_update_and_update_clears_it(tmp_home, qdir, fake, capsys):
+    # an install from a release whose stop.py did not call the band: unedited (the activation receipt says levain wrote
+    # it), so `levain update` refreshes it
+    import hashlib
+
+    from levain.install import activation_receipt_path
+    from levain.update import run_update
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    old = b"# an older release's stop hook\n"
+    (target / "activation" / "hooks" / "stop.py").write_bytes(old)
+    rp = activation_receipt_path(target)
+    data = json.loads(rp.read_text())
+    data["files"]["hooks/stop.py"]["installed"] = hashlib.sha256(old).hexdigest()
+    rp.write_text(json.dumps(data))
+    live, why = cl.hook_live(target, user_scope=False)
+    assert not live and "stale" in why and f"Fix: `levain update --path {target}`" in why
+    got = _launch_pending(qdir)
+    assert not got.started and f"levain update --path {target}" in got.refusal and fake.spawns() == []
+    lines: list[str] = []
+    run_update(target, no_pip=True, emit=lines.append)
+    assert (target / "activation" / "hooks" / "stop.py").read_bytes() != old
+    assert cl.band_problem(None, target, "claude_code") is None, lines
+    assert cl.hook_live(target, user_scope=False)[0]

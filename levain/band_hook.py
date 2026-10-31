@@ -7,8 +7,9 @@ UserPromptSubmit, Stop) into the user-level Claude Code settings (``$CLAUDE_CONF
 no posture, spores, crystal recall or consent: only :func:`levain.band_view.hook_contract`, ``hook_prompt`` and
 ``hook_stop`` (the one renderer). The hooks STAND DOWN, printing nothing and taking no view, when the session's
 working directory is inside an install whose band hooks are wired (that install's own hooks show it: one band, never
-two) and for an autonomous seat. A receipt under the levain home records what was written; ``remove`` takes out exactly
-that and nothing else. Codex's hooks file is already machine-wide; its install hooks call :func:`codex_standalone`
+two), for an autonomous seat, and for a headless session Levain did not launch (:func:`stands_down`). A receipt under
+the levain home records what was written and the interpreter path (``levain update`` re-writes it); ``remove`` takes
+out this module's handlers, found by their module, and leaves the rest of the file as it was. Codex's hooks file is already machine-wide; its install hooks call :func:`codex_standalone`
 outside their install, and only once this receipt exists.
 """
 
@@ -73,8 +74,16 @@ def _quote(value: str) -> str:
     return '"' + value + '"'
 
 
+# Claude Code runs a hook command through a shell and shows a notice for every hook that exits non-zero or writes
+# stderr. The interpreter path is recorded at install: after a venv move, a pipx upgrade or a python bump it can be
+# gone, and every session on the machine would then show that notice on every event. The tail makes a missing
+# interpreter or module quiet; doctor's row still fails it (it probes the interpreter), and `levain update`
+# re-writes the path.
+QUIET_TAIL = "2>/dev/null || true"
+
+
 def command_for(python: str, event: str) -> str:
-    return f"{_quote(python)} -EP -m {MODULE} {event}"
+    return f"{_quote(python)} -EP -m {MODULE} {event} {QUIET_TAIL}"
 
 
 def is_ours(handler: Any) -> bool:
@@ -138,16 +147,26 @@ def _dump(doc: dict[str, Any], text: str | None) -> str:
     return out + ("\n" if text is None or text.endswith("\n") else "")
 
 
+def _target(path: Path) -> Path:
+    """The file ``path`` names once its symlinks are followed: a settings file kept in a dotfiles repo and linked into
+    place is edited where it lives, so the link stays a link."""
+    return Path(os.path.realpath(path))
+
+
 def _write_atomic(path: Path, content: str) -> None:
+    path = _target(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
-        try:
-            os.chmod(tmp, path.stat().st_mode & 0o777)
-        except OSError:
-            pass
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -196,15 +215,17 @@ def _version() -> str:
 
 def install(env: Mapping[str, str] | None = None, python: str | None = None) -> tuple[int, str]:
     env = os.environ if env is None else env
-    path = settings_path(env)
+    path = _target(settings_path(env))
     try:
         doc, text = _load(path)
     except Refused as exc:
         return 1, f"levain band hooks install: refused: {exc}"
     prior = read_receipt(env)
     python = python or sys.executable
-    created = text is None or (bool(prior) and bool(prior.get("created_file")) and not doc)
     _strip_ours(doc)
+    # Read after our own handlers are out: a re-install over a file the first install created still finds nothing of
+    # the operator's in it, and keeps the first install's word that the file was not there before.
+    created = text is None or (bool(prior) and bool(prior.get("created_file")) and not doc)
     hooks = doc.setdefault("hooks", {})
     for event in EVENTS:
         hooks.setdefault(event, []).append(_entry(python, event))
@@ -220,21 +241,39 @@ def install(env: Mapping[str, str] | None = None, python: str | None = None) -> 
     rp = receipt_path(env)
     _write_atomic(rp, json.dumps(receipt, indent=2) + "\n")
     return 0, (f"levain band hooks install: wrote SessionStart, UserPromptSubmit and Stop to {path}\n"
-               f"  band only (no posture, spores, crystal recall or consent); they stand down inside an install whose "
-               f"band hooks are wired\n  receipt: {rp}\n  undo: levain band hooks remove")
+               f"  band only (no posture, spores, crystal recall or consent). They stand down inside an install whose "
+               f"band hooks are wired, for autonomous seats, and in a headless session (`claude -p`) Levain did not "
+               f"launch. The Stop hook may hold a turn once to have the band reprinted.\n"
+               f"  interpreter: {python} (recorded; `levain update` re-writes it after an upgrade)\n"
+               f"  receipt: {rp}\n  check: levain band hooks status\n"
+               f"  undo: levain band hooks remove (takes out levain's band hook handlers, found by their module)")
 
 
 def remove(env: Mapping[str, str] | None = None) -> tuple[int, str]:
     env = os.environ if env is None else env
     receipt = read_receipt(env)
-    path = Path(receipt["settings"]) if receipt and isinstance(receipt.get("settings"), str) else settings_path(env)
-    try:
-        doc, text = _load(path)
-    except Refused as exc:
-        return 1, f"levain band hooks remove: refused: {exc}"
-    n = _strip_ours(doc) if text is not None else 0
-    if n:
-        if receipt and receipt.get("created_file") and not doc:
+    paths: list[Path] = []
+    if receipt and isinstance(receipt.get("settings"), str):
+        paths.append(_target(Path(receipt["settings"])))
+    current = _target(settings_path(env))
+    if current not in paths:                  # CLAUDE_CONFIG_DIR moved since install: that file is cleaned too
+        paths.append(current)
+    loaded: list[tuple[Path, dict[str, Any], str | None]] = []
+    for path in paths:
+        try:
+            doc, text = _load(path)
+        except Refused as exc:
+            return 1, f"levain band hooks remove: refused: {exc}"
+        loaded.append((path, doc, text))
+    total, where = 0, []
+    for i, (path, doc, text) in enumerate(loaded):
+        n = _strip_ours(doc) if text is not None else 0
+        if not n:
+            continue
+        total += n
+        where.append(str(path))
+        # only the file the receipt names can have been created by install
+        if i == 0 and receipt and receipt.get("created_file") and not doc:
             path.unlink()
         else:
             _write_atomic(path, _dump(doc, text))
@@ -244,9 +283,25 @@ def remove(env: Mapping[str, str] | None = None) -> tuple[int, str]:
         rp.unlink()
     except OSError:
         pass
-    if not n and not had:
+    if not total and not had:
         return 0, "levain band hooks remove: nothing to remove (not installed)"
-    return 0, f"levain band hooks remove: took {n} band hook(s) out of {path}; nothing else in it was touched"
+    return 0, (f"levain band hooks remove: took {total} levain band hook handler(s) out of "
+               f"{' and '.join(where) or paths[0]}; the other settings in it were not changed")
+
+
+def refresh_after_update(env: Mapping[str, str] | None = None) -> str | None:
+    """What ``levain update`` does for the user-level band: when the receipt exists, install again from this
+    interpreter (the recorded path follows an upgrade). Returns the line update prints, ``None`` when not installed."""
+    env = os.environ if env is None else env
+    try:
+        if read_receipt(env) is None:
+            return None
+        code, text = install(env)
+    except Exception as exc:  # noqa: BLE001 - said, never the reason update fails
+        code, text = 1, f"{type(exc).__name__}: {exc}"
+    if code == 0:
+        return f"• user-level band hooks re-written for {sys.executable} (levain band hooks status)"
+    return f"• user-level band hooks NOT refreshed: {text.splitlines()[0] if text else 'unknown error'}"
 
 
 def live_commands(env: Mapping[str, str] | None = None) -> dict[str, str] | None:
@@ -307,9 +362,18 @@ def status(env: Mapping[str, str] | None = None) -> tuple[int, str]:
 
 # ---------------------------------------------------------------- the hook entry
 def inside_wired_install(agent: str, cwd: str | None, env: Mapping[str, str]) -> bool:
-    """Whether ``cwd`` is inside an install whose band hooks are wired (that install's own hooks show the band)."""
+    """Whether the session is inside an install whose band hooks are wired (that install's own hooks show the band):
+    ``cwd`` is inside one, or (Claude Code) ``CLAUDE_PROJECT_DIR`` is. A session started at an install keeps that
+    install's project hooks when it later works in a directory outside it, so its project dir decides too."""
     from levain.band_view import _find_hooks_dir, band_hooks_state
 
+    if agent == "claude_code":
+        project = env.get("CLAUDE_PROJECT_DIR")
+        if project:
+            hooks = _find_hooks_dir(agent, project, {})
+            if hooks is not None and band_hooks_state(hooks, agent)[0] == "wired":
+                return True
+        env = {k: v for k, v in env.items() if k != "CLAUDE_PROJECT_DIR"}     # the cwd walk below is the cwd's own
     hooks = _find_hooks_dir(agent, cwd, env)
     if hooks is None or not cwd:
         return False
@@ -318,6 +382,25 @@ def inside_wired_install(agent: str, cwd: str | None, env: Mapping[str, str]) ->
     except (OSError, ValueError):
         return False
     return band_hooks_state(hooks, agent)[0] == "wired"
+
+
+def stands_down(session: str, env: Mapping[str, str]) -> bool:
+    """Whether the user-level band stays silent for this session (its seat, not its directory). A session with a
+    Levain launch row is decided by the row (a coordinator gets the band, a worker does not). One without a row
+    stands down when ``CLAUDE_CODE_ENTRYPOINT`` is set and is not ``cli``: a headless run (``claude -p`` carries
+    ``sdk-cli``), another tool's or the operator's own script, where a band injected every prompt and a Stop that
+    holds a turn would cost a model turn and change the output. Otherwise the seat marker decides
+    (:func:`levain.band_view.seat_fact`)."""
+    from levain.band_view import seat_fact
+    from levain.consent.queue import queue_dir_for
+
+    fact = seat_fact(session, queue_dir_for(env), env)
+    if fact.role is not None:
+        return fact.autonomous
+    entry = (env.get("CLAUDE_CODE_ENTRYPOINT") or "").strip()
+    if entry and entry != "cli":
+        return True
+    return fact.autonomous
 
 
 def _write_json(obj: dict[str, Any]) -> bool:
@@ -338,12 +421,11 @@ def run_event(event: str, payload: dict[str, Any], env: Mapping[str, str], agent
         if not isinstance(session, str) or not session:
             return
         cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) and payload.get("cwd") else os.getcwd()
-        from levain.band_view import hook_contract, hook_prompt, hook_stop, is_autonomous
-        from levain.consent.queue import queue_dir_for
+        from levain.band_view import hook_contract, hook_prompt, hook_stop
 
         if inside_wired_install(agent, cwd, env):
             return
-        if is_autonomous(session, queue_dir_for(env), env):
+        if stands_down(session, env):
             return
         if event == "SessionStart":
             text = hook_contract(payload, env, agent)

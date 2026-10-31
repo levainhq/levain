@@ -33,8 +33,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **`levain band hooks install | remove | status`: the NEEDS YOU band in every session, opt-in.** Writes band-only
   SessionStart, UserPromptSubmit and Stop hooks to your user-level Claude Code settings (`$CLAUDE_CONFIG_DIR` or
   `~/.claude`), merged beside your own hooks, with a receipt (`<levain home>/band_hooks.json`). They carry no posture,
-  spores, recall or consent, and stand down inside an install whose band hooks are wired and for autonomous seats.
-  `remove` takes out exactly what was added; a settings file that does not parse is refused untouched. After install the
+  spores, recall or consent, and stand down inside an install whose band hooks are wired (by the session's directory
+  or its project directory), for autonomous seats, and in a headless session (`claude -p`) that has no Levain launch
+  row. The Stop hook may hold a turn once to have the band reprinted. The hook command records the interpreter path;
+  `levain update` re-writes it, and a missing interpreter stays quiet in the session while doctor fails its row.
+  `levain band hooks status` shows the state. `remove` takes out levain's band hook handlers (found by their module)
+  and leaves the rest of the file as it was; a symlinked settings file stays a symlink (its target is edited); a
+  settings file that does not parse is refused untouched. After install the
   Codex hooks also show the band outside their install (the coordinator's workspace). `levain doctor` has a row for it
   (not installed is info, installed but broken fails) and the Coordinator panel names the command when the Codex band
   cannot render. This is the one exception to "Levain never touches your global Claude Code configuration".

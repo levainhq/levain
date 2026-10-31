@@ -178,7 +178,18 @@ def band_row(setting: dict[str, Any] | None, now: float | None = None) -> RowIn 
     key, t = f"{install}|{agent}", time.monotonic() if now is None else now
     hit = _band_cache.get(key)
     if hit is None or t - hit[0] >= _BAND_TTL:
-        hit = (t, band_failure(None, install, agent))
+        # The check runs the hook's interpreter (bounded, but seconds when cold) inside the panel read: whatever it
+        # returns, a check that could not run included, is held for the same TTL, so a slow probe blocks one read.
+        try:
+            home = None
+            if agent == "codex":
+                from levain.coordinator import codex_launch
+
+                home = codex_launch.codex_home()
+            result = band_failure(None, install, agent, home)
+        except Exception:
+            result = None
+        hit = (t, result)
         _band_cache[key] = hit
     if hit[1] is None:
         return None
