@@ -7001,6 +7001,22 @@
     if (dropRead && Date.now() - dropAt >= DROP_FAIL_TTL_MS) dropRead = null;      // a render reads again once the last read is a few seconds old
     dropRefresh(host, false);
   }
+  // Talking about a card (or anything else) is a drop: this puts `words` at the end of the drop card's box, the cursor after
+  // them, and brings the box into view. Words already typed stay (the new ones go on a new paragraph after them). Posts nothing:
+  // the operator sends it with the box's own Send. A page whose drop card is not drawn opens the drop sheet with the words.
+  function composeDrop(words) {
+    if (typeof words !== "string") return false;
+    const host = document.getElementById("ck-drop");
+    const ui = host && host._drop;
+    if (!ui || host.hidden) return !!openDropSheet(words);
+    if (document.getElementById("levain-modal")) closeModal();      // a focus view stands over the box
+    const box = ui.words;
+    box.value = box.value.trim() ? box.value.replace(/\s+$/, "") + "\n\n" + words : words;
+    dropGrow(box);
+    try { box.scrollIntoView({ block: "center" }); } catch (e) { /* scrolling is a convenience */ }
+    try { box.focus({ preventScroll: true }); box.setSelectionRange(box.value.length, box.value.length); } catch (e) { /* focus is a convenience */ }
+    return true;
+  }
   const DISPATCH_VERB = { sign: "Sign", cancel: "Cancel job", authorise: "Authorise" };
   function dispatchCard(r) {
     const sv = (x) => (typeof x === "string" ? x : "");
@@ -7721,5 +7737,5 @@
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

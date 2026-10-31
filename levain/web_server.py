@@ -1451,6 +1451,21 @@ def build_job_json(job_runtime: "JobRuntime | None", job_id: str) -> bytes:
     return json.dumps(job_runtime.store.read_status(job_id, now)).encode("utf-8")
 
 
+def _board_value(server: Any, *, stamped: bool = True) -> dict[str, Any]:
+    """The cockpit's own board value (:func:`levain.cockpit.board.build`) over this server's coordinator store directory and
+    question store: the one read behind both ``GET /cockpit/board.json`` and the built-in Work board panel, so the two cannot
+    disagree. The panel reads it ``stamped=False``: the read's own clock stamp would change the panel's etag every second and
+    announce a change on the stream when nothing moved (the manifest already says when a panel was read)."""
+    reader = server.consent_reader
+    directory = None
+    if hasattr(reader, "directory"):
+        from levain.consent.queue import default_queue_dir
+
+        directory = reader.directory if reader.directory is not None else default_queue_dir()
+    value = cockpit_board.build(directory, getattr(server, "question_store", None))
+    return value if stamped else {**value, "generated": None}
+
+
 class _LevainHTTPServer(ThreadingHTTPServer):
     """A ``ThreadingHTTPServer`` carrying the substrate source, the cached static
     assets, and the Host-header allowlist. A typed subclass (rather than ad-hoc
@@ -1589,7 +1604,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                     capture=broker.capture if broker is not None else None,
                     edits=broker.edits if broker is not None else None,
                     decision_rows=broker.decision_rows if broker is not None else None,
-                    questions=getattr(self, "question_store", None), notes=getattr(self, "note_store", None))
+                    questions=getattr(self, "question_store", None), notes=getattr(self, "note_store", None),
+                    board=lambda: _board_value(self, stamped=False))
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -2720,15 +2736,7 @@ class _Handler(GuardedHandler):
             self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
             return
         try:
-            reader = self.server.consent_reader
-            directory = None
-            if hasattr(reader, "directory"):
-                from levain.consent.queue import default_queue_dir
-
-                directory = reader.directory if reader.directory is not None else default_queue_dir()
-            sheet = getattr(self.server, "coord_sheet", None)
-            payload = cockpit_board.build(directory, getattr(self.server, "question_store", None),
-                                          drop_dir=sheet.queue_dir if sheet is not None else None)
+            payload = _board_value(self.server)
         except Exception as exc:  # noqa: BLE001 - never a dead connection
             payload = {"error": "board_unreadable", "message": f"the board could not be built ({type(exc).__name__})"}
         finally:
@@ -4285,7 +4293,8 @@ def make_server(
                 # a downstream that registered its own "decisions" keeps exactly that panel (K2b-3b §0.4)
                 decision_rows=broker.decision_rows if broker is not None else None,
                 questions=httpd.question_store,                 # and the questions they ask him (Q-2b)
-                notes=httpd.note_store)                         # and what they tell him (notes)
+                notes=httpd.note_store,                         # and what they tell him (notes)
+                board=lambda: _board_value(httpd, stamped=False))              # the Work board, unless a provider brings its own
     except BaseException:
         # the cockpit put itself back (attach_server); this server's pin is released: it never served
         try:

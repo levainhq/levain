@@ -2755,11 +2755,7 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
   .th-body .tv-head .tv-at { margin-left: 0; }
 }
 
-/* C12: the Board tab's read-only ready-queue zone (board_view.js, bd-*). The tab lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */
-.bd-zone { margin-top: var(--sec, var(--sp-7)); }
-.bd-zone[hidden] { display: none; }
-body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
-.bd-body { padding: var(--sp-4); }
+/* C12: the board kind's painters (board_view.js, bd-*). The panel lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */
 .bd-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--sp-4); align-items: start; }
 .bd-col { min-width: 0; }
 .bd-colhead { margin: 0 0 var(--sp-3); font: var(--fw-semibold) var(--fs-meta)/1.3 var(--sans); color: var(--text); text-transform: uppercase; }
@@ -2777,12 +2773,13 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
 .bd-row + .bd-row { border-top: 1px solid var(--hair-2); }
 .bd-groups .bd-empty { padding-left: var(--sp-3); margin: 0; }
 .bd-held, .bd-note { font: var(--fw-regular) var(--fs-micro)/1.5 var(--sans); color: var(--warn); }
-.bd-gloss, .bd-empty, .bd-say { margin: 0 0 var(--sp-2); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); }
-.bd-tell { margin-top: var(--sp-5); display: grid; gap: var(--sp-2); }
-.bd-tell textarea { width: 100%; box-sizing: border-box; min-height: 64px; }
+.bd-gloss, .bd-empty { margin: 0 0 var(--sp-2); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); }
+/* a card's one way to talk back: a quiet text button, a full touch target on a narrow page */
+.bd-drop { margin-top: var(--sp-2); padding: 0; border: 0; background: none; color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.5 var(--sans); text-decoration: underline; cursor: pointer; }
+.bd-drop:hover { color: var(--text); }
 @media (max-width: 640px) {
   .bd-cols { grid-template-columns: minmax(0, 1fr); }
-  .bd-tell .dev-btn { min-height: var(--hit-min, 44px); }
+  .bd-drop { min-height: var(--hit-min, 44px); }
 }
 
 /* Q17-ALL S5b: the NEEDS YOU band at the head of the Decisions panel. The band number leads every item (and the question row it
@@ -2861,15 +2858,15 @@ body.ke[data-mode="board"] .bd-zone .zone-head { display: flex; }
    boxes, full width of the sheet/card, ~8 rows, grows with its content (card_format.js installFieldGrow is the iOS fallback),
    16px so iOS Safari does not zoom. The write-in answers are one line by contract (a signed write-in may not hold a newline),
    so they get the same width and font, not the rows. */
-body :is(#drop-words, .drop-words, .question-words, .bd-tell textarea) { display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box;
+body :is(#drop-words, .drop-words, .question-words) { display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box;
   min-height: 12em; padding: var(--sp-3) var(--sp-4); font-size: 16px; line-height: 1.45; resize: vertical; field-sizing: content; }
 body :is(.sheet-write-in, .sign-write-in) { grid-column: 1 / -1; display: block; width: 100%; max-width: none; min-width: 0; box-sizing: border-box; min-height: 44px; font-size: 16px; }
 /* The same fields wore the browser's own grey slab (rgb 59 59 59, square, a monospace face) beside the page's token inputs (filters, the
    pairing box: --bg, a --hair-2 line, --r-md). One look for all of them: the token field, the page's sans, a quiet placeholder. */
-body :is(#drop-words, .drop-words, .question-words, .bd-tell textarea, .sheet-write-in, .sign-write-in) { background: var(--bg); color: var(--text);
+body :is(#drop-words, .drop-words, .question-words, .sheet-write-in, .sign-write-in) { background: var(--bg); color: var(--text);
   border: 1px solid var(--hair-2); border-radius: var(--r-md); font-family: var(--sans); box-shadow: var(--recess); }
-body :is(#drop-words, .drop-words, .question-words, .bd-tell textarea, .sheet-write-in, .sign-write-in)::placeholder { color: var(--meta); opacity: 1; }
-body :is(#drop-words, .drop-words, .question-words, .bd-tell textarea, .sheet-write-in, .sign-write-in):focus-visible { outline: 2px solid var(--text); outline-offset: 1px; border-color: var(--label); }   /* --text like the global :focus-visible rule; --accent-line is about 1.7:1 on the light base. #drop-words in the list makes this rule outrank class-only rules */
+body :is(#drop-words, .drop-words, .question-words, .sheet-write-in, .sign-write-in)::placeholder { color: var(--meta); opacity: 1; }
+body :is(#drop-words, .drop-words, .question-words, .sheet-write-in, .sign-write-in):focus-visible { outline: 2px solid var(--text); outline-offset: 1px; border-color: var(--label); }   /* --text like the global :focus-visible rule; --accent-line is about 1.7:1 on the light base. #drop-words in the list makes this rule outrank class-only rules */
 body .state-input { font-size: 16px; }
 
 /* The coordinator drop: an inline composer (Phill 10-30: "front and center", "the whole idea is to make working from the cockpit

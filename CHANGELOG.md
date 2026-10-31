@@ -379,6 +379,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   command line includes `--guard <guard.json>`.
 
 ### Changed
+- **One Work board per cockpit; talk about a card with a drop.** The Board tab no longer draws a second "Ready queue" board with its own "tell the coordinator" box beside the cockpit's board panel. There is one Work board: a panel that registers the `board` kind draws it, and a cockpit with no such panel draws its own from the coordinator store, so the two can no longer disagree. Every card, whichever board it is on, has a "Drop about this card" button that puts `About card <id> (<title>): ` in the Drop to the coordinator box with the cursor after it; you send it like any other drop. A `compose=` link no longer fills a box on the Board tab. `GET /cockpit/board.json` no longer carries a `tell` field.
 - **Revoked devices move to their own tab.** The cockpit's Devices panel now lists only the devices that still hold a key.
   Revoked ones sit under a "Revoked (N)" tab, newest-revoked first, each with the same details as before. The count is
   always shown, the tab appears only once something is revoked, and the tab you picked stays through the panel's refreshes.

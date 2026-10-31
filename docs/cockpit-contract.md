@@ -39,8 +39,8 @@ Notes a provider relies on:
   manifest's verb labels (`Snoozed · spore-1238`). A verb with no label renders as its raw name.
 - **`ambient`**: the kernel stores and serves the events as sent. The renderer owns the encoding.
 - **`board`**: the ready queue as derived columns, the value levain's own `GET /cockpit/board.json` serves
-  (`levain.cockpit.board.build`); a downstream's panel declares `kind="board"` and sends that value. It is a SHAPE check:
-  the kernel parses and executes nothing, and any key it does not name (`band_hint`, `tell`, `journal_as_of_read`, a
+  (`levain.cockpit.board.build`); a downstream's panel declares `kind="board"` and sends that value. With no board panel registered the cockpit draws its own (`work_board`, "Work board"); a board panel registered or discovered later replaces it, so a cockpit draws one board. It is a SHAPE check:
+  the kernel parses and executes nothing, and any key it does not name (`band_hint`, `journal_as_of_read`, a
   card's `held_reason`, `well_formed`, `rank`, `band`, `number`, `source`, `blocks`) is accepted and left alone.
   `queue` is `ok` (read whole), `none` (no queue made yet) or `unreadable`; `unreadable` lists the sources it could not read
   and `note` says why, so a board that could not be read is never drawn as an empty one. Each column's `category` is one

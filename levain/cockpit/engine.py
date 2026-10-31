@@ -121,6 +121,7 @@ SOON_DAYS = 3
 WRITE_READ_CAP = 32       # source reads made inside writes that may run at once (design §4.4)
 WRITE_READ_CAP_PER_SOURCE = 4   # of those, reads of one source (a panel or a discoverer)
 NOW_ID = "now"
+BOARD_DEFAULT_ID = "work_board"   # the kernel's own board panel: drawn only while no provider brings a board (attach_board)
 # a triage-list view id: lower-case, and never "default" (the panel's own order is the default view)
 _VIEW_ID = re.compile(r"(?!default\Z)[a-z0-9][a-z0-9_-]{0,31}")     # matched whole (fullmatch)
 VALUE_ABSENT = "absent"   # the value_version of a line/prose value with no stored record yet
@@ -615,6 +616,7 @@ class Cockpit:
         self._retiring: frozenset[int] | set[int] = frozenset()   # discoverers whose vanished panels are unregistered
         self._discovered: dict[str, int] = {}   # panel id -> the index of the discoverer that registered it
         self._hero_yields: set[str] = set()     # hero panels a later hero panel of their kind replaces (yield_hero)
+        self._board_yields: set[str] = set()    # the kernel's own board panel, which a provider's board replaces (attach_board)
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
@@ -660,16 +662,17 @@ class Cockpit:
     def attach_server(self, view: Any, consent: Callable[[datetime], Any], *,
                       capture: Callable[[datetime], RequestAuthority] | None = None,
                       edits: Callable[[int], Any] | None = None, decision_rows: Callable[[datetime], Any] | None = None,
-                      questions: Any = None, notes: Any = None) -> None:
+                      questions: Any = None, notes: Any = None,
+                      board: Callable[[], Any] | None = None) -> None:
         """Every attach a server makes (``make_server``), as ONE transaction under the cockpit's lock: the verb view
         (:meth:`attach_verbs`), the broker's capture, edits reader and decisions rows when given, the consent reader,
-        then the question and note stores when given. One that raises puts back exactly what this call found, then
+        then the question and note stores and the kernel's own board when given. One that raises puts back exactly what this call found, then
         raises. Nothing else registers while the lock is held, so a panel another thread registers before this call or
         after it is kept: the undo removes only this server's attaches."""
         with self._lock:
             before = (self._verb_view, self._capture, self._edits_reader,
                       tuple(getattr(self._dec, f) for f in _DEC_FIELDS), self._specs, self._state,
-                      dict(self._rowsets), set(self._hero_yields))
+                      dict(self._rowsets), set(self._hero_yields), set(self._board_yields))
             try:
                 self._attach_verbs_locked(view)
                 if capture is not None:
@@ -683,10 +686,12 @@ class Cockpit:
                     self._attach_question_rows_locked(questions)
                 if notes is not None:
                     self._attach_note_rows_locked(notes)
+                if board is not None:
+                    self._attach_board_locked(board)
             except BaseException:
                 # the registry is copy-on-write, so the dicts taken are the ones a reader held then; the row-set
                 # owners and hero yields, changed in place, are put back in place
-                self._verb_view, self._capture, self._edits_reader, dec, self._specs, self._state, rowsets, heroes = (
+                self._verb_view, self._capture, self._edits_reader, dec, self._specs, self._state, rowsets, heroes, boards = (
                     before)
                 for f, v in zip(_DEC_FIELDS, dec):
                     setattr(self._dec, f, v)
@@ -694,6 +699,8 @@ class Cockpit:
                 self._rowsets.update(rowsets)
                 self._hero_yields.clear()
                 self._hero_yields.update(heroes)
+                self._board_yields.clear()
+                self._board_yields.update(boards)
                 raise
 
     def attach_labeller(self, fn: Callable[[], LabelSnapshot]) -> None:
@@ -838,6 +845,17 @@ class Cockpit:
         self._register_locked(spec)
         self._dec.spec = spec
 
+    def _attach_board_locked(self, read: Callable[[], Any]) -> None:
+        """ONE board per cockpit: with no board-kind panel registered, the kernel's own ``Work board`` (``read()`` returns the
+        value :func:`levain.cockpit.board.build` makes) is registered, marked as yielding, so a board panel registered or
+        discovered later replaces it instead of standing beside it."""
+        if any(o.kind == "board" for o in self._specs.values()):
+            return
+        self._register_locked(ProviderSpec(
+            id=BOARD_DEFAULT_ID, kind="board", title="Work board", priority="feed", region="operate",
+            read=lambda ctx: Read(value=read())))
+        self._board_yields.add(BOARD_DEFAULT_ID)
+
     def yield_hero(self, panel_id: str) -> None:
         """Mark a registered hero panel as the kernel's default for its slot: a later hero panel of the same kind
         replaces it (it is unregistered, no error) instead of being refused. Levain's own ``activity`` ambient
@@ -850,6 +868,7 @@ class Cockpit:
 
     def _unregister_locked(self, sid: str) -> None:
         self._hero_yields.discard(sid)
+        self._board_yields.discard(sid)
         specs = dict(self._specs)
         old = specs.pop(sid)
         if old.rowset is not None and self._rowsets.get(old.rowset) == sid:
@@ -1004,6 +1023,9 @@ class Cockpit:
                 raise CockpitRegistrationError(
                     f"{sid}: row set {spec.rowset!r} already belongs to panel {owner!r} (one panel per row set)"
                 )
+        if spec.kind == "board":         # one board: the kernel's own yields to a provider's, validated whole like the hero's
+            for o in [o for o in self._board_yields if o in self._specs]:
+                self._unregister_locked(o)
         if spec.region == HERO:          # validated whole: only now does a yielding default leave the slot
             for o in [o.id for o in self._specs.values()
                       if o.region == HERO and o.kind == spec.kind and o.id in self._hero_yields]:

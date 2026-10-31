@@ -18,7 +18,7 @@ from levain.cockpit import Cockpit, CockpitRegistrationError, ProviderSpec, Read
 from levain.cockpit import board
 from levain.cockpit.engine import BOARD_CATEGORIES, KINDS
 from levain.consent.questions import QuestionStore
-from tests.test_board_grouped_browser import MODAL, ORDER, SETTLED, _seed
+from tests.test_one_board_browser import MODAL, ORDER, SETTLED, _seed
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_questions import lh  # noqa: F401  (fixture)
@@ -80,13 +80,13 @@ def test_a_board_provider_registers_and_appears_in_the_manifest() -> None:
 
 def test_levains_own_board_value_is_accepted_whole(tmp_path: Path, lh) -> None:  # noqa: F811
     """The shape a downstream emits is `board.build`'s: a real build over a seeded store (band card, journal lines, a held card)
-    passes the validator with every extra key (band_hint, tell, journal_as_of_read) left alone."""
+    passes the validator with every extra key (band_hint, journal_as_of_read) left alone."""
     lh.mkdir(parents=True, exist_ok=True, mode=0o700)
     _seed(lh)
     built = board.build(lh, QuestionStore(lh))
     p = _panel(copy.deepcopy(built))
     assert p is not None and p["status"] == "ok", p
-    assert p["value"]["band_hint"] == built["band_hint"] and p["value"]["tell"] == built["tell"]
+    assert p["value"]["band_hint"] == built["band_hint"] and p["value"]["journal_as_of_read"] is True
     assert [c["count"] for c in p["value"]["columns"]] == [2, 1, 1, 0, 1, 1]
 
 
@@ -198,6 +198,51 @@ def test_the_board_kind_is_a_read_only_value_no_verb_versions_it() -> None:
     from levain.cockpit.engine import VERSIONED_VALUE_KINDS, VALUE_VALIDATORS, ROW_KINDS
     assert "board" in VALUE_VALIDATORS and "board" not in VERSIONED_VALUE_KINDS and "board" not in ROW_KINDS
     assert "value_version" not in _panel(_value())["value"]
+
+
+# --- one board per cockpit --------------------------------------------------------------------------
+
+def _attach(ck: Cockpit, value: Any = None) -> None:
+    ck.attach_server(None, lambda now: None, board=lambda: value if value is not None else _value(ready=[_card("levain:a")]))
+
+
+def _boards(ck: Cockpit) -> list[str]:
+    return [i for i, m in ck.manifest(CRED)["panels"].items() if m["kind"] == "board"]
+
+
+def test_a_cockpit_with_no_board_provider_gets_the_kernels_own_work_board() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    _attach(ck)
+    assert _boards(ck) == [BOARD_DEFAULT_ID]
+    got = ck.panel(BOARD_DEFAULT_ID)
+    assert got["status"] == "ok" and got["title"] == "Work board"
+    assert got["value"]["columns"][1]["cards"][0]["id"] == "levain:a"
+
+
+def test_a_board_registered_before_the_attach_is_the_only_board() -> None:
+    ck = Cockpit()
+    ck.register(ProviderSpec(id="b", kind="board", title="Provider board", priority="feed", read=lambda c: Read(value=_value())))
+    _attach(ck)
+    assert _boards(ck) == ["b"]
+
+
+def test_a_board_registered_after_the_attach_replaces_the_kernels_and_the_kernels_does_not_return() -> None:
+    ck = Cockpit()
+    _attach(ck)
+    ck.register(ProviderSpec(id="b", kind="board", title="Provider board", priority="feed", read=lambda c: Read(value=_value())))
+    assert _boards(ck) == ["b"]
+    _attach(ck)                                       # a second attach (a cockpit served twice) adds none beside it
+    assert _boards(ck) == ["b"]
+
+
+def test_a_failed_attach_leaves_no_kernel_board_behind() -> None:
+    from levain.cockpit.engine import BOARD_DEFAULT_ID
+    ck = Cockpit()
+    ck.register(ProviderSpec(BOARD_DEFAULT_ID, "line", "Taken", "gauge", lambda c: Read(value={"lines": []})))    # the id is taken: the board's registration refuses
+    with pytest.raises(CockpitRegistrationError):
+        ck.attach_server(None, lambda now: None, board=lambda: _value())
+    assert _boards(ck) == [] and not ck._board_yields
 
 
 # --- the page ------------------------------------------------------------------------------------
