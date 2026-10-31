@@ -61,10 +61,11 @@ def refinement_of(spec: Mapping[str, Any]) -> str | None:
 
 def derived_flags(role: Mapping[str, Any]) -> dict[str, bool]:
     """Rule (d), A0 §3.2: ``acts_outward`` = the ceiling's ``pushes`` or ``publishes`` non-empty; ``calls_model`` =
-    the role names a model; review is required when either is true. Nothing is stored."""
+    the role names a model, or its executor is ``dream`` (the dream composes with a model, D1 §1.3, even when the
+    role leaves ``model`` empty); review is required when either is true. Nothing is stored."""
     ceiling = role.get("ceiling") or {}
     outward = bool(ceiling.get("pushes") or ceiling.get("publishes"))
-    model = bool(role.get("model"))
+    model = bool(role.get("model")) or role.get("executor") == "dream"
     return {"calls_model": model, "acts_outward": outward, "review_required": model or outward}
 
 
@@ -179,9 +180,14 @@ def check_spec(spec: Mapping[str, Any], *, role: Mapping[str, Any] | None, defau
         out.append(Refusal("4", f"name {name!r} is held by an agent that is not retired"))
 
     # rule 3 (resolution) and rule 5
+    pinned = spec["role"]
     if role is None:
-        out.append(Refusal("3", f"role {spec['role']['name']!r} ({spec['role']['role_hash'][:12]}) is not registered"))
+        out.append(Refusal("3", f"role {pinned['name']!r} ({pinned['role_hash'][:12]}) is not registered"))
     else:
+        if role.get("name") != pinned["name"]:
+            out.append(Refusal("3", f"role.name {pinned['name']!r} does not match the role its role_hash "
+                                    f"{pinned['role_hash'][:12]} pins, which is {role.get('name')!r}: name that role, "
+                                    f"or pin the hash `levain agents role show {pinned['name']}` prints"))
         bad = ceiling_problem(role.get("ceiling"))
         if bad:
             out.append(Refusal("5", bad))

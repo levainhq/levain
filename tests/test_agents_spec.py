@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -11,8 +12,8 @@ import pytest
 
 from levain.agents.role import add_role, role_hash
 from levain.agents.spec import (SpecError, can_fire, canonical_spec, feeder_group, finalize_spec, get_agent,
-                                list_agents, parse_spec, register_spec, retire_agent, set_operation, spec_hash,
-                                stored_specs)
+                                list_agents, mint_agent_id, parse_spec, register_spec, retire_agent, set_operation,
+                                spec_hash, stored_specs)
 from levain.agents.store import open_agent_store
 from levain.authority import _canonical
 from levain.cli import main
@@ -108,6 +109,28 @@ def test_register_versions_are_immutable_and_idempotent(store):
         for sql in ("UPDATE agent_specs SET spec = 'x'", "DELETE FROM agent_specs"):
             with pytest.raises(sqlite3.DatabaseError):
                 conn.execute(sql)
+
+
+def test_a_revert_to_an_earlier_version_is_refused_naming_it(store, tmp_path, capsys):
+    a, *_ = reg(store, "disk_floor")
+    register_spec(store, spec("disk_floor", stop_at=7200), ZONE, revise=True)
+    with pytest.raises(SpecError, match=f"version 1 of agent {a}.*written once and never again"):
+        register_spec(store, spec("disk_floor"), ZONE, revise=True)
+    raw = copy.deepcopy(SPECS["disk_floor"])
+    raw["role"]["role_hash"] = role_hash(ROLES["notify-role"])
+    f = tmp_path / "v1.json"
+    f.write_text(json.dumps(raw))
+    for extra in ([], ["--revise"]):
+        assert main(["agents", "--store-dir", str(store.directory), "register", "--from", str(f), *extra]) == 1
+        out = capsys.readouterr().out
+        assert f"rule 4: the content is version 1 of agent {a}" in out and "IntegrityError" not in out
+        assert "retire" in out and "--revise" in out
+    assert get_agent(store, "disk_floor")["versions"] == [1, 2]
+
+
+def test_mint_agent_id_shape():
+    ids = {mint_agent_id() for _ in range(4)}
+    assert len(ids) == 4 and all(re.fullmatch(r"ag-[0-9a-f]{32}", i) for i in ids)
 
 
 def test_the_stored_text_is_rehashed_on_read(store):

@@ -43,7 +43,7 @@ from levain.agents.store import AgentStore, valid_zone
 from levain.authority import _canonical
 
 __all__ = ["SpecError", "SPEC_FIELDS", "parse_spec", "parse_spec_text", "load_json", "finalize_spec", "spec_hash",
-           "canonical_spec", "register_spec", "list_agents", "get_agent", "set_operation", "retire_agent",
+           "canonical_spec", "register_spec", "register_specs", "mint_agent_id", "find_revert", "list_agents", "get_agent", "set_operation", "retire_agent",
            "resolve_agent", "feeder_group", "stored_specs", "can_fire"]
 
 SPEC_HASH_PREFIX = b"levain-agentspec/1\n"
@@ -307,42 +307,97 @@ def stored_specs(store: AgentStore) -> dict[str, dict[str, Any]]:
     return {name: _check_row(agent_id, name, digest, text) for agent_id, name, digest, text in rows}
 
 
+def mint_agent_id() -> str:
+    """A new ``ag-<32 hex>`` (A0 r6 §3.1): every registration of a name no live agent holds gets a fresh one."""
+    return "ag-" + secrets.token_hex(16)
+
+
+def revert_message(name: str, agent_id: str, version: int) -> str:
+    return (f"the content is version {version} of agent {agent_id} ({name!r}), an earlier version: an agent version "
+            f"is written once and never again (its spec_hash is unique), so a revert cannot be the next version. "
+            f"Change a field so the content is new and --revise it, or retire {agent_id} and register this content "
+            f"as a new agent (a new agent_id)")
+
+
+def earlier_version(conn: Any, agent_id: str, text: str) -> int | None:
+    """The version of ``agent_id`` whose stored canonical text is ``text`` (None when no version holds it)."""
+    row = conn.execute("SELECT version FROM agent_specs WHERE agent_id = ? AND spec = ? ORDER BY version LIMIT 1",
+                       (agent_id, text)).fetchone()
+    return None if row is None else row[0]
+
+
+def find_revert(store: AgentStore, spec: dict[str, Any], default_zone: str | None) -> str | None:
+    """The refusal text when ``spec`` (finalized) equals a NON-current version of the live agent holding its name."""
+    try:
+        text = _canonical(finalize_spec(spec, default_zone))
+    except SpecError:
+        return None
+    with store.read() as conn:
+        held = conn.execute("SELECT agent_id, current_version FROM agents WHERE name = ? AND registration = "
+                            "'registered'", (spec["name"],)).fetchone()
+        if held is None:
+            return None
+        version = earlier_version(conn, held[0], text)
+    return None if version is None or version == held[1] else revert_message(spec["name"], held[0], version)
+
+
+def _register_in(conn: Any, spec: dict[str, Any], default_zone: str | None,
+                 revise: bool) -> tuple[str, str, int, bool]:
+    final = finalize_spec(spec, default_zone)
+    text = _canonical(final)
+    held = conn.execute("SELECT agent_id, current_version FROM agents WHERE name = ? AND registration = "
+                        "'registered'", (final["name"],)).fetchone()
+    if held is None:
+        agent_id = mint_agent_id()
+        digest = spec_hash(agent_id, final)
+        conn.execute("INSERT INTO agents (agent_id, name, current_version, registration, operation, "
+                     "failure_streak, created_at) VALUES (?,?,?,?,?,?,?)",
+                     (agent_id, final["name"], 1, "registered", "active", 0, _now()))
+        conn.execute("INSERT INTO agent_specs (agent_id, version, spec_hash, role_hash, spec, created_at) "
+                     "VALUES (?,?,?,?,?,?)", (agent_id, 1, digest, final["role"]["role_hash"], text, _now()))
+        return agent_id, digest, 1, True
+    agent_id, current = held
+    row = conn.execute("SELECT spec_hash, spec FROM agent_specs WHERE agent_id = ? AND version = ?",
+                       (agent_id, current)).fetchone()
+    if row is not None and row[1] == text:
+        return agent_id, row[0], current, False
+    if not revise:
+        raise SpecError(f"rule 4: name {final['name']!r} is held by agent {agent_id}, which is not retired "
+                        f"(its content differs: pass --revise to write version {current + 1}, or retire it)")
+    earlier = earlier_version(conn, agent_id, text)
+    if earlier is not None:
+        raise SpecError("rule 4: " + revert_message(final["name"], agent_id, earlier))
+    top = conn.execute("SELECT MAX(version) FROM agent_specs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
+    version = (top or 0) + 1
+    digest = spec_hash(agent_id, final)
+    conn.execute("INSERT INTO agent_specs (agent_id, version, spec_hash, role_hash, spec, created_at) "
+                 "VALUES (?,?,?,?,?,?)", (agent_id, version, digest, final["role"]["role_hash"], text, _now()))
+    conn.execute("UPDATE agents SET current_version = ? WHERE agent_id = ?", (version, agent_id))
+    return agent_id, digest, version, True
+
+
+def register_specs(store: AgentStore, specs: list[dict[str, Any]], default_zone: str | None, *,
+                   revise: bool = False) -> list[tuple[str, str, int, bool]]:
+    """Write validated, already-refusal-checked specs in ONE transaction: every one is written or none is (a
+    :class:`SpecError` or a store error from any of them rolls the whole batch back). Two specs of one name in a
+    batch are refused before anything is written."""
+    names = [s["name"] for s in specs]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise SpecError(f"rule 4: {', '.join(repr(n) for n in dup)} appears more than once in one registration")
+    with store.write() as conn:
+        return [_register_in(conn, s, default_zone, revise) for s in specs]
+
+
 def register_spec(store: AgentStore, spec: dict[str, Any], default_zone: str | None, *,
                   revise: bool = False) -> tuple[str, str, int, bool]:
     """Write a validated, already-refusal-checked spec. Return ``(agent_id, spec_hash, version, created)``.
 
     A name no live agent holds mints a NEW agent_id (version 1). A name a live agent holds: the same content is
     returned as is (``created`` False); different content with ``revise`` writes the next version of that agent
-    (versions are immutable; the operation axis is untouched); without ``revise`` it is refused (rule 4)."""
-    final = finalize_spec(spec, default_zone)
-    text = _canonical(final)
-    with store.write() as conn:
-        held = conn.execute("SELECT agent_id, current_version FROM agents WHERE name = ? AND registration = "
-                            "'registered'", (final["name"],)).fetchone()
-        if held is None:
-            agent_id = "ag-" + secrets.token_hex(16)
-            digest = spec_hash(agent_id, final)
-            conn.execute("INSERT INTO agents (agent_id, name, current_version, registration, operation, "
-                         "failure_streak, created_at) VALUES (?,?,?,?,?,?,?)",
-                         (agent_id, final["name"], 1, "registered", "active", 0, _now()))
-            conn.execute("INSERT INTO agent_specs (agent_id, version, spec_hash, role_hash, spec, created_at) "
-                         "VALUES (?,?,?,?,?,?)", (agent_id, 1, digest, final["role"]["role_hash"], text, _now()))
-            return agent_id, digest, 1, True
-        agent_id, current = held
-        row = conn.execute("SELECT spec_hash, spec FROM agent_specs WHERE agent_id = ? AND version = ?",
-                           (agent_id, current)).fetchone()
-        if row is not None and row[1] == text:
-            return agent_id, row[0], current, False
-        if not revise:
-            raise SpecError(f"rule 4: name {final['name']!r} is held by agent {agent_id}, which is not retired "
-                            f"(its content differs: pass --revise to write version {current + 1}, or retire it)")
-        top = conn.execute("SELECT MAX(version) FROM agent_specs WHERE agent_id = ?", (agent_id,)).fetchone()[0]
-        version = (top or 0) + 1
-        digest = spec_hash(agent_id, final)
-        conn.execute("INSERT INTO agent_specs (agent_id, version, spec_hash, role_hash, spec, created_at) "
-                     "VALUES (?,?,?,?,?,?)", (agent_id, version, digest, final["role"]["role_hash"], text, _now()))
-        conn.execute("UPDATE agents SET current_version = ? WHERE agent_id = ?", (version, agent_id))
-    return agent_id, digest, version, True
+    (versions are immutable; the operation axis is untouched); without ``revise`` it is refused (rule 4). Content
+    equal to an EARLIER version of that agent (a revert) is refused, naming the version (spec_hash is unique)."""
+    return register_specs(store, [spec], default_zone, revise=revise)[0]
 
 
 _AGENT_COLS = "agent_id, name, current_version, registration, operation, failure_streak, created_at"

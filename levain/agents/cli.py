@@ -16,8 +16,8 @@ from pathlib import Path
 
 from levain.agents.role import MAX_VERSION, RoleError, add_role, get_role, latest_version, parse_role_text
 from levain.agents.refuse import AuditError, audit_verdicts, check_spec, derived_flags, refinement_of
-from levain.agents.spec import (SpecError, finalize_spec, get_agent, list_agents, load_json, parse_spec,
-                                register_spec, retire_agent, set_operation, stored_specs)
+from levain.agents.spec import (SpecError, finalize_spec, find_revert, get_agent, list_agents, load_json,
+                                parse_spec, register_specs, retire_agent, set_operation, stored_specs)
 from levain.agents.store import AgentStoreRefused, get_default_zone, open_agent_store, set_default_zone
 from levain.autonomic.agent_tables import AGENT_SCHEMA
 from levain.autonomic.db import StoreFormatError
@@ -222,48 +222,71 @@ def run_register(args: argparse.Namespace) -> int:
         stored = stored_specs(store)
     except (SpecError, sqlite3.Error, StoreFormatError) as exc:
         return _fail("register", str(exc))
-    parsed: list[tuple[dict | None, list[str]]] = []
-    for obj in raw:
+    # phase 1: judge EVERY spec against the stored state plus the rest of the file (a feeder group's members see one
+    # another as registered); phase 2: write them all in one transaction, or nothing when any one is refused
+    rows: list[tuple[str, dict | None, list[str], dict]] = []
+    for i, obj in enumerate(raw):
         try:
-            parsed.append((parse_spec(obj), []))
+            rows.append(("", parse_spec(obj), [], {}))
         except SpecError as exc:
-            parsed.append((None, [f"rule 3: {exc}"]))
-    batch = {s["name"]: s for s, _ in parsed if s is not None}
-    lookup = {**stored, **batch}
-    rows: list[tuple[dict | None, list[str], dict]] = []
-    for spec, reasons in parsed:
-        info: dict = {}
-        if spec is not None:
-            held = set(stored)
-            try:
-                same = stored.get(spec["name"]) == finalize_spec(spec, default_zone)
-            except SpecError:
-                same = False
-            if args.revise or same:
-                held.discard(spec["name"])
-            role = _role_by_hash(store, spec["role"]["role_hash"])
-            reasons = [str(r) for r in check_spec(spec, role=role, default_zone=default_zone, names_held=held,
-                                                  lookup=lookup)]
-            info = {"refinement": refinement_of(spec)}
-            if role is not None:
-                info["review_required"] = derived_flags(role)["review_required"]
-        rows.append((spec, reasons, info))
-    out_rows, code = {}, 0
-    for spec, reasons, info in rows:
-        label = spec["name"] if spec else "(unparsed)"
+            rows.append((_label_of(obj, i), None, [f"rule 3: {exc}"], {}))
+    names = [s["name"] for _, s, _, _ in rows if s is not None]
+    twice = {n for n in names if names.count(n) > 1}
+    lookup = {**stored, **{s["name"]: s for _, s, _, _ in rows if s is not None}}
+    for label, spec, reasons, info in rows:
+        if spec is None:
+            continue
+        held = set(stored)
+        try:
+            same = stored.get(spec["name"]) == finalize_spec(spec, default_zone)
+        except SpecError:
+            same = False
+        revert = find_revert(store, spec, default_zone)
+        if args.revise or same or revert:
+            held.discard(spec["name"])
+        role = _role_by_hash(store, spec["role"]["role_hash"])
+        reasons += [str(r) for r in check_spec(spec, role=role, default_zone=default_zone, names_held=held,
+                                               lookup=lookup)]
+        if revert:
+            reasons.append("rule 4: " + revert)
+        if spec["name"] in twice:
+            reasons.append(f"rule 4: name {spec['name']!r} appears {names.count(spec['name'])} times in this file: a "
+                           f"registration writes one version of a name (a feeder group names each member once)")
+        info["refinement"] = refinement_of(spec)
+        if role is not None:
+            info["review_required"] = derived_flags(role)["review_required"]
+    refused = [label or spec["name"] for label, spec, reasons, _ in rows if reasons]
+    entries = []
+    for label, spec, reasons, info in rows:
         entry = {"verdict": "refused" if reasons else "pass", "reasons": reasons, **info}
-        if spec and not reasons and not args.warn:
-            try:
-                agent_id, digest, version, created = register_spec(store, spec, default_zone, revise=args.revise)
-            except (SpecError, sqlite3.Error, StoreFormatError) as exc:
-                entry.update(verdict="refused", reasons=[str(exc)])
-            else:
+        if not reasons and refused:
+            entry.update(verdict="refused", reasons=[
+                "held back: its own checks pass, but a file registers whole or not at all and "
+                + ", ".join(dict.fromkeys(refused)) + " refused"])
+        entries.append((label or spec["name"], spec, entry))
+    if not refused and not args.warn:
+        try:
+            written = register_specs(store, [s for _, s, _ in entries], default_zone, revise=args.revise)
+        except (SpecError, sqlite3.Error, StoreFormatError) as exc:
+            for _, _, entry in entries:
+                entry.update(verdict="refused", reasons=[f"nothing written: {exc}"])
+        else:
+            for (_, _, entry), (agent_id, digest, version, created) in zip(entries, written):
                 entry.update(agent_id=agent_id, spec_hash=digest, version=version, created=created)
-        if entry["verdict"] == "refused":
-            code = 1
+    out_rows: dict = {}
+    for label, _, entry in entries:
         out_rows[label if label not in out_rows else f"{label}#{len(out_rows)}"] = entry
     _print_verdicts({"jobs": out_rows}, args.json, audit=False)
+    code = 1 if any(e["verdict"] == "refused" for e in out_rows.values()) else 0
     return 0 if args.warn else code
+
+
+def _label_of(obj, index: int) -> str:
+    """An unparsable spec's label: its name when one can be read, else its index in the file."""
+    name = obj.get("name") if isinstance(obj, dict) else None
+    if isinstance(name, str) and name.strip() and name.isprintable():
+        return name[:64]
+    return f"spec[{index}]"
 
 
 def _print_verdicts(verdicts: dict, as_json: bool, *, audit: bool) -> None:

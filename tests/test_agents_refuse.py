@@ -157,10 +157,14 @@ def test_c_drill_cadence_only_on_a_recovery_output(store):
 # ---- refinement d ---------------------------------------------------------------------------------------------
 def test_d_review_is_a_derived_flag_never_stored(store):
     flags = {k: derived_flags(parse_role(ROLES[k])) for k in ROLES}
-    assert flags["local-role"] == {"calls_model": False, "acts_outward": False, "review_required": False}
-    assert flags["notify-role"] == {"calls_model": False, "acts_outward": True, "review_required": True}
+    # every fixture role but model-role is a dream executor with model "": the dream calls a model (D1 §1.3)
+    assert flags["local-role"] == {"calls_model": True, "acts_outward": False, "review_required": True}
+    assert flags["notify-role"] == {"calls_model": True, "acts_outward": True, "review_required": True}
     assert flags["model-role"] == {"calls_model": True, "acts_outward": False, "review_required": True}
     assert flags["all-role"]["acts_outward"] is True            # publishes counts
+    # the flag itself: a role that neither names a model nor runs the dream and does not act outward needs no review
+    quiet = {"ceiling": {"lands": ["local data"]}, "model": "", "executor": "session"}
+    assert derived_flags(quiet) == {"calls_model": False, "acts_outward": False, "review_required": False}
     spec = row(store, "disk_floor")
     spec["review_by"] = "2026-12-01"
     with pytest.raises(SpecError, match="review_by"):
@@ -240,6 +244,72 @@ def test_rule_4_a_held_name_is_refused_and_a_retired_name_is_free_with_a_new_id(
     retire_agent(store, a1)
     a2, _, v, created = register_spec(store, parse_spec(spec), ZONE)
     assert a2 != a1 and v == 1 and created
+
+
+def test_d_a_dream_executor_spec_is_review_required_through_register(tmp_path, capsys):
+    s = open_agent_store(tmp_path / "store")
+    spec = copy.deepcopy(SPECS["vendored_sync_check"])          # local-role: executor dream, model "", lands only
+    spec["role"]["role_hash"] = role_hash(s, "local-role")
+    f = tmp_path / "s.json"
+    f.write_text(json.dumps(spec))
+    assert main(["agents", "--store-dir", str(tmp_path / "store"), "register", "--warn", "--json", "--from",
+                 str(f)]) == 0
+    assert json.loads(capsys.readouterr().out)["jobs"]["vendored_sync_check"]["review_required"] is True
+
+
+def test_rule_3_role_name_must_match_the_role_the_hash_pins(store):
+    spec = row(store, "vendored_sync_check")                    # pins local-role's hash
+    spec["role"]["name"] = "notify-role"
+    parsed = parse_spec(spec)
+    got = check_spec(parsed, role=parse_role(ROLES["local-role"]), default_zone=ZONE)
+    assert rules(got) == ["3"]
+    assert "'notify-role' does not match" in got[0].message and "which is 'local-role'" in got[0].message
+
+
+def put(tmp_path, objs):
+    f = tmp_path / "batch.json"
+    f.write_text(json.dumps(objs))
+    return str(f)
+
+
+def test_rule_4_two_specs_of_one_name_in_a_file_refuse_the_file(store, tmp_path, capsys):
+    d = ["agents", "--store-dir", str(store.directory), "register"]
+    a, b = row(store, "vendored_sync_check"), row(store, "vendored_sync_check")
+    b["stop_at"] = 5
+    for extra in (["--warn"], [], ["--revise"]):
+        code = main([*d, "--json", "--from", put(tmp_path, [a, b]), *extra])
+        got = json.loads(capsys.readouterr().out)["jobs"]
+        assert code == (0 if extra == ["--warn"] else 1)
+        assert {v["verdict"] for v in got.values()} == {"refused"}
+        assert all("appears 2 times in this file" in v["reasons"][-1] for v in got.values())
+        assert stored_specs(store) == {}
+
+
+def test_a_feeder_group_registers_whole_or_not_at_all(store, tmp_path, capsys):
+    d = ["agents", "--store-dir", str(store.directory), "register", "--json", "--from"]
+    sensor, classifier, reconciler = (row(store, n) for n in ("email_sensor_argus", "email_classifier_argus",
+                                                              "email_event_reconciler"))
+    assert main([*d, put(tmp_path, [sensor, classifier, reconciler])]) == 1      # the reconciler has no win
+    got = json.loads(capsys.readouterr().out)["jobs"]
+    assert got["email_classifier_argus"]["reasons"][0].startswith("held back: its own checks pass")
+    assert got["email_event_reconciler"]["reasons"] == ["rule 1: no win"]
+    assert stored_specs(store) == {}                                              # nothing written, no dangling feeds
+    reconciler["win"] = {"kind": "verifier", "check": "attestation checked"}
+    assert main([*d, put(tmp_path, [sensor, classifier, reconciler])]) == 0
+    got = json.loads(capsys.readouterr().out)["jobs"]
+    assert {v["version"] for v in got.values()} == {1} and set(stored_specs(store)) == set(got)
+
+
+def test_a_cycle_in_a_file_writes_nothing(store, tmp_path, capsys):
+    base = row(store, "vendored_sync_check")
+    specs = [{**copy.deepcopy(base), "name": n, "feeds": f} for n, f in (("a", ["b"]), ("b", ["c"]), ("c", ["b"]))]
+    assert main(["agents", "--store-dir", str(store.directory), "register", "--json", "--from",
+                 put(tmp_path, specs)]) == 1
+    got = json.loads(capsys.readouterr().out)["jobs"]
+    assert any("feeder cycle: b -> c -> b" in r for r in got["b"]["reasons"])
+    assert any("feeder cycle: c -> b -> c" in r for r in got["c"]["reasons"])
+    assert got["a"]["reasons"][0].startswith("held back")                         # a is not in the cycle
+    assert stored_specs(store) == {}
 
 
 @pytest.mark.parametrize("role,needle", [("empty-role", "empty"), ("all-role", "says 'all'")])
