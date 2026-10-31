@@ -89,12 +89,27 @@
       const b = el("button", "ck-tab", "");
       b.type = "button";
       b.setAttribute("role", "tab");
+      b.id = "dev-tab-" + k;
+      b.setAttribute("aria-controls", "dev-tabpanel");
       b.addEventListener("click", () => { tab = k; paint(); });
+      // roving tabindex: arrows move between the tabs and select, Home/End jump
+      b.addEventListener("keydown", (e) => {
+        const order = ["active", "revoked"];
+        let to = null;
+        if (e.key === "ArrowRight") to = order[(order.indexOf(k) + 1) % order.length];
+        else if (e.key === "ArrowLeft") to = order[(order.indexOf(k) + order.length - 1) % order.length];
+        else if (e.key === "Home") to = order[0];
+        else if (e.key === "End") to = order[order.length - 1];
+        if (!to) return;
+        e.preventDefault();
+        tab = to; paint(); tabBtns[to].focus();
+      });
       tabBtns[k] = b; tabsNav.appendChild(b);
     }
     body.appendChild(tabsNav);
     list = el("div", "dev-list");
     list.setAttribute("role", "tabpanel");
+    list.id = "dev-tabpanel";
     body.appendChild(list);
     pingRow = el("div", "dev-row dev-pings"); pingRow.hidden = true;
     const pm = el("div", "dev-main");
@@ -168,14 +183,25 @@
 
   // Draws the chosen tab from the last read. Active devices newest-paired first; revoked ones newest-revoked first. The Revoked
   // tab exists only while something is revoked, and its count rides its label, so a long history is never hidden silently.
+  // A stamp as a number (ISO text or epoch seconds); one that does not parse sorts last.
+  function when(v) {
+    if (typeof v === "number") return v;
+    const t = Date.parse(v);
+    return Number.isNaN(t) ? 0 : t;
+  }
   function paint() {
-    const live = lastDevs.filter((d) => !d.revoked_at).sort((a, b) => String(b.created).localeCompare(String(a.created)));
-    const gone_ = lastDevs.filter((d) => d.revoked_at).sort((a, b) => String(b.revoked_at).localeCompare(String(a.revoked_at)));
+    const live = lastDevs.filter((d) => !d.revoked_at).sort((a, b) => when(b.created) - when(a.created));
+    const gone_ = lastDevs.filter((d) => d.revoked_at).sort((a, b) => when(b.revoked_at) - when(a.revoked_at));
     if (!gone_.length) tab = "active";
     tabsNav.hidden = !gone_.length;
     tabBtns.active.textContent = "Active (" + live.length + ")";
     tabBtns.revoked.textContent = "Revoked (" + gone_.length + ")";
-    for (const k of ["active", "revoked"]) tabBtns[k].setAttribute("aria-selected", k === tab ? "true" : "false");
+    for (const k of ["active", "revoked"]) {
+      tabBtns[k].setAttribute("aria-selected", k === tab ? "true" : "false");
+      tabBtns[k].tabIndex = k === tab ? 0 : -1;
+    }
+    list.setAttribute("aria-labelledby", "dev-tab-" + tab);
+    list.dataset.paints = String((Number(list.dataset.paints) || 0) + 1);   // a count tests can wait on: one per completed paint
     list.replaceChildren();
     const shown = tab === "revoked" ? gone_ : live;
     if (!lastDevs.length) list.appendChild(el("p", "dev-none", "No device is paired yet. Pair one below: it gets its own key, and you can revoke it here."));
@@ -325,6 +351,8 @@
       if (short) showCode(res.data.short, res.data.short_ttl_seconds || 600);
       else showLink(location.origin + res.data.pair_path, res.data.expires_in_s || 600);
       labelIn.value = "";
+      tab = "active";   // the new device is an active one: show it, not the Revoked list
+      paint();
       refresh();
     } catch (_) {
       say("Could not reach the cockpit.");
