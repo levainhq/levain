@@ -35,6 +35,11 @@ Known edges:
   ``unattended=`` and ``model=``, and the original ``levain.wrap._consolidate`` passed neither, so the lift keeps
   that: every save (dream and ``levain wrap``) is recorded as attended with no model. (The crystallization guard is
   unaffected: an unattended run hands the save a refusing crystal store.)
+- **The journal clear after a cancel can fail.** If the write that nulls ``phase``/``wrap_token``/``composed_sha256``
+  after a successful cancel fails, ``progress.json`` stays at ``saving`` (a warning is logged): the same recovery rule
+  as the committed-save edge above, verify against the DB, not the journal. The live-store refusal for
+  ``--occurrence-dir`` is the CLI's (:func:`levain.dream.cli`); a direct ``consolidate_store`` caller names its own
+  occurrence dir and owns that check.
 - **A cancelled run's journal phase is ``None``.** :data:`PHASES` has no "cancelled" value (D1-1b must define one):
   after our wrap is cancelled on a non-saved end, ``progress.json`` gets ``phase``, ``wrap_token`` and
   ``composed_sha256`` set back to ``null``, so it never reads as a save that may have committed. Only an end that

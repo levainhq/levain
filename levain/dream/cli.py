@@ -118,7 +118,7 @@ def run_dream_run(args: argparse.Namespace) -> int:
     # Absolute once, here (the core does it again): the package, the child's cwd, --add-dir and the prompt must all
     # name the same dir. A default id carries a random suffix: one-second ids collide and overwrite a prior record.
     occ = (Path(args.occurrence_dir).expanduser() if args.occurrence_dir else
-           store_path.parent / "dream" / f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}").resolve()
+           store_path.parent / "dream" / f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex}").resolve()
     why = _refused(occ)
     if why:
         print(f"levain dream run: --occurrence-dir {why}", file=sys.stderr)
