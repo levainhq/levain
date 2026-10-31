@@ -426,3 +426,17 @@ def test_the_service_is_never_a_caller(store):
     for state in ("working", "closed"):
         with pytest.raises(CoordError, match="by is one of"):
             store.set_state(x.thread_id, state, by="service")
+
+
+def test_drop_views_read_the_thread_memberships_once_and_match_the_single_views(store, monkeypatch):
+    drops = [store.accept_drop(f"words {i}", surface="phone", outbox_id="ph-" + f"{i:032d}")[0] for i in range(12)]
+    for i in range(0, 12, 3):
+        store.split(drops[i].drop_id, [work(f"t{i}")])
+    store.merge(store.threads()[0].thread_id, store.threads()[1].thread_id)
+    want = [store.drop_view(d.drop_id) for d in reversed(drops)]
+    calls = []
+    real = CoordStore._threads_of
+    monkeypatch.setattr(CoordStore, "_threads_of", staticmethod(lambda conn, drop_id: calls.append(drop_id) or real(conn, drop_id)))
+    assert store.drop_views(limit=12) == want
+    assert calls == [], "drop_views must not scan the thread revisions once per drop"
+    assert [v[0].drop_id for v in store.drop_views(limit=5)] == [d.drop_id for d in reversed(drops)][:5]

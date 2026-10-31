@@ -35,7 +35,7 @@ def _init(rows, *, drops=DROPS, panel=True, panel_error=None, ke=True) -> str:
     return ("(() => { const f = window.fetch; const J = (o) => new Response(JSON.stringify(o), {status: 200, headers: {'Content-Type': 'application/json'}});"
             f" const PID = {json.dumps(PANEL_ID)}, HEAD = {json.dumps(head)}, PANEL = {json.dumps(panel)}; window.__body = {json.dumps(body)}; window.__drops = {json.dumps(drops)};"
             " window.fetch = function (u, o) { const url = typeof u === 'string' ? u : (u && u.url) || '';"
-            " if (url.indexOf('/cockpit/coord/drops.json') >= 0) return Promise.resolve(window.__fail ? new Response('{}', {status: window.__fail === true ? 500 : window.__fail}) : J(window.__drops));"
+            " if (url.indexOf('/cockpit/coord/drops.json') >= 0) return Promise.resolve(window.__fail ? new Response('{}', {status: window.__fail === true ? 500 : window.__fail}) : (window.__hold ? new Promise((res) => { window.__release = () => res(J(window.__drops)); }) : J(window.__drops)));"
             " if (PANEL && url.indexOf('/cockpit/panel/' + PID + '.json') >= 0) return Promise.resolve(J(window.__body));"
             " if (PANEL && url.indexOf('/cockpit/manifest.json') >= 0) return f.apply(this, arguments).then((r) => r.json()).then((m) => {"
             "  m.panels[PID] = HEAD; const R = m.regions; R.widgets.push(PID); R.header.push(PID);"
@@ -431,3 +431,26 @@ def test_the_sheet_scroll_cap_is_scoped_to_the_page_it_belongs_to_and_the_announ
     assert "#drop-recent" not in media.split("}\n", 3)[0]      # the phone query does not restate it
     core = (root / "dashboard_core.js").read_text()
     assert "clearTimeout(ui.liveTid)" in core
+
+
+@needs_browser
+@needs_ssh
+def test_an_authorized_read_in_flight_cannot_repopulate_rows_after_the_token_is_removed(tmp_path: Path, monkeypatch) -> None:
+    gone = "(() => { window.LevainCockpitTransport.headers = () => ({}); return 1; })()"
+    steps = _boot(_init(DESK_ROWS), [{"eval": "window.__hold = true; 1"}, REDRAW, SETTLE2, {"eval": gone}, REDRAW, SETTLE2, {"eval": _keys()},
+                                      {"eval": "window.__hold = false; window.__release(); 1"}, SETTLE2, {"eval": _keys()}])
+    cleared, after = _all(_run(tmp_path, monkeypatch, steps))
+    assert cleared["rows"] == [] and "no cockpit token" in cleared["note"], cleared
+    assert after["rows"] == [] and "no cockpit token" in after["note"], after       # the late answer is discarded
+
+
+@needs_browser
+@needs_ssh
+def test_a_real_key_that_looks_like_a_numbered_duplicate_never_shares_a_key(tmp_path: Path, monkeypatch) -> None:
+    def row(i: str, t: str) -> dict:
+        return {"id": i, "title": t, "body": t, "facets": {"at": "2026-10-30T10:00:00Z", "source": "desk"}}
+    steps = _boot(_init([row("x", "one"), row("x", "two"), row("x#2", "three")]), [{"eval": _keys()}])
+    (got,) = _all(_run(tmp_path, monkeypatch, steps))
+    keys = [r["key"] for r in got["rows"] if r["key"].startswith("desk:")]
+    assert len(keys) == 3 and len(set(keys)) == 3, keys
+    assert "desk:x" in keys and "desk:x#2" in keys, keys

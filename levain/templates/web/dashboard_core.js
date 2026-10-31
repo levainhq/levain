@@ -6879,8 +6879,16 @@
       else (Array.isArray(panel.lines) ? panel.lines : []).forEach((l) => { try { const it = deskItem(l); if (it) items.push(it); } catch (e) { /* skipped */ } });
     }
     // a repeated key is numbered by its own occurrence among rows of that key, so another row arriving never renumbers it
-    const count = new Map();
-    for (const it of items) { const n = (count.get(it.key) || 0) + 1; count.set(it.key, n); if (n > 1) it.key += "#" + n; }
+    // the first row of each key keeps it, so a genuine key that ends in "#2" is never taken by a numbered repeat
+    const used = new Set(), count = new Map(), repeats = [];
+    for (const it of items) { if (used.has(it.key)) repeats.push(it); else used.add(it.key); }
+    for (const it of repeats) {
+      let n = (count.get(it.key) || 1) + 1;
+      while (used.has(it.key + "#" + n)) n++;
+      count.set(it.key, n);
+      it.key += "#" + n;
+      used.add(it.key);
+    }
     return { fault: fault, seen: !!panel && typeof panel === "object" && !panel.error, items: items.map((it, i) => [it, i]).sort((a, b) => ((b[0].at === null ? -Infinity : b[0].at) - (a[0].at === null ? -Infinity : a[0].at)) || (a[1] - b[1])).map((x) => x[0]) };
   }
   let dropRowSeq = 0;
@@ -7129,6 +7137,8 @@
     const t = window.LevainCockpitTransport;
     const headers = t && typeof t.headers === "function" ? t.headers() : {};
     if (!headers["X-Levain-Write-Token"]) {
+      dropDrawn = ++dropSeq;      // an authorized read still in flight is now older than this answer, so it is discarded when it lands
+      dropRead = null;
       dropHeroDraw(host, { why: "Sign in to send: this browser holds no cockpit token.", auth: true });
       return Promise.resolve();
     }

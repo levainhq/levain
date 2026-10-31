@@ -763,3 +763,17 @@ def test_the_listing_says_when_older_drops_are_not_in_it(world) -> None:
     got = cp.listing()
     assert len(got["coord_drops"]) == phone.DROPS_SCANNED and got["coord_drops_more"] is True
     assert got["coord_drops"][0]["words"] == f"w{phone.DROPS_SCANNED}"
+
+
+def test_exactly_the_scan_bound_of_drops_says_nothing_is_older(world) -> None:
+    from levain.coordinator import phone
+    cp = coord_for(world)
+    store = EnvelopeStore(world["qdir"])
+    for i in range(phone.DROPS_SCANNED):
+        store.accept_drop(f"w{i}", surface="phone", outbox_id="ph-" + f"{i:032d}")
+    got = cp.listing()
+    assert len(got["coord_drops"]) == phone.DROPS_SCANNED and got["coord_drops_more"] is False
+    store.accept_drop("one more", surface="phone", outbox_id="ph-" + "f" * 32)
+    got = cp.listing()
+    assert len(got["coord_drops"]) == phone.DROPS_SCANNED and got["coord_drops_more"] is True
+    assert got["coord_drops"][0]["words"] == "one more" and got["coord_drops"][-1]["words"] == "w1"

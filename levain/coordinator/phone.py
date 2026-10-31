@@ -98,7 +98,7 @@ __all__ = ["REVIEWS_KEPT", "REVIEW_CLEARED_SHOWN", "REVIEW_OPEN_SHOWN", "REVIEW_
 # the drops a listing shows, newest first, are those of these surfaces: every surface the store records. A drop typed
 # at a terminal is his words as much as one sent from the phone or the cockpit, so no surface is left out of his thread
 HIS_SURFACES = SURFACES
-# how many of the newest drops one listing scans: a bound on the per-poll cost, said aloud (coord_drops_more) when reached
+# how many of the newest drops one listing scans: a bound on the per-poll cost; coord_drops_more says aloud that older drops exist beyond the newest DROPS_SCANNED
 DROPS_SCANNED = 200
 # review items a listing shows: the open ones (oldest first, as the queue lists them) and the newest cleared ones
 REVIEW_OPEN_SHOWN = 50
@@ -225,7 +225,7 @@ class CoordPhone:
                             for t in threads]}
 
     def listing(self) -> dict[str, Any]:
-        """The ``coord_*`` keys of ``/consent.json``: his drops (the newest ``DROPS_SCANNED``; ``coord_drops_more`` is true when the scan hit that bound, so older ones may exist) with their receipts, the repos an
+        """The ``coord_*`` keys of ``/consent.json``: his drops (the newest ``DROPS_SCANNED``; ``coord_drops_more`` is true only when older drops exist beyond them) with their receipts, the repos an
         envelope may name, and who may sign one. A store that cannot be read is ``coord_note``, never an empty list
         alone; no store yet is no drops and no note."""
         signers, signer_note = self._signers()
@@ -239,9 +239,10 @@ class CoordPhone:
                 return out
             out["coord_store_id"] = store.store_id()
             out["coord_store_read"] = True
-            views = store.drop_views(limit=DROPS_SCANNED)      # newest first, bounded, ONE read: the thread shows what this scan holds
+            views = store.drop_views(limit=DROPS_SCANNED + 1)      # newest first, ONE read; the extra row only says whether older drops exist
+            out["coord_drops_more"] = len(views) > DROPS_SCANNED
+            views = views[:DROPS_SCANNED]
             scanned = [v[0] for v in views]
-            out["coord_drops_more"] = len(scanned) >= DROPS_SCANNED
             out["coord_drops"] = [self.drop_record(store, v[0].drop_id, v) for v in views if v[0].surface in HIS_SURFACES]
             repos: list[str] = []
             for t in store.threads():
