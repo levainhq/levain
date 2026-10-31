@@ -105,6 +105,10 @@ const send = (method, params = {}) => new Promise((r) => { const i = ++id; pend.
 await send("Page.enable"); await send("Network.enable");
 await send("Page.navigate", { url });
 const values = [];
+// an act-until re-run's own result key, and whether a `do` source parses as one expression (compiled here in node, never run)
+const GUARD_KEY = "__pageDriveGuard";
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const isExpression = (src) => { try { new AsyncFunction(`return (${src}\n);`); return true; } catch (e) { return false; } };
 // a CDP call that gives up after `ms`: a page that never answers must not outlive the step's deadline
 const sendWithin = (ms, method, params) => Promise.race([send(method, params), sleep(Math.max(ms, 1)).then(() => ({ timedOut: true }))]);
 // the outcome of an evaluation, kept apart from the page's own value: { value } or { error } (an exception the page raised,
@@ -206,16 +210,21 @@ for (const s of steps) {
     };
     // an `until` re-run checks its condition and acts in ONE page evaluation, so nothing can come true between the check and
     // the action; a `posts` re-run checks the driver's own POST count right before it acts
+    // The action's source is inlined, never passed to an in-page eval: a page CSP without 'unsafe-eval' blocks
+    // eval once the evaluation has awaited anything, and the condition is awaited (a promise condition is read for its value,
+    // as `check` reads it). An expression `do` is awaited as a plain evaluation awaits it; a statement list runs as statements.
+    // The result carries the driver's own key, so an action that happens to return {done: true} is never read as a result.
     const guarded = s.posts !== undefined ? null :
-      `(async () => { let c = null; try { c = (${s.until}); } catch (e) { c = null; } if (c) return { done: true, v: c }; ` +
-      // `do` is a statement list (as a plain `do` evaluation runs it), so it runs through an indirect eval of its own source
-      `await (0, eval)(${JSON.stringify(s.do)}); return { done: false }; })()`;
+      `(async () => { let c = null; try { c = await (${s.until}\n); } catch (e) { c = null; } ` +
+      `if (c) return { ${GUARD_KEY}: true, v: c }; ` +
+      (isExpression(s.do) ? `await (${s.do}\n);` : `{ ${s.do}\n; }`) + ` return { ${GUARD_KEY}: false }; })()`;
     for (;;) {
       if (Date.now() >= nextDo) {
         if (ran > 0 && Date.now() >= deadline) break;
         if (ran > 0 && s.posts !== undefined && posts.length >= s.posts) { v = true; break; }
-        const a = await evaluateOutcome(ran > 0 && guarded ? guarded : s.do, slice());
-        if (!("error" in a) && a.value && a.value.done === true) { v = a.value.v; break; }
+        const viaGuard = ran > 0 && guarded !== null;
+        const a = await evaluateOutcome(viaGuard ? guarded : s.do, slice());
+        if (viaGuard && !("error" in a) && a.value && a.value[GUARD_KEY] === true) { v = a.value.v; break; }
         ran++; if ("error" in a) lastDoError = a.error;
         nextDo = Date.now() + every;
       }

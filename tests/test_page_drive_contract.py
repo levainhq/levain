@@ -47,6 +47,49 @@ def test_act_until_runs_its_action_again_while_the_condition_is_false(tmp_path: 
     assert values[1] >= 2, values
 
 
+def _drive_at(tmp_path: Path, url: str, steps: list, timeout: float = 60):
+    f = tmp_path / "steps.json"
+    f.write_text(json.dumps(steps))
+    return _page_drive_run.run([NODE, str(DRIVE), CHROME, url, str(f)], timeout=timeout)
+
+
+# the cockpit's pages forbid in-page eval (script-src 'self', no 'unsafe-eval'); a re-run must still act there
+_STRICT_CSP_PAGE = "data:text/html,<meta http-equiv='Content-Security-Policy' content=\"script-src 'self'\"><p>strict</p>"
+
+
+@needs_browser
+@pytest.mark.parametrize("do", [
+    "window.__n = (window.__n || 0) + 1; if (window.__n >= 2) window.__ok = 1; 1",       # a statement list
+    "(window.__n = (window.__n || 0) + 1) >= 2 ? (window.__ok = 1) : 0",                 # one expression
+    "let c = (window.__n = (window.__n || 0) + 1); if (c >= 2) window.__ok = 1; 1",      # declares a name of its own
+])
+@pytest.mark.parametrize("until", ["window.__ok", "new Promise(r => setTimeout(() => r(window.__ok), 20))"])
+def test_act_until_re_runs_its_action_under_a_page_csp_that_forbids_eval(tmp_path: Path, do: str, until: str) -> None:
+    # in-page eval is allowed only until an evaluation awaits something; a promise condition makes the re-run await first
+    r = _drive_at(tmp_path, _STRICT_CSP_PAGE, [{"do": do, "until": until, "ms": 8000, "every": 300}, {"eval": "window.__n"}])
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["values"][1] >= 2, r.stdout
+
+
+@needs_browser
+def test_act_until_awaits_a_promise_condition_on_a_re_run(tmp_path: Path) -> None:
+    # the condition resolves false: a re-run must not read the pending promise as true and skip the action
+    until = "new Promise(r => setTimeout(() => r(window.__n >= 3 ? 1 : false), 50))"
+    r = _drive(tmp_path, [{"do": "window.__n = (window.__n || 0) + 1; 1", "until": until, "ms": 8000, "every": 200},
+                          {"eval": "window.__n"}])
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["values"][1] >= 3, r.stdout
+
+
+@needs_browser
+def test_an_action_returning_done_true_does_not_end_the_step(tmp_path: Path) -> None:
+    # an action's own value is never read as the driver's re-run result
+    r = _drive(tmp_path, [{"do": "window.__n = (window.__n || 0) + 1; ({done: true, v: 1})", "until": "window.__n >= 2",
+                           "ms": 8000, "every": 200}, {"eval": "window.__n"}])
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["values"][1] >= 2, r.stdout
+
+
 @needs_browser
 def test_act_until_posts_form_and_a_failure_names_the_last_error_of_the_action(tmp_path: Path) -> None:
     r = _drive(tmp_path, [{"do": "document.querySelector('#nope').click()", "posts": 1, "ms": 1200, "every": 300}])
