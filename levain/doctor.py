@@ -1903,10 +1903,11 @@ def _check_host_awake() -> list[CheckResult]:
         from levain.coordinator.door import readonly_store
 
         store = readonly_store(qdir)          # a doctor reads: it never creates the store or its tables
-        if store is None:
+        occ = len(awake.live_occurrences())   # the agents' live occurrences hold the host too (P6s), read-only
+        if store is None and not occ:
             return []
-        n = len(awake.working(store))
-        ok, line = awake.describe(qdir, working_count=n)
+        n = len(awake.working(store)) if store is not None else 0
+        ok, line = awake.describe(qdir, working_count=n, occurrence_count=occ)
     except Exception as exc:      # noqa: BLE001 - a doctor row never crashes the run
         return [CheckResult(name, True, f"not read: {exc}", warn=True)]
     return [CheckResult(name, True, line, warn=not ok)]
