@@ -195,3 +195,32 @@ def test_the_declared_names_are_the_names_the_database_holds(maximal: Path) -> N
     # everything the schema lists declare is in the file; the file holds only more of the migrations' own names
     # (`_add_gseq`'s index and trigger per table, R4's one-signature index) and what the stores make by other means
     assert sorted(declared - held) == []
+
+
+_COORD_SRC = Path(__file__).resolve().parent.parent / "levain" / "coordinator"
+
+
+def _insert_sites_without_gseq(text: str) -> list[tuple[str, str]]:
+    """(table, column list) of every ``INSERT INTO <gseq table> (...)`` in ``text`` whose column list lacks ``gseq``;
+    the list runs to its closing parenthesis, across the string-literal line breaks a long statement is written in."""
+    pattern = re.compile(r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+(" + "|".join(GSEQ_TABLES) + r")\s*\(([^)]*)\)")
+    return [(m.group(1), " ".join(m.group(2).split())) for m in pattern.finditer(text)
+            if not re.search(r"\bgseq\b", m.group(2))]
+
+
+def test_every_insert_into_a_gseq_table_names_gseq() -> None:
+    sources = {p.name: p.read_text() for p in sorted(_COORD_SRC.glob("*.py"))}
+    found = {t: 0 for t in GSEQ_TABLES}
+    for text in sources.values():                                  # the scan is not vacuous: every table has a site
+        for t in GSEQ_TABLES:
+            found[t] += len(re.findall(r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+" + t + r"\s*\(", text))
+    assert all(found.values()), found
+    holes = {name: _insert_sites_without_gseq(text) for name, text in sources.items()}
+    assert {n: h for n, h in holes.items() if h} == {}
+
+    # the scanner reports a site that omits the column: one INSERT of a scratch copy loses `, gseq`
+    victim = "teamdrafts.py"
+    assert ", gseq)" in sources[victim]
+    broken = sources[victim].replace(", gseq)", ")", 1)
+    reported = _insert_sites_without_gseq(broken)
+    assert len(reported) == 1 and reported[0][0] in GSEQ_TABLES and "gseq" not in reported[0][1]

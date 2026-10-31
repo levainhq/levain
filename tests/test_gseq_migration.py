@@ -305,3 +305,16 @@ def test_the_review_events_rebuild_keeps_the_gseq_column_index_and_trigger(tmp_p
                          "VALUES (?, 9, 'cleared', 'manual', 'operator', 't', ?)", (items[1].item_id, got[5]))
     finally:
         conn.close()
+
+
+def test_unsequenced_on_a_store_no_writer_has_migrated_is_a_seam_class_error(tmp_path: Path) -> None:
+    """A display's read-only connection reads a store no writer has migrated (no ``gseq_migration_bounds`` table): the
+    count says so in :class:`SeamClassError`, not in a raw ``sqlite3.OperationalError: no such table``."""
+    s = _old_store(tmp_path)                                     # stripped: no bounds table, never opened by the new code
+    conn = s.open_readonly()
+    try:
+        assert "gseq_migration_bounds" not in {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+        with pytest.raises(SeamClassError, match="drops: the store has not been migrated"):
+            unsequenced(conn, "drops")
+    finally:
+        conn.close()

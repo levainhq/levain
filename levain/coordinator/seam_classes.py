@@ -70,10 +70,14 @@ def unsequenced(conn: sqlite3.Connection, table: str) -> int:
     """How many rows of ``table`` hold no ``gseq`` although they were written after the migration bounded the table:
     ``gseq IS NULL AND rowid > baseline_rowid``. A row the migration found (rowid at or below the bound) is legacy and
     is not counted; a row an older binary writes later is, and stays counted after any number of newer writes (the
-    bound never moves). Raises :class:`SeamClassError` for a table with no bound row (it was never migrated)."""
+    bound never moves). Raises :class:`SeamClassError` for a table with no bound row (it was never migrated) and for a
+    store with no bounds table at all (no writer has migrated it, as a display's read-only connection can find)."""
     if not isinstance(table, str) or not table.isidentifier():
         raise SeamClassError(f"{table!r} is not a table name")
-    row = conn.execute("SELECT baseline_rowid FROM gseq_migration_bounds WHERE table_name = ?", (table,)).fetchone()
+    try:
+        row = conn.execute("SELECT baseline_rowid FROM gseq_migration_bounds WHERE table_name = ?", (table,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        raise SeamClassError(f"{table}: the store has not been migrated (no gseq_migration_bounds)") from exc
     if row is None:
         raise SeamClassError(f"{table} has no gseq migration bound: it was never migrated")
     return conn.execute(f"SELECT COUNT(*) FROM {table} WHERE gseq IS NULL AND rowid > ?", (row[0],)).fetchone()[0]

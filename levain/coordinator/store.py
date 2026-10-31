@@ -176,8 +176,10 @@ SCHEMA: tuple[str, ...] = (
 
 # C15 S0: per table the gseq migration reached, the largest rowid it held when it was first migrated (written in the
 # migration's own transaction, once): a row past it with no gseq came from a binary that does not know the column.
-# ADDITIVE like the lifecycle tables (:meth:`CoordStore._statements`): a writer's ensure path makes it; a display's gate
-# does not ask for it, so a store a writer has not brought current is still read
+# ADDITIVE like the lifecycle tables (:meth:`CoordStore._statements`): a writer's ensure path makes it. The base gate
+# (``open_readonly()``) does not ask for it, so a store a writer has not migrated is still read there; the lifecycle
+# gate (``_read_connect()``) does ask for it, so it falls through to ``_connect()``, which migrates the store once under
+# the write lock (idempotent, as for the lifecycle tables)
 SEAM_SCHEMA: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS gseq_migration_bounds (table_name TEXT PRIMARY KEY, baseline_rowid INTEGER NOT NULL)",
     *_append_only("gseq_migration_bounds", "a migration bound"),
@@ -202,7 +204,7 @@ GSEQ_TABLES: dict[str, str] = {
 }
 
 
-def _add_gseq(conn: sqlite3.Connection, table: str, what: str | None = None) -> None:
+def _add_gseq(conn: sqlite3.Connection, table: str) -> None:
     """The additive migration (CH-D1 §2.8), for any table: ``table`` gains ``gseq``, NULL on every row written before it,
     so a row can take its place in the store-wide order. SQLite adds no UNIQUE column, so uniqueness is an index, and a
     replacing INSERT that reuses a gseq is refused by its own trigger (an INSERT OR REPLACE on a unique index deletes
@@ -212,7 +214,7 @@ def _add_gseq(conn: sqlite3.Connection, table: str, what: str | None = None) -> 
     transaction; the table is a name from :data:`GSEQ_TABLES`, never caller text."""
     if table not in GSEQ_TABLES:
         raise CoordError(f"{table} is not a table that takes a gseq")
-    what = what or GSEQ_TABLES[table]
+    what = GSEQ_TABLES[table]
     if "gseq" not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN gseq INTEGER")
     conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_gseq ON {table} (gseq)")
@@ -601,8 +603,10 @@ class CoordStore:
         the ready reader reads their absence as no items (:mod:`levain.coordinator.ready`)."""
         from levain.dispatch.jobs import _SCHEMA as JOB_SCHEMA, FORMAT
 
-        # only ``replies``' sequence gates a reader: the S0 columns (:data:`GSEQ_TABLES`) are read by no display yet, so a
-        # store a writer has not brought current is still read, as a store made before R4's index is
+        # the base gate (``open_readonly()``) asks only for ``replies``' sequence, not for SEAM_SCHEMA or the S0 columns
+        # (:data:`GSEQ_TABLES`), so a store a writer has not migrated is still read there. The lifecycle gate
+        # (``base=False``, ``_read_connect()``) asks for SEAM_SCHEMA, fails, and falls through to ``_connect()``, which
+        # migrates the store once under the write lock (idempotent, as for the lifecycle tables)
         if not schema_present(conn, (*JOB_SCHEMA, *self._statements(base=base, lifecycle=not base))) or "gseq" not in {
                 r[1] for r in conn.execute("PRAGMA table_info(replies)")} \
                 or not {"replies_gseq", "replies_gseq_no_replace"} <= _names(conn):
