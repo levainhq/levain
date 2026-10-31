@@ -883,11 +883,13 @@ def launch_death(conn: sqlite3.Connection, ln: Launch) -> bool | None:
     return True
 
 
-def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
-    """Coordinator deaths in a row since you last looked (a take or release of yours) or a coordinator last ran:
-    ``(count, at of the latest)``."""
+def death_run(conn: sqlite3.Connection) -> list[tuple[str, Launch]]:
+    """The coordinator launches that died in a row since you last looked (a take or release of yours) or a coordinator
+    last ran, NEWEST end first, as ``(launch_id, launch)``: the one walk the wake backoff (:func:`_deaths`) and the stop
+    episode's name (``launch._stop_episode``, the OLDEST of them) both read. The run ends at the first launch that did not
+    die; one nobody tried to start is skipped."""
     looked = _looked(conn)
-    count, latest = 0, None
+    run: list[tuple[str, Launch]] = []
     # in the order the launches ENDED (their latest event), not the order they were asked for
     for (launch_id,) in conn.execute(
             "SELECT l.launch_id FROM launches l WHERE l.role = 'coordinator' AND l.gseq > ? ORDER BY "
@@ -898,13 +900,22 @@ def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
             break
         if death is None:
             continue
-        count += 1
-        if latest is None:
-            # the death's own time: an expiry happened at its until, whenever it was noticed
-            latest = ln.until if ln.state == "expired" else _idle_until(conn, ln) if ln.cause == "lost the lease" \
-                else conn.execute(
-                "SELECT at FROM launch_events WHERE launch_id = ? ORDER BY seq DESC LIMIT 1", (launch_id,)).fetchone()[0]
-    return count, latest
+        run.append((launch_id, ln))
+    return run
+
+
+def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
+    """Coordinator deaths in a row since you last looked (a take or release of yours) or a coordinator last ran:
+    ``(count, at of the latest)``."""
+    run = death_run(conn)
+    if not run:
+        return 0, None
+    launch_id, ln = run[0]
+    # the death's own time: an expiry happened at its until, whenever it was noticed
+    latest = ln.until if ln.state == "expired" else _idle_until(conn, ln) if ln.cause == "lost the lease" \
+        else conn.execute("SELECT at FROM launch_events WHERE launch_id = ? ORDER BY seq DESC LIMIT 1",
+                          (launch_id,)).fetchone()[0]
+    return len(run), latest
 
 
 def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:

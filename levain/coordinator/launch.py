@@ -189,6 +189,35 @@ def _user_settings_files() -> set[Path]:
     return {(d / "settings.json").resolve() for d in dirs}
 
 
+def band_failure(rows: list | None, directory: Path, agent: str,
+                 codex_home: Path | None = None) -> tuple[str, str] | None:
+    """``(what is wrong, the command that fixes it)`` when a coordinator in ``directory`` could not show the NEEDS YOU
+    band, else ``None``: doctor's own ``NEEDS YOU band hooks`` row (taken from ``rows`` when the check ran it, else
+    run here; never a second checker) failing. ``codex_home``: the Codex home whose hooks.json names the interpreter
+    (the one the Codex launcher uses)."""
+    from levain import doctor
+
+    row = next((r for r in rows or () if r.name == doctor.BAND_HOOKS_ROW), None)
+    if row is None:
+        try:
+            row = doctor._check_band_hooks(Path(directory), agent, codex_home)
+        except Exception as exc:  # noqa: BLE001 - a check that cannot run is a refusal, never a pass
+            return (f"{doctor.BAND_HOOKS_ROW}: not checked ({type(exc).__name__}: {str(exc)[:200]})",
+                    f"levain doctor --path {directory}")
+    if row.ok:
+        return None
+    fix = f"levain update --path {directory}" if (row.hint or "").startswith("levain update") else "levain doctor"
+    return f"{row.name}: {row.detail}", fix
+
+
+def band_problem(rows: list | None, directory: Path, agent: str) -> str | None:
+    """:func:`band_failure` as the refusal text: a coordinator that cannot render the band is not started."""
+    bad = band_failure(rows, directory, agent)
+    if bad is None:
+        return None
+    return f"{bad[0]}; the coordinator would show no NEEDS YOU band. Fix: `{bad[1]}`"
+
+
 def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
     """Doctor's own Claude Code check of ``directory`` (never a re-derivation): ``(True, detail)`` when its
     ``Claude Code consent hook`` row reads "wired to this install" AND no ``Claude Code hooks`` row of the same check
@@ -200,7 +229,8 @@ def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
     if not (Path(directory) / "CLAUDE.md").is_file():
         return False, f"{directory} is not a Levain install for Claude Code (no CLAUDE.md)"
     try:
-        rows = doctor._check_claude_code(Path(directory))
+        with doctor.band_probe_once():
+            rows = doctor._check_claude_code(Path(directory), user_band=False)
     except Exception as exc:  # noqa: BLE001 - a check that cannot run is a refusal, never a pass
         return False, f"doctor could not check {directory} ({type(exc).__name__}: {str(exc)[:200]})"
     # ruled (L3 r1 G1): a wired hook is not a running one. doctor reports an effective `disableAllHooks: true` (any
@@ -223,6 +253,9 @@ def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
                 return False, f"{HOOK_ROW}: {row.detail}"
             if off is not None:
                 return False, f"{HOOK_ROW}: {row.detail}, but {_HOOKS_ROW}: {off.detail}"
+            band = band_problem(rows, Path(directory), "claude_code")
+            if band is not None:
+                return False, band
             return True, row.detail + note
     failed = next((r for r in rows if not r.ok), None)
     why = f"{failed.name}: {failed.detail}" if failed is not None else "doctor reports no consent hook row"
@@ -393,6 +426,12 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "A wake is the exception: your first prompt begins `[levain wake ln-...]`. Nobody is waiting on that turn, so "
         "Levain shows you no band on it and does not check your reply for one. Act and record; if something needs him, "
         "file it (`coord escalate`), never narrate it.",
+        "",
+        "Words he dropped from the cockpit or the phone have no terminal for your reply, so answer each one you have "
+        f"read with `{lv} coord reply DROP_ID --text-file PATH --token N {tail}` (`--stdin` reads it from stdin; one "
+        "reply per drop, within 24 hours). Levain freezes its own block (what changed, and the band) onto that reply "
+        "and shows it where he reads it; you do not write the block. A drop with no reply after ten minutes shows on "
+        "the Coordinator panel as `no reply yet`.",
         "",
         "## How your turn ends",
         "",
@@ -582,18 +621,8 @@ def _stop_episode(store: CoordStore) -> str | None:
     from levain.autonomic.durable_sqlite import read_transaction
 
     with read_transaction(store.open_readonly) as conn:
-        looked = lease_mod._looked(conn)
-        first = None
-        # newest end first; the run ends at the first launch that did not die, and one nobody tried to start is skipped
-        for (launch_id,) in conn.execute(
-                "SELECT l.launch_id FROM launches l WHERE l.role = 'coordinator' AND l.gseq > ? ORDER BY "
-                "(SELECT MAX(e.gseq) FROM launch_events e WHERE e.launch_id = l.launch_id) DESC", (looked,)).fetchall():
-            death = lease_mod.launch_death(conn, lease_mod._launch_row(conn, "launch_id", launch_id))
-            if death is False:
-                break
-            if death:
-                first = launch_id
-        return first
+        run = lease_mod.death_run(conn)         # newest end first: the first death of the run is the last
+        return run[-1][0] if run else None
 
 
 def _note_stopped(store: CoordStore) -> None:
@@ -630,8 +659,11 @@ def _note_stopped(store: CoordStore) -> None:
 
 def launch_session(store: CoordStore, launch_id: str) -> Outcome:
     """:func:`_launch_session`, then the band is told when the launch that did not start made the coordinator
-    ``stopped``."""
-    out = _launch_session(store, launch_id)
+    ``stopped``. Each band import probe runs once for the launch (:func:`levain.doctor.band_probe_once`)."""
+    from levain import doctor
+
+    with doctor.band_probe_once():
+        out = _launch_session(store, launch_id)
     if not out.started:
         _note_stopped(store)
     return out

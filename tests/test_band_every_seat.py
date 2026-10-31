@@ -14,6 +14,7 @@ import pytest
 import levain
 from levain import band_view
 from levain.consent.questions import QuestionStore
+from tests.test_repin_on_install import make_install  # noqa: F401  (fixture: a real install, levain init)
 
 OPTS = [("fix", "fixed 30 s"), ("exp", "exponential")]
 TEMPLATES = pathlib.Path(levain.__file__).parent / "templates"
@@ -309,10 +310,9 @@ def test_gate_notice_when_the_band_is_not_installed(qdir, store, monkeypatch, tm
     assert band_view.gate_notice(qdir, "claude_code", "s2", str(proj), e) is not None  # another session
 
 
-def test_gate_notice_silent_when_wired_autonomous_or_broken(qdir, store, monkeypatch, tmp_path):
+def test_gate_notice_silent_when_wired_autonomous_or_broken(qdir, store, monkeypatch, tmp_path, make_install):
     launch_rows(monkeypatch, {"w1": "worker"})
-    wired, bare = tmp_path / "wired", tmp_path / "bare"
-    _hooks_dir(wired, wired=True)
+    wired, bare = make_install("wired"), tmp_path / "bare"
     bare.mkdir()
     ask(store)
     assert band_view.gate_notice(qdir, "claude_code", "s1", str(wired), env(qdir)) is None
@@ -345,26 +345,38 @@ def test_codex_hooks_json_locates_the_install(tmp_path):
 
 
 # --- the doctor row and the brief ---------------------------------------------------------------------------
-def test_doctor_band_hooks_row(tmp_path):
+def _drop_registration(hooks_file, event):
+    doc = json.loads(hooks_file.read_text())
+    del doc["hooks"][event]
+    hooks_file.write_text(json.dumps(doc))
+
+
+def test_doctor_band_hooks_row(tmp_path, make_install):
     from levain import doctor
 
-    _hooks_dir(tmp_path / "a", wired=True)
-    r = doctor._check_band_hooks(tmp_path / "a", "claude_code")
+    a = make_install("a")
+    r = doctor._check_band_hooks(a, "claude_code")
     assert r.ok and not r.warn and "wired" in r.detail
-    _hooks_dir(tmp_path / "b", wired=False)
+    _hooks_dir(tmp_path / "b", wired=True)              # scripts that name the band, and nothing that runs them
     r = doctor._check_band_hooks(tmp_path / "b", "claude_code")
-    assert r.ok and r.warn and r.detail.startswith("absent") and r.hint == "levain update"
-    d = _hooks_dir(tmp_path / "c", wired=True)
-    (d / "stop.py").write_text("pass\n")
-    assert doctor._check_band_hooks(tmp_path / "c", "claude_code").detail.startswith("stale")
-    assert doctor._check_band_hooks(tmp_path / "c", "codex").detail.startswith("stale")     # codex needs Stop too
+    assert not r.ok and r.detail.startswith("absent") and r.hint == "levain update"   # a FAIL: no band shown
+    c = make_install("c")
+    (c / "activation" / "hooks" / "stop.py").write_text("pass\n")
+    assert doctor._check_band_hooks(c, "claude_code").detail.startswith("stale")
+    cx = make_install("cx", adapter="codex")
+    # (wired, not probed: the -EP probe of this interpreter depends on how levain is installed in it)
+    assert doctor.install_band_wiring(cx, None, "codex", tmp_path / "codex-home").state == "wired"
+    (cx / "activation" / "hooks" / "stop.py").write_text("pass\n")
+    assert doctor._check_band_hooks(cx, "codex", tmp_path / "codex-home").detail.startswith("stale")  # Stop too
     assert doctor._check_band_hooks(tmp_path / "zzz", "codex").detail.startswith("absent")
 
 
-def test_shipped_templates_are_wired_for_both_agents():
-    for agent, root in (("claude_code", TEMPLATES / "activation" / "hooks"),
-                        ("codex", TEMPLATES / "adapters" / "codex" / "activation" / "hooks")):
-        assert band_view.band_hooks_state(root, agent) == ("wired", [])
+def test_a_fresh_install_of_each_agent_is_wired(tmp_path, make_install):
+    from levain import doctor
+
+    assert doctor.install_band_wiring(make_install("cc")).state == "wired"
+    assert doctor.install_band_wiring(make_install("cx", adapter="codex"), None, "codex",
+                                      tmp_path / "codex-home").state == "wired"
 
 
 def test_coordinator_brief_carries_the_band_line(tmp_path, monkeypatch):
@@ -401,10 +413,13 @@ def test_codex_stop_script_prints_the_block_json_once(qdir, store, monkeypatch, 
     assert mod.main() == 0 and capsys.readouterr().out == ""           # fail open
 
 
-def test_codex_needs_the_stop_script_to_be_wired(tmp_path):
-    d = _hooks_dir(tmp_path / "c", wired=True)
-    (d / "stop.py").write_text("pass\n")
-    assert band_view.band_hooks_state(d, "codex") == ("stale", ["stop.py"])
+def test_codex_needs_the_stop_hook_to_be_wired(tmp_path, make_install):
+    from levain import doctor
+
+    cx = make_install("cx", adapter="codex")
+    _drop_registration(tmp_path / "codex-home" / "hooks.json", "Stop")
+    w = doctor.install_band_wiring(cx, None, "codex", tmp_path / "codex-home")
+    assert w.state == "stale" and w.detail.startswith("Stop is not registered")
 
 
 def test_verifier_numbered_prose_after_a_bare_header_is_not_the_band(qdir, store, monkeypatch):

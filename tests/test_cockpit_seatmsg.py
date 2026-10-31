@@ -28,7 +28,7 @@ def _compose(enum, declared=DECLARED):
 CHIPS = "[...document.querySelectorAll('[data-ck-compose=recipient]')]"
 PRESSED = CHIPS + ".filter(c => c.getAttribute('aria-pressed') === 'true').map(c => c.dataset.value)"
 PICK = "document.querySelector('[data-ck-compose=recipient-pick]')"
-PRIME = [{"eval": "document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"}, {"until": TV + ".dataset.lens == 'agents'"}]
+PRIME = [{"until": "document.querySelector('#ck-hlens [data-tv=agents]') && 1"}, {"eval": "document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"}, {"until": TV + ".dataset.lens == 'agents'"}]
 
 
 def _message_effect(params, *, origin_key):

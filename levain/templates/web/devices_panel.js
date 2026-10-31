@@ -9,7 +9,7 @@
   "use strict";
   const WRITE_TOKEN_KEY = "levain_write_token";
   const H = "X-Levain-Write-Token";
-  let section = null, list = null, offerBox = null, note = null, labelIn = null, offerBtns = [];
+  let section = null, list = null, tabsNav = null, tabBtns = {}, offerBox = null, note = null, labelIn = null, offerBtns = [];
   // L3 r2 G1: ONE shared in-flight read. A caller that finds one running gets that promise back and queues exactly one
   // re-run (so a change made while it was in flight is read afterwards); reads run one at a time, so what paints is always
   // the newest read. No flag can stick: `running` is cleared in the same step the promise settles, and a read has a timeout.
@@ -17,6 +17,9 @@
   // skip reads while the stored token is still it, so a fresh token (a new link, the prompt) brings the panel back.
   let running = null, rerun = false, gone = false, refused = "";
   const READ_TIMEOUT_MS = 20000;
+  // Which list shows: "active" or "revoked". Kept in the page (not in the nodes a paint replaces), so the 30 s read, a revoke and
+  // every other re-render leave the chosen tab where it was; the tab row is built once and only relabelled.
+  let tab = "active", lastDevs = [];
   // ONESURFACE OS-4: pings for THIS browser. The row appears only where the cockpit serves web push (GET /webpush/key
   // answers, beside a Signer). Every subscription is a paired device's, so it has a revoke above it: Turn on under the
   // cockpit's own key pairs this browser on the spot, and the page keeps the device key it is handed (as pair.js keeps a
@@ -78,7 +81,35 @@
     ph.appendChild(el("h2", null, "Paired devices"));
     panel.appendChild(ph);
     const body = el("div", "pbody dev-body");
+    // the cockpit's own tab row (.ck-tabs / .ck-tab, as the Memory card's tabs); hidden while nothing is revoked
+    tabsNav = el("div", "ck-tabs dev-tabs");
+    tabsNav.setAttribute("role", "tablist");
+    tabsNav.hidden = true;
+    for (const k of ["active", "revoked"]) {
+      const b = el("button", "ck-tab", "");
+      b.type = "button";
+      b.setAttribute("role", "tab");
+      b.id = "dev-tab-" + k;
+      b.setAttribute("aria-controls", "dev-tabpanel");
+      b.addEventListener("click", () => { tab = k; paint(); });
+      // roving tabindex: arrows move between the tabs and select, Home/End jump
+      b.addEventListener("keydown", (e) => {
+        const order = ["active", "revoked"];
+        let to = null;
+        if (e.key === "ArrowRight") to = order[(order.indexOf(k) + 1) % order.length];
+        else if (e.key === "ArrowLeft") to = order[(order.indexOf(k) + order.length - 1) % order.length];
+        else if (e.key === "Home") to = order[0];
+        else if (e.key === "End") to = order[order.length - 1];
+        if (!to) return;
+        e.preventDefault();
+        tab = to; paint(); tabBtns[to].focus();
+      });
+      tabBtns[k] = b; tabsNav.appendChild(b);
+    }
+    body.appendChild(tabsNav);
     list = el("div", "dev-list");
+    list.setAttribute("role", "tabpanel");
+    list.id = "dev-tabpanel";
     body.appendChild(list);
     pingRow = el("div", "dev-row dev-pings"); pingRow.hidden = true;
     const pm = el("div", "dev-main");
@@ -150,6 +181,34 @@
     return r;
   }
 
+  // Draws the chosen tab from the last read. Active devices newest-paired first; revoked ones newest-revoked first. The Revoked
+  // tab exists only while something is revoked, and its count rides its label, so a long history is never hidden silently.
+  // A stamp as a number (ISO text or epoch seconds); one that does not parse sorts last.
+  function when(v) {
+    if (typeof v === "number") return v;
+    const t = Date.parse(v);
+    return Number.isNaN(t) ? 0 : t;
+  }
+  function paint() {
+    const live = lastDevs.filter((d) => !d.revoked_at).sort((a, b) => when(b.created) - when(a.created));
+    const gone_ = lastDevs.filter((d) => d.revoked_at).sort((a, b) => when(b.revoked_at) - when(a.revoked_at));
+    if (!gone_.length) tab = "active";
+    tabsNav.hidden = !gone_.length;
+    tabBtns.active.textContent = "Active (" + live.length + ")";
+    tabBtns.revoked.textContent = "Revoked (" + gone_.length + ")";
+    for (const k of ["active", "revoked"]) {
+      tabBtns[k].setAttribute("aria-selected", k === tab ? "true" : "false");
+      tabBtns[k].tabIndex = k === tab ? 0 : -1;
+    }
+    list.setAttribute("aria-labelledby", "dev-tab-" + tab);
+    list.dataset.paints = String((Number(list.dataset.paints) || 0) + 1);   // a count tests can wait on: one per completed paint
+    list.replaceChildren();
+    const shown = tab === "revoked" ? gone_ : live;
+    if (!lastDevs.length) list.appendChild(el("p", "dev-none", "No device is paired yet. Pair one below: it gets its own key, and you can revoke it here."));
+    else if (!shown.length) list.appendChild(el("p", "dev-none", "No active device. Pair one below: it gets its own key, and you can revoke it here."));
+    for (const d of shown) list.appendChild(row(d));
+  }
+
   // One read and one paint. Resolves true when the panel is as current as it can be (including "nothing to show here"),
   // false when the read failed and said so.
   async function readOnce() {
@@ -170,10 +229,8 @@
     }
     if (note.textContent.endsWith("Couldn't refresh the device list.")) say("");   // G2: also the "Revoked X. Couldn't refresh…" form
     section.hidden = false;
-    list.replaceChildren();
-    const devs = res.data.devices.slice().sort((a, b) => (a.revoked_at ? 1 : 0) - (b.revoked_at ? 1 : 0) || String(b.created).localeCompare(String(a.created)));
-    if (!devs.length) list.appendChild(el("p", "dev-none", "No device is paired yet. Pair one below: it gets its own key, and you can revoke it here."));
-    for (const d of devs) list.appendChild(row(d));
+    lastDevs = res.data.devices;
+    paint();
     if (!labelIn.value) labelIn.placeholder = "name the new device, e.g. iPad";
     pings();
     return true;
@@ -294,6 +351,8 @@
       if (short) showCode(res.data.short, res.data.short_ttl_seconds || 600);
       else showLink(location.origin + res.data.pair_path, res.data.expires_in_s || 600);
       labelIn.value = "";
+      tab = "active";   // the new device is an active one: show it, not the Revoked list
+      paint();
       refresh();
     } catch (_) {
       say("Could not reach the cockpit.");

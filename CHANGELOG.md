@@ -9,6 +9,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Added
 - **Groundwork: AgentSpec, the registration refusals and the lifecycle axes.** `levain agents register|list|show|pause|resume|retire|zone` over immutable, content-hashed agent specs (`stop_at` required), refusing what the agent design's rules 1-6 and five refinements refuse. A file registers whole or not at all (a feeder group is judged together and written in one transaction), and `--warn` writes nothing, not even a new store. A pause stays on its agent through a same-content re-register, a `--revise` and a retire, and only `resume` clears it; a retire followed by a new register of the name is a new agent (a new `agent_id`) that starts active. `--warn` over an audit file echoes the audit's own verdicts and checks each row is coherent; it does not run the refusals, which are exercised by the spec fixture's tests. The build plan's "diff is empty" check cannot hold literally (the output carries fields the expected file does not); the test compares every row's verdict, class, refinement and review flag. Nothing runs an agent yet.
 - **Groundwork: one sleep reconciler over both stores.** `awake.sync` now re-reads the coordinator's working threads AND the agents' live occurrences (`agent_occurrences` in state `admitted` or `launched`) under the one `awake.json` lock, whichever side calls it, and releases the holder only when both are empty; `levain doctor`'s host-sleep row names the source (coordinator, agent, or both) and the occurrence holding the host. Nothing starts an agent occurrence yet.
+- **The coordinator now answers words you drop from the cockpit or the phone, and silence no longer reads as "heard".** `levain coord reply DROP_ID --text ... --token N` files a reply bound to that drop: one reply per drop, within 24 hours of it, and nothing else (a drop that does not exist, a second reply, an old drop, or a drop whose time cannot be read is refused by the store itself). The Coordinator panel shows the reply with the block Levain froze when it was written (what changed since your last message, and the question band), and that block never changes after. A drop with no reply after 10 minutes shows on the panel, and in the coordinator's next reply block, as `drop ... (14:02, phone): no reply yet`; once the 24 hours are over it reads `drop ... (2026-10-31 14:02, phone): no reply, window closed` and stays for 7 days after the drop, then goes. The reply counts as delivered when written, and your next terminal reply names it. A store from before this is upgraded in place and keeps every earlier reply.
 - **The coordinator's reply carries what changed in its store.** Ahead of the NEEDS YOU band, a coordinator session's
   reply block now has a work delta rendered by Levain (never model-written) from the coordinator store's records that carry
   its `gseq`: replies, launch events, lease events, ready moves and chat messages. At most 5 lines in `gseq` order, then
@@ -378,6 +379,41 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   command line includes `--guard <guard.json>`.
 
 ### Changed
+- **`levain band hooks install | remove | status`: the NEEDS YOU band in every session, opt-in.** Writes band-only
+  SessionStart, UserPromptSubmit and Stop hooks to your user-level Claude Code settings (`$CLAUDE_CONFIG_DIR` or
+  `~/.claude`), merged beside your own hooks, with a receipt (`<levain home>/band_hooks.json`). They carry no posture,
+  spores, recall or consent, and stand down where an install's own band hooks run for the session: the project
+  settings Claude Code loads for that session register the install's SessionStart, UserPromptSubmit and Stop band
+  scripts and those scripts match the package (a session started in a subfolder of an install whose hooks sit in its
+  `settings.json` loads none of them, so it gets the user-level band). They also stand down for autonomous seats and
+  in a headless session (`claude -p` and the SDKs) that has no Levain launch row; an IDE or desktop session keeps the
+  band. The Stop hook may hold a turn once to have the band reprinted. The hook command records the interpreter path;
+  `levain update` re-writes it, and a missing interpreter stays quiet in the session while doctor fails its row.
+  `levain band hooks status` shows the state. `remove` takes out levain's band hook handlers (found by their module)
+  and leaves the rest of the file as it was (a blank file comes back as it was); a symlinked settings file stays a
+  symlink (its target is edited, never deleted); a settings file that does not parse is refused untouched and named,
+  and the other is still cleaned. A receipt or settings file that cannot be written is a refusal with a message:
+  install puts the settings file back when its receipt cannot be written, and `remove` exits 1 and keeps the receipt
+  until every file is clean. `levain update` re-writes the hooks in the file the receipt names and says when Claude
+  Code's settings have moved. After install the Codex hooks also show the band outside their install (the
+  coordinator's workspace). `levain doctor` has a row for it
+  (not installed is info, installed but broken fails) and the Coordinator panel names the command when the Codex band
+  cannot render. This is the one exception to "Levain never touches your global Claude Code configuration".
+- **The coordinator will not start without a working NEEDS YOU band, and `levain doctor` fails when the band cannot
+  render.** The coordinator launch (Claude Code and Codex) now refuses, before it starts anything, when the install's
+  SessionStart, UserPromptSubmit or Stop band hook is not registered (a handler carrying `if`, or of a type other
+  than `command`, does not count: Claude Code never runs it on these events), its band scripts are missing or differ from the
+  package, or the interpreter the hooks run, started as the hook starts it, cannot import the band (the hooks swallow
+  a failed import, so the band used to vanish silently). The refusal names what is missing and the fix
+  (`levain update --path <install>`). A Codex coordinator whose workspace is outside the install whose hooks Codex
+  runs is refused until the user-level band is installed (`levain band hooks install`). Doctor's "NEEDS YOU band
+  hooks" row is a FAIL, not a warning, in those cases, and
+  the cockpit's Coordinator panel shows one line with the fix command (or "cannot check" with the reason when its
+  Codex workspace check could not run).
+- **Revoked devices move to their own tab.** The cockpit's Devices panel now lists only the devices that still hold a key.
+  Revoked ones sit under a "Revoked (N)" tab, newest-revoked first, each with the same details as before. The count is
+  always shown, the tab appears only once something is revoked, and the tab you picked stays through the panel's refreshes.
+  Revoking itself is unchanged.
 - **The ping puts what you act on first.** A question ping is now the question, its options, the answer command, and
   only then the blocks, which take the room left and end "(full text on the card)" when cut. The room is measured in
   the bytes the phone push carries (emoji and accented text take more than one), and the question and the option
@@ -469,8 +505,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   gate hook on every call and by the send child after each push, so a ping released by a quiet running out (or the desk
   going idle) waits for the next gate-hook call or push, and stays held while no agent calls. Covered by tests; not run
   on a real phone or a real push.
+- **`levain.band_view.band_hooks_state`.** It judged an install's band hooks by a text match that a script's comment
+  satisfied. Use `levain.doctor.install_band_wiring(install, project_dir)`, which returns `wired`, `stale` or
+  `absent` from the settings the session loads, the three registrations and the scripts' freshness.
 
 ### Fixed
+- **The cockpit's Work view now does something when you click it.** A worker in the Work lens opens its agent page, as a node in the Agents graph does, and an open loop opens its row in the Open loops panel (scrolled to, unfolded if folded, and lit for a moment).
 - **The cockpit's tokens-today figure no longer leaves out subagent lanes on a busy session.** It read only the first 64
   subagent transcripts by file name, so on a heavy session the later lanes were silently missing. It now reads every
   lane written since local midnight, newest first, and a lane it could not read in time (the read budget ran out) is

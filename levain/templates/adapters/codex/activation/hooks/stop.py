@@ -38,6 +38,13 @@ def main() -> int:
         if hasattr(hook, "consent_ledger"):
             hook.consent_ledger("codex", payload, fill=True)
         if not hook.should_fire():
+            # Outside the install: the band's verifier alone, only after `levain band hooks install` (its receipt).
+            if not hook.suppressed():
+                try:
+                    from levain.band_hook import codex_standalone
+                    codex_standalone("Stop", payload)
+                except Exception:
+                    pass
             return 0
         message = payload.get("last_assistant_message")
         if isinstance(message, str) and message:

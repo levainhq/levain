@@ -72,6 +72,15 @@ def main() -> int:
         payload = hook.read_stdin()
 
         if not hook.should_fire():
+            # Outside the install (the coordinator's workspace, any repo): the NEEDS YOU band alone, and only when the
+            # operator opted in with `levain band hooks install` (its receipt). Same stand-down rules; no posture,
+            # spores or recall. A suppressed spawn stays silent.
+            if not hook.suppressed():
+                try:
+                    from levain.band_hook import codex_standalone
+                    codex_standalone("SessionStart", payload)
+                except Exception:
+                    pass
             return 0
 
         sections: list[str] = []

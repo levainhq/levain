@@ -71,6 +71,13 @@ def run_update(
         with install_lock(install, create=False):
             ensure_runtime_ignored(install)
             rc = _run_update(path, **kwargs)  # type: ignore[arg-type]
+            # The opt-in user-level band hooks name the interpreter they were installed from; an upgrade can move it,
+            # so update re-writes them from this one (only when the operator installed them: the receipt). Said,
+            # never the reason the update fails.
+            from levain.band_hook import refresh_after_update
+            band_line = refresh_after_update()
+            if band_line:
+                emit(band_line)
             # anneal 1.0 (KL-19): an update that leaves a usable store also leaves its consolidate
             # baton held by the entity's session, the same rule `init` applies (a store whose claim
             # failed at init, or one an older install never claimed, is reconciled here too).

@@ -66,7 +66,15 @@ SOURCE_HOW = ("none", "cwd", "picker")
 KINDS = ("work", "ask", "note", "relay")
 STATES = ("open", "working", "done", "closed")
 ACTORS = ("operator", "coordinator", "service")
-REPLY_KINDS = ("drop_receipt", "sign", "answer", "know")
+REPLY_KINDS = ("drop_receipt", "sign", "answer", "know", "coordinator_reply")
+#: C11 S4, REPLY-BOUND: a coordinator reply to a drop is refused (by the store's own trigger) once the drop is older
+#: than this when the reply is written. The one place the window is named; the triggers below read it
+REPLY_WINDOW_HOURS = 24
+#: C11 S4: a drop with no coordinator reply after this many minutes shows the "no reply yet" line (derived, never stored)
+UNREPLIED_AFTER_MINUTES = 10
+#: C11 S4: a drop that never got a reply keeps showing (as "no reply, window closed") this many days after the drop, then
+#: ages out; the end of the reply window must not make the silence disappear
+UNREPLIED_SHOWN_DAYS = 7
 _REVISION_CAUSES = ("split", "attach", "resplit", "rescope")
 _EVENT_FIELDS = ("state", "kind", "title", "repo")
 
@@ -121,6 +129,30 @@ def _in(column: str, values: Sequence[str]) -> str:
     return f"{column} IN ({', '.join(repr(v) for v in values)})"
 
 
+def _reply_bound(name: str, cond: str, why: str) -> str:
+    return (f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE INSERT ON replies WHEN NEW.kind = 'coordinator_reply' "
+            f"AND ({cond}) BEGIN SELECT RAISE(ABORT, '{why}'); END")
+
+
+#: C11 S4, REPLY-BOUND (DESIGN 3.3): a coordinator reply names a drop that exists, answers it once, and does so inside
+#: the window. Three triggers, so each refusal is its own message and holds for any writer, not only for Python
+REPLY_BOUND: tuple[str, ...] = (
+    _reply_bound("replies_bound_drop",
+                 "NEW.ref_store != 'drops' OR NOT EXISTS (SELECT 1 FROM drops WHERE drop_id = NEW.ref_id)",
+                 "a coordinator reply names a drop that exists"),
+    _reply_bound("replies_bound_once",
+                 "EXISTS (SELECT 1 FROM replies WHERE kind = 'coordinator_reply' AND ref_store = NEW.ref_store "
+                 "AND ref_id = NEW.ref_id)",
+                 "a drop has one coordinator reply"),
+    _reply_bound("replies_bound_window",
+                 # an unparseable or empty stamp on either side makes the age NULL, and a NULL condition lets the row in:
+                 # each is refused by its own arm (a missing drop is the first trigger's). A reply dated before its drop has a negative age and is refused too
+                 "EXISTS (SELECT 1 FROM drops WHERE drop_id = NEW.ref_id) AND (julianday(NEW.at) IS NULL OR "
+                 "(SELECT julianday(received_at) FROM drops WHERE drop_id = NEW.ref_id) IS NULL OR (julianday(NEW.at) - (SELECT julianday(received_at) FROM drops WHERE "
+                 f"drop_id = NEW.ref_id)) * 24 NOT BETWEEN 0 AND {REPLY_WINDOW_HOURS})",
+                 "a coordinator reply comes within the window of its drop"),
+)
+
 SCHEMA: tuple[str, ...] = (
     # one store-wide order for every authority and event row: never wall-clock (C0 §3.4)
     "CREATE TABLE IF NOT EXISTS gseq (gseq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL)",
@@ -149,6 +181,7 @@ SCHEMA: tuple[str, ...] = (
     f"kind TEXT NOT NULL CHECK ({_in('kind', REPLY_KINDS)}), ref_store TEXT NOT NULL, ref_id TEXT NOT NULL, "
     "body TEXT NOT NULL, at TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS replies_ref ON replies (ref_store, ref_id)",
+    *REPLY_BOUND,
     *_append_only("drops", "a drop"),
     *_append_only("threads", "a thread"),
     *_append_only("thread_revisions", "a thread revision"),
@@ -238,6 +271,64 @@ def _all_gseq(conn: sqlite3.Connection) -> None:
     for table in GSEQ_TABLES:
         if table != "replies":
             _add_gseq(conn, table)
+
+
+def migrate_reply_kinds(conn: sqlite3.Connection) -> bool:
+    """C11 S4: a ``replies`` table made before ``coordinator_reply`` (its CHECK lists the older kinds) is rebuilt with the
+    current CHECK, by SQLite's documented procedure for a constraint change (the precedent is ``review.migrate_events``):
+    a new table, every row copied with its ``rowid`` and every column it holds (``gseq`` among them, so no reply loses
+    its place in the store-wide order), the old table dropped, the new one renamed. The table's triggers and indexes go
+    with the old table; the ensure path's statements and :func:`_all_gseq` that run next recreate them. Runs only in
+    ``_ensure``'s ``BEGIN IMMEDIATE``, with foreign keys off (children name ``replies``). True when it rebuilt."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'replies'").fetchone()
+    if row is None or "coordinator_reply" in row[0]:
+        return False
+    old = [r[1] for r in conn.execute("PRAGMA table_info(replies)")]
+    create = next(stmt for stmt in SCHEMA if stmt.startswith("CREATE TABLE IF NOT EXISTS replies "))
+    create = create.replace("CREATE TABLE IF NOT EXISTS replies ", "CREATE TABLE replies_r5 ", 1)
+    if "gseq" in old:
+        create = create[:-1] + ", gseq INTEGER)"
+    conn.execute(create)
+    cols = ", ".join(old)
+    conn.execute(f"INSERT INTO replies_r5 (rowid, {cols}) SELECT rowid, {cols} FROM replies")
+    conn.execute("DROP TABLE replies")
+    # a modern RENAME re-parses every view and fails on one that names the table just dropped (chat_timeline does);
+    # the legacy mode renames the table alone, the views keep their text and resolve again by name
+    legacy = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    conn.execute("PRAGMA legacy_alter_table = ON")
+    try:
+        conn.execute("ALTER TABLE replies_r5 RENAME TO replies")
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table = {'ON' if legacy else 'OFF'}")
+    return True
+
+
+def refresh_timeline_view(conn: sqlite3.Connection) -> bool:
+    """A ``chat_timeline`` view whose stored text predates ``coordinator_reply`` (its CASE has no arm for it, so a
+    threaded coordinator reply would read back with a NULL kind) is dropped and made again from the current
+    ``CHAT_SCHEMA`` statement. Runs in ``_ensure``'s transaction; True when it did. No view, or a current one: nothing."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'chat_timeline'").fetchone()
+    if row is None or "coordinator_reply" in row[0]:
+        return False
+    from levain.coordinator.chat import CHAT_SCHEMA
+
+    create = next(stmt for stmt in CHAT_SCHEMA if stmt.startswith("CREATE VIEW IF NOT EXISTS chat_timeline "))
+    conn.execute("DROP VIEW chat_timeline")
+    conn.execute(create)
+    return True
+
+
+def _dangling_after(conn: sqlite3.Connection, rebuilt: Sequence[str]) -> list[tuple]:
+    """``PRAGMA foreign_key_check`` of the rebuilt tables and of every table whose foreign keys name one of them, and of
+    nothing else: a dangling row elsewhere in the file is not this rebuild's and must not block it for ever."""
+    scope = set(rebuilt)
+    for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall():
+        if any(fk[2] in rebuilt for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")').fetchall()):
+            scope.add(table)
+    broken: list[tuple] = []
+    for table in sorted(scope):
+        broken.extend(conn.execute(f'PRAGMA foreign_key_check("{table}")').fetchall())
+    return broken
 
 
 _CREATES = re.compile(r"CREATE (?:UNIQUE )?(?:TABLE|INDEX|TRIGGER|VIEW) IF NOT EXISTS (\w+)")
@@ -454,32 +545,52 @@ class CoordStore:
         rebuild, ``PRAGMA integrity_check`` must answer ``ok`` before the transaction commits (any failure rolls all of
         it back). ``create=False``: a file holding no coordinator store is :class:`StoreAbsent`,
         decided under the write lock, and nothing is made."""
-        from levain.coordinator.review import ensure_one_signature, migrate_events
-
         if not create:
             if "threads" not in _names(conn):
                 raise StoreAbsent(f"{self.path} holds no coordinator store")
             JobStore._ensure_schema(conn)      # the dispatch store's own format steps, as its own opener runs them
-        conn.execute("BEGIN IMMEDIATE")
+        from levain.coordinator.review import ensure_one_signature, migrate_events
+
+        # a constraint rebuild of a table other tables point at runs with foreign keys off (a no-op inside a
+        # transaction, so it is set here), and the keys are checked again before the commit. The setting is put back
+        # to what the connection had, whatever happens, including a BEGIN that finds the store busy
+        old_replies = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'replies'").fetchone()
+        rebuild_replies = old_replies is not None and "coordinator_reply" not in old_replies[0]
+        keys_before = conn.execute("PRAGMA foreign_keys").fetchone()[0]
         try:
-            if not create and "threads" not in _names(conn):
-                raise StoreAbsent(f"{self.path} holds no coordinator store")
-            rebuilt = migrate_events(conn)
-            for stmt in self._statements():
-                conn.execute(stmt)
-            ensure_one_signature(conn)
-            _all_gseq(conn)
-            from levain.coordinator.lease import migrate_settings
-            migrate_settings(conn)
-            if rebuilt:
-                check = conn.execute("PRAGMA integrity_check").fetchall()
-                if check != [("ok",)]:
-                    raise CoordError(f"the review_events rebuild left {self.path} failing its integrity check "
-                                     f"({check[:3]}); nothing was changed")
-            conn.execute("COMMIT")
-        except BaseException:
-            _rollback(conn)
-            raise
+            if rebuild_replies:
+                conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if not create and "threads" not in _names(conn):
+                    raise StoreAbsent(f"{self.path} holds no coordinator store")
+                rebuilt: list[str] = ["review_events"] if migrate_events(conn) else []
+                if rebuild_replies and migrate_reply_kinds(conn):
+                    rebuilt.append("replies")
+                for stmt in self._statements():
+                    conn.execute(stmt)
+                refresh_timeline_view(conn)
+                ensure_one_signature(conn)
+                _all_gseq(conn)
+                from levain.coordinator.lease import migrate_settings
+                migrate_settings(conn)
+                if rebuilt:
+                    what = " and ".join(rebuilt)
+                    broken = _dangling_after(conn, rebuilt)
+                    if broken:
+                        raise CoordError(f"the {what} rebuild left {self.path} with a dangling reference "
+                                         f"({broken[:3]}); nothing was changed")
+                    check = conn.execute("PRAGMA integrity_check").fetchall()
+                    if check != [("ok",)]:
+                        raise CoordError(f"the {what} rebuild left {self.path} failing its integrity check "
+                                         f"({check[:3]}); nothing was changed")
+                conn.execute("COMMIT")
+            except BaseException:
+                _rollback(conn)
+                raise
+        finally:
+            if rebuild_replies:
+                conn.execute(f"PRAGMA foreign_keys = {'ON' if keys_before else 'OFF'}")
 
     def _open_existing(self) -> sqlite3.Connection:
         """A read-write connection to the coordinator's file that never makes it: the directory rule read with
