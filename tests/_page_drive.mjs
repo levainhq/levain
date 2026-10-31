@@ -86,12 +86,13 @@ for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`h
 if (!targets) { console.error("chrome never answered"); done(2); }
 const ws = new WebSocket(targets.find((t) => t.type === "page").webSocketDebuggerUrl);
 await new Promise((r) => ws.addEventListener("open", r));
-let id = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
+let id = 0; let navStarts = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
   if (trail.length > 50) trail.shift();          // a page refused in a loop keeps its last 50
   if (d.method === "Page.javascriptDialogOpening") dialogs.push(`${d.params.type}: ${String(d.params.message)}`);
+  if (d.method === "Page.frameStartedLoading" || d.method === "Page.frameRequestedNavigation" || d.method === "Page.frameNavigated") navStarts++;
   if (d.method === "Page.javascriptDialogOpening") trail.push(`dialog declined: ${d.params.type} ${String(d.params.message).slice(0, 80)}`);
   if (d.method === "Network.requestWillBeSent" && d.params.request.method === "POST") {
     posts.push(d.params.request.url.replace(/^https?:\/\/[^/]+/, "") + " " + (d.params.request.postData || ""));
@@ -203,12 +204,18 @@ for (const s of steps) {
       if ("error" in o) { lastError = o.error; return null; }
       return o.value;
     };
+    // an `until` re-run checks its condition and acts in ONE page evaluation, so nothing can come true between the check and
+    // the action; a `posts` re-run checks the driver's own POST count right before it acts
+    const guarded = s.posts !== undefined ? null :
+      `(async () => { let c = null; try { c = (${s.until}); } catch (e) { c = null; } if (c) return { done: true, v: c }; ` +
+      // `do` is a statement list (as a plain `do` evaluation runs it), so it runs through an indirect eval of its own source
+      `await (0, eval)(${JSON.stringify(s.do)}); return { done: false }; })()`;
     for (;;) {
       if (Date.now() >= nextDo) {
-        // the condition is re-checked right before every re-run: one that came true between polls must not get another action
-        if (ran > 0 && (v = await check())) break;
         if (ran > 0 && Date.now() >= deadline) break;
-        const a = await evaluateOutcome(s.do, slice());
+        if (ran > 0 && s.posts !== undefined && posts.length >= s.posts) { v = true; break; }
+        const a = await evaluateOutcome(ran > 0 && guarded ? guarded : s.do, slice());
+        if (!("error" in a) && a.value && a.value.done === true) { v = a.value.v; break; }
         ran++; if ("error" in a) lastDoError = a.error;
         nextDo = Date.now() + every;
       }
@@ -251,8 +258,13 @@ for (const s of steps) {
     }
     values.push(v || { timeout: s.until });
   } else {
+    const before = navStarts;
     const o = await evaluateOutcome(s.eval);
-    if ("error" in o && isNavigationError(o.error)) { values.push({ navigated: true }); continue; }   // the eval navigated the page
+    if ("error" in o && isNavigationError(o.error)) {
+      // a navigation-class error counts as "the eval navigated" only when the page really began a navigation during it
+      for (const end = Date.now() + 1000; navStarts === before && Date.now() < end;) await sleep(50);
+      if (navStarts !== before) { values.push({ navigated: true }); continue; }
+    }
     if ("error" in o && !s.may_error) {
       console.error(`step ${steps.indexOf(s)}: eval failed: ${o.error}: ${s.eval}`);
       await shotOnTimeout(steps.indexOf(s));

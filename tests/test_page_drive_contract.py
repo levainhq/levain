@@ -93,6 +93,9 @@ def test_an_eval_that_navigates_passes_and_any_other_eval_error_still_fails(tmp_
     assert values[0] == {"navigated": True} and values[-1] == 3, values
     r = _drive(tmp_path, [{"eval": "null.x; 1"}])
     assert r.returncode == 1 and "eval failed" in r.stderr and "TypeError" in r.stderr, (r.returncode, r.stderr)
+    # an error that only SAYS navigation, with no navigation started, is not a navigation: it fails (no false green)
+    r = _drive(tmp_path, [{"eval": "(() => { throw new Error('Execution context was destroyed (not really)'); })()"}])
+    assert r.returncode == 1 and "eval failed" in r.stderr, (r.returncode, r.stderr)
 
 
 @needs_browser
