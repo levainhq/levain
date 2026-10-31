@@ -152,7 +152,7 @@ def test_the_phone_band_item_for_an_open_question_says_so_and_draws_no_empty_act
     rows = json.loads(next(v for v in out if isinstance(v, str) and v.startswith("[{")))
     open_row = next(r for r in rows if OPEN_WHAT in r["text"])
     ordinary = next(r for r in rows if ORD_WHAT in r["text"])
-    assert "open question: answer in words in the box below" in open_row["text"], open_row
+    assert "open question: type " in open_row["text"] and ": and your words in the box below" in open_row["text"], open_row
     assert open_row["actions"] == 0, open_row
     assert ordinary["actions"] == 1 and ordinary["buttons"] == 2 and "open question" not in ordinary["text"], ordinary
 
@@ -170,7 +170,7 @@ def test_the_cockpit_source_carries_the_four_open_question_words_and_the_old_one
 
 def test_the_phone_source_carries_the_open_question_words_and_keeps_the_ordinary_placeholder() -> None:
     phone = (WEB / "phone.js").read_text()
-    assert '"open question: answer in words in the box below"' in phone and "if (!it.open_ended) row.appendChild(acts);" in phone
+    assert '"open question: type " + String(it.n) + ": and your words in the box below"' in phone and "if (!it.open_ended) row.appendChild(acts);" in phone
     assert '"open question: your answer, in words"' in phone and 'words.placeholder = "or your own words";' in phone
 
 

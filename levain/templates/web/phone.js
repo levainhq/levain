@@ -466,7 +466,7 @@
       const blocks = Array.isArray(it.blocks) ? it.blocks.join(", ") : (typeof it.blocks === "string" ? it.blocks : "");
       if (blocks) row.appendChild(el("div", "where", "blocks: " + blocks));
       const acts = el("div", "actions");
-      if (it.open_ended) row.appendChild(el("div", "where", "open question: answer in words in the box below"));
+      if (it.open_ended) row.appendChild(el("div", "where", "open question: type " + String(it.n) + ": and your words in the box below"));
       for (const o of (Array.isArray(it.options) ? it.options : [])) {
         const label = String(o && o.letter) + " · " + (o && typeof o.label === "string" ? o.label : "") + (o && o.letter === it.rec ? " (rec)" : "");
         if (authority) { acts.appendChild(el("div", "where", label)); continue; }
