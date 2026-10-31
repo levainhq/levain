@@ -90,11 +90,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-__all__ = ["DROPS_SHOWN", "REVIEWS_KEPT", "REVIEW_CLEARED_SHOWN", "REVIEW_OPEN_SHOWN", "REVIEW_TTL", "CoordPhone",
+__all__ = ["REVIEWS_KEPT", "REVIEW_CLEARED_SHOWN", "REVIEW_OPEN_SHOWN", "REVIEW_TTL", "CoordPhone",
            "CoordRefused"]
 
-# phone drops a listing shows, newest first
-DROPS_SHOWN = 10
+# the drops a listing shows, newest first, are those of these surfaces
+HIS_SURFACES = ("phone", "cockpit")      # the surfaces that carry his own words; a terminal drop (cli) is a seat's or the coordinator's
 # review items a listing shows: the open ones (oldest first, as the queue lists them) and the newest cleared ones
 REVIEW_OPEN_SHOWN = 50
 REVIEW_CLEARED_SHOWN = 10
@@ -219,7 +219,7 @@ class CoordPhone:
                             for t in threads]}
 
     def listing(self) -> dict[str, Any]:
-        """The ``coord_*`` keys of ``/consent.json``: the newest phone drops with their receipts, the repos an
+        """The ``coord_*`` keys of ``/consent.json``: his drops (every one the store's scan returns) with their receipts, the repos an
         envelope may name, and who may sign one. A store that cannot be read is ``coord_note``, never an empty list
         alone; no store yet is no drops and no note."""
         signers, signer_note = self._signers()
@@ -233,7 +233,7 @@ class CoordPhone:
                 return out
             out["coord_store_id"] = store.store_id()
             out["coord_store_read"] = True
-            drops = [d for d in store.drops(limit=200) if d.surface == "phone"][:DROPS_SHOWN]
+            drops = [d for d in store.drops(limit=200) if d.surface in HIS_SURFACES]      # the whole scan, newest first: the thread is his full history
             out["coord_drops"] = [self.drop_record(store, d.drop_id) for d in drops]
             repos: list[str] = []
             for t in store.threads():

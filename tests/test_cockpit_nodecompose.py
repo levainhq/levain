@@ -385,3 +385,13 @@ def test_a_signed_send_whose_page_turned_read_only_during_the_ceremony_says_noth
     assert text and "nothing was sent" in text.lower(), out["values"]
     assert posts == 0, out["values"]
     assert not [e for e in errs if "ResizeObserver" not in e], out["values"]
+
+
+@needs_browser
+def test_the_seat_box_says_when_to_message_a_seat_directly_and_where_everything_else_goes(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    line = "(%s.querySelector('.agent-msg-frame') || {}).textContent" % MBOX
+    want = ("For direct work with this seat (a high-residue build, a deep session on its own problem, or a seat stuck at a prompt). "
+            "Everything else goes to the coordinator: use the drop box.")
+    out = _out(tmp_path, src, [*_open("n3"), {"eval": "JSON.stringify([%s, !!%s.querySelector('textarea.tray-dump-ta'), %s.querySelector('.agent-msg-frame').nextElementSibling !== null])" % (line, MBOX, MBOX)}])
+    assert json.loads(out["values"][-1]) == [want, True, True], out["values"]

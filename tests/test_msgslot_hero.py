@@ -228,7 +228,7 @@ def test_an_expanded_recent_list_taller_than_the_composer_does_not_move_the_comp
 @needs_ssh
 def test_without_a_token_the_hero_still_draws_and_says_to_sign_in(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
-    line = ("JSON.stringify({t: 'line', note: document.querySelector('#ck-drop .drop-note').textContent, box: !!" + BOX + ", disabled: [...document.querySelectorAll('#ck-drop button, #ck-drop textarea')].every(e => e.disabled),"
+    line = ("JSON.stringify({t: 'line', note: document.querySelector('#ck-drop .drop-note').textContent, box: !!" + BOX + ", disabled: [...document.querySelectorAll('#ck-drop button, #ck-drop textarea')].filter(e => !e.hidden).every(e => e.disabled),"
             " shown: document.getElementById('ck-drop').getClientRects().length > 0})")
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/", [{"emulate": {"w": 1280, "h": 900, "dpr": 1}},

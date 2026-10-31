@@ -5843,9 +5843,11 @@
   }
   // A seat's message box on its agent page: the compose panel's own verb, built by the same box builder the compose card uses (so the
   // confirm, the passkey signature of a signed verb and the failure words are the card's), its reader fixed to this seat.
+  const SEAT_DIRECT_NOTE = "For direct work with this seat (a high-residue build, a deep session on its own problem, or a seat stuck at a prompt). Everything else goes to the coordinator: use the drop box.";
   function seatMessageBox(name) {
     const wrap = el("div", "agent-msg");
     wrap.appendChild(el("div", "needs-sec-label", "Message " + name));
+    wrap.appendChild(el("div", "agent-msg-frame ext-meta", SEAT_DIRECT_NOTE));
     const r = seatRecipient(name);
     if (!r) { wrap.appendChild(el("div", "agent-msg-none ext-meta", "can't message this seat right now")); return wrap; }
     const fields = r.act.fields.map((f) => (f === r.field ? Object.assign({}, f, { options: [r.id], default: [r.id] }) : f));
@@ -6823,11 +6825,28 @@
   };
   const dropInstant = (iso) => { const ms = typeof iso === "string" ? Date.parse(iso) : NaN; return Number.isFinite(ms) ? ms : null; };
   // local time, short: "MM-DD HH:MM"; an unreadable instant draws nothing
-  const dropWhenOf = (ms) => {
+  // "today 14:05", "yesterday 14:05", else weekday and date ("Thu 10-29 14:05"), so a time is never a bare clock on an unnamed day
+  const DROP_DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const dropZ = (n) => String(n).padStart(2, "0");
+  const dropWhenOf = (ms, now) => {
     if (ms === null) return "";
-    const d = new Date(ms), z = (n) => String(n).padStart(2, "0");
-    return z(d.getMonth() + 1) + "-" + z(d.getDate()) + " " + z(d.getHours()) + ":" + z(d.getMinutes());
+    const d = new Date(ms), n = new Date(typeof now === "number" ? now : Date.now());
+    const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const ago = Math.round((day(n) - day(d)) / 86400000);
+    const clock = dropZ(d.getHours()) + ":" + dropZ(d.getMinutes());
+    if (ago === 0) return "today " + clock;
+    if (ago === 1) return "yesterday " + clock;
+    return DROP_DAYS[d.getDay()] + " " + dropZ(d.getMonth() + 1) + "-" + dropZ(d.getDate()) + " " + clock;
   };
+  // the whole local instant, for the expanded row (a touch screen has no hover title)
+  const dropSentOf = (ms) => {
+    if (ms === null) return "";
+    const d = new Date(ms);
+    return DROP_DAYS[d.getDay()] + " " + d.getFullYear() + "-" + dropZ(d.getMonth() + 1) + "-" + dropZ(d.getDate()) + " "
+      + dropZ(d.getHours()) + ":" + dropZ(d.getMinutes()) + ":" + dropZ(d.getSeconds());
+  };
+  // a short stable key for a desk row that carries no id of its own (never its position, which shifts as rows arrive)
+  const dropHash = (t) => { let h = 5381; for (let i = 0; i < t.length; i++) h = ((h * 33) ^ t.charCodeAt(i)) >>> 0; return h.toString(36); };
   // one thread item from one of his drops; null for a malformed entry (skipped, never the whole list)
   function dropItem(d) {
     if (!d || typeof d !== "object") return null;
@@ -6838,14 +6857,16 @@
              preview: dropPreview(words), full: words, meta: how + " · " + (stages.join(", ") || "no receipt yet") };
   }
   // one thread item from one of the desk panel's lines (cockpit_view.js keeps the row's own title, body, instant and source on it)
-  function deskItem(l, i) {
+  function deskItem(l) {
     if (!l || typeof l !== "object") return null;
-    const t = l.thread && typeof l.thread === "object" ? l.thread : {};
-    const full = dropText(t.body) || dropText(l.text) || dropText(t.title);
+    const t = l.thread && typeof l.thread === "object" ? l.thread : {};      // the mapper sets it on every line of this panel
+    const full = dropText(t.body) || dropText(t.title);
     const prev = dropText(t.title) || full;
-    const who = dropText(t.source).trim() || dropText(l.addr && l.addr.source).trim() || "desk";
-    return { key: "desk:" + (dropText(l.key) || i), mine: false, who: who, at: dropInstant(t.at), iso: dropText(t.at),
-             preview: dropPreview(prev), full: full, meta: "" };
+    const src = dropText(t.source).trim();
+    // a row an older send of his own filed through the desk's thread is his, whatever case or detail its source carries
+    const his = src.toLowerCase().indexOf("phill") === 0;
+    return { key: "desk:" + (dropText(l.key) || "h" + dropHash(src + "\n" + dropText(t.at) + "\n" + full)), mine: his, who: his ? "you" : src || "desk",
+             at: dropInstant(t.at), iso: dropText(t.at), preview: dropPreview(prev), full: full, meta: "", desk: true };
   }
   // both sources, newest first; an unreadable instant sorts oldest, and equal instants keep the order they arrived in
   function dropThread(drops, view) {
@@ -6855,12 +6876,13 @@
     let fault = "";
     if (panel && typeof panel === "object") {
       if (panel.error) fault = String(panel.error);
-      else (Array.isArray(panel.lines) ? panel.lines : []).forEach((l, i) => { try { const it = deskItem(l, i); if (it) items.push(it); } catch (e) { /* skipped */ } });
+      else (Array.isArray(panel.lines) ? panel.lines : []).forEach((l) => { try { const it = deskItem(l); if (it) items.push(it); } catch (e) { /* skipped */ } });
     }
     const seen = new Set();
     const uniq = items.filter((it) => { if (seen.has(it.key)) { it.key += "#" + seen.size; } seen.add(it.key); return true; });
-    return { fault: fault, items: uniq.map((it, i) => [it, i]).sort((a, b) => ((b[0].at === null ? -Infinity : b[0].at) - (a[0].at === null ? -Infinity : a[0].at)) || (a[1] - b[1])).map((x) => x[0]) };
+    return { fault: fault, seen: !!panel && typeof panel === "object" && !panel.error, items: uniq.map((it, i) => [it, i]).sort((a, b) => ((b[0].at === null ? -Infinity : b[0].at) - (a[0].at === null ? -Infinity : a[0].at)) || (a[1] - b[1])).map((x) => x[0]) };
   }
+  let dropRowSeq = 0;
   function dropRow(it, ui) {
     const row = el("div", "drop-recent-row" + (it.mine ? " drop-mine" : " drop-desk"));
     row.dataset.dropKey = it.key;
@@ -6868,24 +6890,34 @@
     const head = el("button", "drop-row-head");
     head.type = "button";
     head.dataset.dropKey = it.key;
-    const when = el("span", "drop-when ext-meta", dropWhenOf(it.at));
+    const whenText = dropWhenOf(it.at);
+    const when = el("span", "drop-when ext-meta", whenText);
     if (it.iso) when.title = it.iso;
-    head.append(el("span", "drop-who", it.who), when, el("span", "drop-words-first", it.preview));
+    const first = el("span", "drop-words-first", it.preview);
+    head.append(el("span", "drop-who", it.who), when, first);
     if (it.meta) head.appendChild(el("span", "drop-state ext-meta", it.meta));
-    let full = null;
+    // the name keeps its separators: the visible spans run together for a reader that joins them
+    head.setAttribute("aria-label", it.who + ", " + whenText + ": " + it.preview + (it.meta ? " (" + it.meta + ")" : ""));
+    // the whole text is always in the page, hidden until opened, so the button can name it
+    const full = el("div", "drop-full");
+    full.id = "drop-full-" + (++dropRowSeq);
+    full.appendChild(el("div", "drop-full-text", it.full));
+    const sent = dropSentOf(it.at);
+    if (sent) full.appendChild(el("p", "drop-sent ext-meta", "sent " + sent));
+    head.setAttribute("aria-controls", full.id);
     const set = (on) => {
       head.setAttribute("aria-expanded", on ? "true" : "false");
       row.classList.toggle("is-open", on);
-      if (on && !full) { full = el("div", "drop-full"); full.textContent = it.full; row.appendChild(full); }
-      if (!on && full) { full.remove(); full = null; }
+      full.hidden = !on;
+      first.hidden = on;      // the opened text is not read twice
     };
     head.addEventListener("click", () => { const on = !ui.open.has(it.key); if (on) ui.open.add(it.key); else ui.open.delete(it.key); set(on); });
-    row.appendChild(head);
+    row.append(head, full);
     set(ui.open.has(it.key));
     return row;
   }
   function dropHeroBuild(host) {
-    const ui = { req: null, storeId: null, storeRead: false, can: false, shown: false, working: false, drops: [], open: new Set(), q: "", sig: null, view: null, read: null };
+    const ui = { req: null, storeId: null, storeRead: false, can: false, shown: false, working: false, drops: [], open: new Set(), seen: null, q: "", sig: null, view: null, read: null };
     const head = el("div", "needs-headline");
     head.appendChild(el("h3", null, "Drop to the coordinator"));
     ui.say = el("span", "needs-gloss drop-note", "");
@@ -6918,7 +6950,16 @@
     ui.filter.hidden = true;
     ui.list = el("div", "drop-list");
     ui.moreHost = el("div", "drop-more-host");
-    ui.recent.append(ui.fault, ui.filter, ui.list, ui.moreHost);
+    ui.sub = el("p", "drop-sub ext-meta", "Your drops and the coordinator's replies");
+    ui.live = el("p", "drop-live");      // announces a new reply; never holds anything else
+    ui.live.setAttribute("role", "status");
+    ui.live.setAttribute("aria-live", "polite");
+    ui.more = el("button", "needs-history drop-more", "");      // one node for good: a redraw changes its words, so it keeps its focus
+    ui.more.type = "button";
+    ui.more.hidden = true;
+    ui.more.addEventListener("click", () => { ui.shown = !ui.shown; dropThreadDraw(host); });
+    ui.moreHost.appendChild(ui.more);
+    ui.recent.append(ui.sub, ui.fault, ui.filter, ui.list, ui.moreHost, ui.live);
     ui.filter.addEventListener("input", () => { ui.q = ui.filter.value; dropThreadDraw(host); });
     const main = el("div", "drop-main");      // the composer is one left-column element, so the card's grid has two children whatever the list's length
     main.append(head, words, acts, ui.receipt, ui.earlier);
@@ -7025,7 +7066,9 @@
     ui.say.classList.toggle("bad", !ui.can);
     ui.send.disabled = ui.env.disabled = ui.words.disabled = ui.working || !ui.can;
     host.classList.toggle("drop-off", !ui.can);
-    ui.drops = body ? body.coord_drops : [];
+    // a read that failed (or read no store) leaves the rows already drawn; the note above says why
+    if (body && ui.storeRead) ui.drops = body.coord_drops;
+    else if (ui.drops.length) { ui.say.textContent += " Showing the drops last read."; }
     ui.read = r;
     dropThreadDraw(host);
   }
@@ -7038,6 +7081,7 @@
     const hit = (it) => (it.who + "\n" + it.preview + "\n" + it.full).toLowerCase().indexOf(q) >= 0;
     const rows = q ? t.items.filter(hit) : t.items;
     const shown = ui.shown || q ? rows : rows.slice(0, DROP_RECENT_SHOWN);
+    announceDesk(ui, t);
     const sig = JSON.stringify([t.fault, ui.shown, q, t.items.length > 1, shown.map((it) => [it.key, it.at, it.who, it.preview, it.full, it.meta]), rows.length]);
     if (sig === ui.sig) return;
     ui.sig = sig;
@@ -7047,16 +7091,26 @@
     ui.filter.hidden = t.items.length < 2;
     ui.list.replaceChildren(...shown.map((it) => dropRow(it, ui)));
     if (q && !rows.length) ui.list.appendChild(el("p", "drop-none ext-meta", "nothing in the thread matches"));
-    const kids = [];
-    if (!q && rows.length > DROP_RECENT_SHOWN) {
-      const more = el("button", "needs-history drop-more", ui.shown ? "show fewer" : "show " + (rows.length - DROP_RECENT_SHOWN) + " more");
-      more.type = "button";
-      more.addEventListener("click", () => { ui.shown = !ui.shown; dropThreadDraw(host); });
-      kids.push(more);
-    }
-    ui.moreHost.replaceChildren(...kids);
+    ui.more.hidden = !(!q && rows.length > DROP_RECENT_SHOWN);
+    ui.more.textContent = ui.shown ? "show fewer" : "show " + (rows.length - DROP_RECENT_SHOWN) + " more";
     ui.recent.hidden = !(t.fault || t.items.length);
-    if (key) { const again = Array.from(ui.list.querySelectorAll(".drop-row-head")).find((b) => b.dataset.dropKey === key); if (again) again.focus(); }
+    if (key) {
+      const again = Array.from(ui.list.querySelectorAll(".drop-row-head")).find((b) => b.dataset.dropKey === key);
+      // a row folded away by "show fewer" hands its focus to the button that folded it
+      if (again) again.focus(); else if (!ui.more.hidden) ui.more.focus(); else if (!ui.filter.hidden) ui.filter.focus();
+    }
+  }
+  // A coordinator row not seen before (after the first draw that had the desk's panel) is announced once. Never a refresh with nothing
+  // new, never his own rows.
+  function announceDesk(ui, t) {
+    if (!t.seen) return;
+    const keys = t.items.filter((it) => it.desk && !it.mine).map((it) => it.key);
+    const first = ui.seen === null;
+    const fresh = first ? [] : keys.filter((k) => !ui.seen.has(k));
+    ui.seen = new Set([...(ui.seen || []), ...keys]);
+    if (!fresh.length) return;
+    ui.live.textContent = "";
+    setTimeout(() => { ui.live.textContent = "The coordinator replied."; }, 30);      // emptied first, so a second reply is spoken again
   }
   function dropRefresh(host, fresh) {
     const t = window.LevainCockpitTransport;
