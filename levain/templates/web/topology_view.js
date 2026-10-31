@@ -115,7 +115,7 @@
     const task = (t) => (isObj(t) ? Object.assign({}, t, { opened: undefined, cost: isObj(t.cost) ? Object.assign({}, t.cost, { usd: fmtUsd(t.cost.usd), tokens: fmtTokens(t.cost.tokens) }) : t.cost }) : t);
     const sane = isObj(v) ? Object.assign({}, v, { as_of: undefined, nodes: Array.isArray(v.nodes) ? v.nodes.map(lean) : v.nodes,
                                                    tasks: Array.isArray(v.tasks) ? v.tasks.map(task) : v.tasks,
-                                                   counts: isObj(v.counts) ? Object.assign({}, v.counts, { tokens_today: fmtTokens(v.counts.tokens_today) }) : v.counts }) : v;
+                                                   counts: isObj(v.counts) ? Object.assign({}, v.counts, { tokens_today: fmtTokens(v.counts.tokens_today), cache_read_today: cacheFig(v.counts.cache_read_today) }) : v.counts }) : v;
     return JSON.stringify([l, sane, Array.from(shownAll), replaySig()]);       // T is in it: two instants repaint even when the value reads alike
   }
   // one OS-level observer at a time: the card calls this before it replaces its children
@@ -131,6 +131,20 @@
     if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
     if (n >= 1e3) return Math.round(n / 1e3) + "K";
     return String(n);
+  }
+  // a cache-read count is drawn only when it is a non-negative integer (the validator refuses anything else); null otherwise
+  function cacheFig(n) { return typeof n === "number" && Number.isInteger(n) && n >= 0 ? fmtTokens(n) : null; }
+  // The one way the tokens-today figure is drawn, in every lens: a figure with subagent lanes left out is a floor ("30+"), and
+  // says how many were not read ("7 lanes not read"). null when no transcript read.
+  function tokensToday(counts) {
+    const c = isObj(counts) ? counts : {}, fig = fmtTokens(c.tokens_today);
+    if (fig === null) return null;
+    const n = isNum(c.tokens_skipped) && c.tokens_skipped > 0 ? c.tokens_skipped : 0;
+    const note = n ? n + (n === 1 ? " lane" : " lanes") + " not read" : "";
+    // cache reads, when the provider reports them (an embedding cockpit may): shown beside the fresh figure, never added into it
+    const cr = cacheFig(c.cache_read_today), cache = cr === null ? "" : cr + (c.cache_read_today === 1 ? " cache read" : " cache reads");
+    return { fig: fig + (n ? "+" : ""), note: note, cache: cache,
+             text: fig + (n ? "+" : "") + " tokens today" + (note ? " (" + note + ")" : "") + (cache ? ", plus " + cache : "") };
   }
   function fmtUsd(n) { return isNum(n) ? "$" + n.toFixed(2) : null; }
   function clock(iso) {
@@ -341,10 +355,10 @@
     else { const n = conflictCount(v); c = el("span", "tv-stat warn"); c.append(el("b", null, n), n === 1 ? " file conflict" : " file conflicts"); }
     c.dataset.k = "conflicts";
     row.appendChild(c);
-    const tk = v.counts && isNum(v.counts.tokens_today) ? fmtTokens(v.counts.tokens_today) : null;
+    const tk = tokensToday(v.counts);
     const t = el("span", "tv-stat tv-right" + (tk === null ? " dim" : ""));
     t.dataset.k = "tokens";
-    if (tk === null) { t.textContent = "tokens today \u2014"; t.title = "no session transcript could be read"; } else t.append(el("b", null, tk), " tokens today");
+    if (tk === null) { t.textContent = "tokens today \u2014"; t.title = "no session transcript could be read"; } else { t.append(el("b", null, tk.fig), " tokens today" + (tk.note ? " (" + tk.note + ")" : "") + (tk.cache ? " \u00b7 " + tk.cache : "")); t.title = tk.text; }
     row.appendChild(t);
     return row;
   }
@@ -367,7 +381,7 @@
       return c;
     };
     const evN = isNum(counts.events_today) ? counts.events_today : null;
-    const tkN = fmtTokens(counts.tokens_today), unread = isNum(counts.tokens_unread) ? counts.tokens_unread : 0;
+    const tk = tokensToday(counts), tkN = tk === null ? null : tk.fig, unread = isNum(counts.tokens_unread) ? counts.tokens_unread : 0;
     const noTk = past ? "not kept for the past: a session's tokens are read from its transcript as it is now"
       : "no session transcript could be read" + (unread ? " (" + unread + " not read)" : "");
     row.append(
@@ -378,8 +392,8 @@
       m("running", "running", String(running), "sessions running now"),
       m("waiting", "waiting on you", String(waiting), "sessions waiting on a decision or an answer from you", waiting ? "hot" : ""),
       m("tokens", "tokens today", tkN, tkN === null ? noTk
-        : "Fresh tokens since local midnight, from the message timestamps in " + (isNum(counts.tokens_read) ? counts.tokens_read : "the") + " session transcripts: input + output + cache writes (Codex: input - cached + output). Cache reads are not counted.",
-        "", unread ? unread + " not read" : ""));
+        : (tk.note ? "At least this many (" + tk.note + "). " : "") + "Fresh tokens since local midnight, from the message timestamps in " + (isNum(counts.tokens_read) ? counts.tokens_read : "the") + " session transcripts: input + output + cache writes (Codex: input - cached + output). Cache reads are not counted" + (tk.cache ? " in it; the provider reports " + tk.cache + " beside it." : "."),
+        "", [tk && tk.note, tk && tk.cache, unread ? unread + (unread === 1 ? " session" : " sessions") + " not read" : ""].filter(Boolean).join(" \u00b7 ")));
     const conflicts = Array.isArray(v.conflicts) ? v.conflicts : null;
     if (conflicts && conflicts.length) { const n = conflictCount(v); row.appendChild(m("conflicts", n === 1 ? "file conflict" : "file conflicts", String(n), "files two live sessions are both writing", "warn")); }
     return row;

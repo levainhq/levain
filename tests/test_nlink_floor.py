@@ -66,7 +66,8 @@ def test_a_subtree_root_that_is_a_linked_file_is_refused(home) -> None:
     store = home / ".anneal-memory"   # argushub's shape: the root is a SQLite file
     store.write_text("store")
     os.link(store, home / "copy.db")
-    with pytest.raises(ConfinementError, match=r"\.anneal-memory is a crown jewel"):
+    # both names are jewels on one inode; which one the walk reports first is filesystem order
+    with pytest.raises(ConfinementError, match=r"(\.anneal-memory|copy\.db) is a crown jewel with 2 names"):
         _refuse_multiply_linked_jewels(build_policy(_entity(home)))
 
 

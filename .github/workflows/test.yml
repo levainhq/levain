@@ -92,13 +92,29 @@ jobs:
         # node ids, a file in no shard or two, an empty shard. Each command's exit is checked (bash -e, pipefail),
         # and the files go to pytest as one quoted array, so no path is word-split or globbed and an empty list
         # fails here instead of running the whole suite.
+        env:
+          # one scale for every wait the tests make (a shared runner is slower than a laptop): see tests/_waits.py
+          LEVAIN_TEST_WAIT_SCALE: "2"
         run: |
           set -o pipefail
           pytest --collect-only -q > "$RUNNER_TEMP/nodes.txt"
           python tests/ci/shard.py pick --shards "$TEST_SHARDS" --shard "${{ matrix.shard }}" < "$RUNNER_TEMP/nodes.txt" > "$RUNNER_TEMP/files.txt"
           mapfile -t files < "$RUNNER_TEMP/files.txt"
           test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
-          pytest -q "${files[@]}"
+          pytest -q --basetemp="${{ runner.temp }}/pt" "${files[@]}"
+
+      - name: Keep what the page showed at a failed wait
+        # the page driver writes timeout-step-<n>.png / .txt beside its steps file, under pytest's basetemp; reading them is how a
+        # lost-event failure is told from a slow one
+        if: failure()
+        # action pinned to the commit its v7.0.2 tag named on 2026-10-31 (gh api repos/actions/upload-artifact/git/ref/tags/v7.0.2)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: page-timeouts-pytest-py${{ matrix.python-version }}-shard${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/pt/**/timeout-step-*.png
+            ${{ runner.temp }}/pt/**/timeout-step-*.txt
+          if-no-files-found: ignore
 
   root-py39:
     # The code root runs is executed by `ROOT_PYTHON` (levain/slot/root_tree.py): /usr/bin/python3, which is 3.9.6 on
@@ -241,6 +257,7 @@ jobs:
       - name: Run the browser tests
         env:
           CHROME: ${{ steps.chrome.outputs.chrome-path }}
+          LEVAIN_TEST_WAIT_SCALE: "2"      # one scale for every wait the tests and the page driver make (tests/_waits.py)
         run: |
           echo "Chrome: $CHROME"
           "$CHROME" --version
@@ -252,12 +269,25 @@ jobs:
           echo "$files"
           test -n "$files" || { echo "shard ${{ matrix.shard }} holds no test file"; exit 1; }
           set -o pipefail
-          pytest -q -rs $files 2>&1 | tee browser.log
+          pytest -q -rs --basetemp="${{ runner.temp }}/pt" $files 2>&1 | tee browser.log
           # ANY skip is a failure here, whatever its reason: the whole point of this job is that these tests run
           if grep -q -E "^SKIPPED|[0-9]+ skipped" browser.log; then
             echo "a test skipped in the browser job (reasons above, from -rs)"
             exit 1
           fi
+
+      - name: Keep what the page showed at a failed wait
+        # the page driver writes timeout-step-<n>.png / .txt beside its steps file, under pytest's basetemp; reading them is how a
+        # lost-event failure is told from a slow one
+        if: failure()
+        # action pinned to the commit its v7.0.2 tag named on 2026-10-31 (gh api repos/actions/upload-artifact/git/ref/tags/v7.0.2)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: page-timeouts-browser-shard${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/pt/**/timeout-step-*.png
+            ${{ runner.temp }}/pt/**/timeout-step-*.txt
+          if-no-files-found: ignore
 
   isolation:
     # `levain setup-isolation` for real: create the hands user, check the uid gate, undo. Only on
