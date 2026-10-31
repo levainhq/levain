@@ -12,7 +12,7 @@ The lease is not authority. Before S1 places a control principal any process of 
 so the token keeps two coordinator sessions from both counting; it grants nothing.
 
 A LAUNCH is a session Levain starts (C0 §3.4): ``launches`` holds what was asked for (harness, role, threads, model,
-cwd, the token it was asked under, the slot ``session_key`` allocated before any process starts), ``launch_events``
+cwd, the user-layer choice, the token it was asked under, the slot ``session_key`` allocated before any process starts), ``launch_events``
 its life (``pending`` -> ``active``, or ``failed`` / ``expired``; ``active`` -> ``ended``). A launch becomes
 ``active`` only if its latest event is that ``pending`` row, the clock is before its ``until`` and its token is still
 the live lease's, all in one transaction (:func:`activate`); a takeover voids every pending launch.
@@ -59,7 +59,7 @@ __all__ = [
     "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat",
     "check_model", "claim", "by_harness_session", "claim_spawn", "end_launch", "end_unlisted", "fence", "launch",
     "lease", "launches", "LaunchThread", "mark_swept", "over_unswept", "record_thread", "record_write", "release",
-    "request_launch", "service_beat", "set_agent", "setting", "status", "take", "thread_of", "unspawned", "wake",
+    "request_launch", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
     "wake_state",
 ]
 
@@ -118,7 +118,10 @@ LEASE_SCHEMA: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS launches (launch_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE, "
     f"session_key TEXT NOT NULL UNIQUE, harness TEXT NOT NULL CHECK ({_in('harness', HARNESSES)}), "
     f"role TEXT NOT NULL CHECK ({_in('role', ROLES)}), threads TEXT NOT NULL, model TEXT, cwd TEXT, "
-    "token INTEGER NOT NULL, placement TEXT NOT NULL, at TEXT NOT NULL)",
+    "token INTEGER NOT NULL, placement TEXT NOT NULL, at TEXT NOT NULL, "
+    # the setting's user-layer choice when the launch was asked for, as model and cwd are (L3 r1: never the setting at
+    # spawn time); a store from before it gains the column with 0 (off) on every row (:func:`migrate_settings`)
+    "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)))",
     # harness_session_id and argv_sha256 are known only once the process is spawned: they ride the active row
     "CREATE TABLE IF NOT EXISTS launch_events (launch_id TEXT NOT NULL REFERENCES launches(launch_id), "
     f"seq INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL CHECK ({_in('kind', LAUNCH_KINDS)}), "
@@ -128,6 +131,7 @@ LEASE_SCHEMA: tuple[str, ...] = (
     # model and no directory, a harness always a directory
     "CREATE TABLE IF NOT EXISTS coord_settings (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, "
     f"agent TEXT NOT NULL CHECK ({_in('agent', SETTING_AGENTS)}), model TEXT, cwd TEXT, "
+    "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), "
     "by TEXT NOT NULL CHECK (by = 'operator'), at TEXT NOT NULL, "
     "CHECK ((agent = 'none' AND model IS NULL AND cwd IS NULL) OR (agent != 'none' AND cwd IS NOT NULL)))",
     # pid: the levain process that won the spawn (the session's own process is the harness's, known only after)
@@ -223,6 +227,7 @@ class Launch:
     cause: str
     at: str
     pinned_envelope_id: str | None = None   # the envelope a one-thread worker was activated under (§3.4)
+    user_scope: bool = False     # the user-layer choice it was asked under: the spawn reads this, never the setting
 
 
 @dataclass(frozen=True)
@@ -240,6 +245,7 @@ class Setting:
     model: str | None
     cwd: str | None      # resolved: the directory a coordinator session runs in
     at: str
+    user_scope: bool = False    # True: the session also loads your user-level Claude Code settings; False: project, local
 
 
 def _plus(now: str, delta: timedelta) -> str:
@@ -393,8 +399,14 @@ def take(conn: sqlite3.Connection, now: str, *, hold: timedelta = LEASE_TTL) -> 
 
 
 # --- launches ------------------------------------------------------------------------------------------------------
+def _has_user_scope(conn: sqlite3.Connection, table: str) -> bool:
+    """A store made before user_scope has no such column until a writer's opener migrates it: it reads as OFF."""
+    return "user_scope" in {c[1] for c in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | None:
-    r = conn.execute("SELECT launch_id, session_key, harness, role, threads, model, cwd, token, placement, at "
+    col = "user_scope" if _has_user_scope(conn, "launches") else "0"
+    r = conn.execute(f"SELECT launch_id, session_key, harness, role, threads, model, cwd, token, placement, at, {col} "
                      f"FROM launches WHERE {where} = ?", (arg,)).fetchone()
     if r is None:
         return None
@@ -403,7 +415,7 @@ def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | N
     until = next((e[1] for e in events if e[0] == "pending"), None)
     hsid, pin = next(((e[2], e[4]) for e in events if e[0] == "active"), (None, None))
     return Launch(r[0], r[1], r[2], r[3], tuple(json.loads(r[4])), r[5], r[6], r[7], r[8], events[-1][0], until,
-                  hsid, events[-1][3], r[9], pin)
+                  hsid, events[-1][3], r[9], pin, bool(r[10]))
 
 
 def _launch_by_key(conn: sqlite3.Connection, session_key: str) -> Launch | None:
@@ -449,7 +461,8 @@ def _line(name: str, value: object) -> str | None:
 
 
 def _pending(conn: sqlite3.Connection, now: str, *, token: int, harness: str, role: str, threads: Sequence[str],
-             model: str | None, cwd: str | None, cause: str, session_key: str | None = None) -> Launch:
+             model: str | None, cwd: str | None, cause: str, session_key: str | None = None,
+             user_scope: bool = False) -> Launch:
     if harness not in HARNESSES:
         raise _refused(f"a launch's harness is one of {', '.join(HARNESSES)}")
     if role not in ROLES:
@@ -469,9 +482,9 @@ def _pending(conn: sqlite3.Connection, now: str, *, token: int, harness: str, ro
     session_key = session_key or "s-" + secrets.token_hex(8)
     # before S1 places principals a session runs as your uid and the launch grants nothing (C0 §2, §7 L5)
     conn.execute("INSERT INTO launches (launch_id, gseq, session_key, harness, role, threads, model, cwd, token, "
-                 "placement, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'operator-uid', ?)",
+                 "placement, at, user_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'operator-uid', ?, ?)",
                  (launch_id, next_gseq(conn, now), session_key, harness, role, canonical(sorted(threads)),
-                  _line("model", model), _line("cwd", cwd), token, now))
+                  _line("model", model), _line("cwd", cwd), token, now, int(bool(user_scope) and harness == "claude")))
     _launch_event(conn, now, launch_id, "pending", cause, until=_plus(now, LAUNCH_TTL))
     return _launch_row(conn, "launch_id", launch_id)
 
@@ -755,9 +768,19 @@ def _idle(conn: sqlite3.Connection, now: str) -> tuple[Launch | None, list[Launc
 
 # --- the coordinator setting and the spawn ----------------------------------------------------------------------
 def setting(conn: sqlite3.Connection) -> Setting | None:
-    """The latest coordinator setting, or None when you never set one."""
-    r = conn.execute("SELECT agent, model, cwd, at FROM coord_settings ORDER BY seq DESC LIMIT 1").fetchone()
-    return None if r is None else Setting(*r)
+    """The latest coordinator setting, or None when you never set one. ``user_scope`` is on only for a claude row."""
+    col = "user_scope" if _has_user_scope(conn, "coord_settings") else "0"
+    r = conn.execute(f"SELECT agent, model, cwd, at, {col} FROM coord_settings ORDER BY seq DESC LIMIT 1").fetchone()
+    return None if r is None else Setting(r[0], r[1], r[2], r[3], bool(r[4]) and r[0] == "claude")
+
+
+def migrate_settings(conn: sqlite3.Connection) -> None:
+    """The additive migration: ``coord_settings`` and ``launches`` gain ``user_scope``, 0 (off) on every row written
+    before it. Runs in the opener's schema transaction, like the replies' sequence."""
+    for table in ("coord_settings", "launches"):
+        if not _has_user_scope(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_scope INTEGER NOT NULL DEFAULT 0 "
+                         "CHECK (user_scope IN (0, 1))")
 
 
 def check_model(model: object) -> str | None:
@@ -771,9 +794,10 @@ def check_model(model: object) -> str | None:
 
 
 def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | None = None,
-              cwd: str | None = None) -> Setting:
+              cwd: str | None = None, user_scope: bool | None = None) -> Setting:
     """Record your coordinator setting (writer: you only). ``cwd`` is stored as given, which the caller has resolved
-    (Claude Code keys a directory's trust on its real path); agent ``none`` takes neither model nor directory."""
+    (Claude Code keys a directory's trust on its real path); agent ``none`` takes neither model nor directory.
+    ``user_scope`` None keeps the standing setting's (off when there is none); any agent but claude is always off."""
     if agent not in SETTING_AGENTS:
         raise _refused(f"the coordinator agent is one of {', '.join(SETTING_AGENTS)}")
     if agent == "none":
@@ -781,9 +805,29 @@ def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | No
             raise _refused("agent none takes no --model and no --cwd")
     elif not isinstance(cwd, str) or not cwd.startswith("/"):
         raise _refused("a coordinator agent runs in a directory: an absolute path")
-    conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, by, at) VALUES (?, ?, ?, ?, 'operator', ?)",
-                 (next_gseq(conn, now), agent, check_model(model), _line("cwd", cwd), now))
+    if user_scope is None:
+        was = setting(conn)
+        user_scope = was is not None and was.user_scope
+    conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, by, at) "
+                 "VALUES (?, ?, ?, ?, ?, 'operator', ?)",
+                 (next_gseq(conn, now), agent, check_model(model), _line("cwd", cwd),
+                  int(bool(user_scope) and agent == "claude"), now))
     return setting(conn)
+
+
+def set_user_scope(conn: sqlite3.Connection, now: str, user_scope: bool, *, cwd: str | None = None) -> Setting:
+    """``levain coord agent --user-scope on|off`` alone, in the caller's ONE write transaction: the latest setting is
+    read and its replacement (same agent, model and directory) appended under the same lock, so a concurrent change
+    is never undone by a stale copy. Refused unless the standing agent is claude; ``cwd``, when given, must still be
+    the standing directory (the one the caller checked the hook in)."""
+    was = setting(conn)
+    if was is None or was.agent != "claude":
+        raise _refused(f"--user-scope alone changes a claude coordinator, and the standing agent is "
+                       f"{'not set' if was is None else was.agent} (levain coord agent claude --user-scope on|off "
+                       "sets both)")
+    if cwd is not None and was.cwd != cwd:
+        raise _refused(f"the coordinator's directory changed to {was.cwd} while this was checked; run it again")
+    return set_agent(conn, now, "claude", model=was.model, cwd=was.cwd, user_scope=user_scope)
 
 
 def claim_spawn(conn: sqlite3.Connection, now: str, launch_id: str, pid: int) -> tuple[Launch, str | None]:
@@ -921,7 +965,7 @@ def wake(conn: sqlite3.Connection, now: str) -> Launch | None:
                    by="service")
     chosen = setting(conn)          # wake_state answered wake: a harness is set
     return _pending(conn, now, token=token, harness=chosen.agent, role="coordinator", threads=(), model=chosen.model,
-                    cwd=chosen.cwd, cause="wake", session_key=session_key)
+                    cwd=chosen.cwd, cause="wake", session_key=session_key, user_scope=chosen.user_scope)
 
 
 def status(conn: sqlite3.Connection, now: str) -> dict[str, object]:

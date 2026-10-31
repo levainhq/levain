@@ -415,6 +415,8 @@ class CoordStore:
                 conn.execute(stmt)
             ensure_one_signature(conn)
             _replies_gseq(conn)
+            from levain.coordinator.lease import migrate_settings
+            migrate_settings(conn)
             if rebuilt:
                 check = conn.execute("PRAGMA integrity_check").fetchall()
                 if check != [("ok",)]:
@@ -918,12 +920,22 @@ class CoordStore:
         with self._write() as (conn, now):
             return lease.wake(conn, now)
 
-    def coord_set_agent(self, agent: str, *, model: str | None = None, cwd: str | None = None) -> Any:
-        """Your coordinator setting: the agent a wake launches, its model, the (resolved) directory it runs in."""
+    def coord_set_agent(self, agent: str, *, model: str | None = None, cwd: str | None = None,
+                        user_scope: bool | None = None) -> Any:
+        """Your coordinator setting: the agent a wake launches, its model, the (resolved) directory it runs in, and
+        whether the session also loads your user-level Claude Code settings (None keeps the standing choice)."""
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
-            return lease.set_agent(conn, now, agent, model=model, cwd=cwd)
+            return lease.set_agent(conn, now, agent, model=model, cwd=cwd, user_scope=user_scope)
+
+    def coord_set_user_scope(self, user_scope: bool, *, cwd: str | None = None) -> Any:
+        """Only the standing claude setting's user-layer choice, read and replaced in one transaction
+        (:func:`levain.coordinator.lease.set_user_scope`)."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.set_user_scope(conn, now, user_scope, cwd=cwd)
 
     def coord_setting(self) -> Any:
         from levain.coordinator import lease

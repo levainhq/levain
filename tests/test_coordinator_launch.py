@@ -163,7 +163,7 @@ def workdir(tmp_path):
 @pytest.fixture
 def live_hook(monkeypatch):
     """The hook check passes (the real check against a real install is test_coord_agent_sets_up_the_install)."""
-    monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (True, "wired to this install"))
 
 
 @pytest.fixture
@@ -204,7 +204,9 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     assert not any("please fix the flaky test" in a for a in argv)
     # exactly the measured argv, plus the model, plus the prompt naming the brief; never --session-id or a bypass
     assert argv[:7] == ["--bg", "-n", name, "--permission-mode", "default", "--model", "haiku"]
-    assert len(argv) == 8 and str(brief) in argv[7]
+    # the default: the user layer stays out (project + local settings only, auto-memory off), flags before the prompt
+    assert argv[7:11] == ["--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
+    assert len(argv) == 12 and str(brief) in argv[11]
     assert not any(a in ("--session-id", "--bare", "--dangerously-skip-permissions") or "bypass" in a for a in argv)
     spawn = next(c for c in fake.calls() if c["argv"][:1] == ["--bg"])
     assert spawn["cwd"] == str(workdir.resolve())
@@ -357,7 +359,7 @@ def test_a_directory_whose_hook_is_not_live_refuses(qdir, tmp_path, fake, monkey
     assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
     assert rows(qdir, "SELECT count(*) FROM launch_spawns") == [(0,)]
     # fixed while it is still pending, the same launch starts
-    monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (True, "wired to this install"))
     assert cl.launch_session(store, launch_id).started
 
 
@@ -1104,7 +1106,7 @@ def test_a_session_found_gone_loses_its_brief_in_the_same_pass(store, fake, live
 
 
 def test_a_refusal_before_the_spawn_claim_is_one_line_too(store, fake, monkeypatch):
-    monkeypatch.setattr(cl, "hook_live", lambda d: (False, "first line\nsecond\tline ‮"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (False, "first line\nsecond\tline ‮"))
     got = cl.launch_session(store, woken(store))
     assert "\n" not in got.refusal and "first line second line" in got.refusal and "‮" not in got.refusal
 
@@ -1131,9 +1133,10 @@ def test_hooks_turned_off_by_a_settings_file_refuse_the_launch(tmp_home, qdir, f
     # G1: doctor's real check of a real install; the consent hook row still reads "wired", a later row says off
     from levain import doctor
 
-    _main(qdir, capsys, "coord", "agent", "claude")
+    # a user-level file reaches the coordinator only with --user-scope on (the default no longer loads it)
+    _main(qdir, capsys, "coord", "agent", "claude", *(["--user-scope", "on"] if scope == "user" else []))
     target = (tmp_home / ".levain" / "coordinator").resolve()
-    assert cl.hook_live(target)[0]
+    assert cl.hook_live(target, user_scope=True)[0]
     f = tmp_home / ".claude" / "settings.json" if scope == "user" else target / ".claude" / "settings.local.json"
     f.parent.mkdir(parents=True, exist_ok=True)
     data = json.loads(f.read_text()) if f.is_file() else {}
@@ -1141,7 +1144,7 @@ def test_hooks_turned_off_by_a_settings_file_refuse_the_launch(tmp_home, qdir, f
     checked = doctor._check_claude_code(target)
     (hook,) = [r for r in checked if r.name == cl.HOOK_ROW]
     assert hook.detail.startswith("wired to this install")          # the trap: wired, and still not running
-    live, why = cl.hook_live(target)
+    live, why = cl.hook_live(target, user_scope=True)
     assert not live and "turned off by" in why and str(f) in why
     store = CoordStore(qdir)
     d, _ = store.accept_drop("hooks are off", surface="cli")
@@ -1379,6 +1382,504 @@ def test_every_levain_verb_the_brief_names_passes_the_coordinators_door(store, f
     refused = sorted(p for p in paths if p not in door.DOOR)
     assert not refused, f"the brief names verbs the coordinator's door refuses: {refused}"
 
+
+# --- 1030-42: the coordinator spawns without your user layer unless --user-scope on -----------------------------
+def _spawn_argv_and_sha(store, fake, qdir):
+    launch_id = woken(store, "layers")
+    assert cl.launch_session(store, launch_id).started
+    argv = fake.spawns()[-1]
+    (sha,) = rows(qdir, "SELECT argv_sha256 FROM launch_events WHERE launch_id = ? AND kind = 'active'", launch_id)
+    return argv, sha[0]
+
+
+def test_user_scope_off_is_the_default_and_on_restores_the_old_argv(store, fake, live_hook, qdir, workdir):
+    assert store.coord_setting().user_scope is False
+    off_argv, off_sha = _spawn_argv_and_sha(store, fake, qdir)
+    assert off_argv.index("--setting-sources") < off_argv.index("--settings") < len(off_argv) - 1
+    assert off_argv[off_argv.index("--setting-sources") + 1] == "project,local"
+    assert off_argv[off_argv.index("--settings") + 1] == '{"autoMemoryEnabled":false}'
+    assert len(off_argv) == 12 and off_sha.startswith("sha256:")
+
+
+def test_user_scope_on_spawns_with_neither_flag(qdir, workdir, fake, live_hook):
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    argv, _sha = _spawn_argv_and_sha(s, fake, qdir)
+    assert argv[:7] == ["--bg", "-n", argv[2], "--permission-mode", "default", "--model", "haiku"]
+    assert len(argv) == 8 and "--setting-sources" not in argv and "--settings" not in argv
+
+
+def test_the_recorded_argv_sha_differs_between_on_and_off(qdir, workdir, fake, live_hook, tmp_path):
+    shas = {}
+    for scope in (False, True):
+        q = tmp_path / f"q-{scope}"
+        q.mkdir(mode=0o700)
+        s = CoordStore(q)
+        s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=scope)
+        argv, sha = _spawn_argv_and_sha(s, fake, q)
+        shas[scope] = (argv, sha)
+    assert "--setting-sources" in shas[False][0] and "--settings" in shas[False][0]
+    assert "--setting-sources" not in shas[True][0] and "--settings" not in shas[True][0]
+    assert shas[False][1] != shas[True][1]
+
+
+def test_a_pre_existing_store_reads_as_off_and_keeps_its_row(tmp_path):
+    q = tmp_path / "old"
+    q.mkdir(mode=0o700)
+    s = CoordStore(q)
+    s.coord_setting()                                   # makes the store with the current schema
+    c = sqlite3.connect(q / "dispatch.db")
+    try:
+        # coord_settings as it was before user_scope: no column, one standing row (its triggers go with the table)
+        c.execute("DROP TABLE coord_settings")
+        # the production DDL minus only the new column, so the agent/cwd and by CHECKs are the real ones
+        (prod,) = [d for d in lease.LEASE_SCHEMA if "TABLE IF NOT EXISTS coord_settings" in d]
+        col = "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), "
+        assert col in prod
+        c.execute(prod.replace(col, "").replace("IF NOT EXISTS ", ""))
+        c.execute("INSERT INTO gseq (at) VALUES ('2026-01-01T00:00:00Z')")
+        c.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, by, at) VALUES (1, 'claude', 'haiku', '/x', "
+                  "'operator', '2026-01-01T00:00:00Z')")
+        c.commit()
+        row = lease.setting(c)                          # a reader on the old format, before any writer migrates it
+    finally:
+        c.close()
+    assert (row.agent, row.model, row.user_scope) == ("claude", "haiku", False)
+    fresh = CoordStore(q)                               # a writer's opener migrates, the old row reads off
+    got = fresh.coord_setting()
+    assert (got.agent, got.model, got.user_scope) == ("claude", "haiku", False)
+    assert fresh.coord_set_agent("claude", model="haiku", cwd="/x", user_scope=True).user_scope is True
+    assert fresh.coord_set_agent("claude", model="sonnet", cwd="/x").user_scope is True      # None keeps the choice
+    assert fresh.coord_set_agent("none").user_scope is False
+
+
+def test_coord_status_says_the_user_layer(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    text = _main(qdir, capsys, "coord", "status").out
+    assert "user layer: off (project settings only)" in text
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["setting"]["user_scope"] is False
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--user-scope", "on").out
+    assert "user layer: on" in out and "auto-memory" not in out       # auto-memory was never measured under --bg
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["setting"]["user_scope"] is True
+    s = CoordStore(qdir).coord_setting()
+    # --user-scope alone keeps the agent, model and directory
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")
+    t = CoordStore(qdir).coord_setting()
+    assert (t.agent, t.model, t.cwd, t.user_scope) == (s.agent, s.model, s.cwd, False)
+    # a bad value, no agent and nothing, and --user-scope on none, are refused
+    with pytest.raises(SystemExit) as bad:
+        _main(qdir, capsys, "coord", "agent", "claude", "--user-scope", "maybe")
+    assert bad.value.code == 2
+    _main(qdir, capsys, "coord", "agent", rc=1)
+    _main(qdir, capsys, "coord", "agent", "none", "--user-scope", "on", rc=1)
+
+
+def test_a_user_level_disable_all_hooks_is_not_consulted_without_user_scope(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    user = tmp_home / ".claude"
+    user.mkdir(exist_ok=True)
+    (user / "settings.json").write_text('{"disableAllHooks": true}')
+    live, detail = cl.hook_live(target, user_scope=True)
+    assert not live and "turned off by" in detail
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert live, detail
+    assert "project,local only" in detail and "user-level disableAllHooks is not consulted" in detail
+    # a project-level file still refuses, with or without the user layer
+    (target / ".claude" / "settings.local.json").write_text('{"disableAllHooks": true}')
+    assert not cl.hook_live(target, user_scope=False)[0]
+
+
+# --- 1030-42 L3 r1 fixes ---------------------------------------------------------------------------------------
+def test_the_layer_flags_are_the_comma_form_as_one_argument():
+    # measured accepted by a real `claude --bg` on Claude Code 2.1.314 (1030-42 dietrun): one comma argument, inline JSON
+    assert cl._layer_args(False) == ["--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
+    assert cl._layer_args(True) == []
+
+
+@pytest.mark.parametrize("asked", [False, True])
+def test_a_pending_launch_spawns_with_the_layer_it_was_asked_under(qdir, workdir, fake, live_hook, asked):
+    # codex r1 HIGH: a drop wakes under one choice, the operator flips it before the watcher starts the launch
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=asked)
+    launch_id = woken(s, "race")
+    assert s.launch(launch_id).user_scope is asked
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=not asked)
+    assert cl.launch_session(s, launch_id).started
+    argv = fake.spawns()[-1]
+    assert ("--setting-sources" in argv) is (not asked) and ("--settings" in argv) is (not asked)
+
+
+def test_a_launch_asked_for_before_the_column_reads_as_off(qdir, workdir):
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    launch_id = woken(s, "old")
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        c.execute("ALTER TABLE launches DROP COLUMN user_scope")        # launches as it was before the column
+        c.commit()
+        assert lease.launch(c, launch_id).user_scope is False           # a reader before any writer migrates it
+    finally:
+        c.close()
+    fresh = CoordStore(qdir)                                            # a writer's opener adds it, 0 on the old row
+    assert fresh.launch(launch_id).user_scope is False
+    assert rows(qdir, "SELECT user_scope FROM launches WHERE launch_id = ?", launch_id) == [(0,)]
+
+
+def test_user_scope_never_sticks_to_a_non_claude_setting(qdir, workdir, capsys):
+    s = CoordStore(qdir)
+    s.coord_set_agent("codex", cwd=str(workdir.resolve()))
+    out = _main(qdir, capsys, "coord", "agent", "--user-scope", "on", rc=1)
+    assert "claude" in out.err and s.coord_setting().user_scope is False
+    # the store never writes a 1 on a non-claude row, so a later `coord agent claude` has nothing to inherit
+    assert s.coord_set_agent("codex", cwd=str(workdir.resolve()), user_scope=True).user_scope is False
+    assert rows(qdir, "SELECT user_scope FROM coord_settings ORDER BY seq DESC LIMIT 1") == [(0,)]
+    assert s.coord_set_agent("claude", cwd=str(workdir.resolve())).user_scope is False
+    # a codex row that carries a 1 anyway (written before this fix) reads as off and is not inherited
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        c.execute("INSERT INTO gseq (at) VALUES ('2026-01-01T00:00:00Z')")
+        g = c.execute("SELECT MAX(rowid) FROM gseq").fetchone()[0]
+        c.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, by, at) VALUES "
+                  "(?, 'codex', NULL, ?, 1, 'operator', '2026-01-01T00:00:00Z')", (g, str(workdir.resolve())))
+        c.commit()
+    finally:
+        c.close()
+    assert s.coord_setting().user_scope is False
+    assert s.coord_set_agent("claude", cwd=str(workdir.resolve())).user_scope is False
+
+
+def test_a_scope_only_change_never_undoes_a_concurrent_change(qdir, workdir, capsys, monkeypatch):
+    # codex r1 MED: the scope-only write read the row in one transaction and wrote its replacement in another
+    CoordStore(qdir).coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    real, fired = lease.setting, []
+
+    def interleave(conn):
+        got = real(conn)
+        if not fired:
+            fired.append(threading.Thread(target=lambda: CoordStore(qdir).coord_set_agent("none")))
+            fired[0].start()
+            fired[0].join(1.0)          # finishes at once unless the scope change holds the write lock
+        return got
+
+    monkeypatch.setattr(lease, "setting", interleave)
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")
+    fired[0].join(30)
+    monkeypatch.setattr(lease, "setting", real)
+    # the later `agent none` stands (a stale scope-only copy would have re-enabled the claude coordinator)
+    assert rows(qdir, "SELECT agent, user_scope FROM coord_settings ORDER BY seq") == [
+        ("claude", 1), ("claude", 0), ("none", 0)]
+
+
+def test_turning_the_layer_on_refuses_when_a_user_level_file_turns_hooks_off(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    out = _main(qdir, capsys, "coord", "agent", "--user-scope", "on", rc=1)
+    assert "turned off by" in out.err and CoordStore(qdir).coord_setting().user_scope is False
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")      # turning it off checks nothing new
+
+
+def test_a_user_level_disable_all_hooks_through_a_symlinked_home_is_not_consulted(tmp_path, tmp_home, qdir, fake,
+                                                                                 capsys, monkeypatch):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    link = tmp_path / "home-link"
+    link.symlink_to(tmp_home)
+    monkeypatch.setenv("HOME", str(link))
+    target = (link / ".levain" / "coordinator").resolve()
+    (link / ".claude").mkdir(exist_ok=True)
+    (link / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert live, detail
+    assert not cl.hook_live(target, user_scope=True)[0]
+
+
+def test_a_missing_hooks_off_helper_fails_loud_not_as_a_refusal(tmp_path, tmp_home, qdir, fake, capsys, monkeypatch):
+    from levain import doctor
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    assert cl.hook_live(target, user_scope=False)[0]                    # user-only file: not consulted
+    rows_now = doctor._check_claude_code(target)                         # doctor's own rows survive the rename
+    monkeypatch.setattr(doctor, "_check_claude_code", lambda _d: rows_now)
+    monkeypatch.delattr(doctor, "_hooks_off_files")                      # a rename in doctor
+    with pytest.raises(AttributeError):
+        cl.hook_live(target, user_scope=False)
+
+
+def test_the_coordinator_install_allows_a_bare_read_and_no_other_file_tool(tmp_home, qdir, tmp_path, capsys):
+    # 1030-42 (np-5396be49 "5b"): under --setting-sources project,local the user's own `Read` allow is gone and a Read
+    # outside the workspace stopped at a prompt nobody answers; the coordinator install's project settings carry it
+    from levain import install as inst
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    rules = allow(target)
+    assert rules.count("Read") == 1
+    assert not [r for r in rules if r.split("(")[0] in ("Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Bash")
+                and not r.startswith("Bash(")], rules
+    assert not [r for r in rules if r.startswith("Bash(") and not r.endswith(":*)")], rules
+    # a plain `levain init` never gains it
+    plain = tmp_path / "plain"
+    answers = tmp_path / "answers.json"
+    answers.write_text(json.dumps(cl._install_answers()))
+    assert inst.run_init(plain, "claude-code", force=False, answers_file=answers, default_grants="no") == 0
+    assert "Read" not in allow(plain.resolve())
+    assert inst.coordinator_read_rule_pending(plain.resolve()) is False       # not a coordinator: nothing pending
+    assert inst.coordinator_read_rule_pending(target) is False
+
+
+def test_an_older_coordinator_install_is_brought_to_the_read_rule_once(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    with monkeypatch.context() as m:
+        m.setattr(inst, "COORDINATOR_READ_ALLOW", ())                          # the install as an earlier release made it
+        _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    assert "Read" not in allow(target)
+    assert inst.coordinator_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "upgrade pending" in status and "levain update --path" in status
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["install_upgrade_pending"] is True
+    # an operator's own rule survives, and `coord agent claude` (the path a coordinator launch setup takes) adds Read once
+    doc = json.loads((target / ".claude" / "settings.json").read_text())
+    _main(qdir, capsys, "coord", "agent", "claude")
+    got = allow(target)
+    assert got.count("Read") == 1 and inst.coordinator_read_rule_pending(target) is False
+    assert all(r in got for r in doc["permissions"]["allow"])
+    assert "upgrade pending" not in _main(qdir, capsys, "coord", "status").out
+    again = (target / ".claude" / "settings.json").read_bytes()
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert (target / ".claude" / "settings.json").read_bytes() == again        # the second run changes nothing
+    assert allow(target).count("Read") == 1
+
+
+# --- 1030-47 L3 r1 fixes (the Read rule) ---------------------------------------------------------------------------
+def _older_coordinator(qdir, capsys, monkeypatch, tmp_home):
+    """A coordinator install as a release before the Read rule made it."""
+    from levain import install as inst
+
+    with monkeypatch.context() as m:
+        m.setattr(inst, "COORDINATOR_READ_ALLOW", ())
+        _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    assert "Read" not in (target / ".claude" / "settings.json").read_text()
+    return target
+
+
+def _only_inserted(old: str, new: str) -> str:
+    """What ``new`` adds to ``old`` when it is ``old`` with one span inserted (every other byte kept), else fail."""
+    i = 0
+    while i < len(old) and old[i] == new[i]:
+        i += 1
+    ins = new[:len(new) - (len(old) - i)][i:]
+    assert old[:i] + ins + old[i:] == new, (old, new)
+    return ins
+
+
+def test_an_edited_older_coordinator_install_gets_read_and_keeps_every_other_byte(tmp_home, qdir, monkeypatch, capsys):
+    # codex MED + complement MED: a hand-edited settings.json differs from the receipt, so the adapter refresh staged
+    # the package's version and the coordinator launched without Read; the launch now merges the one rule
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    doc = json.loads(f.read_text())
+    doc["permissions"]["allow"].append("Bash(make test:*)")              # the operator's own rule
+    doc["operatorKey"] = {"kept": 1.50, "as": "written"}
+    f.write_text(json.dumps(doc, indent=4) + "\n")                         # and his own formatting
+    old = f.read_text()
+    out =_main(qdir, capsys, "coord", "agent", "claude")
+    new = f.read_text()
+    assert _only_inserted(old, new).strip(" ,\n") == '"Read"'
+    assert json.loads(new)["permissions"]["allow"] == [*doc["permissions"]["allow"], "Read"]
+    assert not list((target / ".levain").glob("pending/**/settings.json"))  # nothing staged: no adapter refresh ran
+    assert out.out.count("Read allow rule") + out.err.count("Read allow rule") == 1      # said once
+    assert inst.coordinator_read_rule_pending(target) is False
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert f.read_text() == new                                            # the second run changes nothing
+
+
+def test_a_receipt_less_older_coordinator_install_gets_read(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    target.joinpath(*inst.ADAPTER_RECEIPT_REL).unlink()
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert json.loads((target / ".claude" / "settings.json").read_text())["permissions"]["allow"].count("Read") == 1
+    assert inst.coordinator_read_rule_pending(target) is False
+
+
+def test_levain_update_brings_an_edited_older_coordinator_install_to_read(tmp_home, qdir, monkeypatch, capsys):
+    # the remedy coord status names must clear it, an edited file included
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    doc = json.loads(f.read_text())
+    doc["permissions"]["allow"].append("Bash(make test:*)")
+    f.write_text(json.dumps(doc, indent=2) + "\n")
+    with inst.install_lock(target, create=False):
+        inst.refresh_adapter(target, apply=True, emit=lambda _l: None, carrier=False)
+    got = json.loads(f.read_text())["permissions"]["allow"]
+    assert got.count("Read") == 1 and "Bash(make test:*)" in got
+    assert inst.coordinator_read_rule_pending(target) is False
+
+
+@pytest.mark.parametrize("text, merged", [
+    ('{"hooks": {}}\n', ["Read"]),                                        # no permissions key
+    ('{"permissions": {"deny": ["Edit(x)"]}}\n', ["Read"]),                 # no allow key
+    ('{}', ["Read"]),
+])
+def test_settings_with_no_allow_list_are_pending_and_the_merge_creates_it(tmp_home, qdir, monkeypatch, capsys, text,
+                                                                         merged):
+    # codex MED: a coordinator whose settings had no permissions/allow read as not pending
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    assert inst.coordinator_read_rule_pending(target) is True
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["install_upgrade_pending"] is True
+    assert inst.add_coordinator_read_rule(target) is True
+    after = json.loads(f.read_text())
+    assert after["permissions"]["allow"] == merged
+    assert {k: v for k, v in after.items() if k != "permissions"} == {k: v for k, v in json.loads(text).items()
+                                                                       if k != "permissions"}
+    assert inst.coordinator_read_rule_pending(target) is False
+    assert inst.add_coordinator_read_rule(target) is False                 # nothing left to add
+
+
+@pytest.mark.parametrize("text, why", [
+    ("{not json", "not valid JSON"),
+    ("[1, 2]", "not a JSON object"),
+    ("[" * 200000 + "]" * 200000, "not valid JSON"),                      # deep nesting: RecursionError
+    ('{"permissions": {"allow": "Read"}}', "not a list"),
+    ('{"permissions": ["Read"]}', "not an object"),
+], ids=["bad-json", "array", "deep", "allow-string", "permissions-array"])
+def test_settings_that_cannot_be_merged_are_pending_reported_and_never_overwritten(tmp_home, qdir, monkeypatch,
+                                                                                  capsys, text, why):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    assert inst.coordinator_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "coordinator install: settings unreadable" in status and why in status, status
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True and why in js["install_settings_problem"]
+    with pytest.raises(inst.InitError):
+        inst.add_coordinator_read_rule(target)
+    assert f.read_text() == text                                           # never overwritten
+
+
+@pytest.mark.parametrize("text", [
+    '{"permissions":{"allow":["Bash(a:*)"]},"x":[1,{"y":"]}"}]}',                   # minified, brackets in strings
+    '{"permissions": {"allow": []}, "z": 1}',
+    '{"permissions": {"allow": ["old"]}, "permissions": {"allow": ["kept"]}}',     # json.loads keeps the last
+    '{\n\t"permissions": {\n\t\t"allow": [\n\t\t\t"a",\n\t\t\t"b"\n\t\t]\n\t}\n}\n',
+])
+def test_the_merge_inserts_one_entry_into_any_layout(tmp_home, qdir, monkeypatch, capsys, text):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    before = json.loads(text)
+    assert inst.add_coordinator_read_rule(target) is True
+    new = f.read_text()
+    assert _only_inserted(text, new).strip(" ,\n\t") == '"Read"'
+    assert json.loads(new)["permissions"]["allow"] == [*before["permissions"]["allow"], "Read"]
+
+
+def test_a_non_utf8_settings_file_is_pending_reported_and_never_written(tmp_home, qdir, monkeypatch, capsys):
+    # L3 readrule r2 (complement + codex): a non-UTF-8 file raised UnicodeDecodeError out of the reader and crashed
+    # coord status, the launch setup and the update refresh
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_bytes(b"\xff\xfe")
+    assert inst.coordinator_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "coordinator install: settings unreadable" in status and "cannot be read" in status, status
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True and "cannot be read" in js["install_settings_problem"]
+    with pytest.raises(inst.InitError):
+        inst.add_coordinator_read_rule(target)
+    # the launch setup: doctor's hook check reads the same file first and refuses (no live hook), never a traceback
+    out = _main(qdir, capsys, "coord", "agent", "claude", rc=1)
+    assert "consent hook is not live" in out.err and "Traceback" not in out.err
+    from levain.coordinator.launch import _bring_read_rule
+    said: list[str] = []
+    _bring_read_rule(target, said.append)                                  # the merge step itself says, never raises
+    assert len(said) == 1 and "Read allow rule is still missing" in said[0] and "cannot be read" in said[0]
+    # the update refresh's Read-rule step. host_guard.agent_pin_status reads the same file first and raises
+    # UnicodeDecodeError there too (not this module's reader; routed), so it is stubbed to reach the step
+    from levain import host_guard
+    monkeypatch.setattr(host_guard, "agent_pin_status", lambda _root: None)
+    said = []
+    with inst.install_lock(target, create=False):
+        inst.refresh_adapter(target, apply=True, emit=said.append, carrier=False)
+    assert any("Read allow rule is still missing" in s for s in said), said
+    assert f.read_bytes() == b"\xff\xfe"                                   # never written
+
+
+def test_a_missing_settings_file_is_pending_and_never_created(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    (target / ".claude" / "settings.json").unlink()
+    assert inst.coordinator_read_rule_pending(target) is True
+    assert "settings unreadable" in _main(qdir, capsys, "coord", "status").out
+    with pytest.raises(inst.InitError):
+        inst.add_coordinator_read_rule(target)
+    assert not (target / ".claude" / "settings.json").exists()
+
+
+def test_coord_status_checks_the_default_directory_when_no_cwd_is_stored(tmp_home, qdir, monkeypatch, capsys):
+    # complement LOW 4: a setting with no stored cwd launches into default_coordinator_dir()
+    # (coord_settings' CHECK refuses a claude row with no cwd, so this is defence only: the status is faked)
+    _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    real = CoordStore.coord_status
+
+    def no_cwd(self):
+        st = real(self)
+        st["setting"] = {**st["setting"], "cwd": None}
+        return st
+
+    monkeypatch.setattr(CoordStore, "coord_status", no_cwd)
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True
+
+
+def test_an_oserror_resolving_a_hooks_off_file_refuses_and_never_crashes(tmp_path, tmp_home, qdir, fake, capsys,
+                                                                         monkeypatch):
+    # complement LOW 6 / deepseek MED-2: a rename still fails loud (the test above), an I/O error does not
+    from levain import doctor
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+
+    class Broken:
+        def resolve(self):
+            raise OSError(40, "Too many levels of symbolic links")
+
+    monkeypatch.setattr(doctor, "_hooks_off_files", lambda *_a, **_k: [Broken()])
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert not live and "turned off by" in detail                       # doctor's row stands: a refusal, not a pass
 
 # --- a drop that lands while a done coordinator idles (1030-42; the shadow day, 10-30 17:33) --------------------
 def _released_and_done(store, fake, clock):

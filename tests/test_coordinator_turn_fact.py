@@ -70,7 +70,7 @@ def test_the_first_prompt_before_activation_is_a_wake(rig, monkeypatch):
             seen["ctx"] = rig.ups(argv[-1], sid=SID_N)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(cl, "hook_live", lambda d: (True, "wired to this install"))
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (True, "wired to this install"))
     monkeypatch.setattr(door, "launch_refusal", lambda d: None)
     monkeypatch.setattr(cl, "_harness", lambda: ("/fake/claude", {}))
     monkeypatch.setattr(cl, "_handover_blocked", lambda s, e, v: "")

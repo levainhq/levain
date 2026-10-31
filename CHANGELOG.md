@@ -6,6 +6,32 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+- **The Claude Code coordinator's own install now allows `Read`.** With your user layer left out, the `Read` rule in
+  your own settings is gone too, so a read of a file outside the coordinator's workspace stopped at a prompt nobody
+  answers. Its install's project settings now carry a bare `Read` allow, so it can read any file your own account can.
+  Write, Edit, WebFetch and every shell command other than its own `coord`, `drops` and `thread` verbs still ask. Only
+  the coordinator's own install gets the rule; a `levain init` for your sessions does not. The rule is the same with
+  `--user-scope on`, where your own rules apply as well. An older coordinator install gets the rule the next time
+  `levain coord agent claude` runs, or from `levain update --path <the coordinator directory>`: only the one entry is
+  added to `permissions.allow` (made if missing), every other byte of the file kept, a hand-edited one included, and a
+  second run changes nothing. Until then `levain coord status` says `coordinator install: upgrade pending` (and
+  `install_upgrade_pending` in `--json`). A settings file that is missing or unreadable (not UTF-8 included), is not a JSON object, or whose
+  `permissions` is not an object or `permissions.allow` not a list, is never written: `coord status` says `coordinator install: settings unreadable` with the reason (and
+  `install_settings_problem` in `--json`), and the rule is yours to add by hand.
+- **The Claude Code coordinator no longer loads your user-level Claude Code layer.** A coordinator session now starts
+  with `--setting-sources project,local` and auto-memory off, so your `~/.claude` settings, hooks, `CLAUDE.md` and
+  memory stay out of its context (measured on a cold turn: about 53K new cache tokens and $0.214 before, 9K and $0.038
+  with the flag). Its own install's project and local settings, including the consent hook, still apply. To put your
+  layer back, run `levain coord agent --user-scope on` (it keeps the agent, model and directory; `--user-scope off`
+  returns to the default, and `levain coord agent claude --user-scope on` sets both at once). `levain coord status`
+  and its `--json` show the choice (`user layer: off (project settings only)`). A launch keeps the choice it was asked
+  under: changing it while a launch waits to start changes the next one. `--user-scope` alone needs a claude
+  coordinator, and turning it on refuses, with the reason, when a `disableAllHooks` in your user settings would stop
+  every launch. A store from before this change reads as off. With the layer off, a `disableAllHooks` that lives only in your user settings no longer refuses the coordinator
+  launch, since the session never reads that file; `disableAllHooks` in the coordinator's own or an ancestor project
+  still refuses. Covered by tests of the spawn argv and the setting.
+
 ### Fixed
 - **The coordinator's verbs take their text without shell quoting.** Shadow 10-30: two of three real coordinators
   misfired on their own shell lines (flags kept in a variable that zsh does not split, then a `coord release` run in the

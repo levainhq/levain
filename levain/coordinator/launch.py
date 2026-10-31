@@ -60,13 +60,14 @@ Known edges: a trust refusal or a session never listed is a death, so three in a
 or release (the first real run will likely meet it). A refusal before the spawn claim (the hook not live, the briefs
 directory refused, claude not on PATH) is no death: the launch stays pending, each start says why, and it expires unspawned. The consent
 queue's settings file is created once: when your main install made it, the coordinator's install keeps it, and its
-grants verify against that install's cockpit (init warns and continues). Your user-scope Claude Code settings, hooks
-and CLAUDE.md imports load into the coordinator's session too (doctor checks the install's wiring and that no settings
-file turns hooks off, not the rest of the effective settings). A drop delivered after a claude coordinator's spawn
-claim, still unsplit when its session is listed done, waits at most one watch pass: the watcher ends that coordinator
-and starts a fresh one, whose brief quotes the drop; `levain coord wake` does the same at once for a done coordinator
-running without the lease. A Codex coordinator, and a drop with no watcher running, still wait up to LEASE_TTL +
-IDLE_GRACE; handing a drop into a running session is not built. A crashed spawn
+grants verify against that install's cockpit (init warns and continues). The coordinator's session loads only the project
+and local Claude Code layers and has auto-memory off (``--setting-sources project,local``, see :func:`_layer_args`); your
+user-level settings, hooks and CLAUDE.md do not reach it unless ``levain coord agent --user-scope on`` (doctor then
+checks the user file too for ``disableAllHooks``, otherwise it says that file is not consulted). A drop delivered after a
+claude coordinator's spawn claim, still unsplit when its session is listed done, waits at most one watch pass: the watcher
+ends that coordinator and starts a fresh one, whose brief quotes the drop; `levain coord wake` does the same at once for a
+done coordinator running without the lease. A Codex coordinator, and a drop with no watcher running, still wait up to
+LEASE_TTL + IDLE_GRACE; handing a drop into a running session is not built. A crashed spawn
 winner is not retried: its launch expires at LAUNCH_TTL and counts as a death. A session the read back listed in
 another directory than the launch's is not stopped (a name alone is not Levain's evidence); the launch fails and that
 session is yours to look at. The coordinator's directory under the levain home is one the hands floor denies by name
@@ -165,10 +166,35 @@ def brief_path(launch: Any) -> Path:
 
 
 # --- the hook check (L2) and the install -------------------------------------------------------------------------
-def hook_live(directory: Path) -> tuple[bool, str]:
+_PROJECT_LAYERS = "project,local"
+
+
+def _layer_args(user_scope: bool) -> list[str]:
+    """The Claude Code flags that keep your user layer (user settings, hooks, CLAUDE.md) out of a session
+    Levain starts: none when ``user_scope`` is on. The one home of the rule, for the coordinator and later a worker."""
+    if user_scope:
+        return []
+    # both forms (one comma-joined argument, inline JSON) were accepted by four real `claude --bg` runs on Claude Code
+    # 2.1.314 (1030-42 dietrun). Measured 10-30 on 2.1.314: with `--setting-sources project,local` those four runs
+    # answered NOT IN CONTEXT for a fact only in the user's ~/.claude/CLAUDE.md and for a canary string, so the user
+    # CLAUDE.md was not injected. Re-measure after a Claude Code upgrade.
+    return ["--setting-sources", _PROJECT_LAYERS, "--settings", '{"autoMemoryEnabled":false}']
+
+
+def _user_settings_files() -> set[Path]:
+    """The user-level Claude Code settings files (``$CLAUDE_CONFIG_DIR`` and ``~/.claude``), resolved: doctor also
+    lists the same file by its real path when the workspace sits under a symlinked home."""
+    dirs = ([Path(os.environ["CLAUDE_CONFIG_DIR"])] if os.environ.get("CLAUDE_CONFIG_DIR") else []) + [
+        Path.home() / ".claude"]
+    return {(d / "settings.json").resolve() for d in dirs}
+
+
+def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
     """Doctor's own Claude Code check of ``directory`` (never a re-derivation): ``(True, detail)`` when its
     ``Claude Code consent hook`` row reads "wired to this install" AND no ``Claude Code hooks`` row of the same check
-    fails "turned off by" (``disableAllHooks``); else ``(False, why)``."""
+    fails "turned off by" (``disableAllHooks``); else ``(False, why)``. With ``user_scope`` False (the coordinator's
+    default) the session never loads your user settings file, so a ``disableAllHooks`` only there is not consulted and
+    the detail says so; no refusal is added or removed for any other file."""
     from levain import doctor
 
     if not (Path(directory) / "CLAUDE.md").is_file():
@@ -180,13 +206,24 @@ def hook_live(directory: Path) -> tuple[bool, str]:
     # ruled (L3 r1 G1): a wired hook is not a running one. doctor reports an effective `disableAllHooks: true` (any
     # settings file a session there loads) as a later failing "Claude Code hooks" row, "turned off by ..."
     off = next((r for r in rows if r.name == _HOOKS_ROW and not r.ok and r.detail.startswith(_HOOKS_OFF)), None)
+    layers = "all layers (user, project, local)" if user_scope else f"{_PROJECT_LAYERS} only"
+    note = f"; the coordinator loads {layers}"
+    if off is not None and not user_scope:
+        # doctor has no public form of this lookup; a rename there raises here (AttributeError, tested), never a
+        # silent refusal. An OSError resolving a listed file (a symlink loop) leaves doctor's row standing: a refusal.
+        try:
+            files = {f.resolve() for f in doctor._hooks_off_files(Path(directory), "claude-code")}
+        except OSError:
+            files = set()
+        if files and files <= _user_settings_files():
+            off, note = None, note + " (user-level disableAllHooks is not consulted)"
     for row in rows:
         if row.name == HOOK_ROW:
             if not row.detail.startswith(_HOOK_LIVE):
                 return False, f"{HOOK_ROW}: {row.detail}"
             if off is not None:
                 return False, f"{HOOK_ROW}: {row.detail}, but {_HOOKS_ROW}: {off.detail}"
-            return True, row.detail
+            return True, row.detail + note
     failed = next((r for r in rows if not r.ok), None)
     why = f"{failed.name}: {failed.detail}" if failed is not None else "doctor reports no consent hook row"
     return False, f"{directory}: the consent hook is not checked ({why})"
@@ -216,7 +253,23 @@ def _install_answers() -> dict[str, str]:
     return answers
 
 
-def setup_install(directory: Path, *, emit: Callable[[str], None] = print) -> tuple[Path, bool, str]:
+def _bring_read_rule(target: Path, emit: Callable[[str], None]) -> None:
+    """A coordinator install an earlier release made lacks the bare ``Read`` allow rule: only that rule is merged
+    into its ``.claude/settings.json`` (:func:`levain.install.add_coordinator_read_rule`, under the install's lock,
+    every other byte kept), never a whole adapter refresh. Said once, through ``emit``; a merge that cannot run leaves
+    the rule pending and ``coord status`` says so."""
+    from levain import install as inst
+
+    try:
+        inst.add_coordinator_read_rule(target)
+    except inst.InitError as exc:
+        emit(f"the Read allow rule is still missing from {target}'s project settings: {str(exc)[:300]}")
+        return
+    emit(f"added the Read allow rule to {target}'s project settings")
+
+
+def setup_install(directory: Path, *, emit: Callable[[str], None] = print,
+                  user_scope: bool = False) -> tuple[Path, bool, str]:
     """Make ``directory`` a Levain install for Claude Code unless its consent hook is live already:
     ``(resolved directory, hook live, detail)``. A directory that holds anything and is not a live install is never
     installed over (no ``--force``). Init runs in this process with an answer file (non-interactive: it asks nothing),
@@ -225,8 +278,10 @@ def setup_install(directory: Path, *, emit: Callable[[str], None] = print) -> tu
     from levain import install as inst
 
     target = Path(directory).expanduser().resolve()
-    live, detail = hook_live(target)
+    live, detail = hook_live(target, user_scope=user_scope)
     if live:
+        if inst.coordinator_read_rule_pending(target):
+            _bring_read_rule(target, emit)
         return target, True, detail
     if not inst._is_safe_install_target(target):
         return target, False, (f"{target} holds files and is not a Levain install with a live consent hook "
@@ -246,7 +301,7 @@ def setup_install(directory: Path, *, emit: Callable[[str], None] = print) -> tu
     target = target.resolve()
     if code != 0:
         return target, False, f"levain init into {target} did not settle (exit {code}; its output is above)"
-    live, detail = hook_live(target)
+    live, detail = hook_live(target, user_scope=user_scope)
     return target, live, detail
 
 
@@ -619,7 +674,8 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
 
     if not ln.cwd or not Path(ln.cwd).is_dir():
         return left(f"the launch's directory {ln.cwd!r} is not a directory")
-    live, detail = hook_live(Path(ln.cwd))
+    user_scope = ln.user_scope       # the choice the launch was asked under (L3 r1), never the setting's now
+    live, detail = hook_live(Path(ln.cwd), user_scope=user_scope)
     if not live:
         return left(f"the consent hook is not live in {ln.cwd}: {detail}")
     try:
@@ -669,7 +725,7 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
         brief = _write_brief(store, got)
         name = session_name(got)
         argv = [exe, "--bg", "-n", name, "--permission-mode", "default",
-                *(["--model", got.model] if got.model else []), _prompt(got, brief)]
+                *(["--model", got.model] if got.model else []), *_layer_args(user_scope), _prompt(got, brief)]
         argv_sha = "sha256:" + hashlib.sha256(canonical_bytes(argv)).hexdigest()
         try:
             cp = _run(argv, cwd=cwd, env=env, timeout=_SPAWN_TIMEOUT)
