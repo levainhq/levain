@@ -3124,6 +3124,8 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
     if "tokens_today" not in counts:
         raise _bad(spec, "value.counts.tokens_today", "is required (null when not tracked)")
     count("value.counts.tokens_today", counts["tokens_today"])
+    if counts.get("cache_read_today") is not None:      # optional, a provider's own figure; absent or null is "not reported"
+        count("value.counts.cache_read_today", counts["cache_read_today"], null=False)
     if not _is_iso(v.get("as_of")):
         raise _bad(spec, "value.as_of", "must be an ISO-8601 timestamp")
     tasks = _need_list(spec, v, "tasks")

@@ -115,7 +115,7 @@
     const task = (t) => (isObj(t) ? Object.assign({}, t, { opened: undefined, cost: isObj(t.cost) ? Object.assign({}, t.cost, { usd: fmtUsd(t.cost.usd), tokens: fmtTokens(t.cost.tokens) }) : t.cost }) : t);
     const sane = isObj(v) ? Object.assign({}, v, { as_of: undefined, nodes: Array.isArray(v.nodes) ? v.nodes.map(lean) : v.nodes,
                                                    tasks: Array.isArray(v.tasks) ? v.tasks.map(task) : v.tasks,
-                                                   counts: isObj(v.counts) ? Object.assign({}, v.counts, { tokens_today: fmtTokens(v.counts.tokens_today) }) : v.counts }) : v;
+                                                   counts: isObj(v.counts) ? Object.assign({}, v.counts, { tokens_today: fmtTokens(v.counts.tokens_today), cache_read_today: cacheFig(v.counts.cache_read_today) }) : v.counts }) : v;
     return JSON.stringify([l, sane, Array.from(shownAll), replaySig()]);       // T is in it: two instants repaint even when the value reads alike
   }
   // one OS-level observer at a time: the card calls this before it replaces its children
@@ -132,6 +132,8 @@
     if (n >= 1e3) return Math.round(n / 1e3) + "K";
     return String(n);
   }
+  // a cache-read count is drawn only when it is a non-negative integer (the validator refuses anything else); null otherwise
+  function cacheFig(n) { return typeof n === "number" && Number.isInteger(n) && n >= 0 ? fmtTokens(n) : null; }
   // The one way the tokens-today figure is drawn, in every lens: a figure with subagent lanes left out is a floor ("30+"), and
   // says how many were not read ("7 lanes not read"). null when no transcript read.
   function tokensToday(counts) {
@@ -140,7 +142,7 @@
     const n = isNum(c.tokens_skipped) && c.tokens_skipped > 0 ? c.tokens_skipped : 0;
     const note = n ? n + (n === 1 ? " lane" : " lanes") + " not read" : "";
     // cache reads, when the provider reports them (an embedding cockpit may): shown beside the fresh figure, never added into it
-    const cr = fmtTokens(c.cache_read_today), cache = cr === null ? "" : cr + " cache reads";
+    const cr = cacheFig(c.cache_read_today), cache = cr === null ? "" : cr + (c.cache_read_today === 1 ? " cache read" : " cache reads");
     return { fig: fig + (n ? "+" : ""), note: note, cache: cache,
              text: fig + (n ? "+" : "") + " tokens today" + (note ? " (" + note + ")" : "") + (cache ? ", plus " + cache : "") };
   }

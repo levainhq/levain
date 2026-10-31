@@ -101,6 +101,14 @@ def test_the_spec_shape_is_accepted_whole():
     assert _panel(empty)["status"] == "empty"
 
 
+@pytest.mark.parametrize("how", ["absent", None, 0, 850_000_000])
+def test_the_cache_read_count_is_optional_and_a_non_negative_integer_when_sent(how):
+    v = copy.deepcopy(_good())
+    if how != "absent":
+        v["counts"]["cache_read_today"] = how
+    assert _panel(v)["status"] == "ok", _panel(v)
+
+
 def _set(path: str, val: Any):
     def f(v):
         cur = v
@@ -143,6 +151,10 @@ MALFORMED = [
     ("conflicts.0.nodes", ["s1", "s1"], "two or more distinct node ids"),
     ("counts", {}, "tokens_today is required"),
     ("counts.tokens_today", "lots", "non-negative integer"),
+    ("counts.cache_read_today", -5, "value.counts.cache_read_today"),
+    ("counts.cache_read_today", 1.5, "value.counts.cache_read_today"),
+    ("counts.cache_read_today", "12", "value.counts.cache_read_today"),
+    ("counts.cache_read_today", True, "value.counts.cache_read_today"),
     ("as_of", None, "value.as_of"),
     ("tasks", _DEL, "value.tasks is required"),
     ("tasks.0.kind", "process", "value.tasks[0].kind"),

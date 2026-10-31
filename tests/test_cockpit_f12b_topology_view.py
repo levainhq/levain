@@ -332,4 +332,43 @@ def test_a_provider_that_sends_no_cache_reads_draws_none(tmp_path, monkeypatch):
     work, agents = json.loads(out[-3]), json.loads(out[-1])
     assert work["stat"]["bold"] == "19.7M" and agents["metric"]["bold"] == "19.7M", (work, agents)
     for text in (work["stat"]["text"], work["stat"]["title"], agents["metric"]["sub"], agents["metric"]["title"]):
-        assert "cache reads" not in text, (text, work, agents)
+        # the static sentence "Cache reads are not counted" is allowed; what a reported figure adds is not (case-insensitive, so a capital cannot hide it)
+        low = text.lower()
+        assert "cache reads beside it" not in low and "plus " not in low and " cache read" not in low.replace("cache reads are not counted", ""), (text, work, agents)
+
+
+def _sig(v: dict, lens: str = "work") -> str:
+    return "window.LevainTopologyView.signature(%s, %s)" % (json.dumps(v), json.dumps(lens))
+
+
+@needs_browser
+def test_the_repaint_signature_follows_the_displayed_cache_figure_not_the_raw_count(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+
+    def with_cache(n):
+        v = _value()
+        v["counts"] = {"tokens_today": 19_700_000, "cache_read_today": n}
+        return v
+    out = _run(tmp_path, src, [{"eval": _sig(with_cache(850_000_000))}, {"eval": _sig(with_cache(850_000_001))}, {"eval": _sig(with_cache(900_000_000))}])
+    same_a, same_b, other = out[-3:]
+    assert same_a == same_b, (same_a, same_b)        # one display bucket (850.0M): no teardown
+    assert same_a != other                            # a visible change repaints
+
+
+@needs_browser
+def test_a_cache_count_the_validator_would_refuse_draws_nothing_and_one_read_is_singular(tmp_path, monkeypatch):
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    steps = []
+    for n in (-5, 1.5, "12", True, 1):
+        v = _value()
+        v["counts"] = {"tokens_today": 19_700_000, "cache_read_today": n}
+        steps += [{"eval": _paint(v)}, {"eval": _tokens_probe()}, {"eval": _paint(v, "agents")}, {"eval": _tokens_probe()}]
+    out = _run(tmp_path, src, steps)
+    rows = [(json.loads(out[-20 + 4 * j + 1]), json.loads(out[-20 + 4 * j + 3])) for j in range(5)]
+    for work, agents in rows[:4]:
+        for text in (work["stat"]["text"], work["stat"]["title"], agents["metric"]["sub"], agents["metric"]["title"]):
+            assert " cache read" not in text.lower().replace("cache reads are not counted", ""), (text, work, agents)
+    work, agents = rows[4]
+    assert "1 cache read" in work["stat"]["text"] and "1 cache reads" not in work["stat"]["text"], work
+    assert "1 cache read" in agents["metric"]["sub"] and "1 cache reads" not in agents["metric"]["sub"], agents
+    assert "reports 1 cache read beside it" in agents["metric"]["title"], agents
