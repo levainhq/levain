@@ -1,0 +1,449 @@
+"""C15 S2b: the open's tables, ``open_brief`` and the two build paths. Every expectation was first read from a real run
+on a scratch store (an active coordinator launch holding the lease for the fenced path; a pending launch whose spawn
+the starter claimed for the cold-start path)."""
+from __future__ import annotations
+
+import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from levain.consent.questions import QuestionStore
+from levain.coordinator import seam, seam_build, seam_handoffs, seam_open
+from levain.coordinator.lease import LeaseRefused
+from levain.coordinator.store import CoordError, CoordStore
+
+NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
+HANDOFF = {"state_line": "main is green", "in_flight": [], "next": "open the queue", "contingencies": [], "notes": "",
+           "attested_operator_present": False, "attested_walked": False}
+
+
+def _dir(tmp_path, name="d"):
+    d = tmp_path / name
+    d.mkdir(mode=0o700)
+    return d
+
+
+def _sql(store, sql, args=()):
+    c = sqlite3.connect(store.path)
+    try:
+        return c.execute(sql, args).fetchall()
+    finally:
+        c.close()
+
+
+def _raw(store, sql, args=()):
+    c = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        c.execute(sql, args)
+    finally:
+        c.close()
+
+
+@pytest.fixture
+def world(tmp_path):
+    """An active coordinator launch holds the lease (activation claims it)."""
+    s = CoordStore(_dir(tmp_path), clock=lambda: NOW)
+    s.coord_set_agent("claude", cwd=str(tmp_path))
+    s.accept_drop("first words", surface="cli")
+    ln = s.coord_status()["launches"][0]
+    got, why = s.launch_activate(ln["launch_id"], harness_session_id="probe-A")
+    assert why is None and got.state == "active"
+    s.session_key = got.session_key
+    s.qdir = _dir(tmp_path, "q")
+    return s
+
+
+def _token(s):
+    return s.coord_status()["lease"]["token"]
+
+
+def _brief(s, kind="operator", **kw):
+    return seam.open_brief(s, s.qdir, kind, NOW, **kw)
+
+
+def _build(s, key="k1", kind="operator", **kw):
+    return seam_build.build(s, kind=kind, signal_kind="silence", signal_key=key, queue_dir=s.qdir, token=_token(s), **kw)
+
+
+def _ack(s, open_id, **kw):
+    return seam_open.acknowledge(s, open_id, token=_token(s), **kw)
+
+
+def _close(s, request_id="c1", prev=None, kind="rotation"):
+    return seam_handoffs.close(s, kind=kind, body=dict(HANDOFF), request_id=request_id, prev_handoff_id=prev,
+                               token=_token(s))
+
+
+def _old_binary_drop(s, n):
+    _raw(s, "INSERT INTO drops (drop_id, surface, outbox_id, words, words_sha256, sent_at, received_at, source_how) "
+            "VALUES (?, 'cli', ?, 'w', 'h', 't', 't', 'none')", (f"dr-{n:032x}", f"old-{n}"))
+
+
+# --- the fixture stores ---------------------------------------------------------------------------------------------
+def test_an_empty_store(tmp_path):
+    s = CoordStore(_dir(tmp_path))
+    s._connect().close()
+    b = seam.open_brief(s, tmp_path / "q", "light", NOW)
+    assert (b.cursor_gseq, b.shown_through_gseq, b.handoff_id, b.omitted_rows) == (0, 0, None, 0)
+    for line in ("Handoff: no handoff; no COUNTED row yet; derived", "Last acknowledged open: no prior acknowledged open",
+                 "Handoff section: absent (no seam_handoffs row)", "Since (gseq 0 to 0): 0 counted rows",
+                 "Unsequenced (rows written by an older release): 0", "Unacknowledged: 0", "Board: 0 items",
+                 f"Not built: {seam.NOT_BUILT}"):
+        assert line in b.text.splitlines(), line
+
+
+def test_no_store_at_all_is_absent_and_nothing_is_made(tmp_path):
+    s = CoordStore(tmp_path / "nowhere")
+    b = seam.open_brief(s, tmp_path / "q", "light", NOW)
+    assert "store: absent: there is no coordinator store here" in b.text and b.cursor_gseq == 0
+    assert not (tmp_path / "nowhere").exists() and not (tmp_path / "q").exists()
+
+
+def test_a_handoff_only_store_shows_the_handoff_whole(world):
+    h = _close(world)
+    b = _brief(world)
+    lines = b.text.splitlines()
+    assert b.handoff_id == h.handoff_id
+    assert f"Handoff section: cut at gseq {h.covers_gseq}, 0 counted row(s) since (rows, not events)" in lines
+    assert "  state: main is green" in lines and "  next: open the queue" in lines
+    assert any(ln.startswith(f"Handoff: #1 (rotation) written ") for ln in lines)
+
+
+def test_a_store_behind_head_counts_the_rows_since_the_cut(world):
+    h = _close(world)
+    world.accept_drop("landed after the close", surface="cli")           # a drop and its receipt: two counted rows
+    b = _brief(world)
+    assert f"Handoff section: cut at gseq {h.covers_gseq}, 2 counted row(s) since (rows, not events)" in b.text
+    assert b.cursor_gseq > h.covers_gseq
+
+
+def test_a_crash_store_has_rows_and_no_handoff(world):
+    b = _brief(world)
+    assert b.handoff_id is None
+    assert any(ln.startswith("Handoff: no handoff; last COUNTED row at ") and ln.endswith("; derived")
+               for ln in b.text.splitlines())
+    assert "  drops: 1" in b.text and "  replies: 1" in b.text
+
+
+def test_an_unreadable_queue_dir_says_so_and_the_store_sections_stand(world, tmp_path):
+    afile = tmp_path / "afile"
+    afile.write_text("not a directory")
+    junk = tmp_path / "junk"
+    junk.mkdir(mode=0o700)
+    (junk / "questions.db").write_bytes(b"this is not a database" * 50)
+    for qdir in (afile, junk):
+        b = seam.open_brief(world, qdir, "operator", NOW)
+        lines = b.text.splitlines()
+        assert any(ln.startswith("Band: cannot-derive (") for ln in lines), qdir
+        assert any(ln.startswith("Card: cannot-derive (the queue directory could not be read") for ln in lines)
+        assert "0 open items" not in b.text and "away: off" not in b.text      # never an empty answer for an unread one
+        assert "Board: 0 items" in lines and "Handoff: no handoff" in b.text and b.cursor_gseq > 0
+    gone = seam.open_brief(world, tmp_path / "never-made", "operator", NOW)    # no queue directory is a band of nothing
+    assert "0 open items" in gone.text and not (tmp_path / "never-made").exists()
+
+
+def test_tables_absent_are_not_tables_present_and_empty(world):
+    present = _brief(world).text.splitlines()
+    assert "Unacknowledged: 0" in present and "Board: 0 items" in present
+    for t in ("open_unsequenced_cuts", "open_deliveries", "open_acks", "open_builds", "ready_items", "ready_journal"):
+        _raw(world, f"DROP TABLE {t}")
+    absent = _brief(world).text.splitlines()
+    assert any(ln.startswith("Unacknowledged: absent (") for ln in absent)
+    assert "Board: no lifecycle tables" in absent
+    assert "Unacknowledged: 0" not in absent and "Board: 0 items" not in absent
+
+
+# --- the cursor rule ------------------------------------------------------------------------------------------------
+def test_a_build_never_acked_does_not_move_since(world):
+    before = _brief(world)
+    b = _build(world)
+    assert (b.cursor_gseq, b.shown_through_gseq) == (before.cursor_gseq, before.cursor_gseq)
+    again = _brief(world)
+    assert f"Since (gseq 0 to {before.cursor_gseq})" in again.text            # still the window from the start
+    assert f"open {b.open_id} (operator) built 0m ago, never acknowledged; never delivered" in again.text
+    assert seam_open.record_delivery(world, b.open_id, "launch_brief") is True
+    assert seam_open.record_delivery(world, b.open_id, "launch_brief") is False
+    delivered = _brief(world)
+    assert "delivered via launch_brief" in delivered.text and f"Since (gseq 0 to {before.cursor_gseq})" in delivered.text
+    _ack(world, b.open_id)
+    acked = _brief(world)
+    assert f"Since (gseq {b.shown_through_gseq} to " in acked.text and "Unacknowledged: 0" in acked.text
+
+
+def test_a_duplicate_signal_returns_the_same_build(world):
+    a = _build(world, "same")
+    world.accept_drop("rows landed between", surface="cli")
+    assert _build(world, "same") == a
+    assert len(_sql(world, "SELECT open_id FROM open_builds")) == 1
+    assert _build(world, "other").open_id == a.open_id + 1
+
+
+def test_the_cursor_is_the_max_shown_through_over_acked_opens_and_never_regresses(world):
+    small = _build(world, "small")
+    world.accept_drop("more", surface="cli")
+    large = _build(world, "large")
+    assert large.shown_through_gseq > small.shown_through_gseq
+    _ack(world, large.open_id)
+    _ack(world, small.open_id)                      # the smaller build is acknowledged LATER
+    with sqlite3.connect(world.path) as c:
+        assert seam_open.acked_cursor(c) == (large.shown_through_gseq, large.open_id)
+    assert f"Since (gseq {large.shown_through_gseq} to " in _brief(world).text
+
+
+def test_a_later_truncated_build_acked_last_does_not_pull_the_cursor_back(world):
+    for i in range(30):
+        world.accept_drop(f"drop number {i}", surface="cli")
+    full = _build(world, "full")
+    capped = _build(world, "capped", body_cap=len(full.body.encode()) - 600)
+    assert capped.open_id > full.open_id and capped.shown_through_gseq < full.shown_through_gseq
+    _ack(world, full.open_id)
+    _ack(world, capped.open_id)                       # the newer build, which showed less, is acknowledged last
+    with sqlite3.connect(world.path) as c:
+        assert seam_open.acked_cursor(c) == (full.shown_through_gseq, full.open_id)
+
+
+def test_truncation_stops_at_the_last_row_rendered_and_the_ack_reaches_no_further(world):
+    for i in range(30):
+        world.accept_drop(f"drop number {i}", surface="cli")
+    full = _brief(world)
+    cap = len(full.text.encode()) - 600
+    cut = _brief(world, body_cap=cap)
+    assert cut.omitted_rows > 0 and cut.shown_through_gseq < cut.cursor_gseq == full.cursor_gseq
+    detail = [ln for ln in cut.text.splitlines() if ln.startswith("  gseq ")]
+    assert int(detail[-1].split()[1]) == cut.shown_through_gseq              # the last row actually rendered
+    assert len(detail) + cut.omitted_rows == len([ln for ln in full.text.splitlines() if ln.startswith("  gseq ")])
+    assert len(cut.text.encode()) <= cap
+    b = _build(world, "cut", body_cap=cap)
+    assert (b.cursor_gseq, b.shown_through_gseq) == (cut.cursor_gseq, cut.shown_through_gseq)
+    _ack(world, b.open_id)
+    nxt = _brief(world)
+    assert f"Since (gseq {b.shown_through_gseq} to {b.cursor_gseq}" in nxt.text
+    shown_again = [ln for ln in nxt.text.splitlines() if ln.startswith("  gseq ")]
+    assert len(shown_again) == cut.omitted_rows                              # the omitted rows return, none lost
+
+
+def test_the_never_cut_sections_must_fit_the_cap(world):
+    with pytest.raises(seam.BriefTooBig):
+        _brief(world, body_cap=200)
+
+
+def test_unsequenced_rows_are_their_own_class_and_are_cut_able(world):
+    assert "Unsequenced (rows written by an older release): 0" in _brief(world).text
+    _old_binary_drop(world, 1)
+    b = _brief(world)
+    assert "  drops: 1 row(s) written by an older release (rowids 3 to 3)" in b.text.splitlines() or \
+        any(ln.startswith("  drops: 1 row(s) written by an older release") for ln in b.text.splitlines())
+    rowid = _sql(world, "SELECT rowid FROM drops WHERE gseq IS NULL")[0][0]
+    assert b.unsequenced_cuts == {"drops": rowid}
+    built = _build(world, "u")
+    assert _sql(world, "SELECT table_name, max_rowid FROM open_unsequenced_cuts WHERE open_id = ?",
+                (built.open_id,)) == [("drops", rowid)]
+    assert any(ln.startswith("  drops: 1 row(s)") for ln in _brief(world).text.splitlines())    # unacked: still there
+    _ack(world, built.open_id)
+    assert "Unsequenced (rows written by an older release): 0" in _brief(world).text
+    _old_binary_drop(world, 2)
+    assert any(ln.startswith("  drops: 1 row(s) written by an older release") for ln in _brief(world).text.splitlines())
+
+
+def test_the_brief_records_no_band_view_and_numbers_nothing(world):
+    qs = QuestionStore(world.qdir)
+    qs.file(agent="claude_code", agent_session_id="s", what="Which?", options=[("a", "A"), ("b", "B")], rec="a",
+            blocks="x", cwd="/tmp")
+
+    def dump():
+        out = {}
+        for p in sorted(world.qdir.iterdir()):
+            if p.suffix == ".db":
+                c = sqlite3.connect(p)
+                try:
+                    out[p.name] = list(c.iterdump())
+                finally:
+                    c.close()
+        return out
+
+    before = dump()
+    b = _build(world, "band")
+    assert dump() == before                                                # no row, table or view in the queue side
+    tables = {r[0] for r in sqlite3.connect(world.qdir / "questions.db").execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert tables.isdisjoint({"band_items", "band_views", "band_closed_shown"})
+    assert "  new: Which?" in b.body.splitlines() and "#1" not in b.body
+
+
+def test_the_brief_is_a_function_of_the_stores_and_now(world):
+    assert _brief(world) == _brief(world)
+    assert _brief(world) != seam.open_brief(world, world.qdir, "operator", NOW + timedelta(hours=1))
+
+
+@pytest.mark.parametrize("kind", ["weekly", "", None])
+def test_an_unknown_kind_is_refused(world, kind):
+    with pytest.raises(CoordError, match="kind rotation, operator, dream, light"):
+        _brief(world, kind=kind)
+
+
+def test_now_is_required_and_aware(world):
+    with pytest.raises(CoordError):
+        seam.open_brief(world, world.qdir, "light", None)
+    with pytest.raises(CoordError, match="aware"):
+        seam.open_brief(world, world.qdir, "light", datetime(2026, 10, 31, 12, 0))
+
+
+# --- the fence and the acknowledging write ---------------------------------------------------------------------------
+def test_the_operators_lease_is_refused_by_every_fenced_write(tmp_path):
+    s = CoordStore(_dir(tmp_path))
+    tok = s.coord_take()                                                   # holder is literally "operator"
+    with pytest.raises(LeaseRefused, match="written by an active coordinator launch; the lease holder is the operator"):
+        seam_build.build(s, kind="light", signal_kind="silence", signal_key="k", queue_dir=tmp_path / "q", token=tok)
+    with pytest.raises(LeaseRefused, match="the lease holder is the operator"):
+        seam_open.acknowledge(s, 1, token=tok)
+    assert _sql(s, "SELECT COUNT(*) FROM open_builds") == [(0,)]
+
+
+def test_a_missing_or_stale_token_writes_nothing(world):
+    with pytest.raises(CoordError, match="live lease token"):
+        seam_build.build(world, kind="light", signal_kind="silence", signal_key="k", queue_dir=world.qdir, token=None)
+    with pytest.raises(LeaseRefused, match="not the live lease's"):
+        seam_build.build(world, kind="light", signal_kind="silence", signal_key="k", queue_dir=world.qdir,
+                         token=_token(world) + 7)
+    assert _sql(world, "SELECT COUNT(*) FROM open_builds") == [(0,)]
+
+
+def test_the_reader_session_is_derived_and_a_read_back_is_required_on_rotation_and_dream(world):
+    rot = _build(world, "r", kind="rotation")
+    with pytest.raises(CoordError, match="read-back"):
+        _ack(world, rot.open_id)
+    assert _sql(world, "SELECT COUNT(*) FROM open_acks") == [(0,)]
+    assert _ack(world, rot.open_id, read_back="main green; next the queue") == (rot.open_id, world.session_key, True)
+    assert _ack(world, rot.open_id, read_back="again") == (rot.open_id, world.session_key, False)
+    assert _sql(world, "SELECT reader_session, read_back FROM open_acks") == [(world.session_key, "main green; next the queue")]
+    op = _build(world, "o")
+    assert _ack(world, op.open_id)[2] is True                              # optional on an operator open
+    with pytest.raises(CoordError, match="no open build 99"):
+        _ack(world, 99)
+    with pytest.raises(sqlite3.DatabaseError, match="read-back"):          # the trigger holds it for a raw writer too
+        _raw(world, "INSERT INTO open_acks VALUES (?, 's-x', '  ', 't')", (rot.open_id,))
+
+
+def test_a_delivery_surface_is_one_of_two(world):
+    b = _build(world)
+    with pytest.raises(CoordError, match="launch_brief, light_verb"):
+        seam_open.record_delivery(world, b.open_id, "email")
+    with pytest.raises(CoordError, match="no open build"):
+        seam_open.record_delivery(world, 99, "light_verb")
+
+
+# --- the starter path -----------------------------------------------------------------------------------------------
+@pytest.fixture
+def pending(tmp_path):
+    clock = [datetime.now(timezone.utc)]
+    s = CoordStore(_dir(tmp_path, "dp"), clock=lambda: clock[0])
+    s.coord_set_agent("claude", cwd=str(tmp_path))
+    s.accept_drop("first words", surface="cli")
+    s.launch_id = s.coord_status()["launches"][0]["launch_id"]
+    s.clock = clock
+    s.qdir = tmp_path / "q"
+    return s
+
+
+def _starter(s, launch_id=None, pid=None, kind="operator"):
+    return seam_build.starter_build(s, s.launch_id if launch_id is None else launch_id,
+                                    pid=os.getpid() if pid is None else pid, kind=kind, queue_dir=s.qdir)
+
+
+def _footprint(s):
+    return [_sql(s, f"SELECT COUNT(*) FROM {t}")[0][0] for t in
+            ("lease_events", "launch_events", "launch_spawns", "gseq", "open_builds", "open_unsequenced_cuts")]
+
+
+def test_a_cold_start_builds_for_the_launch_it_claimed(pending):
+    pending.launch_claim_spawn(pending.launch_id, os.getpid())
+    b = _starter(pending)
+    assert (b.signal_kind, b.signal_key, b.requires_ack, b.seam_kind) == ("launch", pending.launch_id, 1, "operator")
+    assert b.cursor_gseq == b.shown_through_gseq > 0 and b.handoff_id is None
+    assert "no handoff" in b.body
+    assert _starter(pending) == b and len(_sql(pending, "SELECT 1 FROM open_builds")) == 1   # a duplicate signal
+
+
+def test_a_launch_claimed_by_another_pid_is_refused_and_nothing_is_written(pending):
+    pending.launch_claim_spawn(pending.launch_id, os.getpid() + 1)
+    before = _footprint(pending)
+    with pytest.raises(LeaseRefused, match=f"claimed by pid {os.getpid() + 1}, not by pid {os.getpid()}"):
+        _starter(pending)
+    assert _footprint(pending) == before
+
+
+def test_a_launch_whose_spawn_nobody_claimed_is_refused(pending):
+    before = _footprint(pending)
+    with pytest.raises(LeaseRefused, match="not claimed"):
+        _starter(pending)
+    assert _footprint(pending) == before
+
+
+def test_an_unknown_or_non_pending_launch_is_refused(pending, world):
+    pending.launch_claim_spawn(pending.launch_id, os.getpid())
+    with pytest.raises(LeaseRefused, match="no launch"):
+        _starter(pending, launch_id="ln-" + "0" * 32)
+    with pytest.raises(CoordError, match="launch id"):
+        _starter(pending, launch_id=7)
+    world_launch = world.coord_status()["launches"][0]["launch_id"]       # `world`'s launch is active, not pending
+    with pytest.raises(LeaseRefused, match="active, not pending"):
+        seam_build.starter_build(world, world_launch, pid=os.getpid(), kind="light", queue_dir=world.qdir)
+
+
+def test_a_launch_past_its_until_is_refused_and_inherits_no_expiry_write(pending):
+    pending.launch_claim_spawn(pending.launch_id, os.getpid())
+    pending.clock[0] += timedelta(minutes=6)                               # pending lasts five minutes
+    before = _footprint(pending)
+    with pytest.raises(LeaseRefused, match="was pending only until"):
+        _starter(pending)
+    assert _footprint(pending) == before                                   # claim_spawn would have written `expired`
+
+
+def test_a_launch_whose_lease_moved_is_refused(pending):
+    pending.launch_claim_spawn(pending.launch_id, os.getpid())
+    pending.coord_take()                                                   # the operator takes the lease: a new token
+    with pytest.raises(LeaseRefused):
+        _starter(pending)
+    assert _sql(pending, "SELECT COUNT(*) FROM open_builds") == [(0,)]
+
+
+# --- the records ----------------------------------------------------------------------------------------------------
+def test_an_arrival_signal_is_one_per_agent_and_mark_and_is_counted(world):
+    def put(agent, mark):
+        with world._write("coordinator", _token(world)) as (conn, now):
+            return seam_open.record_arrival(conn, now, agent=agent, mark_id=mark, queue_id="q-1")
+
+    first = put("claude_code", 7)
+    gseq = _sql(world, "SELECT gseq FROM arrival_signals")
+    assert put("claude_code", "7") == (first[0], False) and _sql(world, "SELECT gseq FROM arrival_signals") == gseq
+    assert put("codex", 7)[1] is True
+    assert "  arrival_signals: 2" in _brief(world).text.splitlines()
+    with pytest.raises(CoordError, match="agent"):
+        with world._write("coordinator", _token(world)) as (conn, now):
+            seam_open.record_arrival(conn, now, agent="", mark_id=1, queue_id="q")
+
+
+def test_every_open_table_is_append_only_and_the_build_is_bounded(world):
+    b = _build(world)
+    _ack(world, b.open_id)
+    seam_open.record_delivery(world, b.open_id, "light_verb")
+    with world._write("coordinator", _token(world)) as (conn, now):
+        seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
+    for table, col in (("open_builds", "seam_kind"), ("open_deliveries", "surface"), ("open_acks", "reader_session"),
+                       ("arrival_signals", "agent")):
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+            _raw(world, f"UPDATE {table} SET {col} = {col}")
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+            _raw(world, f"DELETE FROM {table}")
+    ins = ("INSERT INTO open_builds (seam_kind, signal_kind, signal_key, cursor_gseq, shown_through_gseq, requires_ack, "
+           "body, body_sha256, built_at) VALUES ('light', 'silence', ?, ?, ?, ?, ?, 'h', 't')")
+    _raw(world, ins, ("ok", 5, 5, 1, "x"))
+    for args in (("big", 5, 5, 1, "x" * (seam_open.BODY_CAP + 1)), ("ahead", 5, 6, 1, "x"), ("noack", 5, 5, 0, "x")):
+        with pytest.raises(sqlite3.IntegrityError):
+            _raw(world, ins, args)
+    with pytest.raises(sqlite3.IntegrityError):
+        _raw(world, "INSERT OR REPLACE INTO open_builds (seam_kind, signal_kind, signal_key, cursor_gseq, "
+                    "shown_through_gseq, requires_ack, body, body_sha256, built_at) VALUES ('light', 'silence', 'ok', "
+                    "0, 0, 1, 'y', 'h', 't')")

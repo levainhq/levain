@@ -29,7 +29,7 @@ from typing import Any
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.contracts.canon import canonical
 from levain.coordinator import seam_classes
-from levain.coordinator.lease import LeaseRefused, lease as _lease, _launch_by_key
+from levain.coordinator.seam_open import active_coordinator_fence
 from levain.coordinator.store import CoordError, CoordStore, StoreAbsent, _append_only, next_gseq
 
 __all__ = ["BODY_KEYS", "KINDS", "LIST_MAX", "MAX_BODY_BYTES", "SEAM_HANDOFF_SCHEMA", "SeamHandoff", "close",
@@ -196,12 +196,8 @@ def close(store: CoordStore, *, kind: Any, body: Any, request_id: Any, prev_hand
         raise CoordError("prev_handoff_id is the latest handoff's id, or None when there is none")
     canon_body = canonical(body)
     with store._write("coordinator", token) as (conn, now):
-        held = _lease(conn, now)         # the fence has just passed it: the lease token is the live lease's
+        held, _launch = active_coordinator_fence(conn, now, token, "a handoff")
         writer = held.holder
-        launch = None if writer == "operator" else _launch_by_key(conn, writer)
-        if launch is None or launch.role != "coordinator" or launch.state != "active":
-            raise LeaseRefused("a handoff is written by an active coordinator launch; the lease holder is "
-                               f"{'the operator' if writer == 'operator' else writer}; nothing was written")
         digest = hashlib.sha256(canonical({"kind": kind, "body": body, "writer": writer}).encode("utf-8")).hexdigest()
         stored = _row(conn.execute(f"SELECT {_COLUMNS} FROM seam_handoffs WHERE close_key = ?",
                                    (request_id,)).fetchone())

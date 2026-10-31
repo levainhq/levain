@@ -29,6 +29,7 @@ COUNTED: frozenset[str] = frozenset({
     "lease_events", "launch_events",
     "review_items", "review_events", "first_reads", "team_drafts", "team_draft_events",
     "chat_messages", "chat_anomalies", "chat_approvals", "chat_approval_events",
+    "arrival_signals",
 })
 
 #: bookkeeping the brief never reports (``lease_events`` kinds claim, beat, release and ``launch_events`` kinds pending,
@@ -54,6 +55,12 @@ EXEMPT: dict[str, str] = {
                              "migrated; it records the migration, it is not a record of the work",
     "seam_handoffs": "the seam tables are the cut itself (C15 S1): a handoff records a seam, it is not work the next "
                      "open reports as having happened since you left",
+    "open_builds": "the seam tables are the cut itself (C15 S2b): a build records what an open showed, it is not work "
+                   "the next open reports as having happened since you left",
+    "open_deliveries": "evidence that a build was handed over (C15 S2b); it moves no cursor and reports nothing",
+    "open_acks": "the acknowledgement that moves the cursor (C15 S2b), not work the next open reports",
+    "open_unsequenced_cuts": "the per-table rowid an open showed of the unsequenced class (C15 S2b), the cut's own "
+                             "bookkeeping",
     **{name: _DISPATCH for name in (
         "artifact_take_failures", "artifact_takes", "authorise_signatures", "cancel_signatures", "event_cursor",
         "handoffs", "job_envelopes", "job_filers", "job_threads", "jobs", "meta", "run_records", "signatures",
