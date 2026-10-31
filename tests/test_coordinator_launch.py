@@ -1660,3 +1660,189 @@ def test_an_older_coordinator_install_is_brought_to_the_read_rule_once(tmp_home,
     _main(qdir, capsys, "coord", "agent", "claude")
     assert (target / ".claude" / "settings.json").read_bytes() == again        # the second run changes nothing
     assert allow(target).count("Read") == 1
+
+
+# --- 1030-47 L3 r1 fixes (the Read rule) ---------------------------------------------------------------------------
+def _older_coordinator(qdir, capsys, monkeypatch, tmp_home):
+    """A coordinator install as a release before the Read rule made it."""
+    from levain import install as inst
+
+    with monkeypatch.context() as m:
+        m.setattr(inst, "COORDINATOR_READ_ALLOW", ())
+        _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    assert "Read" not in (target / ".claude" / "settings.json").read_text()
+    return target
+
+
+def _only_inserted(old: str, new: str) -> str:
+    """What ``new`` adds to ``old`` when it is ``old`` with one span inserted (every other byte kept), else fail."""
+    i = 0
+    while i < len(old) and old[i] == new[i]:
+        i += 1
+    ins = new[:len(new) - (len(old) - i)][i:]
+    assert old[:i] + ins + old[i:] == new, (old, new)
+    return ins
+
+
+def test_an_edited_older_coordinator_install_gets_read_and_keeps_every_other_byte(tmp_home, qdir, monkeypatch, capsys):
+    # codex MED + complement MED: a hand-edited settings.json differs from the receipt, so the adapter refresh staged
+    # the package's version and the coordinator launched without Read; the launch now merges the one rule
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    doc = json.loads(f.read_text())
+    doc["permissions"]["allow"].append("Bash(make test:*)")              # the operator's own rule
+    doc["operatorKey"] = {"kept": 1.50, "as": "written"}
+    f.write_text(json.dumps(doc, indent=4) + "\n")                         # and his own formatting
+    old = f.read_text()
+    out =_main(qdir, capsys, "coord", "agent", "claude")
+    new = f.read_text()
+    assert _only_inserted(old, new).strip(" ,\n") == '"Read"'
+    assert json.loads(new)["permissions"]["allow"] == [*doc["permissions"]["allow"], "Read"]
+    assert not list((target / ".levain").glob("pending/**/settings.json"))  # nothing staged: no adapter refresh ran
+    assert out.out.count("Read allow rule") + out.err.count("Read allow rule") == 1      # said once
+    assert inst.coordinator_read_rule_pending(target) is False
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert f.read_text() == new                                            # the second run changes nothing
+
+
+def test_a_receipt_less_older_coordinator_install_gets_read(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    target.joinpath(*inst.ADAPTER_RECEIPT_REL).unlink()
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert json.loads((target / ".claude" / "settings.json").read_text())["permissions"]["allow"].count("Read") == 1
+    assert inst.coordinator_read_rule_pending(target) is False
+
+
+def test_levain_update_brings_an_edited_older_coordinator_install_to_read(tmp_home, qdir, monkeypatch, capsys):
+    # the remedy coord status names must clear it, an edited file included
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    doc = json.loads(f.read_text())
+    doc["permissions"]["allow"].append("Bash(make test:*)")
+    f.write_text(json.dumps(doc, indent=2) + "\n")
+    with inst.install_lock(target, create=False):
+        inst.refresh_adapter(target, apply=True, emit=lambda _l: None, carrier=False)
+    got = json.loads(f.read_text())["permissions"]["allow"]
+    assert got.count("Read") == 1 and "Bash(make test:*)" in got
+    assert inst.coordinator_read_rule_pending(target) is False
+
+
+@pytest.mark.parametrize("text, merged", [
+    ('{"hooks": {}}\n', ["Read"]),                                        # no permissions key
+    ('{"permissions": {"deny": ["Edit(x)"]}}\n', ["Read"]),                 # no allow key
+    ('{}', ["Read"]),
+])
+def test_settings_with_no_allow_list_are_pending_and_the_merge_creates_it(tmp_home, qdir, monkeypatch, capsys, text,
+                                                                         merged):
+    # codex MED: a coordinator whose settings had no permissions/allow read as not pending
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    assert inst.coordinator_read_rule_pending(target) is True
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["install_upgrade_pending"] is True
+    assert inst.add_coordinator_read_rule(target) is True
+    after = json.loads(f.read_text())
+    assert after["permissions"]["allow"] == merged
+    assert {k: v for k, v in after.items() if k != "permissions"} == {k: v for k, v in json.loads(text).items()
+                                                                       if k != "permissions"}
+    assert inst.coordinator_read_rule_pending(target) is False
+    assert inst.add_coordinator_read_rule(target) is False                 # nothing left to add
+
+
+@pytest.mark.parametrize("text, why", [
+    ("{not json", "not valid JSON"),
+    ("[1, 2]", "not a JSON object"),
+    ("[" * 200000 + "]" * 200000, "not valid JSON"),                      # deep nesting: RecursionError
+    ('{"permissions": {"allow": "Read"}}', "not a list"),
+    ('{"permissions": ["Read"]}', "not an object"),
+], ids=["bad-json", "array", "deep", "allow-string", "permissions-array"])
+def test_settings_that_cannot_be_merged_are_pending_reported_and_never_overwritten(tmp_home, qdir, monkeypatch,
+                                                                                  capsys, text, why):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    assert inst.coordinator_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "coordinator install: settings unreadable" in status and why in status, status
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True and why in js["install_settings_problem"]
+    with pytest.raises(inst.InitError):
+        inst.add_coordinator_read_rule(target)
+    assert f.read_text() == text                                           # never overwritten
+
+
+@pytest.mark.parametrize("text", [
+    '{"permissions":{"allow":["Bash(a:*)"]},"x":[1,{"y":"]}"}]}',                   # minified, brackets in strings
+    '{"permissions": {"allow": []}, "z": 1}',
+    '{"permissions": {"allow": ["old"]}, "permissions": {"allow": ["kept"]}}',     # json.loads keeps the last
+    '{\n\t"permissions": {\n\t\t"allow": [\n\t\t\t"a",\n\t\t\t"b"\n\t\t]\n\t}\n}\n',
+])
+def test_the_merge_inserts_one_entry_into_any_layout(tmp_home, qdir, monkeypatch, capsys, text):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    before = json.loads(text)
+    assert inst.add_coordinator_read_rule(target) is True
+    new = f.read_text()
+    assert _only_inserted(text, new).strip(" ,\n\t") == '"Read"'
+    assert json.loads(new)["permissions"]["allow"] == [*before["permissions"]["allow"], "Read"]
+
+
+def test_a_missing_settings_file_is_pending_and_never_created(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    target = _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    (target / ".claude" / "settings.json").unlink()
+    assert inst.coordinator_read_rule_pending(target) is True
+    assert "settings unreadable" in _main(qdir, capsys, "coord", "status").out
+    with pytest.raises(inst.InitError):
+        inst.add_coordinator_read_rule(target)
+    assert not (target / ".claude" / "settings.json").exists()
+
+
+def test_coord_status_checks_the_default_directory_when_no_cwd_is_stored(tmp_home, qdir, monkeypatch, capsys):
+    # complement LOW 4: a setting with no stored cwd launches into default_coordinator_dir()
+    # (coord_settings' CHECK refuses a claude row with no cwd, so this is defence only: the status is faked)
+    _older_coordinator(qdir, capsys, monkeypatch, tmp_home)
+    real = CoordStore.coord_status
+
+    def no_cwd(self):
+        st = real(self)
+        st["setting"] = {**st["setting"], "cwd": None}
+        return st
+
+    monkeypatch.setattr(CoordStore, "coord_status", no_cwd)
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True
+
+
+def test_an_oserror_resolving_a_hooks_off_file_refuses_and_never_crashes(tmp_path, tmp_home, qdir, fake, capsys,
+                                                                         monkeypatch):
+    # complement LOW 6 / deepseek MED-2: a rename still fails loud (the test above), an I/O error does not
+    from levain import doctor
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / "coordinator").resolve()
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+
+    class Broken:
+        def resolve(self):
+            raise OSError(40, "Too many levels of symbolic links")
+
+    monkeypatch.setattr(doctor, "_hooks_off_files", lambda *_a, **_k: [Broken()])
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert not live and "turned off by" in detail                       # doctor's row stands: a refusal, not a pass

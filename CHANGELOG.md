@@ -13,9 +13,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   Write, Edit, WebFetch and every shell command other than its own `coord`, `drops` and `thread` verbs still ask. Only
   the coordinator's own install gets the rule; a `levain init` for your sessions does not. The rule is the same with
   `--user-scope on`, where your own rules apply as well. An older coordinator install gets the rule the next time
-  `levain coord agent claude` runs, or from `levain update --path <the coordinator directory>`; both keep any rule you
-  added and a second run changes nothing. Until then `levain coord status` says `coordinator install: upgrade pending`
-  (and `install_upgrade_pending` in `--json`).
+  `levain coord agent claude` runs, or from `levain update --path <the coordinator directory>`: only the one entry is
+  added to `permissions.allow` (made if missing), every other byte of the file kept, a hand-edited one included, and a
+  second run changes nothing. Until then `levain coord status` says `coordinator install: upgrade pending` (and
+  `install_upgrade_pending` in `--json`). A settings file that is missing or unreadable, is not a JSON object, or whose
+  `permissions` is not an object or `permissions.allow` not a list, is never written: `coord status` says `coordinator install: settings unreadable` with the reason (and
+  `install_settings_problem` in `--json`), and the rule is yours to add by hand.
 - **The Claude Code coordinator no longer loads your user-level Claude Code layer.** A coordinator session now starts
   with `--setting-sources project,local` and auto-memory off, so your `~/.claude` settings, hooks, `CLAUDE.md` and
   memory stay out of its context (measured on a cold turn: about 53K new cache tokens and $0.214 before, 9K and $0.038

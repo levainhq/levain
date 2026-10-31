@@ -206,9 +206,12 @@ def hook_live(directory: Path, *, user_scope: bool) -> tuple[bool, str]:
     layers = "all layers (user, project, local)" if user_scope else f"{_PROJECT_LAYERS} only"
     note = f"; the coordinator loads {layers}"
     if off is not None and not user_scope:
-        # doctor has no public form of this lookup; a rename there raises here (tested), never a silent refusal. The
-        # helper itself skips a file it cannot read or parse.
-        files = {f.resolve() for f in doctor._hooks_off_files(Path(directory), "claude-code")}
+        # doctor has no public form of this lookup; a rename there raises here (AttributeError, tested), never a
+        # silent refusal. An OSError resolving a listed file (a symlink loop) leaves doctor's row standing: a refusal.
+        try:
+            files = {f.resolve() for f in doctor._hooks_off_files(Path(directory), "claude-code")}
+        except OSError:
+            files = set()
         if files and files <= _user_settings_files():
             off, note = None, note + " (user-level disableAllHooks is not consulted)"
     for row in rows:
@@ -247,22 +250,19 @@ def _install_answers() -> dict[str, str]:
     return answers
 
 
-def _bring_read_rule(target: Path, emit: Callable[[str], None]) -> str:
-    """A coordinator install an earlier release made lacks the bare ``Read`` allow rule: the adapter refresh `levain
-    update` runs (settings and hooks, never the carrier) adds it under the install's lock, an operator's own rules
-    kept and a second run a no-op. A refresh that cannot settle leaves the rule pending; ``coord status`` says so."""
+def _bring_read_rule(target: Path, emit: Callable[[str], None]) -> None:
+    """A coordinator install an earlier release made lacks the bare ``Read`` allow rule: only that rule is merged
+    into its ``.claude/settings.json`` (:func:`levain.install.add_coordinator_read_rule`, under the install's lock,
+    every other byte kept), never a whole adapter refresh. Said once, through ``emit``; a merge that cannot run leaves
+    the rule pending and ``coord status`` says so."""
     from levain import install as inst
 
     try:
-        with inst.install_lock(target, create=False):
-            inst.refresh_adapter(target, apply=True, emit=lambda line: print(line, file=sys.stderr, flush=True),
-                                 carrier=False)
-    except Exception as exc:  # noqa: BLE001 - the launch goes on; the pending state stays visible in `coord status`
-        return f"; the Read allow rule is still pending ({type(exc).__name__}: {str(exc)[:200]})"
-    if inst.coordinator_read_rule_pending(target):
-        return f"; the Read allow rule is still pending (run: levain update --path {shlex.quote(str(target))})"
+        inst.add_coordinator_read_rule(target)
+    except inst.InitError as exc:
+        emit(f"the Read allow rule is still missing from {target}'s project settings: {str(exc)[:300]}")
+        return
     emit(f"added the Read allow rule to {target}'s project settings")
-    return "; the Read allow rule was added"
 
 
 def setup_install(directory: Path, *, emit: Callable[[str], None] = print,
@@ -278,7 +278,7 @@ def setup_install(directory: Path, *, emit: Callable[[str], None] = print,
     live, detail = hook_live(target, user_scope=user_scope)
     if live:
         if inst.coordinator_read_rule_pending(target):
-            detail += _bring_read_rule(target, emit)
+            _bring_read_rule(target, emit)
         return target, True, detail
     if not inst._is_safe_install_target(target):
         return target, False, (f"{target} holds files and is not a Levain install with a live consent hook "

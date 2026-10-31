@@ -1223,15 +1223,20 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
         print(f"levain coord {cmd}: {exc}", file=sys.stderr)
         return 1
     lines = [_lease_line(st["lease"]), f"next drop: {st['wake']} ({st['why']})"]
-    st["install_upgrade_pending"] = False
+    st["install_upgrade_pending"], st["install_settings_problem"] = False, None
     if st.get("setting"):
         lines.append(user_layer_text(st["setting"]))
-        cwd = st["setting"].get("cwd")
-        if st["setting"].get("agent") == "claude" and cwd:
-            from levain.install import coordinator_read_rule_pending
+        if st["setting"].get("agent") == "claude":
+            from levain.coordinator.launch import default_coordinator_dir
+            from levain.install import coordinator_read_rule_state
 
-            if coordinator_read_rule_pending(Path(cwd)):
-                st["install_upgrade_pending"] = True
+            cwd = st["setting"].get("cwd") or str(default_coordinator_dir())
+            pending, problem = coordinator_read_rule_state(Path(cwd))
+            st["install_upgrade_pending"], st["install_settings_problem"] = pending, problem or None
+            if problem:
+                lines.append(f"coordinator install: settings unreadable ({problem}), so its Read allow rule cannot be "
+                             "added and a read outside its workspace waits on a prompt; fix that file by hand")
+            elif pending:
                 lines.append(f"coordinator install: upgrade pending (no Read allow rule, so a read outside its "
                              f"workspace waits on a prompt); run: levain update --path {shlex.quote(str(cwd))}")
     for ln in st["launches"]:
