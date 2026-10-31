@@ -109,8 +109,8 @@ def test_the_build_tab_zone_reads_only_while_build_is_shown_and_hides_without_a_
         out = _drive(tmp_path, base + "/", [
             {"until": "document.querySelector('.th-zone')"},
             {"eval": "document.querySelector('.th-zone').hidden"},                      # no token held: hidden
-            {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); location.reload(); 1"},
-            {"until": "document.querySelector('.th-zone') && document.querySelector('[data-mode-tab=board]')"},
+            {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__pre = 1; location.reload(); 1"},
+            {"until": "!window.__pre && document.querySelector('.th-zone') && document.querySelector('[data-mode-tab=board]')"},   # only the reloaded document lacks the sentinel
             {"eval": _COUNT},
             {"eval": "document.querySelector('[data-mode-tab=board]').click(); 1"},
             {"eval": _WAIT},                                                            # Board: no thread read
@@ -140,7 +140,7 @@ def test_a_token_changed_in_this_page_updates_the_zone_without_a_reload(tmp_path
             {"until": "document.querySelector('[data-mode-tab=board]')"},
             # the sentinel is set on the document that is about to go: only the reloaded one lacks it, so the next wait cannot be
             # satisfied by the old page
-            {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__pre = 1; location.reload(); 1", "may_error": True},   # the reload can destroy the context before the eval answers
+            {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__pre = 1; location.reload(); 1"},
             {"until": "!window.__pre && document.querySelector('.th-zone') && document.querySelector('[data-mode-tab=build]')"},
             {"eval": _COUNT},
             # the Build click is retried with its result: a click the page was not yet ready for opens nothing

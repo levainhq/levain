@@ -15,9 +15,12 @@
 //                                            the `until` form collects the condition's value, the `posts` form collects nothing.
 // An `eval` that throws (a null element, a syntax error, a rejected promise) FAILS the drive: stderr names the step and the error, and
 // the timeout-step-<n> files are saved as for a wait. A step that expects the error carries "may_error": true, and then the
-// error is collected as {"error": "..."} in place of a value.
+// error is collected as {"error": "..."} in place of a value. The one exception is a plain `eval` that navigates the page (a reload, a
+// location change): Chrome may answer it with a destroyed-context / navigated-or-closed error (NAVIGATION_ERRORS below), which is
+// collected as {"navigated": true} and does not fail the drive.
 // Every deadline here (`ms` of until / posts / act-until / shot, the 20000 default, the page-load gate) is multiplied by the
-// LEVAIN_TEST_WAIT_SCALE environment variable (a float, default 1; a value below 1 counts as 1), so a slow runner is one setting.
+// LEVAIN_TEST_WAIT_SCALE environment variable, so a slow runner is one setting. The whole string must be a finite decimal number
+// (tests/_waits.py parses it by the same pattern); it is clamped to [1, 20]; anything else (2junk, inf, nan, 1e9999) is 1.
 // The fixed settle sleeps (emulate / scheme / motion / key) are not scaled.
 // A failing wait also saves timeout-step-<n>.png (+ .txt, the page text) beside the steps file and names it on stderr.
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
@@ -45,7 +48,12 @@ const [chromePath, url, stepsPath] = process.argv.slice(2);
 const steps = JSON.parse(readFileSync(stepsPath, "utf8"));
 const media = {};   // the emulated media features set so far: each setEmulatedMedia call replaces the whole list
 // the one environment scale for every deadline (never below 1: a fast machine does not shorten what a test asked for)
-const WAIT_SCALE = Math.max(1, parseFloat(process.env.LEVAIN_TEST_WAIT_SCALE ?? "") || 1);
+const parseScale = (raw) => {
+  if (!/^[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(raw)) return 1;
+  const v = Number(raw);
+  return Number.isFinite(v) ? Math.min(Math.max(v, 1), 20) : 1;
+};
+const WAIT_SCALE = parseScale(process.env.LEVAIN_TEST_WAIT_SCALE ?? "");
 const scaled = (ms) => Math.round(ms * WAIT_SCALE);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
@@ -103,9 +111,14 @@ const sendWithin = (ms, method, params) => Promise.race([send(method, params), s
 const evaluateOutcome = async (expression, ms = 60000) => {
   const r = await sendWithin(ms, "Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
   if (r.timedOut) return { error: `no answer from the page within ${ms}ms` };
+  if (r.error) return { error: `CDP error ${r.error.code}: ${r.error.message}` };       // a top-level protocol error is never a value
   if (r.result?.exceptionDetails) return { error: r.result.exceptionDetails.text + " " + (r.result.exceptionDetails.exception?.description || "") };
-  return { value: r.result?.result?.value ?? null };
+  if (!r.result?.result) return { error: "malformed Runtime.evaluate answer: " + JSON.stringify(r).slice(0, 200) };
+  return { value: r.result.result.value ?? null };
 };
+// what Chrome says when a navigation takes the page out from under an evaluation (the context is gone / the target moved on)
+const NAVIGATION_ERRORS = ["Execution context was destroyed", "Inspected target navigated or closed", "Cannot find context with specified id"];
+const isNavigationError = (msg) => NAVIGATION_ERRORS.some((m) => String(msg).includes(m));
 const evaluate = async (expression) => {
   const o = await evaluateOutcome(expression);
   return "error" in o ? { error: o.error } : o.value;
@@ -184,17 +197,22 @@ for (const s of steps) {
     const every = s.every || 1500, n = steps.indexOf(s);
     const slice = () => Math.min(Math.max(deadline - Date.now(), 250), 3000);
     let v = null, lastError = null, lastDoError = null, nextDo = 0, ran = 0;
+    const check = async () => {
+      if (s.posts !== undefined) return posts.length >= s.posts;
+      const o = await evaluateOutcome(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`, slice());
+      if ("error" in o) { lastError = o.error; return null; }
+      return o.value;
+    };
     for (;;) {
       if (Date.now() >= nextDo) {
+        // the condition is re-checked right before every re-run: one that came true between polls must not get another action
+        if (ran > 0 && (v = await check())) break;
+        if (ran > 0 && Date.now() >= deadline) break;
         const a = await evaluateOutcome(s.do, slice());
         ran++; if ("error" in a) lastDoError = a.error;
         nextDo = Date.now() + every;
       }
-      if (s.posts !== undefined) v = posts.length >= s.posts;
-      else {
-        const o = await evaluateOutcome(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`, slice());
-        if ("error" in o) { lastError = o.error; v = null; } else v = o.value;
-      }
+      v = await check();
       if (v || Date.now() >= deadline) break;
       await sleep(100);
     }
@@ -234,6 +252,7 @@ for (const s of steps) {
     values.push(v || { timeout: s.until });
   } else {
     const o = await evaluateOutcome(s.eval);
+    if ("error" in o && isNavigationError(o.error)) { values.push({ navigated: true }); continue; }   // the eval navigated the page
     if ("error" in o && !s.may_error) {
       console.error(`step ${steps.indexOf(s)}: eval failed: ${o.error}: ${s.eval}`);
       await shotOnTimeout(steps.indexOf(s));

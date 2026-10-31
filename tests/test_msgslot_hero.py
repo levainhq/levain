@@ -56,6 +56,8 @@ def _send(*, posts: int | None = None, until: str | None = None, ms: int = 15000
     button or the box between the readiness check and the click) is done again after `every` ms. A repeat click is safe because
     it only clicks while the words are still in the box: unsent, or sent and unanswered, when the page reuses the same outbox
     id. Once the reply lands the box is empty and the repeat does nothing. The words are typed once, before, by `_sent`."""
+    if posts is None and until is None:
+        raise ValueError("_send needs the effect to wait for: posts= or until=")
     return {"do": CLICK_SEND_JS, "ms": ms, "every": every, **({"posts": posts} if posts is not None else {"until": until})}
 
 

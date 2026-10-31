@@ -135,7 +135,7 @@ def test_a_tab_switch_to_memory_drops_replay_and_the_topology_polls_again(tmp_pa
     # the tab switch starts a live read of its own; a refetch that lands while that one is out settles "superseded" by design, so the
     # test's refetch asks again until a read settles it (at most 5 times) and the assertion is on that settled answer
     refetch = ("(async () => { let r; for (let i = 0; i < 5; i++) { r = String(await window.LevainCockpitView.refetchPanel('topology')); "
-               "if (r !== 'superseded') break; } return r; })()")
+               "if (r !== 'superseded') break; await new Promise(res => setTimeout(res, 200)); } return r; })()")   # let the in-flight live read settle
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": SPY}, {"eval": _scrub(0.4)}, WAIT_BADGE, {"eval": "(window.__urls = [], 1)"},
                                {"eval": "document.querySelector('[data-mode-tab=memory]').click(); 1"},
                                {"until": "!window.LevainTopologyView.replaying() && !window.LevainTopologyView.paused()"}, {"eval": INFO}, {"eval": refetch}, {"eval": INFO},
@@ -407,6 +407,7 @@ def test_the_live_retry_after_a_failure_issues_a_new_read_and_never_shows_the_un
 def test_a_lens_switch_keeps_the_labelled_frame_until_the_live_read_applies(tmp_path, monkeypatch):
     out = _host_run(tmp_path, monkeypatch, [{"eval": H_SCRUB}, H_PAUSED, {"eval": "window.__mode = 'hang'; 1"},
                                             {"eval": "document.querySelector('#h6 [data-tv=work]').click(); 1"},
+                                            # `=== 1` is deliberate: the test asserts exactly one resume (mid["resumes"] == 1) below
                                             # the precondition: the host card is in replay, badged (waited for on that state, not a fixed sleep)
                                             {"until": "window.LevainTopologyView.replaying() && window.__resumes === 1 && !!document.querySelector('#h6 .tv-rbadge')"}, {"eval": H_INFO},
                                             {"eval": "window.__mode = 'applied'; 1"}, {"eval": H_LIVE},
