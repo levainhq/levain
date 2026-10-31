@@ -588,18 +588,8 @@ def _stop_episode(store: CoordStore) -> str | None:
     from levain.autonomic.durable_sqlite import read_transaction
 
     with read_transaction(store.open_readonly) as conn:
-        looked = lease_mod._looked(conn)
-        first = None
-        # newest end first; the run ends at the first launch that did not die, and one nobody tried to start is skipped
-        for (launch_id,) in conn.execute(
-                "SELECT l.launch_id FROM launches l WHERE l.role = 'coordinator' AND l.gseq > ? ORDER BY "
-                "(SELECT MAX(e.gseq) FROM launch_events e WHERE e.launch_id = l.launch_id) DESC", (looked,)).fetchall():
-            death = lease_mod.launch_death(conn, lease_mod._launch_row(conn, "launch_id", launch_id))
-            if death is False:
-                break
-            if death:
-                first = launch_id
-        return first
+        run = lease_mod.death_run(conn)         # newest end first: the first death of the run is the last
+        return run[-1][0] if run else None
 
 
 def _note_stopped(store: CoordStore) -> None:

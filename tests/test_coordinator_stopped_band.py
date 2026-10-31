@@ -258,3 +258,21 @@ def test_a_single_option_is_a_system_sources_alone_and_answers_share_one_write(q
     assert qs.get(q.id).answer is None
     (done,) = qs.close_open("k", text="closed", channel="cockpit")
     assert qs.get(done.id).answer.value == "closed" and qs.close_open("k", text="again", channel="cockpit") == []
+
+
+def test_the_stop_episode_and_the_wake_backoff_read_one_walk_of_the_deaths(store, qdir, fake, live_hook, clock):
+    _stopped(store, fake, clock, qdir)
+
+    def walked():
+        c = store.open_readonly()
+        try:
+            return lease.death_run(c), lease._deaths(c)[0]
+        finally:
+            c.close()
+
+    run, count = walked()
+    assert count == len(run) == lease.MAX_DEATHS
+    assert cl._stop_episode(store) == run[-1][0] == _first_death(store)      # the oldest of the counted deaths
+    store.coord_release()                                     # a clean release ends the run: both see nothing
+    run, count = walked()
+    assert (run, count) == ([], 0) and cl._stop_episode(store) is None
