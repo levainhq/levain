@@ -1,29 +1,60 @@
 """levain.agents.cli — ``levain agents``: the seam (A0 r6 §3.7). It opens the agent store through
 :func:`levain.agents.store.open_agent_store` and says whether the agent schema is the one this levain writes. The
-verbs of §3.6 arrive with their slices; none exists here.
+verbs of §3.6 arrive with their slices; so far ``role add`` and ``role show`` (the RoleSpec registry, P1) exist.
 
-Exit 0: the agent schema is this levain's. Exit 1: refused, the reason on stderr.
+Exit 0: done (bare ``agents``: the agent schema is this levain's). Exit 1: refused, the reason on stderr.
+``--store-dir`` belongs to ``agents`` and goes before ``role``.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
 
+from levain.agents.role import MAX_VERSION, RoleError, add_role, get_role, latest_version, parse_role_text
 from levain.agents.store import AgentStoreRefused, open_agent_store
 from levain.autonomic.agent_tables import AGENT_SCHEMA
 from levain.autonomic.db import StoreFormatError
 
 
+def _version_arg(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text[:40]!r} is not an integer") from None
+    if not 1 <= value <= MAX_VERSION:
+        raise argparse.ArgumentTypeError(f"a version is an integer from 1 to {MAX_VERSION}")
+    return value
+
+
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
-        "agents", help="Named agents on the autonomic store (the store check).", allow_abbrev=False,
+        "agents", help="Named agents on the autonomic store (the store check; `role add|show`).",
+        allow_abbrev=False,
         description="Open the autonomic store's agent tables and check them against this levain's schema. "
-                    "Refuses a /3 store, and a store whose agent tables are not the ones this levain writes.")
+                    "Refuses a /3 store, and a store whose agent tables are not the ones this levain writes. "
+                    "Verbs: `role add|show` (the role registry). Give --store-dir before `role`.")
     p.add_argument("--store-dir", dest="store_dir", type=Path, default=None,
                    help="The autonomic store directory (default: $LEVAIN_HOME/autonomic).")
     p.set_defaults(func=run_agents)
+    verbs = p.add_subparsers(dest="agents_verb", metavar="VERB")
+    role = verbs.add_parser("role", help="The role registry (P1): add, show.", allow_abbrev=False,
+                            description="Roles are content-hashed and versioned. Give --store-dir before `role`.")
+    rverbs = role.add_subparsers(dest="role_verb", metavar="VERB", required=True)
+    add = rverbs.add_parser("add", help="Register a role from a JSON file; unknown fields are refused.",
+                            allow_abbrev=False,
+                            description="Register a role from a JSON file. --store-dir goes before `role`: "
+                                        "levain agents --store-dir DIR role add FILE.")
+    add.add_argument("file", type=Path, help="The role file (JSON).")
+    add.set_defaults(func=run_role_add)
+    show = rverbs.add_parser("show", help="Print a role, its version and its role_hash.", allow_abbrev=False,
+                             description="Print a role, its version and its role_hash. --store-dir goes before "
+                                         "`role`: levain agents --store-dir DIR role show NAME.")
+    show.add_argument("name", help="The role name.")
+    show.add_argument("--version", type=_version_arg, default=None, help="A version (default: the latest).")
+    show.set_defaults(func=run_role_show)
 
 
 def run_agents(args: argparse.Namespace) -> int:
@@ -36,4 +67,70 @@ def run_agents(args: argparse.Namespace) -> int:
         print(f"levain agents: cannot open the autonomic store: {exc}", file=sys.stderr)
         return 1
     print(f"agent schema {AGENT_SCHEMA}: ok ({store.path})")
+    return 0
+
+
+def _open(args: argparse.Namespace):
+    try:
+        return open_agent_store(args.store_dir)
+    except AgentStoreRefused as exc:
+        print(f"levain agents: {exc}", file=sys.stderr)
+    except (StoreFormatError, sqlite3.Error, OSError) as exc:
+        print(f"levain agents: cannot open the autonomic store: {exc}", file=sys.stderr)
+    return None
+
+
+def run_role_add(args: argparse.Namespace) -> int:
+    try:
+        role = parse_role_text(args.file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"levain agents role add: cannot read {args.file}: {exc}", file=sys.stderr)
+        return 1
+    except RoleError as exc:
+        print(f"levain agents role add: {args.file}: {exc}", file=sys.stderr)
+        return 1
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        name, digest, version, created = add_role(store, role)
+    except RoleError as exc:
+        print(f"levain agents role add: {exc}", file=sys.stderr)
+        return 1
+    except (sqlite3.Error, StoreFormatError) as exc:
+        print(f"levain agents role add: the store refused it: {exc}", file=sys.stderr)
+        return 1
+    if created:
+        print(f"role {name} v{version} added: {digest}")
+        return 0
+    try:
+        latest = latest_version(store, name)
+    except (RoleError, sqlite3.Error, StoreFormatError):
+        latest = version
+    if latest is not None and latest != version:
+        print(f"role {name} v{version} already registered: {digest}; v{version} is registered but the latest is "
+              f"v{latest}, and role show serves v{latest}")
+    else:
+        print(f"role {name} v{version} already registered: {digest}")
+    return 0
+
+
+def run_role_show(args: argparse.Namespace) -> int:
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        digest, version, role = get_role(store, args.name, args.version)
+    except RoleError as exc:
+        print(f"levain agents role show: {exc}", file=sys.stderr)
+        return 1
+    except (sqlite3.Error, StoreFormatError) as exc:
+        print(f"levain agents role show: the store refused it: {exc}", file=sys.stderr)
+        return 1
+    try:  # one write of the whole text, so a stdout that cannot encode it prints nothing
+        print(f"role {args.name} v{version} {digest}\n" + json.dumps(role, indent=2, sort_keys=True, ensure_ascii=False))
+    except UnicodeEncodeError as exc:
+        print(f"levain agents role show: stdout cannot encode the role ({exc.encoding}); "
+              f"set PYTHONIOENCODING=utf-8", file=sys.stderr)
+        return 1
     return 0

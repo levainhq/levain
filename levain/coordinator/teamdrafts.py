@@ -30,7 +30,7 @@ import secrets
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from levain.coordinator.store import ACTORS, CoordError, CoordStore, _append_only, _in
+from levain.coordinator.store import ACTORS, CoordError, CoordStore, _append_only, _in, next_gseq
 
 __all__ = ["DRAFT_SCHEMA", "DRAFT_TYPES", "add_draft", "draft_agent", "get_draft", "list_drafts", "mark_promoted",
            "promoter", "release_promotion", "reserve_promotion", "withdraw_draft"]
@@ -139,10 +139,12 @@ def add_draft(store: CoordStore, type_: str, *, words: str | None = None, kind: 
     _promotable(entry, draft_id)
     body = json.dumps(entry, sort_keys=True, ensure_ascii=False)
     with store._write(by, token if by == "coordinator" else None) as (conn, now):
-        conn.execute("INSERT INTO team_drafts (draft_id, type, body, body_sha256, thread_id, at) VALUES (?,?,?,?,?,?)",
-                     (draft_id, type_, body, hashlib.sha256(body.encode()).hexdigest(), thread_id, now))
-        conn.execute("INSERT INTO team_draft_events (draft_id, seq, event, ledger_id, by, at) "
-                     "VALUES (?,1,'drafted',NULL,?,?)", (draft_id, by, now))
+        conn.execute("INSERT INTO team_drafts (draft_id, type, body, body_sha256, thread_id, at, gseq) "
+                     "VALUES (?,?,?,?,?,?,?)",
+                     (draft_id, type_, body, hashlib.sha256(body.encode()).hexdigest(), thread_id, now,
+                      next_gseq(conn, now)))
+        conn.execute("INSERT INTO team_draft_events (draft_id, seq, event, ledger_id, by, at, gseq) "
+                     "VALUES (?,1,'drafted',NULL,?,?,?)", (draft_id, by, now, next_gseq(conn, now)))
         return _view(conn, draft_id)  # type: ignore[return-value]
 
 
@@ -168,10 +170,10 @@ def list_drafts(store: CoordStore, *, state: str | Sequence[str] | None = "draft
 
 def _next_event(conn, draft_id: str, event: str, ledger_id: str | None, by: str, now: str,
                 owner: dict[str, Any] | None = None) -> None:
-    conn.execute("INSERT INTO team_draft_events (draft_id, seq, event, ledger_id, by, at, owner) VALUES "
-                 "(?, (SELECT MAX(seq) FROM team_draft_events WHERE draft_id = ?) + 1, ?, ?, ?, ?, ?)",
+    conn.execute("INSERT INTO team_draft_events (draft_id, seq, event, ledger_id, by, at, owner, gseq) VALUES "
+                 "(?, (SELECT MAX(seq) FROM team_draft_events WHERE draft_id = ?) + 1, ?, ?, ?, ?, ?, ?)",
                  (draft_id, draft_id, event, ledger_id, by, now,
-                  json.dumps(owner, sort_keys=True) if owner is not None else None))
+                  json.dumps(owner, sort_keys=True) if owner is not None else None, next_gseq(conn, now)))
 
 
 def _current(conn, draft_id: str) -> dict[str, Any]:

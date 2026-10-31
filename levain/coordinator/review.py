@@ -39,7 +39,7 @@ from typing import Any
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
-from levain.coordinator.store import ACTORS, CoordError, CoordStore, _append_only, _in
+from levain.coordinator.store import ACTORS, CoordError, CoordStore, _append_only, _in, next_gseq
 
 __all__ = ["FEEDS", "FEED_LABELS", "MODES", "NEAR_STOP", "NO_SPLIT_AFTER", "REVIEW_SCHEMA", "SIGNED", "SIGN_REQUEST_TTL",
            "SIGN_TIER", "CoordNotFound", "Item", "SignedClearRefused", "body_fields", "clear_item", "clear_message",
@@ -212,9 +212,9 @@ def _insert(conn: sqlite3.Connection, now: str, feed: str, body: Mapping[str, An
                                               (thread_id,)).fetchone() is None:
         raise CoordError(f"no thread {str(thread_id)[:40]}")
     item_id = "rv-" + secrets.token_hex(16)
-    conn.execute("INSERT INTO review_items (item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at) "
-                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                 (item_id, thread_id, feed, key, text, int(authority_relevant), by, now))
+    conn.execute("INSERT INTO review_items (item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at, gseq) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (item_id, thread_id, feed, key, text, int(authority_relevant), by, now, next_gseq(conn, now)))
     row = conn.execute(f"SELECT {_COLS} FROM review_items WHERE item_id = ?", (item_id,)).fetchone()
     return _item(conn, row), True
 
@@ -336,8 +336,8 @@ def _review(store: CoordStore, item_id: str, op: str, mode: str, token: object, 
                              "the coordinator reviewing itself")
         seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM review_events WHERE item_id = ?",
                            (item_id,)).fetchone()[0]
-        conn.execute("INSERT INTO review_events (item_id, seq, op, mode, by, at) VALUES (?, ?, ?, ?, ?, ?)",
-                     (item_id, seq, op, mode, by, now))
+        conn.execute("INSERT INTO review_events (item_id, seq, op, mode, by, at, gseq) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (item_id, seq, op, mode, by, now, next_gseq(conn, now)))
         return _item(conn, row)      # read after the insert: the state it now has
 
 
@@ -497,8 +497,9 @@ def clear_signed(store: CoordStore, item_id: str, *, queue_dir: Path, request_id
         seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM review_events WHERE item_id = ?",
                            (str(item_id),)).fetchone()[0]
         try:
-            conn.execute("INSERT INTO review_events (item_id, seq, op, mode, by, at, sign_request_id) "
-                         "VALUES (?, ?, 'cleared', ?, 'operator', ?, ?)", (str(item_id), seq, SIGNED, now, rid))
+            conn.execute("INSERT INTO review_events (item_id, seq, op, mode, by, at, sign_request_id, gseq) "
+                         "VALUES (?, ?, 'cleared', ?, 'operator', ?, ?, ?)",
+                         (str(item_id), seq, SIGNED, now, rid, next_gseq(conn, now)))
         except sqlite3.IntegrityError as exc:
             # only the unique index on the signature is a replay; any other integrity fault stays a store fault
             if "review_events.sign_request_id" not in str(exc):
@@ -628,10 +629,11 @@ def file_know(store: CoordStore, thread_id: str | None, text: str, *, by: str = 
             raise CoordError(f"no thread {str(thread_id)[:40]}")
         reply_id = store._reply(conn, thread_id, "know", "review", "", {**body, "by": by}, now)
         item_id = "rv-" + secrets.token_hex(16)
-        conn.execute("INSERT INTO review_items (item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at) "
-                     "VALUES (?, ?, 'know', ?, ?, ?, ?, ?)", (item_id, thread_id, "know:" + reply_id,
-                                                              canonical({**body, "reply_id": reply_id}),
-                                                              int(authority_relevant), by, now))
+        conn.execute("INSERT INTO review_items (item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at, "
+                     "gseq) VALUES (?, ?, 'know', ?, ?, ?, ?, ?, ?)", (item_id, thread_id, "know:" + reply_id,
+                                                                       canonical({**body, "reply_id": reply_id}),
+                                                                       int(authority_relevant), by, now,
+                                                                       next_gseq(conn, now)))
         row = conn.execute(f"SELECT {_COLS} FROM review_items WHERE item_id = ?", (item_id,)).fetchone()
         return _item(conn, row), reply_id
 
