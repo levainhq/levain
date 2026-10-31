@@ -34,7 +34,7 @@ from levain.agents.store import AgentStore
 from levain.authority import _canonical
 
 __all__ = ["RoleError", "ROLE_FIELDS", "ROLE_NAME", "parse_role", "parse_role_text", "canonical_role", "role_hash",
-           "instance_ceiling", "spawn_namespace", "add_role", "get_role"]
+           "instance_ceiling", "spawn_namespace", "add_role", "get_role", "latest_version"]
 
 ROLE_HASH_PREFIX = b"levain-rolespec/1\n"
 ROLE_NAME = re.compile(r"[a-z][a-z0-9-]{0,47}")
@@ -65,6 +65,10 @@ def _exact(obj: Any, allowed: tuple[str, ...], where: str, *, required: bool = T
 def _str(value: Any, where: str) -> str:
     if not isinstance(value, str):
         raise RoleError(f"{where} must be a string, not {type(value).__name__}")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise RoleError(f"{where} holds a lone surrogate, which is not valid text") from None
     return value
 
 
@@ -86,9 +90,14 @@ def _brief(value: Any) -> dict[str, Any]:
         if kind not in SLOT_TYPES:
             raise RoleError(f"brief.slots.{slot}: type {kind!r} is not one of {', '.join(SLOT_TYPES)}")
     try:
-        used = {f for _, f, _, _ in string.Formatter().parse(template) if f is not None}
+        parsed = list(string.Formatter().parse(template))
     except ValueError as exc:
         raise RoleError(f"brief.template is not a valid template: {exc}") from None
+    for _, field, spec, _ in parsed:
+        if field is not None and spec and "{" in spec:
+            raise RoleError(f"brief.template: placeholder {field!r} has a nested placeholder in its format spec "
+                            f"{spec!r}; nested placeholders are not allowed")
+    used = {f for _, f, _, _ in parsed if f is not None}
     if used - set(slots):
         raise RoleError(f"brief.template uses undeclared slot {sorted(used - set(slots))[0]!r}")
     if set(slots) - used:
@@ -151,8 +160,12 @@ def parse_role_text(text: str) -> dict[str, Any]:
     """Parse a role file's JSON text (duplicate keys and floats refused) and validate it."""
     try:
         obj = json.loads(text, object_pairs_hook=_pairs, parse_float=_no_floats, parse_constant=_no_floats)
+    except RoleError:
+        raise
     except json.JSONDecodeError as exc:
         raise RoleError(f"not valid JSON: {exc}") from None
+    except (ValueError, RecursionError) as exc:  # an over-long integer, a nesting too deep to read
+        raise RoleError(f"not readable as a role: {type(exc).__name__}: {str(exc)[:100]}") from None
     return parse_role(obj)
 
 
@@ -182,7 +195,7 @@ def add_role(store: AgentStore, role: dict[str, Any]) -> tuple[str, str, int, bo
     returned as it is (``created`` False); new content under a known name takes the next version."""
     role = parse_role(role)
     text = _canonical(role)
-    digest = hashlib.sha256(ROLE_HASH_PREFIX + text.encode("utf-8")).hexdigest()
+    digest = role_hash(role)
     with store.write() as conn:
         row = conn.execute("SELECT name, version FROM agent_roles WHERE role_hash = ?", (digest,)).fetchone()
         if row is not None:
@@ -211,4 +224,12 @@ def get_role(store: AgentStore, name: str, version: int | None = None) -> tuple[
     role = parse_role_text(text)
     if role_hash(role) != digest or _canonical(role) != text:
         raise RoleError(f"role {name!r} v{ver}: the stored text does not hash to its role_hash")
+    if role["name"] != name:
+        raise RoleError(f"role {name!r} v{ver}: the stored text names {role['name']!r}, not {name!r}")
     return digest, ver, role
+
+
+def latest_version(store: AgentStore, name: str) -> int | None:
+    """The newest registered version of ``name``, or None when the name is unknown."""
+    with store.read() as conn:
+        return conn.execute("SELECT MAX(version) FROM agent_roles WHERE name = ?", (name,)).fetchone()[0]

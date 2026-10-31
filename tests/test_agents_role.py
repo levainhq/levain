@@ -54,6 +54,12 @@ def test_add_show_roundtrip_and_versions(tmp_path, capsys):
 def test_hash_matches_a0_formula_and_is_order_stable():
     expect = hashlib.sha256(b"levain-rolespec/1\n" + _canonical(ROLE).encode()).hexdigest()
     assert role_hash(ROLE) == expect
+
+    # a literal, computed independently from A0 §3.1 (sha256 of the prefix + the canonical JSON), not by the code
+    literal = ('{"brief":{"slots":{"topic":"str"},"template":"Write about {topic}"},"ceiling":{"pushes":["origin"],'
+               '"where":[{"paths":["a/"],"repo":"r"}]},"executor":"session","harness":"claude","model":"m",'
+               '"name":"scribe"}')
+    assert role_hash(json.loads(literal)) == "a0e4c6e91646508d12d070fc16baeb9d33601fa0c9bcb1c46a46d906407504b1"
     shuffled = json.loads(json.dumps(dict(reversed(list(ROLE.items())))))
     shuffled["brief"] = dict(reversed(list(shuffled["brief"].items())))
     assert list(shuffled) != list(ROLE)
@@ -125,3 +131,76 @@ def test_stored_text_is_rehashed(tmp_path):
         conn.execute("UPDATE agent_roles SET spec = ?", (_canonical(dict(ROLE, model="swapped")),))
     with pytest.raises(RoleError, match="does not hash"):
         get_role(store, "scribe")
+
+
+def test_nested_placeholder_in_a_format_spec_is_refused():
+    r = copy.deepcopy(ROLE)
+    r["brief"]["template"] = "Write {topic:{width}}"
+    with pytest.raises(RoleError, match=r"'topic'.*nested placeholders are not allowed"):
+        parse_role(r)
+    r["brief"]["slots"]["width"] = "int"  # declaring the inner name does not make it legal
+    with pytest.raises(RoleError, match="nested placeholders are not allowed"):
+        parse_role(r)
+    r["brief"]["template"] = "Write {topic:>10} {{literal}}"  # a plain spec stays legal
+    r["brief"]["slots"].pop("width")
+    assert parse_role(r)["brief"]["template"].startswith("Write {topic:>10}")
+
+
+def test_lone_surrogate_and_huge_integer_are_refusals_not_tracebacks(tmp_path, capsys):
+    text = json.dumps(ROLE).replace('"m"', '"\\ud800"')
+    with pytest.raises(RoleError, match="lone surrogate"):
+        parse_role_text(text)
+    with pytest.raises(RoleError, match="lone surrogate"):
+        parse_role(dict(ROLE, model="\ud800"))
+    with pytest.raises(RoleError, match="not readable"):
+        parse_role_text('{"name":' + "9" * 5000 + "}")
+    store = open_agent_store(tmp_path / "store")
+    with pytest.raises(RoleError):
+        add_role(store, dict(ROLE, model="\ud800"))
+    for body in (text, '{"name":' + "9" * 5000 + "}"):
+        f = tmp_path / "bad.json"
+        f.write_text(body)
+        assert _run(tmp_path, "role", "add", str(f)) == 1
+        assert "levain agents role add" in capsys.readouterr().err
+    with pytest.raises(RoleError, match="no role named"):  # nothing was written
+        get_role(store, "scribe")
+
+
+def test_re_adding_older_content_says_it_is_not_the_latest(tmp_path, capsys):
+    v1, v2 = _file(tmp_path, ROLE, "v1.json"), _file(tmp_path, dict(ROLE, model="other"), "v2.json")
+    assert _run(tmp_path, "role", "add", str(v1)) == 0
+    assert _run(tmp_path, "role", "add", str(v2)) == 0
+    capsys.readouterr()
+    assert _run(tmp_path, "role", "add", str(v1)) == 0
+    out = capsys.readouterr().out
+    assert "v1 is registered but the latest is v2" in out and "role show serves v2" in out
+    assert _run(tmp_path, "role", "add", str(v2)) == 0  # the latest: the plain line
+    out = capsys.readouterr().out
+    assert "already registered" in out and "latest is" not in out
+
+
+def test_role_name_column_must_match_the_hashed_text(tmp_path):
+    store = open_agent_store(tmp_path / "store")
+    add_role(store, ROLE)
+    with store.write() as conn:
+        conn.execute("UPDATE agent_roles SET name = 'impostor'")
+    with pytest.raises(RoleError, match="names 'scribe', not 'impostor'"):
+        get_role(store, "impostor")
+
+
+def test_cli_store_errors_are_one_line_refusals(tmp_path, capsys, monkeypatch):
+    f = _file(tmp_path, ROLE)
+    assert _run(tmp_path, "role", "add", str(f)) == 0
+    capsys.readouterr()
+    from levain.autonomic.db import StoreFormatError
+    import sqlite3
+
+    for exc in (StoreFormatError("bad store"), sqlite3.OperationalError("disk I/O error")):
+        def boom(*a, **k):
+            raise exc
+        monkeypatch.setattr(agents_cli, "get_role", boom)
+        monkeypatch.setattr(agents_cli, "add_role", boom)
+        assert _run(tmp_path, "role", "show", "scribe") == 1
+        assert _run(tmp_path, "role", "add", str(f)) == 1
+        err = capsys.readouterr().err
+        assert err.count("the store refused it") == 2 and "Traceback" not in err
