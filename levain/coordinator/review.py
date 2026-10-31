@@ -639,17 +639,33 @@ def file_know(store: CoordStore, thread_id: str | None, text: str, *, by: str = 
 
 
 # --- waiting on you (derived, never stored; C0 §2) ---------------------------------------------------------------
+def require_aware_now(now: object, entry: str = "card") -> None:
+    """The one check every public entry that takes ``now=`` runs BEFORE any read: a non-None ``now`` must be an aware
+    datetime, else :class:`CoordError` (a naive one would reach an aware-vs-naive comparison later and be swallowed
+    per record into a quietly partial result)."""
+    offset = getattr(now, "utcoffset", None)      # duck-typed: a datetime (or a subclass of one), nothing else has it
+    if now is not None and (not callable(offset) or getattr(now, "tzinfo", None) is None or offset() is None):
+        raise CoordError(f"{entry}(now=) must be an aware datetime")
+
+
 def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] | None = None,
-                       conn: sqlite3.Connection | None = None) -> Callable[[str], bool | None]:
+                       conn: sqlite3.Connection | None = None,
+                       now: datetime | None = None) -> Callable[[str], bool | None]:
     """A request id -> open? read from ``queue.db`` with ``mode=ro``: open while ``undecided`` or ``pending`` and not past
     the queue's own expiry rule (:meth:`ConsentQueue._expiry_due`, the one the queue's read and sweep use: a hold's end
     plus ``UNDECIDED_GRACE``), closed in any other state, ``None`` when the store or the row cannot be read. A raw read:
     this is information, and the seal on a row is the queue's own business. ``conn``: a read-only connection to
-    ``queue.db`` the caller holds (one snapshot for every request, its busy wait the caller's), else one per call."""
+    ``queue.db`` the caller holds (one snapshot for every request, its busy wait the caller's), else one per call.
+    ``now`` (an aware datetime; default ``None`` = the wall clock, or ``clock`` when given): the instant the expiry
+    rule is judged at, in place of any clock read (it wins over ``clock``)."""
     from levain.consent.queue import ConsentQueue
 
+    require_aware_now(now, "queue_request_open")   # before any read: a naive now is refused here, not at the read
     path = Path(queue_dir) / "queue.db"
-    now = clock if clock is not None else (lambda: datetime.now(timezone.utc))
+    if now is not None:
+        fixed = now
+        clock = lambda: fixed  # noqa: E731
+    read_now = clock if clock is not None else (lambda: datetime.now(timezone.utc))
 
     def read(request_id: str) -> bool | None:
         try:
@@ -666,7 +682,7 @@ def queue_request_open(queue_dir: Path | str, *, clock: Callable[[], datetime] |
                 c.close()
         if row is None:
             return None
-        if row[0] == "pending" and ConsentQueue._expiry_due(row[1], utc_stamp(now())):
+        if row[0] == "pending" and ConsentQueue._expiry_due(row[1], utc_stamp(read_now())):
             return False
         return row[0] in ("pending", "undecided")
     return read
@@ -690,19 +706,23 @@ def question_open(queue_dir: Path | str, *, conn: sqlite3.Connection | None = No
 
 
 def waiting_on_you(store: CoordStore, *, sign_open: Callable[[str], bool | None],
-                   answer_open: Callable[[str], bool | None], conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+                   answer_open: Callable[[str], bool | None], conn: sqlite3.Connection | None = None,
+                   now: datetime | None = None) -> dict[str, Any]:
     """What waits on you, derived from the open SIGN and ANSWER records: ``{"threads": {thread_id: [records]},
     "loose": [records with no thread], "unresolved": [records whose state could not be read]}``. A record is
     ``{"kind", "ref_id", "reply_id", "text"}``; a record whose stored body is not readable JSON is ``unresolved`` with
     ``unreadable`` saying so, and the others are read as ever. A thread with no open record is absent. ``conn`` is the read
-    transaction a caller already holds."""
+    transaction a caller already holds. ``now`` (an aware datetime; default ``None`` = the store's clock): the instant a
+    budget-extension SIGN's expiry is judged at, so the answer is a function of the stores and ``now``."""
     from levain.coordinator import budget
+
+    require_aware_now(now, "waiting_on_you")
 
     def read(c: sqlite3.Connection) -> tuple[list[Any], dict[str, Any]]:
         got = c.execute("SELECT reply_id, thread_id, kind, ref_id, body, ref_store FROM replies WHERE kind IN "
                         "('sign', 'answer') ORDER BY rowid").fetchall()
         # a SIGN to extend a thread's budget (C6) points into this store, not queue.db: read here, in this transaction
-        at = store._stamp()
+        at = store._stamp() if now is None else utc_stamp(now)
         return got, {r[3]: budget.sign_open(c, r[3], at) for r in got if r[5] == budget.SIGN_REF}
 
     if conn is not None:

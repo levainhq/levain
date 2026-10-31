@@ -48,11 +48,13 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
 from levain.band_shorthand import ItemInfo, Parse, Refusal, View, parse
 from levain.band_sources import Extra, Extras, NotOffered, read_extras, sheet_text
+from levain.coordinator.review import require_aware_now
 from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.questions import (HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select, open_ended_of,
                                      read_deadline)
@@ -188,7 +190,7 @@ def _busy(exc: sqlite3.OperationalError) -> bool:
     return code is not None and (code & 0xFF) in (5, 6)
 
 
-def _number(store: QuestionStore, refs: list[Any], deadline: float) -> dict[Any, int]:
+def _number(store: QuestionStore, refs: list[Any], deadline: float, now: datetime | None = None) -> dict[Any, int]:
     """Number every ``refs`` that has no number yet (in the order given), in ONE write transaction waited for until
     ``deadline``. A ref is a question id, or ``(source, ref)`` for another source; the result is keyed as given. The numbers come back read under the lock, so two writers never number a ref twice. The lock still
     busy at the deadline: nothing written, nothing returned (``new (number pending)``); any other error is raised."""
@@ -198,7 +200,7 @@ def _number(store: QuestionStore, refs: list[Any], deadline: float) -> dict[Any,
         with store._write_by(deadline) as conn:
             for stmt in BAND_SCHEMA:
                 conn.execute(stmt)
-            stamp = utc_stamp(_now_utc(store._clock))
+            stamp = utc_stamp(now if now is not None else _now_utc(store._clock))   # ``now`` given: no clock is read
             got: dict[Any, int] = {}
             for key in refs:
                 source, ref = key if isinstance(key, tuple) else ("question", key)
@@ -289,26 +291,32 @@ def _extra_lines(label: str, e: Extra, compact: bool) -> list[str]:
 
 
 def render_full(store: QuestionStore | None = None, *, deadline: float | None = None,
-                coord_conn: sqlite3.Connection | None = None) -> Rendered:
+                coord_conn: sqlite3.Connection | None = None, numbering: bool = True,
+                now: datetime | None = None) -> Rendered:
     """:func:`render_with_closed` plus what the view row needs (:class:`Rendered`). ``deadline``
     (``time.monotonic()``; default now + HOOK_BUSY_MS) bounds EVERY wait of the render: the question snapshots, the
     authority sources' stores and a first-time setup of the question store; a store held past it is said ("! not
     read") or leaves numbers pending, never a stalled prompt. ``coord_conn``: a coordinator snapshot the caller holds
-    (the morning card's), read instead of a second one."""
+    (the morning card's), read instead of a second one. ``numbering=False``: a pure read: an item with no number yet is
+    listed ``new (number pending):`` and nothing is written (the default numbers it, one bounded write). ``now`` (an
+    aware datetime; default ``None`` = the wall clock): every expiry of the authority sources is judged at it and none
+    of their clocks is read (only ``Rendered.gen`` still reads ``time.time_ns()``, which is not part of the text)."""
+    require_aware_now(now, "render_full")        # before any read
     store = store if store is not None else QuestionStore()
     gen = time.time_ns()                      # before the snapshot: a later render has a greater gen
     deadline = deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000
     with read_deadline(deadline):
-        return _render_full(store, gen, deadline, coord_conn)
+        return _render_full(store, gen, deadline, coord_conn, numbering, now)
 
 
-def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sqlite3.Connection | None) -> Rendered:
+def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sqlite3.Connection | None,
+                 numbering: bool = True, now: datetime | None = None) -> Rendered:
     items, numbers, closed = _read(store)
     foreign = _foreign(store)
     try:
         # a foreign store has no directory of levain's own: no authority sources are read from it, none are claimed
         extras = Extras() if foreign else read_extras(store.directory, store._clock, deadline=deadline,
-                                                      coord_conn=coord_conn)
+                                                      coord_conn=coord_conn, now=now)
     except Exception as exc:  # noqa: BLE001 - the questions still render; the band says the sources were not read
         extras = Extras(failed=[f"authority sources: {type(exc).__name__}"])
     extra_numbers, extra_closed = _extra_state(store, extras) if extras.items or extras.complete else ({}, [])
@@ -325,8 +333,8 @@ def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sq
         filed[e.band_key] = e.filed
     new = [k for k, _ in entries if (numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)) is None]
     new.sort(key=lambda k: filed.get(k, ""))              # each source's own filed time; a stable sort keeps ties
-    if new:
-        got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline)
+    if new and numbering:
+        got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline, now)
         numbers = {**numbers, **{k: v for k, v in got.items() if isinstance(k, str)}}
         extra_numbers = {**extra_numbers, **{k: v for k, v in got.items() if isinstance(k, tuple)}}
 
@@ -893,7 +901,8 @@ def _finish(entries: list[tuple[dict[str, str], dict[str, Any]]], *, unread: boo
                         read_only)
 
 
-def _snapshot(store: Any, *, writable: bool, deadline: float | None = None) -> BandSnapshot:
+def _snapshot(store: Any, *, writable: bool, deadline: float | None = None, numbering: bool = True,
+              now: datetime | None = None, coord_conn: sqlite3.Connection | None = None) -> BandSnapshot:
     """Read the open items once. It takes no viewer: recording a view is ``band_payload``'s, after this, so nothing
     viewer-dependent can reach ``queue``. Numbers the items that have none (D3: a headline is a show)."""
     gen = time.time_ns()                      # before the reads: a later snapshot has a greater gen
@@ -901,7 +910,7 @@ def _snapshot(store: Any, *, writable: bool, deadline: float | None = None) -> B
     with read_deadline(deadline):
         if _foreign(store):
             return _foreign_snapshot(store, writable, gen)
-        return _native_snapshot(store, writable, gen, deadline)
+        return _native_snapshot(store, writable, gen, deadline, numbering, now, coord_conn)
 
 
 def _foreign_snapshot(store: Any, writable: bool, gen: int) -> BandSnapshot:
@@ -923,10 +932,11 @@ def _foreign_snapshot(store: Any, writable: bool, gen: int) -> BandSnapshot:
                    hwm=max(nums, default=0), gen=gen, read_only=not (writable and can))
 
 
-def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: float) -> BandSnapshot:
+def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: float, numbering: bool = True,
+                     now: datetime | None = None, coord_conn: sqlite3.Connection | None = None) -> BandSnapshot:
     items, numbers, closed = _read(store)
     try:
-        extras = read_extras(store.directory, store._clock, deadline=deadline)
+        extras = read_extras(store.directory, store._clock, deadline=deadline, coord_conn=coord_conn, now=now)
     except Exception as exc:  # noqa: BLE001 - the questions still list; the band says the sources were not read
         extras = Extras(failed=[f"authority sources: {type(exc).__name__}"])
     extra_numbers, extra_closed = _extra_state(store, extras) if extras.items or extras.complete else ({}, [])
@@ -943,9 +953,9 @@ def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: f
         filed[e.band_key] = e.filed
     new = [k for k, _ in order_in if (numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)) is None]
     new.sort(key=lambda k: filed.get(k, ""))
-    if new:                                   # a queue that is all numbered takes no write lock
+    if new and numbering:                     # a queue that is all numbered takes no write lock
         try:
-            got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline)
+            got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline, now)
         except Exception:  # noqa: BLE001 - those items stay unnumbered and the snapshot says so, as number_for_ping does
             got = {}
         numbers = {**numbers, **{k: v for k, v in got.items() if isinstance(k, str)}}
@@ -1011,6 +1021,33 @@ def band_payload(store: Any, viewer: str, deadline: float | None = None, writabl
                 "note": "the band could not be recorded just now", "queue": snap.queue, "read_only": snap.read_only}
     return {"seen_through": snap.hwm, "store_id": snap.store_id, "view_id": view_id, "items": snap.numbered(),
             "note": snap.note, "queue": snap.queue, "read_only": snap.read_only}
+
+
+def band_snapshot_readonly(store: Any, deadline: float | None = None, *, now: datetime | None = None,
+                           coord_conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+    """The band as :func:`band_payload` reads it, with NO write to any store: no view is recorded (``view_id`` is
+    ``None``: nothing here binds an answer), no item is numbered (an open item with no number yet is listed with
+    ``n`` ``None`` and ``pending`` true), no store is set up. Every open item that could be read is in ``items``
+    (numbered or not), with no answer actions (``read_only``). ``queue`` equals the hash of
+    ``band_payload(store, viewer, writable=False)`` (the read-only payload), NOT the default writable one's: the
+    hash covers each item's actions, and a read-only item carries none.
+
+    ``now`` (an aware datetime; default ``None`` = the wall clock): every expiry the authority sources decide (a
+    consent hold, a budget or sign request's) is judged at ``now`` and no wall clock is read, so the output is a
+    function of the stores and ``now``. No wall-clock value reaches the output: ``time.time_ns()`` (the snapshot's
+    ``gen``, not returned) and ``time.monotonic()`` (the lock-wait bound) are read and are not outputs.
+    ``coord_conn``: a coordinator read transaction the caller already holds, read instead of a second one (the
+    coordinator reads then share the caller's snapshot, as :func:`render_full`'s do). It may RAISE on a questions
+    store it cannot read: ``QuestionStoreError`` (a store directory reachable by group or others) or
+    ``sqlite3.OperationalError`` (a ``questions.db`` on a read-only file or directory: sqlite would write its WAL
+    index); it does not degrade to an empty band. A caller that must not fail on it (``open_brief``) catches
+    ``Exception`` and says the band could not be read. WAL sidecars (``-wal``/``-shm``) are touched by any sqlite
+    reader: "no write" means no row, table or file of levain's own."""
+    require_aware_now(now, "band_snapshot_readonly")   # before any read, outside the sources' per-source catch
+    snap = _snapshot(store, writable=False, deadline=deadline, numbering=False, now=now, coord_conn=coord_conn)
+    return {"seen_through": snap.hwm if snap.shown else None, "store_id": snap.store_id, "view_id": None,
+            "items": [it for _, it in snap.entries], "note": snap.note, "queue": snap.queue,
+            "pending": snap.pending, "failed": snap.failed, "read_only": True}
 
 
 def _foreign_payload(store: Any, snap: BandSnapshot) -> dict[str, Any]:
