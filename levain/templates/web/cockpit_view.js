@@ -2398,6 +2398,20 @@
     if (N && N.history()) mark(12);
     else applyMode("board", true);
   }
+  // The Work lens's open loop: its row in the Open loops panel (on the tab that shows that panel), scrolled to and lit.
+  // Finds the row first: with no such row on the page nothing moves and the caller says so (false); null when an unsaved edit would not let it unfold; "hidden" for any other failure.
+  function openLoop(sporeId) {
+    const L = root.LevainLoops;
+    if (!L) return false;
+    const row = L.find(sporeId);
+    if (!row) return false;
+    const panel = row.closest(".panel");
+    if (panel) revealTab(panel);
+    if (L.go(sporeId)) return true;
+    // null = an unsaved edit refused the unfold; "hidden" = the row is there but could not be shown; false = not in the panel
+    const why = typeof L.why === "function" ? L.why() : "";
+    return why === "edit" ? null : why === "absent" ? false : "hidden";
+  }
   // The topology panel's state, read once for the header lens and the Sessions card alike. The panel is hidden on the page (the header draws it), so a
   // fault is the header's to say, three ways: a failed fetch (ts.fault), an error record the kernel sent (data.error), or the page's own
   // "unavailable" card (an external panel, no state of its own).
@@ -2469,7 +2483,7 @@
     if (I.tv) {
       // the Replay strip rides the page's own read path (LevainCockpitTransport.readJson: its auth headers and token handling); resume re-reads the live topology
       const replay = I.canReplay ? { readJson: root.LevainCockpitTransport.readJson, resume: () => refetchPanel("topology") } : undefined;
-      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, replay }); } catch (e) { fail = true; }
+      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, openLoop, replay }); } catch (e) { fail = true; }
     }
     if (body) { host.replaceChildren(body); return; }
     // a fault, or a throw while drawing: said in words with the switch beside it, so the Event graph is one click away

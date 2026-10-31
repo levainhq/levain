@@ -1337,6 +1337,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             return _coord_c6(args, out, store)
         if cmd == "log":
             return _coord_log(args, out, store)
+        if cmd == "reply":
+            return _coord_reply(args, out, store)
         if cmd == "review":
             return _coord_review(args, out, store)
         if cmd == "launch":
@@ -1588,6 +1590,22 @@ def _coord_log(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
         text += f"\n+{delta.total - len(shown)} more: levain coord log --since {shown[-1][0]} --limit {args.limit}"
     _emit(out, args.json, {"records": [{"gseq": g, "text": t} for g, t in shown], "total": delta.total,
                            "through": delta.through}, text)
+    return 0
+
+
+def _coord_reply(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord reply DROP --text ... --token N`` (C11 S4): the coordinator answers words the operator dropped from
+    the cockpit or the phone. The binding rules are the store's own trigger; the block stored with the reply is frozen."""
+    from levain.coordinator import drop_reply
+
+    text = _text_input(args, args.text, "--text")
+    if text is None:
+        raise CoordError("say what you reply: --text TEXT, --text-file PATH or --stdin")
+    r = drop_reply.write_reply(store, args.drop_id, text, token=args.token)
+    _emit(out, args.json, {"reply_id": r.reply_id, "drop_id": r.drop_id, "gseq": r.gseq, "block": r.block,
+                           "covers": {"after": r.after, "through": r.through}},
+          f"replied to drop {r.drop_id} ({r.surface}): reply {r.reply_id}, shown on the Coordinator panel"
+          + (f"\n{r.block}" if r.block else ""))
     return 0
 
 
@@ -1975,6 +1993,15 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                      help="List records with a greater gseq.")
     clg.add_argument("--limit", type=_int_in(1, LOG_LIMIT_MAX), default=50, metavar="N",
                      help=f"At most N records, 1..{LOG_LIMIT_MAX} (default 50).")
+    crp = c_sub.add_parser(
+        "reply", help="Answer words dropped from the cockpit or the phone (one reply per drop, within 24 hours).",
+        description="Files your reply to a drop, shown on the Coordinator panel with Levain's block frozen at this "
+                    "moment (what changed since his last message, and the question band). The store refuses a drop "
+                    "that does not exist, a second reply to a drop, and a drop older than the window.")
+    crp.add_argument("drop_id", metavar="DROP", help="The drop you answer.")
+    crp.add_argument("--text", default=None, help="Your reply.")
+    _text_flags(crp)
+    crp.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
     caw = c_sub.add_parser(
         "away", help="Read a drop as the operator's word that he is away: set away ON (never off).",
         description="Sets away ON for both agents through `levain consent away on`'s own path, so every SIGN waits "
@@ -2012,7 +2039,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     for p in (rvl, rvc, rvo, rvf):
         common(p)
         p.set_defaults(func=run_coord)
-    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, cbu, clg):
+    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, cbu, clg, crp):
         common(p)
         p.set_defaults(func=run_coord)
 
