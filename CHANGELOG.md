@@ -7,7 +7,6 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Changed
-<<<<<<< HEAD
 - **The Claude Code coordinator's own install now allows `Read`.** With your user layer left out, the `Read` rule in
   your own settings is gone too, so a read of a file outside the coordinator's workspace stopped at a prompt nobody
   answers. Its install's project settings now carry a bare `Read` allow, so it can read any file your own account can.
@@ -32,14 +31,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   every launch. A store from before this change reads as off. With the layer off, a `disableAllHooks` that lives only in your user settings no longer refuses the coordinator
   launch, since the session never reads that file; `disableAllHooks` in the coordinator's own or an ancestor project
   still refuses. Covered by tests of the spawn argv and the setting.
-=======
 - **The cockpit's owner key opens nothing off the box.** On a server bound to anything but loopback, and on a loopback
   server reached through a proxy (an extra host, a forwarded-for or Tailscale header), a request carrying the owner
   key is answered as if it carried no credential. Its 403 now says `"auth": "pair"` (a loopback request says
   `"auth": "owner"`), and the manifest's `transport` gains `owner_key`, so a page knows to ask for a pairing code
   rather than the key. `levain serve` no longer prints the owner key or puts it in the unlocked link on an
   off-loopback bind; it prints how to pair a device instead. Not run by hand against a real proxied cockpit.
->>>>>>> origin/seat/1030-34-w1ba
 
 ### Fixed
 - **The coordinator's verbs take their text without shell quoting.** Shadow 10-30: two of three real coordinators
