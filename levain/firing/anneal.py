@@ -261,7 +261,7 @@ class AnnealFiring:
             raise ValueError("identity must be a dict of agent/run/role")
         if identity is not None and set(identity) - set(IDENTITY_KEYS):
             # a misspelled key would otherwise vanish and the episodes lose that provenance silently
-            raise ValueError(f"identity keys are {", ".join(IDENTITY_KEYS)}; got {sorted(identity)}")
+            raise ValueError(f"identity keys are {', '.join(IDENTITY_KEYS)}; got {sorted(identity)}")
         self._identity = (
             episode_identity(identity.get(IDENTITY_AGENT_KEY), identity.get(IDENTITY_RUN_KEY),
                              identity.get(IDENTITY_ROLE_KEY))
