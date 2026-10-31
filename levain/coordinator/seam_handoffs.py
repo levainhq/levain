@@ -2,7 +2,8 @@
 
 A handoff is what a coordinator leaves at a seam (a rotation, the operator leaving, a dream) so the next one starts
 from a cut rather than a guess. The C13 pattern (``ready.py``): an append-only table, written by one lease-fenced
-writer, with triggers that refuse the malformed shapes the writer refuses. The lease fence lives in :func:`close` only, as in C13: no trigger checks the lease, so a raw INSERT is not fenced. ``coord close`` (the CLI) is a later slice; this is
+writer, with triggers that refuse the malformed shapes the writer refuses.
+The lease fence lives in :func:`close` only, as in C13: no trigger checks the lease, so a raw INSERT is not fenced. ``coord close`` (the CLI) is a later slice; this is
 the Python API under it. The ``state_line`` trigger is a floor, not an equal: it refuses a line that is empty after
 ASCII whitespace, and the writer refuses one that is empty after any Unicode whitespace.
 
@@ -121,6 +122,8 @@ def latest(store: CoordStore) -> SeamHandoff | None:
 def _text(name: str, value: Any, *, empty: bool) -> str:
     if not isinstance(value, str) or (not empty and not value.strip()):
         raise CoordError(f"{name} is {'text' if empty else 'non-empty text'}")
+    if "\x00" in value:       # SQLite's length() ends a string at a NUL: the triggers would read a different text
+        raise CoordError(f"{name} holds a NUL character")
     return value
 
 
@@ -206,9 +209,16 @@ def close(store: CoordStore, *, kind: Any, body: Any, request_id: Any, prev_hand
             if stored.request_digest != digest:
                 raise CoordError(f"request id {request_id!r} already closed handoff {stored.handoff_id} by another "
                                  "writer or with other words; a changed close takes a new request id")
+            if stored.prev_handoff_id != prev_handoff_id:
+                raise CoordError(f"request id {request_id!r} already closed handoff {stored.handoff_id} naming "
+                                 f"previous handoff {stored.prev_handoff_id}, not {prev_handoff_id}; a retry names "
+                                 "the same one")
             return stored
         head = conn.execute("SELECT MAX(handoff_id) FROM seam_handoffs").fetchone()[0]
         if prev_handoff_id != head:
+            if head is None or (prev_handoff_id is not None and prev_handoff_id > head):
+                raise CoordError(f"the close named previous handoff {prev_handoff_id}; the latest is {head} "
+                                 "(name the latest handoff, or None when there is none)")
             raise CoordError(f"a newer handoff exists (latest is {head}, the close named {prev_handoff_id})")
         covers = _counted_head(conn)
         conn.execute(

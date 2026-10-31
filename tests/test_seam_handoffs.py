@@ -319,3 +319,27 @@ def test_seam_handoffs_is_exempt_with_a_reason():
 
     assert "seam_handoffs" in sc.EXEMPT and sc.EXEMPT["seam_handoffs"].strip()
     assert "seam_handoffs" not in sc.COUNTED and "seam_handoffs" not in sc.INFRASTRUCTURE
+
+
+def test_a_retry_naming_another_previous_handoff_is_refused(store):
+    first = _close(store, "r1")
+    second = _close(store, "r2", prev=first.handoff_id)
+    with pytest.raises(CoordError, match="naming previous handoff 1, not 2"):
+        _close(store, "r2", prev=second.handoff_id)
+    with pytest.raises(CoordError, match="naming previous handoff 1, not None"):
+        _close(store, "r2", prev=None)
+    assert _close(store, "r2", prev=first.handoff_id) == second
+
+
+def test_a_prev_that_names_no_handoff_does_not_read_as_a_newer_one(store):
+    with pytest.raises(CoordError, match="the close named previous handoff 5; the latest is None"):
+        _close(store, "r1", prev=5)
+    first = _close(store, "r1")
+    with pytest.raises(CoordError, match="the close named previous handoff 9; the latest is 1"):
+        _close(store, "r2", prev=9)
+    assert first.handoff_id == 1
+
+
+def test_a_nul_in_a_text_field_is_a_refusal_not_an_integrity_error(store):
+    with pytest.raises(CoordError, match="state_line holds a NUL"):
+        _close(store, body=_body(state_line="\x00visible"))
