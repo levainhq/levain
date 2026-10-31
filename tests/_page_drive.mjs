@@ -38,9 +38,14 @@
 //                                            a cancelled Face ID as the page sees it); nothing is collected
 //   {"key": "<key>"}                        one trusted key press (down, then up) to the focused element; nothing is collected
 // App content that loads asynchronously is not waited for: put an `until` step before the `shot`.
+// LEVAIN_DRIVE_CDP_PORT: the port of an already running headless Chrome (the test session's shared one). The drive then runs in a
+// fresh browser context of that Chrome (its own cookies, storage and cache) and disposes the context on every exit, instead of
+// launching a Chrome of its own: each launch costs macOS keychain calls that no flag removes. A call that passes
+// LEVAIN_DRIVE_CHROME_FLAGS (flags only a new process can take) ignores the port and spawns, exactly as without it.
+// LEVAIN_DRIVE_LAUNCH_LOG: a file that gets one "spawn" line per Chrome this driver launches (a count for a measurement).
 // A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...], "dialogs": ["<type>: <message>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -59,17 +64,38 @@ const WAIT_SCALE = parseScale(process.env.LEVAIN_TEST_WAIT_SCALE ?? "");
 const scaled = (ms) => Math.round(ms * WAIT_SCALE);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
-const prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
 const chromeFlags = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "chrome_flags.json"), "utf8")).flags;
 // LEVAIN_DRIVE_CHROME_FLAGS: a JSON array of extra Chrome flags (a test that must reach the server under a proxied name)
 const extraFlags = process.env.LEVAIN_DRIVE_CHROME_FLAGS ? JSON.parse(process.env.LEVAIN_DRIVE_CHROME_FLAGS) : [];
-const chrome = spawn(chromePath, [...chromeFlags, ...extraFlags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
-  "--no-first-run", "--window-size=1440,1000", "about:blank"], { stdio: "ignore" });
+const sharedPort = /^[0-9]+$/.test(process.env.LEVAIN_DRIVE_CDP_PORT ?? "") && extraFlags.length === 0 ? Number(process.env.LEVAIN_DRIVE_CDP_PORT) : null;
+const prof = sharedPort ? null : mkdtempSync(join(tmpdir(), "levain-page-drive-"));
+let chrome;
+if (sharedPort) {
+  chrome = { exitCode: 0, signalCode: null, kill() {}, once() {} };   // nothing of ours to kill: the Chrome belongs to the session
+} else {
+  if (process.env.LEVAIN_DRIVE_LAUNCH_LOG) { try { appendFileSync(process.env.LEVAIN_DRIVE_LAUNCH_LOG, "spawn\n"); } catch {} }
+  chrome = spawn(chromePath, [...chromeFlags, ...extraFlags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
+    "--no-first-run", "--window-size=1440,1000", "about:blank"], { stdio: "ignore" });
+}
 // the Python runner gives the driver its own TMPDIR (levain-run-*); a parent that died leaves that for the driver to remove
 const scratch = /\/levain-run-[^/]+\/?$/.test(tmpdir()) ? tmpdir() : null;
 const rm = (d) => { try { rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch {} };
+// shared Chrome: the browser connection that owns this drive's context, and the context to dispose
+let bws = null; let contextId = null; let bid = 0; const bpend = new Map();
+const bsend = (method, params = {}) => new Promise((r) => { const i = ++bid; bpend.set(i, r); bws.send(JSON.stringify({ id: i, method, params })); });
+const disposeContext = async () => {
+  if (!bws || !contextId) return;
+  const c = contextId; contextId = null;
+  // bounded: a wedged browser must not hold the exit; disposeOnDetach closes the context when this connection drops anyway
+  await Promise.race([bsend("Target.disposeBrowserContext", { browserContextId: c }), sleep(2000)]);
+};
 // remove the profile only once Chrome is gone: a live Chrome writes into it again
 const done = (code) => {
+  if (sharedPort) {
+    const fin = () => { if (scratch) rm(scratch); process.exit(code); };
+    setTimeout(fin, 3000); disposeContext().then(fin, fin);
+    return;
+  }
   const fin = () => { rm(prof); if (scratch) rm(scratch); process.exit(code); };
   if (chrome.exitCode !== null || chrome.signalCode !== null) return fin();
   chrome.once("exit", fin); setTimeout(fin, 3000); chrome.kill("SIGKILL");
@@ -83,10 +109,27 @@ process.on("unhandledRejection", (e) => { console.error(e && e.stack || String(e
 process.on("exit", () => { try { chrome.kill(); } catch {} });
 const parent = process.ppid;
 setInterval(() => { if (process.ppid !== parent) done(130); }, 1000).unref();
-let targets = null;
-for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json(); } catch { await sleep(250); } }
-if (!targets) { console.error("chrome never answered"); done(2); }
-const ws = new WebSocket(targets.find((t) => t.type === "page").webSocketDebuggerUrl);
+let pageWsUrl = null;
+if (sharedPort) {
+  let version = null;
+  for (let i = 0; i < 20 && !version; i++) { try { version = await (await fetch(`http://127.0.0.1:${sharedPort}/json/version`)).json(); } catch { await sleep(250); } }
+  if (!version) { console.error("the shared chrome never answered"); done(2); }
+  bws = new WebSocket(version.webSocketDebuggerUrl);
+  await new Promise((r, j) => { bws.addEventListener("open", r); bws.addEventListener("error", () => j(new Error("the shared chrome refused the connection"))); });
+  bws.addEventListener("message", (m) => { const d = JSON.parse(m.data); if (d.id && bpend.has(d.id)) { bpend.get(d.id)(d); bpend.delete(d.id); } });
+  const ctx = await bsend("Target.createBrowserContext", { disposeOnDetach: true });
+  contextId = ctx.result?.browserContextId;
+  if (!contextId) throw new Error("no browser context: " + JSON.stringify(ctx.error || ctx.result));
+  const made = await bsend("Target.createTarget", { url: "about:blank", browserContextId: contextId, width: 1440, height: 1000 });
+  if (!made.result?.targetId) throw new Error("no target: " + JSON.stringify(made.error || made.result));
+  pageWsUrl = `ws://127.0.0.1:${sharedPort}/devtools/page/${made.result.targetId}`;
+} else {
+  let targets = null;
+  for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json(); } catch { await sleep(250); } }
+  if (!targets) { console.error("chrome never answered"); done(2); }
+  pageWsUrl = targets.find((t) => t.type === "page").webSocketDebuggerUrl;
+}
+const ws = new WebSocket(pageWsUrl);
 await new Promise((r) => ws.addEventListener("open", r));
 let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
 ws.addEventListener("message", (m) => {
