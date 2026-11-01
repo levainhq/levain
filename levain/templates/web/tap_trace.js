@@ -1,5 +1,5 @@
 // The tap trace page: lists the trace ring (Cache Storage cache `levain-trace`, written by the push worker and by
-// sw_open.js) newest first, one plain line per step, with a Clear button. It holds no token and makes no network call.
+// sw_open.js) newest first, one plain line per step, with a Clear button. It holds no credential and makes no network call.
 (() => {
   "use strict";
   const CACHE = "levain-trace", PREFIX = "/__levain_trace/";
