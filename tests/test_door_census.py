@@ -72,3 +72,14 @@ def test_a_leaf_with_no_declaration_is_refused(tmp_path, monkeypatch):
     assert door.refusal(root, root.parse_args(["open"])) is None
     for name in ("shut", "bare"):
         assert "is the operator's" in door.refusal(root, root.parse_args([name]))
+
+
+def test_the_door_is_declared_on_a_leaf_never_on_a_group():
+    import pytest
+
+    root = argparse.ArgumentParser(prog="levain")
+    group = root.add_subparsers(dest="command").add_parser("tree")
+    group.add_subparsers(dest="verb").add_parser("leaf")
+    for declare in (door.door_ok, door.not_door):
+        with pytest.raises(ValueError):
+            declare(group)

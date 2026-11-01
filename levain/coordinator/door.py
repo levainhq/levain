@@ -48,17 +48,23 @@ from typing import Any
 DOOR_DEST = "door"
 
 
+def _declare(parsers: tuple[argparse.ArgumentParser, ...], value: bool) -> None:
+    for p in parsers:
+        # a group parser's default would reach every leaf below it that declares nothing, opening a subtree by one call
+        if any(isinstance(a, argparse._SubParsersAction) for a in p._actions):
+            raise ValueError("the door is declared on a leaf verb, never on a group of verbs")
+        p.set_defaults(**{DOOR_DEST: value})
+
+
 def door_ok(*parsers: argparse.ArgumentParser) -> None:
     """Declare each leaf parser a verb the coordinator's door lets run (a write still goes --by coordinator, under
     its lease token)."""
-    for p in parsers:
-        p.set_defaults(**{DOOR_DEST: True})
+    _declare(parsers, True)
 
 
 def not_door(*parsers: argparse.ArgumentParser) -> None:
     """Declare each leaf parser a verb that is the operator's: refused inside the coordinator's workspace."""
-    for p in parsers:
-        p.set_defaults(**{DOOR_DEST: False})
+    _declare(parsers, False)
 
 
 def _leaves(parser: argparse.ArgumentParser, path: tuple[str, ...] = ()) -> Any:
