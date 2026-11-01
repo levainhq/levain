@@ -31,6 +31,7 @@ the lease's own count of live spawned workers, and the agent-schema rule for slo
 from __future__ import annotations
 
 import copy
+import os
 import sqlite3
 from collections.abc import Mapping
 from typing import Any
@@ -42,7 +43,7 @@ from levain.authority import _canonical
 from levain.coordinator import lease as lease_mod
 from levain.coordinator.store import CoordError
 
-__all__ = ["MAX_SPAWN_DEPTH", "MAX_SPAWNS_LIVE", "SpawnRefused", "WorkerContext", "ephemeral_spec", "make_draft",
+__all__ = ["BRIEF_DROPS_MAX", "MAX_SPAWN_DEPTH", "MAX_SPAWNS_LIVE", "SpawnRefused", "WorkerContext", "ephemeral_spec", "make_draft",
            "parse_spawn_ref", "render_brief", "resolve_role", "spawn_worker", "verified_record", "where_refusal",
            "worker_context"]
 
@@ -50,11 +51,20 @@ MAX_SPAWN_DEPTH = lease_mod.MAX_SPAWN_DEPTH
 MAX_SPAWNS_LIVE = lease_mod.MAX_SPAWNS_LIVE
 # [seat] a spawned worker's stop time, in seconds, when the caller names none
 DEFAULT_STOP_S = 2 * 60 * 60
+# [seat] how many of a thread's drops a worker's brief and spec quote; past it they say how many more the thread
+# holds, so a thread that keeps growing can never make the brief too large to build
+BRIEF_DROPS_MAX = 20
 _EPHEMERAL = "ephemeral"
 
 
 class SpawnRefused(CoordError):
-    """A spawn that is refused; the message names the rule."""
+    """A spawn that is refused; the message names the rule. ``transient`` is True when the cause may pass by itself
+    (the store could not be read just now), so a launcher leaves the launch pending for a later pass; False when the
+    launch can never start as asked."""
+
+    def __init__(self, message: str = "", *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 def parse_spawn_ref(ref: object) -> str:
@@ -183,14 +193,16 @@ def verified_record(text: object) -> dict[str, Any]:
 
 def ephemeral_spec(role: Mapping[str, Any], digest: str, *, drop_id: str, thread_id: str, title: str,
                    done: str | None, scope: Mapping[str, Any], stop_s: int = DEFAULT_STOP_S,
-                   more_drops: tuple[str, ...] = ()) -> dict[str, Any]:
-    """The worker's AgentSpec, never registered: input = the drop (and ``more_drops``, the thread's other drops),
-    output = the handoff to the coordinator, win = the ready item's ``DONE:`` line (the thread's title when the item
-    names none). The three parts go through the registry spec's own parsers, so they are the shapes a registered spec
-    would hold. ``stop_at`` is guidance the brief states; nothing ends the worker at that time."""
+                   more_drops: tuple[str, ...] = (), unbriefed: int = 0) -> dict[str, Any]:
+    """The worker's AgentSpec, never registered: input = the drop (and ``more_drops``, the thread's other drops the
+    brief quotes, then how many more, ``unbriefed``, it does not), output = the handoff to the coordinator, win = the
+    ready item's ``DONE:`` line (the thread's title when the item names none). The three parts go through the registry
+    spec's own parsers, so they are the shapes a registered spec would hold. ``stop_at`` is guidance the brief states;
+    nothing ends the worker at that time."""
     name = role_mod.spawn_namespace(role["name"])
     win = done if done else f"the thread is done: {title}"
-    source = f"drop {drop_id}" + (f" and drops {', '.join(more_drops)}" if more_drops else "")
+    source = f"drop {drop_id}" + (f" and drops {', '.join(more_drops)}" if more_drops else "") \
+        + (f" and {unbriefed} more on the thread" if unbriefed else "")
     return {
         "name": name, "kind": _EPHEMERAL, "role": {"name": role["name"], "role_hash": digest},
         "input": spec_mod._input({"source": source,
@@ -205,20 +217,24 @@ def ephemeral_spec(role: Mapping[str, Any], digest: str, *, drop_id: str, thread
 
 class WorkerContext:
     """What the worker brief is built from, for one launch: the record, the role's rendered brief, the ephemeral spec,
-    the scope the store cut, at request time, from the one envelope it names, and every drop the WORK thread holds
-    now (``drops``: ``(drop_id, words)``, the record's own drop first)."""
+    the scope the store cut, at request time, from the one envelope it names, and the drops the WORK thread holds now
+    (``drops``: ``(drop_id, words)``, the record's own drop first, then the newest others in arrival order, at most
+    :data:`BRIEF_DROPS_MAX` in all; ``unbriefed``: how many older ones the thread holds beyond them)."""
 
     def __init__(self, record: dict[str, Any], rendered: str, spec: dict[str, Any], scope: dict[str, Any],
-                 envelope_id: str | None, drop_id: str, thread: Any, drops: list[tuple[str, str]]) -> None:
+                 envelope_id: str | None, drop_id: str, thread: Any, drops: list[tuple[str, str]],
+                 unbriefed: int = 0) -> None:
         self.record, self.rendered, self.spec, self.scope = record, rendered, spec, scope
         self.envelope_id, self.drop_id, self.thread, self.drops = envelope_id, drop_id, thread, drops
+        self.unbriefed = unbriefed
 
 
 def worker_context(store: Any, launch: Any) -> WorkerContext:
     """The context of spawned-worker launch ``launch``, from its stored record (scope, envelope, drop) and the thread's
     title and drops. Anything that cannot be built (no record, a record that does not verify, no single thread, a
     thread that is not open work holding the record's drop) is a :class:`SpawnRefused`, so a launcher refuses it before
-    its spawn claim."""
+    its spawn claim. A store that could not be read (a :class:`CoordError` from a read, an SQLite error such as a
+    locked database) is a TRANSIENT refusal: nothing about the launch is wrong, so it may start on a later pass."""
     if not getattr(launch, "role_ref", None):
         raise SpawnRefused(f"launch {launch.launch_id} carries no spawned role")
     record = verified_record(launch.role_ref)
@@ -229,35 +245,46 @@ def worker_context(store: Any, launch: Any) -> WorkerContext:
         if thread.kind != "work" or thread.state not in lease_mod.LIVE_THREAD_STATES \
                 or record["drop_id"] not in thread.members:
             raise SpawnRefused(f"thread {thread.thread_id} is no longer open work holding drop {record['drop_id']}")
-        more = tuple(m for m in thread.members if m != record["drop_id"])
+        # the thread's members are held sorted by id, so the others are put in arrival order and the NEWEST kept: past
+        # the cap, the operator's latest words are the ones a worker most needs
+        others = sorted((store.drop(m) for m in thread.members if m != record["drop_id"]),
+                        key=lambda d: (d.received_at, d.drop_id))
+        kept = others[len(others) - min(len(others), max(BRIEF_DROPS_MAX - 1, 0)):]
+        more = tuple(d.drop_id for d in kept)
+        unbriefed = len(others) - len(kept)
         spec = ephemeral_spec(record["role"], record["role_hash"], drop_id=record["drop_id"],
                               thread_id=thread.thread_id, title=thread.title, done=record["done"],
-                              scope=record["scope"], more_drops=more)
+                              scope=record["scope"], more_drops=more, unbriefed=unbriefed)
         rendered = render_brief(record["role"], record["slots"])
-        drops = [(i, store.drop(i).words) for i in (record["drop_id"], *more)]
+        drops = [(record["drop_id"], store.drop(record["drop_id"]).words), *((d.drop_id, d.words) for d in kept)]
     except SpawnRefused:
         raise
-    except (CoordError, KeyError, TypeError, ValueError, AttributeError) as exc:
+    except (CoordError, sqlite3.Error) as exc:
+        raise SpawnRefused(f"the store could not be read for the worker's brief ({type(exc).__name__}: "
+                           f"{str(exc)[:200]})", transient=True) from None
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise SpawnRefused(f"the worker's brief cannot be built ({type(exc).__name__}: {str(exc)[:200]})") from None
     return WorkerContext(record, rendered, spec, copy.deepcopy(record["scope"]), record["envelope_id"],
-                         record["drop_id"], thread, drops)
+                         record["drop_id"], thread, drops, unbriefed)
 
 
 def where_refusal(real_cwd: str, scope: Mapping[str, Any]) -> str | None:
     """Why a worker may not run in ``real_cwd`` (a resolved directory) under ``scope`` (None: it may). A scope with no
     ``where`` sets no bound here. Otherwise the directory must be a ``where`` repo's top, or lie inside a directory
     that repo's paths name (``.`` is the whole repo, ``dir/`` a directory): a path that names one file keeps the
-    worker at the repo's top, never in a directory beside the file."""
+    worker at the repo's top, never in a directory beside the file. Each repo is resolved the same way the directory
+    was, so a repo stored through a symlink still holds the directories inside it; a repo of ``/`` holds every one."""
     where = scope.get("where") or []
     if not where:
         return None
     for w in where:
-        top = w["repo"].rstrip("/") or "/"
+        top = os.path.realpath(w["repo"])
         if real_cwd == top:
             return None
-        if not real_cwd.startswith(top + "/"):
+        prefix = top if top.endswith("/") else top + "/"
+        if not real_cwd.startswith(prefix):
             continue
-        rel = real_cwd[len(top) + 1:]
+        rel = real_cwd[len(prefix):]
         if any(p == "." or (p.endswith("/") and (rel + "/").startswith(p)) for p in w["paths"]):
             return None
     named = "; ".join(f"{w['repo']}: {', '.join(w['paths'])}" for w in where)

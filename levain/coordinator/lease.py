@@ -733,6 +733,14 @@ def end_done_worker(conn: sqlite3.Connection, now: str, launch_id: str, *, hando
     ln = launch(conn, launch_id)
     if ln is None or ln.state != "active" or ln.role != "worker" or not ln.role_ref:
         return None
+    _launch_event(conn, now, launch_id, "ended", WORKER_DONE)
+    _keep_handoff(conn, now, launch_id, handoff, why)
+    return _launch_row(conn, "launch_id", launch_id)
+
+
+def _keep_handoff(conn: sqlite3.Connection, now: str, launch_id: str, handoff: str | None, why: str | None) -> None:
+    """Spawned worker ``launch_id``'s ``handoff`` (or ``why`` it has none) written to ``launch_handoffs`` in the
+    caller's transaction; a handoff longer than :data:`HANDOFF_MAX` bytes keeps its head and says so."""
     if handoff is not None:
         raw = handoff.encode("utf-8", "replace")
         if len(raw) > HANDOFF_MAX:
@@ -744,10 +752,8 @@ def end_done_worker(conn: sqlite3.Connection, now: str, launch_id: str, *, hando
         why = "no final message was read"
     if why is not None:
         why = " ".join(unshowable.mark(why, allow="").split())[:_LINE_MAX]
-    _launch_event(conn, now, launch_id, "ended", WORKER_DONE)
     conn.execute("INSERT INTO launch_handoffs (launch_id, gseq, handoff, why, at) VALUES (?, ?, ?, ?, ?)",
                  (launch_id, next_gseq(conn, now), handoff, why, now))
-    return _launch_row(conn, "launch_id", launch_id)
 
 
 def worker_handoff(conn: sqlite3.Connection, launch_id: str) -> dict[str, Any]:
@@ -855,10 +861,12 @@ def end_launch(conn: sqlite3.Connection, now: str, launch_id: str, kind: str, ca
     return _launch_row(conn, "launch_id", launch_id)
 
 
-def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch | None:
+def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str, *, handoff: str | None = None) -> Launch | None:
     """The watcher saw ``launch_id``'s session missing from its harness's list: an ``active`` launch is written
     ``ended``, cause ``0 turns`` for a coordinator that wrote no lease row as coordinator since its ``active`` (a
-    death), else ``gone``. The check and the write are one transaction. None when the launch is no longer active."""
+    death), else ``gone``. A spawned worker's ``handoff`` (its last reply, read by the caller; None: none was read) is
+    kept in the same transaction, marked as read from a session that left before it was seen done. The check and the
+    write are one transaction. None when the launch is no longer active."""
     ln = _must_launch(conn, launch_id)
     if ln.state != "active":
         return None
@@ -868,7 +876,12 @@ def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch |
                                    (launch_id,)).fetchone()[0]
         # a fenced thread or drop write is a lease row too (record_write): a coordinator that split but never beat
         cause = "gone" if _wrote_since(conn, ln.session_key, gseq=active_gseq) else "0 turns"
-    return end_launch(conn, now, launch_id, "ended", cause)
+    ended = end_launch(conn, now, launch_id, "ended", cause)
+    if handoff is not None and ln.role == "worker" and ln.role_ref and _has_column(conn, "launch_handoffs", "handoff"):
+        _keep_handoff(conn, now, launch_id, handoff,
+                      "its session left the listing before it was seen done: this is its last reply, which may not "
+                      "end its turn")
+    return ended
 
 
 def unseen_drop(conn: sqlite3.Connection, ln: Launch) -> str | None:

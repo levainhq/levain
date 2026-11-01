@@ -1248,12 +1248,13 @@ class CoordStore:
         with read_transaction(self._connect) as conn:
             return lease.by_harness_session(conn, harness_session_id)
 
-    def launch_end_unlisted(self, launch_id: str) -> Any:
-        """``launch_id``'s session is gone from its harness's list (:func:`levain.coordinator.lease.end_unlisted`)."""
+    def launch_end_unlisted(self, launch_id: str, *, handoff: str | None = None) -> Any:
+        """``launch_id``'s session is gone from its harness's list (:func:`levain.coordinator.lease.end_unlisted`;
+        ``handoff``: a spawned worker's last reply, kept with the end)."""
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
-            return lease.end_unlisted(conn, now, launch_id)
+            return lease.end_unlisted(conn, now, launch_id, handoff=handoff)
 
     def launch_replace_done(self, launch_id: str, *, asked: bool = False) -> Any:
         """``launch_id``'s session was listed done (:func:`levain.coordinator.lease.replace_done`; ``asked``: your

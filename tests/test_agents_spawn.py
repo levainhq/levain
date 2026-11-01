@@ -455,6 +455,7 @@ def test_done_workers_end_and_a_fifth_spawn_is_accepted(store, fake, live_hook, 
     fake.others([OTHER] + [{"id": f"w{i}", "sessionId": f"sid-worker-{i}", "name": cl.session_name(ln),
                             "cwd": str(wdir), "kind": "background", "state": "done", "status": "idle"}
                            for i, ln in enumerate(made)])
+    cl.watch_once(store)                       # the first done reading; the second, a pass later, ends them
     lines = cl.watch_once(store)
     for ln in made:
         assert store.launch(ln.launch_id).state == "ended" and store.launch(ln.launch_id).cause == lease.WORKER_DONE
@@ -704,6 +705,8 @@ def test_a_done_workers_handoff_is_readable_after_it_is_stopped(store, qdir, fak
                                      _said("I wrote the greeting.\nDONE: README says hello")])
     _transcript(cfg, "sid-quiet", [_ASKED, _said("", blocks=[{"type": "thinking", "thinking": "nothing to say"}])])
     _done_listing(fake, [(ln, "sid-handoff"), (quiet, "sid-quiet")], wdir)
+    lines = cl.watch_once(store)        # one done reading is not enough: a stale listing alone never ends a worker
+    assert store.launch(ln.launch_id).state == "active" and fake.stops() == [], lines
     lines = cl.watch_once(store)
     assert store.launch(ln.launch_id).state == "ended" and len(fake.stops()) == 2, lines
     got = store.launch_handoff(token, ln.launch_id)
@@ -810,3 +813,169 @@ def test_a_path_slot_is_relative_with_no_parent_step(bad):
 
 def test_the_unread_empty_scope_constant_is_gone():
     assert not hasattr(inst, "EMPTY_SCOPE")
+
+
+# --- fix 3: transient refusals, two done readings and a backstop, the canonical cwd, where's repo, the drop cap, -----
+# --- the handoff of a worker that left the listing ------------------------------------------------------------------
+def _locked(*_a, **_k):
+    raise sqlite3.OperationalError("database is locked")
+
+
+def _coord_error(*_a, **_k):
+    raise CoordError("the store could not be read just now")
+
+
+def _record_unreadable(*_a, **_k):
+    raise door.RecordUnreadable("the coordinator record is half written")
+
+
+@pytest.mark.parametrize("where, broken", [
+    ("door", _record_unreadable), ("door", lambda *_a, **_k: (_ for _ in ()).throw(OSError("EIO"))),
+    ("drop", _coord_error), ("drop", _locked), ("thread", _locked)])
+def test_a_transient_refusal_leaves_a_spawned_worker_pending(store, fake, live_hook, wdir, spawn, monkeypatch,
+                                                            where, broken):  # noqa: F811
+    _d, t = a_thread(store)
+    ln = spawn(store, store.coord_take(), t.thread_id, wdir)
+    with pytest.MonkeyPatch.context() as mp:
+        if where == "door":
+            mp.setattr(door, "workspace", broken)
+        else:
+            mp.setattr(store, where, broken)
+        why = cl.worker_refusal(ln, store)
+        assert why is not None and why.transient, why
+        got = cl.launch_session(store, ln.launch_id)
+        assert not got.started and "left pending" in got.refusal, got
+        lines = cl.watch_once(store)
+        assert store.launch(ln.launch_id).state == "pending", lines
+        assert any(f"launch {ln.launch_id}" in x and "left pending" in x for x in lines), lines
+        assert fake.spawns() == []
+    assert cl.launch_session(store, ln.launch_id).started      # the cause passed: the next start goes ahead
+
+
+def test_a_permanent_refusal_carries_its_class(store, fake, live_hook, wdir, spawn):  # noqa: F811
+    _d, t = a_thread(store)
+    ln = spawn(store, store.coord_take(), t.thread_id, wdir)
+    store.set_state(t.thread_id, "closed", by="operator")
+    why = cl.worker_refusal(ln, store)
+    assert why is not None and not why.transient
+    assert not cl.launch_session(store, ln.launch_id).started
+    assert store.launch(ln.launch_id).state == "failed"
+
+
+def test_a_done_worker_ends_on_the_second_consecutive_done_reading(store, fake, live_hook, wdir, spawn,
+                                                                   cfg):  # noqa: F811
+    token = store.coord_take()
+    _d, t = a_thread(store)
+    ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-twice")
+    _transcript(cfg, "sid-twice", [_ASKED, _said("all done\nDONE: yes")])
+    _done_listing(fake, [(ln, "sid-twice")], wdir)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active"
+    # a pass that lists it working breaks the run: the next done reading is a first one again
+    fake.others([OTHER, {"id": "w0", "sessionId": "sid-twice", "name": cl.session_name(ln), "cwd": str(wdir),
+                         "kind": "background", "state": "working", "status": "busy"}])
+    cl.watch_once(store)
+    _done_listing(fake, [(ln, "sid-twice")], wdir)
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active", lines
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended", lines
+    assert store.launch_handoff(token, ln.launch_id)["handoff"] == "all done\nDONE: yes"
+
+
+@pytest.mark.parametrize("stop", ["max_tokens", "refusal", "pause_turn", None])
+def test_a_turn_stopped_for_anything_but_a_tool_call_is_finished(cfg, stop):
+    _transcript(cfg, "sid-stop", [_ASKED, _said("cut short", stop=stop)])
+    finished, handoff, _why = cl.worker_turn(str(cfg), "sid-stop")
+    assert finished and handoff == "cut short"
+    _transcript(cfg, "sid-tool", [_ASKED, _said("", stop="tool_use", blocks=[{"type": "text", "text": "asking"}])])
+    assert cl.worker_turn(str(cfg), "sid-tool")[0] is False
+
+
+def test_a_worker_listed_done_but_never_proven_finished_is_ended_by_the_backstop(store, fake, live_hook, wdir, spawn,
+                                                                                 cfg, monkeypatch):  # noqa: F811
+    # at the default pass every half minute, the backstop is about an hour: longer than a consent prompt is left
+    # waiting in practice, short enough that stuck workers never hold the spawn cap for good
+    assert cl.UNPROVEN_DONE_PASSES * 30 >= 30 * 60
+    monkeypatch.setattr(cl, "UNPROVEN_DONE_PASSES", 3)
+    token = store.coord_take()
+    _d, t = a_thread(store)
+    ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-stuck")
+    _transcript(cfg, "sid-stuck", [_ASKED, _said("", stop="tool_use", blocks=[
+        {"type": "text", "text": "I asked to run the tests."}, {"type": "tool_use", "id": "t1", "name": "Bash",
+                                                                 "input": {}}])])
+    _done_listing(fake, [(ln, "sid-stuck")], wdir)
+    for _ in range(2):
+        lines = cl.watch_once(store)
+        assert store.launch(ln.launch_id).state == "active", lines
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended", lines
+    got = store.launch_handoff(token, ln.launch_id)
+    assert got["handoff"] == "I asked to run the tests." and "3 passes" in got["why"], got
+
+
+def test_the_spawn_runs_in_the_checked_canonical_directory(store, fake, live_hook, wdir, spawn, tmp_path,
+                                                          monkeypatch):  # noqa: F811
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(wdir)
+    _d, t = a_thread(store)
+    ln = spawn(store, store.coord_take(), t.thread_id, link)
+    claim = store.launch_claim_spawn
+
+    def retarget_then_claim(*a, **k):
+        link.unlink()
+        link.symlink_to(elsewhere)             # the link moves after the check
+        return claim(*a, **k)
+
+    monkeypatch.setattr(store, "launch_claim_spawn", retarget_then_claim)
+    got = cl.launch_session(store, ln.launch_id)
+    assert got.started, got
+    (call,) = [c for c in fake.calls() if c["argv"][:1] == ["--bg"]]
+    assert call["cwd"] == str(wdir)
+
+
+def test_where_compares_the_resolved_repo(tmp_path, wdir):
+    link = tmp_path / "repo-link"
+    link.symlink_to(wdir)
+    assert inst.where_refusal(str(wdir), {"where": [{"repo": str(link), "paths": ["."]}]}) is None
+    assert inst.where_refusal(str(wdir / "x"), {"where": [{"repo": str(link), "paths": ["x/"]}]}) is None
+    assert inst.where_refusal(str(wdir), {"where": [{"repo": "/", "paths": ["."]}]}) is None
+    assert inst.where_refusal(str(tmp_path), {"where": [{"repo": str(link), "paths": ["."]}]}) is not None
+
+
+def test_the_drops_briefed_are_capped(store, fake, live_hook, wdir, spawn, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(inst, "BRIEF_DROPS_MAX", 2)
+    d1, t = a_thread(store, "the first words")
+    arrived = [d1.drop_id]
+    for i in range(3):
+        d, _ = store.accept_drop(f"more words {i}", surface="cli")
+        store.split(d.drop_id, [Part("work", attach=t.thread_id)], by="operator")
+        arrived.append(d.drop_id)
+    ln = spawn(store, store.coord_take(), t.thread_id, wdir)
+    got = inst.worker_context(store, ln)
+    own = lease.spawn_record(ln.role_ref)["drop_id"]
+    others = [i for i in arrived if i != own]
+    # the record's own drop first, then the newest of the others: the operator's latest words
+    assert [i for i, _w in got.drops] == [own, others[-1]] and got.unbriefed == 2
+    assert got.spec["input"]["source"].endswith("and 2 more on the thread")
+    assert cl.launch_session(store, ln.launch_id).started
+    brief = (wdir / ".levain" / "briefs" / f"{ln.launch_id}.md").read_text()
+    assert "and 2 more on the thread" in brief and f"`{others[-1]}`" in brief and f"`{others[0]}`" not in brief
+
+
+def test_a_worker_that_left_the_listing_keeps_its_final_message(store, fake, live_hook, wdir, spawn,
+                                                               cfg):  # noqa: F811
+    token = store.coord_take()
+    _d, t = a_thread(store)
+    ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-left")
+    _transcript(cfg, "sid-left", [_ASKED, _said("half of it\nDONE: no")])
+    _d2, t2 = a_thread(store, "the second job")
+    mute = _activate(store, spawn(store, token, t2.thread_id, wdir, slots={"topic": "y"}), "sid-mute")
+    fake.others([OTHER])                       # neither is listed: both left before a done reading
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended" and store.launch(ln.launch_id).cause == "gone", lines
+    assert store.launch_handoff(token, ln.launch_id)["handoff"] == "half of it\nDONE: no"
+    with pytest.raises(lease.LeaseRefused, match="left no handoff"):
+        store.launch_handoff(token, mute.launch_id)
