@@ -5574,6 +5574,8 @@
       // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
       dispatchStale();
       rereadBoard();
+      // the server accepted the drop the sheet filed: the words the box handed over go, unless they were edited since
+      if (ev.data.dropDelivered === true) dropHandedClear();
       dropReload();      // a drop the sheet filed or could not confirm (either may have made the store): the drop card reads again, not from its cache
     }
   });
@@ -6688,6 +6690,15 @@
     if (got && typeof words === "string" && words) { try { window.sessionStorage.setItem(DROP_PREFILL_KEY, words); } catch (e) { /* the sheet opens empty */ } }
     return got;
   }
+  function dropHandedClear() {
+    const host = document.getElementById("ck-drop");
+    const ui = host && host._drop;
+    if (!ui || typeof ui.handed !== "string") return;
+    const box = ui.words;
+    if (box && box.value === ui.handed) { box.value = ""; box.style.height = ""; }
+    ui.handed = undefined;
+    dropPrefillClear();
+  }
   function dropPrefillClear() { try { window.sessionStorage.removeItem(DROP_PREFILL_KEY); } catch (e) { /* nothing kept */ } }
   // ---- the coordinator drop: a card on the home page (Phill 10-30), drawn under the Needs-you row, outside #ck-hero. An inline
   // composer, not a button that opens a sheet. Send posts through /cockpit/coord/drop, the route the /sign/drop sheet posts to,
@@ -6952,7 +6963,7 @@
     const lock = (on) => { ui.working = on; send.disabled = env.disabled = words.disabled = on || !ui.can; };
     ui.paint = paint;
     ui.lock = lock;
-    env.addEventListener("click", () => { if (ui.can) openDropSheet(words.value); });
+    env.addEventListener("click", () => { if (ui.can) { ui.handed = words.value; openDropSheet(words.value); } });
     send.addEventListener("click", () => {
       if (ui.working || !ui.can) return;
       if (ui.reading) { ui.reading.then(() => send.click()); return; }      // the read that names the store is still out

@@ -110,9 +110,9 @@
     $("sheet-msg").textContent = msg;
   }
   // the parent cockpit learns what happened here (framed only); the target origin is this one, never the link's
-  function tell(what) {
+  function tell(what, extra) {
     if (!framed) return;
-    try { window.parent.postMessage({ levainSheet: what, id: id }, location.origin); } catch (e) { /* no parent to tell */ }
+    try { window.parent.postMessage(Object.assign({ levainSheet: what, id: id }, extra || {}), location.origin); } catch (e) { /* no parent to tell */ }
   }
   // the cockpit asks to close the overlay (its x, its Escape): this page answers "ack" at once, so the parent knows a
   // sheet is listening, then applies its own close rule (askClose below), which tells "close" only when it may leave
@@ -950,7 +950,7 @@
       return all.length ? all[0] : null;
     };
     let signedLine = "";
-    const done = (a, plain) => {
+    const done = (a, plain, req) => {
       const d = a.body.drop || {};
       const e = a.body.envelope;
       // a fresh store's first drop made it: its identity is held before the controls unlock, so a fast second send names it.
@@ -970,7 +970,8 @@
         + (plain ? "words only" : e && e.taken ? "envelope " + e.envelope_id + " taken" : "envelope NOT taken: " + String((e && e.refused) || "no envelope in the reply"));
       if (other) say(msg + "; but by a different Levain store than this sheet was opened for. Reload the page to see the current store; nothing more can be signed or sent here.", "bad");
       else say(msg, plain || (e && e.taken) ? "ok" : "bad");
-      tell("signed");
+      // the server accepted this drop (a 2xx): the cockpit's box, which handed these words over, may let them go
+      tell("signed", req && typeof req.words === "string" ? { dropDelivered: true } : null);
       return readDrops().then((g) => {
         if (g.unpaired || g.error) return;
         const dd = Array.isArray(g.coord_drops) ? g.coord_drops : [];
@@ -1015,7 +1016,7 @@
           drop0(req);
           unsure = false;
           if (signed) { ended(); if (signedLine) signing(signedLine, "server", "Signed"); else relabel("Signed"); $("sheet").dataset.state = "signed"; }
-          return done(a, !signed);
+          return done(a, !signed, req);
         }
         if (a.status >= 400 && a.status < 500) {
           // refused: nothing was delivered with this request (a stale signature is signed again from the review); the
