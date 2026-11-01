@@ -1658,10 +1658,7 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
                                                                     who=args.who, why=args.why, **extra)
         ver = rec.ver
     except _REFUSED as exc:
-        said = str(exc)
-        if said.endswith("; nothing was written"):       # a missing --queue-dir is made by the open: say what is true
-            said = said[:-len("nothing was written")] + "no state was written"
-        print(f"levain coord ready {verb}: {said}", file=sys.stderr)
+        print(f"levain coord ready {verb}: {exc}", file=sys.stderr)
         return 2
     _emit(out, args.json, {"journal_id": f"{rec['id']}@{ver}", "record": rec},
           f"{verb}: {rec['id']} {rec['from_category'] or '-'} -> {rec['to_category']}; journal {rec['id']}@{ver}")
