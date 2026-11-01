@@ -1411,6 +1411,11 @@ DONE_READ_GAP = 20
 # way cannot hold the cap on live spawns for good. A worker whose transcript shows a tool call waiting (a consent
 # prompt) is never ended by it
 UNPROVEN_DONE_SECONDS = 60 * 60
+# [seat] the one ceiling on a worker whose transcript shows a tool call waiting (a consent prompt), in seconds of wall
+# time: listed done the whole time, from the first such reading, it is ended, because a session listed done cannot
+# answer its prompt. Far longer than the backstop, so an operator away for the night still finds the prompt open; a
+# reading that lists it anything but done, or shows anything but the wait, starts it again
+WAITING_DONE_CEILING_SECONDS = 24 * 60 * 60
 WORKER_READS = "coord-watch-workers.json"     # in the store's directory: the done readings carried between passes
 _wall = time.time                # the watcher's wall clock for the done readings (tests move it by hand)
 
@@ -1490,8 +1495,9 @@ def _end_done_workers(store: CoordStore, active: list[Any], listed: dict[str, di
     :data:`levain.coordinator.lease.WORKER_DONE`) with its final message as its handoff, in one transaction, so it
     leaves the live-spawn count and the coordinator reads the handoff after (d) stops its session and (e) removes its
     brief (``levain coord handoff worker``). Two done readings count only :data:`DONE_READ_GAP` seconds or more
-    apart. A worker whose transcript shows a tool call waiting (a consent prompt) is left running however long it
-    waits. One listed done whose transcript cannot be read or shows neither is left running and said so, until the
+    apart. A worker whose transcript shows a tool call waiting (a consent prompt) is never ended by the backstop: each
+    pass names it waiting and since when, and only when it has been listed done with the wait shown for
+    :data:`WAITING_DONE_CEILING_SECONDS` of wall time is it ended, why recorded. One listed done whose transcript cannot be read or shows neither is left running and said so, until the
     backstop: listed done for :data:`UNPROVEN_DONE_SECONDS` of wall time with no wait shown, it is ended anyway with
     its last reply kept and why. A pass that lists it anything but done starts every reading again. The readings
     (with the time each started) are carried between passes in :data:`WORKER_READS`, so a one-pass watch counts too;
@@ -1529,10 +1535,20 @@ def _end_done_workers(store: CoordStore, active: list[Any], listed: dict[str, di
                          f"{DONE_READS}; not ended yet")
             continue
         if state == _TURN_WAITS:
-            after[ln.launch_id] = seen
-            lines.append(f"launch {ln.launch_id}: listed done, but {why}; not ended (a worker waiting on a tool call "
-                         "is never ended by the backstop)")
-            continue
+            # the ceiling's clock: the first reading of this run listed done with a tool call waiting, kept as it was
+            first = _stamp(prev, "waits_since")
+            seen["waits_since"] = first if first is not None else now
+            waited = now - seen["waits_since"]
+            if waited < WAITING_DONE_CEILING_SECONDS:
+                after[ln.launch_id] = seen
+                lines.append(f"launch {ln.launch_id}: listed done, but {why}; not ended: waiting on a tool call or "
+                             f"your consent since {_utc(seen['waits_since'])} (a worker waiting on a tool call is "
+                             f"never ended by the backstop; listed done {waited:.0f} s of "
+                             f"{WAITING_DONE_CEILING_SECONDS} s, it is ended then, since a session listed done "
+                             "cannot answer its prompt)")
+                continue
+            why = (f"waited on a tool call for {WAITING_DONE_CEILING_SECONDS // 3600} h with its session listed done "
+                   f"({waited:.0f} s); ended by the waiting ceiling")
         if state == _TURN_UNKNOWN:
             waited = now - seen["since"]
             if waited < UNPROVEN_DONE_SECONDS:
@@ -1565,6 +1581,21 @@ def _count(prev: dict[str, Any], key: str) -> int:
 def _stamp(prev: dict[str, Any], key: str) -> float | None:
     t = prev.get(key)
     return float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) else None
+
+
+def _utc(t: float) -> str:
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    except (OverflowError, OSError, ValueError):          # a stamp past what the platform's clock can name
+        return f"{t:.0f} s after the epoch"
+
+
+def worker_waiting_since(directory: str | os.PathLike[str], launch_id: str) -> str | None:
+    """When worker ``launch_id`` was first read listed done with a tool call waiting (a consent prompt), as the last
+    watcher pass left it in :data:`WORKER_READS` under ``directory``, or None: not read waiting, or unreadable."""
+    prev = _load_reads(Path(directory) / WORKER_READS).get(launch_id)
+    since = _stamp(prev, "waits_since") if isinstance(prev, dict) else None
+    return None if since is None else _utc(since)
 
 
 def _load_reads(path: Path) -> dict[str, Any]:

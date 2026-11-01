@@ -1197,12 +1197,23 @@ class CoordStore:
 
     def launch_handoff(self, token: object, launch_id: str) -> dict[str, Any]:
         """The handoff spawned worker ``launch_id`` left (:func:`levain.coordinator.lease.worker_handoff`), read by the
-        lease holder: ``token`` is fenced in the read's own transaction, and nothing is written."""
+        lease holder: ``token`` is fenced in the read's own transaction, and nothing is written. A refusal for a worker
+        the watcher last read waiting on a tool call names it waiting and since when."""
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
             lease.fence(conn, now, token)
-            return lease.worker_handoff(conn, launch_id)
+            try:
+                return lease.worker_handoff(conn, launch_id)
+            except lease.LeaseRefused as exc:
+                # a worker the watcher last read waiting on a tool call says so, so the operator can see and stop it
+                from levain.coordinator.launch import worker_waiting_since
+
+                since = worker_waiting_since(self.directory, launch_id)
+                if since is None:
+                    raise
+                raise lease.LeaseRefused(f"{exc}; it is waiting on a tool call or your consent since {since}") \
+                    from None
 
     def launch_refuse_worker(self, launch_id: str) -> Any:
         from levain.coordinator import lease

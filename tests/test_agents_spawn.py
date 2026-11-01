@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -997,6 +998,68 @@ def test_a_worker_waiting_on_a_tool_call_is_never_ended_by_the_backstop(store, f
                    for x in lines), lines
         clock.tick(cl.UNPROVEN_DONE_SECONDS * 2)
     assert fake.stops() == []
+
+
+_WAITING = [_ASKED, _said("", stop="tool_use", blocks=[
+    {"type": "text", "text": "May I run the tests?"}, {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}])]
+
+
+def test_a_waiting_worker_listed_done_for_the_ceiling_is_ended_with_why(store, fake, live_hook, wdir, spawn, cfg,
+                                                                        qdir, capsys, clock):  # noqa: F811
+    assert cl.WAITING_DONE_CEILING_SECONDS == 24 * 60 * 60
+    token = store.coord_take()
+    _d, t = a_thread(store)
+    ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-asking")
+    _transcript(cfg, "sid-asking", _WAITING)
+    _done_listing(fake, [(ln, "sid-asking")], wdir)
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock.now))
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active", lines
+    assert any(f"launch {ln.launch_id}:" in x and f"waiting on a tool call or your consent since {started}" in x
+               for x in lines), lines
+    # the operator reading its handoff sees it waiting, and since when
+    with pytest.raises(lease.LeaseRefused, match=f"waiting on a tool call or your consent since {started}"):
+        store.launch_handoff(token, ln.launch_id)
+    clock.tick(cl.WAITING_DONE_CEILING_SECONDS - 1)
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active", lines
+    assert any(f"since {started}" in x for x in lines), lines
+    clock.tick(1)
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended" and len(fake.stops()) == 1, lines
+    got = store.launch_handoff(token, ln.launch_id)
+    assert got["handoff"] == "May I run the tests?", got
+    assert "waited on a tool call for 24 h with its session listed done" in got["why"], got
+
+
+def test_a_reading_that_is_not_done_and_waiting_restarts_the_ceiling(store, fake, live_hook, wdir, spawn, cfg,
+                                                                     clock):  # noqa: F811
+    token = store.coord_take()
+    _d, t = a_thread(store)
+    ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-again")
+    _transcript(cfg, "sid-again", _WAITING)
+    _done_listing(fake, [(ln, "sid-again")], wdir)
+    cl.watch_once(store)
+    clock.tick(cl.WAITING_DONE_CEILING_SECONDS - 60)
+    # listed working for one pass: the session is alive and may answer, so the wait's clock starts again
+    fake.others([OTHER, {"id": "w0", "sessionId": "sid-again", "name": cl.session_name(ln), "cwd": str(wdir),
+                         "kind": "background", "state": "working", "status": "busy"}])
+    cl.watch_once(store)
+    _done_listing(fake, [(ln, "sid-again")], wdir)
+    clock.tick(cl.WAITING_DONE_CEILING_SECONDS - 60)
+    lines = cl.watch_once(store)               # past the ceiling since the first reading, but not since the restart
+    assert store.launch(ln.launch_id).state == "active", lines
+    # listed done but showing no wait for one pass restarts it too
+    _transcript(cfg, "sid-again", [_ASKED, _said("half"), _ASKED])
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active", lines
+    _transcript(cfg, "sid-again", _WAITING)
+    clock.tick(cl.WAITING_DONE_CEILING_SECONDS - 1)
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active", lines
+    clock.tick(cl.WAITING_DONE_CEILING_SECONDS)
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended", lines
 
 
 def test_an_ambiguous_done_worker_is_ended_by_elapsed_time_not_pass_count(store, fake, live_hook, wdir, spawn, cfg,
