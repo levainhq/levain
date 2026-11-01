@@ -618,7 +618,6 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
             # pruned): the original matching means the copy is bad, the original mismatching means the snapshot is.
             # Everything after the release reads only these verified copies.
             socc = scratch / "occs" / name
-            (socc / SNAP_DIR).mkdir(parents=True)
             corrupt: list[str] = []
             bad_copy: list[str] = []
 
@@ -628,6 +627,7 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
                     (bad_copy if sha256_file(src) == want else corrupt).append(label)
 
             try:
+                (socc / SNAP_DIR).mkdir(parents=True)
                 for e in m["files"].values():
                     if e["sha256"] is not None:
                         copy_and_check(snap / e["name"], socc / SNAP_DIR / e["name"], e["sha256"], e["name"])
