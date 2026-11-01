@@ -54,8 +54,14 @@ def test_an_authorised_write_round_trips_and_reset_restores_the_default(rig):
         assert st == 200 and got["cells"]["sleep"]["approval"] == "push" and got["status_kind"] == "loaded"
         assert _call(port, "GET", "/webpush/policy", token=T)[1]["cells"]["sleep"]["approval"] == "push"
         assert presence.read_policy(q)[0]["sleep"]["approval"] == "push"
-        rows = [json.loads(l) for l in (q / "webpush" / "presence.log").read_text().splitlines()] if (q / "webpush" / "presence.log").exists() else []
-        assert not any(r.get("by") for r in rows)           # the operator's own act: no setter identity
+        log = q / "webpush" / presence.LOG_NAME
+        assert log.exists(), "the write left no log row"
+        rows = [json.loads(l) for l in log.read_text().splitlines()]
+        row = rows[-1]
+        assert row["word"] == "policy set sleep approval push" and row["outcome"] == "set"
+        assert "by" not in row                              # the operator's own act: no setter identity
+        assert row["via"] == "browser"                      # the credential's name, never the secret
+        assert T not in log.read_text()
         st, got, _ = _call(port, "POST", "/webpush/policy/reset", {}, token=T)
         assert st == 200 and got["status_kind"] == "default" and got["cells"] == presence.DEFAULT_CELLS
 
@@ -119,15 +125,18 @@ def test_the_block_renders_edits_round_trip_and_the_approval_hold_warns(rig, tmp
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
             {"until": "document.querySelector('.np-panel') && !document.querySelector('.np-panel').hidden", "ms": 20000},
             {"eval": "document.querySelectorAll('.np-warn:not([hidden])').length"},
+            {"eval": "(d=>d.hidden?'hidden':d.textContent+'|'+getComputedStyle(d).color)(document.querySelector('.np-default'))"},
             {"do": cell("quiet.approval", "hold") + ".click()", "until": cell("quiet.approval", "hold") + ".getAttribute('aria-checked')==='true'", "ms": 8000},
             {"eval": "document.querySelectorAll('.np-warn:not([hidden])').length"},
             {"eval": "location.reload() || 1"},
             {"until": "document.querySelector('.np-panel') && !document.querySelector('.np-panel').hidden", "ms": 20000},
             {"eval": state},
-            {"do": "document.querySelector('.np-reset').click()", "until": "document.querySelector('.np-reset').disabled && document.querySelectorAll('.np-warn:not([hidden])').length === 1 && " + cell("quiet.approval", "push") + ".getAttribute('aria-checked')==='true'", "ms": 8000},
+            {"do": "document.querySelector('.np-reset').click()", "until": "document.querySelector('.np-reset').disabled && document.querySelectorAll('.np-warn:not([hidden])').length === 0 && " + cell("quiet.approval", "push") + ".getAttribute('aria-checked')==='true'", "ms": 8000},
             {"eval": "document.documentElement.scrollWidth - document.documentElement.clientWidth"},
         ])
     v = out["values"]
-    assert v[1] == 1 and v[3] == 2      # the shipped default already holds sleep approvals (one warning); holding quiet's adds a second
-    assert ["quiet.approval", "hold"] in json.loads(v[6])   # it held across a reload
+    assert v[1] == 0                    # the shipped default (sleep holds approvals) shows no warning ...
+    assert "wait while you sleep" in v[2]   # ... only the plain, non-warning line
+    assert v[4] == 1                    # a hold in a non-default cell (quiet approvals) warns
+    assert ["quiet.approval", "hold"] in json.loads(v[7])   # it held across a reload
     assert presence.policy_view(q)["status_kind"] == "default"   # reset

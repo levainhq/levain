@@ -349,8 +349,10 @@ def policy_view(queue_dir: Path | str | None) -> dict:
 
 
 def _policy_log(queue_dir: Path | str, ts: float, word: str, by: object, outcome: str, why: str, strict: bool,
-                prior: dict | None = None) -> None:
+                prior: dict | None = None, via: str | None = None) -> None:
     row: dict = {"ts": ts, "word": _clean(word, 60), "prior": dict(prior) if prior else {}, "outcome": outcome}
+    if via:     # the credential's name for a write through the cockpit (never the secret); identity stays ``by``
+        row["via"] = _clean(via, _FIELD_MAX)
     if by is not None:
         who = by if isinstance(by, dict) else {}
         row["by"] = {"agent": _clean(who.get("agent"), _FIELD_MAX), "session": _clean(who.get("session"), _FIELD_MAX),
@@ -412,7 +414,7 @@ def _refuse_setter(queue_dir: Path | str, ts: float, word: str, by: dict | None)
 
 
 def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: dict | None = None,
-               now: float | None = None) -> dict:
+               now: float | None = None, via: str | None = None) -> dict:
     """Set one cell and return the cells after. Operator only (``by`` must be ``None``, see :func:`_refuse_setter`).
     Atomic write under the presence lock; one presence-log row. Raises :class:`PresenceError`."""
     ts = time.time() if now is None else now
@@ -428,15 +430,15 @@ def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: di
         try:
             _write_policy(queue_dir, cells)
         except PresenceError as e:
-            _policy_log(queue_dir, ts, word, None, "refused", str(e), strict=False)
+            _policy_log(queue_dir, ts, word, None, "refused", str(e), strict=False, via=via)
             raise
         _policy_log(queue_dir, ts, word, None, "set" if was != value else "unchanged",
                     f"prior file {prior.replace(' (the whole default is in effect)', '')}; rewritten from the default" if prior else "",
-                    strict=False, prior={f"{mute}.{cls}": was})
+                    strict=False, prior={f"{mute}.{cls}": was}, via=via)
     return cells
 
 
-def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | None = None) -> dict:
+def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | None = None, via: str | None = None) -> dict:
     """Remove the policy file (back to the shipped default) and return the default cells. Operator only."""
     ts = time.time() if now is None else now
     _refuse_setter(queue_dir, ts, "policy reset", by)
@@ -445,10 +447,10 @@ def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | 
         try:
             _write_policy(queue_dir, None)
         except PresenceError as e:
-            _policy_log(queue_dir, ts, "policy reset", None, "refused", str(e), strict=False)
+            _policy_log(queue_dir, ts, "policy reset", None, "refused", str(e), strict=False, via=via)
             raise
         _policy_log(queue_dir, ts, "policy reset", None, "set", "", strict=False,
-                    prior={f"{m}.{c}": before[m][c] for m in MUTE_WORDS for c in CLASSES})
+                    prior={f"{m}.{c}": before[m][c] for m in MUTE_WORDS for c in CLASSES}, via=via)
     return _copy_cells(DEFAULT_CELLS)
 
 

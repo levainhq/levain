@@ -482,7 +482,9 @@
                    ["attention", "Attention items", "things that need you, dated ones included"],
                    ["other", "Other pings", "questions, rulings, summaries"]];
   const HOLD_WARN = "Seats that need your approval will wait silently until you unmute.";
-  let npPanel = null, npSentences = null, npStatus = null, npNote = null, npCells = {}, npReset = null, npBusy = false;
+  const DEFAULT_HOLDS = { sleep: { approval: "hold" } };   // the shipped default's holds (levain.webpush.presence.DEFAULT_CELLS)
+  const DEFAULT_NOTE = "By default, approvals wait while you sleep and push once you are back.";
+  let npPanel = null, npSentences = null, npStatus = null, npNote = null, npCells = {}, npReset = null, npBusy = false, npDefault = null;
 
   function buildPolicy() {
     npPanel = el("div", "panel k-list dev-panel np-panel");
@@ -496,6 +498,8 @@
     body.appendChild(npSentences);
     npStatus = el("p", "dev-note np-status"); npStatus.hidden = true;
     body.appendChild(npStatus);
+    npDefault = el("p", "dev-note np-default", DEFAULT_NOTE); npDefault.hidden = true;
+    body.appendChild(npDefault);
     for (const [mute, mname] of MUTES) {
       const grp = el("div", "np-group");
       grp.appendChild(el("div", "dev-name", "While " + mname.toLowerCase() + " is on"));
@@ -556,8 +560,13 @@
         c.btns[k].setAttribute("aria-checked", k === cur ? "true" : "false");
         c.btns[k].setAttribute("aria-selected", k === cur ? "true" : "false");
       }
-      c.warn.hidden = !(cls === "approval" && cur === "hold");
+      // the warning is for a hold the operator chose; the shipped default's own sleep hold is the plain line below
+      const dflt = (DEFAULT_HOLDS[mute] || {})[cls];
+      c.warn.hidden = !(cls === "approval" && cur === "hold" && cur !== dflt);
     }
+    // approvals held ONLY by the shipped default (sleep): one plain, non-red line instead of the warning
+    const sleepAppr = ((v.cells || {}).sleep || {}).approval;
+    npDefault.hidden = sleepAppr !== "hold";
     npReset.disabled = v.status_kind === "default";
     npPanel.hidden = false;
   }
@@ -568,7 +577,8 @@
     try {
       const res = await api("GET", "/webpush/policy", undefined, READ_TIMEOUT_MS);
       if (res.status === 200 && res.data && res.data.cells) paintPolicy(res.data);
-      else if (res.status === 404 || res.status === 403) npPanel.hidden = true;   // no web push here, or this token is not allowed
+      else if (res.status === 404) npPanel.hidden = true;                          // no web push here
+      else if (res.status === 403) { npPanel.hidden = true; refused = tok; }     // this token is not allowed: stop asking, as refresh does
     } catch (_) { /* the next pulse tries again */ }
   }
 

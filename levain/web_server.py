@@ -2257,7 +2257,8 @@ class _Handler(GuardedHandler):
         """``POST /webpush/policy/set {mute, class, value}`` / ``/webpush/policy/reset {}``: the operator's own write
         (``by=None``), reached only past the push family's gate (same-origin, a surface token on every bind, a JSON
         body): the authority the Devices panel's own writes use. A refusal (a bad cell, a lock or file that cannot be
-        written) is a 422 with its words; the reply is the policy view after."""
+        written) is a 422 with its words; the reply is the policy view after. The log row names the credential used
+        (``via``: the surface token's or the paired device's name, never the secret); the write itself stays ``by=None``."""
         from levain.webpush import presence
 
         try:
@@ -2269,11 +2270,12 @@ class _Handler(GuardedHandler):
             return {"error": "bad_request",
                     "message": ("send exactly mute, class and value as text" if want else "send an empty object")}, 400
         queue = self.server.signer.queue_dir
+        via = str(self._credential()["name"])
         try:
             if route == _POLICY_SET:
-                presence.set_policy(queue, req["mute"], req["class"], req["value"], by=None)
+                presence.set_policy(queue, req["mute"], req["class"], req["value"], by=None, via=via)
             else:
-                presence.reset_policy(queue, by=None)
+                presence.reset_policy(queue, by=None, via=via)
         except presence.PresenceError as exc:
             return {"error": "policy_refused", "message": str(exc)}, 422
         return presence.policy_view(queue), 200
