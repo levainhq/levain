@@ -209,3 +209,97 @@ def test_the_dream_subparser_names_every_verb():
     assert "only `run`" not in text
     for verb in ("run", "rollback", "recover", "drill"):
         assert verb in text
+
+
+# ------------------------------------------------------------------------------------------ D1 revert fix1 (L1+L2)
+
+class ProjectingAnneal(FakeAnneal):
+    """A revert that PROJECTS bytes unlike the snapshot or the dream's (anneal re-projects from its identity), then may
+    crash after its commit."""
+
+    def __init__(self, db, result, crash_after_commit=False):
+        super().__init__(db, result)
+        self.crash_after_commit = crash_after_commit
+        self.committed = False
+
+    def revert_wrap(self, wrap_id, **kw):
+        self.calls.append((wrap_id, kw))
+        if self.committed:
+            return receipt(already_reverted=True, identity_version=7, episodes_reoffered=0)
+        for p in sn.text_tier(self.db).values():
+            if p.exists():
+                p.write_text("projected by anneal, not byte-identical\n")
+        self.committed = True
+        if self.crash_after_commit:
+            raise RuntimeError("crash after anneal committed the revert")
+        return self.result
+
+
+def _use(monkeypatch, fake):
+    monkeypatch.setattr(sn, "_revert_store", lambda db: fake)
+    return fake
+
+
+def test_a_rerun_after_a_crash_following_the_anneal_commit_finishes_with_the_receipt(two, monkeypatch):
+    fake = _use(monkeypatch, ProjectingAnneal(two.db, receipt(identity_version=7, episodes_reoffered=3),
+                                              crash_after_commit=True))
+    with pytest.raises(RuntimeError, match="crash after anneal"):
+        sn.rollback(two.db, two.o2)
+    assert "called_at" in _rec(two)["revert_wrap"] and "receipt" not in _rec(two)["revert_wrap"]
+    assert "projected" in (two.db.parent / "memory.continuity.md").read_text()      # in neither pre nor post
+    res = sn.rollback(two.db, two.o2)                                  # NOT refused as foreign-write
+    assert res.ok and res.outcome == "finished", res.message
+    assert len(fake.calls) == 2                                        # asked anneal again; it answered already_reverted
+    rw = _rec(two)["revert_wrap"]
+    assert rw["receipt"]["already_reverted"] is True and res.card["revert_wrap"]["already_reverted"] is True
+    assert json.loads((two.o2 / "snap/manifest.json").read_text())["reverted_at"]
+    assert "Day 2." in (two.o2 / sn.UNDO_DIR / "memory.continuity.md").read_text()   # the undo copy is kept
+
+
+def test_a_rerun_after_the_receipt_but_before_finish_keeps_the_first_receipt(two, monkeypatch):
+    fake = _use(monkeypatch, ProjectingAnneal(two.db, receipt(identity_version=7, episodes_reoffered=3)))
+    real_finish = sn._finish
+    monkeypatch.setattr(sn, "_finish", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("died before finish")))
+    with pytest.raises(RuntimeError, match="died before finish"):
+        sn.rollback(two.db, two.o2)
+    assert _rec(two)["revert_wrap"]["receipt"]["episodes_reoffered"] == 3
+    monkeypatch.setattr(sn, "_finish", real_finish)
+    res = sn.rollback(two.db, two.o2)
+    assert res.ok and res.outcome == "finished", res.message
+    assert len(fake.calls) == 2
+    rw = _rec(two)["revert_wrap"]
+    assert rw["receipt"]["episodes_reoffered"] == 3 and rw["receipt"]["already_reverted"] is False   # first kept
+    assert rw["receipt_rerun"]["already_reverted"] is True                                          # second beside it
+    assert res.card["revert_wrap"]["episodes_reoffered"] == 3
+    assert "the day's 3 episodes will be offered" in res.message and "nothing was reopened" not in res.message
+    assert "Day 2." in (two.o2 / sn.UNDO_DIR / "memory.continuity.md").read_text()
+
+
+def test_a_store_that_will_not_open_refuses_with_the_error_and_a_remedy(two, monkeypatch):
+    import anneal_memory
+    monkeypatch.setattr(sn, "_has_revert_wrap", lambda: True)
+    monkeypatch.setattr(sn, "_wrap_open", lambda db: False)
+    monkeypatch.setattr(sn, "format_version", lambda db: sn.REVERT_FORMAT)
+    class Boom:
+        def __init__(self, *a, **k):
+            raise OSError("database is locked")
+    monkeypatch.setattr(anneal_memory, "Store", Boom)
+    before = (sn.tier_hashes(two.db), (two.o2 / "snap/manifest.json").read_text())
+    res = sn.rollback(two.db, two.o2)
+    assert not res.ok and res.code == "revert-store"
+    assert "database is locked" in res.message and "Remedy" in res.message and "has no revert_wrap" not in res.message
+    assert sn.tier_hashes(two.db) == before[0] and (two.o2 / "snap/manifest.json").read_text() == before[1]
+    assert not (two.o2 / "rollback.json").exists() and not (two.o2 / sn.UNDO_DIR).exists()
+
+
+def test_a_format_2_store_is_refused_before_any_open_when_the_anneal_would_migrate_it(two, monkeypatch):
+    if sn.format_version(two.db) != sn.SUPPORTED_FORMAT:
+        pytest.skip("scratch store is not format 2 (anneal main creates format 3)")
+    monkeypatch.setattr(sn, "_has_revert_wrap", lambda: True)
+    opened = []
+    monkeypatch.setattr(sn, "_wrap_open", lambda db: opened.append("wrap_open") or False)
+    monkeypatch.setattr(sn, "_revert_store", lambda db: opened.append("revert_store"))
+    db_bytes = two.db.read_bytes()
+    res = sn.rollback(two.db, two.o2)
+    assert not res.ok and res.code == "format" and "migrate it" in res.message and "Remedy" in res.message
+    assert opened == [] and two.db.read_bytes() == db_bytes             # no Store() open, the db untouched
