@@ -879,6 +879,48 @@ def test_a_transient_refusal_leaves_a_spawned_worker_pending(store, fake, live_h
     assert cl.launch_session(store, ln.launch_id).started      # the cause passed: the next start goes ahead
 
 
+def test_every_drop_is_in_a_read_only_file_beside_the_brief(store, fake, live_hook, wdir, spawn,
+                                                           monkeypatch):  # noqa: F811
+    monkeypatch.setattr(inst, "BRIEF_DROPS_MAX", 2)
+    d1, t = a_thread(store, "the first words")
+    arrived = [d1]
+    for i in range(3):
+        d, _ = store.accept_drop(f"more words {i}", surface="cli")
+        store.split(d.drop_id, [Part("work", attach=t.thread_id)], by="operator")
+        arrived.append(store.drop(d.drop_id))
+    ln = spawn(store, store.coord_take(), t.thread_id, wdir)
+    assert cl.launch_session(store, ln.launch_id).started
+    briefs = wdir / ".levain" / "briefs"
+    drops = briefs / f"{ln.launch_id}.drops.md"
+    assert drops.is_file() and (drops.stat().st_mode & 0o777) == 0o400
+    text = drops.read_text()
+    # every drop, oldest to newest, each with its id and its time, the words quoted as data
+    at = [text.index(f"`{d.drop_id}` ({d.received_at}): ") for d in arrived]
+    assert at == sorted(at), text
+    assert all(f"more words {i}" in text for i in range(3)) and "the first words" in text
+    brief = (briefs / f"{ln.launch_id}.md").read_text()
+    assert str(drops) in brief and "and 2 more on the thread" in brief
+    # the file goes with the brief once the launch is over
+    store.launch_end_unlisted(ln.launch_id)    # its session left the listing: the launch is over
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended", lines
+    assert not drops.exists() and not (briefs / f"{ln.launch_id}.md").exists(), lines
+    assert f"launch {ln.launch_id} ended: its drops file removed" in lines, lines
+
+
+def test_a_thread_whose_drops_exceed_the_cap_refuses_the_spawn(store, fake, live_hook, wdir, spawn,
+                                                               monkeypatch):  # noqa: F811
+    assert inst.WORKER_DROPS_MAX_BYTES >= 20 * 20_000          # room for twenty drops of the longest size
+    _d, t = a_thread(store, "x" * 900)
+    ln = spawn(store, store.coord_take(), t.thread_id, wdir)
+    monkeypatch.setattr(inst, "WORKER_DROPS_MAX_BYTES", 800)
+    why = cl.worker_refusal(ln, store)
+    assert why is not None and not why.transient and "bytes" in why and "800" in why, why
+    got = cl.launch_session(store, ln.launch_id)
+    assert not got.started and store.launch(ln.launch_id).state == "failed" and fake.spawns() == []
+    assert not (wdir / ".levain" / "briefs" / f"{ln.launch_id}.drops.md").exists()
+
+
 @pytest.mark.parametrize("where", ["drop", "thread"])
 def test_a_coord_error_building_the_context_is_permanent(store, fake, live_hook, wdir, spawn, where):  # noqa: F811
     # an unknown id or a malformed thread is no read that failed just now: retrying cannot help, so the launch is
