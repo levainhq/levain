@@ -676,6 +676,51 @@ def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, An
             "delivery": "started" if done.answered else "none"}
 
 
+def _item_answer_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+    """Answer ONE band item by its subject and version (W2): ``{kind, id, version}`` plus exactly one of ``pick`` (the
+    displayed letter) or ``text``. No view is bound, so another tab's look cannot make it stale; the version is checked
+    inside the write (:func:`levain.band_view.answer_item`), so of two concurrent answers exactly one wins. A moved
+    version is 409, an authority item 422 (it signs on its own card and never reaches the unsigned answer path), a pick
+    the item does not offer 400; a host whose answer committed and whose delivery then failed is a warning, not a
+    refusal. Unsigned, channel ``cockpit``, viewer ``cockpit:<credential>``; it authorises nothing."""
+    import threading
+
+    from levain import band_view
+    from levain.consent.questions import QuestionStoreError
+
+    store = target.get("questions")
+    if store is None:
+        raise EditError("not_built", 501, "this cockpit has no question store")
+    kind, iid, ver = params.get("kind"), params.get("id"), params.get("version")
+    pick, text = params.get("pick"), params.get("text")
+    if (not isinstance(kind, str) or not isinstance(iid, str) or not isinstance(ver, str) or not iid or not ver
+            or ("pick" in params) == ("text" in params)
+            or ("pick" in params and not isinstance(pick, str)) or ("text" in params and not isinstance(text, str))):
+        raise EditError("bad_request", 400, "answer with {kind, id, version} and exactly one of pick or text")
+    subject = {"kind": kind, "id": iid, "version": ver}
+    viewer = f"cockpit:{target.get('credential') or 'web'}"
+    try:
+        done = band_view.answer_item(store, subject, pick=pick if "pick" in params else None,
+                                     text=text if "text" in params else None, channel="cockpit", viewer=viewer)
+    except band_view.VersionMoved as exc:
+        raise EditError("version_moved", 409, str(exc)) from None
+    except band_view.AuthorityItem as exc:
+        raise EditError("authority_item", 422, str(exc)) from None
+    except band_view.PickNotOffered as exc:
+        raise EditError("pick_not_offered", 400, str(exc)) from None
+    except band_view.AnswerCommitted as exc:
+        return {"recorded": [], "refused": [], "sheets": [], "echo": "", "delivery": "failed", "warning": str(exc)}
+    except ValueError as exc:
+        raise EditError("answer_refused", 422, str(exc)) from None
+    except (QuestionStoreError, OSError, sqlite3.Error) as exc:
+        raise EditError("source_unavailable", 503, f"the question store cannot answer now: {exc}") from None
+    if done.answered:
+        threading.Thread(target=band_view.deliver_recorded, args=(store, done), name="levain-answer-delivery",
+                         daemon=True).start()
+    return {"recorded": done.recorded, "refused": done.refused, "sheets": list(done.sheets), "echo": done.echo,
+            "delivery": "started" if done.answered else "none"}
+
+
 def _resolve_kinds(direction: str) -> Callable[[dict[str, Any]], dict[str, list[Any]]]:
     """The ``spore_kind`` values anneal takes for this row's type, so a renderer offers only those."""
     def options(row: dict[str, Any]) -> dict[str, list[Any]]:
@@ -730,6 +775,9 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("band_answer", "answer", "records your shorthand answers to the NEEDS YOU band and sends them to the "
              "agents (it authorises nothing)", "create", fields=("text", "store_id", "view_id"), floor="C1",
              tier_fn=_const("C1"), reversible=False, fire=_band_fire),
+    VerbSpec("item_answer", "answer", "records your answer to one NEEDS YOU item, bound to the version you were shown "
+             "(it authorises nothing)", "create", fields=("kind", "id", "version", "pick", "text"), floor="C1",
+             tier_fn=_const("C1"), reversible=False, fire=_item_answer_fire),
     VerbSpec("note_dismiss", "dismiss", "marks an agent's note read (it tells the agent nothing and authorises "
              "nothing)", "row", floor="C1", tier_fn=_const("C1"), reversible=False, fire=_note_fire,
              applies_to=_OPEN_NOTE_ROW),

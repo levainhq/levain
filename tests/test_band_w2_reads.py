@@ -287,3 +287,216 @@ def test_a_stale_refusal_drops_the_held_read_so_the_redraw_is_fresh(tmp_path: Pa
         t.join(timeout=5)
     assert out["values"]
     assert store.get(q1.n).answer.value == "fix"
+
+
+# --- W2 session 3: the versioned row answer verb (item_answer) --------------------------------------------------------
+
+def _item_answer(base: str, params: dict, token: str = TOKEN):
+    return _post(f"{base}/cockpit/verb", {"verb": "item_answer", "panel_id": "decisions", "params": params}, token)
+
+
+def _subject_of(base: str, qid: str, token: str = TOKEN) -> dict:
+    """The subject (kind, id, version) band.json shows for question ``qid``."""
+    item = next(i for i in _get(f"{base}/cockpit/band.json", token)["items"] if i["subject"]["id"] == qid)
+    return dict(item["subject"])
+
+
+def _db_bytes(store: QuestionStore) -> bytes:
+    with sqlite3.connect(store.path) as c:
+        return json.dumps([list(map(str, r)) for t in ("questions", "answers")
+                           for r in c.execute(f"SELECT * FROM {t}")] if _has(c, "answers") else
+                          [list(map(str, r)) for r in c.execute("SELECT * FROM questions")]).encode()
+
+
+def _has(c: sqlite3.Connection, table: str) -> bool:
+    return c.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone() is not None
+
+
+def _check_moved_version_refused(base: str, store: QuestionStore, q, pin: dict | None = None) -> None:
+    stale = _subject_of(base, q.id)
+    with sqlite3.connect(store.path) as c:                                # the item changes under the person's feet
+        c.execute("DROP TRIGGER questions_frozen")                         # this test's own scratch store, no other
+        c.execute("UPDATE questions SET rec = 'none' WHERE id = ?", (q.id,))
+    assert _subject_of(base, q.id)["version"] != stale["version"]
+    if pin is not None:
+        pin["v"], pin["on"] = stale["version"], True    # the mutated comparison reads the version the person was shown
+    before = _db_bytes(store)
+    s, body = _item_answer(base, {**stale, "pick": "a"})
+    assert s == 409 and body["error"] == "version_moved", (s, body)
+    assert _db_bytes(store) == before, "a refused answer wrote"
+    assert store.get(q.n).answer is None
+
+
+def test_a_moved_version_is_refused_and_writes_nothing(tmp_path, lh):
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store, "Which retry policy?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        _check_moved_version_refused(base, store, q)
+        subj = _subject_of(base, q.id)
+        s, body = _item_answer(base, {**subj, "pick": "a"})               # the current version answers
+        assert s == 200 and body["recorded"] == ["a"], (s, body)
+    assert store.get(q.n).answer.value == "fix"
+
+
+def test_the_moved_version_check_fails_against_a_variant_without_the_guard(tmp_path, lh, monkeypatch):
+    """Mutation: both version comparisons (the early look and the one inside the write) made vacuous."""
+    pin: dict = {}
+    real = band_view.subject_version
+    monkeypatch.setattr(band_view, "subject_version", lambda q: pin.get("v") if pin.get("on") else real(q))
+    monkeypatch.setattr(band_view, "_still_version", lambda subject: (lambda conn: None))
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store, "Which retry policy?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        pin["on"] = False
+        with pytest.raises(AssertionError):
+            _check_moved_version_refused(base, store, q, pin)
+
+
+def _check_authority_never_reaches_band_answer(base: str, store: QuestionStore, calls: list) -> None:
+    before = _db_bytes(store)
+    for kind in ("consent", "sign", "extend"):                             # an approve/deny on a consent row, a sign request
+        s, body = _item_answer(base, {"kind": kind, "id": "req-1", "version": "v1", "pick": "a"})
+        assert s == 422 and body["error"] == "authority_item", (kind, s, body)
+    s, body = _item_answer(base, {"kind": "consent", "id": "req-1", "version": "v1", "text": "approve"})
+    assert s == 422, (s, body)
+    assert calls == [], f"an authority item reached the unsigned answer path: {calls}"
+    assert _db_bytes(store) == before
+
+
+def _spy_answer_paths(monkeypatch) -> list:
+    """Record every call of the shorthand answer path (what band_answer fires) and the store's answer write."""
+    calls: list = []
+    real_text = band_view.answer_text
+    real_write = QuestionStore.answer_with_context
+
+    def text(*a, **kw):
+        calls.append("answer_text")
+        return real_text(*a, **kw)
+
+    def write(self, *a, **kw):
+        calls.append("answer_with_context")
+        return real_write(self, *a, **kw)
+    monkeypatch.setattr(band_view, "answer_text", text)
+    monkeypatch.setattr(QuestionStore, "answer_with_context", write)
+    return calls
+
+
+def test_an_authority_item_never_reaches_band_answer_through_this_verb(tmp_path, lh, monkeypatch):
+    calls = _spy_answer_paths(monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    _file(store, "Which retry policy?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        _check_authority_never_reaches_band_answer(base, store, calls)
+
+
+def test_the_authority_check_fails_against_a_verb_that_routes_to_band_answer(tmp_path, lh, monkeypatch):
+    """Mutation: a verb that hands every subject to the shorthand path (band_view.answer_text) is caught."""
+    from levain.cockpit import verbs
+
+    calls = _spy_answer_paths(monkeypatch)
+
+    def leaky(store, subject, *, pick, text, channel, viewer):
+        band_view.answer_text(store, f"1{pick or 'a'}", viewer=viewer, channel=channel, store_id="x", view_id=0)
+        raise band_view.AuthorityItem("hidden")
+    monkeypatch.setattr(band_view, "answer_item", leaky)
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    _file(store, "Which retry policy?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        with pytest.raises(AssertionError):
+            _check_authority_never_reaches_band_answer(base, store, calls)
+    assert verbs                                                        # the verb module is the one under test
+
+
+def _race(base: str, subj: dict) -> list:
+    import threading
+
+    gate = threading.Barrier(2, timeout=20)
+    out: list = [None, None]
+
+    def go(i: int) -> None:
+        gate.wait()
+        out[i] = _item_answer(base, {**subj, "pick": "a" if i == 0 else "b"})
+    ts = [threading.Thread(target=go, args=(i,)) for i in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(timeout=60)
+    return out
+
+
+def _both_pass_the_early_look(monkeypatch) -> dict:
+    """Hold each request at the early (outside-the-write) version look until both have reached it, so both enter the
+    write: the race the in-write check exists for. A thread's later call (inside the write) is not held."""
+    import threading
+
+    gate = threading.Barrier(2, timeout=20)
+    real = band_view.subject_version
+    seen = threading.local()
+
+    arm = {"on": False}
+
+    def held(q):
+        if arm["on"] and not getattr(seen, "x", False):
+            seen.x = True
+            gate.wait()
+        return real(q)
+    monkeypatch.setattr(band_view, "subject_version", held)
+    return arm
+
+
+def _check_one_concurrent_answer_wins(base: str, store: QuestionStore, q, arm: dict) -> None:
+    subj = _subject_of(base, q.id)
+    arm["on"] = True
+    a, b = _race(base, subj)
+    codes = sorted([a[0], b[0]])
+    assert codes == [200, 409], (a, b)
+    loser = a if a[0] == 409 else b
+    assert loser[1]["error"] == "version_moved", loser
+    won = "fix" if a[0] == 200 else "exp"
+    assert store.get(q.n).answer.value == won
+
+
+def test_of_two_concurrent_answers_to_one_row_exactly_one_wins(tmp_path, lh, monkeypatch):
+    arm = _both_pass_the_early_look(monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store, "Which retry policy?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        _check_one_concurrent_answer_wins(base, store, q, arm)
+
+
+def test_the_concurrency_check_fails_against_a_variant_without_the_in_write_guard(tmp_path, lh, monkeypatch):
+    """Mutation: no check inside the write. Both requests pass the early look, both enter the write, and the store's own
+    refusal reaches the loser as a different error, so the version refusal the plan names is gone."""
+    arm = _both_pass_the_early_look(monkeypatch)
+    monkeypatch.setattr(band_view, "_still_version", lambda subject: (lambda conn: None))
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store, "Which retry policy?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        with pytest.raises(AssertionError):
+            _check_one_concurrent_answer_wins(base, store, q, arm)
+
+
+def test_item_answer_shapes_and_the_text_and_unoffered_pick_paths(tmp_path, lh):
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q1 = _file(store, "Which retry policy?")
+    q2 = _file(store, "Ship the sweep fix tonight?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        s1, s2 = _subject_of(base, q1.id), _subject_of(base, q2.id)
+        assert _item_answer(base, {**s1, "pick": "a", "text": "x"})[0] == 400        # both
+        assert _item_answer(base, dict(s1))[0] == 400                                  # neither
+        s, body = _item_answer(base, {**s1, "pick": "z"})
+        assert s == 400 and body["error"] == "pick_not_offered", (s, body)
+        assert store.get(q1.n).answer is None
+        s, body = _item_answer(base, {**s1, "text": "linear backoff"})
+        assert s == 200, (s, body)
+        s, body = _item_answer(base, {**s2, "pick": "a"})                              # q1's answer did not move q2
+        assert s == 200, (s, body)
+    got = store.get(q1.n).answer
+    assert (got.kind, got.value) == ("text", "linear backoff")

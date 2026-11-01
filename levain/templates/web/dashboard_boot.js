@@ -512,6 +512,9 @@
   // says only its code.
   const FAULT_WORDS = {
     stale: "That changed somewhere else first. Reload to see the new version.",
+    version_moved: "That item changed since you saw it, so nothing was recorded. Look again.",
+    authority_item: "That item is signed on its own card, so nothing was recorded.",
+    pick_not_offered: "That letter is not one of the choices. Nothing was recorded.",
     needs_intent: "This needs a fresh confirmation. Try again.",
     tier_moved: "This needs a fresh confirmation. Try again.",
     gesture_moved: "This needs a fresh confirmation. Try again.",
@@ -792,6 +795,25 @@
     finally { bandShown = null; }
   }
 
+  // answer ONE band item by its subject and version (W2): the decisions panel's offered item_answer (C1, unsigned, a human
+  // channel). No view is bound, so another tab's look cannot make it stale; a 409 `version_moved` means the item changed
+  // since it was shown and nothing was recorded, a 422 `authority_item` that it signs on its own card. `answer` is
+  // {pick} (the displayed letter) or {text}. Any outcome drops the held read, so the next band read is a fresh band.json.
+  async function answerItem(subject, answer) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const action = panelActionFor("item_answer", null);
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit no longer offers an answer here; nothing was sent" };
+    if (!subject || typeof subject !== "object" || !answer || typeof answer !== "object") {
+      return { ok: false, error: "bad_request", message: "that answer could not be formed; nothing was sent" };
+    }
+    const params = { kind: subject.kind, id: subject.id, version: subject.version };
+    if (typeof answer.pick === "string") params.pick = answer.pick;
+    else if (typeof answer.text === "string") params.text = answer.text;
+    bandShown = null;
+    try { return await postVerb(action, params, {}); }
+    finally { bandShown = null; }
+  }
+
   // dismiss an agent's note: the row's own offered note_dismiss (C1, no confirm, no params). It tells the agent nothing;
   // the kernel's 409 on a row that changed is the answer when it was dismissed elsewhere
   async function dismissNote(rowId) {
@@ -923,7 +945,7 @@
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
         window.LevainDashboard.render(mview, mview.writable
-          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
+          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, answerItem, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;
