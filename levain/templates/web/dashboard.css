@@ -3063,10 +3063,12 @@ body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
   .pr-sheet-link { min-height: var(--hit-min, 44px); display: flex; align-items: center; }
 }
 @media (max-width: 480px) {
-  /* a phone's first row has no room for words beside the brand, Sync, Jump and the theme switch (the brand gives way there): the chip is a touch-sized dot; its colour, the aria-label and the sheet carry the state */
-  body.ke .masthead .indicators .pr-chip { width: var(--hit-min); padding: 0; justify-content: center; }
-  .pr-chip-t { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-  .pr-dot { width: 12px; height: 12px; }
+  /* a phone's first row has no room for words beside the brand, Sync, Jump and the theme switch, and the phone is his main surface (he asked for the state and the time left): the chip is its own full-width row under the tabs, the word and its tail written out */
+  body.ke .masthead .indicators .pr-chip { order: 4; flex: 1 1 100%; width: auto; justify-content: flex-start; padding: 0 var(--sp-4); min-height: var(--hit-min, 44px); }
+  .pr-chip-t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pr-chip-w { font-weight: var(--fw-semibold); }
+  .pr-chip-x { color: var(--label); }
+  .pr-dot { width: 10px; height: 10px; }
 }
 /* the settings section: plain and short, not a stack of tall empty panels */
 body.ke .dev-zone.pr-settings .zone-head { display: flex; }
