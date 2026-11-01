@@ -4,13 +4,14 @@ The directory is 0700 and the file 0600; a symlinked directory or file is refuse
 ``O_NOFOLLOW`` so a link planted between the check and the open is not followed. Under a sandboxed agent the
 queue directory is outside its write reach, which is where the VAPID private key belongs.
 
-``pings``, ``deliveries`` and ``opens`` are records: a trigger refuses to change or delete a row. ``held`` is not: it is
+``pings``, ``deliveries``, ``opens`` and ``receipts`` are records: a trigger refuses to change or delete a row. ``held`` is not: it is
 the queue of pings the presence rule held back from the phone (:mod:`levain.webpush.held`). A flush claims a held ping
 with a lease (``claimed_at``) and marks it released only after a push to the phone succeeded; a claim older than
 :data:`HELD_LEASE_SECS` is taken again, so a flush that dies loses nothing and a duplicate is bounded by the lease.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import stat
@@ -29,6 +30,11 @@ STORE_FORMAT = "levain-push-store/1"
 MAX_SUBSCRIPTIONS_PER_DEVICE = 5
 MAX_SUBSCRIPTIONS = 20
 STAMP = "%Y-%m-%dT%H:%M:%SZ"   # the one stamp format of this store, whole seconds, UTC
+RECEIPT_KINDS = ("received", "shown")
+MAX_RECEIPTS_PER_DEVICE_HOUR = 600   # what one device may report in an hour: a flood cannot grow the table past this
+MAX_RECEIPTS_PER_PING_KIND = 8       # a ping delivered to one device more than once is a few rows, never unbounded
+RECEIPT_MIN_MS = 1_577_836_800_000   # 2020-01-01: a device clock before it is not a clock this record keeps
+RECEIPT_FUTURE_MS = 86_400_000       # and one a day ahead of this server's is not either
 HELD_LEASE_SECS = 300          # a held ping claimed for a push is another flush's to take again after this long
 
 
@@ -126,9 +132,14 @@ _SCHEMA: tuple[str, ...] = (
     "status INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS opens (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
     "REFERENCES pings(id), device_id TEXT, at TEXT NOT NULL)",
+    # what a device reported about a push it got: ``at`` is the worker's own clock (whole stamp plus milliseconds),
+    # ``reported_at`` this server's; the unique key makes a retried report a no-op
+    "CREATE TABLE IF NOT EXISTS receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
+    "REFERENCES pings(id), device_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('received','shown')), "
+    "at TEXT NOT NULL, reported_at TEXT NOT NULL, UNIQUE (ping_id, device_id, kind, at))",
     "CREATE TABLE IF NOT EXISTS held (ping_id INTEGER PRIMARY KEY REFERENCES pings(id), url TEXT NOT NULL, "
     "reason TEXT NOT NULL, held_at TEXT NOT NULL, released_at TEXT, claimed_at TEXT)",
-    *_records("pings"), *_records("deliveries"), *_records("opens"),
+    *_records("pings"), *_records("deliveries"), *_records("opens"), *_records("receipts"),
 )
 
 
@@ -321,6 +332,40 @@ class PushStore:
             if c.execute("SELECT 1 FROM opens WHERE ping_id = ? AND device_id IS ?", (ping_id, device_id)).fetchone() is None:
                 c.execute("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)", (ping_id, device_id, now_stamp()))
             return True
+
+    def add_receipt(self, endpoint_sha256: str, ping_id: int, kind: str, at_ms: int) -> str:
+        """Append what a device reported about a push it got. The device is the one whose live subscription's endpoint
+        hashes to ``endpoint_sha256`` (the endpoint is the secret only that device and this server hold). Answers
+        ``recorded``, ``duplicate`` (the same report again, nothing written), or the refusal: ``unknown_device`` (no live
+        subscription hashes to it), ``unknown_ping``, ``bad_report`` (a kind or time this record does not keep) or
+        ``limited`` (the device reported more than its caps: nothing written)."""
+        if kind not in RECEIPT_KINDS or isinstance(at_ms, bool) or not isinstance(at_ms, int):
+            return "bad_report"
+        if not RECEIPT_MIN_MS <= at_ms <= int(time.time() * 1000) + RECEIPT_FUTURE_MS:
+            return "bad_report"
+        at = time.strftime(STAMP[:-1], time.gmtime(at_ms // 1000)) + f".{at_ms % 1000:03d}Z"
+        with self.write() as c:
+            device = None
+            for row in live_rows(c):
+                if hashlib.sha256(str(row["endpoint"]).encode("utf-8")).hexdigest() == endpoint_sha256:
+                    device = row["device_id"]
+                    break
+            if device is None:
+                return "unknown_device"
+            if c.execute("SELECT 1 FROM pings WHERE id = ?", (ping_id,)).fetchone() is None:
+                return "unknown_ping"
+            if c.execute("SELECT 1 FROM receipts WHERE ping_id = ? AND device_id = ? AND kind = ? AND at = ?",
+                         (ping_id, device, kind, at)).fetchone() is not None:
+                return "duplicate"
+            hour_ago = time.strftime(STAMP, time.gmtime(time.time() - 3600))
+            if (c.execute("SELECT COUNT(*) FROM receipts WHERE device_id = ? AND reported_at >= ?",
+                          (device, hour_ago)).fetchone()[0] >= MAX_RECEIPTS_PER_DEVICE_HOUR
+                    or c.execute("SELECT COUNT(*) FROM receipts WHERE ping_id = ? AND device_id = ? AND kind = ?",
+                                 (ping_id, device, kind)).fetchone()[0] >= MAX_RECEIPTS_PER_PING_KIND):
+                return "limited"
+            c.execute("INSERT INTO receipts (ping_id, device_id, kind, at, reported_at) VALUES (?,?,?,?,?)",
+                      (ping_id, device, kind, at, now_stamp()))
+            return "recorded"
 
     def record(self, limit: int = 100) -> list[dict[str, Any]]:
         """The newest ``limit`` pings, each with its deliveries and opens."""

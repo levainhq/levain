@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1101-tap-trace-1';
+const SW_VERSION = '1101-receipts-1';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -15,7 +15,9 @@ const TRACE_CACHE = 'levain-trace', TRACE_PREFIX = '/__levain_trace/', TRACE_CAP
 // Cache Storage names this worker keeps: `levain-open` holds the pending tap target (see notificationclick); a later row
 // (W5b) adds its own versioned names here.
 const OPEN_CACHE = 'levain-open', OPEN_PREFIX = '/__levain_open/';
-const CACHES_KEEP = [OPEN_CACHE, TRACE_CACHE];
+// A device receipt (see sendReceipt) that could not be delivered waits in its own cache, one entry per ping and kind.
+const RECEIPT_CACHE = 'levain-receipts', RECEIPT_PREFIX = '/__levain_receipt/', RECEIPT_MS = 3000, RECEIPT_DRAIN = 20;
+const CACHES_KEEP = [OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE];
 // How long a 'for: new' entry lives (and how long the worker keeps one after a successful openWindow): the window between
 // openWindow and the opened page's first script run. The page's own limit for 'new' entries is the same figure (sw_open.js).
 const NEW_TTL_MS = 30000;  // a cold-started Home Screen app can take seconds to run its first script; the claim is
@@ -57,6 +59,77 @@ const traceSettled = () => {
   let timer;
   return Promise.race([traceChain, new Promise((r) => { timer = setTimeout(r, 3000); })]).finally(() => clearTimeout(timer));
 };
+
+// --- device receipts -----------------------------------------------------------------------------------------------
+// A push the device got is reported to the server: `received` when the push event fired, `shown` when showNotification
+// resolved. The worker holds no credential, so a report names the SHA-256 of its own push-subscription endpoint (the
+// secret only the device and the server share) and carries ids and times only. Every step is total: nothing in here
+// throws into the notification, and each wait is bounded.
+let endpointHashP = null;
+function endpointHash() {
+  if (!endpointHashP) {
+    endpointHashP = (async () => {
+      const sub = await self.registration.pushManager.getSubscription();
+      if (!sub || !sub.endpoint) return null;
+      const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sub.endpoint));
+      return Array.from(new Uint8Array(d)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    })().catch(() => null);
+  }
+  return endpointHashP;
+}
+// the HTTP status of one POST, or throws after RECEIPT_MS
+async function postReceipt(body) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), RECEIPT_MS);
+  try {
+    const r = await fetch('/webpush/receipt', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                credentials: 'same-origin', cache: 'no-store', body: JSON.stringify(body), signal: ac.signal });
+    return r.status;
+  } finally { clearTimeout(timer); }
+}
+// a status that retrying cannot change: delivered, or refused for this report itself
+const receiptSettled = (status) => status === 200 || (status >= 400 && status < 500 && status !== 408 && status !== 429);
+async function queueReceipt(body) {
+  const c = await caches.open(RECEIPT_CACHE);
+  await c.put(RECEIPT_PREFIX + body.ping + '-' + body.kind, new Response(JSON.stringify(body)));
+}
+// true when the server answered (so the network is up and a drain is worth its time), false otherwise; never throws
+async function sendReceipt(ping, kind, at) {
+  try {
+    if (!Number.isInteger(ping) || ping <= 0) { trace('receipt', { kind, ping: null, result: 'no-ping' }); return false; }
+    const hash = await endpointHash();
+    if (!hash) { trace('receipt-no-sub', { kind, ping }); return false; }
+    const body = { ping, kind, at, endpoint_sha256: hash };
+    let status = null;
+    try { status = await postReceipt(body); } catch (err) { status = null; }
+    if (status === 200) { trace('receipt', { kind, ping, result: 'ok' }); return true; }
+    if (status !== null && receiptSettled(status)) { trace('receipt', { kind, ping, result: 'refused', status }); return true; }
+    try { await queueReceipt(body); trace('receipt', { kind, ping, result: 'queued', status }); } catch (_) { trace('receipt', { kind, ping, result: 'lost', status }); }
+    return status !== null;
+  } catch (_) { return false; /* a receipt never reaches the notification */ }
+}
+// re-send queued receipts, oldest first, up to RECEIPT_DRAIN; one that cannot be delivered stops the drain (the network is
+// the likely cause), one the server settled is dropped
+async function drainReceipts() {
+  try {
+    if (typeof caches === 'undefined') return;
+    const c = await caches.open(RECEIPT_CACHE);
+    const keys = (await c.keys()).map((r) => new URL(r.url).pathname).filter((k) => k.indexOf(RECEIPT_PREFIX) === 0);
+    const items = [];
+    for (const k of keys) {
+      try { const m = await c.match(k); items.push({ k, body: JSON.parse(await m.text()) }); } catch (_) { await c.delete(k); }
+    }
+    items.sort((a, b) => (a.body.at || 0) - (b.body.at || 0));
+    for (const { k, body } of items.slice(0, RECEIPT_DRAIN)) {
+      let status = null;
+      try { status = await postReceipt(body); } catch (_) { status = null; }
+      if (status !== null && receiptSettled(status)) {
+        await c.delete(k);
+        trace('receipt', { kind: body.kind, ping: body.ping, result: status === 200 ? 'drained' : 'refused', status });
+      } else { trace('receipt', { kind: body.kind, ping: body.ping, result: 'still-queued', status }); break; }
+    }
+  } catch (_) { /* best effort */ }
+}
 
 function open() {
   return new Promise((resolve, reject) => {
@@ -113,20 +186,27 @@ self.addEventListener('activate', (e) => e.waitUntil((async () => {
 })()));
 
 self.addEventListener('push', (e) => {
+  const t0 = Date.now();
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: e.data ? e.data.text() : '' }; }
   const title = d.title || 'Levain';
   trace('sw-version', { version: SW_VERSION, on: 'push' });
   trace('push', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
-  // a fixed tag with renotify: a re-ping for the same item replaces the earlier notification and alerts again
-  e.waitUntil(self.registration.showNotification(title, {
+  const ping = typeof d.ping === 'number' ? d.ping : Number(d.ping);
+  // a fixed tag with renotify: a re-ping for the same item replaces the earlier notification and alerts again. The
+  // notification is asked for first and never waits on a receipt: the reports run beside it, inside the same waitUntil
+  const shown = Promise.resolve().then(() => self.registration.showNotification(title, {
     body: d.body || '',
     tag: d.tag || 'levain',
     renotify: true,
     icon: '/icon-192.png',
     badge: '/badge-96.png',   // monochrome alpha: Android draws only the alpha channel in the status bar
     data: { url: d.url || '/', ping: d.ping },
-  }).finally(traceSettled));
+  })).then(() => sendReceipt(ping, 'shown', Date.now()));
+  const received = sendReceipt(ping, 'received', t0);
+  // the queue is re-sent after this push's own reports, and only when the server answered one of them
+  e.waitUntil(Promise.allSettled([shown, received]).then((r) => (r.some((x) => x.value === true) ? drainReceipts() : null)).finally(traceSettled));
+  shown.catch((err) => trace('show-failed', { error: err && err.name || 'error' }));
 });
 
 // How long a tap waits for the page's ack before the worker's own paths run. Short on purpose: clients.openWindow()
@@ -279,5 +359,5 @@ self.addEventListener('notificationclick', (e) => {
     const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     for (const c of wins) c.postMessage({ type: 'levain-opened' });
   })();
-  e.waitUntil(Promise.allSettled([opened, mark]).then(traceSettled));
+  e.waitUntil(Promise.allSettled([opened, mark, drainReceipts()]).then(traceSettled));
 });
