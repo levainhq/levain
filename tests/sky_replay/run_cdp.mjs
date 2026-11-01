@@ -23,9 +23,9 @@ const dirsOf = (d) => readdirSync(d, { withFileTypes: true }).filter((e) => e.is
 // Chrome mints a Secure Enclave key in the operator's keychain on every fresh profile (no flag stops it), the shell never does.
 // A shell binary counts only if it is a regular executable file in a "-mac-<this host's arch>" directory (versions compared
 // numerically; a stray file is skipped); anything else falls back to the given Chrome. The given Chrome is kept when
-// LEVAIN_FULL_CHROME=1, or when it is not DEFAULT_CHROME (a caller that named a Chrome on purpose gets that Chrome).
+// LEVAIN_FULL_CHROME=1, when CHROME is set (as Python reads it), or when it is not DEFAULT_CHROME (a caller that named a Chrome on purpose gets that Chrome).
 const pickChrome = (given, cfg) => {
-  if (process.env.LEVAIN_FULL_CHROME === "1" || given !== DEFAULT_CHROME) return given;
+  if (process.env.LEVAIN_FULL_CHROME === "1" || (process.env.CHROME ?? "") !== "" || given !== DEFAULT_CHROME) return given;
   const raw = cfg.headless_shell_root;
   if (raw === undefined || raw === null || raw === "") return given;
   if (typeof raw !== "string") { console.error("chrome_flags.json: headless_shell_root is not a string; using the given Chrome"); return given; }
@@ -44,7 +44,7 @@ const pickChrome = (given, cfg) => {
   return given;
 };
 const picked = pickChrome(chrome, chromeCfg);
-if (process.env.LEVAIN_PICK_CHROME_DRY === '1') { process.stdout.write(picked + '\n'); rmSync(profile, { recursive: true, force: true }); process.exit(0); }   // a test of the selection: print the pick, launch nothing
+if (process.env.LEVAIN_TEST_PICK_CHROME_DRY === '1') { process.stdout.write(picked + '\n'); rmSync(profile, { recursive: true, force: true }); process.exit(0); }   // a test of the selection: print the pick, launch nothing
 const proc = spawn(picked, [...chromeFlags, '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
   '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--window-size=1180,700', 'about:blank'], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

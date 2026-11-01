@@ -135,12 +135,14 @@ def _cases(tmp: Path):
         ("LEVAIN_FULL_CHROME=1", with_shell, {"LEVAIN_FULL_CHROME": "1"}, False),
         ("a Chrome named on purpose", with_shell, {}, True),
         ("a drive that declared needs_full_chrome", with_shell, {"LEVAIN_DRIVE_FULL_CHROME": "1"}, False),
+        ("CHROME set to exactly the default path", with_shell, {"CHROME": GIVEN}, False),
     ]
 
 
 # the cases whose answer is the shell (the rest answer the given Chrome); the declared-full-Chrome case is a driver rule, not the python selector's
 SHELL_CASES = {"installed and executable", "newest version by number, not by text", "a stray file in the cache is skipped"}
-DRIVER_ONLY = {"a drive that declared needs_full_chrome"}
+DRIVER_ONLY = {"a drive that declared needs_full_chrome", "CHROME set to exactly the default path"}
+AMBIENT = ("LEVAIN_FULL_CHROME", "LEVAIN_DRIVE_FULL_CHROME")   # a case never inherits these from the runner's environment
 
 
 def _run_table(pick, tmp_path: Path, *, driver_cases: bool) -> list[str]:
@@ -163,13 +165,20 @@ def _run_table(pick, tmp_path: Path, *, driver_cases: bool) -> list[str]:
 def _py_pick(root, given, env, explicit):
     flags = root.parent / f"{root.name}.flags.json"
     flags.write_text(json.dumps({"flags": [], "headless_shell_root": str(root)}))
-    old = {k: os.environ.get(k) for k in env}
+    old = {k: os.environ.get(k) for k in (*AMBIENT, *env)}
+    for k in AMBIENT:
+        os.environ.pop(k, None)
     os.environ.update(env)
     try:
         return _shared_chrome._pick_chrome(given, explicit=explicit, flags_file=flags)
     finally:
         for k, v in old.items():
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+def _clean_env() -> dict[str, str]:
+    """The runner's environment without the variables a case sets for itself (full-Chrome switches, a named CHROME)."""
+    return {k: v for k, v in os.environ.items() if k not in (*AMBIENT, "CHROME")}
 
 
 def _node_pick(script: str):
@@ -184,7 +193,7 @@ def _node_pick(script: str):
         steps.write_text("[]")
         argv = [NODE, str(dest), given if not explicit else given + "-named", "about:blank", str(steps)] if script == "_page_drive.mjs" \
             else [NODE, str(dest), given if not explicit else given + "-named", "-"]
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=60, env={**os.environ, "LEVAIN_PICK_CHROME_DRY": "1", **env})
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60, env={**_clean_env(), "LEVAIN_TEST_PICK_CHROME_DRY": "1", **env})
         assert r.returncode == 0, r.stderr
         out = r.stdout.strip()
         return given if out == given + "-named" else out
@@ -237,3 +246,51 @@ def test_the_drivers_name_the_flags_file_and_the_launcher_spreads_it():
     """The wiring the behaviour tests above cannot see: the flags file names a root, and both node drivers read their config."""
     cfg = json.loads(FLAGS_FILE.read_text(encoding="utf-8"))
     assert cfg["headless_shell_root"].startswith("~/")
+
+
+@pytest.mark.skipif(NODE is None, reason="node is needed")
+@on_mac
+@pytest.mark.parametrize("script", ["_page_drive.mjs", "sky_replay/run_cdp.mjs"])
+@pytest.mark.parametrize("ambient", AMBIENT)
+def test_an_ambient_full_chrome_variable_does_not_leak_into_the_cases(tmp_path, monkeypatch, script, ambient):
+    """The runner's own LEVAIN_FULL_CHROME / LEVAIN_DRIVE_FULL_CHROME must not decide the env={} cases (python or node)."""
+    monkeypatch.setenv(ambient, "1")
+    for sub in ("py", "node"):
+        (tmp_path / sub).mkdir()
+    assert _run_table(_py_pick, tmp_path / "py", driver_cases=False) == []
+    assert _run_table(_node_pick(script), tmp_path / "node", driver_cases=script == "_page_drive.mjs") == []
+
+
+def _drive_pick(tmp_path: Path, steps_text: str) -> str:
+    """The Chrome ``_page_drive.mjs`` would launch for a drive whose steps are ``steps_text`` (dry run), with a shell installed."""
+    root = tmp_path / "cache"
+    shell = _shell(root, "156.0.8078.80", HOST_ARCH)
+    d = tmp_path / "drv"
+    d.mkdir()
+    (d / "_page_drive.mjs").write_text((ROOT / "tests" / "_page_drive.mjs").read_text(encoding="utf-8"), encoding="utf-8")
+    (d / "chrome_flags.json").write_text(json.dumps({"flags": [], "headless_shell_root": str(root)}))
+    steps = d / "steps.json"
+    steps.write_text(json.dumps([{"eval": steps_text}]))
+    r = subprocess.run([NODE, str(d / "_page_drive.mjs"), GIVEN, "about:blank", str(steps)], capture_output=True, text=True, timeout=60,
+                       env={**_clean_env(), "LEVAIN_TEST_PICK_CHROME_DRY": "1"})
+    assert r.returncode == 0, r.stderr
+    out = r.stdout.strip()
+    assert out in (GIVEN, str(shell)), out
+    return "full" if out == GIVEN else "shell"
+
+
+@pytest.mark.skipif(NODE is None, reason="node is needed")
+@on_mac
+def test_the_source_sniff_routes_real_push_use_to_full_chrome_and_a_push_api_delete_to_the_shell(tmp_path):
+    cases = [
+        ("delete window.Notification; delete window.PushManager;", "shell"),
+        ("1 + 1", "shell"),
+        ("PushManager.prototype.subscribe = async () => null;", "full"),   # the positive control: a real push use
+        ("navigator.serviceWorker.register('/sw.js')", "full"),
+        ("reg.pushManager.getSubscription()", "full"),
+        ("Notification.requestPermission()", "full"),
+        ("new Notification('x')", "full"),
+    ]
+    wrong = [f"{text!r}: got {got}, want {want}" for i, (text, want) in enumerate(cases)
+             if (got := _drive_pick(tmp_path / f"c{i}", text)) != want]
+    assert wrong == []

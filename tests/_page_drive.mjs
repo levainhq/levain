@@ -77,9 +77,9 @@ const dirsOf = (d) => readdirSync(d, { withFileTypes: true }).filter((e) => e.is
 // Chrome mints a Secure Enclave key in the operator's keychain on every fresh profile (no flag stops it), the shell never does.
 // A shell binary counts only if it is a regular executable file in a "-mac-<this host's arch>" directory (versions compared
 // numerically; a stray file is skipped); anything else falls back to the given Chrome. The given Chrome is kept when
-// LEVAIN_FULL_CHROME=1, or when it is not DEFAULT_CHROME (a caller that named a Chrome on purpose gets that Chrome).
+// LEVAIN_FULL_CHROME=1, when CHROME is set (as Python reads it), or when it is not DEFAULT_CHROME (a caller that named a Chrome on purpose gets that Chrome).
 const pickChrome = (given, cfg) => {
-  if (process.env.LEVAIN_FULL_CHROME === "1" || given !== DEFAULT_CHROME) return given;
+  if (process.env.LEVAIN_FULL_CHROME === "1" || (process.env.CHROME ?? "") !== "" || given !== DEFAULT_CHROME) return given;
   const raw = cfg.headless_shell_root;
   if (raw === undefined || raw === null || raw === "") return given;
   if (typeof raw !== "string") { console.error("chrome_flags.json: headless_shell_root is not a string; using the given Chrome"); return given; }
@@ -105,14 +105,14 @@ const extraFlags = process.env.LEVAIN_DRIVE_CHROME_FLAGS ? JSON.parse(process.en
 // fail-safe that also routes to the full Chrome (union with the declaration, never instead of it). LEVAIN_FULL_CHROME=1 also takes
 // a drive off the session's shell port: the drive spawns its own full Chrome.
 const needsFullChrome = process.env.LEVAIN_DRIVE_FULL_CHROME === "1" || process.env.LEVAIN_FULL_CHROME === "1"
-  || /serviceWorker|PushManager|Notification\./.test(JSON.stringify(steps));
+  || /serviceWorker|[Pp]ushManager\.|\.pushManager|Notification\.|new Notification/.test(JSON.stringify(steps));   // actual use only: a drive that DELETES window.PushManager (no push API on purpose) stays on the shell
 let sharedPort = /^[0-9]+$/.test(process.env.LEVAIN_DRIVE_CDP_PORT ?? "") && extraFlags.length === 0 && !needsFullChrome ? Number(process.env.LEVAIN_DRIVE_CDP_PORT) : null;
 // a Chrome of our own: this process owns it, its port and its profile (also the way out when the shared Chrome fails to set up)
 let prof = null; let port = null;
 let chrome = { exitCode: 0, signalCode: null, kill() {}, once() {} };   // nothing of ours to kill while the Chrome belongs to the session
 const startSpawn = async () => {
   const bin = needsFullChrome ? chromePath : pickChrome(chromePath, chromeCfg);
-  if (process.env.LEVAIN_PICK_CHROME_DRY === "1") { process.stdout.write(bin + "\n"); process.exit(0); }   // a test of the selection: print the pick, launch nothing
+  if (process.env.LEVAIN_TEST_PICK_CHROME_DRY === "1") { process.stdout.write(bin + "\n"); process.exit(0); }   // a test of the selection: print the pick, launch nothing
   port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
   prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
   if (process.env.LEVAIN_DRIVE_LAUNCH_LOG) { try { appendFileSync(process.env.LEVAIN_DRIVE_LAUNCH_LOG, "spawn\n"); } catch {} }
