@@ -22,22 +22,41 @@ const NEW_TTL_MS = 30000;  // a cold-started Home Screen app can take seconds to
                            // already limited to a page at '/' or at the target, so a longer window is cheap
 
 let traceChain = Promise.resolve(), traceSeq = 0;
-// a url reduced to path and query (a fragment can carry a sign token, so it is dropped to a marker)
+// a url reduced to its path, an allowlisted `?view=<value>` (clipped) and markers: other query parameters can carry a
+// credential (written `?...`), and a fragment can carry a sign token (written `#...`)
 function traceUrl(u) {
-  try { const x = new URL(u, self.location.origin); return x.pathname + x.search + (x.hash ? '#...' : ''); } catch (_) { return null; }
+  try {
+    const x = new URL(u, self.location.origin);
+    const v = x.searchParams.get('view');
+    const others = Array.from(x.searchParams.keys()).some((k) => k !== 'view');
+    const q = v !== null ? '?view=' + encodeURIComponent(v.slice(0, 40)) : (others || x.search ? '?...' : '');
+    return x.pathname + q + (x.hash ? '#...' : '');
+  } catch (_) { return null; }
 }
+// a ping or tag recorded only as a string or a finite number (the tag clipped); anything else is null
+function traceScalar(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  return typeof v === 'string' ? v.slice(0, 60) : null;
+}
+// total: nothing in here (the clock, the key, the JSON, the promise chain) can throw into the tap
 function trace(step, detail) {
-  const t = Date.now(), seq = String(traceSeq++).padStart(4, '0');
-  traceChain = traceChain.then(async () => {
-    if (typeof caches === 'undefined') return;
-    const c = await caches.open(TRACE_CACHE);
-    await c.put(TRACE_PREFIX + String(t).padStart(13, '0') + '-' + seq, new Response(JSON.stringify({ t, src: 'sw', step, ...detail })));
-    const keys = (await c.keys()).map((r) => new URL(r.url).pathname).filter((k) => k.indexOf(TRACE_PREFIX) === 0).sort();
-    for (const k of keys.slice(0, Math.max(0, keys.length - TRACE_CAP))) await c.delete(k);
-  }).catch(() => { /* best effort: a failed trace write never reaches the tap */ });
+  try {
+    const t = Date.now(), seq = String(traceSeq++).padStart(4, '0');
+    traceChain = traceChain.then(async () => {
+      if (typeof caches === 'undefined') return;
+      const c = await caches.open(TRACE_CACHE);
+      await c.put(TRACE_PREFIX + String(t).padStart(13, '0') + '-' + seq, new Response(JSON.stringify({ t, src: 'sw', step, ...detail })));
+      const keys = (await c.keys()).map((r) => new URL(r.url).pathname).filter((k) => k.indexOf(TRACE_PREFIX) === 0).sort();
+      for (const k of keys.slice(0, Math.max(0, keys.length - TRACE_CAP))) await c.delete(k);
+    }).catch(() => { /* best effort: a failed trace write never reaches the tap */ });
+  } catch (_) { /* best effort */ }
 }
-// what a click's waitUntil may hold on the trace: bounded, so a stuck cache cannot keep the worker alive
-const traceSettled = () => Promise.race([traceChain, new Promise((r) => setTimeout(r, 3000))]);
+// what a click's waitUntil may hold on the trace: bounded, so a stuck cache cannot keep the worker alive; the timer is
+// cleared when the chain settles first
+const traceSettled = () => {
+  let timer;
+  return Promise.race([traceChain, new Promise((r) => { timer = setTimeout(r, 3000); })]).finally(() => clearTimeout(timer));
+};
 
 function open() {
   return new Promise((resolve, reject) => {
@@ -98,7 +117,7 @@ self.addEventListener('push', (e) => {
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: e.data ? e.data.text() : '' }; }
   const title = d.title || 'Levain';
   trace('sw-version', { version: SW_VERSION, on: 'push' });
-  trace('push', { tag: d.tag || 'levain', ping: d.ping === undefined ? null : d.ping });
+  trace('push', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
   // a fixed tag with renotify: a re-ping for the same item replaces the earlier notification and alerts again
   e.waitUntil(self.registration.showNotification(title, {
     body: d.body || '',
@@ -164,7 +183,7 @@ self.addEventListener('notificationclick', (e) => {
   if (!u || u.origin !== self.location.origin) u = new URL('/', self.location.origin);
   const url = u.href;
   trace('sw-version', { version: SW_VERSION, on: 'notificationclick' });
-  trace('click', { url: traceUrl(url), ping: data.ping === undefined ? null : data.ping });
+  trace('click', { url: traceUrl(url), ping: traceScalar(data.ping) });
   const opened = (async () => {
     const sameOrigin = (c) => { try { return new URL(c.url).origin === self.location.origin; } catch (_) { return false; } };
     // 1. the 'asked' entry is written in PARALLEL with the window lookups (nothing else is awaited before the ack wait), and
@@ -185,7 +204,10 @@ self.addEventListener('notificationclick', (e) => {
     const dropAsked = async () => { try { return await dropPending(askedKey); } catch (_) { return false; } };
     // 2. the window: a controlled cockpit-type page, else any controlled one, else any same-origin one
     const ctl = ctlAll.filter(sameOrigin);
-    const pool = ctl.length ? ctl : anyAll.filter(sameOrigin);
+    // the trace page itself is never the window to take over (it would be navigated away from the ring it shows)
+    const notTrace = (c) => { try { return new URL(c.url).pathname !== '/tap_trace'; } catch (_) { return true; } };
+    const ctlP = ctl.filter(notTrace);
+    const pool = ctlP.length ? ctlP : anyAll.filter(sameOrigin).filter(notTrace);
     const c = pool.find(isCockpitPath) || pool[0];
     // the fallback: a 'for: new' entry (one new nonce), then openWindow; a refused or empty openWindow deletes that entry,
     // so a plain visit to '/' later is never sent to a card nobody opened

@@ -14,6 +14,8 @@ from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import PROXY, _call, _serve
 from tests.test_sw_worker import _open_rig, _run, needs_node
 
+CARD = "https://box.example/sign/9#sign=a&v=1"
+
 
 @pytest.fixture
 def src(tmp_path: Path) -> SubstrateSource:
@@ -94,6 +96,58 @@ def test_the_page_records_load_message_claim_and_assign_without_a_fragment() -> 
     cp = [e for e in got["trace"] if e["step"] == "checkPending"]
     first = cp[0]
     assert first["claimed"] == "/sign/9#..." and first["assigned"] is True and first["seen"][0]["for"] == "new", first
+
+
+@needs_node
+def test_a_url_keeps_only_the_view_param_and_markers_and_no_secret_is_recorded() -> None:
+    got = _run("navigate", "secreturl+ack")
+    text = json.dumps(got["trace"])
+    assert "SECRET" not in text and "write_token" not in text and "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" not in text, text
+    by = {e["step"]: e for e in got["trace"]}
+    assert by["click"]["url"] == "/?view=needs#...", by["click"]
+    assert by["click"]["ping"] is None, by["click"]                                 # an object ping is not recorded
+    assert by["matchAll"]["controlledWindows"][0]["url"] == "/?view=needs#...", by["matchAll"]
+    assert by["ack"]["window"] == "/?view=needs#..."
+
+
+@needs_node
+def test_a_push_records_a_clipped_tag_and_scalar_ping_only() -> None:
+    sw = (Path(__file__).resolve().parent.parent / "levain" / "webpush" / "static" / "sw.js").read_text(encoding="utf-8")
+    assert "traceScalar(d.tag" in sw and "traceScalar(d.ping)" in sw and "slice(0, 60)" in sw
+
+
+@needs_node
+def test_the_page_records_the_nonce_as_a_flag_never_its_value_and_url_params_are_dropped() -> None:
+    got = _open_rig("claim")
+    text = json.dumps(got["trace"])
+    assert '"n1"' not in text and '"other"' not in text, text
+    msgs = [e for e in got["trace"] if e["step"] == "message"]
+    assert msgs and all(e["nonce"] is True for e in msgs), msgs
+    sw_open = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "sw_open.js").read_text(encoding="utf-8")
+    assert "nonce: typeof d.nonce" in sw_open and "d.nonce : null" not in sw_open
+
+
+@needs_node
+def test_a_page_whose_clock_throws_inside_trace_still_acks_and_assigns() -> None:
+    got = _open_rig("datethrow")
+    assert got["afterThrow"]["acks"] == 1 and got["afterThrow"]["assigned"] == ["https://box.example/sign/9#sign=a&v=1"], got
+    assert got["trace"] == [], got["trace"]                                          # nothing could be written, nothing threw
+
+
+@needs_node
+def test_a_tap_trace_page_open_is_never_the_window_taken_over() -> None:
+    got = _run("navigate", "tapwin+ack")
+    assert got["asked"] == [] and got["navigated"] == [] and got["openedUrl"] == CARD, got   # no window: openWindow runs
+    steps = _steps(got)
+    assert "openWindow" in steps and "ack" not in steps, steps
+    got = _run("navigate", "tapwin2+ack")             # another window beside it is the one asked
+    assert got["asked"] == [CARD] and got["askedWho"] == ["https://box.example/docs/guide"], got
+
+
+@needs_node
+def test_the_trace_page_skips_entries_that_are_not_step_records() -> None:
+    js = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "tap_trace.js").read_text(encoding="utf-8")
+    assert "Number.isFinite(e.t)" in js and 'typeof e.step === "string"' in js and "e && typeof e" in js
 
 
 def test_tap_trace_is_served_without_a_credential_and_carries_no_token_field(src) -> None:

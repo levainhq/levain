@@ -26,18 +26,32 @@
   // (it can carry a sign token), and no token or ping body is ever written.
   const TRACE_CACHE = "levain-trace", TRACE_PREFIX = "/__levain_trace/", TRACE_CAP = 60;
   let traceChain = Promise.resolve(), traceSeq = 0;
-  const traceUrl = (u) => { try { const x = new URL(String(u), location.href); return x.pathname + x.search + (x.hash ? "#..." : ""); } catch (_) { return null; } };
-  const trace = (step, detail) => {
-    const t = Date.now(), seq = "p" + String(traceSeq++).padStart(3, "0");
-    traceChain = traceChain.then(async () => {
-      if (!haveCache) return;
-      const c = await caches.open(TRACE_CACHE);
-      await c.put(TRACE_PREFIX + String(t).padStart(13, "0") + "-" + seq, new Response(JSON.stringify({ t, src: "page", step, ...detail })));
-      const keys = (await c.keys()).map((r) => new URL(r.url).pathname).filter((k) => k.indexOf(TRACE_PREFIX) === 0).sort();
-      for (const k of keys.slice(0, Math.max(0, keys.length - TRACE_CAP))) await c.delete(k);
-    }).catch(() => { /* best effort: a failed trace write never reaches the tap */ });
+  // a url reduced to its path, an allowlisted `?view=<value>` (clipped) and markers: other query parameters can carry a
+  // credential (written `?...`), a fragment a sign token (written `#...`)
+  const traceUrl = (u) => {
+    try {
+      const x = new URL(String(u), location.href);
+      const v = x.searchParams.get("view");
+      const others = Array.from(x.searchParams.keys()).some((k) => k !== "view");
+      const q = v !== null ? "?view=" + encodeURIComponent(v.slice(0, 40)) : (others || x.search ? "?..." : "");
+      return x.pathname + q + (x.hash ? "#..." : "");
+    } catch (_) { return null; }
   };
-  const assignTo = (href) => { trace("assign", { target: traceUrl(href) }); location.assign(href); };
+  // total: nothing in here (the clock, the key, the JSON, the promise chain) can throw into the tap
+  const trace = (step, detail) => {
+    try {
+      const t = Date.now(), seq = "p" + String(traceSeq++).padStart(3, "0");
+      traceChain = traceChain.then(async () => {
+        if (!haveCache) return;
+        const c = await caches.open(TRACE_CACHE);
+        await c.put(TRACE_PREFIX + String(t).padStart(13, "0") + "-" + seq, new Response(JSON.stringify({ t, src: "page", step, ...detail })));
+        const keys = (await c.keys()).map((r) => new URL(r.url).pathname).filter((k) => k.indexOf(TRACE_PREFIX) === 0).sort();
+        for (const k of keys.slice(0, Math.max(0, keys.length - TRACE_CAP))) await c.delete(k);
+      }).catch(() => { /* best effort: a failed trace write never reaches the tap */ });
+    } catch (_) { /* best effort */ }
+  };
+  // the assign comes first: the trace of it may often be lost to the navigation, which is fine
+  const assignTo = (href) => { location.assign(href); trace("assign", { target: traceUrl(href) }); };
   try {
     trace("page-load", {
       href: traceUrl(location.href),
@@ -63,7 +77,7 @@
       assignTo(u.href);
     };
     // no cache, or the worker could not write a target: message-only, as before
-    const msg = { type: d.type, url: traceUrl(u.href), nonce: typeof d.nonce === "string" ? d.nonce : null };
+    const msg = { type: d.type, url: traceUrl(u.href), nonce: typeof d.nonce === "string" };
     if (!haveCache || typeof d.nonce !== "string") { trace("message", { ...msg, claim: "message-only" }); go(); return; }
     // only the key this message names, and only a nonce shaped like the worker's: a lost claim means another path (or the
     // worker) already owns this open, so no ack and no navigation

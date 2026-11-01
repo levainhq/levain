@@ -33,7 +33,7 @@ const tick = () => new Promise((r) => setTimeout(r, 30));
 async function boot(href = 'https://box.example/') {
   handlers = []; winHandlers = {}; docHandlers = {};
   sandbox = {
-    URL, Response, Date, Promise, JSON, setTimeout,
+    URL, Response, Date: scenario === 'datethrow' ? Object.assign(class extends Date { static now() { throw new Error('clock'); } }) : Date, Promise, JSON, setTimeout,
     location: { origin: 'https://box.example', href, assign: (u) => log.assigned.push(u) },
     navigator: { standalone: true, serviceWorker: { controller: {}, addEventListener: (t, fn) => handlers.push(fn), startMessages: () => { log.started = true; } } },
     window: { addEventListener: (t, fn) => { (winHandlers[t] = winHandlers[t] || []).push(fn); } },
@@ -70,6 +70,12 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     send({ type: 'other', url: '/x' });
     if (scenario === 'nocache') send({ type: 'levain-open', url: U, nonce: 'whatever' });
     await tick();
+  } else if (scenario === 'datethrow') {
+    // the clock throws inside every trace call: the page still acks and assigns
+    put('n1', { url: U, at: Date.now(), for: 'asked' });
+    send({ type: 'levain-open', url: U, nonce: 'n1' });
+    await tick();
+    log.afterThrow = { acks: log.acks.length, assigned: log.assigned.slice() };
   } else if (scenario === 'claim') {
     put('n1', { url: U, at: Date.now(), for: 'asked' });
     put('n2', { url: '/sign/10', at: Date.now(), for: 'asked' });

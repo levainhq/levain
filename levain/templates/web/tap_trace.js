@@ -15,7 +15,11 @@
     for (const req of await c.keys()) {
       const key = new URL(req.url).pathname;
       if (key.indexOf(PREFIX) !== 0) continue;
-      try { const r = await c.match(req); out.push({ key, e: await r.json() }); } catch (_) { /* an unreadable entry is skipped */ }
+      try {
+        const r = await c.match(req), e = await r.json();
+        // an entry that is not a step record (null, a scalar, no clock or step) is skipped
+        if (e && typeof e === "object" && Number.isFinite(e.t) && typeof e.step === "string") out.push({ key, e });
+      } catch (_) { /* an unreadable entry is skipped */ }
     }
     out.sort((a, b) => (a.key < b.key ? 1 : -1));   // newest first
     return out;

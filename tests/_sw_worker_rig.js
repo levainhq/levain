@@ -150,9 +150,12 @@ function fire(type, ev) {
     else if (kind === 'matchfail') { self_.clients.matchAll = async () => { throw new TypeError('matchAll refused'); }; }
     else if (kind === 'opennull') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; log.entriesAtOpen = pendings(); return null; }; }
     else if (kind === 'openfail') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; throw new TypeError('openWindow refused'); }; }
+    else if (kind === 'secreturl') log.windows = [win(ok, 'https://box.example/?write_token=SECRET&view=needs#frag')];
+    else if (kind === 'tapwin') log.windows = [win(ok, 'https://box.example/tap_trace')];
+    else if (kind === 'tapwin2') log.windows = [win(ok, 'https://box.example/tap_trace'), win(ok, 'https://box.example/docs/guide')];
     else if (kind === 'prefer') log.windows = [win(ok, 'https://box.example/docs/guide'), win(async (u) => { log.navigated.push('cockpit:' + u); return { url: u }; }, 'https://box.example/sign/3')];
-    const url = kind === 'crossorigin' ? 'https://evil.example/x' : kind === 'search' ? '/?view=needs' : '/sign/9#sign=a&v=1';
-    const first = fire('notificationclick', { notification: { close: () => {}, data: { url } } });
+    const url = kind === 'crossorigin' ? 'https://evil.example/x' : kind === 'search' ? '/?view=needs' : kind === 'secreturl' ? '/?write_token=SECRET&view=needs#frag' : '/sign/9#sign=a&v=1';
+    const first = fire('notificationclick', { notification: { close: () => {}, data: { url, ping: kind === 'secreturl' ? { write_token: 'SECRET' } : undefined, tag: kind === 'secreturl' ? 'x'.repeat(100) : undefined } } });
     if (extra === 'two') { await new Promise((r) => setTimeout(r, 100)); await fire('notificationclick', { notification: { close: () => {}, data: { url: '/sign/10' } } }); }
     await first;
     if (ack === 'late') await new Promise((r) => setTimeout(r, 900));   // let the late page act
