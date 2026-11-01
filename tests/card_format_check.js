@@ -134,5 +134,67 @@ for (const bad of ["soon", "", "2026-13-45", undefined, null]) {
   check(r.title === "" && r.text === "Open until " + (bad === undefined || bad === null ? "" : bad) && !/Invalid/.test(r.text), "openUntil: unparseable " + JSON.stringify(bad) + " is shown unchanged");
 }
 
+// 6. links (Phill 11-01): http/https URLs in a card are anchors; the runs concatenate to the input. The same table the iOS
+// app pins (flowConnect tools/verify_np_card.swift): one trailing mark is the sentence's, a balanced closer is the URL's.
+const runs = (t) => C.linkRuns(t).map((r) => (r.link !== undefined ? "<" + r.link + ">" : r.text)).join("|");
+const joined = (t) => C.linkRuns(t).map((r) => (r.link !== undefined ? r.link : r.text)).join("");
+const LINKS = [
+  ["Read it: https://x.example/r/1 · Sign it: https://x.example/s/2", "Read it: |<https://x.example/r/1>| · Sign it: |<https://x.example/s/2>"],
+  ["see https://x.example/a.", "see |<https://x.example/a>|."],
+  ["(https://x.example/a)", "(|<https://x.example/a>|)"],
+  ["https://x.example/wiki/A_(b)", "<https://x.example/wiki/A_(b)>"],
+  ["https://x.example/r, then", "<https://x.example/r>|, then"],
+  ["\"https://x.example/q\"", "\"|<https://x.example/q>|\""],
+  ["HTTPS://X.EXAMPLE/Up", "<HTTPS://X.EXAMPLE/Up>"],
+  ["ftp://x.example/f and javascript:alert(1) and file:///etc/passwd", "ftp://x.example/f and javascript:alert(1) and file:///etc/passwd"],
+  ["xhttps://x.example/no and 9http://x.example/no", "xhttps://x.example/no and 9http://x.example/no"],
+  ["https:///nohost and https:// and http", "https:///nohost and https:// and http"],
+  ["no links here", "no links here"],
+  ["\u0130 Read https://x.example/report", "\u0130 Read |<https://x.example/report>"],              // İ lower-cases to two code units: no index drift
+  ["\u{1D431}https://x.example/no", "\u{1D431}https://x.example/no"],                              // an astral letter before the scheme is a letter
+  ["\u0130\u0130 a https://x.example/a and https://x.example/b", "\u0130\u0130 a |<https://x.example/a>| and |<https://x.example/b>"],
+];
+for (const [src, want] of LINKS) {
+  check(runs(src) === want, "links: " + JSON.stringify(src) + " -> " + runs(src));
+  check(joined(src) === src, "links: the runs of " + JSON.stringify(src) + " concatenate to the input");
+}
+const closers = "https://x.example/r" + ")".repeat(50000);
+const t0 = Date.now();
+check(C.linkRuns(closers)[0].link === "https://x.example/r" && Date.now() - t0 < 2000, "links: a long run of closers trims in one pass");
+
+// the DOM the builders make: anchors with rel and target, text nodes for the rest, never HTML, and the words unchanged
+const vm = require("vm");
+class El {
+  constructor(tag) { this.tag = tag; this.children = []; this.attrs = {}; this.className = ""; this._t = ""; }
+  set textContent(v) { this._t = String(v); this.children = []; }
+  get textContent() { return this._t + this.children.map((c) => c.textContent).join(""); }
+  appendChild(c) { this.children.push(c); return c; }
+  setAttribute(k, v) { this.attrs[k] = v; }
+}
+const doc = { createElement: (t) => new El(t), createTextNode: (t) => { const n = new El("#text"); n._t = String(t); return n; } };
+const sandbox = { URL, window: { document: doc, location: { origin: "https://box.example" } } };
+vm.runInNewContext(fs.readFileSync(path.join(__dirname, "..", "levain", "templates", "web", "card_format.js"), "utf8"), sandbox);
+const CF = sandbox.window.LevainCardFormat;
+const anchors = (el, out = []) => { if (el.tag === "a") out.push(el); el.children.forEach((c) => anchors(c, out)); return out; };
+const card = { repo: "levain", item: "np-1", asked: "The report is at https://box.example/r/9 and waits for you. Sign it: https://other.example/s.", stopped: "", recommended: "", optionLines: [] };
+const head = CF.drawHead(card, new El("pre"));
+const a = anchors(head);
+check(a.length === 1 && a[0].attrs.href === "https://box.example/r/9", "dom: the headline's first sentence carries the cockpit link as an anchor");
+check(a[0].attrs.rel === "noopener" && a[0].attrs.target === undefined, "dom: the cockpit's own origin opens in the same tab, rel=noopener");
+const det = CF.drawDetail(Object.assign({}, card, { asked: "Headline sentence is long enough. Read it: https://box.example/r/9 · Sign it: https://other.example/s?x=1&y=2." }), []);
+const da = anchors(det);
+check(da.length === 2, "dom: both links in the detail are anchors (" + da.length + ")");
+const foreign = da.find((x) => x.attrs.href.startsWith("https://other.example"));
+check(foreign && foreign.attrs.href === "https://other.example/s?x=1&y=2" && foreign.attrs.target === "_blank" && foreign.attrs.rel === "noopener noreferrer",
+  "dom: another origin opens in a new tab, rel=noopener noreferrer, the trailing period left to the sentence");
+check(det.textContent.includes("Sign it: https://other.example/s?x=1&y=2."), "dom: the card's text is unchanged by the links");
+const framedSb = { URL, window: { document: doc, location: { origin: "https://box.example" } } };
+framedSb.window.self = framedSb.window; framedSb.window.top = {};     // a page inside the cockpit's iframe
+vm.runInNewContext(fs.readFileSync(path.join(__dirname, "..", "levain", "templates", "web", "card_format.js"), "utf8"), framedSb);
+const fa = anchors(framedSb.window.LevainCardFormat.drawHead(card, new El("pre")));
+check(fa.length === 1 && fa[0].attrs.target === "_blank", "dom: a framed page opens even its own origin's link in a new tab (the sheet is not replaced)");
+const hostile = CF.drawBody(new El("div"), "see https://x.example/<img src=x onerror=alert(1)> and https://x.example/ok", null, [], "");
+check(anchors(hostile).map((x) => x.attrs.href).join() === "https://x.example/,https://x.example/ok" && !JSON.stringify(hostile).includes("innerHTML"), "dom: markup in a card is text, a < ends the link");
+
 console.log(failures === 0 ? "ALL PASS" : failures + " FAILED");
 process.exit(failures === 0 ? 0 : 1);

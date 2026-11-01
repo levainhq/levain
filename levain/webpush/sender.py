@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import site
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -19,7 +20,7 @@ import urllib.request
 from pathlib import Path
 
 from levain.webpush import ece, vapid
-from levain.webpush.store import PushStore
+from levain.webpush.store import PushStore, PushStoreError
 
 TIMEOUT = 6.0            # per socket operation: connect and read each, so one request ends well inside the budget
 WALL_BUDGET = 20.0       # one dead push service never holds the rest of a send longer than this
@@ -169,6 +170,13 @@ def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str |
     # at once and an unfinished one never holds the process past the budget
     workers = [threading.Thread(target=work, args=(sub["id"], r), daemon=True) for sub, r in reqs
                if isinstance(r, urllib.request.Request)]
+    # the subscriptions about to be pushed, recorded before any push service is asked: a phone's receipt can arrive
+    # before the answers below are written, and is accepted only for a ping targeted at its own subscription. A failed
+    # record costs that ping's receipts (measurement), never the push.
+    try:
+        store.add_targets(ping_id, [sub["id"] for sub, r in reqs if isinstance(r, urllib.request.Request)])
+    except (sqlite3.Error, OSError, PushStoreError):
+        pass
     deadline = time.monotonic() + WALL_BUDGET
     for t in workers:
         t.start()

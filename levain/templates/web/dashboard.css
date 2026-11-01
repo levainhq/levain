@@ -2708,6 +2708,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .card-opt-row { display: flex; gap: var(--sp-3); align-items: baseline; line-height: 1.45; font: var(--fw-regular) var(--fs-body)/1.45 var(--sans); }
 .card-opt-key { font-weight: var(--fw-bold); color: var(--label); flex: none; }
 .card-opt-text { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
+.card-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; word-break: break-word; }   /* a URL in a card is a link: the warm colour, a long one wraps */
 .card-rec-mark { flex: none; padding: 1px var(--sp-2); border: 1px solid var(--ok); border-radius: var(--r-sm); font: var(--fw-bold) var(--fs-micro)/1.4 var(--sans); color: var(--ok); }
 .card-opt-why { margin: var(--sp-2) 0 0; color: var(--label); overflow-wrap: anywhere; line-height: 1.45; }
 /* the answers: full-width rows with their whole text, the recommended one first in green and marked */

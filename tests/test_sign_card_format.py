@@ -206,3 +206,29 @@ def test_the_card_head_is_one_container_and_its_rec_is_the_signed_one(tmp_path: 
     v = out["values"][2:]
     assert v[0] is True and v[1] == "sheet-card,sheet-signed,sheet-detail", v
     assert v[2] == LONG["rec"] and v[3] == 1, v
+
+
+@needs_browser
+@needs_ssh
+def test_the_links_in_a_card_are_real_anchors_in_the_running_sheet(tmp_path: Path, monkeypatch) -> None:
+    """Phill 11-01: the report and consent links on the attest card were plain text. In the running sheet they are anchors
+    (http/https only, rel noopener, another origin in a new tab) and the card's words and the signed text are unchanged."""
+    tail = " Read it: https://box.example/report/9 · Sign it: https://other.example/consent?x=1&y=2."
+    row = dict(LONG, id="np-links0001", message=LONG["message"].replace("stopped: " + LONG["stopped"], "stopped: " + LONG["stopped"] + tail))
+    assert row["message"] != LONG["message"]
+    rig = _Rig(tmp_path, monkeypatch)
+    rid = _file_card(rig, row)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            PHONE, rig.authenticator(), *_open(rig, rid),
+            {"eval": "(() => { document.getElementById('sheet-detail').open = true; return 1; })()"},
+            {"eval": "JSON.stringify([...document.querySelectorAll('#sheet-detail a.card-link')].map(a => [a.getAttribute('href'), a.getAttribute('rel'), a.getAttribute('target'), a.textContent]))"},
+            {"eval": "document.querySelector('#sheet-signed .sheet-message').querySelectorAll('a').length"},
+            {"eval": "document.documentElement.scrollWidth <= window.innerWidth"},
+        ])
+    v = out["values"][2:]
+    links = json.loads(v[1])
+    assert ["https://box.example/report/9", "noopener noreferrer", "_blank", "https://box.example/report/9"] in links, links
+    assert ["https://other.example/consent?x=1&y=2", "noopener noreferrer", "_blank", "https://other.example/consent?x=1&y=2"] in links, links
+    assert v[2] == 0, "the signed text, byte for byte, has no anchors"
+    assert v[3] is True, "a long link does not widen the page"
