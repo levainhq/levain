@@ -100,6 +100,7 @@ h2 { margin: 0 0 var(--sp-3); font: 600 11px/1 var(--round); letter-spacing: var
 .req.sign .card-opt-row { display: flex; gap: var(--sp-3); align-items: baseline; line-height: 1.45; }
 .req.sign .card-opt-key { font-weight: 700; color: var(--label); flex: none; }
 .req.sign .card-opt-text { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
+.req.sign .card-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; word-break: break-word; }
 .req.sign .card-rec-mark { flex: none; padding: 1px var(--sp-2); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: 700 11px/1.4 var(--round); color: var(--label); }
 .req.sign .card-opt-why { margin: var(--sp-2) 0 0; line-height: 1.45; color: var(--label); overflow-wrap: anywhere; }
 .row.dispatch { border-top: 2px solid var(--accent); }   /* a dispatch job waits on you as a request does */
