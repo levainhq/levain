@@ -746,7 +746,7 @@
     prRoute.textContent = v.route_source === "fault" ? rl + " (the route file is unreadable: pings are being pushed)"
       : r === "devices"
       ? rl + (v.route_source === "auto" ? " (suggested: a remote login is open)" : "") + (v.route_until ? " (" + timeLeft(v.route_until) + ")" : "")
-      : rl;
+      : rl + (v.route_source === "operator" && v.route_until ? " (" + timeLeft(v.route_until) + ")" : "");
     if (Array.isArray(v.tokens)) paintTaps(v.tokens);
     prShow(true);
   }

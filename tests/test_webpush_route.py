@@ -183,7 +183,6 @@ def test_an_auto_record_ends_when_he_is_back_at_the_keyboard_and_an_operator_one
 def test_the_live_suggestion_runs_who_at_most_once_per_throttle_window(tmp_path, monkeypatch):
     ran = []
     monkeypatch.setattr(route, "_run_who", lambda: ran.append(1) or "")
-    monkeypatch.setattr(route, "_throttle", {"at": None})
     t = [100.0]
     for _ in range(5):
         route.auto_suggest(tmp_path, idle=900.0, now=NOW, clock=lambda: t[0])
@@ -195,7 +194,6 @@ def test_the_live_suggestion_runs_who_at_most_once_per_throttle_window(tmp_path,
 
 def test_should_push_drives_the_suggestion_and_the_same_call_pushes(tmp_path, monkeypatch):
     monkeypatch.setattr(route, "_run_who", lambda: "phill ttys004 Nov 1 09:12 (203.0.113.7)")
-    monkeypatch.setattr(route, "_throttle", {"at": None})
     d = presence.should_push(tmp_path, "ping", now=NOW, idle=lambda: 900.0)
     assert d.push is True
     assert route.read_route(tmp_path, NOW + 1)[:2] == ("devices", "auto")
@@ -223,3 +221,70 @@ def test_a_failed_route_write_leaves_the_word_untouched_and_raises(tmp_path, mon
     with pytest.raises(presence.PresenceError):
         set_word(tmp_path, "back", by=None, now=NOW + 6)
     assert presence.read_word(tmp_path) == before
+
+
+def test_the_throttle_is_a_file_per_queue_so_it_holds_across_processes(tmp_path):
+    ran = []
+    a, b = tmp_path / "a", tmp_path / "b"
+    import levain.webpush.route as r
+
+    orig = r._run_who
+    r._run_who = lambda: ran.append(1) or ""
+    try:
+        route.auto_suggest(a, idle=900.0, now=NOW, clock=lambda: 100.0)
+        assert (a / "webpush" / "route.auto.stamp").stat().st_mode & 0o777 == 0o600
+        route.auto_suggest(a, idle=900.0, now=NOW, clock=lambda: 105.0)   # a new "process": no shared memory
+        assert len(ran) == 1
+        route.auto_suggest(b, idle=900.0, now=NOW, clock=lambda: 105.0)   # another queue is not throttled by it
+        assert len(ran) == 2
+        (a / "webpush" / "route.auto.stamp").write_text("garbage")
+        route.auto_suggest(a, idle=900.0, now=NOW, clock=lambda: 106.0)   # unreadable stamp = run
+        assert len(ran) == 3
+    finally:
+        r._run_who = orig
+
+
+def test_low_idle_ends_an_auto_route_even_inside_the_throttle_window(tmp_path, monkeypatch):
+    who = "phill ttys004 Nov 1 09:12 (203.0.113.7)"
+    monkeypatch.setattr(route, "_run_who", lambda: who)
+    assert route.auto_suggest(tmp_path, idle=900.0, now=NOW, clock=lambda: 100.0) is True
+    route.auto_suggest(tmp_path, idle=2.0, now=NOW + 1, clock=lambda: 101.0)
+    assert route.read_route(tmp_path, NOW + 2) == ("desk", "default", None)
+
+
+def test_host_classification_parses_addresses_and_never_prefix_matches():
+    def line(h):
+        return f"phill ttys004 Nov 1 09:12 ({h})"
+
+    for local in ("127.0.0.2", "0:0:0:0:0:0:0:1", "::1", "[::1]", "fe80::1%en0", "localhost", "LOCALHOST", ":0",
+                  "::ffff:127.0.0.1"):
+        assert route.remote_login_present(line(local)) is False, local
+    for remote in ("203.0.113.7", "127.evil.example", "localhost.evil.example", "fe80.example.com", "2001:db8::1"):
+        assert route.remote_login_present(line(remote)) is True, remote
+
+
+def test_the_public_setter_flushes_held_pings_for_devices_only(tmp_path, monkeypatch):
+    from levain.webpush import held
+
+    calls = []
+    monkeypatch.setattr(held, "flush_if_due", lambda q, *, throttle=True: calls.append(throttle) or False)
+    route.set_route(tmp_path, "desk", now=NOW)
+    assert calls == []
+    route.set_route(tmp_path, "devices", now=NOW)
+    assert calls == [False]
+
+
+def test_a_word_write_that_fails_restores_the_route_record(tmp_path):
+    set_word(tmp_path, "away", by=None, now=NOW)
+    route.set_route(tmp_path, "devices", "2h", now=NOW)
+    before = (tmp_path / "webpush" / "route.json").read_bytes()
+    pj = tmp_path / "webpush" / "presence.json"
+    pj.unlink()
+    pj.mkdir()   # the word cannot be written over a directory
+    with pytest.raises(presence.PresenceError):
+        set_word(tmp_path, "back", by=None, now=NOW + 5)
+    assert (tmp_path / "webpush" / "route.json").read_bytes() == before
+    (tmp_path / "webpush" / "route.json").unlink()
+    with pytest.raises(presence.PresenceError):
+        set_word(tmp_path, "remote", by=None, now=NOW + 6)
+    assert not (tmp_path / "webpush" / "route.json").exists()

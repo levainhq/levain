@@ -640,18 +640,48 @@ def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float
             _log(queue_dir, row)
         except PresenceError as e:
             raise PresenceError(f"{e}: a setter's write with no record is not made") from e
+    prior_route = _route_snapshot(queue_dir)
     try:
         _follow_route(queue_dir, word, duration, action, ts)   # first: a route failure leaves the word as it was
-        if action == "write":
-            _write(queue_dir, rec)
-        elif action == "clear":
-            _write(queue_dir, None)
+        try:
+            if action == "write":
+                _write(queue_dir, rec)
+            elif action == "clear":
+                _write(queue_dir, None)
+        except PresenceError:
+            _route_restore(queue_dir, prior_route)   # the word did not land, so the route change must not stay
+            raise
     except PresenceError as e:
         _log_best_effort(queue_dir, {**row, "outcome": "refused", "why": _clean(str(e), _WHY_MAX)})
         raise
     if by is None:
         _log_best_effort(queue_dir, row)
     return rec if action == "write" else (None if action == "clear" else prior)
+
+
+def _route_snapshot(queue_dir: Path | str) -> bytes | None:
+    try:
+        with open(Path(queue_dir) / "webpush" / "route.json", "rb") as f:
+            return f.read(4096)
+    except OSError:
+        return None   # absent, or unreadable: restored as absent
+
+
+def _route_restore(queue_dir: Path | str, raw: bytes | None) -> None:
+    path = Path(queue_dir) / "webpush" / "route.json"
+    try:
+        if raw is None:
+            path.unlink(missing_ok=True)
+        else:
+            tmp = path.with_name(f".route.json.{os.getpid()}.restore")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, raw)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+    except OSError:
+        pass   # best effort: the word failure is what the caller sees
 
 
 def _follow_route(queue_dir: Path | str, word: str, duration: str | None, action: str, ts: float) -> None:

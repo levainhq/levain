@@ -405,7 +405,6 @@ def test_the_view_never_runs_the_suggestion_and_a_ping_decision_does(rig, monkey
     src, q = rig
     ran = []
     monkeypatch.setattr("levain.webpush.route._run_who", lambda: ran.append(1) or "phill ttys004 Nov 1 09:12 (203.0.113.7)")
-    monkeypatch.setattr(route_mod, "_throttle", {"at": None})
     with _signed(src, q) as (port, _):
         got = _call(port, "GET", GET, token=T)[1]
         assert got["route"] == "desk" and not ran                    # a GET (a tap token's too) shells out to nothing
@@ -462,8 +461,10 @@ def test_the_route_buttons_post_the_route_word_and_show_the_suggestion(rig, tmp_
             {"eval": "document.querySelector('.pr-route-state').textContent"},
             {"do": "document.querySelector('.pr-route-btn[data-route=\"desk\"]').click()",
              "until": "document.querySelector('.pr-route-btn[data-route=\"desk\"]').getAttribute('aria-pressed')==='true'", "ms": 8000},
+            {"eval": "document.querySelector('.pr-route-state').textContent"},
         ])
     assert out["values"][2].startswith("Devices")
+    assert out["values"][-1].startswith("Desk") and "left" in out["values"][-1]   # an operator Desk ends too
     rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
     assert [r["word"] for r in rows] == ["devices", "desk"]
 
@@ -477,6 +478,7 @@ def test_a_route_set_flushes_held_pings_outside_the_lock_and_without_the_spawn_g
     with _signed(src, q) as (port, _):
         for word in ("devices", "desk", "remote", "back"):
             assert _call(port, "POST", SET, {"word": word}, token=T)[0] == 200
-        assert len(calls) == 4 and all(t is False for _, t in calls)
+        # desk holds, so it flushes nothing; each devices-bound set flushes once (not twice)
+        assert len(calls) == 3 and all(t is False for _, t in calls)
         _call(port, "POST", SET, {"word": "away"}, token=T)
-        assert len(calls) == 4
+        assert len(calls) == 3

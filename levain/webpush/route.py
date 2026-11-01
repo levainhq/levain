@@ -21,6 +21,7 @@ Stdlib only.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
@@ -44,8 +45,7 @@ AUTO_IDLE_SECS = 120.0   # the laptop's own input idle at least this long: the k
 _MAX_BYTES = 1024
 _NUM_LIMIT = 1e15
 AUTO_THROTTLE_SECS = 30.0   # the live path runs `who` at most this often; every ping would otherwise shell out
-_HOSTS_LOCAL = ("127.0.0.1", "::1", "localhost", "fe80:", "::ffff:127.")
-_throttle = {"at": None}
+STAMP_NAME = "route.auto.stamp"
 _WHO = "/usr/bin/who"
 _WHO_TIMEOUT_SECS = 2.0
 _HOSTED = re.compile(r"\(([^()\s]+)\)\s*$")
@@ -53,6 +53,45 @@ _HOSTED = re.compile(r"\(([^()\s]+)\)\s*$")
 
 def _path(queue_dir: Path | str) -> Path:
     return Path(queue_dir) / "webpush" / FILE_NAME
+
+
+def _stamp_path(queue_dir: Path | str) -> Path:
+    return Path(queue_dir) / "webpush" / STAMP_NAME
+
+
+def _throttled(queue_dir: Path | str, now: float) -> bool:
+    """Whether the last `who` run was under the window ago; then it is left alone, else the stamp is rewritten (before the
+    `who` call, so a slow or failed run still counts). The stamp is a file because the caller is a fresh process per ping.
+    A stamp that cannot be read safely, or lies in the future, means run."""
+    path = _stamp_path(queue_dir)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError("not regular")
+            last = float(os.read(fd, 64).decode("ascii").strip())
+        finally:
+            os.close(fd)
+        if _num(last) and 0 <= now - last < AUTO_THROTTLE_SECS:
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        d = path.parent
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        tmp = d / f".{STAMP_NAME}.{os.getpid()}.{time.time_ns()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, repr(float(now)).encode("ascii"))
+        finally:
+            os.close(fd)
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            os.unlink(tmp)
+    except OSError:
+        pass   # no stamp is no throttle; the next call runs
+    return False
 
 
 def _num(v: object) -> bool:
@@ -191,6 +230,13 @@ def set_route(queue_dir: Path | str, route: str, duration: str | None = None, *,
         _log_best_effort(queue_dir, row)
         if after is not None:
             after()
+    if wrote and route == "devices":   # outside the lock: pings held as "active" are due now
+        try:
+            from levain.webpush import held
+
+            held.flush_if_due(queue_dir, throttle=False)
+        except Exception:  # noqa: BLE001 - a failed flush never fails the set
+            pass
     return wrote
 
 
@@ -203,9 +249,23 @@ def remote_login_present(who_output: str) -> bool:
         if len(parts) < 3 or parts[1] == "console":
             continue
         m = _HOSTED.search(line)
-        if m and not m.group(1).startswith(":") and not m.group(1).lower().startswith(_HOSTS_LOCAL):
+        if m and not _local_host(m.group(1)):
             return True
     return False
+
+
+def _local_host(host: str) -> bool:
+    # parsed, never prefix-matched: "127.evil.example" and "fe80:" lookalikes are names, while 127.0.0.2 is loopback too
+    if host.startswith(":") and not host.startswith("::"):
+        return True   # a display such as :0
+    h = host.strip("[]").split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return h.lower() == "localhost"
+    if getattr(ip, "ipv4_mapped", None) is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback or ip.is_link_local
 
 
 def _run_who() -> str:
@@ -218,24 +278,20 @@ def _run_who() -> str:
 
 
 def auto_suggest(queue_dir: Path | str, *, idle: float | None, who: str | None = None, now: float | None = None,
-                 clock=time.monotonic) -> bool:
+                 clock=time.time) -> bool:
     """Set ``devices`` (source ``auto``, one hour) when a remote login is open, the laptop's own input has been idle at
     least :data:`AUTO_IDLE_SECS` (``idle`` seconds, ``None`` when unknown, which suggests nothing) and no route is
     standing: neither an operator's unexpired record nor a ``devices`` already in force. Returns whether it wrote.
     An ``auto`` record ends as soon as the idle reads below the threshold (he is back at the keyboard). Called from the
-    delivery decision, so with ``who`` unset it runs at most once per :data:`AUTO_THROTTLE_SECS` by ``clock``
-    (monotonic, injectable); a caller giving ``who`` is not throttled."""
-    if who is None:
-        t = clock()
-        last = _throttle["at"]
-        if last is not None and 0 <= t - last < AUTO_THROTTLE_SECS:
-            return False
-        _throttle["at"] = t
+    delivery decision, so with ``who`` unset it runs at most once per :data:`AUTO_THROTTLE_SECS` per queue by ``clock``
+    (wall clock, injectable; the stamp is a file under the queue); a caller giving ``who`` is not throttled."""
     if idle is None or not _num(idle):
         return False
     ts = time.time() if now is None else now
     if idle < AUTO_IDLE_SECS:
-        _end_auto(queue_dir, ts)
+        _end_auto(queue_dir, ts)   # before the throttle: the keys back ends an auto route at once
+        return False
+    if who is None and _throttled(queue_dir, clock()):
         return False
     if not remote_login_present(_run_who() if who is None else who):
         return False

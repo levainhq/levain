@@ -2430,7 +2430,7 @@ class _Handler(GuardedHandler):
             if tap is not None and isinstance(exc, presence_tokens.TokenRefused):
                 return {"error": exc.error, "message": str(exc)}, 403
             return {"error": "presence_refused", "message": str(exc)}, 422
-        if req["word"] in route_mod.ROUTE_WORDS or req["word"] in ("remote", "back"):
+        if req["word"] in ("remote", "back"):   # a route-alone set flushes inside set_route
             try:     # outside the presence lock: pings held as "active" are due now the route may read devices
                 from levain.webpush import held
 
