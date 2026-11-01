@@ -277,14 +277,20 @@ def _read_policy(queue_dir: Path | str | None) -> tuple[dict, str, list[str]]:
         return _copy_cells(DEFAULT_CELLS), "default", []
     except OSError as e:
         return bad(f"unreadable ({type(e).__name__})")
+    why = None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return bad("not a regular file")
-        raw = os.read(fd, _MAX_BYTES + 1)
+            why = "not a regular file"
+        else:
+            raw = os.read(fd, _MAX_BYTES + 1)
     except OSError as e:
-        return bad(f"unreadable ({type(e).__name__})")
-    finally:
+        why = f"unreadable ({type(e).__name__})"
+    try:
         os.close(fd)
+    except OSError as e:  # a failed close is the malformed result, never an error out of a read that already happened
+        why = why or f"unreadable ({type(e).__name__})"
+    if why:
+        return bad(why)
     if len(raw) > _MAX_BYTES:
         return bad("file too large")
     try:

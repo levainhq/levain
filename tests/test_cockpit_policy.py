@@ -18,6 +18,9 @@ from tests.test_cockpit_k2a import _install
 from tests.test_pair_card_w1b import _drive, needs_browser
 
 SET = "/webpush/policy/set"
+SEG_LOOK = ("(r => { const look = b => { const c = getComputedStyle(b); return { bg: c.backgroundColor, color: c.color }; };"
+            " return { pressed: look(r.querySelector('button[aria-pressed=\"true\"]')),"
+            " unpressed: look(r.querySelector('button[aria-pressed=\"false\"]')) }; })(document.querySelector('.np-row'))")
 
 
 @pytest.fixture
@@ -123,6 +126,41 @@ def test_a_held_presence_lock_answers_503_within_the_deadline_and_writes_nothing
         assert _call(port, "POST", SET, _cell(), token=T)[0] == 200
 
 
+def test_a_failing_close_is_the_malformed_default_never_a_500_after_a_write(rig, monkeypatch):
+    src, q = rig
+    armed = {"on": False}
+    policy_fds: set = set()
+    real_os = presence.os
+
+    class _FailingClose:                                    # presence's own `os` only: no other module's close is touched
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def open(self, path, *a, **k):
+            fd = real_os.open(path, *a, **k)
+            if str(path).endswith(presence.POLICY_NAME):
+                policy_fds.add(fd)
+            return fd
+
+        def close(self, fd):
+            real_os.close(fd)
+            if armed["on"] and fd in policy_fds:            # only the policy file's own descriptor fails to close
+                policy_fds.discard(fd)
+                raise OSError(5, "close failed")
+            policy_fds.discard(fd)
+    monkeypatch.setattr(presence, "os", _FailingClose())
+    with _signed(src, q) as (port, _):
+        armed["on"] = True
+        st, got, _ = _call(port, "POST", SET, _cell("quiet", "approval", "hold"), token=T)
+        assert st == 200, (st, got)                         # the write went through; the answer is a view, not a 500
+        assert got["status_kind"] == "malformed" and any("OSError" in r for r in got["reasons"]), got
+        armed["on"] = False
+        assert presence.policy_view(q)["status_kind"] == "loaded"      # the file is intact
+        armed["on"] = True
+        st, got, _ = _call(port, "GET", "/webpush/policy", token=T)
+        assert st == 200 and got["status_kind"] == "malformed"
+
+
 def test_the_view_names_which_cells_hold_by_default(rig):
     src, q = rig
     with _signed(src, q) as (port, _):
@@ -169,8 +207,14 @@ def test_the_block_renders_edits_round_trip_and_the_approval_hold_warns(rig, tmp
             {"eval": state},
             {"do": "document.querySelector('.np-reset').click()", "until": "document.querySelector('.np-reset').disabled && document.querySelectorAll('.np-warn:not([hidden])').length === 0 && " + cell("quiet.approval", "push") + ".getAttribute('aria-pressed')==='true'", "ms": 8000},
             {"eval": "document.documentElement.scrollWidth - document.documentElement.clientWidth"},
+            {"eval": SEG_LOOK},
+            {"scheme": "dark"},
+            {"eval": SEG_LOOK},
         ])
     v = out["values"]
+    for look in (v[-2], v[-1]):          # light, then dark: the pressed segment LOOKS different from the unpressed one
+        assert look["pressed"]["bg"] != look["unpressed"]["bg"], look
+        assert look["pressed"]["color"] != look["unpressed"]["color"], look
     assert v[1] == 0                    # the shipped default (sleep holds approvals) shows no warning ...
     assert "wait while you sleep" in v[2]   # ... only the plain, non-warning line
     assert v[4] == 1                    # a hold in a non-default cell (quiet approvals) warns
@@ -198,20 +242,25 @@ def test_a_slow_read_started_before_a_write_does_not_repaint_over_it(rig, tmp_pa
     src, q = rig
     from tests.test_cockpit_pairing_http import _pair
     cell = lambda c, v: f"document.querySelector('.np-row[data-cell=\"{c}\"] button[data-value=\"{v}\"]')"
-    # the first policy read after the wrapper lands answers late (its body is the state at the time it began)
-    wrap = ("(() => { const f = window.fetch; window.__slow = 0; window.fetch = function (u, o) {"
+    # Installed by the driver's init step, before any page script runs. It counts the page's policy GETs: the SECOND one
+    # (the page's own re-read after load) is held, its body already fixed at the state when it began, until the test
+    # releases it; every other policy GET passes and bumps __fin when it resolves. Nothing here waits on a clock.
+    wrap = ("(() => { const f = window.fetch; let n = 0; window.__held = 0; window.__fin = 0;"
+            " const gate = new Promise((ok) => { window.__release = ok; });"
+            " window.fetch = function (u, o) {"
             " const p = f.apply(this, arguments);"
-            " if (String(u).includes('/webpush/policy') && !(o && o.method === 'POST') && !window.__slow) {"
-            " window.__slow = 1; return p.then((r) => new Promise((ok) => setTimeout(() => ok(r), 4000))); }"
-            " return p; }; return 1; })()")
+            " if (!String(u).includes('/webpush/policy') || (o && o.method === 'POST')) return p;"
+            " if (++n === 2) { window.__held = 1; return p.then((r) => gate.then(() => r)); }"
+            " return p.then((r) => { window.__fin++; return r; }); }; })()")
     with _signed(src, q) as (port, _):
         _pair(port)
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"init": wrap},
             {"until": "document.querySelector('.np-panel') && !document.querySelector('.np-panel').hidden", "ms": 20000},
-            {"eval": wrap},
-            {"until": "window.__slow === 1", "ms": 8000},                      # the slow (stale) read is in flight
-            {"do": cell("quiet.approval", "hold") + ".click()", "until": cell("quiet.approval", "hold") + ".getAttribute('aria-pressed')==='true'", "ms": 8000},
-            {"eval": "new Promise((ok) => setTimeout(() => ok(" + cell("quiet.approval", "hold") + ".getAttribute('aria-pressed')), 5500))"},
+            {"until": "window.__held === 1", "ms": 20000},                     # the stale read is in flight, held
+            {"do": cell("quiet.approval", "hold") + ".click()", "until": cell("quiet.approval", "hold") + ".getAttribute('aria-pressed')==='true' && window.__fin >= 2 && ![...document.querySelectorAll('.np-row button')].some(b => b.disabled)", "ms": 20000},
+            {"eval": "window.__release() || 1"},                                  # now the stale body arrives, after the write and its follow-up GET
+            {"eval": "new Promise((ok) => setTimeout(() => ok(" + cell("quiet.approval", "hold") + ".getAttribute('aria-pressed')), 600))"},
             {"eval": "[...document.querySelectorAll('.np-row button')].some(b => b.disabled)"},
         ])
     assert out["values"][4] == "true"       # the late stale read (default: push) did not take the written value back
