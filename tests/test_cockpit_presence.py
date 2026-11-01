@@ -222,6 +222,29 @@ def test_a_revoked_or_unknown_tap_token_is_refused(rig):
         assert presence.read_word(q) is None
 
 
+def test_a_revoke_that_lands_after_the_first_check_refuses_the_write(rig, monkeypatch):
+    # the revoke runs at the last seam before set_word takes the lock: after the request's credential was resolved
+    src, q = rig
+    real = presence._locked
+    fired = []
+
+    def revoking(queue_dir, **kw):
+        if not fired:
+            fired.append(presence_tokens.revoke(q, "door"))
+        return real(queue_dir, **kw)
+
+    with _signed(src, q) as (port, _):
+        tok, _ = _mint(port)
+        monkeypatch.setattr(presence, "_locked", revoking)
+        st, got, _ = _call(port, "POST", SET, {"word": "away"}, headers=_tap(tok))
+        assert fired == [True]
+        assert st == 403 and got["error"] == "forbidden", got
+    assert presence.read_word(q) is None
+    rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
+    assert rows[-1]["outcome"] == "refused" and rows[-1]["via"] == "presence:door"
+    assert presence_tokens.list_public(q) == []
+
+
 def test_a_tap_token_reaches_nothing_else(rig):
     src, q = rig
     with _signed(src, q) as (port, _):

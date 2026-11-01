@@ -102,6 +102,49 @@ def test_the_rate_limit_counts_per_key_over_a_sliding_minute():
     assert r.hit("a", now=60.5) == 0.0
 
 
+def test_a_failed_read_refuses_every_write_and_leaves_the_file(tmp_path, monkeypatch):
+    import errno
+
+    pt.create(tmp_path, "door")
+    pt.create(tmp_path, "bed")
+    f = tmp_path / "webpush" / pt.FILE_NAME
+    before, ino = f.read_bytes(), f.stat().st_ino
+    real = os.open
+
+    def emfile(path, *a, **kw):
+        if os.fspath(path).endswith(pt.FILE_NAME):
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(pt.os, "open", emfile)
+    with pytest.raises(PresenceError):
+        pt.create(tmp_path, "hall")
+    with pytest.raises(PresenceError):
+        pt.revoke(tmp_path, "door")
+    pt.touch(tmp_path, "door", now=5.0)        # best effort: no error, and no write
+    assert pt.verify(tmp_path, "anything") is None and pt.list_public(tmp_path) == []
+    monkeypatch.setattr(pt.os, "open", real)
+    assert f.read_bytes() == before and f.stat().st_ino == ino
+    assert [r["name"] for r in pt.list_public(tmp_path)] == ["door", "bed"]
+
+
+def test_a_malformed_file_is_not_overwritten_by_a_write(tmp_path):
+    d = tmp_path / "webpush"
+    d.mkdir()
+    (d / pt.FILE_NAME).write_text("not json")
+    with pytest.raises(PresenceError):
+        pt.create(tmp_path, "door")
+    assert (d / pt.FILE_NAME).read_text() == "not json"
+
+
+def test_touch_with_no_match_writes_nothing(tmp_path):
+    pt.create(tmp_path, "door")
+    f = tmp_path / "webpush" / pt.FILE_NAME
+    ino = f.stat().st_ino
+    pt.touch(tmp_path, "ghost", now=1.0)
+    assert f.stat().st_ino == ino
+
+
 def test_a_deeply_nested_file_reads_as_no_tokens(tmp_path):
     pt.create(tmp_path, "door")
     (tmp_path / "webpush" / pt.FILE_NAME).write_text("[" * 30000 + "]" * 30000)

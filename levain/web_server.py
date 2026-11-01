@@ -2389,28 +2389,39 @@ class _Handler(GuardedHandler):
                 allowed = ", ".join(tap["words"])
                 return {"error": "word_not_allowed",
                         "message": f"this tap token may set only: {allowed}"}, 403
-            # the body may have arrived long after the headers: the token is asked again now, so a revoke that returned
-            # before this write is never followed by a word from that token
-            from levain.webpush import presence_tokens
-
-            if presence_tokens.verify(queue, self.headers.get(_PRESENCE_TOKEN_HEADER, "")) is None:
-                return {"error": "forbidden", "message": "this tap token is not valid"}, 403
             wait = self.server.presence_rate.hit(tap["name"])
             if wait:
                 self._post_headers = [("Retry-After", str(int(wait) + 1))]
                 return {"error": "rate_limited", "message": "too many taps; try again in a minute"}, 429
         via = tap["name"] if tap is not None else str(self._credential()["name"])
+        precheck = after = None
+        if tap is not None:
+            # The token is asked again, fresh, under the presence lock that revoke also takes: a revoke or a narrowed
+            # list either lands before this check (refused here) or after the word is written, never in between.
+            from levain.webpush import presence_tokens
+
+            supplied = self.headers.get(_PRESENCE_TOKEN_HEADER, "")
+            name, word = tap["token_name"], req["word"]
+
+            def precheck() -> None:
+                rec = presence_tokens.verify(queue, supplied)
+                if rec is None or rec["name"] != name:
+                    raise presence_tokens.TokenRefused("forbidden", "this tap token is not valid")
+                if word in presence.WORDS and word not in rec["words"]:
+                    raise presence_tokens.TokenRefused(
+                        "word_not_allowed", f"this tap token may set only: {', '.join(rec['words'])}")
+
+            def after() -> None:
+                presence_tokens.stamp(queue, name)
         try:
             presence.set_word(queue, req["word"], duration=req.get("for") or None, by=None, via=via,
-                              wait=_POLICY_LOCK_WAIT_SECS)
+                              wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
         except presence.PresenceBusy:
             return {"error": "presence_busy", "message": "the presence word is busy right now; nothing was changed, try again"}, 503
         except presence.PresenceError as exc:
+            if tap is not None and isinstance(exc, presence_tokens.TokenRefused):
+                return {"error": exc.error, "message": str(exc)}, 403
             return {"error": "presence_refused", "message": str(exc)}, 422
-        if tap is not None:
-            from levain.webpush import presence_tokens
-
-            presence_tokens.touch(queue, tap["token_name"])
         return self._presence_view(queue), 200
 
     def _presence_token_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":

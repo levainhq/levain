@@ -2,8 +2,8 @@
 an NFC tag) with no location fix and none of the authority a cockpit token carries.
 
 The file (``<queue>/webpush/presence_tokens.json``, 0600) holds only the sha256 of each token, never the token: the
-secret is shown once, at creation. The web layer resolves a supplied token here once per request and owns the rate limit
-(:class:`RateLimit`); this module decides nothing about routes. A token may set only the words on its allow-list, and
+secret is shown once, at creation. The web layer resolves a supplied token here, asks again under the presence lock at
+the write, and owns the rate limit (:class:`RateLimit`); this module decides nothing about routes. A token may set only the words on its allow-list, and
 ``sleep`` and ``loud`` (the two that silence or force the phone for a long stretch) only when the operator listed them.
 """
 from __future__ import annotations
@@ -40,31 +40,57 @@ def _hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+class TokenRefused(PresenceError):
+    """A tap token refused at the write itself (revoked, or the word no longer on its list). ``error`` is the reply's
+    error code."""
+
+    def __init__(self, error: str, message: str) -> None:
+        super().__init__(message)
+        self.error = error
+
+
 def _read(queue_dir: Path | str) -> list[dict]:
-    """The records on file; a missing, oversize, foreign-owned or malformed file reads as none (a token is then
-    unknown, which is a refusal)."""
+    """The records on file; a missing file is none. Anything else that is not a readable file of this user's (an I/O
+    error, oversize, foreign-owned, malformed) raises :class:`PresenceError`: a caller about to write the list back
+    must never take a failed read for an empty list, or it would drop every token. A read-only caller that wants a
+    refusal instead uses :func:`_read_or_none`."""
     path = _path(queue_dir)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
+    except FileNotFoundError:
         return []
+    except OSError as e:
+        raise PresenceError(f"presence tokens not read: {e}") from e
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > _MAX_BYTES:
-            return []
+            raise PresenceError(f"{path} is not a tap-token file of this user's")
         with os.fdopen(fd, "rb", closefd=False) as fh:
             got = json.loads(fh.read(_MAX_BYTES + 1).decode("utf-8"))
-    except (OSError, ValueError, RecursionError):      # a deeply nested document is malformed like any other
-        return []
+    except OSError as e:
+        raise PresenceError(f"presence tokens not read: {e}") from e
+    except (ValueError, RecursionError) as e:      # a deeply nested document is malformed like any other
+        raise PresenceError(f"{path} is malformed: remove it to start a new list") from e
     finally:
         os.close(fd)
     recs = got.get("tokens") if isinstance(got, dict) else None
+    if not isinstance(recs, list):
+        raise PresenceError(f"{path} is malformed: remove it to start a new list")
     out = []
-    for r in recs if isinstance(recs, list) else []:
+    for r in recs:
         if (isinstance(r, dict) and isinstance(r.get("name"), str) and isinstance(r.get("sha256"), str)
                 and isinstance(r.get("words"), list)):
             out.append(r)
     return out
+
+
+def _read_or_none(queue_dir: Path | str) -> list[dict]:
+    """:func:`_read` for a caller that only reads: a file that cannot be read is no tokens (a token is then unknown,
+    which is a refusal)."""
+    try:
+        return _read(queue_dir)
+    except PresenceError:
+        return []
 
 
 def _write(queue_dir: Path | str, recs: list[dict]) -> None:
@@ -91,6 +117,7 @@ def _write(queue_dir: Path | str, recs: list[dict]) -> None:
                     if n <= 0:
                         raise OSError("short write")
                     view = view[n:]
+                os.fsync(fd)        # the bytes are durable before the rename makes them the list
             finally:
                 os.close(fd)
             os.replace(tmp, path)
@@ -138,7 +165,7 @@ def verify(queue_dir: Path | str, supplied: str) -> dict | None:
     or ``None`` for unknown or revoked. The record is the public one, with no hash."""
     got = None
     digest = _hash(supplied if isinstance(supplied, str) else "").encode("ascii")
-    for r in _read(queue_dir):
+    for r in _read_or_none(queue_dir):
         same = hmac.compare_digest(digest, r["sha256"].encode("utf-8", "replace"))
         if same and not r.get("revoked") and got is None:
             got = _public(r)
@@ -161,18 +188,31 @@ def revoke(queue_dir: Path | str, name: str) -> bool:
 
 def list_public(queue_dir: Path | str) -> list[dict]:
     """The live tokens, with no hash."""
-    return [_public(r) for r in _read(queue_dir) if not r.get("revoked")]
+    return [_public(r) for r in _read_or_none(queue_dir) if not r.get("revoked")]
+
+
+def stamp(queue_dir: Path | str, name: str, *, now: float | None = None) -> None:
+    """Stamp ``last_used`` on the live token ``name``, for a caller ALREADY holding the presence lock (a second
+    ``flock`` from the same process on another descriptor would wait on itself). Best effort: a display stamp never
+    fails the write it follows. A file that cannot be read, or no live token of that name, writes nothing."""
+    try:
+        recs = _read(queue_dir)
+        hit = False
+        for r in recs:
+            if r["name"] == name and not r.get("revoked"):
+                r["last_used"] = time.time() if now is None else now
+                hit = True
+        if hit:
+            _write(queue_dir, recs)
+    except PresenceError:
+        pass
 
 
 def touch(queue_dir: Path | str, name: str, *, now: float | None = None) -> None:
-    """Stamp ``last_used`` on the live token ``name``. Best effort: a display stamp never fails the write it follows."""
+    """:func:`stamp` under its own hold of the presence lock. Best effort, like it."""
     try:
         with _locked(queue_dir, strict=True, wait=0.5):
-            recs = _read(queue_dir)
-            for r in recs:
-                if r["name"] == name and not r.get("revoked"):
-                    r["last_used"] = time.time() if now is None else now
-            _write(queue_dir, recs)
+            stamp(queue_dir, name, now=now)
     except PresenceError:
         pass
 

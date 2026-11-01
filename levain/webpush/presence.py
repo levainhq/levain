@@ -510,7 +510,8 @@ def check_setter(word: str, by: dict | None, said: str | None) -> str:
 
 def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, now: float | None = None,
              by: dict | None = None, said: str | None = None, match: object = None,
-             via: str | None = None, wait: float | None = None) -> dict | None:
+             via: str | None = None, wait: float | None = None,
+             precheck: "Callable[[], None] | None" = None, after: "Callable[[], None] | None" = None) -> dict | None:
     """Write ``word`` (``duration`` for quiet, loud and remote; ``loud off`` clears a loud). Returns what is on file
     after, ``None`` when no word stands. ``back`` leaves a standing ``loud`` alone and returns it. Raises
     :class:`PresenceError` for an unknown word, a bad duration, or a directory or file that is not safe to write.
@@ -530,9 +531,28 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
 
     ``via`` names the credential an HTTP write came in on (never its secret); it is recorded on the operator's row.
     ``wait`` (seconds) is for a caller that must not park a thread behind a stalled lock holder: the lock is then
-    required (a failure to take it refuses the write, :class:`PresenceBusy` past the wait) instead of skipped."""
-    with _locked(queue_dir, strict=by is not None or wait is not None, wait=wait):
-        return _set_word(queue_dir, word, duration, now, by, said, match, via)
+    required (a failure to take it refuses the write, :class:`PresenceBusy` past the wait) instead of skipped.
+
+    ``precheck`` runs once the lock is held and before the word on file is read: a :class:`PresenceError` it raises
+    refuses the call (logged as a refusal) with nothing written, so a credential it re-checks and a revoke that takes
+    the same lock have one order. Passing one requires the lock. ``after`` runs under the same hold once the word is
+    written; it must not take the presence lock itself."""
+    strict = by is not None or wait is not None or precheck is not None
+    with _locked(queue_dir, strict=strict, wait=wait):
+        if precheck is not None:
+            try:
+                precheck()
+            except PresenceError as e:
+                ts = time.time() if now is None else now
+                row = _log_row(ts, word, duration, by, said, read_word(queue_dir))
+                if via:
+                    row["via"] = _clean(via, _FIELD_MAX)
+                _log_best_effort(queue_dir, {**row, "outcome": "refused", "why": _clean(str(e), _WHY_MAX)})
+                raise
+        out = _set_word(queue_dir, word, duration, now, by, said, match, via)
+        if after is not None:
+            after()
+        return out
 
 
 @contextmanager
