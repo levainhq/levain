@@ -62,10 +62,13 @@ def test_an_unreadable_report_file_is_an_error_not_an_empty_history_and_a_killed
     import os
 
     tap_report.record(tmp_path, None, [{"t": 1}])
-    stale = tmp_path / (tap_report.FILE + ".abcd")
+    stale = tmp_path / (tap_report.TMP_PREFIX + "abcd")
+    backup = tmp_path / (tap_report.FILE + ".bak")
+    backup.write_text("keep")
+    os.utime(backup, (1, 1))
     stale.write_text("x")
     os.utime(stale, (1, 1))
-    fresh = tmp_path / (tap_report.FILE + ".live")
+    fresh = tmp_path / (tap_report.TMP_PREFIX + "live")
     fresh.write_text("x")
     os.chmod(tmp_path / tap_report.FILE, 0)
     try:
@@ -77,9 +80,14 @@ def test_an_unreadable_report_file_is_an_error_not_an_empty_history_and_a_killed
         os.chmod(tmp_path / tap_report.FILE, 0o600)
     assert len(tap_report.reports(tmp_path)) == 1                      # the history is still there
     tap_report.record(tmp_path, None, [{"t": 3}])
-    assert not stale.exists() and fresh.exists()
+    assert not stale.exists() and fresh.exists() and backup.exists()   # only the writer's own namespace is swept
     (tmp_path / tap_report.FILE).write_bytes(b"\xff\xfe torn\n")                  # invalid UTF-8 is a skipped line, never a 500
     assert tap_report.reports(tmp_path) == [] and tap_report.record(tmp_path, None, [{"t": 4}]) >= 1
+
+
+def test_a_posted_value_cannot_forge_a_line_or_drive_the_terminal() -> None:
+    out = tap_report.render({"at": "x", "device": "d\x1b[2J", "entries": [{"t": 1, "src": "sw", "step": "a\nreport forged", "u": "\x1b]0;x\x07"}]})
+    assert "\x1b" not in out and "\x07" not in out and out.count("\n") == 1 and "report forged" in out.splitlines()[1]
 
 
 def test_the_trace_route_answers_503_when_busy_or_unwritable(tmp_path: Path, monkeypatch) -> None:

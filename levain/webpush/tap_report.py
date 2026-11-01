@@ -17,6 +17,7 @@ from pathlib import Path
 
 FILE = "tap_trace_reports.jsonl"
 KEEP = 40            # reports kept; each is at most the push family's body cap (the route reads no more than that)
+TMP_PREFIX = ".tap_trace_reports.tmp-"   # the writer's temp files; the sweep touches only this namespace
 LOCK_WAIT_SECS = 2.0 # how long a post waits for the file's lock before answering busy
 MAX_ENTRIES = 60     # the ring's own cap
 _VALUE_CLIP = 200
@@ -73,7 +74,7 @@ def record(queue_dir: str | os.PathLike[str], device_id: str | None, entries: li
         except FileNotFoundError:
             old = []
         lines = (old[-(KEEP - 1):] if KEEP > 1 else []) + [row]
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=FILE + ".")        # mode 0600
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=TMP_PREFIX)        # mode 0600
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
@@ -93,9 +94,7 @@ def record(queue_dir: str | os.PathLike[str], device_id: str | None, entries: li
 
 def _sweep(d: Path, *, older_than_secs: float = 3600.0) -> None:
     """Remove a temp file a killed writer left (called under the lock, so no live writer owns one)."""
-    for p in d.glob(FILE + ".*"):
-        if p.name == FILE + ".lock":
-            continue
+    for p in d.glob(TMP_PREFIX + "*"):
         try:
             if time.time() - p.stat().st_mtime > older_than_secs:
                 p.unlink()
@@ -130,14 +129,20 @@ def _clock(ms: object) -> str:
         return "?"
 
 
+def _plain(text: str) -> str:
+    """A line with every control character (a newline, an escape sequence) shown as ``?``: a posted value cannot forge a
+    report line or drive the operator's terminal."""
+    return "".join(c if c.isprintable() else "?" for c in text)
+
+
 def render(report: dict[str, object]) -> str:
     """One report as plain lines, steps in time order."""
-    rows = [f"report {report.get('at')} device={report.get('device')} page={report.get('page')}"]
+    rows = [_plain(f"report {report.get('at')} device={report.get('device')} page={report.get('page')}")]
     raw = report.get("entries")
     entries = [e for e in (raw if isinstance(raw, list) else []) if isinstance(e, dict)]
     for e in sorted(entries, key=lambda e: e.get("t") if isinstance(e.get("t"), (int, float)) else 0):
         rest = " ".join(f"{k}={v}" for k, v in e.items() if k not in ("t", "src", "step"))
-        rows.append(f"  {_clock(e.get('t'))} {e.get('src')}/{e.get('step')} {rest}".rstrip())
+        rows.append(_plain(f"  {_clock(e.get('t'))} {e.get('src')}/{e.get('step')} {rest}".rstrip()))
     return "\n".join(rows)
 
 
