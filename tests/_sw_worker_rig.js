@@ -6,7 +6,7 @@ const vm = require('vm');
 
 const [swPath, scenario, mode] = process.argv.slice(2);
 const listeners = {};
-const log = { console: [], asked: [], fetches: 0, opened: [], posted: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
+const log = { console: [], asked: [], fetches: 0, opened: [], posted: [], longWaits: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
 let uncontrolled = [];   // windows only matchAll({includeUncontrolled: true}) returns
 
 // --- IndexedDB: databases by name, each with object stores that are Maps ---------------------------------------------
@@ -87,7 +87,9 @@ const self_ = {
 const sandbox = {
   self: self_, indexedDB, caches, Response, Math,
   console: { info: (m) => log.console.push(['info', String(m)]), warn: (m) => log.console.push(['warn', String(m)]) },
-  URL, setTimeout, clearTimeout, MessageChannel, Date, Promise, JSON, String, Array,
+  URL, clearTimeout, MessageChannel,
+  // a wait of 5 s or more is recorded and shortened, so the worker's 10 s hold after a successful openWindow does not slow the rig
+  setTimeout: (fn, ms, ...a) => setTimeout(fn, ms >= 5000 ? (log.longWaits.push(ms), 50) : ms, ...a), Date, Promise, JSON, String, Array,
   fetch: () => { log.fetches += 1; throw new Error('the worker must not call fetch'); },
 };
 vm.createContext(sandbox);
@@ -107,7 +109,10 @@ function fire(type, ev) {
     dbs.set('levain-sw', { version: 1, stores: new Map([['kv', new Map([['token', 'phone-token']])]]) });
     dbs.set('levain-sw-2', { version: 1, stores: new Map([['opened', new Map([['7', 1]])]]) });
     for (const n of ['levain-old-shell', 'levain-sw-cache', 'levain-open', 'other-app-cache']) cacheNames.add(n);
+    // the pre-fix4 singleton key, and a current per-entry key in the same cache
+    cacheStores.set('levain-open', new Map([['/__levain_open', '{"url":"/sign/1"}'], ['/__levain_open/abc', '{"url":"/sign/2","for":"asked"}']]));
     await fire('activate', {});
+    log.openKeys = [...cacheStores.get('levain-open').keys()].sort();
     log.dbs = [...dbs.keys()].sort();
     log.caches = [...cacheNames].sort();
     log.keptOpened = [...(dbs.get('levain-sw-2').stores.get('opened').entries())];
@@ -137,6 +142,7 @@ function fire(type, ev) {
     else if (kind === 'mismatch') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/elsewhere' }; })];
     else if (kind === 'fragment') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/sign/9' }; })];
     else if (kind === 'search') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/' }; }, 'https://box.example/')];
+    else if (kind === 'matchfail') { self_.clients.matchAll = async () => { throw new TypeError('matchAll refused'); }; }
     else if (kind === 'opennull') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; log.entriesAtOpen = pendings(); return null; }; }
     else if (kind === 'openfail') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; throw new TypeError('openWindow refused'); }; }
     else if (kind === 'prefer') log.windows = [win(ok, 'https://box.example/docs/guide'), win(async (u) => { log.navigated.push('cockpit:' + u); return { url: u }; }, 'https://box.example/sign/3')];

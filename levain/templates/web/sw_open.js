@@ -7,17 +7,18 @@
 // The worker also writes PENDING TARGETS to Cache Storage, one entry per open under its own key '/__levain_open/<nonce>',
 // value {url, nonce, at, for}. Whoever deletes that exact key (cache.delete resolves true for one caller only) owns the
 // open, and nobody deletes a key it did not name or read. for 'asked' (written before the worker asks a window): only the
-// message path claims it, by the nonce the worker named. for 'new' (written just before openWindow): only a page's FIRST
-// load claims it (the script's first run, or a pageshow that is not a bfcache restore), because iOS can land a tapped
-// window on the root url; an already loaded page that merely resumes claims nothing, so a window the worker gave up on
-// never moves late.
+// message path claims it, by the nonce the worker named. for 'new' (written just before openWindow): only this document's
+// first script run claims it (one scan per document, never repeated on pageshow or resume), because iOS can land a tapped
+// window on the root url; and only a page at '/' or at the entry's own target does, so an unrelated first load never takes
+// it. An already loaded page that merely resumes claims nothing, so a window the worker gave up on never moves late.
 
 (() => {
   "use strict";
   if (!("serviceWorker" in navigator)) return;
   const CACHE = "levain-open", PREFIX = "/__levain_open/";
-  // a target older than this is a tap nobody followed up (the card it points at is stale, and a later plain visit must not jump)
-  const PENDING_TTL_MS = 30000;
+  // a target older than this is a tap nobody followed up (the card it points at is stale, and a later plain visit must not jump).
+  // 'new': the window between openWindow and the opened page's first script run. 'asked': the worker's ack wait plus slack.
+  const TTL_MS = { asked: 30000, new: 10000 };
   const haveCache = typeof caches !== "undefined";
   // same origin, path and query; only a fragment may differ
   const sameTarget = (a, b) => a.origin === b.origin && a.pathname === b.pathname && a.search === b.search;
@@ -55,15 +56,17 @@
         let e = null;
         try { const r = await cache.match(req); e = r && await r.json(); } catch (_) { e = null; }
         // unreadable or expired: deleted (the exact key read); the worker deletes its own on the paths it owns
-        if (!e || typeof e.url !== "string" || typeof e.at !== "number" || Date.now() - e.at > PENDING_TTL_MS) { await cache.delete(req); continue; }
+        if (!e || typeof e.url !== "string" || typeof e.at !== "number" || Date.now() - e.at > (TTL_MS[e.for] || TTL_MS.asked)) { await cache.delete(req); continue; }
         if (e.for !== "new") continue;                       // 'asked' belongs to the message path
         let u;
         try { u = new URL(e.url, location.href); } catch (_) { continue; }
         if (u.origin !== location.origin) continue;
         found.push({ req, e, u });
       }
-      // the entry for the page already showing, else the newest; a lost delete means another page took it: try the next
+      // only a page at '/' (the iOS root landing) or at the entry's own target may take a 'new' entry
       const here = new URL(location.href);
+      for (let i = found.length - 1; i >= 0; i--) if (here.pathname !== "/" && !sameTarget(found[i].u, here)) found.splice(i, 1);
+      // the entry for the page already showing, else the newest; a lost delete means another page took it: try the next
       found.sort((x, y) => (sameTarget(y.u, here) - sameTarget(x.u, here)) || (y.e.at - x.e.at));
       for (const f of found) {
         if (!(await cache.delete(f.req))) continue;
@@ -72,8 +75,8 @@
       }
     } catch (_) { /* no cache: nothing pending */ } finally { checking = false; }
   }
+  // once, at this document's first script run: a pageshow call would let a page opened for one tap consume a later tap's entry
   checkPending();
-  window.addEventListener("pageshow", (ev) => { if (!ev.persisted) checkPending(); });
 
   // an uncontrolled page (opened before the worker took over) queues worker messages until this is called
   try { navigator.serviceWorker.startMessages(); } catch (_) { /* older engines deliver without it */ }

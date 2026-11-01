@@ -36,6 +36,14 @@ def test_activating_the_new_worker_deletes_the_old_database_and_every_levain_cac
 
 
 @needs_node
+def test_activating_deletes_the_pre_fix4_singleton_pending_key_and_only_that() -> None:
+    """(d) a rolling update: the old worker's one fixed key '/__levain_open' (no claim path reads it any more) goes at
+    activation; the per-entry keys stay."""
+    got = _run("activate")
+    assert got["openKeys"] == ["/__levain_open/abc"], got
+
+
+@needs_node
 def test_a_tap_writes_the_ping_id_to_opened_makes_no_fetch_and_the_worker_hears_no_message() -> None:
     """Reproduced red on the base worker: a tap read the token from IndexedDB and called fetch('/webpush/opened')."""
     got = _run("click")
@@ -187,12 +195,25 @@ def test_the_window_preference_picks_the_cockpit_page_over_a_docs_page() -> None
 
 
 @needs_node
-def test_a_fallback_open_window_writes_one_fresh_new_entry_just_before_it_for_the_page_that_lands_on_root() -> None:
+def test_a_fallback_open_window_writes_one_fresh_new_entry_just_before_it_and_drops_it_after_ten_seconds() -> None:
     """(c, d) the asked entry is gone (the worker claimed it) and ONE 'new' entry, another nonce, is present when
-    openWindow runs, so the asked window can never claim it and the page iOS lands on '/' can."""
+    openWindow runs, so the asked window can never claim it and the page iOS lands on '/' can. A successful openWindow into
+    a page that never claims it (no listener) leaves nothing behind: the worker holds the click open for the 10 s window,
+    then drops its own key (the rig shortens the wait and records the requested one)."""
     got = _run("navigate", "uncontrolled")
-    assert got["pendingLeft"] == 1 and got["pending"]["for"] == "new" and got["pending"]["nonce"] != got["nonces"][0], got
-    assert [e["for"] for e in got["entriesAtOpen"]] == ["new"], got
+    assert got["longWaits"] == [10000], got
+    entry, = got["entriesAtOpen"]
+    assert entry["for"] == "new" and entry["nonce"] != got["nonces"][0], got
+    assert got["pendingLeft"] == 0, got
+
+
+@needs_node
+def test_a_window_lookup_that_rejects_still_reaches_the_fallback_and_cleans_the_asked_entry() -> None:
+    """a rejected matchAll counts as no window: the asked entry is dropped, openWindow runs with its 'new' entry"""
+    got = _run("navigate", "matchfail")
+    assert got["openedUrl"] == CARD and got["asked"] == [], got
+    assert [e["for"] for e in got["entriesAtOpen"]] == ["new"], got   # the asked entry was dropped before the fallback wrote its own
+    assert got["pendingLeft"] == 0, got
 
 
 @needs_node
@@ -204,14 +225,17 @@ def test_a_message_deletes_only_the_key_its_nonce_names() -> None:
 
 
 @needs_node
-def test_only_a_pages_first_load_claims_a_new_entry() -> None:
+def test_only_a_documents_first_script_run_claims_a_fresh_new_entry_at_the_root_or_at_its_own_target() -> None:
     got = _open_rig("load")
     assert got["firstLoad"] == {"assigned": [CARD], "pending": False}, got         # iOS landed on '/': the first-load check forwards
-    assert got["asked"] == {"assigned": 1, "pending": True}, got                   # an 'asked' entry is the message path's, never the load check's
-    assert got["expired"] == {"assigned": 1, "pending": False}, got                # older than 30 s: deleted, ignored
+    assert got["noPageshowHandler"] is True, got                                   # the scan is one per document: pageshow runs none
+    assert got["asked"] == {"assigned": 1, "askedKept": True, "expiredNewGone": True}, got   # 'asked' is the message path's (15 s old: alive); 'new' dies at 10 s
+    assert got["askedExpired"] == {"assigned": 1, "gone": True}, got               # 'asked' dies at 30 s
     assert got["alreadyHere"] == {"assigned": 1, "pending": False}, got            # consumed, no pointless assign
-    assert got["resumed"] == {"assigned": 1, "pending": True}, got                 # visibilitychange and a bfcache pageshow claim nothing
-    assert got["shown"] == {"assigned": 2, "pending": False}, got                  # a first load does
+    assert got["unrelated"] == {"assigned": 1, "pending": True}, got               # an unrelated first load (not '/', not the target) takes nothing
+    assert got["unrelatedPair"] == {"assigned": 1, "pending": True}, got
+    assert got["resumed"] == {"assigned": 1, "pending": True}, got                 # visibilitychange and any pageshow claim nothing
+    assert got["nineSeconds"] == {"assigned": 2, "pending": False}, got           # inside the 10 s window a root landing forwards
     assert got["cross"] == {"assigned": 2}, got                                    # never follows another origin
     assert got["query"] == {"assigned": ["https://box.example/?view=needs"], "pending": False}, got   # '/' is not '/?view=needs'
     assert got["fragment"] == {"moved": 0, "pending": False}, got                  # only a fragment differs: already here
@@ -222,6 +246,16 @@ def test_a_first_load_takes_the_entry_for_its_own_url_else_the_newest() -> None:
     got = _open_rig("first")
     assert got["first"] == {"assigned": ["https://box.example/sign/3"], "left": ["mid", "old"]}, got
     assert got["own"] == {"assigned": 1, "left": ["mid"]}, got   # at /sign/1 it takes that entry and stays put
+
+
+@needs_node
+def test_a_page_opened_for_one_tap_does_not_consume_the_next_taps_entry_on_its_initial_pageshow() -> None:
+    """overlapping taps A and B, a page opened at A: A's entry is its own; B's survives A's load and A's pageshow, and the
+    page opened for B takes it. (The pageshow rescan this replaces moved A's page to B.)"""
+    got = _open_rig("overlap")
+    assert got["afterLoad"] == {"assigned": [], "left": ["tapB"]}, got
+    assert got["afterPageshow"] == {"assigned": [], "left": ["tapB"]}, got
+    assert got["afterB"] == {"assigned": [], "left": []}, got
 
 
 @needs_node

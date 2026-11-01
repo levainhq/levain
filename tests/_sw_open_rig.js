@@ -1,14 +1,17 @@
 // Runs levain/templates/web/sw_open.js in a vm with a stub page; prints what the page did.
-// usage: node _sw_open_rig.js <path to sw_open.js> [messages|claim|load|first|nocache]
+// usage: node _sw_open_rig.js <path to sw_open.js> [messages|claim|load|first|overlap|nocache]
 //   messages (default): the message path with no pending target (message-only), cross-origin and malformed messages
 //   claim:   a message deletes only the key its nonce names; a lost or wrong claim does nothing, a second one too
-//   load:    a page's FIRST load claims 'new' entries only; 'asked' and expired ones, resumes and bfcache restores claim nothing
+//   load:    a document's first script run claims a fresh 'new' entry only at '/' or at the entry's own target; 'asked' and
+//            expired ones, an unrelated page, and any resume or pageshow claim nothing
 //   first:   which of several 'new' entries a first-loading page takes (the one for its own url, else the newest)
+//   overlap: two taps' entries; the page opened for the first takes only that one, and its initial pageshow takes nothing more
 //   nocache: no Cache Storage (an insecure context) -> message-only behaviour even with a nonce
+// Each `boot(href)` is a NEW document: a fresh vm context running the page script once, over the one shared cache store.
 const fs = require('fs');
 const vm = require('vm');
 const [swOpen, scenario = 'messages'] = process.argv.slice(2);
-const handlers = [], winHandlers = {}, docHandlers = {};
+let handlers = [], winHandlers = {}, docHandlers = {};
 const log = { assigned: [], acks: [], started: false };
 const store = new Map();
 const PFX = '/__levain_open/';
@@ -20,17 +23,25 @@ const cache = {
 };
 const put = (nonce, e) => store.set(PFX + nonce, JSON.stringify({ nonce, ...e }));
 const has = (nonce) => store.has(PFX + nonce);
-const sandbox = {
-  URL, Response, Date, Promise, JSON, setTimeout,
-  location: { origin: 'https://box.example', href: 'https://box.example/', assign: (u) => log.assigned.push(u) },
-  navigator: { serviceWorker: { addEventListener: (t, fn) => handlers.push(fn), startMessages: () => { log.started = true; } } },
-  window: { addEventListener: (t, fn) => { (winHandlers[t] = winHandlers[t] || []).push(fn); } },
-  document: { visibilityState: 'hidden', addEventListener: (t, fn) => { (docHandlers[t] = docHandlers[t] || []).push(fn); } },
-};
-if (scenario !== 'nocache') sandbox.caches = { open: async () => cache };
+const left = () => [...store.keys()].map((k) => k.slice(PFX.length)).sort();
+let sandbox;
+const tick = () => new Promise((r) => setTimeout(r, 30));
+async function boot(href = 'https://box.example/') {
+  handlers = []; winHandlers = {}; docHandlers = {};
+  sandbox = {
+    URL, Response, Date, Promise, JSON, setTimeout,
+    location: { origin: 'https://box.example', href, assign: (u) => log.assigned.push(u) },
+    navigator: { serviceWorker: { addEventListener: (t, fn) => handlers.push(fn), startMessages: () => { log.started = true; } } },
+    window: { addEventListener: (t, fn) => { (winHandlers[t] = winHandlers[t] || []).push(fn); } },
+    document: { visibilityState: 'hidden', addEventListener: (t, fn) => { (docHandlers[t] = docHandlers[t] || []).push(fn); } },
+  };
+  if (scenario !== 'nocache') sandbox.caches = { open: async () => cache };
+  vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(swOpen, 'utf8'), sandbox);
+  await tick();
+}
 const CARD = 'https://box.example/sign/9#sign=a&v=1';
 const U = '/sign/9#sign=a&v=1';
-const tick = () => new Promise((r) => setTimeout(r, 30));
 const send = (data) => handlers.forEach((h) => h({ data, ports: [{ postMessage: (m) => log.acks.push({ m, assignedSoFar: log.assigned.length }) }] }));
 const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); await tick(); };
 
@@ -41,9 +52,12 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     put('mid', { url: '/sign/2', at: Date.now() - 1000, for: 'new' });
     put('new', { url: '/sign/3', at: Date.now(), for: 'new' });
   }
-  vm.createContext(sandbox);
-  vm.runInContext(fs.readFileSync(swOpen, 'utf8'), sandbox);
-  await tick();
+  if (scenario === 'overlap') {
+    put('tapA', { url: '/sign/1#sign=a', at: Date.now() - 100, for: 'new' });
+    put('tapB', { url: '/sign/2#sign=b', at: Date.now(), for: 'new' });
+  }
+  const here0 = scenario === 'first' ? 'https://box.example/' : scenario === 'overlap' ? 'https://box.example/sign/1#sign=a' : 'https://box.example/';
+  await boot(here0);
   if (scenario === 'messages' || scenario === 'nocache') {
     send({ type: 'levain-open', url: U });
     send({ type: 'levain-open', url: 'https://evil.example/x' });
@@ -66,45 +80,66 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     send({ type: 'levain-open', url: U, nonce: 'n1' });      // the entry is gone
     await tick();
   } else if (scenario === 'load') {
-    log.firstLoad = { assigned: log.assigned.slice(), pending: has('n0') };      // fresh 'new' target: forwarded, consumed
-    put('a1', { url: U, at: Date.now(), for: 'asked' });                        // 'asked' belongs to the message path
-    await fire('pageshow', winHandlers, { persisted: false });
-    log.asked = { assigned: log.assigned.length, pending: has('a1') };
-    put('x1', { url: U, at: Date.now() - 31000, for: 'new' });                  // expired
-    await fire('pageshow', winHandlers, { persisted: false });
-    log.expired = { assigned: log.assigned.length, pending: has('x1') };
-    sandbox.location.href = CARD;
+    log.firstLoad = { assigned: log.assigned.slice(), pending: has('n0') };      // fresh 'new' target at '/': forwarded, consumed
+    log.noPageshowHandler = !('pageshow' in winHandlers);                         // the scan is not repeated on pageshow
+    // 'asked' belongs to the message path, and lives 30 s: 15 s old is alive and untouched; 'new' lives 10 s
+    put('a1', { url: U, at: Date.now() - 15000, for: 'asked' });
+    put('x1', { url: U, at: Date.now() - 11000, for: 'new' });                   // expired 'new'
+    await boot('https://box.example/');
+    log.asked = { assigned: log.assigned.length, askedKept: has('a1'), expiredNewGone: !has('x1') };
+    store.clear();
+    put('x2', { url: U, at: Date.now() - 31000, for: 'asked' });                 // expired 'asked'
+    await boot('https://box.example/');
+    log.askedExpired = { assigned: log.assigned.length, gone: !has('x2') };
+    store.clear();
     put('h1', { url: U, at: Date.now(), for: 'new' });                          // already here
-    await fire('pageshow', winHandlers, { persisted: false });
+    await boot(CARD);
     log.alreadyHere = { assigned: log.assigned.length, pending: has('h1') };
-    sandbox.location.href = 'https://box.example/';
-    put('r1', { url: U, at: Date.now(), for: 'new' });                          // an already loaded page resumes: claims nothing
+    store.clear();
+    put('u1', { url: U, at: Date.now(), for: 'new' });                          // an unrelated first load (not '/', not the target)
+    await boot('https://box.example/sign/3');
+    log.unrelated = { assigned: log.assigned.length, pending: has('u1') };
+    await boot('https://box.example/pair');
+    log.unrelatedPair = { assigned: log.assigned.length, pending: has('u1') };
+    // an already loaded page at '/' that resumes (visibilitychange, bfcache pageshow, any pageshow) claims nothing
+    await boot('https://box.example/sign/3');
+    put('r1', { url: U, at: Date.now(), for: 'new' });
     sandbox.document.visibilityState = 'hidden';
     await fire('visibilitychange', docHandlers);
     sandbox.document.visibilityState = 'visible';
     await fire('visibilitychange', docHandlers);
-    await fire('pageshow', winHandlers, { persisted: true });                   // a bfcache restore: claims nothing
-    log.resumed = { assigned: log.assigned.length, pending: has('r1') };
-    await fire('pageshow', winHandlers, { persisted: false });                  // a first load does
-    log.shown = { assigned: log.assigned.length, pending: has('r1') };
-    put('c1', { url: 'https://evil.example/x', at: Date.now(), for: 'new' });   // cross-origin: never followed
+    await fire('pageshow', winHandlers, { persisted: true });
     await fire('pageshow', winHandlers, { persisted: false });
+    log.resumed = { assigned: log.assigned.length, pending: has('u1') && has('r1') };
+    store.clear();
+    put('s1', { url: U, at: Date.now() - 9000, for: 'new' });                   // 9 s old: still inside the 10 s window
+    await boot('https://box.example/');
+    log.nineSeconds = { assigned: log.assigned.length, pending: has('s1') };
+    store.clear();
+    put('c1', { url: 'https://evil.example/x', at: Date.now(), for: 'new' });   // cross-origin: never followed
+    await boot('https://box.example/');
     log.cross = { assigned: log.assigned.length };
     store.clear();
-    sandbox.location.href = 'https://box.example/';
     put('q1', { url: '/?view=needs', at: Date.now(), for: 'new' });             // the query is part of the target: '/' is not there
-    await fire('pageshow', winHandlers, { persisted: false });
+    await boot('https://box.example/');
     log.query = { assigned: log.assigned.slice(-1), pending: has('q1') };
-    sandbox.location.href = 'https://box.example/?view=needs';
+    store.clear();
     put('q2', { url: '/?view=needs#top', at: Date.now(), for: 'new' });         // only a fragment differs: already here
     const before = log.assigned.length;
-    await fire('pageshow', winHandlers, { persisted: false });
+    await boot('https://box.example/?view=needs');
     log.fragment = { moved: log.assigned.length - before, pending: has('q2') };
   } else if (scenario === 'first') {
-    log.first = { assigned: log.assigned.slice(), left: [...store.keys()].map((k) => k.slice(PFX.length)).sort() };   // the newest went; two stay
-    sandbox.location.href = 'https://box.example/sign/1';
-    await fire('pageshow', winHandlers, { persisted: false });                 // a page already at /sign/1 takes its own entry and stays
-    log.own = { assigned: log.assigned.length, left: [...store.keys()].map((k) => k.slice(PFX.length)).sort() };
+    log.first = { assigned: log.assigned.slice(), left: left() };                // the newest went; two stay
+    await boot('https://box.example/sign/1');                                    // a page already at /sign/1 takes its own entry and stays
+    log.own = { assigned: log.assigned.length, left: left() };
+  } else if (scenario === 'overlap') {
+    // the page opened for tap A (at A's target) took A's entry and stayed; B's entry is still there for B's window
+    log.afterLoad = { assigned: log.assigned.slice(), left: left() };
+    await fire('pageshow', winHandlers, { persisted: false });                   // its initial pageshow: takes nothing
+    await fire('pageshow', winHandlers, { persisted: true });
+    log.afterPageshow = { assigned: log.assigned.slice(), left: left() };
+    await boot('https://box.example/sign/2#sign=b');                             // B's window: takes B's entry, stays
+    log.afterB = { assigned: log.assigned.slice(), left: left() };
   }
   console.log(JSON.stringify(log));
 })().catch((e) => { console.log(JSON.stringify({ error: String(e && e.stack || e) })); process.exit(1); });
