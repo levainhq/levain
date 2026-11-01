@@ -70,7 +70,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                         description="Hash the latest snapshot, integrity-check its db backup, run the real rollback on a "
                                     "scratch copy of the store and open the result. Never touches the store itself.")
     dr.add_argument("--store-dir", required=True, help="A directory holding memory.db (or .levain/memory.db).")
-    dr.add_argument("--root", default=None, help="The occurrences dir (default <store dir>/dream).")
+    dr.add_argument("--root", default=None, help="The occurrences dir (default dream/ beside the store's resolved memory.db).")
     dr.add_argument("--json", action="store_true")
     dr.set_defaults(func=run_dream_drill)
 
