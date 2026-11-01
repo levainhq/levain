@@ -4,9 +4,10 @@
 const fs = require('fs');
 const vm = require('vm');
 
-const [swPath, scenario] = process.argv.slice(2);
+const [swPath, scenario, mode] = process.argv.slice(2);
 const listeners = {};
-const log = { fetches: 0, opened: [], posted: [], claimed: false, skipWaiting: false, windows: [] };
+const log = { console: [], asked: [], fetches: 0, opened: [], posted: [], longWaits: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
+let uncontrolled = [];   // windows only matchAll({includeUncontrolled: true}) returns
 
 // --- IndexedDB: databases by name, each with object stores that are Maps ---------------------------------------------
 const dbs = new Map();   // name -> {version, stores: Map(storeName -> Map)}
@@ -48,15 +49,29 @@ const indexedDB = {
 
 // --- Cache Storage ---------------------------------------------------------------------------------------------------
 const cacheNames = new Set();
+const cacheStores = new Map();   // cache name -> Map(request key -> body text)
 const caches = {
   keys: async () => [...cacheNames],
   delete: async (n) => cacheNames.delete(n),
+  open: async (n) => {
+    cacheNames.add(n);
+    if (!cacheStores.has(n)) cacheStores.set(n, new Map());
+    const m = cacheStores.get(n);
+    return {
+      put: async (k, r) => { m.set(k, await r.text()); },
+      match: async (k) => (m.has(k) ? new Response(m.get(k)) : undefined),
+      delete: async (k) => m.delete(k),
+      keys: async () => [...m.keys()].map((k) => ({ url: 'https://box.example' + k })),
+    };
+  },
 };
+
+const pendings = () => [...(cacheStores.get('levain-open') || new Map()).entries()].map(([k, v]) => ({ key: k, ...JSON.parse(v) }));
 
 // --- clients ---------------------------------------------------------------------------------------------------------
 const windowClient = {
   url: 'https://box.example/', focus: async () => {}, navigate: async () => {},
-  postMessage: (m) => log.posted.push(m),
+  postMessage: (m, tr) => { if (m && m.type === 'levain-open') { log.asked.push(m.url); tr[0].postMessage({ ok: true }); } else log.posted.push(m); },
 };
 const self_ = {
   addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
@@ -65,12 +80,16 @@ const self_ = {
   registration: { showNotification: async () => {} },
   clients: {
     claim: async () => { log.claimed = true; },
-    matchAll: async () => log.windows.slice(),
-    openWindow: async () => { log.openWindow = true; },
+    matchAll: async (o) => log.windows.concat((o && o.includeUncontrolled) ? uncontrolled : []),
+    openWindow: async (u) => { log.openWindow = true; log.openedUrl = u; log.openedAll = (log.openedAll || []).concat([u]); log.entriesAtOpen = pendings(); return { url: u }; },
   },
 };
 const sandbox = {
-  self: self_, indexedDB, caches, URL, setTimeout, Date, Promise, JSON, String, Array,
+  self: self_, indexedDB, caches, Response, Math,
+  console: { info: (m) => log.console.push(['info', String(m)]), warn: (m) => log.console.push(['warn', String(m)]) },
+  URL, clearTimeout, MessageChannel,
+  // a wait of 5 s or more is recorded and shortened, so the worker's NEW_TTL_MS hold after a successful openWindow does not slow the rig
+  setTimeout: (fn, ms, ...a) => setTimeout(fn, ms >= 5000 ? (log.longWaits.push(ms), 50) : ms, ...a), Date, Promise, JSON, String, Array,
   fetch: () => { log.fetches += 1; throw new Error('the worker must not call fetch'); },
 };
 vm.createContext(sandbox);
@@ -89,11 +108,52 @@ function fire(type, ev) {
     // the retired phone-port database (it held the phone token), the new one, and caches of several names
     dbs.set('levain-sw', { version: 1, stores: new Map([['kv', new Map([['token', 'phone-token']])]]) });
     dbs.set('levain-sw-2', { version: 1, stores: new Map([['opened', new Map([['7', 1]])]]) });
-    for (const n of ['levain-old-shell', 'levain-sw-cache', 'other-app-cache']) cacheNames.add(n);
+    for (const n of ['levain-old-shell', 'levain-sw-cache', 'levain-open', 'other-app-cache']) cacheNames.add(n);
+    // the pre-fix4 singleton key, and a current per-entry key in the same cache
+    cacheStores.set('levain-open', new Map([['/__levain_open', '{"url":"/sign/1"}'], ['/__levain_open/abc', '{"url":"/sign/2","for":"asked"}']]));
     await fire('activate', {});
+    log.openKeys = [...cacheStores.get('levain-open').keys()].sort();
     log.dbs = [...dbs.keys()].sort();
     log.caches = [...cacheNames].sort();
     log.keptOpened = [...(dbs.get('levain-sw-2').stores.get('opened').entries())];
+  } else if (scenario === 'navigate') {
+    // mode: <window>[+ack][+two] ; "+two" fires a second tap (url /sign/10) 100 ms after the first ; window = controlled | uncontrolled | reject | null | mismatch | crossorigin. "+ack" means the
+    // page runs sw_open.js (acks the worker's levain-open message); without it the page is silent, as an old cached page is.
+    const [kind, ack, extra] = mode.split('+');
+    // ack: absent = silent page; 'ack' = acks at once; 'late' = acks after OPEN_ACK_MS (the page claims the pending target first)
+    const post = function (m, tr) {
+      if (m && m.type === 'levain-open') {
+        log.askedWho = (log.askedWho || []).concat([this.url]);
+        log.asked.push(m.url); log.nonces = (log.nonces || []).concat([m.nonce]);
+        if (ack === 'ack') tr[0].postMessage({ ok: true });
+        if (ack === 'late') setTimeout(async () => {
+          // what sw_open.js does: delete the key the message names, ack only if that delete took it
+          const c = await caches.open('levain-open');
+          if (await c.delete('/__levain_open/' + m.nonce)) { log.lateClaimed = true; tr[0].postMessage({ ok: true }); } else log.lateClaimed = false;
+        }, 700);
+      } else log.posted.push(m);
+    };
+    const win = (nav, u) => ({ url: u || 'https://box.example/cockpit', focus: async () => { log.focused += 1; }, navigate: nav, postMessage: post });
+    const ok = async (u) => { log.navigated.push(u); return { url: u }; };
+    if (kind === 'controlled' || kind === 'crossorigin') log.windows = [win(ok)];
+    else if (kind === 'uncontrolled') uncontrolled = [win(async () => { throw new TypeError("This service worker is not the client's active service worker."); })];
+    else if (kind === 'reject') log.windows = [win(async () => { throw new TypeError('navigate refused'); })];
+    else if (kind === 'null') log.windows = [win(async (u) => { log.navigated.push(u); return null; })];
+    else if (kind === 'mismatch') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/elsewhere' }; })];
+    else if (kind === 'fragment') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/sign/9' }; })];
+    else if (kind === 'search') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/' }; }, 'https://box.example/')];
+    else if (kind === 'matchfail') { self_.clients.matchAll = async () => { throw new TypeError('matchAll refused'); }; }
+    else if (kind === 'opennull') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; log.entriesAtOpen = pendings(); return null; }; }
+    else if (kind === 'openfail') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; throw new TypeError('openWindow refused'); }; }
+    else if (kind === 'prefer') log.windows = [win(ok, 'https://box.example/docs/guide'), win(async (u) => { log.navigated.push('cockpit:' + u); return { url: u }; }, 'https://box.example/sign/3')];
+    const url = kind === 'crossorigin' ? 'https://evil.example/x' : kind === 'search' ? '/?view=needs' : '/sign/9#sign=a&v=1';
+    const first = fire('notificationclick', { notification: { close: () => {}, data: { url } } });
+    if (extra === 'two') { await new Promise((r) => setTimeout(r, 100)); await fire('notificationclick', { notification: { close: () => {}, data: { url: '/sign/10' } } }); }
+    await first;
+    if (ack === 'late') await new Promise((r) => setTimeout(r, 900));   // let the late page act
+    log.pendings = pendings();
+    log.pendingLeft = log.pendings.length;
+    if (log.pendings.length) log.pending = log.pendings[0];
   } else if (scenario === 'click') {
     log.windows = [windowClient];
     let closed = false;

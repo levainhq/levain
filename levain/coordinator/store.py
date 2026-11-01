@@ -1142,12 +1142,12 @@ class CoordStore:
             return lease.claim_spawn(conn, now, launch_id, pid)
 
     def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
-                       model: str | None = None, cwd: str | None = None) -> Any:
+                       model: str | None = None, cwd: str | None = None, role_ref: str | None = None) -> Any:
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
             return lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
-                                        cwd=cwd)
+                                        cwd=cwd, role_ref=role_ref)
 
     def launch_activate(self, launch_id: str, *, harness_session_id: str, argv_sha256: str | None = None) -> Any:
         from levain.coordinator import lease
@@ -1189,6 +1189,38 @@ class CoordStore:
             budget.file_sign(self, conn, now, g)
         return lease.launch(conn, launch_id), g.refusal
 
+    def launch_end_done_worker(self, launch_id: str, *, handoff: str | None = None, why: str | None = None) -> Any:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.end_done_worker(conn, now, launch_id, handoff=handoff, why=why)
+
+    def launch_handoff(self, token: object, launch_id: str) -> dict[str, Any]:
+        """The handoff spawned worker ``launch_id`` left (:func:`levain.coordinator.lease.worker_handoff`), read by the
+        lease holder: ``token`` is fenced in the read's own transaction, and nothing is written. A refusal for a worker
+        the watcher last read waiting on a tool call names it waiting and since when."""
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            lease.fence(conn, now, token)
+            try:
+                return lease.worker_handoff(conn, launch_id)
+            except lease.LeaseRefused as exc:
+                # a worker the watcher last read waiting on a tool call says so, so the operator can see and stop it
+                from levain.coordinator.launch import worker_waiting_since
+
+                since = worker_waiting_since(self.directory, launch_id)
+                if since is None:
+                    raise
+                raise lease.LeaseRefused(f"{exc}; it is waiting on a tool call or your consent since {since}") \
+                    from None
+
+    def launch_refuse_worker(self, launch_id: str) -> Any:
+        from levain.coordinator import lease
+
+        with self._write() as (conn, now):
+            return lease.refuse_unstarted_worker(conn, now, launch_id)
+
     def launch_end(self, launch_id: str, kind: str, cause: str) -> Any:
         from levain.coordinator import lease
 
@@ -1227,12 +1259,13 @@ class CoordStore:
         with read_transaction(self._connect) as conn:
             return lease.by_harness_session(conn, harness_session_id)
 
-    def launch_end_unlisted(self, launch_id: str) -> Any:
-        """``launch_id``'s session is gone from its harness's list (:func:`levain.coordinator.lease.end_unlisted`)."""
+    def launch_end_unlisted(self, launch_id: str, *, handoff: str | None = None) -> Any:
+        """``launch_id``'s session is gone from its harness's list (:func:`levain.coordinator.lease.end_unlisted`;
+        ``handoff``: a spawned worker's last reply, kept with the end)."""
         from levain.coordinator import lease
 
         with self._write() as (conn, now):
-            return lease.end_unlisted(conn, now, launch_id)
+            return lease.end_unlisted(conn, now, launch_id, handoff=handoff)
 
     def launch_replace_done(self, launch_id: str, *, asked: bool = False) -> Any:
         """``launch_id``'s session was listed done (:func:`levain.coordinator.lease.replace_done`; ``asked``: your

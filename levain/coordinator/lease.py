@@ -48,6 +48,7 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import timedelta
+from typing import Any
 
 from levain import unshowable
 from levain.cockpit.consent import parse_stamp, utc_stamp
@@ -55,12 +56,13 @@ from levain.contracts.canon import canonical
 from levain.coordinator.store import CoordError, _append_only, next_gseq
 
 __all__ = [
-    "BACKOFF", "HARNESSES", "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
+    "BACKOFF", "HARNESSES", "MAX_SPAWNS_LIVE", "MAX_SPAWN_DEPTH", "SPAWN_PREFIX",
+    "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
     "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat",
-    "check_model", "claim", "by_harness_session", "claim_spawn", "end_launch", "end_unlisted", "fence", "launch",
+    "check_model", "claim", "by_harness_session", "claim_spawn", "end_done_worker", "end_launch", "end_unlisted", "fence", "launch",
     "lease", "launches", "LaunchThread", "mark_swept", "over_unswept", "record_thread", "record_write", "release",
-    "request_launch", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
-    "wake_state",
+    "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
+    "wake_state", "HANDOFF_MAX", "refuse_unstarted_worker", "worker_handoff",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
@@ -76,6 +78,10 @@ SEVERAL_THREADS = "a worker holds one thread"
 # a done coordinator the watcher (a drop it never saw waits) or your `levain coord wake` ended so a fresh one starts:
 # a stop, never a death, so the wake in the same transaction is never put into backoff by it (1030-42 L3 r1)
 REPLACED = "replaced while done"
+# a spawned worker whose one turn finished (its session listed done): ended so it no longer counts as a live spawn
+WORKER_DONE = "worker done"
+# a pending spawned worker whose record or thread no longer allows it (the thread merged away, closed or done)
+SPAWN_REFUSED = "spawn refused"
 ROLES = ("coordinator", "worker")
 SETTING_AGENTS = (*HARNESSES, "none")
 _LEASE_BY = ("operator", "coordinator", "service")
@@ -97,7 +103,7 @@ SERVICE_BEAT_WINDOW = 2 * LEASE_TTL
 _MODEL = re.compile(r"[A-Za-z0-9._\[\]][A-Za-z0-9._\[\]-]*")
 # causes the store writes itself; a caller's end_launch never takes one, so no caller can relabel a death
 _SERVICE_CAUSES = ("takeover", "operator release", "lease lost before active", "pending past until",
-                   "lost the lease", BUDGET_CROSSED, SEVERAL_THREADS, REPLACED)
+                   "lost the lease", BUDGET_CROSSED, SEVERAL_THREADS, REPLACED, WORKER_DONE, SPAWN_REFUSED)
 MAX_DEATHS = 3
 
 _LAUNCH_ID = re.compile(r"ln-[0-9a-f]{32}")
@@ -121,7 +127,10 @@ LEASE_SCHEMA: tuple[str, ...] = (
     "token INTEGER NOT NULL, placement TEXT NOT NULL, at TEXT NOT NULL, "
     # the setting's user-layer choice when the launch was asked for, as model and cwd are (L3 r1: never the setting at
     # spawn time); a store from before it gains the column with 0 (off) on every row (:func:`migrate_settings`)
-    "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)))",
+    "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), "
+    # a spawned worker's role: the canonical text of its spawn record (:func:`spawn_record`), NULL for any other
+    # launch; a store from before it gains the column as NULL on every row (:func:`migrate_settings`)
+    "role_ref TEXT)",
     # harness_session_id and argv_sha256 are known only once the process is spawned: they ride the active row
     "CREATE TABLE IF NOT EXISTS launch_events (launch_id TEXT NOT NULL REFERENCES launches(launch_id), "
     f"seq INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL CHECK ({_in('kind', LAUNCH_KINDS)}), "
@@ -147,8 +156,17 @@ LEASE_SCHEMA: tuple[str, ...] = (
     # a launch that is over whose session the watcher saw not running: it leaves the watcher's over list for good
     "CREATE TABLE IF NOT EXISTS launch_sweeps (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
     "gseq INTEGER NOT NULL UNIQUE, cause TEXT NOT NULL, at TEXT NOT NULL)",
+    # a done spawned worker's handoff (P3: output = the handoff), written in the transaction that ends it, before its
+    # session is stopped: its final message, or why there is none
+    "CREATE TABLE IF NOT EXISTS launch_handoffs (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), "
+    "gseq INTEGER NOT NULL UNIQUE, handoff TEXT, why TEXT, at TEXT NOT NULL, "
+    "CHECK (handoff IS NOT NULL OR why IS NOT NULL))",
     *_append_only("launch_threads", "a launch thread"),
     *_append_only("launch_sweeps", "a launch sweep"),
+    *_append_only("launch_handoffs", "a worker handoff"),
+    "CREATE TRIGGER IF NOT EXISTS launch_handoffs_no_replace BEFORE INSERT ON launch_handoffs WHEN EXISTS (SELECT 1 "
+    "FROM launch_handoffs WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a worker handoff is written once'); END",
     "CREATE TRIGGER IF NOT EXISTS launch_threads_no_replace BEFORE INSERT ON launch_threads WHEN EXISTS (SELECT 1 "
     "FROM launch_threads WHERE seq = NEW.seq OR gseq = NEW.gseq) "
     "BEGIN SELECT RAISE(ABORT, 'a launch thread is never replaced'); END",
@@ -228,6 +246,7 @@ class Launch:
     at: str
     pinned_envelope_id: str | None = None   # the envelope a one-thread worker was activated under (§3.4)
     user_scope: bool = False     # the user-layer choice it was asked under: the spawn reads this, never the setting
+    role_ref: str | None = None  # a spawned worker's spawn record (:func:`spawn_record`); None for every other launch
 
 
 @dataclass(frozen=True)
@@ -295,7 +314,7 @@ def fence(conn: sqlite3.Connection, now: str, token: object) -> Lease:
     held = lease(conn, now)
     if held is None or held.token != token:
         current = "no coordinator holds the lease" if held is None else f"the lease token is {held.token}"
-        raise _refused(f"lease token {token} is not the live lease's ({current}); nothing was written")
+        raise _refused(f"lease token {token} is not the live lease's ({current}); no state was written")
     if not held.live:
         raise _refused(f"lease token {token} is past its until ({held.until}); the holder claims again")
     if held.holder != "operator":
@@ -326,7 +345,7 @@ def claim(conn: sqlite3.Connection, now: str, launch_id: str, session_key: str) 
                by="service")
         held = None
     if held is not None:
-        raise _refused(f"the lease is held by {held.holder} until {held.until}; nothing was written")
+        raise _refused(f"the lease is held by {held.holder} until {held.until}; no state was written")
     return _event(conn, now, "claim", session_key, token=None, until=_plus(now, LEASE_TTL), cause="claim",
                   by="coordinator")
 
@@ -399,15 +418,183 @@ def take(conn: sqlite3.Connection, now: str, *, hold: timedelta = LEASE_TTL) -> 
 
 
 # --- launches ------------------------------------------------------------------------------------------------------
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return column in {c[1] for c in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def _has_user_scope(conn: sqlite3.Connection, table: str) -> bool:
     """A store made before user_scope has no such column until a writer's opener migrates it: it reads as OFF."""
-    return "user_scope" in {c[1] for c in conn.execute(f"PRAGMA table_info({table})")}
+    return _has_column(conn, table, "user_scope")
+
+
+# --- a spawned worker's role (P3) ----------------------------------------------------------------------------------
+SPAWN_PREFIX = "@spawn/"
+# [seat] the spawn caps: a worker spawning a worker is depth 2, and no deeper; and at most this many spawned workers
+# are asked for or running at once, so a loop of spawns is bounded by a count, not by anyone noticing it
+MAX_SPAWN_DEPTH = 2
+MAX_SPAWNS_LIVE = 4
+ROLE_REF_MAX = 16 * 1024
+# [seat] the most of a done worker's final message the store keeps, in bytes
+HANDOFF_MAX = 64 * 1024
+# what the caller writes: the role, its slot values, the DONE line and the parent it names
+_DRAFT_KEYS = frozenset({"spawn", "role_hash", "inline", "role", "slots", "done", "parent_launch_id"})
+# what the store adds in the request's own transaction, never taken from the caller: the depth from the parent's
+# record, the thread's drop, and the one envelope head the scope was cut from, with that scope
+_DERIVED_KEYS = frozenset({"depth", "drop_id", "envelope_id", "scope"})
+_SPAWN_KEYS = _DRAFT_KEYS | _DERIVED_KEYS
+_SCOPE_KEYS = frozenset({"where", "lands", "pushes", "publishes"})
+# the thread states a spawned worker may be asked for and started in: done and closed work has nothing left to do
+LIVE_THREAD_STATES = ("open", "working")
+
+
+def _spawn_text(text: object, keys: frozenset[str], what: str) -> dict[str, Any]:
+    if not isinstance(text, str) or len(text.encode("utf-8", "surrogatepass")) > ROLE_REF_MAX:
+        raise _refused(f"{what} is text of at most {ROLE_REF_MAX} bytes")
+    try:
+        rec = json.loads(text)
+    except ValueError:
+        raise _refused(f"{what} is JSON") from None
+    if not isinstance(rec, dict) or set(rec) != keys:
+        raise _refused(f"{what} has exactly the keys {sorted(keys)}")
+    if not isinstance(rec["spawn"], str) or not rec["spawn"].startswith(SPAWN_PREFIX) \
+            or not isinstance(rec["role_hash"], str) or re.fullmatch(r"[0-9a-f]{64}", rec["role_hash"]) is None \
+            or type(rec["inline"]) is not bool or not isinstance(rec["role"], dict) \
+            or not isinstance(rec["slots"], dict) or not (rec["done"] is None or isinstance(rec["done"], str)) \
+            or not (rec["parent_launch_id"] is None or isinstance(rec["parent_launch_id"], str)
+                    and _LAUNCH_ID.fullmatch(rec["parent_launch_id"])):
+        raise _refused(f"{what} names an @spawn/ role, its 64-hex hash, inline or not, the role, its slot values, the "
+                       "DONE line (or null) and the parent launch (or null)")
+    for v in [rec["done"], *rec["slots"].values()]:
+        if isinstance(v, str):
+            try:
+                v.encode("utf-8")
+            except UnicodeEncodeError:
+                raise _refused(f"{what} holds text that is not UTF-8 (a lone surrogate)") from None
+    return rec
+
+
+def spawn_draft(text: object) -> dict[str, Any]:
+    """The parsed spawn DRAFT a caller hands :func:`request_launch` as ``role_ref``, or a :class:`LeaseRefused`. A draft
+    carries no depth, drop, envelope or scope: the store derives those in the request's own transaction."""
+    return _spawn_text(text, _DRAFT_KEYS, "a spawn draft")
+
+
+def spawn_record(text: object) -> dict[str, Any]:
+    """The parsed spawn record a launch's ``role_ref`` holds, or a :class:`LeaseRefused` naming what is wrong. The
+    shape only: the role is re-hashed when the store writes the record (:func:`_complete_spawn`) and again by
+    :func:`levain.agents.instantiate.verified_record` at every read that builds a brief."""
+    rec = _spawn_text(text, _SPAWN_KEYS, "a launch's role_ref")
+    scope = rec["scope"]
+    if type(rec["depth"]) is not int or not 1 <= rec["depth"] <= MAX_SPAWN_DEPTH \
+            or not isinstance(rec["drop_id"], str) or re.fullmatch(r"dr-[0-9a-f]{32}", rec["drop_id"]) is None \
+            or not (rec["envelope_id"] is None or isinstance(rec["envelope_id"], str) and rec["envelope_id"]) \
+            or not isinstance(scope, dict) or set(scope) != _SCOPE_KEYS \
+            or any(not isinstance(scope[k], list) for k in _SCOPE_KEYS) \
+            or any(not isinstance(w, dict) or not isinstance(w.get("repo"), str) or not isinstance(w.get("paths"), list)
+                   for w in scope["where"]):
+        raise _refused(f"a launch's role_ref holds a depth of 1 to {MAX_SPAWN_DEPTH}, the thread's drop, the envelope "
+                       "it was cut from (or null) and the scope (where, lands, pushes, publishes)")
+    return rec
+
+
+def _complete_spawn(conn: sqlite3.Connection, draft: dict[str, Any], *, harness: str, model: str | None,
+                    threads: Sequence[str], cwd: str | None) -> str:
+    """The spawn record for ``draft``, every derived field read in the caller's transaction: the role re-hashed and
+    held to the launch's harness and model; the one thread live WORK holding a drop; the depth from an ACTIVE parent
+    worker's own record; and the scope cut from ONE envelope head (its id kept, so the activation pins that one).
+
+    The depth is the lineage the lease holder DECLARES: a worker holds no lease token and no door verb, so every
+    request comes through the lease holder, and one that names no parent is depth 1. It is not a bound a caller
+    cannot get around; the lease and the live-spawn cap (:data:`MAX_SPAWNS_LIVE`) are what bind."""
+    from levain.agents import role as role_mod
+    from levain.coordinator.envelopes import EnvelopeStore, narrow_scope
+    from levain.coordinator.store import CoordStore
+
+    if len(threads) != 1:
+        raise _refused("a spawned worker holds exactly one thread")
+    if not isinstance(cwd, str) or not cwd.startswith("/"):
+        raise _refused("a spawned worker runs in a directory named by an absolute path")
+    try:
+        role = role_mod.parse_role(draft["role"])
+        if role_mod.role_hash(role) != draft["role_hash"]:
+            raise _refused("the spawn draft's role does not hash to its role_hash")
+        if draft["spawn"] != role_mod.spawn_namespace(role["name"]):
+            raise _refused("the spawn draft names another role than the one it holds")
+    except role_mod.RoleError as exc:
+        raise _refused(f"the spawn draft's role is refused: {exc}") from None
+    if role["executor"] != "session":
+        raise _refused(f"role {role['name']!r} has executor {role['executor']!r}; a spawned worker is a session")
+    if harness != role["harness"]:
+        raise _refused(f"role {role['name']!r} runs on {role['harness']}, and the launch asks for {harness}")
+    if model != role["model"]:
+        raise _refused(f"role {role['name']!r} runs model {role['model']!r}, and the launch asks for {model!r}")
+    thread = CoordStore._thread(conn, threads[0])
+    if thread.kind != "work" or thread.state not in LIVE_THREAD_STATES or not thread.members:
+        raise _refused(f"thread {thread.thread_id} is {thread.kind}, {thread.state}, with {len(thread.members)} drops: "
+                       "only open WORK that holds a drop gets a worker")
+    depth = 1
+    parent_id = draft["parent_launch_id"]
+    if parent_id is not None:
+        parent = launch(conn, parent_id)
+        if parent is None or parent.role != "worker" or parent.state != "active" or not parent.role_ref:
+            raise _refused(f"a nested spawn names an active spawned worker as its parent; {parent_id} is not one")
+        try:
+            depth = spawn_record(parent.role_ref)["depth"] + 1
+        except LeaseRefused as exc:
+            raise _refused(f"the parent launch's own record is refused ({exc})") from None
+        if depth > MAX_SPAWN_DEPTH:
+            raise _refused(f"a spawn is at most {MAX_SPAWN_DEPTH} deep (this one would be {depth})")
+    envelope_id = _head_envelope(conn, thread.thread_id)
+    scope: dict[str, Any] = {k: [] for k in sorted(_SCOPE_KEYS)}
+    if envelope_id is not None:
+        eff = EnvelopeStore._effective(conn, envelope_id, thread.thread_id)
+        scope = {k: eff[k] for k in sorted(_SCOPE_KEYS)}
+    try:
+        narrowed = narrow_scope(scope, role["ceiling"])
+    except CoordError as exc:
+        raise _refused(f"the role's ceiling is refused ({exc})") from None
+    rec = {**draft, "depth": depth, "drop_id": thread.members[0], "envelope_id": envelope_id,
+           "scope": {k: narrowed[k] for k in sorted(_SCOPE_KEYS)}}
+    text = canonical(rec)
+    spawn_record(text)
+    return text
+
+
+def spawn_thread_refusal(conn: sqlite3.Connection, ln: Launch) -> str | None:
+    """Why spawned worker ``ln`` may not start now that its record and thread are read again (None: it may): a record
+    that no longer parses, or a thread no longer open work holding the record's drop."""
+    from levain.coordinator.store import CoordStore
+
+    if ln.role != "worker" or not ln.role_ref:
+        return None
+    try:
+        rec = spawn_record(ln.role_ref)
+    except LeaseRefused as exc:
+        return f"the worker's role record is refused ({exc})"
+    if len(ln.threads) != 1:
+        return "a spawned worker holds exactly one thread"
+    try:
+        thread = CoordStore._thread(conn, ln.threads[0])
+    except (CoordError, TypeError):
+        return f"the worker's thread {ln.threads[0]} cannot be read"
+    if thread.kind != "work" or thread.state not in LIVE_THREAD_STATES or rec["drop_id"] not in thread.members:
+        return f"the worker's thread {thread.thread_id} is no longer open work holding drop {rec['drop_id']}"
+    return None
+
+
+def _spawn_caps(conn: sqlite3.Connection, now: str) -> None:
+    _expire_pending(conn, now)
+    live = sum(1 for state in ("pending", "active") for ln in _in_state(conn, state, "worker") if ln.role_ref)
+    if live >= MAX_SPAWNS_LIVE:
+        raise _refused(f"{live} spawned workers are asked for or running, and at most {MAX_SPAWNS_LIVE} are allowed "
+                       "at once")
 
 
 def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | None:
     col = "user_scope" if _has_user_scope(conn, "launches") else "0"
-    r = conn.execute(f"SELECT launch_id, session_key, harness, role, threads, model, cwd, token, placement, at, {col} "
-                     f"FROM launches WHERE {where} = ?", (arg,)).fetchone()
+    ref = "role_ref" if _has_column(conn, "launches", "role_ref") else "NULL"
+    r = conn.execute(f"SELECT launch_id, session_key, harness, role, threads, model, cwd, token, placement, at, {col}, "
+                     f"{ref} FROM launches WHERE {where} = ?", (arg,)).fetchone()
     if r is None:
         return None
     events = conn.execute("SELECT kind, until, harness_session_id, cause, pinned_envelope_id FROM launch_events "
@@ -415,7 +602,7 @@ def _launch_row(conn: sqlite3.Connection, where: str, arg: object) -> Launch | N
     until = next((e[1] for e in events if e[0] == "pending"), None)
     hsid, pin = next(((e[2], e[4]) for e in events if e[0] == "active"), (None, None))
     return Launch(r[0], r[1], r[2], r[3], tuple(json.loads(r[4])), r[5], r[6], r[7], r[8], events[-1][0], until,
-                  hsid, events[-1][3], r[9], pin, bool(r[10]))
+                  hsid, events[-1][3], r[9], pin, bool(r[10]), r[11])
 
 
 def _launch_by_key(conn: sqlite3.Connection, session_key: str) -> Launch | None:
@@ -462,7 +649,7 @@ def _line(name: str, value: object) -> str | None:
 
 def _pending(conn: sqlite3.Connection, now: str, *, token: int, harness: str, role: str, threads: Sequence[str],
              model: str | None, cwd: str | None, cause: str, session_key: str | None = None,
-             user_scope: bool = False) -> Launch:
+             user_scope: bool = False, role_ref: str | None = None) -> Launch:
     if harness not in HARNESSES:
         raise _refused(f"a launch's harness is one of {', '.join(HARNESSES)}")
     if role not in ROLES:
@@ -478,19 +665,27 @@ def _pending(conn: sqlite3.Connection, now: str, *, token: int, harness: str, ro
     for t in threads:
         if conn.execute("SELECT 1 FROM threads WHERE thread_id = ?", (t,)).fetchone() is None:
             raise _refused(f"no thread {t}")
+    model = check_model(model)
+    if role_ref is not None:
+        if role != "worker":
+            raise _refused("only a worker launch carries a spawned role")
+        role_ref = _complete_spawn(conn, spawn_draft(role_ref), harness=harness, model=model, threads=threads, cwd=cwd)
+        _spawn_caps(conn, now)
     launch_id = "ln-" + secrets.token_hex(16)
     session_key = session_key or "s-" + secrets.token_hex(8)
     # before S1 places principals a session runs as your uid and the launch grants nothing (C0 §2, §7 L5)
     conn.execute("INSERT INTO launches (launch_id, gseq, session_key, harness, role, threads, model, cwd, token, "
-                 "placement, at, user_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'operator-uid', ?, ?)",
+                 "placement, at, user_scope, role_ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'operator-uid', ?, ?, ?)",
                  (launch_id, next_gseq(conn, now), session_key, harness, role, canonical(sorted(threads)),
-                  _line("model", model), _line("cwd", cwd), token, now, int(bool(user_scope) and harness == "claude")))
+                  _line("model", model), _line("cwd", cwd), token, now, int(bool(user_scope) and harness == "claude"),
+                  role_ref))
     _launch_event(conn, now, launch_id, "pending", cause, until=_plus(now, LAUNCH_TTL))
     return _launch_row(conn, "launch_id", launch_id)
 
 
 def request_launch(conn: sqlite3.Connection, now: str, token: object, *, harness: str, role: str = "worker",
-                   threads: Sequence[str] = (), model: str | None = None, cwd: str | None = None) -> Launch:
+                   threads: Sequence[str] = (), model: str | None = None, cwd: str | None = None,
+                   role_ref: str | None = None) -> Launch:
     """The lease holder asks for a launch: written ``pending`` under its token, activated only while that token is
     still the live lease's. A coordinator launch asked for while a lease is held is a rotation. A worker holds
     exactly one thread (:data:`SEVERAL_THREADS`): refused here with nothing written."""
@@ -499,7 +694,7 @@ def request_launch(conn: sqlite3.Connection, now: str, token: object, *, harness
     if role == "worker" and len(threads) > 1:
         raise _refused(_several(len(threads)))
     return _pending(conn, now, token=token, harness=harness, role=role, threads=threads, model=model, cwd=cwd,
-                    cause="requested")
+                    cause="requested", role_ref=role_ref)
 
 
 def _several(n: int) -> str:
@@ -515,6 +710,80 @@ def refuse_several(conn: sqlite3.Connection, now: str, ln: Launch) -> tuple[Laun
         return None
     _launch_event(conn, now, ln.launch_id, "failed", SEVERAL_THREADS)
     return _launch_row(conn, "launch_id", ln.launch_id), f"launch {ln.launch_id}: {_several(len(ln.threads))}"
+
+
+def _refuse_spawn(conn: sqlite3.Connection, now: str, ln: Launch) -> tuple[Launch, str] | None:
+    """A pending spawned worker whose record or thread no longer allows it (:func:`spawn_thread_refusal`): written
+    ``failed`` (cause :data:`SPAWN_REFUSED`) in the caller's transaction, so it leaves the live-spawn count, and
+    ``(launch, why)`` returned; None otherwise. The spawn claim and the activation both call it."""
+    why = None if ln.state != "pending" else spawn_thread_refusal(conn, ln)
+    if why is None:
+        return None
+    _launch_event(conn, now, ln.launch_id, "failed", SPAWN_REFUSED)
+    return _launch_row(conn, "launch_id", ln.launch_id), f"launch {ln.launch_id}: {why}"
+
+
+def end_done_worker(conn: sqlite3.Connection, now: str, launch_id: str, *, handoff: str | None = None,
+                    why: str | None = None) -> Launch | None:
+    """A spawned worker whose one turn finished: ``ended``, cause :data:`WORKER_DONE`, so it leaves the live-spawn
+    count and the watcher stops its session and removes its brief. Its ``handoff`` (its final message), or ``why`` it
+    has none, is written to ``launch_handoffs`` in the same transaction, so it outlives the session; a handoff longer
+    than :data:`HANDOFF_MAX` bytes keeps its head and says so. None, nothing written, when it is not an active spawned
+    worker any more."""
+    ln = launch(conn, launch_id)
+    if ln is None or ln.state != "active" or ln.role != "worker" or not ln.role_ref:
+        return None
+    _launch_event(conn, now, launch_id, "ended", WORKER_DONE)
+    _keep_handoff(conn, now, launch_id, handoff, why)
+    return _launch_row(conn, "launch_id", launch_id)
+
+
+def _keep_handoff(conn: sqlite3.Connection, now: str, launch_id: str, handoff: str | None, why: str | None) -> None:
+    """Spawned worker ``launch_id``'s ``handoff`` (or ``why`` it has none) written to ``launch_handoffs`` in the
+    caller's transaction; a handoff longer than :data:`HANDOFF_MAX` bytes keeps its head and says so."""
+    if handoff is not None:
+        raw = handoff.encode("utf-8", "replace")
+        if len(raw) > HANDOFF_MAX:
+            handoff = raw[:HANDOFF_MAX].decode("utf-8", "ignore")
+            why = f"the handoff is cut to its first {HANDOFF_MAX} bytes"
+        else:
+            handoff = raw.decode("utf-8")
+    elif why is None:
+        why = "no final message was read"
+    if why is not None:
+        why = " ".join(unshowable.mark(why, allow="").split())[:_LINE_MAX]
+    conn.execute("INSERT INTO launch_handoffs (launch_id, gseq, handoff, why, at) VALUES (?, ?, ?, ?, ?)",
+                 (launch_id, next_gseq(conn, now), handoff, why, now))
+
+
+def worker_handoff(conn: sqlite3.Connection, launch_id: str) -> dict[str, Any]:
+    """The handoff spawned worker ``launch_id`` left (``launch_id``, ``handoff``, ``why``, ``at``), or a
+    :class:`LeaseRefused` naming why there is none to read: no such launch, not a spawned worker, or one that has
+    not ended done."""
+    ln = _must_launch(conn, launch_id)
+    if ln.role != "worker" or not ln.role_ref:
+        raise _refused(f"launch {launch_id} is not a spawned worker; only a spawned worker leaves a handoff")
+    if not _has_column(conn, "launch_handoffs", "handoff"):
+        raise _refused("this store holds no worker handoffs yet")
+    r = conn.execute("SELECT handoff, why, at FROM launch_handoffs WHERE launch_id = ?", (launch_id,)).fetchone()
+    if r is None:
+        raise _refused(f"worker launch {launch_id} is {ln.state} ({ln.cause}) and left no handoff; one is written "
+                       "when its turn finishes")
+    return {"launch_id": launch_id, "handoff": r[0], "why": r[1], "at": r[2]}
+
+
+def refuse_unstarted_worker(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch | None:
+    """A pending spawned worker its launcher refused before any spawn claim (it can never start as asked): written
+    ``failed``, cause :data:`SPAWN_REFUSED`, in the caller's transaction, so it leaves the live-spawn count at once
+    instead of at :data:`LAUNCH_TTL`. None, nothing written, for any other launch, or one whose spawn a process has
+    claimed meanwhile."""
+    ln = launch(conn, launch_id)
+    if ln is None or ln.state != "pending" or ln.role != "worker" or not ln.role_ref:
+        return None
+    if conn.execute("SELECT 1 FROM launch_spawns WHERE launch_id = ?", (launch_id,)).fetchone() is not None:
+        return None
+    _launch_event(conn, now, launch_id, "failed", SPAWN_REFUSED)
+    return _launch_row(conn, "launch_id", launch_id)
 
 
 def _head_envelope(conn: sqlite3.Connection, thread_id: str) -> str | None:
@@ -535,7 +804,9 @@ def activate(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_sess
     which commits) and the reason returned: ``(launch, None)`` on activation, ``(launch, reason)`` when refused.
 
     THE PIN (C0 §3.4): a worker launch whose threads are exactly ``[T]`` records T's head envelope at this moment on
-    its ``active`` row, in this transaction; it and every job it files run under that envelope, which later
+    its ``active`` row, in this transaction (a SPAWNED worker records the envelope its stored scope was cut from, so
+    its brief and its pin name the same one; a spawned worker whose thread is no longer open work is written failed
+    here, :func:`_refuse_spawn`); it and every job it files run under that envelope, which later
     successors and attenuations can only narrow. A coordinator launch and a thread with no envelope pin nothing (no
     envelope authority); a pending worker holding several threads is refused here (:func:`refuse_several`). The pin is the head as bound, live or not: whether
     it is still in force is the predicate's question at each use (§4.5), never this one's."""
@@ -556,7 +827,13 @@ def activate(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_sess
     several = refuse_several(conn, now, ln)
     if several is not None:
         return several
-    pin = _head_envelope(conn, ln.threads[0]) if ln.role == "worker" else None
+    spawned = _refuse_spawn(conn, now, ln)
+    if spawned is not None:
+        return spawned
+    # a spawned worker is pinned to the one envelope its scope was cut from, never to a head bound since: the brief
+    # and the pin then describe the same envelope
+    pin = None if ln.role != "worker" else spawn_record(ln.role_ref)["envelope_id"] if ln.role_ref else \
+        _head_envelope(conn, ln.threads[0])
     _launch_event(conn, now, launch_id, "active", "spawned", harness_session_id=hsid,
                   argv_sha256=_line("argv sha256", argv_sha256), pinned_envelope_id=pin)
     if ln.role == "coordinator" and held.holder == ln.session_key:
@@ -584,10 +861,12 @@ def end_launch(conn: sqlite3.Connection, now: str, launch_id: str, kind: str, ca
     return _launch_row(conn, "launch_id", launch_id)
 
 
-def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch | None:
+def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str, *, handoff: str | None = None) -> Launch | None:
     """The watcher saw ``launch_id``'s session missing from its harness's list: an ``active`` launch is written
     ``ended``, cause ``0 turns`` for a coordinator that wrote no lease row as coordinator since its ``active`` (a
-    death), else ``gone``. The check and the write are one transaction. None when the launch is no longer active."""
+    death), else ``gone``. A spawned worker's ``handoff`` (its last reply, read by the caller; None: none was read) is
+    kept in the same transaction, marked as read from a session that left before it was seen done. The check and the
+    write are one transaction. None when the launch is no longer active."""
     ln = _must_launch(conn, launch_id)
     if ln.state != "active":
         return None
@@ -597,7 +876,12 @@ def end_unlisted(conn: sqlite3.Connection, now: str, launch_id: str) -> Launch |
                                    (launch_id,)).fetchone()[0]
         # a fenced thread or drop write is a lease row too (record_write): a coordinator that split but never beat
         cause = "gone" if _wrote_since(conn, ln.session_key, gseq=active_gseq) else "0 turns"
-    return end_launch(conn, now, launch_id, "ended", cause)
+    ended = end_launch(conn, now, launch_id, "ended", cause)
+    if handoff is not None and ln.role == "worker" and ln.role_ref and _has_column(conn, "launch_handoffs", "handoff"):
+        _keep_handoff(conn, now, launch_id, handoff,
+                      "its session left the listing before it was seen done: this is its last reply, which may not "
+                      "end its turn")
+    return ended
 
 
 def unseen_drop(conn: sqlite3.Connection, ln: Launch) -> str | None:
@@ -776,11 +1060,13 @@ def setting(conn: sqlite3.Connection) -> Setting | None:
 
 def migrate_settings(conn: sqlite3.Connection) -> None:
     """The additive migration: ``coord_settings`` and ``launches`` gain ``user_scope``, 0 (off) on every row written
-    before it. Runs in the opener's schema transaction, like the replies' sequence."""
+    before it, and ``launches`` gains ``role_ref``, NULL on every row. Runs in the opener's schema transaction, like the replies' sequence."""
     for table in ("coord_settings", "launches"):
         if not _has_user_scope(conn, table):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN user_scope INTEGER NOT NULL DEFAULT 0 "
                          "CHECK (user_scope IN (0, 1))")
+    if not _has_column(conn, "launches", "role_ref"):
+        conn.execute("ALTER TABLE launches ADD COLUMN role_ref TEXT")
 
 
 def check_model(model: object) -> str | None:
@@ -834,7 +1120,8 @@ def claim_spawn(conn: sqlite3.Connection, now: str, launch_id: str, pid: int) ->
     """The one-spawner compare-and-set, inside the caller's ``BEGIN IMMEDIATE``: ``(launch, None)`` when this process
     may start the launch's session (its latest event is ``pending``, ``now`` is before its ``until``, its token is
     still the live lease's, and nobody claimed the spawn before), else ``(launch, why)`` and nothing to spawn. A launch
-    past its until is written ``expired`` and one whose lease is gone ``failed``, as :func:`activate` would."""
+    past its until is written ``expired`` and one whose lease is gone ``failed``, as :func:`activate` would; so is a
+    spawned worker whose record or thread no longer allows it (:func:`_refuse_spawn`)."""
     ln = _must_launch(conn, launch_id)
     if ln.state != "pending":
         return ln, f"launch {launch_id} is {ln.state}, not pending"
@@ -852,6 +1139,9 @@ def claim_spawn(conn: sqlite3.Connection, now: str, launch_id: str, pid: int) ->
     several = refuse_several(conn, now, ln)
     if several is not None:
         return several
+    spawned = _refuse_spawn(conn, now, ln)
+    if spawned is not None:
+        return spawned
     conn.execute("INSERT INTO launch_spawns (launch_id, gseq, pid, at) VALUES (?, ?, ?, ?)",
                  (launch_id, next_gseq(conn, now), pid, now))
     return ln, None
@@ -872,7 +1162,7 @@ def launch_death(conn: sqlite3.Connection, ln: Launch) -> bool | None:
     # writing as coordinator died idle
     wrote = _wrote_since(conn, ln.session_key)
     died = ln.state in ("failed", "expired") and ln.cause not in ("lease lost before active", BUDGET_CROSSED,
-                                                                       SEVERAL_THREADS, REPLACED) \
+                                                                       SEVERAL_THREADS, REPLACED, SPAWN_REFUSED) \
         or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
     # REPLACED (ended): its session finished a turn and was ended to make room, never a death, written or not
     if not died:
@@ -985,4 +1275,14 @@ def status(conn: sqlite3.Connection, now: str) -> dict[str, object]:
     return {"lease": None if held is None else {"token": held.token, "holder": held.holder, "until": held.until,
                                                 "cause": held.cause, "live": held.live},
             "wake": state, "why": why, "setting": None if (s := setting(conn)) is None else asdict(s),
-            "launches": [asdict(ln) for ln in launches(conn, limit=10)]}
+            "launches": [{**asdict(ln), "spawn": _spawn_name(ln)} for ln in launches(conn, limit=10)]}
+
+
+def _spawn_name(ln: Launch) -> str | None:
+    """A spawned worker's ``@spawn/<name>`` as status shows it; None for any other launch or a record that is not one."""
+    if not ln.role_ref:
+        return None
+    try:
+        return spawn_record(ln.role_ref)["spawn"]
+    except LeaseRefused:
+        return None

@@ -2,6 +2,12 @@
 
     push = not muted AND (urgent OR not_home OR desk inactive >= ACTIVE_WINDOW_SECS)        ... unless loud
 
+That is the shipped default. While ``quiet`` or ``sleep`` is active the operator's policy cell for the ping's class
+(``approval``, ``attention``, ``other``: :data:`KIND_CLASSES`) decides push or hold, kept in
+``<queue_dir>/webpush/policy.json`` and set with ``levain ping policy`` (operator only); a ``push`` cell pushes while
+that word is active even when the desk is active, a ``hold`` cell holds. With no policy file, or a malformed one, the
+cells are :data:`DEFAULT_CELLS`, which are the rule above.
+
 (Phill 10-25: *"++ yes that's the shape 100%"*.) A ping that is not pushed is still written to the notification record
 (:func:`levain.webpush.sender.send` with ``push=False``); only the push to the phone is held, and a held ping waits in
 the push store (:mod:`levain.webpush.held`) until the rule next says push.
@@ -9,9 +15,9 @@ the push store (:mod:`levain.webpush.held`) until the rule next says push.
 Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newest replaces the one before):
 
 - ``quiet [duration]`` and ``sleep`` are the only holding words. ``quiet`` mutes for its duration (default
-  :data:`DEFAULT_SECS`, at most :data:`MAX_SECS`); an urgent ping still pushes through it. ``sleep`` mutes until the
+  :data:`DEFAULT_SECS`, at most :data:`MAX_SECS`); by default an urgent ping still pushes through it (the policy). ``sleep`` mutes until the
   operator's next input at this machine after saying it (input is read from the macOS HID idle time: he has typed since
-  when ``now - idle`` is later than the word), urgent pings included. With no idle reading (not macOS, or the read
+  when ``now - idle`` is later than the word), urgent pings included by default (the policy). With no idle reading (not macOS, or the read
   failed) it cannot see his input, so it ends :data:`SLEEP_BLIND_SECS` after the word and ``levain ping status`` says the
   idle source is unavailable.
 - ``loud [duration|off]`` turns pings on for its duration, over every other parameter, a mute included; only its timer,
@@ -58,7 +64,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "SLEEP_BLIND_SECS", "URGENT_KINDS", "WORDS", "Decision",
+__all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "SLEEP_BLIND_SECS", "URGENT_KINDS", "WORDS", "Decision", "KIND_CLASSES", "DEFAULT_CELLS", "kind_class",
+           "read_policy", "set_policy", "reset_policy", "policy_sentences", "policy_view", "policy_is_default",
            "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "set_word", "should_push"]
 
 ACTIVE_WINDOW_SECS = 5 * 60
@@ -78,11 +85,25 @@ _WHY_MAX = 300
 LOG_NAME = "presence.log.jsonl"
 LOCK_NAME = ".presence.lock"
 LOG_MAX_BYTES = 1 << 20   # past this the log is rotated to ``LOG_NAME + ".1"``
-# urgent = a ping about a request that holds an agent until the operator answers: the hook's wait (``consent``, the
-# default kind: the permission hook, the publish gate, the limits), the push gate's wait (``push``) and the asking-again
-# of a request still pending (``reping``), and the rows the coordinator raises to him (``attention``, C11 Q1 (c): passes
-# ``quiet``, never ``sleep``). Every other kind (``question``, ``ruling``, ``summary``) waits for the rule.
-URGENT_KINDS = frozenset({"consent", "push", "reping", "attention"})
+# THE one kind -> class map (never configurable). ``approval``: a ping about a request that holds an agent until the
+# operator answers: the hook's wait (``consent``, the default kind: the permission hook, the publish gate, the limits),
+# the push gate's wait (``push``) and the asking-again of a request still pending (``reping``). ``attention``: the rows
+# the coordinator raises to him (``attention``, C11 Q1 (c)) and a dated item (``dated``). ``other``: every other kind,
+# unknown ones included (``question``, ``ruling``, ``summary``, the self-test ping the senders file as ``test``, and the
+# kind ``describe`` probes the rule with, ``ping``).
+CLASSES = ("approval", "attention", "other")
+KIND_CLASSES = {"consent": "approval", "push": "approval", "reping": "approval",
+                "attention": "attention", "dated": "attention"}
+# urgent = approval or attention: derived from the map, not a second copy.
+URGENT_KINDS = frozenset(k for k, c in KIND_CLASSES.items() if c in ("approval", "attention"))
+MUTE_WORDS = ("quiet", "sleep")
+# The shipped default policy is today's rule for every kind that existed before the policy: quiet lets approval and
+# attention through, sleep holds all. ``dated`` is the one deliberate change: a kind unknown before is now class
+# ``attention``, so it pushes at an active desk and through quiet, which it did not before.
+DEFAULT_CELLS = {"quiet": {"approval": "push", "attention": "push", "other": "hold"},
+                 "sleep": {"approval": "hold", "attention": "hold", "other": "hold"}}
+POLICY_NAME = "policy.json"
+POLICY_VERSION = 1
 FILE_NAME = "presence.json"
 _MAX_BYTES = 4096
 _DURATION = re.compile(r"^(\d{1,4})\s*(m|min|mins|minutes?|h|hr|hrs|hours?)?$", re.I)
@@ -90,6 +111,10 @@ _DURATION = re.compile(r"^(\d{1,4})\s*(m|min|mins|minutes?|h|hr|hrs|hours?)?$", 
 
 class PresenceError(ValueError):
     """A word or duration that cannot be applied, or a presence file that cannot be written safely."""
+
+
+class PresenceBusy(PresenceError):
+    """The presence lock was not free within the wait a caller allowed (``_locked(..., wait=...)``)."""
 
 
 @dataclass(frozen=True)
@@ -179,19 +204,45 @@ def _active(word: dict | None, name: str, now: float) -> bool:
     return bool(word and word["word"] == name and now < word["until"])
 
 
-def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False) -> Decision:
+def kind_class(kind: object) -> str:
+    """The class (``approval``, ``attention`` or ``other``) of a ping kind; an unknown kind is ``other``."""
+    return KIND_CLASSES.get(kind, "other") if isinstance(kind, str) else "other"
+
+
+_CLASS_WORDS = {"approval": "approvals", "attention": "attention items", "other": "other pings"}
+
+
+def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False, class_name: str | None = None,
+           policy: dict | None = None) -> Decision:
     """Whether a ping is pushed at ``now``. ``idle``: seconds since the operator's last input at this machine, ``None``
-    when unknown. Pure."""
+    when unknown. ``class_name`` is the ping's class (:func:`kind_class`); left unset, ``urgent`` stands for
+    ``approval`` and not urgent for ``other``. ``policy`` is the cells (:func:`read_policy`), the shipped default when
+    unset: while ``quiet`` or ``sleep`` is active the cell for (word, class) decides push or hold. Pure."""
     if _active(word, "loud", now):
         return Decision(True, "pushing", "loud: pings on until its timer ends, over every other parameter")
+    cls = class_name if class_name in CLASSES else ("approval" if urgent else "other")
+    cells = policy if policy is not None else DEFAULT_CELLS
     seen = None if idle is None else now - max(0.0, idle)   # when he last did something here
+    mute = None
     if word and word["word"] == "sleep" and (now < word["ts"] + SLEEP_BLIND_SECS if seen is None
                                              else not seen > word["ts"]):
-        return Decision(False, "muted", "sleep: nothing is pushed until his next input here, urgent pings included", "sleep")
-    if urgent:
+        mute = "sleep"
+    elif _active(word, "quiet", now):
+        mute = "quiet"
+    if mute is not None:
+        value = cells[mute][cls]
+        custom = value != DEFAULT_CELLS[mute][cls]
+        if value == "push":
+            return Decision(True, "pushing", f"{mute}: {_CLASS_WORDS[cls]} still reach you (your policy)" if custom else "urgent")
+        if mute == "sleep":
+            why = (f"sleep: {_CLASS_WORDS[cls]} are held (your policy)" if custom else
+                   "sleep: nothing is pushed until his next input here, urgent pings included")
+        else:
+            why = (f"quiet: {_CLASS_WORDS[cls]} are held (your policy)" if custom else
+                   "quiet: nothing but an urgent ping is pushed until it ends")
+        return Decision(False, "muted", why, mute)
+    if cls != "other":
         return Decision(True, "pushing", "urgent")
-    if _active(word, "quiet", now):
-        return Decision(False, "muted", "quiet: nothing but an urgent ping is pushed until it ends", "quiet")
     if word and word["word"] == "away" and not (seen is not None and seen > word["ts"] + AWAY_GRACE_SECS):
         return Decision(True, "pushing", "away: his word")
     if _active(word, "remote", now):
@@ -203,6 +254,222 @@ def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = 
     return Decision(False, "holding", f"desk active {int((idle or 0.0) // 60)} min ago")
 
 
+def _policy_path(queue_dir: Path | str) -> Path:
+    return Path(queue_dir) / "webpush" / POLICY_NAME
+
+
+def _copy_cells(cells: dict) -> dict:
+    return {m: dict(c) for m, c in cells.items()}
+
+
+def _read_policy(queue_dir: Path | str | None) -> tuple[dict, str, list[str]]:
+    """``(cells, kind, reasons)``: ``kind`` is ``default``, ``loaded`` or ``malformed``; ``reasons`` is empty unless
+    malformed. Any malformed reason returns the whole shipped default, never a partial file."""
+    if queue_dir is None:
+        return _copy_cells(DEFAULT_CELLS), "default", []
+
+    def bad(*why: str) -> tuple[dict, str, list[str]]:
+        return _copy_cells(DEFAULT_CELLS), "malformed", list(why)
+
+    try:
+        fd = os.open(_policy_path(queue_dir), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return _copy_cells(DEFAULT_CELLS), "default", []
+    except OSError as e:
+        return bad(f"unreadable ({type(e).__name__})")
+    why = None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            why = "not a regular file"
+        else:
+            raw = os.read(fd, _MAX_BYTES + 1)
+    except OSError as e:
+        why = f"unreadable ({type(e).__name__})"
+    try:
+        os.close(fd)
+    except OSError as e:  # a failed close is the malformed result, never an error out of a read that already happened
+        why = why or f"unreadable ({type(e).__name__})"
+    if why:
+        return bad(why)
+    if len(raw) > _MAX_BYTES:
+        return bad("file too large")
+    try:
+        got = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return bad("not valid JSON")
+    if not isinstance(got, dict) or got.get("version") != POLICY_VERSION or isinstance(got.get("version"), bool):
+        return bad(f"version is not {POLICY_VERSION}")
+    given = got.get("cells")
+    if not isinstance(given, dict):
+        return bad("no cells")
+    cells: dict = {}
+    invalid = []
+    for m in MUTE_WORDS:
+        row = given.get(m)
+        cells[m] = {}
+        for c in CLASSES:
+            v = row.get(c) if isinstance(row, dict) else None
+            if v in ("push", "hold"):
+                cells[m][c] = v
+            else:
+                invalid.append(f"missing or invalid cell {m}.{c}")
+    if invalid:
+        return bad(*invalid)
+    return cells, "loaded", []
+
+
+def read_policy(queue_dir: Path | str | None) -> tuple[dict, str]:
+    """``(cells, status)``: the six cells in effect and ``default`` (no file), ``loaded`` or ``malformed: <reasons>``.
+    A file that is unreadable, a symlink, not regular, oversized, unparseable, of another version, without cells, or with
+    any missing or invalid cell is malformed, and a malformed file is the WHOLE shipped default
+    (:data:`DEFAULT_CELLS`), never a partial file: it never holds more than the default does."""
+    cells, kind, reasons = _read_policy(queue_dir)
+    if kind == "malformed":
+        return cells, "malformed: " + "; ".join(reasons) + " (the whole default is in effect)"
+    return cells, kind
+
+
+def policy_is_default(cells: dict, status: str) -> bool:
+    return status == "default" or (status == "loaded" and cells == DEFAULT_CELLS)
+
+
+def policy_sentences(cells: dict) -> dict:
+    """One plain sentence per mute word, from its cells."""
+    out = {}
+    for m in MUTE_WORDS:
+        end = "until you are back" if m == "sleep" else "until it ends"
+        through = [_CLASS_WORDS[c] for c in CLASSES if cells[m][c] == "push"]
+        waits = [_CLASS_WORDS[c] for c in CLASSES if cells[m][c] == "hold"]
+        if not through:
+            out[m] = f"In {m}: nothing reaches you {end}"
+        elif not waits:
+            out[m] = f"In {m}: everything reaches you"
+        else:
+            out[m] = f"In {m}: {' and '.join(through)} reach you; {' and '.join(waits)} wait {end}"
+    return out
+
+
+def policy_view(queue_dir: Path | str | None) -> dict:
+    """The stable dict ``levain ping policy show --json`` prints."""
+    cells, kind, reasons = _read_policy(queue_dir)  # ONE read: cells, status, kind and reasons agree
+    status = "malformed: " + "; ".join(reasons) + " (the whole default is in effect)" if kind == "malformed" else kind
+    # `held_by_default`: an APPROVAL cell that holds only because the shipped default says so (no table of the operator's own
+    # is in effect); the block says so in one plain line, where a hold of his own choosing gets the warning
+    held = {f"{m}.approval": True for m in MUTE_WORDS
+            if kind != "loaded" and cells[m]["approval"] == "hold" and DEFAULT_CELLS[m]["approval"] == "hold"}
+    return {"version": POLICY_VERSION, "cells": cells, "classes": dict(sorted(KIND_CLASSES.items())),
+            "default_class": "other", "status": status, "status_kind": kind, "reasons": reasons,
+            "sentences": policy_sentences(cells), "default_cells": _copy_cells(DEFAULT_CELLS), "held_by_default": held}
+
+
+def _policy_log(queue_dir: Path | str, ts: float, word: str, by: object, outcome: str, why: str, strict: bool,
+                prior: dict | None = None, via: str | None = None) -> None:
+    row: dict = {"ts": ts, "word": _clean(word, 60), "prior": dict(prior) if prior else {}, "outcome": outcome}
+    if via:     # the credential's name for a write through the cockpit (never the secret); identity stays ``by``
+        row["via"] = _clean(via, _FIELD_MAX)
+    if by is not None:
+        who = by if isinstance(by, dict) else {}
+        row["by"] = {"agent": _clean(who.get("agent"), _FIELD_MAX), "session": _clean(who.get("session"), _FIELD_MAX),
+                     "role": _clean(who.get("role"), 20)}
+    if why:
+        row["why"] = _clean(why, _WHY_MAX)
+    (_log if strict else _log_best_effort)(queue_dir, row)
+
+
+def _write_policy(queue_dir: Path | str, cells: dict | None) -> None:
+    path = _policy_path(queue_dir)
+    d = path.parent
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise PresenceError(f"{d} is not a directory of this user's")
+        if cells is None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            return
+        tmp = d / f".{POLICY_NAME}.{os.getpid()}.{time.time_ns()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                view = memoryview(json.dumps({"version": POLICY_VERSION, "cells": cells}).encode("utf-8"))
+                while view:
+                    n = os.write(fd, view)
+                    if n <= 0:
+                        raise OSError("short write")
+                    view = view[n:]
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+    except OSError as e:
+        raise PresenceError(f"policy not written: {e}") from e
+
+
+def _refuse_setter(queue_dir: Path | str, ts: float, word: str, by: dict | None) -> None:
+    """The policy is the operator's alone, like his own presence words: a caller carrying an agent identity (a seat or
+    the coordinator) is refused, and the refusal is one row in the presence log. The role is a label under one uid, not
+    a boundary: it records intent, it does not stop a process that hides its environment."""
+    if by is None:
+        return
+    who = "the coordinator" if isinstance(by, dict) and by.get("role") == "coordinator" else "a seat"
+    msg = (f"the notification policy is the operator's own: {who} may not change it "
+           "(the operator sets it himself, from a terminal outside any agent session)")
+    with _locked(queue_dir, strict=False):
+        _policy_log(queue_dir, ts, word, by, "refused", msg, strict=False)
+    raise PresenceError(msg)
+
+
+def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: dict | None = None,
+               now: float | None = None, via: str | None = None, wait: float | None = None) -> dict:
+    """Set one cell and return the cells after. Operator only (``by`` must be ``None``, see :func:`_refuse_setter`).
+    Atomic write under the presence lock; one presence-log row. Raises :class:`PresenceError`; ``wait`` (seconds) bounds the
+    lock wait and raises :class:`PresenceBusy` past it (default: wait as long as it takes, as the CLI does)."""
+    ts = time.time() if now is None else now
+    word = f"policy set {mute} {cls} {value}"
+    _refuse_setter(queue_dir, ts, word, by)
+    if mute not in MUTE_WORDS or cls not in CLASSES or value not in ("push", "hold"):
+        raise PresenceError(f"policy set takes <{'|'.join(MUTE_WORDS)}> <{'|'.join(CLASSES)}> <push|hold>")
+    with _locked(queue_dir, strict=True, wait=wait):  # a policy mutation never runs unlocked: two sets could lose one
+        cells, _status = read_policy(queue_dir)
+        prior = _status if _status.startswith("malformed") else ""
+        was = cells[mute][cls]
+        cells[mute][cls] = value
+        try:
+            _write_policy(queue_dir, cells)
+        except PresenceError as e:
+            _policy_log(queue_dir, ts, word, None, "refused", str(e), strict=False, via=via)
+            raise
+        _policy_log(queue_dir, ts, word, None, "set" if was != value else "unchanged",
+                    f"prior file {prior.replace(' (the whole default is in effect)', '')}; rewritten from the default" if prior else "",
+                    strict=False, prior={f"{mute}.{cls}": was}, via=via)
+    return cells
+
+
+def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | None = None, via: str | None = None,
+                 wait: float | None = None) -> dict:
+    """Remove the policy file (back to the shipped default) and return the default cells. Operator only."""
+    ts = time.time() if now is None else now
+    _refuse_setter(queue_dir, ts, "policy reset", by)
+    with _locked(queue_dir, strict=True, wait=wait):
+        before, _st = read_policy(queue_dir)
+        try:
+            _write_policy(queue_dir, None)
+        except PresenceError as e:
+            _policy_log(queue_dir, ts, "policy reset", None, "refused", str(e), strict=False, via=via)
+            raise
+        _policy_log(queue_dir, ts, "policy reset", None, "set", "", strict=False,
+                    prior={f"{m}.{c}": before[m][c] for m in MUTE_WORDS for c in CLASSES}, via=via)
+    return _copy_cells(DEFAULT_CELLS)
+
+
 def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = None,
                 idle: Callable[[], float | None] | None = None) -> Decision:
     """:func:`decide` for a ``kind`` of ping against the word on file and the input idle time (``idle`` defaults to
@@ -210,7 +477,8 @@ def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = 
     try:
         if idle is None:
             from levain.consent.auto_away import input_idle_seconds as idle
-        return decide(time.time() if now is None else now, read_word(queue_dir), idle(), urgent=kind in URGENT_KINDS)
+        return decide(time.time() if now is None else now, read_word(queue_dir), idle(), class_name=kind_class(kind),
+                      policy=read_policy(queue_dir)[0])
     except Exception:  # noqa: BLE001 - the rule failing must not silence the phone
         return Decision(True, "pushing", "the presence rule could not be read: pushing")
 
@@ -263,9 +531,10 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
 
 
 @contextmanager
-def _locked(queue_dir: Path | str, *, strict: bool):
+def _locked(queue_dir: Path | str, *, strict: bool, wait: float | None = None):
     """Hold the presence lock (a ``flock`` on a lock file beside ``presence.json``). ``strict``: failing to take it
-    raises :class:`PresenceError`; else it is reported on stderr and the body runs unlocked."""
+    raises :class:`PresenceError`; else it is reported on stderr and the body runs unlocked. ``wait`` (seconds, with ``strict``):
+    take the lock by non-blocking attempts up to that deadline, then raise :class:`PresenceBusy`; ``None`` blocks."""
     d = Path(queue_dir) / "webpush"
     fd = None
     try:
@@ -277,11 +546,24 @@ def _locked(queue_dir: Path | str, *, strict: bool):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
             raise PresenceError(f"{d / LOCK_NAME} is not a file of this user's")
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if wait is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise PresenceBusy("the presence lock is held by another process") from None
+                    time.sleep(0.05)
     except (OSError, PresenceError) as e:
         if fd is not None:
             os.close(fd)
         fd = None
+        if strict and isinstance(e, PresenceBusy):
+            raise
         if strict:
             raise PresenceError(f"presence lock not taken: {e}") from e
         print(f"levain ping: presence lock not taken: {e}", file=sys.stderr)
@@ -556,6 +838,9 @@ def describe(queue_dir: Path | str, *, now: float | None = None,
 
     n = held.count(queue_dir)
     line = f"{d.state.upper()}: {d.why} (word: {on_file}; {n} held for the phone)"
+    cells, pstatus = read_policy(queue_dir)
+    if not policy_is_default(cells, pstatus):
+        line += f"; notification policy: {pstatus if pstatus != 'loaded' else 'yours'} ({' / '.join(policy_sentences(cells).values())})"
     if word is not None and "by" in word:
         by = word["by"]
         who = f"{by['agent']} {by['session']}".strip()

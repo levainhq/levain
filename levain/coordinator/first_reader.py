@@ -46,7 +46,8 @@ and a head that moved abandons the transaction and replays again outside it:
    question's harness, holding exactly one thread, with a pinned envelope (C0 §3.4);
 4. that envelope (and the head of its supersede chain) is live for the thread, its signature re-verified against the
    authority log (C0 §4.5); with no authority snapshot nothing is live;
-5. the question was asked from inside a repository the envelope's narrowed ``where`` names.
+5. the question was asked from inside a repository the envelope's narrowed ``where`` names, and, for a spawned
+   worker, inside the scope its role left of that same envelope (stored on its launch; never the envelope instead).
 
 Whether the question's SUBJECT is inside the envelope is the coordinator's judgement and no code here reads it: the KNOW
 is filed ``authority_relevant``, so it is cleared only by you or a fresh session you asked, never by the coordinator
@@ -206,6 +207,20 @@ def _verdict(store: Any, conn: sqlite3.Connection, now: str, q: Any, authority: 
     if refused is not None:
         return no(refused, **ids)
     where = store._effective(conn, ln.pinned_envelope_id, ln.threads[0])["where"]
+    if ln.role_ref:
+        # a spawned worker is held to the scope its role left of that envelope (stored when it was asked for, cut
+        # from the very envelope it is pinned to), never to the envelope's whole where; a record that cannot be read
+        # or names another envelope refuses, it never falls back to the envelope
+        try:
+            rec = lease.spawn_record(ln.role_ref)
+        except lease.LeaseRefused as exc:
+            return no(f"launch {ln.launch_id}'s spawn record cannot be read ({exc}), so its scope is unknown", **ids)
+        if rec["envelope_id"] != ln.pinned_envelope_id:
+            return no(f"launch {ln.launch_id}'s scope was cut from another envelope than the one it is pinned to",
+                      **ids)
+        if not _inside(q.cwd, rec["scope"]["where"]):
+            return no(f"the question was asked from {q.cwd[:200]}, outside every repo launch {ln.launch_id}'s role "
+                      f"leaves of envelope {ln.pinned_envelope_id}", **ids)
     if not _inside(q.cwd, where):
         return no(f"the question was asked from {q.cwd[:200]}, outside every repo envelope "
                   f"{ln.pinned_envelope_id} names", **ids)

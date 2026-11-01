@@ -1126,6 +1126,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
     "/pair_card.js": ("pair_card.js", "text/javascript; charset=utf-8"),
+    # The page half of a push tap: every page a Home Screen window can show loads it (the cockpit, the sign sheet, /pair).
+    "/sw_open.js": ("sw_open.js", "text/javascript; charset=utf-8"),
     # An old phone link (the phone port shared this origin before the cockpit took it): see the file's header.
     "/legacy_phone_link.js": ("legacy_phone_link.js", "text/javascript; charset=utf-8"),
     # The sign sheet's script (OS-1): its page is GET /sign/<id>, served by _route beside a Signer.
@@ -1147,8 +1149,13 @@ _ASSETS: dict[str, tuple[str, str]] = {
 # store. The two reads and three writes need a
 # token on every bind; the phone port's own pairing (/webpush/pair, /webpush/pair/redeem) is not served here: this
 # origin pairs through /pair.
-_PUSH_GET = frozenset({"/webpush/key", "/webpush/record"})
-_PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test"})
+_POLICY_PATH = "/webpush/policy"            # NP S2: the operator's notification policy (levain.webpush.presence)
+_POLICY_LOCK_WAIT_SECS = 3.0              # how long an HTTP policy write waits for the presence lock
+_POLICY_SET = "/webpush/policy/set"
+_POLICY_RESET = "/webpush/policy/reset"
+_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH})
+_PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test",
+                        _POLICY_SET, _POLICY_RESET})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
 _PUSH_TEST = "/webpush/test"
 _PUSH_PREFIX = "/webpush/"
@@ -2214,6 +2221,13 @@ class _Handler(GuardedHandler):
         queue = self.server.signer.queue_dir
         try:
             try:
+                if path == _POLICY_PATH:
+                    from levain.webpush import presence
+
+                    self._send(json.dumps(presence.policy_view(queue)).encode("utf-8"), "application/json; charset=utf-8",
+                               status=200, head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)],
+                               cache_control="private, no-store")
+                    return
                 got = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=True,
                                          device_id=str(self._credential()["name"]))
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
@@ -2232,6 +2246,8 @@ class _Handler(GuardedHandler):
         whether the device is live (:func:`levain.webpush.store.live_rows`), so a revoke stops its pings whether or
         not :meth:`_retire_push` ran, and the subscribe asks it again inside its own write. A subscribe under any
         other credential pairs this browser first (:meth:`_pair_and_subscribe`)."""
+        if route in (_POLICY_SET, _POLICY_RESET):
+            return self._policy_post(route, raw)
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
             return self._pair_and_subscribe(raw, name)
@@ -2239,6 +2255,36 @@ class _Handler(GuardedHandler):
             return self._push_test(name)
         got = self._push_handle(route, raw, name)
         return got[1], got[0]
+
+    def _policy_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":
+        """``POST /webpush/policy/set {mute, class, value}`` / ``/webpush/policy/reset {}``: the operator's own write
+        (``by=None``), reached only past the push family's gate (same-origin, a surface token on every bind, a JSON
+        body): the authority the Devices panel's own writes use. A refusal (a bad cell, a lock or file that cannot be
+        written) is a 422 with its words; the reply is the policy view after. The log row names the credential used
+        (``via``: the surface token's or the paired device's name, never the secret); the write itself stays ``by=None``."""
+        from levain.webpush import presence
+
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {"error": "bad_json", "message": "body is not valid JSON"}, 400
+        want = {"mute", "class", "value"} if route == _POLICY_SET else set()
+        if not isinstance(req, dict) or set(req) != want or not all(isinstance(v, str) for v in req.values()):
+            return {"error": "bad_request",
+                    "message": ("send exactly mute, class and value as text" if want else "send an empty object")}, 400
+        queue = self.server.signer.queue_dir
+        via = str(self._credential()["name"])
+        try:
+            # A bounded lock wait: a stalled holder of the presence lock must not park handler threads on request_gate slots.
+            if route == _POLICY_SET:
+                presence.set_policy(queue, req["mute"], req["class"], req["value"], by=None, via=via, wait=_POLICY_LOCK_WAIT_SECS)
+            else:
+                presence.reset_policy(queue, by=None, via=via, wait=_POLICY_LOCK_WAIT_SECS)
+        except presence.PresenceBusy:
+            return {"error": "policy_busy", "message": "the notification policy is busy right now; nothing was changed, try again"}, 503
+        except presence.PresenceError as exc:
+            return {"error": "policy_refused", "message": str(exc)}, 422
+        return presence.policy_view(queue), 200
 
     def _push_test(self, name: str) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/test``: a test ping to the CALLER's own subscriptions and no other device's, sent inside the

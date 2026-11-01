@@ -540,8 +540,8 @@ def _line(name: str, value: Any, high: int) -> str:
 
 def _check_token(token: Any) -> int:
     if token is None:
-        raise CoordError("a lifecycle write needs the coordinator's identity (the live lease token); nothing was "
-                         "written. Reads need none")
+        raise CoordError("a lifecycle write needs the coordinator's identity (the live lease token); no state "
+                         "was written. Reads need none")
     if not isinstance(token, int) or isinstance(token, bool):
         raise CoordError("the coordinator's identity is the lease token, an integer")
     return token
@@ -638,10 +638,19 @@ def _refuse_cycle(conn: sqlite3.Connection, item_id: str, deps: Sequence[str]) -
             stack.extend(graph.get(d, ()))
 
 
+class _Written(dict):
+    """A journal record that also carries ``ver``: the version its own write transaction produced. Still exactly the
+    SCHEMA §6 fields as a mapping."""
+
+    def __init__(self, rec: Mapping[str, Any], *, ver: int) -> None:
+        super().__init__(rec)
+        self.ver = ver
+
+
 def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: Any, why: Any, source: str,
                 creating: bool, repo: Any = None, **fields: Any) -> dict:
     """THE write path: checks, then ONE fenced write transaction that writes the journal record and then the state
-    row; a failure anywhere rolls both back. Returns the journal record (SCHEMA §6 fields)."""
+    row; a failure anywhere rolls both back. Returns the journal record (SCHEMA §6 fields) as a :class:`_Written` (a plain dict with ``.ver``, the version this transaction wrote)."""
     token = _check_token(token)
     why = _line("why", why, _WHY_MAX)
     who = _line("who", who, _WHO_MAX)
@@ -653,44 +662,48 @@ def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: An
             raise CoordError("an item's repo is its project key (flow, levain, ...)")
         if "title" not in changes:
             raise CoordError("a new item needs a title")
-    with store._write("coordinator", token) as (conn, now):
-        if not _lifecycle_present(conn):        # a store made before C13: the write path makes the tables, in its txn
-            for stmt in LIFECYCLE_SCHEMA:
-                conn.execute(stmt)
-        diverged = _diverged(conn, item_id)     # loud and named, before a write that would fail on the journal's key
-        if diverged:
-            raise diverged[0]
-        found = _current(conn, item_id)
-        prior = found[0] if found else None
-        if creating and prior is not None:
-            raise CoordError(f"{item_id} already exists ({prior['category']}); move or correct it")
-        if not creating and prior is None:
-            raise CoordError(f"{item_id} is not in the coordinator store; add it first")
-        if prior is None:
-            rank = changes.get("rank")
-            if rank is None:
-                top = conn.execute(f"SELECT MAX(rank) FROM ({_CURRENT}) WHERE repo = ?", (repo,)).fetchone()[0]
-                rank = 1 if top is None else top + 1
-            state = {"repo": repo, "title": changes["title"], "tier": changes.get("tier"),
-                     "done_line": changes.get("done_line"), "depends_on": changes.get("depends_on", []),
-                     "rank": rank}
-        else:
-            state = {k: prior[k] for k in ("repo", "title", "tier", "done_line", "depends_on", "rank")}
-            state.update(changes)
-        if "depends_on" in changes:
-            _refuse_cycle(conn, item_id, state["depends_on"])
-        state["category"] = state["status"] = to        # v1: the status IS the category name (§3)
-        if prior is not None and all(state[k] == prior[k] for k in _STATE_FIELDS):
-            raise CoordError(f"{item_id} already reads so; nothing to write")
-        ver = 1 if prior is None else prior["ver"] + 1
-        ts, iso = _local_iso(now)
-        rec = {"ts": ts, "iso": iso, "id": item_id, "repo": state["repo"],
-               "from_status": None if prior is None else prior["status"], "to_status": state["status"],
-               "from_category": None if prior is None else prior["category"], "to_category": to,
-               "who": who, "why": why, "source": source, "applied_by": None}
-        _insert_journal(conn, rec, ver=ver, gseq=next_gseq(conn, now), at=now, token=token)
-        _insert_state(conn, state, item_id=item_id, ver=ver, who=who, at=now)
-    return rec
+    try:
+        # a lifecycle write never makes a store: a coordinator holding a live lease always has one
+        with store._write("coordinator", token, create=False) as (conn, now):
+            if not _lifecycle_present(conn):        # a store made before C13: the write path makes the tables, in its txn
+                for stmt in LIFECYCLE_SCHEMA:
+                    conn.execute(stmt)
+            diverged = _diverged(conn, item_id)     # loud and named, before a write that would fail on the journal's key
+            if diverged:
+                raise diverged[0]
+            found = _current(conn, item_id)
+            prior = found[0] if found else None
+            if creating and prior is not None:
+                raise CoordError(f"{item_id} already exists ({prior['category']}); move or correct it")
+            if not creating and prior is None:
+                raise CoordError(f"{item_id} is not in the coordinator store; add it first")
+            if prior is None:
+                rank = changes.get("rank")
+                if rank is None:
+                    top = conn.execute(f"SELECT MAX(rank) FROM ({_CURRENT}) WHERE repo = ?", (repo,)).fetchone()[0]
+                    rank = 1 if top is None else top + 1
+                state = {"repo": repo, "title": changes["title"], "tier": changes.get("tier"),
+                         "done_line": changes.get("done_line"), "depends_on": changes.get("depends_on", []),
+                         "rank": rank}
+            else:
+                state = {k: prior[k] for k in ("repo", "title", "tier", "done_line", "depends_on", "rank")}
+                state.update(changes)
+            if "depends_on" in changes:
+                _refuse_cycle(conn, item_id, state["depends_on"])
+            state["category"] = state["status"] = to        # v1: the status IS the category name (§3)
+            if prior is not None and all(state[k] == prior[k] for k in _STATE_FIELDS):
+                raise CoordError(f"{item_id} already reads so; nothing to write")
+            ver = 1 if prior is None else prior["ver"] + 1
+            ts, iso = _local_iso(now)
+            rec = {"ts": ts, "iso": iso, "id": item_id, "repo": state["repo"],
+                   "from_status": None if prior is None else prior["status"], "to_status": state["status"],
+                   "from_category": None if prior is None else prior["category"], "to_category": to,
+                   "who": who, "why": why, "source": source, "applied_by": None}
+            _insert_journal(conn, rec, ver=ver, gseq=next_gseq(conn, now), at=now, token=token)
+            _insert_state(conn, state, item_id=item_id, ver=ver, who=who, at=now)
+    except StoreAbsent as exc:
+        raise CoordError(f"no coordinator store at {Path(str(store.path)).parent}; no state was written") from exc
+    return _Written(rec, ver=ver)           # the version THIS transaction wrote, never a later read of the journal
 
 
 def add(store: CoordStore, token: Any, item_id: str, *, repo: str, title: str, who: str, why: str,

@@ -9,7 +9,7 @@
   "use strict";
   const WRITE_TOKEN_KEY = "levain_write_token";
   const H = "X-Levain-Write-Token";
-  let section = null, list = null, tabsNav = null, tabBtns = {}, offerBox = null, note = null, labelIn = null, offerBtns = [];
+  let section = null, devPanel = null, list = null, tabsNav = null, tabBtns = {}, offerBox = null, note = null, labelIn = null, offerBtns = [];
   // L3 r2 G1: ONE shared in-flight read. A caller that finds one running gets that promise back and queues exactly one
   // re-run (so a change made while it was in flight is read afterwards); reads run one at a time, so what paints is always
   // the newest read. No flag can stick: `running` is cleared in the same step the promise settles, and a read has a timeout.
@@ -92,6 +92,8 @@
     section.appendChild(head);
     const grid = el("div", "ck-zgrid dev-grid");
     const panel = el("div", "panel k-list dev-panel");
+    devPanel = panel;
+    panel.hidden = true;   // shown by its own read
     panel.dataset.modes = "board";   // dashboard.css hides a zone whose panel names no tab for the current mode
     const ph = el("div", "phead");
     ph.appendChild(el("h2", null, "Paired devices"));
@@ -160,10 +162,17 @@
     body.appendChild(note);
     panel.appendChild(body);
     grid.appendChild(panel);
+    grid.appendChild(buildPolicy());
     section.appendChild(grid);
     const main = document.querySelector("main.frame");
     if (main) main.appendChild(section); else document.body.appendChild(section);
   }
+
+  // The section holds two independent blocks (the paired devices, the Notifications policy); it shows while either does, and
+  // each block keeps its own gone/refused state, so a cockpit with one and not the other still shows what it has.
+  function syncSection() { section.hidden = devPanel.hidden && (!npPanel || npPanel.hidden); }
+  function devShown(on) { devPanel.hidden = !on; syncSection(); }
+  function npShown(on) { npPanel.hidden = !on; syncSection(); }
 
   function say(msg) { note.textContent = msg; note.hidden = !msg; }
 
@@ -253,21 +262,21 @@
   async function readOnce() {
     if (gone) return true;
     const tok = token();
-    if (!tok) { section.hidden = true; return true; }
-    if (tok === refused) { section.hidden = true; return true; }
+    if (!tok) { devShown(false); return true; }
+    if (tok === refused) { devShown(false); return true; }
     let res;
     try { res = await api("GET", "/cockpit/pair/devices.json", undefined, READ_TIMEOUT_MS); }
-    catch (_) { if (!section.hidden) say("Couldn't refresh the device list."); return false; }
+    catch (_) { if (!devPanel.hidden) say("Couldn't refresh the device list."); return false; }
     if (res.status !== 200 || !Array.isArray(res.data.devices)) {
       // 404: a read-only or ledger-less server (no pairing): stable, stop asking. 403: this token is refused; stop asking with
       // it, ask again once the stored token is a different one.
-      if (res.status === 404) { section.hidden = true; gone = true; return true; }
-      if (res.status === 403) { section.hidden = true; refused = tok; return true; }
+      if (res.status === 404) { devShown(false); gone = true; return true; }
+      if (res.status === 403) { devShown(false); refused = tok; return true; }
       say("Couldn't refresh the device list.");
       return false;
     }
     if (note.textContent.endsWith("Couldn't refresh the device list.")) say("");   // G2: also the "Revoked X. Couldn't refresh…" form
-    section.hidden = false;
+    devShown(true);
     lastDevs = res.data.devices;
     paint();
     if (!labelIn.value) labelIn.placeholder = "name the new device, e.g. iPad";
@@ -472,12 +481,149 @@
     say(revoked && !listed ? msg + " Couldn't refresh the device list." : msg);
   }
 
+  // NP S2: the Notifications block. The operator's own policy for what reaches him while a mute word (quiet, sleep) is on:
+  // GET /webpush/policy reads it (levain.webpush.presence.policy_view), POST /webpush/policy/set {mute, class, value} and
+  // /webpush/policy/reset write it, under the same token as every other write on this panel. Hidden where the cockpit
+  // serves no web push (a 404) or the token is refused, on its own: the pairing read does not decide it. The words come from the server (`sentences`, `status`).
+  const MUTES = [["quiet", "Quiet"], ["sleep", "Sleep"]];
+  const CLASSES = [["approval", "Approvals", "seats asking you to say yes or no"],
+                   ["attention", "Attention items", "things that need you, dated ones included"],
+                   ["other", "Other pings", "questions, rulings, summaries"]];
+  const HOLD_WARN = "Seats that need your approval will wait silently until you unmute.";
+  const DEFAULT_NOTE = "By default, approvals wait while you sleep and push once you are back.";
+  let npPanel = null, npSentences = null, npStatus = null, npNote = null, npCells = {}, npReset = null, npBusy = false, npDefault = null,
+      npGen = 0, npGone = false, npRefused = "", npResetOff = false;   // npGen: bumped by every write; an older read is dropped
+
+  function buildPolicy() {
+    npPanel = el("div", "panel k-list dev-panel np-panel");
+    npPanel.dataset.modes = "board";
+    npPanel.hidden = true;
+    const ph = el("div", "phead");
+    ph.appendChild(el("h2", null, "Notifications"));
+    npPanel.appendChild(ph);
+    const body = el("div", "pbody dev-body");
+    npSentences = el("div", "np-sentences");
+    body.appendChild(npSentences);
+    npStatus = el("p", "dev-note np-status"); npStatus.hidden = true;
+    body.appendChild(npStatus);
+    npDefault = el("p", "dev-note np-default", DEFAULT_NOTE); npDefault.hidden = true;
+    body.appendChild(npDefault);
+    for (const [mute, mname] of MUTES) {
+      const grp = el("div", "np-group");
+      grp.appendChild(el("div", "dev-name", "While " + mname.toLowerCase() + " is on"));
+      for (const [cls, cname, gloss] of CLASSES) {
+        const r = el("div", "dev-row np-row");
+        r.dataset.cell = mute + "." + cls;
+        const main = el("div", "dev-main");
+        main.appendChild(el("div", "np-cls", cname));
+        main.appendChild(el("div", "dev-meta", gloss));
+        const warn = el("div", "np-warn", HOLD_WARN);
+        warn.setAttribute("role", "alert");
+        warn.hidden = true;
+        if (cls === "approval") main.appendChild(warn);
+        r.appendChild(main);
+        const seg = el("div", "ck-tabs np-seg");
+        seg.setAttribute("role", "group");
+        seg.setAttribute("aria-label", cname + " while " + mname.toLowerCase() + " is on");
+        const btns = {};
+        for (const v of ["push", "hold"]) {
+          const b = el("button", "ck-tab", v === "push" ? "Reach me" : "Wait");
+          b.type = "button";
+          b.dataset.value = v;
+          b.addEventListener("click", () => setCell(mute, cls, v));
+          btns[v] = b; seg.appendChild(b);
+        }
+        r.appendChild(seg);
+        npCells[mute + "." + cls] = { btns: btns, warn: warn, cls: cls };
+        grp.appendChild(r);
+      }
+      body.appendChild(grp);
+    }
+    npReset = el("button", "dev-btn np-reset", "Reset to default");
+    npReset.type = "button";
+    npReset.addEventListener("click", resetPolicy);
+    const foot = el("div", "np-foot");
+    foot.appendChild(npReset);
+    body.appendChild(foot);
+    npNote = el("p", "dev-note"); npNote.hidden = true;
+    body.appendChild(npNote);
+    npPanel.appendChild(body);
+    return npPanel;
+  }
+
+  function npSay(msg) { npNote.textContent = msg; npNote.hidden = !msg; }
+
+  function paintPolicy(v) {
+    npSentences.replaceChildren();
+    for (const [mute] of MUTES) npSentences.appendChild(el("p", "np-sentence", (v.sentences || {})[mute] || ""));
+    const bad = v.status_kind === "malformed";
+    npStatus.hidden = v.status_kind === "default";
+    npStatus.className = "dev-note np-status" + (bad ? " np-bad" : "");
+    npStatus.textContent = bad ? "The policy file is not usable: " + (v.reasons || []).join("; ") + ". The default is in effect until you set a cell or reset."
+                               : "Your own table is in effect, not the default.";
+    for (const [mute] of MUTES) for (const [cls] of CLASSES) {
+      const c = npCells[mute + "." + cls], cur = ((v.cells || {})[mute] || {})[cls];
+      for (const k of ["push", "hold"]) {
+        c.btns[k].setAttribute("aria-pressed", k === cur ? "true" : "false");
+      }
+      // the warning is for a hold that is not the shipped default's own; the server names the default cells
+      const dflt = (((v.default_cells || {})[mute]) || {})[cls];
+      c.warn.hidden = !(cls === "approval" && cur === "hold" && cur !== dflt);
+    }
+    // approvals held ONLY by the shipped default: one plain, non-red line, shown when the server says a cell holds by default
+    npDefault.hidden = !Object.values(v.held_by_default || {}).some(Boolean);
+    npResetOff = v.status_kind === "default";
+    npReset.disabled = npBusy || npResetOff;
+    npShown(true);
+  }
+
+  async function readPolicy() {
+    if (npGone) return;
+    const tok = token();
+    if (!tok || tok === npRefused) { npShown(false); return; }
+    const startedAt = npGen;
+    try {
+      const res = await api("GET", "/webpush/policy", undefined, READ_TIMEOUT_MS);
+      if (startedAt !== npGen) return;                                                  // a write landed since this read began: it is stale
+      if (res.status === 200 && res.data && res.data.cells) paintPolicy(res.data);
+      else if (res.status === 404) { npShown(false); npGone = true; }            // no web push here
+      else if (res.status === 403) { npShown(false); npRefused = tok; }          // this token is not allowed: stop asking
+    } catch (_) { /* the next pulse tries again */ }
+  }
+
+  async function writePolicy(path, body) {
+    if (npBusy) return;
+    npBusy = true; npGen++; npSay("");
+    for (const k in npCells) for (const b of Object.values(npCells[k].btns)) b.disabled = true;
+    npReset.disabled = true;
+    try {
+      const res = await api("POST", path, body);
+      npGen++;                                                                    // reads begun while the write ran are stale too
+      if (res.status === 200 && res.data && res.data.cells) paintPolicy(res.data);
+      else npSay("Could not change the policy (" + ((res.data && res.data.message) || res.status) + ").");
+    } catch (_) { npSay("Could not reach the cockpit."); }
+    finally {
+      try { await readPolicy(); }   // the server's word on what is in effect, after a refusal too; the buttons wait for it to paint
+      finally {
+        npBusy = false;
+        for (const k in npCells) for (const b of Object.values(npCells[k].btns)) b.disabled = false;
+        npReset.disabled = npResetOff;
+      }
+    }
+  }
+  function setCell(mute, cls, value) { return writePolicy("/webpush/policy/set", { mute: mute, class: cls, value: value }); }
+  function resetPolicy() { return writePolicy("/webpush/policy/reset", {}); }
+
   function start() {
     build();
     refresh();
+    readPolicy();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
-    setTimeout(refresh, 2500);
-    const pulse = setInterval(() => { if (gone) clearInterval(pulse); else if (!document.hidden) refresh(); }, 30000);
+    setTimeout(() => { refresh(); readPolicy(); }, 2500);
+    const pulse = setInterval(() => {
+      if (gone && npGone) clearInterval(pulse);
+      else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); }
+    }, 30000);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
 })();
