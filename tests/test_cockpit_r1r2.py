@@ -231,13 +231,13 @@ class TestManifestMapperAdversarial:
         ck = _tray_cockpit()
         ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c: Read(value={"lines": [
             {"label": "state", "text": "x", "at": "2026-10-09T12:00:00.000Z", "source": "s"}]}), region="header"))
-        ck.register(ProviderSpec("weather", "line", "Weather", "gauge", lambda c: Read(value={"lines": [
+        ck.register(ProviderSpec("reading-a", "line", "Reading A", "gauge", lambda c: Read(value={"lines": [
             {"label": "now", "text": "cloudy", "at": None, "source": None}]}), region="header", rank=5))
         snap = self._snap(ck)
         snap["panels"]["state"] = {"error": "HTTP 500"}
         view = _view(snap)
         assert view["state"] is None and "HTTP 500" in view["errors"]["state"]
-        assert view["extra_panels"]["weather"]["lines"][0]["text"] == "cloudy"
+        assert view["extra_panels"]["reading-a"]["lines"][0]["text"] == "cloudy"
 
     def test_a_malformed_state_line_is_an_error_never_no_state_set(self) -> None:
         # the operator's own words: a panel with the wrong shape must not render as "no state set"
@@ -399,12 +399,12 @@ class TestManifestMapperBoundary:
 
     def test_a_panel_listed_twice_is_placed_once_and_a_non_string_stamp_does_not_blank_the_view(self) -> None:
         ck = _tray_cockpit()
-        ck.register(ProviderSpec("weather", "line", "Weather", "gauge", lambda c: Read(value={"lines": [
+        ck.register(ProviderSpec("reading-a", "line", "Reading A", "gauge", lambda c: Read(value={"lines": [
             {"label": "now", "text": "cloudy", "at": 12345, "source": None}]}), region="header"))
         snap = snapshot(ck)
-        snap["manifest"]["regions"]["zones"][0]["panels"].append("weather")
+        snap["manifest"]["regions"]["zones"][0]["panels"].append("reading-a")
         view = _view(snap)
-        assert [e["id"] for e in view["layout"]].count("weather") == 1
+        assert [e["id"] for e in view["layout"]].count("reading-a") == 1
 
     def test_wire_keys_named_like_prototype_members_are_data(self) -> None:
         ck = _tray_cockpit()

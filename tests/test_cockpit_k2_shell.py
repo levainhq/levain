@@ -17,7 +17,7 @@ from tests._ke_dom import NODE, WEB, run_node
 pytestmark = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 # the ids flow's own page draws (flow/scripts/flow_cockpit.py renders this template): every one must land on a tab
-FLOW_IDS = ["sky", "weather", "brief", "ops", "memory", "inbox", "stream", "roster", "fleet", "decisions", "flow-episodes", "flow-spores"]
+FLOW_IDS = ["sky", "reading-a", "brief", "ops", "memory", "inbox", "stream", "roster", "fleet", "decisions", "flow-episodes", "flow-spores"]
 TABS = {"morning", "board", "build", "memory"}
 
 

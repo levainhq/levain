@@ -342,7 +342,7 @@ def test_registered_under_its_own_id_with_the_opt_out(tmp_path):
     _root, src, _ids = _install(tmp_path)
     ck = build_default_cockpit(src)
     assert "topology" in ck.panel_ids and "topology" in OPTIONAL_NATIVE
-    flow_ids = {"sky", "memory", "weather", "brief", "ops", "inbox", "stream", "roster"}
+    flow_ids = {"sky", "memory", "reading-a", "brief", "ops", "inbox", "stream", "roster"}
     assert "topology" not in flow_ids                                   # flow registers its own ids on top
     ck2 = build_default_cockpit(src, exclude=("topology",))
     assert "topology" not in ck2.panel_ids

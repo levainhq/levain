@@ -8,6 +8,7 @@
 (function () {
   "use strict";
   const WRITE_TOKEN_KEY = "levain_write_token";
+  const ALL_MODES = "morning board build memory";   // the settings section is not a tab's card: it shows under every mode
   const H = "X-Levain-Write-Token";
   let section = null, devPanel = null, list = null, tabsNav = null, tabBtns = {}, offerBox = null, note = null, labelIn = null, offerBtns = [];
   // L3 r2 G1: ONE shared in-flight read. A caller that finds one running gets that promise back and queues exactly one
@@ -162,16 +163,34 @@
     body.appendChild(note);
     panel.appendChild(body);
     grid.appendChild(panel);
-    grid.appendChild(buildPresence());
-    grid.appendChild(buildPolicy());
     section.appendChild(grid);
+    // the quieter half of Presence and the Notifications policy: one plainly titled section at the foot, in every mode, so the
+    // sheet's link always has somewhere to land
+    prSetSec = el("section", "ck-zone dev-zone pr-settings");
+    prSetSec.id = "presence-settings";
+    prSetSec.tabIndex = -1;
+    prSetSec.dataset.zone = "presence";
+    prSetSec.dataset.modes = ALL_MODES;
+    prSetSec.hidden = true;
+    const sh = el("div", "zone-head");
+    sh.appendChild(el("h2", "zone-title", "Presence & notification settings"));
+    prSetSec.appendChild(sh);
+    const sgrid = el("div", "ck-zgrid dev-grid pr-settings-grid");
+    sgrid.appendChild(buildTaps());
+    sgrid.appendChild(buildPolicy());
+    prSetSec.appendChild(sgrid);
     const main = document.querySelector("main.frame");
-    if (main) main.appendChild(section); else document.body.appendChild(section);
+    if (main) { main.appendChild(section); main.appendChild(prSetSec); } else { document.body.appendChild(section); document.body.appendChild(prSetSec); }
+    buildChip();
+    buildSheet();
   }
 
-  // The section holds two independent blocks (the paired devices, the Notifications policy); it shows while either does, and
-  // each block keeps its own gone/refused state, so a cockpit with one and not the other still shows what it has.
-  function syncSection() { section.hidden = devPanel.hidden && (!npPanel || npPanel.hidden) && (!prPanel || prPanel.hidden); }
+  // The devices section shows with its own read; the settings section holds two independent blocks (tap tokens, the
+  // Notifications policy) and shows while either does, each with its own gone/refused state.
+  function syncSection() {
+    section.hidden = devPanel.hidden;
+    if (prSetSec) prSetSec.hidden = (!npPanel || npPanel.hidden) && (!prPanel || prPanel.hidden);
+  }
   function devShown(on) { devPanel.hidden = !on; syncSection(); }
   function npShown(on) { npPanel.hidden = !on; syncSection(); }
 
@@ -497,7 +516,7 @@
 
   function buildPolicy() {
     npPanel = el("div", "panel k-list dev-panel np-panel");
-    npPanel.dataset.modes = "board";
+    npPanel.dataset.modes = ALL_MODES;
     npPanel.hidden = true;
     const ph = el("div", "phead");
     ph.appendChild(el("h2", null, "Notifications"));
@@ -615,57 +634,80 @@
   function setCell(mute, cls, value) { return writePolicy("/webpush/policy/set", { mute: mute, class: cls, value: value }); }
   function resetPolicy() { return writePolicy("/webpush/policy/reset", {}); }
 
-  // ---- Presence: the word that says whether pings reach you, shown and set here, and the tap tokens a Shortcut or an NFC tag
-  // uses to set it with no location. GET /webpush/presence reads it ({word, until, text, tokens}); POST /webpush/presence/set
-  // {word, for?} writes it; /webpush/presence/token/new {name, words} and /revoke {name} manage the taps. Same token as every
-  // other write here; the route ({route, route_source, route_until}) says where an ordinary ping goes while you are active at the
-  // laptop: Desk holds it for the terminal band, Devices pushes it to your phone. {word:"desk"|"devices", for?} sets the route alone. Hidden on a 404 (no web push) or a refused token, on its own. The state is in the server's words (`text`).
-  const PR_WORDS = [["back", "Back"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"], ["remote", "Remote"]];
+  // ---- Presence. The word that says whether pings reach you lives in the masthead: a chip on every page (state and time left)
+  // that opens a small sheet of big buttons, so setting it as you come and go takes a tap or two. GET /webpush/presence reads
+  // it ({word, until, text, route, route_source, route_until, tokens}); POST /webpush/presence/set {word, for?} writes it.
+  // The route ({route, route_source, route_until}) says where an ordinary ping goes while you are active at the laptop: Desk
+  // holds it for the terminal band, Devices pushes it to your phone; {word:"desk"|"devices", for?} sets the route alone.
+  // Below the page sits the quieter part (tap tokens a Shortcut or an NFC tag uses to set the word with no location fix, and
+  // the Notifications policy), reached from the sheet's link. Same token as every other write here; the chip hides on a 404
+  // (no web push) or a refused token, without a word of error in the header.
+  const PR_WORDS = [["back", "Here"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"], ["remote", "Remote"]];
   const PR_ROUTES = [["desk", "Desk"], ["devices", "Devices"]];
-  const PR_TAP_WORDS = PR_WORDS.concat(PR_ROUTES);
+  // the tap-token form names the word the server knows (back), not the sheet's friendlier "Here"
+  const PR_TAP_WORDS = [["back", "Back"]].concat(PR_WORDS.slice(1), PR_ROUTES);
   const PR_TIMED = ["quiet", "loud", "remote"];
-  const PR_DURATIONS = [["15m", "15 minutes"], ["1h", "1 hour"], ["4h", "4 hours"], ["24h", "24 hours"]];
+  // "" is "until back": away and sleep already end on his return and take no duration; a timed word or the Devices route
+  // needs an end, so it takes the longest the server allows
+  const PR_DURATIONS = [["15m", "15m"], ["1h", "1h"], ["2h", "2h"], ["", "Until back"]];
+  const PR_CAP = "24h";
+  const PR_DUR_KEY = "levain_presence_for";
   const PR_TAP_DEFAULT = ["away", "back", "quiet", "remote", "desk", "devices"];
   const PR_WORD_GLOSS = { back: "pings reach you as usual", away: "held for your phone", quiet: "only what needs you reaches you",
                           sleep: "only what needs you reaches you, until you are active", loud: "everything reaches you",
                           remote: "you are working from your phone: sets Devices too" };
   const PR_ROUTE_GLOSS = { desk: "held for the terminal while you are active at the laptop",
                            devices: "pushed to your phone and cockpit even while you are active" };
-  let prPanel = null, prState = null, prText = null, prBtns = {}, prSelect = null, prRouteBtns = {}, prRoute = null, prEndLoud = null, prNote = null, prTapList = null,
-      prNew = null, prName = null, prChecks = {}, prShown = null, prBusy = false, prGen = 0, prGone = false, prRefused = "", prCur = null;
+  let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prBtns = {}, prRouteBtns = {}, prDurBtns = {}, prRoute = null,
+      prEndLoud = null, prSheetNote = null, prLink = null, prDur = "1h", prSetSec = null, prTapList = null, prNote = null,
+      prNew = null, prName = null, prChecks = {}, prBusy = false, prGen = 0, prReadId = 0, prGone = false, prRefused = "", prCur = null;
 
-  function buildPresence() {
-    prPanel = el("div", "panel k-list dev-panel pr-panel");
-    prPanel.dataset.modes = "board";
-    prPanel.hidden = true;
-    const ph = el("div", "phead");
-    ph.appendChild(el("h2", null, "Presence"));
-    prPanel.appendChild(ph);
-    const body = el("div", "pbody dev-body");
-    prState = el("p", "pr-state");
-    prState.setAttribute("aria-live", "polite");
-    body.appendChild(prState);
-    prText = el("p", "dev-note pr-text");
-    body.appendChild(prText);
-    const seg = el("div", "pr-words");
-    seg.setAttribute("role", "group");
-    seg.setAttribute("aria-label", "Set your presence");
+  function loadDur() {
+    try {
+      const v = window.localStorage.getItem(PR_DUR_KEY);
+      if (v !== null && PR_DURATIONS.some((d) => d[0] === v)) return v;
+    } catch (_) { /* storage blocked: the default stands for this page only */ }
+    return "1h";
+  }
+  function saveDur(v) { try { window.localStorage.setItem(PR_DUR_KEY, v); } catch (_) { /* not remembered */ } }
+
+  // The chip is in the page's own masthead markup, so it exists on every mode; this only wires and fills it.
+  function buildChip() {
+    prChip = document.getElementById("presencebtn");
+    if (!prChip) return;
+    prChipText = prChip.querySelector(".pr-chip-t");
+    prChip.addEventListener("click", () => { if (prSheet.hidden) openSheet(); else closeSheet(true); });
+  }
+
+  function buildSheet() {
+    prDur = loadDur();
+    prSheet = el("div", "pr-sheet");
+    prSheet.id = "pr-sheet";
+    prSheet.setAttribute("role", "dialog");
+    prSheet.setAttribute("aria-label", "Presence");
+    prSheet.hidden = true;
+    prSheetText = el("p", "pr-sheet-text");
+    prSheetText.setAttribute("aria-live", "polite");
+    prSheet.appendChild(prSheetText);
+    const words = el("div", "pr-sheet-words");
+    words.setAttribute("role", "group");
+    words.setAttribute("aria-label", "Set your presence");
     for (const [w, label] of PR_WORDS) {
-      const b = el("button", "dev-btn pr-word" + (w === "back" ? " dev-primary" : ""), label);
+      const b = el("button", "pr-big pr-sheet-word", label);
       b.type = "button";
       b.dataset.word = w;
       b.title = PR_WORD_GLOSS[w];
       b.addEventListener("click", () => setWord(w));
-      prBtns[w] = b; seg.appendChild(b);
+      prBtns[w] = b; words.appendChild(b);
     }
-    body.appendChild(seg);
-    const rt = el("div", "pr-route");
-    rt.appendChild(el("span", "dev-meta", "Pings go to"));
-    const rseg = el("div", "pr-words pr-route-words");
+    prSheet.appendChild(words);
+    const rt = el("div", "pr-sheet-row");
+    rt.appendChild(el("span", "pr-sheet-lab", "Pings go to"));
+    const rseg = el("div", "pr-sheet-seg");
     rseg.setAttribute("role", "group");
     rseg.setAttribute("aria-label", "Where pings go while you are active");
     for (const [r, label] of PR_ROUTES) {
-      const b = el("button", "dev-btn pr-route-btn", label);
+      const b = el("button", "pr-big pr-route-btn", label);
       b.type = "button";
       b.dataset.route = r;
       b.title = PR_ROUTE_GLOSS[r];
@@ -673,29 +715,101 @@
       prRouteBtns[r] = b; rseg.appendChild(b);
     }
     rt.appendChild(rseg);
-    prRoute = el("p", "dev-note pr-route-state");
-    rt.appendChild(prRoute);
-    body.appendChild(rt);
-    const dur = el("label", "pr-for");
-    dur.appendChild(el("span", "dev-meta", "For:"));
-    prSelect = el("select", "dev-label pr-duration");
-    prSelect.setAttribute("aria-label", "How long");
-    for (const [v, label] of PR_DURATIONS) { const o = el("option", null, label); o.value = v; prSelect.appendChild(o); }
-    prSelect.value = "1h";
-    dur.appendChild(prSelect);
-    body.appendChild(dur);
-    prEndLoud = el("button", "dev-btn pr-endloud", "End Loud");
+    prSheet.appendChild(rt);
+    prRoute = el("p", "pr-sheet-route");
+    prSheet.appendChild(prRoute);
+    const dr = el("div", "pr-sheet-row");
+    dr.appendChild(el("span", "pr-sheet-lab", "For"));
+    const dseg = el("div", "pr-sheet-seg");
+    dseg.setAttribute("role", "group");
+    dseg.setAttribute("aria-label", "How long: Quiet, Loud, Remote and Devices");
+    for (const [v, label] of PR_DURATIONS) {
+      const b = el("button", "pr-big pr-dur", label);
+      b.type = "button";
+      b.dataset.for = v;
+      b.addEventListener("click", () => { prDur = v; saveDur(v); paintDur(); });
+      prDurBtns[v] = b; dseg.appendChild(b);
+    }
+    dr.appendChild(dseg);
+    prSheet.appendChild(dr);
+    // visible on a phone, where a tooltip never shows: what "Until back" does for the words that cannot stand forever
+    prSheet.appendChild(el("p", "pr-sheet-route", "Until back: Desk stays as set; Quiet, Sleep, Loud, Remote and Devices end after " + PR_CAP + " at most."));
+    paintDur();
+    prEndLoud = el("button", "pr-big pr-endloud", "End Loud");
     prEndLoud.type = "button"; prEndLoud.hidden = true;
     prEndLoud.addEventListener("click", () => writePresence({ word: "loud", for: "off" }));
-    body.appendChild(prEndLoud);
-    prNote = el("p", "dev-note"); prNote.hidden = true;
-    body.appendChild(prNote);
+    prSheet.appendChild(prEndLoud);
+    prSheetNote = el("p", "pr-sheet-note"); prSheetNote.hidden = true;
+    prSheetNote.setAttribute("role", "status");
+    prSheet.appendChild(prSheetNote);
+    prLink = el("a", "pr-sheet-link", "Presence settings →");
+    prLink.href = "#presence-settings";
+    prLink.addEventListener("click", (e) => { e.preventDefault(); closeSheet(false); toSettings(); });
+    prSheet.appendChild(prLink);
+    document.body.appendChild(prSheet);
+  }
 
-    const taps = el("div", "pr-taps");
-    taps.appendChild(el("div", "dev-name", "Tap tokens"));
-    taps.appendChild(el("p", "dev-note", "A tap token lets one Shortcut or NFC tag set your presence, and nothing else."));
+  function toSettings() {
+    if (!prSetSec || prSetSec.hidden) return;
+    prSetSec.scrollIntoView({ block: "start" });
+    prSetSec.focus({ preventScroll: true });
+  }
+  function paintDur() { for (const [v, b] of Object.entries(prDurBtns)) b.setAttribute("aria-pressed", v === prDur ? "true" : "false"); }
+
+  function placeSheet() {
+    const r = prChip.getBoundingClientRect();
+    const w = Math.min(340, window.innerWidth - 16);
+    prSheet.style.setProperty("--pr-top", Math.round(r.bottom + 8) + "px");
+    prSheet.style.setProperty("--pr-left", Math.round(Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8))) + "px");
+  }
+  function openSheet() {
+    if (!prCur) return;
+    placeSheet();
+    prSheet.hidden = false;
+    prChip.setAttribute("aria-expanded", "true");
+    document.addEventListener("pointerdown", sheetOutside, true);
+    document.addEventListener("keydown", sheetKey, true);
+    window.addEventListener("resize", placeSheet);
+    const cur = prBtns[prCur.word || "back"] || prBtns.back;
+    cur.focus();
+  }
+  function closeSheet(refocus) {
+    if (!prSheet || prSheet.hidden) return;
+    prSheet.hidden = true;
+    prChip.setAttribute("aria-expanded", "false");
+    document.removeEventListener("pointerdown", sheetOutside, true);
+    document.removeEventListener("keydown", sheetKey, true);
+    window.removeEventListener("resize", placeSheet);
+    if (refocus) prChip.focus();
+  }
+  function sheetOutside(e) {
+    if (prSheet.contains(e.target) || prChip.contains(e.target)) return;
+    closeSheet(false);
+  }
+  function sheetKey(e) {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeSheet(true); return; }
+    if (e.key !== "Tab") return;
+    // keep Tab inside the sheet while it is open
+    const f = [...prSheet.querySelectorAll("button:not(:disabled), a[href]")].filter((n) => !n.hidden);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    else if (!prSheet.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+  }
+
+  // The tap-token block of the settings section (the word buttons moved to the sheet)
+  function buildTaps() {
+    prPanel = el("div", "panel k-list dev-panel pr-panel");
+    prPanel.dataset.modes = ALL_MODES;
+    prPanel.hidden = true;
+    const ph = el("div", "phead");
+    ph.appendChild(el("h2", null, "Tap tokens"));
+    prPanel.appendChild(ph);
+    const body = el("div", "pbody dev-body");
+    body.appendChild(el("p", "dev-note pr-intro", "A tap token lets one Shortcut or NFC tag set your presence, and nothing else."));
     prTapList = el("div", "dev-list pr-tap-list");
-    taps.appendChild(prTapList);
+    body.appendChild(prTapList);
     const form = el("form", "pr-new-form");
     prName = el("input", "dev-label pr-name");
     prName.type = "text"; prName.maxLength = 40; prName.placeholder = "Name, e.g. Front door tag";
@@ -713,16 +827,23 @@
     go.type = "submit";
     form.appendChild(go);
     form.addEventListener("submit", (e) => { e.preventDefault(); createTap(); });
-    taps.appendChild(form);
+    body.appendChild(form);
     prNew = el("div", "dev-link pr-new"); prNew.hidden = true;
-    taps.appendChild(prNew);
-    body.appendChild(taps);
+    body.appendChild(prNew);
+    prNote = el("p", "dev-note"); prNote.hidden = true;
+    body.appendChild(prNote);
     prPanel.appendChild(body);
     return prPanel;
   }
 
-  function prShow(on) { prPanel.hidden = !on; syncSection(); }
+  // the chip and the sheet follow the read; a refusal or no web push takes the chip away quietly
+  function prShow(on) {
+    prPanel.hidden = !on; syncSection();
+    if (prChip) prChip.hidden = !on;
+    if (!on) closeSheet(false);
+  }
   function prSay(msg) { prNote.textContent = msg; prNote.hidden = !msg; }
+  function sheetSay(msg) { prSheetNote.textContent = msg; prSheetNote.hidden = !msg; }
   function timeLeft(until) {
     const t = stampMs(until);
     if (Number.isNaN(t)) return "";
@@ -731,13 +852,35 @@
     if (m < 90) return m + " min left";
     return Math.round(m / 60) + " h left";
   }
+  // "42m", "1h 5m": short enough for a masthead
+  function span(ms) {
+    const m = Math.max(1, Math.ceil(ms / 60000));
+    if (m < 60) return m + "m";
+    const h = Math.floor(m / 60), r = m % 60;
+    return r ? h + "h " + r + "m" : h + "h";
+  }
+
+  function paintChip(v) {
+    if (!prChip) return;
+    const w = v.word;
+    const name = w ? (PR_WORDS.find((x) => x[0] === w) || [w, w])[1] : "Here";
+    let t = name, say = name;
+    const ms = w && v.until ? stampMs(v.until) - Date.now() : NaN;
+    if (!Number.isNaN(ms) && ms > 0) { t += " · " + span(ms); say += ", " + span(ms) + " left"; }
+    if (v.route === "devices") { t += " · devices"; say += ", pings go to devices"; }
+    // the word and its tail (time, route) are separate nodes so a phone's masthead can keep the word and drop the tail
+    prChipText.textContent = "";
+    prChipText.appendChild(el("span", "pr-chip-w", name));
+    if (t.length > name.length) prChipText.appendChild(el("span", "pr-chip-x", t.slice(name.length)));
+    prChip.dataset.state = w || "here";
+    prChip.setAttribute("aria-label", "Presence: " + say + ". Change it");
+  }
 
   function paintPresence(v) {
     prCur = v;
     const w = v.word;
-    const label = w ? (PR_WORDS.find((x) => x[0] === w) || [w, w])[1] : "";
-    prState.textContent = w ? label + (v.until ? " (" + timeLeft(v.until) + ")" : "") : "No word is set";
-    prText.textContent = v.text || "";
+    paintChip(v);
+    prSheetText.textContent = v.text || "";
     for (const [k, b] of Object.entries(prBtns)) b.setAttribute("aria-pressed", k === w || (k === "back" && !w) ? "true" : "false");
     prEndLoud.hidden = w !== "loud";
     const r = v.route === "devices" ? "devices" : "desk";
@@ -746,7 +889,8 @@
     prRoute.textContent = v.route_source === "fault" ? rl + " (the route file is unreadable: pings are being pushed)"
       : r === "devices"
       ? rl + (v.route_source === "auto" ? " (suggested: a remote login is open)" : "") + (v.route_until ? " (" + timeLeft(v.route_until) + ")" : "")
-      : rl + (v.route_source === "operator" && v.route_until ? " (" + timeLeft(v.route_until) + ")" : "");
+      : v.route_source === "operator" && v.route_until ? rl + " (" + timeLeft(v.route_until) + ")" : "";
+    prRoute.hidden = !prRoute.textContent;
     if (Array.isArray(v.tokens)) paintTaps(v.tokens);
     prShow(true);
   }
@@ -773,10 +917,10 @@
     if (prGone) return;
     const tok = token();
     if (!tok || tok === prRefused) { prShow(false); return; }
-    const startedAt = prGen;
+    const startedAt = prGen, mine = ++prReadId;   // only the newest read paints: a slow older one never overwrites it
     try {
       const res = await api("GET", "/webpush/presence", undefined, READ_TIMEOUT_MS);
-      if (startedAt !== prGen) return;
+      if (startedAt !== prGen || mine !== prReadId) return;
       if (res.status === 200 && res.data && "word" in res.data) paintPresence(res.data);
       else if (res.status === 404) { prShow(false); prGone = true; }
       else if (res.status === 403) { prShow(false); prRefused = tok; }
@@ -786,31 +930,35 @@
   function prDisable(on) {
     for (const b of Object.values(prBtns)) b.disabled = on;
     for (const b of Object.values(prRouteBtns)) b.disabled = on;
+    for (const b of Object.values(prDurBtns)) b.disabled = on;
     prEndLoud.disabled = on;
   }
   async function writePresence(body) {
     if (prBusy) return;
-    prBusy = true; prGen++; prSay(""); prDisable(true);
+    prBusy = true; prGen++; sheetSay(""); prDisable(true);
+    let ok = false;
     try {
       const res = await api("POST", "/webpush/presence/set", body);
       prGen++;
-      if (res.status === 200 && res.data && "word" in res.data) paintPresence(res.data);
-      else prSay("Could not set your presence (" + ((res.data && res.data.message) || res.status) + ").");
-    } catch (_) { prSay("Could not reach the cockpit."); }
+      if (res.status === 200 && res.data && "word" in res.data) { paintPresence(res.data); ok = true; }
+      else sheetSay("Could not set your presence (" + ((res.data && res.data.message) || res.status) + ").");
+    } catch (_) { sheetSay("Could not reach the cockpit."); }
     finally {
       try { await readPresence(); }
-      finally { prBusy = false; prDisable(false); }
+      finally { prBusy = false; prDisable(false); if (ok) closeSheet(true); }
     }
   }
   function setWord(w) {
     const body = { word: w };
-    if (PR_TIMED.indexOf(w) >= 0) body.for = prSelect.value;
+    if (PR_TIMED.indexOf(w) >= 0) body.for = prDur || PR_CAP;
     return writePresence(body);
   }
 
   function setRoute(r) {
     const body = { word: r };
-    body.for = prSelect.value;
+    // Desk with no end is the server's longest Desk; Devices with no end would fall to an hour, so it takes the cap
+    const f = prDur || (r === "devices" ? PR_CAP : "");
+    if (f) body.for = f;
     return writePresence(body);
   }
 
@@ -877,6 +1025,8 @@
     readPresence();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
     setTimeout(() => { refresh(); readPolicy(); readPresence(); }, 2500);
+    // a tab brought back after a long time repaints at once, not at the next pulse
+    document.addEventListener("visibilitychange", () => { if (!document.hidden && !prGone && !prBusy) readPresence(); });
     const pulse = setInterval(() => {
       if (gone && npGone && prGone) clearInterval(pulse);
       else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); if (!prBusy) readPresence(); }

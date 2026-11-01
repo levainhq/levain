@@ -1,7 +1,7 @@
-"""The reader's place on the page across a reload, and the hero weather's refresh button. Driven in headless
+"""The reader's place on the page across a reload, and the hero meta row. Driven in headless
 Chrome against a served cockpit: a reload rebuilds the board (emptying it clamps the page to the top), so
-`LevainDashboard.render` puts the scroll back; focus restored to a filter box must not scroll; the hero
-weather carries a button that re-reads its panel."""
+`LevainDashboard.render` puts the scroll back; focus restored to a filter box must not scroll; a downstream hero reading
+draws as an ordinary card and the last-wrap line overlaps nothing."""
 
 from __future__ import annotations
 
@@ -25,13 +25,13 @@ TALL = ("(() => { const ss = document.styleSheets[0]; ss.insertRule('#board > * 
 # count the renders (the boot code calls LevainDashboard.render on every load) without changing what they do
 COUNT = ("(() => { const L = window.LevainDashboard, r = L.render; window.__renders = 0;"
          " L.render = function () { try { return r.apply(this, arguments); } finally { window.__renders++; } }; return 1; })()")
-WEATHER = {"as_of": "2026-10-16T12:00:00+00:00", "value": 61, "unit": "F", "condition": "clear", "symbol": "clear",
+READING = {"as_of": "2026-10-16T12:00:00+00:00", "value": 61, "unit": "F", "condition": "clear", "symbol": "clear",
            "sub": [{"label": "AQI", "value": 42, "band": "good"}, {"label": "feels", "value": "59°"}], "hi": 70, "lo": 52}
 
 
-def _weather_cockpit(src: Any) -> Any:
+def _reading_cockpit(src: Any) -> Any:
     ck = build_default_cockpit(src)
-    ck.register(ProviderSpec("weather", "reading", "Weather", "feed", lambda c: Read(value=WEATHER), region="hero"))
+    ck.register(ProviderSpec("weather", "reading", "Reading", "feed", lambda c: Read(value=READING), region="hero"))
     return ck
 
 
@@ -88,30 +88,29 @@ def test_a_tab_coming_back_keeps_the_readers_place(tmp_path: Path) -> None:
 
 
 @needs_browser
-def test_the_hero_weather_has_a_button_that_rereads_its_panel(tmp_path: Path) -> None:
+def test_a_downstream_hero_reading_draws_no_weather_card_and_the_wrap_line_overlaps_nothing(tmp_path: Path) -> None:
+    """A downstream may still register a hero reading (even one with the old weather id): it draws as an ordinary card, never
+    a weather instrument, and the last-wrap line stays on the hero meta row clear of the clock, the events and that card."""
     _root, src, _ids = _install(tmp_path)
-    with _Served(src, cockpit=_weather_cockpit(src), surface_tokens={"browser": "T"}, install_class="reported") as url:
-        btn = "document.querySelector('[data-ck-hero=weather] button.wx-refresh')"
-        out = _drive(tmp_path, f"{url}/", [
-            {"until": f"{btn} && 1"},
-            # the button sits in flow: it overlaps none of the figure, the bounds or the sub-readings
-            {"eval": f"(() => {{ const b = {btn}.getBoundingClientRect(); const hit = (e) => {{ const r = e.getBoundingClientRect();"
-                     " return r.width && r.height && b.left < r.right && r.left < b.right && b.top < r.bottom && r.top < b.bottom; };"
-                     " return [...document.querySelectorAll('[data-ck-hero=weather] .wx-main > *, [data-ck-hero=weather] .aqi,"
-                     " [data-ck-hero=weather] .wx-src')].filter(hit).map(e => e.className); })()"},
-            # a fetch counter, installed before the click: every GET that names the weather panel
-            {"eval": "(() => { const f = window.fetch; window.__wx = []; window.fetch = function (u, o) {"
-                     " const url = typeof u === 'string' ? u : u.url; const m = ((o && o.method) || 'GET').toUpperCase();"
-                     " if (m === 'GET' && /weather/.test(url)) window.__wx.push(url); return f.apply(this, arguments); }; return 1; })()"},
-            {"eval": f"{btn}.click(); 1"},
-            {"until": "window.__wx.length >= 1 && window.__wx"},
-            {"until": f"{btn} && !{btn}.hasAttribute('aria-busy') && !{btn}.disabled && 1"},
-        ])
-    v = out["values"]
-    assert v[0] is True or v[0] == 1, v
-    assert v[1] == [], f"the refresh button overlaps the weather: {v[1]}"
-    assert isinstance(v[4], list) and v[4], f"no GET for the weather panel was sent: {v}"
-    assert v[5] in (True, 1), f"the button is gone or stuck busy after the refetch: {v}"
+    probe = ("(() => { const q = (s) => document.querySelector(s); const wrap = q('#ck-wrapline .wrapline');"
+             " if (!wrap) return null; const b = wrap.getBoundingClientRect();"
+             " const hit = (e) => { const r = e.getBoundingClientRect(); return r.width && r.height && b.left < r.right && r.left < b.right && b.top < r.bottom && r.top < b.bottom; };"
+             " const others = [...document.querySelectorAll('#ck-when *, #ck-wrapline .events, #ck-sky .ck-card')].filter((e) => !wrap.contains(e) && e !== wrap && !e.contains(wrap)).filter(hit).map((e) => e.className || e.tagName);"
+             " return [others, document.documentElement.scrollWidth <= window.innerWidth, !!q('[data-ck-hero=weather]'), !!q('.wx-refresh'), !!q('svg.wx-icon'), getComputedStyle(q('#ck-band')).display, ((q('#ck-sky .ck-card .needs-sec-label') || {}).textContent || '')]; })()")
+    with _Served(src, cockpit=_reading_cockpit(src), surface_tokens={"browser": "T"}, install_class="reported") as url:
+        steps: list[dict[str, Any]] = []
+        for w in (390, 768, 1280):
+            steps += [{"emulate": {"w": w, "h": 900}}, {"until": probe}, {"eval": probe}]
+        out = _drive(tmp_path, f"{url}/", steps)
+    got = [v for v in out["values"] if isinstance(v, list) and len(v) == 7]
+    assert len(got) >= 3, out["values"]
+    for others, no_hscroll, weather, refresh, icon, band, title in got:
+        assert others == [], f"the last-wrap line overlaps: {others}"
+        assert no_hscroll is True
+        assert not weather and not refresh and not icon
+        assert band == "grid", f"the hero band lost its stylesheet rules: display is {band!r}"
+        assert title == "Reading", "a downstream hero reading shows its own title"
+
 
 
 @needs_browser
