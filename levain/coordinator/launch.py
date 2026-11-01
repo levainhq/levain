@@ -1125,7 +1125,8 @@ def _observed(exe: str, env: dict[str, str], cwd: str) -> list[dict[str, Any]] |
 
 def _remove_briefs(store: CoordStore) -> list[str]:
     """Delete the brief of every launch of this store that is over (ended, failed, expired): a brief quotes your drops
-    verbatim and has no reader once its launch is over (L3 r1 G9). Only a regular file named ``ln-<hex>.md`` in a
+    verbatim and has no reader once its launch is over (L3 r1 G9); a worker's drops file goes with it. Only a regular
+    file named ``ln-<hex>.md`` (or ``ln-<hex>.drops.md``) in a
     briefs directory that is a real directory of yours, naming a launch asked to run in that very directory."""
     lines: list[str] = []
     for d in store.launch_dirs():
