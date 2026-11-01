@@ -232,3 +232,19 @@ def test_the_ping_treats_a_dropped_socket_as_not_healthy(tmp_path: Path) -> None
     finally:
         srv.shutdown()
     assert r.returncode == 1
+
+
+@pytest.mark.parametrize("flag", ["LEVAIN_FULL_CHROME", "LEVAIN_DRIVE_FULL_CHROME"])
+def test_a_full_chrome_flag_never_starts_the_shared_chrome(monkeypatch, flag):
+    """With the drive taking its own full Chrome, the runner must not start (and then discard) the session's shared Chrome."""
+    calls = []
+    monkeypatch.setattr(_shared_chrome, "port", lambda: calls.append(1) or 4242)
+    monkeypatch.setenv("LEVAIN_DRIVE_SHARE", "1")
+    monkeypatch.delenv("LEVAIN_DRIVE_CHROME_FLAGS", raising=False)
+    monkeypatch.delenv("LEVAIN_FULL_CHROME", raising=False)
+    monkeypatch.delenv("LEVAIN_DRIVE_FULL_CHROME", raising=False)
+    argv = [NODE or "node", str(DRIVE)]
+    assert _page_drive_run._shared_env(argv) == {"LEVAIN_DRIVE_CDP_PORT": "4242"} and calls == [1]   # the positive control: the seam works
+    calls.clear()
+    monkeypatch.setenv(flag, "1")
+    assert _page_drive_run._shared_env(argv) == {} and calls == []

@@ -364,6 +364,13 @@ def test_a_paired_subscription_without_its_journal_is_refused_and_an_unreadable_
     assert paired_device_live(tmp_path / "bad", PAIRED_PREFIX + "d-1") is False
 
 
+@pytest.fixture
+def full_chrome(monkeypatch):
+    """Declares the capability: this drive needs service workers, Push or Notifications, which chrome-headless-shell lacks, so
+    ``tests/_page_drive.mjs`` runs it on the full Chrome in a process of its own (LEVAIN_DRIVE_FULL_CHROME=1)."""
+    monkeypatch.setenv("LEVAIN_DRIVE_FULL_CHROME", "1")
+
+
 # --- the cockpit page's own control (fix round 1, P4): the Devices panel turns pings on for this browser ------------
 
 def _fake_push(sub: dict[str, Any]) -> str:
@@ -388,7 +395,7 @@ def _panel(tok: str, sub: dict[str, Any], extra: "list[dict]") -> "list[dict]":
 
 
 @needs_browser
-def test_the_devices_panel_turns_pings_on_for_a_paired_browser(rig, pushes, tmp_path) -> None:
+def test_the_devices_panel_turns_pings_on_for_a_paired_browser(full_chrome, rig, pushes, tmp_path) -> None:
     from levain.webpush import live
 
     src, qdir = rig
@@ -408,7 +415,7 @@ def test_the_devices_panel_turns_pings_on_for_a_paired_browser(rig, pushes, tmp_
 
 
 @needs_browser
-def test_one_tap_under_the_cockpits_own_key_pairs_this_browser_and_lists_it(rig, pushes, tmp_path) -> None:
+def test_one_tap_under_the_cockpits_own_key_pairs_this_browser_and_lists_it(full_chrome, rig, pushes, tmp_path) -> None:
     src, qdir = rig
     with _signed(src, qdir) as (port, _):
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token={T}", _panel(T, _sub(8), [
