@@ -270,12 +270,44 @@
     return ios ? "This Home Screen app keeps its own sign-in, so it needs one pairing code: get one from the Devices panel on any device that is already paired." : "";
   }
 
-  window.levainPairCard = { claim: claim, drainOpened: drainOpened, fold: fold, installedNote: installedNote,
+  window.levainPairCard = { claim: claim, drainOpened: drainOpened, reportTrace: reportTrace, fold: fold, installedNote: installedNote,
     env: () => ({ installed: installedApp(), apple: onApple() }), noPushWords: noPushWords, turnOnFailed: turnOnFailed, subscribeLost: SUBSCRIBE_LOST };
 
-  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") drainOpened(); });
+  // 4. the trace report: the on-device tap trace ring (Cache Storage `levain-trace`, written by sw.js and sw_open.js) posted to
+  // /webpush/trace with this page's key, so a tap test needs only the tap and the operator reads the report at the laptop
+  // (levain.webpush.tap_report). Step names, counts and path-only urls: no token, no ping body. Best effort and silent; one
+  // post per new ring head (the newest step's time is kept in localStorage), the newest steps that fit the push body cap.
+  const TRACE_CACHE = "levain-trace", TRACE_PREFIX = "/__levain_trace/", TRACE_SENT_KEY = "levain_trace_sent", TRACE_BODY_MAX = 6500;
+  let reporting = false;
+  async function reportTrace() {
+    if (reporting || !token() || typeof caches === "undefined") return;
+    reporting = true;
+    try {
+      const c = await caches.open(TRACE_CACHE);
+      const got = [];
+      for (const req of await c.keys()) {
+        if (new URL(req.url).pathname.indexOf(TRACE_PREFIX) !== 0) continue;
+        try { const e = await (await c.match(req)).json(); if (e && typeof e === "object" && Number.isFinite(e.t)) got.push(e); } catch (_) { /* skipped */ }
+      }
+      if (!got.length) return;
+      got.sort((a, b) => a.t - b.t);
+      const head = got[got.length - 1].t;
+      let sent = 0;
+      try { sent = Number(window.localStorage.getItem(TRACE_SENT_KEY)) || 0; } catch (_) { /* none */ }
+      if (head <= sent) return;
+      let keep = got;
+      while (keep.length > 1 && JSON.stringify(keep).length > TRACE_BODY_MAX) keep = keep.slice(1);   // drop the oldest
+      const res = await api("POST", "/webpush/trace", { page: location.pathname, entries: keep });
+      if (res.status >= 200 && res.status < 300) { try { window.localStorage.setItem(TRACE_SENT_KEY, String(head)); } catch (_) { /* resent next time */ } }
+    } catch (_) { /* best effort: a report never reaches the page */ } finally { reporting = false; }
+  }
+  // a moment after the page's own first steps (page-load, the claim) are written, and again when the app comes forward
+  const reportSoon = () => { setTimeout(reportTrace, 2500); };
+
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") { drainOpened(); reportSoon(); } });
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.addEventListener("message", (e) => { if (e.data && e.data.type === OPENED_MESSAGE) drainOpened(); });
+    navigator.serviceWorker.addEventListener("message", (e) => { if (e.data && e.data.type === OPENED_MESSAGE) { drainOpened(); reportSoon(); } });
   }
   drainOpened();
+  reportSoon();
 })();

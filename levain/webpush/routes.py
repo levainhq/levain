@@ -162,4 +162,12 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
         if ping is None:
             return _err(400, "bad_ping", "ping must be an integer id")
         return _json(200, {"recorded": store.add_open(ping, device_id)})
+    if method == "POST" and path == "/webpush/trace":
+        from levain.webpush import tap_report
+
+        obj = _body_json(body)
+        entries = tap_report.clean(obj.get("entries")) if obj else None
+        if entries is None:
+            return _err(400, "bad_trace", "entries must be a list of objects")
+        return _json(200, {"kept": tap_report.record(queue_dir, device_id, entries, page=obj.get("page"))})
     return _err(404, "not_found", "no such push path")
