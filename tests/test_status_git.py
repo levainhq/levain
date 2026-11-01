@@ -52,6 +52,7 @@ def repo(tmp_path: Path):
 
 def test_a_pair_is_ok_only_when_the_first_containing_tag_matches_and_the_sha_is_on_main(repo) -> None:
     mod, _work, s = repo
+    mod.pin_main()
     table = ("| id | piece | status | derive |\n|---|---|---|---|\n"
              f"| R1 | right | RELEASED v0.1.0 | `rel {s['a']}` -> v0.1.0 | none |\n"
              f"| R2 | wrong tag | RELEASED v0.1.0 | `rel {s['b']}` -> v0.1.0 | none |\n"
@@ -70,18 +71,60 @@ def test_a_pair_is_ok_only_when_the_first_containing_tag_matches_and_the_sha_is_
 
 def test_write_replaces_its_own_block_and_nothing_else(repo, tmp_path: Path) -> None:
     mod, _work, s = repo
+    mod.pin_main()
     f = tmp_path / "STATUS.md"
     f.write_text(f"# status\nintro\n\n## The table\n| R1 | x | y | `rel {s['a']}` -> v0.1.0 | z |\n", encoding="utf-8")
-    mod.write_block(f, mod.ancestry(f.read_text(encoding="utf-8")))
+    t = f.read_text(encoding="utf-8"); f.write_text(mod.splice(t, mod.ancestry(t)), encoding="utf-8")
     once = f.read_text(encoding="utf-8")
     assert once.index(mod.START) < once.index("## The table") and "intro" in once
-    mod.write_block(f, mod.ancestry(f.read_text(encoding="utf-8")))
+    t = f.read_text(encoding="utf-8"); f.write_text(mod.splice(t, mod.ancestry(t)), encoding="utf-8")
     assert f.read_text(encoding="utf-8") == once, "a second write changes nothing"
     assert once.count(mod.START) == 1
 
 
 def test_the_state_header_names_main_the_tag_and_each_branch(repo) -> None:
     mod, _work, s = repo
+    mod.pin_main()
     out = mod.state(5)
     assert s["c"] in out and "newest tag: v0.2.0, 1 commits on main since it" in out
     assert "origin/seat/x" in out and "1 ahead, NOT merged" in out
+
+
+def test_git_that_cannot_answer_stops_the_tool_and_writes_nothing(repo, tmp_path: Path, capsys) -> None:
+    mod, work, _s = repo
+    f = tmp_path / "STATUS.md"
+    f.write_text("# s\n## t\n| R1 | x | y | `rel abcdef1` -> v0.1.0 | z |\n", encoding="utf-8")
+    before = f.read_text(encoding="utf-8")
+    mod.REF = "origin/nope"
+    assert mod.main(["ancestry", str(f), "--write"]) == 2 and f.read_text(encoding="utf-8") == before
+    assert "does not resolve" in capsys.readouterr().err
+    mod.REF = "origin/main"
+    mod.ROOT = str(tmp_path)                                     # not a repository
+    assert mod.main(["state"]) == 2
+
+
+def test_a_malformed_marker_pair_is_refused_and_a_marker_in_prose_is_not_a_marker(repo) -> None:
+    mod, _work, _s = repo
+    block = mod.START + "\nx\n" + mod.END
+    for bad in (mod.START + "\nonly start\n## t\n", mod.END + "\n" + mod.START + "\n", block + "\n" + block + "\n"):
+        with pytest.raises(ValueError):
+            mod.splice(bad, block)
+    prose = f"intro mentions `{mod.START}` inline\n## t\nbody\n"
+    out = mod.splice(prose, block)
+    assert out.startswith("intro") and out.count("\n" + mod.START) == 1 and out.index(block) < out.index("## t")
+
+
+def test_a_rel_cell_the_tool_cannot_read_is_a_row_not_a_silence(repo) -> None:
+    mod, _work, s = repo
+    mod.pin_main()
+    out = mod.ancestry(f"| R1 | a | b | `rel {s['a']}` -> v0.1.0; `rel zzz` -> v1 | z |\n| R2 | a | b | `rel {s['b']}` -> v0.2.0-rc1 | z |\n")
+    assert "UNPARSED" in out and "| R1 | `rel zzz`" in out
+
+
+def test_one_tag_claimed_for_a_comma_list_of_shas_checks_each(repo) -> None:
+    mod, _work, s = repo
+    mod.pin_main()
+    out = mod.ancestry(f"| R1 | a | b | `rel {s['a']}`, `rel {s['b']}` -> v0.1.0; `rel {s['a']}` -> v0.1.0 | z |\n")
+    lines = [ln for ln in out.splitlines() if ln.startswith("| R1")]
+    assert len(lines) == 3 and "UNPARSED" not in out
+    assert lines[0].rstrip().endswith("| ok |") and lines[1].rstrip().endswith("| DRIFT |")      # b first shipped in v0.2.0
