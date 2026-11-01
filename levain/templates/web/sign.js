@@ -311,7 +311,7 @@
     if (card) drawCardHead(body, card, msg);
     else body.appendChild(msg);
     // a card's headline IS the title: the header above it drops the request's title, so it is said once
-    if (card) $("sheet-title").hidden = true; else $("sheet-title").hidden = false;
+    { const t = $("sheet-title"); if (t) t.hidden = !!card; }
     // a dispatch job is shown whole (every path, every change): its box scrolls, it is never cut to fit
     if (dispatch) { msg.id = "sheet-contract"; msg.tabIndex = 0; Object.assign(msg.style, { maxHeight: "50vh", overflow: "auto" }); }
     if (r.expires_at) {
@@ -406,11 +406,18 @@
     const pick = $("sheet-pick"); if (pick) pick.remove();
     const miss = $("sheet-pick-miss"); if (miss) miss.remove();
     const until = $("sheet-open-until"); if (until) until.remove();
-    const m = /\(([^)]*)\):\s*([\s\S]*)$/.exec(String(line || ""));
+    // with the choice known, its own "(choice):" marks where the words begin; else the first one in the line does
+    const text = String(line || "");
+    const at = what ? text.indexOf("(" + what + "):") : -1;
+    const m = at >= 0 ? /^\(([^)]*)\):\s*([\s\S]*)$/.exec(text.slice(at)) : /\(([^)]*)\):\s*([\s\S]*)$/.exec(text);
     const choice = what || (m ? m[1] : "");
     const words = m && m[2] ? m[2] : "";
     let out = $("sheet-outcome");
-    if (!out) { out = el("p", "sheet-outcome"); out.id = "sheet-outcome"; const head = $("sheet-card"); if (head) head.after(out); else $("sheet-body").prepend(out); }
+    if (!out) {
+      // a live region is announced when its text changes after it is in the page, so it goes in empty and is filled after
+      out = el("p", "sheet-outcome"); out.id = "sheet-outcome"; out.setAttribute("role", "status");
+      const head = $("sheet-card"); if (head) head.after(out); else $("sheet-body").prepend(out);
+    }
     out.textContent = "Signed" + (choice ? " (" + choice + ")" : "") + (words ? ": " + words : "");
     // the exact record moves into the disclosure whole (same nodes, same ids), where "What exactly gets signed" opens it
     const home = $("sheet-signed");
