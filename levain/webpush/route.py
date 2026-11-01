@@ -42,6 +42,10 @@ ROUTE_WORDS = ROUTES   # the words the HTTP set takes for the route alone
 FILE_NAME = "route.json"
 AUTO_IDLE_SECS = 120.0   # the laptop's own input idle at least this long: the keyboard in use is not the one he is at
 _MAX_BYTES = 1024
+_NUM_LIMIT = 1e15
+AUTO_THROTTLE_SECS = 30.0   # the live path runs `who` at most this often; every ping would otherwise shell out
+_HOSTS_LOCAL = ("127.0.0.1", "::1", "localhost", "fe80:", "::ffff:127.")
+_throttle = {"at": None}
 _WHO = "/usr/bin/who"
 _WHO_TIMEOUT_SECS = 2.0
 _HOSTED = re.compile(r"\(([^()\s]+)\)\s*$")
@@ -52,7 +56,8 @@ def _path(queue_dir: Path | str) -> Path:
 
 
 def _num(v: object) -> bool:
-    return not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+    # compared, never passed to isfinite: an int of hundreds of digits overflows that call; nan and inf fail the compare
+    return not isinstance(v, bool) and isinstance(v, (int, float)) and abs(v) < _NUM_LIMIT
 
 
 def _load(queue_dir: Path | str | None) -> dict | None:
@@ -84,7 +89,11 @@ def _load(queue_dir: Path | str | None) -> dict | None:
     until = got.get("until")
     if until is not None and not _num(until):
         raise ValueError("bad until")
-    source = got.get("source") if got.get("source") in ("operator", "auto") else "operator"
+    if until is None and got["route"] == "desk":
+        raise ValueError("a desk record always ends")   # an endless desk would be an operator override nobody set
+    if got.get("source") not in ("operator", "auto"):
+        raise ValueError("unknown source")   # never promoted to an operator record
+    source = got["source"]
     return {"route": got["route"], "ts": float(got["ts"]), "source": source,
             "until": None if until is None else float(min(until, got["ts"] + MAX_SECS))}
 
@@ -95,7 +104,7 @@ def read_route(queue_dir: Path | str | None, now: float | None = None) -> tuple[
     t = time.time() if now is None else now
     try:
         rec = _load(queue_dir)
-    except ValueError:
+    except (ValueError, ArithmeticError):
         return "devices", "fault", None
     if rec is None or (rec["until"] is not None and t >= rec["until"]):
         return "desk", "default", None
@@ -148,7 +157,8 @@ def apply_route(queue_dir: Path | str, route: str, duration: str | None = None, 
     if source not in ("operator", "auto"):
         raise PresenceError(f"{source!r} is not a route source")
     ts = time.time() if now is None else now
-    secs = parse_duration(duration)
+    # an operator's Desk outlasts the hour an auto suggestion stands for, or it would be silently replaced
+    secs = float(MAX_SECS) if (route == "desk" and source == "operator" and not duration) else parse_duration(duration)
     if source == "auto":
         try:
             cur = _load(queue_dir)
@@ -187,13 +197,13 @@ def set_route(queue_dir: Path | str, route: str, duration: str | None = None, *,
 def remote_login_present(who_output: str) -> bool:
     """Whether ``who`` output lists a login from another host: a line whose tty is not ``console`` and that ends with a
     parenthesised host (an ssh or mosh session lists as ``user ttysNNN date (host)``). A local Terminal tab has no host and
-    does not count; neither does a display name such as ``(:0)``."""
+    does not count; neither does a display name such as ``(:0)`` or a loopback host."""
     for line in (who_output or "").splitlines():
         parts = line.split()
         if len(parts) < 3 or parts[1] == "console":
             continue
         m = _HOSTED.search(line)
-        if m and not m.group(1).startswith(":"):
+        if m and not m.group(1).startswith(":") and not m.group(1).lower().startswith(_HOSTS_LOCAL):
             return True
     return False
 
@@ -207,15 +217,28 @@ def _run_who() -> str:
         return ""   # no reading is no remote login
 
 
-def auto_suggest(queue_dir: Path | str, *, idle: float | None, who: str | None = None, now: float | None = None) -> bool:
+def auto_suggest(queue_dir: Path | str, *, idle: float | None, who: str | None = None, now: float | None = None,
+                 clock=time.monotonic) -> bool:
     """Set ``devices`` (source ``auto``, one hour) when a remote login is open, the laptop's own input has been idle at
     least :data:`AUTO_IDLE_SECS` (``idle`` seconds, ``None`` when unknown, which suggests nothing) and no route is
-    standing: neither an operator's unexpired record nor a ``devices`` already in force. Returns whether it wrote."""
-    if idle is None or not _num(idle) or idle < AUTO_IDLE_SECS:
+    standing: neither an operator's unexpired record nor a ``devices`` already in force. Returns whether it wrote.
+    An ``auto`` record ends as soon as the idle reads below the threshold (he is back at the keyboard). Called from the
+    delivery decision, so with ``who`` unset it runs at most once per :data:`AUTO_THROTTLE_SECS` by ``clock``
+    (monotonic, injectable); a caller giving ``who`` is not throttled."""
+    if who is None:
+        t = clock()
+        last = _throttle["at"]
+        if last is not None and 0 <= t - last < AUTO_THROTTLE_SECS:
+            return False
+        _throttle["at"] = t
+    if idle is None or not _num(idle):
+        return False
+    ts = time.time() if now is None else now
+    if idle < AUTO_IDLE_SECS:
+        _end_auto(queue_dir, ts)
         return False
     if not remote_login_present(_run_who() if who is None else who):
         return False
-    ts = time.time() if now is None else now
     try:
         with _locked(queue_dir, strict=True, wait=0.5):
             route, _source, _until = read_route(queue_dir, ts)
@@ -225,7 +248,24 @@ def auto_suggest(queue_dir: Path | str, *, idle: float | None, who: str | None =
             if wrote:
                 _log_best_effort(queue_dir, {"ts": ts, "word": "devices", "prior": {}, "outcome": "set",
                                              "why": "auto: a remote login is open and the laptop's input is idle"})
-            return wrote
     except PresenceError as e:
         print(f"levain route: auto suggestion skipped: {e}", file=sys.stderr)
         return False
+    if wrote:   # outside the lock: pings held as "active" are due now that the route is devices
+        from levain.webpush import held
+
+        held.flush_if_due(queue_dir, throttle=False)
+    return wrote
+
+
+def _end_auto(queue_dir: Path | str, ts: float) -> None:
+    if read_route(queue_dir, ts)[1] != "auto":
+        return
+    try:
+        with _locked(queue_dir, strict=True, wait=0.5):
+            if read_route(queue_dir, ts)[1] == "auto":
+                _write(queue_dir, None)
+                _log_best_effort(queue_dir, {"ts": ts, "word": "desk", "prior": {}, "outcome": "set",
+                                             "why": "auto route ended: input at the laptop again"})
+    except PresenceError as e:
+        print(f"levain route: auto route not ended: {e}", file=sys.stderr)

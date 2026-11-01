@@ -139,3 +139,84 @@ def test_who_failing_reads_as_no_remote_login(monkeypatch):
 
     monkeypatch.setattr(route.subprocess, "run", boom)
     assert route._run_who() == ""
+
+
+# ---- L3 r1 fixes -----------------------------------------------------------------------------------------------
+
+def _raw(tmp_path, text):
+    d = tmp_path / "webpush"
+    d.mkdir(exist_ok=True)
+    (d / route.FILE_NAME).write_text(text)
+
+
+@pytest.mark.parametrize("text", [
+    '{"route": "devices", "ts": 1, "until": %s, "source": "operator"}' % ("9" * 400),
+    '{"route": "devices", "ts": %s, "until": null, "source": "operator"}' % ("9" * 400),
+    '{"route": "desk", "ts": 1000000, "until": null, "source": "operator"}',
+    '{"route": "desk", "ts": 1000000, "until": 2000000}',
+    '{"route": "desk", "ts": 1000000, "until": 2000000, "source": "Operator"}',
+    '{"route": "desk", "ts": 1000000, "until": 2000000, "source": "root"}',
+    '{"route": "desk", "ts": 1000000, "until": 1e300, "source": "operator"}',
+])
+def test_a_malformed_record_reads_as_the_fault_never_as_an_operator_override(tmp_path, text):
+    _raw(tmp_path, text)
+    assert route.read_route(tmp_path, NOW) == ("devices", "fault", None)
+
+
+def test_loopback_hosts_are_not_remote_logins():
+    for host in ("127.0.0.1", "::1", "localhost", "fe80::1%lo0", "::ffff:127.0.0.1", "LOCALHOST"):
+        assert route.remote_login_present(f"phill ttys004 Nov 1 09:12 ({host})") is False, host
+    assert route.remote_login_present("phill ttys004 Nov 1 09:12 (203.0.113.7)") is True
+
+
+def test_an_auto_record_ends_when_he_is_back_at_the_keyboard_and_an_operator_one_does_not(tmp_path):
+    who = "phill ttys004 Nov 1 09:12 (203.0.113.7)"
+    assert route.auto_suggest(tmp_path, idle=900.0, who=who, now=NOW) is True
+    assert route.read_route(tmp_path, NOW + 1)[:2] == ("devices", "auto")
+    assert route.auto_suggest(tmp_path, idle=3.0, who=who, now=NOW + 2) is False
+    assert route.read_route(tmp_path, NOW + 3) == ("desk", "default", None)
+    route.set_route(tmp_path, "devices", "2h", now=NOW)
+    route.auto_suggest(tmp_path, idle=3.0, who=who, now=NOW + 2)
+    assert route.read_route(tmp_path, NOW + 3)[:2] == ("devices", "operator")
+
+
+def test_the_live_suggestion_runs_who_at_most_once_per_throttle_window(tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(route, "_run_who", lambda: ran.append(1) or "")
+    monkeypatch.setattr(route, "_throttle", {"at": None})
+    t = [100.0]
+    for _ in range(5):
+        route.auto_suggest(tmp_path, idle=900.0, now=NOW, clock=lambda: t[0])
+    assert len(ran) == 1
+    t[0] += route.AUTO_THROTTLE_SECS + 1
+    route.auto_suggest(tmp_path, idle=900.0, now=NOW, clock=lambda: t[0])
+    assert len(ran) == 2
+
+
+def test_should_push_drives_the_suggestion_and_the_same_call_pushes(tmp_path, monkeypatch):
+    monkeypatch.setattr(route, "_run_who", lambda: "phill ttys004 Nov 1 09:12 (203.0.113.7)")
+    monkeypatch.setattr(route, "_throttle", {"at": None})
+    d = presence.should_push(tmp_path, "ping", now=NOW, idle=lambda: 900.0)
+    assert d.push is True
+    assert route.read_route(tmp_path, NOW + 1)[:2] == ("devices", "auto")
+
+
+def test_an_operator_desk_defaults_to_a_day_and_devices_to_an_hour(tmp_path):
+    route.set_route(tmp_path, "desk", now=NOW)
+    assert route.read_route(tmp_path, NOW + 1)[2] == NOW + presence.MAX_SECS
+    route.set_route(tmp_path, "devices", now=NOW)
+    assert route.read_route(tmp_path, NOW + 1)[2] == NOW + presence.DEFAULT_SECS
+
+
+def test_a_failed_route_write_leaves_the_word_untouched_and_raises(tmp_path, monkeypatch):
+    set_word(tmp_path, "away", by=None, now=NOW)
+    before = presence.read_word(tmp_path)
+
+    def boom(*a, **k):
+        raise presence.PresenceError("route not written: disk")
+
+    monkeypatch.setattr(route, "apply_route", boom)
+    for word in ("back", "remote"):
+        with pytest.raises(presence.PresenceError):
+            set_word(tmp_path, word, by=None, now=NOW + 5)
+        assert presence.read_word(tmp_path) == before

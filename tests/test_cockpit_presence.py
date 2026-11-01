@@ -399,11 +399,17 @@ def test_the_view_carries_the_route_and_a_route_word_leaves_the_presence_word(ri
         assert _call(port, "POST", SET, {"word": "back"}, token=T)[1]["route"] == "desk"
 
 
-def test_the_view_suggests_devices_when_a_remote_desk_is_seen(rig, monkeypatch):
+def test_the_view_never_runs_the_suggestion_and_a_ping_decision_does(rig, monkeypatch):
+    from levain.webpush import presence as pres, route as route_mod
+
     src, q = rig
-    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 900.0)
-    monkeypatch.setattr("levain.webpush.route._run_who", lambda: "phill ttys004 Nov 1 09:12 (203.0.113.7)")
+    ran = []
+    monkeypatch.setattr("levain.webpush.route._run_who", lambda: ran.append(1) or "phill ttys004 Nov 1 09:12 (203.0.113.7)")
+    monkeypatch.setattr(route_mod, "_throttle", {"at": None})
     with _signed(src, q) as (port, _):
+        got = _call(port, "GET", GET, token=T)[1]
+        assert got["route"] == "desk" and not ran                    # a GET (a tap token's too) shells out to nothing
+        pres.should_push(q, "ping", idle=lambda: 900.0)
         got = _call(port, "GET", GET, token=T)[1]
         assert got["route"] == "devices" and got["route_source"] == "auto"
         _call(port, "POST", SET, {"word": "desk"}, token=T)
@@ -440,7 +446,8 @@ def test_a_revoke_before_the_route_write_refuses_it(rig, monkeypatch):
 def test_the_panel_script_carries_the_route_row():
     js = load_web_asset("devices_panel.js")
     js = js[0].decode() if isinstance(js, tuple) else js
-    for needle in ("Pings go to", "Devices", "suggested: a remote login is open", "route_source"):
+    for needle in ("Pings go to", "Devices", "suggested: a remote login is open", "route_source",
+                   "the route file is unreadable: pings are being pushed"):
         assert needle in js, needle
 
 
@@ -459,3 +466,17 @@ def test_the_route_buttons_post_the_route_word_and_show_the_suggestion(rig, tmp_
     assert out["values"][2].startswith("Devices")
     rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
     assert [r["word"] for r in rows] == ["devices", "desk"]
+
+
+def test_a_route_set_flushes_held_pings_outside_the_lock_and_without_the_spawn_gap(rig, monkeypatch):
+    from levain.webpush import held
+
+    src, q = rig
+    calls = []
+    monkeypatch.setattr(held, "flush_if_due", lambda queue, *, throttle=True: calls.append((queue, throttle)) or False)
+    with _signed(src, q) as (port, _):
+        for word in ("devices", "desk", "remote", "back"):
+            assert _call(port, "POST", SET, {"word": word}, token=T)[0] == 200
+        assert len(calls) == 4 and all(t is False for _, t in calls)
+        _call(port, "POST", SET, {"word": "away"}, token=T)
+        assert len(calls) == 4

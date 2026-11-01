@@ -2359,12 +2359,6 @@ class _Handler(GuardedHandler):
             rec = None
         from levain.webpush import route as route_mod
 
-        try:     # the open cockpit polls this: a remote desk is noticed here, with no model and no extra timer
-            from levain.consent.auto_away import input_idle_seconds
-
-            route_mod.auto_suggest(queue, idle=input_idle_seconds(), now=now)
-        except Exception:  # noqa: BLE001 - a suggestion that cannot run is no suggestion
-            pass
         route, route_source, route_until = route_mod.read_route(queue, now)
         view = {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
                 "route": route, "route_source": route_source, "route_until": route_until,
@@ -2436,6 +2430,13 @@ class _Handler(GuardedHandler):
             if tap is not None and isinstance(exc, presence_tokens.TokenRefused):
                 return {"error": exc.error, "message": str(exc)}, 403
             return {"error": "presence_refused", "message": str(exc)}, 422
+        if req["word"] in route_mod.ROUTE_WORDS or req["word"] in ("remote", "back"):
+            try:     # outside the presence lock: pings held as "active" are due now the route may read devices
+                from levain.webpush import held
+
+                held.flush_if_due(queue, throttle=False)
+            except Exception:  # noqa: BLE001 - a failed flush never fails the set
+                pass
         return self._presence_view(queue), 200
 
     def _presence_token_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":

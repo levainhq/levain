@@ -476,7 +476,7 @@ def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | 
 
 
 def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = None,
-                idle: Callable[[], float | None] | None = None) -> Decision:
+                idle: Callable[[], float | None] | None = None, suggest: bool = True) -> Decision:
     """:func:`decide` for a ``kind`` of ping against the word on file and the input idle time (``idle`` defaults to
     :func:`levain.consent.auto_away.input_idle_seconds`). Any fault reads as push: a missed ping is the worse error."""
     try:
@@ -485,7 +485,13 @@ def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = 
         from levain.webpush import route as _route
 
         at = time.time() if now is None else now
-        return decide(at, read_word(queue_dir), idle(), class_name=kind_class(kind),
+        reading = idle()
+        if suggest:   # delivery drives the suggestion (throttled there); a status read (``suggest=False``) never does
+            try:
+                _route.auto_suggest(queue_dir, idle=reading, now=at)
+            except Exception:  # noqa: BLE001 - its fault never changes the rule
+                pass
+        return decide(at, read_word(queue_dir), reading, class_name=kind_class(kind),
                       policy=read_policy(queue_dir)[0], route=_route.read_route(queue_dir, at)[0])
     except Exception:  # noqa: BLE001 - the rule failing must not silence the phone
         return Decision(True, "pushing", "the presence rule could not be read: pushing")
@@ -635,6 +641,7 @@ def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float
         except PresenceError as e:
             raise PresenceError(f"{e}: a setter's write with no record is not made") from e
     try:
+        _follow_route(queue_dir, word, duration, action, ts)   # first: a route failure leaves the word as it was
         if action == "write":
             _write(queue_dir, rec)
         elif action == "clear":
@@ -642,7 +649,6 @@ def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float
     except PresenceError as e:
         _log_best_effort(queue_dir, {**row, "outcome": "refused", "why": _clean(str(e), _WHY_MAX)})
         raise
-    _follow_route(queue_dir, word, duration, action, ts)
     if by is None:
         _log_best_effort(queue_dir, row)
     return rec if action == "write" else (None if action == "clear" else prior)
@@ -650,16 +656,13 @@ def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float
 
 def _follow_route(queue_dir: Path | str, word: str, duration: str | None, action: str, ts: float) -> None:
     """``remote`` is a preset (present + route devices for the same duration) and ``back`` is present + desk; the caller
-    holds the presence lock. The word is already written, so a route that cannot be written is reported, never raised."""
+    holds the presence lock. Runs BEFORE the word is written, so a route that cannot be written raises and the word is untouched."""
     if not ((word == "remote" and action == "write") or (word == "back" and action == "clear")):
         return
     from levain.webpush import route
 
-    try:
-        route.apply_route(queue_dir, "devices" if word == "remote" else "desk", duration if word == "remote" else None,
-                          source="operator", now=ts)
-    except PresenceError as e:
-        print(f"levain ping: route not set with `{word}`: {e}", file=sys.stderr)
+    route.apply_route(queue_dir, "devices" if word == "remote" else "desk", duration if word == "remote" else None,
+                      source="operator", now=ts)
 
 
 def _evidence(match: object) -> tuple[bool, float | None, str]:
@@ -878,7 +881,7 @@ def describe(queue_dir: Path | str, *, now: float | None = None,
         reading = idle()
     except Exception:  # noqa: BLE001 - no reading: the rule reads the desk as inactive
         reading = None
-    d = should_push(queue_dir, "ping", now=ts, idle=lambda: reading)
+    d = should_push(queue_dir, "ping", now=ts, idle=lambda: reading, suggest=False)
     if word is not None and word["word"] == "sleep" and reading is None and ts < word["ts"] + SLEEP_BLIND_SECS:
         end = time.strftime("%H:%M", time.localtime(word["ts"] + SLEEP_BLIND_SECS))
         d = Decision(d.push, d.state, f"{d.why}; idle source unavailable, so sleep ends at {end}", d.by)

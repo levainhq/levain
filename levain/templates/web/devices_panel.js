@@ -677,7 +677,7 @@
     rt.appendChild(prRoute);
     body.appendChild(rt);
     const dur = el("label", "pr-for");
-    dur.appendChild(el("span", "dev-meta", "For Quiet, Loud, Remote and Devices:"));
+    dur.appendChild(el("span", "dev-meta", "For:"));
     prSelect = el("select", "dev-label pr-duration");
     prSelect.setAttribute("aria-label", "How long");
     for (const [v, label] of PR_DURATIONS) { const o = el("option", null, label); o.value = v; prSelect.appendChild(o); }
@@ -743,7 +743,8 @@
     const r = v.route === "devices" ? "devices" : "desk";
     for (const [k, b] of Object.entries(prRouteBtns)) b.setAttribute("aria-pressed", k === r ? "true" : "false");
     const rl = PR_ROUTES.find((x) => x[0] === r)[1];
-    prRoute.textContent = r === "devices"
+    prRoute.textContent = v.route_source === "fault" ? rl + " (the route file is unreadable: pings are being pushed)"
+      : r === "devices"
       ? rl + (v.route_source === "auto" ? " (suggested: a remote login is open)" : "") + (v.route_until ? " (" + timeLeft(v.route_until) + ")" : "")
       : rl;
     if (Array.isArray(v.tokens)) paintTaps(v.tokens);
@@ -809,7 +810,7 @@
 
   function setRoute(r) {
     const body = { word: r };
-    if (r === "devices") body.for = prSelect.value;
+    body.for = prSelect.value;
     return writePresence(body);
   }
 
