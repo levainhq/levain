@@ -87,9 +87,12 @@ __all__ = [
 CRYSTAL_READS = frozenset({"active", "surface_rewarm_candidates"})
 """The crystal-store methods a consolidate legitimately needs, and nothing else.
 
-DERIVED FROM ANNEAL'S CALL SITES rather than from the class's public surface: these are the only two
-instance attributes ``anneal_memory.continuity`` reaches for on a crystal store across the whole
-``prepare_wrap`` → ``validated_save_continuity`` path. Both are pure reads (``active`` loads and
+DERIVED FROM ANNEAL'S CALL SITES rather than from the class's public surface: these are the instance
+attributes ``anneal_memory.continuity`` reaches for on a crystal store across the whole
+``prepare_wrap`` → ``validated_save_continuity`` path. Newer anneal also calls ``_pinned()``, which is NOT in this
+set: it returns ``(view, version)`` with ``view`` a raw store copy, so the guard handles it itself and returns
+``(<the same guard around view>, version)`` (see ``NoCrystallizeStore.__getattr__``); anneal 1.0.2 has no
+``_pinned`` and the attribute is simply absent. Both set members are pure reads (``active`` loads and
 filters; ``surface_rewarm_candidates`` loads, filters and ranks) — neither opens a transaction.
 
 ⚠ If a future anneal release makes the consolidate need another READ, this set is the one place to
@@ -173,6 +176,16 @@ class NoCrystallizeStore:
         # besides the dunders — is every attribute anneal asks for.
         if name in CRYSTAL_READS:
             return getattr(self._ncs_store, name)
+        if name == "_pinned":
+            real = getattr(self._ncs_store, "_pinned", None)  # absent on anneal 1.0.2: behave as before
+            if real is None:
+                raise CrystallizationRefused(name)
+
+            def _pinned_guarded() -> Any:
+                view, version = real()
+                return NoCrystallizeStore(view), version
+
+            return _pinned_guarded
         raise CrystallizationRefused(name)
 
     def __setattr__(self, name: str, value: Any) -> None:

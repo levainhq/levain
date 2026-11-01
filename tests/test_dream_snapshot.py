@@ -883,3 +883,28 @@ def test_j3_a_lock_or_scratch_failure_is_a_failed_drill_not_a_traceback(scratch,
     res = sn.drill(scratch, scratch.parent / "dream")
     assert res.outcome == "failed" and "scratch" in res.steps[-1]["detail"]
     assert lock_ledger == []
+
+
+# ------------------------------------------------------------------------- format 3 is taken only with revert_wrap
+
+def test_take_refuses_format_3_without_revert_wrap_and_names_why(scratch, monkeypatch):
+    monkeypatch.setattr(sn, "format_version", lambda db: 3)
+    monkeypatch.setattr(sn, "_has_revert_wrap", lambda: False)
+    r = dream(scratch, "o1", _VALID)
+    assert r.outcome == "snapshot-refused" and "revert_wrap" in r.detail and "3" in r.detail
+    assert not (occ(scratch, "o1") / "snap").exists()
+
+
+def test_take_refuses_any_other_format_even_with_revert_wrap(scratch, monkeypatch):
+    monkeypatch.setattr(sn, "format_version", lambda db: 4)
+    monkeypatch.setattr(sn, "_has_revert_wrap", lambda: True)
+    assert dream(scratch, "o1", _VALID).outcome == "snapshot-refused"
+
+
+def test_take_accepts_format_3_when_the_store_class_has_revert_wrap(scratch, monkeypatch):
+    monkeypatch.setattr(sn, "format_version", lambda db: 3)
+    monkeypatch.setattr(Store, "revert_wrap", lambda self, *a, **k: None, raising=False)
+    assert sn._has_revert_wrap() is True
+    with Store(str(scratch), section_schema=None) as s:
+        m = sn.take(s, occ(scratch, "o1"))
+    assert m["format_version"] == 3 and (occ(scratch, "o1") / "snap" / "manifest.json").is_file()

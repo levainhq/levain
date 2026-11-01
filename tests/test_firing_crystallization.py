@@ -129,3 +129,27 @@ def test_refuse_crystallization_returns_the_proxy_type():
 
 def test_repr_names_the_wrapped_store_for_debuggability():
     assert "_FakeCrystalStore" in repr(refuse_crystallization(_FakeCrystalStore()))
+
+
+class _PinnedCrystalStore(_FakeCrystalStore):
+    """anneal main: prepare_wrap calls ``_pinned()`` -> ``(view, version)`` with ``view`` a raw store copy."""
+
+    def _pinned(self):
+        return _FakeCrystalStore(), "v1"
+
+
+def test_pinned_returns_a_guarded_view_and_passes_the_version_through():
+    guard = refuse_crystallization(_PinnedCrystalStore())
+    view, version = guard._pinned()
+    assert version == "v1"
+    assert isinstance(view, NoCrystallizeStore)
+    assert view.active() == [{"name": "a_pattern", "level": 3}]
+    with pytest.raises(CrystallizationRefused):
+        view.crystallize("x")
+    with pytest.raises(CrystallizationRefused):
+        view.touch
+
+
+def test_without_pinned_on_the_real_store_the_attribute_is_refused_as_before():
+    with pytest.raises(CrystallizationRefused):
+        refuse_crystallization(_FakeCrystalStore())._pinned

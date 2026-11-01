@@ -44,7 +44,8 @@ DRILL_RECORD = "drill.json"
 #: Snapshots kept for occurrences that consolidated. Only the newest can be rolled back; the one before it is kept for
 #: the drill and for reading by hand.
 KEEP_SNAPSHOTS = 2
-#: The only store format with a proven rollback (text files are the authority; the db is never restored).
+#: The store format with a proven text-only rollback (text files are the authority; the db is never restored).
+#: Format 3 (REVERT_FORMAT) is also taken, but only when anneal has revert_wrap (see ``_has_revert_wrap``).
 SUPPORTED_FORMAT = 2
 DRILL_CADENCE_S = 7 * 24 * 3600
 #: The store format whose identity lives in the db: only anneal's ``revert_wrap`` can undo a save on it.
@@ -219,9 +220,13 @@ def take(store: Any, occ_dir: Path | None) -> dict[str, Any]:
     occ_dir = Path(occ_dir)
     db = _store_db(store)
     fmt = format_version(db)
-    if fmt != SUPPORTED_FORMAT:
-        raise SnapshotRefused(f"the store's format_version is {fmt!r}, not {SUPPORTED_FORMAT}: only format "
-                              f"{SUPPORTED_FORMAT} has a proven rollback, so the dream will not consolidate it")
+    # take/rollback symmetry, one test: format 3 is taken exactly when rollback() could undo it (revert_wrap exists).
+    if fmt != SUPPORTED_FORMAT and not (fmt == REVERT_FORMAT and _has_revert_wrap()):
+        why = (f"format {REVERT_FORMAT} is rollbackable only through anneal's revert_wrap, which this anneal-memory "
+               f"lacks; " if fmt == REVERT_FORMAT else "")
+        raise SnapshotRefused(f"the store's format_version is {fmt!r}, not {SUPPORTED_FORMAT}: {why}only format "
+                              f"{SUPPORTED_FORMAT} (or {REVERT_FORMAT} with revert_wrap) has a proven "
+                              "rollback, so the dream will not consolidate it")
     if store.get_wrap_started_at():
         raise SnapshotRefused("a wrap is open on this store; a snapshot now would capture a half-made wrap")
     if not str(getattr(store, "store_id", "") or ""):
@@ -369,17 +374,24 @@ def _refused(code: str, why: str) -> RollbackResult:
     return RollbackResult("refused", f"REFUSED ({code}): {why} Nothing was changed.", code=code)
 
 
+def _has_revert_wrap() -> bool:
+    """The one capability test: the installed anneal-memory ``Store`` has a callable ``revert_wrap`` (public surface
+    only). ``take`` (what may be snapshotted) and ``rollback`` (what may be undone) both ask this."""
+    try:
+        from anneal_memory import Store
+    except ImportError:
+        return False
+    return callable(getattr(Store, "revert_wrap", None))
+
+
 def _revert_store(db: Path) -> Any | None:
     """An open anneal ``Store`` on ``db`` when this anneal-memory has ``revert_wrap`` (public surface only: no table
     names, no version parsing), else None. A store that will not open is None too: the text-only rollback then runs
     and its own checks decide."""
+    if not _has_revert_wrap():
+        return None
     try:
         from anneal_memory import Store
-    except ImportError:
-        return None
-    if not callable(getattr(Store, "revert_wrap", None)):
-        return None
-    try:
         return Store(str(db), section_schema=None)
     except Exception:  # noqa: BLE001
         return None
