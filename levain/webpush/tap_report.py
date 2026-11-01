@@ -66,7 +66,12 @@ def record(queue_dir: str | os.PathLike[str], device_id: str | None, entries: li
                 if time.monotonic() >= deadline:
                     raise TraceBusy from None
                 time.sleep(0.02)
-        old = [ln for ln in _text(d).splitlines() if ln.strip()]
+        _sweep(d)
+        # a file that exists and cannot be read is an error (503), never an empty history to replace
+        try:
+            old = [ln for ln in (d / FILE).read_text(encoding="utf-8").splitlines() if ln.strip()]
+        except FileNotFoundError:
+            old = []
         lines = (old[-(KEEP - 1):] if KEEP > 1 else []) + [row]
         fd, tmp = tempfile.mkstemp(dir=d, prefix=FILE + ".")        # mode 0600
         try:
@@ -84,6 +89,18 @@ def record(queue_dir: str | os.PathLike[str], device_id: str | None, entries: li
         return len(lines)
     finally:
         os.close(lock)
+
+
+def _sweep(d: Path, *, older_than_secs: float = 3600.0) -> None:
+    """Remove a temp file a killed writer left (called under the lock, so no live writer owns one)."""
+    for p in d.glob(FILE + ".*"):
+        if p.name == FILE + ".lock":
+            continue
+        try:
+            if time.time() - p.stat().st_mtime > older_than_secs:
+                p.unlink()
+        except OSError:
+            pass
 
 
 def _text(d: Path) -> str:

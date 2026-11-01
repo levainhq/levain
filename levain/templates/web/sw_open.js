@@ -130,15 +130,18 @@
   // The trace REPORT: the ring posted to /webpush/trace with the key this paired page holds in localStorage (the same key
   // pair_card.js posts opens with), so a tap test needs only the tap and the operator reads the report at the laptop
   // (levain.webpush.tap_report). Every page that loads this script reports, so a tap landing on any of them is read. Step
-  // names, counts and path-only urls: no token, no ping body. Best effort and silent; one post per new ring head, compared by
-  // its cache key and never by clock order (a device clock that moved back must not hide a trace).
-  const SENT_KEY = "levain_trace_sent", BODY_MAX = 6500;   // bytes: the push family's body cap is 8192
-  let reporting = false;
+  // names, counts and path-only urls: no token, no ping body. Best effort and silent. One post per ring CONTENT: what is
+  // remembered is the whole list of cache keys joined, compared for equality only, so no clock order (a device clock that
+  // moved back) and no count can hide a new step. An answer that is not a settle (a refused key, 429, 5xx, no network) tries
+  // again, at most RETRIES more times, 20 s apart and then 40 s.
+  const SENT_KEY = "levain_trace_sent", BODY_MAX = 7600, RETRIES = 2;   // bytes: the push family's body cap is 8192
+  let reporting = false, retried = 0;
   async function reportTrace() {
     let key = "";
     try { key = window.localStorage.getItem("levain_write_token") || ""; } catch (_) { /* no storage: no key */ }
     if (reporting || !key || !haveCache) return;
     reporting = true;
+    let settled = true;
     try {
       const c = await caches.open(TRACE_CACHE);
       const got = [];
@@ -149,17 +152,23 @@
       }
       if (!got.length) return;
       got.sort((a, b) => (a.k < b.k ? -1 : 1));
-      const head = got[got.length - 1].k;
+      const sig = got.map((x) => x.k).join("|");
       let sent = "";
       try { sent = window.localStorage.getItem(SENT_KEY) || ""; } catch (_) { /* none */ }
-      if (head === sent) return;
+      if (sig === sent) return;
       let keep = got.map((x) => x.e);
-      while (keep.length > 1 && new TextEncoder().encode(JSON.stringify(keep)).length > BODY_MAX) keep = keep.slice(1);   // drop the oldest
+      const bodyOf = () => JSON.stringify({ page: location.pathname.slice(0, 100), entries: keep });
+      while (keep.length > 1 && new TextEncoder().encode(bodyOf()).length > BODY_MAX) keep = keep.slice(1);   // drop the oldest
+      settled = false;
       const res = await fetch("/webpush/trace", { method: "POST", cache: "no-store",
-        headers: { "Content-Type": "application/json", "X-Levain-Write-Token": key }, body: JSON.stringify({ page: location.pathname, entries: keep }) });
-      // settled by a 2xx or a 400 (this body will never be accepted); a refused key, a 429, a 5xx or a network failure retries
-      if ((res.status >= 200 && res.status < 300) || res.status === 400) { try { window.localStorage.setItem(SENT_KEY, head); } catch (_) { /* resent next time */ } }
-    } catch (_) { /* best effort: a report never reaches the page */ } finally { reporting = false; }
+        headers: { "Content-Type": "application/json", "X-Levain-Write-Token": key }, body: bodyOf() });
+      // settled by a 2xx, or a 400 or 413 (this body will never be accepted)
+      settled = (res.status >= 200 && res.status < 300) || res.status === 400 || res.status === 413;
+      if (settled) { try { window.localStorage.setItem(SENT_KEY, sig); } catch (_) { /* resent next time */ } }
+    } catch (_) { /* best effort: a report never reaches the page */ } finally {
+      reporting = false;
+      if (!settled && retried < RETRIES) { retried += 1; setTimeout(reportTrace, 20000 * retried); }
+    }
   }
   window.levainTraceReport = reportTrace;
   // a moment after this page's own first steps are written, and again when the app comes forward

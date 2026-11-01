@@ -58,6 +58,28 @@ def test_record_replaces_the_file_whole_privately_and_answers_busy_when_the_lock
     assert tap_report.record(tmp_path, None, [{"t": 3}]) == 4   # three kept raw lines (two unreadable) plus the new row
 
 
+def test_an_unreadable_report_file_is_an_error_not_an_empty_history_and_a_killed_writers_temp_is_swept(tmp_path: Path) -> None:
+    import os
+
+    tap_report.record(tmp_path, None, [{"t": 1}])
+    stale = tmp_path / (tap_report.FILE + ".abcd")
+    stale.write_text("x")
+    os.utime(stale, (1, 1))
+    fresh = tmp_path / (tap_report.FILE + ".live")
+    fresh.write_text("x")
+    os.chmod(tmp_path / tap_report.FILE, 0)
+    try:
+        if os.access(tmp_path / tap_report.FILE, os.R_OK):
+            pytest.skip("running as a user that reads mode 0 files")
+        with pytest.raises(OSError):
+            tap_report.record(tmp_path, None, [{"t": 2}])
+    finally:
+        os.chmod(tmp_path / tap_report.FILE, 0o600)
+    assert len(tap_report.reports(tmp_path)) == 1                      # the history is still there
+    tap_report.record(tmp_path, None, [{"t": 3}])
+    assert not stale.exists() and fresh.exists()
+
+
 def test_the_trace_route_answers_503_when_busy_or_unwritable(tmp_path: Path, monkeypatch) -> None:
     from levain.webpush import routes
 
@@ -89,7 +111,7 @@ def test_the_trace_route_needs_the_credential_and_files_a_report_the_reader_prin
 
 def test_every_page_that_loads_the_tap_script_reports_with_the_key_it_holds_and_pair_card_does_not() -> None:
     js = load_web_asset("sw_open.js")
-    assert '"/webpush/trace"' in js and '"X-Levain-Write-Token": key' in js and "TextEncoder" in js
+    assert '"/webpush/trace"' in js and '"X-Levain-Write-Token": key' in js and "TextEncoder" in js and "RETRIES" in js
     assert "reportTrace" not in load_web_asset("pair_card.js")
     for page in ("dashboard.html", "pair.html", "sign.html"):
         assert '<script src="/sw_open.js"></script>' in load_web_asset(page), page
@@ -115,9 +137,12 @@ def test_the_trace_is_reported_once_per_new_head_and_again_after_a_refusal(tmp_p
             {"eval": "window.levainTraceReport().then(() => window.__posts.length)"},                        # same head: silent
             {"eval": "window.__mode = 400; localStorage.removeItem('levain_trace_sent'); window.levainTraceReport().then(() => window.__posts.length)"},
             {"eval": "window.levainTraceReport().then(() => window.__posts.length)"},                        # a 400 settles it: no retry loop
+            {"eval": "caches.open('levain-trace').then((c) => c.put('/__levain_trace/0000000000001-z9', new Response(JSON.stringify({ t: 1, src: 'sw', step: 'older-clock' }))))"
+                     ".then(() => window.levainTraceReport()).then(() => window.__posts.length)"},               # a step that sorts BEFORE the head still reports
             {"eval": "JSON.stringify(window.__posts[1])"},
         ])
     v = out["values"]
     assert [int(v[2]), int(v[3]), int(v[4]), int(v[5]), int(v[6])] == [1, 2, 2, 3, 3], v
-    post = json.loads(v[7])
+    assert int(v[7]) == 4, v
+    post = json.loads(v[8])
     assert post["tok"] == "TKN" and [e["step"] for e in post["body"]["entries"] if e["step"] in ("s0", "s1", "s2")] == ["s0", "s1", "s2"], post   # the page's own steps ride along
