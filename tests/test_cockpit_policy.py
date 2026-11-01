@@ -231,10 +231,10 @@ def test_the_block_shows_when_the_device_list_is_gone_and_the_policy_is_not(rig,
     with _signed(src, q) as (port, _):
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
             {"until": "document.querySelector('.np-panel') && !document.querySelector('.np-panel').hidden", "ms": 20000},
-            {"eval": "(s=>s && !s.hidden)(document.querySelector('.dev-zone'))"},
+            {"eval": "(s=>s && !s.hidden)(document.getElementById('presence-settings'))"},
             {"eval": "[...document.querySelectorAll('.dev-panel')].map(p=>p.hidden)"},
         ])
-    assert out["values"][1] is True and out["values"][2] == [True, False, False]   # the section shows; the pairing panel does not, Presence and Notifications do
+    assert out["values"][1] is True and out["values"][2] == [True, False, False]   # the settings section shows; the pairing panel does not, the tap tokens and Notifications do
 
 
 @needs_browser

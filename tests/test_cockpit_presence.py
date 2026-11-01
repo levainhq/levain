@@ -333,35 +333,104 @@ def test_no_log_line_carries_a_tap_token(rig, caplog, capfd, monkeypatch):
     assert tok not in caplog.text and tok not in out.out and tok not in out.err
 
 
-# ---- the Presence block in the Devices panel --------------------------------------------------------------------------
+# ---- the Presence chip, its sheet and the settings section ------------------------------------------------------------
 
 from levain.web_server import load_web_asset
 from tests.test_pair_card_w1b import _drive, needs_browser
 
-_SHOWN = "document.querySelector('.pr-panel') && !document.querySelector('.pr-panel').hidden"
+_CHIP = "document.getElementById('presencebtn')"
+_SHOWN = f"{_CHIP} && !{_CHIP}.hidden"
+_OPEN = "!document.getElementById('pr-sheet').hidden"
+_CHIP_TEXT = f"{_CHIP}.querySelector('.pr-chip-t').textContent"
 
 
-def test_the_panel_script_carries_the_presence_block_and_no_client_name():
-    js = load_web_asset("devices_panel.js")
-    js = js[0].decode() if isinstance(js, tuple) else js
-    for needle in ("Presence", "/webpush/presence", "/webpush/presence/set", "/webpush/presence/token/new",
-                   "/webpush/presence/token/revoke", "Tap tokens", "X-Levain-Presence-Token", "Copy"):
+def _opened(extra: str = "") -> dict:
+    return {"do": f"{_CHIP}.click()", "until": _OPEN + extra, "ms": 8000}
+
+
+def _asset(name: str) -> str:
+    js = load_web_asset(name)
+    return js[0].decode() if isinstance(js, tuple) else js
+
+
+def test_the_page_carries_the_chip_and_the_script_the_sheet_and_no_client_name():
+    html = _asset("dashboard.html")
+    assert 'id="presencebtn"' in html and html.index('id="presencebtn"') < html.index('id="refresh"')
+    js = _asset("devices_panel.js")
+    for needle in ("/webpush/presence", "/webpush/presence/set", "/webpush/presence/token/new", "/webpush/presence/token/revoke",
+                   "Tap tokens", "X-Levain-Presence-Token", "Copy", "Presence settings", "presence-settings", "Pings go to",
+                   "Until back", "route_source", "the route file is unreadable: pings are being pushed"):
         assert needle in js, needle
 
 
 @needs_browser
-def test_the_block_renders_a_word_button_posts_its_body_and_a_new_tap_is_shown_once(rig, tmp_path, monkeypatch):
+def test_the_chip_reads_the_word_and_none_and_the_sheet_posts_each_body(rig, tmp_path, monkeypatch):
     src, q = rig
     with _signed(src, q) as (port, _):
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
             {"until": _SHOWN, "ms": 20000},
-            {"eval": "[...document.querySelectorAll('.pr-word')].map(b=>b.textContent)"},
-            {"eval": "document.querySelector('.pr-word.dev-primary').textContent"},
-            {"do": "document.querySelector('.pr-duration').value='4h'; document.querySelector('.pr-word[data-word=\"quiet\"]').click()",
-             "until": "document.querySelector('.pr-state').textContent.startsWith('Quiet')", "ms": 8000},
-            {"eval": "document.querySelector('.pr-state').textContent"},
-            {"do": "document.querySelector('.pr-word[data-word=\"away\"]').click()",
-             "until": "document.querySelector('.pr-state').textContent==='Away'", "ms": 8000},
+            {"eval": _CHIP_TEXT},
+            {"eval": f"[...document.querySelectorAll('#pr-sheet .pr-sheet-word')].map(b=>b.textContent)"},
+            _opened(),
+            {"eval": "document.getElementById('pr-sheet').contains(document.activeElement)"},
+            {"do": "document.querySelector('.pr-dur[data-for=\"2h\"]').click(); document.querySelector('.pr-sheet-word[data-word=\"quiet\"]').click()",
+             "until": f"{_CHIP_TEXT}.startsWith('Quiet \\u00b7 ')", "ms": 8000},
+            {"eval": _CHIP_TEXT},
+            {"eval": f"[document.getElementById('pr-sheet').hidden, document.activeElement===({_CHIP}), localStorage.getItem('levain_presence_for')]"},
+            _opened(),
+            {"do": "document.querySelector('.pr-sheet-word[data-word=\"away\"]').click()", "until": f"{_CHIP_TEXT}==='Away'", "ms": 8000},
+            _opened(),
+            {"do": "document.querySelector('.pr-route-btn[data-route=\"devices\"]').click()", "until": f"{_CHIP_TEXT}==='Away \\u00b7 devices'", "ms": 8000},
+            {"eval": f"fetch('/webpush/presence', {{headers: {{'X-Levain-Write-Token': '{T}'}}}}).then(r => r.json()).then(j => Math.round((j.route_until - Date.now() / 1000) / 3600))"},
+            _opened(),
+            {"do": "document.querySelector('.pr-dur[data-for=\"\"]').click(); document.querySelector('.pr-route-btn[data-route=\"desk\"]').click()",
+             "until": f"{_CHIP_TEXT}==='Away'", "ms": 8000},
+            _opened(),
+            {"do": "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))", "until": "document.getElementById('pr-sheet').hidden", "ms": 4000},
+            {"eval": f"document.activeElement===({_CHIP})"},
+            _opened(),
+            {"do": "document.body.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}))", "until": "document.getElementById('pr-sheet').hidden", "ms": 4000},
+        ])
+    v = out["values"]
+    assert v[1] == "Here"
+    assert v[2] == ["Here", "Away", "Quiet", "Sleep", "Loud", "Remote"]
+    assert v[4] is True                                                    # focus moved into the sheet
+    assert v[6].startswith("Quiet · ") and v[6].endswith(("m", "h"))
+    assert v[7] == [True, True, "2h"]                                      # closed after the write, focus back, the pick remembered
+    assert v[-2] is True
+    assert v[12] == 2                                                      # Devices took the picked 2h
+    rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
+    assert [(r["word"], r.get("duration")) for r in rows] == [("quiet", "2h"), ("away", None), ("devices", None), ("desk", None)]
+
+
+@needs_browser
+def test_a_standing_word_shows_in_the_chip_with_its_time_left(rig, tmp_path, monkeypatch):
+    src, q = rig
+    presence.set_word(q, "quiet", duration="1h")
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000},
+            {"eval": _CHIP_TEXT},
+            {"eval": f"{_CHIP}.getAttribute('aria-label')"},
+            {"eval": f"{_CHIP}.tagName"},
+        ])
+    v = out["values"]
+    assert v[1] == "Quiet · 1h" or v[1].startswith("Quiet · 59m")      # an hour from the moment it was set
+    assert v[2].startswith("Presence: Quiet") and v[3] == "BUTTON"
+
+
+@needs_browser
+def test_the_link_reveals_the_settings_and_a_tap_token_is_made_shown_once_and_revoked(rig, tmp_path, monkeypatch):
+    src, q = rig
+    settings = "document.getElementById('presence-settings')"
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN + f" && {settings} && !{settings}.hidden", "ms": 20000},
+            {"eval": f"{settings}.querySelector('.zone-title').textContent"},
+            {"eval": f"[...document.querySelectorAll('.pr-sheet-word')].length"},
+            _opened(),
+            {"do": "document.querySelector('.pr-sheet-link').click()", "until": "document.getElementById('pr-sheet').hidden", "ms": 4000},
+            {"eval": f"[document.activeElement.id, Math.round({settings}.getBoundingClientRect().top) < window.innerHeight]"},
             {"do": "document.querySelector('.pr-name').value='Door'; document.querySelector('.pr-new-form button[type=submit]').click()",
              "until": "!document.querySelector('.pr-new').hidden", "ms": 8000},
             {"eval": "document.querySelector('.pr-new .dev-url').value.length"},
@@ -371,13 +440,11 @@ def test_the_block_renders_a_word_button_posts_its_body_and_a_new_tap_is_shown_o
             {"do": "document.querySelector('.pr-revoke').click()", "until": "!document.querySelector('.pr-tap')", "ms": 8000},
         ])
     v = out["values"]
-    assert v[1] == ["Back", "Away", "Quiet", "Sleep", "Loud", "Remote"] and v[2] == "Back"
-    assert v[4].startswith("Quiet (") and "left" in v[4]
-    assert v[7] >= 40                                     # the token was shown
-    assert v[10][0] is True and "away, back, quiet, remote, desk, devices" in v[10][1]    # gone after a reload; the list names its words
+    assert v[1] == "Presence & notification settings"
+    assert v[5][0] == "presence-settings" and v[5][1] is True
+    assert v[7] >= 40                                                       # the token was shown
+    assert v[10][0] is True and "away, back, quiet, remote, desk, devices" in v[10][1]
     assert presence_tokens.list_public(q) == []
-    rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
-    assert [(r["word"], r.get("duration")) for r in rows[:2]] == [("quiet", "4h"), ("away", None)]
 
 
 # ---- the route axis over HTTP ------------------------------------------------------------------------------------
@@ -440,33 +507,6 @@ def test_a_revoke_before_the_route_write_refuses_it(rig, monkeypatch):
         monkeypatch.setattr(presence_tokens, "verify", lambda *a, **k: None)
         assert _call(port, "POST", SET, {"word": "devices"}, headers=_tap(tok))[0] == 403
         assert route.read_route(q)[0] == "desk"
-
-
-def test_the_panel_script_carries_the_route_row():
-    js = load_web_asset("devices_panel.js")
-    js = js[0].decode() if isinstance(js, tuple) else js
-    for needle in ("Pings go to", "Devices", "suggested: a remote login is open", "route_source",
-                   "the route file is unreadable: pings are being pushed"):
-        assert needle in js, needle
-
-
-@needs_browser
-def test_the_route_buttons_post_the_route_word_and_show_the_suggestion(rig, tmp_path, monkeypatch):
-    src, q = rig
-    with _signed(src, q) as (port, _):
-        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
-            {"until": _SHOWN, "ms": 20000},
-            {"do": "document.querySelector('.pr-route-btn[data-route=\"devices\"]').click()",
-             "until": "document.querySelector('.pr-route-btn[data-route=\"devices\"]').getAttribute('aria-pressed')==='true'", "ms": 8000},
-            {"eval": "document.querySelector('.pr-route-state').textContent"},
-            {"do": "document.querySelector('.pr-route-btn[data-route=\"desk\"]').click()",
-             "until": "document.querySelector('.pr-route-btn[data-route=\"desk\"]').getAttribute('aria-pressed')==='true'", "ms": 8000},
-            {"eval": "document.querySelector('.pr-route-state').textContent"},
-        ])
-    assert out["values"][2].startswith("Devices")
-    assert out["values"][-1].startswith("Desk") and "left" in out["values"][-1]   # an operator Desk ends too
-    rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
-    assert [r["word"] for r in rows] == ["devices", "desk"]
 
 
 def test_a_route_set_flushes_held_pings_outside_the_lock_and_without_the_spawn_gap(rig, monkeypatch):

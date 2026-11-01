@@ -3029,20 +3029,59 @@ body.ke #drop-recent { max-height: 40vh; overflow: auto; }
   .np-seg .ck-tab { flex: 1 1 0; min-height: var(--hit-min, 44px); }
 }
 
-/* ---- Presence block (devices_panel.js): the word, six buttons, the tap tokens. */
-.pr-state { margin: var(--sp-2) 0 var(--sp-2); font: var(--fw-semibold) var(--fs-lead, var(--fs-body))/1.3 var(--sans); color: var(--text); }
-.pr-words { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-4); }
-.pr-word[aria-pressed="true"] { background: var(--card-2); border-color: var(--text); }
-.pr-for { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-4); flex-wrap: wrap; }
-.pr-for .dev-label { flex: none; }
-.pr-endloud { margin-top: var(--sp-3); }
-.pr-taps { margin-top: var(--sp-6); }
+/* ---- Presence (devices_panel.js): the masthead chip, its sheet, and the compact settings section at the foot. ---- */
+.pr-chip[hidden] { display: none !important; }   /* the masthead's own button rules set display and would override [hidden] */
+body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
+.pr-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--ok); }
+.pr-chip[data-state="away"] .pr-dot, .pr-chip[data-state="remote"] .pr-dot { background: var(--warn); }
+.pr-chip[data-state="quiet"] .pr-dot, .pr-chip[data-state="sleep"] .pr-dot { background: var(--label); }
+.pr-chip[data-state="loud"] .pr-dot { background: var(--bad); }
+.pr-chip-t { font-variant-numeric: tabular-nums; }
+.pr-sheet { position: fixed; z-index: 40; top: var(--pr-top, 64px); left: var(--pr-left, 8px); width: min(340px, calc(100vw - 16px)); box-sizing: border-box;
+  padding: var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-lg); box-shadow: 0 12px 32px color-mix(in oklch, var(--base) 60%, transparent); }
+.pr-sheet[hidden] { display: none; }
+.pr-sheet-text { margin: 0 0 var(--sp-3); color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.4 var(--sans); }
+.pr-sheet-words { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-2); }
+.pr-sheet-row { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-3); }
+.pr-sheet-lab { flex: none; min-width: 5.5em; color: var(--label); font: var(--fw-regular) var(--fs-micro) var(--sans); }
+.pr-sheet-seg { flex: 1 1 auto; display: flex; gap: var(--sp-2); min-width: 0; }
+.pr-sheet-seg .pr-big { flex: 1 1 0; padding-inline: var(--sp-2); }
+.pr-big { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-3); font: var(--fw-semibold) var(--fs-meta)/1.1 var(--sans); color: var(--text); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-md); cursor: pointer; }
+.pr-big:hover { border-color: var(--text); }
+.pr-big:disabled { opacity: .5; cursor: default; }
+.pr-big[aria-pressed="true"] { background: var(--card-2); border-color: var(--text); }
+.pr-sheet-route { margin: var(--sp-2) 0 0; color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.4 var(--sans); }
+.pr-sheet-route[hidden], .pr-sheet-note[hidden] { display: none; }
+.pr-endloud { width: 100%; margin-top: var(--sp-3); }
+.pr-endloud[hidden] { display: none; }
+.pr-sheet-note { margin: var(--sp-3) 0 0; color: var(--bad); font: var(--fw-regular) var(--fs-micro)/1.4 var(--sans); }
+.pr-sheet-link { display: block; margin-top: var(--sp-4); padding-top: var(--sp-3); border-top: 1px solid var(--hair); color: var(--text); font: var(--fw-medium) var(--fs-meta) var(--sans); text-decoration: none; }
+.pr-sheet-link:hover { text-decoration: underline; }
+@media (max-width: 720px) {
+  /* a bottom sheet on a phone: the thumb's reach, full width */
+  .pr-sheet { top: auto; left: 0; right: 0; bottom: 0; width: auto; border-radius: var(--r-lg) var(--r-lg) 0 0; border-bottom: 0; padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom, 0px)); }
+  .pr-sheet-link { min-height: var(--hit-min, 44px); display: flex; align-items: center; }
+}
+@media (max-width: 480px) {
+  /* a phone's first row has no room for words beside the brand, Sync, Jump and the theme switch (the brand gives way there): the chip is a touch-sized dot; its colour, the aria-label and the sheet carry the state */
+  body.ke .masthead .indicators .pr-chip { width: var(--hit-min); padding: 0; justify-content: center; }
+  .pr-chip-t { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .pr-dot { width: 12px; height: 12px; }
+}
+/* the settings section: plain and short, not a stack of tall empty panels */
+body.ke .dev-zone.pr-settings .zone-head { display: flex; }
+.pr-settings { margin-top: var(--sp-6); }
+.pr-settings .zone-head { margin: 0 0 var(--sp-3); }
+.pr-settings .zone-title { margin: 0; }
+.pr-settings:focus { outline: none; }
+.pr-settings .dev-body { padding: var(--sp-1) var(--sp-5) var(--sp-4); }
+.pr-settings .dev-row { padding: var(--sp-3) 0; }
+.pr-settings .np-group { margin-top: var(--sp-3); }
+.pr-settings .pr-new-form { margin-top: var(--sp-3); }
+.pr-settings-grid { gap: var(--sp-4); }
 .pr-checks { display: flex; flex-wrap: wrap; gap: var(--sp-3); flex: 1 1 100%; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); }
 .pr-new .dev-url { width: 100%; margin: var(--sp-3) 0; }
-@media (max-width: 520px) {
-  .pr-word, .pr-revoke { min-height: var(--hit-min, 44px); }
-  .pr-words .pr-word { flex: 1 1 30%; }
-}
+@media (max-width: 520px) { .pr-revoke { min-height: var(--hit-min, 44px); } }
 
 /* ---- The sign sheet and /pair at every size (Phill 11-01: "why is it this narrow little strip on a huge empty page"). One page, drawn for the
    screen it is on. Below 800px nothing changes: the 420px card above, and the sheet (a grid of one column) reads in the order it always did:
