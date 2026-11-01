@@ -83,3 +83,16 @@ def test_the_door_is_declared_on_a_leaf_never_on_a_group():
     for declare in (door.door_ok, door.not_door):
         with pytest.raises(ValueError):
             declare(group)
+
+
+def test_no_group_of_verbs_carries_a_door_default():
+    """A default on a group reaches every leaf below it that declares nothing, whether it was set before or after the
+    group's subcommands were added (door_ok refuses a group, but a parser built with parents=[...] or a direct
+    set_defaults would not pass through it)."""
+    def walk(parser, path=()):
+        subs = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+        for sub in subs:
+            assert parser.get_default(door.DOOR_DEST) is None, f"group {' '.join(path) or 'levain'} carries a door default"
+            for name, child in sub.choices.items():
+                walk(child, (*path, name))
+    walk(build_parser())
