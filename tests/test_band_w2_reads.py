@@ -17,7 +17,7 @@ import pytest
 from levain import band_view
 from levain import web_server
 from levain.consent import band
-from levain.consent.questions import QuestionStore
+from levain.consent.questions import Link, QuestionStore
 from tests.test_band_pages import BAND_ROWS, DESKTOP, HISTORY
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _get, _install, _post, _serve
@@ -500,3 +500,84 @@ def test_item_answer_shapes_and_the_text_and_unoffered_pick_paths(tmp_path, lh):
         assert s == 200, (s, body)
     got = store.get(q1.n).answer
     assert (got.kind, got.value) == ("text", "linear backoff")
+
+
+# --- W2 session 3 fix: a REAL authority row (a question carrying a link, a question carrying a sign_request) -----------
+
+def _linked_question(store: QuestionStore):
+    """A question filed through the store's own writer with a link: the row a `levain ask --would-push` leaves."""
+    return store.file(agent="claude_code", agent_session_id="s2", what="Push the fix?", options=OPTS, rec="exp",
+                      blocks="the push", cwd="/w", link=Link("fix", "push", "req-1", "qid-1"))
+
+
+def _count_store_writes(monkeypatch) -> list:
+    writes: list = []
+    real = QuestionStore.answer_with_context
+
+    def spy(self, *a, **kw):
+        writes.append(1)
+        return real(self, *a, **kw)
+    monkeypatch.setattr(QuestionStore, "answer_with_context", spy)
+    return writes
+
+
+def _post_real_subject(base: str, q, body: dict) -> tuple[int, dict]:
+    """Post item_answer with the subject kind and version band.json really shows for ``q``."""
+    subj = _subject_of(base, q.id)
+    assert subj["kind"] == "question", subj
+    return _item_answer(base, {**subj, **body})
+
+
+def test_a_linked_question_is_refused_by_the_early_look_before_any_write(tmp_path, lh, monkeypatch):
+    """The early look (answer_item's own kind check) refuses a REAL linked question: 422, DB unchanged, and the store's
+    answer write is never reached (so the in-write check cannot be what refused it)."""
+    writes = _count_store_writes(monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _linked_question(store)
+    assert band_view._question_kind(store.get(q.n)) == "authority"
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        before = _db_bytes(store)
+        for body in ({"pick": "a"}, {"text": "go ahead"}):
+            s, resp = _post_real_subject(base, q, body)
+            assert s == 422 and resp["error"] == "authority_item", (body, s, resp)
+        assert _db_bytes(store) == before and store.get(q.n).answer is None
+    assert writes == [], "the refusal came from inside the write, not from the early look"
+
+
+def test_a_linked_question_that_slips_the_early_look_is_refused_inside_the_write(tmp_path, lh, monkeypatch):
+    """The in-write check (_still_version) alone: the early look is made to see an information row once, as a row that
+    changed between the look and the write would; the write's own check refuses, nothing is recorded."""
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _linked_question(store)
+    real = band_view._question_kind
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        subj = _subject_of(base, q.id)
+        first = {"seen": False}
+
+        def lies_once(row):
+            if not first["seen"]:
+                first["seen"] = True
+                return "information"
+            return real(row)
+        monkeypatch.setattr(band_view, "_question_kind", lies_once)
+        before = _db_bytes(store)
+        s, resp = _item_answer(base, {**subj, "pick": "a"})
+        assert first["seen"], "the early look was not reached"
+        assert s == 422 and resp["error"] == "authority_item", (s, resp)
+        assert _db_bytes(store) == before and store.get(q.n).answer is None
+
+
+def test_a_foreign_question_carrying_a_sign_request_is_refused_before_the_host_is_asked():
+    """No writer of the levain store sets sign_request (the kernel's store sets none), so the field is only real on a
+    host's row: the foreign path refuses it before question_versions / answer_versioned."""
+    from tests.test_band_reads import Host, fq
+
+    row = fq(1, "q-sign", sign_request="req-sign-1")
+    host = Host([row], {"q-sign": "v1"})
+    for kw in ({"pick": "a", "text": None}, {"pick": None, "text": "go"}):
+        with pytest.raises(band_view.AuthorityItem):
+            band_view.answer_item(host, {"kind": "question", "id": "q-sign", "version": "v1"}, channel="cockpit",
+                                  viewer=VIEWER, **kw)
+    assert host.answered == []

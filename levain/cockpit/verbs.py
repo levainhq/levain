@@ -679,7 +679,8 @@ def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, An
 def _item_answer_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
     """Answer ONE band item by its subject and version (W2): ``{kind, id, version}`` plus exactly one of ``pick`` (the
     displayed letter) or ``text``. No view is bound, so another tab's look cannot make it stale; the version is checked
-    inside the write (:func:`levain.band_view.answer_item`), so of two concurrent answers exactly one wins. A moved
+    inside the write (:func:`levain.band_view.answer_item`), so of two concurrent answers exactly one wins on the levain
+    store; a foreign host's answer is as atomic as that host's own ``answer_versioned``. A moved
     version is 409, an authority item 422 (it signs on its own card and never reaches the unsigned answer path), a pick
     the item does not offer 400; a host whose answer committed and whose delivery then failed is a warning, not a
     refusal. Unsigned, channel ``cockpit``, viewer ``cockpit:<credential>``; it authorises nothing."""
