@@ -23,7 +23,8 @@ Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newe
 - ``loud [duration|off]`` turns pings on for its duration, over every other parameter, a mute included; only its timer,
   ``loud off`` or any other word written over it (``set_word`` keeps one word on file) ends it, never ``back``.
 - ``away`` pushes at once until input at this machine more than :data:`AWAY_GRACE_SECS` after it (a line typed just
-  after saying it is the parting instruction). ``remote [duration]`` pushes for its duration. ``back`` clears
+  after saying it is the parting instruction). ``remote [duration]`` pushes for its duration and also sets the route to ``devices`` for it
+  (:mod:`levain.webpush.route`; ``back`` sets it to ``desk``). ``back`` clears
   ``away``, ``remote``, ``quiet`` and ``sleep``, and leaves the measurement to decide. All optional overrides.
 
 Desk activity is the macOS HID idle time (:func:`levain.consent.auto_away.input_idle_seconds`): measured, never
@@ -213,11 +214,13 @@ _CLASS_WORDS = {"approval": "approvals", "attention": "attention items", "other"
 
 
 def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False, class_name: str | None = None,
-           policy: dict | None = None) -> Decision:
+           policy: dict | None = None, route: str = "desk") -> Decision:
     """Whether a ping is pushed at ``now``. ``idle``: seconds since the operator's last input at this machine, ``None``
     when unknown. ``class_name`` is the ping's class (:func:`kind_class`); left unset, ``urgent`` stands for
     ``approval`` and not urgent for ``other``. ``policy`` is the cells (:func:`read_policy`), the shipped default when
-    unset: while ``quiet`` or ``sleep`` is active the cell for (word, class) decides push or hold. Pure."""
+    unset: while ``quiet`` or ``sleep`` is active the cell for (word, class) decides push or hold. ``route``
+    (:mod:`levain.webpush.route`) is ``desk`` or ``devices``: ``devices`` pushes an ordinary ping even while the desk is
+    active, after every mute and word above it. Pure."""
     if _active(word, "loud", now):
         return Decision(True, "pushing", "loud: pings on until its timer ends, over every other parameter")
     cls = class_name if class_name in CLASSES else ("approval" if urgent else "other")
@@ -247,6 +250,8 @@ def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = 
         return Decision(True, "pushing", "away: his word")
     if _active(word, "remote", now):
         return Decision(True, "pushing", "remote: his word")
+    if route == "devices":
+        return Decision(True, "pushing", "route: devices (his phone shows the band)")
     if seen is None:
         return Decision(True, "pushing", "no desk activity source: read as inactive")
     if idle is not None and idle >= ACTIVE_WINDOW_SECS:
@@ -477,8 +482,11 @@ def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = 
     try:
         if idle is None:
             from levain.consent.auto_away import input_idle_seconds as idle
-        return decide(time.time() if now is None else now, read_word(queue_dir), idle(), class_name=kind_class(kind),
-                      policy=read_policy(queue_dir)[0])
+        from levain.webpush import route as _route
+
+        at = time.time() if now is None else now
+        return decide(at, read_word(queue_dir), idle(), class_name=kind_class(kind),
+                      policy=read_policy(queue_dir)[0], route=_route.read_route(queue_dir, at)[0])
     except Exception:  # noqa: BLE001 - the rule failing must not silence the phone
         return Decision(True, "pushing", "the presence rule could not be read: pushing")
 
@@ -634,9 +642,24 @@ def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float
     except PresenceError as e:
         _log_best_effort(queue_dir, {**row, "outcome": "refused", "why": _clean(str(e), _WHY_MAX)})
         raise
+    _follow_route(queue_dir, word, duration, action, ts)
     if by is None:
         _log_best_effort(queue_dir, row)
     return rec if action == "write" else (None if action == "clear" else prior)
+
+
+def _follow_route(queue_dir: Path | str, word: str, duration: str | None, action: str, ts: float) -> None:
+    """``remote`` is a preset (present + route devices for the same duration) and ``back`` is present + desk; the caller
+    holds the presence lock. The word is already written, so a route that cannot be written is reported, never raised."""
+    if not ((word == "remote" and action == "write") or (word == "back" and action == "clear")):
+        return
+    from levain.webpush import route
+
+    try:
+        route.apply_route(queue_dir, "devices" if word == "remote" else "desk", duration if word == "remote" else None,
+                          source="operator", now=ts)
+    except PresenceError as e:
+        print(f"levain ping: route not set with `{word}`: {e}", file=sys.stderr)
 
 
 def _evidence(match: object) -> tuple[bool, float | None, str]:

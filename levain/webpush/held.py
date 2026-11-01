@@ -71,13 +71,14 @@ def count(queue_dir: Path | str | None) -> int:
 
 
 def plan(items: list[dict], word: dict | None, idle: float | None, now: float,
-         policy: dict | None = None) -> tuple[list[dict], list[dict]]:
+         policy: dict | None = None, route: str = "desk") -> tuple[list[dict], list[dict]]:
     """``(active, muted)``: which held ``items`` the rule releases at ``now``, as pings held for an active desk and
     pings held by a mute. Pure."""
     active: list[dict] = []
     muted: list[dict] = []
     for item in items:
-        d = presence.decide(now, word, idle, class_name=presence.kind_class(item["kind"]), policy=policy)
+        d = presence.decide(now, word, idle, class_name=presence.kind_class(item["kind"]), policy=policy,
+                        route=route)
         if item["reason"] == "active":
             if d.push:
                 active.append(item)
@@ -100,7 +101,10 @@ def _plan_now(queue_dir: Path | str, at: float, idle: Callable[[], float | None]
     items = PushStore(queue_dir).held_items(now=at)
     if not items:
         return [], []
-    return plan(items, presence.read_word(queue_dir), _idle_source(idle)(), at, presence.read_policy(queue_dir)[0])
+    from levain.webpush import route
+
+    return plan(items, presence.read_word(queue_dir), _idle_source(idle)(), at, presence.read_policy(queue_dir)[0],
+                route.read_route(queue_dir, at)[0])
 
 
 def _inside_spawn_gap(queue_dir: Path | str) -> bool:

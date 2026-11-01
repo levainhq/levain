@@ -618,15 +618,20 @@
   // ---- Presence: the word that says whether pings reach you, shown and set here, and the tap tokens a Shortcut or an NFC tag
   // uses to set it with no location. GET /webpush/presence reads it ({word, until, text, tokens}); POST /webpush/presence/set
   // {word, for?} writes it; /webpush/presence/token/new {name, words} and /revoke {name} manage the taps. Same token as every
-  // other write here; hidden on a 404 (no web push) or a refused token, on its own. The state is in the server's words (`text`).
+  // other write here; the route ({route, route_source, route_until}) says where an ordinary ping goes while you are active at the
+  // laptop: Desk holds it for the terminal band, Devices pushes it to your phone. {word:"desk"|"devices", for?} sets the route alone. Hidden on a 404 (no web push) or a refused token, on its own. The state is in the server's words (`text`).
   const PR_WORDS = [["back", "Back"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"], ["remote", "Remote"]];
+  const PR_ROUTES = [["desk", "Desk"], ["devices", "Devices"]];
+  const PR_TAP_WORDS = PR_WORDS.concat(PR_ROUTES);
   const PR_TIMED = ["quiet", "loud", "remote"];
   const PR_DURATIONS = [["15m", "15 minutes"], ["1h", "1 hour"], ["4h", "4 hours"], ["24h", "24 hours"]];
-  const PR_TAP_DEFAULT = ["away", "back", "quiet", "remote"];
+  const PR_TAP_DEFAULT = ["away", "back", "quiet", "remote", "desk", "devices"];
   const PR_WORD_GLOSS = { back: "pings reach you as usual", away: "held for your phone", quiet: "only what needs you reaches you",
                           sleep: "only what needs you reaches you, until you are active", loud: "everything reaches you",
-                          remote: "you are working from your phone" };
-  let prPanel = null, prState = null, prText = null, prBtns = {}, prSelect = null, prEndLoud = null, prNote = null, prTapList = null,
+                          remote: "you are working from your phone: sets Devices too" };
+  const PR_ROUTE_GLOSS = { desk: "held for the terminal while you are active at the laptop",
+                           devices: "pushed to your phone and cockpit even while you are active" };
+  let prPanel = null, prState = null, prText = null, prBtns = {}, prSelect = null, prRouteBtns = {}, prRoute = null, prEndLoud = null, prNote = null, prTapList = null,
       prNew = null, prName = null, prChecks = {}, prShown = null, prBusy = false, prGen = 0, prGone = false, prRefused = "", prCur = null;
 
   function buildPresence() {
@@ -654,8 +659,25 @@
       prBtns[w] = b; seg.appendChild(b);
     }
     body.appendChild(seg);
+    const rt = el("div", "pr-route");
+    rt.appendChild(el("span", "dev-meta", "Pings go to"));
+    const rseg = el("div", "pr-words pr-route-words");
+    rseg.setAttribute("role", "group");
+    rseg.setAttribute("aria-label", "Where pings go while you are active");
+    for (const [r, label] of PR_ROUTES) {
+      const b = el("button", "dev-btn pr-route-btn", label);
+      b.type = "button";
+      b.dataset.route = r;
+      b.title = PR_ROUTE_GLOSS[r];
+      b.addEventListener("click", () => setRoute(r));
+      prRouteBtns[r] = b; rseg.appendChild(b);
+    }
+    rt.appendChild(rseg);
+    prRoute = el("p", "dev-note pr-route-state");
+    rt.appendChild(prRoute);
+    body.appendChild(rt);
     const dur = el("label", "pr-for");
-    dur.appendChild(el("span", "dev-meta", "For Quiet, Loud and Remote:"));
+    dur.appendChild(el("span", "dev-meta", "For Quiet, Loud, Remote and Devices:"));
     prSelect = el("select", "dev-label pr-duration");
     prSelect.setAttribute("aria-label", "How long");
     for (const [v, label] of PR_DURATIONS) { const o = el("option", null, label); o.value = v; prSelect.appendChild(o); }
@@ -680,7 +702,7 @@
     prName.setAttribute("aria-label", "Name for the new tap token");
     form.appendChild(prName);
     const boxes = el("div", "pr-checks");
-    for (const [w, label] of PR_WORDS) {
+    for (const [w, label] of PR_TAP_WORDS) {
       const l = el("label", "pr-check");
       const c = el("input"); c.type = "checkbox"; c.value = w; c.checked = PR_TAP_DEFAULT.indexOf(w) >= 0;
       l.appendChild(c); l.appendChild(document.createTextNode(" " + label));
@@ -718,6 +740,12 @@
     prText.textContent = v.text || "";
     for (const [k, b] of Object.entries(prBtns)) b.setAttribute("aria-pressed", k === w || (k === "back" && !w) ? "true" : "false");
     prEndLoud.hidden = w !== "loud";
+    const r = v.route === "devices" ? "devices" : "desk";
+    for (const [k, b] of Object.entries(prRouteBtns)) b.setAttribute("aria-pressed", k === r ? "true" : "false");
+    const rl = PR_ROUTES.find((x) => x[0] === r)[1];
+    prRoute.textContent = r === "devices"
+      ? rl + (v.route_source === "auto" ? " (suggested: a remote login is open)" : "") + (v.route_until ? " (" + timeLeft(v.route_until) + ")" : "")
+      : rl;
     if (Array.isArray(v.tokens)) paintTaps(v.tokens);
     prShow(true);
   }
@@ -756,6 +784,7 @@
 
   function prDisable(on) {
     for (const b of Object.values(prBtns)) b.disabled = on;
+    for (const b of Object.values(prRouteBtns)) b.disabled = on;
     prEndLoud.disabled = on;
   }
   async function writePresence(body) {
@@ -778,6 +807,12 @@
     return writePresence(body);
   }
 
+  function setRoute(r) {
+    const body = { word: r };
+    if (r === "devices") body.for = prSelect.value;
+    return writePresence(body);
+  }
+
   let tapBusy = false;     // one tap-token change at a time: a second create would replace the first one's only shown secret
   async function tapCall(path, body) {
     prGen++; prSay("");
@@ -791,7 +826,7 @@
   }
   async function createTap() {
     const name = prName.value.trim();
-    const words = PR_WORDS.map((x) => x[0]).filter((w) => prChecks[w].checked);
+    const words = PR_TAP_WORDS.map((x) => x[0]).filter((w) => prChecks[w].checked);
     if (!name) { prSay("Give the tap token a name."); return; }
     if (!words.length) { prSay("Pick at least one word it may set."); return; }
     if (tapBusy) return;

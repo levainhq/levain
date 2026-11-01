@@ -21,10 +21,13 @@ from collections import deque
 from pathlib import Path
 
 from levain.webpush.presence import LOG_NAME as _LOG_NAME  # noqa: F401 - the same directory, one place
-from levain.webpush.presence import WORDS, PresenceError, _locked
+from levain.webpush.presence import WORDS as _PRESENCE_WORDS, PresenceError, _locked
+from levain.webpush.route import ROUTE_WORDS
+
+WORDS = _PRESENCE_WORDS + ROUTE_WORDS   # what a token may be listed for: the presence words and the two route words
 
 FILE_NAME = "presence_tokens.json"
-DEFAULT_WORDS = ("away", "back", "quiet", "remote")
+DEFAULT_WORDS = ("away", "back", "quiet", "remote", "desk", "devices")
 NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,40}$")
 MAX_TOKENS = 50
 _MAX_BYTES = 64 * 1024

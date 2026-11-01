@@ -7,6 +7,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ## [Unreleased]
 
 ### Added
+- **A route for pings: Desk or Devices.** Presence still says whether you are reachable; the new route says where an ordinary ping goes while you are active at the laptop. Desk holds it for the terminal band (as before); Devices pushes it to your phone and cockpit. `remote` is now a one-word preset (present + Devices) and `back` returns to Desk. When a login from another host is open and the laptop's own keyboard and mouse have been idle, Levain suggests Devices on its own; what you set always beats the suggestion. `GET /webpush/presence` gains `route`, `route_source` and `route_until`; `POST /webpush/presence/set {word: "desk"|"devices", for?}` sets the route alone, and tap tokens may carry both words (new tokens get them by default).
 - **Set your presence from a tap, and from the cockpit.** A Presence block in the Devices panel shows your word (away, back, quiet, sleep, loud, remote) and sets it; `GET /webpush/presence` and `POST /webpush/presence/set {word, for?}` do the same over HTTP. A tap token (`POST /webpush/presence/token/new`, shown once, stored only as a hash, revocable) lets one Apple Shortcut or NFC tag set the word with no location fix, and reaches nothing else: only the words you allow, ten writes a minute.
 
 ### Changed

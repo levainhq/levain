@@ -2357,7 +2357,17 @@ class _Handler(GuardedHandler):
         now = time.time()
         if rec is not None and presence.is_expired(rec, now):
             rec = None
+        from levain.webpush import route as route_mod
+
+        try:     # the open cockpit polls this: a remote desk is noticed here, with no model and no extra timer
+            from levain.consent.auto_away import input_idle_seconds
+
+            route_mod.auto_suggest(queue, idle=input_idle_seconds(), now=now)
+        except Exception:  # noqa: BLE001 - a suggestion that cannot run is no suggestion
+            pass
+        route, route_source, route_until = route_mod.read_route(queue, now)
         view = {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
+                "route": route, "route_source": route_source, "route_until": route_until,
                 "text": presence.describe(queue)}
         if self._credential_is_full():     # a tap token's holder is told the word, never the list of other taps
             from levain.webpush import presence_tokens
@@ -2373,7 +2383,7 @@ class _Handler(GuardedHandler):
         family's gate. ``for`` is the duration text of a timed word (``loud`` takes ``off``). A refusal is a 422 with its
         words, a lock held past the bounded wait a 503; the reply is the view after. The row names the credential
         (``via``), never the secret."""
-        from levain.webpush import presence
+        from levain.webpush import presence, route as route_mod
 
         try:
             req = json.loads(raw.decode("utf-8"))
@@ -2385,7 +2395,7 @@ class _Handler(GuardedHandler):
         queue = self.server.signer.queue_dir
         tap = None if self._credential_is_full() else self._presence_credential()
         if tap is not None:        # a tap token: only its own words, and only so fast (the counter is this server's)
-            if req["word"] in presence.WORDS and req["word"] not in tap["words"]:
+            if req["word"] in presence.WORDS + route_mod.ROUTE_WORDS and req["word"] not in tap["words"]:
                 allowed = ", ".join(tap["words"])
                 return {"error": "word_not_allowed",
                         "message": f"this tap token may set only: {allowed}"}, 403
@@ -2407,15 +2417,19 @@ class _Handler(GuardedHandler):
                 rec = presence_tokens.verify(queue, supplied)
                 if rec is None or rec["name"] != name:
                     raise presence_tokens.TokenRefused("forbidden", "this tap token is not valid")
-                if word in presence.WORDS and word not in rec["words"]:
+                if word in presence.WORDS + route_mod.ROUTE_WORDS and word not in rec["words"]:
                     raise presence_tokens.TokenRefused(
                         "word_not_allowed", f"this tap token may set only: {', '.join(rec['words'])}")
 
             def after() -> None:
                 presence_tokens.stamp(queue, name)
         try:
-            presence.set_word(queue, req["word"], duration=req.get("for") or None, by=None, via=via,
-                              wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
+            if req["word"] in route_mod.ROUTE_WORDS:      # the route alone: the presence word is left as it is
+                route_mod.set_route(queue, req["word"], req.get("for") or None, via=via,
+                                    wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
+            else:
+                presence.set_word(queue, req["word"], duration=req.get("for") or None, by=None, via=via,
+                                  wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
         except presence.PresenceBusy:
             return {"error": "presence_busy", "message": "the presence word is busy right now; nothing was changed, try again"}, 503
         except presence.PresenceError as exc:

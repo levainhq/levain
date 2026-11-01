@@ -168,7 +168,7 @@ def test_a_tap_token_is_minted_once_and_stored_only_as_a_hash(rig):
     src, q = rig
     with _signed(src, q) as (port, _):
         tok, got = _mint(port)
-        assert got["record"]["name"] == "door" and got["record"]["words"] == ["away", "back", "quiet", "remote"]
+        assert got["record"]["name"] == "door" and got["record"]["words"] == ["away", "back", "quiet", "remote", "desk", "devices"]
         assert "sha256" not in json.dumps(got)
         f = q / "webpush" / presence_tokens.FILE_NAME
         assert (f.stat().st_mode & 0o777) == 0o600
@@ -203,7 +203,7 @@ def test_the_allow_list_is_enforced_and_names_the_allowed_words(rig):
         tok, _ = _mint(port)
         for w in ("sleep", "loud"):
             st, got, _ = _call(port, "POST", SET, {"word": w}, headers=_tap(tok))
-            assert st == 403 and "away, back, quiet, remote" in got["message"], got
+            assert st == 403 and "away, back, quiet, remote, desk, devices" in got["message"], got
         assert presence.read_word(q) is None
         wide, _ = _mint(port, "bed", ["sleep", "loud"])
         assert _call(port, "POST", SET, {"word": "sleep"}, headers=_tap(wide))[0] == 200
@@ -374,7 +374,88 @@ def test_the_block_renders_a_word_button_posts_its_body_and_a_new_tap_is_shown_o
     assert v[1] == ["Back", "Away", "Quiet", "Sleep", "Loud", "Remote"] and v[2] == "Back"
     assert v[4].startswith("Quiet (") and "left" in v[4]
     assert v[7] >= 40                                     # the token was shown
-    assert v[10][0] is True and "away, back, quiet, remote" in v[10][1]    # gone after a reload; the list names its words
+    assert v[10][0] is True and "away, back, quiet, remote, desk, devices" in v[10][1]    # gone after a reload; the list names its words
     assert presence_tokens.list_public(q) == []
     rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
     assert [(r["word"], r.get("duration")) for r in rows[:2]] == [("quiet", "4h"), ("away", None)]
+
+
+# ---- the route axis over HTTP ------------------------------------------------------------------------------------
+def test_the_view_carries_the_route_and_a_route_word_leaves_the_presence_word(rig):
+    from levain.webpush import route
+
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        got = _call(port, "GET", GET, token=T)[1]
+        assert (got["route"], got["route_source"], got["route_until"]) == ("desk", "default", None)
+        presence.set_word(q, "quiet", duration="1h")
+        t0 = time.time()
+        st, got, _ = _call(port, "POST", SET, {"word": "devices", "for": "2h"}, token=T)
+        assert st == 200 and got["route"] == "devices" and got["route_source"] == "operator" and got["word"] == "quiet"
+        assert abs(got["route_until"] - (t0 + 7200)) < 30
+        assert _call(port, "POST", SET, {"word": "desk"}, token=T)[1]["route"] == "desk"
+        assert _call(port, "POST", SET, {"word": "remote"}, token=T)[1]["route"] == "devices"
+        assert route.read_route(q)[0] == "devices"
+        assert _call(port, "POST", SET, {"word": "back"}, token=T)[1]["route"] == "desk"
+
+
+def test_the_view_suggests_devices_when_a_remote_desk_is_seen(rig, monkeypatch):
+    src, q = rig
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 900.0)
+    monkeypatch.setattr("levain.webpush.route._run_who", lambda: "phill ttys004 Nov 1 09:12 (203.0.113.7)")
+    with _signed(src, q) as (port, _):
+        got = _call(port, "GET", GET, token=T)[1]
+        assert got["route"] == "devices" and got["route_source"] == "auto"
+        _call(port, "POST", SET, {"word": "desk"}, token=T)
+        got = _call(port, "GET", GET, token=T)[1]
+        assert got["route"] == "desk" and got["route_source"] == "operator"      # his word beats the suggestion
+
+
+def test_a_tap_token_with_devices_sets_the_route_and_one_without_is_refused(rig):
+    from levain.webpush import route
+
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        narrow, _ = _mint(port, "narrow", ["away"])
+        st, got, _ = _call(port, "POST", SET, {"word": "devices"}, headers=_tap(narrow))
+        assert st == 403 and "away" in got["message"] and route.read_route(q)[0] == "desk"
+        tok, _ = _mint(port)
+        st, got, _ = _call(port, "POST", SET, {"word": "devices"}, headers=_tap(tok))
+        assert st == 200 and got["route"] == "devices"
+        log = (q / "webpush" / presence.LOG_NAME).read_text()
+        assert json.loads(log.splitlines()[-1])["via"] == "presence:door"
+
+
+def test_a_revoke_before_the_route_write_refuses_it(rig, monkeypatch):
+    from levain.webpush import route
+
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok, _ = _mint(port)
+        monkeypatch.setattr(presence_tokens, "verify", lambda *a, **k: None)
+        assert _call(port, "POST", SET, {"word": "devices"}, headers=_tap(tok))[0] == 403
+        assert route.read_route(q)[0] == "desk"
+
+
+def test_the_panel_script_carries_the_route_row():
+    js = load_web_asset("devices_panel.js")
+    js = js[0].decode() if isinstance(js, tuple) else js
+    for needle in ("Pings go to", "Devices", "suggested: a remote login is open", "route_source"):
+        assert needle in js, needle
+
+
+@needs_browser
+def test_the_route_buttons_post_the_route_word_and_show_the_suggestion(rig, tmp_path, monkeypatch):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000},
+            {"do": "document.querySelector('.pr-route-btn[data-route=\"devices\"]').click()",
+             "until": "document.querySelector('.pr-route-btn[data-route=\"devices\"]').getAttribute('aria-pressed')==='true'", "ms": 8000},
+            {"eval": "document.querySelector('.pr-route-state').textContent"},
+            {"do": "document.querySelector('.pr-route-btn[data-route=\"desk\"]').click()",
+             "until": "document.querySelector('.pr-route-btn[data-route=\"desk\"]').getAttribute('aria-pressed')==='true'", "ms": 8000},
+        ])
+    assert out["values"][2].startswith("Devices")
+    rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
+    assert [r["word"] for r in rows] == ["devices", "desk"]
