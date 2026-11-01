@@ -5,6 +5,7 @@ run in headless Chrome when it is installed."""
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -61,39 +62,112 @@ def test_only_a_recent_decision_stays_on_the_strip() -> None:
     assert got == [True, True, False, False, False, False, False]
 
 
-def test_the_strip_keeps_answered_cards_apart_from_everything_that_counts() -> None:
-    assert "items: (lines) => needsWaiting(needsItems(lines))" in CORE      # the glance tile and the push badge read waiting items only
-    assert "needsWaiting(needsItems(((currentView" in CORE                  # the focus view still closes when its item is answered
-    assert "answered.push({ kind: \"question\", q: ln.question, answered: true })" in CORE
-
-
 OPTIONS = [("ship", "Ship it tonight"), ("hold", "Hold for the morning")]
+DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
+
+
+def _file(store: QuestionStore, what: str, agent: str = "claude_code"):
+    return store.file(agent=agent, agent_session_id="s-" + what[:4], what=what, options=OPTIONS, rec="hold", blocks="the sweep", cwd="/w")
+
+
+def _values(out: dict, marker: str) -> dict:
+    return [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and marker in v][0]
+
+
+def _home(tmp_path: Path, monkeypatch) -> QuestionStore:
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    (home / "consent").mkdir(parents=True, mode=0o700)
+    return QuestionStore(home / "consent")
+
+
+# the selector the page's "Needs you" tab jumps to, read from the page source so the test follows it
+JUMP_SELECTOR = re.search(r'needs: "([^"]+)"', CORE[CORE.index("const PHONE_JUMP_TARGET"):]).group(1)
+
+# Both strip states read the page in build mode, where only the bar draws the strip: an answered card is not drawn there
+STRIP = ("JSON.stringify({rows: document.querySelectorAll('#ck-needs .needs-row').length,"
+         " headline: !!document.querySelector('#ck-needs .needs-headline'), pill: !!document.querySelector('#ck-needs .needs-count'),"
+         " count: (document.querySelector('#ck-needs .needs-headline .needs-count') || {}).textContent || null,"
+         " history: !!document.querySelector('#ck-needs .needs-history'),"
+         " waiting: !!document.querySelector('#ck-needs[data-waiting]'),"
+         " jump: !!document.querySelector(%s),"
+         " cards: document.querySelectorAll('#ck-needs .needs-answered .needs-card').length,"
+         " label: (document.querySelector('#ck-needs .needs-answered .needs-sec-label') || {}).textContent || null,"
+         " ticking: document.querySelectorAll('#ck-needs .needs-settled-tag [data-age-at]').length,"
+         " lines: [...document.querySelectorAll('#ck-needs .needs-answered .consent-note')].map(n => n.textContent),"
+         " strip: 1})") % json.dumps(JUMP_SELECTOR)
+BUILD_HIDES = ("(window.LevainCockpitKinds.applyMode('build', true), JSON.stringify({hidden: [...document.querySelectorAll('#ck-needs .needs-answered')]"
+               ".every(n => getComputedStyle(n).display === 'none'), n: document.querySelectorAll('#ck-needs .needs-answered').length, build: 1}))")
 
 
 @needs_browser
 def test_an_answered_card_shows_its_answer_and_moves_no_count(tmp_path: Path, monkeypatch) -> None:
-    home = tmp_path / "levain_home"
-    monkeypatch.setenv("LEVAIN_HOME", str(home))
-    (home / "consent").mkdir(parents=True, mode=0o700)
-    store = QuestionStore(home / "consent")
-    done = store.file(agent="claude_code", agent_session_id="s1", what="Ship the sweep fix tonight?", options=OPTIONS, rec="hold",
-                      blocks="the sweep", cwd="/w")
-    waiting = store.file(agent="codex", agent_session_id="s2", what="Which branch do we cut from?", options=OPTIONS, rec="ship",
-                         blocks="the cut", cwd="/w")
+    store = _store = _home(tmp_path, monkeypatch)
+    done = _file(store, "Ship the sweep fix tonight?")
+    _file(store, "Which branch do we cut from?", agent="codex")
     store.answer(done.n, option="ship", channel="cli")
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
-            {"emulate": {"w": 1440, "h": 900, "dpr": 1}},
-            {"until": "document.querySelector('#ck-needs .needs-settled .consent-note') && 1", "ms": 30000},
-            {"eval": "JSON.stringify({rows: document.querySelectorAll('#ck-needs .needs-row').length,"
-                     " count: document.querySelector('#ck-needs .needs-headline .needs-count').textContent,"
-                     " settled: document.querySelectorAll('#ck-needs .needs-settled').length,"
-                     " line: document.querySelector('#ck-needs .needs-settled .consent-note').textContent,"
-                     " buttons: document.querySelectorAll('#ck-needs .needs-settled .question-option, #ck-needs .needs-settled .question-send').length,"
-                     " open: [...document.querySelectorAll('#ck-needs .needs-row')].map(r => r.dataset.needsId)})"},
-        ])["values"]
-    seen = [json.loads(v) for v in out if isinstance(v, str) and v.startswith("{") and '"settled"' in v][0]
-    assert seen["rows"] == 1 and seen["count"] == "1" and seen["settled"] == 1 and seen["buttons"] == 0, seen
-    assert seen["line"].startswith("Answered: ship · Ship it tonight") and seen["line"].endswith("via cli"), seen
-    assert waiting.n and len(seen["open"]) == 1
+            DESKTOP, {"until": "document.querySelector('#ck-needs .needs-answered .consent-note') && 1", "ms": 30000},
+            {"eval": STRIP}, {"eval": BUILD_HIDES}])
+    seen, build = _values(out, '"strip"'), _values(out, '"build"')
+    assert seen["rows"] == 1 and seen["count"] == "1" and seen["cards"] == 1 and seen["waiting"] and seen["jump"], seen
+    assert seen["label"] == "Just answered" and seen["ticking"] == 1, seen     # the age in the tag is the page's ticking one
+    assert seen["lines"][0].startswith("Answered: ship \u00b7 Ship it tonight") and seen["lines"][0].endswith("via cli"), seen
+    assert build == {"hidden": True, "n": 1, "build": 1}, build                 # build and memory draw the bar alone
+
+
+@needs_browser
+def test_a_strip_of_only_answered_cards_has_no_headline_pill_or_jump_and_keeps_three(tmp_path: Path, monkeypatch) -> None:
+    store = _home(tmp_path, monkeypatch)
+    for k in range(5):
+        store.answer(_file(store, f"Question number {k} to settle?").n, option="hold", channel="cockpit")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            DESKTOP, {"until": "document.querySelector('#ck-needs .needs-answered .consent-note') && 1", "ms": 30000},
+            {"eval": STRIP}, {"eval": BUILD_HIDES}])
+    seen, build = _values(out, '"strip"'), _values(out, '"build"')
+    assert seen["headline"] is False and seen["pill"] is False and seen["history"] is False and seen["rows"] == 0, seen
+    assert seen["waiting"] is False and seen["jump"] is False, seen              # the "Needs you" tab has nothing to jump to
+    assert seen["cards"] == 3 and seen["label"] == "Just answered", seen         # five answered, the newest three kept
+    assert build["hidden"] is True and build["n"] == 1, build
+
+
+ROWS = "[...document.querySelectorAll('#levain-modal [data-question-row]')]"
+ROWS_STATE = ("JSON.stringify({rows: %s.length, drawn: %s.filter(r => r.querySelector('.consent-body')).length,"
+              " drawnNoButton: %s.filter(r => r.querySelector('.consent-body') && !r.querySelector('.consent-details')).length,"
+              " buttons: %s.filter(r => r.querySelector('.consent-details')).length,"
+              " blank: %s.filter(r => { const b = r.querySelector('.consent-body'); return b && b.textContent.trim() === ''; }).length, rowsstate: 1})"
+              % ((ROWS,) * 5))
+
+
+def _history_steps(settle: str) -> list[dict]:
+    return [DESKTOP, {"until": "window.LevainNeeds && window.LevainNeeds.history && 1", "ms": 30000},
+            {"eval": "window.LevainNeeds.history(null) ? 1 : 0"}, {"until": f"{ROWS}.length === 7 && 1", "ms": 30000},
+            {"until": settle, "ms": 15000}, {"eval": ROWS_STATE}]
+
+
+@needs_browser
+def test_only_the_five_newest_answered_rows_draw_their_answer_unasked(tmp_path: Path, monkeypatch) -> None:
+    store = _home(tmp_path, monkeypatch)
+    for k in range(7):
+        store.answer(_file(store, f"Question number {k} to settle?").n, option="ship", channel="cli")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        got = _values(_drive(tmp_path, f"{url}/#write_token=T", _history_steps(f"{ROWS}.filter(r => r.querySelector('.consent-body')).length >= 5")),
+                      '"rowsstate"')
+    assert got["rows"] == 7 and got["drawn"] == 5 and got["drawnNoButton"] == 5 and got["buttons"] == 2 and got["blank"] == 0, got
+
+
+@needs_browser
+def test_a_row_whose_read_fails_draws_no_blank_slot(tmp_path: Path, monkeypatch) -> None:
+    """No page token: every body read is refused. The rows keep their details button and carry no empty body."""
+    store = _home(tmp_path, monkeypatch)
+    for k in range(7):
+        store.answer(_file(store, f"Question number {k} to settle?").n, option="ship", channel="cli")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        got = _values(_drive(tmp_path, f"{url}/", _history_steps("true")), '"rowsstate"')
+    assert got["rows"] == 7 and got["drawn"] == 0 and got["buttons"] == 7 and got["blank"] == 0, got

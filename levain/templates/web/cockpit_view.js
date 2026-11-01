@@ -371,6 +371,7 @@
                             options: isNum(f.question_options) ? f.question_options : 0,
                             age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                             decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
+                            decidedAt: typeof f.decided_at === "string" ? f.decided_at : "",
                             offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct"),
                             sign: signOf(f) };
         }

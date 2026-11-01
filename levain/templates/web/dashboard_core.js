@@ -4542,6 +4542,13 @@
     if (!F || typeof F.drawBody !== "function" || !text) return null;
     try { return F.drawBody(el("div", "card-body needs-q-body"), text, dropping, options, rec); } catch (e) { return null; }
   }
+  // the answered questions among a panel's lines, newest decision first, at most `max` of them (a Set of the line.question objects)
+  const ANSWERED_ROWS_EAGER = 5;
+  function newestAnswered(lines, max) {
+    const at = (q) => { const ms = Date.parse(q.decidedAt); return Number.isFinite(ms) ? ms : 0; };
+    return new Set((Array.isArray(lines) ? lines : []).map((ln) => ln && ln.question).filter((q) => q && q.state === "answered")
+      .sort((a, b) => at(b) - at(a)).slice(0, max));
+  }
   // The one line an answered question carries on every surface: "Answered: K · label | his words · signed | unsigned · time · via channel".
   // `signed` null (the store cannot say) adds nothing; an unreadable time adds nothing. Every string is the agent's or the operator's and
   // is drawn as text only.
@@ -4792,7 +4799,8 @@
     slot.setAttribute("data-band-read", read);
     applyBandNumbers();
   }
-  function questionRow(o) {
+  // `eager`: this answered row is among the newest the panel draws (appendExternalLines), so its answer is fetched without the click
+  function questionRow(o, eager) {
     const q = o.question;
     const open = q.state === "open";
     const row = el("div", "row consent-row question-row" + (open ? " ext-accent" : " ext-dim"));
@@ -4825,11 +4833,14 @@
       });
     });
     head.appendChild(btn);
-    if (!open) {
-      // an answered row shows how it was answered without the click; the details button stays for a failed read's retry
-      if (!slot) { slot = el("div", "consent-body ext-meta"); row.appendChild(slot); }
+    if (!open && eager) {
+      // one of the newest answered rows shows how it was answered without the click. The slot exists only once the read gave an
+      // answer, so a failed, token-less or answer-less read leaves no blank space and the details button as it was; the rest of
+      // the answered rows draw on that click.
       questionBody(q, row).then((b) => {
-        if (!b || b.error) return;
+        if (slot || !b || b.error || !b.answer || typeof b.answer !== "object") return;
+        slot = el("div", "consent-body ext-meta");
+        row.appendChild(slot);
         drawQuestionBody(q, slot, b);
         btn.remove();
       });
@@ -5776,11 +5787,15 @@
     }
     const due = (it) => { const ms = Date.parse(it.c.expiresAt); return Number.isFinite(ms) ? ms : Infinity; };
     consents.sort((a, b) => due(a) - due(b));   // Array.prototype.sort is stable: equal expiries keep the kernel's order
-    return questions.concat(consents, answered);
+    // the strip keeps the newest few: a morning of answers is not a second queue. A question with no readable decision age
+    // (an empty decidedAge) is not in the strip by intent: the window cannot be told for it.
+    const keep = newestAnswered(answered.map((it) => ({ question: it.q })), NEEDS_ANSWERED_MAX);
+    const byQ = new Map(answered.map((it) => [it.q, it]));
+    return questions.concat(consents, Array.from(keep).map((q) => byQ.get(q)));
   }
   // an item the strip shows only so the answer given stays visible for a while: it waits on nothing and is never counted
   const needsWaiting = (items) => items.filter((it) => !it.answered);
-  const NEEDS_ANSWERED_MINUTES = 30;
+  const NEEDS_ANSWERED_MINUTES = 30, NEEDS_ANSWERED_MAX = 3;
   // decidedAge is the row's relative label ("40s ago", "12m ago"); only seconds and minutes under the window qualify
   function decidedRecently(label) {
     const m = /^(\d+)([sm]) ago$/.exec(typeof label === "string" ? label : "");
@@ -6014,14 +6029,21 @@
     else slot.textContent = "this request has no id";
     return card;
   }
+  // "answered <age>" with an age the page's age timer keeps current; a line with no stamp shows the label it was given
+  function settledTag(q) {
+    const tag = el("span", "ext-meta needs-left needs-settled-tag", "answered ");
+    const K = window.LevainCockpitKinds;
+    if (q.decidedAt && K && K.ageSpan) tag.appendChild(K.ageSpan(q.decidedAt));
+    else tag.appendChild(document.createTextNode(q.decidedAge || ""));
+    return tag;
+  }
   function questionCard(q) {
     const card = el("div", "needs-card needs-question is-full");
     card.dataset.needsCard = "question";
     card._needsItem = { kind: "question", q };
     const settled = q.state === "answered";
     if (settled) card.classList.add("needs-settled");
-    needsHead(card, settled ? el("span", "ext-meta needs-left needs-settled-tag", "answered" + (q.decidedAge ? " " + q.decidedAge : ""))
-      : (q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null));
+    needsHead(card, settled ? settledTag(q) : (q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null));
     const slot = el("div", "needs-body ext-meta", "reading the question…");
     card.appendChild(slot);
     questionBody(q, card).then((b) => {
@@ -6034,6 +6056,7 @@
     host.replaceChildren();
     host.hidden = true;
     delete host.dataset.sig;
+    delete host.dataset.waiting;
   }
   // The strip's row (option A, Phill 10-26): one fixed-height summary per waiting item, a single button that opens the focus view.
   // It carries no answer control: the options, the words box, Allow/Deny and the sign row live only in the focus view, where the
@@ -6098,6 +6121,21 @@
     // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits
     const sig = all.map(needsKey).join("\n");
     if (host.dataset.sig === sig && !host.hidden) return;
+    // the answered cards are drawn under a quiet label of their own; with nothing waiting that is all the strip holds
+    const answeredSection = () => {
+      const sec = el("div", "needs-answered");
+      sec.appendChild(el("div", "needs-sec-label", "Just answered"));
+      for (const it of settled) sec.appendChild(questionCard(it.q));
+      return sec;
+    };
+    if (!items.length) {
+      host.replaceChildren(answeredSection());
+      delete host.dataset.waiting;
+      host.hidden = false;
+      host.dataset.sig = sig;
+      return;
+    }
+    host.dataset.waiting = "1";
     const head = el("div", "needs-headline");
     head.appendChild(el("h3", null, "Needs you"));
     head.appendChild(el("span", "needs-count", String(items.length)));
@@ -6136,15 +6174,8 @@
     if (!grid) grid = el("div", "needs-grid");
     for (let i = 0; i < cards.length; i++) if (grid.children[i] !== cards[i]) grid.insertBefore(cards[i], grid.children[i] || null);
     while (grid.children.length > cards.length) grid.removeChild(grid.lastChild);
-    const kids = [head];
-    if (items.length) kids.push(needsBar(items), grid);
-    if (settled.length) {
-      // just-answered cards, calm and last: they count for nothing and carry no control
-      const sec = el("div", "needs-answered");
-      sec.appendChild(el("div", "needs-sec-label", "Just answered"));
-      for (const it of settled) sec.appendChild(questionCard(it.q));
-      kids.push(sec);
-    }
+    const kids = [head, needsBar(items), grid];
+    if (settled.length) kids.push(answeredSection());
     host.replaceChildren(...kids);
     host.hidden = false;
     host.dataset.sig = sig;   // only a strip that was drawn is recorded as drawn: a build that threw is tried again at the next render
@@ -7297,6 +7328,7 @@
     // the body holds none right now, never on a flag set once.
     if (owner && owner !== host) host.dataset.proposalSlot = "";
     let slotDue = !!(owner && !host.querySelector(".proposal-slot"));
+    const eagerQ = newestAnswered(lines, ANSWERED_ROWS_EAGER);
     for (const ln of lines) {
       const o = ln && typeof ln === "object" ? ln : {};
       // rows that carry a group (a list drawn as a count) come in the kernel's order: a heading where the group changes
@@ -7306,7 +7338,7 @@
         host.appendChild(el("div", "ext-grouphead", o.grp));
       }
       if (o.consent) { host.appendChild(consentRow(o)); continue; }
-      if (o.question) { host.appendChild(questionRow(o)); continue; }
+      if (o.question) { host.appendChild(questionRow(o, !!o.question && eagerQ.has(o.question))); continue; }
       if (o.note) { host.appendChild(noteRow(o)); continue; }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.wrapMeta) row.classList.add("meta-wrap");   // a row whose meta line IS its content (the sessions' chips): it wraps, never ellipsises
@@ -7871,7 +7903,8 @@
   // deadline a little past the read's own; a view with nothing to show (no standing grant, a read that failed) is left where the
   // slot is, or at its top when it has none.
   const PHONE_JUMP_TARGET = {
-    needs: "#ck-needs:not([hidden])",
+    // an answered-only strip waits on nothing: the jump goes only where something waits
+    needs: "#ck-needs[data-waiting]:not([hidden])",
     board: ".panel[data-ck-panel=\"tray\"]",
     notes: ".panel[data-ck-panel=\"notifications\"]",
   };

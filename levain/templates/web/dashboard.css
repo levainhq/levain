@@ -1812,6 +1812,7 @@ body.ke .needs-terminal .consent-cmd { margin-top: 0; }
 @media (max-width: 480px) { body.ke .consent-kv { grid-template-columns: minmax(0, 1fr); gap: 0; } body.ke .consent-kv dd { margin-bottom: var(--sp-2); } }
 /* the other tabs carry the header alone: one line saying how many wait */
 body.ke .needs-bar { display: none; }
+body.ke[data-mode="build"] .needs-answered, body.ke[data-mode="memory"] .needs-answered,
 body.ke[data-mode="build"] .needs-grid, body.ke[data-mode="memory"] .needs-grid,
 body.ke[data-mode="build"] #ck-needs .needs-headline, body.ke[data-mode="memory"] #ck-needs .needs-headline { display: none; }   /* the strip's own headline only: the drop reuses the class and keeps its heading in every view */
 body.ke[data-mode="build"] .needs-bar, body.ke[data-mode="memory"] .needs-bar { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; padding: var(--sp-3) var(--sp-5);
