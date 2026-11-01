@@ -28,4 +28,6 @@ def test_the_seams_exist(command, capsys):
 
 def test_dream_does_nothing_and_says_so(capsys):
     assert cli.main(["dream"]) == 1
-    assert "not built" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    for verb in ("run", "rollback", "recover", "drill"):
+        assert verb in err

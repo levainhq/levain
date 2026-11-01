@@ -604,8 +604,8 @@ def test_dream_run_refuses_the_live_store_dir_and_a_model_with_no_row(scratch, t
     assert cli.main(["dream", "run", "--store-dir", str(scratch.parent), "--mind", "claude"]) == 2
     assert "no price row" in capsys.readouterr().err
     assert _store_state(scratch) == (None, 0, 3)
-    assert cli.main(["dream"]) == 1                                # the bare command is still "not built"
-    assert "not built" in capsys.readouterr().err
+    assert cli.main(["dream"]) == 1                                # the bare command names the verbs
+    assert "rollback" in capsys.readouterr().err
 
 
 # ---------- review fixes (D1-1a r2): each from a hand run on a scratch store ----------

@@ -81,8 +81,7 @@ def _store_and_occurrence(p: argparse.ArgumentParser) -> None:
 
 
 def run_dream(args: argparse.Namespace) -> int:
-    print("levain dream: not built in this release (only `levain dream run --store-dir <copy>` exists)",
-          file=sys.stderr)
+    print("levain dream: choose run, rollback, recover or drill (see `levain dream --help`)", file=sys.stderr)
     return 1
 
 
