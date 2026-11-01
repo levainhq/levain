@@ -154,14 +154,23 @@ def test_show_with_no_store_makes_nothing(tmp_path, capsys):
 
 
 def test_the_printed_version_is_the_one_the_write_produced_not_a_second_read(qdir, token, store, capsys, monkeypatch):
-    def boom(*a, **k):
-        raise OSError("journal read failed after the commit")
+    seen = []
+    real = ready.add
 
-    monkeypatch.setattr(ready, "journal", boom)
-    code, out, err = _add(qdir, capsys, token)
-    assert (code, err) == (0, "") and "journal levain:a@1" in out
-    monkeypatch.undo()
-    assert [r["id"] for r in ready.journal(store)] == ["levain:a"]       # the write did commit
+    def spy(*a, **k):
+        rec = real(*a, **k)
+        seen.append(rec.ver)
+        return rec
+
+    monkeypatch.setattr(ready, "add", spy)
+    _add(qdir, capsys, token, "levain:a")
+    code, out, err = _add(qdir, capsys, token, "levain:b")
+    assert (code, err) == (0, "") and seen == [1, 1]
+    assert f"journal levain:b@{seen[-1]}" in out
+    # a second write moves the version on; the printed one must follow the write's own record, not a constant
+    code, out, _ = _run(qdir, capsys, "move", "levain:a", "--to", "ready", "--who", "d", "--why", "w", "--token",
+                        str(token))
+    assert "journal levain:a@2" in out
 
 
 def test_show_never_says_nothing_queued_beside_an_unreadable_store(qdir, token, store, capsys):
@@ -182,3 +191,54 @@ def test_a_stale_token_on_a_missing_queue_dir_says_no_state_was_written(tmp_path
     code, out, err = _run(q, capsys, "move", "levain:a", "--to", "done", "--who", "d", "--why", "w", "--token", "5")
     assert code == 2 and out == "" and err.rstrip().endswith("; no state was written")
     assert "nothing was written" not in err
+
+
+def test_a_lifecycle_write_on_a_missing_store_makes_nothing(tmp_path, capsys):
+    q = tmp_path / "never"
+    for argv in (("add", "levain:a", "--repo", "levain", "--title", "A"),
+                 ("move", "levain:a", "--to", "done"), ("correct", "levain:a", "--to", "done")):
+        code, out, err = _run(q, capsys, *argv, "--who", "d", "--why", "w", "--token", "1")
+        assert code == 2 and out == "" and "no coordinator store at" in err and err.rstrip().endswith("no state was written")
+        assert not q.exists()
+
+
+def test_a_write_with_no_token_says_no_state_was_written(qdir, token, capsys):
+    code, _, err = _run(qdir, capsys, "move", "levain:a", "--to", "done", "--who", "d", "--why", "w")
+    assert code == 2 and "no state was written" in err and "nothing was written" not in err
+
+
+def test_no_tier_and_no_done_line_clear_and_omitting_them_keeps(qdir, token, capsys):
+    _add(qdir, capsys, token, "levain:a", "--tier", "sonnet", "--done-line", "green")
+
+    def item():
+        _, out, _ = _run(qdir, capsys, "show", "--all", "--json")
+        return {i["id"]: i for i in json.loads(out)["items"]}["levain:a"]
+
+    code, _, _ = _run(qdir, capsys, "move", "levain:a", "--to", "ready", "--who", "d", "--why", "w", "--token", str(token))
+    assert code == 0 and (item()["tier"], item()["done_line"]) == ("sonnet", "green")      # omitted: unchanged
+    code, _, _ = _run(qdir, capsys, "correct", "levain:a", "--to", "backlog", "--who", "d", "--why", "w", "--token",
+                      str(token), "--no-tier", "--no-done-line")
+    assert code == 0 and (item()["tier"], item()["done_line"]) == (None, None)
+
+
+@pytest.mark.parametrize("a,b", [("--no-tier", "--tier"), ("--no-done-line", "--done-line")])
+def test_the_clearing_flags_are_exclusive_with_their_setters(qdir, token, capsys, a, b):
+    with pytest.raises(SystemExit):
+        main(["coord", "ready", "move", "levain:a", "--to", "done", a, b, "x", "--queue-dir", str(qdir)])
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_move_with_a_title_changes_the_title(qdir, token, capsys):
+    _add(qdir, capsys, token, "levain:a")
+    code, _, err = _run(qdir, capsys, "move", "levain:a", "--to", "ready", "--who", "d", "--why", "w", "--token",
+                        str(token), "--title", "Renamed")
+    assert (code, err) == (0, "")
+    _, out, _ = _run(qdir, capsys, "show", "--json")
+    assert [i["title"] for i in json.loads(out)["items"]] == ["Renamed"]
+
+
+def test_show_json_has_the_same_keys_with_and_without_a_store(tmp_path, qdir, token, capsys):
+    _add(qdir, capsys, token)
+    _, present, _ = _run(qdir, capsys, "show", "--json")
+    _, absent, _ = _run(tmp_path / "never", capsys, "show", "--json")
+    assert set(json.loads(present)) == set(json.loads(absent)) and "store" in json.loads(absent)

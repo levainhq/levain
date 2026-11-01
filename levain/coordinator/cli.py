@@ -1635,11 +1635,14 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     verb = args.ready_cmd
     try:
         if verb == "show":
-            if _no_store(store):
-                _emit(out, args.json, {"schema": ready.SCHEMA_VERSION, "items": [], "unreadable": [], "store": None},
+            where = str(Path(str(store.path)).parent)
+            if _no_store(store):            # the same keys as a present store's answer, only empty
+                _emit(out, args.json, {"schema": ready.SCHEMA_VERSION,
+                                       "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                       "items": [], "unreadable": [], "store": where},
                       f"{NO_STORE}: nothing is queued")
                 return 0
-            got = ready.list_ready(store, all=args.all, repo=args.repo)
+            got = {**ready.list_ready(store, all=args.all, repo=args.repo), "store": where}
             lines = [_ready_line(i) for i in got["items"]]
             if not lines and not got["unreadable"]:       # absence is only said when nothing was left unread
                 lines = ["nothing queued"]
@@ -1649,6 +1652,11 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
         given = {"title": args.title, "tier": args.tier, "done_line": args.done_line, "rank": args.rank,
                  "depends_on": args.depends_on}
         extra = {k: v for k, v in given.items() if v is not None}
+        if verb != "add":                   # --no-tier / --no-done-line: an explicit None clears the field
+            if args.no_tier:
+                extra["tier"] = None
+            if args.no_done_line:
+                extra["done_line"] = None
         if verb == "add":
             rec = ready.add(store, args.token, args.item_id, repo=args.repo, title=args.title, who=args.who,
                             why=args.why, to=args.to, tier=args.tier, done_line=args.done_line,
@@ -2114,9 +2122,17 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         rdw.add_argument("--why", default=None, help="Why (one line; goes in the journal).")
         rdw.add_argument("--to", required=verb != "add", default="backlog" if verb == "add" else None,
                          help="The category (backlog, ready, running, waiting, done).")
-        rdw.add_argument("--title", default=None, required=verb == "add")
-        rdw.add_argument("--tier", default=None, help="sonnet, opus or haiku.")
-        rdw.add_argument("--done-line", dest="done_line", default=None)
+        rdw.add_argument("--title", default=None, required=verb == "add",
+                         help="The title" + ("." if verb == "add" else " (changes it; omit to keep)."))
+        tier_g = rdw.add_mutually_exclusive_group()
+        done_g = rdw.add_mutually_exclusive_group()
+        tier_g.add_argument("--tier", default=None, help="sonnet, opus or haiku.")
+        done_g.add_argument("--done-line", dest="done_line", default=None)
+        if verb != "add":
+            tier_g.add_argument("--no-tier", dest="no_tier", action="store_true",
+                                help="Clear the tier (omit this and --tier to leave it unchanged).")
+            done_g.add_argument("--no-done-line", dest="no_done_line", action="store_true",
+                                help="Clear the done line (omit this and --done-line to leave it unchanged).")
         rdw.add_argument("--rank", type=int, default=None)
         rdw.add_argument("--depends-on", dest="depends_on", nargs="*", default=None, metavar="ITEM",
                          help="Item ids it waits on (none given: clears them).")
