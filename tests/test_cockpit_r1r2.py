@@ -23,11 +23,12 @@ from levain.cockpit import Cockpit, Fault, ProviderSpec, Read, RowIn, register_o
 from levain.cockpit.registry import Ordering
 from levain.cockpit.text import render_lines, snapshot, visible
 from tests._chrome_flags import CHROME_SAFE_FLAGS
+from tests._shared_chrome import _session_chrome
 from tests._page_drive_run import run as run_driver
 
 WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 NODE = shutil.which("node")
-CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME = _session_chrome()   # chrome-headless-shell when installed (no keychain), else the CHROME env or the default Chrome
 
 # A DELIBERATELY NON-NATURAL ordering: ids descending, two groups assigned by id parity. The natural
 # kernel orderings sort by due date / tier; a renderer that re-sorts would show that instead.

@@ -28,6 +28,8 @@ _STATIC_FILES = {
 }
 STATIC_PATHS = frozenset(_STATIC_FILES)
 MAX_BODY = 8192
+MAX_RECEIPT_BODY = 512
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MAX_ENDPOINT = 2048
 _HOST = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 JSON = "application/json"
@@ -113,6 +115,33 @@ def subscription_refusal(body: bytes) -> tuple[int, bytes, str] | None:
     """The 400 ``handle`` would answer this subscribe body with, or None when it is one ``handle`` stores (the cockpit
     asks before it pairs a browser, so a bad body mints nothing)."""
     return _subscription(body)[1]
+
+
+_RECEIPT_REFUSALS = {"unknown_device": (403, "unknown_device"), "unknown_ping": (404, "unknown_ping"),
+                     "bad_report": (400, "bad_report"), "limited": (429, "limited")}
+
+
+def receipt(body: bytes, *, queue_dir: Path | str) -> tuple[int, bytes, str]:
+    """``POST /webpush/receipt {ping, kind, at, endpoint_sha256}``: a device's own report that a push arrived or was shown.
+    It is the one webpush write that carries no token: the service worker holds no credential, so the report is
+    authenticated by the SHA-256 of the device's own push-subscription endpoint, which only that device and this server
+    know. It appends ids and times only (never ping text), and the caller must not hand it to :func:`handle`, whose
+    every other route is token-gated. An unknown hash, an absent ping or one never pushed to that device's subscription
+    (the same 404 as an absent one), a malformed or oversize body: refused, nothing written, and no refusal takes the
+    store's write lock (:meth:`PushStore.add_receipt`)."""
+    if len(body) > MAX_RECEIPT_BODY:
+        return _err(413, "too_large", "a receipt is a few hundred bytes")
+    obj = _body_json(body)
+    ping = _int(obj.get("ping")) if obj else None
+    digest = obj.get("endpoint_sha256") if obj else None
+    if (ping is None or not isinstance(digest, str) or _SHA256.match(digest) is None
+            or set(obj) != {"ping", "kind", "at", "endpoint_sha256"}):
+        return _err(400, "bad_report", "send ping, kind, at and endpoint_sha256, and nothing else")
+    got = PushStore(queue_dir).add_receipt(digest, ping, obj["kind"], obj["at"])
+    if got in _RECEIPT_REFUSALS:
+        status, code = _RECEIPT_REFUSALS[got]
+        return _err(status, code, "this receipt was not recorded")
+    return _json(200, {"recorded": got == "recorded"})
 
 
 def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path | str, authorized: bool,

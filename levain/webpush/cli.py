@@ -34,6 +34,15 @@ def register(subparsers) -> None:
     r.add_argument("--json", action="store_true")
     r.add_argument("--limit", type=int, default=100)
     r.set_defaults(func=_record)
+    rc = common(sub.add_parser(
+        "receipts", help="What each phone said about each push: received, shown, tapped, duplicates.",
+        description="Device receipts per ping and phone, joined with the push service's answer and the tap. A ping "
+                    "with no receipt is `no receipt yet`, never lost; `silent` is said only when that phone reported "
+                    "something LATER than this ping reached it."))
+    rc.add_argument("--since", default=None, metavar="7d", help="Only pings from the last N days, hours or minutes (7d, 12h, 30m).")
+    rc.add_argument("--ref", default=None, help="Only pings about this ref (request:<id> or question:<n>).")
+    rc.add_argument("--json", action="store_true", help="The stable JSON form (levain.webpush.receipts docstring).")
+    rc.set_defaults(func=_receipts)
     from levain.webpush import presence
 
     for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), except urgent ones; one summary and the held "
@@ -265,6 +274,20 @@ def _test(args: argparse.Namespace) -> int:
 def _said(status: int) -> str:
     """A delivery status in words where it is not an HTTP answer: below 0 none came within the budget, 0 none came."""
     return "no answer in time" if status < 0 else str(status) if status else "no answer"
+
+
+def _receipts(args: argparse.Namespace) -> int:
+    from levain.webpush import receipts
+    from levain.webpush.store import PushStore
+
+    try:
+        since = None if args.since is None else receipts.parse_since(args.since)
+    except ValueError as err:
+        print(f"levain ping receipts: {err}")
+        return 2
+    report = receipts.build(PushStore(_qdir(args)), since=since, ref=args.ref)
+    print(json.dumps(report, indent=2) if args.json else receipts.text(report))
+    return 0
 
 
 def _record(args: argparse.Namespace) -> int:

@@ -10,6 +10,7 @@ from levain.cockpit.effects import DownstreamEffect
 from levain.writes import ActionVerb
 from tests._inbox_fake import FakeInbox
 from tests._chrome_flags import CHROME_SAFE_FLAGS
+from tests._shared_chrome import _session_chrome
 from tests._page_drive_run import run as run_driver
 from tests.test_cockpit_k2a import _get, _install, _post, _serve
 from tests.test_cockpit_r1_write import INBOX_PANELS, _inbox_panel
@@ -73,7 +74,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME = _session_chrome()   # chrome-headless-shell when installed (no keychain), else the CHROME env or the default Chrome
 
 
 def _dump(url: str) -> str:

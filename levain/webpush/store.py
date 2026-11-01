@@ -4,14 +4,21 @@ The directory is 0700 and the file 0600; a symlinked directory or file is refuse
 ``O_NOFOLLOW`` so a link planted between the check and the open is not followed. Under a sandboxed agent the
 queue directory is outside its write reach, which is where the VAPID private key belongs.
 
-``pings``, ``deliveries`` and ``opens`` are records: a trigger refuses to change or delete a row. ``held`` is not: it is
+``pings``, ``targets``, ``deliveries``, ``opens`` and ``receipts`` are records: a trigger refuses to change or delete a row.
+A ``targets`` row is written for each subscription a push is about to go to, BEFORE the push services are asked (the
+``deliveries`` row, with the answer, is written only after every push of the send finished, up to the send's wall
+budget): a device's receipt can arrive in between, and it is accepted for a ping targeted at or delivered to its own
+subscription, never any other. ``held`` is not a record: it is
 the queue of pings the presence rule held back from the phone (:mod:`levain.webpush.held`). A flush claims a held ping
 with a lease (``claimed_at``) and marks it released only after a push to the phone succeeded; a claim older than
 :data:`HELD_LEASE_SECS` is taken again, so a flush that dies loses nothing and a duplicate is bounded by the lease.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
+import re
 import sqlite3
 import stat
 import time
@@ -29,6 +36,12 @@ STORE_FORMAT = "levain-push-store/1"
 MAX_SUBSCRIPTIONS_PER_DEVICE = 5
 MAX_SUBSCRIPTIONS = 20
 STAMP = "%Y-%m-%dT%H:%M:%SZ"   # the one stamp format of this store, whole seconds, UTC
+RECEIPT_KINDS = ("received", "shown")
+MAX_RECEIPTS_PER_DEVICE_HOUR = 600   # what one device may report in an hour: a flood cannot grow the table past this
+MAX_RECEIPTS_PER_PING_KIND = 8       # a ping delivered to one device more than once is a few rows, never unbounded
+RECEIPT_MIN_MS = 1_577_836_800_000   # 2020-01-01: a device clock before it is not a clock this record keeps
+RECEIPT_FUTURE_MS = 86_400_000       # and one a day ahead of this server's is not either
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 HELD_LEASE_SECS = 300          # a held ping claimed for a push is another flush's to take again after this long
 
 
@@ -126,10 +139,23 @@ _SCHEMA: tuple[str, ...] = (
     "status INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS opens (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
     "REFERENCES pings(id), device_id TEXT, at TEXT NOT NULL)",
+    # what a device reported about a push it got: ``at`` is the worker's own clock (whole stamp plus milliseconds),
+    # ``reported_at`` this server's; the unique key makes a retried report a no-op
+    "CREATE TABLE IF NOT EXISTS receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
+    "REFERENCES pings(id), device_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('received','shown')), "
+    "at TEXT NOT NULL, reported_at TEXT NOT NULL, UNIQUE (ping_id, device_id, kind, at))",
     "CREATE TABLE IF NOT EXISTS held (ping_id INTEGER PRIMARY KEY REFERENCES pings(id), url TEXT NOT NULL, "
     "reason TEXT NOT NULL, held_at TEXT NOT NULL, released_at TEXT, claimed_at TEXT)",
-    *_records("pings"), *_records("deliveries"), *_records("opens"),
+    # a push about to go to a subscription (written before the push services are asked; see the module docstring)
+    "CREATE TABLE IF NOT EXISTS targets (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
+    "REFERENCES pings(id), subscription_id INTEGER NOT NULL REFERENCES subscriptions(id), at TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS receipts_device_reported ON receipts (device_id, reported_at)",
+    "CREATE INDEX IF NOT EXISTS targets_ping_sub ON targets (ping_id, subscription_id)",
+    "CREATE INDEX IF NOT EXISTS deliveries_ping_sub ON deliveries (ping_id, subscription_id)",
+    *_records("pings"), *_records("targets"), *_records("deliveries"), *_records("opens"), *_records("receipts"),
 )
+# every name the schema creates (tables, indexes, triggers), for the lock-free "nothing to do" check
+_SCHEMA_NAMES = frozenset(re.findall(r"IF NOT EXISTS (\w+)", " ".join(_SCHEMA)))
 
 
 def _check_dir(directory: Path) -> None:
@@ -181,7 +207,27 @@ class PushStore:
         return conn
 
     @staticmethod
+    def _schema_current(conn: sqlite3.Connection) -> bool:
+        """Whether every table, index, trigger and column :meth:`_ensure_schema` makes is already there, read without the
+        write lock: a store opened per request (the token-less receipt route) never takes ``BEGIN IMMEDIATE`` just to
+        find nothing to do."""
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+        if not _SCHEMA_NAMES <= names:
+            return False
+        row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+        if row is None or row[0] != STORE_FORMAT:
+            return False
+        for table, column in (("subscriptions", "subscribed"), ("subscriptions", "journal"), ("pings", "command"),
+                              ("held", "claimed_at")):
+            if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+                return False
+        return conn.execute("SELECT 1 FROM subscriptions WHERE device_id IS NULL AND retired_at IS NULL "
+                            "LIMIT 1").fetchone() is None
+
+    @staticmethod
     def _ensure_schema(conn: sqlite3.Connection) -> None:
+        if PushStore._schema_current(conn):
+            return
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() \
@@ -304,6 +350,16 @@ class PushStore:
             c.execute("UPDATE held SET released_at = ? WHERE ping_id = ? AND released_at IS NULL",
                       (now_stamp(), ping_id))
 
+    def add_targets(self, ping_id: int, subscription_ids: list[int]) -> None:
+        """Record that ``ping_id`` is about to be pushed to each of ``subscription_ids`` (one transaction), before any
+        push service is asked: a receipt from one of those devices is accepted from this moment."""
+        if not subscription_ids:
+            return
+        with self.write() as c:
+            at = now_stamp()
+            c.executemany("INSERT INTO targets (ping_id, subscription_id, at) VALUES (?,?,?)",
+                          [(ping_id, sid, at) for sid in subscription_ids])
+
     def add_delivery(self, ping_id: int, subscription_id: int, status: int, *, retire: bool = False) -> None:
         with self.write() as c:
             at = now_stamp()
@@ -322,6 +378,55 @@ class PushStore:
                 c.execute("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)", (ping_id, device_id, now_stamp()))
             return True
 
+    def add_receipt(self, endpoint_sha256: str, ping_id: int, kind: str, at_ms: int) -> str:
+        """Append what a device reported about a push it got. The device is the one whose live subscription's endpoint
+        hashes to ``endpoint_sha256`` (the endpoint is the secret only that device and this server hold). Answers
+        ``recorded``, ``duplicate`` (the same report again, nothing written), or the refusal: ``unknown_device`` (no live
+        subscription hashes to it), ``unknown_ping``, ``bad_report`` (a kind or time this record does not keep) or
+        ``limited`` (the device reported more than its caps: nothing written).
+
+        ``unknown_ping`` is also the answer for a ping that exists but was never targeted at or delivered to THIS
+        subscription (the one the hash resolved to): one device's hash writes only about its own pushes, and the answer
+        is the same as for an absent ping, so it says nothing about which pings exist.
+
+        The request carries no token, so nothing it sends takes the write lock until it has earned it: the hash is
+        resolved, and the ping, duplicate and cap checks made, in a READ transaction; every non-retired subscription's
+        digest is compared with :func:`hmac.compare_digest`, all of them, with no early exit; the pairing journal is
+        asked only about the one matched device. Only a matched, live, targeted, new, within-cap receipt opens the write
+        transaction, which checks the subscription, duplicate and caps again before it appends."""
+        if kind not in RECEIPT_KINDS or isinstance(at_ms, bool) or not isinstance(at_ms, int):
+            return "bad_report"
+        if not RECEIPT_MIN_MS <= at_ms <= int(time.time() * 1000) + RECEIPT_FUTURE_MS:
+            return "bad_report"
+        if not isinstance(endpoint_sha256, str) or _SHA256_HEX.match(endpoint_sha256) is None:
+            return "unknown_device"
+        if isinstance(ping_id, bool) or not isinstance(ping_id, int) or not 1 <= ping_id <= 2**63 - 1:
+            return "unknown_ping"
+        at = time.strftime(STAMP[:-1], time.gmtime(at_ms // 1000)) + f".{at_ms % 1000:03d}Z"
+        with self.read() as c:
+            match = None
+            for row in c.execute("SELECT id, endpoint, device_id, journal FROM subscriptions WHERE retired_at IS NULL"):
+                digest = hashlib.sha256(str(row["endpoint"]).encode("utf-8")).hexdigest()
+                if hmac.compare_digest(digest, endpoint_sha256) and match is None:
+                    match = dict(row)
+        if match is None or not paired_device_live(match["journal"], match["device_id"] or ""):
+            return "unknown_device"
+        sid, device = match["id"], match["device_id"]
+        with self.read() as c:
+            got = _receipt_checks(c, sid, device, ping_id, kind, at)
+        if got is not None:
+            return got
+        with self.write() as c:
+            if c.execute("SELECT 1 FROM subscriptions WHERE id = ? AND device_id = ? AND retired_at IS NULL",
+                         (sid, device)).fetchone() is None:
+                return "unknown_device"
+            got = _receipt_checks(c, sid, device, ping_id, kind, at)
+            if got is not None:
+                return got
+            c.execute("INSERT INTO receipts (ping_id, device_id, kind, at, reported_at) VALUES (?,?,?,?,?)",
+                      (ping_id, device, kind, at, now_stamp()))
+            return "recorded"
+
     def record(self, limit: int = 100) -> list[dict[str, Any]]:
         """The newest ``limit`` pings, each with its deliveries and opens."""
         with self.read() as c:
@@ -332,6 +437,25 @@ class PushStore:
                 p["opens"] = [dict(r) for r in c.execute(
                     "SELECT device_id, at FROM opens WHERE ping_id = ? ORDER BY id", (p["id"],))]
             return pings
+
+
+def _receipt_checks(c: sqlite3.Connection, sid: int, device: str, ping_id: int, kind: str, at: str) -> str | None:
+    """The answer a receipt gets before it is written (``unknown_ping``, ``duplicate``, ``limited``), or None when it may
+    be appended: the ping was targeted at or delivered to subscription ``sid``, the report is new, and the caps hold."""
+    if (c.execute("SELECT 1 FROM targets WHERE ping_id = ? AND subscription_id = ?", (ping_id, sid)).fetchone() is None
+            and c.execute("SELECT 1 FROM deliveries WHERE ping_id = ? AND subscription_id = ?",
+                          (ping_id, sid)).fetchone() is None):
+        return "unknown_ping"
+    if c.execute("SELECT 1 FROM receipts WHERE ping_id = ? AND device_id = ? AND kind = ? AND at = ?",
+                 (ping_id, device, kind, at)).fetchone() is not None:
+        return "duplicate"
+    hour_ago = time.strftime(STAMP, time.gmtime(time.time() - 3600))
+    if (c.execute("SELECT COUNT(*) FROM receipts WHERE device_id = ? AND reported_at >= ?",
+                  (device, hour_ago)).fetchone()[0] >= MAX_RECEIPTS_PER_DEVICE_HOUR
+            or c.execute("SELECT COUNT(*) FROM receipts WHERE ping_id = ? AND device_id = ? AND kind = ?",
+                         (ping_id, device, kind)).fetchone()[0] >= MAX_RECEIPTS_PER_PING_KIND):
+        return "limited"
+    return None
 
 
 def _subscribe(c: sqlite3.Connection, endpoint: str, p256dh: str, auth: str, device_id: str, *,

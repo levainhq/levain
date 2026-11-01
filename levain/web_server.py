@@ -1168,6 +1168,12 @@ _PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENC
 _PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
                         _POLICY_SET, _POLICY_RESET, _PRESENCE_SET, _PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
+# A device's receipt for a push it got: the one webpush POST that takes no token (the worker holds none). Its report names
+# the SHA-256 of the device's own subscription endpoint, checked by the store; it is kept OUT of _PUSH_POST so every route
+# in that set stays token-gated.
+_PUSH_RECEIPT = "/webpush/receipt"
+_RECEIPT_SLOTS = 2
+_RECEIPT_BODY_MAX = 512
 _PUSH_TEST = "/webpush/test"
 _PUSH_PREFIX = "/webpush/"
 # A refused short-code claim, by the short row's state after it (``CockpitDB.short_offer_state``): "used up by wrong
@@ -1604,6 +1610,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         # a revoke bumps AFTER its transaction commits, which every open stream compares before each frame (RU-3)
         self.pair_verify_gate = threading.BoundedSemaphore(_PAIR_VERIFY_SLOTS)
         self.pair_claim_gate = threading.BoundedSemaphore(_PAIR_CLAIM_SLOTS)
+        self.receipt_gate = threading.BoundedSemaphore(_RECEIPT_SLOTS)
         self.pair_epoch = 0
         self.pair_epoch_lock = threading.Lock()
         # (verb, client_txn) -> params fingerprint, for each draft whose compose_signer call is in flight here
@@ -3606,6 +3613,8 @@ class _Handler(GuardedHandler):
         # credential. The authed pair POSTs need a token on every bind, loopback included.
         if route == _PAIR_CLAIM:
             return self._pair_claim()
+        if route == _PUSH_RECEIPT and self.server.signer is not None:
+            return self._receipt_post()
         if route in _PAIR_AUTHED_POST:
             if not self._off_box_token_valid():
                 return self._token_403("credential_required")
@@ -3889,6 +3898,37 @@ class _Handler(GuardedHandler):
             self._pair_send(payload, status, cache_control="no-store")
         finally:
             self.server.pair_claim_gate.release()
+
+    def _receipt_post(self) -> None:
+        """``POST /webpush/receipt``: a device's report that a push arrived or was shown, carved out by exact path before the
+        token gates like the pairing claim (the service worker holds no credential). Host, same-origin and JSON checks
+        already ran or run here; the body is capped at 512 bytes; its own 2-slot semaphore; the store authenticates the
+        report by the endpoint hash it names and bounds how much one device may write (levain.webpush.routes.receipt)."""
+        if not self.server.receipt_gate.acquire(blocking=False):
+            return self._pair_refuse(503, "busy", "server busy")
+        try:
+            if self._refuse_non_json():
+                return
+            clen = self._declared_length()
+            if clen is None:
+                return
+            if self._refuse_oversize(clen, _RECEIPT_BODY_MAX, 2 * _RECEIPT_BODY_MAX):
+                return
+            try:
+                raw = self.rfile.read(clen)
+            except OSError:
+                self.close_connection = True
+                return
+            from levain.webpush import routes as push_routes
+
+            try:
+                status, body, _ = push_routes.receipt(raw, queue_dir=self.server.signer.queue_dir)
+            except Exception as exc:  # noqa: BLE001 - never leak a traceback to the client
+                self._send_json({"error": "internal", "message": type(exc).__name__}, 500)
+                return
+            self._send(body, "application/json; charset=utf-8", status=status, cache_control="no-store")
+        finally:
+            self.server.receipt_gate.release()
 
     def _pair_authed_post(self, route: str) -> None:
         """``POST /cockpit/pair/offer {label?}`` mints a one-time code minted by THIS credential (RQ-2); ``POST
