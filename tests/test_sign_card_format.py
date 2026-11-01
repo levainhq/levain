@@ -198,11 +198,11 @@ def test_the_card_head_is_one_container_and_its_rec_is_the_signed_one(tmp_path: 
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *_open(rig, rid),
-            {"eval": "!!document.querySelector('#sheet-card #sheet-headline') && !!document.querySelector('#sheet-card #sheet-signed')"},
+            {"eval": "!!document.querySelector('#sheet-card #sheet-headline') && !!document.querySelector('#sheet-signed[data-card]')"},
             {"eval": "[...document.querySelectorAll('[data-card]')].map(n => n.id).join()"},
             {"eval": "[...document.querySelectorAll('#sheet-actions .sheet-rec')].map(b => b.dataset.choice).join()"},
             {"eval": "document.querySelectorAll('[id=sheet-headline]').length"},
         ])
     v = out["values"][2:]
-    assert v[0] is True and v[1] == "sheet-card,sheet-detail", v
+    assert v[0] is True and v[1] == "sheet-card,sheet-signed,sheet-detail", v
     assert v[2] == LONG["rec"] and v[3] == 1, v

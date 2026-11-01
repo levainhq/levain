@@ -3020,16 +3020,13 @@ body.ke #drop-recent { max-height: 40vh; overflow: auto; }
 
 /* ---- The sign sheet and /pair at every size (Phill 11-01: "why is it this narrow little strip on a huge empty page"). One page, drawn for the
    screen it is on. Below 800px nothing changes: the 420px card above, and the sheet (a grid of one column) reads in the order it always did:
-   the answers, Detail, the status line, the way back. From 800px a needs-phill card is a two-column decision sheet (reading left, deciding
+   the answers, Detail (in the DOM there, not by `order`), the status line, the way back. From 800px a needs-phill card is a two-column decision sheet (reading left, deciding
    right) and every other sheet and /pair is one wider measure. The embedded sheet (the cockpit's modal) keeps its own layout. ---- */
 #sheet { display: grid; grid-template-columns: minmax(0, 1fr); }
-#sheet-decide { display: contents; }
-#sheet-detail { order: 1; }
-#sheet-note { order: 2; }
-#sheet-note:empty { display: none; }     /* an empty block's margins collapsed away in the old flow; a grid item's would not */
-#sheet-back { order: 3; }
+#sheet-decide, #sheet-decide-in { display: contents; }
+#sheet-note:empty { margin: 0; padding: 0; min-height: 0; }     /* an empty block's margins collapsed away in the old flow; a grid item's would not. Kept rendered: it is an aria-live region */
 @media (min-width: 800px) {
-  .pair-body:not(.sheet-embedded) { align-items: start; padding: clamp(var(--sp-6), 7vh, var(--sp-9)) var(--sp-7); }
+  .pair-body:not(.sheet-embedded) { align-items: center; padding: clamp(var(--sp-6), 7vh, var(--sp-9)) var(--sp-7); }     /* a card shorter than the screen sits in its middle; a taller one grows the page */
   .pair-body:not(.sheet-embedded) .pair-card { width: min(100%, 720px); padding: var(--sp-8); }
   .pair-body:not(.sheet-embedded) .pair-brand { margin-bottom: var(--sp-6); }
   .pair-body:not(.sheet-embedded) .pair-card h1 { font-size: var(--fs-h); }
@@ -3042,8 +3039,8 @@ body.ke #drop-recent { max-height: 40vh; overflow: auto; }
     padding: 0;
     overflow: clip;       /* clip, never hidden: a scroll container would stop the deciding column sticking */
     grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
-    grid-template-rows: auto auto auto auto 1fr;
-    grid-template-areas: "brand from" "title title" "read decide" "detail decide" ". decide";
+    grid-template-rows: auto auto auto auto auto 1fr;
+    grid-template-areas: "brand from" "title title" "read decide" "detail decide" "sign decide" ". decide";
   }
   .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card)::before { content: ""; grid-area: decide; justify-self: start; width: 1px; background: var(--hair); }
   .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > .pair-brand,
@@ -3052,13 +3049,19 @@ body.ke #drop-recent { max-height: 40vh; overflow: auto; }
   .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-msg { grid-area: from; justify-content: flex-end; text-align: right; font-size: var(--fs-meta); color: var(--meta); }
   .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-title { grid-area: title; margin: 0; padding: var(--sp-7) var(--g) 0; }
   .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-body { grid-area: read; padding: var(--sp-4) var(--g) var(--sp-5); }
-  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-detail { grid-area: detail; order: 0; margin: 0; padding: 0 var(--g) var(--sp-7); max-width: calc(68ch + 2 * var(--g)); box-sizing: border-box; }
-  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-decide {
-    grid-area: decide; display: block; align-self: start; position: sticky; top: var(--sp-6);
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-detail { grid-area: detail; margin: 0; padding: 0 var(--g); max-width: calc(68ch + 2 * var(--g)); box-sizing: border-box; }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-signed { grid-area: sign; margin: 0; padding: 0 var(--g) var(--sp-7); max-width: calc(68ch + 2 * var(--g)); box-sizing: border-box; }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-signed > summary { border-top: 1px solid var(--hair); padding-top: var(--sp-3); }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-signed .ext-meta { margin: var(--sp-3) 0 0; }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-signed .sheet-line { margin-top: var(--sp-2); }
+  /* the deciding column: #sheet-decide is the grid item (it stretches over the rows beside the reading, whatever their height), and
+     #sheet-decide-in sticks inside it, scrolling within itself when it is taller than the screen */
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-decide { grid-area: decide; display: block; align-self: stretch; }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) #sheet-decide-in {
+    display: block; position: sticky; top: var(--sp-6);
     max-height: calc(100dvh - 2 * var(--sp-6)); overflow-y: auto; padding: var(--sp-5) var(--g) var(--sp-7);
   }
-  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) #sheet-note { order: 0; }
-  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) #sheet-back { order: 0; margin: var(--sp-6) 0 0; padding-top: var(--sp-4); border-top: 1px solid var(--hair); }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) #sheet-back { margin: var(--sp-6) 0 0; padding-top: var(--sp-4); border-top: 1px solid var(--hair); }
   .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) .card-meta { margin-bottom: var(--sp-4); }
   .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) .card-headline { font-size: clamp(var(--fs-h), 1.1vw + 12px, 28px); line-height: 1.25; margin-bottom: var(--sp-6); }
   .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) .pair-actions.card-rows { gap: var(--sp-4); margin-bottom: var(--sp-5); }

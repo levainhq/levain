@@ -333,6 +333,39 @@
     return det;
   }
 
+  // The "Open until" line of a request, human and local: `Open until 9:21 AM today`, `Open until tomorrow, 9:21 AM`,
+  // `Open until Wed 4 Nov, 9:21 AM` (within the week), else `Open until 4 Nov 2027, 9:21 AM`, in the viewer's time zone and
+  // the page's locale; `title` keeps the exact stamp. A value that does not parse as a date is shown as it came (never
+  // "Invalid Date", never a throw). `opts` is for tests: { now: Date, locale, timeZone }.
+  function openUntil(stamp, opts) {
+    const raw = String(stamp === undefined || stamp === null ? "" : stamp);
+    const same = { text: "Open until " + raw, title: "" };
+    try {
+      const o = opts || {};
+      const d = new Date(raw);
+      if (!raw.trim() || isNaN(d.getTime())) return same;
+      const now = o.now instanceof Date ? o.now : new Date();
+      const tz = o.timeZone ? { timeZone: o.timeZone } : {};
+      const part = (date, f) => {
+        const out = {};
+        for (const p of new Intl.DateTimeFormat(o.locale, Object.assign({}, f, tz)).formatToParts(date)) out[p.type] = p.value;
+        return out;
+      };
+      const day = (date) => { const p = part(date, { year: "numeric", month: "numeric", day: "numeric" }); return Date.UTC(+p.year, +p.month - 1, +p.day) / 86400000; };
+      const time = new Intl.DateTimeFormat(o.locale, Object.assign({ hour: "numeric", minute: "2-digit" }, tz)).format(d).replace(/[\u202f\u00a0]/g, " ");
+      const diff = Math.round(day(d) - day(now));
+      const w = part(d, { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+      let text;
+      if (diff === 0) text = time + " today";
+      else if (diff === 1) text = "tomorrow, " + time;
+      else if (diff >= 2 && diff <= 6) text = w.weekday + " " + w.day + " " + w.month + ", " + time;
+      else text = w.day + " " + w.month + " " + w.year + ", " + time;
+      return { text: "Open until " + text, title: raw };
+    } catch (e) {
+      return same;
+    }
+  }
+
   // Free-text fields (the Drop box, the question and coordinator boxes, the phone's words and state line) grow with what is
   // typed. CSS `field-sizing: content` does it where the browser has it; this is the fallback that works on iOS Safari
   // today: one delegated listener, height from scrollHeight on input. Safe to call from every surface (once per page).
@@ -350,7 +383,7 @@
     doc.addEventListener("input", (ev) => grow(ev.target));
   }
 
-  const api = { installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, drawHead, drawDetail, drawBody };
+  const api = { installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);

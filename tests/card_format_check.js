@@ -118,5 +118,21 @@ for (const r of [long, short]) {
   check(eq(shown, src), r.id + ": headline + rest + sections words == asked + stopped words (" + shown.length + ")");
 }
 
+// 5. the "Open until" line: human, local, the exact stamp kept in the title; pinned now (Sun 2026-11-01 10:00 New York) and zone
+const NOW = { now: new Date("2026-11-01T15:00:00Z"), locale: "en-US", timeZone: "America/New_York" };
+const ou = (stamp) => C.openUntil(stamp, NOW);
+check(eq(ou("2026-11-01T14:21:20.833132+00:00"), { text: "Open until 9:21 AM today", title: "2026-11-01T14:21:20.833132+00:00" }), "openUntil: today");
+check(ou("2026-11-02T04:30:00+00:00").text === "Open until 11:30 PM today", "openUntil: the viewer's day, not UTC's (11:30 PM New York is Nov 2 in UTC)");
+check(ou("2026-11-02T14:21:00Z").text === "Open until tomorrow, 9:21 AM", "openUntil: tomorrow");
+check(ou("2026-11-04T14:21:00Z").text === "Open until Wed 4 Nov, 9:21 AM", "openUntil: a weekday within the week");
+check(ou("2026-11-07T14:21:00Z").text === "Open until Sat 7 Nov, 9:21 AM", "openUntil: day 6 is still by weekday");
+check(ou("2026-11-08T14:21:00Z").text === "Open until 8 Nov 2026, 9:21 AM", "openUntil: day 7 is a dated line with the year");
+check(ou("2027-03-09T14:21:00Z").text === "Open until 9 Mar 2027, 9:21 AM", "openUntil: a far date, with the year");
+check(ou("2026-10-30T14:21:00Z").text === "Open until 30 Oct 2026, 10:21 AM", "openUntil: a past day keeps the old wording rule, only the time is formatted");
+for (const bad of ["soon", "", "2026-13-45", undefined, null]) {
+  const r = ou(bad);
+  check(r.title === "" && r.text === "Open until " + (bad === undefined || bad === null ? "" : bad) && !/Invalid/.test(r.text), "openUntil: unparseable " + JSON.stringify(bad) + " is shown unchanged");
+}
+
 console.log(failures === 0 ? "ALL PASS" : failures + " FAILED");
 process.exit(failures === 0 ? 0 : 1);
