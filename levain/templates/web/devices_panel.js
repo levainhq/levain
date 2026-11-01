@@ -162,6 +162,7 @@
     body.appendChild(note);
     panel.appendChild(body);
     grid.appendChild(panel);
+    grid.appendChild(buildPresence());
     grid.appendChild(buildPolicy());
     section.appendChild(grid);
     const main = document.querySelector("main.frame");
@@ -170,7 +171,7 @@
 
   // The section holds two independent blocks (the paired devices, the Notifications policy); it shows while either does, and
   // each block keeps its own gone/refused state, so a cockpit with one and not the other still shows what it has.
-  function syncSection() { section.hidden = devPanel.hidden && (!npPanel || npPanel.hidden); }
+  function syncSection() { section.hidden = devPanel.hidden && (!npPanel || npPanel.hidden) && (!prPanel || prPanel.hidden); }
   function devShown(on) { devPanel.hidden = !on; syncSection(); }
   function npShown(on) { npPanel.hidden = !on; syncSection(); }
 
@@ -614,15 +615,225 @@
   function setCell(mute, cls, value) { return writePolicy("/webpush/policy/set", { mute: mute, class: cls, value: value }); }
   function resetPolicy() { return writePolicy("/webpush/policy/reset", {}); }
 
+  // ---- Presence: the word that says whether pings reach you, shown and set here, and the tap tokens a Shortcut or an NFC tag
+  // uses to set it with no location. GET /webpush/presence reads it ({word, until, text, tokens}); POST /webpush/presence/set
+  // {word, for?} writes it; /webpush/presence/token/new {name, words} and /revoke {name} manage the taps. Same token as every
+  // other write here; hidden on a 404 (no web push) or a refused token, on its own. The state is in the server's words (`text`).
+  const PR_WORDS = [["back", "Back"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"], ["remote", "Remote"]];
+  const PR_TIMED = ["quiet", "loud", "remote"];
+  const PR_DURATIONS = [["15m", "15 minutes"], ["1h", "1 hour"], ["4h", "4 hours"], ["24h", "24 hours"]];
+  const PR_TAP_DEFAULT = ["away", "back", "quiet", "remote"];
+  const PR_WORD_GLOSS = { back: "pings reach you as usual", away: "held for your phone", quiet: "only what needs you reaches you",
+                          sleep: "only what needs you reaches you, until you are active", loud: "everything reaches you",
+                          remote: "you are working from your phone" };
+  let prPanel = null, prState = null, prText = null, prBtns = {}, prSelect = null, prEndLoud = null, prNote = null, prTapList = null,
+      prNew = null, prName = null, prChecks = {}, prShown = null, prBusy = false, prGen = 0, prGone = false, prRefused = "", prCur = null;
+
+  function buildPresence() {
+    prPanel = el("div", "panel k-list dev-panel pr-panel");
+    prPanel.dataset.modes = "board";
+    prPanel.hidden = true;
+    const ph = el("div", "phead");
+    ph.appendChild(el("h2", null, "Presence"));
+    prPanel.appendChild(ph);
+    const body = el("div", "pbody dev-body");
+    prState = el("p", "pr-state");
+    prState.setAttribute("aria-live", "polite");
+    body.appendChild(prState);
+    prText = el("p", "dev-note pr-text");
+    body.appendChild(prText);
+    const seg = el("div", "pr-words");
+    seg.setAttribute("role", "group");
+    seg.setAttribute("aria-label", "Set your presence");
+    for (const [w, label] of PR_WORDS) {
+      const b = el("button", "dev-btn pr-word" + (w === "back" ? " dev-primary" : ""), label);
+      b.type = "button";
+      b.dataset.word = w;
+      b.title = PR_WORD_GLOSS[w];
+      b.addEventListener("click", () => setWord(w));
+      prBtns[w] = b; seg.appendChild(b);
+    }
+    body.appendChild(seg);
+    const dur = el("label", "pr-for");
+    dur.appendChild(el("span", "dev-meta", "For Quiet, Loud and Remote:"));
+    prSelect = el("select", "dev-label pr-duration");
+    prSelect.setAttribute("aria-label", "How long");
+    for (const [v, label] of PR_DURATIONS) { const o = el("option", null, label); o.value = v; prSelect.appendChild(o); }
+    prSelect.value = "1h";
+    dur.appendChild(prSelect);
+    body.appendChild(dur);
+    prEndLoud = el("button", "dev-btn pr-endloud", "End Loud");
+    prEndLoud.type = "button"; prEndLoud.hidden = true;
+    prEndLoud.addEventListener("click", () => writePresence({ word: "loud", for: "off" }));
+    body.appendChild(prEndLoud);
+    prNote = el("p", "dev-note"); prNote.hidden = true;
+    body.appendChild(prNote);
+
+    const taps = el("div", "pr-taps");
+    taps.appendChild(el("div", "dev-name", "Tap tokens"));
+    taps.appendChild(el("p", "dev-note", "A tap token lets one Shortcut or NFC tag set your presence, and nothing else."));
+    prTapList = el("div", "dev-list pr-tap-list");
+    taps.appendChild(prTapList);
+    const form = el("form", "dev-offer pr-new-form");
+    prName = el("input", "dev-label pr-name");
+    prName.type = "text"; prName.maxLength = 40; prName.placeholder = "Name, e.g. Front door tag";
+    prName.setAttribute("aria-label", "Name for the new tap token");
+    form.appendChild(prName);
+    const boxes = el("div", "pr-checks");
+    for (const [w, label] of PR_WORDS) {
+      const l = el("label", "pr-check");
+      const c = el("input"); c.type = "checkbox"; c.value = w; c.checked = PR_TAP_DEFAULT.indexOf(w) >= 0;
+      l.appendChild(c); l.appendChild(document.createTextNode(" " + label));
+      prChecks[w] = c; boxes.appendChild(l);
+    }
+    form.appendChild(boxes);
+    const go = el("button", "dev-btn", "Create tap token");
+    go.type = "submit";
+    form.appendChild(go);
+    form.addEventListener("submit", (e) => { e.preventDefault(); createTap(); });
+    taps.appendChild(form);
+    prNew = el("div", "dev-link pr-new"); prNew.hidden = true;
+    taps.appendChild(prNew);
+    body.appendChild(taps);
+    prPanel.appendChild(body);
+    return prPanel;
+  }
+
+  function prShow(on) { prPanel.hidden = !on; syncSection(); }
+  function prSay(msg) { prNote.textContent = msg; prNote.hidden = !msg; }
+  function timeLeft(until) {
+    const t = stampMs(until);
+    if (Number.isNaN(t)) return "";
+    const m = Math.round((t - Date.now()) / 60000);
+    if (m <= 0) return "ending now";
+    if (m < 90) return m + " min left";
+    return Math.round(m / 60) + " h left";
+  }
+
+  function paintPresence(v) {
+    prCur = v;
+    const w = v.word;
+    const label = w ? (PR_WORDS.find((x) => x[0] === w) || [w, w])[1] : "";
+    prState.textContent = w ? label + (v.until ? " (" + timeLeft(v.until) + ")" : "") : "No word is set";
+    prText.textContent = v.text || "";
+    for (const [k, b] of Object.entries(prBtns)) b.setAttribute("aria-pressed", k === w || (k === "back" && !w) ? "true" : "false");
+    prEndLoud.hidden = w !== "loud";
+    if (Array.isArray(v.tokens)) paintTaps(v.tokens);
+    prShow(true);
+  }
+
+  function paintTaps(tokens) {
+    prTapList.replaceChildren();
+    if (!tokens.length) { prTapList.appendChild(el("p", "dev-none", "No tap tokens yet.")); return; }
+    for (const t of tokens) {
+      const row = el("div", "dev-row pr-tap");
+      row.dataset.name = t.name;
+      const main = el("div", "dev-main");
+      main.appendChild(el("div", "dev-name", t.name));
+      main.appendChild(el("div", "dev-meta", "May set: " + (t.words || []).join(", ") + " · last used " + when(t.last_used)));
+      row.appendChild(main);
+      const rv = el("button", "dev-btn pr-revoke", "Revoke");
+      rv.type = "button";
+      rv.addEventListener("click", () => revokeTap(t.name));
+      row.appendChild(rv);
+      prTapList.appendChild(row);
+    }
+  }
+
+  async function readPresence() {
+    if (prGone) return;
+    const tok = token();
+    if (!tok || tok === prRefused) { prShow(false); return; }
+    const startedAt = prGen;
+    try {
+      const res = await api("GET", "/webpush/presence", undefined, READ_TIMEOUT_MS);
+      if (startedAt !== prGen) return;
+      if (res.status === 200 && res.data && "word" in res.data) paintPresence(res.data);
+      else if (res.status === 404) { prShow(false); prGone = true; }
+      else if (res.status === 403) { prShow(false); prRefused = tok; }
+    } catch (_) { /* the next pulse tries again */ }
+  }
+
+  function prDisable(on) {
+    for (const b of Object.values(prBtns)) b.disabled = on;
+    prEndLoud.disabled = on;
+  }
+  async function writePresence(body) {
+    if (prBusy) return;
+    prBusy = true; prGen++; prSay(""); prDisable(true);
+    try {
+      const res = await api("POST", "/webpush/presence/set", body);
+      prGen++;
+      if (res.status === 200 && res.data && "word" in res.data) paintPresence(res.data);
+      else prSay("Could not set your presence (" + ((res.data && res.data.message) || res.status) + ").");
+    } catch (_) { prSay("Could not reach the cockpit."); }
+    finally {
+      try { await readPresence(); }
+      finally { prBusy = false; prDisable(false); }
+    }
+  }
+  function setWord(w) {
+    const body = { word: w };
+    if (PR_TIMED.indexOf(w) >= 0) body.for = prSelect.value;
+    return writePresence(body);
+  }
+
+  async function tapCall(path, body) {
+    prGen++; prSay("");
+    try {
+      const res = await api("POST", path, body);
+      prGen++;
+      if (res.status === 200 && res.data) { if (Array.isArray(res.data.tokens)) paintTaps(res.data.tokens); return res.data; }
+      prSay("Could not change the tap tokens (" + ((res.data && res.data.message) || res.status) + ").");
+    } catch (_) { prSay("Could not reach the cockpit."); }
+    return null;
+  }
+  async function createTap() {
+    const name = prName.value.trim();
+    const words = PR_WORDS.map((x) => x[0]).filter((w) => prChecks[w].checked);
+    if (!name) { prSay("Give the tap token a name."); return; }
+    if (!words.length) { prSay("Pick at least one word it may set."); return; }
+    const got = await tapCall("/webpush/presence/token/new", { name: name, words: words });
+    if (!got || !got.token) return;
+    prName.value = "";
+    showNewTap(got.token, got.record || {});
+  }
+  // The secret is shown here once, in this node, and kept nowhere: a reload or the next read never brings it back.
+  function showNewTap(tok, rec) {
+    prNew.replaceChildren();
+    prNew.appendChild(el("div", "dev-name", "Token for " + (rec.name || "this tap") + ": copy it now, it is not shown again"));
+    const url = el("input", "dev-url");
+    url.type = "text"; url.readOnly = true; url.value = tok;
+    url.setAttribute("aria-label", "The new tap token");
+    prNew.appendChild(url);
+    const copy = el("button", "dev-btn", "Copy");
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(tok); copy.textContent = "Copied"; }
+      catch (_) { url.focus(); url.select(); copy.textContent = "Select and copy"; }
+    });
+    prNew.appendChild(copy);
+    const origin = window.location.origin;
+    prNew.appendChild(el("p", "dev-link-n", "In Shortcuts or on the tag: send a POST to " + origin + "/webpush/presence/set"));
+    prNew.appendChild(el("p", "dev-link-n", "with the header X-Levain-Presence-Token set to this token and the JSON body {\"word\":\"away\"}."));
+    prNew.hidden = false;
+  }
+  async function revokeTap(name) {
+    await tapCall("/webpush/presence/token/revoke", { name: name });
+    prNew.hidden = true; prNew.replaceChildren();
+    await readPresence();
+  }
+
   function start() {
     build();
     refresh();
     readPolicy();
+    readPresence();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
-    setTimeout(() => { refresh(); readPolicy(); }, 2500);
+    setTimeout(() => { refresh(); readPolicy(); readPresence(); }, 2500);
     const pulse = setInterval(() => {
-      if (gone && npGone) clearInterval(pulse);
-      else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); }
+      if (gone && npGone && prGone) clearInterval(pulse);
+      else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); if (!prBusy) readPresence(); }
     }, 30000);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();

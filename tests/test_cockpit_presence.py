@@ -308,3 +308,50 @@ def test_no_log_line_carries_a_tap_token(rig, caplog, capfd, monkeypatch):
         _call(port, "POST", "/edit", {}, headers=_tap(tok))
     out = capfd.readouterr()
     assert tok not in caplog.text and tok not in out.out and tok not in out.err
+
+
+# ---- the Presence block in the Devices panel --------------------------------------------------------------------------
+
+from levain.web_server import load_web_asset
+from tests.test_pair_card_w1b import _drive, needs_browser
+
+_SHOWN = "document.querySelector('.pr-panel') && !document.querySelector('.pr-panel').hidden"
+
+
+def test_the_panel_script_carries_the_presence_block_and_no_client_name():
+    js = load_web_asset("devices_panel.js")
+    js = js[0].decode() if isinstance(js, tuple) else js
+    for needle in ("Presence", "/webpush/presence", "/webpush/presence/set", "/webpush/presence/token/new",
+                   "/webpush/presence/token/revoke", "Tap tokens", "X-Levain-Presence-Token", "Copy"):
+        assert needle in js, needle
+
+
+@needs_browser
+def test_the_block_renders_a_word_button_posts_its_body_and_a_new_tap_is_shown_once(rig, tmp_path, monkeypatch):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000},
+            {"eval": "[...document.querySelectorAll('.pr-word')].map(b=>b.textContent)"},
+            {"eval": "document.querySelector('.pr-word.dev-primary').textContent"},
+            {"do": "document.querySelector('.pr-duration').value='4h'; document.querySelector('.pr-word[data-word=\"quiet\"]').click()",
+             "until": "document.querySelector('.pr-state').textContent.startsWith('Quiet')", "ms": 8000},
+            {"eval": "document.querySelector('.pr-state').textContent"},
+            {"do": "document.querySelector('.pr-word[data-word=\"away\"]').click()",
+             "until": "document.querySelector('.pr-state').textContent==='Away'", "ms": 8000},
+            {"do": "document.querySelector('.pr-name').value='Door'; document.querySelector('.pr-new-form button[type=submit]').click()",
+             "until": "!document.querySelector('.pr-new').hidden", "ms": 8000},
+            {"eval": "document.querySelector('.pr-new .dev-url').value.length"},
+            {"eval": "location.reload() || 1"},
+            {"until": _SHOWN + " && document.querySelector('.pr-tap')", "ms": 20000},
+            {"eval": "[document.querySelector('.pr-new').hidden, document.querySelector('.pr-tap .dev-meta').textContent]"},
+            {"do": "document.querySelector('.pr-revoke').click()", "until": "!document.querySelector('.pr-tap')", "ms": 8000},
+        ])
+    v = out["values"]
+    assert v[1] == ["Back", "Away", "Quiet", "Sleep", "Loud", "Remote"] and v[2] == "Back"
+    assert v[4].startswith("Quiet (") and "left" in v[4]
+    assert v[7] >= 40                                     # the token was shown
+    assert v[10][0] is True and "away, back, quiet, remote" in v[10][1]    # gone after a reload; the list names its words
+    assert presence_tokens.list_public(q) == []
+    rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
+    assert [(r["word"], r.get("duration")) for r in rows[:2]] == [("quiet", "4h"), ("away", None)]

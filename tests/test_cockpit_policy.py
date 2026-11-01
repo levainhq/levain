@@ -234,7 +234,7 @@ def test_the_block_shows_when_the_device_list_is_gone_and_the_policy_is_not(rig,
             {"eval": "(s=>s && !s.hidden)(document.querySelector('.dev-zone'))"},
             {"eval": "[...document.querySelectorAll('.dev-panel')].map(p=>p.hidden)"},
         ])
-    assert out["values"][1] is True and out["values"][2] == [True, False]   # the section shows; the pairing panel does not
+    assert out["values"][1] is True and out["values"][2] == [True, False, False]   # the section shows; the pairing panel does not, Presence and Notifications do
 
 
 @needs_browser

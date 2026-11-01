@@ -3029,6 +3029,21 @@ body.ke #drop-recent { max-height: 40vh; overflow: auto; }
   .np-seg .ck-tab { flex: 1 1 0; min-height: var(--hit-min, 44px); }
 }
 
+/* ---- Presence block (devices_panel.js): the word, six buttons, the tap tokens. */
+.pr-state { margin: var(--sp-2) 0 var(--sp-2); font: var(--fw-semibold) var(--fs-lead, var(--fs-body))/1.3 var(--sans); color: var(--text); }
+.pr-words { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-4); }
+.pr-word[aria-pressed="true"] { background: var(--card-2); border-color: var(--text); }
+.pr-for { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-4); flex-wrap: wrap; }
+.pr-for .dev-label { flex: none; }
+.pr-endloud { margin-top: var(--sp-3); }
+.pr-taps { margin-top: var(--sp-6); }
+.pr-checks { display: flex; flex-wrap: wrap; gap: var(--sp-3); flex: 1 1 100%; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); }
+.pr-new .dev-url { width: 100%; margin: var(--sp-3) 0; }
+@media (max-width: 520px) {
+  .pr-word, .pr-revoke { min-height: var(--hit-min, 44px); }
+  .pr-words .pr-word { flex: 1 1 30%; }
+}
+
 /* ---- The sign sheet and /pair at every size (Phill 11-01: "why is it this narrow little strip on a huge empty page"). One page, drawn for the
    screen it is on. Below 800px nothing changes: the 420px card above, and the sheet (a grid of one column) reads in the order it always did:
    the answers, Detail (in the DOM there, not by `order`), the status line, the way back. From 800px a needs-phill card is a two-column decision sheet (reading left, deciding
