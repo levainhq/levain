@@ -11,11 +11,13 @@ import fcntl
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 FILE = "tap_trace_reports.jsonl"
-KEEP = 40            # reports kept; each is at most the push family's body cap
+KEEP = 40            # reports kept; each is at most the push family's body cap (the route reads no more than that)
+LOCK_WAIT_SECS = 2.0 # how long a post waits for the file's lock before answering busy
 MAX_ENTRIES = 60     # the ring's own cap
 _VALUE_CLIP = 200
 
@@ -33,41 +35,74 @@ def clean(entries: object) -> list[dict[str, object]] | None:
     if not isinstance(entries, list):
         return None
     out: list[dict[str, object]] = []
-    for e in entries[:MAX_ENTRIES]:
+    for e in entries[-MAX_ENTRIES:]:   # the newest steps
         if not isinstance(e, dict):
             return None
         out.append({str(k)[:30]: _scalar(v) for k, v in list(e.items())[:20]})
     return out
 
 
+class TraceBusy(Exception):
+    """The report file's lock was not free within :data:`LOCK_WAIT_SECS`; the page posts again later."""
+
+
 def record(queue_dir: str | os.PathLike[str], device_id: str | None, entries: list[dict[str, object]],
            *, page: object = None) -> int:
-    """Append one report (the newest :data:`KEEP` stay); returns how many reports are kept."""
-    path = Path(queue_dir) / FILE
+    """Add one report (the newest :data:`KEEP` stay) and return how many reports are kept. The file is replaced whole
+    (a temp file in the same directory, then ``os.replace``), so a reader sees the old file or the new one, never a half
+    written one; the lock is a sidecar file taken without blocking past :data:`LOCK_WAIT_SECS`. Raises
+    :class:`TraceBusy` on a lock timeout and ``OSError`` when the directory cannot be written."""
+    d = Path(queue_dir)
     row = json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "device": device_id, "page": _scalar(page),
                       "entries": entries}, separators=(",", ":"))
-    with open(path, "a+", encoding="utf-8") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        f.seek(0)
-        lines = [ln for ln in f.read().splitlines() if ln.strip()][-(KEEP - 1):] + [row]
-        f.seek(0)
-        f.truncate()
-        f.write("\n".join(lines) + "\n")
+    lock = os.open(d / (FILE + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_SECS
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TraceBusy from None
+                time.sleep(0.02)
+        old = [ln for ln in _text(d).splitlines() if ln.strip()]
+        lines = (old[-(KEEP - 1):] if KEEP > 1 else []) + [row]
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=FILE + ".")        # mode 0600
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, d / FILE)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return len(lines)
+    finally:
+        os.close(lock)
+
+
+def _text(d: Path) -> str:
+    try:
+        return (d / FILE).read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def reports(queue_dir: str | os.PathLike[str]) -> list[dict[str, object]]:
     """Every kept report, oldest first; an unreadable line is skipped."""
-    try:
-        text = (Path(queue_dir) / FILE).read_text(encoding="utf-8")
-    except OSError:
-        return []
     out = []
-    for ln in text.splitlines():
+    for ln in _text(Path(queue_dir)).splitlines():
         try:
-            out.append(json.loads(ln))
+            row = json.loads(ln)
         except ValueError:
             continue
+        if isinstance(row, dict):
+            out.append(row)
     return out
 
 
@@ -81,7 +116,8 @@ def _clock(ms: object) -> str:
 def render(report: dict[str, object]) -> str:
     """One report as plain lines, steps in time order."""
     rows = [f"report {report.get('at')} device={report.get('device')} page={report.get('page')}"]
-    entries = [e for e in report.get("entries", []) if isinstance(e, dict)]
+    raw = report.get("entries")
+    entries = [e for e in (raw if isinstance(raw, list) else []) if isinstance(e, dict)]
     for e in sorted(entries, key=lambda e: e.get("t") if isinstance(e.get("t"), (int, float)) else 0):
         rest = " ".join(f"{k}={v}" for k, v in e.items() if k not in ("t", "src", "step"))
         rows.append(f"  {_clock(e.get('t'))} {e.get('src')}/{e.get('step')} {rest}".rstrip())

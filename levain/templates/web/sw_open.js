@@ -127,6 +127,46 @@
   // once, at this document's first script run: a pageshow call would let a page opened for one tap consume a later tap's entry
   checkPending();
 
+  // The trace REPORT: the ring posted to /webpush/trace with the key this paired page holds in localStorage (the same key
+  // pair_card.js posts opens with), so a tap test needs only the tap and the operator reads the report at the laptop
+  // (levain.webpush.tap_report). Every page that loads this script reports, so a tap landing on any of them is read. Step
+  // names, counts and path-only urls: no token, no ping body. Best effort and silent; one post per new ring head, compared by
+  // its cache key and never by clock order (a device clock that moved back must not hide a trace).
+  const SENT_KEY = "levain_trace_sent", BODY_MAX = 6500;   // bytes: the push family's body cap is 8192
+  let reporting = false;
+  async function reportTrace() {
+    let key = "";
+    try { key = window.localStorage.getItem("levain_write_token") || ""; } catch (_) { /* no storage: no key */ }
+    if (reporting || !key || !haveCache) return;
+    reporting = true;
+    try {
+      const c = await caches.open(TRACE_CACHE);
+      const got = [];
+      for (const req of await c.keys()) {
+        const k = new URL(req.url).pathname;
+        if (k.indexOf(TRACE_PREFIX) !== 0) continue;
+        try { const e = await (await c.match(req)).json(); if (e && typeof e === "object" && Number.isFinite(e.t)) got.push({ k, e }); } catch (_) { /* skipped */ }
+      }
+      if (!got.length) return;
+      got.sort((a, b) => (a.k < b.k ? -1 : 1));
+      const head = got[got.length - 1].k;
+      let sent = "";
+      try { sent = window.localStorage.getItem(SENT_KEY) || ""; } catch (_) { /* none */ }
+      if (head === sent) return;
+      let keep = got.map((x) => x.e);
+      while (keep.length > 1 && new TextEncoder().encode(JSON.stringify(keep)).length > BODY_MAX) keep = keep.slice(1);   // drop the oldest
+      const res = await fetch("/webpush/trace", { method: "POST", cache: "no-store",
+        headers: { "Content-Type": "application/json", "X-Levain-Write-Token": key }, body: JSON.stringify({ page: location.pathname, entries: keep }) });
+      // settled by a 2xx or a 400 (this body will never be accepted); a refused key, a 429, a 5xx or a network failure retries
+      if ((res.status >= 200 && res.status < 300) || res.status === 400) { try { window.localStorage.setItem(SENT_KEY, head); } catch (_) { /* resent next time */ } }
+    } catch (_) { /* best effort: a report never reaches the page */ } finally { reporting = false; }
+  }
+  window.levainTraceReport = reportTrace;
+  // a moment after this page's own first steps are written, and again when the app comes forward
+  const reportSoon = () => { setTimeout(reportTrace, 2500); };
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") reportSoon(); });
+  reportSoon();
+
   // an uncontrolled page (opened before the worker took over) queues worker messages until this is called
   try { navigator.serviceWorker.startMessages(); } catch (_) { /* older engines deliver without it */ }
 })();
