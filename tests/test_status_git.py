@@ -128,3 +128,29 @@ def test_one_tag_claimed_for_a_comma_list_of_shas_checks_each(repo) -> None:
     lines = [ln for ln in out.splitlines() if ln.startswith("| R1")]
     assert len(lines) == 3 and "UNPARSED" not in out
     assert lines[0].rstrip().endswith("| ok |") and lines[1].rstrip().endswith("| DRIFT |")      # b first shipped in v0.2.0
+
+
+def test_a_second_write_changes_nothing_even_with_an_unparsed_cell(repo, tmp_path: Path) -> None:
+    mod, _work, s = repo
+    f = tmp_path / "STATUS.md"
+    f.write_text(f"# s\n## t\n| R1 | a | b | `rel {s['a']}` -> v0.1.0; `rel zzz` | z |\n", encoding="utf-8")
+    assert mod.main(["ancestry", str(f), "--write"]) == 0
+    once = f.read_text(encoding="utf-8")
+    assert once.count("UNPARSED") == 1
+    assert mod.main(["ancestry", str(f), "--write"]) == 0 and f.read_text(encoding="utf-8") == once
+
+
+def test_an_unreadable_occurrence_is_found_by_position_and_a_build_suffix_is_read(repo) -> None:
+    mod, _work, s = repo
+    mod.pin_main()
+    out = mod.ancestry(f"| R1 | a | b | `rel {s['a']}` -> v0.1.0; `rel {s['a']}` | z |\n")
+    assert out.count("UNPARSED") == 1                       # the same text twice: the bare one still shows
+    assert mod.PAIR.search(f"`rel {s['a']}` -> v1.2.3-rc.1+build.7 |").group(2) == "v1.2.3-rc.1+build.7"
+
+
+def test_a_marker_free_file_with_no_heading_and_no_final_newline_still_round_trips(repo, tmp_path: Path) -> None:
+    mod, _work, s = repo
+    f = tmp_path / "STATUS.md"
+    f.write_text(f"| R1 | a | b | `rel {s['a']}` -> v0.1.0 | z |", encoding="utf-8")
+    assert mod.main(["ancestry", str(f), "--write"]) == 0
+    assert mod.main(["ancestry", str(f), "--write"]) == 0

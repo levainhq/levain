@@ -30,10 +30,10 @@ import tempfile
 from pathlib import Path
 
 START, END = "<!-- GEN:git-ancestry -->", "<!-- /GEN:git-ancestry -->"
-TAG = r"v\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.\-]+)?"
+TAG = r"v\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.\-+]+)?"
 SHA = r"`rel ([0-9a-fA-F]{7,40})`"
 # one or more `rel <sha>` (comma separated) followed by -> <tag>: the tag is claimed for each of them
-PAIR = re.compile(r"((?:`rel [0-9a-fA-F]{7,40}`\s*,?\s*)+)->\s*(" + TAG + ")")
+PAIR = re.compile(r"((?:`rel [0-9a-fA-F]{7,40}`\s*,?\s*)+)->\s*(" + TAG + r")(?=[;,\s|`)]|$)")
 REL_ANY = re.compile(r"`rel [^`]*`")
 ROW = re.compile(r"^\|\s*([^|]+?)\s*\|")
 REF = "origin/main"
@@ -66,7 +66,10 @@ def pin_main() -> str:
 
 
 def resolves(sha: str) -> bool:
-    return git("rev-parse", "--verify", "--quiet", sha + "^{commit}").returncode == 0
+    got = git("rev-parse", "--verify", "--quiet", sha + "^{commit}")
+    if got.returncode not in (0, 1):                     # 1 = no such commit; anything else is git failing
+        raise GitError(f"git rev-parse {sha} failed: {got.stderr.strip()}")
+    return got.returncode == 0
 
 
 def first_tag(sha: str) -> str | None:
@@ -99,18 +102,28 @@ def pairs(text: str) -> list[tuple[str, str, str]]:
 
 
 def unparsed(text: str) -> list[tuple[str, str]]:
-    """(row id, cell text) for every `rel ...` cell in a table row that :data:`PAIR` did not read, so a form the tool does
-    not understand shows as a row instead of vanishing from the count."""
+    """(row id, cell text) for every `rel ...` cell in a table row that no :data:`PAIR` match covers (by position, so a cell
+    that repeats a read one's text still shows), so a form the tool does not understand is a row instead of a silence."""
     out = []
     for line in text.splitlines():
         m = ROW.match(line)
         if not m or not line.startswith("|"):
             continue
-        read = {f"`rel {sha}`" for group, _ in PAIR.findall(line) for sha in re.findall(SHA, group)}
-        for cell in REL_ANY.findall(line):
-            if cell not in read:
-                out.append((m.group(1), cell))
+        covered = [c.span(1) for c in PAIR.finditer(line)]
+        for cell in REL_ANY.finditer(line):
+            if not any(a <= cell.start() and cell.end() <= b for a, b in covered):
+                out.append((m.group(1), cell.group(0)))
     return out
+
+
+def without_block(text: str) -> str:
+    """``text`` minus a generated block, so the tool never reads its own output back as input (a second run must change
+    nothing). A malformed marker pair is :func:`splice`'s to refuse; here it leaves the text whole."""
+    starts = [m.start() for m in re.finditer(r"^" + re.escape(START) + r"[ \t]*$", text, re.M)]
+    ends = [m.end() for m in re.finditer(r"^" + re.escape(END) + r"[ \t]*$", text, re.M)]
+    if len(starts) == 1 and len(ends) == 1 and starts[0] < ends[0]:
+        return text[:starts[0]] + text[ends[0]:]
+    return text
 
 
 def ancestry(text: str) -> str:
@@ -142,7 +155,8 @@ def splice(text: str, block: str) -> str:
     if not starts and not ends:
         m = re.search(r"^## ", text, re.M)
         at = m.start() if m else len(text)
-        return text[:at] + block + "\n\n" + text[at:]
+        lead = "" if at == 0 or text[:at].endswith("\n") else "\n"
+        return text[:at] + lead + block + "\n\n" + text[at:]
     if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
         raise ValueError(f"the status file has {len(starts)} start and {len(ends)} end markers (or them out of order): fix by hand")
     return text[:starts[0]] + block + text[ends[0]:]
@@ -163,20 +177,28 @@ def write_atomic(path: Path, text: str) -> None:
         raise
 
 
+def need(*args: str) -> str:
+    got = git(*args)
+    if got.returncode != 0:
+        raise GitError(f"git {' '.join(args[:2])} failed: {got.stderr.strip()}")
+    return got.stdout.strip()
+
+
 def state(branches: int) -> str:
-    tip = git("log", "-1", "--format=%h %ad %s", "--date=format:%m-%d %H:%M", MAIN).stdout.strip()
-    tag = git("describe", "--tags", "--abbrev=0", "--match", "v*", MAIN).stdout.strip()
-    if not tip:
-        raise GitError("git log could not read the tip of " + REF)
-    since = git("rev-list", "--count", f"{tag}..{MAIN}").stdout.strip() if tag else "?"
-    out = [f"- main: `{tip}`", f"- newest tag: {tag or '(none)'}, {since} commits on main since it"]
-    refs = git("for-each-ref", "refs/remotes/origin/seat", "--sort=-committerdate", f"--count={branches}",
-               "--format=%(refname:short)%1f%(objectname:short)%1f%(committerdate:format:%m-%d %H:%M)").stdout.splitlines()
+    tip = need("log", "-1", "--format=%h %ad %s", "--date=format:%m-%d %H:%M", MAIN)
+    described = git("describe", "--tags", "--abbrev=0", "--match", "v*", MAIN)       # pin_main saw tags exist; none reachable is allowed
+    tag = described.stdout.strip() if described.returncode == 0 else ""
+    since = need("rev-list", "--count", f"{tag}..{MAIN}") if tag else "?"
+    out = [f"- main: `{tip}`", f"- newest tag: {tag or '(none reachable)'}, {since} commits on main since it"]
+    # the full object id is what every later question asks (a ref name read back from a replacement-decoded line, or a ref that
+    # moved since, would not identify the commit shown); the name is only for display
+    refs = need("for-each-ref", "refs/remotes/origin/seat", "--sort=-committerdate", f"--count={branches}",
+                "--format=%(objectname)%1f%(refname:short)%1f%(committerdate:format:%m-%d %H:%M)").splitlines()
     out.append(f"- newest {len(refs)} seat branches (commits main lacks, merged?):")
     for line in refs:
-        ref, sha, when = line.split("\x1f")
-        ahead = git("rev-list", "--count", f"{MAIN}..{ref}").stdout.strip()
-        out.append(f"  - `{ref}` {sha} ({when}): {ahead} ahead, {'merged' if on_main(ref) else 'NOT merged'}")
+        oid, ref, when = line.split("\x1f")
+        ahead = need("rev-list", "--count", f"{MAIN}..{oid}")
+        out.append(f"  - `{ref}` {oid[:8]} ({when}): {ahead} ahead, {'merged' if on_main(oid) else 'NOT merged'}")
     return "\n".join(out)
 
 
@@ -194,9 +216,9 @@ def main(argv: list[str]) -> int:
         if args.cmd == "state":
             print(state(args.branches))
             return 0
-        path = Path(args.status_file)
+        path = Path(os.path.realpath(args.status_file))      # a symlinked status file is written through, never replaced
         text = path.read_text(encoding="utf-8")            # one snapshot: what is checked is what is spliced
-        block = ancestry(text)
+        block = ancestry(without_block(text))
         if args.write:
             write_atomic(path, splice(text, block))
         else:
