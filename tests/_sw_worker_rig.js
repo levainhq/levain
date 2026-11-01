@@ -4,9 +4,10 @@
 const fs = require('fs');
 const vm = require('vm');
 
-const [swPath, scenario] = process.argv.slice(2);
+const [swPath, scenario, mode] = process.argv.slice(2);
 const listeners = {};
-const log = { fetches: 0, opened: [], posted: [], claimed: false, skipWaiting: false, windows: [] };
+const log = { fetches: 0, opened: [], posted: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
+let uncontrolled = [];   // windows only matchAll({includeUncontrolled: true}) returns
 
 // --- IndexedDB: databases by name, each with object stores that are Maps ---------------------------------------------
 const dbs = new Map();   // name -> {version, stores: Map(storeName -> Map)}
@@ -65,8 +66,8 @@ const self_ = {
   registration: { showNotification: async () => {} },
   clients: {
     claim: async () => { log.claimed = true; },
-    matchAll: async () => log.windows.slice(),
-    openWindow: async () => { log.openWindow = true; },
+    matchAll: async (o) => log.windows.concat((o && o.includeUncontrolled) ? uncontrolled : []),
+    openWindow: async (u) => { log.openWindow = true; log.openedUrl = u; },
   },
 };
 const sandbox = {
@@ -94,6 +95,16 @@ function fire(type, ev) {
     log.dbs = [...dbs.keys()].sort();
     log.caches = [...cacheNames].sort();
     log.keptOpened = [...(dbs.get('levain-sw-2').stores.get('opened').entries())];
+  } else if (scenario === 'navigate') {
+    // mode: controlled | uncontrolled | reject | null | crossorigin ; the window answers as a browser does
+    const win = (nav) => ({ url: 'https://box.example/cockpit', focus: async () => { log.focused += 1; }, navigate: nav, postMessage: () => {} });
+    const ok = async (u) => { log.navigated.push(u); return {}; };
+    if (mode === 'controlled' || mode === 'crossorigin') log.windows = [win(ok)];
+    else if (mode === 'uncontrolled') uncontrolled = [win(async () => { throw new TypeError("This service worker is not the client's active service worker."); })];
+    else if (mode === 'reject') log.windows = [win(async () => { throw new TypeError('navigate refused'); })];
+    else if (mode === 'null') log.windows = [win(async (u) => { log.navigated.push(u); return null; })];
+    const url = mode === 'crossorigin' ? 'https://evil.example/x' : '/sign/9#sign=a&v=1';
+    await fire('notificationclick', { notification: { close: () => {}, data: { url } } });
   } else if (scenario === 'click') {
     log.windows = [windowClient];
     let closed = false;

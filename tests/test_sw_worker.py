@@ -17,8 +17,8 @@ NODE = shutil.which("node")
 needs_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
 
 
-def _run(scenario: str) -> dict:
-    cp = subprocess.run([NODE, str(HERE / "_sw_worker_rig.js"), str(SW), scenario], capture_output=True, text=True,
+def _run(scenario: str, *extra: str) -> dict:
+    cp = subprocess.run([NODE, str(HERE / "_sw_worker_rig.js"), str(SW), scenario, *extra], capture_output=True, text=True,
                         timeout=60)
     assert cp.returncode == 0, cp.stdout + cp.stderr
     return json.loads(cp.stdout)
@@ -47,3 +47,40 @@ def test_a_tap_writes_the_ping_id_to_opened_makes_no_fetch_and_the_worker_hears_
     assert got["openedAfterNoPing"] == 1, got                        # a tap with no ping id writes nothing
     assert got["posted"] == [{"type": "levain-opened"}], got         # the nudge carries no data
     assert got["closed"] is True
+
+
+CARD = "https://box.example/sign/9#sign=a&v=1"
+
+
+@needs_node
+def test_a_tap_steers_a_window_the_worker_controls_and_opens_no_second_one() -> None:
+    got = _run("navigate", "controlled")
+    assert got["navigated"] == [CARD] and got["focused"] == 1, got
+    assert "openWindow" not in got, got
+
+
+@needs_node
+def test_a_tap_with_only_an_uncontrolled_window_opens_the_card() -> None:
+    """Reproduced in headless Chrome 10-31: WindowClient.navigate() on a window opened before the worker took control
+    rejects with 'TypeError: This service worker is not the client's active service worker.', which the base worker's
+    catch swallowed, so the laptop tap changed nothing."""
+    got = _run("navigate", "uncontrolled")
+    assert got["openedUrl"] == CARD and got["navigated"] == [], got
+
+
+@needs_node
+def test_a_tap_whose_navigate_rejects_opens_the_card() -> None:
+    got = _run("navigate", "reject")
+    assert got["openedUrl"] == CARD, got
+
+
+@needs_node
+def test_a_tap_whose_navigate_resolves_null_opens_the_card() -> None:
+    got = _run("navigate", "null")
+    assert got["navigated"] == [CARD] and got["openedUrl"] == CARD, got
+
+
+@needs_node
+def test_a_cross_origin_url_still_opens_the_root() -> None:
+    got = _run("navigate", "crossorigin")
+    assert got["navigated"] == ["https://box.example/"], got

@@ -79,13 +79,18 @@ self.addEventListener('notificationclick', (e) => {
   if (!u || u.origin !== self.location.origin) u = new URL('/', self.location.origin);
   const url = u.href;
   const opened = (async () => {
-    const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    for (const c of all) {
-      if (new URL(c.url).origin === self.location.origin) {
-        await c.focus();
-        if ('navigate' in c) { try { await c.navigate(url); } catch (_) { /* keep the focused window */ } }
-        return;
-      }
+    // navigate() rejects (TypeError) on a window this worker does not control, one opened before it took over or kept
+    // across a hard reload, so only a controlled same-origin window is steered; any other path opens the card itself
+    const ctl = await self.clients.matchAll({ type: 'window' });
+    for (const c of ctl) {
+      if (new URL(c.url).origin !== self.location.origin) continue;
+      // focus() can be refused without user activation; the card still goes to this window
+      try { await c.focus(); } catch (_) { /* navigate anyway */ }
+      try {
+        // a null from navigate() is a navigation the browser refused: fall through to a new window
+        if (await c.navigate(url)) return;
+      } catch (_) { /* fall through to a new window */ }
+      break;
     }
     await self.clients.openWindow(url);
   })();
