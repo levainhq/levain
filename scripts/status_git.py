@@ -193,7 +193,8 @@ def state(branches: int) -> str:
     # the full object id is what every later question asks (a ref name read back from a replacement-decoded line, or a ref that
     # moved since, would not identify the commit shown); the name is only for display
     refs = need("for-each-ref", "refs/remotes/origin/seat", "--sort=-committerdate", f"--count={branches}",
-                "--format=%(objectname)%1f%(refname:short)%1f%(committerdate:format:%m-%d %H:%M)").splitlines()
+                "--format=%(objectname)%1f%(refname:short)%1f%(committerdate:format:%m-%d %H:%M)").split("\n")
+    refs = [r for r in refs if r]
     out.append(f"- newest {len(refs)} seat branches (commits main lacks, merged?):")
     for line in refs:
         oid, ref, when = line.split("\x1f")
