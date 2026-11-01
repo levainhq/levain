@@ -3,10 +3,14 @@
 The rules are flow's ``dream_snapshot.py`` rules, not its code (D1_EXECUTOR §3): a rollback refuses per FILE, verifies
 every snapshot file before it touches the store, keeps what it replaces, and a rerun finishes an interrupted one.
 
-A rollback restores the memory TEXT only. The wrap's db rows (its ``wraps`` row, pattern history, the episode
-watermark) stay, so the day's episodes still count as consolidated and are not offered to the next dream. Whether the
-NEXT save is accepted after a rollback was run by hand on a scratch store: anneal accepted it (format 2). The limit is
-stated in every rollback's output; closing it needs an anneal ``revert_wrap``.
+Two rollbacks, chosen by the public surface of the installed anneal-memory (``callable(Store.revert_wrap)``):
+
+* WITH ``revert_wrap``: the rollback verifies the snapshot, then asks anneal to undo the wrap. The day's episodes are
+  offered to the next dream. On a store that keeps its identity in the db anneal restores the identity itself (and
+  re-projects the files), so Levain does not write the text; when anneal restored none (``identity_version`` is
+  None) Levain restores the text after the revert.
+* WITHOUT it (anneal <= 1.0.2, format 2): the memory TEXT only. The wrap's db rows stay, so the day's episodes still
+  count as consolidated and are not offered to the next dream; every rollback's output says so.
 
 Layout, under one occurrence dir ``<root>/<occurrence id>/``:
 
@@ -43,9 +47,25 @@ KEEP_SNAPSHOTS = 2
 #: The only store format with a proven rollback (text files are the authority; the db is never restored).
 SUPPORTED_FORMAT = 2
 DRILL_CADENCE_S = 7 * 24 * 3600
+#: The store format whose identity lives in the db: only anneal's ``revert_wrap`` can undo a save on it.
+REVERT_FORMAT = 3
 
-LIMIT = ("The memory text is restored. The day's episodes are NOT re-offered: anneal still counts them as "
-         "consolidated until it has a revert_wrap, so the next dream starts from the episodes that arrive after this.")
+LIMIT = ("The memory text is restored. The day's episodes are NOT re-offered: this anneal-memory has no revert_wrap, "
+         "so anneal still counts them as consolidated and the next dream starts from the episodes that arrive after "
+         "this.")
+
+#: One line of remedy per ``WrapRevertRefused.code`` (printed with the code; never swallowed).
+REVERT_REMEDY = {
+    "not_latest": "a later dream has saved since; only the newest can be rolled back.",
+    "unknown_wrap": "anneal has no such wrap in this store; the snapshot's wrap id does not match it.",
+    "wrap_open": "a consolidation is in progress; cancel it first.",
+    "identity_moved": "the memory changed after this dream; a rollback would discard that change.",
+    "no_prior_identity": "this dream's save was the store's first identity, so there is no earlier text to restore.",
+    "episodes_gone": "some of the day's episodes were pruned or deleted, so reverting would discard the only summary "
+                     "of them; rerun with --allow-missing to revert anyway.",
+    "no_identity_version": "anneal holds no identity version for this wrap (it was recorded outside a save), so "
+                           "reverting it would leave its text in the identity.",
+}
 
 
 class SnapshotRefused(Exception):
@@ -349,6 +369,22 @@ def _refused(code: str, why: str) -> RollbackResult:
     return RollbackResult("refused", f"REFUSED ({code}): {why} Nothing was changed.", code=code)
 
 
+def _revert_store(db: Path) -> Any | None:
+    """An open anneal ``Store`` on ``db`` when this anneal-memory has ``revert_wrap`` (public surface only: no table
+    names, no version parsing), else None. A store that will not open is None too: the text-only rollback then runs
+    and its own checks decide."""
+    try:
+        from anneal_memory import Store
+    except ImportError:
+        return None
+    if not callable(getattr(Store, "revert_wrap", None)):
+        return None
+    try:
+        return Store(str(db), section_schema=None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _wrap_open(db: Path) -> bool:
     """True when a wrap is open on the store, or that cannot be told (the stricter reading)."""
     try:
@@ -407,7 +443,8 @@ def _later_blocker(occ_dir: Path, m: Mapping[str, Any]) -> str | None:
 
 def rollback(store_path: Path | str, occ_dir: Path | str, *, who: str = "operator",
              file_card: Callable[[dict[str, Any]], Any] | None = None,
-             lock: Callable[[Path], Any] | None = None) -> RollbackResult:
+             lock: Callable[[Path], Any] | None = None, allow_missing: bool = False,
+             lease_token: str | None = None) -> RollbackResult:
     """Restore the memory text the dream in ``occ_dir`` replaced (D1_EXECUTOR §3.2), one step, under the store lock.
 
     Refuses when a wrap is open, when there is no post record (no proof the live text is the dream's), when a rollback
@@ -416,7 +453,11 @@ def rollback(store_path: Path | str, occ_dir: Path | str, *, who: str = "operato
     its manifest hash. ``memory.db`` is never restored: episodes captured after the dream live there.
 
     ``file_card`` (D1-1c's card filer) is called with the ``rolled-back`` card spec after a successful restore; its
-    failure is recorded on the result, never raised, because the text is already restored."""
+    failure is recorded on the result, never raised, because the text is already restored.
+
+    When anneal has ``revert_wrap`` the wrap is undone through it (see the module docstring); ``allow_missing`` and
+    ``lease_token`` (the dream's lease, when it is live and the caller holds it) are passed to it. A refusal from
+    anneal restores nothing and comes back as a ``refused`` result carrying anneal's code and a one-line remedy."""
     from levain import wrap as _w
 
     db, occ_dir = Path(store_path).resolve(), Path(occ_dir)
@@ -424,13 +465,13 @@ def rollback(store_path: Path | str, occ_dir: Path | str, *, who: str = "operato
     if handle is _w._ANOTHER_WRAP_RUNNING:
         return _refused("lock-held", "another consolidate holds the store's wrap lock.")
     try:
-        return _rollback_locked(db, occ_dir, who, file_card)
+        return _rollback_locked(db, occ_dir, who, file_card, allow_missing=allow_missing, lease_token=lease_token)
     finally:
         _w._unlock_wrap(handle)
 
 
-def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None
-                     ) -> RollbackResult:
+def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+                     *, allow_missing: bool = False, lease_token: str | None = None) -> RollbackResult:
     m = read_manifest(occ_dir)
     if m is None:
         return _refused("no-snapshot", f"there is no snapshot under {occ_dir / SNAP_DIR}.")
@@ -443,9 +484,11 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
         if rec and rec.get("at"):
             # the card is rebuilt from the durable record, so a crash after `reverted_at` but before the card reached
             # the operator costs nothing: every rerun shows the same card
-            card = _rollback_card(occ_dir, str(rec.get("who") or who), str(rec["at"]), list(rec.get("files") or []))
+            limit = str(rec.get("limit") or LIMIT)
+            card = _rollback_card(occ_dir, str(rec.get("who") or who), str(rec["at"]), list(rec.get("files") or []),
+                                  limit, rec.get("revert_wrap"))
             return RollbackResult("already-reverted", f"already-reverted: this dream was already rolled back at "
-                                  f"{m['reverted_at']}; nothing was changed. {LIMIT}", code="already-reverted",
+                                  f"{m['reverted_at']}; nothing was changed. {limit}", code="already-reverted",
                                   restored=list(rec.get("files") or []), undo_dir=str(occ_dir / UNDO_DIR), card=card)
         return _refused("already-reverted", f"this dream was already rolled back at {m['reverted_at']}.")
     if _wrap_open(db):
@@ -454,10 +497,30 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
     pre = {k: e["sha256"] for k, e in m["files"].items()}
     post = m.get("post_files")
     live = tier_hashes(db)
-    if live == pre and m.get("revert_started_at"):
+    rec0 = _read_json(occ_dir / ROLLBACK_RECORD) or {}
+    rstore = _revert_store(db)
+    try:
+        return _rollback_checked(db, occ_dir, who, file_card, m, pre, post, live, rec0, rstore,
+                                 allow_missing, lease_token)
+    finally:
+        if rstore is not None:
+            with contextlib.suppress(Exception):
+                rstore.close()
+
+
+def _rollback_checked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+                      m: dict[str, Any], pre: dict[str, Any], post: Any, live: dict[str, str | None],
+                      rec0: dict[str, Any], rstore: Any | None, allow_missing: bool,
+                      lease_token: str | None) -> RollbackResult:
+    snap = occ_dir / SNAP_DIR
+    if live == pre and m.get("revert_started_at") and (rstore is None or (rec0.get("revert_wrap") or {}).get("receipt")):
         # an earlier rollback restored every file, then died before it finished: mark it finished
-        return _finish(occ_dir, m, who, [], file_card, finished=True)
-    if live == pre:
+        return _finish(occ_dir, m, who, [], file_card, finished=True,
+                       limit=_reoffer_text((rec0.get("revert_wrap") or {}).get("receipt")) if rstore is not None
+                       else LIMIT)
+    if live == pre and not (rstore is not None and m.get("revert_started_at")):
+        # (with revert_wrap, a started rollback whose revert may not have been recorded goes on: anneal answers
+        # already_reverted and the receipt is written)
         return RollbackResult("nothing", "nothing to roll back: the live text is already the one the snapshot holds.")
     if not post:
         return _refused("no-post", "the snapshot has no post-save record (it never ran, or the save did not land), so "
@@ -466,9 +529,14 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
     if blocker:
         return _refused("later-dream", blocker + ".")
     fmt = format_version(db)
-    if fmt != SUPPORTED_FORMAT:
+    if fmt != SUPPORTED_FORMAT and not (rstore is not None and fmt == REVERT_FORMAT):
         return _refused("format", f"the store's format_version is {fmt!r}; only {SUPPORTED_FORMAT} has a proven "
-                                  "rollback (on 3 the db is the identity authority and the files are projections).")
+                                  "rollback without revert_wrap (on 3 the db is the identity authority and the files "
+                                  "are projections, and only anneal's revert_wrap can undo a save there).")
+    wrap_id = m.get("wrap_id")
+    if rstore is not None and (isinstance(wrap_id, bool) or not isinstance(wrap_id, int)):
+        return _refused("no-wrap-id", f"the post record holds no wrap id ({wrap_id!r}), so anneal cannot be told which "
+                                      "wrap to revert.")
     # per FILE, not per tier: each live file must be what the dream saved or what it replaced. A rollback that died
     # halfway leaves a mix of the two, and a rerun finishes it; any third value is a later write.
     foreign = [k for k in live if live[k] not in (pre[k], post.get(k))]
@@ -479,7 +547,8 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
         if e["sha256"] is not None and sha256_file(snap / e["name"]) != e["sha256"]:
             return _refused("snapshot-damaged", f"{snap / e['name']} does not match its manifest hash.")
     undo = occ_dir / UNDO_DIR
-    if not m.get("revert_started_at"):
+    fresh = not m.get("revert_started_at")
+    if fresh:
         # only the FIRST attempt's copy holds the dream's text; a rerun never overwrites it
         shutil.rmtree(undo, ignore_errors=True)
         undo.mkdir(parents=True)
@@ -488,6 +557,16 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
                 shutil.copy2(src, undo / src.name)
         m["revert_started_at"] = _now()
         _write_manifest(occ_dir, m)
+    if rstore is not None:
+        return _revert_through_anneal(db, occ_dir, who, file_card, m, live, rec0, rstore, fresh, allow_missing,
+                                      lease_token)
+    return _restore_text(db, occ_dir, who, file_card, m, live, finished=False)
+
+
+def _restore_text(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+                  m: dict[str, Any], live: dict[str, str | None], *, finished: bool,
+                  limit: str = LIMIT, revert: dict[str, Any] | None = None) -> RollbackResult:
+    snap = occ_dir / SNAP_DIR
     restored: list[str] = []
     tier = text_tier(db)
     for key, e in m["files"].items():
@@ -500,16 +579,100 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
         if live[key] != e["sha256"]:
             _atomic_copy(snap / e["name"], dest)
             restored.append(dest.name)
-    return _finish(occ_dir, m, who, restored, file_card, finished=False)
+    return _finish(occ_dir, m, who, restored, file_card, finished=finished, limit=limit, revert=revert)
 
 
-def _rollback_card(occ_dir: Path, who: str, at: str, restored: list[str]) -> dict[str, Any]:
-    return {"kind": "rolled-back", "dedupe_key": f"dream-rollback:{occ_dir.name}", "occurrence": occ_dir.name,
-            "who": who, "at": at, "files": restored, "limit": LIMIT}
+def _receipt_dict(r: Any) -> dict[str, Any]:
+    names = ("wrap_id", "revert_id", "episodes_reoffered", "window_after", "last_wrap_id_after", "already_reverted",
+             "identity_version", "pattern_state_exact")
+    return {n: getattr(r, n, None) for n in names}
+
+
+def _revert_through_anneal(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+                           m: dict[str, Any], live: dict[str, str | None], rec0: dict[str, Any], rstore: Any,
+                           fresh: bool, allow_missing: bool, lease_token: str | None) -> RollbackResult:
+    """Undo the wrap through anneal's ``revert_wrap``. Progress is in rollback.json (``revert_wrap.called_at`` before
+    the call, ``.receipt`` after) beside the manifest's ``revert_started_at``; a rerun after a crash calls again and
+    anneal answers ``already_reverted``, after which any text step still owed runs."""
+    rec_path = occ_dir / ROLLBACK_RECORD
+    prior = dict(rec0.get("revert_wrap") or {})
+    rw = {**prior, "wrap_id": m["wrap_id"], "called_at": _now(),
+          "reason": f"levain dream rollback {occ_dir.name}", "actor": f"levain-dream:{who}",
+          "allow_missing": bool(allow_missing), "leased": bool(lease_token)}
+    rw.pop("receipt", None)
+    _write_json(rec_path, {**rec0, "revert_wrap": rw})
+    try:
+        receipt = rstore.revert_wrap(m["wrap_id"], reason=rw["reason"], actor=rw["actor"], lease_token=lease_token,
+                                     allow_missing=bool(allow_missing))
+    except BaseException as exc:
+        code = _refusal_code(exc)
+        if code is None:
+            raise
+        if fresh:
+            # nothing changed: the attempt leaves no mark, so it does not block an older dream's rollback either
+            m["revert_started_at"] = None
+            _write_manifest(occ_dir, m)
+            shutil.rmtree(occ_dir / UNDO_DIR, ignore_errors=True)
+            if rec0:
+                _write_json(rec_path, rec0)
+            else:
+                with contextlib.suppress(OSError):
+                    rec_path.unlink()
+        remedy = REVERT_REMEDY.get(code, "") if code != "lease_fenced" else (
+            "the dream's consolidation lease is live and the token given does not match; pass the right "
+            "--lease-token or wait for the lease to lapse.")
+        detail = str(getattr(exc, "detail", "") or exc)
+        return _refused(code, f"anneal refused the revert ({detail.rstrip('.')}). Remedy: {remedy}" if remedy
+                        else f"anneal refused the revert ({detail.rstrip('.')}).")
+    rec = _receipt_dict(receipt)
+    rw["receipt"], rw["reverted_at"] = rec, _now()
+    _write_json(rec_path, {**(_read_json(rec_path) or {}), "revert_wrap": rw})
+    reoffer = _reoffer_text(rec)
+    if rec["identity_version"] is not None:
+        # anneal restored the identity itself (appended a version and re-projected the files): Levain writes no text
+        after = tier_hashes(db)
+        restored = [text_tier(db)[k].name for k in after if after[k] != live[k]]
+        extra = ""
+        if any(after[k] != e["sha256"] for k, e in m["files"].items()):
+            extra = (" NOTE: the text files after anneal's revert are not byte-identical to the snapshot "
+                     "(anneal projects them from its identity); the snapshot copy is in " + str(occ_dir / SNAP_DIR) + ".")
+        return _finish(occ_dir, m, who, restored, file_card, finished=not fresh, limit=reoffer + extra, revert=rw,
+                       how="anneal restored the identity itself")
+    fresh_live = tier_hashes(db)
+    return _restore_text(db, occ_dir, who, file_card, m, fresh_live, finished=not fresh, limit=reoffer, revert=rw)
+
+
+def _reoffer_text(rec: Mapping[str, Any] | None) -> str:
+    if not rec:
+        return LIMIT
+    if rec.get("already_reverted"):
+        return "anneal had already reverted this wrap; nothing was reopened by this call."
+    return f"the day's {rec.get('episodes_reoffered')} episodes will be offered to the next dream."
+
+
+def _refusal_code(exc: BaseException) -> str | None:
+    """anneal's refusal code when ``exc`` is a revert refusal or a lease fence (by name and ``code``, so no anneal
+    import is needed at module scope), else None."""
+    names = {c.__name__ for c in type(exc).__mro__}
+    if "WrapRevertRefused" in names:
+        return str(getattr(exc, "code", "") or "refused")
+    if "LeaseFencedError" in names:
+        return "lease_fenced"
+    return None
+
+
+def _rollback_card(occ_dir: Path, who: str, at: str, restored: list[str], limit: str = LIMIT,
+                   revert: dict[str, Any] | None = None) -> dict[str, Any]:
+    card = {"kind": "rolled-back", "dedupe_key": f"dream-rollback:{occ_dir.name}", "occurrence": occ_dir.name,
+            "who": who, "at": at, "files": restored, "limit": limit}
+    if revert and revert.get("receipt"):
+        card["revert_wrap"] = revert["receipt"]
+    return card
 
 
 def _finish(occ_dir: Path, m: dict[str, Any], who: str, restored: list[str],
-            file_card: Callable[[dict[str, Any]], Any] | None, *, finished: bool) -> RollbackResult:
+            file_card: Callable[[dict[str, Any]], Any] | None, *, finished: bool, limit: str = LIMIT,
+            revert: dict[str, Any] | None = None, how: str = "") -> RollbackResult:
     # ``reverted_at`` is the LAST durable marker: it says the record and the card are both out. A rerun after a crash
     # (or a card that did not go) finds it unset, reuses the record already written and finishes the rest.
     rec_path = occ_dir / ROLLBACK_RECORD
@@ -517,16 +680,21 @@ def _finish(occ_dir: Path, m: dict[str, Any], who: str, restored: list[str],
     if prior and prior.get("at"):
         at, restored = str(prior["at"]), list(prior.get("files") or [])
         who = str(prior.get("who") or who)
+        limit = str(prior.get("limit") or limit)
+        revert = prior.get("revert_wrap") or revert
     else:
         at = _now()
-        _write_json(rec_path, {"who": who, "at": at, "files": restored,
-                               "finished_an_interrupted_rollback": finished, "limit": LIMIT})
-    card = _rollback_card(occ_dir, who, at, restored)
+        if revert is None and prior and prior.get("revert_wrap"):
+            revert = prior["revert_wrap"]
+        _write_json(rec_path, {**(prior or {}), "who": who, "at": at, "files": restored,
+                               "finished_an_interrupted_rollback": finished, "limit": limit,
+                               **({"revert_wrap": revert} if revert else {})})
+    card = _rollback_card(occ_dir, who, at, restored, limit, revert)
     res = RollbackResult("finished" if finished else "rolled-back", "", restored=restored,
                          undo_dir=str(occ_dir / UNDO_DIR), card=card)
     res.message = (f"{'finished the interrupted rollback of' if finished else 'rolled back'} {occ_dir.name}: "
-                   f"restored {', '.join(restored) or 'nothing further'}; the text it replaced is kept in "
-                   f"{occ_dir / UNDO_DIR}. {LIMIT}")
+                   f"{(how + '; ') if how else ''}restored {', '.join(restored) or 'nothing further'}; the text it "
+                   f"replaced is kept in {occ_dir / UNDO_DIR}. {limit}")
     if file_card is not None:
         try:
             file_card(card)

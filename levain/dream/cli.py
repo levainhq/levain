@@ -18,10 +18,12 @@ from pathlib import Path
 
 
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
-    p = subparsers.add_parser("dream", help="Dreaming (only `run` on a store copy exists in this release).",
+    p = subparsers.add_parser("dream", help="Dreaming: run (on a store copy), rollback, recover, drill. Nothing is scheduled.",
                               allow_abbrev=False,
-                              description="Consolidate a store through a compose mind. Only `run` on a COPY of a "
-                                          "store is built; nothing is scheduled.")
+                              description="Consolidate a store through a compose mind. Verbs: `run` (one consolidate "
+                                          "of a store COPY), `rollback` (undo the newest dream, one step), "
+                                          "`recover` (settle a dream that did not end cleanly) and `drill` (prove "
+                                          "the latest snapshot restores, on a scratch copy). Nothing is scheduled.")
     p.set_defaults(func=run_dream)
     sub = p.add_subparsers(dest="dream_command")
     r = sub.add_parser("run", allow_abbrev=False, help="Consolidate a store COPY once.",
@@ -50,10 +52,16 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     r.set_defaults(func=run_dream_run)
     rb = sub.add_parser("rollback", allow_abbrev=False, help="Restore the memory text a dream replaced (one step).",
                         description="Restore the memory TEXT the dream replaced, from its snapshot. One step: only the "
-                                    "newest dream, only if the live text is what it saved or replaced. memory.db is "
-                                    "never restored, so the day's episodes stay counted as consolidated.")
+                                    "newest dream, only if the live text is what it saved or replaced. With an "
+                                    "anneal-memory that has revert_wrap the wrap is undone through it and the "
+                                    "day's episodes are offered to the next dream; without it only the text is "
+                                    "restored (memory.db is not) and the episodes stay counted as consolidated.")
     _store_and_occurrence(rb)
     rb.add_argument("--who", default="operator", help="Recorded in rollback.json.")
+    rb.add_argument("--allow-missing", action="store_true",
+                    help="revert_wrap: revert even though some of the day's episodes no longer exist.")
+    rb.add_argument("--lease-token", default=None,
+                    help="revert_wrap: the dream's consolidation lease token, when that lease is live and you hold it.")
     rb.add_argument("--json", action="store_true")
     rb.set_defaults(func=run_dream_rollback)
     rc = sub.add_parser("recover", allow_abbrev=False, help="Settle the store side of a dream that did not end cleanly.",
@@ -81,7 +89,7 @@ def _store_and_occurrence(p: argparse.ArgumentParser) -> None:
 
 
 def run_dream(args: argparse.Namespace) -> int:
-    print("levain dream: not built in this release (only `levain dream run --store-dir <copy>` exists)",
+    print("levain dream: name a verb: run, rollback, recover or drill (see `levain dream --help`)",
           file=sys.stderr)
     return 1
 
@@ -225,12 +233,16 @@ def run_dream_rollback(args: argparse.Namespace) -> int:
     got = _store_and_occ("rollback", args)
     if got is None:
         return 2
-    res = snap.rollback(got[0], got[1], who=args.who)
+    res = snap.rollback(got[0], got[1], who=args.who, allow_missing=bool(getattr(args, "allow_missing", False)),
+                        lease_token=getattr(args, "lease_token", None) or None)
     if args.json:
         print(json.dumps({"outcome": res.outcome, "code": res.code, "message": res.message, "restored": res.restored,
                           "card": res.card}, sort_keys=True))
     else:
         print(f"levain dream rollback: {res.message}")
+        rw = (res.card or {}).get("revert_wrap")
+        if rw:
+            print(f"  anneal receipt: {json.dumps(rw, sort_keys=True)}")
         if res.card:
             print(f"  card to file: {json.dumps(res.card, sort_keys=True)}")
     return 0 if res.ok else 1
