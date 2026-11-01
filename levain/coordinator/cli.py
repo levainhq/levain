@@ -1349,6 +1349,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             return _coord_reply(args, out, store)
         if cmd == "review":
             return _coord_review(args, out, store)
+        if cmd == "ready":
+            return _coord_ready(args, out, store)
         if cmd == "launch":
             from levain.coordinator.launch import launch_session
 
@@ -1614,6 +1616,50 @@ def _coord_reply(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
                            "covers": {"after": r.after, "through": r.through}},
           f"replied to drop {r.drop_id} ({r.surface}): reply {r.reply_id}, shown on the Coordinator panel"
           + (f"\n{r.block}" if r.block else ""))
+    return 0
+
+
+def _ready_line(it: dict[str, Any]) -> str:
+    held = f"  [held: {it['held_reason']}]" if it.get("held_reason") else ""
+    return (f"{it['id']}  {it['repo']}  {it['status_category']}  {it['tier'] or '-'}  rank {it['rank']}  "
+            f"{it['title']}{held}")
+
+
+def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord ready show|add|move|correct`` (C13): the ready queue. ``show`` is a read (no lease, no
+    coordinator live). A write maps exactly to ``ready.add`` / ``move`` / ``correct`` and is fenced by the live lease
+    token (``--token``); every refusal is printed plainly and exits 2, with nothing written. On success it prints the
+    journal record's id (item and version)."""
+    from levain.coordinator import ready
+
+    verb = args.ready_cmd
+    try:
+        if verb == "show":
+            if _no_store(store):
+                _emit(out, args.json, {"schema": ready.SCHEMA_VERSION, "items": [], "unreadable": [], "store": None},
+                      f"{NO_STORE}: nothing is queued")
+                return 0
+            got = ready.list_ready(store, all=args.all, repo=args.repo)
+            lines = [_ready_line(i) for i in got["items"]] or ["nothing queued"]
+            lines += [f"unreadable: {u}" for u in got["unreadable"]]
+            _emit(out, args.json, got, "\n".join(lines))
+            return 0
+        given = {"title": args.title, "tier": args.tier, "done_line": args.done_line, "rank": args.rank,
+                 "depends_on": args.depends_on}
+        extra = {k: v for k, v in given.items() if v is not None}
+        if verb == "add":
+            rec = ready.add(store, args.token, args.item_id, repo=args.repo, title=args.title, who=args.who,
+                            why=args.why, to=args.to, tier=args.tier, done_line=args.done_line,
+                            depends_on=args.depends_on or (), rank=args.rank)
+        else:
+            rec = (ready.move if verb == "move" else ready.correct)(store, args.token, args.item_id, to=args.to,
+                                                                    who=args.who, why=args.why, **extra)
+        ver = len(ready.journal(store, args.item_id))
+    except _REFUSED as exc:
+        print(f"levain coord ready {verb}: {exc}", file=sys.stderr)
+        return 2
+    _emit(out, args.json, {"journal_id": f"{rec['id']}@{ver}", "record": rec},
+          f"{verb}: {rec['id']} {rec['from_category'] or '-'} -> {rec['to_category']}; journal {rec['id']}@{ver}")
     return 0
 
 
@@ -2045,6 +2091,36 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                      help="Also print what the open does not derive or build, and its read scope.")
     cop.add_argument("--read-back-file", dest="read_back_file", type=Path, default=None, metavar="PATH")
     cop.add_argument("--token", type=int, default=None, help="Your coordinator lease token.")
+    crd = c_sub.add_parser(
+        "ready", help="The ready queue: show it (a read), or add, move and correct an item (the coordinator's write).",
+        description="show reads the queue with no coordinator live. add, move and correct are the coordinator's: each "
+                    "needs --token (the live lease's, levain coord status shows it), --who and --why, writes one "
+                    "journal record, and prints its id. A refusal exits 2 and writes nothing. needs-you is the "
+                    "band's, never a move target.")
+    rd_sub = crd.add_subparsers(dest="ready_cmd", required=True)
+    ready_leaves: list[argparse.ArgumentParser] = []
+    rds = rd_sub.add_parser("show", help="The queue: effectively-ready items (--all: every column).")
+    rds.add_argument("--all", action="store_true", help="Every column, not only ready.")
+    rds.add_argument("--repo", default=None, help="Only this repo.")
+    ready_leaves.append(rds)
+    for verb, what in (("add", "A new item (backlog unless --to says)."), ("move", "Move an item to --to."),
+                       ("correct", "Correct a wrong state: a new record, never an edit of an old one.")):
+        rdw = rd_sub.add_parser(verb, help=what)
+        rdw.add_argument("item_id", metavar="ITEM")
+        rdw.add_argument("--token", type=int, default=None, help="The live coordinator lease's token (required).")
+        rdw.add_argument("--who", default=None, help="Who makes this change.")
+        rdw.add_argument("--why", default=None, help="Why (one line; goes in the journal).")
+        rdw.add_argument("--to", required=verb != "add", default="backlog" if verb == "add" else None,
+                         help="The category (backlog, ready, running, waiting, done).")
+        rdw.add_argument("--title", default=None, required=verb == "add")
+        rdw.add_argument("--tier", default=None, help="sonnet, opus or haiku.")
+        rdw.add_argument("--done-line", dest="done_line", default=None)
+        rdw.add_argument("--rank", type=int, default=None)
+        rdw.add_argument("--depends-on", dest="depends_on", nargs="*", default=None, metavar="ITEM",
+                         help="Item ids it waits on (none given: clears them).")
+        if verb == "add":
+            rdw.add_argument("--repo", required=True, help="The item's repo (fixed at add).")
+        ready_leaves.append(rdw)
     chn = c_sub.add_parser("handoff", help="Read the handoffs coordinators left.")
     chn_sub = chn.add_subparsers(dest="handoff_cmd", required=True)
     chs = chn_sub.add_parser("show", help="The latest handoff, or the one named.",
@@ -2081,6 +2157,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                      help="Whole seconds >= 1: the kernel ends the run (SIGALRM) if it is still going after this "
                           "long. 0 or omitted: no bound.")
     for p in (rvl, rvc, rvo, rvf):
+        common(p)
+        p.set_defaults(func=run_coord)
+    for p in ready_leaves:
         common(p)
         p.set_defaults(func=run_coord)
     for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, cbu, clg, crp, ccl, cop, chs):
