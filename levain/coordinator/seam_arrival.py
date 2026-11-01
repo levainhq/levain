@@ -13,6 +13,7 @@ Nothing here watches: the leave is consumed whenever ``coord open --light`` runs
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
@@ -117,7 +118,8 @@ def _activity(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 def silence(store: Any, *, gap_hours: float = SILENCE_GAP_HOURS) -> Silence:
     """The gap rule. The newest operator activity record fires when the record before it is at least ``gap_hours``
     older. With fewer than two records there is no gap to measure, and the answer says so rather than firing."""
-    if gap_hours < 0:
+    if not isinstance(gap_hours, (int, float)) or isinstance(gap_hours, bool) or not math.isfinite(gap_hours) \
+            or gap_hours < 0:
         raise CoordError("the gap is a number of hours, zero or more")
     with closing(store._connect()) as conn:
         recent = _activity(conn)

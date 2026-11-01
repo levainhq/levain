@@ -134,9 +134,48 @@ def test_a_verified_away_off_is_one_leave_and_one_open(world, cockpit, qdir, cap
     rows = sql(world, "SELECT signal_kind, signal_key, seam_kind FROM open_builds")
     assert rows == [("away_off", f"claude_code:{leaves[0].mark_id}", "operator")]
     assert len(sql(world, "SELECT 1 FROM arrival_signals")) == 1
-    again = light(qdir, capsys, world.token)               # the same leave is the same open
+
+
+def _open_id(out):
+    return out.split("--\nopen ")[1].split(" (")[0]
+
+
+def test_a_built_leave_is_offered_until_acknowledged_then_never_again(world, cockpit, qdir, capsys):
+    away_on(qdir, "claude_code")
+    away_off(cockpit, qdir, "claude_code")
+    first = light(qdir, capsys, world.token).out
+    again = light(qdir, capsys, world.token).out            # built, not acknowledged: offered once more, same open
+    assert again.count("~~~ OPEN ") == 1 and "coord open --ack" in again and _open_id(again) == _open_id(first)
     assert len(sql(world, "SELECT 1 FROM open_builds")) == 1 and len(sql(world, "SELECT 1 FROM arrival_signals")) == 1
-    assert again.out.split("--\nopen ")[1].split(" (operator)")[0] == out.out.split("--\nopen ")[1].split(" (operator)")[0]
+    run(qdir, capsys, "open", "--ack", _open_id(first), "--token", str(world.token))
+    deliveries = sql(world, "SELECT * FROM open_deliveries")
+    done = light(qdir, capsys, world.token).out             # built and acknowledged: nothing new
+    assert done.strip().startswith(f"already acknowledged: open {_open_id(first)} (away_off:claude_code:")
+    assert "~~~ OPEN " not in done and "coord open --ack" not in done
+    assert len(sql(world, "SELECT 1 FROM open_builds")) == 1 and sql(world, "SELECT * FROM open_deliveries") == deliveries
+    as_json = json.loads(light(qdir, capsys, world.token, "--json").out)
+    assert as_json["opens"] == [] and as_json["already_acknowledged"] == [int(_open_id(first))]
+
+
+def test_an_acknowledged_leave_does_not_hide_a_new_one(world, cockpit, qdir, capsys):
+    away_on(qdir, "claude_code")
+    away_off(cockpit, qdir, "claude_code")
+    first = light(qdir, capsys, world.token).out
+    run(qdir, capsys, "open", "--ack", _open_id(first), "--token", str(world.token))
+    away_on(qdir, "codex")
+    away_off(cockpit, qdir, "codex")
+    both = light(qdir, capsys, world.token).out
+    assert f"already acknowledged: open {_open_id(first)} (away_off:claude_code:" in both
+    assert both.count("~~~ OPEN ") == 1 and _open_id(both) != _open_id(first)
+
+
+def test_a_tilde_queue_dir_is_expanded(world, cockpit, qdir, capsys, tmp_path, monkeypatch):
+    away_on(qdir, "claude_code")
+    away_off(cockpit, qdir, "claude_code")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    tilde = "~/" + str(qdir.relative_to(tmp_path))
+    assert main(["coord", "open", "--light", "--token", str(world.token), "--queue-dir", tilde]) == 0
+    assert capsys.readouterr().out.count("~~~ OPEN ") == 1
 
 
 def test_a_leave_signed_by_a_revoked_key_opens_nothing(world, cockpit, qdir, capsys):
@@ -236,6 +275,16 @@ def test_light_fires_on_the_gap_and_a_repeat_is_the_same_open(world, qdir, clock
     assert "zero or more" in err
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "NaN"])
+def test_a_gap_that_is_not_finite_is_refused(world, qdir, capsys, value):
+    with pytest.raises(SystemExit) as exc:
+        main(["coord", "open", "--light", "--token", str(world.token), f"--gap-hours={value}", "--queue-dir", str(qdir)])
+    assert exc.value.code == 2 and "finite number of hours" in capsys.readouterr().err
+    with pytest.raises(Exception, match="zero or more"):
+        seam_arrival.silence(world, gap_hours=float(value))
+    assert sql(world, "SELECT 1 FROM open_builds") == []
+
+
 # --- the Missing close row ----------------------------------------------------------------------------------------
 def _brief(world, qdir, clock):
     return seam.open_brief(world, qdir, "light", clock()).text
@@ -273,3 +322,17 @@ def test_an_unreadable_queue_is_cannot_derive_for_missing_close_not_zero(world, 
     (qdir / "queue.db").write_bytes(b"this is not a database")
     text = _brief(world, qdir, clock)
     assert "Missing close: cannot-derive" in text
+
+
+def test_missing_close_compares_instants_not_strings_of_mixed_precision(monkeypatch):
+    # a close in the same wall second as, but before, the mark: as strings it sorts later ('Z' > '.')
+    mark, close = "2026-10-31T12:00:00.500000Z", "2026-10-31T12:00:00Z"
+    assert close > mark
+    monkeypatch.setattr(seam.morning, "_away", lambda _q: {"claude_code": {"since": mark}})
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE seam_handoffs (handoff_id INTEGER PRIMARY KEY, seam_kind TEXT, written_at TEXT)")
+    conn.execute("INSERT INTO seam_handoffs (seam_kind, written_at) VALUES ('operator', ?)", (close,))
+    rows = seam._missing_close(conn, Path("unused"), {"seam_handoffs"})
+    assert rows[0].startswith("Missing close: operator seam began ") and "before it" in rows[0]
+    conn.execute("INSERT INTO seam_handoffs (seam_kind, written_at) VALUES ('operator', '2026-10-31T12:00:01Z')")
+    assert seam._missing_close(conn, Path("unused"), {"seam_handoffs"}) == [seam._MISSING_ZERO]

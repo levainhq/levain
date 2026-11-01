@@ -1635,6 +1635,18 @@ def _int_in(low: int, high: int) -> Callable[[str], int]:
     return parse
 
 
+def _gap_hours(text: str) -> float:
+    """An argparse type for ``--gap-hours``: a finite number. ``nan`` and ``inf`` are argparse's one-line refusal
+    (exit 2): neither is a gap that could ever be met or measured. A negative one is the gap rule's own refusal."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text[:40]!r} is not a number of hours") from None
+    if value != value or value in (float("inf"), float("-inf")):
+        raise argparse.ArgumentTypeError(f"must be a finite number of hours, got {text[:40]}")
+    return value
+
+
 def _coord_c6(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     """``levain coord morning|away|budget`` (C6): the morning card, away from your word, the thread budget gauges."""
     from levain.coordinator import budget, morning
@@ -2045,7 +2057,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     cop.add_argument("--light", action="store_true",
                      help="Open for an arrival: a verified away OFF (one open per agent) or a gap in the operator's "
                           "activity. Prints 'no light open needed' when neither.")
-    cop.add_argument("--gap-hours", dest="gap_hours", type=float, default=_seam_arrival.SILENCE_GAP_HOURS, metavar="H",
+    cop.add_argument("--gap-hours", dest="gap_hours", type=_gap_hours, default=_seam_arrival.SILENCE_GAP_HOURS, metavar="H",
                      help="With --light: the gap between operator activity records that counts as an arrival "
                           "(default %(default)s).")
     cop.add_argument("--verbose", action="store_true",

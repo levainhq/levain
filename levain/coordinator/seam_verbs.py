@@ -214,7 +214,8 @@ def _light(args: argparse.Namespace, out: Any, store: Any) -> int:
     from levain.coordinator import seam_arrival
 
     launch, why = _active(store, args.token)
-    qdir = args.queue_dir if args.queue_dir is not None else Path(store.directory)
+    given = None if args.queue_dir is None else Path(args.queue_dir).expanduser()
+    qdir = given if given is not None else Path(store.directory)
     leaves, notes = seam_arrival.verified_leaves(qdir)
     quiet = seam_arrival.silence(store, gap_hours=args.gap_hours)
     found = [f"away OFF: {lv.agent} (mark {lv.mark_id}) left away mode with a leave that verifies" for lv in leaves]
@@ -233,14 +234,35 @@ def _light(args: argparse.Namespace, out: Any, store: Any) -> int:
     signals = [("operator", "away_off", f"{lv.agent}:{lv.mark_id}") for lv in leaves]
     if quiet.fired:
         signals.append(("light", "silence", str(quiet.key)))
+    acked = _acked_signals(store, signals)
+    done = [f"already acknowledged: open {acked[s]} ({s[1]}:{s[2]})" for s in signals if s in acked]
+    signals = [s for s in signals if s not in acked]
     if not signals:
-        _emit(out, args.json, {"opens": [], "found": found}, "\n".join([quiet.why, *[f"unread: {n}" for n in notes]]))
+        lines = [*done] if done else [quiet.why]
+        _emit(out, args.json, {"opens": [], "found": found, "already_acknowledged": sorted(acked.values())},
+              "\n".join([*lines, *[f"unread: {n}" for n in notes]]))
         return 0
     tail = _tail(store)
+    if done and not args.json:
+        out.write("\n".join(done) + "\n")
     for kind, sig_kind, key in signals:
-        built = build(store, kind=kind, signal_kind=sig_kind, signal_key=key, queue_dir=args.queue_dir, token=args.token)
+        built = build(store, kind=kind, signal_kind=sig_kind, signal_key=key, queue_dir=given, token=args.token)
         _print_built(args, out, store, launch, built, handoff, tail, "", {"signal": f"{sig_kind}:{key}"})
     return 0
+
+
+def _acked_signals(store: Any, signals: list[tuple[str, str, str]]) -> dict[tuple[str, str, str], int]:
+    """The signals whose stored build is already acknowledged (by this reader or any other), each to its open id. A
+    built but unacknowledged one is not here: it is offered again (the same open), so a successor coordinator after a
+    rotation that never acknowledged it still receives it. Read-only; the build itself stays the fenced writer's."""
+    acked: dict[tuple[str, str, str], int] = {}
+    with read_transaction(store.open_readonly) as conn:
+        for sig in signals:
+            stored = seam_open.stored_build(conn, *sig)
+            if stored is not None and conn.execute("SELECT 1 FROM open_acks WHERE open_id = ? LIMIT 1",
+                                                   (stored.open_id,)).fetchone() is not None:
+                acked[sig] = stored.open_id
+    return acked
 
 
 def _ack(args: argparse.Namespace, out: Any, store: Any) -> int:
