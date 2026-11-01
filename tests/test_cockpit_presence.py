@@ -397,7 +397,7 @@ def test_the_chip_reads_the_word_and_none_and_the_sheet_posts_each_body(rig, tmp
     assert v[4] is True                                                    # focus moved into the sheet
     assert v[6].startswith("Quiet · ") and v[6].endswith(("m", "h"))
     assert v[7] == [True, True, "2h"]                                      # closed after the write, focus back, the pick remembered
-    assert v[-2] is True
+    assert v[-3] is True                                                   # Escape put focus back on the chip
     assert v[12] == 2                                                      # Devices took the picked 2h
     rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
     assert [(r["word"], r.get("duration")) for r in rows] == [("quiet", "2h"), ("away", None), ("devices", None), ("desk", None)]

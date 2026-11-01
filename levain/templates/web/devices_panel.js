@@ -727,6 +727,7 @@
       const b = el("button", "pr-big pr-dur", label);
       b.type = "button";
       b.dataset.for = v;
+      if (!v) b.title = "Desk pings stay on until you are back; Quiet, Sleep, Loud, Remote and Devices end after " + PR_CAP + " at most";
       b.addEventListener("click", () => { prDur = v; saveDur(v); paintDur(); });
       prDurBtns[v] = b; dseg.appendChild(b);
     }
@@ -785,7 +786,7 @@
     closeSheet(false);
   }
   function sheetKey(e) {
-    if (e.key === "Escape") { e.preventDefault(); closeSheet(true); return; }
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeSheet(true); return; }
     if (e.key !== "Tab") return;
     // keep Tab inside the sheet while it is open
     const f = [...prSheet.querySelectorAll("button:not(:disabled), a[href]")].filter((n) => !n.hidden);
@@ -1023,6 +1024,8 @@
     readPresence();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
     setTimeout(() => { refresh(); readPolicy(); readPresence(); }, 2500);
+    // a tab brought back after a long time repaints at once, not at the next pulse
+    document.addEventListener("visibilitychange", () => { if (!document.hidden && !prGone && !prBusy) readPresence(); });
     const pulse = setInterval(() => {
       if (gone && npGone && prGone) clearInterval(pulse);
       else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); if (!prBusy) readPresence(); }

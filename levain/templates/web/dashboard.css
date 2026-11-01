@@ -3038,7 +3038,7 @@ body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
 .pr-chip[data-state="loud"] .pr-dot { background: var(--bad); }
 .pr-chip-t { font-variant-numeric: tabular-nums; }
 .pr-sheet { position: fixed; z-index: 40; top: var(--pr-top, 64px); left: var(--pr-left, 8px); width: min(340px, calc(100vw - 16px)); box-sizing: border-box;
-  padding: var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-lg); box-shadow: 0 12px 32px color-mix(in oklch, var(--base) 60%, transparent); }
+  padding: var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-lg); box-shadow: 0 12px 32px color-mix(in oklch, var(--base) 60%, transparent); max-height: calc(100dvh - var(--pr-top, 64px) - 8px); overflow-y: auto; }
 .pr-sheet[hidden] { display: none; }
 .pr-sheet-text { margin: 0 0 var(--sp-3); color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.4 var(--sans); }
 .pr-sheet-words { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-2); }
@@ -3059,7 +3059,7 @@ body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
 .pr-sheet-link:hover { text-decoration: underline; }
 @media (max-width: 720px) {
   /* a bottom sheet on a phone: the thumb's reach, full width */
-  .pr-sheet { top: auto; left: 0; right: 0; bottom: 0; width: auto; border-radius: var(--r-lg) var(--r-lg) 0 0; border-bottom: 0; padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom, 0px)); }
+  .pr-sheet { top: auto; left: 0; right: 0; bottom: 0; width: auto; border-radius: var(--r-lg) var(--r-lg) 0 0; border-bottom: 0; padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom, 0px)); max-height: 90dvh; }
   .pr-sheet-link { min-height: var(--hit-min, 44px); display: flex; align-items: center; }
 }
 @media (max-width: 480px) {
