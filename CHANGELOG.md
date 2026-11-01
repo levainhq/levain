@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.11.27] — 2026-10-31
+
 ### Added
 - **AgentSpec, the registration refusals and the lifecycle axes (the registry only: nothing runs an agent yet).** `levain agents register|list|show|pause|resume|retire|zone` over immutable, content-hashed agent specs (`stop_at` required), refusing what the agent design's rules 1-6 and five refinements refuse. A file registers whole or not at all (a feeder group is judged together and written in one transaction), and `--warn` writes nothing, not even a new store. A pause stays on its agent through a same-content re-register, a `--revise` and a retire, and only `resume` clears it; a retire followed by a new register of the name is a new agent (a new `agent_id`) that starts active. `--warn` over an audit file echoes the audit's own verdicts and checks each row is coherent; it does not run the refusals, which are exercised by the spec fixture's tests. The build plan's "diff is empty" check cannot hold literally (the output carries fields the expected file does not); the test compares every row's verdict, class, refinement and review flag. Nothing runs an agent yet.
 - **One sleep reconciler over both stores (the agent side has no occurrences to count yet).** `awake.sync` now re-reads the coordinator's working threads AND the agents' live occurrences (`agent_occurrences` in state `admitted` or `launched`) under the one `awake.json` lock, whichever side calls it, and releases the holder only when both are empty; `levain doctor`'s host-sleep row names the source (coordinator, agent, or both) and the occurrence holding the host. Nothing starts an agent occurrence yet.
