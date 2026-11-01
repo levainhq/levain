@@ -5,8 +5,10 @@
 // window message {type: 'levain-opened'}. The page opens the same database with the same version and upgrade, so
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
-// Cache Storage names this worker keeps. W1b keeps none; a later row (W5b) adds its own versioned names here.
-const CACHES_KEEP = [];
+// Cache Storage names this worker keeps: `levain-open` holds the pending tap target (see notificationclick); a later row
+// (W5b) adds its own versioned names here.
+const OPEN_CACHE = 'levain-open', OPEN_KEY = '/__levain_open';
+const CACHES_KEEP = [OPEN_CACHE];
 
 function open() {
   return new Promise((resolve, reject) => {
@@ -71,19 +73,41 @@ self.addEventListener('push', (e) => {
 });
 
 // How long a tap waits for the page's ack before the worker's own paths run. Short on purpose: clients.openWindow()
-// needs the click's user-activation window, and a page that has the listener acks within a few ms.
-const OPEN_ACK_MS = 800;
+// must still be inside the click's user-activation window when it runs, and Chrome may grant only ONE focus() or
+// openWindow() per click, so nothing is awaited before this wait (focus included). A page with the listener acks in ms.
+const OPEN_ACK_MS = 400;
+
+// The pending target: one cache entry {url, nonce, at}. Whoever deletes it (cache.delete resolves true for exactly one
+// caller) owns the open, so a late ack, a load-time check and the worker's fallback can never open the card twice.
+async function putPending(entry) {
+  const c = await caches.open(OPEN_CACHE);
+  await c.put(OPEN_KEY, new Response(JSON.stringify(entry)));
+}
+async function claimPending() {
+  const c = await caches.open(OPEN_CACHE);
+  return c.delete(OPEN_KEY);
+}
+const newNonce = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
 // Ask a window to go to url itself; true only if it acked {ok: true} on the reply port within OPEN_ACK_MS
-function askToOpen(c, url) {
+function askToOpen(c, url, nonce) {
   return new Promise((resolve) => {
     let ch;
     try { ch = new MessageChannel(); } catch (_) { resolve(false); return; }
     const t = setTimeout(() => done(false), OPEN_ACK_MS);
     const done = (ok) => { clearTimeout(t); ch.port1.onmessage = null; try { ch.port1.close(); } catch (_) { /* gone */ } resolve(ok); };
     ch.port1.onmessage = (m) => { if (m.data && m.data.ok === true) done(true); };
-    try { c.postMessage({ type: 'levain-open', url }, [ch.port2]); } catch (_) { done(false); }
+    try { c.postMessage({ type: 'levain-open', url, nonce }, [ch.port2]); } catch (_) { done(false); }
   });
+}
+
+// the cockpit '/', a sign sheet or /pair: the pages that load sw_open.js
+function isCockpitPath(c) {
+  try { const p = new URL(c.url).pathname; return p === '/' || p === '/pair' || p.startsWith('/sign/'); } catch (_) { return false; }
+}
+// same origin and path: a fragment or an equivalent spelling of the target still counts as arrived
+function sameTarget(a, b) {
+  try { const x = new URL(a), y = new URL(b); return x.origin === y.origin && x.pathname === y.pathname; } catch (_) { return false; }
 }
 
 self.addEventListener('notificationclick', (e) => {
@@ -96,25 +120,53 @@ self.addEventListener('notificationclick', (e) => {
   const url = u.href;
   const opened = (async () => {
     const sameOrigin = (c) => { try { return new URL(c.url).origin === self.location.origin; } catch (_) { return false; } };
-    // prefer a window this worker controls, else any same-origin window (an uncontrolled one still hears a message)
+    // 1. the pending target is written BEFORE any focus or openWindow: a page that is (re)loaded or resumed claims it
+    //    even if no message ever reaches it (iOS can open the root url, or drop a message to a resumed app)
+    let nonce = newNonce(), pending = true;
+    try { await putPending({ url, nonce, at: Date.now() }); } catch (err) {
+      pending = false;
+      console.warn(`levain sw: the pending target was not written (${err}); the tap is message-only`);
+    }
+    const openNew = async (why) => {
+      try {
+        const w = await self.clients.openWindow(url);
+        console.info(`levain sw: tap -> openWindow${w ? '' : ' (no client returned)'}${why ? ` after ${why}` : ''}`);
+      } catch (err) {
+        console.warn(`levain sw: openWindow(${url}) failed: ${err}`);
+        console.info('levain sw: tap -> openWindow-failed');
+      }
+    };
+    // 2. the window: a controlled cockpit-type page, else any controlled one, else any same-origin one
     const ctl = (await self.clients.matchAll({ type: 'window' })).filter(sameOrigin);
     const pool = ctl.length ? ctl : (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).filter(sameOrigin);
-    const c = pool[0];
-    if (!c) { await self.clients.openWindow(url); return; }
-    // focus() can be refused without user activation; the card still goes to this window
-    try { await c.focus(); } catch (_) { /* ask anyway */ }
-    // the page navigates itself (sw_open.js): WindowClient.navigate rejects on an uncontrolled window and can resolve
-    // without moving a page on iOS WebKit. An ack means the page took it.
-    if (await askToOpen(c, url)) return;
-    // no ack (a page without the listener, e.g. an old cached one): the worker's own paths
-    if (ctl.length) {
+    const c = pool.find(isCockpitPath) || pool[0];
+    // 4. no window
+    if (!c) { await openNew(''); return; }
+    // 3. ask the page to go itself (sw_open.js). WindowClient.navigate rejects on an uncontrolled window and can resolve
+    //    without moving a page on iOS WebKit. No focus before the wait.
+    if (await askToOpen(c, url, pending ? nonce : null)) {
+      try { await c.focus(); } catch (_) { /* best effort */ }
+      console.info('levain sw: tap -> ack');
+      return;
+    }
+    // no ack: take the open over, or find the page already took it (a late ack claimed the pending target)
+    if (pending) {
+      let mine = false;
+      try { mine = await claimPending(); } catch (_) { mine = true; }
+      if (!mine) { console.info('levain sw: tap -> ack (late)'); return; }
+    }
+    if (ctl.includes(c)) {
+      try { await c.focus(); } catch (_) { /* navigate anyway */ }
       try {
-        // accepted only if the resolved client is at the target; null or another url is a navigation that did not happen
+        // accepted when the resolved client is at the target (origin + path); null or another page is a navigation that did not happen
         const r = await c.navigate(url);
-        if (r && r.url === url) return;
+        if (r && sameTarget(r.url, url)) { console.info('levain sw: tap -> navigate'); return; }
       } catch (_) { /* fall through to a new window */ }
     }
-    await self.clients.openWindow(url);
+    // a fresh nonce: a late ack from the window that was asked can no longer claim, while the new window's page
+    // (which may land on '/' on iOS) still finds the target
+    if (pending) { nonce = newNonce(); try { await putPending({ url, nonce, at: Date.now() }); } catch (_) { /* best effort */ } }
+    await openNew('no ack');
   })();
   // the mark is local and best effort: a failed write loses one open's record, never the page. It is said on the
   // console, not swallowed: a VersionError means the page opened `levain-sw-2` at a version other than this pin (1)

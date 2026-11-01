@@ -6,7 +6,7 @@ const vm = require('vm');
 
 const [swPath, scenario, mode] = process.argv.slice(2);
 const listeners = {};
-const log = { asked: [], fetches: 0, opened: [], posted: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
+const log = { console: [], asked: [], fetches: 0, opened: [], posted: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
 let uncontrolled = [];   // windows only matchAll({includeUncontrolled: true}) returns
 
 // --- IndexedDB: databases by name, each with object stores that are Maps ---------------------------------------------
@@ -49,9 +49,20 @@ const indexedDB = {
 
 // --- Cache Storage ---------------------------------------------------------------------------------------------------
 const cacheNames = new Set();
+const cacheStores = new Map();   // cache name -> Map(request key -> body text)
 const caches = {
   keys: async () => [...cacheNames],
   delete: async (n) => cacheNames.delete(n),
+  open: async (n) => {
+    cacheNames.add(n);
+    if (!cacheStores.has(n)) cacheStores.set(n, new Map());
+    const m = cacheStores.get(n);
+    return {
+      put: async (k, r) => { m.set(k, await r.text()); },
+      match: async (k) => (m.has(k) ? new Response(m.get(k)) : undefined),
+      delete: async (k) => m.delete(k),
+    };
+  },
 };
 
 // --- clients ---------------------------------------------------------------------------------------------------------
@@ -71,7 +82,9 @@ const self_ = {
   },
 };
 const sandbox = {
-  self: self_, indexedDB, caches, URL, setTimeout, clearTimeout, MessageChannel, Date, Promise, JSON, String, Array,
+  self: self_, indexedDB, caches, Response, Math,
+  console: { info: (m) => log.console.push(['info', String(m)]), warn: (m) => log.console.push(['warn', String(m)]) },
+  URL, setTimeout, clearTimeout, MessageChannel, Date, Promise, JSON, String, Array,
   fetch: () => { log.fetches += 1; throw new Error('the worker must not call fetch'); },
 };
 vm.createContext(sandbox);
@@ -90,7 +103,7 @@ function fire(type, ev) {
     // the retired phone-port database (it held the phone token), the new one, and caches of several names
     dbs.set('levain-sw', { version: 1, stores: new Map([['kv', new Map([['token', 'phone-token']])]]) });
     dbs.set('levain-sw-2', { version: 1, stores: new Map([['opened', new Map([['7', 1]])]]) });
-    for (const n of ['levain-old-shell', 'levain-sw-cache', 'other-app-cache']) cacheNames.add(n);
+    for (const n of ['levain-old-shell', 'levain-sw-cache', 'levain-open', 'other-app-cache']) cacheNames.add(n);
     await fire('activate', {});
     log.dbs = [...dbs.keys()].sort();
     log.caches = [...cacheNames].sort();
@@ -99,16 +112,37 @@ function fire(type, ev) {
     // mode: <window>[+ack] ; window = controlled | uncontrolled | reject | null | mismatch | crossorigin. "+ack" means the
     // page runs sw_open.js (acks the worker's levain-open message); without it the page is silent, as an old cached page is.
     const [kind, ack] = mode.split('+');
-    const post = (m, tr) => { if (m && m.type === 'levain-open') { log.asked.push(m.url); if (ack) tr[0].postMessage({ ok: true }); } else log.posted.push(m); };
-    const win = (nav) => ({ url: 'https://box.example/cockpit', focus: async () => { log.focused += 1; }, navigate: nav, postMessage: post });
+    // ack: absent = silent page; 'ack' = acks at once; 'late' = acks after OPEN_ACK_MS (the page claims the pending target first)
+    const post = function (m, tr) {
+      if (m && m.type === 'levain-open') {
+        log.askedWho = (log.askedWho || []).concat([this.url]);
+        log.asked.push(m.url); log.nonces = (log.nonces || []).concat([m.nonce]);
+        if (ack === 'ack') tr[0].postMessage({ ok: true });
+        if (ack === 'late') setTimeout(async () => {
+          // what sw_open.js does: claim by nonce, ack only if the delete took it
+          const c = await caches.open('levain-open');
+          const got = await c.match('/__levain_open');
+          const e = got && JSON.parse(await got.text());
+          if (e && e.nonce === m.nonce && await c.delete('/__levain_open')) { log.lateClaimed = true; tr[0].postMessage({ ok: true }); } else log.lateClaimed = false;
+        }, 700);
+      } else log.posted.push(m);
+    };
+    const win = (nav, u) => ({ url: u || 'https://box.example/cockpit', focus: async () => { log.focused += 1; }, navigate: nav, postMessage: post });
     const ok = async (u) => { log.navigated.push(u); return { url: u }; };
     if (kind === 'controlled' || kind === 'crossorigin') log.windows = [win(ok)];
     else if (kind === 'uncontrolled') uncontrolled = [win(async () => { throw new TypeError("This service worker is not the client's active service worker."); })];
     else if (kind === 'reject') log.windows = [win(async () => { throw new TypeError('navigate refused'); })];
     else if (kind === 'null') log.windows = [win(async (u) => { log.navigated.push(u); return null; })];
     else if (kind === 'mismatch') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/elsewhere' }; })];
+    else if (kind === 'fragment') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/sign/9' }; })];
+    else if (kind === 'openfail') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; throw new TypeError('openWindow refused'); }; }
+    else if (kind === 'prefer') log.windows = [win(ok, 'https://box.example/docs/guide'), win(async (u) => { log.navigated.push('cockpit:' + u); return { url: u }; }, 'https://box.example/sign/3')];
     const url = kind === 'crossorigin' ? 'https://evil.example/x' : '/sign/9#sign=a&v=1';
     await fire('notificationclick', { notification: { close: () => {}, data: { url } } });
+    if (ack === 'late') await new Promise((r) => setTimeout(r, 900));   // let the late page act
+    const left = cacheStores.get('levain-open');
+    log.pendingLeft = left ? left.size : 0;
+    if (left && left.size) log.pending = JSON.parse([...left.values()][0]);
   } else if (scenario === 'click') {
     log.windows = [windowClient];
     let closed = false;
