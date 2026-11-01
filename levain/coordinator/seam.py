@@ -195,7 +195,7 @@ def _scope_line(read_at: str | None = None) -> str:
 def verbose_lines() -> list[str]:
     """What the brief leaves out and ``coord open --verbose`` adds: the parts not derived or not built, and the read
     scope. Constant text, so a stored open needs nothing more to print them."""
-    return ["Missing close: not derived by this release (S4)", f"Not built: {NOT_BUILT}", _scope_line()]
+    return [f"Not built: {NOT_BUILT}", _scope_line()]
 
 
 _UNSEQ_HEAD = "Unsequenced (rows written by an older release)"
@@ -206,14 +206,16 @@ _CARD_ZEROS = {"  NEEDS YOU: see Band above": "", "  undecided (0):": "undecided
                "thread budgets", "  waiting on you: 0": "waiting on you", "  review queue: 0 open item(s)":
                "review queue items"}
 _AWAY_OFF = "  away: off"
+_MISSING_ZERO = "Missing close: 0"
 
 
-def _collapse_zeros(read_at: str, *sections: list[str]) -> list[str]:
+def _collapse_zeros(read_at: str, *sections: list[str], missing: list[str] | None = None) -> list[str]:
     """The never-cut sections after Since, with every section that is exactly its own "nothing here" line folded into
     one ``Empty`` line. A section that could not be read is never empty: its cannot-derive line matches no zero form,
     so it is always shown whole."""
     unseq, unack, board, band, card = sections
     zero_forms = ((unseq, f"{_UNSEQ_HEAD}: 0", "unsequenced rows"),
+                  *(() if missing is None else ((missing, _MISSING_ZERO, "missing close"),)),
                   (unack, "Unacknowledged: 0", "unacknowledged opens"),
                   (board, "Board: 0 items", "board items"),
                   (band, f"Band (queue side, read {read_at}): 0 open items",
@@ -271,7 +273,8 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
                   else _guard("Card", lambda: _card(store, conn, qdir, now), failed))
     rest = _collapse_zeros(read_at, unseq_lines,
                            _guard("Unacknowledged", lambda: _unacknowledged(conn, now), failed, critical=True),
-                           _guard("Board", lambda: _board(store, conn, read_at), failed), band_lines, card_lines)
+                           _guard("Board", lambda: _board(store, conn, read_at), failed), band_lines, card_lines,
+                           missing=_guard("Missing close", lambda: _missing_close(conn, qdir, present), failed))
     head_lines, handoff_lines, since_lines, rest = ([_clean(ln) for ln in part] for part in
                                                     (head_lines, handoff_lines, since_lines, rest))
     rows = [(g, _clean(label)) for g, label in rows]
@@ -514,6 +517,28 @@ def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[st
     if out["unreadable"]:
         lines.append("  unreadable: " + _cap(", ".join(map(str, out["unreadable"])), 200))
     return lines
+
+
+def _missing_close(conn: sqlite3.Connection, qdir: Path, present: set[str]) -> list[str]:
+    """The Missing close row: the newest away mark across the agents (the operator's seam began there) against the
+    newest ``operator`` handoff. A mark with no operator handoff after it is a seam nobody closed. Queue-side (the mark)
+    and store-side (the handoff), so it is read at the brief's read time like the card; an unreadable queue is
+    ``cannot-derive`` (the guard), never "nothing missing"."""
+    away = morning._away(qdir)
+    marks = [(s["since"], a) for a, s in away.items() if s.get("since")]
+    if not marks:
+        return [_MISSING_ZERO]
+    began = max(m[0] for m in marks)
+    who = ", ".join(sorted(a for t, a in marks if t == began))
+    closed = None
+    if "seam_handoffs" in present:
+        row = conn.execute("SELECT written_at FROM seam_handoffs WHERE seam_kind = 'operator' "
+                           "ORDER BY handoff_id DESC LIMIT 1").fetchone()
+        closed = None if row is None else row[0]
+    if closed is not None and closed >= began:
+        return [_MISSING_ZERO]
+    last = "no operator close recorded" if closed is None else f"the last operator close was {closed}, before it"
+    return [f"Missing close: operator seam began {began} ({who} away mark); {last}"]
 
 
 def _band(store: CoordStore, conn: sqlite3.Connection, qdir: Path, now: datetime, read_at: str) -> list[str]:

@@ -1774,6 +1774,7 @@ def review_modes() -> tuple[str, ...]:
 
 
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
+    from levain.coordinator import seam_arrival as _seam_arrival
     from levain.coordinator import seam_handoffs as _seam_handoffs
 
     qdir_help = "The consent directory holding dispatch.db (default: the consent queue's)."
@@ -2041,6 +2042,12 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "only then. A rotation or dream open needs --read-back-file, your restatement of the handoff. "
                     "A --token that is given and refused exits 1 after printing the read-only open.")
     cop.add_argument("--ack", type=int, default=None, metavar="OPEN_ID")
+    cop.add_argument("--light", action="store_true",
+                     help="Open for an arrival: a verified away OFF (one open per agent) or a gap in the operator's "
+                          "activity. Prints 'no light open needed' when neither.")
+    cop.add_argument("--gap-hours", dest="gap_hours", type=float, default=_seam_arrival.SILENCE_GAP_HOURS, metavar="H",
+                     help="With --light: the gap between operator activity records that counts as an arrival "
+                          "(default %(default)s).")
     cop.add_argument("--verbose", action="store_true",
                      help="Also print what the open does not derive or build, and its read scope.")
     cop.add_argument("--read-back-file", dest="read_back_file", type=Path, default=None, metavar="PATH")

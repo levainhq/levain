@@ -152,6 +152,8 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
         return _ack(args, out, store)
     if args.read_back_file is not None:
         raise CoordError("--read-back-file goes with --ack OPEN_ID: it is the read-back an acknowledgement carries")
+    if args.light:
+        return _light(args, out, store)
     launch, why = _active(store, args.token)
     tail = _tail(store)
     handoff = seam_handoffs.latest(store)
@@ -185,6 +187,11 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
             raise CoordError(f"--token {args.token} was refused: {why}; the open above is read-only and cannot be "
                              "acknowledged")
         return 0
+    return _print_built(args, out, store, launch, built, handoff, tail, extra, more_json)
+
+
+def _print_built(args: argparse.Namespace, out: Any, store: Any, launch: Any, built: Any, handoff: Any, tail: str,
+                 extra: str, more_json: dict[str, Any]) -> int:
     seam_open.record_delivery(store, built.open_id, "light_verb", recipient=launch.launch_id)
     needs = " --read-back-file PATH" if built.seam_kind in seam_open.PREDECESSOR_HANDOFF_SEAMS else ""
     ack = f"{_lv(launch)} coord open --ack {built.open_id}{needs} --token {args.token}{tail}"
@@ -196,6 +203,43 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
           f"{_fenced(built.body)}{extra}\n\n--\nopen {built.open_id} ({built.seam_kind}), built {built.built_at}; it "
           "is the open stored for you, so running coord open again prints it unchanged\n"
           f"acknowledge it, which moves the Since window past what it showed: {ack}{more}\n{_prev_line(handoff)}")
+    return 0
+
+
+def _light(args: argparse.Namespace, out: Any, store: Any) -> int:
+    """``coord open --light``: the arrival signals an operator's coming back leaves, each one open. A verified away OFF
+    is an ``operator`` open keyed ``agent:mark_id``; a gap in the operator's activity is a ``light`` open keyed by the
+    record that ended it. Nothing builds without a live coordinator token (the operator's own terminal prints what it
+    found and never acknowledges)."""
+    from levain.coordinator import seam_arrival
+
+    launch, why = _active(store, args.token)
+    qdir = args.queue_dir if args.queue_dir is not None else Path(store.directory)
+    leaves, notes = seam_arrival.verified_leaves(qdir)
+    quiet = seam_arrival.silence(store, gap_hours=args.gap_hours)
+    found = [f"away OFF: {lv.agent} (mark {lv.mark_id}) left away mode with a leave that verifies" for lv in leaves]
+    if quiet.fired:
+        found.append(f"silence: {quiet.why}")
+    found += [f"unread: {n}" for n in notes]
+    if launch is None:
+        if args.token is not None:
+            raise CoordError(f"--token {args.token} was refused: {why}; nothing was built or recorded")
+        _emit(out, args.json, {"opens": [], "found": found, "why": why},
+              ("\n".join(found) if found else quiet.why) + f"\nnothing was built: {why}; a coordinator's token builds "
+              "the open (it cannot be built or acknowledged from the operator's terminal)")
+        return 0
+    seam_arrival.ingest(store, args.token, leaves)
+    handoff = seam_handoffs.latest(store)
+    signals = [("operator", "away_off", f"{lv.agent}:{lv.mark_id}") for lv in leaves]
+    if quiet.fired:
+        signals.append(("light", "silence", str(quiet.key)))
+    if not signals:
+        _emit(out, args.json, {"opens": [], "found": found}, "\n".join([quiet.why, *[f"unread: {n}" for n in notes]]))
+        return 0
+    tail = _tail(store)
+    for kind, sig_kind, key in signals:
+        built = build(store, kind=kind, signal_kind=sig_kind, signal_key=key, queue_dir=args.queue_dir, token=args.token)
+        _print_built(args, out, store, launch, built, handoff, tail, "", {"signal": f"{sig_kind}:{key}"})
     return 0
 
 

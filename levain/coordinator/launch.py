@@ -400,7 +400,12 @@ def _open_section(store: CoordStore, launch: Any, lv: str, tail: str) -> list[st
             f"--kind rotation|operator --body-file PATH --request-id ID --prev-handoff-id H --token N {tail}` "
             "(`coord open` prints the H to use; the body is JSON with state_line, in_flight, next, contingencies, "
             "notes, attested_operator_present, attested_walked; `coord handoff show` reads one back). In it, name rows "
-            "by id (dr-..., item keys), never by ordinal: the next coordinator sees ids, not your order.", ""]
+            "by id (dr-..., item keys), never by ordinal: the next coordinator sees ids, not your order.", "",
+            f"When the operator comes back (a drop or a chat message of his arrives after a gap, or he has left away "
+            f"mode), run `{lv} coord open --light --token N {tail}` on your first turn: it builds one open for each "
+            "arrival it finds and prints `no light open needed` when there is none. Nothing watches for you, so it "
+            "only runs when you run it. When he heads off, run `coord away`, then close with `--kind operator`: an "
+            "away mark with no operator close after it shows as the Missing close row in the next open.", ""]
 
 
 def record_brief_delivery(store: CoordStore, launch_id: str) -> None:
