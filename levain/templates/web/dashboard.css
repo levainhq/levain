@@ -2685,6 +2685,17 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .card-detail > summary { color: var(--text); font-size: var(--fs-body); border-top: 1px solid var(--hair); padding-top: var(--sp-3); }
 .card-signed .sheet-message { margin-top: var(--sp-3); }
 .card-detail-body { padding-top: var(--sp-3); }
+/* a disclosure reads as one: a chevron at the right of the summary (one marker only: the native one is off, iOS Safari's too), turned 90 degrees
+   when open; the open summary goes to the text colour and the body gets a hairline down its left side */
+.card-signed > summary, .card-detail > summary { list-style: none; gap: var(--sp-3); justify-content: space-between; border-radius: var(--r-sm); }
+.card-signed > summary::-webkit-details-marker, .card-detail > summary::-webkit-details-marker { display: none; }
+.card-signed > summary::after, .card-detail > summary::after { content: ""; flex: none; width: 7px; height: 7px; margin-right: var(--sp-2); border-right: 2px solid var(--label); border-bottom: 2px solid var(--label); transform: rotate(-45deg); }
+.card-signed[open] > summary::after, .card-detail[open] > summary::after { transform: rotate(45deg); }
+@media (prefers-reduced-motion: no-preference) { .card-signed > summary::after, .card-detail > summary::after { transition: transform .15s ease-out; } }
+.card-signed > summary:hover, .card-detail > summary:hover, .card-signed[open] > summary, .card-detail[open] > summary { color: var(--text); }
+.card-signed > summary:hover::after, .card-detail > summary:hover::after, .card-signed[open] > summary::after, .card-detail[open] > summary::after { border-color: var(--text); }
+.card-signed > summary:focus-visible, .card-detail > summary:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+.card-detail[open] > .card-detail-body, .card-signed[open] > :not(summary) { border-left: 2px solid var(--hair-2); padding-left: var(--sp-4); }
 .card-sec { margin: 0 0 var(--sp-5); }
 .card-label { margin: 0 0 var(--sp-2); font: var(--fw-bold) var(--fs-body)/1.3 var(--sans); letter-spacing: normal; text-transform: none; font-variant-caps: normal; color: var(--text); }
 .card-label-top { margin-top: var(--sp-2); }

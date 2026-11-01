@@ -134,3 +134,15 @@ def test_a_short_reading_column_beside_a_tall_deciding_one_keeps_every_control_r
     assert 0 <= atend[0] < atend[2] and atend[1] > 0, v           # after scrolling the page to its end the column is still on screen
     assert 0 <= firsttop < 200, v                                 # the first control is at the column's top
     assert last[0] == 8 and last[1] is True and last[2] is True, v   # the last control is reachable by scrolling the column
+
+
+def test_every_card_disclosure_summary_has_one_marker_that_turns_when_open() -> None:
+    """Detail and the signing disclosure (and the cockpit's signed text, same classes) read as tappable: a drawn chevron, the native
+    marker off (iOS Safari too), a 90 degree turn when [open], a visible focus ring, a touch-sized summary, reduced motion respected."""
+    for k in ("card-detail", "card-signed"):
+        assert f".{k} > summary::-webkit-details-marker" in CSS and "list-style: none" in CSS
+        assert f".{k} > summary::after" in CSS and f".{k}[open] > summary::after" in CSS
+        assert f".{k} > summary:focus-visible" in CSS
+    assert "transform: rotate(-45deg)" in CSS and "transform: rotate(45deg)" in CSS
+    assert re.search(r"prefers-reduced-motion: no-preference\) \{ \.card-signed > summary::after.*transition: transform", CSS), "the turn animates only when motion is allowed"
+    assert re.search(r"\.card-signed > summary, \.card-detail > summary \{[^}]*min-height: var\(--hit-min, 44px\)", CSS)
