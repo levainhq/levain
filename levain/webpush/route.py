@@ -60,10 +60,9 @@ def _stamp_path(queue_dir: Path | str) -> Path:
     return Path(queue_dir) / "webpush" / STAMP_NAME
 
 
-def _throttled(queue_dir: Path | str, now: float) -> bool:
-    """Whether the last `who` run was under the window ago; then it is left alone, else the stamp is rewritten (before the
-    `who` call, so a slow or failed run still counts). The stamp is a file because the caller is a fresh process per ping.
-    A stamp that cannot be read safely, or lies in the future, means run."""
+def _stamp_recent(queue_dir: Path | str, now: float) -> bool:
+    """Read-only: whether the stamp says the last `who` run was under the window ago. A stamp that cannot be read safely,
+    or lies in the future, reads as not recent. The one parse :func:`_throttled` and :func:`projected_route` share."""
     path = _stamp_path(queue_dir)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -73,10 +72,18 @@ def _throttled(queue_dir: Path | str, now: float) -> bool:
             last = float(os.read(fd, 64).decode("ascii").strip())
         finally:
             os.close(fd)
-        if _num(last) and 0 <= now - last < AUTO_THROTTLE_SECS:
-            return True
+        return bool(_num(last) and 0 <= now - last < AUTO_THROTTLE_SECS)
     except (OSError, ValueError):
-        pass
+        return False
+
+
+def _throttled(queue_dir: Path | str, now: float) -> bool:
+    """Whether the last `who` run was under the window ago; then it is left alone, else the stamp is rewritten (before the
+    `who` call, so a slow or failed run still counts). The stamp is a file because the caller is a fresh process per ping.
+    A stamp that cannot be read safely, or lies in the future, means run."""
+    if _stamp_recent(queue_dir, now):
+        return True
+    path = _stamp_path(queue_dir)
     try:
         d = path.parent
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -295,14 +302,20 @@ def _auto_may_suggest(route: str, source: str, idle: float | None, who_text) -> 
 
 
 def projected_route(queue_dir: Path | str | None, *, idle: float | None, now: float | None = None,
-                    who: str | None = None) -> str:
+                    who: str | None = None, clock=time.time) -> str:
     """The route a delivery at ``now`` would see after :func:`auto_suggest`, computed with no write, stamp, flush or
-    throttle (pure apart from the read of ``who`` when none is given). It shares auto_suggest's conditions
-    (:func:`_auto_ends`, :func:`_auto_may_suggest`) so the two cannot drift."""
+    throttle write (pure apart from the read of ``who`` when none is given). It shares auto_suggest's conditions
+    (:func:`_auto_ends`, :func:`_auto_may_suggest`) and READS the suggestion throttle without writing it: when a delivery
+    would be throttled (``who`` unset, the stamp under the window old by ``clock``) the standing route stands. A caller
+    giving ``who`` is unthrottled, as in delivery."""
     ts = time.time() if now is None else now
     route, source, _until = read_route(queue_dir, ts)
     if _auto_ends(source, idle):
         return "desk"
+    if idle is None or not _num(idle) or idle < AUTO_IDLE_SECS:
+        return route
+    if who is None and _stamp_recent(queue_dir, clock()):
+        return route   # delivery returns early here and holds on the standing route
     if _auto_may_suggest(route, source, idle, lambda: _run_who() if who is None else who):
         return "devices"
     return route

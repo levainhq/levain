@@ -135,7 +135,7 @@ def _write(queue_dir: Path | str, recs: list[dict]) -> None:
 
 
 def _public(r: dict) -> dict:
-    return {"name": r["name"], "words": list(r["words"]), "created": r.get("created"),
+    return {"name": r["name"], "words": [w for w in r["words"] if w in WORDS], "created": r.get("created"),
             "last_used": r.get("last_used"), "revoked": bool(r.get("revoked"))}
 
 

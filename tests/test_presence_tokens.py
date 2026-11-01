@@ -149,3 +149,15 @@ def test_a_deeply_nested_file_reads_as_no_tokens(tmp_path):
     pt.create(tmp_path, "door")
     (tmp_path / "webpush" / pt.FILE_NAME).write_text("[" * 30000 + "]" * 30000)
     assert pt.list_public(tmp_path) == []
+
+
+def test_a_legacy_token_lists_only_the_current_words(tmp_path):
+    rec, tok = pt.create(tmp_path, "old")
+    f = tmp_path / "webpush" / pt.FILE_NAME
+    data = json.loads(f.read_text())
+    recs = data if isinstance(data, list) else data.get("tokens", data)
+    recs[0]["words"] = ["away", "remote", "quiet"]
+    f.write_text(json.dumps(data))
+    assert pt.list_public(tmp_path)[0]["words"] == ["away", "quiet"]
+    got = pt.verify(tmp_path, tok)   # it keeps working as stored; the dropped word is simply not advertised
+    assert got is not None and got["name"] == "old" and got["words"] == ["away", "quiet"]

@@ -600,3 +600,9 @@ def test_an_older_server_without_effective_paints_the_stored_word(rig, tmp_path,
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
             {"until": _SHOWN, "ms": 20000}, {"eval": _CHIP_TEXT}])
     assert out["values"][1].startswith("Quiet \u00b7 ")
+
+
+def test_the_panel_copy_cuts_a_reason_at_a_word_and_does_not_promise_sleep_a_duration():
+    js = _asset("devices_panel.js")
+    assert "u2026" in js and "slice(0, 40)" in js
+    assert "Quiet, Sleep, Loud" not in js and "Sleep takes no duration" in js

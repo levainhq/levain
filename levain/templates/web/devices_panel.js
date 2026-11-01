@@ -733,7 +733,7 @@
     dr.appendChild(dseg);
     prSheet.appendChild(dr);
     // visible on a phone, where a tooltip never shows: what "Until back" does for the words that cannot stand forever
-    prSheet.appendChild(el("p", "pr-sheet-route", "Until back: Desk stays as set; Quiet, Sleep, Loud and Devices end after " + PR_CAP + " at most."));
+    prSheet.appendChild(el("p", "pr-sheet-route", "Until back: Desk stays as set; Quiet, Loud and Devices end after " + PR_CAP + " at most; Sleep takes no duration."));
     paintDur();
     prEndLoud = el("button", "pr-big pr-endloud", "End Loud");
     prEndLoud.type = "button"; prEndLoud.hidden = true;
@@ -862,7 +862,8 @@
 
   // the push rule's reason, cut to a masthead's length: "desk inactive 7 min", "route: devices (his phone shows the band)" -> "route: devices"
   function shortReason(r) {
-    return String(r || "").replace(/\s*\(.*$/, "").replace(/^no desk activity source: read as inactive$/, "no desk reading").slice(0, 40);
+    r = String(r || "").replace(/\s*\(.*$/, "").replace(/^no desk activity source: read as inactive$/, "no desk reading");
+    return r.length <= 40 ? r : (/\s/.test(r[40]) ? r.slice(0, 40) : r.slice(0, 40).replace(/\s+\S*$/, "")).replace(/[\s,;:.-]+$/, "") + "\u2026";
   }
   const PR_STATES = { pushing: "Pushing", holding: "Holding", muted: "Muted" };
 

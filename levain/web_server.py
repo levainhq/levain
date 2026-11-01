@@ -2439,11 +2439,15 @@ class _Handler(GuardedHandler):
         from levain.webpush import route as route_mod
 
         route, route_source, route_until = route_mod.read_route(queue, now)
+        try:   # the projected route (and so any `who` run) is computed ONCE for the whole view
+            projected = route_mod.projected_route(queue, idle=reading, now=now)
+        except Exception:  # noqa: BLE001 - a fault reads as the standing route
+            projected = route
         view = {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
                 "route": route, "route_source": route_source, "route_until": route_until,
-                "text": presence.describe(queue, now=now, word=rec, reading=reading),
+                "text": presence.describe(queue, now=now, word=rec, reading=reading, route=projected),
                 # what the push rule does right now (the same call a delivery makes); a status read never drives the route suggestion
-                "effective": presence.effective(queue, now, suggest=False, word=rec, reading=reading)}
+                "effective": presence.effective(queue, now, suggest=False, word=rec, reading=reading, route=projected)}
         if self._credential_is_full():     # a tap token's holder is told the word, never the list of other taps
             from levain.webpush import presence_tokens
 

@@ -131,3 +131,55 @@ def test_projected_route_writes_nothing(tmp_path):
     assert route.projected_route(q, idle=5.0, now=1001.0, who=REMOTE) == "desk"
     assert _tree(q) == before
     assert json.loads(open(route._path(q)).read())["route"] == "devices"
+
+
+# ---- fix round 2 -------------------------------------------------------------------------------------------------
+
+def test_projected_route_honours_the_suggestion_throttle_read_only(tmp_path, monkeypatch):
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    idle = route.AUTO_IDLE_SECS + 10.0
+    monkeypatch.setattr(route, "_run_who", lambda: "")
+    # a delivery just probed `who` (found nothing): the stamp is fresh
+    assert route.auto_suggest(q, idle=idle, now=1000.0, clock=lambda: 1000.0) is False
+    stamp = _tree(q)
+    # a remote login opens inside the window: the next delivery is throttled and holds on desk, so the projection must too
+    monkeypatch.setattr(route, "_run_who", lambda: REMOTE)
+    assert route.auto_suggest(q, idle=idle, now=1005.0, clock=lambda: 1005.0) is False
+    assert route.projected_route(q, idle=idle, now=1005.0, clock=lambda: 1005.0) == "desk"
+    assert _tree(q) == stamp                                                  # reading the throttle wrote nothing
+    # past the window both would suggest devices
+    assert route.projected_route(q, idle=idle, now=1100.0, clock=lambda: 1100.0) == "devices"
+    # an explicit `who` is unthrottled, as in delivery
+    assert route.projected_route(q, idle=idle, now=1005.0, who=REMOTE, clock=lambda: 1005.0) == "devices"
+
+
+def test_presence_view_projects_the_route_and_runs_who_once(tmp_path, monkeypatch):
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    runs = []
+    monkeypatch.setattr(route, "_run_who", lambda: runs.append(1) or REMOTE)
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: route.AUTO_IDLE_SECS + 10.0)
+    v = web_server._Handler._presence_view(_Fake(), q)
+    assert len(runs) == 1
+    assert v["effective"]["pushing"] is True
+
+
+def test_core_given_a_route_does_not_project(tmp_path, monkeypatch):
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    monkeypatch.setattr(route, "projected_route", lambda *a, **k: pytest.fail("projected_route called"))
+    presence.effective(q, word=None, reading=900.0, route="desk")
+    presence.describe(q, word=None, reading=900.0, route="desk")
+
+
+def test_an_operator_desk_record_stays_desk_through_auto_suggest(tmp_path):
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    route.set_route(q, "desk", source="operator", now=1000.0)
+    idle = route.AUTO_IDLE_SECS + 10.0
+    assert route.auto_suggest(q, idle=idle, who=REMOTE, now=1001.0) is False
+    assert route.read_route(q, 1001.0)[:2] == ("desk", "operator")
+    # apply_route itself refuses an auto set over the unexpired operator record: the _auto_may_suggest guard adds nothing
+    assert route.apply_route(q, "devices", None, source="auto", now=1001.0) is False
+    assert route.read_route(q, 1001.0)[:2] == ("desk", "operator")
