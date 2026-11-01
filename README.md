@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/levainhq/levain/main/docs/img/levain-mark-256.png" width="128" height="128" alt="The Levain mark"></p>
+
 # Levain
 
 **A harness for working with an AI agent as a partner: it grows its own memory and identity, pushes back on its training's worst habits, and answers to you, always.**
