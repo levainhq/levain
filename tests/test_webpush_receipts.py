@@ -45,10 +45,22 @@ def store(tmp_path: Path) -> PushStore:
     return PushStore(tmp_path)
 
 
+def _sub_id(store: PushStore, endpoint: str = EP) -> int:
+    with store.read() as c:
+        return int(c.execute("SELECT id FROM subscriptions WHERE endpoint = ?", (endpoint,)).fetchone()[0])
+
+
+def _ping(store: PushStore, ref: str | None = None, endpoint: str = EP) -> int:
+    """A ping the send is pushing to ``endpoint``'s subscription (its target recorded, no answer yet)."""
+    ping = store.add_ping("sign", ref, "t", "b")
+    store.add_targets(ping, [_sub_id(store, endpoint)])
+    return ping
+
+
 # --- the store -------------------------------------------------------------------------------------------------------
 
 def test_a_receipt_is_appended_under_the_device_whose_endpoint_hashes_to_it(store: PushStore) -> None:
-    ping = store.add_ping("sign", "np-1", "t", "b")
+    ping = _ping(store, "np-1")
     assert store.add_receipt(H, ping, "received", _ms()) == "recorded"
     with store.read() as c:
         (row,) = c.execute("SELECT ping_id, device_id, kind, at, reported_at FROM receipts").fetchall()
@@ -57,7 +69,7 @@ def test_a_receipt_is_appended_under_the_device_whose_endpoint_hashes_to_it(stor
 
 
 def test_a_retried_report_is_idempotent_and_a_second_delivery_is_a_second_row(store: PushStore) -> None:
-    ping = store.add_ping("sign", None, "t", "b")
+    ping = _ping(store)
     at = _ms()
     assert store.add_receipt(H, ping, "received", at) == "recorded"
     assert store.add_receipt(H, ping, "received", at) == "duplicate"
@@ -67,7 +79,7 @@ def test_a_retried_report_is_idempotent_and_a_second_delivery_is_a_second_row(st
 
 
 def test_receipts_never_change_and_are_never_deleted(store: PushStore) -> None:
-    ping = store.add_ping("sign", None, "t", "b")
+    ping = _ping(store)
     store.add_receipt(H, ping, "shown", _ms())
     with store.write() as c:
         with pytest.raises(sqlite3.DatabaseError, match="never change"):
@@ -83,12 +95,12 @@ def test_the_table_is_added_to_a_store_that_predates_it(tmp_path: Path) -> None:
         c.execute("DROP TRIGGER receipts_frozen")
         c.execute("DROP TRIGGER receipts_kept")
         c.execute("DROP TABLE receipts")
-    ping = s.add_ping("sign", None, "t", "b")
+    ping = _ping(s)
     assert PushStore(tmp_path).add_receipt(H, ping, "received", _ms()) == "recorded"   # a fresh opener ensures the schema
 
 
 def test_unknown_device_ping_kind_and_time_are_refused_with_nothing_written(store: PushStore) -> None:
-    ping = store.add_ping("sign", None, "t", "b")
+    ping = _ping(store)
     assert store.add_receipt("0" * 64, ping, "received", _ms()) == "unknown_device"
     assert store.add_receipt(H, ping + 99, "received", _ms()) == "unknown_ping"
     assert store.add_receipt(H, ping, "tapped", _ms()) == "bad_report"
@@ -101,19 +113,19 @@ def test_unknown_device_ping_kind_and_time_are_refused_with_nothing_written(stor
 
 
 def test_a_retired_or_revoked_subscription_reports_nothing(store: PushStore, tmp_path: Path) -> None:
-    ping = store.add_ping("sign", None, "t", "b")
+    ping = _ping(store)
     revoke(store, "phone")
     assert store.add_receipt(H, ping, "received", _ms()) == "unknown_device"
     other = tmp_path / "q2"
     phone(other, EP)
     s2 = PushStore(other)
-    p2 = s2.add_ping("sign", None, "t", "b")
+    p2 = _ping(s2)
     s2.retire_subscription(EP)
     assert s2.add_receipt(H, p2, "received", _ms()) == "unknown_device"
 
 
 def test_a_device_cannot_report_past_its_caps(store: PushStore) -> None:
-    ping = store.add_ping("sign", None, "t", "b")
+    ping = _ping(store)
     base = _ms()
     for i in range(MAX_RECEIPTS_PER_PING_KIND):
         assert store.add_receipt(H, ping, "received", base + i) == "recorded"
@@ -127,8 +139,130 @@ def test_a_device_cannot_report_past_its_caps(store: PushStore) -> None:
                       (p, PAIRED_PREFIX + "phone", "received", "2026-10-31T00:00:00.000Z", now_stamp()))
             done += 1
     assert done == MAX_RECEIPTS_PER_DEVICE_HOUR
-    fresh = store.add_ping("sign", None, "t", "b")
+    fresh = _ping(store)
     assert store.add_receipt(H, fresh, "received", _ms()) == "limited"              # the device's hour
+
+
+EP_B = "https://web.push.apple.com/b-phone"
+H_B = hashlib.sha256(EP_B.encode()).hexdigest()
+
+
+def test_a_device_writes_only_about_pings_sent_to_its_own_subscription(store: PushStore, tmp_path: Path) -> None:
+    phone(tmp_path, EP_B, "b")
+    only_a = _ping(store)                                                   # targeted at A's subscription only
+    assert store.add_receipt(H_B, only_a, "received", _ms()) == "unknown_ping"     # B cannot write about it
+    never_pushed = store.add_ping("sign", None, "t", "b")
+    assert store.add_receipt(H, never_pushed, "received", _ms()) == "unknown_ping"  # nor A about a ping never pushed
+    assert store.add_receipt(H, only_a, "received", _ms()) == "recorded"          # A, about its own, can
+    to_b = _ping(store, endpoint=EP_B)
+    assert store.add_receipt(H_B, to_b, "shown", _ms()) == "recorded"
+    # a delivery row (the answer, written after the push) counts like the target written before it
+    answered = store.add_ping("sign", None, "t", "b")
+    store.add_delivery(answered, _sub_id(store, EP_B), 201)
+    assert store.add_receipt(H_B, answered, "received", _ms()) == "recorded"
+    assert store.add_receipt(H, answered, "received", _ms()) == "unknown_ping"
+    with store.read() as c:
+        rows = sorted(tuple(r) for r in c.execute("SELECT ping_id, device_id FROM receipts"))
+    assert rows == sorted([(only_a, PAIRED_PREFIX + "phone"), (to_b, PAIRED_PREFIX + "b"), (answered, PAIRED_PREFIX + "b")])
+    # the route says the same thing for "not sent to you" as for "no such ping": it is not an oracle
+    a = routes.receipt(json.dumps(_body(only_a, h=H_B)).encode(), queue_dir=tmp_path)
+    b = routes.receipt(json.dumps(_body(10_000, h=H_B)).encode(), queue_dir=tmp_path)
+    assert a == b and a[0] == 404
+
+
+def test_the_send_records_its_targets_before_any_push_so_an_early_receipt_is_accepted(tmp_path: Path, monkeypatch) -> None:
+    import os
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from levain.webpush import ece, sender, vapid
+
+    vapid.ensure_keys(tmp_path)
+    s = PushStore(tmp_path)
+    key = ece.b64e(ece.public_bytes(ec.generate_private_key(ec.SECP256R1())))
+    s.add_subscription(EP, key, ece.b64e(os.urandom(16)), "phone")
+    early = []
+
+    def post(req):   # the phone's receipt lands while the push service has not answered yet
+        ping = PushStore(tmp_path).record(1)[0]["id"]
+        early.append(PushStore(tmp_path).add_receipt(H, ping, "received", _ms()))
+        with PushStore(tmp_path).read() as c:
+            early.append(c.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0])
+        return 201
+
+    monkeypatch.setattr(sender, "_post", post)
+    sender.send(tmp_path, kind="sign", ref="np-1", title="t", body="b")
+    assert early == ["recorded", 0]                      # accepted before the delivery row existed
+    with s.read() as c:
+        assert c.execute("SELECT COUNT(*) FROM targets").fetchone()[0] == 1
+        assert c.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 1
+        with pytest.raises(sqlite3.DatabaseError, match="never"):
+            c.execute("DELETE FROM targets")
+
+
+def test_an_unauthenticated_hash_never_takes_the_write_lock(store: PushStore, tmp_path: Path, monkeypatch) -> None:
+    import secrets
+
+    ping = _ping(store)
+    writes = []
+    real = PushStore.write
+
+    def counted(self):
+        writes.append(1)
+        return real(self)
+
+    monkeypatch.setattr(PushStore, "write", counted)
+    for _ in range(50):
+        assert routes.receipt(json.dumps(_body(ping, h=secrets.token_hex(32))).encode(), queue_dir=tmp_path)[0] == 403
+    assert writes == []                                     # a fresh store per request, and still no write lock
+    assert store.add_receipt(H, ping + 1, "received", _ms()) == "unknown_ping" and writes == []
+    assert store.add_receipt(H, ping, "received", _ms()) == "recorded" and len(writes) == 1
+    at = _ms()
+    assert store.add_receipt(H, ping, "shown", at) == "recorded" and store.add_receipt(H, ping, "shown", at) == "duplicate"
+    assert len(writes) == 2                                 # a duplicate is answered from the read
+
+
+def test_a_flood_of_random_hashes_leaves_a_real_write_unblocked(store: PushStore, tmp_path: Path) -> None:
+    import secrets
+    import threading
+
+    stop = threading.Event()
+    refused = [0]
+
+    def flood() -> None:
+        while not stop.is_set():
+            assert PushStore(tmp_path).add_receipt(secrets.token_hex(32), 1, "received", _ms()) == "unknown_device"
+            refused[0] += 1
+
+    threads = [threading.Thread(target=flood, daemon=True) for _ in range(4)]
+    for t in threads:
+        t.start()
+    try:
+        time.sleep(0.2)
+        worst = 0.0
+        for _ in range(10):
+            t0 = time.monotonic()
+            ping = _ping(store)
+            assert store.add_receipt(H, ping, "received", _ms()) == "recorded"
+            worst = max(worst, time.monotonic() - t0)
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(5)
+    assert refused[0] > 50 and worst < 2.0, (refused[0], worst)
+
+
+def test_a_hash_is_compared_with_compare_digest_over_every_candidate(store: PushStore, tmp_path: Path, monkeypatch) -> None:
+    from levain.webpush import store as store_mod
+
+    phone(tmp_path, EP_B, "b")
+    ping = _ping(store)
+    calls = []
+    real = store_mod.hmac.compare_digest
+    monkeypatch.setattr(store_mod.hmac, "compare_digest", lambda a, b: calls.append(1) or real(a, b))
+    assert store.add_receipt(H, ping, "received", _ms()) == "recorded"     # A matches first, B is still compared
+    assert len(calls) == 2
+    assert store.add_receipt("not hex", ping, "received", _ms()) == "unknown_device"
 
 
 # --- the route -------------------------------------------------------------------------------------------------------
@@ -138,7 +272,7 @@ def _body(ping: int, kind: str = "received", at: int | None = None, h: str = H) 
 
 
 def test_the_receipt_route_refuses_what_it_cannot_place_and_writes_nothing(store: PushStore, tmp_path: Path) -> None:
-    ping = store.add_ping("sign", None, "t", "b")
+    ping = _ping(store)
     ok = routes.receipt(json.dumps(_body(ping)).encode(), queue_dir=tmp_path)
     assert ok[0] == 200 and json.loads(ok[1]) == {"recorded": True}
     cases = [
@@ -162,7 +296,7 @@ def test_the_receipt_route_refuses_what_it_cannot_place_and_writes_nothing(store
 
 
 def test_the_flood_answers_429_and_stops_growing_the_table(store: PushStore, tmp_path: Path) -> None:
-    ping = store.add_ping("sign", None, "t", "b")
+    ping = _ping(store)
     base = _ms()
     codes = [routes.receipt(json.dumps(_body(ping, at=base + i)).encode(), queue_dir=tmp_path)[0]
              for i in range(MAX_RECEIPTS_PER_PING_KIND + 4)]
@@ -178,7 +312,7 @@ def test_http_the_receipt_takes_no_token_and_every_other_webpush_post_still_need
         assert _call(port, "POST", "/webpush/subscribe", _sub(7), token=tok)[0] == 200
         ep = _sub(7)["endpoint"]
         h = hashlib.sha256(ep.encode()).hexdigest()
-        ping = PushStore(qdir).add_ping("sign", "np-7", "t", "b")
+        ping = _ping(PushStore(qdir), "np-7", endpoint=ep)
         for hdrs in (None, PROXY):                                   # no token, on loopback and through the proxy
             st, out, hd = _call(port, "POST", "/webpush/receipt", _body(ping, at=_ms() + (0 if hdrs is None else 1), h=h),
                                 headers=hdrs)
@@ -205,7 +339,7 @@ def test_http_the_receipt_keeps_the_origin_json_and_size_checks(rig) -> None:
         _, tok = _pair(port)
         _call(port, "POST", "/webpush/subscribe", _sub(7), token=tok)
         h = hashlib.sha256(_sub(7)["endpoint"].encode()).hexdigest()
-        ping = PushStore(qdir).add_ping("sign", None, "t", "b")
+        ping = _ping(PushStore(qdir), endpoint=_sub(7)["endpoint"])
         good = json.dumps(_body(ping, h=h)).encode()
 
         def post(headers: dict[str, str], body: bytes = good) -> int:
@@ -242,7 +376,18 @@ def _run(mode: str) -> dict:
 
 
 def _receipt_steps(got: dict) -> list[tuple]:
-    return [(e["kind"], e.get("result"), e.get("status")) for e in got["trace"] if e["step"] == "receipt"]
+    return [(e["kind"], e.get("result"), e.get("status")) for e in got["trace"] if e["step"] in ("receipt", "receipt-refused")]
+
+
+def _keys(queued: list[str]) -> list[tuple[int, str]]:
+    """(ping, kind) of each queued key, which must be the per-report form <ping>-<kind>-<13-digit ms>-<4-digit seq>."""
+    out = []
+    for k in queued:
+        tail = k[len("/__levain_receipt/"):]
+        ping, kind, at, seq = tail.split("-")
+        assert len(at) == 13 and at.isdigit() and len(seq) == 4 and seq.isdigit(), k
+        out.append((int(ping), kind))
+    return sorted(out)
 
 
 @needs_node
@@ -259,7 +404,7 @@ def test_a_push_posts_received_then_shown_with_the_endpoint_hash_and_ids_only() 
     assert "secret body" not in json.dumps(got["posts"])
     assert got["shownCalls"] == [{"title": "T", "tag": "x"}] and got["queued"] == []
     assert _receipt_steps(got) == [("received", "ok", None), ("shown", "ok", None)]
-    assert any(e["step"] == "sw-version" and e["version"] == "1101-receipts-1" and e["on"] == "push" for e in got["trace"])
+    assert any(e["step"] == "sw-version" and e["version"] == "1101-receipts-2" and e["on"] == "push" for e in got["trace"])
 
 
 @needs_node
@@ -267,21 +412,38 @@ def test_the_notification_is_asked_for_before_any_receipt_and_still_shown_when_f
     got = _run("throw")
     assert got["order"][0] == "show", got["order"]
     assert got["shownCalls"] == [{"title": "T", "tag": "x"}]
-    assert got["queued"] == ["/__levain_receipt/42-received", "/__levain_receipt/42-shown"], got["queued"]
+    assert _keys(got["queued"]) == [(42, "received"), (42, "shown")], got["queued"]
     assert _receipt_steps(got) == [("received", "queued", None), ("shown", "queued", None)]
 
 
 @needs_node
-def test_a_hanging_post_is_cut_at_three_seconds_and_queued() -> None:
+def test_a_hanging_post_is_cut_by_the_event_budget_and_stays_queued() -> None:
     got = _run("hang")
-    assert 2800 <= got["elapsedMs"] < 5500, got["elapsedMs"]
-    assert got["shownCalls"] and got["queued"] == ["/__levain_receipt/42-received", "/__levain_receipt/42-shown"]
+    assert 3800 <= got["elapsedMs"] < 4800, got["elapsedMs"]
+    assert got["shownCalls"] and _keys(got["queued"]) == [(42, "received"), (42, "shown")]
+
+
+@needs_node
+def test_the_notification_is_shown_when_every_receipt_step_hangs() -> None:
+    for mode in ("hang+subhang", "hang+cachehang", "deaf+cachehang", "deaf+subhang+cachehang"):
+        got = _run(mode)
+        assert got["order"][0] == "show" and got["shownCalls"] == [{"title": "T", "tag": "x"}], (mode, got["order"])
+        assert got["elapsedMs"] < 4800, (mode, got["elapsedMs"])        # the event ends by the 4 s receipt budget
+
+
+@needs_node
+def test_twenty_queued_receipts_with_slow_posts_end_within_the_budget() -> None:
+    got = _run("slow+seed20+clickonly")
+    assert got["clickMs"] < 4800, got["clickMs"]
+    assert len(got["posts"]) <= 5                                      # at most five re-sent in one event
+    assert len(got["queued"]) >= 20 - len(got["posts"]) + 1            # the one the deadline aborted stays queued
+    assert got.get("aborted", 0) == 1
 
 
 @needs_node
 def test_a_failed_post_is_resent_by_the_next_notification_click_oldest_first() -> None:
     got = _run("throw+then:ok+click")
-    assert got["afterFirst"]["queued"] == ["/__levain_receipt/42-received", "/__levain_receipt/42-shown"]
+    assert _keys(got["afterFirst"]["queued"]) == [(42, "received"), (42, "shown")]
     assert [p["body"]["kind"] for p in got["posts"]] == ["received", "shown"], got["posts"]     # sent order = oldest first
     assert got["queued"] == []
     assert ("received", "drained", 200) in _receipt_steps(got)
@@ -296,22 +458,57 @@ def test_a_failed_post_is_resent_by_the_next_push() -> None:
 
 
 @needs_node
+def test_two_offline_deliveries_of_one_ping_both_survive_and_are_both_sent() -> None:
+    got = _run("throw+twice+then:ok+click")
+    assert _keys(got["afterFirst"]["queued"]) == [(42, "received"), (42, "received"), (42, "shown"), (42, "shown")]
+    sent = sorted((p["body"]["kind"], p["body"]["at"]) for p in got["posts"])
+    assert len(sent) == 4 and sent == sorted((p["body"]["kind"], p["body"]["at"]) for p in got["firstPosts"])
+    assert got["queued"] == []
+
+
+@needs_node
 def test_a_drain_stops_at_the_first_failure_and_keeps_what_it_did_not_send() -> None:
     got = _run("throw+then:throw+click")
     assert len(got["posts"]) == 1                              # one attempt, then the drain stops
-    assert got["queued"] == ["/__levain_receipt/42-received", "/__levain_receipt/42-shown"]
+    assert _keys(got["queued"]) == [(42, "received"), (42, "shown")]
     assert ("received", "still-queued", None) in _receipt_steps(got)
 
 
 @needs_node
-def test_a_drain_sends_twenty_at_most_and_the_oldest_first() -> None:
-    got = _run("ok+seed25+clickonly")
-    ats = [p["body"]["at"] for p in got["posts"]]
-    assert len(ats) == 20 and ats == sorted(ats), ats
-    assert len(got["queued"]) == 5 and all(p["body"]["endpoint_sha256"] == "a" * 64 for p in got["posts"])
-    left = sorted(1_800_000_000_000 + ((i * 7) % 25) * 1000 for i in range(25))[20:]
-    assert sorted(int(k.split("/")[-1].split("-")[0]) for k in got["queued"]) == sorted(
-        100 + i for i in range(25) if 1_800_000_000_000 + ((i * 7) % 25) * 1000 in left)
+def test_a_drain_sends_five_at_most_and_the_oldest_first() -> None:
+    got = _run("ok+seed25+seedold+clickonly")
+    sent = [(p["body"]["ping"], p["body"]["at"]) for p in got["posts"]]
+    assert len(sent) == 5 and sent[0] == (99, 1_750_000_000_000), sent          # an entry of the old key form goes first
+    ats = [a for _, a in sent[1:]]
+    assert ats == sorted(got["seededAts"])[:4], ats
+    assert len(got["queued"]) == 26 - 5
+
+
+@needs_node
+def test_the_queue_is_capped_and_drops_the_oldest() -> None:
+    got = _run("throw+seed200")
+    assert len(got["queued"]) == 200
+    assert (42, "received") in _keys([k for k in got["queued"] if k.startswith("/__levain_receipt/42-")])
+    oldest = sorted(got["seededAts"])[:2]
+    left = {int(k.split("-")[-2]) for k in got["queued"]}
+    assert not left & set(oldest)                                # the two oldest seeded entries were dropped
+
+
+@needs_node
+def test_the_endpoint_hash_is_asked_per_event_so_a_rotated_subscription_sends_its_new_hash() -> None:
+    got = _run("ok+then:ok+push+rotate")
+    first = {p["body"]["endpoint_sha256"] for p in got["firstPosts"]}
+    second = {p["body"]["endpoint_sha256"] for p in got["posts"]}
+    assert first == {hashlib.sha256(b"https://fcm.googleapis.com/fcm/send/dev1").hexdigest()}
+    assert second == {hashlib.sha256(b"https://fcm.googleapis.com/fcm/send/dev2").hexdigest()}
+
+
+@needs_node
+def test_a_refused_hash_is_traced_receipt_refused_and_dropped_not_retried() -> None:
+    got = _run("403+then:ok+click")
+    assert got["afterFirst"]["queued"] == [] and got["posts"] == []          # nothing left to retry
+    refused = [e for e in got["trace"] if e["step"] == "receipt-refused"]
+    assert [(e["kind"], e["status"]) for e in refused] == [("received", 403), ("shown", 403)]
 
 
 @needs_node
@@ -329,8 +526,8 @@ def test_a_push_with_no_ping_id_makes_no_post() -> None:
 
 @needs_node
 def test_a_refused_receipt_is_traced_with_its_status_and_not_queued_but_a_server_fault_is() -> None:
-    got = _run("403")
-    assert got["queued"] == [] and _receipt_steps(got) == [("received", "refused", 403), ("shown", "refused", 403)]
+    got = _run("404")
+    assert got["queued"] == [] and _receipt_steps(got) == [("received", "refused", 404), ("shown", "refused", 404)]
     got = _run("500")
     assert len(got["queued"]) == 2 and _receipt_steps(got)[0] == ("received", "queued", 500)
     got = _run("429")                                            # a rate limit is retried later, never settled
@@ -451,6 +648,115 @@ def test_ref_and_since_filter_the_report(tmp_path: Path) -> None:
 def test_the_text_report_says_no_receipt_is_not_lost(tmp_path: Path) -> None:
     out = receipts.text(receipts.build(_seed(tmp_path)))
     assert "DUPLICATE x2" in out and "silent" in out and "no receipt yet" in out and "not lost" in out
+    assert "push service gone (404/410)" in out
+
+
+def _two_phones(tmp_path: Path) -> tuple[PushStore, int, int]:
+    phone(tmp_path, "https://fcm.googleapis.com/fcm/send/a", "a")
+    phone(tmp_path, "https://web.push.apple.com/b", "b")
+    s = PushStore(tmp_path)
+    with s.read() as c:
+        subs = {r["device_id"]: r["id"] for r in c.execute("SELECT id, device_id FROM subscriptions")}
+    return s, subs[PAIRED_PREFIX + "a"], subs[PAIRED_PREFIX + "b"]
+
+
+def _rows(s: PushStore, deliveries=(), receipts_=(), opens=()) -> None:
+    with s.write() as c:
+        c.executemany("INSERT INTO deliveries (ping_id, subscription_id, status, at) VALUES (?,?,?,?)", deliveries)
+        c.executemany("INSERT INTO receipts (ping_id, device_id, kind, at, reported_at) VALUES (?,?,?,?,?)",
+                      [(p, PAIRED_PREFIX + d, k, at, at[:19] + "Z") for p, d, k, at in receipts_])
+        c.executemany("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)",
+                      [(p, PAIRED_PREFIX + d, at) for p, d, at in opens])
+
+
+def _ms_stamp(minutes: int, ms: int = 0) -> str:
+    return _t(minutes)[:-1] + f".{ms:03d}Z"
+
+
+def test_silent_is_decided_by_times_not_by_ping_id_order(tmp_path: Path) -> None:
+    s, sa, _ = _two_phones(tmp_path)
+    held, later = s.add_ping("sign", "np-held", "t", "b"), s.add_ping("sign", "np-2", "t", "b")   # held < later by id
+    # `later` went out first and was reported; `held` was released afterwards under its old, lower id
+    _rows(s, deliveries=[(later, sa, 201, _t(0)), (held, sa, 201, _t(5))],
+          receipts_=[(later, "a", "received", _ms_stamp(0, 500))])
+    assert _by(receipts.build(s), 0, [held], "a")["outcome"] == "no receipt yet"
+    _rows(s, receipts_=[(later, "a", "shown", _ms_stamp(6))])                 # A reported something after held reached it
+    assert _by(receipts.build(s), 0, [held], "a")["outcome"] == "silent"
+
+
+def test_a_tapped_ping_is_shown_even_with_its_receipts_lost(tmp_path: Path) -> None:
+    s, sa, sb = _two_phones(tmp_path)
+    p, q = s.add_ping("sign", None, "t", "b"), s.add_ping("sign", None, "t", "b")
+    _rows(s, deliveries=[(p, sa, 201, _t(0)), (q, sa, 201, _t(1)), (p, sb, 410, _t(0))],
+          receipts_=[(q, "a", "received", _ms_stamp(2))], opens=[(p, "a", _t(3)), (p, "b", _t(3))])
+    rep = receipts.build(s)
+    a = _by(rep, 0, [p], "a")
+    assert a["outcome"] == "shown" and a["tapped_at"] == _t(3) and a["received_at"] is None    # never "silent"
+    b = _by(rep, 0, [p], "b")
+    assert b["outcome"] == "shown" and b["push"] == "gone"                  # a tap beats "not accepted" too
+    assert {r["device"]: r["silent"] for r in rep["devices"]}[PAIRED_PREFIX + "a"] == 0
+
+
+@pytest.mark.parametrize("statuses, push, accepted, outcome", [
+    ([201], "accepted", True, "no receipt yet"),
+    ([0], "no-answer", None, "no receipt yet"),
+    ([-1], "no-answer", None, "no receipt yet"),
+    ([-1, 503], "no-answer", None, "no receipt yet"),
+    ([0, 201], "accepted", True, "no receipt yet"),
+    ([500], "refused", False, "not accepted"),
+    ([403, 429], "refused", False, "not accepted"),
+    ([404], "gone", False, "not accepted"),
+    ([410, 500], "gone", False, "not accepted"),
+])
+def test_the_five_push_states(tmp_path: Path, statuses: list[int], push: str, accepted: bool | None, outcome: str) -> None:
+    s, sa, _ = _two_phones(tmp_path)
+    p = s.add_ping("sign", None, "t", "b")
+    _rows(s, deliveries=[(p, sa, st, _t(i)) for i, st in enumerate(statuses)])
+    d = _by(receipts.build(s), 0, [p], "a")
+    assert (d["push"], d["accepted"], d["outcome"]) == (push, accepted, outcome)
+    assert receipts.push_state(statuses) == push
+    word = {"accepted": "accepted", "no-answer": "no answer", "refused": "refused", "gone": "gone (404/410)"}[push]
+    assert f"push service {word};" in receipts.text(receipts.build(s))
+
+
+def test_the_fifth_push_state_is_none_without_a_delivery(tmp_path: Path) -> None:
+    s, _, _ = _two_phones(tmp_path)
+    p = s.add_ping("sign", None, "t", "b")
+    _rows(s, receipts_=[(p, "b", "received", _ms_stamp(0))])
+    d = _by(receipts.build(s), 0, [p], "b")
+    assert (d["push"], d["accepted"], d["outcome"]) == ("none", None, "received")
+    assert "push service no delivery on record" in receipts.text(receipts.build(s))
+    assert receipts.PUSH_STATES == ("accepted", "no-answer", "gone", "refused", "none")
+
+
+def test_a_long_record_reports_without_since_in_bounded_time(tmp_path: Path, capsys) -> None:
+    n = 5000
+    phone(tmp_path, "https://fcm.googleapis.com/fcm/send/a", "a")
+    phone(tmp_path, "https://web.push.apple.com/b", "b")
+    phone(tmp_path, "https://updates.push.services.mozilla.com/c", "c")
+    s = PushStore(tmp_path)
+    with s.write() as c:
+        subs = {r["device_id"][len(PAIRED_PREFIX):]: r["id"] for r in c.execute("SELECT id, device_id FROM subscriptions")}
+        c.executemany("INSERT INTO pings (at, kind, ref, title, body) VALUES (?,?,?,?,?)",
+                      [(_t(i % 600), "sign", f"np-{i}", "t", "b") for i in range(n)])
+        ids = [r[0] for r in c.execute("SELECT id FROM pings ORDER BY id")]
+        c.executemany("INSERT INTO deliveries (ping_id, subscription_id, at, status) VALUES (?,?,?,?)",
+                      [(p, sid, _t(i % 600), 201) for i, p in enumerate(ids) for sid in subs.values()])
+        c.executemany("INSERT INTO receipts (ping_id, device_id, kind, at, reported_at) VALUES (?,?,?,?,?)",
+                      [(p, PAIRED_PREFIX + d, k, _ms_stamp(i % 600, 100), _t(i % 600))
+                       for i, p in enumerate(ids) for d in ("a", "b") for k in ("received", "shown")])
+        c.executemany("INSERT INTO opens (ping_id, device_id, at) VALUES (?,?,?)",
+                      [(p, PAIRED_PREFIX + "a", _t(i % 600)) for i, p in enumerate(ids[::10])])
+    t0 = time.monotonic()
+    rep = receipts.build(s)                                  # no --since: every ping, more than any SQLite variable limit
+    took = time.monotonic() - t0
+    assert len(rep["pings"]) == n and all(len(p["devices"]) == 3 for p in rep["pings"])
+    roll = {r["device"]: r for r in rep["devices"]}
+    assert roll[PAIRED_PREFIX + "a"]["shown"] == n and roll[PAIRED_PREFIX + "c"]["received"] == 0
+    assert took < 10.0, took
+    t0 = time.monotonic()
+    rc, out = _cli(tmp_path, capsys=capsys)
+    assert rc == 0 and f"#{ids[-1]} " in out and time.monotonic() - t0 < 15.0
 
 
 # --- the command -----------------------------------------------------------------------------------------------------
@@ -473,7 +779,7 @@ def test_the_command_prints_the_stable_json_shape(tmp_path: Path, capsys) -> Non
     got = json.loads(out)
     assert rc == 0 and list(got) == ["format", "since", "ref", "pings", "devices"] and got["format"] == "levain-ping-receipts/1"
     assert list(got["pings"][0]) == ["ping", "at", "kind", "ref", "devices"]
-    assert list(got["pings"][0]["devices"][0]) == ["device", "accepted", "statuses", "sent_at", "received_at", "shown_at",
+    assert list(got["pings"][0]["devices"][0]) == ["device", "push", "accepted", "statuses", "sent_at", "received_at", "shown_at",
                                                    "tapped_at", "received_count", "duplicate", "sent_to_received_s",
                                                    "received_to_shown_s", "outcome"]
     assert list(got["devices"][0]) == ["device", "sent", "accepted", "received", "shown", "tapped", "duplicates", "silent",

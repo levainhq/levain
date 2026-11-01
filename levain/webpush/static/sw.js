@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1101-receipts-1';
+const SW_VERSION = '1101-receipts-2';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -15,8 +15,12 @@ const TRACE_CACHE = 'levain-trace', TRACE_PREFIX = '/__levain_trace/', TRACE_CAP
 // Cache Storage names this worker keeps: `levain-open` holds the pending tap target (see notificationclick); a later row
 // (W5b) adds its own versioned names here.
 const OPEN_CACHE = 'levain-open', OPEN_PREFIX = '/__levain_open/';
-// A device receipt (see sendReceipt) that could not be delivered waits in its own cache, one entry per ping and kind.
-const RECEIPT_CACHE = 'levain-receipts', RECEIPT_PREFIX = '/__levain_receipt/', RECEIPT_MS = 3000, RECEIPT_DRAIN = 20;
+// A device receipt (see sendReceipt) waits in its own cache until the server answered it: one entry per REPORT, key
+// RECEIPT_PREFIX + <ping> + '-' + <kind> + '-' + <time ms, zero padded> + '-' + <seq>, so two deliveries of one ping are two
+// entries. At most RECEIPT_QUEUE_CAP entries (the oldest dropped); at most RECEIPT_DRAIN re-sent per event; all receipt
+// work of one event ends RECEIPT_BUDGET_MS after the event started.
+const RECEIPT_CACHE = 'levain-receipts', RECEIPT_PREFIX = '/__levain_receipt/';
+const RECEIPT_BUDGET_MS = 4000, RECEIPT_DRAIN = 5, RECEIPT_QUEUE_CAP = 200;
 const CACHES_KEEP = [OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE];
 // How long a 'for: new' entry lives (and how long the worker keeps one after a successful openWindow): the window between
 // openWindow and the opened page's first script run. The page's own limit for 'new' entries is the same figure (sw_open.js).
@@ -64,71 +68,123 @@ const traceSettled = () => {
 // A push the device got is reported to the server: `received` when the push event fired, `shown` when showNotification
 // resolved. The worker holds no credential, so a report names the SHA-256 of its own push-subscription endpoint (the
 // secret only the device and the server share) and carries ids and times only. Every step is total: nothing in here
-// throws into the notification, and each wait is bounded.
-let endpointHashP = null;
-function endpointHash() {
-  if (!endpointHashP) {
-    endpointHashP = (async () => {
-      const sub = await self.registration.pushManager.getSubscription();
-      if (!sub || !sub.endpoint) return null;
-      const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sub.endpoint));
-      return Array.from(new Uint8Array(d)).map((b) => b.toString(16).padStart(2, '0')).join('');
-    })().catch(() => null);
-  }
-  return endpointHashP;
-}
-// the HTTP status of one POST, or throws after RECEIPT_MS
-async function postReceipt(body) {
+// throws into the notification. ONE budget per event bounds all of it (receiptBudget): every fetch shares its abort
+// signal, and every subscription, digest and Cache Storage wait races its deadline.
+const LATE = Object.freeze({ late: true });   // what a wait under a budget yields when the deadline came first
+// The receipt budget of one event: RECEIPT_BUDGET_MS from t0 (the event's start). `within(f)` runs f and yields its
+// result, or LATE once the deadline passed; `signal` aborts every fetch at the deadline; `over` says it passed.
+function receiptBudget(t0) {
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), RECEIPT_MS);
+  const b = { signal: ac.signal, over: false };
+  let timer;
+  const expired = new Promise((r) => {
+    timer = setTimeout(() => { b.over = true; try { ac.abort(); } catch (_) { /* gone */ } r(LATE); },
+                       Math.max(0, RECEIPT_BUDGET_MS - (Date.now() - t0)));
+  });
+  b.within = (f) => Promise.race([Promise.resolve().then(f), expired]);
+  b.end = () => clearTimeout(timer);
+  return b;
+}
+// the SHA-256 (hex) of this worker's push-subscription endpoint, asked NOW (never cached across events: a rotated
+// subscription has a new endpoint); null without a subscription, LATE past the budget
+async function endpointHash(b) {
   try {
-    const r = await fetch('/webpush/receipt', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                                                credentials: 'same-origin', cache: 'no-store', body: JSON.stringify(body), signal: ac.signal });
-    return r.status;
-  } finally { clearTimeout(timer); }
+    const sub = await b.within(() => self.registration.pushManager.getSubscription());
+    if (sub === LATE) return LATE;
+    if (!sub || !sub.endpoint) return null;
+    const d = await b.within(() => crypto.subtle.digest('SHA-256', new TextEncoder().encode(sub.endpoint)));
+    if (d === LATE) return LATE;
+    return Array.from(new Uint8Array(d)).map((x) => x.toString(16).padStart(2, '0')).join('');
+  } catch (_) { return null; }
 }
-// a status that retrying cannot change: delivered, or refused for this report itself
+// the HTTP status of one POST; throws when the network failed or the budget aborted it
+async function postReceipt(body, b) {
+  const r = await b.within(() => fetch('/webpush/receipt', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                                            credentials: 'same-origin', cache: 'no-store', body: JSON.stringify(body), signal: b.signal }));
+  if (r === LATE) throw new Error('receipt budget');
+  return r.status;
+}
+// a status that retrying cannot change: delivered, or refused for this report itself (an unknown hash or ping included)
 const receiptSettled = (status) => status === 200 || (status >= 400 && status < 500 && status !== 408 && status !== 429);
-async function queueReceipt(body) {
-  const c = await caches.open(RECEIPT_CACHE);
-  await c.put(RECEIPT_PREFIX + body.ping + '-' + body.kind, new Response(JSON.stringify(body)));
+let receiptSeq = 0;
+const receiptKey = (body) => RECEIPT_PREFIX + body.ping + '-' + body.kind + '-' + String(body.at).padStart(13, '0') + '-' +
+  String(receiptSeq++).padStart(4, '0');
+// [time, seq] from a key, for oldest-first; a key of an older form sorts first
+function receiptAge(k) {
+  const m = /-(\d+)-(\d+)$/.exec(k.slice(RECEIPT_PREFIX.length));
+  return m ? [Number(m[1]), Number(m[2])] : [0, 0];
 }
-// true when the server answered (so the network is up and a drain is worth its time), false otherwise; never throws
-async function sendReceipt(ping, kind, at) {
+const byAge = (x, y) => { const a = receiptAge(x), c = receiptAge(y); return a[0] - c[0] || a[1] - c[1] || (x < y ? -1 : x > y ? 1 : 0); };
+const receiptKeys = async (c) => (await c.keys()).map((r) => new URL(r.url).pathname).filter((k) => k.indexOf(RECEIPT_PREFIX) === 0).sort(byAge);
+// write one report under its own key, then drop the oldest past RECEIPT_QUEUE_CAP; true when written
+async function putReceipt(key, body) {
+  if (typeof caches === 'undefined') return false;
+  const c = await caches.open(RECEIPT_CACHE);
+  await c.put(key, new Response(JSON.stringify(body)));
+  const keys = await receiptKeys(c);
+  for (const k of keys.slice(0, Math.max(0, keys.length - RECEIPT_QUEUE_CAP))) await c.delete(k);
+  return true;
+}
+async function dropReceipt(key) {
+  const c = await caches.open(RECEIPT_CACHE);
+  return c.delete(key);
+}
+const traceRefused = (kind, ping, status, result) => trace('receipt-refused', { kind, ping, result, status });
+// Report one receipt: written to the queue under its own key while the POST runs beside it, and removed only when the
+// server answered 200 or refused it (a refused report is dropped: retrying cannot change it); a network failure, a 5xx,
+// 408 or 429, or the budget leaves it queued for a later event. True when the server answered (the network is up, so a
+// drain is worth its time); never throws.
+async function sendReceipt(ping, kind, at, b, hashP) {
   try {
     if (!Number.isInteger(ping) || ping <= 0) { trace('receipt', { kind, ping: null, result: 'no-ping' }); return false; }
-    const hash = await endpointHash();
+    const hash = await hashP;
+    if (hash === LATE || b.over) { trace('receipt', { kind, ping, result: 'late' }); return false; }
     if (!hash) { trace('receipt-no-sub', { kind, ping }); return false; }
     const body = { ping, kind, at, endpoint_sha256: hash };
-    let status = null;
-    try { status = await postReceipt(body); } catch (err) { status = null; }
-    if (status === 200) { trace('receipt', { kind, ping, result: 'ok' }); return true; }
-    if (status !== null && receiptSettled(status)) { trace('receipt', { kind, ping, result: 'refused', status }); return true; }
-    try { await queueReceipt(body); trace('receipt', { kind, ping, result: 'queued', status }); } catch (_) { trace('receipt', { kind, ping, result: 'lost', status }); }
+    const key = receiptKey(body);
+    const [put, post] = await Promise.allSettled([b.within(() => putReceipt(key, body)), postReceipt(body, b)]);
+    const queued = put.status === 'fulfilled' && put.value === true;
+    const status = post.status === 'fulfilled' ? post.value : null;
+    if (status !== null && receiptSettled(status)) {
+      if (queued) { try { await b.within(() => dropReceipt(key)); } catch (_) { /* re-sent later: the server absorbs it */ } }
+      if (status === 200) trace('receipt', { kind, ping, result: 'ok' }); else traceRefused(kind, ping, status, 'refused');
+      return true;
+    }
+    trace('receipt', { kind, ping, result: queued ? 'queued' : 'lost', status });
     return status !== null;
   } catch (_) { return false; /* a receipt never reaches the notification */ }
 }
-// re-send queued receipts, oldest first, up to RECEIPT_DRAIN; one that cannot be delivered stops the drain (the network is
-// the likely cause), one the server settled is dropped
-async function drainReceipts() {
+// Re-send queued receipts, oldest first, at most RECEIPT_DRAIN, inside budget b. Each entry is deleted by the exact key
+// read, and only after the server answered 200 or refused it; one the server did not settle stops the drain (the network
+// is the likely cause) and stays.
+async function drainReceipts(b) {
   try {
-    if (typeof caches === 'undefined') return;
-    const c = await caches.open(RECEIPT_CACHE);
-    const keys = (await c.keys()).map((r) => new URL(r.url).pathname).filter((k) => k.indexOf(RECEIPT_PREFIX) === 0);
-    const items = [];
-    for (const k of keys) {
-      try { const m = await c.match(k); items.push({ k, body: JSON.parse(await m.text()) }); } catch (_) { await c.delete(k); }
-    }
-    items.sort((a, b) => (a.body.at || 0) - (b.body.at || 0));
-    for (const { k, body } of items.slice(0, RECEIPT_DRAIN)) {
+    if (typeof caches === 'undefined' || b.over) return;
+    const c = await b.within(() => caches.open(RECEIPT_CACHE));
+    if (c === LATE) return;
+    const keys = await b.within(() => receiptKeys(c));
+    if (keys === LATE) return;
+    for (const k of keys.slice(0, RECEIPT_DRAIN)) {
+      if (b.over) return;
+      let body;
+      try {
+        body = await b.within(async () => { const m = await c.match(k); return m ? JSON.parse(await m.text()) : null; });
+      } catch (_) { try { await b.within(() => c.delete(k)); } catch (_e) { /* best effort */ } continue; }   // unreadable
+      if (body === LATE) return;
+      if (!body) continue;
       let status = null;
-      try { status = await postReceipt(body); } catch (_) { status = null; }
+      try { status = await postReceipt(body, b); } catch (_) { status = null; }
       if (status !== null && receiptSettled(status)) {
-        await c.delete(k);
-        trace('receipt', { kind: body.kind, ping: body.ping, result: status === 200 ? 'drained' : 'refused', status });
+        try { await b.within(() => c.delete(k)); } catch (_) { /* re-sent later: the server absorbs it */ }
+        if (status === 200) trace('receipt', { kind: body.kind, ping: body.ping, result: 'drained', status });
+        else traceRefused(body.kind, body.ping, status, 'refused');
       } else { trace('receipt', { kind: body.kind, ping: body.ping, result: 'still-queued', status }); break; }
     }
   } catch (_) { /* best effort */ }
+}
+// all receipt work of one event, bounded: resolves by the budget's deadline whatever hangs inside
+function boundedReceipts(b, work) {
+  return b.within(work).catch(() => null).finally(() => b.end());
 }
 
 function open() {
@@ -190,22 +246,33 @@ self.addEventListener('push', (e) => {
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: e.data ? e.data.text() : '' }; }
   const title = d.title || 'Levain';
+  // a fixed tag with renotify: a re-ping for the same item replaces the earlier notification and alerts again. The
+  // notification is asked for FIRST, before any trace or receipt, and never waits on either; it does not race the
+  // receipt budget (only receipts do)
+  let shown;
+  try {
+    shown = Promise.resolve(self.registration.showNotification(title, {
+      body: d.body || '',
+      tag: d.tag || 'levain',
+      renotify: true,
+      icon: '/icon-192.png',
+      badge: '/badge-96.png',   // monochrome alpha: Android draws only the alpha channel in the status bar
+      data: { url: d.url || '/', ping: d.ping },
+    }));
+  } catch (err) { shown = Promise.reject(err); }
   trace('sw-version', { version: SW_VERSION, on: 'push' });
   trace('push', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
   const ping = typeof d.ping === 'number' ? d.ping : Number(d.ping);
-  // a fixed tag with renotify: a re-ping for the same item replaces the earlier notification and alerts again. The
-  // notification is asked for first and never waits on a receipt: the reports run beside it, inside the same waitUntil
-  const shown = Promise.resolve().then(() => self.registration.showNotification(title, {
-    body: d.body || '',
-    tag: d.tag || 'levain',
-    renotify: true,
-    icon: '/icon-192.png',
-    badge: '/badge-96.png',   // monochrome alpha: Android draws only the alpha channel in the status bar
-    data: { url: d.url || '/', ping: d.ping },
-  })).then(() => sendReceipt(ping, 'shown', Date.now()));
-  const received = sendReceipt(ping, 'received', t0);
-  // the queue is re-sent after this push's own reports, and only when the server answered one of them
-  e.waitUntil(Promise.allSettled([shown, received]).then((r) => (r.some((x) => x.value === true) ? drainReceipts() : null)).finally(traceSettled));
+  // then the receipts, all under one budget from the event's start: received now, shown when the notification resolved,
+  // and the queue re-sent after both, only when the server answered one of them
+  const b = receiptBudget(t0);
+  const receipts = boundedReceipts(b, async () => {
+    const hashP = endpointHash(b);   // one hash for this event's reports, asked now
+    const r = await Promise.all([sendReceipt(ping, 'received', t0, b, hashP),
+                                 shown.then(() => sendReceipt(ping, 'shown', Date.now(), b, hashP), () => false)]);
+    if (r.some((x) => x === true)) await drainReceipts(b);
+  });
+  e.waitUntil(Promise.allSettled([shown, receipts]).finally(traceSettled));
   shown.catch((err) => trace('show-failed', { error: err && err.name || 'error' }));
 });
 
@@ -255,6 +322,7 @@ function sameTarget(a, b) {
 }
 
 self.addEventListener('notificationclick', (e) => {
+  const clickT0 = Date.now();
   e.notification.close();
   const data = e.notification.data || {};
   let u;
@@ -359,5 +427,7 @@ self.addEventListener('notificationclick', (e) => {
     const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     for (const c of wins) c.postMessage({ type: 'levain-opened' });
   })();
-  e.waitUntil(Promise.allSettled([opened, mark, drainReceipts()]).then(traceSettled));
+  // the receipt queue is re-sent beside the tap, under the click's own receipt budget (never holding the tap)
+  const rb = receiptBudget(clickT0);
+  e.waitUntil(Promise.allSettled([opened, mark, boundedReceipts(rb, () => drainReceipts(rb))]).then(traceSettled));
 });

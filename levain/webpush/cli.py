@@ -38,7 +38,7 @@ def register(subparsers) -> None:
         "receipts", help="What each phone said about each push: received, shown, tapped, duplicates.",
         description="Device receipts per ping and phone, joined with the push service's answer and the tap. A ping "
                     "with no receipt is `no receipt yet`, never lost; `silent` is said only when that phone reported "
-                    "a LATER ping."))
+                    "something LATER than this ping reached it."))
     rc.add_argument("--since", default=None, metavar="7d", help="Only pings from the last N days, hours or minutes (7d, 12h, 30m).")
     rc.add_argument("--ref", default=None, help="Only pings about this ref (request:<id> or question:<n>).")
     rc.add_argument("--json", action="store_true", help="The stable JSON form (levain.webpush.receipts docstring).")

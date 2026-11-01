@@ -111,6 +111,12 @@ sandbox.fetch = (url, init) => {
   log.posts.push({ url, method: init.method, body: JSON.parse(init.body), contentType: init.headers['Content-Type'], hasSignal: !!init.signal });
   if (behaviour === 'throw') return Promise.reject(new TypeError('network down'));
   if (behaviour === 'hang') return new Promise((_, rej) => init.signal.addEventListener('abort', () => rej(new Error('aborted'))));
+  if (behaviour === 'slow') return new Promise((res, rej) => {   // 200 after 1.5 s, unless the worker aborts it first
+    let done = false;   // the signal is shared by the event's every fetch: count an abort only of one still in flight
+    const t = setTimeout(() => { done = true; res({ status: 200 }); }, 1500);
+    init.signal.addEventListener('abort', () => { if (done) return; done = true; clearTimeout(t); log.aborted = (log.aborted || 0) + 1; rej(new Error('aborted')); });
+  });
+  if (behaviour === 'deaf') return new Promise(() => {});   // never settles, never honours the abort
   const status = behaviour === 'ok' ? 200 : Number(behaviour);
   return Promise.resolve({ status });
 };
@@ -181,35 +187,60 @@ function fire(type, ev) {
     log.pendingLeft = log.pendings.length;
     if (log.pendings.length) log.pending = log.pendings[0];
   } else if (scenario === 'push') {
-    // mode: <behaviour>[+<flag>...]; flags: nosub noping showthrows seed25 then:<behaviour> (after the first push, the fetch
-    // behaves so and a `click` or a second `push` event runs: `then:ok+click` / `then:ok+push`)
+    // mode: <behaviour>[+<flag>...]; flags: nosub noping showthrows seed<N> (N queued entries, new key form, a scrambled
+    // age order) seedold (one entry under the pre-fix key form) twice (the first push fires twice, the same ping) subhang
+    // (getSubscription never answers) cachehang (the receipts cache never opens) then:<behaviour> (after the first push, the fetch behaves so and a `click` or a second `push` event runs:
+    // `then:ok+click` / `then:ok+push`) rotate (the subscription's endpoint changes before that second event)
     const parts = mode.split('+');
     behaviour = parts[0];
     log.subscription = parts.includes('nosub') ? null : { endpoint: 'https://fcm.googleapis.com/fcm/send/dev1' };
     log.showThrows = parts.includes('showthrows');
-    if (parts.includes('seed25')) {
+    if (parts.includes('subhang')) self_.registration.pushManager.getSubscription = () => new Promise(() => {});
+    if (parts.includes('cachehang')) {
+      const realOpen = caches.open;
+      caches.open = (n) => (n === 'levain-receipts' ? new Promise(() => {}) : realOpen(n));
+    }
+    const seed = parts.find((p) => /^seed\d+$/.test(p));
+    if (seed || parts.includes('seedold')) {
       const m = new Map();
-      for (let i = 0; i < 25; i++) {
-        const at = 1_800_000_000_000 + ((i * 7) % 25) * 1000;
-        m.set('/__levain_receipt/' + (100 + i) + '-received', JSON.stringify({ ping: 100 + i, kind: 'received', at, endpoint_sha256: 'a'.repeat(64) }));
+      const n = seed ? Number(seed.slice(4)) : 0;
+      log.seededAts = [];
+      for (let i = 0; i < n; i++) {
+        const at = 1_700_000_000_000 + ((i * 7) % n) * 1000;
+        log.seededAts.push(at);
+        m.set('/__levain_receipt/' + (100 + i) + '-received-' + String(at).padStart(13, '0') + '-0000',
+              JSON.stringify({ ping: 100 + i, kind: 'received', at, endpoint_sha256: 'a'.repeat(64) }));
       }
+      if (parts.includes('seedold')) m.set('/__levain_receipt/99-shown', JSON.stringify({ ping: 99, kind: 'shown', at: 1_750_000_000_000, endpoint_sha256: 'b'.repeat(64) }));
       cacheNames.add('levain-receipts'); cacheStores.set('levain-receipts', m);
     }
     const data = parts.includes('noping') ? { title: 'T', body: 'secret body' } : { title: 'T', body: 'secret body', ping: 42, url: '/', tag: 'x' };
     const started = Date.now();
     const evPush = () => ({ data: { json: () => data } });
-    if (!parts.includes('clickonly')) await fire('push', evPush());
+    if (!parts.includes('clickonly')) {
+      await fire('push', evPush());
+      if (parts.includes('twice')) await fire('push', evPush());
+    }
     log.elapsedMs = Date.now() - started;
     log.afterFirst = { posts: log.posts.length, queued: [...(cacheStores.get('levain-receipts') || new Map()).keys()].sort() };
+    log.firstPosts = log.posts;
     const then = parts.find((p) => p.startsWith('then:'));
     if (then) {
       behaviour = then.slice(5);
       log.posts = [];
       log.windows = [windowClient];
+      if (parts.includes('rotate')) log.subscription = { endpoint: 'https://fcm.googleapis.com/fcm/send/dev2' };
+      const t1 = Date.now();
       if (parts.includes('click')) await fire('notificationclick', { notification: { close: () => {}, data: { url: '/' } } });
       if (parts.includes('push')) await fire('push', evPush());
+      log.thenMs = Date.now() - t1;
     }
-    if (parts.includes('clickonly')) { log.windows = [windowClient]; await fire('notificationclick', { notification: { close: () => {}, data: { url: '/' } } }); }
+    if (parts.includes('clickonly')) {
+      log.windows = [windowClient];
+      const t1 = Date.now();
+      await fire('notificationclick', { notification: { close: () => {}, data: { url: '/' } } });
+      log.clickMs = Date.now() - t1;
+    }
     log.queued = [...(cacheStores.get('levain-receipts') || new Map()).keys()].sort();
     log.trace = traceSteps();
   } else if (scenario === 'click') {

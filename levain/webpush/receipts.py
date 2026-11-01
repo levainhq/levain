@@ -6,25 +6,43 @@ answered (``deliveries``); a device that woke for a push reports ``received`` (t
 four per ping and device.
 
 Reading it: a ping with no receipt is ``no receipt yet``, never lost. A device that has not woken since cannot have
-reported, so ``silent`` is said only when that device has reported on a LATER ping. ``received_count`` above one is a
-duplicate delivery (the repeat-notification signal). Times are the worker's own clock for ``received_at`` and
-``shown_at`` and the server's for ``sent_at`` and ``tapped_at``, so a latency carries the device's clock skew and can be
-slightly negative.
+reported, so ``silent`` is said only when that device reported a receipt (on any ping, of any kind) whose time is LATER
+than this ping's delivery to it: ping ids are not send order (a held ping is released later under its old, lower id),
+so the times decide, never the ids. A tap is the strongest sign the ping was seen: a tapped ping's outcome is ``shown``
+even when its receipts were lost. ``received_count`` above one is a duplicate delivery (the repeat-notification signal).
+Times are the worker's own clock for ``received_at`` and ``shown_at`` and the server's for ``sent_at`` and ``tapped_at``,
+so a latency, and the ``silent`` comparison, carry the device's clock skew and a latency can be slightly negative.
+
+What the push service said (``push``), from every attempt to that device for that ping, the first that applies:
+
+- ``accepted``: some attempt got a 2xx (the push service took it; ``accepted`` is true only here)
+- ``no-answer``: no 2xx, and some attempt got no answer (status 0) or none within the send's wall budget (-1, UNKNOWN):
+  the push may still have gone, so ``accepted`` is null, never false
+- ``gone``: every answer was a refusal and one was 404 or 410 (the subscription is dead; the send retired it)
+- ``refused``: every answer was another non-2xx refusal (4xx or 5xx)
+- ``none``: no delivery on record for this device (it reported or tapped without one, or the send is still running)
+
+``accepted`` is false only for ``gone`` and ``refused``; ``outcome`` is ``not accepted`` only for those two and only when
+the device reported nothing and did not tap.
+
+The read is four aggregate queries joined to the filtered ``pings`` in SQL (no parameter per ping) and one grouping pass,
+so a report without ``--since`` over a long record stays linear in its rows.
+
+Known edge, not built against: ``/webpush/receipt`` takes no token, so two slow unauthenticated clients can hold both of
+its semaphore slots; that channel is measurement, not delivery, and has its own semaphore, so no push is affected.
 
 JSON form (``format`` ``levain-ping-receipts/1``, the keys the desk joins to the native APNs side on ``ref``)::
 
     {"format": "levain-ping-receipts/1", "since": <stamp or null>, "ref": <ref or null>,
      "pings": [{"ping": int, "at": stamp, "kind": str, "ref": str|null,
-                "devices": [{"device": str, "accepted": bool|null, "statuses": [int], "sent_at": stamp|null,
+                "devices": [{"device": str, "push": "accepted"|"no-answer"|"gone"|"refused"|"none",
+                             "accepted": bool|null, "statuses": [int], "sent_at": stamp|null,
                              "received_at": stamp|null, "shown_at": stamp|null, "tapped_at": stamp|null,
                              "received_count": int, "duplicate": bool,
                              "sent_to_received_s": float|null, "received_to_shown_s": float|null,
                              "outcome": "shown"|"received"|"silent"|"no receipt yet"|"not accepted"}]}],
      "devices": [{"device": str, "sent": int, "accepted": int, "received": int, "shown": int, "tapped": int,
                   "duplicates": int, "silent": int, "median_sent_to_received_s": float|null}]}
-
-``accepted`` is null for a ping with no delivery to that device (it reported or tapped without one on record);
-``outcome`` is ``not accepted`` only when every push-service answer was a refusal and the device reported nothing.
 """
 from __future__ import annotations
 
@@ -37,8 +55,13 @@ from levain.webpush.store import STAMP, PushStore
 
 FORMAT = "levain-ping-receipts/1"
 _SINCE = re.compile(r"^(\d+)([dhm])$")
+PUSH_STATES = ("accepted", "no-answer", "gone", "refused", "none")
+_PUSH_WORDS = {"accepted": "accepted", "no-answer": "no answer", "gone": "gone (404/410)", "refused": "refused",
+               "none": "no delivery on record"}
+# the filtered pings, joined by every read below: no SQL parameter per ping
+_PINGS = "(? IS NULL OR p.at >= ?) AND (? IS NULL OR p.ref = ?)"
 
-__all__ = ["FORMAT", "build", "parse_since", "text"]
+__all__ = ["FORMAT", "PUSH_STATES", "build", "parse_since", "push_state", "text"]
 
 
 def parse_since(word: str) -> timedelta:
@@ -47,6 +70,19 @@ def parse_since(word: str) -> timedelta:
     if m is None or int(m.group(1)) == 0:
         raise ValueError(f"--since {word!r}: use a number and d, h or m (7d, 12h, 30m)")
     return timedelta(**{{"d": "days", "h": "hours", "m": "minutes"}[m.group(2)]: int(m.group(1))})
+
+
+def push_state(statuses: list[int]) -> str:
+    """The push service's answer over every attempt (the module docstring's five states)."""
+    if not statuses:
+        return "none"
+    if any(200 <= s < 300 for s in statuses):
+        return "accepted"
+    if any(s <= 0 for s in statuses):
+        return "no-answer"
+    if any(s in (404, 410) for s in statuses):
+        return "gone"
+    return "refused"
 
 
 def _t(stamp: str | None) -> datetime | None:
@@ -67,72 +103,79 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
           now: datetime | None = None) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     cutoff = None if since is None else (now - since).strftime(STAMP)
-    with store.read() as c:
-        pings = [dict(r) for r in c.execute(
-            "SELECT id, at, kind, ref FROM pings WHERE (? IS NULL OR at >= ?) AND (? IS NULL OR ref = ?) ORDER BY id",
-            (cutoff, cutoff, ref, ref))]
-        ids = [p["id"] for p in pings]
-        marks = ",".join("?" * len(ids))
-        deliveries = [dict(r) for r in c.execute(
-            "SELECT d.ping_id, d.at, d.status, s.device_id FROM deliveries d JOIN subscriptions s ON s.id = d.subscription_id "
-            f"WHERE d.ping_id IN ({marks}) ORDER BY d.id", ids)] if ids else []
-        receipts = [dict(r) for r in c.execute(
-            f"SELECT ping_id, device_id, kind, at FROM receipts WHERE ping_id IN ({marks}) ORDER BY id", ids)] if ids else []
-        opens = [dict(r) for r in c.execute(
-            f"SELECT ping_id, device_id, at FROM opens WHERE ping_id IN ({marks}) ORDER BY id", ids)] if ids else []
-        # the newest ping each device has reported on, over the whole record: a ping before it was passed over
-        last = {r["device_id"]: r["m"] for r in c.execute("SELECT device_id, MAX(ping_id) AS m FROM receipts GROUP BY device_id")}
-
+    args = (cutoff, cutoff, ref, ref)
     by: dict[tuple[int, str], dict[str, Any]] = {}
+    per_ping: dict[int, list[str]] = {}
 
     def cell(ping: int, device: str) -> dict[str, Any]:
-        return by.setdefault((ping, device), {"statuses": [], "sent": [], "received": [], "shown": [], "tapped": []})
+        x = by.get((ping, device))
+        if x is None:
+            x = by[(ping, device)] = {"statuses": [], "sent": [], "received_n": 0, "received": None, "shown": None,
+                                      "tapped": None}
+            per_ping.setdefault(ping, []).append(device)
+        return x
 
-    for d in deliveries:
-        if d["device_id"]:
+    with store.read() as c:
+        pings = [dict(r) for r in c.execute(f"SELECT p.id, p.at, p.kind, p.ref FROM pings p WHERE {_PINGS} ORDER BY p.id",
+                                            args)]
+        for d in c.execute("SELECT d.ping_id, s.device_id, d.at, d.status FROM deliveries d "
+                           "JOIN pings p ON p.id = d.ping_id JOIN subscriptions s ON s.id = d.subscription_id "
+                           f"WHERE {_PINGS} AND s.device_id IS NOT NULL ORDER BY d.id", args):
             x = cell(d["ping_id"], d["device_id"])
             x["statuses"].append(d["status"])
             x["sent"].append(d["at"])
-    for r in receipts:
-        cell(r["ping_id"], r["device_id"])[r["kind"]].append(r["at"])
-    for o in opens:
-        if o["device_id"]:
-            cell(o["ping_id"], o["device_id"])["tapped"].append(o["at"])
+        # every receipt stamp has the one form (whole stamp, milliseconds, Z), so MIN and MAX on the text are by time
+        for r in c.execute("SELECT r.ping_id, r.device_id, SUM(r.kind = 'received') AS n, "
+                           "MIN(CASE WHEN r.kind = 'received' THEN r.at END) AS received, "
+                           "MIN(CASE WHEN r.kind = 'shown' THEN r.at END) AS shown "
+                           f"FROM receipts r JOIN pings p ON p.id = r.ping_id WHERE {_PINGS} "
+                           "GROUP BY r.ping_id, r.device_id", args):
+            x = cell(r["ping_id"], r["device_id"])
+            x["received_n"], x["received"], x["shown"] = int(r["n"] or 0), r["received"], r["shown"]
+        for o in c.execute("SELECT o.ping_id, o.device_id, MIN(o.at) AS at FROM opens o JOIN pings p ON p.id = o.ping_id "
+                           f"WHERE {_PINGS} AND o.device_id IS NOT NULL GROUP BY o.ping_id, o.device_id", args):
+            cell(o["ping_id"], o["device_id"])["tapped"] = o["at"]
+        # the newest receipt each device has made, over the whole record (any ping, any kind)
+        last = {r["device_id"]: _t(r["m"]) for r in c.execute(
+            "SELECT device_id, MAX(at) AS m FROM receipts GROUP BY device_id")}
 
     out_pings, roll = [], {}
     for p in pings:
         devices = []
-        for (pid, device), x in sorted(by.items()):
-            if pid != p["id"]:
-                continue
-            ok = None if not x["statuses"] else any(200 <= s < 300 for s in x["statuses"])
-            recv, shown = sorted(x["received"])[:1], sorted(x["shown"])[:1]
-            if shown:
+        for device in sorted(per_ping.get(p["id"], ())):
+            x = by[(p["id"], device)]
+            push = push_state(x["statuses"])
+            ok = True if push == "accepted" else False if push in ("gone", "refused") else None
+            recv, shown, tapped = x["received"], x["shown"], x["tapped"]
+            sent_at = min(x["sent"]) if x["sent"] else None
+            last_sent = _t(max(x["sent"])) if x["sent"] else None
+            reported = last.get(device)
+            if shown or tapped:
                 outcome = "shown"
             elif recv:
                 outcome = "received"
             elif ok is False:
                 outcome = "not accepted"
-            elif last.get(device, 0) > p["id"]:
+            elif last_sent is not None and reported is not None and reported > last_sent:
                 outcome = "silent"
             else:
                 outcome = "no receipt yet"
-            sent_at = min(x["sent"]) if x["sent"] else None
-            row = {"device": device, "accepted": ok, "statuses": x["statuses"], "sent_at": sent_at,
-                   "received_at": recv[0] if recv else None, "shown_at": shown[0] if shown else None,
-                   "tapped_at": min(x["tapped"]) if x["tapped"] else None, "received_count": len(x["received"]),
-                   "duplicate": len(x["received"]) > 1,
-                   "sent_to_received_s": _gap(sent_at, recv[0] if recv else None),
-                   "received_to_shown_s": _gap(recv[0] if recv else None, shown[0] if shown else None),
+            row = {"device": device, "push": push, "accepted": ok, "statuses": x["statuses"], "sent_at": sent_at,
+                   "received_at": recv, "shown_at": shown, "tapped_at": tapped, "received_count": x["received_n"],
+                   "duplicate": x["received_n"] > 1,
+                   "sent_to_received_s": _gap(sent_at, recv),
+                   "received_to_shown_s": _gap(recv, shown),
                    "outcome": outcome}
             devices.append(row)
-            r = roll.setdefault(device, {"device": device, "sent": 0, "accepted": 0, "received": 0, "shown": 0,
-                                         "tapped": 0, "duplicates": 0, "silent": 0, "_lat": []})
+            r = roll.get(device)
+            if r is None:
+                r = roll[device] = {"device": device, "sent": 0, "accepted": 0, "received": 0, "shown": 0,
+                                    "tapped": 0, "duplicates": 0, "silent": 0, "_lat": []}
             r["sent"] += 1 if x["statuses"] else 0
             r["accepted"] += 1 if ok else 0
             r["received"] += 1 if recv else 0
             r["shown"] += 1 if shown else 0
-            r["tapped"] += 1 if x["tapped"] else 0
+            r["tapped"] += 1 if tapped else 0
             r["duplicates"] += 1 if row["duplicate"] else 0
             r["silent"] += 1 if outcome == "silent" else 0
             if row["sent_to_received_s"] is not None:
@@ -157,7 +200,7 @@ def text(report: dict[str, Any]) -> str:
         if not p["devices"]:
             lines.append("    no device was sent this ping")
         for d in p["devices"]:
-            push = {None: "no delivery on record", True: "accepted", False: "not accepted"}[d["accepted"]]
+            push = _PUSH_WORDS.get(d["push"], d["push"])
             dup = f"; DUPLICATE x{d['received_count']}" if d["duplicate"] else ""
             lines.append(f"    {d['device']}: {d['outcome']} (push service {push}; received {d['received_at'] or '-'}, "
                          f"shown {d['shown_at'] or '-'}, tapped {d['tapped_at'] or '-'}; sent->received "
@@ -170,5 +213,5 @@ def text(report: dict[str, Any]) -> str:
                      f"{r['duplicates']} / {r['silent']} / {_s(r['median_sent_to_received_s'])}")
     lines.append("")
     lines.append("A ping with no receipt is `no receipt yet`, not lost: a phone that has not woken since cannot have "
-                 "reported. `silent` means that phone reported a LATER ping.")
+                 "reported. `silent` means that phone reported something LATER than this ping reached it.")
     return "\n".join(lines)

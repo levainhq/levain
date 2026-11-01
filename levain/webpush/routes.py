@@ -126,8 +126,9 @@ def receipt(body: bytes, *, queue_dir: Path | str) -> tuple[int, bytes, str]:
     It is the one webpush write that carries no token: the service worker holds no credential, so the report is
     authenticated by the SHA-256 of the device's own push-subscription endpoint, which only that device and this server
     know. It appends ids and times only (never ping text), and the caller must not hand it to :func:`handle`, whose
-    every other route is token-gated. An unknown hash, an absent ping, a malformed or oversize body: refused, nothing
-    written."""
+    every other route is token-gated. An unknown hash, an absent ping or one never pushed to that device's subscription
+    (the same 404 as an absent one), a malformed or oversize body: refused, nothing written, and no refusal takes the
+    store's write lock (:meth:`PushStore.add_receipt`)."""
     if len(body) > MAX_RECEIPT_BODY:
         return _err(413, "too_large", "a receipt is a few hundred bytes")
     obj = _body_json(body)
