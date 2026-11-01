@@ -243,9 +243,9 @@
     const det = window.LevainCardFormat.drawDetail(card, options);
     det.id = "sheet-detail";
     det.dataset.card = "detail";
-    const sheet = $("sheet"), note = $("sheet-note");
-    if (note && note.parentNode === sheet) sheet.insertBefore(det, note);
-    else sheet.appendChild(det);
+    // last in the page: below 800px dashboard.css `order`s it between the answers and the status line (its old place), and from
+    // 800px it is the reading column's second block; its DOM place stays after the answers either way
+    $("sheet").appendChild(det);
   }
 
   function draw(got) {

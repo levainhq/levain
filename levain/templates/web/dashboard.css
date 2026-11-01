@@ -3017,3 +3017,51 @@ body.ke #drop-recent { max-height: 40vh; overflow: auto; }
   .np-seg { flex: 1 1 100%; }
   .np-seg .ck-tab { flex: 1 1 0; min-height: var(--hit-min, 44px); }
 }
+
+/* ---- The sign sheet and /pair at every size (Phill 11-01: "why is it this narrow little strip on a huge empty page"). One page, drawn for the
+   screen it is on. Below 800px nothing changes: the 420px card above, and the sheet (a grid of one column) reads in the order it always did:
+   the answers, Detail, the status line, the way back. From 800px a needs-phill card is a two-column decision sheet (reading left, deciding
+   right) and every other sheet and /pair is one wider measure. The embedded sheet (the cockpit's modal) keeps its own layout. ---- */
+#sheet { display: grid; grid-template-columns: minmax(0, 1fr); }
+#sheet-decide { display: contents; }
+#sheet-detail { order: 1; }
+#sheet-note { order: 2; }
+#sheet-note:empty { display: none; }     /* an empty block's margins collapsed away in the old flow; a grid item's would not */
+#sheet-back { order: 3; }
+@media (min-width: 800px) {
+  .pair-body:not(.sheet-embedded) { align-items: start; padding: clamp(var(--sp-6), 7vh, var(--sp-9)) var(--sp-7); }
+  .pair-body:not(.sheet-embedded) .pair-card { width: min(100%, 720px); padding: var(--sp-8); }
+  .pair-body:not(.sheet-embedded) .pair-brand { margin-bottom: var(--sp-6); }
+  .pair-body:not(.sheet-embedded) .pair-card h1 { font-size: var(--fs-h); }
+  .pair-body:not(.sheet-embedded) #sheet-body > * { max-width: 68ch; }
+
+  /* the decision sheet: header bar, title, then reading | deciding, the hairline between them */
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) {
+    --g: clamp(var(--sp-6), 3.4vw, var(--sp-8));
+    width: min(100%, 1120px);
+    padding: 0;
+    overflow: clip;       /* clip, never hidden: a scroll container would stop the deciding column sticking */
+    grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    grid-template-rows: auto auto auto auto 1fr;
+    grid-template-areas: "brand from" "title title" "read decide" "detail decide" ". decide";
+  }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card)::before { content: ""; grid-area: decide; justify-self: start; width: 1px; background: var(--hair); }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > .pair-brand,
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-msg { margin: 0; padding: var(--sp-5) var(--g); border-bottom: 1px solid var(--hair); background: var(--card-2); display: flex; align-items: center; }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > .pair-brand { grid-area: brand; }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-msg { grid-area: from; justify-content: flex-end; text-align: right; font-size: var(--fs-meta); color: var(--meta); }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-title { grid-area: title; margin: 0; padding: var(--sp-7) var(--g) 0; }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-body { grid-area: read; padding: var(--sp-4) var(--g) var(--sp-5); }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-detail { grid-area: detail; order: 0; margin: 0; padding: 0 var(--g) var(--sp-7); max-width: calc(68ch + 2 * var(--g)); box-sizing: border-box; }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) > #sheet-decide {
+    grid-area: decide; display: block; align-self: start; position: sticky; top: var(--sp-6);
+    max-height: calc(100dvh - 2 * var(--sp-6)); overflow-y: auto; padding: var(--sp-5) var(--g) var(--sp-7);
+  }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) #sheet-note { order: 0; }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) #sheet-back { order: 0; margin: var(--sp-6) 0 0; padding-top: var(--sp-4); border-top: 1px solid var(--hair); }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) .card-meta { margin-bottom: var(--sp-4); }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) .card-headline { font-size: clamp(var(--fs-h), 1.1vw + 12px, 28px); line-height: 1.25; margin-bottom: var(--sp-6); }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) .pair-actions.card-rows { gap: var(--sp-4); margin-bottom: var(--sp-5); }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) .pair-actions.card-rows .dev-btn { font-size: var(--fs-lead); padding: var(--sp-4) var(--sp-5); }
+  .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) #sheet-signing { margin: 0 0 var(--sp-4); }
+}

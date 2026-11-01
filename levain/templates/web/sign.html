@@ -13,9 +13,12 @@
     <h1 id="sheet-title">Sign request</h1>
     <p id="sheet-msg">Reading the sign request…</p>
     <div id="sheet-body"></div>
-    <div id="sheet-actions" class="pair-actions" hidden></div>
-    <p id="sheet-note"></p>
-    <p id="sheet-back"><a id="sheet-home" href="/">Back to the cockpit</a></p>
+    <!-- #sheet-decide groups the controls so a wide screen can hold them as one column; below 800px it is display: contents (dashboard.css) -->
+    <div id="sheet-decide">
+      <div id="sheet-actions" class="pair-actions" hidden></div>
+      <p id="sheet-note"></p>
+      <p id="sheet-back"><a id="sheet-home" href="/">Back to the cockpit</a></p>
+    </div>
   </main>
   <!-- The sheet's code is its own served file: this page's CSP is script-src 'self', no inline script. -->
   <script src="/sw_open.js"></script>
