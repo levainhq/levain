@@ -2988,6 +2988,9 @@ body.sheet-embedded #drop-words { min-height: 7em; }
 .sheet-embedded.pair-body { display: block; min-height: 0; padding: 0; background: transparent; }
 .sheet-embedded .pair-card { width: 100%; max-width: none; box-sizing: border-box; border: 0; border-radius: 0; background: transparent; padding: var(--sp-5) var(--sp-6) var(--sp-6); }
 .sheet-embedded .pair-brand, .sheet-embedded #sheet-title { display: none; }
+/* a signed card leads with the outcome; the exact record (status line, signed line) moves into "What exactly gets signed" */
+.sheet-outcome { margin: var(--sp-4) 0; font: var(--fw-semibold) var(--fs-body)/1.4 var(--sans); color: var(--text); overflow-wrap: anywhere; }
+#sheet-title[hidden] { display: none; }
 @media (min-width: 760px) {
   .sheet-embedded .env-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--sp-6); }
 }

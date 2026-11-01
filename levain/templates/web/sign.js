@@ -310,11 +310,14 @@
     $("sheet-actions").classList.toggle("card-rows", !!card);
     if (card) drawCardHead(body, card, msg);
     else body.appendChild(msg);
+    // a card's headline IS the title: the header above it drops the request's title, so it is said once
+    if (card) $("sheet-title").hidden = true; else $("sheet-title").hidden = false;
     // a dispatch job is shown whole (every path, every change): its box scrolls, it is never cut to fit
     if (dispatch) { msg.id = "sheet-contract"; msg.tabIndex = 0; Object.assign(msg.style, { maxHeight: "50vh", overflow: "auto" }); }
     if (r.expires_at) {
       const when = window.LevainCardFormat && typeof window.LevainCardFormat.openUntil === "function" ? window.LevainCardFormat.openUntil(r.expires_at) : { text: "Open until " + r.expires_at, title: "" };
       const p = el("p", "ext-meta", when.text);
+      p.id = "sheet-open-until";
       if (when.title) p.title = when.title;
       body.appendChild(p);
     }
@@ -338,7 +341,8 @@
     const who = el("p", "ext-meta", "May sign: ");
     who.id = "sheet-signers";
     who.textContent += signers.map((fp) => fp.slice(0, 18) + "…"
-      + (held[fp] && typeof held[fp].provider === "string" && held[fp].provider ? " (" + held[fp].provider + ")" : "")).join(", ");
+      + (held[fp] && typeof held[fp].provider === "string" && held[fp].provider && !/^provider not recorded/i.test(held[fp].provider)
+        ? " (" + held[fp].provider + ")" : "")).join(", ");     // an unrecorded provider is not worth a clause
     signingHome().appendChild(who);
     $("sheet").dataset.state = "open";
     offer(r, rp, signers, held);
@@ -394,6 +398,24 @@
   // what is being signed, beside the controls: the page's expectation at the tap ("page"), then the line the challenge
   // carries ("server"), which after a signature is the line signed
   // `label`: "Signing" while the ceremony runs; "Signed", "Not signed" or "Not confirmed" once it has ended
+  // After a card is signed the page leads with what happened, in the reader's words: "Signed (b): Hold for the morning". What
+  // the page said before (the pick line, when the request is open until) goes, and the exact record (the status line and the
+  // signed line) moves into the card's "What exactly gets signed" disclosure, whole, for audit.
+  function showOutcome(what, line) {
+    if (!cardView) return;
+    const pick = $("sheet-pick"); if (pick) pick.remove();
+    const miss = $("sheet-pick-miss"); if (miss) miss.remove();
+    const until = $("sheet-open-until"); if (until) until.remove();
+    const m = /\(([^)]*)\):\s*([\s\S]*)$/.exec(String(line || ""));
+    const choice = what || (m ? m[1] : "");
+    const words = m && m[2] ? m[2] : "";
+    let out = $("sheet-outcome");
+    if (!out) { out = el("p", "sheet-outcome"); out.id = "sheet-outcome"; const head = $("sheet-card"); if (head) head.after(out); else $("sheet-body").prepend(out); }
+    out.textContent = "Signed" + (choice ? " (" + choice + ")" : "") + (words ? ": " + words : "");
+    // the exact record moves into the disclosure whole (same nodes, same ids), where "What exactly gets signed" opens it
+    const home = $("sheet-signed");
+    if (home) for (const id of ["sheet-signing", "sheet-note"]) { const n = $(id); if (n && n.parentNode !== home) home.appendChild(n); }
+  }
   function signing(text, source, label) {
     let n = $("sheet-signing");
     if (!n) {
@@ -562,6 +584,7 @@
             + " (its reply was lost; the cockpit confirmed it)", "ok");
         if (a.line) signing(a.line, "server", "Signed"); else relabel("Signed");
         $("sheet").dataset.state = "signed";
+        showOutcome(st.body.choice, a.line);
         return signedNow();
       }
       if (state === "refused") {
@@ -745,6 +768,7 @@
           say("signed" + (what ? " (" + what + ")" : "") + " · by " + by + ns + (line ? ": " + line : "") + went, "ok");
           if (line) signing(line, "server", "Signed"); else relabel("Signed");
           $("sheet").dataset.state = "signed";
+          showOutcome(what, line);
           return "signed";
         });
       }, (e) => unsigned("The passkey did not sign (" + ((e && e.name) || "cancelled") + ")"));
