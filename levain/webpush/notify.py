@@ -52,8 +52,10 @@ def _refuse_chars(text: str, what: str, *, newline: bool) -> None:
 def clean_title(title: object) -> str:
     if not isinstance(title, str):
         raise NotifyRefused("bad_shape", "the title is a string")
-    text = unicodedata.normalize("NFC", title).strip()
+    # the characters are checked BEFORE the trim, so a refused one at either end is refused, never quietly trimmed away
+    text = unicodedata.normalize("NFC", title)
     _refuse_chars(text, "title", newline=False)
+    text = text.strip()
     if not text:
         raise NotifyRefused("empty", "the title is empty", 422)
     if len(text) > TITLE_MAX:
@@ -66,8 +68,11 @@ def clean_title(title: object) -> str:
 def clean_body(body: object) -> str:
     if not isinstance(body, str):
         raise NotifyRefused("bad_shape", "the body is a string")
-    text = unicodedata.normalize("NFC", body).replace("\r\n", "\n").strip()
+    # the only quiet changes: CRLF to LF, the surrounding whitespace trimmed, three or more newlines to two; every
+    # character is checked before the trim
+    text = unicodedata.normalize("NFC", body).replace("\r\n", "\n")
     _refuse_chars(text, "body", newline=True)
+    text = text.strip()
     if not text:
         raise NotifyRefused("empty", "the body is empty", 422)
     if len(text) > BODY_MAX:

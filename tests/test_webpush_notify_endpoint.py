@@ -89,9 +89,12 @@ def _raw(port, head: str, body: bytes = b"", wait: float = 5.0):
         s.close()
 
 
-def _head(port, extra: str = "", clen: str | None = "10", ctype: str = "application/json") -> str:
+def _head(port, extra: str = "", clen: str | None = "10", ctype: str = "application/json", *, close: bool = True) -> str:
+    """The request head; ``close=False`` leaves the connection kept alive (HTTP/1.1's default), so a ``Connection:
+    close`` in the answer is the server's own choice."""
     return (f"POST {URL} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n" + (f"Content-Type: {ctype}\r\n" if ctype else "")
-            + (f"Content-Length: {clen}\r\n" if clen is not None else "") + extra + "Connection: close\r\n\r\n")
+            + (f"Content-Length: {clen}\r\n" if clen is not None else "") + extra
+            + ("Connection: close\r\n" if close else "") + "\r\n")
 
 
 def _mint(q, name="Backup", **kw):
@@ -270,24 +273,35 @@ def test_429_carries_retry_after_and_a_refused_post_is_not_stored(rig):
     assert len(PushStore(q).notices()) == 2
 
 
-def test_a_content_length_over_4_kib_is_refused_without_reading_the_body(rig):
+def test_a_content_length_over_8_kib_is_refused_without_reading_the_body(rig):
     src, q = rig
     tok = _mint(q)
     with _signed(src, q) as (port, _):
         t0 = time.monotonic()
         # the headers say 100 kB and NO body follows: a server that read first would sit until the socket timeout
-        st, got, hdrs = _raw(port, _head(port, f"{nt.HEADER}: {tok}\r\n", clen="100000"), wait=5.0)
+        st, got, hdrs = _raw(port, _head(port, f"{nt.HEADER}: {tok}\r\n", clen="100000", close=False), wait=5.0)
         assert st == 413 and got["error"] == "too_large" and time.monotonic() - t0 < 4
         assert hdrs.get("connection") == "close"
-        # the line is exact: 4096 is read, 4097 is not
-        body = json.dumps({"body": "x" * 900, "title": "t"}).encode()
-        assert len(body) < 4096
-        st, got, _ = _raw(port, _head(port, f"{nt.HEADER}: {tok}\r\n", clen="4097"), wait=5.0)
+        # the line is exact: 8192 is read, 8193 is not
+        st, got, _ = _raw(port, _head(port, f"{nt.HEADER}: {tok}\r\n", clen="8193"), wait=5.0)
         assert st == 413
-        pad = b'{"body":"x","priority":"low"}' + b" " * (4096 - 29)
-        assert len(pad) == 4096
-        assert _raw(port, _head(port, f"{nt.HEADER}: {tok}\r\n", clen="4096"), pad)[0] == 200
+        pad = b'{"body":"x","priority":"low"}' + b" " * (8192 - 29)
+        assert len(pad) == 8192
+        assert _raw(port, _head(port, f"{nt.HEADER}: {tok}\r\n", clen="8192"), pad)[0] == 200
     assert len(PushStore(q).notices()) == 1
+
+
+def test_a_title_and_body_at_their_character_maxima_in_4_byte_characters_are_taken(rig):
+    src, q = rig
+    tok = _mint(q)
+    title, body = "\U0001f600" * notify.TITLE_MAX, "\U0001f6a8" * notify.BODY_MAX
+    raw = json.dumps({"title": title, "body": body, "priority": "low"}, ensure_ascii=False).encode("utf-8")
+    assert len(raw) > 4096                       # over the cap this replaced: the post the review showed refused
+    with _signed(src, q) as (port, _):
+        st, got, _ = _post(port, raw=raw, token=tok)
+    assert st == 200, got
+    n = PushStore(q).notices()[0]
+    assert n["title"] == title and n["body"] == body
 
 
 @pytest.mark.parametrize("clen", [None, "abc", "-1", "1 2"])
@@ -672,3 +686,138 @@ def test_the_mint_cli_is_refused_inside_an_agent_session(rig, capsys, monkeypatc
     assert main(["notify", "token", "revoke", "Hub", "--queue-dir", str(q)]) == 2
     assert [r["name"] for r in nt.list_public(q)] == ["Hub"]
     assert main(["notify", "token", "list", "--queue-dir", str(q)]) == 0          # a read is open
+
+
+# ---- L3 r1: a token that is not live never holds a request slot ------------------------------------------------------
+
+UNKNOWN = "lvn_" + "a" * 43          # the minted shape, but no token
+
+
+def test_a_token_that_is_not_live_is_refused_from_the_header_and_never_holds_a_slot(rig):
+    src, q = rig
+    live = _mint(q, "Live")
+    gone = _mint(q, "Gone")
+    nt.revoke(q, "Gone")
+    with _signed(src, q) as (port, _):
+        t0 = time.monotonic()
+        # more stalled posts than the server has request slots: each declares a body and never sends it. A server that
+        # held a slot to read the body would sit on it until the socket timeout and this answer would never come
+        for i in range(12):
+            bad = (UNKNOWN, gone, "nope")[i % 3]
+            st, got, hdrs = _raw(port, _head(port, f"{nt.HEADER}: {bad}\r\n", clen="100", close=False), wait=3.0)
+            assert (st, got) == (403, {"error": "forbidden", "message": "unknown or revoked token"}), (bad, got)
+            assert hdrs.get("connection") == "close"
+        assert time.monotonic() - t0 < 4
+        # the slots are free: a live post and another gated route are answered at once
+        assert _post(port, {"body": "x", "priority": "low"}, token=live)[0] == 200
+        assert _call(port, "GET", "/webpush/presence", token=T)[0] == 200
+    assert len(PushStore(q).notices()) == 1
+
+
+def _answers(port, data: bytes, wait: float = 3.0) -> tuple[int, bool]:
+    """Send ``data`` on one kept-alive socket; how many responses came back, and whether the server closed it."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=wait)
+    buf, closed = b"", False
+    try:
+        s.sendall(data)
+        while True:
+            try:
+                chunk = s.recv(65536)
+            except (socket.timeout, ConnectionResetError):
+                break
+            if not chunk:
+                closed = True
+                break
+            buf += chunk
+    finally:
+        s.close()
+    return buf.count(b"HTTP/1.1 "), closed
+
+
+@pytest.mark.parametrize("case", ["404", "401", "403", "411", "413", "415", "503"])
+def test_every_early_refusal_closes_so_an_unread_body_is_never_the_next_request(rig, case):
+    from tests.test_cockpit_pairing_http import _serve
+
+    src, q = rig
+    tok = _mint(q)
+
+    def run(port, httpd):
+        smuggled = f"GET /webpush/key HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode()
+        auth = "" if case == "401" else f"{nt.HEADER}: {UNKNOWN if case == '403' else tok}\r\n"
+        clen = {"411": None, "413": "9000"}.get(case, str(len(smuggled)))
+        head = _head(port, auth, clen=clen, ctype="text/plain" if case == "415" else "application/json", close=False)
+        held_slots = 0
+        if case == "503":
+            while httpd.request_gate.acquire(blocking=False):
+                held_slots += 1
+        try:
+            n, closed = _answers(port, head.encode() + smuggled)
+        finally:
+            for _i in range(held_slots):
+                httpd.request_gate.release()
+        assert (n, closed) == (1, True), (case, n, closed)
+
+    if case == "404":
+        with _serve(src) as (port, httpd):
+            run(port, httpd)
+    else:
+        with _signed(src, q) as (port, httpd):
+            run(port, httpd)
+    assert PushStore(q).notices() == []
+
+
+# ---- L3 r1: a token store that fails answers 503 with a fixed message ------------------------------------------------
+
+def test_a_token_store_write_failure_is_a_fixed_503_and_the_detail_goes_to_the_log(rig, monkeypatch, caplog):
+    import logging
+
+    src, q = rig
+    tok = _mint(q)
+
+    def full(*_a, **_k):
+        raise nt.NotifyTokenError(f"notify tokens not written: [Errno 28] No space left on device: '{q}/webpush/x'")
+
+    caplog.set_level(logging.WARNING)
+    with _signed(src, q) as (port, _):
+        monkeypatch.setattr(nt, "_write", full)
+        st, got, _ = _post(port, {"body": "x"}, token=tok)
+    assert st == 503 and got == {"error": "notify_unavailable",
+                                 "message": "notices cannot be taken right now; nothing was stored, try again later"}
+    assert str(q) not in json.dumps(got) and "Errno" not in json.dumps(got)
+    assert "No space left on device" in caplog.text
+    assert PushStore(q).notices() == [] and PushStore(q).record() == []
+
+
+def test_a_malformed_record_beside_a_live_token_is_a_503_and_the_file_is_left(rig):
+    src, q = rig
+    tok = _mint(q)
+    f = q / "webpush" / nt.FILE_NAME
+    doc = json.loads(f.read_text())
+    doc["tokens"].append({"name": "Broken", "source": "broken", "sha256": "0" * 64, "rate_per_min": "six"})
+    f.write_text(json.dumps(doc))
+    before = f.read_bytes()
+    with _signed(src, q) as (port, _):
+        st, got, _ = _post(port, {"body": "x"}, token=tok)
+        assert st == 503 and got["error"] == "notify_unavailable"
+        st, got, _h = _call(port, "GET", TOKENS, token=T)
+        assert st == 503 and got["error"] == "notify_tokens_unreadable"      # never an empty or partial listing
+    assert f.read_bytes() == before and PushStore(q).notices() == []
+
+
+def test_a_store_failure_stores_nothing_and_answers_not_stored(rig, monkeypatch):
+    import sqlite3
+
+    src, q = rig
+    tok = _mint(q)
+    presence.set_word(q, "sleep")                       # a normal notice is held: a ping AND a held row would be written
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    with _signed(src, q) as (port, _):
+        monkeypatch.setattr(PushStore, "_insert_notice", staticmethod(boom))
+        st, got, _ = _post(port, {"body": "x"}, token=tok)
+    assert st == 503 and got == {"error": "not_stored", "message": "the notice was not stored; try again"}
+    s = PushStore(q)
+    assert s.notices(include_dismissed=True) == [] and s.record() == [] and s.held_items() == []
+    assert nt.list_public(q)[0]["sent_today"] == 1      # the known edge: the quota a store failure spent is not refunded

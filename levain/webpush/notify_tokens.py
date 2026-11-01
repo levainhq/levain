@@ -36,8 +36,13 @@ FILE_NAME = "notify_tokens.json"
 LOCK_NAME = ".notify.lock"
 HEADER = "X-Levain-Notify-Token"       # ``Authorization: Bearer <token>`` is its alias at the web layer
 TOKEN_PREFIX = "lvn_"                  # greppable, so a leaked token is found by a scanner
-NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,40}$")
-SOURCE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,23}$")
+# every use of these is a fullmatch: a `$` anchor would admit a trailing newline
+NAME_RE = re.compile(r"[A-Za-z0-9 ._-]{1,40}")
+SOURCE_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,23}")
+# the shape :func:`create` mints (the prefix, then ``secrets.token_urlsafe(32)``): anything else is no token, refused
+# without reading the file
+TOKEN_RE = re.compile(re.escape(TOKEN_PREFIX) + r"[A-Za-z0-9_-]{43}")
+FORBIDDEN = ("forbidden", "unknown or revoked token")     # one refusal for unknown, revoked and malformed alike
 MAX_TOKENS = 50
 _MAX_BYTES = 128 * 1024
 RATE_PER_MIN = 6
@@ -98,9 +103,26 @@ def _hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def _read(queue_dir: Path | str) -> list[dict]:
+def _well_formed(r: object) -> bool:
+    """A record every reader can use without a type error: the three strings, the caps and counters as whole numbers,
+    the ceiling one of the priorities."""
+    if not isinstance(r, dict) or not all(isinstance(r.get(k), str) for k in ("name", "sha256", "source")):
+        return False
+    for k in ("rate_per_min", "rate_per_day", "urgent_per_hour", "day_count"):
+        v = r.get(k)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
+            return False
+    if r.get("max_priority") is not None and r.get("max_priority") not in PRIORITIES:
+        return False
+    return r.get("urgent_times") is None or isinstance(r.get("urgent_times"), list)
+
+
+def _read(queue_dir: Path | str, *, strict: bool = True) -> list[dict]:
     """The records on file; a missing file is none. Anything else that is not a readable file of this user's raises
-    :class:`NotifyTokenError`: a caller about to write the list back must never take a failed read for an empty list."""
+    :class:`NotifyTokenError`: a caller about to write the list back must never take a failed read for an empty list.
+    ``strict`` (every writer, and every listing) also refuses a file holding ANY malformed record, so a write never
+    rewrites the list without it and a listing is never a partial one; ``strict=False`` is verification's, where a
+    malformed record is no token and the rest still verify."""
     path = _path(queue_dir)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -114,6 +136,8 @@ def _read(queue_dir: Path | str) -> list[dict]:
             raise NotifyTokenError(f"{path} is not a notify-token file of this user's")
         with os.fdopen(fd, "rb", closefd=False) as fh:
             got = json.loads(fh.read(_MAX_BYTES + 1).decode("utf-8"))
+    except NotifyTokenError:        # a ValueError too: its own reason, never reported as "malformed"
+        raise
     except OSError as e:
         raise NotifyTokenError(f"notify tokens not read: {e}") from e
     except (ValueError, RecursionError) as e:
@@ -123,13 +147,16 @@ def _read(queue_dir: Path | str) -> list[dict]:
     recs = got.get("tokens") if isinstance(got, dict) else None
     if not isinstance(recs, list):
         raise NotifyTokenError(f"{path} is malformed: remove it to start a new list")
-    return [r for r in recs if isinstance(r, dict) and isinstance(r.get("name"), str)
-            and isinstance(r.get("sha256"), str) and isinstance(r.get("source"), str)]
+    good = [r for r in recs if _well_formed(r)]
+    if strict and len(good) != len(recs):
+        raise NotifyTokenError(f"{path} holds {len(recs) - len(good)} malformed token record(s); nothing was changed: "
+                               "repair the file or remove it to start a new list")
+    return good
 
 
 def _read_or_none(queue_dir: Path | str) -> list[dict]:
     try:
-        return _read(queue_dir)
+        return _read(queue_dir, strict=False)
     except NotifyTokenError:
         return []
 
@@ -197,10 +224,10 @@ def create(queue_dir: Path | str, name: str, source: str | None = None, *, max_p
     (the label every notice from it carries) defaults to the name lowercased when that is a valid slug; it is unique among
     live tokens and cannot change afterwards. ``urgent=True`` is the only way a token may post an urgent notice, and it
     raises the ceiling to ``urgent``; ``max_priority="urgent"`` without it is a refusal."""
-    if not isinstance(name, str) or not NAME_RE.match(name) or name != name.strip():
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name != name.strip():
         raise NotifyTokenError("a token's name is 1 to 40 letters, digits, spaces, dots, dashes or underscores")
     label = name.lower().replace(" ", "-") if source is None else source
-    if not isinstance(label, str) or not SOURCE_RE.match(label):
+    if not isinstance(label, str) or not SOURCE_RE.fullmatch(label):
         raise NotifyTokenError("a source label is 1 to 24 lowercase letters, digits, dots, dashes or underscores")
     if max_priority not in PRIORITIES:
         raise NotifyTokenError(f"a token's highest priority is one of: {', '.join(PRIORITIES)}")
@@ -241,7 +268,11 @@ def _find(recs: list[dict], supplied: object) -> dict | None:
 
 
 def verify(queue_dir: Path | str, supplied: str) -> dict | None:
-    """The public record ``supplied`` is the live token of, or ``None`` (unknown and revoked read the same)."""
+    """The public record ``supplied`` is the live token of, or ``None`` (unknown, revoked and malformed read the same).
+    Takes no lock and writes nothing, so the web layer asks it from the header alone, before it holds a request slot or
+    reads a body; :func:`admit` asks again under the lock."""
+    if not isinstance(supplied, str) or not TOKEN_RE.fullmatch(supplied):
+        return None
     r = _find(_read_or_none(queue_dir), supplied)
     return None if r is None else _public(r)
 
@@ -262,8 +293,9 @@ def revoke(queue_dir: Path | str, name: str) -> bool:
 
 
 def list_public(queue_dir: Path | str) -> list[dict]:
-    """The live tokens: never a hash, never a secret."""
-    return [_public(r) for r in _read_or_none(queue_dir) if not r.get("revoked")]
+    """The live tokens: never a hash, never a secret. A token file that cannot be read whole raises
+    :class:`NotifyTokenError` rather than answer with an empty or partial list."""
+    return [_public(r) for r in _read(queue_dir) if not r.get("revoked")]
 
 
 class _MinuteWindow:
@@ -313,16 +345,15 @@ def admit(queue_dir: Path | str, supplied: str, title: object, body: object, pri
     """Decide one post. Under the notify lock: the token (unknown and revoked are one refusal, ``forbidden``), the
     priority against the token's ceiling (a request above it is refused with a named reason, never lowered), the
     sanitised text, then the caps (per minute, per day, urgent per hour). Only a post that passes everything counts toward
-    a cap and stamps ``last_used``. Raises :class:`levain.webpush.notify.NotifyRefused`."""
+    a cap and stamps ``last_used``. Raises :class:`levain.webpush.notify.NotifyRefused`; a token file that cannot be read
+    or written whole (a malformed record in it included: the stamp would rewrite the list without it) raises
+    :class:`NotifyTokenError`, and nothing is admitted."""
     t = time.time() if now is None else now
     with _locked(queue_dir):
-        try:
-            recs = _read(queue_dir)
-        except NotifyTokenError:       # a token file that cannot be read knows no token
-            recs = []
+        recs = _read(queue_dir)
         rec = _find(recs, supplied)
         if rec is None:
-            raise NotifyRefused("forbidden", "unknown or revoked token", 403)
+            raise NotifyRefused(*FORBIDDEN, 403)
         want = "normal" if priority is None else priority
         if not isinstance(want, str) or want not in RANK:
             raise NotifyRefused("bad_priority", f"priority is one of: {', '.join(PRIORITIES)}")

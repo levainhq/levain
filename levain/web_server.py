@@ -1172,7 +1172,9 @@ _NOTIFY_PATH = "/notify"
 _NOTIFY_TOKEN_HEADER = "X-Levain-Notify-Token"
 _NOTIFY_TOKENS = "/webpush/notify/tokens"
 _NOTIFY_TOKENS_REVOKE = "/webpush/notify/tokens/revoke"
-_NOTIFY_MAX_REQUEST = 4096                  # the whole request body, refused on its declared length before it is read
+# the whole request body, refused on its declared length before it is read: in bytes, sized so a title and a body at
+# their character maxima in 4-byte UTF-8 still fit
+_NOTIFY_MAX_REQUEST = 8192
 _NOTIFY_KEYS = frozenset({"title", "body", "priority"})
 _NOTIFY_DEFAULT_TITLE = "Notice"            # a post with no title carries this; the source label is put in front of it
 _NOTIFY_MINT_KEYS = frozenset({"name", "source", "urgent", "max_priority", "rate_per_min", "rate_per_day",
@@ -1235,17 +1237,17 @@ def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
     from levain.webpush.store import PushStore
 
     decision, reason = notify.decide_now(queue, adm.priority)
-    store = PushStore(queue)
     ref = notify.notice_ref(adm.source)
-    ping_id = None
+    hold = (notify.NOTICES_URL, reason or "active") if decision == "held" else None
+    # the ping, its held row and the notice are one transaction: a failure stores none of them, and the caller says so
+    ping_id, nid = PushStore(queue).record_notice(adm.kind, ref, adm.display, adm.source, adm.title, adm.body,
+                                                  adm.priority, adm.token, decision, hold=hold)
     if decision == "pushed":
-        ping_id = store.add_ping(adm.kind, ref, adm.display, adm.body)
-    elif decision == "held":
-        ping_id = store.add_ping(adm.kind, ref, adm.display, adm.body, hold=(notify.NOTICES_URL, reason or "active"))
-    nid = store.add_notice(adm.source, adm.title, adm.body, adm.priority, adm.token, decision, ping_id)
-    if decision == "pushed":
-        threading.Thread(target=_push_notice, args=(queue, ping_id, adm.kind, ref, adm.display, adm.body),
-                         daemon=True, name="levain-notice-push").start()
+        try:
+            threading.Thread(target=_push_notice, args=(queue, ping_id, adm.kind, ref, adm.display, adm.body),
+                             daemon=True, name="levain-notice-push").start()
+        except RuntimeError:  # no thread to be had: the notice is stored, and its push is best effort
+            _log.warning("notify: the push thread for a stored notice did not start")
     if decision != "recorded":
         try:      # a mute that ended since the last event lets other held pings through now, as a presence write does
             held.flush_if_due(queue)
@@ -2342,9 +2344,12 @@ class _Handler(GuardedHandler):
                 if path == _NOTIFY_TOKENS:
                     from levain.webpush import notify_tokens
 
-                    self._send(json.dumps({"tokens": notify_tokens.list_public(queue)}).encode("utf-8"),
-                               "application/json; charset=utf-8", status=200, head=head,
-                               headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+                    try:      # a token file that cannot be read whole is said so, never listed as empty or partial
+                        doc, st = {"tokens": notify_tokens.list_public(queue)}, 200
+                    except notify_tokens.NotifyTokenError as exc:
+                        doc, st = {"error": "notify_tokens_unreadable", "message": str(exc)}, 503
+                    self._send(json.dumps(doc).encode("utf-8"), "application/json; charset=utf-8", status=st,
+                               head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
                     return
                 if path == _PRESENCE_PATH:
                     self._send(json.dumps(self._presence_view(queue)).encode("utf-8"), "application/json; charset=utf-8",
@@ -2558,11 +2563,11 @@ class _Handler(GuardedHandler):
                 return {"token": token, "record": rec, "tokens": notify_tokens.list_public(queue)}, 200
             if not notify_tokens.revoke(queue, req["name"]):
                 return {"error": "not_found", "message": "no live notify token has that name"}, 404
+            return {"tokens": notify_tokens.list_public(queue)}, 200
         except notify_tokens.NotifyBusy:
             return {"error": "notify_busy", "message": "the notify tokens are busy right now; nothing was changed, try again"}, 503
         except notify_tokens.NotifyTokenError as exc:
             return {"error": "notify_token_refused", "message": str(exc)}, 422
-        return {"tokens": notify_tokens.list_public(queue)}, 200
 
     def _notify_credential(self) -> "str | None":
         """The notify token this request carries (``X-Levain-Notify-Token``, else ``Authorization: Bearer``), as sent;
@@ -2578,9 +2583,12 @@ class _Handler(GuardedHandler):
 
     def _notify_post(self) -> None:
         """``POST /notify {title?, body, priority?}``: a notice from a service, as a doorbell and nothing more. Every
-        refusal that does not need the body is sent before a byte of it is read (a missing credential, the content type,
-        the length, a busy server); the token, the sanitiser and the caps are :func:`levain.webpush.notify_tokens.admit`'s,
-        the one place a post is decided."""
+        refusal that does not need the body is sent before a byte of it is read, and closes the connection so the unread
+        body is never taken for the next request (no route, a missing credential, a token that is not a live one, the
+        content type, the length, a busy server). The token is checked from the header alone, with no lock and before a
+        request slot is held, so a caller without a live token can never sit on a slot waiting for a body; the token
+        again, the sanitiser and the caps are :func:`levain.webpush.notify_tokens.admit`'s, the one place a post is
+        decided."""
         from levain.webpush import notify_tokens
         from levain.webpush.notify import NotifyRefused
 
@@ -2593,6 +2601,8 @@ class _Handler(GuardedHandler):
             return self._send(json.dumps({"error": "unauthorized", "message": "send a notify token as "
                                           f"{_NOTIFY_TOKEN_HEADER} or Authorization: Bearer"}).encode("utf-8"),
                               "application/json; charset=utf-8", status=401, headers=[("WWW-Authenticate", "Bearer")])
+        if notify_tokens.verify(signer.queue_dir, supplied) is None:
+            return self._reject(403, *notify_tokens.FORBIDDEN)
         if self._refuse_non_json():
             return
         clen = self._declared_length()
@@ -2623,10 +2633,17 @@ class _Handler(GuardedHandler):
                                   "application/json; charset=utf-8", status=exc.status, headers=headers)
             except notify_tokens.NotifyBusy:
                 return self._send_json({"error": "notify_busy", "message": "busy; try again"}, 503)
+            except notify_tokens.NotifyTokenError as exc:
+                # the token file could not be read or written whole: the detail (a path, an errno) is the log's, never
+                # the poster's
+                _log.warning("notify: a post was not admitted: %s", exc)
+                return self._send_json({"error": "notify_unavailable", "message": "notices cannot be taken right now; "
+                                        "nothing was stored, try again later"}, 503)
             try:
                 out = _deliver_notice(queue, adm)
             except Exception as exc:  # noqa: BLE001 - never leak a traceback to the client
-                return self._send_json({"error": "internal", "message": type(exc).__name__}, 500)
+                _log.warning("notify: an admitted notice was not stored: %s: %s", type(exc).__name__, exc)
+                return self._send_json({"error": "not_stored", "message": "the notice was not stored; try again"}, 503)
             self._send_json({"ok": True, **out}, 200)
         finally:
             self.server.request_gate.release()

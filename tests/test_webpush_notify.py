@@ -203,7 +203,9 @@ def test_a_failed_read_refuses_a_write_and_leaves_the_file(tmp_path, monkeypatch
         _mint(tmp_path, "hall")
     with pytest.raises(nt.NotifyTokenError):
         nt.revoke(tmp_path, "door")
-    assert nt.verify(tmp_path, "x") is None and nt.list_public(tmp_path) == []
+    assert nt.verify(tmp_path, "x") is None
+    with pytest.raises(nt.NotifyTokenError):          # a listing says it could not read, never answers empty
+        nt.list_public(tmp_path)
     monkeypatch.setattr(nt.os, "open", real)
     assert f.read_bytes() == before and f.stat().st_ino == ino
 
@@ -446,3 +448,126 @@ def test_notices_do_not_touch_the_ping_record(tmp_path):
     s = PushStore(tmp_path)
     s.add_notice("x", "t", "b", "normal", "T", "recorded", now=NOW)
     assert s.record() == []
+
+
+# --- L3 r1: the ping, its held row and the notice are one transaction ------------------------------------------------
+
+def _rows(q):
+    s = PushStore(q)
+    return s.record(), s.held_items(), s.notices(limit=100, include_dismissed=True)
+
+
+@pytest.mark.parametrize("decision,hold", [("pushed", None), ("held", ("/?view=notices", "sleep")), ("recorded", None)])
+def test_record_notice_stores_the_ping_its_hold_and_the_notice_together(tmp_path, decision, hold):
+    pid, nid = PushStore(tmp_path).record_notice("notify", "notify:backup", "[backup] t", "backup", "t", "b", "normal",
+                                                 "Backup", decision, hold=hold, now=NOW)
+    pings, held_rows, notices = _rows(tmp_path)
+    assert [n["id"] for n in notices] == [nid] and notices[0]["ping_id"] == pid
+    if decision == "recorded":
+        assert pid is None and pings == [] and held_rows == []
+    else:
+        assert [p["id"] for p in pings] == [pid] and pings[0]["title"] == "[backup] t"
+        assert [h["ping_id"] for h in held_rows] == ([pid] if decision == "held" else [])
+
+
+@pytest.mark.parametrize("decision,hold", [("held", ("/?view=notices", "sleep")), ("pushed", None)])
+def test_a_failed_notice_write_rolls_back_its_ping_and_held_row(tmp_path, monkeypatch, decision, hold):
+    import sqlite3
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(PushStore, "_insert_notice", staticmethod(boom))
+    with pytest.raises(sqlite3.OperationalError):
+        PushStore(tmp_path).record_notice("notify", "notify:backup", "[backup] t", "backup", "t", "b", "normal",
+                                          "Backup", decision, hold=hold, now=NOW)
+    assert _rows(tmp_path) == ([], [], [])              # no orphan ping, no held row the flush would release later
+
+
+@pytest.mark.parametrize("decision,hold", [("held", None), ("pushed", ("/", "quiet")), ("recorded", ("/", "quiet")),
+                                           ("sent", None)])
+def test_record_notice_refuses_a_hold_that_does_not_match_the_decision(tmp_path, decision, hold):
+    with pytest.raises(ValueError):
+        PushStore(tmp_path).record_notice("notify", "notify:x", "[x] t", "x", "t", "b", "normal", "X", decision,
+                                          hold=hold, now=NOW)
+    assert _rows(tmp_path) == ([], [], [])
+
+
+# --- L3 r1: a malformed record is never rewritten away, and a listing is never partial ------------------------------
+
+def _corrupt_one(q, **bad):
+    f = q / "webpush" / nt.FILE_NAME
+    doc = json.loads(f.read_text())
+    doc["tokens"].append({"name": "Broken", "source": "broken", "sha256": "0" * 64, **bad})
+    f.write_text(json.dumps(doc))
+    return f
+
+
+@pytest.mark.parametrize("bad", [{"name": 7}, {"rate_per_min": "6"}, {"rate_per_day": True}, {"day_count": 1.5},
+                                 {"max_priority": "high"}, {"urgent_times": "now"}, {"sha256": None}])
+def test_a_malformed_record_refuses_every_write_and_every_listing_and_leaves_the_file(tmp_path, bad, capsys):
+    from levain.cli import main
+
+    _, tok = _mint(tmp_path, "Good")
+    f = _corrupt_one(tmp_path, **bad)
+    before = f.read_bytes()
+    with pytest.raises(nt.NotifyTokenError, match="malformed token record"):
+        _mint(tmp_path, "Another")
+    with pytest.raises(nt.NotifyTokenError, match="malformed token record"):
+        nt.revoke(tmp_path, "Good")
+    with pytest.raises(nt.NotifyTokenError, match="malformed token record"):
+        nt.admit(tmp_path, tok, "t", "b", now=NOW)                    # the stamp is a write too
+    with pytest.raises(nt.NotifyTokenError, match="malformed token record"):
+        nt.list_public(tmp_path)
+    assert main(["notify", "token", "list", "--queue-dir", str(tmp_path)]) == 2
+    assert "malformed token record" in capsys.readouterr().out
+    assert f.read_bytes() == before                                     # the corrupted-but-live record survives
+    # verification fails closed for the bad record only: the good token still verifies
+    assert nt.verify(tmp_path, tok)["name"] == "Good"
+
+
+def test_a_file_that_is_not_this_users_says_so_and_not_malformed(tmp_path):
+    _mint(tmp_path, "Good")
+    f = tmp_path / "webpush" / nt.FILE_NAME
+    f.write_text(json.dumps({"version": 1, "tokens": [], "pad": "x" * (nt._MAX_BYTES + 1)}))
+    with pytest.raises(nt.NotifyTokenError) as e:
+        nt.list_public(tmp_path)
+    assert "is not a notify-token file of this user's" in str(e.value) and "malformed" not in str(e.value)
+
+
+# --- L3 r1: shapes are whole-string matches -------------------------------------------------------------------------
+
+@pytest.mark.parametrize("kw", [dict(name="x\n"), dict(name="ok", source="backup\n"), dict(name="Backup\n")])
+def test_a_trailing_newline_is_not_a_name_or_a_source(tmp_path, kw):
+    with pytest.raises(nt.NotifyTokenError):
+        nt.create(tmp_path, kw.pop("name"), **kw)
+    assert not (tmp_path / "webpush" / nt.FILE_NAME).exists()
+
+
+def test_verify_takes_only_the_minted_shape(tmp_path):
+    _, tok = _mint(tmp_path)
+    assert nt.TOKEN_RE.fullmatch(tok)
+    assert nt.verify(tmp_path, tok)["name"] == "Backup"
+    for bad in (tok + "\n", tok[:-1], "lvn_" + "a" * 44, "LVN_" + tok[4:], " " + tok):
+        assert nt.verify(tmp_path, bad) is None
+
+
+# --- L3 r1: a refused character at either end is refused, not trimmed ------------------------------------------------
+
+@pytest.mark.parametrize("title,body", [("ok ", "b"), (" ok", "b"), ("ok\n", "b"), ("ok\t", "b"),
+                                        ("t", "text\t"), ("t", "\ttext"), ("t", "text "), ("t", "text\r"),
+                                        ("t", "text\x0b"), ("t", "\x1ctext")])
+def test_a_forbidden_character_at_either_end_is_refused(tmp_path, tok, title, body):
+    assert _refused(queue_dir=tmp_path, supplied=tok, title=title, body=body, now=NOW).error == "bad_characters"
+
+
+def test_the_only_quiet_changes_are_the_documented_ones(tmp_path, tok):
+    a = nt.admit(tmp_path, tok, "  spaced  ", "\n  body\r\n\r\n\r\n\r\nend  \n", now=NOW)
+    assert a.title == "spaced" and a.body == "body\n\nend"
+
+
+def test_an_empty_notice_summary_is_an_empty_string():
+    from levain.webpush import held
+
+    assert held.notice_summary([]) == ""
+    assert held.notice_summary([{"ref": "notify:a"}]) == "1 notice held: a"

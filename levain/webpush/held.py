@@ -58,7 +58,9 @@ def _is_notice(item: dict) -> bool:
 
 def notice_summary(items: list[dict]) -> str:
     """The one line that goes before released notices: how many, and from which sources (the ref's source, in the order
-    each first appeared), e.g. ``2 notices held: nightly-backup, site-monitor``."""
+    each first appeared), e.g. ``2 notices held: nightly-backup, site-monitor``; an empty string when there are none."""
+    if not items:
+        return ""
     names: list[str] = []
     for i in items:
         ref = i.get("ref") or ""
@@ -235,10 +237,10 @@ def _flush(queue_dir: Path | str, at: float, idle: Callable[[], float | None] | 
                         body=f"{n} ping{'' if n == 1 else 's'} held while you were {what}; they follow.")
         except Exception:  # noqa: BLE001 - the pings themselves still go
             pass
-    if notice_muted:
+    summary = notice_summary(notice_muted)
+    if summary:
         try:
-            sender.send(qdir, kind="summary", ref=None, title="levain", url=NOTICES_SUMMARY_URL,
-                        body=notice_summary(notice_muted))
+            sender.send(qdir, kind="summary", ref=None, title="levain", url=NOTICES_SUMMARY_URL, body=summary)
         except Exception:  # noqa: BLE001 - the notices themselves still go
             pass
     pushed = 0

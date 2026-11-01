@@ -90,7 +90,11 @@ def _mint(args: argparse.Namespace) -> int:
 def _list(args: argparse.Namespace) -> int:
     from levain.webpush import notify_tokens
 
-    rows = notify_tokens.list_public(_qdir(args))
+    try:
+        rows = notify_tokens.list_public(_qdir(args))
+    except notify_tokens.NotifyTokenError as e:     # never an empty or partial listing of a file it could not read
+        print(f"levain notify token list: {e}")
+        return 2
     if args.json:
         print(json.dumps(rows))
         return 0

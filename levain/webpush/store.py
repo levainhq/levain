@@ -320,29 +320,53 @@ class PushStore:
         ``(url, reason)``: the ping is also queued for the phone in the same transaction, ``reason`` being the word that
         muted it (``quiet``, ``sleep``) or ``active`` (the desk was in use)."""
         with self.write() as c:
-            ping_id = int(c.execute("INSERT INTO pings (at, kind, ref, title, body, command) VALUES (?,?,?,?,?,?)",
-                                    (now_stamp(), kind, ref, title, body,
-                                     None if command is None else int(bool(command)))).lastrowid)
-            if hold is not None:
-                c.execute("INSERT INTO held (ping_id, url, reason, held_at) VALUES (?,?,?,?)",
-                          (ping_id, hold[0], hold[1], now_stamp()))
-            return ping_id
+            return self._insert_ping(c, kind, ref, title, body, command, hold)
+
+    @staticmethod
+    def _insert_ping(c: sqlite3.Connection, kind: str, ref: str | None, title: str, body: str, command: bool | None,
+                     hold: tuple[str, str] | None) -> int:
+        ping_id = int(c.execute("INSERT INTO pings (at, kind, ref, title, body, command) VALUES (?,?,?,?,?,?)",
+                                (now_stamp(), kind, ref, title, body,
+                                 None if command is None else int(bool(command)))).lastrowid)
+        if hold is not None:
+            c.execute("INSERT INTO held (ping_id, url, reason, held_at) VALUES (?,?,?,?)",
+                      (ping_id, hold[0], hold[1], now_stamp()))
+        return ping_id
 
     # --- notices -------------------------------------------------------------------------------------
     def add_notice(self, source: str, title: str, body: str, priority: str, token: str, decision: str,
                    ping_id: int | None = None, *, now: float | None = None) -> int:
         """Record one posted notice and prune in the same transaction: past the newest :data:`NOTICES_KEEP`, or older than
         :data:`NOTICES_DAYS` days, goes."""
+        with self.write() as c:
+            return self._insert_notice(c, source, title, body, priority, token, decision, ping_id,
+                                       time.time() if now is None else now)
+
+    def record_notice(self, kind: str, ref: str, display: str, source: str, title: str, body: str, priority: str,
+                      token: str, decision: str, *, hold: tuple[str, str] | None = None,
+                      now: float | None = None) -> tuple[int | None, int]:
+        """A posted notice and its delivery record in ONE transaction: the ping (``pushed`` and ``held``; a ``recorded``
+        notice has none), its held row (``held`` only, ``hold`` being ``(url, reason)`` as :meth:`add_ping` takes it),
+        the notice row and the retention prune. Any failure rolls back all of it, so there is never a ping without its
+        notice or a notice pointing at no ping. Returns ``(ping_id, notice_id)``."""
+        if decision not in ("pushed", "held", "recorded") or (hold is not None) != (decision == "held"):
+            raise ValueError("a held notice, and only a held one, carries its hold")
         at = time.time() if now is None else now
         with self.write() as c:
-            nid = int(c.execute("INSERT INTO notices (at, source, title, body, priority, token, decision, ping_id) "
-                                "VALUES (?,?,?,?,?,?,?,?)",
-                                (time.strftime(STAMP, time.gmtime(at)), source, title, body, priority, token, decision,
-                                 ping_id)).lastrowid)
-            c.execute("DELETE FROM notices WHERE at < ?", (time.strftime(STAMP, time.gmtime(at - NOTICES_DAYS * 86400)),))
-            c.execute("DELETE FROM notices WHERE id NOT IN (SELECT id FROM notices ORDER BY id DESC LIMIT ?)",
-                      (NOTICES_KEEP,))
-            return nid
+            ping_id = None if decision == "recorded" else self._insert_ping(c, kind, ref, display, body, None, hold)
+            return ping_id, self._insert_notice(c, source, title, body, priority, token, decision, ping_id, at)
+
+    @staticmethod
+    def _insert_notice(c: sqlite3.Connection, source: str, title: str, body: str, priority: str, token: str,
+                       decision: str, ping_id: int | None, at: float) -> int:
+        nid = int(c.execute("INSERT INTO notices (at, source, title, body, priority, token, decision, ping_id) "
+                            "VALUES (?,?,?,?,?,?,?,?)",
+                            (time.strftime(STAMP, time.gmtime(at)), source, title, body, priority, token, decision,
+                             ping_id)).lastrowid)
+        c.execute("DELETE FROM notices WHERE at < ?", (time.strftime(STAMP, time.gmtime(at - NOTICES_DAYS * 86400)),))
+        c.execute("DELETE FROM notices WHERE id NOT IN (SELECT id FROM notices ORDER BY id DESC LIMIT ?)",
+                  (NOTICES_KEEP,))
+        return nid
 
     def notices(self, limit: int = 100, *, include_dismissed: bool = False) -> list[dict[str, Any]]:
         """The newest ``limit`` notices (at most :data:`NOTICES_KEEP`), dismissed ones left out unless asked for."""
