@@ -18,10 +18,10 @@ from pathlib import Path
 
 
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
-    p = subparsers.add_parser("dream", help="Dreaming (only `run` on a store copy exists in this release).",
+    p = subparsers.add_parser("dream", help="Dreaming: run on a store copy; rollback, recover and drill.",
                               allow_abbrev=False,
-                              description="Consolidate a store through a compose mind. Only `run` on a COPY of a "
-                                          "store is built; nothing is scheduled.")
+                              description="Consolidate a store through a compose mind (`run`, on a COPY of a store), "
+                                          "and roll back, recover or drill a dream. Nothing schedules a dream.")
     p.set_defaults(func=run_dream)
     sub = p.add_subparsers(dest="dream_command")
     r = sub.add_parser("run", allow_abbrev=False, help="Consolidate a store COPY once.",
