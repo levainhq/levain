@@ -149,6 +149,7 @@ _SCHEMA: tuple[str, ...] = (
     # a push about to go to a subscription (written before the push services are asked; see the module docstring)
     "CREATE TABLE IF NOT EXISTS targets (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
     "REFERENCES pings(id), subscription_id INTEGER NOT NULL REFERENCES subscriptions(id), at TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS receipts_device_reported ON receipts (device_id, reported_at)",
     "CREATE INDEX IF NOT EXISTS targets_ping_sub ON targets (ping_id, subscription_id)",
     "CREATE INDEX IF NOT EXISTS deliveries_ping_sub ON deliveries (ping_id, subscription_id)",
     *_records("pings"), *_records("targets"), *_records("deliveries"), *_records("opens"), *_records("receipts"),

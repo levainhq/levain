@@ -11,7 +11,8 @@ than this ping's delivery to it: ping ids are not send order (a held ping is rel
 so the times decide, never the ids. A tap is the strongest sign the ping was seen: a tapped ping's outcome is ``shown``
 even when its receipts were lost. ``received_count`` above one is a duplicate delivery (the repeat-notification signal).
 Times are the worker's own clock for ``received_at`` and ``shown_at`` and the server's for ``sent_at`` and ``tapped_at``,
-so a latency, and the ``silent`` comparison, carry the device's clock skew and a latency can be slightly negative.
+so a latency carries the device's clock skew and can be slightly negative; the ``silent`` comparison uses the time the
+SERVER received the device's newest report (``reported_at``), so a wrong phone clock cannot make a ping silent.
 
 What the push service said (``push``), from every attempt to that device for that ping, the first that applies:
 
@@ -137,7 +138,7 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
             cell(o["ping_id"], o["device_id"])["tapped"] = o["at"]
         # the newest receipt each device has made, over the whole record (any ping, any kind)
         last = {r["device_id"]: _t(r["m"]) for r in c.execute(
-            "SELECT device_id, MAX(at) AS m FROM receipts GROUP BY device_id")}
+            "SELECT device_id, MAX(reported_at) AS m FROM receipts GROUP BY device_id")}
 
     out_pings, roll = [], {}
     for p in pings:

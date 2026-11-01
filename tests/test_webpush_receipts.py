@@ -404,7 +404,7 @@ def test_a_push_posts_received_then_shown_with_the_endpoint_hash_and_ids_only() 
     assert "secret body" not in json.dumps(got["posts"])
     assert got["shownCalls"] == [{"title": "T", "tag": "x"}] and got["queued"] == []
     assert _receipt_steps(got) == [("received", "ok", None), ("shown", "ok", None)]
-    assert any(e["step"] == "sw-version" and e["version"] == "1101-receipts-2" and e["on"] == "push" for e in got["trace"])
+    assert any(e["step"] == "sw-version" and e["version"] == "1101-receipts-3" and e["on"] == "push" for e in got["trace"])
 
 
 @needs_node
@@ -482,6 +482,19 @@ def test_a_drain_sends_five_at_most_and_the_oldest_first() -> None:
     ats = [a for _, a in sent[1:]]
     assert ats == sorted(got["seededAts"])[:4], ats
     assert len(got["queued"]) == 26 - 5
+
+
+@needs_node
+def test_a_drain_goes_past_an_entry_the_server_keeps_refusing_and_drops_one_older_than_a_day() -> None:
+    # L3 r2 (complement MED): a 429 or 5xx on the oldest entry stopped the drain, so it held every newer one behind it
+    got = _run("429+seed4+seedstale+clickonly")
+    posted = [p["body"]["ping"] for p in got["posts"]]
+    assert 98 not in posted, "an entry older than a day is dropped, never posted"
+    assert sorted(posted) == [42, 42, 100, 101, 102, 103] or {100, 101, 102, 103} <= set(posted), posted   # every fresh seeded entry was tried
+    assert not any(k.startswith("/__levain_receipt/98-") for k in got["queued"]), got["queued"]
+    assert (None, "expired", None) in _receipt_steps(got), _receipt_steps(got)
+    got = _run("throw+seed4+clickonly")
+    assert len(got["posts"]) <= 2, "no answer at all (the network) still stops the drain"
 
 
 @needs_node
@@ -682,6 +695,18 @@ def test_silent_is_decided_by_times_not_by_ping_id_order(tmp_path: Path) -> None
     assert _by(receipts.build(s), 0, [held], "a")["outcome"] == "no receipt yet"
     _rows(s, receipts_=[(later, "a", "shown", _ms_stamp(6))])                 # A reported something after held reached it
     assert _by(receipts.build(s), 0, [held], "a")["outcome"] == "silent"
+
+
+def test_a_phone_with_a_fast_clock_is_not_silent_the_server_clock_decides(tmp_path: Path) -> None:
+    # L3 r2 (complement LOW): silent compared the phone's own `at` with the server's delivery time, so a clock a day ahead
+    # made every later ping silent; it compares when the SERVER received the newest report (reported_at)
+    s, sa, _ = _two_phones(tmp_path)
+    first, later = s.add_ping("sign", "np-1", "t", "b"), s.add_ping("sign", "np-2", "t", "b")
+    _rows(s, deliveries=[(first, sa, 201, _t(0)), (later, sa, 201, _t(5))])
+    with s.write() as c:       # the phone's clock says tomorrow; the server received the report at minute 1
+        c.execute("INSERT INTO receipts (ping_id, device_id, kind, at, reported_at) VALUES (?,?,?,?,?)",
+                  (first, PAIRED_PREFIX + "a", "received", _ms_stamp(60 * 24), _ms_stamp(1)))
+    assert _by(receipts.build(s), 0, [later], "a")["outcome"] == "no receipt yet"
 
 
 def test_a_tapped_ping_is_shown_even_with_its_receipts_lost(tmp_path: Path) -> None:

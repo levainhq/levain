@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1101-receipts-2';
+const SW_VERSION = '1101-receipts-3';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -20,7 +20,7 @@ const OPEN_CACHE = 'levain-open', OPEN_PREFIX = '/__levain_open/';
 // entries. At most RECEIPT_QUEUE_CAP entries (the oldest dropped); at most RECEIPT_DRAIN re-sent per event; all receipt
 // work of one event ends RECEIPT_BUDGET_MS after the event started.
 const RECEIPT_CACHE = 'levain-receipts', RECEIPT_PREFIX = '/__levain_receipt/';
-const RECEIPT_BUDGET_MS = 4000, RECEIPT_DRAIN = 5, RECEIPT_QUEUE_CAP = 200;
+const RECEIPT_BUDGET_MS = 4000, RECEIPT_DRAIN = 5, RECEIPT_QUEUE_CAP = 200, RECEIPT_MAX_AGE_MS = 86400000;
 const CACHES_KEEP = [OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE];
 // How long a 'for: new' entry lives (and how long the worker keeps one after a successful openWindow): the window between
 // openWindow and the opened page's first script run. The page's own limit for 'new' entries is the same figure (sw_open.js).
@@ -155,8 +155,10 @@ async function sendReceipt(ping, kind, at, b, hashP) {
   } catch (_) { return false; /* a receipt never reaches the notification */ }
 }
 // Re-send queued receipts, oldest first, at most RECEIPT_DRAIN, inside budget b. Each entry is deleted by the exact key
-// read, and only after the server answered 200 or refused it; one the server did not settle stops the drain (the network
-// is the likely cause) and stays.
+// read, and only after the server answered 200 or refused it, or when it is older than RECEIPT_MAX_AGE_MS (a day: the
+// ping it describes is long past). No answer at all (the network) stops the drain and the entry stays; an answer that
+// is not a settle (408, 429, a 5xx) leaves that entry and goes on to the next, so one entry the server keeps refusing
+// for a while cannot hold the ones behind it.
 async function drainReceipts(b) {
   try {
     if (typeof caches === 'undefined' || b.over) return;
@@ -166,6 +168,11 @@ async function drainReceipts(b) {
     if (keys === LATE) return;
     for (const k of keys.slice(0, RECEIPT_DRAIN)) {
       if (b.over) return;
+      if (Date.now() - receiptAge(k)[0] > RECEIPT_MAX_AGE_MS && receiptAge(k)[0] > 0) {
+        try { await b.within(() => c.delete(k)); } catch (_) { /* best effort */ }
+        trace('receipt', { kind: null, ping: null, result: 'expired' });
+        continue;
+      }
       let body;
       try {
         body = await b.within(async () => { const m = await c.match(k); return m ? JSON.parse(await m.text()) : null; });
@@ -178,7 +185,10 @@ async function drainReceipts(b) {
         try { await b.within(() => c.delete(k)); } catch (_) { /* re-sent later: the server absorbs it */ }
         if (status === 200) trace('receipt', { kind: body.kind, ping: body.ping, result: 'drained', status });
         else traceRefused(body.kind, body.ping, status, 'refused');
-      } else { trace('receipt', { kind: body.kind, ping: body.ping, result: 'still-queued', status }); break; }
+      } else {
+        trace('receipt', { kind: body.kind, ping: body.ping, result: 'still-queued', status });
+        if (status === null) break;       // no answer: the network is the likely cause
+      }
     }
   } catch (_) { /* best effort */ }
 }

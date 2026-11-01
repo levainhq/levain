@@ -206,12 +206,13 @@ function fire(type, ev) {
       const n = seed ? Number(seed.slice(4)) : 0;
       log.seededAts = [];
       for (let i = 0; i < n; i++) {
-        const at = 1_700_000_000_000 + ((i * 7) % n) * 1000;
+        const at = Date.now() - 3_600_000 + ((i * 7) % n) * 1000;
         log.seededAts.push(at);
         m.set('/__levain_receipt/' + (100 + i) + '-received-' + String(at).padStart(13, '0') + '-0000',
               JSON.stringify({ ping: 100 + i, kind: 'received', at, endpoint_sha256: 'a'.repeat(64) }));
       }
       if (parts.includes('seedold')) m.set('/__levain_receipt/99-shown', JSON.stringify({ ping: 99, kind: 'shown', at: 1_750_000_000_000, endpoint_sha256: 'b'.repeat(64) }));
+      if (parts.includes('seedstale')) { const at = Date.now() - 3 * 86400000; m.set('/__levain_receipt/98-received-' + String(at).padStart(13, '0') + '-0000', JSON.stringify({ ping: 98, kind: 'received', at, endpoint_sha256: 'c'.repeat(64) })); }
       cacheNames.add('levain-receipts'); cacheStores.set('levain-receipts', m);
     }
     const data = parts.includes('noping') ? { title: 'T', body: 'secret body' } : { title: 'T', body: 'secret body', ping: 42, url: '/', tag: 'x' };
