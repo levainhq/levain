@@ -4548,7 +4548,9 @@
   }
   // `card` (the Needs-you strip's card) draws the mock's anatomy: the question as a bold title, "blocks: ...", then "REC key. words";
   // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
-  function drawQuestionBody(q, slot, b, card) {
+  // `receipt` (a settled Needs-you card): the question is decided, so only the title, the answer line and what it blocked are
+  // drawn; the options, the recommendation and every control are not built at all.
+  function drawQuestionBody(q, slot, b, card, receipt) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const open = q.state === "open";
     const cli = "levain question show " + q.n;   // the options are listed there; answer with: levain question answer N --option KEY
@@ -4560,6 +4562,15 @@
     }
     const options = Array.isArray(b.options) ? b.options : [];
     const parts = [];
+    const settledAnswer = receipt && card && b.answer && typeof b.answer === "object" ? b.answer : null;
+    if (settledAnswer) {
+      parts.push(el("div", "needs-q-title", sv(b.what)));
+      parts.push(el("div", "consent-note ext-meta needs-answer-line", answerLine(settledAnswer, options)));
+      const more = blocksBeyondTitle(sv(b.what), sv(b.blocks));
+      if (more) parts.push(questionText(more, null, [], "") || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
+      slot.replaceChildren(...parts);
+      return;
+    }
     let head = null;     // the focus view's title, blocks and REC lines: a needs-phill sign card is drawn in their place
     if (card) {
       parts.push(el("div", "needs-q-title", sv(b.what)));
@@ -6053,7 +6064,7 @@
     card.appendChild(slot);
     Promise.resolve(questionBody(q, card)).then((b) => {
       if (!b) return;
-      drawQuestionBody(q, slot, b, card);
+      drawQuestionBody(q, slot, b, card, settled);
       if (!b.error && !settled) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
     });
     return card;

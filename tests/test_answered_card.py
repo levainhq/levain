@@ -312,3 +312,52 @@ def test_a_rejected_eager_read_leaves_the_details_button_working(tmp_path: Path,
                  {"eval": ROWS_STATE}]
         got = _values(_drive(tmp_path, f"{url}/#write_token=T", steps), '"rowsstate"')
     assert got["rows"] == 7 and got["drawn"] >= 1, got
+
+
+RECEIPT = ("JSON.stringify({receipt: 1, cards: document.querySelectorAll('#ck-needs .needs-answered .needs-card').length,"
+           " text: (document.querySelector('#ck-needs .needs-answered .needs-card') || {}).textContent || '',"
+           " options: document.querySelectorAll('#ck-needs .needs-answered .question-option').length,"
+           " recs: document.querySelectorAll('#ck-needs .needs-answered .needs-rec, #ck-needs .needs-answered .question-rec').length,"
+           " buttons: document.querySelectorAll('#ck-needs .needs-answered button').length,"
+           " order: [...document.querySelectorAll('#ck-needs .needs-answered .needs-card .needs-body > *')].map(n => n.className)})")
+
+
+def _receipt_run(tmp_path: Path, monkeypatch, core: str | None = None) -> dict:
+    store = _home(tmp_path, monkeypatch)
+    done = _file(store, "Ship the sweep fix tonight?")
+    _file(store, "Which branch do we cut from?", agent="codex")
+    store.answer(done.n, option="hold", channel="phone")
+    _root, src, _ids = _install(tmp_path)
+    if core is not None:
+        from levain import web_server
+        real = web_server.load_web_asset
+        monkeypatch.setattr(web_server, "load_web_asset", lambda fn: core if fn == "dashboard_core.js" else real(fn))
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            DESKTOP, {"until": "document.querySelector('#ck-needs .needs-answered .consent-note') && 1", "ms": 30000},
+            {"eval": RECEIPT}])
+    return _values(out, '"receipt"')
+
+
+def _assert_receipt(seen: dict) -> None:
+    assert "Answered: hold" in seen["text"] and "via phone" in seen["text"], seen
+    assert "Options" not in seen["text"] and "REC" not in seen["text"], seen
+    assert seen["options"] == 0 and seen["recs"] == 0 and seen["buttons"] == 0, seen
+    assert seen["order"][0] == "needs-q-title" and "needs-answer-line" in seen["order"][1], seen   # title, then the answer
+
+
+@needs_browser
+def test_a_settled_card_is_a_receipt_with_the_answer_and_no_options_or_controls(tmp_path: Path, monkeypatch) -> None:
+    seen = _receipt_run(tmp_path, monkeypatch)
+    _assert_receipt(seen)
+
+
+@needs_browser
+def test_the_receipt_assertions_fail_on_the_full_body(tmp_path: Path, monkeypatch) -> None:
+    """The check has teeth: the same run against a temp copy that draws the whole body for a settled card must fail it."""
+    marker = "drawQuestionBody(q, slot, b, card, settled);"
+    assert marker in CORE
+    seen = _receipt_run(tmp_path, monkeypatch, core=CORE.replace(marker, "drawQuestionBody(q, slot, b, card);"))
+    print(seen)
+    with pytest.raises(AssertionError):
+        _assert_receipt(seen)
