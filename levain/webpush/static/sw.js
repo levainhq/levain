@@ -7,7 +7,7 @@
 const DB = 'levain-sw-2', STORE = 'opened';
 // Cache Storage names this worker keeps: `levain-open` holds the pending tap target (see notificationclick); a later row
 // (W5b) adds its own versioned names here.
-const OPEN_CACHE = 'levain-open', OPEN_KEY = '/__levain_open';
+const OPEN_CACHE = 'levain-open', OPEN_PREFIX = '/__levain_open/';
 const CACHES_KEEP = [OPEN_CACHE];
 
 function open() {
@@ -77,15 +77,21 @@ self.addEventListener('push', (e) => {
 // openWindow() per click, so nothing is awaited before this wait (focus included). A page with the listener acks in ms.
 const OPEN_ACK_MS = 400;
 
-// The pending target: one cache entry {url, nonce, at}. Whoever deletes it (cache.delete resolves true for exactly one
-// caller) owns the open, so a late ack, a load-time check and the worker's fallback can never open the card twice.
+// The pending targets: ONE cache entry PER OPEN, key OPEN_PREFIX + nonce, value {url, nonce, at, for}. A claim is
+// cache.delete(<that exact key>) resolving true: whoever gets true owns the open, and nothing ever deletes a key it did
+// not read or name, so a second tap's entry, or a fallback entry meant for another window, is never touched.
+// for: 'asked' = written before a window is asked; only the message path (the nonce the worker named) may claim it.
+//      'new'   = written immediately before openWindow; only a page's FIRST load may claim it (sw_open.js).
 async function putPending(entry) {
   const c = await caches.open(OPEN_CACHE);
-  await c.put(OPEN_KEY, new Response(JSON.stringify(entry)));
+  const key = OPEN_PREFIX + entry.nonce;
+  await c.put(key, new Response(JSON.stringify(entry)));
+  return key;
 }
-async function claimPending() {
+async function dropPending(key) {
+  if (!key) return false;
   const c = await caches.open(OPEN_CACHE);
-  return c.delete(OPEN_KEY);
+  return c.delete(key);
 }
 const newNonce = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 
@@ -105,9 +111,9 @@ function askToOpen(c, url, nonce) {
 function isCockpitPath(c) {
   try { const p = new URL(c.url).pathname; return p === '/' || p === '/pair' || p.startsWith('/sign/'); } catch (_) { return false; }
 }
-// same origin and path: a fragment or an equivalent spelling of the target still counts as arrived
+// same origin, path and query: only a fragment may differ (a client still at '/' is not at '/?view=needs')
 function sameTarget(a, b) {
-  try { const x = new URL(a), y = new URL(b); return x.origin === y.origin && x.pathname === y.pathname; } catch (_) { return false; }
+  try { const x = new URL(a), y = new URL(b); return x.origin === y.origin && x.pathname === y.pathname && x.search === y.search; } catch (_) { return false; }
 }
 
 self.addEventListener('notificationclick', (e) => {
@@ -120,52 +126,62 @@ self.addEventListener('notificationclick', (e) => {
   const url = u.href;
   const opened = (async () => {
     const sameOrigin = (c) => { try { return new URL(c.url).origin === self.location.origin; } catch (_) { return false; } };
-    // 1. the pending target is written BEFORE any focus or openWindow: a page that is (re)loaded or resumed claims it
-    //    even if no message ever reaches it (iOS can open the root url, or drop a message to a resumed app)
-    let nonce = newNonce(), pending = true;
-    try { await putPending({ url, nonce, at: Date.now() }); } catch (err) {
-      pending = false;
-      console.warn(`levain sw: the pending target was not written (${err}); the tap is message-only`);
-    }
+    // 1. the 'asked' entry is written in PARALLEL with the window lookups (nothing else is awaited before the ack wait), and
+    //    before any focus or message: the page claims it by the nonce the message names
+    const nonce = newNonce();
+    const [askedKey, ctlAll, anyAll] = await Promise.all([
+      putPending({ url, nonce, at: Date.now(), for: 'asked' }).catch((err) => {
+        console.warn(`levain sw: the pending target was not written (${err}); the tap is message-only`);
+        return null;
+      }),
+      self.clients.matchAll({ type: 'window' }),
+      self.clients.matchAll({ type: 'window', includeUncontrolled: true }),
+    ]);
+    // the asked entry is for nobody when no window exists: dropped best effort
+    const dropAsked = async () => { try { return await dropPending(askedKey); } catch (_) { return false; } };
+    // 2. the window: a controlled cockpit-type page, else any controlled one, else any same-origin one
+    const ctl = ctlAll.filter(sameOrigin);
+    const pool = ctl.length ? ctl : anyAll.filter(sameOrigin);
+    const c = pool.find(isCockpitPath) || pool[0];
+    // the fallback: a 'for: new' entry (one new nonce), then openWindow; a refused or empty openWindow deletes that entry,
+    // so a plain visit to '/' later is never sent to a card nobody opened
     const openNew = async (why) => {
+      let key = null;
+      try { key = await putPending({ url, nonce: newNonce(), at: Date.now(), for: 'new' }); } catch (_) { /* best effort: the page may not forward itself */ }
       try {
         const w = await self.clients.openWindow(url);
-        console.info(`levain sw: tap -> openWindow${w ? '' : ' (no client returned)'}${why ? ` after ${why}` : ''}`);
+        if (w) { console.info(`levain sw: tap -> openWindow${why ? ` after ${why}` : ''}`); return; }
+        console.warn(`levain sw: openWindow(${url}) returned no client`);
       } catch (err) {
         console.warn(`levain sw: openWindow(${url}) failed: ${err}`);
-        console.info('levain sw: tap -> openWindow-failed');
       }
+      console.info('levain sw: tap -> openWindow-failed');
+      try { await dropPending(key); } catch (_) { /* nothing more to do */ }
     };
-    // 2. the window: a controlled cockpit-type page, else any controlled one, else any same-origin one
-    const ctl = (await self.clients.matchAll({ type: 'window' })).filter(sameOrigin);
-    const pool = ctl.length ? ctl : (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).filter(sameOrigin);
-    const c = pool.find(isCockpitPath) || pool[0];
-    // 4. no window
-    if (!c) { await openNew(''); return; }
+    // 4. no window (the asked entry was written for nobody)
+    if (!c) { await dropAsked(); await openNew(''); return; }
     // 3. ask the page to go itself (sw_open.js). WindowClient.navigate rejects on an uncontrolled window and can resolve
     //    without moving a page on iOS WebKit. No focus before the wait.
-    if (await askToOpen(c, url, pending ? nonce : null)) {
+    if (await askToOpen(c, url, askedKey ? nonce : null)) {
       try { await c.focus(); } catch (_) { /* best effort */ }
       console.info('levain sw: tap -> ack');
       return;
     }
-    // no ack: take the open over, or find the page already took it (a late ack claimed the pending target)
-    if (pending) {
-      let mine = false;
-      try { mine = await claimPending(); } catch (_) { mine = true; }
+    // no ack: claim the asked entry (the exact key this tap wrote) or find the page already took it (a late ack)
+    if (askedKey) {
+      let mine;
+      // a cache that throws cannot have been claimed by a page that needs the same cache: the worker owns the open
+      try { mine = await dropPending(askedKey); } catch (_) { mine = true; }
       if (!mine) { console.info('levain sw: tap -> ack (late)'); return; }
     }
     if (ctl.includes(c)) {
       try { await c.focus(); } catch (_) { /* navigate anyway */ }
       try {
-        // accepted when the resolved client is at the target (origin + path); null or another page is a navigation that did not happen
+        // accepted when the resolved client is at the target (origin + path + query); null or another page is a navigation that did not happen
         const r = await c.navigate(url);
         if (r && sameTarget(r.url, url)) { console.info('levain sw: tap -> navigate'); return; }
       } catch (_) { /* fall through to a new window */ }
     }
-    // a fresh nonce: a late ack from the window that was asked can no longer claim, while the new window's page
-    // (which may land on '/' on iOS) still finds the target
-    if (pending) { nonce = newNonce(); try { await putPending({ url, nonce, at: Date.now() }); } catch (_) { /* best effort */ } }
     await openNew('no ack');
   })();
   // the mark is local and best effort: a failed write loses one open's record, never the page. It is said on the

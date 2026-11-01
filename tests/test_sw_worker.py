@@ -117,27 +117,53 @@ def _open_rig(scenario: str) -> dict:
     return json.loads(cp.stdout)
 
 
+CARD2 = "https://box.example/sign/10"
+KEYS = "/__levain_open/"
+
+
 @needs_node
-def test_a_tap_writes_the_pending_target_before_it_asks_and_the_levain_open_cache_survives_activation() -> None:
+def test_a_tap_writes_its_own_keyed_entry_before_it_asks_and_the_levain_open_cache_survives_activation() -> None:
     got = _run("navigate", "controlled+ack")
-    assert got["pending"]["url"] == CARD and got["nonces"] == [got["pending"]["nonce"]], got   # the message carries the nonce
+    pend = got["pending"]
+    assert pend["url"] == CARD and pend["for"] == "asked" and got["nonces"] == [pend["nonce"]], got   # the message carries the nonce
+    assert pend["key"] == KEYS + pend["nonce"], got                                                   # one key per entry
     assert _run("activate")["caches"] == ["levain-open", "other-app-cache"]   # kept; every other levain- cache still goes
 
 
 @needs_node
 def test_a_late_ack_after_the_worker_took_over_double_navigates_nothing() -> None:
-    """L1 W1: the worker timed out and navigated; the page's ack arrived after. The worker deleted the pending target, so
-    the page's claim lost (no ack, no assign): exactly one navigation."""
+    """(b) the worker timed out and navigated; the page's ack arrived after. The worker deleted its own key, so the page's
+    delete of that key lost (no ack, no assign): exactly one navigation."""
     got = _run("navigate", "controlled+late")
     assert got["navigated"] == [CARD] and got["lateClaimed"] is False and got["pendingLeft"] == 0, got
     assert "openWindow" not in got, got
 
 
 @needs_node
-def test_a_refused_open_window_warns_and_nothing_throws() -> None:
+def test_two_overlapping_taps_each_claim_only_their_own_entry() -> None:
+    """(a) tap B writes while tap A waits; A's timeout deletes A's key only, so B still owns its entry, times out, claims it
+    and navigates to its own card. (A shared key would make B read A's delete as a late ack and drop its card.)"""
+    got = _run("navigate", "controlled+silent+two")
+    assert got["navigated"] == [CARD, CARD2] and "openWindow" not in got and got["pendingLeft"] == 0, got
+    assert len(set(got["nonces"])) == 2, got
+
+
+@needs_node
+def test_a_refused_open_window_warns_and_leaves_no_entry() -> None:
+    """(e) no window; openWindow rejects: the 'new' entry the worker wrote just before is deleted, so a later plain visit to
+    the root is never sent to a card nobody opened."""
     got = _run("navigate", "openfail")
     assert got["openAttempt"] == CARD, got
     assert any(k == "warn" and "openWindow" in m and "refused" in m for k, m in got["console"]), got
+    assert ["info", "levain sw: tap -> openWindow-failed"] in got["console"], got
+    assert got["pendingLeft"] == 0, got
+
+
+@needs_node
+def test_an_open_window_that_returns_no_client_leaves_no_entry() -> None:
+    got = _run("navigate", "opennull")
+    assert got["openAttempt"] == CARD and got["pendingLeft"] == 0, got
+    assert [e["for"] for e in got["entriesAtOpen"]] == ["new"], got   # the no-window path writes ONLY the 'new' entry
     assert ["info", "levain sw: tap -> openWindow-failed"] in got["console"], got
 
 
@@ -148,34 +174,54 @@ def test_a_navigate_that_resolves_at_the_target_with_another_fragment_counts_as_
 
 
 @needs_node
+def test_a_navigate_that_resolves_at_the_root_is_not_arrival_at_a_query_target() -> None:
+    """(f) the target is '/?view=needs'; the client stayed at '/': same origin and path but another query is NOT success."""
+    got = _run("navigate", "search")
+    assert got["navigated"] == ["https://box.example/?view=needs"] and got["openedUrl"] == "https://box.example/?view=needs", got
+
+
+@needs_node
 def test_the_window_preference_picks_the_cockpit_page_over_a_docs_page() -> None:
     got = _run("navigate", "prefer+ack")
     assert got["askedWho"] == ["https://box.example/sign/3"], got
 
 
 @needs_node
-def test_a_fallback_open_window_leaves_a_fresh_target_for_the_page_that_lands_on_root() -> None:
+def test_a_fallback_open_window_writes_one_fresh_new_entry_just_before_it_for_the_page_that_lands_on_root() -> None:
+    """(c, d) the asked entry is gone (the worker claimed it) and ONE 'new' entry, another nonce, is present when
+    openWindow runs, so the asked window can never claim it and the page iOS lands on '/' can."""
     got = _run("navigate", "uncontrolled")
-    assert got["pendingLeft"] == 1 and got["pending"]["nonce"] != got["nonces"][0], got        # a late ack cannot claim it
+    assert got["pendingLeft"] == 1 and got["pending"]["for"] == "new" and got["pending"]["nonce"] != got["nonces"][0], got
+    assert [e["for"] for e in got["entriesAtOpen"]] == ["new"], got
 
 
 @needs_node
-def test_the_page_claims_by_nonce_and_only_once() -> None:
+def test_a_message_deletes_only_the_key_its_nonce_names() -> None:
     got = _open_rig("claim")
-    assert got["afterWrong"] == {"assigned": 0, "acks": 0, "pending": True}, got   # a wrong nonce: no ack, no move, entry kept
-    assert got["assigned"] == [CARD] and len(got["acks"]) == 1, got                # the right nonce won once; the repeat and the gone entry did nothing
-    assert got["afterRight"] == {"pending": False}, got
+    assert got["afterWrong"] == {"assigned": 0, "acks": 0, "n1": True, "n2": True}, got   # no entry for the nonce: no ack, no move, nothing deleted
+    assert got["assigned"] == [CARD] and len(got["acks"]) == 1, got                        # the right nonce won once; the repeat and the gone entry did nothing
+    assert got["afterRight"] == {"n1": False, "n2": True}, got                             # another tap's entry is never touched
 
 
 @needs_node
-def test_a_page_that_loads_or_resumes_after_the_tap_forwards_itself_and_an_expired_target_is_dropped() -> None:
+def test_only_a_pages_first_load_claims_a_new_entry() -> None:
     got = _open_rig("load")
-    assert got["firstLoad"] == {"assigned": [CARD], "pending": False}, got         # iOS landed on '/': the load check forwards
+    assert got["firstLoad"] == {"assigned": [CARD], "pending": False}, got         # iOS landed on '/': the first-load check forwards
+    assert got["asked"] == {"assigned": 1, "pending": True}, got                   # an 'asked' entry is the message path's, never the load check's
     assert got["expired"] == {"assigned": 1, "pending": False}, got                # older than 30 s: deleted, ignored
     assert got["alreadyHere"] == {"assigned": 1, "pending": False}, got            # consumed, no pointless assign
-    assert got["hidden"] == {"assigned": 1, "pending": True}, got                  # a hidden page does not act
-    assert got["visible"] == {"assigned": 2, "pending": False}, got
-    assert got["cross"] == {"assigned": 2, "pending": False}, got                  # never follows another origin
+    assert got["resumed"] == {"assigned": 1, "pending": True}, got                 # visibilitychange and a bfcache pageshow claim nothing
+    assert got["shown"] == {"assigned": 2, "pending": False}, got                  # a first load does
+    assert got["cross"] == {"assigned": 2}, got                                    # never follows another origin
+    assert got["query"] == {"assigned": ["https://box.example/?view=needs"], "pending": False}, got   # '/' is not '/?view=needs'
+    assert got["fragment"] == {"moved": 0, "pending": False}, got                  # only a fragment differs: already here
+
+
+@needs_node
+def test_a_first_load_takes_the_entry_for_its_own_url_else_the_newest() -> None:
+    got = _open_rig("first")
+    assert got["first"] == {"assigned": ["https://box.example/sign/3"], "left": ["mid", "old"]}, got
+    assert got["own"] == {"assigned": 1, "left": ["mid"]}, got   # at /sign/1 it takes that entry and stays put
 
 
 @needs_node

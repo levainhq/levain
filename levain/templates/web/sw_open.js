@@ -4,30 +4,23 @@
 // page acks {ok: true} on that port BEFORE it navigates (the navigation unloads the page), then assigns the location.
 // A url that is not on this origin is ignored without an ack (the worker checks too; this page does not trust it).
 // Loaded by every page this origin serves a window can be showing: the cockpit (/), the sign sheet and /pair.
-// The worker also writes a PENDING TARGET {url, nonce, at} to Cache Storage before it asks (iOS can open the root url on a
-// tap, or drop a message to a just-resumed app). Whoever deletes that entry (cache.delete resolves true for one caller
-// only) owns the open: the message path claims it by nonce, and a load / pageshow / visible page claims whatever is
-// pending, so a late ack, a resumed page and the worker's fallback can never open the card twice.
+// The worker also writes PENDING TARGETS to Cache Storage, one entry per open under its own key '/__levain_open/<nonce>',
+// value {url, nonce, at, for}. Whoever deletes that exact key (cache.delete resolves true for one caller only) owns the
+// open, and nobody deletes a key it did not name or read. for 'asked' (written before the worker asks a window): only the
+// message path claims it, by the nonce the worker named. for 'new' (written just before openWindow): only a page's FIRST
+// load claims it (the script's first run, or a pageshow that is not a bfcache restore), because iOS can land a tapped
+// window on the root url; an already loaded page that merely resumes claims nothing, so a window the worker gave up on
+// never moves late.
 
 (() => {
   "use strict";
   if (!("serviceWorker" in navigator)) return;
-  const CACHE = "levain-open", KEY = "/__levain_open";
+  const CACHE = "levain-open", PREFIX = "/__levain_open/";
   // a target older than this is a tap nobody followed up (the card it points at is stale, and a later plain visit must not jump)
   const PENDING_TTL_MS = 30000;
   const haveCache = typeof caches !== "undefined";
-
-  // delete the pending entry; true only for the caller whose delete removed it
-  async function takePending(want) {
-    const cache = await caches.open(CACHE);
-    const r = await cache.match(KEY);
-    if (!r) return null;
-    let e;
-    try { e = await r.json(); } catch (_) { await cache.delete(KEY); return null; }
-    if (!e || typeof e.url !== "string") { await cache.delete(KEY); return null; }
-    if (want && !want(e)) return null;
-    return (await cache.delete(KEY)) ? e : null;
-  }
+  // same origin, path and query; only a fragment may differ
+  const sameTarget = (a, b) => a.origin === b.origin && a.pathname === b.pathname && a.search === b.search;
 
   navigator.serviceWorker.addEventListener("message", (ev) => {
     const d = ev.data;
@@ -42,29 +35,45 @@
     };
     // no cache, or the worker could not write a target: message-only, as before
     if (!haveCache || typeof d.nonce !== "string") { go(); return; }
-    // a lost claim means another path (or the worker) already owns this open: no ack, no navigation
-    takePending((e) => e.nonce === d.nonce).then((e) => { if (e) go(); }).catch(() => { /* cache unreadable: the worker's path runs */ });
+    // only the key this message names, and only a nonce shaped like the worker's: a lost claim means another path (or the
+    // worker) already owns this open, so no ack and no navigation
+    if (!/^[a-z0-9]+$/i.test(d.nonce)) return;
+    caches.open(CACHE).then((c) => c.delete(PREFIX + d.nonce)).then((won) => { if (won) go(); })
+      .catch(() => { /* cache unreadable: the worker's path runs */ });
   });
 
-  // the load-time check: a page that opens (or comes back to the front) after the tap forwards itself to the target
+  // the first-load check: a page that opens right after the tap (iOS can open the root url) forwards itself
   let checking = false;
   async function checkPending() {
     if (!haveCache || checking) return;
     checking = true;
     try {
-      const e = await takePending(null);
-      if (!e) return;
-      let u;
-      try { u = new URL(e.url, location.href); } catch (_) { return; }
-      if (u.origin !== location.origin) return;
-      if (typeof e.at !== "number" || Date.now() - e.at > PENDING_TTL_MS) return;   // expired: already deleted by the take
-      if (u.href === location.href) return;                                          // already here: consumed, nothing to do
-      location.assign(u.href);
+      const cache = await caches.open(CACHE);
+      const found = [];
+      for (const req of await cache.keys()) {
+        if (new URL(req.url).pathname.indexOf(PREFIX) !== 0) continue;
+        let e = null;
+        try { const r = await cache.match(req); e = r && await r.json(); } catch (_) { e = null; }
+        // unreadable or expired: deleted (the exact key read); the worker deletes its own on the paths it owns
+        if (!e || typeof e.url !== "string" || typeof e.at !== "number" || Date.now() - e.at > PENDING_TTL_MS) { await cache.delete(req); continue; }
+        if (e.for !== "new") continue;                       // 'asked' belongs to the message path
+        let u;
+        try { u = new URL(e.url, location.href); } catch (_) { continue; }
+        if (u.origin !== location.origin) continue;
+        found.push({ req, e, u });
+      }
+      // the entry for the page already showing, else the newest; a lost delete means another page took it: try the next
+      const here = new URL(location.href);
+      found.sort((x, y) => (sameTarget(y.u, here) - sameTarget(x.u, here)) || (y.e.at - x.e.at));
+      for (const f of found) {
+        if (!(await cache.delete(f.req))) continue;
+        if (!sameTarget(f.u, here)) location.assign(f.u.href);   // already here: consumed, the page stays
+        return;
+      }
     } catch (_) { /* no cache: nothing pending */ } finally { checking = false; }
   }
   checkPending();
-  window.addEventListener("pageshow", checkPending);
-  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") checkPending(); });
+  window.addEventListener("pageshow", (ev) => { if (!ev.persisted) checkPending(); });
 
   // an uncontrolled page (opened before the worker took over) queues worker messages until this is called
   try { navigator.serviceWorker.startMessages(); } catch (_) { /* older engines deliver without it */ }

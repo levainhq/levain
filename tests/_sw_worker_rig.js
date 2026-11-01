@@ -61,9 +61,12 @@ const caches = {
       put: async (k, r) => { m.set(k, await r.text()); },
       match: async (k) => (m.has(k) ? new Response(m.get(k)) : undefined),
       delete: async (k) => m.delete(k),
+      keys: async () => [...m.keys()].map((k) => ({ url: 'https://box.example' + k })),
     };
   },
 };
+
+const pendings = () => [...(cacheStores.get('levain-open') || new Map()).entries()].map(([k, v]) => ({ key: k, ...JSON.parse(v) }));
 
 // --- clients ---------------------------------------------------------------------------------------------------------
 const windowClient = {
@@ -78,7 +81,7 @@ const self_ = {
   clients: {
     claim: async () => { log.claimed = true; },
     matchAll: async (o) => log.windows.concat((o && o.includeUncontrolled) ? uncontrolled : []),
-    openWindow: async (u) => { log.openWindow = true; log.openedUrl = u; },
+    openWindow: async (u) => { log.openWindow = true; log.openedUrl = u; log.openedAll = (log.openedAll || []).concat([u]); log.entriesAtOpen = pendings(); return { url: u }; },
   },
 };
 const sandbox = {
@@ -109,9 +112,9 @@ function fire(type, ev) {
     log.caches = [...cacheNames].sort();
     log.keptOpened = [...(dbs.get('levain-sw-2').stores.get('opened').entries())];
   } else if (scenario === 'navigate') {
-    // mode: <window>[+ack] ; window = controlled | uncontrolled | reject | null | mismatch | crossorigin. "+ack" means the
+    // mode: <window>[+ack][+two] ; "+two" fires a second tap (url /sign/10) 100 ms after the first ; window = controlled | uncontrolled | reject | null | mismatch | crossorigin. "+ack" means the
     // page runs sw_open.js (acks the worker's levain-open message); without it the page is silent, as an old cached page is.
-    const [kind, ack] = mode.split('+');
+    const [kind, ack, extra] = mode.split('+');
     // ack: absent = silent page; 'ack' = acks at once; 'late' = acks after OPEN_ACK_MS (the page claims the pending target first)
     const post = function (m, tr) {
       if (m && m.type === 'levain-open') {
@@ -119,11 +122,9 @@ function fire(type, ev) {
         log.asked.push(m.url); log.nonces = (log.nonces || []).concat([m.nonce]);
         if (ack === 'ack') tr[0].postMessage({ ok: true });
         if (ack === 'late') setTimeout(async () => {
-          // what sw_open.js does: claim by nonce, ack only if the delete took it
+          // what sw_open.js does: delete the key the message names, ack only if that delete took it
           const c = await caches.open('levain-open');
-          const got = await c.match('/__levain_open');
-          const e = got && JSON.parse(await got.text());
-          if (e && e.nonce === m.nonce && await c.delete('/__levain_open')) { log.lateClaimed = true; tr[0].postMessage({ ok: true }); } else log.lateClaimed = false;
+          if (await c.delete('/__levain_open/' + m.nonce)) { log.lateClaimed = true; tr[0].postMessage({ ok: true }); } else log.lateClaimed = false;
         }, 700);
       } else log.posted.push(m);
     };
@@ -135,14 +136,18 @@ function fire(type, ev) {
     else if (kind === 'null') log.windows = [win(async (u) => { log.navigated.push(u); return null; })];
     else if (kind === 'mismatch') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/elsewhere' }; })];
     else if (kind === 'fragment') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/sign/9' }; })];
+    else if (kind === 'search') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/' }; }, 'https://box.example/')];
+    else if (kind === 'opennull') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; log.entriesAtOpen = pendings(); return null; }; }
     else if (kind === 'openfail') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; throw new TypeError('openWindow refused'); }; }
     else if (kind === 'prefer') log.windows = [win(ok, 'https://box.example/docs/guide'), win(async (u) => { log.navigated.push('cockpit:' + u); return { url: u }; }, 'https://box.example/sign/3')];
-    const url = kind === 'crossorigin' ? 'https://evil.example/x' : '/sign/9#sign=a&v=1';
-    await fire('notificationclick', { notification: { close: () => {}, data: { url } } });
+    const url = kind === 'crossorigin' ? 'https://evil.example/x' : kind === 'search' ? '/?view=needs' : '/sign/9#sign=a&v=1';
+    const first = fire('notificationclick', { notification: { close: () => {}, data: { url } } });
+    if (extra === 'two') { await new Promise((r) => setTimeout(r, 100)); await fire('notificationclick', { notification: { close: () => {}, data: { url: '/sign/10' } } }); }
+    await first;
     if (ack === 'late') await new Promise((r) => setTimeout(r, 900));   // let the late page act
-    const left = cacheStores.get('levain-open');
-    log.pendingLeft = left ? left.size : 0;
-    if (left && left.size) log.pending = JSON.parse([...left.values()][0]);
+    log.pendings = pendings();
+    log.pendingLeft = log.pendings.length;
+    if (log.pendings.length) log.pending = log.pendings[0];
   } else if (scenario === 'click') {
     log.windows = [windowClient];
     let closed = false;
