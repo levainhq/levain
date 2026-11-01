@@ -153,3 +153,35 @@ def test_pinned_returns_a_guarded_view_and_passes_the_version_through():
 def test_without_pinned_on_the_real_store_the_attribute_is_refused_as_before():
     with pytest.raises(CrystallizationRefused):
         refuse_crystallization(_FakeCrystalStore())._pinned
+
+
+# ---------- a REAL prepare_wrap through the guard ----------
+
+def test_a_real_prepare_wrap_runs_through_the_guard_without_reaching_outside_the_allow_list(tmp_path):
+    """The allow-list was derived from anneal's call sites; this runs the real call. On an anneal whose prepare_wrap
+    asks for ``_pinned()`` the guard must hand back a guarded view that only reads; on one without it the attribute is
+    absent. Either way ``CrystallizationRefused`` (a BaseException, never swallowed) must not come out of it."""
+    anneal = pytest.importorskip("anneal_memory")
+    from anneal_memory.continuity import prepare_wrap
+
+    db = tmp_path / "memory.db"
+    with anneal.Store(str(db), section_schema=anneal.FLOW_SCHEMA) as store:
+        for i in range(3):
+            store.record(content=f"Turn {i}: helped the operator.", episode_type="observation", source="t")
+        pinned: list[str] = []
+        base = anneal.CrystalStore
+
+        class Spy(base):  # type: ignore[valid-type, misc]
+            pass
+
+        if hasattr(base, "_pinned"):
+            def _pinned(self):
+                pinned.append("_pinned")
+                return base._pinned(self)
+            Spy._pinned = _pinned
+
+        crystal = refuse_crystallization(Spy(tmp_path / "memory.crystal.json"))
+        result = prepare_wrap(store, crystal_store=crystal)
+        assert result["status"] == "ready" and result["wrap_token"]
+        if hasattr(base, "_pinned"):
+            assert pinned, "this anneal has _pinned, so a real prepare_wrap is expected to call it through the guard"

@@ -8,7 +8,8 @@ Two rollbacks, chosen by the public surface of the installed anneal-memory (``ca
 * WITH ``revert_wrap``: the rollback verifies the snapshot, then asks anneal to undo the wrap. The day's episodes are
   offered to the next dream. On a store that keeps its identity in the db anneal restores the identity itself (and
   re-projects the files), so Levain does not write the text; when anneal restored none (``identity_version`` is
-  None) Levain restores the text after the revert.
+  None) Levain restores the text after the revert. A rerun finds one of three states in rollback.json
+  (``_rollback_gen3``): no call started, a call started with no receipt, or a receipt.
 * WITHOUT it (anneal <= 1.0.2, format 2): the memory TEXT only. The wrap's db rows stay, so the day's episodes still
   count as consolidated and are not offered to the next dream; every rollback's output says so.
 
@@ -461,7 +462,7 @@ def _later_blocker(occ_dir: Path, m: Mapping[str, Any]) -> str | None:
 def rollback(store_path: Path | str, occ_dir: Path | str, *, who: str = "operator",
              file_card: Callable[[dict[str, Any]], Any] | None = None,
              lock: Callable[[Path], Any] | None = None, allow_missing: bool = False,
-             lease_token: str | None = None) -> RollbackResult:
+             lease_token: str | None = None, allow_foreign: bool = False) -> RollbackResult:
     """Restore the memory text the dream in ``occ_dir`` replaced (D1_EXECUTOR §3.2), one step, under the store lock.
 
     Refuses when a wrap is open, when there is no post record (no proof the live text is the dream's), when a rollback
@@ -472,9 +473,11 @@ def rollback(store_path: Path | str, occ_dir: Path | str, *, who: str = "operato
     ``file_card`` (D1-1c's card filer) is called with the ``rolled-back`` card spec after a successful restore; its
     failure is recorded on the result, never raised, because the text is already restored.
 
-    When anneal has ``revert_wrap`` the wrap is undone through it (see the module docstring); ``allow_missing`` and
-    ``lease_token`` (the dream's lease, when it is live and the caller holds it) are passed to it. A refusal from
-    anneal restores nothing and comes back as a ``refused`` result carrying anneal's code and a one-line remedy."""
+    When anneal has ``revert_wrap`` the wrap is undone through it (see the module docstring and
+    :func:`_rollback_gen3` for the three states a rerun can find); ``allow_missing`` and ``lease_token`` (the dream's
+    lease, when it is live and the caller holds it) are passed to it. A refusal from anneal restores nothing and comes
+    back as a ``refused`` result carrying anneal's code and a one-line remedy. ``allow_foreign`` matters only to a
+    rerun of a revert that was started (``foreign-write-after-revert``)."""
     from levain import wrap as _w
 
     db, occ_dir = Path(store_path).resolve(), Path(occ_dir)
@@ -482,17 +485,18 @@ def rollback(store_path: Path | str, occ_dir: Path | str, *, who: str = "operato
     if handle is _w._ANOTHER_WRAP_RUNNING:
         return _refused("lock-held", "another consolidate holds the store's wrap lock.")
     try:
-        return _rollback_locked(db, occ_dir, who, file_card, allow_missing=allow_missing, lease_token=lease_token)
+        return _rollback_locked(db, occ_dir, who, file_card, allow_missing=allow_missing, lease_token=lease_token,
+                                allow_foreign=allow_foreign)
     finally:
         _w._unlock_wrap(handle)
 
 
 def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
-                     *, allow_missing: bool = False, lease_token: str | None = None) -> RollbackResult:
+                     *, allow_missing: bool = False, lease_token: str | None = None,
+                     allow_foreign: bool = False) -> RollbackResult:
     m = read_manifest(occ_dir)
     if m is None:
         return _refused("no-snapshot", f"there is no snapshot under {occ_dir / SNAP_DIR}.")
-    snap = occ_dir / SNAP_DIR
     why = store_identity_problem(db, m)
     if why:
         return _refused("store-mismatch", why)
@@ -508,92 +512,347 @@ def _rollback_locked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dic
                                   f"{m['reverted_at']}; nothing was changed. {limit}", code="already-reverted",
                                   restored=list(rec.get("files") or []), undo_dir=str(occ_dir / UNDO_DIR), card=card)
         return _refused("already-reverted", f"this dream was already rolled back at {m['reverted_at']}.")
+    has_rw = _has_revert_wrap()
     # BEFORE any Store() open: an anneal with revert_wrap migrates a format-2 store to format 3 on open (measured), a
     # change a rollback must never make, refused or not. Plain sqlite reads the format; only the anneal that ran the dream
     # (no revert_wrap) may roll a format-2 store back.
-    if format_version(db) == SUPPORTED_FORMAT and _has_revert_wrap():
+    if format_version(db) == SUPPORTED_FORMAT and has_rw:
         return _refused("format", f"the store is format {SUPPORTED_FORMAT} and this anneal-memory (which has revert_wrap) "
                                   f"would migrate it to format {REVERT_FORMAT} just by opening it. Nothing was opened or "
                                   "changed. Remedy: roll this dream back with the anneal-memory that ran it (one without "
                                   "revert_wrap).")
+    if has_rw:
+        return _rollback_gen3(db, occ_dir, who, file_card, m, allow_missing, lease_token, allow_foreign)
     if _wrap_open(db):
         return _refused("wrap-open", "a wrap is open on this store (or its state cannot be read); rolling back now "
                                      "would race its save.")
+    return _rollback_text_only(db, occ_dir, who, file_card, m)
+
+
+def _rollback_text_only(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+                        m: dict[str, Any]) -> RollbackResult:
+    """The anneal <= 1.0.2 (format 2, no ``revert_wrap``) rollback: the memory text only (D1-1b, unchanged)."""
+    snap = occ_dir / SNAP_DIR
     pre = {k: e["sha256"] for k, e in m["files"].items()}
     post = m.get("post_files")
     live = tier_hashes(db)
-    rec0 = _read_json(occ_dir / ROLLBACK_RECORD) or {}
-    try:
-        rstore = _revert_store(db)
-    except RevertStoreUnavailable as exc:
-        return _refused("revert-store", f"this anneal-memory has revert_wrap but the store would not open ({exc}). "
-                                        "Nothing was changed. Remedy: free the store (close what holds it) and rerun.")
-    try:
-        return _rollback_checked(db, occ_dir, who, file_card, m, pre, post, live, rec0, rstore,
-                                 allow_missing, lease_token)
-    finally:
-        if rstore is not None:
-            with contextlib.suppress(Exception):
-                rstore.close()
-
-
-def _rollback_checked(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
-                      m: dict[str, Any], pre: dict[str, Any], post: Any, live: dict[str, str | None],
-                      rec0: dict[str, Any], rstore: Any | None, allow_missing: bool,
-                      lease_token: str | None) -> RollbackResult:
-    snap = occ_dir / SNAP_DIR
-    # a revert_wrap call was STARTED (called_at is written durably before the call): anneal is the authority on whether
-    # it committed, so a rerun asks it again (it answers already_reverted) instead of judging the live files
-    started = rstore is not None and bool((rec0.get("revert_wrap") or {}).get("called_at"))
-    if live == pre and m.get("revert_started_at") and (rstore is None or (rec0.get("revert_wrap") or {}).get("receipt")):
+    if live == pre and m.get("revert_started_at"):
         # an earlier rollback restored every file, then died before it finished: mark it finished
-        return _finish(occ_dir, m, who, [], file_card, finished=True,
-                       limit=_reoffer_text((rec0.get("revert_wrap") or {}).get("receipt")) if rstore is not None
-                       else LIMIT)
-    if live == pre and not (started or (rstore is not None and m.get("revert_started_at"))):
-        # (with revert_wrap, a started rollback whose revert may not have been recorded goes on: anneal answers
-        # already_reverted and the receipt is written)
+        return _finish(occ_dir, m, who, [], file_card, finished=True)
+    if live == pre:
         return RollbackResult("nothing", "nothing to roll back: the live text is already the one the snapshot holds.")
     if not post:
-        return _refused("no-post", "the snapshot has no post-save record (it never ran, or the save did not land), so "
-                                   "there is no proof the live text is the dream's.")
+        return _refused("no-post", NO_POST_WHY)
     blocker = _later_blocker(occ_dir, m)
     if blocker:
         return _refused("later-dream", blocker + ".")
     fmt = format_version(db)
-    if fmt != SUPPORTED_FORMAT and not (rstore is not None and fmt == REVERT_FORMAT):
+    if fmt != SUPPORTED_FORMAT:
         return _refused("format", f"the store's format_version is {fmt!r}; only {SUPPORTED_FORMAT} has a proven "
                                   "rollback without revert_wrap (on 3 the db is the identity authority and the files "
                                   "are projections, and only anneal's revert_wrap can undo a save there).")
-    wrap_id = m.get("wrap_id")
-    if rstore is not None and (isinstance(wrap_id, bool) or not isinstance(wrap_id, int)):
-        return _refused("no-wrap-id", f"the post record holds no wrap id ({wrap_id!r}), so anneal cannot be told which "
-                                      "wrap to revert.")
     # per FILE, not per tier: each live file must be what the dream saved or what it replaced. A rollback that died
     # halfway leaves a mix of the two, and a rerun finishes it; any third value is a later write.
-    # (skipped once a revert_wrap call started: anneal re-projects the files and they need not be either value)
-    foreign = [] if started else [k for k in live if live[k] not in (pre[k], post.get(k))]
+    foreign = [k for k in live if live[k] not in (pre[k], post.get(k))]
     if foreign:
-        return _refused("foreign-write", f"the live {', '.join(sorted(foreign))} is neither what this dream saved nor "
-                                         "what it replaced; a later write would be silently undone.")
+        return _refused("foreign-write", _foreign_why(foreign))
     for key, e in m["files"].items():
         if e["sha256"] is not None and sha256_file(snap / e["name"]) != e["sha256"]:
             return _refused("snapshot-damaged", f"{snap / e['name']} does not match its manifest hash.")
-    undo = occ_dir / UNDO_DIR
-    fresh = not m.get("revert_started_at")
-    if fresh:
-        # only the FIRST attempt's copy holds the dream's text; a rerun never overwrites it
-        shutil.rmtree(undo, ignore_errors=True)
-        undo.mkdir(parents=True)
-        for src in text_tier(db).values():
-            if src.is_file():
-                shutil.copy2(src, undo / src.name)
-        m["revert_started_at"] = _now()
-        _write_manifest(occ_dir, m)
-    if rstore is not None:
-        return _revert_through_anneal(db, occ_dir, who, file_card, m, live, rec0, rstore, fresh, allow_missing,
-                                      lease_token)
+    if not m.get("revert_started_at"):
+        _take_undo_copy(db, occ_dir, m)
     return _restore_text(db, occ_dir, who, file_card, m, live, finished=False)
+
+
+NO_POST_WHY = ("the snapshot has no post-save record (it never ran, or the save did not land), so there is no proof "
+               "the live text is the dream's.")
+
+
+def _foreign_why(foreign: list[str]) -> str:
+    return (f"the live {', '.join(sorted(foreign))} is neither what this dream saved nor what it replaced; a later "
+            "write would be silently undone.")
+
+
+def _take_undo_copy(db: Path, occ_dir: Path, m: dict[str, Any]) -> None:
+    """Keep the live text in ``reverted-from/`` and mark the rollback started. Only the FIRST attempt's copy holds the
+    dream's text; a rerun never overwrites it."""
+    undo = occ_dir / UNDO_DIR
+    shutil.rmtree(undo, ignore_errors=True)
+    undo.mkdir(parents=True)
+    for src in text_tier(db).values():
+        if src.is_file():
+            shutil.copy2(src, undo / src.name)
+    m["revert_started_at"] = _now()
+    _write_manifest(occ_dir, m)
+
+
+def _wrap_open_ro(db: Path) -> bool:
+    """:func:`_wrap_open` by plain read-only sqlite (no ``Store`` is constructed, so nothing can migrate or re-project):
+    True when a wrap is open, or that cannot be told (the stricter reading)."""
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = con.execute("select value from metadata where key = 'wrap_started_at'").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return True
+    return bool(row and str(row[0] if row[0] is not None else "").strip())
+
+
+def _later_posts(occ_dir: Path, m: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The post-save hashes of every sibling dream taken AFTER this one: text a later dream saved is recorded, not a
+    stranger's."""
+    me = (_taken(m), occ_dir.name)
+    return [other["post_files"] for n, other in snapshots(occ_dir.parent)
+            if n != occ_dir.name and (_taken(other), n) > me and other.get("post_files")]
+
+
+def _gen3_refusal_text(exc: BaseException, code: str) -> tuple[str, str]:
+    """(anneal's detail, the one-line remedy) for a refusal ``code``."""
+    remedy = REVERT_REMEDY.get(code, "") if code != "lease_fenced" else (
+        "the dream's consolidation lease is live and the token given does not match; pass the right "
+        "--lease-token or wait for the lease to lapse.")
+    return str(getattr(exc, "detail", "") or exc).rstrip("."), remedy
+
+
+def _revert_state_hint(db: Path, wrap_id: Any) -> str:
+    return (f"Check what anneal did with `anneal-memory --db {db} history`: if wrap {wrap_id} is no longer listed, the "
+            "revert committed.")
+
+
+def _open_for_revert(db: Path) -> Any:
+    store = _revert_store(db)
+    if store is None:
+        raise RevertStoreUnavailable("this anneal-memory has no revert_wrap")
+    return store
+
+
+def _rollback_gen3(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+                   m: dict[str, Any], allow_missing: bool, lease_token: str | None,
+                   allow_foreign: bool) -> RollbackResult:
+    """The rollback when anneal has ``revert_wrap``: a three-state machine keyed on the DURABLE record of the rollback
+    being resumed (``rollback.json``'s ``revert_wrap``), never on the manifest's ``revert_started_at``.
+
+    * S0, no ``called_at``: a FIRST attempt. Every check reads plain sqlite (read-only) and file hashes; no ``Store`` is
+      constructed until all have passed; the undo copy is taken before the first write-capable open; there is no
+      file-hash no-op shortcut (anneal is the authority). A refusal from anneal restores the record as it was, so the
+      next run is S0 again.
+    * S1, ``called_at`` and no ``receipt``: anneal may or may not have committed. The live files are hashed first
+      (``foreign-write-after-revert`` if one is a stranger's, unless ``allow_foreign``); anneal is then asked again
+      BEFORE any occurrence-based check, and answers ``already_reverted`` or reverts. Marks are kept on a refusal.
+    * S2, a ``receipt``: finish without calling anneal again.
+    """
+    pre = {k: e["sha256"] for k, e in m["files"].items()}
+    post = m.get("post_files")
+    live = tier_hashes(db)
+    rec0 = _read_json(occ_dir / ROLLBACK_RECORD) or {}
+    rw0 = dict(rec0.get("revert_wrap") or {})
+    if rw0.get("receipt"):
+        return _gen3_s2(db, occ_dir, who, file_card, m, pre, post, live, rw0, allow_foreign)
+    if rw0.get("called_at"):
+        return _gen3_s1(db, occ_dir, who, file_card, m, pre, post, live, rec0, rw0, allow_missing, lease_token,
+                        allow_foreign)
+    return _gen3_s0(db, occ_dir, who, file_card, m, pre, post, live, rec0, allow_missing, lease_token)
+
+
+def _gen3_format_wrap_problem(db: Path, m: Mapping[str, Any], *, started: bool) -> RollbackResult | None:
+    """The format, wrap-id and wrap-open checks every state that will call anneal shares (read-only)."""
+    fmt = format_version(db)
+    if fmt != REVERT_FORMAT:
+        return _refused("format", f"the store's format_version is {fmt!r}; the rollback through anneal's revert_wrap is "
+                                  f"proven on format {REVERT_FORMAT} only (on it the db is the identity authority and "
+                                  "the files are projections).")
+    wrap_id = m.get("wrap_id")
+    if isinstance(wrap_id, bool) or not isinstance(wrap_id, int):
+        return _refused("no-wrap-id", f"the post record holds no wrap id ({wrap_id!r}), so anneal cannot be told which "
+                                      "wrap to revert.")
+    if _wrap_open_ro(db):
+        why = ("a wrap is open on this store (or its state cannot be read); rolling back now would race its save.")
+        if started:
+            return RollbackResult("refused", f"REFUSED (wrap-open): {why} A revert was started earlier and anneal may "
+                                  f"have committed it; nothing was changed by this run. {_revert_state_hint(db, wrap_id)}",
+                                  code="wrap-open")
+        return _refused("wrap-open", why)
+    return None
+
+
+def _gen3_s0(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+             m: dict[str, Any], pre: dict[str, Any], post: Any, live: dict[str, str | None], rec0: dict[str, Any],
+             allow_missing: bool, lease_token: str | None) -> RollbackResult:
+    snap = occ_dir / SNAP_DIR
+    if not post:
+        return _refused("no-post", NO_POST_WHY)
+    blocker = _later_blocker(occ_dir, m)
+    if blocker:
+        return _refused("later-dream", blocker + ".")
+    bad = _gen3_format_wrap_problem(db, m, started=False)
+    if bad:
+        return bad
+    # per FILE, not per tier. No file-hash no-op here: live == pre after a legitimate edit back does not mean there is
+    # nothing to undo in the db, and anneal is the authority.
+    foreign = [k for k in live if live[k] not in (pre[k], post.get(k))]
+    if foreign:
+        return _refused("foreign-write", _foreign_why(foreign))
+    for key, e in m["files"].items():
+        if e["sha256"] is not None and sha256_file(snap / e["name"]) != e["sha256"]:
+            return _refused("snapshot-damaged", f"{snap / e['name']} does not match its manifest hash.")
+    # every check passed: the first writes. The undo copy comes BEFORE the first write-capable open.
+    rec_path = occ_dir / ROLLBACK_RECORD
+    prev_started = m.get("revert_started_at")
+    _take_undo_copy(db, occ_dir, m)
+    rw = {"wrap_id": m["wrap_id"], "called_at": _now(), "reason": f"levain dream rollback {occ_dir.name}",
+          "actor": f"levain-dream:{who}", "allow_missing": bool(allow_missing), "leased": bool(lease_token)}
+    _write_json(rec_path, {**rec0, "revert_wrap": rw})
+
+    def back_to_s0() -> None:
+        """Nothing reached anneal's db: leave the occurrence exactly as this attempt found it."""
+        m["revert_started_at"] = prev_started
+        _write_manifest(occ_dir, m)
+        shutil.rmtree(occ_dir / UNDO_DIR, ignore_errors=True)
+        if rec0:
+            _write_json(rec_path, rec0)
+        else:
+            with contextlib.suppress(OSError):
+                rec_path.unlink()
+
+    try:
+        store = _open_for_revert(db)
+    except RevertStoreUnavailable as exc:
+        back_to_s0()
+        return _refused("revert-store", f"this anneal-memory has revert_wrap but the store would not open ({exc}). "
+                                        "Remedy: free the store (close what holds it) and rerun.")
+    with contextlib.closing(store):
+        try:
+            receipt = store.revert_wrap(m["wrap_id"], reason=rw["reason"], actor=rw["actor"],
+                                        lease_token=lease_token, allow_missing=bool(allow_missing))
+        except Exception as exc:  # noqa: BLE001 — anneal's refusals are named below; anything else is re-raised
+            code = _refusal_code(exc)
+            if code is None:
+                raise      # a crash: the record keeps called_at, so the rerun is S1
+            back_to_s0()
+            detail, remedy = _gen3_refusal_text(exc, code)
+            return _refused(code, f"anneal refused the revert ({detail}). Remedy: {remedy}" if remedy
+                            else f"anneal refused the revert ({detail}).")
+    return _gen3_receipt(db, occ_dir, who, file_card, m, rw, receipt, base=live, pre=pre, post=post, later=[],
+                         fresh=True, allow_foreign=False)
+
+
+def _allowed(pre: Mapping[str, Any], post: Any, later: list[Mapping[str, Any]]) -> dict[str, set[Any]]:
+    """Per file, the hashes that are the dream's own or a recorded later dream's (never a stranger's)."""
+    return {k: {pre[k], (post or {}).get(k), *(p.get(k) for p in later)} for k in pre}
+
+
+def _later_only(later: list[Mapping[str, Any]], keys: Any) -> dict[str, set[Any]]:
+    """Per file, the hashes a later dream saved (text this rollback did not write, whoever's it now is)."""
+    return {k: {p.get(k) for p in later} for k in keys}
+
+
+def _gen3_s1(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+             m: dict[str, Any], pre: dict[str, Any], post: Any, live: dict[str, str | None], rec0: dict[str, Any],
+             rw0: dict[str, Any], allow_missing: bool, lease_token: str | None,
+             allow_foreign: bool) -> RollbackResult:
+    wrap_id = m.get("wrap_id")
+    started = (f"A revert of wrap {wrap_id} was started at {rw0.get('called_at')} and anneal may have committed it")
+    later = _later_posts(occ_dir, m)
+    allowed = _allowed(pre, post, later)
+    foreign = [k for k in live if live[k] not in allowed[k]]
+    if foreign and not allow_foreign:
+        return RollbackResult(
+            "refused", f"REFUSED (foreign-write-after-revert): {started}, and the live {', '.join(sorted(foreign))} "
+            "has changed since: it is neither this dream's text, nor what it replaced, nor a later dream's. Nothing was "
+            f"overwritten. Remedy: inspect the file; to let anneal re-project the identity over it, rerun with "
+            f"--allow-foreign. {_revert_state_hint(db, wrap_id)}", code="foreign-write-after-revert")
+    bad = _gen3_format_wrap_problem(db, m, started=True)
+    if bad:
+        return bad
+    try:
+        store = _open_for_revert(db)
+    except RevertStoreUnavailable as exc:
+        return RollbackResult(
+            "refused", f"REFUSED (revert-store): {started}; this run could not open the store ({exc}) and changed "
+            f"nothing. Remedy: free the store (close what holds it) and rerun. {_revert_state_hint(db, wrap_id)}",
+            code="revert-store")
+    with contextlib.closing(store):
+        try:
+            receipt = store.revert_wrap(m["wrap_id"], reason=str(rw0.get("reason") or f"levain dream rollback {occ_dir.name}"),
+                                        actor=str(rw0.get("actor") or f"levain-dream:{who}"), lease_token=lease_token,
+                                        allow_missing=bool(allow_missing))
+        except Exception as exc:  # noqa: BLE001
+            code = _refusal_code(exc)
+            if code is None:
+                raise
+            detail, remedy = _gen3_refusal_text(exc, code)
+            if code == "not_latest":
+                # a real block, found by asking anneal first: a later wrap exists and this one was never reverted
+                why = _later_blocker(occ_dir, m) or "a later wrap exists in the store"
+                return RollbackResult("refused", f"REFUSED (later-dream): {why}. {started}; anneal says the wrap is not "
+                                      f"the newest and was not reverted ({detail}). The marks are kept.",
+                                      code="later-dream")
+            return RollbackResult(
+                "refused", f"REFUSED ({code}): anneal refused the revert on the rerun ({detail}). {started}, so it "
+                f"may already have committed; the marks are kept. {('Remedy: ' + remedy + ' ') if remedy else ''}"
+                f"{_revert_state_hint(db, wrap_id)}", code=code)
+    rw = {**rw0, "reconciled_at": _now(), "allow_missing": bool(allow_missing), "leased": bool(lease_token)}
+    return _gen3_receipt(db, occ_dir, who, file_card, m, rw, receipt, base=post or live, pre=pre, post=post,
+                         later=later, fresh=False, allow_foreign=allow_foreign)
+
+
+def _gen3_s2(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+             m: dict[str, Any], pre: dict[str, Any], post: Any, live: dict[str, str | None], rw0: dict[str, Any],
+             allow_foreign: bool) -> RollbackResult:
+    """The receipt is recorded: anneal is never asked again, the rest of the rollback finishes."""
+    return _gen3_after_receipt(db, occ_dir, who, file_card, m, rw0, base=post or live, pre=pre, post=post,
+                               later=_later_posts(occ_dir, m), fresh=False, allow_foreign=allow_foreign)
+
+
+def _gen3_receipt(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+                  m: dict[str, Any], rw: dict[str, Any], receipt: Any, *, base: Mapping[str, Any],
+                  pre: Mapping[str, Any], post: Any, later: list[Mapping[str, Any]], fresh: bool,
+                  allow_foreign: bool) -> RollbackResult:
+    """Record anneal's answer durably (the FIRST receipt: S1 has none), then finish."""
+    rw["receipt"], rw["reverted_at"] = _receipt_dict(receipt), _now()
+    rec_path = occ_dir / ROLLBACK_RECORD
+    _write_json(rec_path, {**(_read_json(rec_path) or {}), "revert_wrap": rw})
+    return _gen3_after_receipt(db, occ_dir, who, file_card, m, rw, base=base, pre=pre, post=post, later=later,
+                               fresh=fresh, allow_foreign=allow_foreign)
+
+
+def _gen3_after_receipt(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
+                        m: dict[str, Any], rw: dict[str, Any], *, base: Mapping[str, Any], pre: Mapping[str, Any],
+                        post: Any, later: list[Mapping[str, Any]], fresh: bool,
+                        allow_foreign: bool) -> RollbackResult:
+    rec = rw["receipt"]
+    reoffer = _reoffer_text(rec)
+    after = tier_hashes(db)
+    if rec.get("identity_version") is not None:
+        # anneal restored the identity itself (appended a version and re-projected the files): Levain writes no text.
+        # `restored` is what changed from where this run started (S0: the live text; S1/S2: the dream's post text),
+        # leaving out a file that now holds a later dream's text (this rollback did not write that).
+        by_later = _later_only(later, after)
+        restored = [text_tier(db)[k].name for k in after if after[k] != base.get(k) and after[k] not in by_later[k]]
+        extra = ""
+        if any(after[k] != e["sha256"] for k, e in m["files"].items() if after[k] not in by_later[k]):
+            extra = (" NOTE: the text files after anneal's revert are not byte-identical to the snapshot "
+                     "(anneal projects them from its identity); the snapshot copy is in " + str(occ_dir / SNAP_DIR) + ".")
+        return _finish(occ_dir, m, who, restored, file_card, finished=not fresh, limit=reoffer + extra, revert=rw,
+                       how="anneal restored the identity itself")
+    # anneal restored no identity: the text step is Levain's, and it never overwrites a stranger's file
+    snap = occ_dir / SNAP_DIR
+    for key, e in m["files"].items():
+        if e["sha256"] is not None and sha256_file(snap / e["name"]) != e["sha256"]:
+            return RollbackResult("refused", f"REFUSED (snapshot-damaged): {snap / e['name']} does not match its "
+                                  "manifest hash. anneal's revert is recorded; the text step is still owed. "
+                                  "The marks are kept.", code="snapshot-damaged")
+    allowed = _allowed(pre, post, later)
+    foreign = [k for k in after if after[k] not in allowed[k]]
+    if foreign and not allow_foreign:
+        return RollbackResult(
+            "refused", f"REFUSED (foreign-write-after-revert): anneal's revert is recorded and restored no identity, so "
+            f"the text step is Levain's; the live {', '.join(sorted(foreign))} has changed since the dream. Nothing was "
+            "overwritten. Remedy: inspect the file; to restore it from the snapshot anyway, rerun with --allow-foreign.",
+            code="foreign-write-after-revert")
+    return _restore_text(db, occ_dir, who, file_card, m, after, finished=not fresh, limit=reoffer, revert=rw)
 
 
 def _restore_text(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
@@ -621,73 +880,18 @@ def _receipt_dict(r: Any) -> dict[str, Any]:
     return {n: getattr(r, n, None) for n in names}
 
 
-def _revert_through_anneal(db: Path, occ_dir: Path, who: str, file_card: Callable[[dict[str, Any]], Any] | None,
-                           m: dict[str, Any], live: dict[str, str | None], rec0: dict[str, Any], rstore: Any,
-                           fresh: bool, allow_missing: bool, lease_token: str | None) -> RollbackResult:
-    """Undo the wrap through anneal's ``revert_wrap``. Progress is in rollback.json (``revert_wrap.called_at`` before
-    the call, ``.receipt`` after) beside the manifest's ``revert_started_at``; a rerun after a crash calls again and
-    anneal answers ``already_reverted``, after which any text step still owed runs."""
-    rec_path = occ_dir / ROLLBACK_RECORD
-    prior = dict(rec0.get("revert_wrap") or {})
-    rw = {**prior, "wrap_id": m["wrap_id"], "called_at": _now(),
-          "reason": f"levain dream rollback {occ_dir.name}", "actor": f"levain-dream:{who}",
-          "allow_missing": bool(allow_missing), "leased": bool(lease_token)}
-    _write_json(rec_path, {**rec0, "revert_wrap": rw})
-    try:
-        receipt = rstore.revert_wrap(m["wrap_id"], reason=rw["reason"], actor=rw["actor"], lease_token=lease_token,
-                                     allow_missing=bool(allow_missing))
-    except BaseException as exc:
-        code = _refusal_code(exc)
-        if code is None:
-            raise
-        if fresh:
-            # nothing changed: the attempt leaves no mark, so it does not block an older dream's rollback either
-            m["revert_started_at"] = None
-            _write_manifest(occ_dir, m)
-            shutil.rmtree(occ_dir / UNDO_DIR, ignore_errors=True)
-            if rec0:
-                _write_json(rec_path, rec0)
-            else:
-                with contextlib.suppress(OSError):
-                    rec_path.unlink()
-        remedy = REVERT_REMEDY.get(code, "") if code != "lease_fenced" else (
-            "the dream's consolidation lease is live and the token given does not match; pass the right "
-            "--lease-token or wait for the lease to lapse.")
-        detail = str(getattr(exc, "detail", "") or exc)
-        return _refused(code, f"anneal refused the revert ({detail.rstrip('.')}). Remedy: {remedy}" if remedy
-                        else f"anneal refused the revert ({detail.rstrip('.')}).")
-    got = _receipt_dict(receipt)
-    if rw.get("receipt"):
-        # a rerun's already_reverted answer never replaces the first receipt (it holds the real episodes_reoffered)
-        rw["receipt_rerun"] = got
-    else:
-        rw["receipt"], rw["reverted_at"] = got, _now()
-    rec = rw["receipt"]
-    _write_json(rec_path, {**(_read_json(rec_path) or {}), "revert_wrap": rw})
-    reoffer = _reoffer_text(rec)
-    if rec["identity_version"] is not None:
-        # anneal restored the identity itself (appended a version and re-projected the files): Levain writes no text
-        after = tier_hashes(db)
-        restored = [text_tier(db)[k].name for k in after if after[k] != live[k]]
-        extra = ""
-        if any(after[k] != e["sha256"] for k, e in m["files"].items()):
-            extra = (" NOTE: the text files after anneal's revert are not byte-identical to the snapshot "
-                     "(anneal projects them from its identity); the snapshot copy is in " + str(occ_dir / SNAP_DIR) + ".")
-        return _finish(occ_dir, m, who, restored, file_card, finished=not fresh, limit=reoffer + extra, revert=rw,
-                       how="anneal restored the identity itself")
-    fresh_live = tier_hashes(db)
-    return _restore_text(db, occ_dir, who, file_card, m, fresh_live, finished=not fresh, limit=reoffer, revert=rw)
-
-
 def _reoffer_text(rec: Mapping[str, Any] | None) -> str:
     if not rec:
         return LIMIT
     if rec.get("already_reverted"):
         return "anneal had already reverted this wrap; nothing was reopened by this call."
-    return f"the day's {rec.get('episodes_reoffered')} episodes will be offered to the next dream."
+    n = rec.get("episodes_reoffered")
+    if n is None:
+        return "an unknown number of the day's episodes will be offered to the next dream."
+    return f"the day's {n} episodes will be offered to the next dream."
 
 
-def _refusal_code(exc: BaseException) -> str | None:
+def _refusal_code(exc: Exception) -> str | None:
     """anneal's refusal code when ``exc`` is a revert refusal or a lease fence (by name and ``code``, so no anneal
     import is needed at module scope), else None."""
     names = {c.__name__ for c in type(exc).__mro__}

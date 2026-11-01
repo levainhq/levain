@@ -62,6 +62,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     help="revert_wrap: revert even though some of the day's episodes no longer exist.")
     rb.add_argument("--lease-token", default=None,
                     help="revert_wrap: the dream's consolidation lease token, when that lease is live and you hold it.")
+    rb.add_argument("--allow-foreign", action="store_true",
+                    help="revert_wrap: for a rerun of a revert that was started, when the live text changed since: let "
+                         "anneal re-project the identity over it (the live text is overwritten).")
     rb.add_argument("--json", action="store_true")
     rb.set_defaults(func=run_dream_rollback)
     rc = sub.add_parser("recover", allow_abbrev=False, help="Settle the store side of a dream that did not end cleanly.",
@@ -234,7 +237,8 @@ def run_dream_rollback(args: argparse.Namespace) -> int:
     if got is None:
         return 2
     res = snap.rollback(got[0], got[1], who=args.who, allow_missing=bool(getattr(args, "allow_missing", False)),
-                        lease_token=getattr(args, "lease_token", None) or None)
+                        lease_token=getattr(args, "lease_token", None) or None,
+                        allow_foreign=bool(getattr(args, "allow_foreign", False)))
     if args.json:
         print(json.dumps({"outcome": res.outcome, "code": res.code, "message": res.message, "restored": res.restored,
                           "card": res.card}, sort_keys=True))
