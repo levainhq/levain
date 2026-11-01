@@ -228,7 +228,7 @@
     return n;
   }
   // ---- links (Phill 11-01: the report and consent links on the attest card were plain text to copy). Same rules as the
-  // iOS app (flowConnect Shared/NPCard.swift linkRuns): http and https only, the URL starts at an "http(s)://" not inside
+  // iOS app (NPCard.swift linkRuns): http and https only, the URL starts at an "http(s)://" not inside
   // a longer word and ends at whitespace, <, > or ", trailing sentence punctuation is not part of it, a closing bracket
   // only when the URL has more closers than openers, and a URL needs a host. The runs concatenate to the input, so no word
   // changes. Drawn as DOM anchors, never HTML.
