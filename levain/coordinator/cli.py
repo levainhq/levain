@@ -34,6 +34,7 @@ from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import envelope as env
+from levain.coordinator.door import door_ok, not_door
 from levain.coordinator.envelopes import EnvelopeStore
 from levain.coordinator.store import (KINDS, STATES, WORDS_MAX, CoordError, Drop, Part, Source, Thread, check_source,
                                       check_words, words_sha256)
@@ -1987,6 +1988,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ls.add_argument("--limit", type=int, default=50)
     common(ls)
     ls.set_defaults(func=run_drop_list)
+    door_ok(sp, nt, sh, ls)      # all four of the drops tree are the coordinator's
 
     t = subparsers.add_parser("thread", help="The threads your drops became.")
     t_sub = t.add_subparsers(dest="thread_cmd", required=True)
@@ -2040,6 +2042,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     common(tf)
     for p in (tl, ts, tst, tm, td, ta, tf):
         p.set_defaults(func=run_thread)
+    door_ok(tl, ts, tst, tm, td, ta, tf)      # every thread verb is the coordinator's (a write goes --by coordinator)
 
     ch_sub = _chat_subparsers(subparsers)
     chs = ch_sub.add_parser(
@@ -2221,6 +2224,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     rds.add_argument("--all", action="store_true", help="Every column, not only ready.")
     rds.add_argument("--repo", default=None, help="Only this repo.")
     ready_leaves.append(rds)
+    door_ok(rds)
     for verb, what in (("add", "A new item (backlog unless --to says)."), ("move", "Move an item to --to."),
                        ("correct", "Correct a wrong state: a new record, never an edit of an old one.")):
         rdw = rd_sub.add_parser(verb, help=what)
@@ -2247,6 +2251,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         if verb == "add":
             rdw.add_argument("--repo", required=True, help="The item's repo (fixed at add).")
         ready_leaves.append(rdw)
+        door_ok(rdw)      # add, move and correct are the coordinator's write: refused without the live lease token
     chn = c_sub.add_parser("handoff", help="Read the handoffs coordinators left.")
     chn_sub = chn.add_subparsers(dest="handoff_cmd", required=True)
     chs = chn_sub.add_parser("show", help="The latest handoff, or the one named.",
@@ -2297,6 +2302,10 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw):
         common(p)
         p.set_defaults(func=run_coord)
+    # the coordinator's own verbs (its brief names these); the operator's verbs are declared beside them, never left out
+    door_ok(cs, cr, cb, cc, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw)
+    not_door(ct, cw, ca, cl, cwa)
+    not_door(rvl, rvc, rvo, rvf)
 
     e = subparsers.add_parser(
         "envelope", help="Thread envelopes: what the coordinator may do for a thread, signed by you.",

@@ -136,7 +136,7 @@ def test_a_record_inside_a_workspace_or_under_a_file_shuts_the_door_for_every_co
     q.mkdir(mode=0o700)
     for here in (ws, tmp_path):
         monkeypatch.chdir(here)
-        assert main(["thread", "list", "--queue-dir", str(q)]) == 1     # a DOOR verb too
+        assert main(["thread", "list", "--queue-dir", str(q)]) == 1     # a door verb too
         err = capsys.readouterr().err
         assert "lies inside a coordinator's workspace" in err and "point LEVAIN_HOME outside it" in err, err
         assert "repair or delete" not in err, err

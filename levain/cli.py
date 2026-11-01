@@ -53,7 +53,9 @@ def _positive_seconds(text: str) -> float:
     return value
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The root parser of the whole CLI, every tree registered (``main`` parses with it; the coordinator door derives
+    its list from it)."""
     parser = argparse.ArgumentParser(
         prog="levain",
         description=(
@@ -1562,7 +1564,11 @@ def main(argv: list[str] | None = None) -> int:
     from levain.upgrade import register as _register_upgrade
 
     _register_upgrade(subparsers)
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     from levain.launch import api_key_lifted
 

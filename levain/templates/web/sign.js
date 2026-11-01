@@ -234,8 +234,30 @@
     box.id = "sheet-card";
     box.dataset.card = "head";
     box.querySelector(".card-headline").id = "sheet-headline";
-    box.querySelector(".card-signed").id = "sheet-signed";
+    // the signed text is verification detail, not the reading: it leaves the head box and stands after the body (below the open-until
+    // line), collapsed, and holds the signer line and the option lines too, one disclosure for what exactly gets signed
+    const raw = box.querySelector(".card-signed");
+    raw.id = "sheet-signed";
+    raw.dataset.card = "signed";
+    const rawSummary = raw.querySelector("summary");
+    if (rawSummary) rawSummary.textContent = "What exactly gets signed";
+    raw.remove();
     body.appendChild(box);
+    body.after(raw);
+  }
+  // where the signing detail (May sign, the option lines) goes: inside the card's signed disclosure, else the body
+  function signingHome() { return (cardView && $("sheet-signed")) || $("sheet-body"); }
+  // Detail stands where it is read, in the DOM and not only by CSS `order`, so keyboard and screen-reader order follow the page:
+  // from 800px it is the reading column's (before the signing detail and the deciding column, #sheet-decide); below 800px it follows the answers
+  // (the group is display: contents there, so Detail sits between the answers and the status line, as it always did)
+  function placeDetail(det) {
+    const wide = window.matchMedia && window.matchMedia("(min-width: 800px)").matches;
+    const decide = $("sheet-decide"), acts = $("sheet-actions");
+    const signed = $("sheet-signed");
+    if (wide && signed) signed.before(det);          // the grid reads Detail, then the signing detail, down the reading column
+    else if (wide && decide) decide.before(det);
+    else if (acts && acts.parentNode) acts.after(det);
+    else $("sheet").appendChild(det);
   }
   function drawCardDetail(card, options) {
     const stale = $("sheet-detail");
@@ -243,9 +265,13 @@
     const det = window.LevainCardFormat.drawDetail(card, options);
     det.id = "sheet-detail";
     det.dataset.card = "detail";
-    const sheet = $("sheet"), note = $("sheet-note");
-    if (note && note.parentNode === sheet) sheet.insertBefore(det, note);
-    else sheet.appendChild(det);
+    placeDetail(det);
+    if (!placeDetail.watching && window.matchMedia) {
+      placeDetail.watching = true;
+      const mq = window.matchMedia("(min-width: 800px)");
+      const again = () => { const d = $("sheet-detail"); if (d) placeDetail(d); };
+      if (mq.addEventListener) mq.addEventListener("change", again); else if (mq.addListener) mq.addListener(again);
+    }
   }
 
   function draw(got) {
@@ -286,7 +312,12 @@
     else body.appendChild(msg);
     // a dispatch job is shown whole (every path, every change): its box scrolls, it is never cut to fit
     if (dispatch) { msg.id = "sheet-contract"; msg.tabIndex = 0; Object.assign(msg.style, { maxHeight: "50vh", overflow: "auto" }); }
-    if (r.expires_at) body.appendChild(el("p", "ext-meta", "Open until " + r.expires_at));
+    if (r.expires_at) {
+      const when = window.LevainCardFormat && typeof window.LevainCardFormat.openUntil === "function" ? window.LevainCardFormat.openUntil(r.expires_at) : { text: "Open until " + r.expires_at, title: "" };
+      const p = el("p", "ext-meta", when.text);
+      if (when.title) p.title = when.title;
+      body.appendChild(p);
+    }
     // what the server says about this request beside its options (a consent allow only the laptop key signs)
     if (typeof r.note === "string" && r.note && signersOf(r).length) {
       const n = el("p", "ext-meta", r.note);
@@ -308,7 +339,7 @@
     who.id = "sheet-signers";
     who.textContent += signers.map((fp) => fp.slice(0, 18) + "…"
       + (held[fp] && typeof held[fp].provider === "string" && held[fp].provider ? " (" + held[fp].provider + ")" : "")).join(", ");
-    body.appendChild(who);
+    signingHome().appendChild(who);
     $("sheet").dataset.state = "open";
     offer(r, rp, signers, held);
   }
@@ -500,7 +531,7 @@
       const lines = el("div", "ext-meta", dispatch ? "Each act signs the payload the cockpit builds for it (shown above the tap):"
         : "Each option signs the message with its line appended:");
       for (const o of options) if (o && typeof o.line === "string") lines.appendChild(el("div", "sheet-line", o.line));
-      $("sheet-body").appendChild(lines);
+      signingHome().appendChild(lines);
     }
   }
 

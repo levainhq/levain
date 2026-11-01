@@ -227,13 +227,93 @@
     if (text !== undefined) n.textContent = text;
     return n;
   }
+  // ---- links (Phill 11-01: the report and consent links on the attest card were plain text to copy). Same rules as the
+  // iOS app (flowConnect Shared/NPCard.swift linkRuns): http and https only, the URL starts at an "http(s)://" not inside
+  // a longer word and ends at whitespace, <, > or ", trailing sentence punctuation is not part of it, a closing bracket
+  // only when the URL has more closers than openers, and a URL needs a host. The runs concatenate to the input, so no word
+  // changes. Drawn as DOM anchors, never HTML.
+  const URL_TRAIL = ".,;:!?*`'\u2019\u201D";
+  const CLOSERS = { ")": "(", "]": "[", "}": "{" };
+  // scanned on the original string with a case-insensitive pattern, never on a lower-cased copy (case folding changes a
+  // string's length for some letters, and the indices would drift); the character before the scheme is read as a whole code
+  // point, so an astral letter counts as a letter
+  function nextUrlStart(s, from) {
+    const re = /https?:\/\//gi;
+    re.lastIndex = from;
+    for (let m = re.exec(s); m; m = re.exec(s)) {
+      const before = m.index > 0 ? Array.from(s.slice(Math.max(0, m.index - 2), m.index)).pop() : "";
+      if (before && /[\p{L}\p{N}]/u.test(before)) { re.lastIndex = m.index + 1; continue; }
+      return { at: m.index, scheme: m[0].length };
+    }
+    return null;
+  }
+  function linkRuns(s) {
+    const text = String(s);
+    const out = [];
+    let plain = "", from = 0;
+    while (from < text.length) {
+      const m = nextUrlStart(text, from);
+      if (!m) { plain += text.slice(from); break; }
+      plain += text.slice(from, m.at);
+      let end = m.at;
+      while (end < text.length && !/[\s<>"]/.test(text[end])) end++;
+      const chars = Array.from(text.slice(m.at, end));
+      const count = {};
+      for (const c of chars) count[c] = (count[c] || 0) + 1;
+      let keep = chars.length;
+      while (keep > 0) {
+        const last = chars[keep - 1];
+        if (URL_TRAIL.indexOf(last) >= 0) { keep--; count[last]--; continue; }
+        if (CLOSERS[last] && (count[last] || 0) > (count[CLOSERS[last]] || 0)) { keep--; count[last]--; continue; }
+        break;
+      }
+      const url = chars.slice(0, keep).join("");
+      let ok = false;
+      // the host is the text between the scheme and the first / ? or #: an empty one ("https:///x") is words, not a link
+      const authority = url.slice(m.scheme).split(/[/?#]/)[0];
+      try { const u = new URL(url); ok = authority.length > 0 && (u.protocol === "http:" || u.protocol === "https:") && !!u.hostname; } catch (_) { ok = false; }
+      if (ok) {
+        if (plain) { out.push({ text: plain }); plain = ""; }
+        out.push({ link: url });
+        plain += chars.slice(keep).join("");
+      } else {
+        plain += text.slice(m.at, end);
+      }
+      from = end;
+    }
+    if (plain) out.push({ text: plain });
+    return out;
+  }
+  // an element holding `text` with its URLs as anchors: rel="noopener", the cockpit's own origin in the same tab, any other
+  // address in a new one
+  function rich(tag, cls, text) {
+    const n = node(tag, cls);
+    appendLinked(n, text);
+    return n;
+  }
+  function appendLinked(into, text) {
+    const here = root.location && root.location.origin;
+    for (const run of linkRuns(text)) {
+      if (run.link === undefined) { into.appendChild(root.document.createTextNode(run.text)); continue; }
+      const a = node("a", "card-link", run.link);
+      a.setAttribute("href", run.link);
+      let own = false;
+      try { own = !!here && new URL(run.link).origin === here; } catch (_) { own = false; }
+      a.setAttribute("rel", own ? "noopener" : "noopener noreferrer");
+      // a framed page (the cockpit shows the sign sheet in an iframe) must not navigate away from the sheet: new tab too
+      let framed = false;
+      try { framed = !!root.top && root.top !== root.self; } catch (_) { framed = true; }
+      if (!own || framed) a.setAttribute("target", "_blank");
+      into.appendChild(a);
+    }
+  }
   // meta (repo · item), the headline, and `msg` (the caller's node holding the message, exactly as signed) collapsed under
   // "Signed text, exactly as signed"
   function drawHead(card, msg) {
     const box = node("div", "card-head");
     const meta = [card.repo, card.item].filter((x) => x).join(" · ");
     if (meta) box.appendChild(node("p", "card-meta", meta));
-    box.appendChild(node("h2", "card-headline", headline(card.asked).head));
+    box.appendChild(rich("h2", "card-headline", headline(card.asked).head));
     const raw = node("details", "card-signed");
     if (card.loose) raw.open = true;     // a message the strict grammar refused: the exact signed text stays in view
     raw.appendChild(node("summary", "", "Signed text, exactly as signed"));
@@ -250,7 +330,7 @@
   }
   function list(items) {
     const ul = node("ul", "card-list");
-    for (const i of items) ul.appendChild(node("li", "", i));
+    for (const i of items) ul.appendChild(rich("li", "", i));
     return ul;
   }
   function drawSections(into, secs) {
@@ -261,10 +341,10 @@
         if (b.kind === "paragraph") {
           if (!b.text) continue;
           const dots = dotItems(b.text);
-          sec.appendChild(dots ? list(dots) : node("p", "card-p", b.text));
+          sec.appendChild(dots ? list(dots) : rich("p", "card-p", b.text));
           continue;
         }
-        if (b.lead) sec.appendChild(node("p", "card-p", b.lead));
+        if (b.lead) sec.appendChild(rich("p", "card-p", b.lead));
         sec.appendChild(list(b.items));
       }
       into.appendChild(sec);
@@ -279,10 +359,10 @@
       const li = node("li", "card-opt" + (o.key === rec ? " card-opt-rec" : ""));
       const row = node("div", "card-opt-row");
       row.appendChild(node("span", "card-opt-key", "(" + o.key + ")"));
-      row.appendChild(node("span", "card-opt-text", o.text));
+      row.appendChild(rich("span", "card-opt-text", o.text));
       if (o.key === rec) row.appendChild(node("span", "card-rec-mark", "Rec"));
       li.appendChild(row);
-      if (o.key === rec && why) li.appendChild(node("p", "card-opt-why", why));
+      if (o.key === rec && why) li.appendChild(rich("p", "card-opt-why", why));
       ul.appendChild(li);
     }
     sec.appendChild(ul);
@@ -333,6 +413,39 @@
     return det;
   }
 
+  // The "Open until" line of a request, human and local: `Open until 9:21 AM today`, `Open until tomorrow, 9:21 AM`,
+  // `Open until Wed 4 Nov, 9:21 AM` (within the week), else `Open until 4 Nov 2027, 9:21 AM`, in the viewer's time zone and
+  // the page's locale; `title` keeps the exact stamp. A value that does not parse as a date is shown as it came (never
+  // "Invalid Date", never a throw). `opts` is for tests: { now: Date, locale, timeZone }.
+  function openUntil(stamp, opts) {
+    const raw = String(stamp === undefined || stamp === null ? "" : stamp);
+    const same = { text: "Open until " + raw, title: "" };
+    try {
+      const o = opts || {};
+      const d = new Date(raw);
+      if (!raw.trim() || isNaN(d.getTime())) return same;
+      const now = o.now instanceof Date ? o.now : new Date();
+      const tz = o.timeZone ? { timeZone: o.timeZone } : {};
+      const part = (date, f) => {
+        const out = {};
+        for (const p of new Intl.DateTimeFormat(o.locale, Object.assign({}, f, tz)).formatToParts(date)) out[p.type] = p.value;
+        return out;
+      };
+      const day = (date) => { const p = part(date, { year: "numeric", month: "numeric", day: "numeric" }); return Date.UTC(+p.year, +p.month - 1, +p.day) / 86400000; };
+      const time = new Intl.DateTimeFormat(o.locale, Object.assign({ hour: "numeric", minute: "2-digit" }, tz)).format(d).replace(/[\u202f\u00a0]/g, " ");
+      const diff = Math.round(day(d) - day(now));
+      const w = part(d, { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+      let text;
+      if (diff === 0) text = time + " today";
+      else if (diff === 1) text = "tomorrow, " + time;
+      else if (diff >= 2 && diff <= 6) text = w.weekday + " " + w.day + " " + w.month + ", " + time;
+      else text = w.day + " " + w.month + " " + w.year + ", " + time;
+      return { text: "Open until " + text, title: raw };
+    } catch (e) {
+      return same;
+    }
+  }
+
   // Free-text fields (the Drop box, the question and coordinator boxes, the phone's words and state line) grow with what is
   // typed. CSS `field-sizing: content` does it where the browser has it; this is the fallback that works on iOS Safari
   // today: one delegated listener, height from scrollHeight on input. Safe to call from every surface (once per page).
@@ -350,7 +463,7 @@
     doc.addEventListener("input", (ev) => grow(ev.target));
   }
 
-  const api = { installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, drawHead, drawDetail, drawBody };
+  const api = { linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);

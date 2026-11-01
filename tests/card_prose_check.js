@@ -5,14 +5,15 @@
 const fs = require("fs");
 const path = require("path");
 class N {
-  constructor(tag) { this.tag = tag; this.children = []; this.className = ""; this._t = ""; this.open = false; }
+  constructor(tag) { this.tag = tag; this.children = []; this.className = ""; this._t = ""; this.open = false; this.attrs = {}; }
+  setAttribute(k, v) { this.attrs[k] = v; }
   set textContent(v) { this._t = String(v); this.children = []; }
   get textContent() { return this._t + this.children.map((c) => c.textContent).join(""); }
   appendChild(c) { this.children.push(c); return c; }
   all(tag) { return this.children.flatMap((c) => (c.tag === tag ? [c] : []).concat(c.all(tag))); }
   cls(name) { return this.children.flatMap((c) => (c.className.split(" ").includes(name) ? [c] : []).concat(c.cls(name))); }
 }
-global.window = { document: { createElement: (t) => new N(t) } };
+global.window = { document: { createElement: (t) => new N(t), createTextNode: (t) => { const n = new N("#text"); n._t = String(t); return n; } } };
 const C = require(path.join(__dirname, "..", "levain", "templates", "web", "card_format.js"));
 const cases = JSON.parse(fs.readFileSync(path.join(__dirname, "card_prose_cases.json"), "utf8"));
 let failures = 0;

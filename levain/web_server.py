@@ -1158,7 +1158,7 @@ _POLICY_LOCK_WAIT_SECS = 3.0              # how long an HTTP policy write waits 
 _POLICY_SET = "/webpush/policy/set"
 _POLICY_RESET = "/webpush/policy/reset"
 _PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH})
-_PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test",
+_PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
                         _POLICY_SET, _POLICY_RESET})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
 # A device's receipt for a push it got: the one webpush POST that takes no token (the worker holds none). Its report names
