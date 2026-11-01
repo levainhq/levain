@@ -922,6 +922,30 @@ def test_a_thread_whose_drops_exceed_the_cap_refuses_the_spawn(store, fake, live
     assert not (wdir / ".levain" / "briefs" / f"{ln.launch_id}.drops.md").exists()
 
 
+def test_a_huge_thread_is_refused_before_its_whole_drops_file_is_built():
+    from types import SimpleNamespace
+
+    def drop(i):
+        return SimpleNamespace(drop_id=f"d{i:04d}", received_at="2026-10-31T00:00:00Z", words="é" * 1000)
+
+    whole = inst.drops_file_text("t1", [drop(i) for i in range(3)])
+    assert inst.drops_file_text("t1", [drop(i) for i in range(3)], len(whole.encode("utf-8"))) == whole  # at the cap
+    with pytest.raises(inst.SpawnRefused):
+        inst.drops_file_text("t1", [drop(i) for i in range(3)], len(whole.encode("utf-8")) - 1)
+    read = []
+
+    def endless():                   # a thread that never ends: anything read past the crossing drop is a failure
+        for i in range(10**9):
+            assert len(read) < 6, "a drop was read past the one that crossed the cap"
+            read.append(i)
+            yield drop(i)
+
+    with pytest.raises(inst.SpawnRefused) as got:
+        inst.drops_file_text("t1", endless(), 5000)          # each line is ~2 KiB of UTF-8: the third crosses
+    assert not got.value.transient and "5000 bytes" in str(got.value) and "d0002" in str(got.value), got.value
+    assert read == [0, 1, 2]
+
+
 @pytest.mark.parametrize("where", ["drop", "thread"])
 def test_a_coord_error_building_the_context_is_permanent(store, fake, live_hook, wdir, spawn, where):  # noqa: F811
     # an unknown id or a malformed thread is no read that failed just now: retrying cannot help, so the launch is
