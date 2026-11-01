@@ -150,6 +150,9 @@ const LINKS = [
   ["xhttps://x.example/no and 9http://x.example/no", "xhttps://x.example/no and 9http://x.example/no"],
   ["https:///nohost and https:// and http", "https:///nohost and https:// and http"],
   ["no links here", "no links here"],
+  ["\u0130 Read https://x.example/report", "\u0130 Read |<https://x.example/report>"],              // İ lower-cases to two code units: no index drift
+  ["\u{1D431}https://x.example/no", "\u{1D431}https://x.example/no"],                              // an astral letter before the scheme is a letter
+  ["\u0130\u0130 a https://x.example/a and https://x.example/b", "\u0130\u0130 a |<https://x.example/a>| and |<https://x.example/b>"],
 ];
 for (const [src, want] of LINKS) {
   check(runs(src) === want, "links: " + JSON.stringify(src) + " -> " + runs(src));
@@ -185,6 +188,11 @@ const foreign = da.find((x) => x.attrs.href.startsWith("https://other.example"))
 check(foreign && foreign.attrs.href === "https://other.example/s?x=1&y=2" && foreign.attrs.target === "_blank" && foreign.attrs.rel === "noopener noreferrer",
   "dom: another origin opens in a new tab, rel=noopener noreferrer, the trailing period left to the sentence");
 check(det.textContent.includes("Sign it: https://other.example/s?x=1&y=2."), "dom: the card's text is unchanged by the links");
+const framedSb = { URL, window: { document: doc, location: { origin: "https://box.example" } } };
+framedSb.window.self = framedSb.window; framedSb.window.top = {};     // a page inside the cockpit's iframe
+vm.runInNewContext(fs.readFileSync(path.join(__dirname, "..", "levain", "templates", "web", "card_format.js"), "utf8"), framedSb);
+const fa = anchors(framedSb.window.LevainCardFormat.drawHead(card, new El("pre")));
+check(fa.length === 1 && fa[0].attrs.target === "_blank", "dom: a framed page opens even its own origin's link in a new tab (the sheet is not replaced)");
 const hostile = CF.drawBody(new El("div"), "see https://x.example/<img src=x onerror=alert(1)> and https://x.example/ok", null, [], "");
 check(anchors(hostile).map((x) => x.attrs.href).join() === "https://x.example/,https://x.example/ok" && !JSON.stringify(hostile).includes("innerHTML"), "dom: markup in a card is text, a < ends the link");
 

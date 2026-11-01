@@ -234,13 +234,16 @@
   // changes. Drawn as DOM anchors, never HTML.
   const URL_TRAIL = ".,;:!?*`'\u2019\u201D";
   const CLOSERS = { ")": "(", "]": "[", "}": "{" };
+  // scanned on the original string with a case-insensitive pattern, never on a lower-cased copy (case folding changes a
+  // string's length for some letters, and the indices would drift); the character before the scheme is read as a whole code
+  // point, so an astral letter counts as a letter
   function nextUrlStart(s, from) {
-    const lower = s.toLowerCase();
-    for (let i = lower.indexOf("http", from); i >= 0; i = lower.indexOf("http", i + 1)) {
-      const scheme = lower.startsWith("https://", i) ? 8 : (lower.startsWith("http://", i) ? 7 : 0);
-      if (!scheme) continue;
-      if (i > 0 && /[\p{L}\p{N}]/u.test(s[i - 1])) continue;
-      return { at: i, scheme };
+    const re = /https?:\/\//gi;
+    re.lastIndex = from;
+    for (let m = re.exec(s); m; m = re.exec(s)) {
+      const before = m.index > 0 ? Array.from(s.slice(Math.max(0, m.index - 2), m.index)).pop() : "";
+      if (before && /[\p{L}\p{N}]/u.test(before)) { re.lastIndex = m.index + 1; continue; }
+      return { at: m.index, scheme: m[0].length };
     }
     return null;
   }
@@ -297,7 +300,10 @@
       let own = false;
       try { own = !!here && new URL(run.link).origin === here; } catch (_) { own = false; }
       a.setAttribute("rel", own ? "noopener" : "noopener noreferrer");
-      if (!own) a.setAttribute("target", "_blank");
+      // a framed page (the cockpit shows the sign sheet in an iframe) must not navigate away from the sheet: new tab too
+      let framed = false;
+      try { framed = !!root.top && root.top !== root.self; } catch (_) { framed = true; }
+      if (!own || framed) a.setAttribute("target", "_blank");
       into.appendChild(a);
     }
   }
