@@ -5546,6 +5546,7 @@
     for (const n of signSheetInerted) n.inert = false;
     signSheetInerted = [];
     dropPrefillClear();      // words handed to a drop sheet that never read them are not left for the next one
+    dropHandedReset();       // a handoff outlives its sheet never
     if (veil) veil.remove();
     if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
     if (signSheetLease) { signSheetLease = false; signBusy--; }
@@ -5574,8 +5575,8 @@
       // the sheet's line stays on it until it is closed; the board under it reads again, and the dispatch jobs with it
       dispatchStale();
       rereadBoard();
-      // the server accepted the drop the sheet filed: the words the box handed over go, unless they were edited since
-      if (ev.data.dropDelivered === true) dropHandedClear();
+      // the server accepted the drop the sheet filed: the box lets go of the words only if it holds exactly those words
+      if (ev.data.dropDelivered === true) dropHandedClear(ev.data.words);
       dropReload();      // a drop the sheet filed or could not confirm (either may have made the store): the drop card reads again, not from its cache
     }
   });
@@ -6690,14 +6691,31 @@
     if (got && typeof words === "string" && words) { try { window.sessionStorage.setItem(DROP_PREFILL_KEY, words); } catch (e) { /* the sheet opens empty */ } }
     return got;
   }
-  function dropHandedClear() {
+  function dropHandedReset() {
+    const host = document.getElementById("ck-drop");
+    if (host && host._drop) host._drop.handed = undefined;
+  }
+  // A drop the sheet filed was accepted. The handoff is spent whatever happens here (so no later delivery can match it), and the
+  // box lets go only when a handoff was outstanding and the box still holds exactly the words the server accepted; the request
+  // state moves on as it does after a plain Send, so a retry cannot send the cleared words again.
+  function dropHandedClear(delivered) {
     const host = document.getElementById("ck-drop");
     const ui = host && host._drop;
-    if (!ui || typeof ui.handed !== "string") return;
-    const box = ui.words;
-    if (box && box.value === ui.handed) { box.value = ""; box.style.height = ""; }
+    if (!ui) return;
+    const outstanding = typeof ui.handed === "string";
     ui.handed = undefined;
+    const box = ui.words;
+    if (!outstanding || !box || typeof delivered !== "string" || !delivered.trim() || box.value.trim() !== delivered.trim()) return;
+    if (ui.req && ui.req.words.trim() === delivered.trim()) {
+      dropForget(ui.req);
+      ui.req = null;
+      ui.fromKeep = false;
+    }
+    box.value = "";
+    box.style.height = "";
     dropPrefillClear();
+    if (typeof ui.resume === "function") ui.resume();
+    if (typeof ui.earlierLine === "function") ui.earlierLine();
   }
   function dropPrefillClear() { try { window.sessionStorage.removeItem(DROP_PREFILL_KEY); } catch (e) { /* nothing kept */ } }
   // ---- the coordinator drop: a card on the home page (Phill 10-30), drawn under the Needs-you row, outside #ck-hero. An inline
@@ -6899,7 +6917,7 @@
     words.id = "ck-drop-words";
     words.placeholder = "words for the coordinator";
     words.setAttribute("aria-label", "your words for the coordinator");
-    words.addEventListener("input", dropPrefillClear);      // words changed since a handoff: that handoff is stale
+    words.addEventListener("input", () => { dropPrefillClear(); ui.handed = undefined; });      // words changed since a handoff: that handoff is stale
     const acts = el("div", "needs-actions drop-actions");
     const send = el("button", "needs-btn needs-primary", "Send");
     send.type = "button";
@@ -6959,11 +6977,13 @@
       return true;
     };
     ui.earlierLine = earlierLine;
+    ui.resume = resume;
     const paint = (msg, bad) => { ui.receipt.textContent = msg; ui.receipt.classList.toggle("bad", !!bad); };
     const lock = (on) => { ui.working = on; send.disabled = env.disabled = words.disabled = on || !ui.can; };
     ui.paint = paint;
     ui.lock = lock;
-    env.addEventListener("click", () => { if (ui.can) { ui.handed = words.value; openDropSheet(words.value); } });
+    // (the handoff is marked after the sheet opens: opening closes any sheet first, and a close ends a handoff)
+    env.addEventListener("click", () => { if (ui.can) { const got = openDropSheet(words.value); if (got) ui.handed = words.value; } });
     send.addEventListener("click", () => {
       if (ui.working || !ui.can) return;
       if (ui.reading) { ui.reading.then(() => send.click()); return; }      // the read that names the store is still out

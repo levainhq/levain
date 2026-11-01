@@ -60,6 +60,57 @@ def _run(tmp_path: Path, monkeypatch, status: int, signed: bool) -> dict:
         return _tagged(drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps))
 
 
+OTHER = "words typed only in the sheet"
+OPEN_SHEET = [{"eval": "document.querySelector('#ck-drop [data-coord-drop=envelope]').click(); 1"},
+              {"until": _in(FD, "return !!d.getElementById('drop-review') && /ev-test/.test(d.getElementById('drop-review').textContent);"), "ms": 30000}]
+DELIVERED = [SIGN_ON, _click(FD, "#drop-sign"),
+             {"until": _in(FD, "return /delivered|Not sure|not delivered/.test(d.getElementById('sheet-note').textContent);"), "ms": 20000},
+             {"eval": "new Promise((r) => setTimeout(() => r(1), 800))"}]
+CLOSE_SHEET = [{"eval": _in(FD, "const c = d.getElementById('sheet-close'); if (c) c.click(); return 1;")},
+               {"eval": "new Promise((r) => setTimeout(() => r(1), 1500))"}]
+
+
+def _scene(tmp_path: Path, monkeypatch, middle: list) -> dict:
+    steps = [{"emulate": {"w": 430, "h": 932, "dpr": 3, "mobile": True}}, {"touch": True},
+             {"init": make_init() + ";" + SERVER.replace("__STATUS__", "200")}, {"until": NEEDS, "ms": 30000},
+             {"until": READY, "ms": 30000}, _type(WORDS), *middle, _state("end")]
+    rig = FullRig(tmp_path, monkeypatch)
+    with rig.serving():
+        return _tagged(drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps))
+
+
+def _sheet_words(text: str) -> dict:
+    return {"eval": _in(FD, f"const e = d.getElementById('drop-words'); e.value = {json.dumps(text)}; "
+                            "e.dispatchEvent(new Event('input', {bubbles: true})); return 1;")}
+
+
+@needs_browser
+@needs_ssh
+def test_words_edited_in_the_sheet_leave_the_box_holding_what_was_never_sent(tmp_path: Path, monkeypatch) -> None:
+    t = _scene(tmp_path, monkeypatch, [*OPEN_SHEET, _sheet_words(OTHER), *DELIVERED, *CLOSE_SHEET])
+    assert t["end"]["box"] == WORDS, t
+
+
+@needs_browser
+@needs_ssh
+def test_an_abandoned_handoff_does_not_let_a_later_delivery_wipe_the_box(tmp_path: Path, monkeypatch) -> None:
+    reopen = [{"eval": "window.LevainSignSheet.openDrop(''); 1"},
+              {"until": _in(FD, "return !!d.getElementById('drop-words');"), "ms": 30000},
+              _sheet_words(OTHER),
+              {"until": _in(FD, "return !!d.getElementById('drop-review') && /ev-test/.test(d.getElementById('drop-review').textContent);"), "ms": 30000}]
+    t = _scene(tmp_path, monkeypatch, [*OPEN_SHEET, *CLOSE_SHEET, *reopen, *DELIVERED, *CLOSE_SHEET])
+    assert t["end"]["box"] == WORDS, t
+
+
+@needs_browser
+@needs_ssh
+def test_a_delivered_message_from_anything_but_the_sheet_is_ignored(tmp_path: Path, monkeypatch) -> None:
+    forged = [{"eval": f"window.postMessage({{levainSheet: 'signed', dropDelivered: true, words: {json.dumps(WORDS)}}}, window.location.origin); "
+                       "new Promise((r) => setTimeout(() => r(1), 800))"}]
+    t = _scene(tmp_path, monkeypatch, [*OPEN_SHEET, *forged])
+    assert t["end"]["box"] == WORDS, t
+
+
 def _gone(t: dict) -> None:
     assert t["home"]["box"] == "" and t["reload"]["box"] == "" and t["reload"]["kept"] == 0, t
 

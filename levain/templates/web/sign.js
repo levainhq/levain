@@ -970,8 +970,9 @@
         + (plain ? "words only" : e && e.taken ? "envelope " + e.envelope_id + " taken" : "envelope NOT taken: " + String((e && e.refused) || "no envelope in the reply"));
       if (other) say(msg + "; but by a different Levain store than this sheet was opened for. Reload the page to see the current store; nothing more can be signed or sent here.", "bad");
       else say(msg, plain || (e && e.taken) ? "ok" : "bad");
-      // the server accepted this drop (a 2xx): the cockpit's box, which handed these words over, may let them go
-      tell("signed", req && typeof req.words === "string" ? { dropDelivered: true } : null);
+      // the server accepted this drop (a 2xx): the message names the exact words it accepted, so the cockpit's box lets go of
+      // them only when it still holds those very words
+      tell("signed", req && typeof req.words === "string" ? { dropDelivered: true, words: req.words } : null);
       return readDrops().then((g) => {
         if (g.unpaired || g.error) return;
         const dd = Array.isArray(g.coord_drops) ? g.coord_drops : [];
