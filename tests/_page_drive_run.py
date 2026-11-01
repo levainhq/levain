@@ -76,6 +76,8 @@ def _shared_env(argv: Sequence[str]) -> dict[str, str]:
     take, ask ``tests/_shared_chrome.py`` for a port, which starts that Chrome on first need. Any other call gets nothing."""
     if os.environ.get("LEVAIN_DRIVE_SHARE") != "1" or _extra_flags():
         return {}
+    if os.environ.get("LEVAIN_FULL_CHROME") == "1" or os.environ.get("LEVAIN_DRIVE_FULL_CHROME") == "1":
+        return {}   # the driver takes a full Chrome of its own then and would discard the shared port: do not start the shared Chrome at all
     if not any(os.path.basename(str(a)) == "_page_drive.mjs" for a in argv):
         return {}
     try:

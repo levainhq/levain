@@ -17,6 +17,8 @@ from . import pack as P
 from . import roles as R
 from . import wire as W
 from .export import export_stream
+from levain.coordinator.door import door_ok, not_door
+
 from .hook import decide
 from .ledger_api import LedgerTransport, open_ledger
 from .transport import InitIncomplete, JoinIncomplete, Repo, TeamError
@@ -524,13 +526,17 @@ def register(subparsers) -> None:
                     "edit it governs, and an owner-generated PROJECT.md canon.")
     sub = team_p.add_subparsers(dest="team_command", metavar="<team command>", required=True)
 
-    def add(name, func, help_):
+    def add(name, func, help_, *, door):
+        """One team command. ``door`` is required: True/False says whether the coordinator's door lets it run
+        (:mod:`levain.coordinator.door`), None marks a group that only holds subcommands."""
         p = sub.add_parser(name, help=help_, description=help_)
         p.add_argument("--repo", help="a path inside the project's git repository (default: cwd)")
         p.set_defaults(func=_guarded(func) if func else None)
+        if door is not None:
+            (door_ok if door else not_door)(p)
         return p
 
-    p = add("init", cmd_init, "Create the team ledger in this repository (first engineer; becomes the remote branch).")
+    p = add("init", cmd_init, "Create the team ledger in this repository (first engineer; becomes the remote branch).", door=False)
     p.add_argument("--project")
     p.add_argument("--owner", required=True, help="handle of the canon owner (must be a --member)")
     p.add_argument("--member", action="append", required=True, metavar="HANDLE=EMAIL[=PUBKEY]",
@@ -552,7 +558,7 @@ def register(subparsers) -> None:
                    help="let entries signed by a key with no user presence (a file or agent key) count; by default a "
                         "new team needs a Touch ID or security-key touch on every `levain team record`")
 
-    p = add("join", cmd_join, "Join this clone to the team ledger already on the remote.")
+    p = add("join", cmd_join, "Join this clone to the team ledger already on the remote.", door=False)
     p.add_argument("--remote")
     p.add_argument("--root", help="the genesis of the ledger to trust (required when the remote has several)")
     p.add_argument("--signing-key", help="your ssh public key file (in ssh-agent, or without a passphrase)")
@@ -563,7 +569,7 @@ def register(subparsers) -> None:
     p.add_argument("--anneal-db")
     p.add_argument("--no-install", action="store_true")
 
-    p = add("record", cmd_record, "Record a decision, constraint, finding, question or tension (the one write path).")
+    p = add("record", cmd_record, "Record a decision, constraint, finding, question or tension (the one write path).", door=False)
     p.add_argument("type", choices=[t for t in E.TYPES if t not in ("ack", "retire")])
     p.add_argument("--kind", choices=E.KINDS, help="ruling (decided by an owner, binds) or practice")
     p.add_argument("--mode", choices=E.MODES, help="per-ruling override of the team mode")
@@ -582,7 +588,7 @@ def register(subparsers) -> None:
                    help="keep it local for now (by default the entry is pushed so the team sees it immediately)")
     p.add_argument("--json", action="store_true")
 
-    p = add("retire", cmd_retire, "Retire entries without replacing them (a ruling needs the decider's words).")
+    p = add("retire", cmd_retire, "Retire entries without replacing them (a ruling needs the decider's words).", door=False)
     p.add_argument("ids", nargs="+")
     p.add_argument("--words")
     p.add_argument("--owner")
@@ -590,24 +596,24 @@ def register(subparsers) -> None:
     p.add_argument("--agent")
     p.add_argument("--no-push", action="store_true")
 
-    p = add("sync", cmd_sync, "Fetch, rebase and push the ledger.")
+    p = add("sync", cmd_sync, "Fetch, rebase and push the ledger.", door=False)
     p.add_argument("--no-push", action="store_true")
 
-    p = add("status", cmd_status, "What is in force (or, with --path, what governs one file).")
+    p = add("status", cmd_status, "What is in force (or, with --path, what governs one file).", door=True)
     p.add_argument("--path")
     p.add_argument("--json", action="store_true")
 
-    add("verify", cmd_verify, "Walk every file's hash chain and every reference; exit 1 on any problem.")
+    add("verify", cmd_verify, "Walk every file's hash chain and every reference; exit 1 on any problem.", door=True)
 
-    p = add("consolidate", cmd_consolidate, "Owner only: regenerate PROJECT.md from the in-force entries.")
+    p = add("consolidate", cmd_consolidate, "Owner only: regenerate PROJECT.md from the in-force entries.", door=False)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-push", action="store_true")
 
-    p = add("export", cmd_export, "Print the ledger as JSON lines (all entries per file in file order).")
+    p = add("export", cmd_export, "Print the ledger as JSON lines (all entries per file in file order).", door=True)
     p.add_argument("--jsonl", action="store_true", help="JSON lines (the only format; the flag is accepted for clarity)")
     p.add_argument("--in-force", action="store_true", help="only in-force entries, time order (not chain-verifiable)")
 
-    p = add("view", cmd_view, "Serve the read-only team view (four panes) on localhost.")
+    p = add("view", cmd_view, "Serve the read-only team view (four panes) on localhost.", door=False)
     p.add_argument("--dir", dest="repo", help="same as --repo")
     p.add_argument("--host", default="127.0.0.1", help="loopback only (default 127.0.0.1)")
     p.add_argument("--port", type=_port, default=7450, help="0..65535; 0 picks an ephemeral port (default 7450)")
@@ -615,12 +621,12 @@ def register(subparsers) -> None:
     p.add_argument("--cockpit-url", default="http://127.0.0.1:7420/", help="where the nav's Cockpit link points")
     p.add_argument("--ack-flag", type=int, default=3, help="acks on one path before it is flagged for review (default 3)")
 
-    p = add("install", cmd_install, "Wire the team hooks into .claude/settings.local.json (idempotent).")
+    p = add("install", cmd_install, "Wire the team hooks into .claude/settings.local.json (idempotent).", door=False)
     p.add_argument("--python", help="interpreter for the hook command (default: this one)")
 
-    add("doctor", cmd_doctor, "Check the ledger, the identity mapping, the remote, the hooks and the anneal seam.")
+    add("doctor", cmd_doctor, "Check the ledger, the identity mapping, the remote, the hooks and the anneal seam.", door=True)
 
-    p = add("member", None, "Owner only: change team membership.")
+    p = add("member", None, "Owner only: change team membership.", door=None)
     msub = p.add_subparsers(dest="member_command", required=True)
     ma = msub.add_parser("add", help="add a member")
     ma.add_argument("handle")
@@ -629,21 +635,23 @@ def register(subparsers) -> None:
     ma.add_argument("--repo")
     ma.add_argument("--no-push", action="store_true")
     ma.set_defaults(func=_guarded(cmd_member_add))
+    not_door(ma)
     from . import cli_tenure
     mr = msub.add_parser("remove", help="remove a member")
     mr.add_argument("handle")
     mr.add_argument("--repo")
     mr.add_argument("--no-push", action="store_true")
     mr.set_defaults(func=_guarded(lambda a: cli_tenure.cmd_member_remove(open_ledger(_repo(a)), a)))
+    not_door(mr)
     cli_tenure.register(sub, add)
     from . import cli_draft
     cli_draft.register(sub, add)
 
     p = add("file-keys", cmd_file_keys, "Owner only: allow or refuse entries signed with no user presence (a file or "
-            "agent key) for the whole team; refused by default (Touch ID or a security key).")
+            "agent key) for the whole team; refused by default (Touch ID or a security key).", door=False)
     p.add_argument("choice", choices=("allow", "refuse"))
     p.add_argument("--no-push", action="store_true")
-    p = add("pack-sync", cmd_pack_sync, "Owner only: seed or upgrade a pack's judgment.toml rules into the ledger.")
+    p = add("pack-sync", cmd_pack_sync, "Owner only: seed or upgrade a pack's judgment.toml rules into the ledger.", door=False)
     p.add_argument("pack_dir")
     p.add_argument("--no-push", action="store_true")
 

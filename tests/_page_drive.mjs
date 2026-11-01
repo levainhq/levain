@@ -45,8 +45,8 @@
 // LEVAIN_DRIVE_LAUNCH_LOG: a file that gets one "spawn" line per Chrome this driver launches (a count for a measurement).
 // A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...], "dialogs": ["<type>: <message>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { accessSync, appendFileSync, constants, mkdtempSync, readdirSync, statSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
@@ -63,18 +63,60 @@ const parseScale = (raw) => {
 const WAIT_SCALE = parseScale(process.env.LEVAIN_TEST_WAIT_SCALE ?? "");
 const scaled = (ms) => Math.round(ms * WAIT_SCALE);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const chromeFlags = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "chrome_flags.json"), "utf8")).flags;
+const chromeCfg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "chrome_flags.json"), "utf8"));
+const chromeFlags = chromeCfg.flags;
+const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const versionKey = (name) => (name.match(/([0-9]+(?:\.[0-9]+)*)$/)?.[1] ?? "").split(".").filter(Boolean).map(Number);
+const newerFirst = (a, b) => {
+  const x = versionKey(a), y = versionKey(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? -1) !== (y[i] ?? -1)) return (y[i] ?? -1) - (x[i] ?? -1);
+  return 0;
+};
+const dirsOf = (d) => readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+// chrome-headless-shell (Chrome for Testing's headless binary) when installed under chrome_flags.json's headless_shell_root: full
+// Chrome mints a Secure Enclave key in the operator's keychain on every fresh profile (no flag stops it), the shell never does.
+// A shell binary counts only if it is a regular executable file in a "-mac-<this host's arch>" directory (versions compared
+// numerically; a stray file is skipped); anything else falls back to the given Chrome. The given Chrome is kept when
+// LEVAIN_FULL_CHROME=1, when CHROME is set (as Python reads it), or when it is not DEFAULT_CHROME (a caller that named a Chrome on purpose gets that Chrome).
+const pickChrome = (given, cfg) => {
+  if (process.env.LEVAIN_FULL_CHROME === "1" || (process.env.CHROME ?? "") !== "" || given !== DEFAULT_CHROME) return given;
+  const raw = cfg.headless_shell_root;
+  if (raw === undefined || raw === null || raw === "") return given;
+  if (typeof raw !== "string") { console.error("chrome_flags.json: headless_shell_root is not a string; using the given Chrome"); return given; }
+  const arch = { arm64: "arm64", x64: "x64" }[process.arch];
+  if (process.platform !== "darwin" || !arch) return given;
+  let root, versions;
+  try { root = raw.replace(/^~/, userInfo().homedir); versions = dirsOf(root).sort(newerFirst); } catch { return given; }
+  for (const v of versions) {
+    let subs;
+    try { subs = dirsOf(join(root, v)).filter((n) => n.endsWith(`-mac-${arch}`)).sort(); } catch { continue; }
+    for (const a of subs) {
+      const bin = join(root, v, a, "chrome-headless-shell");
+      try { if (statSync(bin).isFile()) { accessSync(bin, constants.X_OK); return bin; } } catch {}
+    }
+  }
+  return given;
+};
 // LEVAIN_DRIVE_CHROME_FLAGS: a JSON array of extra Chrome flags (a test that must reach the server under a proxied name)
 const extraFlags = process.env.LEVAIN_DRIVE_CHROME_FLAGS ? JSON.parse(process.env.LEVAIN_DRIVE_CHROME_FLAGS) : [];
-let sharedPort = /^[0-9]+$/.test(process.env.LEVAIN_DRIVE_CDP_PORT ?? "") && extraFlags.length === 0 ? Number(process.env.LEVAIN_DRIVE_CDP_PORT) : null;
+// chrome-headless-shell has no service worker, Push or Notification API: a drive that needs them DECLARES it with
+// LEVAIN_DRIVE_FULL_CHROME=1 (the test sets it; a pytest fixture in the test file) and then runs on the full Chrome given in argv, in
+// a process of its own (never the session's shell), and pays the one keychain key that costs. The source-text sniff below is only a
+// fail-safe that also routes to the full Chrome (union with the declaration, never instead of it). LEVAIN_FULL_CHROME=1 also takes
+// a drive off the session's shell port: the drive spawns its own full Chrome.
+const needsFullChrome = process.env.LEVAIN_DRIVE_FULL_CHROME === "1" || process.env.LEVAIN_FULL_CHROME === "1"
+  || /serviceWorker|[Pp]ushManager\.|\.pushManager|Notification\.|new Notification/.test(JSON.stringify(steps));   // actual use only: a drive that DELETES window.PushManager (no push API on purpose) stays on the shell
+let sharedPort = /^[0-9]+$/.test(process.env.LEVAIN_DRIVE_CDP_PORT ?? "") && extraFlags.length === 0 && !needsFullChrome ? Number(process.env.LEVAIN_DRIVE_CDP_PORT) : null;
 // a Chrome of our own: this process owns it, its port and its profile (also the way out when the shared Chrome fails to set up)
 let prof = null; let port = null;
 let chrome = { exitCode: 0, signalCode: null, kill() {}, once() {} };   // nothing of ours to kill while the Chrome belongs to the session
 const startSpawn = async () => {
+  const bin = needsFullChrome ? chromePath : pickChrome(chromePath, chromeCfg);
+  if (process.env.LEVAIN_TEST_PICK_CHROME_DRY === "1") { process.stdout.write(bin + "\n"); process.exit(0); }   // a test of the selection: print the pick, launch nothing
   port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
   prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
   if (process.env.LEVAIN_DRIVE_LAUNCH_LOG) { try { appendFileSync(process.env.LEVAIN_DRIVE_LAUNCH_LOG, "spawn\n"); } catch {} }
-  chrome = spawn(chromePath, [...chromeFlags, ...extraFlags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
+  chrome = spawn(bin, [...chromeFlags, ...extraFlags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
     "--no-first-run", "--window-size=1440,1000", "about:blank"], { stdio: "ignore" });
 };
 if (!sharedPort) await startSpawn();

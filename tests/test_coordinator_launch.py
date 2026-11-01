@@ -1357,7 +1357,7 @@ def test_every_levain_verb_the_brief_names_passes_the_coordinators_door(store, f
     refused all three inside its workspace. Every command path the brief names is read off the real CLI parser and
     must be in the door: a brief that names a verb the door refuses fails here."""
     from levain import install as inst
-    from levain.cli import main
+    from levain.cli import build_parser, main
     from levain.coordinator import door
 
     launch_id = woken(store)
@@ -1399,7 +1399,7 @@ def test_every_levain_verb_the_brief_names_passes_the_coordinators_door(store, f
             assert len(got) >= 2, command
             paths.add(got)
     assert {("coord", "questions"), ("coord", "answer"), ("coord", "escalate"), ("coord", "claim")} <= paths
-    refused = sorted(p for p in paths if p not in door.DOOR)
+    refused = sorted(p for p in paths if p not in door.door_paths(build_parser()))
     assert not refused, f"the brief names verbs the coordinator's door refuses: {refused}"
 
 
