@@ -4823,26 +4823,37 @@
     btn.type = "button";
     btn.title = open ? "read the question and answer it" : "show how this question was answered";
     let slot = null;   // one slot per row: a retry after a failed read reuses it
-    btn.addEventListener("click", () => {
+    let eagerBusy = false, clickedMeanwhile = false;   // the one in-flight marker: an eager read and a click never both draw
+    const openBody = () => {
       btn.disabled = true;
       if (!slot) { slot = el("div", "consent-body ext-meta"); row.appendChild(slot); }
       slot.replaceChildren(document.createTextNode("reading the question…"));
-      questionBody(q, row).then((b) => {
+      Promise.resolve(questionBody(q, row)).then((b) => {
+        if (!b) { btn.disabled = false; slot.remove(); slot = null; return; }
         drawQuestionBody(q, slot, b);
         if (b.error) btn.disabled = false; else btn.remove();
       });
+    };
+    btn.addEventListener("click", () => {
+      if (eagerBusy) { clickedMeanwhile = true; btn.disabled = true; return; }   // the eager read draws, or hands the click back
+      openBody();
     });
     head.appendChild(btn);
     if (!open && eager) {
       // one of the newest answered rows shows how it was answered without the click. The slot exists only once the read gave an
       // answer, so a failed, token-less or answer-less read leaves no blank space and the details button as it was; the rest of
       // the answered rows draw on that click.
-      questionBody(q, row).then((b) => {
-        if (slot || !b || b.error || !b.answer || typeof b.answer !== "object") return;
-        slot = el("div", "consent-body ext-meta");
-        row.appendChild(slot);
-        drawQuestionBody(q, slot, b);
-        btn.remove();
+      eagerBusy = true;
+      Promise.resolve(questionBody(q, row)).then((b) => {
+        eagerBusy = false;
+        if (!slot && b && !b.error && b.answer && typeof b.answer === "object") {
+          slot = el("div", "consent-body ext-meta");
+          row.appendChild(slot);
+          drawQuestionBody(q, slot, b);
+          btn.remove();
+          return;
+        }
+        if (clickedMeanwhile) { clickedMeanwhile = false; openBody(); }
       });
     }
     return row;
@@ -5781,7 +5792,7 @@
       if (!ln || typeof ln !== "object") continue;
       if (ln.consent && ln.consent.state === "pending") consents.push({ kind: "consent", c: ln.consent });
       else if (ln.question && ln.question.state === "open") questions.push({ kind: "question", q: ln.question });
-      else if (ln.question && ln.question.state === "answered" && decidedRecently(ln.question.decidedAge)) {
+      else if (ln.question && ln.question.state === "answered" && decidedRecently(ln.question.decidedAge, ln.question.decidedAt)) {
         answered.push({ kind: "question", q: ln.question, answered: true });
       }
     }
@@ -5796,13 +5807,32 @@
   // an item the strip shows only so the answer given stays visible for a while: it waits on nothing and is never counted
   const needsWaiting = (items) => items.filter((it) => !it.answered);
   const NEEDS_ANSWERED_MINUTES = 30, NEEDS_ANSWERED_MAX = 3;
-  // decidedAge is the row's relative label ("40s ago", "12m ago"); only seconds and minutes under the window qualify
-  function decidedRecently(label) {
+  // the page's clock as the age timer reads it (the server's, so a skewed browser cannot misreport the window)
+  function needsNow() {
+    const K = typeof window !== "undefined" ? window.LevainCockpitKinds : null;
+    return K && typeof K.serverNow === "function" ? K.serverNow() : Date.now();
+  }
+  // How long the answer still stays on the strip, in ms; null when the stamp cannot be read.
+  function decidedLeftMs(at) {
+    const ms = typeof at === "string" ? Date.parse(at) : NaN;
+    return Number.isFinite(ms) ? ms + NEEDS_ANSWERED_MINUTES * 60000 - needsNow() : null;
+  }
+  // The raw stamp decides when it is readable, so the window ends on an idle page; the row's relative label ("40s ago",
+  // "12m ago") is the fallback for a line with no stamp, and only seconds and minutes under the window qualify there.
+  function decidedRecently(label, at) {
+    const left = decidedLeftMs(at);
+    if (left !== null) return left > 0;
     const m = /^(\d+)([sm]) ago$/.exec(typeof label === "string" ? label : "");
     if (!m) return false;
-    return m[2] === "s" || Number(m[1]) < NEEDS_ANSWERED_MINUTES;
+    return m[2] === "s" ? Number(m[1]) < 60 : Number(m[1]) < NEEDS_ANSWERED_MINUTES;
   }
-  const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state);
+  // whether this page holds a write token: an answered card's body is read with it, so the token arriving is a change of state
+  function hasWriteToken() {
+    const t = typeof window !== "undefined" ? window.LevainCockpitTransport : null;
+    const h = t && typeof t.headers === "function" ? t.headers() : {};
+    return !!(h && h["X-Levain-Write-Token"]);
+  }
+  const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state + "|" + (hasWriteToken() ? "t" : "-"));
   // the name a glance tile gives the top item: the tool and who asked, or the question's number (its words are fetched, not in the row)
   function needsName(it) {
     return it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "question #" + it.q.n + " · " + (it.q.agent || "agent");
@@ -6046,7 +6076,8 @@
     needsHead(card, settled ? settledTag(q) : (q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null));
     const slot = el("div", "needs-body ext-meta", "reading the question…");
     card.appendChild(slot);
-    questionBody(q, card).then((b) => {
+    Promise.resolve(questionBody(q, card)).then((b) => {
+      if (!b) return;
       drawQuestionBody(q, slot, b, card);
       if (!b.error && !settled) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
     });
@@ -6110,7 +6141,30 @@
     row.addEventListener("click", () => openNeedsFocus(row._needsItem || it, row));
     return row;
   }
+  // One timer for the earliest answered card to leave the strip: it re-runs the selection, which drops the card on an idle page.
+  // Every render clears it and arms it again for the cards then listed.
+  let needsExpiryTimer = 0;
   function renderNeeds(view) {
+    if (needsExpiryTimer) { window.clearTimeout(needsExpiryTimer); needsExpiryTimer = 0; }
+    try { renderNeedsNow(view); }
+    finally { armNeedsExpiry(view); }
+  }
+  function armNeedsExpiry(view) {
+    if (typeof window.setTimeout !== "function") return;
+    let soonest = Infinity;
+    for (const ln of Array.isArray(((view.extra_panels || {}).decisions || {}).lines) ? view.extra_panels.decisions.lines : []) {
+      const q = ln && ln.question;
+      if (!q || q.state !== "answered") continue;
+      const left = decidedLeftMs(q.decidedAt);
+      if (left !== null && left > 0 && left < soonest) soonest = left;
+    }
+    if (soonest === Infinity) return;
+    needsExpiryTimer = window.setTimeout(() => {
+      needsExpiryTimer = 0;
+      try { renderNeeds(view); } catch (e) { /* the strip keeps what it showed */ }
+    }, Math.min(soonest + 50, 2147483000));
+  }
+  function renderNeedsNow(view) {
     signRecheck();      // a board read: every frozen card asks the cockpit about its unsettled answer again
     const host = document.getElementById("ck-needs");
     if (!host) return;

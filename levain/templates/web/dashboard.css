@@ -1815,6 +1815,7 @@ body.ke .needs-bar { display: none; }
 body.ke[data-mode="build"] .needs-answered, body.ke[data-mode="memory"] .needs-answered,
 body.ke[data-mode="build"] .needs-grid, body.ke[data-mode="memory"] .needs-grid,
 body.ke[data-mode="build"] #ck-needs .needs-headline, body.ke[data-mode="memory"] #ck-needs .needs-headline { display: none; }   /* the strip's own headline only: the drop reuses the class and keeps its heading in every view */
+body.ke[data-mode="build"] #ck-needs:not([data-waiting]), body.ke[data-mode="memory"] #ck-needs:not([data-waiting]) { display: none; }   /* only answered cards: nothing is drawn in these modes, so the host takes no space */
 body.ke[data-mode="build"] .needs-bar, body.ke[data-mode="memory"] .needs-bar { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; padding: var(--sp-3) var(--sp-5);
   background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: var(--r-lg); }
 body.ke .needs-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }

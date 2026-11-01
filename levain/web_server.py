@@ -2118,14 +2118,16 @@ class _Handler(GuardedHandler):
                 q = store.get(int(n))
                 if q is not None:
                     a = q.answer
+                    opts = list(q.options)
+                    signed = getattr(a, "signed", None) if a is not None else None
                     status, payload = 200, {
                         "n": q.n, "agent": q.agent, "what": q.what,
-                        "options": [{"key": k, "label": label} for k, label in q.options],
+                        "options": [{"key": k, "label": label} for k, label in opts],
                         "rec": q.rec, "blocks": q.blocks, "open_ended": q.open_ended, "filed_at": q.filed_at,
                         "answer": None if a is None else {
                             "kind": a.kind, "value": a.value, "channel": a.channel, "answered_at": a.answered_at,
-                            "signed": getattr(a, "signed", None),
-                            "label": next((label for k, label in q.options if k == a.value), None)
+                            "signed": None if signed is None else bool(signed),
+                            "label": next((label for k, label in opts if k == a.value), None)
                             if a.kind == "option" else None}}
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise

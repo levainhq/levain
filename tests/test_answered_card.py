@@ -27,7 +27,7 @@ def _slice(start: str, stop: str) -> str:
 
 def _node(expr: str) -> object:
     src = (_slice("function answerLine(", "  // `card` (the Needs-you strip's card)") +
-           _slice("const NEEDS_ANSWERED_MINUTES", "  const needsKey"))
+           _slice("const NEEDS_ANSWERED_MINUTES", "  // the name a glance tile gives the top item"))
     out = subprocess.run([NODE, "-e", src + "\nconsole.log(JSON.stringify(" + expr + "));"],
                          capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
@@ -58,8 +58,45 @@ def test_the_composed_line_for_an_option_words_and_each_signed_state() -> None:
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 def test_only_a_recent_decision_stays_on_the_strip() -> None:
-    got = _node('["0s ago", "29m ago", "30m ago", "1h ago", "2d ago", "", null].map(decidedRecently)')
-    assert got == [True, True, False, False, False, False, False]
+    got = _node('["0s ago", "29m ago", "30m ago", "1h ago", "2d ago", "", null, "120s ago", "59s ago"].map((l) => decidedRecently(l))')
+    assert got == [True, True, False, False, False, False, False, False, True]
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_the_window_is_decided_from_the_stamp_against_the_live_clock_not_the_label() -> None:
+    """A label computed at map time reads "29m ago" forever; the stamp against the clock does not."""
+    got = _node('(() => { const at = new Date(Date.now() - 29 * 60000).toISOString(); const stale = new Date(Date.now() - 31 * 60000).toISOString();'
+                ' return [decidedRecently("29m ago", at), decidedRecently("29m ago", stale), decidedRecently("", stale),'
+                ' decidedRecently("", at), decidedRecently("0s ago", "garbage"), decidedLeftMs("garbage"), decidedLeftMs(at) > 0]; })()')
+    assert got == [True, False, False, True, True, None, True]
+    clocked = _node('(() => { globalThis.window = {LevainCockpitKinds: {serverNow: () => Date.parse("2026-11-01T15:00:00Z")}};'
+                    ' return [decidedRecently("", "2026-11-01T14:40:00Z"), decidedRecently("", "2026-11-01T14:20:00Z")]; })()')
+    assert clocked == [True, False]          # the server-adjusted clock, not the browser's, bounds the window
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_a_question_signature_changes_when_the_write_token_arrives() -> None:
+    src = _slice("function hasWriteToken", "  // the name a glance tile gives the top item")
+    out = subprocess.run([NODE, "-e", src + "\nconst it = {kind: 'question', q: {n: 4, state: 'answered'}};"
+                          "globalThis.window = {LevainCockpitTransport: {headers: () => ({})}}; const a = needsKey(it);"
+                          "globalThis.window = {LevainCockpitTransport: {headers: () => ({'X-Levain-Write-Token': 'T'})}}; const b = needsKey(it);"
+                          "console.log(JSON.stringify([a !== b, a, b]));"], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout)[0] is True
+
+
+def test_the_server_body_normalises_signed_and_reads_options_once() -> None:
+    src = (WEB.parent.parent / "web_server.py").read_text()
+    body = src[src.index("def _serve_question_body"):]
+    body = body[:body.index("finally:")]
+    assert body.count("q.options") == 1 and "opts = list(q.options)" in body
+    assert '"signed": None if signed is None else bool(signed)' in body
+
+
+def test_a_strip_of_only_answered_cards_takes_no_space_in_build_and_memory() -> None:
+    css = (WEB / "dashboard.css").read_text()
+    for mode in ("build", "memory"):
+        assert f'body.ke[data-mode="{mode}"] #ck-needs:not([data-waiting])' in css
 
 
 OPTIONS = [("ship", "Ship it tonight"), ("hold", "Hold for the morning")]
@@ -171,3 +208,41 @@ def test_a_row_whose_read_fails_draws_no_blank_slot(tmp_path: Path, monkeypatch)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         got = _values(_drive(tmp_path, f"{url}/", _history_steps("true")), '"rowsstate"')
     assert got["rows"] == 7 and got["drawn"] == 0 and got["buttons"] == 7 and got["blank"] == 0, got
+
+
+@needs_browser
+def test_an_answered_card_leaves_an_idle_page_when_its_window_ends(tmp_path: Path, monkeypatch) -> None:
+    """Answered 29m45s ago: the card is drawn, then the page's own timer drops it with no refetch and no input."""
+    from datetime import datetime, timedelta, timezone
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    (home / "consent").mkdir(parents=True, mode=0o700)
+    store = QuestionStore(home / "consent", clock=lambda: datetime.now(timezone.utc) - timedelta(minutes=29, seconds=45))
+    store.answer(_file(store, "Ship the sweep fix tonight?").n, option="ship", channel="cli")
+    _root, src, _ids = _install(tmp_path)
+    cards = "document.querySelectorAll('#ck-needs .needs-answered .needs-card').length"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            DESKTOP, {"until": f"{cards} === 1 && 1", "ms": 10000},
+            {"until": f"{cards} === 0 && 1", "ms": 40000},
+            {"eval": "JSON.stringify({gone: " + cards + ", host: document.querySelector('#ck-needs').hidden, done: 1})"}])
+    seen = _values(out, '"done"')
+    assert seen["gone"] == 0 and seen["host"] is True, seen
+
+
+@needs_browser
+def test_a_details_click_during_the_eager_read_draws_one_body(tmp_path: Path, monkeypatch) -> None:
+    store = _home(tmp_path, monkeypatch)
+    for k in range(7):
+        store.answer(_file(store, f"Question number {k} to settle?").n, option="ship", channel="cli")
+    _root, src, _ids = _install(tmp_path)
+    click = ("(() => { const r = " + ROWS + ".find(r => r.querySelector('.consent-details')); if (!r) return 0;"
+             " r.querySelector('.consent-details').click(); return 1; })()")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        steps = [DESKTOP, {"until": "window.LevainNeeds && window.LevainNeeds.history && 1", "ms": 30000},
+                 {"eval": "window.LevainNeeds.history(null) ? 1 : 0"}, {"until": f"{ROWS}.length === 7 && 1", "ms": 30000},
+                 {"eval": click},                                                     # right after the rows drew, eager reads in flight
+                 {"until": f"{ROWS}.filter(r => r.querySelector('.consent-body')).length >= 5", "ms": 15000},
+                 {"eval": "JSON.stringify({multi: " + ROWS + ".filter(r => r.querySelectorAll('.consent-body').length > 1).length, rowsstate: 1})"}]
+        got = _values(_drive(tmp_path, f"{url}/#write_token=T", steps), '"rowsstate"')
+    assert got["multi"] == 0, got
