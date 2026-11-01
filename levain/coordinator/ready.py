@@ -638,10 +638,19 @@ def _refuse_cycle(conn: sqlite3.Connection, item_id: str, deps: Sequence[str]) -
             stack.extend(graph.get(d, ()))
 
 
+class _Written(dict):
+    """A journal record that also carries ``ver``: the version its own write transaction produced. Still exactly the
+    SCHEMA §6 fields as a mapping."""
+
+    def __init__(self, rec: Mapping[str, Any], *, ver: int) -> None:
+        super().__init__(rec)
+        self.ver = ver
+
+
 def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: Any, why: Any, source: str,
                 creating: bool, repo: Any = None, **fields: Any) -> dict:
     """THE write path: checks, then ONE fenced write transaction that writes the journal record and then the state
-    row; a failure anywhere rolls both back. Returns the journal record (SCHEMA §6 fields)."""
+    row; a failure anywhere rolls both back. Returns the journal record (SCHEMA §6 fields) as a :class:`_Written` (a plain dict with ``.ver``, the version this transaction wrote)."""
     token = _check_token(token)
     why = _line("why", why, _WHY_MAX)
     who = _line("who", who, _WHO_MAX)
@@ -690,7 +699,7 @@ def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: An
                "who": who, "why": why, "source": source, "applied_by": None}
         _insert_journal(conn, rec, ver=ver, gseq=next_gseq(conn, now), at=now, token=token)
         _insert_state(conn, state, item_id=item_id, ver=ver, who=who, at=now)
-    return rec
+    return _Written(rec, ver=ver)           # the version THIS transaction wrote, never a later read of the journal
 
 
 def add(store: CoordStore, token: Any, item_id: str, *, repo: str, title: str, who: str, why: str,

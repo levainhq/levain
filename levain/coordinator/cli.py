@@ -1640,7 +1640,9 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
                       f"{NO_STORE}: nothing is queued")
                 return 0
             got = ready.list_ready(store, all=args.all, repo=args.repo)
-            lines = [_ready_line(i) for i in got["items"]] or ["nothing queued"]
+            lines = [_ready_line(i) for i in got["items"]]
+            if not lines and not got["unreadable"]:       # absence is only said when nothing was left unread
+                lines = ["nothing queued"]
             lines += [f"unreadable: {u}" for u in got["unreadable"]]
             _emit(out, args.json, got, "\n".join(lines))
             return 0
@@ -1654,9 +1656,12 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
         else:
             rec = (ready.move if verb == "move" else ready.correct)(store, args.token, args.item_id, to=args.to,
                                                                     who=args.who, why=args.why, **extra)
-        ver = len(ready.journal(store, args.item_id))
+        ver = rec.ver
     except _REFUSED as exc:
-        print(f"levain coord ready {verb}: {exc}", file=sys.stderr)
+        said = str(exc)
+        if said.endswith("; nothing was written"):       # a missing --queue-dir is made by the open: say what is true
+            said = said[:-len("nothing was written")] + "no state was written"
+        print(f"levain coord ready {verb}: {said}", file=sys.stderr)
         return 2
     _emit(out, args.json, {"journal_id": f"{rec['id']}@{ver}", "record": rec},
           f"{verb}: {rec['id']} {rec['from_category'] or '-'} -> {rec['to_category']}; journal {rec['id']}@{ver}")

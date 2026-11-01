@@ -151,3 +151,34 @@ def test_show_with_no_store_makes_nothing(tmp_path, capsys):
     assert (code, err) == (0, "") and "no coordinator store here" in out and not q.exists()
     code, out, _ = _run(q, capsys, "show", "--json")
     assert json.loads(out)["items"] == [] and not q.exists()
+
+
+def test_the_printed_version_is_the_one_the_write_produced_not_a_second_read(qdir, token, store, capsys, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("journal read failed after the commit")
+
+    monkeypatch.setattr(ready, "journal", boom)
+    code, out, err = _add(qdir, capsys, token)
+    assert (code, err) == (0, "") and "journal levain:a@1" in out
+    monkeypatch.undo()
+    assert [r["id"] for r in ready.journal(store)] == ["levain:a"]       # the write did commit
+
+
+def test_show_never_says_nothing_queued_beside_an_unreadable_store(qdir, token, store, capsys):
+    import sqlite3
+    _add(qdir, capsys, token)
+    c = sqlite3.connect(qdir / "dispatch.db")
+    for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'ready_items%'").fetchall():
+        c.execute(f"DROP TRIGGER {name}")
+    c.execute("DELETE FROM ready_items")
+    c.commit()
+    c.close()
+    code, out, _ = _run(qdir, capsys, "show")
+    assert "unreadable: " in out and "nothing queued" not in out
+
+
+def test_a_stale_token_on_a_missing_queue_dir_says_no_state_was_written(tmp_path, capsys):
+    q = tmp_path / "never"
+    code, out, err = _run(q, capsys, "move", "levain:a", "--to", "done", "--who", "d", "--why", "w", "--token", "5")
+    assert code == 2 and out == "" and err.rstrip().endswith("; no state was written")
+    assert "nothing was written" not in err
