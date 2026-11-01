@@ -360,3 +360,44 @@ def test_the_receipt_assertions_fail_on_the_full_body(tmp_path: Path, monkeypatc
     seen = _receipt_run(tmp_path, monkeypatch, core=CORE.replace(marker, "drawQuestionBody(q, slot, b, card);"))
     with pytest.raises(AssertionError):
         _assert_receipt(seen)
+
+
+def _failed_read_run(tmp_path: Path, monkeypatch, core: str | None = None) -> dict:
+    store = _home(tmp_path, monkeypatch)
+    done = _file(store, "Ship the sweep fix tonight?")
+    store.answer(done.n, option="hold", channel="phone")
+    _root, src, _ids = _install(tmp_path)
+    if core is not None:
+        from levain import web_server
+        real = web_server.load_web_asset
+        monkeypatch.setattr(web_server, "load_web_asset", lambda fn: core if fn == "dashboard_core.js" else real(fn))
+    # the page's body read fails at the network (the manifest still lists the settled card)
+    bad = ("const rf = window.fetch.bind(window); "
+           "window.fetch = (u, o) => String(u).indexOf('/cockpit/question/') === 0 ? Promise.reject(new Error('down')) : rf(u, o);")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            DESKTOP, {"init": bad},
+            {"until": "document.querySelector('#ck-needs .needs-answered .needs-card') && 1", "ms": 30000},
+            {"eval": "new Promise((r) => setTimeout(() => r(1), 2500))"},
+            {"eval": RECEIPT}])
+    return _values(out, '"receipt"')
+
+
+def _assert_failed_read_receipt(seen: dict) -> None:
+    assert seen["cards"] == 1 and "answer not shown" in seen["text"], seen
+    assert seen["options"] == 0 and seen["recs"] == 0 and seen["buttons"] == 0, seen
+    assert seen["order"][0] == "needs-q-title", seen
+
+
+@needs_browser
+def test_a_settled_card_whose_body_read_fails_stays_a_receipt_with_no_controls(tmp_path: Path, monkeypatch) -> None:
+    _assert_failed_read_receipt(_failed_read_run(tmp_path, monkeypatch))
+
+
+@needs_browser
+def test_the_failed_read_assertions_fail_without_the_receipt_branch(tmp_path: Path, monkeypatch) -> None:
+    marker = 'if (receipt && card && (b.error ||'
+    assert marker in CORE
+    seen = _failed_read_run(tmp_path, monkeypatch, core=CORE.replace(marker, 'if (false && card && (b.error ||'))
+    with pytest.raises(AssertionError):
+        _assert_failed_read_receipt(seen)
