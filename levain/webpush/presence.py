@@ -485,25 +485,32 @@ def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | 
     return _copy_cells(DEFAULT_CELLS)
 
 
+_UNSET = object()   # "read it yourself", distinct from None (no word on file / no idle reading)
+
+
 def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Callable[[], float | None] | None,
-          suggest: bool) -> tuple[Decision, str, dict | None]:
+          suggest: bool, word: object = _UNSET, reading: object = _UNSET) -> tuple[Decision, str, dict | None]:
     """The one place the rule is read: ``(decision, source, word)`` for a ``kind`` of ping at ``now``. Both
     :func:`should_push` and :func:`effective` call it, so the push and the chip cannot diverge. Raises on a fault; the
-    callers read that as push."""
-    if idle is None:
-        from levain.consent.auto_away import input_idle_seconds as idle
+    callers read that as push. ``word`` and ``reading`` let a caller that already sampled the word and the idle time have
+    this rule work from that same snapshot (one read of each per status), not a second code path."""
     from levain.webpush import route as _route
 
     at = time.time() if now is None else now
-    reading = idle()
+    if reading is _UNSET:
+        if idle is None:
+            from levain.consent.auto_away import input_idle_seconds as idle
+        reading = idle()
     if suggest:   # delivery drives the suggestion (throttled there); a status read (``suggest=False``) never does
         try:
             _route.auto_suggest(queue_dir, idle=reading, now=at)
         except Exception:  # noqa: BLE001 - its fault never changes the rule
             pass
-    word = read_word(queue_dir)
-    d, source = _decide(at, word, reading, class_name=kind_class(kind),
-                        policy=read_policy(queue_dir)[0], route=_route.read_route(queue_dir, at)[0])
+    if word is _UNSET:
+        word = read_word(queue_dir)
+    # a delivery (suggest) reads the route after auto_suggest; a status read projects the same route without writing
+    r = (_route.read_route(queue_dir, at)[0] if suggest else _route.projected_route(queue_dir, idle=reading, now=at))
+    d, source = _decide(at, word, reading, class_name=kind_class(kind), policy=read_policy(queue_dir)[0], route=r)
     return d, source, word
 
 
@@ -511,29 +518,36 @@ _FAULT = "the presence rule could not be read: pushing"
 
 
 def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = None,
-                idle: Callable[[], float | None] | None = None, suggest: bool = True) -> Decision:
+                idle: Callable[[], float | None] | None = None, suggest: bool = True,
+                word: object = _UNSET) -> Decision:
     """:func:`decide` for a ``kind`` of ping against the word on file and the input idle time (``idle`` defaults to
     :func:`levain.consent.auto_away.input_idle_seconds`). Any fault reads as push: a missed ping is the worse error."""
     try:
-        return _core(queue_dir, kind, now, idle, suggest)[0]
+        return _core(queue_dir, kind, now, idle, suggest, word)[0]
     except Exception:  # noqa: BLE001 - the rule failing must not silence the phone
         return Decision(True, "pushing", _FAULT)
 
 
 def effective(queue_dir: Path | str | None, now: float | None = None, *,
-              idle: Callable[[], float | None] | None = None, suggest: bool = False) -> dict:
+              idle: Callable[[], float | None] | None = None, suggest: bool = False,
+              word: object = _UNSET, reading: object = _UNSET) -> dict:
     """What the rule does now with an ordinary ping, for the cockpit chip and any status read:
     ``{state: pushing|holding|muted, pushing, reason, source: word|measured, since}``. It is the same call
     :func:`should_push` makes (:func:`_core`, kind ``ping``), so the chip and the push decision for the same instant are
     one answer; the route axis is folded in as there. ``source`` is ``word`` when a word on file (loud, away, quiet, sleep)
     decided, ``measured`` when the desk reading or the route decided; ``since`` is that word's time, else ``None``.
-    ``suggest`` defaults off: a status read never drives the route suggestion. A fault reads as pushing."""
+    ``suggest`` defaults off: a status read never drives the route suggestion, and projects the route a delivery would see
+    (:func:`levain.webpush.route.projected_route`). ``word`` and ``reading`` (the word record and the idle seconds) let a caller
+    that sampled them once get an answer from that same snapshot. ``word`` in the result names the deciding word, else ``None``.
+    A fault reads as pushing."""
     try:
-        d, source, word = _core(queue_dir, "ping", now, idle, suggest)
+        d, source, wrec = _core(queue_dir, "ping", now, idle, suggest, word, reading)
     except Exception:  # noqa: BLE001 - the same fault rule as should_push
-        return {"state": "pushing", "pushing": True, "reason": _FAULT, "source": "measured", "since": None}
-    since = word["ts"] if source == "word" and word is not None else None
-    return {"state": d.state, "pushing": d.push, "reason": d.why, "source": source, "since": since}
+        return {"state": "pushing", "pushing": True, "reason": _FAULT, "source": "measured", "since": None,
+                "word": None}
+    decided = wrec if source == "word" and wrec is not None else None
+    return {"state": d.state, "pushing": d.push, "reason": d.why, "source": source,
+            "since": decided["ts"] if decided else None, "word": decided["word"] if decided else None}
 
 
 def check_setter(word: str, by: dict | None, said: str | None) -> str:
@@ -917,18 +931,20 @@ def _write(queue_dir: Path | str, rec: dict | None) -> None:
 
 
 def describe(queue_dir: Path | str, *, now: float | None = None,
-             idle: Callable[[], float | None] | None = None) -> str:
+             idle: Callable[[], float | None] | None = None, word: object = _UNSET, reading: object = _UNSET) -> str:
     """One line for ``levain ping status``: the word on file, what the rule does now with an ordinary ping, and how many
     pings are held for the phone."""
     ts = time.time() if now is None else now
-    word = read_word(queue_dir)
-    try:
-        if idle is None:
-            from levain.consent.auto_away import input_idle_seconds as idle
-        reading = idle()
-    except Exception:  # noqa: BLE001 - no reading: the rule reads the desk as inactive
-        reading = None
-    d = should_push(queue_dir, "ping", now=ts, idle=lambda: reading, suggest=False)
+    if word is _UNSET:
+        word = read_word(queue_dir)
+    if reading is _UNSET:
+        try:
+            if idle is None:
+                from levain.consent.auto_away import input_idle_seconds as idle
+            reading = idle()
+        except Exception:  # noqa: BLE001 - no reading: the rule reads the desk as inactive
+            reading = None
+    d = should_push(queue_dir, "ping", now=ts, idle=lambda: reading, suggest=False, word=word)
     if word is not None and word["word"] == "sleep" and reading is None and ts < word["ts"] + SLEEP_BLIND_SECS:
         end = time.strftime("%H:%M", time.localtime(word["ts"] + SLEEP_BLIND_SECS))
         d = Decision(d.push, d.state, f"{d.why}; idle source unavailable, so sleep ends at {end}", d.by)

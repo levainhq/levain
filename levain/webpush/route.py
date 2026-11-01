@@ -37,7 +37,7 @@ from levain.webpush.presence import (MAX_SECS, PresenceError, _FIELD_MAX, _clean
                                      parse_duration)
 
 __all__ = ["ROUTES", "ROUTE_WORDS", "AUTO_IDLE_SECS", "read_route", "set_route", "apply_route", "remote_login_present",
-           "auto_suggest"]
+           "auto_suggest", "projected_route"]
 
 ROUTES = ("desk", "devices")
 ROUTE_WORDS = ROUTES   # the words the HTTP set takes for the route alone
@@ -278,6 +278,36 @@ def _run_who() -> str:
         return ""   # no reading is no remote login
 
 
+def _auto_ends(source: str, idle: float | None) -> bool:
+    """The one condition under which a standing auto route ends: the keys are back (idle known and under the threshold)."""
+    return source == "auto" and idle is not None and _num(idle) and idle < AUTO_IDLE_SECS
+
+
+def _auto_may_suggest(route: str, source: str, idle: float | None, who_text) -> bool:
+    """The one condition under which a delivery suggests ``devices``: the laptop idle at least the threshold, no route
+    standing (not ``devices``, no unexpired operator record) and a remote login open. ``who_text`` is a callable returning
+    the ``who`` output, run only when the cheaper conditions hold."""
+    if idle is None or not _num(idle) or idle < AUTO_IDLE_SECS:
+        return False
+    if route == "devices" or source == "operator":
+        return False
+    return remote_login_present(who_text())
+
+
+def projected_route(queue_dir: Path | str | None, *, idle: float | None, now: float | None = None,
+                    who: str | None = None) -> str:
+    """The route a delivery at ``now`` would see after :func:`auto_suggest`, computed with no write, stamp, flush or
+    throttle (pure apart from the read of ``who`` when none is given). It shares auto_suggest's conditions
+    (:func:`_auto_ends`, :func:`_auto_may_suggest`) so the two cannot drift."""
+    ts = time.time() if now is None else now
+    route, source, _until = read_route(queue_dir, ts)
+    if _auto_ends(source, idle):
+        return "desk"
+    if _auto_may_suggest(route, source, idle, lambda: _run_who() if who is None else who):
+        return "devices"
+    return route
+
+
 def auto_suggest(queue_dir: Path | str, *, idle: float | None, who: str | None = None, now: float | None = None,
                  clock=time.time) -> bool:
     """Set ``devices`` (source ``auto``, one hour) when a remote login is open, the laptop's own input has been idle at
@@ -294,12 +324,13 @@ def auto_suggest(queue_dir: Path | str, *, idle: float | None, who: str | None =
         return False
     if who is None and _throttled(queue_dir, clock()):
         return False
-    if not remote_login_present(_run_who() if who is None else who):
+    who_text = _run_who() if who is None else who
+    if not remote_login_present(who_text):
         return False
     try:
         with _locked(queue_dir, strict=True, wait=0.5):
-            route, _source, _until = read_route(queue_dir, ts)
-            if route == "devices":
+            route, source, _until = read_route(queue_dir, ts)
+            if not _auto_may_suggest(route, source, idle, lambda: who_text):
                 return False
             wrote = apply_route(queue_dir, "devices", None, source="auto", now=ts)
             if wrote:

@@ -2426,8 +2426,14 @@ class _Handler(GuardedHandler):
         each when no word stands, or it has ended), and the words of ``presence.describe``."""
         from levain.webpush import presence
 
-        rec = presence.read_word(queue)
+        rec = presence.read_word(queue)   # ONE read of the word and ONE idle sample feed every field below
         now = time.time()
+        try:
+            from levain.consent.auto_away import input_idle_seconds
+
+            reading = input_idle_seconds()
+        except Exception:  # noqa: BLE001 - no reading: the rule reads the desk as inactive
+            reading = None
         if rec is not None and presence.is_expired(rec, now):
             rec = None
         from levain.webpush import route as route_mod
@@ -2435,9 +2441,9 @@ class _Handler(GuardedHandler):
         route, route_source, route_until = route_mod.read_route(queue, now)
         view = {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
                 "route": route, "route_source": route_source, "route_until": route_until,
-                "text": presence.describe(queue),
+                "text": presence.describe(queue, now=now, word=rec, reading=reading),
                 # what the push rule does right now (the same call a delivery makes); a status read never drives the route suggestion
-                "effective": presence.effective(queue, now, suggest=False)}
+                "effective": presence.effective(queue, now, suggest=False, word=rec, reading=reading)}
         if self._credential_is_full():     # a tap token's holder is told the word, never the list of other taps
             from levain.webpush import presence_tokens
 

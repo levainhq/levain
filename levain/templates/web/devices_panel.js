@@ -870,7 +870,7 @@
     if (!prChip) return;
     const eff = v.effective && PR_STATES[v.effective.state] ? v.effective : null;
     // a word on file that is DECIDING shows as the word (and its time left); anything else shows what the rule is doing now
-    const w = eff ? (eff.source === "word" ? v.word : null) : v.word;
+    const w = eff ? (eff.source === "word" ? (eff.word || null) : null) : v.word;
     let name = w ? (PR_WORDS.find((x) => x[0] === w) || [w, w])[1] : (eff ? PR_STATES[eff.state] : "Here");
     let t = name, say = name;
     const ms = w && v.until ? stampMs(v.until) - Date.now() : NaN;
