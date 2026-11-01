@@ -2998,3 +2998,22 @@ body.sheet-embedded #drop-words { min-height: 7em; }
 @media (max-width: 760px) { .modal.modal-sheet { height: 100dvh; max-height: 100dvh; } }
 /* the drop sheet's list of his drops grows with his history: it scrolls inside the sheet */
 body.ke #drop-recent { max-height: 40vh; overflow: auto; }
+
+/* ---- Notifications block (NP S2): the operator's policy for what reaches him under quiet and sleep (devices_panel.js). */
+.dev-panel[hidden] { display: none; }
+.np-sentences { margin: var(--sp-2) 0 var(--sp-4); }
+.np-sentence { margin: 0 0 var(--sp-2); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--text); }
+.np-group { margin-top: var(--sp-5); }
+.np-cls { font: var(--fw-semibold) var(--fs-meta)/1.3 var(--sans); color: var(--text); }
+.np-seg { flex: none; display: flex; gap: var(--sp-1); }
+.np-seg .ck-tab[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
+.np-seg .ck-tab { white-space: nowrap; min-height: 38px; }
+.np-warn { margin-top: var(--sp-2); padding: var(--sp-2) var(--sp-3); border-left: 3px solid var(--bad); color: var(--text); font: var(--fw-semibold) var(--fs-micro)/1.5 var(--sans); }
+.np-warn[hidden] { display: none; }
+.np-bad { color: var(--bad); }
+.np-foot { display: flex; margin-top: var(--sp-5); }
+@media (max-width: 520px) {
+  .np-row { flex-wrap: wrap; }
+  .np-seg { flex: 1 1 100%; }
+  .np-seg .ck-tab { flex: 1 1 0; min-height: var(--hit-min, 44px); }
+}

@@ -102,8 +102,8 @@ def test_the_panel_reads_through_one_shared_promise_and_no_flag_can_stick() -> N
 def test_a_403_refuses_that_token_only_and_a_different_token_revives_the_panel() -> None:
     # L3 r3 H2: `gone` is for 404 alone; a 403 remembers the refused token and reads are skipped only while token() is still it.
     js = load_web_asset("devices_panel.js")
-    assert re.search(r"res\.status === 404\) \{ section\.hidden = true; gone = true;", js)
-    assert re.search(r"res\.status === 403\) \{ section\.hidden = true; refused = tok;", js)
+    assert re.search(r"res\.status === 404\) \{ devShown\(false\); gone = true;", js)
+    assert re.search(r"res\.status === 403\) \{ devShown\(false\); refused = tok;", js)
     assert not re.search(r"403[^\n]*gone = true", js), "a 403 must not set gone for the page"
     assert "if (tok === refused)" in js
     assert js.index("if (gone) return true;") < js.index("if (tok === refused)")
@@ -121,7 +121,7 @@ def test_only_the_devices_list_read_has_a_timeout_never_the_offer_or_revoke_post
             assert "READ_TIMEOUT_MS" in line, line
         else:
             assert "READ_TIMEOUT_MS" not in line and "timeout" not in line.lower(), line
-    assert len(re.findall(r'api\("POST"', js)) == 4      # offer, revoke, and the pings subscribe and unsubscribe (OS-4)
+    assert len(re.findall(r'api\("POST"', js)) == 5      # offer, revoke, the pings subscribe and unsubscribe (OS-4), the policy write (NP S2: one call, the route an argument)
 
 
 def _fetch_calls(js: str) -> "list[str]":
