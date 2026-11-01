@@ -4559,7 +4559,7 @@
       // recommendation or any control; it keeps what is known (the title when the body came, else the question's number) and says so
       const known = !b.error;
       const parts = [el("div", "needs-q-title", (known && sv(b.what)) || "Question " + q.n),
-                     el("div", "consent-note ext-meta needs-answer-line", known ? "answer not shown" : "answer not shown (" + b.error + ")")];
+                     el("div", "consent-note ext-meta needs-answer-line", known ? "answer not shown" : "answer not shown (" + String(b.error).slice(0, 200) + ")")];
       const more = known ? blocksBeyondTitle(sv(b.what), sv(b.blocks)) : "";
       if (more) parts.push(questionText(more, null, [], "") || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
       slot.replaceChildren(...parts);

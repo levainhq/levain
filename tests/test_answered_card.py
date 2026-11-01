@@ -377,8 +377,8 @@ def _failed_read_run(tmp_path: Path, monkeypatch, core: str | None = None) -> di
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             DESKTOP, {"init": bad},
-            {"until": "document.querySelector('#ck-needs .needs-answered .needs-card') && 1", "ms": 30000},
-            {"eval": "new Promise((r) => setTimeout(() => r(1), 2500))"},
+            {"until": "(() => { const b = document.querySelector('#ck-needs .needs-answered .needs-card .needs-body'); "
+                      "return !!b && b.textContent !== '' && !/reading the question/.test(b.textContent) && 1; })()", "ms": 30000},
             {"eval": RECEIPT}])
     return _values(out, '"receipt"')
 
