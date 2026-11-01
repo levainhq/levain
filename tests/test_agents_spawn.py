@@ -561,7 +561,9 @@ def test_the_first_reader_holds_a_spawned_worker_to_its_stored_scope(ctx, wdir, 
 # --- levain coord spawn ----------------------------------------------------------------------------------------------
 def test_levain_coord_spawn_is_the_caller_drop_split_spawn_watch_status(store, qdir, fake, live_hook, wdir, registry,
                                                                         tmp_path, capsys):  # noqa: F811
-    assert ("coord", "spawn") in door.DOOR
+    from levain.cli import build_parser
+
+    assert ("coord", "spawn") in door.door_paths(build_parser())
     role_mod.add_role(registry, role())
     token = store.coord_take()
     d, _ = store.accept_drop("make the readme say hello", surface="cli")
@@ -738,7 +740,9 @@ def test_a_done_workers_handoff_is_readable_after_it_is_stopped(store, qdir, fak
     none = store.launch_handoff(token, quiet.launch_id)
     assert none["handoff"] is None and "no text" in none["why"]
     # the lease holder reads it through its door; a token that is not the live lease's reads nothing
-    assert ("coord", "handoff", "worker") in door.DOOR
+    from levain.cli import build_parser
+
+    assert ("coord", "handoff", "worker") in door.door_paths(build_parser())
     out = _main(qdir, capsys, "coord", "handoff", "worker", ln.launch_id, "--token", str(token))
     assert "DONE: README says hello" in out.out
     out = _main(qdir, capsys, "coord", "handoff", "worker", quiet.launch_id, "--token", str(token))

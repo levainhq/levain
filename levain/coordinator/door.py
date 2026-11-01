@@ -1,10 +1,11 @@
 """The coordinator's door: what may run of the ``levain`` CLI inside the coordinator's workspace.
 
 np-6843ca07 (a), signed, and the head's 1021-18 rulings: a command run from inside the coordinator's workspace is
-DEFAULT-DENY. A command whose path is not in :data:`DOOR` is refused, in every tree, and every write it does run goes
-``--by coordinator`` under its lease token (an operator write is unfenced, so a session that lost its lease could
-otherwise still write). A command not listed here is refused there until it is listed: the check reads the command
-path off the parser itself, so a new tree needs no second list to be covered.
+DEFAULT-DENY. A command is refused, in every tree, unless its own parser was marked :func:`door_ok` where the verb is
+defined, and every write it does run goes ``--by coordinator`` under its lease token (an operator write is unfenced,
+so a session that lost its lease could otherwise still write). A verb with no mark (or marked :func:`not_door`) is
+refused there: the mark rides in the parsed arguments, so a new verb or tree needs no second list to be covered, and
+:func:`door_paths` derives the open paths from the parser.
 
 Provenance is WHERE the command runs, never a lookup of the session: the process's working directory, walked up to the
 filesystem root, is inside a coordinator's workspace or is not. Both harnesses' tool subprocesses start in the
@@ -41,30 +42,48 @@ import stat
 from pathlib import Path
 from typing import Any
 
-# The coordinator's own verbs (its brief names these), the team-ledger draft it may write, and the team tree's read
-# verbs. Never `team record` / `retire` / `draft promote`: the ledger is signed by the operator.
-DOOR: frozenset[tuple[str, ...]] = frozenset({
-    ("coord", "status"), ("coord", "claim"), ("coord", "beat"), ("coord", "release"),
-    # the seats' questions, read first (C5): its own KNOWs and escalations, never the operator's answer verb
-    ("coord", "questions"), ("coord", "answer"), ("coord", "escalate"),
-    # away ON from a drop (fenced by the lease token), and the budget gauge and morning card it reads (C6)
-    ("coord", "away"), ("coord", "budget"), ("coord", "morning"),
-    # its answer to words he dropped from the cockpit or the phone (C11 S4), fenced by the lease token
-    ("coord", "reply"),
-    # one worker for a WORK thread (P3), fenced by the lease token; the store derives its scope and depth
-    ("coord", "spawn"),
-    # a done spawned worker's handoff, its final message, read back under the lease token (P3); it writes nothing
-    ("coord", "handoff", "worker"),
-    # the display-only list a work delta's "+N more" line points at; it makes nothing
-    ("coord", "log"),
-    # the seam (C15 S3): its open and the acknowledgement of it, the handoff it leaves, and reading one back
-    ("coord", "open"), ("coord", "close"), ("coord", "handoff", "show"),
-    ("drops", "list"), ("drops", "show"), ("drops", "split"), ("drops", "note"),
-    ("thread", "list"), ("thread", "show"), ("thread", "state"), ("thread", "merge"), ("thread", "detach"),
-    ("thread", "add"), ("thread", "set"),
-    ("team", "draft", "add"), ("team", "draft", "list"), ("team", "draft", "show"),
-    ("team", "status"), ("team", "verify"), ("team", "export"), ("team", "doctor"),
-})
+# The door is declared AT each verb's definition, never in a second list: ``door_ok(leaf)`` marks a leaf parser the
+# coordinator may run, ``not_door(leaf)`` marks one it may not, and a leaf marked neither is refused (default-deny).
+# Never `team record` / `retire` / `draft promote`: the ledger is signed by the operator.
+DOOR_DEST = "door"
+
+
+def door_ok(*parsers: argparse.ArgumentParser) -> None:
+    """Declare each leaf parser a verb the coordinator's door lets run (a write still goes --by coordinator, under
+    its lease token)."""
+    for p in parsers:
+        p.set_defaults(**{DOOR_DEST: True})
+
+
+def not_door(*parsers: argparse.ArgumentParser) -> None:
+    """Declare each leaf parser a verb that is the operator's: refused inside the coordinator's workspace."""
+    for p in parsers:
+        p.set_defaults(**{DOOR_DEST: False})
+
+
+def _leaves(parser: argparse.ArgumentParser, path: tuple[str, ...] = ()) -> Any:
+    """Every ``(path, leaf parser)`` under ``parser``; an alias is one leaf, under the first name it was added by."""
+    subs = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)]
+    if not subs:
+        yield path, parser
+        return
+    seen: set[int] = set()
+    for name, child in subs[0].choices.items():
+        if id(child) not in seen:
+            seen.add(id(child))
+            yield from _leaves(child, (*path, name))
+
+
+def declared_leaves(parser: argparse.ArgumentParser) -> dict[tuple[str, ...], bool | None]:
+    """Each leaf path under ``parser`` and its declaration: True (door_ok), False (not_door), None (neither)."""
+    return {path: leaf.get_default(DOOR_DEST) for path, leaf in _leaves(parser)}
+
+
+def door_paths(parser: argparse.ArgumentParser) -> frozenset[tuple[str, ...]]:
+    """The command paths the door lets run, derived from ``parser`` (the root parser, ``levain.cli.build_parser()``)
+    by collecting every leaf marked ``door_ok``."""
+    return frozenset(path for path, mark in declared_leaves(parser).items() if mark is True)
+
 
 _DB_NAME = "dispatch.db"
 _ROLE = "coordinator"
@@ -423,7 +442,7 @@ def refusal(parser: argparse.ArgumentParser, args: argparse.Namespace) -> str | 
         return f"{words}: {unreadable(exc)}"
     if ws is None:
         return None
-    if path not in DOOR:
+    if getattr(args, DOOR_DEST, False) is not True:
         return (f"{words}: `{words}` is the operator's, and this is the coordinator's workspace ({ws}); run it "
                 "from your own terminal, outside it")
     if getattr(args, "by", "coordinator") != "coordinator":

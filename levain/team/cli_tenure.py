@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from levain.coordinator.door import not_door
+
 from . import roles as R
 from . import signing as S
 from . import tenure as T
@@ -428,17 +430,17 @@ def register(sub, add) -> None:
         return run
 
     p = add("owner", wrap(cmd_owner), "Owner only: offer ownership to a member (they accept with a key already "
-            "in force for them).")
+            "in force for them).", door=False)
     p.add_argument("handle", nargs="?")
     p.add_argument("--email")
     p.add_argument("--cancel", action="store_true", help="withdraw the pending offer")
     p.add_argument("--no-push", action="store_true")
 
     p = add("accept", wrap(cmd_accept), "Accept a pending ownership offer made to the member whose key this "
-            "machine holds.")
+            "machine holds.", door=False)
     p.add_argument("--no-push", action="store_true")
 
-    p = add("key", None, "Signing keys: add (pending until proven), confirm, remove.")
+    p = add("key", None, "Signing keys: add (pending until proven), confirm, remove.", door=None)
     ksub = p.add_subparsers(dest="key_command", required=True)
     for name, fn, help_ in (("add", cmd_key_add, "propose a key: the member's own, or the owner's for a member with no key yet"),
                             ("confirm", cmd_key_confirm, "prove this machine's pending key"),
@@ -454,39 +456,40 @@ def register(sub, add) -> None:
             kp.add_argument("fingerprint")
         from .cli import _guarded
         kp.set_defaults(func=_guarded(wrap(fn)))
+        not_door(kp)
 
-    p = add("revoke", wrap(cmd_revoke), "Owner only: void every commit a stolen key signed after a commit.")
+    p = add("revoke", wrap(cmd_revoke), "Owner only: void every commit a stolen key signed after a commit.", door=False)
     p.add_argument("fingerprint")
     p.add_argument("--after", required=True)
     p.add_argument("--no-push", action="store_true")
 
-    p = add("veto", wrap(cmd_veto), "Owner only: revoke a past spell's authority (owner links, or member lines).")
+    p = add("veto", wrap(cmd_veto), "Owner only: revoke a past spell's authority (owner links, or member lines).", door=False)
     p.add_argument("handle")
     p.add_argument("--role", choices=("owner", "member"), required=True)
     p.add_argument("--since", required=True, help="the counted commit that began the spell")
     p.add_argument("--no-push", action="store_true")
 
-    p = add("distrust", wrap(cmd_distrust, fetch=False), "This clone only: stop counting one commit (an emergency act).")
+    p = add("distrust", wrap(cmd_distrust, fetch=False), "This clone only: stop counting one commit (an emergency act).", door=False)
     p.add_argument("commit", nargs="?")
     p.add_argument("--list", action="store_true")
     p.add_argument("--clear", action="store_true")
 
-    p = add("repin", wrap(cmd_repin, fetch=False), "This clone only: re-pin the genesis or the anchor the owner names.")
+    p = add("repin", wrap(cmd_repin, fetch=False), "This clone only: re-pin the genesis or the anchor the owner names.", door=False)
     p.add_argument("--root")
     p.add_argument("--anchor")
 
     p = add("accept-merge", wrap(cmd_accept_merge, fetch=False), "This clone only, on the owner's word: follow one parent of a "
-                                                    "merge on the ledger; lists what it leaves out.")
+                                                    "merge on the ledger; lists what it leaves out.", door=False)
     p.add_argument("merge")
     p.add_argument("--parent", type=int, required=True,   # a trust decision, never a default (docs L3 r1)
                    help="the merge parent the owner named (1 = the published line)")
 
     p = add("retire-legacy", wrap(cmd_retire_legacy), "Delete the remote 0.6.x levain-ledger (its owner only, or "
-                                                      "--force); it is never read or converted.")
+                                                      "--force); it is never read or converted.", door=False)
     p.add_argument("--force", action="store_true")
 
     p = add("regenesis", wrap(cmd_regenesis), "After a permanently lost owner: a fresh strict genesis on a new "
-                                              "branch, carrying the old ledger as a read-only record.")
+                                              "branch, carrying the old ledger as a read-only record.", door=False)
     p.add_argument("--from", dest="from_", required=True,
                    help="the old ledger tip to carry (a commit of the pinned ledger this clone holds)")
     p.add_argument("--owner", required=True)

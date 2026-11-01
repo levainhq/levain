@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from levain import unshowable
+from levain.coordinator.door import door_ok, not_door
 
 from . import entry as E
 from .ledger_api import open_ledger
@@ -221,10 +222,10 @@ def register(sub, add) -> None:
     a.add_argument("--owner"); a.add_argument("--words"); a.add_argument("--words-file")
     a.add_argument("--summary"); a.add_argument("--reason"); a.add_argument("--recheck")
     a.add_argument("--paths", action="append", metavar="GLOB"); a.add_argument("--thread")
-    actor(a); common(a)
-    ls = dsub.add_parser("list", help="Open drafts and any being promoted (--all: every draft)."); ls.add_argument("--all", action="store_true"); common(ls)
-    sh = dsub.add_parser("show", help="One draft."); sh.add_argument("draft_id"); common(sh)
-    w = dsub.add_parser("withdraw", help="Withdraw a draft."); w.add_argument("draft_id"); actor(w); common(w)
+    actor(a); common(a); door_ok(a)
+    ls = dsub.add_parser("list", help="Open drafts and any being promoted (--all: every draft)."); ls.add_argument("--all", action="store_true"); common(ls); door_ok(ls)
+    sh = dsub.add_parser("show", help="One draft."); sh.add_argument("draft_id"); common(sh); door_ok(sh)
+    w = dsub.add_parser("withdraw", help="Withdraw a draft."); w.add_argument("draft_id"); actor(w); common(w); not_door(w)
     pr = dsub.add_parser("promote", help="Show a draft whole, then sign it into the ledger with your key (yours only).")
     pr.add_argument("draft_id"); pr.add_argument("--yes", action="store_true")
     pr.add_argument("--words", help="the decider's own words (a ruling's are required: the draft's are never signed)")
@@ -233,6 +234,7 @@ def register(sub, add) -> None:
     pr.add_argument("--resume", action="store_true",
                     help="take over a reservation whose promote is gone (run in the clone that made it)")
     common(pr)
+    not_door(pr)
 
 
 def _run(args) -> int:
