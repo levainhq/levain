@@ -571,6 +571,19 @@ def test_mint_list_and_revoke_ride_the_full_credential_only(rig):
         assert _call(port, "POST", REVOKE, {"name": "Hub"}, token=T)[0] == 404
 
 
+def test_a_mint_whose_listing_fails_still_returns_the_token_it_made(rig, monkeypatch):
+    # the secret is shown once: a failed supplementary listing after the commit must not withhold it
+    src, q = rig
+    def boom(_q):
+        raise nt.NotifyTokenError("listing failed")
+    monkeypatch.setattr(nt, "list_public", boom)
+    with _signed(src, q) as (port, _):
+        st, got, _ = _call(port, "POST", TOKENS, {"name": "Hub"}, token=T)
+    assert st == 200 and got["token"].startswith("lvn_") and got["tokens"] == []
+    monkeypatch.undo()
+    assert [r["name"] for r in nt.list_public(q)] == ["Hub"]
+
+
 @pytest.mark.parametrize("body,status,error", [
     ({}, 400, "bad_request"), ({"name": 3}, 400, "bad_request"), ({"name": "a", "words": ["x"]}, 400, "bad_request"),
     ({"name": "a", "caps": {}}, 400, "bad_request"), ([1], 400, "bad_request"),

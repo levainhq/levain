@@ -2560,7 +2560,11 @@ class _Handler(GuardedHandler):
         try:
             if new:
                 rec, token = notify_tokens.create(queue, req["name"], **{k: v for k, v in req.items() if k != "name"})
-                return {"token": token, "record": rec, "tokens": notify_tokens.list_public(queue)}, 200
+                try:
+                    listing = notify_tokens.list_public(queue)
+                except notify_tokens.NotifyTokenError:
+                    listing = []   # the token is already minted and shown once: a failed supplementary listing must not withhold it
+                return {"token": token, "record": rec, "tokens": listing}, 200
             if not notify_tokens.revoke(queue, req["name"]):
                 return {"error": "not_found", "message": "no live notify token has that name"}, 404
             return {"tokens": notify_tokens.list_public(queue)}, 200
