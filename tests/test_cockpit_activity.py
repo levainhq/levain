@@ -192,7 +192,7 @@ def _flow_ids(ck) -> None:
     """flow's Bridge panels, by id, kind and region, as scripts/flow_cockpit.py registers them."""
     r = lambda ctx: Read(value={})                                               # noqa: E731
     ck.register(ProviderSpec("brief", "brief", "Brief", "gauge", r, region="brief", rank=-2))
-    ck.register(ProviderSpec("weather", "reading", "Weather", "gauge", r, region="hero", rank=1, optional=True))
+    ck.register(ProviderSpec("reading-a", "reading", "Reading A", "gauge", r, region="hero", rank=1, optional=True))
     ck.register(ProviderSpec("sky", "ambient", "Sky", "feed", r, region="hero", rank=2))
     ck.register(ProviderSpec("inbox", "list", "Inbox", "feed", r, region="operate", rank=22, order="time.desc",
                              version_fields=("*",)))
@@ -217,7 +217,7 @@ def test_r1_activity_yields_the_hero_to_a_downstream_ambient(tmp_path):
     _flow_ids(ck)                                                                # flow's sky: no raise
     ids = set(ck.panel_ids)
     assert "sky" in ids and "activity" not in ids
-    assert ck.manifest(CRED)["regions"]["hero"] == ["weather", "sky"]
+    assert ck.manifest(CRED)["regions"]["hero"] == ["reading-a", "sky"]
     assert ck.panel("activity", credential_class="none") is None
     # a second hero ambient after sky is still refused: only the kernel's default yields
     with pytest.raises(Exception, match="the hero holds at most one ambient"):

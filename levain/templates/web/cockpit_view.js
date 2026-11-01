@@ -727,7 +727,7 @@
     }
     if (wrapsFail) view.errors.wraps = wrapsFail;
 
-    // header region: state goes under the masthead; any other header panel (a downstream's weather, say)
+    // header region: state goes under the masthead; any other header panel (a downstream reading, say)
     // is drawn as a panel first in Operate, never silently dropped. An older kernel's `focus` panel is
     // retired data, not a fault: it is skipped. A manifest that declares hero / brief / widgets is KE-shaped:
     // those regions are drawn from their own lists and `header` (their derived union) is not read.
@@ -939,7 +939,7 @@
           span: c.span === 2 || c.span === 3 ? c.span : 1, tabs: typeof c.tabs === "string" && c.tabs ? c.tabs : "" })) });
       }
     }
-    // the hero is the page's header and reads the same in every mode: its weather is not one of the orientation
+    // the hero is the page's header and reads the same in every mode: its panels are not among the orientation
     // readings Build drops
     const inHero = new Set(view.ke ? view.ke.hero : []);
     for (const e of view.layout) e.modes = inHero.has(e.id) ? ALL_TABS : modesOf(e);
@@ -1105,80 +1105,14 @@
     }
   }
 
-  // The reading's icon: one inline SVG per token of the contract's READING_SYMBOLS, drawn from a few shared
-  // parts (no external asset, no icon font). An unknown token draws the plain cloud rather than nothing.
-  const SVG_NS = "http://www.w3.org/2000/svg";
-  const ICON_INK = "#c9d2e3", ICON_SUN = "#ffd36b", ICON_RAIN = "#7fb2ff";
-  const P = {
-    cloud: ["path", { d: "M14 30h24a9 9 0 0 0 1-17.9A12 12 0 0 0 14.3 11 10 10 0 0 0 14 30z", fill: ICON_INK }],
-    cloudHi: ["path", { d: "M12 30h22a9 9 0 0 0 .8-18A11.5 11.5 0 0 0 12.3 11 9.6 9.6 0 0 0 12 30z", fill: ICON_INK }],
-    sun: ["circle", { cx: 26, cy: 20, r: 9, fill: ICON_SUN }],
-    sunHi: ["circle", { cx: 34, cy: 12, r: 7, fill: ICON_SUN }],
-    rays: ["path", { d: "M26 3v5M26 32v5M9 20h5M38 20h5M14 8l3.5 3.5M34.5 28.5L38 32M14 32l3.5-3.5M34.5 11.5L38 8", stroke: ICON_SUN, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
-    moon: ["path", { d: "M32 6a14 14 0 1 0 8 25A11 11 0 0 1 32 6z", fill: ICON_INK }],
-    moonHi: ["path", { d: "M38 4a9 9 0 1 0 5 16A7 7 0 0 1 38 4z", fill: ICON_INK }],
-    drops: ["path", { d: "M18 35l-2 6M27 35l-2 6M36 35l-2 6", stroke: ICON_RAIN, "stroke-width": 2.5, "stroke-linecap": "round", fill: "none" }],
-    drizzle: ["path", { d: "M19 35l-1 3M28 35l-1 3M37 35l-1 3", stroke: ICON_RAIN, "stroke-width": 2, "stroke-linecap": "round", fill: "none" }],
-    heavy: ["path", { d: "M15 34l-3 8M22 34l-3 8M29 34l-3 8M36 34l-3 8", stroke: ICON_RAIN, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
-    snow: ["path", { d: "M18 36v5M15.5 38.5h5M27 36v5M24.5 38.5h5M36 36v5M33.5 38.5h5", stroke: ICON_INK, "stroke-width": 2, "stroke-linecap": "round", fill: "none" }],
-    bolt: ["path", { d: "M29 28l-7 9h5l-3 7 9-10h-5z", fill: ICON_SUN }],
-    lines: ["path", { d: "M8 34h36M12 40h28M8 28h36", stroke: ICON_INK, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
-    wind: ["path", { d: "M6 18h28a5 5 0 1 0-5-5M6 26h36a5 5 0 1 1-5 5M6 34h20", stroke: ICON_INK, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
-    haze: ["path", { d: "M10 20h32M6 27h40M10 34h32", stroke: ICON_SUN, "stroke-width": 3, "stroke-linecap": "round", opacity: 0.7, fill: "none" }],
-  };
-  const ICONS = {
-    "clear": ["sun", "rays"], "clear-night": ["moon"], "partly-cloudy": ["sunHi", "cloudHi"], "partly-cloudy-night": ["moonHi", "cloudHi"],
-    "cloudy": ["cloud"], "fog": ["cloud", "lines"], "drizzle": ["cloud", "drizzle"], "rain": ["cloud", "drops"], "heavy-rain": ["cloud", "heavy"],
-    "thunderstorm": ["cloud", "bolt"], "snow": ["cloud", "snow"], "sleet": ["cloud", "drops", "snow"], "wind": ["wind"], "haze": ["haze"],
-  };
-  function weatherIcon(symbol) {
-    const svg = document.createElementNS(SVG_NS, "svg");
-    svg.setAttribute("viewBox", "0 0 52 44");
-    svg.setAttribute("width", "52");
-    svg.setAttribute("height", "44");
-    svg.setAttribute("class", "wx-icon");
-    svg.setAttribute("role", "img");
-    svg.setAttribute("aria-label", typeof symbol === "string" && symbol ? symbol : "weather");
-    for (const key of (Object.prototype.hasOwnProperty.call(ICONS, symbol) ? ICONS[symbol] : ICONS.cloudy)) {
-      const [tag, attrs] = P[key];
-      const n = document.createElementNS(SVG_NS, tag);
-      for (const k of Object.keys(attrs)) n.setAttribute(k, String(attrs[k]));
-      svg.appendChild(n);
-    }
-    return svg;
-  }
-  // the EPA band a sub-reading names, compared case-insensitively against the contract's lowercase tokens
-  const BAND_WORDS = { "good": "Good", "moderate": "Moderate", "unhealthy-sensitive": "Unhealthy for sensitive groups", "unhealthy": "Unhealthy",
-    "very-unhealthy": "Very unhealthy", "hazardous": "Hazardous" };
-  function bandOf(raw) {
-    const t = String(raw).trim().toLowerCase().replace(/\s+/g, "-");
-    return Object.prototype.hasOwnProperty.call(BAND_WORDS, t) ? t : "";
-  }
-  function bars() {
-    const svg = document.createElementNS(SVG_NS, "svg");
-    svg.setAttribute("viewBox", "0 0 16 14");
-    svg.setAttribute("width", "16");
-    svg.setAttribute("height", "14");
-    svg.setAttribute("aria-hidden", "true");
-    const g = document.createElementNS(SVG_NS, "path");
-    g.setAttribute("d", "M2 3h9M2 7h12M2 11h7");
-    g.setAttribute("stroke", "currentColor");
-    g.setAttribute("stroke-width", "2");
-    g.setAttribute("stroke-linecap", "round");
-    g.setAttribute("fill", "none");
-    svg.appendChild(g);
-    return svg;
-  }
-
-  // opts (a glance tile only): rows = how many band sub-readings to draw, age = whether the "read ... ago" line is drawn
+  // The generic reading face: a figure with its unit, a condition under it, and at the side every sub-reading (a banded one carries
+  // its band in words after the figure) and the bounds. It draws no glyph or colour of its own; what a reading means is the
+  // downstream provider's. opts (a glance tile only): side = how many sub-reading lines to draw, age = whether the "read ... ago"
+  // line is drawn
   function paintReading(host, v, opts) {
-    const cap = opts && opts.rows != null ? opts.rows : Infinity;
     const sideCap = opts && opts.side != null ? opts.side : Infinity;
-    let drawn = 0, sideDrawn = 0;
+    let sideDrawn = 0;
     const top = el("div", "rd wx-main");
-    const icon = weatherIcon(v.symbol);
-    icon.setAttribute("data-ck-weather", "icon");
-    top.appendChild(icon);
     const main = el("div", "wx-big");
     const t = el("div", "wx-t");
     t.appendChild(el("span", "rd-n num", v.value));
@@ -1186,15 +1120,15 @@
     main.appendChild(t);
     if (v.condition) main.appendChild(el("div", "rd-c wx-c", v.condition));
     top.appendChild(main);
-    // what sits to the side of the figure: the bounds, and every sub-reading that carries no band
     const side = el("div", "wx-side");
     const subs = Array.isArray(v.sub) ? v.sub : [];
     for (const sub of subs) {
-      if (typeof sub.band === "string" && sub.band) continue;
       if (sideDrawn++ >= sideCap) continue;
       const line = el("div", "rd-sub");
       line.appendChild(document.createTextNode(sub.label + " "));
       line.appendChild(el("b", "num", sub.value == null ? "" : sub.value));
+      if (typeof sub.band === "string" && sub.band) line.appendChild(document.createTextNode(" " + sub.band));
+      if (typeof sub.detail === "string" && sub.detail) line.title = sub.detail;
       side.appendChild(line);
     }
     const bounds = [isNum(v.hi) ? ["H", v.hi] : null, isNum(v.lo) ? ["L", v.lo] : null].filter(Boolean);
@@ -1205,25 +1139,6 @@
     }
     if (side.childNodes.length) top.appendChild(side);
     host.appendChild(top);
-    // the banded sub-readings (air, pollen, any other) are one small table beside the figure: a band glyph, the name, the figure on a
-    // tabular column, the band in words; each source line sits under its own row. An absent reading draws nothing, never a placeholder.
-    const air = el("div", "wx-air");
-    for (const sub of subs) {
-      if (!(typeof sub.band === "string" && sub.band)) continue;
-      if (drawn++ >= cap) continue;
-      const token = bandOf(sub.band);
-      const row = el("div", "aqi band-" + (token || "other"));
-      row.appendChild(bars());
-      row.appendChild(el("span", "aqi-l", sub.label.charAt(0).toUpperCase() + sub.label.slice(1)));
-      row.appendChild(el("b", "num aqi-v", sub.value == null ? "" : String(sub.value)));
-      // the pill carries the band in words; `good` is calm, any other named band is hot, an unknown one neutral
-      const pill = el("span", "pill" + (token && token !== "good" ? " hot" : ""), token ? BAND_WORDS[token] : sub.band);
-      pill.setAttribute("data-ck-weather", "aqi");
-      row.appendChild(pill);
-      air.appendChild(row);
-      if (typeof sub.detail === "string" && sub.detail) { row.title = sub.detail; air.appendChild(el("div", "wx-src aqi-d", sub.detail)); }
-    }
-    if (air.childNodes.length) host.appendChild(air);
     const age = typeof v.as_of === "string" ? ago(v.as_of) : "";
     if (age && !(opts && opts.age === false)) host.appendChild(el("div", "wx-src wx-age", "read " + age));
   }
@@ -1363,16 +1278,14 @@
     }
     if (d.kind === "reading") {
       const r = d.reading || {};
-      // every component the tile draws is budgeted: the side lines (sub-readings with no band) first, then the band rows, and the
-      // "read ... ago" line goes before any of them; whatever is not drawn is counted, so the tile opens
-      const subs = Array.isArray(r.sub) ? r.sub : [];
-      const bands = subs.filter((x) => typeof x.band === "string" && x.band).length;
-      const side = subs.length - bands;
+      // every component the tile draws is budgeted: the sub-reading lines first and the "read ... ago" line before any of them;
+      // whatever is not drawn is counted, so the tile opens
+      const side = Array.isArray(r.sub) ? r.sub.length : 0;
       const hasAge = typeof r.as_of === "string" && !!ago(r.as_of);
-      s.units = side + bands;
-      const sideShown = Math.min(side, cap), bandShown = Math.min(bands, Math.max(0, cap - side));
-      paintReading(host, r, { rows: bandShown, side: sideShown, age: !s.noAge });
-      s.hidden = side - sideShown + bands - bandShown + (s.noAge && hasAge ? 1 : 0);
+      s.units = side;
+      const sideShown = Math.min(side, cap);
+      paintReading(host, r, { side: sideShown, age: !s.noAge });
+      s.hidden = side - sideShown + (s.noAge && hasAge ? 1 : 0);
       moreNote(host, s.hidden);
       return;
     }

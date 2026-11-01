@@ -588,7 +588,7 @@
     const state = document.getElementById("state"), store = document.getElementById("store");
     if (state && store && store.parentNode && state.parentNode !== store.parentNode) store.parentNode.insertBefore(state, store);
   }
-  // a failed hero render: the CONTENT mounts are emptied (stale weather and sky beside the error line would read as current);
+  // a failed hero render: the CONTENT mounts are emptied (stale sky beside the error line would read as current);
   // the structural mounts (#ck-hero, #ck-band, #ck-skycol) stay for the next render
   function restoreHero() {
     for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-wrapline"]) { const m = document.getElementById(id); if (m) { m.replaceChildren(); if (id === "ck-legend") m.hidden = true; } }
@@ -630,7 +630,7 @@
     return entry.pkind || (data && data.kind) || entry.kind || "unknown";
   }
 
-  // one bare node (no panel header): the hero's weather and sky, the brief, the widgets. It draws what a zone card draws
+  // one bare node (no panel header): the hero's sky, the brief, the widgets. It draws what a zone card draws
   // for the same panel: the banner (stale / partial / held back / an alert), the note, then the content in whichever
   // shape the contract allows (markdown, a typed face, or lines). An alert is content, so it suppresses the empty message.
   // An error sentence from a provider may carry a raw ISO timestamp ("failing since 2026-10-21T22:37:12.126051+00:00"): shown as the local clock
@@ -744,10 +744,10 @@
     };
     const entries = view.ke.hero.map((id) => byId.get(id)).filter(Boolean);
     const kindOf = (e) => ((view.extra_panels || {})[e.id] || {}).kind;
-    const wx = entries.find((e) => kindOf(e) === "reading"), sky = entries.find((e) => kindOf(e) === "ambient");
+    const sky = entries.find((e) => kindOf(e) === "ambient");
     // the now band: the clock and date at the left, the state line beside them (placed by renderBriefRegion), and at the right the
-    // wrap line (always something real: the last wrap, or "No wraps yet" and a fact the install has), the sky's event count and the
-    // weather when a provider supplies one. A bare install has no sky and no weather and the band is still whole.
+    // wrap line (always something real: the last wrap, or "No wraps yet" and a fact the install has), and the sky's event count.
+    // A bare install has no sky and the band is still whole.
     const clock = el("div", "clock num"), date = el("div", "date"), events = el("div", "events");
     clock.dataset.ckHero = "clock"; date.dataset.ckHero = "date"; events.dataset.ckHero = "events";
     // everything that can throw is built off the page; the structural mounts (when, wrap line, sky)
@@ -757,39 +757,14 @@
     stamp.append(clock, date);
     whenKids.push(stamp);
     const lastWrap = wrapLineOf(view);
-    if (!wx) metaKids.push(lastWrap);   // with a weather card the wrap line rides the card's foot row instead (no dead band under it)
+    metaKids.push(lastWrap);
     metaKids.push(events);
-    if (wx) {
-      const node = bareNode(wx, view, "wx");
-      node.dataset.ckHero = "weather";
-      lastWrap.classList.add("wx-wrap");
-      const V = window.LevainCockpitView;
-      if (V && typeof V.refetchPanel === "function") {
-        // re-reads this panel's source now; the source decides how fresh that is (the read age under the figure says)
-        const again = el("button", "wx-refresh", "↻");
-        again.type = "button";
-        again.title = "Read the weather again";
-        again.setAttribute("aria-label", "Read the weather again");
-        // busy, not disabled: a disabled button drops the keyboard focus of the reader who pressed it
-        let busy = false;
-        again.addEventListener("click", () => {
-          if (busy) return;
-          busy = true;
-          again.setAttribute("aria-busy", "true");
-          Promise.resolve().then(() => V.refetchPanel(wx.id)).catch(() => "fault").then((r) => {
-            // `false`: the panel cannot be re-read on its own (no longer external, its shape moved, or a board render
-            // landed meanwhile): the board reloads, as the stream does with the same answer
-            const T = window.LevainCockpitTransport;
-            if (r === false && T && typeof T.reload === "function") return T.reload();
-            return r;
-          }).catch(() => "fault").finally(() => { busy = false; again.removeAttribute("aria-busy"); });
-        });
-        node.append(lastWrap, again);
-      } else node.appendChild(lastWrap);
-      metaKids.push(node);
-    }
     if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events, place: legendHook.place, hide: legendHook.hide } }));
-    for (const e of entries) if (e !== wx && e !== sky) skyKids.push(bareNode(e, view, "ck-card"));
+    for (const e of entries) if (e !== sky) {
+      const card = bareNode(e, view, "ck-card");
+      if (typeof e.title === "string" && e.title) card.insertBefore(el("div", "needs-sec-label", e.title), card.firstChild);
+      skyKids.push(card);
+    }
     // the clock is mounted only now: nothing after this can throw, so no clock ticks on a node that never attached
     if (window.LevainCockpitKinds) window.LevainCockpitKinds.mountClock(clock, date);
     when.replaceChildren(...whenKids);
