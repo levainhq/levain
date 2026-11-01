@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>Levain · tap trace</title>
+<link rel="stylesheet" href="/dashboard.css" />
+</head>
+<body class="pair-body">
+  <main class="pair-card" aria-live="polite">
+    <div class="pair-brand"><span class="pair-dot"></span>Levain tap trace</div>
+    <p id="tt-head" class="pair-msg">Reading the trace…</p>
+    <div class="pair-actions">
+      <button id="tt-refresh" class="dev-btn" type="button">Refresh</button>
+      <button id="tt-clear" class="dev-btn" type="button">Clear</button>
+    </div>
+    <div id="tt-lines"></div>
+  </main>
+  <!-- No sw_open.js here: this page must never claim a pending tap target. The script is its own file (CSP: no inline). -->
+  <script src="/tap_trace.js"></script>
+</body>
+</html>
