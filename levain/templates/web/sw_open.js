@@ -127,6 +127,58 @@
   // once, at this document's first script run: a pageshow call would let a page opened for one tap consume a later tap's entry
   checkPending();
 
+  // The trace REPORT: the ring posted to /webpush/trace with the key this paired page holds in localStorage (the same key
+  // pair_card.js posts opens with), so a tap test needs only the tap and the operator reads the report at the laptop
+  // (levain.webpush.tap_report). Every page that loads this script reports, so a tap landing on any of them is read. Step
+  // names, counts and path-only urls: no token, no ping body. Best effort and silent. One post per ring CONTENT: what is
+  // remembered is the whole list of cache keys joined, compared for equality only, so no clock order (a device clock that
+  // moved back) and no count can hide a new step. An answer that is not a settle (a refused key, 429, 5xx, no network) tries
+  // again, at most RETRIES more times in a row, 20 s and then 40 s after (a settle resets the count).
+  const SENT_KEY = "levain_trace_sent", BODY_MAX = 7600, RETRIES = 2;   // bytes: the push family's body cap is 8192
+  let reporting = false, retried = 0;
+  async function reportTrace(isRetry) {
+    let key = "";
+    try { key = window.localStorage.getItem("levain_write_token") || ""; } catch (_) { /* no storage: no key */ }
+    if (reporting || !key || !haveCache) return;
+    reporting = true;
+    let settled = true;
+    try {
+      const c = await caches.open(TRACE_CACHE);
+      const got = [];
+      for (const req of await c.keys()) {
+        const k = new URL(req.url).pathname;
+        if (k.indexOf(TRACE_PREFIX) !== 0) continue;
+        try { const e = await (await c.match(req)).json(); if (e && typeof e === "object" && Number.isFinite(e.t)) got.push({ k, e }); } catch (_) { /* skipped */ }
+      }
+      if (!got.length) return;
+      got.sort((a, b) => (a.k < b.k ? -1 : 1));
+      const sig = got.map((x) => x.k).join("|");
+      let sent = "";
+      try { sent = window.localStorage.getItem(SENT_KEY) || ""; } catch (_) { /* none */ }
+      if (sig === sent) return;
+      if (isRetry !== true) retried = 0;   // a call that is not a scheduled retry starts its own allowance
+      let keep = got.map((x) => x.e);
+      const bodyOf = () => JSON.stringify({ page: location.pathname.slice(0, 100), entries: keep });
+      while (keep.length > 1 && new TextEncoder().encode(bodyOf()).length > BODY_MAX) keep = keep.slice(1);   // drop the oldest
+      settled = false;
+      const ctl = typeof AbortController === "function" ? new AbortController() : null;
+      const stop = ctl ? setTimeout(() => ctl.abort(), 10000) : 0;   // a stalled link must not hold `reporting` forever
+      const res = await fetch("/webpush/trace", { method: "POST", cache: "no-store", signal: ctl ? ctl.signal : undefined,
+        headers: { "Content-Type": "application/json", "X-Levain-Write-Token": key }, body: bodyOf() }).finally(() => clearTimeout(stop));
+      // settled by a 2xx, or a 400 or 413 (this body will never be accepted)
+      settled = (res.status >= 200 && res.status < 300) || res.status === 400 || res.status === 413;
+      if (settled) { retried = 0; try { window.localStorage.setItem(SENT_KEY, sig); } catch (_) { /* resent next time */ } }
+    } catch (_) { /* best effort: a report never reaches the page */ } finally {
+      reporting = false;
+      if (!settled && retried < RETRIES) { retried += 1; setTimeout(() => reportTrace(true), 20000 * retried); }
+    }
+  }
+  window.levainTraceReport = reportTrace;
+  // a moment after this page's own first steps are written, and again when the app comes forward
+  const reportSoon = () => { setTimeout(reportTrace, 2500); };
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") reportSoon(); });
+  reportSoon();
+
   // an uncontrolled page (opened before the worker took over) queues worker messages until this is called
   try { navigator.serviceWorker.startMessages(); } catch (_) { /* older engines deliver without it */ }
 })();
