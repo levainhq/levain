@@ -20,6 +20,34 @@
   // 'new': the window between openWindow and the opened page's first script run. 'asked': the worker's ack wait plus slack.
   const TTL_MS = { asked: 30000, new: 30000 };
   const haveCache = typeof caches !== "undefined";
+
+  // The TRACE (the worker writes the same ring, see sw.js): one cache entry per step under '/__levain_trace/<time>-<seq>',
+  // value {t, src: 'page', step, ...detail}, capped. Best effort and never awaited by the tap; urls lose their fragment
+  // (it can carry a sign token), and no token or ping body is ever written.
+  const TRACE_CACHE = "levain-trace", TRACE_PREFIX = "/__levain_trace/", TRACE_CAP = 60;
+  let traceChain = Promise.resolve(), traceSeq = 0;
+  const traceUrl = (u) => { try { const x = new URL(String(u), location.href); return x.pathname + x.search + (x.hash ? "#..." : ""); } catch (_) { return null; } };
+  const trace = (step, detail) => {
+    const t = Date.now(), seq = "p" + String(traceSeq++).padStart(3, "0");
+    traceChain = traceChain.then(async () => {
+      if (!haveCache) return;
+      const c = await caches.open(TRACE_CACHE);
+      await c.put(TRACE_PREFIX + String(t).padStart(13, "0") + "-" + seq, new Response(JSON.stringify({ t, src: "page", step, ...detail })));
+      const keys = (await c.keys()).map((r) => new URL(r.url).pathname).filter((k) => k.indexOf(TRACE_PREFIX) === 0).sort();
+      for (const k of keys.slice(0, Math.max(0, keys.length - TRACE_CAP))) await c.delete(k);
+    }).catch(() => { /* best effort: a failed trace write never reaches the tap */ });
+  };
+  const assignTo = (href) => { trace("assign", { target: traceUrl(href) }); location.assign(href); };
+  try {
+    trace("page-load", {
+      href: traceUrl(location.href),
+      standalone: !!(typeof matchMedia === "function" && matchMedia("(display-mode: standalone)").matches),
+      navStandalone: navigator.standalone === undefined ? null : !!navigator.standalone,
+      referrer: document.referrer ? traceUrl(document.referrer) : "",
+      visibility: document.visibilityState,
+      controller: !!navigator.serviceWorker.controller,
+    });
+  } catch (_) { /* best effort */ }
   // same origin, path and query; only a fragment may differ
   const sameTarget = (a, b) => a.origin === b.origin && a.pathname === b.pathname && a.search === b.search;
 
@@ -32,15 +60,16 @@
     const port = ev.ports && ev.ports[0];
     const go = () => {
       if (port) { try { port.postMessage({ ok: true }); } catch (_) { /* the worker falls back to its own path */ } }
-      location.assign(u.href);
+      assignTo(u.href);
     };
     // no cache, or the worker could not write a target: message-only, as before
-    if (!haveCache || typeof d.nonce !== "string") { go(); return; }
+    const msg = { type: d.type, url: traceUrl(u.href), nonce: typeof d.nonce === "string" ? d.nonce : null };
+    if (!haveCache || typeof d.nonce !== "string") { trace("message", { ...msg, claim: "message-only" }); go(); return; }
     // only the key this message names, and only a nonce shaped like the worker's: a lost claim means another path (or the
     // worker) already owns this open, so no ack and no navigation
-    if (!/^[a-z0-9]+$/i.test(d.nonce)) return;
-    caches.open(CACHE).then((c) => c.delete(PREFIX + d.nonce)).then((won) => { if (won) go(); })
-      .catch(() => { /* cache unreadable: the worker's path runs */ });
+    if (!/^[a-z0-9]+$/i.test(d.nonce)) { trace("message", { ...msg, claim: "bad-nonce" }); return; }
+    caches.open(CACHE).then((c) => c.delete(PREFIX + d.nonce)).then((won) => { trace("message", { ...msg, claim: won ? "won" : "lost" }); if (won) go(); })
+      .catch((err) => { trace("message", { ...msg, claim: "error", error: err && err.name || "error" }); /* cache unreadable: the worker's path runs */ });
   });
 
   // the first-load check: a page that opens right after the tap (iOS can open the root url) forwards itself
@@ -50,13 +79,17 @@
     checking = true;
     try {
       const cache = await caches.open(CACHE);
-      const found = [];
+      const found = [], seen = [];
       for (const req of await cache.keys()) {
         if (new URL(req.url).pathname.indexOf(PREFIX) !== 0) continue;
         let e = null;
         try { const r = await cache.match(req); e = r && await r.json(); } catch (_) { e = null; }
         // unreadable or expired: deleted (the exact key read); the worker deletes its own on the paths it owns
-        if (!e || typeof e.url !== "string" || typeof e.at !== "number" || Date.now() - e.at > (TTL_MS[e.for] || TTL_MS.asked)) { await cache.delete(req); continue; }
+        if (!e || typeof e.url !== "string" || typeof e.at !== "number" || Date.now() - e.at > (TTL_MS[e.for] || TTL_MS.asked)) {
+          seen.push({ for: e && e.for || null, ageMs: e && typeof e.at === "number" ? Date.now() - e.at : null, url: e && typeof e.url === "string" ? traceUrl(e.url) : null, dropped: "expired" });
+          await cache.delete(req); continue;
+        }
+        seen.push({ for: e.for || null, ageMs: Date.now() - e.at, url: traceUrl(e.url) });
         if (e.for !== "new") continue;                       // 'asked' belongs to the message path
         let u;
         try { u = new URL(e.url, location.href); } catch (_) { continue; }
@@ -70,9 +103,11 @@
       found.sort((x, y) => (sameTarget(y.u, here) - sameTarget(x.u, here)) || (y.e.at - x.e.at));
       for (const f of found) {
         if (!(await cache.delete(f.req))) continue;
-        if (!sameTarget(f.u, here)) location.assign(f.u.href);   // already here: consumed, the page stays
+        trace("checkPending", { seen, claimed: traceUrl(f.u.href), assigned: !sameTarget(f.u, here) });
+        if (!sameTarget(f.u, here)) assignTo(f.u.href);   // already here: consumed, the page stays
         return;
       }
+      trace("checkPending", { seen, claimed: null, assigned: false });
     } catch (_) { /* no cache: nothing pending */ } finally { checking = false; }
   }
   // once, at this document's first script run: a pageshow call would let a page opened for one tap consume a later tap's entry
