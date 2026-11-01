@@ -18,7 +18,7 @@
   const CACHE = "levain-open", PREFIX = "/__levain_open/";
   // a target older than this is a tap nobody followed up (the card it points at is stale, and a later plain visit must not jump).
   // 'new': the window between openWindow and the opened page's first script run. 'asked': the worker's ack wait plus slack.
-  const TTL_MS = { asked: 30000, new: 10000 };
+  const TTL_MS = { asked: 30000, new: 30000 };
   const haveCache = typeof caches !== "undefined";
   // same origin, path and query; only a fragment may differ
   const sameTarget = (a, b) => a.origin === b.origin && a.pathname === b.pathname && a.search === b.search;

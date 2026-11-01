@@ -11,7 +11,8 @@ const OPEN_CACHE = 'levain-open', OPEN_PREFIX = '/__levain_open/';
 const CACHES_KEEP = [OPEN_CACHE];
 // How long a 'for: new' entry lives (and how long the worker keeps one after a successful openWindow): the window between
 // openWindow and the opened page's first script run. The page's own limit for 'new' entries is the same figure (sw_open.js).
-const NEW_TTL_MS = 10000;
+const NEW_TTL_MS = 30000;  // a cold-started Home Screen app can take seconds to run its first script; the claim is
+                           // already limited to a page at '/' or at the target, so a longer window is cheap
 
 function open() {
   return new Promise((resolve, reject) => {
@@ -92,7 +93,7 @@ const OPEN_ACK_MS = 400;
 // not read or name, so a second tap's entry, or a fallback entry meant for another window, is never touched.
 // for: 'asked' = written before a window is asked; only the message path (the nonce the worker named) may claim it.
 //      'new'   = written immediately before openWindow; only a page's FIRST load may claim it (sw_open.js), and only a page
-//                at '/' (where iOS lands a tapped window) or at the entry's own target; it lives NEW_TTL_MS, 'asked' 30 s.
+//                at '/' (where iOS lands a tapped window) or at the entry's own target; it lives NEW_TTL_MS, as 'asked' does.
 async function putPending(entry) {
   const c = await caches.open(OPEN_CACHE);
   const key = OPEN_PREFIX + entry.nonce;

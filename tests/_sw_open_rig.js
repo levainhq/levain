@@ -82,9 +82,9 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
   } else if (scenario === 'load') {
     log.firstLoad = { assigned: log.assigned.slice(), pending: has('n0') };      // fresh 'new' target at '/': forwarded, consumed
     log.noPageshowHandler = !('pageshow' in winHandlers);                         // the scan is not repeated on pageshow
-    // 'asked' belongs to the message path, and lives 30 s: 15 s old is alive and untouched; 'new' lives 10 s
+    // 'asked' belongs to the message path, and lives 30 s: 15 s old is alive and untouched; 'new' lives 30 s too
     put('a1', { url: U, at: Date.now() - 15000, for: 'asked' });
-    put('x1', { url: U, at: Date.now() - 11000, for: 'new' });                   // expired 'new'
+    put('x1', { url: U, at: Date.now() - 31000, for: 'new' });                   // expired 'new'
     await boot('https://box.example/');
     log.asked = { assigned: log.assigned.length, askedKept: has('a1'), expiredNewGone: !has('x1') };
     store.clear();
@@ -112,7 +112,7 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     await fire('pageshow', winHandlers, { persisted: false });
     log.resumed = { assigned: log.assigned.length, pending: has('u1') && has('r1') };
     store.clear();
-    put('s1', { url: U, at: Date.now() - 9000, for: 'new' });                   // 9 s old: still inside the 10 s window
+    put('s1', { url: U, at: Date.now() - 29000, for: 'new' });                  // 29 s old: still inside the 30 s window
     await boot('https://box.example/');
     log.nineSeconds = { assigned: log.assigned.length, pending: has('s1') };
     store.clear();

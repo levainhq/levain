@@ -198,10 +198,10 @@ def test_the_window_preference_picks_the_cockpit_page_over_a_docs_page() -> None
 def test_a_fallback_open_window_writes_one_fresh_new_entry_just_before_it_and_drops_it_after_ten_seconds() -> None:
     """(c, d) the asked entry is gone (the worker claimed it) and ONE 'new' entry, another nonce, is present when
     openWindow runs, so the asked window can never claim it and the page iOS lands on '/' can. A successful openWindow into
-    a page that never claims it (no listener) leaves nothing behind: the worker holds the click open for the 10 s window,
+    a page that never claims it (no listener) leaves nothing behind: the worker holds the click open for the NEW_TTL_MS window,
     then drops its own key (the rig shortens the wait and records the requested one)."""
     got = _run("navigate", "uncontrolled")
-    assert got["longWaits"] == [10000], got
+    assert got["longWaits"] == [30000], got
     entry, = got["entriesAtOpen"]
     assert entry["for"] == "new" and entry["nonce"] != got["nonces"][0], got
     assert got["pendingLeft"] == 0, got
@@ -229,13 +229,13 @@ def test_only_a_documents_first_script_run_claims_a_fresh_new_entry_at_the_root_
     got = _open_rig("load")
     assert got["firstLoad"] == {"assigned": [CARD], "pending": False}, got         # iOS landed on '/': the first-load check forwards
     assert got["noPageshowHandler"] is True, got                                   # the scan is one per document: pageshow runs none
-    assert got["asked"] == {"assigned": 1, "askedKept": True, "expiredNewGone": True}, got   # 'asked' is the message path's (15 s old: alive); 'new' dies at 10 s
+    assert got["asked"] == {"assigned": 1, "askedKept": True, "expiredNewGone": True}, got   # 'asked' is the message path's (15 s old: alive); 'new' dies at 30 s
     assert got["askedExpired"] == {"assigned": 1, "gone": True}, got               # 'asked' dies at 30 s
     assert got["alreadyHere"] == {"assigned": 1, "pending": False}, got            # consumed, no pointless assign
     assert got["unrelated"] == {"assigned": 1, "pending": True}, got               # an unrelated first load (not '/', not the target) takes nothing
     assert got["unrelatedPair"] == {"assigned": 1, "pending": True}, got
     assert got["resumed"] == {"assigned": 1, "pending": True}, got                 # visibilitychange and any pageshow claim nothing
-    assert got["nineSeconds"] == {"assigned": 2, "pending": False}, got           # inside the 10 s window a root landing forwards
+    assert got["nineSeconds"] == {"assigned": 2, "pending": False}, got           # inside the 30 s window a root landing forwards
     assert got["cross"] == {"assigned": 2}, got                                    # never follows another origin
     assert got["query"] == {"assigned": ["https://box.example/?view=needs"], "pending": False}, got   # '/' is not '/?view=needs'
     assert got["fragment"] == {"moved": 0, "pending": False}, got                  # only a fragment differs: already here

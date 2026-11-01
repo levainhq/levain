@@ -88,7 +88,7 @@ const sandbox = {
   self: self_, indexedDB, caches, Response, Math,
   console: { info: (m) => log.console.push(['info', String(m)]), warn: (m) => log.console.push(['warn', String(m)]) },
   URL, clearTimeout, MessageChannel,
-  // a wait of 5 s or more is recorded and shortened, so the worker's 10 s hold after a successful openWindow does not slow the rig
+  // a wait of 5 s or more is recorded and shortened, so the worker's NEW_TTL_MS hold after a successful openWindow does not slow the rig
   setTimeout: (fn, ms, ...a) => setTimeout(fn, ms >= 5000 ? (log.longWaits.push(ms), 50) : ms, ...a), Date, Promise, JSON, String, Array,
   fetch: () => { log.fetches += 1; throw new Error('the worker must not call fetch'); },
 };
