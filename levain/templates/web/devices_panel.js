@@ -160,6 +160,7 @@
     body.appendChild(note);
     panel.appendChild(body);
     grid.appendChild(panel);
+    grid.appendChild(buildPolicy());
     section.appendChild(grid);
     const main = document.querySelector("main.frame");
     if (main) main.appendChild(section); else document.body.appendChild(section);
@@ -472,12 +473,132 @@
     say(revoked && !listed ? msg + " Couldn't refresh the device list." : msg);
   }
 
+  // NP S2: the Notifications block. The operator's own policy for what reaches him while a mute word (quiet, sleep) is on:
+  // GET /webpush/policy reads it (levain.webpush.presence.policy_view), POST /webpush/policy/set {mute, class, value} and
+  // /webpush/policy/reset write it, under the same token as every other write on this panel. Hidden where the cockpit
+  // serves no web push (a 404) or the token is refused. The words come from the server (`sentences`, `status`).
+  const MUTES = [["quiet", "Quiet"], ["sleep", "Sleep"]];
+  const CLASSES = [["approval", "Approvals", "seats asking you to say yes or no"],
+                   ["attention", "Attention items", "things that need you, dated ones included"],
+                   ["other", "Other pings", "questions, rulings, summaries"]];
+  const HOLD_WARN = "Seats that need your approval will wait silently until you unmute.";
+  let npPanel = null, npSentences = null, npStatus = null, npNote = null, npCells = {}, npReset = null, npBusy = false;
+
+  function buildPolicy() {
+    npPanel = el("div", "panel k-list dev-panel np-panel");
+    npPanel.dataset.modes = "board";
+    npPanel.hidden = true;
+    const ph = el("div", "phead");
+    ph.appendChild(el("h2", null, "Notifications"));
+    npPanel.appendChild(ph);
+    const body = el("div", "pbody dev-body");
+    npSentences = el("div", "np-sentences");
+    body.appendChild(npSentences);
+    npStatus = el("p", "dev-note np-status"); npStatus.hidden = true;
+    body.appendChild(npStatus);
+    for (const [mute, mname] of MUTES) {
+      const grp = el("div", "np-group");
+      grp.appendChild(el("div", "dev-name", "While " + mname.toLowerCase() + " is on"));
+      for (const [cls, cname, gloss] of CLASSES) {
+        const r = el("div", "dev-row np-row");
+        r.dataset.cell = mute + "." + cls;
+        const main = el("div", "dev-main");
+        main.appendChild(el("div", "np-cls", cname));
+        main.appendChild(el("div", "dev-meta", gloss));
+        const warn = el("div", "np-warn", HOLD_WARN);
+        warn.setAttribute("role", "alert");
+        warn.hidden = true;
+        if (cls === "approval") main.appendChild(warn);
+        r.appendChild(main);
+        const seg = el("div", "ck-tabs np-seg");
+        seg.setAttribute("role", "radiogroup");
+        seg.setAttribute("aria-label", cname + " while " + mname.toLowerCase() + " is on");
+        const btns = {};
+        for (const v of ["push", "hold"]) {
+          const b = el("button", "ck-tab", v === "push" ? "Reach me" : "Wait");
+          b.type = "button";
+          b.setAttribute("role", "radio");
+          b.dataset.value = v;
+          b.addEventListener("click", () => setCell(mute, cls, v));
+          btns[v] = b; seg.appendChild(b);
+        }
+        r.appendChild(seg);
+        npCells[mute + "." + cls] = { btns: btns, warn: warn, cls: cls };
+        grp.appendChild(r);
+      }
+      body.appendChild(grp);
+    }
+    npReset = el("button", "dev-btn np-reset", "Reset to default");
+    npReset.type = "button";
+    npReset.addEventListener("click", resetPolicy);
+    const foot = el("div", "np-foot");
+    foot.appendChild(npReset);
+    body.appendChild(foot);
+    npNote = el("p", "dev-note"); npNote.hidden = true;
+    body.appendChild(npNote);
+    npPanel.appendChild(body);
+    return npPanel;
+  }
+
+  function npSay(msg) { npNote.textContent = msg; npNote.hidden = !msg; }
+
+  function paintPolicy(v) {
+    npSentences.replaceChildren();
+    for (const [mute] of MUTES) npSentences.appendChild(el("p", "np-sentence", (v.sentences || {})[mute] || ""));
+    const bad = v.status_kind === "malformed";
+    npStatus.hidden = v.status_kind === "default";
+    npStatus.className = "dev-note np-status" + (bad ? " np-bad" : "");
+    npStatus.textContent = bad ? "The policy file is not usable: " + (v.reasons || []).join("; ") + ". The default is in effect until you set a cell or reset."
+                               : "Your own table is in effect, not the default.";
+    for (const [mute] of MUTES) for (const [cls] of CLASSES) {
+      const c = npCells[mute + "." + cls], cur = ((v.cells || {})[mute] || {})[cls];
+      for (const k of ["push", "hold"]) {
+        c.btns[k].setAttribute("aria-checked", k === cur ? "true" : "false");
+        c.btns[k].setAttribute("aria-selected", k === cur ? "true" : "false");
+      }
+      c.warn.hidden = !(cls === "approval" && cur === "hold");
+    }
+    npReset.disabled = v.status_kind === "default";
+    npPanel.hidden = false;
+  }
+
+  async function readPolicy() {
+    const tok = token();
+    if (!tok || tok === refused) { npPanel.hidden = true; return; }
+    try {
+      const res = await api("GET", "/webpush/policy", undefined, READ_TIMEOUT_MS);
+      if (res.status === 200 && res.data && res.data.cells) paintPolicy(res.data);
+      else if (res.status === 404 || res.status === 403) npPanel.hidden = true;   // no web push here, or this token is not allowed
+    } catch (_) { /* the next pulse tries again */ }
+  }
+
+  async function writePolicy(path, body) {
+    if (npBusy) return;
+    npBusy = true; npSay("");
+    for (const k in npCells) for (const b of Object.values(npCells[k].btns)) b.disabled = true;
+    npReset.disabled = true;
+    try {
+      const res = await api("POST", path, body);
+      if (res.status === 200 && res.data && res.data.cells) paintPolicy(res.data);
+      else npSay("Could not change the policy (" + (res.data.message || res.status) + ").");
+    } catch (_) { npSay("Could not reach the cockpit."); }
+    finally {
+      npBusy = false;
+      for (const k in npCells) for (const b of Object.values(npCells[k].btns)) b.disabled = false;
+      npReset.disabled = false;
+      await readPolicy();   // the server's word on what is in effect, after a refusal too
+    }
+  }
+  function setCell(mute, cls, value) { return writePolicy("/webpush/policy/set", { mute: mute, class: cls, value: value }); }
+  function resetPolicy() { return writePolicy("/webpush/policy/reset", {}); }
+
   function start() {
     build();
     refresh();
+    readPolicy();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
-    setTimeout(refresh, 2500);
-    const pulse = setInterval(() => { if (gone) clearInterval(pulse); else if (!document.hidden) refresh(); }, 30000);
+    setTimeout(() => { refresh(); readPolicy(); }, 2500);
+    const pulse = setInterval(() => { if (gone) clearInterval(pulse); else if (!document.hidden) { refresh(); if (!npBusy) readPolicy(); } }, 30000);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
 })();
