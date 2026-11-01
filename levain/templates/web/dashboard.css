@@ -2640,7 +2640,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .dev-none { margin: 0; padding: var(--sp-4) 0; color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
 /* after .dev-none and as specific as it: a quiet sub-note, not a second empty-state block */
 .dev-none.dev-stale-note { padding: 0 0 var(--sp-2); font-size: var(--fs-micro); }
-.dev-offer { display: flex; gap: var(--sp-3); margin-top: var(--sp-5); flex-wrap: wrap; }
+.dev-offer, .pr-new-form { display: flex; gap: var(--sp-3); margin-top: var(--sp-5); flex-wrap: wrap; }
 .dev-label, .dev-url { flex: 1 1 220px; min-width: 0; min-height: 38px; box-sizing: border-box; padding: var(--sp-2) var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-sm); background: var(--base); color: var(--text); font: var(--fw-regular) var(--fs-meta) var(--sans); }
 .dev-url { font-family: var(--mono); font-size: var(--fs-micro); }
 .dev-btn { flex: none; min-height: 38px; padding: var(--sp-2) var(--sp-4); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--text); background: none; border: 1px solid var(--label); border-radius: var(--r-sm); cursor: pointer; }
@@ -2657,7 +2657,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
   .dev-body { padding-inline: var(--sp-5); }
   .dev-btn, .dev-label, .dev-url, .dev-tabs .ck-tab { min-height: var(--hit-min, 44px); }
   .dev-tabs .ck-tab { flex: 1 1 0; }
-  .dev-offer .dev-btn { flex: 1 1 100%; }
+  .dev-offer .dev-btn, .pr-new-form .dev-btn { flex: 1 1 100%; }
 }
 
 .pair-body { min-height: 100vh; display: grid; place-items: center; padding: var(--sp-6); box-sizing: border-box; }

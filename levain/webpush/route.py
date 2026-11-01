@@ -32,6 +32,7 @@ import sys
 import time
 from pathlib import Path
 
+from levain.launch import child_env
 from levain.webpush.presence import (MAX_SECS, PresenceError, _FIELD_MAX, _clean, _locked, _log_best_effort,
                                      parse_duration)
 
@@ -271,7 +272,7 @@ def _local_host(host: str) -> bool:
 def _run_who() -> str:
     try:
         out = subprocess.run([_WHO], capture_output=True, text=True, timeout=_WHO_TIMEOUT_SECS, check=False,
-                             stdin=subprocess.DEVNULL)
+                             stdin=subprocess.DEVNULL, env=child_env())
         return out.stdout if out.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError, ValueError):
         return ""   # no reading is no remote login

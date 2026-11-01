@@ -696,7 +696,7 @@
     taps.appendChild(el("p", "dev-note", "A tap token lets one Shortcut or NFC tag set your presence, and nothing else."));
     prTapList = el("div", "dev-list pr-tap-list");
     taps.appendChild(prTapList);
-    const form = el("form", "dev-offer pr-new-form");
+    const form = el("form", "pr-new-form");
     prName = el("input", "dev-label pr-name");
     prName.type = "text"; prName.maxLength = 40; prName.placeholder = "Name, e.g. Front door tag";
     prName.setAttribute("aria-label", "Name for the new tap token");
