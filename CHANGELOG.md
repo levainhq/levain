@@ -6,6 +6,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+- **Set your presence from a tap, and from the cockpit.** A Presence block in the Devices panel shows your word (away, back, quiet, sleep, loud, remote) and sets it; `GET /webpush/presence` and `POST /webpush/presence/set {word, for?}` do the same over HTTP. A tap token (`POST /webpush/presence/token/new`, shown once, stored only as a hash, revocable) lets one Apple Shortcut or NFC tag set the word with no location fix, and reaches nothing else: only the words you allow, ten writes a minute.
+
 ### Changed
 - **The Decisions panel has no standing answer box.** The "answer by number and letter" box (with its send button) at the top of the NEEDS YOU band is gone from the cockpit's Decisions panel. A decision is answered on its own card: an option button on its band row, or that card's own write-in; with nothing waiting the panel shows history and no input. Freeform words to the desk go through the Drop.
 
