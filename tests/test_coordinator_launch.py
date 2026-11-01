@@ -1064,7 +1064,7 @@ def test_one_missed_read_ends_nothing(store, fake, live_hook, clock):
     assert len(agents) == 5                  # the spawn gate's two reads, the read back, then the two reads of this pass
 
 
-def test_a_worker_launch_is_never_started(qdir, store, fake, live_hook):
+def test_a_worker_launch_with_no_spawned_role_is_never_started(qdir, store, fake, live_hook):
     from levain.coordinator.store import Part
 
     d, _ = store.accept_drop("work for a worker", surface="cli")
@@ -1072,9 +1072,10 @@ def test_a_worker_launch_is_never_started(qdir, store, fake, live_hook):
     (t,) = store.split(d.drop_id, [Part("work", "w")], by="operator")
     ln = store.launch_request(token, harness="claude", threads=[t.thread_id])
     got = cl.launch_session(store, ln.launch_id)
-    assert not got.started and "the worker brief is not built" in got.refusal
+    assert not got.started and "a worker with no spawned role has no brief" in got.refusal
     lines = cl.watch_once(store)
-    assert f"launch {ln.launch_id}: a worker launch; the worker brief is not built, left pending" in lines
+    assert any(f"launch {ln.launch_id}: a worker launch; a worker with no spawned role has no brief" in x
+               and x.endswith(", left pending") for x in lines)
     assert fake.spawns() == [] and store.launch(ln.launch_id).state == "pending"
     assert rows(qdir, "SELECT count(*) FROM launch_spawns") == [(0,)]
 

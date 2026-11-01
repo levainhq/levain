@@ -35,7 +35,7 @@ COUNTED: frozenset[str] = frozenset({
 #: bookkeeping the brief never reports (``lease_events`` kinds claim, beat, release and ``launch_events`` kinds pending,
 #: active are INFRASTRUCTURE too, by kind)
 INFRASTRUCTURE: frozenset[str] = frozenset({
-    "launches", "launch_spawns", "launch_threads", "launch_sweeps",
+    "launches", "launch_spawns", "launch_threads", "launch_sweeps", "launch_handoffs",
     "review_marks", "know_deliveries", "held_pings", "held_ping_releases",
     "chat_events", "chat_outbox_events", "chat_cursors", "chat_echoes", "chat_launch_checks",
     "turn_lease_events", "chat_egress_events",

@@ -1329,6 +1329,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             tok = store.coord_claim(args.launch, args.session)
             _emit(out, args.json, {"token": tok}, f"claimed: token {tok}")
             return 0
+        if cmd == "handoff" and args.handoff_cmd == "worker":
+            return _coord_worker_handoff(args, out, store)
         if cmd in ("close", "open", "handoff"):
             from levain.coordinator import seam_verbs
 
@@ -1347,6 +1349,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             return _coord_log(args, out, store)
         if cmd == "reply":
             return _coord_reply(args, out, store)
+        if cmd == "spawn":
+            return _coord_spawn(args, out, store)
         if cmd == "review":
             return _coord_review(args, out, store)
         if cmd == "ready":
@@ -1435,7 +1439,8 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
                 lines.append(f"coordinator install: upgrade pending (no Read allow rule, so a read outside its "
                              f"workspace waits on a prompt); run: levain update --path {shlex.quote(str(cwd))}")
     for ln in st["launches"]:
-        lines.append(f"  {ln['launch_id']}  {ln['role']}  {ln['harness']}  {ln['state']} ({ln['cause']})  "
+        spawn = f"  {ln['spawn']}" if ln.get("spawn") else ""
+        lines.append(f"  {ln['launch_id']}  {ln['role']}{spawn}  {ln['harness']}  {ln['state']} ({ln['cause']})  "
                      f"session {ln['session_key']}  asked {ln['at']}")
     _emit(out, args.json, st, "\n".join(lines))
     return 0
@@ -1670,6 +1675,76 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
         return 2
     _emit(out, args.json, {"journal_id": f"{rec['id']}@{ver}", "record": rec},
           f"{verb}: {rec['id']} {rec['from_category'] or '-'} -> {rec['to_category']}; journal {rec['id']}@{ver}")
+
+
+_SLOTS_FILE_MAX = 64 * 1024
+
+
+def _coord_spawn(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord spawn --thread T (--role @spawn/NAME | --inline FILE) --cwd DIR --token N`` (P3): the lease holder
+    asks for one worker on a WORK thread (:func:`levain.agents.instantiate.spawn_worker`). The store derives the depth,
+    the drop and the scope in the request's own transaction; ``coord watch`` or ``coord launch`` starts it."""
+    from levain.agents import instantiate
+    from levain.agents import role as role_mod
+    from levain.agents.store import AgentStoreRefused, open_agent_store
+
+    inline = None
+    if args.inline is not None:
+        try:
+            inline = role_mod.parse_role_text(args.inline.expanduser().read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CoordError(f"--inline {args.inline} could not be read ({type(exc).__name__}: {exc})") from None
+        except role_mod.RoleError as exc:
+            raise CoordError(f"--inline {args.inline} is not a role: {exc}") from None
+    slots: dict[str, Any] = {}
+    if args.slots_file is not None:
+        try:
+            raw = args.slots_file.expanduser().read_text(encoding="utf-8")
+            if len(raw) > _SLOTS_FILE_MAX:
+                raise CoordError(f"--slots-file is at most {_SLOTS_FILE_MAX} characters")
+            got = json.loads(raw)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise CoordError(f"--slots-file {args.slots_file} is not a JSON object of slot values "
+                             f"({type(exc).__name__}: {exc})") from None
+        if not isinstance(got, dict):
+            raise CoordError("--slots-file holds one JSON object: slot name -> value")
+        slots.update(got)
+    for pair in args.slot or ():
+        name, eq, value = pair.partition("=")
+        if not eq or not name:
+            raise CoordError(f"--slot is NAME=VALUE (got {pair[:40]!r})")
+        if name in slots:
+            raise CoordError(f"slot {name!r} is given twice")
+        slots[name] = value
+    cwd = os.path.realpath(args.cwd.expanduser())
+    try:
+        agents = open_agent_store(args.agent_store_dir)
+    except AgentStoreRefused as exc:
+        raise CoordError(f"the role registry cannot be opened ({exc})") from None
+    ln = instantiate.spawn_worker(store, args.token, thread_id=args.thread, cwd=cwd, ref=args.role, inline=inline,
+                                  slots=slots, agent_store=agents, parent_launch=args.parent, done=args.done)
+    rec = instantiate.verified_record(ln.role_ref)
+    _emit(out, args.json, {"launch_id": ln.launch_id, "state": ln.state, "spawn": rec["spawn"],
+                           "inline": rec["inline"], "depth": rec["depth"], "thread": args.thread, "cwd": cwd,
+                           "envelope_id": rec["envelope_id"], "scope": rec["scope"]},
+          f"asked for worker launch {ln.launch_id} ({rec['spawn']}{', inline' if rec['inline'] else ''}, depth "
+          f"{rec['depth']}) on thread {args.thread} in {cwd}: {ln.state} until {ln.until}; `levain coord watch` or "
+          f"`levain coord launch {ln.launch_id}` starts it")
+    return 0
+
+
+def _coord_worker_handoff(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
+    """``levain coord handoff worker LAUNCH_ID --token N`` (P3): the handoff a done spawned worker left, read by the lease
+    holder (:meth:`CoordStore.launch_handoff`). Its text is the worker's own words, shown with every hidden character
+    marked, line breaks kept."""
+    got = store.launch_handoff(args.token, args.launch_id)
+    text = None if got["handoff"] is None else unshowable.mark(got["handoff"], allow="\n\t")
+    head = f"worker launch {got['launch_id']}: handoff kept {got['at']}"
+    if text is None:
+        body = f"{head}; no final message: {got['why']}"
+    else:
+        body = f"{head}" + (f" ({got['why']})" if got["why"] else "") + f"\n\n{text}"
+    _emit(out, args.json, {**got, "handoff": text}, body)
     return 0
 
 
@@ -1827,6 +1902,12 @@ def review_modes() -> tuple[str, ...]:
     from levain.coordinator import review
 
     return review.MODES
+
+
+def _spawn_caps() -> tuple[int, int]:
+    from levain.coordinator import lease
+
+    return lease.MAX_SPAWN_DEPTH, lease.MAX_SPAWNS_LIVE
 
 
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
@@ -2068,6 +2149,32 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     crp.add_argument("--text", default=None, help="Your reply.")
     _text_flags(crp)
     crp.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
+    csp = c_sub.add_parser(
+        "spawn", help="Ask for one worker on a WORK thread, from a registered role (@spawn/NAME) or an inline one.",
+        description="The worker runs the role's brief with your slot values, in DIR (outside every coordinator "
+                    "workspace), under the consent hook. Its scope is the thread's envelope cut down to the role's "
+                    "ceiling, once, when it is asked for; nothing about the thread's envelope changes. --parent "
+                    f"declares the lineage (the active spawned worker this one is for; at most {_spawn_caps()[0]} "
+                    "deep by what you declare): a worker holds no token and no coordinator verb, so you are the "
+                    "only spawner, and what binds is your lease and the cap of "
+                    f"{_spawn_caps()[1]} asked for or running at once. `levain coord watch` or "
+                    "`levain coord launch LAUNCH_ID` starts it, `levain coord status` lists it, and "
+                    "`levain coord handoff worker LAUNCH_ID` reads its final message once its turn is done.")
+    csp.add_argument("--thread", required=True, metavar="THREAD", help="The WORK thread the worker holds.")
+    who = csp.add_mutually_exclusive_group(required=True)
+    who.add_argument("--role", default=None, metavar="@spawn/NAME", help="A registered role.")
+    who.add_argument("--inline", type=Path, default=None, metavar="FILE", help="A role, as JSON in this file.")
+    csp.add_argument("--slot", action="append", default=None, metavar="NAME=VALUE",
+                     help="A text or path slot's value (repeat per slot).")
+    csp.add_argument("--slots-file", dest="slots_file", type=Path, default=None, metavar="PATH",
+                     help="Slot values as one JSON object (an int slot goes here).")
+    csp.add_argument("--cwd", type=Path, required=True, metavar="DIR", help="The directory the worker runs in.")
+    csp.add_argument("--done", default=None, metavar="LINE", help="The ready item's DONE: line (the worker's win).")
+    csp.add_argument("--parent", default=None, metavar="LAUNCH_ID",
+                     help="The active spawned worker asking for this one.")
+    csp.add_argument("--agent-store-dir", dest="agent_store_dir", type=Path, default=None, metavar="DIR",
+                     help="The role registry's store (default: this Levain home's).")
+    csp.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
     caw = c_sub.add_parser(
         "away", help="Read a drop as the operator's word that he is away: set away ON (never off).",
         description="Sets away ON for both agents through `levain consent away on`'s own path, so every SIGN waits "
@@ -2146,6 +2253,12 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                                          "id (dr-..., item keys), never by ordinal.")
     chs.add_argument("handoff_id", nargs="?", type=int, default=None, metavar="HANDOFF_ID")
     chs.add_argument("--md", action="store_true", help="Render as markdown.")
+    chw = chn_sub.add_parser("worker", help="A done spawned worker's handoff: its final message (the lease holder's).",
+                             description="Prints the final message a spawned worker left when its turn finished, kept "
+                                         "when the watcher ended it, before its session was stopped; or why it left "
+                                         "none. The read is fenced by your lease token and writes nothing.")
+    chw.add_argument("launch_id", metavar="LAUNCH_ID")
+    chw.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
     cbu = c_sub.add_parser(
         "budget", help="Each thread's budget against what its sessions used (Q13's counts): the gauge.",
         description="The budget is the thread's head envelope's; usage is Q13's count of the worker sessions pinned to "
@@ -2180,7 +2293,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     for p in ready_leaves:
         common(p)
         p.set_defaults(func=run_coord)
-    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, cbu, clg, crp, ccl, cop, chs):
+    for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw):
         common(p)
         p.set_defaults(func=run_coord)
 
