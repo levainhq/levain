@@ -61,6 +61,19 @@ def register(subparsers) -> None:
     lg.add_argument("--limit", type=int, default=50, help="The newest N rows (default 50).")
     lg.add_argument("--json", action="store_true")
     lg.set_defaults(func=_log)
+    pol = sub.add_parser("policy", help="Which kinds of ping break through quiet and sleep (the operator's own setting).",
+                         description="The notification policy: for quiet and sleep, whether approvals, attention items "
+                                     "and other pings are pushed or held. Reading is open; setting is the operator's alone.")
+    psub = pol.add_subparsers(dest="policy_cmd", required=True)
+    ps = common(psub.add_parser("show", help="The six cells, the kind classes and what each mute word does."))
+    ps.add_argument("--json", action="store_true")
+    ps.set_defaults(func=_policy_show)
+    pset = common(psub.add_parser("set", help="Set one cell (operator only)."))
+    pset.add_argument("mute", choices=presence.MUTE_WORDS)
+    pset.add_argument("kind_class", choices=presence.CLASSES)
+    pset.add_argument("value", choices=("push", "hold"))
+    pset.set_defaults(func=_policy_set)
+    common(psub.add_parser("reset", help="Back to the shipped default (operator only).")).set_defaults(func=_policy_reset)
 
 
 def _qdir(args: argparse.Namespace) -> Path:
@@ -147,6 +160,56 @@ def _status(args: argparse.Namespace) -> int:
 
     print(presence.describe(_qdir(args)))
     return 0
+
+
+def _policy_show(args: argparse.Namespace) -> int:
+    from levain.webpush import presence
+
+    view = presence.policy_view(_qdir(args))
+    if args.json:
+        print(json.dumps(view, indent=2))
+        return 0
+    print(f"policy: {view['status']}")
+    print(f"{'':7}" + "".join(f"{c:<11}" for c in presence.CLASSES))
+    for m in presence.MUTE_WORDS:
+        print(f"{m:<7}" + "".join(f"{view['cells'][m][c]:<11}" for c in presence.CLASSES))
+    print("classes: " + "; ".join(f"{c}: " + ", ".join(k for k, v in view["classes"].items() if v == c)
+                                  for c in presence.CLASSES))
+    for m in presence.MUTE_WORDS:
+        print(view["sentences"][m])
+    return 0
+
+
+def _policy_write(args: argparse.Namespace, what: str, fn) -> int:
+    from levain.webpush import presence
+
+    qdir = _qdir(args)
+    try:
+        cells = fn(qdir, _setter(qdir))
+    except presence.PresenceError as e:
+        print(f"levain ping policy {what}: {e}")
+        return 2
+    try:   # a looser policy can make held pings due: start their push now
+        from levain.webpush import held
+
+        held.flush_if_due(qdir, throttle=False)
+    except Exception:  # noqa: BLE001 - the policy is written; the next gate call flushes
+        pass
+    for line in presence.policy_sentences(cells).values():
+        print(line)
+    return 0
+
+
+def _policy_set(args: argparse.Namespace) -> int:
+    from levain.webpush import presence
+
+    return _policy_write(args, "set", lambda q, by: presence.set_policy(q, args.mute, args.kind_class, args.value, by=by))
+
+
+def _policy_reset(args: argparse.Namespace) -> int:
+    from levain.webpush import presence
+
+    return _policy_write(args, "reset", lambda q, by: presence.reset_policy(q, by=by))
 
 
 def _log(args: argparse.Namespace) -> int:
