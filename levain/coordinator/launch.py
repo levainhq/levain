@@ -81,6 +81,7 @@ import contextlib
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import pwd
 import re
@@ -1373,12 +1374,17 @@ _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}")
 # [seat] how many consecutive passes must read a worker listed done with its turn finished before it is ended: one
 # reading may be a stale listing beside the previous turn's last reply, a second one a pass later is not
 DONE_READS = 2
-# [seat] the backstop: a worker read listed done on this many consecutive passes without its turn ever shown finished
-# is ended anyway, its last reply kept and why recorded. At the default pass of 30 s that is about an hour, longer
-# than a consent prompt is plausibly left waiting, and short enough that workers stuck that way cannot hold the cap
-# on live spawns for good
-UNPROVEN_DONE_PASSES = 120
+# [seat] the least time, in seconds, between two done readings that count: two passes run back to back (a daemon pass
+# beside a one-shot watch) would read the same stale listing twice
+DONE_READ_GAP = 20
+# [seat] the backstop, in seconds of wall time: a worker listed done for this long while its transcript neither shows
+# its turn finished nor a tool call waiting (unreadable, or ambiguous) is ended anyway, its last reply kept and why
+# recorded. Long enough that a turn is not plausibly left unreadable that long, short enough that workers stuck that
+# way cannot hold the cap on live spawns for good. A worker whose transcript shows a tool call waiting (a consent
+# prompt) is never ended by it
+UNPROVEN_DONE_SECONDS = 60 * 60
 WORKER_READS = "coord-watch-workers.json"     # in the store's directory: the done readings carried between passes
+_wall = time.time                # the watcher's wall clock for the done readings (tests move it by hand)
 
 
 def worker_turn(config_dir: str | None, session: str) -> tuple[bool, str | None, str | None]:
@@ -1390,21 +1396,32 @@ def worker_turn(config_dir: str | None, session: str) -> tuple[bool, str | None,
     of the last assistant reply (every main-thread record of its message), whether or not the turn is finished, so a
     caller that ends the worker anyway keeps it; no text gives a None handoff and a ``why``. A transcript that cannot
     be found or read, or whose tail holds no reply, gives ``(False, None, why)``: nothing proves the turn is over."""
+    state, handoff, why = _turn_state(config_dir, session)
+    return state == _TURN_FINISHED, handoff, why
+
+
+_TURN_FINISHED, _TURN_WAITS, _TURN_UNKNOWN = "finished", "waits", "unknown"
+
+
+def _turn_state(config_dir: str | None, session: str) -> tuple[str, str | None, str | None]:
+    """:func:`worker_turn` with its not-finished half split: ``waits`` when the transcript positively shows the last
+    reply holding a tool call with no result after it (a consent prompt among them), ``unknown`` when it cannot be
+    found or read, holds no reply, or its last reply was followed by a prompt or a tool's result."""
     from levain.consent import band
 
     if not isinstance(session, str) or _SESSION_ID.fullmatch(session) is None:
-        return False, None, "the session id is not one a transcript is named by"
+        return _TURN_UNKNOWN, None, "the session id is not one a transcript is named by"
     cfg = config_dir if config_dir and os.path.isabs(config_dir) else None
     path = band.claude_transcript(cfg, session)
     if path is None:
-        return False, None, "the session's transcript was not found"
+        return _TURN_UNKNOWN, None, "the session's transcript was not found"
     try:
         size = path.stat().st_size
         with open(path, "rb") as fh:
             fh.seek(max(size - _TRANSCRIPT_TAIL, 0))
             tail = fh.read()
     except OSError as exc:
-        return False, None, f"the session's transcript could not be read ({type(exc).__name__})"
+        return _TURN_UNKNOWN, None, f"the session's transcript could not be read ({type(exc).__name__})"
     main: list[dict[str, Any]] = []
     for raw in tail.splitlines():
         try:
@@ -1416,7 +1433,7 @@ def worker_turn(config_dir: str | None, session: str) -> tuple[bool, str | None,
             main.append(rec)
     replies = [rec for rec in main if rec["type"] == "assistant"]
     if not replies:
-        return False, None, "the transcript's tail holds no reply"
+        return _TURN_UNKNOWN, None, "the transcript's tail holds no reply"
     last = replies[-1]["message"]
     mid = last.get("id")
     texts: list[str] = []
@@ -1428,13 +1445,14 @@ def worker_turn(config_dir: str | None, session: str) -> tuple[bool, str | None,
                   if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str) and b["text"]]
     handoff = "\n\n".join(texts) if texts else None
     if main[-1]["type"] != "assistant":
-        return False, handoff, "the last reply was followed by a prompt or a tool's result: the turn is in progress"
+        return (_TURN_UNKNOWN, handoff,
+                "the last reply was followed by a prompt or a tool's result: the turn is in progress")
     content = last.get("content")
     blocks = content if isinstance(content, list) else []
     if last.get("stop_reason") == _TURN_GOES_ON or any(isinstance(b, dict) and b.get("type") == "tool_use"
                                                        for b in blocks):
-        return False, handoff, "its last reply waits on a tool call: the turn is in progress"
-    return True, handoff, None if handoff is not None else "the worker's last turn held no text"
+        return _TURN_WAITS, handoff, "its last reply waits on a tool call: the turn is in progress"
+    return _TURN_FINISHED, handoff, None if handoff is not None else "the worker's last turn held no text"
 
 
 def _end_done_workers(store: CoordStore, active: list[Any], listed: dict[str, dict[str, Any]],
@@ -1443,12 +1461,13 @@ def _end_done_workers(store: CoordStore, active: list[Any], listed: dict[str, di
     shows its turn finished (:func:`worker_turn`) on :data:`DONE_READS` consecutive passes is written ``ended`` (cause
     :data:`levain.coordinator.lease.WORKER_DONE`) with its final message as its handoff, in one transaction, so it
     leaves the live-spawn count and the coordinator reads the handoff after (d) stops its session and (e) removes its
-    brief (``levain coord handoff worker``). A worker listed done whose turn is not shown finished (a reply waiting on
-    a tool call, a consent prompt among them, or a transcript that cannot be read) is left running and said so, until
-    the backstop: listed done on :data:`UNPROVEN_DONE_PASSES` consecutive passes, it is ended anyway with its last
-    reply kept and why. A pass that lists it anything but done starts both counts again. The readings are carried
-    between passes in :data:`WORKER_READS`, so a one-pass watch counts too; one that cannot be read counts from zero,
-    which only delays an end."""
+    brief (``levain coord handoff worker``). Two done readings count only :data:`DONE_READ_GAP` seconds or more
+    apart. A worker whose transcript shows a tool call waiting (a consent prompt) is left running however long it
+    waits. One listed done whose transcript cannot be read or shows neither is left running and said so, until the
+    backstop: listed done for :data:`UNPROVEN_DONE_SECONDS` of wall time with no wait shown, it is ended anyway with
+    its last reply kept and why. A pass that lists it anything but done starts every reading again. The readings
+    (with the time each started) are carried between passes in :data:`WORKER_READS`, so a one-pass watch counts too;
+    readings that cannot be read start from zero, which only delays an end."""
     path = Path(store.directory) / WORKER_READS
     before = _load_reads(path)
     after: dict[str, dict[str, Any]] = {}
@@ -1458,23 +1477,44 @@ def _end_done_workers(store: CoordStore, active: list[Any], listed: dict[str, di
         prev = before.get(ln.launch_id)
         if not isinstance(prev, dict) or prev.get("session") != ln.harness_session_id:
             prev = {}
-        finished, handoff, why = worker_turn(env.get("CLAUDE_CONFIG_DIR"), ln.harness_session_id)
-        seen = {"session": ln.harness_session_id, "done": _count(prev, "done") + 1,
-                "finished": _count(prev, "finished") + 1 if finished else 0}
-        if finished and seen["finished"] < DONE_READS:
+        now = _wall()
+        state, handoff, why = _turn_state(env.get("CLAUDE_CONFIG_DIR"), ln.harness_session_id)
+        seen: dict[str, Any] = {"session": ln.harness_session_id, "finished": 0}
+        if state == _TURN_FINISHED:
+            count, last = _count(prev, "finished"), _stamp(prev, "finished_at")
+            if count and last is not None and now - last < DONE_READ_GAP:
+                seen.update(finished=count, finished_at=last)
+                if _stamp(prev, "since") is not None:
+                    seen["since"] = prev["since"]
+                after[ln.launch_id] = seen
+                lines.append(f"launch {ln.launch_id}: listed done with its turn finished, but too soon after the last "
+                             f"reading ({now - last:.0f} s of {DONE_READ_GAP} s); not counted, not ended yet")
+                continue
+            seen.update(finished=count + 1, finished_at=now)
+        if state != _TURN_WAITS:
+            # the backstop's clock: the first reading of this run listed done with no wait shown, kept as it was
+            first = _stamp(prev, "since")
+            seen["since"] = first if first is not None else now
+        if state == _TURN_FINISHED and seen["finished"] < DONE_READS:
             after[ln.launch_id] = seen
             lines.append(f"launch {ln.launch_id}: listed done with its turn finished, reading {seen['finished']} of "
                          f"{DONE_READS}; not ended yet")
             continue
-        if not finished:
-            if seen["done"] < UNPROVEN_DONE_PASSES:
+        if state == _TURN_WAITS:
+            after[ln.launch_id] = seen
+            lines.append(f"launch {ln.launch_id}: listed done, but {why}; not ended (a worker waiting on a tool call "
+                         "is never ended by the backstop)")
+            continue
+        if state == _TURN_UNKNOWN:
+            waited = now - seen["since"]
+            if waited < UNPROVEN_DONE_SECONDS:
                 after[ln.launch_id] = seen
                 lines.append(f"launch {ln.launch_id}: listed done, but {why}; not ended (only a finished turn ends a "
-                             f"worker; listed done {seen['done']} of {UNPROVEN_DONE_PASSES} passes before the "
-                             "backstop ends it)")
+                             f"worker; listed done {waited:.0f} s of {UNPROVEN_DONE_SECONDS} s before the backstop "
+                             "ends it)")
                 continue
-            why = (f"listed done on {seen['done']} passes in a row without its turn shown finished ({why}); ended by "
-                   "the backstop")
+            why = (f"listed done for {waited:.0f} s without its turn shown finished or a tool call shown waiting "
+                   f"({why}); ended by the backstop")
         try:
             ended = store.launch_end_done_worker(ln.launch_id, handoff=handoff, why=why)
         except (CoordError, sqlite3.Error) as exc:
@@ -1494,9 +1534,14 @@ def _count(prev: dict[str, Any], key: str) -> int:
     return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0
 
 
+def _stamp(prev: dict[str, Any], key: str) -> float | None:
+    t = prev.get(key)
+    return float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) else None
+
+
 def _load_reads(path: Path) -> dict[str, Any]:
-    """The done readings the last pass left (``launch_id -> {session, done, finished}``); empty when there are none or
-    they cannot be read, which only delays an end."""
+    """The done readings the last pass left (``launch_id -> {session, finished, finished_at, since}``); empty when
+    there are none or they cannot be read, which only delays an end."""
     try:
         got = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError):
@@ -1505,12 +1550,16 @@ def _load_reads(path: Path) -> dict[str, Any]:
 
 
 def _save_reads(path: Path, reads: dict[str, dict[str, Any]]) -> list[str]:
-    """``reads`` written in place of the last pass's, whole or not at all; a line when it could not be written."""
-    tmp = path.with_name(path.name + ".tmp")
+    """``reads`` written in place of the last pass's, whole or not at all; a line when it could not be written. The
+    file is written under a name of this process's own and then replaced, so two passes at once never write into one
+    file; the later replace wins, and the gap between counted readings keeps it from counting one reading twice."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     try:
         tmp.write_text(json.dumps(reads, sort_keys=True), encoding="utf-8")
         os.replace(tmp, path)
     except OSError as exc:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
         return [f"the workers' done readings could not be kept ({type(exc).__name__}); the next pass counts from "
                 "zero"]
     return []

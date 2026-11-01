@@ -440,7 +440,8 @@ def test_depth_is_derived_from_an_active_parents_own_record(store, wdir, spawn):
         spawn(store, token, t4.thread_id, wdir, parent_launch=parent.launch_id)
 
 
-def test_done_workers_end_and_a_fifth_spawn_is_accepted(store, fake, live_hook, wdir, spawn, cfg):  # noqa: F811
+def test_done_workers_end_and_a_fifth_spawn_is_accepted(store, fake, live_hook, wdir, spawn, cfg,
+                                                        clock):  # noqa: F811
     token = store.coord_take()
     made = []
     for i in range(lease.MAX_SPAWNS_LIVE):
@@ -456,6 +457,7 @@ def test_done_workers_end_and_a_fifth_spawn_is_accepted(store, fake, live_hook, 
                             "cwd": str(wdir), "kind": "background", "state": "done", "status": "idle"}
                            for i, ln in enumerate(made)])
     cl.watch_once(store)                       # the first done reading; the second, a pass later, ends them
+    clock.tick(cl.DONE_READ_GAP)
     lines = cl.watch_once(store)
     for ln in made:
         assert store.launch(ln.launch_id).state == "ended" and store.launch(ln.launch_id).cause == lease.WORKER_DONE
@@ -687,6 +689,26 @@ def cfg(tmp_path, monkeypatch):
     return d
 
 
+class _Clock:
+    """The watcher's wall clock, moved by hand."""
+
+    def __init__(self):
+        self.now = 1_900_000_000.0
+
+    def __call__(self):
+        return self.now
+
+    def tick(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = _Clock()
+    monkeypatch.setattr(cl, "_wall", c)
+    return c
+
+
 def _done_listing(fake, pairs, wdir):
     fake.others([OTHER] + [{"id": f"w{i}", "sessionId": sid, "name": cl.session_name(ln), "cwd": str(wdir),
                             "kind": "background", "state": "done", "status": "idle"}
@@ -694,7 +716,7 @@ def _done_listing(fake, pairs, wdir):
 
 
 def test_a_done_workers_handoff_is_readable_after_it_is_stopped(store, qdir, fake, live_hook, wdir, spawn, cfg,
-                                                                 capsys):  # noqa: F811
+                                                                 capsys, clock):  # noqa: F811
     token = store.coord_take()
     _d, t = a_thread(store)
     ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-handoff")
@@ -707,6 +729,7 @@ def test_a_done_workers_handoff_is_readable_after_it_is_stopped(store, qdir, fak
     _done_listing(fake, [(ln, "sid-handoff"), (quiet, "sid-quiet")], wdir)
     lines = cl.watch_once(store)        # one done reading is not enough: a stale listing alone never ends a worker
     assert store.launch(ln.launch_id).state == "active" and fake.stops() == [], lines
+    clock.tick(cl.DONE_READ_GAP)
     lines = cl.watch_once(store)
     assert store.launch(ln.launch_id).state == "ended" and len(fake.stops()) == 2, lines
     got = store.launch_handoff(token, ln.launch_id)
@@ -863,7 +886,7 @@ def test_a_permanent_refusal_carries_its_class(store, fake, live_hook, wdir, spa
 
 
 def test_a_done_worker_ends_on_the_second_consecutive_done_reading(store, fake, live_hook, wdir, spawn,
-                                                                   cfg):  # noqa: F811
+                                                                   cfg, clock):  # noqa: F811
     token = store.coord_take()
     _d, t = a_thread(store)
     ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-twice")
@@ -874,10 +897,13 @@ def test_a_done_worker_ends_on_the_second_consecutive_done_reading(store, fake, 
     # a pass that lists it working breaks the run: the next done reading is a first one again
     fake.others([OTHER, {"id": "w0", "sessionId": "sid-twice", "name": cl.session_name(ln), "cwd": str(wdir),
                          "kind": "background", "state": "working", "status": "busy"}])
+    clock.tick(cl.DONE_READ_GAP)
     cl.watch_once(store)
     _done_listing(fake, [(ln, "sid-twice")], wdir)
+    clock.tick(cl.DONE_READ_GAP)
     lines = cl.watch_once(store)
     assert store.launch(ln.launch_id).state == "active", lines
+    clock.tick(cl.DONE_READ_GAP)
     lines = cl.watch_once(store)
     assert store.launch(ln.launch_id).state == "ended", lines
     assert store.launch_handoff(token, ln.launch_id)["handoff"] == "all done\nDONE: yes"
@@ -892,12 +918,8 @@ def test_a_turn_stopped_for_anything_but_a_tool_call_is_finished(cfg, stop):
     assert cl.worker_turn(str(cfg), "sid-tool")[0] is False
 
 
-def test_a_worker_listed_done_but_never_proven_finished_is_ended_by_the_backstop(store, fake, live_hook, wdir, spawn,
-                                                                                 cfg, monkeypatch):  # noqa: F811
-    # at the default pass every half minute, the backstop is about an hour: longer than a consent prompt is left
-    # waiting in practice, short enough that stuck workers never hold the spawn cap for good
-    assert cl.UNPROVEN_DONE_PASSES * 30 >= 30 * 60
-    monkeypatch.setattr(cl, "UNPROVEN_DONE_PASSES", 3)
+def test_a_worker_waiting_on_a_tool_call_is_never_ended_by_the_backstop(store, fake, live_hook, wdir, spawn, cfg,
+                                                                        clock):  # noqa: F811
     token = store.coord_take()
     _d, t = a_thread(store)
     ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-stuck")
@@ -905,13 +927,66 @@ def test_a_worker_listed_done_but_never_proven_finished_is_ended_by_the_backstop
         {"type": "text", "text": "I asked to run the tests."}, {"type": "tool_use", "id": "t1", "name": "Bash",
                                                                  "input": {}}])])
     _done_listing(fake, [(ln, "sid-stuck")], wdir)
-    for _ in range(2):
+    for _ in range(3):                         # the consent wait: however long it lasts, it is never ended
         lines = cl.watch_once(store)
         assert store.launch(ln.launch_id).state == "active", lines
+        assert any(f"launch {ln.launch_id}: listed done" in x and "never ended by the backstop" in x
+                   for x in lines), lines
+        clock.tick(cl.UNPROVEN_DONE_SECONDS * 2)
+    assert fake.stops() == []
+
+
+def test_an_ambiguous_done_worker_is_ended_by_elapsed_time_not_pass_count(store, fake, live_hook, wdir, spawn, cfg,
+                                                                          clock):  # noqa: F811
+    # about an hour: longer than a turn is plausibly left unreadable, short enough that a stuck worker never holds
+    # the spawn cap for good; counted in time, so fast passes cannot bring it forward
+    assert cl.UNPROVEN_DONE_SECONDS == 60 * 60 and not hasattr(cl, "UNPROVEN_DONE_PASSES")
+    token = store.coord_take()
+    _d, t = a_thread(store)
+    ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-murky")
+    # a reply followed by a prompt the harness lists done: nothing shows a tool call waiting, nothing shows it finished
+    _transcript(cfg, "sid-murky", [_ASKED, _said("half of it"), _ASKED])
+    _done_listing(fake, [(ln, "sid-murky")], wdir)
+    for _ in range(4):                         # rapid passes: no time has gone by
+        lines = cl.watch_once(store)
+        assert store.launch(ln.launch_id).state == "active", lines
+    clock.tick(cl.UNPROVEN_DONE_SECONDS - 1)
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active", lines
+    clock.tick(1)
     lines = cl.watch_once(store)
     assert store.launch(ln.launch_id).state == "ended", lines
     got = store.launch_handoff(token, ln.launch_id)
-    assert got["handoff"] == "I asked to run the tests." and "3 passes" in got["why"], got
+    assert got["handoff"] == "half of it" and "ended by the backstop" in got["why"] and "3600 s" in got["why"], got
+    # an unreadable transcript is the same class
+    _d2, t2 = a_thread(store, "the second job")
+    lost = _activate(store, spawn(store, token, t2.thread_id, wdir, slots={"topic": "y"}), "sid-lost")
+    _done_listing(fake, [(lost, "sid-lost")], wdir)
+    cl.watch_once(store)
+    clock.tick(cl.UNPROVEN_DONE_SECONDS)
+    lines = cl.watch_once(store)
+    assert store.launch(lost.launch_id).state == "ended", lines
+
+
+def test_two_done_readings_must_be_spaced_by_the_minimum_interval(store, fake, live_hook, wdir, spawn, cfg,
+                                                                  clock):  # noqa: F811
+    assert cl.DONE_READ_GAP > 0
+    token = store.coord_take()
+    _d, t = a_thread(store)
+    ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-quick")
+    _transcript(cfg, "sid-quick", [_ASKED, _said("all done\nDONE: yes")])
+    _done_listing(fake, [(ln, "sid-quick")], wdir)
+    cl.watch_once(store)
+    clock.tick(cl.DONE_READ_GAP - 1)
+    lines = cl.watch_once(store)               # back to back (a daemon pass beside a cron run): not a second reading
+    assert store.launch(ln.launch_id).state == "active", lines
+    assert any(f"launch {ln.launch_id}:" in x and "too soon" in x for x in lines), lines
+    clock.tick(1)
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended", lines
+    # the readings file is replaced whole through a per-process name: no shared tmp file is left behind
+    assert [p.name for p in Path(store.directory).iterdir() if p.name.startswith(cl.WORKER_READS)] == [
+        cl.WORKER_READS]
 
 
 def test_the_spawn_runs_in_the_checked_canonical_directory(store, fake, live_hook, wdir, spawn, tmp_path,
