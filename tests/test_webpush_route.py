@@ -206,21 +206,19 @@ def test_an_operator_desk_defaults_to_a_day_and_devices_to_an_hour(tmp_path):
     assert route.read_route(tmp_path, NOW + 1)[2] == NOW + presence.DEFAULT_SECS
 
 
-def test_a_failed_route_write_leaves_the_word_untouched_and_raises(tmp_path, monkeypatch):
+def test_a_failed_route_write_reports_it_after_the_word_landed(tmp_path, monkeypatch):
     set_word(tmp_path, "away", by=None, now=NOW)
-    before = presence.read_word(tmp_path)
 
     def boom(*a, **k):
         raise presence.PresenceError("route not written: disk")
 
     monkeypatch.setattr(route, "apply_route", boom)
-    with pytest.raises(presence.PresenceError):
+    with pytest.raises(presence.PresenceError, match="tap it again"):
         set_word(tmp_path, "remote", by=None, now=NOW + 5)
-    assert presence.read_word(tmp_path) == before
+    assert presence.read_word(tmp_path)["word"] == "remote"      # the word is set; the caller was told the route was not
     monkeypatch.setattr(route, "_write", boom)
-    with pytest.raises(presence.PresenceError):
+    with pytest.raises(presence.PresenceError, match="tap it again"):
         set_word(tmp_path, "back", by=None, now=NOW + 6)
-    assert presence.read_word(tmp_path) == before
 
 
 def test_the_throttle_is_a_file_per_queue_so_it_holds_across_processes(tmp_path):
@@ -274,17 +272,14 @@ def test_the_public_setter_flushes_held_pings_for_devices_only(tmp_path, monkeyp
     assert calls == [False]
 
 
-def test_a_word_write_that_fails_restores_the_route_record(tmp_path):
+def test_a_word_write_that_fails_leaves_the_route_alone(tmp_path):
     set_word(tmp_path, "away", by=None, now=NOW)
     route.set_route(tmp_path, "devices", "2h", now=NOW)
     before = (tmp_path / "webpush" / "route.json").read_bytes()
     pj = tmp_path / "webpush" / "presence.json"
     pj.unlink()
     pj.mkdir()   # the word cannot be written over a directory
-    with pytest.raises(presence.PresenceError):
-        set_word(tmp_path, "back", by=None, now=NOW + 5)
-    assert (tmp_path / "webpush" / "route.json").read_bytes() == before
-    (tmp_path / "webpush" / "route.json").unlink()
-    with pytest.raises(presence.PresenceError):
-        set_word(tmp_path, "remote", by=None, now=NOW + 6)
-    assert not (tmp_path / "webpush" / "route.json").exists()
+    for word in ("back", "remote"):
+        with pytest.raises(presence.PresenceError):
+            set_word(tmp_path, word, by=None, now=NOW + 5)
+        assert (tmp_path / "webpush" / "route.json").read_bytes() == before
