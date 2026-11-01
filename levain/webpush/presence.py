@@ -653,8 +653,9 @@ def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float
     try:
         _follow_route(queue_dir, word, duration, action, ts)
     except PresenceError as e:
-        _log_best_effort(queue_dir, {**row, "outcome": "set", "why": _clean(f"route not changed: {e}", _WHY_MAX)})
-        raise PresenceError(f"{word} is set, but the route was not changed ({e}); tap it again") from e
+        done = "cleared" if action == "clear" else "set"
+        _log_best_effort(queue_dir, {**row, "outcome": done, "why": _clean(f"route not changed: {e}", _WHY_MAX)})
+        raise PresenceError(f"{word} is {done}, but the route was not changed ({e}); tap it again") from e
     if by is None:
         _log_best_effort(queue_dir, row)
     return rec if action == "write" else (None if action == "clear" else prior)
