@@ -979,3 +979,69 @@ def test_a_worker_that_left_the_listing_keeps_its_final_message(store, fake, liv
     assert store.launch_handoff(token, ln.launch_id)["handoff"] == "half of it\nDONE: no"
     with pytest.raises(lease.LeaseRefused, match="left no handoff"):
         store.launch_handoff(token, mute.launch_id)
+
+
+# --- fix 4: one directory after the check, the backstop by elapsed time, every drop in a file, the error classes, ---
+# --- spaced done readings -------------------------------------------------------------------------------------------
+def test_a_link_retargeted_after_the_check_cannot_split_the_hook_check_from_the_spawn(store, fake, wdir, spawn,
+                                                                                     tmp_path, monkeypatch):  # noqa: F811
+    hooked = tmp_path / "hooked"
+    hooked.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(wdir)
+    _d, t = a_thread(store)
+    ln = spawn(store, store.coord_take(), t.thread_id, link)
+    seen = []
+
+    def hook(d, **_kw):
+        seen.append(str(d))
+        return (Path(d).resolve() == hooked.resolve(), "wired to this install")
+
+    monkeypatch.setattr(cl, "hook_live", hook)
+    check = cl._worker_check
+
+    def check_then_retarget(*a, **k):
+        got = check(*a, **k)
+        link.unlink()
+        link.symlink_to(hooked)                # the link moves to a directory with a live hook after the check
+        return got
+
+    monkeypatch.setattr(cl, "_worker_check", check_then_retarget)
+    got = cl.launch_session(store, ln.launch_id)
+    # the hook is checked in the directory the checks resolved (no live hook there), so nothing starts, and nothing
+    # is made in the directory the link now names
+    assert seen == [str(wdir)], seen
+    assert not got.started and "consent hook is not live" in got.refusal, got
+    assert fake.spawns() == [] and not (hooked / ".levain").exists()
+    # with the hook live there, every step runs in the checked directory: the brief, the prompt and the spawn
+    link.unlink()
+    link.symlink_to(wdir)
+    monkeypatch.setattr(cl, "hook_live", lambda d, **_kw: (seen.append(str(d)) or True, "wired to this install"))
+    seen.clear()
+    got = cl.launch_session(store, ln.launch_id)
+    assert got.started, got
+    (call,) = [c for c in fake.calls() if c["argv"][:1] == ["--bg"]]
+    assert call["cwd"] == str(wdir) and seen == [str(wdir)]
+    brief = wdir / ".levain" / "briefs" / f"{ln.launch_id}.md"
+    assert brief.is_file() and str(brief) in call["argv"][-1] and not (hooked / ".levain").exists()
+    assert f"Your directory is \"{wdir}\"" in brief.read_text()
+
+
+def test_a_checked_directory_that_moved_after_the_claim_fails_by_the_defined_fail(store, fake, live_hook, wdir, spawn,
+                                                                                  tmp_path, monkeypatch):  # noqa: F811
+    _d, t = a_thread(store)
+    ln = spawn(store, store.coord_take(), t.thread_id, wdir)
+    claim = store.launch_claim_spawn
+    moved = tmp_path / "moved"
+    moved.mkdir()
+
+    def swap_then_claim(*a, **k):
+        got = claim(*a, **k)
+        wdir.rename(tmp_path / "gone")
+        wdir.symlink_to(moved)                 # the checked path itself became a link after the claim
+        return got
+
+    monkeypatch.setattr(store, "launch_claim_spawn", swap_then_claim)
+    got = cl.launch_session(store, ln.launch_id)
+    assert not got.started and "now resolves to" in got.refusal, got
+    assert store.launch(ln.launch_id).state == "failed" and fake.spawns() == []

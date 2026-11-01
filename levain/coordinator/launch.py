@@ -78,6 +78,7 @@ coordinator's own install there refuses its floor (fail-closed).
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import json
 import os
@@ -943,6 +944,11 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
         from levain.coordinator import codex_launch
 
         return codex_launch.launch(store, ln)
+    if checked is not None:
+        # from here on a worker has ONE directory, the one its checks resolved: the hook check, the briefs directory,
+        # the brief, its prompt and the spawn all take it, so a link in the asked path retargeted since cannot make
+        # the hook check and the spawn see different directories
+        ln = dataclasses.replace(ln, cwd=checked)
 
     def left(cause: str) -> Outcome:
         return Outcome(launch_id, False, refusal=_plain(f"{cause} (launch {launch_id} left pending, until {ln.until})"))
@@ -966,6 +972,8 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
     got, why = store.launch_claim_spawn(launch_id, os.getpid())
     if why is not None:
         return Outcome(launch_id, False, refusal=why)
+    if checked is not None:
+        got = dataclasses.replace(got, cwd=checked)
 
     def fail(cause: str, remedy: str | None = None) -> Outcome:
         cause = _plain(cause)
@@ -981,8 +989,8 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
     spawned = settled = False
     exe = name = ""
     # a worker spawns in the directory its checks resolved, never through the path it was asked with: a symlink in
-    # that path retargeted since cannot move it
-    cwd = checked if checked is not None else got.cwd
+    # that path retargeted since cannot move it; a checked path that itself became a link since fails here
+    cwd = got.cwd
     real = os.path.realpath(cwd)
     if checked is not None and real != checked:
         return fail(f"the worker's checked directory {checked} now resolves to {real}; nothing was started")
