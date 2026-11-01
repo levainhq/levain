@@ -110,6 +110,7 @@ _add(S, "drop", "the renderer formats age", False, "state.age_label")
 H = "header"
 _add(H, "map", "line state in header (from the source keys, not the display text)", True,
      "state")
+_add(H, "drop", "the cockpit no longer draws a weather card; a legacy /header.json key is dropped on purpose", True, "weather", "error")
 
 K = "sky"
 _add(K, "map", "visual sky: ok -> status, stars/heads -> data", True,

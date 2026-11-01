@@ -1136,7 +1136,7 @@ body.ke .deck { max-width: var(--page-max); margin: 0 auto; }
 /* THE NOW BAND, then the sky as a card under it (F1). The band is one row: the clock and date, the state line verbatim with its
    age, and at the right the last-wrap line. The masthead above it (brand, the four
    tabs, the status cluster, the theme switch) is the page's bar and never moves into the hero. A bare install has no sky and no
-   downstream panel: the band is still whole, and the sky card is simply not drawn. *
+   downstream panel: the band is still whole, and the sky card is simply not drawn. */
 body.ke .hero > .ck-region-err { padding: var(--sp-5) var(--gutter); }
 body.ke .hero { display: block; }
 body.ke .band { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: var(--sp-7); padding-block: var(--gap) var(--sp-5); }

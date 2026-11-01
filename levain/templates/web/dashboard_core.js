@@ -760,7 +760,11 @@
     metaKids.push(lastWrap);
     metaKids.push(events);
     if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events, place: legendHook.place, hide: legendHook.hide } }));
-    for (const e of entries) if (e !== sky) skyKids.push(bareNode(e, view, "ck-card"));
+    for (const e of entries) if (e !== sky) {
+      const card = bareNode(e, view, "ck-card");
+      if (typeof e.title === "string" && e.title) card.insertBefore(el("div", "needs-sec-label", e.title), card.firstChild);
+      skyKids.push(card);
+    }
     // the clock is mounted only now: nothing after this can throw, so no clock ticks on a node that never attached
     if (window.LevainCockpitKinds) window.LevainCockpitKinds.mountClock(clock, date);
     when.replaceChildren(...whenKids);

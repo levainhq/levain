@@ -96,18 +96,20 @@ def test_a_downstream_hero_reading_draws_no_weather_card_and_the_wrap_line_overl
              " if (!wrap) return null; const b = wrap.getBoundingClientRect();"
              " const hit = (e) => { const r = e.getBoundingClientRect(); return r.width && r.height && b.left < r.right && r.left < b.right && b.top < r.bottom && r.top < b.bottom; };"
              " const others = [...document.querySelectorAll('#ck-when *, #ck-wrapline .events, #ck-sky .ck-card')].filter((e) => !wrap.contains(e) && e !== wrap && !e.contains(wrap)).filter(hit).map((e) => e.className || e.tagName);"
-             " return [others, document.documentElement.scrollWidth <= window.innerWidth, !!q('[data-ck-hero=weather]'), !!q('.wx-refresh'), !!q('svg.wx-icon')]; })()")
+             " return [others, document.documentElement.scrollWidth <= window.innerWidth, !!q('[data-ck-hero=weather]'), !!q('.wx-refresh'), !!q('svg.wx-icon'), getComputedStyle(q('#ck-band')).display, ((q('#ck-sky .ck-card .needs-sec-label') || {}).textContent || '')]; })()")
     with _Served(src, cockpit=_reading_cockpit(src), surface_tokens={"browser": "T"}, install_class="reported") as url:
         steps: list[dict[str, Any]] = []
         for w in (390, 768, 1280):
             steps += [{"emulate": {"w": w, "h": 900}}, {"until": probe}, {"eval": probe}]
         out = _drive(tmp_path, f"{url}/", steps)
-    got = [v for v in out["values"] if isinstance(v, list) and len(v) == 5]
+    got = [v for v in out["values"] if isinstance(v, list) and len(v) == 7]
     assert len(got) >= 3, out["values"]
-    for others, no_hscroll, weather, refresh, icon in got:
+    for others, no_hscroll, weather, refresh, icon, band, title in got:
         assert others == [], f"the last-wrap line overlaps: {others}"
         assert no_hscroll is True
         assert not weather and not refresh and not icon
+        assert band == "grid", f"the hero band lost its stylesheet rules: display is {band!r}"
+        assert title == "Reading", "a downstream hero reading shows its own title"
 
 
 
