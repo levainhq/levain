@@ -23,9 +23,10 @@ Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newe
 - ``loud [duration|off]`` turns pings on for its duration, over every other parameter, a mute included; only its timer,
   ``loud off`` or any other word written over it (``set_word`` keeps one word on file) ends it, never ``back``.
 - ``away`` pushes at once until input at this machine more than :data:`AWAY_GRACE_SECS` after it (a line typed just
-  after saying it is the parting instruction). ``remote [duration]`` pushes for its duration and also sets the route to ``devices`` for it
-  (:mod:`levain.webpush.route`; ``back`` sets it to ``desk``). ``back`` clears
-  ``away``, ``remote``, ``quiet`` and ``sleep``, and leaves the measurement to decide. All optional overrides.
+  after saying it is the parting instruction). ``back`` clears ``away``, ``quiet`` and ``sleep``, sets the route to ``desk``
+  (:mod:`levain.webpush.route`) and leaves the measurement to decide. All optional overrides. (There was a ``remote`` word;
+  it was dropped 11-01: the route, ``devices``, is how pings go to the phone, and a measured remote session is desk activity.
+  A ``remote`` left on file by an older version reads as no word.)
 
 Desk activity is the macOS HID idle time (:func:`levain.consent.auto_away.input_idle_seconds`): measured, never
 predicted. With no such source, or no readable word, nothing is muted and the desk reads inactive: a ping he did not
@@ -67,7 +68,7 @@ from pathlib import Path
 
 __all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "SLEEP_BLIND_SECS", "URGENT_KINDS", "WORDS", "Decision", "KIND_CLASSES", "DEFAULT_CELLS", "kind_class",
            "read_policy", "set_policy", "reset_policy", "policy_sentences", "policy_view", "policy_is_default",
-           "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "set_word", "should_push"]
+           "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "set_word", "should_push", "effective"]
 
 ACTIVE_WINDOW_SECS = 5 * 60
 AWAY_GRACE_SECS = 3 * 60
@@ -75,9 +76,10 @@ DEFAULT_SECS = 60 * 60
 MAX_SECS = 24 * 3600
 MIN_SECS = 60
 SLEEP_BLIND_SECS = DEFAULT_SECS   # with no idle reading, `sleep` cannot see his next input: it ends this long after the word
-WORDS = ("away", "back", "sleep", "quiet", "loud", "remote")
-TIMED = ("quiet", "loud", "remote")
-SEAT_WORDS = ("away", "remote")
+WORDS = ("away", "back", "sleep", "quiet", "loud")
+TIMED = ("quiet", "loud")
+SEAT_WORDS = ("away",)
+DROPPED_WORDS = {"remote": "the `remote` word was dropped: use the route, `devices`, to push pings to your phone"}
 COORDINATOR_WORDS = SEAT_WORDS + ("quiet", "sleep")
 ROLES = ("seat", "coordinator")
 _SAID_MAX = 300
@@ -218,14 +220,21 @@ _CLASS_WORDS = {"approval": "approvals", "attention": "attention items", "other"
 
 def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False, class_name: str | None = None,
            policy: dict | None = None, route: str = "desk") -> Decision:
+    """:func:`_decide` without the source: whether a ping is pushed at ``now`` (the full docstring is there). Pure."""
+    return _decide(now, word, idle, urgent=urgent, class_name=class_name, policy=policy, route=route)[0]
+
+
+def _decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False, class_name: str | None = None,
+            policy: dict | None = None, route: str = "desk") -> tuple[Decision, str]:
     """Whether a ping is pushed at ``now``. ``idle``: seconds since the operator's last input at this machine, ``None``
     when unknown. ``class_name`` is the ping's class (:func:`kind_class`); left unset, ``urgent`` stands for
     ``approval`` and not urgent for ``other``. ``policy`` is the cells (:func:`read_policy`), the shipped default when
     unset: while ``quiet`` or ``sleep`` is active the cell for (word, class) decides push or hold. ``route``
     (:mod:`levain.webpush.route`) is ``desk`` or ``devices``: ``devices`` pushes an ordinary ping even while the desk is
-    active, after every mute and word above it. Pure."""
+    active, after every mute and word above it. Returns ``(decision, source)``: ``word`` when a word on file (loud, a
+    mute, away) decided, ``measured`` when the desk reading, the route or the ping's class decided. Pure."""
     if _active(word, "loud", now):
-        return Decision(True, "pushing", "loud: pings on until its timer ends, over every other parameter")
+        return Decision(True, "pushing", "loud: pings on until its timer ends, over every other parameter"), "word"
     cls = class_name if class_name in CLASSES else ("approval" if urgent else "other")
     cells = policy if policy is not None else DEFAULT_CELLS
     seen = None if idle is None else now - max(0.0, idle)   # when he last did something here
@@ -239,27 +248,25 @@ def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = 
         value = cells[mute][cls]
         custom = value != DEFAULT_CELLS[mute][cls]
         if value == "push":
-            return Decision(True, "pushing", f"{mute}: {_CLASS_WORDS[cls]} still reach you (your policy)" if custom else "urgent")
+            return Decision(True, "pushing", f"{mute}: {_CLASS_WORDS[cls]} still reach you (your policy)" if custom else "urgent"), "word"
         if mute == "sleep":
             why = (f"sleep: {_CLASS_WORDS[cls]} are held (your policy)" if custom else
                    "sleep: nothing is pushed until his next input here, urgent pings included")
         else:
             why = (f"quiet: {_CLASS_WORDS[cls]} are held (your policy)" if custom else
                    "quiet: nothing but an urgent ping is pushed until it ends")
-        return Decision(False, "muted", why, mute)
+        return Decision(False, "muted", why, mute), "word"
     if cls != "other":
-        return Decision(True, "pushing", "urgent")
+        return Decision(True, "pushing", "urgent"), "measured"
     if word and word["word"] == "away" and not (seen is not None and seen > word["ts"] + AWAY_GRACE_SECS):
-        return Decision(True, "pushing", "away: his word")
-    if _active(word, "remote", now):
-        return Decision(True, "pushing", "remote: his word")
+        return Decision(True, "pushing", "away: his word"), "word"
     if route == "devices":
-        return Decision(True, "pushing", "route: devices (his phone shows the band)")
+        return Decision(True, "pushing", "route: devices (his phone shows the band)"), "measured"
     if seen is None:
-        return Decision(True, "pushing", "no desk activity source: read as inactive")
+        return Decision(True, "pushing", "no desk activity source: read as inactive"), "measured"
     if idle is not None and idle >= ACTIVE_WINDOW_SECS:
-        return Decision(True, "pushing", f"desk inactive {int(idle // 60)} min")
-    return Decision(False, "holding", f"desk active {int((idle or 0.0) // 60)} min ago")
+        return Decision(True, "pushing", f"desk inactive {int(idle // 60)} min"), "measured"
+    return Decision(False, "holding", f"desk active {int((idle or 0.0) // 60)} min ago"), "measured"
 
 
 def _policy_path(queue_dir: Path | str) -> Path:
@@ -478,26 +485,55 @@ def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | 
     return _copy_cells(DEFAULT_CELLS)
 
 
+def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Callable[[], float | None] | None,
+          suggest: bool) -> tuple[Decision, str, dict | None]:
+    """The one place the rule is read: ``(decision, source, word)`` for a ``kind`` of ping at ``now``. Both
+    :func:`should_push` and :func:`effective` call it, so the push and the chip cannot diverge. Raises on a fault; the
+    callers read that as push."""
+    if idle is None:
+        from levain.consent.auto_away import input_idle_seconds as idle
+    from levain.webpush import route as _route
+
+    at = time.time() if now is None else now
+    reading = idle()
+    if suggest:   # delivery drives the suggestion (throttled there); a status read (``suggest=False``) never does
+        try:
+            _route.auto_suggest(queue_dir, idle=reading, now=at)
+        except Exception:  # noqa: BLE001 - its fault never changes the rule
+            pass
+    word = read_word(queue_dir)
+    d, source = _decide(at, word, reading, class_name=kind_class(kind),
+                        policy=read_policy(queue_dir)[0], route=_route.read_route(queue_dir, at)[0])
+    return d, source, word
+
+
+_FAULT = "the presence rule could not be read: pushing"
+
+
 def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = None,
                 idle: Callable[[], float | None] | None = None, suggest: bool = True) -> Decision:
     """:func:`decide` for a ``kind`` of ping against the word on file and the input idle time (``idle`` defaults to
     :func:`levain.consent.auto_away.input_idle_seconds`). Any fault reads as push: a missed ping is the worse error."""
     try:
-        if idle is None:
-            from levain.consent.auto_away import input_idle_seconds as idle
-        from levain.webpush import route as _route
-
-        at = time.time() if now is None else now
-        reading = idle()
-        if suggest:   # delivery drives the suggestion (throttled there); a status read (``suggest=False``) never does
-            try:
-                _route.auto_suggest(queue_dir, idle=reading, now=at)
-            except Exception:  # noqa: BLE001 - its fault never changes the rule
-                pass
-        return decide(at, read_word(queue_dir), reading, class_name=kind_class(kind),
-                      policy=read_policy(queue_dir)[0], route=_route.read_route(queue_dir, at)[0])
+        return _core(queue_dir, kind, now, idle, suggest)[0]
     except Exception:  # noqa: BLE001 - the rule failing must not silence the phone
-        return Decision(True, "pushing", "the presence rule could not be read: pushing")
+        return Decision(True, "pushing", _FAULT)
+
+
+def effective(queue_dir: Path | str | None, now: float | None = None, *,
+              idle: Callable[[], float | None] | None = None, suggest: bool = False) -> dict:
+    """What the rule does now with an ordinary ping, for the cockpit chip and any status read:
+    ``{state: pushing|holding|muted, pushing, reason, source: word|measured, since}``. It is the same call
+    :func:`should_push` makes (:func:`_core`, kind ``ping``), so the chip and the push decision for the same instant are
+    one answer; the route axis is folded in as there. ``source`` is ``word`` when a word on file (loud, away, quiet, sleep)
+    decided, ``measured`` when the desk reading or the route decided; ``since`` is that word's time, else ``None``.
+    ``suggest`` defaults off: a status read never drives the route suggestion. A fault reads as pushing."""
+    try:
+        d, source, word = _core(queue_dir, "ping", now, idle, suggest)
+    except Exception:  # noqa: BLE001 - the same fault rule as should_push
+        return {"state": "pushing", "pushing": True, "reason": _FAULT, "source": "measured", "since": None}
+    since = word["ts"] if source == "word" and word is not None else None
+    return {"state": d.state, "pushing": d.push, "reason": d.why, "source": source, "since": since}
 
 
 def check_setter(word: str, by: dict | None, said: str | None) -> str:
@@ -529,7 +565,7 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
              by: dict | None = None, said: str | None = None, match: object = None,
              via: str | None = None, wait: float | None = None,
              precheck: "Callable[[], None] | None" = None, after: "Callable[[], None] | None" = None) -> dict | None:
-    """Write ``word`` (``duration`` for quiet, loud and remote; ``loud off`` clears a loud). Returns what is on file
+    """Write ``word`` (``duration`` for quiet and loud; ``loud off`` clears a loud). Returns what is on file
     after, ``None`` when no word stands. ``back`` leaves a standing ``loud`` alone and returns it. Raises
     :class:`PresenceError` for an unknown word, a bad duration, or a directory or file that is not safe to write.
     ``by`` (a seat's or the coordinator's identity, see :func:`check_setter`) and ``said`` (his words) are for an agent
@@ -665,17 +701,14 @@ def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float
 
 
 def _follow_route(queue_dir: Path | str, word: str, duration: str | None, action: str, ts: float) -> None:
-    """``remote`` is a preset (present + route devices for the same duration) and ``back`` is present + desk; the caller
-    holds the presence lock. Runs after the word is written; a route that cannot be written raises and the caller says so."""
-    if not ((word == "remote" and action == "write") or (word == "back" and action == "clear")):
+    """``back`` is present + desk; the caller holds the presence lock. Runs after the word is written; a route that
+    cannot be written raises and the caller says so."""
+    if not (word == "back" and action == "clear"):
         return
     from levain.webpush import route
 
-    if word == "back":
-        # present at the desk: the standing route record goes, and a later remote login can still suggest devices
-        route._write(queue_dir, None)
-        return
-    route.apply_route(queue_dir, "devices", duration, source="operator", now=ts)
+    # present at the desk: the standing route record goes, and a later remote login can still suggest devices
+    route._write(queue_dir, None)
 
 
 def _evidence(match: object) -> tuple[bool, float | None, str]:
@@ -693,7 +726,8 @@ def _plan(word: str, duration: str | None, ts: float, prior: dict | None, by: di
     word), ``clear`` (no word stands after) or ``keep`` (the word on file stays, the note says why). Raises
     :class:`PresenceError` for a refusal."""
     if word not in WORDS:
-        raise PresenceError(f"{word!r} is not a presence word (one of: {', '.join(WORDS)})")
+        hint = f"; {DROPPED_WORDS[word]}" if word in DROPPED_WORDS else ""
+        raise PresenceError(f"{word!r} is not a presence word (one of: {', '.join(WORDS)}){hint}")
     quote = check_setter(word, by, said) if by is not None else None
     if by is not None and _active(prior, "loud", ts):
         raise PresenceError("`loud` is the operator's standing word; a seat cannot replace it "
@@ -841,7 +875,7 @@ def read_log(queue_dir: Path | str | None, *, limit: int | None = None) -> list[
 
 
 def is_expired(word: dict | None, now: float) -> bool:
-    """Whether ``word`` is a timed word (quiet, loud, remote) whose time has run out."""
+    """Whether ``word`` is a timed word (quiet, loud) whose time has run out."""
     return bool(word and word["word"] in TIMED and not _active(word, word["word"], now))
 
 

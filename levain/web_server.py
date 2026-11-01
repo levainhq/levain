@@ -2435,7 +2435,9 @@ class _Handler(GuardedHandler):
         route, route_source, route_until = route_mod.read_route(queue, now)
         view = {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
                 "route": route, "route_source": route_source, "route_until": route_until,
-                "text": presence.describe(queue)}
+                "text": presence.describe(queue),
+                # what the push rule does right now (the same call a delivery makes); a status read never drives the route suggestion
+                "effective": presence.effective(queue, now, suggest=False)}
         if self._credential_is_full():     # a tap token's holder is told the word, never the list of other taps
             from levain.webpush import presence_tokens
 
@@ -2503,7 +2505,7 @@ class _Handler(GuardedHandler):
             if tap is not None and isinstance(exc, presence_tokens.TokenRefused):
                 return {"error": exc.error, "message": str(exc)}, 403
             return {"error": "presence_refused", "message": str(exc)}, 422
-        if req["word"] in ("remote", "back"):   # a route-alone set flushes inside set_route
+        if req["word"] == "back":   # a route-alone set flushes inside set_route
             try:     # outside the presence lock: pings held as "active" are due now the route may read devices
                 from levain.webpush import held
 

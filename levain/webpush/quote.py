@@ -1,6 +1,6 @@
 """levain.webpush.quote — is the quote a setter gives for a presence word something the operator typed?
 
-A seat or the coordinator sets ``away`` or ``remote`` (the coordinator also ``quiet`` and ``sleep``) on "his words" and
+A seat sets ``away`` (the coordinator also ``quiet`` and ``sleep``) on "his words" and
 quotes them (:func:`levain.webpush.presence.set_word`). This module reads the setter's own session transcript and finds
 the quote in one of the operator's turns there, so the record can say whether the quote is his and when he typed it
 (P2, ``project_memory/1030-2-presence/DESIGN.md`` section 4).

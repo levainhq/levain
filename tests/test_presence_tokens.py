@@ -12,7 +12,7 @@ from levain.webpush.presence import PresenceError
 
 def test_create_returns_a_token_once_and_keeps_only_its_hash(tmp_path):
     rec, tok = pt.create(tmp_path, "door")
-    assert len(tok) >= 43 and rec["words"] == ["away", "back", "quiet", "remote", "desk", "devices"] and rec["revoked"] is False
+    assert len(tok) >= 43 and rec["words"] == ["away", "back", "quiet", "desk", "devices"] and rec["revoked"] is False
     f = tmp_path / "webpush" / pt.FILE_NAME
     assert (f.stat().st_mode & 0o777) == 0o600
     text = f.read_text()

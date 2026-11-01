@@ -2972,8 +2972,9 @@ body.ke #drop-recent { max-height: 40vh; overflow: auto; }
 .pr-chip[hidden] { display: none !important; }   /* the masthead's own button rules set display and would override [hidden] */
 body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
 .pr-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--ok); }
-.pr-chip[data-state="away"] .pr-dot, .pr-chip[data-state="remote"] .pr-dot { background: var(--warn); }
-.pr-chip[data-state="quiet"] .pr-dot, .pr-chip[data-state="sleep"] .pr-dot { background: var(--label); }
+.pr-chip[data-state="away"] .pr-dot { background: var(--warn); }
+.pr-chip[data-state="quiet"] .pr-dot, .pr-chip[data-state="sleep"] .pr-dot,
+.pr-chip[data-state="holding"] .pr-dot, .pr-chip[data-state="muted"] .pr-dot { background: var(--label); }
 .pr-chip[data-state="loud"] .pr-dot { background: var(--bad); }
 .pr-chip-t { font-variant-numeric: tabular-nums; }
 .pr-sheet { position: fixed; z-index: 40; top: var(--pr-top, 64px); left: var(--pr-left, 8px); width: min(340px, calc(100vw - 16px)); box-sizing: border-box;

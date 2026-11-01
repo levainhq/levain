@@ -24,8 +24,8 @@ def _idle():
     return 10.0
 
 
-@pytest.mark.parametrize("word,duration", [("away", None), ("remote", "30m")])
-def test_a_seat_sets_away_and_remote_on_his_words_and_the_record_names_it(tmp_path, word, duration):
+@pytest.mark.parametrize("word,duration", [("away", None)])
+def test_a_seat_sets_away_on_his_words_and_the_record_names_it(tmp_path, word, duration):
     rec = set_word(tmp_path, word, duration=duration, now=NOW, by=SEAT, said="heading out")
     assert rec["word"] == word and rec["by"] == SEAT and rec["said"] == "heading out"
     on_file = json.loads(_file(tmp_path).read_text())
@@ -169,7 +169,7 @@ def test_cli_the_parser_takes_said_on_every_word():
     cli.register(top.add_subparsers(dest="cmd"))
     got = top.parse_args(["ping", "away", "--said", "heading out"])
     assert got.said == "heading out" and got.word == "away"
-    assert top.parse_args(["ping", "remote", "2h", "--said", "x"]).duration == "2h"
+    assert top.parse_args(["ping", "quiet", "2h", "--said", "x"]).duration == "2h"
     assert top.parse_args(["ping", "back"]).said is None
 
 

@@ -84,9 +84,17 @@ def test_away_pushes_at_once_until_input_past_the_grace():
     assert AWAY_GRACE_SECS == 180
 
 
-def test_remote_pushes_for_its_duration_only():
-    assert decide(NOW, _w("remote", until=NOW + 60), ACTIVE).push is True
-    assert decide(NOW, _w("remote", until=NOW - 1), ACTIVE).push is False
+def test_remote_is_no_longer_a_presence_word(tmp_path):
+    """Dropped 11-01: it is not a word to set, and a `remote` an older version left on file reads as NO word."""
+    assert "remote" not in presence.WORDS and "remote" not in presence.TIMED and "remote" not in presence.SEAT_WORDS
+    with pytest.raises(presence.PresenceError, match="`remote` word was dropped"):
+        set_word(tmp_path, "remote", duration="1h", now=NOW)
+    assert presence.read_word(tmp_path) is None
+    (tmp_path / "webpush").mkdir(mode=0o700, exist_ok=True)
+    (tmp_path / "webpush" / presence.FILE_NAME).write_text(json.dumps({"word": "remote", "ts": NOW, "until": NOW + 3600}))
+    assert presence.read_word(tmp_path) is None
+    # the rule then follows the measurement: an active desk holds
+    assert presence.should_push(tmp_path, "ping", now=NOW + 1, idle=lambda: ACTIVE).push is False
 
 
 def test_expired_quiet_stops_holding_and_expired_loud_stops_overriding():
@@ -259,7 +267,7 @@ def test_cli_words_write_the_word_and_status_says_why(tmp_path, capsys, monkeypa
     assert presence.read_word(tmp_path) is None
     assert "HOLDING" in capsys.readouterr().out
     assert _cli(tmp_path, "quiet", "soon") == 2
-    for w in ("sleep", "away", "remote", "back"):
+    for w in ("sleep", "away", "back"):
         assert _cli(tmp_path, w) == 0
     assert _cli(tmp_path, "status") == 0
 
@@ -297,3 +305,54 @@ def test_a_failed_write_keeps_the_word_and_leaves_no_temp_file(tmp_path, monkeyp
     monkeypatch.undo()
     assert presence.read_word(tmp_path)["word"] == "away"
     assert [p.name for p in tmp_path.rglob("*.tmp")] == []
+
+
+def test_effective_is_the_same_answer_as_should_push_for_every_decide_case(tmp_path):
+    """The chip and the push decision are one function: over words x idle x route x kind, effective(...).pushing is
+    should_push(...).push, and source says whether a word or the measurement decided."""
+    from levain.webpush import route
+
+    words = [None, _w("away", ts=NOW - 100), _w("away", ts=NOW - 1000), _w("quiet", until=NOW + 60), _w("quiet", until=NOW - 1),
+             _w("sleep", ts=NOW - 100), _w("loud", until=NOW + 60), _w("loud", until=NOW - 1)]
+    n = 0
+    for wi, w in enumerate(words):
+        for idle in (None, 0.0, 120.0, float(ACTIVE_WINDOW_SECS), 900.0):
+            for rt in ("desk", "devices"):
+                q = tmp_path / f"q{n}"
+                n += 1
+                (q / "webpush").mkdir(parents=True, mode=0o700)
+                if w is not None:
+                    (q / "webpush" / presence.FILE_NAME).write_text(json.dumps(w))
+                if rt == "devices":
+                    route.set_route(q, "devices", now=NOW - 5)
+                got = presence.effective(q, NOW, idle=lambda: idle)
+                want = presence.should_push(q, "ping", now=NOW, idle=lambda: idle, suggest=False)
+                assert got["pushing"] is want.push and got["state"] == want.state and got["reason"] == want.why, (w, idle, rt)
+                assert got["source"] in ("word", "measured") and got["state"] in ("pushing", "holding", "muted")
+                if got["source"] == "word":
+                    assert got["since"] == w["ts"]
+                else:
+                    assert got["since"] is None
+    # source: a word decides when it is loud, a mute, or a live away; the desk reading decides otherwise
+    q = tmp_path / "src"
+    (q / "webpush").mkdir(parents=True, mode=0o700)
+    assert presence.effective(q, NOW, idle=lambda: 900.0)["source"] == "measured"
+    (q / "webpush" / presence.FILE_NAME).write_text(json.dumps(_w("quiet", until=NOW + 60)))
+    assert presence.effective(q, NOW, idle=lambda: 900.0)["source"] == "word"
+    (q / "webpush" / presence.FILE_NAME).write_text(json.dumps(_w("away", ts=NOW - 1000)))   # spent: he typed after the grace
+    assert presence.effective(q, NOW, idle=lambda: 5.0)["source"] == "measured"
+
+
+def test_effective_never_drives_the_route_suggestion_and_a_fault_reads_as_pushing(tmp_path, monkeypatch):
+    from levain.webpush import route
+
+    ran = []
+    monkeypatch.setattr(route, "auto_suggest", lambda *a, **k: ran.append(1) or False)
+    presence.effective(tmp_path, NOW, idle=lambda: 900.0)
+    assert ran == []                                  # a status read (suggest=False) never suggests
+    presence.should_push(tmp_path, "ping", now=NOW, idle=lambda: 900.0)
+    assert ran == [1]                                 # a delivery does
+    def boom():
+        raise RuntimeError("no idle")
+    got = presence.effective(tmp_path, NOW, idle=boom)
+    assert got["pushing"] is True and got["state"] == "pushing" and "could not be read" in got["reason"]
