@@ -1164,9 +1164,25 @@ _PRESENCE_TOKEN_REVOKE = "/webpush/presence/token/revoke"
 # The ONLY two routes a presence (tap) token reaches; every other route reads it as no credential at all.
 _PRESENCE_TOKEN_ROUTES = frozenset({_PRESENCE_PATH, _PRESENCE_SET})
 _PRESENCE_TOKEN_HEADER = "X-Levain-Presence-Token"
-_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH})
+# The notify endpoint: a service posts a text-only notice at the operator with a purpose-bound notify token
+# (levain.webpush.notify_tokens). The token is read on /notify alone, as the ONE credential of that route; every other
+# route sees it as no credential at all, and no other credential is read there. Its three admin routes (list, mint,
+# revoke) are the full credential's, on the push family's gate with no token carve-out.
+_NOTIFY_PATH = "/notify"
+_NOTIFY_TOKEN_HEADER = "X-Levain-Notify-Token"
+_NOTIFY_TOKENS = "/webpush/notify/tokens"
+_NOTIFY_TOKENS_REVOKE = "/webpush/notify/tokens/revoke"
+# the whole request body, refused on its declared length before it is read: in bytes, sized so a title and a body at
+# their character maxima in 4-byte UTF-8 still fit
+_NOTIFY_MAX_REQUEST = 8192
+_NOTIFY_KEYS = frozenset({"title", "body", "priority"})
+_NOTIFY_DEFAULT_TITLE = "Notice"            # a post with no title carries this; the source label is put in front of it
+_NOTIFY_MINT_KEYS = frozenset({"name", "source", "urgent", "max_priority", "rate_per_min", "rate_per_day",
+                               "urgent_per_hour"})
+_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH, _NOTIFY_TOKENS})
 _PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
-                        _POLICY_SET, _POLICY_RESET, _PRESENCE_SET, _PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE})
+                        _POLICY_SET, _POLICY_RESET, _PRESENCE_SET, _PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE,
+                        _NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
 # A device's receipt for a push it got: the one webpush POST that takes no token (the worker holds none). Its report names
 # the SHA-256 of the device's own subscription endpoint, checked by the store; it is kept OUT of _PUSH_POST so every route
@@ -1196,6 +1212,50 @@ def _push_static() -> frozenset[str]:
     return STATIC_PATHS
 
 
+def _push_notice(queue: Path, ping_id: int, kind: str, ref: str, title: str, body: str) -> None:
+    """Push one recorded notice to the live subscriptions, off the request thread (a push service can take most of
+    :data:`levain.webpush.sender.WALL_BUDGET`, and the poster is a script that should not wait on it). A failure here is
+    in the ping's delivery rows, never the poster's reply."""
+    try:
+        from levain.webpush import notify, sender
+        from levain.webpush.store import PushStore
+
+        sender.deliver(queue, PushStore(queue), ping_id, kind=kind, ref=ref, title=title, body=body, url=notify.NOTICES_URL)
+    except Exception:  # noqa: BLE001 - the notice is recorded; its push is best effort
+        pass
+
+
+def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
+    """Act on an admitted notice: store it, then do what the operator's notification policy says (the same ``decide`` a
+    seat's ping meets, through :func:`levain.webpush.notify.decide_now`). ``pushed``: the ping is recorded and sent to
+    the phones; ``held``: it waits in the held queue for the existing flush; ``recorded`` (low): stored only. The ping's
+    ref is ``notify:<source>`` (the push's tag and topic) and its link is the notices view, both fixed by Levain; the title
+    carries the token's source label. Returns ``{"id", "decision"}``."""
+    import threading
+
+    from levain.webpush import held, notify
+    from levain.webpush.store import PushStore
+
+    decision, reason = notify.decide_now(queue, adm.priority)
+    ref = notify.notice_ref(adm.source)
+    hold = (notify.NOTICES_URL, reason or "active") if decision == "held" else None
+    # the ping, its held row and the notice are one transaction: a failure stores none of them, and the caller says so
+    ping_id, nid = PushStore(queue).record_notice(adm.kind, ref, adm.display, adm.source, adm.title, adm.body,
+                                                  adm.priority, adm.token, decision, hold=hold)
+    if decision == "pushed":
+        try:
+            threading.Thread(target=_push_notice, args=(queue, ping_id, adm.kind, ref, adm.display, adm.body),
+                             daemon=True, name="levain-notice-push").start()
+        except RuntimeError:  # no thread to be had: the notice is stored, and its push is best effort
+            _log.warning("notify: the push thread for a stored notice did not start")
+    if decision != "recorded":
+        try:      # a mute that ended since the last event lets other held pings through now, as a presence write does
+            held.flush_if_due(queue)
+        except Exception:  # noqa: BLE001 - a failed flush never fails the post
+            pass
+    return {"id": nid, "decision": decision}
+
+
 # The chat routes (K1 part 2, `levain serve --chat`). Served only when the server holds a ChatHost;
 # reserved either way, so a downstream route can never claim them.
 _CHAT_GET_ROUTES = ("/chat.json", "/chat/session.json", "/chat/job.json")
@@ -1215,6 +1275,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
     _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, _COORD_LIST, _COORD_SHEET,
     cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _PAIR_OFFER, _PAIR_REVOKE, _PAIR_LIST, _PAIR_CLAIM,
+    _NOTIFY_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
@@ -2280,6 +2341,16 @@ class _Handler(GuardedHandler):
                                status=200, head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)],
                                cache_control="private, no-store")
                     return
+                if path == _NOTIFY_TOKENS:
+                    from levain.webpush import notify_tokens
+
+                    try:      # a token file that cannot be read whole is said so, never listed as empty or partial
+                        doc, st = {"tokens": notify_tokens.list_public(queue)}, 200
+                    except notify_tokens.NotifyTokenError as exc:
+                        doc, st = {"error": "notify_tokens_unreadable", "message": str(exc)}, 503
+                    self._send(json.dumps(doc).encode("utf-8"), "application/json; charset=utf-8", status=st,
+                               head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+                    return
                 if path == _PRESENCE_PATH:
                     self._send(json.dumps(self._presence_view(queue)).encode("utf-8"), "application/json; charset=utf-8",
                                status=200, head=head,
@@ -2310,6 +2381,8 @@ class _Handler(GuardedHandler):
             return self._presence_post(raw)
         if route in (_PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE):
             return self._presence_token_post(route, raw)
+        if route in (_NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE):
+            return self._notify_token_post(route, raw)
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
             return self._pair_and_subscribe(raw, name)
@@ -2466,6 +2539,118 @@ class _Handler(GuardedHandler):
         except presence.PresenceError as exc:
             return {"error": "presence_refused", "message": str(exc)}, 422
         return {"tokens": presence_tokens.list_public(queue)}, 200
+
+    def _notify_token_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":
+        """``POST /webpush/notify/tokens {name, source?, urgent?, max_priority?, rate_per_min?, rate_per_day?,
+        urgent_per_hour?}`` mints a notify token; ``/revoke {name}`` revokes one. Full credential only (the push gate
+        lets no token through on these routes). The new token is in THIS reply and nowhere else."""
+        from levain.webpush import notify_tokens
+
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {"error": "bad_json", "message": "body is not valid JSON"}, 400
+        new = route == _NOTIFY_TOKENS
+        keys = _NOTIFY_MINT_KEYS if new else {"name"}
+        if not isinstance(req, dict) or "name" not in req or not set(req) <= keys or not isinstance(req["name"], str):
+            return {"error": "bad_request", "message": "send name as text" + (
+                ", and only source, urgent, max_priority, rate_per_min, rate_per_day or urgent_per_hour besides"
+                if new else "")}, 400
+        queue = self.server.signer.queue_dir
+        try:
+            if new:
+                rec, token = notify_tokens.create(queue, req["name"], **{k: v for k, v in req.items() if k != "name"})
+                try:
+                    listing = notify_tokens.list_public(queue)
+                except notify_tokens.NotifyTokenError:
+                    listing = []   # the token is already minted and shown once: a failed supplementary listing must not withhold it
+                return {"token": token, "record": rec, "tokens": listing}, 200
+            if not notify_tokens.revoke(queue, req["name"]):
+                return {"error": "not_found", "message": "no live notify token has that name"}, 404
+            return {"tokens": notify_tokens.list_public(queue)}, 200
+        except notify_tokens.NotifyBusy:
+            return {"error": "notify_busy", "message": "the notify tokens are busy right now; nothing was changed, try again"}, 503
+        except notify_tokens.NotifyTokenError as exc:
+            return {"error": "notify_token_refused", "message": str(exc)}, 422
+
+    def _notify_credential(self) -> "str | None":
+        """The notify token this request carries (``X-Levain-Notify-Token``, else ``Authorization: Bearer``), as sent;
+        ``None`` for no credential of that kind. A header that cannot be a token is returned as ``""``, which no token
+        matches. Read here only, never from a URL or a body, and never written to a response or a log."""
+        raw = self.headers.get(_NOTIFY_TOKEN_HEADER)
+        if raw is None:
+            scheme, _, rest = self.headers.get("Authorization", "").partition(" ")
+            raw = rest.strip() if scheme.lower() == "bearer" else None
+        if raw is None or raw == "":
+            return None
+        return raw if len(raw) <= 128 and _HEADER_SAFE_TOKEN.fullmatch(raw) else ""
+
+    def _notify_post(self) -> None:
+        """``POST /notify {title?, body, priority?}``: a notice from a service, as a doorbell and nothing more. Every
+        refusal that does not need the body is sent before a byte of it is read, and closes the connection so the unread
+        body is never taken for the next request (no route, a missing credential, a token that is not a live one, the
+        content type, the length, a busy server). The token is checked from the header alone, with no lock and before a
+        request slot is held, so a caller without a live token can never sit on a slot waiting for a body; the token
+        again, the sanitiser and the caps are :func:`levain.webpush.notify_tokens.admit`'s, the one place a post is
+        decided."""
+        from levain.webpush import notify_tokens
+        from levain.webpush.notify import NotifyRefused
+
+        signer = self.server.signer
+        if signer is None:
+            return self._reject(404, "not_found", "no such route")
+        supplied = self._notify_credential()
+        if supplied is None:
+            self.close_connection = True
+            return self._send(json.dumps({"error": "unauthorized", "message": "send a notify token as "
+                                          f"{_NOTIFY_TOKEN_HEADER} or Authorization: Bearer"}).encode("utf-8"),
+                              "application/json; charset=utf-8", status=401, headers=[("WWW-Authenticate", "Bearer")])
+        if notify_tokens.verify(signer.queue_dir, supplied) is None:
+            return self._reject(403, *notify_tokens.FORBIDDEN)
+        if self._refuse_non_json():
+            return
+        clen = self._declared_length()
+        if clen is None or self._refuse_oversize(clen, _NOTIFY_MAX_REQUEST, 0):    # never drained: it is not read
+            return
+        if not self.server.request_gate.acquire(blocking=False):
+            return self._reject(503, "notify_busy", "server busy")
+        try:
+            try:
+                raw = self.rfile.read(clen)
+            except OSError:        # a stalled client hit the socket timeout
+                self.close_connection = True
+                return
+            try:
+                req = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return self._send_json({"error": "bad_json", "message": "body is not valid JSON"}, 400)
+            if not isinstance(req, dict) or not set(req) <= _NOTIFY_KEYS or "body" not in req:
+                return self._send_json({"error": "bad_request", "message": "send body, and only title and priority "
+                                        "besides: a notice is text, nothing else"}, 400)
+            queue = signer.queue_dir
+            try:
+                adm = notify_tokens.admit(queue, supplied, req.get("title", _NOTIFY_DEFAULT_TITLE), req["body"],
+                                          req.get("priority"))
+            except NotifyRefused as exc:
+                headers = [("Retry-After", str(int(exc.retry_after) + 1))] if exc.status == 429 else None
+                return self._send(json.dumps({"error": exc.error, "message": str(exc)}).encode("utf-8"),
+                                  "application/json; charset=utf-8", status=exc.status, headers=headers)
+            except notify_tokens.NotifyBusy:
+                return self._send_json({"error": "notify_busy", "message": "busy; try again"}, 503)
+            except notify_tokens.NotifyTokenError as exc:
+                # the token file could not be read or written whole: the detail (a path, an errno) is the log's, never
+                # the poster's
+                _log.warning("notify: a post was not admitted: %s", exc)
+                return self._send_json({"error": "notify_unavailable", "message": "notices cannot be taken right now; "
+                                        "nothing was stored, try again later"}, 503)
+            try:
+                out = _deliver_notice(queue, adm)
+            except Exception as exc:  # noqa: BLE001 - never leak a traceback to the client
+                _log.warning("notify: an admitted notice was not stored: %s: %s", type(exc).__name__, exc)
+                return self._send_json({"error": "not_stored", "message": "the notice was not stored; try again"}, 503)
+            self._send_json({"ok": True, **out}, 200)
+        finally:
+            self.server.request_gate.release()
 
     def _push_test(self, name: str) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/test``: a test ping to the CALLER's own subscriptions and no other device's, sent inside the
@@ -3647,6 +3832,10 @@ class _Handler(GuardedHandler):
             return self._pair_claim()
         if route == _PUSH_RECEIPT and self.server.signer is not None:
             return self._receipt_post()
+        # NOTIFY: a notify token is the credential of this route alone, so the route is carved out BEFORE the surface
+        # token gates (which a service holding a notify token cannot pass, and must not)
+        if route == _NOTIFY_PATH:
+            return self._notify_post()
         if route in _PAIR_AUTHED_POST:
             if not self._off_box_token_valid():
                 return self._token_403("credential_required")
