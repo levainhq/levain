@@ -60,8 +60,8 @@ class TestHero:
     def test_reading_and_ambient_register_and_lead_the_hero(self):
         ck = _ck()
         ck.register(_spec("sky", "ambient", "hero", rank=0))
-        ck.register(_spec("weather", "reading", "hero", rank=5))
-        assert _regions(ck)["hero"] == ["weather", "sky"]      # the reading first, whatever the rank
+        ck.register(_spec("reading-a", "reading", "hero", rank=5))
+        assert _regions(ck)["hero"] == ["reading-a", "sky"]      # the reading first, whatever the rank
 
     def test_a_second_reading_is_refused(self):
         ck = _ck()
@@ -175,16 +175,16 @@ class TestZoneLayout:
 class TestLegacyHeader:
     def test_reading_line_and_list_map(self):
         ck = _ck()
-        ck.register(_spec("weather", "reading", "header", rank=1))
+        ck.register(_spec("reading-a", "reading", "header", rank=1))
         ck.register(_spec("sky", "ambient", "header", rank=2))
         ck.register(_spec("state", "line", "header", rank=0))
         ck.register(_spec("odd", "list", "header"))
         specs = ck._specs
-        assert [(specs[i].region, specs[i].legacy_region) for i in ("weather", "sky", "state", "odd")] == [
+        assert [(specs[i].region, specs[i].legacy_region) for i in ("reading-a", "sky", "state", "odd")] == [
             ("hero", "header"), ("hero", "header"), ("brief", "header"), ("operate", "header")]
         r = _regions(ck)
-        assert r["hero"] == ["weather", "sky"] and r["brief"] == ["state"]
-        assert r["header"] == ["weather", "sky", "state"]       # hero then brief, derived
+        assert r["hero"] == ["reading-a", "sky"] and r["brief"] == ["state"]
+        assert r["header"] == ["reading-a", "sky", "state"]       # hero then brief, derived
         assert "odd" in r["zones"][0]["panels"]
 
     def test_a_second_legacy_reading_goes_to_operate(self):

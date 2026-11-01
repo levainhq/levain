@@ -1134,9 +1134,9 @@ body.ke { --gutter: var(--gutter-ke); }
 body.ke .deck { max-width: var(--page-max); margin: 0 auto; }
 
 /* THE NOW BAND, then the sky as a card under it (F1). The band is one row: the clock and date, the state line verbatim with its
-   age, and at the right the last-wrap line (and the weather, when a provider supplies it). The masthead above it (brand, the four
+   age, and at the right the last-wrap line. The masthead above it (brand, the four
    tabs, the status cluster, the theme switch) is the page's bar and never moves into the hero. A bare install has no sky and no
-   weather: the band is still whole, and the sky card is simply not drawn. */
+   downstream panel: the band is still whole, and the sky card is simply not drawn. *
 body.ke .hero > .ck-region-err { padding: var(--sp-5) var(--gutter); }
 body.ke .hero { display: block; }
 body.ke .band { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: var(--sp-7); padding-block: var(--gap) var(--sp-5); }
@@ -1153,37 +1153,7 @@ body.ke .band-meta b { color: var(--label); font-weight: var(--fw-semibold); }
 body.ke .band-meta .events { font-size: var(--fs-meta); line-height: 1.6; color: var(--meta); margin: 0; }
 body.ke .band-meta .events:empty { display: none; }
 body.ke .band-meta .events .bad { color: var(--accent); }
-/* N5 the hero weather: one small instrument under the wrap line. Left, the sky: glyph, the temperature, the condition under it and
-   the feels / high / low column; right of a hairline, the banded readings (air, pollen) as a table: name, a tabular figure, the band in
-   words, each source line under its row; along the foot, how old the read is and the re-read key. Lit like the page's other keys
-   (the top edge catches the light). With no banded reading the right half is simply not there; the instrument closes around the sky. */
-body.ke .band-meta .wx { margin-top: var(--sp-4); padding: var(--sp-4) var(--sp-5) var(--sp-3); display: grid; grid-template-columns: auto auto; grid-template-areas: "main air" "foot foot";
-  column-gap: var(--sp-6); row-gap: var(--sp-3); align-items: center; min-width: 0; text-align: left; color: var(--label);
-  background: linear-gradient(to bottom, color-mix(in oklch, var(--card), var(--contrast) 2%), var(--card)); border: 1px solid var(--hair); border-radius: var(--r-lg); box-shadow: var(--edge-hi); }
-body.ke .band-meta .wx .xbody { display: contents; }
-body.ke .band-meta:has(.wx-air) { max-width: 600px; }   /* room for the readings table beside the sky, so a pill never meets the edge */
-body.ke .band-meta .wx:not(:has(.wx-air)) { grid-template-columns: auto; grid-template-areas: "main" "foot"; }
-body.ke .band-meta .wx .wx-main { grid-area: main; gap: var(--sp-4); }
-body.ke .band-meta .wx .wx-air { grid-area: air; align-self: stretch; padding-left: var(--sp-6); border-left: 1px solid var(--hair); }
-body.ke .band-meta .wx .wx-age { grid-area: foot; justify-self: start; align-self: end; margin: 0; padding-top: var(--sp-3); }
-/* the foot's hairline is the instrument's own line across its full width; the read age sits under it at the left, the re-read key at the right */
-body.ke .band-meta .wx::before { content: ""; grid-area: foot; align-self: start; height: 1px; background: var(--hair); }
-/* the last wrap sits in the card's foot, between the read age and the re-read key, as one quiet line */
-body.ke .band-meta .wx .wx-wrap { grid-area: foot; justify-self: center; align-self: end; display: flex; gap: var(--sp-3); padding-top: var(--sp-3); font-size: var(--fs-micro); color: var(--meta); white-space: nowrap; }
-body.ke .band-meta .wx .wx-wrap > div + div::before { content: "\00b7"; margin-right: var(--sp-3); }
-body.ke .band-meta .wx-refresh { grid-area: foot; justify-self: end; align-self: end; margin: var(--sp-3) 0 0; padding: 0; width: var(--ctl-row); height: var(--ctl-row);
-  display: grid; place-items: center; border-radius: var(--r-sm); background: var(--key-bg); border: 0; box-shadow: var(--edge-hi), var(--lift); font-size: var(--fs-meta); }
-body.ke .band-meta .wx-refresh:hover { color: var(--text); }
-body.ke .band-meta .wx-refresh:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
-body.ke .band-meta .wx .wx-side { margin-left: var(--sp-2); text-align: left; }
-/* narrow: the readings stack under the sky, divided by a hairline across instead of down */
-@media (max-width: 560px) {
-  body.ke .band-meta .wx { grid-template-columns: minmax(0, 1fr); grid-template-areas: "main" "air" "foot"; width: 100%; box-sizing: border-box; }
-  body.ke .band-meta .wx .wx-air { padding: var(--sp-3) 0 0; border-left: 0; border-top: 1px solid var(--hair); }
-}
-body.ke .band-meta .wx .wx-t .rd-n, body.ke .band-meta .wx b { color: var(--text); }
 .wx-main { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: nowrap; }
-.wx-icon { flex: none; }
 .wx-t { display: flex; align-items: baseline; gap: var(--sp-2); }
 .wx-t .rd-n { font: var(--fw-bold) var(--fs-figure)/1 var(--round); letter-spacing: var(--track-tight); }
 .wx-t .rd-u { font: var(--fw-semibold) var(--fs-body) var(--round); color: var(--label); }
@@ -1192,29 +1162,7 @@ body.ke .band-meta .wx .wx-t .rd-n, body.ke .band-meta .wx b { color: var(--text
 .wx-side b { color: var(--text); font-weight: var(--fw-semibold); }
 .wx-side > * { overflow: hidden; text-overflow: ellipsis; }
 .wx-side .rd-sub, .wx-side .rd-b { display: block; margin: 0; padding: 0; border: 0; font-size: var(--fs-meta); color: var(--label); }
-/* the banded readings' table: glyph | name | figure (right-aligned, tabular) | band pill; a source line spans name..pill under its row */
-.wx-air { display: grid; grid-template-columns: auto auto auto 1fr; column-gap: var(--sp-3); row-gap: var(--sp-1); align-content: center; align-items: center; justify-content: start; }
-.wx-air > .aqi { display: contents; }
-.wx-air > .aqi > svg { grid-column: 1; }
-.wx-air .aqi-l { grid-column: 2; font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
-.wx-air .aqi-v { grid-column: 3; justify-self: end; min-width: 2ch; text-align: right; font: var(--fw-bold) var(--fs-lead)/1 var(--round); color: var(--text); font-variant-numeric: tabular-nums lining-nums; }
-.wx-air .aqi .pill { grid-column: 4; justify-self: start; }
-.wx-air > .aqi-d { grid-column: 2 / -1; margin: 0 0 var(--sp-2); max-width: none; white-space: normal; }   /* the source line reads whole: it wraps inside the readings column, never cut */
-.wx-air > .aqi-d:last-child { margin-bottom: 0; }
-.aqi { display: flex; align-items: center; gap: var(--sp-3); font-size: var(--fs-body); flex-wrap: wrap; }
-.aqi b { font-weight: var(--fw-semibold); }
-.aqi .pill { margin-left: 0; }
 .wx-src { font-size: var(--fs-micro); color: var(--meta); margin-top: calc(var(--sp-2) * -1); }
-.wx-refresh { align-self: flex-start; background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md);
-  color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); padding: var(--sp-3) var(--sp-4); cursor: pointer; }
-.wx-refresh:hover { color: var(--text); border-color: var(--hair-2); }
-.wx-refresh[aria-busy="true"] { opacity: .5; cursor: progress; }
-/* the EPA bands: good is calm, every named band above it is hot, an unknown token stays neutral */
-.band-good { color: var(--ok); } .band-moderate { color: var(--aqi-moderate); } .band-unhealthy-sensitive { color: var(--aqi-sensitive); }
-.band-unhealthy { color: var(--aqi-unhealthy); } .band-very-unhealthy { color: var(--aqi-very); } .band-hazardous { color: var(--aqi-hazard); }
-.aqi > b { color: var(--text); }
-.aqi .pill { background: color-mix(in srgb, currentColor 15%, transparent); color: inherit; }
-.aqi.band-other .pill { background: var(--card-2); color: var(--label); }
 
 /* THE BAR (F6): brand, the four tabs, the status cluster, Sync / Jump, the theme switch. ONE control row at --ctl-md. */
 body.ke .masthead { padding-block: 0; min-height: 60px; gap: var(--sp-6); flex-wrap: nowrap; align-items: center; }
@@ -2588,15 +2536,6 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
   body.ke .masthead .name-editor { order: 4; flex: 1 1 100%; }
   body.ke .masthead .name-input { flex: 1 1 12ch; min-width: 0; max-width: none; }
 }
-/* The hero weather card's foot holds three things in one grid area (read age, last wrap, re-read key). Where the band stacks they
-   cannot share one line: the last wrap takes a line of its own under the age and the key. */
-@media (max-width: 1180px) {
-  body.ke .band-meta .wx { grid-template-areas: "main air" "foot foot" "wrap wrap"; }
-  body.ke .band-meta .wx:not(:has(.wx-air)) { grid-template-areas: "main" "foot" "wrap"; }
-  body.ke .band-meta .wx .wx-wrap { grid-area: wrap; justify-self: start; padding-top: 0; }
-}
-/* the phone keeps its one column (the 560px rule's stack), with the wrap line under the foot (L3 r1: the rule above re-made two columns there) */
-@media (max-width: 560px) { body.ke .band-meta .wx { grid-template-areas: "main" "air" "foot" "wrap"; } }   /* a card with no air reading: the rule above's own line, already one column */
 /* A tile's lines never run past its edge: a status row keeps its label and cuts its reading with an ellipsis (the row's title holds
    the whole of it), and a big figure's label drops under it when they do not fit side by side. Tiles only, and not the phone's
    half-width tile (its own rule above wraps the reading instead). */
