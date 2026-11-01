@@ -1675,6 +1675,7 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
         return 2
     _emit(out, args.json, {"journal_id": f"{rec['id']}@{ver}", "record": rec},
           f"{verb}: {rec['id']} {rec['from_category'] or '-'} -> {rec['to_category']}; journal {rec['id']}@{ver}")
+    return 0
 
 
 _SLOTS_FILE_MAX = 64 * 1024
