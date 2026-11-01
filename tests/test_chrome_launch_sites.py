@@ -69,3 +69,13 @@ def test_the_shared_session_chrome_launch_site_is_scanned_and_spreads_the_flags(
     assert "*CHROME_SAFE_FLAGS" in text
     assert offending_sites({name: text}) == []
     assert offending_sites({name: text.replace("CHROME_SAFE_FLAGS", "X")}) == [name]
+
+
+def test_the_drivers_prefer_the_headless_shell_that_the_flags_file_names():
+    """Full Chrome mints a keychain key per fresh profile; the three drivers that launch from the flags file must all read
+    its ``headless_shell_root`` (a driver that forgot would quietly go back to full Chrome)."""
+    cfg = json.loads(FLAGS_FILE.read_text(encoding="utf-8"))
+    assert cfg["headless_shell_root"].startswith("~/")
+    files = _tracked_sources()
+    for name in ("tests/_shared_chrome.py", "tests/_page_drive.mjs", "tests/sky_replay/run_cdp.mjs"):
+        assert "headless_shell_root" in files[name], name

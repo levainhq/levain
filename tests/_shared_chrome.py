@@ -14,7 +14,9 @@ Chrome's group and removes the profile once the pytest pid is gone.
 from __future__ import annotations
 
 import atexit
+import json
 import os
+import pwd
 import shutil
 import signal
 import subprocess
@@ -23,10 +25,31 @@ import tempfile
 import time
 from pathlib import Path
 
-from tests._chrome_flags import CHROME_SAFE_FLAGS
+from tests._chrome_flags import CHROME_FLAGS_FILE, CHROME_SAFE_FLAGS
 from tests._page_drive_run import _sweep
 
-CHROME = os.environ.get("CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+
+def _pick_chrome(given: str) -> str:
+    """chrome-headless-shell when installed under the flags file's ``headless_shell_root``: full Chrome mints a Secure
+    Enclave key in the operator's keychain on every fresh profile and no flag stops it; the shell never does.
+    ``LEVAIN_FULL_CHROME=1`` keeps the given Chrome."""
+    if os.environ.get("LEVAIN_FULL_CHROME") == "1":
+        return given
+    try:
+        raw = json.loads(CHROME_FLAGS_FILE.read_text(encoding="utf-8")).get("headless_shell_root", "")
+        # the account's real home, not $HOME: the tests point $HOME at a scratch dir
+        root = Path(pwd.getpwuid(os.getuid()).pw_dir) / raw.removeprefix("~/")
+        for ver in sorted(root.iterdir(), reverse=True) if raw else []:
+            for arch in sorted(ver.iterdir()):
+                if (arch / "chrome-headless-shell").is_file():
+                    return str(arch / "chrome-headless-shell")
+    except (OSError, ValueError):
+        pass
+    return given
+
+
+CHROME = _pick_chrome(os.environ.get("CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 PING = Path(__file__).with_name("_cdp_ping.mjs")
 WATCH = Path(__file__).with_name("_shared_chrome_watch.py")
 PING_CDP_MS = 2000       # the Browser.getVersion exchange itself, timed inside the ping from after node has started

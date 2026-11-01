@@ -1,1 +1,1 @@
-{"flags": ["--headless=new", "--use-mock-keychain", "--password-store=basic"]}
+{"flags": ["--headless=new", "--use-mock-keychain", "--password-store=basic"], "headless_shell_root": "~/.cache/levain-test-chrome/chrome-headless-shell"}

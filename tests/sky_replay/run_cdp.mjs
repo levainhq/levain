@@ -1,16 +1,31 @@
 // Drives driver.html in headless Chrome over CDP: real frames, real time. Prints the page's RESULT line,
 // and saves screenshots when asked.   node run_cdp.mjs <chrome> <outdir|-> 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir, userInfo } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const [chrome, outdir = '-'] = process.argv.slice(2);
 const here = dirname(fileURLToPath(import.meta.url));
 const profile = mkdtempSync(join(tmpdir(), 'sky-cdp-'));
-const chromeFlags = JSON.parse(readFileSync(join(here, '..', 'chrome_flags.json'), 'utf8')).flags;
-const proc = spawn(chrome, [...chromeFlags, '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
+const chromeCfg = JSON.parse(readFileSync(join(here, '..', 'chrome_flags.json'), 'utf8'));
+const chromeFlags = chromeCfg.flags;
+// chrome-headless-shell (Chrome for Testing's headless binary) when installed under chrome_flags.json's headless_shell_root: full
+// Chrome mints a Secure Enclave key in the operator's keychain on every fresh profile (no flag stops it), the shell never does.
+// LEVAIN_FULL_CHROME=1 keeps the given Chrome.
+const pickChrome = (given, cfg) => {
+  if (process.env.LEVAIN_FULL_CHROME === '1' || !cfg.headless_shell_root) return given;
+  try {
+    const root = cfg.headless_shell_root.replace(/^~/, userInfo().homedir);
+    for (const v of readdirSync(root).sort().reverse()) for (const a of readdirSync(join(root, v))) {
+      const bin = join(root, v, a, 'chrome-headless-shell');
+      if (existsSync(bin)) return bin;
+    }
+  } catch {}
+  return given;
+};
+const proc = spawn(pickChrome(chrome, chromeCfg), [...chromeFlags, '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
   '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--window-size=1180,700', 'about:blank'], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Chrome must not outlive this process on any exit node can see (a signal, a thrown error, the parent dying);

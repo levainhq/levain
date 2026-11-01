@@ -45,8 +45,8 @@
 // LEVAIN_DRIVE_LAUNCH_LOG: a file that gets one "spawn" line per Chrome this driver launches (a count for a measurement).
 // A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...], "dialogs": ["<type>: <message>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
@@ -63,10 +63,28 @@ const parseScale = (raw) => {
 const WAIT_SCALE = parseScale(process.env.LEVAIN_TEST_WAIT_SCALE ?? "");
 const scaled = (ms) => Math.round(ms * WAIT_SCALE);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const chromeFlags = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "chrome_flags.json"), "utf8")).flags;
+const chromeCfg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "chrome_flags.json"), "utf8"));
+const chromeFlags = chromeCfg.flags;
+// chrome-headless-shell (Chrome for Testing's headless binary) when installed under chrome_flags.json's headless_shell_root: full
+// Chrome mints a Secure Enclave key in the operator's keychain on every fresh profile (no flag stops it), the shell never does.
+// LEVAIN_FULL_CHROME=1 keeps the given Chrome.
+const pickChrome = (given, cfg) => {
+  if (process.env.LEVAIN_FULL_CHROME === "1" || !cfg.headless_shell_root) return given;
+  try {
+    const root = cfg.headless_shell_root.replace(/^~/, userInfo().homedir);
+    for (const v of readdirSync(root).sort().reverse()) for (const a of readdirSync(join(root, v))) {
+      const bin = join(root, v, a, "chrome-headless-shell");
+      if (existsSync(bin)) return bin;
+    }
+  } catch {}
+  return given;
+};
 // LEVAIN_DRIVE_CHROME_FLAGS: a JSON array of extra Chrome flags (a test that must reach the server under a proxied name)
 const extraFlags = process.env.LEVAIN_DRIVE_CHROME_FLAGS ? JSON.parse(process.env.LEVAIN_DRIVE_CHROME_FLAGS) : [];
-let sharedPort = /^[0-9]+$/.test(process.env.LEVAIN_DRIVE_CDP_PORT ?? "") && extraFlags.length === 0 ? Number(process.env.LEVAIN_DRIVE_CDP_PORT) : null;
+// chrome-headless-shell has no service worker API: a drive whose steps touch it needs the full Chrome given in argv (and its own
+// process, not the session's shell), and pays the one keychain key that costs
+const needsFullChrome = JSON.stringify(steps).includes("serviceWorker");
+let sharedPort = /^[0-9]+$/.test(process.env.LEVAIN_DRIVE_CDP_PORT ?? "") && extraFlags.length === 0 && !needsFullChrome ? Number(process.env.LEVAIN_DRIVE_CDP_PORT) : null;
 // a Chrome of our own: this process owns it, its port and its profile (also the way out when the shared Chrome fails to set up)
 let prof = null; let port = null;
 let chrome = { exitCode: 0, signalCode: null, kill() {}, once() {} };   // nothing of ours to kill while the Chrome belongs to the session
@@ -74,7 +92,7 @@ const startSpawn = async () => {
   port = await new Promise((r) => { const s = createServer(); s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
   prof = mkdtempSync(join(tmpdir(), "levain-page-drive-"));
   if (process.env.LEVAIN_DRIVE_LAUNCH_LOG) { try { appendFileSync(process.env.LEVAIN_DRIVE_LAUNCH_LOG, "spawn\n"); } catch {} }
-  chrome = spawn(chromePath, [...chromeFlags, ...extraFlags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
+  chrome = spawn(needsFullChrome ? chromePath : pickChrome(chromePath, chromeCfg), [...chromeFlags, ...extraFlags, `--remote-debugging-port=${port}`, `--user-data-dir=${prof}`,
     "--no-first-run", "--window-size=1440,1000", "about:blank"], { stdio: "ignore" });
 };
 if (!sharedPort) await startSpawn();
