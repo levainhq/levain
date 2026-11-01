@@ -984,13 +984,14 @@ def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: f
 
 
 def summary(store: Any, *, writable: bool = True, deadline: float | None = None) -> dict[str, Any]:
-    """The summary read (``GET /cockpit/needs.json``): counts, headlines, kinds, stable keys and ``queue``. It records
+    """The summary read (``GET /cockpit/needs.json``): counts, headlines, kinds, stable keys, ``queue`` and ``seen_through`` (the
+    band's high-water mark, so a page can tell another surface moved it). It records
     no view and carries nothing to bind an answer to. Its only levain write is numbering the items that had no number."""
     snap = _snapshot(store, writable=writable, deadline=deadline)
     items = [{"key": key, "n": it["n"], "kind": it["kind"], "headline": _short(it["what"], _HEADLINE), "tag": it["tag"]}
              for key, it in snap.entries]
-    return {"schema": 1, "store_id": snap.store_id, "count": len(items), "queue": snap.queue, "items": items,
-            "note": snap.note, "read_only": snap.read_only}
+    return {"schema": 1, "store_id": snap.store_id, "seen_through": snap.hwm, "count": len(items), "queue": snap.queue,
+            "items": items, "note": snap.note, "read_only": snap.read_only}
 
 
 def subject_for(store: Any, kind: str, ref: str) -> dict[str, Any] | None:

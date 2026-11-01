@@ -93,8 +93,10 @@ def test_a_summary_call_leaves_the_viewers_band_views_unchanged(tmp_path, lh):
         assert [i["kind"] for i in got["items"]] == ["information", "information"]
         assert got["items"][1]["headline"] == "Ship the sweep fix tonight?"
         # nothing in it can answer: no view, no version, no actions, no options
-        assert not _walk_keys(got) & {"view_id", "version", "actions", "options", "subject", "seen_through"}
-        assert got["queue"] == _get(f"{base}/cockpit/band.json", TOKEN)["queue"]
+        assert not _walk_keys(got) & {"view_id", "version", "actions", "options", "subject"}
+        band_json = _get(f"{base}/cockpit/band.json", TOKEN)
+        assert got["queue"] == band_json["queue"]
+        assert got["seen_through"] == band_json["seen_through"]      # the mark a page compares; it binds nothing
         assert _views(store, VIEWER)[0] == 2                      # the band.json read after it did record: the probe can move
 
 
@@ -167,6 +169,27 @@ def test_the_summary_rides_the_bands_gate_and_says_when_there_is_no_store(tmp_pa
         with pytest.raises(urllib.error.HTTPError) as e:
             _get(f"{base}/cockpit/needs.json", TOKEN)
         assert e.value.code == 404 and json.loads(e.value.read())["message"] == "no question store"
+
+
+def test_an_embedder_cannot_serve_the_summary_path(tmp_path, lh):
+    _root, src, _ids = _install(tmp_path)
+    with pytest.raises(ValueError):
+        web_server.make_server(src, port=0, extra_json={"/cockpit/needs.json": lambda: b"{}"})
+    assert web_server._NEEDS_PATH in web_server._RESERVED_PATHS
+
+
+def test_the_summarys_mark_moves_when_the_bands_does_and_the_page_compares_it(tmp_path, lh):
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    _file(store, "Which retry policy?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        first = _get(f"{base}/cockpit/needs.json", TOKEN)
+        _file(store, "Ship the sweep fix tonight?")
+        second = _get(f"{base}/cockpit/needs.json", TOKEN)
+    assert isinstance(first["seen_through"], int) and second["seen_through"] > first["seen_through"]
+    boot = (Path(web_server.__file__).parent / "templates" / "web" / "dashboard_boot.js").read_text()
+    assert "sum.seen_through !== shown.seen_through" in boot       # a moved mark makes the page re-read band.json
+    assert "bandSummary," not in boot                              # the dead render opt is gone
 
 
 # --- the page: band.json recorded only when the queue changed ----------------------------------------------------------

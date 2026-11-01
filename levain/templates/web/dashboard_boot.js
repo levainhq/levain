@@ -760,7 +760,8 @@
   function bandSame(sum, shown) {
     if (!sum || typeof sum !== "object" || !shown || typeof shown !== "object") return false;
     if (sum.note || shown.note || shown.view_id === null || shown.view_id === undefined) return false;
-    if (typeof sum.queue !== "string" || sum.queue !== shown.queue || sum.store_id !== shown.store_id) return false;
+    if (typeof sum.queue !== "string" || sum.queue !== shown.queue || sum.store_id !== shown.store_id
+        || sum.seen_through !== shown.seen_through) return false;
     const si = Array.isArray(sum.items) ? sum.items : null;
     const bi = Array.isArray(shown.items) ? shown.items : null;
     if (!si || !bi || si.length !== bi.length || si.some((it) => !it || !Number.isInteger(it.n))) return false;
@@ -922,7 +923,7 @@
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
         window.LevainDashboard.render(mview, mview.writable
-          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, bandSummary, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
+          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;
