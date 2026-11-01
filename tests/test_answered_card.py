@@ -358,6 +358,5 @@ def test_the_receipt_assertions_fail_on_the_full_body(tmp_path: Path, monkeypatc
     marker = "drawQuestionBody(q, slot, b, card, settled);"
     assert marker in CORE
     seen = _receipt_run(tmp_path, monkeypatch, core=CORE.replace(marker, "drawQuestionBody(q, slot, b, card);"))
-    print(seen)
     with pytest.raises(AssertionError):
         _assert_receipt(seen)
