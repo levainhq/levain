@@ -226,6 +226,27 @@ BLOCK_READS = ("(() => { const f = window.fetch; window.fetch = (u, ...r) => (/\
 
 
 @needs_browser
+def test_a_tapped_answer_frees_the_option_buttons_without_waiting_on_a_redraw_that_failed(tmp_path: Path, lh) -> None:
+    # kept from the deleted typed-box test (L3 r1): the controls come back even when the page's own re-reads fail afterwards
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q1 = _file(store, "Which retry policy?")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        out = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
+            DESKTOP,
+            {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
+            {"eval": HISTORY},
+            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": BLOCK_READS},
+            {"eval": TAP % "1a"},
+            {"eval": "new Promise(r => setTimeout(r, 2500)).then(() => 1)"},
+            {"eval": "[...document.querySelectorAll('[data-band-row] .band-option')].every((b) => !b.disabled)"},
+        ])
+    assert out["values"][-1] is True, out["values"]
+    assert _answer(store, q1.n).value == "fix"
+
+
+@needs_browser
 def test_a_cockpit_store_fault_shows_a_fixed_line_never_the_raw_error(tmp_path: Path, lh, monkeypatch) -> None:
     _root, src, _ids = _install(tmp_path)
     store = QuestionStore(lh)

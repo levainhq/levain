@@ -4732,7 +4732,7 @@
       }
       if (res && res.error === "stale_band") {
         // another view of the band was shown since this one: nothing was recorded; the list is read again and drawn fresh
-        bandFill(slot, "the band changed since it was shown to you, so nothing was recorded. It is redrawn below: check the numbers and send again.", true);
+        bandFill(slot, "the band changed since it was shown to you, so nothing was recorded. It is redrawn below: check the numbers and tap again.", true);
         return;
       }
       msg.textContent = (res && (res.detail || res.message || res.error)) || "failed";
