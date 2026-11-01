@@ -295,7 +295,7 @@ def fence(conn: sqlite3.Connection, now: str, token: object) -> Lease:
     held = lease(conn, now)
     if held is None or held.token != token:
         current = "no coordinator holds the lease" if held is None else f"the lease token is {held.token}"
-        raise _refused(f"lease token {token} is not the live lease's ({current}); nothing was written")
+        raise _refused(f"lease token {token} is not the live lease's ({current}); no state was written")
     if not held.live:
         raise _refused(f"lease token {token} is past its until ({held.until}); the holder claims again")
     if held.holder != "operator":
@@ -326,7 +326,7 @@ def claim(conn: sqlite3.Connection, now: str, launch_id: str, session_key: str) 
                by="service")
         held = None
     if held is not None:
-        raise _refused(f"the lease is held by {held.holder} until {held.until}; nothing was written")
+        raise _refused(f"the lease is held by {held.holder} until {held.until}; no state was written")
     return _event(conn, now, "claim", session_key, token=None, until=_plus(now, LEASE_TTL), cause="claim",
                   by="coordinator")
 
