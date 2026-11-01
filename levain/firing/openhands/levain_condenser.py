@@ -109,6 +109,7 @@ class LevainCondenser(VagusCondenser):
         presence_kind: str = "stub",
         *,
         entity_dir: str | None = None,
+        identity: dict[str, str] | None = None,
     ) -> "LevainCondenser":
         """Construct with both serializable kinds, then apply any live handles (test doubles /
         in-process handles). A live handle does NOT survive fork — production passes a non-stub
@@ -118,7 +119,8 @@ class LevainCondenser(VagusCondenser):
         ``presence``/``presence_kind`` are trailing optionals a subclass may add. ``entity_dir`` is the
         inherited per-conversation entity (spore-438); it feeds the presence rebuild too."""
         obj = cls(
-            inner=inner, firing_kind=firing_kind, presence_kind=presence_kind, entity_dir=entity_dir
+            inner=inner, firing_kind=firing_kind, presence_kind=presence_kind, entity_dir=entity_dir,
+            identity=identity,
         )
         if firing is not None:
             _warn_live_override_wont_survive_fork(firing, firing_kind, StubFiring, "firing")

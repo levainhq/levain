@@ -74,6 +74,9 @@ class VagusCondenser(CondenserBase):
     # (it rides fork/reload with the kind) so an isolated firing is rebuilt against its own store.
     # There is no process-level entity to look up instead. ``None`` = rebuild from the kind alone.
     entity_dir: str | None = None
+    # The per-agent episode stamp, serialized beside the kind for the same reason: a fork or reload rebuilds the
+    # firing from the dump, and a firing rebuilt without it would capture unstamped. ``None`` = no stamp.
+    identity: dict[str, str] | None = None
     _firing: FiringContract | None = PrivateAttr(default=None)
     # A monotonic per-inject turn counter — the directive-rotation index. NOT View-derived:
     # `len(view.events)` is non-monotonic (the View shrinks on compaction) AND collides under a
@@ -89,7 +92,7 @@ class VagusCondenser(CondenserBase):
     @model_validator(mode="after")
     def _ensure_firing(self) -> "VagusCondenser":
         if self._firing is None:
-            self._firing = build_firing(self.firing_kind, entity_dir=self.entity_dir)
+            self._firing = build_firing(self.firing_kind, entity_dir=self.entity_dir, identity=self.identity)
         return self
 
     @classmethod
@@ -100,8 +103,9 @@ class VagusCondenser(CondenserBase):
         firing_kind: str = "stub",
         *,
         entity_dir: str | None = None,
+        identity: dict[str, str] | None = None,
     ) -> "VagusCondenser":
-        obj = cls(inner=inner, firing_kind=firing_kind, entity_dir=entity_dir)
+        obj = cls(inner=inner, firing_kind=firing_kind, entity_dir=entity_dir, identity=identity)
         if firing is not None:
             # A live override (test double / in-process handle). It does NOT survive fork()/
             # reload — the child rebuilds from firing_kind. A real (non-stub) firing passed with
@@ -156,7 +160,7 @@ class VagusCondenser(CondenserBase):
         # Self-heal even on unsafe construction paths (model_construct bypasses the
         # validator) — a structural guard, not an -O-strippable assert.
         if self._firing is None:
-            self._firing = build_firing(self.firing_kind, entity_dir=self.entity_dir)
+            self._firing = build_firing(self.firing_kind, entity_dir=self.entity_dir, identity=self.identity)
         # Feed the firing the agent's own recent context (the recall query) + the monotonic
         # turn index (for race-free directive rotation that a fixed-window inner can't freeze).
         # A stub firing ignores both; a real-recall firing recalls against the query.
