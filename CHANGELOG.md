@@ -6,6 +6,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+- **The Decisions panel has no standing answer box.** The "answer by number and letter" box (with its send button) at the top of the NEEDS YOU band is gone from the cockpit's Decisions panel. A decision is answered on its own card: an option button on its band row, or that card's own write-in; with nothing waiting the panel shows history and no input. Freeform words to the desk go through the Drop.
+
 ## [0.11.27] — 2026-10-31
 
 ### Added

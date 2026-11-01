@@ -70,7 +70,7 @@ def _views(store: QuestionStore, viewer: str) -> list:
 # --- the cockpit's Decisions panel --------------------------------------------------------------------------------------
 
 @needs_browser
-def test_the_decisions_panel_shows_the_band_by_number_and_the_shorthand_box_answers_it(tmp_path: Path, lh) -> None:
+def test_the_decisions_panel_shows_the_band_by_number_and_a_tap_on_an_option_answers_it(tmp_path: Path, lh) -> None:
     shots = _shot_dir(tmp_path)
     _root, src, _ids = _install(tmp_path)
     store = QuestionStore(lh)
@@ -85,7 +85,7 @@ def test_the_decisions_panel_shows_the_band_by_number_and_the_shorthand_box_answ
             {"shot": str(shots / "cockpit_decisions_band.png"), "full": True},
             {"eval": "[...document.querySelectorAll('[data-band-row]')].map(r => [r.dataset.bandRow, r.querySelector('.band-num').textContent])"},
             {"eval": "[...document.querySelectorAll('[data-question-row]')].map(r => [r.querySelector('.band-num').textContent, r.querySelector('.consent-tool').textContent])"},
-            {"eval": "(() => { const b = document.querySelector('.band-box'); b.value = '2a'; b.dispatchEvent(new Event('input')); document.querySelector('.band-send').click(); return 1; })()"},
+            {"eval": TAP % "2a"},
             {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
             {"eval": "document.querySelector('[data-band-row]').dataset.bandRow"},
         ])
@@ -97,6 +97,42 @@ def test_the_decisions_panel_shows_the_band_by_number_and_the_shorthand_box_answ
     assert (a.kind, a.value, a.channel) == ("option", "fix", "cockpit")
     assert _answer(store, q1.n) is None
     assert len(_views(store, "cockpit:browser")) >= 1                 # the Decisions panel being shown recorded this credential's view
+
+
+def test_neither_the_cockpit_nor_the_phone_app_ships_a_band_answer_box() -> None:
+    # Phill 11-01 ("1a" twice): a decision is answered on its own card; freeform words go through the Drop
+    from levain.web_server import load_web_asset
+
+    for name in ("dashboard_core.js", "phone.js", "dashboard.css", "phone.css"):
+        text = load_web_asset(name)
+        assert "band-box" not in text and "band-send" not in text and "bandDraft" not in text, name
+
+
+@needs_browser
+def test_the_decisions_panel_has_no_standing_input_with_items_waiting_or_with_none(tmp_path: Path, lh) -> None:
+    # Phill 11-01: all freeform desk comms go through the Drop; a decision is answered on its own card (option buttons and that
+    # card's write-in). The band slot is rows and buttons only: no input, no textarea, no send button, whatever waits
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    count = "document.querySelectorAll('[data-band-slot] input, [data-band-slot] textarea, [data-band-slot] .band-send, .band-box').length"
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        empty = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
+            DESKTOP,
+            {"until": "document.querySelector('.ck-card') && 1", "ms": 30000},        # nothing filed: no needs panel draws at all
+            {"eval": "new Promise(r => setTimeout(r, 2500)).then(() => 1)"},
+            {"eval": count},
+        ])
+        _file(store, "Which retry policy?")
+        waiting = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
+            DESKTOP,
+            {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
+            {"eval": HISTORY},
+            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
+            {"eval": count},
+            {"eval": "document.querySelectorAll('[data-band-row] .band-option').length"},
+        ])
+    assert empty["values"][-1] == 0, empty["values"]
+    assert waiting["values"][-2] == 0 and waiting["values"][-1] >= 1, waiting["values"]
 
 
 @needs_browser
@@ -141,22 +177,18 @@ def test_a_stale_cockpit_answer_redraws_the_band_says_why_and_records_nothing(tm
             {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
             {"eval": HISTORY},
             {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
-            {"eval": "(() => { const b = document.querySelector('.band-box'); b.value = '1a'; b.dispatchEvent(new Event('input')); return 1; })()"},
             # an open state editor is unsaved work: the page defers its own passive re-reads while it is open, so the page's
             # picture of the band cannot refresh itself before the send (a self-refresh would make the view current again)
             {"eval": "(document.querySelector('.state-edit').click(), document.querySelector('.state-editor').nodeType)"},   # throws if the editor did not open
             {"eval": "new Promise(r => setTimeout(r, 9000)).then(() => 1)"},     # the other tab's look lands in the meantime
-            {"eval": "(document.querySelector('.band-send').click(), 1)"},
+            {"eval": TAP % "1a"},
             {"until": "/changed since it was shown/.test((document.querySelector('.band-msg') || {}).textContent || '') && 1", "ms": 30000},
             {"until": f"{BAND_ROWS} === 2 && 1", "ms": 30000},
             {"shot": str(shots / "cockpit_decisions_band_stale.png"), "full": True},
-            {"eval": "document.querySelector('.band-box').value"},
-            {"eval": "(document.querySelector('.band-send').click(), 1)"},
+            {"eval": TAP % "1a"},                                           # the second send, from the fresh view
             {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
         ])
         t.join(timeout=5)
-    v = out["values"]
-    assert v[10] == "1a", v                                           # the words are kept across the redraw
     assert _answer(store, q1.n).value == "fix"                        # the second send, from the fresh view
 
 
@@ -185,64 +217,12 @@ def _authority(store: QuestionStore):
                       rec="go", blocks="x", cwd="/tmp/proj", link=Link("go", "push", "req-1", "qid-1"))
 
 
-TYPE_AND_SEND = ("(() => { const b = document.querySelector('%s'); b.value = '%s'; b.dispatchEvent(new Event('input')); "
-                 "document.querySelector('%s').click(); return 1; })()")
+# the Decisions panel has no typed-shorthand box (Phill 11-01: a decision is answered on its own card); an answer is a tap on the
+# item's option button, whose title is "answer <n><letter>"
+TAP = "(() => { document.querySelector('[data-band-row] .band-option[title=\"answer %s\"]').click(); return 1; })()"
 # the page's own re-reads fail from here on (the verb post still works): a send that lands must not wait for a redraw
 BLOCK_READS = ("(() => { const f = window.fetch; window.fetch = (u, ...r) => (/\\/cockpit\\/(?!verb)|consent\\.json/.test(String(u && u.url || u)) "
                "? Promise.reject(new TypeError('blocked')) : f(u, ...r)); return 1; })()")
-
-
-@needs_browser
-def test_a_cockpit_mixed_answer_names_the_authority_item_and_keeps_its_words(tmp_path: Path, lh) -> None:
-    _root, src, _ids = _install(tmp_path)
-    store = QuestionStore(lh)
-    q1, q2 = _file(store, "Which retry policy?"), _authority(store)
-    with _serve(src, write_token=TOKEN) as (base, _h):
-        out = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
-            DESKTOP,
-            {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
-            {"eval": HISTORY},
-            {"until": f"{BAND_ROWS} === 2 && 1", "ms": 30000},
-            {"eval": TYPE_AND_SEND % (".band-box", "1a 2a", ".band-send")},
-            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
-            {"eval": "new Promise(r => setTimeout(r, 1500)).then(() => 1)"},
-            {"eval": "(document.querySelector('.band-msg') || {}).textContent"},
-            {"eval": "document.querySelector('.band-box').value"},
-        ])
-    v = out["values"]
-    assert _answer(store, q1.n).value == "fix" and _answer(store, q2.n) is None
-    assert "recorded: 1a" in v[-2] and "2 needs your signature" in v[-2] and "Decisions" in v[-2], v   # names the item
-    assert "2a" in v[-1] and "1a" not in v[-1], v                    # the unrecorded part stays in the box
-
-
-@needs_browser
-def test_a_cockpit_sheets_only_answer_does_not_read_as_success_and_frees_the_controls(tmp_path: Path, lh) -> None:
-    _root, src, _ids = _install(tmp_path)
-    store = QuestionStore(lh)
-    _authority(store)
-    with _serve(src, write_token=TOKEN) as (base, _h):
-        out = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
-            DESKTOP,
-            {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
-            {"eval": HISTORY},
-            {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
-            {"eval": BLOCK_READS},
-            {"eval": TYPE_AND_SEND % (".band-box", "1a", ".band-send")},
-            {"eval": "new Promise(r => setTimeout(r, 2500)).then(() => 1)"},
-            {"eval": "(document.querySelector('.band-msg') || {}).textContent"},
-            {"eval": "document.querySelector('.band-box').value"},
-            {"eval": "document.querySelector('.band-box').disabled || document.querySelector('.band-send').disabled"},
-        ])
-    v = out["values"]
-    assert "nothing recorded" in v[-3] and "1 needs your signature" in v[-3], v
-    assert v[-2] == "1a", v
-    assert v[-1] is False, v                                         # re-enabled without waiting on a redraw that failed
-
-
-
-
-
-
 
 
 @needs_browser
@@ -260,7 +240,7 @@ def test_a_cockpit_store_fault_shows_a_fixed_line_never_the_raw_error(tmp_path: 
             {"until": "document.querySelector('#ck-needs .needs-history') && 1", "ms": 30000},
             {"eval": HISTORY},
             {"until": f"{BAND_ROWS} === 1 && 1", "ms": 30000},
-            {"eval": TYPE_AND_SEND % (".band-box", "1a", ".band-send")},
+            {"eval": TAP % "1a"},
             {"until": "(document.querySelector('.band-msg') || {}).textContent && 1", "ms": 30000},
             {"eval": "document.querySelector('.band-msg').textContent"},
         ])

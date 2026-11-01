@@ -383,13 +383,12 @@
     $("morning").replaceChildren(card);
   }
 
-  // The NEEDS YOU band (Q17-ALL S5b): each open item under its band number, one shorthand box ("15b", "1a 2b") and a tap on
-  // an option sending "<n><letter>". The listing's `band` carries the {store_id, view_id} this page was shown; an answer posts
+  // The NEEDS YOU band (Q17-ALL S5b): each open item under its band number and a tap on an option sending "<n><letter>" (no typed
+  // shorthand box: a decision is answered on its own card, freeform words go through the Drop). The listing's `band` carries the {store_id, view_id} this page was shown; an answer posts
   // them to /band/answer and the server records it only while that is still this device's newest view (409 stale_band: nothing
   // was recorded, the list is redrawn). Unsigned, a human channel (Q1 ruled (a)); an authority item is listed and opens its
   // signing sheet, never answered here. Text only (never HTML) for everything an agent wrote.
   const bandNumOf = new Map();      // question n -> band number: a question card leads with it (`#n` stays as the source tag)
-  let bandDraft = "";               // the shorthand typed and not sent: a redraw gives it back
   function bandCard(band) {
     const card = el("article", "req band");
     card.setAttribute("data-band", "");
@@ -400,14 +399,7 @@
     const note = el("div", "note");
     const say = (text, kind) => { notes.set("band", [text, kind || ""]); note.textContent = text; note.className = "note " + (kind || ""); };
     if (notes.has("band")) say(notes.get("band")[0], notes.get("band")[1]);
-    const box = el("input", "band-box");
-    box.type = "text"; box.maxLength = 400; box.value = bandDraft; box.autocomplete = "off"; box.autocapitalize = "off";
-    box.setAttribute("autocorrect", "off"); box.spellcheck = false;
-    box.setAttribute("aria-label", "answer by number and letter");
-    box.placeholder = "e.g. 15b";
-    const go = el("button", "allow band-send", "Send");
-    go.type = "button";
-    const buttons = [go];
+    const buttons = [];
     const canAnswer = band.view_id !== null && band.view_id !== undefined && typeof band.store_id === "string";
     const send = (text) => {
       text = String(text || "").trim();
@@ -415,42 +407,27 @@
       if (!canAnswer) { say(band.note || "the band could not be recorded just now, so it cannot be answered", "bad"); return; }
       busy++;
       buttons.forEach((b) => { b.disabled = true; });
-      box.disabled = true;
       say("sending the answer…");
       call("POST", "/band/answer", { text: text, store_id: band.store_id, view_id: band.view_id }).then((a) => {
         if (a.status === 409) {
           // a different band was shown since this one: nothing was recorded; the list is redrawn from a fresh look
-          bandDraft = box.value;
-          box.blur();
           buttons.forEach((b) => { b.disabled = false; });    // never left waiting on a redraw that may fail
-          box.disabled = false;
-          say("the band changed since it was shown to you, so nothing was recorded. It is redrawn: check the numbers and send again.", "bad");
+          say("the band changed since it was shown to you, so nothing was recorded. It is redrawn: check the numbers and tap again.", "bad");
           return;
         }
         buttons.forEach((b) => { b.disabled = false; });
-        box.disabled = false;
         if (!a.ok) return say("not answered: " + why(a), "bad");
         const b = a.body || {};
         const rec = Array.isArray(b.recorded) ? b.recorded : [];
         const refused = Array.isArray(b.refused) ? b.refused : [];
         const sheets = Array.isArray(b.sheets) ? b.sheets : [];
-        // what was not recorded stays in the box (a piece runs from its number to the next number)
-        const done = new Set(rec.map((l) => (/^\d+/.exec(String(l)) || [""])[0]).filter(Boolean));
-        let cur = null;
-        bandDraft = (rec.length ? String(text).split(/[\s,;]+/).filter((tok) => {
-          const m = /^\d+/.exec(tok);
-          if (m) cur = m[0];
-          return !(cur !== null && done.has(cur));
-        }).join(" ") : text);
-        if (!refused.length && !sheets.length) bandDraft = "";
-        box.value = bandDraft;
         last = "answered the band" + (rec.length ? " (" + rec.length + ")" : "");
         const bad = refused.length > 0 || sheets.length > 0;
         say((rec.length ? "recorded: " + rec.join(", ") : "nothing recorded")
           + (refused.length ? " · refused: " + refused.join("; ") : "")
           + (sheets.length ? " · " + sheets.map((s) => (/^\s*(\d+)/.exec(String(s)) || [0, "?"])[1]).join(", ")
             + " needs your signature: sign it on the phone's sign sheet" : ""), bad ? "bad" : "ok");
-      }).catch((e) => { buttons.forEach((b) => { b.disabled = false; }); box.disabled = false; say("the page failed (" + ((e && e.name) || "error") + "); answer again, and if it was already recorded the page says so", "bad"); })
+      }).catch((e) => { buttons.forEach((b) => { b.disabled = false; }); say("the page failed (" + ((e && e.name) || "error") + "); answer again, and if it was already recorded the page says so", "bad"); })
         .finally(() => { busy--; setTimeout(load, 300); });
     };
     for (const it of items) {
@@ -479,12 +456,7 @@
       card.appendChild(row);
     }
     if (typeof band.note === "string" && band.note) card.appendChild(el("div", "where", band.note));
-    box.addEventListener("input", () => { bandDraft = box.value; });
-    box.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); send(box.value); } });
-    go.addEventListener("click", () => send(box.value));
-    const bar = el("div", "band-bar");
-    bar.append(box, go);
-    card.append(bar, note);
+    card.append(note);
     return card;
   }
 
@@ -1500,7 +1472,7 @@
   function held() {
     if (busy) return true;
     if (Array.from(document.querySelectorAll("textarea.words:not(:disabled)")).some((t) => t.value.trim() !== "")) return true;
-    return !!(document.activeElement && document.activeElement.matches("input.reason, input.band-box"));
+    return !!(document.activeElement && document.activeElement.matches("input.reason"));
   }
 
   function load() {

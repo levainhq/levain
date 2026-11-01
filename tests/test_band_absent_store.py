@@ -337,8 +337,7 @@ def test_an_absent_payload_with_an_answer_to_say_still_says_it(tmp_path, monkeyp
              " if (/\\/cockpit\\/verb/.test(url) && o && typeof o.body === 'string' && /band_answer/.test(o.body)) {"
              " const b = JSON.parse(o.body); b.params.view_id = 999999; o = Object.assign({}, o, {body: JSON.stringify(b)}); }"
              " return f.call(this, u, o); }; return 1; })()")
-    send = ("(() => { const box = document.querySelector('[data-band-slot] .band-box'); box.value = '1a';"
-            " document.querySelector('[data-band-slot] .band-send').click(); return 1; })()")
+    send = ("(() => { document.querySelector('[data-band-slot] .band-option[title=\"answer 1a\"]').click(); return 1; })()")
     said = ("(() => { const s = document.querySelector('#levain-modal [data-band-slot][data-band-read=\"absent\"]');"
             " const m = s && s.querySelector('.band-msg'); return m && m.textContent ? m.textContent : null; })()")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
@@ -362,8 +361,7 @@ _HOLD = ("(() => { const f = window.fetch; window.fetch = function (u, o) { cons
          " if (window.__hold && /\\/cockpit\\/band\\.json/.test(url)) { const self = this; return new Promise((res) => {"
          " window.__release = () => { window.__hold = false; res(f.call(self, u, o)); }; }); }"
          " return f.call(this, u, o); }; window.__hold = true; return 1; })()")
-_SEND = ("(() => { const box = document.querySelector('[data-band-slot] .band-box'); box.value = '1a';"
-         " document.querySelector('[data-band-slot] .band-send').click(); return 1; })()")
+_SEND = ("(() => { document.querySelector('[data-band-slot] .band-option[title=\"answer 1a\"]').click(); return 1; })()")
 _NO_MARKER = ("window.__release && (() => { const s = document.querySelector('#levain-modal [data-band-slot]');"
               " return !!s && !s.hasAttribute('data-band-read'); })()")
 # the next draw throws once (bandDraw's own replaceChildren), as a draw that fails on a payload it did not expect would

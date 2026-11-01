@@ -4650,18 +4650,7 @@
   // (unsigned, a human channel): an authority item is listed and says it opens its signing sheet. Every string is drawn with
   // textContent, never as HTML.
   const bandNumOf = new Map();    // question n -> band number, from the last band read: a question row leads with it
-  let bandDraft = "";             // the shorthand typed and not sent: a redraw gives it back
   let bandKeep = "";              // what the last send said about refusals and sheets: a redraw gives it back until the next send
-  // the typed words minus the pieces of the items that were recorded (a piece runs from its number to the next number)
-  function bandUnrecorded(text, recorded) {
-    const done = new Set(recorded.map((l) => (/^\d+/.exec(String(l)) || [""])[0]).filter(Boolean));
-    let cur = null;
-    return String(text).split(/[\s,;]+/).filter((tok) => {
-      const m = /^\d+/.exec(tok);
-      if (m) cur = m[0];
-      return !(cur !== null && done.has(cur));
-    }).join(" ");
-  }
   let bandGot = null;             // the last read, shared for a moment by the slots one render draws (the server takes one at a time)
   function bandFetch(fresh) {
     if (!fresh && bandGot && Date.now() - bandGot.at < 2000) return bandGot.p;
@@ -4714,12 +4703,6 @@
     kids.push(el("div", "ext-grouphead", "needs you · the band"));
     const msg = el("span", "edit-msg band-msg", say || bandKeep);
     const controls = [];
-    const box = el("input", "band-box");
-    box.type = "text"; box.maxLength = 400; box.value = bandDraft; box.autocomplete = "off";
-    box.setAttribute("aria-label", "answer the band by number and letter");
-    box.placeholder = "answer by number and letter, e.g. 15b";
-    const go = el("button", "undo-btn band-send", "send");
-    go.type = "button";
     const canAnswer = !!(answerBand && b.view_id !== null && b.view_id !== undefined && typeof b.store_id === "string");
     const send = async (text) => {
       text = String(text || "").trim();
@@ -4738,30 +4721,22 @@
         const rec = Array.isArray(d.recorded) ? d.recorded : [];
         const refused = Array.isArray(d.refused) ? d.refused : [];
         const sheets = Array.isArray(d.sheets) ? d.sheets : [];
-        bandDraft = rec.length && (refused.length || sheets.length) ? bandUnrecorded(text, rec) : (rec.length ? "" : text);
         bandKeep = (rec.length ? "recorded: " + rec.join(", ") : "nothing recorded")
           + (refused.length ? " · refused: " + refused.join("; ") : "")
           + (sheets.length ? " · " + sheets.map((s) => (/^\s*(\d+)/.exec(String(s)) || [0, "?"])[1]).join(", ")
             + " needs your signature: sign it in Decisions" : "");
         const live = document.querySelector("[data-band-slot] .band-msg");
-        const liveBox = document.querySelector("[data-band-slot] .band-box");
         if (!refused.length && !sheets.length) bandKeep = "";
         if (live) live.textContent = bandKeep;
-        if (liveBox) liveBox.value = bandDraft;
         return;
       }
       if (res && res.error === "stale_band") {
         // another view of the band was shown since this one: nothing was recorded; the list is read again and drawn fresh
-        bandDraft = box.value;
         bandFill(slot, "the band changed since it was shown to you, so nothing was recorded. It is redrawn below: check the numbers and send again.", true);
         return;
       }
       msg.textContent = (res && (res.detail || res.message || res.error)) || "failed";
     };
-    box.addEventListener("input", () => { bandDraft = box.value; });
-    box.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); send(box.value); } });
-    go.addEventListener("click", () => send(box.value));
-    controls.push(box, go);
     for (const it of items) {
       if (!it || typeof it !== "object") continue;
       const authority = it.kind === "authority";
@@ -4791,7 +4766,7 @@
     }
     if (b.note) kids.push(el("div", "ext-meta band-note", String(b.note)));
     const bar = el("div", "band-bar");
-    bar.append(box, go, msg);
+    bar.append(msg);
     kids.push(bar);
     slot.replaceChildren(...kids);
     slot.setAttribute("data-band-read", read);
