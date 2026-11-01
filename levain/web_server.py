@@ -2389,6 +2389,12 @@ class _Handler(GuardedHandler):
                 allowed = ", ".join(tap["words"])
                 return {"error": "word_not_allowed",
                         "message": f"this tap token may set only: {allowed}"}, 403
+            # the body may have arrived long after the headers: the token is asked again now, so a revoke that returned
+            # before this write is never followed by a word from that token
+            from levain.webpush import presence_tokens
+
+            if presence_tokens.verify(queue, self.headers.get(_PRESENCE_TOKEN_HEADER, "")) is None:
+                return {"error": "forbidden", "message": "this tap token is not valid"}, 403
             wait = self.server.presence_rate.hit(tap["name"])
             if wait:
                 self._post_headers = [("Retry-After", str(int(wait) + 1))]

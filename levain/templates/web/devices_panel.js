@@ -778,6 +778,7 @@
     return writePresence(body);
   }
 
+  let tapBusy = false;     // one tap-token change at a time: a second create would replace the first one's only shown secret
   async function tapCall(path, body) {
     prGen++; prSay("");
     try {
@@ -793,10 +794,14 @@
     const words = PR_WORDS.map((x) => x[0]).filter((w) => prChecks[w].checked);
     if (!name) { prSay("Give the tap token a name."); return; }
     if (!words.length) { prSay("Pick at least one word it may set."); return; }
-    const got = await tapCall("/webpush/presence/token/new", { name: name, words: words });
-    if (!got || !got.token) return;
-    prName.value = "";
-    showNewTap(got.token, got.record || {});
+    if (tapBusy) return;
+    tapBusy = true;
+    try {
+      const got = await tapCall("/webpush/presence/token/new", { name: name, words: words });
+      if (!got || !got.token) return;
+      prName.value = "";
+      showNewTap(got.token, got.record || {});
+    } finally { tapBusy = false; }
   }
   // The secret is shown here once, in this node, and kept nowhere: a reload or the next read never brings it back.
   function showNewTap(tok, rec) {
@@ -819,8 +824,13 @@
     prNew.hidden = false;
   }
   async function revokeTap(name) {
-    await tapCall("/webpush/presence/token/revoke", { name: name });
-    prNew.hidden = true; prNew.replaceChildren();
+    if (tapBusy) return;
+    tapBusy = true;
+    try {
+      // the one-time secret on screen goes only when a revoke succeeded, never on a refusal
+      const got = await tapCall("/webpush/presence/token/revoke", { name: name });
+      if (got) { prNew.hidden = true; prNew.replaceChildren(); }
+    } finally { tapBusy = false; }
     await readPresence();
   }
 

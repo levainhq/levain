@@ -100,3 +100,9 @@ def test_the_rate_limit_counts_per_key_over_a_sliding_minute():
     assert wait == pytest.approx(57.0)
     assert r.hit("b", now=3) == 0.0
     assert r.hit("a", now=60.5) == 0.0
+
+
+def test_a_deeply_nested_file_reads_as_no_tokens(tmp_path):
+    pt.create(tmp_path, "door")
+    (tmp_path / "webpush" / pt.FILE_NAME).write_text("[" * 30000 + "]" * 30000)
+    assert pt.list_public(tmp_path) == []

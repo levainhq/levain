@@ -54,7 +54,7 @@ def _read(queue_dir: Path | str) -> list[dict]:
             return []
         with os.fdopen(fd, "rb", closefd=False) as fh:
             got = json.loads(fh.read(_MAX_BYTES + 1).decode("utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):      # a deeply nested document is malformed like any other
         return []
     finally:
         os.close(fd)
