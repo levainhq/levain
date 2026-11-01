@@ -703,22 +703,88 @@ def test_g3_a_held_lock_defers_the_drill_before_it_looks_at_any_snapshot(scratch
 
 # --------------------------------------------------------------------------------------------------- fix5 (L3 round 4)
 
-def test_k4_the_drill_releases_the_wrap_lock_before_it_hashes_and_checks_integrity(scratch, monkeypatch):
+def test_k4_the_lock_is_held_during_hashing_and_free_during_integrity_check(scratch, monkeypatch):
     from levain import wrap as w
     two_dreams(scratch)
-    seen = []
-    real_hash = sn.sha256_file
+    held_at_hash, held_at_integrity = [], []
+    real_hash, real_connect = sn.sha256_file, sn.sqlite3.connect
 
-    def probe(path):
-        if Path(path).name == sn.DB_BACKUP and not seen:
-            h = w._lock_wrap_file(scratch.parent / "wrap.lock")
-            seen.append(h is not w._ANOTHER_WRAP_RUNNING)       # True: the drill no longer holds the lock here
-            if h is not w._ANOTHER_WRAP_RUNNING:
-                w._unlock_wrap(h)
+    def taken():
+        h = w._lock_wrap_file(scratch.parent / "wrap.lock")
+        if h is not w._ANOTHER_WRAP_RUNNING:
+            w._unlock_wrap(h)
+            return False
+        return True
+
+    def hash_probe(path):
+        if Path(path).name == sn.DB_BACKUP:
+            held_at_hash.append(taken())
         return real_hash(path)
-    monkeypatch.setattr(sn, "sha256_file", probe)
+
+    def connect_probe(target, *a, **k):
+        if sn.DB_BACKUP in str(target):
+            held_at_integrity.append(taken())
+        return real_connect(target, *a, **k)
+    monkeypatch.setattr(sn, "sha256_file", hash_probe)
+    monkeypatch.setattr(sn.sqlite3, "connect", connect_probe)
     res = sn.drill(scratch, scratch.parent / "dream")
-    assert res.outcome == "ok" and seen == [True]
+    assert res.outcome == "ok"
+    assert held_at_hash and all(held_at_hash)
+    assert held_at_integrity == [False]
+
+
+def _latest_snap_dir(scratch):
+    name, _m = sn.snapshots(scratch.parent / "dream")[-1]
+    return scratch.parent / "dream" / name / sn.SNAP_DIR
+
+
+def test_fix7_a_snapshot_pruned_after_release_cannot_fail_the_drill(scratch, monkeypatch):
+    import shutil as _sh
+    from levain import wrap as w
+    two_dreams(scratch)
+    snapdir = _latest_snap_dir(scratch)
+    real_unlock = w._unlock_wrap
+
+    def unlock_then_prune(h):
+        out = real_unlock(h)
+        _sh.rmtree(snapdir.parent, ignore_errors=True)       # a concurrent prune right after release
+        return out
+    monkeypatch.setattr(w, "_unlock_wrap", unlock_then_prune)
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "ok", res.steps
+
+
+def test_fix7_a_short_scratch_copy_is_a_failed_copy_and_integrity_never_runs_on_it(scratch, monkeypatch):
+    two_dreams(scratch)
+    real = sn.shutil.copy2
+
+    def short(src, dst, *a, **k):
+        real(src, dst, *a, **k)
+        data = Path(dst).read_bytes()
+        Path(dst).write_bytes(data[: len(data) // 2])
+        return dst
+    monkeypatch.setattr(sn.shutil, "copy2", short)
+    real_connect = sn.sqlite3.connect
+    opened = []
+    monkeypatch.setattr(sn.sqlite3, "connect",
+                        lambda target, *a, **k: (opened.append(str(target)), real_connect(target, *a, **k))[1])
+    res = sn.drill(scratch, scratch.parent / "dream")
+    names = [(s["name"], s["status"]) for s in res.steps]
+    assert res.outcome == "failed" and names[-1] == ("copy", "failed")
+    assert ("hash", "failed") not in names and not any(s["name"] == "integrity" for s in res.steps)
+    assert not any(sn.DB_BACKUP in o for o in opened)
+
+
+def test_fix7_a_corrupted_original_is_a_corrupt_snapshot_at_the_hash_step(scratch):
+    two_dreams(scratch)
+    victim = _latest_snap_dir(scratch) / sn.DB_BACKUP
+    data = bytearray(victim.read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    victim.write_bytes(bytes(data))
+    res = sn.drill(scratch, scratch.parent / "dream")
+    names = [(s["name"], s["status"]) for s in res.steps]
+    assert res.outcome == "failed" and names[-1] == ("hash", "failed")
+    assert not any(s["name"] in ("copy", "integrity") for s in res.steps)
 
 
 # --------------------------------------------------------------------------------------------------- fix6 (L3 round 5)
@@ -796,6 +862,7 @@ def test_j2_a_short_copy_is_never_reported_as_a_corrupt_snapshot(scratch, monkey
     res = sn.drill(scratch, scratch.parent / "dream")
     hashed = [s for s in res.steps if s["name"] == "hash"]
     assert hashed and hashed[0]["status"] == "ok"        # the originals are intact, so the snapshot is not corrupt
+    assert res.steps[-1]["name"] == "copy" and res.steps[-1]["status"] == "failed"
 
 
 def test_j3_a_lock_or_scratch_failure_is_a_failed_drill_not_a_traceback(scratch, monkeypatch, lock_ledger):

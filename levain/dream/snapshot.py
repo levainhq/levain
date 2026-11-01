@@ -613,45 +613,47 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
             occ = root / name
             res.snapshot, res.outcome = name, "ok"
             snap = occ / SNAP_DIR
-            # the lock covers only choosing, reading and copying: the hash runs on the originals and the integrity
-            # check on the scratch copy after it is released, so a large store does not hold every dream off
+            # under the lock: copy every snapshot file and the db backup to scratch and hash each COPY against the
+            # manifest. A copy that mismatches is compared with its original (still under the lock, so it cannot be
+            # pruned): the original matching means the copy is bad, the original mismatching means the snapshot is.
+            # Everything after the release reads only these verified copies.
             socc = scratch / "occs" / name
             (socc / SNAP_DIR).mkdir(parents=True)
+            corrupt: list[str] = []
+            bad_copy: list[str] = []
+
+            def copy_and_check(src: Path, dst: Path, want: str | None, label: str) -> None:
+                shutil.copy2(src, dst)
+                if sha256_file(dst) != want:
+                    (bad_copy if sha256_file(src) == want else corrupt).append(label)
+
             try:
                 for e in m["files"].values():
                     if e["sha256"] is not None:
-                        shutil.copy2(snap / e["name"], socc / SNAP_DIR / e["name"])
-                shutil.copy2(snap / DB_BACKUP, bdir / DB_BACKUP)
+                        copy_and_check(snap / e["name"], socc / SNAP_DIR / e["name"], e["sha256"], e["name"])
+                copy_and_check(snap / DB_BACKUP, bdir / DB_BACKUP, m.get("db_backup_sha256"), DB_BACKUP)
             except OSError as exc:
                 copy_err = f"{type(exc).__name__}: {exc}"
-            if copy_err is None and m.get("post_files"):
+            if copy_err is None and not corrupt and not bad_copy and m.get("post_files"):
                 try:
                     copy_db = _copy_store(db, sdir)
                 except (OSError, sqlite3.Error) as exc:
                     restore_err = f"the live store could not be copied: {type(exc).__name__}: {exc}"
         finally:
             release()
-        # the hash reads the ORIGINAL snapshot files (read-only), so a short or failed copy is never reported as a
-        # corrupt snapshot
-        try:
-            bad = [e["name"] for e in m["files"].values() if e["sha256"] is not None
-                   and sha256_file(snap / e["name"]) != e["sha256"]]
-            if sha256_file(occ / SNAP_DIR / DB_BACKUP) != m.get("db_backup_sha256"):
-                bad.append(DB_BACKUP)
-        except OSError as exc:
-            bad = [f"{type(exc).__name__}: {exc}"]
-        if _step(res, "hash", "failed" if bad else "ok", f"does not match the manifest: {bad}" if bad
+        if _step(res, "hash", "failed" if corrupt else "ok", f"does not match the manifest: {corrupt}" if corrupt
                  else "every snapshot file and the db backup match their manifest hashes") == "failed":
             return _drill_done(res, root, write_result, failed=True)
+        if copy_err is not None or bad_copy:
+            _step(res, "copy", "failed", f"the scratch copy failed: {copy_err}" if copy_err
+                  else f"the scratch copy of {bad_copy} does not match the manifest though the snapshot does")
+            return _drill_done(res, root, write_result, failed=True)
         try:
-            if copy_err is not None:
-                verdict = [f"the scratch copy failed: {copy_err}"]
-            else:
-                con = sqlite3.connect(f"file:{bdir / DB_BACKUP}?mode=ro", uri=True)
-                try:
-                    verdict = [r[0] for r in con.execute("pragma integrity_check")]
-                finally:
-                    con.close()
+            con = sqlite3.connect(f"file:{bdir / DB_BACKUP}?mode=ro", uri=True)
+            try:
+                verdict = [r[0] for r in con.execute("pragma integrity_check")]
+            finally:
+                con.close()
         except sqlite3.Error as exc:
             verdict = [f"{type(exc).__name__}: {exc}"]
         ok = verdict == ["ok"]
