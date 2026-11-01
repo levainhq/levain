@@ -13,13 +13,16 @@ import unicodedata
 
 from levain.webpush import presence
 
-__all__ = ["BODY_MAX", "TITLE_MAX", "PRIORITIES", "NotifyRefused", "clean_body", "clean_title", "display_title",
-           "kind_for", "notify_decision"]
+__all__ = ["BODY_MAX", "TITLE_MAX", "PRIORITIES", "NOTICES_URL", "NotifyRefused", "clean_body", "clean_title",
+           "decide_now", "display_title", "kind_for", "notice_ref", "notify_decision"]
 
 TITLE_MAX = 80
 BODY_MAX = 1000
 PRIORITIES = ("low", "normal", "urgent")      # three levels; there is no ``high``
 RANK = {p: i for i, p in enumerate(PRIORITIES)}
+# where a notice's push opens: a fixed link of Levain's own, never one the poster chose (a page without a notices view
+# falls back to the board)
+NOTICES_URL = "/?view=notices"
 # a title that opens with a bracketed label would read as another source's label once ours is put in front of it
 _OPENS_WITH_LABEL = re.compile(r"^\s*[\[【〔〖「『［⟦⸨].{0,60}?[\]】〕〗」』］⟧⸩]")
 
@@ -95,3 +98,20 @@ def notify_decision(priority: str, now: float, word: dict | None, idle: float | 
         return "recorded"
     d = presence.decide(now, word, idle, class_name=presence.kind_class(kind), policy=policy, route=route)
     return "pushed" if d.push else "held"
+
+
+def notice_ref(source: str) -> str:
+    """The ping ref of every notice from ``source``: it is the push's tag and topic, so repeated notices from one source
+    collapse into one notification and never replace a seat's or a needs item's."""
+    return f"notify:{source}"
+
+
+def decide_now(queue_dir, priority: str, *, now: float | None = None, idle=None) -> tuple[str, str | None]:
+    """``(decision, hold reason)`` for a notice posted now, read the way every other ping is: the operator's word, policy
+    and route on file and the desk's idle time, through :func:`levain.webpush.presence.should_push`. The reason is the
+    word that muted a held notice (``quiet``, ``sleep``) or ``active`` (the desk was in use), else ``None``. ``low`` is
+    recorded and never asks the rule."""
+    if priority == "low":
+        return "recorded", None
+    said = presence.should_push(queue_dir, kind_for(priority), now=now, idle=idle)
+    return ("pushed", None) if said.push else ("held", said.by or "active")

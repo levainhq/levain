@@ -29,7 +29,7 @@ from pathlib import Path
 from levain.webpush import notify
 from levain.webpush.notify import NotifyRefused, PRIORITIES, RANK
 
-__all__ = ["Admitted", "NotifyTokenError", "admit", "create", "list_public", "revoke", "verify", "FILE_NAME", "HEADER",
+__all__ = ["Admitted", "NotifyBusy", "NotifyTokenError", "admit", "create", "list_public", "revoke", "verify", "FILE_NAME", "HEADER",
            "TOKEN_PREFIX"]
 
 FILE_NAME = "notify_tokens.json"
@@ -48,6 +48,10 @@ _DAY = 86400.0
 
 class NotifyTokenError(ValueError):
     """A request about the token list that cannot be applied, or a token file that cannot be read or written safely."""
+
+
+class NotifyBusy(NotifyTokenError):
+    """The notify lock stayed held past the wait: nothing was changed, and a retry may succeed."""
 
 
 @contextmanager
@@ -70,7 +74,7 @@ def _locked(queue_dir: Path | str, wait: float = 3.0):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise NotifyTokenError("the notify lock is held by another process") from None
+                    raise NotifyBusy("the notify lock is held by another process") from None
                 time.sleep(0.02)
     except OSError as e:
         if fd is not None:
