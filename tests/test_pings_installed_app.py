@@ -11,7 +11,7 @@ from typing import Any
 
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import T, _serve
-from tests.test_cockpit_webpush import _ROW, _panel, _signed, _sub, rig, pushes  # noqa: F401 (fixtures)
+from tests.test_cockpit_webpush import _ROW, _panel, _signed, _sub, full_chrome, rig, pushes  # noqa: F401 (fixtures)
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests import test_pair_card_w1b as w1b
 
@@ -211,14 +211,14 @@ def _turn_on_with(tmp_path, rig, answer: str):
 
 
 @needs_browser
-def test_a_lost_subscribe_answer_keeps_the_subscription_and_does_not_claim_nothing_changed(rig, tmp_path) -> None:
+def test_a_lost_subscribe_answer_keeps_the_subscription_and_does_not_claim_nothing_changed(full_chrome, rig, tmp_path) -> None:
     note, unsubs = _turn_on_with(tmp_path, rig, LOST)
     assert unsubs == 0, unsubs
     assert "Nothing was changed" not in note and "Devices panel" in note, note
 
 
 @needs_browser
-def test_a_clear_subscribe_refusal_still_undoes_the_subscription(rig, tmp_path) -> None:
+def test_a_clear_subscribe_refusal_still_undoes_the_subscription(full_chrome, rig, tmp_path) -> None:
     note, unsubs = _turn_on_with(tmp_path, rig, REFUSED)
     assert unsubs == 1 and note == "Could not turn pings on (not now).", (note, unsubs)
 

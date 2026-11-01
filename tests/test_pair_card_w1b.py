@@ -14,6 +14,7 @@ import pytest
 
 from levain.web_server import load_web_asset
 from tests._page_drive_run import run as run_driver
+from tests.test_cockpit_webpush import full_chrome  # noqa: F401 (fixture)
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import PROXY, T, _call, _serve
 
@@ -68,7 +69,7 @@ def test_an_unpaired_page_off_the_box_draws_the_pair_card_and_never_the_owner_pr
 
 
 @needs_browser
-def test_a_short_claim_keeps_the_key_and_the_mark_drops_the_phone_port_keys_and_updates_the_worker(tmp_path, monkeypatch) -> None:
+def test_a_short_claim_keeps_the_key_and_the_mark_drops_the_phone_port_keys_and_updates_the_worker(full_chrome, tmp_path, monkeypatch) -> None:
     _root, src, _ids = _install(tmp_path)
     with _serve(src, extra_hosts=[NAME]) as (port, _h):
         code = _short(port)
@@ -94,7 +95,7 @@ def test_a_short_claim_keeps_the_key_and_the_mark_drops_the_phone_port_keys_and_
 
 
 @needs_browser
-def test_the_pings_button_asks_for_permission_before_anything_else(tmp_path, monkeypatch) -> None:
+def test_the_pings_button_asks_for_permission_before_anything_else(full_chrome, tmp_path, monkeypatch) -> None:
     _root, src, _ids = _install(tmp_path)
     with _serve(src, extra_hosts=[NAME]) as (port, _h):
         code = _short(port)
@@ -158,7 +159,7 @@ def test_a_pending_open_is_posted_with_the_pages_key_retried_online_and_kept_on_
 
 
 @needs_browser
-def test_turn_on_pings_can_be_tapped_again_after_a_refusal_or_a_failed_subscribe(tmp_path, monkeypatch) -> None:
+def test_turn_on_pings_can_be_tapped_again_after_a_refusal_or_a_failed_subscribe(full_chrome, tmp_path, monkeypatch) -> None:
     _root, src, _ids = _install(tmp_path)
     btn = "[...document.querySelectorAll('#ck-unpaired button')].find((b) => b.textContent === 'Turn on pings')"
     msg = "(document.querySelector('#ck-unpaired .pair-msg') || {}).textContent || ''"

@@ -8,8 +8,15 @@ without this test failing."""
 from __future__ import annotations
 
 import json
+import os
+import platform
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
+
+from tests import _shared_chrome
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAGS_FILE = ROOT / "tests" / "chrome_flags.json"
@@ -71,11 +78,162 @@ def test_the_shared_session_chrome_launch_site_is_scanned_and_spreads_the_flags(
     assert offending_sites({name: text.replace("CHROME_SAFE_FLAGS", "X")}) == [name]
 
 
-def test_the_drivers_prefer_the_headless_shell_that_the_flags_file_names():
-    """Full Chrome mints a keychain key per fresh profile; the three drivers that launch from the flags file must all read
-    its ``headless_shell_root`` (a driver that forgot would quietly go back to full Chrome)."""
+# --- the shell selection, by behaviour over a fake cache tree (python selector and the two node drivers) ---------------------
+
+GIVEN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+HOST_ARCH = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "x64", "amd64": "x64"}.get(platform.machine().lower())
+OTHER_ARCH = "x64" if HOST_ARCH == "arm64" else "arm64"
+NODE = shutil.which("node")
+on_mac = pytest.mark.skipif(platform.system() != "Darwin" or HOST_ARCH is None, reason="the shell cache is a macOS layout")
+
+
+def _shell(root: Path, version: str, arch: str, *, mode: int = 0o755) -> Path:
+    d = root / f"mac_{arch}-{version}" / f"chrome-headless-shell-mac-{arch}"
+    d.mkdir(parents=True)
+    f = d / "chrome-headless-shell"
+    f.write_text("#!/bin/sh\nexit 0\n")
+    f.chmod(mode)
+    return f
+
+
+def _cases(tmp: Path):
+    """(name, root as the flags file names it, setup(root) -> the expected pick or None for the given Chrome, env, explicit)."""
+    def with_shell(root):
+        return _shell(root, "156.0.8078.80", HOST_ARCH)
+
+    def numeric(root):
+        _shell(root, "99.0.1.1", HOST_ARCH)
+        return _shell(root, "156.0.8078.80", HOST_ARCH)
+
+    def stray(root):
+        root.mkdir(parents=True, exist_ok=True)
+        (root / ".DS_Store").write_text("x")
+        (root / "mac_arm-999.0.0.0").write_text("a file where a version directory goes")
+        return _shell(root, "156.0.8078.80", HOST_ARCH)
+
+    def not_exec(root):
+        _shell(root, "156.0.8078.80", HOST_ARCH, mode=0o644)
+
+    def wrong_platform(root):
+        _shell(root, "156.0.8078.80", OTHER_ARCH)
+
+    def as_directory(root):
+        (root / "mac_arm-156.0.8078.80" / f"chrome-headless-shell-mac-{HOST_ARCH}" / "chrome-headless-shell").mkdir(parents=True)
+
+    def empty(root):
+        root.mkdir(parents=True, exist_ok=True)
+
+    return [
+        ("installed and executable", with_shell, {}, False),
+        ("newest version by number, not by text", numeric, {}, False),
+        ("a stray file in the cache is skipped", stray, {}, False),
+        ("no cache at all", None, {}, False),
+        ("an empty cache", empty, {}, False),
+        ("not executable", not_exec, {}, False),
+        ("wrong-platform directory", wrong_platform, {}, False),
+        ("the binary is a directory", as_directory, {}, False),
+        ("LEVAIN_FULL_CHROME=1", with_shell, {"LEVAIN_FULL_CHROME": "1"}, False),
+        ("a Chrome named on purpose", with_shell, {}, True),
+        ("a drive that declared needs_full_chrome", with_shell, {"LEVAIN_DRIVE_FULL_CHROME": "1"}, False),
+    ]
+
+
+# the cases whose answer is the shell (the rest answer the given Chrome); the declared-full-Chrome case is a driver rule, not the python selector's
+SHELL_CASES = {"installed and executable", "newest version by number, not by text", "a stray file in the cache is skipped"}
+DRIVER_ONLY = {"a drive that declared needs_full_chrome"}
+
+
+def _run_table(pick, tmp_path: Path, *, driver_cases: bool) -> list[str]:
+    """Runs every case through ``pick(root, given, env, explicit) -> chosen path``; returns the cases it answered wrongly."""
+    wrong = []
+    for i, (name, setup, env, explicit) in enumerate(_cases(tmp_path)):
+        if name in DRIVER_ONLY and not driver_cases:
+            continue
+        root = tmp_path / f"case{i}"
+        expected_bin = setup(root) if setup else None
+        want = str(expected_bin) if name in SHELL_CASES else GIVEN
+        if name in SHELL_CASES and not (platform.system() == "Darwin" and HOST_ARCH):
+            continue
+        got = pick(root, GIVEN, env, explicit)
+        if got != want:
+            wrong.append(f"{name}: got {got!r}, want {want!r}")
+    return wrong
+
+
+def _py_pick(root, given, env, explicit):
+    flags = root.parent / f"{root.name}.flags.json"
+    flags.write_text(json.dumps({"flags": [], "headless_shell_root": str(root)}))
+    old = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        return _shared_chrome._pick_chrome(given, explicit=explicit, flags_file=flags)
+    finally:
+        for k, v in old.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+def _node_pick(script: str):
+    def pick(root, given, env, explicit):
+        d = root.parent / f"{root.name}.drv"
+        (d / "sky_replay").mkdir(parents=True)
+        src = ROOT / "tests" / script
+        dest = d / script
+        dest.write_text(src.read_text(encoding="utf-8"))
+        (d / "chrome_flags.json").write_text(json.dumps({"flags": [], "headless_shell_root": str(root)}))
+        steps = d / "steps.json"
+        steps.write_text("[]")
+        argv = [NODE, str(dest), given if not explicit else given + "-named", "about:blank", str(steps)] if script == "_page_drive.mjs" \
+            else [NODE, str(dest), given if not explicit else given + "-named", "-"]
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60, env={**os.environ, "LEVAIN_PICK_CHROME_DRY": "1", **env})
+        assert r.returncode == 0, r.stderr
+        out = r.stdout.strip()
+        return given if out == given + "-named" else out
+    return pick
+
+
+def test_the_python_selector_picks_by_behaviour(tmp_path):
+    assert _run_table(_py_pick, tmp_path, driver_cases=False) == []
+
+
+@pytest.mark.skipif(NODE is None, reason="node is needed")
+@pytest.mark.parametrize("script", ["_page_drive.mjs", "sky_replay/run_cdp.mjs"])
+def test_the_node_selectors_pick_by_behaviour(tmp_path, script):
+    assert _run_table(_node_pick(script), tmp_path, driver_cases=script == "_page_drive.mjs") == []
+
+
+@on_mac
+def test_a_selector_that_always_returns_the_given_chrome_fails_the_table(tmp_path):
+    """The positive control: the table is not satisfiable by `return given`."""
+    wrong = _run_table(lambda root, given, env, explicit: given, tmp_path, driver_cases=True)
+    assert len(wrong) == len(SHELL_CASES) and all(w.split(":")[0] in SHELL_CASES for w in wrong)
+
+
+def test_the_python_selector_survives_an_unknown_account_and_a_malformed_root(tmp_path, monkeypatch, capsys):
+    def unknown(uid):
+        raise KeyError(uid)
+    monkeypatch.setattr(_shared_chrome.pwd, "getpwuid", unknown)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert _shared_chrome._real_home() == tmp_path / "home"
+    flags = tmp_path / "f.json"
+    flags.write_text(json.dumps({"flags": [], "headless_shell_root": 7}))
+    _shared_chrome._warned.clear()
+    assert _shared_chrome._pick_chrome(GIVEN, flags_file=flags, system="Darwin", machine="arm64") == GIVEN
+    assert _shared_chrome._pick_chrome(GIVEN, flags_file=flags, system="Darwin", machine="arm64") == GIVEN
+    assert capsys.readouterr().err.count("headless_shell_root is not a string") == 1   # one warning, not one per call
+    flags.write_text("{not json")
+    assert _shared_chrome._pick_chrome(GIVEN, flags_file=flags, system="Darwin", machine="arm64") == GIVEN
+
+
+def test_the_session_chrome_reads_full_chrome_and_a_named_chrome_when_it_starts(monkeypatch):
+    monkeypatch.delenv("CHROME", raising=False)
+    monkeypatch.setenv("LEVAIN_FULL_CHROME", "1")
+    assert _shared_chrome._session_chrome() == _shared_chrome.DEFAULT_CHROME
+    monkeypatch.delenv("LEVAIN_FULL_CHROME")
+    monkeypatch.setenv("CHROME", "/opt/named/chrome")
+    assert _shared_chrome._session_chrome() == "/opt/named/chrome"
+
+
+def test_the_drivers_name_the_flags_file_and_the_launcher_spreads_it():
+    """The wiring the behaviour tests above cannot see: the flags file names a root, and both node drivers read their config."""
     cfg = json.loads(FLAGS_FILE.read_text(encoding="utf-8"))
     assert cfg["headless_shell_root"].startswith("~/")
-    files = _tracked_sources()
-    for name in ("tests/_shared_chrome.py", "tests/_page_drive.mjs", "tests/sky_replay/run_cdp.mjs"):
-        assert "headless_shell_root" in files[name], name

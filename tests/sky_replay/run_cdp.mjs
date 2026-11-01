@@ -1,7 +1,7 @@
 // Drives driver.html in headless Chrome over CDP: real frames, real time. Prints the page's RESULT line,
 // and saves screenshots when asked.   node run_cdp.mjs <chrome> <outdir|-> 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,21 +11,41 @@ const here = dirname(fileURLToPath(import.meta.url));
 const profile = mkdtempSync(join(tmpdir(), 'sky-cdp-'));
 const chromeCfg = JSON.parse(readFileSync(join(here, '..', 'chrome_flags.json'), 'utf8'));
 const chromeFlags = chromeCfg.flags;
+const DEFAULT_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const versionKey = (name) => (name.match(/([0-9]+(?:\.[0-9]+)*)$/)?.[1] ?? "").split(".").filter(Boolean).map(Number);
+const newerFirst = (a, b) => {
+  const x = versionKey(a), y = versionKey(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? -1) !== (y[i] ?? -1)) return (y[i] ?? -1) - (x[i] ?? -1);
+  return 0;
+};
+const dirsOf = (d) => readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
 // chrome-headless-shell (Chrome for Testing's headless binary) when installed under chrome_flags.json's headless_shell_root: full
 // Chrome mints a Secure Enclave key in the operator's keychain on every fresh profile (no flag stops it), the shell never does.
-// LEVAIN_FULL_CHROME=1 keeps the given Chrome.
+// A shell binary counts only if it is a regular executable file in a "-mac-<this host's arch>" directory (versions compared
+// numerically; a stray file is skipped); anything else falls back to the given Chrome. The given Chrome is kept when
+// LEVAIN_FULL_CHROME=1, or when it is not DEFAULT_CHROME (a caller that named a Chrome on purpose gets that Chrome).
 const pickChrome = (given, cfg) => {
-  if (process.env.LEVAIN_FULL_CHROME === '1' || !cfg.headless_shell_root) return given;
-  try {
-    const root = cfg.headless_shell_root.replace(/^~/, userInfo().homedir);
-    for (const v of readdirSync(root).sort().reverse()) for (const a of readdirSync(join(root, v))) {
-      const bin = join(root, v, a, 'chrome-headless-shell');
-      if (existsSync(bin)) return bin;
+  if (process.env.LEVAIN_FULL_CHROME === "1" || given !== DEFAULT_CHROME) return given;
+  const raw = cfg.headless_shell_root;
+  if (raw === undefined || raw === null || raw === "") return given;
+  if (typeof raw !== "string") { console.error("chrome_flags.json: headless_shell_root is not a string; using the given Chrome"); return given; }
+  const arch = { arm64: "arm64", x64: "x64" }[process.arch];
+  if (process.platform !== "darwin" || !arch) return given;
+  let root, versions;
+  try { root = raw.replace(/^~/, userInfo().homedir); versions = dirsOf(root).sort(newerFirst); } catch { return given; }
+  for (const v of versions) {
+    let subs;
+    try { subs = dirsOf(join(root, v)).filter((n) => n.endsWith(`-mac-${arch}`)).sort(); } catch { continue; }
+    for (const a of subs) {
+      const bin = join(root, v, a, "chrome-headless-shell");
+      try { if (statSync(bin).isFile()) { accessSync(bin, constants.X_OK); return bin; } } catch {}
     }
-  } catch {}
+  }
   return given;
 };
-const proc = spawn(pickChrome(chrome, chromeCfg), [...chromeFlags, '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
+const picked = pickChrome(chrome, chromeCfg);
+if (process.env.LEVAIN_PICK_CHROME_DRY === '1') { process.stdout.write(picked + '\n'); rmSync(profile, { recursive: true, force: true }); process.exit(0); }   // a test of the selection: print the pick, launch nothing
+const proc = spawn(picked, [...chromeFlags, '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
   '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--window-size=1180,700', 'about:blank'], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Chrome must not outlive this process on any exit node can see (a signal, a thrown error, the parent dying);
