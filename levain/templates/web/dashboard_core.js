@@ -4803,7 +4803,7 @@
       btn.disabled = true;
       if (!slot) { slot = el("div", "consent-body ext-meta"); row.appendChild(slot); }
       slot.replaceChildren(document.createTextNode("reading the question…"));
-      Promise.resolve(questionBody(q, row)).then((b) => {
+      Promise.resolve().then(() => questionBody(q, row)).catch(() => null).then((b) => {
         if (!b) { btn.disabled = false; slot.remove(); slot = null; return; }
         drawQuestionBody(q, slot, b);
         if (b.error) btn.disabled = false; else btn.remove();
@@ -4819,8 +4819,8 @@
       // answer, so a failed, token-less or answer-less read leaves no blank space and the details button as it was; the rest of
       // the answered rows draw on that click.
       eagerBusy = true;
-      Promise.resolve(questionBody(q, row)).then((b) => {
-        eagerBusy = false;
+      Promise.resolve().then(() => questionBody(q, row)).catch(() => null).then((b) => {
+        eagerBusy = false;   // a rejected read is no body: the button stays, a click still works
         if (!slot && b && !b.error && b.answer && typeof b.answer === "object") {
           slot = el("div", "consent-body ext-meta");
           row.appendChild(slot);
@@ -5807,7 +5807,7 @@
     const h = t && typeof t.headers === "function" ? t.headers() : {};
     return !!(h && h["X-Levain-Write-Token"]);
   }
-  const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state + "|" + (hasWriteToken() ? "t" : "-"));
+  const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state + (it.q.state === "answered" ? "|" + (hasWriteToken() ? "t" : "-") : ""));
   // the name a glance tile gives the top item: the tool and who asked, or the question's number (its words are fetched, not in the row)
   function needsName(it) {
     return it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "question #" + it.q.n + " · " + (it.q.agent || "agent");

@@ -78,7 +78,16 @@
   const CALM_AGE_TICK_MS = 120000;       // the same timer under Calm: slower, never stopped, so every age stays true
   const SAVE_STAMP = "last save at";
   let serverOffsetMs = 0;       // the server's clock minus this browser's, as of the last snapshot
+  let serverOffsetGen = NaN;    // the freshest server timestamp that has set the offset
   const serverNow = () => Date.now() + serverOffsetMs;
+  // A refetch maps the manifest it started with, so a reading no fresher than the one already taken must not move the clock;
+  // a fresher one may only move it forward, so the page's server time never runs backward.
+  function nextServerOffset(prevOffset, prevGen, gen, browserNow) {
+    if (isNaN(gen)) return { offset: prevOffset, gen: prevGen };
+    if (isNaN(prevGen)) return { offset: gen - browserNow, gen };
+    if (gen <= prevGen) return { offset: prevOffset, gen: prevGen };
+    return { offset: Math.max(prevOffset, gen - browserNow), gen };
+  }
 
   function ageLabel(iso, now, prefix) {
     const t = parseIso(iso);
@@ -673,7 +682,8 @@
     noteRepos(snap.panels);
     const m = snap.manifest;
     const gen = parseIso(m.generated_at);
-    serverOffsetMs = isNaN(gen) ? 0 : gen - Date.now();
+    const nx = nextServerOffset(serverOffsetMs, serverOffsetGen, gen, Date.now());
+    serverOffsetMs = nx.offset; serverOffsetGen = nx.gen;
     let now = isNaN(gen) ? Date.now() : gen;   // the server's clock, so a skewed browser cannot misreport ages
     const genAt = now;
     for (const p of Object.values(snap.panels || {})) {

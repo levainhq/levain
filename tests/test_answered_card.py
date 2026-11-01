@@ -246,3 +246,69 @@ def test_a_details_click_during_the_eager_read_draws_one_body(tmp_path: Path, mo
                  {"eval": "JSON.stringify({multi: " + ROWS + ".filter(r => r.querySelectorAll('.consent-body').length > 1).length, rowsstate: 1})"}]
         got = _values(_drive(tmp_path, f"{url}/#write_token=T", steps), '"rowsstate"')
     assert got["multi"] == 0, got
+
+
+VIEW = (WEB / "cockpit_view.js").read_text()
+
+
+def _offset(expr: str) -> object:
+    src = VIEW[VIEW.index("  function nextServerOffset"):VIEW.index("  function ageLabel")]
+    out = subprocess.run([NODE, "-e", src + "\nconsole.log(JSON.stringify(" + expr + "));"], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_a_refetch_of_a_stale_manifest_never_moves_the_server_clock_back() -> None:
+    """Every panel refetch maps the manifest it started with; the offset must not follow it back, or an answered card
+    29m59s old would get its window renewed on each refetch."""
+    got = _offset("""(() => {
+      let off = 0, gen = NaN, clock = 1000000;            // the browser clock; the server runs 5s ahead
+      const take = (g) => { const n = nextServerOffset(off, gen, g, clock); off = n.offset; gen = n.gen; };
+      const now = () => clock + off;
+      take(clock + 5000);                                   // a fresh snapshot
+      const first = now();
+      clock += 20000; const before = now();
+      for (let i = 0; i < 5; i++) { take(1000000 + 5000); clock += 1000; }   // the same stale manifest, mapped again and again
+      const after = now();
+      const decided = first - (29 * 60000 + 59000);        // an answer 29m59s old when the first snapshot was taken
+      const left = (t) => decided + 30 * 60000 - t;
+      take(clock + 5000 + 100);                             // a genuinely fresh one may move it forward only
+      return [before <= after, left(after) < left(before), now() >= after, off];
+    })()""")
+    assert got[0] is True and got[1] is True and got[2] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_the_first_reading_and_an_unreadable_stamp_are_handled() -> None:
+    assert _offset("[nextServerOffset(0, NaN, 5000, 1000), nextServerOffset(7, 9, NaN, 1000), nextServerOffset(0, NaN, 1000, 5000)]") == [
+        {"offset": 4000, "gen": 5000}, {"offset": 7, "gen": 9}, {"offset": -4000, "gen": 1000}]
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_an_open_question_key_ignores_the_token_and_an_answered_one_does_not() -> None:
+    src = _slice("function hasWriteToken", "  // the name a glance tile gives the top item")
+    out = subprocess.run([NODE, "-e", src + "\nconst o = {kind: 'question', q: {n: 4, state: 'open'}}, a = {kind: 'question', q: {n: 4, state: 'answered'}};"
+                          "globalThis.window = {LevainCockpitTransport: {headers: () => ({})}}; const o1 = needsKey(o), a1 = needsKey(a);"
+                          "globalThis.window = {LevainCockpitTransport: {headers: () => ({'X-Levain-Write-Token': 'T'})}};"
+                          "console.log(JSON.stringify([o1 === needsKey(o), a1 !== needsKey(a)]));"], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout) == [True, True]
+
+
+@needs_browser
+def test_a_rejected_eager_read_leaves_the_details_button_working(tmp_path: Path, monkeypatch) -> None:
+    store = _home(tmp_path, monkeypatch)
+    for k in range(7):
+        store.answer(_file(store, f"Question number {k} to settle?").n, option="ship", channel="cli")
+    _root, src, _ids = _install(tmp_path)
+    real = "window.__h = window.LevainCockpitTransport.headers"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        steps = [DESKTOP, {"until": "window.LevainNeeds && window.LevainNeeds.history && 1", "ms": 30000},
+                 {"eval": real + "; window.LevainCockpitTransport.headers = () => { if (new Error().stack.includes('questionBody')) throw new Error('boom'); return window.__h(); }; window.LevainNeeds.history(null) ? 1 : 0"},
+                 {"until": f"{ROWS}.length === 7 && 1", "ms": 30000},
+                 {"eval": "window.LevainCockpitTransport.headers = window.__h; " + ROWS + ".find(r => r.querySelector('.consent-details')).querySelector('.consent-details').click(); 1"},
+                 {"until": f"{ROWS}.some(r => r.querySelector('.consent-body')) && 1", "ms": 15000},
+                 {"eval": ROWS_STATE}]
+        got = _values(_drive(tmp_path, f"{url}/#write_token=T", steps), '"rowsstate"')
+    assert got["rows"] == 7 and got["drawn"] >= 1, got
