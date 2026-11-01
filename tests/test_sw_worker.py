@@ -53,34 +53,64 @@ CARD = "https://box.example/sign/9#sign=a&v=1"
 
 
 @needs_node
-def test_a_tap_steers_a_window_the_worker_controls_and_opens_no_second_one() -> None:
+def test_a_page_that_acks_is_asked_to_open_the_card_itself_and_the_worker_does_nothing_more() -> None:
+    for kind in ("controlled", "uncontrolled"):
+        got = _run("navigate", kind + "+ack")
+        assert got["asked"] == [CARD] and got["focused"] == 1, got
+        assert got["navigated"] == [] and "openWindow" not in got, (kind, got)
+
+
+@needs_node
+def test_a_controlled_page_that_never_acks_is_navigated_by_the_worker() -> None:
     got = _run("navigate", "controlled")
-    assert got["navigated"] == [CARD] and got["focused"] == 1, got
+    assert got["asked"] == [CARD] and got["navigated"] == [CARD] and got["focused"] == 1, got
     assert "openWindow" not in got, got
 
 
 @needs_node
-def test_a_tap_with_only_an_uncontrolled_window_opens_the_card() -> None:
+def test_an_uncontrolled_page_that_never_acks_gets_a_new_window_and_no_navigate() -> None:
     """Reproduced in headless Chrome 10-31: WindowClient.navigate() on a window opened before the worker took control
-    rejects with 'TypeError: This service worker is not the client's active service worker.', which the base worker's
-    catch swallowed, so the laptop tap changed nothing."""
+    rejects with 'TypeError: This service worker is not the client's active service worker.'"""
     got = _run("navigate", "uncontrolled")
     assert got["openedUrl"] == CARD and got["navigated"] == [], got
 
 
 @needs_node
-def test_a_tap_whose_navigate_rejects_opens_the_card() -> None:
+def test_a_navigate_that_rejects_opens_the_card() -> None:
     got = _run("navigate", "reject")
     assert got["openedUrl"] == CARD, got
 
 
 @needs_node
-def test_a_tap_whose_navigate_resolves_null_opens_the_card() -> None:
+def test_a_navigate_that_resolves_null_opens_the_card() -> None:
     got = _run("navigate", "null")
     assert got["navigated"] == [CARD] and got["openedUrl"] == CARD, got
 
 
 @needs_node
-def test_a_cross_origin_url_still_opens_the_root() -> None:
-    got = _run("navigate", "crossorigin")
-    assert got["navigated"] == ["https://box.example/"], got
+def test_a_navigate_that_resolves_at_a_different_url_opens_the_card() -> None:
+    got = _run("navigate", "mismatch")
+    assert got["navigated"] == [CARD] and got["openedUrl"] == CARD, got
+
+
+@needs_node
+def test_a_cross_origin_url_is_sent_as_the_root() -> None:
+    got = _run("navigate", "crossorigin+ack")
+    assert got["asked"] == ["https://box.example/"] and got["navigated"] == [], got
+
+
+@needs_node
+def test_the_page_listener_acks_before_it_assigns_and_ignores_a_cross_origin_url() -> None:
+    cp = subprocess.run([NODE, str(HERE / "_sw_open_rig.js"), str(SW.parent.parent.parent / "templates" / "web" / "sw_open.js")],
+                        capture_output=True, text=True, timeout=60)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    got = json.loads(cp.stdout)
+    assert got["assigned"] == [CARD], got                                  # only the same-origin url moved the page
+    assert got["acks"] == [{"m": {"ok": True}, "assignedSoFar": 0}], got   # and the ack went out before the assign
+    assert got["started"] is True, got
+
+
+def test_every_page_a_window_can_show_loads_the_open_listener() -> None:
+    web = SW.parent.parent.parent / "templates" / "web"
+    for page in ("dashboard.html", "sign.html", "pair.html"):
+        assert '<script src="/sw_open.js"></script>' in (web / page).read_text(encoding="utf-8"), page

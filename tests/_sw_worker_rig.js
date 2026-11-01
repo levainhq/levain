@@ -6,7 +6,7 @@ const vm = require('vm');
 
 const [swPath, scenario, mode] = process.argv.slice(2);
 const listeners = {};
-const log = { fetches: 0, opened: [], posted: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
+const log = { asked: [], fetches: 0, opened: [], posted: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
 let uncontrolled = [];   // windows only matchAll({includeUncontrolled: true}) returns
 
 // --- IndexedDB: databases by name, each with object stores that are Maps ---------------------------------------------
@@ -57,7 +57,7 @@ const caches = {
 // --- clients ---------------------------------------------------------------------------------------------------------
 const windowClient = {
   url: 'https://box.example/', focus: async () => {}, navigate: async () => {},
-  postMessage: (m) => log.posted.push(m),
+  postMessage: (m, tr) => { if (m && m.type === 'levain-open') { log.asked.push(m.url); tr[0].postMessage({ ok: true }); } else log.posted.push(m); },
 };
 const self_ = {
   addEventListener: (type, fn) => { (listeners[type] = listeners[type] || []).push(fn); },
@@ -71,7 +71,7 @@ const self_ = {
   },
 };
 const sandbox = {
-  self: self_, indexedDB, caches, URL, setTimeout, Date, Promise, JSON, String, Array,
+  self: self_, indexedDB, caches, URL, setTimeout, clearTimeout, MessageChannel, Date, Promise, JSON, String, Array,
   fetch: () => { log.fetches += 1; throw new Error('the worker must not call fetch'); },
 };
 vm.createContext(sandbox);
@@ -96,14 +96,18 @@ function fire(type, ev) {
     log.caches = [...cacheNames].sort();
     log.keptOpened = [...(dbs.get('levain-sw-2').stores.get('opened').entries())];
   } else if (scenario === 'navigate') {
-    // mode: controlled | uncontrolled | reject | null | crossorigin ; the window answers as a browser does
-    const win = (nav) => ({ url: 'https://box.example/cockpit', focus: async () => { log.focused += 1; }, navigate: nav, postMessage: () => {} });
-    const ok = async (u) => { log.navigated.push(u); return {}; };
-    if (mode === 'controlled' || mode === 'crossorigin') log.windows = [win(ok)];
-    else if (mode === 'uncontrolled') uncontrolled = [win(async () => { throw new TypeError("This service worker is not the client's active service worker."); })];
-    else if (mode === 'reject') log.windows = [win(async () => { throw new TypeError('navigate refused'); })];
-    else if (mode === 'null') log.windows = [win(async (u) => { log.navigated.push(u); return null; })];
-    const url = mode === 'crossorigin' ? 'https://evil.example/x' : '/sign/9#sign=a&v=1';
+    // mode: <window>[+ack] ; window = controlled | uncontrolled | reject | null | mismatch | crossorigin. "+ack" means the
+    // page runs sw_open.js (acks the worker's levain-open message); without it the page is silent, as an old cached page is.
+    const [kind, ack] = mode.split('+');
+    const post = (m, tr) => { if (m && m.type === 'levain-open') { log.asked.push(m.url); if (ack) tr[0].postMessage({ ok: true }); } else log.posted.push(m); };
+    const win = (nav) => ({ url: 'https://box.example/cockpit', focus: async () => { log.focused += 1; }, navigate: nav, postMessage: post });
+    const ok = async (u) => { log.navigated.push(u); return { url: u }; };
+    if (kind === 'controlled' || kind === 'crossorigin') log.windows = [win(ok)];
+    else if (kind === 'uncontrolled') uncontrolled = [win(async () => { throw new TypeError("This service worker is not the client's active service worker."); })];
+    else if (kind === 'reject') log.windows = [win(async () => { throw new TypeError('navigate refused'); })];
+    else if (kind === 'null') log.windows = [win(async (u) => { log.navigated.push(u); return null; })];
+    else if (kind === 'mismatch') log.windows = [win(async (u) => { log.navigated.push(u); return { url: 'https://box.example/elsewhere' }; })];
+    const url = kind === 'crossorigin' ? 'https://evil.example/x' : '/sign/9#sign=a&v=1';
     await fire('notificationclick', { notification: { close: () => {}, data: { url } } });
   } else if (scenario === 'click') {
     log.windows = [windowClient];

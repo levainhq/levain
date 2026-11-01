@@ -70,6 +70,22 @@ self.addEventListener('push', (e) => {
   }));
 });
 
+// How long a tap waits for the page's ack before the worker's own paths run. Short on purpose: clients.openWindow()
+// needs the click's user-activation window, and a page that has the listener acks within a few ms.
+const OPEN_ACK_MS = 800;
+
+// Ask a window to go to url itself; true only if it acked {ok: true} on the reply port within OPEN_ACK_MS
+function askToOpen(c, url) {
+  return new Promise((resolve) => {
+    let ch;
+    try { ch = new MessageChannel(); } catch (_) { resolve(false); return; }
+    const t = setTimeout(() => done(false), OPEN_ACK_MS);
+    const done = (ok) => { clearTimeout(t); ch.port1.onmessage = null; try { ch.port1.close(); } catch (_) { /* gone */ } resolve(ok); };
+    ch.port1.onmessage = (m) => { if (m.data && m.data.ok === true) done(true); };
+    try { c.postMessage({ type: 'levain-open', url }, [ch.port2]); } catch (_) { done(false); }
+  });
+}
+
 self.addEventListener('notificationclick', (e) => {
   e.notification.close();
   const data = e.notification.data || {};
@@ -79,18 +95,24 @@ self.addEventListener('notificationclick', (e) => {
   if (!u || u.origin !== self.location.origin) u = new URL('/', self.location.origin);
   const url = u.href;
   const opened = (async () => {
-    // navigate() rejects (TypeError) on a window this worker does not control, one opened before it took over or kept
-    // across a hard reload, so only a controlled same-origin window is steered; any other path opens the card itself
-    const ctl = await self.clients.matchAll({ type: 'window' });
-    for (const c of ctl) {
-      if (new URL(c.url).origin !== self.location.origin) continue;
-      // focus() can be refused without user activation; the card still goes to this window
-      try { await c.focus(); } catch (_) { /* navigate anyway */ }
+    const sameOrigin = (c) => { try { return new URL(c.url).origin === self.location.origin; } catch (_) { return false; } };
+    // prefer a window this worker controls, else any same-origin window (an uncontrolled one still hears a message)
+    const ctl = (await self.clients.matchAll({ type: 'window' })).filter(sameOrigin);
+    const pool = ctl.length ? ctl : (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).filter(sameOrigin);
+    const c = pool[0];
+    if (!c) { await self.clients.openWindow(url); return; }
+    // focus() can be refused without user activation; the card still goes to this window
+    try { await c.focus(); } catch (_) { /* ask anyway */ }
+    // the page navigates itself (sw_open.js): WindowClient.navigate rejects on an uncontrolled window and can resolve
+    // without moving a page on iOS WebKit. An ack means the page took it.
+    if (await askToOpen(c, url)) return;
+    // no ack (a page without the listener, e.g. an old cached one): the worker's own paths
+    if (ctl.length) {
       try {
-        // a null from navigate() is a navigation the browser refused: fall through to a new window
-        if (await c.navigate(url)) return;
+        // accepted only if the resolved client is at the target; null or another url is a navigation that did not happen
+        const r = await c.navigate(url);
+        if (r && r.url === url) return;
       } catch (_) { /* fall through to a new window */ }
-      break;
     }
     await self.clients.openWindow(url);
   })();
