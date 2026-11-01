@@ -509,7 +509,8 @@ def check_setter(word: str, by: dict | None, said: str | None) -> str:
 
 
 def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, now: float | None = None,
-             by: dict | None = None, said: str | None = None, match: object = None) -> dict | None:
+             by: dict | None = None, said: str | None = None, match: object = None,
+             via: str | None = None, wait: float | None = None) -> dict | None:
     """Write ``word`` (``duration`` for quiet, loud and remote; ``loud off`` clears a loud). Returns what is on file
     after, ``None`` when no word stands. ``back`` leaves a standing ``loud`` alone and returns it. Raises
     :class:`PresenceError` for an unknown word, a bad duration, or a directory or file that is not safe to write.
@@ -525,9 +526,13 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
 
     The whole call (read the word on file, plan, log row, write, outcome row) runs under one interprocess lock, so a
     word set meanwhile is read, never overwritten. A setter that cannot take the lock is refused; the operator's own
-    word goes through without it."""
-    with _locked(queue_dir, strict=by is not None):
-        return _set_word(queue_dir, word, duration, now, by, said, match)
+    word goes through without it.
+
+    ``via`` names the credential an HTTP write came in on (never its secret); it is recorded on the operator's row.
+    ``wait`` (seconds) is for a caller that must not park a thread behind a stalled lock holder: the lock is then
+    required (a failure to take it refuses the write, :class:`PresenceBusy` past the wait) instead of skipped."""
+    with _locked(queue_dir, strict=by is not None or wait is not None, wait=wait):
+        return _set_word(queue_dir, word, duration, now, by, said, match, via)
 
 
 @contextmanager
@@ -575,10 +580,12 @@ def _locked(queue_dir: Path | str, *, strict: bool, wait: float | None = None):
 
 
 def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float | None, by: dict | None,
-              said: str | None, match: object) -> dict | None:
+              said: str | None, match: object, via: str | None = None) -> dict | None:
     ts = time.time() if now is None else now
     prior = read_word(queue_dir)
     row = _log_row(ts, word, duration, by, said, prior)
+    if via:
+        row["via"] = _clean(via, _FIELD_MAX)
     ev = _evidence(match) if by is not None else None
     if ev is not None:
         row["verified"] = ev[0]

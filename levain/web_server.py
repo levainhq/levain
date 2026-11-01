@@ -1157,9 +1157,11 @@ _POLICY_PATH = "/webpush/policy"            # NP S2: the operator's notification
 _POLICY_LOCK_WAIT_SECS = 3.0              # how long an HTTP policy write waits for the presence lock
 _POLICY_SET = "/webpush/policy/set"
 _POLICY_RESET = "/webpush/policy/reset"
-_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH})
+_PRESENCE_PATH = "/webpush/presence"        # the operator's presence word, shown and set from one place
+_PRESENCE_SET = "/webpush/presence/set"
+_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH})
 _PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
-                        _POLICY_SET, _POLICY_RESET})
+                        _POLICY_SET, _POLICY_RESET, _PRESENCE_SET})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
 _PUSH_TEST = "/webpush/test"
 _PUSH_PREFIX = "/webpush/"
@@ -2232,6 +2234,11 @@ class _Handler(GuardedHandler):
                                status=200, head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)],
                                cache_control="private, no-store")
                     return
+                if path == _PRESENCE_PATH:
+                    self._send(json.dumps(self._presence_view(queue)).encode("utf-8"), "application/json; charset=utf-8",
+                               status=200, head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)],
+                               cache_control="private, no-store")
+                    return
                 got = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=True,
                                          device_id=str(self._credential()["name"]))
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
@@ -2252,6 +2259,8 @@ class _Handler(GuardedHandler):
         other credential pairs this browser first (:meth:`_pair_and_subscribe`)."""
         if route in (_POLICY_SET, _POLICY_RESET):
             return self._policy_post(route, raw)
+        if route == _PRESENCE_SET:
+            return self._presence_post(raw)
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
             return self._pair_and_subscribe(raw, name)
@@ -2289,6 +2298,43 @@ class _Handler(GuardedHandler):
         except presence.PresenceError as exc:
             return {"error": "policy_refused", "message": str(exc)}, 422
         return presence.policy_view(queue), 200
+
+    def _presence_view(self, queue: Path) -> "dict[str, Any]":
+        """The presence word as the cockpit and a tap shortcut read it: the standing word's name and end (None for
+        each when no word stands, or it has ended), and the words of ``presence.describe``."""
+        from levain.webpush import presence
+
+        rec = presence.read_word(queue)
+        now = time.time()
+        if rec is not None and presence.is_expired(rec, now):
+            rec = None
+        return {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
+                "text": presence.describe(queue)}
+
+    def _presence_post(self, raw: bytes) -> "tuple[dict[str, Any], int]":
+        """``POST /webpush/presence/set {word, for?}``: the operator's own word (``by=None``), reached only past the push
+        family's gate. ``for`` is the duration text of a timed word (``loud`` takes ``off``). A refusal is a 422 with its
+        words, a lock held past the bounded wait a 503; the reply is the view after. The row names the credential
+        (``via``), never the secret."""
+        from levain.webpush import presence
+
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {"error": "bad_json", "message": "body is not valid JSON"}, 400
+        if (not isinstance(req, dict) or not set(req) <= {"word", "for"} or not isinstance(req.get("word"), str)
+                or not isinstance(req.get("for", ""), str)):
+            return {"error": "bad_request", "message": "send word as text, and for (a duration) as text if the word is timed"}, 400
+        queue = self.server.signer.queue_dir
+        via = str(self._credential()["name"])
+        try:
+            presence.set_word(queue, req["word"], duration=req.get("for") or None, by=None, via=via,
+                              wait=_POLICY_LOCK_WAIT_SECS)
+        except presence.PresenceBusy:
+            return {"error": "presence_busy", "message": "the presence word is busy right now; nothing was changed, try again"}, 503
+        except presence.PresenceError as exc:
+            return {"error": "presence_refused", "message": str(exc)}, 422
+        return self._presence_view(queue), 200
 
     def _push_test(self, name: str) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/test``: a test ping to the CALLER's own subscriptions and no other device's, sent inside the
