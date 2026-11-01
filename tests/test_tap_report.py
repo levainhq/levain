@@ -156,3 +156,25 @@ def test_the_trace_is_reported_once_per_new_head_and_again_after_a_refusal(tmp_p
     assert int(v[7]) == 4, v
     post = json.loads(v[8])
     assert post["tok"] == "TKN" and [e["step"] for e in post["body"]["entries"] if e["step"] in ("s0", "s1", "s2")] == ["s0", "s1", "s2"], post   # the page's own steps ride along
+
+
+@needs_browser
+def test_a_persistently_refused_report_retries_twice_and_a_new_call_starts_a_fresh_allowance(tmp_path, monkeypatch) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src) as (port, _h):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/", [
+            {"until": "window.levainTraceReport && performance.now() > 3500", "ms": 15000},
+            {"eval": "(async () => { localStorage.removeItem('levain_trace_sent'); localStorage.setItem('levain_write_token', 'TKN');"
+                     " window.__posts = 0; const f = window.fetch.bind(window);"
+                     " window.fetch = (u, o) => { if (String(u) !== '/webpush/trace') return f(u, o);"
+                     "   window.__posts += 1; return Promise.resolve(new Response('{}', { status: 503 })); };"
+                     " const st = window.setTimeout.bind(window);"
+                     " window.setTimeout = (fn, ms, ...a) => st(fn, ms >= 20000 ? 5 : ms, ...a);"       # the 20 s and 40 s waits run at once
+                     " const c = await caches.open('levain-trace');"
+                     " await c.put('/__levain_trace/9999999999999-y000', new Response(JSON.stringify({ t: 5, src: 'sw', step: 'r' })));"
+                     " await window.levainTraceReport(); await new Promise((ok) => st(ok, 600)); return window.__posts; })()"},
+            {"eval": "window.levainTraceReport().then(() => new Promise((ok) => setTimeout(ok, 600))).then(() => window.__posts)"},
+        ])
+    v = out["values"]
+    assert int(v[1]) == 3, v            # the first post and exactly two retries: the count is not reset by its own retry
+    assert int(v[2]) == 6, v            # a call of its own starts a fresh allowance: one post and two more retries

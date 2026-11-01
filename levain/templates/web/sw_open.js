@@ -135,8 +135,8 @@
   // moved back) and no count can hide a new step. An answer that is not a settle (a refused key, 429, 5xx, no network) tries
   // again, at most RETRIES more times in a row, 20 s and then 40 s after (a settle resets the count).
   const SENT_KEY = "levain_trace_sent", BODY_MAX = 7600, RETRIES = 2;   // bytes: the push family's body cap is 8192
-  let reporting = false, retried = 0, retryPending = false;
-  async function reportTrace() {
+  let reporting = false, retried = 0;
+  async function reportTrace(isRetry) {
     let key = "";
     try { key = window.localStorage.getItem("levain_write_token") || ""; } catch (_) { /* no storage: no key */ }
     if (reporting || !key || !haveCache) return;
@@ -156,7 +156,7 @@
       let sent = "";
       try { sent = window.localStorage.getItem(SENT_KEY) || ""; } catch (_) { /* none */ }
       if (sig === sent) return;
-      if (!retryPending) retried = 0;   // new content that is not itself a retry starts its own allowance
+      if (isRetry !== true) retried = 0;   // a call that is not a scheduled retry starts its own allowance
       let keep = got.map((x) => x.e);
       const bodyOf = () => JSON.stringify({ page: location.pathname.slice(0, 100), entries: keep });
       while (keep.length > 1 && new TextEncoder().encode(bodyOf()).length > BODY_MAX) keep = keep.slice(1);   // drop the oldest
@@ -170,7 +170,7 @@
       if (settled) { retried = 0; try { window.localStorage.setItem(SENT_KEY, sig); } catch (_) { /* resent next time */ } }
     } catch (_) { /* best effort: a report never reaches the page */ } finally {
       reporting = false;
-      if (!settled && retried < RETRIES) { retried += 1; retryPending = true; setTimeout(() => { retryPending = false; reportTrace(); }, 20000 * retried); }
+      if (!settled && retried < RETRIES) { retried += 1; setTimeout(() => reportTrace(true), 20000 * retried); }
     }
   }
   window.levainTraceReport = reportTrace;
