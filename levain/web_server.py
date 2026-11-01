@@ -1159,9 +1159,14 @@ _POLICY_SET = "/webpush/policy/set"
 _POLICY_RESET = "/webpush/policy/reset"
 _PRESENCE_PATH = "/webpush/presence"        # the operator's presence word, shown and set from one place
 _PRESENCE_SET = "/webpush/presence/set"
+_PRESENCE_TOKEN_NEW = "/webpush/presence/token/new"       # full credential only: mints a tap token
+_PRESENCE_TOKEN_REVOKE = "/webpush/presence/token/revoke"
+# The ONLY two routes a presence (tap) token reaches; every other route reads it as no credential at all.
+_PRESENCE_TOKEN_ROUTES = frozenset({_PRESENCE_PATH, _PRESENCE_SET})
+_PRESENCE_TOKEN_HEADER = "X-Levain-Presence-Token"
 _PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH})
 _PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
-                        _POLICY_SET, _POLICY_RESET, _PRESENCE_SET})
+                        _POLICY_SET, _POLICY_RESET, _PRESENCE_SET, _PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
 _PUSH_TEST = "/webpush/test"
 _PUSH_PREFIX = "/webpush/"
@@ -1700,6 +1705,8 @@ class _Handler(GuardedHandler):
     server_version = "levain-serve"
     server: _LevainHTTPServer  # narrow the type for typed attribute access
     _credential_cache: Any = _UNSET
+    _presence_cache: Any = _UNSET   # reset per request in handle_one_request
+    _post_headers: "list[tuple[str, str]]" = []   # extra headers for a push POST's JSON reply (never mutated in place)
     _pair_epoch_seen = 0       # the revocation epoch read just before this request's paired lookup (RU-3)
     # (Content-Security-Policy, X-Frame-Options) in place of http_guards' for this one response (send_header), else None
     _frame_headers: "tuple[str, str] | None" = None
@@ -1750,6 +1757,8 @@ class _Handler(GuardedHandler):
         connection closed (RU-2: like every refusal sent before a body is read). The body never says "token": the
         dashboard's token-drop paths match that word."""
         self._credential_cache = _UNSET
+        self._presence_cache = _UNSET
+        self._post_headers = []
         try:
             super().handle_one_request()
         except _CredentialUnavailable:
@@ -1940,6 +1949,36 @@ class _Handler(GuardedHandler):
     def _writes_need_credential(self) -> bool:
         """K2a: a writable surface needs a credential on every write, on every bind."""
         return self.server.levain_source.write_scope is not None
+
+    def _presence_credential(self) -> "dict[str, Any] | None":
+        """The tap token this request carries, resolved ONCE per request (cached beside ``_credential``, reset at the
+        same place) and by no other code: ``{"class": "presence", "name": "presence:<name>", "words": [...]}``, or None
+        for no header, an unknown or revoked token, or a server with no Signer queue. Deliberately NOT a class of
+        ``_credential``: every consumer of that (the write gate, the broker, the pairing routes) then keeps seeing a
+        presence token as no credential, with nothing to remember to refuse. The header is read here only, never from a
+        URL or a body, and is never written to a response or a log."""
+        cached = self._presence_cache
+        if cached is not _UNSET:
+            return cached
+        got = None
+        raw = self.headers.get(_PRESENCE_TOKEN_HEADER, "")
+        signer = self.server.signer
+        if raw and signer is not None and len(raw) <= 128 and _HEADER_SAFE_TOKEN.fullmatch(raw):
+            from levain.webpush import presence_tokens
+
+            rec = presence_tokens.verify(signer.queue_dir, raw)
+            if rec is not None:
+                got = {"class": "presence", "name": "presence:" + rec["name"], "token_name": rec["name"],
+                       "words": list(rec["words"])}
+        self._presence_cache = got
+        return got
+
+    def _push_gate_ok(self, route: str) -> bool:
+        """The push family's credential check: a full credential (``_off_box_token_valid``), or, on the two presence
+        routes alone, a tap token. The one place a tap token is let through."""
+        if self._off_box_token_valid():
+            return True
+        return route in _PRESENCE_TOKEN_ROUTES and self._presence_credential() is not None
 
     def _off_box_token_valid(self) -> bool:
         """True iff the request carries any surface's token (``_credential``). The SINGLE compare
@@ -2192,7 +2231,7 @@ class _Handler(GuardedHandler):
         self._send_framing((_SHEET_CSP, "SAMEORIGIN"), self.server.levain_assets[_SHEET_PAGE], "text/html; charset=utf-8",
                            head=head)
 
-    def _sign_read_admitted(self, *, head: bool, what: str) -> bool:
+    def _sign_read_admitted(self, *, head: bool, what: str, route: str = "") -> bool:
         """The sign reads' gate past ``_route`` (the sign listing's and the grant listing's, one code path): same-origin
         only (``Sec-Fetch-Site`` absent or ``same-origin``), a surface token on every bind, then the request gate,
         which True leaves HELD for the caller to release. False: the refusal was sent."""
@@ -2202,7 +2241,7 @@ class _Handler(GuardedHandler):
                        "application/json; charset=utf-8", status=403, head=head, headers=hdrs,
                        cache_control="private, no-store")
             return False
-        if not self._off_box_token_valid():
+        if not (self._push_gate_ok(route) if route in _PRESENCE_TOKEN_ROUTES else self._off_box_token_valid()):
             self._gated_read_403(f"{what} need", head=head)
             return False
         if not self.server.request_gate.acquire(blocking=False):
@@ -2222,7 +2261,7 @@ class _Handler(GuardedHandler):
                                                      device_id=None) or (404, b"not found\n", "text/plain")
             self._send(body, ctype, status=status, head=head)
             return
-        if not self._sign_read_admitted(head=head, what="push reads"):
+        if not self._sign_read_admitted(head=head, what="push reads", route=path):
             return
         queue = self.server.signer.queue_dir
         try:
@@ -2236,7 +2275,8 @@ class _Handler(GuardedHandler):
                     return
                 if path == _PRESENCE_PATH:
                     self._send(json.dumps(self._presence_view(queue)).encode("utf-8"), "application/json; charset=utf-8",
-                               status=200, head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)],
+                               status=200, head=head,
+                               headers=[("Vary", f"{_WRITE_TOKEN_HEADER}, {_PRESENCE_TOKEN_HEADER}")],
                                cache_control="private, no-store")
                     return
                 got = push_routes.handle("GET", path, {}, b"", queue_dir=queue, authorized=True,
@@ -2261,6 +2301,8 @@ class _Handler(GuardedHandler):
             return self._policy_post(route, raw)
         if route == _PRESENCE_SET:
             return self._presence_post(raw)
+        if route in (_PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE):
+            return self._presence_token_post(route, raw)
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
             return self._pair_and_subscribe(raw, name)
@@ -2308,8 +2350,16 @@ class _Handler(GuardedHandler):
         now = time.time()
         if rec is not None and presence.is_expired(rec, now):
             rec = None
-        return {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
+        view = {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
                 "text": presence.describe(queue)}
+        if self._credential_is_full():     # a tap token's holder is told the word, never the list of other taps
+            from levain.webpush import presence_tokens
+
+            view["tokens"] = presence_tokens.list_public(queue)
+        return view
+
+    def _credential_is_full(self) -> bool:
+        return self._credential(required=True)["class"] == "token"
 
     def _presence_post(self, raw: bytes) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/presence/set {word, for?}``: the operator's own word (``by=None``), reached only past the push
@@ -2326,7 +2376,17 @@ class _Handler(GuardedHandler):
                 or not isinstance(req.get("for", ""), str)):
             return {"error": "bad_request", "message": "send word as text, and for (a duration) as text if the word is timed"}, 400
         queue = self.server.signer.queue_dir
-        via = str(self._credential()["name"])
+        tap = None if self._credential_is_full() else self._presence_credential()
+        if tap is not None:        # a tap token: only its own words, and only so fast (the counter is this server's)
+            if req["word"] in presence.WORDS and req["word"] not in tap["words"]:
+                allowed = ", ".join(tap["words"])
+                return {"error": "word_not_allowed",
+                        "message": f"this tap token may set only: {allowed}"}, 403
+            wait = self.server.presence_rate.hit(tap["name"])
+            if wait:
+                self._post_headers = [("Retry-After", str(int(wait) + 1))]
+                return {"error": "rate_limited", "message": "too many taps; try again in a minute"}, 429
+        via = tap["name"] if tap is not None else str(self._credential()["name"])
         try:
             presence.set_word(queue, req["word"], duration=req.get("for") or None, by=None, via=via,
                               wait=_POLICY_LOCK_WAIT_SECS)
@@ -2334,7 +2394,39 @@ class _Handler(GuardedHandler):
             return {"error": "presence_busy", "message": "the presence word is busy right now; nothing was changed, try again"}, 503
         except presence.PresenceError as exc:
             return {"error": "presence_refused", "message": str(exc)}, 422
+        if tap is not None:
+            from levain.webpush import presence_tokens
+
+            presence_tokens.touch(queue, tap["token_name"])
         return self._presence_view(queue), 200
+
+    def _presence_token_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":
+        """``POST /webpush/presence/token/new {name, words?}`` / ``/revoke {name}``: full credential only (the push gate
+        let a tap token through on the two presence routes alone). The new token is in THIS reply and nowhere else."""
+        from levain.webpush import presence, presence_tokens
+
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {"error": "bad_json", "message": "body is not valid JSON"}, 400
+        new = route == _PRESENCE_TOKEN_NEW
+        keys = {"name", "words"} if new else {"name"}
+        if (not isinstance(req, dict) or not {"name"} <= set(req) <= keys or not isinstance(req["name"], str)
+                or ("words" in req and (not isinstance(req["words"], list)
+                                        or not all(isinstance(w, str) for w in req["words"])))):
+            return {"error": "bad_request", "message": "send name as text" + (", and words as a list of words" if new else "")}, 400
+        queue = self.server.signer.queue_dir
+        try:
+            if new:
+                rec, token = presence_tokens.create(queue, req["name"], req.get("words"))
+                return {"token": token, "record": rec, "tokens": presence_tokens.list_public(queue)}, 200
+            if not presence_tokens.revoke(queue, req["name"]):
+                return {"error": "not_found", "message": "no live tap token has that name"}, 404
+        except presence.PresenceBusy:
+            return {"error": "presence_busy", "message": "the tap tokens are busy right now; nothing was changed, try again"}, 503
+        except presence.PresenceError as exc:
+            return {"error": "presence_refused", "message": str(exc)}, 422
+        return {"tokens": presence_tokens.list_public(queue)}, 200
 
     def _push_test(self, name: str) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/test``: a test ping to the CALLER's own subscriptions and no other device's, sent inside the
@@ -3541,10 +3633,13 @@ class _Handler(GuardedHandler):
         key_line = route == _KEY_LINE_ROUTE and self.server.signer is not None
         # and web push (OS-4): a token on every bind
         push = route in _PUSH_POST and self.server.signer is not None
-        if (sign is not None or compose or grant is not None or consent is not None or dispatch is not None
-                or coord is not None or push or key_line) and not self._off_box_token_valid():
+        if push:
+            if not self._push_gate_ok(route):
+                return self._token_403("credential_required")
+        elif (sign is not None or compose or grant is not None or consent is not None or dispatch is not None
+                or coord is not None or key_line) and not self._off_box_token_valid():
             return self._token_403("credential_required")
-        if self._write_token_required() and not self._off_box_token_valid():
+        if self._write_token_required() and not (self._push_gate_ok(route) if push else self._off_box_token_valid()):
             return self._token_403("forbidden")
         # CSRF layer 2: require application/json (a cross-origin page cannot send it
         # without a CORS preflight this server never answers).
@@ -3616,6 +3711,9 @@ class _Handler(GuardedHandler):
                     out, status = {"error": "internal", "message": type(exc).__name__}, 500
                 if isinstance(out, bytes):
                     self._send(out, "application/json; charset=utf-8", status=status)
+                elif self._post_headers:
+                    self._send(json.dumps(out).encode("utf-8"), "application/json; charset=utf-8", status=status,
+                               headers=self._post_headers, cache_control="private, no-store")
                 else:
                     self._send_json(out, status)
                 return
@@ -4345,6 +4443,9 @@ def make_server(
     # Bound the expensive routes (store read + writes). Cockpit GET reads wait briefly for a read-pool slot (see
     # _acquire_read_slot) and leave _RESERVED_SLOTS free; every other gated route answers 503 past the cap.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
+    from levain.webpush.presence_tokens import RateLimit as _PresenceRate
+
+    httpd.presence_rate = _PresenceRate()     # tap-token writes per minute, counted in this process
     httpd.read_gate = threading.BoundedSemaphore(max(1, _MAX_INFLIGHT - _RESERVED_SLOTS))
     httpd.read_waiters = 0
     httpd.read_waiters_lock = threading.Lock()

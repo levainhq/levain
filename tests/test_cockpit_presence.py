@@ -140,3 +140,171 @@ def test_a_quiet_word_set_here_does_not_stop_an_urgent_consent_ping(rig):
     now = time.time()
     assert presence.decide(now, word, 99999.0, urgent=True).push is True
     assert presence.decide(now, word, 99999.0, urgent=False).push is False
+
+
+# ---- tap tokens: the purpose-bound credential ------------------------------------------------------------------------
+
+import logging
+
+from levain.webpush import presence_tokens
+
+TAP = "X-Levain-Presence-Token"
+NEW = "/webpush/presence/token/new"
+REVOKE = "/webpush/presence/token/revoke"
+
+
+def _mint(port, name="door", words=None):
+    body = {"name": name} if words is None else {"name": name, "words": words}
+    st, got, _ = _call(port, "POST", NEW, body, token=T)
+    assert st == 200, got
+    return got["token"], got
+
+
+def _tap(tok):
+    return {TAP: tok}
+
+
+def test_a_tap_token_is_minted_once_and_stored_only_as_a_hash(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok, got = _mint(port)
+        assert got["record"]["name"] == "door" and got["record"]["words"] == ["away", "back", "quiet", "remote"]
+        assert "sha256" not in json.dumps(got)
+        f = q / "webpush" / presence_tokens.FILE_NAME
+        assert (f.stat().st_mode & 0o777) == 0o600
+        assert tok not in f.read_text() and presence_tokens._hash(tok) in f.read_text()
+        # the secret is in no later body: the list, the view, a set, a refusal
+        bodies = [_call(port, "GET", GET, token=T)[1], _call(port, "POST", SET, {"word": "away"}, headers=_tap(tok))[1],
+                  _call(port, "POST", SET, {"word": "sleep"}, headers=_tap(tok))[1],
+                  _call(port, "POST", REVOKE, {"name": "door"}, token=T)[1],
+                  _call(port, "POST", SET, {"word": "away"}, headers=_tap(tok))[1]]
+        assert all(tok not in json.dumps(b) for b in bodies)
+        assert _call(port, "GET", GET, token=T)[1]["tokens"] == []
+
+
+def test_a_tap_token_reads_and_sets_the_word_and_the_row_names_it(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok, _ = _mint(port)
+        st, got, hdrs = _call(port, "POST", SET, {"word": "quiet", "for": "15m"}, headers=_tap(tok))
+        assert st == 200 and got["word"] == "quiet" and "tokens" not in got
+        assert tok not in hdrs.get("vary", "") and tok not in json.dumps(hdrs)
+        st, got, _ = _call(port, "GET", GET, headers=_tap(tok))
+        assert st == 200 and got["word"] == "quiet" and "tokens" not in got
+        log = (q / "webpush" / presence.LOG_NAME).read_text()
+        assert json.loads(log.splitlines()[-1])["via"] == "presence:door" and tok not in log
+        assert presence_tokens.list_public(q)[0]["last_used"] is not None
+        assert "tokens" in _call(port, "GET", GET, token=T)[1]
+
+
+def test_the_allow_list_is_enforced_and_names_the_allowed_words(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok, _ = _mint(port)
+        for w in ("sleep", "loud"):
+            st, got, _ = _call(port, "POST", SET, {"word": w}, headers=_tap(tok))
+            assert st == 403 and "away, back, quiet, remote" in got["message"], got
+        assert presence.read_word(q) is None
+        wide, _ = _mint(port, "bed", ["sleep", "loud"])
+        assert _call(port, "POST", SET, {"word": "sleep"}, headers=_tap(wide))[0] == 200
+        assert _call(port, "POST", SET, {"word": "away"}, headers=_tap(wide))[0] == 403
+
+
+def test_a_revoked_or_unknown_tap_token_is_refused(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok, _ = _mint(port)
+        assert _call(port, "POST", REVOKE, {"name": "door"}, token=T)[0] == 200
+        for t in (tok, "nope", "x" * 300):
+            assert _call(port, "POST", SET, {"word": "away"}, headers=_tap(t))[0] == 403
+            assert _call(port, "GET", GET, headers=_tap(t))[0] == 403
+        assert _call(port, "POST", REVOKE, {"name": "door"}, token=T)[0] == 404
+        assert presence.read_word(q) is None
+
+
+def test_a_tap_token_reaches_nothing_else(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok, _ = _mint(port)
+        h = _tap(tok)
+        # a write route, a read route, chat, the policy routes, the token routes, the other push routes
+        for method, path, body in (("POST", "/edit", {"x": 1}), ("POST", "/action", {"x": 1}),
+                                   ("GET", "/cockpit/manifest.json", None), ("GET", "/cockpit/sign.json", None),
+                                   ("POST", "/chat", {"x": 1}), ("GET", "/chat.json", None),
+                                   ("GET", "/webpush/policy", None), ("POST", "/webpush/policy/set",
+                                                                      {"mute": "sleep", "class": "approval", "value": "push"}),
+                                   ("POST", "/webpush/policy/reset", {}), ("POST", NEW, {"name": "evil"}),
+                                   ("POST", REVOKE, {"name": "door"}), ("GET", "/webpush/key", None),
+                                   ("POST", "/webpush/subscribe", {"x": 1}), ("POST", "/webpush/test", {}),
+                                   ("POST", "/cockpit/pair/offer", {"label": "x"}), ("GET", "/cockpit/pair/list", None)):
+            for hdrs in (h, {**h, **PROXY}):
+                st, got, _ = _call(port, method, path, body, headers=hdrs)
+                miss, miss_got, _ = _call(port, method, path, body, headers={k: v for k, v in hdrs.items() if k != TAP})
+                assert st == miss, (method, path, st, miss)         # exactly as a missing credential answers
+                if method == "POST" or "X-Forwarded-For" in hdrs or hdrs is not h:
+                    assert st in (403, 404), (method, path, st)     # (a plain loopback read is token-free, same as with none)
+        assert presence.policy_view(q)["status_kind"] == "default"
+        assert [r["name"] for r in presence_tokens.list_public(q)] == ["door"]
+
+
+def test_a_tap_token_in_the_url_or_body_is_not_a_credential(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok, _ = _mint(port)
+        assert _call(port, "GET", f"{GET}?token={tok}")[0] == 403
+        assert _call(port, "POST", SET, {"word": "away", "token": tok})[0] == 403
+        assert _call(port, "POST", f"{SET}?presence_token={tok}", {"word": "away"})[0] == 403
+        assert presence.read_word(q) is None
+
+
+def test_the_full_credential_wins_and_a_tap_token_cannot_mint(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok, _ = _mint(port)
+        # both headers: the full credential's authority applies (sleep is not on the tap's list)
+        assert _call(port, "POST", SET, {"word": "sleep"}, token=T, headers=_tap(tok))[0] == 200
+        assert _call(port, "POST", NEW, {"name": "x"}, headers=_tap(tok))[0] == 403
+
+
+@pytest.mark.parametrize("body", [{}, {"name": 1}, {"name": "ok", "x": 1}, {"name": "ok", "words": "away"},
+                                  {"name": "ok", "words": ["flying"]}, {"name": ""}, {"name": "a/b"}, {"name": "x" * 41},
+                                  {"name": "ok", "words": []}])
+def test_a_bad_mint_is_refused(rig, body):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        assert _call(port, "POST", NEW, body, token=T)[0] in (400, 422)
+        assert presence_tokens.list_public(q) == []
+
+
+def test_a_duplicate_live_name_is_refused(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        _mint(port)
+        assert _call(port, "POST", NEW, {"name": "door"}, token=T)[0] == 422
+
+
+def test_the_rate_limit_is_429_with_retry_after(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        tok, _ = _mint(port)
+        other, _ = _mint(port, "other")
+        for _i in range(10):
+            assert _call(port, "POST", SET, {"word": "away"}, headers=_tap(tok))[0] == 200
+        st, got, hdrs = _call(port, "POST", SET, {"word": "away"}, headers=_tap(tok))
+        assert st == 429 and int(hdrs["retry-after"]) >= 1
+        assert _call(port, "POST", SET, {"word": "away"}, headers=_tap(other))[0] == 200   # per token
+        assert _call(port, "POST", SET, {"word": "away"}, token=T)[0] == 200               # not the full credential
+
+
+def test_no_log_line_carries_a_tap_token(rig, caplog, capfd, monkeypatch):
+    monkeypatch.setenv("LEVAIN_SERVE_VERBOSE", "1")
+    src, q = rig
+    caplog.set_level(logging.DEBUG)
+    with _signed(src, q) as (port, _):
+        tok, _ = _mint(port)
+        _call(port, "POST", SET, {"word": "away"}, headers=_tap(tok))
+        _call(port, "GET", GET, headers=_tap(tok))
+        _call(port, "POST", SET, {"word": "sleep"}, headers=_tap(tok))
+        _call(port, "POST", "/edit", {}, headers=_tap(tok))
+    out = capfd.readouterr()
+    assert tok not in caplog.text and tok not in out.out and tok not in out.err
