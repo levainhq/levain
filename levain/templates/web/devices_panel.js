@@ -660,7 +660,7 @@
                            devices: "pushed to your phone and cockpit even while you are active" };
   let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prBtns = {}, prRouteBtns = {}, prDurBtns = {}, prRoute = null,
       prEndLoud = null, prSheetNote = null, prLink = null, prDur = "1h", prSetSec = null, prTapList = null, prNote = null,
-      prNew = null, prName = null, prChecks = {}, prBusy = false, prGen = 0, prGone = false, prRefused = "", prCur = null;
+      prNew = null, prName = null, prChecks = {}, prBusy = false, prGen = 0, prReadId = 0, prGone = false, prRefused = "", prCur = null;
 
   function loadDur() {
     try {
@@ -727,12 +727,13 @@
       const b = el("button", "pr-big pr-dur", label);
       b.type = "button";
       b.dataset.for = v;
-      if (!v) b.title = "Desk pings stay on until you are back; Quiet, Sleep, Loud, Remote and Devices end after " + PR_CAP + " at most";
       b.addEventListener("click", () => { prDur = v; saveDur(v); paintDur(); });
       prDurBtns[v] = b; dseg.appendChild(b);
     }
     dr.appendChild(dseg);
     prSheet.appendChild(dr);
+    // visible on a phone, where a tooltip never shows: what "Until back" does for the words that cannot stand forever
+    prSheet.appendChild(el("p", "pr-sheet-route", "Until back: Desk stays as set; Quiet, Sleep, Loud, Remote and Devices end after " + PR_CAP + " at most."));
     paintDur();
     prEndLoud = el("button", "pr-big pr-endloud", "End Loud");
     prEndLoud.type = "button"; prEndLoud.hidden = true;
@@ -916,10 +917,10 @@
     if (prGone) return;
     const tok = token();
     if (!tok || tok === prRefused) { prShow(false); return; }
-    const startedAt = prGen;
+    const startedAt = prGen, mine = ++prReadId;   // only the newest read paints: a slow older one never overwrites it
     try {
       const res = await api("GET", "/webpush/presence", undefined, READ_TIMEOUT_MS);
-      if (startedAt !== prGen) return;
+      if (startedAt !== prGen || mine !== prReadId) return;
       if (res.status === 200 && res.data && "word" in res.data) paintPresence(res.data);
       else if (res.status === 404) { prShow(false); prGone = true; }
       else if (res.status === 403) { prShow(false); prRefused = tok; }
