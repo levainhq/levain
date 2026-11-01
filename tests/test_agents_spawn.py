@@ -852,9 +852,13 @@ def _record_unreadable(*_a, **_k):
     raise door.RecordUnreadable("the coordinator record is half written")
 
 
+def _io_error(*_a, **_k):
+    raise OSError(5, "Input/output error")
+
+
 @pytest.mark.parametrize("where, broken", [
-    ("door", _record_unreadable), ("door", lambda *_a, **_k: (_ for _ in ()).throw(OSError("EIO"))),
-    ("drop", _coord_error), ("drop", _locked), ("thread", _locked)])
+    ("door", _record_unreadable), ("door", _io_error),
+    ("drop", _io_error), ("drop", _locked), ("thread", _locked)])
 def test_a_transient_refusal_leaves_a_spawned_worker_pending(store, fake, live_hook, wdir, spawn, monkeypatch,
                                                             where, broken):  # noqa: F811
     _d, t = a_thread(store)
@@ -873,6 +877,23 @@ def test_a_transient_refusal_leaves_a_spawned_worker_pending(store, fake, live_h
         assert any(f"launch {ln.launch_id}" in x and "left pending" in x for x in lines), lines
         assert fake.spawns() == []
     assert cl.launch_session(store, ln.launch_id).started      # the cause passed: the next start goes ahead
+
+
+@pytest.mark.parametrize("where", ["drop", "thread"])
+def test_a_coord_error_building_the_context_is_permanent(store, fake, live_hook, wdir, spawn, where):  # noqa: F811
+    # an unknown id or a malformed thread is no read that failed just now: retrying cannot help, so the launch is
+    # written failed and stops holding a spawn slot
+    _d, t = a_thread(store)
+    ln = spawn(store, store.coord_take(), t.thread_id, wdir)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(store, where, _coord_error)
+        with pytest.raises(inst.SpawnRefused) as got:
+            inst.worker_context(store, ln)
+        assert not got.value.transient
+        why = cl.worker_refusal(ln, store)
+        assert why is not None and not why.transient, why
+        assert not cl.launch_session(store, ln.launch_id).started
+    assert store.launch(ln.launch_id).state == "failed" and fake.spawns() == []
 
 
 def test_a_permanent_refusal_carries_its_class(store, fake, live_hook, wdir, spawn):  # noqa: F811

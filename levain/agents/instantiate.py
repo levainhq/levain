@@ -233,8 +233,9 @@ def worker_context(store: Any, launch: Any) -> WorkerContext:
     """The context of spawned-worker launch ``launch``, from its stored record (scope, envelope, drop) and the thread's
     title and drops. Anything that cannot be built (no record, a record that does not verify, no single thread, a
     thread that is not open work holding the record's drop) is a :class:`SpawnRefused`, so a launcher refuses it before
-    its spawn claim. A store that could not be read (a :class:`CoordError` from a read, an SQLite error such as a
-    locked database) is a TRANSIENT refusal: nothing about the launch is wrong, so it may start on a later pass."""
+    its spawn claim. A store that could not be read (an SQLite error such as a locked database, or an I/O error) is a
+    TRANSIENT refusal: nothing about the launch is wrong, so it may start on a later pass. A :class:`CoordError` (an
+    unknown id, a malformed thread) is permanent: no later pass reads it differently."""
     if not getattr(launch, "role_ref", None):
         raise SpawnRefused(f"launch {launch.launch_id} carries no spawned role")
     record = verified_record(launch.role_ref)
@@ -259,10 +260,10 @@ def worker_context(store: Any, launch: Any) -> WorkerContext:
         drops = [(record["drop_id"], store.drop(record["drop_id"]).words), *((d.drop_id, d.words) for d in kept)]
     except SpawnRefused:
         raise
-    except (CoordError, sqlite3.Error) as exc:
+    except (sqlite3.Error, OSError) as exc:
         raise SpawnRefused(f"the store could not be read for the worker's brief ({type(exc).__name__}: "
                            f"{str(exc)[:200]})", transient=True) from None
-    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+    except (CoordError, KeyError, TypeError, ValueError, AttributeError) as exc:
         raise SpawnRefused(f"the worker's brief cannot be built ({type(exc).__name__}: {str(exc)[:200]})") from None
     return WorkerContext(record, rendered, spec, copy.deepcopy(record["scope"]), record["envelope_id"],
                          record["drop_id"], thread, drops, unbriefed)
