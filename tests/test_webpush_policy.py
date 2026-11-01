@@ -278,3 +278,44 @@ def test_status_mentions_the_policy_only_when_it_is_not_the_default(tmp_path):
     assert "notification policy" in line and "In sleep: approvals and attention items reach you" in line
     _write(tmp_path, "{bad")
     assert "malformed" in presence.describe(tmp_path, now=NOW, idle=lambda: ACTIVE)
+
+
+def _no_lock(monkeypatch):
+    import fcntl
+
+    def boom(fd, op):
+        raise OSError("lock unavailable")
+    monkeypatch.setattr(fcntl, "flock", boom)
+
+
+def test_policy_set_and_reset_fail_when_the_lock_cannot_be_taken(tmp_path, monkeypatch, capsys):
+    presence.set_policy(tmp_path, "sleep", "approval", "push", now=NOW)
+    before = (tmp_path / "webpush" / "policy.json").read_bytes()
+    _no_lock(monkeypatch)
+    with pytest.raises(presence.PresenceError, match="presence lock not taken"):
+        presence.set_policy(tmp_path, "quiet", "other", "push", now=NOW)
+    with pytest.raises(presence.PresenceError, match="presence lock not taken"):
+        presence.reset_policy(tmp_path, now=NOW)
+    assert (tmp_path / "webpush" / "policy.json").read_bytes() == before
+    capsys.readouterr()
+    assert _cli(tmp_path, "policy", "set", "quiet", "other", "push") != 0
+    assert "presence lock not taken" in capsys.readouterr().out
+    assert (tmp_path / "webpush" / "policy.json").read_bytes() == before
+
+
+def test_policy_view_reads_the_file_once(tmp_path, monkeypatch):
+    _write(tmp_path, _file(PHILL))
+    real, calls = presence._read_policy, []
+    monkeypatch.setattr(presence, "_read_policy", lambda q: calls.append(1) or real(q))
+    v = presence.policy_view(tmp_path)
+    assert len(calls) == 1 and v["status"] == "loaded" and v["cells"] == PHILL
+
+
+def test_policy_log_rows_record_the_prior_cells(tmp_path):
+    presence.set_policy(tmp_path, "quiet", "other", "push", now=NOW)
+    presence.reset_policy(tmp_path, now=NOW)
+    rows = presence.read_log(tmp_path)
+    assert rows[0]["prior"] == {"quiet.other": "hold"}
+    assert rows[1]["prior"] == {"quiet.approval": "push", "quiet.attention": "push", "quiet.other": "push",
+                                "sleep.approval": "hold", "sleep.attention": "hold", "sleep.other": "hold"}
+    assert presence.log_line(rows[0])

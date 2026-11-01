@@ -97,7 +97,9 @@ KIND_CLASSES = {"consent": "approval", "push": "approval", "reping": "approval",
 # urgent = approval or attention: derived from the map, not a second copy.
 URGENT_KINDS = frozenset(k for k, c in KIND_CLASSES.items() if c in ("approval", "attention"))
 MUTE_WORDS = ("quiet", "sleep")
-# The shipped default policy is today's rule exactly: quiet lets approval and attention through, sleep holds all.
+# The shipped default policy is today's rule for every kind that existed before the policy: quiet lets approval and
+# attention through, sleep holds all. ``dated`` is the one deliberate change: a kind unknown before is now class
+# ``attention``, so it pushes at an active desk and through quiet, which it did not before.
 DEFAULT_CELLS = {"quiet": {"approval": "push", "attention": "push", "other": "hold"},
                  "sleep": {"approval": "hold", "attention": "hold", "other": "hold"}}
 POLICY_NAME = "policy.json"
@@ -339,15 +341,16 @@ def policy_sentences(cells: dict) -> dict:
 
 def policy_view(queue_dir: Path | str | None) -> dict:
     """The stable dict ``levain ping policy show --json`` prints."""
-    cells, status = read_policy(queue_dir)
-    kind, reasons = _read_policy(queue_dir)[1:]
+    cells, kind, reasons = _read_policy(queue_dir)  # ONE read: cells, status, kind and reasons agree
+    status = "malformed: " + "; ".join(reasons) + " (the whole default is in effect)" if kind == "malformed" else kind
     return {"version": POLICY_VERSION, "cells": cells, "classes": dict(sorted(KIND_CLASSES.items())),
             "default_class": "other", "status": status, "status_kind": kind, "reasons": reasons,
             "sentences": policy_sentences(cells)}
 
 
-def _policy_log(queue_dir: Path | str, ts: float, word: str, by: object, outcome: str, why: str, strict: bool) -> None:
-    row: dict = {"ts": ts, "word": _clean(word, 60), "prior": {}, "outcome": outcome}
+def _policy_log(queue_dir: Path | str, ts: float, word: str, by: object, outcome: str, why: str, strict: bool,
+                prior: dict | None = None) -> None:
+    row: dict = {"ts": ts, "word": _clean(word, 60), "prior": dict(prior) if prior else {}, "outcome": outcome}
     if by is not None:
         who = by if isinstance(by, dict) else {}
         row["by"] = {"agent": _clean(who.get("agent"), _FIELD_MAX), "session": _clean(who.get("session"), _FIELD_MAX),
@@ -417,7 +420,7 @@ def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: di
     _refuse_setter(queue_dir, ts, word, by)
     if mute not in MUTE_WORDS or cls not in CLASSES or value not in ("push", "hold"):
         raise PresenceError(f"policy set takes <{'|'.join(MUTE_WORDS)}> <{'|'.join(CLASSES)}> <push|hold>")
-    with _locked(queue_dir, strict=False):
+    with _locked(queue_dir, strict=True):  # a policy mutation never runs unlocked: two sets could lose one
         cells, _status = read_policy(queue_dir)
         prior = _status if _status.startswith("malformed") else ""
         was = cells[mute][cls]
@@ -429,7 +432,7 @@ def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: di
             raise
         _policy_log(queue_dir, ts, word, None, "set" if was != value else "unchanged",
                     f"prior file {prior.replace(' (the whole default is in effect)', '')}; rewritten from the default" if prior else "",
-                    strict=False)
+                    strict=False, prior={f"{mute}.{cls}": was})
     return cells
 
 
@@ -437,13 +440,15 @@ def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | 
     """Remove the policy file (back to the shipped default) and return the default cells. Operator only."""
     ts = time.time() if now is None else now
     _refuse_setter(queue_dir, ts, "policy reset", by)
-    with _locked(queue_dir, strict=False):
+    with _locked(queue_dir, strict=True):
+        before, _st = read_policy(queue_dir)
         try:
             _write_policy(queue_dir, None)
         except PresenceError as e:
             _policy_log(queue_dir, ts, "policy reset", None, "refused", str(e), strict=False)
             raise
-        _policy_log(queue_dir, ts, "policy reset", None, "set", "", strict=False)
+        _policy_log(queue_dir, ts, "policy reset", None, "set", "", strict=False,
+                    prior={f"{m}.{c}": before[m][c] for m in MUTE_WORDS for c in CLASSES})
     return _copy_cells(DEFAULT_CELLS)
 
 
