@@ -2049,6 +2049,7 @@
   // dark, light. A choice is kept per browser, never anywhere an agent reads; `?theme=light|dark` is a one-visit override that is not
   // kept. A browser that refuses storage still switches for the page's life.
   const THEME_KEY = "levain_cockpit_theme";
+  const THEME_ORDER = ["system", "dark", "light"];
   const isTheme = (t) => t === "light" || t === "dark";
   function storedTheme() { try { const t = root.localStorage.getItem(THEME_KEY); return isTheme(t) ? t : ""; } catch (_) { return ""; } }
   function queryTheme() {
@@ -2193,10 +2194,9 @@
   }
   // Inbox and Grants go to the closest block that exists: the Inbox panel (else the notifications), the standing grants in the Decisions view
   function goDest(d) {
-    const J = root.LevainPhoneJump;
+    const J = root.LevainDestJump;
     if (typeof J !== "function") return;
-    if (d === "grants") J("grants", document.querySelector('.ck-dest[data-dest="grants"]'));
-    else if (d === "inbox") J(document.querySelector('.panel[data-ck-panel="inbox"]') ? "inbox" : "notes", document.querySelector('.ck-dest[data-dest="inbox"]'));
+    if (d === "grants" || d === "inbox") J(d, document.querySelector('.ck-dest[data-dest="' + d + '"]'));
   }
   // `fromReader`: chosen by the reader (click, key, address change); `go`: also go to the destination's block
   function applyDest(d, fromReader, go) {
@@ -2772,13 +2772,18 @@
 
   function install() {
     // the address wins over the tab kept for this browser tab; an unknown fragment falls back to the kept one, then Board
-    applyDest(hashDest() || destOf(saved(MODE_KEY)) || "board");
+    // an address naming Inbox or Grants also goes to its block (a reload lands where the reader was)
+    const first = hashDest();
+    applyDest(first || destOf(saved(MODE_KEY)) || "board", false, !!first);
     setTheme(queryTheme() || storedTheme(), false);
     if (root.matchMedia) { const mq = root.matchMedia("(prefers-color-scheme: light)"); if (mq.addEventListener) mq.addEventListener("change", paintThemeSwitch); }
     if (typeof root.addEventListener === "function") root.addEventListener("hashchange", () => { const d = hashDest(); if (d) applyDest(d, false, true); });
     document.addEventListener("click", (ev) => {
       const b = ev.target && ev.target.closest ? ev.target.closest("[data-theme-set]") : null;
-      if (b) setTheme(b.dataset.themeSet, true);
+      if (!b) return;
+      // the narrow bar draws only the key in force (dashboard.css): a tap on it moves to the next choice
+      const one = b.getAttribute("aria-pressed") === "true" && root.matchMedia && root.matchMedia("(max-width: 480px)").matches;
+      setTheme(one ? THEME_ORDER[(THEME_ORDER.indexOf(b.dataset.themeSet) + 1) % THEME_ORDER.length] : b.dataset.themeSet, true);
     });
     paintCalmSwitch();
     document.addEventListener("click", (ev) => {

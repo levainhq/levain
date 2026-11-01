@@ -6,8 +6,6 @@ as test_cockpit_k10_agents does); the age-timer test uses the page's fake DOM.""
 from __future__ import annotations
 
 import json
-import sys
-import warnings
 
 from tests._ke_dom import NODE, run_node
 from tests.test_cockpit_f12b_topology_view import TV, _paint, _run
@@ -106,18 +104,11 @@ out.tick = [K.AGE_TICK_MS, K.CALM_AGE_TICK_MS];
     assert out["tick"][1] > out["tick"][0]
 
 
-ABSOLUTE_ROW1_SKIP = ("the ROW1_AT_13C4D885 constants were measured on macOS; Linux headless Chrome (run 40424542908 levainhq/levain, cockpit browser tests "
-                       "Python 3.13) put the tabs' right edge 27 px and the brand's right edge 3 px off them, so the absolute comparison runs on darwin only")
-# the first row's element rects at 13c4d885 (before any Calm control), measured in a scratch checkout of that commit with this test's emulation
-# (fixture of test_cockpit_k7_build, 800 px tall, dpr 2): [left, top, right, bottom]
-ROW1_AT_13C4D885 = {
-    320: {"brand": [28, 38, 50, 54], "live": [54, 43, 61, 50], "sync": [65, 24, 120, 68], "jump": [124, 24, 168, 68], "theme": [172, 24, 292, 68], "tabs": [28, 76, 305, 124]},
-    375: {"brand": [28, 38, 105, 54], "live": [109, 43, 116, 50], "sync": [120, 24, 175, 68], "jump": [179, 24, 223, 68], "theme": [227, 24, 347, 68], "tabs": [28, 76, 347, 124]},
-    430: {"brand": [28, 38, 144, 54], "live": [152, 43, 159, 50], "sync": [167, 24, 222, 68], "jump": [230, 24, 274, 68], "theme": [282, 24, 402, 68], "tabs": [28, 76, 402, 124]},
-}
-
-
-ROW1_ORDER = ("brand", "live", "sync", "jump", "theme")   # the controls that share the first row, left to right; the tabs are the second row
+# the bar's first row, left to right (W1c: the destinations are the one nav's, so the bar is one row of these); rects are [left, top, right, bottom]
+ROW1_ORDER = ("brand", "live", "sync", "jump", "theme", "avatar")
+# a known-good row at 375px, font-independent, for the invariants' own check
+GOOD_ROW1 = {"brand": [28, 38, 65, 54], "live": [69, 43, 76, 50], "sync": [80, 8, 124, 52], "jump": [128, 8, 172, 52], "theme": [176, 8, 276, 52],
+             "avatar": [280, 8, 324, 52], "bar": [0, 0, 375, 60]}
 
 
 def _row1_defects(row1: dict, width: int) -> list:
@@ -136,22 +127,22 @@ def _row1_defects(row1: dict, width: int) -> list:
     bound = max(r[3] - r[1] for _, r in rects) / 2   # centres of one row differ by less than half its tallest control
     if max(c for _, c in centres) - min(c for _, c in centres) >= bound:
         bad.append(f"the controls do not share one row (centres {centres}, bound {bound})")
-    tabs = row1["tabs"]   # the second row: no control of the first may reach into it (touching edges is allowed)
+    bar = row1["bar"]   # the bar is the one row: no control of it may reach outside it
     for k, r in rects:
-        if r[3] > tabs[1] and r[0] < tabs[2] and tabs[0] < r[2]:
-            bad.append(f"{k} overlaps the tabs ({k} bottom {r[3]} > tabs top {tabs[1]})")
+        if r[1] < bar[1] or r[3] > bar[3]:
+            bad.append(f"{k} leaves the bar ({k} {r[1]}..{r[3]}, bar {bar[1]}..{bar[3]})")
     return bad
 
 
 @pytest.mark.parametrize("width,mutate,expect", [
     (375, lambda r: r.update(sync=[r["sync"][0] + 10, r["sync"][1], r["sync"][2] + 10, r["sync"][3]]), "sync overlaps jump"),
-    (375, lambda r: r.update(theme=[r["theme"][0] + 40, r["theme"][1], r["theme"][2] + 40, r["theme"][3]]), "theme leaves the 375px viewport"),
+    (375, lambda r: r.update(avatar=[r["avatar"][0] + 80, r["avatar"][1], r["avatar"][2] + 80, r["avatar"][3]]), "avatar leaves the 375px viewport"),
     (375, lambda r: r.update(jump=[r["jump"][0], r["jump"][1] + 30, r["jump"][2], r["jump"][3] + 30]), "do not share one row"),
     (375, lambda r: r.update(live=[10, r["live"][1], 17, r["live"][3]]), "is left of"),
-    (375, lambda r: r.update(jump=[r["jump"][0], r["jump"][1] + 21, r["jump"][2], r["jump"][3] + 21]), "jump overlaps the tabs"),
+    (375, lambda r: r.update(bar=[0, 0, 375, 40]), "leaves the bar"),
 ])
 def test_the_row_invariants_catch_a_real_defect_and_pass_the_known_good_row(width, mutate, expect):
-    good = {k: list(v) for k, v in ROW1_AT_13C4D885[width].items()}
+    good = {k: list(v) for k, v in GOOD_ROW1.items()}
     assert _row1_defects(good, width) == []
     mutate(good)
     assert any(expect in d for d in _row1_defects(good, width)), _row1_defects(good, width)
@@ -159,8 +150,8 @@ def test_the_row_invariants_catch_a_real_defect_and_pass_the_known_good_row(widt
 
 @needs_browser
 @pytest.mark.parametrize("width", [320, 375, 430])
-def test_on_a_phone_the_first_row_is_untouched_and_calm_is_a_labelled_button_beside_the_clock(tmp_path, monkeypatch, width):
-    """C8: the phone bar's first row and tabs have the geometry they had at 13c4d885 (the wordmark as whole as it was), and Calm is a
+def test_on_a_phone_the_bar_is_one_row_calm_moves_nothing_and_calm_is_a_labelled_button_beside_the_clock(tmp_path, monkeypatch, width):
+    """C8: the phone bar is one sound row (W1c: the destinations are the one nav's; the wordmark as whole as it was), pressing Calm moves nothing in it, and Calm is a
     text-labelled button of full touch size at the right of the clock and date: in the viewport, overlapping nothing. The masthead copy is
     hidden on a phone; the two stay in step (label, aria-pressed) whichever is pressed."""
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
@@ -171,7 +162,7 @@ def test_on_a_phone_the_first_row_is_untouched_and_calm_is_a_labelled_button_bes
         ...['.band-state', '.band-meta'].map((s) => q(s)).filter(Boolean).map((e) => [e.className, tr(e)])];
       const hit = (a, b) => a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5;
       const textRight = Math.max(tr(q('.clockbox .clock')).right, tr(q('.clockbox .date')).right);
-      return JSON.stringify({ row1: { brand: r(q('.masthead .brand')), live: r(q('.masthead .livechip')), sync: r(q('#refresh')), jump: r(q('#jumpbtn')), theme: r(q('.masthead .themesw')), tabs: r(q('.masthead .seg')) },
+      return JSON.stringify({ row1: { brand: r(q('.masthead .brand')), live: r(q('.masthead .livechip')), sync: r(q('#refresh')), jump: r(q('#jumpbtn')), theme: r(q('.masthead .themesw')), avatar: r(q('#ck-avatar')), bar: r(q('.masthead')) },
         wordmarkCut: wm.scrollWidth > wm.clientWidth, cr: [Math.round(cr.left), Math.round(cr.top), Math.round(cr.right), Math.round(cr.bottom)],
         inside: cr.left >= 0 && cr.right <= innerWidth && cr.top >= 0 && cr.bottom <= innerHeight, h: cr.height, rightOfClock: cr.left >= textRight,
         overlaps: others.filter(([, b]) => b.width > 0 && hit(cr, b)).map(([n]) => n),
@@ -181,17 +172,13 @@ def test_on_a_phone_the_first_row_is_untouched_and_calm_is_a_labelled_button_bes
     out = _run(tmp_path, src, [{"eval": "new Promise(r => setTimeout(r, 300))"}, {"eval": probe}, CLICK_PHONE, {"eval": probe}, CLICK_PHONE, press_masthead, {"eval": probe}],
                first={"emulate": {"w": width, "h": 800, "dpr": 2, "mobile": True}})
     off, on, back = json.loads(out[-6]), json.loads(out[-4]), json.loads(out[-1])
-    if sys.platform != "darwin":
-        warnings.warn(ABSOLUTE_ROW1_SKIP)
     # off; the phone button pressed (on); the phone button pressed off, then the hidden masthead button pressed on by script (on again)
     for got in (off, on, back):
-        for key, rect in ROW1_AT_13C4D885[width].items():
-            if sys.platform == "darwin":   # the platform the constants were measured on
-                assert all(abs(a - b) <= 1 for a, b in zip(got["row1"][key], rect)), (key, got["row1"][key], rect)
-            if got is not off:   # calm moves nothing, on every platform: the font-independent check, so it never compares `off` with itself
+        for key in ROW1_ORDER:
+            if got is not off:   # calm moves nothing, on every platform
                 assert all(abs(a - b) <= 1 for a, b in zip(got["row1"][key], off["row1"][key])), (key, got["row1"][key], off["row1"][key])
         assert _row1_defects(got["row1"], width) == [], got["row1"]   # every platform: order, no overlap, inside the viewport, one row
-        assert width == 320 or not got["wordmarkCut"], got   # whole where 13c4d885 had it whole (375 and 430); at 320 it was already the dot alone
+        assert width == 320 or not got["wordmarkCut"], got   # whole at 375 and 430; at 320 the bar's other controls take the room
         assert got["inside"] and got["rightOfClock"] and got["h"] >= 36 and not got["overlaps"], got
         assert got["fontSize"] != "0px" and got["text"] in ("Calm off", "Calm on") and got["mastheadCalmShown"] is False, got
         assert got["sw"] <= got["vw"], got

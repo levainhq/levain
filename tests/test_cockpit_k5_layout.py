@@ -30,6 +30,11 @@ RELOAD = "window.__old = 1; location.reload(); 1"
 FRESH = "!window.__old && " + READY["until"]
 
 
+# From 840px the one nav is a 196px sidebar (dashboard.css), so the bar has the viewport's width less that. The bar tests below name the
+# BAR's width (what they were written against) and run the viewport at that plus the sidebar.
+SIDEBAR = 196
+
+
 def _run(tmp_path: Path, steps: list, width: int = 1440, frag: str = BOARD) -> list:
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
@@ -215,7 +220,7 @@ LONG_JAR = ("const j = document.getElementById('jar'); j.hidden = false; j.inner
 @needs_browser
 @pytest.mark.parametrize("font, width", [("", 1180), ("", 1240), (VERDANA, 1280), (VERDANA, 1340)], ids=["native-1180", "native-1240", "verdana-1280", "verdana-1340"])
 def test_a_full_bar_truncates_the_name_with_an_ellipsis_and_never_overflows_into_the_tabs(tmp_path: Path, width: int, font: str) -> None:
-    out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}], width=width)[-1]
+    out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}], width=width + SIDEBAR)[-1]
     assert out["sw"] <= out["cw"], out                                     # nothing widens the page
     assert out["unitLeft"] >= out["tabsRight"], out                        # the readout stays right of the tabs
     assert out["readoutRight"] <= out["mastRight"], out
@@ -226,7 +231,7 @@ def test_a_full_bar_truncates_the_name_with_an_ellipsis_and_never_overflows_into
 @needs_browser
 @pytest.mark.parametrize("font, width", [("", 1400), ("", 1500), (VERDANA, 1460), (VERDANA, 1560)], ids=["native-1400", "native-1500", "verdana-1460", "verdana-1560"])
 def test_the_jar_label_gives_way_before_the_name_does(tmp_path: Path, width: int, font: str) -> None:
-    got = _run(tmp_path, [{"eval": FULL_BAR % (font, LONG_JAR)}], width=width)[-1]
+    got = _run(tmp_path, [{"eval": FULL_BAR % (font, LONG_JAR)}], width=width + SIDEBAR)[-1]
     assert got["sw"] <= got["cw"] and got["unitLeft"] >= got["tabsRight"], got
     assert got["jarCut"] is True, got                                      # the label is what shrank (its text overflows its box: ellipsized)
     if font or sys.platform == "darwin":                                   # the width at which a 14-W name still fits whole beside a long label is the font's
@@ -244,7 +249,7 @@ JAR_ICON = ("(() => { const s = document.querySelector('#jar svg').getBoundingCl
 @pytest.mark.parametrize("font, width", [("", 1101), ("", 1180), (VERDANA, 1101), (VERDANA, 1180)],
                          ids=["native-1101", "native-1180", "verdana-1101", "verdana-1180"])
 def test_the_jar_icon_keeps_its_room_and_never_overlaps_the_indicators(tmp_path: Path, width: int, font: str) -> None:
-    out = _run(tmp_path, [{"eval": FULL_BAR % (font, REAL_JAR)}, {"eval": JAR_ICON}], width=width)
+    out = _run(tmp_path, [{"eval": FULL_BAR % (font, REAL_JAR)}, {"eval": JAR_ICON}], width=width + SIDEBAR)
     icon = out[-1]
     assert icon["svgW"] > 0, icon
     assert icon["svgRight"] <= icon["indLeft"], icon                       # the icon ends before the live/status cluster begins
@@ -261,7 +266,7 @@ CALM = ("(() => { const b = document.getElementById('calmbtn'), r = b.getBoundin
                          ids=[f"{n}-{w}" for n, w in [("native", 1101), ("native", 1180), ("native", 1280), ("native", 1281), ("native", 1340), ("native", 1440),
                                                       ("verdana", 1101), ("verdana", 1180), ("verdana", 1280), ("verdana", 1340), ("verdana", 1440)]])
 def test_calm_beside_the_name_never_overflows_the_bar_and_keeps_its_name_as_an_icon(tmp_path: Path, width: int, font: str) -> None:
-    out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}, {"eval": CALM}], width=width)
+    out = _run(tmp_path, [{"eval": FULL_BAR % (font, NO_JAR)}, {"eval": CALM}], width=width + SIDEBAR)
     geo, calm = out[-2], out[-1]
     assert geo["sw"] <= geo["cw"] and geo["unitLeft"] >= geo["tabsRight"] and geo["readoutRight"] <= geo["mastRight"], geo
     if width >= (1180 if _wide(font) else 1100):
@@ -487,7 +492,7 @@ CALM_ON = ("(() => { const b = document.getElementById('calmbtn'), bg = () => ge
 
 @needs_browser
 def test_calm_on_in_the_icon_band_has_the_filled_background_of_the_theme_switchs_pressed_button(tmp_path: Path) -> None:
-    got = _run(tmp_path, [{"eval": CALM_ON}], width=1180)[-1]
+    got = _run(tmp_path, [{"eval": CALM_ON}], width=1180 + SIDEBAR)[-1]
     assert got["offPressed"] == "false" and got["onPressed"] == "true", got
     assert got["theme"], got
     assert got["on"] != got["off"], got
@@ -496,6 +501,6 @@ def test_calm_on_in_the_icon_band_has_the_filled_background_of_the_theme_switchs
 
 @needs_browser
 def test_calm_on_at_1440_keeps_the_labelled_look_with_no_filled_background(tmp_path: Path) -> None:
-    got = _run(tmp_path, [{"eval": CALM_ON}], width=1440)[-1]
+    got = _run(tmp_path, [{"eval": CALM_ON}], width=1440 + SIDEBAR)[-1]
     assert got["offPressed"] == "false" and got["onPressed"] == "true", got
     assert got["on"] == got["off"], got

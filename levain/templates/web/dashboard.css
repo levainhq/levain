@@ -163,11 +163,8 @@
   .wordmark { font: var(--fw-bold) var(--fs-title)/1 var(--round); letter-spacing: var(--track-tight); color: var(--text); display: flex; align-items: center; gap: var(--sp-3); }
   .wordmark::before { content: ""; width: 10px; height: 10px; border-radius: var(--r-pill); background: var(--accent); display: inline-block; }
   .model { display: none; }
-  .seg { display: flex; background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-2); }
-  .mode { background: none; border: 0; border-radius: var(--r-md); padding: var(--sp-2) var(--sp-4); color: var(--label); cursor: pointer; font: var(--fw-semibold) var(--fs-body) var(--round); }
-  .mode kbd, button#jumpbtn kbd { font: var(--fw-regular) var(--fs-micro) var(--mono); color: var(--meta); margin-inline: 0 var(--sp-2); }
+  button#jumpbtn kbd { font: var(--fw-regular) var(--fs-micro) var(--mono); color: var(--meta); margin-inline: 0 var(--sp-2); }
   button#jumpbtn kbd { margin-inline: var(--sp-2) 0; }
-  .mode[aria-selected="true"] { background: var(--card-2); color: var(--text); }
   .readout { display: flex; align-items: center; gap: var(--sp-6); margin-left: auto; min-width: 0; flex-wrap: wrap; }
   .unit { display: flex; align-items: baseline; gap: var(--sp-3); min-width: 0; }
   .unit-label { font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); color: var(--label); text-transform: uppercase; }
@@ -1218,15 +1215,12 @@ body.ke .band-meta .wx .wx-t .rd-n, body.ke .band-meta .wx b { color: var(--text
 
 /* THE BAR (F6): brand, the four tabs, the status cluster, Sync / Jump, the theme switch. ONE control row at --ctl-md. */
 body.ke .masthead { padding-block: 0; min-height: 60px; gap: var(--sp-6); flex-wrap: nowrap; align-items: center; }
-body.ke .masthead .seg { height: var(--seg-h); box-sizing: border-box; padding: 3px; border-radius: var(--r-md); align-items: stretch; flex: none; }
-body.ke .masthead .mode { display: inline-flex; align-items: center; gap: var(--sp-3); padding: 0 var(--sp-4); font-size: var(--fs-body); font-weight: var(--fw-semibold); border-radius: var(--r-sm); white-space: nowrap; }
 /* the page's switches (tabs, theme, the lens switch) are one material: a recessed track, the chosen key raised and lit */
-body.ke .masthead .seg, body.ke .themesw { background: var(--track-bg); border-color: var(--hair); box-shadow: var(--recess); }
-body.ke .masthead .mode[aria-selected="true"], body.ke .themesw button[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
+body.ke .themesw { background: var(--track-bg); border-color: var(--hair); box-shadow: var(--recess); }
+body.ke .themesw button[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
 /* one control height across the bar: the tab track, the theme track and the Sync / Jump keys share --seg-h with the lens switch */
 body.ke .masthead .themesw { height: var(--seg-h); box-sizing: border-box; padding: 3px; align-items: stretch; }
 body.ke .masthead .themesw button { height: auto; }
-body.ke .masthead .mode:not([aria-selected="true"]):hover { color: var(--text); }
 body.ke .masthead .readout { gap: var(--sp-4); flex: 1; justify-content: flex-end; flex-wrap: nowrap; min-width: 0; font-variant-numeric: tabular-nums; }
 body.ke .masthead .unit { gap: 0; flex: 0 1 auto; min-width: 0; }   /* shrink order when the bar is full: the jar (see .jar) first, the name only when nothing else can give, and then with an ellipsis */
 body.ke .masthead .unit-label { display: none; }
@@ -1577,62 +1571,65 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
 
 /* ═══════════════════════════ PASS 2 (10-14 ~19:2x): the phone's header, and the known gaps ═══════════════════════════ */
 
-/* THE BAR ON A NARROW SCREEN. Two rows: the brand with the status dot, Sync and the theme switch; then the four tabs across the width.
-   Under 1100px (960 until 1023+13, when the jar and the live dot overlapped the tabs between 961 and 1040; 1040 until 1027+4, when a wide font's bar overlapped them between 1041 and 1099) the read-time line and the jar sit on a third row; under 480px they go (the live dot stays), Jump becomes its icon and
-   the keyboard cues go: a phone has no keyboard. Then the band stacked (clock, date, the state line, the wrap line). */
-@media (width <= 1100px) {   /* range form: a zoomed page's fractional width (1100.5) falls in one band, never between two */
-  body.ke .masthead { flex-wrap: wrap; row-gap: var(--sp-3); column-gap: var(--sp-3); padding-block: var(--sp-4); }
-  body.ke .masthead .brand { order: 0; margin-right: auto; }
-  body.ke .masthead .seg { order: 2; flex: 1 1 100%; }
-  body.ke .masthead .seg .mode { flex: 1 1 0; justify-content: center; }
-  body.ke .masthead .readout, body.ke .masthead .indicators, body.ke .masthead .unit { display: contents; }
-  body.ke .masthead .indicators button, body.ke .masthead .themesw, body.ke .masthead .livechip { order: 1; }
-  body.ke .masthead .jar, body.ke .masthead .stamp { order: 3; }
-  body.ke .masthead .entity { display: none; }
-}
-/* Between the stacked breakpoint and the width where the labelled Calm button fits beside the name, Calm shows its icon; the label stays its accessible name (aria-label + title, set by the page) */
-@media (1100px < width <= 1280px) {
-  /* the media width counts a classic scrollbar (Linux, 15px) that the bar cannot use: at 1101 there CI's Linux Chrome put
-     the readout 1px over the tabs with the bar's wide gaps (run 40505814450), so the band's gaps are the narrower step */
+/* THE BAR ON A NARROW SCREEN. One row at every width (the destinations are the nav's, not the bar's): the brand, the Needs pill, the
+   live dot, Sync, Calm, Jump, the theme switch, the settings avatar. What gives room as the screen narrows, in order: the jar and the
+   unit name (the sidebar takes 196px of a width the bar cannot use, so the steps sit that far above the full-width ones the bar had before the nav), then the
+   read-time line, then Calm's label (its icon stays), under 480px the jar and read-time line go (the live dot stays), Jump and Sync
+   become their icons, and the keyboard cues go: a phone has no keyboard. Then the band stacked (clock, date, the state line, the wrap line). */
+@media (width <= 1476px) {   /* range form: a zoomed page's fractional width falls in one band, never between two */
   body.ke .masthead { gap: var(--sp-4); }
   body.ke .masthead #calmbtn { font-size: 0; padding: var(--sp-3); gap: 0; }   /* the zero-size label is still a flex item: without gap: 0 the bar's gap sits between it and the glyph */
   body.ke .masthead #calmbtn::before { content: "\2248"; font-size: var(--fs-title); }
   body.ke .masthead #calmbtn[aria-pressed="true"] { background: var(--key-bg); color: var(--text); box-shadow: var(--edge-hi), var(--key-ring), var(--lift); }
 }
+@media (width <= 1296px) { body.ke .masthead .jar, body.ke .masthead .entity { display: none; } }
+@media (width <= 1180px) { body.ke .masthead .stamp { display: none; } }
+/* Under 900px the sidebar and the rail leave the bar 600-700px: the live chip is its dot, Sync and Jump their icons (the label stays
+   each one's accessible name, set by the page), and the sky's own toggle (a provider adds it) is a desk control that goes. */
+@media (width <= 900px) {
+  body.ke .masthead .indicators button.sky-toggle { display: none; }
+  body.ke .masthead .livechip { font-size: 0; gap: 0; }
+  body.ke .masthead #jumpbtn, body.ke .masthead #refresh { font-size: 0; width: var(--hit-min); padding: 0; justify-content: center; }
+  body.ke .masthead #jumpbtn::before { content: "\2315"; font-size: var(--fs-title); }
+  body.ke .masthead #refresh::before { content: "\21BB"; font-size: var(--fs-title); }
+}
 @media (max-width: 720px) {
   body.ke .band { grid-template-columns: 1fr; gap: var(--sp-4); }
   body.ke .band-state { padding-left: 0; border-left: 0; }
   body.ke .band-meta { text-align: left; align-items: flex-start; max-width: none; }
-  body.ke .masthead .mode kbd, body.ke .masthead #jumpbtn kbd { display: none; }
-  body.ke .masthead .seg { height: auto; min-height: var(--hit-min); }
-  body.ke .masthead .mode { min-height: calc(var(--hit-min) - var(--sp-1) * 2); }
+  body.ke .masthead #jumpbtn kbd { display: none; }
   body.ke .masthead .indicators button { height: var(--hit-min); }
-  /* the track grows with its keys (as .seg does above): the keys are touch-sized, and in a fixed --seg-h track the raised one stood taller than it */
-  body.ke .masthead .themesw { height: auto; min-height: var(--hit-min); }
+  /* the theme switch is one key here, the choice in force: a tap moves to the next (cockpit_view.js), so the bar holds one line */
+  body.ke .masthead .themesw { flex: none; height: auto; min-height: var(--hit-min); }
   body.ke .masthead .themesw button { width: var(--hit-min); height: calc(var(--hit-min) - var(--sp-2) * 2); }
+  body.ke .masthead .themesw button:not([aria-pressed="true"]) { display: none; }
+  /* Calm leaves the bar: the band carries its own Calm button (#calmphone) at the right of the clock and date */
+  body.ke .masthead #calmbtn { display: none; }
+  body.ke .band { position: relative; }
+  body.ke .band #calmphone { display: inline-flex; align-items: center; justify-content: center; position: absolute; top: var(--gap); right: var(--gutter); min-height: var(--hit-min); }
+  /* the brand takes what the bar leaves instead of claiming its own width, so a wider font cannot push the theme switch
+     onto a row of its own (Linux Chrome's fonts did, in CI) */
+  body.ke .masthead .brand { flex: 1 1 0; min-width: 0; margin-right: 0; }
+  body.ke .masthead .readout { flex: none; }
+  /* block, not flex: an ellipsis only draws on a block's own text, and a long white-label name is cut with one (its full text is the title) */
+  body.ke .masthead .brand .wordmark { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  body.ke .masthead .brand .wordmark::before { margin-right: var(--sp-3); vertical-align: middle; }
   body.ke .skycol { padding-inline: 0; }
   body.ke .skycard { border-radius: 0; border-inline: 0; }
   body.ke #ck-sky { padding: 0; }
   body.ke .hero .sky-bar { padding: var(--sp-4) var(--gutter) var(--sp-3); }
 }
 @media (max-width: 480px) {
-  body.ke .masthead .jar, body.ke .masthead .stamp, body.ke .masthead .indicators button.sky-toggle { display: none; }   /* the sky's own toggle (a provider adds it) is a desk control */
-  body.ke .masthead .livechip { font-size: 0; gap: 0; }
-  body.ke .masthead #jumpbtn { font-size: 0; width: var(--hit-min); padding: 0; justify-content: center; }
-  body.ke .masthead #jumpbtn::before { content: "\2315"; font-size: var(--fs-title); }
-  /* Calm leaves the first row on a phone: the band carries its own Calm button (#calmphone) at the right of the clock and date */
-  body.ke .masthead #calmbtn { display: none; }
-  body.ke .band { position: relative; }
-  body.ke .band #calmphone { display: inline-flex; align-items: center; justify-content: center; position: absolute; top: var(--gap); right: var(--gutter); min-height: var(--hit-min); }
-  body.ke .masthead .themesw button { width: 36px; font-size: var(--fs-micro); }
-  /* the brand takes what the first row leaves instead of claiming its own width, so a wider font cannot push the theme switch
-     onto a row of its own (Linux Chrome's fonts did, in CI) */
-  body.ke .masthead .brand { flex: 1 1 0; min-width: 0; margin-right: 0; }
-  /* block, not flex: an ellipsis only draws on a block's own text, and a long white-label name is cut with one (its full text is the title) */
-  body.ke .masthead .brand .wordmark { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  body.ke .masthead .brand .wordmark::before { margin-right: var(--sp-3); vertical-align: middle; }
+  body.ke .masthead .jar, body.ke .masthead .stamp { display: none; }
+  body.ke .masthead, body.ke .masthead .readout, body.ke .masthead .indicators { gap: var(--sp-2); }
+  body.ke .masthead .ck-needs-pill { padding: 0 var(--sp-3); }
+  body.ke .masthead .themesw button { width: 36px; }
 }
-@media (max-width: 400px) { body.ke .masthead { column-gap: var(--sp-2); } }   /* room for the default wordmark at 375px */
+@media (max-width: 400px) {
+  body.ke .masthead .brand .wordmark::before { display: none; }
+  body.ke .masthead .ck-needs-pill { padding: 0 var(--sp-2); }
+  body.ke .masthead .themesw { padding: var(--sp-1); }
+}   /* room for the default wordmark at 375px: the live dot beside it is the bar's one dot */
 
 /* AN EMPTY CARD is a slim bar, last in its zone (a card with a list behind it keeps its place and its height). Beside a tall
    neighbour an empty card used to leave a void under it; as a bar at the end of the zone it takes one thin full-width line, and the
@@ -2804,34 +2801,20 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 
 /* OS-3: THE NARROW LAYOUT. The phone's views (Needs you, Board, Notifications, Grants, Drop, the state line) are this page's own
    content, laid out for a thumb under the page's existing 720px break; the wider layout draws none of this. The page keeps its
-   design language: what changes is the order (what waits on him comes before the graph), one strip that jumps to each view, and
-   hit areas. The strip is hidden here and shown only in the narrow block, so a wide page never sees it. */
-.ck-phonetabs { display: none; }
+   design language: what changes is the order (what waits on him comes before the graph) and hit areas. The views are reached
+   through the one nav (THE ONE NAV, below), not a strip of their own. */
 @media (max-width: 720px) {
-  /* the hero's two children (the band, the sky card) join the deck's column so the needs strip can sit between them: the state
+  /* the hero's two children (the band, the sky card) join the deck's column so the Needs-you row can sit between them: the state
      line first, then what waits on him, then the sky. Every moved block has an explicit order; the rest keep document order.
      The hero draws no box of its own (display block is all it sets), so its flatten loses no padding, margin or paint; a box
      style added to it would need the deck's gap to carry it here. */
   body.ke .deck > .masthead { order: -4; }
-  body.ke .ck-phonetabs { order: -3; }
   body.ke .hero:not([hidden]) { display: contents; }
   body.ke .hero > .band { order: -2; }
-  body.ke .ck-needs, body.ke .ck-drop, body.ke .ck-notes { order: -1; }   /* equal order keeps document order: the strip, then the drop under it, then the notes */
-  /* a view the strip jumps to stops under the sticky strip, never behind it */
-  body.ke #ck-needs, body.ke #ck-drop, body.ke #ck-state-slot, body.ke .panel[data-ck-panel="tray"], body.ke .panel[data-ck-panel="notifications"] { scroll-margin-top: calc(var(--hit-min) + var(--sp-4)); }
-  body.ke .ck-phonetabs {
-    display: flex; gap: 0; position: sticky; top: 0; z-index: 5;
-    padding: 0 var(--gutter-ke); background: var(--base); border-bottom: 1px solid var(--hair);
-    overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none;
-  }
-  body.ke .ck-phonetabs::-webkit-scrollbar { display: none; }
-  body.ke .ck-phonetabs button {
-    flex: 1 1 auto; min-height: var(--hit-min); padding: 0 var(--sp-2); white-space: nowrap;
-    background: none; border: 0; border-radius: var(--r-md); color: var(--label); cursor: pointer;
-    font: var(--fw-semibold) var(--fs-meta) var(--round);
-  }
-  body.ke .skycol { margin-top: var(--sec); }   /* the sky now follows the needs strip, not the band: the one section space between them */
-  body.ke .ck-phonetabs button:active { background: var(--card-2); color: var(--text); }
+  body.ke .ck-needs, body.ke .ck-drop, body.ke .ck-notes { order: -1; }   /* equal order keeps document order: the Needs-you row, then the drop under it, then the notes */
+  /* a block the nav's Inbox destination scrolls to stops a little below the top edge, never flush against it */
+  body.ke .panel[data-ck-panel="inbox"], body.ke .panel[data-ck-panel="notifications"] { scroll-margin-top: var(--sp-4); }
+  body.ke .skycol { margin-top: var(--sec); }   /* the sky now follows the Needs-you row, not the band: the one section space between them */
   /* the Decisions view's rows (the open request, a standing grant, the drop): the command takes the row's width and its button
      the line under it at a thumb's height, in place of a button squeezing a wrapped command into a sliver beside it */
   body.ke .modal-body .consent-cmd { flex-direction: column; align-items: flex-start; }
@@ -3048,4 +3031,4 @@ body.ke #drop-recent { max-height: 40vh; overflow: auto; }
 }
 @media (pointer: coarse) { .ck-dest { min-height: var(--hit-min); } }
 /* wrapped (<= 1100px) the brand, the pill and the avatar stay on the first row (order 0); the rest of the bar follows */
-@media (width <= 480px) { .ck-needs-pill .ck-pill-you { display: none; } }
+@media (width <= 560px) { .ck-needs-pill .ck-pill-you { display: none; } }

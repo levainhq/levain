@@ -354,6 +354,48 @@ def test_an_absent_payload_with_an_answer_to_say_still_says_it(tmp_path, monkeyp
     assert "the band changed since it was shown" in out["values"][-1], out["values"][-1]
 
 
+@needs_browser
+def test_the_stale_band_refusal_text_survives_the_next_redraw(tmp_path, monkeypatch):
+    """The words a stale answer's redraw is told to say are kept like a send's: the next re-read of the board reads the band again and draws the
+    slot again, and the refusal must still be on it (it went blank at that redraw)."""
+    seed = Seed(tmp_path, now=datetime.now(timezone.utc))
+    monkeypatch.setenv("LEVAIN_HOME", str(seed.dir.parent))
+    seed.clock[0] = datetime.now(timezone.utc)
+    _live_request(seed)
+    _file(QuestionStore(seed.dir))
+    _root, src, _ids = _install(tmp_path)
+    # the answer's binding is made stale (the server refuses it); every band read is counted so the test knows a redraw happened
+    patch = ("(() => { window.__bandReads = 0; const f = window.fetch; window.fetch = function (u, o) { const url = String((u && u.url) || u);"
+             " if (/\\/cockpit\\/band\\.json/.test(url)) window.__bandReads++;"
+             " if (/\\/cockpit\\/verb/.test(url) && o && typeof o.body === 'string' && /band_answer/.test(o.body)) {"
+             " const b = JSON.parse(o.body); b.params.view_id = 999999; o = Object.assign({}, o, {body: JSON.stringify(b)}); }"
+             " return f.call(this, u, o); }; return 1; })()")
+    send = ("(() => { const box = document.querySelector('[data-band-slot] .band-box'); box.value = '1a';"
+            " document.querySelector('[data-band-slot] .band-send').click(); return 1; })()")
+    said_js = ("(() => { const m = document.querySelector('#levain-modal [data-band-slot] .band-msg');"
+               " return m && /the band changed since it was shown/.test(m.textContent) ? m.textContent : null; })()")
+    reads = "window.__bandReads"
+    # a re-read of the board (what the poll does: the board's redraw) reads the band again and draws the slot again
+    resync = "(() => { window.LevainDashboard.redraw(); return 1; })()"
+    again = "window.__bandReads > window.__readsAtSaid && document.querySelector('#levain-modal [data-band-slot][data-band-read]')"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE}, {"eval": OPEN_DECISIONS},
+            {"until": _SETTLED % "ok"},
+            {"eval": patch}, {"eval": send},
+            {"until": said_js, "ms": 20000},
+            {"eval": "(() => { window.__readsAtSaid = window.__bandReads; return 1; })()"},
+            {"eval": "new Promise(r => setTimeout(r, 2300)).then(() => 1)"},   # past the band read's 2 s share window
+            {"eval": resync},
+            {"until": again, "ms": 30000},
+            {"eval": "new Promise(r => setTimeout(r, 600)).then(() => 1)"},
+            {"eval": said_js},
+            {"eval": reads},
+        ])
+    assert "the band changed since it was shown" in str(out["values"][-2]), out["values"][-3:]
+    assert out["values"][-1] > 1, out["values"][-3:]   # the band was read again after the refusal was drawn
+
+
 # a fetch wrapper for the marker test: an answer is refused as stale (so the page redraws the SAME slot with a fresh read),
 # and that fresh read is held pending until the test releases it
 _HOLD = ("(() => { const f = window.fetch; window.fetch = function (u, o) { const url = String((u && u.url) || u);"

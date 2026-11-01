@@ -1,4 +1,4 @@
-"""Cockpit pass 2 (Phill 10-14 ~19:2x): the phone's header leads with the nav and the sky shows only rows with events; an empty card
+"""Cockpit pass 2 (Phill 10-14 ~19:2x): the phone's header is one row (the nav is the one nav since W1c) and the sky shows only rows with events; an empty card
 is a slim bar at the end of its zone instead of a void beside tall neighbours."""
 
 from __future__ import annotations
@@ -48,32 +48,40 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
         return _drive(tmp_path, f"{url}/#write_token=T", [{"until": "document.querySelector('.ck-widgets .ck-card.w')"}, *steps])["values"]
 
 
-@needs_browser
-def test_the_phone_bar_is_two_rows_with_the_tabs_across_the_width(tmp_path: Path) -> None:
-    """K2 r2 (L2-9): brand, status dot, Sync and the theme switch on one row, the four tabs across the width on the next; no horizontal scroll."""
-    vals = _page(tmp_path, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"until": "document.querySelector('.masthead .seg') && document.querySelector('.band .clock') && document.querySelector('.masthead .indicators button')"}, {"eval": """(() => {
+BAR_ONE_ROW = """(() => {
       const box = (e) => e.getBoundingClientRect(), q = (s) => document.querySelector(s);
-      const bar = q('.masthead'), seg = q('.masthead .seg'), theme = q('.masthead .themesw'), brand = q('.masthead .brand');
-      return { segTop: box(seg).top, clockTop: box(q('.band .clock')).top, segShare: box(seg).width / innerWidth, barH: box(bar).height,
-        oneRow: Math.abs(box(theme).top - box(brand).top) < 24 && box(theme).bottom < box(seg).top, sw: document.documentElement.scrollWidth, vw: innerWidth }; })()"""}])
-    got = vals[2]
-    assert got["segTop"] < got["clockTop"] and got["segShare"] > 0.85 and got["oneRow"] and got["barH"] < 150 and got["sw"] <= got["vw"], got
+      const brand = q('.masthead .brand'), wm = q('.masthead .brand .wordmark');
+      const kids = ['#refresh', '#jumpbtn', '.themesw', '#ck-avatar'].map((s) => q('.masthead ' + s)).filter((e) => e && e.getClientRects().length);
+      return { n: kids.length, oneRow: kids.every((e) => Math.abs((box(e).top + box(e).bottom) / 2 - (box(brand).top + box(brand).bottom) / 2) < 24),
+        inside: kids.every((e) => box(e).right <= innerWidth + 1 && box(e).left >= -1), noSeg: !q('.masthead .seg'), barH: box(q('.masthead')).height,
+        clockTop: box(q('.band .clock')).top, barBottom: box(q('.masthead')).bottom,
+        whole: wm.scrollWidth <= wm.clientWidth + 1, sw: document.documentElement.scrollWidth, vw: innerWidth }; })()"""
+BAR_READY = "document.querySelector('.band .clock') && document.querySelector('.masthead .indicators button') && document.querySelector('.masthead .themesw') && document.querySelector('.masthead .brand .wordmark')"
 
 
 @needs_browser
 @pytest.mark.parametrize("width", [320, 375, 390, 430, 480])
-def test_the_theme_switch_stays_on_the_first_row_at_every_phone_width(tmp_path: Path, width: int) -> None:
-    """CI's Linux fonts once wrapped the theme switch onto a row of its own at 390px; the old CSS did the same at 375px on any font.
-    The brand gives way instead; at 430px (and wider) the default wordmark is never cut."""
-    vals = _page(tmp_path, [{"emulate": {"w": width, "h": 812, "dpr": 3, "mobile": True}}, {"until": "document.querySelector('.masthead .seg') && document.querySelector('.masthead .themesw') && document.querySelector('.masthead .brand .wordmark') && document.querySelector('.masthead .indicators button')"}, {"eval": """(() => {
-      const box = (e) => e.getBoundingClientRect(), q = (s) => document.querySelector(s);
-      const theme = q('.masthead .themesw'), brand = q('.masthead .brand'), wm = q('.masthead .brand .wordmark');
-      return { oneRow: Math.abs(box(theme).top - box(brand).top) < 24 && box(theme).bottom < box(q('.masthead .seg')).top,
-        whole: wm.scrollWidth <= wm.clientWidth + 1, sw: document.documentElement.scrollWidth, vw: innerWidth }; })()"""}])
+def test_the_phone_bar_is_one_row_at_every_phone_width(tmp_path: Path, width: int) -> None:
+    """The bar's destinations moved to the one nav (W1c), so the bar is one row: brand, Sync, Jump, the theme
+    switch and the settings avatar share it, at every phone width, with no sideways scroll and the clock below it. CI's Linux fonts once
+    wrapped the theme switch onto a row of its own at 390px; the brand gives way instead, and from 375px the default wordmark is never cut."""
+    vals = _page(tmp_path, [{"emulate": {"w": width, "h": 812, "dpr": 3, "mobile": True}}, {"until": BAR_READY}, {"eval": BAR_ONE_ROW}])
     got = vals[2]
-    assert got["oneRow"] and got["sw"] <= got["vw"], got
-    if width >= 430:
+    assert got["n"] == 4 and got["oneRow"] and got["inside"] and got["noSeg"], got   # every control is drawn, on the brand's row, inside the screen
+    assert got["barH"] < 80 and got["barBottom"] <= got["clockTop"] and got["sw"] <= got["vw"], got
+    if width >= 375:
         assert got["whole"], got
+
+
+@needs_browser
+@pytest.mark.parametrize("width", [721, 840, 1101, 1280])
+def test_the_bar_is_one_row_beside_the_rail_and_the_sidebar(tmp_path: Path, width: int) -> None:
+    """The rail (from 600px) and the sidebar (from 840px) take width the bar cannot use: the bar keeps one row and never overlaps or scrolls
+    sideways, including 1101 to 1280, where the sidebar once squeezed the unit name to an ellipsis stub."""
+    vals = _page(tmp_path, [{"emulate": {"w": width, "h": 900, "dpr": 1}}, {"until": BAR_READY}, {"eval": BAR_ONE_ROW}])
+    got = vals[2]
+    assert got["oneRow"] and got["inside"] and got["noSeg"] and got["barH"] < 80 and got["sw"] <= got["vw"], got
+    assert got["whole"], got
 
 
 @needs_browser
@@ -187,17 +195,30 @@ def test_a_row_with_a_repo_facet_is_tagged_from_it_and_a_row_without_one_from_it
     assert got == {"fix the flaky test": "review", "Review the cash flow report": "website", "Review the invoice": "review"}, vals[2]
 
 
-@needs_browser
-def test_the_phone_theme_keys_sit_inside_their_track_in_every_selected_state(tmp_path: Path) -> None:
-    """Phill 10-22 (iPhone 15 Pro Max): the raised theme key stood taller than its track. Every key is one box and fits the track."""
-    vals = _page(tmp_path, [{"emulate": {"w": 430, "h": 932, "dpr": 3, "mobile": True}}, {"until": "document.body.classList.contains('ke') && document.querySelector('.masthead .themesw button')"}, {"eval": """(() => {
+THEME_KEYS = """(() => {
       const out = [], tr = document.querySelector('.masthead .themesw');
-      for (const w of ['system', 'dark', 'light']) {
-        tr.querySelector('[data-theme-set=' + w + ']').click();
-        const t = tr.getBoundingClientRect(), bs = [...tr.querySelectorAll('button')].map((b) => b.getBoundingClientRect());
-        out.push({ want: w, got: (tr.querySelector('[aria-pressed=true]') || {}).dataset?.themeSet, sizes: bs.map((b) => [b.width, b.height]), inside: bs.every((b) => b.top >= t.top && b.bottom <= t.bottom) });
-      }
-      return out; })()"""}])
+      const read = (want) => { const t = tr.getBoundingClientRect(), bs = [...tr.querySelectorAll('button')].filter((b) => b.getClientRects().length).map((b) => b.getBoundingClientRect());
+        out.push({ want, got: (tr.querySelector('[aria-pressed=true]') || {}).dataset?.themeSet, shown: bs.length, sizes: bs.map((b) => [b.width, b.height]), inside: bs.every((b) => b.top >= t.top && b.bottom <= t.bottom) }); };
+      %s
+      return out; })()"""
+
+
+@needs_browser
+def test_the_phone_theme_switch_is_one_key_that_cycles_and_sits_inside_its_track(tmp_path: Path) -> None:
+    """Phill 10-22 (iPhone 15 Pro Max): the raised theme key stood taller than its track. On a phone the switch is ONE key (the choice in
+    force) so the bar holds one row: a tap moves to the next choice, system to dark to light and round, and the key fits the track."""
+    steps = "for (const want of ['dark', 'light', 'system']) { tr.querySelector('[aria-pressed=true]').click(); read(want); }"
+    vals = _page(tmp_path, [{"emulate": {"w": 430, "h": 932, "dpr": 3, "mobile": True}}, {"until": "document.body.classList.contains('ke') && document.querySelector('.masthead .themesw button')"}, {"eval": THEME_KEYS % steps}])
     for state in vals[2]:
-        assert state["got"] == state["want"], state
+        assert state["got"] == state["want"] and state["shown"] == 1, state
+        assert state["inside"] and len({tuple(s) for s in state["sizes"]}) == 1, state
+
+
+@needs_browser
+def test_the_theme_switch_shows_all_three_keys_inside_its_track_from_a_tablet_up(tmp_path: Path) -> None:
+    """Above the phone's width the three keys are drawn and each sets its own choice; every key is one box and fits the track."""
+    steps = "for (const want of ['system', 'dark', 'light']) { tr.querySelector('[data-theme-set=' + want + ']').click(); read(want); }"
+    vals = _page(tmp_path, [{"emulate": {"w": 800, "h": 932, "dpr": 2, "mobile": True}}, {"until": "document.body.classList.contains('ke') && document.querySelector('.masthead .themesw button')"}, {"eval": THEME_KEYS % steps}])
+    for state in vals[2]:
+        assert state["got"] == state["want"] and state["shown"] == 3, state
         assert state["inside"] and len({tuple(s) for s in state["sizes"]}) == 1, state

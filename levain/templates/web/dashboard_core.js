@@ -178,9 +178,9 @@
   let modalPending = null;
   let modalAwaiting = false;
   let modalGen = 0;
-  // The narrow page's jump into the Decisions view runs one wait at a time: a newer tap, the reader's own touch or wheel, or the
+  // The nav's jump to Inbox or Grants runs one wait at a time: a newer tap, the reader's own touch or wheel, or the
   // view closing ends the run in flight, so nothing yanks the view back. Declared here because closeModal ends it.
-  let phoneJumpRun = 0;
+  let destJumpRun = 0;
 
   // The starter jar (masthead): rise level = today's episodes against the entity's own typical
   // day (view.jar, counts from its store); a typical day sits at the dashed mark. A bubble
@@ -4651,7 +4651,8 @@
   // textContent, never as HTML.
   const bandNumOf = new Map();    // question n -> band number, from the last band read: a question row leads with it
   let bandDraft = "";             // the shorthand typed and not sent: a redraw gives it back
-  let bandKeep = "";              // what the last send said about refusals and sheets: a redraw gives it back until the next send
+  let bandKeep = "";              // what the last send said about refusals and sheets, or why a stale band was redrawn: a redraw gives it back until the next send or a change of the queue
+  let bandKeepSig = "";           // the queue (its item numbers) the kept words were said about
   // the typed words minus the pieces of the items that were recorded (a piece runs from its number to the next number)
   function bandUnrecorded(text, recorded) {
     const done = new Set(recorded.map((l) => (/^\d+/.exec(String(l)) || [""])[0]).filter(Boolean));
@@ -4705,6 +4706,11 @@
     const items = Array.isArray(b.items) ? b.items : [];
     bandNumOf.clear();
     for (const it of items) if (it && Number.isInteger(it.question)) bandNumOf.set(it.question, it.n);
+    // the words a draw is told to say (the stale-band refusal) are kept like a send's, so the next poll's redraw gives them back;
+    // a queue that changed since they were said ends them
+    const sig = items.map((it) => (it && it.n) + ":" + (it && it.question)).join(",");
+    if (say) { bandKeep = say; bandKeepSig = sig; }
+    else if (bandKeep && bandKeepSig && bandKeepSig !== sig) { bandKeep = ""; bandKeepSig = ""; }
     const kids = [];
     // the settle marker the page owns: a read has landed and been drawn (a test waits on it, never on a clock)
     const read = b.store === "absent" ? "absent" : (b.note ? "note" : "ok");
@@ -4739,6 +4745,7 @@
         const refused = Array.isArray(d.refused) ? d.refused : [];
         const sheets = Array.isArray(d.sheets) ? d.sheets : [];
         bandDraft = rec.length && (refused.length || sheets.length) ? bandUnrecorded(text, rec) : (rec.length ? "" : text);
+        bandKeepSig = "";   // a send's words stand until the next send (the queue changes under them as the answer lands)
         bandKeep = (rec.length ? "recorded: " + rec.join(", ") : "nothing recorded")
           + (refused.length ? " · refused: " + refused.join("; ") : "")
           + (sheets.length ? " · " + sheets.map((s) => (/^\s*(\d+)/.exec(String(s)) || [0, "?"])[1]).join(", ")
@@ -7692,7 +7699,7 @@
     questionBodies.clear();
     consentBodies.clear();   // request bodies (commands, working directories) are not kept past the view
     consentGen++;
-    phoneJumpRun++;
+    destJumpRun++;
     pruneModalKinds();
     document.body.classList.remove("modal-open");
     modalKey = null;
@@ -7866,87 +7873,74 @@
     }
   }
 
-  // OS-3, the narrow page's strip: one tap goes to the phone view's content. Needs you, Board and Notifications are blocks on this
-  // page, and so is Drop (the card under the Needs-you row: its tab scrolls there and focuses the box); Grants are drawn inside the
-  // Decisions view, so that tab opens it and takes the reader to its own slot. That
-  // view fills as its reads answer (queued, each up to the fetch deadline), so the wait is for the POPULATED node, bounded by a
-  // deadline a little past the read's own; a view with nothing to show (no standing grant, a read that failed) is left where the
-  // slot is, or at its top when it has none.
-  const PHONE_JUMP_TARGET = {
-    needs: "#ck-needs:not([hidden])",
-    board: ".panel[data-ck-panel=\"tray\"]",
-    notes: ".panel[data-ck-panel=\"notifications\"]",
-    inbox: ".panel[data-ck-panel=\"inbox\"]",
-  };
-  const PHONE_JUMP_WAIT_MS = CONSENT_FETCH_TIMEOUT_MS + 5000, PHONE_JUMP_STEP_MS = 150, PHONE_JUMP_STEADY = 2;
-  // `slot`: where the tab's section sits once it is drawn; `filled`: the same node once its read has filled it (the grants heading
-  // exists only with a grant under it)
-  function phoneJumpFind(which, overlay) {
+  // The one nav's Inbox and Grants destinations: a tap (or an address that names one) goes to the closest block that exists. Inbox is
+  // the Inbox panel (else the notifications) on the Board page; Grants are drawn inside the Decisions view, so that destination opens
+  // it and takes the reader to its own slot. The view fills as its reads answer (queued, each up to the fetch deadline), so the wait
+  // is for the POPULATED node, bounded by a deadline a little past the read's own; a view with nothing to show (no standing grant, a
+  // read that failed) is left where the slot is, or at its top when it has none. The Inbox block may not be drawn yet when the
+  // address is read on a reload, so its wait is for the block itself, bounded the same way.
+  const DEST_JUMP_TARGETS = ".panel[data-ck-panel=\"inbox\"], .panel[data-ck-panel=\"notifications\"]";
+  const DEST_JUMP_WAIT_MS = CONSENT_FETCH_TIMEOUT_MS + 5000, DEST_JUMP_STEP_MS = 150, DEST_JUMP_STEADY = 2;
+  // `slot`: where the standing grants' section sits once it is drawn; `filled`: the same node once its read has filled it (the grants
+  // heading exists only with a grant under it)
+  function destJumpFind(overlay) {
     const head = Array.from(overlay.querySelectorAll(".ext-grouphead")).find((h) => /standing grants/i.test(h.textContent)) || null;
     return { slot: head, filled: head };
   }
-  const phoneJumpDrawn = (n) => !!n && n.getClientRects().length > 0;
+  const destJumpDrawn = (n) => !!n && n.getClientRects().length > 0;
   // The filled node is scrolled to again until the view stops growing above it (steady looks at the same height), so a row that
   // fills in after the node appeared does not leave the reader short of it.
   // The run belongs to the one view the tap opened (or found open): a view closed and opened again is another view, whose own
   // navigation the old wait must not act on.
-  function phoneJumpInView(which, run, overlay, deadline, seen) {
-    if (run !== phoneJumpRun || document.getElementById("levain-modal") !== overlay) return;
-    const f = phoneJumpFind(which, overlay);
+  function destJumpInView(run, overlay, deadline, seen) {
+    if (run !== destJumpRun || document.getElementById("levain-modal") !== overlay) return;
+    const f = destJumpFind(overlay);
     let top = seen ? seen.top : undefined, steady = seen ? seen.steady : 0;
-    if (phoneJumpDrawn(f.filled)) {
+    if (destJumpDrawn(f.filled)) {
       const now = f.filled.getBoundingClientRect().top;
       steady = top !== undefined && Math.abs(now - top) < 1 ? steady + 1 : 0;
-      if (steady >= PHONE_JUMP_STEADY) return;
+      if (steady >= DEST_JUMP_STEADY) return;
       if (steady === 0) f.filled.scrollIntoView({ block: "start" });
       top = f.filled.getBoundingClientRect().top;
-    } else if (!seen && phoneJumpDrawn(f.slot)) {
+    } else if (!seen && destJumpDrawn(f.slot)) {
       f.slot.scrollIntoView({ block: "start" });   // the slot is there before its read answers: the tap shows the move at once
     }
     if (Date.now() < deadline) {
-      window.setTimeout(() => phoneJumpInView(which, run, overlay, deadline, { top: top, steady: steady }), PHONE_JUMP_STEP_MS);
-    } else if (!phoneJumpDrawn(f.filled) && phoneJumpDrawn(f.slot)) {
+      window.setTimeout(() => destJumpInView(run, overlay, deadline, { top: top, steady: steady }), DEST_JUMP_STEP_MS);
+    } else if (!destJumpDrawn(f.filled) && destJumpDrawn(f.slot)) {
       f.slot.scrollIntoView({ block: "start" });   // never filled: the slot is where the reader lands
     }
   }
-  function phoneJump(which, opener) {
-    const run = ++phoneJumpRun;
-    if (which === "drop") {       // the drop is a card under the Needs-you row: the tab scrolls to its box, no view to open
-      const host = document.getElementById("ck-drop");
-      if (!host) return;
-      window.requestAnimationFrame(() => {
-        if (run !== phoneJumpRun) return;
-        host.scrollIntoView({ block: "start" });
-        const ta = host._drop && host._drop.words;
-        if (ta && !ta.disabled) ta.focus({ preventScroll: true });
-      });
+  // The Inbox block (else the notifications) is waited for, then shown (its page view first, when the saved view hides it) and scrolled to.
+  function destJumpToBlock(run, deadline) {
+    if (run !== destJumpRun) return;
+    const target = document.querySelector(".panel[data-ck-panel=\"inbox\"]") || document.querySelector(".panel[data-ck-panel=\"notifications\"]");
+    if (!target) {
+      if (Date.now() < deadline) window.setTimeout(() => destJumpToBlock(run, deadline), DEST_JUMP_STEP_MS);
       return;
     }
+    // a panel the saved view hides has no box to scroll to: its view is shown first, and the scroll waits for the layout frame
+    const K = window.LevainCockpitKinds;
+    if (K && typeof K.revealTab === "function") K.revealTab(target);
+    window.requestAnimationFrame(() => {
+      const t = target.isConnected ? target : document.querySelector(DEST_JUMP_TARGETS);
+      if (run === destJumpRun && t) t.scrollIntoView({ block: "start" });
+    });
+  }
+  function destJump(which, opener) {
+    const run = ++destJumpRun;
     if (which === "grants") {
       if (!document.getElementById("levain-modal") && !openDecisionsHistory(opener)) return;
       const overlay = document.getElementById("levain-modal");
       // opening can close a view it could not build, which ends the run: the wait starts from the run as it stands once the view is up
-      if (overlay) phoneJumpInView(which, phoneJumpRun, overlay, Date.now() + PHONE_JUMP_WAIT_MS);
+      if (overlay) destJumpInView(destJumpRun, overlay, Date.now() + DEST_JUMP_WAIT_MS);
       return;
     }
-    const sel = PHONE_JUMP_TARGET[which];
-    const target = sel ? document.querySelector(sel) : null;
-    if (!target) return;
-    // a panel the saved tab hides has no box to scroll to: its tab is shown first, and the scroll waits for the layout frame
-    const K = window.LevainCockpitKinds;
-    if (K && typeof K.revealTab === "function") K.revealTab(target);
-    window.requestAnimationFrame(() => {
-      const t = target.isConnected ? target : document.querySelector(sel);
-      if (run === phoneJumpRun && t) t.scrollIntoView({ block: "start" });
-    });
+    destJumpToBlock(run, Date.now() + DEST_JUMP_WAIT_MS);
   }
-  document.addEventListener("click", (ev) => {
-    const b = ev.target && ev.target.closest ? ev.target.closest("[data-phone-jump]") : null;
-    if (b) phoneJump(b.dataset.phoneJump, b);
-  });
-  for (const type of ["touchstart", "wheel"]) document.addEventListener(type, () => { phoneJumpRun++; }, { passive: true, capture: true });
+  for (const type of ["touchstart", "wheel"]) document.addEventListener(type, () => { destJumpRun++; }, { passive: true, capture: true });
 
-  window.LevainPhoneJump = phoneJump;   // the one nav's Inbox and Grants destinations go to their closest block through it (cockpit_view.js goDest)
+  window.LevainDestJump = destJump;   // cockpit_view.js goDest: the Inbox and Grants destinations go to their closest block through it
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };

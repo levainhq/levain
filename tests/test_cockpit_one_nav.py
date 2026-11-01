@@ -115,3 +115,20 @@ def test_a_kept_mode_from_before_the_nav_maps_to_its_destination(tmp_path: Path,
                                      {"eval": "JSON.stringify({ k: 'at', dest: document.body.dataset.dest })"}])
     at = [json.loads(v) for v in res["values"] if isinstance(v, str) and v.startswith("{")][-1]
     assert at["dest"] == "now", at
+
+
+@needs_browser
+@needs_ssh
+def test_an_address_naming_inbox_scrolls_to_its_block_not_just_lights_the_destination(tmp_path: Path, monkeypatch) -> None:
+    """A reload at `#inbox` (a phone: the Inbox block is far down the page) lands on the block, where it once only lit the destination."""
+    rig = FullRig(tmp_path, monkeypatch)
+    url = f"{rig.origin}/#write_token={TOK}&inbox"
+    block = "(document.querySelector('.panel[data-ck-panel=\"inbox\"]') || document.querySelector('.panel[data-ck-panel=\"notifications\"]'))"
+    probe = ("JSON.stringify({ k: 'at', dest: document.body.dataset.dest, y: Math.round(window.scrollY),"
+             f" top: Math.round({block}.getBoundingClientRect().top) }})")
+    with rig.serving():
+        res = drive_touch(tmp_path, url, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"touch": True}, {"until": NEEDS, "ms": 30000},
+                                          {"until": f"{block} && window.scrollY > 0", "ms": 30000}, {"eval": "new Promise(r => setTimeout(r, 600)).then(() => 1)"},
+                                          {"eval": probe}])
+    at = [json.loads(v) for v in res["values"] if isinstance(v, str) and v.startswith("{")][-1]
+    assert at["dest"] == "inbox" and at["y"] > 0 and 0 <= at["top"] < 140, at
