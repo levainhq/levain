@@ -661,8 +661,11 @@ def _follow_route(queue_dir: Path | str, word: str, duration: str | None, action
         return
     from levain.webpush import route
 
-    route.apply_route(queue_dir, "devices" if word == "remote" else "desk", duration if word == "remote" else None,
-                      source="operator", now=ts)
+    if word == "back":
+        # present at the desk: the standing route record goes, and a later remote login can still suggest devices
+        route._write(queue_dir, None)
+        return
+    route.apply_route(queue_dir, "devices", duration, source="operator", now=ts)
 
 
 def _evidence(match: object) -> tuple[bool, float | None, str]:

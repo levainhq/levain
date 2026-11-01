@@ -87,7 +87,7 @@ def test_the_remote_word_sets_devices_for_its_duration_and_back_sets_desk(tmp_pa
     set_word(tmp_path, "sleep", now=NOW + 7)
     assert route.read_route(tmp_path, NOW + 8)[0] == "devices"
     set_word(tmp_path, "back", now=NOW + 9)
-    assert route.read_route(tmp_path, NOW + 10)[:2] == ("desk", "operator")
+    assert route.read_route(tmp_path, NOW + 10)[:2] == ("desk", "default")   # the record is gone; a remote login may suggest again
 
 
 def test_back_under_a_standing_loud_leaves_the_route(tmp_path):
@@ -216,7 +216,10 @@ def test_a_failed_route_write_leaves_the_word_untouched_and_raises(tmp_path, mon
         raise presence.PresenceError("route not written: disk")
 
     monkeypatch.setattr(route, "apply_route", boom)
-    for word in ("back", "remote"):
-        with pytest.raises(presence.PresenceError):
-            set_word(tmp_path, word, by=None, now=NOW + 5)
-        assert presence.read_word(tmp_path) == before
+    with pytest.raises(presence.PresenceError):
+        set_word(tmp_path, "remote", by=None, now=NOW + 5)
+    assert presence.read_word(tmp_path) == before
+    monkeypatch.setattr(route, "_write", boom)
+    with pytest.raises(presence.PresenceError):
+        set_word(tmp_path, "back", by=None, now=NOW + 6)
+    assert presence.read_word(tmp_path) == before
