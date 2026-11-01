@@ -42,6 +42,8 @@ MAX_RECEIPTS_PER_PING_KIND = 8       # a ping delivered to one device more than 
 RECEIPT_MIN_MS = 1_577_836_800_000   # 2020-01-01: a device clock before it is not a clock this record keeps
 RECEIPT_FUTURE_MS = 86_400_000       # and one a day ahead of this server's is not either
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+NOTICES_KEEP = 500             # the newest notices kept, and no notice is kept past NOTICES_DAYS
+NOTICES_DAYS = 30
 HELD_LEASE_SECS = 300          # a held ping claimed for a push is another flush's to take again after this long
 
 
@@ -149,6 +151,12 @@ _SCHEMA: tuple[str, ...] = (
     # a push about to go to a subscription (written before the push services are asked; see the module docstring)
     "CREATE TABLE IF NOT EXISTS targets (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
     "REFERENCES pings(id), subscription_id INTEGER NOT NULL REFERENCES subscriptions(id), at TEXT NOT NULL)",
+    # a posted notice (levain.webpush.notify): ``source`` and ``token`` are copied at write time, so a revoked or
+    # renamed token never rewrites history; ``ping_id`` is the delivery record when one was made (a ``low`` notice has none)
+    "CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, source TEXT NOT NULL, "
+    "title TEXT NOT NULL, body TEXT NOT NULL, priority TEXT NOT NULL CHECK (priority IN ('low','normal','urgent')), "
+    "token TEXT NOT NULL, decision TEXT NOT NULL CHECK (decision IN ('pushed','held','recorded')), "
+    "ping_id INTEGER REFERENCES pings(id), dismissed_at TEXT)",
     "CREATE INDEX IF NOT EXISTS receipts_device_reported ON receipts (device_id, reported_at)",
     "CREATE INDEX IF NOT EXISTS targets_ping_sub ON targets (ping_id, subscription_id)",
     "CREATE INDEX IF NOT EXISTS deliveries_ping_sub ON deliveries (ping_id, subscription_id)",
@@ -319,6 +327,37 @@ class PushStore:
                 c.execute("INSERT INTO held (ping_id, url, reason, held_at) VALUES (?,?,?,?)",
                           (ping_id, hold[0], hold[1], now_stamp()))
             return ping_id
+
+    # --- notices -------------------------------------------------------------------------------------
+    def add_notice(self, source: str, title: str, body: str, priority: str, token: str, decision: str,
+                   ping_id: int | None = None, *, now: float | None = None) -> int:
+        """Record one posted notice and prune in the same transaction: past the newest :data:`NOTICES_KEEP`, or older than
+        :data:`NOTICES_DAYS` days, goes."""
+        at = time.time() if now is None else now
+        with self.write() as c:
+            nid = int(c.execute("INSERT INTO notices (at, source, title, body, priority, token, decision, ping_id) "
+                                "VALUES (?,?,?,?,?,?,?,?)",
+                                (time.strftime(STAMP, time.gmtime(at)), source, title, body, priority, token, decision,
+                                 ping_id)).lastrowid)
+            c.execute("DELETE FROM notices WHERE at < ?", (time.strftime(STAMP, time.gmtime(at - NOTICES_DAYS * 86400)),))
+            c.execute("DELETE FROM notices WHERE id NOT IN (SELECT id FROM notices ORDER BY id DESC LIMIT ?)",
+                      (NOTICES_KEEP,))
+            return nid
+
+    def notices(self, limit: int = 100, *, include_dismissed: bool = False) -> list[dict[str, Any]]:
+        """The newest ``limit`` notices (at most :data:`NOTICES_KEEP`), dismissed ones left out unless asked for."""
+        n = max(0, min(int(limit), NOTICES_KEEP))
+        with self.read() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM notices" + ("" if include_dismissed else " WHERE dismissed_at IS NULL")
+                + " ORDER BY id DESC LIMIT ?", (n,))]
+
+    def dismiss_notice(self, notice_id: int, *, now: float | None = None) -> bool:
+        """Mark a notice dismissed; whether one was (an unknown or already dismissed id is not)."""
+        at = time.time() if now is None else now
+        with self.write() as c:
+            return c.execute("UPDATE notices SET dismissed_at = ? WHERE id = ? AND dismissed_at IS NULL",
+                             (time.strftime(STAMP, time.gmtime(at)), notice_id)).rowcount == 1
 
     # --- the held queue ------------------------------------------------------------------------------
     @staticmethod
