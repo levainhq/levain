@@ -239,7 +239,8 @@
     const raw = box.querySelector(".card-signed");
     raw.id = "sheet-signed";
     raw.dataset.card = "signed";
-    raw.querySelector("summary").textContent = "What exactly gets signed";
+    const rawSummary = raw.querySelector("summary");
+    if (rawSummary) rawSummary.textContent = "What exactly gets signed";
     raw.remove();
     body.appendChild(box);
     body.after(raw);
