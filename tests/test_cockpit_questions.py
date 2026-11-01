@@ -390,3 +390,25 @@ def test_a_verb_without_applies_to_is_never_offered_or_fired_on_a_question_row(m
     got = V.row_actions(None, None, "decisions", other, "token", "local", date(2026, 10, 18), policy=genesis_policy())
     assert "probe" in [a["verb"] for a in got]
     assert not V._applies_to_row(probe, "decisions", qrow) and V._applies_to_row(probe, "decisions", other)
+
+
+def test_the_body_answer_carries_signed_signer_and_the_options_label(tmp_path, lh):
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store)
+    store.answer(q.n, option="ship", channel="cockpit")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        a = _get_status(f"{base}/cockpit/question/{q.n}.json", TOKEN)[1]["answer"]
+    assert a["kind"] == "option" and a["value"] == "ship"
+    assert a["label"] == dict(OPTIONS)["ship"]
+    assert a["signed"] is None and a["signer"] is None      # the native store records neither: unknown, not "unsigned"
+
+
+def test_a_words_answer_has_no_label(tmp_path, lh):
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store)
+    store.answer(q.n, text="not tonight", channel="cli")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        a = _get_status(f"{base}/cockpit/question/{q.n}.json", TOKEN)[1]["answer"]
+    assert a["label"] is None and set(a) >= {"kind", "value", "channel", "answered_at", "signed", "signer", "label"}

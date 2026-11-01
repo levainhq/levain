@@ -4542,6 +4542,28 @@
     if (!F || typeof F.drawBody !== "function" || !text) return null;
     try { return F.drawBody(el("div", "card-body needs-q-body"), text, dropping, options, rec); } catch (e) { return null; }
   }
+  // The one line an answered question carries on every surface: "Answered: K · label | his words · signed | unsigned · time · via channel".
+  // `signed` null (the store cannot say) adds nothing; an unreadable time adds nothing. Every string is the agent's or the operator's and
+  // is drawn as text only.
+  function answerLine(a, options) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const parts = [];
+    if (a.kind === "option") {
+      const opt = (Array.isArray(options) ? options : []).find((o) => o && o.key === a.value);
+      const label = sv(a.label) || (opt ? sv(opt.label) : "");
+      parts.push(sv(a.value) + (label ? " \u00b7 " + label : ""));
+    } else {
+      parts.push(sv(a.value));
+    }
+    if (a.signed === true) parts.push("signed");
+    else if (a.signed === false) parts.push("unsigned");
+    const ms = Date.parse(sv(a.answered_at));
+    if (Number.isFinite(ms)) {
+      parts.push(new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }));
+    }
+    if (sv(a.channel)) parts.push("via " + sv(a.channel));
+    return "Answered: " + parts.join(" \u00b7 ");
+  }
   // `card` (the Needs-you strip's card) draws the mock's anatomy: the question as a bold title, "blocks: ...", then "REC key. words";
   // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
   function drawQuestionBody(q, slot, b, card) {
@@ -4579,9 +4601,7 @@
     }
     const a = b.answer && typeof b.answer === "object" ? b.answer : null;
     if (a) {
-      const opt = options.find((o) => o && o.key === a.value);
-      parts.push(el("div", "consent-note ext-meta", "answered via " + sv(a.channel) + (a.kind === "option"
-        ? ": option " + sv(a.value) + (opt ? " (" + sv(opt.label) + ")" : "") : ", in words: " + sv(a.value))));
+      parts.push(el("div", "consent-note ext-meta", answerLine(a, options)));
       slot.replaceChildren(...parts);
       return;
     }
@@ -4805,6 +4825,15 @@
       });
     });
     head.appendChild(btn);
+    if (!open) {
+      // an answered row shows how it was answered without the click; the details button stays for a failed read's retry
+      if (!slot) { slot = el("div", "consent-body ext-meta"); row.appendChild(slot); }
+      questionBody(q, row).then((b) => {
+        if (!b || b.error) return;
+        drawQuestionBody(q, slot, b);
+        btn.remove();
+      });
+    }
     return row;
   }
 
@@ -5736,15 +5765,27 @@
   // command for a terminal; the question's answer goes through the verb path the board already has. History (decided rows,
   // outcomes, standing-rule proposals) stays in the Decisions focus view, behind the strip's "all decisions" button.
   function needsItems(lines) {
-    const consents = [], questions = [];
+    const consents = [], questions = [], answered = [];
     for (const ln of Array.isArray(lines) ? lines : []) {
       if (!ln || typeof ln !== "object") continue;
       if (ln.consent && ln.consent.state === "pending") consents.push({ kind: "consent", c: ln.consent });
       else if (ln.question && ln.question.state === "open") questions.push({ kind: "question", q: ln.question });
+      else if (ln.question && ln.question.state === "answered" && decidedRecently(ln.question.decidedAge)) {
+        answered.push({ kind: "question", q: ln.question, answered: true });
+      }
     }
     const due = (it) => { const ms = Date.parse(it.c.expiresAt); return Number.isFinite(ms) ? ms : Infinity; };
     consents.sort((a, b) => due(a) - due(b));   // Array.prototype.sort is stable: equal expiries keep the kernel's order
-    return questions.concat(consents);
+    return questions.concat(consents, answered);
+  }
+  // an item the strip shows only so the answer given stays visible for a while: it waits on nothing and is never counted
+  const needsWaiting = (items) => items.filter((it) => !it.answered);
+  const NEEDS_ANSWERED_MINUTES = 30;
+  // decidedAge is the row's relative label ("40s ago", "12m ago"); only seconds and minutes under the window qualify
+  function decidedRecently(label) {
+    const m = /^(\d+)([sm]) ago$/.exec(typeof label === "string" ? label : "");
+    if (!m) return false;
+    return m[2] === "s" || Number(m[1]) < NEEDS_ANSWERED_MINUTES;
   }
   const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state);
   // the name a glance tile gives the top item: the tool and who asked, or the question's number (its words are fetched, not in the row)
@@ -5977,12 +6018,15 @@
     const card = el("div", "needs-card needs-question is-full");
     card.dataset.needsCard = "question";
     card._needsItem = { kind: "question", q };
-    needsHead(card, q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null);
+    const settled = q.state === "answered";
+    if (settled) card.classList.add("needs-settled");
+    needsHead(card, settled ? el("span", "ext-meta needs-left needs-settled-tag", "answered" + (q.decidedAge ? " " + q.decidedAge : ""))
+      : (q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null));
     const slot = el("div", "needs-body ext-meta", "reading the question…");
     card.appendChild(slot);
     questionBody(q, card).then((b) => {
       drawQuestionBody(q, slot, b, card);
-      if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
+      if (!b.error && !settled) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
     });
     return card;
   }
@@ -6047,18 +6091,19 @@
     signRecheck();      // a board read: every frozen card asks the cockpit about its unsettled answer again
     const host = document.getElementById("ck-needs");
     if (!host) return;
-    const items = needsItems(((view.extra_panels || {}).decisions || {}).lines);
-    if (!items.length) { clearNeeds(host); return; }
+    const all = needsItems(((view.extra_panels || {}).decisions || {}).lines);
+    const items = needsWaiting(all), settled = all.filter((it) => it.answered);
+    if (!all.length) { clearNeeds(host); return; }
     // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
     // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits
-    const sig = items.map(needsKey).join("\n");
+    const sig = all.map(needsKey).join("\n");
     if (host.dataset.sig === sig && !host.hidden) return;
     const head = el("div", "needs-headline");
     head.appendChild(el("h3", null, "Needs you"));
     head.appendChild(el("span", "needs-count", String(items.length)));
     // no re-ping route exists (the phone is told when a request is filed, and the queue re-pings on its own clock; nothing here
     // pushes), so the gloss claims no ping: it says where the answer is signed
-    head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
+    if (items.length) head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
     if (items.some((it) => it.kind === "question") && items.some((it) => it.kind === "consent")) {
       head.appendChild(el("span", "needs-order", "questions first, then soonest to expire"));
     }
@@ -6091,7 +6136,16 @@
     if (!grid) grid = el("div", "needs-grid");
     for (let i = 0; i < cards.length; i++) if (grid.children[i] !== cards[i]) grid.insertBefore(cards[i], grid.children[i] || null);
     while (grid.children.length > cards.length) grid.removeChild(grid.lastChild);
-    host.replaceChildren(head, needsBar(items), grid);
+    const kids = [head];
+    if (items.length) kids.push(needsBar(items), grid);
+    if (settled.length) {
+      // just-answered cards, calm and last: they count for nothing and carry no control
+      const sec = el("div", "needs-answered");
+      sec.appendChild(el("div", "needs-sec-label", "Just answered"));
+      for (const it of settled) sec.appendChild(questionCard(it.q));
+      kids.push(sec);
+    }
+    host.replaceChildren(...kids);
     host.hidden = false;
     host.dataset.sig = sig;   // only a strip that was drawn is recorded as drawn: a build that threw is tried again at the next render
   }
@@ -7615,7 +7669,7 @@
       // a live view repaints from its own source and stays open. buildModal on an open modal is a repaint only: it keeps the one overlay (and
       // its one keydown listener), the scroll and the focus, and swaps the body for the `build` the caller returns
       if (modalCustom.live) { buildModal(null); return; }
-      if (!needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
+      if (!needsWaiting(needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines)).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
       return;
     }
     const entry = findEntry(currentView, modalKey);
@@ -7890,7 +7944,7 @@
   for (const type of ["touchstart", "wheel"]) document.addEventListener(type, () => { phoneJumpRun++; }, { passive: true, capture: true });
 
   window.LevainAgentPage = { open: openAgentPage };
-  window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
+  window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
   window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

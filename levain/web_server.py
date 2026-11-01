@@ -2122,8 +2122,11 @@ class _Handler(GuardedHandler):
                         "n": q.n, "agent": q.agent, "what": q.what,
                         "options": [{"key": k, "label": label} for k, label in q.options],
                         "rec": q.rec, "blocks": q.blocks, "open_ended": q.open_ended, "filed_at": q.filed_at,
-                        "answer": None if a is None else {"kind": a.kind, "value": a.value, "channel": a.channel,
-                                                          "answered_at": a.answered_at}}
+                        "answer": None if a is None else {
+                            "kind": a.kind, "value": a.value, "channel": a.channel, "answered_at": a.answered_at,
+                            "signed": getattr(a, "signed", None), "signer": getattr(a, "signer", None),
+                            "label": next((label for k, label in q.options if k == a.value), None)
+                            if a.kind == "option" else None}}
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection

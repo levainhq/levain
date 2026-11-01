@@ -1746,6 +1746,9 @@ body.ke .needs-chip { font: var(--fw-medium) var(--fs-micro)/1.4 var(--mono); co
 body.ke .needs-body { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; flex: 1 1 auto; }
 body.ke .needs-body .consent-display { margin-top: 0; }
 body.ke .needs-card.is-full { max-width: 720px; width: 100%; }
+body.ke .needs-answered { display: flex; flex-direction: column; gap: var(--sp-3); margin-top: var(--sp-4); }
+body.ke .needs-card.needs-settled { border-color: var(--line, var(--label)); opacity: .85; }
+body.ke .needs-card.needs-settled .needs-settled-tag { color: var(--label); }
 body.ke .needs-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); margin-top: auto; }
 body.ke .needs-btn, body.ke .needs-card .question-option { min-height: 38px; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--text); background: none; border: 1px solid var(--label); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-4); cursor: pointer; text-align: center; margin: 0; }
 body.ke .needs-btn:hover, body.ke .needs-card .question-option:hover { border-color: var(--text); background: var(--card-2); }
