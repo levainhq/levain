@@ -113,6 +113,10 @@ class PresenceError(ValueError):
     """A word or duration that cannot be applied, or a presence file that cannot be written safely."""
 
 
+class PresenceBusy(PresenceError):
+    """The presence lock was not free within the wait a caller allowed (``_locked(..., wait=...)``)."""
+
+
 @dataclass(frozen=True)
 class Decision:
     push: bool
@@ -343,9 +347,13 @@ def policy_view(queue_dir: Path | str | None) -> dict:
     """The stable dict ``levain ping policy show --json`` prints."""
     cells, kind, reasons = _read_policy(queue_dir)  # ONE read: cells, status, kind and reasons agree
     status = "malformed: " + "; ".join(reasons) + " (the whole default is in effect)" if kind == "malformed" else kind
+    # `held_by_default`: an APPROVAL cell that holds only because the shipped default says so (no table of the operator's own
+    # is in effect); the block says so in one plain line, where a hold of his own choosing gets the warning
+    held = {f"{m}.approval": True for m in MUTE_WORDS
+            if kind != "loaded" and cells[m]["approval"] == "hold" and DEFAULT_CELLS[m]["approval"] == "hold"}
     return {"version": POLICY_VERSION, "cells": cells, "classes": dict(sorted(KIND_CLASSES.items())),
             "default_class": "other", "status": status, "status_kind": kind, "reasons": reasons,
-            "sentences": policy_sentences(cells)}
+            "sentences": policy_sentences(cells), "default_cells": _copy_cells(DEFAULT_CELLS), "held_by_default": held}
 
 
 def _policy_log(queue_dir: Path | str, ts: float, word: str, by: object, outcome: str, why: str, strict: bool,
@@ -414,15 +422,16 @@ def _refuse_setter(queue_dir: Path | str, ts: float, word: str, by: dict | None)
 
 
 def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: dict | None = None,
-               now: float | None = None, via: str | None = None) -> dict:
+               now: float | None = None, via: str | None = None, wait: float | None = None) -> dict:
     """Set one cell and return the cells after. Operator only (``by`` must be ``None``, see :func:`_refuse_setter`).
-    Atomic write under the presence lock; one presence-log row. Raises :class:`PresenceError`."""
+    Atomic write under the presence lock; one presence-log row. Raises :class:`PresenceError`; ``wait`` (seconds) bounds the
+    lock wait and raises :class:`PresenceBusy` past it (default: wait as long as it takes, as the CLI does)."""
     ts = time.time() if now is None else now
     word = f"policy set {mute} {cls} {value}"
     _refuse_setter(queue_dir, ts, word, by)
     if mute not in MUTE_WORDS or cls not in CLASSES or value not in ("push", "hold"):
         raise PresenceError(f"policy set takes <{'|'.join(MUTE_WORDS)}> <{'|'.join(CLASSES)}> <push|hold>")
-    with _locked(queue_dir, strict=True):  # a policy mutation never runs unlocked: two sets could lose one
+    with _locked(queue_dir, strict=True, wait=wait):  # a policy mutation never runs unlocked: two sets could lose one
         cells, _status = read_policy(queue_dir)
         prior = _status if _status.startswith("malformed") else ""
         was = cells[mute][cls]
@@ -438,11 +447,12 @@ def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: di
     return cells
 
 
-def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | None = None, via: str | None = None) -> dict:
+def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | None = None, via: str | None = None,
+                 wait: float | None = None) -> dict:
     """Remove the policy file (back to the shipped default) and return the default cells. Operator only."""
     ts = time.time() if now is None else now
     _refuse_setter(queue_dir, ts, "policy reset", by)
-    with _locked(queue_dir, strict=True):
+    with _locked(queue_dir, strict=True, wait=wait):
         before, _st = read_policy(queue_dir)
         try:
             _write_policy(queue_dir, None)
@@ -515,9 +525,10 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
 
 
 @contextmanager
-def _locked(queue_dir: Path | str, *, strict: bool):
+def _locked(queue_dir: Path | str, *, strict: bool, wait: float | None = None):
     """Hold the presence lock (a ``flock`` on a lock file beside ``presence.json``). ``strict``: failing to take it
-    raises :class:`PresenceError`; else it is reported on stderr and the body runs unlocked."""
+    raises :class:`PresenceError`; else it is reported on stderr and the body runs unlocked. ``wait`` (seconds, with ``strict``):
+    take the lock by non-blocking attempts up to that deadline, then raise :class:`PresenceBusy`; ``None`` blocks."""
     d = Path(queue_dir) / "webpush"
     fd = None
     try:
@@ -529,11 +540,24 @@ def _locked(queue_dir: Path | str, *, strict: bool):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
             raise PresenceError(f"{d / LOCK_NAME} is not a file of this user's")
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if wait is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise PresenceBusy("the presence lock is held by another process") from None
+                    time.sleep(0.05)
     except (OSError, PresenceError) as e:
         if fd is not None:
             os.close(fd)
         fd = None
+        if strict and isinstance(e, PresenceBusy):
+            raise
         if strict:
             raise PresenceError(f"presence lock not taken: {e}") from e
         print(f"levain ping: presence lock not taken: {e}", file=sys.stderr)

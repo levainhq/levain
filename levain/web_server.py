@@ -1148,6 +1148,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
 # token on every bind; the phone port's own pairing (/webpush/pair, /webpush/pair/redeem) is not served here: this
 # origin pairs through /pair.
 _POLICY_PATH = "/webpush/policy"            # NP S2: the operator's notification policy (levain.webpush.presence)
+_POLICY_LOCK_WAIT_SECS = 3.0              # how long an HTTP policy write waits for the presence lock
 _POLICY_SET = "/webpush/policy/set"
 _POLICY_RESET = "/webpush/policy/reset"
 _PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH})
@@ -2272,10 +2273,13 @@ class _Handler(GuardedHandler):
         queue = self.server.signer.queue_dir
         via = str(self._credential()["name"])
         try:
+            # A bounded lock wait: a stalled holder of the presence lock must not park handler threads on request_gate slots.
             if route == _POLICY_SET:
-                presence.set_policy(queue, req["mute"], req["class"], req["value"], by=None, via=via)
+                presence.set_policy(queue, req["mute"], req["class"], req["value"], by=None, via=via, wait=_POLICY_LOCK_WAIT_SECS)
             else:
-                presence.reset_policy(queue, by=None, via=via)
+                presence.reset_policy(queue, by=None, via=via, wait=_POLICY_LOCK_WAIT_SECS)
+        except presence.PresenceBusy:
+            return {"error": "policy_busy", "message": "the notification policy is busy right now; nothing was changed, try again"}, 503
         except presence.PresenceError as exc:
             return {"error": "policy_refused", "message": str(exc)}, 422
         return presence.policy_view(queue), 200

@@ -3,11 +3,14 @@ family's gate (same-origin, a surface token on every bind, JSON only) and call p
 operator's own act; the Devices panel draws the block."""
 from __future__ import annotations
 
+import fcntl
 import json
+import time
 
 import pytest
 
 from levain.webpush import presence
+from levain import web_server
 from levain.web_server import load_web_asset
 from tests.test_cockpit_pairing_http import PROXY, T, _call
 from tests.test_cockpit_webpush import _signed
@@ -98,6 +101,39 @@ def test_a_lock_failure_is_surfaced_as_an_error_the_block_shows(rig, monkeypatch
         assert st == 422 and got["error"] == "policy_refused" and "lock not taken" in got["message"]
 
 
+def test_a_held_presence_lock_answers_503_within_the_deadline_and_writes_nothing(rig, monkeypatch):
+    src, q = rig
+    monkeypatch.setattr(web_server, "_POLICY_LOCK_WAIT_SECS", 0.4)
+    d = q / "webpush"
+    d.mkdir(mode=0o700)
+    holder = open(d / presence.LOCK_NAME, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX)                      # a stalled holder, from this test
+    try:
+        with _signed(src, q) as (port, _):
+            for path, body in ((SET, _cell()), ("/webpush/policy/reset", {})):
+                t0 = time.monotonic()
+                st, got, _ = _call(port, "POST", path, body, token=T)
+                assert st == 503 and got["error"] == "policy_busy" and "nothing was changed" in got["message"], (st, got)
+                assert time.monotonic() - t0 < 5
+            assert presence.policy_view(q)["status_kind"] == "default"      # nothing written
+            assert not (d / "policy.json").exists()
+    finally:
+        holder.close()
+    with _signed(src, q) as (port, _):                       # the lock freed: the same write goes through
+        assert _call(port, "POST", SET, _cell(), token=T)[0] == 200
+
+
+def test_the_view_names_which_cells_hold_by_default(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        v = _call(port, "GET", "/webpush/policy", token=T)[1]
+        assert v["default_cells"] == presence.DEFAULT_CELLS and v["held_by_default"] == {"sleep.approval": True}
+        # an explicit table of the operator's own, sleep approvals held too: nothing holds BY DEFAULT
+        assert _call(port, "POST", SET, _cell("sleep", "approval", "hold"), token=T)[0] == 200
+        v = _call(port, "GET", "/webpush/policy", token=T)[1]
+        assert v["status_kind"] == "loaded" and v["cells"]["sleep"]["approval"] == "hold" and v["held_by_default"] == {}
+
+
 def test_a_malformed_file_is_reported_by_the_read(rig):
     src, q = rig
     (q / "webpush").mkdir(mode=0o700)
@@ -119,19 +155,19 @@ def test_the_block_renders_edits_round_trip_and_the_approval_hold_warns(rig, tmp
     src, q = rig
     from tests.test_cockpit_pairing_http import _pair
     cell = lambda c, v: f"document.querySelector('.np-row[data-cell=\"{c}\"] button[data-value=\"{v}\"]')"
-    state = "JSON.stringify([...document.querySelectorAll('.np-row')].map(r=>[r.dataset.cell,r.querySelector('[aria-checked=true]').dataset.value]))"
+    state = "JSON.stringify([...document.querySelectorAll('.np-row')].map(r=>[r.dataset.cell,r.querySelector('[aria-pressed=true]').dataset.value]))"
     with _signed(src, q) as (port, _):
         _pair(port)
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
             {"until": "document.querySelector('.np-panel') && !document.querySelector('.np-panel').hidden", "ms": 20000},
             {"eval": "document.querySelectorAll('.np-warn:not([hidden])').length"},
             {"eval": "(d=>d.hidden?'hidden':d.textContent+'|'+getComputedStyle(d).color)(document.querySelector('.np-default'))"},
-            {"do": cell("quiet.approval", "hold") + ".click()", "until": cell("quiet.approval", "hold") + ".getAttribute('aria-checked')==='true'", "ms": 8000},
+            {"do": cell("quiet.approval", "hold") + ".click()", "until": cell("quiet.approval", "hold") + ".getAttribute('aria-pressed')==='true'", "ms": 8000},
             {"eval": "document.querySelectorAll('.np-warn:not([hidden])').length"},
             {"eval": "location.reload() || 1"},
             {"until": "document.querySelector('.np-panel') && !document.querySelector('.np-panel').hidden", "ms": 20000},
             {"eval": state},
-            {"do": "document.querySelector('.np-reset').click()", "until": "document.querySelector('.np-reset').disabled && document.querySelectorAll('.np-warn:not([hidden])').length === 0 && " + cell("quiet.approval", "push") + ".getAttribute('aria-checked')==='true'", "ms": 8000},
+            {"do": "document.querySelector('.np-reset').click()", "until": "document.querySelector('.np-reset').disabled && document.querySelectorAll('.np-warn:not([hidden])').length === 0 && " + cell("quiet.approval", "push") + ".getAttribute('aria-pressed')==='true'", "ms": 8000},
             {"eval": "document.documentElement.scrollWidth - document.documentElement.clientWidth"},
         ])
     v = out["values"]
@@ -140,3 +176,59 @@ def test_the_block_renders_edits_round_trip_and_the_approval_hold_warns(rig, tmp
     assert v[4] == 1                    # a hold in a non-default cell (quiet approvals) warns
     assert ["quiet.approval", "hold"] in json.loads(v[7])   # it held across a reload
     assert presence.policy_view(q)["status_kind"] == "default"   # reset
+
+
+@needs_browser
+def test_the_block_shows_when_the_device_list_is_gone_and_the_policy_is_not(rig, tmp_path, monkeypatch):
+    src, q = rig
+    # a cockpit whose pairing list answers 404 while /webpush/policy answers 200 keeps the Notifications block
+    monkeypatch.setattr(web_server._Handler, "_serve_pair_list",
+                        lambda self, *, head: self._pair_send({"error": "not_found"}, 404, head=head))
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": "document.querySelector('.np-panel') && !document.querySelector('.np-panel').hidden", "ms": 20000},
+            {"eval": "(s=>s && !s.hidden)(document.querySelector('.dev-zone'))"},
+            {"eval": "[...document.querySelectorAll('.dev-panel')].map(p=>p.hidden)"},
+        ])
+    assert out["values"][1] is True and out["values"][2] == [True, False]   # the section shows; the pairing panel does not
+
+
+@needs_browser
+def test_a_slow_read_started_before_a_write_does_not_repaint_over_it(rig, tmp_path, monkeypatch):
+    src, q = rig
+    from tests.test_cockpit_pairing_http import _pair
+    cell = lambda c, v: f"document.querySelector('.np-row[data-cell=\"{c}\"] button[data-value=\"{v}\"]')"
+    # the first policy read after the wrapper lands answers late (its body is the state at the time it began)
+    wrap = ("(() => { const f = window.fetch; window.__slow = 0; window.fetch = function (u, o) {"
+            " const p = f.apply(this, arguments);"
+            " if (String(u).includes('/webpush/policy') && !(o && o.method === 'POST') && !window.__slow) {"
+            " window.__slow = 1; return p.then((r) => new Promise((ok) => setTimeout(() => ok(r), 4000))); }"
+            " return p; }; return 1; })()")
+    with _signed(src, q) as (port, _):
+        _pair(port)
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": "document.querySelector('.np-panel') && !document.querySelector('.np-panel').hidden", "ms": 20000},
+            {"eval": wrap},
+            {"until": "window.__slow === 1", "ms": 8000},                      # the slow (stale) read is in flight
+            {"do": cell("quiet.approval", "hold") + ".click()", "until": cell("quiet.approval", "hold") + ".getAttribute('aria-pressed')==='true'", "ms": 8000},
+            {"eval": "new Promise((ok) => setTimeout(() => ok(" + cell("quiet.approval", "hold") + ".getAttribute('aria-pressed')), 5500))"},
+            {"eval": "[...document.querySelectorAll('.np-row button')].some(b => b.disabled)"},
+        ])
+    assert out["values"][4] == "true"       # the late stale read (default: push) did not take the written value back
+    assert out["values"][5] is False        # the buttons are enabled again
+
+
+@needs_browser
+def test_a_custom_table_holding_sleep_approvals_shows_no_default_line(rig, tmp_path, monkeypatch):
+    src, q = rig
+    from tests.test_cockpit_pairing_http import _pair
+    with _signed(src, q) as (port, _):
+        _pair(port)
+        assert _call(port, "POST", SET, _cell("quiet", "other", "push"), token=T)[0] == 200   # an explicit table of his own
+        assert _call(port, "POST", SET, _cell("sleep", "approval", "hold"), token=T)[0] == 200
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": "document.querySelector('.np-panel') && !document.querySelector('.np-panel').hidden", "ms": 20000},
+            {"eval": "document.querySelector('.np-default').hidden"},
+            {"eval": "document.querySelectorAll('.np-warn:not([hidden])').length"},
+        ])
+    assert out["values"][1] is True and out["values"][2] == 0

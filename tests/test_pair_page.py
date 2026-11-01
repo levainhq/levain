@@ -102,8 +102,8 @@ def test_the_panel_reads_through_one_shared_promise_and_no_flag_can_stick() -> N
 def test_a_403_refuses_that_token_only_and_a_different_token_revives_the_panel() -> None:
     # L3 r3 H2: `gone` is for 404 alone; a 403 remembers the refused token and reads are skipped only while token() is still it.
     js = load_web_asset("devices_panel.js")
-    assert re.search(r"res\.status === 404\) \{ section\.hidden = true; gone = true;", js)
-    assert re.search(r"res\.status === 403\) \{ section\.hidden = true; refused = tok;", js)
+    assert re.search(r"res\.status === 404\) \{ devShown\(false\); gone = true;", js)
+    assert re.search(r"res\.status === 403\) \{ devShown\(false\); refused = tok;", js)
     assert not re.search(r"403[^\n]*gone = true", js), "a 403 must not set gone for the page"
     assert "if (tok === refused)" in js
     assert js.index("if (gone) return true;") < js.index("if (tok === refused)")

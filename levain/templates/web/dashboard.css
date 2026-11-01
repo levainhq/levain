@@ -3000,7 +3000,7 @@ body.sheet-embedded #drop-words { min-height: 7em; }
 body.ke #drop-recent { max-height: 40vh; overflow: auto; }
 
 /* ---- Notifications block (NP S2): the operator's policy for what reaches him under quiet and sleep (devices_panel.js). */
-.np-panel[hidden] { display: none; }
+.dev-panel[hidden] { display: none; }
 .np-sentences { margin: var(--sp-2) 0 var(--sp-4); }
 .np-sentence { margin: 0 0 var(--sp-2); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--text); }
 .np-group { margin-top: var(--sp-5); }

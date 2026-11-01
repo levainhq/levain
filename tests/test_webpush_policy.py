@@ -216,7 +216,8 @@ def test_held_flush_reads_the_policy_file(tmp_path, monkeypatch):
 def test_cli_show_default_json(tmp_path, capsys):
     assert _cli(tmp_path, "policy", "show", "--json") == 0
     v = json.loads(capsys.readouterr().out)
-    assert set(v) == {"version", "cells", "classes", "default_class", "status", "status_kind", "reasons", "sentences"}
+    assert set(v) == {"version", "cells", "classes", "default_class", "status", "status_kind", "reasons", "sentences",
+                    "default_cells", "held_by_default"}
     assert v["version"] == 1 and v["cells"] == DEFAULT_CELLS and v["status"] == "default"
     assert v["status_kind"] == "default" and v["reasons"] == [] and v["default_class"] == "other"
     assert v["classes"] == presence.KIND_CLASSES and "(any other kind)" not in v["classes"]
