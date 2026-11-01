@@ -133,7 +133,7 @@
   // names, counts and path-only urls: no token, no ping body. Best effort and silent. One post per ring CONTENT: what is
   // remembered is the whole list of cache keys joined, compared for equality only, so no clock order (a device clock that
   // moved back) and no count can hide a new step. An answer that is not a settle (a refused key, 429, 5xx, no network) tries
-  // again, at most RETRIES more times, 20 s apart and then 40 s.
+  // again, at most RETRIES more times in a row, 20 s and then 40 s after (a settle resets the count).
   const SENT_KEY = "levain_trace_sent", BODY_MAX = 7600, RETRIES = 2;   // bytes: the push family's body cap is 8192
   let reporting = false, retried = 0;
   async function reportTrace() {
@@ -164,7 +164,7 @@
         headers: { "Content-Type": "application/json", "X-Levain-Write-Token": key }, body: bodyOf() });
       // settled by a 2xx, or a 400 or 413 (this body will never be accepted)
       settled = (res.status >= 200 && res.status < 300) || res.status === 400 || res.status === 413;
-      if (settled) { try { window.localStorage.setItem(SENT_KEY, sig); } catch (_) { /* resent next time */ } }
+      if (settled) { retried = 0; try { window.localStorage.setItem(SENT_KEY, sig); } catch (_) { /* resent next time */ } }
     } catch (_) { /* best effort: a report never reaches the page */ } finally {
       reporting = false;
       if (!settled && retried < RETRIES) { retried += 1; setTimeout(reportTrace, 20000 * retried); }

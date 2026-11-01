@@ -78,6 +78,8 @@ def test_an_unreadable_report_file_is_an_error_not_an_empty_history_and_a_killed
     assert len(tap_report.reports(tmp_path)) == 1                      # the history is still there
     tap_report.record(tmp_path, None, [{"t": 3}])
     assert not stale.exists() and fresh.exists()
+    (tmp_path / tap_report.FILE).write_bytes(b"\xff\xfe torn\n")                  # invalid UTF-8 is a skipped line, never a 500
+    assert tap_report.reports(tmp_path) == [] and tap_report.record(tmp_path, None, [{"t": 4}]) >= 1
 
 
 def test_the_trace_route_answers_503_when_busy_or_unwritable(tmp_path: Path, monkeypatch) -> None:
@@ -111,7 +113,7 @@ def test_the_trace_route_needs_the_credential_and_files_a_report_the_reader_prin
 
 def test_every_page_that_loads_the_tap_script_reports_with_the_key_it_holds_and_pair_card_does_not() -> None:
     js = load_web_asset("sw_open.js")
-    assert '"/webpush/trace"' in js and '"X-Levain-Write-Token": key' in js and "TextEncoder" in js and "RETRIES" in js
+    assert '"/webpush/trace"' in js and '"X-Levain-Write-Token": key' in js and "TextEncoder" in js and "RETRIES" in js and "retried = 0" in js
     assert "reportTrace" not in load_web_asset("pair_card.js")
     for page in ("dashboard.html", "pair.html", "sign.html"):
         assert '<script src="/sw_open.js"></script>' in load_web_asset(page), page

@@ -69,7 +69,7 @@ def record(queue_dir: str | os.PathLike[str], device_id: str | None, entries: li
         _sweep(d)
         # a file that exists and cannot be read is an error (503), never an empty history to replace
         try:
-            old = [ln for ln in (d / FILE).read_text(encoding="utf-8").splitlines() if ln.strip()]
+            old = [ln for ln in (d / FILE).read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
         except FileNotFoundError:
             old = []
         lines = (old[-(KEEP - 1):] if KEEP > 1 else []) + [row]
@@ -105,7 +105,7 @@ def _sweep(d: Path, *, older_than_secs: float = 3600.0) -> None:
 
 def _text(d: Path) -> str:
     try:
-        return (d / FILE).read_text(encoding="utf-8")
+        return (d / FILE).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
 
