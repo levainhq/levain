@@ -2,6 +2,12 @@
 
     push = not muted AND (urgent OR not_home OR desk inactive >= ACTIVE_WINDOW_SECS)        ... unless loud
 
+That is the shipped default. While ``quiet`` or ``sleep`` is active the operator's policy cell for the ping's class
+(``approval``, ``attention``, ``other``: :data:`KIND_CLASSES`) decides push or hold, kept in
+``<queue_dir>/webpush/policy.json`` and set with ``levain ping policy`` (operator only); a ``push`` cell pushes while
+that word is active even when the desk is active, a ``hold`` cell holds. With no policy file, or a malformed one, the
+cells are :data:`DEFAULT_CELLS`, which are the rule above.
+
 (Phill 10-25: *"++ yes that's the shape 100%"*.) A ping that is not pushed is still written to the notification record
 (:func:`levain.webpush.sender.send` with ``push=False``); only the push to the phone is held, and a held ping waits in
 the push store (:mod:`levain.webpush.held`) until the rule next says push.
@@ -9,9 +15,9 @@ the push store (:mod:`levain.webpush.held`) until the rule next says push.
 Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newest replaces the one before):
 
 - ``quiet [duration]`` and ``sleep`` are the only holding words. ``quiet`` mutes for its duration (default
-  :data:`DEFAULT_SECS`, at most :data:`MAX_SECS`); an urgent ping still pushes through it. ``sleep`` mutes until the
+  :data:`DEFAULT_SECS`, at most :data:`MAX_SECS`); by default an urgent ping still pushes through it (the policy). ``sleep`` mutes until the
   operator's next input at this machine after saying it (input is read from the macOS HID idle time: he has typed since
-  when ``now - idle`` is later than the word), urgent pings included. With no idle reading (not macOS, or the read
+  when ``now - idle`` is later than the word), urgent pings included by default (the policy). With no idle reading (not macOS, or the read
   failed) it cannot see his input, so it ends :data:`SLEEP_BLIND_SECS` after the word and ``levain ping status`` says the
   idle source is unavailable.
 - ``loud [duration|off]`` turns pings on for its duration, over every other parameter, a mute included; only its timer,
@@ -83,7 +89,8 @@ LOG_MAX_BYTES = 1 << 20   # past this the log is rotated to ``LOG_NAME + ".1"``
 # operator answers: the hook's wait (``consent``, the default kind: the permission hook, the publish gate, the limits),
 # the push gate's wait (``push``) and the asking-again of a request still pending (``reping``). ``attention``: the rows
 # the coordinator raises to him (``attention``, C11 Q1 (c)) and a dated item (``dated``). ``other``: every other kind,
-# unknown ones included (``question``, ``ruling``, ``summary``, and the self-test ``ping``, which waits for the rule).
+# unknown ones included (``question``, ``ruling``, ``summary``, the self-test ping the senders file as ``test``, and the
+# kind ``describe`` probes the rule with, ``ping``).
 CLASSES = ("approval", "attention", "other")
 KIND_CLASSES = {"consent": "approval", "push": "approval", "reping": "approval",
                 "attention": "attention", "dated": "attention"}
@@ -199,15 +206,15 @@ def kind_class(kind: object) -> str:
 _CLASS_WORDS = {"approval": "approvals", "attention": "attention items", "other": "other pings"}
 
 
-def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False, kind_class: str | None = None,
+def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False, class_name: str | None = None,
            policy: dict | None = None) -> Decision:
     """Whether a ping is pushed at ``now``. ``idle``: seconds since the operator's last input at this machine, ``None``
-    when unknown. ``kind_class`` is the ping's class (:func:`kind_class`); left unset, ``urgent`` stands for
+    when unknown. ``class_name`` is the ping's class (:func:`kind_class`); left unset, ``urgent`` stands for
     ``approval`` and not urgent for ``other``. ``policy`` is the cells (:func:`read_policy`), the shipped default when
     unset: while ``quiet`` or ``sleep`` is active the cell for (word, class) decides push or hold. Pure."""
     if _active(word, "loud", now):
         return Decision(True, "pushing", "loud: pings on until its timer ends, over every other parameter")
-    cls = kind_class if kind_class in CLASSES else ("approval" if urgent else "other")
+    cls = class_name if class_name in CLASSES else ("approval" if urgent else "other")
     cells = policy if policy is not None else DEFAULT_CELLS
     seen = None if idle is None else now - max(0.0, idle)   # when he last did something here
     mute = None
@@ -249,51 +256,65 @@ def _copy_cells(cells: dict) -> dict:
     return {m: dict(c) for m, c in cells.items()}
 
 
-def read_policy(queue_dir: Path | str | None) -> tuple[dict, str]:
-    """``(cells, status)``: the six cells in effect and ``default`` (no file), ``loaded`` or ``malformed: <reason>``.
-    A file that is absent, a symlink, not regular, oversized, unparseable or of another version is the shipped default
-    (:data:`DEFAULT_CELLS`); a missing or invalid cell takes the default cell value, so a malformed file never holds
-    more than the default does."""
-    cells = _copy_cells(DEFAULT_CELLS)
+def _read_policy(queue_dir: Path | str | None) -> tuple[dict, str, list[str]]:
+    """``(cells, kind, reasons)``: ``kind`` is ``default``, ``loaded`` or ``malformed``; ``reasons`` is empty unless
+    malformed. Any malformed reason returns the whole shipped default, never a partial file."""
     if queue_dir is None:
-        return cells, "default"
+        return _copy_cells(DEFAULT_CELLS), "default", []
+
+    def bad(*why: str) -> tuple[dict, str, list[str]]:
+        return _copy_cells(DEFAULT_CELLS), "malformed", list(why)
+
     try:
         fd = os.open(_policy_path(queue_dir), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        return cells, "default"
+        return _copy_cells(DEFAULT_CELLS), "default", []
     except OSError as e:
-        return cells, f"malformed: unreadable ({type(e).__name__})"
+        return bad(f"unreadable ({type(e).__name__})")
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return cells, "malformed: not a regular file"
+            return bad("not a regular file")
         raw = os.read(fd, _MAX_BYTES + 1)
     except OSError as e:
-        return cells, f"malformed: unreadable ({type(e).__name__})"
+        return bad(f"unreadable ({type(e).__name__})")
     finally:
         os.close(fd)
     if len(raw) > _MAX_BYTES:
-        return cells, "malformed: file too large"
+        return bad("file too large")
     try:
         got = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):
-        return cells, "malformed: not valid JSON"
+        return bad("not valid JSON")
     if not isinstance(got, dict) or got.get("version") != POLICY_VERSION or isinstance(got.get("version"), bool):
-        return cells, f"malformed: version is not {POLICY_VERSION}"
+        return bad(f"version is not {POLICY_VERSION}")
     given = got.get("cells")
     if not isinstance(given, dict):
-        return cells, "malformed: no cells"
-    bad = []
+        return bad("no cells")
+    cells: dict = {}
+    invalid = []
     for m in MUTE_WORDS:
         row = given.get(m)
+        cells[m] = {}
         for c in CLASSES:
             v = row.get(c) if isinstance(row, dict) else None
             if v in ("push", "hold"):
                 cells[m][c] = v
             else:
-                bad.append(f"{m}.{c}")
-    if bad:
-        return cells, "malformed: missing or invalid " + ", ".join(bad) + " (default used)"
-    return cells, "loaded"
+                invalid.append(f"missing or invalid cell {m}.{c}")
+    if invalid:
+        return bad(*invalid)
+    return cells, "loaded", []
+
+
+def read_policy(queue_dir: Path | str | None) -> tuple[dict, str]:
+    """``(cells, status)``: the six cells in effect and ``default`` (no file), ``loaded`` or ``malformed: <reasons>``.
+    A file that is unreadable, a symlink, not regular, oversized, unparseable, of another version, without cells, or with
+    any missing or invalid cell is malformed, and a malformed file is the WHOLE shipped default
+    (:data:`DEFAULT_CELLS`), never a partial file: it never holds more than the default does."""
+    cells, kind, reasons = _read_policy(queue_dir)
+    if kind == "malformed":
+        return cells, "malformed: " + "; ".join(reasons) + " (the whole default is in effect)"
+    return cells, kind
 
 
 def policy_is_default(cells: dict, status: str) -> bool:
@@ -319,9 +340,9 @@ def policy_sentences(cells: dict) -> dict:
 def policy_view(queue_dir: Path | str | None) -> dict:
     """The stable dict ``levain ping policy show --json`` prints."""
     cells, status = read_policy(queue_dir)
-    classes = {k: kind_class(k) for k in sorted(KIND_CLASSES)}
-    classes["(any other kind)"] = "other"
-    return {"version": POLICY_VERSION, "cells": cells, "classes": classes, "status": status,
+    kind, reasons = _read_policy(queue_dir)[1:]
+    return {"version": POLICY_VERSION, "cells": cells, "classes": dict(sorted(KIND_CLASSES.items())),
+            "default_class": "other", "status": status, "status_kind": kind, "reasons": reasons,
             "sentences": policy_sentences(cells)}
 
 
@@ -398,6 +419,7 @@ def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: di
         raise PresenceError(f"policy set takes <{'|'.join(MUTE_WORDS)}> <{'|'.join(CLASSES)}> <push|hold>")
     with _locked(queue_dir, strict=False):
         cells, _status = read_policy(queue_dir)
+        prior = _status if _status.startswith("malformed") else ""
         was = cells[mute][cls]
         cells[mute][cls] = value
         try:
@@ -405,7 +427,9 @@ def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: di
         except PresenceError as e:
             _policy_log(queue_dir, ts, word, None, "refused", str(e), strict=False)
             raise
-        _policy_log(queue_dir, ts, word, None, "set" if was != value else "unchanged", "", strict=False)
+        _policy_log(queue_dir, ts, word, None, "set" if was != value else "unchanged",
+                    f"prior file {prior.replace(' (the whole default is in effect)', '')}; rewritten from the default" if prior else "",
+                    strict=False)
     return cells
 
 
@@ -430,7 +454,7 @@ def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = 
     try:
         if idle is None:
             from levain.consent.auto_away import input_idle_seconds as idle
-        return decide(time.time() if now is None else now, read_word(queue_dir), idle(), kind_class=kind_class(kind),
+        return decide(time.time() if now is None else now, read_word(queue_dir), idle(), class_name=kind_class(kind),
                       policy=read_policy(queue_dir)[0])
     except Exception:  # noqa: BLE001 - the rule failing must not silence the phone
         return Decision(True, "pushing", "the presence rule could not be read: pushing")

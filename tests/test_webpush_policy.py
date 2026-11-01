@@ -49,6 +49,8 @@ def _file(cells):
 
 
 def test_class_map_and_urgent_kinds_derive_from_it():
+    # `dated` is a deliberate NEW kind (flow sends it for dated items), not part of the old rule; under the default
+    # it behaves like `attention`.
     for k in ("consent", "push", "reping"):
         assert presence.kind_class(k) == "approval"
     for k in ("attention", "dated"):
@@ -67,25 +69,25 @@ def test_default_policy_is_todays_rule_for_every_word_and_class(wordname, idle):
         urgent = cls != "other"
         # the old call (urgent=) and the policy call give one decision
         old = decide(NOW, word, idle, urgent=urgent)
-        assert decide(NOW, word, idle, kind_class=cls, policy=DEFAULT_CELLS) == old
-        assert decide(NOW, word, idle, kind_class=cls) == old
+        assert decide(NOW, word, idle, class_name=cls, policy=DEFAULT_CELLS) == old
+        assert decide(NOW, word, idle, class_name=cls) == old
     # the table of today's rule while muted
     if wordname == "quiet":
-        assert [decide(NOW, word, idle, kind_class=c).push for c in presence.CLASSES] == [True, True, False]
+        assert [decide(NOW, word, idle, class_name=c).push for c in presence.CLASSES] == [True, True, False]
     if wordname == "sleep" and idle != ACTIVE:   # input 10 s ago is after the word: sleep has ended
-        assert not any(decide(NOW, word, idle, kind_class=c).push for c in presence.CLASSES)
+        assert not any(decide(NOW, word, idle, class_name=c).push for c in presence.CLASSES)
 
 
 def test_phills_table_changes_exactly_those_cells():
     sleep = _w("sleep")
-    got = {c: decide(NOW, sleep, INACTIVE, kind_class=c, policy=PHILL) for c in presence.CLASSES}
+    got = {c: decide(NOW, sleep, INACTIVE, class_name=c, policy=PHILL) for c in presence.CLASSES}
     assert got["approval"].push and got["attention"].push and not got["other"].push
     assert got["approval"].why == "sleep: approvals still reach you (your policy)"
     assert got["other"].state == "muted" and got["other"].by == "sleep"
     # quiet is untouched by a sleep-only change
     quiet = _w("quiet", until=NOW + 600)
     for c in presence.CLASSES:
-        assert decide(NOW, quiet, ACTIVE, kind_class=c, policy=PHILL) == decide(NOW, quiet, ACTIVE, kind_class=c)
+        assert decide(NOW, quiet, ACTIVE, class_name=c, policy=PHILL) == decide(NOW, quiet, ACTIVE, class_name=c)
 
 
 def test_every_cell_decides_while_muted_and_loud_and_unmuted_are_unchanged():
@@ -93,20 +95,20 @@ def test_every_cell_decides_while_muted_and_loud_and_unmuted_are_unchanged():
         cells = {m: dict(c) for m, c in DEFAULT_CELLS.items()}
         cells[mute][cls] = value
         word = _w(mute, until=NOW + 600)
-        assert decide(NOW, word, INACTIVE, kind_class=cls, policy=cells).push is (value == "push")
+        assert decide(NOW, word, INACTIVE, class_name=cls, policy=cells).push is (value == "push")
         # loud first, whatever the policy
         loud = _w("loud", until=NOW + 600)
-        assert decide(NOW, loud, INACTIVE, kind_class=cls, policy=cells).push is True
+        assert decide(NOW, loud, INACTIVE, class_name=cls, policy=cells).push is True
         # no mute word: urgent classes push, other follows measurement; the policy is not read
-        assert decide(NOW, None, ACTIVE, kind_class=cls, policy=cells) == decide(NOW, None, ACTIVE, urgent=cls != "other")
+        assert decide(NOW, None, ACTIVE, class_name=cls, policy=cells) == decide(NOW, None, ACTIVE, urgent=cls != "other")
     # a sleep that has ended (he typed) is no mute: the policy does not apply
-    assert decide(NOW, _w("sleep"), 0.0, kind_class="other", policy={
+    assert decide(NOW, _w("sleep"), 0.0, class_name="other", policy={
         "quiet": DEFAULT_CELLS["quiet"], "sleep": {"approval": "hold", "attention": "hold", "other": "hold"}}).state == "holding"
 
 
 def test_quiet_other_push_is_named_as_policy():
     cells = {"quiet": {"approval": "push", "attention": "push", "other": "push"}, "sleep": DEFAULT_CELLS["sleep"]}
-    d = decide(NOW, _w("quiet", until=NOW + 600), ACTIVE, kind_class="other", policy=cells)
+    d = decide(NOW, _w("quiet", until=NOW + 600), ACTIVE, class_name="other", policy=cells)
     assert d.push and "your policy" in d.why
 
 
@@ -122,16 +124,42 @@ def test_read_policy_default_loaded_and_malformed(tmp_path):
         assert cells == DEFAULT_CELLS and status.startswith("malformed"), bad[:30]
 
 
-def test_a_bad_cell_takes_the_default_value_and_never_silences_more(tmp_path):
+def test_a_bad_cell_makes_the_whole_file_the_default(tmp_path):
     cells = {"quiet": {"approval": "hold", "attention": "banana", "other": "push"},
              "sleep": {"approval": "push", "other": None}}
     _write(tmp_path, _file(cells))
     got, status = presence.read_policy(tmp_path)
     assert status.startswith("malformed") and "quiet.attention" in status and "sleep.other" in status
-    assert got["quiet"] == {"approval": "hold", "attention": "push", "other": "push"}   # the valid cells stand
-    assert got["sleep"] == {"approval": "push", "attention": "hold", "other": "hold"}
-    # bad attention cell in quiet reads as push (the default), so the file silences no more than the default does
-    assert presence.should_push(tmp_path, "attention", now=NOW, idle=lambda: ACTIVE).push is True
+    assert "whole default" in status and "(default used)" not in status
+    assert got == DEFAULT_CELLS   # no valid cell of a malformed file stands
+    # one bad cell plus quiet.approval=hold: quiet approval PUSHES (the default), the hold is not honoured
+    bad = {"quiet": {"approval": "hold", "attention": "push", "other": "hold"},
+           "sleep": {"approval": "hold", "attention": "hold", "other": "banana"}}
+    _write(tmp_path, _file(bad))
+    cells2, status2 = presence.read_policy(tmp_path)
+    assert cells2["quiet"]["approval"] == "push" and status2.startswith("malformed")
+    presence.set_word(tmp_path, "quiet", now=NOW - 10)
+    assert presence.should_push(tmp_path, "consent", now=NOW, idle=lambda: ACTIVE).push is True
+
+
+def test_policy_view_shape_malformed(tmp_path):
+    _write(tmp_path, _file({"quiet": {"approval": "hold", "attention": "push", "other": "hold"},
+                           "sleep": {"approval": "hold", "attention": "hold", "other": "banana"}}))
+    v = presence.policy_view(tmp_path)
+    assert v["status_kind"] == "malformed" and v["reasons"] == ["missing or invalid cell sleep.other"]
+    assert v["status"].startswith("malformed: ") and v["cells"] == DEFAULT_CELLS and v["default_class"] == "other"
+    _write(tmp_path, _file(PHILL))
+    v = presence.policy_view(tmp_path)
+    assert v["status_kind"] == "loaded" and v["reasons"] == [] and v["status"] == "loaded"
+
+
+def test_set_policy_on_a_malformed_file_logs_the_prior_status(tmp_path):
+    _write(tmp_path, "{nope")
+    cells = presence.set_policy(tmp_path, "quiet", "other", "push", now=NOW)
+    assert cells["quiet"]["other"] == "push" and cells["sleep"] == DEFAULT_CELLS["sleep"]
+    rows = [json.loads(line) for line in (tmp_path / "webpush" / "presence.log.jsonl").read_text().splitlines()]
+    assert "prior file malformed: not valid JSON" in rows[-1]["why"] and "rewritten from the default" in rows[-1]["why"]
+    assert presence.read_policy(tmp_path)[1] == "loaded"
 
 
 def test_malformed_file_is_the_default_decision(tmp_path):
@@ -182,14 +210,16 @@ def test_held_flush_reads_the_policy_file(tmp_path, monkeypatch):
     _write(tmp_path, _file(PHILL))
     monkeypatch.setattr(PushStore, "held_items", lambda self, now=None: [{"kind": "consent", "reason": "muted", "id": 1}])
     held._plan_now(tmp_path, NOW, lambda: 500.0)
-    assert seen["policy"] == PHILL and seen["kind_class"] == "approval"
+    assert seen["policy"] == PHILL and seen["class_name"] == "approval"
 
 
 def test_cli_show_default_json(tmp_path, capsys):
     assert _cli(tmp_path, "policy", "show", "--json") == 0
     v = json.loads(capsys.readouterr().out)
-    assert set(v) == {"version", "cells", "classes", "status", "sentences"}
+    assert set(v) == {"version", "cells", "classes", "default_class", "status", "status_kind", "reasons", "sentences"}
     assert v["version"] == 1 and v["cells"] == DEFAULT_CELLS and v["status"] == "default"
+    assert v["status_kind"] == "default" and v["reasons"] == [] and v["default_class"] == "other"
+    assert v["classes"] == presence.KIND_CLASSES and "(any other kind)" not in v["classes"]
     assert v["classes"]["dated"] == "attention" and v["classes"]["consent"] == "approval"
     assert v["sentences"]["sleep"] == "In sleep: nothing reaches you until you are back"
     assert not (tmp_path / "webpush" / "policy.json").exists()

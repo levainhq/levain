@@ -174,7 +174,10 @@ def _policy_show(args: argparse.Namespace) -> int:
     for m in presence.MUTE_WORDS:
         print(f"{m:<7}" + "".join(f"{view['cells'][m][c]:<11}" for c in presence.CLASSES))
     print("classes: " + "; ".join(f"{c}: " + ", ".join(k for k, v in view["classes"].items() if v == c)
-                                  for c in presence.CLASSES))
+                                  for c in presence.CLASSES if c != view["default_class"]) +
+          f"; any other kind -> {view['default_class']}")
+    for r in view["reasons"]:
+        print(f"malformed: {r}")
     for m in presence.MUTE_WORDS:
         print(view["sentences"][m])
     return 0

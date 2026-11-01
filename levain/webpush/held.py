@@ -77,7 +77,7 @@ def plan(items: list[dict], word: dict | None, idle: float | None, now: float,
     active: list[dict] = []
     muted: list[dict] = []
     for item in items:
-        d = presence.decide(now, word, idle, kind_class=presence.kind_class(item["kind"]), policy=policy)
+        d = presence.decide(now, word, idle, class_name=presence.kind_class(item["kind"]), policy=policy)
         if item["reason"] == "active":
             if d.push:
                 active.append(item)
