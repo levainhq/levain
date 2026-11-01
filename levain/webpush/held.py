@@ -47,6 +47,32 @@ STAMP_NAME = "flush.spawned"
 SPAWN_LOCK_NAME = "flush.spawn.lock"
 
 
+NOTICES_SUMMARY_URL = "/?view=notices"
+_NOTICE_KINDS = ("notify", "notify_urgent")
+_SUMMARY_SOURCES = 4     # the sources a notice summary names before "and N more"
+
+
+def _is_notice(item: dict) -> bool:
+    return item.get("kind") in _NOTICE_KINDS
+
+
+def notice_summary(items: list[dict]) -> str:
+    """The one line that goes before released notices: how many, and from which sources (the ref's source, in the order
+    each first appeared), e.g. ``2 notices held: nightly-backup, site-monitor``; an empty string when there are none."""
+    if not items:
+        return ""
+    names: list[str] = []
+    for i in items:
+        ref = i.get("ref") or ""
+        name = ref[len("notify:"):] if ref.startswith("notify:") else "unknown"
+        if name not in names:
+            names.append(name)
+    shown = ", ".join(names[:_SUMMARY_SOURCES]) + (f" and {len(names) - _SUMMARY_SOURCES} more"
+                                                   if len(names) > _SUMMARY_SOURCES else "")
+    n = len(items)
+    return f"{n} notice{'' if n == 1 else 's'} held: {shown}"
+
+
 def _db(queue_dir: Path | str) -> Path:
     from levain.webpush.store import DB_NAME, DIR_NAME
 
@@ -198,14 +224,24 @@ def _flush(queue_dir: Path | str, at: float, idle: Callable[[], float | None] | 
     muted = [i for i in muted if i["ping_id"] in claimed]
     active = [i for i in active if i["ping_id"] in claimed]
     qdir = Path(queue_dir)
-    if muted:
-        by = {i["reason"] for i in muted}
+    # a held notice is summarised on its own, naming its sources, and opens the notices view: it is never counted among
+    # the pings that wait on him, and the needs view is never where a notice leads
+    seat_muted = [i for i in muted if not _is_notice(i)]
+    notice_muted = [i for i in muted if _is_notice(i)]
+    if seat_muted:
+        by = {i["reason"] for i in seat_muted}
         what = "quiet" if by == {"quiet"} else "asleep" if by == {"sleep"} else "muted"
-        n = len(muted)
+        n = len(seat_muted)
         try:
             sender.send(qdir, kind="summary", ref=None, title="levain", url=SUMMARY_URL,
                         body=f"{n} ping{'' if n == 1 else 's'} held while you were {what}; they follow.")
         except Exception:  # noqa: BLE001 - the pings themselves still go
+            pass
+    summary = notice_summary(notice_muted)
+    if summary:
+        try:
+            sender.send(qdir, kind="summary", ref=None, title="levain", url=NOTICES_SUMMARY_URL, body=summary)
+        except Exception:  # noqa: BLE001 - the notices themselves still go
             pass
     pushed = 0
     for item in muted + active:

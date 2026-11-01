@@ -1557,6 +1557,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     _register_webpush(subparsers)
 
+    from levain.webpush.notify_cli import register as _register_notify
+
+    _register_notify(subparsers)
+
     from levain.slot.launch import register as _register_session
 
     _register_session(subparsers)

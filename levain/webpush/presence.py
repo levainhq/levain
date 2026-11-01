@@ -91,10 +91,13 @@ LOG_MAX_BYTES = 1 << 20   # past this the log is rotated to ``LOG_NAME + ".1"``
 # the push gate's wait (``push``) and the asking-again of a request still pending (``reping``). ``attention``: the rows
 # the coordinator raises to him (``attention``, C11 Q1 (c)) and a dated item (``dated``). ``other``: every other kind,
 # unknown ones included (``question``, ``ruling``, ``summary``, the self-test ping the senders file as ``test``, and the
-# kind ``describe`` probes the rule with, ``ping``).
+# kind ``describe`` probes the rule with, ``ping``). A posted notice (:mod:`levain.webpush.notify`) files as ``notify``
+# (``other``) or, from a token the operator marked urgent, ``notify_urgent``, which SHARES the ``attention`` cell: the
+# operator's table stays the one authority and no sender rings through a hold he set.
 CLASSES = ("approval", "attention", "other")
 KIND_CLASSES = {"consent": "approval", "push": "approval", "reping": "approval",
-                "attention": "attention", "dated": "attention"}
+                "attention": "attention", "dated": "attention",
+                "notify": "other", "notify_urgent": "attention"}
 # urgent = approval or attention: derived from the map, not a second copy.
 URGENT_KINDS = frozenset(k for k, c in KIND_CLASSES.items() if c in ("approval", "attention"))
 MUTE_WORDS = ("quiet", "sleep")
