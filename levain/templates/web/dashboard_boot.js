@@ -743,9 +743,42 @@
     return postVerb(action, params, {});
   }
 
-  // The NEEDS YOU band as this credential is shown it (Q17-ALL S5b): reading it numbers what is shown and records the view
-  // the answer below binds to. Rejects when the cockpit has no band to show (no question store) or cannot read it.
-  function bandRead() { return authedReadJson("/cockpit/band.json"); }
+  // The band's summary (W2): count, headlines, kinds and a {source, id} key per open item, plus `queue`. It records no
+  // view and can answer nothing: the read for anything that only shows or counts the band.
+  function bandSummary() { return authedReadJson("/cockpit/needs.json"); }
+
+  // The NEEDS YOU band as this credential is shown it (Q17-ALL S5b): reading band.json numbers what is shown and records
+  // the view the answer below binds to. The page records it only when the queue changed (W2): the summary is read first,
+  // and while it describes exactly what the last band.json read showed (same store, same queue, the same items under the
+  // same numbers, no note on either) that read is handed back and nothing is recorded. Any answer drops it, so the read
+  // after an answer, a stale refusal included, is a fresh band.json. Rejects when the cockpit has no band to show (no
+  // question store) or cannot read it.
+  let bandShown = null;           // the last band.json read this page drew from, while it can still be answered from
+  function bandKeys(list, keyOf) {
+    return list.map((it) => { const k = keyOf(it) || {}; return k.kind + "\u0000" + k.id + "\u0000" + it.n; }).sort().join("\u0001");
+  }
+  function bandSame(sum, shown) {
+    if (!sum || typeof sum !== "object" || !shown || typeof shown !== "object") return false;
+    if (sum.note || shown.note || shown.view_id === null || shown.view_id === undefined) return false;
+    if (typeof sum.queue !== "string" || sum.queue !== shown.queue || sum.store_id !== shown.store_id) return false;
+    const si = Array.isArray(sum.items) ? sum.items : null;
+    const bi = Array.isArray(shown.items) ? shown.items : null;
+    if (!si || !bi || si.length !== bi.length || si.some((it) => !it || !Number.isInteger(it.n))) return false;
+    return bandKeys(si, (it) => it.key && { kind: it.key.source, id: it.key.id })
+      === bandKeys(bi, (it) => it && it.subject && { kind: it.subject.kind, id: it.subject.id });
+  }
+  async function bandRead() {
+    const held = bandShown;
+    if (held) {
+      let sum = null;
+      try { sum = await bandSummary(); } catch (_) { sum = null; }     // a summary that fails costs one band.json read
+      if (held === bandShown && bandSame(sum, held)) return held;
+    }
+    bandShown = null;
+    const b = await authedReadJson("/cockpit/band.json");
+    bandShown = b;
+    return b;
+  }
 
   // answer the band by its shorthand ("15b", "1a 2b"): the decisions panel's offered band_answer (C1, unsigned, a human
   // channel), bound to the view the page was shown ({store_id, view_id}). A 409 means another view was shown since.
@@ -753,7 +786,9 @@
     if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
     const action = panelActionFor("band_answer", null);
     if (!action) return { ok: false, error: "not_offered", message: "the cockpit no longer offers an answer here; nothing was sent" };
-    return postVerb(action, { text: text, store_id: storeId, view_id: viewId }, {});
+    bandShown = null;     // whatever the answer did, the next band read is a fresh band.json
+    try { return await postVerb(action, { text: text, store_id: storeId, view_id: viewId }, {}); }
+    finally { bandShown = null; }
   }
 
   // dismiss an agent's note: the row's own offered note_dismiss (C1, no confirm, no params). It tells the agent nothing;
@@ -887,7 +922,7 @@
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
         window.LevainDashboard.render(mview, mview.writable
-          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
+          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, bandSummary, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;

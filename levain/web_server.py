@@ -157,6 +157,11 @@ _QUESTION_ID = re.compile(r"[1-9][0-9]{0,11}")
 # ``cockpit:<credential name>``, the viewer ``band_answer`` binds to). Its words are the agents', so it rides the
 # question body's gate exactly (a surface token on every bind).
 _BAND_PATH = "/cockpit/band.json"
+# The band's SUMMARY (W2): GET /cockpit/needs.json, ``band_view.summary``: the count, headlines, kinds and a stable
+# ``{source, id}`` key per open item, plus ``queue``. It records no view and carries no version or view id, so nothing
+# read from it can answer; it is the read for every surface that only shows or counts. Its headlines are the agents'
+# words, so it rides the band's gate exactly.
+_NEEDS_PATH = "/cockpit/needs.json"
 # One agent note's body: GET /cockpit/note/<n>.json. Its words are the agent's, so the row carries none of them and this
 # route serves them behind the question body's gate exactly (a surface token on every bind).
 _NOTE_BODY_PREFIX = "/cockpit/note/"
@@ -2074,11 +2079,14 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
-    def _serve_band(self, *, head: bool) -> None:
+    def _serve_band(self, *, head: bool, summary: bool = False) -> None:
         """``GET /cockpit/band.json``: the band as this credential is shown it (:func:`levain.band_view.band_payload`
         for ``cockpit:<credential name>``, the exact viewer ``band_answer`` binds to): ``{seen_through, store_id,
         view_id, items, note}``. A HEAD shows nothing (no number, no view). Behind the question body's gate: a
-        surface token on every bind. Without a question store, 404."""
+        surface token on every bind. Without a question store, 404.
+
+        ``summary`` (``GET /cockpit/needs.json``): :func:`levain.band_view.summary` behind the same gate, and no
+        viewer is named, so no view is recorded for anyone."""
         hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
         if not self._off_box_token_valid():
             self._gated_read_403("the band needs", head=head)
@@ -2098,8 +2106,11 @@ class _Handler(GuardedHandler):
             return
         try:
             from levain import band_view
-            viewer = f"cockpit:{self._credential(required=True).get('name') or 'web'}"
-            status, payload = 200, band_view.band_payload(store, viewer)
+            if summary:
+                status, payload = 200, band_view.summary(store)
+            else:
+                viewer = f"cockpit:{self._credential(required=True).get('name') or 'web'}"
+                status, payload = 200, band_view.band_payload(store, viewer)
         except _CredentialUnavailable:   # RU-5: only the outer catch answers it
             raise
         except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
@@ -3106,6 +3117,9 @@ class _Handler(GuardedHandler):
             return
         if path == _BAND_PATH:
             self._serve_band(head=head)
+            return
+        if path == _NEEDS_PATH:
+            self._serve_band(head=head, summary=True)
             return
         if path.startswith(_NOTE_BODY_PREFIX) and path.endswith(_CONSENT_BODY_SUFFIX):
             self._serve_note_body(path, head=head)
