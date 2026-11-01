@@ -959,6 +959,15 @@
   const FILTER_KEY = "levain_cockpit_filter:";
   const MODE_KEY = "levain_cockpit_mode";
   const MODES = ["morning", "board", "build", "memory"];
+  // The one nav's six destinations (Phill 10-30: one cockpit across phone, tablet and desktop). Each shows one of the four page views;
+  // Inbox and Grants have no page of their own yet, so they open Board and go to the closest block (goDest). `morning` is the old
+  // name of Now: an address or a kept value that says it still lands there.
+  const DESTS = ["now", "board", "inbox", "grants", "build", "memory"];
+  const DEST_MODE = { now: "morning", board: "board", inbox: "board", grants: "board", build: "build", memory: "memory" };
+  const MODE_DEST = { morning: "now", board: "board", build: "build", memory: "memory" };
+  const NAMES = DESTS.concat(["morning"]);
+  function destOf(name) { const n = String(name || "").replace(/=$/, ""); return DESTS.indexOf(n) >= 0 ? n : (n === "morning" ? "now" : ""); }
+  let curDest = "";
   const SEARCH_DEBOUNCE_MS = 250;
   const STORE_LIMIT = 50;
   let hoverPanel = null;                // the panel the pointer last entered: `/` filters the panel you are looking at
@@ -2141,14 +2150,15 @@
     writeLayout(l);
   }
   // ---- the modes and the keys ----
-  // A tab named in the address: `#morning|#board|#build|#memory`, alone or beside other fragment parts (`#write_token=...&board`).
+  // A destination named in the address: `#now|#board|#inbox|#grants|#build|#memory` (or the old `#morning`), alone or beside other fragment parts (`#write_token=...&board`).
   // A bare name may arrive spelled `name=`: dashboard_boot.js strips the write token through URLSearchParams, which writes every
   // part it keeps as `key=value`. The name is read with that suffix removed and, when the address is rewritten, written bare.
-  const hashParts = () => String((root.location && root.location.hash) || "").replace(/^#/, "").split("&").filter(Boolean).map((p) => (MODES.indexOf(p.replace(/=$/, "")) >= 0 ? p.replace(/=$/, "") : p));
-  function hashMode() { return hashParts().find((p) => MODES.indexOf(p) >= 0) || ""; }
-  // the address follows the tab the reader chose; any other fragment part stays
+  const hashParts = () => String((root.location && root.location.hash) || "").replace(/^#/, "").split("&").filter(Boolean).map((p) => (NAMES.indexOf(p.replace(/=$/, "")) >= 0 ? p.replace(/=$/, "") : p));
+  function hashDest() { const p = hashParts().find((q) => NAMES.indexOf(q) >= 0); return p ? destOf(p) : ""; }
+  function hashMode() { const d = hashDest(); return d ? DEST_MODE[d] : ""; }
+  // the address follows the destination the reader chose; any other fragment part stays
   function writeHash(m) {
-    try { root.history.replaceState(null, "", root.location.pathname + root.location.search + "#" + hashParts().filter((p) => MODES.indexOf(p) < 0).concat(m).join("&")); }
+    try { root.history.replaceState(null, "", root.location.pathname + root.location.search + "#" + hashParts().filter((p) => NAMES.indexOf(p) < 0).concat(m).join("&")); }
     catch (_) { /* an address that cannot be rewritten is still a working page */ }
   }
   // `fromReader`: the tab was chosen by the reader (a click, a key, the jump box), so the address follows; the first paint does not write it
@@ -2159,18 +2169,40 @@
       try { dropSky(s); s.body.replaceChildren(); paintSky(s, s.body, s.data.sky); } catch (_) { /* the next paint remounts */ }
     }
   }
-  function applyMode(m, fromReader) {
+  // `dest`: the destination that chose the view (Inbox and Grants both show Board); without one, the destination already current if it
+  // shows this view, else the view's own
+  function applyMode(m, fromReader, dest) {
     if (MODES.indexOf(m) < 0) m = "board";
+    if (!dest || DEST_MODE[dest] !== m) dest = DEST_MODE[curDest] === m ? curDest : MODE_DEST[m];
+    curDest = dest;
     document.body.dataset.mode = m;
-    save(MODE_KEY, m);
-    if (fromReader) writeHash(m);
-    for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
+    document.body.dataset.dest = dest;
+    save(MODE_KEY, dest);
+    if (fromReader) writeHash(dest);
+    for (const b of document.querySelectorAll(".ck-dest")) {
+      const on = b.dataset.dest === dest;
+      b.setAttribute("aria-selected", on ? "true" : "false");
+      if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+    }
     resizeSkies();
     fillGrids();
     // the header lens is on every tab but Memory (going to Memory ends its replay and stops its stream loop), the Sessions card on Build only
     try { paintHeaderLens(); paintBuildSessions(); } catch (_) { /* the card repaints on the next poll */ }
     // the layout controls read what the tab shows: any tab change, by click, key, address or reveal, asks them to refresh
     if (typeof document.dispatchEvent === "function") document.dispatchEvent(new Event("ck-layout-refresh"));
+  }
+  // Inbox and Grants go to the closest block that exists: the Inbox panel (else the notifications), the standing grants in the Decisions view
+  function goDest(d) {
+    const J = root.LevainPhoneJump;
+    if (typeof J !== "function") return;
+    if (d === "grants") J("grants", document.querySelector('.ck-dest[data-dest="grants"]'));
+    else if (d === "inbox") J(document.querySelector('.panel[data-ck-panel="inbox"]') ? "inbox" : "notes", document.querySelector('.ck-dest[data-dest="inbox"]'));
+  }
+  // `fromReader`: chosen by the reader (click, key, address change); `go`: also go to the destination's block
+  function applyDest(d, fromReader, go) {
+    d = destOf(d) || "board";
+    applyMode(DEST_MODE[d], fromReader, d);
+    if (go) goDest(d);
   }
   // the first tab that shows a panel: the one it is on if it shows it, else Board if it does, else the first it names. A node with no
   // tab list (page chrome) is on every tab.
@@ -2740,10 +2772,10 @@
 
   function install() {
     // the address wins over the tab kept for this browser tab; an unknown fragment falls back to the kept one, then Board
-    applyMode(hashMode() || saved(MODE_KEY) || "board");
+    applyDest(hashDest() || destOf(saved(MODE_KEY)) || "board");
     setTheme(queryTheme() || storedTheme(), false);
     if (root.matchMedia) { const mq = root.matchMedia("(prefers-color-scheme: light)"); if (mq.addEventListener) mq.addEventListener("change", paintThemeSwitch); }
-    if (typeof root.addEventListener === "function") root.addEventListener("hashchange", () => { const m = hashMode(); if (m) applyMode(m); });
+    if (typeof root.addEventListener === "function") root.addEventListener("hashchange", () => { const d = hashDest(); if (d) applyDest(d, false, true); });
     document.addEventListener("click", (ev) => {
       const b = ev.target && ev.target.closest ? ev.target.closest("[data-theme-set]") : null;
       if (b) setTheme(b.dataset.themeSet, true);
@@ -2762,9 +2794,9 @@
     let fillTimer = 0;
     if (typeof root.addEventListener === "function") root.addEventListener("resize", () => { root.clearTimeout(fillTimer); fillTimer = root.setTimeout(fillGrids, 120); });
     document.addEventListener("click", (ev) => {
-      const t = ev.target && ev.target.closest ? ev.target.closest("[data-mode-tab],#jumpbtn") : null;
+      const t = ev.target && ev.target.closest ? ev.target.closest(".ck-dest,#jumpbtn") : null;
       if (!t) return;
-      if (t.id === "jumpbtn") openJump(); else applyMode(t.dataset.modeTab, true);
+      if (t.id === "jumpbtn") openJump(); else applyDest(t.dataset.dest, true, true);
     });
     // a filter keeps focus through a re-render until the operator goes somewhere else
     document.addEventListener("mousedown", (ev) => { if (!(ev.target && ev.target.closest && ev.target.closest(".xfilter"))) focusKeep = null; });
@@ -2786,7 +2818,7 @@
         const onScreen = r.bottom > 0 && r.top < (root.innerHeight || document.documentElement.clientHeight);
         near.focus(onScreen ? { preventScroll: true } : undefined);
         near.select();
-      } else if (ev.key.length === 1 && "1234".indexOf(ev.key) >= 0) applyMode(MODES["1234".indexOf(ev.key)], true);
+      } else if (ev.key.length === 1 && "123456".indexOf(ev.key) >= 0) applyDest(DESTS["123456".indexOf(ev.key)], true, true);
     });
   }
   if (typeof document !== "undefined") {
@@ -2794,7 +2826,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, applyDest, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

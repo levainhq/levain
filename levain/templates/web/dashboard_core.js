@@ -600,7 +600,7 @@
     const dropHost = document.getElementById("ck-drop");
     if (dropHost && !on) dropHost.hidden = true;   // the Send box sits under the Needs-you row, outside #ck-hero: it leaves with the KE page, and the next KE render (renderDropHero) shows it again
     const needsHost = document.getElementById("ck-needs");
-    if (needsHost && !on) clearNeeds(needsHost);   // the strip is drawn only by the KE page, and only while something waits (renderNeeds)
+    if (needsHost && !on) { clearNeeds(needsHost); paintNeedsPill([]); }   // the strip is drawn only by the KE page, and only while something waits (renderNeeds)
     const notesHost = document.getElementById("ck-notes");
     if (notesHost && !on) { clearNeeds(notesHost); noteBodies.clear(); }   // and the notes strip, likewise (renderNotes)
     // the hero's legend follows the hero: shown by the sky's own render, hidden with the region
@@ -6011,6 +6011,36 @@
     });
     return card;
   }
+  // The header's Needs pill: the count of what waits on him, one tap from any destination. It opens the same sheet a row of the strip
+  // opens (the first waiting item's focus view); with nothing waiting it is not drawn.
+  let needsPillItems = [];
+  function paintNeedsPill(items) {
+    needsPillItems = items || [];
+    const pill = document.getElementById("ck-needs-pill");
+    if (!pill) return;
+    const n = needsPillItems.length;
+    pill.hidden = n === 0;
+    const num = document.getElementById("ck-needs-pill-n");
+    if (num) num.textContent = String(n);
+    pill.setAttribute("aria-label", n + " waiting on you");
+  }
+  document.addEventListener("click", (ev) => {
+    const pill = ev.target && ev.target.closest ? ev.target.closest("#ck-needs-pill") : null;
+    if (!pill) return;
+    if (needsPillItems.length) openNeedsFocus(needsPillItems[0], pill); else openDecisionsHistory(pill);
+  });
+  // The header's settings avatar: the settings page is another lane's; until it lands the avatar goes to the closest thing there is,
+  // the paired-devices panel, and says so to a page that wants to take it over (the event is cancelable: a handler that opens settings
+  // calls preventDefault and the fallback does not run).
+  document.addEventListener("click", (ev) => {
+    const av = ev.target && ev.target.closest ? ev.target.closest("#ck-avatar") : null;
+    if (!av) return;
+    if (!av.dispatchEvent(new CustomEvent("ck-open-settings", { bubbles: true, cancelable: true }))) return;
+    const dev = document.querySelector('[data-zone="devices"]');
+    const K = window.LevainCockpitKinds;
+    if (dev && K && typeof K.revealTab === "function") K.revealTab(dev);
+    if (dev && typeof dev.scrollIntoView === "function") window.requestAnimationFrame(() => dev.scrollIntoView({ block: "start" }));
+  });
   function clearNeeds(host) {
     host.replaceChildren();
     host.hidden = true;
@@ -6073,6 +6103,7 @@
     const host = document.getElementById("ck-needs");
     if (!host) return;
     const items = needsItems(((view.extra_panels || {}).decisions || {}).lines);
+    paintNeedsPill(items);
     if (!items.length) { clearNeeds(host); return; }
     // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
     // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits
@@ -7845,6 +7876,7 @@
     needs: "#ck-needs:not([hidden])",
     board: ".panel[data-ck-panel=\"tray\"]",
     notes: ".panel[data-ck-panel=\"notifications\"]",
+    inbox: ".panel[data-ck-panel=\"inbox\"]",
   };
   const PHONE_JUMP_WAIT_MS = CONSENT_FETCH_TIMEOUT_MS + 5000, PHONE_JUMP_STEP_MS = 150, PHONE_JUMP_STEADY = 2;
   // `slot`: where the tab's section sits once it is drawn; `filled`: the same node once its read has filled it (the grants heading
@@ -7914,6 +7946,7 @@
   });
   for (const type of ["touchstart", "wheel"]) document.addEventListener(type, () => { phoneJumpRun++; }, { passive: true, capture: true });
 
+  window.LevainPhoneJump = phoneJump;   // the one nav's Inbox and Grants destinations go to their closest block through it (cockpit_view.js goDest)
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };

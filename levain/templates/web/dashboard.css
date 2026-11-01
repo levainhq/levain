@@ -2998,3 +2998,54 @@ body.sheet-embedded #drop-words { min-height: 7em; }
 @media (max-width: 760px) { .modal.modal-sheet { height: 100dvh; max-height: 100dvh; } }
 /* the drop sheet's list of his drops grows with his history: it scrolls inside the sheet */
 body.ke #drop-recent { max-height: 40vh; overflow: auto; }
+
+/* ═══════════════════════════ THE ONE NAV (W1c): six destinations, one element, three shapes ═══════════════════════════
+   Now, Board, Inbox, Grants, Build, Memory. Under 600px a bar at the foot of the screen (the thumb's edge), from 600 a rail down the
+   left (icon over a short name), from 840 a sidebar (icon, name, the key). The shape is the screen's width and nothing else: no
+   device is asked what it is and nothing is hidden from one (Phill 10-30: "no driving rule"). The header above it is one row of
+   chips: the live chip, the Needs pill, Sync, Jump, the theme switch and the settings avatar. */
+:root { --nav-w: 0px; --nav-h: 0px; }
+.ck-nav { position: fixed; z-index: 10; display: flex; background: var(--base); border-color: var(--hair); border-style: solid; border-width: 0; box-sizing: border-box; }
+.ck-dest { display: flex; align-items: center; justify-content: center; background: none; border: 0; border-radius: var(--r-md); color: var(--label); cursor: pointer; font: var(--fw-semibold) var(--fs-meta) var(--round); position: relative; }
+.ck-dest svg { width: 22px; height: 22px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.ck-dest kbd { font: var(--fw-regular) var(--fs-micro) var(--mono); color: var(--meta); }
+.ck-dest[aria-selected="true"] { background: var(--card-2); color: var(--text); }
+.ck-dest[aria-selected="true"] svg { stroke: var(--accent); }
+.ck-needs-pill { display: inline-flex; align-items: center; gap: var(--sp-3); min-height: var(--ctl-md); padding: 0 var(--sp-4); border-radius: var(--r-pill); cursor: pointer;
+  border: 1px solid var(--accent-line); background: var(--accent-soft); color: var(--accent); font: var(--fw-semibold) var(--fs-meta)/1 var(--round); }
+.ck-needs-pill[hidden] { display: none; }
+.ck-needs-pill b { font: var(--fw-bold) var(--fs-meta)/1 var(--mono); }
+.ck-avatar { display: inline-grid; place-items: center; width: var(--ctl-md); height: var(--ctl-md); padding: 0; border-radius: var(--r-pill); cursor: pointer; background: var(--card); border: 1px solid var(--hair); color: var(--label); }
+.ck-avatar svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; }
+.ck-avatar:hover, .ck-needs-pill:hover { filter: brightness(1.12); }
+.ck-nav kbd { display: none; }
+
+/* under 600: the bar */
+@media (width < 600px) {
+  :root { --nav-h: calc(56px + env(safe-area-inset-bottom, 0px)); }
+  body { padding-bottom: var(--nav-h); }
+  .ck-nav { left: 0; right: 0; bottom: 0; height: var(--nav-h); padding: 0 var(--sp-2) env(safe-area-inset-bottom, 0px); border-top-width: 1px; justify-content: space-around; }
+  .ck-dest { flex: 1 1 0; min-width: 0; flex-direction: column; gap: 2px; align-self: stretch; font-size: var(--fs-micro); }
+  .ck-needs-pill { min-height: var(--hit-min); }
+  .ck-avatar { width: var(--hit-min); height: var(--hit-min); }
+}
+/* 600 to 839: the rail */
+@media (600px <= width < 840px) {
+  :root { --nav-w: 76px; }
+  body { padding-left: var(--nav-w); }
+  .ck-nav { top: 0; bottom: 0; left: 0; width: var(--nav-w); padding: var(--sp-5) var(--sp-2); border-right-width: 1px; flex-direction: column; align-items: stretch; gap: var(--sp-2); }
+  .ck-dest { flex-direction: column; gap: 3px; min-height: var(--hit-min); padding: var(--sp-3) 0; font-size: var(--fs-micro); }
+  .ck-needs-pill { min-height: var(--hit-min); }
+  .ck-avatar { width: var(--hit-min); height: var(--hit-min); }
+}
+/* 840 and up: the sidebar */
+@media (width >= 840px) {
+  :root { --nav-w: 196px; }
+  body { padding-left: var(--nav-w); }
+  .ck-nav { top: 0; bottom: 0; left: 0; width: var(--nav-w); padding: var(--sp-6) var(--sp-4); border-right-width: 1px; flex-direction: column; align-items: stretch; gap: var(--sp-2); }
+  .ck-dest { justify-content: flex-start; gap: var(--sp-4); min-height: var(--hit-min); padding: 0 var(--sp-4); font-size: var(--fs-body); }
+  .ck-dest kbd { display: inline; margin-left: auto; }
+}
+@media (pointer: coarse) { .ck-dest { min-height: var(--hit-min); } }
+/* wrapped (<= 1100px) the brand, the pill and the avatar stay on the first row (order 0); the rest of the bar follows */
+@media (width <= 480px) { .ck-needs-pill .ck-pill-you { display: none; } }

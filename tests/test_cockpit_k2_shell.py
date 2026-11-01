@@ -43,12 +43,12 @@ out.tableProto = [Object.getPrototypeOf(K.TABS_OF_ID), Object.getPrototypeOf(K.T
     assert out["health"] == ["memory"] and out["mind"] == ["memory"] and out["identity"] == ["memory"]   # the Memory tab holds the mind
 
 
-def test_the_memory_tab_is_the_fourth_and_key_4_reaches_it() -> None:
+def test_the_memory_tab_is_the_sixth_destination_and_key_6_reaches_it() -> None:
     src = (WEB / "cockpit_view.js").read_text(encoding="utf-8")
     assert re.search(r'const MODES = \["morning", "board", "build", "memory"\];', src)
-    assert '"1234".indexOf(ev.key)' in src and 'MODES["1234".indexOf(ev.key)]' in src
+    assert '"123456".indexOf(ev.key)' in src and 'DESTS["123456".indexOf(ev.key)]' in src
     html = (WEB / "dashboard.html").read_text(encoding="utf-8")
-    assert 'data-mode-tab="memory"' in html and "<kbd>4</kbd>Memory" in html
+    assert 'data-mode-tab="memory"' in html and "<kbd>6</kbd>" in html and "Memory</span>" in html
 
 
 def test_deep_links_choose_the_tab_and_an_unknown_one_chooses_nothing(tmp_path: Path) -> None:

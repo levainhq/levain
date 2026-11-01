@@ -196,7 +196,7 @@ FULL_BAR = ("(() => { %s"
             " const n = document.getElementById('entity'); n.textContent = 'WWWWWWWWWWWWWW'; %s"
             " const q = (s) => document.querySelector(s).getBoundingClientRect(), vw = document.documentElement, ue = document.querySelector('.masthead .unit');"
             " ue.style.flex = 'none'; const nat = Math.round(q('.masthead .unit').width), natE = n.scrollWidth; ue.style.flex = '';"
-            " return new Promise(r => setTimeout(r, 200)).then(() => { const m = q('.masthead'), t = q('.masthead .seg'), u = q('.masthead .unit'), ro = q('.masthead .readout');"
+            " return new Promise(r => setTimeout(r, 200)).then(() => { const m = q('.masthead'), t = q('.masthead .brand'), u = q('.masthead .unit'), ro = q('.masthead .readout');"
             " const jl = document.querySelector('.jar-label');"
             " return { sw: vw.scrollWidth, cw: vw.clientWidth, unitLeft: Math.round(u.left), tabsRight: Math.round(t.right), readoutRight: Math.round(ro.right), mastRight: Math.round(m.right),"
             " nameCut: n.scrollWidth > n.clientWidth, unitW: Math.round(u.width), nat, nameW: n.clientWidth, jarCut: jl ? jl.scrollWidth > jl.clientWidth : null }; }); })()")
