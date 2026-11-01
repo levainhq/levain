@@ -1118,6 +1118,29 @@ def test_an_ambiguous_done_worker_is_ended_by_elapsed_time_not_pass_count(store,
     assert store.launch(lost.launch_id).state == "ended", lines
 
 
+@pytest.mark.parametrize("records, wait", [
+    ([_ASKED, _said("all done\nDONE: yes")], "gap"),               # the spacing stamp
+    ([_ASKED, _said("half of it"), _ASKED], "backstop"),           # the backstop's since
+    (_WAITING, "ceiling"),                                         # the waiting ceiling's since
+])
+def test_a_wall_clock_step_back_resets_the_stamp(store, fake, live_hook, wdir, spawn, cfg, clock, records,
+                                                 wait):  # noqa: F811
+    token = store.coord_take()
+    _d, t = a_thread(store)
+    ln = _activate(store, spawn(store, token, t.thread_id, wdir), "sid-skew")
+    _transcript(cfg, "sid-skew", records)
+    _done_listing(fake, [(ln, "sid-skew")], wdir)
+    cl.watch_once(store)
+    clock.tick(-2 * 60 * 60)                   # the clock steps back two hours: every stamp kept is in the future
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active", lines
+    assert not any("too soon" in x or " -" in x for x in lines if ln.launch_id in x), lines
+    clock.tick({"gap": cl.DONE_READ_GAP, "backstop": cl.UNPROVEN_DONE_SECONDS,
+                "ceiling": cl.WAITING_DONE_CEILING_SECONDS}[wait])
+    lines = cl.watch_once(store)               # counted from the reading after the step, not stalled until catch-up
+    assert store.launch(ln.launch_id).state == "ended", lines
+
+
 def test_two_done_readings_must_be_spaced_by_the_minimum_interval(store, fake, live_hook, wdir, spawn, cfg,
                                                                   clock):  # noqa: F811
     assert cl.DONE_READ_GAP > 0

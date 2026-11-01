@@ -1512,6 +1512,7 @@ def _end_done_workers(store: CoordStore, active: list[Any], listed: dict[str, di
         if not isinstance(prev, dict) or prev.get("session") != ln.harness_session_id:
             prev = {}
         now = _wall()
+        prev = _drop_future(prev, now)
         state, handoff, why = _turn_state(env.get("CLAUDE_CONFIG_DIR"), ln.harness_session_id)
         seen: dict[str, Any] = {"session": ln.harness_session_id, "finished": 0}
         if state == _TURN_FINISHED:
@@ -1581,6 +1582,16 @@ def _count(prev: dict[str, Any], key: str) -> int:
 def _stamp(prev: dict[str, Any], key: str) -> float | None:
     t = prev.get(key)
     return float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) else None
+
+
+def _drop_future(prev: dict[str, Any], now: float) -> dict[str, Any]:
+    """``prev`` without any stamp later than ``now`` (the wall clock stepped back): such a stamp is stale, so its
+    clock starts again from this reading instead of stalling until the clock catches up. A finished reading whose
+    stamp goes takes its count with it, so the next one is a first again."""
+    future = {k for k in ("finished_at", "since", "waits_since") if (t := _stamp(prev, k)) is not None and t > now}
+    if not future:
+        return prev
+    return {k: v for k, v in prev.items() if k not in future and not (k == "finished" and "finished_at" in future)}
 
 
 def _utc(t: float) -> str:
