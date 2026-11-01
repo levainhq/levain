@@ -1639,7 +1639,7 @@ def _coord_ready(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
             if _no_store(store):            # the same keys as a present store's answer, only empty
                 _emit(out, args.json, {"schema": ready.SCHEMA_VERSION,
                                        "generated": datetime.now().astimezone().isoformat(timespec="seconds"),
-                                       "items": [], "unreadable": [], "store": where},
+                                       "items": [], "unreadable": [], "store": None},   # None = no store; a present store names its dir
                       f"{NO_STORE}: nothing is queued")
                 return 0
             got = {**ready.list_ready(store, all=args.all, repo=args.repo), "store": where}

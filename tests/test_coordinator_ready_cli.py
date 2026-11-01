@@ -241,4 +241,4 @@ def test_show_json_has_the_same_keys_with_and_without_a_store(tmp_path, qdir, to
     _add(qdir, capsys, token)
     _, present, _ = _run(qdir, capsys, "show", "--json")
     _, absent, _ = _run(tmp_path / "never", capsys, "show", "--json")
-    assert set(json.loads(present)) == set(json.loads(absent)) and "store" in json.loads(absent)
+    assert set(json.loads(present)) == set(json.loads(absent)) and json.loads(absent)["store"] is None and json.loads(present)["store"]
