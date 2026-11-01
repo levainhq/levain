@@ -2056,7 +2056,9 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     cop.add_argument("--ack", type=int, default=None, metavar="OPEN_ID")
     cop.add_argument("--light", action="store_true",
                      help="Open for an arrival: a verified away OFF (one open per agent) or a gap in the operator's "
-                          "activity. Prints 'no light open needed' when neither.")
+                          "activity. Prints 'no light open needed' when neither. With --json, one document "
+                          "always: opens, already_acknowledged, found, notes. Exits 3 when every agent's consent "
+                          "queue was unreadable and nothing was built.")
     cop.add_argument("--gap-hours", dest="gap_hours", type=_gap_hours, default=_seam_arrival.SILENCE_GAP_HOURS, metavar="H",
                      help="With --light: the gap between operator activity records that counts as an arrival "
                           "(default %(default)s).")

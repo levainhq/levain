@@ -66,7 +66,8 @@ from levain.coordinator.store import GSEQ_TABLES, CoordError, CoordStore, StoreA
 from levain import unshowable
 from levain.dispatch import DispatchError
 
-__all__ = ["Brief", "BriefTooBig", "DETAIL_FIELDS", "DETAIL_ROWS_MAX", "NOT_BUILT", "open_brief", "verbose_lines"]
+__all__ = ["Brief", "BriefTooBig", "DETAIL_FIELDS", "DETAIL_ROWS_MAX", "NOT_BUILT", "instant", "open_brief",
+           "verbose_lines"]
 
 #: the most Since detail rows one brief reads, whatever the byte cap leaves
 DETAIL_ROWS_MAX = 1000
@@ -519,9 +520,10 @@ def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[st
     return lines
 
 
-def _instant(text: str) -> datetime:
+def instant(text: str) -> datetime:
     """An ISO stamp as an aware UTC datetime, whatever its precision: the queue's marks carry microseconds and the
-    handoffs whole seconds, so their strings do not sort as their instants do. A naive stamp is read as UTC."""
+    handoffs whole seconds, so their strings do not sort as their instants do. A naive stamp is read as UTC. The one
+    stamp reader for the seam code (the arrival signals' gap rule reads its records through it too)."""
     got = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
     return got.replace(tzinfo=timezone.utc) if got.tzinfo is None else got.astimezone(timezone.utc)
 
@@ -535,14 +537,14 @@ def _missing_close(conn: sqlite3.Connection, qdir: Path, present: set[str]) -> l
     marks = [(s["since"], a) for a, s in away.items() if s.get("since")]
     if not marks:
         return [_MISSING_ZERO]
-    began = max((m[0] for m in marks), key=_instant)
-    who = ", ".join(sorted(a for t, a in marks if _instant(t) == _instant(began)))
+    began = max((m[0] for m in marks), key=instant)
+    who = ", ".join(sorted(a for t, a in marks if instant(t) == instant(began)))
     closed = None
     if "seam_handoffs" in present:
         row = conn.execute("SELECT written_at FROM seam_handoffs WHERE seam_kind = 'operator' "
                            "ORDER BY handoff_id DESC LIMIT 1").fetchone()
         closed = None if row is None else row[0]
-    if closed is not None and _instant(closed) >= _instant(began):
+    if closed is not None and instant(closed) >= instant(began):
         return [_MISSING_ZERO]
     last = "no operator close recorded" if closed is None else f"the last operator close was {closed}, before it"
     return [f"Missing close: operator seam began {began} ({who} away mark); {last}"]

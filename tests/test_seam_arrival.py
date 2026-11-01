@@ -336,3 +336,181 @@ def test_missing_close_compares_instants_not_strings_of_mixed_precision(monkeypa
     assert rows[0].startswith("Missing close: operator seam began ") and "before it" in rows[0]
     conn.execute("INSERT INTO seam_handoffs (seam_kind, written_at) VALUES ('operator', '2026-10-31T12:00:01Z')")
     assert seam._missing_close(conn, Path("unused"), {"seam_handoffs"}) == [seam._MISSING_ZERO]
+
+
+# --- the durable to-do list (fix2: codex HIGH 1 and 2) --------------------------------------------------------------
+def _die_once(monkeypatch):
+    """The first build raises, as a process dying between recording a signal and building its open would."""
+    from levain.coordinator import seam_verbs
+    from levain.coordinator.store import CoordError
+
+    real = seam_verbs.build
+    calls = []
+
+    def dying(*a, **kw):
+        calls.append(kw.get("signal_key"))
+        if len(calls) == 1:
+            raise CoordError("simulated death before the build")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(seam_verbs, "build", dying)
+    return calls
+
+
+def test_a_recorded_leave_whose_build_died_is_built_after_a_newer_away_mark(world, cockpit, qdir, capsys, monkeypatch):
+    away_on(qdir, "claude_code")
+    away_off(cockpit, qdir, "claude_code")
+    mark = verified(qdir)[0][0].mark_id
+    _die_once(monkeypatch)
+    light(qdir, capsys, world.token, rc=1)
+    assert sql(world, "SELECT agent, mark_id FROM arrival_signals") == [("claude_code", mark)]
+    assert sql(world, "SELECT 1 FROM open_builds") == []
+    away_on(qdir, "claude_code")                                    # the leave is no longer the latest mark
+    assert verified(qdir) == ([], [])
+    out = light(qdir, capsys, world.token).out
+    assert out.count("~~~ OPEN ") == 1 and "(operator)" in out
+    light(qdir, capsys, world.token)
+    assert sql(world, "SELECT signal_kind, signal_key FROM open_builds") == [("away_off", f"claude_code:{mark}")]
+
+
+def _gap_drop(world, clock, words):
+    """A drop five hours after every record before it: the gap rule fires on it. The older records are re-dated in
+    place (a drop is append-only, so the test lifts the update trigger for that one statement and puts it back); the
+    store's clock is never stepped, so the lease the CLI reads on the real clock stays live."""
+    from levain.coordinator.store import _append_only
+
+    gap_end = world.accept_drop(words, surface="cli")[0].drop_id
+    old = (clock.t - timedelta(hours=5)).isoformat().replace("+00:00", "Z")
+    c = sqlite3.connect(world.path)
+    try:
+        with c:
+            c.execute("DROP TRIGGER drops_frozen")
+            c.execute("UPDATE drops SET received_at = ? WHERE drop_id != ?", (old, gap_end))
+            c.execute(_append_only("drops", "a drop")[0])
+    finally:
+        c.close()
+    return gap_end
+
+
+def test_a_fired_silence_whose_build_died_is_built_after_a_newer_record(world, qdir, clock, capsys, monkeypatch):
+    gap_end = _gap_drop(world, clock, "back after a while")
+    _die_once(monkeypatch)
+    light(qdir, capsys, world.token, rc=1)
+    assert sql(world, "SELECT agent, mark_id, queue_id FROM arrival_signals") == [
+        (seam_arrival.SILENCE_AGENT, f"drop:{gap_end}", seam_arrival.SILENCE_QUEUE)]
+    world.accept_drop("and again, minutes later", surface="cli")
+    assert not seam_arrival.silence(world).fired                    # the gap no longer fires on its own
+    out = light(qdir, capsys, world.token).out
+    assert out.count("~~~ OPEN ") == 1 and "(light)" in out
+    light(qdir, capsys, world.token)
+    assert sql(world, "SELECT signal_kind, signal_key, seam_kind FROM open_builds") == [
+        ("silence", f"drop:{gap_end}", "light")]
+
+
+# --- one output document (fix2: the JSON MED, deepseek MED 3) ------------------------------------------------------
+_SHAPE = {"opens", "already_acknowledged", "found", "notes"}
+
+
+def test_two_signals_print_one_json_document(world, cockpit, qdir, clock, capsys):
+    _gap_drop(world, clock, "back")
+    away_on(qdir, "claude_code")
+    away_off(cockpit, qdir, "claude_code")
+    capsys.readouterr()                                             # the consent verbs' own output
+    doc = json.loads(light(qdir, capsys, world.token, "--json").out)
+    assert set(doc) == _SHAPE and len(doc["opens"]) == 2
+    assert sorted(o["signal"].split(":")[0] for o in doc["opens"]) == ["away_off", "silence"]
+    assert any(f.startswith("away OFF: claude_code") for f in doc["found"])
+    assert any(f.startswith("silence: ") for f in doc["found"])
+    empty = json.loads(run(qdir, capsys, "open", "--light", "--json").out)      # the operator's terminal
+    assert set(empty) == _SHAPE and empty["opens"] == [] and any("nothing was built" in n for n in empty["notes"])
+
+
+def test_an_unreadable_queue_is_reported_beside_a_build_and_every_one_unreadable_exits_3(world, qdir, clock, capsys,
+                                                                                         monkeypatch):
+    real = seam_arrival.verified_leaves
+
+    def half(q, agents=seam_arrival.AGENTS):
+        leaves, notes = real(q, agents[:1])
+        return leaves, notes + ["codex: the away mark could not be read (OSError: test)"]
+
+    monkeypatch.setattr(seam_arrival, "verified_leaves", half)
+    _gap_drop(world, clock, "back")
+    out = light(qdir, capsys, world.token).out
+    assert out.count("~~~ OPEN ") == 1 and "unread: codex: the away mark could not be read" in out
+    assert "silence: operator activity" in out
+    monkeypatch.undo()
+    run(qdir, capsys, "open", "--ack", _open_id(out), "--token", str(world.token))
+    (qdir / "queue.db").write_bytes(b"this is not a database")
+    blind = light(qdir, capsys, world.token, "--json", rc=3).out
+    doc = json.loads(blind)
+    assert doc["opens"] == [] and sum("could not be read" in n for n in doc["notes"]) == 2
+
+
+# --- nothing written before the fence (fix2: codex MED 4) ------------------------------------------------------------
+def _state(d: Path):
+    """The directory's files, each with its bytes' digest and mtime. SQLite's own ``-wal``/``-shm`` sidecars, which a
+    ``mode=ro`` reader of a WAL file may create, are left out: they hold no row and no schema."""
+    import hashlib
+
+    return sorted((p.name, hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns) for p in d.iterdir()
+                  if not p.name.endswith(("-wal", "-shm")))
+
+
+def test_a_tokenless_or_refused_light_run_makes_and_migrates_nothing(qdir, capsys, tmp_path):
+    before = _state(qdir)
+    run(qdir, capsys, "open", "--light")
+    run(qdir, capsys, "open", "--light", "--token", "5", rc=1)
+    assert _state(qdir) == before and not (qdir / "dispatch.db").exists()
+
+
+def test_a_refused_light_run_against_a_store_leaves_it_unchanged(world, qdir, capsys):
+    before = _state(qdir)
+    err = run(qdir, capsys, "open", "--light", "--token", str(world.token + 99), rc=1).err
+    assert "was refused" in err and _state(qdir) == before
+
+
+# --- the gap rule reads robustly (fix2: complement MED 2 / LOW 3, deepseek MED 2) -----------------------------------
+class _File:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+
+def _activity_db(tmp_path, drops, *, chat=None):
+    p = tmp_path / "activity.db"
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE drops (drop_id TEXT, received_at TEXT)")
+    c.executemany("INSERT INTO drops VALUES (?, ?)", drops)
+    if chat is not None:
+        c.execute(chat)
+    c.commit()
+    c.close()
+    return _File(p)
+
+
+def test_one_stamp_reader_and_a_naive_stamp_is_utc():
+    assert seam_arrival.instant is seam.instant
+    assert seam.instant("2026-10-31T12:00:00") == datetime(2026, 10, 31, 12, tzinfo=UTC)
+
+
+def test_the_gap_orders_by_instant_not_by_the_string(tmp_path):
+    # two offset stamps sort above the true newest as strings; by instant they are both two hours older
+    f = _activity_db(tmp_path, [("a", "2026-10-31T15:00:00+05:00"), ("b", "2026-10-31T14:00:00+04:00"),
+                                ("c", "2026-10-31T12:00:00Z")])
+    got = seam_arrival.silence(f, gap_hours=1)
+    assert got.fired and got.key == "drop:c" and got.gap_hours == pytest.approx(2.0)
+
+
+def test_a_malformed_activity_row_is_skipped_with_a_note(tmp_path):
+    f = _activity_db(tmp_path, [("bad", None), ("worse", "not a time"), ("a", "2026-10-31T06:00:00Z"),
+                                ("b", "2026-10-31T12:00:00Z")],
+                     chat="CREATE TABLE chat_messages (message_id TEXT, at TEXT)")      # no author_kind column
+    got = seam_arrival.silence(f)
+    assert got.fired and got.key == "drop:b"
+    assert sum("has no readable time" in n for n in got.notes) == 2
+    assert any("chat records could not be read" in n for n in got.notes)
+
+
+def test_silence_on_no_store_file_makes_nothing(tmp_path):
+    f = _File(tmp_path / "absent" / "dispatch.db")
+    assert "no operator activity record yet" in seam_arrival.silence(f).why
+    assert not (tmp_path / "absent").exists()

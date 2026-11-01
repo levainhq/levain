@@ -190,79 +190,90 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
     return _print_built(args, out, store, launch, built, handoff, tail, extra, more_json)
 
 
-def _print_built(args: argparse.Namespace, out: Any, store: Any, launch: Any, built: Any, handoff: Any, tail: str,
-                 extra: str, more_json: dict[str, Any]) -> int:
+def _built(args: argparse.Namespace, store: Any, launch: Any, built: Any, handoff: Any, tail: str, extra: str,
+           more_json: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """A built open's ``(json object, text)``, its delivery to this launch recorded."""
     seam_open.record_delivery(store, built.open_id, "light_verb", recipient=launch.launch_id)
     needs = " --read-back-file PATH" if built.seam_kind in seam_open.PREDECESSOR_HANDOFF_SEAMS else ""
     ack = f"{_lv(launch)} coord open --ack {built.open_id}{needs} --token {args.token}{tail}"
     more = ("; PATH holds your restatement of the handoff in your own words (required on a "
             f"{built.seam_kind} open)") if needs else ""
-    _emit(out, args.json, {"open_id": built.open_id, "kind": built.seam_kind, "acknowledgeable": True, "body": built.body,
-                           "ack": ack, "prev_handoff_id": None if handoff is None else handoff.handoff_id,
-                           **more_json},
-          f"{_fenced(built.body)}{extra}\n\n--\nopen {built.open_id} ({built.seam_kind}), built {built.built_at}; it "
-          "is the open stored for you, so running coord open again prints it unchanged\n"
-          f"acknowledge it, which moves the Since window past what it showed: {ack}{more}\n{_prev_line(handoff)}")
+    return ({"open_id": built.open_id, "kind": built.seam_kind, "acknowledgeable": True, "body": built.body, "ack": ack,
+             "prev_handoff_id": None if handoff is None else handoff.handoff_id, **more_json},
+            f"{_fenced(built.body)}{extra}\n\n--\nopen {built.open_id} ({built.seam_kind}), built {built.built_at}; it "
+            "is the open stored for you, so running coord open again prints it unchanged\n"
+            f"acknowledge it, which moves the Since window past what it showed: {ack}{more}\n{_prev_line(handoff)}")
+
+
+def _print_built(args: argparse.Namespace, out: Any, store: Any, launch: Any, built: Any, handoff: Any, tail: str,
+                 extra: str, more_json: dict[str, Any]) -> int:
+    obj, text = _built(args, store, launch, built, handoff, tail, extra, more_json)
+    _emit(out, args.json, obj, text)
     return 0
+
+
+#: ``coord open --light``'s exit when every agent's consent queue was unreadable and nothing was built
+LIGHT_UNREADABLE_EXIT = 3
 
 
 def _light(args: argparse.Namespace, out: Any, store: Any) -> int:
     """``coord open --light``: the arrival signals an operator's coming back leaves, each one open. A verified away OFF
     is an ``operator`` open keyed ``agent:mark_id``; a gap in the operator's activity is a ``light`` open keyed by the
-    record that ended it. Nothing builds without a live coordinator token (the operator's own terminal prints what it
-    found and never acknowledges)."""
+    record that ended it. Each is recorded in ``arrival_signals`` under the fence before it is built, and every recorded
+    signal with no acknowledged build is built (or offered again) by every run. Nothing builds or is recorded without a
+    live coordinator token: the reads before the fenced write are read-only (the token check, the gap, the to-do
+    list), the fenced write is the first write-capable open, and no build runs before it (the operator's own terminal
+    prints what it found and never acknowledges).
+
+    One output document whatever happened: ``{"opens", "already_acknowledged", "found", "notes"}`` in ``--json``, the
+    same in that order as text. Exit 0, or :data:`LIGHT_UNREADABLE_EXIT` when every agent's queue was unreadable and
+    nothing was built."""
     from levain.coordinator import seam_arrival
+    from levain.coordinator.morning import AGENTS
 
     launch, why = _active(store, args.token)
     given = None if args.queue_dir is None else Path(args.queue_dir).expanduser()
     qdir = given if given is not None else Path(store.directory)
-    leaves, notes = seam_arrival.verified_leaves(qdir)
-    quiet = seam_arrival.silence(store, gap_hours=args.gap_hours)
+    leaves, unread = seam_arrival.verified_leaves(qdir)
+    quiet = seam_arrival.silence(store, gap_hours=args.gap_hours)     # read-only: makes and migrates nothing
     found = [f"away OFF: {lv.agent} (mark {lv.mark_id}) left away mode with a leave that verifies" for lv in leaves]
     if quiet.fired:
         found.append(f"silence: {quiet.why}")
-    found += [f"unread: {n}" for n in notes]
+    notes = [f"unread: {n}" for n in unread] + [f"unread: {n}" for n in quiet.notes]
+    blind = len(unread) >= len(AGENTS)
+    opens: list[tuple[dict[str, Any], str]] = []
+    done: list[str] = []
+    acked_ids: list[int] = []
     if launch is None:
         if args.token is not None:
             raise CoordError(f"--token {args.token} was refused: {why}; nothing was built or recorded")
-        _emit(out, args.json, {"opens": [], "found": found, "why": why},
-              ("\n".join(found) if found else quiet.why) + f"\nnothing was built: {why}; a coordinator's token builds "
-              "the open (it cannot be built or acknowledged from the operator's terminal)")
-        return 0
-    seam_arrival.ingest(store, args.token, leaves)
-    handoff = seam_handoffs.latest(store)
-    signals = [("operator", "away_off", f"{lv.agent}:{lv.mark_id}") for lv in leaves]
-    if quiet.fired:
-        signals.append(("light", "silence", str(quiet.key)))
-    acked = _acked_signals(store, signals)
-    done = [f"already acknowledged: open {acked[s]} ({s[1]}:{s[2]})" for s in signals if s in acked]
-    signals = [s for s in signals if s not in acked]
-    if not signals:
-        lines = [*done] if done else [quiet.why]
-        _emit(out, args.json, {"opens": [], "found": found, "already_acknowledged": sorted(acked.values())},
-              "\n".join([*lines, *[f"unread: {n}" for n in notes]]))
-        return 0
-    tail = _tail(store)
-    if done and not args.json:
-        out.write("\n".join(done) + "\n")
-    for kind, sig_kind, key in signals:
-        built = build(store, kind=kind, signal_kind=sig_kind, signal_key=key, queue_dir=given, token=args.token)
-        _print_built(args, out, store, launch, built, handoff, tail, "", {"signal": f"{sig_kind}:{key}"})
-    return 0
-
-
-def _acked_signals(store: Any, signals: list[tuple[str, str, str]]) -> dict[tuple[str, str, str], int]:
-    """The signals whose stored build is already acknowledged (by this reader or any other), each to its open id. A
-    built but unacknowledged one is not here: it is offered again (the same open), so a successor coordinator after a
-    rotation that never acknowledged it still receives it. Read-only; the build itself stays the fenced writer's."""
-    acked: dict[tuple[str, str, str], int] = {}
-    with read_transaction(store.open_readonly) as conn:
-        for sig in signals:
-            stored = seam_open.stored_build(conn, *sig)
-            if stored is not None and conn.execute("SELECT 1 FROM open_acks WHERE open_id = ? LIMIT 1",
-                                                   (stored.open_id,)).fetchone() is not None:
-                acked[sig] = stored.open_id
-    return acked
+        if not quiet.fired:
+            notes.append(quiet.why)
+        notes.append(f"nothing was built: {why}; a coordinator's token builds the open (it cannot be built or "
+                     "acknowledged from the operator's terminal)")
+    else:
+        current = [("operator", "away_off", f"{lv.agent}:{lv.mark_id}") for lv in leaves]
+        if quiet.fired:
+            current.append(("light", "silence", str(quiet.key)))
+        todo, _acked = seam_arrival.pending(store)
+        if current or todo:
+            # the one fenced write: the new signals recorded, and the to-do list read, before anything builds
+            todo, acked = seam_arrival.ingest(store, args.token, leaves, quiet)
+            done = [f"already acknowledged: open {acked[s]} ({s[1]}:{s[2]})" for s in current if s in acked]
+            acked_ids = sorted({acked[s] for s in current if s in acked})
+        if todo:
+            handoff = seam_handoffs.latest(store)
+            tail = _tail(store)
+            for kind, sig_kind, key in todo:
+                built = build(store, kind=kind, signal_kind=sig_kind, signal_key=key, queue_dir=given,
+                              token=args.token)
+                opens.append(_built(args, store, launch, built, handoff, tail, "", {"signal": f"{sig_kind}:{key}"}))
+        if not opens and not quiet.fired:
+            notes.append(quiet.why)
+    text = [t for _o, t in opens] + done + found + notes
+    _emit(out, args.json, {"opens": [o for o, _t in opens], "already_acknowledged": acked_ids, "found": found,
+                           "notes": notes}, "\n".join(text))
+    return LIGHT_UNREADABLE_EXIT if blind and not opens else 0
 
 
 def _ack(args: argparse.Namespace, out: Any, store: Any) -> int:
