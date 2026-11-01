@@ -7,6 +7,7 @@ const vm = require('vm');
 const [swPath, scenario, mode] = process.argv.slice(2);
 const listeners = {};
 const log = { console: [], asked: [], fetches: 0, opened: [], posted: [], longWaits: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
+let traceFail = false;   // 'tracefail' in the mode: every open of the trace cache throws
 let uncontrolled = [];   // windows only matchAll({includeUncontrolled: true}) returns
 
 // --- IndexedDB: databases by name, each with object stores that are Maps ---------------------------------------------
@@ -54,6 +55,7 @@ const caches = {
   keys: async () => [...cacheNames],
   delete: async (n) => cacheNames.delete(n),
   open: async (n) => {
+    if (n === 'levain-trace' && traceFail) throw new TypeError('the trace cache refused');
     cacheNames.add(n);
     if (!cacheStores.has(n)) cacheStores.set(n, new Map());
     const m = cacheStores.get(n);
@@ -66,6 +68,7 @@ const caches = {
   },
 };
 
+const traceSteps = () => [...(cacheStores.get('levain-trace') || new Map()).entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => ({ key: k, ...JSON.parse(v) }));
 const pendings = () => [...(cacheStores.get('levain-open') || new Map()).entries()].map(([k, v]) => ({ key: k, ...JSON.parse(v) }));
 
 // --- clients ---------------------------------------------------------------------------------------------------------
@@ -119,7 +122,9 @@ function fire(type, ev) {
   } else if (scenario === 'navigate') {
     // mode: <window>[+ack][+two] ; "+two" fires a second tap (url /sign/10) 100 ms after the first ; window = controlled | uncontrolled | reject | null | mismatch | crossorigin. "+ack" means the
     // page runs sw_open.js (acks the worker's levain-open message); without it the page is silent, as an old cached page is.
-    const [kind, ack, extra] = mode.split('+');
+    const parts = mode.split('+');
+    traceFail = parts.includes('tracefail');
+    const [kind, ack, extra] = parts.filter((p) => p !== 'tracefail');
     // ack: absent = silent page; 'ack' = acks at once; 'late' = acks after OPEN_ACK_MS (the page claims the pending target first)
     const post = function (m, tr) {
       if (m && m.type === 'levain-open') {
@@ -133,7 +138,7 @@ function fire(type, ev) {
         }, 700);
       } else log.posted.push(m);
     };
-    const win = (nav, u) => ({ url: u || 'https://box.example/cockpit', focus: async () => { log.focused += 1; }, navigate: nav, postMessage: post });
+    const win = (nav, u) => ({ url: u || 'https://box.example/cockpit', visibilityState: 'visible', focused: true, focus: async () => { log.focused += 1; }, navigate: nav, postMessage: post });
     const ok = async (u) => { log.navigated.push(u); return { url: u }; };
     if (kind === 'controlled' || kind === 'crossorigin') log.windows = [win(ok)];
     else if (kind === 'uncontrolled') uncontrolled = [win(async () => { throw new TypeError("This service worker is not the client's active service worker."); })];
@@ -145,12 +150,16 @@ function fire(type, ev) {
     else if (kind === 'matchfail') { self_.clients.matchAll = async () => { throw new TypeError('matchAll refused'); }; }
     else if (kind === 'opennull') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; log.entriesAtOpen = pendings(); return null; }; }
     else if (kind === 'openfail') { log.windows = []; self_.clients.openWindow = async (u) => { log.openAttempt = u; throw new TypeError('openWindow refused'); }; }
+    else if (kind === 'secreturl') log.windows = [win(ok, 'https://box.example/?write_token=SECRET&view=needs#frag')];
+    else if (kind === 'tapwin') log.windows = [win(ok, 'https://box.example/tap_trace')];
+    else if (kind === 'tapwin2') log.windows = [win(ok, 'https://box.example/tap_trace'), win(ok, 'https://box.example/docs/guide')];
     else if (kind === 'prefer') log.windows = [win(ok, 'https://box.example/docs/guide'), win(async (u) => { log.navigated.push('cockpit:' + u); return { url: u }; }, 'https://box.example/sign/3')];
-    const url = kind === 'crossorigin' ? 'https://evil.example/x' : kind === 'search' ? '/?view=needs' : '/sign/9#sign=a&v=1';
-    const first = fire('notificationclick', { notification: { close: () => {}, data: { url } } });
+    const url = kind === 'crossorigin' ? 'https://evil.example/x' : kind === 'search' ? '/?view=needs' : kind === 'secreturl' ? '/?write_token=SECRET&view=needs#frag' : '/sign/9#sign=a&v=1';
+    const first = fire('notificationclick', { notification: { close: () => {}, data: { url, ping: kind === 'secreturl' ? { write_token: 'SECRET' } : undefined, tag: kind === 'secreturl' ? 'x'.repeat(100) : undefined } } });
     if (extra === 'two') { await new Promise((r) => setTimeout(r, 100)); await fire('notificationclick', { notification: { close: () => {}, data: { url: '/sign/10' } } }); }
     await first;
     if (ack === 'late') await new Promise((r) => setTimeout(r, 900));   // let the late page act
+    log.trace = traceSteps();
     log.pendings = pendings();
     log.pendingLeft = log.pendings.length;
     if (log.pendings.length) log.pending = log.pendings[0];

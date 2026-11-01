@@ -16,6 +16,10 @@ const log = { assigned: [], acks: [], started: false };
 const store = new Map();
 const PFX = '/__levain_open/';
 const keyOf = (r) => (typeof r === 'string' ? r : new URL(r.url).pathname);
+const traceStore = new Map();
+const traceCache = { put: async (k, r) => { traceStore.set(k, await r.text()); }, delete: async (k) => traceStore.delete(k),
+  keys: async () => [...traceStore.keys()].map((k) => ({ url: 'https://box.example' + k })), match: async () => undefined };
+const traceSteps = () => [...traceStore.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([, v]) => JSON.parse(v));
 const cache = {
   match: async (r) => (store.has(keyOf(r)) ? new Response(store.get(keyOf(r))) : undefined),
   delete: async (r) => store.delete(keyOf(r)),
@@ -29,13 +33,13 @@ const tick = () => new Promise((r) => setTimeout(r, 30));
 async function boot(href = 'https://box.example/') {
   handlers = []; winHandlers = {}; docHandlers = {};
   sandbox = {
-    URL, Response, Date, Promise, JSON, setTimeout,
+    URL, Response, Date: scenario === 'datethrow' ? Object.assign(class extends Date { static now() { throw new Error('clock'); } }) : Date, Promise, JSON, setTimeout,
     location: { origin: 'https://box.example', href, assign: (u) => log.assigned.push(u) },
-    navigator: { serviceWorker: { addEventListener: (t, fn) => handlers.push(fn), startMessages: () => { log.started = true; } } },
+    navigator: { standalone: true, serviceWorker: { controller: {}, addEventListener: (t, fn) => handlers.push(fn), startMessages: () => { log.started = true; } } },
     window: { addEventListener: (t, fn) => { (winHandlers[t] = winHandlers[t] || []).push(fn); } },
     document: { visibilityState: 'hidden', addEventListener: (t, fn) => { (docHandlers[t] = docHandlers[t] || []).push(fn); } },
   };
-  if (scenario !== 'nocache') sandbox.caches = { open: async () => cache };
+  if (scenario !== 'nocache') sandbox.caches = { open: async (n) => (n === 'levain-trace' ? traceCache : cache) };
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(swOpen, 'utf8'), sandbox);
   await tick();
@@ -66,6 +70,12 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     send({ type: 'other', url: '/x' });
     if (scenario === 'nocache') send({ type: 'levain-open', url: U, nonce: 'whatever' });
     await tick();
+  } else if (scenario === 'datethrow') {
+    // the clock throws inside every trace call: the page still acks and assigns
+    put('n1', { url: U, at: Date.now(), for: 'asked' });
+    send({ type: 'levain-open', url: U, nonce: 'n1' });
+    await tick();
+    log.afterThrow = { acks: log.acks.length, assigned: log.assigned.slice() };
   } else if (scenario === 'claim') {
     put('n1', { url: U, at: Date.now(), for: 'asked' });
     put('n2', { url: '/sign/10', at: Date.now(), for: 'asked' });
@@ -141,5 +151,6 @@ const fire = async (t, o, ev = {}) => { for (const fn of (o[t] || [])) fn(ev); a
     await boot('https://box.example/sign/2#sign=b');                             // B's window: takes B's entry, stays
     log.afterB = { assigned: log.assigned.slice(), left: left() };
   }
+  log.trace = traceSteps();
   console.log(JSON.stringify(log));
 })().catch((e) => { console.log(JSON.stringify({ error: String(e && e.stack || e) })); process.exit(1); });
