@@ -187,3 +187,17 @@ def test_no_laptop_reading_pushes_but_never_holds_and_the_line_names_it(tmp_path
     (q / "webpush" / presence.REMOTE_NAME).unlink()
     intent.apply_settings(q, devices="on")
     assert cx.away_hold(st, "codex", blind, queue_dir=q) == auto_away.DEFAULT_HOLDS["codex"]
+
+
+def test_an_agent_with_no_settings_file_is_not_counted_in_the_approvals_clause(tmp_path, cockpit):
+    """His real store: claude_code is set up and can sign, codex has no settings file. The shared queue.db made codex count
+    as "having a store", read as unsignable, and the line said no enrolled key could sign from a device (11-02, desk 6)."""
+    q = _scratch(tmp_path, cockpit)
+    intent.apply_preset(q, "away")
+    assert (q / cx.SETTINGS_NAME).exists()
+    assert auto_away.approvals_note(q, to_devices=True) is None   # both set up and signable: nothing to say
+    (q / cx.SETTINGS_NAME).unlink()
+    assert not away.settings(q, "codex").cockpit_data_root         # codex is not set up
+    assert auto_away.approvals_note(q, to_devices=True) is None
+    assert auto_away.approvals_note(q) is None
+    assert "Approvals:" not in intent.describe_line(q, idle=lambda: 2.0)
