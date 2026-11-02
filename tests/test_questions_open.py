@@ -229,7 +229,7 @@ def _through_the_push(monkeypatch, tmp_path, q, extra=""):
 
     got = []
     monkeypatch.setattr(webpush, "live", lambda cwd: True)
-    monkeypatch.setattr(presence, "should_push", lambda cwd, kind: SimpleNamespace(push=True, by=None))
+    monkeypatch.setattr(presence, "should_push", lambda cwd, kind, **kw: SimpleNamespace(push=True, by=None))   # approval_push (1b) passes idle=, suggest=
     monkeypatch.setattr(sender.subprocess, "Popen", lambda *a, **k: _Child(got))
     monkeypatch.setattr(band_view, "number_for_ping", lambda store, qid: 3)
     assert band._send_ping("claude_code", q, tmp_path / "consent", extra)

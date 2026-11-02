@@ -2487,30 +2487,25 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
     """``levain consent away [show|on|off|auto]`` under the ``consent`` subparsers ``cs_sub``."""
     away = cs_sub.add_parser(
         "away", help="Show or set away mode: whether the consent hook holds a request for a signed answer.",
-        description="Away mode off: the hook answers only by a standing grant and otherwise leaves "
-                    "the agent's own dialog to ask you at once, so a signed answer has nothing to land on. On: the "
-                    "hook holds each request no grant answers for up to --hold seconds so you can answer it with "
-                    "`levain consent answer` or your phone. Claude Code shows its own dialog during the hold too "
-                    "(an allow from the hook dismisses it); Codex shows no dialog until the hold ends, so for Codex "
-                    "away means away. `on` and `off` are your word and stand until `auto` clears it; with no word "
-                    "(the default `levain init` writes; a settings file from before auto-away keeps its on or off "
-                    "as your word), away mode is on while this Mac has had no keyboard, mouse or trackpad input for "
-                    "--idle-after seconds (default 600) and an enrolled key could sign an answer; there is no input-"
-                    "idle source on other platforms, so there only `on` turns it on. A held request ends early when "
-                    "away mode turns off (your input, or `off`), leaving the agent's own dialog to ask. `on` refuses "
-                    "when no enrolled key in the install's cockpit could sign an answer. `on` also records an away "
-                    "mark in the consent queue store, which the hook reads as well as the settings file: leaving it "
-                    "(`off` or `auto`) takes a leave signed by a key enrolled in the install's cockpit "
-                    "(--signing-key), and rewriting the away words in the settings file does not end it. Revoking the "
-                    "key that signed a leave puts away mode back on. Any enrolled key may sign a leave, whatever its "
-                    "class. A consent store that cannot be read is never read as no mark: `off` and `auto` refuse "
-                    "until it is repaired or moved aside. A process running as you is beyond what levain "
-                    "stops without OS confinement: it can rewrite the store, or point the settings file's "
-                    "cockpit_data_root at a cockpit holding its own key (doctor warns on a foreign cockpit). "
-                    "Input-idle away needs no signature to end: your input ends it. Changes only "
-                    "away_mode, away_word, away_hold_seconds and away_idle_seconds in <queue dir>/claude_code.json "
-                    "and codex.json; grants nothing (every answer still verifies as a signature). `show` says which "
-                    "source decides now.")
+        description="Whether an approval waits for a signed answer from your devices. It follows your presence "
+                    "record, the same one `levain ping status` prints: an approval is held for a signed answer "
+                    "exactly when it would reach your devices (the default follows your input at this Mac: on after "
+                    "--idle-after seconds without it, 600 unless you set another), and otherwise the agent's own "
+                    "dialog asks you at once. `on`, `off` and `auto` are your verbs on that record and each prints "
+                    "its line: `on` = devices on (and an away mark in the consent queue store, which stands over the "
+                    "record: leaving it takes a leave signed by a key enrolled in the install's cockpit, "
+                    "--signing-key); `off` = a signed leave and devices off; `auto` = a signed leave and devices "
+                    "follow (--idle-after sets the follow time, 60 to 86400 seconds). A held request ends early "
+                    "when the record says the other way (your input, or `off`), leaving the agent's own dialog to "
+                    "ask. `on` refuses when no enrolled key in the install's cockpit could sign an answer, and a "
+                    "record that sends approvals to your devices holds only while one could. Claude Code shows its "
+                    "own dialog during the hold too (an allow from the hook dismisses it); Codex shows no dialog "
+                    "until the hold ends, so for Codex away means away. A consent store that cannot be read is "
+                    "never read as no mark: `off` and `auto` refuse until it is repaired or moved aside. A process "
+                    "running as you is beyond what levain stops without OS confinement: it can rewrite the store, "
+                    "or point the settings file's cockpit_data_root at a cockpit holding its own key (doctor warns "
+                    "on a foreign cockpit). Grants nothing (every answer still verifies as a signature). `show` "
+                    "says what decides now.")
     away.add_argument("action", nargs="?", choices=("show", "on", "off", "auto"), default="show")
     away.add_argument("--agent", choices=("claude_code", "codex", "all"), default="all",
                       help="Which agent's settings (default: every agent that has a settings file).")
@@ -2518,8 +2513,8 @@ def _add_consent_away_parser(cs_sub: argparse._SubParsersAction) -> None:
                       help="Seconds to hold a request in away mode, more than 0 and at most 840, the longest the "
                            "hook waits (default: the file's hold, else 300 for Claude Code and 120 for Codex).")
     away.add_argument("--idle-after", dest="idle_after", type=float, default=None,
-                      help="With `auto`: seconds of no input after which away mode turns on (default: the file's, "
-                           "else 600).")
+                      help="With `auto`: seconds of no input after which devices come on (the record's follow time, "
+                           "60 to 86400; default: the record's, else 600).")
     away.add_argument("--signing-key", dest="signing_key", type=Path, default=None,
                       help="With `off` or `auto`: an enrolled key that signs leaving an away mode `on` set (its "
                            "private key file, or the .pub of a key an agent holds). With --agent all, one "
@@ -2536,6 +2531,7 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
     from levain.consent.adapters.claude_code import away_mark_of, effective_away
     from levain.consent.auto_away import hold_seconds
     from levain.consent.queue import QueueStoreError, default_queue_dir
+    from levain.webpush import intent
 
     # abspath, not resolve(): the queue directory's symlink check must see the path as given (L3 r1)
     qdir = Path(os.path.abspath(args.queue_dir.expanduser())) if args.queue_dir is not None else default_queue_dir()
@@ -2548,6 +2544,10 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
         return 2
     if args.action not in ("off", "auto") and args.signing_key is not None:
         print("levain consent away: --signing-key goes with `off` or `auto`", file=sys.stderr)
+        return 2
+    if args.idle_after is not None and not (intent.FOLLOW_MIN <= args.idle_after <= intent.FOLLOW_MAX):
+        print(f"levain consent away: --idle-after is the record's follow time: {intent.FOLLOW_MIN:g} to "
+              f"{intent.FOLLOW_MAX:g} seconds", file=sys.stderr)
         return 2
     try:
         away.check_queue_dir(qdir)
@@ -2572,6 +2572,50 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
                   "was changed", file=sys.stderr)
             return 1
     rc, seen = 0, 0
+    if args.action != "show":
+        # the set phase, ONE order (L3 r2): every agent's refusals that need no store (away.check_set) before anything
+        # changes; then the record's base devices setting (DESIGN §4), the cheaper to undo, and nothing else when it
+        # fails; then each agent's mark (or signed leave). Not atomic across agents (each takes its own signature):
+        # an agent whose mark could not change is named with what its hook does now (a mark that still stands holds
+        # and pushes whatever the record says, auto_away.mark_stands), and the run exits non-zero. No rollback.
+        word = {"on": True, "off": False, "auto": None}[args.action]
+        present = []
+        for agent in agents:
+            try:
+                if away.read(qdir, agent) is not None:
+                    away.check_set(qdir, agent, word, args.hold, args.idle_after, signing_key=args.signing_key)
+                    present.append(agent)
+            except (OSError, ValueError, QueueStoreError) as e:
+                print(f"levain consent away: {agent}: {e}; nothing was changed", file=sys.stderr)
+                return 1
+        if present:
+            devices = {"on": "on", "off": "off", "auto": "follow"}[args.action]
+            try:
+                intent.apply_settings(qdir, devices=devices, follow_after=args.idle_after if args.action == "auto" else None,
+                                      via=f"consent away {args.action}")
+            except intent.presence.PresenceError as e:
+                print(f"levain consent away: the presence record was not changed ({e}), so no agent was", file=sys.stderr)
+                return 1
+            for agent in present:
+                try:
+                    away.set_away(qdir, agent, word, args.hold, args.idle_after, signing_key=args.signing_key)
+                except (OSError, ValueError, QueueStoreError) as e:
+                    rc = 1
+                    try:
+                        stands = away.settings(qdir, agent).away_marked
+                    except Exception:  # noqa: BLE001 - the report below says what the hook meets
+                        stands = True
+                    now = ("its away mark still stands, so its hook holds approvals for a signed answer and pushes them "
+                           "to your devices whatever the record says" if stands else
+                           "no away mark stands, so its hook follows the record")
+                    print(f"levain consent away: {agent}: {e}. The presence record says devices {devices} now; {now}",
+                          file=sys.stderr)
+            try:   # devices coming on can make held pings due: start their push now
+                from levain.webpush import held
+
+                held.flush_if_due(qdir, throttle=False)
+            except Exception:  # noqa: BLE001 - the record is written; the next gate call flushes
+                pass
     for agent in agents:
         try:
             try:
@@ -2591,16 +2635,13 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
                     print(msg, file=sys.stderr)
                     rc = 1
                 continue
-            if args.action != "show":
-                word = {"on": True, "off": False, "auto": None}[args.action]
-                away.set_away(qdir, agent, word, args.hold, args.idle_after, signing_key=args.signing_key)
             got = away.settings(qdir, agent)  # what the hook reads, not the raw file and the store's mark
             seen += 1
         except (OSError, ValueError, QueueStoreError) as e:
             print(f"levain consent away: {agent}: {e}", file=sys.stderr)
             rc = 1
             continue
-        on, source, why = effective_away(got)
+        on, source, why = effective_away(got, queue_dir=qdir)
         reason = away.why_unanswerable(got)
         if got.away_unreadable:
             print(f"{agent}: {got.away_unreadable}; repair it, or move it aside (a store moved aside reads as no "
@@ -2627,15 +2668,14 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
                     line += (f"; a leave signed by {mark.leave_by} does not verify ({mark.leave_refusal}), so the "
                              "mark stands")
                 line += "; `levain consent away off --signing-key <key>` leaves it"
-        elif source == "word" and not (got.legacy and not on):  # a legacy off's reason already names the command
-            line += "; `levain consent away auto` hands it back to input idle"
-        elif source == "idle" and not on:
-            line += f"; on after {got.away_idle_seconds:g}s of no keyboard, mouse or trackpad input"
+        elif source.startswith("intent"):
+            line += "; follows your presence record (`levain ping status` says why)"
         print(line)
     if seen == 0 and rc == 0:
         print(f"levain consent away: no consent settings in {qdir}; `levain init` with the consent hook on writes "
               "them", file=sys.stderr)
         return 1
+    print(intent.describe_line(qdir))
     return rc
 
 

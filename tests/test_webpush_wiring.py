@@ -34,8 +34,12 @@ def test_no_phone_reads_nothing_and_creates_no_store(tmp_path, monkeypatch):
 
 
 def test_a_phone_with_pings_on_gets_the_gate_ping_with_its_ref(tmp_path, monkeypatch):
+    from levain.consent import auto_away
+
     _phone(tmp_path)
     calls = _spy(monkeypatch)
+    # away from the laptop past the follow time, injected: the default follow reads this Mac's real idle otherwise
+    monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: 3600.0)
     assert webpush.live(tmp_path) is True
     assert claude_code.ping_configured(claude_code.AdapterSettings(), tmp_path) is True
     assert claude_code.notify(claude_code.AdapterSettings(), "levain: claude waits on you: Bash (request r1).",

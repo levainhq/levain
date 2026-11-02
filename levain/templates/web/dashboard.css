@@ -2960,69 +2960,61 @@ body.sheet-embedded #drop-words { min-height: 7em; }
 /* the drop sheet's list of his drops grows with his history: it scrolls inside the sheet */
 body.ke #drop-recent { max-height: 40vh; overflow: auto; }
 
-/* ---- Notifications block (NP S2): the operator's policy for what reaches him under quiet and sleep (devices_panel.js). */
+/* ---- Presence 1b (devices_panel.js): the masthead chip, its sheet (the one sentence, presets, three settings, what is sensed), and the
+   settings section at the foot (the Standing default and the tap tokens). Dark first; the tokens carry the light theme. ---- */
 .dev-panel[hidden] { display: none; }
-.np-sentences { margin: var(--sp-2) 0 var(--sp-4); }
-.np-sentence { margin: 0 0 var(--sp-2); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--text); }
-.np-group { margin-top: var(--sp-5); }
-.np-cls { font: var(--fw-semibold) var(--fs-meta)/1.3 var(--sans); color: var(--text); }
-.np-seg { flex: none; display: flex; gap: var(--sp-1); }
-.np-seg .ck-tab[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
-.np-seg .ck-tab { white-space: nowrap; min-height: 38px; }
-.np-warn { margin-top: var(--sp-2); padding: var(--sp-2) var(--sp-3); border-left: 3px solid var(--bad); color: var(--text); font: var(--fw-semibold) var(--fs-micro)/1.5 var(--sans); }
-.np-warn[hidden] { display: none; }
-.np-bad { color: var(--bad); }
-.np-foot { display: flex; margin-top: var(--sp-5); }
-@media (max-width: 520px) {
-  .np-row { flex-wrap: wrap; }
-  .np-seg { flex: 1 1 100%; }
-  .np-seg .ck-tab { flex: 1 1 0; min-height: var(--hit-min, 44px); }
-}
-
-/* ---- Presence (devices_panel.js): the masthead chip, its sheet, and the compact settings section at the foot. ---- */
 .pr-chip[hidden] { display: none !important; }   /* the masthead's own button rules set display and would override [hidden] */
 body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
 .pr-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--ok); }
-.pr-chip[data-state="away"] .pr-dot { background: var(--warn); }
-.pr-chip[data-state="quiet"] .pr-dot, .pr-chip[data-state="sleep"] .pr-dot,
-.pr-chip[data-state="holding"] .pr-dot, .pr-chip[data-state="muted"] .pr-dot { background: var(--label); }
-.pr-chip[data-state="loud"] .pr-dot { background: var(--bad); }
+.pr-chip[data-state="desk"] .pr-dot { background: var(--label); }
+.pr-chip[data-state="fault"] .pr-dot { background: var(--bad); }
 .pr-chip-t { font-variant-numeric: tabular-nums; }
-.pr-sheet { position: fixed; z-index: 40; top: var(--pr-top, 64px); left: var(--pr-left, 8px); width: min(340px, calc(100vw - 16px)); box-sizing: border-box;
-  padding: var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-lg); box-shadow: 0 12px 32px color-mix(in oklch, var(--base) 60%, transparent); max-height: calc(100dvh - var(--pr-top, 64px) - 8px); overflow-y: auto; }
+.pr-chip-x { color: var(--label); }
+.pr-sheet { --pr-w: 380px; position: fixed; z-index: 40; top: var(--pr-top, 64px); left: var(--pr-left, 8px); width: min(var(--pr-w), calc(100vw - 16px)); box-sizing: border-box;
+  padding: var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-lg); box-shadow: 0 12px 32px color-mix(in oklch, var(--base) 60%, transparent); max-height: calc(100dvh - var(--pr-top, 64px) - 8px); overflow-y: auto; overscroll-behavior: contain; }
 .pr-sheet[hidden] { display: none; }
-.pr-sheet-who { margin: 0 0 var(--sp-3); color: var(--text, inherit); font: var(--fw-semibold) var(--fs-micro)/1.4 var(--sans); }
-.pr-sheet-text { margin: 0 0 var(--sp-3); color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.4 var(--sans); }
-.pr-sheet-words { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-2); }
-.pr-sheet-row { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-3); }
-.pr-sheet-lab { flex: none; min-width: 5.5em; color: var(--label); font: var(--fw-regular) var(--fs-micro) var(--sans); }
-.pr-sheet-seg { flex: 1 1 auto; display: flex; gap: var(--sp-2); min-width: 0; }
-.pr-sheet-seg .pr-big { flex: 1 1 0; padding-inline: var(--sp-2); }
-.pr-big { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-3); font: var(--fw-semibold) var(--fs-meta)/1.1 var(--sans); color: var(--text); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-md); cursor: pointer; }
+@media (max-width: 1100px) { .pr-sheet { --pr-w: 420px; } }   /* iPad: the same popover, wider */
+/* the sentence: the server's words, verbatim, in a quiet mono panel (it is the line the terminal prints) */
+.pr-sheet-text { margin: 0 0 var(--sp-4); padding: var(--sp-3) var(--sp-4); background: var(--card-2); border-radius: var(--r-md); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono, ui-monospace, Menlo, monospace); overflow-wrap: anywhere; user-select: text; }
+.pr-sheet-who { margin: var(--sp-4) 0 0; padding-top: var(--sp-3); border-top: 1px solid var(--hair); color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.4 var(--sans); }
+.pr-sheet-lab { margin: var(--sp-4) 0 var(--sp-2); color: var(--label); font: var(--fw-semibold) var(--fs-micro)/1.2 var(--sans); text-transform: uppercase; letter-spacing: .05em; }
+.pr-sheet-seg { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; min-width: 0; }
+.pr-sheet-seg > .pr-big { flex: 1 1 auto; }
+.pr-sheet-seg.pr-sub { margin-top: var(--sp-2); gap: var(--sp-2); }
+.pr-sheet-seg.pr-sub > .pr-big { flex: 0 0 auto; min-height: 36px; padding-inline: var(--sp-4); font-weight: var(--fw-medium); }
+.pr-sheet-seg[hidden], .pr-custom[hidden] { display: none; }
+.pr-sheet-hint { color: var(--label); font: var(--fw-regular) var(--fs-micro) var(--sans); }
+.pr-until-note { margin: var(--sp-2) 0 0; }
+.pr-custom { display: flex; gap: var(--sp-2); align-items: center; margin-top: var(--sp-2); }
+.pr-num { width: 5.5em; min-height: 36px; padding: 0 var(--sp-3); box-sizing: border-box; color: var(--text); background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-body) var(--sans); }
+.pr-num[aria-invalid="true"] { border-color: var(--bad); }
+.pr-custom-go { min-height: 36px; }
+.pr-big { min-height: 36px; padding: var(--sp-2) var(--sp-3); font: var(--fw-semibold) var(--fs-meta)/1.1 var(--sans); color: var(--text); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-md); cursor: pointer; }
 .pr-big:hover { border-color: var(--text); }
 .pr-big:disabled { opacity: .5; cursor: default; }
 .pr-big[aria-pressed="true"] { background: var(--card-2); border-color: var(--text); }
-.pr-sheet-route { margin: var(--sp-2) 0 0; color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.4 var(--sans); }
-.pr-sheet-route[hidden], .pr-sheet-note[hidden] { display: none; }
-.pr-endloud { width: 100%; margin-top: var(--sp-3); }
+.pr-endloud { width: 100%; margin-top: var(--sp-2); }
 .pr-endloud[hidden] { display: none; }
 .pr-sheet-note { margin: var(--sp-3) 0 0; color: var(--bad); font: var(--fw-regular) var(--fs-micro)/1.4 var(--sans); }
+.pr-sheet-note[hidden] { display: none; }
 .pr-sheet-link { display: block; margin-top: var(--sp-4); padding-top: var(--sp-3); border-top: 1px solid var(--hair); color: var(--text); font: var(--fw-medium) var(--fs-meta) var(--sans); text-decoration: none; }
 .pr-sheet-link:hover { text-decoration: underline; }
 @media (max-width: 720px) {
-  /* a bottom sheet on a phone: the thumb's reach, full width */
-  .pr-sheet { top: auto; left: 0; right: 0; bottom: 0; width: auto; border-radius: var(--r-lg) var(--r-lg) 0 0; border-bottom: 0; padding-bottom: calc(var(--sp-4) + env(safe-area-inset-bottom, 0px)); max-height: 90dvh; }
+  /* a bottom sheet on a phone: the thumb's reach, full width, a 16px gutter, every button 44px */
+  .pr-sheet { top: auto; left: 0; right: 0; bottom: 0; width: auto; border-radius: var(--r-lg) var(--r-lg) 0 0; border-bottom: 0; padding: var(--sp-5) var(--sp-5) calc(var(--sp-5) + env(safe-area-inset-bottom, 0px)); max-height: 90dvh; }
+  .pr-big, .pr-sheet-seg.pr-sub > .pr-big, .pr-num, .pr-custom-go { min-height: var(--hit-min, 44px); }
+  .pr-sheet-seg > .pr-big { flex: 1 1 calc(50% - var(--sp-2)); }          /* the segmented rows wrap to two lines */
+  .pr-sheet-seg.pr-sub > .pr-big { flex: 1 1 auto; }
   .pr-sheet-link { min-height: var(--hit-min, 44px); display: flex; align-items: center; }
 }
 @media (max-width: 480px) {
-  /* a phone's first row has no room for words beside the brand, Sync, Jump and the theme switch, and the phone is his main surface (he asked for the state and the time left): the chip is its own full-width row under the tabs, the word and its tail written out */
+  /* a phone's first row has no room for words beside the brand, Sync, Jump and the theme switch, and the phone is his main surface: the chip is its own full-width row under the tabs, the word and its tail written out */
   body.ke .masthead .indicators .pr-chip { order: 4; flex: 1 1 100%; width: auto; justify-content: flex-start; padding: 0 var(--sp-4); min-height: var(--hit-min, 44px); }
   .pr-chip-t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .pr-chip-w { font-weight: var(--fw-semibold); }
-  .pr-chip-x { color: var(--label); }
   .pr-dot { width: 10px; height: 10px; }
 }
-/* the settings section: plain and short, not a stack of tall empty panels */
+/* the settings section: plain and short, not a stack of tall empty panels. #presence-settings and .pr-settings-grid are the mount S4.2 uses. */
 body.ke .dev-zone.pr-settings .zone-head { display: flex; }
 .pr-settings { margin-top: var(--sp-6); }
 .pr-settings .zone-head { margin: 0 0 var(--sp-3); }
@@ -3030,12 +3022,15 @@ body.ke .dev-zone.pr-settings .zone-head { display: flex; }
 .pr-settings:focus { outline: none; }
 .pr-settings .dev-body { padding: var(--sp-1) var(--sp-5) var(--sp-4); }
 .pr-settings .dev-row { padding: var(--sp-3) 0; }
-.pr-settings .np-group { margin-top: var(--sp-3); }
 .pr-settings .pr-new-form { margin-top: var(--sp-3); }
 .pr-settings-grid { gap: var(--sp-4); }
+.pr-standing .pr-sheet-seg { max-width: 460px; }
 .pr-checks { display: flex; flex-wrap: wrap; gap: var(--sp-3); flex: 1 1 100%; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); }
 .pr-new .dev-url { width: 100%; margin: var(--sp-3) 0; }
-@media (max-width: 520px) { .pr-revoke { min-height: var(--hit-min, 44px); } }
+@media (max-width: 520px) {
+  .pr-revoke { min-height: var(--hit-min, 44px); }
+  .pr-standing .pr-big { min-height: var(--hit-min, 44px); }
+}
 
 /* ---- The sign sheet and /pair at every size (Phill 11-01: "why is it this narrow little strip on a huge empty page"). One page, drawn for the
    screen it is on. Below 800px nothing changes: the 420px card above, and the sheet (a grid of one column) reads in the order it always did:
