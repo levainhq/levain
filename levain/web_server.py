@@ -1237,7 +1237,7 @@ def _push_notice(queue: Path, ping_id: int, kind: str, ref: str, title: str, bod
 
 
 def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
-    """Act on an admitted notice: store it, then do what the operator's notification policy says (the same ``decide`` a
+    """Act on an admitted notice: store it, then do what the operator's presence record says (the same ``decide`` a
     seat's ping meets, through :func:`levain.webpush.notify.decide_now`). ``pushed``: the ping is recorded and sent to
     the phones; ``held``: it waits in the held queue for the existing flush; ``recorded`` (low): stored only. The ping's
     ref is ``notify:<source>`` (the push's tag and topic) and its link is the notices view, both fixed by Levain; the title

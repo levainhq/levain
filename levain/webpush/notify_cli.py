@@ -34,7 +34,7 @@ def register(subparsers) -> None:
                    help="flow: flow's own poster (it may name the notice's source; its links render as Levain's own). "
                         "token (default): a service you gave a key; its links show in full.")
     m.add_argument("--urgent", action="store_true",
-                   help="Let this token post urgent notices (they follow your notification policy's attention cell).")
+                   help="Let this token post urgent notices (they pass the presence record's attention rule: `levain ping status` says what is let through now).")
     m.add_argument("--max-priority", dest="max_priority", choices=("low", "normal", "urgent"), default=None,
                    help="The highest priority this token may post (default normal; urgent needs --urgent).")
     m.add_argument("--rate-per-min", dest="rate_per_min", type=int, default=None, help="Notices per minute (default 6).")
