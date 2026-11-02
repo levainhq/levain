@@ -195,7 +195,8 @@ def _scope_line(read_at: str | None = None) -> str:
 def verbose_lines() -> list[str]:
     """What the brief leaves out and ``coord open --verbose`` adds: the parts not derived or not built, and the read
     scope. Constant text, so a stored open needs nothing more to print them."""
-    return ["Missing close: not derived by this release (S4)", f"Not built: {NOT_BUILT}", _scope_line()]
+    return ["Missing close: shown in the brief only when an away mark began an operator seam with no operator close "
+            "after it", f"Not built: {NOT_BUILT}", _scope_line()]
 
 
 _UNSEQ_HEAD = "Unsequenced (rows written by an older release)"
@@ -272,6 +273,8 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
     rest = _collapse_zeros(read_at, unseq_lines,
                            _guard("Unacknowledged", lambda: _unacknowledged(conn, now), failed, critical=True),
                            _guard("Board", lambda: _board(store, conn, read_at), failed), band_lines, card_lines)
+    if not band_lines[0].startswith("Band: cannot-derive"):       # an unreadable queue directory is already said above
+        rest = [*rest, *_guard("Missing close", lambda: _missing_close(conn, present, qdir), failed)]
     head_lines, handoff_lines, since_lines, rest = ([_clean(ln) for ln in part] for part in
                                                     (head_lines, handoff_lines, since_lines, rest))
     rows = [(g, _clean(label)) for g, label in rows]
@@ -499,6 +502,28 @@ def _unacknowledged(conn: sqlite3.Connection, now: datetime) -> list[str]:
     if len(rows) > _LIST_LINES:
         lines.append(f"  ... more than {_LIST_LINES} unacknowledged opens; the newest {_LIST_LINES} are listed")
     return lines
+
+
+def _missing_close(conn: sqlite3.Connection, present: set[str], qdir: Path) -> list[str]:
+    """The operator seam that began (the latest away mark across agents, as ``morning.card`` reads it: a display, no
+    leave is verified) with no operator handoff written after it. Nothing to say renders no line, so a brief of a
+    store with no marks or a close in order is unchanged."""
+    began = None
+    who = ""
+    for agent, got in morning._away(qdir).items():
+        since = got.get("since")
+        if since is not None and (began is None or parse_stamp(since) > parse_stamp(began)):
+            began, who = since, agent
+    if began is None:
+        return []
+    close = None
+    if "seam_handoffs" in present:
+        close = conn.execute("SELECT handoff_id, written_at FROM seam_handoffs WHERE seam_kind = 'operator' ORDER BY "
+                             "handoff_id DESC LIMIT 1").fetchone()
+    if close is not None and parse_stamp(close[1]) >= parse_stamp(began):
+        return []
+    prior = "recorded" if close is None else f"after it (the last operator close is #{close[0]}, written {close[1]})"
+    return [f"Missing close: operator seam began {began} ({who} away); no operator close {prior}"]
 
 
 def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[str]:

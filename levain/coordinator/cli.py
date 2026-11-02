@@ -2208,6 +2208,12 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "only then. A rotation or dream open needs --read-back-file, your restatement of the handoff. "
                     "A --token that is given and refused exits 1 after printing the read-only open.")
     cop.add_argument("--ack", type=int, default=None, metavar="OPEN_ID")
+    cop.add_argument("--light", action="store_true",
+                     help="The coordinator's first turn after the operator spoke: print a light open (what changed since "
+                          "the last acknowledged open, plus the band) only when the operator's previous activity was "
+                          "--gap-hours or more before this; otherwise say none is needed.")
+    cop.add_argument("--gap-hours", dest="gap_hours", type=float, default=None, metavar="H",
+                     help="With --light: the gap under which no light open is needed (default 4).")
     cop.add_argument("--verbose", action="store_true",
                      help="Also print what the open does not derive or build, and its read scope.")
     cop.add_argument("--read-back-file", dest="read_back_file", type=Path, default=None, metavar="PATH")
