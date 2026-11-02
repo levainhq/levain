@@ -9,7 +9,8 @@ deferred ``BEGIN`` that has read nothing yet gets the same answer as one in ``BE
 that read first holds a snapshot and gets SQLite's busy error, which writes nothing.
 
 ``tick`` walks every registered, active agent's slots since its stored cursor, in the agent's stored zone, with an
-injected clock. What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
+injected clock. Before the walk it ends every admitted occurrence the full cap has held past its grace
+(:func:`close_no_slot`); ``launch_over`` and ``session_alive`` are the coordinator-lease probes (see :mod:`slots`). What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
 binding_id | None``; ``None`` means the agent is not armed), because arming is derived from the authority log and a
 binding is minted by the launch slice, neither of which is this module's.
 """
@@ -18,17 +19,17 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from levain.agents import schedule
+from levain.agents import schedule, slots
 from levain.agents.spec import _check_row
 from levain.agents.store import AgentStore, open_agent_store
 
-__all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurrence_id", "run_id", "claim", "tick",
-           "heartbeat", "takeover"]
+__all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurrence_id", "run_id", "claim",
+           "close_no_slot", "tick", "heartbeat", "takeover"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
@@ -99,6 +100,7 @@ class TickResult:
     refused: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, why): a stored spec that fails
     changed: list[str] = field(default_factory=list)                 # lifecycle moved mid-tick: left for next tick
     clamped: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, cursor): a cursor past the clock
+    no_slot: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, key): admitted, past grace, no slot
 
 
 def _agents(conn: sqlite3.Connection) -> list[tuple]:
@@ -139,8 +141,48 @@ def _settle(conn: sqlite3.Connection, agent_id: str, cursor: datetime | None, fl
         _set_cursor(conn, agent_id, floor)
 
 
+def _admitted_since(kind: str, key: str, admitted_at: str) -> datetime | None:
+    """When an admitted occurrence's grace began: a scheduled key is its slot's instant (the grace
+    :func:`schedule.classify` already measures), any other key has none, so its own admission. A stamp that does
+    not parse gives ``None``: the row is never closed on a time nobody can read."""
+    try:
+        admitted = datetime.strptime(admitted_at, _STAMP).replace(tzinfo=timezone.utc)
+        return datetime.strptime(key, _STAMP).replace(tzinfo=timezone.utc) if kind == "scheduled" else admitted
+    except (ValueError, TypeError):
+        return None
+
+
+def close_no_slot(conn: sqlite3.Connection, now: datetime, over: Collection[str] = ()) -> list[tuple[str, str]]:
+    """End as ``missed`` / ``no_slot`` every ``admitted`` occurrence past its grace while the cap is full (A0 §2.4:
+    a named occurrence is retried each tick, and only the grace running out ends it). Returns ``(agent_id, key)``.
+    It reclaims the expired coordinator leases in ``over`` (probed by the caller, :func:`slots.probe_over`) first, and
+    does nothing while a slot is free: an occurrence still admitted past grace with a slot free was not left by the
+    cap, so ``no_slot`` would be a false reason. A cap nobody can read decides nothing here: the tick goes on for
+    the other agents and the occurrences stay admitted. Runs in the caller's write transaction."""
+    try:
+        if slots.free(conn, now, over) > 0:
+            return []
+    except ValueError:
+        return []
+    at = _stamp(now)
+    closed = []
+    for oid, agent_id, kind, key, admitted_at in conn.execute(
+            "SELECT occurrence_id, agent_id, kind, key, admitted_at FROM agent_occurrences WHERE state = 'admitted'"
+            " ORDER BY admitted_at, occurrence_id").fetchall():
+        since = _admitted_since(kind, key, admitted_at)
+        if since is None or schedule.classify(since, now) != schedule.MISSED:
+            continue
+        conn.execute("UPDATE agent_occurrences SET state = 'missed', reason = 'no_slot', ended_at = ?"
+                     " WHERE occurrence_id = ? AND state = 'admitted'", (at, oid))
+        slots.release(conn, oid)  # an admitted occurrence holds nothing (A0 §2.4), so this frees nothing today
+        closed.append((agent_id, key))
+    return closed
+
+
 def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
-         binding_of: Callable[[str, str], str | None]) -> TickResult:
+         binding_of: Callable[[str, str], str | None],
+         session_alive: Callable[[str], bool | None] | None = None,
+         launch_over: Callable[[str], bool | None] | None = None) -> TickResult:
     """One controller pass. ``store`` is an opened :class:`AgentStore` or a store directory; a directory is opened
     through :func:`open_agent_store`, so a refused agent schema raises ``AgentStoreRefused`` with its named reason
     before anything is read or written.
@@ -155,6 +197,14 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
     now = schedule._utc(clock())  # a naive clock reading is refused up front
     floor = now.replace(second=0, microsecond=0)
     out = TickResult()
+    # first, so an occurrence the cap held past its grace no longer reads as a live previous one to this tick's claims
+    with store.read() as conn:
+        expired = slots.expired_launches(conn, now)
+    over = slots.probe_over(expired, launch_over, session_alive)  # outside any write lock: a probe can be slow
+    with store.write() as conn:
+        for agent_id, key in close_no_slot(conn, now, over):
+            out.no_slot.append((agent_id, key))
+            out.missed[agent_id] = out.missed.get(agent_id, 0) + 1  # the miss streak (P6-2b) counts it
     with store.read() as conn:
         agents = _agents(conn)
     for agent_id, name, operation, version, digest, text in agents:
