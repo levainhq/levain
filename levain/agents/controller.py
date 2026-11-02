@@ -138,15 +138,15 @@ def _settle(conn: sqlite3.Connection, agent_id: str, cursor: datetime | None, fl
         _set_cursor(conn, agent_id, floor)
 
 
-def _admitted_since(kind: str, key: str, admitted_at: str) -> datetime:
+def _admitted_since(kind: str, key: str, admitted_at: str) -> datetime | None:
     """When an admitted occurrence's grace began: a scheduled key is its slot's instant (the grace
-    :func:`schedule.classify` already measures), any other key has none, so its own admission."""
-    if kind == "scheduled":
-        try:
-            return datetime.strptime(key, _STAMP).replace(tzinfo=timezone.utc)
-        except ValueError:
-            pass
-    return datetime.strptime(admitted_at, _STAMP).replace(tzinfo=timezone.utc)
+    :func:`schedule.classify` already measures), any other key has none, so its own admission. A stamp that does
+    not parse gives ``None``: the row is never closed on a time nobody can read."""
+    try:
+        admitted = datetime.strptime(admitted_at, _STAMP).replace(tzinfo=timezone.utc)
+        return datetime.strptime(key, _STAMP).replace(tzinfo=timezone.utc) if kind == "scheduled" else admitted
+    except (ValueError, TypeError):
+        return None
 
 
 def close_no_slot(conn: sqlite3.Connection, now: datetime, over: Collection[str] = ()) -> list[tuple[str, str]]:
@@ -166,7 +166,8 @@ def close_no_slot(conn: sqlite3.Connection, now: datetime, over: Collection[str]
     for oid, agent_id, kind, key, admitted_at in conn.execute(
             "SELECT occurrence_id, agent_id, kind, key, admitted_at FROM agent_occurrences WHERE state = 'admitted'"
             " ORDER BY admitted_at, occurrence_id").fetchall():
-        if schedule.classify(_admitted_since(kind, key, admitted_at), now) != schedule.MISSED:
+        since = _admitted_since(kind, key, admitted_at)
+        if since is None or schedule.classify(since, now) != schedule.MISSED:
             continue
         conn.execute("UPDATE agent_occurrences SET state = 'missed', reason = 'no_slot', ended_at = ?"
                      " WHERE occurrence_id = ? AND state = 'admitted'", (at, oid))

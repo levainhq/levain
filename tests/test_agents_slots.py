@@ -176,18 +176,68 @@ def test_a_probe_that_raises_on_a_null_session_key_keeps_the_slot_and_the_tick_f
         assert [h[2] for h in slots.held(c)] == ["held-1", "ln-nokey"]       # kept, tick finished
 
 
-def test_a_probe_does_not_hold_the_write_lock(tmp_path):
+def _lock_probe_outcome(tmp_path, tick):
     store, ag = _store(tmp_path)
     with store.write() as c:
         slots.take(c, slots.LAUNCH, "ln-1", T0)
     other = sqlite3.connect(store.path, timeout=0.1, isolation_level=None)
+    outcome = []
 
     def launch_over(launch_id):
-        other.execute("BEGIN IMMEDIATE")                                     # fails 'database is locked' if tick holds it
-        other.execute("ROLLBACK")
+        try:
+            other.execute("BEGIN IMMEDIATE")                                 # 'database is locked' if tick holds it
+            other.execute("ROLLBACK")
+            outcome.append("acquired")
+        except sqlite3.OperationalError as exc:
+            outcome.append(str(exc))
         return False
 
-    ctl.tick(store, lambda: T0 + 16 * MIN, lambda a, h: None, None, launch_over)
+    tick(store, lambda: T0 + 16 * MIN, lambda a, h: None, None, launch_over)
+    other.close()
+    return outcome
+
+
+def test_a_probe_does_not_hold_the_write_lock(tmp_path):
+    # the outcome is recorded in the test, not inferred from the tick: `_ask` swallows a probe's exception
+    assert _lock_probe_outcome(tmp_path, ctl.tick) == ["acquired"]
+
+
+def test_the_lock_probe_test_can_fail(tmp_path, monkeypatch):
+    """A tick that probes inside its write transaction makes the same test fail, so it is not vacuous."""
+    def probing_inside_write(store, clock, binding_of, session_alive=None, launch_over=None):
+        now = clock()
+        with store.read() as conn:
+            expired = slots.expired_launches(conn, now)
+        with store.write():
+            slots.probe_over(expired, launch_over, session_alive)
+
+    out = _lock_probe_outcome(tmp_path, probing_inside_write)
+    assert out and out != ["acquired"] and "locked" in out[0]
+
+
+def _full_cap_with(store, ag, kind, key, admitted_at):
+    with store.write() as c:
+        for i in (1, 2):
+            slots.take(c, slots.OCCURRENCE, f"held-{i}", T0 - 60 * MIN)
+        ctl.claim(c, agent_id=ag, kind=kind, key=key, spec_hash="h", binding_id="b1", window_key="w", now=T0 - 60 * MIN)
+        c.execute("DROP TRIGGER agent_occurrences_identity")                 # a corrupted row is the fixture
+        c.execute("UPDATE agent_occurrences SET admitted_at = ?", (admitted_at,))
+
+
+@pytest.mark.parametrize("kind,key,admitted_at", [
+    ("scheduled", "2026-11-02T11:00:00Z", "not-a-stamp"),
+    ("scheduled", "not-a-stamp", "2026-11-02T11:00:00Z"),
+    ("manual", "x", "not-a-stamp"),
+])
+def test_an_unparseable_stamp_keeps_the_row_admitted_and_never_aborts_the_tick(tmp_path, kind, key, admitted_at):
+    store, ag = _store(tmp_path)
+    _full_cap_with(store, ag, kind, key, admitted_at)
+    with store.write() as c:
+        assert ctl.close_no_slot(c, T0) == []
+    r = ctl.tick(store, lambda: T0, lambda a, h: None)                       # the tick itself goes on
+    assert r.no_slot == []
+    with store.read() as c:
+        assert c.execute("SELECT state FROM agent_occurrences").fetchone()[0] == "admitted"
 
 
 def _fill(store, ag, cursor="2026-11-02T11:58:00Z"):
