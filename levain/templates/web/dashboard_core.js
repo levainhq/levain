@@ -7251,6 +7251,10 @@
     else if (ui.drops.length) { ui.say.textContent += " Showing the drops last read."; }
     ui.read = r;
     dropThreadDraw(host);
+    // words a card handed over before this first read landed (see composeDrop) go in now, or are refused with the reason
+    const held = ui.pending;
+    ui.pending = null;
+    if (held) for (const w of held) composeDrop(w);
   }
   // the thread: his drops and the desk's replies in one list. Only the list is replaced: the filter box keeps its focus and the
   // composer is never touched. A redraw that would change nothing leaves the DOM alone, so selected text stays selected.
@@ -7345,6 +7349,9 @@
     const ui = host && host._drop;
     if (!ui || host.hidden) return !!openDropSheet(words);
     // a box that cannot take words now says why on its card; words put in a disabled box would look sent-ready and be lost
+    // before the first read lands the box does not yet know whether it can take words (it starts off): the words wait for that
+    // read, then go in or are refused with its reason, rather than a click on a card being lost in the first moments of the page
+    if (!ui.read && !ui.working) { (ui.pending = ui.pending || []).push(words); return true; }
     if (ui.working || !ui.can) {
       ui.say.textContent = ui.working ? "The drop box is busy" : "The drop box is off" + (ui.note ? ": " + ui.note : "");
       ui.say.classList.add("bad");
