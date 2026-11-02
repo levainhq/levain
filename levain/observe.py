@@ -12,6 +12,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -214,7 +215,8 @@ def install(root: Path, *, live: bool = False, python: str | None = None) -> int
         if any(_is_ours(h) for g in groups if isinstance(g, dict) for h in g.get("hooks", [])):
             print(f"already installed in {path}")
             return 0
-        cmd = f"{python or sys.executable} -m {MARKER}"
+        # a missing interpreter or a failed import must not show the harness "Hook failed": the logger answers nothing
+        cmd = f"{shlex.quote(python or sys.executable)} -m {MARKER} 2>/dev/null || true"
         groups.append({"matcher": "", "hooks": [{"type": "command", "command": cmd}]})
         _write_settings(path, doc)
     except (OSError, ValueError, AttributeError) as exc:
