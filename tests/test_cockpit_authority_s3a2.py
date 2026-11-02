@@ -637,6 +637,9 @@ SNAPSHOT_BUILDERS = {
     # it through RequestAuthority.capture would pull the cockpit request path into the autonomic engine for no
     # freshness gain (both snapshot at one instant).
     (LEVAIN / "graduation_policy.py", "_replay"),
+    # AgentAuthority.replay is the autonomic engine's read-only anchored replay: the anchor is read before its
+    # transaction, it appends nothing, and it was written to be the same kind of reader as graduation_policy._replay.
+    (LEVAIN / "agent_authority.py", "replay"),
 }
 
 
@@ -780,6 +783,41 @@ def _check_per_act_append(fn: ast.FunctionDef | ast.AsyncFunctionDef, names: tup
             for v in sources), f"{fn.name}: {holder} is not a journal this act opened or was handed"
 
 
+# The appenders that are HANDED their cockpit connection by a caller and open none: (file, function, the parameter).
+HANDED_APPENDERS = {
+    ("agents/bars.py", "_r2"): "cockpit",
+}
+
+
+def _check_handed_append(tree: ast.Module, name: str, param: str) -> None:
+    """``name`` appends through ``param`` alone: every append call passes that bare parameter as its first
+    argument, ``name`` neither rebinds it nor declares global state, the module builds no journal of its own at
+    any depth (so it cannot hold one), and ``name`` is called only from ``recover``, passing ``recover``'s own
+    ``cockpit`` parameter, so the connection is the caller's per-act one and not the module's."""
+    fn = _function(tree, name)
+    assert not [n for n in ast.walk(fn) if isinstance(n, (ast.Global, ast.Nonlocal))], f"{name}: global state"
+    assert param in {a.arg for a in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)}, f"{name}: no {param}"
+    rebound = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == param and isinstance(n.ctx, ast.Store)]
+    assert rebound == [], f"{name}: {param} is rebound"
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "append" and _dotted(n.func) == "_auth.append"]
+    assert calls, f"{name}: no _auth.append call"
+    for call in calls:
+        first = call.args[0] if call.args else None
+        assert isinstance(first, ast.Name) and first.id == param, f"{name}:{call.lineno} append off the handed {param}"
+    built = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call) and _dotted(n.func) is not None
+             and _dotted(n.func).split(".")[-1] in ("_journal", "CockpitDB", "autocommit", "connect")]
+    assert built == [], f"{name}: the module builds a connection itself at {built}"
+    callers = [(c, f.name) for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+               for c in ast.walk(f) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == name]
+    assert [f for _c, f in callers] == ["recover"], f"{name}: called from {[f for _c, f in callers]}"
+    recover = _function(tree, "recover")
+    assert "cockpit" in {a.arg for a in (*recover.args.args, *recover.args.kwonlyargs)}
+    for c, _f in callers:
+        args = [*c.args, *(k.value for k in c.keywords)]
+        assert any(isinstance(a, ast.Name) and a.id == "cockpit" for a in args), f"{name}: not recover's cockpit"
+
+
 def _check_the_appenders(root: Path) -> None:
     """The S3a-2 MUST (a) guard over the package at ``root`` (the installed one, or a planted copy)."""
     appenders = []
@@ -790,7 +828,10 @@ def _check_the_appenders(root: Path) -> None:
             appenders.append((str(path.relative_to(root)), fn, name))
     # cli._signed_append (append + prepare): the `levain binding policy create|renew|revoke` verbs, a short-lived CLI
     # act that opens its journal per act, the same shape as keys._append; PER_ACT_APPENDERS holds both to it below.
-    assert sorted(appenders) == [("chat_egress/key_setup.py", "setup_key", "append"),
+    # agents.bars._r2 appends a bar's stored signature through the cockpit connection recover hands it; it opens none
+    # and is held to that by HANDED_APPENDERS below.
+    assert sorted(appenders) == [("agents/bars.py", "_r2", "append"),
+                                 ("chat_egress/key_setup.py", "setup_key", "append"),
                                  ("chat_egress/key_setup.py", "setup_key", "prepare"),
                                  ("cli.py", "_signed_append", "append"),
                                  ("cli.py", "_signed_append", "prepare"),
@@ -799,6 +840,8 @@ def _check_the_appenders(root: Path) -> None:
                                  ("consent/grants.py", "prepare_revoke", "prepare")]
     for (rel, name), calls in PER_ACT_APPENDERS.items():
         _check_per_act_append(_function(ast.parse((root / rel).read_text(encoding="utf-8")), name), calls)
+    for (rel, name), param in HANDED_APPENDERS.items():
+        _check_handed_append(ast.parse((root / rel).read_text(encoding="utf-8")), name, param)
     callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
                if _key_act_callers(ast.parse(path.read_text(encoding="utf-8")))]
     assert callers == ["cli.py"]
@@ -880,6 +923,27 @@ def test_the_appender_guard_sees_an_append_off_its_per_act_connection(tmp_path, 
     src = (root / rel).read_text(encoding="utf-8")
     assert src.count(old) == 1, old
     (root / rel).write_text(src.replace(old, new), encoding="utf-8")
+    with pytest.raises(AssertionError, match=why):
+        _check_the_appenders(root)
+
+
+@pytest.mark.parametrize("old, new, why", [
+    ("_auth.append(cockpit, link,", "_auth.append(_HELD, link,", "_r2:.* append off the handed cockpit"),
+    ("    link = _auth.UnsignedLink(seq, prev, rec, fp)\n", "    link = _auth.UnsignedLink(seq, prev, rec, fp)\n    cockpit = conn\n",
+     "_r2: cockpit is rebound"),
+    ("    pending = _pending(bar)\n    if pending is None or bar.pending_signature",
+     "    pending = _pending(bar)\n    _HELD = CockpitDB('x')\n    if pending is None or bar.pending_signature",
+     "the module builds a connection itself"),
+    ("or _r2(conn, cockpit, state,", "or _r2(conn, _HELD, state,", "_r2: not recover's cockpit"),
+])
+def test_the_handed_append_guard_sees_an_append_off_the_handed_connection(tmp_path, old, new, why):
+    # the handed-connection shape is not vacuous: another connection, a rebound parameter, a journal the module
+    # builds, or a caller that passes something other than recover's own cockpit fails it
+    root = tmp_path / "levain"
+    shutil.copytree(LEVAIN, root, ignore=shutil.ignore_patterns("__pycache__"))
+    src = (root / "agents" / "bars.py").read_text(encoding="utf-8")
+    assert src.count(old) == 1, old
+    (root / "agents" / "bars.py").write_text(src.replace(old, new), encoding="utf-8")
     with pytest.raises(AssertionError, match=why):
         _check_the_appenders(root)
 
