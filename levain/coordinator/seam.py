@@ -195,7 +195,8 @@ def _scope_line(read_at: str | None = None) -> str:
 def verbose_lines() -> list[str]:
     """What the brief leaves out and ``coord open --verbose`` adds: the parts not derived or not built, and the read
     scope. Constant text, so a stored open needs nothing more to print them."""
-    return ["Missing close: not derived by this release (S4)", f"Not built: {NOT_BUILT}", _scope_line()]
+    return ["Missing close: shown in the brief only when an away mark began an operator seam with no operator close "
+            "after it", f"Not built: {NOT_BUILT}", _scope_line()]
 
 
 _UNSEQ_HEAD = "Unsequenced (rows written by an older release)"
@@ -266,12 +267,18 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
     band_lines = _guard("Band", lambda: _band(store, conn, qdir, now, read_at), failed)
     # the card reads a queue directory it cannot open as "not away, nothing undecided": with the band unread, its queue
     # parts are unknown, and the brief says that rather than print the empty answers
+    band_unread = bool(band_lines) and band_lines[0].startswith("Band: cannot-derive")
     card_lines = (["Card: cannot-derive (the queue directory could not be read, so the away, undecided and waiting "
-                   "parts are unknown)"] if band_lines[0].startswith("Band: cannot-derive")
+                   "parts are unknown)"] if band_unread
                   else _guard("Card", lambda: _card(store, conn, qdir, now), failed))
     rest = _collapse_zeros(read_at, unseq_lines,
                            _guard("Unacknowledged", lambda: _unacknowledged(conn, now), failed, critical=True),
                            _guard("Board", lambda: _board(store, conn, read_at), failed), band_lines, card_lines)
+    # read on its own: a band that could not be read says nothing about the away marks; only this row's own failure
+    # beside an unread band repeats what the band line already says
+    missing = _guard("Missing close", lambda: _missing_close(conn, present, qdir), failed)
+    if not (band_unread and missing[:1] and missing[0].startswith("Missing close: cannot-derive")):
+        rest = [*rest, *missing]
     head_lines, handoff_lines, since_lines, rest = ([_clean(ln) for ln in part] for part in
                                                     (head_lines, handoff_lines, since_lines, rest))
     rows = [(g, _clean(label)) for g, label in rows]
@@ -499,6 +506,28 @@ def _unacknowledged(conn: sqlite3.Connection, now: datetime) -> list[str]:
     if len(rows) > _LIST_LINES:
         lines.append(f"  ... more than {_LIST_LINES} unacknowledged opens; the newest {_LIST_LINES} are listed")
     return lines
+
+
+def _missing_close(conn: sqlite3.Connection, present: set[str], qdir: Path) -> list[str]:
+    """The operator seam that began (the latest away mark across agents, as ``morning.card`` reads it: a display, no
+    leave is verified) with no operator handoff written after it. Nothing to say renders no line, so a brief of a
+    store with no marks or a close in order is unchanged."""
+    began = None
+    who = ""
+    for agent, got in morning._away(qdir).items():
+        since = got.get("since")
+        if since is not None and (began is None or parse_stamp(since) > parse_stamp(began)):
+            began, who = since, agent
+    if began is None:
+        return []
+    close = None
+    if "seam_handoffs" in present:
+        close = conn.execute("SELECT handoff_id, written_at FROM seam_handoffs WHERE seam_kind = 'operator' ORDER BY "
+                             "handoff_id DESC LIMIT 1").fetchone()
+    if close is not None and parse_stamp(close[1]) >= parse_stamp(began):
+        return []
+    prior = "recorded" if close is None else f"after it (the last operator close is #{close[0]}, written {close[1]})"
+    return [f"Missing close: operator seam began {began} ({who} away); no operator close {prior}"]
 
 
 def _board(store: CoordStore, conn: sqlite3.Connection, read_at: str) -> list[str]:
