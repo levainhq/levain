@@ -30,7 +30,7 @@ from typing import Any
 
 MODULE = "levain.band_hook"
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
-_TIMEOUT = {"SessionStart": 30, "UserPromptSubmit": 10, "Stop": 10}
+_TIMEOUT = {"SessionStart": 30, "UserPromptSubmit": 30, "Stop": 10}
 _MATCHER = "startup|resume|clear|compact"          # the install's own SessionStart matcher
 INSTALL_COMMAND = "levain band hooks install"
 RECEIPT_NAME ="band_hooks.json"
