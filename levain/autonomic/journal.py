@@ -563,8 +563,16 @@ class RunJournal:
         if conn.execute("SELECT 1 FROM meta WHERE key = 'registry'").fetchone() is not None:
             # this store holds a binding registry: the run's grant must still stand, read in this same
             # transaction (a corrupt registry, an absent or no-longer-fireable binding stops it)
-            from levain.autonomic.binding import registry_bars
-            barred = registry_bars(conn, run[0], run_id)
+            from levain.autonomic.binding import agent_run_proof, registry_bars, registry_scan_bars
+            # an agent run's named Binding is never a ``bindings`` row: with the proof, only the corruption scan
+            # applies and ``fence_now`` judges the agent's authority. Only a ``/2`` store that holds the agent
+            # tables reads the proof, so a ``/3`` store never sees the extra SELECT.
+            if (not self._v3 and conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = "
+                                              "'agent_occurrences'").fetchone() is not None
+                    and agent_run_proof(conn, run_id)):
+                barred = registry_scan_bars(conn)
+            else:
+                barred = registry_bars(conn, run[0], run_id)
             if barred is not None:
                 return EffectOutcome(EffectStatus.BARRED, barred)
         if eff is not None and eff[1] == "unknown":

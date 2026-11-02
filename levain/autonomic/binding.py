@@ -869,6 +869,38 @@ def registry_bars(conn: sqlite3.Connection, binding_id: str, run_id: str) -> str
     return None if BindingStore.is_fireable(b) else "binding_not_fireable"
 
 
+def registry_scan_bars(conn: sqlite3.Connection) -> str | None:
+    """Only the registry's corruption verdict, read in the caller's transaction: ``"registry_corrupt"`` or ``None``.
+    An agent run (see :func:`agent_run_proof`) has a named Binding that is never a ``bindings`` row, so the presence
+    and fireability checks of :func:`registry_bars` do not apply to it; a corrupt registry still fires nothing."""
+    _, problem = _scan_in(conn)
+    return None if problem is None else "registry_corrupt"
+
+
+def agent_run_proof(conn: sqlite3.Connection, run_id: str) -> bool:
+    """Whether ``run_id`` is the run of a launched agent occurrence, read in the caller's transaction. Row presence
+    alone is too weak (a caller could reuse an agent's run id to skip a registry revoke), so every part must hold:
+    the occurrence's ``binding_id`` is the run's, it is ``launched`` with a ``launch_epoch``, and the run id
+    recomputes from its ``{agent_id, kind, key}``. Any read that fails answers False, so the ordinary
+    :func:`registry_bars` applies. This guards against a confused deputy; a process that can write this database
+    already holds the keyless registry."""
+    try:
+        run = conn.execute("SELECT binding_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        row = conn.execute("SELECT agent_id, kind, key, binding_id, state, launch_epoch FROM agent_occurrences "
+                           "WHERE run_id = ?", (run_id,)).fetchone()
+    except sqlite3.Error:
+        return False
+    if run is None or row is None:
+        return False
+    agent_id, kind, key, binding_id, state, launch_epoch = row
+    if binding_id != run[0] or state != "launched" or launch_epoch is None:
+        return False
+    # the same digest as levain.agents.controller.run_id, which this leaf cannot import
+    text = json.dumps({"agent_id": agent_id, "kind": kind, "key": key}, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+    return run_id == "run-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+
+
 def _parse_json_registry(text: str) -> tuple[list[dict[str, Any]], str | None]:
     """Read a registry kept in the earlier JSON FILE format, for :meth:`BindingStore.migrate_json`: a JSON
     object keyed by ``binding_id`` (this package's) or a top-level list (the vagus package's). Parsed with a
