@@ -3834,28 +3834,33 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
             detail += (f"; a leave signed by {mark.leave_by} does not verify ({mark.leave_refusal}), so the mark "
                        "stands")
         out.append(CheckResult(f"{label} away mode", True, detail, warn=mark.leave_refusal is not None))
-    elif settings.explicit_off:
-        when = " (set before auto-away existed)" if settings.legacy else ""
-        out.append(CheckResult(f"{label} away mode", True,
-                               f"off by your word{when}: an unanswered request goes straight to {label}'s own "
-                               "dialog; `levain consent away auto` lets input idle decide"))
-    elif not settings.away_mode:
-        out.append(CheckResult(f"{label} away mode", True,
-                               f"follows input idle: after {settings.away_idle_seconds:g}s of no keyboard, mouse "
-                               f"or trackpad input (macOS; no idle source elsewhere) a request is held for a "
-                               f"signed answer until you are back, otherwise it goes straight to {label}'s own "
-                               "dialog"))
     else:
-        hold = int(min(settings.away_hold_seconds, max(0.0, DEFAULT_MAX_HOLD - CLEANUP_RESERVE)))
-        if adapter == "claude-code":
+        from levain.consent.auto_away import DEFAULT_HOLDS
+
+        # the presence record decides (DESIGN §4): what the hook itself reads (effective_away: held for a signed answer
+        # when an approval reaches the devices AND an enrolled key could sign it, and not on a blind follow); the
+        # settings file's away words are not read (a file word that disagrees is named below)
+        push, _source, why = claude_code.effective_away(settings, queue_dir=qdir)
+        hold = int(min(settings.away_hold_seconds if settings.away_hold_seconds > 0 else DEFAULT_HOLDS[mod.AGENT],
+                       max(0.0, DEFAULT_MAX_HOLD - CLEANUP_RESERVE)))
+        ignored = (f"; the settings file's away word ({'on' if settings.away_mode else 'off'}) is not read now"
+                   if settings.away_mode or settings.explicit_off else "")
+        if not push:
             out.append(CheckResult(f"{label} away mode", True,
-                                   f"on, hold {hold}s: Claude Code shows its dialog during the hold; an expired "
-                                   "hold leaves it standing"))
+                                   f"follows your presence record, which sends approvals to {label}'s own dialog now "
+                                   f"({why}){ignored}; `levain ping status` prints the line"))
+        elif adapter == "claude-code":
+            out.append(CheckResult(f"{label} away mode", True,
+                                   f"follows your presence record, which holds approvals for a signed answer now "
+                                   f"({why}), hold {hold}s: Claude Code shows its dialog during the hold; an expired "
+                                   f"hold leaves it standing{ignored}"))
         else:
             out.append(CheckResult(f"{label} away mode", True,
-                                   f"on, hold {hold}s: Codex shows NO dialog during the hold (\"Running hook\", "
-                                   f"up to {hold}s), then its own dialog",
-                                   f"Away mode is your opt-in, set in {qdir / mod.SETTINGS_NAME}.", warn=True))
+                                   f"follows your presence record, which holds approvals for a signed answer now "
+                                   f"({why}), hold {hold}s: Codex shows NO dialog during the hold (\"Running hook\", "
+                                   f"up to {hold}s), then its own dialog{ignored}",
+                                   "`levain ping devices off` (or `levain consent away off`) sends approvals "
+                                   "straight to the dialog.", warn=True))
     ours = os.path.realpath(consent_cockpit_root(install))
     name = f"{label} consent authority"
     root = settings.cockpit_data_root

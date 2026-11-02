@@ -1,64 +1,32 @@
-"""levain.webpush.presence — whether a ping is pushed to the phone now. One rule, no state precedence:
+"""levain.webpush.presence — whether a ping is pushed to the phone now, and the words that set it.
 
-    push = not muted AND (urgent OR not_home OR no input at the laptop for >= ACTIVE_WINDOW_SECS)        ... unless loud
+Since presence 1b (Phill 11-02) the rule lives in :mod:`levain.webpush.intent`: ONE record (``intent.json``) with a standing
+``base`` and an ``overlay`` (a preset or a setting for a while), each carrying ``devices`` (on / off / follow), ``follow_after``
+(seconds; default 600) and ``lets_through`` (everything / needs / approvals / nothing). Sensing (laptop idle, remote input, a
+desk message, desk liveness) is shown and feeds only ``follow`` and ``until: input``; it never rewrites the record. This module
+keeps what the record shares with its callers:
 
-That is the shipped default. While ``quiet`` or ``sleep`` is active the operator's policy cell for the ping's class
-(``approval``, ``attention``, ``other``: :data:`KIND_CLASSES`) decides push or hold, kept in
-``<queue_dir>/webpush/policy.json`` and set with ``levain ping policy`` (operator only); a ``push`` cell pushes while
-that word is active even when the desk is active, a ``hold`` cell holds. With no policy file, or a malformed one, the
-cells are :data:`DEFAULT_CELLS`, which are the rule above.
+- the vocabulary the record is written with: the preset words (:data:`WORDS`), who may set which (:data:`SEAT_WORDS`,
+  :data:`COORDINATOR_WORDS`, :func:`check_setter`), durations (:func:`parse_duration`), the kind -> class map
+  (:data:`KIND_CLASSES`), and the lock (:func:`_locked`), the log (:func:`log_line`, :func:`read_log`) and the setter checks
+  every write goes through;
+- the remote-activity record (:func:`note_remote_activity`): input over ssh or mosh, or a turn in the Claude app's remote
+  control, reported BY A CALLER and kept as a high-water mark in ``remote_activity.json``. It is NOT desk presence (Phill
+  11-01: *"don't we want device pings ON when remote desk is measured and NOT be counted at the physical desk?"*): while
+  fresh (under :data:`ACTIVE_WINDOW_SECS`) it turns ``follow`` to devices on, and it never counts as laptop input;
+- the wrappers flow's installed half and older callers use for one release: :func:`should_push` (the one decider, signature
+  unchanged), :func:`effective`, :func:`describe`, :func:`read_word`, :func:`set_word` and the deprecated :func:`decide`;
+- the pre-1b readers the migration uses (:func:`read_legacy_word`, :func:`read_policy`), and the retired policy
+  (:func:`policy_view`, :func:`set_policy`: the policy cells are replaced by the presets' ``lets_through``).
 
-(Phill 10-25: *"++ yes that's the shape 100%"*.) A ping that is not pushed is still written to the notification record
-(:func:`levain.webpush.sender.send` with ``push=False``); only the push to the phone is held, and a held ping waits in
-the push store (:mod:`levain.webpush.held`) until the rule next says push.
+A word may carry who set it. A seat the operator told ("heading out") may set only :data:`SEAT_WORDS`, and the coordinator only
+:data:`COORDINATOR_WORDS`; every other word, and a standing ``loud`` (no setter replaces it), stays his. A setter's write is
+refused unless it names an agent and quotes his words, and the record keeps the setter and the quote beside the overlay. The
+setter's role comes from the caller's session identity, which is a label under one uid and not a boundary.
 
-Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newest replaces the one before):
-
-- ``quiet [duration]`` and ``sleep`` are the only holding words. ``quiet`` mutes for its duration (default
-  :data:`DEFAULT_SECS`, at most :data:`MAX_SECS`); by default an urgent ping still pushes through it (the policy). ``sleep`` mutes until the
-  operator's next input at this machine after saying it (input is read from the macOS HID idle time: he has typed since
-  when ``now - idle`` is later than the word); by default approvals and urgent pings still push through it, as through quiet (the policy). With no idle reading (not macOS, or the read
-  failed) it cannot see his input, so it ends :data:`SLEEP_BLIND_SECS` after the word and ``levain ping status`` says the
-  idle source is unavailable.
-- ``loud [duration|off]`` turns pings on for its duration, over every other parameter, a mute included; only its timer,
-  ``loud off`` or any other word written over it (``set_word`` keeps one word on file) ends it, never ``back``.
-- ``away`` pushes at once until input at this machine more than :data:`AWAY_GRACE_SECS` after it (a line typed just
-  after saying it is the parting instruction). ``back`` clears ``away``, ``quiet`` and ``sleep``, sets the route to ``desk``
-  (:mod:`levain.webpush.route`) and leaves the measurement to decide. All optional overrides. (There was a ``remote`` word;
-  it was dropped 11-01: the route, ``devices``, is how pings go to the phone, and a measured remote session is desk activity.
-  A ``remote`` left on file by an older version reads as no word.)
-
-Remote activity is NOT desk presence (Phill 11-01: *"don't we want device pings ON when remote desk is measured and NOT be
-counted at the physical desk?"*). Input over ssh or mosh, or a turn in the Claude app's remote control, is reported with
-:func:`note_remote_activity` BY A CALLER (Levain ships none; source ``remote-terminal`` or ``remote-control``) and kept as a high-water mark in
-``<queue_dir>/webpush/remote_activity.json``. While that record is fresh (under :data:`ACTIVE_WINDOW_SECS`), an ordinary
-ping PUSHES to his devices, after every word above it (loud, a mute, an urgent ping, ``away``) and BEFORE the desk-idle
-test, so the answer is ``pushing`` with source ``measured``. It never touches the laptop reading: the HID idle (``seen``)
-is the only thing that holds a ping at the desk. The precedence is exact: if he sits down and types at the laptop while a
-remote record is still fresh, the answer is STILL pushing until the record ages out (the remote reading is not cleared by
-laptop input). :func:`effective` carries the fresh record as ``remote`` so flow can tag a row filed needing the laptop.
-
-The operator's activity is the macOS HID idle time (:func:`levain.consent.auto_away.input_idle_seconds`): measured, never
-predicted, and a message he sent to a desk at the laptop counts as input too (:mod:`levain.webpush.desk`, which also keeps
-the desk's liveness record and the Here / Away reading the chip shows). With no such source, or no readable word, nothing is
-muted and he reads inactive: a ping he did not need costs one notification, a ping he needed and never got costs the day. This host has no location signal, so
-``not_home`` is the ``away`` word alone.
-
-A word may carry who set it. A seat the operator told ("heading out") may set only :data:`SEAT_WORDS`, and the
-coordinator only :data:`COORDINATOR_WORDS`; every other word, and a standing ``loud`` (no setter replaces it), stays his.
-A setter's write is refused unless it names an agent and quotes his words, and the record keeps the setter and the quote
-beside the word. A setter replaces a word the operator set himself only when its quote is found in what he typed
-(:mod:`levain.webpush.quote`) after that word; any other quote sets over no word or another agent's word, marked
-unverified. The setter's role comes from the caller's session
-identity, which is a label under one uid and not a boundary: it records intent, it does not stop a process that hides
-its environment.
-
-The consent hook's own away mode (:mod:`levain.consent.away`) is a different setting (whether the hook holds a request
-for a signed answer) and is not read or changed here.
-
-Every call to :func:`set_word`, a refusal included, leaves one row in ``<queue_dir>/webpush/presence.log.jsonl``
-(append-only, rotated to ``.1`` past 1 MiB; ``levain ping log``): who, in which role, the word, the quote, the
-word it found, and the outcome.
+Every write, a refusal included, leaves one row in ``<queue_dir>/webpush/presence.log.jsonl`` (append-only, rotated to ``.1``
+past 1 MiB; ``levain ping log``). Any fault reads as push: a ping he did not need costs one notification, one he needed and
+never got costs the day.
 
 Stdlib only.
 """
@@ -79,7 +47,8 @@ from pathlib import Path
 
 __all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "SLEEP_BLIND_SECS", "URGENT_KINDS", "WORDS", "Decision", "KIND_CLASSES", "DEFAULT_CELLS", "kind_class",
            "read_policy", "set_policy", "reset_policy", "policy_sentences", "policy_view", "policy_is_default",
-           "REMOTE_SOURCES", "REMOTE_FAULT", "note_remote_activity", "read_remote_activity", "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "set_word", "should_push", "effective"]
+           "REMOTE_SOURCES", "REMOTE_FAULT", "note_remote_activity", "read_remote_activity", "PresenceError", "PresenceBusy", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "read_legacy_word", "set_word", "should_push", "effective"]
+
 
 ACTIVE_WINDOW_SECS = 5 * 60
 AWAY_GRACE_SECS = 3 * 60
@@ -200,8 +169,8 @@ def _valid(got: object) -> dict | None:
     return {"word": got["word"], "ts": float(ts), **_provenance(got)}
 
 
-def read_word(queue_dir: Path | str | None) -> dict | None:
-    """The word on file, or ``None``. A file that is missing, a symlink, not regular, oversized, unparseable or naming
+def read_legacy_word(queue_dir: Path | str | None) -> dict | None:
+    """The PRE-1b word on file (``presence.json``), or ``None``; the migration reads it. A file that is missing, a symlink, not regular, oversized, unparseable or naming
     a word this version does not know (an older or newer writer's) is no word: the measurement then decides."""
     if queue_dir is None:
         return None
@@ -237,63 +206,13 @@ _CLASS_WORDS = {"approval": "approvals", "attention": "attention items", "other"
 
 def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False, class_name: str | None = None,
            policy: dict | None = None, route: str = "desk", remote: dict | None = None) -> Decision:
-    """:func:`_decide` without the source: whether a ping is pushed at ``now`` (the full docstring is there). Pure."""
-    return _decide(now, word, idle, urgent=urgent, class_name=class_name, policy=policy, route=route, remote=remote)[0]
+    """DEPRECATED, one release (use :func:`levain.webpush.intent.decide`): the pre-1b arguments mapped onto the record. ``word``
+    is a pre-1b word record and ``route`` ``desk`` or ``devices``; ``policy`` is ignored (the presets' ``lets_through``
+    replaced the cells). ``idle`` is the laptop input idle seconds. Pure."""
+    from levain.webpush import intent
 
-
-def _decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False, class_name: str | None = None,
-            policy: dict | None = None, route: str = "desk", remote: dict | None = None) -> tuple[Decision, str]:
-    """Whether a ping is pushed at ``now``. ``idle``: seconds since the operator's last input at this machine, ``None``
-    when unknown. ``class_name`` is the ping's class (:func:`kind_class`); left unset, ``urgent`` stands for
-    ``approval`` and not urgent for ``other``. ``policy`` is the cells (:func:`read_policy`), the shipped default when
-    unset: while ``quiet`` or ``sleep`` is active the cell for (word, class) decides push or hold. ``route``
-    (:mod:`levain.webpush.route`) is ``desk`` or ``devices``: ``devices`` pushes an ordinary ping even while the desk is
-    active, after every mute and word above it. ``remote`` (:func:`read_remote_activity`: ``{at, source, age}`` or ``None``) is
-    measured remote activity, which is not desk presence: while it is fresh at ``now`` an ordinary ping (class ``other``
-    only; an urgent class has already pushed on its own reason) pushes, after
-    loud, a mute, urgent and ``away`` and BEFORE the route and the desk-idle test. It never changes ``seen`` (the laptop
-    reading), so input at the laptop while a remote record is still fresh does NOT hold the ping: it keeps pushing until
-    the record ages out. Returns ``(decision, source)``: ``word`` when a word on file (loud, a
-    mute, away) decided, ``measured`` when the desk reading, the route or the ping's class decided. Pure."""
-    if _active(word, "loud", now):
-        return Decision(True, "pushing", "loud: pings on until its timer ends, over every other parameter"), "word"
     cls = class_name if class_name in CLASSES else ("approval" if urgent else "other")
-    cells = policy if policy is not None else DEFAULT_CELLS
-    seen = None if idle is None else now - max(0.0, idle)   # when he last did something here
-    mute = None
-    if word and word["word"] == "sleep" and (now < word["ts"] + SLEEP_BLIND_SECS if seen is None
-                                             else not seen > word["ts"]):
-        mute = "sleep"
-    elif _active(word, "quiet", now):
-        mute = "quiet"
-    if mute is not None:
-        value = cells[mute][cls]
-        custom = value != DEFAULT_CELLS[mute][cls]
-        if value == "push":
-            return Decision(True, "pushing", f"{mute}: {_CLASS_WORDS[cls]} still reach you (your policy)" if custom else "urgent"), "word"
-        if mute == "sleep":
-            why = (f"sleep: {_CLASS_WORDS[cls]} are held (your policy)" if custom else
-                   "sleep: only approvals and urgent pings are pushed until his next input here")
-        else:
-            why = (f"quiet: {_CLASS_WORDS[cls]} are held (your policy)" if custom else
-                   "quiet: nothing but an urgent ping is pushed until it ends")
-        return Decision(False, "muted", why, mute), "word"
-    if cls != "other":
-        return Decision(True, "pushing", "urgent"), "measured"
-    if word and word["word"] == "away" and not (seen is not None and seen > word["ts"] + AWAY_GRACE_SECS):
-        return Decision(True, "pushing", "away: his word"), "word"
-    if remote is not None:   # ordinary pings only: every non-"other" class has already returned above, on its own reason
-        rage = now - remote["at"]
-        if rage < ACTIVE_WINDOW_SECS:   # a stale reading decides nothing, however it was passed in
-            return Decision(True, "pushing", f"remote desk: {remote['source']} input {int(max(0.0, rage) // 60)} min ago, "
-                                             "so pings go to your devices"), "measured"
-    if route == "devices":
-        return Decision(True, "pushing", "route: devices (his phone shows the band)"), "measured"
-    if seen is None:
-        return Decision(True, "pushing", "no laptop input source: read as inactive"), "measured"
-    if idle is not None and idle >= ACTIVE_WINDOW_SECS:
-        return Decision(True, "pushing", f"you: no input at the laptop for {int(idle // 60)} min"), "measured"
-    return Decision(False, "holding", f"you: input at the laptop {int((idle or 0.0) // 60)} min ago"), "measured"
+    return intent.decide(now, intent.from_legacy(word, route, now), idle, class_name=cls, remote=remote)
 
 
 def _policy_path(queue_dir: Path | str) -> Path:
@@ -392,124 +311,35 @@ def policy_sentences(cells: dict) -> dict:
 
 
 def policy_view(queue_dir: Path | str | None) -> dict:
-    """The stable dict ``levain ping policy show --json`` prints."""
-    cells, kind, reasons = _read_policy(queue_dir)  # ONE read: cells, status, kind and reasons agree
-    status = "malformed: " + "; ".join(reasons) + " (the whole default is in effect)" if kind == "malformed" else kind
-    # `held_by_default`: an APPROVAL cell that holds only because the shipped default says so (no table of the operator's own
-    # is in effect); the block says so in one plain line, where a hold of his own choosing gets the warning
-    held = {f"{m}.approval": True for m in MUTE_WORDS
-            if kind != "loaded" and cells[m]["approval"] == "hold" and DEFAULT_CELLS[m]["approval"] == "hold"}
-    return {"version": POLICY_VERSION, "cells": cells, "classes": dict(sorted(KIND_CLASSES.items())),
-            "default_class": "other", "status": status, "status_kind": kind, "reasons": reasons,
-            "sentences": policy_sentences(cells), "default_cells": _copy_cells(DEFAULT_CELLS), "held_by_default": held}
+    """The stable dict ``levain ping policy show --json`` prints. The notification policy is RETIRED (presence 1b): what each
+    preset lets through is part of the preset (:data:`levain.webpush.intent.PRESET_TABLE`) and the operator changes it for a
+    given stretch with ``levain ping lets``. ``cells`` is derived from the presets so an older reader still paints something true."""
+    from levain.webpush import intent
+
+    lets = {m: intent.PRESET_TABLE[m]["lets_through"] for m in MUTE_WORDS}
+    cells = {m: {c: ("push" if c in intent.LETS_CLASSES[lets[m]] else "hold") for c in CLASSES} for m in MUTE_WORDS}
+    return {"version": POLICY_VERSION, "retired": True, "message": POLICY_RETIRED, "cells": cells,
+            "classes": dict(sorted(KIND_CLASSES.items())), "default_class": "other", "status": "retired",
+            "status_kind": "retired", "reasons": [], "sentences": policy_sentences(cells),
+            "default_cells": _copy_cells(DEFAULT_CELLS), "held_by_default": {},
+            "presets": {p: {"devices": r["devices"], "lets_through": r["lets_through"], "until": r["until"]}
+                        for p, r in intent.PRESET_TABLE.items()}}
 
 
-def _policy_log(queue_dir: Path | str, ts: float, word: str, by: object, outcome: str, why: str, strict: bool,
-                prior: dict | None = None, via: str | None = None) -> None:
-    row: dict = {"ts": ts, "word": _clean(word, 60), "prior": dict(prior) if prior else {}, "outcome": outcome}
-    if via:     # the credential's name for a write through the cockpit (never the secret); identity stays ``by``
-        row["via"] = _clean(via, _FIELD_MAX)
-    if by is not None:
-        who = by if isinstance(by, dict) else {}
-        row["by"] = {"agent": _clean(who.get("agent"), _FIELD_MAX), "session": _clean(who.get("session"), _FIELD_MAX),
-                     "role": _clean(who.get("role"), 20)}
-    if why:
-        row["why"] = _clean(why, _WHY_MAX)
-    (_log if strict else _log_best_effort)(queue_dir, row)
-
-
-def _write_policy(queue_dir: Path | str, cells: dict | None) -> None:
-    path = _policy_path(queue_dir)
-    d = path.parent
-    try:
-        os.makedirs(d, mode=0o700, exist_ok=True)
-        st = os.lstat(d)
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-            raise PresenceError(f"{d} is not a directory of this user's")
-        if cells is None:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-            return
-        tmp = d / f".{POLICY_NAME}.{os.getpid()}.{time.time_ns()}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        try:
-            try:
-                view = memoryview(json.dumps({"version": POLICY_VERSION, "cells": cells}).encode("utf-8"))
-                while view:
-                    n = os.write(fd, view)
-                    if n <= 0:
-                        raise OSError("short write")
-                    view = view[n:]
-            finally:
-                os.close(fd)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
-    except OSError as e:
-        raise PresenceError(f"policy not written: {e}") from e
-
-
-def _refuse_setter(queue_dir: Path | str, ts: float, word: str, by: dict | None) -> None:
-    """The policy is the operator's alone, like his own presence words: a caller carrying an agent identity (a seat or
-    the coordinator) is refused, and the refusal is one row in the presence log. The role is a label under one uid, not
-    a boundary: it records intent, it does not stop a process that hides its environment."""
-    if by is None:
-        return
-    who = "the coordinator" if isinstance(by, dict) and by.get("role") == "coordinator" else "a seat"
-    msg = (f"the notification policy is the operator's own: {who} may not change it "
-           "(the operator sets it himself, from a terminal outside any agent session)")
-    with _locked(queue_dir, strict=False):
-        _policy_log(queue_dir, ts, word, by, "refused", msg, strict=False)
-    raise PresenceError(msg)
+POLICY_RETIRED = ("the notification policy is retired: each preset says what it lets through (quiet and sleep: approvals "
+                  "and attention items), and `levain ping lets everything|needs|approvals|nothing [--for 1h]` changes it")
 
 
 def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: dict | None = None,
                now: float | None = None, via: str | None = None, wait: float | None = None) -> dict:
-    """Set one cell and return the cells after. Operator only (``by`` must be ``None``, see :func:`_refuse_setter`).
-    Atomic write under the presence lock; one presence-log row. Raises :class:`PresenceError`; ``wait`` (seconds) bounds the
-    lock wait and raises :class:`PresenceBusy` past it (default: wait as long as it takes, as the CLI does)."""
-    ts = time.time() if now is None else now
-    word = f"policy set {mute} {cls} {value}"
-    _refuse_setter(queue_dir, ts, word, by)
-    if mute not in MUTE_WORDS or cls not in CLASSES or value not in ("push", "hold"):
-        raise PresenceError(f"policy set takes <{'|'.join(MUTE_WORDS)}> <{'|'.join(CLASSES)}> <push|hold>")
-    with _locked(queue_dir, strict=True, wait=wait):  # a policy mutation never runs unlocked: two sets could lose one
-        cells, _status = read_policy(queue_dir)
-        prior = _status if _status.startswith("malformed") else ""
-        was = cells[mute][cls]
-        cells[mute][cls] = value
-        try:
-            _write_policy(queue_dir, cells)
-        except PresenceError as e:
-            _policy_log(queue_dir, ts, word, None, "refused", str(e), strict=False, via=via)
-            raise
-        _policy_log(queue_dir, ts, word, None, "set" if was != value else "unchanged",
-                    f"prior file {prior.replace(' (the whole default is in effect)', '')}; rewritten from the default" if prior else "",
-                    strict=False, prior={f"{mute}.{cls}": was}, via=via)
-    return cells
+    """Retired: always raises :class:`PresenceError` with the pointer (presence 1b)."""
+    raise PresenceError(POLICY_RETIRED)
 
 
 def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | None = None, via: str | None = None,
                  wait: float | None = None) -> dict:
-    """Remove the policy file (back to the shipped default) and return the default cells. Operator only."""
-    ts = time.time() if now is None else now
-    _refuse_setter(queue_dir, ts, "policy reset", by)
-    with _locked(queue_dir, strict=True, wait=wait):
-        before, _st = read_policy(queue_dir)
-        try:
-            _write_policy(queue_dir, None)
-        except PresenceError as e:
-            _policy_log(queue_dir, ts, "policy reset", None, "refused", str(e), strict=False, via=via)
-            raise
-        _policy_log(queue_dir, ts, "policy reset", None, "set", "", strict=False,
-                    prior={f"{m}.{c}": before[m][c] for m in MUTE_WORDS for c in CLASSES}, via=via)
-    return _copy_cells(DEFAULT_CELLS)
+    """Retired: always raises :class:`PresenceError` with the pointer (presence 1b)."""
+    raise PresenceError(POLICY_RETIRED)
 
 
 def _remote_path(queue_dir: Path | str) -> Path:
@@ -638,56 +468,6 @@ def note_remote_activity(queue_dir: Path | str, source: str, at: float | None = 
 
 
 _UNSET = object()   # "read it yourself", distinct from None (no word on file / no idle reading)
-
-
-def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Callable[[], float | None] | None,
-          suggest: bool, word: object = _UNSET, reading: object = _UNSET,
-          route: object = _UNSET, remote: object = _UNSET) -> tuple[Decision, str, dict | None, dict | None, float | None]:
-    """The one place the rule is read: ``(decision, source, word, remote, reading)`` for a ``kind`` of ping at ``now``
-    (``reading``: the laptop input idle seconds the rule used, a recent desk message counted as input). Both
-    :func:`should_push` and :func:`effective` call it, so the push and the chip cannot diverge. Raises on a fault; the
-    callers read that as push. ``word`` and ``reading`` let a caller that already sampled the word and the idle time have
-    this rule work from that same snapshot (one read of each per status), not a second code path. ``remote`` is the
-    fresh remote-activity record (:func:`read_remote_activity`), read here once when not handed in."""
-    from levain.webpush import route as _route
-
-    at = time.time() if now is None else now
-    if reading is _UNSET:
-        if idle is None:
-            from levain.consent.auto_away import input_idle_seconds as idle
-        reading = idle()
-    if queue_dir is not None:   # a message to a desk at the laptop is input too (levain.webpush.desk)
-        from levain.webpush import desk as _desk
-
-        reading = _desk.adjust_reading(queue_dir, reading, at)
-    if suggest:   # delivery drives the suggestion (throttled there); a status read (``suggest=False``) never does
-        try:
-            _route.auto_suggest(queue_dir, idle=reading, now=at)
-        except Exception:  # noqa: BLE001 - its fault never changes the rule
-            pass
-    if word is _UNSET:
-        word = read_word(queue_dir)
-    # a delivery (suggest) reads the route after auto_suggest; a status read projects the same route without writing
-    if route is not _UNSET:
-        r = route   # a caller that projected the route once hands it in; projected_route (and its `who`) is not run again
-    else:
-        r = (_route.read_route(queue_dir, at)[0] if suggest else _route.projected_route(queue_dir, idle=reading, now=at))
-    if remote is REMOTE_FAULT:
-        raise PresenceError("the remote-activity read faulted")
-    if remote is _UNSET:
-        remote = read_remote_activity(queue_dir, at)
-    d, source = _decide(at, word, reading, class_name=kind_class(kind), policy=read_policy(queue_dir)[0], route=r, remote=remote)
-    if suggest:   # a delivery: keep what it saw and said, and the here/away change if there was one (never a fault of the rule)
-        try:
-            from levain.webpush import desk as _desk
-
-            _desk.record_decision(queue_dir, at, kind, d.push, d.state, d.why, source, reading, word)
-            _desk.observe(queue_dir, at, reading)
-        except Exception:  # noqa: BLE001
-            pass
-    return d, source, word, remote, reading
-
-
 _FAULT = "the presence rule could not be read: pushing"
 REMOTE_FAULT = object()   # a caller's "the remote read itself faulted": the rule then takes the standard fail-open decision
 
@@ -695,57 +475,30 @@ REMOTE_FAULT = object()   # a caller's "the remote read itself faulted": the rul
 def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = None,
                 idle: Callable[[], float | None] | None = None, suggest: bool = True,
                 word: object = _UNSET, route: object = _UNSET, remote: object = _UNSET) -> Decision:
-    """:func:`decide` for a ``kind`` of ping against the word on file and the input idle time (``idle`` defaults to
-    :func:`levain.consent.auto_away.input_idle_seconds`). Any fault reads as push: a missed ping is the worse error."""
+    """Whether a ``kind`` of ping is pushed to his devices now: THE decider (:func:`levain.webpush.intent._core`), against the
+    one record and the sensors (``idle`` defaults to :func:`levain.consent.auto_away.input_idle_seconds`). ``suggest`` marks a
+    delivery (it keeps the decision and writes the event rows sensing saw); a status read leaves it off. ``word`` and ``route``
+    are accepted and ignored (the record replaced both); ``remote`` keeps its meaning. Any fault reads as push: a missed ping
+    is the worse error."""
     try:
-        return _core(queue_dir, kind, now, idle, suggest, word, route=route, remote=remote)[0]
+        from levain.webpush import intent
+
+        return intent._core(queue_dir, kind, now, idle, suggest, remote)[0]
     except Exception:  # noqa: BLE001 - the rule failing must not silence the phone
         return Decision(True, "pushing", _FAULT)
 
 
-def effective(queue_dir: Path | str | None, now: float | None = None, *,
-              idle: Callable[[], float | None] | None = None, suggest: bool = False,
-              word: object = _UNSET, reading: object = _UNSET, route: object = _UNSET, remote: object = _UNSET) -> dict:
-    """What the rule does now with an ordinary ping, for the cockpit chip and any status read:
-    ``{state: pushing|holding|muted, pushing, reason, source: word|measured, since, word, remote, you, desk}``
-    (``you``: the operator's Here / Away reading; ``desk``: the desk's liveness record: :mod:`levain.webpush.desk`). It is the same call
-    :func:`should_push` makes (:func:`_core`, kind ``ping``), so the chip and the push decision for the same instant are
-    one answer; the route axis is folded in as there. ``source`` is ``word`` when a word on file (loud, away, quiet, sleep)
-    decided, ``measured`` when the desk reading or the route decided; ``since`` is that word's time, else ``None``.
-    ``suggest`` defaults off: a status read never drives the route suggestion, and projects the route a delivery would see
-    (:func:`levain.webpush.route.projected_route`). ``word`` and ``reading`` (the word record and the idle seconds) let a caller
-    that sampled them once get an answer from that same snapshot; ``route`` is the same for a route projected once. ``word`` in the result names the deciding word, else ``None``.
-    ``remote`` is ``{source, at}`` while a fresh remote-activity record stands (whatever decided: flow derives
-    [NEEDS THE LAPTOP] from it), else ``None``; a caller that read it once hands it in. A fault reads as pushing."""
-    try:
-        d, source, wrec, rrec, used = _core(queue_dir, "ping", now, idle, suggest, word, reading, route, remote)
-    except Exception:  # noqa: BLE001 - the same fault rule as should_push
-        return {"state": "pushing", "pushing": True, "reason": _FAULT, "source": "measured", "since": None,
-                "word": None, "remote": None, "you": None, "desk": None}
-    decided = wrec if source == "word" and wrec is not None else None
-    return {"state": d.state, "pushing": d.push, "reason": d.why, "source": source,
-            "since": decided["ts"] if decided else None, "word": decided["word"] if decided else None,
-            "remote": {"source": rrec["source"], "at": rrec["at"]} if rrec else None,
-            "you": _you(queue_dir, now, used), "desk": _desk_view(queue_dir, now)}
+def effective(queue_dir: Path | str | None, now: float | None = None, *, idle: Callable[[], float | None] | None = None,
+              suggest: bool = False, word: object = _UNSET, reading: object = _UNSET, route: object = _UNSET,
+              remote: object = _UNSET) -> dict:
+    """What the rule does now with an ordinary ping, for the cockpit chip and any status read: ``{state: pushing|holding|muted,
+    pushing, reason, source: word|measured, since, word, remote, you, desk}`` plus ``line`` and ``chip`` and the record's parts
+    (:func:`levain.webpush.intent.view`). It is the same sample :func:`should_push` takes, so the chip and a push for the same
+    instant are one answer. ``reading`` (the raw laptop idle seconds) and ``remote`` let a caller that sampled them once get an
+    answer from that same snapshot; ``word``, ``route`` and ``suggest`` are accepted and ignored. A fault reads as pushing."""
+    from levain.webpush import intent
 
-
-def _you(queue_dir: Path | str | None, now: float | None, used: float | None) -> dict | None:
-    """The operator's Here / Away reading for :func:`effective` (a fault reads as no reading, never as a state)."""
-    try:
-        from levain.webpush import desk as _desk
-
-        return _desk.you_view(time.time() if now is None else now, used)
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _desk_view(queue_dir: Path | str | None, now: float | None) -> dict | None:
-    try:
-        from levain.webpush import desk as _desk
-
-        return _desk.read_desk(queue_dir, now)
-    except Exception:  # noqa: BLE001
-        return None
+    return intent.view(queue_dir, now=now, idle=idle, remote=remote, reading=reading)
 
 
 def check_setter(word: str, by: dict | None, said: str | None) -> str:
@@ -773,51 +526,76 @@ def check_setter(word: str, by: dict | None, said: str | None) -> str:
     return quote
 
 
+def read_word(queue_dir: Path | str | None, now: float | None = None,
+              idle: Callable[[], float | None] | None = None) -> dict | None:
+    """Compat (one release): the standing overlay as the old ``{word, ts, until?, by?, said?, verified?}`` record, or ``None``
+    (no overlay, an ended one, a setting with no preset, or a fault)."""
+    if queue_dir is None:
+        return None
+    try:
+        from levain.webpush import intent
+
+        now = time.time() if now is None else now
+        s = intent._sample(queue_dir, now, idle)
+        return intent.legacy_word(s["rec"], now, intent._last_input(now, s["reading"]), s["msg_at"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_ROUTE_ALIASES = ("desk", "devices")   # the tap-token words of the retired route: `desk` is follow, `devices` is devices on
+
+
 def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, now: float | None = None,
              by: dict | None = None, said: str | None = None, match: object = None,
              via: str | None = None, wait: float | None = None,
-             precheck: "Callable[[], None] | None" = None, after: "Callable[[], None] | None" = None) -> dict | None:
-    """Write ``word`` (``duration`` for quiet and loud; ``loud off`` clears a loud). Returns what is on file
-    after, ``None`` when no word stands. ``back`` leaves a standing ``loud`` alone and returns it. Raises
-    :class:`PresenceError` for an unknown word, a bad duration, or a directory or file that is not safe to write.
-    ``by`` (a seat's or the coordinator's identity, see :func:`check_setter`) and ``said`` (his words) are for an agent
-    setting a word for him: both are checked before anything is read or written, and recorded with the word. With
-    ``by`` unset the call is the operator's own and records nothing more. ``match`` (a
-    :class:`levain.webpush.quote.Match`) says whether the quote is in what he typed; with none, it is unverified.
-    A setter replaces a word he set himself only on a verified quote he typed after that word (:func:`_plan`).
+             precheck: "Callable[[], None] | None" = None, after: "Callable[[], None] | None" = None,
+             tap: bool = False) -> dict | None:
+    """Compat (one release): :func:`levain.webpush.intent.apply_preset` for a preset word, ``devices`` (devices on, one hour by
+    default) and ``desk`` (follow) for the old route words. Returns what :func:`read_word` reads after, ``None`` when no preset
+    stands. All arguments but ``tap`` are :func:`levain.webpush.intent.apply_preset`'s.
 
-    Every call leaves one row in the presence log (:func:`read_log`), a refusal included. A setter's row is written
-    before the word and a row that cannot be written refuses the write; the operator's own row is written after, and a
-    failure to write it is reported on stderr and never stops his word.
+    ``tap`` (the caller holds a tap token, not the full credential): an alias writes a bounded overlay only, never the
+    base (``desk`` for a day by default, the retired route's own default), and neither alias replaces a standing preset
+    (``away``, ``quiet``, ``sleep``, ``loud``): that is refused under the lock, and ``back`` ends it. The operator's own
+    path (``tap`` false) writes the standing default: ``desk`` is ``follow`` with no overlay and no end (the retired route
+    gave it a day; follow is the default state, so there is nothing to return to), and ``devices`` is one hour unless a
+    duration is given."""
+    from levain.webpush import intent
 
-    The whole call (read the word on file, plan, log row, write, outcome row) runs under one interprocess lock, so a
-    word set meanwhile is read, never overwritten. A setter that cannot take the lock is refused; the operator's own
-    word goes through without it.
+    if word in _ROUTE_ALIASES:
+        if by is not None:
+            raise PresenceError(f"`{word}` is the operator's own word: a seat or the coordinator may not set it")
+        if tap:
+            if isinstance(duration, str) and duration.strip().lower() == "switch":
+                raise PresenceError(f"a tap's `{word}` sets a bounded while only, never your standing default")
+            outer = precheck
 
-    ``via`` names the credential an HTTP write came in on (never its secret); it is recorded on the operator's row.
-    ``wait`` (seconds) is for a caller that must not park a thread behind a stalled lock holder: the lock is then
-    required (a failure to take it refuses the write, :class:`PresenceBusy` past the wait) instead of skipped.
-
-    ``precheck`` runs once the lock is held and before the word on file is read: a :class:`PresenceError` it raises
-    refuses the call (logged as a refusal) with nothing written, so a credential it re-checks and a revoke that takes
-    the same lock have one order. Passing one requires the lock. ``after`` runs under the same hold once the word is
-    written; it must not take the presence lock itself."""
-    strict = by is not None or wait is not None or precheck is not None
-    with _locked(queue_dir, strict=strict, wait=wait):
-        if precheck is not None:
-            try:
-                precheck()
-            except PresenceError as e:
-                ts = time.time() if now is None else now
-                row = _log_row(ts, word, duration, by, said, read_word(queue_dir))
-                if via:
-                    row["via"] = _clean(via, _FIELD_MAX)
-                _log_best_effort(queue_dir, {**row, "outcome": "refused", "why": _clean(str(e), _WHY_MAX)})
-                raise
-        out = _set_word(queue_dir, word, duration, now, by, said, match, via)
-        if after is not None:
-            after()
-        return out
+            def precheck() -> None:   # runs under the presence lock, before anything is read for writing
+                if outer is not None:
+                    outer()
+                t = time.time() if now is None else now
+                rec = intent.read(queue_dir, t)
+                ov = rec["overlay"]
+                if rec["status"] in ("file", "projection") and ov is not None and ov.get("preset"):
+                    reading, msg_at = intent._live(queue_dir, t, None, rec)
+                    if intent.overlay_active(rec, t, intent._last_input(t, reading), msg_at):
+                        raise PresenceError(f"`{ov['preset']}` stands: a tap's `{word}` does not replace it "
+                                            "(`back` ends it)")
+        if word == "devices":
+            intent.apply_settings(queue_dir, devices="on", until=duration or "60m", via=via, wait=wait, now=now,
+                                  precheck=precheck, after=after)
+        else:   # desk: the measurement decides again, which is follow; from a tap, for a bounded while only
+            intent.apply_settings(queue_dir, devices="follow", until=duration or ("24h" if tap else "switch"), via=via,
+                                  wait=wait, now=now, precheck=precheck, after=after)
+    else:
+        intent.apply_preset(queue_dir, word, duration=duration, now=now, by=by, said=said, match=match, via=via, wait=wait,
+                            precheck=precheck, after=after)
+    ts = time.time() if now is None else now
+    try:   # what the write left standing (read as of the write itself: he has just acted, so the overlay stands)
+        rec = intent.read(queue_dir, ts)
+        return intent.legacy_word(rec, ts, ts, None)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @contextmanager
@@ -864,65 +642,6 @@ def _locked(queue_dir: Path | str, *, strict: bool, wait: float | None = None):
             os.close(fd)
 
 
-def _set_word(queue_dir: Path | str, word: str, duration: str | None, now: float | None, by: dict | None,
-              said: str | None, match: object, via: str | None = None) -> dict | None:
-    ts = time.time() if now is None else now
-    prior = read_word(queue_dir)
-    row = _log_row(ts, word, duration, by, said, prior)
-    if via:
-        row["via"] = _clean(via, _FIELD_MAX)
-    ev = _evidence(match) if by is not None else None
-    if ev is not None:
-        row["verified"] = ev[0]
-        if ev[1] is not None:
-            row["said_at"] = ev[1]
-    try:
-        action, rec, why = _plan(word, duration, ts, prior, by, said, ev)
-    except PresenceError as e:
-        _log_best_effort(queue_dir, {**row, "outcome": "refused", "why": _clean(str(e), _WHY_MAX)})
-        raise
-    row["outcome"] = "set" if action != "keep" else "unchanged"
-    if rec is not None and "until" in rec:
-        row["until"] = rec["until"]
-    if why:
-        row["why"] = why
-    if by is not None:
-        try:
-            _log(queue_dir, row)
-        except PresenceError as e:
-            raise PresenceError(f"{e}: a setter's write with no record is not made") from e
-    try:
-        if action == "write":
-            _write(queue_dir, rec)
-        elif action == "clear":
-            _write(queue_dir, None)
-    except PresenceError as e:
-        _log_best_effort(queue_dir, {**row, "outcome": "refused", "why": _clean(str(e), _WHY_MAX)})
-        raise
-    # The word has landed; the route follows it. There is no rollback of the word: a route that cannot be written is
-    # reported to the caller, who sees the word set and the route unchanged, and taps again.
-    try:
-        _follow_route(queue_dir, word, duration, action, ts)
-    except PresenceError as e:
-        done = "cleared" if action == "clear" else "set"
-        _log_best_effort(queue_dir, {**row, "outcome": done, "why": _clean(f"route not changed: {e}", _WHY_MAX)})
-        raise PresenceError(f"{word} is {done}, but the route was not changed ({e}); tap it again") from e
-    if by is None:
-        _log_best_effort(queue_dir, row)
-    return rec if action == "write" else (None if action == "clear" else prior)
-
-
-def _follow_route(queue_dir: Path | str, word: str, duration: str | None, action: str, ts: float) -> None:
-    """``back`` is present + desk; the caller holds the presence lock. Runs after the word is written; a route that
-    cannot be written raises and the caller says so."""
-    if not (word == "back" and action == "clear"):
-        return
-    from levain.webpush import route
-
-    # present at the desk: the standing route record goes, and a later remote login can still suggest devices
-    route._write(queue_dir, None)
-
-
 def _evidence(match: object) -> tuple[bool, float | None, str]:
     """``(verified, said_at, why)`` from a :class:`levain.webpush.quote.Match`; no match is unverified."""
     verified = getattr(match, "verified", False) is True
@@ -930,52 +649,6 @@ def _evidence(match: object) -> tuple[bool, float | None, str]:
     at = float(at) if verified and isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at) else None
     why = _clean(getattr(match, "why", "") or "no transcript check ran", _WHY_MAX)
     return verified and at is not None, at, why
-
-
-def _plan(word: str, duration: str | None, ts: float, prior: dict | None, by: dict | None,
-          said: str | None, ev: tuple[bool, float | None, str] | None = None) -> tuple[str, dict | None, str]:
-    """What a call does, with nothing read or written: ``(action, record, note)``, action ``write`` (the record is the
-    word), ``clear`` (no word stands after) or ``keep`` (the word on file stays, the note says why). Raises
-    :class:`PresenceError` for a refusal."""
-    if word not in WORDS:
-        hint = f"; {DROPPED_WORDS[word]}" if word in DROPPED_WORDS else ""
-        raise PresenceError(f"{word!r} is not a presence word (one of: {', '.join(WORDS)}){hint}")
-    quote = check_setter(word, by, said) if by is not None else None
-    if by is not None and _active(prior, "loud", ts):
-        raise PresenceError("`loud` is the operator's standing word; a seat cannot replace it "
-                            "(the operator says `loud off` himself)")
-    note = ""
-    if by is not None:
-        ev = ev or (False, None, "no transcript check ran")
-        if prior is not None and "by" not in prior and not is_expired(prior, ts):   # his own standing word
-            at = time.strftime("%H:%M", time.localtime(prior["ts"]))
-            if not ev[0]:
-                raise PresenceError(f"he set `{prior['word']}` himself at {at} and your quote is not in your transcript "
-                                    f"({ev[2]}); he ends it himself")
-            if ev[1] <= prior["ts"]:
-                raise PresenceError(f"he set `{prior['word']}` himself at {at}, after the sentence you quote; "
-                                    "he ends it himself")
-        elif not ev[0]:
-            note = f"unverified: {ev[2]}"
-    if word == "loud" and (duration or "").strip().lower() == "off":
-        if _active(prior, "loud", ts) or (prior and prior["word"] == "loud"):
-            return "clear", None, "loud off"
-        return "keep", None, "loud off: no loud was standing"
-    if word == "back" and _active(prior, "loud", ts):
-        return "keep", None, "back leaves a standing loud"
-    if word == "back":
-        return "clear", None, ""
-    if word not in TIMED and duration:
-        raise PresenceError(f"`{word}` takes no duration")
-    rec: dict = {"word": word, "ts": ts}
-    if word in TIMED:
-        rec["until"] = ts + parse_duration(duration)
-    if quote is not None:
-        rec["by"] = {"agent": _clean(by.get("agent"), _FIELD_MAX), "session": _clean(by.get("session"), _FIELD_MAX),
-                     "role": by["role"]}
-        rec["said"] = quote
-        rec["verified"] = ev[0]
-    return "write", rec, note
 
 
 def _log_row(ts: float, word: object, duration: str | None, by: object, said: object, prior: dict | None) -> dict:
@@ -1091,74 +764,11 @@ def is_expired(word: dict | None, now: float) -> bool:
     return bool(word and word["word"] in TIMED and not _active(word, word["word"], now))
 
 
-def _write(queue_dir: Path | str, rec: dict | None) -> None:
-    path = _path(queue_dir)
-    d = path.parent
-    try:
-        os.makedirs(d, mode=0o700, exist_ok=True)
-        st = os.lstat(d)
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-            raise PresenceError(f"{d} is not a directory of this user's")
-        if rec is None:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-            return
-        tmp = d / f".{FILE_NAME}.{os.getpid()}.{time.time_ns()}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        try:
-            try:
-                view = memoryview(json.dumps(rec).encode("utf-8"))
-                while view:   # a short write would rename a half word into place
-                    n = os.write(fd, view)
-                    if n <= 0:
-                        raise OSError("short write")
-                    view = view[n:]
-            finally:
-                os.close(fd)
-            os.replace(tmp, path)
-        except BaseException:
-            try:   # a failed write leaves no orphan temp file behind; the word in place is untouched
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
-    except OSError as e:
-        raise PresenceError(f"presence word not written: {e}") from e
-
-
 def describe(queue_dir: Path | str, *, now: float | None = None,
              idle: Callable[[], float | None] | None = None, word: object = _UNSET, reading: object = _UNSET,
              route: object = _UNSET, remote: object = _UNSET) -> str:
-    """One line for ``levain ping status``: the word on file, what the rule does now with an ordinary ping, and how many
-    pings are held for the phone."""
-    ts = time.time() if now is None else now
-    if word is _UNSET:
-        word = read_word(queue_dir)
-    if reading is _UNSET:
-        try:
-            if idle is None:
-                from levain.consent.auto_away import input_idle_seconds as idle
-            reading = idle()
-        except Exception:  # noqa: BLE001 - no reading: the rule reads the desk as inactive
-            reading = None
-    d = should_push(queue_dir, "ping", now=ts, idle=lambda: reading, suggest=False, word=word, route=route, remote=remote)
-    if word is not None and word["word"] == "sleep" and reading is None and ts < word["ts"] + SLEEP_BLIND_SECS:
-        end = time.strftime("%H:%M", time.localtime(word["ts"] + SLEEP_BLIND_SECS))
-        d = Decision(d.push, d.state, f"{d.why}; idle source unavailable, so sleep ends at {end}", d.by)
-    on_file = "no word" if word is None else (word["word"] if "until" not in word else
-                                              f"{word['word']} until {time.strftime('%H:%M', time.localtime(word['until']))}")
-    from levain.webpush import held
+    """The one line for ``levain ping status``: :func:`levain.webpush.intent.describe_line` (``word`` and ``route`` are accepted
+    and ignored; ``reading`` and ``remote`` let a caller that sampled them once get an answer from that same snapshot)."""
+    from levain.webpush import intent
 
-    n = held.count(queue_dir)
-    line = f"{d.state.upper()}: {d.why} (word: {on_file}; {n} held for the phone)"
-    cells, pstatus = read_policy(queue_dir)
-    if not policy_is_default(cells, pstatus):
-        line += f"; notification policy: {pstatus if pstatus != 'loaded' else 'yours'} ({' / '.join(policy_sentences(cells).values())})"
-    if word is not None and "by" in word:
-        by = word["by"]
-        who = f"{by['agent']} {by['session']}".strip()
-        flag = " (unverified)" if word.get("verified") is not True else ""
-        line += f"; set by {'the coordinator ' if by['role'] == 'coordinator' else ''}{who} from your words: {word['said']}{flag}"
-    return line
+    return intent.view(queue_dir, now=now, idle=idle, remote=remote, reading=reading)["line"]

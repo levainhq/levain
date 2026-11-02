@@ -15,6 +15,14 @@ SEAT = {"agent": "claude_code", "session": "s-1", "role": "seat"}
 T = time.time() - 600.0
 
 
+@pytest.fixture(autouse=True)
+def _no_laptop_reading(monkeypatch):
+    """These tests read a standing `away` overlay with no idle source of their own: no laptop reading, so no input can
+    have ended it (the suite's default reading is input just now, which ends an until-input overlay)."""
+    import levain.consent.auto_away as auto_away
+    monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: None)
+
+
 def _line(pres) -> str:
     c = {"at": "t", "presence": pres, "away": {}, "band": {"text": "x", "error": None}, "undecided": [], "budgets": [],
          "waiting": [], "review": [], "review_total": 0, "errors": [], "delivery_ran": None}
@@ -43,9 +51,9 @@ def test_an_unverified_word_carries_false_and_the_mark(tmp_path):
 
 def test_a_legacy_record_with_no_verified_key_reads_as_unverified(tmp_path):
     set_word(tmp_path, "away", by=SEAT, said="heading out", now=T, match=Match(True, T - 5, "ok"))
-    p = tmp_path / "webpush" / presence.FILE_NAME
+    p = tmp_path / "webpush" / "intent.json"
     rec = json.loads(p.read_text())
-    del rec["verified"]
+    del rec["overlay"]["verified"]
     p.write_text(json.dumps(rec))
     pres = morning._presence(tmp_path)
     assert pres["verified"] is False

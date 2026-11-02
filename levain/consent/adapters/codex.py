@@ -12,8 +12,8 @@ holding when they come back. The hook:
    the event's ``permission_mode``), except for a request that targets agent config or hooks
    (:func:`targets_agent_config`), which is never eligible. A standing consent grant can answer there; its targets
    are read by :func:`policy_targets`, registered with the policy when this module is imported;
-3. when away mode is on (:func:`levain.consent.auto_away.away_state`: the operator's explicit word, else input
-   idle on macOS, else off) waits up to the hold for a signed answer the core verifies, re-reading away mode while
+3. when away mode is on (:func:`levain.consent.auto_away.away_state`: a signed away mark, else the presence record,
+   so exactly when an approval would reach the operator's devices) waits up to the hold for a signed answer the core verifies, re-reading away mode while
    it waits so an operator who comes back gets Codex's dialog within about a second, and withdraws the request if
    none came;
 4. prints ``allow`` only for a verified allow and ``deny`` only for a verified deny. Anything else, including any
@@ -239,7 +239,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
                                         protected=protected)
     if agent_config and unconfined(cwd, home=home, environ=environ, codex_home=codex_dir):
         return None  # an unconfined session (Q10 D2): Codex's approval answers, as the gate left it to the mode
-    hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
+    hold = min(away_hold(settings, AGENT, idle, queue_dir=Path(queue.directory)), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER, model=event.get("model"))
@@ -628,7 +628,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
             # request: the floor denies, files nothing (Q10 D1); a plain deny, never ``continue: false`` (above)
             note(refused="floor")
             return _deny(floor_text(what, loose))
-        if posture in ATTENDED_POSTURES and not effective_away(settings)[0]:
+        if posture in ATTENDED_POSTURES and not effective_away(settings, queue_dir=qdir)[0]:
             # approvals on and the operator present: Codex's own approval asks for an agent-config write (measured
             # B5-fix1, MEASURE_away), so the gate holds only while he is away, as Claude Code's does (head ruling 10-18)
             return halt_wins(None)
