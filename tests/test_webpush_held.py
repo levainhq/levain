@@ -217,6 +217,7 @@ def test_the_send_child_flushes_held_pings_after_a_push_but_not_after_a_held_one
     base = {"title": "t", "body": "b", "ref": None, "url": "/"}
     assert run({**base, "push": True, "hold": None}) == 0 and flushed == [tmp_path]
     assert run({**base, "push": False, "hold": "active"}) == 0 and flushed == [tmp_path]
+    assert run({**base, "push": False, "hold": "lets"}) == 0   # a mute from his base lets-through setting is a valid reason: refusing it dropped the ping (11-02)
     assert run({**base, "push": False, "hold": 3}) == 2   # a hold that is not a word is refused
     assert child.main(["flush", "--queue-dir", str(tmp_path)]) == 0 and flushed == [tmp_path, tmp_path]
 

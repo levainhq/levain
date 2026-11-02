@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         command, push, hold = f.get("command"), f.get("push", True), f.get("hold")
         if (not all(isinstance(x, str) for x in (title, body, url)) or not (ref is None or isinstance(ref, str))
                 or not (command is None or isinstance(command, bool)) or not isinstance(push, bool)
-                or hold not in (None, "quiet", "sleep", "active")):
+                or hold not in (None, "quiet", "sleep", "active", "lets")):   # "lets": a mute from his base lets-through setting (intent._decide)
             raise ValueError("fields")
     except (ValueError, KeyError, TypeError, AttributeError):
         print("levain.webpush send: expected a JSON object {title, body, ref, url, command, push, hold} on stdin", file=sys.stderr)
