@@ -20,8 +20,9 @@ One lock (the presence lock, ``<queue>/webpush/.presence.lock``), one event stre
 ``presence.log.jsonl``), one decider (:func:`should_push` in :mod:`levain.webpush.presence` calls :func:`_core` here) and one
 sentence (:func:`describe_line`), printed verbatim by every surface. Consent asks the same decider
 (:func:`approvals_route`), so a push and a hold diverge in one named case only: a ``follow`` that pushes for want of a
-laptop input reading does not hold (the line's ``Approvals:`` clause says so). A write against a record that cannot be
-read is refused, never replaced.
+laptop input reading does not hold (the line's ``Approvals:`` clause says so). A prompt left to the agent's own dialog
+still sends a NOTICE to the devices whenever ``lets_through`` admits approvals (:func:`approval_notice`): a notice, never
+a hold. A write against a record that cannot be read is refused, never replaced.
 
 Stdlib only.
 """
@@ -43,7 +44,7 @@ from levain.webpush.presence import (ACTIVE_WINDOW_SECS, AWAY_GRACE_SECS, COORDI
 
 __all__ = ["VERSION", "FILE_NAME", "BACKUP_DIR", "DEVICES", "LETS", "LETS_CLASSES", "FOLLOW_DEFAULT", "FOLLOW_MIN",
            "FOLLOW_MAX", "PRESET_TABLE", "overlay_active", "overlay_ended", "devices_on_now", "decide", "read", "view",
-           "describe_line", "approvals_to_devices", "approvals_route", "apply_preset", "apply_settings", "read_changes", "migrate",
+           "describe_line", "approvals_to_devices", "approvals_route", "approval_notice", "apply_preset", "apply_settings", "read_changes", "migrate",
            "unmigrate", "legacy_word", "from_legacy"]
 
 VERSION = 1
@@ -389,6 +390,22 @@ def approvals_route(queue_dir: Path | str | None, *, now: float | None = None,
     return True, d.why, _blind(s, eff)
 
 
+def approval_notice(queue_dir: Path | str | None, *, now: float | None = None,
+                    idle: Callable[[], float | None] | None = None) -> tuple[bool, str]:
+    """``(send, why)``: whether a NOTICE that an approval prompt waits in the agent's own dialog goes to his devices
+    (Phill 11-02, np-e642162b (a): *"yes we DO want these to be able to find us ASAP"*). It goes whenever the record's
+    ``lets_through`` admits approvals, whatever the desk or the devices setting is doing; only a mute holds it. It
+    starts no hold and is not :func:`approvals_to_devices` (the hold's question, unchanged): the dialog stays where
+    the agent asked. Read from the same one sample as the decider (:func:`_core`); a fault reads as send, as
+    :func:`presence.should_push` reads it."""
+    at = time.time() if now is None else now
+    try:
+        d, _source, _s = _core(queue_dir, "consent", at, idle, False)
+    except Exception:  # noqa: BLE001 - the same fault rule as should_push
+        return True, presence._FAULT
+    return d.state != "muted", d.why
+
+
 # --------------------------------------------------------------------------------------------------- the describe line
 def _base_text(base: dict) -> str:
     d = base["devices"]
@@ -455,6 +472,13 @@ def _line(queue_dir: Path | str | None, s: dict, st: dict, *, approvals: str | N
     where = "your devices" if st["goes"] else "the desk only"
     if st["goes"] and lets in ("needs", "approvals"):
         where += f", {_LETS_WORDS[lets]}"
+    if not st["goes"]:
+        # what reaches the devices whatever the desk is doing: an attention item (Phill 10-27) and the notice that an
+        # approval prompt waits in the agent's own dialog (Phill 11-02, approval_notice); a mute holds both
+        through = [w for c, w in (("approval", "approval prompts"), ("attention", "attention items"))
+                   if c in LETS_CLASSES[lets]]
+        if through:
+            where += ", except " + " and ".join(through)
     dev = {"on": "on", "off": "off"}.get(eff["devices"]) or f"follow, after {_mins(eff['follow_after'])}"
     blind = ov is not None and ov["until"]["kind"] == "input" and s["reading"] is None
     line = (f"Pings now: {where} ({st['why']}). Devices: {dev}. Lets through: {_LETS_WORDS[lets]}. "
