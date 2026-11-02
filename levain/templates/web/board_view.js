@@ -120,6 +120,22 @@
     if (b) host.appendChild(b);
   }
 
+  // What an empty column says. ONE rule: a column is "nothing" only when every source that feeds it was read. The sources, from the
+  // producer (cockpit/board.py, coordinator/ready.py): the store feeds every column but needs-you ("coordinator" in unreadable, or the
+  // queue state is anything but "ok"/"none": fail closed); the seat roster adds running and waiting ("seats"); the band is needs-you's
+  // alone ("band"). The journal only annotates cards, so it never empties a column.
+  var COLUMN_SOURCES = { "needs-you": ["band"], running: ["coordinator", "seats"], waiting: ["coordinator", "seats"] };
+  function sourceMissing(model, src) {
+    if (!Array.isArray(model.unreadable)) return true;      // the producer always sends the list: a payload without it cannot say what was read
+    var un = model.unreadable;
+    if (src === "coordinator" && model.queue !== "ok" && model.queue !== "none") return true;
+    return un.indexOf(src) >= 0;
+  }
+  function emptyText(model, col) {
+    var bad = (COLUMN_SOURCES[col.category] || ["coordinator"]).some(function (s) { return sourceMissing(model, s); });
+    return bad ? "unknown (could not read)" : "nothing";
+  }
+
   // The needs-you column's one sentence: said by the grouped tab and the six columns alike, so the two cannot drift.
   function needsYouNote(model) { return "This column is the Needs you band. Answer there (`" + model.hint + "`)."; }
 
@@ -146,7 +162,7 @@
       if (col.category === "needs-you") {
         wrap.appendChild(el(doc, "p", "bd-gloss", needsYouNote(model)));
       }
-      if (!col.cards.length) wrap.appendChild(el(doc, "p", "bd-empty", "nothing"));
+      if (!col.cards.length) wrap.appendChild(el(doc, "p", "bd-empty", emptyText(model, col)));
       col.cards.forEach(function (k) {
         var row = el(doc, "div", "bd-row");
         row.dataset.id = k.id;
@@ -178,7 +194,7 @@
       if (col.category === "needs-you") {
         c.appendChild(el(doc, "p", "bd-gloss", needsYouNote(model)));
       }
-      if (!col.cards.length) c.appendChild(el(doc, "p", "bd-empty", "nothing"));
+      if (!col.cards.length) c.appendChild(el(doc, "p", "bd-empty", emptyText(model, col)));
       col.cards.forEach(function (k) {
         var card = el(doc, "article", "bd-card");
         card.dataset.id = k.id;
