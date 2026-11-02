@@ -374,7 +374,7 @@ def test_the_chip_reads_the_word_and_none_and_the_sheet_posts_each_body(rig, tmp
             _opened(),
             {"eval": "document.getElementById('pr-sheet').contains(document.activeElement)"},
             {"do": "document.querySelector('.pr-dur[data-for=\"2h\"]').click(); document.querySelector('.pr-sheet-word[data-word=\"quiet\"]').click()",
-             "until": f"{_CHIP_TEXT}.startsWith('Quiet \\u00b7 ')", "ms": 8000},
+             "until": f"{_CHIP_TEXT}.startsWith('Quiet \\u00b7 ') && document.getElementById('pr-sheet').hidden", "ms": 8000},   # the sheet closes after the follow-up read, not with the paint
             {"eval": _CHIP_TEXT},
             {"eval": f"[document.getElementById('pr-sheet').hidden, document.activeElement===({_CHIP}), localStorage.getItem('levain_presence_for')]"},
             _opened(),
