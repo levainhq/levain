@@ -564,11 +564,9 @@ def _read_remote_raw(queue_dir: Path | str | None) -> dict | None:
 
 def read_remote_activity(queue_dir: Path | str | None, now: float | None = None) -> dict | None:
     """``{at, source, age}`` while the remote-activity record is valid and under :data:`ACTIVE_WINDOW_SECS` old at
-    ``now``, else ``None`` (missing, stale, unreadable, invalid, a symlink, or dated more than a minute ahead)."""
-    try:
-        rec = _read_remote_raw(queue_dir)
-    except Exception:  # noqa: BLE001 - total: an unreadable record is no record
-        return None
+    ``now``, else ``None`` (missing, stale, unreadable, invalid, a symlink, or dated more than a minute ahead). A fault the read did not anticipate
+    raises: the callers that read a fault as push (:func:`should_push`, the status view) take the fail-open decision."""
+    rec = _read_remote_raw(queue_dir)   # an unreadable or invalid record is None there; an UNEXPECTED fault propagates, so the callers that read a fault as push (should_push, the status view) do
     if rec is None:
         return None
     t = time.time() if now is None else now

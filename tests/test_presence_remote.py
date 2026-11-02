@@ -234,3 +234,20 @@ def test_a_lock_timeout_returns_false_and_never_raises(tmp_path, monkeypatch):
     finally:
         os.close(fd)
     assert not _file(q).exists()
+
+
+def test_an_unexpected_fault_inside_the_raw_remote_read_fails_open_not_to_no_activity(tmp_path, monkeypatch):
+    """The reader used to swallow any fault as 'no record', so an active desk held the ping; now the fault reaches the callers
+    that read it as push."""
+    q = _q(tmp_path)
+
+    def boom(*a, **k):
+        raise RuntimeError("raw read blew up")
+
+    monkeypatch.setattr(presence, "_read_remote_raw", boom)
+    with pytest.raises(RuntimeError):
+        presence.read_remote_activity(q)
+    d = presence.should_push(q, "ping", now=time.time(), idle=lambda: 0.0, suggest=False)
+    assert d.push is True and d.why == presence._FAULT
+    e = presence.effective(q, time.time(), idle=lambda: 0.0)
+    assert e["pushing"] is True
