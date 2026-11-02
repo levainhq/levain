@@ -103,24 +103,48 @@ def _cutoff(now: float | None = None) -> str:
 _NOT_ITEMS_SQL = ",".join(f"'{k}'" for k in _NOT_ITEMS)
 
 
-def _candidates(c: sqlite3.Connection, *, limit: int = 2 * NOTICES_KEEP) -> list[tuple[str, int, str, bool, str | None]]:
-    """Every visible item, lightweight and newest first: ``(kind, number, at, read, read_at)`` with kind ``n`` or ``p``.
-    Visible: not deleted by the operator; a ping within the retention window, a notice the record still keeps."""
+def _candidates(c: sqlite3.Connection, *, limit: int | None = None,
+                after: tuple[str, int, str] | None = None) -> list[tuple[str, int, str, bool, str | None]]:
+    """The visible items, lightweight and newest first: ``(kind, number, at, read, read_at)`` with kind ``n`` or ``p``.
+    Visible: not deleted by the operator; a ping within the retention window, a notice the record still keeps. ``after`` is
+    a keyset ``(at, number, kind)``: only the items strictly older than it, in the list's own order. ``limit`` bounds the
+    result and is applied in SQL per source, so no item is ever hidden by a cap: with no ``limit`` it is every visible item."""
     fp, fn = _floor(c, "center_floor_ping"), _floor(c, "center_floor_notice")
     rows: list[tuple[str, int, str, bool, str | None]] = []
-    for r in c.execute(
-            "SELECT n.id, n.at, m.is_read, m.read_at FROM notices n LEFT JOIN center_marks m ON m.item = 'n' || n.id "
-            "WHERE m.deleted_at IS NULL ORDER BY n.id DESC LIMIT ?", (NOTICES_KEEP,)):
-        read = bool(r[2]) if r[2] is not None else r[0] <= fn
-        rows.append(("n", r[0], r[1], read, r[3]))
-    for r in c.execute(
-            "SELECT p.id, p.at, m.is_read, m.read_at FROM pings p LEFT JOIN center_marks m ON m.item = 'p' || p.id "
-            f"WHERE p.kind NOT IN ({_NOT_ITEMS_SQL}) AND p.at >= ? AND m.deleted_at IS NULL "
-            "ORDER BY p.id DESC LIMIT ?", (_cutoff(), NOTICES_KEEP)):
-        read = bool(r[2]) if r[2] is not None else r[0] <= fp
-        rows.append(("p", r[0], r[1], read, r[3]))
+    for kind, table, floor, extra, args in (
+            ("n", "notices", fn, "", ()),
+            ("p", "pings", fp, f"AND t.kind NOT IN ({_NOT_ITEMS_SQL}) AND t.at >= ? ", (_cutoff(),))):
+        where, params = "", list(args)
+        if after is not None:
+            at, num, k = after
+            # (at, id, kind) < (after): this source's kind is fixed, so the third key is a constant truth
+            where = "AND (t.at < ? OR (t.at = ? AND (t.id < ? OR (t.id = ? AND ?)))) "
+            params += [at, at, num, num, 1 if kind < k else 0]
+        sql = (f"SELECT t.id, t.at, m.is_read, m.read_at FROM {table} t LEFT JOIN center_marks m "
+               f"ON m.item = '{kind}' || t.id WHERE m.deleted_at IS NULL {extra}{where}ORDER BY t.at DESC, t.id DESC")
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        for r in c.execute(sql, params):
+            read = bool(r[2]) if r[2] is not None else r[0] <= floor
+            rows.append((kind, r[0], r[1], read, r[3]))
     rows.sort(key=lambda t: (t[2], t[1], t[0]), reverse=True)
-    return rows[:limit]
+    return rows if limit is None else rows[:limit]
+
+
+def _cursor_key(c: sqlite3.Connection, before: str) -> tuple[str, int, str]:
+    """``(at, number, kind)`` of the item a ``before`` cursor names, read from the table whether or not the item is still
+    visible (deleted by the operator, cleared, aged out): a cursor stays good for the whole paging session. A row the record
+    no longer holds at all takes the ``at`` of the nearest newer row of its source (a repeat is possible, a skipped item
+    is not); with no newer row either, the id never existed here: ``not_found``."""
+    kind, num = before[0], int(before[1:])
+    table = "notices" if kind == "n" else "pings"
+    row = c.execute(f"SELECT at FROM {table} WHERE id = ?", (num,)).fetchone()
+    if row is None:
+        row = c.execute(f"SELECT at FROM {table} WHERE id > ? ORDER BY id LIMIT 1", (num,)).fetchone()
+    if row is None:
+        raise CenterError("not_found", "that item is not in the list", 404)
+    return (row[0], num, kind)
 
 
 def _counts(c: sqlite3.Connection) -> tuple[int, int]:
@@ -169,8 +193,11 @@ class _Reader:
                 self._questions = QuestionStore(self.queue_dir)
         except Exception:  # noqa: BLE001 - outcome_of says "unread" for the row
             pass
-        got = record.outcome_of(self.queue_dir, ref, _queue=self._queue, _questions=self._questions)
-        return got.get("state") in ("pending", "open")
+        try:
+            got = record.outcome_of(self.queue_dir, ref, _queue=self._queue, _questions=self._questions)
+            return got.get("state") in ("pending", "open")
+        except Exception:  # noqa: BLE001 - one ref that cannot be read is False for that item, never a failed page
+            return False
 
     def label(self, journal: Any, device_id: str) -> str:
         key = (journal, device_id)
@@ -269,16 +296,8 @@ def list_items(store: PushStore, *, limit: int = PAGE, before: str | None = None
     if before is not None and not (isinstance(before, str) and _ITEM.fullmatch(before)):
         raise CenterError("bad_request", "before is an item id", 400)
     with store.read() as c:
-        cands = _candidates(c)
-        if before is not None:
-            at = None
-            for k, num, a, _r, _t in cands:
-                if f"{k}{num}" == before:
-                    at = (a, num, k)
-                    break
-            if at is None:
-                raise CenterError("not_found", "that item is not in the list", 404)
-            cands = [t for t in cands if (t[2], t[1], t[0]) < at]
+        after = _cursor_key(c, before) if before is not None else None
+        cands = _candidates(c, limit=n + 1, after=after)
         page = cands[:n]
         more = len(cands) > n
         unread, total = _counts(c)
@@ -368,14 +387,25 @@ def set_read(store: PushStore, item: str, read: bool) -> int:
         return _counts(c)[0]
 
 
+def _visible_sql(c: sqlite3.Connection) -> list[tuple[str, str, tuple[Any, ...], Any]]:
+    """The two sources as ``(kind, FROM/WHERE for the visible rows, params, floor)``: the SAME predicate :func:`_candidates`
+    and :func:`_counts` use, so a bulk write reaches exactly the rows the list and the badge count."""
+    fp, fn = _floor(c, "center_floor_ping"), _floor(c, "center_floor_notice")
+    return [("n", "FROM notices t LEFT JOIN center_marks m ON m.item = 'n' || t.id WHERE m.deleted_at IS NULL", (), fn),
+            ("p", "FROM pings t LEFT JOIN center_marks m ON m.item = 'p' || t.id WHERE m.deleted_at IS NULL "
+                  f"AND t.kind NOT IN ({_NOT_ITEMS_SQL}) AND t.at >= ?", (_cutoff(),), fp)]
+
+
 def mark_all_read(store: PushStore) -> int:
-    """Mark every item in the list read. Returns the unread count after (0, unless an item arrived since)."""
+    """Mark every item in the list read. Returns the unread count after (0, unless an item arrived since). Set-based over
+    every visible item, never over a page or a cap."""
     with store.write() as c:
         stamp = now_stamp()
-        for kind, num, _at, read, _t in _candidates(c):
-            if not read:
-                c.execute("INSERT INTO center_marks (item, is_read, read_at) VALUES (?,1,?) ON CONFLICT(item) DO UPDATE "
-                          "SET is_read = 1, read_at = excluded.read_at", (f"{kind}{num}", stamp))
+        for kind, frm, params, floor in _visible_sql(c):
+            c.execute(f"INSERT INTO center_marks (item, is_read, read_at) SELECT '{kind}' || t.id, 1, ? {frm} "
+                      "AND COALESCE(m.is_read, t.id <= ?) = 0 "
+                      "ON CONFLICT(item) DO UPDATE SET is_read = 1, read_at = excluded.read_at",
+                      (stamp, *params, floor))
         _prune_marks(c)
         return _counts(c)[0]
 
@@ -397,9 +427,10 @@ def clear(store: PushStore) -> int:
     """Remove every item now in the list; Needs-you items are untouched. Returns the unread count after."""
     with store.write() as c:
         stamp = now_stamp()
-        for kind, num, _at, _read, _t in _candidates(c):
-            c.execute("INSERT INTO center_marks (item, is_read, read_at, deleted_at) VALUES (?,1,?,?) ON CONFLICT(item) "
-                      "DO UPDATE SET deleted_at = excluded.deleted_at", (f"{kind}{num}", stamp, stamp))
+        for kind, frm, params, _floor_ in _visible_sql(c):
+            c.execute(f"INSERT INTO center_marks (item, is_read, read_at, deleted_at) SELECT '{kind}' || t.id, 1, ?, ? "
+                      f"{frm} ON CONFLICT(item) DO UPDATE SET deleted_at = excluded.deleted_at",
+                      (stamp, stamp, *params))
         _prune_marks(c)
         return _counts(c)[0]
 
@@ -415,4 +446,6 @@ def push_url(store: PushStore, ping_id: int, kind: str, url: str) -> str:
             row = c.execute("SELECT id FROM notices WHERE ping_id = ?", (int(ping_id),)).fetchone()
     except Exception:  # noqa: BLE001 - the push still goes, to the link it already had
         return url
+    if row is None and kind in _NOT_ITEMS:
+        return url      # a notify ping whose notice the record has pruned is no item: a tap on p<id> would be a 404
     return f"/?view=notifications&n={'n' + str(row[0]) if row else 'p' + str(int(ping_id))}"
