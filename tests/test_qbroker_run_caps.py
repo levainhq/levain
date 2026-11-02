@@ -199,3 +199,18 @@ def test_run_state_refuses_an_impossible_state(L, resolver, clock, bad):
     write_state(L, **bad)
     with pytest.raises(operator.OperatorError):
         operator.run_state(L / "queue", "run-1")
+
+
+def test_a_run_with_no_deadline_and_no_latch_opens_no_write_transaction(tmp_path, monkeypatch):
+    """The max_calls-only path reads for a latch first and owes no write transaction (L3 r2 deepseek 3)."""
+    from levain.qbroker import broker as B
+    qdir = tmp_path / "q"
+    qdir.mkdir(mode=0o700)
+    opened = []
+    real = B.write_transaction
+    monkeypatch.setattr(B, "write_transaction", lambda *a, **k: (opened.append(1), real(*a, **k))[1])
+    assert B._run_deadline_trip(qdir, "run:r-1", None, 100.0) is None
+    assert opened == []
+    assert B._run_deadline_trip(qdir, "run:r-1", 50, 100.0) == 0      # a deadline still latches, in a write
+    assert opened == [1]
+    assert B._run_deadline_trip(qdir, "run:r-1", None, 100.0) == 0    # a held latch is found by the read, then written

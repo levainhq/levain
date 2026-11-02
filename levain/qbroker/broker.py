@@ -166,6 +166,7 @@ _RUN_STATE_PREFIX = "runstate-"
 # row is one row; keyed by the calling agent, the second agent was answered other_agent and the run stuck
 # limits-failed. The per-agent count stays the operator-global step's, keyed by the session
 _RUN_COUNT_AGENT = "claude_code"
+# (the run key is new in the P7-A3 slice, so no earlier row exists under another agent to migrate)
 # the broker's durable deadline latch, a table of its own in limits.db (L3 r1 codex MED): a run past its deadline
 # stays past it, whatever the wall clock or a later session's ATTACH-derived deadline says
 _RUN_TRIPS_SCHEMA = ("CREATE TABLE IF NOT EXISTS qbroker_run_trips ("
@@ -343,10 +344,26 @@ def cap_digest(cap: Any) -> str | None:
     return "sha256:" + hashlib.sha256(cap.encode("utf-8")).hexdigest()
 
 
+def _run_trip_held(qdir: Path, key: str) -> bool:
+    """Read-only: whether a deadline latch row exists for the run ``key`` (no database, no table, no row: ``False``).
+    A failure to read is raised, so a run is never let through on a read that did not happen."""
+    conn = consent_limits._connect(qdir)
+    try:
+        has = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'qbroker_run_trips'").fetchone()
+        if has is None:
+            return False
+        return conn.execute("SELECT 1 FROM qbroker_run_trips WHERE root = ? AND kind = ?",
+                            (key, RUN_DEADLINE_KIND)).fetchone() is not None
+    finally:
+        conn.close()
+
+
 def _run_deadline_trip(qdir: Path, key: str, deadline: int | None, now: float) -> int | None:
     """In one write transaction on ``limits.db``: ``None`` when the run ``key`` has not passed a deadline, else the
     run's counted calls (the counter's own row, never the published view). A run whose deadline is past at ``now`` is
     latched here first; a latched run is past it from then on, so no later clock or deadline is consulted."""
+    if deadline is None and not _run_trip_held(qdir, key):
+        return None                  # no deadline and nothing latched: no write transaction is owed
     with write_transaction(lambda: consent_limits._connect(qdir)) as conn:
         consent_limits._ensure(conn)
         conn.execute(_RUN_TRIPS_SCHEMA)

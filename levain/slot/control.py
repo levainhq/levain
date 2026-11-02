@@ -1992,7 +1992,11 @@ class Control:
         if "max_calls" in t.facts:
             out["max_calls"] = t.facts["max_calls"]
         at, span = self._attached_at.get(session), t.facts.get("deadline_s")
-        if span is not None and at is not None and type(span) is int:
+        if span is not None:
+            if at is None or type(span) is not int:
+                # a deadline the ticket asks for but CONTROL cannot place (restarted, or an attach it did not see)
+                # fails closed: the answer never carries max_calls with the deadline silently dropped
+                raise Refused("run-malformed")
             out["deadline"] = int(at) + span           # absolute, CONTROL's clock at ATTACH (whole seconds)
         return out
 

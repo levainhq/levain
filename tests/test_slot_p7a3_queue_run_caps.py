@@ -66,3 +66,34 @@ def test_the_ticket_seam_derives_the_deadline_from_the_attach_clock(env):
         assert set(env.control._ticket_run_facts(S2)) == set(FACTS)
     finally:
         env.control.tickets = real
+
+
+def _seam_resolve(env: Env, facts: dict, attached: float | None) -> dict:
+    """QUEUE-RESOLVE through the real ticket seam (not a stub of the facts), with a given attach clock."""
+    class T:
+        run_id = "r-1"
+    T.facts = {**{k: v for k, v in FACTS.items() if k != "run_id"}, **facts}
+    if attached is not None:
+        env.control._attached_at[S2] = attached
+    env.control.tickets = type("S", (), {"bound": lambda self, s: T, "close": lambda self: None})()
+    env.control._run_facts = env.control._ticket_run_facts
+    to_rendered(env, S2)
+    as_dispatch(env, S2)
+    return env.client("qbroker").ask("QUEUE-RESOLVE", slot=slot_ref(0), cap_digest=cap_digest(cap_of(env, S2)))
+
+
+def test_a_deadline_ticket_with_no_attach_clock_fails_closed(env):
+    """A ticket with deadline_s but no attach entry (CONTROL restarted) must never answer max_calls without a deadline."""
+    ans = _seam_resolve(env, {"max_calls": 7, "deadline_s": 600}, None)
+    print("NO ATTACH CLOCK", ans)
+    assert ans["refused"] == "run-malformed" and "run" not in ans
+
+
+def test_a_deadline_ticket_with_an_attach_clock_still_answers_both(env):
+    ans = _seam_resolve(env, {"max_calls": 7, "deadline_s": 600}, 1000.0)
+    assert ans["run"]["max_calls"] == 7 and ans["run"]["deadline"] == 1600
+
+
+def test_a_ticket_without_deadline_s_needs_no_attach_clock(env):
+    ans = _seam_resolve(env, {"max_calls": 7}, None)
+    assert ans["run"]["max_calls"] == 7 and "deadline" not in ans["run"]
