@@ -262,7 +262,7 @@ class BrokerClient:
             return GATE_HALTED, got["request_id"]
         if verdict == GATE_OVER and keys == {"gate", "kind"} and (got["kind"] is None or isinstance(got["kind"], str)):
             return GATE_OVER, got["kind"]
-        if verdict == GATE_FENCED and keys == {"gate", "reason"} and isinstance(got["reason"], str):
+        if verdict == GATE_FENCED and keys == {"gate", "reason"} and isinstance(got["reason"], str) and got["reason"]:
             return GATE_FENCED, got["reason"]
         if verdict == GATE_FAILED and keys == {"gate", "reason"} and isinstance(got["reason"], str):
             return GATE_FAILED, got["reason"]

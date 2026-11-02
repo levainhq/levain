@@ -142,7 +142,7 @@ from levain.slot import limits_doc
 __all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
            "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
            "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_CALLS_KIND", "RUN_DEADLINE_KIND", "RUN_KEYS", "RUN_OPTIONAL_KEYS",
-           "RUN_STATE_FORMAT", "run_state_path", "FenceSource", "SLOT_CLASS", "Broker", "Resolved",
+           "RUN_STATE_FORMAT", "run_state_path", "FenceSource", "FenceUnavailable", "SLOT_CLASS", "Broker", "Resolved",
            "Resolver", "resolved_from", "slot_ref", "stored_request"]
 
 log = logging.getLogger("levain.qbroker")
@@ -221,7 +221,7 @@ LimitsSource = Callable[[str, str], "Mapping[str, float]"]
 # the agent fence for a resolved session (P7-2, A0 section 2.3): ``None`` when the session's authority is as it was
 # launched, else the current side's reason (a non-empty string) for the `fenced` verdict; any exception is an
 # unreadable fence, which GATE answers `limits-failed`, never go
-# (:class:`levain.qbroker.fence.AgentFences` is the one in production)
+# (production's is :func:`levain.qbroker.__main__.build_fence`'s)
 FenceSource = Callable[["Resolved"], "str | None"]
 # the counter's directory under requests/ (limits.db and its failure files)
 LIMITS_DIR = "limits"
@@ -267,6 +267,10 @@ class Resolved:
     session: str
     kind: str
     run: Mapping[str, Any] | None
+
+
+class FenceUnavailable(Exception):
+    """A fence that cannot decide: its message names why, and GATE answers ``limits-failed`` with it."""
 
 
 class Resolver(Protocol):
@@ -877,6 +881,9 @@ class Broker:
             return None
         try:
             reason = self._fence(who)
+        except FenceUnavailable as exc:
+            log.warning("qbroker: the agent fence of run %s cannot decide: %s", who.run.get("run_id"), exc)
+            return wire.answer(rid, gate="limits-failed", reason=f"the agent fence could not decide: {exc}"[:512])
         except Exception as exc:  # noqa: BLE001 - an unreadable fence is not a go
             log.warning("qbroker: the agent fence of run %s could not be read (%s)", who.run.get("run_id"),
                         type(exc).__name__)
