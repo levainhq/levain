@@ -254,12 +254,21 @@ def test_an_unexpected_fault_inside_the_raw_remote_read_fails_open_not_to_no_act
 
 
 def test_the_readme_says_levain_ships_no_remote_activity_reporter_until_one_exists() -> None:
-    """README and CHANGELOG say nothing in Levain reports remote activity (Diogenes 11-02). If a caller is added inside the
-    package, this fails: update both documents to say what the new caller measures, then change this test."""
-    import re
+    """README and CHANGELOG say nothing in Levain reports remote activity (Diogenes 11-02). If a CALL appears in the package,
+    this fails: update both documents to say what the new caller measures, then change this test. Docs and comments that
+    only name the function are not calls."""
+    import ast
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
-    callers = [str(p.relative_to(root)) for p in (root / "levain").rglob("*.py")
-               if p.name != "presence.py" and re.search(r"\bnote_remote_activity\b", p.read_text(encoding="utf-8"))]
+    defining = root / "levain" / "webpush" / "presence.py"
+    callers = []
+    for p in (root / "levain").rglob("*.py"):
+        if p == defining:
+            continue
+        for node in ast.walk(ast.parse(p.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call):
+                f = node.func
+                if (f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)) == "note_remote_activity":
+                    callers.append(str(p.relative_to(root)))
     assert callers == [], f"a caller now exists ({callers}): the 'Levain ships no measurer' wording is stale"

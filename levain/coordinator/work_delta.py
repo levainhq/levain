@@ -50,7 +50,7 @@ def local_clock(stamp: Any, with_date: bool = False) -> str:
     text = stamp if isinstance(stamp, str) else ""
     try:
         local = parse_stamp(text).astimezone()
-    except ConsentError:
+    except (ConsentError, OverflowError, OSError, ValueError):     # not a stamp, or a year the zone's offset pushes out of range
         return f"{text[:10]} {text[11:16]}" if with_date else text[11:16]
     return local.strftime("%Y-%m-%d %H:%M" if with_date else "%H:%M")
 
