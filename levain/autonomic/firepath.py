@@ -64,6 +64,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from levain.autonomic.agent_bind import is_agent_binding
 from levain.autonomic.binding import Binding, BindingStore, binding_invocation
 from levain.autonomic.chainpath import ChainExecutor, ChainOutcome
 from levain.autonomic.executor import ActionRequest
@@ -246,6 +247,13 @@ class FireDispatcher:
         chain with no executor wired, a one-shot that lost the claim race). Single-link → the gate fires
         directly (4a); multi-link → the chain executor walks it (4b). Raises only on a genuine internal
         fault (caught by ``dispatch``'s per-binding net)."""
+        # 0. A NAMED (agent) binding is compiled per occurrence and never lives in the registry, so one that
+        # reaches the dispatcher is a caller bug or a forged row: refuse it before anything reads or fires it.
+        if is_agent_binding(binding):
+            _log.error("firepath: binding %s is a named-agent binding — refused, the agent path does not fire "
+                       "through the dispatcher", binding.binding_id)
+            return None
+
         # 1. RE-VALIDATE the stored predicate against the event (the dispatcher cannot trust a stored
         # predicate was ever validated — cut 2). A raise = the predicate is not evaluable → SKIP
         # (fail-closed: never fire on an unvalidatable predicate). A non-match → SKIP (no fire).
