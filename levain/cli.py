@@ -653,6 +653,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_band_parsers(subparsers)
     _add_dispatch_parsers(subparsers)
     _add_coordinator_parsers(subparsers)
+    _add_observe_parser(subparsers)
     from levain.agents.cli import add_parsers as _add_agents_parsers
     _add_agents_parsers(subparsers)
     from levain.dream.cli import add_parsers as _add_dream_parsers
@@ -4868,6 +4869,36 @@ def _cmd_update(args: argparse.Namespace) -> int:
         no_pip=args.no_pip,
         ack=args.ack,
     )
+
+
+def _add_observe_parser(subparsers: argparse._SubParsersAction) -> None:
+    ob_p = subparsers.add_parser(
+        "observe",
+        help="Observe-mode PermissionRequest logger: aggregate counts only, answers nothing.",
+        description=("A logger-only hook for a bypass day: counts tool and command FAMILIES (never command text, "
+                     "paths, cwd or session ids) into <levain home>/observe/ and prints nothing."),
+    )
+    ob_sub = ob_p.add_subparsers(dest="observe_cmd", required=True)
+    for name, hlp in (("install", "Add the logger's one PermissionRequest entry to <settings-root>/settings.json."),
+                      ("uninstall", "Remove only the logger's entry from <settings-root>/settings.json.")):
+        p = ob_sub.add_parser(name, help=hlp)
+        p.add_argument("--settings-root", type=Path, required=True, help="Directory holding settings.json.")
+        p.add_argument("--live", action="store_true", help="Allow writing the live ~/.claude.")
+        p.set_defaults(func=_cmd_observe)
+    sm = ob_sub.add_parser("summary", help="Print the day's counts as a table.")
+    sm.add_argument("--day", default=None, help="UTC day YYYY-MM-DD (default: today).")
+    sm.set_defaults(func=_cmd_observe)
+
+
+def _cmd_observe(args: argparse.Namespace) -> int:
+    from levain import observe
+
+    if args.observe_cmd == "install":
+        return observe.install(args.settings_root, live=args.live)
+    if args.observe_cmd == "uninstall":
+        return observe.uninstall(args.settings_root, live=args.live)
+    print(observe.summarise(observe.counts_path(day=args.day)))
+    return 0
 
 
 def _cmd_messaging(args: argparse.Namespace) -> int:
