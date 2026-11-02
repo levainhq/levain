@@ -52,7 +52,9 @@ def test_the_notices_section_is_in_no_needs_board_tray_or_agents_view():
 
 def test_the_deep_link_and_the_sheet_link_reach_the_section():
     js = _asset("devices_panel.js")
-    assert '"view") === "notices"' in js and 'ntLink.href = "#notices"' in js and 'ntSec.id = "notices"' in js
+    # ONE reader for the cockpit (1101-6): the notices view is one of its three, and the section lands through it
+    assert 'DEEP_VIEWS = ["needs", "notices", "inbox"]' in js and js.count('get("view")') == 1
+    assert 'deep.view === "notices"' in js and 'ntLink.href = "#notices"' in js and 'ntSec.id = "notices"' in js
 
 
 def test_the_server_deep_link_is_the_one_the_page_reads():

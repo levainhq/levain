@@ -18,6 +18,30 @@
   // skip reads while the stored token is still it, so a fresh token (a new link, the prompt) brings the panel back.
   let running = null, rerun = false, gone = false, refused = "";
   const READ_TIMEOUT_MS = 20000;
+  // ---- The ONE deep-link reader. A push opens `/?view=<needs|notices|inbox>` (and `&n=<item id>` for the inbox): this is where
+  // the cockpit reads it, once, at load, before anything rewrites the address. An unknown view is ignored. Each view finishes
+  // its own landing (needs: the Needs-you jump; notices: the section; inbox: the list, that item opened) and then calls
+  // deepDone(), which drops the query so a reload or a later tap starts clean.
+  const DEEP_VIEWS = ["needs", "notices", "inbox"];
+  const ITEM_ID = /^[pn][1-9][0-9]{0,17}$/;
+  let deep = null;
+  try {
+    const q = new URLSearchParams(window.location.search), v = q.get("view"), n = q.get("n") || "";
+    if (DEEP_VIEWS.indexOf(v) >= 0) deep = { view: v, n: v === "inbox" && ITEM_ID.test(n) ? n : "" };
+  } catch (_) { deep = null; }
+  function deepDone() {
+    deep = null;
+    try { window.history.replaceState(null, "", window.location.pathname + window.location.hash); } catch (_) { /* the address stays */ }
+  }
+  // Needs-you is the cockpit's home area; the narrow page's own jump scrolls to it, so the link rides that. It waits (bounded) for
+  // the area to be drawn.
+  function landNeeds(tries) {
+    if (!deep || deep.view !== "needs") return;
+    const btn = document.querySelector('[data-phone-jump="needs"]');
+    if (btn && document.querySelector("#ck-needs:not([hidden])")) { deepDone(); btn.click(); return; }
+    if (tries >= 20) { deepDone(); return; }
+    setTimeout(() => landNeeds(tries + 1), 500);
+  }
   // Which list shows: "active" or "revoked". Kept in the page (not in the nodes a paint replaces), so the 30 s read, a revoke and
   // every other re-render leave the chosen tab where it was; the tab row is built once and only relabelled.
   let tab = "active", lastDevs = [];
@@ -180,10 +204,11 @@
     sgrid.appendChild(buildNotify());
     sgrid.appendChild(buildPolicy());
     prSetSec.appendChild(sgrid);
+    buildInbox();
     buildNotices();
     const main = document.querySelector("main.frame");
-    if (main) { main.appendChild(section); main.appendChild(prSetSec); main.appendChild(ntSec); }
-    else { document.body.appendChild(section); document.body.appendChild(prSetSec); document.body.appendChild(ntSec); }
+    if (main) { main.appendChild(section); main.appendChild(prSetSec); main.appendChild(ibSec); main.appendChild(ntSec); }
+    else { document.body.appendChild(section); document.body.appendChild(prSetSec); document.body.appendChild(ibSec); document.body.appendChild(ntSec); }
     buildChip();
     buildSheet();
   }
@@ -665,14 +690,192 @@
       prEndLoud = null, prSheetNote = null, prLink = null, prDur = "1h", prSetSec = null, prTapList = null, prNote = null,
       prNew = null, prName = null, prChecks = {}, prBusy = false, prGen = 0, prReadId = 0, prGone = false, prRefused = "", prCur = null;
 
+  // ---- Inbox: what Levain pinged you, newest first, with a read mark the server holds (GET /webpush/inbox) -------------------
+  // The place a push lands. A row is a ping or a notice; the marks live on the server, so the iPad and the iPhone agree. Every
+  // field is set with textContent (el() does) and a URL in a body stays inert text. A notice keeps one extra control, Dismiss;
+  // a row's other control only expands it, and expanding reads it. The app-icon badge is not drawn here: the server answers
+  // GET /webpush/inbox/unread_count for whoever wants it.
+  let ibSec = null, ibList = null, ibNote = null, ibHead = null, ibAll = null, ibRows = [], ibOpen = new Set(), ibHl = "", ibGone = false,
+      ibBusy = false, ibGen = 0, ibReadId = 0, ibReading = false, ibSig = "", ibKind = "";
+  function buildInbox() {
+    ibSec = el("section", "ck-zone dev-zone ib-zone");
+    ibSec.id = "inbox-view";
+    ibSec.tabIndex = -1;
+    ibSec.dataset.zone = "inbox";
+    ibSec.dataset.modes = ALL_MODES;
+    ibSec.hidden = true;
+    const sh = el("div", "zone-head");
+    sh.appendChild(el("h2", "zone-title", "Inbox"));
+    ibHead = el("span", "zone-gloss ib-count");
+    ibHead.setAttribute("role", "status");
+    sh.appendChild(ibHead);
+    ibAll = el("button", "dev-btn ib-all", "Mark all read");
+    ibAll.type = "button";
+    ibAll.hidden = true;
+    ibAll.addEventListener("click", markAllRead);
+    sh.appendChild(ibAll);
+    ibSec.appendChild(sh);
+    const panel = el("div", "panel k-list dev-panel ib-panel");
+    panel.dataset.modes = ALL_MODES;
+    const body = el("div", "pbody dev-body");
+    ibNote = el("p", "dev-note ib-note"); ibNote.hidden = true;
+    body.appendChild(ibNote);
+    ibList = el("div", "dev-list ib-list");
+    body.appendChild(ibList);
+    panel.appendChild(body);
+    const grid = el("div", "ck-zgrid dev-grid ib-grid");
+    grid.appendChild(panel);
+    ibSec.appendChild(grid);
+  }
+  function ibSay(msg, kind) { ibNote.textContent = msg; ibNote.hidden = !msg; ibKind = msg ? (kind || "") : ""; }
+  function ibCount(n) {
+    ibHead.textContent = n > 0 ? n + " unread" : "";
+    ibAll.hidden = !(n > 0);
+  }
+  function firstLine(t) { const s = String(t || "").split("\n")[0]; return s.length > 140 ? s.slice(0, 140) + "…" : s; }
+  function paintInbox(rows, unread) {
+    // the same rows again paint nothing (a pulse never swallows a click or drops focus); a changed list gives focus back by id
+    const sig = JSON.stringify(rows) + "|" + [...ibOpen].join(",") + "|" + ibHl;
+    ibCount(unread);
+    if (sig === ibSig && ibList.firstChild) return;
+    ibSig = sig;
+    ibRows = rows;
+    let keep = null;
+    const act = document.activeElement;
+    if (act && ibList.contains(act)) {
+      const r = act.closest(".ib-row");
+      if (r) keep = [r.dataset.id, act.classList.contains("ib-dismiss") ? "ib-dismiss" : "ib-toggle"];
+    }
+    ibList.replaceChildren();
+    if (!rows.length) { ibList.appendChild(el("p", "dev-none ib-empty", "Nothing has pinged you.")); return; }
+    for (const it of rows) {
+      const open = ibOpen.has(it.id);
+      const row = el("div", "dev-row ib-row" + (open ? " ib-open" : "") + (it.read ? "" : " ib-unread") + (it.id === ibHl ? " ib-hl" : ""));
+      row.dataset.id = String(it.id);
+      row.dataset.priority = String(it.priority);
+      row.dataset.kind = String(it.kind);
+      const main = el("div", "dev-main");
+      const head = el("div", "ib-head");
+      const dot = el("span", "ib-dot");
+      dot.setAttribute("role", "img"); dot.setAttribute("aria-label", it.read ? "read" : "unread");
+      head.appendChild(dot);
+      head.appendChild(el("span", "ib-src", String(it.source || "")));
+      if (it.priority === "urgent") head.appendChild(el("span", "ib-pri", "urgent"));
+      head.appendChild(el("span", "ib-when", when(it.at)));
+      main.appendChild(head);
+      const tg = el("button", "ib-toggle");
+      tg.type = "button";
+      tg.setAttribute("aria-expanded", open ? "true" : "false");
+      tg.appendChild(el("span", "ib-title", String(it.title || "")));
+      if (it.body) tg.appendChild(el("span", "ib-body", String(it.body)));
+      tg.addEventListener("click", () => {
+        const now = !ibOpen.has(it.id);
+        if (now) ibOpen.add(it.id); else ibOpen.delete(it.id);
+        row.classList.toggle("ib-open", now); tg.setAttribute("aria-expanded", now ? "true" : "false");   // in place: focus stays
+        if (now) markRead(it.id);
+      });
+      main.appendChild(tg);
+      row.appendChild(main);
+      if (it.dismissable) {
+        const dm = el("button", "dev-btn ib-dismiss", "Dismiss");
+        dm.type = "button";
+        dm.addEventListener("click", () => dismissItem(it.id));
+        row.appendChild(dm);
+      }
+      ibList.appendChild(row);
+    }
+    if (keep) {
+      for (const r of ibList.querySelectorAll(".ib-row")) {
+        if (r.dataset.id !== keep[0]) continue;
+        const c = r.querySelector("." + keep[1]);
+        if (c) c.focus({ preventScroll: true });
+        break;
+      }
+    }
+  }
+  async function readInbox(force) {
+    if (!ibSec || ibGone) return;
+    if (!force && (ibBusy || ibReading)) return;
+    const startedAt = ibGen, mine = ++ibReadId;     // only the newest read, begun after the last mutation, paints
+    ibReading = true;
+    try {
+      if (!token()) { ibSec.hidden = true; return; }
+      const res = await api("GET", "/webpush/inbox", undefined, READ_TIMEOUT_MS);
+      if (startedAt !== ibGen || mine !== ibReadId) return;
+      if (res.status === 200 && res.data && Array.isArray(res.data.items)) {
+        paintInbox(res.data.items, Number(res.data.unread) || 0); if (ibKind === "read") ibSay(""); ibSec.hidden = false;
+        if (deep && deep.view === "inbox") await landInbox();
+      } else if (res.status === 404 || res.status === 403) { ibSec.hidden = true; ibGone = true; }
+      else if (!ibSec.hidden) ibSay("The inbox is unavailable right now.", "read");
+    } catch (_) { /* the next pulse tries again */ }
+    finally { if (mine === ibReadId) ibReading = false; }
+  }
+  // A push named an item: the list opens on it, highlighted and read; an item that is gone (pruned, dismissed) is said, and the
+  // list still shows. Runs once per link.
+  async function landInbox() {
+    const want = deep.n;
+    deepDone();
+    if (want && !ibRows.some((r) => r.id === want)) ibSay("That one is gone.", "gone");
+    else if (want) {
+      ibHl = want; ibOpen.add(want);
+      ibSig = "";                                   // repaint with the item open and marked
+      paintInbox(ibRows, ibRows.filter((r) => !r.read).length);
+      await markRead(want);
+    }
+    toInbox();
+  }
+  async function markRead(id) {
+    const it = ibRows.find((r) => r.id === id);
+    if (!it || it.read) return;
+    it.read = true;                                  // in place: the dot and the count change, the row stays under the finger
+    const row = [...ibList.querySelectorAll(".ib-row")].find((r) => r.dataset.id === id);
+    if (row) { row.classList.remove("ib-unread"); const d = row.querySelector(".ib-dot"); if (d) d.setAttribute("aria-label", "read"); }
+    ibCount(ibRows.filter((r) => !r.read).length);
+    try {
+      const res = await api("POST", "/webpush/inbox/read", { id: id });
+      if (res.status === 200 && res.data && typeof res.data.unread === "number") ibCount(res.data.unread);
+      else if (res.status !== 404) { it.read = false; ibSig = ""; readInbox(true); }       // not written: the server's list is the truth
+    } catch (_) { it.read = false; ibSig = ""; readInbox(true); }
+  }
+  async function markAllRead() {
+    if (ibBusy) return;
+    ibBusy = true; ibGen++; ibSay("");
+    let ok = false;
+    try {
+      const res = await api("POST", "/webpush/inbox/read", { all: true });
+      if (res.status === 200) ok = true; else ibSay("Could not mark them read (" + ((res.data && res.data.message) || res.status) + ").", "act");
+    } catch (_) { ibSay("Could not reach the cockpit.", "act"); }
+    finally { ibBusy = false; ibGen++; }
+    if (ok) { ibSig = ""; await readInbox(true); }
+  }
+  async function dismissItem(id) {
+    if (ibBusy || id.charAt(0) !== "n") return;
+    ibBusy = true; ibGen++; ibSay("");
+    let ok = false;
+    try {
+      const res = await api("POST", "/webpush/notices/dismiss", { id: Number(id.slice(1)) });
+      // gone already (another device dismissed it) reads as a dismiss; a failure keeps its message until the next action
+      if (res.status === 200 || res.status === 404) { ok = true; ibOpen.delete(id); }
+      else ibSay("Could not dismiss (" + ((res.data && res.data.message) || res.status) + ").", "act");
+    } catch (_) { ibSay("Could not reach the cockpit.", "act"); }
+    finally { ibBusy = false; ibGen++; }
+    if (ok) { ibSig = ""; await readInbox(true); readNotices(true); }
+  }
+  function toInbox() {
+    if (!ibSec || ibSec.hidden) return;
+    const hl = ibHl ? [...ibSec.querySelectorAll(".ib-row")].find((r) => r.dataset.id === ibHl) : null;
+    (hl || ibSec).scrollIntoView({ block: "start" });
+    const f = hl ? hl.querySelector(".ib-toggle") : null;
+    (f || ibSec).focus({ preventScroll: true });
+  }
+
   // ---- Notices: what your own services posted at you (levain.webpush.notify) ---------------------------------------------------
-  // A doorbell's log and nothing more. Its own section at the foot in every mode, so `/?view=notices` (the link a notice's push
-  // carries) always has somewhere to land. Every field is set with textContent (el() does), never as markup, and a URL in a body
+  // A doorbell's log and nothing more. Its own section at the foot in every mode, so `/?view=notices` (the link a held-notices
+  // push once carried) always has somewhere to land. Every field is set with textContent (el() does), never as markup, and a URL in a body
   // stays inert text: no link, no reply, no deep link. Dismiss is the one action. It carries no count and no badge, it is not in
   // Needs-you, the board, the tray or the agents graph, and nothing else on the page learns what it holds.
-  let ntSec = null, ntList = null, ntNote = null, ntOpen = new Set(), ntGone = false, ntBusy = false, ntAsked = false,
+  let ntSec = null, ntList = null, ntNote = null, ntOpen = new Set(), ntGone = false, ntBusy = false,
       ntGen = 0, ntReadId = 0, ntReading = false, ntSig = "", ntKind = "";
-  try { ntAsked = new URLSearchParams(window.location.search).get("view") === "notices"; } catch (_) { ntAsked = false; }
   function buildNotices() {
     ntSec = el("section", "ck-zone dev-zone nt-zone");
     ntSec.id = "notices";
@@ -761,7 +964,7 @@
       if (startedAt !== ntGen || mine !== ntReadId) return;
       if (res.status === 200 && res.data && Array.isArray(res.data.notices)) {
         paintNotices(res.data.notices); if (ntKind === "read") ntSay(""); ntSec.hidden = false;
-        if (ntAsked) { ntAsked = false; try { window.history.replaceState(null, "", window.location.pathname + window.location.hash); } catch (_) { /* the address stays */ } toNotices(); }
+        if (deep && deep.view === "notices") { deepDone(); toNotices(); }
       } else if (res.status === 404 || res.status === 403) { ntSec.hidden = true; ntGone = true; }
       else if (!ntSec.hidden) ntSay("The notices are unavailable right now.", "read");
     } catch (_) { /* the next pulse tries again */ }
@@ -1008,6 +1211,10 @@
     const ntLink = el("a", "pr-sheet-link nt-link", "Notices →");
     ntLink.href = "#notices";
     ntLink.addEventListener("click", (e) => { e.preventDefault(); closeSheet(false); toNotices(); });
+    const ibLink = el("a", "pr-sheet-link ib-link", "Inbox →");
+    ibLink.href = "#inbox-view";
+    ibLink.addEventListener("click", (e) => { e.preventDefault(); closeSheet(false); toInbox(); });
+    prSheet.appendChild(ibLink);
     prSheet.appendChild(ntLink);
     document.body.appendChild(prSheet);
   }
@@ -1288,17 +1495,19 @@
     readPresence();
     readNotify();
     readNotices();
+    readInbox();
+    landNeeds(0);
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
-    setTimeout(() => { refresh(); readPolicy(); readPresence(); readNotify(); readNotices(); }, 2500);
+    setTimeout(() => { refresh(); readPolicy(); readPresence(); readNotify(); readNotices(); readInbox(); }, 2500);
     // a tab brought back after a long time repaints at once, not at the next pulse
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) return;
       if (!prGone && !prBusy) readPresence();
-      readNotify(); readNotices();
+      readNotify(); readNotices(); readInbox();
     });
     const pulse = setInterval(() => {
       if (gone && npGone && prGone) clearInterval(pulse);
-      else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); if (!prBusy) readPresence(); readNotify(); readNotices(); }
+      else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); if (!prBusy) readPresence(); readNotify(); readNotices(); readInbox(); }
     }, 30000);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();

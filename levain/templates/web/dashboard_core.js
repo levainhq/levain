@@ -7824,6 +7824,7 @@
   // slot is, or at its top when it has none.
   const PHONE_JUMP_TARGET = {
     needs: "#ck-needs:not([hidden])",
+    inbox: "#inbox-view:not([hidden])",
     board: ".panel[data-ck-panel=\"tray\"]",
     notes: ".panel[data-ck-panel=\"notifications\"]",
   };
