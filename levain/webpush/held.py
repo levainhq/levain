@@ -1,13 +1,13 @@
 """levain.webpush.held — pings the presence rule held back from the phone, and their release.
 
-A ping the rule holds (:func:`levain.webpush.presence.decide`) is recorded as usual and queued in the push store's
-``held`` table (:meth:`levain.webpush.store.PushStore.hold`) with the reason it was held: ``quiet``, ``sleep`` or
-``active`` (the desk was in use). :func:`flush` releases what the rule now lets through:
+A ping the rule holds (:func:`levain.webpush.intent.decide`) is recorded as usual and queued in the push store's
+``held`` table (:meth:`levain.webpush.store.PushStore.hold`) with the reason it was held: a preset that muted it (``quiet``,
+``sleep``) or ``active`` (his devices were off, e.g. ``follow`` at the laptop). :func:`flush` releases what the rule now lets
+through, and only that:
 
-- an ``active`` ping goes when the rule says push for it now (the desk has been idle for the window, or an override);
-- a ping held by ``quiet`` or ``sleep`` goes when the rule no longer mutes it (the quiet ran out or was cleared, the
-  operator typed here after ``sleep``, or a ``loud`` is on), whatever the desk shows, preceded by ONE summary push for the
-  batch.
+- an ``active`` ping goes when the rule says push for it now (``follow`` turned devices on, or a setting or preset did);
+- a ping held by a mute goes when the rule says push for it (the mute ended or widened AND his devices are on), preceded by
+  ONE summary push for the batch.
 
 A flush takes a held ping with a lease (:meth:`PushStore.claim_held`) and marks it released only after a push to the phone
 succeeded (:meth:`PushStore.release_held`): a failed push, a raised error or a flush that dies leaves it held, and it is
@@ -96,20 +96,21 @@ def count(queue_dir: Path | str | None) -> int:
         return 0
 
 
-def plan(items: list[dict], word: dict | None, idle: float | None, now: float,
-         policy: dict | None = None, route: str = "desk") -> tuple[list[dict], list[dict]]:
-    """``(active, muted)``: which held ``items`` the rule releases at ``now``, as pings held for an active desk and
-    pings held by a mute. Pure."""
+def plan(items: list[dict], rec: dict, reading: float | None, now: float, remote: dict | None = None,
+         desk_msg_at: float | None = None) -> tuple[list[dict], list[dict]]:
+    """``(active, muted)``: which held ``items`` the record releases at ``now``, as pings held while his devices were off
+    (reason ``active``) and pings held by a mute (a preset's ``lets_through``). ``rec`` is :func:`levain.webpush.intent.read`;
+    ``reading`` the laptop idle seconds with a desk message counted as input. A held ping is released exactly when the rule
+    now says push for its kind: lifting a mute does not push a ping while his devices are still off. Pure."""
+    from levain.webpush import intent
+
     active: list[dict] = []
     muted: list[dict] = []
     for item in items:
-        d = presence.decide(now, word, idle, class_name=presence.kind_class(item["kind"]), policy=policy,
-                        route=route)
-        if item["reason"] == "active":
-            if d.push:
-                active.append(item)
-        elif d.state != "muted":
-            muted.append(item)
+        d = intent.decide(now, rec, reading, class_name=presence.kind_class(item["kind"]), remote=remote,
+                          desk_msg_at=desk_msg_at)
+        if d.push:
+            (active if item["reason"] == "active" else muted).append(item)
     return active, muted
 
 
@@ -127,13 +128,11 @@ def _plan_now(queue_dir: Path | str, at: float, idle: Callable[[], float | None]
     items = PushStore(queue_dir).held_items(now=at)
     if not items:
         return [], []
-    from levain.webpush import route
+    from levain.webpush import intent
 
-    from levain.webpush import desk
-
-    # a message to a desk at the laptop is input here too, exactly as in the rule a delivery reads (presence._core)
-    return plan(items, presence.read_word(queue_dir), desk.adjust_reading(queue_dir, _idle_source(idle)(), at), at,
-                presence.read_policy(queue_dir)[0], route.read_route(queue_dir, at)[0])
+    # one sample, exactly as the rule a delivery reads (intent._core): a desk message is laptop input too
+    s = intent._sample(queue_dir, at, _idle_source(idle))
+    return plan(items, s["rec"], s["reading"], at, s["remote"], s["msg_at"])
 
 
 def _inside_spawn_gap(queue_dir: Path | str) -> bool:

@@ -3,7 +3,7 @@ an NFC tag) with no location fix and none of the authority a cockpit token carri
 
 The file (``<queue>/webpush/presence_tokens.json``, 0600) holds only the sha256 of each token, never the token: the
 secret is shown once, at creation. The web layer resolves a supplied token here, asks again under the presence lock at
-the write, and owns the rate limit (:class:`RateLimit`); this module decides nothing about routes. A token may set only the words on its allow-list, and
+the write, and owns the rate limit (:class:`RateLimit`); this module decides nothing about what a word does (the record, :mod:`levain.webpush.intent`, does). A token may set only the words on its allow-list, and
 ``sleep`` and ``loud`` (the two that silence or force the phone for a long stretch) only when the operator listed them.
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from levain.webpush.presence import LOG_NAME as _LOG_NAME  # noqa: F401 - the sa
 from levain.webpush.presence import WORDS as _PRESENCE_WORDS, PresenceError, _locked
 from levain.webpush.route import ROUTE_WORDS
 
-WORDS = _PRESENCE_WORDS + ROUTE_WORDS   # what a token may be listed for: the presence words and the two route words
+WORDS = _PRESENCE_WORDS + ROUTE_WORDS   # what a token may be listed for: the presets, and the two aliases (`desk` -> follow, `devices` -> devices on)
 
 FILE_NAME = "presence_tokens.json"
 DEFAULT_WORDS = ("away", "back", "quiet", "desk", "devices")

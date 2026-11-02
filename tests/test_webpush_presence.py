@@ -1,4 +1,5 @@
-"""The phone-push rule: push = not muted AND (urgent OR not_home OR desk inactive >= 5 min), loud over all."""
+"""The phone-push rule over the one intent record (presence 1b): follow (devices on after 10 min of no laptop input) by default,
+the presets' lets_through, loud over all, and the compat words flow's installed half still calls."""
 from __future__ import annotations
 
 import json
@@ -8,12 +9,13 @@ import stat
 import pytest
 
 from levain.consent.adapters import claude_code
-from levain.webpush import presence, sender
-from levain.webpush.presence import ACTIVE_WINDOW_SECS, AWAY_GRACE_SECS, PresenceError, decide, set_word
+from levain.webpush import intent, presence, sender
+from levain.webpush.presence import AWAY_GRACE_SECS, PresenceError, set_word
 from tests._push_fixtures import phone
 
 NOW = 1_000_000.0
-ACTIVE, INACTIVE = 10.0, ACTIVE_WINDOW_SECS + 1.0   # idle seconds
+FOLLOW = intent.FOLLOW_DEFAULT
+ACTIVE, INACTIVE = 10.0, FOLLOW + 1.0   # idle seconds
 
 
 @pytest.fixture(autouse=True)
@@ -24,63 +26,88 @@ def _as_operator(monkeypatch):
     monkeypatch.setattr(band, "agent_process", lambda: None)
 
 
-def _w(word, **kw):
-    rec = {"word": word, "ts": NOW - 100}
-    rec.update(kw)
-    return rec
+def _rec(overlay=None, **base):
+    """A ``intent.read``-shaped record (the pure rule's input) with an optional overlay."""
+    b = {"devices": "follow", "follow_after": FOLLOW, "lets_through": "everything", "ts": 0.0, **base}
+    return {"status": "file", "reason": "", "base": b, "overlay": overlay, "projection": None}
 
 
-def test_active_desk_holds_an_ordinary_ping():
-    d = decide(NOW, None, ACTIVE)
+def _ov(preset, lets, until, **kw):
+    return {"preset": preset, "devices": "on", "follow_after": FOLLOW, "lets_through": lets, "ts": NOW - 100, "until": until, **kw}
+
+
+AWAY = lambda **kw: _ov("away", "everything", {"kind": "input"}, **kw)       # noqa: E731
+SLEEP = lambda **kw: _ov("sleep", "needs", {"kind": "input"}, **kw)          # noqa: E731
+QUIET = lambda secs=600, **kw: _ov("quiet", "needs", {"kind": "timer", "at": NOW + secs}, **kw)   # noqa: E731
+LOUD = lambda secs=600, **kw: _ov("loud", "everything", {"kind": "timer", "at": NOW + secs}, **kw)   # noqa: E731
+
+
+def decide(rec, idle, cls="other", **kw):
+    return intent.decide(NOW, rec, idle, class_name=cls, **kw)
+
+
+def test_an_active_laptop_holds_an_ordinary_ping():
+    d = decide(_rec(), ACTIVE)
     assert (d.push, d.state) == (False, "holding")
 
 
-def test_inactive_five_minutes_pushes():
-    assert decide(NOW, None, ACTIVE_WINDOW_SECS).push is True
-    assert decide(NOW, None, ACTIVE_WINDOW_SECS - 1).push is False
+def test_follow_pushes_after_ten_minutes_of_no_input_and_not_before():
+    assert decide(_rec(), FOLLOW).push is True
+    assert decide(_rec(), FOLLOW - 1).push is False
+    assert intent.FOLLOW_DEFAULT == 600
 
 
 def test_no_activity_source_reads_inactive():
-    assert decide(NOW, None, None).push is True
+    d = decide(_rec(), None)
+    assert d.push is True and d.why == "follow: no laptop input reading"
 
 
-def test_urgent_pushes_while_home_and_active():
-    assert decide(NOW, None, ACTIVE, urgent=True).push is True
+def test_an_approval_at_an_active_laptop_is_the_agents_own_dialog_not_a_phone_push():
+    """The retired 'urgent always pushes' override (FOR PHILL 4a): at the laptop under follow, the dialog is right there."""
+    assert decide(_rec(), ACTIVE, "approval").push is False
+    assert decide(_rec(), ACTIVE, "attention").push is False
+    assert decide(_rec(), INACTIVE, "approval").push is True
 
 
-def test_quiet_holds_an_ordinary_ping_but_urgent_pushes_through():
-    q = _w("quiet", until=NOW + 600)
-    assert decide(NOW, q, INACTIVE).push is False
-    assert decide(NOW, q, ACTIVE).state == "muted"
-    d = decide(NOW, q, ACTIVE, urgent=True)
+def test_quiet_holds_an_ordinary_ping_but_approvals_and_attention_push_through():
+    q = _rec(QUIET())
+    assert decide(q, ACTIVE).state == "muted" and decide(q, INACTIVE).state == "muted"
+    for cls in ("approval", "attention"):
+        d = decide(q, ACTIVE, cls)
+        assert (d.push, d.state) == (True, "pushing")
+
+
+def test_sleep_lets_approvals_and_attention_through_as_phill_ruled_and_mutes_the_rest():
+    d = decide(_rec(SLEEP()), INACTIVE, "approval")
     assert (d.push, d.state) == (True, "pushing")
-
-
-def test_sleep_holds_urgent_too():
-    d = decide(NOW, _w("sleep"), INACTIVE, urgent=True)   # no input since the word, said 100 s ago
+    d = decide(_rec(SLEEP()), INACTIVE)
     assert (d.push, d.state, d.by) == (False, "muted", "sleep")
 
 
-def test_loud_overrides_quiet_and_sleep_and_an_active_desk():
-    assert decide(NOW, _w("loud", until=NOW + 600), ACTIVE).push is True
-    # loud replaces the word on file, so "over a mute" is the one word: a loud stamped after a quiet wins by being the file
-    assert decide(NOW, _w("loud", until=NOW + 600), ACTIVE, urgent=False).push is True
+def test_loud_overrides_an_active_laptop_and_an_ordinary_ping():
+    assert decide(_rec(LOUD()), ACTIVE).push is True
+    assert decide(_rec(LOUD()), ACTIVE, "other").state == "pushing"
 
 
-def test_sleep_mutes_until_input_after_the_word():
-    s = _w("sleep")   # said 100 s ago
-    assert decide(NOW, s, INACTIVE, urgent=True).push is False
-    assert decide(NOW, s, None).push is False
-    # input 50 s ago is after the word (said 100 s ago): no longer muted, and the desk is active
-    assert decide(NOW, s, 50.0).state == "holding"
+def test_sleep_ends_at_input_past_the_grace_and_the_grace_is_every_until_input_presets():
+    s = _rec(SLEEP())   # said 100 s ago
+    assert decide(s, 50.0).state == "muted"            # input 50 s ago is 50 s after the word: the parting instruction
+    assert decide(s, None).state == "muted"            # no reading: it ends only at the blind bound (SLEEP_BLIND_SECS)
+    ended = decide(_rec(SLEEP(ts=NOW - 1000)), 50.0)   # input 950 s after the word is past the 180 s grace
+    assert (ended.push, ended.state) == (False, "holding")
+
+
+def test_a_sleep_with_no_idle_reading_ends_at_the_blind_bound():
+    old = _rec(SLEEP(ts=NOW - presence.SLEEP_BLIND_SECS - 1))
+    assert decide(old, None, "other").push is True and "no laptop input reading" in decide(old, None).why
 
 
 def test_away_pushes_at_once_until_input_past_the_grace():
-    a = _w("away", ts=NOW - 600)
-    # input 10 s ago is 590 s after the word: past the 180 s grace, so the word is spent
-    assert decide(NOW, a, ACTIVE).push is False
+    a = _rec(AWAY(ts=NOW - 600))
+    # input 10 s ago is 590 s after the word: past the 180 s grace, so the word is spent and follow reads the desk
+    assert decide(a, ACTIVE).push is False
     # input 1 s after the word is the parting instruction: still away
-    assert decide(NOW, _w("away", ts=NOW - 100), 99.0).push is True
+    assert decide(_rec(AWAY(ts=NOW - 100)), 99.0).push is True
     assert AWAY_GRACE_SECS == 180
 
 
@@ -89,26 +116,32 @@ def test_remote_is_no_longer_a_presence_word(tmp_path):
     assert "remote" not in presence.WORDS and "remote" not in presence.TIMED and "remote" not in presence.SEAT_WORDS
     with pytest.raises(presence.PresenceError, match="`remote` word was dropped"):
         set_word(tmp_path, "remote", duration="1h", now=NOW)
-    assert presence.read_word(tmp_path) is None
+    assert presence.read_word(tmp_path, now=NOW) is None
     (tmp_path / "webpush").mkdir(mode=0o700, exist_ok=True)
     (tmp_path / "webpush" / presence.FILE_NAME).write_text(json.dumps({"word": "remote", "ts": NOW, "until": NOW + 3600}))
-    assert presence.read_word(tmp_path) is None
-    # the rule then follows the measurement: an active desk holds
+    assert presence.read_word(tmp_path, now=NOW) is None
+    # the rule then follows the measurement: an active laptop holds
     assert presence.should_push(tmp_path, "ping", now=NOW + 1, idle=lambda: ACTIVE).push is False
 
 
-def test_expired_quiet_stops_holding_and_expired_loud_stops_overriding():
-    assert decide(NOW, _w("quiet", until=NOW - 1), INACTIVE).push is True
-    assert decide(NOW, _w("quiet", until=NOW - 1), ACTIVE).state == "holding"
-    assert decide(NOW, _w("loud", until=NOW - 1), ACTIVE).push is False
-    # a quiet that ended while a loud had replaced it never mutes
-    assert decide(NOW + 700, _w("quiet", until=NOW + 600), INACTIVE).push is True
+def test_expired_quiet_stops_muting_and_expired_loud_stops_overriding():
+    assert decide(_rec(QUIET(-1)), INACTIVE).push is True
+    assert decide(_rec(QUIET(-1)), ACTIVE).state == "holding"
+    assert decide(_rec(LOUD(-1)), ACTIVE).push is False
+    # a quiet that ended while a loud had replaced it never mutes (one overlay on file)
+    assert decide(_rec(QUIET(-100)), INACTIVE).push is True
 
 
-def test_no_state_precedence_urgent_beats_quiet_and_an_active_desk_and_quiet_beats_away():
-    assert decide(NOW, _w("quiet", until=NOW + 600), ACTIVE, urgent=True).push is True
-    assert decide(NOW, _w("quiet", until=NOW + 600), ACTIVE).push is False
-    assert decide(NOW, _w("away", ts=NOW - 100), ACTIVE).push is True
+def test_no_state_precedence_approvals_beat_quiet_and_quiet_beats_nothing_and_away_beats_an_active_laptop():
+    assert decide(_rec(QUIET()), ACTIVE, "approval").push is True
+    assert decide(_rec(QUIET()), ACTIVE).push is False
+    assert decide(_rec(AWAY(ts=NOW - 100)), ACTIVE).push is True
+
+
+def test_a_fault_in_the_record_reads_as_push():
+    bad = {"status": "fault", "reason": "not valid JSON", "base": _rec()["base"], "overlay": None, "projection": None}
+    d = decide(bad, ACTIVE, "other")
+    assert d.push is True and "could not be read" in d.why
 
 
 # --- words, files ----------------------------------------------------------------------------------------------------
@@ -116,7 +149,7 @@ def test_no_state_precedence_urgent_beats_quiet_and_an_active_desk_and_quiet_bea
 def test_set_word_roundtrip_and_durations(tmp_path):
     rec = set_word(tmp_path, "quiet", duration="30m", now=NOW)
     assert rec["until"] == NOW + 1800
-    assert presence.read_word(tmp_path) == {"word": "quiet", "ts": NOW, "until": NOW + 1800}
+    assert presence.read_word(tmp_path, now=NOW, idle=lambda: 5.0) == {"word": "quiet", "ts": NOW, "until": NOW + 1800}
     assert set_word(tmp_path, "quiet", now=NOW)["until"] == NOW + 3600
     assert set_word(tmp_path, "loud", duration="2h", now=NOW)["until"] == NOW + 7200
     assert set_word(tmp_path, "quiet", duration="9999h", now=NOW)["until"] == NOW + presence.MAX_SECS
@@ -128,27 +161,27 @@ def test_set_word_roundtrip_and_durations(tmp_path):
 
 def test_file_modes_and_replacement(tmp_path):
     set_word(tmp_path, "sleep", now=NOW)
-    p = tmp_path / "webpush" / presence.FILE_NAME
+    p = tmp_path / "webpush" / intent.FILE_NAME
     assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
     assert stat.S_IMODE(os.stat(p.parent).st_mode) == 0o700
     set_word(tmp_path, "quiet", now=NOW + 1)   # the newest replaces the one before
-    assert presence.read_word(tmp_path)["word"] == "quiet"
+    assert presence.read_word(tmp_path, now=NOW + 1, idle=lambda: 5.0)["word"] == "quiet"
 
 
 def test_back_clears_but_never_a_standing_loud(tmp_path):
     set_word(tmp_path, "quiet", now=NOW)
     assert set_word(tmp_path, "back", now=NOW + 1) is None
-    assert presence.read_word(tmp_path) is None
+    assert presence.read_word(tmp_path, now=NOW + 1) is None
     set_word(tmp_path, "loud", duration="30", now=NOW)
     assert set_word(tmp_path, "back", now=NOW + 1)["word"] == "loud"
-    assert presence.read_word(tmp_path)["word"] == "loud"
+    assert presence.read_word(tmp_path, now=NOW + 1, idle=lambda: 5.0)["word"] == "loud"
     assert set_word(tmp_path, "back", now=NOW + 5000) is None   # the loud has run out: back works again
 
 
 def test_loud_off_ends_loud_only(tmp_path):
     set_word(tmp_path, "loud", duration="30", now=NOW)
     assert set_word(tmp_path, "loud", duration="off", now=NOW + 1) is None
-    assert presence.read_word(tmp_path) is None
+    assert presence.read_word(tmp_path, now=NOW + 1) is None
     set_word(tmp_path, "quiet", now=NOW)
     assert set_word(tmp_path, "loud", duration="off", now=NOW + 1)["word"] == "quiet"
 
@@ -159,24 +192,39 @@ def test_a_loud_after_a_quiet_replaces_it(tmp_path):
     assert presence.should_push(tmp_path, "ping", now=NOW + 2, idle=lambda: ACTIVE).push is True
 
 
-def test_unreadable_or_foreign_word_files_are_no_word(tmp_path):
+def test_the_route_words_are_aliases_for_the_settings(tmp_path):
+    set_word(tmp_path, "devices", now=NOW)                                  # the old tap-token word: devices on for an hour
+    assert presence.should_push(tmp_path, "ping", now=NOW + 1, idle=lambda: ACTIVE).push is True
+    assert intent.read(tmp_path)["overlay"]["preset"] is None
+    set_word(tmp_path, "desk", now=NOW + 2)                                 # the measurement decides again: follow, as the base
+    assert presence.should_push(tmp_path, "ping", now=NOW + 3, idle=lambda: ACTIVE).push is False
+    with pytest.raises(PresenceError):
+        set_word(tmp_path, "devices", by={"agent": "claude", "session": "s", "role": "seat"}, said="x")
+
+
+def test_unreadable_or_foreign_record_files_read_as_a_fault_and_old_word_files_as_no_word(tmp_path):
     d = tmp_path / "webpush"
     d.mkdir(mode=0o700)
-    f = d / presence.FILE_NAME
-    for body in ("{not json", json.dumps({"word": "focus", "ts": 1}), json.dumps(["quiet"]),
-                 json.dumps({"word": "quiet", "ts": "x"}), "x" * 9000):
+    f = d / intent.FILE_NAME
+    for body in ("{not json", json.dumps({"version": 2}), json.dumps(["quiet"]), json.dumps({"version": 1, "base": {}}), "x" * 9000):
         f.write_text(body)
-        assert presence.read_word(tmp_path) is None
+        assert intent.read(tmp_path)["status"] == "fault", body[:20]
+        assert presence.should_push(tmp_path, "ping", now=NOW, idle=lambda: ACTIVE).push is True      # a fault reads as push
     f.unlink()
     f.symlink_to(tmp_path / "elsewhere")
-    assert presence.read_word(tmp_path) is None
+    assert intent.read(tmp_path)["status"] == "fault"
+    f.unlink()
+    old = d / presence.FILE_NAME
+    for body in ("{not json", json.dumps({"word": "focus", "ts": 1}), json.dumps(["quiet"]), json.dumps({"word": "quiet", "ts": "x"}), "x" * 9000):
+        old.write_text(body)
+        assert presence.read_legacy_word(tmp_path) is None
 
 
-def test_a_timed_word_without_until_gets_the_default(tmp_path):
+def test_a_timed_legacy_word_without_until_gets_the_default(tmp_path):
     d = tmp_path / "webpush"
     d.mkdir(mode=0o700)
     (d / presence.FILE_NAME).write_text(json.dumps({"word": "quiet", "ts": NOW}))
-    assert presence.read_word(tmp_path)["until"] == NOW + presence.DEFAULT_SECS
+    assert presence.read_legacy_word(tmp_path)["until"] == NOW + presence.DEFAULT_SECS
 
 
 def test_should_push_reads_a_fault_as_push(tmp_path):
@@ -202,28 +250,28 @@ def _notify(qdir, kind):
     return claude_code.notify(claude_code.AdapterSettings(), "levain: x waits", cwd=qdir, kind=kind, ref="request:r1")
 
 
-def test_wiring_active_desk_records_the_ping_without_pushing(tmp_path, monkeypatch):
+def test_wiring_active_laptop_records_the_ping_without_pushing(tmp_path, monkeypatch):
     _phone(tmp_path)
     calls = _spy(monkeypatch, ACTIVE)
     assert _notify(tmp_path, "ruling") is False
     assert [c["push"] for c in calls] == [False]   # recorded, not pushed
 
 
-def test_wiring_inactive_desk_pushes(tmp_path, monkeypatch):
+def test_wiring_walked_away_pushes(tmp_path, monkeypatch):
     _phone(tmp_path)
     calls = _spy(monkeypatch, INACTIVE)
     assert _notify(tmp_path, "ruling") is True
     assert [c["push"] for c in calls] == [True]
 
 
-def test_wiring_urgent_consent_pushes_with_an_active_desk(tmp_path, monkeypatch):
+def test_wiring_a_consent_at_an_active_laptop_stays_with_the_agents_own_dialog(tmp_path, monkeypatch):
     _phone(tmp_path)
     calls = _spy(monkeypatch, ACTIVE)
-    assert _notify(tmp_path, "consent") is True
-    assert [c["push"] for c in calls] == [True]
+    assert _notify(tmp_path, "consent") is False
+    assert [c["push"] for c in calls] == [False]
 
 
-def test_wiring_quiet_holds_consent_and_loud_pushes_again(tmp_path, monkeypatch):
+def test_wiring_quiet_holds_an_ordinary_ping_and_loud_pushes_again(tmp_path, monkeypatch):
     _phone(tmp_path)
     calls = _spy(monkeypatch, INACTIVE)
     set_word(tmp_path, "quiet", duration="30")
@@ -233,14 +281,14 @@ def test_wiring_quiet_holds_consent_and_loud_pushes_again(tmp_path, monkeypatch)
     assert [c["push"] for c in calls] == [False, True]
 
 
-def test_wiring_quiet_still_pushes_a_consent_and_sleep_holds_it(tmp_path, monkeypatch):
+def test_wiring_quiet_and_sleep_both_let_a_consent_through(tmp_path, monkeypatch):
     _phone(tmp_path)
     calls = _spy(monkeypatch, ACTIVE)
     set_word(tmp_path, "quiet", duration="30")
     assert _notify(tmp_path, "consent") is True
     set_word(tmp_path, "sleep")
-    assert _notify(tmp_path, "consent") is False
-    assert [c["push"] for c in calls] == [True, False]
+    assert _notify(tmp_path, "consent") is True      # Phill 10-25: in sleep an approval prompt block still pings him
+    assert [c["push"] for c in calls] == [True, True]
 
 
 # --- the CLI words ----------------------------------------------------------------------------------------------------
@@ -256,40 +304,40 @@ def _cli(tmp_path, *argv):
     return a.func(a)
 
 
-def test_cli_words_write_the_word_and_status_says_why(tmp_path, capsys, monkeypatch):
+def test_cli_words_write_the_record_and_status_prints_the_one_line(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: ACTIVE)
     assert _cli(tmp_path, "quiet", "20m") == 0
     assert presence.read_word(tmp_path)["word"] == "quiet"
-    assert "MUTED" in capsys.readouterr().out
+    assert "your devices, needs only (quiet)" in capsys.readouterr().out
     assert _cli(tmp_path, "loud", "5") == 0
-    assert "PUSHING" in capsys.readouterr().out
+    assert "your devices (loud)" in capsys.readouterr().out
     assert _cli(tmp_path, "loud", "off") == 0
     assert presence.read_word(tmp_path) is None
-    assert "HOLDING" in capsys.readouterr().out
+    assert "the desk only" in capsys.readouterr().out
     assert _cli(tmp_path, "quiet", "soon") == 2
     for w in ("sleep", "away", "back"):
         assert _cli(tmp_path, w) == 0
     assert _cli(tmp_path, "status") == 0
+    assert capsys.readouterr().out.strip().splitlines()[-1] == intent.describe_line(tmp_path)
 
 
-def test_a_short_write_does_not_truncate_the_word(tmp_path, monkeypatch):
-    """The word is replaced whole from a temp file; a write that takes only part of the bytes must be continued, not
-    renamed into place as a half-written (unreadable) word."""
+def test_a_short_write_does_not_truncate_the_record(tmp_path, monkeypatch):
+    """The record is replaced whole from a temp file; a write that takes only part of the bytes must be continued, not
+    renamed into place as a half-written (unreadable) record."""
     real = os.write
 
     def short(fd, data):
         return real(fd, bytes(data)[:3])
 
     monkeypatch.setattr(presence.os, "write", short)
-    presence._write(tmp_path, {"word": "away", "ts": NOW})
+    intent._write_record(tmp_path, {"base": _rec()["base"], "overlay": AWAY()})
     monkeypatch.undo()
-    assert presence.read_word(tmp_path) is not None
-    assert presence.read_word(tmp_path)["word"] == "away"
+    assert intent.read(tmp_path)["status"] == "file" and intent.read(tmp_path)["overlay"]["preset"] == "away"
 
 
-def test_a_failed_write_keeps_the_word_and_leaves_no_temp_file(tmp_path, monkeypatch):
-    """A write that fails part way (a full disk) raises, keeps the word already in place, and removes its temp file."""
-    presence._write(tmp_path, {"word": "away", "ts": NOW})
+def test_a_failed_write_keeps_the_record_and_leaves_no_temp_file(tmp_path, monkeypatch):
+    """A write that fails part way (a full disk) raises, keeps the record already in place, and removes its temp file."""
+    intent._write_record(tmp_path, {"base": _rec()["base"], "overlay": AWAY()})
     real = os.write
     calls = []
 
@@ -301,62 +349,53 @@ def test_a_failed_write_keeps_the_word_and_leaves_no_temp_file(tmp_path, monkeyp
 
     monkeypatch.setattr(presence.os, "write", fails_second)
     with pytest.raises(presence.PresenceError):
-        presence._write(tmp_path, {"word": "sleep", "ts": NOW})
+        intent._write_record(tmp_path, {"base": _rec()["base"], "overlay": SLEEP()})
     monkeypatch.undo()
-    assert presence.read_word(tmp_path)["word"] == "away"
+    assert intent.read(tmp_path)["overlay"]["preset"] == "away"
     assert [p.name for p in tmp_path.rglob("*.tmp")] == []
 
 
-def test_effective_is_the_same_answer_as_should_push_for_every_decide_case(tmp_path):
-    """The chip and the push decision are one function: over words x idle x route x kind, effective(...).pushing is
-    should_push(...).push, and source says whether a word or the measurement decided."""
-    from levain.webpush import route
-
-    words = [None, _w("away", ts=NOW - 100), _w("away", ts=NOW - 1000), _w("quiet", until=NOW + 60), _w("quiet", until=NOW - 1),
-             _w("sleep", ts=NOW - 100), _w("loud", until=NOW + 60), _w("loud", until=NOW - 1)]
+def test_effective_is_the_same_answer_as_should_push_for_every_overlay_idle_and_remote_case(tmp_path):
+    """The chip and the push decision are one function: over overlays x idle x remote, effective(...).pushing is
+    should_push(...).push, and source says whether an overlay or the measurement decided."""
+    overlays = [None, AWAY(ts=NOW - 100), AWAY(ts=NOW - 1000), QUIET(60), QUIET(-1), SLEEP(ts=NOW - 100), LOUD(60), LOUD(-1)]
     n = 0
-    for wi, w in enumerate(words):
-        for idle in (None, 0.0, 120.0, float(ACTIVE_WINDOW_SECS), 900.0):
-            for rt, rem in [(r, m) for r in ("desk", "devices") for m in ("absent", "fresh", "stale")]:
+    for oi, ov in enumerate(overlays):
+        for idle in (None, 0.0, 120.0, float(FOLLOW), 900.0):
+            for rem in ("absent", "fresh", "stale"):
                 q = tmp_path / f"q{n}"
                 n += 1
                 (q / "webpush").mkdir(parents=True, mode=0o700)
-                if w is not None:
-                    (q / "webpush" / presence.FILE_NAME).write_text(json.dumps(w))
-                if rt == "devices":
-                    route.set_route(q, "devices", now=NOW - 5)
+                intent._write_record(q, {"base": _rec()["base"], "overlay": ov})
                 if rem != "absent":   # fresh: 2 min old; stale: past the window
-                    age = 120.0 if rem == "fresh" else ACTIVE_WINDOW_SECS + 1.0
+                    age = 120.0 if rem == "fresh" else presence.ACTIVE_WINDOW_SECS + 1.0
                     (q / "webpush" / presence.REMOTE_NAME).write_text(json.dumps({"at": NOW - age, "source": "remote-terminal"}))
                 got = presence.effective(q, NOW, idle=lambda: idle)
                 want = presence.should_push(q, "ping", now=NOW, idle=lambda: idle, suggest=False)
-                assert got["pushing"] is want.push and got["state"] == want.state and got["reason"] == want.why, (w, idle, rt, rem)
+                assert got["pushing"] is want.push and got["state"] == want.state and got["reason"] == want.why, (oi, idle, rem)
                 assert (got["remote"] is not None) is (rem == "fresh")
                 assert got["source"] in ("word", "measured") and got["state"] in ("pushing", "holding", "muted")
-                if got["source"] == "word":
-                    assert got["since"] == w["ts"]
-                else:
-                    assert got["since"] is None
-    # source: a word decides when it is loud, a mute, or a live away; the desk reading decides otherwise
+                assert got["line"] == intent.describe_line(q, now=NOW, idle=lambda: idle)
+    # source: an overlay decides while it stands; the measurement decides otherwise
     q = tmp_path / "src"
     (q / "webpush").mkdir(parents=True, mode=0o700)
     assert presence.effective(q, NOW, idle=lambda: 900.0)["source"] == "measured"
-    (q / "webpush" / presence.FILE_NAME).write_text(json.dumps(_w("quiet", until=NOW + 60)))
-    assert presence.effective(q, NOW, idle=lambda: 900.0)["source"] == "word"
-    (q / "webpush" / presence.FILE_NAME).write_text(json.dumps(_w("away", ts=NOW - 1000)))   # spent: he typed after the grace
+    intent._write_record(q, {"base": _rec()["base"], "overlay": QUIET(60)})
+    got = presence.effective(q, NOW, idle=lambda: 900.0)
+    assert got["source"] == "word" and got["word"] == "quiet" and got["since"] == NOW - 100
+    intent._write_record(q, {"base": _rec()["base"], "overlay": AWAY(ts=NOW - 1000)})   # spent: he typed after the grace
     assert presence.effective(q, NOW, idle=lambda: 5.0)["source"] == "measured"
 
 
-def test_effective_never_drives_the_route_suggestion_and_a_fault_reads_as_pushing(tmp_path, monkeypatch):
-    from levain.webpush import route
+def test_a_status_read_writes_no_decision_row_and_a_delivery_does_and_a_fault_reads_as_pushing(tmp_path):
+    from levain.webpush import desk
 
-    ran = []
-    monkeypatch.setattr(route, "auto_suggest", lambda *a, **k: ran.append(1) or False)
     presence.effective(tmp_path, NOW, idle=lambda: 900.0)
-    assert ran == []                                  # a status read (suggest=False) never suggests
+    assert not (tmp_path / "webpush" / desk.DECISIONS_NAME).exists()      # a status read (suggest=False) writes nothing
     presence.should_push(tmp_path, "ping", now=NOW, idle=lambda: 900.0)
-    assert ran == [1]                                 # a delivery does
+    assert (tmp_path / "webpush" / desk.DECISIONS_NAME).exists()          # a delivery keeps what it saw
+
     def boom():
         raise RuntimeError("no idle")
-    got = presence.effective(tmp_path, NOW, idle=boom)
-    assert got["pushing"] is True and got["state"] == "pushing" and "could not be read" in got["reason"]
+    got = presence.effective(tmp_path, NOW, idle=boom)                    # no reading: follow reads him inactive and pushes
+    assert got["pushing"] is True and got["state"] == "pushing"

@@ -7,7 +7,7 @@ import time
 import pytest
 
 from levain.coordinator import morning
-from levain.webpush import presence
+from levain.webpush import intent, presence
 from levain.webpush.presence import PresenceError, read_log, read_word, set_word
 from levain.webpush.quote import Match
 
@@ -38,12 +38,12 @@ def test_each_word_a_setter_replaces_stays_on_record_and_the_card_names_the_sett
 
 def test_a_refusal_leaves_a_row_and_the_word_unchanged(tmp_path):
     set_word(tmp_path, "away", now=T)
-    on_file = (tmp_path / "webpush" / presence.FILE_NAME).read_text()
+    on_file = (tmp_path / "webpush" / intent.FILE_NAME).read_text()
     with pytest.raises(PresenceError):
         set_word(tmp_path, "quiet", by=SEAT, said="be quiet", now=T + 60)
     with pytest.raises(PresenceError):
         set_word(tmp_path, "away", by=SEAT, said=None, now=T + 120)
-    assert (tmp_path / "webpush" / presence.FILE_NAME).read_text() == on_file
+    assert (tmp_path / "webpush" / intent.FILE_NAME).read_text() == on_file
     refused = [r for r in read_log(tmp_path) if r["outcome"] == "refused"]
     assert [(r["word"], r["by"]["role"], r["prior"]) for r in refused] == [("quiet", "seat", {"word": "away"}),
                                                                            ("away", "seat", {"word": "away"})]
@@ -54,11 +54,11 @@ def test_an_unwritable_log_refuses_a_setter_and_not_the_operator(tmp_path, capsy
     (tmp_path / "webpush").mkdir()
     (tmp_path / "webpush" / presence.LOG_NAME).mkdir()   # a directory where the log file goes: appending fails
     set_word(tmp_path, "quiet", duration="10m", now=T)
-    before = (tmp_path / "webpush" / presence.FILE_NAME).read_text()
+    before = (tmp_path / "webpush" / intent.FILE_NAME).read_text()
     with pytest.raises(PresenceError, match="no record is not made"):
         set_word(tmp_path, "away", by=SEAT, said="heading out", now=T + 60, match=said(T + 30))
-    assert (tmp_path / "webpush" / presence.FILE_NAME).read_text() == before
-    assert read_word(tmp_path)["word"] == "quiet"
+    assert (tmp_path / "webpush" / intent.FILE_NAME).read_text() == before
+    assert read_word(tmp_path, now=T + 61, idle=lambda: 5.0)["word"] == "quiet"
     assert set_word(tmp_path, "sleep", now=T + 120)["word"] == "sleep"   # his own word goes through
     assert "presence log not written" in capsys.readouterr().err
 

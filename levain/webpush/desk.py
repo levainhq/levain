@@ -3,17 +3,18 @@
 Three records beside the presence word (all under ``<queue_dir>/webpush/``), plus the readings the chip paints from them:
 
 - **A desk message** (:func:`note_desk_message`, ``desk_message.json``): the operator typed a message to a desk at the laptop.
-  It ends an ``away`` or ``sleep`` word at once (never ``quiet`` or ``loud``: those are his own standing choices) and counts as
-  activity for :data:`~levain.webpush.presence.ACTIVE_WINDOW_SECS`, so a long message that is being composed holds pings the
-  way keyboard input does. A turn in the Claude app's remote control is NOT a desk message: the caller decides, and it reports
+  It is laptop input: it ends an ``until: input`` overlay (``away``, ``sleep``) at once, by READING (the intent record is never
+  written here, :mod:`levain.webpush.intent`), and counts as activity for the ``follow`` threshold, so a long message that is
+  being composed holds pings the way keyboard input does. A turn in the Claude app's remote control is NOT a desk message: the caller decides, and it reports
   that as :func:`~levain.webpush.presence.note_remote_activity`. Every desk message writes a row to the presence log
   (``levain ping log``), which is the stream a coordinator wakes on.
 - **Desk liveness** (:func:`publish_desk` / :func:`end_desk` / :func:`read_desk`, ``desk.json``): the desk's name and when it
   began, refreshed by whoever runs the desk. A record not refreshed for :data:`DESK_LIVE_TTL_SECS` reads ``stale``, never
   ``live``: a publisher that died must not leave "live" standing.
 - **The Here / Away reading of the operator** (:func:`you_view`), derived from the laptop's input idle time (and a desk
-  message): ``here`` while the last input is under :data:`~levain.webpush.presence.ACTIVE_WINDOW_SECS` old, ``away``
-  after it, cleared by input. :func:`observe` writes one presence-log row at each change (``auto-away`` / ``auto-here``).
+  message): ``here`` while the last input is under ``follow_after`` old (the one threshold, ten minutes by default), ``away``
+  after it, cleared by input. :func:`observe` writes one presence-log row at each change (``auto-away`` / ``auto-here``) and
+  one when it first sees an overlay ended (``ended away`` / ``ended sleep`` / ``ended quiet``): event rows, never a record write.
   The word "desk" is never used for this reading: it names the desk, and the operator is "you".
 
 :func:`record_decision` keeps one row per delivery decision (``push_decisions.jsonl``: kind, push, reason, idle, word) so the
@@ -125,52 +126,70 @@ def read_desk_message(queue_dir: Path | str | None, now: float | None = None) ->
     return {"at": at, "source": str(got.get("source") or "")[:_NAME_MAX], "desk": str(got.get("desk") or "")[:_NAME_MAX]}
 
 
-def adjust_reading(queue_dir: Path | str | None, reading: float | None, now: float) -> float | None:
+def adjust_reading(queue_dir: Path | str | None, reading: float | None, now: float, window: float | None = None) -> float | None:
     """The laptop's input idle seconds with a recent desk message counted as activity: the smaller of the two, when the
-    message is under :data:`ACTIVE_WINDOW_SECS` old. Older messages change nothing (so ``None``, no source, stays ``None``)."""
+    message is under ``window`` seconds old (default :data:`ACTIVE_WINDOW_SECS`; the intent rule passes ``follow_after``).
+    Older messages change nothing (so ``None``, no source, stays ``None``)."""
     msg = read_desk_message(queue_dir, now)
     if msg is None:
         return reading
     age = max(0.0, now - msg["at"])
-    if age >= ACTIVE_WINDOW_SECS:
+    if age >= (ACTIVE_WINDOW_SECS if window is None else window):
         return reading
     return age if reading is None else min(reading, age)
 
 
 def note_desk_message(queue_dir: Path | str, source: str, *, desk: str | None = None, now: float | None = None) -> dict:
-    """The operator sent a message to a desk from the laptop. Ends an ``away`` or ``sleep`` word (never ``quiet`` or
-    ``loud``), records the message as activity (:func:`adjust_reading`) and leaves one presence-log row. ``source`` names the
-    caller (required). Returns ``{at, cleared}`` (``cleared``: the word it ended, or ``None``). An older message than the one
-    on file never replaces it. Raises :class:`PresenceError` for a missing source or a lock/file fault: the caller decides
-    whether that matters (a fault changes no word)."""
+    """The operator sent a message to a desk from the laptop. It is laptop input: it records the message as activity
+    (:func:`adjust_reading`), ends an ``until: input`` overlay (``away``, ``sleep``) by READING and never by writing the intent
+    record, and leaves one presence-log row. ``source`` names the caller (required). Returns ``{at, ended, cleared}``
+    (``ended``: the preset it ended, ``"setting"`` for a setting made until his next input, else ``None``; ``cleared`` is the
+    same value, for callers that read the old key). An older message than the one on file never replaces it. Raises
+    :class:`PresenceError` for a missing source or a lock/file fault: the caller decides whether that matters."""
     src = str(source or "").strip()
     if not src:
         raise PresenceError("a desk message names its source")
+    from levain.webpush import intent
+
     t = time.time() if now is None else now
     with presence._locked(queue_dir, strict=True, wait=_LOCK_WAIT_SECS):
         cur = read_desk_message(queue_dir, t)
-        word = presence.read_word(queue_dir)
-        cleared = word["word"] if word and word["word"] in ("away", "sleep") else None
-        # the message record first: a fault writing it leaves the word standing, never a word gone with no input recorded
-        if cur is None or t >= cur["at"]:
+        rec = intent.read(queue_dir, t)
+        ov = rec["overlay"]
+        newer = cur is None or t >= cur["at"]   # an older message than the one on file ends nothing
+        seen = _read(queue_dir, AUTO_NAME) or {}
+        ended = None
+        if (newer and ov is not None and ov["until"]["kind"] == "input" and ov["ts"] < t and rec["status"] != "fault"
+                and seen.get("ended") != _ended_key(ov)):
+            ended = ov["preset"] or "setting"
+        # the message record first: a fault writing it leaves the overlay standing, never one ended with no input recorded
+        if newer:
             _write(queue_dir, DESK_MESSAGE_NAME, {"at": t, "source": src[:_NAME_MAX], "desk": str(desk or "")[:_NAME_MAX]})
-        if cleared and (cur is None or t >= cur["at"]):   # an older message than the one on file ends no word
-            presence._write(queue_dir, None)
-        else:
-            cleared = None
-        row = {"ts": t, "word": "desk-message", "prior": {"word": word["word"]} if word else {}, "outcome": "set",
-               "via": src[:_NAME_MAX], "by": {"agent": "operator", "session": str(desk or "")[:_NAME_MAX], "role": "desk"}}
-        if cleared:
-            row["why"] = f"ended {cleared}"
+        if ended:   # the end is noted once per overlay; the record itself stays exactly as it was
+            _write(queue_dir, AUTO_NAME, {**seen, "ended": _ended_key(ov)})
+        row = {"ts": t, "word": "desk-message", "prior": {"word": ov["preset"] or "set for a while"} if ended else {},
+               "outcome": "set", "via": src[:_NAME_MAX],
+               "by": {"agent": "operator", "session": str(desk or "")[:_NAME_MAX], "role": "desk"}}
+        if ended:
+            row["why"] = f"ended {ended}"
         presence._log_best_effort(queue_dir, row)
-    if cleared:   # pings that the ended word held are due now, as after `back` (a flush that cannot start is retried at the next call)
-        try:
-            from levain.webpush import held
+    if ended:   # pings that the ended overlay held are due now (a flush that cannot start is retried at the next call)
+        _flush(queue_dir)
+    return {"at": t, "ended": ended, "cleared": ended}
 
-            held.flush_if_due(queue_dir, throttle=False)
-        except Exception:  # noqa: BLE001
-            pass
-    return {"at": t, "cleared": cleared}
+
+def _ended_key(ov: dict) -> str:
+    """Which overlay an ``ended ...`` row was already written for (so each end is noted once)."""
+    return f"{ov['preset'] or 'setting'}@{ov['ts']}"
+
+
+def _flush(queue_dir: Path | str) -> None:
+    try:
+        from levain.webpush import held
+
+        held.flush_if_due(queue_dir, throttle=False)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ------------------------------------------------------------------------------------------------- desk liveness
@@ -237,45 +256,81 @@ def read_desk(queue_dir: Path | str | None, now: float | None = None) -> dict:
 
 
 # --------------------------------------------------------------------------------------- the operator: here or away
-def you_view(now: float, reading: float | None, word: dict | None = None) -> dict:
+def you_view(now: float, reading: float | None, word: dict | None = None, *, window: float | None = None) -> dict:
     """The operator's own reading, from the laptop's input idle seconds (already counting a desk message): ``{state, idle_secs,
-    text, short}`` with ``state`` ``here`` (input under :data:`ACTIVE_WINDOW_SECS` ago), ``away`` (longer), or ``unknown`` (no input
-    source). ``away`` here is the MEASUREMENT; a standing word is shown by the chip as the word."""
+    text, short}`` with ``state`` ``here`` (input under ``window`` ago: ``follow_after``, default :data:`ACTIVE_WINDOW_SECS`),
+    ``away`` (longer), or ``unknown`` (no input source). ``away`` here is the MEASUREMENT; a standing overlay is shown by the
+    chip as its preset."""
+    limit = ACTIVE_WINDOW_SECS if window is None else window
     if reading is None:
         return {"state": "unknown", "idle_secs": None, "text": "You: no laptop input reading", "short": "no reading"}
     idle = max(0.0, reading)
     mins = int(idle // 60)
-    if idle < ACTIVE_WINDOW_SECS:
+    if idle < limit:
         short = "active just now" if mins < 1 else f"active {mins} min ago"
         return {"state": "here", "idle_secs": idle, "text": f"You: {short}", "short": short}
     return {"state": "away", "idle_secs": idle, "text": f"You: no input at the laptop for {mins} min", "short": f"idle {mins} min"}
 
 
-def observe(queue_dir: Path | str | None, now: float, reading: float | None) -> str | None:
-    """Write one presence-log row when the measured reading changes between ``here`` and ``away`` (``auto-away`` /
-    ``auto-here``), so a coordinator can wake on it; the first reading seen only seeds the state. Best effort: a lock or file
-    fault writes nothing and never raises. Returns the state read (``None`` for ``unknown``)."""
-    state = you_view(now, reading)["state"]
-    if queue_dir is None or state == "unknown":
+def _mins_text(secs: float) -> str:
+    m = secs / 60.0
+    return f"{int(m)} min" if float(m).is_integer() else f"{m:.1f} min"
+
+
+def observe(queue_dir: Path | str | None, now: float, reading: float | None, *, msg_at: float | None = None) -> str | None:
+    """Write event rows for what sensing saw change, and nothing else (the intent record is never written here): one presence-log
+    row when the measured reading crosses ``follow_after`` between ``here`` and ``away`` (``auto-away`` / ``auto-here``), and one
+    ``ended away`` / ``ended sleep`` / ``ended quiet`` the first time it sees an overlay on file has ended, so a coordinator can
+    wake on them. The first reading seen only seeds the state. An ``auto-away`` crossing, or an overlay just seen ended, starts
+    the flush of held pings that are due. Best effort: a lock or file fault writes nothing and never raises. Returns the state
+    read (``None`` for ``unknown``)."""
+    if queue_dir is None:
         return None
-    seen = _read(queue_dir, AUTO_NAME)
-    if seen and seen.get("state") == state:   # nothing changed: no lock, no write (a delivery reads this on every ping)
-        return state
+    from levain.webpush import intent
+
+    try:
+        rec = intent.read(queue_dir, now)
+        if msg_at is None:
+            m = read_desk_message(queue_dir, now)
+            msg_at = m["at"] if m else None
+        eff, _ov, why = intent._eff(rec, now, reading, msg_at)
+        window = eff["follow_after"]
+        gone = rec["overlay"] if (why is not None and rec["overlay"] is not None) else None
+    except Exception:  # noqa: BLE001 - an event row never blocks a read
+        window, gone, why = ACTIVE_WINDOW_SECS, None, None
+    state = you_view(now, reading, window=window)["state"]
+    ret = None if state == "unknown" else state
+    seen = _read(queue_dir, AUTO_NAME) or {}
+    if (state == "unknown" or seen.get("state") == state) and (gone is None or seen.get("ended") == _ended_key(gone)):
+        return ret   # nothing changed: no lock, no write (a delivery reads this on every ping)
+    wake = False
     try:
         with presence._locked(queue_dir, strict=True, wait=_LOCK_WAIT_SECS):
             cur = _read(queue_dir, AUTO_NAME) or {}
             prev = cur.get("state")
-            if prev == state:
-                return state
-            _write(queue_dir, AUTO_NAME, {"state": state, "since": now})
-            if prev in ("here", "away"):
+            new = dict(cur)
+            if state != "unknown" and prev != state:
+                new.update({"state": state, "since": now})
+                if prev in ("here", "away"):
+                    presence._log_best_effort(queue_dir, {
+                        "ts": now, "word": f"auto-{state}", "prior": {"word": f"auto-{prev}"}, "outcome": "set", "via": "auto",
+                        "by": {"agent": "levain", "session": "", "role": "auto"},
+                        "why": f"laptop input idle {int((reading or 0) // 60)} min against a {_mins_text(window)} follow threshold"})
+                    wake = state == "away"
+            if gone is not None and cur.get("ended") != _ended_key(gone):
+                new["ended"] = _ended_key(gone)
+                name = gone["preset"] or "setting"
                 presence._log_best_effort(queue_dir, {
-                    "ts": now, "word": f"auto-{state}", "prior": {"word": f"auto-{prev}"}, "outcome": "set", "via": "auto",
-                    "by": {"agent": "levain", "session": "", "role": "auto"},
-                    "why": f"laptop input idle {int((reading or 0) // 60)} min against a {int(ACTIVE_WINDOW_SECS // 60)} min window"})
+                    "ts": now, "word": f"ended {name}", "prior": {"word": name}, "outcome": "set", "via": "sensing",
+                    "by": {"agent": "levain", "session": "", "role": "auto"}, "why": f"ended by {why}"})
+                wake = True
+            if new != cur:
+                _write(queue_dir, AUTO_NAME, new)
     except (PresenceError, OSError):
-        return state
-    return state
+        return ret
+    if wake:
+        _flush(queue_dir)
+    return ret
 
 
 # ---------------------------------------------------------------------------------------- one row per decision

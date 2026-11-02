@@ -6,14 +6,14 @@ from datetime import datetime, timezone
 import pytest
 
 from levain.consent.adapters import claude_code
-from levain.webpush import held, presence, sender
-from levain.webpush.presence import ACTIVE_WINDOW_SECS, set_word
+from levain.webpush import held, intent, presence, sender
+from levain.webpush.presence import set_word
 from levain.webpush.store import PushStore
 from tests._h4 import h4_env, h4_home
 from tests._push_fixtures import phone
 
 NOW = 1_000_000.0
-ACTIVE, INACTIVE = 10.0, ACTIVE_WINDOW_SECS + 1.0
+ACTIVE, INACTIVE = 10.0, intent.FOLLOW_DEFAULT + 1.0
 
 
 @pytest.fixture(autouse=True)
@@ -69,7 +69,7 @@ def test_active_held_pings_wait_for_the_window_then_push_once(tmp_path, monkeypa
     assert held.count(tmp_path) == 0
 
 
-def test_a_quiet_that_ends_sends_one_summary_then_the_held_pings_even_at_an_active_desk(tmp_path, monkeypatch):
+def test_a_quiet_that_ends_sends_one_summary_then_the_held_pings_once_his_devices_are_on(tmp_path, monkeypatch):
     _phone(tmp_path)
     sent = _fake(monkeypatch)
     set_word(tmp_path, "quiet", duration="10", now=NOW)
@@ -78,32 +78,44 @@ def test_a_quiet_that_ends_sends_one_summary_then_the_held_pings_even_at_an_acti
     inside = NOW + 300
     assert held.flush(tmp_path, now=inside, idle=lambda: INACTIVE) == 0   # still quiet
     after = NOW + 700
-    assert held.flush(tmp_path, now=after, idle=lambda: ACTIVE) == 2
+    assert held.flush(tmp_path, now=after, idle=lambda: ACTIVE) == 0   # the quiet is over, but he is at the laptop: follow keeps them for the desk
+    assert held.count(tmp_path) == 2 and sent == []
+    assert held.flush(tmp_path, now=after, idle=lambda: INACTIVE) == 2   # walked away: devices on, one summary first
     assert [b"held while you were quiet" in d for d in sent] == [True, False, False]
     assert b"2 pings" in sent[0]
     assert [b"first" in d for d in sent[1:]] == [True, False] and b"second" in sent[2]
-    assert held.flush(tmp_path, now=after, idle=lambda: ACTIVE) == 0
+    assert held.flush(tmp_path, now=after, idle=lambda: INACTIVE) == 0
     assert len(sent) == 3
 
 
-def test_sleep_ends_at_his_next_input_and_releases_the_same_way(tmp_path, monkeypatch):
+def test_sleep_lets_a_held_approval_through_at_once_and_the_rest_wait_until_his_devices_are_on(tmp_path, monkeypatch):
     _phone(tmp_path)
     sent = _fake(monkeypatch)
     set_word(tmp_path, "sleep", now=NOW)
-    _hold(tmp_path, "sleep", kind="consent", ref="request:r1", body="urgent held by sleep")
-    assert held.flush(tmp_path, now=NOW + 600, idle=lambda: 600.0 + 50) == 0   # no input since the word
-    assert held.flush(tmp_path, now=NOW + 600, idle=lambda: 20.0) == 1   # typed 20 s ago
-    assert b"asleep" in sent[0] and b"urgent held by sleep" in sent[1]
+    _hold(tmp_path, "sleep", kind="consent", ref="request:r1", body="approval held before the ruling")
+    _hold(tmp_path, "sleep", kind="ruling", ref="question:1", body="ordinary held by sleep")
+    # Phill 10-25: in sleep an approval still reaches him, and an ordinary ping waits
+    assert held.flush(tmp_path, now=NOW + 600, idle=lambda: 600.0 + 50) == 1
+    assert b"approval held before the ruling" in sent[-1] and held.count(tmp_path) == 1
+    # he types: the sleep is over, and at the laptop follow keeps the ordinary ping for the desk
+    assert held.flush(tmp_path, now=NOW + 700, idle=lambda: 20.0) == 0
+    # ten minutes without input: devices on, the ordinary ping goes after its summary
+    assert held.flush(tmp_path, now=NOW + 1400, idle=lambda: 700.0) == 1
+    assert b"asleep" in sent[-2] and b"ordinary held by sleep" in sent[-1]
 
 
-def test_loud_releases_everything_and_back_ends_a_quiet_release(tmp_path, monkeypatch):
+def test_loud_releases_everything_at_once_and_back_ends_a_quiet_release(tmp_path, monkeypatch):
     _phone(tmp_path)
     sent = _fake(monkeypatch)
-    set_word(tmp_path, "quiet", duration="60", now=NOW)
+    _hold(tmp_path, "active")
+    set_word(tmp_path, "loud", duration="60", now=NOW)
+    assert held.flush(tmp_path, now=NOW + 1, idle=lambda: ACTIVE) == 1      # loud: devices on whatever the laptop does
+    set_word(tmp_path, "quiet", duration="60", now=NOW + 2)
     _hold(tmp_path, "quiet")
     set_word(tmp_path, "back", now=NOW + 5)
-    assert held.flush(tmp_path, now=NOW + 6, idle=lambda: ACTIVE) == 1
-    assert len(sent) == 2
+    assert held.flush(tmp_path, now=NOW + 6, idle=lambda: ACTIVE) == 0      # back: follow again, and he is at the laptop
+    assert held.flush(tmp_path, now=NOW + 7, idle=lambda: INACTIVE) == 1
+    assert len(sent) == 3
 
 
 def test_nothing_is_released_while_no_phone_is_live_and_it_is_kept(tmp_path, monkeypatch):
@@ -167,14 +179,14 @@ def test_wiring_notify_queues_a_held_ping_under_its_reason(tmp_path, monkeypatch
     set_word(tmp_path, "sleep")
     ping("consent")
     assert [(c["push"], c["hold"]) for c in calls] == [(False, "active"), (False, "quiet"), (True, None),
-                                                      (False, "sleep")]
+                                                      (True, None)]   # Phill 10-25: a consent still pings him in sleep
 
 
 def test_status_says_how_many_are_held(tmp_path, monkeypatch):
     _phone(tmp_path)
     _fake(monkeypatch)
     _hold(tmp_path, "active")
-    assert "1 held for the phone" in presence.describe(tmp_path, now=NOW, idle=lambda: ACTIVE)
+    assert "Held for your devices: 1." in presence.describe(tmp_path, now=NOW, idle=lambda: ACTIVE)
 
 
 def test_tick_flushes_until_stopped(tmp_path, monkeypatch):
@@ -277,7 +289,7 @@ def test_h1_a_summary_that_raises_does_not_lose_the_held_pings(tmp_path, monkeyp
         return real(qdir, **kw)
 
     monkeypatch.setattr(sender, "send", send)
-    assert held.flush(tmp_path, now=NOW + 700, idle=lambda: ACTIVE) == 1
+    assert held.flush(tmp_path, now=NOW + 700, idle=lambda: INACTIVE) == 1
     assert held.count(tmp_path) == 0 and b"kept" in sent[0]
 
 
@@ -402,12 +414,12 @@ def test_h6_sleep_without_an_idle_reading_ends_at_a_bound_and_status_says_so(tmp
     from levain.webpush.presence import SLEEP_BLIND_SECS
 
     set_word(tmp_path, "sleep", now=NOW)
-    word = presence.read_word(tmp_path)
-    assert presence.decide(NOW + 60, word, None, urgent=True).push is False
-    assert presence.decide(NOW + SLEEP_BLIND_SECS + 1, word, None, urgent=True).push is True
+    rec = intent.read(tmp_path)
+    assert intent.decide(NOW + 60, rec, None, class_name="other").push is False                     # no reading: it cannot see his input
+    assert intent.decide(NOW + SLEEP_BLIND_SECS + 1, rec, None, class_name="other").push is True     # ... so it ends at the bound
     text = presence.describe(tmp_path, now=NOW + 60, idle=lambda: None)
-    assert "idle source unavailable" in text
-    assert "idle source unavailable" not in presence.describe(tmp_path, now=NOW + 60, idle=lambda: 5000.0)
+    assert "with no input reading" in text
+    assert "with no input reading" not in presence.describe(tmp_path, now=NOW + 60, idle=lambda: 5000.0)
 
 
 # --- fix round r2: E1/H1 (every device answered or was retired), H5 (one spawn under a burst) --------------------------

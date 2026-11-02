@@ -8,17 +8,24 @@ import time
 
 import pytest
 
-from levain import web_server
-from levain.webpush import presence, route
-from levain.webpush.presence import ACTIVE_WINDOW_SECS, PresenceError, decide
+from levain.webpush import intent, presence
+from levain.webpush.presence import ACTIVE_WINDOW_SECS, PresenceError
 
 NOW = 1_000_000.0
 FRESH = {"at": NOW - 120.0, "source": "remote-terminal", "age": 120.0}
 
 
-@pytest.fixture(autouse=True)
-def _quiet_who(monkeypatch):
-    monkeypatch.setattr(route, "_run_who", lambda: "")
+def _rec(overlay=None):
+    base = {"devices": "follow", "follow_after": 600, "lets_through": "everything", "ts": 0.0}
+    return {"status": "file", "reason": "", "base": base, "overlay": overlay, "projection": None}
+
+
+def _ov(preset, lets, until, ts=NOW - 10):
+    return {"preset": preset, "devices": "on", "follow_after": 600, "lets_through": lets, "ts": ts, "until": until}
+
+
+def decide(rec_or_none, idle, *, class_name="other", remote=None):
+    return intent.decide(NOW, rec_or_none or _rec(), idle, class_name=class_name, remote=remote)
 
 
 def _q(tmp_path):
@@ -116,41 +123,38 @@ def test_read_shape_stale_absent_unreadable_and_symlink(tmp_path):
 
 
 def test_fresh_remote_makes_an_active_laptop_ordinary_ping_push():
-    assert decide(NOW, None, 0.0).push is False                                           # control: held without it
-    d = decide(NOW, None, 0.0, remote=FRESH)
+    assert decide(None, 0.0).push is False                                                # control: held without it
+    d = decide(None, 0.0, remote=FRESH)
     assert (d.push, d.state) == (True, "pushing")
-    assert d.why == "remote desk: remote-terminal input 2 min ago, so pings go to your devices"
-    _, source = presence._decide(NOW, None, 0.0, remote=FRESH)
+    assert d.why == "follow: remote terminal input 2 min ago"
+    _, source = intent._decide(NOW, _rec(), 0.0, "other", FRESH, None)
     assert source == "measured"
     stale = {"at": NOW - ACTIVE_WINDOW_SECS - 1, "source": "remote-control", "age": ACTIVE_WINDOW_SECS + 1}
-    assert decide(NOW, None, 0.0, remote=stale).push is False                             # a stale reading decides nothing
-    assert decide(NOW, None, 0.0, remote=None).push is False
+    assert decide(None, 0.0, remote=stale).push is False                                  # a stale reading decides nothing
+    assert decide(None, 0.0, remote=None).push is False
 
 
 def test_typing_at_the_laptop_does_not_clear_a_fresh_remote_record():
     for idle in (0.0, 1.0, 30.0):                                                         # he is at the laptop; the record is fresh
-        assert decide(NOW, None, idle, remote=FRESH).push is True
+        assert decide(None, idle, remote=FRESH).push is True
 
 
-def test_loud_mute_urgent_and_away_precedence_is_unchanged():
-    loud = {"word": "loud", "ts": NOW - 10, "until": NOW + 600}
-    quiet = {"word": "quiet", "ts": NOW - 10, "until": NOW + 600}
-    sleep = {"word": "sleep", "ts": NOW + 5}   # input never lands after it: a standing mute
-    away = {"word": "away", "ts": NOW - 10}
-    for w in (loud, quiet, sleep, away, None):
-        for cls in ("approval", "attention", "other"):
-            for idle in (0.0, 900.0, None):
-                a = presence._decide(NOW, w, idle, class_name=cls)
-                b = presence._decide(NOW, w, idle, class_name=cls, remote=FRESH)
-                if w is None and cls == "other" and (idle is None or idle < ACTIVE_WINDOW_SECS):
-                    continue   # only the desk-idle hold can change, and for exactly the rule's reason
-                if w is None and cls == "other":
-                    assert b[0].push is True and "remote desk" in b[0].why   # idle desk: remote names itself
-                    continue
-                assert a == b, (w, cls, idle)
-    d = decide(NOW, sleep, 900.0, remote=FRESH)
+def test_remote_never_counts_as_the_desk_and_feeds_follow_only():
+    """DESIGN §3 and FOR PHILL 2 (a): under explicit `off` or a mute, what he set decides; remote never ends an until-input overlay."""
+    off = _rec()
+    off["base"] = {**off["base"], "devices": "off"}
+    assert decide(off, 900.0, remote=FRESH).push is False                                 # off: remote feeds follow only
+    sleep = _rec(_ov("sleep", "needs", {"kind": "input"}, ts=NOW + 5))                    # input never lands after it: a standing mute
+    d = decide(sleep, 900.0, remote=FRESH)
     assert (d.push, d.state, d.by) == (False, "muted", "sleep")                           # a mute still holds an ordinary ping
-    assert decide(NOW, away, 900.0, remote=FRESH).why == "away: his word"                 # away decides before remote
+    for rec in (sleep, _rec(_ov("loud", "everything", {"kind": "timer", "at": NOW + 600})),
+                _rec(_ov("quiet", "needs", {"kind": "timer", "at": NOW + 600})), _rec(_ov("away", "everything", {"kind": "input"}))):
+        for cls in ("approval", "attention", "other"):
+            for idle in (0.0, 900.0, None):   # an overlay has devices on already, so a remote record changes nothing it decides
+                assert intent._decide(NOW, rec, idle, cls, None, None) == intent._decide(NOW, rec, idle, cls, FRESH, None), (rec["overlay"]["preset"], cls, idle)
+    for idle in (0.0, 30.0, 599.0, 900.0, None):   # follow: the remote record turns devices on, and only follow
+        assert decide(None, idle, remote=FRESH).push is True
+    assert decide(_rec(_ov("away", "everything", {"kind": "input"})), 900.0, remote=FRESH).why == "away"   # away decides before remote
 
 
 def test_effective_shape_and_the_one_function_rule(tmp_path):
@@ -159,17 +163,17 @@ def test_effective_shape_and_the_one_function_rule(tmp_path):
     _file(q).write_text(json.dumps({"at": NOW - 120, "source": "remote-control"}))
     eff = presence.effective(q, NOW, idle=lambda: 0.0)
     assert eff["remote"] == {"source": "remote-control", "at": NOW - 120}
-    assert eff["state"] == "pushing" and eff["source"] == "measured" and "remote-control input 2 min ago" in eff["reason"]
+    assert eff["state"] == "pushing" and eff["source"] == "measured" and "remote control turn 2 min ago" in eff["reason"]
     want = presence.should_push(q, "ping", now=NOW, idle=lambda: 0.0, suggest=False)
     assert eff["pushing"] is want.push and eff["reason"] == want.why
-    # a deciding word still shows the fresh record, so flow can tag the row
+    # a deciding overlay still shows the fresh record, so flow can tag the row
     presence.set_word(q, "quiet", duration="1h", now=NOW)
     eff = presence.effective(q, NOW, idle=lambda: 0.0)
     assert eff["state"] == "muted" and eff["remote"]["source"] == "remote-control"
-    assert "remote desk" in presence.describe(tmp_path / "other", now=NOW, idle=lambda: 0.0, remote=FRESH)
+    assert "remote terminal input" in presence.describe(tmp_path / "other", now=NOW, idle=lambda: 0.0, remote=FRESH)
 
 
-def test_a_status_get_reads_the_remote_record_once(tmp_path, monkeypatch):
+def test_a_status_read_reads_the_remote_record_once(tmp_path, monkeypatch):
     q = _q(tmp_path)
     now = time.time()
     _file(q).write_text(json.dumps({"at": now - 60, "source": "remote-terminal"}))
@@ -181,36 +185,24 @@ def test_a_status_get_reads_the_remote_record_once(tmp_path, monkeypatch):
         return real(queue)
 
     monkeypatch.setattr(presence, "_read_remote_raw", counting)
-    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 5.0)
-
-    class _Fake:
-        def _credential_is_full(self):
-            return False
-
-    v = web_server._Handler._presence_view(_Fake(), q)
+    v = intent.view(q, now=now, idle=lambda: 5.0)
     assert len(reads) == 1
-    assert v["effective"]["remote"]["source"] == "remote-terminal" and v["effective"]["pushing"] is True
-    assert "remote desk" in v["text"]
+    assert v["remote"]["source"] == "remote-terminal" and v["pushing"] is True
+    assert "remote terminal input" in v["line"]
 
 
 def test_a_faulted_remote_read_fails_open_in_the_status_and_in_delivery(tmp_path, monkeypatch):
     q = _q(tmp_path)
-    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 0.0)   # active laptop: would hold
 
     def boom(*a, **k):
         raise RuntimeError("read blew up")
 
     monkeypatch.setattr(presence, "read_remote_activity", boom)
-
-    class _Fake:
-        def _credential_is_full(self):
-            return False
-
-    v = web_server._Handler._presence_view(_Fake(), q)
+    v = intent.view(q, now=time.time(), idle=lambda: 0.0)          # active laptop: would hold
     want = presence.should_push(q, "ping", now=time.time(), idle=lambda: 0.0, suggest=False)
     assert want.push is True and want.why == presence._FAULT
-    assert v["effective"]["pushing"] is True and v["effective"]["state"] == "pushing" and v["effective"]["reason"] == presence._FAULT
-    assert presence._FAULT in v["text"] and v["text"].startswith("PUSHING")
+    assert v["pushing"] is True and v["state"] == "pushing" and v["reason"] == presence._FAULT
+    assert v["line"].startswith("Pings now: your devices (the presence record could not be read")
 
 
 def test_a_lock_timeout_returns_false_and_never_raises(tmp_path, monkeypatch):

@@ -10,12 +10,9 @@ import pytest
 
 from levain.webpush import notify, notify_tokens as nt, presence
 from levain.webpush.notify import NotifyRefused
-from levain.webpush.presence import DEFAULT_CELLS
 from levain.webpush.store import NOTICES_KEEP, PushStore
 
 NOW = 1_000_000.0
-PHILL = {"quiet": dict(DEFAULT_CELLS["quiet"]), "sleep": {"approval": "push", "attention": "push", "other": "hold"}}
-DEFAULT = {m: dict(c) for m, c in DEFAULT_CELLS.items()}
 
 
 @pytest.fixture(autouse=True)
@@ -355,10 +352,6 @@ def test_caps_are_per_token(tmp_path):
 
 # --- the policy decision -------------------------------------------------------------------------------
 
-def _sleep_word():
-    return {"word": "sleep", "ts": NOW - 100}
-
-
 def test_kinds_and_classes():
     assert presence.kind_class("notify") == "other" and presence.kind_class("notify_urgent") == "attention"
     assert "notify_urgent" in presence.URGENT_KINDS and "notify" not in presence.URGENT_KINDS
@@ -368,34 +361,44 @@ def test_kinds_and_classes():
         notify.kind_for("high")
 
 
-def test_a_sleep_notice_under_the_default_table_every_priority_is_held_or_recorded():
-    # idle 1000 < now - word.ts: no input since the word, so sleep still holds
-    got = {p: notify.notify_decision(p, NOW, _sleep_word(), 1000.0, policy=DEFAULT) for p in notify.PRIORITIES}
-    assert got == {"low": "recorded", "normal": "held", "urgent": "held"}
+def _rec(preset=None, lets="everything", until=None, ts=None, devices="follow"):
+    base = {"devices": "follow", "follow_after": 600, "lets_through": "everything", "ts": 0.0}
+    ov = None
+    if preset:
+        ov = {"preset": preset, "devices": "on", "follow_after": 600, "lets_through": lets, "ts": NOW - 10 if ts is None else ts,
+              "until": until or {"kind": "input"}}
+    return {"status": "file", "reason": "", "base": base, "overlay": ov, "projection": None}
 
 
-def test_a_sleep_notice_under_phills_table_only_an_urgent_one_rings():
-    got = {p: notify.notify_decision(p, NOW, _sleep_word(), 1000.0, policy=PHILL) for p in notify.PRIORITIES}
+def test_a_sleep_notice_every_priority_low_is_recorded_normal_is_held_and_an_urgent_one_rings():
+    # idle 1000 s: no input since the word, so sleep stands; it lets approvals and attention through (Phill 10-25)
+    got = {p: notify.notify_decision(p, NOW, _rec("sleep", "needs"), 1000.0) for p in notify.PRIORITIES}
     assert got == {"low": "recorded", "normal": "held", "urgent": "pushed"}
 
 
+def test_a_setting_that_lets_nothing_through_holds_even_an_urgent_notice():
+    got = {p: notify.notify_decision(p, NOW, _rec("sleep", "nothing"), 1000.0) for p in notify.PRIORITIES}
+    assert got == {"low": "recorded", "normal": "held", "urgent": "held"}
+
+
 def test_quiet_and_the_open_desk(tmp_path):
-    quiet = {"word": "quiet", "ts": NOW - 10, "until": NOW + 600}
-    assert notify.notify_decision("normal", NOW, quiet, 1000.0, policy=DEFAULT) == "held"
-    assert notify.notify_decision("urgent", NOW, quiet, 1000.0, policy=DEFAULT) == "pushed"      # the default quiet attention cell
-    # no mute: an ordinary notice follows the desk (active holds, idle pushes), an urgent one pushes
-    assert notify.notify_decision("normal", NOW, None, 5.0) == "held"
-    assert notify.notify_decision("normal", NOW, None, 99999.0) == "pushed"
-    assert notify.notify_decision("urgent", NOW, None, 5.0) == "pushed"
-    loud = {"word": "loud", "ts": NOW - 10, "until": NOW + 600}
-    assert notify.notify_decision("normal", NOW, loud, 5.0, policy=DEFAULT) == "pushed"
+    quiet = _rec("quiet", "needs", {"kind": "timer", "at": NOW + 600})
+    assert notify.notify_decision("normal", NOW, quiet, 1000.0) == "held"
+    assert notify.notify_decision("urgent", NOW, quiet, 1000.0) == "pushed"      # quiet lets attention through
+    # no overlay: an ordinary notice follows the laptop (active holds, ten idle minutes pushes); an urgent one is the same
+    # (the retired 'urgent always pushes' override: at the laptop the band is right there)
+    assert notify.notify_decision("normal", NOW, _rec(), 5.0) == "held"
+    assert notify.notify_decision("normal", NOW, _rec(), 99999.0) == "pushed"
+    assert notify.notify_decision("urgent", NOW, _rec(), 5.0) == "held"
+    loud = _rec("loud", "everything", {"kind": "timer", "at": NOW + 600})
+    assert notify.notify_decision("normal", NOW, loud, 5.0) == "pushed"
     assert notify.notify_decision("low", NOW, loud, 5.0) == "recorded"
 
 
-def test_the_decision_is_the_operators_tables_not_the_senders(tmp_path):
-    # the same urgent notice moves with the table alone
-    assert (notify.notify_decision("urgent", NOW, _sleep_word(), 1000.0, policy=DEFAULT),
-            notify.notify_decision("urgent", NOW, _sleep_word(), 1000.0, policy=PHILL)) == ("held", "pushed")
+def test_the_decision_is_the_operators_record_not_the_senders():
+    # the same urgent notice moves with the record's lets_through alone
+    assert (notify.notify_decision("urgent", NOW, _rec("sleep", "nothing"), 1000.0),
+            notify.notify_decision("urgent", NOW, _rec("sleep", "needs"), 1000.0)) == ("held", "pushed")
 
 
 # --- the notices store ---------------------------------------------------------------------------------

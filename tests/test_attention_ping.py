@@ -56,14 +56,14 @@ def test_an_escalated_question_pushes_as_attention_under_quiet(rig):
     assert wire.spawned == [("attention", True, None)]
 
 
-def test_an_escalated_question_is_muted_under_sleep(rig):
+def test_an_escalated_question_still_pushes_under_sleep(rig):   # Phill 10-25: in sleep a high-priority ping reaches him
     d, wire = rig
     tok = d.coordinator()
     q, _ = d.ask()
     _say(d, "sleep")
     fr.escalate(d.store, q.id, "outside its envelope", token=tok)
     band.release_held_pings(d.dir)
-    assert len(wire.spawned) == 1 and wire.spawned[0][:2] == ("attention", False) and wire.spawned[0][2] == "sleep"
+    assert wire.spawned == [("attention", True, None)]
 
 
 def test_an_unread_release_stays_a_question_and_is_muted_under_quiet(rig):
@@ -83,14 +83,14 @@ def test_a_seats_question_with_no_coordinator_is_muted_under_quiet(rig):
     assert wire.spawned == [("question", False, "quiet")]
 
 
-def test_the_stopped_row_pushes_under_quiet_and_not_under_sleep(rig):
+def test_the_stopped_row_pushes_under_quiet_and_under_sleep(rig):
     d, wire = rig
     _say(d, "quiet")
     assert band.file_coordinator_stopped(d.dir, "claude_code", "stopped after three deaths", "ep-1") is not None
     _say(d, "sleep")
     assert band.file_coordinator_stopped(d.dir, "claude_code", "stopped after three deaths", "ep-2") is not None
     assert wire.spawned[0] == ("attention", True, None)
-    assert wire.spawned[1][:2] == ("attention", False) and wire.spawned[1][2] == "sleep"
+    assert wire.spawned[1] == ("attention", True, None)
 
 
 def test_the_coordinators_own_question_is_not_held_and_pings_as_attention(rig):

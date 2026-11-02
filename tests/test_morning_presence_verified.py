@@ -43,9 +43,9 @@ def test_an_unverified_word_carries_false_and_the_mark(tmp_path):
 
 def test_a_legacy_record_with_no_verified_key_reads_as_unverified(tmp_path):
     set_word(tmp_path, "away", by=SEAT, said="heading out", now=T, match=Match(True, T - 5, "ok"))
-    p = tmp_path / "webpush" / presence.FILE_NAME
+    p = tmp_path / "webpush" / "intent.json"
     rec = json.loads(p.read_text())
-    del rec["verified"]
+    del rec["overlay"]["verified"]
     p.write_text(json.dumps(rec))
     pres = morning._presence(tmp_path)
     assert pres["verified"] is False
