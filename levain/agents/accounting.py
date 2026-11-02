@@ -116,14 +116,20 @@ def _is_amount(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+# the largest amount a SQLite INTEGER holds: an exposure above it is refused, an actual above it is debited at it
+_MAX_MICROS = 2**63 - 1
+
 # the runs of one agent that count against its signed limits: launched (a reservation exists, or launched_at is set),
-# scheduled ones by their window key, manual ones by when they launched
+# scheduled ones by their window key, manual ones by when they launched. Times compare as instants (julianday), so a
+# stamp written with an offset or fractional seconds is placed where it happened, not where its text sorts.
+# Per A0 §2.6 a manual launch with no window holding now (:swk NULL) counts manual runs only: that is the contract's
+# basis, not an omission here; a scheduled launch's :swk is its own NOT NULL window key.
 _COUNTED = ("FROM agent_occurrences o WHERE o.agent_id = :agent AND o.occurrence_id != :me"
             " AND (o.launched_at IS NOT NULL OR EXISTS (SELECT 1 FROM agent_reservations r"
             " WHERE r.occurrence_id = o.occurrence_id))"
             " AND ((o.kind = 'scheduled' AND o.window_key = :swk)"
-            " OR (o.kind = 'manual' AND COALESCE(o.launched_at, o.admitted_at) >= :start"
-            " AND COALESCE(o.launched_at, o.admitted_at) < :end))")
+            " OR (o.kind = 'manual' AND julianday(COALESCE(o.launched_at, o.admitted_at)) >= julianday(:start)"
+            " AND julianday(COALESCE(o.launched_at, o.admitted_at)) < julianday(:end)))")
 
 
 def reserve(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, executor: Executor, *,
@@ -134,12 +140,21 @@ def reserve(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, executo
     agent's launched runs in the window already meet the signed ceiling, or when the window's spend, its open
     reservations and this exposure would pass the signed window budget. Spend is what settled reservations debited
     plus what open ones hold, over the same runs the ceiling counts.
+
+    Raises ``RuntimeError`` when ``conn`` is not inside a transaction. Its first statement takes the write lock (a
+    no-op write), so the counts below are read under it even in a deferred ``BEGIN``; a deferred transaction that
+    already read a snapshot another writer has since moved past fails there with ``database is locked``.
     """
+    if not conn.in_transaction:
+        raise RuntimeError("reserve runs inside the launch transaction (BEGIN IMMEDIATE); this connection has none")
+    conn.execute("UPDATE agent_reservations SET state = state WHERE 0")
     me = str(_field(occurrence, "occurrence_id"))
     agent = str(_field(occurrence, "agent_id"))
     exposure = getattr(executor, "max_exposure_usd_micros", None)
-    if not _is_amount(exposure):
+    if not _is_amount(exposure) or exposure > _MAX_MICROS:
         return Refused("no_exposure")
+    # a reservation commits only with its launch (one transaction), so a reserved occurrence is launched, and the
+    # transition trigger refuses launched -> skipped-budget: a caller applying this Refused.state cannot end a live row
     if conn.execute("SELECT 1 FROM agent_reservations WHERE occurrence_id = ?", (me,)).fetchone() is not None:
         return Refused("already_reserved")
     args = {"agent": agent, "me": me, "swk": limits.scheduled_window_key, "start": limits.span_start,
@@ -147,14 +162,15 @@ def reserve(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, executo
     launched = conn.execute(f"SELECT COUNT(*) {_COUNTED}", args).fetchone()[0]
     if launched >= limits.run_ceiling:
         return Refused("ceiling")
+    # TOTAL, not SUM: SUM raises "integer overflow" once breaches past 2**63 accumulate; TOTAL is exact below 2**53
     held = conn.execute(
-        "SELECT COALESCE(SUM(CASE WHEN r.state = 'open' THEN r.reserved_usd_micros"
-        " ELSE COALESCE(r.debited_usd_micros, r.reserved_usd_micros) END), 0)"
+        "SELECT TOTAL(CASE WHEN r.state = 'open' THEN r.reserved_usd_micros"
+        " ELSE COALESCE(r.debited_usd_micros, r.reserved_usd_micros) END)"
         f" FROM agent_reservations r WHERE r.occurrence_id IN (SELECT o.occurrence_id {_COUNTED})", args).fetchone()[0]
     if held + exposure > limits.budget_window_usd_micros:
         return Refused("budget_window")
     conn.execute("INSERT INTO agent_reservations (occurrence_id, agent_id, window_key, reserved_usd_micros, state)"
-                 " VALUES (?, ?, ?, ?, 'open')", (me, agent, str(_field(occurrence, "window_key")), exposure))
+                 " VALUES (?, ?, ?, ?, 'open')", (me, agent, _field(occurrence, "window_key"), exposure))
     return Reserved(exposure)
 
 
@@ -169,21 +185,23 @@ def settle(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, usage: U
     me = str(_field(occurrence, "occurrence_id"))
     row = conn.execute("SELECT agent_id, reserved_usd_micros, debited_usd_micros, state FROM agent_reservations"
                        " WHERE occurrence_id = ?", (me,)).fetchone()
-    if row is None:
+    if row is None:    # a launch writes its reservation in its own transaction, so only a never-launched row lands here
         return Settled(0, False, "no_reservation")
     agent, reserved, debited, state = row[0], row[1], row[2], row[3]
-    if state == "settled":
+    if state != "open":    # the CHECK allows only open/settled; anything not open is not ours to settle again
         return Settled(int(debited or 0), False, "already_settled")
     actual = getattr(usage, "usd_micros", None)
     if not _is_amount(actual):
         charge, basis, breach = reserved, "unreadable", False
-    elif actual > reserved:
-        charge, basis, breach = actual, "breach", True
+    elif actual > reserved:    # an actual past what SQLite holds is debited at the most it holds: still a breach
+        charge, basis, breach = min(actual, _MAX_MICROS), "breach", True
     else:
         charge, basis, breach = actual, "actual", False
     conn.execute("UPDATE agent_reservations SET state = 'settled', debited_usd_micros = ?, settled_reason = ?"
                  " WHERE occurrence_id = ? AND state = 'open'", (charge, basis, me))
     if breach:
+        # operation is only active|paused (CHECK) and no levain code deletes an agent row, so this cannot demote
+        # another state or miss a live agent
         conn.execute("UPDATE agents SET operation = 'paused' WHERE agent_id = ?", (agent,))
     return Settled(charge, breach, basis)
 
