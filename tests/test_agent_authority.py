@@ -114,3 +114,43 @@ def test_an_unreadable_store_refuses(world, tmp_path):
         fence_now(conn)                                                # and nothing is held after the failed refresh
     with pytest.raises(AgentAuthorityError):
         agent_fence({"agent_id": AGENT}, authority=authority, store_id=STORE)   # not a launched occurrence
+
+
+def test_a_mapping_that_is_not_the_stored_launch_refuses(world, tmp_path):
+    # behaviour: fence_now reads every launch column from the store, so a mapping carrying occ-1's id with another
+    # live link (or another spec) of the same agent never matches: the check runs on the row, not on the caller's copy
+    create(world, 1)
+    create(world, 2)
+    conn, row = _occurrence(tmp_path, world)
+    authority = AgentAuthority(world.root)
+    authority.refresh()
+    other = "al-000000000002"
+    mixed = {**row, "link_id": other, "link_incarnation": authority.incarnation(other)}
+    assert authority.peek(other, agent_id=AGENT, store_id=STORE, now=world.clock.now)[0] is True
+    fence, fence_now = _fence(world, conn, mixed, authority)
+    assert fence_now(conn) != fence
+    fence, fence_now = _fence(world, conn, {**row, "spec_hash": "c" * 64}, authority)
+    assert fence_now(conn) != fence
+
+
+def test_a_closed_bar_revoke_seq_that_is_no_integer_refuses(world, tmp_path):
+    # behaviour: a closed bar's revoke_seq reaches agent_link_arms as stored; a REAL is never truncated into an
+    # integer that passes, so the check is STALE
+    create(world, 1)
+    conn, row = _occurrence(tmp_path, world)
+    conn.execute("INSERT INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar, revoke_seq, closed_at)"
+                 " VALUES ('bar-1', ?, 't', 0, 0.5, 't')", (AGENT,))
+    authority = AgentAuthority(world.root)
+    authority.refresh()
+    fence, fence_now = _fence(world, conn, row, authority)
+    assert fence_now(conn) != fence
+
+
+def test_null_launch_columns_are_never_launched(world, tmp_path):
+    # behaviour: a mapping whose link columns are NULL raises, never coerced to the string "None"
+    create(world, 1)
+    _, row = _occurrence(tmp_path, world)
+    authority = AgentAuthority(world.root)
+    for column in ("link_id", "link_incarnation"):
+        with pytest.raises(AgentAuthorityError):
+            agent_fence({**row, column: None}, authority=authority, store_id=STORE)

@@ -36,6 +36,9 @@ PEEK_BUSY_TIMEOUT = 0.05
 _REFRESH_BUSY_TIMEOUT = 2.0
 
 _LAUNCHED = "launched"
+# the columns the claim wrote (agent_occurrences_identity) or the launch wrote once (..._launch_immutable); the fence from
+# the caller's copy, fence_now from the stored row, so the two agree only when the copy is the row's launch
+_LAUNCH_COLUMNS = ("agent_id", "link_id", "link_incarnation", "spec_hash", "binding_id", "launch_epoch")
 
 
 class AgentAuthorityError(Exception):
@@ -91,6 +94,8 @@ class AgentAuthority:
 
     def refresh(self) -> _auth.AuthoritySnapshot:
         """Replay and cache. A failed replay raises and leaves nothing cached, so the next peek refuses."""
+        # L3 r1, left: the replay's own error (sqlite3, AnchorError, ...) propagates unwrapped, a raise either way;
+        # concurrent refreshes may publish out of order or refuse peeks mid-replay, which fails closed (UNCLASSIFIED).
         self._state = None
         state = self.replay()
         self._state = state
@@ -112,9 +117,7 @@ class AgentAuthority:
         path = _auth.anchor_path(self._root)
         try:
             anchor = _auth.read_anchor(path)
-            if anchor is not None and anchor.store_id == state.store_id and state.seq < anchor.seq:
-                raise AgentCoverMoved("the anchor is past the held replay")
-            _auth.check_anchor(state, anchor, path=path)
+            _auth.check_anchor(state, anchor, path=path)   # an anchor past the held replay raises here
             head = self._head()
             if head != (state.seq, state.head_hash):
                 raise AgentCoverMoved("the log head moved")
@@ -129,9 +132,10 @@ class AgentAuthority:
 
     def incarnation(self, link_id: str) -> str | None:
         """The held replay's incarnation of ``link_id`` (None: no such link there). Raises if nothing is held."""
-        if self._state is None:
+        state = self._state     # read once: a concurrent refresh clears it
+        if state is None:
             raise AgentCoverMoved("no verified replay is held")
-        return _auth.agent_link_incarnation(self._state, link_id)
+        return _auth.agent_link_incarnation(state, link_id)
 
     def peek(self, link_id: str, *, agent_id: str, store_id: str, now: datetime,
              closed_bar_revoke_seq: int = 0) -> tuple[bool, str | None]:
@@ -165,45 +169,51 @@ def _digest(fields: Mapping[str, object]) -> str:
                                      ensure_ascii=False).encode()).hexdigest()
 
 
+# L3 r1, left (each fails closed, none reachable to a pass): state is pinned to "launched" on purpose (launched goes
+# only to the terminal done/failed/stopped, and no effect fires after); an absent anchor is check_anchor's first-use
+# contract, shared with AuthorityCoverage; a close() that raises in replay/_head can only replace one raise with
+# another; a malformed grant or key in peek, or an unserialisable digest field, raises out of fence_now (a refusal).
 def agent_fence(occurrence: Mapping[str, object], *, authority: AgentAuthority, store_id: str,
                 now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
                 ) -> tuple[str, Callable[[sqlite3.Connection], str]]:
     """``(fence, fence_now)`` for a launched ``occurrence`` (a mapping carrying ``occurrence_id``, ``agent_id``,
     ``link_id``, ``link_incarnation``, ``spec_hash``, ``binding_id`` and ``launch_epoch``).
 
-    ``fence`` is built from those immutable launch columns alone, with state ``launched``, no bar and a live link.
-    ``fence_now(conn)`` reads the occurrence's epoch and state and the agent's bar on ``conn`` (the effect's own
-    transaction) and liveness by :meth:`AgentAuthority.peek`; it raises :class:`AgentCoverMoved` when the peek does,
-    and :class:`AgentAuthorityError` for an occurrence or bar it cannot read, so a check that cannot complete refuses."""
+    ``fence`` is built from those launch columns alone, with state ``launched``, no bar and a live link.
+    ``fence_now(conn)`` reads the occurrence's launch columns, epoch and state and the agent's bar on ``conn`` (the
+    effect's own transaction) and liveness by :meth:`AgentAuthority.peek` of the stored link, so the check runs on the
+    row and a mapping that is not that row's launch never matches. It raises :class:`AgentCoverMoved` when the peek
+    does, and :class:`AgentAuthorityError` for an occurrence or bar it cannot read, so a check that cannot complete
+    refuses."""
     try:
-        occurrence_id = str(occurrence["occurrence_id"])
-        agent_id, link_id = str(occurrence["agent_id"]), str(occurrence["link_id"])
-        incarnation = str(occurrence["link_incarnation"])
-        spec_hash, binding_id = str(occurrence["spec_hash"]), str(occurrence["binding_id"])
-        launch_epoch = occurrence["launch_epoch"]
+        occurrence_id = occurrence["occurrence_id"]
+        launch = {column: occurrence[column] for column in _LAUNCH_COLUMNS}
     except KeyError as exc:
         raise AgentAuthorityError(f"the occurrence lacks {exc.args[0]!r}: it is not a launched one") from exc
-    if type(launch_epoch) is not int or not link_id or not incarnation:
+    if type(occurrence_id) is not str or type(launch["launch_epoch"]) is not int \
+            or any(type(launch[c]) is not str or not launch[c] for c in _LAUNCH_COLUMNS if c != "launch_epoch"):
         raise AgentAuthorityError("the occurrence carries no launch epoch or link: it was never launched")
-    fixed = {"agent_id": agent_id, "link_id": link_id, "link_incarnation": incarnation, "spec_hash": spec_hash,
-             "binding_id": binding_id}
-    fence = _digest({**fixed, "epoch": launch_epoch, "state": _LAUNCHED, "barred": False, "live": True})
+    fence = _digest({**launch, "live_incarnation": launch["link_incarnation"], "epoch": launch["launch_epoch"],
+                     "state": _LAUNCHED, "barred": False, "live": True})
 
     def fence_now(conn: sqlite3.Connection) -> str:
         try:
-            row = conn.execute("SELECT epoch, state FROM agent_occurrences WHERE occurrence_id = ?",
-                               (occurrence_id,)).fetchone()
+            row = conn.execute(f"SELECT {', '.join(_LAUNCH_COLUMNS)}, epoch, state FROM agent_occurrences"
+                               " WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
+            if row is None:
+                raise AgentAuthorityError("the occurrence is not in the store")
+            stored = dict(zip(_LAUNCH_COLUMNS, row))
             barred = conn.execute("SELECT 1 FROM agent_bars WHERE agent_id = ? AND closed_at IS NULL",
-                                  (agent_id,)).fetchone() is not None
+                                  (stored["agent_id"],)).fetchone() is not None
             closed = conn.execute("SELECT MAX(revoke_seq) FROM agent_bars WHERE agent_id = ? AND closed_at IS NOT NULL",
-                                  (agent_id,)).fetchone()[0]
+                                  (stored["agent_id"],)).fetchone()[0]
         except sqlite3.Error as exc:
             raise AgentAuthorityError(f"the occurrence or its bar cannot be read: {type(exc).__name__}") from exc
-        if row is None:
-            raise AgentAuthorityError("the occurrence is not in the store")
-        live, current = authority.peek(link_id, agent_id=agent_id, store_id=store_id, now=now(),
-                                       closed_bar_revoke_seq=0 if closed is None else int(closed))
-        return _digest({**fixed, "link_incarnation": current or "", "epoch": row[0], "state": row[1],
-                        "barred": barred, "live": live})
+        # the bar's revoke_seq goes to agent_link_arms as stored (no int()): a value that is no integer at or
+        # above zero is its False, never a truncation that passes. An unlaunched row (NULL link) peeks False.
+        live, current = authority.peek(stored["link_id"], agent_id=stored["agent_id"], store_id=store_id, now=now(),
+                                       closed_bar_revoke_seq=0 if closed is None else closed)
+        return _digest({**stored, "live_incarnation": current or "", "epoch": row[len(_LAUNCH_COLUMNS)],
+                        "state": row[len(_LAUNCH_COLUMNS) + 1], "barred": barred, "live": live})
 
     return fence, fence_now
