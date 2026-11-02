@@ -88,13 +88,16 @@ def _day(now: datetime | None = None) -> str:
     return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
 
 
+OBSERVE_DIR = "observe"  # named in firing.confinement.LEVAIN_HOME_STATE_DIRS (a test ties the two)
+
+
 def home_dir() -> Path:
     h = os.environ.get("LEVAIN_HOME")
     return Path(h).expanduser() if h else Path.home() / ".levain"
 
 
 def counts_path(home: Path | None = None, day: str | None = None) -> Path:
-    return (home or home_dir()) / "observe" / f"counts-{day or _day()}.json"
+    return (home or home_dir()) / OBSERVE_DIR / f"counts-{day or _day()}.json"
 
 
 def record(path: Path, event: Any) -> None:

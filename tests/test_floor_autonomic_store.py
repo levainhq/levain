@@ -293,6 +293,7 @@ def test_every_levain_home_reader_is_named_for_the_fallback():
     from levain.consent.queue import default_queue_dir
     from levain.coordinator.launch import default_coordinator_dir
     from levain.firing import ssh_agent
+    from levain.observe import OBSERVE_DIR
     from levain.firing.confinement import GRANTS_DIR, LEVAIN_HOME_STATE_DIRS
 
     pkg = Path(levain.__file__).parent
@@ -304,9 +305,9 @@ def test_every_levain_home_reader_is_named_for_the_fallback():
     # the home path itself into the launchd unit's environment and builds no directory under it, so it adds no name.
     assert reads == {"autonomic/db.py": 1, "chat_egress/srt_pin.py": 1, "cli.py": 1, "cockpit/custody.py": 1,
                      "consent/queue.py": 1, "coordinator/launch.py": 1, "firing/confinement.py": 2,
-                     "firing/ssh_agent.py": 1}, reads
+                     "firing/ssh_agent.py": 1, "observe.py": 1}, reads
     names = {default_store_dir().name, default_key_dir().name, default_queue_dir().name, GRANTS_DIR,
-             ssh_agent.RUN_DIR, ssh_agent.HOST_KEYS_DIR, default_coordinator_dir().name, default_prefix().name}
+             ssh_agent.RUN_DIR, ssh_agent.HOST_KEYS_DIR, default_coordinator_dir().name, default_prefix().name, OBSERVE_DIR}
     assert names == set(LEVAIN_HOME_STATE_DIRS)
 
 
