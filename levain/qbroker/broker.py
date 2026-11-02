@@ -129,17 +129,20 @@ from levain.consent import limits as consent_limits
 from levain.consent.adapters.rules import MAX_HOLD
 from levain.consent.policy import AGENT_CONFIG_TIER
 from levain.consent.record import ExternalGateRequest
+from levain.contracts.canon import canonical_bytes
 from levain.qbroker import grants, wire
 from levain.qbroker.limits import LimitsUnavailable
 from levain.qbroker.receipts import Receipts
 from levain.qbroker.seam import answer_refusal, grant_allow_refusal, request_of
 from levain.qbroker.signers import SignersSnapshot, SignersSource
-from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, valid_request_id
+from levain.qbroker.store import (ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, _read_untrusted, _parsed,
+                                  replace_file, valid_request_id)
 from levain.slot import limits_doc
 
 __all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
            "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
-           "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_KEYS", "RUN_OPTIONAL_KEYS", "SLOT_CLASS", "Broker", "Resolved",
+           "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_CALLS_KIND", "RUN_DEADLINE_KIND", "RUN_KEYS", "RUN_OPTIONAL_KEYS",
+           "RUN_STATE_FORMAT", "run_state_path", "SLOT_CLASS", "Broker", "Resolved",
            "Resolver", "resolved_from", "slot_ref", "stored_request"]
 
 log = logging.getLogger("levain.qbroker")
@@ -149,7 +152,15 @@ RUN_KEYS = frozenset({"run_id", "job_id", "run_index", "contract_digest", "model
 # CONTRACT §26 S1-c: repo_root = STORE/live/<session>/repo, the run's worktree, DERIVED by CONTROL (never the hook's
 # cwd). Optional on the wire: a run without it resolves and files as before, and only the grant needs it (absent,
 # every call queues)
-RUN_OPTIONAL_KEYS = frozenset({"repo_root"})
+#
+# P7-A3 (subscription route, section 3.2): max_calls (a whole number >= 1) and deadline (absolute whole epoch seconds on
+# CONTROL's clock) are the run's own caps, carried here so GATE can hold them; either may be absent
+RUN_OPTIONAL_KEYS = frozenset({"repo_root", "max_calls", "deadline"})
+# the two over-limit kinds GATE answers for a run's own caps (broker_client names them with their stop text)
+RUN_CALLS_KIND = "run-calls"
+RUN_DEADLINE_KIND = "run-deadline"
+RUN_STATE_FORMAT = "levain-queue-run-state/1"
+_RUN_STATE_PREFIX = "runstate-"
 # requests one run (a dispatch run's run_id) or one interactive session may file. A hook files one request per
 # permission prompt it does not settle itself; past this many, the agent is looping on a gate, and every row is a
 # file the operator's cockpit lists, so the run is refused rather than allowed to bury the queue.
@@ -258,11 +269,27 @@ def resolved_from(answer: Any) -> Resolved | None:
         if not isinstance(run, Mapping) or not RUN_KEYS <= set(run) <= RUN_KEYS | RUN_OPTIONAL_KEYS \
                 or not isinstance(run["run_id"], str) or not run["run_id"] \
                 or not isinstance(run["contract_digest"], str) or _DIGEST.fullmatch(run["contract_digest"]) is None \
-                or ("repo_root" in run and not _root_ok(run["repo_root"])):
+                or ("repo_root" in run and not _root_ok(run["repo_root"])) \
+                or ("max_calls" in run and not _calls_ok(run["max_calls"])) \
+                or ("deadline" in run and not _deadline_ok(run["deadline"])):
             return None
     elif run is not None:
         return None
     return Resolved(session=session, kind=kind, run=None if run is None else dict(run))
+
+
+def _calls_ok(v: Any) -> bool:
+    return type(v) is int and 1 <= v <= limits_doc.SLOT_RANGE["calls"][1]
+
+
+def _deadline_ok(v: Any) -> bool:
+    # whole epoch seconds: the wire and the state file are canonical JSON, which carries no float
+    return type(v) is int and 0 < v <= 10**12
+
+
+def run_state_path(requests: Path, run_id: str) -> Path:
+    """Where the broker publishes a run's state for the operator (``requests/`` is the operator's read surface)."""
+    return requests / f"{_RUN_STATE_PREFIX}{hashlib.sha256(run_id.encode('utf-8')).hexdigest()[:32]}.json"
 
 
 def _root_ok(root: Any) -> bool:
@@ -305,6 +332,18 @@ def cap_digest(cap: Any) -> str | None:
     if not isinstance(cap, str) or not cap or len(cap) > CAP_MAX:
         return None
     return "sha256:" + hashlib.sha256(cap.encode("utf-8")).hexdigest()
+
+
+def _read_run_state(path: Path) -> dict[str, Any] | None:
+    """The published run state at ``path``, ``None`` when there is none or it is not one."""
+    try:
+        data = _read_untrusted(path)
+        doc = None if data is None else _parsed(data)
+    except (ValueError, OSError):
+        return None
+    if doc is None or doc.get("format") != RUN_STATE_FORMAT or type(doc.get("calls")) is not int:
+        return None
+    return doc
 
 
 def _quota_key(session: str, run: Mapping[str, Any] | None) -> str:
@@ -770,6 +809,11 @@ class Broker:
         halting = self._halted_on(who.session)
         if halting is not None:
             return wire.answer(rid, gate="halted", request_id=halting)
+        # SEAM (P7-2): the agent fence step runs HERE, before the run's count: a STALE session answers `fenced` and
+        # counts nothing (P7-A subscription route, section 3.2 "Fence-aware, restart-safe").
+        over = self._gate_run(rid, who.run, agent, tool_name, digest, tid)
+        if over is not None:
+            return over
         if self._limits is None:
             return wire.answer(rid, gate="go")
         root = consent_limits.session_root(who.session)
@@ -806,6 +850,64 @@ class Broker:
         if verdict.state != "ok":       # fail_deny, and anything else: a slot has no fail-open (S-a r1 MED 1)
             return wire.answer(rid, gate="limits-failed", reason=str(verdict.reason or "the limits store failed")[:512])
         return wire.answer(rid, gate="go")
+
+    def _gate_run(self, rid: int, run: Mapping[str, Any] | None, agent: str, tool_name: str, digest: str,
+                  tid: str | None) -> dict[str, Any] | None:
+        """The run's own caps (P7-A3): ``None`` to go on to the operator-global limits, else GATE's answer.
+
+        A run CONTROL resolves with ``max_calls`` / ``deadline`` is counted under ``run:<run_id>`` (the resolved id,
+        as :func:`_quota_key`) in the same ``limits.db``, so a restart keeps the count. Past ``deadline`` the call is
+        ``over-limit`` kind :data:`RUN_DEADLINE_KIND` and counts nothing; a count past ``max_calls`` is kind
+        :data:`RUN_CALLS_KIND` and LATCHES as Q13's crossing does (the cap is fixed, so the latch stays). This step
+        runs before the operator-global count, so a call the global limits then deny is still one of the run's:
+        the run's cap is a bound, and a bound errs toward counting. The state is published for the operator
+        (:func:`run_state_path`) after every verdict; a publish that fails answers ``limits-failed``."""
+        if run is None or ("max_calls" not in run and "deadline" not in run):
+            return None
+        key = _quota_key("", run)
+        if consent_limits.SUBAGENT_MARK in key:       # session_root would cut the key: another run's counter
+            return wire.answer(rid, gate="limits-failed", reason="the run id cannot be a counter key")
+        qdir = self._limits_dir()
+        if qdir is None:
+            return wire.answer(rid, gate="limits-failed", reason=LIMITS_DIR_FAILED)
+        cap, deadline = run.get("max_calls"), run.get("deadline")
+        path = run_state_path(self._store.requests, run["run_id"])
+        with self._mutex:
+            lock = self._root_locks.setdefault(key, threading.Lock())
+        with lock:
+            now = self._clock().timestamp()
+            if deadline is not None and now >= deadline:
+                prior = _read_run_state(path)
+                calls = prior.get("calls", 0) if prior is not None else 0
+                return self._publish_run(rid, path, run, calls, RUN_DEADLINE_KIND)
+            lim = {k: float("inf") for k in limits_doc.KINDS}
+            if cap is not None:
+                lim["calls"] = float(cap)
+            event = {"tool_use_id": tid} if isinstance(tid, str) else {}
+            verdict = consent_limits.count_call(qdir, agent, key, event, tool_name=tool_name, tool_input=digest,
+                                                limits=lim, count_crossed=False, one_agent=True, now=now)
+            if verdict.state == "crossed" and verdict.kind == "calls":
+                # the crossing call is not counted (count_crossed=False): the verdict's count is the one it crossed
+                # AT, so the calls made are the cap
+                return self._publish_run(rid, path, run, int(cap), RUN_CALLS_KIND)
+            if verdict.state != "ok":
+                return wire.answer(rid, gate="limits-failed",
+                                   reason=str(verdict.reason or "the run's limits store failed")[:512])
+            failed = self._publish_run(rid, path, run, int(verdict.counts["calls"]), None)
+            return failed if failed.get("gate") == "limits-failed" else None
+
+    def _publish_run(self, rid: int, path: Path, run: Mapping[str, Any], calls: int, kind: str | None
+                     ) -> dict[str, Any]:
+        """Write the run's state beside the request rows and answer for ``kind`` (``None``: a go-on that is only
+        returned when the write failed)."""
+        doc = {"format": RUN_STATE_FORMAT, "run_id": run["run_id"], "calls": calls, "cap": run.get("max_calls"),
+               "deadline": run.get("deadline"), "tripped": kind}
+        try:
+            replace_file(path, canonical_bytes(doc))
+        except Exception:   # noqa: BLE001 - a state the operator cannot read is a slot with no brake it can see
+            log.exception("qbroker: the run state %s could not be written", path)
+            return wire.answer(rid, gate="limits-failed", reason="the run's state could not be published")
+        return wire.answer(rid, gate="over-limit", kind=kind) if kind is not None else {"gate": "go"}
 
     def _limits_dir(self) -> Path | None:
         """Where the counter keeps ``limits.db``: :data:`LIMITS_DIR` under ``requests/`` (the broker's own directory;
