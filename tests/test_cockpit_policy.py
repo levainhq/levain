@@ -234,7 +234,7 @@ def test_the_block_shows_when_the_device_list_is_gone_and_the_policy_is_not(rig,
             {"eval": "(s=>s && !s.hidden)(document.getElementById('presence-settings'))"},
             {"eval": "[...document.querySelectorAll('.dev-panel')].map(p=>p.hidden)"},
         ])
-    assert out["values"][1] is True and out["values"][2] == [True, False, False]   # the settings section shows; the pairing panel does not, the tap tokens and Notifications do
+    assert out["values"][1] is True and out["values"][2] == [True, True, False, False]   # the settings section shows; the pairing panel does not, nor Notify tokens (its own read is not due yet), the tap tokens and Notifications do
 
 
 @needs_browser

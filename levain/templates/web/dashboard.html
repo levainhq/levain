@@ -51,11 +51,12 @@
         </div>
       </div>
     </header>
-    <!-- The narrow page's views, one jump each (drawn only under the stylesheet's 720px break; dashboard_core.js wires the clicks). -->
+    <!-- The page's views, one jump each, at every width (dashboard_core.js wires the clicks). Notifications opens the notification
+         center; its pill is the unread count, Needs you carries the waiting count. -->
     <nav class="ck-phonetabs" id="ck-phonetabs" aria-label="Views">
-      <button type="button" data-phone-jump="needs">Needs you</button>
+      <button type="button" data-phone-jump="needs">Needs you<span class="ck-tabcount ck-needs-count" data-nc-needs hidden></span></button>
       <button type="button" data-phone-jump="board">Board</button>
-      <button type="button" data-phone-jump="notes">Notifications</button>
+      <button type="button" data-phone-jump="notifications" aria-haspopup="dialog">Notifications<span class="ck-tabcount ck-pill" data-nc-unread hidden></span></button>
       <button type="button" data-phone-jump="grants">Grants</button>
       <button type="button" data-phone-jump="drop">Drop</button>
     </nav>

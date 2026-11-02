@@ -4100,6 +4100,7 @@
   }
   function renderExternalBody(entry, view, opts) {
     const p = panel(entry);
+    if (entry.id === "notifications") return ncPanel(p);   // the one notification list, drawn compact (S4.2)
     const data = (view.extra_panels || {})[entry.id] || {};
     if (data.error) {
       p.appendChild(el("p", "err", "unavailable — " + data.error));
@@ -6173,6 +6174,8 @@
     if (!host) return;
     const all = needsItems(((view.extra_panels || {}).decisions || {}).lines);
     const items = needsWaiting(all), settled = all.filter((it) => it.answered);
+    ncNeedsCount(items.length);               // the strip's Needs you count and the app-icon badge: the waiting items, nothing else
+    syncAppBadge(view, items.length);
     if (!all.length) { clearNeeds(host); return; }
     // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
     // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits
@@ -8044,6 +8047,7 @@
   }
   function phoneJump(which, opener) {
     const run = ++phoneJumpRun;
+    if (which === "notifications") { openNotifyCenter(opener); return; }   // the notification center's focus view (S4.2)
     if (which === "drop") {       // the drop is a card under the Needs-you row: the tab scrolls to its box, no view to open
       const host = document.getElementById("ck-drop");
       if (!host) return;
@@ -8078,6 +8082,571 @@
     if (b) phoneJump(b.dataset.phoneJump, b);
   });
   for (const type of ["touchstart", "wheel"]) document.addEventListener(type, () => { phoneJumpRun++; }, { passive: true, capture: true });
+
+  // ====================================================================== THE NOTIFICATION CENTER (S4.2) ====
+  // One list of Levain's pings and the notices posted at the operator (GET /webpush/center, levain/webpush/center.py), drawn
+  // three ways from ONE store: the strip's unread pill, the page's compact panel (the five newest), and the focus view (list and
+  // detail). The page never holds a mark the server did not confirm: a write is awaited, then the list is read again; a failed
+  // write says what did not land and the list is the server's. Every field is set through el()/textContent or the markdown
+  // renderer's DOM nodes, never innerHTML: this page shares a document with the write token.
+  const NC_PATH = "/webpush/center", NC_POLL_MS = 30000, NC_TIMEOUT_MS = 15000, NC_PANEL_ROWS = 5, NC_SWIPE_PX = 96;
+  const NC_ID = /^[pn][0-9]{1,19}$/;
+  const nc = { sig: "", items: [], unread: 0, total: 0, needs: 0, next: null, status: "idle", goodAt: 0, readId: 0, busy: 0 };
+  // status: idle (never read) | ok | error (never read, last try failed) | noauth (no/refused token) | absent (this server has no center)
+  const ncUi = { sel: null, pinned: null, filter: "", banner: null, menu: false, detail: false, gone: "", more: false };
+  let ncRoot = null, ncDeepPending = null;
+  const ncPanels = new Set();
+
+  function ncApi(method, path, body) {
+    const t = window.LevainCockpitTransport;
+    const headers = t && typeof t.headers === "function" ? Object.assign({}, t.headers()) : {};
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ status: 403, data: {}, notoken: true });
+    if (body !== undefined) headers["Content-Type"] = "application/json";
+    const ctl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = ctl ? window.setTimeout(() => ctl.abort(), NC_TIMEOUT_MS) : 0;
+    return fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: "no-store", signal: ctl ? ctl.signal : undefined })
+      .then((res) => res.json().then((d) => ({ status: res.status, data: d && typeof d === "object" ? d : {} }), () => ({ status: res.status, data: {} })))
+      .catch(() => ({ status: 0, data: {} }))
+      .finally(() => { if (timer) window.clearTimeout(timer); });
+  }
+  const ncFind = (id) => nc.items.find((x) => x.id === id) || (ncUi.pinned && ncUi.pinned.id === id ? ncUi.pinned : null);
+  const ncClock = (ms) => new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  function ncWhen(iso, full) {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return "";
+    const d = new Date(t), now = new Date();
+    const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    if (full) return time + " · " + d.toLocaleDateString([], { month: "short", day: "numeric" });
+    if (d.toDateString() === now.toDateString()) return time;
+    return (now - d) / 86400000 < 6 ? d.toLocaleDateString([], { weekday: "short" }) : d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
+  function ncDelivery(dv) {
+    if (!dv || typeof dv !== "object") return "";
+    if (typeof dv.held === "string" && dv.held) return "Held: " + dv.held;
+    const pushed = Array.isArray(dv.pushed) ? dv.pushed.map(String) : [], failed = Array.isArray(dv.failed) ? dv.failed.map(String) : [];
+    let s = pushed.length ? "Pushed to " + pushed.join(", ") : failed.length ? "Push did not reach " + failed.join(", ") : "Push on its way";
+    if (pushed.length && failed.length) s += " · did not reach " + failed.join(", ");
+    if (pushed.length) s += dv.opened_at ? " · opened " + ncWhen(dv.opened_at, false) : " · not opened";
+    return s;
+  }
+
+  // ---- the read -------------------------------------------------------------------------------------------------------
+  // Only the newest read paints (a write bumps the id, so a read begun before it is dropped). A failed read keeps the list and
+  // says so; a list never read says that instead.
+  async function ncRead(force) {
+    if (nc.busy && !force) return false;
+    const mine = ++nc.readId;
+    const res = await ncApi("GET", NC_PATH + "?limit=50");
+    if (mine !== nc.readId) return false;
+    const d = res.data || {};
+    if (res.status === 200 && Array.isArray(d.items)) {
+      // the same list again repaints nothing (a pulse never closes a swiped row or drops the reader's place)
+      const sig = JSON.stringify([d.items, d.unread, d.total, d.needs_count, d.next_before]);
+      const same = sig === nc.sig && nc.status === "ok" && !ncUi.banner && !ncDeepPending;
+      nc.sig = sig; nc.goodAt = Date.now();
+      if (same) return true;
+      nc.items = d.items; nc.unread = d.unread | 0; nc.total = d.total | 0; nc.needs = d.needs_count | 0; nc.next = d.next_before || null;
+      nc.status = "ok"; nc.goodAt = Date.now();
+      if (ncUi.banner && ncUi.banner.kind === "read") ncUi.banner = null;
+      if (ncUi.sel && !ncFind(ncUi.sel) && !ncDeepPending) { ncUi.sel = null; ncUi.detail = false; }
+    } else if (res.status === 404 && nc.status !== "ok") {
+      nc.status = "absent";
+    } else {
+      if (res.notoken || res.status === 403) { if (nc.status !== "ok") nc.status = "noauth"; }
+      else if (nc.status !== "ok") nc.status = "error";
+      if (nc.status === "ok" || nc.goodAt) ncUi.banner = { kind: "read", retry: true, text: "Couldn’t refresh. Showing the list as of " + ncClock(nc.goodAt || Date.now()) + "." };
+    }
+    ncPaint();
+    if (nc.status === "ok" && ncDeepPending) ncDeepTry();
+    return nc.status === "ok";
+  }
+  async function ncMore() {
+    if (!nc.next || ncUi.more) return;
+    ncUi.more = true; ncPaint();
+    const res = await ncApi("GET", NC_PATH + "?limit=50&before=" + encodeURIComponent(nc.next));
+    ncUi.more = false;
+    if (res.status === 200 && Array.isArray(res.data.items)) {
+      const have = new Set(nc.items.map((x) => x.id));
+      nc.items = nc.items.concat(res.data.items.filter((x) => !have.has(x.id)));
+      nc.next = res.data.next_before || null;
+    } else ncUi.banner = { kind: "write", retry: false, text: "Older notifications didn’t load. The list is as it was." };
+    ncPaint();
+  }
+
+  // ---- the writes (each awaited; the list is read again after, so the page shows what the server holds) ----------------
+  async function ncWrite(path, body, failWords, quiet404) {
+    nc.busy++; nc.readId++; nc.sig = "";   // the page's list is about to differ from the server's: the next read always paints
+    // a failure's banner stays until it is dismissed or the next write starts: a write that lands never wipes another's failure
+    if (ncUi.banner && ncUi.banner.kind === "write") ncUi.banner = null;
+    let res;
+    try { res = await ncApi("POST", path, body); } finally { nc.busy--; }
+    const ok = (res.status === 200 && res.data.ok === true) || (quiet404 && res.status === 404);
+    if (ok) { if (typeof res.data.unread === "number") nc.unread = res.data.unread; }
+    else ncUi.banner = { kind: "write", retry: false, text: failWords + " didn’t reach Levain. Nothing was changed." };
+    await ncRead(true);
+    return ok;
+  }
+  async function ncSetRead(id, read) {
+    const ok = await ncWrite(NC_PATH + "/read", { id, read }, read ? "Marking it read" : "Marking it unread", false);
+    if (ok && ncUi.pinned && ncUi.pinned.id === id) { ncUi.pinned = Object.assign({}, ncUi.pinned, { read }); ncPaint(); }
+    return ok;
+  }
+  const ncMarkAll = () => ncWrite(NC_PATH + "/read-all", {}, "Mark all read", false);
+  async function ncClear() {
+    ncUi.menu = false;
+    const ok = await ncWrite(NC_PATH + "/clear", {}, "Clear all", false);
+    if (ok) { ncUi.sel = null; ncUi.pinned = null; ncUi.detail = false; ncPaint(); }
+  }
+  async function ncDelete(id) {
+    const it = ncFind(id);
+    // the row leaves at once; a failure puts the server's list back (ncWrite reads again) and names what did not land
+    nc.items = nc.items.filter((x) => x.id !== id); nc.total = Math.max(0, nc.total - 1);
+    if (it && !it.read) nc.unread = Math.max(0, nc.unread - 1);
+    if (ncUi.sel === id) { ncUi.sel = null; ncUi.detail = false; }
+    if (ncUi.pinned && ncUi.pinned.id === id) ncUi.pinned = null;
+    ncPaint();
+    const ok = await ncWrite(NC_PATH + "/delete", { id }, "Delete", true);
+    return ok;
+  }
+  function ncSelect(id) {
+    ncUi.sel = id; ncUi.detail = true; ncUi.gone = "";
+    const it = ncFind(id);
+    ncPaint();
+    if (it && !it.read) ncSetRead(id, true);
+  }
+
+  // ---- the deep link: /?view=notifications&n=<id> (a push tap) --------------------------------------------------------
+  async function ncDeepTry() {
+    const id = ncDeepPending;
+    if (!id) return;
+    if (nc.items.some((x) => x.id === id)) { ncDeepPending = null; ncSelect(id); return; }
+    if (nc.status !== "ok") return;           // no list yet (the token may still be on its way): the next read tries again
+    ncDeepPending = null;
+    const res = await ncApi("GET", NC_PATH + "/item?id=" + encodeURIComponent(id));
+    if (res.status === 200 && res.data.item) { ncUi.pinned = res.data.item; ncSelect(id); return; }
+    if (res.status === 404) {
+      ncUi.gone = res.data.error === "gone" && typeof res.data.message === "string" ? res.data.message : res.data.error === "gone" ? "That notification was deleted." : "That notification isn’t here.";
+      ncUi.sel = null; ncUi.detail = false;
+    } else ncUi.banner = { kind: "write", retry: false, text: "Couldn’t open that notification. The list is as it was." };
+    ncPaint();
+  }
+  function ncUrlAsk() {
+    try {
+      const q = new URLSearchParams(window.location.search);
+      if (q.get("view") !== "notifications") return null;
+      const n = q.get("n");
+      q.delete("view"); q.delete("n");
+      const rest = q.toString();
+      window.history.replaceState(null, "", window.location.pathname + (rest ? "?" + rest : "") + window.location.hash);
+      return { id: n && NC_ID.test(n) ? n : null };
+    } catch (_) { return null; }
+  }
+
+  // ---- the markdown and the links ---------------------------------------------------------------------------------------
+  // The page's own renderer (DOM nodes only; raw HTML paints as literal text), then two passes: a bare http(s) URL becomes a link,
+  // and every link is held to the rule: only absolute http/https is live (target _blank, rel noopener noreferrer); any other
+  // scheme, or a relative path, stays its text. A notify-token sender's link shows its full address beside the anchor text, so
+  // the words never hide where it goes (Phill 4a).
+  function ncLinkify(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    const hits = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const host = n.parentNode;
+      if (host && host.closest && host.closest("a, code, pre")) continue;
+      if (/https?:\/\//i.test(n.nodeValue)) hits.push(n);
+    }
+    for (const node of hits) {
+      const text = node.nodeValue, frag = document.createDocumentFragment();
+      let last = 0;
+      text.replace(/\bhttps?:\/\/[^\s<>"'`]+/gi, (m, at) => {
+        const url = m.replace(/[.,;:!?)\]]+$/, "");
+        if (at > last) frag.appendChild(document.createTextNode(text.slice(last, at)));
+        const a = el("a", "md-link", url);
+        a.setAttribute("href", url);
+        frag.appendChild(a);
+        last = at + url.length;
+        return m;
+      });
+      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    }
+  }
+  function ncHarden(root, origin) {
+    for (const a of Array.from(root.querySelectorAll("a"))) {
+      let url = null;
+      try { const u = new URL(a.getAttribute("href") || ""); if (u.protocol === "http:" || u.protocol === "https:") url = u; } catch (_) { /* relative or unreadable: inert */ }
+      if (!url) { a.replaceWith(...Array.from(a.childNodes)); continue; }
+      a.setAttribute("href", url.href);
+      a.setAttribute("target", "_blank");
+      a.setAttribute("rel", "noopener noreferrer");
+      a.classList.add("nc-link");
+      if (origin === "token") {
+        const shown = a.textContent.trim();
+        if (shown !== url.href && shown !== (url.href.replace(/\/$/, ""))) a.after(el("span", "nc-fullurl", " (" + url.href + ")"));
+      }
+    }
+  }
+  function ncBody(md, origin) {
+    const host = el("div", "nc-body");
+    const frag = renderMarkdown(String(md || ""));
+    ncLinkify(frag);
+    ncHarden(frag, origin);
+    host.appendChild(frag);
+    return host;
+  }
+
+  // ---- the row (one component: the panel's compact row and the focus view's full row) ----------------------------------
+  function ncChips(it) {
+    const f = document.createDocumentFragment();
+    f.appendChild(el("span", "nc-chip o-" + (it.origin === "token" || it.origin === "flow" ? it.origin : "levain"), it.source || it.origin || ""));
+    if (it.priority === "urgent" || it.priority === "low") f.appendChild(el("span", "nc-chip p-" + it.priority, it.priority));
+    return f;
+  }
+  function ncSwipe(row, rowin) {
+    let x0 = 0, y0 = 0, horiz = null, live = false;
+    row.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 1) return;
+      x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; horiz = null; live = true;
+      rowin.style.transition = "none";
+    }, { passive: true });
+    row.addEventListener("touchmove", (e) => {
+      if (!live) return;
+      const dx = e.touches[0].clientX - x0, dy = e.touches[0].clientY - y0;
+      if (horiz === null && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) horiz = Math.abs(dx) > Math.abs(dy);
+      if (!horiz) return;
+      const base = row.classList.contains("is-swiped") ? -NC_SWIPE_PX : 0;
+      rowin.style.transform = "translateX(" + Math.max(-NC_SWIPE_PX, Math.min(0, base + dx)) + "px)";
+    }, { passive: true });
+    const end = () => {
+      if (!live) return;
+      live = false;
+      const m = /-?[0-9.]+/.exec(rowin.style.transform || "");
+      const v = m ? parseFloat(m[0]) : null;
+      rowin.style.transition = ""; rowin.style.transform = "";
+      if (v === null) return;
+      const open = v < -NC_SWIPE_PX / 2;
+      if (open) for (const o of row.parentNode.querySelectorAll(".is-swiped")) o.classList.remove("is-swiped");
+      row.classList.toggle("is-swiped", open);
+    };
+    row.addEventListener("touchend", end); row.addEventListener("touchcancel", end);
+  }
+  function ncRow(it, o) {
+    const compact = !!o.compact;
+    const row = el("div", "nc-row " + (it.read ? "is-read" : "is-unread") + (o.selected ? " is-sel" : "") + (compact ? " nc-compact" : ""));
+    row.dataset.id = it.id; row.dataset.origin = it.origin || "";
+    row.setAttribute("role", "listitem");
+    const rowin = el("div", "nc-rowin");
+    let dot;
+    if (compact) { dot = el("span", "nc-dot"); dot.setAttribute("aria-hidden", "true"); dot.appendChild(el("span", "nc-dotmark")); }
+    else {
+      dot = el("button", "nc-dot nc-dot-btn"); dot.type = "button";
+      dot.setAttribute("aria-label", it.read ? "Mark unread" : "Mark read");
+      dot.title = it.read ? "Mark unread" : "Mark read";
+      dot.appendChild(el("span", "nc-dotmark"));
+      dot.addEventListener("click", (ev) => { ev.stopPropagation(); ncSetRead(it.id, !it.read); });
+    }
+    const main = el("button", "nc-main"); main.type = "button";
+    const l1 = el("span", "nc-l1");
+    l1.appendChild(ncChips(it));
+    l1.appendChild(el("span", "nc-time", ncWhen(it.at, false)));
+    main.appendChild(l1);
+    main.appendChild(el("span", "nc-title", it.title || "(no title)"));
+    if (!compact && it.preview) main.appendChild(el("span", "nc-preview", it.preview));
+    if (it.read === false) main.appendChild(el("span", "nc-sr", " (unread)"));
+    main.addEventListener("click", () => {
+      if (row.classList.contains("is-swiped")) { row.classList.remove("is-swiped"); return; }
+      o.onOpen(it, main);
+    });
+    rowin.append(dot, main);
+    if (!compact) {
+      const del = el("button", "nc-del"); del.type = "button";
+      del.setAttribute("aria-label", "Delete"); del.title = "Delete";
+      del.appendChild(ncIcon("trash"));
+      del.addEventListener("click", (ev) => { ev.stopPropagation(); ncDelete(it.id); });
+      rowin.appendChild(del);
+    }
+    row.appendChild(rowin);
+    if (!compact) {
+      const sw = el("button", "nc-swipe-del", "Delete"); sw.type = "button";
+      sw.addEventListener("click", (ev) => { ev.stopPropagation(); ncDelete(it.id); });
+      row.insertBefore(sw, rowin);
+      ncSwipe(row, rowin);
+    }
+    return row;
+  }
+  function ncIcon(name) {
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("width", "14"); svg.setAttribute("height", "14");
+    svg.setAttribute("fill", "none"); svg.setAttribute("stroke", "currentColor"); svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round"); svg.setAttribute("stroke-linejoin", "round"); svg.setAttribute("aria-hidden", "true");
+    const paths = {
+      trash: ["M3 6h18", "M8 6V4h8v2", "M6 6l1 14h10l1-14", "M10 11v6", "M14 11v6"],
+      bellslash: ["M18 8a6 6 0 0 0-9.3-5", "M6 8c0 7-3 9-3 9h14", "M13.7 21a2 2 0 0 1-3.4 0", "M2 2l20 20"],
+      mail: ["M4 5h16v14H4z", "M4 7l8 6 8-6"],
+      back: ["M15 6l-6 6 6 6"],
+    }[name] || [];
+    for (const d of paths) { const p = document.createElementNS(NS, "path"); p.setAttribute("d", d); svg.appendChild(p); }
+    return svg;
+  }
+
+  // ---- the strip -----------------------------------------------------------------------------------------------------
+  function ncStrip() {
+    const u = nc.status === "ok" ? nc.unread : 0;
+    for (const n of document.querySelectorAll("[data-nc-unread]")) {
+      n.hidden = u <= 0; n.textContent = u > 99 ? "99+" : String(u);
+      n.title = u + " unread";
+    }
+  }
+  function ncNeedsCount(n) {
+    for (const c of document.querySelectorAll("[data-nc-needs]")) { c.hidden = !(n > 0); c.textContent = n > 99 ? "99+" : String(n); c.title = n + " waiting on you"; }
+  }
+  // The app-icon badge heals on every Needs-you render (the same count the strip shows; cleared at 0), so a push that carried a
+  // stale number is corrected the moment the page opens. Only when the decisions panel carried its lines: a panel that did not
+  // read says nothing, never a 0. Notices never count. Feature-detected and caught.
+  function syncAppBadge(view, n) {
+    const dec = (view && view.extra_panels || {}).decisions;
+    if (!dec || !Array.isArray(dec.lines)) return;
+    try {
+      const nav = window.navigator;
+      if (!nav) return;
+      const r = n > 0 ? (typeof nav.setAppBadge === "function" ? nav.setAppBadge(n) : null)
+                      : (typeof nav.clearAppBadge === "function" ? nav.clearAppBadge() : null);
+      if (r && typeof r.catch === "function") r.catch(() => {});
+    } catch (_) { /* a badge that cannot be set is not an error the page shows */ }
+  }
+
+  // ---- the panel (the five newest, compact) ----------------------------------------------------------------------------
+  function ncPanel(p) {
+    const h = p.querySelector("h2");
+    if (h) h.textContent = "Notifications";
+    const head = p.querySelector(".phead");
+    const count = el("span", "nc-panel-count"); count.hidden = true;
+    const expand = el("button", "pexpand"); expand.type = "button";
+    expand.title = "focus this panel"; expand.setAttribute("aria-label", "expand Notifications to a focus view");
+    expand.appendChild(el("span", "pexpand-ico", "⤢"));
+    expand.addEventListener("click", () => openNotifyCenter(expand));
+    if (head) {
+      for (const old of head.querySelectorAll(".pexpand, .ck-count")) old.remove();   // the generic panel's own expand opened the old record
+      head.append(count, expand);
+    }
+    const body = el("div", "pbody nc-pbody");
+    p.appendChild(body);
+    p.classList.add("nc-panel");
+    p._ncFill = () => {
+      const u = nc.status === "ok" ? nc.unread : 0;
+      count.hidden = u <= 0; count.textContent = u + " unread";
+      body.replaceChildren();
+      if (nc.status === "idle") { body.appendChild(el("p", "empty", "Loading…")); return; }
+      if (nc.status !== "ok") { body.appendChild(el("p", "empty", ncStateWords())); return; }
+      if (!nc.items.length) { body.appendChild(el("p", "empty", "No notifications")); return; }
+      const list = el("div", "nc-list"); list.setAttribute("role", "list");
+      for (const it of nc.items.slice(0, NC_PANEL_ROWS)) list.appendChild(ncRow(it, { compact: true, onOpen: (x, opener) => openNotifyCenter(opener, x.id) }));
+      body.appendChild(list);
+      const all = el("button", "nc-openall", "Open all (" + nc.total + ")"); all.type = "button";
+      all.addEventListener("click", () => openNotifyCenter(all));
+      body.appendChild(all);
+    };
+    ncPanels.add(p);
+    p._ncFill();
+    return p;
+  }
+  function ncStateWords() {
+    return nc.status === "noauth" ? "Open the cockpit with its token to read notifications."
+      : nc.status === "absent" ? "This cockpit does not serve notifications."
+      : "Couldn’t load notifications.";
+  }
+
+  // ---- the focus view --------------------------------------------------------------------------------------------------
+  function ncMakeRoot() {
+    const root = el("div", "nc-root");
+    const bar = el("div", "nc-bar");
+    bar.appendChild(el("span", "nc-unread"));
+    const fl = el("label", "nc-filterbox");
+    const filter = el("input", "nc-filter"); filter.type = "search"; filter.placeholder = "Filter"; filter.autocomplete = "off";
+    filter.setAttribute("aria-label", "Filter notifications"); filter.value = ncUi.filter;
+    filter.addEventListener("input", () => { ncUi.filter = filter.value; ncFillList(); });
+    fl.appendChild(filter);
+    bar.appendChild(fl);
+    const markall = el("button", "nc-btn nc-markall", "Mark all read"); markall.type = "button";
+    markall.addEventListener("click", () => { ncMarkAll(); });
+    bar.appendChild(markall);
+    const more = el("div", "nc-more");
+    const mb = el("button", "nc-btn nc-morebtn", "⋯"); mb.type = "button";
+    mb.setAttribute("aria-haspopup", "menu"); mb.setAttribute("aria-expanded", "false"); mb.setAttribute("aria-label", "More");
+    mb.addEventListener("click", (ev) => { ev.stopPropagation(); ncUi.menu = !ncUi.menu; ncFillBar(); });
+    const menu = el("div", "nc-menu"); menu.setAttribute("role", "menu"); menu.hidden = true;
+    const mm = el("button", "nc-menuitem nc-menu-mark", "Mark all read"); mm.type = "button"; mm.setAttribute("role", "menuitem");
+    mm.addEventListener("click", () => { ncUi.menu = false; ncFillBar(); ncMarkAll(); });
+    const mc = el("button", "nc-menuitem nc-menu-clear", "Clear all"); mc.type = "button"; mc.setAttribute("role", "menuitem");
+    mc.addEventListener("click", () => { ncClear(); });
+    menu.append(mm, mc);
+    more.append(mb, menu);
+    bar.appendChild(more);
+    root.appendChild(bar);
+    const banner = el("div", "nc-banner"); banner.setAttribute("role", "alert"); banner.hidden = true;
+    root.appendChild(banner);
+    const split = el("div", "nc-split");
+    const lp = el("div", "nc-listpane");
+    const needs = el("button", "nc-needsline"); needs.type = "button"; needs.hidden = true;
+    needs.addEventListener("click", () => { closeModal(); phoneJump("needs", needs); });
+    const list = el("div", "nc-list"); list.setAttribute("role", "list");
+    lp.append(needs, list);
+    const dp = el("div", "nc-detailpane");
+    const back = el("button", "nc-back"); back.type = "button";
+    back.append(ncIcon("back"), document.createTextNode(" Notifications"));
+    back.addEventListener("click", () => { ncUi.detail = false; ncPaint(); });
+    const detail = el("div", "nc-detail");
+    dp.append(back, detail);
+    split.append(lp, dp);
+    root.appendChild(split);
+    root.addEventListener("click", (ev) => { if (ncUi.menu && !ev.target.closest(".nc-more")) { ncUi.menu = false; ncFillBar(); } });
+    root.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && ncUi.menu) { ev.preventDefault(); ev.stopPropagation(); ncUi.menu = false; ncFillBar(); mb.focus(); } });
+    root._nc = { bar, filter, markall, mb, menu, mm, mc, banner, needs, list, detail, split, lp, dp };
+    return root;
+  }
+  const ncLive = () => !!ncRoot && ncRoot.isConnected && !!document.getElementById("levain-modal");
+  function ncFillBar() {
+    if (!ncLive()) return;
+    const r = ncRoot._nc, has = nc.status === "ok" && nc.total > 0, unread = nc.status === "ok" ? nc.unread : 0;
+    const u = r.bar.querySelector(".nc-unread");
+    u.textContent = unread > 0 ? unread + " unread" : ""; u.hidden = unread <= 0;
+    r.markall.hidden = unread <= 0;
+    r.mm.hidden = unread <= 0; r.mc.hidden = !has;
+    r.mb.parentNode.hidden = !has;
+    r.menu.hidden = !(ncUi.menu && has);
+    r.mb.setAttribute("aria-expanded", ncUi.menu && has ? "true" : "false");
+  }
+  function ncFillBanner() {
+    if (!ncLive()) return;
+    const r = ncRoot._nc, b = ncUi.banner;
+    r.banner.replaceChildren(); r.banner.hidden = !b;
+    if (!b) return;
+    r.banner.appendChild(el("span", "nc-banner-t", b.text));
+    if (b.retry) { const rt = el("button", "nc-btn", "Retry"); rt.type = "button"; rt.addEventListener("click", () => { ncRead(true); }); r.banner.appendChild(rt); }
+    const x = el("button", "nc-banner-x", "×"); x.type = "button"; x.setAttribute("aria-label", "Dismiss");
+    x.addEventListener("click", () => { ncUi.banner = null; ncFillBanner(); });
+    r.banner.appendChild(x);
+  }
+  function ncMatches(it) {
+    const q = ncUi.filter.trim().toLowerCase();
+    if (!q) return true;
+    return [it.title, it.preview, it.source].some((s) => typeof s === "string" && s.toLowerCase().indexOf(q) >= 0);
+  }
+  // a repaint of the list keeps the reader's place: the scroll, and focus on the same control of the same row
+  function ncFillList() {
+    if (!ncLive()) return;
+    const r = ncRoot._nc, list = r.list, top = list.scrollTop;
+    const act = document.activeElement, keep = act && list.contains(act) && act.closest(".nc-row") ? [act.closest(".nc-row").dataset.id, act.classList.contains("nc-dot-btn") ? ".nc-dot-btn" : act.classList.contains("nc-del") ? ".nc-del" : ".nc-main"] : null;
+    r.needs.hidden = !(nc.status === "ok" && nc.needs > 0);
+    r.needs.textContent = "Needs you (" + nc.needs + ") · open the cards →";
+    list.replaceChildren();
+    if (nc.status === "idle") {
+      const sp = el("div", "nc-state"); sp.appendChild(el("span", "nc-spin")); sp.appendChild(el("p", null, "Loading…")); list.appendChild(sp);
+    } else if (nc.status !== "ok") {
+      const s = el("div", "nc-state"); s.appendChild(el("p", null, ncStateWords()));
+      if (nc.status === "error") { const rt = el("button", "nc-btn", "Retry"); rt.type = "button"; rt.addEventListener("click", () => { ncRead(true); }); s.appendChild(rt); }
+      list.appendChild(s);
+    } else if (!nc.items.length) {
+      const s = el("div", "nc-state"); s.appendChild(ncIcon("bellslash")); s.appendChild(el("h3", null, "No notifications"));
+      s.appendChild(el("p", null, "Levain’s pings, notices and what your services post land here.")); list.appendChild(s);
+    } else {
+      const shown = nc.items.filter(ncMatches);
+      if (!shown.length) list.appendChild(el("p", "nc-nomatch", "Nothing matches “" + ncUi.filter.trim() + "”."));
+      for (const it of shown) list.appendChild(ncRow(it, { selected: it.id === ncUi.sel, onOpen: (x) => ncSelect(x.id) }));
+      if (nc.next) {
+        const m = el("button", "nc-btn nc-older", ncUi.more ? "Loading…" : "Load older"); m.type = "button"; m.disabled = ncUi.more;
+        m.addEventListener("click", ncMore); list.appendChild(m);
+      }
+    }
+    list.scrollTop = top;
+    if (keep) {
+      const row = Array.prototype.find.call(list.querySelectorAll(".nc-row"), (n) => n.dataset.id === keep[0]);
+      const c = row && row.querySelector(keep[1]);
+      if (c) c.focus({ preventScroll: true });
+    }
+  }
+  function ncFillDetail() {
+    if (!ncLive()) return;
+    const r = ncRoot._nc, d = r.detail;
+    r.split.dataset.detail = ncUi.detail ? "1" : "0";
+    ncRoot.dataset.detail = ncUi.detail ? "1" : "0";
+    const it = ncUi.sel ? ncFind(ncUi.sel) : null;
+    const act = document.activeElement, keepTool = act && d.contains(act) ? act.dataset.tool || null : null;
+    d.replaceChildren();
+    if (ncUi.gone) d.appendChild(el("p", "nc-gone", ncUi.gone));
+    if (!it) { if (!ncUi.gone) d.appendChild(el("p", "nc-none", "Nothing selected.")); return; }
+    const meta = el("div", "nc-dmeta");
+    meta.appendChild(ncChips(it));
+    meta.appendChild(el("span", "nc-time", ncWhen(it.at, true)));
+    d.appendChild(meta);
+    d.appendChild(el("h2", "nc-dtitle", it.title || "(no title)"));
+    const tools = el("div", "nc-tools");
+    const tg = el("button", "nc-btn nc-toggle"); tg.type = "button"; tg.dataset.tool = "toggle";
+    tg.append(ncIcon("mail"), document.createTextNode(it.read ? " Mark unread" : " Mark read"));
+    tg.addEventListener("click", () => { ncSetRead(it.id, !it.read); });
+    const dl = el("button", "nc-btn nc-delete"); dl.type = "button"; dl.dataset.tool = "delete";
+    dl.append(ncIcon("trash"), document.createTextNode(" Delete"));
+    dl.addEventListener("click", () => { ncDelete(it.id); });
+    tools.append(tg, dl);
+    d.appendChild(tools);
+    if (typeof it.image_url === "string" && /^\/[^/\\]/.test(it.image_url)) { const im = el("img", "nc-img"); im.src = it.image_url; im.alt = ""; d.appendChild(im); }
+    if (it.body) d.appendChild(ncBody(it.body, it.origin));
+    if (it.needs_ref && it.needs_open) {
+      const nd = el("div", "nc-needsbox");
+      const go = el("button", "nc-needsgo", "Answer on the Needs-you card →"); go.type = "button";
+      go.addEventListener("click", () => ncGoNeeds(it.needs_ref, go));
+      nd.appendChild(go);
+      nd.appendChild(el("p", "nc-note", "Still waiting on you. Deleting this ping does not close the item."));
+      d.appendChild(nd);
+    }
+    if (it.origin === "token") d.appendChild(el("p", "nc-note nc-tokennote", "Posted by notify token " + (it.token_name || "") + ": every link shows its full address."));
+    const dv = ncDelivery(it.delivery);
+    if (dv) d.appendChild(el("p", "nc-delivery", "Delivery: " + dv));
+    if (keepTool) { const c = d.querySelector('[data-tool="' + keepTool + '"]'); if (c) c.focus({ preventScroll: true }); }
+  }
+  // the card the ping is about: the focus view of that Needs-you item, else the strip (never an answer control here)
+  function ncGoNeeds(ref, opener) {
+    closeModal();
+    try {
+      const lines = ((currentView && currentView.extra_panels || {}).decisions || {}).lines;
+      const it = needsWaiting(needsItems(lines)).find((x) => needsIdOf(x) === ref);
+      if (it) { openNeedsFocus(it, opener && opener.isConnected ? opener : null); return; }
+    } catch (_) { /* fall through to the strip */ }
+    phoneJump("needs", opener);
+  }
+  function ncFillAll() { ncFillBar(); ncFillBanner(); ncFillList(); ncFillDetail(); }
+  function ncPaint() {
+    ncStrip();
+    for (const p of Array.from(ncPanels)) { if (!p.isConnected) ncPanels.delete(p); else p._ncFill(); }
+    ncFillAll();
+  }
+  // opens the focus view; `id` (a panel row, or a push tap's `n`) selects that item and marks it read
+  function openNotifyCenter(opener, id) {
+    ncUi.filter = ""; ncUi.menu = false; ncUi.sel = null; ncUi.pinned = null; ncUi.gone = ""; ncUi.detail = false;
+    if (ncUi.banner && ncUi.banner.kind === "write") ncUi.banner = null;
+    ncDeepPending = id && NC_ID.test(id) ? id : null;
+    modalCustom = { id: "notifications", page: true, title: "Notifications", build: () => { ncRoot = ncMakeRoot(); return ncRoot; } };
+    modalGlance = false;
+    modalKey = "custom:notifications";
+    modalReturnFocus = opener || null;
+    modalEpisodeQuery = "";
+    buildModal(null);
+    ncFillAll();
+    if (ncDeepPending) ncDeepTry();
+    ncRead(true);
+  }
+  function ncBoot() {
+    ncStrip();
+    const ask = ncUrlAsk();
+    window.setTimeout(() => { ncRead(false); }, 600);
+    window.setTimeout(() => { if (nc.status !== "ok") ncRead(false); }, 3000);
+    window.setInterval(() => { if (!document.hidden) ncRead(false); }, NC_POLL_MS);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) ncRead(false); });
+    if (ask) openNotifyCenter(null, ask.id);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", ncBoot); else ncBoot();
+  window.LevainNotifyCenter = { open: openNotifyCenter, state: () => ({ status: nc.status, unread: nc.unread, total: nc.total, needs: nc.needs }), read: ncRead };
 
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };

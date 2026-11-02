@@ -89,7 +89,7 @@
     section.hidden = true;
     const head = el("div", "zone-head");
     head.appendChild(el("div", "zone-title", "Devices"));
-    head.appendChild(el("span", "zone-gloss", "who holds a key to this cockpit"));
+    head.appendChild(el("span", "zone-gloss", "who holds a key to this cockpit, and who may post to you"));
     section.appendChild(head);
     const grid = el("div", "ck-zgrid dev-grid");
     const panel = el("div", "panel k-list dev-panel");
@@ -163,6 +163,7 @@
     body.appendChild(note);
     panel.appendChild(body);
     grid.appendChild(panel);
+    grid.appendChild(buildNotify());   // Notify tokens beside Paired devices (S4.2, C7)
     section.appendChild(grid);
     // the quieter half of Presence and the Notifications policy: one plainly titled section at the foot, in every mode, so the
     // sheet's link always has somewhere to land
@@ -302,6 +303,146 @@
     if (!labelIn.value) labelIn.placeholder = "name the new device, e.g. iPad";
     pings();
     return true;
+  }
+
+  // ---- notify tokens: what lets one of your own services post into Notifications (POST /notify) ------------------------------
+  // Shown wherever the full credential reads the list (the push family's gate lets nothing else through); the new token is
+  // in the mint reply alone, shown once in this node and kept nowhere, and the list never carries a hash. The block joins the
+  // Devices grid beside Paired devices (S4.2, C7) and kicks its own read: a first read once the stored token has arrived, one on a
+  // tab brought back, and a slow pulse.
+  let nfPanel = null, nfList = null, nfNew = null, nfNote = null, nfName = null, nfSource = null, nfUrgent = null, nfBusy = false, nfGen = 0, nfReadId = 0, nfReading = false;
+  function buildNotify() {
+    nfPanel = el("div", "panel k-list dev-panel nf-panel");
+    nfPanel.dataset.modes = "board";
+    nfPanel.hidden = true;
+    const ph = el("div", "phead");
+    ph.appendChild(el("h2", null, "Notify tokens"));
+    nfPanel.appendChild(ph);
+    const body = el("div", "pbody dev-body");
+    body.appendChild(el("p", "dev-note nf-intro", "A notify token lets one of your own services post into Notifications, and nothing else."));
+    nfList = el("div", "dev-list nf-list");
+    body.appendChild(nfList);
+    const form = el("form", "nf-form");
+    nfName = el("input", "dev-label nf-name");
+    nfName.type = "text"; nfName.maxLength = 40; nfName.placeholder = "Name, e.g. Backup";
+    nfName.setAttribute("aria-label", "Name for the new notify token");
+    form.appendChild(nfName);
+    nfSource = el("input", "dev-label nf-source");
+    nfSource.type = "text"; nfSource.maxLength = 24; nfSource.placeholder = "Label, lowercase (optional)";
+    nfSource.setAttribute("aria-label", "Source label for the new notify token");
+    form.appendChild(nfSource);
+    const boxes = el("div", "nf-checks");
+    const l = el("label", "nf-check");
+    nfUrgent = el("input", "nf-urgent"); nfUrgent.type = "checkbox"; nfUrgent.checked = false;
+    l.appendChild(nfUrgent); l.appendChild(document.createTextNode(" urgent: this token can wake you through sleep"));
+    boxes.appendChild(l);
+    form.appendChild(boxes);
+    const go = el("button", "dev-btn nf-mint", "Create notify token");
+    go.type = "submit";
+    form.appendChild(go);
+    form.addEventListener("submit", (e) => { e.preventDefault(); createNotify(); });
+    body.appendChild(form);
+    nfNew = el("div", "dev-link nf-new"); nfNew.hidden = true;
+    body.appendChild(nfNew);
+    nfNote = el("p", "dev-note nf-note"); nfNote.hidden = true;
+    body.appendChild(nfNote);
+    nfPanel.appendChild(body);
+    setTimeout(readNotify, 2500);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) readNotify(); });
+    setInterval(() => { if (!document.hidden) readNotify(); }, 30000);
+    return nfPanel;
+  }
+  function nfShow(on) { nfPanel.hidden = !on; if (on && section) section.hidden = false; }
+  function nfSay(msg) { nfNote.textContent = msg; nfNote.hidden = !msg; }
+  function paintNotify(tokens) {
+    nfList.replaceChildren();
+    if (!tokens.length) { nfList.appendChild(el("p", "dev-none", "No notify tokens yet.")); return; }
+    for (const t of tokens) {
+      const row = el("div", "dev-row nf-row");
+      row.dataset.name = t.name;
+      const main = el("div", "dev-main");
+      main.appendChild(el("div", "dev-name", t.name + (t.source && t.source !== t.name ? " (" + t.source + ")" : "")));
+      main.appendChild(el("div", "dev-meta", (t.urgent ? "May wake you through sleep" : "Normal and low only") + " · "
+        + t.rate_per_min + "/min, " + t.rate_per_day + "/day · last used " + when(t.last_used)));
+      row.appendChild(main);
+      const rv = el("button", "dev-btn nf-revoke", "Revoke");
+      rv.type = "button";
+      rv.addEventListener("click", () => revokeNotify(t.name));
+      row.appendChild(rv);
+      nfList.appendChild(row);
+    }
+  }
+  async function readNotify() {
+    if (nfBusy || nfReading) return;
+    if (!token()) { nfShow(false); return; }
+    const startedAt = nfGen, mine = ++nfReadId;     // a read begun before a mutation never paints over it
+    nfReading = true;
+    try {
+      const res = await api("GET", "/webpush/notify/tokens", undefined, READ_TIMEOUT_MS);
+      if (startedAt !== nfGen || mine !== nfReadId) return;
+      if (res.status === 200 && res.data && Array.isArray(res.data.tokens)) { paintNotify(res.data.tokens); nfShow(true); }
+      else if (res.status === 403 || res.status === 404) nfShow(false);
+    } catch (_) { /* the next pulse tries again */ }
+    finally { if (mine === nfReadId) nfReading = false; }
+  }
+  async function notifyCall(path, body) {
+    nfSay("");
+    try {
+      const res = await api("POST", path, body);
+      if (res.status === 200 && res.data) { if (Array.isArray(res.data.tokens)) paintNotify(res.data.tokens); return res.data; }
+      nfSay("Could not change the notify tokens (" + ((res.data && res.data.message) || res.status) + ").");
+    } catch (_) { nfSay("Could not reach the cockpit."); }
+    return null;
+  }
+  async function createNotify() {
+    const name = nfName.value.trim();
+    if (!name) { nfSay("Give the notify token a name."); return; }
+    if (nfBusy) return;     // a second mint would replace the first one's only shown secret
+    nfBusy = true; nfGen++;
+    try {
+      const body = { name: name };
+      const src = nfSource.value.trim();
+      if (src) body.source = src;
+      if (nfUrgent.checked) body.urgent = true;
+      const got = await notifyCall("/webpush/notify/tokens", body);
+      if (!got || !got.token) return;
+      nfName.value = ""; nfSource.value = ""; nfUrgent.checked = false;
+      showNewNotify(got.token, got.record || {});
+    } finally { nfBusy = false; nfGen++; }
+  }
+  function notifyCurl(tok) {
+    return "curl -H \"Authorization: Bearer " + tok + "\" -H \"Content-Type: application/json\" -d '{\"title\":\"..\",\"body\":\"..\"}' "
+      + window.location.origin + "/notify";
+  }
+  function showNewNotify(tok, rec) {
+    nfNew.replaceChildren();
+    nfNew.dataset.name = String(rec.name || "");
+    nfNew.appendChild(el("div", "dev-name", "Token for " + (rec.name || "this service") + ": copy it now, it is not shown again"));
+    const line = el("input", "dev-url nf-token");
+    line.type = "text"; line.readOnly = true; line.value = tok;
+    line.setAttribute("aria-label", "The new notify token");
+    nfNew.appendChild(line);
+    const cmd = notifyCurl(tok);
+    const box = el("pre", "dev-url nf-curl", cmd);
+    nfNew.appendChild(box);
+    const copy = el("button", "dev-btn nf-copy", "Copy the curl");
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(cmd); copy.textContent = "Copied"; }
+      catch (_) { line.focus(); line.select(); copy.textContent = "Select the token and copy"; }
+    });
+    nfNew.appendChild(copy);
+    nfNew.appendChild(el("p", "dev-link-n", "Text only: a title, a body and a priority (low, normal" + (rec.urgent ? ", urgent" : "") + "). Anything else is refused."));
+    nfNew.hidden = false;
+  }
+  async function revokeNotify(name) {
+    if (nfBusy) return;
+    nfBusy = true; nfGen++;
+    try {
+      // the one-time secret on screen goes only when ITS token's revoke succeeded, never on a refusal or another token's
+      const got = await notifyCall("/webpush/notify/tokens/revoke", { name: name });
+      if (got && nfNew.dataset.name === name) { nfNew.hidden = true; nfNew.replaceChildren(); delete nfNew.dataset.name; }
+    } finally { nfBusy = false; nfGen++; }
   }
 
   // ---- pings (OS-4) -------------------------------------------------------------------------------------------------
