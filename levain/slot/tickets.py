@@ -82,6 +82,9 @@ from levain.slot.runtime_grammar import _verifier_steps
 JOURNAL = "tickets.jsonl"
 CEILING_FORMAT = "levain-dispatch-ceiling/1"
 CEILING_KEYS = frozenset({"format", "max_reserved_microdollars_per_run", "max_open_tickets", "max_runs_per_day"})
+#: c7.14: `/2` adds the three subscription maxima; a `/1` ceiling stays valid and refuses every passthrough mint.
+CEILING_FORMAT_2 = "levain-dispatch-ceiling/2"
+CEILING_KEYS_2 = CEILING_KEYS | {"max_calls_per_run", "max_tunnel_bytes_per_run", "max_deadline_s"}
 #: CONTRACT V16: an unbound ticket's lifetime.
 TICKET_UNUSED_S = 15 * 60
 #: DECISION: the largest journal CONTROL reads at its start (the compaction keeps it to the open tickets, one day's
@@ -123,11 +126,18 @@ EGRESS_ROUTES_MAX = 64
 VERIFIER_STEPS_MAX = 32 * 1024
 
 _ROUTE_FIELDS = ("route", "routemap_generation", "route_policy_digest")
+#: c7.14 AUTH: the ticket's authentication axis. Absent = `brokered` (and a brokered ticket's facts never carry the
+#: key, so a journal line minted before the axis existed reads, and digests, as it was minted).
+AUTHS = ("brokered", "passthrough")
+VENDORS = ("claude", "codex")
+#: the fields only a passthrough ticket carries: `vendor` and the three per-run caps (ticket facts, so CONTROL's
+#: `_ticket_run_facts` finds `max_calls` / `deadline_s`, and render writes the byte cap from `max_tunnel_bytes`).
+_PASSTHROUGH_FIELDS = ("vendor", "max_calls", "max_tunnel_bytes", "deadline_s")
 _VERIFIER_FIELDS = ("verifier_generation", "verifier_id", "verifier_steps", "input_bundle_digest",
                     "driver_input_digest")
 #: §3.3 RUN-TICKET-MINT's fields beside `attempt_id`.
 MINT_FIELDS = frozenset({"job_id", "run_index", "contract_digest", "kind", "model_requested", "egress_routes",
-                         "reserved_microdollars", *_ROUTE_FIELDS, *_VERIFIER_FIELDS})
+                         "reserved_microdollars", *_ROUTE_FIELDS, *_VERIFIER_FIELDS, "auth", *_PASSTHROUGH_FIELDS})
 #: a journal `mint` line's keys, exactly (fix 2: the rebuild refuses any other set); a verifier ticket's line adds
 #: `verifier`, the entry CONTROL resolved at mint (3c-8, CONTRACT §3.5 VERIFIER IDENTITY), and no other line has it
 MINT_LINE_KEYS = frozenset({"op", "ticket", "attempt_id", "run_id", "request_digest", "facts", "minted_ms", "day"})
@@ -175,7 +185,15 @@ def check_facts(args: Mapping[str, object]) -> Dict[str, object]:
     facts["egress_routes"] = [_text(r, "egress_routes", _ROUTE) for r in egress]
     facts["reserved_microdollars"] = _uint(args.get("reserved_microdollars"), "reserved_microdollars")
     present = {k for k in (*_ROUTE_FIELDS, "model_requested", *_VERIFIER_FIELDS) if k in args}
+    auth = args.get("auth", "brokered")
+    if type(auth) is not str or auth not in AUTHS:
+        raise _field("auth")
     if kind == "verifier":
+        if auth != "brokered":
+            raise _field("auth", "a verifier ticket is never passthrough")
+        for k in _PASSTHROUGH_FIELDS:
+            if k in args:
+                raise _field(k, "forbidden for a verifier ticket")
         for k in (*_ROUTE_FIELDS, "model_requested"):
             if k in present:
                 raise _field(k, "forbidden for a verifier ticket")
@@ -204,6 +222,11 @@ def check_facts(args: Mapping[str, object]) -> Dict[str, object]:
     for k in _VERIFIER_FIELDS:
         if k in present:
             raise _field(k, f"forbidden for an {kind} ticket")
+    if auth == "passthrough":
+        return _check_passthrough_facts(args, facts)
+    for k in _PASSTHROUGH_FIELDS:
+        if k in args:
+            raise _field(k, "only a passthrough ticket carries it")
     for k in (*_ROUTE_FIELDS, "model_requested"):
         if k not in present:
             raise _field(k, f"required for an {kind} ticket")
@@ -213,6 +236,32 @@ def check_facts(args: Mapping[str, object]) -> Dict[str, object]:
     facts["model_requested"] = _text(args["model_requested"], "model_requested", _NAME)
     if facts["reserved_microdollars"] <= 0:
         raise _field("reserved_microdollars", "must be > 0")
+    return facts
+
+
+def _check_passthrough_facts(args: Mapping[str, object], facts: Dict[str, object]) -> Dict[str, object]:
+    """CONTRACT §3.5 AUTH, the SHAPE half for a passthrough executor or planner ticket (`facts` already holds the
+    kind, job, run index, digest, egress ids and reserved dollars): no route, generation or policy digest (the
+    session's route is the base map's one passthrough route for the vendor, CONTROL's to find); reserved dollars 0;
+    `vendor` and the three per-run caps present, each a whole number >= 1. `model_requested` is optional, as no
+    dispatch-map route decides which models exist; when given it is the text form a model name takes. The ceiling is
+    the VALUE half, read at mint. `auth` is kept in the facts (a brokered ticket's never are)."""
+    for k in _ROUTE_FIELDS:
+        if k in args:
+            raise _field(k, "forbidden for a passthrough ticket")
+    if facts["reserved_microdollars"] != 0:
+        raise _field("reserved_microdollars", "a passthrough ticket reserves 0")
+    for k in _PASSTHROUGH_FIELDS:
+        if k not in args:
+            raise _field(k, "required for a passthrough ticket")
+    facts["auth"] = "passthrough"
+    if args["vendor"] not in VENDORS or type(args["vendor"]) is not str:
+        raise _field("vendor")
+    facts["vendor"] = args["vendor"]
+    for k in ("max_calls", "max_tunnel_bytes", "deadline_s"):
+        facts[k] = _uint(args[k], k, low=1)
+    if "model_requested" in args:
+        facts["model_requested"] = _text(args["model_requested"], "model_requested", _NAME)
     return facts
 
 
@@ -258,6 +307,10 @@ class Ceiling:
     max_reserved_microdollars_per_run: int
     max_open_tickets: int
     max_runs_per_day: int
+    #: c7.14 (`/2` only): the per-run subscription maxima; None on a `/1` ceiling, which refuses a passthrough mint
+    max_calls_per_run: Optional[int] = None
+    max_tunnel_bytes_per_run: Optional[int] = None
+    max_deadline_s: Optional[int] = None
 
 
 def read_ceiling(path: Path, owner: int = 0) -> Ceiling:
@@ -285,9 +338,15 @@ def read_ceiling(path: Path, owner: int = 0) -> Ceiling:
         obj = canon.parse(data)
     except (ContractError, ValueError, RecursionError):
         raise Refused("ticket-ceiling:file", "the ceiling does not parse") from None
-    if not isinstance(obj, dict) or set(obj) != CEILING_KEYS or obj["format"] != CEILING_FORMAT:
-        raise Refused("ticket-ceiling:file", f"the ceiling is exactly {sorted(CEILING_KEYS)}")
-    vals = [obj[k] for k in ("max_reserved_microdollars_per_run", "max_open_tickets", "max_runs_per_day")]
+    two = isinstance(obj, dict) and obj.get("format") == CEILING_FORMAT_2
+    keys = CEILING_KEYS_2 if two else CEILING_KEYS
+    if not isinstance(obj, dict) or set(obj) != keys or obj["format"] != (CEILING_FORMAT_2 if two else CEILING_FORMAT):
+        raise Refused("ticket-ceiling:file", f"the ceiling is exactly {sorted(CEILING_KEYS)} (/1) or "
+                                             f"{sorted(CEILING_KEYS_2)} (/2)")
+    names = ["max_reserved_microdollars_per_run", "max_open_tickets", "max_runs_per_day"]
+    if two:
+        names += ["max_calls_per_run", "max_tunnel_bytes_per_run", "max_deadline_s"]
+    vals = [obj[k] for k in names]
     if any(type(v) is not int or not 0 <= v <= JSON_INT_MAX for v in vals):
         raise Refused("ticket-ceiling:file", "a ceiling value is not a non-negative integer")
     return Ceiling(*vals)
@@ -730,6 +789,14 @@ class TicketStore:
         ceiling = read_ceiling(self.ceiling_path, self.ceiling_uid)
         if facts["reserved_microdollars"] > ceiling.max_reserved_microdollars_per_run:   # type: ignore[operator]
             raise Refused("ticket-ceiling:max_reserved_microdollars_per_run")
+        if facts.get("auth") == "passthrough":
+            if ceiling.max_calls_per_run is None:
+                raise Refused("ceiling-lacks-subscription", "the ceiling is /1: sign a /2 to allow a subscription run")
+            for fact, cap in (("max_calls", ceiling.max_calls_per_run),
+                              ("max_tunnel_bytes", ceiling.max_tunnel_bytes_per_run),
+                              ("deadline_s", ceiling.max_deadline_s)):
+                if facts[fact] > cap:                             # type: ignore[operator]
+                    raise Refused(f"ticket-ceiling:{fact}")
         with self.lock:
             self._live()
             again = self._replay(attempt_id, digest)
@@ -921,6 +988,6 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-__all__ = ["BOUND", "CANCELLED", "CEILING_FORMAT", "Ceiling", "EXPIRED", "JOURNAL", "KINDS", "LEASE_OVER", "MINT_FIELDS",
+__all__ = ["AUTHS", "BOUND", "CANCELLED", "CEILING_FORMAT", "CEILING_FORMAT_2", "CEILING_KEYS_2", "Ceiling", "VENDORS", "EXPIRED", "JOURNAL", "KINDS", "LEASE_OVER", "MINT_FIELDS",
            "RELEASED", "RENDERS_AS", "RESOLVED_KEYS", "RUN_ID_RE", "TICKET_UNUSED_S", "check_resolved", "check_slot",
            "Ticket", "TicketStore", "UNBOUND", "check_attempt_id", "check_facts", "read_ceiling", "request_digest"]

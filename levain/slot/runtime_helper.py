@@ -534,6 +534,8 @@ def front_policy_bytes(store: Store, a: R.Alloc, routes: Sequence[str]) -> bytes
     routes_view = front_session_routes(_canon_obj(data, "base-map"), routes, dispatch=a.kind in FR.DISPATCH_KINDS)
     doc = {"format": FR.POLICY_FORMAT, "kind": a.kind, "session": a.session, "routes": routes_view,
            "incarnation": a.lease_seq}
+    if is_passthrough_ticket(a):
+        doc.update(passthrough_front_limits(a))
     out = canon.canonical_bytes(doc)
     try:
         FR.load_policy(out)
@@ -542,11 +544,35 @@ def front_policy_bytes(store: Store, a: R.Alloc, routes: Sequence[str]) -> bytes
     return out
 
 
+def is_passthrough_ticket(a: R.Alloc) -> bool:
+    """c7.14: the alloc is a ticketed session whose ticket CONTROL answered as ``auth: passthrough`` and whose own
+    ``auth`` says the same (CONTROL compared the two at ATTACH)."""
+    return (a.ticket is not None and a.auth == "passthrough" and a.ticket_facts is not None
+            and a.ticket_facts.get("auth") == "passthrough")
+
+
+def passthrough_front_limits(a: R.Alloc) -> Dict[str, object]:
+    """The front file's passthrough limits for a passthrough ticket (P7-A §3.2): ``tunnel_bytes_cap`` from the
+    ticket's ``max_tunnel_bytes`` and ``deadline`` (absolute, CONTROL's reading at ATTACH), through P7-A2's
+    ``render.front_limit_fields`` (which refuses a value the front's parser would). INTEGRATION SEAM: the function
+    belongs to P7-A2; where it is absent the file is refused ``front-limits-unbuilt`` rather than written with a
+    passthrough route and no cap, since a route the front admits without a cap is the exposure this slice closes."""
+    facts = a.ticket_facts or {}
+    for k in ("max_tunnel_bytes", "deadline"):
+        if k not in facts:
+            raise Refused("ticket-facts-missing", f"a passthrough ticket's facts without {k}")
+    fn = getattr(RD, "front_limit_fields", None)
+    if fn is None:
+        raise Refused("front-limits-unbuilt", "render.front_limit_fields (P7-A2) is not in this tree")
+    return dict(fn(tunnel_bytes_cap=facts["max_tunnel_bytes"], deadline=facts["deadline"]))
+
+
 def refuse_ticketed_front(a: R.Alloc) -> None:
     """3b-8a T5, until S2 builds CONTRACT §3.3 ROUTE PINNING: a ticketed egress session (dispatch or planner) has no
     front policy root can build, so it is refused by name. The base map's entry is never a ticket's, even under the
-    same id."""
-    if a.ticket is not None and a.slot.slot_class == "egress":
+    same id. c7.14: a PASSTHROUGH ticket is the one exception: it names no dispatch-map route, so there is nothing to
+    pin, and its front file is the base map's passthrough entry plus the ticket's limits."""
+    if a.ticket is not None and a.slot.slot_class == "egress" and not is_passthrough_ticket(a):
         raise Refused("route-policy-unavailable", "a ticketed session's front policy needs route pinning (S2)")
 
 
@@ -1178,6 +1204,9 @@ class SlotView:
     slot: SlotId
     credentials: frozenset = frozenset()
     baseline: Optional[str] = None
+    #: c7.14: the vendor the baseline's ``dispatch: yes`` mark is for (the operator's consent that unattended runs may
+    #: use this slot's login), else None
+    dispatch: Optional[str] = None
 
     @property
     def reusable(self) -> bool:
@@ -1197,6 +1226,22 @@ def _baseline_vendor(data: Optional[bytes]) -> Optional[str]:
     return ID.baseline_vendor(data)
 
 
+def baseline_dispatch_vendor(data: Optional[bytes]) -> Optional[str]:
+    """The vendor a baseline file marks ``dispatch: yes`` (c7.14, §7.6), else None. Read tolerant of every other key
+    (the file's shape and its writer are ``identity``'s): a missing file, a file that does not parse, another format,
+    or any value but the text ``yes`` carries no mark, the safe side."""
+    if data is None:
+        return None
+    try:
+        obj = canon.parse(data)
+    except (ContractError, ValueError, RecursionError):
+        return None
+    if (not isinstance(obj, dict) or obj.get("format") != "levain-baseline/1" or obj.get("dispatch") != "yes"
+            or obj.get("vendor") not in VENDORS):
+        return None
+    return str(obj["vendor"])
+
+
 def parse_slot_state_of(data: bytes, slot: SlotId) -> R.SlotState:
     """records' parse, plus the file's own (class, index) must be the directory it sits in."""
     st = R.parse_slot_state(data)
@@ -1210,7 +1255,7 @@ def read_view(store: Store, slot: SlotId) -> SlotView:
         raw = read_at(sfd, "state", f"slots/{slot.tag}/state")
         state = parse_slot_state_of(raw, slot) if raw is not None else None   # DECISION: absent = not reusable
         creds: frozenset = frozenset()
-        baseline = None
+        baseline = dispatch = None
         if slot.slot_class == "egress":
             try:
                 kfd = _openat_dir(sfd, "keep", f"slots/{slot.tag}/keep")
@@ -1221,8 +1266,10 @@ def read_view(store: Store, slot: SlotId) -> SlotView:
                     creds = frozenset(v for v, n in CREDENTIAL_NAME.items() if exists_regular_at(kfd, n))
                 finally:
                     os.close(kfd)
-            baseline = _baseline_vendor(read_at(sfd, "baseline", f"slots/{slot.tag}/baseline"))
-    return SlotView(state, slot, creds, baseline)
+            raw_baseline = read_at(sfd, "baseline", f"slots/{slot.tag}/baseline")
+            baseline = _baseline_vendor(raw_baseline)
+            dispatch = baseline_dispatch_vendor(raw_baseline)
+    return SlotView(state, slot, creds, baseline, dispatch)
 
 
 def pick_slot(views: Sequence[SlotView], *, slot_class: str, kind: str, vendor: str, auth: str,
@@ -1240,6 +1287,15 @@ def pick_slot(views: Sequence[SlotView], *, slot_class: str, kind: str, vendor: 
     if ticketed:
         if named is not None:
             raise Refused("ticket-slot-argument", f"{slot_class} {named}")
+        if auth == "passthrough":
+            # c7.14: only a slot whose login the operator marked for unattended runs, for THIS vendor (credential
+            # parked and baseline naming it both), and never a credential-free one. DECISION: taking a marked slot
+            # leaves the credential-free count alone, so `operator-slot-reserved` has nothing to guard here.
+            marked = [v for v in reusable if v.holds(vendor) and v.dispatch == vendor]
+            if not marked:
+                raise Refused(f"no-dispatch-credential:{vendor}", f"no reusable {slot_class} slot is marked for "
+                                                                  f"unattended {vendor} runs")
+            return marked[0].slot
         free = [v for v in reusable if not v.operator_held]
         if not free:
             raise Refused(f"no-free-slot:{slot_class}", "no reusable credential-free slot")
@@ -2056,7 +2112,7 @@ def render(ctx: Ctx, req: RuntimeRequest, blob: RenderBlob) -> Dict[str, object]
         if a.policy is not None:
             raise Refused("not-allocated", req.session)
         # §3.5's second gate, before step (1)'s CAS: a refusal here leaves the session ALLOCATED and acts on nothing
-        RD.check_ticket(blob, a.kind, a.slot.slot_class, a.ticket, a.ticket_facts)
+        RD.check_ticket(blob, a.kind, a.slot.slot_class, a.ticket, a.ticket_facts, auth=a.auth)
         refuse_ticketed_front(a)        # 3b-8a T5: before the base map's route types are read, so one name for all
         if a.ticket is not None and a.ticket_facts is not None and a.ticket_facts.get("kind") == "verifier":
             RD.check_driver_template(a.ticket_facts["verifier"], ctx.seams.driver_template)   # type: ignore[arg-type]
@@ -2176,6 +2232,12 @@ def _teardown(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 def _confirm_identity(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     from levain.slot import identity as ID
 
+    if req.dispatch and not getattr(ID, "BASELINE_DISPATCH_KEY", None):
+        # INTEGRATION SEAM (c7.14): the baseline's writer is `identity.py` (P7-A4's file). Where it does not name the
+        # key it writes (`BASELINE_DISPATCH_KEY`) and take `req.dispatch`, `--dispatch` is refused BEFORE a baseline
+        # is written, never accepted and dropped: an operator who asked for the unattended-use mark must not be told
+        # the baseline is written when it carries none.
+        raise Refused("dispatch-mark-unbuilt", "identity.py does not write the dispatch mark yet")
     return ID.confirm_identity(ctx, req, blob)
 
 

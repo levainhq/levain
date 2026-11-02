@@ -1943,8 +1943,11 @@ def return_move(facts: EndFacts, *, slot_owner_ok: Callable[[os.stat_result], bo
     Order: rename, fsync ``keep/``, fsync the tree directory, at the faults ``return:checked``, ``return:renamed``,
     ``return:source-synced``, ``return:done``. The caller holds the session END lock. The baseline and the gate are
     the caller's."""
-    if facts.kind != "interactive" or not facts.parks:
-        raise Refused("bad-root", "return_move: not an interactive passthrough session of a credential vendor")
+    if facts.kind not in ("interactive", "dispatch", "planner") or not facts.parks:
+        # c7.14: a ticketed passthrough session (kind dispatch or planner) is returned its credential as an
+        # interactive one is; a `login` or `verifier` session never is
+        raise Refused("bad-root", "return_move: not an interactive or ticketed passthrough session of a credential "
+                                  "vendor")
     if slot_owner_ok is None:
         slot_owner_ok = lambda st: st.st_uid == facts.slot_uid   # noqa: E731
     parts, name = facts.credential   # type: ignore[misc]
