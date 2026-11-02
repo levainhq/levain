@@ -13,7 +13,7 @@ import pytest
 import levain.authority as auth
 from levain.authority import ReplayCache
 from levain.cli import main
-from levain.coordinator import seam_arrival, seam_open
+from levain.coordinator import seam, seam_arrival, seam_build, seam_open
 from levain.coordinator.store import CoordStore
 from tests.test_consent_away import _cockpit, _queue
 from tests.test_seam_verbs import _activate, _body, body_file
@@ -27,14 +27,22 @@ def _home(tmp_path, monkeypatch):
 class World:
     """A coordinator store beside its consent queue and a real cockpit with one enrolled laptop key."""
 
-    def __init__(self, tmp_path, capsys):
+    def __init__(self, tmp_path, capsys, starter=False):
         (tmp_path / "ck").mkdir()
         self.q = _queue(tmp_path, _cockpit(tmp_path / "ck"))
         self.key = tmp_path / "ck" / "laptop"
         self.capsys = capsys
         self.store = CoordStore(self.q)
         self.store.coord_set_agent("claude", cwd=str(tmp_path))
-        _, self.token = _activate(self.store)
+        if starter:          # as a real launch runs: the cold start builds its open before the launch activates
+            d, _ = self.store.accept_drop("words", surface="cli")
+            lid = self.store.woken_launch(d.drop_id)
+            self.store.launch_claim_spawn(lid, os.getpid())
+            seam_build.starter_build(self.store, lid, pid=os.getpid(), kind="light", queue_dir=self.q)
+            self.store.launch_activate(lid, harness_session_id="h-" + lid)
+            self.token = self.store.coord_status()["lease"]["token"]
+        else:
+            _, self.token = _activate(self.store)
 
     def run(self, *argv, rc=0):
         got = main(list(argv))
@@ -148,3 +156,65 @@ def test_the_light_gap_is_between_operator_activity_not_since_an_open(world, tmp
     now[0] += timedelta(hours=1)
     s.accept_drop("c", surface="cli")
     assert seam_arrival.light_gap(s, 4.0)[:2] == (False, "no light open needed: previous activity 1.0 h ago")
+
+
+def test_light_passes_an_acknowledged_open(tmp_path, capsys):
+    w = World(tmp_path, capsys, starter=True)
+    starter = re.search(r"--ack (\d+)", w.coord("open")).group(1)
+    w.coord("open", "--ack", starter)
+    w.store.accept_drop("later", surface="cli")
+    got = w.coord("open", "--light", "--gap-hours", "0.000000001")
+    light = re.search(r"open (\d+) \(light\)", got).group(1)
+    assert light != starter                                               # the acknowledged starter is not reprinted
+    w.coord("open", "--ack", light)
+    assert w.coord("open", "--light", "--gap-hours", "0.000000001") == (
+        f"no light open needed: the light open for this activity (open {light}) is acknowledged\n")
+
+
+def test_gap_hours_a_duration_cannot_hold_is_refused(world):
+    world.store.accept_drop("two", surface="cli")
+    assert main(["coord", "open", "--light", "--gap-hours", "1e308", "--token", str(world.token), "--queue-dir",
+                 str(world.q)]) == 1
+    assert "a duration can hold" in world.capsys.readouterr().err
+
+
+def test_ack_refuses_the_light_flags(world):
+    assert main(["coord", "open", "--ack", "1", "--light", "--gap-hours", "-1", "--token", str(world.token),
+                 "--queue-dir", str(world.q)]) == 1
+    assert "takes no --light or --gap-hours" in world.capsys.readouterr().err
+
+
+@pytest.mark.parametrize("band", [lambda *a, **k: 1 / 0, lambda *a, **k: []])
+def test_missing_close_is_read_without_the_band(world, monkeypatch, band):
+    world.away("claude_code")
+    monkeypatch.setattr(seam, "_band", band)
+    assert "Missing close: operator seam began" in world.run("coord", "open", "--queue-dir", str(world.q))
+
+
+def test_leaves_open_oldest_mark_first(world):
+    for agent in ("codex", "claude_code"):
+        world.away(agent)
+    for agent in ("claude_code", "codex"):
+        world.away(agent, on=False)
+    leaves, notes = seam_arrival.verified_leaves(world.q)
+    assert [lv.agent for lv in leaves] == ["codex", "claude_code"] and notes == []
+
+
+def test_a_build_that_returns_nothing_is_a_note(world, monkeypatch):
+    world.away("claude_code")
+    world.away("claude_code", on=False)
+    monkeypatch.setattr(seam_arrival, "build", lambda *a, **k: None)
+    builds, notes = seam_arrival.ingest_leaves(world.store, world.q, world.token)
+    assert builds == [] and notes == [notes[0]] and "no build was returned" in notes[0]
+
+
+def test_a_stale_lookup_records_the_leave_once(world, monkeypatch):
+    world.away("claude_code")
+    world.away("claude_code", on=False)
+    (first,), _ = seam_arrival.ingest_leaves(world.store, world.q, world.token)
+    real = seam_arrival.stored_build
+    # the racing reader's view outside the fence misses the build; the look under the fence sees it
+    monkeypatch.setattr(seam_arrival, "stored_build", lambda conn, *a: real(conn, *a) if conn.in_transaction else None)
+    monkeypatch.setattr(seam_arrival, "record_arrival", lambda *a, **k: pytest.fail("recorded a consumed leave"))
+    (again,), notes = seam_arrival.ingest_leaves(world.store, world.q, world.token)
+    assert again.open_id == first.open_id and notes == []

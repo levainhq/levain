@@ -148,14 +148,20 @@ def _readonly_text(store: Any, args: argparse.Namespace, kind: str | None = None
 
 
 def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
+    light = bool(getattr(args, "light", False))
+    gap_hours = getattr(args, "gap_hours", None)
     if args.ack is not None:
+        # refused, not dropped: a caller that asked for a light open must not read an acknowledgement as one
+        if light or gap_hours is not None:
+            raise CoordError("--ack acknowledges a built open and takes no --light or --gap-hours; run them as two "
+                             "commands; nothing was written")
         return _ack(args, out, store)
     if args.read_back_file is not None:
         raise CoordError("--read-back-file goes with --ack OPEN_ID: it is the read-back an acknowledgement carries")
-    light = bool(getattr(args, "light", False))
-    gap_hours = getattr(args, "gap_hours", None)
     if gap_hours is not None and not light:
         raise CoordError("--gap-hours goes with --light: it is the gap under which no light open is needed")
+    if gap_hours is not None:
+        seam_arrival.gap_threshold(gap_hours)        # refused before anything is read or written
     launch, why = _active(store, args.token)
     tail = _tail(store)
     handoff = seam_handoffs.latest(store)
@@ -173,9 +179,19 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
             if len(waiting) > 1:
                 arrival_notes.append(f"{len(waiting) - 1} more leave open(s) wait: acknowledge this one, then run "
                                      "coord open again")
+        if light and built is not None and seam_arrival.is_acked(store, built.open_id):
+            built = None        # an acknowledged open is done with: --light asks whether the operator spoke since
     if light and built is None:
         needed, gap_why, latest = seam_arrival.light_gap(
             store, seam_arrival.LIGHT_GAP_HOURS if gap_hours is None else gap_hours)
+        if needed and launch is not None:
+            from contextlib import closing
+
+            with closing(store._connect()) as conn:
+                prior = seam_open.stored_build(conn, "light", "silence", latest.ref)
+            if prior is not None and seam_arrival.is_acked(store, prior.open_id):
+                needed, gap_why = False, (f"no light open needed: the light open for this activity (open "
+                                          f"{prior.open_id}) is acknowledged")
         if not needed:
             _emit(out, args.json, {"open_id": None, "acknowledgeable": False, "light_needed": False, "why": gap_why,
                                    **({"notes": arrival_notes} if arrival_notes else {})},

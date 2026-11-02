@@ -267,14 +267,18 @@ def _render(store: CoordStore, conn: sqlite3.Connection, qdir: Path, kind: str, 
     band_lines = _guard("Band", lambda: _band(store, conn, qdir, now, read_at), failed)
     # the card reads a queue directory it cannot open as "not away, nothing undecided": with the band unread, its queue
     # parts are unknown, and the brief says that rather than print the empty answers
+    band_unread = bool(band_lines) and band_lines[0].startswith("Band: cannot-derive")
     card_lines = (["Card: cannot-derive (the queue directory could not be read, so the away, undecided and waiting "
-                   "parts are unknown)"] if band_lines[0].startswith("Band: cannot-derive")
+                   "parts are unknown)"] if band_unread
                   else _guard("Card", lambda: _card(store, conn, qdir, now), failed))
     rest = _collapse_zeros(read_at, unseq_lines,
                            _guard("Unacknowledged", lambda: _unacknowledged(conn, now), failed, critical=True),
                            _guard("Board", lambda: _board(store, conn, read_at), failed), band_lines, card_lines)
-    if not band_lines[0].startswith("Band: cannot-derive"):       # an unreadable queue directory is already said above
-        rest = [*rest, *_guard("Missing close", lambda: _missing_close(conn, present, qdir), failed)]
+    # read on its own: a band that could not be read says nothing about the away marks; only this row's own failure
+    # beside an unread band repeats what the band line already says
+    missing = _guard("Missing close", lambda: _missing_close(conn, present, qdir), failed)
+    if not (band_unread and missing[:1] and missing[0].startswith("Missing close: cannot-derive")):
+        rest = [*rest, *missing]
     head_lines, handoff_lines, since_lines, rest = ([_clean(ln) for ln in part] for part in
                                                     (head_lines, handoff_lines, since_lines, rest))
     rows = [(g, _clean(label)) for g, label in rows]

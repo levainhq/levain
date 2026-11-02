@@ -28,7 +28,7 @@ from levain.coordinator.seam_open import (OpenBuild, active_coordinator_fence, o
                                          stored_build)
 from levain.coordinator.store import CoordError, CoordStore
 
-__all__ = ["ACTIVITY_SOURCES", "Activity", "LIGHT_GAP_HOURS", "Leave", "ingest_leaves", "is_acked",
+__all__ = ["ACTIVITY_SOURCES", "Activity", "LIGHT_GAP_HOURS", "Leave", "gap_threshold", "ingest_leaves", "is_acked",
            "light_gap", "operator_activity", "verified_leaves"]
 
 #: the gap between two operator-activity records under which a light open is not needed, in hours. Levain's own pick,
@@ -45,6 +45,7 @@ class Leave:
     agent: str
     mark_id: str
     queue_id: str
+    set_at: str = ""     # when the verified mark was set: the leaves' order, oldest first
 
     @property
     def key(self) -> str:
@@ -72,24 +73,28 @@ def _queue_id(queue_dir: Path) -> str:
 
 
 def verified_leaves(queue_dir: Path | str) -> tuple[list[Leave], list[str]]:
-    """``(leaves, notes)``: each agent whose latest away mark has a leave that verifies now. An agent whose settings,
-    store or authority cannot be read contributes no leave and one note; a mark whose leave does not verify
-    (``left`` false: no leave, a revoked key, a changed row) contributes neither."""
+    """``(leaves, notes)``: each agent whose latest away mark has a leave that verifies now, the oldest mark first. An
+    agent whose settings, store or authority cannot be read contributes no leave and one note; a mark whose leave does
+    not verify (``left`` false: no leave, a revoked key, a changed row) contributes neither."""
+    from levain.cockpit.consent import parse_stamp
     from levain.consent import away
     from levain.consent.adapters.claude_code import away_mark_of
 
     qdir = Path(queue_dir)
-    leaves: list[Leave] = []
+    got: list[tuple[Any, Leave]] = []
     notes: list[str] = []
     for agent in _AGENTS:
         try:
             mark = away_mark_of(qdir, away.claude_code.settings_from(away.read(qdir, agent)), agent)
             if mark is None or mark.left is not True:
                 continue
-            leaves.append(Leave(agent, str(mark.id), _queue_id(qdir)))
+            # known edge: the queue id is a second read of the path, so a queue.db swapped between the two reads
+            # pairs one queue's mark with another's id; only a hand-replaced queue file does that, never real use
+            got.append((parse_stamp(mark.set_at), Leave(agent, str(mark.id), _queue_id(qdir), mark.set_at)))
         except Exception as exc:  # noqa: BLE001 - an unreadable consent state is never a leave
             notes.append(f"{agent}: the away mark could not be read ({type(exc).__name__}), so no leave was consumed")
-    return leaves, notes
+    got.sort(key=lambda pair: pair[0])
+    return [lv for _, lv in got], notes
 
 
 def is_acked(store: CoordStore, open_id: int) -> bool:
@@ -100,9 +105,9 @@ def is_acked(store: CoordStore, open_id: int) -> bool:
 
 def ingest_leaves(store: CoordStore, queue_dir: Path | str | None, token: Any) -> tuple[list[OpenBuild], list[str]]:
     """Consume every verified leave: record its arrival signal and build its operator open, keyed ``agent:mark_id``.
-    ``(builds, notes)``, builds oldest leave first. A leave already built returns its stored build and writes nothing;
-    a leave whose build is refused (a degraded or oversized brief) is a note, and the next call tries again. Fenced
-    by the coordinator's token: a caller with none ingests nothing."""
+    ``(builds, notes)``, builds oldest away mark first. A leave already built returns its stored build and writes
+    nothing; a leave whose build is refused (a degraded or oversized brief) is a note, and the next call tries again.
+    Fenced by the coordinator's token: a caller with none ingests nothing."""
     leaves, notes = verified_leaves(Path(queue_dir) if queue_dir is not None else Path(store.directory))
     builds: list[OpenBuild] = []
     for lv in leaves:
@@ -112,9 +117,14 @@ def ingest_leaves(store: CoordStore, queue_dir: Path | str | None, token: Any) -
             if have is None:
                 with store._write("coordinator", token) as (conn, now):
                     active_coordinator_fence(conn, now, token, "an arrival signal")
-                    record_arrival(conn, now, agent=lv.agent, mark_id=lv.mark_id, queue_id=lv.queue_id)
+                    # looked up again under the fence: a racing coordinator may have consumed the leave since
+                    if stored_build(conn, "operator", "away_off", lv.key) is None:
+                        record_arrival(conn, now, agent=lv.agent, mark_id=lv.mark_id, queue_id=lv.queue_id)
                 have = build(store, kind="operator", signal_kind="away_off", signal_key=lv.key, queue_dir=queue_dir,
                              token=token)
+            if have is None:
+                notes.append(f"{lv.agent}: the leave of mark {lv.mark_id} opened nothing yet (no build was returned)")
+                continue
             builds.append(have)
         except CoordError as exc:
             notes.append(f"{lv.agent}: the leave of mark {lv.mark_id} opened nothing yet ({str(exc)[:160]})")
@@ -139,21 +149,32 @@ def operator_activity(store: CoordStore, limit: int = 2) -> list[Activity]:
     return [Activity(*r) for r in rows]
 
 
+def gap_threshold(gap_hours: Any) -> timedelta:
+    """``gap_hours`` as the gap a light open needs, checked before any read: a positive, finite number of hours that a
+    duration can hold."""
+    if not isinstance(gap_hours, (int, float)) or isinstance(gap_hours, bool) or not math.isfinite(gap_hours) \
+            or gap_hours <= 0:
+        raise CoordError("--gap-hours is a positive number of hours")
+    try:
+        return timedelta(hours=gap_hours)
+    except OverflowError:
+        raise CoordError(f"--gap-hours is a positive number of hours a duration can hold (at most "
+                         f"{timedelta.max.total_seconds() / 3600:.0f})") from None
+
+
 def light_gap(store: CoordStore, gap_hours: float) -> tuple[bool, str, Activity | None]:
     """``(needed, why, latest)``: whether the operator's latest activity record follows a gap of at least
     ``gap_hours`` after the one before it (no earlier record is an unbounded gap), the sentence for the verb to print
     and the record the light open is keyed by. No activity at all needs nothing."""
     from levain.cockpit.consent import parse_stamp
 
-    if not isinstance(gap_hours, (int, float)) or isinstance(gap_hours, bool) or not math.isfinite(gap_hours) \
-            or gap_hours <= 0:
-        raise CoordError("--gap-hours is a positive number of hours")
+    threshold = gap_threshold(gap_hours)
     got = operator_activity(store, 2)
     if not got:
         return False, "no light open needed: no operator activity is recorded", None
     if len(got) == 1:
         return True, "the operator's first recorded activity", got[0]
     gap = parse_stamp(got[0].at) - parse_stamp(got[1].at)
-    if gap < timedelta(hours=gap_hours):
+    if gap < threshold:
         return False, f"no light open needed: previous activity {gap.total_seconds() / 3600:.1f} h ago", got[0]
     return True, f"previous activity {gap.total_seconds() / 3600:.1f} h before this", got[0]
