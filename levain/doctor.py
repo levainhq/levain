@@ -156,6 +156,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_consent_hooks(install))
     core.extend(_check_consent_limits())
     core.extend(_check_chat_network())
+    core.extend(_check_phone_path())
     core.extend(_check_dispatch_adoption_rules())
     core.extend(_check_dispatch_verifiers())
     core.extend(_check_slot_isolation())
@@ -354,6 +355,71 @@ def _check_chat_network() -> list[CheckResult]:
     except (EgressRefused, srt_pin.SrtProblem) as exc:
         return [CheckResult(name, False, str(exc), fix)]
     return [CheckResult(name, True, f"node {node}, srt {st.version} at {st.prefix}")]
+
+
+def _tailscale_json(argv: list[str], run: Any) -> Any:
+    """One time-bounded read-only tailscale call parsed as JSON; None when it printed nothing usable."""
+    import json
+    try:
+        r = run(argv, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout or "null")
+    except ValueError:
+        return None
+
+
+def _check_phone_path(*, which: Any = None, run: Any = None, port: int | None = None) -> list[CheckResult]:
+    """Whether a phone can reach the cockpit through Tailscale, the self-hosted phone path. Reads only
+    (`tailscale status --json`, `tailscale serve status --json`), each bounded to 10 seconds. Every state says
+    in one sentence whether the phone can reach this laptop and what to do; a funnel is a FAIL."""
+    import shutil
+    from urllib.parse import urlparse
+
+    from levain.daemon import DEFAULT_PORT
+
+    name = "phone path"
+    which = which or shutil.which
+    run = run or subprocess.run
+    port = DEFAULT_PORT if port is None else port
+    fix_serve = f"Run `tailscale serve --bg --https=443 http://127.0.0.1:{port}`."
+    if not which("tailscale"):
+        return [CheckResult(name, True, "tailscale not found, so a phone cannot reach this laptop",
+                            "Install Tailscale on the laptop and the phone and sign in to the same tailnet "
+                            "(README: Answer an agent from your phone).", neutral=True)]
+    status = _tailscale_json(["tailscale", "status", "--json"], run)
+    if not isinstance(status, dict):
+        return [CheckResult(name, True, "tailscale did not answer, so a phone may not reach this laptop",
+                            "Open the Tailscale app on the laptop and check it is running.", warn=True)]
+    state = status.get("BackendState")
+    if state != "Running":
+        return [CheckResult(name, True, f"tailscale is not signed in and running (state: {state or 'unknown'}), "
+                                        "so a phone cannot reach this laptop",
+                            "Sign in to Tailscale on the laptop and the phone, on the same tailnet.", warn=True)]
+    serve = _tailscale_json(["tailscale", "serve", "status", "--json"], run)
+    serve = serve if isinstance(serve, dict) else {}
+    funnel = [k for k, v in (serve.get("AllowFunnel") or {}).items() if v]
+    if funnel:
+        return [CheckResult(name, False, f"funnel is on for {', '.join(funnel)}: the cockpit is open to the internet",
+                            "Run `tailscale funnel reset` now; the cockpit must be reachable from your tailnet only.")]
+    dns = str((status.get("Self") or {}).get("DNSName") or "").rstrip(".")
+    proxies = []
+    for web in (serve.get("Web") or {}).values():
+        for h in ((web or {}).get("Handlers") or {}).values():
+            proxies.append(str((h or {}).get("Proxy") or ""))
+    for pr in proxies:
+        try:
+            if urlparse(pr).port == port:
+                where = f"https://{dns}" if dns else "the machine's ts.net name"
+                return [CheckResult(name, True, f"tailscale proxies to the cockpit port {port}, so a phone on your "
+                                                f"tailnet can reach it at {where}")]
+        except ValueError:
+            continue
+    return [CheckResult(name, True, f"tailscale is running but not serving the cockpit port {port}, so a phone "
+                                    "cannot reach this laptop yet", fix_serve, warn=True)]
 
 
 def _check_consent_limits() -> list[CheckResult]:

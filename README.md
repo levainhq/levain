@@ -406,7 +406,17 @@ The keys directory (`<levain home>/keys`) is denied to an entity's bash and file
 
 ### Answer an agent from your phone
 
-The phone reaches levain through the cockpit, and only after you pair it. Put an https proxy you trust in front of the cockpit (`tailscale serve`, for example), open the cockpit on the phone, and type the code `levain cockpit pair --short` prints (`XXXX-XXXX`) into the cockpit's pair card. `levain cockpit pair --url https://<name>:<port>` prints a link instead. Either one pairs one device, once, within 10 minutes, and `levain cockpit pair` prints the code or link only to a terminal unless you pass `--print`, since anyone who reads it can pair.
+The phone reaches levain through the cockpit, and only after you pair it. Tailscale is the self-hosted phone path. The Bureau as an outbound relay is the no-setup path and arrives with managed hosting; every public door lives there. Nothing on your laptop opens to the internet, and `tailscale funnel` is never the way: it publishes the cockpit to anyone. Set it up once:
+
+1. Install Tailscale on the laptop and on the phone. Without both there is no private network for the phone to travel.
+2. Sign in to the same tailnet on both. A phone on another tailnet cannot see the laptop.
+3. Start the cockpit, then proxy it: `tailscale serve --bg --https=443 http://127.0.0.1:7420`. The cockpit listens on this machine only; the proxy gives it an https name inside your tailnet, which a passkey needs.
+4. On the phone, open `https://<machine>.<tailnet>.ts.net`. This is the name `tailscale serve status` prints; a wrong name opens nothing.
+5. Pair with `levain cockpit pair --short` and type the code (`XXXX-XXXX`) into the cockpit's pair card. An unpaired phone sees nothing.
+
+`levain doctor` has a `phone path` row that says plainly whether a phone can reach the laptop and what to do, and fails if funnel is on.
+
+`levain cockpit pair --url https://<name>:<port>` prints a link instead. `levain cockpit pair --url https://<name>:<port>` prints a link instead. Either one pairs one device, once, within 10 minutes, and `levain cockpit pair` prints the code or link only to a terminal unless you pass `--print`, since anyone who reads it can pair.
 
 A passkey is enrolled and used on the cockpit's own pages: the cockpit makes it, the laptop enrols it as a `display-phone` key (a passkey never enrols itself), and the cockpit's sheets sign a consent answer or a late ruling with it. The queue checks that signature with `ssh-keygen`, as for an answer signed in the terminal. Those pages are served only by a cockpit started with a signing queue and the https name your proxy serves it on, on 443: `levain serve --write --install-class reported --sign-queue-dir <levain home>/consent --sign-host <name>`. The name is written as the browser's address bar shows it (lowercase, no trailing dot, no port) and is the one the passkey is made for; the page origin is `https://<name>`, the only origin the consent and dispatch sheets take a signature from. The queue must already exist and is never created. The options need `--write`, since the pages ride the cockpit's tokens, and are refused beside `--chat`; `--install-class reported` is there because pairing the phone is a cockpit write, which a cockpit with no governed install marker refuses until a class is declared. The phone signs with the token it was paired with, never the owner key. With any queue other than `<levain home>/consent`, the one the cockpit's consent cards are read from, the consent and grant sheets are off and the start-up `signing:` line says so. Until a cockpit is started that way, answer at the desk with `levain consent answer`.
 
