@@ -8401,6 +8401,21 @@
     }
     return row;
   }
+  // the cold start: placeholder rows in the row's own shape (never a bare word), the word kept for a screen reader
+  function ncSkeleton(n, compact) {
+    const box = el("div", "nc-skel" + (compact ? " nc-skel-compact" : ""));
+    box.setAttribute("aria-busy", "true");
+    box.appendChild(el("span", "nc-sr", "Loading…"));
+    for (let i = 0; i < n; i++) {
+      const row = el("div", "nc-skelrow"); row.setAttribute("aria-hidden", "true");
+      const lines = el("span", "nc-skellines");
+      lines.append(el("span", "nc-skelbar nc-skel-chip"), el("span", "nc-skelbar nc-skel-title"));
+      if (!compact) lines.appendChild(el("span", "nc-skelbar nc-skel-prev"));
+      row.append(el("span", "nc-skeldot"), lines);
+      box.appendChild(row);
+    }
+    return box;
+  }
   function ncIcon(name) {
     const NS = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(NS, "svg");
@@ -8464,7 +8479,7 @@
       const u = nc.status === "ok" ? nc.unread : 0;
       count.hidden = u <= 0; count.textContent = u + " unread";
       body.replaceChildren();
-      if (nc.status === "idle") { body.appendChild(el("p", "empty", "Loading…")); return; }
+      if (nc.status === "idle") { body.appendChild(ncSkeleton(3, true)); return; }
       if (nc.status !== "ok") { body.appendChild(el("p", "empty", ncStateWords())); return; }
       if (!nc.items.length) { body.appendChild(el("p", "empty", "No notifications")); return; }
       const list = el("div", "nc-list"); list.setAttribute("role", "list");
@@ -8569,7 +8584,7 @@
     r.needs.textContent = "Needs you (" + nc.needs + ") · open the cards →";
     list.replaceChildren();
     if (nc.status === "idle") {
-      const sp = el("div", "nc-state"); sp.appendChild(el("span", "nc-spin")); sp.appendChild(el("p", null, "Loading…")); list.appendChild(sp);
+      list.appendChild(ncSkeleton(6, false));
     } else if (nc.status !== "ok") {
       const s = el("div", "nc-state"); s.appendChild(el("p", null, ncStateWords()));
       if (nc.status === "error") { const rt = el("button", "nc-btn", "Retry"); rt.type = "button"; rt.addEventListener("click", () => { ncRead(true); }); s.appendChild(rt); }
