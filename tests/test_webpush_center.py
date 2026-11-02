@@ -243,7 +243,7 @@ def test_the_list_pages_newest_first_and_a_list_that_cannot_be_read_is_not_an_em
         assert _ids(second) == ["p3", "p2"] and second["next_before"] == "p2"
         _, last, _ = _get(port, LIST + "?limit=2&before=p2")
         assert _ids(last) == ["p1"] and last["next_before"] is None
-        assert _get(port, LIST + "?before=p999")[0] == 404 and _get(port, LIST + "?limit=x")[0] == 400
+        assert _get(port, LIST + "?before=p999")[0] == 404 and _get(port, LIST + "?limit=x")[0] == 400 and _get(port, LIST + "?limit=" + "9" * 5000)[0] == 400
         monkeypatch.setattr(center, "list_items", lambda *a, **k: (_ for _ in ()).throw(OSError("db")))
         st, doc, _ = _get(port, LIST)
         assert st == 503 and doc["ok"] is False and "items" not in doc
@@ -306,7 +306,7 @@ def test_one_unreadable_store_or_ref_degrades_that_item_not_the_page(tmp_path, m
     monkeypatch.setattr(QuestionStore, "open_questions", lambda self: (_ for _ in ()).throw(RuntimeError("x")))
     monkeypatch.setattr("levain.consent.listing.read_listing",
                         lambda *a, **k: type("L", (), {"pending": [type("E", (), {"state": "pending"})()] * 3})())
-    assert needs.open_needs_count(q) == 3          # the consents still count
+    assert needs.open_needs_count(q) is None       # three consents readable, the questions not: unknown, never a 3 that could lower a badge of 6
     monkeypatch.undo()
     monkeypatch.setattr(QuestionStore, "open_questions", lambda self: (_ for _ in ()).throw(RuntimeError("x")))
     assert needs.open_needs_count(q) is None       # nothing counted and a half unreadable: unknown, never 0

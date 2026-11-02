@@ -2601,7 +2601,7 @@ class _Handler(GuardedHandler):
             if path == _CENTER_ITEM:
                 return center.get(store, q.get("id", [""])[0]), 200
             raw = q.get("limit", [""])[0]
-            if raw and not (raw.isascii() and raw.isdigit()):
+            if raw and not (len(raw) <= 9 and raw.isascii() and raw.isdigit()):    # an over-long digit string never reaches int()
                 return {"ok": False, "error": "bad_request", "message": "limit is a whole number"}, 400
             doc = center.list_items(store, limit=int(raw) if raw else center.PAGE, before=q.get("before", [None])[0])
             n = needs.open_needs_count(queue)

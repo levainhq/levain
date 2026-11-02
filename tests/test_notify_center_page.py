@@ -256,17 +256,21 @@ def test_a_failed_write_and_a_failed_refresh_say_what_happened_and_keep_the_serv
         total = len(_center(port)["items"])
         out = _drive(tmp_path, _url(port), [
             {"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": f"{PILL} && !{PILL}.hidden && 1", "ms": 40000}, OPEN, OPENED, {"eval": fail_delete},
+            {"eval": "window.__fail = 'read'; window.LevainNotifyCenter.read(true).then(() => 1)"},
+            {"until": f"/as of/.test({MODAL}.querySelector('.nc-banner-t').textContent) && 1"},
+            {"eval": f"JSON.stringify({{ r: {MODAL}.querySelector('.nc-banner-t').textContent, rows: {ROWS}.length, retry: !!{MODAL}.querySelector('.nc-banner .nc-btn') }})"},
+            {"eval": "window.__fail = 'delete'; 1"},
             {"eval": f"{_row('Inbox digest')}.querySelector('.nc-main').click(); 1"}, {"until": f"{MODAL}.querySelector('.nc-delete') && 1"},
             {"eval": f"{MODAL}.querySelector('.nc-delete').click(); 1"},
             {"until": f"{MODAL}.querySelector('.nc-banner') && !{MODAL}.querySelector('.nc-banner').hidden && /Delete/.test({MODAL}.querySelector('.nc-banner').textContent) && {ROWS}.length === {total} && 1"},
             {"eval": f"JSON.stringify({{ w: {MODAL}.querySelector('.nc-banner-t').textContent, rows: {ROWS}.length }})"},
-            {"eval": "window.__fail = 'read'; window.LevainNotifyCenter.read(true).then(() => 1)"},
-            {"until": f"/as of/.test({MODAL}.querySelector('.nc-banner-t').textContent) && 1"},
-            {"eval": f"JSON.stringify({{ r: {MODAL}.querySelector('.nc-banner-t').textContent, rows: {ROWS}.length, retry: !!{MODAL}.querySelector('.nc-banner .nc-btn') }})"}])
+            {"eval": "window.__fail = 'read'; window.LevainNotifyCenter.read(true).then(() => 1)"}, SETTLE,
+            {"eval": f"JSON.stringify({{ k: {MODAL}.querySelector('.nc-banner-t').textContent, rows: {ROWS}.length }})"}])
         held_rows = len(_center(port)["items"])
-    wr, rd = _json(out)
+    rd, wr, kept = _json(out)
     assert wr["w"] == "Delete didn’t reach Levain. Nothing was changed." and wr["rows"] == total, wr
     assert rd["r"].startswith("Couldn’t refresh. Showing the list as of ") and rd["rows"] == total and rd["retry"] is True, rd
+    assert kept["k"] == wr["w"] and kept["rows"] == total                              # a refresh that also fails never replaces the standing write failure
     assert held_rows == total                                                         # the server never lost the item either
 
 

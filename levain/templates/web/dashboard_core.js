@@ -8089,7 +8089,7 @@
   // detail). The page never holds a mark the server did not confirm: a write is awaited, then the list is read again; a failed
   // write says what did not land and the list is the server's. Every field is set through el()/textContent or the markdown
   // renderer's DOM nodes, never innerHTML: this page shares a document with the write token.
-  const NC_PATH = "/webpush/center", NC_POLL_MS = 30000, NC_TIMEOUT_MS = 15000, NC_PANEL_ROWS = 5, NC_SWIPE_PX = 96;
+  const NC_PATH = "/webpush/center", NC_POLL_MS = 30000, NC_TIMEOUT_MS = 15000, NC_PANEL_ROWS = 5, NC_SWIPE_PX = 96, NC_REFRESH_MAX = 200;   // 200 is the server's page cap
   const NC_ID = /^[pn][0-9]{1,19}$/;
   const nc = { sig: "", items: [], unread: 0, total: 0, needs: 0, next: null, status: "idle", goodAt: 0, readId: 0, busy: 0 };
   // status: idle (never read) | ok | error (never read, last try failed) | noauth (no/refused token) | absent (this server has no center)
@@ -8136,7 +8136,9 @@
   async function ncRead(force) {
     if (nc.busy && !force) return false;
     const mine = ++nc.readId;
-    const res = await ncApi("GET", NC_PATH + "?limit=50");
+    // a refresh keeps the pages the reader loaded: it asks for as many rows as are held (the server's page cap bounds it), so opening
+    // an older row, a write or the 30 s pulse never collapses the list to page one and closes the open detail
+    const res = await ncApi("GET", NC_PATH + "?limit=" + Math.min(NC_REFRESH_MAX, Math.max(50, nc.items.length)));
     if (mine !== nc.readId) return false;
     const d = res.data || {};
     if (res.status === 200 && Array.isArray(d.items)) {
@@ -8145,7 +8147,7 @@
       const same = sig === nc.sig && nc.status === "ok" && !ncUi.banner && !ncDeepPending;
       nc.sig = sig; nc.goodAt = Date.now();
       if (same) return true;
-      nc.items = d.items; nc.unread = d.unread | 0; nc.total = d.total | 0; nc.needs = d.needs_count | 0; nc.next = d.next_before || null;
+      nc.items = d.items; nc.unread = d.unread | 0; nc.total = d.total | 0; if (typeof d.needs_count === "number") nc.needs = d.needs_count | 0; nc.next = d.next_before || null;
       nc.status = "ok"; nc.goodAt = Date.now();
       if (ncUi.banner && ncUi.banner.kind === "read") ncUi.banner = null;
       if (ncUi.sel && !ncFind(ncUi.sel) && !ncDeepPending) { ncUi.sel = null; ncUi.detail = false; }
@@ -8154,7 +8156,8 @@
     } else {
       if (res.notoken || res.status === 403) { if (nc.status !== "ok") nc.status = "noauth"; }
       else if (nc.status !== "ok") nc.status = "error";
-      if (nc.status === "ok" || nc.goodAt) ncUi.banner = { kind: "read", retry: true, text: "Couldn’t refresh. Showing the list as of " + ncClock(nc.goodAt || Date.now()) + "." };
+      // a standing write failure ("Delete didn't reach Levain") is the more specific word: a refresh that also fails never replaces it
+      if ((nc.status === "ok" || nc.goodAt) && !(ncUi.banner && ncUi.banner.kind === "write")) ncUi.banner = { kind: "read", retry: true, text: "Couldn’t refresh. Showing the list as of " + ncClock(nc.goodAt || Date.now()) + "." };
     }
     ncPaint();
     if (nc.status === "ok" && ncDeepPending) ncDeepTry();
@@ -8191,26 +8194,39 @@
     if (ok && ncUi.pinned && ncUi.pinned.id === id) { ncUi.pinned = Object.assign({}, ncUi.pinned, { read }); ncPaint(); }
     return ok;
   }
-  const ncMarkAll = () => ncWrite(NC_PATH + "/read-all", {}, "Mark all read", false);
+  async function ncMarkAll() {
+    const ok = await ncWrite(NC_PATH + "/read-all", {}, "Mark all read", false);
+    if (ok && ncUi.pinned && !ncUi.pinned.read) { ncUi.pinned = Object.assign({}, ncUi.pinned, { read: true }); ncPaint(); }
+    return ok;
+  }
   async function ncClear() {
     ncUi.menu = false;
     const ok = await ncWrite(NC_PATH + "/clear", {}, "Clear all", false);
     if (ok) { ncUi.sel = null; ncUi.pinned = null; ncUi.detail = false; ncPaint(); }
   }
   async function ncDelete(id) {
-    const it = ncFind(id);
-    // the row leaves at once; a failure puts the server's list back (ncWrite reads again) and names what did not land
+    const it = ncFind(id), was = { items: nc.items, total: nc.total, unread: nc.unread }, wasSel = ncUi.sel === id, wasPin = ncUi.pinned;
+    // the row leaves at once; a failure puts it back (the pinned copy is only dropped once the delete is confirmed) and names what did not land
     nc.items = nc.items.filter((x) => x.id !== id); nc.total = Math.max(0, nc.total - 1);
     if (it && !it.read) nc.unread = Math.max(0, nc.unread - 1);
     if (ncUi.sel === id) { ncUi.sel = null; ncUi.detail = false; }
-    if (ncUi.pinned && ncUi.pinned.id === id) ncUi.pinned = null;
     ncPaint();
     const ok = await ncWrite(NC_PATH + "/delete", { id }, "Delete", true);
+    if (ok) { if (ncUi.pinned && ncUi.pinned.id === id) { ncUi.pinned = null; ncPaint(); } return ok; }
+    // not deleted: a refresh that failed too (its sig is still empty) leaves the optimistic list, so the held one comes back whole;
+    // a refresh that landed already holds the server's list, and a row beyond it stays reachable through the pin
+    if (!nc.sig) { nc.items = was.items; nc.total = was.total; nc.unread = was.unread; }
+    if (it && !nc.items.some((x) => x.id === id)) ncUi.pinned = it;
+    else if (wasPin && wasPin.id === id) ncUi.pinned = wasPin;
+    if (wasSel) { ncUi.sel = id; ncUi.detail = true; }
+    ncPaint();
     return ok;
   }
   function ncSelect(id) {
     ncUi.sel = id; ncUi.detail = true; ncUi.gone = "";
     const it = ncFind(id);
+    // a row beyond the first page is pinned, so no refresh can lose the open detail
+    if (it && nc.items.findIndex((x) => x.id === id) >= 50) ncUi.pinned = it;
     ncPaint();
     if (it && !it.read) ncSetRead(id, true);
   }

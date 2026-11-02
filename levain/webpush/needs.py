@@ -20,8 +20,8 @@ BADGE_MAX = 99      # payload room is tight and a badge past two digits says not
 
 
 def open_needs_count(queue_dir: "Path | str") -> "int | None":
-    """Pending consent requests plus open questions in ``queue_dir`` as of now. Each store is read on its own: one that cannot
-    be read counts what the other holds, and an unreadable half with nothing counted in the other is None, never 0.
+    """Pending consent requests plus open questions in ``queue_dir`` as of now. Each store is read on its own so a failure in one
+    does not stop the other, but either failing makes the answer None (unknown), never a lower-bound number.
     Creates nothing (a queue with no ``questions.db`` has no open questions)."""
     total, failed = 0, False
     try:
@@ -29,7 +29,7 @@ def open_needs_count(queue_dir: "Path | str") -> "int | None":
 
         got = read_listing(queue_dir, now=datetime.now(timezone.utc))
         total = sum(1 for e in got.pending if e.state == "pending")
-    except Exception:  # noqa: BLE001 - this half is unknown; the other still counts
+    except Exception:  # noqa: BLE001 - this half is unknown; the other is still read, but the answer is None
         failed = True
     try:
         from levain.consent.questions import QuestionStore
@@ -37,8 +37,8 @@ def open_needs_count(queue_dir: "Path | str") -> "int | None":
         total += len(QuestionStore(queue_dir).open_questions())
     except Exception:  # noqa: BLE001 - likewise
         failed = True
-    # a half that could not be read leaves a floor, never a zero: a wrong 0 would clear a real badge
-    return None if failed and total == 0 else total
+    # a half that could not be read makes the count unknown, never a smaller number: a partial count could lower a real badge (6 -> 2)
+    return None if failed else total
 
 
 def badge_value(queue_dir: "Path | str") -> "int | None":
