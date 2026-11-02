@@ -20,7 +20,7 @@ from levain.graduation_policy import AuthorityCoverage
 
 pytest.importorskip("cryptography")
 from tests.test_authority_graduation_kind import GP, STORE, World, grad  # noqa: E402
-from tests.test_graduation_policy import APPEND  # noqa: E402
+from tests.test_graduation_policy import APPEND, root_dir  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -68,9 +68,7 @@ def test_e2c_arm_a_on_the_real_branch(tmp_path):
     (tmp_path / "w").mkdir(mode=0o700)
     w = World(tmp_path / "w")
     w.link({"op": "create_grant", "grant": grad(w)}, "laptop")
-    rootdir = tmp_path / "root"
-    rootdir.mkdir(mode=0o700)
-    signers = rootdir / "allowed_signers"
+    signers = root_dir(tmp_path) / "allowed_signers"
     signers.write_text(f'laptop namespaces="levain-authority" {w.state().keys[w.fp("laptop")].public_key}\n')
     os.chmod(signers, 0o644)
     src = AuthorityCoverage(w.root, allowed_signers=signers, store_id=STORE)
