@@ -557,7 +557,9 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
     ``tap`` (the caller holds a tap token, not the full credential): an alias writes a bounded overlay only, never the
     base (``desk`` for a day by default, the retired route's own default), and neither alias replaces a standing preset
     (``away``, ``quiet``, ``sleep``, ``loud``): that is refused under the lock, and ``back`` ends it. The operator's own
-    path (``tap`` false) is unchanged."""
+    path (``tap`` false) writes the standing default: ``desk`` is ``follow`` with no overlay and no end (the retired route
+    gave it a day; follow is the default state, so there is nothing to return to), and ``devices`` is one hour unless a
+    duration is given."""
     from levain.webpush import intent
 
     if word in _ROUTE_ALIASES:
