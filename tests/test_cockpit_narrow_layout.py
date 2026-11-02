@@ -13,7 +13,7 @@ from tests.test_cockpit_narrow_layout_rig import (DESKTOP, NEEDS, PHONE_TOUCH, S
 CSS = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.css"
 HTML = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.html"
 
-TABS = ["needs", "board", "notes", "grants", "drop"]
+TABS = ["needs", "inbox", "board", "notes", "grants", "drop"]
 
 # where things sit and how the strip draws, as one JSON string
 LAYOUT = """(() => { const q = (s) => document.querySelector(s);
@@ -46,7 +46,7 @@ def test_a_phone_gets_the_strip_the_needs_first_and_a_jump_to_each_page_view(tmp
     layout, jumps = values[0], {v["which"]: v for v in values[1:]}
     assert layout["display"] == "flex" and layout["position"] == "sticky" and layout["tabs"] == TABS
     assert layout["tabH"] >= 40, layout   # a thumb's height
-    assert layout["stripFits"], layout    # all five tabs show at 390, none cut at the edge
+    assert layout["stripFits"], layout    # all six tabs show at 390, none cut at the edge
     assert layout["scrollW"] <= layout["vw"], layout   # no sideways scroll
     # the hero's two children join the deck's column without the hero's own box: it carries none for the flatten to lose
     assert layout["heroDisplay"] == "contents" and layout["heroBox"] == "0px 0px 0px 0px 0px 0px 0px 0px rgba(0, 0, 0, 0) none", layout

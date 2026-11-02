@@ -2765,7 +2765,7 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
   body.ke .hero > .band { order: -2; }
   body.ke .ck-needs, body.ke .ck-drop, body.ke .ck-notes { order: -1; }   /* equal order keeps document order: the strip, then the drop under it, then the notes */
   /* a view the strip jumps to stops under the sticky strip, never behind it */
-  body.ke #ck-needs, body.ke #ck-drop, body.ke #ck-state-slot, body.ke .panel[data-ck-panel="tray"], body.ke .panel[data-ck-panel="notifications"] { scroll-margin-top: calc(var(--hit-min) + var(--sp-4)); }
+  body.ke #ck-needs, body.ke #ck-drop, body.ke #ck-state-slot, body.ke #inbox-view, body.ke .panel[data-ck-panel="tray"], body.ke .panel[data-ck-panel="notifications"] { scroll-margin-top: calc(var(--hit-min) + var(--sp-4)); }
   body.ke .ck-phonetabs {
     display: flex; gap: 0; position: sticky; top: 0; z-index: 5;
     padding: 0 var(--gutter-ke); background: var(--base); border-bottom: 1px solid var(--hair);
