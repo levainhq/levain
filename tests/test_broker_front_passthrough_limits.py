@@ -143,9 +143,40 @@ async def _settled(front: Front) -> None:
 
 
 async def _drain_to_eof(r: asyncio.StreamReader) -> None:
+    """Read until the tunnel has ended. A close that leaves unread inbound bytes surfaces on Linux as a reset rather
+    than EOF (the client had written past what the front read before the cut), so either ending means "closed"."""
     data = b"x"
     while data:
-        data = await asyncio.wait_for(r.read(65536), 5)
+        try:
+            data = await asyncio.wait_for(r.read(65536), 5)
+        except (ConnectionResetError, BrokenPipeError):
+            return
+
+
+def test_drain_to_eof_accepts_eof_and_reset_as_the_tunnel_ending():
+    class _Eof:
+        def __init__(self):
+            self.chunks = [b"abc", b""]
+
+        async def read(self, n):
+            return self.chunks.pop(0)
+
+    class _Reset:
+        def __init__(self, exc):
+            self.exc, self.first = exc, True
+
+        async def read(self, n):
+            if self.first:
+                self.first = False
+                return b"abc"
+            raise self.exc
+
+    async def go():
+        await _drain_to_eof(_Eof())
+        await _drain_to_eof(_Reset(ConnectionResetError(104, "reset")))
+        await _drain_to_eof(_Reset(BrokenPipeError(32, "pipe")))
+
+    asyncio.run(go())
 
 
 def test_no_cap_counts_and_logs_the_total_but_never_refuses():
