@@ -64,3 +64,30 @@ def test_install_refuses_the_live_claude_dir_without_live(tmp_path, monkeypatch,
     assert not (live / "settings.json").exists()
     assert cli.main(["observe", "install", "--settings-root", str(live), "--live"]) == 0
     assert (live / "settings.json").exists()
+
+
+def test_install_refuses_and_writes_nothing_on_a_non_list_hook_entry_or_a_failed_import(tmp_path, monkeypatch):
+    root = tmp_path / "r"
+    root.mkdir()
+    (root / "settings.json").write_text('{"hooks": {"PermissionRequest": {"matcher": "Bash"}}}')
+    before = (root / "settings.json").read_text()
+    monkeypatch.setattr(observe, "_can_import", lambda py: True)
+    assert cli.main(["observe", "install", "--settings-root", str(root)]) == 1
+    assert cli.main(["observe", "uninstall", "--settings-root", str(root)]) == 1
+    (root / "settings.json").write_text("{}")
+    monkeypatch.setattr(observe, "_can_import", lambda py: False)
+    assert cli.main(["observe", "install", "--settings-root", str(root)]) == 1
+    assert (root / "settings.json").read_text() == "{}" and before
+
+
+def test_a_settings_symlink_into_the_live_dir_needs_live(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "settings.json").write_text("{}")
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "settings.json").symlink_to(home / ".claude" / "settings.json")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(observe, "_can_import", lambda py: True)
+    assert cli.main(["observe", "install", "--settings-root", str(other)]) == 2
+    assert (home / ".claude" / "settings.json").read_text() == "{}"

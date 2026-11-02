@@ -236,19 +236,26 @@ def install(root: Path, *, live: bool = False, python: str | None = None) -> int
         print(f"refused: {root} is the live ~/.claude; pass --live to write there", file=sys.stderr)
         return 2
     path = Path(root).expanduser() / "settings.json"
+    if not live and is_live_root(path.resolve().parent):  # a symlinked settings.json into the live dir
+        print(f"refused: {path} resolves into the live ~/.claude; pass --live to write there", file=sys.stderr)
+        return 2
     try:
         doc = _load_settings(path)
         hooks_doc = doc.setdefault("hooks", {})
         groups = hooks_doc.setdefault("PermissionRequest", [])
         if not isinstance(hooks_doc, dict) or not isinstance(groups, list):
             raise ValueError("hooks.PermissionRequest is not a list; fix it by hand first")
-        if any(_is_ours(h) for g in groups if isinstance(g, dict) for h in (g.get("hooks") if isinstance(g.get("hooks"), list) else [])):
-            print(f"already installed in {path}")
-            return 0
-        # a missing interpreter or a failed import must not show the harness "Hook failed": the logger answers nothing
         py = python or sys.executable
+        # a missing interpreter or a failed import must not show the harness "Hook failed": the logger answers nothing
         if not _can_import(py):
             raise ValueError(f"{py} cannot import levain.observe; install levain there first")
+        ours = [h for g in groups if isinstance(g, dict) for h in (g.get("hooks") if isinstance(g.get("hooks"), list) else [])
+                if _is_ours(h)]
+        if ours:
+            if any(" -I -m " not in h["command"] for h in ours):
+                raise ValueError("an older observe entry is installed; run `levain observe uninstall` first")
+            print(f"already installed in {path}")
+            return 0
         # -I: the hook runs in the project's cwd, so a levain/ directory there must not shadow the installed package
         cmd = f"{shlex.quote(py)} -I -m {MARKER} {SUFFIX}"
         groups.append({"matcher": "", "hooks": [{"type": "command", "command": cmd}]})
@@ -268,6 +275,9 @@ def uninstall(root: Path, *, live: bool = False) -> int:
     if not path.exists():
         print(f"nothing to remove: {path} does not exist")
         return 0
+    if not live and is_live_root(path.resolve().parent):
+        print(f"refused: {path} resolves into the live ~/.claude; pass --live to write there", file=sys.stderr)
+        return 2
     try:
         doc = _load_settings(path)
         hooks = doc.get("hooks", {})
@@ -291,6 +301,9 @@ def uninstall(root: Path, *, live: bool = False) -> int:
                 if not hooks:
                     doc.pop("hooks", None)
             _write_settings(path, doc)
+        else:
+            print(f"nothing to remove: no observe entry in {path}")
+            return 0
     except (OSError, ValueError, AttributeError) as exc:
         print(f"refused, nothing written: {exc}", file=sys.stderr)
         return 1
