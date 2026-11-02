@@ -415,9 +415,11 @@ def _event(out, message, **kw):
     return ev
 
 
+SCOPE = {"store": "flow-needs-phill", "install": "flow-3ce2832a8fe94ea7", "session": "sess-1", "view": "view-1"}
+
+
 def _ctx(signers_text, **kw):
-    c = {"signers": signers_text, "principal": "phill", "ctk": lambda pk: (True, "bio"),
-         "event_ts": AT + timedelta(seconds=7)}
+    c = {"signers": signers_text, "principal": "phill", "ctk": lambda pk: (True, "bio"), **SCOPE}
     c.update(kw)
     return c
 
@@ -434,14 +436,15 @@ def test_class_signed_terminal(signed_world):
     ({"what": "Another question?"}, {}, {}, "asked"),
     ({}, {"answer": "(b) other"}, {}, "recorded answer"),
     ({}, {"signed_entry": 2}, {}, "entry out of range"),
-    ({}, {}, {"event_ts": AT + timedelta(minutes=11)}, "stale"),
-    ({}, {}, {"event_ts": AT - timedelta(seconds=5)}, "future-dated"),
+    ({}, {"ts": "2026-11-02T19:03:24Z"}, {}, "stale"),
+    ({}, {"ts": "2026-11-02T18:52:18Z"}, {}, "future-dated"),
     ({}, {}, {"ctk": lambda pk: (False, "none")}, "ctk"),
     ({}, {}, {"signers": ""}, "no signers"),
 ])
 def test_class_failed(signed_world, row_patch, ev_patch, ctx_patch, why):
     path, message, out, signers = signed_world
     ev = _event(out, message)
+    ev_patch = dict(ev_patch)                      # never pop from pytest's shared parametrize dict
     if "signed_entry" in ev_patch:
         ev["signed"]["entry"] = ev_patch.pop("signed_entry")
     ev.update(ev_patch)
@@ -478,15 +481,174 @@ def test_class_labels_confer_nothing():
     assert legacy.state == "legacy" and "before signing existed" in legacy.detail
 
 
+BASE = {"ts": "2026-11-02T18:40:00Z", "answer": "(a) Add a Levain 1.0 row", "via": "terminal",
+        "unsigned": {"reason": "cancelled"}}
+
+
+def _countersign(path, message, **kw):
+    """A countersign event: typed at another seat (sess-2 / view-2), 7 s after its own `at`."""
+    sig = ckeys.ssh_signer(path, namespace=ts.NAMESPACE)[1](message)
+    cs = {"event": "countersign", "of_ts": BASE["ts"], "ts": "2026-11-02T18:52:30Z", "session": "sess-2",
+          "view": "view-2", "signed": {"format": ts.FORMAT, "message": message.decode(), "sig": sig, "entry": 1}}
+    cs.update(kw)
+    return cs
+
+
 def test_class_countersign_makes_late(signed_world):
     path, message, out, signers = signed_world
-    base = {"ts": "2026-11-02T18:40:00Z", "answer": "(a) Add a Levain 1.0 row", "via": "terminal",
-            "unsigned": {"reason": "cancelled"}}
-    cs = {"of_ts": base["ts"], "signed": {"format": ts.FORMAT, "message": message.decode(), "sig": out.signature,
-                                           "entry": 1}}
-    got = ts.answer_class(base, ROW, _ctx(signers, countersigns=[cs]))
+    cm = _msg(session="sess-2", view="view-2", countersign_of=BASE["ts"])
+    cs = _countersign(path, cm)
+    got = ts.answer_class(BASE, ROW, _ctx(signers, countersigns=[cs]))
     assert got.state == "signed-terminal" and got.late
-    other = ts.answer_class(base, ROW, _ctx(signers, countersigns=[{**cs, "of_ts": "elsewhere"}]))
+    other = ts.answer_class(BASE, ROW, _ctx(signers, countersigns=[{**cs, "of_ts": "elsewhere"}]))
     assert other.state == "unsigned-terminal"
-    bad_row = ts.answer_class(base, {**ROW, "id": "np-x"}, _ctx(signers, countersigns=[cs]))
+    bad_row = ts.answer_class(BASE, {**ROW, "id": "np-x"}, _ctx(signers, countersigns=[cs]))
     assert bad_row.state == "unsigned-terminal"
+
+
+# --- L3 r1 planted failures (each returned a wrong class or raised on 5e4aba86) ----------------------
+
+@pytest.mark.parametrize("name,value", [(n, v) for n in ts.SCOPE_FIELDS for v in ("other-1", None)])
+def test_class_scope_must_match_every_signed_field(signed_world, name, value):
+    # L3 r1 codex HIGH: a signature from store/install/session/view A replayed into B verified as signed
+    path, message, out, signers = signed_world
+    want = "levain-questions:other" if (name == "store" and value) else value
+    ctx = _ctx(signers, **{name: want})
+    if value is None:
+        del ctx[name]                                  # a reader that names no scope fails closed
+    got = ts.answer_class(_event(out, message), ROW, ctx)
+    assert (got.state, got.reason) == ("failed", "scope-mismatch")
+
+
+def test_class_ordinary_signature_is_never_a_countersign(signed_world):
+    # L3 r1 codex HIGH: the unsigned outer of_ts relabelled an ordinary signature as a countersign
+    path, message, out, signers = signed_world
+    for cm in (_msg(session="sess-2", view="view-2"),                                  # no countersign-of line
+               _msg(session="sess-2", view="view-2", countersign_of="2026-11-02T18:39:59Z")):   # names another
+        got = ts.answer_class(BASE, ROW, _ctx(signers, countersigns=[_countersign(path, cm)]))
+        assert got.state == "unsigned-terminal" and not got.late
+
+
+def test_class_countersign_message_is_never_a_direct_answer(signed_world):
+    path, message, out, signers = signed_world
+    cm = _msg(countersign_of=BASE["ts"])
+    ev = _event(out, cm)
+    ev["signed"]["sig"] = _sign_with(path, cm)
+    got = ts.answer_class(ev, ROW, _ctx(signers))
+    assert (got.state, got.reason) == ("failed", "countersign-mismatch")
+
+
+@pytest.mark.parametrize("patch", [
+    {"ts": "2026-11-02T19:10:00Z"},                    # its own `at` is stale against its own ts
+    {"ts": None}, {"ts": "2026-11-02T18:52:30"},       # no aware time of its own
+    {"session": None}, {"view": "view-other"},         # its own scope
+])
+def test_class_countersign_binds_its_own_event(signed_world, patch):
+    path, message, out, signers = signed_world
+    cs = _countersign(path, _msg(session="sess-2", view="view-2", countersign_of=BASE["ts"]), **patch)
+    assert ts.answer_class(BASE, ROW, _ctx(signers, countersigns=[cs])).state == "unsigned-terminal"
+
+
+def test_class_countersign_store_and_install_are_the_readers(signed_world):
+    path, message, out, signers = signed_world
+    cs = _countersign(path, _msg(session="sess-2", view="view-2", countersign_of=BASE["ts"]))
+    assert ts.answer_class(BASE, ROW, _ctx(signers, countersigns=[cs], install="other")).state == "unsigned-terminal"
+
+
+def test_class_never_raises(signed_world, tmp_path, monkeypatch):
+    # L3 r1 deepseek HIGH + codex/complement MED: every one of these raised out of answer_class
+    path, message, out, signers = signed_world
+
+    def oserror(pk):
+        raise OSError(2, "sc_auth: no such file")
+
+    def runtime(pk):
+        raise RuntimeError("provider gone")
+    cases = [
+        (_event(out, message), _ctx(signers, ssh_keygen=tmp_path / "missing"), "verifier-unavailable"),
+        (_event(out, message), _ctx(signers, ctk=oserror), "verifier-unavailable"),
+        (_event(out, message), _ctx(signers, ctk=runtime), "classifier-error"),
+        ({**_event(out, message), "signed": {**_event(out, message)["signed"], "message": "\ud800"}},
+         _ctx(signers), "malformed"),
+        (_event(out, message, ts="not a time"), _ctx(signers), "stale"),
+        (_event(out, message, ts="2026-11-02T18:52:30"), _ctx(signers), "stale"),       # naive
+        (_event(out, message, ts=None), _ctx(signers), "stale"),
+        (_event(out, message, ts=[1]), _ctx(signers), "stale"),
+    ]
+    for ev, ctx, reason in cases:
+        got = ts.answer_class(ev, ROW, ctx)
+        assert (got.state, got.reason) == ("failed", reason), (ev.get("ts"), got)
+    assert ts.answer_class(_event(out, message), "not a row", _ctx(signers)).reason == "not-this-row"
+    assert ts.answer_class(None).state == "failed" and ts.answer_class(["x"]).state == "failed"
+    monkeypatch.setattr(ts, "verify", lambda *a, **k: (_ for _ in ()).throw(ValueError("odd")))
+    got = ts.answer_class(_event(out, message), ROW, _ctx(signers))
+    assert (got.state, got.reason) == ("failed", "classifier-error")
+
+
+def test_class_event_ts_forms(signed_world):
+    path, message, out, signers = signed_world
+    for good in ("2026-11-02T18:52:30Z", "2026-11-02T13:52:30-05:00", (AT + timedelta(seconds=7)).timestamp(),
+                 int((AT + timedelta(seconds=7)).timestamp()), AT + timedelta(seconds=7)):
+        assert ts.answer_class(_event(out, message, ts=good), ROW, _ctx(signers)).state == "signed-terminal", good
+    assert ts.event_time(True) is None and ts.event_time(float("inf")) is None and ts.event_time("x" * 100) is None
+
+
+@pytest.mark.parametrize("fields", [
+    {},                                                          # neither answer nor text
+    {"text": "(a) Add a Levain 1.0 row"},                        # the signed variant is answer, not text
+    {"answer": "(a) Add a Levain 1.0 row", "text": "also this"}, # both
+    {"answer": 1},                                               # not text
+])
+def test_class_answer_variant_is_exact(signed_world, fields):
+    # L3 r1 codex/complement MED: an event with no answer and no text classified signed
+    path, message, out, signers = signed_world
+    ev = {k: v for k, v in _event(out, message).items() if k != "answer"}
+    ev.update(fields)
+    got = ts.answer_class(ev, ROW, _ctx(signers))
+    assert (got.state, got.reason) == ("failed", "answer-mismatch")
+    # and the text variant classifies when the signed entry is text
+    tm = _msg(entries=(ts.Entry(ROW["id"], ROW["row_version"], ROW["what"], "information", text="sure"),))
+    tev = {k: v for k, v in _event(out, tm).items() if k != "answer"}
+    tev.update(text="sure", signed={**tev["signed"], "sig": _sign_with(path, tm)})
+    assert ts.answer_class(tev, ROW, _ctx(signers)).state == "signed-terminal"
+
+
+def test_build_refuses_naive_at_and_checks_length_after_nfc():
+    # L3 r1 codex/deepseek: a naive `at` was read as local time and shifted
+    with pytest.raises(ts.MessageError, match="aware"):
+        _msg(at=datetime(2026, 11, 2, 18, 52, 23))
+    # U+0344 normalises to two code points: a line at the bound before NFC is over it after
+    with pytest.raises(ts.MessageError, match="longer"):
+        _msg(typed="̈́" * (ts.LINE_MAX // 2 + 1))
+
+
+@pytest.mark.parametrize("which", [ts.KEY_LABEL, ts.KEY_LABEL + ".pub", ts.KEY_LABEL + SIDECAR_SUFFIX])
+def test_find_key_refuses_links(tmp_path, which):
+    # L3 r1 deepseek/complement: the key files were checked with exists(), which follows links
+    d = tmp_path / "keys"
+    _plain_key(d)
+    real = tmp_path / ("real-" + which)
+    (d / which).rename(real)
+    (d / which).symlink_to(real)
+    with pytest.raises(KeyError_, match="link"):
+        ts.find_key(d)
+
+
+def test_status_never_raises(tmp_path, monkeypatch):
+    d = tmp_path / "keys"
+    _plain_key(d)
+
+    def ctk_oserror(*a, **k):
+        raise FileNotFoundError(2, "no sc_auth")
+    monkeypatch.setattr(ts, "ctk_status", ctk_oserror)
+    assert ts.status(d).state == "warning"
+    monkeypatch.setattr(ts, "find_key", lambda *a: (_ for _ in ()).throw(PermissionError(13, "denied")))
+    assert ts.status(d).state == "warning"
+
+
+def test_sign_never_raises(tmp_path):
+    d = tmp_path / "keys"
+    _plain_key(d)
+    for factory in (_factory(ValueError("odd")), _factory(signature=None), lambda p: None):
+        out = ts.sign(_msg(), key_dir=d, signer_factory=factory)
+        assert (out.state, out.reason) == ("unsigned", "signer-error"), out

@@ -37,13 +37,14 @@ from levain.authority import _pipe_reading
 from levain.authority_sig import (VerifierUnavailable, _sshsig_type_and_flags, presence_missing,
                                   sshsig_public_key)
 from levain.cockpit import keys as _keys
-from levain.cockpit.custody import SC_AUTH, TOUCH_ID, ctk_status, list_identities, read_sidecar
+from levain.cockpit.custody import SC_AUTH, SIDECAR_SUFFIX, TOUCH_ID, ctk_status, read_sidecar
 from levain.cockpit.keys import KeyError_, Signer, signing_public_key
 from levain.trust_anchor import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
 
-__all__ = ["AnswerClass", "Entry", "KEY_LABEL", "MessageError", "NAMESPACE", "FORMAT", "ParsedMessage",
-           "REASONS", "SignOutcome", "StatusReport", "TerminalKey", "VerifyResult", "answer_class", "build_message",
-           "default_signer_factory", "find_key", "fresh", "is_remote", "parse_verified", "sign", "status", "verify"]
+__all__ = ["AnswerClass", "Entry", "FAILED_REASONS", "KEY_LABEL", "MessageError", "NAMESPACE", "FORMAT",
+           "ParsedMessage", "REASONS", "SCOPE_FIELDS", "SignOutcome", "StatusReport", "TerminalKey", "VerifyResult",
+           "answer_class", "build_message", "default_signer_factory", "event_time", "find_key", "fresh", "is_remote",
+           "parse_verified", "sign", "status", "target_id", "verify"]
 
 FORMAT = "levain-terminal-answer/1"
 NAMESPACE = "levain-terminal-answer"
@@ -70,6 +71,11 @@ _CTRL = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]")
 
 class MessageError(ValueError):
     """A message that cannot be built, or bytes that are not a ``levain-terminal-answer/1`` message."""
+
+
+def _one_line(exc: BaseException) -> str:
+    text = str(exc)
+    return f"{type(exc).__name__}: {text.splitlines()[0]}" if text else type(exc).__name__
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -133,13 +139,17 @@ def build_message(*, store: str, install: str, session: str, view: str, typed: s
                   countersign_of: str | None = None) -> bytes:
     """The bytes the operator's key signs. ``typed`` is the one line he typed (NFC, at most :data:`LINE_MAX`);
     ``typed_block`` the verbatim prompt block that parsed, when that is more than the line (its NFC sha256 is
-    signed). ``nonce`` and ``at`` default to fresh values; tests pass them to pin the bytes. Raises
-    :class:`MessageError` on a field that is out of form, no entries, or a message over :data:`MAX_BYTES`."""
+    signed). ``nonce`` and ``at`` default to fresh values; tests pass them to pin the bytes; a naive ``at`` is
+    refused, never read as local time. ``countersign_of`` (a re-sign of an earlier answer, DESIGN section 7) is
+    that answer's ``ts`` as its store writes it. Raises :class:`MessageError` on a field that is out of form, no
+    entries, or a message over :data:`MAX_BYTES`."""
     entries = tuple(entries)
     if not entries:
         raise MessageError("a message answers at least one entry")
-    typed = unicodedata.normalize("NFC", _line(typed, "typed"))
+    typed = _line(unicodedata.normalize("NFC", typed) if isinstance(typed, str) else typed, "typed")
     nonce = secrets.token_hex(8) if nonce is None else nonce
+    if at is not None and (not isinstance(at, datetime) or at.tzinfo is None or at.utcoffset() is None):
+        raise MessageError("`at` must be an aware datetime")
     when = (at or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime(_AT_FORMAT)
     lines = [FORMAT, f"store: {_pattern(store, _STORE, 'store')}", f"install: {_pattern(install, _ID, 'install')}",
              f"session: {_pattern(session, _ID, 'session')}", f"view: {_pattern(view, _ID, 'view')}",
@@ -249,7 +259,10 @@ def parse_verified(signed: bytes) -> ParsedMessage:
 
 
 def fresh(parsed: ParsedMessage, event_ts: datetime) -> bool:
-    """`at` lies within :data:`STALE_S` before the resolve event, never after it. A bound on staleness only."""
+    """`at` lies within :data:`STALE_S` before the resolve event, never after it. A bound on staleness only.
+    An ``event_ts`` that is not an aware datetime is never fresh."""
+    if not isinstance(event_ts, datetime) or event_ts.tzinfo is None or event_ts.utcoffset() is None:
+        return False
     return timedelta(0) <= event_ts - parsed.at <= timedelta(seconds=STALE_S)
 
 
@@ -268,11 +281,26 @@ def _real_key_dir() -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".levain" / "keys"
 
 
+def _own_regular_file(path: Path) -> bool:
+    """False when nothing is at ``path``; True for a regular file this user owns; anything else (a link, a
+    directory, another owner's file) raises ``KeyError_``. Read with ``lstat``, so a link is never followed."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise KeyError_(f"cannot read {path}: {exc.strerror or exc}") from None
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        raise KeyError_(f"{path} is not a regular file of this user (a link is refused)")
+    return True
+
+
 def find_key(key_dir: Path | None = None) -> TerminalKey | None:
     """The enrolled terminal key, found by the fixed label :data:`KEY_LABEL` in the key directory, or None when
     there is none with a ``touch-id`` sidecar. Read-only: nothing is created. A directory open to other users or
-    owned by someone else, or a sidecar that is there but malformed, raises ``KeyError_``. ``key_dir`` is for
-    tests; the default is the real home's, whatever the environment says."""
+    owned by someone else, a key, ``.pub`` or sidecar that is a link or not this user's regular file, or a sidecar
+    that is there but malformed, raises ``KeyError_``. ``key_dir`` is for tests; the default is the real home's,
+    whatever the environment says."""
     d = Path(key_dir) if key_dir is not None else _real_key_dir()
     try:
         st = os.lstat(d)
@@ -283,8 +311,10 @@ def find_key(key_dir: Path | None = None) -> TerminalKey | None:
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
         raise KeyError_(f"{d} is not a private directory of this user (a link is refused)")
     path = d / KEY_LABEL
-    if not path.exists() or not (d / (KEY_LABEL + ".pub")).exists():
+    present = [_own_regular_file(p) for p in (path, d / (KEY_LABEL + ".pub"))]
+    if not all(present):
         return None
+    _own_regular_file(d / (KEY_LABEL + SIDECAR_SUFFIX))
     sidecar = read_sidecar(path)
     if sidecar is None or sidecar.custody != TOUCH_ID:
         return None
@@ -300,18 +330,20 @@ class StatusReport:
 
 def status(key_dir: Path | None = None, *, sc_auth: Path | str = SC_AUTH, identities: list | None = None,
            platform: str | None = None) -> StatusReport:
-    """``terminal-key status``: read-only (``sc_auth list-ctk-identities`` and a look at the key directory)."""
+    """``terminal-key status``: read-only (``sc_auth list-ctk-identities`` and a look at the key directory).
+    Never raises: anything that stops the look is a ``warning`` report naming it."""
     try:
         key = find_key(key_dir)
-    except KeyError_ as exc:
-        return StatusReport("warning", f"WARNING: the terminal key cannot be read: {exc}")
+    except Exception as exc:  # noqa: BLE001 - a status display reports, it never crashes its caller
+        return StatusReport("warning", f"WARNING: the terminal key cannot be read: {_one_line(exc)}")
     if key is None:
         return StatusReport("not enrolled", "not enrolled: answers at the terminal are recorded unsigned")
     try:
         fp = _keys.fingerprint_of(key.public_key)
         ok, note = ctk_status(key.public_key, sc_auth=sc_auth, identities=identities, platform=platform)
-    except (KeyError_, VerifierUnavailable) as exc:
-        return StatusReport("warning", f"WARNING: the terminal key's identity cannot be checked: {exc}", key.public_key)
+    except Exception as exc:  # noqa: BLE001 - as above (sc_auth missing is an OSError, a hang a TimeoutExpired)
+        return StatusReport("warning", f"WARNING: the terminal key's identity cannot be checked: {_one_line(exc)}",
+                            key.public_key)
     if ok is True:
         return StatusReport("enrolled", f"terminal key: enrolled ({fp}), {note}", key.public_key)
     return StatusReport("warning", f"WARNING: terminal key ({fp}): {note}", key.public_key)
@@ -365,10 +397,19 @@ def _classify(exc: KeyError_) -> tuple[str, str]:
 def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None = None,
          signer_factory: SignerFactory | None = None, remote: bool = False,
          bound_s: float = SIGN_BOUND_S) -> SignOutcome:
-    """Sign ``message`` with the terminal key, or say exactly why not (:data:`REASONS`); never raises for an
-    unavailable key. ``remote`` routes to ``unsigned/remote`` before any key is looked at, so no prompt reaches an
-    unattended screen. The default factory is bounded to ``bound_s`` seconds by narrowing ``ssh_signer``'s own
-    timeout for the duration of the call (process-wide, under a lock: the hook is a one-shot process)."""
+    """Sign ``message`` with the terminal key, or say exactly why not (:data:`REASONS`); never raises (an
+    unexpected failure is ``signer-error``). ``remote`` routes to ``unsigned/remote`` before any key is looked
+    at, so no prompt reaches an unattended screen.
+
+    The bound (L3 r1, 2026-11-02): when this was written ``ssh_signer`` took no timeout argument, read the
+    module global ``keys._SIGN_TIMEOUT`` when its ``sign`` ran, and only that ``subprocess.run`` timeout could
+    end the ssh-keygen child (and with it the Touch ID sheet). So this narrows that global to ``bound_s`` for
+    the call and restores it after, under a lock that serialises terminal signs; a worker-thread bound was
+    rejected because it would leave the child, and the sheet, alive with nothing able to end it. The edge
+    that remains: in a process that also signs through ``keys.ssh_signer`` on another thread (an authority or
+    cockpit signer, not a terminal sign), a signature that starts while a terminal sign is in progress runs
+    with this bound instead of its own. A ``timeout`` argument on ``ssh_signer`` removes both the global write
+    and this edge."""
     if remote:
         return SignOutcome("unsigned", "remote", "the desk is remote")
     if not isinstance(message, (bytes, bytearray)) or len(message) > MAX_BYTES:
@@ -396,6 +437,10 @@ def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None
         return SignOutcome("unsigned", "timeout", "the sign step ran out of time")
     except OSError as exc:
         return SignOutcome("unsigned", "signer-error", f"{type(exc).__name__}: {exc.strerror or exc}")
+    except Exception as exc:  # noqa: BLE001 - the hook records an answer whatever the signer did
+        return SignOutcome("unsigned", "signer-error", _one_line(exc))
+    if not isinstance(signature, str) or not signature:
+        return SignOutcome("unsigned", "signer-error", "the signer returned no signature")
     return SignOutcome("signed", None, "", signature, fp)
 
 
@@ -458,7 +503,10 @@ def verify(message: bytes, sig: str, signers: str, principal: str, *, ssh_keygen
         raise VerifierUnavailable(f"ssh-keygen could not verify a terminal signature ({type(exc).__name__})") from None
     finally:
         for fd in fds:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     if cp.returncode != 0:
         return _refuse("the signature does not verify for this principal in this namespace", flags=flags,
                        public_key=public_key)
@@ -498,6 +546,13 @@ class AnswerClass:
     claim: str = ""
     detail: str = ""
     late: bool = False
+    reason: str = ""    # failed only: one of FAILED_REASONS
+
+
+# why a signed block is `failed` (machine-readable; `detail` says it in words)
+FAILED_REASONS = ("malformed", "verifier-unavailable", "bad-signature", "scope-mismatch", "countersign-mismatch",
+                  "not-this-row", "answer-mismatch", "stale", "classifier-error")
+SCOPE_FIELDS = ("store", "install", "session", "view")
 
 
 @dataclass
@@ -507,63 +562,150 @@ class _Ctx:
     ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN
     ctk: Callable[[str], tuple[bool | None, str]] | None = None
     countersigns: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
+    store: Any = None
+    install: Any = None
 
 
-def _terminal_signed(answer: Mapping[str, Any], row: Mapping[str, Any] | None, ctx: _Ctx,
-                     event_ts: datetime | None) -> AnswerClass:
-    """Good only if the signature verifies in the terminal namespace, the bytes parse, and the entry the event
-    names is the row it is attached to (item, row_version, asked, and the answer or text it records)."""
-    signed = answer.get("signed")
+def _failed(reason: str, detail: str) -> AnswerClass:
+    return AnswerClass("failed", detail=detail, reason=reason)
+
+
+def event_time(value: Any) -> datetime | None:
+    """A stored event's ``ts`` as an aware datetime: an aware datetime, an ISO 8601 text with an offset or ``Z``,
+    or a finite epoch number. None for anything else (absent, naive, malformed), which no freshness check
+    passes."""
+    try:
+        if isinstance(value, datetime):
+            return value if value.tzinfo is not None and value.utcoffset() is not None else None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, timezone.utc)
+        if isinstance(value, str) and len(value) <= 64:
+            got = datetime.fromisoformat(value)
+            return got if got.tzinfo is not None and got.utcoffset() is not None else None
+    except (ValueError, OverflowError, OSError):
+        return None
+    return None
+
+
+def target_id(answer: Mapping[str, Any]) -> str | None:
+    """The identifier a countersign's signed ``countersign-of`` line must name: the answer's ``ts`` as its store
+    wrote it (a text verbatim, a number in Python's ``str`` form). None when the answer has no usable ``ts``."""
+    v = answer.get("ts")
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        v = str(v)
+    if isinstance(v, str) and _VERSION.fullmatch(v):
+        return v
+    return None
+
+
+def _recorded(answer: Mapping[str, Any]) -> tuple[str, str] | None:
+    """``("answer", v)`` or ``("text", v)``: exactly one of the two present (not None) and text, else None."""
+    a, t = answer.get("answer"), answer.get("text")
+    if a is not None and t is None and isinstance(a, str):
+        return "answer", a
+    if t is not None and a is None and isinstance(t, str):
+        return "text", t
+    return None
+
+
+def _terminal_signed(signed: Any, recorded: Mapping[str, Any], row: Mapping[str, Any] | None, ctx: _Ctx,
+                     scope: Mapping[str, Any], event_ts: Any, countersign_of: str | None) -> AnswerClass:
+    """Good only if the signature verifies in the terminal namespace, the bytes parse, the four signed scope
+    fields equal ``scope``, the signed ``countersign-of`` is exactly ``countersign_of`` (absent on a direct
+    answer), the entry the block names is the row it is attached to (item, row_version, asked), the answer
+    ``recorded`` holds is the signed one in kind and value, and ``at`` is fresh against ``event_ts``."""
     if not isinstance(signed, Mapping) or signed.get("format") != FORMAT:
-        return AnswerClass("failed", detail="not a terminal signature")
+        return _failed("malformed", "not a terminal signature")
     message, sig = signed.get("message"), signed.get("sig")
     if not isinstance(message, str) or not isinstance(sig, str):
-        return AnswerClass("failed", detail="the signed block carries no message and signature")
-    raw = message.encode("utf-8")
+        return _failed("malformed", "the signed block carries no message and signature")
+    try:
+        raw = message.encode("utf-8")
+    except UnicodeError:
+        return _failed("malformed", "the signed message is not UTF-8 encodable")
     try:
         got = verify(raw, sig, ctx.signers, ctx.principal, ssh_keygen=ctx.ssh_keygen, ctk=ctx.ctk)
+    except (VerifierUnavailable, KeyError_, OSError, subprocess.SubprocessError) as exc:
+        return _failed("verifier-unavailable", f"the signature could not be checked: {_one_line(exc)}")
+    if not got.ok:
+        return _failed("bad-signature", got.problem)
+    try:
         parsed = parse_verified(raw)
     except MessageError as exc:
-        return AnswerClass("failed", detail=f"signed bytes are not a terminal answer: {exc}")
-    if not got.ok:
-        return AnswerClass("failed", detail=got.problem)
+        return _failed("malformed", f"signed bytes are not a terminal answer: {exc}")
     if signed.get("message_sha256") not in (None, parsed.message_sha256):
-        return AnswerClass("failed", detail="message_sha256 is not the message's")
+        return _failed("malformed", "message_sha256 is not the message's")
+    for name in SCOPE_FIELDS:
+        want = scope.get(name)
+        if not isinstance(want, str) or not want or getattr(parsed, name) != want:
+            return _failed("scope-mismatch", f"the signed {name} is not this answer's (or the reader named none)")
+    if countersign_of is None and parsed.countersign_of is not None:
+        return _failed("countersign-mismatch", "a countersign message presented as a direct answer")
+    if countersign_of is not None and parsed.countersign_of != countersign_of:
+        return _failed("countersign-mismatch", "the signed countersign-of does not name this answer")
     n = signed.get("entry")
     if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= len(parsed.entries):
-        return AnswerClass("failed", detail="the event names no entry of the signed message")
+        return _failed("not-this-row", "the event names no entry of the signed message")
     entry = parsed.entries[n - 1]
-    if row is None:
-        return AnswerClass("failed", detail="no row to bind the entry to")
+    if not isinstance(row, Mapping):
+        return _failed("not-this-row", "no row to bind the entry to")
     if (entry.item != row.get("id") or entry.row_version != row.get("row_version")
             or entry.asked != row.get("what")):
-        return AnswerClass("failed", detail="the signed entry is not this row (item, version or question)")
-    if (answer.get("answer") is not None and answer.get("answer") != entry.answer) or \
-            (answer.get("text") is not None and answer.get("text") != entry.text):
-        return AnswerClass("failed", detail="the recorded answer is not the signed one")
-    if event_ts is not None and not fresh(parsed, event_ts):
-        return AnswerClass("failed", detail="the signature is not within ten minutes before the answer")
+        return _failed("not-this-row", "the signed entry is not this row (item, version or question)")
+    kept = _recorded(recorded)
+    signed_answer = ("answer", entry.answer) if entry.answer is not None else ("text", entry.text)
+    if kept is None or kept != signed_answer:
+        return _failed("answer-mismatch", "the recorded answer is not the signed one (kind or words)")
+    when = event_time(event_ts)
+    if when is None:
+        return _failed("stale", "the event has no aware time to bound the signature by")
+    if not fresh(parsed, when):
+        return _failed("stale", "the signature is not within ten minutes before the event")
     return AnswerClass("signed-terminal", got.fingerprint, got.claim)
 
 
 def answer_class(answer: Mapping[str, Any], row: Mapping[str, Any] | None = None, context: Mapping[str, Any] | None = None
                  ) -> AnswerClass:
-    """The one function every reader of a Levain answer goes through. ``answer`` is the resolve event as stored
-    (``signed`` / ``via`` / ``unsigned`` / ``answer`` / ``text`` / ``ts``); ``row`` the row it is attached to
-    (``id``, ``row_version``, ``what``); ``context`` holds ``signers`` (allowed-signers text), ``principal``,
-    ``event_ts`` (aware datetime), ``ctk``, ``ssh_keygen`` and ``countersigns`` (later events of the same shape
-    with ``of_ts``). Order: a ``signed`` block that re-verifies, else a verifying countersign (marked late), else
-    the labels, which never confer anything. No field a hook or CLI writes is read as evidence."""
+    """The one function every reader of a Levain answer goes through; it never raises (anything unexpected is
+    ``failed``/``classifier-error``). ``answer`` is the resolve event as stored (``signed`` / ``via`` /
+    ``unsigned`` / ``answer`` / ``text`` / ``ts``); ``row`` the row it is attached to (``id``, ``row_version``,
+    ``what``); ``context`` holds ``signers`` (allowed-signers text), ``principal``, ``ctk``, ``ssh_keygen``, the
+    scope the reader expects (``store``, ``install``, ``session``, ``view``) and ``countersigns``.
+
+    A direct signature must carry all four scope fields as the context names them, no ``countersign-of`` line,
+    and an ``at`` fresh against the answer's own ``ts``. A countersign is a later event ``{of_ts, ts, session,
+    view, signed}``: its signed ``countersign-of`` must name the answer (:func:`target_id`), its store and install
+    are the context's, its session and view its own event's, and its ``at`` is bounded by its own ``ts``; it
+    confirms the answer the original event recorded. Any missing expected field fails closed.
+
+    Order: a ``signed`` block that re-verifies, else a verifying countersign (marked late), else the labels,
+    which never confer anything. No field a hook or CLI writes is read as evidence."""
+    try:
+        return _answer_class(answer, row, context)
+    except Exception as exc:  # noqa: BLE001 - the chokepoint classifies, it never crashes a reader
+        return _failed("classifier-error", f"the answer could not be classified: {_one_line(exc)}")
+
+
+def _answer_class(answer: Any, row: Any, context: Any) -> AnswerClass:
+    if not isinstance(answer, Mapping):
+        return _failed("malformed", "the answer is not an event")
     c = dict(context or {})
     ctx = _Ctx(c.get("signers", ""), c.get("principal", "phill"), c.get("ssh_keygen", DEFAULT_SSH_KEYGEN),
-               c.get("ctk"), tuple(c.get("countersigns") or ()))
-    ts = c.get("event_ts")
+               c.get("ctk"), tuple(c.get("countersigns") or ()), c.get("store"), c.get("install"))
     if answer.get("signed") is not None:
-        return _terminal_signed(answer, row, ctx, ts)
+        scope = {name: c.get(name) for name in SCOPE_FIELDS}
+        return _terminal_signed(answer.get("signed"), answer, row, ctx, scope, answer.get("ts"), None)
+    target = target_id(answer)
     for cs in ctx.countersigns:
-        if cs.get("of_ts") != answer.get("ts") or cs.get("signed") is None:
+        if target is None or not isinstance(cs, Mapping) or cs.get("of_ts") != answer.get("ts") \
+                or cs.get("signed") is None:
             continue
-        got = _terminal_signed({**cs, "answer": answer.get("answer"), "text": answer.get("text")}, row, ctx, None)
+        scope = {"store": ctx.store, "install": ctx.install, "session": cs.get("session"), "view": cs.get("view")}
+        got = _terminal_signed(cs.get("signed"), answer, row, ctx, scope, cs.get("ts"), target)
         if got.state == "signed-terminal":
             return AnswerClass(got.state, got.signer_fp, got.claim, "countersigned later", late=True)
     via = answer.get("via")
