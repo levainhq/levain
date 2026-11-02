@@ -8138,7 +8138,7 @@
     const mine = ++nc.readId;
     // a refresh keeps the pages the reader loaded: it asks for as many rows as are held (the server's page cap bounds it), so opening
     // an older row, a write or the 30 s pulse never collapses the list to page one and closes the open detail
-    const res = await ncApi("GET", NC_PATH + "?limit=" + Math.min(NC_REFRESH_MAX, Math.max(50, nc.items.length + 10)));
+    const res = await ncApi("GET", NC_PATH + "?limit=" + Math.min(NC_REFRESH_MAX, Math.max(50, nc.items.length)));
     if (mine !== nc.readId) return false;
     const d = res.data || {};
     if (res.status === 200 && Array.isArray(d.items)) {
