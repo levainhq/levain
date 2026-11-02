@@ -1170,35 +1170,36 @@ class Front:
         if self.pt_exhausted:
             raise Refused("passthrough-bytes-exhausted", "cap-reached")
 
-    def _pt_take(self, n: int, own: dict) -> bool:
+    def _pt_take(self, n: int, own: dict) -> tuple[bool, Optional[dict]]:
         """Reserve ``n`` passthrough bytes the caller writes next, with no await between this and its write. False
         (nothing counted) when the session is exhausted or ``n`` would pass the cap; the latter latches exhaustion and
-        closes every passthrough connection, the caller's included, so the chunk is dropped whole. A reservation that
-        lands exactly on the cap latches exhaustion and closes every OTHER connection; the caller's (``own``, its
+        closes every passthrough connection, the caller's included, so the chunk is dropped whole. Returns ``(taken, record)``: ``record`` is the exhaustion log record when this
+        call latched it, else None; the caller logs it, because the log writer is reached only from coroutines. A
+        reservation that lands exactly on the cap latches exhaustion and closes every OTHER connection; the caller's (``own``, its
         counts) is marked cut but left open, so its accepted chunk is written before the caller ends it."""
         cap = self.policy.tunnel_bytes_cap
         if cap is None:
             self.pt_total += n
-            return True
+            return True, None
         if self.pt_exhausted:
-            return False
+            return False, None
         if self.pt_total + n > cap:
-            self._pt_exhaust()
-            return False
+            return False, self._pt_exhaust()
         self.pt_total += n
         if self.pt_total == cap:
-            self._pt_exhaust(spare=own)
-        return True
+            return True, self._pt_exhaust(spare=own)
+        return True, None
 
-    def _pt_exhaust(self, spare: Optional[dict] = None) -> None:
+    def _pt_exhaust(self, spare: Optional[dict] = None) -> dict:
+        """Latch exhaustion and cut the connections; returns the record the async caller logs (no log write here)."""
         self.pt_exhausted = True
-        self._log({"event": "passthrough-bytes-exhausted", "cap": self.policy.tunnel_bytes_cap,
-                   "total": self.pt_total})
+        rec = {"event": "passthrough-bytes-exhausted", "cap": self.policy.tunnel_bytes_cap, "total": self.pt_total}
         for counts, c, u in list(self._pt_open.values()):
             counts["cut"] = True
             if counts is not spare:
                 c.close()
                 u.close()
+        return rec
 
     async def _pt_drain(self, w: asyncio.StreamWriter) -> bool:
         """Drain a passthrough writer, bounded by the deadline when there is one: False when it passes first."""
@@ -1354,8 +1355,12 @@ class Front:
                     pt_refusal = "passthrough-bytes-exhausted"
                 elif uwriter.is_closing():   # shut down meanwhile: nothing is counted or forwarded
                     return
-                elif not self._pt_take(len(hello), counts):
-                    pt_refusal = "passthrough-bytes-exhausted"
+                else:
+                    taken, ex_rec = self._pt_take(len(hello), counts)
+                    if ex_rec is not None:
+                        self._log(ex_rec)
+                    if not taken:
+                        pt_refusal = "passthrough-bytes-exhausted"
             if pt_refusal is not None:
                 self._log({"event": "refused", "refused": pt_refusal, "detail": "hello", "host": route.host,
                            "address": addr})
@@ -1451,7 +1456,10 @@ class Front:
                             return "deadline"
                         if counts.get("cut") or dst.is_closing():
                             return "bytes-exhausted" if counts.get("cut") else "broken"
-                        if not self._pt_take(len(chunk), counts):
+                        taken, ex_rec = self._pt_take(len(chunk), counts)
+                        if ex_rec is not None:
+                            self._log(ex_rec)
+                        if not taken:
                             return "bytes-exhausted"
                     last[0] = loop.time()
                     dst.write(chunk)
