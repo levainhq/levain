@@ -3074,3 +3074,26 @@ body.ke .dev-zone.pr-settings .zone-head { display: flex; }
   .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) .pair-actions.card-rows .dev-btn { font-size: var(--fs-lead); padding: var(--sp-4) var(--sp-5); }
   .pair-body:not(.sheet-embedded) #sheet:has(#sheet-card) #sheet-signing { margin: 0 0 var(--sp-4); }
 }
+.nf-curl { flex: none; width: 100%; margin: var(--sp-3) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; -webkit-user-select: all; }
+.nf-new .nf-token { width: 100%; margin-top: var(--sp-3); }
+/* The Notices section: a row type of its own. The source is a muted chip, the priority a dot (grey low, plain normal, amber
+   urgent), the title and body one toggle that only expands the text, Dismiss the one action. Reuses the dev-* rows and tokens. */
+.nt-zone { margin-top: var(--sp-6); }
+.nt-zone:focus { outline: none; }
+.nt-zone .zone-head { margin: 0 0 var(--sp-3); }
+.nt-zone .zone-title { margin: 0; }
+.nt-zone .dev-body { padding: var(--sp-1) var(--sp-5) var(--sp-4); }
+.nt-zone .dev-row { padding: var(--sp-3) 0; align-items: flex-start; }
+.nt-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); }
+.nt-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--label); }
+.nt-row[data-priority="low"] .nt-dot { background: var(--hair-2); }
+.nt-row[data-priority="urgent"] .nt-dot { background: var(--warn); }
+.nt-src, .nt-revoked { padding: 2px var(--sp-3); border: 1px solid var(--hair); border-radius: var(--r-sm); color: var(--meta, var(--label)); font: var(--fw-regular) var(--fs-micro) var(--mono); overflow-wrap: anywhere; }
+.nt-revoked { color: var(--warn); border-color: var(--warn); }
+.nt-when { color: var(--label); font: var(--fw-regular) var(--fs-micro) var(--sans); }
+.nt-toggle { display: block; width: 100%; min-height: var(--hit-min, 44px); margin: 0; padding: var(--sp-2) 0 0; border: 0; background: none; color: var(--text); text-align: left; font: inherit; cursor: pointer; }
+.nt-title { display: block; font: var(--fw-semibold) var(--fs-meta)/1.4 var(--sans); overflow-wrap: anywhere; }
+.nt-body { display: -webkit-box; margin-top: var(--sp-2); color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.5 var(--sans); overflow-wrap: anywhere; white-space: pre-wrap; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.nt-open .nt-body { display: block; -webkit-line-clamp: unset; overflow: visible; }
+.nt-row .dev-main { min-width: 0; flex: 1 1 auto; }
+body.ke .dev-zone.nt-zone .zone-head { display: flex; }

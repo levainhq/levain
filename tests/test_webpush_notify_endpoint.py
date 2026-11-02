@@ -393,7 +393,7 @@ def test_a_notify_token_is_refused_on_every_other_route_and_changes_nothing(rig)
     tok = _mint(q, "Hub", urgent=True)
     both = {nt.HEADER: tok, "Authorization": f"Bearer {tok}"}
     with _signed(src, q) as (port, _):
-        gets = ["/webpush/presence", "/webpush/policy", "/webpush/record", "/webpush/key", TOKENS, "/substrate.json",
+        gets = ["/webpush/presence", "/webpush/policy", "/webpush/record", "/webpush/key", TOKENS, "/webpush/notices", "/substrate.json",
                 "/cockpit/manifest.json", "/cockpit/pair/list", "/recall.json"]
         for path in gets:
             # a notify token adds nothing: the answer is the one a request with no credential gets, loopback or proxied
@@ -406,7 +406,7 @@ def test_a_notify_token_is_refused_on_every_other_route_and_changes_nothing(rig)
         posts = [("/webpush/presence/set", {"word": "away"}), ("/webpush/presence/set", {"word": "sleep"}),
                  ("/webpush/policy/set", {"mute": "sleep", "class": "other", "value": "push"}),
                  ("/webpush/presence/token/new", {"name": "x"}), (TOKENS, {"name": "mine"}), (REVOKE, {"name": "Hub"}),
-                 ("/webpush/test", {}), ("/edit", {}), ("/action", {}), ("/cockpit/pair/offer", {"label": "x"})]
+                 ("/webpush/notices/dismiss", {"id": 1}), ("/webpush/test", {}), ("/edit", {}), ("/action", {}), ("/cockpit/pair/offer", {"label": "x"})]
         for path, body in posts:
             for hdrs in (both, {**both, **PROXY}):
                 st, _g, _h = _call(port, "POST", path, body, headers=hdrs)

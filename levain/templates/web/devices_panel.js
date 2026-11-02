@@ -177,10 +177,13 @@
     prSetSec.appendChild(sh);
     const sgrid = el("div", "ck-zgrid dev-grid pr-settings-grid");
     sgrid.appendChild(buildTaps());
+    sgrid.appendChild(buildNotify());
     sgrid.appendChild(buildPolicy());
     prSetSec.appendChild(sgrid);
+    buildNotices();
     const main = document.querySelector("main.frame");
-    if (main) { main.appendChild(section); main.appendChild(prSetSec); } else { document.body.appendChild(section); document.body.appendChild(prSetSec); }
+    if (main) { main.appendChild(section); main.appendChild(prSetSec); main.appendChild(ntSec); }
+    else { document.body.appendChild(section); document.body.appendChild(prSetSec); document.body.appendChild(ntSec); }
     buildChip();
     buildSheet();
   }
@@ -189,7 +192,7 @@
   // Notifications policy) and shows while either does, each with its own gone/refused state.
   function syncSection() {
     section.hidden = devPanel.hidden;
-    if (prSetSec) prSetSec.hidden = (!npPanel || npPanel.hidden) && (!prPanel || prPanel.hidden);
+    if (prSetSec) prSetSec.hidden = (!npPanel || npPanel.hidden) && (!prPanel || prPanel.hidden) && (!nfPanel || nfPanel.hidden);
   }
   function devShown(on) { devPanel.hidden = !on; syncSection(); }
   function npShown(on) { npPanel.hidden = !on; syncSection(); }
@@ -662,6 +665,228 @@
       prEndLoud = null, prSheetNote = null, prLink = null, prDur = "1h", prSetSec = null, prTapList = null, prNote = null,
       prNew = null, prName = null, prChecks = {}, prBusy = false, prGen = 0, prReadId = 0, prGone = false, prRefused = "", prCur = null;
 
+  // ---- Notices: what your own services posted at you (levain.webpush.notify) ---------------------------------------------------
+  // A doorbell's log and nothing more. Its own section at the foot in every mode, so `/?view=notices` (the link a notice's push
+  // carries) always has somewhere to land. Every field is set with textContent (el() does), never as markup, and a URL in a body
+  // stays inert text: no link, no reply, no deep link. Dismiss is the one action. It carries no count and no badge, it is not in
+  // Needs-you, the board, the tray or the agents graph, and nothing else on the page learns what it holds.
+  let ntSec = null, ntList = null, ntNote = null, ntOpen = new Set(), ntGone = false, ntBusy = false, ntAsked = false;
+  try { ntAsked = new URLSearchParams(window.location.search).get("view") === "notices"; } catch (_) { ntAsked = false; }
+  function buildNotices() {
+    ntSec = el("section", "ck-zone dev-zone nt-zone");
+    ntSec.id = "notices";
+    ntSec.tabIndex = -1;
+    ntSec.dataset.zone = "notices";
+    ntSec.dataset.modes = ALL_MODES;
+    ntSec.hidden = true;
+    const sh = el("div", "zone-head");
+    sh.appendChild(el("h2", "zone-title", "Notices"));
+    ntSec.appendChild(sh);
+    const panel = el("div", "panel k-list dev-panel nt-panel");
+    panel.dataset.modes = ALL_MODES;
+    const body = el("div", "pbody dev-body");
+    ntList = el("div", "dev-list nt-list");
+    body.appendChild(ntList);
+    ntNote = el("p", "dev-note nt-note"); ntNote.hidden = true;
+    body.appendChild(ntNote);
+    panel.appendChild(body);
+    const grid = el("div", "ck-zgrid dev-grid nt-grid");     // a zone shows in a mode through a panel in a grid that names the mode
+    grid.appendChild(panel);
+    ntSec.appendChild(grid);
+  }
+  function ntSay(msg) { ntNote.textContent = msg; ntNote.hidden = !msg; }
+  function paintNotices(rows) {
+    ntList.replaceChildren();
+    if (!rows.length) { ntList.appendChild(el("p", "dev-none nt-empty", "No notices right now.")); return; }
+    for (const n of rows) {
+      const open = ntOpen.has(n.id);
+      const row = el("div", "dev-row nt-row" + (open ? " nt-open" : ""));
+      row.dataset.id = String(n.id);
+      row.dataset.priority = String(n.priority);
+      const main = el("div", "dev-main");
+      const head = el("div", "nt-head");
+      const dot = el("span", "nt-dot");
+      dot.setAttribute("role", "img"); dot.setAttribute("aria-label", "priority " + n.priority); dot.title = String(n.priority);
+      head.appendChild(dot);
+      head.appendChild(el("span", "nt-src", String(n.source || "")));
+      if (n.revoked) head.appendChild(el("span", "nt-revoked", "revoked"));
+      head.appendChild(el("span", "nt-when", when(n.at)));
+      main.appendChild(head);
+      const tg = el("button", "nt-toggle");
+      tg.type = "button";
+      tg.setAttribute("aria-expanded", open ? "true" : "false");
+      tg.appendChild(el("span", "nt-title", String(n.title || "")));
+      if (n.body) tg.appendChild(el("span", "nt-body", String(n.body)));
+      tg.addEventListener("click", () => { if (ntOpen.has(n.id)) ntOpen.delete(n.id); else ntOpen.add(n.id); paintNotices(rows); });
+      main.appendChild(tg);
+      row.appendChild(main);
+      const dm = el("button", "dev-btn nt-dismiss", "Dismiss");
+      dm.type = "button";
+      dm.addEventListener("click", () => dismissNotice(n.id));
+      row.appendChild(dm);
+      ntList.appendChild(row);
+    }
+  }
+  async function readNotices() {
+    if (ntGone || ntBusy) return;
+    if (!token()) { ntSec.hidden = true; return; }
+    try {
+      const res = await api("GET", "/webpush/notices", undefined, READ_TIMEOUT_MS);
+      if (res.status === 200 && res.data && Array.isArray(res.data.notices)) {
+        paintNotices(res.data.notices); ntSay(""); ntSec.hidden = false;
+        if (ntAsked) { ntAsked = false; try { window.history.replaceState(null, "", window.location.pathname + window.location.hash); } catch (_) { /* the address stays */ } toNotices(); }
+      } else if (res.status === 404) { ntSec.hidden = true; ntGone = true; }
+      else if (res.status === 403) ntSec.hidden = true;
+      else if (!ntSec.hidden) ntSay("The notices are unavailable right now.");
+    } catch (_) { /* the next pulse tries again */ }
+  }
+  async function dismissNotice(id) {
+    if (ntBusy) return;
+    ntBusy = true; ntSay("");
+    try {
+      const res = await api("POST", "/webpush/notices/dismiss", { id: id });
+      // gone already (another device dismissed it) reads as a dismiss: the list is read again either way
+      if (res.status !== 200 && res.status !== 404) ntSay("Could not dismiss (" + ((res.data && res.data.message) || res.status) + ").");
+      ntOpen.delete(id);
+    } catch (_) { ntSay("Could not reach the cockpit."); }
+    finally { ntBusy = false; }
+    await readNotices();
+  }
+  function toNotices() {
+    if (!ntSec || ntSec.hidden) return;
+    ntSec.scrollIntoView({ block: "start" });
+    ntSec.focus({ preventScroll: true });
+  }
+
+  // ---- notify tokens: what lets one of your own services post a notice at you (POST /notify) -------------------------------
+  // Shown wherever the full credential reads the list (the push family's gate lets nothing else through); the new token is
+  // in the mint reply alone, shown once in this node and kept nowhere, and the list never carries a hash.
+  let nfPanel = null, nfList = null, nfNew = null, nfNote = null, nfName = null, nfSource = null, nfUrgent = null, nfBusy = false;
+  function buildNotify() {
+    nfPanel = el("div", "panel k-list dev-panel pr-panel nf-panel");
+    nfPanel.dataset.modes = ALL_MODES;
+    nfPanel.hidden = true;
+    const ph = el("div", "phead");
+    ph.appendChild(el("h2", null, "Notify tokens"));
+    nfPanel.appendChild(ph);
+    const body = el("div", "pbody dev-body");
+    body.appendChild(el("p", "dev-note pr-intro", "A notify token lets one of your own services post a text notice at you, and nothing else. Notices appear under Notices on your phone."));
+    nfList = el("div", "dev-list nf-list");
+    body.appendChild(nfList);
+    const form = el("form", "pr-new-form nf-form");
+    nfName = el("input", "dev-label nf-name");
+    nfName.type = "text"; nfName.maxLength = 40; nfName.placeholder = "Name, e.g. Backup";
+    nfName.setAttribute("aria-label", "Name for the new notify token");
+    form.appendChild(nfName);
+    nfSource = el("input", "dev-label nf-source");
+    nfSource.type = "text"; nfSource.maxLength = 24; nfSource.placeholder = "Label on each notice, lowercase (optional), e.g. nightly";
+    nfSource.setAttribute("aria-label", "Source label for the new notify token");
+    form.appendChild(nfSource);
+    const boxes = el("div", "pr-checks");
+    const l = el("label", "pr-check");
+    nfUrgent = el("input", "nf-urgent"); nfUrgent.type = "checkbox"; nfUrgent.checked = false;
+    l.appendChild(nfUrgent); l.appendChild(document.createTextNode(" urgent: this token can wake you through sleep"));
+    boxes.appendChild(l);
+    form.appendChild(boxes);
+    const go = el("button", "dev-btn nf-mint", "Create notify token");
+    go.type = "submit";
+    form.appendChild(go);
+    form.addEventListener("submit", (e) => { e.preventDefault(); createNotify(); });
+    body.appendChild(form);
+    nfNew = el("div", "dev-link nf-new"); nfNew.hidden = true;
+    body.appendChild(nfNew);
+    nfNote = el("p", "dev-note nf-note"); nfNote.hidden = true;
+    body.appendChild(nfNote);
+    nfPanel.appendChild(body);
+    return nfPanel;
+  }
+  function nfShow(on) { nfPanel.hidden = !on; syncSection(); }
+  function nfSay(msg) { nfNote.textContent = msg; nfNote.hidden = !msg; }
+  function paintNotify(tokens) {
+    nfList.replaceChildren();
+    if (!tokens.length) { nfList.appendChild(el("p", "dev-none", "No notify tokens yet.")); return; }
+    for (const t of tokens) {
+      const row = el("div", "dev-row nf-row");
+      row.dataset.name = t.name;
+      const main = el("div", "dev-main");
+      main.appendChild(el("div", "dev-name", t.name + (t.source && t.source !== t.name ? " (" + t.source + ")" : "")));
+      main.appendChild(el("div", "dev-meta", (t.urgent ? "May wake you through sleep" : "Normal and low only") + " · "
+        + t.rate_per_min + "/min, " + t.rate_per_day + "/day · last used " + when(t.last_used)));
+      row.appendChild(main);
+      const rv = el("button", "dev-btn nf-revoke", "Revoke");
+      rv.type = "button";
+      rv.addEventListener("click", () => revokeNotify(t.name));
+      row.appendChild(rv);
+      nfList.appendChild(row);
+    }
+  }
+  async function readNotify() {
+    if (!token()) { nfShow(false); return; }
+    try {
+      const res = await api("GET", "/webpush/notify/tokens", undefined, READ_TIMEOUT_MS);
+      if (res.status === 200 && res.data && Array.isArray(res.data.tokens)) { paintNotify(res.data.tokens); nfShow(true); }
+      else if (res.status === 403 || res.status === 404) nfShow(false);
+    } catch (_) { /* the next pulse tries again */ }
+  }
+  async function notifyCall(path, body) {
+    nfSay("");
+    try {
+      const res = await api("POST", path, body);
+      if (res.status === 200 && res.data) { if (Array.isArray(res.data.tokens)) paintNotify(res.data.tokens); return res.data; }
+      nfSay("Could not change the notify tokens (" + ((res.data && res.data.message) || res.status) + ").");
+    } catch (_) { nfSay("Could not reach the cockpit."); }
+    return null;
+  }
+  async function createNotify() {
+    const name = nfName.value.trim();
+    if (!name) { nfSay("Give the notify token a name."); return; }
+    if (nfBusy) return;     // a second mint would replace the first one's only shown secret
+    nfBusy = true;
+    try {
+      const body = { name: name };
+      const src = nfSource.value.trim();
+      if (src) body.source = src;
+      if (nfUrgent.checked) body.urgent = true;
+      const got = await notifyCall("/webpush/notify/tokens", body);
+      if (!got || !got.token) return;
+      nfName.value = ""; nfSource.value = ""; nfUrgent.checked = false;
+      showNewNotify(got.token, got.record || {});
+    } finally { nfBusy = false; }
+  }
+  function notifyCurl(tok) {
+    return "curl -H \"Authorization: Bearer " + tok + "\" -H \"Content-Type: application/json\" -d '{\"title\":\"..\",\"body\":\"..\"}' "
+      + window.location.origin + "/notify";
+  }
+  function showNewNotify(tok, rec) {
+    nfNew.replaceChildren();
+    nfNew.appendChild(el("div", "dev-name", "Token for " + (rec.name || "this service") + ": copy it now, it is not shown again"));
+    const line = el("input", "dev-url nf-token");
+    line.type = "text"; line.readOnly = true; line.value = tok;
+    line.setAttribute("aria-label", "The new notify token");
+    nfNew.appendChild(line);
+    const cmd = notifyCurl(tok);
+    const box = el("pre", "dev-url nf-curl", cmd);
+    nfNew.appendChild(box);
+    const copy = el("button", "dev-btn nf-copy", "Copy the curl");
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(cmd); copy.textContent = "Copied"; }
+      catch (_) { line.focus(); line.select(); copy.textContent = "Select the token and copy"; }
+    });
+    nfNew.appendChild(copy);
+    nfNew.appendChild(el("p", "dev-link-n", "Text only: a title, a body and a priority (low, normal" + (rec.urgent ? ", urgent" : "") + "). Anything else is refused."));
+    nfNew.hidden = false;
+  }
+  async function revokeNotify(name) {
+    if (nfBusy) return;
+    nfBusy = true;
+    try {
+      // the one-time secret on screen goes only when a revoke succeeded, never on a refusal
+      const got = await notifyCall("/webpush/notify/tokens/revoke", { name: name });
+      if (got) { nfNew.hidden = true; nfNew.replaceChildren(); }
+    } finally { nfBusy = false; }
+  }
+
   function loadDur() {
     try {
       const v = window.localStorage.getItem(PR_DUR_KEY);
@@ -746,6 +971,10 @@
     prLink.href = "#presence-settings";
     prLink.addEventListener("click", (e) => { e.preventDefault(); closeSheet(false); toSettings(); });
     prSheet.appendChild(prLink);
+    const ntLink = el("a", "pr-sheet-link nt-link", "Notices →");
+    ntLink.href = "#notices";
+    ntLink.addEventListener("click", (e) => { e.preventDefault(); closeSheet(false); toNotices(); });
+    prSheet.appendChild(ntLink);
     document.body.appendChild(prSheet);
   }
 
@@ -1023,13 +1252,15 @@
     refresh();
     readPolicy();
     readPresence();
+    readNotify();
+    readNotices();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
-    setTimeout(() => { refresh(); readPolicy(); readPresence(); }, 2500);
+    setTimeout(() => { refresh(); readPolicy(); readPresence(); readNotify(); readNotices(); }, 2500);
     // a tab brought back after a long time repaints at once, not at the next pulse
     document.addEventListener("visibilitychange", () => { if (!document.hidden && !prGone && !prBusy) readPresence(); });
     const pulse = setInterval(() => {
       if (gone && npGone && prGone) clearInterval(pulse);
-      else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); if (!prBusy) readPresence(); }
+      else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); if (!prBusy) readPresence(); readNotices(); }
     }, 30000);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();

@@ -376,6 +376,15 @@ class PushStore:
                 "SELECT * FROM notices" + ("" if include_dismissed else " WHERE dismissed_at IS NULL")
                 + " ORDER BY id DESC LIMIT ?", (n,))]
 
+    def opened_ping_ids(self, ping_ids: list[int]) -> set[int]:
+        """Which of these pings some device opened (a row in ``opens``)."""
+        ids = sorted({int(i) for i in ping_ids})
+        if not ids:
+            return set()
+        with self.read() as c:
+            return {int(r[0]) for r in c.execute(
+                "SELECT DISTINCT ping_id FROM opens WHERE ping_id IN (%s)" % ",".join("?" * len(ids)), ids)}
+
     def dismiss_notice(self, notice_id: int, *, now: float | None = None) -> bool:
         """Mark a notice dismissed; whether one was (an unknown or already dismissed id is not)."""
         at = time.time() if now is None else now

@@ -1172,6 +1172,10 @@ _NOTIFY_PATH = "/notify"
 _NOTIFY_TOKEN_HEADER = "X-Levain-Notify-Token"
 _NOTIFY_TOKENS = "/webpush/notify/tokens"
 _NOTIFY_TOKENS_REVOKE = "/webpush/notify/tokens/revoke"
+# the cockpit's Notices card: the full credential's read of the log and its one write (dismiss)
+_NOTICES = "/webpush/notices"
+_NOTICES_DISMISS = "/webpush/notices/dismiss"
+_NOTICES_LIMIT = 100
 # the whole request body, refused on its declared length before it is read: in bytes, sized so a title and a body at
 # their character maxima in 4-byte UTF-8 still fit
 _NOTIFY_MAX_REQUEST = 8192
@@ -1179,10 +1183,10 @@ _NOTIFY_KEYS = frozenset({"title", "body", "priority"})
 _NOTIFY_DEFAULT_TITLE = "Notice"            # a post with no title carries this; the source label is put in front of it
 _NOTIFY_MINT_KEYS = frozenset({"name", "source", "urgent", "max_priority", "rate_per_min", "rate_per_day",
                                "urgent_per_hour"})
-_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH, _NOTIFY_TOKENS})
+_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH, _NOTIFY_TOKENS, _NOTICES})
 _PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
                         _POLICY_SET, _POLICY_RESET, _PRESENCE_SET, _PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE,
-                        _NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE})
+                        _NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE, _NOTICES_DISMISS})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
 # A device's receipt for a push it got: the one webpush POST that takes no token (the worker holds none). Its report names
 # the SHA-256 of the device's own subscription endpoint, checked by the store; it is kept OUT of _PUSH_POST so every route
@@ -2351,6 +2355,11 @@ class _Handler(GuardedHandler):
                     self._send(json.dumps(doc).encode("utf-8"), "application/json; charset=utf-8", status=st,
                                head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
                     return
+                if path == _NOTICES:
+                    doc, st = self._notices_view(queue)
+                    self._send(json.dumps(doc).encode("utf-8"), "application/json; charset=utf-8", status=st,
+                               head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+                    return
                 if path == _PRESENCE_PATH:
                     self._send(json.dumps(self._presence_view(queue)).encode("utf-8"), "application/json; charset=utf-8",
                                status=200, head=head,
@@ -2383,6 +2392,8 @@ class _Handler(GuardedHandler):
             return self._presence_token_post(route, raw)
         if route in (_NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE):
             return self._notify_token_post(route, raw)
+        if route == _NOTICES_DISMISS:
+            return self._notice_dismiss_post(raw)
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
             return self._pair_and_subscribe(raw, name)
@@ -2539,6 +2550,48 @@ class _Handler(GuardedHandler):
         except presence.PresenceError as exc:
             return {"error": "presence_refused", "message": str(exc)}, 422
         return {"tokens": presence_tokens.list_public(queue)}, 200
+
+    def _notices_view(self, queue: Path) -> "tuple[dict[str, Any], int]":
+        """``GET /webpush/notices``: the newest undismissed notices for the Notices card, each row's id, at, source,
+        title, body, priority, decision, whether a device opened its ping, and whether its source's token is revoked
+        (no live token carries that name any more). Text only: the card draws it with textContent, never as markup."""
+        from levain.webpush import notify_tokens
+        from levain.webpush.store import PushStore
+
+        try:
+            store = PushStore(queue)
+            rows = store.notices(_NOTICES_LIMIT)
+            opened = store.opened_ping_ids([r["ping_id"] for r in rows if r["ping_id"] is not None])
+        except Exception as exc:  # noqa: BLE001 - a log that cannot be read is an answer, never an empty card
+            return {"error": "notices_unreadable", "message": type(exc).__name__}, 503
+        try:
+            live = {t["name"] for t in notify_tokens.list_public(queue)}
+        except notify_tokens.NotifyTokenError:
+            live = None      # the token file cannot be read whole: no row is tagged revoked on a guess
+        return {"notices": [
+            {"id": r["id"], "at": r["at"], "source": r["source"], "title": r["title"], "body": r["body"],
+             "priority": r["priority"], "decision": r["decision"], "opened": r["ping_id"] in opened,
+             "revoked": live is not None and r["token"] not in live} for r in rows]}, 200
+
+    def _notice_dismiss_post(self, raw: bytes) -> "tuple[dict[str, Any], int]":
+        """``POST /webpush/notices/dismiss {id}``: take one notice off the card. The full credential's alone; an unknown or
+        already dismissed id is a 404 and nothing is written."""
+        from levain.webpush.store import PushStore
+
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {"error": "bad_json", "message": "body is not valid JSON"}, 400
+        nid = req.get("id") if isinstance(req, dict) and set(req) == {"id"} else None
+        if isinstance(nid, bool) or not isinstance(nid, int):
+            return {"error": "bad_request", "message": "send id as a whole number, and nothing else"}, 400
+        try:
+            done = PushStore(self.server.signer.queue_dir).dismiss_notice(nid)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "notices_unreadable", "message": type(exc).__name__}, 503
+        if not done:
+            return {"error": "not_found", "message": "no such notice, or it is already dismissed"}, 404
+        return {"dismissed": nid}, 200
 
     def _notify_token_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/notify/tokens {name, source?, urgent?, max_priority?, rate_per_min?, rate_per_day?,

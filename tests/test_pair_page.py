@@ -121,7 +121,7 @@ def test_only_the_devices_list_read_has_a_timeout_never_the_offer_or_revoke_post
             assert "READ_TIMEOUT_MS" in line, line
         else:
             assert "READ_TIMEOUT_MS" not in line and "timeout" not in line.lower(), line
-    assert len(re.findall(r'api\("POST"', js)) == 7      # offer, revoke, the pings subscribe and unsubscribe (OS-4), the policy write (NP S2: one call, the route an argument), the presence word, the tap-token change (one call, the route an argument)
+    assert len(re.findall(r'api\("POST"', js)) == 9      # offer, revoke, the pings subscribe and unsubscribe (OS-4), the policy write (NP S2: one call, the route an argument), the presence word, the tap-token change (one call, the route an argument), the notify-token change (N3: one call, the route an argument), the notice dismiss (N3)
 
 
 def _fetch_calls(js: str) -> "list[str]":
