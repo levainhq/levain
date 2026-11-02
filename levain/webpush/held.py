@@ -107,7 +107,8 @@ def plan(items: list[dict], rec: dict, reading: float | None, now: float, remote
     now says push for its kind: lifting a mute does not push a ping while his devices are still off. ``mark`` (why a consent
     away mark stands, :func:`levain.consent.auto_away.any_mark_stands`) releases an approval-class ping whatever the record
     says, by the same decider a new one meets (:func:`levain.consent.auto_away.marked_push`). A held approval-class ping is
-    about a filed request (only :func:`levain.consent.adapters.claude_code.notify` holds one), so it is decided with
+    one :func:`levain.consent.adapters.claude_code.notify` sent (a request filed and held, a limit hold, a ruling-delivery
+    notice: each waits on him, and only that function holds one), so it is decided with
     ``filed`` as a new one is (:func:`levain.consent.auto_away.approval_push`): released once no mute holds it. Pure."""
     from levain.consent.auto_away import marked_push
     from levain.webpush import intent
