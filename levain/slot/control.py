@@ -67,6 +67,7 @@ from levain.contracts import ContractError, canon
 from levain.slot import FRAME_MAX, Refused
 from levain.slot import records as R
 from levain.slot import events as EV
+from levain.slot import limits_doc
 from levain.slot import lineage as LN
 from levain.slot import routemaps
 from levain.slot import tickets as T
@@ -156,6 +157,11 @@ SESSIONS_DIGESTS_MAX = 512
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 #: The run fields ``QUEUE-RESOLVE`` copies from the session's bound ticket (§3.3); ``repo_root`` is added by CONTROL.
 QUEUE_RUN_KEYS = frozenset({"run_id", "job_id", "run_index", "contract_digest", "model_requested"})
+#: P7-A3: the per-run caps a subscription run's answer may add; absent when the ticket holds neither. The bounds are
+#: the broker's own (``qbroker.broker`` ``_calls_ok`` / ``_deadline_ok``), and a plain int is the only type.
+QUEUE_RUN_OPTIONAL_KEYS = frozenset({"max_calls", "deadline"})
+_RUN_CALLS_MAX = limits_doc.SLOT_RANGE["calls"][1]
+_RUN_DEADLINE_MAX = 10**12
 #: ``TOKEN-RESOLVE``'s ``run`` (§3.3) beside ``run_id``: the bound ticket's own facts, never root's claims.
 RESOLVE_RUN_FACTS = ("job_id", "run_index", "contract_digest", "route", "routemap_generation", "route_policy_digest",
                      "model_requested", "reserved_microdollars")
@@ -580,7 +586,11 @@ def _default_is_brokered(claims: Mapping[str, object]) -> bool:
 def _run_facts_ok(facts: object) -> bool:
     """The run fields a seam hands ``QUEUE-RESOLVE``, exactly :data:`QUEUE_RUN_KEYS` with their §3.3 types: CONTROL
     is the one author of what the broker is told, so it checks the values too, not only the names."""
-    if not isinstance(facts, Mapping) or set(facts) != QUEUE_RUN_KEYS:
+    if not isinstance(facts, Mapping) or not QUEUE_RUN_KEYS <= set(facts) <= QUEUE_RUN_KEYS | QUEUE_RUN_OPTIONAL_KEYS:
+        return False
+    calls, deadline = facts.get("max_calls", 1), facts.get("deadline", 1)
+    if not (type(calls) is int and 1 <= calls <= _RUN_CALLS_MAX and type(deadline) is int
+            and 0 < deadline <= _RUN_DEADLINE_MAX):
         return False
     run_id, job_id, idx = facts["run_id"], facts["job_id"], facts["run_index"]
     model, digest = facts["model_requested"], facts["contract_digest"]
@@ -1007,6 +1017,7 @@ class Control:
         self._mu = threading.Lock()
         self._leases: dict[str, Lease] = {}            # nonce -> lease (a dead one kept, bounded: _retire)
         self._session_lease: dict[str, Lease] = {}
+        self._attached_at: dict[str, float] = {}     # P7-A3: the clock at a ticket-bound ATTACH, for run.deadline
         self._handles: dict[str, Handles] = {}
         #: token digests whose handles were dropped (oldest first, bounded): TOKEN-RESOLVE answers them token-revoked.
         self._revoked_tokens: collections.OrderedDict[str, None] = collections.OrderedDict()
@@ -1439,6 +1450,7 @@ class Control:
         with self._mu:
             if self._session_lease.get(session) is lease and not lease.live:
                 del self._session_lease[session]
+                self._attached_at.pop(session, None)
                 self._retire(lease)
 
     def _retire(self, lease: Lease) -> None:
@@ -1739,6 +1751,7 @@ class Control:
                 with self._verifier_attach(held if lease.ticket is not None else None), self.store.lock(session):
                     if self.store.get(session) is not None:
                         raise Refused("session-exists")
+                    attached_at = self._clock()
                     if lease.ticket is not None:
                         # journaled before the record exists: a crash between the two leaves the ticket bound and no
                         # session, which runs nothing; CONTROL's next start unbinds it (head ruling H8)
@@ -1785,6 +1798,7 @@ class Control:
         if landed is not None:
             raise landed
         if facts is not None:
+            self._attached_at[session] = attached_at
             return {"generation": 0, "ticket_facts": facts}   # §3.3: the ticket's facts, for render's check
         return {"generation": 0}
 
@@ -1972,8 +1986,15 @@ class Control:
         t = self.tickets.bound(session) if self.tickets is not None else None
         if t is None:
             return None
-        return {"run_id": t.run_id, "job_id": t.facts["job_id"], "run_index": t.facts["run_index"],
-                "contract_digest": t.facts["contract_digest"], "model_requested": t.facts.get("model_requested")}
+        out: dict[str, object] = {"run_id": t.run_id, "job_id": t.facts["job_id"], "run_index": t.facts["run_index"],
+                                  "contract_digest": t.facts["contract_digest"],
+                                  "model_requested": t.facts.get("model_requested")}
+        if "max_calls" in t.facts:
+            out["max_calls"] = t.facts["max_calls"]
+        at, span = self._attached_at.get(session), t.facts.get("deadline_s")
+        if span is not None and at is not None and type(span) is int:
+            out["deadline"] = int(at) + span           # absolute, CONTROL's clock at ATTACH (whole seconds)
+        return out
 
     def _register_front(self, rec: R.SessionState, claims: Mapping[str, object]) -> tuple[R.SessionState, object]:
         """MINT's steps 1-3 for a session with a front (caller holds the session lock); returns the TOKEN-ONLY
@@ -2276,7 +2297,7 @@ class Control:
         facts = dict(got) if isinstance(got, Mapping) else got   # one snapshot: checked and relayed are the same
         if not _run_facts_ok(facts):
             raise Refused("run-malformed")
-        run: dict[str, object] = {k: facts[k] for k in sorted(QUEUE_RUN_KEYS)}
+        run: dict[str, object] = {k: facts[k] for k in sorted(QUEUE_RUN_KEYS | (QUEUE_RUN_OPTIONAL_KEYS & set(facts)))}
         run["repo_root"] = str(session_repo(self._host, session))
         return {"session": session, "kind": kind, "run": run}
 
