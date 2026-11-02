@@ -126,7 +126,9 @@ jobs:
     # the files import from the checkout, and --noconftest keeps the repo conftest, which is written for 3.12+, out.
     name: root-run code (Python 3.9)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The closure tests step took 14 min on green main and 13 min 7 s on the run the 15 min cap cancelled (run 41522235194):
+    # the closure's test set grows with every landing, so the cap sits at twice the measured time, not at the time.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
