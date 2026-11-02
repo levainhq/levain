@@ -862,6 +862,8 @@
 
   // the push rule's reason, cut to a masthead's length: "desk inactive 7 min", "route: devices (his phone shows the band)" -> "route: devices"
   function shortReason(r) {
+    const rm = /^remote desk: (\S+) input (\d+) min ago/.exec(String(r || ""));   // "remote terminal 2 min ago"
+    if (rm) return rm[1].replace(/-/g, " ") + " " + rm[2] + " min ago";
     r = String(r || "").replace(/\s*\(.*$/, "").replace(/^no desk activity source: read as inactive$/, "no desk reading");
     return r.length <= 40 ? r : (/\s/.test(r[40]) ? r.slice(0, 40) : r.slice(0, 40).replace(/\s+\S*$/, "")).replace(/[\s,;:.-]+$/, "") + "\u2026";
   }

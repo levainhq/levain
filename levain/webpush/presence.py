@@ -28,6 +28,16 @@ Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newe
   it was dropped 11-01: the route, ``devices``, is how pings go to the phone, and a measured remote session is desk activity.
   A ``remote`` left on file by an older version reads as no word.)
 
+Remote activity is NOT desk presence (Phill 11-01: *"don't we want device pings ON when remote desk is measured and NOT be
+counted at the physical desk?"*). Input over ssh or mosh, or a turn in the Claude app's remote control, is reported with
+:func:`note_remote_activity` (source ``remote-terminal`` or ``remote-control``) and kept as a high-water mark in
+``<queue_dir>/webpush/remote_activity.json``. While that record is fresh (under :data:`ACTIVE_WINDOW_SECS`), an ordinary
+ping PUSHES to his devices, after every word above it (loud, a mute, an urgent ping, ``away``) and BEFORE the desk-idle
+test, so the answer is ``pushing`` with source ``measured``. It never touches the laptop reading: the HID idle (``seen``)
+is the only thing that holds a ping at the desk. The precedence is exact: if he sits down and types at the laptop while a
+remote record is still fresh, the answer is STILL pushing until the record ages out (the remote reading is not cleared by
+laptop input). :func:`effective` carries the fresh record as ``remote`` so flow can tag a row filed needing the laptop.
+
 Desk activity is the macOS HID idle time (:func:`levain.consent.auto_away.input_idle_seconds`): measured, never
 predicted. With no such source, or no readable word, nothing is muted and the desk reads inactive: a ping he did not
 need costs one notification, a ping he needed and never got costs the day. This host has no location signal, so
@@ -68,7 +78,7 @@ from pathlib import Path
 
 __all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "SLEEP_BLIND_SECS", "URGENT_KINDS", "WORDS", "Decision", "KIND_CLASSES", "DEFAULT_CELLS", "kind_class",
            "read_policy", "set_policy", "reset_policy", "policy_sentences", "policy_view", "policy_is_default",
-           "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "set_word", "should_push", "effective"]
+           "REMOTE_SOURCES", "note_remote_activity", "read_remote_activity", "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "set_word", "should_push", "effective"]
 
 ACTIVE_WINDOW_SECS = 5 * 60
 AWAY_GRACE_SECS = 3 * 60
@@ -111,6 +121,11 @@ DEFAULT_CELLS = {"quiet": {"approval": "push", "attention": "push", "other": "ho
 POLICY_NAME = "policy.json"
 POLICY_VERSION = 1
 FILE_NAME = "presence.json"
+REMOTE_SOURCES = ("remote-terminal", "remote-control")
+REMOTE_NAME = "remote_activity.json"
+_REMOTE_MAX_BYTES = 1024
+_REMOTE_SKEW_SECS = 60.0   # an `at` further ahead than this is clamped to now when written, and a record that far ahead is no record
+_REMOTE_LOCK_WAIT_SECS = 0.5
 _MAX_BYTES = 4096
 _DURATION = re.compile(r"^(\d{1,4})\s*(m|min|mins|minutes?|h|hr|hrs|hours?)?$", re.I)
 
@@ -219,19 +234,23 @@ _CLASS_WORDS = {"approval": "approvals", "attention": "attention items", "other"
 
 
 def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False, class_name: str | None = None,
-           policy: dict | None = None, route: str = "desk") -> Decision:
+           policy: dict | None = None, route: str = "desk", remote: dict | None = None) -> Decision:
     """:func:`_decide` without the source: whether a ping is pushed at ``now`` (the full docstring is there). Pure."""
-    return _decide(now, word, idle, urgent=urgent, class_name=class_name, policy=policy, route=route)[0]
+    return _decide(now, word, idle, urgent=urgent, class_name=class_name, policy=policy, route=route, remote=remote)[0]
 
 
 def _decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = False, class_name: str | None = None,
-            policy: dict | None = None, route: str = "desk") -> tuple[Decision, str]:
+            policy: dict | None = None, route: str = "desk", remote: dict | None = None) -> tuple[Decision, str]:
     """Whether a ping is pushed at ``now``. ``idle``: seconds since the operator's last input at this machine, ``None``
     when unknown. ``class_name`` is the ping's class (:func:`kind_class`); left unset, ``urgent`` stands for
     ``approval`` and not urgent for ``other``. ``policy`` is the cells (:func:`read_policy`), the shipped default when
     unset: while ``quiet`` or ``sleep`` is active the cell for (word, class) decides push or hold. ``route``
     (:mod:`levain.webpush.route`) is ``desk`` or ``devices``: ``devices`` pushes an ordinary ping even while the desk is
-    active, after every mute and word above it. Returns ``(decision, source)``: ``word`` when a word on file (loud, a
+    active, after every mute and word above it. ``remote`` (:func:`read_remote_activity`: ``{at, source, age}`` or ``None``) is
+    measured remote activity, which is not desk presence: while it is fresh at ``now`` an ordinary ping pushes, after
+    loud, a mute, urgent and ``away`` and BEFORE the route and the desk-idle test. It never changes ``seen`` (the laptop
+    reading), so input at the laptop while a remote record is still fresh does NOT hold the ping: it keeps pushing until
+    the record ages out. Returns ``(decision, source)``: ``word`` when a word on file (loud, a
     mute, away) decided, ``measured`` when the desk reading, the route or the ping's class decided. Pure."""
     if _active(word, "loud", now):
         return Decision(True, "pushing", "loud: pings on until its timer ends, over every other parameter"), "word"
@@ -260,6 +279,11 @@ def _decide(now: float, word: dict | None, idle: float | None, *, urgent: bool =
         return Decision(True, "pushing", "urgent"), "measured"
     if word and word["word"] == "away" and not (seen is not None and seen > word["ts"] + AWAY_GRACE_SECS):
         return Decision(True, "pushing", "away: his word"), "word"
+    if remote is not None:
+        rage = now - remote["at"]
+        if rage < ACTIVE_WINDOW_SECS:   # a stale reading decides nothing, however it was passed in
+            return Decision(True, "pushing", f"remote desk: {remote['source']} input {int(max(0.0, rage) // 60)} min ago, "
+                                             "so pings go to your devices"), "measured"
     if route == "devices":
         return Decision(True, "pushing", "route: devices (his phone shows the band)"), "measured"
     if seen is None:
@@ -485,16 +509,121 @@ def reset_policy(queue_dir: Path | str, *, by: dict | None = None, now: float | 
     return _copy_cells(DEFAULT_CELLS)
 
 
+def _remote_path(queue_dir: Path | str) -> Path:
+    return Path(queue_dir) / "webpush" / REMOTE_NAME
+
+
+def _remote_valid(got: object) -> dict | None:
+    if not isinstance(got, dict) or got.get("source") not in REMOTE_SOURCES:
+        return None
+    at = got.get("at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at) or not 0 <= at < 1e11:
+        return None
+    return {"at": float(at), "source": got["source"]}
+
+
+def _read_remote_raw(queue_dir: Path | str | None) -> dict | None:
+    """The remote record on file with no age test, or ``None`` for a file that is missing, a symlink, not regular,
+    oversized, unparseable or invalid (the same discipline as :func:`read_word`)."""
+    if queue_dir is None:
+        return None
+    try:
+        fd = os.open(_remote_path(queue_dir), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        raw = os.read(fd, _REMOTE_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(raw) > _REMOTE_MAX_BYTES:
+        return None
+    try:
+        return _remote_valid(json.loads(raw.decode("utf-8")))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+
+
+def read_remote_activity(queue_dir: Path | str | None, now: float | None = None) -> dict | None:
+    """``{at, source, age}`` while the remote-activity record is valid and under :data:`ACTIVE_WINDOW_SECS` old at
+    ``now``, else ``None`` (missing, stale, unreadable, invalid, a symlink, or dated more than a minute ahead)."""
+    rec = _read_remote_raw(queue_dir)
+    if rec is None:
+        return None
+    t = time.time() if now is None else now
+    age = t - rec["at"]
+    if age < -_REMOTE_SKEW_SECS or age >= ACTIVE_WINDOW_SECS:
+        return None
+    return {"at": rec["at"], "source": rec["source"], "age": max(0.0, age)}
+
+
+def _write_remote(queue_dir: Path | str, rec: dict) -> None:
+    d = _remote_path(queue_dir).parent
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise PresenceError(f"{d} is not a directory of this user's")
+    tmp = d / f".{REMOTE_NAME}.{os.getpid()}.{time.time_ns()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            view = memoryview(json.dumps(rec).encode("utf-8"))
+            while view:
+                n = os.write(fd, view)
+                if n <= 0:
+                    raise OSError("short write")
+                view = view[n:]
+        finally:
+            os.close(fd)
+        os.replace(tmp, _remote_path(queue_dir))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def note_remote_activity(queue_dir: Path | str, source: str, at: float | None = None) -> bool:
+    """Record input measured away from the laptop (``source`` one of :data:`REMOTE_SOURCES`; anything else raises
+    :class:`PresenceError`) at ``at`` (default now; more than a minute ahead is clamped to now). The record is a monotone
+    high-water mark: an older ``at`` never replaces a newer one, an equal-or-newer one does. Written atomically under the
+    presence lock. Returns whether the mark was written; a lock not taken within a short wait, or a file that cannot be
+    written, returns ``False`` and never raises into a caller's poll. It never touches the laptop activity reading."""
+    if source not in REMOTE_SOURCES:
+        raise PresenceError(f"{source!r} is not a remote source (one of: {', '.join(REMOTE_SOURCES)})")
+    now = time.time()
+    if at is None:
+        t = now
+    elif isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
+        raise PresenceError(f"{at!r} is not a time")
+    else:
+        t = min(float(at), now) if at > now + _REMOTE_SKEW_SECS else float(at)
+    try:
+        with _locked(queue_dir, strict=True, wait=_REMOTE_LOCK_WAIT_SECS):
+            cur = _read_remote_raw(queue_dir)
+            if cur is not None and t < cur["at"]:
+                return False
+            _write_remote(queue_dir, {"at": t, "source": source})
+            return True
+    except (PresenceError, OSError):
+        return False
+
+
 _UNSET = object()   # "read it yourself", distinct from None (no word on file / no idle reading)
 
 
 def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Callable[[], float | None] | None,
           suggest: bool, word: object = _UNSET, reading: object = _UNSET,
-          route: object = _UNSET) -> tuple[Decision, str, dict | None]:
-    """The one place the rule is read: ``(decision, source, word)`` for a ``kind`` of ping at ``now``. Both
+          route: object = _UNSET, remote: object = _UNSET) -> tuple[Decision, str, dict | None, dict | None]:
+    """The one place the rule is read: ``(decision, source, word, remote)`` for a ``kind`` of ping at ``now``. Both
     :func:`should_push` and :func:`effective` call it, so the push and the chip cannot diverge. Raises on a fault; the
     callers read that as push. ``word`` and ``reading`` let a caller that already sampled the word and the idle time have
-    this rule work from that same snapshot (one read of each per status), not a second code path."""
+    this rule work from that same snapshot (one read of each per status), not a second code path. ``remote`` is the
+    fresh remote-activity record (:func:`read_remote_activity`), read here once when not handed in."""
     from levain.webpush import route as _route
 
     at = time.time() if now is None else now
@@ -514,8 +643,10 @@ def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Call
         r = route   # a caller that projected the route once hands it in; projected_route (and its `who`) is not run again
     else:
         r = (_route.read_route(queue_dir, at)[0] if suggest else _route.projected_route(queue_dir, idle=reading, now=at))
-    d, source = _decide(at, word, reading, class_name=kind_class(kind), policy=read_policy(queue_dir)[0], route=r)
-    return d, source, word
+    if remote is _UNSET:
+        remote = read_remote_activity(queue_dir, at)
+    d, source = _decide(at, word, reading, class_name=kind_class(kind), policy=read_policy(queue_dir)[0], route=r, remote=remote)
+    return d, source, word, remote
 
 
 _FAULT = "the presence rule could not be read: pushing"
@@ -523,35 +654,37 @@ _FAULT = "the presence rule could not be read: pushing"
 
 def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = None,
                 idle: Callable[[], float | None] | None = None, suggest: bool = True,
-                word: object = _UNSET, route: object = _UNSET) -> Decision:
+                word: object = _UNSET, route: object = _UNSET, remote: object = _UNSET) -> Decision:
     """:func:`decide` for a ``kind`` of ping against the word on file and the input idle time (``idle`` defaults to
     :func:`levain.consent.auto_away.input_idle_seconds`). Any fault reads as push: a missed ping is the worse error."""
     try:
-        return _core(queue_dir, kind, now, idle, suggest, word, route=route)[0]
+        return _core(queue_dir, kind, now, idle, suggest, word, route=route, remote=remote)[0]
     except Exception:  # noqa: BLE001 - the rule failing must not silence the phone
         return Decision(True, "pushing", _FAULT)
 
 
 def effective(queue_dir: Path | str | None, now: float | None = None, *,
               idle: Callable[[], float | None] | None = None, suggest: bool = False,
-              word: object = _UNSET, reading: object = _UNSET, route: object = _UNSET) -> dict:
+              word: object = _UNSET, reading: object = _UNSET, route: object = _UNSET, remote: object = _UNSET) -> dict:
     """What the rule does now with an ordinary ping, for the cockpit chip and any status read:
-    ``{state: pushing|holding|muted, pushing, reason, source: word|measured, since}``. It is the same call
+    ``{state: pushing|holding|muted, pushing, reason, source: word|measured, since, word, remote}``. It is the same call
     :func:`should_push` makes (:func:`_core`, kind ``ping``), so the chip and the push decision for the same instant are
     one answer; the route axis is folded in as there. ``source`` is ``word`` when a word on file (loud, away, quiet, sleep)
     decided, ``measured`` when the desk reading or the route decided; ``since`` is that word's time, else ``None``.
     ``suggest`` defaults off: a status read never drives the route suggestion, and projects the route a delivery would see
     (:func:`levain.webpush.route.projected_route`). ``word`` and ``reading`` (the word record and the idle seconds) let a caller
     that sampled them once get an answer from that same snapshot; ``route`` is the same for a route projected once. ``word`` in the result names the deciding word, else ``None``.
-    A fault reads as pushing."""
+    ``remote`` is ``{source, at}`` while a fresh remote-activity record stands (whatever decided: flow derives
+    [NEEDS THE LAPTOP] from it), else ``None``; a caller that read it once hands it in. A fault reads as pushing."""
     try:
-        d, source, wrec = _core(queue_dir, "ping", now, idle, suggest, word, reading, route)
+        d, source, wrec, rrec = _core(queue_dir, "ping", now, idle, suggest, word, reading, route, remote)
     except Exception:  # noqa: BLE001 - the same fault rule as should_push
         return {"state": "pushing", "pushing": True, "reason": _FAULT, "source": "measured", "since": None,
-                "word": None}
+                "word": None, "remote": None}
     decided = wrec if source == "word" and wrec is not None else None
     return {"state": d.state, "pushing": d.push, "reason": d.why, "source": source,
-            "since": decided["ts"] if decided else None, "word": decided["word"] if decided else None}
+            "since": decided["ts"] if decided else None, "word": decided["word"] if decided else None,
+            "remote": {"source": rrec["source"], "at": rrec["at"]} if rrec else None}
 
 
 def check_setter(word: str, by: dict | None, said: str | None) -> str:
@@ -936,7 +1069,7 @@ def _write(queue_dir: Path | str, rec: dict | None) -> None:
 
 def describe(queue_dir: Path | str, *, now: float | None = None,
              idle: Callable[[], float | None] | None = None, word: object = _UNSET, reading: object = _UNSET,
-             route: object = _UNSET) -> str:
+             route: object = _UNSET, remote: object = _UNSET) -> str:
     """One line for ``levain ping status``: the word on file, what the rule does now with an ordinary ping, and how many
     pings are held for the phone."""
     ts = time.time() if now is None else now
@@ -949,7 +1082,7 @@ def describe(queue_dir: Path | str, *, now: float | None = None,
             reading = idle()
         except Exception:  # noqa: BLE001 - no reading: the rule reads the desk as inactive
             reading = None
-    d = should_push(queue_dir, "ping", now=ts, idle=lambda: reading, suggest=False, word=word, route=route)
+    d = should_push(queue_dir, "ping", now=ts, idle=lambda: reading, suggest=False, word=word, route=route, remote=remote)
     if word is not None and word["word"] == "sleep" and reading is None and ts < word["ts"] + SLEEP_BLIND_SECS:
         end = time.strftime("%H:%M", time.localtime(word["ts"] + SLEEP_BLIND_SECS))
         d = Decision(d.push, d.state, f"{d.why}; idle source unavailable, so sleep ends at {end}", d.by)

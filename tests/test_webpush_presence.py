@@ -317,7 +317,7 @@ def test_effective_is_the_same_answer_as_should_push_for_every_decide_case(tmp_p
     n = 0
     for wi, w in enumerate(words):
         for idle in (None, 0.0, 120.0, float(ACTIVE_WINDOW_SECS), 900.0):
-            for rt in ("desk", "devices"):
+            for rt, rem in [(r, m) for r in ("desk", "devices") for m in ("absent", "fresh", "stale")]:
                 q = tmp_path / f"q{n}"
                 n += 1
                 (q / "webpush").mkdir(parents=True, mode=0o700)
@@ -325,9 +325,13 @@ def test_effective_is_the_same_answer_as_should_push_for_every_decide_case(tmp_p
                     (q / "webpush" / presence.FILE_NAME).write_text(json.dumps(w))
                 if rt == "devices":
                     route.set_route(q, "devices", now=NOW - 5)
+                if rem != "absent":   # fresh: 2 min old; stale: past the window
+                    age = 120.0 if rem == "fresh" else ACTIVE_WINDOW_SECS + 1.0
+                    (q / "webpush" / presence.REMOTE_NAME).write_text(json.dumps({"at": NOW - age, "source": "remote-terminal"}))
                 got = presence.effective(q, NOW, idle=lambda: idle)
                 want = presence.should_push(q, "ping", now=NOW, idle=lambda: idle, suggest=False)
-                assert got["pushing"] is want.push and got["state"] == want.state and got["reason"] == want.why, (w, idle, rt)
+                assert got["pushing"] is want.push and got["state"] == want.state and got["reason"] == want.why, (w, idle, rt, rem)
+                assert (got["remote"] is not None) is (rem == "fresh")
                 assert got["source"] in ("word", "measured") and got["state"] in ("pushing", "holding", "muted")
                 if got["source"] == "word":
                     assert got["since"] == w["ts"]
