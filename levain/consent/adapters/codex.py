@@ -277,6 +277,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
             # np-e642162b (a)); `held` is true only when the hold ran and its ping started
             held = hold_ping(settings, queue.directory, AGENT, what_of(), request.id, wait)
             wait = min(wait, max(0.0, deadline - clock()))   # the ping's spawn time comes out of the hold, not the reserve
+            held = held and wait > 0   # the spawn can have used the whole wait: then no hold runs and the dialog's notice goes (L3 round c)
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
                                         still_away=still_away)
         if got is None:

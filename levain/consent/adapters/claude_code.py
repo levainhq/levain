@@ -1055,6 +1055,7 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
             # np-e642162b (a)); `held` is true only when the hold ran and its ping started
             held = hold_ping(settings, queue.directory, AGENT, _notice_what(tool_name, tool_input), request.id, wait)
             wait = min(wait, max(0.0, deadline - clock()))   # the ping's spawn time comes out of the hold, not the reserve
+            held = held and wait > 0   # the spawn can have used the whole wait: then no hold runs and the dialog's notice goes (L3 round c)
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
                                         still_away=still_away, contained_launch=contained_launch)
         if got is None:
@@ -1404,19 +1405,12 @@ def hold_ping(settings: AdapterSettings, queue_dir: Path | str, agent: str, what
     """Phill 11-02 (np-e642162b (a)): *"yes we DO want these to be able to find us ASAP"*. The ping for a
     PermissionRequest filed and about to be held for a signed answer (an away hold that will run: ``wait`` above zero),
     sent exactly as the PreToolUse gate pings its filed request (:func:`notify`, kind ``consent``, ref
-    ``request:<id>``), so presence and mutes rule it the same way (a mute queues it, :mod:`levain.webpush.held`). Said
-    once per ref: a ping already on record for the request (:func:`levain.webpush.pinged`, with a phone paired) is not
-    sent again. True when the ping was started (the notify command, a push, or the record child that queues a held
-    one) or is already on record; False when nothing could start, so the caller lets the dialog's prompt notice go.
-    Never raises."""
+    ``request:<id>``), so presence and mutes rule it the same way (a mute queues it, :mod:`levain.webpush.held`). The
+    request id was minted for this very call, so nothing can have pinged it yet and there is no dedupe read here (a
+    read that faults would read as "already pinged" and silence both this ping and the dialog's notice: L3 round c).
+    True when the ping was started (the notify command, a push, or the record child that queues a held one); False
+    when nothing could start, so the caller lets the dialog's prompt notice go. Never raises."""
     ref = f"request:{request_id}"
-    try:
-        from levain.webpush import live, pinged
-
-        if live(queue_dir) and pinged(queue_dir, ref):
-            return True
-    except Exception:  # noqa: BLE001 - the dedupe read failed: try the ping
-        pass
     try:
         started, pushed, recorded = _notify_ex(
             settings, f"levain: {agent} waits on you up to {math.ceil(wait):g} s: {what} (request {request_id}).",

@@ -503,18 +503,17 @@ def test_an_away_hold_whose_ping_cannot_start_sends_the_dialog_notice(tmp_path, 
     assert calls[0]["body"].startswith(f"{agent} asks in its own dialog: ")
 
 
-def test_an_away_hold_ping_is_said_once_per_request(tmp_path, monkeypatch):
-    """The dedupe: a ping already on record for the request is not sent again, and the hold still counts as pinged."""
-    from levain.webpush.store import PushStore
+def test_an_away_hold_ping_is_never_silenced_by_a_faulting_dedupe_read(tmp_path, monkeypatch):
+    """L3 round c (complement MED 1): the request id was minted for this hook call, so nothing can have pinged it; a
+    `pinged` read that faults reads as "already pinged" and used to silence both this ping and the dialog's notice."""
+    import levain.webpush as wp
 
     qdir = tmp_path / "q"
     qdir.mkdir()
     _phone(qdir)
     calls = _spy(monkeypatch, ACTIVE)
-    s = _away()
-    assert claude_code.hold_ping(s, qdir, "claude_code", "Bash: touch x", "r7", 300.0) is True
-    PushStore(qdir).add_ping("consent", "request:r7", "levain", "x")   # what the spawned child records
-    assert claude_code.hold_ping(s, qdir, "claude_code", "Bash: touch x", "r7", 300.0) is True
+    monkeypatch.setattr(wp, "pinged", lambda *a, **kw: True)   # what a locked pings DB reads as
+    assert claude_code.hold_ping(_away(), qdir, "claude_code", "Bash: touch x", "r7", 300.0) is True
     assert [c["ref"] for c in calls] == ["request:r7"]
     assert calls[0]["body"] == "claude_code waits on you up to 300 s: Bash: touch x (request r7)."
 
