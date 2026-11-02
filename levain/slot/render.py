@@ -87,6 +87,13 @@ READSET_ATTRIBUTES = b"* -text -eol -crlf -ident -filter -working-tree-encoding\
 TOKEN_ENV = {"claude": "ANTHROPIC_AUTH_TOKEN", "codex": "OPENAI_API_KEY"}
 #: The names that must be ABSENT from a vendor session's env, rendered or added at exec (:func:`check_env_absent`).
 ABSENT_ENV: Mapping[str, frozenset] = {"claude": frozenset({"ANTHROPIC_API_KEY"}), "codex": frozenset()}
+#: c7.14 (P7-A §1.1, A-g10): a passthrough session bills the slot's own login. A vendor CLI that finds an API key or a
+#: bearer token in its env prefers it to the stored login, which would silently move the bill to a key (and, for
+#: Claude Code, stop at its "use this API key?" prompt), so these names are ABSENT on a passthrough session too.
+PASSTHROUGH_ABSENT_ENV: Mapping[str, frozenset] = {
+    "claude": frozenset({"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}),
+    "codex": frozenset({"OPENAI_API_KEY", "CODEX_API_KEY"}),
+}
 #: R7 (1030+24): a macOS Codex session's TLS roots. Codex loads them with rustls-native-certs; from the slot the
 #: platform store is not reachable (the profile denies ``com.apple.SecurityServer``), and on r3c10-vm 10-30 every
 #: chatgpt.com tunnel ended ``broken`` with 171 bytes up. rustls-native-certs reads ``SSL_CERT_FILE`` instead of the
@@ -357,8 +364,12 @@ def egress_hosts(blob: RenderBlob, facts: RenderFacts) -> tuple[str, ...]:
     return tuple(sorted(out))
 
 
+#: c7.14: the facts a passthrough ticket's alloc must hold for render to act (``deadline`` is ATTACH's absolute reading).
+PASSTHROUGH_TICKET_KEYS = ("vendor", "max_calls", "max_tunnel_bytes", "deadline_s", "deadline")
+
+
 def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | None,
-                 ticket_facts: Mapping[str, object] | None) -> None:
+                 ticket_facts: Mapping[str, object] | None, auth: str | None = None) -> None:
     """CONTRACT §3.5 "Ticket facts reach render", render's half (the second gate; CONTROL's ``MINT`` claims check is
     the first): the blob against the ticket facts alloc carries (root's snapshot of CONTROL's record), refused by name
     before render acts. A session with no ticket has nothing to check here.
@@ -368,7 +379,12 @@ def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | Non
       ``verifier_steps``: 3c-8, so no gate below compares a field against an absent one); or a verifier ticket whose
       facts hold no resolved ``verifier`` entry (no driver is authorised without one);
     - ``ticket-kind-mismatch``: the alloc's kind and class are not what the ticket's kind renders as;
-    - ``ticket-routes-mismatch``: the blob's routes are not exactly the ticket's ``route`` + ``egress_routes``;
+    - ``ticket-routes-mismatch``: the blob's routes are not exactly the ticket's ``route`` + ``egress_routes``; for a
+      PASSTHROUGH ticket (c7.14; ``auth`` is alloc's) exactly one route beside the ticket's ``egress_routes`` (the
+      base map's passthrough route for the vendor: :func:`check_facts` holds its type to ``subscription_passthrough``,
+      and CONTROL's MINT claims check holds it to the vendor's), so a passthrough session has no egress route its
+      ticket did not list; ``ticket-auth-mismatch``: alloc's ``auth`` is not the ticket's (``brokered`` when its facts
+      carry none); ``ticket-vendor-mismatch``: a passthrough ticket's vendor is not the blob's;
     - ``ticket-model-mismatch``: the blob's model is not the ticket's ``model_requested`` (none for a verifier);
     - ``ticket-steps-mismatch`` / ``ticket-driver-mismatch``: a verifier blob's ``verifier_steps`` are not the
       ticket's, or its ``driver`` is not the resolved entry's ``driver_template``."""
@@ -378,14 +394,34 @@ def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | Non
         raise Refused("ticket-facts-missing", "alloc names a ticket without its facts")
     if RENDERS_AS.get(str(ticket_facts.get("kind"))) != (kind, slot_class):
         raise Refused("ticket-kind-mismatch", f"{ticket_facts.get('kind')!s:.16} is not {kind} {slot_class}")
-    required = ("verifier_steps",) if ticket_facts["kind"] == "verifier" else ("route", "model_requested")
+    passthrough = ticket_facts.get("auth") == "passthrough"
+    if ticket_facts["kind"] == "verifier":
+        required: tuple[str, ...] = ("verifier_steps",)
+    elif passthrough:
+        required = PASSTHROUGH_TICKET_KEYS
+    else:
+        required = ("route", "model_requested")
     for k in required:
         if k not in ticket_facts:
             raise Refused("ticket-facts-missing", f"a {ticket_facts['kind']} ticket's facts without {k}")
-    want = sorted([*([ticket_facts["route"]] if "route" in ticket_facts else []),
-                   *ticket_facts["egress_routes"]])                                   # type: ignore[misc]
-    if sorted(blob.routes) != want:
-        raise Refused("ticket-routes-mismatch", "the blob's routes are not the ticket's")
+    if auth is not None and ticket_facts["kind"] != "verifier" and auth != ticket_facts.get("auth", "brokered"):
+        raise Refused("ticket-auth-mismatch", f"alloc auth {auth!s:.16} is not the ticket's")
+    egress = list(ticket_facts["egress_routes"])                                      # type: ignore[call-overload]
+    if passthrough:
+        if blob.vendor != ticket_facts["vendor"]:
+            raise Refused("ticket-vendor-mismatch", "the blob's vendor is not the ticket's")
+        rest = list(blob.routes)
+        for rid in egress:
+            if rid not in rest:
+                raise Refused("ticket-routes-mismatch", "the blob lacks a route the ticket lists")
+            rest.remove(rid)
+        if len(rest) != 1 or rest[0] in egress:
+            raise Refused("ticket-routes-mismatch", "a passthrough blob names its one passthrough route and the "
+                                                    "ticket's egress routes, nothing else")
+    else:
+        want = sorted([*([ticket_facts["route"]] if "route" in ticket_facts else []), *egress])
+        if sorted(blob.routes) != want:
+            raise Refused("ticket-routes-mismatch", "the blob's routes are not the ticket's")
     if blob.model != ticket_facts.get("model_requested"):
         raise Refused("ticket-model-mismatch", "the blob's model is not the ticket's")
     if ticket_facts["kind"] != "verifier":
@@ -466,10 +502,14 @@ def _base_env(facts: RenderFacts, home: PurePosixPath, user: str) -> dict[str, s
     return env
 
 
-def check_env_absent(vendor: str, names: Iterable[str]) -> None:
+def check_env_absent(vendor: str, names: Iterable[str], auth: str | None = None) -> None:
     """Refused ``env-forbidden`` when ``names`` holds one of :data:`ABSENT_ENV`'s for ``vendor``, so no later edit
-    can put ``ANTHROPIC_API_KEY`` (and its blocking prompt) back in a Claude Code session."""
-    bad = sorted(set(names) & ABSENT_ENV.get(vendor, frozenset()))
+    can put ``ANTHROPIC_API_KEY`` (and its blocking prompt) back in a Claude Code session; on a ``passthrough``
+    ``auth`` also one of :data:`PASSTHROUGH_ABSENT_ENV`'s (an API key that would take the bill from the login)."""
+    gone = ABSENT_ENV.get(vendor, frozenset())
+    if auth == "passthrough":
+        gone = gone | PASSTHROUGH_ABSENT_ENV.get(vendor, frozenset())
+    bad = sorted(set(names) & gone)
     if bad:
         raise Refused("env-forbidden", ",".join(bad))
 
@@ -478,7 +518,7 @@ def render_env(blob: RenderBlob, facts: RenderFacts) -> dict[str, dict[str, str]
     """§3.4 per role (:func:`_render_env`), each env checked against :data:`ABSENT_ENV`."""
     envs = _render_env(blob, facts)
     for env in envs.values():
-        check_env_absent(facts.vendor, env)
+        check_env_absent(facts.vendor, env, facts.auth)
     return envs
 
 
@@ -526,7 +566,7 @@ def secret_env_names(blob: RenderBlob, facts: RenderFacts) -> tuple[str, ...]:
         out.append(TOKEN_ENV[facts.vendor])
     if "levain_queue" in blob.hooks:
         out.append(QUEUE_CAP_ENV)
-    check_env_absent(facts.vendor, out)
+    check_env_absent(facts.vendor, out, facts.auth)
     return tuple(out)
 
 
@@ -1086,7 +1126,7 @@ __all__ = [
     "front_limit_fields", "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
     "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
-    "TOKEN_ENV", "ABSENT_ENV", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
+    "TOKEN_ENV", "ABSENT_ENV", "PASSTHROUGH_ABSENT_ENV", "PASSTHROUGH_TICKET_KEYS", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",
     "assert_no_syscall", "check_driver_template", "profile_lines", "read_driver_template", "render_profile",
     "render_importer_profile", "render_verifier_profile",

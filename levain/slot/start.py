@@ -10,7 +10,7 @@ CONTROL checks, never as a fact root acts on.
 
 1. ``kind``: kind ``verifier`` answers ``verb-unbuilt:verifier`` (§5.6, session 2f). A ``login`` session proceeds
    with no ``keep/`` return: its credential is the one the vendor's login writes. An interactive passthrough
-   session runs :func:`_identity_gate` at the start of step 4, under the same lock: the slot's baseline read, the
+   session (or a ticketed one, c7.14) runs :func:`_identity_gate` at the start of step 4, under the same lock: the slot's baseline read, the
    parked credential returned from ``keep/`` into the session tree, the vendor's identity call recorded in the state
    record's ``identity`` and compared with the baseline (``identity-changed`` when it differs; a login the server
    no longer accepts, ``identity-expired``; Claude's sign-in server unreachable, ``identity-unreachable``). Claude
@@ -737,7 +737,9 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
         raise Refused("already-started", a.session)
     if rec is None or rec.state != R.RENDERED:
         raise Refused("not-rendered", f"{a.session}: {rec.state if rec else 'no record'}")   # SECRETS' own rule
-    if a.kind == "interactive" and a.auth == "passthrough" and a.vendor in E.CREDENTIALS:
+    if (a.kind == "interactive" or a.ticket is not None) and a.auth == "passthrough" and a.vendor in E.CREDENTIALS:
+        # c7.14: a ticketed passthrough session (alloc auth passthrough only exists on one CONTROL bound to a
+        # passthrough ticket: ATTACH compares the two) takes the same keep/ return and identity compare
         _identity_gate(ctx, a)
     with ctx.store.dir("live", a.session) as sfd:
         _fresh_repo(ctx, a, sfd)
