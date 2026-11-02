@@ -162,8 +162,8 @@ def approvals_note(queue_dir: Path | str | None, *, to_devices: bool | None = No
     always named (true, and never wrong). A signed away mark stands over the record (approvals reach the devices for a
     signed answer whatever it says); a record that would send them there still holds only while an enrolled key could
     sign, and not at all when ``blind`` (it sends them there only for want of a laptop input reading:
-    :func:`away_state` then leaves the agent's own dialog to ask). Read for every agent that has settings or a store in
-    ``queue_dir``; any fault says nothing."""
+    :func:`away_state` then leaves the agent's own dialog to ask). Read for every agent that has its own settings file in
+    ``queue_dir`` (the shared store counts only as claude_code's, when no agent has a settings file); any fault says nothing."""
     if queue_dir is None:
         return None
     try:
