@@ -346,6 +346,9 @@ def test_an_empty_column_of_an_unreadable_source_says_unknown_not_nothing():
     assert e["ok"]["grouped"] == e["ok"]["cols"] == [nothing] * 6
     assert e["queue"]["grouped"] == e["queue"]["cols"] == [unknown] * 4 + [nothing, unknown]   # the queue feeds every column but needs-you
     assert e["band"]["grouped"] == e["band"]["cols"] == [nothing] * 4 + [unknown, nothing]   # the band is needs-you's alone
+    # the seat roster feeds running and waiting only; a queue state that is not ok/none, with no unreadable key at all, fails closed
+    assert e["seats"]["grouped"] == e["seats"]["cols"] == [nothing, nothing, unknown, unknown, nothing, nothing]
+    assert e["noKey"]["grouped"] == e["noKey"]["cols"] == [unknown] * 4 + [nothing, unknown]
 
 
 def test_the_board_value_carries_no_tell_field_and_the_page_has_no_ready_queue_zone(tmp_path, lh):
