@@ -120,6 +120,13 @@
     if (b) host.appendChild(b);
   }
 
+  // What an empty column says. "nothing" is a fact only for a source that was read: a queue that could not be read (or a band that
+  // could not) leaves its columns unknown, and "nothing" beside a warning would read as an empty, healthy board.
+  function emptyText(model, col) {
+    var bad = col.category === "needs-you" ? model.unreadable.indexOf("band") >= 0 : model.queue === "unreadable";
+    return bad ? "unknown (could not read)" : "nothing";
+  }
+
   // The needs-you column's one sentence: said by the grouped tab and the six columns alike, so the two cannot drift.
   function needsYouNote(model) { return "This column is the Needs you band. Answer there (`" + model.hint + "`)."; }
 
@@ -146,7 +153,7 @@
       if (col.category === "needs-you") {
         wrap.appendChild(el(doc, "p", "bd-gloss", needsYouNote(model)));
       }
-      if (!col.cards.length) wrap.appendChild(el(doc, "p", "bd-empty", "nothing"));
+      if (!col.cards.length) wrap.appendChild(el(doc, "p", "bd-empty", emptyText(model, col)));
       col.cards.forEach(function (k) {
         var row = el(doc, "div", "bd-row");
         row.dataset.id = k.id;
@@ -178,7 +185,7 @@
       if (col.category === "needs-you") {
         c.appendChild(el(doc, "p", "bd-gloss", needsYouNote(model)));
       }
-      if (!col.cards.length) c.appendChild(el(doc, "p", "bd-empty", "nothing"));
+      if (!col.cards.length) c.appendChild(el(doc, "p", "bd-empty", emptyText(model, col)));
       col.cards.forEach(function (k) {
         var card = el(doc, "article", "bd-card");
         card.dataset.id = k.id;
