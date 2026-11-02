@@ -295,8 +295,9 @@ def record_decision(queue_dir: Path | str | None, now: float, kind: str, push: b
             st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
                 return
-            os.write(fd, (json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8"))
-            size = st.st_size + 1
+            line = (json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8")
+            os.write(fd, line)
+            size = st.st_size + len(line)
         finally:
             os.close(fd)
         if size > DECISIONS_MAX_BYTES:
