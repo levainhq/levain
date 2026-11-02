@@ -88,8 +88,10 @@ def _looks_like_error(head: bytes) -> bool:
             return _JSON_ERROR_LEAD.match(text) is not None
         if not isinstance(body, dict):
             return False
-        keys = {str(k).lower() for k in body}
-        return bool(keys & {"error", "errors"}) and keys <= _ENVELOPE_KEYS and bool(body.get("error") or body.get("errors"))
+        lowered = {str(k).lower(): v for k, v in body.items()}
+        keys = set(lowered)
+        return (bool(keys & {"error", "errors"}) and keys <= _ENVELOPE_KEYS
+                and bool(lowered.get("error") or lowered.get("errors")))
     return _TEXT_ERROR_HEAD.match(text) is not None
 
 
@@ -119,10 +121,15 @@ def input_liveness(source: str | os.PathLike | None, now: datetime, *, stale_aft
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return _gauge(name, DEAD, "the input source is gone", None, now, stale_after)
+    except PermissionError:
+        return _gauge(name, DEAD, "the input source is unreadable (permission denied)", None, now, stale_after)
     except (OSError, ValueError) as e:
         return _gauge(name, UNKNOWN, f"the input source cannot be examined ({type(e).__name__})", None, now, stale_after)
     try:
-        st = os.fstat(fd)
+        try:
+            st = os.fstat(fd)
+        except OSError as e:
+            return _gauge(name, UNKNOWN, f"the input source cannot be examined ({type(e).__name__})", None, now, stale_after)
         if not stat.S_ISREG(st.st_mode):
             return _gauge(name, UNKNOWN, "the input source is not a file", None, now, stale_after)
         mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)

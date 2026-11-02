@@ -178,3 +178,19 @@ def test_a_tie_on_the_stamp_breaks_by_insertion_and_a_launched_run_dates_from_la
     with store2.read() as c:
         h2 = g.run_health(c, aid2, NOW)
     assert h2.age_seconds == 60 and not h2.stale
+
+
+def test_a_capitalised_error_envelope_is_a_stub(tmp_path):
+    f = tmp_path / "in.json"
+    f.write_bytes(b'{"Error": "Unauthorized"}')
+    assert g.input_liveness(str(f), NOW).value == g.QUIET
+
+
+def test_an_unreadable_input_is_dead_not_unknown(tmp_path):
+    f = tmp_path / "in.txt"
+    f.write_bytes(b"real data " * 40)
+    f.chmod(0)
+    try:
+        assert g.input_liveness(str(f), NOW).value == g.DEAD
+    finally:
+        f.chmod(0o600)
