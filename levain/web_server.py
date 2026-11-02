@@ -2445,8 +2445,8 @@ class _Handler(GuardedHandler):
             projected = route
         try:   # ONE read of the remote-activity record too: describe and effective get the same one
             remote = presence.read_remote_activity(queue, now)
-        except Exception:  # noqa: BLE001 - no reading is no remote activity
-            remote = None
+        except Exception:  # noqa: BLE001 - a faulted read is a fault, not "no remote activity": both calls fail open from it
+            remote = presence.REMOTE_FAULT
         view = {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
                 "route": route, "route_source": route_source, "route_until": route_until,
                 "text": presence.describe(queue, now=now, word=rec, reading=reading, route=projected, remote=remote),

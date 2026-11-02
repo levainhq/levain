@@ -78,7 +78,7 @@ from pathlib import Path
 
 __all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "SLEEP_BLIND_SECS", "URGENT_KINDS", "WORDS", "Decision", "KIND_CLASSES", "DEFAULT_CELLS", "kind_class",
            "read_policy", "set_policy", "reset_policy", "policy_sentences", "policy_view", "policy_is_default",
-           "REMOTE_SOURCES", "note_remote_activity", "read_remote_activity", "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "set_word", "should_push", "effective"]
+           "REMOTE_SOURCES", "REMOTE_FAULT", "note_remote_activity", "read_remote_activity", "PresenceError", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "set_word", "should_push", "effective"]
 
 ACTIVE_WINDOW_SECS = 5 * 60
 AWAY_GRACE_SECS = 3 * 60
@@ -247,7 +247,8 @@ def _decide(now: float, word: dict | None, idle: float | None, *, urgent: bool =
     unset: while ``quiet`` or ``sleep`` is active the cell for (word, class) decides push or hold. ``route``
     (:mod:`levain.webpush.route`) is ``desk`` or ``devices``: ``devices`` pushes an ordinary ping even while the desk is
     active, after every mute and word above it. ``remote`` (:func:`read_remote_activity`: ``{at, source, age}`` or ``None``) is
-    measured remote activity, which is not desk presence: while it is fresh at ``now`` an ordinary ping pushes, after
+    measured remote activity, which is not desk presence: while it is fresh at ``now`` an ordinary ping (class ``other``
+    only; an urgent class has already pushed on its own reason) pushes, after
     loud, a mute, urgent and ``away`` and BEFORE the route and the desk-idle test. It never changes ``seen`` (the laptop
     reading), so input at the laptop while a remote record is still fresh does NOT hold the ping: it keeps pushing until
     the record ages out. Returns ``(decision, source)``: ``word`` when a word on file (loud, a
@@ -279,7 +280,7 @@ def _decide(now: float, word: dict | None, idle: float | None, *, urgent: bool =
         return Decision(True, "pushing", "urgent"), "measured"
     if word and word["word"] == "away" and not (seen is not None and seen > word["ts"] + AWAY_GRACE_SECS):
         return Decision(True, "pushing", "away: his word"), "word"
-    if remote is not None:
+    if remote is not None:   # ordinary pings only: every non-"other" class has already returned above, on its own reason
         rage = now - remote["at"]
         if rage < ACTIVE_WINDOW_SECS:   # a stale reading decides nothing, however it was passed in
             return Decision(True, "pushing", f"remote desk: {remote['source']} input {int(max(0.0, rage) // 60)} min ago, "
@@ -513,13 +514,27 @@ def _remote_path(queue_dir: Path | str) -> Path:
     return Path(queue_dir) / "webpush" / REMOTE_NAME
 
 
+def _remote_at(at: object) -> float | None:
+    """THE validator for a remote record's ``at``, used by the write and the read: a number (not a bool) with
+    ``0 < at < 1e11``, else ``None``. The bounds are compared BEFORE any float() or isfinite(), so a 500-digit int, nan,
+    inf, a negative and zero are all invalid and none of them raises."""
+    if isinstance(at, bool) or not isinstance(at, (int, float)):
+        return None
+    try:
+        if not 0 < at < 1e11:
+            return None
+        return float(at)
+    except (OverflowError, ValueError, TypeError):
+        return None
+
+
 def _remote_valid(got: object) -> dict | None:
     if not isinstance(got, dict) or got.get("source") not in REMOTE_SOURCES:
         return None
-    at = got.get("at")
-    if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at) or not 0 <= at < 1e11:
+    at = _remote_at(got.get("at"))
+    if at is None:
         return None
-    return {"at": float(at), "source": got["source"]}
+    return {"at": at, "source": got["source"]}
 
 
 def _read_remote_raw(queue_dir: Path | str | None) -> dict | None:
@@ -543,14 +558,17 @@ def _read_remote_raw(queue_dir: Path | str | None) -> dict | None:
         return None
     try:
         return _remote_valid(json.loads(raw.decode("utf-8")))
-    except (UnicodeDecodeError, ValueError, RecursionError):
+    except (UnicodeDecodeError, ValueError, RecursionError, ArithmeticError):
         return None
 
 
 def read_remote_activity(queue_dir: Path | str | None, now: float | None = None) -> dict | None:
     """``{at, source, age}`` while the remote-activity record is valid and under :data:`ACTIVE_WINDOW_SECS` old at
     ``now``, else ``None`` (missing, stale, unreadable, invalid, a symlink, or dated more than a minute ahead)."""
-    rec = _read_remote_raw(queue_dir)
+    try:
+        rec = _read_remote_raw(queue_dir)
+    except Exception:  # noqa: BLE001 - total: an unreadable record is no record
+        return None
     if rec is None:
         return None
     t = time.time() if now is None else now
@@ -589,8 +607,11 @@ def _write_remote(queue_dir: Path | str, rec: dict) -> None:
 
 def note_remote_activity(queue_dir: Path | str, source: str, at: float | None = None) -> bool:
     """Record input measured away from the laptop (``source`` one of :data:`REMOTE_SOURCES`; anything else raises
-    :class:`PresenceError`) at ``at`` (default now; more than a minute ahead is clamped to now). The record is a monotone
-    high-water mark: an older ``at`` never replaces a newer one, an equal-or-newer one does. Written atomically under the
+    :class:`PresenceError`) at ``at`` (default now; an ``at`` later than now is clamped to now, so a source clock that runs ahead is stamped
+    now). An invalid ``at`` (not a number, a bool, nan, inf, zero, negative, absurdly large) returns ``False`` and never
+    raises into a poll caller. The record is a monotone high-water mark: an older ``at`` never replaces a newer one, an
+    equal-or-newer one does; an existing record dated more than a minute ahead of now (a clock stepped back) counts as
+    absent, so a current write overwrites it. Written atomically under the
     presence lock. Returns whether the mark was written; a lock not taken within a short wait, or a file that cannot be
     written, returns ``False`` and never raises into a caller's poll. It never touches the laptop activity reading."""
     if source not in REMOTE_SOURCES:
@@ -598,13 +619,16 @@ def note_remote_activity(queue_dir: Path | str, source: str, at: float | None = 
     now = time.time()
     if at is None:
         t = now
-    elif isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
-        raise PresenceError(f"{at!r} is not a time")
     else:
-        t = min(float(at), now) if at > now + _REMOTE_SKEW_SECS else float(at)
+        t = _remote_at(at)
+        if t is None:
+            return False
+        t = min(t, now)
     try:
         with _locked(queue_dir, strict=True, wait=_REMOTE_LOCK_WAIT_SECS):
             cur = _read_remote_raw(queue_dir)
+            if cur is not None and cur["at"] > now + _REMOTE_SKEW_SECS:
+                cur = None
             if cur is not None and t < cur["at"]:
                 return False
             _write_remote(queue_dir, {"at": t, "source": source})
@@ -643,6 +667,8 @@ def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Call
         r = route   # a caller that projected the route once hands it in; projected_route (and its `who`) is not run again
     else:
         r = (_route.read_route(queue_dir, at)[0] if suggest else _route.projected_route(queue_dir, idle=reading, now=at))
+    if remote is REMOTE_FAULT:
+        raise PresenceError("the remote-activity read faulted")
     if remote is _UNSET:
         remote = read_remote_activity(queue_dir, at)
     d, source = _decide(at, word, reading, class_name=kind_class(kind), policy=read_policy(queue_dir)[0], route=r, remote=remote)
@@ -650,6 +676,7 @@ def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Call
 
 
 _FAULT = "the presence rule could not be read: pushing"
+REMOTE_FAULT = object()   # a caller's "the remote read itself faulted": the rule then takes the standard fail-open decision
 
 
 def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = None,

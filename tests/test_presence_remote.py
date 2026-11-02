@@ -37,8 +37,8 @@ def test_a_bad_source_raises_and_writes_nothing(tmp_path):
         with pytest.raises(PresenceError):
             presence.note_remote_activity(q, bad)
     assert not _file(q).exists()
-    with pytest.raises(PresenceError):
-        presence.note_remote_activity(q, "remote-terminal", float("nan"))
+    assert presence.note_remote_activity(q, "remote-terminal", float("nan")) is False   # a bad time is False, never a raise
+    assert not _file(q).exists()
 
 
 def test_the_mark_is_monotone_and_an_older_at_is_ignored(tmp_path):
@@ -61,10 +61,34 @@ def test_a_future_at_beyond_a_minute_is_clamped_to_now(tmp_path):
     assert presence.note_remote_activity(q, "remote-control", before + 3600) is True
     at = json.loads(_file(q).read_text())["at"]
     assert before <= at <= time.time()
-    q2 = tmp_path / "q2"
-    near = time.time() + 30                                                               # within the skew: kept as given
-    assert presence.note_remote_activity(q2, "remote-control", near) is True
-    assert json.loads(_file(q2).read_text())["at"] == near
+    q2 = _q(tmp_path / "x")
+    t0 = time.time()
+    assert presence.note_remote_activity(q2, "remote-control", t0 + 30) is True           # any future at is stamped now
+    assert t0 <= json.loads(_file(q2).read_text())["at"] <= time.time()
+
+
+def test_one_validator_for_at_on_write_and_read(tmp_path):
+    q = _q(tmp_path)
+    for bad in (10**500, float("nan"), float("inf"), float("-inf"), -1, -100.0, 0, 0.0, True, "5", 1e11):
+        assert presence.note_remote_activity(q, "remote-terminal", bad) is False, bad
+        assert not _file(q).exists(), bad
+    for bad in ('{"at": 1' + "0" * 499 + ', "source": "remote-terminal"}', '{"at": NaN, "source": "remote-terminal"}',
+                '{"at": -5, "source": "remote-terminal"}', '{"at": 0, "source": "remote-terminal"}',
+                '{"at": true, "source": "remote-terminal"}'):
+        _file(q).write_text(bad)
+        assert presence.read_remote_activity(q, NOW) is None, bad
+
+
+def test_a_future_dated_record_is_absent_to_the_writer_and_the_reader(tmp_path):
+    q = _q(tmp_path)
+    now = time.time()
+    _file(q).write_text(json.dumps({"at": now + 3600, "source": "remote-terminal"}))   # a clock stepped back
+    assert presence.read_remote_activity(q, now) is None
+    assert presence.note_remote_activity(q, "remote-control", now - 5) is True          # a current write overwrites it
+    assert json.loads(_file(q).read_text())["source"] == "remote-control"
+    assert presence.read_remote_activity(q, now)["source"] == "remote-control"
+    _file(q).write_text(json.dumps({"at": now + 30, "source": "remote-terminal"}))      # within a minute ahead: age 0
+    assert presence.read_remote_activity(q, now)["age"] == 0.0
 
 
 def test_read_shape_stale_absent_unreadable_and_symlink(tmp_path):
@@ -167,6 +191,26 @@ def test_a_status_get_reads_the_remote_record_once(tmp_path, monkeypatch):
     assert len(reads) == 1
     assert v["effective"]["remote"]["source"] == "remote-terminal" and v["effective"]["pushing"] is True
     assert "remote desk" in v["text"]
+
+
+def test_a_faulted_remote_read_fails_open_in_the_status_and_in_delivery(tmp_path, monkeypatch):
+    q = _q(tmp_path)
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 0.0)   # active laptop: would hold
+
+    def boom(*a, **k):
+        raise RuntimeError("read blew up")
+
+    monkeypatch.setattr(presence, "read_remote_activity", boom)
+
+    class _Fake:
+        def _credential_is_full(self):
+            return False
+
+    v = web_server._Handler._presence_view(_Fake(), q)
+    want = presence.should_push(q, "ping", now=time.time(), idle=lambda: 0.0, suggest=False)
+    assert want.push is True and want.why == presence._FAULT
+    assert v["effective"]["pushing"] is True and v["effective"]["state"] == "pushing" and v["effective"]["reason"] == presence._FAULT
+    assert presence._FAULT in v["text"] and v["text"].startswith("PUSHING")
 
 
 def test_a_lock_timeout_returns_false_and_never_raises(tmp_path, monkeypatch):
