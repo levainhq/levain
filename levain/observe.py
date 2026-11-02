@@ -237,8 +237,11 @@ def _write_settings(path: Path, doc: dict) -> None:
 
 
 def _can_import(py: str) -> bool:
+    from levain.launch import child_env  # install-time only; the hook path never calls this
+
     try:
-        return subprocess.run([py, "-I", "-c", "import levain.observe"], capture_output=True, timeout=30).returncode == 0
+        return subprocess.run([py, "-I", "-c", "import levain.observe"], capture_output=True, timeout=30,
+                              env=child_env()).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
