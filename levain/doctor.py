@@ -5898,6 +5898,26 @@ def _check_codex_gate_trust(install: Path, hooks_path: Path, codex_home: Path) -
                         "enabled, levain's hash)")]
 
 
+def _check_codex_prompt_timeout(entries: list[dict], hooks_path: Path) -> list[CheckResult]:
+    """A failing row when the rendered UserPromptSubmit handler's timeout is shorter than a signing turn can take
+    (the same test the user-level band hooks apply, :func:`levain.band_hook._short_timeout`); no row otherwise."""
+    from levain.band_hook import PROMPT_HOOK_TIMEOUT_S, _short_timeout
+
+    for entry in entries:
+        for hook in entry.get("hooks", []) if isinstance(entry, dict) else []:
+            if not isinstance(hook, dict) or not hook.get("command"):
+                continue
+            short = _short_timeout(hook)
+            if short is None:
+                return []
+            return [CheckResult(
+                f"{hooks_path} UserPromptSubmit timeout", False,
+                f"timeout {short!r}, shorter than the {PROMPT_HOOK_TIMEOUT_S} s a Touch ID answer can take: Codex "
+                "would kill the hook after the answer is recorded, before its echo",
+                "Run `levain update` (or `levain band hooks install`) to re-render it.", upgrade_pending=True)]
+    return []
+
+
 def _check_codex(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("AGENTS.md", True, "present"))
@@ -5992,6 +6012,9 @@ def _check_codex(install: Path) -> list[CheckResult]:
                             f"wired to this install ({py})" if py else "wired",
                         )
                     )
+            # a Codex hooks.json rendered before the prompt hook's timeout grew still carries the short one
+            if _hook_command_targets(ups, install, "user_prompt_submit.py"):
+                results.extend(_check_codex_prompt_timeout(ups, hooks_path))
             # only while the file is this install's: otherwise the rows above already say it is not wired
             if _hook_command_targets(ss, install, "session_start.py"):
                 results.extend(_check_transcript_hooks(install, hh, ("Stop", "PostToolUse"), "Codex"))
