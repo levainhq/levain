@@ -66,15 +66,20 @@ def _hash(value: Any, name: str) -> str:
 def _text(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise AgentBindError(f"{name} must be a non-empty string")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise AgentBindError(f"{name} holds a lone surrogate, which is not valid text") from None
     return value
 
 
 def _core(*, agent_id: str, role_hash: str, role_text: str, spec_hash: str, capabilities: dict[str, Any],
           created_at: str) -> dict[str, Any]:
-    _text(agent_id, "agent_id")
-    _text(created_at, "created_at")
-    _hash(role_hash, "role_hash")
-    _hash(spec_hash, "spec_hash")
+    # The helpers validate and return the value unchanged; the raw locals are the sealed values by design.
+    agent_id = _text(agent_id, "agent_id")
+    created_at = _text(created_at, "created_at")
+    role_hash = _hash(role_hash, "role_hash")
+    spec_hash = _hash(spec_hash, "spec_hash")
     if not isinstance(role_text, str):
         raise AgentBindError("role_text must be the role row's stored text")
     if not isinstance(capabilities, dict):
@@ -125,4 +130,4 @@ def seal(*, agent_id: str, role_hash: str, role_text: str, spec_hash: str, capab
 def is_agent_binding(binding: Binding) -> bool:
     """True for the compiled form: the agent creator prefix and the agent trigger type together."""
     return (isinstance(binding.created_by, str) and binding.created_by.startswith(AGENT_CREATOR_PREFIX)
-            and binding.trigger.type == AGENT_TRIGGER_TYPE)
+            and getattr(binding.trigger, "type", None) == AGENT_TRIGGER_TYPE)

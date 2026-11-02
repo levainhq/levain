@@ -51,5 +51,12 @@ def test_the_leaf_test_file_is_unchanged_by_this_slice():
     import ast
     from pathlib import Path
     tree = ast.parse(Path(ab.__file__).read_text())
-    mods = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
-    assert all(m.startswith("levain.autonomic") or "." not in m for m in mods)
+    mods = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            mods.update(a.name for a in n.names)
+        elif isinstance(n, ast.ImportFrom):
+            assert n.level == 0 or n.module, "a bare relative import hides its target"
+            mods.add(("." * n.level) + (n.module or ""))
+    allowed_plain = {"__future__", "typing", "hashlib", "json"}
+    assert all(m in allowed_plain or m.startswith("levain.autonomic") for m in mods), sorted(mods)
