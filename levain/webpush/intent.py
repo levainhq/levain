@@ -620,8 +620,8 @@ def _until_arg(until: object, ts: float) -> dict | None:
         return {"kind": "input"}
     if isinstance(until, dict):
         got = _valid_until(until)
-        if got is None:
-            raise PresenceError("until is not a valid end")
+        if got is None or (got["kind"] == "timer" and got["at"] <= ts):
+            raise PresenceError("until is not a valid end (a timer ends after now)")
         return got
     if isinstance(until, (int, float)) and not isinstance(until, bool):
         secs = float(until)

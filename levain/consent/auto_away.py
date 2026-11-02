@@ -113,10 +113,33 @@ def approval_push(settings: Any, queue_dir: Path | str | None, kind: str = "cons
     :func:`levain.webpush.presence.should_push`. Returns its :class:`~levain.webpush.presence.Decision`."""
     from levain.webpush import presence
 
-    why = mark_stands(settings)
+    forced = marked_push(mark_stands(settings), kind)
+    return forced if forced is not None else presence.should_push(queue_dir, kind, idle=idle, suggest=suggest)
+
+
+def marked_push(why: str | None, kind: str) -> Any:
+    """The mark half of the one mark-aware decider, pure: a push :class:`~levain.webpush.presence.Decision` for an
+    approval-class ``kind`` when a mark stands (``why``, :func:`mark_stands`), else ``None`` (the record decides). Read by
+    :func:`approval_push` for a new ping and by :func:`levain.webpush.held.plan` for one already held."""
+    from levain.webpush import presence
+
     if why is not None and presence.kind_class(kind) == "approval":
         return presence.Decision(True, "pushing", why)
-    return presence.should_push(queue_dir, kind, idle=idle, suggest=suggest)
+    return None
+
+
+def any_mark_stands(queue_dir: Path | str) -> str | None:
+    """:func:`mark_stands` for the first agent in ``queue_dir`` it names (``None`` when none does), each agent's settings
+    read exactly as its hook reads them (``read_settings_file``, defaults for a bad file, then ``with_away_mark``, an
+    unreadable store a mark). A held ping does not say which agent's hook filed it, so a release reads every agent's."""
+    from levain.consent.adapters import claude_code, codex
+
+    qdir = Path(queue_dir)
+    for agent, name in (("claude_code", claude_code.SETTINGS_NAME), ("codex", codex.SETTINGS_NAME)):
+        why = mark_stands(claude_code.with_away_mark(claude_code.read_settings_file(qdir / name), qdir, agent))
+        if why is not None:
+            return why
+    return None
 
 
 def hold_seconds(settings: Any, agent: str, source: str) -> float:

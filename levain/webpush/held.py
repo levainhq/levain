@@ -7,7 +7,9 @@ through, and only that:
 
 - an ``active`` ping goes when the rule says push for it now (``follow`` turned devices on, or a setting or preset did);
 - a ping held by a mute goes when the rule says push for it (the mute ended or widened AND his devices are on), preceded by
-  ONE summary push for the batch.
+  ONE summary push for the batch;
+- an approval-class ping goes whenever a signed consent away mark stands, whatever the record says (the mark-aware
+  decider a new ping meets, :func:`levain.consent.auto_away.marked_push`).
 
 A flush takes a held ping with a lease (:meth:`PushStore.claim_held`) and marks it released only after a push to the phone
 succeeded (:meth:`PushStore.release_held`): a failed push, a raised error or a flush that dies leaves it held, and it is
@@ -97,18 +99,21 @@ def count(queue_dir: Path | str | None) -> int:
 
 
 def plan(items: list[dict], rec: dict, reading: float | None, now: float, remote: dict | None = None,
-         desk_msg_at: float | None = None) -> tuple[list[dict], list[dict]]:
+         desk_msg_at: float | None = None, mark: str | None = None) -> tuple[list[dict], list[dict]]:
     """``(active, muted)``: which held ``items`` the record releases at ``now``, as pings held while his devices were off
     (reason ``active``) and pings held by a mute (a preset's ``lets_through``). ``rec`` is :func:`levain.webpush.intent.read`;
     ``reading`` the laptop idle seconds with a desk message counted as input. A held ping is released exactly when the rule
-    now says push for its kind: lifting a mute does not push a ping while his devices are still off. Pure."""
+    now says push for its kind: lifting a mute does not push a ping while his devices are still off. ``mark`` (why a consent
+    away mark stands, :func:`levain.consent.auto_away.any_mark_stands`) releases an approval-class ping whatever the record
+    says, by the same decider a new one meets (:func:`levain.consent.auto_away.marked_push`). Pure."""
+    from levain.consent.auto_away import marked_push
     from levain.webpush import intent
 
     active: list[dict] = []
     muted: list[dict] = []
     for item in items:
-        d = intent.decide(now, rec, reading, class_name=presence.kind_class(item["kind"]), remote=remote,
-                          desk_msg_at=desk_msg_at)
+        d = marked_push(mark, item["kind"]) or intent.decide(
+            now, rec, reading, class_name=presence.kind_class(item["kind"]), remote=remote, desk_msg_at=desk_msg_at)
         if d.push:
             (active if item["reason"] == "active" else muted).append(item)
     return active, muted
@@ -132,7 +137,12 @@ def _plan_now(queue_dir: Path | str, at: float, idle: Callable[[], float | None]
 
     # one sample, exactly as the rule a delivery reads (intent._core): a desk message is laptop input too
     s = intent._sample(queue_dir, at, _idle_source(idle))
-    return plan(items, s["rec"], s["reading"], at, s["remote"], s["msg_at"])
+    mark = None
+    if any(presence.kind_class(i["kind"]) == "approval" for i in items):   # the consent store is read only when it can decide
+        from levain.consent.auto_away import any_mark_stands
+
+        mark = any_mark_stands(queue_dir)
+    return plan(items, s["rec"], s["reading"], at, s["remote"], s["msg_at"], mark)
 
 
 def _inside_spawn_gap(queue_dir: Path | str) -> bool:

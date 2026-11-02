@@ -381,3 +381,69 @@ def test_the_hook_never_recreates_a_lost_away_table(qdir):
     conn = sqlite3.connect(qdir / "queue.db")
     assert "away_marks" not in {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     conn.close()
+
+
+def _base_devices(qdir: Path) -> str:
+    return json.loads((qdir / "webpush" / "intent.json").read_text())["base"]["devices"]
+
+
+def test_a_record_that_cannot_be_written_leaves_every_mark_standing(qdir, monkeypatch, capsys):
+    """L3 r2 (codex MED), reproduced on cc1ed078: `off` left both signed marks, then the record write failed, so the
+    record still said devices on beside no mark. The record is written first now: when it fails no agent changes."""
+    from levain.webpush import intent, presence
+
+    assert main(["consent", "away", "on", "--queue-dir", str(qdir)]) == 0
+
+    def unwritable(*a, **k):
+        raise presence.PresenceError("the record is unwritable")
+
+    monkeypatch.setattr(intent, "apply_settings", unwritable)
+    assert main(["consent", "away", "off", "--signing-key", str(_key(qdir)), "--queue-dir", str(qdir)]) == 1
+    assert "so no agent was" in capsys.readouterr().err
+    assert all(away.settings(qdir, a).away_marked for a in away.AGENTS)
+    assert _base_devices(qdir) == "on"
+
+
+def test_a_refusal_before_the_store_leaves_the_record_alone(qdir, capsys):
+    """L3 r2: with the record written first, a refusal every agent makes before its store (here a hold past the hook's
+    deadline) must still change nothing, the record included (away.check_set runs for every agent first)."""
+    from levain.webpush import intent
+
+    intent.apply_settings(qdir, devices="off")
+    assert main(["consent", "away", "on", "--hold", "9999", "--queue-dir", str(qdir)]) == 1
+    assert "nothing was changed" in capsys.readouterr().err
+    assert _base_devices(qdir) == "off"
+    assert not any(away.settings(qdir, a).away_marked for a in away.AGENTS)
+
+
+def test_a_consent_ping_held_before_a_signed_away_goes_once_the_mark_stands(qdir, monkeypatch):
+    """L3 r2 (deepseek MED), reproduced on cc1ed078: a consent ping held while devices were off stayed held under a
+    standing signed away mark (record devices off), though a new one is pushed. Release reads the same mark rule."""
+    import urllib.request
+
+    from levain.webpush import held, intent, sender
+    from tests._push_fixtures import phone
+
+    intent.apply_settings(qdir, devices="off")
+    sender.send(qdir, kind="consent", ref="request:1", title="levain", body="allow?", url="/?view=needs", push=False,
+                hold="active")
+    assert main(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    intent.apply_settings(qdir, devices="off")   # the operator turns devices off; the signed mark still stands
+    phone(qdir, "https://fcm.googleapis.com/fcm/send/held-mark")
+    monkeypatch.setattr(sender, "_prepare", lambda q, sub, data, topic: urllib.request.Request("https://fcm.googleapis.com/x",
+                                                                                                data=b""))
+    monkeypatch.setattr(sender, "_post", lambda req: 201)
+    assert held.due(qdir, idle=lambda: 5.0) is True
+    assert held.flush(qdir, idle=lambda: 5.0) == 1 and held.count(qdir) == 0
+
+
+def test_the_recheck_reads_the_holds_own_queue_directory(qdir, tmp_path):
+    """L3 r2 (deepseek MED): the recheck reads presence from its settings path's directory, the hold from
+    queue.directory. Every caller passes <queue.directory>/<name>; a path elsewhere is refused, never rechecked."""
+    s = cc.load_settings(qdir)
+    queue = cc._queue_for(qdir, s, home=h4_home())
+    assert cc.still_away_from(qdir / cc.SETTINGS_NAME, s, queue=queue)()[0] in (True, False)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    with pytest.raises(AssertionError):
+        cc.still_away_from(elsewhere / cc.SETTINGS_NAME, s, queue=queue)

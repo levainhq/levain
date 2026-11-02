@@ -262,6 +262,9 @@ def _migrate(args: argparse.Namespace) -> int:
     if args.undo and args.dry_run:
         print("levain ping migrate: --undo and --dry-run do not go together")
         return 2
+    if args.force and not args.undo:
+        print("levain ping migrate: --force goes with --undo")
+        return 2
     try:
         if args.undo:
             got = intent.unmigrate(qdir, force=args.force)

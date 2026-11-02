@@ -2573,40 +2573,49 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
             return 1
     rc, seen = 0, 0
     if args.action != "show":
-        # the set phase: each agent's mark (or signed leave) first, then the record's base devices setting follows the
-        # word (DESIGN §4), then the report below reads the result. Not atomic across agents (each takes its own
-        # signature): when ANY agent changed, the record follows the word, so a changed mark is never left beside a
-        # record that contradicts it, and a partial application is said plainly (and exits non-zero)
+        # the set phase, ONE order (L3 r2): every agent's refusals that need no store (away.check_set) before anything
+        # changes; then the record's base devices setting (DESIGN §4), the cheaper to undo, and nothing else when it
+        # fails; then each agent's mark (or signed leave). Not atomic across agents (each takes its own signature):
+        # an agent whose mark could not change is named with what its hook does now (a mark that still stands holds
+        # and pushes whatever the record says, auto_away.mark_stands), and the run exits non-zero. No rollback.
         word = {"on": True, "off": False, "auto": None}[args.action]
-        changed, failed = [], []
+        present = []
         for agent in agents:
             try:
                 if away.read(qdir, agent) is not None:
-                    away.set_away(qdir, agent, word, args.hold, args.idle_after, signing_key=args.signing_key)
-                    changed.append(agent)
+                    away.check_set(qdir, agent, word, args.hold, args.idle_after, signing_key=args.signing_key)
+                    present.append(agent)
             except (OSError, ValueError, QueueStoreError) as e:
-                print(f"levain consent away: {agent}: {e}", file=sys.stderr)
-                failed.append(agent)
-                rc = 1
-        if changed and failed:
-            print(f"levain consent away: PARTLY applied: {args.action} for {', '.join(changed)}, NOT for "
-                  f"{', '.join(failed)} (see above); the presence record follows the word for the agents that changed",
-                  file=sys.stderr)
-        if changed:
+                print(f"levain consent away: {agent}: {e}; nothing was changed", file=sys.stderr)
+                return 1
+        if present:
             devices = {"on": "on", "off": "off", "auto": "follow"}[args.action]
             try:
                 intent.apply_settings(qdir, devices=devices, follow_after=args.idle_after if args.action == "auto" else None,
                                       via=f"consent away {args.action}")
             except intent.presence.PresenceError as e:
-                print(f"levain consent away: the presence record was not changed: {e}", file=sys.stderr)
-                rc = 1
-            else:
-                try:   # devices coming on can make held pings due: start their push now
-                    from levain.webpush import held
+                print(f"levain consent away: the presence record was not changed ({e}), so no agent was", file=sys.stderr)
+                return 1
+            for agent in present:
+                try:
+                    away.set_away(qdir, agent, word, args.hold, args.idle_after, signing_key=args.signing_key)
+                except (OSError, ValueError, QueueStoreError) as e:
+                    rc = 1
+                    try:
+                        stands = away.settings(qdir, agent).away_marked
+                    except Exception:  # noqa: BLE001 - the report below says what the hook meets
+                        stands = True
+                    now = ("its away mark still stands, so its hook holds approvals for a signed answer and pushes them "
+                           "to your devices whatever the record says" if stands else
+                           "no away mark stands, so its hook follows the record")
+                    print(f"levain consent away: {agent}: {e}. The presence record says devices {devices} now; {now}",
+                          file=sys.stderr)
+            try:   # devices coming on can make held pings due: start their push now
+                from levain.webpush import held
 
-                    held.flush_if_due(qdir, throttle=False)
-                except Exception:  # noqa: BLE001 - the record is written; the next gate call flushes
-                    pass
+                held.flush_if_due(qdir, throttle=False)
+            except Exception:  # noqa: BLE001 - the record is written; the next gate call flushes
+                pass
     for agent in agents:
         try:
             try:

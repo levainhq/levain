@@ -794,6 +794,10 @@ def still_away_from(path: Path, started: AdapterSettings, *, agent: str | None =
     the hold's start). Known edge: the hook's ``queue`` verifies leaves against the cockpit the settings named when
     it opened, so a ``cockpit_data_root`` changed during a hold takes effect at the next hook call."""
     agent = agent if agent is not None else path.stem
+    # INVARIANT: the recheck's queue_dir (path.parent) is the hold's (queue.directory): every caller passes
+    # <queue.directory>/<settings name>; a foreign path would recheck another presence record (a test's stand-in queue
+    # is not a ConsentQueue and is not checked)
+    assert not isinstance(queue, ConsentQueue) or Path(queue.directory) == path.parent, (path, queue.directory)
 
     def recheck() -> tuple[bool, str, str]:
         fresh = try_read_settings_file(path)
