@@ -514,7 +514,7 @@
   const PR_DURS = ["15m", "1h", "2h"];
   const PR_DEVICES = [["on", "On"], ["follow", "Follow"], ["off", "Off"]];
   const PR_AFTER = [5, 10, 15, 30, 60];                  // minutes of no input before follow turns devices on
-  const PR_LETS = [["everything", "Everything"], ["needs", "Needs only"], ["approvals", "Approvals only"], ["nothing", "Nothing"]];
+  const PR_LETS = [["everything", "Everything"], ["needs", "Approvals and needs"], ["approvals", "Approvals only"], ["nothing", "Nothing"]];
   const PR_UNTILS = [["switch", "I switch it"], ["for", "For…"], ["input", "My next input"]];
   // the tap-token form names the words the server knows: the presets, and the two aliases (desk = follow, devices = on)
   const PR_TAP_WORDS = [["back", "Back"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"],
