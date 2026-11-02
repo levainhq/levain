@@ -469,7 +469,8 @@ def _check_phone_path(*, which: Any = None, run: Any = None, port: int | None = 
             pr = str(h.get("Proxy") or "") if isinstance(h, dict) else ""
             try:
                 u = urlparse(pr)
-                hit = mount == "/" and u.scheme == "http" and u.hostname in _LOOPBACK and u.port == port
+                hit = (mount == "/" and u.scheme == "http" and u.hostname in _LOOPBACK and u.port == port
+                       and u.path in ("", "/") and not str(key).endswith(":80"))  # :80 is plain http, not the https name a passkey needs
             except ValueError:
                 continue
             if hit:

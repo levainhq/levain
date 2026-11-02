@@ -67,3 +67,12 @@ def test_the_tailscale_child_gets_no_secret_environment(monkeypatch):
     monkeypatch.setenv("LEVAIN_TEST_SECRET_TOKEN", "hunter2")
     r = doctor._bounded_tailscale([sys.executable, "-c", "import os,json;print(json.dumps(dict(os.environ)))"])
     assert r.returncode == 0 and "LEVAIN_TEST_SECRET_TOKEN" not in json.loads(r.stdout)
+
+
+def test_a_proxy_to_a_subpath_or_a_plain_http_listener_is_not_the_cockpit():
+    def serve(key, target):
+        return {"Web": {key: {"Handlers": {"/": {"Proxy": target}}}}}
+    st = {"BackendState": "Running", "Self": {"DNSName": "m.t.ts.net."}}
+    assert _row(st, serve("m.t.ts.net:443", f"http://127.0.0.1:{PORT}/foo")).warn
+    assert _row(st, serve("m.t.ts.net:80", f"http://127.0.0.1:{PORT}")).warn
+    assert not _row(st, serve("m.t.ts.net:443", f"http://127.0.0.1:{PORT}")).warn
