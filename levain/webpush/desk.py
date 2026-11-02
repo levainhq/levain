@@ -263,13 +263,13 @@ def you_view(now: float, reading: float | None, word: dict | None = None, *, win
     chip as its preset."""
     limit = ACTIVE_WINDOW_SECS if window is None else window
     if reading is None:
-        return {"state": "unknown", "idle_secs": None, "text": "You: no laptop input reading", "short": "no reading"}
+        return {"state": "unknown", "idle_secs": None, "text": "Laptop: no input reading", "short": "no reading"}
     idle = max(0.0, reading)
     mins = int(idle // 60)
     if idle < limit:
         short = "active just now" if mins < 1 else f"active {mins} min ago"
-        return {"state": "here", "idle_secs": idle, "text": f"You: {short}", "short": short}
-    return {"state": "away", "idle_secs": idle, "text": f"You: no input at the laptop for {mins} min", "short": f"idle {mins} min"}
+        return {"state": "here", "idle_secs": idle, "text": f"Laptop: {short}", "short": short}
+    return {"state": "away", "idle_secs": idle, "text": f"Laptop: no input for {mins} min", "short": f"idle {mins} min"}
 
 
 def _mins_text(secs: float) -> str:
