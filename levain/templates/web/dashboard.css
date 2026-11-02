@@ -3188,7 +3188,7 @@ body.ke .dev-zone.pr-settings .zone-head { display: flex; }
 .nc-state p, .nc-nomatch, .nc-none, .nc-gone { margin: 0; color: var(--meta); font: var(--fw-regular) var(--fs-body)/var(--lh-list) var(--sans); }
 .nc-nomatch, .nc-none, .nc-gone { padding: var(--sp-5); }
 .nc-gone { color: var(--accent); font-weight: var(--fw-semibold); }
-.nc-spin { width: 18px; height: 18px; border-radius: var(--r-pill); border: 2px solid var(--hair-2); border-top-color: var(--label); animation: nc-spin .8s linear infinite; }
+.nc-spin { width: 18px; height: 18px; border-radius: var(--r-pill); border: 2px solid var(--hair-2); border-top-color: var(--label); animation: nc-spin .8s linear 12; }
 @keyframes nc-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .nc-spin { animation: none; } .nc-rowin { transition: none; } }
 .nc-older { margin: var(--sp-4) var(--sp-5); }
