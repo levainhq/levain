@@ -95,9 +95,11 @@ def _no_operator_git_config_reads(monkeypatch):
 def _no_input_idle_source(monkeypatch):
     """The consent hook reads this Mac's real input idle (`levain.consent.auto_away.input_idle_seconds`), so a
     suite run while nobody touches the machine would hold requests no test meant to hold. Every in-process test
-    gets "no idle source"; a test of input idle passes its own reader."""
+    gets input at the laptop just now (0 s): under the presence record (follow, 10 min) that is "the desk", so nothing
+    is held. (It was "no idle source" while a missing reading meant not away; under the record a missing reading
+    reads as devices on, DESIGN §3, and would hold every request.) A test of input idle passes its own reader."""
     import levain.consent.auto_away as auto_away
-    monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: None)
+    monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: 0.0)
 
 
 @pytest.fixture(autouse=True)

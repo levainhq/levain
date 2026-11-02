@@ -1,4 +1,5 @@
-"""Presence-aware away mode: the explicit word, then input idle, then off; a held request follows a flip to off.
+"""Presence-aware away mode: a signed mark, then the presence record (follow, 10 min by default); a held request
+follows a flip to off. (A caller with no queue directory keeps the old order for one release: word, input idle, off.)
 
 Built from the runs in levain project_memory/1017-presence/AUTOAWAY_RUN.md (the real hook entry point, the real
 `levain consent away` verb, and Codex 0.162.1)."""
@@ -83,8 +84,10 @@ def _wait_pending(qdir, limit=10.0):
     raise AssertionError("the hook never held the request")
 
 
-def test_the_word_off_mid_hold_releases_to_the_agents_dialog(qdir, capsys):
-    # runs A1 (Claude Code shape) and X2 (Codex 0.162.1): the hold ends about a second after `away off`, no answer
+def test_the_word_off_mid_hold_releases_to_the_agents_dialog(qdir, idle, capsys):
+    # runs A1 (Claude Code shape) and X2 (Codex 0.162.1): the hold ends about a second after `away off`, no answer.
+    # `away off` is a signed leave AND the record's devices off, so the release names the record
+    idle[0] = 5.0
     for agent in ("claude_code", "codex"):
         mod, event = EVENTS[agent]
         assert cli(["consent", "away", "on", "--hold", "15", "--agent", agent, "--queue-dir", str(qdir)]) == 0
@@ -96,7 +99,7 @@ def test_the_word_off_mid_hold_releases_to_the_agents_dialog(qdir, capsys):
         assert not t.is_alive() and time.monotonic() - flipped < cc.RECHECK_EVERY + 3
         assert out.getvalue() == ""  # no decision: the agent's own dialog asks
         state, note = _row(qdir)
-        assert state == "withdrawn" and note.startswith("away mode ended (explicit word: off)")
+        assert state == "withdrawn" and note.startswith("away mode ended (devices off)")
 
 
 def test_input_idle_holds_and_input_releases(qdir, idle, capsys, tmp_path):
@@ -108,7 +111,7 @@ def test_input_idle_holds_and_input_releases(qdir, idle, capsys, tmp_path):
     idle[0] = 2.0
     t.join(10)
     assert not t.is_alive() and out.getvalue() == ""
-    assert _row(qdir) == ("withdrawn", "away mode ended (input idle 2s < 600s); the native dialog stands")
+    assert _row(qdir) == ("withdrawn", "away mode ended (follow: input at the laptop just now); the native dialog stands")
     # run_h2 (a): an idle hold whose cockpit can no longer sign (its database gone) is released at the recheck
     (tmp_path / "own").mkdir()
     own = _cockpit(tmp_path / "own")
@@ -120,14 +123,15 @@ def test_input_idle_holds_and_input_releases(qdir, idle, capsys, tmp_path):
     os.rename(own / "cockpit.db", own / "cockpit.db.gone")
     t.join(10)
     assert not t.is_alive() and out.getvalue() == "" and _row(qdir) == (
-        "withdrawn", "away mode ended (input idle 700s >= 600s, but no enrolled key could sign an answer); the "
-                     "native dialog stands")
+        "withdrawn", "away mode ended (follow: no input for 11 min, but no enrolled key could sign an answer); "
+                     "the native dialog stands")
 
 
-def test_the_explicit_word_outranks_input_idle_until_auto_clears_it(qdir, idle, capsys):
-    # runs S0, I1, I2 and I3: off holds nothing however idle, on holds however present, auto hands it back to
-    # idle; `show` names the source each time. Run H1: a file levain 0.11.4 wrote (its own `away on --hold 90`
-    # then `away off`, from PyPI) is the word off, never handed to input idle by the upgrade
+def test_the_record_decides_and_the_verbs_write_it(qdir, idle, capsys):
+    # runs S0, I1, I2 and I3, now on the record (DESIGN §4): the settings file's away words are NOT read when a queue
+    # directory is given. `on` is a signed mark + devices on, `off` a signed leave + devices off, `auto` a signed
+    # leave + devices follow (--idle-after is the follow time); `show` and every verb end with the describe line.
+    # A file levain 0.11.4 wrote (explicit off, no away_word) is no longer a standing off: the record decides.
     legacy = qdir.parent / "legacy"
     legacy.mkdir(mode=0o700)
     os.chmod(legacy, 0o700)
@@ -136,38 +140,39 @@ def test_the_explicit_word_outranks_input_idle_until_auto_clears_it(qdir, idle, 
                                                        "away_hold_seconds": 90.0}, indent=2) + "\n")
     idle[0] = 4000.0
     cli(["consent", "away", "show", "--agent", "codex", "--queue-dir", str(legacy)])
-    assert "codex: away mode off;" in (out := capsys.readouterr().out)
-    assert "set by explicit word: off (set before auto-away existed); `levain consent away auto` lets input idle " \
-           "decide" in out
-    (legacy / cx.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": root, "away_mode": True,
-                                                       "away_hold_seconds": 90.0}, indent=2) + "\n")
-    cli(["consent", "away", "show", "--agent", "codex", "--queue-dir", str(legacy)])
-    # run_h2 R3: a legacy ON is told the way back to input idle too
-    assert "`levain consent away auto` hands it back to input idle" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "codex: away mode ON, holds up to 90s" in out and "set by follow: no input for 66 min" in out
+    assert "follows your presence record" in out and out.rstrip().splitlines()[-1].startswith("Pings now: your devices")
+    # the legacy path (a caller with no queue directory, for one release) still reads the word: explicit off
+    assert auto_away.away_state(cx.load_settings(legacy), lambda: 4000.0)[:2] == (False, "word")
     (legacy / cx.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": root, "away_mode": False,
                                                        "away_hold_seconds": 90.0}, indent=2) + "\n")
-    cli(["consent", "away", "auto", "--agent", "codex", "--queue-dir", str(legacy)])
+    assert cli(["consent", "away", "auto", "--agent", "codex", "--queue-dir", str(legacy)]) == 0
     assert "away mode ON, holds up to 90s" in capsys.readouterr().out  # the 0.11.4 hold is kept, not defaulted
     assert json.loads((legacy / cx.SETTINGS_NAME).read_text())["away_hold_seconds"] == 90.0
     idle[0] = 213.0
     cli(["consent", "away", "show", "--agent", "codex", "--queue-dir", str(qdir)])
     assert "codex: away mode off; answers verify against" in (out := capsys.readouterr().out)
-    assert "set by input idle 213s < 600s; on after 600s of no keyboard, mouse or trackpad input" in out
-    cli(["consent", "away", "auto", "--idle-after", "1", "--agent", "codex", "--queue-dir", str(qdir)])
+    assert "set by follow: input at the laptop 3 min ago" in out
+    assert cli(["consent", "away", "auto", "--idle-after", "120", "--agent", "codex", "--queue-dir", str(qdir)]) == 0
     assert "codex: away mode ON, holds up to 120s" in (out := capsys.readouterr().out)
-    assert "set by input idle 213s >= 1s" in out
+    assert "set by follow: no input for 3 min" in out and "Devices: follow, after 2 min." in out
     assert cli(["consent", "away", "on", "--idle-after", "5", "--queue-dir", str(qdir)]) == 2
+    assert cli(["consent", "away", "auto", "--idle-after", "5", "--queue-dir", str(qdir)]) == 2   # under the follow floor
+    assert "60 to 86400" in capsys.readouterr().err
     idle[0] = 700.0
     assert cli(["consent", "away", "off", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
-    assert "set by explicit word: off; `levain consent away auto` hands it back to input idle" in \
-        capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "set by devices off" in out and "Devices: off." in out
     t, out, started = _hook(cc, EVENTS["claude_code"][1], qdir)
     t.join(10)
     assert time.monotonic() - started < 2 and _row(qdir) == (
         "withdrawn", "the hook stopped waiting; the native dialog stands")
     idle[0] = 0.0
     assert cli(["consent", "away", "on", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
-    assert auto_away.away_state(cc.load_settings(qdir))[:2] == (True, "word")
+    assert "Devices: on." in capsys.readouterr().out
+    assert cc.effective_away(away.settings(qdir, "claude_code"), queue_dir=qdir)[:2] == (True, "word")   # the mark
+    assert auto_away.away_state(cc.load_settings(qdir))[:2] == (True, "word")   # the old caller reads the file's word
     assert cli(["consent", "away", "auto", "--agent", "claude_code", "--signing-key", str(_key(qdir)),
                 "--queue-dir", str(qdir)]) == 0
     assert json.loads((qdir / cc.SETTINGS_NAME).read_text())["away_word"] == "auto"

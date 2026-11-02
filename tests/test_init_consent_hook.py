@@ -180,7 +180,7 @@ def test_init_creates_the_settings_file_away_off(make_install):
     assert os.stat(path.parent).st_mode & 0o777 == 0o700
 
 
-def test_init_never_rewrites_an_existing_settings_file(make_install, capsys, tmp_path):
+def test_init_never_rewrites_an_existing_settings_file(make_install, capsys, tmp_path, monkeypatch):
     path = _settings_file(codex.SETTINGS_NAME)
     path.parent.mkdir(mode=0o700, parents=True)
     mine = {"cockpit_data_root": "/somewhere/else/cockpit", "away_mode": True, "away_hold_seconds": 15}
@@ -193,8 +193,18 @@ def test_init_never_rewrites_an_existing_settings_file(make_install, capsys, tmp
     rows = doctor._check_codex(cx)
     auth = _row(rows, "Codex consent authority")
     assert not auth.warn and "nothing is answered by a grant" in auth.detail, auth  # no cockpit database anywhere
-    away = _row(rows, "Codex away mode")
+    away = _row(rows, "Codex away mode")   # the record decides; at the desk it sends approvals to the dialog, and the file's word is named as unread
+    assert not away.warn and "follows your presence record" in away.detail and "is not read now" in away.detail, away
+    from levain.webpush import intent
+    (path.parent / "webpush").mkdir(mode=0o700, exist_ok=True)
+    intent.apply_preset(path.parent, "away")   # the record says devices: it holds for a signed answer ...
+    away = _row(doctor._check_codex(cx), "Codex away mode")   # ... only while a key could sign (what the hook reads: L3 r1 codex LOW)
+    assert not away.warn and "own dialog now" in away.detail and "no enrolled key could sign" in away.detail, away
+    can_sign = claude_code._can_sign
+    monkeypatch.setattr(claude_code, "_can_sign", lambda st: True)
+    away = _row(doctor._check_codex(cx), "Codex away mode")
     assert away.warn and "NO dialog during the hold" in away.detail and "15s" in away.detail, away
+    monkeypatch.setattr(claude_code, "_can_sign", can_sign)
     other = tmp_path / "other" / "cockpit"
     other.mkdir(parents=True)
     (other / "cockpit.db").write_bytes(b"")
@@ -267,7 +277,7 @@ def test_doctor_rows_on_a_fresh_install(make_install):
     hook = _row(rows, "Claude Code consent hook")  # a fresh install has no key: the Q10 floor's WARN (L2-7)
     assert hook.warn and "refused outright outside default mode" in hook.detail
     away = _row(rows, "Claude Code away mode")
-    assert not away.warn and away.detail.startswith("follows input idle:"), away
+    assert not away.warn and away.detail.startswith("follows your presence record"), away
     auth = _row(rows, "Claude Code consent authority")
     assert not auth.warn and "no cockpit.db there yet" in auth.detail, auth
     (Path(os.path.realpath(cc / ".levain" / "cockpit"))).mkdir(parents=True, exist_ok=True)
@@ -275,13 +285,19 @@ def test_doctor_rows_on_a_fresh_install(make_install):
     assert "no cockpit.db" not in _row(doctor._check_claude_code(cc), "Claude Code consent authority").detail
 
 
-def test_doctor_claude_away_on_is_not_a_warning(make_install):
+def test_doctor_claude_away_on_is_not_a_warning(make_install, monkeypatch):
     cc = make_install("cc")
     path = _settings_file(claude_code.SETTINGS_NAME)
     doc = json.loads(path.read_text())
     path.write_text(json.dumps({**doc, "away_mode": True, "away_word": "on", "away_hold_seconds": 5000}))
+    from levain.webpush import intent
+    (path.parent / "webpush").mkdir(mode=0o700, exist_ok=True)
+    intent.apply_preset(path.parent, "away")   # the record says devices; the file's word alone decides nothing now
+    away = _row(doctor._check_claude_code(cc), "Claude Code away mode")   # no enrolled key: the hook asks the dialog
+    assert not away.warn and "own dialog now (away, but no enrolled key could sign an answer)" in away.detail, away
+    monkeypatch.setattr(claude_code, "_can_sign", lambda st: True)
     away = _row(doctor._check_claude_code(cc), "Claude Code away mode")
-    assert not away.warn and "on, hold 840s" in away.detail and "dialog during the hold" in away.detail, away
+    assert not away.warn and "(away), hold 840s" in away.detail and "dialog during the hold" in away.detail, away
 
 
 def test_a_codex_install_that_does_not_own_the_file_gets_no_consent_rows(make_install):
