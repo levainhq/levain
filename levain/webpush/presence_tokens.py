@@ -27,7 +27,7 @@ from levain.webpush.route import ROUTE_WORDS
 WORDS = _PRESENCE_WORDS + ROUTE_WORDS   # what a token may be listed for: the presence words and the two route words
 
 FILE_NAME = "presence_tokens.json"
-DEFAULT_WORDS = ("away", "back", "quiet", "remote", "desk", "devices")
+DEFAULT_WORDS = ("away", "back", "quiet", "desk", "devices")
 NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,40}$")
 MAX_TOKENS = 50
 _MAX_BYTES = 64 * 1024
@@ -135,7 +135,7 @@ def _write(queue_dir: Path | str, recs: list[dict]) -> None:
 
 
 def _public(r: dict) -> dict:
-    return {"name": r["name"], "words": list(r["words"]), "created": r.get("created"),
+    return {"name": r["name"], "words": [w for w in r["words"] if w in WORDS], "created": r.get("created"),
             "last_used": r.get("last_used"), "revoked": bool(r.get("revoked"))}
 
 

@@ -120,6 +120,9 @@ class Answer:
     value: str
     channel: str
     answered_at: str
+    # whether the answer was signed, and by which signer; None = the store cannot say (a native store records neither)
+    signed: bool | None = None
+    signer: str | None = None
 
 
 @dataclass(frozen=True)

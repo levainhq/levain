@@ -79,8 +79,8 @@ def test_auto_never_replaces_an_unexpired_operator_record_and_operator_replaces_
     assert route.read_route(tmp_path, NOW + 3701)[:2] == ("desk", "operator")
 
 
-def test_the_remote_word_sets_devices_for_its_duration_and_back_sets_desk(tmp_path):
-    set_word(tmp_path, "remote", duration="2h", now=NOW)
+def test_back_sets_desk_and_the_other_words_leave_the_route(tmp_path):
+    route.set_route(tmp_path, "devices", "2h", now=NOW)
     assert route.read_route(tmp_path, NOW + 1) == ("devices", "operator", NOW + 7200)
     set_word(tmp_path, "away", now=NOW + 5)
     assert route.read_route(tmp_path, NOW + 6)[0] == "devices"            # away and sleep leave the route alone
@@ -91,7 +91,7 @@ def test_the_remote_word_sets_devices_for_its_duration_and_back_sets_desk(tmp_pa
 
 
 def test_back_under_a_standing_loud_leaves_the_route(tmp_path):
-    set_word(tmp_path, "remote", now=NOW)
+    route.set_route(tmp_path, "devices", now=NOW)
     set_word(tmp_path, "loud", duration="1h", now=NOW + 1)
     set_word(tmp_path, "back", now=NOW + 2)
     assert route.read_route(tmp_path, NOW + 3)[0] == "devices"
@@ -213,9 +213,6 @@ def test_a_failed_route_write_reports_it_after_the_word_landed(tmp_path, monkeyp
         raise presence.PresenceError("route not written: disk")
 
     monkeypatch.setattr(route, "apply_route", boom)
-    with pytest.raises(presence.PresenceError, match="tap it again"):
-        set_word(tmp_path, "remote", by=None, now=NOW + 5)
-    assert presence.read_word(tmp_path)["word"] == "remote"      # the word is set; the caller was told the route was not
     monkeypatch.setattr(route, "_write", boom)
     with pytest.raises(presence.PresenceError, match="tap it again"):
         set_word(tmp_path, "back", by=None, now=NOW + 6)
@@ -279,7 +276,7 @@ def test_a_word_write_that_fails_leaves_the_route_alone(tmp_path):
     pj = tmp_path / "webpush" / "presence.json"
     pj.unlink()
     pj.mkdir()   # the word cannot be written over a directory
-    for word in ("back", "remote"):
+    for word in ("back",):
         with pytest.raises(presence.PresenceError):
             set_word(tmp_path, word, by=None, now=NOW + 5)
         assert (tmp_path / "webpush" / "route.json").read_bytes() == before

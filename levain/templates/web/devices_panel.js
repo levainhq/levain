@@ -664,26 +664,26 @@
 
   // ---- Presence. The word that says whether pings reach you lives in the masthead: a chip on every page (state and time left)
   // that opens a small sheet of big buttons, so setting it as you come and go takes a tap or two. GET /webpush/presence reads
-  // it ({word, until, text, route, route_source, route_until, tokens}); POST /webpush/presence/set {word, for?} writes it.
-  // The route ({route, route_source, route_until}) says where an ordinary ping goes while you are active at the laptop: Desk
+  // it ({word, until, text, route, route_source, route_until, effective, tokens}); POST /webpush/presence/set {word, for?} writes it.
+  // The chip paints `effective` ({state: pushing|holding|muted, reason, source: word|measured}), the one answer the push rule gives
+  // right now; with none (an older server) it paints the stored word. The route ({route, route_source, route_until}) says where an ordinary ping goes while you are active at the laptop: Desk
   // holds it for the terminal band, Devices pushes it to your phone; {word:"desk"|"devices", for?} sets the route alone.
   // Below the page sits the quieter part (tap tokens a Shortcut or an NFC tag uses to set the word with no location fix, and
   // the Notifications policy), reached from the sheet's link. Same token as every other write here; the chip hides on a 404
   // (no web push) or a refused token, without a word of error in the header.
-  const PR_WORDS = [["back", "Here"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"], ["remote", "Remote"]];
+  const PR_WORDS = [["back", "Here"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"]];
   const PR_ROUTES = [["desk", "Desk"], ["devices", "Devices"]];
   // the tap-token form names the word the server knows (back), not the sheet's friendlier "Here"
   const PR_TAP_WORDS = [["back", "Back"]].concat(PR_WORDS.slice(1), PR_ROUTES);
-  const PR_TIMED = ["quiet", "loud", "remote"];
+  const PR_TIMED = ["quiet", "loud"];
   // "" is "until back": away and sleep already end on his return and take no duration; a timed word or the Devices route
   // needs an end, so it takes the longest the server allows
   const PR_DURATIONS = [["15m", "15m"], ["1h", "1h"], ["2h", "2h"], ["", "Until back"]];
   const PR_CAP = "24h";
   const PR_DUR_KEY = "levain_presence_for";
-  const PR_TAP_DEFAULT = ["away", "back", "quiet", "remote", "desk", "devices"];
+  const PR_TAP_DEFAULT = ["away", "back", "quiet", "desk", "devices"];
   const PR_WORD_GLOSS = { back: "pings reach you as usual", away: "held for your phone", quiet: "only what needs you reaches you",
-                          sleep: "only what needs you reaches you, until you are active", loud: "everything reaches you",
-                          remote: "you are working from your phone: sets Devices too" };
+                          sleep: "only what needs you reaches you, until you are active", loud: "everything reaches you" };
   const PR_ROUTE_GLOSS = { desk: "held for the terminal while you are active at the laptop",
                            devices: "pushed to your phone and cockpit even while you are active" };
   let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prBtns = {}, prRouteBtns = {}, prDurBtns = {}, prRoute = null,
@@ -1184,7 +1184,7 @@
     dr.appendChild(el("span", "pr-sheet-lab", "For"));
     const dseg = el("div", "pr-sheet-seg");
     dseg.setAttribute("role", "group");
-    dseg.setAttribute("aria-label", "How long: Quiet, Loud, Remote and Devices");
+    dseg.setAttribute("aria-label", "How long: Quiet, Loud and Devices");
     for (const [v, label] of PR_DURATIONS) {
       const b = el("button", "pr-big pr-dur", label);
       b.type = "button";
@@ -1195,7 +1195,7 @@
     dr.appendChild(dseg);
     prSheet.appendChild(dr);
     // visible on a phone, where a tooltip never shows: what "Until back" does for the words that cannot stand forever
-    prSheet.appendChild(el("p", "pr-sheet-route", "Until back: Desk stays as set; Quiet, Sleep, Loud, Remote and Devices end after " + PR_CAP + " at most."));
+    prSheet.appendChild(el("p", "pr-sheet-route", "Until back: Desk stays as set; Quiet, Loud and Devices end after " + PR_CAP + " at most; Sleep takes no duration."));
     paintDur();
     prEndLoud = el("button", "pr-big pr-endloud", "End Loud");
     prEndLoud.type = "button"; prEndLoud.hidden = true;
@@ -1330,19 +1330,31 @@
     return r ? h + "h " + r + "m" : h + "h";
   }
 
+  // the push rule's reason, cut to a masthead's length: "desk inactive 7 min", "route: devices (his phone shows the band)" -> "route: devices"
+  function shortReason(r) {
+    const rm = /^remote desk: (\S+) input (\d+) min ago/.exec(String(r || ""));   // "remote terminal 2 min ago"
+    if (rm) return rm[1].replace(/-/g, " ") + " " + rm[2] + " min ago";
+    r = String(r || "").replace(/\s*\(.*$/, "").replace(/^no desk activity source: read as inactive$/, "no desk reading");
+    return r.length <= 40 ? r : (/\s/.test(r[40]) ? r.slice(0, 40) : r.slice(0, 40).replace(/\s+\S*$/, "")).replace(/[\s,;:.-]+$/, "") + "\u2026";
+  }
+  const PR_STATES = { pushing: "Pushing", holding: "Holding", muted: "Muted" };
+
   function paintChip(v) {
     if (!prChip) return;
-    const w = v.word;
-    const name = w ? (PR_WORDS.find((x) => x[0] === w) || [w, w])[1] : "Here";
+    const eff = v.effective && PR_STATES[v.effective.state] ? v.effective : null;
+    // a word on file that is DECIDING shows as the word (and its time left); anything else shows what the rule is doing now
+    const w = eff ? (eff.source === "word" ? (eff.word || null) : null) : v.word;
+    let name = w ? (PR_WORDS.find((x) => x[0] === w) || [w, w])[1] : (eff ? PR_STATES[eff.state] : "Here");
     let t = name, say = name;
     const ms = w && v.until ? stampMs(v.until) - Date.now() : NaN;
     if (!Number.isNaN(ms) && ms > 0) { t += " · " + span(ms); say += ", " + span(ms) + " left"; }
-    if (v.route === "devices") { t += " · devices"; say += ", pings go to devices"; }
+    if (eff && !w) { const why = shortReason(eff.reason); if (why) { t += " · " + why; say += ", " + why; } }
+    else if (v.route === "devices") { t += " · devices"; say += ", pings go to devices"; }
     // the word and its tail (time, route) are separate nodes so a phone's masthead can keep the word and drop the tail
     prChipText.textContent = "";
     prChipText.appendChild(el("span", "pr-chip-w", name));
     if (t.length > name.length) prChipText.appendChild(el("span", "pr-chip-x", t.slice(name.length)));
-    prChip.dataset.state = w || "here";
+    prChip.dataset.state = w || (eff ? eff.state : "here");
     prChip.setAttribute("aria-label", "Presence: " + say + ". Change it");
   }
 

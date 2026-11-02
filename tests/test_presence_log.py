@@ -24,15 +24,15 @@ def test_each_word_a_setter_replaces_stays_on_record_and_the_card_names_the_sett
     set_word(tmp_path, "quiet", duration="2h", now=T)
     set_word(tmp_path, "away", by=SEAT, said="anything at all", now=T + 60, match=said(T + 30))
     set_word(tmp_path, "sleep", now=T + 120)
-    set_word(tmp_path, "remote", by=COORD, said="I am on the train", now=T + 180, match=said(T + 150))
+    set_word(tmp_path, "quiet", by=COORD, said="I am on the train", now=T + 180, match=said(T + 150))
     rows = read_log(tmp_path)
     assert [(r["word"], r["outcome"], r["prior"].get("word")) for r in rows] == [
-        ("quiet", "set", None), ("away", "set", "quiet"), ("sleep", "set", "away"), ("remote", "set", "sleep")]
+        ("quiet", "set", None), ("away", "set", "quiet"), ("sleep", "set", "away"), ("quiet", "set", "sleep")]
     assert rows[1]["by"] == SEAT and rows[1]["said"] == "anything at all" and "by" not in rows[0]
     assert rows[3]["by"] == COORD and rows[3]["prior"] == {"word": "sleep"}
     card = morning._presence(tmp_path)   # the standing word is the coordinator's; the rows are old, so no refusals
-    assert card["word"] == "remote" and card["by"] == COORD and card["said"] == "I am on the train"
-    set_word(tmp_path, "remote", duration="1m", by=SEAT, said="back soon", now=T)   # ran out 29 minutes ago
+    assert card["word"] == "quiet" and card["by"] == COORD and card["said"] == "I am on the train"
+    set_word(tmp_path, "quiet", duration="1m", by=COORD, said="back soon", now=T)   # ran out 29 minutes ago
     assert morning._presence(tmp_path) is None
 
 
@@ -66,7 +66,7 @@ def test_an_unwritable_log_refuses_a_setter_and_not_the_operator(tmp_path, capsy
 def test_past_the_size_bound_the_log_rotates_and_reads_back_newest_first_kept(tmp_path, monkeypatch):
     monkeypatch.setattr(presence, "LOG_MAX_BYTES", 1500)
     for i in range(40):
-        set_word(tmp_path, "remote", duration=f"{i + 1}m", by=SEAT, said=f"word {i}", now=T + i)
+        set_word(tmp_path, "away", by=SEAT, said=f"word {i}", now=T + i)
     d = tmp_path / "webpush"
     assert (d / (presence.LOG_NAME + ".1")).stat().st_size < 3000
     assert not (d / presence.LOG_NAME).exists() or (d / presence.LOG_NAME).stat().st_size < 3000

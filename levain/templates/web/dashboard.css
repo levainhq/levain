@@ -1694,6 +1694,9 @@ body.ke .needs-chip { font: var(--fw-medium) var(--fs-micro)/1.4 var(--mono); co
 body.ke .needs-body { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; flex: 1 1 auto; }
 body.ke .needs-body .consent-display { margin-top: 0; }
 body.ke .needs-card.is-full { max-width: 720px; width: 100%; }
+body.ke .needs-answered { display: flex; flex-direction: column; gap: var(--sp-3); margin-top: var(--sp-4); }
+body.ke .needs-card.needs-settled { border-color: var(--line, var(--label)); opacity: .85; }
+body.ke .needs-card.needs-settled .needs-settled-tag { color: var(--label); }
 body.ke .needs-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); margin-top: auto; }
 body.ke .needs-btn, body.ke .needs-card .question-option { min-height: 38px; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--text); background: none; border: 1px solid var(--label); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-4); cursor: pointer; text-align: center; margin: 0; }
 body.ke .needs-btn:hover, body.ke .needs-card .question-option:hover { border-color: var(--text); background: var(--card-2); }
@@ -1757,8 +1760,10 @@ body.ke .needs-terminal .consent-cmd { margin-top: 0; }
 @media (max-width: 480px) { body.ke .consent-kv { grid-template-columns: minmax(0, 1fr); gap: 0; } body.ke .consent-kv dd { margin-bottom: var(--sp-2); } }
 /* the other tabs carry the header alone: one line saying how many wait */
 body.ke .needs-bar { display: none; }
+body.ke[data-mode="build"] .needs-answered, body.ke[data-mode="memory"] .needs-answered,
 body.ke[data-mode="build"] .needs-grid, body.ke[data-mode="memory"] .needs-grid,
 body.ke[data-mode="build"] #ck-needs .needs-headline, body.ke[data-mode="memory"] #ck-needs .needs-headline { display: none; }   /* the strip's own headline only: the drop reuses the class and keeps its heading in every view */
+body.ke[data-mode="build"] #ck-needs:not([data-waiting]), body.ke[data-mode="memory"] #ck-needs:not([data-waiting]) { display: none; }   /* only answered cards: nothing is drawn in these modes, so the host takes no space */
 body.ke[data-mode="build"] .needs-bar, body.ke[data-mode="memory"] .needs-bar { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; padding: var(--sp-3) var(--sp-5);
   background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: var(--r-lg); }
 body.ke .needs-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
@@ -2972,8 +2977,9 @@ body.ke #drop-recent { max-height: 40vh; overflow: auto; }
 .pr-chip[hidden] { display: none !important; }   /* the masthead's own button rules set display and would override [hidden] */
 body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
 .pr-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--ok); }
-.pr-chip[data-state="away"] .pr-dot, .pr-chip[data-state="remote"] .pr-dot { background: var(--warn); }
-.pr-chip[data-state="quiet"] .pr-dot, .pr-chip[data-state="sleep"] .pr-dot { background: var(--label); }
+.pr-chip[data-state="away"] .pr-dot { background: var(--warn); }
+.pr-chip[data-state="quiet"] .pr-dot, .pr-chip[data-state="sleep"] .pr-dot,
+.pr-chip[data-state="holding"] .pr-dot, .pr-chip[data-state="muted"] .pr-dot { background: var(--label); }
 .pr-chip[data-state="loud"] .pr-dot { background: var(--bad); }
 .pr-chip-t { font-variant-numeric: tabular-nums; }
 .pr-sheet { position: fixed; z-index: 40; top: var(--pr-top, 64px); left: var(--pr-left, 8px); width: min(340px, calc(100vw - 16px)); box-sizing: border-box;

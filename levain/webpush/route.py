@@ -37,7 +37,7 @@ from levain.webpush.presence import (MAX_SECS, PresenceError, _FIELD_MAX, _clean
                                      parse_duration)
 
 __all__ = ["ROUTES", "ROUTE_WORDS", "AUTO_IDLE_SECS", "read_route", "set_route", "apply_route", "remote_login_present",
-           "auto_suggest"]
+           "auto_suggest", "projected_route"]
 
 ROUTES = ("desk", "devices")
 ROUTE_WORDS = ROUTES   # the words the HTTP set takes for the route alone
@@ -60,10 +60,9 @@ def _stamp_path(queue_dir: Path | str) -> Path:
     return Path(queue_dir) / "webpush" / STAMP_NAME
 
 
-def _throttled(queue_dir: Path | str, now: float) -> bool:
-    """Whether the last `who` run was under the window ago; then it is left alone, else the stamp is rewritten (before the
-    `who` call, so a slow or failed run still counts). The stamp is a file because the caller is a fresh process per ping.
-    A stamp that cannot be read safely, or lies in the future, means run."""
+def _stamp_recent(queue_dir: Path | str, now: float) -> bool:
+    """Read-only: whether the stamp says the last `who` run was under the window ago. A stamp that cannot be read safely,
+    or lies in the future, reads as not recent. The one parse :func:`_throttled` and :func:`projected_route` share."""
     path = _stamp_path(queue_dir)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -73,10 +72,18 @@ def _throttled(queue_dir: Path | str, now: float) -> bool:
             last = float(os.read(fd, 64).decode("ascii").strip())
         finally:
             os.close(fd)
-        if _num(last) and 0 <= now - last < AUTO_THROTTLE_SECS:
-            return True
+        return bool(_num(last) and 0 <= now - last < AUTO_THROTTLE_SECS)
     except (OSError, ValueError):
-        pass
+        return False
+
+
+def _throttled(queue_dir: Path | str, now: float) -> bool:
+    """Whether the last `who` run was under the window ago; then it is left alone, else the stamp is rewritten (before the
+    `who` call, so a slow or failed run still counts). The stamp is a file because the caller is a fresh process per ping.
+    A stamp that cannot be read safely, or lies in the future, means run."""
+    if _stamp_recent(queue_dir, now):
+        return True
+    path = _stamp_path(queue_dir)
     try:
         d = path.parent
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -278,6 +285,42 @@ def _run_who() -> str:
         return ""   # no reading is no remote login
 
 
+def _auto_ends(source: str, idle: float | None) -> bool:
+    """The one condition under which a standing auto route ends: the keys are back (idle known and under the threshold)."""
+    return source == "auto" and idle is not None and _num(idle) and idle < AUTO_IDLE_SECS
+
+
+def _auto_may_suggest(route: str, source: str, idle: float | None, who_text) -> bool:
+    """The one condition under which a delivery suggests ``devices``: the laptop idle at least the threshold, no route
+    standing (not ``devices``, no unexpired operator record) and a remote login open. ``who_text`` is a callable returning
+    the ``who`` output, run only when the cheaper conditions hold."""
+    if idle is None or not _num(idle) or idle < AUTO_IDLE_SECS:
+        return False
+    if route == "devices" or source == "operator":
+        return False
+    return remote_login_present(who_text())
+
+
+def projected_route(queue_dir: Path | str | None, *, idle: float | None, now: float | None = None,
+                    who: str | None = None, clock=time.time) -> str:
+    """The route a delivery at ``now`` would see after :func:`auto_suggest`, computed with no write, stamp, flush or
+    throttle write (pure apart from the read of ``who`` when none is given). It shares auto_suggest's conditions
+    (:func:`_auto_ends`, :func:`_auto_may_suggest`) and READS the suggestion throttle without writing it: when a delivery
+    would be throttled (``who`` unset, the stamp under the window old by ``clock``) the standing route stands. A caller
+    giving ``who`` is unthrottled, as in delivery."""
+    ts = time.time() if now is None else now
+    route, source, _until = read_route(queue_dir, ts)
+    if _auto_ends(source, idle):
+        return "desk"
+    if idle is None or not _num(idle) or idle < AUTO_IDLE_SECS:
+        return route
+    if who is None and _stamp_recent(queue_dir, clock()):
+        return route   # delivery returns early here and holds on the standing route
+    if _auto_may_suggest(route, source, idle, lambda: _run_who() if who is None else who):
+        return "devices"
+    return route
+
+
 def auto_suggest(queue_dir: Path | str, *, idle: float | None, who: str | None = None, now: float | None = None,
                  clock=time.time) -> bool:
     """Set ``devices`` (source ``auto``, one hour) when a remote login is open, the laptop's own input has been idle at
@@ -294,12 +337,13 @@ def auto_suggest(queue_dir: Path | str, *, idle: float | None, who: str | None =
         return False
     if who is None and _throttled(queue_dir, clock()):
         return False
-    if not remote_login_present(_run_who() if who is None else who):
+    who_text = _run_who() if who is None else who
+    if not remote_login_present(who_text):
         return False
     try:
         with _locked(queue_dir, strict=True, wait=0.5):
-            route, _source, _until = read_route(queue_dir, ts)
-            if route == "devices":
+            route, source, _until = read_route(queue_dir, ts)
+            if not _auto_may_suggest(route, source, idle, lambda: who_text):
                 return False
             wrote = apply_route(queue_dir, "devices", None, source="auto", now=ts)
             if wrote:

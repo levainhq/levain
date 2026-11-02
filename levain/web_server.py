@@ -2190,12 +2190,17 @@ class _Handler(GuardedHandler):
                 q = store.get(int(n))
                 if q is not None:
                     a = q.answer
+                    opts = list(q.options)
+                    signed = getattr(a, "signed", None) if a is not None else None
                     status, payload = 200, {
                         "n": q.n, "agent": q.agent, "what": q.what,
-                        "options": [{"key": k, "label": label} for k, label in q.options],
+                        "options": [{"key": k, "label": label} for k, label in opts],
                         "rec": q.rec, "blocks": q.blocks, "open_ended": q.open_ended, "filed_at": q.filed_at,
-                        "answer": None if a is None else {"kind": a.kind, "value": a.value, "channel": a.channel,
-                                                          "answered_at": a.answered_at}}
+                        "answer": None if a is None else {
+                            "kind": a.kind, "value": a.value, "channel": a.channel, "answered_at": a.answered_at,
+                            "signed": None if signed is None else bool(signed),
+                            "label": next((label for k, label in opts if k == a.value), None)
+                            if a.kind == "option" else None}}
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
@@ -2451,16 +2456,33 @@ class _Handler(GuardedHandler):
         each when no word stands, or it has ended), and the words of ``presence.describe``."""
         from levain.webpush import presence
 
-        rec = presence.read_word(queue)
+        rec = presence.read_word(queue)   # ONE read of the word and ONE idle sample feed every field below
         now = time.time()
+        try:
+            from levain.consent.auto_away import input_idle_seconds
+
+            reading = input_idle_seconds()
+        except Exception:  # noqa: BLE001 - no reading: the rule reads the desk as inactive
+            reading = None
         if rec is not None and presence.is_expired(rec, now):
             rec = None
         from levain.webpush import route as route_mod
 
         route, route_source, route_until = route_mod.read_route(queue, now)
+        try:   # the projected route (and so any `who` run) is computed ONCE for the whole view
+            projected = route_mod.projected_route(queue, idle=reading, now=now)
+        except Exception:  # noqa: BLE001 - a fault reads as the standing route
+            projected = route
+        try:   # ONE read of the remote-activity record too: describe and effective get the same one
+            remote = presence.read_remote_activity(queue, now)
+        except Exception:  # noqa: BLE001 - a faulted read is a fault, not "no remote activity": both calls fail open from it
+            remote = presence.REMOTE_FAULT
         view = {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
                 "route": route, "route_source": route_source, "route_until": route_until,
-                "text": presence.describe(queue)}
+                "text": presence.describe(queue, now=now, word=rec, reading=reading, route=projected, remote=remote),
+                # what the push rule does right now (the same call a delivery makes); a status read never drives the route suggestion
+                "effective": presence.effective(queue, now, suggest=False, word=rec, reading=reading, route=projected,
+                                                 remote=remote)}
         if self._credential_is_full():     # a tap token's holder is told the word, never the list of other taps
             from levain.webpush import presence_tokens
 
@@ -2528,7 +2550,7 @@ class _Handler(GuardedHandler):
             if tap is not None and isinstance(exc, presence_tokens.TokenRefused):
                 return {"error": exc.error, "message": str(exc)}, 403
             return {"error": "presence_refused", "message": str(exc)}, 422
-        if req["word"] in ("remote", "back"):   # a route-alone set flushes inside set_route
+        if req["word"] == "back":   # a route-alone set flushes inside set_route
             try:     # outside the presence lock: pings held as "active" are due now the route may read devices
                 from levain.webpush import held
 

@@ -78,7 +78,16 @@
   const CALM_AGE_TICK_MS = 120000;       // the same timer under Calm: slower, never stopped, so every age stays true
   const SAVE_STAMP = "last save at";
   let serverOffsetMs = 0;       // the server's clock minus this browser's, as of the last snapshot
+  let serverOffsetGen = NaN;    // the freshest server timestamp that has set the offset
   const serverNow = () => Date.now() + serverOffsetMs;
+  // A refetch maps the manifest it started with, so a reading no fresher than the one already taken must not move the clock;
+  // a fresher one may only move it forward, so the page's server time never runs backward.
+  function nextServerOffset(prevOffset, prevGen, gen, browserNow) {
+    if (isNaN(gen)) return { offset: prevOffset, gen: prevGen };
+    if (isNaN(prevGen)) return { offset: gen - browserNow, gen };
+    if (gen <= prevGen) return { offset: prevOffset, gen: prevGen };
+    return { offset: Math.max(prevOffset, gen - browserNow), gen };
+  }
 
   function ageLabel(iso, now, prefix) {
     const t = parseIso(iso);
@@ -371,6 +380,7 @@
                             options: isNum(f.question_options) ? f.question_options : 0,
                             age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "",
                             decidedAge: typeof f.decided_at === "string" ? ageLabel(f.decided_at, nowMs || Date.now(), "") : "",
+                            decidedAt: typeof f.decided_at === "string" ? f.decided_at : "",
                             offered: (Array.isArray(r.actions) ? r.actions : []).some((a) => a && a.verb === "question_answer" && a.gesture === "direct"),
                             sign: signOf(f) };
         }
@@ -672,7 +682,8 @@
     noteRepos(snap.panels);
     const m = snap.manifest;
     const gen = parseIso(m.generated_at);
-    serverOffsetMs = isNaN(gen) ? 0 : gen - Date.now();
+    const nx = nextServerOffset(serverOffsetMs, serverOffsetGen, gen, Date.now());
+    serverOffsetMs = nx.offset; serverOffsetGen = nx.gen;
     let now = isNaN(gen) ? Date.now() : gen;   // the server's clock, so a skewed browser cannot misreport ages
     const genAt = now;
     for (const p of Object.values(snap.panels || {})) {
@@ -2707,7 +2718,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

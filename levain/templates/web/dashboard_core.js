@@ -4517,12 +4517,54 @@
     if (!F || typeof F.drawBody !== "function" || !text) return null;
     try { return F.drawBody(el("div", "card-body needs-q-body"), text, dropping, options, rec); } catch (e) { return null; }
   }
+  // the answered questions among a panel's lines, newest decision first, at most `max` of them (a Set of the line.question objects)
+  const ANSWERED_ROWS_EAGER = 5;
+  function newestAnswered(lines, max) {
+    const at = (q) => { const ms = Date.parse(q.decidedAt); return Number.isFinite(ms) ? ms : 0; };
+    return new Set((Array.isArray(lines) ? lines : []).map((ln) => ln && ln.question).filter((q) => q && q.state === "answered")
+      .sort((a, b) => at(b) - at(a)).slice(0, max));
+  }
+  // The one line an answered question carries on every surface: "Answered: K · label | his words · signed | unsigned · time · via channel".
+  // `signed` null (the store cannot say) adds nothing; an unreadable time adds nothing. Every string is the agent's or the operator's and
+  // is drawn as text only.
+  function answerLine(a, options) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const parts = [];
+    if (a.kind === "option") {
+      const opt = (Array.isArray(options) ? options : []).find((o) => o && o.key === a.value);
+      const label = sv(a.label) || (opt ? sv(opt.label) : "");
+      parts.push(sv(a.value) + (label ? " \u00b7 " + label : ""));
+    } else {
+      parts.push(sv(a.value));
+    }
+    if (a.signed === true) parts.push("signed");
+    else if (a.signed === false) parts.push("unsigned");
+    const ms = Date.parse(sv(a.answered_at));
+    if (Number.isFinite(ms)) {
+      parts.push(new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }));
+    }
+    if (sv(a.channel)) parts.push("via " + sv(a.channel));
+    return "Answered: " + parts.join(" \u00b7 ");
+  }
   // `card` (the Needs-you strip's card) draws the mock's anatomy: the question as a bold title, "blocks: ...", then "REC key. words";
   // the options, the words box and the send button go to the card's own bottom row, so cards in a row end their actions together.
-  function drawQuestionBody(q, slot, b, card) {
+  // `receipt` (a settled Needs-you card): the question is decided, so only the title, the answer line and what it blocked are
+  // drawn; the options, the recommendation and every control are not built at all.
+  function drawQuestionBody(q, slot, b, card, receipt) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const open = q.state === "open";
     const cli = "levain question show " + q.n;   // the options are listed there; answer with: levain question answer N --option KEY
+    if (receipt && card && (b.error || !(b.answer && typeof b.answer === "object"))) {
+      // a settled card is a receipt whatever the read did: a failed read or a missing answer never brings back the options, the
+      // recommendation or any control; it keeps what is known (the title when the body came, else the question's number) and says so
+      const known = !b.error;
+      const parts = [el("div", "needs-q-title", (known && sv(b.what)) || "Question " + q.n),
+                     el("div", "consent-note ext-meta needs-answer-line", known ? "answer not shown" : "answer not shown (" + String(b.error).slice(0, 200) + ")")];
+      const more = known ? blocksBeyondTitle(sv(b.what), sv(b.blocks)) : "";
+      if (more) parts.push(questionText(more, null, [], "") || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
+      slot.replaceChildren(...parts);
+      return;
+    }
     if (b.error) {
       const parts = [el("div", "consent-note ext-meta", b.error)];
       if (open) parts.push(copyLine(cli, "show command"));   // no token: the terminal route still answers
@@ -4531,6 +4573,15 @@
     }
     const options = Array.isArray(b.options) ? b.options : [];
     const parts = [];
+    const settledAnswer = receipt && card && b.answer && typeof b.answer === "object" ? b.answer : null;
+    if (settledAnswer) {
+      parts.push(el("div", "needs-q-title", sv(b.what)));
+      parts.push(el("div", "consent-note ext-meta needs-answer-line", answerLine(settledAnswer, options)));
+      const more = blocksBeyondTitle(sv(b.what), sv(b.blocks));
+      if (more) parts.push(questionText(more, null, [], "") || el("div", "ext-meta needs-q-blocks", "blocks: " + more));
+      slot.replaceChildren(...parts);
+      return;
+    }
     let head = null;     // the focus view's title, blocks and REC lines: a needs-phill sign card is drawn in their place
     if (card) {
       parts.push(el("div", "needs-q-title", sv(b.what)));
@@ -4554,9 +4605,7 @@
     }
     const a = b.answer && typeof b.answer === "object" ? b.answer : null;
     if (a) {
-      const opt = options.find((o) => o && o.key === a.value);
-      parts.push(el("div", "consent-note ext-meta", "answered via " + sv(a.channel) + (a.kind === "option"
-        ? ": option " + sv(a.value) + (opt ? " (" + sv(opt.label) + ")" : "") : ", in words: " + sv(a.value))));
+      parts.push(el("div", "consent-note ext-meta", answerLine(a, options)));
       slot.replaceChildren(...parts);
       return;
     }
@@ -4747,7 +4796,8 @@
     slot.setAttribute("data-band-read", read);
     applyBandNumbers();
   }
-  function questionRow(o) {
+  // `eager`: this answered row is among the newest the panel draws (appendExternalLines), so its answer is fetched without the click
+  function questionRow(o, eager) {
     const q = o.question;
     const open = q.state === "open";
     const row = el("div", "row consent-row question-row" + (open ? " ext-accent" : " ext-dim"));
@@ -4770,16 +4820,39 @@
     btn.type = "button";
     btn.title = open ? "read the question and answer it" : "show how this question was answered";
     let slot = null;   // one slot per row: a retry after a failed read reuses it
-    btn.addEventListener("click", () => {
+    let eagerBusy = false, clickedMeanwhile = false;   // the one in-flight marker: an eager read and a click never both draw
+    const openBody = () => {
       btn.disabled = true;
       if (!slot) { slot = el("div", "consent-body ext-meta"); row.appendChild(slot); }
       slot.replaceChildren(document.createTextNode("reading the question…"));
-      questionBody(q, row).then((b) => {
+      Promise.resolve().then(() => questionBody(q, row)).catch(() => null).then((b) => {
+        if (!b) { btn.disabled = false; slot.remove(); slot = null; return; }
         drawQuestionBody(q, slot, b);
         if (b.error) btn.disabled = false; else btn.remove();
       });
+    };
+    btn.addEventListener("click", () => {
+      if (eagerBusy) { clickedMeanwhile = true; btn.disabled = true; return; }   // the eager read draws, or hands the click back
+      openBody();
     });
     head.appendChild(btn);
+    if (!open && eager) {
+      // one of the newest answered rows shows how it was answered without the click. The slot exists only once the read gave an
+      // answer, so a failed, token-less or answer-less read leaves no blank space and the details button as it was; the rest of
+      // the answered rows draw on that click.
+      eagerBusy = true;
+      Promise.resolve().then(() => questionBody(q, row)).catch(() => null).then((b) => {
+        eagerBusy = false;   // a rejected read is no body: the button stays, a click still works
+        if (!slot && b && !b.error && b.answer && typeof b.answer === "object") {
+          slot = el("div", "consent-body ext-meta");
+          row.appendChild(slot);
+          drawQuestionBody(q, slot, b);
+          btn.remove();
+          return;
+        }
+        if (clickedMeanwhile) { clickedMeanwhile = false; openBody(); }
+      });
+    }
     return row;
   }
 
@@ -5714,17 +5787,52 @@
   // command for a terminal; the question's answer goes through the verb path the board already has. History (decided rows,
   // outcomes, standing-rule proposals) stays in the Decisions focus view, behind the strip's "all decisions" button.
   function needsItems(lines) {
-    const consents = [], questions = [];
+    const consents = [], questions = [], answered = [];
     for (const ln of Array.isArray(lines) ? lines : []) {
       if (!ln || typeof ln !== "object") continue;
       if (ln.consent && ln.consent.state === "pending") consents.push({ kind: "consent", c: ln.consent });
       else if (ln.question && ln.question.state === "open") questions.push({ kind: "question", q: ln.question });
+      else if (ln.question && ln.question.state === "answered" && decidedRecently(ln.question.decidedAge, ln.question.decidedAt)) {
+        answered.push({ kind: "question", q: ln.question, answered: true });
+      }
     }
     const due = (it) => { const ms = Date.parse(it.c.expiresAt); return Number.isFinite(ms) ? ms : Infinity; };
     consents.sort((a, b) => due(a) - due(b));   // Array.prototype.sort is stable: equal expiries keep the kernel's order
-    return questions.concat(consents);
+    // the strip keeps the newest few: a morning of answers is not a second queue. A question with no readable decision age
+    // (an empty decidedAge) is not in the strip by intent: the window cannot be told for it.
+    const keep = newestAnswered(answered.map((it) => ({ question: it.q })), NEEDS_ANSWERED_MAX);
+    const byQ = new Map(answered.map((it) => [it.q, it]));
+    return questions.concat(consents, Array.from(keep).map((q) => byQ.get(q)));
   }
-  const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state);
+  // an item the strip shows only so the answer given stays visible for a while: it waits on nothing and is never counted
+  const needsWaiting = (items) => items.filter((it) => !it.answered);
+  const NEEDS_ANSWERED_MINUTES = 30, NEEDS_ANSWERED_MAX = 3;
+  // the page's clock as the age timer reads it (the server's, so a skewed browser cannot misreport the window)
+  function needsNow() {
+    const K = typeof window !== "undefined" ? window.LevainCockpitKinds : null;
+    return K && typeof K.serverNow === "function" ? K.serverNow() : Date.now();
+  }
+  // How long the answer still stays on the strip, in ms; null when the stamp cannot be read.
+  function decidedLeftMs(at) {
+    const ms = typeof at === "string" ? Date.parse(at) : NaN;
+    return Number.isFinite(ms) ? ms + NEEDS_ANSWERED_MINUTES * 60000 - needsNow() : null;
+  }
+  // The raw stamp decides when it is readable, so the window ends on an idle page; the row's relative label ("40s ago",
+  // "12m ago") is the fallback for a line with no stamp, and only seconds and minutes under the window qualify there.
+  function decidedRecently(label, at) {
+    const left = decidedLeftMs(at);
+    if (left !== null) return left > 0;
+    const m = /^(\d+)([sm]) ago$/.exec(typeof label === "string" ? label : "");
+    if (!m) return false;
+    return m[2] === "s" ? Number(m[1]) < 60 : Number(m[1]) < NEEDS_ANSWERED_MINUTES;
+  }
+  // whether this page holds a write token: an answered card's body is read with it, so the token arriving is a change of state
+  function hasWriteToken() {
+    const t = typeof window !== "undefined" ? window.LevainCockpitTransport : null;
+    const h = t && typeof t.headers === "function" ? t.headers() : {};
+    return !!(h && h["X-Levain-Write-Token"]);
+  }
+  const needsKey = (it) => (it.kind === "consent" ? "c:" + it.c.id + "|" + it.c.state + "|" + it.c.expiresAt : "q:" + it.q.n + "|" + it.q.state + (it.q.state === "answered" ? "|" + (hasWriteToken() ? "t" : "-") : ""));
   // the name a glance tile gives the top item: the tool and who asked, or the question's number (its words are fetched, not in the row)
   function needsName(it) {
     return it.kind === "consent" ? (it.c.tool || "request") + " · " + (it.c.agent || "agent") : "question #" + it.q.n + " · " + (it.q.agent || "agent");
@@ -5951,16 +6059,27 @@
     else slot.textContent = "this request has no id";
     return card;
   }
+  // "answered <age>" with an age the page's age timer keeps current; a line with no stamp shows the label it was given
+  function settledTag(q) {
+    const tag = el("span", "ext-meta needs-left needs-settled-tag", "answered ");
+    const K = window.LevainCockpitKinds;
+    if (q.decidedAt && K && K.ageSpan) tag.appendChild(K.ageSpan(q.decidedAt));
+    else tag.appendChild(document.createTextNode(q.decidedAge || ""));
+    return tag;
+  }
   function questionCard(q) {
     const card = el("div", "needs-card needs-question is-full");
     card.dataset.needsCard = "question";
     card._needsItem = { kind: "question", q };
-    needsHead(card, q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null);
+    const settled = q.state === "answered";
+    if (settled) card.classList.add("needs-settled");
+    needsHead(card, settled ? settledTag(q) : (q.age ? el("span", "ext-meta needs-left", "asked " + q.age) : null));
     const slot = el("div", "needs-body ext-meta", "reading the question…");
     card.appendChild(slot);
-    questionBody(q, card).then((b) => {
-      drawQuestionBody(q, slot, b, card);
-      if (!b.error) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
+    Promise.resolve(questionBody(q, card)).then((b) => {
+      if (!b) return;
+      drawQuestionBody(q, slot, b, card, settled);
+      if (!b.error && !settled) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
     });
     return card;
   }
@@ -5968,6 +6087,7 @@
     host.replaceChildren();
     host.hidden = true;
     delete host.dataset.sig;
+    delete host.dataset.waiting;
   }
   // The strip's row (option A, Phill 10-26): one fixed-height summary per waiting item, a single button that opens the focus view.
   // It carries no answer control: the options, the words box, Allow/Deny and the sign row live only in the focus view, where the
@@ -6036,23 +6156,62 @@
       if (r && typeof r.catch === "function") r.catch(() => {});
     } catch (_) { /* a badge that cannot be set is not an error the page shows */ }
   }
+  // One timer for the earliest answered card to leave the strip: it re-runs the selection, which drops the card on an idle page.
+  // Every render clears it and arms it again for the cards then listed.
+  let needsExpiryTimer = 0;
   function renderNeeds(view) {
+    if (needsExpiryTimer) { window.clearTimeout(needsExpiryTimer); needsExpiryTimer = 0; }
+    try { renderNeedsNow(view); }
+    finally { armNeedsExpiry(view); }
+  }
+  function armNeedsExpiry(view) {
+    if (typeof window.setTimeout !== "function") return;
+    let soonest = Infinity;
+    for (const ln of Array.isArray(((view.extra_panels || {}).decisions || {}).lines) ? view.extra_panels.decisions.lines : []) {
+      const q = ln && ln.question;
+      if (!q || q.state !== "answered") continue;
+      const left = decidedLeftMs(q.decidedAt);
+      if (left !== null && left > 0 && left < soonest) soonest = left;
+    }
+    if (soonest === Infinity) return;
+    needsExpiryTimer = window.setTimeout(() => {
+      needsExpiryTimer = 0;
+      try { renderNeeds(view); } catch (e) { /* the strip keeps what it showed */ }
+    }, Math.min(soonest + 50, 2147483000));
+  }
+  function renderNeedsNow(view) {
     signRecheck();      // a board read: every frozen card asks the cockpit about its unsettled answer again
     const host = document.getElementById("ck-needs");
     if (!host) return;
-    const items = needsItems(((view.extra_panels || {}).decisions || {}).lines);
-    syncAppBadge(view, items.length);
-    if (!items.length) { clearNeeds(host); return; }
+    const all = needsItems(((view.extra_panels || {}).decisions || {}).lines);
+    const items = needsWaiting(all), settled = all.filter((it) => it.answered);
+    syncAppBadge(view, items.length);   // the badge counts what WAITS, never the answered cards the strip still shows
+    if (!all.length) { clearNeeds(host); return; }
     // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
     // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits
-    const sig = items.map(needsKey).join("\n");
+    const sig = all.map(needsKey).join("\n");
     if (host.dataset.sig === sig && !host.hidden) return;
+    // the answered cards are drawn under a quiet label of their own; with nothing waiting that is all the strip holds
+    const answeredSection = () => {
+      const sec = el("div", "needs-answered");
+      sec.appendChild(el("div", "needs-sec-label", "Just answered"));
+      for (const it of settled) sec.appendChild(questionCard(it.q));
+      return sec;
+    };
+    if (!items.length) {
+      host.replaceChildren(answeredSection());
+      delete host.dataset.waiting;
+      host.hidden = false;
+      host.dataset.sig = sig;
+      return;
+    }
+    host.dataset.waiting = "1";
     const head = el("div", "needs-headline");
     head.appendChild(el("h3", null, "Needs you"));
     head.appendChild(el("span", "needs-count", String(items.length)));
     // no re-ping route exists (the phone is told when a request is filed, and the queue re-pings on its own clock; nothing here
     // pushes), so the gloss claims no ping: it says where the answer is signed
-    head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
+    if (items.length) head.appendChild(el("span", "needs-gloss", "Agents are waiting on a ruling. Sign it on your phone."));
     if (items.some((it) => it.kind === "question") && items.some((it) => it.kind === "consent")) {
       head.appendChild(el("span", "needs-order", "questions first, then soonest to expire"));
     }
@@ -6085,7 +6244,9 @@
     if (!grid) grid = el("div", "needs-grid");
     for (let i = 0; i < cards.length; i++) if (grid.children[i] !== cards[i]) grid.insertBefore(cards[i], grid.children[i] || null);
     while (grid.children.length > cards.length) grid.removeChild(grid.lastChild);
-    host.replaceChildren(head, needsBar(items), grid);
+    const kids = [head, needsBar(items), grid];
+    if (settled.length) kids.push(answeredSection());
+    host.replaceChildren(...kids);
     host.hidden = false;
     host.dataset.sig = sig;   // only a strip that was drawn is recorded as drawn: a build that threw is tried again at the next render
   }
@@ -7265,6 +7426,7 @@
     // the body holds none right now, never on a flag set once.
     if (owner && owner !== host) host.dataset.proposalSlot = "";
     let slotDue = !!(owner && !host.querySelector(".proposal-slot"));
+    const eagerQ = newestAnswered(lines, ANSWERED_ROWS_EAGER);
     for (const ln of lines) {
       const o = ln && typeof ln === "object" ? ln : {};
       // rows that carry a group (a list drawn as a count) come in the kernel's order: a heading where the group changes
@@ -7274,7 +7436,7 @@
         host.appendChild(el("div", "ext-grouphead", o.grp));
       }
       if (o.consent) { host.appendChild(consentRow(o)); continue; }
-      if (o.question) { host.appendChild(questionRow(o)); continue; }
+      if (o.question) { host.appendChild(questionRow(o, !!o.question && eagerQ.has(o.question))); continue; }
       if (o.note) { host.appendChild(noteRow(o)); continue; }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.wrapMeta) row.classList.add("meta-wrap");   // a row whose meta line IS its content (the sessions' chips): it wraps, never ellipsises
@@ -7637,7 +7799,7 @@
       // a live view repaints from its own source and stays open. buildModal on an open modal is a repaint only: it keeps the one overlay (and
       // its one keydown listener), the scroll and the focus, and swaps the body for the `build` the caller returns
       if (modalCustom.live) { buildModal(null); return; }
-      if (!needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
+      if (!needsWaiting(needsItems(((currentView && currentView.extra_panels || {}).decisions || {}).lines)).some((it) => needsIdOf(it) === modalCustom.id)) closeModal();
       return;
     }
     const entry = findEntry(currentView, modalKey);
@@ -7839,7 +8001,8 @@
   // deadline a little past the read's own; a view with nothing to show (no standing grant, a read that failed) is left where the
   // slot is, or at its top when it has none.
   const PHONE_JUMP_TARGET = {
-    needs: "#ck-needs:not([hidden])",
+    // an answered-only strip waits on nothing: the jump goes only where something waits
+    needs: "#ck-needs[data-waiting]:not([hidden])",
     inbox: "#inbox-view:not([hidden])",
     board: ".panel[data-ck-panel=\"tray\"]",
     notes: ".panel[data-ck-panel=\"notifications\"]",
@@ -7913,7 +8076,7 @@
   for (const type of ["touchstart", "wheel"]) document.addEventListener(type, () => { phoneJumpRun++; }, { passive: true, capture: true });
 
   window.LevainAgentPage = { open: openAgentPage };
-  window.LevainNeeds = { items: needsItems, name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
+  window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
   window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

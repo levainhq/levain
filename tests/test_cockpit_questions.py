@@ -390,3 +390,45 @@ def test_a_verb_without_applies_to_is_never_offered_or_fired_on_a_question_row(m
     got = V.row_actions(None, None, "decisions", other, "token", "local", date(2026, 10, 18), policy=genesis_policy())
     assert "probe" in [a["verb"] for a in got]
     assert not V._applies_to_row(probe, "decisions", qrow) and V._applies_to_row(probe, "decisions", other)
+
+
+def test_the_body_answer_carries_signed_and_the_options_label(tmp_path, lh):
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store)
+    store.answer(q.n, option="ship", channel="cockpit")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        a = _get_status(f"{base}/cockpit/question/{q.n}.json", TOKEN)[1]["answer"]
+    assert a["kind"] == "option" and a["value"] == "ship"
+    assert a["label"] == dict(OPTIONS)["ship"]
+    assert a["signed"] is None and "signer" not in a      # the native store records no signature: unknown, not "unsigned"
+
+
+def test_a_words_answer_has_no_label(tmp_path, lh):
+    _root, src, _ids = _install(tmp_path)
+    store = QuestionStore(lh)
+    q = _file(store)
+    store.answer(q.n, text="not tonight", channel="cli")
+    with _serve(src, write_token=TOKEN) as (base, _h):
+        a = _get_status(f"{base}/cockpit/question/{q.n}.json", TOKEN)[1]["answer"]
+    assert a["label"] is None and set(a) == {"kind", "value", "channel", "answered_at", "signed", "label"}
+
+
+def test_a_foreign_stores_signed_answer_reaches_the_body_without_its_signer(tmp_path, lh):
+    """A store that is not levain's own (flow's) answers through the real route: `signed` is carried, the signer's fingerprint is not."""
+    import dataclasses
+
+    from levain.consent.questions import Answer
+
+    _root, src, _ids = _install(tmp_path)
+    q = _file(QuestionStore(lh))
+    signed = dataclasses.replace(q, answer=Answer(q.id, "option", "hold", "phone", "2026-11-01T14:05:00Z", True, "SHA256:fp"))
+
+    class Foreign:
+        def get(self, n):
+            return signed if n == q.n else None
+
+    with _serve(src, write_token=TOKEN) as (base, httpd):
+        httpd.question_store = Foreign()
+        a = _get_status(f"{base}/cockpit/question/{q.n}.json", TOKEN)[1]["answer"]
+    assert a["signed"] is True and "signer" not in a and a["label"] == "Hold for the morning" and a["channel"] == "phone"
