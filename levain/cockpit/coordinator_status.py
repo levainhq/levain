@@ -28,6 +28,7 @@ from typing import Any
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.engine import ReadContext
 from levain.cockpit.results import Read, Result, RowIn
+from levain.coordinator.work_delta import local_clock
 
 __all__ = ["COORD_STATUS_ID", "COORD_VERBS", "HOLD_VERB", "START_VERB", "STOP_VERB", "register_status_verbs",
            "status_reader", "status_verbs"]
@@ -109,7 +110,7 @@ def _reply_rows(data: dict[str, Any] | None) -> list[RowIn]:
             for u in data["unreplied"]]
     for r in data["replies"]:
         rows.append(_row(f"reply:{r.reply_id}", "Reply",
-                         f"to drop {r.drop_id} ({r.received_at[11:16]}, {r.surface}): {r.text}"))
+                         f"to drop {r.drop_id} ({local_clock(r.received_at)}, {r.surface}): {r.text}"))
         for i, line in enumerate(r.block.splitlines()):
             if line.strip():
                 rows.append(_row(f"reply:{r.reply_id}:block:{i}", "Levain's block", line.strip()))

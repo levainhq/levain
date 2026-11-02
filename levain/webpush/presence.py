@@ -30,7 +30,7 @@ Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newe
 
 Remote activity is NOT desk presence (Phill 11-01: *"don't we want device pings ON when remote desk is measured and NOT be
 counted at the physical desk?"*). Input over ssh or mosh, or a turn in the Claude app's remote control, is reported with
-:func:`note_remote_activity` (source ``remote-terminal`` or ``remote-control``) and kept as a high-water mark in
+:func:`note_remote_activity` BY A CALLER (Levain ships none; source ``remote-terminal`` or ``remote-control``) and kept as a high-water mark in
 ``<queue_dir>/webpush/remote_activity.json``. While that record is fresh (under :data:`ACTIVE_WINDOW_SECS`), an ordinary
 ping PUSHES to his devices, after every word above it (loud, a mute, an urgent ping, ``away``) and BEFORE the desk-idle
 test, so the answer is ``pushing`` with source ``measured``. It never touches the laptop reading: the HID idle (``seen``)

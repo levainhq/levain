@@ -251,3 +251,15 @@ def test_an_unexpected_fault_inside_the_raw_remote_read_fails_open_not_to_no_act
     assert d.push is True and d.why == presence._FAULT
     e = presence.effective(q, time.time(), idle=lambda: 0.0)
     assert e["pushing"] is True
+
+
+def test_the_readme_says_levain_ships_no_remote_activity_reporter_until_one_exists() -> None:
+    """README and CHANGELOG say nothing in Levain reports remote activity (Diogenes 11-02). If a caller is added inside the
+    package, this fails: update both documents to say what the new caller measures, then change this test."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    callers = [str(p.relative_to(root)) for p in (root / "levain").rglob("*.py")
+               if p.name != "presence.py" and re.search(r"\bnote_remote_activity\b", p.read_text(encoding="utf-8"))]
+    assert callers == [], f"a caller now exists ({callers}): the 'Levain ships no measurer' wording is stale"

@@ -610,6 +610,13 @@ def _transcript_rate(rec: dict[str, Any], now: datetime) -> float | None:
         return None
 
 
+def local_midnight_utc(now: datetime) -> datetime:
+    """The start of ``now``'s local day, as UTC. A naive local midnight resolves its offset for THAT date, so a day on
+    which the zone changes its clock still starts at the zone's own midnight (``now``'s offset would be a DST hour off)."""
+    local_now = now.astimezone()
+    return datetime(local_now.year, local_now.month, local_now.day).astimezone(timezone.utc)
+
+
 def _today_counts(install_root: Path, recs: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
     """The header's day figures. ``tokens_today``: fresh tokens (input + output + cache write; Codex input - cached +
     output) the sessions' transcripts spent since LOCAL midnight, by each record's own timestamp, summed over the
@@ -618,7 +625,7 @@ def _today_counts(install_root: Path, recs: list[dict[str, Any]], now: datetime)
     logged hook events since local midnight (``events_partial``: a log rotated past midnight, so a floor)."""
     from levain.cockpit.session_context import find_transcript, tokens_since_detail
 
-    midnight = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    midnight = local_midnight_utc(now)
     total, read, unread, skipped = 0, 0, 0, 0
     events, logs, partial = 0, 0, False
     for rec in recs:

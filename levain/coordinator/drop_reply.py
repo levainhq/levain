@@ -154,5 +154,5 @@ def unreplied_line(u: Unreplied) -> str:
     """``drop dr-.. (14:02, phone): no reply yet``, or once the window is closed ``drop dr-.. (2026-10-31 14:02, phone):
     no reply, window closed``: the silence made visible (DESIGN 3.3)."""
     if u.closed:
-        return f"drop {u.drop_id} ({u.received_at[:10]} {u.received_at[11:16]}, {u.surface}): no reply, window closed"
-    return f"drop {u.drop_id} ({u.received_at[11:16]}, {u.surface}): no reply yet"
+        return f"drop {u.drop_id} ({work_delta.local_clock(u.received_at, True)}, {u.surface}): no reply, window closed"
+    return f"drop {u.drop_id} ({work_delta.local_clock(u.received_at)}, {u.surface}): no reply yet"

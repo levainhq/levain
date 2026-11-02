@@ -61,6 +61,17 @@ def _insert(qdir, drop_id, at, kind="coordinator_reply", ref_store="drops", body
         c.close()
 
 
+@pytest.fixture(autouse=True)
+def _utc_zone(monkeypatch):
+    """The stamps are UTC and the lines show local time; the fixed clock below reads as itself when the zone is UTC."""
+    import time
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
 def _stamp(dt):
     return utc_stamp(dt)
 
@@ -552,3 +563,35 @@ def test_a_malformed_reply_body_is_shown_unreadable_and_hides_no_other_reply(qdi
     assert set(got) == {good, bad, notobj, typed, cov}
     assert got[good].text == "fine"
     assert got[bad].text == got[notobj].text == got[typed].text == got[cov].text == "(unreadable body)"
+
+
+# ----------------------------------------------------------------------------------- the lines show LOCAL time (Diogenes 11-02)
+def test_the_unreplied_and_reply_lines_show_the_clock_of_the_machines_zone_not_the_stamps_utc(qdir, monkeypatch) -> None:
+    import time
+    store, _box = _clocked(qdir, NOW)
+    d = _drop(store)
+    monkeypatch.setenv("TZ", "America/New_York")        # 2026-10-31 is still daylight time: UTC-4
+    time.tzset()
+    late = NOW + timedelta(minutes=UNREPLIED_AFTER_MINUTES + 1)
+    text = work_delta.render(_delta(qdir, late, since=10**6))
+    assert f"drop {d} (10:00, phone): no reply yet" in text and "(14:00" not in text
+    closed = NOW + timedelta(hours=REPLY_WINDOW_HOURS + 1)
+    assert f"drop {d} (2026-10-31 10:00, phone): no reply, window closed" in work_delta.render(_delta(qdir, closed, since=10**6))
+    assert work_delta.local_clock("not a stamp") == "" and work_delta.local_clock("2026-10-31T14:00:00.000000Z") == "10:00"
+
+
+def test_local_midnight_of_a_dst_change_day_is_the_zones_own_midnight(monkeypatch) -> None:
+    import time
+    from levain.cockpit.topology import local_midnight_utc
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        # 2026-11-01: clocks fall back at 02:00. Midnight is still EDT (04:00Z); the afternoon is EST (offset -5).
+        got = local_midnight_utc(datetime(2026, 11, 1, 20, 0, tzinfo=timezone.utc))        # 15:00 EST
+        assert got == datetime(2026, 11, 1, 4, 0, tzinfo=timezone.utc)
+        # 2026-03-08: clocks spring forward at 02:00. Midnight is EST (05:00Z); the afternoon is EDT.
+        got = local_midnight_utc(datetime(2026, 3, 8, 20, 0, tzinfo=timezone.utc))         # 16:00 EDT
+        assert got == datetime(2026, 3, 8, 5, 0, tzinfo=timezone.utc)
+    finally:
+        monkeypatch.undo()
+        time.tzset()

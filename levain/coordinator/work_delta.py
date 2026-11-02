@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from levain.cockpit.consent import utc_stamp
+from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.coordinator.store import CoordStore, _append_only
 
 __all__ = ["HEAD", "MAX_LINES", "OPERATOR_VIEWS_SCHEMA", "WorkBlock", "WorkDelta", "advance", "read_block", "render",
@@ -42,6 +42,17 @@ OPERATOR_VIEWS_SCHEMA: tuple[str, ...] = (
     "COALESCE((SELECT MAX(gseq) FROM operator_views WHERE viewer = NEW.viewer), -1) "
     "BEGIN SELECT RAISE(ABORT, 'the operator work cursor only moves forward'); END",
 )
+
+
+def local_clock(stamp: Any, with_date: bool = False) -> str:
+    """The wall-clock ``HH:MM`` (``YYYY-MM-DD HH:MM`` with ``with_date``) of a stored UTC stamp, in the machine's zone: the
+    stamps are UTC and a person reads local time. A string that is not a stamp falls back to its own clock slice."""
+    text = stamp if isinstance(stamp, str) else ""
+    try:
+        local = parse_stamp(text).astimezone()
+    except ConsentError:
+        return f"{text[:10]} {text[11:16]}" if with_date else text[11:16]
+    return local.strftime("%Y-%m-%d %H:%M" if with_date else "%H:%M")
 
 
 def _clean(value: Any, limit: int = _FIELD_MAX) -> str:
@@ -66,7 +77,7 @@ def _reply_line(kind: str, ref_store: str, ref_id: str, body: str) -> str:
     if kind == "coordinator_reply":
         # delivered when written, so no terminal reply carried it: the next one names it (DESIGN 3.4)
         at = _clean(b.get("received_at"), 40)
-        hhmm = at[11:16] if len(at) >= 16 else at
+        hhmm = local_clock(at) if len(at) >= 16 else at
         return (f"1 reply to your {_clean(b.get('surface'), 12) or 'drop'} message at {hhmm} "
                 f"(drop {_short_id(b.get('drop_id') or ref_id)}): on the Coordinator panel")
     if kind == "know":
