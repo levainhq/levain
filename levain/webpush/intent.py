@@ -390,14 +390,14 @@ def _who_text(ov: dict | None) -> str:
     return f" Set by {who} from your words: \"{ov['said']}\"{flag}."
 
 
-def _approvals_note(queue_dir: Path | str | None) -> str | None:
+def _approvals_note(queue_dir: Path | str | None, to_devices: bool | None = None) -> str | None:
     """The ``Approvals:`` clause, from consent's side (the signed away mark, a key that can sign). Consent provides
     ``levain.consent.auto_away.approvals_note(queue_dir)``; until it does, or on any fault, there is none."""
     try:
         from levain.consent import auto_away
 
         fn = getattr(auto_away, "approvals_note", None)
-        return fn(queue_dir) if fn is not None else None
+        return fn(queue_dir, to_devices=to_devices) if fn is not None else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -481,7 +481,11 @@ def view(queue_dir: Path | str | None, *, now: float | None = None, idle: Callab
         held_n = held.count(queue_dir)
     except Exception:  # noqa: BLE001
         held_n = 0
-    approvals = None if st["fault"] else _approvals_note(queue_dir)
+    approvals = None
+    if not st["fault"]:
+        # ONE sample: whether the record itself sends approvals to the devices, so consent's clause names only a difference.
+        to_dev = _decide(at, s["rec"], s["reading"], "approval", s["remote"], s["msg_at"])[0].push
+        approvals = _approvals_note(queue_dir, to_dev)
     ov = None if st["fault"] else st["ov"]
     window = s["rec"]["base"]["follow_after"] if st["fault"] else st["eff"]["follow_after"]
     out = {"state": d.state, "pushing": d.push, "reason": d.why, "source": source,
