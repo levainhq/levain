@@ -72,9 +72,9 @@ class Executor(Protocol):
 class Limits:
     """What the launch check is held to, read by the caller from the signed link and the schedule.
 
-    ``run_ceiling`` and ``budget_window_usd_micros`` are the link's signed fields. ``scheduled_window_key`` is the
-    key of the window whose scheduled runs count (the occurrence's own window for a scheduled launch; the window that
-    holds now for a manual launch, or None when none does). ``span_start``/``span_end`` bound, as UTC ISO text with
+    ``run_ceiling`` and ``budget_window_usd_micros`` are the link's signed fields. ``scheduled_window_key`` is read
+    for a MANUAL launch only: the window that holds now, or None when none does. A scheduled launch always counts its
+    own occurrence's window key, whatever is passed here. ``span_start``/``span_end`` bound, as UTC ISO text with
     start inclusive and end exclusive, the manual runs that count (the window for a scheduled launch, today in the
     agent's zone for a manual one). One signed limit covers both kinds: no second allowance for manual runs.
     """
@@ -122,14 +122,18 @@ _MAX_MICROS = 2**63 - 1
 # the runs of one agent that count against its signed limits: launched (a reservation exists, or launched_at is set),
 # scheduled ones by their window key, manual ones by when they launched. Times compare as instants (julianday), so a
 # stamp written with an offset or fractional seconds is placed where it happened, not where its text sorts.
+# A manual run is left out only when it is PROVABLY outside the span: julianday() is NULL for a stamp (or bound) it
+# cannot parse, the comparison is then NULL, COALESCE makes it 0, and the run counts (fail-closed, never dropped).
+# julianday is a double (~ms resolution): a stamp within about a millisecond of a bound may land on either side.
 # Per A0 §2.6 a manual launch with no window holding now (:swk NULL) counts manual runs only: that is the contract's
-# basis, not an omission here; a scheduled launch's :swk is its own NOT NULL window key.
+# basis, not an omission here; a scheduled launch's :swk is its own window key, read from the occurrence (reserve).
 _COUNTED = ("FROM agent_occurrences o WHERE o.agent_id = :agent AND o.occurrence_id != :me"
             " AND (o.launched_at IS NOT NULL OR EXISTS (SELECT 1 FROM agent_reservations r"
             " WHERE r.occurrence_id = o.occurrence_id))"
             " AND ((o.kind = 'scheduled' AND o.window_key = :swk)"
-            " OR (o.kind = 'manual' AND julianday(COALESCE(o.launched_at, o.admitted_at)) >= julianday(:start)"
-            " AND julianday(COALESCE(o.launched_at, o.admitted_at)) < julianday(:end)))")
+            " OR (o.kind = 'manual'"
+            " AND COALESCE(julianday(COALESCE(o.launched_at, o.admitted_at)) < julianday(:start), 0) = 0"
+            " AND COALESCE(julianday(COALESCE(o.launched_at, o.admitted_at)) >= julianday(:end), 0) = 0))")
 
 
 def reserve(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, executor: Executor, *,
@@ -157,12 +161,18 @@ def reserve(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, executo
     # transition trigger refuses launched -> skipped-budget: a caller applying this Refused.state cannot end a live row
     if conn.execute("SELECT 1 FROM agent_reservations WHERE occurrence_id = ?", (me,)).fetchone() is not None:
         return Refused("already_reserved")
-    args = {"agent": agent, "me": me, "swk": limits.scheduled_window_key, "start": limits.span_start,
-            "end": limits.span_end}
+    # a scheduled launch counts its OWN window (A0 §2.6), so the key comes from the occurrence and no caller value
+    # (a None included) can switch scheduled counting off; Limits.scheduled_window_key is read for a manual launch only
+    if _field(occurrence, "kind") == "scheduled":
+        swk = _field(occurrence, "window_key")
+    else:
+        swk = limits.scheduled_window_key
+    args = {"agent": agent, "me": me, "swk": swk, "start": limits.span_start, "end": limits.span_end}
     launched = conn.execute(f"SELECT COUNT(*) {_COUNTED}", args).fetchone()[0]
     if launched >= limits.run_ceiling:
         return Refused("ceiling")
-    # TOTAL, not SUM: SUM raises "integer overflow" once breaches past 2**63 accumulate; TOTAL is exact below 2**53
+    # TOTAL, not SUM: SUM raises "integer overflow" once breaches past 2**63 accumulate; TOTAL is exact below 2**53,
+    # and a signed window budget is at most 10**12 (authority._AGENT_INT_MAX), so rounding cannot move this check
     held = conn.execute(
         "SELECT TOTAL(CASE WHEN r.state = 'open' THEN r.reserved_usd_micros"
         " ELSE COALESCE(r.debited_usd_micros, r.reserved_usd_micros) END)"
@@ -179,9 +189,16 @@ def settle(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, usage: U
 
     Readable usage within the reservation debits the actual and releases the rest. Unreadable usage (``None``, or
     anything that is not a non-negative integer) debits the whole reservation. An actual above the reservation is
-    debited in full and is a breach: the agent is set ``paused`` here, in the same transaction, and the caller ends
-    the row ``failed``. Settling twice changes nothing: the second call reports ``already_settled``.
+    debited in full (saturated at 2**63-1, the most a SQLite INTEGER holds) and is a breach: the agent is set
+    ``paused`` here, in the same transaction, and the caller ends the row ``failed``. Settling twice changes nothing:
+    the second call reports ``already_settled``.
+
+    Raises ``RuntimeError`` when ``conn`` is not inside a transaction, and takes the write lock (a no-op write) before
+    it reads the reservation, as :func:`reserve` does: two settlements cannot both read ``open`` and both report.
     """
+    if not conn.in_transaction:
+        raise RuntimeError("settle runs inside the terminal transaction (BEGIN IMMEDIATE); this connection has none")
+    conn.execute("UPDATE agent_reservations SET state = state WHERE 0")
     me = str(_field(occurrence, "occurrence_id"))
     row = conn.execute("SELECT agent_id, reserved_usd_micros, debited_usd_micros, state FROM agent_reservations"
                        " WHERE occurrence_id = ?", (me,)).fetchone()
@@ -201,7 +218,8 @@ def settle(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, usage: U
                  " WHERE occurrence_id = ? AND state = 'open'", (charge, basis, me))
     if breach:
         # operation is only active|paused (CHECK) and no levain code deletes an agent row, so this cannot demote
-        # another state or miss a live agent
+        # another state or miss a live agent (occurrences carry no FK to agents: an occurrence written for an agent row
+        # that never existed would pause nothing here; the occurrence writer, not yet built, owns that invariant)
         conn.execute("UPDATE agents SET operation = 'paused' WHERE agent_id = ?", (agent,))
     return Settled(charge, breach, basis)
 

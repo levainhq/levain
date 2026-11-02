@@ -136,6 +136,39 @@ def test_a_manual_run_stamped_with_an_offset_counts_at_its_instant(store):
         assert reserve(conn, second, _Exec(9000), limits=day3) == Refused("budget_window")
 
 
+def test_a_manual_run_whose_stamp_cannot_be_parsed_counts_against_the_ceiling(store):
+    day = Limits(run_ceiling=1, budget_window_usd_micros=10_000, scheduled_window_key=None,
+                 span_start="2026-11-02T00:00:00Z", span_end="2026-11-03T00:00:00Z")
+    with store.write() as conn:
+        first = _admit(conn, 1, "manual", "m:2026-11-02", "2026/11/02 10:00")
+        assert reserve(conn, first, _Exec(1000), limits=day) == Reserved(1000)
+        second = _admit(conn, 2, "manual", "m:2026-11-02", "2026-11-02T11:00:00Z")
+        assert reserve(conn, second, _Exec(1000), limits=day) == Refused("ceiling")
+
+
+def test_a_scheduled_launch_counts_its_own_window_even_when_the_caller_passes_no_key(store):
+    no_key = dataclasses.replace(LIMITS, scheduled_window_key=None)
+    with store.write() as conn:
+        assert reserve(conn, _admit(conn, 1), _Exec(1000), limits=LIMITS) == Reserved(1000)
+        _launch(conn, "oc-1")
+        assert reserve(conn, _admit(conn, 2), _Exec(1000), limits=no_key) == Refused("ceiling")
+
+
+def test_settle_refuses_a_connection_with_no_open_transaction_and_writes_nothing(store):
+    # autocommit makes the read and the update two transactions: two settlements could both read 'open'
+    with store.write() as conn:
+        row = _admit(conn, 1)
+        reserve(conn, row, _Exec(1000), limits=LIMITS)
+        _launch(conn, "oc-1")
+    conn = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        with pytest.raises(RuntimeError, match="BEGIN IMMEDIATE"):
+            settle(conn, row, Usage(400, 1, 1, "stub"))
+        assert conn.execute("SELECT state FROM agent_reservations").fetchone()[0] == "open"
+    finally:
+        conn.close()
+
+
 def test_stop_result_is_frozen_and_a_stub_that_cannot_observe_returns_terminated_false():
     class Blind:
         max_exposure_usd_micros = 1
