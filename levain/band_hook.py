@@ -30,7 +30,13 @@ from typing import Any
 
 MODULE = "levain.band_hook"
 EVENTS = ("SessionStart", "UserPromptSubmit", "Stop")
-_TIMEOUT = {"SessionStart": 30, "UserPromptSubmit": 30, "Stop": 10}
+# The harness's kill bound for every UserPromptSubmit hook that can run band_view.hook_prompt (TERMSIGN L2): the
+# band's own worst turn (store read, a sign step bounded by terminal_sign.SIGN_BOUND_S waiting on a touch, the write,
+# the render) plus the codex install wrapper's bounded calls around it. Killed inside that window, an answer can be
+# recorded with no echo, or a Touch ID sheet left open. The codex template carries the same number; a test asserts it
+# for every install path and asserts the arithmetic.
+PROMPT_HOOK_TIMEOUT_S = 45
+_TIMEOUT = {"SessionStart": 30, "UserPromptSubmit": PROMPT_HOOK_TIMEOUT_S, "Stop": 10}
 _MATCHER = "startup|resume|clear|compact"          # the install's own SessionStart matcher
 INSTALL_COMMAND = "levain band hooks install"
 RECEIPT_NAME ="band_hooks.json"
@@ -369,19 +375,37 @@ def refresh_after_update(env: Mapping[str, str] | None = None) -> str | None:
     return f"• user-level band hooks NOT refreshed: {text.splitlines()[0] if text else 'unknown error'}{moved}"
 
 
-def live_commands(env: Mapping[str, str] | None = None) -> dict[str, str] | None:
-    """``{event: command}`` of this module's handlers in the live user settings (``None``: the file is unreadable)."""
+def _live_handlers(env: Mapping[str, str] | None = None) -> dict[str, dict[str, Any]] | None:
+    """``{event: handler}`` of this module's handlers in the live user settings (``None``: the file is unreadable)."""
     try:
         doc, text = _load(settings_path(env))
     except Refused:
         return None
-    out: dict[str, str] = {}
+    out: dict[str, dict[str, Any]] = {}
     for event, entries in ((doc.get("hooks") or {}).items() if text is not None else ()):
         for entry in entries:
             for h in (entry.get("hooks") or []) if isinstance(entry, dict) and isinstance(entry.get("hooks"), list) else []:
                 if is_ours(h):
-                    out.setdefault(event, h["command"])
+                    out.setdefault(event, h)
     return out
+
+
+def live_commands(env: Mapping[str, str] | None = None) -> dict[str, str] | None:
+    """``{event: command}`` of this module's handlers in the live user settings (``None``: the file is unreadable)."""
+    handlers = _live_handlers(env)
+    return None if handlers is None else {event: h["command"] for event, h in handlers.items()}
+
+
+# Claude Code's bound for a command hook that names no timeout.
+_HARNESS_DEFAULT_TIMEOUT_S = 60
+
+
+def _short_timeout(handler: Mapping[str, Any]) -> Any:
+    """The handler's timeout when it is shorter than a signing turn can take (an install written before TERMSIGN L2,
+    or a hand edit), else ``None``. A handler naming none gets the harness's default, which is long enough."""
+    t = handler.get("timeout", _HARNESS_DEFAULT_TIMEOUT_S)
+    ok = isinstance(t, (int, float)) and not isinstance(t, bool) and t >= PROMPT_HOOK_TIMEOUT_S
+    return None if ok else t
 
 
 def user_band_state(env: Mapping[str, str] | None = None, probe: bool = True) -> tuple[str, str]:
@@ -390,7 +414,9 @@ def user_band_state(env: Mapping[str, str] | None = None, probe: bool = True) ->
     cannot import ``levain.band_hook`` and ``levain.band_view`` (doctor's own probe,
     :func:`levain.doctor._band_import_problem`)."""
     env = os.environ if env is None else env
-    receipt, live = read_receipt(env), live_commands(env)
+    handlers = _live_handlers(env)
+    receipt = read_receipt(env)
+    live = None if handlers is None else {event: h["command"] for event, h in handlers.items()}
     path = settings_path(env)
     if live is None:
         return ("broken" if receipt else "not installed",
@@ -402,6 +428,11 @@ def user_band_state(env: Mapping[str, str] | None = None, probe: bool = True) ->
     missing = [e for e in EVENTS if e not in live]
     if missing:
         return "broken", f"{', '.join(missing)} missing from {path}: run levain band hooks install"
+    short = _short_timeout(handlers["UserPromptSubmit"])
+    if short is not None:
+        return "broken", (f"the UserPromptSubmit hook in {path} has timeout {short!r}, shorter than the "
+                          f"{PROMPT_HOOK_TIMEOUT_S} s a Touch ID answer can take (the harness would kill it after the "
+                          f"answer is recorded, before its echo): run levain band hooks install")
     from levain.doctor import _band_import_problem, band_probe_spec
 
     spec = band_probe_spec(live["UserPromptSubmit"])

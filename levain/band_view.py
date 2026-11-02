@@ -46,6 +46,7 @@ import os
 import sqlite3
 import sys
 import time
+import types
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
@@ -632,6 +633,10 @@ class Signing:
     fp: str | None = None
     versions: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # read-only once built: the same object sits in every entry of the line, and the write checks against it
+        object.__setattr__(self, "versions", types.MappingProxyType(dict(self.versions)))
+
 
 _SIGN_WORDS = {
     "no-key": "terminal signing is not set up (levain band terminal-key create)",
@@ -668,13 +673,32 @@ def _sign_note(by_state: Mapping[str, Sequence[str]], signing: "Signing | None",
     return "; ".join(parts) or None
 
 
+def _check_provenance(e: Mapping[str, Any]) -> tuple[str, Any]:
+    """The answer and the per-entry checks of :meth:`QuestionStore.answer_with_context`, the same tests in the same
+    order with the same words (``via``, ``viewer``, ``seen_through``, ``note``), so the signed write refuses exactly
+    what the unsigned one does. Returns ``(kind, value)`` of the answer; raises :class:`ConsentError`."""
+    via, viewer, seen, note = e.get("via"), e.get("viewer"), e.get("seen_through"), e.get("note")
+    kind, value = _answer_of(e.get("option"), e.get("text"))
+    if via not in ("seat", "cli", "cockpit", "phone"):
+        raise ConsentError(f"via must be seat, cli, cockpit or phone: {via!r}")
+    if viewer is not None and (not isinstance(viewer, str) or "\x00" in viewer):
+        raise ConsentError("viewer must be a string with no NUL")
+    if seen is not None and (not isinstance(seen, int) or isinstance(seen, bool) or seen < 0):
+        raise ConsentError("seen_through must be a band number")
+    if note is not None and (not isinstance(note, str) or len(note) > _TEXT_MAX or "\x00" in note):
+        raise ConsentError(f"note must be at most {_TEXT_MAX} characters with no NUL")
+    return kind, value
+
+
 def _answer_signed(store: QuestionStore, entries: list[dict[str, Any]], *, channel: str,
-                   deadline: float | None) -> list[Any]:
+                   deadline: float | None, require: Callable[[sqlite3.Connection], None] | None = None) -> list[Any]:
     """:meth:`QuestionStore.answer_with_context` for the seat hook: the same one write, each answer with its
     ``answer_context`` row, plus the signing columns (the base method inserts only the original five). An entry
     may carry ``sign`` (a :class:`Signing`): a SIGNED one is recorded only if the row still has the version the
     message names, read again here under the write lock (a moved row is that item's refusal, never an answer over
-    stale bytes). Migrates a store made before the columns. Lock waits, savepoints and results as the base method."""
+    stale bytes). Migrates a store made before the columns. Lock waits, savepoints, ``require`` (run after the schema,
+    before any entry; whatever it raises rolls back the whole write and is raised), the per-entry checks
+    (:func:`_check_provenance`) and results as the base method."""
     if channel not in ANSWER_CHANNELS:
         raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
     out: list[Any] = []
@@ -682,14 +706,14 @@ def _answer_signed(store: QuestionStore, entries: list[dict[str, Any]], *, chann
         for stmt in BAND_SCHEMA:
             conn.execute(stmt)
         _ensure_sign_columns(conn)
+        if require is not None:
+            require(conn)
         stamp = utc_stamp(_now_utc(store._clock))
         for e in entries:
             conn.execute("SAVEPOINT answer_entry")
             try:
                 note, sign = e.get("note"), e.get("sign")
-                if note is not None and (not isinstance(note, str) or len(note) > _TEXT_MAX or "\x00" in note):
-                    raise ConsentError(f"note must be at most {_TEXT_MAX} characters with no NUL")
-                kind, value = _answer_of(e.get("option"), e.get("text"))
+                kind, value = _check_provenance(e)
                 q = store._by_ref(conn, e.get("ref"))
                 if q is None:
                     raise ConsentError(f"no such question: {e.get('ref')!r}")
@@ -831,7 +855,7 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
             signing = sign_with(todo_pairs)
         except Exception as exc:                              # noqa: BLE001 - the answer is recorded whatever the signer did
             signing = Signing("unsigned", "signer-error", type(exc).__name__,
-                              versions={q.id: "" for _, q in todo_pairs})
+                              versions={q.id: "" for _, q in todo_pairs if _question_kind(q) == "information"})
         if signing is not None:
             for act, entry in todo:
                 if questions[act.n].id in signing.versions:
@@ -841,7 +865,8 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
                 deadline = max(deadline, time.monotonic() + HOOK_BUSY_MS / 1000)
     if todo or require is not None:
         try:
-            results: list[Any] = (_answer_signed(store, [e for _, e in todo], channel=channel, deadline=deadline)
+            results: list[Any] = (_answer_signed(store, [e for _, e in todo], channel=channel, deadline=deadline,
+                                                 require=require)
                                   if sign_with is not None else
                                   store.answer_with_context([e for _, e in todo], channel=channel, schema=BAND_SCHEMA,
                                                             deadline=deadline, require=require))
@@ -1381,16 +1406,22 @@ def _is_relay(prompt: str, environ: Mapping[str, str]) -> bool:
 
 def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse, session: str,
                      environ: Mapping[str, str], signer_factory: Any = None, key_dir: Path | None = None,
-                     on_sign: Callable[[], None] | None = None) -> Callable[[list[tuple[Any, Question]]], Signing | None]:
+                     on_sign: Callable[[], None] | None = None, *, view_id: int | None = None
+                     ) -> Callable[[list[tuple[Any, Question]]], Signing | None]:
     """The ``sign_with`` of a seat's typed answer (TERMSIGN L2): after a full parse, ONE message naming every
     information entry about to be recorded (item, row version as read for the plan, the question, the answer), signed
     once, outside any store lock. Authority entries are not signed here. It never raises: a message that cannot be
-    built or a signer that fails is an unsigned outcome naming why (``terminal_sign.REASONS``)."""
+    built or a signer that fails is an unsigned outcome naming why (``terminal_sign.REASONS``).
+
+    ``view_id``: the view (``band_views.seq``) the plan was PARSED against, which the message names (DESIGN §2). It
+    is never re-read here: a view another hook of this viewer commits between the parse and the sign would otherwise
+    scope the signature to a band the line was not read from. ``None`` (no view): unsigned, ``signer-error``."""
     def sign_with(pairs: list[tuple[Any, Question]]) -> Signing | None:
         from levain.consent import terminal_sign as ts
 
         entries: list[Any] = []
         versions: dict[str, str] = {}
+        info_ids = {q.id: "" for _, q in pairs if _question_kind(q) == "information"}
         try:
             for act, q in pairs:
                 if _question_kind(q) != "information":
@@ -1406,19 +1437,19 @@ def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse
                 versions[q.id] = version
             if not entries:
                 return None
-            got = _newest_view(store, viewer)
             sid = _store_id_of(store)
-            if got is None or sid is None:
-                return Signing("unsigned", "signer-error", "no view or store id to bind the message to", versions=versions)
+            if view_id is None or sid is None:
+                return Signing("unsigned", "signer-error", "no view or store id to bind the message to", versions=info_ids)
             rest = (plan.rest or "").strip()
             at = prompt.rfind(rest) if rest else -1
             block = (prompt[:at] if at >= 0 else prompt).strip()
             typed = " / ".join(ln.strip() for ln in block.splitlines() if ln.strip())
-            message = ts.build_message(store=f"levain-questions:{sid}", install=sid, session=session, view=str(got[1]),
+            message = ts.build_message(store=f"levain-questions:{sid}", install=sid, session=session, view=str(view_id),
                                        typed=typed, typed_block=None if typed == block else block, entries=entries)
         except Exception as exc:  # noqa: BLE001 - signing never blocks recording
+            # every information entry of the line, never a map the loop left half-built
             return Signing("unsigned", "signer-error", f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}",
-                           versions=versions or {q.id: "" for _, q in pairs})
+                           versions=info_ids)
         if on_sign is not None:
             on_sign()
         out = ts.sign(message, key_dir=key_dir, signer_factory=signer_factory, remote=ts.is_remote(environ))
@@ -1441,11 +1472,12 @@ def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mappin
     signed. ``signer_factory`` and ``key_dir`` are for tests; ``on_sign`` is told when a sign step is about to run. Left alone they reach the real Secure Enclave key."""
     if not isinstance(prompt, str) or not prompt.strip() or _is_relay(prompt, environ):
         return ""
-    plan, view, questions, extras = plan_for_full(store, viewer, prompt)
+    got = _newest_view(store, viewer)           # read ONCE: the plan and the signed message name the same view
+    plan, view, questions, extras = _plan_on(store, got[0] if got is not None else None, prompt)
     if not plan.matched:
         return format_echo([], [], "seat", plan.hint) if plan.hint else ""
     sign_with = (_terminal_signer(store, viewer, prompt, plan, session, environ, signer_factory, key_dir,
-                                  on_sign) if session else None)
+                                  on_sign, view_id=got[1] if got is not None else None) if session else None)
     return apply_plan(store, plan, questions, viewer=viewer, via="seat",
                       seen_through=view.seen_through if view else 0, deadline=deadline, extras=extras,
                       sign_with=sign_with).echo
@@ -1610,8 +1642,8 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
                             on_sign=lambda: signed_ran.append(True))
     except Exception:                         # fail open before anything is recorded: the prompt passes untouched
         echo = ""
-    if signed_ran and time.monotonic() >= deadline:   # signing waited on a touch past the hook's bound: the render has its own
-        deadline = time.monotonic() + HOOK_BUSY_MS / 1000
+    if signed_ran and deadline is not None:   # a sign step waited on a touch: the render gets a full bound of its own
+        deadline = max(deadline, time.monotonic() + HOOK_BUSY_MS / 1000)
         with read_deadline(deadline):
             return _hook_render(store, directory, session, viewer, coord, echo, deadline)
     return _hook_render(store, directory, session, viewer, coord, echo, deadline)

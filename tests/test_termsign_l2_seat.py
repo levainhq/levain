@@ -325,7 +325,7 @@ def test_the_hook_renders_after_a_slow_sign_and_names_the_state(store, env, keyd
     assert "recorded: 1a (you, seat)" in out and "signed (Touch ID, laptop): 1a" in out
     assert "not read" not in out and "NEEDS YOU" in out                            # item 2 still shown
     # the installed entry carries the raised bound: a touch can take longer than the old ten seconds
-    assert band_hook._entry("/usr/bin/python3", "UserPromptSubmit")["hooks"][0]["timeout"] == 30
+    assert band_hook._entry("/usr/bin/python3", "UserPromptSubmit")["hooks"][0]["timeout"] == band_hook.PROMPT_HOOK_TIMEOUT_S
     assert band_hook._entry("/usr/bin/python3", "Stop")["hooks"][0]["timeout"] == 10
 
 
@@ -381,3 +381,140 @@ def test_a_new_store_has_the_columns_from_the_start(store, env, keydir):
         with pytest.raises(sqlite3.DatabaseError, match="append-only"):
             c.execute("UPDATE answer_context SET sig = 'forged'")
     assert cols[-5:] == ["sig", "message", "signer_fp", "sign_state", "sign_reason"]
+
+
+# --- L3 r1 fixes ---------------------------------------------------------------------------------------
+
+TEMPLATES = Path(band_view.__file__).parent / "templates"
+CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S = 60       # Claude Code's own bound for a command hook that names none
+
+
+def _prompt_hook_timeouts(doc):
+    """Every UserPromptSubmit handler's timeout in a hooks document (``None`` where the handler names none)."""
+    return [h.get("timeout") for entry in (doc.get("hooks") or {}).get("UserPromptSubmit") or []
+            for h in entry.get("hooks") or []]
+
+
+def _wrapper_bounds_s(script):
+    """The codex wrapper's own bounded calls around the band (its anneal-memory queries), read from its source."""
+    import re
+    text = script.read_text()
+    return sum(float(re.search(rf"^{name} = ([0-9.]+)", text, re.M).group(1))
+               for name in ("WRAP_CHECK_TIMEOUT", "SPORE_CHECK_TIMEOUT", "CRYSTAL_CHECK_TIMEOUT"))
+
+
+def test_every_installed_prompt_hook_outlasts_the_whole_signing_turn(tmp_path):
+    """codex HIGH r1: the codex install's hooks.json kept 10 s while the sign step may take 20. Every install path that
+    can run :func:`band_view.hook_prompt` is enumerated (each template that registers a UserPromptSubmit, the codex
+    one as install renders it, and the user-level band entry) and each carries ONE number, which budgets the band's
+    worst turn (read, sign, write, render) plus the codex wrapper's own bounded calls."""
+    from levain import install as inst
+
+    need = (ts.SIGN_BOUND_S + 3 * band_view.HOOK_BUSY_MS / 1000
+            + _wrapper_bounds_s(TEMPLATES / "adapters" / "codex" / "activation" / "hooks" / "user_prompt_submit.py"))
+    assert band_hook.PROMPT_HOOK_TIMEOUT_S >= need + 5                              # 5 s for interpreter start-up
+    found = {}
+    for path in sorted(TEMPLATES.rglob("*.json*")):
+        try:
+            doc = json.loads(path.read_text())
+        except ValueError:
+            continue
+        if isinstance(doc, dict) and _prompt_hook_timeouts(doc):
+            found[path.relative_to(TEMPLATES).as_posix()] = _prompt_hook_timeouts(doc)
+    assert set(found) == {"adapters/codex/hooks.json.template", "adapters/claude-code/settings.template.json"}
+    assert found["adapters/codex/hooks.json.template"] == [band_hook.PROMPT_HOOK_TIMEOUT_S]
+    # the claude-code install names no timeout: Claude Code's default bound applies, and it is longer still
+    assert found["adapters/claude-code/settings.template.json"] == [None]
+    assert CLAUDE_CODE_DEFAULT_HOOK_TIMEOUT_S >= band_hook.PROMPT_HOOK_TIMEOUT_S
+    rendered = json.loads(inst._codex_hooks_json(TEMPLATES / "adapters" / "codex", "/usr/bin/python3", tmp_path))
+    assert _prompt_hook_timeouts(rendered) == [band_hook.PROMPT_HOOK_TIMEOUT_S]
+    entry = band_hook._entry("/usr/bin/python3", "UserPromptSubmit")
+    assert _prompt_hook_timeouts({"hooks": {"UserPromptSubmit": [entry]}}) == [band_hook.PROMPT_HOOK_TIMEOUT_S]
+
+
+def test_the_signed_view_is_the_one_the_line_was_parsed_against(store, env, keydir, monkeypatch):
+    """codex HIGH r1: another hook of the same viewer commits a newer view between the parse and the sign. The message
+    names the view the plan was parsed against, never the newest one re-read at sign time."""
+    seen(store, env, 2)
+    v1 = band_view._newest_view(store, VIEWER)[1]
+    real = band_view._plan_on
+
+    def plan_then_another_view(*a, **kw):
+        got = real(*a, **kw)
+        out, commit = band_view.hook_prompt({"session_id": SESSION, "prompt": "hello"}, env)   # another tab, same viewer
+        commit()
+        return got
+    monkeypatch.setattr(band_view, "_plan_on", plan_then_another_view)
+    echo = seat(store, env, "1a", keydir)
+    assert band_view._newest_view(store, VIEWER)[1] != v1                          # the race happened
+    assert "signed (Touch ID, laptop): 1a" in echo
+    q1 = band_view._items_of(store, band_view._view_by_id(store, VIEWER, v1))[1]
+    assert ts.parse_verified(band_view.answer_sign_of(store, q1.id)["message"].encode()).view == str(v1)
+
+
+def _signed_stub(pairs):
+    return band_view.Signing("signed", None, "", "m", "s", "SHA256:" + "A" * 43,
+                             {q.id: band_view.subject_version(q) for _, q in pairs})
+
+
+def test_require_is_run_on_the_signed_path_too(store, env):
+    """MED r1: a caller passing both ``require`` and ``sign_with`` had the precondition skipped and the answer stored."""
+    seen(store, env, 1)
+    plan, view, questions, extras = band_view.plan_for_full(store, VIEWER, "1a")
+
+    def stale(conn):
+        raise band_view.StaleBand("stale")
+    with pytest.raises(band_view.StaleBand):
+        band_view.apply_plan(store, plan, questions, viewer=VIEWER, via="seat", seen_through=view.seen_through,
+                             extras=extras, require=stale, sign_with=_signed_stub)
+    assert recorded(store) == []
+    ran = []
+    band_view.apply_plan(store, plan, questions, viewer=VIEWER, via="seat", seen_through=view.seen_through,
+                         extras=extras, require=lambda conn: ran.append(conn), sign_with=_signed_stub)
+    assert len(ran) == 1 and recorded(store) == [(1, "fix")]
+
+
+@pytest.mark.parametrize("over", [{"viewer": "v\x00 forged"}, {"seen_through": -1}, {"seen_through": True},
+                                  {"via": "agent"}], ids=["nul-viewer", "negative-seen", "bool-seen", "bad-via"])
+def test_the_signed_path_validates_provenance_as_the_unsigned_one_does(store, env, over):
+    """MED r1: the signed write skipped answer_with_context's checks of viewer, seen_through and via."""
+    seen(store, env, 1)
+    plan, view, questions, extras = band_view.plan_for_full(store, VIEWER, "1a")
+    kw = {"viewer": VIEWER, "via": "seat", "seen_through": view.seen_through, **over}
+    unsigned = band_view.apply_plan(store, plan, questions, extras=extras, **kw)
+    assert unsigned.recorded == [] and recorded(store) == []
+    signed = band_view.apply_plan(store, plan, questions, extras=extras, sign_with=_signed_stub, **kw)
+    assert signed.recorded == [] and signed.refused and recorded(store) == [] and sidecar(store) == []
+
+
+def test_the_render_bound_is_rearmed_after_any_sign_step(store, env, keydir, monkeypatch):
+    """MED r1: the render's bound was re-armed only when signing had used ALL of the hook's; a touch that left 0.1 s
+    gave the render 0.1 s. After a sign step the render always gets a full bound from a fresh reading."""
+    seen(store, env, 1)
+    monkeypatch.setattr(ts, "_real_key_dir", lambda: keydir)
+    monkeypatch.setattr(band_view, "HOOK_BUSY_MS", 1000)
+
+    def factory(path):
+        fp, signer = real_factory(path)
+
+        def slow(message):
+            time.sleep(0.5)                                                        # half the bound, not all of it
+            return signer(message)
+        return fp, slow
+    monkeypatch.setattr(ts, "default_signer_factory", factory)
+    real = band_view._hook_render
+    left = []
+
+    def render(*a, **kw):
+        left.append(a[-1] - time.monotonic())
+        return real(*a, **kw)
+    monkeypatch.setattr(band_view, "_hook_render", render)
+    out, commit = band_view.hook_prompt({"session_id": SESSION, "prompt": "1a"}, env)
+    assert "signed (Touch ID, laptop): 1a" in out
+    assert left and left[0] > 0.9
+
+
+def test_signing_versions_cannot_be_changed_after_the_fact():
+    s = band_view.Signing("signed", versions={"q": "v"})
+    with pytest.raises(TypeError):
+        s.versions["q"] = "other"
