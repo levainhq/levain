@@ -161,10 +161,12 @@ def test_a_standing_mark_that_holds_an_approval_also_pushes_it(tmp_path, cockpit
     assert presence.should_push(q, "consent", idle=lambda: 2.0, suggest=False).push is False   # ... the record alone says no
     assert cc.notify(marked, "levain: x", cwd=q, ref="request:1") is True               # ... and the approval goes
     assert spawned[-1]["push"] is True and spawned[-1]["hold"] is None
-    # a non-approval ping under the mark still reads the record; an unmarked approval reads the record
+    # a non-approval ping under the mark still reads the record; an unmarked approval reads the record as a FILED
+    # request's ping (Phill 11-02, np-e642162b (a)): devices off does not hold it, only a mute does
     plain = away.settings(q, "codex")
     assert not plain.away_marked
-    assert cc.notify(plain, "levain: y", cwd=q, ref="request:2") is False and spawned[-1]["push"] is False
+    muted = intent.read(q)["base"]["lets_through"] == "nothing"
+    assert cc.notify(plain, "levain: y", cwd=q, ref="request:2") is (not muted) and spawned[-1]["push"] is (not muted)
     assert auto_away.approval_push(marked, q, "notify", idle=lambda: 2.0, suggest=False).push is False
 
 

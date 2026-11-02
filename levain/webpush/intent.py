@@ -286,15 +286,17 @@ def _eff(rec: dict, now: float, reading: float | None, desk_msg_at: float | None
 
 
 def decide(now: float, rec: dict, reading: float | None, *, class_name: str, remote: dict | None = None,
-           desk_msg_at: float | None = None) -> Decision:
+           desk_msg_at: float | None = None, filed: bool = False) -> Decision:
     """Whether a ping of ``class_name`` is pushed at ``now``. Pure. ``rec`` is a :func:`read` result; ``reading`` the laptop
-    idle seconds with a desk message counted as input. A fault reads as push (a ping he did not need costs one
-    notification, one he needed and never got costs the day)."""
-    return _decide(now, rec, reading, class_name, remote, desk_msg_at)[0]
+    idle seconds with a desk message counted as input. ``filed``: the ping is about a request already FILED and waiting
+    for a signed answer (an approval-class ping from a consent hook or gate), which goes whatever the desk or devices
+    setting is doing (only a mute holds it). A fault reads as push (a ping he did not need costs one notification, one
+    he needed and never got costs the day)."""
+    return _decide(now, rec, reading, class_name, remote, desk_msg_at, filed)[0]
 
 
 def _decide(now: float, rec: dict, reading: float | None, class_name: str, remote: dict | None,
-            desk_msg_at: float | None) -> tuple[Decision, str]:
+            desk_msg_at: float | None, filed: bool = False) -> tuple[Decision, str]:
     if rec["status"] == "fault":
         return Decision(True, "pushing", _FAULT_WHY), "measured"
     eff, ov, _ended = _eff(rec, now, reading, desk_msg_at)
@@ -310,6 +312,12 @@ def _decide(now: float, rec: dict, reading: float | None, class_name: str, remot
         # Phill 10-27: an attention item pings his phone "even when pings are not otherwise on" (the desk being active, or devices
         # off, holds the other classes, never this one); only a mute (lets_through) holds it, above.
         return Decision(True, "pushing", "an attention item reaches your devices whatever the desk is doing", preset), source
+    if filed and class_name == "approval":
+        # Phill 11-02 (np-e642162b (a)): "yes we DO want these to be able to find us ASAP". A request already filed and
+        # held for a signed answer has no dialog to fall back to, so its ping is the only way it finds him. This is the
+        # PING's decision only: the hold's question (approvals_to_devices, approvals_route) never passes ``filed``.
+        return Decision(True, "pushing", "a filed request waits on your signed answer: it reaches your devices "
+                                         "whatever the desk is doing", preset), source
     return Decision(False, "holding", why), source
 
 
@@ -341,12 +349,13 @@ def _sample(queue_dir: Path | str | None, now: float, idle: Callable[[], float |
 
 
 def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Callable[[], float | None] | None,
-          suggest: bool, remote: object = _UNSET, raw: object = _UNSET) -> tuple[Decision, str, dict]:
+          suggest: bool, remote: object = _UNSET, raw: object = _UNSET, filed: bool = False) -> tuple[Decision, str, dict]:
     """The one place the rule is read: ``(decision, source, sample)``. Both :func:`presence.should_push` and the status
-    (:func:`view`) call it, so the push and the line cannot diverge. Raises on a fault; the callers read that as push."""
+    (:func:`view`) call it, so the push and the line cannot diverge. ``filed``: see :func:`decide`. Raises on a fault;
+    the callers read that as push."""
     at = time.time() if now is None else now
     s = _sample(queue_dir, at, idle, raw=raw, remote=remote)
-    d, source = _decide(at, s["rec"], s["reading"], kind_class(kind), s["remote"], s["msg_at"])
+    d, source = _decide(at, s["rec"], s["reading"], kind_class(kind), s["remote"], s["msg_at"], filed)
     if suggest:   # a delivery: keep what it saw and said, and the event rows (never a fault of the rule)
         try:
             ov = s["rec"]["overlay"] if source == "word" else None
@@ -473,8 +482,9 @@ def _line(queue_dir: Path | str | None, s: dict, st: dict, *, approvals: str | N
     if st["goes"] and lets in ("needs", "approvals"):
         where += f", {_LETS_WORDS[lets]}"
     if not st["goes"]:
-        # what reaches the devices whatever the desk is doing: an attention item (Phill 10-27) and the notice that an
-        # approval prompt waits in the agent's own dialog (Phill 11-02, approval_notice); a mute holds both
+        # what reaches the devices whatever the desk is doing: an attention item (Phill 10-27), the notice that an
+        # approval prompt waits in the agent's own dialog (Phill 11-02, approval_notice) and the ping about a request
+        # filed and held for a signed answer (the same ruling, decide's ``filed``); a mute holds all of them
         through = [w for c, w in (("approval", "approval prompts"), ("attention", "attention items"))
                    if c in LETS_CLASSES[lets]]
         if through:

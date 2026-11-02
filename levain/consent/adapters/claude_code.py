@@ -1352,7 +1352,9 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     or ``question:<n>``, name it there) by a detached child, with whether the notify command started, and that
     same child pushes it to each paired phone when one with pings on was live at that moment and
     :func:`levain.consent.auto_away.approval_push` says so (``should_push``, except that an approval under a standing
-    signed away mark always goes: the hook is holding it for that answer) (a ping it holds is recorded and queued for the phone,
+    signed away mark always goes, and any other approval-class ping, being about a request filed and held for a signed
+    answer, goes whatever the desk or devices setting is doing unless a mute holds it: Phill 11-02, np-e642162b (a))
+    (a ping it holds is recorded and queued for the phone,
     :mod:`levain.webpush.held`, not pushed). With no ``cwd`` there
     is no queue directory, so nothing is recorded and no push is sent.
     True when the notify command or a push started; False when neither is configured or neither could start (a

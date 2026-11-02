@@ -267,11 +267,13 @@ def test_wiring_walked_away_pushes(tmp_path, monkeypatch):
     assert [c["push"] for c in calls] == [True]
 
 
-def test_wiring_a_consent_at_an_active_laptop_stays_with_the_agents_own_dialog(tmp_path, monkeypatch):
+def test_wiring_a_filed_consent_at_an_active_laptop_pushes(tmp_path, monkeypatch):
+    """notify() with an approval-class kind is always a ping about a FILED request held for a signed answer (no
+    dialog): Phill 11-02 (np-e642162b (a)) it goes to his devices at an active laptop too. Was push False before."""
     _phone(tmp_path)
     calls = _spy(monkeypatch, ACTIVE)
-    assert _notify(tmp_path, "consent") is False
-    assert [c["push"] for c in calls] == [False]
+    assert _notify(tmp_path, "consent") is True
+    assert [c["push"] for c in calls] == [True]
 
 
 def test_wiring_quiet_holds_an_ordinary_ping_and_loud_pushes_again(tmp_path, monkeypatch):
@@ -406,6 +408,91 @@ def test_codex_dialog_at_an_active_laptop_pings_the_devices_once(tmp_path, monke
     assert codex.decide(e, q, codex.AdapterSettings(), environ=h4_env(), home=h4_home()) is None
     assert [(c["kind"], c["push"]) for c in calls] == [("consent", True)]
     assert calls[0]["body"].startswith("codex asks in its own dialog: ")
+
+
+# --- a request FILED and held for a signed answer, no dialog (Phill 11-02, np-e642162b (a), the same ruling) ------------
+
+def _gated_edit(ws, posture, **extra):
+    (ws / ".claude").mkdir(parents=True, exist_ok=True)
+    return {"hook_event_name": "PreToolUse", "session_id": "s-filed", "cwd": str(ws), "permission_mode": posture,
+            "tool_name": "Edit", "tool_use_id": f"tu-{posture}",
+            "tool_input": {"file_path": str(ws / ".claude" / "settings.json"), "old_string": "a", "new_string": "b"},
+            **extra}
+
+
+@pytest.mark.parametrize("posture", ["bypassPermissions", "acceptEdits", "auto"])
+def test_a_filed_and_held_request_at_an_active_laptop_pushes_its_ping(tmp_path, monkeypatch, posture):
+    """THE REPRODUCTION (fails on 6c5236c2: the ping is recorded held "active", push False). A gated T3 call in a
+    non-default posture, him active at the laptop (follow reading 5 s), a key could sign: the request is filed and held
+    for a signed answer (no dialog will ask), and its ping goes to his devices. The hold's own question is unchanged."""
+    from tests._h4 import h4_env, h4_home
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)   # a key could sign
+    assert intent.approvals_to_devices(q.directory, idle=lambda: ACTIVE)[0] is False   # the hold's question: unchanged
+    settings = claude_code.AdapterSettings(gate_hold_seconds=0.2)
+    out = claude_code.gate(_gated_edit(tmp_path / "ws", posture), q, settings, home=h4_home(), environ=h4_env(),
+                           sleep=lambda s: None)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"          # held to D, never passed
+    assert [(c["kind"], c["push"], c["hold"]) for c in calls] == [("consent", True, None)]
+    assert calls[0]["ref"].startswith("request:")
+    assert q.get(calls[0]["ref"].split(":", 1)[1]) is not None                # the request was filed
+
+
+def test_a_filed_codex_request_at_an_active_laptop_pushes_its_ping(tmp_path, monkeypatch):
+    from levain.consent.adapters import codex
+    from tests._h4 import h4_env, h4_home
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    monkeypatch.setattr(codex, "nothing_can_decide", lambda s, **kw: False)
+    ws = tmp_path / "ws"
+    (ws / ".codex").mkdir(parents=True)
+    event = {"hook_event_name": "PreToolUse", "session_id": "s-cx", "turn_id": "t1", "transcript_path": None,
+             "cwd": str(ws), "model": "m", "permission_mode": "bypassPermissions", "tool_name": "apply_patch",
+             "tool_input": {"command": "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch"},
+             "tool_use_id": "call-cx"}
+    out = codex.gate(event, q, codex.AdapterSettings(gate_hold_seconds=0.2), home=h4_home(), environ=h4_env(),
+                     codex_dir=ws / ".codex", sleep=lambda s: None)
+    assert out is not None                                                    # held to D, never passed
+    assert [(c["kind"], c["push"], c["hold"]) for c in calls] == [("consent", True, None)]
+    assert calls[0]["ref"].startswith("request:")
+
+
+def test_a_filed_request_ping_is_still_held_by_a_mute(tmp_path, monkeypatch):
+    """Only a mute (lets_through not admitting approvals) holds the ping about a filed request, under its word."""
+    _phone(tmp_path)
+    calls = _spy(monkeypatch, ACTIVE)
+    intent.apply_settings(tmp_path, lets_through="nothing", idle=lambda: ACTIVE)
+    for kind in ("consent", "push", "reping"):
+        assert _notify(tmp_path, kind) is False
+    assert [c["push"] for c in calls] == [False] * 3 and all(c["hold"] for c in calls)
+
+
+def test_a_filed_request_ping_goes_with_devices_off_and_other_pings_still_hold(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    calls = _spy(monkeypatch, INACTIVE)
+    intent.apply_settings(tmp_path, devices="off", idle=lambda: INACTIVE)
+    for kind in ("consent", "push", "reping"):
+        assert _notify(tmp_path, kind) is True
+    assert _notify(tmp_path, "ruling") is False            # an other-class ping: held as before
+    assert [c["push"] for c in calls] == [True, True, True, False]
+    assert intent.approvals_to_devices(tmp_path, idle=lambda: INACTIVE)[0] is False   # the hold's question: unchanged
+
+
+def test_a_held_approval_ping_is_released_at_an_active_laptop_once_the_mute_ends():
+    """held.plan reads the rule a new filed-request ping meets: an approval ping held by a mute goes once the mute
+    ends, at the laptop too; an other-class ping held the same way waits for his devices."""
+    from levain.webpush import held
+
+    rec = intent.read(None, 0.0)
+    items = [{"kind": "consent", "reason": "quiet"}, {"kind": "ruling", "reason": "quiet"},
+             {"kind": "reping", "reason": "active"}]
+    active, muted = held.plan(items, rec, 5.0, 1000.0)
+    assert [i["kind"] for i in muted] == ["consent"] and [i["kind"] for i in active] == ["reping"]
 
 
 # --- the CLI words ----------------------------------------------------------------------------------------------------
