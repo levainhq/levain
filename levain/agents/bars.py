@@ -109,9 +109,12 @@ def _begin_immediate(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError as exc:
                 if "locked" not in str(exc) and "busy" not in str(exc):
                     raise
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise
-                time.sleep(0.02)    # a bounded retry on a busy store, the one wait this step is specified to make
+                # a bounded retry on a busy store, the one wait this step is specified to make; the pause never
+                # runs past the deadline
+                time.sleep(min(0.02, remaining))
     finally:
         conn.execute(f"PRAGMA busy_timeout = {saved}")
 
