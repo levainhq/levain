@@ -82,7 +82,7 @@ from levain.consent import policy as consent_policy
 from levain.consent.adapters.claude_code import (  # noqa: F401
     CLEANUP_RESERVE, DEFAULT_MAX_HOLD, DEFAULT_TIER, ISOLATE_PRELUDE, MIN_FILE_HOLD, AdapterSettings,
     _absolute_root, _atomic_write, _is_ours, _merge_handler, _refuse_symlink, _stat_key, _verified, away_hold,
-    effective_away, hold_for_answer, hook_command, read_settings_file, still_away_from, with_away_mark,
+    effective_away, hold_for_answer, hold_ping, hook_command, read_settings_file, still_away_from, with_away_mark,
     hook_timeout, levain_home_protected, nothing_can_decide, prompt_notice, prompt_ref,
     protected_paths,
 )
@@ -216,8 +216,10 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     withdrawing the request it filed); the caller (:func:`main`) turns that into no decision. ``max_hold`` is a
     total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. The hold and ``idle`` / ``still_away``
     are the Claude Code adapter's (:func:`levain.consent.adapters.claude_code.decide`). ``policy`` is only ever reached
-    through :func:`levain.consent.policy.guarded_policy`, never for a request filed at ``AGENT_CONFIG_TIER``. When
-    Codex's own dialog is left to ask with no away hold (nothing can decide, or a zero hold ran out), one
+    through :func:`levain.consent.policy.guarded_policy`, never for a request filed at ``AGENT_CONFIG_TIER``. When an
+    away hold will run, the request is pinged to his devices first
+    (:func:`~levain.consent.adapters.claude_code.hold_ping`); when Codex's own dialog is left to ask with no hold that
+    ran and pinged (nothing can decide, a zero hold, a deadline that left no wait, a ping that could not start), one
     :func:`~levain.consent.adapters.claude_code.prompt_notice` tells his devices it waits."""
     if getattr(queue, "directory", None) is None:
         raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
@@ -234,15 +236,17 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     posture = event.get("permission_mode")
     posture = posture if isinstance(posture, str) and posture else None
 
+    def what_of() -> str:
+        try:
+            return _call_what(tool_name, tool_input, cwd, home=home, environ=environ, codex_dir=codex_dir)
+        except Exception:  # noqa: BLE001 - the ping names the tool at least
+            return tool_name
+
     def notice(request_id: str | None) -> None:
-        # Codex's own approval dialog asks with no away hold: one notice to his devices that it waits (Phill 11-02,
-        # np-e642162b (a); claude_code.prompt_notice, which never raises)
+        # Codex's own approval dialog asks and no away hold pinged his devices about the request: one notice to them
+        # that it waits (Phill 11-02, np-e642162b (a); claude_code.prompt_notice, which never raises)
         try:
-            what = _call_what(tool_name, tool_input, cwd, home=home, environ=environ, codex_dir=codex_dir)
-        except Exception:  # noqa: BLE001 - the notice names the tool at least
-            what = tool_name
-        try:
-            prompt_notice(queue.directory, AGENT, what, prompt_ref(request_id), idle=idle)
+            prompt_notice(queue.directory, AGENT, what_of(), prompt_ref(request_id), idle=idle)
         except Exception:  # noqa: BLE001 - a notice never changes the hook's answer
             pass
 
@@ -267,7 +271,12 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
                                                           policy=policy), request)
         wait = min(hold, max(0.0, deadline - clock()))
         back = None
+        held = False
         if got is None and wait > 0:
+            # a hold will run: his devices hear of the request now, as the gate pings its filed request (Phill 11-02,
+            # np-e642162b (a)); `held` is true only when the hold ran and its ping started
+            held = hold_ping(settings, queue.directory, AGENT, what_of(), request.id, wait)
+            wait = min(wait, max(0.0, deadline - clock()))   # the ping's spawn time comes out of the hold, not the reserve
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
                                         still_away=still_away)
         if got is None:
@@ -278,7 +287,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
         settled = True
         if got is not None:
             return hook_output(got)
-        if hold <= 0:   # no away hold routed the request to his devices: the dialog asks, and they hear it waits
+        if not held:   # no hold ran and pinged his devices about the request: the dialog asks, and they hear it waits
             notice(request.id)
         return None
     finally:
