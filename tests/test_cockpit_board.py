@@ -337,6 +337,20 @@ def test_the_filter_matches_folded_text_with_every_term_and_counts_cards_and_a_c
     assert g["colKeys"] == ["cards", "category"], g                    # a filtered column keeps every key the model gave it
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_an_empty_column_of_an_unreadable_source_says_unknown_not_nothing():
+    """W2 (read in a browser): beside the "queue could not be read" banner six columns said "nothing", which reads as an empty,
+    healthy board. A column whose source could not be read says so; a read source says "nothing"."""
+    e = _harness_run()["emptyWords"]
+    nothing, unknown = "nothing", "unknown (could not read)"
+    assert e["ok"]["grouped"] == e["ok"]["cols"] == [nothing] * 6
+    assert e["queue"]["grouped"] == e["queue"]["cols"] == [unknown] * 4 + [nothing, unknown]   # the queue feeds every column but needs-you
+    assert e["band"]["grouped"] == e["band"]["cols"] == [nothing] * 4 + [unknown, nothing]   # the band is needs-you's alone
+    # the seat roster feeds running and waiting only; a queue state that is not ok/none, with no unreadable key at all, fails closed
+    assert e["seats"]["grouped"] == e["seats"]["cols"] == [nothing, nothing, unknown, unknown, nothing, nothing]
+    assert e["noKey"]["grouped"] == e["noKey"]["cols"] == [unknown] * 4 + [nothing, unknown]
+
+
 def test_the_board_value_carries_no_tell_field_and_the_page_has_no_ready_queue_zone(tmp_path, lh):
     """One board per cockpit: the board's read no longer offers a second messaging box, and the script that painted the
     standalone zone is gone (what is left is the painters the board kind uses)."""
