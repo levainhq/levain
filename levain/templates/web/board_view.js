@@ -120,10 +120,18 @@
     if (b) host.appendChild(b);
   }
 
-  // What an empty column says. "nothing" is a fact only for a source that was read: a queue that could not be read (or a band that
-  // could not) leaves its columns unknown, and "nothing" beside a warning would read as an empty, healthy board.
+  // What an empty column says. ONE rule: a column is "nothing" only when every source that feeds it was read. The sources, from the
+  // producer (cockpit/board.py, coordinator/ready.py): the store feeds every column but needs-you ("coordinator" in unreadable, or the
+  // queue state is anything but "ok"/"none": fail closed); the seat roster adds running and waiting ("seats"); the band is needs-you's
+  // alone ("band"). The journal only annotates cards, so it never empties a column.
+  var COLUMN_SOURCES = { "needs-you": ["band"], running: ["coordinator", "seats"], waiting: ["coordinator", "seats"] };
+  function sourceMissing(model, src) {
+    var un = Array.isArray(model.unreadable) ? model.unreadable : [];
+    if (src === "coordinator" && model.queue !== "ok" && model.queue !== "none") return true;
+    return un.indexOf(src) >= 0;
+  }
   function emptyText(model, col) {
-    var bad = col.category === "needs-you" ? model.unreadable.indexOf("band") >= 0 : model.queue === "unreadable";
+    var bad = (COLUMN_SOURCES[col.category] || ["coordinator"]).some(function (s) { return sourceMissing(model, s); });
     return bad ? "unknown (could not read)" : "nothing";
   }
 
