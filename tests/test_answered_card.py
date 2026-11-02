@@ -416,7 +416,9 @@ def test_the_just_answered_block_is_folded_until_clicked_and_stays_open_after(tm
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             DESKTOP, {"until": "document.querySelector('#ck-needs .needs-answered .consent-note') && 1", "ms": 30000},
-            {"eval": state}, {"eval": click}, {"eval": state}])
+            {"eval": state}, {"eval": click}, {"eval": state},
+            {"eval": "JSON.stringify({kept: window.localStorage.getItem('levain.needs.answeredOpen'), keptkey: 1})"}])
     folded, opened = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"fold"' in v]
+    assert _values(out, '"keptkey"')["kept"] == "1"                                      # the open choice is stored for this browser
     assert folded == {"hidden": True, "open": "false", "n": "1", "fold": 1}, folded       # folded by default, the count shown
     assert opened == {"hidden": False, "open": "true", "n": "1", "fold": 1}, opened       # one click opens it
