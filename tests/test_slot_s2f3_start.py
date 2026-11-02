@@ -170,9 +170,9 @@ class Launches:
         Claude login records ``identity-unparsable``. Every other target keeps the helper's own capture."""
         if canon.parse(spec_json)["target"] == "identity":
             self.identity_captures = getattr(self, "identity_captures", 0) + 1
-            if self.profile_uuid is not None:      # G3: the server answers this account
-                body = json.dumps({"account": {"uuid": self.profile_uuid}})
-                return 0, json.dumps({"refresh": 200, "status": 200, "body": body}, sort_keys=True).encode() + b"\n"
+            if self.profile_uuid is not None:      # G3: the binary's auth status names this account
+                line = {"claim": "local-data", "logged_in": True, "org_id": self.profile_uuid}
+                return 0, json.dumps(line, sort_keys=True).encode() + b"\n"
             return 1, b'{"error":"no-token"}\n'
         return H.capture_target(argv, spec_json, cgroup, bound)
 

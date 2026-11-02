@@ -7,7 +7,7 @@
 * start's identity step for a Claude login (:func:`levain.slot.start.identity_capture`): under the session END lock,
   Linux ends and proves the kill domain (the forwarder start left is a slot-uid process), then no slot-uid process may
   be alive (proc.py's END proof), then a fresh forwarder (Linux), then the child, its stdout captured by root within
-  ``PROFILE_ANSWER_MAX`` and judged by ``parse_profile_answer``.
+  ``PROFILE_ANSWER_MAX`` and judged by ``parse_auth_answer``.
 
 Built on lane F2/2f3's harness (``World`` + the fake launches + the fake process table). What only a VM run can show
 (the real child through the real tunnel as the slot uid) is the lane's residue, not a test here.
@@ -39,10 +39,17 @@ UUID = "4b8e0c1a-1d2e-4f00-9a7b-0123456789ab"
 
 
 def _answer(status: int = 200, body: object = None) -> bytes:
-    if body is None:
-        body = {"account": {"uuid": UUID, "email_address": "x@example.invalid"}, "organization": {"uuid": "o-1"}}
-    text = body if isinstance(body, str) else json.dumps(body)
-    return json.dumps({"refresh": 200, "status": status, "body": text}, sort_keys=True).encode() + b"\n"
+    """The child's line for a case: 200 = signed in as UUID, 401/403 = the binary says not signed in, a ``body`` = a
+    shape the parser must refuse, any other status = an error name."""
+    if body is not None:
+        line = {"claim": "local-data", "logged_in": True}
+    elif status == 200:
+        line = {"claim": "local-data", "logged_in": True, "org_id": UUID}
+    elif status in (401, 403):
+        line = {"claim": "local-data", "logged_in": False}
+    else:
+        line = {"error": "exit-nonzero"}
+    return json.dumps(line, sort_keys=True).encode() + b"\n"
 
 
 def _capture(w, la, table, answer=(0, None)):

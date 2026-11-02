@@ -2232,12 +2232,6 @@ def _teardown(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
 def _confirm_identity(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     from levain.slot import identity as ID
 
-    if req.dispatch and not getattr(ID, "BASELINE_DISPATCH_KEY", None):
-        # INTEGRATION SEAM (c7.14): the baseline's writer is `identity.py` (P7-A4's file). Where it does not name the
-        # key it writes (`BASELINE_DISPATCH_KEY`) and take `req.dispatch`, `--dispatch` is refused BEFORE a baseline
-        # is written, never accepted and dropped: an operator who asked for the unattended-use mark must not be told
-        # the baseline is written when it carries none.
-        raise Refused("dispatch-mark-unbuilt", "identity.py does not write the dispatch mark yet")
     return ID.confirm_identity(ctx, req, blob)
 
 

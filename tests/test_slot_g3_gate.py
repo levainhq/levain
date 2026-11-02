@@ -207,14 +207,20 @@ def test_claude_differ_refuses_identity_changed_with_the_credential_back_before_
 # --- test 8: every failure of the call --------------------------------------------------------------------------------
 
 def _ans(status=200, body=None):
-    body = {"account": {"uuid": UUID}} if body is None else body
-    return json.dumps({"refresh": 200, "status": status,
-                       "body": body if isinstance(body, str) else json.dumps(body)}).encode() + b"\n"
+    if body is not None:
+        line = {"claim": "local-data", "logged_in": True, "org_id": body}
+    elif status == 200:
+        line = {"claim": "local-data", "logged_in": True, "org_id": UUID}
+    elif status in (401, 403):
+        line = {"claim": "local-data", "logged_in": False}
+    else:
+        line = {"error": "exit-nonzero"}
+    return json.dumps(line).encode() + b"\n"
 
 
 @pytest.mark.parametrize("answer", [
-    (1, b"{}"), (0, b"x" * (ID.PROFILE_ANSWER_MAX + 1)), (0, b"not json"), (0, _ans(500)), (0, _ans(body={})),
-    (0, _ans(body={"account": {"uuid": "bad uuid"}})), (0, b'{"status":200}\n')])
+    (1, b"{}"), (0, b"x" * (ID.PROFILE_ANSWER_MAX + 1)), (0, b"not json"), (0, _ans(500)), (0, _ans(body=7)),
+    (0, _ans(body="bad uuid")), (0, b'{"status":200}\n')])
 def test_each_unparsable_answer_refuses_and_parks_back(env, answer):
     w, la, _ = env
     s = _gated(w, la)
@@ -229,9 +235,9 @@ def test_each_unparsable_answer_refuses_and_parks_back(env, answer):
                                          (500, "identity-unparsable")])
 def test_an_auth_failure_answer_says_the_login_looks_expired(status, name):
     with pytest.raises(Refused) as e:
-        ID.parse_profile_answer(0, _ans(status))
+        ID.parse_auth_answer(0, _ans(status))
     assert e.value.name == name
-    assert f"HTTP {status}" in str(e.value) and ("expired or revoked" in str(e.value)) is (name == "identity-expired")
+    assert ("sign in to this slot again" in str(e.value)) is (name == "identity-expired")
 
 
 def test_a_capture_that_times_out_refuses_identity_unparsable(env):
