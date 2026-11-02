@@ -188,6 +188,17 @@ def test_an_unreadable_journal_is_named_and_the_cards_stay(filled, monkeypatch):
     assert col == "running" and card["journal"] is None
 
 
+def test_a_damaged_journal_that_breaks_the_divergence_read_still_keeps_the_cards(filled, monkeypatch):
+    def broken(conn, item_id=None):
+        raise ready.CoordError("the journal has no ver column")
+
+    monkeypatch.setattr(ready, "_diverged", broken)
+    out = board.build(filled, QuestionStore(filled))
+    assert out["queue"] == "ok" and "journal" in out["unreadable"] and "coordinator" not in out["unreadable"]
+    col, card = _cards(out)["levain:a"]
+    assert col == "running" and card["journal"] is None
+
+
 def test_build_writes_nothing(filled):
     before = (filled / "dispatch.db").read_bytes()
     board.build(filled, QuestionStore(filled))

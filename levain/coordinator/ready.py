@@ -544,18 +544,19 @@ def snapshot(store: CoordStore | Path | str, *, sources: Mapping[str, Any] | Non
     now = st._stamp()
 
     def q(conn: sqlite3.Connection) -> tuple:
-        cur = _current(conn), _diverged(conn)
+        cur = _current(conn)
         try:
+            div = _diverged(conn)       # reads the journal too: a damaged journal degrades to "journal", the cards stay
             recs = ([(r[0], dict(zip(_JOURNAL_FIELDS, r[1:])))
                      for r in conn.execute(f"SELECT ver, {cols} FROM ready_journal ORDER BY gseq")]
                     if _lifecycle_present(conn) else [])
         except (sqlite3.Error, ValueError, CoordError):
-            recs = None
+            div, recs = [], None
         try:
-            seat = _seat_rows(conn, now)
+            seat = _seat_rows(conn, now)     # one malformed launch row names "seats" for the lot (named degradation, not a blank board)
         except (sqlite3.Error, ValueError, CoordError, TypeError, AttributeError):
             seat = None
-        return cur[0], cur[1], recs, seat
+        return cur, div, recs, seat
 
     try:
         rows, diverged, recs, seat_rows = _read(st, q)
