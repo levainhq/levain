@@ -15,7 +15,7 @@ import levain.authority as auth
 from levain.authority import ReplayCache
 from levain.cli import main
 from levain.cockpit.firejournal import CockpitDB
-from levain.consent import away
+from levain.consent import auto_away, away
 from levain.consent.adapters import claude_code as cc
 from levain.consent.adapters import codex as cx
 from tests._h4 import h4_home
@@ -52,6 +52,13 @@ def _queue(tmp_path: Path, root: object) -> Path:
         (q / name).write_text(json.dumps({"cockpit_data_root": str(root), "away_mode": False,
                                           "away_hold_seconds": 0, "other": 1}))
     return q
+
+
+@pytest.fixture(autouse=True)
+def _at_the_laptop(monkeypatch):
+    """Input at this Mac 5 s ago, so the presence record (follow, 10 min) says the desk: what these tests read does not
+    depend on the machine they run on (a runner with no idle source reads as devices on, DESIGN §3)."""
+    monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: 5.0)
 
 
 @pytest.fixture(scope="module")

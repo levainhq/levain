@@ -43,7 +43,10 @@ _FIELD = 300
 
 def away_from_drop(store: CoordStore, drop_id: str, *, token: object, agents: Sequence[str] = AGENTS) -> dict[str, Any]:
     """The coordinator read drop ``drop_id`` as your word that you are away: set Q14 away ON for each of ``agents``
-    through the operator's own path, then file a KNOW saying so. Lease-fenced (``token``): refused with nothing written
+    through the operator's own path, write the ``away`` preset on the presence record as the coordinator (its quote is
+    the drop's own words, checked against the drop: ``levain ping away`` with ``--drop``), then file a KNOW saying so.
+    A preset the record refuses (a verified quote typed after a standing setting of yours is needed to replace it) is
+    named in the KNOW and changes nothing else; the marks stand. Lease-fenced (``token``): refused with nothing written
     unless the caller holds the live lease. An agent whose consent settings are missing, or whose held calls nobody
     could answer (``set_away`` refuses it exactly as it refuses ``levain consent away on``), or whose settings cannot
     be read or written (an ``OSError``), is skipped and named with why; the KNOW says which agents were set away and
@@ -68,10 +71,26 @@ def away_from_drop(store: CoordStore, drop_id: str, *, token: object, agents: Se
     if not marked:
         raise CoordError("away was not set for any agent: " + "; ".join(f"{a}: {w}" for a, w in skipped.items()))
     words = drop.words if len(drop.words) <= 200 else drop.words[:200] + "..."
+    import time
+
+    from levain.webpush import held, intent, presence, quote
+
+    qdir, said = Path(store.directory), " ".join(drop.words.split())[:300]   # the quote: the drop's own words
+    try:
+        intent.apply_preset(qdir, "away", via="coordinator drop", said=said,
+                            by={"agent": "coordinator", "session": drop_id, "role": "coordinator"},
+                            match=quote.match_drop(qdir, drop_id, said, now=time.time()))
+        record = " The presence record says away now (`levain ping status` prints the line)."
+        try:   # devices come on: pings held for them are due now
+            held.flush_if_due(qdir, throttle=False)
+        except Exception:  # noqa: BLE001 - the record is written; the next gate call flushes
+            pass
+    except (presence.PresenceError, OSError) as exc:   # the marks stand; the KNOW must still be filed
+        record = f" The presence record was NOT changed ({str(exc)[:_FIELD]}); `levain ping status` says what it reads."
     text = (f"the coordinator read your drop {drop_id} ({words!r}) as away and set away ON for "
             f"{', '.join(marked)}: a SIGN from {'that agent' if len(marked) == 1 else 'those agents'} now waits "
             "UNDECIDED for your morning card. Only you can leave away (`levain consent away off --signing-key KEY`)."
-            + skipped_lines(skipped))
+            + skipped_lines(skipped) + record)
     try:
         item, _reply = review.file_know(store, threads[0] if threads else None, text, by="coordinator", token=token)
     except CoordError as exc:

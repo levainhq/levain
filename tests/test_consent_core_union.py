@@ -19,7 +19,8 @@ from tests._decide_scenarios import _event, run_all
 
 GOLDEN = Path(__file__).parent / "fixtures" / "decide_golden_be0af189.json"
 NONCE = "a" * 32
-AWAY = cc.AdapterSettings(away_mode=True, away_hold_seconds=20)
+# a signed away mark stands: it holds whatever the presence record says (the file's word alone is not read with a queue dir)
+AWAY = cc.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=20)
 
 
 class Q:

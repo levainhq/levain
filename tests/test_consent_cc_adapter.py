@@ -89,7 +89,9 @@ class FakeQueue:
         return None  # no gate allow to reuse: the PermissionRequest path files its own request
 
 
-AWAY = cc.AdapterSettings(away_mode=True, away_hold_seconds=20)
+# a signed away mark stands (what holds whatever the presence record says; the file's word alone is read only by a
+# caller with no queue directory)
+AWAY = cc.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=20)
 
 
 def run_main(monkeypatch, queue, stdin_text, settings=AWAY, policy=None):
@@ -190,7 +192,7 @@ def test_default_mode_answers_at_once(monkeypatch):
 
 def test_the_wait_never_exceeds_the_installed_hold():
     q = FakeQueue(None)
-    cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=5000), max_hold=60 + cc.CLEANUP_RESERVE,
+    cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=5000), max_hold=60 + cc.CLEANUP_RESERVE,
               clock=lambda: 0.0, environ=h4_env(), home=h4_home())
     assert q.waited == [60.0] and q.filed[0]["hold"] == timedelta(seconds=60)
 
@@ -342,6 +344,9 @@ def test_real_core_signed_allow_through_main(tmp_path):
     qdir.mkdir(parents=True, mode=0o700)
     (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"away_mode": True, "away_hold_seconds": 20,
                                                      "cockpit_data_root": str(root)}))
+    from levain.webpush import intent
+    (qdir / "webpush").mkdir(mode=0o700)
+    intent.apply_preset(qdir, "away")   # the presence record, not the file's word, says approvals go to the devices
     observer = ConsentQueue(qdir, authority=authority_source(root / "cockpit.db", anchor=None), home=h4_home())
 
     def answer():
@@ -563,7 +568,7 @@ def test_max_hold_is_a_total_deadline_and_the_cc_timeout_exceeds_it():
     is above wait + reserve, so it never cancels a hook that is delivering a verified answer."""
     for max_hold in (0, 30, 60, 90, 900, 1800.5):
         q = FakeQueue(None)
-        cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=10**6), max_hold=max_hold, environ=h4_env(), home=h4_home())
+        cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=10**6), max_hold=max_hold, environ=h4_env(), home=h4_home())
         wait = q.waited[0] if q.waited else 0.0
         assert wait <= max(0.0, max_hold - cc.CLEANUP_RESERVE) + 1e-6
         assert wait + cc.CLEANUP_RESERVE < cc.hook_timeout(max_hold)
@@ -577,7 +582,7 @@ def test_the_deadline_counts_time_already_spent():
     def slow_policy(request, queue=None, **kw):
         t[0] += 50
         return None
-    cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=10**6), max_hold=200,
+    cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=10**6), max_hold=200,
               policy=slow_policy, clock=lambda: t[0], environ=h4_env(), home=h4_home())
     assert q.waited == [200 - cc.CLEANUP_RESERVE - 50]
 
@@ -726,7 +731,7 @@ def test_a_direct_decide_caller_cannot_skip_the_adapters_own_protection(tmp_path
     calls = []
     q = FakeQueue(None)
     q.directory = tmp_path / "consent"
-    settings = cc.AdapterSettings(away_mode=True, away_hold_seconds=20, cockpit_data_root=str(tmp_path / "cockpit"))
+    settings = cc.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=20, cockpit_data_root=str(tmp_path / "cockpit"))
     cc.decide(event("Write", {"file_path": str(tmp_path / rel), "content": "{}"}), q, settings,
               policy=lambda r, *a, **kw: calls.append(r), environ=h4_env(), home=h4_home())
     assert q.filed[0]["tier"] == cc.AGENT_CONFIG_TIER and calls == []

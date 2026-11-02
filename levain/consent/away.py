@@ -3,9 +3,13 @@
 Away mode is what lets a signed answer reach the agent: with it off, the hook asks only the standing grants and,
 with none matching, withdraws the request at once so the agent's own dialog asks; with it on, the hook holds each
 request up to ``away_hold_seconds`` while ``levain consent answer`` or the phone signs one. Whether it is on is
-:func:`levain.consent.auto_away.away_state`: the operator's explicit word (``away_word``, set here by
-:func:`set_away`; ``auto``, the one ``levain init`` writes, is none), else input idle past ``away_idle_seconds`` on
-macOS, else off. A file with no ``away_word`` was written before auto-away existed: its ``away_mode`` is the word.
+:func:`levain.consent.auto_away.away_state`: given the queue directory (every hook), a signed away mark, else the
+presence record (:func:`levain.webpush.intent.approvals_to_devices`: held exactly when an approval would reach the
+operator's devices); the words this module writes (``away_word``, ``away_mode``, ``away_idle_seconds``) are read only
+by a caller with no queue directory (one release): the explicit word (``auto``, the one ``levain init`` writes, is
+none), else input idle past ``away_idle_seconds`` on macOS, else off. A file with no ``away_word`` was written before
+auto-away existed: its ``away_mode`` is the word. ``levain consent away on|off|auto`` also set the record's base
+devices setting (:func:`levain.cli._cmd_consent_away`), so the file words and the record move together.
 Claude Code shows its own dialog during the hold (an allow from the hook
 dismisses it); Codex shows none until the hold ends. The file is the adapter's own (``<queue dir>/claude_code.json``
 or ``codex.json``, read by :func:`levain.consent.adapters.claude_code.load_settings`); this module changes only

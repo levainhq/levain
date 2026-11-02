@@ -2592,9 +2592,10 @@ def _consent_agent_version(adapter: str) -> str | None:
 
 def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], None]) -> None:
     """Create the consent adapter's settings file (``<queue dir>/claude_code.json`` or ``codex.json``) when there is
-    none: this install's cockpit as ``cockpit_data_root``, ``away_word`` ``auto`` (no explicit word, so input idle
-    decides, :func:`levain.consent.auto_away.away_state`). CREATE-ONLY: an existing file is never
-    written (its away word is the operator's, and repointing another install's cockpit would make that install's
+    none: this install's cockpit as ``cockpit_data_root``, ``away_word`` ``auto`` (no explicit word; the presence record
+    decides whether an approval is held for a signed answer, :func:`levain.consent.auto_away.away_state`, and the file's
+    away words are not read then). CREATE-ONLY: an existing file is never
+    written (its hold length is the operator's, and repointing another install's cockpit would make that install's
     signed answers undeliverable); one naming another cockpit, or none, is reported. Never fails init: a hook with no
     settings file gives no decision and the agent's own dialog answers, except the PreToolUse gate, which then refuses
     an agent config or hook edit in every mode but ``default`` (the Q10 floor: nothing could approve it)."""
@@ -2623,8 +2624,9 @@ def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], N
                     os.fsync(fh.fileno())
                 try:
                     os.link(tmp, path)  # fails when another writer created it meanwhile: theirs is kept
-                    emit(f"  consent settings: {path} (away mode follows input idle on macOS, off elsewhere "
-                         f"until `levain consent away on`; grants verify against {ours})")
+                    emit(f"  consent settings: {path} (approvals follow your presence record, `levain ping status`: held "
+                         f"for a signed answer when it sends pings to your devices, by default after 10 minutes "
+                         f"without input at this Mac; grants verify against {ours})")
                     return
                 except FileExistsError:
                     pass
@@ -2639,9 +2641,11 @@ def _write_consent_settings(install: Path, adapter: str, emit: Callable[[str], N
             emit(f"  WARN: consent settings {path} name another cockpit ({settings.cockpit_data_root}); kept, so "
                  f"grants and answers verify there, not against this install's {ours}.")
         if settings.away_mode:
-            # an existing file is kept as it is, so init reports the away mode the hook will read (L3 r1 codex LOW)
-            emit(f"  consent settings {path} kept: away mode ON (holds up to {settings.away_hold_seconds:g}s before "
-                 f"the agent's own dialog).")
+            # an existing file is kept as it is; its away word is not read now (the presence record decides), so init
+            # says what still binds: a signed mark and the file's hold length (L3 r1 codex LOW)
+            emit(f"  consent settings {path} kept: its away word ON is not read now; your presence record decides "
+                 f"(`levain ping status`), holding up to {settings.away_hold_seconds:g}s before the agent's own "
+                 f"dialog. Only a signed `levain consent away on` stands over the record.")
     except (OSError, ValueError, QueueStoreError) as e:
         emit(f"  WARN: consent settings not written ({e}); the consent hook gives no decision until "
              f"{path} names a cockpit, so the agent's own dialog answers (an agent config or hook edit outside "

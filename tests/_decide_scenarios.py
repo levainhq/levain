@@ -80,7 +80,7 @@ def run_all(cc: Any, Decision: Any, ExternalGateRequest: Any, home: Path) -> dic
                     return r, "allowed"
             return None
 
-    away = cc.AdapterSettings(away_mode=True, away_hold_seconds=20)
+    away = cc.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=20)   # a signed mark: holds whatever the record says
     off = cc.AdapterSettings()
     config_write = ("Write", {"file_path": CWD + "/.claude/settings.json", "content": "{}"})
     cases: dict[str, tuple[Any, Any, Any, dict[str, Any]]] = {
