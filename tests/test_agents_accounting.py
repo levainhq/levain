@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import sqlite3
 import threading
 
 import pytest
@@ -20,10 +21,11 @@ class _Exec:
         self.max_exposure_usd_micros = exposure
 
 
-def _admit(conn, n: int) -> dict:
-    row = {"occurrence_id": f"oc-{n}", "agent_id": "ag-1", "kind": "scheduled", "key": f"k{n}", "state": "admitted",
-           "window_key": WINDOW, "spec_hash": "sh", "binding_id": "b", "run_id": f"run-{n}",
-           "admitted_at": "2026-11-02T09:00:00Z"}
+def _admit(conn, n: int, kind: str = "scheduled", window_key: str = WINDOW,
+           admitted_at: str = "2026-11-02T09:00:00Z") -> dict:
+    row = {"occurrence_id": f"oc-{n}", "agent_id": "ag-1", "kind": kind, "key": f"k{n}", "state": "admitted",
+           "window_key": window_key, "spec_hash": "sh", "binding_id": "b", "run_id": f"run-{n}",
+           "admitted_at": admitted_at}
     conn.execute("INSERT INTO agent_occurrences (occurrence_id,agent_id,kind,key,state,window_key,spec_hash,"
                  "binding_id,run_id,admitted_at) VALUES (:occurrence_id,:agent_id,:kind,:key,:state,:window_key,"
                  ":spec_hash,:binding_id,:run_id,:admitted_at)", row)
@@ -95,6 +97,43 @@ def test_an_actual_above_the_reservation_is_debited_in_full_and_pauses_the_agent
         assert conn.execute("SELECT operation FROM agents").fetchone()[0] == "paused"
         assert conn.execute("SELECT debited_usd_micros, settled_reason FROM agent_reservations").fetchone() == \
             (2500, "breach")
+
+
+def test_reserve_refuses_a_connection_with_no_open_transaction_and_writes_nothing(store):
+    with store.write() as conn:
+        row = _admit(conn, 1)
+    conn = sqlite3.connect(store.path, isolation_level=None)    # autocommit: each statement its own transaction
+    try:
+        with pytest.raises(RuntimeError, match="BEGIN IMMEDIATE"):
+            reserve(conn, row, _Exec(1000), limits=LIMITS)
+        assert conn.execute("SELECT COUNT(*) FROM agent_reservations").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_amounts_past_the_sqlite_integer_range_refuse_or_saturate_and_the_window_still_refuses(store):
+    limits = dataclasses.replace(LIMITS, run_ceiling=5)
+    with store.write() as conn:
+        conn.execute("INSERT INTO agents (agent_id,name,current_version,registration,operation,created_at)"
+                     " VALUES ('ag-1','a',1,'registered','active','2026-11-02T08:00:00Z')")
+        rows = [_admit(conn, 1), _admit(conn, 2)]
+        assert reserve(conn, _admit(conn, 3), _Exec(2**63), limits=limits) == Refused("no_exposure")
+        assert [reserve(conn, r, _Exec(1000), limits=limits) for r in rows] == [Reserved(1000)] * 2
+        outs = [settle(conn, r, Usage(2**70, 1, 1, "stub")) for r in rows]    # two breaches past 2**63
+        assert [(o.debited_usd_micros, o.breach) for o in outs] == [(2**63 - 1, True)] * 2
+        assert conn.execute("SELECT operation FROM agents").fetchone()[0] == "paused"
+        assert reserve(conn, _admit(conn, 4), _Exec(1), limits=limits) == Refused("budget_window")
+
+
+def test_a_manual_run_stamped_with_an_offset_counts_at_its_instant(store):
+    # 20:00-05:00 on the 2nd is 01:00Z on the 3rd: inside the 3rd's span although its text sorts before it
+    day3 = Limits(run_ceiling=5, budget_window_usd_micros=10_000, scheduled_window_key=None,
+                  span_start="2026-11-03T00:00:00Z", span_end="2026-11-04T00:00:00Z")
+    with store.write() as conn:
+        first = _admit(conn, 1, "manual", "m:2026-11-03", "2026-11-02T20:00:00-05:00")
+        second = _admit(conn, 2, "manual", "m:2026-11-03", "2026-11-03T02:00:00Z")
+        assert reserve(conn, first, _Exec(9000), limits=day3) == Reserved(9000)
+        assert reserve(conn, second, _Exec(9000), limits=day3) == Refused("budget_window")
 
 
 def test_stop_result_is_frozen_and_a_stub_that_cannot_observe_returns_terminated_false():
