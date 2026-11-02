@@ -202,9 +202,11 @@ def _presence(qdir: Path, now: float | None = None) -> dict[str, Any] | None:
 
     from levain.webpush import presence
 
-    word = presence.read_word(qdir)
     if now is None:
         now = time.time()
+    # The card reports what an agent set, as of ``now`` (a pure function of its inputs): it takes no live laptop-idle
+    # sample (``lambda: None``), so whether his input has since ended an ``away`` is the status line's to say, not the card's.
+    word = presence.read_word(qdir, now, idle=lambda: None)
     setter = word if word is not None and "by" in word and not presence.is_expired(word, now) else None
     cutoff = now - PRESENCE_WINDOW_SECS
     recent = [r for r in presence.read_log(qdir) if r["ts"] >= cutoff and isinstance(r.get("by"), dict)]
