@@ -85,3 +85,20 @@ def test_a_refused_write_leaves_every_surface_on_the_line_it_had(rig, capsys):
         st, got, _ = _call(port, "POST", "/webpush/presence/set", {"devices": "follow", "follow_after": 5}, token=T)
         assert st == 422 and "message" in got
         assert _same_everywhere(capsys, port, q) == before
+
+
+def test_the_lets_through_words_are_the_same_string_in_every_surface(rig, capsys):
+    """Phill 11-02: each level's visible words name what it includes, identically in describe_line, ``levain ping status`` and the
+    presence sheet's JS table (PR_LETS); the record keys stay everything|needs|approvals|nothing."""
+    import re
+    from pathlib import Path
+
+    src, q = rig
+    js = (Path(intent.__file__).resolve().parent.parent / "templates" / "web" / "devices_panel.js").read_text()
+    sheet = dict(re.findall(r'\["(everything|needs|approvals|nothing)", "([^"]+)"\]', js.split("const PR_LETS", 1)[1].split(";", 1)[0]))
+    assert sheet == intent._LETS_WORDS == {"everything": "Everything", "needs": "Approvals and needs",
+                                           "approvals": "Approvals only", "nothing": "Nothing"}
+    for key, words in intent._LETS_WORDS.items():
+        rc, printed = _cli(capsys, q, "lets", key, "--for", "1h")
+        assert rc == 0, printed
+        assert f"Lets through: {words}." in printed == _status(capsys, q) == intent.describe_line(q, idle=lambda: IDLE), key

@@ -2973,6 +2973,9 @@ body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
 .pr-sheet { --pr-w: 380px; position: fixed; z-index: 40; top: var(--pr-top, 64px); left: var(--pr-left, 8px); width: min(var(--pr-w), calc(100vw - 16px)); box-sizing: border-box;
   padding: var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-lg); box-shadow: 0 12px 32px color-mix(in oklch, var(--base) 60%, transparent); max-height: calc(100dvh - var(--pr-top, 64px) - 8px); overflow-y: auto; overscroll-behavior: contain; }
 .pr-sheet[hidden] { display: none; }
+.sheet-grabber { display: none; touch-action: none; }
+@media (max-width: 720px) { .sheet-grabber { display: block; box-sizing: content-box; width: 40px; height: 5px; border-radius: 3px; background: var(--dim); opacity: .55; margin: calc(var(--sp-4) * -1) auto 0; padding: var(--sp-3) 0; background-clip: content-box; } }
+.modal-head { touch-action: none; }
 @media (max-width: 1100px) { .pr-sheet { --pr-w: 420px; } }   /* iPad: the same popover, wider */
 /* the sentence: the server's words, verbatim, in a quiet mono panel (it is the line the terminal prints) */
 .pr-sheet-text { margin: 0 0 var(--sp-4); padding: var(--sp-3) var(--sp-4); background: var(--card-2); border-radius: var(--r-md); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono, ui-monospace, Menlo, monospace); overflow-wrap: anywhere; user-select: text; }

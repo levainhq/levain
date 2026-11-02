@@ -862,11 +862,13 @@ class Abstained:
     gate's allow was taken but the request it names could not be read, twice (``take_unread``, nothing filed,
     ``request`` ``None``, ``why`` the take's request id), or the hold ended without one (``hold_expired``: a zero hold,
     a timeout, away mode ending, a lost withdraw race; ``request`` the filed request, ``why`` ``""``). Each becomes
-    the operator's own question."""
+    the operator's own question. ``held`` is whether an away hold started for it (a hold above zero: the request
+    was routed to his devices for a signed answer); a hook caller sends a prompt notice only when it is false."""
     call: CoreCall
     reason: Literal["no_decider", "hold_expired", "take_unread"]
     request: ExternalGateRequest | None
     why: str
+    held: bool = False
 
 
 @dataclass(frozen=True)
@@ -895,11 +897,32 @@ CoreResult = Decided | Abstained | Declined
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, environ: Mapping[str, str], home: Path,
            claude_pid: int | None = None, **kw: Any) -> dict[str, Any] | None:
     """The hook's output for one event, or ``None`` for no decision: :func:`hook_output` of a :class:`Decided`
-    result of :func:`decide_ex` (called with ``launch_nonce=""`` and ``contained_launch=None``), else ``None``.
-    Raises what :func:`decide_ex` raises; the caller (:func:`main`) turns that into no decision."""
+    result of :func:`decide_ex` (called with ``launch_nonce=""`` and ``contained_launch=None``), else ``None``. An
+    :class:`Abstained` result with no away hold (``held`` false) also sends one :func:`prompt_notice`: the dialog asks,
+    and his devices hear that it waits. Raises what :func:`decide_ex` raises; the caller (:func:`main`) turns that
+    into no decision."""
     out = decide_ex(event, queue, settings, environ=environ, home=home, claude_pid=claude_pid, launch_nonce="",
                     contained_launch=None, **kw)
-    return hook_output(out.decision) if isinstance(out, Decided) else None
+    if isinstance(out, Decided):
+        return hook_output(out.decision)
+    if isinstance(out, Abstained) and not out.held:
+        # the agent's own dialog asks and no away hold routed the request to his devices: one notice that it waits
+        # (Phill 11-02, np-e642162b (a); :func:`prompt_notice`, which never raises)
+        try:
+            c = out.call
+            tool_input = event.get("tool_input") if isinstance(event, Mapping) else None
+            prompt_notice(queue.directory, AGENT, _notice_what(c.tool_name, tool_input),
+                          prompt_ref(out.request.id if out.request is not None else None), idle=kw.get("idle"))
+        except Exception:  # noqa: BLE001 - a notice never changes the hook's answer
+            pass
+    return None
+
+
+def _notice_what(tool_name: str, tool_input: Any) -> str:
+    try:
+        return _what(tool_name, {} if tool_input is None else tool_input)
+    except Exception:  # noqa: BLE001 - the notice names the tool at least
+        return tool_name
 
 
 def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, environ: Mapping[str, str], home: Path,
@@ -1041,7 +1064,8 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
             # R8-6: levain allowed this row by a contained-shell grant, and this call's proof (or none) cannot take
             # delivery of it: a deny with its own cause, never a card for a row levain already allowed
             return Declined(call, "contained_delivery_refused")
-        return Decided(call, request, got) if got is not None else Abstained(call, "hold_expired", request, "")
+        return Decided(call, request, got) if got is not None else Abstained(call, "hold_expired", request, "",
+                                                                             held=hold > 0)
     finally:
         if not settled:
             # An exception between file() and the withdraw: withdraw now so no ghost request stays answerable
@@ -1356,6 +1380,42 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
         except Exception:  # noqa: BLE001 - a failed ping never fails the gate
             pushed = False
     return started or pushed
+
+
+def prompt_ref(request_id: str | None) -> str:
+    """The ref a prompt notice is recorded under: ``request:<id>`` when the hook filed a request for the call, else
+    ``prompt:<random>``, minted for this one hook call. Never a digest of the call: Claude Code's PermissionRequest
+    carries no ``tool_use_id``, so the same command asked again later would share a digest and its notice would be
+    taken for a repeat. One ref per prompt either way."""
+    if request_id:
+        return f"request:{request_id}"
+    import uuid
+
+    return f"prompt:{uuid.uuid4().hex}"
+
+
+def prompt_notice(queue_dir: Path | str | None, agent: str, what: str, ref: str, *,
+                  idle: Callable[[], float | None] | None = None) -> bool:
+    """Phill 11-02 (np-e642162b (a)): *"yes we DO want these to be able to find us ASAP"*. A PermissionRequest the hook
+    left to the agent's own dialog with NO away hold (he is at the laptop, or nothing can sign) sends ONE notice to
+    his paired devices that the prompt waits, whatever the desk is doing, when the presence record lets approvals
+    through (:func:`levain.webpush.intent.approval_notice`; a mute says nothing). The dialog stays: nothing is held,
+    and :func:`levain.webpush.intent.approvals_to_devices` (the hold's question) is not read. Through the one sender
+    (:func:`levain.webpush.sender.spawn`, kind ``consent``, an approval-class kind), never the notify command. Said once
+    per ``ref`` (:func:`levain.webpush.pinged`), so a prompt whose request the hold path already pinged is not pinged
+    again. True when the push started. Never raises: any fault says nothing."""
+    try:
+        from levain.webpush import intent, live, pinged, sender
+
+        if queue_dir is None or not live(queue_dir) or pinged(queue_dir, ref):
+            return False
+        send, _why = intent.approval_notice(queue_dir, idle=idle)
+        if not send:
+            return False
+        return sender.spawn(queue_dir, kind="consent", ref=ref, title="levain",
+                            body=f"{agent} asks in its own dialog: {what}", url="/?view=needs", push=True)
+    except Exception:  # noqa: BLE001 - a notice never fails the hook
+        return False
 
 
 def _notify_argv(settings: AdapterSettings, message: str, *, cwd: Path | str | None) -> bool:

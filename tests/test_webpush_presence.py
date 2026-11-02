@@ -62,10 +62,13 @@ def test_no_activity_source_reads_inactive():
     assert d.push is True and d.why == "follow: no laptop input reading"
 
 
-def test_an_approval_at_an_active_laptop_is_the_agents_own_dialog_not_a_phone_push():
-    """The retired 'urgent always pushes' override (FOR PHILL 4a): at the laptop under follow, the dialog is right there."""
-    assert decide(_rec(), ACTIVE, "approval").push is False
-    assert decide(_rec(), ACTIVE, "attention").push is False
+def test_an_approval_at_an_active_laptop_stays_in_the_agents_dialog_and_its_notice_still_goes():
+    """Phill 11-02 (np-e642162b (a)): *"yes we DO want these to be able to find us ASAP"*. At the laptop under follow the
+    record still does not route an approval to the devices for a signed answer (the hold's question: the agent's own
+    dialog asks), but the NOTICE that a prompt waits goes whatever the desk is doing (adapter wiring below); an
+    attention item pushes at an active desk too (1b)."""
+    assert decide(_rec(), ACTIVE, "approval").push is False          # the hold's decision, unchanged
+    assert decide(_rec(), ACTIVE, "attention").push is True
     assert decide(_rec(), INACTIVE, "approval").push is True
 
 
@@ -291,6 +294,120 @@ def test_wiring_quiet_and_sleep_both_let_a_consent_through(tmp_path, monkeypatch
     assert [c["push"] for c in calls] == [True, True]
 
 
+# --- the prompt notice: an approval left to the agent's own dialog (Phill 11-02, np-e642162b (a)) -----------------------
+
+def _consent_queue(tmp_path):
+    from levain.consent.queue import ConsentQueue, authority_source
+    from tests._h4 import h4_home
+
+    q = tmp_path / "consent"
+    q.mkdir(mode=0o700)
+    return ConsentQueue(q, authority=authority_source(q, anchor=None), home=h4_home())
+
+
+def _pr_event(**extra):
+    return {"session_id": "s-notice", "transcript_path": "/x.jsonl", "cwd": "/work/proj", "permission_mode": "default",
+            "hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "touch x"}, **extra}
+
+
+def _cc_decide(q, settings=None, **kw):
+    from tests._h4 import h4_env, h4_home
+
+    return claude_code.decide(_pr_event(), q, settings or claude_code.AdapterSettings(), environ=h4_env(),
+                              home=h4_home(), **kw)
+
+
+@pytest.mark.parametrize("decider", ["nothing can decide", "a zero hold ran out"])
+def test_an_approval_prompt_at_an_active_laptop_pings_the_devices_once_and_starts_no_hold(tmp_path, monkeypatch, decider):
+    """THE REPRODUCTION (fails on 8dc7ce30: no push at all). Him active at the laptop, a phone paired: Claude Code's own
+    dialog asks (no decision), ONE notice push goes to the devices, and no consent hold starts."""
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    if decider == "a zero hold ran out":
+        monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)
+    assert intent.approvals_to_devices(q.directory, idle=lambda: ACTIVE)[0] is False   # the hold's question: unchanged
+    assert _cc_decide(q) is None                                                       # the agent's own dialog asks
+    assert [(c["kind"], c["push"], c["url"]) for c in calls] == [("consent", True, "/?view=needs")]
+    assert calls[0]["body"].startswith("claude_code asks in its own dialog: ")
+    assert q.pending() == []                                                           # nothing held
+    if decider == "a zero hold ran out":
+        assert calls[0]["ref"].startswith("request:")
+        assert q.get(calls[0]["ref"].split(":", 1)[1])[1] == "withdrawn"               # left to the dialog at once
+    else:
+        assert calls[0]["ref"].startswith("prompt:")
+
+
+def test_the_same_command_asked_again_is_a_new_prompt_and_pings_again(tmp_path, monkeypatch):
+    """Claude Code's PermissionRequest carries no tool_use_id: a second ask of the same command, its first ping on
+    record, is still a new prompt (its ref is minted per hook call, never a digest of the call)."""
+    from levain.webpush.store import PushStore
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    assert _cc_decide(q) is None
+    PushStore(q.directory).add_ping("consent", calls[0]["ref"], "levain", "x")   # what the spawned child records
+    assert _cc_decide(q) is None
+    assert len(calls) == 2 and calls[0]["ref"] != calls[1]["ref"]
+
+
+def test_a_prompt_notice_is_said_once_per_ref_and_never_under_a_mute(tmp_path, monkeypatch):
+    from levain.webpush.store import PushStore
+
+    qdir = tmp_path / "q"
+    qdir.mkdir()
+    _phone(qdir)
+    calls = _spy(monkeypatch, ACTIVE)
+    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "request:r9") is True
+    PushStore(qdir).add_ping("consent", "request:r9", "levain", "x")   # what the spawned child records
+    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "request:r9") is False
+    intent.apply_settings(qdir, lets_through="nothing", idle=lambda: ACTIVE)
+    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "request:r10") is False
+    intent.apply_settings(qdir, lets_through="approvals", idle=lambda: ACTIVE)
+    assert claude_code.prompt_notice(qdir, "claude_code", "Bash: touch x", "request:r10") is True
+    assert [c["ref"] for c in calls] == ["request:r9", "request:r10"]
+
+
+def test_a_prompt_notice_needs_a_phone_and_a_fault_says_nothing(tmp_path, monkeypatch):
+    qdir = tmp_path / "q"
+    qdir.mkdir()
+    calls = _spy(monkeypatch, ACTIVE)
+    assert claude_code.prompt_notice(qdir, "claude_code", "x", "request:r1") is False     # no phone paired
+    _phone(qdir)
+
+    def boom(*a, **kw):
+        raise RuntimeError("sender")
+    monkeypatch.setattr(sender, "spawn", boom)
+    assert claude_code.prompt_notice(qdir, "claude_code", "x", "request:r1") is False
+    assert calls == []
+
+
+def test_an_away_hold_pings_through_the_hold_path_and_sends_no_notice(tmp_path, monkeypatch):
+    """When an away hold routed the request to his devices (the hold path's own ping), the dialog that asks after it
+    gets no second notice."""
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)
+    away = claude_code.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=0.3)
+    assert _cc_decide(q, away, max_hold=0.3 + claude_code.CLEANUP_RESERVE) is None
+    assert calls == []
+
+
+def test_codex_dialog_at_an_active_laptop_pings_the_devices_once(tmp_path, monkeypatch):
+    from levain.consent.adapters import codex
+    from tests._h4 import h4_env, h4_home
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    e = {**_pr_event(), "session_id": "s-codex"}
+    assert codex.decide(e, q, codex.AdapterSettings(), environ=h4_env(), home=h4_home()) is None
+    assert [(c["kind"], c["push"]) for c in calls] == [("consent", True)]
+    assert calls[0]["body"].startswith("codex asks in its own dialog: ")
+
+
 # --- the CLI words ----------------------------------------------------------------------------------------------------
 
 def _cli(tmp_path, *argv):
@@ -308,7 +425,7 @@ def test_cli_words_write_the_record_and_status_prints_the_one_line(tmp_path, cap
     monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: ACTIVE)
     assert _cli(tmp_path, "quiet", "20m") == 0
     assert presence.read_word(tmp_path)["word"] == "quiet"
-    assert "your devices, needs only (quiet)" in capsys.readouterr().out
+    assert "your devices, Approvals and needs (quiet)" in capsys.readouterr().out
     assert _cli(tmp_path, "loud", "5") == 0
     assert "your devices (loud)" in capsys.readouterr().out
     assert _cli(tmp_path, "loud", "off") == 0

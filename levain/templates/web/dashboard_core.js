@@ -5654,6 +5654,101 @@
       dropReload();      // a drop the sheet filed or could not confirm (either may have made the store): the drop card reads again, not from its cache
     }
   });
+  // One drag-down-to-dismiss for every cockpit sheet (touch). It is delegated and attribute-driven, so a sheet needs no wiring of
+  // its own: any [role="dialog"] that is a `.modal-overlay` (the panel is its `.modal` child) or carries `data-sheet-dismiss`
+  // (the panel is the dialog itself; the value, when it is a media query, limits the gesture to it, for a popover that is a
+  // sheet only on a phone) takes it. A drag that starts on the header (`.modal-head`, `.sheet-grabber`), or anywhere on the
+  // sheet while nothing under the finger is scrolled down, moves the panel; past a distance or a speed it DISMISSES, a short one
+  // springs back. Dismissing is the sheet's own close path, never a second one: a `levain:sheet-dismiss` event the sheet may
+  // handle (preventDefault says it did), else a click on its `.modal-close` X, so a guard on the X (the sign sheet's ask) holds.
+  // A sheet still on screen after a dismiss (the guard kept it) springs back. The X and Escape are untouched.
+  const SHEET_FAR = 96, SHEET_FRAC = 0.25, SHEET_SPEED = 0.6, SHEET_SLOP = 8;
+  function sheetTarget(t) {
+    const dlg = t && t.closest ? t.closest('[role="dialog"]') : null;
+    if (!dlg) return null;
+    const own = dlg.getAttribute("data-sheet-dismiss");
+    if (own === null && !dlg.classList.contains("modal-overlay")) return null;
+    if (own && own !== "true" && own !== "" && window.matchMedia && !window.matchMedia(own).matches) return null;
+    const panel = own !== null ? dlg : (dlg.querySelector(":scope > .modal") || dlg);
+    return { dlg, panel };
+  }
+  // a scrolled-down scroller between the finger and the panel owns the gesture (the body scrolls back up first)
+  function sheetScrolledDown(node, panel) {
+    for (let n = node; n && n.nodeType === 1; n = n.parentElement) {
+      if (n.scrollHeight > n.clientHeight + 1 && n.scrollTop > 0) {
+        const oy = getComputedStyle(n).overflowY;
+        if (oy === "auto" || oy === "scroll") return true;
+      }
+      if (n === panel) break;
+    }
+    return false;
+  }
+  function sheetDismiss(dlg) {
+    const ev = new CustomEvent("levain:sheet-dismiss", { bubbles: false, cancelable: true });
+    dlg.dispatchEvent(ev);
+    if (ev.defaultPrevented) return;
+    const x = dlg.querySelector(".modal-close");
+    if (x) x.click();
+  }
+  function sheetDragInit() {
+    if (typeof document === "undefined" || typeof document.addEventListener !== "function" || typeof CustomEvent === "undefined") return;
+    let g = null;
+    const reduce = () => !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    const settle = (panel) => {
+      panel.style.transition = reduce() ? "none" : "transform 160ms ease-out";
+      panel.style.transform = "";
+      if (!reduce()) setTimeout(() => { panel.style.transition = ""; }, 200);
+      else panel.style.transition = "";
+    };
+    document.addEventListener("touchstart", (e) => {
+      g = null;
+      if (e.touches.length !== 1) return;
+      const tgt = sheetTarget(e.target);
+      if (!tgt) return;
+      const t0 = e.target;
+      if (t0.closest && t0.closest("input, textarea, select, [contenteditable]")) return;
+      const handle = !!(t0.closest && t0.closest(".modal-head, .sheet-grabber"));
+      if (!handle && sheetScrolledDown(t0, tgt.panel)) return;
+      const t = e.touches[0];
+      g = { dlg: tgt.dlg, panel: tgt.panel, x: t.clientX, y: t.clientY, at: Date.now(), dy: 0, live: false, v: 0, ly: t.clientY, lt: Date.now() };
+    }, { passive: true });
+    document.addEventListener("touchmove", (e) => {
+      if (!g || e.touches.length !== 1) return;
+      const t = e.touches[0], dy = t.clientY - g.y, dx = t.clientX - g.x;
+      if (!g.live) {
+        if (Math.abs(dy) < SHEET_SLOP && Math.abs(dx) < SHEET_SLOP) return;
+        if (dy <= 0 || Math.abs(dx) > Math.abs(dy)) { g = null; return; }   // up, or sideways: the page's own gesture
+        g.live = true;
+        g.panel.style.transition = "none";
+        g.panel.style.animation = "none";    // the modal's rise animation holds its end state and would override the drag
+      }
+      const now = Date.now();
+      if (now > g.lt) g.v = (t.clientY - g.ly) / (now - g.lt);
+      g.ly = t.clientY; g.lt = now; g.dy = Math.max(0, dy);
+      g.panel.style.transform = "translateY(" + g.dy + "px)";
+      if (e.cancelable) e.preventDefault();
+    }, { passive: false });
+    const end = (cancel) => (e) => {
+      const d = g;
+      g = null;
+      if (!d || !d.live) return;
+      const far = d.dy > Math.max(SHEET_FAR, d.panel.getBoundingClientRect().height * SHEET_FRAC);
+      if (!cancel && (far || (d.v > SHEET_SPEED && d.dy > 24))) {
+        sheetDismiss(d.dlg);
+        if (d.dlg.hidden) { d.panel.style.transition = ""; d.panel.style.transform = ""; d.panel.style.animation = ""; return; }   // closed by hiding: it reopens in place, with its entrance animation back (a spring-back keeps animation:none: clearing it on an open sheet would replay the rise)
+        // a sheet that is still up (its guard kept it) is given back where it was
+        setTimeout(() => {
+          if (!d.panel.isConnected) return;
+          if (d.dlg.hidden) { d.panel.style.transition = ""; d.panel.style.transform = ""; d.panel.style.animation = ""; } else settle(d.panel);   // a hidden sheet reopens in place
+        }, 250);
+      } else settle(d.panel);
+    };
+    document.addEventListener("touchend", end(false), { passive: true });
+    document.addEventListener("touchcancel", end(true), { passive: true });
+  }
+  sheetDragInit();
+  window.LevainSheetDismiss = { target: sheetTarget };
+
   window.LevainSignSheet = { open: openSignSheet, openConsent: openConsentSheet, openDispatch: openDispatchSheet, openDrop: openDropSheet, close: closeSignSheet };
 
   // A signed verb's send (ActionVerb.sign): the server's compose_signer files a sign request for exactly these params, the

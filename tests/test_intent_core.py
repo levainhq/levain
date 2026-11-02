@@ -111,7 +111,7 @@ def test_sleep_lets_approvals_and_high_priority_through_and_mutes_the_rest(tmp_p
     for kind in ("notify", "question"):
         got = _push(q, kind, 5.0)
         assert (got.push, got.state, got.by) == (False, "muted", "sleep"), kind
-    assert _push(q, "notify", 5.0).why == "sleep: lets through needs only"
+    assert _push(q, "notify", 5.0).why == "sleep: lets through Approvals and needs"
 
 
 def test_migration_maps_a_word_and_a_route_to_one_record_is_idempotent_and_undoes_byte_identical(tmp_path):
@@ -205,3 +205,24 @@ def test_a_tap_alias_never_writes_the_base_nor_replaces_a_standing_preset(tmp_pa
         assert _file(q) == before
     presence.set_word(q, "desk", now=NOW + 2)    # the operator's own path: unchanged, the base
     assert _doc(q)["base"]["devices"] == "follow" and _doc(q)["overlay"] is None
+
+
+def test_an_attention_item_pushes_while_he_is_active_at_the_laptop_and_when_devices_are_off_but_never_through_a_mute(tmp_path):
+    """Phill 10-27: an attention row "will get picked up in the band here in the terminal, go to cockpit, and ping my phone even
+    when pings are not otherwise on"; the class is attention, dated and notify_urgent (presence.KIND_CLASSES). Under follow at
+    an active laptop, 1b held every class until the hold ceiling (flow 4, 11-02): every state below must push an attention kind
+    and still hold approvals and other pings as the record says."""
+    q = tmp_path
+    attention = ("attention", "dated", "notify_urgent")
+    for kind in attention:
+        assert _push(q, kind, 5.0).push is True, kind                      # follow, input 5 s ago: the desk is active
+    assert _push(q, "notify", 5.0).push is False                           # other: held as before
+    assert _push(q, "consent", 5.0).push is False                          # approvals follow the record (the design question is the operator's)
+    intent.apply_settings(q, devices="off", now=NOW, idle=_idle(5.0))      # pings off
+    for kind in attention:
+        assert _push(q, kind, 5.0).push is True, kind
+    assert _push(q, "notify", 5.0).push is False and _push(q, "consent", 5.0).push is False
+    intent.apply_settings(q, devices="follow", lets_through="approvals", now=NOW, idle=_idle(5.0))   # a mute for attention: stays muted
+    for kind in attention:
+        got = _push(q, kind, 5.0)
+        assert (got.push, got.state) == (False, "muted"), kind

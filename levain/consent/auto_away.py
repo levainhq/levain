@@ -172,9 +172,12 @@ def approvals_note(queue_dir: Path | str | None, *, to_devices: bool | None = No
 
         qdir = Path(queue_dir)
         marked = unsignable = unmarked = False
-        for agent in DEFAULT_HOLDS:
-            if not (qdir / away_mod.AGENTS[agent]).exists() and not (qdir / claude_code.DB_NAME).exists():
-                continue
+        # An agent counts when it has its own settings file: the store (queue.db) is shared by every agent, so it cannot say
+        # which one is set up. With the store and no settings file at all, claude_code is the one counted, as before.
+        counted = [a for a in DEFAULT_HOLDS if (qdir / away_mod.AGENTS[a]).exists()]
+        if not counted and (qdir / claude_code.DB_NAME).exists():
+            counted = ["claude_code"]
+        for agent in counted:
             st = away_mod.settings(qdir, agent)
             if getattr(st, "away_unreadable", ""):
                 continue

@@ -385,11 +385,12 @@ def test_quiet_and_the_open_desk(tmp_path):
     quiet = _rec("quiet", "needs", {"kind": "timer", "at": NOW + 600})
     assert notify.notify_decision("normal", NOW, quiet, 1000.0) == "held"
     assert notify.notify_decision("urgent", NOW, quiet, 1000.0) == "pushed"      # quiet lets attention through
-    # no overlay: an ordinary notice follows the laptop (active holds, ten idle minutes pushes); an urgent one is the same
-    # (the retired 'urgent always pushes' override: at the laptop the band is right there)
+    # no overlay: an ordinary notice follows the laptop (active holds, ten idle minutes pushes); an urgent one is an attention
+    # item and pushes whatever the desk is doing (Phill 10-27: it pings his phone "even when pings are not otherwise on"); only
+    # a mute (lets_through) holds it, as the sleep/nothing case below shows
     assert notify.notify_decision("normal", NOW, _rec(), 5.0) == "held"
     assert notify.notify_decision("normal", NOW, _rec(), 99999.0) == "pushed"
-    assert notify.notify_decision("urgent", NOW, _rec(), 5.0) == "held"
+    assert notify.notify_decision("urgent", NOW, _rec(), 5.0) == "pushed"
     loud = _rec("loud", "everything", {"kind": "timer", "at": NOW + 600})
     assert notify.notify_decision("normal", NOW, loud, 5.0) == "pushed"
     assert notify.notify_decision("low", NOW, loud, 5.0) == "recorded"
