@@ -51,8 +51,7 @@ def register(subparsers) -> None:
                                  "Mac (read from the Mac's input idle time); one summary and the held pings follow."),
                        ("loud", "Push every ping for a while (default 60 min), over everything else; `loud off` ends it."),
                        ("away", "Push at once until you next type here (optional override)."),
-                       ("remote", "Push for a while (default 60 min) whatever the desk shows (optional override)."),
-                       ("back", "Clear away, remote, quiet or sleep; a standing loud is left (`loud off`).")):
+                       ("back", "Clear away, quiet or sleep; a standing loud is left (`loud off`).")):
         w = common(sub.add_parser(word, help=text))
         if word in presence.TIMED:
             w.add_argument("duration", nargs="?", default=None,
@@ -154,7 +153,7 @@ def _word(args: argparse.Namespace) -> int:
     except presence.PresenceError as e:
         print(f"levain ping {args.word}: {e}")
         return 2
-    try:   # a word can make held pings due (loud, away, remote, back, a quiet ended): start their push now
+    try:   # a word can make held pings due (loud, away, back, a quiet ended): start their push now
         from levain.webpush import held
 
         held.flush_if_due(qdir, throttle=False)

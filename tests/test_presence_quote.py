@@ -81,7 +81,7 @@ def test_codex_turns_are_read_in_both_rollout_formats_and_an_injected_user_item_
 
 
 @pytest.mark.parametrize("his_word,setter_word,role", [("quiet", "away", "seat"), ("away", "sleep", "coordinator"),
-                                                       ("sleep", "remote", "seat")])
+                                                       ("sleep", "quiet", "coordinator")])
 def test_an_invented_quote_never_replaces_a_word_he_set_himself(tmp_path, his_word, setter_word, role):
     set_word(tmp_path, his_word, now=NOW - 3000)
     on_file = (tmp_path / "webpush" / presence.FILE_NAME).read_text()
@@ -102,7 +102,7 @@ def test_a_real_quote_replaces_his_word_only_if_he_typed_it_after_that_word(tmp_
     from levain.coordinator import first_reader
     monkeypatch.setattr(first_reader, "is_coordinator_session", lambda directory, sess: False)
 
-    def run(word="remote", said="I am on the train"):
+    def run(word="away", said="I am on the train"):
         return cli._word(argparse.Namespace(queue_dir=tmp_path, word=word, duration=None, said=said, drop=None))
 
     set_word(tmp_path, "sleep", now=NOW - 600)   # his word, newer than the sentence he typed to the seat
@@ -111,7 +111,7 @@ def test_a_real_quote_replaces_his_word_only_if_he_typed_it_after_that_word(tmp_
     set_word(tmp_path, "sleep", now=NOW - 1800)   # his word, older than the sentence
     assert run() == 0
     rec = read_word(tmp_path)
-    assert rec["word"] == "remote" and rec["verified"] is True
+    assert rec["word"] == "away" and rec["verified"] is True
     set_word(tmp_path, "sleep", now=NOW - 1800)
     row = [r for r in read_log(tmp_path) if r["outcome"] == "set" and r.get("by")][-1]
     assert row["verified"] is True and abs(row["said_at"] - (NOW - 1200)) < 1
@@ -123,8 +123,8 @@ def test_with_no_transcript_a_setter_is_unverified_but_sets_over_no_word_or_a_re
     rec = set_word(tmp_path, "away", by=SEAT, said="heading out now", now=NOW - 100, match=no)
     assert rec["verified"] is False and describe(tmp_path, idle=lambda: 10.0).endswith("heading out now (unverified)")
     assert read_log(tmp_path)[-1]["why"].startswith("unverified: no transcript")
-    assert set_word(tmp_path, "remote", duration="30m", by=SEAT, said="on the train", now=NOW, match=no)["word"] == "remote"
-    assert set_word(tmp_path, "away", by={**SEAT, "session": "other-seat-1"}, said="heading out", now=NOW + 1)["word"] == "away"
+    assert set_word(tmp_path, "away", by=SEAT, said="on the train", now=NOW + 1, match=no)["word"] == "away"
+    assert set_word(tmp_path, "away", by={**SEAT, "session": "other-seat-1"}, said="heading out", now=NOW + 2)["word"] == "away"
 
 
 def test_a_coordinator_proves_its_quote_with_the_drop_it_names_and_a_seat_may_not(tmp_path, monkeypatch, capsys):

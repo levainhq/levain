@@ -58,7 +58,7 @@ def test_an_untimed_word_is_set_and_read_back(rig, word):
         assert T not in (q / "webpush" / presence.LOG_NAME).read_text()
 
 
-@pytest.mark.parametrize("word", ["quiet", "remote", "loud"])
+@pytest.mark.parametrize("word", ["quiet", "loud"])
 def test_a_timed_word_takes_a_duration_and_names_its_end(rig, word):
     src, q = rig
     with _signed(src, q) as (port, _):
@@ -168,7 +168,7 @@ def test_a_tap_token_is_minted_once_and_stored_only_as_a_hash(rig):
     src, q = rig
     with _signed(src, q) as (port, _):
         tok, got = _mint(port)
-        assert got["record"]["name"] == "door" and got["record"]["words"] == ["away", "back", "quiet", "remote", "desk", "devices"]
+        assert got["record"]["name"] == "door" and got["record"]["words"] == ["away", "back", "quiet", "desk", "devices"]
         assert "sha256" not in json.dumps(got)
         f = q / "webpush" / presence_tokens.FILE_NAME
         assert (f.stat().st_mode & 0o777) == 0o600
@@ -203,7 +203,7 @@ def test_the_allow_list_is_enforced_and_names_the_allowed_words(rig):
         tok, _ = _mint(port)
         for w in ("sleep", "loud"):
             st, got, _ = _call(port, "POST", SET, {"word": w}, headers=_tap(tok))
-            assert st == 403 and "away, back, quiet, remote, desk, devices" in got["message"], got
+            assert st == 403 and "away, back, quiet, desk, devices" in got["message"], got
         assert presence.read_word(q) is None
         wide, _ = _mint(port, "bed", ["sleep", "loud"])
         assert _call(port, "POST", SET, {"word": "sleep"}, headers=_tap(wide))[0] == 200
@@ -374,7 +374,7 @@ def test_the_chip_reads_the_word_and_none_and_the_sheet_posts_each_body(rig, tmp
             _opened(),
             {"eval": "document.getElementById('pr-sheet').contains(document.activeElement)"},
             {"do": "document.querySelector('.pr-dur[data-for=\"2h\"]').click(); document.querySelector('.pr-sheet-word[data-word=\"quiet\"]').click()",
-             "until": f"{_CHIP_TEXT}.startsWith('Quiet \\u00b7 ')", "ms": 8000},
+             "until": f"{_CHIP_TEXT}.startsWith('Quiet \\u00b7 ') && document.getElementById('pr-sheet').hidden", "ms": 8000},   # the sheet closes after the follow-up read, not with the paint
             {"eval": _CHIP_TEXT},
             {"eval": f"[document.getElementById('pr-sheet').hidden, document.activeElement===({_CHIP}), localStorage.getItem('levain_presence_for')]"},
             _opened(),
@@ -392,8 +392,8 @@ def test_the_chip_reads_the_word_and_none_and_the_sheet_posts_each_body(rig, tmp
             {"do": "document.body.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}))", "until": "document.getElementById('pr-sheet').hidden", "ms": 4000},
         ])
     v = out["values"]
-    assert v[1] == "Here"
-    assert v[2] == ["Here", "Away", "Quiet", "Sleep", "Loud", "Remote"]
+    assert v[1].startswith("Holding")                                      # no word: the chip shows what the rule does (the desk is active)
+    assert v[2] == ["Here", "Away", "Quiet", "Sleep", "Loud"]
     assert v[4] is True                                                    # focus moved into the sheet
     assert v[6].startswith("Quiet · ") and v[6].endswith(("m", "h"))
     assert v[7] == [True, True, "2h"]                                      # closed after the write, focus back, the pick remembered
@@ -443,7 +443,7 @@ def test_the_link_reveals_the_settings_and_a_tap_token_is_made_shown_once_and_re
     assert v[1] == "Presence & notification settings"
     assert v[5][0] == "presence-settings" and v[5][1] is True
     assert v[7] >= 40                                                       # the token was shown
-    assert v[10][0] is True and "away, back, quiet, remote, desk, devices" in v[10][1]
+    assert v[10][0] is True and "away, back, quiet, desk, devices" in v[10][1]
     assert presence_tokens.list_public(q) == []
 
 
@@ -461,7 +461,7 @@ def test_the_view_carries_the_route_and_a_route_word_leaves_the_presence_word(ri
         assert st == 200 and got["route"] == "devices" and got["route_source"] == "operator" and got["word"] == "quiet"
         assert abs(got["route_until"] - (t0 + 7200)) < 30
         assert _call(port, "POST", SET, {"word": "desk"}, token=T)[1]["route"] == "desk"
-        assert _call(port, "POST", SET, {"word": "remote"}, token=T)[1]["route"] == "devices"
+        assert _call(port, "POST", SET, {"word": "devices"}, token=T)[1]["route"] == "devices"
         assert route.read_route(q)[0] == "devices"
         assert _call(port, "POST", SET, {"word": "back"}, token=T)[1]["route"] == "desk"
 
@@ -516,9 +516,93 @@ def test_a_route_set_flushes_held_pings_outside_the_lock_and_without_the_spawn_g
     calls = []
     monkeypatch.setattr(held, "flush_if_due", lambda queue, *, throttle=True: calls.append((queue, throttle)) or False)
     with _signed(src, q) as (port, _):
-        for word in ("devices", "desk", "remote", "back"):
+        for word in ("devices", "desk", "back"):
             assert _call(port, "POST", SET, {"word": word}, token=T)[0] == 200
         # desk holds, so it flushes nothing; each devices-bound set flushes once (not twice)
-        assert len(calls) == 3 and all(t is False for _, t in calls)
+        assert len(calls) == 2 and all(t is False for _, t in calls)
         _call(port, "POST", SET, {"word": "away"}, token=T)
-        assert len(calls) == 3
+        assert len(calls) == 2
+
+
+# ---- P1: the `remote` word is gone, and the view and the chip carry the EFFECTIVE state -----------------------------
+
+def test_the_remote_word_is_refused_with_a_message_and_a_token_that_lists_it_fails_closed(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        st, got, _ = _call(port, "POST", SET, {"word": "remote"}, token=T)
+        assert st == 422 and "`remote` word was dropped" in got["message"] and presence.read_word(q) is None
+        # a token minted before the drop still names `remote` in its list: it stays a token, the word is refused
+        tok, _ = _mint(port)
+        f = q / "webpush" / presence_tokens.FILE_NAME
+        doc = json.loads(f.read_text())
+        doc["tokens"][0]["words"] = ["away", "remote"]
+        f.write_text(json.dumps(doc))
+        st, got, _ = _call(port, "POST", SET, {"word": "remote"}, headers=_tap(tok))
+        assert st == 422 and "dropped" in got["message"] and presence.read_word(q) is None
+        assert _call(port, "POST", SET, {"word": "away"}, headers=_tap(tok))[0] == 200
+
+
+def test_the_view_carries_effective_and_it_agrees_with_the_push_decision(rig, monkeypatch):
+    src, q = rig
+    idle = [5.0]
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: idle[0])
+    with _signed(src, q) as (port, _):
+        got = _call(port, "GET", GET, token=T)[1]
+        eff = got["effective"]
+        assert got["word"] is None and (eff["state"], eff["pushing"], eff["source"], eff["since"]) == ("holding", False, "measured", None)
+        assert eff["pushing"] is presence.should_push(q, "ping", suggest=False).push
+        idle[0] = 900.0                                             # the desk went idle: the same stored (no) word now pushes
+        eff = _call(port, "GET", GET, token=T)[1]["effective"]
+        assert (eff["state"], eff["pushing"], eff["source"]) == ("pushing", True, "measured") and "desk inactive" in eff["reason"]
+        _call(port, "POST", SET, {"word": "quiet", "for": "1h"}, token=T)
+        eff = _call(port, "GET", GET, token=T)[1]["effective"]
+        assert (eff["state"], eff["pushing"], eff["source"]) == ("muted", False, "word") and abs(eff["since"] - time.time()) < 30
+
+
+def _chip_text_when(rig, tmp_path, monkeypatch, idle_secs, word=None, word_age=0.0):
+    src, q = rig
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: idle_secs)
+    if word:
+        presence.set_word(q, word, now=time.time() - word_age)
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000}, {"eval": _CHIP_TEXT}, {"eval": f"{_CHIP}.dataset.state"}])
+    return out["values"][1], out["values"][2]
+
+
+@needs_browser
+def test_the_chip_paints_the_effective_state_not_the_stored_word(rig, tmp_path, monkeypatch):
+    # no word on file, the desk idle 15 min: pushing
+    text, state = _chip_text_when(rig, tmp_path, monkeypatch, 900.0)
+    assert text.startswith("Pushing") and "desk inactive" in text and state == "pushing"
+    # no word, the desk active: holding
+    text, state = _chip_text_when(rig, tmp_path, monkeypatch, 5.0)
+    assert text.startswith("Holding") and state == "holding"
+    # `away` on file but he typed more than the grace after it: the word is spent, the chip says what the rule does
+    text, state = _chip_text_when(rig, tmp_path, monkeypatch, 5.0, word="away", word_age=1200.0)
+    assert text.startswith("Holding") and "Away" not in text and state == "holding"
+
+
+@needs_browser
+def test_an_older_server_without_effective_paints_the_stored_word(rig, tmp_path, monkeypatch):
+    src, q = rig
+    real = web_server._Handler._presence_view
+
+    def old_view(self, queue):
+        v = real(self, queue)
+        v.pop("effective", None)
+        return v
+
+    monkeypatch.setattr(web_server._Handler, "_presence_view", old_view)
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 900.0)
+    presence.set_word(q, "quiet", duration="1h")
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000}, {"eval": _CHIP_TEXT}])
+    assert out["values"][1].startswith("Quiet \u00b7 ")
+
+
+def test_the_panel_copy_cuts_a_reason_at_a_word_and_does_not_promise_sleep_a_duration():
+    js = _asset("devices_panel.js")
+    assert "u2026" in js and "slice(0, 40)" in js
+    assert "Quiet, Sleep, Loud" not in js and "Sleep takes no duration" in js
