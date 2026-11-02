@@ -123,6 +123,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
+from levain.autonomic.durable_sqlite import write_transaction
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _TIER_NEEDS
 from levain.consent import limits as consent_limits
@@ -135,8 +136,7 @@ from levain.qbroker.limits import LimitsUnavailable
 from levain.qbroker.receipts import Receipts
 from levain.qbroker.seam import answer_refusal, grant_allow_refusal, request_of
 from levain.qbroker.signers import SignersSnapshot, SignersSource
-from levain.qbroker.store import (ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, _read_untrusted, _parsed,
-                                  replace_file, valid_request_id)
+from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueStore, replace_file, valid_request_id
 from levain.slot import limits_doc
 
 __all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
@@ -161,6 +161,15 @@ RUN_CALLS_KIND = "run-calls"
 RUN_DEADLINE_KIND = "run-deadline"
 RUN_STATE_FORMAT = "levain-queue-run-state/1"
 _RUN_STATE_PREFIX = "runstate-"
+# the agent a run's own count is kept under, whatever agent the call names (L3 r1 complement MED): a run_id may front
+# more than one agent (a claude_code session and a codex session of one run), and its cap bounds the RUN, so the run's
+# row is one row; keyed by the calling agent, the second agent was answered other_agent and the run stuck
+# limits-failed. The per-agent count stays the operator-global step's, keyed by the session
+_RUN_COUNT_AGENT = "claude_code"
+# the broker's durable deadline latch, a table of its own in limits.db (L3 r1 codex MED): a run past its deadline
+# stays past it, whatever the wall clock or a later session's ATTACH-derived deadline says
+_RUN_TRIPS_SCHEMA = ("CREATE TABLE IF NOT EXISTS qbroker_run_trips ("
+                     " root TEXT NOT NULL, kind TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (root, kind))")
 # requests one run (a dispatch run's run_id) or one interactive session may file. A hook files one request per
 # permission prompt it does not settle itself; past this many, the agent is looping on a gate, and every row is a
 # file the operator's cockpit lists, so the run is refused rather than allowed to bury the queue.
@@ -334,16 +343,26 @@ def cap_digest(cap: Any) -> str | None:
     return "sha256:" + hashlib.sha256(cap.encode("utf-8")).hexdigest()
 
 
-def _read_run_state(path: Path) -> dict[str, Any] | None:
-    """The published run state at ``path``, ``None`` when there is none or it is not one."""
-    try:
-        data = _read_untrusted(path)
-        doc = None if data is None else _parsed(data)
-    except (ValueError, OSError):
-        return None
-    if doc is None or doc.get("format") != RUN_STATE_FORMAT or type(doc.get("calls")) is not int:
-        return None
-    return doc
+def _run_deadline_trip(qdir: Path, key: str, deadline: int | None, now: float) -> int | None:
+    """In one write transaction on ``limits.db``: ``None`` when the run ``key`` has not passed a deadline, else the
+    run's counted calls (the counter's own row, never the published view). A run whose deadline is past at ``now`` is
+    latched here first; a latched run is past it from then on, so no later clock or deadline is consulted."""
+    with write_transaction(lambda: consent_limits._connect(qdir)) as conn:
+        consent_limits._ensure(conn)
+        conn.execute(_RUN_TRIPS_SCHEMA)
+        held = conn.execute("SELECT 1 FROM qbroker_run_trips WHERE root = ? AND kind = ?",
+                            (key, RUN_DEADLINE_KIND)).fetchone()
+        if held is None:
+            if deadline is None or now < deadline:
+                return None
+            conn.execute("INSERT INTO qbroker_run_trips (root, kind, at) VALUES (?, ?, ?)",
+                         (key, RUN_DEADLINE_KIND, now))
+        row = conn.execute("SELECT calls FROM sessions WHERE agent = ? AND root = ?",
+                           (_RUN_COUNT_AGENT, key)).fetchone()
+        calls = 0 if row is None else row[0]
+        if type(calls) is not int or calls < 0:
+            raise ValueError(f"the run's counter row holds {str(calls)[:40]!r}")
+        return calls
 
 
 def _quota_key(session: str, run: Mapping[str, Any] | None) -> str:
@@ -809,9 +828,10 @@ class Broker:
         halting = self._halted_on(who.session)
         if halting is not None:
             return wire.answer(rid, gate="halted", request_id=halting)
-        # SEAM (P7-2): the agent fence step runs HERE, before the run's count: a STALE session answers `fenced` and
-        # counts nothing (P7-A subscription route, section 3.2 "Fence-aware, restart-safe").
-        over = self._gate_run(rid, who.run, agent, tool_name, digest, tid)
+        # SEAM (P7-2): the agent fence step is NOT implemented here. It was planned for this point, before the run's
+        # count, so a STALE session would answer `fenced` and count nothing (P7-A subscription route, section 3.2
+        # "Fence-aware, restart-safe"); until P7-2 lands, a stale session's call is counted against its run.
+        over = self._gate_run(rid, who.run, tool_name, digest, tid)
         if over is not None:
             return over
         if self._limits is None:
@@ -851,17 +871,23 @@ class Broker:
             return wire.answer(rid, gate="limits-failed", reason=str(verdict.reason or "the limits store failed")[:512])
         return wire.answer(rid, gate="go")
 
-    def _gate_run(self, rid: int, run: Mapping[str, Any] | None, agent: str, tool_name: str, digest: str,
+    def _gate_run(self, rid: int, run: Mapping[str, Any] | None, tool_name: str, digest: str,
                   tid: str | None) -> dict[str, Any] | None:
         """The run's own caps (P7-A3): ``None`` to go on to the operator-global limits, else GATE's answer.
 
         A run CONTROL resolves with ``max_calls`` / ``deadline`` is counted under ``run:<run_id>`` (the resolved id,
-        as :func:`_quota_key`) in the same ``limits.db``, so a restart keeps the count. Past ``deadline`` the call is
-        ``over-limit`` kind :data:`RUN_DEADLINE_KIND` and counts nothing; a count past ``max_calls`` is kind
-        :data:`RUN_CALLS_KIND` and LATCHES as Q13's crossing does (the cap is fixed, so the latch stays). This step
-        runs before the operator-global count, so a call the global limits then deny is still one of the run's:
-        the run's cap is a bound, and a bound errs toward counting. The state is published for the operator
-        (:func:`run_state_path`) after every verdict; a publish that fails answers ``limits-failed``."""
+        as :func:`_quota_key`) in the same ``limits.db``, under one agent value whatever agent calls
+        (:data:`_RUN_COUNT_AGENT`), so a restart keeps the count. Past ``deadline`` the call is ``over-limit`` kind
+        :data:`RUN_DEADLINE_KIND`, counts nothing, and LATCHES in ``limits.db`` (:func:`_run_deadline_trip`): every
+        later call of the run is past it, whatever the clock. A count past ``max_calls`` is kind :data:`RUN_CALLS_KIND`
+        and latches as Q13's crossing does (the cap is fixed, so the latch stays). This step runs before the
+        operator-global count, so a call the global limits then deny is still one of the run's: the run's cap is a
+        bound, and a bound errs toward counting. The state is published for the operator (:func:`run_state_path`)
+        after every verdict, its ``calls`` always the counter's; it is a view, and a stale one is corrected by the
+        next call.
+
+        Known edges, left for later slices: the run's counter row, latch rows and state file are kept with no
+        retention (one each per capped run); every call under a capped run is a durable write."""
         if run is None or ("max_calls" not in run and "deadline" not in run):
             return None
         key = _quota_key("", run)
@@ -876,16 +902,20 @@ class Broker:
             lock = self._root_locks.setdefault(key, threading.Lock())
         with lock:
             now = self._clock().timestamp()
-            if deadline is not None and now >= deadline:
-                prior = _read_run_state(path)
-                calls = prior.get("calls", 0) if prior is not None else 0
-                return self._publish_run(rid, path, run, calls, RUN_DEADLINE_KIND)
+            try:
+                tripped = _run_deadline_trip(qdir, key, deadline, now)
+            except Exception as exc:    # noqa: BLE001 - a deadline that cannot be read is a run with no brake
+                log.exception("qbroker: the deadline latch of %s could not be read", key)
+                return wire.answer(rid, gate="limits-failed",
+                                   reason=f"the run's deadline latch failed ({type(exc).__name__})"[:512])
+            if tripped is not None:
+                return self._publish_run(rid, path, run, tripped, RUN_DEADLINE_KIND)
             lim = {k: float("inf") for k in limits_doc.KINDS}
             if cap is not None:
                 lim["calls"] = float(cap)
             event = {"tool_use_id": tid} if isinstance(tid, str) else {}
-            verdict = consent_limits.count_call(qdir, agent, key, event, tool_name=tool_name, tool_input=digest,
-                                                limits=lim, count_crossed=False, one_agent=True, now=now)
+            verdict = consent_limits.count_call(qdir, _RUN_COUNT_AGENT, key, event, tool_name=tool_name,
+                                                tool_input=digest, limits=lim, count_crossed=False, now=now)
             if verdict.state == "crossed" and verdict.kind == "calls":
                 # the crossing call is not counted (count_crossed=False): the verdict's count is the one it crossed
                 # AT, so the calls made are the cap
@@ -899,12 +929,14 @@ class Broker:
     def _publish_run(self, rid: int, path: Path, run: Mapping[str, Any], calls: int, kind: str | None
                      ) -> dict[str, Any]:
         """Write the run's state beside the request rows and answer for ``kind`` (``None``: a go-on that is only
-        returned when the write failed)."""
+        returned when the write failed). A write that fails answers ``limits-failed`` even after a call was counted:
+        the call is spent and not made, and a retry without a ``tool_use_id`` is counted again, which errs toward
+        denying (the cap's side)."""
         doc = {"format": RUN_STATE_FORMAT, "run_id": run["run_id"], "calls": calls, "cap": run.get("max_calls"),
                "deadline": run.get("deadline"), "tripped": kind}
         try:
             replace_file(path, canonical_bytes(doc))
-        except Exception:   # noqa: BLE001 - a state the operator cannot read is a slot with no brake it can see
+        except (OSError, ValueError):   # a state the operator cannot read is a slot with no brake it can see
             log.exception("qbroker: the run state %s could not be written", path)
             return wire.answer(rid, gate="limits-failed", reason="the run's state could not be published")
         return wire.answer(rid, gate="over-limit", kind=kind) if kind is not None else {"gate": "go"}
