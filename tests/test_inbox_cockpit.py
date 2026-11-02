@@ -150,7 +150,10 @@ def test_a_tap_is_a_mutation_a_read_that_began_before_it_cannot_paint_over():
     src = _source()
     body = src[src.index("async function markRead"):src.index("async function markAllRead")]
     assert "ibPending++; ibGen++" in body and "ibPending--; ibGen++" in body       # the same gen discipline dismiss and mark-all use
-    assert "ibPending > 0" in src[src.index("async function readInbox"):src.index("async function landInbox")]
+    rd = src[src.index("async function readInbox"):src.index("async function landInbox")]
+    # a FORCED refresh waits for a tap's write too, then runs once after it settles
+    assert rd.index("ibPending > 0") < rd.index("if (!force")
+    assert "ibLater = true" in rd and "ibLater) { ibLater = false; readInbox(true)" in body
 
 
 def test_only_a_literal_404_latches_the_inbox_off_and_a_403_waits_for_a_new_token():
@@ -159,7 +162,9 @@ def test_only_a_literal_404_latches_the_inbox_off_and_a_403_waits_for_a_new_toke
         body = js[js.index(f"async function {fn}"):js.index(f"async function {fn}") + 2200]
         assert f"res.status === 404) {{ " in body and f"{flag} = true" in body
         assert "res.status === 404 || res.status === 403" not in body
-        assert f"{pair} = token()" in body and f"{pair} === token()" in body
+        # the token a request carried is read BEFORE the call, so a late 403 records the token it refused, never a newer one
+        assert "const tk = token();" in body and f"{pair} = tk;" in body and f"{pair} === tk" in body
+        assert body.index("const tk = token();") < body.index('await api("GET"')
 
 
 def test_the_gone_note_clears_on_the_next_read_and_the_deep_link_asks_for_its_item_by_id():

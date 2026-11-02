@@ -702,7 +702,7 @@
   // a row's other control only expands it, and expanding reads it. The app-icon badge is not drawn here: the server answers
   // GET /webpush/inbox/unread_count for whoever wants it.
   let ibSec = null, ibList = null, ibNote = null, ibHead = null, ibAll = null, ibRows = [], ibOpen = new Set(), ibHl = "", ibGone = false, ibRefused = "", ibPin = null,
-      ibBusy = false, ibPending = 0, ibGen = 0, ibReadId = 0, ibReading = false, ibSig = "", ibKind = "";
+      ibBusy = false, ibPending = 0, ibLater = false, ibGen = 0, ibReadId = 0, ibReading = false, ibSig = "", ibKind = "";
   function buildInbox() {
     ibSec = el("section", "ck-zone dev-zone ib-zone");
     ibSec.id = "inbox-view";
@@ -801,12 +801,14 @@
   }
   async function readInbox(force) {
     if (!ibSec || ibGone) return;
-    if (!force && (ibBusy || ibPending > 0 || ibReading)) return;
+    if (ibPending > 0) { ibLater = true; return; }     // every refresh, a forced one too, waits for a tap's write to settle, then runs once
+    if (!force && (ibBusy || ibReading)) return;
     const startedAt = ibGen, mine = ++ibReadId;     // only the newest read, begun after the last mutation, paints
     ibReading = true;
     try {
       if (!token()) { ibSec.hidden = true; return; }
-      if (ibRefused && ibRefused === token()) return;     // a 403 refused THAT token only; a new token tries again
+      const tk = token();
+      if (ibRefused && ibRefused === tk) return;     // a 403 refused THAT token only; a new token tries again
       ibRefused = "";
       // a deep-linked item is asked for by id, so one past the newest page is still found (null: the store has no such row)
       const asks = deep && deep.view === "inbox" && deep.n ? deep.n : "";
@@ -821,7 +823,7 @@
         ibSec.hidden = false;
         if (deep && deep.view === "inbox") await landInbox(asks && res.data.item === null);
       } else if (res.status === 404) { ibSec.hidden = true; ibGone = true; }
-      else if (res.status === 403) { ibSec.hidden = true; ibRefused = token(); }
+      else if (res.status === 403) { ibSec.hidden = true; ibRefused = tk; }
       else if (!ibSec.hidden) ibSay("The inbox is unavailable right now.", "read");
     } catch (_) { if (!ibSec.hidden && ibKind === "read") ibSay("The inbox is unavailable right now.", "read"); }
     finally { if (mine === ibReadId) ibReading = false; }
@@ -855,7 +857,7 @@
       if (res.status === 200 && res.data && typeof res.data.unread === "number") ibCount(res.data.unread);
       else if (res.status !== 404) bad = true;       // not written: the server's list is the truth
     } catch (_) { bad = true; }
-    finally { ibPending--; ibGen++; }
+    finally { ibPending--; ibGen++; if (ibPending === 0 && ibLater) { ibLater = false; readInbox(true); } }
     if (bad) { it.read = false; ibSig = ""; readInbox(true); }
   }
   async function markAllRead() {
@@ -990,7 +992,8 @@
     ntReading = true;
     try {
       if (!token()) { ntSec.hidden = true; return; }
-      if (ntRefused && ntRefused === token()) return;
+      const tk = token();
+      if (ntRefused && ntRefused === tk) return;
       ntRefused = "";
       const res = await api("GET", "/webpush/notices", undefined, READ_TIMEOUT_MS);
       if (startedAt !== ntGen || mine !== ntReadId) return;
@@ -998,7 +1001,7 @@
         paintNotices(res.data.notices); if (ntKind === "read") ntSay(""); ntSec.hidden = false;
         if (deep && deep.view === "notices") { deepDone(); toNotices(); }
       } else if (res.status === 404) { ntSec.hidden = true; ntGone = true; }
-      else if (res.status === 403) { ntSec.hidden = true; ntRefused = token(); }
+      else if (res.status === 403) { ntSec.hidden = true; ntRefused = tk; }
       else if (!ntSec.hidden) ntSay("The notices are unavailable right now.", "read");
     } catch (_) { /* the next pulse tries again */ }
     finally { if (mine === ntReadId) ntReading = false; }
