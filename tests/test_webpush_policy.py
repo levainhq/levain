@@ -13,7 +13,20 @@ from levain.webpush.presence import ACTIVE_WINDOW_SECS, DEFAULT_CELLS, decide
 
 NOW = 1_000_000.0
 ACTIVE, INACTIVE = 10.0, ACTIVE_WINDOW_SECS + 1.0
-PHILL = {"quiet": dict(DEFAULT_CELLS["quiet"]), "sleep": {"approval": "push", "attention": "push", "other": "hold"}}
+# Re-baselined (sleep default 10-25: approval and attention push, other holds): the table that differs from the default
+# is now the one that holds everything through sleep (the old default), an explicit choice of his.
+HOLDING = {"quiet": dict(DEFAULT_CELLS["quiet"]), "sleep": {"approval": "hold", "attention": "hold", "other": "hold"}}
+
+
+def test_the_shipped_default_is_pinned_cell_by_cell():
+    """The one new pin (10-25 ruling): quiet and sleep both push approvals and attention and hold the rest."""
+    assert DEFAULT_CELLS == {"quiet": {"approval": "push", "attention": "push", "other": "hold"},
+                             "sleep": {"approval": "push", "attention": "push", "other": "hold"}}
+    sleep = _w("sleep")
+    got = {c: decide(NOW, sleep, INACTIVE, class_name=c) for c in presence.CLASSES}
+    assert got["approval"].push and got["attention"].push and not got["other"].push
+    assert got["other"].state == "muted" and got["other"].by == "sleep"
+    assert got["other"].why == "sleep: only approvals and urgent pings are pushed until his next input here"
 
 
 @pytest.fixture(autouse=True)
@@ -75,19 +88,22 @@ def test_default_policy_is_todays_rule_for_every_word_and_class(wordname, idle):
     if wordname == "quiet":
         assert [decide(NOW, word, idle, class_name=c).push for c in presence.CLASSES] == [True, True, False]
     if wordname == "sleep" and idle != ACTIVE:   # input 10 s ago is after the word: sleep has ended
-        assert not any(decide(NOW, word, idle, class_name=c).push for c in presence.CLASSES)
+        assert [decide(NOW, word, idle, class_name=c).push for c in presence.CLASSES] == [True, True, False]   # re-baselined
 
 
-def test_phills_table_changes_exactly_those_cells():
+def test_a_holding_table_changes_exactly_those_cells():
     sleep = _w("sleep")
-    got = {c: decide(NOW, sleep, INACTIVE, class_name=c, policy=PHILL) for c in presence.CLASSES}
-    assert got["approval"].push and got["attention"].push and not got["other"].push
-    assert got["approval"].why == "sleep: approvals still reach you (your policy)"
-    assert got["other"].state == "muted" and got["other"].by == "sleep"
+    got = {c: decide(NOW, sleep, INACTIVE, class_name=c, policy=HOLDING) for c in presence.CLASSES}
+    assert not got["approval"].push and not got["attention"].push and not got["other"].push
+    assert got["approval"].why == "sleep: approvals are held (your policy)"
+    assert got["attention"].why == "sleep: attention items are held (your policy)"
+    assert got["approval"].state == "muted" and got["approval"].by == "sleep"
+    # the one cell that equals the default keeps the default's wording
+    assert got["other"].why == decide(NOW, sleep, INACTIVE, class_name="other").why
     # quiet is untouched by a sleep-only change
     quiet = _w("quiet", until=NOW + 600)
     for c in presence.CLASSES:
-        assert decide(NOW, quiet, ACTIVE, class_name=c, policy=PHILL) == decide(NOW, quiet, ACTIVE, class_name=c)
+        assert decide(NOW, quiet, ACTIVE, class_name=c, policy=HOLDING) == decide(NOW, quiet, ACTIVE, class_name=c)
 
 
 def test_every_cell_decides_while_muted_and_loud_and_unmuted_are_unchanged():
@@ -115,10 +131,10 @@ def test_quiet_other_push_is_named_as_policy():
 def test_read_policy_default_loaded_and_malformed(tmp_path):
     assert presence.read_policy(tmp_path) == (DEFAULT_CELLS, "default")
     assert presence.read_policy(None)[1] == "default"
-    _write(tmp_path, _file(PHILL))
-    assert presence.read_policy(tmp_path) == (PHILL, "loaded")
-    for bad in ("{nope", "[]", json.dumps({"version": 2, "cells": PHILL}), json.dumps({"version": True, "cells": PHILL}),
-                json.dumps({"version": 1}), " " * 5000, json.dumps({"version": 1, "cells": PHILL, "pad": "x" * 5000})):
+    _write(tmp_path, _file(HOLDING))
+    assert presence.read_policy(tmp_path) == (HOLDING, "loaded")
+    for bad in ("{nope", "[]", json.dumps({"version": 2, "cells": HOLDING}), json.dumps({"version": True, "cells": HOLDING}),
+                json.dumps({"version": 1}), " " * 5000, json.dumps({"version": 1, "cells": HOLDING, "pad": "x" * 5000})):
         _write(tmp_path, bad)
         cells, status = presence.read_policy(tmp_path)
         assert cells == DEFAULT_CELLS and status.startswith("malformed"), bad[:30]
@@ -148,7 +164,7 @@ def test_policy_view_shape_malformed(tmp_path):
     v = presence.policy_view(tmp_path)
     assert v["status_kind"] == "malformed" and v["reasons"] == ["missing or invalid cell sleep.other"]
     assert v["status"].startswith("malformed: ") and v["cells"] == DEFAULT_CELLS and v["default_class"] == "other"
-    _write(tmp_path, _file(PHILL))
+    _write(tmp_path, _file(HOLDING))
     v = presence.policy_view(tmp_path)
     assert v["status_kind"] == "loaded" and v["reasons"] == [] and v["status"] == "loaded"
 
@@ -167,18 +183,19 @@ def test_malformed_file_is_the_default_decision(tmp_path):
     _write(tmp_path, "{not json")
     for kind in ("consent", "attention", "dated", "question", "mystery"):
         d = presence.should_push(tmp_path, kind, now=NOW, idle=lambda: 500.0)
-        assert d.push is False and d.state == "muted"
+        # the default decision (re-baselined): approvals and attention push through sleep, the rest is muted
+        assert d.push is (kind in ("consent", "attention", "dated")) and (d.state == "muted") is (not d.push)
     (tmp_path / "webpush" / "policy.json").unlink()
 
 
 def test_should_push_reads_the_policy_and_faults_read_as_push(tmp_path):
     presence.set_word(tmp_path, "sleep", now=NOW - 100)
     idle = lambda: 500.0   # noqa: E731 - no input since the word
+    assert presence.should_push(tmp_path, "consent", now=NOW, idle=idle).push is True   # the default pushes an approval
+    _write(tmp_path, _file(HOLDING))
     assert presence.should_push(tmp_path, "consent", now=NOW, idle=idle).push is False
-    _write(tmp_path, _file(PHILL))
-    assert presence.should_push(tmp_path, "consent", now=NOW, idle=idle).push is True
-    assert presence.should_push(tmp_path, "dated", now=NOW, idle=idle).push is True
-    assert presence.should_push(tmp_path, "attention", now=NOW, idle=idle).push is True
+    assert presence.should_push(tmp_path, "dated", now=NOW, idle=idle).push is False
+    assert presence.should_push(tmp_path, "attention", now=NOW, idle=idle).push is False
     assert presence.should_push(tmp_path, "question", now=NOW, idle=idle).push is False
     assert presence.should_push(tmp_path, "mystery", now=NOW, idle=idle).push is False
 
@@ -192,9 +209,9 @@ def test_held_ping_is_released_by_the_same_policy():
     sleep = _w("sleep")
     items = [{"kind": k, "reason": "muted", "id": k} for k in ("consent", "attention", "question")]
     act, muted = held.plan(items, sleep, 500.0, NOW)
-    assert muted == []   # default: sleep holds all
-    act, muted = held.plan(items, sleep, 500.0, NOW, PHILL)
-    assert [i["kind"] for i in muted] == ["consent", "attention"]
+    assert [i["kind"] for i in muted] == ["consent", "attention"]   # default (re-baselined): sleep releases approvals and attention
+    act, muted = held.plan(items, sleep, 500.0, NOW, HOLDING)
+    assert muted == []   # a table holding sleep holds all
     # a ping held as "active" is released by decide with the policy too
     act, _ = held.plan([{"kind": "question", "reason": "active", "id": 1}], _w("quiet", until=NOW + 600), ACTIVE, NOW,
                        {"quiet": {"approval": "push", "attention": "push", "other": "push"}, "sleep": DEFAULT_CELLS["sleep"]})
@@ -207,10 +224,10 @@ def test_held_flush_reads_the_policy_file(tmp_path, monkeypatch):
     from levain.webpush.store import PushStore
 
     PushStore(tmp_path)  # creates the store
-    _write(tmp_path, _file(PHILL))
+    _write(tmp_path, _file(HOLDING))
     monkeypatch.setattr(PushStore, "held_items", lambda self, now=None: [{"kind": "consent", "reason": "muted", "id": 1}])
     held._plan_now(tmp_path, NOW, lambda: 500.0)
-    assert seen["policy"] == PHILL and seen["class_name"] == "approval"
+    assert seen["policy"] == HOLDING and seen["class_name"] == "approval"
 
 
 def test_cli_show_default_json(tmp_path, capsys):
@@ -222,26 +239,27 @@ def test_cli_show_default_json(tmp_path, capsys):
     assert v["status_kind"] == "default" and v["reasons"] == [] and v["default_class"] == "other"
     assert v["classes"] == presence.KIND_CLASSES and "(any other kind)" not in v["classes"]
     assert v["classes"]["dated"] == "attention" and v["classes"]["consent"] == "approval"
-    assert v["sentences"]["sleep"] == "In sleep: nothing reaches you until you are back"
+    sentence = "In sleep: approvals and attention items reach you; other pings wait until you are back"
+    assert v["sentences"]["sleep"] == sentence
     assert not (tmp_path / "webpush" / "policy.json").exists()
     assert _cli(tmp_path, "policy", "show") == 0
-    assert "In sleep: nothing reaches you until you are back" in capsys.readouterr().out
+    assert sentence in capsys.readouterr().out
 
 
 def test_cli_set_show_reset_and_log(tmp_path, capsys):
-    assert _cli(tmp_path, "policy", "set", "sleep", "approval", "push") == 0
-    assert _cli(tmp_path, "policy", "set", "sleep", "attention", "push") == 0
-    assert presence.read_policy(tmp_path) == (PHILL, "loaded")
+    assert _cli(tmp_path, "policy", "set", "sleep", "approval", "hold") == 0
+    assert _cli(tmp_path, "policy", "set", "sleep", "attention", "hold") == 0
+    assert presence.read_policy(tmp_path) == (HOLDING, "loaded")
     assert (tmp_path / "webpush" / "policy.json").stat().st_mode & 0o777 == 0o600
     assert list((tmp_path / "webpush").glob(".policy.json.*")) == []   # no temp left
     capsys.readouterr()
     assert _cli(tmp_path, "policy", "show", "--json") == 0
     v = json.loads(capsys.readouterr().out)
-    assert v["status"] == "loaded" and v["cells"] == PHILL
+    assert v["status"] == "loaded" and v["cells"] == HOLDING
     assert _cli(tmp_path, "policy", "reset") == 0
     assert presence.read_policy(tmp_path) == (DEFAULT_CELLS, "default")
     rows = presence.read_log(tmp_path)
-    assert [r["word"] for r in rows] == ["policy set sleep approval push", "policy set sleep attention push", "policy reset"]
+    assert [r["word"] for r in rows] == ["policy set sleep approval hold", "policy set sleep attention hold", "policy reset"]
     assert all(r["outcome"] == "set" for r in rows)
     with pytest.raises(SystemExit):
         _cli(tmp_path, "policy", "set", "sleep", "approval", "maybe")
@@ -252,7 +270,7 @@ def test_agent_setter_is_refused_and_logged(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(band, "agent_process", lambda: "claude")
     monkeypatch.setattr(band, "_agent_and_session", lambda agent, s: ("claude", "sess-1"))
-    assert _cli(tmp_path, "policy", "set", "sleep", "approval", "push") == 2
+    assert _cli(tmp_path, "policy", "set", "sleep", "approval", "hold") == 2
     assert "operator's own" in capsys.readouterr().out
     assert _cli(tmp_path, "policy", "reset") == 2
     assert not (tmp_path / "webpush" / "policy.json").exists()
@@ -261,7 +279,7 @@ def test_agent_setter_is_refused_and_logged(tmp_path, monkeypatch, capsys):
     assert rows[0]["by"]["agent"] == "claude" and rows[0]["by"]["role"] == "seat"
     # an existing policy survives an agent's reset
     monkeypatch.setattr(band, "agent_process", lambda: None)
-    assert _cli(tmp_path, "policy", "set", "sleep", "approval", "push") == 0
+    assert _cli(tmp_path, "policy", "set", "sleep", "approval", "hold") == 0
     monkeypatch.setattr(band, "agent_process", lambda: "claude")
     assert _cli(tmp_path, "policy", "reset") == 2
     assert presence.read_policy(tmp_path)[1] == "loaded"
@@ -274,9 +292,9 @@ def test_status_mentions_the_policy_only_when_it_is_not_the_default(tmp_path):
     assert "policy" not in base
     _write(tmp_path, _file(DEFAULT_CELLS))   # a file equal to the default says nothing
     assert presence.describe(tmp_path, now=NOW, idle=lambda: ACTIVE) == base
-    _write(tmp_path, _file(PHILL))
+    _write(tmp_path, _file(HOLDING))
     line = presence.describe(tmp_path, now=NOW, idle=lambda: ACTIVE)
-    assert "notification policy" in line and "In sleep: approvals and attention items reach you" in line
+    assert "notification policy" in line and "In sleep: nothing reaches you until you are back" in line
     _write(tmp_path, "{bad")
     assert "malformed" in presence.describe(tmp_path, now=NOW, idle=lambda: ACTIVE)
 
@@ -290,7 +308,7 @@ def _no_lock(monkeypatch):
 
 
 def test_policy_set_and_reset_fail_when_the_lock_cannot_be_taken(tmp_path, monkeypatch, capsys):
-    presence.set_policy(tmp_path, "sleep", "approval", "push", now=NOW)
+    presence.set_policy(tmp_path, "sleep", "approval", "hold", now=NOW)
     before = (tmp_path / "webpush" / "policy.json").read_bytes()
     _no_lock(monkeypatch)
     with pytest.raises(presence.PresenceError, match="presence lock not taken"):
@@ -305,11 +323,11 @@ def test_policy_set_and_reset_fail_when_the_lock_cannot_be_taken(tmp_path, monke
 
 
 def test_policy_view_reads_the_file_once(tmp_path, monkeypatch):
-    _write(tmp_path, _file(PHILL))
+    _write(tmp_path, _file(HOLDING))
     real, calls = presence._read_policy, []
     monkeypatch.setattr(presence, "_read_policy", lambda q: calls.append(1) or real(q))
     v = presence.policy_view(tmp_path)
-    assert len(calls) == 1 and v["status"] == "loaded" and v["cells"] == PHILL
+    assert len(calls) == 1 and v["status"] == "loaded" and v["cells"] == HOLDING
 
 
 def test_policy_log_rows_record_the_prior_cells(tmp_path):
@@ -318,5 +336,5 @@ def test_policy_log_rows_record_the_prior_cells(tmp_path):
     rows = presence.read_log(tmp_path)
     assert rows[0]["prior"] == {"quiet.other": "hold"}
     assert rows[1]["prior"] == {"quiet.approval": "push", "quiet.attention": "push", "quiet.other": "push",
-                                "sleep.approval": "hold", "sleep.attention": "hold", "sleep.other": "hold"}
+                                "sleep.approval": "push", "sleep.attention": "push", "sleep.other": "hold"}
     assert presence.log_line(rows[0])
