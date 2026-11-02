@@ -128,6 +128,7 @@ def seal(*, agent_id: str, role_hash: str, role_text: str, spec_hash: str, capab
 
 
 def is_agent_binding(binding: Binding) -> bool:
-    """True for the compiled form: the agent creator prefix and the agent trigger type together."""
-    return (isinstance(binding.created_by, str) and binding.created_by.startswith(AGENT_CREATOR_PREFIX)
-            and getattr(binding.trigger, "type", None) == AGENT_TRIGGER_TYPE)
+    """True for the compiled form. Either marker alone counts (the agent creator prefix, or the agent trigger type), so
+    a half-formed binding is refused by the dispatcher rather than read as an ordinary one."""
+    return ((isinstance(binding.created_by, str) and binding.created_by.startswith(AGENT_CREATOR_PREFIX))
+            or getattr(binding.trigger, "type", None) == AGENT_TRIGGER_TYPE)

@@ -59,4 +59,4 @@ def test_the_leaf_test_file_is_unchanged_by_this_slice():
             assert n.level == 0 or n.module, "a bare relative import hides its target"
             mods.add(("." * n.level) + (n.module or ""))
     allowed_plain = {"__future__", "typing", "hashlib", "json"}
-    assert all(m in allowed_plain or m.startswith("levain.autonomic") for m in mods), sorted(mods)
+    assert all(m in allowed_plain or m == "levain.autonomic" or m.startswith("levain.autonomic.") for m in mods), sorted(mods)
