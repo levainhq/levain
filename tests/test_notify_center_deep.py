@@ -108,9 +108,13 @@ def test_an_item_at_index_49_stays_open_when_a_new_arrival_shifts_it_past_the_re
               " : f(u, o).then(async (resp) => { const d = await resp.clone().json(); const n = +(String(u).match(/limit=(\\d+)/) || [0, 50])[1];"
               " d.items = [Object.assign({}, d.items[0], { id: 'p99999', title: 'Fresh' })].concat(d.items).slice(0, n);"
               " return new Response(JSON.stringify(d), { status: 200 }); }); return 1; })()")
+    # the row's own title is read BEFORE the click: the seeded notices and the deep items share timestamps, so which title sits at
+    # index 49 is not fixed, and the claim is "the row I opened stays open", not "it is a deep item"
+    before = f"JSON.stringify({{ title: {ROWS}[49].querySelector('.nc-title').textContent }})"
     state = f"JSON.stringify({{ title: ({MODAL}.querySelector('.nc-dtitle') || {{}}).textContent || '' }})"
     with _signed(r.src, r.q) as (port, _):
         r.seed(port)
         out = _drive(tmp_path, _url(port), [WIDE, READY, OPEN, {"until": f"{ROWS}.length == 50 && 1", "ms": 30000}, {"eval": arrive},
-                                            {"eval": f"{ROWS}[49].querySelector('.nc-main').click(); 1"}, SETTLE, {"eval": state}])
-    assert _json(out)[-1]["title"].startswith("Deep item"), out
+                                            {"eval": before}, {"eval": f"{ROWS}[49].querySelector('.nc-main').click(); 1"}, SETTLE, {"eval": state}])
+    got = _json(out)
+    assert got[-1]["title"] and got[-1]["title"] == got[-2]["title"], out
