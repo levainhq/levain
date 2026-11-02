@@ -93,15 +93,18 @@ def kind_for(priority: str) -> str:
     return "notify_urgent" if priority == "urgent" else "notify"
 
 
-def notify_decision(priority: str, now: float, word: dict | None, idle: float | None, *, policy: dict | None = None,
-                    route: str = "desk") -> str:
+def notify_decision(priority: str, now: float, rec: dict, reading: float | None, *, remote: dict | None = None,
+                    desk_msg_at: float | None = None) -> str:
     """``pushed``, ``held`` or ``recorded`` for a notice. ``low`` is recorded only (nothing to push, nothing to release
-    later); every other priority is the operator's policy to decide, by its kind's class, through
-    :func:`levain.webpush.presence.decide`. Pure: the arguments are what ``decide`` takes."""
+    later); every other priority is the record's to decide, by its kind's class, through
+    :func:`levain.webpush.intent.decide`. Pure: the arguments are what ``decide`` takes (``rec`` is
+    :func:`levain.webpush.intent.read`'s result, ``reading`` the laptop idle seconds)."""
     kind = kind_for(priority)
     if priority == "low":
         return "recorded"
-    d = presence.decide(now, word, idle, class_name=presence.kind_class(kind), policy=policy, route=route)
+    from levain.webpush import intent
+
+    d = intent.decide(now, rec, reading, class_name=presence.kind_class(kind), remote=remote, desk_msg_at=desk_msg_at)
     return "pushed" if d.push else "held"
 
 
@@ -112,10 +115,10 @@ def notice_ref(source: str) -> str:
 
 
 def decide_now(queue_dir, priority: str, *, now: float | None = None, idle=None) -> tuple[str, str | None]:
-    """``(decision, hold reason)`` for a notice posted now, read the way every other ping is: the operator's word, policy
-    and route on file and the desk's idle time, through :func:`levain.webpush.presence.should_push`. The reason is the
-    word that muted a held notice (``quiet``, ``sleep``) or ``active`` (the desk was in use), else ``None``. ``low`` is
-    recorded and never asks the rule."""
+    """``(decision, hold reason)`` for a notice posted now, read the way every other ping is: the one intent record and the
+    sensors, through :func:`levain.webpush.presence.should_push`. The reason is the preset that muted a held notice
+    (``quiet``, ``sleep``; ``lets`` for a setting that lets nothing through) or ``active`` (his devices were off), else
+    ``None``. ``low`` is recorded and never asks the rule."""
     if priority == "low":
         return "recorded", None
     said = presence.should_push(queue_dir, kind_for(priority), now=now, idle=idle)

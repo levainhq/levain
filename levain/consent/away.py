@@ -3,9 +3,13 @@
 Away mode is what lets a signed answer reach the agent: with it off, the hook asks only the standing grants and,
 with none matching, withdraws the request at once so the agent's own dialog asks; with it on, the hook holds each
 request up to ``away_hold_seconds`` while ``levain consent answer`` or the phone signs one. Whether it is on is
-:func:`levain.consent.auto_away.away_state`: the operator's explicit word (``away_word``, set here by
-:func:`set_away`; ``auto``, the one ``levain init`` writes, is none), else input idle past ``away_idle_seconds`` on
-macOS, else off. A file with no ``away_word`` was written before auto-away existed: its ``away_mode`` is the word.
+:func:`levain.consent.auto_away.away_state`: given the queue directory (every hook), a signed away mark, else the
+presence record (:func:`levain.webpush.intent.approvals_route`: held exactly when an approval would reach the
+operator's devices, except a ``follow`` that reaches them only for want of a laptop input reading); the words this module writes (``away_word``, ``away_mode``, ``away_idle_seconds``) are read only
+by a caller with no queue directory (one release): the explicit word (``auto``, the one ``levain init`` writes, is
+none), else input idle past ``away_idle_seconds`` on macOS, else off. A file with no ``away_word`` was written before
+auto-away existed: its ``away_mode`` is the word. ``levain consent away on|off|auto`` also set the record's base
+devices setting (:func:`levain.cli._cmd_consent_away`), so the file words and the record move together.
 Claude Code shows its own dialog during the hold (an allow from the hook
 dismisses it); Codex shows none until the hold ends. The file is the adapter's own (``<queue dir>/claude_code.json``
 or ``codex.json``, read by :func:`levain.consent.adapters.claude_code.load_settings`); this module changes only
@@ -47,7 +51,7 @@ from levain.consent.queue import (
 )
 from levain.consent.record import AWAY_NAMESPACE, away_leave_message
 
-__all__ = ["AGENTS", "DEFAULT_HOLDS", "MAX_HOLD", "check_queue_dir", "read", "set_away", "settings",
+__all__ = ["AGENTS", "DEFAULT_HOLDS", "MAX_HOLD", "check_queue_dir", "check_set", "read", "set_away", "settings",
            "why_unanswerable"]
 
 # agent -> its settings file name in the queue directory
@@ -216,31 +220,7 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
     Raises ``ValueError`` for a hold outside (0, :data:`MAX_HOLD`], an ``idle_after`` that is not a finite number
     above 0, a missing settings file, a store that cannot be read, or a queue directory that breaks the queue's own
     rule (``QueueStoreError``)."""
-    if hold is not None and _valid_hold(hold) is None:
-        raise ValueError(f"--hold must be more than 0 and at most {MAX_HOLD:g} seconds (the longest the hook waits)")
-    if idle_after is not None:
-        try:
-            ok = not isinstance(idle_after, bool) and isinstance(idle_after, (int, float)) \
-                and math.isfinite(float(idle_after)) and idle_after > 0
-        except OverflowError:   # an integer too large for a float
-            ok = False
-        if not ok:
-            raise ValueError("--idle-after must be a finite number of seconds above 0")
-    check_queue_dir(qdir)
-    if not on and signing_key is not None:
-        _check_signing_key(signing_key)
-    got = _read_keyed(qdir, agent)
-    if got is None:
-        raise ValueError(f"no {AGENTS[agent]} in {qdir}: `levain init` writes it (with the consent hook on) and "
-                         "names the install's cockpit; away mode is set in that file")
-    data, key = got
-    if on and hold is None:
-        hold = _valid_hold(data.get("away_hold_seconds")) or DEFAULT_HOLDS[agent]
-    if on:
-        # the snapshot being written is the one checked (L3 r1: a re-read could validate another file's root)
-        reason = why_unanswerable(claude_code.settings_from(data))
-        if reason:
-            raise ValueError(f"away mode not turned on: {reason}, so a held request could only wait out its hold")
+    data, key, hold = check_set(qdir, agent, on, hold, idle_after, signing_key=signing_key)
     adapter_settings = claude_code.settings_from(data)
     data["away_mode"] = on is True
     data["away_word"] = "auto" if on is None else "on" if on else "off"
@@ -273,6 +253,39 @@ def set_away(qdir: Path, agent: str, on: bool | None, hold: float | None = None,
                   "run `levain consent away off` or `auto` again")
         raise ValueError(f"{changed} in the consent queue store, but {path} was not written ({e}): {stands}") from e
     return data
+
+
+def check_set(qdir: Path, agent: str, on: bool | None, hold: float | None = None, idle_after: float | None = None,
+              *, signing_key: Path | None = None) -> tuple[dict[str, Any], tuple[int, int, int, int], float | None]:
+    """Every refusal :func:`set_away` makes before it touches the store, and nothing else: ``(the settings file as
+    read, its stat key, the hold to write)``. ``levain consent away`` runs it for every agent before the presence
+    record is written, so a refusal here changes nothing anywhere. Raises ``ValueError`` / ``QueueStoreError``."""
+    if hold is not None and _valid_hold(hold) is None:
+        raise ValueError(f"--hold must be more than 0 and at most {MAX_HOLD:g} seconds (the longest the hook waits)")
+    if idle_after is not None:
+        try:
+            ok = not isinstance(idle_after, bool) and isinstance(idle_after, (int, float)) \
+                and math.isfinite(float(idle_after)) and idle_after > 0
+        except OverflowError:   # an integer too large for a float
+            ok = False
+        if not ok:
+            raise ValueError("--idle-after must be a finite number of seconds above 0")
+    check_queue_dir(qdir)
+    if not on and signing_key is not None:
+        _check_signing_key(signing_key)
+    got = _read_keyed(qdir, agent)
+    if got is None:
+        raise ValueError(f"no {AGENTS[agent]} in {qdir}: `levain init` writes it (with the consent hook on) and "
+                         "names the install's cockpit; away mode is set in that file")
+    data, key = got
+    if on and hold is None:
+        hold = _valid_hold(data.get("away_hold_seconds")) or DEFAULT_HOLDS[agent]
+    if on:
+        # the snapshot being written is the one checked (L3 r1: a re-read could validate another file's root)
+        reason = why_unanswerable(claude_code.settings_from(data))
+        if reason:
+            raise ValueError(f"away mode not turned on: {reason}, so a held request could only wait out its hold")
+    return data, key, hold
 
 
 def _write_settings(qdir: Path, path: Path, body: str, key: tuple[int, int, int, int]) -> None:

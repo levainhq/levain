@@ -11,8 +11,8 @@ hook runs (measured, Q0 item 2); a later ``allow`` from the hook dismisses it an
    event's ``permission_mode``) and the tool input the request was filed for; it answers only with a standing
    consent grant the queue verified. A request that targets agent config or hooks (:func:`targets_agent_config`)
    is never eligible for one;
-3. when away mode is on (:func:`levain.consent.auto_away.away_state`: the operator's explicit word, else input
-   idle on macOS, else off) waits up to the hold for a signed answer the core verifies, re-reading away mode while
+3. when away mode is on (:func:`levain.consent.auto_away.away_state`: a signed away mark, else the presence record,
+   so exactly when an approval would reach the operator's devices) waits up to the hold for a signed answer the core verifies, re-reading away mode while
    it waits and stopping when away mode ends, and withdraws the request if none came (one whose hold ran out
    is expired);
 4. prints ``allow`` only for a verified allow (with a line naming the grant when a grant answered) and ``deny``
@@ -723,22 +723,24 @@ def _can_sign(settings: AdapterSettings) -> bool:
         return False  # an authority that does not replay verifies nothing
 
 
-def effective_away(settings: AdapterSettings, idle: Callable[[], float | None] | None = None
-                   ) -> tuple[bool, str, str]:
-    """:func:`levain.consent.auto_away.away_state`, except that away by input idle is away only while an enrolled
-    key could sign an answer (:func:`_can_sign`; source ``idle_unsignable`` otherwise): the explicit word on
-    checks that when it is set, nothing sets input idle. Read at a hold's start and at every recheck, and by
-    ``levain consent away``."""
-    away, source, why = away_state(settings, idle)
-    if away and source == "idle" and not _can_sign(settings):
-        return False, "idle_unsignable", f"{why}, but no enrolled key could sign an answer"
+def effective_away(settings: AdapterSettings, idle: Callable[[], float | None] | None = None, *,
+                   queue_dir: Path | str | None = None) -> tuple[bool, str, str]:
+    """:func:`levain.consent.auto_away.away_state`, except that away by the presence record (``intent``) or by input
+    idle is away only while an enrolled key could sign an answer (:func:`_can_sign`; source ``intent_unsignable`` /
+    ``idle_unsignable`` otherwise): the explicit word on and a signed mark check that when they are set, nothing
+    sets the others. Given ``queue_dir`` (every hook call site) the record decides: away exactly when an approval
+    reaches the operator's devices. Read at a hold's start and at every recheck, and by ``levain consent away``."""
+    away, source, why = away_state(settings, idle, queue_dir=queue_dir)
+    if away and source in ("idle", "intent") and not _can_sign(settings):
+        return False, f"{source}_unsignable", f"{why}, but no enrolled key could sign an answer"
     return away, source, why
 
 
-def away_hold(settings: AdapterSettings, agent: str, idle: Callable[[], float | None] | None = None) -> float:
+def away_hold(settings: AdapterSettings, agent: str, idle: Callable[[], float | None] | None = None, *,
+              queue_dir: Path | str | None = None) -> float:
     """Seconds the hook holds a request for a signed answer under ``settings``: 0 unless :func:`effective_away`
-    says away (``idle`` is its idle source)."""
-    away, source, _why = effective_away(settings, idle)
+    says away (``idle`` is its idle source; ``queue_dir`` makes the presence record decide)."""
+    away, source, _why = effective_away(settings, idle, queue_dir=queue_dir)
     return hold_seconds(settings, agent, source) if away else 0.0
 
 
@@ -792,11 +794,15 @@ def still_away_from(path: Path, started: AdapterSettings, *, agent: str | None =
     the hold's start). Known edge: the hook's ``queue`` verifies leaves against the cockpit the settings named when
     it opened, so a ``cockpit_data_root`` changed during a hold takes effect at the next hook call."""
     agent = agent if agent is not None else path.stem
+    # INVARIANT: the recheck's queue_dir (path.parent) is the hold's (queue.directory): every caller passes
+    # <queue.directory>/<settings name>; a foreign path would recheck another presence record (a test's stand-in queue
+    # is not a ConsentQueue and is not checked)
+    assert not isinstance(queue, ConsentQueue) or Path(queue.directory) == path.parent, (path, queue.directory)
 
     def recheck() -> tuple[bool, str, str]:
         fresh = try_read_settings_file(path)
         return effective_away(with_away_mark(fresh if fresh is not None else started, path.parent, agent,
-                                             queue=queue))
+                                             queue=queue), queue_dir=path.parent)
     return recheck
 
 
@@ -1003,7 +1009,7 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
                 taken = _verified(took, got_row[0])
                 if taken is not None:
                     return Decided(call, got_row[0], taken)
-    hold = min(away_hold(settings, AGENT, idle), max(0.0, deadline - clock()))
+    hold = min(away_hold(settings, AGENT, idle, queue_dir=Path(queue.directory)), max(0.0, deadline - clock()))
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER,
@@ -1321,7 +1327,8 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     a queue directory, the ping is also written to the notification record (``kind`` and ``ref``, ``request:<id>``
     or ``question:<n>``, name it there) by a detached child, with whether the notify command started, and that
     same child pushes it to each paired phone when one with pings on was live at that moment and
-    :func:`levain.webpush.presence.should_push` says so (a ping it holds is recorded and queued for the phone,
+    :func:`levain.consent.auto_away.approval_push` says so (``should_push``, except that an approval under a standing
+    signed away mark always goes: the hook is holding it for that answer) (a ping it holds is recorded and queued for the phone,
     :mod:`levain.webpush.held`, not pushed). With no ``cwd`` there
     is no queue directory, so nothing is recorded and no push is sent.
     True when the notify command or a push started; False when neither is configured or neither could start (a
@@ -1331,10 +1338,13 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     pushed = False
     if cwd is not None:
         try:
-            from levain.webpush import live, presence, sender
+            from levain.consent.auto_away import approval_push
+            from levain.webpush import live, sender
 
             paired = live(cwd)
-            said = presence.should_push(cwd, kind) if paired else None
+            # the mark-aware decider: a standing signed away mark holds the request for a signed answer, so its
+            # approval goes to the devices whatever the record says (the hold and the push read one mark rule)
+            said = approval_push(settings, cwd, kind) if paired else None
             phone = said is not None and said.push
             # a ping the rule holds waits in the held queue under the word that muted it, else as "active"
             hold = None if said is None or said.push else (said.by or "active")
@@ -1703,7 +1713,7 @@ def _gate_call(event: Mapping[str, Any], queue: ConsentQueue, settings: AdapterS
             # goes on with what does not need the change (L2-2)
             note(refused="floor")
             return _pre("deny", floor_text(what, loose))
-        if posture in ATTENDED_POSTURES and not effective_away(settings)[0]:
+        if posture in ATTENDED_POSTURES and not effective_away(settings, queue_dir=Path(queue.directory))[0]:
             # an attended default session: Claude Code's own dialog (or his own allow rule) decides,
             # as the PermissionRequest hook leaves it while he is present; held only while he is away (head ruling 10-18)
             return None

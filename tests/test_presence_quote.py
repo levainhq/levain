@@ -12,12 +12,20 @@ from datetime import datetime, timezone
 import pytest
 
 from levain.consent import band
-from levain.webpush import cli, presence, quote
+from levain.webpush import cli, intent, presence, quote
 from levain.webpush.presence import PresenceError, describe, read_log, read_word, set_word
 
 NOW = time.time()
 SEAT = {"agent": "claude_code", "session": "abc12345-seat", "role": "seat"}
 SID = "abc12345-seat"
+
+
+@pytest.fixture(autouse=True)
+def _no_laptop_reading(monkeypatch):
+    """These tests read a standing `away` overlay with no idle source of their own: no laptop reading, so no input can
+    have ended it (the suite's default reading is input just now, which ends an until-input overlay)."""
+    import levain.consent.auto_away as auto_away
+    monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: None)
 
 
 def _iso(t: float) -> str:
@@ -84,12 +92,12 @@ def test_codex_turns_are_read_in_both_rollout_formats_and_an_injected_user_item_
                                                        ("sleep", "quiet", "coordinator")])
 def test_an_invented_quote_never_replaces_a_word_he_set_himself(tmp_path, his_word, setter_word, role):
     set_word(tmp_path, his_word, now=NOW - 3000)
-    on_file = (tmp_path / "webpush" / presence.FILE_NAME).read_text()
+    on_file = (tmp_path / "webpush" / intent.FILE_NAME).read_text()
     by = {**SEAT, "role": role}
     with pytest.raises(PresenceError, match="he ends it himself"):
         set_word(tmp_path, setter_word, by=by, said="anything at all", now=NOW,
                  match=quote.Match(False, None, "the quote is in none of the last 3 operator turns"))
-    assert (tmp_path / "webpush" / presence.FILE_NAME).read_text() == on_file
+    assert (tmp_path / "webpush" / intent.FILE_NAME).read_text() == on_file
     row = read_log(tmp_path)[-1]
     assert row["outcome"] == "refused" and row["verified"] is False and row["prior"]["word"] == his_word
 
@@ -115,13 +123,13 @@ def test_a_real_quote_replaces_his_word_only_if_he_typed_it_after_that_word(tmp_
     set_word(tmp_path, "sleep", now=NOW - 1800)
     row = [r for r in read_log(tmp_path) if r["outcome"] == "set" and r.get("by")][-1]
     assert row["verified"] is True and abs(row["said_at"] - (NOW - 1200)) < 1
-    assert "(unverified)" not in describe(tmp_path, idle=lambda: 10.0)
+    assert "(unverified)" not in describe(tmp_path, now=NOW, idle=lambda: 10.0)
 
 
 def test_with_no_transcript_a_setter_is_unverified_but_sets_over_no_word_or_a_relayed_word(tmp_path):
     no = quote.Match(False, None, "no transcript found for the session")
     rec = set_word(tmp_path, "away", by=SEAT, said="heading out now", now=NOW - 100, match=no)
-    assert rec["verified"] is False and describe(tmp_path, idle=lambda: 10.0).endswith("heading out now (unverified)")
+    assert rec["verified"] is False and describe(tmp_path, now=NOW, idle=lambda: 10.0).endswith('"heading out now" (unverified).')
     assert read_log(tmp_path)[-1]["why"].startswith("unverified: no transcript")
     assert set_word(tmp_path, "away", by=SEAT, said="on the train", now=NOW + 1, match=no)["word"] == "away"
     assert set_word(tmp_path, "away", by={**SEAT, "session": "other-seat-1"}, said="heading out", now=NOW + 2)["word"] == "away"
@@ -223,12 +231,12 @@ def test_a_lookup_that_fails_is_an_unverified_quote_never_a_traceback(tmp_path, 
 def test_a_seat_set_word_from_before_the_check_reads_as_unverified(tmp_path):
     set_word(tmp_path, "away", by=SEAT, said="heading out now", now=NOW - 100,
              match=quote.Match(True, NOW - 200, "the quote is in an operator turn of the transcript"))
-    path = tmp_path / "webpush" / presence.FILE_NAME
+    path = tmp_path / "webpush" / intent.FILE_NAME
     rec = json.loads(path.read_text())
-    del rec["verified"]   # the record a seat wrote before P2
+    del rec["overlay"]["verified"]   # the record a seat wrote before P2
     path.write_text(json.dumps(rec))
-    assert describe(tmp_path, idle=lambda: 10.0).endswith("heading out now (unverified)")
-    assert read_word(tmp_path)["verified"] is False
+    assert describe(tmp_path, now=NOW, idle=lambda: 10.0).endswith('"heading out now" (unverified).')
+    assert read_word(tmp_path, now=NOW, idle=lambda: 10.0)["verified"] is False
 
 
 def test_an_over_long_line_is_counted_in_the_reason_and_a_cut_first_line_is_dropped_whole(tmp_path, monkeypatch):

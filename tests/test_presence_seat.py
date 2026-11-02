@@ -8,7 +8,7 @@ import json
 import pytest
 
 from levain.consent import band
-from levain.webpush import cli, presence
+from levain.webpush import cli, intent, presence
 from levain.webpush.presence import PresenceError, describe, read_word, set_word
 
 SEAT = {"agent": "claude_code", "session": "abc12345-seat", "role": "seat"}
@@ -17,7 +17,7 @@ NOW = 1_000_000.0
 
 
 def _file(tmp_path):
-    return tmp_path / "webpush" / presence.FILE_NAME
+    return tmp_path / "webpush" / intent.FILE_NAME
 
 
 def _idle():
@@ -28,15 +28,15 @@ def _idle():
 def test_a_seat_sets_away_on_his_words_and_the_record_names_it(tmp_path, word, duration):
     rec = set_word(tmp_path, word, duration=duration, now=NOW, by=SEAT, said="heading out")
     assert rec["word"] == word and rec["by"] == SEAT and rec["said"] == "heading out"
-    on_file = json.loads(_file(tmp_path).read_text())
+    on_file = json.loads(_file(tmp_path).read_text())["overlay"]
     assert on_file["by"] == SEAT and on_file["said"] == "heading out"
-    assert read_word(tmp_path)["by"] == SEAT
+    assert read_word(tmp_path, now=NOW, idle=_idle)["by"] == SEAT
 
 
 def test_status_says_who_set_it_and_from_what_words(tmp_path):
     set_word(tmp_path, "away", by=SEAT, said="heading out")
     line = describe(tmp_path, idle=_idle)
-    assert line.endswith("; set by claude_code abc12345-seat from your words: heading out (unverified)")
+    assert line.endswith('Set by seat claude_code abc12345-seat from your words: "heading out" (unverified).')
 
 
 @pytest.mark.parametrize("word", ["quiet", "sleep", "loud", "back"])
@@ -74,7 +74,7 @@ def test_a_refusal_leaves_the_word_already_on_file_untouched(tmp_path):
 def test_the_coordinator_may_also_set_quiet_and_sleep_but_not_back_or_loud(tmp_path):
     q = set_word(tmp_path, "quiet", duration="2h", now=NOW, by=COORD, said="quiet till noon please")
     assert q["by"]["role"] == "coordinator" and q["until"] == NOW + 7200
-    assert "set by the coordinator claude_code def67890-coord from your words: quiet till noon please" in describe(
+    assert 'Set by the coordinator claude_code def67890-coord from your words: "quiet till noon please"' in describe(
         tmp_path, now=NOW + 1, idle=_idle)
     assert set_word(tmp_path, "sleep", now=NOW, by=COORD, said="going to bed")["word"] == "sleep"
     for word in ("back", "loud"):
@@ -95,18 +95,20 @@ def test_the_operators_own_words_are_unchanged_and_clear_the_setter(tmp_path):
     set_word(tmp_path, "away", by=SEAT, said="heading out")
     rec = set_word(tmp_path, "quiet", duration="10m", now=NOW)
     assert "by" not in rec and "said" not in rec
-    assert "by" not in json.loads(_file(tmp_path).read_text())
-    assert "set by" not in describe(tmp_path, now=NOW + 1, idle=_idle)
+    assert "by" not in json.loads(_file(tmp_path).read_text())["overlay"]
+    assert "Set by" not in describe(tmp_path, now=NOW + 1, idle=_idle)
     assert set_word(tmp_path, "back") is None
 
 
 def test_a_record_with_a_malformed_setter_reads_as_the_plain_word(tmp_path):
     d = tmp_path / "webpush"
     d.mkdir()
-    (d / presence.FILE_NAME).write_text(json.dumps({"word": "away", "ts": NOW, "by": "claude", "said": "x"}))
-    assert read_word(tmp_path) == {"word": "away", "ts": NOW}
-    (d / presence.FILE_NAME).write_text(json.dumps({"word": "away", "ts": NOW, "by": SEAT}))
-    assert read_word(tmp_path) == {"word": "away", "ts": NOW}
+    base = {"devices": "follow", "follow_after": 600, "lets_through": "everything", "ts": 0}
+    ov = {"preset": "away", "devices": "on", "follow_after": 600, "lets_through": "everything", "ts": NOW, "until": {"kind": "input"}}
+    (d / intent.FILE_NAME).write_text(json.dumps({"version": 1, "base": base, "overlay": {**ov, "by": "claude", "said": "x"}}))
+    assert read_word(tmp_path, now=NOW + 1, idle=_idle) == {"word": "away", "ts": NOW}
+    (d / intent.FILE_NAME).write_text(json.dumps({"version": 1, "base": base, "overlay": {**ov, "by": SEAT}}))   # no quote: not shown as set by a seat
+    assert read_word(tmp_path, now=NOW + 1, idle=_idle) == {"word": "away", "ts": NOW}
 
 
 # the CLI: who is setting it is read from the same identity `levain ask` names
@@ -132,7 +134,7 @@ def test_cli_a_seat_sets_away_with_said_and_status_shows_it(tmp_path, monkeypatc
     assert cli._word(_args(tmp_path, "away", said="heading out")) == 0
     assert read_word(tmp_path)["by"] == SEAT and read_word(tmp_path)["said"] == "heading out"
     assert cli._status(argparse.Namespace(queue_dir=tmp_path)) == 0
-    assert "set by claude_code abc12345-seat from your words: heading out" in capsys.readouterr().out
+    assert 'Set by seat claude_code abc12345-seat from your words: "heading out"' in capsys.readouterr().out
 
 
 def test_cli_a_seat_without_said_is_refused_in_words_and_writes_nothing(tmp_path, monkeypatch, capsys):
