@@ -20,18 +20,21 @@ import json
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from levain.agents import schedule
 from levain.agents.spec import _check_row
 from levain.agents.store import AgentStore, open_agent_store
 
-__all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "TickResult", "occurrence_id", "run_id", "claim", "tick"]
+__all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurrence_id", "run_id", "claim", "tick",
+           "heartbeat", "takeover"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
 OVERLAP = "skipped-overlap"
+
+LEASE_S = 900  # A0 r7 section 2.3 [judged]: the coordinator slot's lease
 
 CURSOR_PREFIX = "tick_cursor:"
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
@@ -205,3 +208,77 @@ def _walk(store: AgentStore, agent_id: str, snap: tuple, trigger: dict, binding:
                     (agent_id, key))
             _set_cursor(conn, agent_id, upto)
         cursor = upto
+
+
+def _write_lock(conn: sqlite3.Connection) -> None:
+    # A write that matches no row still takes SQLite's write lock, so the lease read after it is the one the CAS
+    # compares against. A caller in a deferred BEGIN that has read nothing yet gets the same answer as one in BEGIN
+    # IMMEDIATE; one that read first holds a snapshot, and if a rival committed since then it gets SQLite's busy error
+    # here, before anything is written.
+    conn.execute("UPDATE agent_occurrences SET lease_until = lease_until WHERE 0")
+
+
+def _lease(value: object) -> datetime | None:
+    """A stored lease, or ``None`` when it is absent or unreadable (neither is evidence of a lapse or of life)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, _STAMP).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _expiry(at: datetime, lease_s: int) -> datetime:
+    # Stamps hold whole seconds and the lapse test compares the untruncated clock, so the expiry is rounded up:
+    # a lease is never shorter than asked for, and heartbeat and takeover share the boundary ``at > lease``.
+    moment = at + timedelta(seconds=lease_s)
+    return moment.replace(microsecond=0) + timedelta(seconds=1) if moment.microsecond else moment
+
+
+def heartbeat(conn: sqlite3.Connection, occurrence_id: str, epoch: int, now: datetime, lease_s: int = LEASE_S) -> bool:
+    """The supervisor's heartbeat: extend a ``launched`` row's lease to ``now + lease_s``. It is a compare-and-set on
+    the epoch the holder launched or last renewed under and on the exact lease it read, so a holder that a takeover
+    fenced (the epoch moved, the row left ``launched``) writes nothing and is told ``False``. A lease that has already
+    lapsed (``now`` past it) is refused too: the row belongs to takeover from that moment, and a late holder must not
+    postpone crash recovery. An absent or unreadable lease is refused, as takeover refuses it. The lease never moves
+    backwards, so a renew computed from an earlier clock reading, or a wall clock set back, leaves the later lease in
+    place. Runs inside the caller's write transaction and takes its write lock first."""
+    if not conn.in_transaction:
+        raise RuntimeError("a heartbeat runs inside the caller's write transaction")
+    at = schedule._utc(now)
+    _write_lock(conn)
+    row = conn.execute("SELECT lease_until FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'"
+                       " AND epoch = ?", (occurrence_id, epoch)).fetchone()
+    if row is None:
+        return False
+    lease = _lease(row[0])
+    if lease is None or at > lease:
+        return False
+    until = max(lease, _expiry(at, lease_s))
+    cur = conn.execute("UPDATE agent_occurrences SET lease_until = ? WHERE occurrence_id = ? AND state = 'launched'"
+                       " AND epoch = ? AND lease_until = ?", (_stamp(until), occurrence_id, epoch, row[0]))
+    return cur.rowcount == 1
+
+
+def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime) -> bool:
+    """Fenced takeover (A0 r7 section 2.3, lapse recovery): end a ``launched`` row whose lease has lapsed, writing
+    ``epoch + 1`` and ``crash_recovered`` in one statement. The lease is read here, inside the write transaction, and
+    the ``UPDATE`` is guarded by the exact value read, so a heartbeat that landed first or a takeover that already
+    ran leaves it with nothing to change (``False``). A live lease is never taken over; a lease that is absent or
+    unreadable is not evidence of a lapse, so it is refused too. Slot and reservation release belong to the
+    terminal transaction P6-5 wires around this. It takes the caller's write lock first, as :func:`heartbeat` does."""
+    if not conn.in_transaction:
+        raise RuntimeError("a takeover runs inside the caller's write transaction")
+    at = schedule._utc(now)
+    _write_lock(conn)
+    row = conn.execute("SELECT lease_until FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'",
+                       (occurrence_id,)).fetchone()
+    if row is None:
+        return False
+    lease = _lease(row[0])
+    if lease is None or at <= lease:
+        return False
+    cur = conn.execute("UPDATE agent_occurrences SET state = 'stopped', reason = 'crash_recovered', epoch = epoch + 1,"
+                       " ended_at = ? WHERE occurrence_id = ? AND state = 'launched' AND lease_until = ?",
+                       (_stamp(at), occurrence_id, row[0]))
+    return cur.rowcount == 1
