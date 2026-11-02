@@ -14,8 +14,8 @@ CONTROL checks, never as a fact root acts on.
    parked credential returned from ``keep/`` into the session tree, the vendor's identity call recorded in the state
    record's ``identity`` and compared with the baseline (``identity-changed`` when it differs; a login the server
    no longer accepts, ``identity-expired``; the check not answering, ``identity-unreachable``). Claude
-   only: the identity child asks the unmodified binary ``claude auth status --json`` and reports its account as a
-   local-data claim; Levain never opens or refreshes the login. Any refusal there
+   only: the identity child asks the unmodified binary ``claude auth status --json`` and reports a digest of the
+   ``orgId`` and email it names as a local-data claim; Levain never opens or refreshes the login. Any refusal there
    precedes ``<S>/repo`` and the clone, and the credential is parked back into ``keep/``.
    ``vendor``: root's copy of the session's vendor CLI (its install unit) in ``VENDOR_PREFIX`` is not whole
    (:func:`check_vendor_installed`; setup and repair copy it there) = ``vendor-not-installed:<vendor>``, before any
@@ -60,7 +60,6 @@ then SCRUBBED (proc.scrub over every uid of the slot, under the slot lock) and t
 from __future__ import annotations
 
 import errno
-import json
 import os
 import re
 import select
@@ -675,8 +674,8 @@ def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
     :func:`levain.slot.end.park_move` of the credential back into ``keep/`` (a no-op when it never left): a failure
     there is noted and END's park is the backstop. No baseline is written on this path.
 
-    For Claude the identity child asks the unmodified binary for its own account report (a local-data claim) and
-    changes nothing in the credential."""
+    For Claude the identity child asks the unmodified binary for its own sign-in report (a local-data claim, a
+    digest of ``orgId`` and email) and changes nothing in the credential."""
     seams = ctx.seams
     seams.at("identity-gate")
     baseline = ID.read_slot_baseline(ctx, a)
@@ -863,7 +862,7 @@ def identity_capture(ctx: H.Ctx, a: R.Alloc) -> Tuple[int, bytes]:
     4. Linux egress: a fresh forwarder (:func:`_spawn_forwarder`), so the call reaches the passthrough tunnel;
     5. the child, its output captured;
     6. the kill domain ended again (the fresh forwarder reaped) and steps 2-3's proof, whether 4-5 passed or not, so
-       neither outlives the call. On a failed 4-5 a failure here is noted; after an answer it is ``identity-window``;
+       neither outlives the call. On a failed 4-5 a failure here is noted; after an answer it is ``identity-window``.
 
     The login already ran, so every failure is a :class:`Refused` the caller records: a window check's (the session
     lock's own refusals, ``session-busy`` among them, and step 1's ``not-active:<STATE>`` keep their names) is

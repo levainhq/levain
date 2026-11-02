@@ -171,7 +171,7 @@ class Launches:
         if canon.parse(spec_json)["target"] == "identity":
             self.identity_captures = getattr(self, "identity_captures", 0) + 1
             if self.profile_uuid is not None:      # G3: the binary's auth status names this account
-                line = {"claim": "local-data", "logged_in": True, "org_id": self.profile_uuid}
+                line = {"claim": "local-data", "logged_in": True, "id_digest": self.profile_uuid}
                 return 0, json.dumps(line, sort_keys=True).encode() + b"\n"
             return 1, b'{"error":"no-token"}\n'
         return H.capture_target(argv, spec_json, cgroup, bound)
@@ -620,7 +620,7 @@ def test_passthrough_interactive_runs_the_identity_gate(env, monkeypatch):
     w, la, _ = env
     monkeypatch.setattr(SS, "slot_owner_ok", lambda st: True)
     w.give_credential(E0)
-    la.profile_uuid = "4b8e0c1a-1d2e-4f00-9a7b-0123456789ab"
+    la.profile_uuid = "4b8e0c1a1d2e4f009a7b0123456789ab4b8e0c1a1d2e4f009a7b0123456789ab"
     s = _rendered(w, "egress", "interactive", "claude", "passthrough",
                   blob=_blob(routes=["claude-sub", "github"]))
     assert w.main(["start", s])[1] == {"ok": True, "exit": 0}

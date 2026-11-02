@@ -5,8 +5,9 @@ baseline ``confirm-identity yes`` writes.
 * The identity call (:func:`identity_call`): one function per vendor. Codex has no server-validated call, so its
   observed id is the literal :data:`NOT_A_CHECK` (IG-2, published per §7.6 "not a check"). Claude's (IG-3, G1b):
   :mod:`levain.slot.identity_child` run AS THE SLOT through wall's ``identity`` target (start's
-  :func:`levain.slot.start.identity_capture`), its line judged by root (:func:`parse_auth_answer`): the ``orgId`` of the unmodified
-  binary's own ``claude auth status --json``, a LOCAL-DATA claim (:data:`CLAIM`).
+  :func:`levain.slot.start.identity_capture`), its line judged by root (:func:`parse_auth_answer`): a digest of the
+  ``orgId`` and email in the unmodified binary's own ``claude auth status --json``, computed in the child (root never
+  sees the email), a LOCAL-DATA claim (:data:`CLAIM`).
 * A ``login`` session's ``start`` runs it as its last step, after the vendor exits (:func:`record_login_identity`),
   and CASes the result into the state record's ``identity``: ``{observed_id}`` when the call answered, else
   ``{result: <refusal name>}``. A vendor that exited non-zero is not asked: ``{result: login-exit-nonzero}``.
@@ -22,8 +23,8 @@ baseline ``confirm-identity yes`` writes.
 
 * Claude's child asks the unmodified binary and nothing else: Levain never opens the login file, never refreshes
   it, and never speaks to a sign-in server (P7-A N-A1; this retired the earlier token refresh). A binary that says it
-  is not signed in is ``identity-expired``; one that did not answer in time is ``identity-unreachable``
-  (:func:`parse_auth_answer`).
+  is not signed in is ``identity-expired``; one that did not answer in time, or is older than the child's minimum
+  version, is ``identity-unreachable`` (:func:`parse_auth_answer`).
 
 * A baseline may carry the unattended-use mark (``dispatch``, value ``yes``): ``confirm-identity yes --dispatch``
   writes it; a later confirm without the flag writes a baseline with no mark.
@@ -89,7 +90,7 @@ IDENTITY_CALLS: Mapping[str, Callable[..., str]] = {"codex": _codex_call, "claud
 
 
 def identity_call(ctx: Optional[H.Ctx], vendor: str, a: Optional[R.Alloc] = None, *, held: bool = False) -> str:
-    """The stable account id the vendor's identity call observed, checked against §7.6's pattern (else
+    """The stable id the vendor's identity call observed, checked against §7.6's pattern (else
     ``identity-unparsable``), or :class:`Refused` by the call's own name. ``held`` reaches the vendor's callable
     (Codex ignores it)."""
     call = IDENTITY_CALLS.get(vendor)
@@ -104,6 +105,8 @@ def identity_call(ctx: Optional[H.Ctx], vendor: str, a: Optional[R.Alloc] = None
 #: §7.6: root reads at most this much of the identity call's stdout.
 PROFILE_ANSWER_MAX = 64 * 1024
 _FIXED_NAME_RE = re.compile(r"[a-z\-]{1,32}", re.ASCII)
+#: the child's ``id_digest``: a SHA-256 in lower-case hex.
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 #: the claim an identity answer makes: the unmodified binary's own report from its local data. It stays this until U-A5
 #: (does ``auth status`` ask the server?) is measured on a signed-in slot; the names ``matched`` / ``not-a-check`` /
 #: ``identity-changed`` are kept and say nothing stronger.
@@ -112,11 +115,13 @@ CLAIM = IC.CLAIM
 
 def parse_auth_answer(exit_code: int, out: bytes) -> str:
     """IG-3 / P7-A N-A1: root's judgement of :mod:`levain.slot.identity_child`'s line. The observed id is the line's
-    ``org_id`` when the child exited 0, the line is within :data:`PROFILE_ANSWER_MAX`, holds exactly ``claim``
-    :data:`CLAIM`, ``logged_in`` true and an ``org_id`` that fits ``OBSERVED_ID_RE``. Fail closed on any other shape.
+    ``id_digest`` (:func:`levain.slot.identity_child.id_digest`: 64 lower-case hex) when the child exited 0, the line
+    is within :data:`PROFILE_ANSWER_MAX`, and holds exactly ``claim`` :data:`CLAIM`, ``logged_in`` true and that
+    digest. Fail closed on any other shape.
 
     * ``identity-expired``: the binary said it is not logged in (sign in to this slot again).
-    * ``identity-unreachable``: the binary did not answer in time (``timeout``); a retry, never a new login.
+    * ``identity-unreachable``: the binary did not answer in time (``timeout``), a retry, never a new login; or it is
+      older than the child's minimum version (``binary-too-old`` leads the detail), an upgrade of the vendor binary.
     * ``identity-unparsable``: every other error name, a non-zero exit, a different claim or any other shape."""
     import json
 
@@ -139,18 +144,21 @@ def parse_auth_answer(exit_code: int, out: bytes) -> str:
             raise bad("error name")
         if name == "timeout":
             raise Refused(UNREACHABLE, "the Claude binary's auth status did not answer in time")
+        if name == "binary-too-old":
+            raise Refused(UNREACHABLE, "binary-too-old: the Claude binary is older than "
+                          + ".".join(map(str, IC.MIN_VERSION)) + "; upgrade the vendor install")
         raise bad(f"identity call: {name}")
     if ans.get("claim") != CLAIM:
         raise bad("claim")
     if ans.get("logged_in") is False and set(ans) == {"claim", "logged_in"}:
         raise Refused(EXPIRED, "the Claude binary reports the slot is not signed in (sign in to this slot again)")
-    if set(ans) != {"claim", "logged_in", "org_id"} or ans["logged_in"] is not True:
+    if set(ans) != {"claim", "logged_in", "id_digest"} or ans["logged_in"] is not True:
         raise bad("shape")
     if exit_code != 0:
         raise bad(f"identity call exit {exit_code}")
-    oid = ans["org_id"]
-    if type(oid) is not str or not R.OBSERVED_ID_RE.fullmatch(oid):
-        raise bad("no org_id")
+    oid = ans["id_digest"]
+    if type(oid) is not str or not _DIGEST_RE.fullmatch(oid):
+        raise bad("no id_digest")
     return oid
 
 
@@ -243,7 +251,7 @@ def baseline_vendor(data: Optional[bytes]) -> Optional[str]:
 
 #: DECISION: the most a baseline file may hold; ``baseline_bytes`` writes well under this.
 BASELINE_MAX_BYTES = 4096
-#: the record's ``identity.result`` for a gate that matched, that found another account, and a vendor with no check.
+#: the record's ``identity.result`` for a gate that matched, that found another sign-in, and a vendor with no check.
 GATE_MATCHED = "matched"
 GATE_CHANGED = "identity-changed"
 #: the record's ``identity.result`` for a login a sign-in repairs (the binary says it is not signed in), and for a
@@ -334,7 +342,7 @@ def gate_check(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Dict[str,
              else GATE_CHANGED}
     _cas_gate_identity(ctx, a.session, ident)
     if not same:
-        raise Refused(GATE_CHANGED, f"{a.slot.tag}: the observed account is not the slot's baseline")
+        raise Refused(GATE_CHANGED, f"{a.slot.tag}: the observed sign-in is not the slot's baseline")
     return ident
 
 

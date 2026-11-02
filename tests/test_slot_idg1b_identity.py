@@ -35,7 +35,7 @@ from tests.test_slot_s2f3_start import DARWIN_IDS, _world
 from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
 E0 = SlotId("egress", 0)
-UUID = "4b8e0c1a-1d2e-4f00-9a7b-0123456789ab"
+UUID = "4b8e0c1a1d2e4f009a7b0123456789ab4b8e0c1a1d2e4f009a7b0123456789ab"
 
 
 def _answer(status: int = 200, body: object = None) -> bytes:
@@ -44,7 +44,7 @@ def _answer(status: int = 200, body: object = None) -> bytes:
     if body is not None:
         line = {"claim": "local-data", "logged_in": True}
     elif status == 200:
-        line = {"claim": "local-data", "logged_in": True, "org_id": UUID}
+        line = {"claim": "local-data", "logged_in": True, "id_digest": UUID}
     elif status in (401, 403):
         line = {"claim": "local-data", "logged_in": False}
     else:
