@@ -414,23 +414,30 @@ class PushStore:
             return 0
 
     @staticmethod
-    def _inbox_rows(c: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
+    def _inbox_rows(c: sqlite3.Connection, limit: int, item: "str | None" = None) -> list[dict[str, Any]]:
         fp, fn = PushStore._inbox_floor(c, "inbox_floor_ping"), PushStore._inbox_floor(c, "inbox_floor_notice")
         marked = {r[0] for r in c.execute("SELECT item FROM inbox_reads")}
         cutoff = time.strftime(STAMP, time.gmtime(time.time() - NOTICES_DAYS * 86400))
         rows: list[dict[str, Any]] = []
-        for n in c.execute("SELECT n.*, EXISTS(SELECT 1 FROM opens o WHERE o.ping_id = n.ping_id) AS was_opened "
-                           "FROM notices n WHERE n.dismissed_at IS NULL ORDER BY n.id DESC LIMIT ?", (NOTICES_KEEP,)):
+        # ``item`` asks for that one row wherever it sits (a retained row past the newest page is still one the store has)
+        want_n = int(item[1:]) if item and item[0] == "n" else None
+        want_p = int(item[1:]) if item and item[0] == "p" else None
+        nq, na = ("AND n.id = ? ", (want_n,)) if want_n is not None else ("", ())
+        pq, pa = ("AND p.id = ? ", (want_p,)) if want_p is not None else ("", ())
+        for n in ([] if want_p is not None else c.execute(
+                "SELECT n.*, EXISTS(SELECT 1 FROM opens o WHERE o.ping_id = n.ping_id) AS was_opened "
+                "FROM notices n WHERE n.dismissed_at IS NULL " + nq + "ORDER BY n.id DESC LIMIT ?", na + (NOTICES_KEEP,))):
             item = f"n{n['id']}"
             rows.append({"id": item, "kind": "notice", "title": n["title"], "body": n["body"], "at": n["at"],
                          "source": n["source"], "priority": n["priority"], "decision": n["decision"],
                          "opened": bool(n["was_opened"]), "read": n["id"] <= fn or item in marked,
                          "ping_id": n["ping_id"], "notice_id": n["id"], "_n": n["id"]})
         # a notice's own ping is the notice, shown once; a summary only links to a view
-        for p in c.execute("SELECT p.*, EXISTS(SELECT 1 FROM opens o WHERE o.ping_id = p.id) AS was_opened, "
-                           "h.ping_id AS held_id FROM pings p LEFT JOIN held h ON h.ping_id = p.id AND h.released_at IS NULL "
-                           "WHERE p.kind NOT IN ('summary', 'notify', 'notify_urgent') AND p.at >= ? "
-                           "ORDER BY p.id DESC LIMIT ?", (cutoff, NOTICES_KEEP)):
+        for p in ([] if want_n is not None else c.execute(
+                "SELECT p.*, EXISTS(SELECT 1 FROM opens o WHERE o.ping_id = p.id) AS was_opened, "
+                "h.ping_id AS held_id FROM pings p LEFT JOIN held h ON h.ping_id = p.id AND h.released_at IS NULL "
+                "WHERE p.kind NOT IN ('summary', 'notify', 'notify_urgent') AND p.at >= ? " + pq +
+                "ORDER BY p.id DESC LIMIT ?", (cutoff,) + pa + (NOTICES_KEEP,))):
             item = f"p{p['id']}"
             rows.append({"id": item, "kind": "ping", "title": p["title"], "body": p["body"], "at": p["at"],
                          "source": p["kind"], "priority": "normal",
@@ -439,22 +446,48 @@ class PushStore:
         rows.sort(key=lambda r: (r["at"], r["_n"]), reverse=True)
         return rows[:limit]
 
+    @staticmethod
+    def _inbox_unread(c: sqlite3.Connection) -> dict[str, int]:
+        """Unread counts straight from the tables, not from the newest page: a count never stops at :data:`NOTICES_KEEP`."""
+        fp, fn = PushStore._inbox_floor(c, "inbox_floor_ping"), PushStore._inbox_floor(c, "inbox_floor_notice")
+        cutoff = time.strftime(STAMP, time.gmtime(time.time() - NOTICES_DAYS * 86400))
+        notices = c.execute("SELECT COUNT(*) FROM notices n WHERE n.dismissed_at IS NULL AND n.id > ? "
+                            "AND ('n' || n.id) NOT IN (SELECT item FROM inbox_reads)", (fn,)).fetchone()[0]
+        pings = c.execute("SELECT COUNT(*) FROM pings p WHERE p.kind NOT IN ('summary', 'notify', 'notify_urgent') "
+                          "AND p.at >= ? AND p.id > ? AND ('p' || p.id) NOT IN (SELECT item FROM inbox_reads)",
+                          (cutoff, fp)).fetchone()[0]
+        return {"unread": pings + notices, "pings": pings, "notices": notices}
+
+    @staticmethod
+    def _clean(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for r in rows:
+            r.pop("_n", None)
+        return rows
+
     def inbox(self, limit: int = 100) -> list[dict[str, Any]]:
         """The newest ``limit`` items, pings and undismissed notices merged, each with its ``read`` mark."""
         lim = max(0, min(int(limit), NOTICES_KEEP))
         with self.read() as c:
             rows = self._inbox_rows(c, lim)
-        for r in rows:
-            r.pop("_n", None)
-        return rows
+        return self._clean(rows)
 
     def inbox_counts(self) -> dict[str, int]:
         """Unread items now: ``unread`` (all), and ``pings`` / ``notices`` apart, so a surface can count the kinds it wants."""
         with self.read() as c:
-            rows = self._inbox_rows(c, 10 ** 6)
-        pings = sum(1 for r in rows if not r["read"] and r["kind"] == "ping")
-        notices = sum(1 for r in rows if not r["read"] and r["kind"] == "notice")
-        return {"unread": pings + notices, "pings": pings, "notices": notices}
+            return self._inbox_unread(c)
+
+    def inbox_snapshot(self, limit: int = 100, item: "str | None" = None) -> "tuple[list[dict[str, Any]], dict[str, int], dict[str, Any] | None]":
+        """The rows, the unread counts and (when ``item`` is asked for) that one row, all from ONE read transaction, so the
+        header count and the rows cannot disagree for a write landing between them."""
+        lim = max(0, min(int(limit), NOTICES_KEEP))
+        with self.read() as c:
+            rows = self._inbox_rows(c, lim)
+            counts = self._inbox_unread(c)
+            one = None
+            if isinstance(item, str) and re.fullmatch(r"[pn][1-9][0-9]{0,17}", item):
+                found = self._inbox_rows(c, 1, item)
+                one = found[0] if found else None
+        return self._clean(rows), counts, (self._clean([one])[0] if one else None)
 
     @staticmethod
     def _inbox_find(c: sqlite3.Connection, item: Any) -> "dict[str, Any] | None":

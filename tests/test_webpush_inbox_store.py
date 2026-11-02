@@ -95,3 +95,41 @@ def test_a_pruned_notice_takes_its_read_mark_with_it(tmp_path):
     _notice(st, "new")                       # the next insert prunes the stale mark
     with st.read() as c:
         assert c.execute("SELECT COUNT(*) FROM inbox_reads WHERE item = ?", (f"n{n}",)).fetchone()[0] == 0
+
+
+def test_the_unread_count_is_not_capped_by_the_page_keep(tmp_path, monkeypatch):
+    import levain.webpush.store as store_mod
+
+    st = PushStore(tmp_path)
+    for i in range(5):
+        _notice(st, f"n{i}")
+    st.add_ping("attention", "a", "A", "x")
+    monkeypatch.setattr(store_mod, "NOTICES_KEEP", 2)           # the page keeps two of each kind; the count still sees all
+    assert len(st.inbox()) == 2
+    assert st.inbox_counts() == {"unread": 6, "pings": 1, "notices": 5}
+
+
+def test_a_retained_row_past_the_page_is_found_by_id_and_a_missing_one_is_not(tmp_path):
+    st = PushStore(tmp_path)
+    ids = [_notice(st, f"n{i}")[1] for i in range(5)]
+    rows, counts, one = st.inbox_snapshot(2, f"n{ids[0]}")
+    assert [r["id"] for r in rows] == [f"n{ids[4]}", f"n{ids[3]}"] and f"n{ids[0]}" not in [r["id"] for r in rows]
+    assert one is not None and one["id"] == f"n{ids[0]}" and one["read"] is False and "_n" not in one
+    assert counts["unread"] == 5
+    assert st.inbox_snapshot(2, "n99999")[2] is None and st.inbox_snapshot(2, "zz")[2] is None
+    assert st.inbox_snapshot(2)[2] is None
+
+
+def test_the_snapshot_reads_rows_and_counts_in_one_transaction(tmp_path):
+    st = PushStore(tmp_path)
+    _notice(st, "x")
+    opened = []
+    real = st.read
+
+    def spy():
+        opened.append(1)
+        return real()
+
+    st.read = spy
+    st.inbox_snapshot(10, "n1")
+    assert len(opened) == 1

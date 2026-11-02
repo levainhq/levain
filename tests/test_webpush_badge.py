@@ -212,9 +212,17 @@ def _page(view, n, nav="full") -> dict:
 def test_the_page_calls_the_badge_from_the_needs_render_with_the_same_count_it_shows():
     src = CORE.read_text(encoding="utf-8")
     body = src[src.index("function renderNeeds("):src.index("// the Decisions focus view")]
-    assert body.index("syncAppBadge(view, items.length)") < body.index("if (!items.length) { clearNeeds(host); return; }")
+    assert body.index("syncAppBadge(view, items.length)") < body.index("if (!all.length) { clearNeeds(host); return; }")
     assert body.index("syncAppBadge(view, items.length)") < body.index("host.dataset.sig === sig")   # before the unchanged early return
     assert "needsItems(((view.extra_panels || {}).decisions || {}).lines)" in body
+
+
+@needs_node
+def test_the_page_badge_caps_at_99_as_the_payload_does():
+    from levain.webpush import needs
+
+    ok = {"extra_panels": {"decisions": {"lines": []}}}
+    assert _page(ok, 150)["calls"] == [["set", needs.BADGE_MAX]] and _page(ok, 99)["calls"] == [["set", 99]]
 
 
 @needs_node

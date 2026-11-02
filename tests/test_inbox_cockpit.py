@@ -143,3 +143,61 @@ def test_empty_inbox_says_so(rig, tmp_path, monkeypatch):
             {"eval": f"[{SEC}.querySelector('.ib-empty').textContent, {SEC}.querySelector('.ib-count').textContent]"},
         ])
     assert out["values"][1] == ["Nothing has pinged you.", ""]
+
+
+
+def test_a_tap_is_a_mutation_a_read_that_began_before_it_cannot_paint_over():
+    src = _source()
+    body = src[src.index("async function markRead"):src.index("async function markAllRead")]
+    assert "ibPending++; ibGen++" in body and "ibPending--; ibGen++" in body       # the same gen discipline dismiss and mark-all use
+    assert "ibPending > 0" in src[src.index("async function readInbox"):src.index("async function landInbox")]
+
+
+def test_only_a_literal_404_latches_the_inbox_off_and_a_403_waits_for_a_new_token():
+    for fn, flag, pair in (("readInbox", "ibGone", "ibRefused"), ("readNotices", "ntGone", "ntRefused")):
+        js = _asset("devices_panel.js")
+        body = js[js.index(f"async function {fn}"):js.index(f"async function {fn}") + 2200]
+        assert f"res.status === 404) {{ " in body and f"{flag} = true" in body
+        assert "res.status === 404 || res.status === 403" not in body
+        assert f"{pair} = token()" in body and f"{pair} === token()" in body
+
+
+def test_the_gone_note_clears_on_the_next_read_and_the_deep_link_asks_for_its_item_by_id():
+    src = _source()
+    body = src[src.index("async function readInbox"):src.index("async function landInbox")]
+    assert 'ibKind === "gone"' in body and '"?n=" + encodeURIComponent' in body and "res.data.item === null" in body
+
+
+def test_the_inbox_tab_before_the_first_read_reads_and_says_loading_and_the_open_ids_sort_in_the_signature():
+    src = _source()
+    body = src[src.index("function toInbox"):]
+    assert 'ibSay("Loading…"' in body and "readInbox(true)" in body
+    assert "[...ibOpen].sort().join" in src
+
+
+def test_the_needs_landing_scrolls_to_the_area_where_the_phone_tab_is_not_displayed():
+    js = _asset("devices_panel.js")
+    body = js[js.index("function landNeeds"):js.index("function landNeeds") + 900]
+    assert "getClientRects().length" in body and "host.scrollIntoView" in body and "btn.click()" in body
+
+
+@needs_browser
+def test_a_push_link_to_a_retained_item_past_the_newest_page_opens_it_and_is_not_called_gone(rig, tmp_path, monkeypatch):
+    import levain.web_server as ws
+
+    src, q = rig
+    st = PushStore(q)
+    first = st.add_ping("attention", "digest", "the oldest ping", "kept, but past the page")
+    for i in range(3):
+        st.record_notice("notify", "notify:Backup", f"b{i}", "Backup", f"b{i}", "x", "normal", "Backup", "pushed")
+    monkeypatch.setattr(ws, "_INBOX_LIMIT", 2)
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/?view=inbox&n=p{first}#write_token={T}", [
+            {"until": f"{SEC} && !{SEC}.hidden && {SEC}.querySelector('.ib-hl')", "ms": 20000},
+            {"eval": f"[{_rows()}, {SEC}.querySelector('.ib-note').hidden, {SEC}.querySelector('.ib-count').textContent]"},
+        ])
+    rows, note_hidden, count = out["values"][1]
+    hl = [r for r in rows if r[2]]
+    assert [r[0] for r in hl] == [f"p{first}"] and hl[0][1] is False and hl[0][3] is True      # found, highlighted, open, READ
+    assert note_hidden is True and count == "3 unread"
+    assert {r["id"]: r["read"] for r in PushStore(q).inbox()}[f"p{first}"] is True

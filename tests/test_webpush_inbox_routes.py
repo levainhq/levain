@@ -97,3 +97,21 @@ def test_the_route_does_not_break_the_notices_routes(rig):
         assert [n["id"] for n in _call(port, "GET", "/webpush/notices", token=T)[1]["notices"]] == [nid]
         assert _call(port, "POST", "/webpush/notices/dismiss", {"id": nid}, token=T)[0] == 200
         assert _call(port, "GET", LIST, token=T)[1]["items"][0]["kind"] == "ping"     # the dismissed notice left the list
+
+
+def test_a_deep_linked_item_past_the_page_comes_back_by_id_and_only_a_missing_one_is_null(rig, monkeypatch):
+    import levain.web_server as ws
+
+    src, q = rig
+    st = PushStore(q)
+    first = st.add_ping("attention", "a", "oldest", "x")
+    for i in range(3):
+        st.record_notice("notify", "notify:Backup", f"b{i}", "Backup", f"b{i}", "x", "normal", "Backup", "pushed")
+    monkeypatch.setattr(ws, "_INBOX_LIMIT", 2)
+    with _signed(src, q) as (port, _):
+        got = _call(port, "GET", LIST, token=T)[1]
+        assert len(got["items"]) == 2 and "item" not in got and got["unread"] == 4
+        got = _call(port, "GET", f"{LIST}?n=p{first}", token=T)[1]
+        assert f"p{first}" not in [r["id"] for r in got["items"]]
+        assert got["item"]["id"] == f"p{first}" and got["item"]["dismissable"] is False and got["unread"] == 4
+        assert _call(port, "GET", f"{LIST}?n=n99999", token=T)[1]["item"] is None

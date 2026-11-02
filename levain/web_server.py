@@ -2618,20 +2618,30 @@ class _Handler(GuardedHandler):
 
         try:
             store = PushStore(queue)
-            counts = store.inbox_counts()
             if count_only:
+                counts = store.inbox_counts()
                 # the open Needs-you items beside the unread split (the app-icon badge; notices never count): omitted when
                 # a store cannot be read, never a 0
                 from levain.webpush import needs
 
                 n = needs.open_needs_count(queue)
                 return (counts if n is None else {**counts, "needs_count": n}), 200
-            rows = store.inbox(_INBOX_LIMIT)
+            from urllib.parse import parse_qs, urlsplit
+
+            want = parse_qs(urlsplit(self.path).query).get("n", [""])[0].strip()
+            # rows and counts from ONE read, and a deep-linked item looked up by id (it may sit past the newest page)
+            rows, counts, one = store.inbox_snapshot(_INBOX_LIMIT, want or None)
         except Exception as exc:  # noqa: BLE001 - a list that cannot be read is an answer, never an empty inbox
             return {"error": "inbox_unreadable", "message": type(exc).__name__}, 503
         keep = ("id", "kind", "title", "body", "at", "source", "priority", "decision", "opened", "read")
-        return {"items": [dict({k: r[k] for k in keep}, dismissable=r["kind"] == "notice") for r in rows],
-                **counts}, 200
+
+        def shape(r: "dict[str, Any]") -> "dict[str, Any]":
+            return dict({k: r[k] for k in keep}, dismissable=r["kind"] == "notice")
+
+        doc: "dict[str, Any]" = {"items": [shape(r) for r in rows], **counts}
+        if want:
+            doc["item"] = None if one is None else shape(one)     # null: the store really has no such row
+        return doc, 200
 
     def _inbox_read_post(self, raw: bytes) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/inbox/read`` with exactly one of ``{id}`` (that item), ``{up_to}`` (that item and every older one) or

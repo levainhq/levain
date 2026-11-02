@@ -38,7 +38,13 @@
   function landNeeds(tries) {
     if (!deep || deep.view !== "needs") return;
     const btn = document.querySelector('[data-phone-jump="needs"]');
-    if (btn && document.querySelector("#ck-needs:not([hidden])")) { deepDone(); btn.click(); return; }
+    const host = document.querySelector("#ck-needs:not([hidden])");
+    if (host) {
+      deepDone();
+      // the phone tab exists only at phone width; where it is not displayed, scroll to the area itself
+      if (btn && btn.getClientRects().length) btn.click(); else host.scrollIntoView({ block: "start" });
+      return;
+    }
     if (tries >= 20) { deepDone(); return; }
     setTimeout(() => landNeeds(tries + 1), 500);
   }
@@ -695,8 +701,8 @@
   // field is set with textContent (el() does) and a URL in a body stays inert text. A notice keeps one extra control, Dismiss;
   // a row's other control only expands it, and expanding reads it. The app-icon badge is not drawn here: the server answers
   // GET /webpush/inbox/unread_count for whoever wants it.
-  let ibSec = null, ibList = null, ibNote = null, ibHead = null, ibAll = null, ibRows = [], ibOpen = new Set(), ibHl = "", ibGone = false,
-      ibBusy = false, ibGen = 0, ibReadId = 0, ibReading = false, ibSig = "", ibKind = "";
+  let ibSec = null, ibList = null, ibNote = null, ibHead = null, ibAll = null, ibRows = [], ibOpen = new Set(), ibHl = "", ibGone = false, ibRefused = "", ibPin = null,
+      ibBusy = false, ibPending = 0, ibGen = 0, ibReadId = 0, ibReading = false, ibSig = "", ibKind = "";
   function buildInbox() {
     ibSec = el("section", "ck-zone dev-zone ib-zone");
     ibSec.id = "inbox-view";
@@ -735,7 +741,7 @@
   function firstLine(t) { const s = String(t || "").split("\n")[0]; return s.length > 140 ? s.slice(0, 140) + "…" : s; }
   function paintInbox(rows, unread) {
     // the same rows again paint nothing (a pulse never swallows a click or drops focus); a changed list gives focus back by id
-    const sig = JSON.stringify(rows) + "|" + [...ibOpen].join(",") + "|" + ibHl;
+    const sig = JSON.stringify(rows) + "|" + [...ibOpen].sort().join(",") + "|" + ibHl;
     ibCount(unread);
     if (sig === ibSig && ibList.firstChild) return;
     ibSig = sig;
@@ -795,27 +801,37 @@
   }
   async function readInbox(force) {
     if (!ibSec || ibGone) return;
-    if (!force && (ibBusy || ibReading)) return;
+    if (!force && (ibBusy || ibPending > 0 || ibReading)) return;
     const startedAt = ibGen, mine = ++ibReadId;     // only the newest read, begun after the last mutation, paints
     ibReading = true;
     try {
       if (!token()) { ibSec.hidden = true; return; }
-      const res = await api("GET", "/webpush/inbox", undefined, READ_TIMEOUT_MS);
+      if (ibRefused && ibRefused === token()) return;     // a 403 refused THAT token only; a new token tries again
+      ibRefused = "";
+      // a deep-linked item is asked for by id, so one past the newest page is still found (null: the store has no such row)
+      const asks = deep && deep.view === "inbox" && deep.n ? deep.n : "";
+      const res = await api("GET", "/webpush/inbox" + (asks ? "?n=" + encodeURIComponent(asks) : ""), undefined, READ_TIMEOUT_MS);
       if (startedAt !== ibGen || mine !== ibReadId) return;
       if (res.status === 200 && res.data && Array.isArray(res.data.items)) {
-        paintInbox(res.data.items, Number(res.data.unread) || 0); if (ibKind === "read") ibSay(""); ibSec.hidden = false;
-        if (deep && deep.view === "inbox") await landInbox();
-      } else if (res.status === 404 || res.status === 403) { ibSec.hidden = true; ibGone = true; }
+        let rows = res.data.items;
+        if (asks && res.data.item) ibPin = res.data.item;
+        if (ibPin && !rows.some((r) => r.id === ibPin.id)) rows = rows.concat([ibPin]);
+        paintInbox(rows, Number(res.data.unread) || 0);
+        if (ibKind === "read" || ibKind === "gone") ibSay("");
+        ibSec.hidden = false;
+        if (deep && deep.view === "inbox") await landInbox(asks && res.data.item === null);
+      } else if (res.status === 404) { ibSec.hidden = true; ibGone = true; }
+      else if (res.status === 403) { ibSec.hidden = true; ibRefused = token(); }
       else if (!ibSec.hidden) ibSay("The inbox is unavailable right now.", "read");
-    } catch (_) { /* the next pulse tries again */ }
+    } catch (_) { if (!ibSec.hidden && ibKind === "read") ibSay("The inbox is unavailable right now.", "read"); }
     finally { if (mine === ibReadId) ibReading = false; }
   }
   // A push named an item: the list opens on it, highlighted and read; an item that is gone (pruned, dismissed) is said, and the
   // list still shows. Runs once per link.
-  async function landInbox() {
+  async function landInbox(absent) {
     const want = deep.n;
     deepDone();
-    if (want && !ibRows.some((r) => r.id === want)) ibSay("That one is gone.", "gone");
+    if (want && (absent || !ibRows.some((r) => r.id === want))) ibSay("That one is gone.", "gone");
     else if (want) {
       ibHl = want; ibOpen.add(want);
       ibSig = "";                                   // repaint with the item open and marked
@@ -831,15 +847,20 @@
     const row = [...ibList.querySelectorAll(".ib-row")].find((r) => r.dataset.id === id);
     if (row) { row.classList.remove("ib-unread"); const d = row.querySelector(".ib-dot"); if (d) d.setAttribute("aria-label", "read"); }
     ibCount(ibRows.filter((r) => !r.read).length);
+    // a read in flight, or a pulse, that began before this tap must not paint the row unread again: the tap is a mutation
+    ibPending++; ibGen++;
+    let bad = false;
     try {
       const res = await api("POST", "/webpush/inbox/read", { id: id });
       if (res.status === 200 && res.data && typeof res.data.unread === "number") ibCount(res.data.unread);
-      else if (res.status !== 404) { it.read = false; ibSig = ""; readInbox(true); }       // not written: the server's list is the truth
-    } catch (_) { it.read = false; ibSig = ""; readInbox(true); }
+      else if (res.status !== 404) bad = true;       // not written: the server's list is the truth
+    } catch (_) { bad = true; }
+    finally { ibPending--; ibGen++; }
+    if (bad) { it.read = false; ibSig = ""; readInbox(true); }
   }
   async function markAllRead() {
     if (ibBusy) return;
-    ibBusy = true; ibGen++; ibSay("");
+    ibBusy = true; ibGen++; ibSay(""); ibPin = null;
     let ok = false;
     try {
       const res = await api("POST", "/webpush/inbox/read", { all: true });
@@ -850,7 +871,7 @@
   }
   async function dismissItem(id) {
     if (ibBusy || id.charAt(0) !== "n") return;
-    ibBusy = true; ibGen++; ibSay("");
+    ibBusy = true; ibGen++; ibSay(""); if (ibPin && ibPin.id === id) ibPin = null;
     let ok = false;
     try {
       const res = await api("POST", "/webpush/notices/dismiss", { id: Number(id.slice(1)) });
@@ -862,11 +883,20 @@
     if (ok) { ibSig = ""; await readInbox(true); readNotices(true); }
   }
   function toInbox() {
-    if (!ibSec || ibSec.hidden) return;
-    const hl = ibHl ? [...ibSec.querySelectorAll(".ib-row")].find((r) => r.dataset.id === ibHl) : null;
-    (hl || ibSec).scrollIntoView({ block: "start" });
-    const f = hl ? hl.querySelector(".ib-toggle") : null;
-    (f || ibSec).focus({ preventScroll: true });
+    if (!ibSec) return;
+    const land = () => {
+      const hl = ibHl ? [...ibSec.querySelectorAll(".ib-row")].find((r) => r.dataset.id === ibHl) : null;
+      (hl || ibSec).scrollIntoView({ block: "start" });
+      const f = hl ? hl.querySelector(".ib-toggle") : null;
+      (f || ibSec).focus({ preventScroll: true });
+    };
+    if (ibSec.hidden) {
+      // not read yet (the tab was tapped before the first read landed): show the section and read, never do nothing
+      if (!token() || ibGone || (ibRefused && ibRefused === token())) return;
+      ibSec.hidden = false; ibSay("Loading…", "read");
+      readInbox(true).then(() => { if (!ibSec.hidden) land(); });
+    }
+    land();
   }
 
   // ---- Notices: what your own services posted at you (levain.webpush.notify) ---------------------------------------------------
@@ -874,7 +904,7 @@
   // push once carried) always has somewhere to land. Every field is set with textContent (el() does), never as markup, and a URL in a body
   // stays inert text: no link, no reply, no deep link. Dismiss is the one action. It carries no count and no badge, it is not in
   // Needs-you, the board, the tray or the agents graph, and nothing else on the page learns what it holds.
-  let ntSec = null, ntList = null, ntNote = null, ntOpen = new Set(), ntGone = false, ntBusy = false,
+  let ntSec = null, ntList = null, ntNote = null, ntOpen = new Set(), ntGone = false, ntRefused = "", ntBusy = false,
       ntGen = 0, ntReadId = 0, ntReading = false, ntSig = "", ntKind = "";
   function buildNotices() {
     ntSec = el("section", "ck-zone dev-zone nt-zone");
@@ -960,12 +990,15 @@
     ntReading = true;
     try {
       if (!token()) { ntSec.hidden = true; return; }
+      if (ntRefused && ntRefused === token()) return;
+      ntRefused = "";
       const res = await api("GET", "/webpush/notices", undefined, READ_TIMEOUT_MS);
       if (startedAt !== ntGen || mine !== ntReadId) return;
       if (res.status === 200 && res.data && Array.isArray(res.data.notices)) {
         paintNotices(res.data.notices); if (ntKind === "read") ntSay(""); ntSec.hidden = false;
         if (deep && deep.view === "notices") { deepDone(); toNotices(); }
-      } else if (res.status === 404 || res.status === 403) { ntSec.hidden = true; ntGone = true; }
+      } else if (res.status === 404) { ntSec.hidden = true; ntGone = true; }
+      else if (res.status === 403) { ntSec.hidden = true; ntRefused = token(); }
       else if (!ntSec.hidden) ntSay("The notices are unavailable right now.", "read");
     } catch (_) { /* the next pulse tries again */ }
     finally { if (mine === ntReadId) ntReading = false; }

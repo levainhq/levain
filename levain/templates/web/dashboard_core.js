@@ -6151,7 +6151,7 @@
     try {
       const nav = window.navigator;
       if (!nav) return;
-      const r = n > 0 ? (typeof nav.setAppBadge === "function" ? nav.setAppBadge(n) : null)
+      const r = n > 0 ? (typeof nav.setAppBadge === "function" ? nav.setAppBadge(Math.min(n, 99)) : null)   // 99 = needs.BADGE_MAX, as the push payload clips
                       : (typeof nav.clearAppBadge === "function" ? nav.clearAppBadge() : null);
       if (r && typeof r.catch === "function") r.catch(() => {});
     } catch (_) { /* a badge that cannot be set is not an error the page shows */ }
