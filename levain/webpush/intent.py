@@ -60,7 +60,7 @@ LETS_CLASSES = {"everything": frozenset({"approval", "attention", "other"}),
                 "needs": frozenset({"approval", "attention"}),
                 "approvals": frozenset({"approval"}),
                 "nothing": frozenset()}
-_LETS_WORDS = {"everything": "everything", "needs": "needs only", "approvals": "approvals only", "nothing": "nothing"}
+_LETS_WORDS = {"everything": "Everything", "needs": "Approvals and needs", "approvals": "Approvals only", "nothing": "Nothing"}
 # what each preset writes (devices is always `on`; follow_after is the base's; `back` and `loud off` write nothing)
 PRESET_TABLE = {"away": {"devices": "on", "lets_through": "everything", "until": "input"},
                 "quiet": {"devices": "on", "lets_through": "needs", "until": "timer"},

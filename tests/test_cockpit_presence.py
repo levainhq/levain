@@ -396,7 +396,7 @@ def test_the_chip_reads_the_record_and_the_sheet_posts_each_body_and_repaints_fr
     assert v[2] == ["Away", "Back", "Quiet", "Sleep", "Loud"]
     assert v[4] is True and v[5].startswith("Pings now: ")                 # focus in the sheet, which opens on the server's own line
     assert v[7][0] is False and v[7][1] == "2h" and "quiet" in v[7][2]     # the sheet stays open to show the new line; the pick is remembered
-    assert "Lets through: approvals only" in v[10][0] and "your next input" in v[10][0] and v[10][1] == "switch"
+    assert "Lets through: Approvals only" in v[10][0] and "your next input" in v[10][0] and v[10][1] == "switch"
     assert v[-1] is True
     rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
     assert [r["word"] for r in rows][:3] == ["quiet", "away", "set lets approvals until input"]
