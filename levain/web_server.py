@@ -1176,6 +1176,11 @@ _NOTIFY_TOKENS_REVOKE = "/webpush/notify/tokens/revoke"
 _NOTICES = "/webpush/notices"
 _NOTICES_DISMISS = "/webpush/notices/dismiss"
 _NOTICES_LIMIT = 100
+# the cockpit Inbox (1101-6): pings and notices as one list with server-held read marks; the full credential's alone
+_INBOX = "/webpush/inbox"
+_INBOX_UNREAD = "/webpush/inbox/unread_count"
+_INBOX_READ = "/webpush/inbox/read"
+_INBOX_LIMIT = 100
 # the whole request body, refused on its declared length before it is read: in bytes, sized so a title and a body at
 # their character maxima in 4-byte UTF-8 still fit
 _NOTIFY_MAX_REQUEST = 8192
@@ -1183,10 +1188,11 @@ _NOTIFY_KEYS = frozenset({"title", "body", "priority"})
 _NOTIFY_DEFAULT_TITLE = "Notice"            # a post with no title carries this; the source label is put in front of it
 _NOTIFY_MINT_KEYS = frozenset({"name", "source", "urgent", "max_priority", "rate_per_min", "rate_per_day",
                                "urgent_per_hour"})
-_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH, _NOTIFY_TOKENS, _NOTICES})
+_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH, _NOTIFY_TOKENS, _NOTICES,
+                      _INBOX, _INBOX_UNREAD})
 _PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
                         _POLICY_SET, _POLICY_RESET, _PRESENCE_SET, _PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE,
-                        _NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE, _NOTICES_DISMISS})
+                        _NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE, _NOTICES_DISMISS, _INBOX_READ})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
 # A device's receipt for a push it got: the one webpush POST that takes no token (the worker holds none). Its report names
 # the SHA-256 of the device's own subscription endpoint, checked by the store; it is kept OUT of _PUSH_POST so every route
@@ -1216,7 +1222,7 @@ def _push_static() -> frozenset[str]:
     return STATIC_PATHS
 
 
-def _push_notice(queue: Path, ping_id: int, kind: str, ref: str, title: str, body: str) -> None:
+def _push_notice(queue: Path, ping_id: int, kind: str, ref: str, title: str, body: str, notice_id: "int | None" = None) -> None:
     """Push one recorded notice to the live subscriptions, off the request thread (a push service can take most of
     :data:`levain.webpush.sender.WALL_BUDGET`, and the poster is a script that should not wait on it). A failure here is
     in the ping's delivery rows, never the poster's reply."""
@@ -1224,7 +1230,8 @@ def _push_notice(queue: Path, ping_id: int, kind: str, ref: str, title: str, bod
         from levain.webpush import notify, sender
         from levain.webpush.store import PushStore
 
-        sender.deliver(queue, PushStore(queue), ping_id, kind=kind, ref=ref, title=title, body=body, url=notify.NOTICES_URL)
+        sender.deliver(queue, PushStore(queue), ping_id, kind=kind, ref=ref, title=title, body=body,
+                       url=notify.inbox_url(notice_id))
     except Exception:  # noqa: BLE001 - the notice is recorded; its push is best effort
         pass
 
@@ -1233,7 +1240,7 @@ def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
     """Act on an admitted notice: store it, then do what the operator's notification policy says (the same ``decide`` a
     seat's ping meets, through :func:`levain.webpush.notify.decide_now`). ``pushed``: the ping is recorded and sent to
     the phones; ``held``: it waits in the held queue for the existing flush; ``recorded`` (low): stored only. The ping's
-    ref is ``notify:<source>`` (the push's tag and topic) and its link is the notices view, both fixed by Levain; the title
+    ref is ``notify:<source>`` (the push's tag and topic) and its link is its own Inbox row, both fixed by Levain; the title
     carries the token's source label. Returns ``{"id", "decision"}``."""
     import threading
 
@@ -1242,13 +1249,13 @@ def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
 
     decision, reason = notify.decide_now(queue, adm.priority)
     ref = notify.notice_ref(adm.source)
-    hold = (notify.NOTICES_URL, reason or "active") if decision == "held" else None
+    hold = (notify.INBOX_URL, reason or "active") if decision == "held" else None
     # the ping, its held row and the notice are one transaction: a failure stores none of them, and the caller says so
     ping_id, nid = PushStore(queue).record_notice(adm.kind, ref, adm.display, adm.source, adm.title, adm.body,
                                                   adm.priority, adm.token, decision, hold=hold)
     if decision == "pushed":
         try:
-            threading.Thread(target=_push_notice, args=(queue, ping_id, adm.kind, ref, adm.display, adm.body),
+            threading.Thread(target=_push_notice, args=(queue, ping_id, adm.kind, ref, adm.display, adm.body, nid),
                              daemon=True, name="levain-notice-push").start()
         except RuntimeError:  # no thread to be had: the notice is stored, and its push is best effort
             _log.warning("notify: the push thread for a stored notice did not start")
@@ -2360,6 +2367,11 @@ class _Handler(GuardedHandler):
                     self._send(json.dumps(doc).encode("utf-8"), "application/json; charset=utf-8", status=st,
                                head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
                     return
+                if path in (_INBOX, _INBOX_UNREAD):
+                    doc, st = self._inbox_view(queue, path == _INBOX_UNREAD)
+                    self._send(json.dumps(doc).encode("utf-8"), "application/json; charset=utf-8", status=st,
+                               head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+                    return
                 if path == _PRESENCE_PATH:
                     self._send(json.dumps(self._presence_view(queue)).encode("utf-8"), "application/json; charset=utf-8",
                                status=200, head=head,
@@ -2394,6 +2406,8 @@ class _Handler(GuardedHandler):
             return self._notify_token_post(route, raw)
         if route == _NOTICES_DISMISS:
             return self._notice_dismiss_post(raw)
+        if route == _INBOX_READ:
+            return self._inbox_read_post(raw)
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
             return self._pair_and_subscribe(raw, name)
@@ -2572,6 +2586,51 @@ class _Handler(GuardedHandler):
             {"id": r["id"], "at": r["at"], "source": r["source"], "title": r["title"], "body": r["body"],
              "priority": r["priority"], "decision": r["decision"], "opened": r["ping_id"] in opened,
              "revoked": live is not None and r["token"] not in live} for r in rows]}, 200
+
+    def _inbox_view(self, queue: Path, count_only: bool) -> "tuple[dict[str, Any], int]":
+        """``GET /webpush/inbox``: the newest items, pings and undismissed notices merged, each row's id (``p<n>`` / ``n<n>``),
+        kind, title, body, at, source, priority, decision, whether a device opened its ping, whether it is read and whether it can be
+        dismissed (a notice), with the unread count beside. ``GET /webpush/inbox/unread_count``: the count alone, split by kind
+        (``unread`` all, ``pings``, ``notices``) so a surface counts the kinds it chooses. Text only, as the notices card."""
+        from levain.webpush.store import PushStore
+
+        try:
+            store = PushStore(queue)
+            counts = store.inbox_counts()
+            if count_only:
+                return counts, 200
+            rows = store.inbox(_INBOX_LIMIT)
+        except Exception as exc:  # noqa: BLE001 - a list that cannot be read is an answer, never an empty inbox
+            return {"error": "inbox_unreadable", "message": type(exc).__name__}, 503
+        keep = ("id", "kind", "title", "body", "at", "source", "priority", "decision", "opened", "read")
+        return {"items": [dict({k: r[k] for k in keep}, dismissable=r["kind"] == "notice") for r in rows],
+                **counts}, 200
+
+    def _inbox_read_post(self, raw: bytes) -> "tuple[dict[str, Any], int]":
+        """``POST /webpush/inbox/read`` with exactly one of ``{id}`` (that item), ``{up_to}`` (that item and every older one) or
+        ``{all: true}``. An unknown id (pruned, dismissed) is a 404 and nothing is written."""
+        from levain.webpush.store import PushStore
+
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {"error": "bad_json", "message": "body is not valid JSON"}, 400
+        ok = isinstance(req, dict) and len(req) == 1 and next(iter(req)) in ("id", "up_to", "all")
+        key = next(iter(req)) if ok else ""
+        val = req[key] if ok else None
+        if not ok or (key == "all" and val is not True) or (key != "all" and not isinstance(val, str)):
+            return {"error": "bad_request", "message": "send one of id, up_to (an item id) or all: true"}, 400
+        try:
+            store = PushStore(self.server.signer.queue_dir)
+            if key == "all":
+                done = {"read": "all", "marked": store.mark_inbox_read_all()}
+            elif (store.mark_inbox_read if key == "id" else store.mark_inbox_read_up_to)(val):
+                done = {"read": val}
+            else:
+                return {"error": "not_found", "message": "no such item, or it is gone"}, 404
+            return {**done, **store.inbox_counts()}, 200
+        except Exception as exc:  # noqa: BLE001
+            return {"error": "inbox_unreadable", "message": type(exc).__name__}, 503
 
     def _notice_dismiss_post(self, raw: bytes) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/notices/dismiss {id}``: take one notice off the card. The full credential's alone; an unknown or

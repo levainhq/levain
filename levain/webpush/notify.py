@@ -13,7 +13,7 @@ import unicodedata
 
 from levain.webpush import presence
 
-__all__ = ["BODY_MAX", "TITLE_MAX", "PRIORITIES", "NOTICES_URL", "NotifyRefused", "clean_body", "clean_title",
+__all__ = ["BODY_MAX", "TITLE_MAX", "PRIORITIES", "NOTICES_URL", "INBOX_URL", "inbox_url", "NotifyRefused", "clean_body", "clean_title",
            "decide_now", "display_title", "kind_for", "notice_ref", "notify_decision"]
 
 TITLE_MAX = 80
@@ -23,6 +23,14 @@ RANK = {p: i for i, p in enumerate(PRIORITIES)}
 # where a notice's push opens: a fixed link of Levain's own, never one the poster chose (a page without a notices view
 # falls back to the board)
 NOTICES_URL = "/?view=notices"
+# the cockpit Inbox (1101-6): the list a notice's push now opens, on the one item it is about (``n=<item id>``). The id is
+# Levain's own (``n<notice id>``), never text the poster chose.
+INBOX_URL = "/?view=inbox"
+
+
+def inbox_url(notice_id: "int | None") -> str:
+    """The link a notice's push opens: the Inbox on that notice (the bare Inbox when there is no notice id)."""
+    return INBOX_URL if notice_id is None else f"{INBOX_URL}&n=n{int(notice_id)}"
 # a title that opens with a bracketed label would read as another source's label once ours is put in front of it
 _OPENS_WITH_LABEL = re.compile(r"^\s*[\[【〔〖「『［⟦⸨].{0,60}?[\]】〕〗」』］⟧⸩]")
 

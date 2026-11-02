@@ -47,7 +47,7 @@ STAMP_NAME = "flush.spawned"
 SPAWN_LOCK_NAME = "flush.spawn.lock"
 
 
-NOTICES_SUMMARY_URL = "/?view=notices"
+NOTICES_SUMMARY_URL = "/?view=inbox"       # a summary links the list; each released notice links its own row
 _NOTICE_KINDS = ("notify", "notify_urgent")
 _SUMMARY_SOURCES = 4     # the sources a notice summary names before "and N more"
 
@@ -246,8 +246,13 @@ def _flush(queue_dir: Path | str, at: float, idle: Callable[[], float | None] | 
     pushed = 0
     for item in muted + active:
         try:
+            url = item["url"]
+            if _is_notice(item):       # the notice's own row, found by its ping (the hold was written before the ids existed)
+                from levain.webpush import notify
+
+                url = notify.inbox_url(store.notice_id_for_ping(item["ping_id"]))
             results = sender.deliver(qdir, store, item["ping_id"], kind=item["kind"], ref=item["ref"],
-                                     title=item["title"], body=item["body"], url=item["url"])
+                                     title=item["title"], body=item["body"], url=url)
             if _pushed(results):
                 store.release_held(item["ping_id"])
                 pushed += 1

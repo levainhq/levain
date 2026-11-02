@@ -157,6 +157,9 @@ _SCHEMA: tuple[str, ...] = (
     "title TEXT NOT NULL, body TEXT NOT NULL, priority TEXT NOT NULL CHECK (priority IN ('low','normal','urgent')), "
     "token TEXT NOT NULL, decision TEXT NOT NULL CHECK (decision IN ('pushed','held','recorded')), "
     "ping_id INTEGER REFERENCES pings(id), dismissed_at TEXT)",
+    # the cockpit Inbox's read marks (1101-6): one row per item read, ``p<ping id>`` or ``n<notice id>``. A mark is a fact the
+    # server holds, so two devices agree. Not a record table: a pruned notice's mark is deleted with it.
+    "CREATE TABLE IF NOT EXISTS inbox_reads (item TEXT PRIMARY KEY, read_at TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS receipts_device_reported ON receipts (device_id, reported_at)",
     "CREATE INDEX IF NOT EXISTS targets_ping_sub ON targets (ping_id, subscription_id)",
     "CREATE INDEX IF NOT EXISTS deliveries_ping_sub ON deliveries (ping_id, subscription_id)",
@@ -259,6 +262,11 @@ class PushStore:
             # a subscription with no device is one no revoke can stop: none is stored any more, and any left is retired
             conn.execute("UPDATE subscriptions SET retired_at = ? WHERE device_id IS NULL AND retired_at IS NULL",
                          (now_stamp(),))
+            # the Inbox floors: what existed when the Inbox first came is history, read; set once, never moved
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('inbox_floor_ping', "
+                         "(SELECT CAST(COALESCE(MAX(id), 0) AS TEXT) FROM pings))")
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('inbox_floor_notice', "
+                         "(SELECT CAST(COALESCE(MAX(id), 0) AS TEXT) FROM notices))")
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('format', ?)", (STORE_FORMAT,))
             conn.execute("COMMIT")
         except BaseException:
@@ -366,6 +374,8 @@ class PushStore:
         c.execute("DELETE FROM notices WHERE at < ?", (time.strftime(STAMP, time.gmtime(at - NOTICES_DAYS * 86400)),))
         c.execute("DELETE FROM notices WHERE id NOT IN (SELECT id FROM notices ORDER BY id DESC LIMIT ?)",
                   (NOTICES_KEEP,))
+        c.execute("DELETE FROM inbox_reads WHERE item LIKE 'n%' AND CAST(SUBSTR(item, 2) AS INTEGER) "
+                  "NOT IN (SELECT id FROM notices)")
         return nid
 
     def notices(self, limit: int = 100, *, include_dismissed: bool = False) -> list[dict[str, Any]]:
@@ -391,6 +401,111 @@ class PushStore:
         with self.write() as c:
             return c.execute("UPDATE notices SET dismissed_at = ? WHERE id = ? AND dismissed_at IS NULL",
                              (time.strftime(STAMP, time.gmtime(at)), notice_id)).rowcount == 1
+
+    # --- the Inbox: pings and notices as one list, with server-held read marks ----------------------------
+    # Per-row marks, not one watermark: the two kinds count ids apart, and a tap on a push reads one item out of order.
+    # What existed when the Inbox came is read by the two floors (meta), so an upgrade does not make history unread.
+    @staticmethod
+    def _inbox_floor(c: sqlite3.Connection, key: str) -> int:
+        row = c.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        try:
+            return int(row[0]) if row else 0
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _inbox_rows(c: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
+        fp, fn = PushStore._inbox_floor(c, "inbox_floor_ping"), PushStore._inbox_floor(c, "inbox_floor_notice")
+        marked = {r[0] for r in c.execute("SELECT item FROM inbox_reads")}
+        cutoff = time.strftime(STAMP, time.gmtime(time.time() - NOTICES_DAYS * 86400))
+        rows: list[dict[str, Any]] = []
+        for n in c.execute("SELECT n.*, EXISTS(SELECT 1 FROM opens o WHERE o.ping_id = n.ping_id) AS was_opened "
+                           "FROM notices n WHERE n.dismissed_at IS NULL ORDER BY n.id DESC LIMIT ?", (NOTICES_KEEP,)):
+            item = f"n{n['id']}"
+            rows.append({"id": item, "kind": "notice", "title": n["title"], "body": n["body"], "at": n["at"],
+                         "source": n["source"], "priority": n["priority"], "decision": n["decision"],
+                         "opened": bool(n["was_opened"]), "read": n["id"] <= fn or item in marked,
+                         "ping_id": n["ping_id"], "notice_id": n["id"], "_n": n["id"]})
+        # a notice's own ping is the notice, shown once; a summary only links to a view
+        for p in c.execute("SELECT p.*, EXISTS(SELECT 1 FROM opens o WHERE o.ping_id = p.id) AS was_opened, "
+                           "h.ping_id AS held_id FROM pings p LEFT JOIN held h ON h.ping_id = p.id AND h.released_at IS NULL "
+                           "WHERE p.kind NOT IN ('summary', 'notify', 'notify_urgent') AND p.at >= ? "
+                           "ORDER BY p.id DESC LIMIT ?", (cutoff, NOTICES_KEEP)):
+            item = f"p{p['id']}"
+            rows.append({"id": item, "kind": "ping", "title": p["title"], "body": p["body"], "at": p["at"],
+                         "source": p["kind"], "priority": "normal",
+                         "decision": "held" if p["held_id"] is not None else "pushed", "opened": bool(p["was_opened"]),
+                         "read": p["id"] <= fp or item in marked, "ping_id": p["id"], "notice_id": None, "_n": p["id"]})
+        rows.sort(key=lambda r: (r["at"], r["_n"]), reverse=True)
+        return rows[:limit]
+
+    def inbox(self, limit: int = 100) -> list[dict[str, Any]]:
+        """The newest ``limit`` items, pings and undismissed notices merged, each with its ``read`` mark."""
+        lim = max(0, min(int(limit), NOTICES_KEEP))
+        with self.read() as c:
+            rows = self._inbox_rows(c, lim)
+        for r in rows:
+            r.pop("_n", None)
+        return rows
+
+    def inbox_counts(self) -> dict[str, int]:
+        """Unread items now: ``unread`` (all), and ``pings`` / ``notices`` apart, so a surface can count the kinds it wants."""
+        with self.read() as c:
+            rows = self._inbox_rows(c, 10 ** 6)
+        pings = sum(1 for r in rows if not r["read"] and r["kind"] == "ping")
+        notices = sum(1 for r in rows if not r["read"] and r["kind"] == "notice")
+        return {"unread": pings + notices, "pings": pings, "notices": notices}
+
+    @staticmethod
+    def _inbox_find(c: sqlite3.Connection, item: Any) -> "dict[str, Any] | None":
+        if not isinstance(item, str) or not re.fullmatch(r"[pn][1-9][0-9]{0,17}", item):
+            return None
+        num = int(item[1:])
+        if item[0] == "n":
+            row = c.execute("SELECT at FROM notices WHERE id = ? AND dismissed_at IS NULL", (num,)).fetchone()
+        else:
+            row = c.execute("SELECT at FROM pings WHERE id = ? AND kind NOT IN ('summary','notify','notify_urgent')",
+                            (num,)).fetchone()
+        return None if row is None else {"item": item, "at": row[0]}
+
+    def mark_inbox_read(self, item: str) -> bool:
+        """Mark one item read (again is a no-op that still answers True); False when there is no such item (pruned, dismissed
+        or never was), nothing written."""
+        with self.write() as c:
+            if self._inbox_find(c, item) is None:
+                return False
+            c.execute("INSERT OR IGNORE INTO inbox_reads (item, read_at) VALUES (?, ?)", (item, now_stamp()))
+            return True
+
+    def mark_inbox_read_up_to(self, item: str) -> bool:
+        """Mark that item and every item at or before its time read (the stamps are whole seconds: same second, same mark)."""
+        with self.write() as c:
+            found = self._inbox_find(c, item)
+            if found is None:
+                return False
+            self._mark_where(c, found["at"])
+            return True
+
+    def mark_inbox_read_all(self) -> int:
+        """Mark everything in the list read; returns how many were unread."""
+        with self.write() as c:
+            return self._mark_where(c, None)
+
+    def _mark_where(self, c: sqlite3.Connection, up_to_at: "str | None") -> int:
+        n = 0
+        stamp = now_stamp()
+        for r in self._inbox_rows(c, 10 ** 6):
+            if r["read"] or (up_to_at is not None and r["at"] > up_to_at):
+                continue
+            c.execute("INSERT OR IGNORE INTO inbox_reads (item, read_at) VALUES (?, ?)", (r["id"], stamp))
+            n += 1
+        return n
+
+    def notice_id_for_ping(self, ping_id: int) -> "int | None":
+        """The notice a ping was made for (the id its push link names), None when it belongs to none."""
+        with self.read() as c:
+            row = c.execute("SELECT id FROM notices WHERE ping_id = ?", (int(ping_id),)).fetchone()
+        return None if row is None else int(row[0])
 
     # --- the held queue ------------------------------------------------------------------------------
     @staticmethod
