@@ -12,8 +12,11 @@ connections from ``AgentStore.read()`` or ``AgentStoreView.read()``), and the on
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import sqlite3
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,12 +30,14 @@ DEAD = "dead"              # the source is gone or unreadable: a failure
 UNKNOWN = "unknown"        # no evidence either way
 NOT_MEASURED = "not-measured"
 
-# An error body written where input should be (an HTTP error page, a traceback, an {"error": ...} reply) is small;
-# a real input of that size would not start with an error marker, so both tests must hold.
+# An error body written where input should be (an HTTP error page, a traceback, an {"error": ...} reply) is small and
+# shaped like an envelope. A bare word such as "error" inside real data is not a stub, so only a leading shape counts.
 STUB_MAX_BYTES = 1024
-_ERROR_MARKERS = (b"error", b"traceback", b"exception", b"failed", b"unauthorized", b"forbidden", b"not found",
-                  b"timed out", b"timeout", b"rate limit", b"denied")
-_JSON_ERROR_HEAD = (b'{"error"', b'{"errors"', b'{"message"', b"<html", b"<!doctype")
+_ENVELOPE_KEYS = frozenset({"error", "errors", "message", "status", "statuscode", "code", "detail", "details", "type",
+                            "request_id", "requestid"})
+_JSON_ERROR_LEAD = re.compile(r'\{\s*"errors?"\s*:')
+_TEXT_ERROR_HEAD =re.compile(r"(?:traceback \(most recent call last\)|(?:error|fatal|exception)\s*[:\[]"
+                              r"|http/\d(?:\.\d)?\s+[45]\d\d\b)", re.IGNORECASE)
 
 DEFAULT_STALE_AFTER = 2 * 24 * 3600    # seconds; a reading older than this says so
 
@@ -72,46 +77,80 @@ def _gauge(name: str, value: str, detail: str, observed: datetime | None, now: d
 
 
 def _looks_like_error(head: bytes) -> bool:
-    low = head.lstrip().lower()
-    return low.startswith(_JSON_ERROR_HEAD) or any(m in low[:200] for m in _ERROR_MARKERS)
+    text = head.decode("utf-8", "replace").lstrip()
+    low = text.lower()
+    if low.startswith(("<html", "<!doctype html")):
+        return True
+    if text.startswith("{"):
+        try:
+            body = json.loads(text)
+        except ValueError:    # a cut-off reply still leads with its error key
+            return _JSON_ERROR_LEAD.match(text) is not None
+        if not isinstance(body, dict):
+            return False
+        keys = {str(k).lower() for k in body}
+        return bool(keys & {"error", "errors"}) and keys <= _ENVELOPE_KEYS and bool(body.get("error") or body.get("errors"))
+    return _TEXT_ERROR_HEAD.match(text) is not None
+
+
+def _as_path(source: object) -> Path | None:
+    """The path ``source`` names, or None when it cannot be made into one on this host."""
+    try:
+        raw = os.fspath(source)    # type: ignore[arg-type]
+        if isinstance(raw, bytes):
+            raw = os.fsdecode(raw)
+        return Path(raw).expanduser() if raw.strip() else None
+    except (TypeError, ValueError, RuntimeError, OSError):
+        return None
 
 
 def input_liveness(source: str | os.PathLike | None, now: datetime, *, stale_after: int = DEFAULT_STALE_AFTER) -> Gauge:
     """Whether the input at ``source`` (a file path) is real. A missing source is DEAD, an empty file or an error
-    stub (small and error-shaped) is QUIET with no real input, anything else is OK. A source that is not a path
-    this host can stat is UNKNOWN: this gauge makes no network call to find out."""
+    stub (small and envelope-shaped) is QUIET with no real input, anything else is OK. A source that is not a path
+    this host can open is UNKNOWN: this gauge makes no network call to find out. The size and the content come from
+    one descriptor, so a file replaced mid-read cannot pair one file's size with another's bytes."""
     name = "input_liveness"
-    if source is None or not str(source).strip():
+    if source is None:
         return _gauge(name, UNKNOWN, "the spec names no input source", None, now, stale_after)
-    path = Path(str(source)).expanduser()
+    path = _as_path(source)
+    if path is None:
+        return _gauge(name, UNKNOWN, "the input source is not a path this host can use", None, now, stale_after)
     try:
-        st = path.stat()
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return _gauge(name, DEAD, "the input source is gone", None, now, stale_after)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         return _gauge(name, UNKNOWN, f"the input source cannot be examined ({type(e).__name__})", None, now, stale_after)
-    if not path.is_file():
-        return _gauge(name, UNKNOWN, "the input source is not a file", None, now, stale_after)
-    mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
-    if st.st_size == 0:
-        return _gauge(name, QUIET, "no real input: the file is empty", mtime, now, stale_after)
     try:
-        with open(path, "rb") as f:
-            head = f.read(STUB_MAX_BYTES + 1)
-    except OSError as e:
-        return _gauge(name, DEAD, f"the input source cannot be read ({type(e).__name__})", mtime, now, stale_after)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return _gauge(name, UNKNOWN, "the input source is not a file", None, now, stale_after)
+        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+        try:
+            head = os.read(fd, STUB_MAX_BYTES + 1)
+        except OSError as e:
+            return _gauge(name, DEAD, f"the input source cannot be read ({type(e).__name__})", mtime, now, stale_after)
+    finally:
+        os.close(fd)
+    if not head:
+        return _gauge(name, QUIET, "no real input: the file is empty", mtime, now, stale_after)
     if len(head) <= STUB_MAX_BYTES and _looks_like_error(head):
-        return _gauge(name, QUIET, f"no real input: a {st.st_size}-byte error stub", mtime, now, stale_after)
+        return _gauge(name, QUIET, f"no real input: a {len(head)}-byte error stub", mtime, now, stale_after)
     return _gauge(name, OK, f"{st.st_size} bytes of input", mtime, now, stale_after)
 
 
 def _latest(conn: sqlite3.Connection, agent_id: str, state: str | None = None) -> tuple | None:
-    sql = ("SELECT state, admitted_at, launched_at, ended_at, reason FROM agent_occurrences WHERE agent_id = ?")
+    """The newest occurrence of the agent's CURRENT spec: a run of an earlier revision says nothing of this one, and an
+    agent with no current spec has no evidence. Ties on the second-resolution stamp break by insertion order."""
+    sql = ("SELECT o.state, o.admitted_at, o.launched_at, o.ended_at, o.reason FROM agent_occurrences o"
+           " JOIN agents a ON a.agent_id = o.agent_id"
+           " JOIN agent_specs s ON s.agent_id = a.agent_id AND s.version = a.current_version AND s.spec_hash = o.spec_hash"
+           " WHERE o.agent_id = ?")
     args: list = [agent_id]
     if state is not None:
-        sql += " AND state = ?"
+        sql += " AND o.state = ?"
         args.append(state)
-    sql += " ORDER BY admitted_at DESC, occurrence_id DESC LIMIT 1"
+    sql += " ORDER BY o.admitted_at DESC, o.rowid DESC LIMIT 1"
     return conn.execute(sql, args).fetchone()
 
 
@@ -126,15 +165,22 @@ def output_arrival(conn: sqlite3.Connection, agent_id: str, destination: str | o
         return _gauge(name, UNKNOWN, "no finished run to look for output from", None, now, stale_after)
     ended = _parse_stamp(row[3])
     began = _parse_stamp(row[2]) or _parse_stamp(row[1])
-    if destination is None or not str(destination).strip():
-        return _gauge(name, UNKNOWN, "the spec names no output destination", ended, now, stale_after)
+    path = _as_path(destination) if destination is not None else None
+    if path is None:
+        return _gauge(name, UNKNOWN, "the spec names no usable output destination", ended, now, stale_after)
     try:
-        mtime = datetime.fromtimestamp(Path(str(destination)).expanduser().stat().st_mtime, tz=timezone.utc)
+        st = path.stat()
     except FileNotFoundError:
         return _gauge(name, DEAD, "the last run is done and its destination is missing", ended, now, stale_after)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         return _gauge(name, UNKNOWN, f"the destination cannot be examined ({type(e).__name__})", ended, now, stale_after)
-    if began is not None and mtime < began:
+    if not stat.S_ISREG(st.st_mode):
+        return _gauge(name, UNKNOWN, "the destination is not a file", ended, now, stale_after)
+    mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+    if began is None:
+        return _gauge(name, UNKNOWN, "the last run has no start stamp to compare the destination with", mtime, now,
+                      stale_after)
+    if mtime < began:
         return _gauge(name, DEAD, "the destination is older than the last run", mtime, now, stale_after)
     return _gauge(name, OK, "the destination was written by the last run", mtime, now, stale_after)
 
@@ -144,7 +190,8 @@ def fate_of_output(conn: sqlite3.Connection, agent_id: str, output: dict | None,
     cadence": OK when a run finished inside ``drill_cadence`` seconds, DEAD when the latest finished run is older,
     UNKNOWN with none. A push output has no fate measure here (its arrival is :func:`output_arrival`)."""
     name = "fate_of_output"
-    cls = (output or {}).get("class")
+    output = output if isinstance(output, dict) else {}
+    cls = output.get("class")
     if cls == "corpus":
         return _gauge(name, NOT_MEASURED, "a corpus output is not measured", None, now, DEFAULT_STALE_AFTER)
     if cls != "recovery":
@@ -173,7 +220,7 @@ def run_health(conn: sqlite3.Connection, agent_id: str, now: datetime, *, stale_
     row = _latest(conn, agent_id)
     if row is None:
         return _gauge(name, UNKNOWN, "the agent has no runs", None, now, stale_after)
-    state, admitted, _launched, ended, _reason = row
-    when = _parse_stamp(ended) or _parse_stamp(admitted)
+    state, admitted, launched, ended, _reason = row
+    when = _parse_stamp(ended) or _parse_stamp(launched) or _parse_stamp(admitted)
     value = {"done": OK, "failed": DEAD, "skipped-no-input": QUIET}.get(state, UNKNOWN)
     return _gauge(name, value, f"the latest run is {state}", when, now, stale_after)
