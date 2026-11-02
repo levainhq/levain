@@ -658,7 +658,7 @@
                           sleep: "only what needs you reaches you, until you are active", loud: "everything reaches you" };
   const PR_ROUTE_GLOSS = { desk: "held for the terminal while you are active at the laptop",
                            devices: "pushed to your phone and cockpit even while you are active" };
-  let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prBtns = {}, prRouteBtns = {}, prDurBtns = {}, prRoute = null,
+  let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prSheetWho = null, prBtns = {}, prRouteBtns = {}, prDurBtns = {}, prRoute = null,
       prEndLoud = null, prSheetNote = null, prLink = null, prDur = "1h", prSetSec = null, prTapList = null, prNote = null,
       prNew = null, prName = null, prChecks = {}, prBusy = false, prGen = 0, prReadId = 0, prGone = false, prRefused = "", prCur = null;
 
@@ -689,6 +689,8 @@
     prSheetText = el("p", "pr-sheet-text");
     prSheetText.setAttribute("aria-live", "polite");
     prSheet.appendChild(prSheetText);
+    prSheetWho = el("p", "pr-sheet-who");    // two different things under two names: the desk, and you
+    prSheet.appendChild(prSheetWho);
     const words = el("div", "pr-sheet-words");
     words.setAttribute("role", "group");
     words.setAttribute("aria-label", "Set your presence");
@@ -860,11 +862,11 @@
     return r ? h + "h " + r + "m" : h + "h";
   }
 
-  // the push rule's reason, cut to a masthead's length: "desk inactive 7 min", "route: devices (his phone shows the band)" -> "route: devices"
+  // the push rule's reason, cut to a masthead's length: "you: no input at the laptop for 7 min", "route: devices (his phone shows the band)" -> "route: devices"
   function shortReason(r) {
     const rm = /^remote desk: (\S+) input (\d+) min ago/.exec(String(r || ""));   // "remote terminal 2 min ago"
     if (rm) return rm[1].replace(/-/g, " ") + " " + rm[2] + " min ago";
-    r = String(r || "").replace(/\s*\(.*$/, "").replace(/^no desk activity source: read as inactive$/, "no desk reading");
+    r = String(r || "").replace(/\s*\(.*$/, "").replace(/^no laptop input source: read as inactive$/, "no laptop reading");
     return r.length <= 40 ? r : (/\s/.test(r[40]) ? r.slice(0, 40) : r.slice(0, 40).replace(/\s+\S*$/, "")).replace(/[\s,;:.-]+$/, "") + "\u2026";
   }
   const PR_STATES = { pushing: "Pushing", holding: "Holding", muted: "Muted" };
@@ -874,17 +876,24 @@
     const eff = v.effective && PR_STATES[v.effective.state] ? v.effective : null;
     // a word on file that is DECIDING shows as the word (and its time left); anything else shows what the rule is doing now
     const w = eff ? (eff.source === "word" ? (eff.word || null) : null) : v.word;
-    let name = w ? (PR_WORDS.find((x) => x[0] === w) || [w, w])[1] : (eff ? PR_STATES[eff.state] : "Here");
+    // with no word deciding, the chip says where YOU are (measured from the laptop's input; a message to a desk counts), not what the
+    // push rule did: the rule's own state stays in the sheet text and the aria label
+    const you = eff && eff.you && (eff.you.state === "here" || eff.you.state === "away") ? eff.you : null;
+    let name = w ? (PR_WORDS.find((x) => x[0] === w) || [w, w])[1] : (you ? (you.state === "away" ? "Away" : "Here") : (eff ? PR_STATES[eff.state] : "Here"));
     let t = name, say = name;
     const ms = w && v.until ? stampMs(v.until) - Date.now() : NaN;
     if (!Number.isNaN(ms) && ms > 0) { t += " · " + span(ms); say += ", " + span(ms) + " left"; }
-    if (eff && !w) { const why = shortReason(eff.reason); if (why) { t += " · " + why; say += ", " + why; } }
+    if (eff && !w) {
+      const why = eff.remote ? shortReason(eff.reason) : (you ? you.short : shortReason(eff.reason));
+      if (why) { t += " · " + why; say += ", " + why; }
+      if (you) say += ". Pings: " + eff.state;
+    }
     else if (v.route === "devices") { t += " · devices"; say += ", pings go to devices"; }
     // the word and its tail (time, route) are separate nodes so a phone's masthead can keep the word and drop the tail
     prChipText.textContent = "";
     prChipText.appendChild(el("span", "pr-chip-w", name));
     if (t.length > name.length) prChipText.appendChild(el("span", "pr-chip-x", t.slice(name.length)));
-    prChip.dataset.state = w || (eff ? eff.state : "here");
+    prChip.dataset.state = w || (you && you.state === "away" ? "away" : (eff ? eff.state : "here"));
     prChip.setAttribute("aria-label", "Presence: " + say + ". Change it");
   }
 
@@ -893,6 +902,9 @@
     const w = v.word;
     paintChip(v);
     prSheetText.textContent = v.text || "";
+    const ef = v.effective || {};
+    prSheetWho.textContent = [ef.desk && ef.desk.text, ef.you && ef.you.text].filter(Boolean).join(" \u00b7 ");
+    prSheetWho.hidden = !prSheetWho.textContent;
     for (const [k, b] of Object.entries(prBtns)) b.setAttribute("aria-pressed", k === w || (k === "back" && !w) ? "true" : "false");
     prEndLoud.hidden = w !== "loud";
     const r = v.route === "devices" ? "devices" : "desk";

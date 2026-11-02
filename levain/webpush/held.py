@@ -129,8 +129,11 @@ def _plan_now(queue_dir: Path | str, at: float, idle: Callable[[], float | None]
         return [], []
     from levain.webpush import route
 
-    return plan(items, presence.read_word(queue_dir), _idle_source(idle)(), at, presence.read_policy(queue_dir)[0],
-                route.read_route(queue_dir, at)[0])
+    from levain.webpush import desk
+
+    # a message to a desk at the laptop is input here too, exactly as in the rule a delivery reads (presence._core)
+    return plan(items, presence.read_word(queue_dir), desk.adjust_reading(queue_dir, _idle_source(idle)(), at), at,
+                presence.read_policy(queue_dir)[0], route.read_route(queue_dir, at)[0])
 
 
 def _inside_spawn_gap(queue_dir: Path | str) -> bool:

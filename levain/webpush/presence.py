@@ -1,6 +1,6 @@
 """levain.webpush.presence — whether a ping is pushed to the phone now. One rule, no state precedence:
 
-    push = not muted AND (urgent OR not_home OR desk inactive >= ACTIVE_WINDOW_SECS)        ... unless loud
+    push = not muted AND (urgent OR not_home OR no input at the laptop for >= ACTIVE_WINDOW_SECS)        ... unless loud
 
 That is the shipped default. While ``quiet`` or ``sleep`` is active the operator's policy cell for the ping's class
 (``approval``, ``attention``, ``other``: :data:`KIND_CLASSES`) decides push or hold, kept in
@@ -38,9 +38,10 @@ is the only thing that holds a ping at the desk. The precedence is exact: if he 
 remote record is still fresh, the answer is STILL pushing until the record ages out (the remote reading is not cleared by
 laptop input). :func:`effective` carries the fresh record as ``remote`` so flow can tag a row filed needing the laptop.
 
-Desk activity is the macOS HID idle time (:func:`levain.consent.auto_away.input_idle_seconds`): measured, never
-predicted. With no such source, or no readable word, nothing is muted and the desk reads inactive: a ping he did not
-need costs one notification, a ping he needed and never got costs the day. This host has no location signal, so
+The operator's activity is the macOS HID idle time (:func:`levain.consent.auto_away.input_idle_seconds`): measured, never
+predicted, and a message he sent to a desk at the laptop counts as input too (:mod:`levain.webpush.desk`, which also keeps
+the desk's liveness record and the Here / Away reading the chip shows). With no such source, or no readable word, nothing is
+muted and he reads inactive: a ping he did not need costs one notification, a ping he needed and never got costs the day. This host has no location signal, so
 ``not_home`` is the ``away`` word alone.
 
 A word may carry who set it. A seat the operator told ("heading out") may set only :data:`SEAT_WORDS`, and the
@@ -288,10 +289,10 @@ def _decide(now: float, word: dict | None, idle: float | None, *, urgent: bool =
     if route == "devices":
         return Decision(True, "pushing", "route: devices (his phone shows the band)"), "measured"
     if seen is None:
-        return Decision(True, "pushing", "no desk activity source: read as inactive"), "measured"
+        return Decision(True, "pushing", "no laptop input source: read as inactive"), "measured"
     if idle is not None and idle >= ACTIVE_WINDOW_SECS:
-        return Decision(True, "pushing", f"desk inactive {int(idle // 60)} min"), "measured"
-    return Decision(False, "holding", f"desk active {int((idle or 0.0) // 60)} min ago"), "measured"
+        return Decision(True, "pushing", f"you: no input at the laptop for {int(idle // 60)} min"), "measured"
+    return Decision(False, "holding", f"you: input at the laptop {int((idle or 0.0) // 60)} min ago"), "measured"
 
 
 def _policy_path(queue_dir: Path | str) -> Path:
@@ -640,8 +641,9 @@ _UNSET = object()   # "read it yourself", distinct from None (no word on file / 
 
 def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Callable[[], float | None] | None,
           suggest: bool, word: object = _UNSET, reading: object = _UNSET,
-          route: object = _UNSET, remote: object = _UNSET) -> tuple[Decision, str, dict | None, dict | None]:
-    """The one place the rule is read: ``(decision, source, word, remote)`` for a ``kind`` of ping at ``now``. Both
+          route: object = _UNSET, remote: object = _UNSET) -> tuple[Decision, str, dict | None, dict | None, float | None]:
+    """The one place the rule is read: ``(decision, source, word, remote, reading)`` for a ``kind`` of ping at ``now``
+    (``reading``: the laptop input idle seconds the rule used, a recent desk message counted as input). Both
     :func:`should_push` and :func:`effective` call it, so the push and the chip cannot diverge. Raises on a fault; the
     callers read that as push. ``word`` and ``reading`` let a caller that already sampled the word and the idle time have
     this rule work from that same snapshot (one read of each per status), not a second code path. ``remote`` is the
@@ -653,6 +655,10 @@ def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Call
         if idle is None:
             from levain.consent.auto_away import input_idle_seconds as idle
         reading = idle()
+    if queue_dir is not None:   # a message to a desk at the laptop is input too (levain.webpush.desk)
+        from levain.webpush import desk as _desk
+
+        reading = _desk.adjust_reading(queue_dir, reading, at)
     if suggest:   # delivery drives the suggestion (throttled there); a status read (``suggest=False``) never does
         try:
             _route.auto_suggest(queue_dir, idle=reading, now=at)
@@ -670,7 +676,15 @@ def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Call
     if remote is _UNSET:
         remote = read_remote_activity(queue_dir, at)
     d, source = _decide(at, word, reading, class_name=kind_class(kind), policy=read_policy(queue_dir)[0], route=r, remote=remote)
-    return d, source, word, remote
+    if suggest:   # a delivery: keep what it saw and said, and the here/away change if there was one (never a fault of the rule)
+        try:
+            from levain.webpush import desk as _desk
+
+            _desk.record_decision(queue_dir, at, kind, d.push, d.state, d.why, source, reading, word)
+            _desk.observe(queue_dir, at, reading)
+        except Exception:  # noqa: BLE001
+            pass
+    return d, source, word, remote, reading
 
 
 _FAULT = "the presence rule could not be read: pushing"
@@ -692,7 +706,8 @@ def effective(queue_dir: Path | str | None, now: float | None = None, *,
               idle: Callable[[], float | None] | None = None, suggest: bool = False,
               word: object = _UNSET, reading: object = _UNSET, route: object = _UNSET, remote: object = _UNSET) -> dict:
     """What the rule does now with an ordinary ping, for the cockpit chip and any status read:
-    ``{state: pushing|holding|muted, pushing, reason, source: word|measured, since, word, remote}``. It is the same call
+    ``{state: pushing|holding|muted, pushing, reason, source: word|measured, since, word, remote, you, desk}``
+    (``you``: the operator's Here / Away reading; ``desk``: the desk's liveness record: :mod:`levain.webpush.desk`). It is the same call
     :func:`should_push` makes (:func:`_core`, kind ``ping``), so the chip and the push decision for the same instant are
     one answer; the route axis is folded in as there. ``source`` is ``word`` when a word on file (loud, away, quiet, sleep)
     decided, ``measured`` when the desk reading or the route decided; ``since`` is that word's time, else ``None``.
@@ -702,14 +717,34 @@ def effective(queue_dir: Path | str | None, now: float | None = None, *,
     ``remote`` is ``{source, at}`` while a fresh remote-activity record stands (whatever decided: flow derives
     [NEEDS THE LAPTOP] from it), else ``None``; a caller that read it once hands it in. A fault reads as pushing."""
     try:
-        d, source, wrec, rrec = _core(queue_dir, "ping", now, idle, suggest, word, reading, route, remote)
+        d, source, wrec, rrec, used = _core(queue_dir, "ping", now, idle, suggest, word, reading, route, remote)
     except Exception:  # noqa: BLE001 - the same fault rule as should_push
         return {"state": "pushing", "pushing": True, "reason": _FAULT, "source": "measured", "since": None,
-                "word": None, "remote": None}
+                "word": None, "remote": None, "you": None, "desk": None}
     decided = wrec if source == "word" and wrec is not None else None
     return {"state": d.state, "pushing": d.push, "reason": d.why, "source": source,
             "since": decided["ts"] if decided else None, "word": decided["word"] if decided else None,
-            "remote": {"source": rrec["source"], "at": rrec["at"]} if rrec else None}
+            "remote": {"source": rrec["source"], "at": rrec["at"]} if rrec else None,
+            "you": _you(queue_dir, now, used), "desk": _desk_view(queue_dir, now)}
+
+
+def _you(queue_dir: Path | str | None, now: float | None, used: float | None) -> dict | None:
+    """The operator's Here / Away reading for :func:`effective` (a fault reads as no reading, never as a state)."""
+    try:
+        from levain.webpush import desk as _desk
+
+        return _desk.you_view(time.time() if now is None else now, used)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _desk_view(queue_dir: Path | str | None, now: float | None) -> dict | None:
+    try:
+        from levain.webpush import desk as _desk
+
+        return _desk.read_desk(queue_dir, now)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def check_setter(word: str, by: dict | None, said: str | None) -> str:

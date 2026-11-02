@@ -2441,6 +2441,12 @@ class _Handler(GuardedHandler):
             reading = None
         if rec is not None and presence.is_expired(rec, now):
             rec = None
+        try:   # the chip's own read notices a change between Here and Away, so the log row exists without a ping
+            from levain.webpush import desk as desk_mod
+
+            desk_mod.observe(queue, now, desk_mod.adjust_reading(queue, reading, now))
+        except Exception:  # noqa: BLE001 - an event row never blocks the view
+            pass
         from levain.webpush import route as route_mod
 
         route, route_source, route_until = route_mod.read_route(queue, now)

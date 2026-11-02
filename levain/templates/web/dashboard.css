@@ -2991,6 +2991,7 @@ body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
 .pr-sheet { position: fixed; z-index: 40; top: var(--pr-top, 64px); left: var(--pr-left, 8px); width: min(340px, calc(100vw - 16px)); box-sizing: border-box;
   padding: var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-lg); box-shadow: 0 12px 32px color-mix(in oklch, var(--base) 60%, transparent); max-height: calc(100dvh - var(--pr-top, 64px) - 8px); overflow-y: auto; }
 .pr-sheet[hidden] { display: none; }
+.pr-sheet-who { margin: 0 0 var(--sp-3); color: var(--text, inherit); font: var(--fw-semibold) var(--fs-micro)/1.4 var(--sans); }
 .pr-sheet-text { margin: 0 0 var(--sp-3); color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.4 var(--sans); }
 .pr-sheet-words { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-2); }
 .pr-sheet-row { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-3); }
