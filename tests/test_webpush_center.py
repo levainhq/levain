@@ -247,3 +247,66 @@ def test_the_list_pages_newest_first_and_a_list_that_cannot_be_read_is_not_an_em
         monkeypatch.setattr(center, "list_items", lambda *a, **k: (_ for _ in ()).throw(OSError("db")))
         st, doc, _ = _get(port, LIST)
         assert st == 503 and doc["ok"] is False and "items" not in doc
+
+
+# --- S4.1 L3 r1 fixes: each built from its reproduction ---------------------------------------------------------------
+def test_600_unread_pings_are_all_reachable_and_bulk_writes_reach_them_all(tmp_path):
+    """600 unread pings (past the old per-source 500 cap): paging reaches every one once, mark-all-read takes the badge to 0,
+    and clear empties the list (the count and the rows agree)."""
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    s = PushStore(q)
+    for i in range(600):
+        s.add_ping("question", f"question:{i + 1}", "levain", f"ping {i}")
+    seen, nb = [], None
+    while True:
+        doc = center.list_items(s, limit=200, before=nb)
+        seen += _ids(doc)
+        nb = doc["next_before"]
+        if not nb:
+            break
+    assert len(seen) == len(set(seen)) == doc["total"] == 600
+    assert center.mark_all_read(s) == 0
+    center.clear(s)
+    assert center.list_items(s)["total"] == 0
+
+
+def test_a_cursor_whose_row_was_deleted_or_pruned_still_pages(tmp_path):
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    s = PushStore(q)
+    for i in range(5):
+        s.add_ping("question", f"question:{i + 1}", "levain", f"p{i}")
+    cur = center.list_items(s, limit=2)["next_before"]
+    center.delete(s, cur)
+    assert _ids(center.list_items(s, limit=2, before=cur)) == ["p3", "p2"]
+    center.clear(s)                                       # and a clear: the cursor row is hidden, still in the record
+    assert center.list_items(s, limit=2, before=cur)["items"] == []
+
+
+def test_a_held_notify_ping_with_no_notice_row_keeps_its_link(tmp_path):
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    s = PushStore(q)
+    pid = s.add_ping("notify", None, "levain", "x")
+    assert center.push_url(s, pid, "notify", "/?view=notices") == "/?view=notices"
+    assert center.push_url(s, pid, "question", "/x") == f"/?view=notifications&n=p{pid}"
+
+
+def test_one_unreadable_store_or_ref_degrades_that_item_not_the_page(tmp_path, monkeypatch):
+    from levain.webpush import record
+
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    s = PushStore(q)
+    s.add_ping("question", "question:1", "levain", "z")
+    monkeypatch.setattr(record, "outcome_of", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad ref")))
+    assert center.list_items(s)["total"] == 1
+    monkeypatch.undo()
+    monkeypatch.setattr(QuestionStore, "open_questions", lambda self: (_ for _ in ()).throw(RuntimeError("x")))
+    monkeypatch.setattr("levain.consent.listing.read_listing",
+                        lambda *a, **k: type("L", (), {"pending": [type("E", (), {"state": "pending"})()] * 3})())
+    assert needs.open_needs_count(q) == 3          # the consents still count
+    monkeypatch.undo()
+    monkeypatch.setattr(QuestionStore, "open_questions", lambda self: (_ for _ in ()).throw(RuntimeError("x")))
+    assert needs.open_needs_count(q) is None       # nothing counted and a half unreadable: unknown, never 0
