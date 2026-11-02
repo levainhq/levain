@@ -8166,10 +8166,12 @@
   async function ncMore() {
     if (!nc.next || ncUi.more) return;
     ncUi.more = true; ncPaint();
-    const gen = nc.wgen;   // a write that lands while this page is in flight makes it stale: it is dropped, never appended
-    const res = await ncApi("GET", NC_PATH + "?limit=50&before=" + encodeURIComponent(nc.next));
+    const gen = nc.wgen, cursor = nc.next;   // a write that lands while this page is in flight makes it stale: it is dropped, never appended
+    const res = await ncApi("GET", NC_PATH + "?limit=50&before=" + encodeURIComponent(cursor));
     ncUi.more = false;
     if (gen !== nc.wgen) { ncPaint(); return; }
+    // a pulse that replaced the list while this page was in flight moved the cursor: appending would leave a gap, so read again
+    if (nc.next !== cursor) { ncPaint(); ncRead(true); return; }
     if (res.status === 200 && Array.isArray(res.data.items)) {
       const have = new Set(nc.items.map((x) => x.id));
       nc.items = nc.items.concat(res.data.items.filter((x) => !have.has(x.id)));
