@@ -458,10 +458,10 @@ def _capture_payloads(monkeypatch):
     seen, done = [], threading.Event()
     real = sender.build_payload
 
-    def spy(title, body, tag, url, ping_id):
+    def spy(title, body, tag, url, ping_id, badge=None):
         seen.append({"title": title, "body": body, "tag": tag, "url": url, "ping": ping_id})
         done.set()
-        return real(title, body, tag, url, ping_id)
+        return real(title, body, tag, url, ping_id, badge)
 
     monkeypatch.setattr(sender, "build_payload", spy)
     return seen, done

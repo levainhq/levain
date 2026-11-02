@@ -56,11 +56,15 @@ def _fit(text: str, room: int) -> str:
     return text[:lo] + "..."
 
 
-def build_payload(title: str, body: str, tag: str, url: str, ping_id: int) -> bytes:
+def build_payload(title: str, body: str, tag: str, url: str, ping_id: int, badge: "int | None" = None) -> bytes:
     """The JSON the service worker reads, at most :data:`ece.MAX_PLAINTEXT` bytes as SERIALIZED (quotes and control
-    characters escape to two and six bytes, so the clip is by serialized size, never by raw length)."""
+    characters escape to two and six bytes, so the clip is by serialized size, never by raw length). ``badge``: the open
+    Needs-you count at send time (an int 0..99); omitted when unknown (None, or anything but a plain int), so the worker leaves
+    the icon as it is, never a wrong 0. Its few bytes are counted before the body is fitted."""
     payload = {"title": _fit(title, _TITLE_ROOM), "body": "", "tag": _fit(tag, _TAG_ROOM),
               "url": _fit(url, _URL_ROOM), "ping": ping_id}
+    if type(badge) is int and 0 <= badge <= 99:
+        payload["badge"] = badge
     payload["body"] = _fit(body, ece.MAX_PLAINTEXT - len(_dumps(payload)))
     data = _dumps(payload)
     assert len(data) <= ece.MAX_PLAINTEXT
@@ -158,7 +162,9 @@ def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str |
     """Push the already recorded ping ``ping_id`` to each live subscription (``device``: that device's only) and
     record each answer."""
     subs = store.live_subscriptions(device=device)
-    data = build_payload(title, body, ref or kind, url, ping_id)
+    from levain.webpush import needs
+
+    data = build_payload(title, body, ref or kind, url, ping_id, needs.badge_value(qdir))
     topic = topic_for(ref)
     reqs = [(sub, _prepare(qdir, sub, data, topic)) for sub in subs]
     statuses: dict[int, int] = {}

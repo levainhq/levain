@@ -6021,11 +6021,27 @@
     row.addEventListener("click", () => openNeedsFocus(row._needsItem || it, row));
     return row;
   }
+  // The app-icon badge heals on every Needs-you render: it is set to the count the strip shows (the same items.length), and
+  // cleared at 0, so a push that carried a stale number is corrected the moment the page opens. Only when the decisions panel
+  // actually carried its lines (a panel that did not read says nothing: never a 0 from an unread panel). Notices are not in
+  // this count. Feature-detected and caught: a browser without the Badging API, or a refusal, changes nothing else.
+  function syncAppBadge(view, n) {
+    const dec = (view && view.extra_panels || {}).decisions;
+    if (!dec || !Array.isArray(dec.lines)) return;
+    try {
+      const nav = window.navigator;
+      if (!nav) return;
+      const r = n > 0 ? (typeof nav.setAppBadge === "function" ? nav.setAppBadge(n) : null)
+                      : (typeof nav.clearAppBadge === "function" ? nav.clearAppBadge() : null);
+      if (r && typeof r.catch === "function") r.catch(() => {});
+    } catch (_) { /* a badge that cannot be set is not an error the page shows */ }
+  }
   function renderNeeds(view) {
     signRecheck();      // a board read: every frozen card asks the cockpit about its unsettled answer again
     const host = document.getElementById("ck-needs");
     if (!host) return;
     const items = needsItems(((view.extra_panels || {}).decisions || {}).lines);
+    syncAppBadge(view, items.length);
     if (!items.length) { clearNeeds(host); return; }
     // the same set of waiting items leaves the strip as it is: a card with half-typed words, an open "details" and a running
     // countdown is not rebuilt under the reader by a refetch that changed nothing about what waits

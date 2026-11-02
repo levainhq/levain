@@ -216,6 +216,24 @@ function fire(type, ev) {
       cacheNames.add('levain-receipts'); cacheStores.set('levain-receipts', m);
     }
     const data = parts.includes('noping') ? { title: 'T', body: 'secret body' } : { title: 'T', body: 'secret body', ping: 42, url: '/', tag: 'x' };
+    // the badge flags (1101-6 B): badge<N> puts N in the payload (badgestr: the string "3", badgeneg: -1, badgefloat: 2.5);
+    // nav gives the worker a navigator with setAppBadge/clearAppBadge (navset: no clearAppBadge; navthrow: both throw at
+    // once; navreject: both reject), recording every call in log.badgeCalls
+    const bn = parts.find((p) => /^badge\d+$/.test(p));
+    if (bn) data.badge = Number(bn.slice(5));
+    if (parts.includes('badgestr')) data.badge = '3';
+    if (parts.includes('badgeneg')) data.badge = -1;
+    if (parts.includes('badgefloat')) data.badge = 2.5;
+    log.badgeCalls = [];
+    if (parts.some((p) => p.startsWith('nav'))) {
+      const rec = (k) => (...a) => {
+        log.badgeCalls.push([k, ...a]);
+        if (parts.includes('navthrow')) throw new Error('badge refused');
+        return parts.includes('navreject') ? Promise.reject(new Error('badge refused')) : Promise.resolve();
+      };
+      self_.navigator = { setAppBadge: rec('set') };
+      if (!parts.includes('navset')) self_.navigator.clearAppBadge = rec('clear');
+    }
     const started = Date.now();
     const evPush = () => ({ data: { json: () => data } });
     if (!parts.includes('clickonly')) {

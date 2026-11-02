@@ -2598,7 +2598,12 @@ class _Handler(GuardedHandler):
             store = PushStore(queue)
             counts = store.inbox_counts()
             if count_only:
-                return counts, 200
+                # the open Needs-you items beside the unread split (the app-icon badge; notices never count): omitted when
+                # a store cannot be read, never a 0
+                from levain.webpush import needs
+
+                n = needs.open_needs_count(queue)
+                return (counts if n is None else {**counts, "needs_count": n}), 200
             rows = store.inbox(_INBOX_LIMIT)
         except Exception as exc:  # noqa: BLE001 - a list that cannot be read is an answer, never an empty inbox
             return {"error": "inbox_unreadable", "message": type(exc).__name__}, 503

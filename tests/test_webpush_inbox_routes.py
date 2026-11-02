@@ -40,7 +40,24 @@ def test_the_list_carries_the_shape_with_the_count_and_a_notice_is_dismissable(r
         assert ping["body"] == "line <b>1</b>" and ping["read"] is False
         assert set(notice) == {"id", "kind", "title", "body", "at", "source", "priority", "decision", "opened", "read",
                                "dismissable"}
-        assert _call(port, "GET", COUNT, token=T)[1] == {"unread": 2, "pings": 1, "notices": 1}
+        # needs_count: the open Needs-you items (none filed here; the notice does not count)
+        assert _call(port, "GET", COUNT, token=T)[1] == {"unread": 2, "pings": 1, "notices": 1, "needs_count": 0}
+
+
+def test_unread_count_carries_the_open_needs_count_and_notices_never_move_it(rig):
+    from levain.consent.questions import QuestionStore
+
+    src, q = rig
+    _seed(q)
+    QuestionStore(q).file(agent="claude_code", agent_session_id="s", what="go?", options=[("a", "yes"), ("b", "no")], rec="a",
+                          blocks="x", cwd="/w")
+    with _signed(src, q) as (port, _):
+        got = _call(port, "GET", COUNT, token=T)[1]
+        assert got["needs_count"] == 1 and got["notices"] == 1 and got["unread"] == 2
+        assert _call(port, "POST", READ, {"all": True}, token=T)[0] == 200
+        got = _call(port, "GET", COUNT, token=T)[1]
+        assert got["unread"] == 0 and got["needs_count"] == 1       # reading the inbox never touches the open Needs-you count
+        assert "needs_count" not in _call(port, "GET", LIST, token=T)[1]
 
 
 def test_read_one_up_to_and_all_and_the_bad_shapes(rig):
