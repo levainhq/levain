@@ -17,7 +17,7 @@ from levain.autonomic import agent_tables as at
 from levain.autonomic.db import DB_NAME, AutonomicDB
 
 # `sha256("\n".join(AGENT_OBJECT_DDL))`. The compare in check_agent_schema is byte-exact against these constants.
-DDL_SHA256 = "2fc46682884787619f53aca1a0a1c6e53e82cb9ec5d497138cd04868c5fb456e"
+DDL_SHA256 = "007d65fdaeaa5c07a9b70939fdd9926e0b379b271d6bbddde0cd2a579ef1f451"
 
 NOW = "2026-10-30T18:00:00Z"
 
@@ -29,7 +29,7 @@ def test_the_agent_ddl_is_pinned():
 
 def test_the_object_names_are_the_spec():
     assert len(at.AGENT_TABLES) == 8 and len(at.AGENT_TRIGGERS) == 17
-    assert at.AGENT_SCHEMA == "levain-agent-schema/2"
+    assert at.AGENT_SCHEMA == "levain-agent-schema/3"
     ref = at.reference_master()
     assert sorted(r[1] for r in ref if r[0] == "trigger") == sorted(at.AGENT_TRIGGERS)
     assert sorted(r[1] for r in ref if r[0] == "table") == sorted(at.AGENT_TABLES)
@@ -177,10 +177,10 @@ def test_agent_objects_with_no_marker_are_refused_and_nothing_is_created(good, t
 
 def test_an_unknown_marker_is_refused(good, tmp_path):
     t = tampered(good, tmp_path, "marker2", [
-        "UPDATE meta SET value = 'levain-agent-schema/3' WHERE key = 'agent_schema'"])
+        "UPDATE meta SET value = 'levain-agent-schema/4' WHERE key = 'agent_schema'"])
     reason = at.check_agent_schema(t)
     assert reason is not None and reason.startswith("unknown agent schema marker")
-    assert "'levain-agent-schema/3'" in reason
+    assert "'levain-agent-schema/4'" in reason
     t.close()
 
 
@@ -529,3 +529,114 @@ def test_a_replace_colliding_only_on_rowid_is_what_the_pragma_still_closes(tmp_p
                                  " spec, created_at) VALUES (?, 'ag-1', 7, 's7', 'r1', '{}', ?)", (rid, NOW))
         p.close()
     assert out == {0: None, 1: "agent specs are never deleted"}
+
+
+# ------------------------------------------------------------------ the /2 -> /3 migration (P7-A §4)
+
+# agent_reservations as 0.11.27 stored it: the table a real /2 store (made by the P5c-3 opener) holds
+V2_RESERVATIONS_SQL = ("CREATE TABLE agent_reservations (occurrence_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, "
+                       "window_key TEXT NOT NULL, reserved_usd_micros INTEGER NOT NULL, debited_usd_micros INTEGER, "
+                       "state TEXT NOT NULL CHECK (state IN ('open','settled')), settled_reason TEXT)")
+
+
+@pytest.fixture
+def v2(tmp_path) -> Path:
+    """A /2 store file with two reservation rows. It is the /3 opener's store with the seven columns dropped and the
+    marker set back; the table text is asserted equal to what the /2 code stored, so it is a /2 store, not a lookalike."""
+    store = tmp_path / "v2"
+    with AutonomicDB(store).write():
+        pass
+    path = store / DB_NAME
+    c = connect(path)
+    for name, _ in at.RESERVATION_COLUMNS_V3:
+        c.execute(f"ALTER TABLE agent_reservations DROP COLUMN {name}")
+    c.execute("UPDATE meta SET value = ? WHERE key = 'agent_schema'", (at.AGENT_SCHEMA_V2,))
+    c.execute("INSERT INTO agent_reservations VALUES ('oc-1','ag-1','w:x',5,NULL,'open',NULL)")
+    c.execute("INSERT INTO agent_reservations VALUES ('oc-2','ag-1','w:x',7,3,'settled','actual')")
+    assert c.execute("SELECT sql FROM sqlite_master WHERE name = 'agent_reservations'").fetchone()[0] \
+        == V2_RESERVATIONS_SQL
+    c.close()
+    return path
+
+
+def test_a_v2_store_migrates_to_v3_and_passes_the_check_with_its_rows_intact(v2):
+    c = connect(v2)
+    assert at.check_agent_schema(c) == "unknown agent schema marker 'levain-agent-schema/2'"
+    assert at.migrate_agent_schema(c) is True
+    assert at.agent_marker(c) == at.AGENT_SCHEMA and at.check_agent_schema(c) is None
+    assert [r[1] for r in c.execute("PRAGMA table_info(agent_reservations)")][7:] \
+        == [n for n, _ in at.RESERVATION_COLUMNS_V3]
+    rows = c.execute("SELECT occurrence_id, reserved_usd_micros, debited_usd_micros, state, billing, cap_actions,"
+                     " used_seconds FROM agent_reservations ORDER BY occurrence_id").fetchall()
+    assert rows == [("oc-1", 5, None, "open", None, None, None), ("oc-2", 7, 3, "settled", None, None, None)]
+    assert not c.in_transaction
+    c.close()
+
+
+def test_migrating_twice_changes_nothing(v2):
+    c = connect(v2)
+    assert at.migrate_agent_schema(c) is True
+    before = c.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall()
+    assert at.migrate_agent_schema(c) is False
+    assert c.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall() == before
+    c.close()
+
+
+def test_a_crash_before_the_marker_bump_leaves_the_store_a_whole_v2_store(v2):
+    c = connect(v2)
+
+    def deny_marker_bump(action, arg1, arg2, db, source):
+        return sqlite3.SQLITE_DENY if (action == sqlite3.SQLITE_UPDATE and arg1 == "meta") else sqlite3.SQLITE_OK
+
+    c.set_authorizer(deny_marker_bump)
+    with pytest.raises(sqlite3.DatabaseError):
+        at.migrate_agent_schema(c)
+    c.set_authorizer(None)
+    assert not c.in_transaction
+    assert at.agent_marker(c) == at.AGENT_SCHEMA_V2
+    assert c.execute("SELECT sql FROM sqlite_master WHERE name = 'agent_reservations'").fetchone()[0] \
+        == V2_RESERVATIONS_SQL
+    assert at.migrate_agent_schema(c) is True and at.check_agent_schema(c) is None    # and it resumes cleanly
+    c.close()
+
+
+def test_a_run_that_found_some_columns_already_there_finishes_the_job(v2):
+    c = connect(v2)
+    c.execute("ALTER TABLE agent_reservations ADD COLUMN billing TEXT")
+    c.execute("ALTER TABLE agent_reservations ADD COLUMN cap_actions INTEGER")
+    assert at.migrate_agent_schema(c) is True and at.check_agent_schema(c) is None
+    c.close()
+
+
+def test_only_a_v2_marker_migrates_and_the_others_are_still_refused(good, tmp_path):
+    for n, marker in enumerate(("levain-agent-schema/1", "levain-agent-schema/4", None, at.AGENT_SCHEMA)):
+        sqls = [f"UPDATE meta SET value = '{marker}' WHERE key = 'agent_schema'"] if marker else \
+            ["DELETE FROM meta WHERE key = 'agent_schema'"]
+        t = tampered(good, tmp_path, f"other{n}", sqls)
+        before = t.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall()
+        reason = at.check_agent_schema(t)
+        assert at.migrate_agent_schema(t) is False
+        assert t.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall() == before
+        assert at.check_agent_schema(t) == reason
+        t.close()
+
+
+def test_a_v2_store_with_an_altered_object_is_refused_and_left_as_it_was(v2):
+    c = connect(v2)
+    c.execute("DROP TRIGGER agent_occurrences_one_fire")
+    with pytest.raises(sqlite3.DatabaseError, match="did not migrate cleanly"):
+        at.migrate_agent_schema(c)
+    assert not c.in_transaction and at.agent_marker(c) == at.AGENT_SCHEMA_V2
+    assert c.execute("SELECT sql FROM sqlite_master WHERE name = 'agent_reservations'").fetchone()[0] \
+        == V2_RESERVATIONS_SQL
+    c.close()
+
+
+def test_the_migration_joins_a_callers_transaction_and_the_caller_decides(v2):
+    c = connect(v2)
+    c.execute("BEGIN IMMEDIATE")
+    assert at.migrate_agent_schema(c) is True
+    assert c.in_transaction
+    c.execute("ROLLBACK")
+    assert at.agent_marker(c) == at.AGENT_SCHEMA_V2
+    c.close()

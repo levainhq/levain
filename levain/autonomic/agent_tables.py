@@ -17,10 +17,19 @@ import sqlite3
 
 __all__ = ["AGENT_SCHEMA", "AGENT_TABLES", "AGENT_TRIGGERS", "AGENT_OBJECT_DDL", "create_agent_objects",
            "ddl_agents", "agent_master", "reference_master", "has_agent_object", "agent_marker",
-           "check_agent_schema"]
+           "check_agent_schema", "AGENT_SCHEMA_V2", "RESERVATION_COLUMNS_V3", "migrate_agent_schema"]
 
-# /1 named A0 r6's twelve-trigger text (F0 r1, never merged); a store carrying it is refused as an unknown marker
-AGENT_SCHEMA = "levain-agent-schema/2"
+# /1 named A0 r6's twelve-trigger text (F0 r1, never merged); a store carrying it is refused as an unknown marker.
+# /2 shipped in 0.11.27. /3 adds the seven subscription-route columns to agent_reservations (P7-A §4) and is the first
+# marker with a migration: :func:`migrate_agent_schema` takes exactly a /2 store to /3 and nothing else.
+AGENT_SCHEMA_V2 = "levain-agent-schema/2"
+AGENT_SCHEMA = "levain-agent-schema/3"
+
+# the columns /3 appends to agent_reservations, in order, as (name, type). A fresh store's DDL ends with the same text
+# ``ALTER TABLE ... ADD COLUMN`` leaves in sqlite_master, so a migrated store and a fresh one compare equal.
+RESERVATION_COLUMNS_V3 = (("billing", "TEXT"), ("cap_actions", "INTEGER"), ("cap_tunnel_bytes", "INTEGER"),
+                          ("cap_seconds", "INTEGER"), ("used_actions", "INTEGER"), ("used_tunnel_bytes", "INTEGER"),
+                          ("used_seconds", "INTEGER"))
 
 AGENT_TABLES = ("agent_settings", "agent_roles", "agents", "agent_specs", "agent_occurrences", "agent_bars",
                 "agent_slots", "agent_reservations")
@@ -64,7 +73,9 @@ AGENT_OBJECT_DDL: tuple[str, ...] = (
     " owner_id TEXT NOT NULL UNIQUE, taken_at TEXT NOT NULL, expires_at TEXT)",
     "CREATE TABLE IF NOT EXISTS agent_reservations (occurrence_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,"
     " window_key TEXT NOT NULL, reserved_usd_micros INTEGER NOT NULL, debited_usd_micros INTEGER,"
-    " state TEXT NOT NULL CHECK (state IN ('open','settled')), settled_reason TEXT)",
+    " state TEXT NOT NULL CHECK (state IN ('open','settled')), settled_reason TEXT,"
+    " billing TEXT, cap_actions INTEGER, cap_tunnel_bytes INTEGER, cap_seconds INTEGER,"
+    " used_actions INTEGER, used_tunnel_bytes INTEGER, used_seconds INTEGER)",
     # the triggers; each BEFORE, each RAISE(ABORT) (which ignores the statement's OR clause)
     "CREATE TRIGGER IF NOT EXISTS agent_occurrences_frozen BEFORE UPDATE ON agent_occurrences"
     " WHEN OLD.state NOT IN ('admitted','launched')"
@@ -198,3 +209,40 @@ def check_agent_schema(conn: sqlite3.Connection) -> str | None:
         extra = sorted({r[1] for r in set(have) - set(ref)})
         return f"agent schema differs: missing/changed {missing}, extra/changed {extra}"
     return None
+
+
+def migrate_agent_schema(conn: sqlite3.Connection) -> bool:
+    """Take a ``/2`` store to ``/3``: the seven reservation columns, then the marker, in ONE ``BEGIN IMMEDIATE``.
+    Returns True when it migrated, False when the store was not a ``/2`` store (no marker, already ``/3``, or any other
+    marker: all left untouched, so the caller's opener still refuses an unknown marker through
+    :func:`check_agent_schema`).
+
+    Inside a caller's open transaction it joins it (the caller commits or rolls back); otherwise it opens its own.
+    A column already present is skipped, and the marker bump is the last write, so a second run, or one after a crash
+    (which rolled the whole transaction back), lands in the same place. After the writes the store must pass
+    :func:`check_agent_schema` against the ``/3`` reference; a ``/2`` store whose objects were altered by hand fails
+    that, nothing is kept, and the check's reason is raised as ``sqlite3.DatabaseError``."""
+    own = not conn.in_transaction
+    if own:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        if agent_marker(conn) != AGENT_SCHEMA_V2:
+            if own:
+                conn.execute("ROLLBACK")
+            return False
+        have = {r[1] for r in conn.execute("PRAGMA table_info(agent_reservations)")}
+        for name, kind in RESERVATION_COLUMNS_V3:
+            if name not in have:
+                conn.execute(f"ALTER TABLE agent_reservations ADD COLUMN {name} {kind}")
+        conn.execute("UPDATE meta SET value = ? WHERE key = 'agent_schema' AND value = ?",
+                     (AGENT_SCHEMA, AGENT_SCHEMA_V2))
+        reason = check_agent_schema(conn)
+        if reason is not None:
+            raise sqlite3.DatabaseError(f"the /2 agent schema did not migrate cleanly: {reason}")
+        if own:
+            conn.execute("COMMIT")
+        return True
+    except BaseException:
+        if own and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise

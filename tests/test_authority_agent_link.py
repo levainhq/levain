@@ -474,3 +474,62 @@ def test_a_repo_reaching_into_git_and_a_non_finite_guard_are_refused(world):
                                                            "grant": link(world, 1, capabilities=caps)}), repo
     for bad in (float("nan"), float("inf")):
         assert "finite JSON" in world.refused({"op": "create_grant", "grant": link(world, 1, guard=[{"v": bad}])})
+
+
+# --- the two link shapes (P7-A §2.2, §4): the shipped one and the one with the route's three fields ---------------------
+
+ROUTE = {"billing": "api_key", "budget_run_calls": 0, "budget_run_tunnel_bytes": 0}
+SUB = {"billing": "subscription", "budget_run_usd_micros": 0, "budget_window_usd_micros": 0,
+       "budget_run_calls": 20, "budget_run_tunnel_bytes": 5_000_000}
+
+
+def test_the_shipped_shape_is_accepted_and_reads_as_api_key_with_zero_caps(world):
+    snap = create(world, 1)    # link() builds the shipped shape
+    assert auth.agent_links(snap, AGENT, STORE) == ["al-000000000001"]
+    assert auth.agent_link_terms(snap.policy.grants["al-000000000001"]) == ("api_key", 0, 0)
+
+
+def test_the_new_shape_is_accepted_for_both_billings(world):
+    snap = create(world, 1, **ROUTE)
+    assert auth.agent_link_terms(snap.policy.grants["al-000000000001"]) == ("api_key", 0, 0)
+    snap = create(world, 2, **SUB)
+    assert auth.agent_link_terms(snap.policy.grants["al-000000000002"]) == ("subscription", 20, 5_000_000)
+
+
+def test_a_partial_or_mixed_shape_is_refused(world):
+    for keep in (("billing",), ("budget_run_calls",), ("budget_run_tunnel_bytes",),
+                 ("billing", "budget_run_calls"), ("budget_run_calls", "budget_run_tunnel_bytes")):
+        grant = link(world, 1, **{k: ROUTE[k] for k in keep})
+        assert "must carry exactly" in world.refused({"op": "create_grant", "grant": grant}), keep
+    # the full new set minus one shipped field is neither shape either
+    short = link(world, 1, **ROUTE)
+    del short["run_ceiling"]
+    assert "must carry exactly" in world.refused({"op": "create_grant", "grant": short})
+
+
+def test_the_route_rule_binds_the_new_shape(world):
+    cases = [
+        ({**SUB, "budget_run_usd_micros": 1}, "subscription link"),
+        ({**SUB, "budget_window_usd_micros": 1}, "subscription link"),
+        ({**SUB, "budget_run_calls": 0}, "subscription link"),
+        ({**SUB, "budget_run_tunnel_bytes": 0}, "subscription link"),
+        ({**ROUTE, "budget_run_calls": 1}, "api_key link"),
+        ({**ROUTE, "budget_run_tunnel_bytes": 1}, "api_key link"),
+        ({**ROUTE, "billing": "oauth"}, "billing must be one of"),
+        ({**ROUTE, "billing": None}, "billing must be one of"),
+        ({**ROUTE, "billing": ["api_key"]}, "billing must be one of"),
+    ]
+    for over, text in cases:
+        assert text in world.refused({"op": "create_grant", "grant": link(world, 1, **over)}), over
+    for name in ("budget_run_calls", "budget_run_tunnel_bytes"):
+        for bad in (1.5, True, -1, 10**13, "5", None):
+            assert f"{name} must be an integer from 0 to" in world.refused(
+                {"op": "create_grant", "grant": link(world, 1, **{**SUB, name: bad})}), (name, bad)
+
+
+def test_a_link_of_either_shape_replays_and_its_terms_stay_fixed(world):
+    create(world, 1)
+    create(world, 2, **SUB)
+    snap = world.state()
+    assert auth.agent_link_terms(snap.policy.grants["al-000000000001"])[0] == "api_key"
+    assert auth.agent_link_terms(snap.policy.grants["al-000000000002"])[0] == "subscription"

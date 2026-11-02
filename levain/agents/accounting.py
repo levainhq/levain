@@ -19,7 +19,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-__all__ = ["Usage", "StopResult", "Executor", "Limits", "Reserved", "Refused", "Settled", "reserve", "settle",
+__all__ = ["Usage", "StopResult", "Executor", "ActionExposure", "SubscriptionExecutor", "FRONT_READ_BUFFER", "BILLINGS",
+           "Limits", "Reserved", "Refused", "Settled", "reserve", "settle",
            "open_reservations", "WINDOW_KEY_FORMS"]
 
 # the three forms of ``agent_occurrences.window_key`` (A0 §2.6); the first two are scheduled, the third is manual
@@ -34,6 +35,31 @@ class Usage:
     input_tokens: int | None
     output_tokens: int | None
     source: str
+    # a subscription run's usage (P7-A §3): tool calls (or turns, for the dream), the front's byte total, wall-clock
+    # seconds. None is unreadable. Ignored on an api_key route, and ``usd_micros`` is ignored on a subscription one.
+    actions: int | None = None
+    tunnel_bytes: int | None = None
+    seconds: int | None = None
+
+
+# the two billings a link carries (P7-A §2.2); a reservation row with no billing (written before /3) is an api_key one
+BILLINGS = ("api_key", "subscription")
+_UNITS = ("tool_calls", "turns")
+
+# the bytes the gateway front reads at a time: a run's byte total can pass its cap by one read before the front stops
+# the tunnel, so the breach line sits one buffer above the cap (P7-A §2.2's breach row). Intent: the front's chunk size.
+FRONT_READ_BUFFER = 65536
+
+
+@dataclass(frozen=True)
+class ActionExposure:
+    """The per-run caps a subscription run's enforcers hold (P7-A §4): ``actions`` (tool calls for a session, turns
+    for the dream), ``seconds`` (the deadline, the spec's ``stop_at``) and ``tunnel_bytes`` (None only for an executor
+    that grants no process-starting tool)."""
+    actions: int
+    unit: str
+    seconds: int
+    tunnel_bytes: int | None
 
 
 @dataclass(frozen=True)
@@ -68,6 +94,14 @@ class Executor(Protocol):
     def stop(self, deadline_s: float) -> StopResult: ...
 
 
+@runtime_checkable
+class SubscriptionExecutor(Executor, Protocol):
+    """An Executor that can run on a subscription route: it states ``max_exposure_usd_micros = 0`` and the per-run
+    caps its enforcers hold. A separate protocol rather than a member of :class:`Executor`, so an executor written for
+    the API-key route stays an Executor."""
+    action_exposure: ActionExposure | None
+
+
 @dataclass(frozen=True)
 class Limits:
     """What the launch check is held to, read by the caller from the signed link and the schedule.
@@ -77,12 +111,18 @@ class Limits:
     own occurrence's window key, whatever is passed here. ``span_start``/``span_end`` bound, as UTC ISO text with
     start inclusive and end exclusive, the manual runs that count (the window for a scheduled launch, today in the
     agent's zone for a manual one). One signed limit covers both kinds: no second allowance for manual runs.
+
+    ``billing`` and the two per-run action caps are the link's (P7-A §2.2): an ``api_key`` link carries zero caps and a
+    ``subscription`` link carries positive ones and zero dollar budgets. The defaults are the shipped link's reading.
     """
     run_ceiling: int
     budget_window_usd_micros: int
     scheduled_window_key: str | None
     span_start: str
     span_end: str
+    billing: str = "api_key"
+    budget_run_calls: int = 0
+    budget_run_tunnel_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -114,6 +154,30 @@ def _field(occurrence: Mapping | sqlite3.Row, name: str) -> object:
 
 def _is_amount(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_positive(value: object) -> bool:
+    return _is_amount(value) and value > 0  # type: ignore[operator]
+
+
+def _subscription_exposure(executor: object, limits: Limits) -> ActionExposure | None:
+    """The executor's ``ActionExposure`` when it is a valid subscription statement, else None (refused fail-closed):
+    no non-zero dollar exposure, an :class:`ActionExposure` whose ``actions`` and ``seconds`` are positive integers,
+    whose ``unit`` is a known one, whose ``actions`` and any ``tunnel_bytes`` are within the link's per-run caps."""
+    dollars = getattr(executor, "max_exposure_usd_micros", None)
+    if type(dollars) is not int or dollars != 0:
+        return None
+    exp = getattr(executor, "action_exposure", None)
+    if not isinstance(exp, ActionExposure) or exp.unit not in _UNITS:
+        return None
+    if not _is_positive(exp.actions) or not _is_positive(exp.seconds):
+        return None
+    if not _is_positive(limits.budget_run_calls) or exp.actions > limits.budget_run_calls:
+        return None
+    if exp.tunnel_bytes is not None and (not _is_positive(exp.tunnel_bytes)
+                                         or exp.tunnel_bytes > limits.budget_run_tunnel_bytes):
+        return None
+    return exp
 
 
 # the largest amount a SQLite INTEGER holds: an exposure above it is refused, an actual above it is debited at it
@@ -154,9 +218,20 @@ def reserve(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, executo
     conn.execute("UPDATE agent_reservations SET state = state WHERE 0")
     me = str(_field(occurrence, "occurrence_id"))
     agent = str(_field(occurrence, "agent_id"))
-    exposure = getattr(executor, "max_exposure_usd_micros", None)
-    if not _is_amount(exposure) or exposure > _MAX_MICROS:
+    if limits.billing not in BILLINGS:
         return Refused("no_exposure")
+    subscription = limits.billing == "subscription"
+    if subscription:
+        # a subscription run reserves no dollars (Levain's keys never charge it): the dollar window is untouched
+        action = _subscription_exposure(executor, limits)
+        if action is None:
+            return Refused("no_exposure")
+        exposure = 0
+    else:
+        action = None
+        exposure = getattr(executor, "max_exposure_usd_micros", None)
+        if not _is_amount(exposure) or exposure > _MAX_MICROS:
+            return Refused("no_exposure")
     # a reservation commits only with its launch (one transaction), so a reserved occurrence is launched, and the
     # transition trigger refuses launched -> skipped-budget: a caller applying this Refused.state cannot end a live row
     if conn.execute("SELECT 1 FROM agent_reservations WHERE occurrence_id = ?", (me,)).fetchone() is not None:
@@ -177,10 +252,16 @@ def reserve(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, executo
         "SELECT TOTAL(CASE WHEN r.state = 'open' THEN r.reserved_usd_micros"
         " ELSE COALESCE(r.debited_usd_micros, r.reserved_usd_micros) END)"
         f" FROM agent_reservations r WHERE r.occurrence_id IN (SELECT o.occurrence_id {_COUNTED})", args).fetchone()[0]
-    if held + exposure > limits.budget_window_usd_micros:
+    if not subscription and held + exposure > limits.budget_window_usd_micros:
         return Refused("budget_window")
-    conn.execute("INSERT INTO agent_reservations (occurrence_id, agent_id, window_key, reserved_usd_micros, state)"
-                 " VALUES (?, ?, ?, ?, 'open')", (me, agent, _field(occurrence, "window_key"), exposure))
+    if action is None:
+        conn.execute("INSERT INTO agent_reservations (occurrence_id, agent_id, window_key, reserved_usd_micros, state)"
+                     " VALUES (?, ?, ?, ?, 'open')", (me, agent, _field(occurrence, "window_key"), exposure))
+    else:
+        conn.execute("INSERT INTO agent_reservations (occurrence_id, agent_id, window_key, reserved_usd_micros, state,"
+                     " billing, cap_actions, cap_tunnel_bytes, cap_seconds) VALUES (?, ?, ?, 0, 'open',"
+                     " 'subscription', ?, ?, ?)", (me, agent, _field(occurrence, "window_key"), action.actions,
+                                                   action.tunnel_bytes, action.seconds))
     return Reserved(exposure)
 
 
@@ -200,13 +281,16 @@ def settle(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, usage: U
         raise RuntimeError("settle runs inside the terminal transaction (BEGIN IMMEDIATE); this connection has none")
     conn.execute("UPDATE agent_reservations SET state = state WHERE 0")
     me = str(_field(occurrence, "occurrence_id"))
-    row = conn.execute("SELECT agent_id, reserved_usd_micros, debited_usd_micros, state FROM agent_reservations"
-                       " WHERE occurrence_id = ?", (me,)).fetchone()
+    row = conn.execute("SELECT agent_id, reserved_usd_micros, debited_usd_micros, state, billing, cap_actions,"
+                       " cap_tunnel_bytes, cap_seconds FROM agent_reservations WHERE occurrence_id = ?",
+                       (me,)).fetchone()
     if row is None:    # a launch writes its reservation in its own transaction, so only a never-launched row lands here
         return Settled(0, False, "no_reservation")
     agent, reserved, debited, state = row[0], row[1], row[2], row[3]
     if state != "open":    # the CHECK allows only open/settled; anything not open is not ours to settle again
         return Settled(int(debited or 0), False, "already_settled")
+    if row[4] == "subscription":
+        return _settle_subscription(conn, me, agent, row[5], row[6], row[7], usage)
     actual = getattr(usage, "usd_micros", None)
     if not _is_amount(actual):
         charge, basis, breach = reserved, "unreadable", False
@@ -222,6 +306,36 @@ def settle(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, usage: U
         # that never existed would pause nothing here; the occurrence writer, not yet built, owns that invariant)
         conn.execute("UPDATE agents SET operation = 'paused' WHERE agent_id = ?", (agent,))
     return Settled(charge, breach, basis)
+
+
+def _settle_subscription(conn: sqlite3.Connection, me: str, agent: str, cap_actions: int | None,
+                         cap_bytes: int | None, cap_seconds: int | None, usage: Usage) -> Settled:
+    """Settle a subscription reservation (P7-A §2.2's rows): no dollars are debited whatever ``usd_micros`` says. A
+    count above its cap (actions above ``cap_actions``, bytes above ``cap_tunnel_bytes`` plus one front read buffer; a
+    run with no byte cap has none to pass) is a breach: the actual is recorded, the agent is paused in this
+    transaction and the caller ends the row ``failed``. An unreadable action count, or an unreadable byte total where a
+    byte cap exists, records the caps as used and is no breach. Seconds are recorded and judged by neither rule."""
+    actions = getattr(usage, "actions", None)
+    nbytes = getattr(usage, "tunnel_bytes", None)
+    seconds = getattr(usage, "seconds", None)
+    cap_a = int(cap_actions or 0)
+    cap_b = None if cap_bytes is None else int(cap_bytes)
+    readable = _is_amount(actions) and (cap_b is None or _is_amount(nbytes))
+    if not readable:
+        used_a, used_b, basis, breach = cap_a, cap_b, "unreadable", False
+        used_s = cap_seconds if not _is_amount(seconds) else min(seconds, _MAX_MICROS)  # type: ignore[type-var]
+    else:
+        used_a = min(actions, _MAX_MICROS)  # type: ignore[type-var]
+        used_b = None if not _is_amount(nbytes) else min(nbytes, _MAX_MICROS)  # type: ignore[type-var]
+        used_s = None if not _is_amount(seconds) else min(seconds, _MAX_MICROS)  # type: ignore[type-var]
+        breach = actions > cap_a or (used_b is not None and used_b > (cap_b or 0) + FRONT_READ_BUFFER)  # type: ignore[operator]
+        basis = "breach" if breach else "actual"
+    conn.execute("UPDATE agent_reservations SET state = 'settled', debited_usd_micros = 0, settled_reason = ?,"
+                 " used_actions = ?, used_tunnel_bytes = ?, used_seconds = ? WHERE occurrence_id = ? AND state = 'open'",
+                 (basis, used_a, used_b, used_s, me))
+    if breach:
+        conn.execute("UPDATE agents SET operation = 'paused' WHERE agent_id = ?", (agent,))
+    return Settled(0, breach, basis)
 
 
 def open_reservations(conn: sqlite3.Connection) -> list[str]:
