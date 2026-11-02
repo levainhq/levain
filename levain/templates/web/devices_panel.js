@@ -591,7 +591,10 @@
     prSheet.id = "pr-sheet";
     prSheet.setAttribute("role", "dialog");
     prSheet.setAttribute("aria-label", "Presence");
+    prSheet.setAttribute("data-sheet-dismiss", "(max-width: 720px)");   // a bottom sheet on a phone: dragged down it closes (dashboard_core.js)
+    prSheet.addEventListener("levain:sheet-dismiss", (e) => { e.preventDefault(); closeSheet(true); });
     prSheet.hidden = true;
+    prSheet.appendChild(el("div", "sheet-grabber"));
     prSheetText = el("p", "pr-sheet-text");        // THE line, verbatim from the server
     prSheetText.setAttribute("aria-live", "polite");
     prSheet.appendChild(prSheetText);
