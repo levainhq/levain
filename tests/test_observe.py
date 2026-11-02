@@ -39,7 +39,8 @@ def test_hook_prints_nothing_and_exits_zero_on_garbage_and_unwritable_home(tmp_p
     assert out.out == "" and out.err == ""
 
 
-def test_install_preserves_other_hooks_and_uninstall_removes_only_its_own(tmp_path):
+def test_install_preserves_other_hooks_and_uninstall_removes_only_its_own(tmp_path, monkeypatch):
+    monkeypatch.setattr(observe, "_can_import", lambda py: True)
     root = tmp_path / "claude"
     root.mkdir()
     other = {"matcher": "Bash", "hooks": [{"type": "command", "command": "other-hook"}]}
@@ -54,6 +55,7 @@ def test_install_preserves_other_hooks_and_uninstall_removes_only_its_own(tmp_pa
 
 
 def test_install_refuses_the_live_claude_dir_without_live(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(observe, "_can_import", lambda py: True)
     monkeypatch.setenv("HOME", str(tmp_path))
     live = tmp_path / ".claude"
     live.mkdir()

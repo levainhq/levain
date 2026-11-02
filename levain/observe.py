@@ -13,13 +13,17 @@ import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-MARKER = "levain.observe hook"  # the install's entry carries this in its command; uninstall removes only it
+MARKER = "levain.observe hook"  # the install's entry ends with this plus SUFFIX; uninstall removes only that exact shape
+SUFFIX = ">/dev/null 2>&1 || true"
 MODES = frozenset({"default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"})
 COMMANDS = frozenset({
     "git", "python", "python3", "pip", "pip3", "uv", "pytest", "npm", "npx", "node", "pnpm", "yarn", "ls", "cat",
@@ -66,9 +70,7 @@ def family(event: Any) -> dict:
     elif name in FILE_READ:
         out["tool"] = "file-read"
     elif name.startswith("mcp__"):
-        server = name.split("__")[1] if name.count("__") >= 1 else ""
-        server = re.sub(r"[^A-Za-z0-9_.-]", "", server)[:40]
-        out["tool"] = f"mcp:{server}" if server else "mcp:other"
+        out["tool"] = "mcp"  # a server name is free configuration text, so it is never stored
     elif name in ("Task", "Agent"):
         out["tool"] = "agent"
     agent_id = ev.get("agent_id")
@@ -101,7 +103,14 @@ def record(path: Path, event: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     key = _key(family(event))
     with open(path.parent / ".lock", "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        for attempt in range(20):  # a stuck holder must not hold the harness: drop this sample after ~1 s
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if attempt == 19:
+                    return
+                time.sleep(0.05)
         try:
             counts = json.loads(path.read_text()) if path.exists() else {}
         except (OSError, ValueError):
@@ -176,7 +185,8 @@ def hook_main() -> int:
 # -- settings.json install / uninstall -------------------------------------------------------------------------
 
 def _is_ours(handler: Any) -> bool:
-    return isinstance(handler, dict) and MARKER in str(handler.get("command", ""))
+    cmd = handler.get("command") if isinstance(handler, dict) else None
+    return isinstance(cmd, str) and cmd.endswith(f" -m {MARKER} {SUFFIX}")
 
 
 def is_live_root(root: Path) -> bool:
@@ -196,12 +206,29 @@ def _load_settings(path: Path) -> dict:
 
 
 def _write_settings(path: Path, doc: dict) -> None:
+    path = path.resolve()  # a dotfile-managed symlink is written through, never replaced
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".settings-")
-    with os.fdopen(fd, "w") as fh:
-        json.dump(doc, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(doc, fh, indent=2)
+            fh.write("\n")
+        if path.exists():
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _can_import(py: str) -> bool:
+    try:
+        return subprocess.run([py, "-I", "-c", "import levain.observe"], capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def install(root: Path, *, live: bool = False, python: str | None = None) -> int:
@@ -211,12 +238,19 @@ def install(root: Path, *, live: bool = False, python: str | None = None) -> int
     path = Path(root).expanduser() / "settings.json"
     try:
         doc = _load_settings(path)
-        groups = doc.setdefault("hooks", {}).setdefault("PermissionRequest", [])
-        if any(_is_ours(h) for g in groups if isinstance(g, dict) for h in g.get("hooks", [])):
+        hooks_doc = doc.setdefault("hooks", {})
+        groups = hooks_doc.setdefault("PermissionRequest", [])
+        if not isinstance(hooks_doc, dict) or not isinstance(groups, list):
+            raise ValueError("hooks.PermissionRequest is not a list; fix it by hand first")
+        if any(_is_ours(h) for g in groups if isinstance(g, dict) for h in (g.get("hooks") if isinstance(g.get("hooks"), list) else [])):
             print(f"already installed in {path}")
             return 0
         # a missing interpreter or a failed import must not show the harness "Hook failed": the logger answers nothing
-        cmd = f"{shlex.quote(python or sys.executable)} -m {MARKER} 2>/dev/null || true"
+        py = python or sys.executable
+        if not _can_import(py):
+            raise ValueError(f"{py} cannot import levain.observe; install levain there first")
+        # -I: the hook runs in the project's cwd, so a levain/ directory there must not shadow the installed package
+        cmd = f"{shlex.quote(py)} -I -m {MARKER} {SUFFIX}"
         groups.append({"matcher": "", "hooks": [{"type": "command", "command": cmd}]})
         _write_settings(path, doc)
     except (OSError, ValueError, AttributeError) as exc:
@@ -238,6 +272,8 @@ def uninstall(root: Path, *, live: bool = False) -> int:
         doc = _load_settings(path)
         hooks = doc.get("hooks", {})
         groups = hooks.get("PermissionRequest", []) if isinstance(hooks, dict) else []
+        if not isinstance(groups, list):
+            raise ValueError("hooks.PermissionRequest is not a list; fix it by hand first")
         kept = []
         for g in groups:
             if isinstance(g, dict) and isinstance(g.get("hooks"), list):
