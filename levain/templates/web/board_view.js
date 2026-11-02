@@ -126,7 +126,8 @@
   // alone ("band"). The journal only annotates cards, so it never empties a column.
   var COLUMN_SOURCES = { "needs-you": ["band"], running: ["coordinator", "seats"], waiting: ["coordinator", "seats"] };
   function sourceMissing(model, src) {
-    var un = Array.isArray(model.unreadable) ? model.unreadable : [];
+    if (!Array.isArray(model.unreadable)) return true;      // the producer always sends the list: a payload without it cannot say what was read
+    var un = model.unreadable;
     if (src === "coordinator" && model.queue !== "ok" && model.queue !== "none") return true;
     return un.indexOf(src) >= 0;
   }
