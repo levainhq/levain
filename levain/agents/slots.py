@@ -1,23 +1,30 @@
 """levain.agents.slots — the slot table (A0 r7 §2.4; BUILD_PLAN P6-3a).
 
 Coordinator launches and named fires share one cap through ``agent_slots``. The cap is the ``agent_settings`` row
-``max_slots`` (default 2). Every function runs inside the caller's write transaction, so a slot commits or rolls back
-with whatever else the caller writes (the launch transaction, P6-5a; the terminal transaction that releases it).
+``max_slots`` (default 2). Every write function runs inside the caller's write transaction, so a slot commits or rolls
+back with whatever else the caller writes (the launch transaction, P6-5a; the terminal transaction that releases it).
 
 An occurrence slot has no ``expires_at``: it is released by the transaction that writes the occurrence's terminal
 state, never by a clock. A coordinator slot is a lease (``owner_kind='launch'``, ``expires_at = taken + LEASE_S``)
-that its watcher renews; it is reclaimed only when it has expired AND its ``launches`` row is terminal or its
-``session_key`` is not alive. Liveness is not this module's to know, so it comes in as ``session_alive``; ``None``
-means "cannot tell", which keeps the slot (fail-closed for the cap).
+that its watcher renews; it is reclaimed only when it has expired AND its launch is over or its session is not alive.
+
+The launches live in the coordinator's store, a different file from the agent tables, so this module never reads
+them. What it needs comes in as two injected callables, probed by :func:`probe_over` BEFORE the write transaction
+opens (a probe can be slow, and a write lock is not held across it): ``launch_over(launch_id)`` says whether the
+launch is gone or terminal, and ``session_alive(launch_id)`` whether its session still runs. ``None``, a missing
+callable or a callable that raises all mean "cannot tell", and that keeps the slot (fail-closed for the cap).
+
+Left open on purpose, P6-2b's: an occurrence admitted past its grace while a slot is free is not ended here, so it
+is not recorded as a ``no_slot`` miss that the cap did not cause.
 """
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterable
 from datetime import datetime, timedelta, timezone
 
-__all__ = ["MAX_SLOTS_KEY", "DEFAULT_MAX_SLOTS", "LEASE_S", "OCCURRENCE", "LAUNCH", "max_slots", "held", "reclaim",
-           "take", "release", "renew", "free"]
+__all__ = ["MAX_SLOTS_KEY", "DEFAULT_MAX_SLOTS", "LEASE_S", "OCCURRENCE", "LAUNCH", "max_slots", "held",
+           "expired_launches", "probe_over", "reclaim", "take", "release", "renew", "free"]
 
 MAX_SLOTS_KEY = "max_slots"
 DEFAULT_MAX_SLOTS = 2  # judged; a default, not a measurement (A0 §2.4)
@@ -25,7 +32,6 @@ LEASE_S = 900
 OCCURRENCE = "occurrence"
 LAUNCH = "launch"
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
-_TERMINAL = ("failed", "expired", "ended")
 
 
 def _stamp(moment: datetime) -> str:
@@ -55,47 +61,57 @@ def held(conn: sqlite3.Connection) -> list[tuple[int, str, str, str | None]]:
     return conn.execute("SELECT slot, owner_kind, owner_id, expires_at FROM agent_slots ORDER BY slot").fetchall()
 
 
-def _launch_over(conn: sqlite3.Connection, launch_id: str, session_alive: Callable[[str], bool] | None) -> bool:
-    """True when a coordinator slot's launch no longer needs it: no such launch, a terminal one, or a session that
-    is not alive. A store that never held the coordinator's tables has no launches, so none is alive."""
+def expired_launches(conn: sqlite3.Connection, now: datetime) -> list[str]:
+    """The launch ids whose coordinator lease has expired at ``now``: what to probe before the write transaction."""
+    return [r[0] for r in conn.execute("SELECT owner_id FROM agent_slots WHERE owner_kind = ? AND expires_at IS NOT NULL"
+                                       " AND expires_at <= ? ORDER BY slot", (LAUNCH, _stamp(now))).fetchall()]
+
+
+def _ask(probe: Callable[[str], bool | None] | None, launch_id: str) -> bool | None:
+    if probe is None:
+        return None
     try:
-        row = conn.execute("SELECT session_key FROM launches WHERE launch_id = ?", (launch_id,)).fetchone()
-        if row is None:
-            return True
-        last = conn.execute("SELECT kind FROM launch_events WHERE launch_id = ? ORDER BY seq DESC LIMIT 1",
-                            (launch_id,)).fetchone()
-    except sqlite3.OperationalError as exc:
-        if "no such table" not in str(exc):
-            raise
-        return True
-    if last is not None and last[0] in _TERMINAL:
-        return True
-    return session_alive is not None and not session_alive(row[0])
+        answer = probe(launch_id)
+    except Exception:  # noqa: BLE001 - a probe that cannot answer is "cannot tell", never a reason to free a slot
+        return None
+    return answer if isinstance(answer, bool) else None
 
 
-def reclaim(conn: sqlite3.Connection, now: datetime, session_alive: Callable[[str], bool] | None = None) -> list[int]:
-    """Free every expired coordinator lease whose launch is over (A0 §2.4); returns the slots freed. An occurrence
-    slot is never reclaimed here, and an unexpired lease is never reclaimed, whatever its launch looks like."""
+def probe_over(launch_ids: Iterable[str], launch_over: Callable[[str], bool | None] | None = None,
+               session_alive: Callable[[str], bool | None] | None = None) -> frozenset[str]:
+    """The launch ids whose slot may be freed: the launch is over, or it is not over and its session is not alive.
+    Run it outside any write transaction. Anything unknown keeps the slot."""
+    over = set()
+    for launch_id in launch_ids:
+        ended = _ask(launch_over, launch_id)
+        if ended is True or (ended is False and _ask(session_alive, launch_id) is False):
+            over.add(launch_id)
+    return frozenset(over)
+
+
+def reclaim(conn: sqlite3.Connection, now: datetime, over: Collection[str] = ()) -> list[int]:
+    """Free every expired coordinator lease whose launch id is in ``over`` (A0 §2.4; see :func:`probe_over`);
+    returns the slots freed. The row is re-checked in this transaction: a lease renewed since the probe is no longer
+    expired and stays. An occurrence slot is never reclaimed here, whatever ``over`` holds."""
     _need_txn(conn)
     at = _stamp(now)
     freed = []
-    rows = conn.execute("SELECT slot, owner_id FROM agent_slots WHERE owner_kind = ? AND expires_at IS NOT NULL"
-                        " AND expires_at <= ? ORDER BY slot", (LAUNCH, at)).fetchall()
-    for slot, owner in rows:
-        if _launch_over(conn, owner, session_alive):
-            conn.execute("DELETE FROM agent_slots WHERE slot = ?", (slot,))
+    for slot, owner in conn.execute("SELECT slot, owner_id FROM agent_slots WHERE owner_kind = ? AND expires_at IS NOT"
+                                    " NULL AND expires_at <= ? ORDER BY slot", (LAUNCH, at)).fetchall():
+        if owner in over and conn.execute("DELETE FROM agent_slots WHERE slot = ? AND owner_id = ? AND owner_kind = ?"
+                                          " AND expires_at <= ?", (slot, owner, LAUNCH, at)).rowcount:
             freed.append(slot)
     return freed
 
 
-def free(conn: sqlite3.Connection, now: datetime, session_alive: Callable[[str], bool] | None = None) -> int:
+def free(conn: sqlite3.Connection, now: datetime, over: Collection[str] = ()) -> int:
     """How many slots a :func:`take` could get right now, after a reclaim (which this call performs)."""
-    reclaim(conn, now, session_alive)
+    reclaim(conn, now, over)
     return max(0, max_slots(conn) - conn.execute("SELECT COUNT(*) FROM agent_slots").fetchone()[0])
 
 
 def take(conn: sqlite3.Connection, kind: str, owner_id: str, now: datetime,
-         session_alive: Callable[[str], bool] | None = None) -> int | None:
+         over: Collection[str] = ()) -> int | None:
     """Take the lowest free slot for ``owner_id``, or return ``None`` when the cap is full (the caller keeps its
     refusal path). Reclaims first. A second take by the same owner returns the slot it already holds, unchanged.
     A launch's slot is a lease of :data:`LEASE_S` seconds; an occurrence's has no expiry."""
@@ -107,7 +123,7 @@ def take(conn: sqlite3.Connection, kind: str, owner_id: str, now: datetime,
         if mine[1] != kind:
             raise ValueError("an owner id holds a slot under one kind only")
         return mine[0]
-    if free(conn, now, session_alive) < 1:
+    if free(conn, now, over) < 1:
         return None
     used = {r[0] for r in conn.execute("SELECT slot FROM agent_slots")}
     slot = next(n for n in range(1, len(used) + 2) if n not in used)
@@ -124,8 +140,10 @@ def release(conn: sqlite3.Connection, owner_id: str) -> bool:
 
 
 def renew(conn: sqlite3.Connection, launch_id: str, now: datetime) -> bool:
-    """The coordinator watcher's per-pass renewal: ``expires_at = now + LEASE_S``. False when the lease is gone
-    (reclaimed meanwhile), so the watcher knows its launch no longer holds a slot."""
+    """The coordinator watcher's per-pass renewal: ``expires_at = now + LEASE_S``, never moving an expiry backward
+    (a late or replayed renewal cannot shorten a lease). False when the lease is gone (reclaimed meanwhile), so the
+    watcher knows its launch no longer holds a slot."""
     _need_txn(conn)
-    return conn.execute("UPDATE agent_slots SET expires_at = ? WHERE owner_id = ? AND owner_kind = ?",
+    return conn.execute("UPDATE agent_slots SET expires_at = MAX(COALESCE(expires_at, ''), ?)"
+                        " WHERE owner_id = ? AND owner_kind = ?",
                         (_stamp(now + timedelta(seconds=LEASE_S)), launch_id, LAUNCH)).rowcount > 0

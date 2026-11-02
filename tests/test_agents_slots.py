@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,16 +31,39 @@ def _store(tmp_path, cron="*/20 * * * *"):
     return store, register_spec(store, parse_spec(d), "America/New_York")[0]
 
 
-def _launch(conn, launch_id, session_key, *events):
-    """A launches row on the coordinator's own DDL, with the given event kinds in order."""
+def _dispatch(tmp_path, *launches):
+    """The coordinator's own file, apart from the agent tables' (`dispatch.db` beside `autonomic.db`): returns
+    `(launch_over, session_alive)` reading it. Each launch is `(launch_id, session_key, *event kinds)`."""
+    db = sqlite3.connect(tmp_path / "dispatch.db")
     for ddl in LEASE_SCHEMA:
-        conn.execute(ddl)
-    conn.execute("INSERT INTO launches (launch_id, gseq, session_key, harness, role, threads, token, placement, at)"
-                 " VALUES (?, ?, ?, 'claude', 'coordinator', '[]', 1, 'p', '2026-11-02T11:00:00Z')",
-                 (launch_id, abs(hash(launch_id)) % 10**6, session_key))
-    for seq, kind in enumerate(events, 1):
-        conn.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, cause, at) VALUES (?, ?, ?, ?, 'x', 't')",
-                     (launch_id, seq, abs(hash((launch_id, seq))) % 10**6 + 10**7, kind))
+        db.execute(ddl)
+    for launch_id, session_key, *events in launches:
+        db.execute("INSERT INTO launches (launch_id, gseq, session_key, harness, role, threads, token, placement, at)"
+                   " VALUES (?, ?, ?, 'claude', 'coordinator', '[]', 1, 'p', '2026-11-02T11:00:00Z')",
+                   (launch_id, abs(hash(launch_id)) % 10**6, session_key))
+        for seq, kind in enumerate(events, 1):
+            db.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, cause, at) VALUES (?, ?, ?, ?, 'x', 't')",
+                       (launch_id, seq, abs(hash((launch_id, seq))) % 10**6 + 10**7, kind))
+    db.commit()
+    alive = {}
+
+    def launch_over(launch_id):
+        if db.execute("SELECT 1 FROM launches WHERE launch_id = ?", (launch_id,)).fetchone() is None:
+            return True
+        last = db.execute("SELECT kind FROM launch_events WHERE launch_id = ? ORDER BY seq DESC LIMIT 1",
+                          (launch_id,)).fetchone()
+        return last is not None and last[0] in ("failed", "expired", "ended")
+
+    def session_alive(launch_id):
+        key = db.execute("SELECT session_key FROM launches WHERE launch_id = ?", (launch_id,)).fetchone()[0]
+        return alive.get(key)
+
+    return launch_over, session_alive, alive
+
+
+def _reclaim(c, now, launch_over=None, session_alive=None):
+    ids = slots.expired_launches(c, now)
+    return slots.reclaim(c, now, slots.probe_over(ids, launch_over, session_alive))
 
 
 def test_the_cap_is_shared_and_a_release_frees_it(tmp_path):
@@ -61,41 +85,109 @@ def test_the_cap_is_shared_and_a_release_frees_it(tmp_path):
 
 def test_a_coordinator_lease_expires_at_900s_and_is_reclaimed_only_when_its_launch_is_over(tmp_path):
     store, _ = _store(tmp_path)
-    alive = {"k-live": True, "k-dead": False}
+    over, alive_fn, alive = _dispatch(tmp_path, ("ln-live", "k-live", "pending", "active"),
+                                      ("ln-dead", "k-dead", "pending", "active"))
+    alive.update({"k-live": True, "k-dead": False})
     with store.write() as c:
-        _launch(c, "ln-live", "k-live", "pending", "active")
-        _launch(c, "ln-dead", "k-dead", "pending", "active")
         assert slots.take(c, slots.LAUNCH, "ln-live", T0) == 1
         assert slots.take(c, slots.LAUNCH, "ln-dead", T0) == 2
         assert c.execute("SELECT expires_at FROM agent_slots WHERE slot = 1").fetchone()[0] == "2026-11-02T12:15:00Z"
         # not yet expired: nothing is reclaimed, though one session is dead
-        assert slots.reclaim(c, T0 + timedelta(seconds=899), alive.__getitem__) == []
+        assert _reclaim(c, T0 + timedelta(seconds=899), over, alive_fn) == []
         # expired: the dead session's lease goes, the live session's stays
-        assert slots.reclaim(c, T0 + timedelta(seconds=900), alive.__getitem__) == [2]
+        assert _reclaim(c, T0 + timedelta(seconds=900), over, alive_fn) == [2]
         # a renewal pushes the live lease out
         assert slots.renew(c, "ln-live", T0 + timedelta(seconds=900))
-        assert slots.reclaim(c, T0 + timedelta(seconds=1700), lambda k: False) == []
-        assert slots.reclaim(c, T0 + timedelta(seconds=1800), lambda k: False) == [1]
+        alive["k-live"] = False
+        assert _reclaim(c, T0 + timedelta(seconds=1700), over, alive_fn) == []
+        assert _reclaim(c, T0 + timedelta(seconds=1800), over, alive_fn) == [1]
         assert not slots.renew(c, "ln-live", T0 + timedelta(seconds=1801))   # gone: the watcher is told
 
 
 def test_a_terminal_launch_frees_an_expired_lease_even_if_the_session_looks_alive(tmp_path):
     store, _ = _store(tmp_path)
+    over, alive_fn, alive = _dispatch(tmp_path, ("ln-done", "k-done", "pending", "active", "ended"),
+                                      ("ln-pend", "k-pend", "pending"))
+    alive.update({"k-done": True, "k-pend": True})
     with store.write() as c:
-        _launch(c, "ln-done", "k-done", "pending", "active", "ended")
-        _launch(c, "ln-pend", "k-pend", "pending")
         assert slots.take(c, slots.LAUNCH, "ln-done", T0) == 1
         assert slots.take(c, slots.LAUNCH, "ln-pend", T0) == 2
         late = T0 + timedelta(seconds=901)
-        assert slots.reclaim(c, late, lambda k: True) == [1]
-        assert slots.reclaim(c, late, None) == []                            # liveness unknown: the slot is kept
+        assert _reclaim(c, late, None, alive_fn) == []                       # no launch state: the slot is kept
+        assert _reclaim(c, late, over, alive_fn) == [1]
 
 
-def test_a_store_without_the_coordinator_tables_reclaims_an_expired_lease(tmp_path):
+def test_a_launch_the_agent_store_cannot_see_is_never_freed_without_the_probe(tmp_path):
+    """Planted: the slots in autonomic.db, the launches in dispatch.db. The old join met `no such table` and freed
+    a live coordinator's slot without asking whether its session ran."""
+    store, _ = _store(tmp_path)
+    over, alive_fn, alive = _dispatch(tmp_path, ("ln-live", "k-live", "pending", "active"))
+    alive["k-live"] = True
+    with store.write() as c:
+        slots.take(c, slots.LAUNCH, "ln-live", T0)
+        late = T0 + timedelta(seconds=901)
+        assert _reclaim(c, late) == [] and _reclaim(c, late, None, alive_fn) == []
+        assert _reclaim(c, late, over, alive_fn) == []                       # live: kept
+        for broken in (lambda i: None, lambda i: 1 / 0):                      # unknown or raising: kept
+            assert _reclaim(c, late, broken, alive_fn) == []
+            assert _reclaim(c, late, over, broken) == []
+        alive["k-live"] = False
+        assert _reclaim(c, late, over, alive_fn) == [1]
+
+
+def test_a_reclaim_rechecks_the_row_the_probe_saw(tmp_path):
     store, _ = _store(tmp_path)
     with store.write() as c:
-        slots.take(c, slots.LAUNCH, "ln-orphan", T0)
-        assert slots.reclaim(c, T0 + timedelta(seconds=900), None) == [1]
+        slots.take(c, slots.LAUNCH, "ln-1", T0)
+        verdict = slots.probe_over(slots.expired_launches(c, T0 + timedelta(seconds=901)), lambda i: True)
+        assert verdict == {"ln-1"}
+        slots.renew(c, "ln-1", T0 + timedelta(seconds=901))                  # renewed after the probe
+        assert slots.reclaim(c, T0 + timedelta(seconds=901), verdict) == []
+        assert slots.reclaim(c, T0 + timedelta(seconds=901 + 900), verdict) == [1]
+
+
+def test_a_renewal_never_moves_an_expiry_backward(tmp_path):
+    store, _ = _store(tmp_path)
+    with store.write() as c:
+        slots.take(c, slots.LAUNCH, "ln-1", T0 + timedelta(seconds=600))     # expires 12:25
+        assert slots.renew(c, "ln-1", T0)                                    # a late pass: 12:15 would be earlier
+        assert c.execute("SELECT expires_at FROM agent_slots").fetchone()[0] == "2026-11-02T12:25:00Z"
+
+
+def test_a_probe_that_raises_on_a_null_session_key_keeps_the_slot_and_the_tick_finishes(tmp_path):
+    store, ag = _store(tmp_path)
+    armed = lambda a, h: "b1"  # noqa: E731
+    with store.write() as c:
+        c.execute("INSERT INTO agent_settings (key, value) VALUES (?, ?)",
+                  (ctl.CURSOR_PREFIX + ag, "2026-11-02T11:58:00Z"))
+        slots.take(c, slots.OCCURRENCE, "held-1", T0 - 60 * MIN)
+        slots.take(c, slots.LAUNCH, "ln-nokey", T0)
+
+    def launch_over(launch_id):
+        return False
+
+    def session_alive(launch_id):
+        raise TypeError("session_key is NULL")                                 # the caller's NULL key, as a raise
+
+    ctl.tick(store, lambda: T0 + MIN, armed)
+    r = ctl.tick(store, lambda: T0 + 16 * MIN, armed, session_alive, launch_over)
+    assert r.no_slot == [(ag, "2026-11-02T12:00:00Z")]                       # the kept lease still fills the cap
+    with store.read() as c:
+        assert [h[2] for h in slots.held(c)] == ["held-1", "ln-nokey"]       # kept, tick finished
+
+
+def test_a_probe_does_not_hold_the_write_lock(tmp_path):
+    store, ag = _store(tmp_path)
+    with store.write() as c:
+        slots.take(c, slots.LAUNCH, "ln-1", T0)
+    other = sqlite3.connect(store.path, timeout=0.1, isolation_level=None)
+
+    def launch_over(launch_id):
+        other.execute("BEGIN IMMEDIATE")                                     # fails 'database is locked' if tick holds it
+        other.execute("ROLLBACK")
+        return False
+
+    ctl.tick(store, lambda: T0 + 16 * MIN, lambda a, h: None, None, launch_over)
 
 
 def _fill(store, ag, cursor="2026-11-02T11:58:00Z"):
@@ -145,6 +237,7 @@ def test_a_free_slot_never_ends_an_occurrence_as_no_slot(tmp_path):
 def test_an_expired_coordinator_lease_frees_the_slot_the_tick_would_have_refused(tmp_path):
     store, ag = _store(tmp_path)
     armed = lambda a, h: "b1"  # noqa: E731
+    over, alive_fn, alive = _dispatch(tmp_path)                              # no launch rows: ln-gone is absent
     with store.write() as c:
         c.execute("INSERT INTO agent_settings (key, value) VALUES (?, ?)",
                   (ctl.CURSOR_PREFIX + ag, "2026-11-02T11:58:00Z"))
@@ -152,7 +245,41 @@ def test_an_expired_coordinator_lease_frees_the_slot_the_tick_would_have_refused
         slots.take(c, slots.LAUNCH, "ln-gone", T0)                           # expires 12:15
     ctl.tick(store, lambda: T0 + MIN, armed)
     # at 12:16 the lease is expired and its launch absent: the tick reclaims it, a slot is free, nothing is missed
-    r = ctl.tick(store, lambda: T0 + 16 * MIN, armed)
+    r = ctl.tick(store, lambda: T0 + 16 * MIN, armed, alive_fn, over)
     assert r.no_slot == []
     with store.read() as c:
         assert [h[2] for h in slots.held(c)] == ["held-1"]
+
+
+def test_without_probes_a_full_cap_holds_and_the_occurrence_ends_no_slot(tmp_path):
+    store, ag = _store(tmp_path)
+    armed = lambda a, h: "b1"  # noqa: E731
+    with store.write() as c:
+        c.execute("INSERT INTO agent_settings (key, value) VALUES (?, ?)",
+                  (ctl.CURSOR_PREFIX + ag, "2026-11-02T11:58:00Z"))
+        slots.take(c, slots.OCCURRENCE, "held-1", T0 - 60 * MIN)
+        slots.take(c, slots.LAUNCH, "ln-gone", T0)
+    ctl.tick(store, lambda: T0 + MIN, armed)
+    r = ctl.tick(store, lambda: T0 + 40 * MIN, armed)
+    assert r.no_slot == [(ag, "2026-11-02T12:00:00Z")]
+
+
+def test_closing_an_occurrence_releases_a_slot_it_holds_and_an_unreadable_cap_halts_nothing(tmp_path):
+    store, ag = _store(tmp_path)
+    armed = lambda a, h: "b1"  # noqa: E731
+    with store.write() as c:
+        c.execute("INSERT INTO agent_settings (key, value) VALUES (?, ?)",
+                  (ctl.CURSOR_PREFIX + ag, "2026-11-02T11:58:00Z"))
+    ctl.tick(store, lambda: T0 + MIN, armed)
+    with store.write() as c:
+        oid = c.execute("SELECT occurrence_id FROM agent_occurrences").fetchone()[0]
+        slots.take(c, slots.OCCURRENCE, oid, T0)                             # not reachable by A0 §2.4; defensive
+        slots.take(c, slots.OCCURRENCE, "held-2", T0)
+    r = ctl.tick(store, lambda: T0 + 40 * MIN, armed)
+    assert r.no_slot == [(ag, "2026-11-02T12:00:00Z")]
+    with store.read() as c:
+        assert [h[2] for h in slots.held(c)] == ["held-2"]
+    with store.write() as c:                                                 # a cap nobody can read
+        c.execute("INSERT INTO agent_settings (key, value) VALUES ('max_slots', 'lots')")
+    r = ctl.tick(store, lambda: T0 + 61 * MIN, armed)                        # the tick completes and still claims
+    assert r.overlapped == [(ag, "2026-11-02T13:00:00Z")] and r.no_slot == []   # it walked the slot, nothing halted

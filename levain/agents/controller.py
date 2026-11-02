@@ -10,7 +10,7 @@ that read first holds a snapshot and gets SQLite's busy error, which writes noth
 
 ``tick`` walks every registered, active agent's slots since its stored cursor, in the agent's stored zone, with an
 injected clock. Before the walk it ends every admitted occurrence the full cap has held past its grace
-(:func:`close_no_slot`); ``session_alive`` is the coordinator-lease liveness check (see :mod:`slots`). What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
+(:func:`close_no_slot`); ``launch_over`` and ``session_alive`` are the coordinator-lease probes (see :mod:`slots`). What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
 binding_id | None``; ``None`` means the agent is not armed), because arming is derived from the authority log and a
 binding is minted by the launch slice, neither of which is this module's.
 """
@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -149,14 +149,17 @@ def _admitted_since(kind: str, key: str, admitted_at: str) -> datetime:
     return datetime.strptime(admitted_at, _STAMP).replace(tzinfo=timezone.utc)
 
 
-def close_no_slot(conn: sqlite3.Connection, now: datetime,
-                  session_alive: Callable[[str], bool] | None = None) -> list[tuple[str, str]]:
+def close_no_slot(conn: sqlite3.Connection, now: datetime, over: Collection[str] = ()) -> list[tuple[str, str]]:
     """End as ``missed`` / ``no_slot`` every ``admitted`` occurrence past its grace while the cap is full (A0 §2.4:
     a named occurrence is retried each tick, and only the grace running out ends it). Returns ``(agent_id, key)``.
-    It reclaims expired coordinator leases first, and does nothing while a slot is free: an occurrence still
-    admitted past grace with a slot free was not left by the cap, so ``no_slot`` would be a false reason. Runs in
-    the caller's write transaction."""
-    if slots.free(conn, now, session_alive) > 0:
+    It reclaims the expired coordinator leases in ``over`` (probed by the caller, :func:`slots.probe_over`) first, and
+    does nothing while a slot is free: an occurrence still admitted past grace with a slot free was not left by the
+    cap, so ``no_slot`` would be a false reason. A cap nobody can read decides nothing here: the tick goes on for
+    the other agents and the occurrences stay admitted. Runs in the caller's write transaction."""
+    try:
+        if slots.free(conn, now, over) > 0:
+            return []
+    except ValueError:
         return []
     at = _stamp(now)
     closed = []
@@ -167,13 +170,15 @@ def close_no_slot(conn: sqlite3.Connection, now: datetime,
             continue
         conn.execute("UPDATE agent_occurrences SET state = 'missed', reason = 'no_slot', ended_at = ?"
                      " WHERE occurrence_id = ? AND state = 'admitted'", (at, oid))
+        slots.release(conn, oid)  # an admitted occurrence holds nothing (A0 §2.4), so this frees nothing today
         closed.append((agent_id, key))
     return closed
 
 
 def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
          binding_of: Callable[[str, str], str | None],
-         session_alive: Callable[[str], bool] | None = None) -> TickResult:
+         session_alive: Callable[[str], bool | None] | None = None,
+         launch_over: Callable[[str], bool | None] | None = None) -> TickResult:
     """One controller pass. ``store`` is an opened :class:`AgentStore` or a store directory; a directory is opened
     through :func:`open_agent_store`, so a refused agent schema raises ``AgentStoreRefused`` with its named reason
     before anything is read or written.
@@ -189,8 +194,11 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
     floor = now.replace(second=0, microsecond=0)
     out = TickResult()
     # first, so an occurrence the cap held past its grace no longer reads as a live previous one to this tick's claims
+    with store.read() as conn:
+        expired = slots.expired_launches(conn, now)
+    over = slots.probe_over(expired, launch_over, session_alive)  # outside any write lock: a probe can be slow
     with store.write() as conn:
-        for agent_id, key in close_no_slot(conn, now, session_alive):
+        for agent_id, key in close_no_slot(conn, now, over):
             out.no_slot.append((agent_id, key))
             out.missed[agent_id] = out.missed.get(agent_id, 0) + 1  # the miss streak (P6-2b) counts it
     with store.read() as conn:
