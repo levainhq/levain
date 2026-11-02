@@ -18,7 +18,7 @@ from typing import Any
 from levain import unshowable
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.coordinator import lease as _leases
-from levain.coordinator import seam_handoffs, seam_open
+from levain.coordinator import seam_arrival, seam_handoffs, seam_open
 from levain.coordinator.seam import _trim, open_brief, verbose_lines
 from levain.coordinator.seam_build import build
 from levain.coordinator.store import CoordError, StoreAbsent
@@ -142,23 +142,68 @@ def _own_launch_build(store: Any, launch: Any) -> Any:
         return None if row is None else seam_open.stored_build(conn, row[0], "launch", launch.launch_id)
 
 
-def _readonly_text(store: Any, args: argparse.Namespace) -> tuple[str, Any]:
-    brief = open_brief(store, args.queue_dir, open_kind(store), store._clock())
+def _readonly_text(store: Any, args: argparse.Namespace, kind: str | None = None) -> tuple[str, Any]:
+    brief = open_brief(store, args.queue_dir, open_kind(store) if kind is None else kind, store._clock())
     return brief.text, brief
 
 
 def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
+    light = bool(getattr(args, "light", False))
+    gap_hours = getattr(args, "gap_hours", None)
     if args.ack is not None:
+        # refused, not dropped: a caller that asked for a light open must not read an acknowledgement as one
+        if light or gap_hours is not None:
+            raise CoordError("--ack acknowledges a built open and takes no --light or --gap-hours; run them as two "
+                             "commands; nothing was written")
         return _ack(args, out, store)
     if args.read_back_file is not None:
         raise CoordError("--read-back-file goes with --ack OPEN_ID: it is the read-back an acknowledgement carries")
+    if gap_hours is not None and not light:
+        raise CoordError("--gap-hours goes with --light: it is the gap under which no light open is needed")
+    if gap_hours is not None:
+        seam_arrival.gap_threshold(gap_hours)        # refused before anything is read or written
     launch, why = _active(store, args.token)
     tail = _tail(store)
     handoff = seam_handoffs.latest(store)
     built = None
     note = ""
+    kind = None
+    arrival_notes: list[str] = []
     if launch is not None:
         built = _own_launch_build(store, launch)
+        # a verified leave is consumed whenever an open runs; its open comes before a stale one already acknowledged
+        arrivals, arrival_notes = seam_arrival.ingest_leaves(store, args.queue_dir, args.token)
+        waiting = [b for b in arrivals if not seam_arrival.is_acked(store, b.open_id)]
+        if waiting and (built is None or seam_arrival.is_acked(store, built.open_id)):
+            built = waiting[0]
+            if len(waiting) > 1:
+                arrival_notes.append(f"{len(waiting) - 1} more leave open(s) wait: acknowledge this one, then run "
+                                     "coord open again")
+        if light and built is not None and seam_arrival.is_acked(store, built.open_id):
+            built = None        # an acknowledged open is done with: --light asks whether the operator spoke since
+    if light and built is None:
+        needed, gap_why, latest = seam_arrival.light_gap(
+            store, seam_arrival.LIGHT_GAP_HOURS if gap_hours is None else gap_hours)
+        if needed and launch is not None:
+            from contextlib import closing
+
+            with closing(store._connect()) as conn:
+                prior = seam_open.stored_build(conn, "light", "silence", latest.ref)
+            if prior is not None and seam_arrival.is_acked(store, prior.open_id):
+                needed, gap_why = False, (f"no light open needed: the light open for this activity (open "
+                                          f"{prior.open_id}) is acknowledged")
+        if not needed:
+            _emit(out, args.json, {"open_id": None, "acknowledgeable": False, "light_needed": False, "why": gap_why,
+                                   **({"notes": arrival_notes} if arrival_notes else {})},
+                  gap_why + "".join(f"\n{ln}" for ln in arrival_notes))
+            return 0
+        kind = "light"
+        if launch is not None:
+            built = build(store, kind="light", signal_kind="silence", signal_key=latest.ref, queue_dir=args.queue_dir,
+                          token=args.token)
+        else:
+            note = f"printed read-only and cannot be acknowledged ({why})"
+    elif launch is not None:
         if (built is None and handoff is not None and handoff.seam_kind in seam_open.PREDECESSOR_HANDOFF_SEAMS
                 and handoff.writer == launch.session_key):
             note = (f"a coordinator cannot acknowledge its own handoff (this launch wrote handoff {handoff.handoff_id}): "
@@ -173,10 +218,12 @@ def run_open(args: argparse.Namespace, out: Any, store: Any) -> int:
     else:
         note = f"printed read-only and cannot be acknowledged ({why})"
     verbose = verbose_lines() if getattr(args, "verbose", False) else None
-    extra = "".join(f"\n{ln}" for ln in verbose or ())
+    extra = "".join(f"\n{ln}" for ln in [*(verbose or ()), *arrival_notes])
     more_json = {} if verbose is None else {"verbose": verbose}
+    if arrival_notes:
+        more_json["notes"] = arrival_notes
     if built is None:
-        text, brief = _readonly_text(store, args)
+        text, brief = _readonly_text(store, args, kind)
         _emit(out, args.json, {"open_id": None, "acknowledgeable": False, "why": note, "body": text,
                                "prev_handoff_id": None if handoff is None else handoff.handoff_id, **more_json},
               f"{_fenced(text)}{extra}\n\n--\n{note}\n{_prev_line(handoff)}")
