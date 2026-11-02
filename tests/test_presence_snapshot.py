@@ -74,7 +74,7 @@ def test_effective_works_from_a_given_snapshot(tmp_path):
     q.mkdir(mode=0o700)
     called = []
     e = presence.effective(q, word=None, reading=900.0, idle=lambda: called.append(1) or 5.0)
-    assert not called and e["state"] == "pushing" and "inactive" in e["reason"]
+    assert not called and e["state"] == "pushing" and "no input at the laptop" in e["reason"]
 
 
 def _no_route_remote_idle(q):

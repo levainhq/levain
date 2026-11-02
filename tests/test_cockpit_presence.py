@@ -392,7 +392,7 @@ def test_the_chip_reads_the_word_and_none_and_the_sheet_posts_each_body(rig, tmp
             {"do": "document.body.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}))", "until": "document.getElementById('pr-sheet').hidden", "ms": 4000},
         ])
     v = out["values"]
-    assert v[1].startswith("Holding")                                      # no word: the chip shows what the rule does (the desk is active)
+    assert v[1].startswith("Here")                                         # no word: the chip shows where he is (input at the laptop just now)
     assert v[2] == ["Here", "Away", "Quiet", "Sleep", "Loud"]
     assert v[4] is True                                                    # focus moved into the sheet
     assert v[6].startswith("Quiet · ") and v[6].endswith(("m", "h"))
@@ -553,7 +553,8 @@ def test_the_view_carries_effective_and_it_agrees_with_the_push_decision(rig, mo
         assert eff["pushing"] is presence.should_push(q, "ping", suggest=False).push
         idle[0] = 900.0                                             # the desk went idle: the same stored (no) word now pushes
         eff = _call(port, "GET", GET, token=T)[1]["effective"]
-        assert (eff["state"], eff["pushing"], eff["source"]) == ("pushing", True, "measured") and "desk inactive" in eff["reason"]
+        assert (eff["state"], eff["pushing"], eff["source"]) == ("pushing", True, "measured") and "no input at the laptop" in eff["reason"]
+        assert eff["you"]["state"] == "away" and eff["desk"]["live"] is False        # the operator's reading and the desk's record, two names
         _call(port, "POST", SET, {"word": "quiet", "for": "1h"}, token=T)
         eff = _call(port, "GET", GET, token=T)[1]["effective"]
         assert (eff["state"], eff["pushing"], eff["source"]) == ("muted", False, "word") and abs(eff["since"] - time.time()) < 30
@@ -572,15 +573,15 @@ def _chip_text_when(rig, tmp_path, monkeypatch, idle_secs, word=None, word_age=0
 
 @needs_browser
 def test_the_chip_paints_the_effective_state_not_the_stored_word(rig, tmp_path, monkeypatch):
-    # no word on file, the desk idle 15 min: pushing
+    # no word on file, no input at the laptop for 15 min: the chip says Away, measured
     text, state = _chip_text_when(rig, tmp_path, monkeypatch, 900.0)
-    assert text.startswith("Pushing") and "desk inactive" in text and state == "pushing"
-    # no word, the desk active: holding
+    assert text.startswith("Away") and "idle 15 min" in text and state == "away"
+    # no word, input just now: Here
     text, state = _chip_text_when(rig, tmp_path, monkeypatch, 5.0)
-    assert text.startswith("Holding") and state == "holding"
-    # `away` on file but he typed more than the grace after it: the word is spent, the chip says what the rule does
+    assert text.startswith("Here") and "active just now" in text and state == "holding"
+    # `away` on file but he typed more than the grace after it: the word is spent, the chip says where he is
     text, state = _chip_text_when(rig, tmp_path, monkeypatch, 5.0, word="away", word_age=1200.0)
-    assert text.startswith("Holding") and "Away" not in text and state == "holding"
+    assert text.startswith("Here") and "Away" not in text and state == "holding"
 
 
 @needs_browser
