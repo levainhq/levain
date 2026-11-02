@@ -305,6 +305,10 @@ def _decide(now: float, rec: dict, reading: float | None, class_name: str, remot
         return Decision(False, "muted", f"{label}: lets through {_LETS_WORDS[eff['lets_through']]}", preset or "lets"), source
     if on:
         return Decision(True, "pushing", why, preset), source
+    if class_name == "attention":
+        # Phill 10-27: an attention item pings his phone "even when pings are not otherwise on" (the desk being active, or devices
+        # off, holds the other classes, never this one); only a mute (lets_through) holds it, above.
+        return Decision(True, "pushing", "an attention item reaches your devices whatever the desk is doing", preset), source
     return Decision(False, "holding", why), source
 
 
