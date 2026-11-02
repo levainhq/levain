@@ -79,3 +79,38 @@ def test_a_failed_delete_keeps_a_deep_linked_item_and_mark_all_read_marks_it(tmp
     failed, marked = _json(out)
     assert failed["title"].startswith("Deep item 000") and failed["banner"].startswith("Delete didn’t reach Levain"), failed
     assert marked["tg"].strip() == "Mark unread", marked
+
+
+@needs_browser
+def test_a_load_older_in_flight_is_dropped_when_a_delete_lands_first(tmp_path: Path) -> None:
+    """Load older is slow, a delete lands, then the older page arrives: that stale page must be dropped, not appended (S4 L3 r3)."""
+    r = Rig(tmp_path)
+    _seed_many(r)
+    hold = ("(() => { const f = window.fetch; window.__held = null; window.fetch = (u, o) => String(u).includes('before=')"
+            " ? new Promise((res) => { window.__held = () => f(u, o).then(res); }) : f(u, o); return 1; })()")
+    state = f"JSON.stringify({{ rows: {ROWS}.length }})"
+    with _signed(r.src, r.q) as (port, _):
+        r.seed(port)
+        out = _drive(tmp_path, _url(port), [WIDE, READY, OPEN, {"until": f"{ROWS}.length >= 50 && 1", "ms": 30000}, {"eval": hold},
+                                            {"eval": f"{MODAL}.querySelector('.nc-older').click(); 1"},
+                                            {"eval": f"{ROWS}[0].querySelector('.nc-main').click(); 1"}, SETTLE,
+                                            {"eval": f"{MODAL}.querySelector('.nc-delete').click(); 1"}, SETTLE,
+                                            {"eval": "window.__held(); 1"}, SETTLE, {"eval": state}])
+    assert _json(out)[-1]["rows"] < 90, out                                  # page one plus the refresh margin (~70); the stale older page would make it 99+
+
+
+@needs_browser
+def test_an_item_at_index_49_stays_open_when_a_new_arrival_shifts_it_past_the_refresh_limit(tmp_path: Path) -> None:
+    """Open the 50th row; a new notification arrives before the refresh; the detail must stay (S4 L3 r3)."""
+    r = Rig(tmp_path)
+    _seed_many(r)
+    arrive = ("(() => { const f = window.fetch; window.fetch = (u, o) => !String(u).startsWith('/webpush/center?limit=') ? f(u, o)"
+              " : f(u, o).then(async (resp) => { const d = await resp.clone().json(); const n = +(String(u).match(/limit=(\\d+)/) || [0, 50])[1];"
+              " d.items = [Object.assign({}, d.items[0], { id: 'p99999', title: 'Fresh' })].concat(d.items).slice(0, n);"
+              " return new Response(JSON.stringify(d), { status: 200 }); }); return 1; })()")
+    state = f"JSON.stringify({{ title: ({MODAL}.querySelector('.nc-dtitle') || {{}}).textContent || '' }})"
+    with _signed(r.src, r.q) as (port, _):
+        r.seed(port)
+        out = _drive(tmp_path, _url(port), [WIDE, READY, OPEN, {"until": f"{ROWS}.length == 50 && 1", "ms": 30000}, {"eval": arrive},
+                                            {"eval": f"{ROWS}[49].querySelector('.nc-main').click(); 1"}, SETTLE, {"eval": state}])
+    assert _json(out)[-1]["title"].startswith("Deep item"), out

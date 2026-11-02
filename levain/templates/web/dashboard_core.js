@@ -8091,7 +8091,7 @@
   // renderer's DOM nodes, never innerHTML: this page shares a document with the write token.
   const NC_PATH = "/webpush/center", NC_POLL_MS = 30000, NC_TIMEOUT_MS = 15000, NC_PANEL_ROWS = 5, NC_SWIPE_PX = 96, NC_REFRESH_MAX = 200;   // 200 is the server's page cap
   const NC_ID = /^[pn][0-9]{1,19}$/;
-  const nc = { sig: "", items: [], unread: 0, total: 0, needs: 0, next: null, status: "idle", goodAt: 0, readId: 0, busy: 0 };
+  const nc = { sig: "", items: [], unread: 0, total: 0, needs: 0, next: null, status: "idle", goodAt: 0, readId: 0, wgen: 0, busy: 0 };
   // status: idle (never read) | ok | error (never read, last try failed) | noauth (no/refused token) | absent (this server has no center)
   const ncUi = { sel: null, pinned: null, filter: "", banner: null, menu: false, detail: false, gone: "", more: false };
   let ncRoot = null, ncDeepPending = null;
@@ -8138,7 +8138,7 @@
     const mine = ++nc.readId;
     // a refresh keeps the pages the reader loaded: it asks for as many rows as are held (the server's page cap bounds it), so opening
     // an older row, a write or the 30 s pulse never collapses the list to page one and closes the open detail
-    const res = await ncApi("GET", NC_PATH + "?limit=" + Math.min(NC_REFRESH_MAX, Math.max(50, nc.items.length)));
+    const res = await ncApi("GET", NC_PATH + "?limit=" + Math.min(NC_REFRESH_MAX, Math.max(50, nc.items.length + 10)));
     if (mine !== nc.readId) return false;
     const d = res.data || {};
     if (res.status === 200 && Array.isArray(d.items)) {
@@ -8166,8 +8166,10 @@
   async function ncMore() {
     if (!nc.next || ncUi.more) return;
     ncUi.more = true; ncPaint();
+    const gen = nc.wgen;   // a write that lands while this page is in flight makes it stale: it is dropped, never appended
     const res = await ncApi("GET", NC_PATH + "?limit=50&before=" + encodeURIComponent(nc.next));
     ncUi.more = false;
+    if (gen !== nc.wgen) { ncPaint(); return; }
     if (res.status === 200 && Array.isArray(res.data.items)) {
       const have = new Set(nc.items.map((x) => x.id));
       nc.items = nc.items.concat(res.data.items.filter((x) => !have.has(x.id)));
@@ -8178,7 +8180,7 @@
 
   // ---- the writes (each awaited; the list is read again after, so the page shows what the server holds) ----------------
   async function ncWrite(path, body, failWords, quiet404) {
-    nc.busy++; nc.readId++; nc.sig = "";   // the page's list is about to differ from the server's: the next read always paints
+    nc.busy++; nc.readId++; nc.wgen++; nc.sig = "";   // the page's list is about to differ from the server's: the next read always paints
     // a failure's banner stays until it is dismissed or the next write starts: a write that lands never wipes another's failure
     if (ncUi.banner && ncUi.banner.kind === "write") ncUi.banner = null;
     let res;
@@ -8225,8 +8227,8 @@
   function ncSelect(id) {
     ncUi.sel = id; ncUi.detail = true; ncUi.gone = "";
     const it = ncFind(id);
-    // a row beyond the first page is pinned, so no refresh can lose the open detail
-    if (it && nc.items.findIndex((x) => x.id === id) >= 50) ncUi.pinned = it;
+    // the open row is always pinned (a new arrival can push it past any refresh limit); ncFind prefers the list's own copy
+    if (it) ncUi.pinned = it;
     ncPaint();
     if (it && !it.read) ncSetRead(id, true);
   }
