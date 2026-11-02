@@ -28,6 +28,8 @@ __all__ = ["FENCE_DB_TIMEOUT", "AgentFences", "Unfenceable"]
 
 # how long the fence waits on autonomic.db before the read fails (and GATE answers limits-failed)
 FENCE_DB_TIMEOUT = 0.25
+# locked refresh-and-check passes after a cover-moved check, before the check refuses (GATE answers limits-failed)
+_COVER_RETRIES = 3
 # the autonomic store id's form, as the authority log validates an agent link's store_id (levain.agents.bars)
 _STORE_ID = re.compile(r"store-[0-9a-f]{32}")
 _OCCURRENCE_COLUMNS = ("occurrence_id", "agent_id", "link_id", "link_incarnation", "spec_hash", "binding_id",
@@ -55,12 +57,13 @@ class AgentFences:
     store's ``meta`` row on each check.
 
     The occurrence, its bar and the reason are read in one read transaction, so the reason names the snapshot the
-    digest came from. When the peek answers cover moved, the replay is refreshed and the check made again once, both
-    under one lock: a refresh never runs beside a retry (``AgentAuthority.refresh`` clears its snapshot while it
-    replays). Concurrent cover-moved checks share one refresh (a check whose peek failed before a refresh succeeded
-    replays nothing more), so a revoke that lands just after a refresh is still read and answered ``fenced``; after a
-    refresh that raised, none is tried for ``refresh_interval`` seconds from its end. A still unreadable cover
-    raises, so GATE refuses."""
+    digest came from. When building the fence or the peek answers cover moved, the replay is refreshed and the check
+    made again, both under one lock, for at most ``_COVER_RETRIES`` passes: a refresh never runs beside a retry
+    (``AgentAuthority.refresh`` clears its snapshot while it replays). Concurrent cover-moved checks share one refresh
+    (a check whose peek failed before a refresh succeeded replays nothing more on its first pass); a retry that still
+    finds the cover moved replays again on the next pass, so a revoke that lands just after a refresh is still read and
+    answered ``fenced``. After a refresh that raised, none is tried for ``refresh_interval`` seconds from its end. A
+    cover still unreadable after the last pass raises, so GATE refuses."""
 
     def __init__(self, db: Path | str, authority: Any, store_id: str | None = None, *,
                  refresh_interval: float = 1.0,
@@ -85,27 +88,40 @@ class AgentFences:
             if len(rows) > 1:
                 raise FenceUnavailable(f"more than one agent occurrence names session {who.session}")
             occurrence = dict(zip(_OCCURRENCE_COLUMNS, rows[0]))
-            fence, fence_now = agent_fence(occurrence, authority=self._authority,
-                                           store_id=self._store_id or self._read_store_id(conn), now=self._clock)
+            store_id = self._store_id or self._read_store_id(conn)
             seen = self._generation
             try:
-                return self._check(conn, occurrence, fence, fence_now)
+                return self._attempt(conn, occurrence, store_id)
             except AgentCoverMoved:
-                with self._lock:
+                pass
+            with self._lock:
+                for attempt in range(_COVER_RETRIES):
                     self._refresh(seen)
-                    return self._check(conn, occurrence, fence, fence_now)
+                    try:
+                        return self._attempt(conn, occurrence, store_id)
+                    except AgentCoverMoved:
+                        if attempt + 1 == _COVER_RETRIES:
+                            raise
+                        # L3 r2 codex: the cover moved again after the last refresh; the next pass replays
+                        seen = self._generation
         finally:
             conn.close()
 
+    def _attempt(self, conn: Any, occurrence: Mapping[str, Any], store_id: str) -> str | None:
+        # L3 r2 deepseek: agent_fence is inside the guarded region, so a cover-moved raise from it is refreshed too
+        fence, fence_now = agent_fence(occurrence, authority=self._authority, store_id=store_id, now=self._clock)
+        return self._check(conn, occurrence, fence, fence_now)
+
     def _check(self, conn: Any, occurrence: Mapping[str, Any], fence: str,
                fence_now: Callable[[Any], str]) -> str | None:
-        conn.execute("BEGIN")
         try:
+            conn.execute("BEGIN")
             if fence_now(conn) == fence:
                 return None
             return self._reason(conn, occurrence)
         finally:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:     # SQLite may already have rolled back; never mask the check's own error
+                conn.execute("ROLLBACK")
 
     def _refresh(self, seen: int) -> None:
         """Under ``self._lock``. Replays unless one succeeded since the caller's failed peek began (``seen``: the

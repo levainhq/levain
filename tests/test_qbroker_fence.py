@@ -273,6 +273,68 @@ def test_after_a_failed_refresh_the_interval_runs_from_its_end(rig, monkeypatch)
     assert fences(who) is None and authority.refreshes == 2
 
 
+def test_agent_fence_raising_cover_moved_takes_the_refresh_path(rig, monkeypatch):
+    # L3 r2 deepseek: agent_fence itself raised AgentCoverMoved (a refresh elsewhere cleared the replay) outside the
+    # guarded region, so no refresh ran and GATE answered limits-failed
+    authority = SlowAuthority()                                   # nothing held: a refresh elsewhere cleared it
+
+    def agent_fence(occurrence, *, authority=authority, store_id, now):
+        authority.peek()
+        return "f", lambda conn: "f"
+    monkeypatch.setattr(qfence, "agent_fence", agent_fence)
+    fences = AgentFences(rig.db, authority, STORE, refresh_interval=1.0)
+    assert fences(Resolved(session=SESSION, kind="dispatch", run=rig.run)) is None
+    assert authority.refreshes == 1
+
+
+def test_a_cover_that_moves_again_after_another_callers_refresh_is_refreshed(rig, monkeypatch):
+    # L3 r2 codex: the caller's peek failed, another caller refreshed, then the cover moved again before this caller's
+    # retry; _refresh(seen) skipped on the generation and the retry answered limits-failed
+    authority = SlowAuthority()
+    authority.state = "held"
+    fences = AgentFences(rig.db, authority, STORE, refresh_interval=0.0)
+    calls = {"n": 0}
+
+    def fence_now(conn):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            authority.state = None                                # the cover moves under this caller's peek
+            with fences._lock:                                    # another caller refreshes meanwhile
+                fences._refresh(fences._generation)
+            authority.state = None                                # and the cover moves again before the retry
+        authority.peek()
+        return "f"
+    monkeypatch.setattr(qfence, "agent_fence", lambda occurrence, *, authority, store_id, now: ("f", fence_now))
+    assert fences(Resolved(session=SESSION, kind="dispatch", run=rig.run)) is None
+    assert authority.refreshes == 2
+
+
+def test_a_cover_that_never_settles_fails_closed_after_a_bounded_retry(rig, monkeypatch):
+    authority = SlowAuthority()
+
+    def fence_now(conn):
+        authority.state = None                                    # every peek finds the cover moved
+        authority.peek()
+    monkeypatch.setattr(qfence, "agent_fence", lambda occurrence, *, authority, store_id, now: ("f", fence_now))
+    fences = AgentFences(rig.db, authority, STORE, refresh_interval=0.0)
+    with pytest.raises(AgentCoverMoved):
+        fences(Resolved(session=SESSION, kind="dispatch", run=rig.run))
+    assert 1 <= authority.refreshes <= qfence._COVER_RETRIES
+
+
+def test_a_check_whose_transaction_already_ended_raises_its_own_error(rig):
+    # L3 r2 complement LOW: an unconditional ROLLBACK in the finally raised "no transaction is active" over the
+    # check's own error when SQLite had already rolled the transaction back (or BEGIN never opened one)
+    conn = sqlite3.connect(rig.db, isolation_level=None)
+
+    def fence_now(c):
+        c.execute("ROLLBACK")                                     # as SQLite's own rollback on an I/O or full error
+        raise AgentCoverMoved("the cover moved")
+    with pytest.raises(AgentCoverMoved, match="the cover moved"):
+        rig.fences._check(conn, {}, "f", fence_now)
+    conn.close()
+
+
 def test_a_retry_never_runs_beside_a_refresh(rig, monkeypatch):
     authority = SlowAuthority(pause=0.005)
     stub_fence(monkeypatch, authority)
