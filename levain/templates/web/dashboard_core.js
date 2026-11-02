@@ -6144,6 +6144,9 @@
   // One timer for the earliest answered card to leave the strip: it re-runs the selection, which drops the card on an idle page.
   // Every render clears it and arms it again for the cards then listed.
   let needsExpiryTimer = 0;
+  const ANSWERED_KEY = "levain.needs.answeredOpen";
+  let answeredOpen = false;
+  try { answeredOpen = window.localStorage.getItem(ANSWERED_KEY) === "1"; } catch (e) { answeredOpen = false; }
   function renderNeeds(view) {
     if (needsExpiryTimer) { window.clearTimeout(needsExpiryTimer); needsExpiryTimer = 0; }
     try { renderNeedsNow(view); }
@@ -6176,10 +6179,28 @@
     const sig = all.map(needsKey).join("\n");
     if (host.dataset.sig === sig && !host.hidden) return;
     // the answered cards are drawn under a quiet label of their own; with nothing waiting that is all the strip holds
+    // folded by default (Phill 11-02): a count under a label you click to open; the cards stay in the page, hidden, so the
+    // strip's signature and the settled-card tick are unchanged. Per viewer and per browser, like the Tray's held toggle.
     const answeredSection = () => {
       const sec = el("div", "needs-answered");
-      sec.appendChild(el("div", "needs-sec-label", "Just answered"));
-      for (const it of settled) sec.appendChild(questionCard(it.q));
+      const toggle = el("button", "needs-answered-toggle");
+      toggle.type = "button";
+      toggle.appendChild(el("span", "needs-sec-label", "Just answered"));
+      toggle.appendChild(el("span", "needs-answered-n", String(settled.length)));
+      const body = el("div", "needs-answered-body");
+      for (const it of settled) body.appendChild(questionCard(it.q));
+      const show = (open) => {
+        body.hidden = !open;
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+        toggle.dataset.open = open ? "1" : "0";
+      };
+      show(answeredOpen);
+      toggle.addEventListener("click", () => {
+        answeredOpen = body.hidden;
+        show(answeredOpen);
+        try { window.localStorage.setItem(ANSWERED_KEY, answeredOpen ? "1" : "0"); } catch (e) { /* the choice then lasts this page only */ }
+      });
+      sec.append(toggle, body);
       return sec;
     };
     if (!items.length) {

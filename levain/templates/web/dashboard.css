@@ -1695,6 +1695,12 @@ body.ke .needs-body { display: flex; flex-direction: column; gap: var(--sp-2); m
 body.ke .needs-body .consent-display { margin-top: 0; }
 body.ke .needs-card.is-full { max-width: 720px; width: 100%; }
 body.ke .needs-answered { display: flex; flex-direction: column; gap: var(--sp-3); margin-top: var(--sp-4); }
+body.ke .needs-answered-toggle { display: flex; align-items: center; gap: var(--sp-2); background: none; border: 0; padding: var(--sp-2) 0; cursor: pointer; color: inherit; font: inherit; text-align: left; }
+body.ke .needs-answered-toggle::before { content: "\25B8"; color: var(--meta); font-size: var(--fs-micro); }
+body.ke .needs-answered-toggle[data-open="1"]::before { content: "\25BE"; }
+body.ke .needs-answered-n { font: var(--fw-bold) var(--fs-micro)/1 var(--mono); color: var(--meta); }
+body.ke .needs-answered-body { display: flex; flex-direction: column; gap: var(--sp-3); }
+body.ke .needs-answered-body[hidden] { display: none; }
 body.ke .needs-card.needs-settled { border-color: var(--line, var(--label)); opacity: .85; }
 body.ke .needs-card.needs-settled .needs-settled-tag { color: var(--label); }
 body.ke .needs-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); margin-top: auto; }

@@ -318,7 +318,7 @@ RECEIPT = ("JSON.stringify({receipt: 1, cards: document.querySelectorAll('#ck-ne
            " text: (document.querySelector('#ck-needs .needs-answered .needs-card') || {}).textContent || '',"
            " options: document.querySelectorAll('#ck-needs .needs-answered .question-option').length,"
            " recs: document.querySelectorAll('#ck-needs .needs-answered .needs-rec, #ck-needs .needs-answered .question-rec').length,"
-           " buttons: document.querySelectorAll('#ck-needs .needs-answered button').length,"
+           " buttons: document.querySelectorAll('#ck-needs .needs-answered-body button').length,"
            " order: [...document.querySelectorAll('#ck-needs .needs-answered .needs-card .needs-body > *')].map(n => n.className)})")
 
 
@@ -401,3 +401,22 @@ def test_the_failed_read_assertions_fail_without_the_receipt_branch(tmp_path: Pa
     seen = _failed_read_run(tmp_path, monkeypatch, core=CORE.replace(marker, 'if (false && card && (b.error ||'))
     with pytest.raises(AssertionError):
         _assert_failed_read_receipt(seen)
+
+
+@needs_browser
+def test_the_just_answered_block_is_folded_until_clicked_and_stays_open_after(tmp_path: Path, monkeypatch) -> None:
+    store = _home(tmp_path, monkeypatch)
+    store.answer(_file(store, "Question to fold away?").n, option="hold", channel="cockpit")
+    _file(store, "One that still waits?", agent="codex")
+    _root, src, _ids = _install(tmp_path)
+    state = ("JSON.stringify({hidden: document.querySelector('#ck-needs .needs-answered-body').hidden,"
+             " open: document.querySelector('#ck-needs .needs-answered-toggle').getAttribute('aria-expanded'),"
+             " n: document.querySelector('#ck-needs .needs-answered-n').textContent, fold: 1})")
+    click = "(document.querySelector('#ck-needs .needs-answered-toggle').click(), 1)"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            DESKTOP, {"until": "document.querySelector('#ck-needs .needs-answered .consent-note') && 1", "ms": 30000},
+            {"eval": state}, {"eval": click}, {"eval": state}])
+    folded, opened = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"fold"' in v]
+    assert folded == {"hidden": True, "open": "false", "n": "1", "fold": 1}, folded       # folded by default, the count shown
+    assert opened == {"hidden": False, "open": "true", "n": "1", "fold": 1}, opened       # one click opens it
