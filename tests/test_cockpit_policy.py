@@ -53,18 +53,19 @@ def test_no_signer_serves_no_policy(rig):
         assert _call(port, "POST", SET, _cell(), token=T)[0] == 404
 
 
+# Re-baselined (sleep default 10-25): the written cell is sleep.approval hold, a real change from the new push default.
 def test_an_authorised_write_round_trips_and_reset_restores_the_default(rig):
     src, q = rig
     with _signed(src, q) as (port, _):
-        st, got, _ = _call(port, "POST", SET, _cell(), token=T)
-        assert st == 200 and got["cells"]["sleep"]["approval"] == "push" and got["status_kind"] == "loaded"
-        assert _call(port, "GET", "/webpush/policy", token=T)[1]["cells"]["sleep"]["approval"] == "push"
-        assert presence.read_policy(q)[0]["sleep"]["approval"] == "push"
+        st, got, _ = _call(port, "POST", SET, _cell(v="hold"), token=T)
+        assert st == 200 and got["cells"]["sleep"]["approval"] == "hold" and got["status_kind"] == "loaded"
+        assert _call(port, "GET", "/webpush/policy", token=T)[1]["cells"]["sleep"]["approval"] == "hold"
+        assert presence.read_policy(q)[0]["sleep"]["approval"] == "hold"
         log = q / "webpush" / presence.LOG_NAME
         assert log.exists(), "the write left no log row"
         rows = [json.loads(l) for l in log.read_text().splitlines()]
         row = rows[-1]
-        assert row["word"] == "policy set sleep approval push" and row["outcome"] == "set"
+        assert row["word"] == "policy set sleep approval hold" and row["outcome"] == "set"
         assert "by" not in row                              # the operator's own act: no setter identity
         assert row["via"] == "browser"                      # the credential's name, never the secret
         assert T not in log.read_text()
@@ -165,8 +166,8 @@ def test_the_view_names_which_cells_hold_by_default(rig):
     src, q = rig
     with _signed(src, q) as (port, _):
         v = _call(port, "GET", "/webpush/policy", token=T)[1]
-        assert v["default_cells"] == presence.DEFAULT_CELLS and v["held_by_default"] == {"sleep.approval": True}
-        # an explicit table of the operator's own, sleep approvals held too: nothing holds BY DEFAULT
+        assert v["default_cells"] == presence.DEFAULT_CELLS and v["held_by_default"] == {}   # re-baselined: no approval cell holds by default now
+        # an explicit table of the operator's own, sleep approvals held: his hold, not the default's, so still nothing BY DEFAULT
         assert _call(port, "POST", SET, _cell("sleep", "approval", "hold"), token=T)[0] == 200
         v = _call(port, "GET", "/webpush/policy", token=T)[1]
         assert v["status_kind"] == "loaded" and v["cells"]["sleep"]["approval"] == "hold" and v["held_by_default"] == {}
@@ -215,8 +216,8 @@ def test_the_block_renders_edits_round_trip_and_the_approval_hold_warns(rig, tmp
     for look in (v[-2], v[-1]):          # light, then dark: the pressed segment LOOKS different from the unpressed one
         assert look["pressed"]["bg"] != look["unpressed"]["bg"], look
         assert look["pressed"]["color"] != look["unpressed"]["color"], look
-    assert v[1] == 0                    # the shipped default (sleep holds approvals) shows no warning ...
-    assert "wait while you sleep" in v[2]   # ... only the plain, non-warning line
+    assert v[1] == 0                    # the shipped default shows no warning ...
+    assert v[2] == "hidden"             # ... and (re-baselined) no default line either: no approval cell holds by default now
     assert v[4] == 1                    # a hold in a non-default cell (quiet approvals) warns
     assert ["quiet.approval", "hold"] in json.loads(v[7])   # it held across a reload
     assert presence.policy_view(q)["status_kind"] == "default"   # reset
@@ -280,4 +281,5 @@ def test_a_custom_table_holding_sleep_approvals_shows_no_default_line(rig, tmp_p
             {"eval": "document.querySelector('.np-default').hidden"},
             {"eval": "document.querySelectorAll('.np-warn:not([hidden])').length"},
         ])
-    assert out["values"][1] is True and out["values"][2] == 0
+    # re-baselined: sleep approvals held is now a non-default hold, so the warning shows; the default line stays hidden
+    assert out["values"][1] is True and out["values"][2] == 1

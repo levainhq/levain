@@ -90,10 +90,11 @@ def test_sleep_ends_at_his_next_input_and_releases_the_same_way(tmp_path, monkey
     _phone(tmp_path)
     sent = _fake(monkeypatch)
     set_word(tmp_path, "sleep", now=NOW)
-    _hold(tmp_path, "sleep", kind="consent", ref="request:r1", body="urgent held by sleep")
+    # re-baselined (sleep default 10-25): an approval now pushes through sleep, so the held ping is an `other` one
+    _hold(tmp_path, "sleep", kind="ruling", ref="question:1", body="ruling held by sleep")
     assert held.flush(tmp_path, now=NOW + 600, idle=lambda: 600.0 + 50) == 0   # no input since the word
     assert held.flush(tmp_path, now=NOW + 600, idle=lambda: 20.0) == 1   # typed 20 s ago
-    assert b"asleep" in sent[0] and b"urgent held by sleep" in sent[1]
+    assert b"asleep" in sent[0] and b"ruling held by sleep" in sent[1]
 
 
 def test_loud_releases_everything_and_back_ends_a_quiet_release(tmp_path, monkeypatch):
@@ -165,9 +166,10 @@ def test_wiring_notify_queues_a_held_ping_under_its_reason(tmp_path, monkeypatch
     ping("ruling")
     ping("consent")
     set_word(tmp_path, "sleep")
-    ping("consent")
+    ping("consent")    # re-baselined: the sleep default pushes an approval ...
+    ping("ruling")     # ... and holds an `other` ping under the reason `sleep`
     assert [(c["push"], c["hold"]) for c in calls] == [(False, "active"), (False, "quiet"), (True, None),
-                                                      (False, "sleep")]
+                                                      (True, None), (False, "sleep")]
 
 
 def test_status_says_how_many_are_held(tmp_path, monkeypatch):
@@ -403,8 +405,10 @@ def test_h6_sleep_without_an_idle_reading_ends_at_a_bound_and_status_says_so(tmp
 
     set_word(tmp_path, "sleep", now=NOW)
     word = presence.read_word(tmp_path)
-    assert presence.decide(NOW + 60, word, None, urgent=True).push is False
-    assert presence.decide(NOW + SLEEP_BLIND_SECS + 1, word, None, urgent=True).push is True
+    # re-baselined: an urgent (approval) ping pushes through sleep now, so the bound is pinned on an `other` ping
+    assert presence.decide(NOW + 60, word, None, urgent=True).push is True
+    assert presence.decide(NOW + 60, word, None).push is False
+    assert presence.decide(NOW + SLEEP_BLIND_SECS + 1, word, None).push is True
     text = presence.describe(tmp_path, now=NOW + 60, idle=lambda: None)
     assert "idle source unavailable" in text
     assert "idle source unavailable" not in presence.describe(tmp_path, now=NOW + 60, idle=lambda: 5000.0)

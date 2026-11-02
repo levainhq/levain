@@ -651,7 +651,7 @@
                    ["attention", "Attention items", "things that need you, dated ones included"],
                    ["other", "Other pings", "questions, rulings, summaries"]];
   const HOLD_WARN = "Seats that need your approval will wait silently until you unmute.";
-  const DEFAULT_NOTE = "By default, approvals wait while you sleep and push once you are back.";
+  const DEFAULT_NOTE = "By default, approvals and urgent pings still reach you while you sleep; everything else waits until you are back.";
   let npPanel = null, npSentences = null, npStatus = null, npNote = null, npCells = {}, npReset = null, npBusy = false, npDefault = null,
       npGen = 0, npGone = false, npRefused = "", npResetOff = false;   // npGen: bumped by every write; an older read is dropped
 

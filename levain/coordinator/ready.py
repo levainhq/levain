@@ -324,8 +324,10 @@ def derive_items(sources: Mapping[str, Any]) -> builtins.list:
 
     for seat in sources.get("seats") or ():
         if isinstance(seat, Mapping) and seat.get("token"):
-            projections.append(_item(id=f"seat:{seat['token']}", repo=str(seat.get("repo") or "flow"),
-                                     title=seat.get("name") or seat["token"], declared="running", source="seat",
+            repo = seat.get("repo")
+            projections.append(_item(id=f"seat:{seat['token']}", repo="flow" if repo is None else str(repo),
+                                     title=seat.get("name") or seat["token"],
+                                     declared="waiting" if seat.get("declared") == "waiting" else "running", source="seat",
                                      ref="roster"))
     for ci in sources.get("ci") or ():
         if isinstance(ci, Mapping) and ci.get("id"):
@@ -489,6 +491,95 @@ def list_ready(store: CoordStore | Path | str, *, all: bool = False, repo: str |
         out["items"] = [i for i in out["items"] if i["status_category"] == "ready"]
     if repo is not None:
         out["items"] = [i for i in out["items"] if i["repo"] == repo]
+    return out
+
+
+SEATS_SOURCE = "seats"
+JOURNAL_SOURCE = "journal"
+
+
+def _seat_rows(conn: sqlite3.Connection, now: str) -> builtins.list:
+    """The live seats (SCHEMA section 5's roster projection) from the launch rows the coordinator already keeps: every launch
+    whose latest event is ``active``. ``token`` is the launch id, ``name`` says harness, role and thread.
+
+    Liveness is the lease's own reading (:func:`levain.coordinator.lease.lease`), not a second rule: a coordinator launch is
+    ``running`` only while the lease stands live and is HELD BY ITS SESSION; one whose lease lapsed or is held by another
+    session has no liveness evidence and is projected ``waiting`` ("no live lease"), never ``running``. A worker holds no
+    lease and the store keeps no heartbeat for it: the watcher ends a launch whose session is no longer listed
+    (``end_unlisted``), so for a worker ``active`` is that watcher's reading, shown as is.
+
+    ``repo`` is ``""``: a launch records no repository (``cwd`` is an arbitrary execution directory, its basename wrong for a
+    nested directory or a worktree), and no wrong repo is better than a guessed one. A store before the launch tables reads as
+    no seats."""
+    from levain.coordinator import lease
+
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'launch_events'").fetchone() is None:
+        return []
+    held = lease.lease(conn, now)
+    out = []
+    for ln in lease._in_state(conn, "active"):
+        seat = {"token": ln.launch_id, "repo": "", "name": " ".join([str(ln.harness), str(ln.role), *map(str, ln.threads)])}
+        if ln.role == "coordinator" and not (held is not None and held.live and held.holder == ln.session_key):
+            seat["declared"] = "waiting"
+            seat["name"] += " (no live lease)"
+        out.append(seat)
+    return out
+
+
+def snapshot(store: CoordStore | Path | str, *, sources: Mapping[str, Any] | None = None, generated: str | None = None) -> dict:
+    """ONE consistent read of everything the board draws: :func:`list_ready` (every category) plus the journal's records
+    (``journal``, store order) plus the live seats as ``running`` projections (SCHEMA section 5), all in ONE read transaction, so a
+    card's journal line is never newer than its column: a journal record newer than its item's state row (journal ahead of
+    state) is left out of ``journal``, and the item is named in ``unreadable`` as :func:`list_ready` names it. A source that
+    cannot be read is named in ``unreadable`` (the seat roster as ``seats``, the journal as ``journal``: the cards stay, without
+    their journal lines), never an empty column. No coordinator needed."""
+    st = _store_of(store)
+    merged: dict[str, Any] = dict(sources or {})
+    given = merged.pop("unreadable", ())
+    unreadable = [given] if isinstance(given, str) else [*given]
+    rows: builtins.list = []
+    records: builtins.list = []
+    seats: builtins.list = []
+    cols = ", ".join(_JOURNAL_FIELDS)
+    now = st._stamp()
+
+    def q(conn: sqlite3.Connection) -> tuple:
+        cur = _current(conn)
+        try:
+            div = _diverged(conn)       # reads the journal too: a damaged journal degrades to "journal", the cards stay
+            recs = ([(r[0], dict(zip(_JOURNAL_FIELDS, r[1:])))
+                     for r in conn.execute(f"SELECT ver, {cols} FROM ready_journal ORDER BY gseq")]
+                    if _lifecycle_present(conn) else [])
+        except (sqlite3.Error, ValueError, CoordError):
+            div, recs = [], None
+        try:
+            seat = _seat_rows(conn, now)     # one malformed launch row names "seats" for the lot (named degradation, not a blank board)
+        except (sqlite3.Error, ValueError, CoordError, TypeError, AttributeError):
+            seat = None
+        return cur, div, recs, seat
+
+    try:
+        rows, diverged, recs, seat_rows = _read(st, q)
+        unreadable.extend(d.tag for d in diverged)
+        if recs is None:
+            unreadable.append(JOURNAL_SOURCE)
+        else:
+            state_ver = {r["id"]: r["ver"] for r in rows}
+            records = [rec for ver, rec in recs if ver <= state_ver.get(rec["id"], ver)]
+        if seat_rows is None:
+            unreadable.append(SEATS_SOURCE)
+        else:
+            seats = seat_rows
+    except StoreAbsent:
+        if not _absent(st):
+            unreadable.append(STORE_SOURCE)
+    except _READ_ERRORS:
+        unreadable.append(STORE_SOURCE)
+    merged["store"] = [*rows, *(merged.get("store") or ())]
+    merged["seats"] = [*seats, *(merged.get("seats") or ())]
+    stamp = generated or datetime.now().astimezone().isoformat(timespec="seconds")
+    out = derive(merged, generated=stamp, unreadable=unreadable)
+    out["journal"] = records
     return out
 
 

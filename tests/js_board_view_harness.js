@@ -98,6 +98,16 @@ const longTitleWords = globalThis.LevainBoardView.dropWords({ id: "i".repeat(100
 load();
 const V = globalThis.LevainBoardView;
 const out = { exports: Object.keys(V).sort(), filtering: filtering(V), grouped: grouped(V) };
+// An empty column says "nothing" only for a source that was read: an unreadable queue (or band) says "unknown", in both bodies.
+function emptyWords(V, extra) {
+  const model = V.boardModel(Object.assign({ queue: "ok", columns: [] }, extra));
+  const g = node("div"), c = node("div");
+  V.renderGrouped(doc, g, model);
+  V.renderBoard(doc, c, model);
+  const empties = (root) => walk(root).filter((n) => n.className === "bd-empty").map((n) => n.textContent);
+  return { grouped: empties(g), cols: empties(c) };
+}
+out.emptyWords = { ok: emptyWords(V, {}), queue: emptyWords(V, { queue: "unreadable", unreadable: ["coordinator"] }), band: emptyWords(V, { unreadable: ["band"] }), seats: emptyWords(V, { unreadable: ["seats"] }), noKey: emptyWords(V, { unreadable: undefined, queue: "mystery" }) };
 out.drop = dropButtons();
 out.dropHere = hereOut;
 out.longTitleWords = longTitleWords;

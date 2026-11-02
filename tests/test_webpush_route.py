@@ -7,7 +7,7 @@ import os
 import pytest
 
 from levain.webpush import presence, route
-from levain.webpush.presence import ACTIVE_WINDOW_SECS, decide, set_word
+from levain.webpush.presence import ACTIVE_WINDOW_SECS, DEFAULT_CELLS, decide, set_word
 
 NOW = 1_000_000.0
 ACTIVE = 10.0
@@ -36,7 +36,10 @@ def test_route_changes_nothing_for_urgent_or_the_mutes_and_loud_wins():
         assert decide(NOW, None, ACTIVE, class_name="approval", route=r).push is True
     assert decide(NOW, _w("quiet", until=NOW + 600), ACTIVE, class_name="other", route="devices").push is False
     assert decide(NOW, _w("sleep"), 250.0, class_name="other", route="devices").push is False
-    assert decide(NOW, _w("sleep"), 250.0, class_name="approval", route="devices").push is False
+    # re-baselined (sleep default 10-25): an approval pushes through sleep on its own reason; a held cell stays held on a route
+    assert decide(NOW, _w("sleep"), 250.0, class_name="approval", route="devices").push is True
+    holding = {"quiet": DEFAULT_CELLS["quiet"], "sleep": {"approval": "hold", "attention": "hold", "other": "hold"}}
+    assert decide(NOW, _w("sleep"), 250.0, class_name="approval", route="devices", policy=holding).push is False
     assert decide(NOW, _w("loud", until=NOW + 600), ACTIVE, class_name="other", route="desk").push is True
 
 

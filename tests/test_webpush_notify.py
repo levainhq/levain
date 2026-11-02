@@ -15,6 +15,8 @@ from levain.webpush.store import NOTICES_KEEP, PushStore
 
 NOW = 1_000_000.0
 PHILL = {"quiet": dict(DEFAULT_CELLS["quiet"]), "sleep": {"approval": "push", "attention": "push", "other": "hold"}}
+# the table that holds everything through sleep: the shipped default before 10-25, now an explicit choice of his
+HOLDING = {"quiet": dict(DEFAULT_CELLS["quiet"]), "sleep": {"approval": "hold", "attention": "hold", "other": "hold"}}
 DEFAULT = {m: dict(c) for m, c in DEFAULT_CELLS.items()}
 
 
@@ -368,9 +370,15 @@ def test_kinds_and_classes():
         notify.kind_for("high")
 
 
-def test_a_sleep_notice_under_the_default_table_every_priority_is_held_or_recorded():
-    # idle 1000 < now - word.ts: no input since the word, so sleep still holds
+def test_a_sleep_notice_under_the_default_table_only_an_urgent_one_rings():
+    # re-baselined (sleep default 10-25): the default now pushes attention, so an urgent notice rings through sleep
+    # idle 1000 < now - word.ts: no input since the word, so sleep still holds the rest
     got = {p: notify.notify_decision(p, NOW, _sleep_word(), 1000.0, policy=DEFAULT) for p in notify.PRIORITIES}
+    assert got == {"low": "recorded", "normal": "held", "urgent": "pushed"}
+
+
+def test_a_sleep_notice_under_a_table_holding_attention_every_priority_is_held_or_recorded():
+    got = {p: notify.notify_decision(p, NOW, _sleep_word(), 1000.0, policy=HOLDING) for p in notify.PRIORITIES}
     assert got == {"low": "recorded", "normal": "held", "urgent": "held"}
 
 
@@ -395,7 +403,7 @@ def test_quiet_and_the_open_desk(tmp_path):
 def test_the_decision_is_the_operators_tables_not_the_senders(tmp_path):
     # the same urgent notice moves with the table alone
     assert (notify.notify_decision("urgent", NOW, _sleep_word(), 1000.0, policy=DEFAULT),
-            notify.notify_decision("urgent", NOW, _sleep_word(), 1000.0, policy=PHILL)) == ("held", "pushed")
+            notify.notify_decision("urgent", NOW, _sleep_word(), 1000.0, policy=HOLDING)) == ("pushed", "held")
 
 
 # --- the notices store ---------------------------------------------------------------------------------

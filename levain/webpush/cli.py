@@ -47,8 +47,8 @@ def register(subparsers) -> None:
 
     for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), except urgent ones; one summary and the held "
                                  "pings follow when it ends."),
-                       ("sleep", "Hold every phone push, urgent too, until your next keyboard or mouse input at this "
-                                 "Mac (read from the Mac's input idle time); one summary and the held pings follow."),
+                       ("sleep", "Hold phone pushes until your next keyboard or mouse input at this Mac (read from the Mac's "
+                                 "input idle time), except approvals and urgent ones; one summary and the held pings follow."),
                        ("loud", "Push every ping for a while (default 60 min), over everything else; `loud off` ends it."),
                        ("away", "Push at once until you next type here (optional override)."),
                        ("back", "Clear away, quiet or sleep; a standing loud is left (`loud off`).")):

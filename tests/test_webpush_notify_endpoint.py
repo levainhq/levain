@@ -101,15 +101,15 @@ def _mint(q, name="Backup", **kw):
     return nt.create(q, name, **kw)[1]
 
 
-def _phill_table(q):
-    """Phill's recorded table: through sleep, approvals and attention push, the rest hold."""
-    presence.set_policy(q, "sleep", "approval", "push")
-    presence.set_policy(q, "sleep", "attention", "push")
+def _held_table(q):
+    """A table of his own that holds approvals and attention through sleep (the shipped default before 10-25)."""
+    presence.set_policy(q, "sleep", "approval", "hold")
+    presence.set_policy(q, "sleep", "attention", "hold")
 
 
 # ---- every status in the spec ---------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("table", ["default", "phill"])
+@pytest.mark.parametrize("table", ["default", "held"])
 @pytest.mark.parametrize("word,priority,expect", [
     (None, "normal", "pushed"),          # nothing muted, desk idle: pushed
     (None, "low", "recorded"),
@@ -118,16 +118,16 @@ def _phill_table(q):
     ("quiet", "low", "recorded"),
     ("sleep", "low", "recorded"),
     ("quiet", "urgent", "pushed"),       # the attention cell: push in quiet under both tables
-    ("sleep", "urgent", None),           # sleep: held by the default table, pushed by Phill's
+    ("sleep", "urgent", None),           # sleep: pushed by the default table (10-25), held by a table that holds attention
 ])
 def test_200_for_each_decision_under_each_mute_and_table(rig, table, word, priority, expect, monkeypatch):
     src, q = rig
-    if table == "phill":
-        _phill_table(q)
+    if table == "held":
+        _held_table(q)
     if word:
         presence.set_word(q, word, duration="1h" if word == "quiet" else None)
     if expect is None:
-        expect = "pushed" if table == "phill" else "held"
+        expect = "held" if table == "held" else "pushed"
     tok = _mint(q, "Backup", urgent=True)
     with _signed(src, q) as (port, _):
         monkeypatch.setattr(held, "flush_if_due", lambda *a, **k: False)
@@ -502,7 +502,8 @@ def test_a_held_notice_is_released_by_the_existing_flush_with_a_summary_naming_i
         for tok, t in ((a, "ran"), (b, "down"), (a, "ran again")):
             assert _post(port, {"title": t, "body": "text"}, token=tok)[1]["decision"] == "held"
     # a seat's ping held beside them keeps its own summary and its own link
-    PushStore(q).add_ping("push", "request:r1", "levain", "approve me", hold=("/?view=needs", "sleep"))
+    # re-baselined (sleep default 10-25): an approval pushes through sleep, so the seat's held ping is an `other` one
+    PushStore(q).add_ping("ruling", "question:1", "levain", "approve me", hold=("/?view=needs", "sleep"))
     assert held.count(q) == 4
     sent = []
     monkeypatch.setattr("levain.webpush.live", lambda qd: True)

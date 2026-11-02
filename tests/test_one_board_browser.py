@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -188,6 +189,46 @@ def test_drop_about_this_card_opens_the_drop_box_with_that_cards_words(tmp_path:
     assert out["posts"] == [] and sheet.dropped == []                            # a click posts nothing: it is a drop the operator sends
 
 
+class _SlowSheet(_Sheet):
+    """A drop sheet whose first read is slow, as on a loaded runner: the page is up and the board drawn before the drop box has
+    learned whether it can take words."""
+    delay = 1.5
+
+    def listing(self):
+        time.sleep(self.delay)
+        return super().listing()
+
+
+@needs_browser
+def test_a_card_clicked_before_the_drop_box_has_read_is_not_lost(tmp_path: Path, lh) -> None:  # noqa: F811
+    """The drop textarea is drawn enabled while `can` is still false until its first read lands. A "Drop about this card" click in
+    that window used to be refused and the refusal wiped by the read, so the words never arrived (the CI flake: step 7, the box
+    empty and unfocused). The words now wait for the read and go in, with focus, when it says the box can take them; and are
+    refused with the reason when it says it cannot."""
+    lh.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _seed(lh)
+    _root, src, _ids = _install(tmp_path)
+    box, host = "document.getElementById('ck-drop-words')", "document.getElementById('ck-drop')"
+    want = "About card levain:a (Land the board follow-up): "
+    click = lambda k: f"{BUILTIN}.querySelector('[data-drop-about=\"{k}\"]').click(); 1"
+    with _serve(src, write_token=TOKEN) as (url, httpd):
+        httpd.coord_sheet = sheet = _SlowSheet(lh)
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{BUILTIN} && {BUILTIN}.querySelector('[data-drop-about=\"levain:a\"]') && {box} && 1"},
+            {"eval": f"[{host}._drop.read, {host}._drop.can]"},          # the click below is before the read: the window under test
+            {"eval": click("levain:a")},
+            {"until": f"{box}.value === {json.dumps(want)} && document.activeElement === {box} && 1"},
+            {"eval": f"JSON.stringify([{box}.value, {box}.selectionStart, {host}._drop.pending, {host}._drop.say.textContent])"},
+        ])
+    v = out["values"]
+    assert v[-4] == [None, False], v                                           # no read had landed when the card was clicked
+    value, caret, pending, say = json.loads(v[-1])
+    assert value == want and caret == len(want) and pending is None and say == ""
+    assert out["posts"] == [] and sheet.dropped == []
+
+
 @needs_browser
 def test_a_board_whose_drop_files_to_another_coordinator_draws_no_drop_button(tmp_path: Path, lh) -> None:  # noqa: F811
     lh.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -216,7 +257,8 @@ def test_compose_drop_refuses_a_box_that_is_busy_or_off_and_clears_a_stale_hando
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
             *_reload(),
-            {"until": f"{BUILTIN} && {box} && !{box}.disabled && 1"},
+            # the box starts enabled and off: it is ready to be driven by hand only once its first read has landed
+            {"until": f"{BUILTIN} && {host} && {host}._drop && {host}._drop.read && {host}._drop.can && !{box}.disabled && 1"},
             {"eval": "sessionStorage.setItem('levain-drop-prefill', 'stale'); 1"},
             {"eval": f"{host}._drop.working = true; [LevainDashboard.composeDrop('x'), {state}]"},        # a send in flight
             {"eval": f"{host}._drop.working = false; {host}._drop.can = false; {host}._drop.note = 'no store'; "

@@ -9,7 +9,7 @@ import pytest
 
 from levain.consent.adapters import claude_code
 from levain.webpush import presence, sender
-from levain.webpush.presence import ACTIVE_WINDOW_SECS, AWAY_GRACE_SECS, PresenceError, decide, set_word
+from levain.webpush.presence import ACTIVE_WINDOW_SECS, AWAY_GRACE_SECS, DEFAULT_CELLS, PresenceError, decide, set_word
 from tests._push_fixtures import phone
 
 NOW = 1_000_000.0
@@ -56,8 +56,12 @@ def test_quiet_holds_an_ordinary_ping_but_urgent_pushes_through():
     assert (d.push, d.state) == (True, "pushing")
 
 
-def test_sleep_holds_urgent_too():
+def test_sleep_pushes_urgent_by_default_and_holds_it_when_his_cell_says_hold():
+    # re-baselined (sleep default 10-25: approvals and attention push through sleep)
     d = decide(NOW, _w("sleep"), INACTIVE, urgent=True)   # no input since the word, said 100 s ago
+    assert (d.push, d.state, d.by) == (True, "pushing", "")
+    holding = {"quiet": DEFAULT_CELLS["quiet"], "sleep": {"approval": "hold", "attention": "hold", "other": "hold"}}
+    d = decide(NOW, _w("sleep"), INACTIVE, urgent=True, policy=holding)
     assert (d.push, d.state, d.by) == (False, "muted", "sleep")
 
 
@@ -69,7 +73,8 @@ def test_loud_overrides_quiet_and_sleep_and_an_active_desk():
 
 def test_sleep_mutes_until_input_after_the_word():
     s = _w("sleep")   # said 100 s ago
-    assert decide(NOW, s, INACTIVE, urgent=True).push is False
+    assert decide(NOW, s, INACTIVE).push is False        # re-baselined: an urgent ping pushes through sleep now
+    assert decide(NOW, s, INACTIVE, urgent=True).push is True
     assert decide(NOW, s, None).push is False
     # input 50 s ago is after the word (said 100 s ago): no longer muted, and the desk is active
     assert decide(NOW, s, 50.0).state == "holding"
@@ -233,14 +238,16 @@ def test_wiring_quiet_holds_consent_and_loud_pushes_again(tmp_path, monkeypatch)
     assert [c["push"] for c in calls] == [False, True]
 
 
-def test_wiring_quiet_still_pushes_a_consent_and_sleep_holds_it(tmp_path, monkeypatch):
+def test_wiring_quiet_and_the_sleep_default_push_a_consent_and_a_held_sleep_cell_holds_it(tmp_path, monkeypatch):
     _phone(tmp_path)
     calls = _spy(monkeypatch, ACTIVE)
     set_word(tmp_path, "quiet", duration="30")
     assert _notify(tmp_path, "consent") is True
     set_word(tmp_path, "sleep")
+    assert _notify(tmp_path, "consent") is True      # re-baselined: the sleep default pushes an approval
+    presence.set_policy(tmp_path, "sleep", "approval", "hold")
     assert _notify(tmp_path, "consent") is False
-    assert [c["push"] for c in calls] == [True, False]
+    assert [c["push"] for c in calls] == [True, True, False]
 
 
 # --- the CLI words ----------------------------------------------------------------------------------------------------

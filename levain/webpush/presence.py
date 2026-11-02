@@ -17,7 +17,7 @@ Words, kept in ``<queue_dir>/webpush/presence.json`` (one word on file; the newe
 - ``quiet [duration]`` and ``sleep`` are the only holding words. ``quiet`` mutes for its duration (default
   :data:`DEFAULT_SECS`, at most :data:`MAX_SECS`); by default an urgent ping still pushes through it (the policy). ``sleep`` mutes until the
   operator's next input at this machine after saying it (input is read from the macOS HID idle time: he has typed since
-  when ``now - idle`` is later than the word), urgent pings included by default (the policy). With no idle reading (not macOS, or the read
+  when ``now - idle`` is later than the word); by default approvals and urgent pings still push through it, as through quiet (the policy). With no idle reading (not macOS, or the read
   failed) it cannot see his input, so it ends :data:`SLEEP_BLIND_SECS` after the word and ``levain ping status`` says the
   idle source is unavailable.
 - ``loud [duration|off]`` turns pings on for its duration, over every other parameter, a mute included; only its timer,
@@ -115,10 +115,11 @@ KIND_CLASSES = {"consent": "approval", "push": "approval", "reping": "approval",
 URGENT_KINDS = frozenset(k for k, c in KIND_CLASSES.items() if c in ("approval", "attention"))
 MUTE_WORDS = ("quiet", "sleep")
 # The shipped default policy is today's rule for every kind that existed before the policy: quiet lets approval and
-# attention through, sleep holds all. ``dated`` is the one deliberate change: a kind unknown before is now class
+# attention through, and sleep lets them through too (Phill 10-25: in sleep "you CAN ping me for approval prompt blocks
+# or anything else high priority like that"); only ``other`` is held. ``dated`` is the one deliberate change: a kind unknown before is now class
 # ``attention``, so it pushes at an active desk and through quiet, which it did not before.
 DEFAULT_CELLS = {"quiet": {"approval": "push", "attention": "push", "other": "hold"},
-                 "sleep": {"approval": "hold", "attention": "hold", "other": "hold"}}
+                 "sleep": {"approval": "push", "attention": "push", "other": "hold"}}
 POLICY_NAME = "policy.json"
 POLICY_VERSION = 1
 FILE_NAME = "presence.json"
@@ -272,7 +273,7 @@ def _decide(now: float, word: dict | None, idle: float | None, *, urgent: bool =
             return Decision(True, "pushing", f"{mute}: {_CLASS_WORDS[cls]} still reach you (your policy)" if custom else "urgent"), "word"
         if mute == "sleep":
             why = (f"sleep: {_CLASS_WORDS[cls]} are held (your policy)" if custom else
-                   "sleep: nothing is pushed until his next input here, urgent pings included")
+                   "sleep: only approvals and urgent pings are pushed until his next input here")
         else:
             why = (f"quiet: {_CLASS_WORDS[cls]} are held (your policy)" if custom else
                    "quiet: nothing but an urgent ping is pushed until it ends")

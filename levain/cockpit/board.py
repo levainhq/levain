@@ -79,8 +79,10 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
 def build(store_dir: Path | str | None, question_store: Any = None, *, generated: str | None = None,
           drop_dir: Path | str | None = None) -> dict[str, Any]:
     """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], unreadable, band_hint, note,
-    journal_as_of_read}``. KNOWN EDGE: the items and the journal are two read transactions (C13 exposes no single
-    snapshot), so a card's journal line is "as of read": it may be newer than the card's column for one poll.
+    journal_as_of_read}``. The items, the journal and the live-seat projections (``running`` cards, no journal line) come from
+    ONE read transaction (:func:`levain.coordinator.ready.snapshot`), so a card's journal line is never newer than its column;
+    ``journal_as_of_read`` stays and names that the line is the record as of this read. No CI projection: Levain keeps no CI-wait
+    source (flow's ``state/land_waiter`` is flow's).
 
     ``drop_dir`` is accepted and ignored for one more release (the value no longer carries ``tell``); it warns."""
     if drop_dir is not None:
@@ -92,7 +94,7 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
     queue = "none"
     if store_dir is not None:
         try:
-            out = ready.list(store_dir, all=True, generated=generated)
+            out = ready.snapshot(store_dir, generated=generated)
             items = list(out.get("items") or [])
             unreadable.extend(str(u) for u in out.get("unreadable") or ())
             generated = out.get("generated") or generated
@@ -102,10 +104,7 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
                 queue = "unreadable"
             else:
                 queue = "ok"
-                try:
-                    journal = _last_records(ready.journal(store_dir))
-                except Exception:  # noqa: BLE001 - cards stay, their journal lines are reported missing
-                    unreadable.append("journal")
+                journal = _last_records(out.get("journal"))
         except Exception:  # noqa: BLE001 - never a 500: the store is named unreadable
             unreadable.append("coordinator")
             queue = "unreadable"
