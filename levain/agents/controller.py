@@ -20,18 +20,21 @@ import json
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from levain.agents import schedule
 from levain.agents.spec import _check_row
 from levain.agents.store import AgentStore, open_agent_store
 
-__all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "TickResult", "occurrence_id", "run_id", "claim", "tick"]
+__all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurrence_id", "run_id", "claim", "tick",
+           "heartbeat", "takeover"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
 OVERLAP = "skipped-overlap"
+
+LEASE_S = 900  # A0 r7 section 2.3 [judged]: the coordinator slot's lease
 
 CURSOR_PREFIX = "tick_cursor:"
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
@@ -205,3 +208,41 @@ def _walk(store: AgentStore, agent_id: str, snap: tuple, trigger: dict, binding:
                     (agent_id, key))
             _set_cursor(conn, agent_id, upto)
         cursor = upto
+
+
+def heartbeat(conn: sqlite3.Connection, occurrence_id: str, epoch: int, now: datetime, lease_s: int = LEASE_S) -> bool:
+    """The supervisor's heartbeat: push a ``launched`` row's lease to ``now + lease_s``. It is a compare-and-set on
+    the epoch the holder launched or last renewed under, so a holder that a takeover fenced (the epoch moved, the
+    row left ``launched``) writes nothing and is told ``False``. Runs inside the caller's write transaction."""
+    if not conn.in_transaction:
+        raise RuntimeError("a heartbeat runs inside the caller's write transaction")
+    until = _stamp(schedule._utc(now) + timedelta(seconds=lease_s))
+    cur = conn.execute("UPDATE agent_occurrences SET lease_until = ? WHERE occurrence_id = ? AND state = 'launched'"
+                       " AND epoch = ?", (until, occurrence_id, epoch))
+    return cur.rowcount == 1
+
+
+def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime) -> bool:
+    """Fenced takeover (A0 r7 section 2.3, lapse recovery): end a ``launched`` row whose lease has lapsed, writing
+    ``epoch + 1`` and ``crash_recovered`` in one statement. The lease is read here, inside the write transaction, and
+    the ``UPDATE`` is guarded by the exact value read, so a heartbeat that landed first or a takeover that already
+    ran leaves it with nothing to change (``False``). A live lease is never taken over; a lease that is absent or
+    unreadable is not evidence of a lapse, so it is refused too. Slot and reservation release belong to the
+    terminal transaction P6-5 wires around this."""
+    if not conn.in_transaction:
+        raise RuntimeError("a takeover runs inside the caller's write transaction")
+    at = schedule._utc(now)
+    row = conn.execute("SELECT lease_until FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'",
+                       (occurrence_id,)).fetchone()
+    if row is None or row[0] is None:
+        return False
+    try:
+        lease = datetime.strptime(row[0], _STAMP).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    if at <= lease:
+        return False
+    cur = conn.execute("UPDATE agent_occurrences SET state = 'stopped', reason = 'crash_recovered', epoch = epoch + 1,"
+                       " ended_at = ? WHERE occurrence_id = ? AND state = 'launched' AND lease_until = ?",
+                       (_stamp(at), occurrence_id, row[0]))
+    return cur.rowcount == 1
