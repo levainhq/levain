@@ -1062,8 +1062,26 @@ def parse_driver_input(raw: bytes) -> object:
     return obj
 
 
+def front_limit_fields(tunnel_bytes_cap: object = None, deadline: object = None) -> dict:
+    """The optional passthrough limits of the front's session file (``R/gw/slot<n>/session.json``, P7-A §3.2), as
+    the top-level keys to merge into it: ``tunnel_bytes_cap`` (positive int) and ``deadline`` (absolute epoch seconds,
+    a positive int). ``None`` omits a key. A value of any other shape is refused ``front-limit-invalid:<key>`` here,
+    before the front's own parser would refuse the file. Pure: where the values come from and the write of the file
+    are the verb's."""
+    out: dict = {}
+    if tunnel_bytes_cap is not None:
+        if type(tunnel_bytes_cap) is not int or tunnel_bytes_cap <= 0:
+            raise Refused("front-limit-invalid:tunnel-bytes-cap", repr(tunnel_bytes_cap)[:40])
+        out["tunnel_bytes_cap"] = tunnel_bytes_cap
+    if deadline is not None:
+        if type(deadline) is not int or deadline <= 0:   # an int: the canonical encoding the file is written in has no floats
+            raise Refused("front-limit-invalid:deadline", repr(deadline)[:40])
+        out["deadline"] = deadline
+    return out
+
+
 __all__ = [
-    "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
+    "front_limit_fields", "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
     "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
     "TOKEN_ENV", "ABSENT_ENV", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",

@@ -15,6 +15,7 @@ STATUS = {
     "token-invalid": 401, "token-revoked": 401, "front-mismatch": 401,
     "route-not-allowed": 403, "model-not-allowed": 403, "host-not-allowed": 403, "address-refused": 403,
     "policy-header": 403, "passthrough-for-dispatch": 403, "credential-host-mismatch": 403,
+    "passthrough-bytes-exhausted": 403, "passthrough-deadline": 403,
     "template-miss": 404,
     "body-cap": 413,
     "malformed": 400,
