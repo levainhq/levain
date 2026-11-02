@@ -5734,11 +5734,11 @@
       const far = d.dy > Math.max(SHEET_FAR, d.panel.getBoundingClientRect().height * SHEET_FRAC);
       if (!cancel && (far || (d.v > SHEET_SPEED && d.dy > 24))) {
         sheetDismiss(d.dlg);
-        if (d.dlg.hidden) { d.panel.style.transition = ""; d.panel.style.transform = ""; return; }   // closed by hiding: it reopens in place
+        if (d.dlg.hidden) { d.panel.style.transition = ""; d.panel.style.transform = ""; d.panel.style.animation = ""; return; }   // closed by hiding: it reopens in place, with its entrance animation back (a spring-back keeps animation:none: clearing it on an open sheet would replay the rise)
         // a sheet that is still up (its guard kept it) is given back where it was
         setTimeout(() => {
           if (!d.panel.isConnected) return;
-          if (d.dlg.hidden) { d.panel.style.transition = ""; d.panel.style.transform = ""; } else settle(d.panel);   // a hidden sheet reopens in place
+          if (d.dlg.hidden) { d.panel.style.transition = ""; d.panel.style.transform = ""; d.panel.style.animation = ""; } else settle(d.panel);   // a hidden sheet reopens in place
         }, 250);
       } else settle(d.panel);
     };
