@@ -45,13 +45,14 @@ def register(subparsers) -> None:
     rc.set_defaults(func=_receipts)
     from levain.webpush import presence
 
-    for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), except urgent ones; one summary and the held "
-                                 "pings follow when it ends."),
-                       ("sleep", "Hold phone pushes until your next keyboard or mouse input at this Mac (read from the Mac's "
-                                 "input idle time), except approvals and urgent ones; one summary and the held pings follow."),
+    for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), except what needs you (approvals and "
+                                 "attention items); one summary and the held pings follow when it ends."),
+                       ("sleep", "Hold phone pushes until your next keyboard or mouse input at this Mac, except approvals and "
+                                 "high-priority items (read from the Mac's input idle time); one summary and the held pings follow."),
                        ("loud", "Push every ping for a while (default 60 min), over everything else; `loud off` ends it."),
-                       ("away", "Push at once until you next type here (optional override)."),
-                       ("back", "Clear away, quiet or sleep; a standing loud is left (`loud off`).")):
+                       ("away", "Push to your devices at once until you next type here."),
+                       ("back", "Clear away, quiet or sleep and return to your standing default; a standing loud is left "
+                                "(`loud off`).")):
         w = common(sub.add_parser(word, help=text))
         if word in presence.TIMED:
             w.add_argument("duration", nargs="?", default=None,
@@ -64,24 +65,66 @@ def register(subparsers) -> None:
                        help="The coordinator only: the drop that holds the words quoted by --said (a drop reaches the "
                             "coordinator in its brief file, not as a prompt, so it is the evidence for the quote).")
         w.set_defaults(func=_word, word=word)
-    common(sub.add_parser("status", help="Whether a ping is pushed now, and why.")).set_defaults(func=_status)
+
+    def ending(sp: argparse.ArgumentParser) -> None:
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("--for", dest="for_", default=None, metavar="DUR",
+                       help="Only for this long (30, 30m or 2h; 1 minute to 24 h), then your standing default again.")
+        g.add_argument("--until-input", dest="until_input", action="store_true",
+                       help="Only until your next keyboard or mouse input at this Mac, then your standing default again.")
+
+    dv = common(sub.add_parser(
+        "devices", help="Whether pings reach your devices: on, off, or follow where you are (operator only).",
+        description="Devices on: pings reach your phone and cockpit. Off: they wait for the desk. Follow (the standing default): "
+                    "they reach your devices once you have had no input at this Mac for `--after` (default 10 min), or when "
+                    "you are on a remote terminal. With neither --for nor --until-input the setting becomes your standing "
+                    "default; with one of them it holds only that long and your standing default returns."))
+    dv.add_argument("mode", choices=("on", "off", "follow"))
+    dv.add_argument("--after", default=None, metavar="DUR", help="With follow: how long without input counts as away (30m, 15, 1h; 1 minute to 24 h).")
+    ending(dv)
+    dv.set_defaults(func=_devices)
+    lt = common(sub.add_parser(
+        "lets", help="What reaches your devices: everything, needs, approvals or nothing (operator only).",
+        description="Everything; needs (approvals and attention items); approvals (approvals alone); nothing. Held pings wait for "
+                    "your devices (or the setting to widen) and are pushed then. With neither --for nor --until-input the "
+                    "setting becomes your standing default."))
+    lt.add_argument("level", choices=_intent_lets())
+    ending(lt)
+    lt.set_defaults(func=_lets)
+    st = common(sub.add_parser("status", help="Whether a ping is pushed now, and why: the one line the cockpit shows too."))
+    st.add_argument("--json", action="store_true", help="The full view the cockpit paints from.")
+    st.set_defaults(func=_status)
     lg = common(sub.add_parser("log", help="Every presence word set or refused: who, which role, the quote, the outcome."))
     lg.add_argument("--limit", type=int, default=50, help="The newest N rows (default 50).")
     lg.add_argument("--json", action="store_true")
     lg.set_defaults(func=_log)
-    pol = sub.add_parser("policy", help="Which kinds of ping break through quiet and sleep (the operator's own setting).",
-                         description="The notification policy: for quiet and sleep, whether approvals, attention items "
-                                     "and other pings are pushed or held. Reading is open; setting is the operator's alone.")
+    mg = common(sub.add_parser(
+        "migrate", help="One-time fold of presence.json, route.json and policy.json into the one intent record.",
+        description="Idempotent: a second run changes nothing. The old files move to webpush/pre-intent/<stamp>/ with a receipt; "
+                    "`--undo` puts them back byte for byte. `--dry-run` shows the record and the line it would give."))
+    mg.add_argument("--dry-run", dest="dry_run", action="store_true")
+    mg.add_argument("--undo", action="store_true", help="Restore the files the last migration moved, and remove the record.")
+    mg.add_argument("--force", action="store_true", help="With --undo: even though the record changed since the migration.")
+    mg.set_defaults(func=_migrate)
+    pol = sub.add_parser("policy", help="RETIRED: what each preset lets through (`policy show`); change it with `levain ping lets`.",
+                         description="The notification policy is retired: each preset says what it lets through, and `levain ping "
+                                     "lets` changes it for a stretch. `show` prints the presets; `set` and `reset` refuse.")
     psub = pol.add_subparsers(dest="policy_cmd", required=True)
-    ps = common(psub.add_parser("show", help="The six cells, the kind classes and what each mute word does."))
+    ps = common(psub.add_parser("show", help="What each preset lets through."))
     ps.add_argument("--json", action="store_true")
     ps.set_defaults(func=_policy_show)
-    pset = common(psub.add_parser("set", help="Set one cell (operator only)."))
-    pset.add_argument("mute", choices=presence.MUTE_WORDS)
-    pset.add_argument("kind_class", choices=presence.CLASSES)
-    pset.add_argument("value", choices=("push", "hold"))
-    pset.set_defaults(func=_policy_set)
-    common(psub.add_parser("reset", help="Back to the shipped default (operator only).")).set_defaults(func=_policy_reset)
+    pset = common(psub.add_parser("set", help="Refused: the policy is retired (exit 2)."))
+    pset.add_argument("mute", nargs="?")
+    pset.add_argument("kind_class", nargs="?")
+    pset.add_argument("value", nargs="?")
+    pset.set_defaults(func=_policy_retired, what="set")
+    common(psub.add_parser("reset", help="Refused: the policy is retired (exit 2).")).set_defaults(func=_policy_retired, what="reset")
+
+
+def _intent_lets() -> tuple[str, ...]:
+    from levain.webpush import intent
+
+    return intent.LETS
 
 
 def _qdir(args: argparse.Namespace) -> Path:
@@ -137,8 +180,19 @@ def _evidence(by: dict, said: str | None, qdir: Path, drop: str | None):
         return quote.Match(False, None, f"transcript check failed ({type(e).__name__})")
 
 
+def _flush(qdir: Path) -> None:
+    """A write can make held pings due (loud, away, back, a widened setting, a mute ended): start their push now, outside
+    the lock. The library does not (a write that spawns a process under the lock is a hazard); callers do."""
+    try:
+        from levain.webpush import held
+
+        held.flush_if_due(qdir, throttle=False)
+    except Exception:  # noqa: BLE001 - the record is written; the next gate call flushes
+        pass
+
+
 def _word(args: argparse.Namespace) -> int:
-    from levain.webpush import presence
+    from levain.webpush import intent, presence
 
     qdir = _qdir(args)
     drop = getattr(args, "drop", None)
@@ -147,80 +201,113 @@ def _word(args: argparse.Namespace) -> int:
         if drop and (by is None or by["role"] != "coordinator"):
             raise presence.PresenceError("--drop is the coordinator's evidence for its quote; "
                                          "the operator's own word and a seat's need none")
-        presence.set_word(qdir, args.word, duration=getattr(args, "duration", None), by=by,
-                          said=getattr(args, "said", None),
-                          match=None if by is None else _evidence(by, getattr(args, "said", None), qdir, drop))
+        intent.apply_preset(qdir, args.word, duration=getattr(args, "duration", None), by=by,
+                            said=getattr(args, "said", None),
+                            match=None if by is None else _evidence(by, getattr(args, "said", None), qdir, drop))
     except presence.PresenceError as e:
         print(f"levain ping {args.word}: {e}")
         return 2
-    try:   # a word can make held pings due (loud, away, back, a quiet ended): start their push now
-        from levain.webpush import held
-
-        held.flush_if_due(qdir, throttle=False)
-    except Exception:  # noqa: BLE001 - the word is written; the next gate call flushes
-        pass
-    print(presence.describe(qdir))
+    _flush(qdir)
+    print(intent.describe_line(qdir))
     return 0
 
 
-def _status(args: argparse.Namespace) -> int:
-    from levain.webpush import presence
+def _until(args: argparse.Namespace):
+    """``--for DUR`` -> the duration, ``--until-input`` -> ``input``, neither -> ``switch`` (the standing default)."""
+    if args.for_ is not None:
+        return args.for_
+    return "input" if args.until_input else "switch"
 
-    print(presence.describe(_qdir(args)))
+
+def _settings(args: argparse.Namespace, what: str, **fields) -> int:
+    from levain.webpush import intent, presence
+
+    qdir = _qdir(args)
+    try:
+        intent.apply_settings(qdir, until=_until(args), by=_setter(qdir), **fields)
+    except presence.PresenceError as e:
+        print(f"levain ping {what}: {e}")
+        return 2
+    _flush(qdir)
+    print(intent.describe_line(qdir))
+    return 0
+
+
+def _devices(args: argparse.Namespace) -> int:
+    if args.after is not None and args.mode != "follow":
+        print("levain ping devices: --after is how long without input counts as away; it goes with `follow`")
+        return 2
+    return _settings(args, "devices", devices=args.mode, follow_after=args.after)
+
+
+def _lets(args: argparse.Namespace) -> int:
+    return _settings(args, "lets", lets_through=args.level)
+
+
+def _status(args: argparse.Namespace) -> int:
+    from levain.webpush import intent
+
+    qdir = _qdir(args)
+    if getattr(args, "json", False):
+        print(json.dumps(intent.view(qdir), indent=2, default=str))
+    else:
+        print(intent.describe_line(qdir))
+    return 0
+
+
+def _migrate(args: argparse.Namespace) -> int:
+    from levain.webpush import intent, presence
+
+    qdir = _qdir(args)
+    if args.undo and args.dry_run:
+        print("levain ping migrate: --undo and --dry-run do not go together")
+        return 2
+    try:
+        if args.undo:
+            got = intent.unmigrate(qdir, force=args.force)
+            print(got["status"] + (f" (from {got['backup']})" if got.get("backup") else ""))
+            for name in got.get("restored") or []:
+                print(f"- restored {name}")
+            print(intent.describe_line(qdir))
+            return 0
+        got = intent.migrate(qdir, dry_run=args.dry_run)
+    except presence.PresenceError as e:
+        print(f"levain ping migrate: {e}")
+        return 2
+    print(got["status"])
+    for line in got.get("lines") or []:
+        print(f"- {line}")
+    if got.get("backup"):
+        print(f"old files kept in {got['backup']} (levain ping migrate --undo puts them back)")
+    if got["status"] == "dry run":
+        print("record: " + json.dumps(got.get("record"), sort_keys=True, default=str))
+        print("the line it would give: " + str(got.get("line")))
+    else:
+        print(intent.describe_line(qdir))
     return 0
 
 
 def _policy_show(args: argparse.Namespace) -> int:
-    from levain.webpush import presence
+    from levain.webpush import intent, presence
 
     view = presence.policy_view(_qdir(args))
     if args.json:
         print(json.dumps(view, indent=2))
         return 0
-    print(f"policy: {view['status']}")
-    print(f"{'':7}" + "".join(f"{c:<11}" for c in presence.CLASSES))
-    for m in presence.MUTE_WORDS:
-        print(f"{m:<7}" + "".join(f"{view['cells'][m][c]:<11}" for c in presence.CLASSES))
-    print("classes: " + "; ".join(f"{c}: " + ", ".join(k for k, v in view["classes"].items() if v == c)
-                                  for c in presence.CLASSES if c != view["default_class"]) +
-          f"; any other kind -> {view['default_class']}")
-    for r in view["reasons"]:
-        print(f"malformed: {r}")
-    for m in presence.MUTE_WORDS:
-        print(view["sentences"][m])
+    print("what each preset lets through (the notification policy is retired):")
+    for name, r in intent.PRESET_TABLE.items():
+        end = "your next input at this Mac" if r["until"] == "input" else "a timer (default 60 min)"
+        print(f"  {name:<6} devices {r['devices']:<3}  lets through {intent._LETS_WORDS[r['lets_through']]:<14}  until {end}")
+    print("  back   clears the preset and returns to your standing default (a standing loud is left)")
+    print("retired: change it with `levain ping lets everything|needs|approvals|nothing [--for 1h | --until-input]`")
     return 0
 
 
-def _policy_write(args: argparse.Namespace, what: str, fn) -> int:
+def _policy_retired(args: argparse.Namespace) -> int:
     from levain.webpush import presence
 
-    qdir = _qdir(args)
-    try:
-        cells = fn(qdir, _setter(qdir))
-    except presence.PresenceError as e:
-        print(f"levain ping policy {what}: {e}")
-        return 2
-    try:   # a looser policy can make held pings due: start their push now
-        from levain.webpush import held
-
-        held.flush_if_due(qdir, throttle=False)
-    except Exception:  # noqa: BLE001 - the policy is written; the next gate call flushes
-        pass
-    for line in presence.policy_sentences(cells).values():
-        print(line)
-    return 0
-
-
-def _policy_set(args: argparse.Namespace) -> int:
-    from levain.webpush import presence
-
-    return _policy_write(args, "set", lambda q, by: presence.set_policy(q, args.mute, args.kind_class, args.value, by=by))
-
-
-def _policy_reset(args: argparse.Namespace) -> int:
-    from levain.webpush import presence
-
-    return _policy_write(args, "reset", lambda q, by: presence.reset_policy(q, by=by))
+    print(f"levain ping policy {args.what}: {presence.POLICY_RETIRED}")
+    return 2
 
 
 def _log(args: argparse.Namespace) -> int:

@@ -2397,74 +2397,42 @@ class _Handler(GuardedHandler):
         return got[1], got[0]
 
     def _policy_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":
-        """``POST /webpush/policy/set {mute, class, value}`` / ``/webpush/policy/reset {}``: the operator's own write
-        (``by=None``), reached only past the push family's gate (same-origin, a surface token on every bind, a JSON
-        body): the authority the Devices panel's own writes use. A refusal (a bad cell, a lock or file that cannot be
-        written) is a 422 with its words; the reply is the policy view after. The log row names the credential used
-        (``via``: the surface token's or the paired device's name, never the secret); the write itself stays ``by=None``."""
+        """``POST /webpush/policy/set`` / ``/webpush/policy/reset``: RETIRED (presence 1b). What each preset lets through is part
+        of the preset, and the operator changes it for a stretch with the Lets-through row (``POST /webpush/presence/set``
+        ``{lets_through, until}``). Both routes answer a 422 with the pointer and write nothing, so an older page that still
+        posts here is told, not silently ignored."""
         from levain.webpush import presence
 
-        try:
-            req = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return {"error": "bad_json", "message": "body is not valid JSON"}, 400
-        want = {"mute", "class", "value"} if route == _POLICY_SET else set()
-        if not isinstance(req, dict) or set(req) != want or not all(isinstance(v, str) for v in req.values()):
-            return {"error": "bad_request",
-                    "message": ("send exactly mute, class and value as text" if want else "send an empty object")}, 400
-        queue = self.server.signer.queue_dir
-        via = str(self._credential()["name"])
-        try:
-            # A bounded lock wait: a stalled holder of the presence lock must not park handler threads on request_gate slots.
-            if route == _POLICY_SET:
-                presence.set_policy(queue, req["mute"], req["class"], req["value"], by=None, via=via, wait=_POLICY_LOCK_WAIT_SECS)
-            else:
-                presence.reset_policy(queue, by=None, via=via, wait=_POLICY_LOCK_WAIT_SECS)
-        except presence.PresenceBusy:
-            return {"error": "policy_busy", "message": "the notification policy is busy right now; nothing was changed, try again"}, 503
-        except presence.PresenceError as exc:
-            return {"error": "policy_refused", "message": str(exc)}, 422
-        return presence.policy_view(queue), 200
+        return {"error": "policy_refused", "message": presence.POLICY_RETIRED}, 422
 
     def _presence_view(self, queue: Path) -> "dict[str, Any]":
-        """The presence word as the cockpit and a tap shortcut read it: the standing word's name and end (None for
-        each when no word stands, or it has ended), and the words of ``presence.describe``."""
-        from levain.webpush import presence
+        """What the cockpit paints and a tap shortcut reads: :func:`levain.webpush.intent.view` (the line, the chip, the record's
+        two layers, the settings in force, the sensing), from ONE idle sample, plus ``tokens`` for a full credential and the
+        legacy ``word`` (the deciding preset), ``until`` (epoch, a timed overlay's end) and ``text`` (= ``line``) for one release.
+        The cockpit never composes its own words: ``line`` is what ``levain ping status`` prints at the same instant."""
+        from levain.webpush import desk as desk_mod, intent
 
-        rec = presence.read_word(queue)   # ONE read of the word and ONE idle sample feed every field below
         now = time.time()
         try:
             from levain.consent.auto_away import input_idle_seconds
 
-            reading = input_idle_seconds()
+            raw = input_idle_seconds()
         except Exception:  # noqa: BLE001 - no reading: the rule reads the desk as inactive
-            reading = None
-        if rec is not None and presence.is_expired(rec, now):
-            rec = None
-        try:   # the chip's own read notices a change between Here and Away, so the log row exists without a ping
-            from levain.webpush import desk as desk_mod
-
-            desk_mod.observe(queue, now, desk_mod.adjust_reading(queue, reading, now))
+            raw = None
+        view = dict(intent.view(queue, now=now, reading=raw))
+        try:   # the chip's own read notices a change between Here and Away, so the event row exists without a ping
+            eff = view.get("effective") or view.get("base") or {}
+            window = eff.get("follow_after")
+            msg = desk_mod.read_desk_message(queue, now)
+            desk_mod.observe(queue, now, desk_mod.adjust_reading(queue, raw, now, window=window),
+                             msg_at=msg["at"] if msg else None)
         except Exception:  # noqa: BLE001 - an event row never blocks the view
             pass
-        from levain.webpush import route as route_mod
-
-        route, route_source, route_until = route_mod.read_route(queue, now)
-        try:   # the projected route (and so any `who` run) is computed ONCE for the whole view
-            projected = route_mod.projected_route(queue, idle=reading, now=now)
-        except Exception:  # noqa: BLE001 - a fault reads as the standing route
-            projected = route
-        try:   # ONE read of the remote-activity record too: describe and effective get the same one
-            remote = presence.read_remote_activity(queue, now)
-        except Exception:  # noqa: BLE001 - a faulted read is a fault, not "no remote activity": both calls fail open from it
-            remote = presence.REMOTE_FAULT
-        view = {"word": rec["word"] if rec else None, "until": rec.get("until") if rec else None,
-                "route": route, "route_source": route_source, "route_until": route_until,
-                "text": presence.describe(queue, now=now, word=rec, reading=reading, route=projected, remote=remote),
-                # what the push rule does right now (the same call a delivery makes); a status read never drives the route suggestion
-                "effective": presence.effective(queue, now, suggest=False, word=rec, reading=reading, route=projected,
-                                                 remote=remote)}
-        if self._credential_is_full():     # a tap token's holder is told the word, never the list of other taps
+        ov = view.get("overlay")
+        end = ov.get("until") if isinstance(ov, dict) else None
+        view["until"] = end.get("at") if isinstance(end, dict) and end.get("kind") == "timer" else None
+        view["text"] = view["line"]
+        if self._credential_is_full():     # a tap token's holder is told the state, never the list of other taps
             from levain.webpush import presence_tokens
 
             view["tokens"] = presence_tokens.list_public(queue)
@@ -2474,23 +2442,44 @@ class _Handler(GuardedHandler):
         return self._credential(required=True)["class"] == "token"
 
     def _presence_post(self, raw: bytes) -> "tuple[dict[str, Any], int]":
-        """``POST /webpush/presence/set {word, for?}``: the operator's own word (``by=None``), reached only past the push
-        family's gate. ``for`` is the duration text of a timed word (``loud`` takes ``off``). A refusal is a 422 with its
-        words, a lock held past the bounded wait a 503; the reply is the view after. The row names the credential
-        (``via``), never the secret."""
-        from levain.webpush import presence, route as route_mod
+        """``POST /webpush/presence/set``: the operator's own write (``by=None``), reached only past the push family's gate. One of
+        ``{preset, for?}`` (away, back, quiet, sleep, loud; ``for`` is a timed preset's duration, ``off`` for ``loud``),
+        ``{word, for?}`` (the same, plus the tap aliases ``desk`` and ``devices``) or ``{devices?, follow_after?, lets_through?,
+        until?}`` (``until`` is ``switch``, ``input`` or a duration; ``switch`` writes the standing default). The direct
+        settings are the full credential's alone: a tap token sends presets only. A refusal is a 422 with its words, a lock held
+        past the bounded wait a 503; every write is followed by the held-ping flush, and the reply is the view after (the one
+        the cockpit repaints from), so what it shows is what ``levain ping status`` prints at that instant."""
+        from levain.webpush import intent, presence, route as route_mod
 
         try:
             req = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return {"error": "bad_json", "message": "body is not valid JSON"}, 400
-        if (not isinstance(req, dict) or not set(req) <= {"word", "for"} or not isinstance(req.get("word"), str)
-                or not isinstance(req.get("for", ""), str)):
-            return {"error": "bad_request", "message": "send word as text, and for (a duration) as text if the word is timed"}, 400
+        setting_keys = {"devices", "follow_after", "lets_through", "until"}
+        num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)   # noqa: E731
+        shape = ""
+        if not isinstance(req, dict):
+            shape = "send an object"
+        elif "preset" in req or "word" in req:
+            key = "preset" if "preset" in req else "word"
+            if set(req) - {key, "for"} or not isinstance(req.get(key), str) or not isinstance(req.get("for", ""), str):
+                shape = "send preset (or word) as text, and for (a duration) as text if the preset is timed"
+        elif not req or set(req) - setting_keys:
+            shape = "send a preset, or devices, follow_after, lets_through and until"
+        elif (any(k in req and not isinstance(req[k], str) for k in ("devices", "lets_through"))
+              or ("follow_after" in req and not (num(req["follow_after"]) or isinstance(req["follow_after"], str)))
+              or ("until" in req and not (num(req["until"]) or isinstance(req["until"], str)))):
+            shape = "devices and lets_through are text, follow_after a number of seconds or text like 15m, until switch, input or a duration"
+        if shape:
+            return {"error": "bad_request", "message": shape}, 400
+        direct = "preset" not in req and "word" not in req
+        word = req.get("preset") if "preset" in req else req.get("word")
         queue = self.server.signer.queue_dir
         tap = None if self._credential_is_full() else self._presence_credential()
         if tap is not None:        # a tap token: only its own words, and only so fast (the counter is this server's)
-            if req["word"] in presence.WORDS + route_mod.ROUTE_WORDS and req["word"] not in tap["words"]:
+            if direct:
+                return {"error": "word_not_allowed", "message": "a tap token sets a preset only, never the settings"}, 403
+            if word in presence.WORDS + route_mod.ROUTE_WORDS and word not in tap["words"]:
                 allowed = ", ".join(tap["words"])
                 return {"error": "word_not_allowed",
                         "message": f"this tap token may set only: {allowed}"}, 403
@@ -2506,7 +2495,7 @@ class _Handler(GuardedHandler):
             from levain.webpush import presence_tokens
 
             supplied = self.headers.get(_PRESENCE_TOKEN_HEADER, "")
-            name, word = tap["token_name"], req["word"]
+            name = tap["token_name"]
 
             def precheck() -> None:
                 rec = presence_tokens.verify(queue, supplied)
@@ -2519,25 +2508,25 @@ class _Handler(GuardedHandler):
             def after() -> None:
                 presence_tokens.stamp(queue, name)
         try:
-            if req["word"] in route_mod.ROUTE_WORDS:      # the route alone: the presence word is left as it is
-                route_mod.set_route(queue, req["word"], req.get("for") or None, via=via,
-                                    wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
-            else:
-                presence.set_word(queue, req["word"], duration=req.get("for") or None, by=None, via=via,
+            if direct:
+                intent.apply_settings(queue, devices=req.get("devices"), follow_after=req.get("follow_after"),
+                                      lets_through=req.get("lets_through"), until=req.get("until", "switch"), by=None,
+                                      via=via, wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
+            else:       # set_word takes the presets and the two tap aliases (desk, devices) and calls apply_preset / apply_settings
+                presence.set_word(queue, word, duration=req.get("for") or None, by=None, via=via,
                                   wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
         except presence.PresenceBusy:
-            return {"error": "presence_busy", "message": "the presence word is busy right now; nothing was changed, try again"}, 503
+            return {"error": "presence_busy", "message": "the presence record is busy right now; nothing was changed, try again"}, 503
         except presence.PresenceError as exc:
             if tap is not None and isinstance(exc, presence_tokens.TokenRefused):
                 return {"error": exc.error, "message": str(exc)}, 403
             return {"error": "presence_refused", "message": str(exc)}, 422
-        if req["word"] == "back":   # a route-alone set flushes inside set_route
-            try:     # outside the presence lock: pings held as "active" are due now the route may read devices
-                from levain.webpush import held
+        try:     # a write can make held pings due (a widened mute, devices on, back): start their push now, outside the lock
+            from levain.webpush import held
 
-                held.flush_if_due(queue, throttle=False)
-            except Exception:  # noqa: BLE001 - a failed flush never fails the set
-                pass
+            held.flush_if_due(queue, throttle=False)
+        except Exception:  # noqa: BLE001 - a failed flush never fails the set; the next gate call flushes
+            pass
         return self._presence_view(queue), 200
 
     def _presence_token_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":
