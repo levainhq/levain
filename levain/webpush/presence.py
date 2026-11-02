@@ -474,16 +474,17 @@ REMOTE_FAULT = object()   # a caller's "the remote read itself faulted": the rul
 
 def should_push(queue_dir: Path | str | None, kind: str, *, now: float | None = None,
                 idle: Callable[[], float | None] | None = None, suggest: bool = True,
-                word: object = _UNSET, route: object = _UNSET, remote: object = _UNSET) -> Decision:
+                word: object = _UNSET, route: object = _UNSET, remote: object = _UNSET, filed: bool = False) -> Decision:
     """Whether a ``kind`` of ping is pushed to his devices now: THE decider (:func:`levain.webpush.intent._core`), against the
     one record and the sensors (``idle`` defaults to :func:`levain.consent.auto_away.input_idle_seconds`). ``suggest`` marks a
     delivery (it keeps the decision and writes the event rows sensing saw); a status read leaves it off. ``word`` and ``route``
-    are accepted and ignored (the record replaced both); ``remote`` keeps its meaning. Any fault reads as push: a missed ping
-    is the worse error."""
+    are accepted and ignored (the record replaced both); ``remote`` keeps its meaning. ``filed`` (the ping is about a request
+    filed and held for a signed answer, :func:`levain.webpush.intent.decide`) is for that ping's push only: the hold's own
+    question never passes it. Any fault reads as push: a missed ping is the worse error."""
     try:
         from levain.webpush import intent
 
-        return intent._core(queue_dir, kind, now, idle, suggest, remote)[0]
+        return intent._core(queue_dir, kind, now, idle, suggest, remote, filed=filed)[0]
     except Exception:  # noqa: BLE001 - the rule failing must not silence the phone
         return Decision(True, "pushing", _FAULT)
 
