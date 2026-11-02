@@ -789,33 +789,64 @@ HANDED_APPENDERS = {
 }
 
 
+def _rebinds(fn: ast.AST, param: str) -> list[int]:
+    """Every way ``fn`` (nested scopes included) can bind or unbind ``param`` after its parameter list."""
+    hits = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == param
+            and isinstance(n.ctx, (ast.Store, ast.Del))]
+    hits += [n.lineno for n in ast.walk(fn) if isinstance(n, ast.ExceptHandler) and n.name == param]
+    hits += [n.lineno for n in ast.walk(fn) if isinstance(n, ast.alias) and (n.asname or n.name) == param]
+    hits += [n.lineno for n in ast.walk(fn) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+             and n is not fn and n.name == param]
+    hits += [n.lineno for n in ast.walk(fn) if isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name == param]
+    hits += [n.lineno for n in ast.walk(fn) if isinstance(n, ast.MatchMapping) and n.rest == param]
+    hits += [n.lineno for n in ast.walk(fn) if isinstance(n, (ast.Global, ast.Nonlocal)) and param in n.names]
+    return hits
+
+
 def _check_handed_append(tree: ast.Module, name: str, param: str) -> None:
     """``name`` appends through ``param`` alone: every append call passes that bare parameter as its first
     argument, ``name`` neither rebinds it nor declares global state, the module builds no journal of its own at
-    any depth (so it cannot hold one), and ``name`` is called only from ``recover``, passing ``recover``'s own
-    ``cockpit`` parameter, so the connection is the caller's per-act one and not the module's."""
+    any depth (so it cannot hold one), and ``name`` is referenced only by one direct call inside ``recover``, which
+    passes ``recover``'s own, never rebound ``cockpit`` in exactly the slot ``name`` binds ``param`` to, so the
+    connection is the caller's per-act one and not the module's."""
     fn = _function(tree, name)
     assert not [n for n in ast.walk(fn) if isinstance(n, (ast.Global, ast.Nonlocal))], f"{name}: global state"
-    assert param in {a.arg for a in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)}, f"{name}: no {param}"
-    rebound = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == param and isinstance(n.ctx, ast.Store)]
-    assert rebound == [], f"{name}: {param} is rebound"
+    positional = [a.arg for a in (*fn.args.posonlyargs, *fn.args.args)]
+    assert param in {*positional, *(a.arg for a in fn.args.kwonlyargs)}, f"{name}: no {param}"
+    assert _rebinds(fn, param) == [], f"{name}: {param} is rebound"
     calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
              and n.func.attr == "append" and _dotted(n.func) == "_auth.append"]
     assert calls, f"{name}: no _auth.append call"
     for call in calls:
         first = call.args[0] if call.args else None
         assert isinstance(first, ast.Name) and first.id == param, f"{name}:{call.lineno} append off the handed {param}"
+    builders = ("_journal", "CockpitDB", "autocommit", "connect", "Connection")
     built = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call) and _dotted(n.func) is not None
-             and _dotted(n.func).split(".")[-1] in ("_journal", "CockpitDB", "autocommit", "connect")]
-    assert built == [], f"{name}: the module builds a connection itself at {built}"
-    callers = [(c, f.name) for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
-               for c in ast.walk(f) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == name]
-    assert [f for _c, f in callers] == ["recover"], f"{name}: called from {[f for _c, f in callers]}"
+             and _dotted(n.func).split(".")[-1] in builders]
+    built += [n.lineno for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+              for a in n.names if a.name in builders]
+    built += [n.lineno for n in ast.walk(tree) if isinstance(n, (ast.Name, ast.Attribute)) and isinstance(n.ctx, ast.Load)
+              and (n.id if isinstance(n, ast.Name) else n.attr) in builders[:-1]]   # a Connection annotation is no opener
+    assert built == [], f"{name}: the module builds a connection itself at {sorted(set(built))}"
     recover = _function(tree, "recover")
-    assert "cockpit" in {a.arg for a in (*recover.args.args, *recover.args.kwonlyargs)}
-    for c, _f in callers:
-        args = [*c.args, *(k.value for k in c.keywords)]
-        assert any(isinstance(a, ast.Name) and a.id == "cockpit" for a in args), f"{name}: not recover's cockpit"
+    assert param in {a.arg for a in (*recover.args.args, *recover.args.kwonlyargs)}, f"{name}: recover has no {param}"
+    assert _rebinds(recover, param) == [], f"{name}: recover rebinds its {param}"
+    # every mention of the appender, in any context, is the func of one direct call inside recover
+    direct = [c for c in ast.walk(recover) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+              and c.func.id == name]
+    mentions = [n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == name
+                or isinstance(n, ast.Attribute) and n.attr == name
+                or isinstance(n, ast.alias) and name in (n.name, n.asname)]
+    assert len(direct) == 1 and len(mentions) == 1 and mentions[0] is direct[0].func, \
+        f"{name}: not called exactly once, directly, from recover ({len(direct)} direct, {len(mentions)} mentions)"
+    call = direct[0]
+    assert not any(isinstance(a, ast.Starred) for a in call.args) and all(k.arg is not None for k in call.keywords), \
+        f"{name}: recover's call splats its arguments"
+    at = positional.index(param) if param in positional else None
+    keyed = [k.value for k in call.keywords if k.arg == param]
+    slot = ([call.args[at]] if at is not None and at < len(call.args) else []) + keyed
+    assert len(slot) == 1 and isinstance(slot[0], ast.Name) and slot[0].id == param, \
+        f"{name}: not recover's {param} in the {param} slot"
 
 
 def _check_the_appenders(root: Path) -> None:
@@ -935,6 +966,34 @@ def test_the_appender_guard_sees_an_append_off_its_per_act_connection(tmp_path, 
      "    pending = _pending(bar)\n    _HELD = CockpitDB('x')\n    if pending is None or bar.pending_signature",
      "the module builds a connection itself"),
     ("or _r2(conn, cockpit, state,", "or _r2(conn, _HELD, state,", "_r2: not recover's cockpit"),
+    # the slot the handed argument sits in, not just its presence among the arguments
+    ("or _r2(conn, cockpit, state,", "or _r2(cockpit, conn, state,", "_r2: not recover's cockpit in the cockpit slot"),
+    ("or _r2(conn, cockpit, state, bar, now=now, anchor=anchor,", "or _r2(conn, conn, state, bar, now=now, anchor=cockpit,",
+     "_r2: not recover's cockpit in the cockpit slot"),
+    ("or _r2(conn, cockpit, state, bar,", "or _r2(*(conn, cockpit, state), bar,", "_r2: recover's call splats"),
+    # recover's own cockpit stays the one it was handed
+    ("        open_bars = [_bar(r)", "        cockpit = conn\n        open_bars = [_bar(r)", "_r2: recover rebinds its cockpit"),
+    ("    link = _auth.UnsignedLink(seq, prev, rec, fp)\n",
+     "    link = _auth.UnsignedLink(seq, prev, rec, fp)\n    try:\n        pass\n    except Exception as cockpit:\n        pass\n",
+     "_r2: cockpit is rebound"),
+    ("    link = _auth.UnsignedLink(seq, prev, rec, fp)\n", "    link = _auth.UnsignedLink(seq, prev, rec, fp)\n    del cockpit\n",
+     "_r2: cockpit is rebound"),
+    # no other reference to the appender: a module-level call, an alias, a callback
+    ("def recover(conn: sqlite3.Connection, authority",
+     "_r2(None, None, None, None, now=None, anchor=None, ssh_keygen=None)\n\n\ndef recover(conn: sqlite3.Connection, authority",
+     "_r2: not called exactly once, directly, from recover"),
+    ("def recover(conn: sqlite3.Connection, authority", "_ALIAS = _r2\n\n\ndef recover(conn: sqlite3.Connection, authority",
+     "_r2: not called exactly once, directly, from recover"),
+    # an opener the module reaches under another name
+    ("from levain.agent_authority import AgentAuthority\n",
+     "from levain.agent_authority import AgentAuthority\nfrom levain.cockpit.db import CockpitDB as DB\n",
+     "the module builds a connection itself"),
+    ("from levain.agent_authority import AgentAuthority\n",
+     "from levain.agent_authority import AgentAuthority\nfrom sqlite3 import connect as open_it\n",
+     "the module builds a connection itself"),
+    ("from levain.agent_authority import AgentAuthority\n",
+     "from levain.agent_authority import AgentAuthority\nimport sqlite3 as _s\n_OPEN = _s.connect\n",
+     "the module builds a connection itself"),
 ])
 def test_the_handed_append_guard_sees_an_append_off_the_handed_connection(tmp_path, old, new, why):
     # the handed-connection shape is not vacuous: another connection, a rebound parameter, a journal the module
