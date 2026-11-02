@@ -39,8 +39,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from levain.webpush import desk, presence
-from levain.webpush.presence import (ACTIVE_WINDOW_SECS, AWAY_GRACE_SECS, COORDINATOR_WORDS, MAX_SECS, MIN_SECS, SEAT_WORDS,
-                                     SLEEP_BLIND_SECS, TIMED, WORDS, Decision, PresenceError, kind_class, parse_duration)
+from levain.webpush.presence import (ACTIVE_WINDOW_SECS, COORDINATOR_WORDS, MAX_SECS, MIN_SECS, SEAT_WORDS,
+                                     TIMED, WORDS, Decision, PresenceError, kind_class, parse_duration)
 
 __all__ = ["VERSION", "FILE_NAME", "BACKUP_DIR", "DEVICES", "LETS", "LETS_CLASSES", "FOLLOW_DEFAULT", "FOLLOW_MIN",
            "FOLLOW_MAX", "PRESET_TABLE", "overlay_active", "overlay_ended", "devices_on_now", "decide", "read", "view",
@@ -216,9 +216,10 @@ def read(queue_dir: Path | str | None, now: float | None = None) -> dict:
 # --------------------------------------------------------------------------------------------------- the pure rules
 def overlay_ended(rec: dict, now: float, last_input_at: float | None, desk_msg_at: float | None) -> str | None:
     """Why the overlay in ``rec`` (a :func:`read` result) has ended at ``now``, or ``None`` while it stands (or when there is
-    no overlay). ``timer``: ``now`` past ``at``. ``input``: a desk message after the overlay's ``ts`` (no grace), or laptop
-    input after ``ts + AWAY_GRACE_SECS`` (the parting instruction), or, with no laptop reading at all, ``SLEEP_BLIND_SECS`` after
-    ``ts``. Remote input never ends it. Pure."""
+    no overlay). ``timer``: ``now`` past ``at``. ``desk message``: a typed turn into a session after the overlay's ``ts`` (no
+    grace). An until-input overlay (an explicit word, away / sleep or a setting) STANDS until another word of his or that
+    typed turn (Phill np-a93deaf7 "2a", 11-02): sensed laptop input, fresh or stale, present or missing, never ends it.
+    Remote input never ends it. Pure."""
     ov = rec.get("overlay")
     if ov is None:
         return None
@@ -227,9 +228,7 @@ def overlay_ended(rec: dict, now: float, last_input_at: float | None, desk_msg_a
         return "timer" if now >= until["at"] else None
     if desk_msg_at is not None and desk_msg_at > ov["ts"]:
         return "desk message"
-    if last_input_at is None:
-        return "no input reading for an hour" if now >= ov["ts"] + SLEEP_BLIND_SECS else None
-    return "input at the laptop" if last_input_at > ov["ts"] + AWAY_GRACE_SECS else None
+    return None
 
 
 def overlay_active(rec: dict, now: float, last_input_at: float | None, desk_msg_at: float | None) -> bool:
@@ -424,16 +423,14 @@ def _base_text(base: dict) -> str:
     return text
 
 
-def _until_text(rec: dict, ov: dict | None, now: float, blind: bool) -> str:
+def _until_text(rec: dict, ov: dict | None, now: float) -> str:
     if ov is None:
         return "I switch it"
     then = _base_text(rec["base"])
     u = ov["until"]
     if u["kind"] == "timer":
         return f"{_clock(u['at'], now)} (then {then})"
-    if blind:
-        return f"your next input, or {_clock(ov['ts'] + SLEEP_BLIND_SECS, now)} with no input reading (then {then})"
-    return f"your next input at the laptop (then {then})"
+    return f"another word of yours or a message you type into a session (then {then})"
 
 
 def _who_text(ov: dict | None) -> str:
@@ -490,9 +487,8 @@ def _line(queue_dir: Path | str | None, s: dict, st: dict, *, approvals: str | N
         if through:
             where += ", except " + " and ".join(through)
     dev = {"on": "on", "off": "off"}.get(eff["devices"]) or f"follow, after {_mins(eff['follow_after'])}"
-    blind = ov is not None and ov["until"]["kind"] == "input" and s["reading"] is None
     line = (f"Pings now: {where} ({st['why']}). Devices: {dev}. Lets through: {_LETS_WORDS[lets]}. "
-            f"Until: {_until_text(rec, ov, now, blind)}.")
+            f"Until: {_until_text(rec, ov, now)}.")
     if approvals:
         line += f" Approvals: {approvals}."
     if held_n:

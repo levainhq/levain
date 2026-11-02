@@ -10,7 +10,7 @@ import pytest
 
 from levain.consent.adapters import claude_code
 from levain.webpush import intent, presence, sender
-from levain.webpush.presence import AWAY_GRACE_SECS, PresenceError, set_word
+from levain.webpush.presence import PresenceError, set_word
 from tests._push_fixtures import phone
 
 NOW = 1_000_000.0
@@ -92,26 +92,28 @@ def test_loud_overrides_an_active_laptop_and_an_ordinary_ping():
     assert decide(_rec(LOUD()), ACTIVE, "other").state == "pushing"
 
 
-def test_sleep_ends_at_input_past_the_grace_and_the_grace_is_every_until_input_presets():
-    s = _rec(SLEEP())   # said 100 s ago
-    assert decide(s, 50.0).state == "muted"            # input 50 s ago is 50 s after the word: the parting instruction
-    assert decide(s, None).state == "muted"            # no reading: it ends only at the blind bound (SLEEP_BLIND_SECS)
-    ended = decide(_rec(SLEEP(ts=NOW - 1000)), 50.0)   # input 950 s after the word is past the 180 s grace
-    assert (ended.push, ended.state) == (False, "holding")
+def test_sleep_stands_against_sensed_input_fresh_or_stale_or_missing():
+    """np-a93deaf7 "2a": a set sleep ends on a word of his or a typed turn, never on sensed laptop input."""
+    old = _rec(SLEEP(ts=NOW - 1000))     # said 1000 s ago, so any input reading below is past the old 180 s grace
+    for reading in (50.0, 400.0, 5000.0, None):      # a fresh reading, a stale one, one older than the word, no reading at all
+        d = decide(old, reading)
+        assert (d.push, d.state, d.by) == (False, "muted", "sleep"), reading
+    stale_word = _rec(SLEEP(ts=NOW - 10 * 3600))      # even hours later, with no reading, it stands (no blind bound)
+    assert decide(stale_word, None).state == "muted"
 
 
-def test_a_sleep_with_no_idle_reading_ends_at_the_blind_bound():
-    old = _rec(SLEEP(ts=NOW - presence.SLEEP_BLIND_SECS - 1))
-    assert decide(old, None, "other").push is True and "no laptop input reading" in decide(old, None).why
-
-
-def test_away_pushes_at_once_until_input_past_the_grace():
+def test_away_stands_against_sensed_input_the_shape_of_the_1752_row():
     a = _rec(AWAY(ts=NOW - 600))
-    # input 10 s ago is 590 s after the word: past the 180 s grace, so the word is spent and follow reads the desk
-    assert decide(a, ACTIVE).push is False
-    # input 1 s after the word is the parting instruction: still away
-    assert decide(_rec(AWAY(ts=NOW - 100)), 99.0).push is True
-    assert AWAY_GRACE_SECS == 180
+    for reading in (10.0, 99.0, 590.0, 5000.0, None):   # input past the old grace, fresh and stale, and none
+        assert decide(a, reading).push is True, reading
+
+
+def test_a_desk_message_ends_a_set_away_and_a_set_sleep():
+    for ov in (AWAY(ts=NOW - 600), SLEEP(ts=NOW - 600)):
+        rec = _rec(ov)
+        assert intent.overlay_ended(rec, NOW, 5.0, NOW - 100) == "desk message"
+        assert intent.overlay_ended(rec, NOW, 5.0, NOW - 700) is None      # a message before the word does not
+        assert intent.overlay_ended(rec, NOW, 5.0, None) is None           # sensed input alone does not
 
 
 def test_remote_is_no_longer_a_presence_word(tmp_path):
@@ -758,7 +760,11 @@ def test_effective_is_the_same_answer_as_should_push_for_every_overlay_idle_and_
     intent._write_record(q, {"base": _rec()["base"], "overlay": QUIET(60)})
     got = presence.effective(q, NOW, idle=lambda: 900.0)
     assert got["source"] == "word" and got["word"] == "quiet" and got["since"] == NOW - 100
-    intent._write_record(q, {"base": _rec()["base"], "overlay": AWAY(ts=NOW - 1000)})   # spent: he typed after the grace
+    from levain.webpush import desk
+
+    intent._write_record(q, {"base": _rec()["base"], "overlay": AWAY(ts=NOW - 1000)})
+    assert presence.effective(q, NOW, idle=lambda: 5.0)["source"] == "word"       # sensed input, past the old grace, does not spend it
+    desk.note_desk_message(q, "test-hook", now=NOW - 500)                          # a typed turn into a session does
     assert presence.effective(q, NOW, idle=lambda: 5.0)["source"] == "measured"
 
 
