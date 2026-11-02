@@ -108,7 +108,7 @@ def _agents(conn: sqlite3.Connection) -> list[tuple]:
 def _state(conn: sqlite3.Connection, agent_id: str) -> tuple | None:
     """What the tick's decision rested on, read again inside the write that acts on it."""
     return conn.execute(
-        "SELECT a.registration, a.operation, a.current_version, s.spec_hash FROM agents a"
+        "SELECT a.registration, a.operation, a.current_version, s.spec_hash, a.name, s.spec FROM agents a"
         " JOIN agent_specs s ON s.agent_id = a.agent_id AND s.version = a.current_version"
         " WHERE a.agent_id = ?", (agent_id,)).fetchone()
 
@@ -155,7 +155,7 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
     with store.read() as conn:
         agents = _agents(conn)
     for agent_id, name, operation, version, digest, text in agents:
-        snap = ("registered", operation, version, digest)
+        snap = ("registered", operation, version, digest, name, text)
         trigger = binding = None
         if operation != "active":
             out.paused.append(agent_id)
