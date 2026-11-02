@@ -2662,7 +2662,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 .pair-actions.card-rows .sheet-rec { order: -1; border-color: var(--ok); color: var(--ok); }
 .pair-actions.card-rows .sheet-rec .card-key { color: var(--ok); }
 .pair-actions.card-rows .sheet-rec::after { content: "Rec"; margin-left: var(--sp-3); padding: 1px var(--sp-2); border: 1px solid var(--ok); border-radius: var(--r-sm); font-size: var(--fs-micro); font-weight: var(--fw-bold); white-space: nowrap; }
-.sheet-line { overflow-wrap: anywhere; }
+.sheet-line, #sheet-note, #sheet-signing { overflow-wrap: anywhere; }   /* the record carries unbroken ids and digests: it wraps, whole and selectable */
 /* the same card in the cockpit's focus view (a needs-phill question signed through its request): the sheet's anatomy */
 .needs-card-head .card-headline { margin: 0 0 var(--sp-4); font: var(--fw-bold) var(--fs-title)/1.3 var(--round); color: var(--text); overflow-wrap: anywhere; }
 .needs-card-head .consent-display { margin-top: var(--sp-3); white-space: pre-wrap; overflow-wrap: anywhere; }
