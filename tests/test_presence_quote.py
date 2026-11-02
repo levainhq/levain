@@ -20,6 +20,14 @@ SEAT = {"agent": "claude_code", "session": "abc12345-seat", "role": "seat"}
 SID = "abc12345-seat"
 
 
+@pytest.fixture(autouse=True)
+def _no_laptop_reading(monkeypatch):
+    """These tests read a standing `away` overlay with no idle source of their own: no laptop reading, so no input can
+    have ended it (the suite's default reading is input just now, which ends an until-input overlay)."""
+    import levain.consent.auto_away as auto_away
+    monkeypatch.setattr(auto_away, "input_idle_seconds", lambda: None)
+
+
 def _iso(t: float) -> str:
     return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
