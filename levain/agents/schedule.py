@@ -12,19 +12,22 @@ shifted). Each slot is keyed by its UTC instant, so one slot is one key whatever
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from levain.agents.spec import _CRON_BOUNDS, _CRON_NAMES
 
 GRACE = timedelta(minutes=15)
 _MINUTE = timedelta(minutes=1)
+MAX_SPAN = timedelta(days=90)  # the walk is per minute; a caller with an older cursor chunks it
 
 DUE = "due"
 MISSED = "missed"
 NOT_YET = "not-yet"
 
 
+@lru_cache(maxsize=256)
 def _field_set(text: str, index: int) -> tuple[frozenset[int], bool]:
     """The values a cron field allows, and whether the field is unrestricted (a bare ``*``)."""
     lo, hi = _CRON_BOUNDS[index]
@@ -42,7 +45,8 @@ def _field_set(text: str, index: int) -> tuple[frozenset[int], bool]:
         out.update(range(first, last + 1, step))
     if index == 4:  # day-of-week: 7 is Sunday too
         out = {0 if v == 7 else v for v in out}
-    return frozenset(out), text == "*"
+    # Vixie cron: a field that begins with ``*`` (``*/2`` too) counts as unrestricted for the day-field rule.
+    return frozenset(out), text.startswith("*")
 
 
 def _matches(cron: str, local: datetime) -> bool:
@@ -80,7 +84,10 @@ def _in_window(window: dict[str, str] | None, local: datetime) -> bool:
 def _zone(zone: str | None) -> ZoneInfo:
     if not zone:
         raise ValueError("a schedule needs the agent's stored zone; the host's zone is never used")
-    return ZoneInfo(zone)
+    try:
+        return ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"unknown schedule zone: {zone!r}") from exc
 
 
 def _utc(moment: datetime) -> datetime:
@@ -94,6 +101,8 @@ def slots_between(trigger: dict[str, Any], zone: str | None, after: datetime, up
     tz = _zone(zone)
     cursor = _utc(after).replace(second=0, microsecond=0)
     end = _utc(upto)
+    if end - cursor > MAX_SPAN:
+        raise ValueError("slots_between span is too large; walk it in bounded chunks")
     out: list[datetime] = []
     cursor += _MINUTE
     while cursor <= end:
