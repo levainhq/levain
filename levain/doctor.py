@@ -156,6 +156,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_consent_hooks(install))
     core.extend(_check_consent_limits())
     core.extend(_check_chat_network())
+    core.extend(_check_phone_path())
     core.extend(_check_dispatch_adoption_rules())
     core.extend(_check_dispatch_verifiers())
     core.extend(_check_slot_isolation())
@@ -354,6 +355,128 @@ def _check_chat_network() -> list[CheckResult]:
     except (EgressRefused, srt_pin.SrtProblem) as exc:
         return [CheckResult(name, False, str(exc), fix)]
     return [CheckResult(name, True, f"node {node}, srt {st.version} at {st.prefix}")]
+
+
+_TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+_LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+class _Ran:
+    """What :func:`_bounded_tailscale` hands back: the exit code and the output, like a completed process."""
+    def __init__(self, returncode: int, stdout: str) -> None:
+        self.returncode, self.stdout = returncode, stdout
+
+
+def _bounded_tailscale(argv: list[str], timeout: float = 10) -> _Ran:
+    """tailscale in its own process group with a minimal environment (``child_env``: no credentials), killed whole
+    at the timeout: a descendant that holds the output pipe would keep a plain ``subprocess.run`` waiting past it."""
+    import os
+    import signal
+
+    from levain.launch import child_env
+
+    env = child_env()
+    env["TAILSCALE_BE_CLI"] = "1"                  # the macOS app binary answers as the CLI only with this
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         env=env, text=True, start_new_session=True)
+    try:
+        out, _err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            p.communicate(timeout=1)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        raise
+    return _Ran(p.returncode, out or "")
+
+
+def _tailscale_json(argv: list[str], run: Any) -> Any:
+    """One time-bounded read-only tailscale call parsed as JSON; None when it printed nothing usable."""
+    import json
+    try:
+        r = run(argv)
+    except (OSError, ValueError, subprocess.TimeoutExpired):  # ValueError: output that is not decodable text
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout or "null")
+    except ValueError:
+        return None
+
+
+def _serve_url(key: str, dns: str) -> str:
+    """The URL a ``Web`` key (``host:port``) is reached at: https, with the port when it is not 443."""
+    host, sep, p = str(key).rpartition(":")
+    if not sep:
+        host, p = str(key), ""
+    host = host or dns or "the machine's ts.net name"
+    return f"https://{host}" if p in ("", "443") else f"https://{host}:{p}"
+
+
+def _check_phone_path(*, which: Any = None, run: Any = None, port: int | None = None,
+                      app: str | None = None) -> list[CheckResult]:
+    """This laptop's side of the phone path: Tailscale's state and the serve config. It cannot see the phone. Reads
+    only (`tailscale status --json`, `tailscale serve status --json`), each bounded to 10 seconds. A funnel is a
+    FAIL; a serve config it cannot read is a WARN, never an OK. Known edge, by intent: a serve config that
+    persists after the cockpit stops reads as serving (no local HTTP probe)."""
+    import os
+    import shutil
+    from urllib.parse import urlparse
+
+    from levain.daemon import DEFAULT_PORT
+
+    name = "phone path"
+    which = which or shutil.which
+    run = run or _bounded_tailscale
+    port = DEFAULT_PORT if port is None else port
+    fix_serve = f"Run `tailscale serve --bg --https=443 http://127.0.0.1:{port}`."
+    app = _TAILSCALE_APP if app is None else app
+    exe = which("tailscale") or (app if os.access(app, os.X_OK) else None)
+    if not exe:
+        return [CheckResult(name, True, "tailscale not found, so a phone cannot reach this laptop",
+                            "Install Tailscale on the laptop and the phone and sign in to the same tailnet "
+                            "(README: Answer an agent from your phone).", neutral=True)]
+    status = _tailscale_json([exe, "status", "--json"], run)
+    if not isinstance(status, dict):
+        return [CheckResult(name, True, "tailscale did not answer, so a phone may not reach this laptop",
+                            "Open the Tailscale app on the laptop and check it is running.", warn=True)]
+    state = status.get("BackendState")
+    if state != "Running":
+        return [CheckResult(name, True, f"tailscale is not signed in and running (state: {state or 'unknown'}), "
+                                        "so a phone cannot reach this laptop",
+                            "Sign in to Tailscale on the laptop and the phone, on the same tailnet.", warn=True)]
+    serve = _tailscale_json([exe, "serve", "status", "--json"], run)
+    if not isinstance(serve, dict):
+        return [CheckResult(name, True, "could not read the serve configuration, so doctor cannot tell whether "
+                                        "the cockpit is exposed",
+                            "Run `tailscale serve status` and check nothing is open to the internet.", warn=True)]
+    allow = serve.get("AllowFunnel")
+    funnel = [k for k, v in (allow.items() if isinstance(allow, dict) else ()) if v]
+    if funnel:
+        return [CheckResult(name, False, f"funnel is on for {', '.join(funnel)}: the cockpit is open to the internet",
+                            "Run `tailscale funnel reset` now; the cockpit must be reachable from your tailnet only.")]
+    self_status = status.get("Self")
+    dns = str((self_status if isinstance(self_status, dict) else {}).get("DNSName") or "").rstrip(".")
+    webs = serve.get("Web")
+    for key, web in (webs.items() if isinstance(webs, dict) else ()):
+        handlers = web.get("Handlers") if isinstance(web, dict) else None
+        for mount, h in (handlers.items() if isinstance(handlers, dict) else ()):
+            pr = str(h.get("Proxy") or "") if isinstance(h, dict) else ""
+            try:
+                u = urlparse(pr)
+                hit = mount == "/" and u.scheme == "http" and u.hostname in _LOOPBACK and u.port == port
+            except ValueError:
+                continue
+            if hit:
+                return [CheckResult(name, True, f"tailscale proxies to the cockpit port {port}, so a phone on your "
+                                                f"tailnet can reach it at {_serve_url(key, dns)}")]
+    return [CheckResult(name, True, f"tailscale is running but not serving the cockpit port {port}, so a phone "
+                                    "cannot reach this laptop yet", fix_serve, warn=True)]
 
 
 def _check_consent_limits() -> list[CheckResult]:
