@@ -2238,7 +2238,21 @@ def _confirm_identity(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, ob
         # is written, never accepted and dropped: an operator who asked for the unattended-use mark must not be told
         # the baseline is written when it carries none.
         raise Refused("dispatch-mark-unbuilt", "identity.py does not write the dispatch mark yet")
-    return ID.confirm_identity(ctx, req, blob)
+    out = ID.confirm_identity(ctx, req, blob)
+    if req.dispatch and req.answer == "yes":
+        # L3 r1 (deepseek MED 2, complement LOW 2): the key's NAME proves no writer honours `req.dispatch`; the
+        # written baseline is read back, and a baseline without this vendor's mark is told, never answered `written`
+        # as if marked (the baseline itself stands: the operator's login is confirmed, only unattended use is not)
+        vendor, raw = _written_baseline(ctx, str(req.session))
+        if baseline_dispatch_vendor(raw) != vendor:
+            raise Refused("dispatch-mark-unwritten", "the baseline was written without the dispatch mark")
+    return out
+
+
+def _written_baseline(ctx: Ctx, session: str) -> Tuple[str, Optional[bytes]]:
+    """The session's vendor and its slot's baseline bytes as they are now (None when absent)."""
+    a = read_alloc(ctx, session)
+    return a.vendor, ctx.store.read(("slots", a.slot.tag), "baseline")
 
 
 def _probe(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
