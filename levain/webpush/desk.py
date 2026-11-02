@@ -151,15 +151,25 @@ def note_desk_message(queue_dir: Path | str, source: str, *, desk: str | None = 
         cur = read_desk_message(queue_dir, t)
         word = presence.read_word(queue_dir)
         cleared = word["word"] if word and word["word"] in ("away", "sleep") else None
-        if cleared:
-            presence._write(queue_dir, None)
+        # the message record first: a fault writing it leaves the word standing, never a word gone with no input recorded
         if cur is None or t >= cur["at"]:
             _write(queue_dir, DESK_MESSAGE_NAME, {"at": t, "source": src[:_NAME_MAX], "desk": str(desk or "")[:_NAME_MAX]})
+        if cleared and (cur is None or t >= cur["at"]):   # an older message than the one on file ends no word
+            presence._write(queue_dir, None)
+        else:
+            cleared = None
         row = {"ts": t, "word": "desk-message", "prior": {"word": word["word"]} if word else {}, "outcome": "set",
                "via": src[:_NAME_MAX], "by": {"agent": "operator", "session": str(desk or "")[:_NAME_MAX], "role": "desk"}}
         if cleared:
             row["why"] = f"ended {cleared}"
         presence._log_best_effort(queue_dir, row)
+    if cleared:   # pings that the ended word held are due now, as after `back` (a flush that cannot start is retried at the next call)
+        try:
+            from levain.webpush import held
+
+            held.flush_if_due(queue_dir, throttle=False)
+        except Exception:  # noqa: BLE001
+            pass
     return {"at": t, "cleared": cleared}
 
 
@@ -248,6 +258,9 @@ def observe(queue_dir: Path | str | None, now: float, reading: float | None) -> 
     state = you_view(now, reading)["state"]
     if queue_dir is None or state == "unknown":
         return None
+    seen = _read(queue_dir, AUTO_NAME)
+    if seen and seen.get("state") == state:   # nothing changed: no lock, no write (a delivery reads this on every ping)
+        return state
     try:
         with presence._locked(queue_dir, strict=True, wait=_LOCK_WAIT_SECS):
             cur = _read(queue_dir, AUTO_NAME) or {}
@@ -277,10 +290,13 @@ def record_decision(queue_dir: Path | str | None, now: float, kind: str, push: b
         d = Path(queue_dir) / "webpush"
         os.makedirs(d, mode=0o700, exist_ok=True)
         path = d / DECISIONS_NAME
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)   # NONBLOCK: a pipe in its place fails, never hangs a push
         try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return
             os.write(fd, (json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8"))
-            size = os.fstat(fd).st_size
+            size = st.st_size + 1
         finally:
             os.close(fd)
         if size > DECISIONS_MAX_BYTES:

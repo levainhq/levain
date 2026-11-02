@@ -74,3 +74,17 @@ def test_the_one_rule_never_calls_laptop_idle_the_desk_and_keeps_what_each_deliv
     eff = presence.effective(q, NOW, idle=lambda: 900.0)
     assert eff["you"]["state"] == "away" and eff["desk"]["live"] is False
     assert presence.should_push(q, "ping", now=NOW, idle=lambda: 900.0, suggest=False).why == eff["reason"]    # the chip and a push are one answer
+
+
+def test_a_ping_held_for_an_active_desk_is_not_released_by_the_flush_while_a_desk_message_counts_as_input(tmp_path):
+    from levain.webpush import held
+    from levain.webpush.store import PushStore
+
+    q = tmp_path
+    PushStore(q).add_ping("ping", "r1", "t", "b", None, hold=("/", "active"))
+    def pending(now):
+        active, muted = held._plan_now(q, now, lambda: 3600.0)           # the laptop itself has been still for an hour
+        return len(active)
+    assert pending(time.time()) == 1                                     # no desk message: raw idle releases it
+    desk.note_desk_message(q, "test-hook", now=time.time() - 30)
+    assert pending(time.time()) == 0                                     # the same reading the delivery rule used
