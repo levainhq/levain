@@ -73,20 +73,34 @@ def test_render_limit_fields_round_trip_through_the_front_parser():
 
 # --- the running front -----------------------------------------------------------------------------------------
 
-async def _run(pol: bytes, fn) -> None:
+async def _run(pol: bytes, fn, *, silent: bool = False, seen: dict | None = None, on_connect=None) -> None:
+    """``silent``: the upstream reads and never answers (else it echoes). ``seen``: filled with the bytes the upstream
+    actually received (``"up"``) and ``"eof"`` once its side ended. ``on_connect``: called as the front opens the
+    upstream, before it answers the CONNECT."""
+    seen = {} if seen is None else seen
+    seen.update(up=0, eof=0)
+
     async def resolve(host: str, port: int):
         return [PUBLIC]
 
     async def echo(r, w):
-        while data := await r.read(65536):
-            w.write(data)
-            await w.drain()
+        try:
+            while data := await r.read(65536):
+                seen["up"] += len(data)
+                if not silent:
+                    w.write(data)
+                    await w.drain()
+        except (ConnectionError, OSError):
+            pass
+        seen["eof"] += 1
         w.close()
 
     upstream = await asyncio.start_server(echo, "127.0.0.1", 0)
     up_port = upstream.sockets[0].getsockname()[1]
 
     async def connect(addr, port):
+        if on_connect is not None:
+            on_connect()
         return await asyncio.open_connection("127.0.0.1", up_port)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -94,6 +108,7 @@ async def _run(pol: bytes, fn) -> None:
         front = Front(load_policy(pol), log_path=log, slot_uid=os.getuid(), resolve=resolve, connect=connect)
         path = str(Path(tmp) / "gw.sock")
         server = await front.serve_unix(path)
+        front._test_path = [path]   # for tests that drive a CONNECT by hand (_raw_200)
 
         async def open_tunnel(host: str = "api.anthropic.com"):
             """-> (status, head, reader, writer); on a 200 the ClientHello is already sent."""
@@ -247,3 +262,194 @@ def test_a_future_deadline_and_ample_cap_change_nothing():
         await _settled(front)
 
     asyncio.run(_run(policy(tunnel_bytes_cap=10**9, deadline=int(time.time()) + 3600), body))
+
+
+# --- L3 r1: the limits hold at the forward, not only at the read --------------------------------------------------
+
+class _Clock:
+    """The front's wall clock, stepped by the test: replaces ``levain.broker.front.time``."""
+
+    def __init__(self, now: float) -> None:
+        self.now = now
+
+    def time(self) -> float:
+        return self.now
+
+
+HELLO_LEN = len(client_hello("api.anthropic.com"))
+
+
+async def _until(pred, what: str) -> None:
+    for _ in range(500):
+        if pred():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+async def _read_n(r: asyncio.StreamReader, n: int) -> bytes:
+    got = b""
+    while len(got) < n:
+        data = await asyncio.wait_for(r.read(65536), 5)
+        assert data, (len(got), n)
+        got += data
+    return got
+
+
+async def _raw_200(path_holder: list, front: Front, host: str = "api.anthropic.com"):
+    """A CONNECT answered 200 whose ClientHello the test sends (or withholds) itself."""
+    r, w = await asyncio.open_unix_connection(path_holder[0])
+    w.write(_connect(f"{host}:443"))
+    await w.drain()
+    head = await r.readuntil(b"\r\n\r\n")
+    return int(head.split(b" ", 2)[1]), head, r, w
+
+
+def _tunnels(log: Path) -> list:
+    return [x for x in _records(log) if x.get("event") == "tunnel" and x["passthrough"]]
+
+
+def test_a_chunk_read_across_the_deadline_is_never_forwarded(monkeypatch):
+    """codex HIGH: the clock passes the deadline while a relay waits in its read; the chunk that read returns is dropped
+    in both directions, never forwarded."""
+    import levain.broker.front as front_mod
+    deadline = 1_900_000_000
+    clock = _Clock(deadline - 100.0)
+    monkeypatch.setattr(front_mod, "time", clock)
+    seen: dict = {}
+
+    async def body(open_tunnel, front: Front, log: Path) -> None:
+        status, _, r, w = await open_tunnel()
+        assert status == 200
+        await _read_n(r, HELLO_LEN)                  # the hello's echo: both relay directions now wait in a read
+        clock.now = deadline + 1.0                   # the deadline passes between the read and the forward
+        w.write(b"P" * 1000)
+        await w.drain()
+        assert await asyncio.wait_for(r.read(65536), 5) == b""      # closed, the payload never echoed
+        await _settled(front)
+        t = _tunnels(log)[-1]
+        assert t["end"] == "deadline" and t["bytes_up"] == HELLO_LEN, t
+        assert seen["up"] == HELLO_LEN, seen        # the upstream never saw the post-deadline chunk
+
+    asyncio.run(_run(policy(tunnel_bytes_cap=10**9, deadline=deadline), body, seen=seen))
+
+
+def test_a_deadline_passing_while_the_upstream_opens_refuses_the_connect(monkeypatch):
+    import levain.broker.front as front_mod
+    deadline = 1_900_000_000
+    clock = _Clock(deadline - 100.0)
+    monkeypatch.setattr(front_mod, "time", clock)
+    seen: dict = {}
+
+    def late() -> None:
+        clock.now = deadline + 1.0                   # admitted before the open, past the deadline after it
+
+    async def body(open_tunnel, front: Front, log: Path) -> None:
+        status, head, _, w = await open_tunnel()
+        assert status == 403 and b"X-Levain-Refused: passthrough-deadline" in head, head
+        w.close()
+        await _settled(front)
+        await asyncio.sleep(0.05)
+        assert seen["up"] == 0 and not _tunnels(log)
+
+    asyncio.run(_run(policy(tunnel_bytes_cap=10**9, deadline=deadline), body, seen=seen, on_connect=late))
+
+
+def test_a_deadline_passing_before_the_hello_keeps_the_hello(monkeypatch):
+    import levain.broker.front as front_mod
+    deadline = 1_900_000_000
+    clock = _Clock(deadline - 100.0)
+    monkeypatch.setattr(front_mod, "time", clock)
+    seen: dict = {}
+
+    async def body(open_tunnel, front: Front, log: Path) -> None:
+        status, _, r, w = await _raw_200(front._test_path, front)
+        assert status == 200
+        clock.now = deadline + 1.0                   # after the 200, before the hello
+        w.write(client_hello("api.anthropic.com"))
+        await w.drain()
+        assert await asyncio.wait_for(r.read(65536), 5) == b""
+        await _settled(front)
+        assert seen["up"] == 0, seen
+        refused = [x for x in _records(log) if x.get("event") == "refused"]
+        assert refused and refused[-1]["refused"] == "passthrough-deadline", refused
+
+    asyncio.run(_run(policy(tunnel_bytes_cap=10**9, deadline=deadline), body, seen=seen))
+
+
+def test_the_chunk_that_lands_exactly_on_the_cap_is_forwarded_and_counted():
+    """codex MED: pt_total == cap - 4096 and a 4096-byte read. The chunk fits, so it is forwarded whole, and every count
+    (the tunnel record, the session total) equals what the upstream actually received."""
+    seen: dict = {}
+
+    async def body(open_tunnel, front: Front, log: Path) -> None:
+        status, _, r, w = await open_tunnel()
+        assert status == 200
+        await _until(lambda: seen["up"] == HELLO_LEN, "the hello upstream")
+        cap = front.policy.tunnel_bytes_cap
+        front.pt_total = cap - 4096                  # the session has 4096 bytes left
+        w.write(b"Q" * 4096)
+        await w.drain()
+        await _until(lambda: seen["eof"], "the upstream to see the tunnel close")
+        await _settled(front)
+        t = _tunnels(log)[-1]
+        assert seen["up"] == HELLO_LEN + 4096, (seen, t)
+        assert t["bytes_up"] == seen["up"] and t["end"] == "bytes-exhausted", t
+        assert front.pt_total == cap and front.pt_exhausted
+        ex = [x for x in _records(log) if x.get("event") == "passthrough-bytes-exhausted"]
+        assert ex and ex[0]["total"] == cap
+
+    asyncio.run(_run(policy(tunnel_bytes_cap=10**6), body, silent=True, seen=seen))
+
+
+def test_a_cap_equal_to_the_hello_forwards_it_then_closes_the_tunnel():
+    """codex MED: the hello takes the whole cap; it is forwarded, and that tunnel is then closed, not left open to idle."""
+    seen: dict = {}
+
+    async def body(open_tunnel, front: Front, log: Path) -> None:
+        status, _, r, w = await open_tunnel()
+        assert status == 200
+        assert await asyncio.wait_for(r.read(65536), 3) == b""       # closed promptly (silent upstream, silent client)
+        await _until(lambda: seen["eof"], "the upstream to see the tunnel close")
+        await _settled(front)
+        assert seen["up"] == HELLO_LEN and front.pt_total == HELLO_LEN and front.pt_exhausted
+        t = _tunnels(log)[-1]
+        assert t["bytes_up"] == HELLO_LEN and t["end"] == "bytes-exhausted", t
+
+    asyncio.run(_run(policy(tunnel_bytes_cap=HELLO_LEN), body, silent=True, seen=seen))
+
+
+def test_exhaustion_closes_a_tunnel_still_waiting_for_its_hello():
+    seen: dict = {}
+
+    async def body(open_tunnel, front: Front, log: Path) -> None:
+        status, _, r, w = await open_tunnel()
+        assert status == 200
+        await _read_n(r, HELLO_LEN)
+        status2, _, r2, w2 = await _raw_200(front._test_path, front)   # admitted; its hello never comes
+        assert status2 == 200
+        w.write(b"R" * 4096)                                           # past the cap
+        await w.drain()
+        assert await asyncio.wait_for(r2.read(65536), 3) == b""        # closed by exhaustion, not its 10 s hello wait
+        assert front.pt_exhausted and front.pt_total <= front.policy.tunnel_bytes_cap
+        w2.close()
+
+    asyncio.run(_run(policy(tunnel_bytes_cap=2 * HELLO_LEN + 100), body, seen=seen))
+
+
+def test_huge_integer_limits_are_refused_not_crashed():
+    """10**400 is a valid JSON integer: float() of it overflows. Both parsers refuse it by name, with one bound."""
+    for dl in (10**400, -10**400, 10**12 + 1, 1e400):
+        with pytest.raises(PolicyError, match="deadline must be"):
+            load_policy(policy(tunnel_bytes_cap=1000, deadline=dl))
+        with pytest.raises(Exception, match="front-limit-invalid:deadline"):
+            front_limit_fields(None, dl)
+    for cap in (10**400, 2**53 + 1):
+        with pytest.raises(PolicyError, match="tunnel_bytes_cap must be"):
+            load_policy(policy(tunnel_bytes_cap=cap))
+        with pytest.raises(Exception, match="front-limit-invalid:tunnel-bytes-cap"):
+            front_limit_fields(cap)
+    # the bounds themselves are accepted by both, and round-trip
+    out = front_limit_fields(2**53, 10**12)
+    p = load_policy(policy(**out))
+    assert (p.tunnel_bytes_cap, p.deadline) == (2**53, 10**12)

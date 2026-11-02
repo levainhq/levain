@@ -42,6 +42,7 @@ from typing import Any, Iterable, Mapping
 import levain
 from levain.contracts import ContractError
 from levain.contracts import canon
+from levain.broker import norm as broker_norm
 from levain.broker import policy as broker_policy
 from levain.firing.hands import HostOS
 from levain.slot import Refused
@@ -1064,17 +1065,18 @@ def parse_driver_input(raw: bytes) -> object:
 
 def front_limit_fields(tunnel_bytes_cap: object = None, deadline: object = None) -> dict:
     """The optional passthrough limits of the front's session file (``R/gw/slot<n>/session.json``, P7-A §3.2), as
-    the top-level keys to merge into it: ``tunnel_bytes_cap`` (positive int) and ``deadline`` (absolute epoch seconds,
-    a positive int). ``None`` omits a key. A value of any other shape is refused ``front-limit-invalid:<key>`` here,
-    before the front's own parser would refuse the file. Pure: where the values come from and the write of the file
-    are the verb's."""
+    the top-level keys to merge into it: ``tunnel_bytes_cap`` (an int in (0, ``norm.PT_CAP_MAX``]) and ``deadline``
+    (absolute epoch seconds, an int in (0, ``norm.PT_DEADLINE_MAX``]). ``None`` omits a key. A value of any other shape
+    or size is refused ``front-limit-invalid:<key>`` here, before the front's own parser would refuse the file. Pure:
+    where the values come from and the write of the file are the verb's."""
     out: dict = {}
     if tunnel_bytes_cap is not None:
-        if type(tunnel_bytes_cap) is not int or tunnel_bytes_cap <= 0:
+        if type(tunnel_bytes_cap) is not int or not 0 < tunnel_bytes_cap <= broker_norm.PT_CAP_MAX:
             raise Refused("front-limit-invalid:tunnel-bytes-cap", repr(tunnel_bytes_cap)[:40])
         out["tunnel_bytes_cap"] = tunnel_bytes_cap
     if deadline is not None:
-        if type(deadline) is not int or deadline <= 0:   # an int: the canonical encoding the file is written in has no floats
+        # an int: the canonical encoding the file is written in has no floats
+        if type(deadline) is not int or not 0 < deadline <= broker_norm.PT_DEADLINE_MAX:
             raise Refused("front-limit-invalid:deadline", repr(deadline)[:40])
         out["deadline"] = deadline
     return out

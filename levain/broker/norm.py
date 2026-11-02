@@ -25,6 +25,12 @@ STATUS = {
     "credential-unavailable": 503,
     "body-json": 400, "body-unbounded": 403, "body-timeout": 408,
 }
+#: P7-A §3.2: the largest passthrough limits a session file may carry, meant as ONE bound for the file's writer and its
+#: reader, so what one writes the other loads. 2**53 bytes is the
+#: largest integer a JSON reader keeps exact as a double; 10**12 epoch seconds is ~year 33658, past any real deadline
+#: and still exact as a float.
+PT_CAP_MAX = 2 ** 53
+PT_DEADLINE_MAX = 10 ** 12
 #: the names that carry a `:<what>` suffix on the wire (R4 §1.6: `body-unbounded:document`); the status is the prefix's.
 PARAMETERISED = ("body-unbounded",)
 _WHAT = re.compile(r"[a-z][a-z0-9_]{0,47}\Z")
