@@ -47,7 +47,7 @@ STAMP_NAME = "flush.spawned"
 SPAWN_LOCK_NAME = "flush.spawn.lock"
 
 
-NOTICES_SUMMARY_URL = "/?view=notices"
+NOTICES_SUMMARY_URL = "/?view=notifications"
 _NOTICE_KINDS = ("notify", "notify_urgent")
 _SUMMARY_SOURCES = 4     # the sources a notice summary names before "and N more"
 

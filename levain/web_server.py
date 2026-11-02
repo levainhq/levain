@@ -1175,14 +1175,25 @@ _NOTIFY_TOKENS_REVOKE = "/webpush/notify/tokens/revoke"
 # the whole request body, refused on its declared length before it is read: in bytes, sized so a title and a body at
 # their character maxima in 4-byte UTF-8 still fit
 _NOTIFY_MAX_REQUEST = 8192
-_NOTIFY_KEYS = frozenset({"title", "body", "priority"})
+_NOTIFY_KEYS = frozenset({"title", "body", "priority", "source"})
 _NOTIFY_DEFAULT_TITLE = "Notice"            # a post with no title carries this; the source label is put in front of it
 _NOTIFY_MINT_KEYS = frozenset({"name", "source", "urgent", "max_priority", "rate_per_min", "rate_per_day",
                                "urgent_per_hour"})
-_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH, _NOTIFY_TOKENS})
+# The notification center (levain.webpush.center): Levain's pings and the notices posted at the operator as one list, with
+# the operator's read/unread/delete marks. Reads and writes are the full credential's; a failed write is a real HTTP error
+# with ``{ok: false, message}``, never a 200 that says otherwise.
+_CENTER = "/webpush/center"
+_CENTER_ITEM = "/webpush/center/item"
+_CENTER_READ = "/webpush/center/read"
+_CENTER_READ_ALL = "/webpush/center/read-all"
+_CENTER_DELETE = "/webpush/center/delete"
+_CENTER_CLEAR = "/webpush/center/clear"
+_CENTER_POST = frozenset({_CENTER_READ, _CENTER_READ_ALL, _CENTER_DELETE, _CENTER_CLEAR})
+_PUSH_GET = frozenset({"/webpush/key", "/webpush/record", _POLICY_PATH, _PRESENCE_PATH, _NOTIFY_TOKENS, _CENTER,
+                       _CENTER_ITEM})
 _PUSH_POST = frozenset({"/webpush/subscribe", "/webpush/unsubscribe", "/webpush/opened", "/webpush/test", "/webpush/trace",
                         _POLICY_SET, _POLICY_RESET, _PRESENCE_SET, _PRESENCE_TOKEN_NEW, _PRESENCE_TOKEN_REVOKE,
-                        _NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE})
+                        _NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE, *_CENTER_POST})
 _PUSH_SUBSCRIBE = "/webpush/subscribe"
 # A device's receipt for a push it got: the one webpush POST that takes no token (the worker holds none). Its report names
 # the SHA-256 of the device's own subscription endpoint, checked by the store; it is kept OUT of _PUSH_POST so every route
@@ -1241,7 +1252,7 @@ def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
     hold = (notify.NOTICES_URL, reason or "active") if decision == "held" else None
     # the ping, its held row and the notice are one transaction: a failure stores none of them, and the caller says so
     ping_id, nid = PushStore(queue).record_notice(adm.kind, ref, adm.display, adm.source, adm.title, adm.body,
-                                                  adm.priority, adm.token, decision, hold=hold)
+                                                  adm.priority, adm.token, decision, hold=hold, origin=adm.origin)
     if decision == "pushed":
         try:
             threading.Thread(target=_push_notice, args=(queue, ping_id, adm.kind, ref, adm.display, adm.body),
@@ -1253,7 +1264,7 @@ def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
             held.flush_if_due(queue)
         except Exception:  # noqa: BLE001 - a failed flush never fails the post
             pass
-    return {"id": nid, "decision": decision}
+    return {"id": nid, "item": f"n{nid}", "decision": decision}
 
 
 # The chat routes (K1 part 2, `levain serve --chat`). Served only when the server holds a ChatHost;
@@ -2356,6 +2367,11 @@ class _Handler(GuardedHandler):
                     self._send(json.dumps(doc).encode("utf-8"), "application/json; charset=utf-8", status=st,
                                head=head, headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
                     return
+                if path in (_CENTER, _CENTER_ITEM):
+                    doc, st = self._center_get(path, queue)
+                    self._send(json.dumps(doc).encode("utf-8"), "application/json; charset=utf-8", status=st, head=head,
+                               headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+                    return
                 if path == _PRESENCE_PATH:
                     self._send(json.dumps(self._presence_view(queue)).encode("utf-8"), "application/json; charset=utf-8",
                                status=200, head=head,
@@ -2388,6 +2404,8 @@ class _Handler(GuardedHandler):
             return self._presence_token_post(route, raw)
         if route in (_NOTIFY_TOKENS, _NOTIFY_TOKENS_REVOKE):
             return self._notify_token_post(route, raw)
+        if route in _CENTER_POST:
+            return self._center_post(route, raw)
         name = str(self._credential()["name"])
         if route == _PUSH_SUBSCRIBE and not name.startswith(PAIRED_PREFIX):
             return self._pair_and_subscribe(raw, name)
@@ -2568,6 +2586,64 @@ class _Handler(GuardedHandler):
             return {"error": "presence_refused", "message": str(exc)}, 422
         return {"tokens": presence_tokens.list_public(queue)}, 200
 
+    def _center_get(self, path: str, queue: Path) -> "tuple[dict[str, Any], int]":
+        """``GET /webpush/center[?limit=&before=<item id>]``: ``{items, unread, total, next_before, needs_count?}``;
+        ``GET /webpush/center/item?id=<item id>``: ``{item, unread}``. ``needs_count`` (the open Needs-you items, the app-icon
+        badge's number) is left out when a store cannot be read, never a 0. A store that cannot be read is a 503."""
+        from urllib.parse import parse_qs, urlsplit
+
+        from levain.webpush import center, needs
+        from levain.webpush.store import PushStore
+
+        q = parse_qs(urlsplit(self.path).query)
+        try:
+            store = PushStore(queue)
+            if path == _CENTER_ITEM:
+                return center.get(store, q.get("id", [""])[0]), 200
+            raw = q.get("limit", [""])[0]
+            if raw and not (raw.isascii() and raw.isdigit()):
+                return {"ok": False, "error": "bad_request", "message": "limit is a whole number"}, 400
+            doc = center.list_items(store, limit=int(raw) if raw else center.PAGE, before=q.get("before", [None])[0])
+            n = needs.open_needs_count(queue)
+            return (doc if n is None else {**doc, "needs_count": n}), 200
+        except center.CenterError as exc:
+            return {"ok": False, "error": exc.code, "message": str(exc)}, exc.status
+        except Exception as exc:  # noqa: BLE001 - a list that cannot be read is an answer, never an empty list
+            _log.warning("center: the list was not read: %s: %s", type(exc).__name__, exc)
+            return {"ok": False, "error": "center_unreadable", "message": "the notifications could not be read"}, 503
+
+    def _center_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":
+        """The center's writes: ``/read {id, read}`` (the toggle, and mark-read on open), ``/read-all {}``, ``/delete {id}``,
+        ``/clear {}``. Each answers ``{ok: true, unread}``; a failure is a 4xx or 5xx with ``{ok: false, message}``. A delete
+        or a clear removes pings from the list and never closes a Needs-you item."""
+        from levain.webpush import center
+        from levain.webpush.store import PushStore
+
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {"ok": False, "error": "bad_json", "message": "body is not valid JSON"}, 400
+        want = {_CENTER_READ: {"id", "read"}, _CENTER_DELETE: {"id"}}.get(route, set())
+        if not isinstance(req, dict) or set(req) != want:
+            return {"ok": False, "error": "bad_request",
+                    "message": "send exactly " + (", ".join(sorted(want)) if want else "an empty object")}, 400
+        try:
+            store = PushStore(self.server.signer.queue_dir)
+            if route == _CENTER_READ:
+                unread = center.set_read(store, req["id"], req["read"])
+            elif route == _CENTER_READ_ALL:
+                unread = center.mark_all_read(store)
+            elif route == _CENTER_DELETE:
+                unread = center.delete(store, req["id"])
+            else:
+                unread = center.clear(store)
+        except center.CenterError as exc:
+            return {"ok": False, "error": exc.code, "message": str(exc)}, exc.status
+        except Exception as exc:  # noqa: BLE001 - a write that did not land is said, never a 200
+            _log.warning("center: a write did not land: %s: %s", type(exc).__name__, exc)
+            return {"ok": False, "error": "center_unwritable", "message": "that did not reach Levain; nothing was changed"}, 503
+        return {"ok": True, "unread": unread}, 200
+
     def _notify_token_post(self, route: str, raw: bytes) -> "tuple[dict[str, Any], int]":
         """``POST /webpush/notify/tokens {name, source?, urgent?, max_priority?, rate_per_min?, rate_per_day?,
         urgent_per_hour?}`` mints a notify token; ``/revoke {name}`` revokes one. Full credential only (the push gate
@@ -2614,7 +2690,7 @@ class _Handler(GuardedHandler):
         return raw if len(raw) <= 128 and _HEADER_SAFE_TOKEN.fullmatch(raw) else ""
 
     def _notify_post(self) -> None:
-        """``POST /notify {title?, body, priority?}``: a notice from a service, as a doorbell and nothing more. Every
+        """``POST /notify {title?, body?, priority?, source?}`` (a title or a body; ``source`` only from a flow-origin token): a notice from a service, as a doorbell and nothing more. Every
         refusal that does not need the body is sent before a byte of it is read, and closes the connection so the unread
         body is never taken for the next request (no route, a missing credential, a token that is not a live one, the
         content type, the length, a busy server). The token is checked from the header alone, with no lock and before a
@@ -2652,13 +2728,13 @@ class _Handler(GuardedHandler):
                 req = json.loads(raw.decode("utf-8"))
             except (ValueError, UnicodeDecodeError):
                 return self._send_json({"error": "bad_json", "message": "body is not valid JSON"}, 400)
-            if not isinstance(req, dict) or not set(req) <= _NOTIFY_KEYS or "body" not in req:
-                return self._send_json({"error": "bad_request", "message": "send body, and only title and priority "
-                                        "besides: a notice is text, nothing else"}, 400)
+            if not isinstance(req, dict) or not set(req) <= _NOTIFY_KEYS or not (req.keys() & {"body", "title"}):
+                return self._send_json({"error": "bad_request", "message": "send a title or a body, and only priority "
+                                        "(and, from flow's own token, source) besides: a notice is text, nothing else"}, 400)
             queue = signer.queue_dir
             try:
-                adm = notify_tokens.admit(queue, supplied, req.get("title", _NOTIFY_DEFAULT_TITLE), req["body"],
-                                          req.get("priority"))
+                adm = notify_tokens.admit(queue, supplied, req.get("title", _NOTIFY_DEFAULT_TITLE), req.get("body"),
+                                          req.get("priority"), source=req.get("source"), no_body="body" not in req)
             except NotifyRefused as exc:
                 headers = [("Retry-After", str(int(exc.retry_after) + 1))] if exc.status == 429 else None
                 return self._send(json.dumps({"error": exc.error, "message": str(exc)}).encode("utf-8"),

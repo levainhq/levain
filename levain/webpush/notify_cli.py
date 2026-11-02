@@ -30,6 +30,9 @@ def register(subparsers) -> None:
     m.add_argument("--name", required=True, help="The token's name (1-40 letters, digits, spaces, dots, dashes, underscores).")
     m.add_argument("--source", default=None,
                    help="The label every notice from it carries (default: the name, lowercased). It cannot change later.")
+    m.add_argument("--origin", choices=("token", "flow"), default="token",
+                   help="flow: flow's own poster (it may name the notice's source; its links render as Levain's own). "
+                        "token (default): a service you gave a key; its links show in full.")
     m.add_argument("--urgent", action="store_true",
                    help="Let this token post urgent notices (they follow your notification policy's attention cell).")
     m.add_argument("--max-priority", dest="max_priority", choices=("low", "normal", "urgent"), default=None,
@@ -71,7 +74,7 @@ def _mint(args: argparse.Namespace) -> int:
     if args.max_priority is not None:
         kw["max_priority"] = args.max_priority
     try:
-        rec, token = notify_tokens.create(_qdir(args), args.name, args.source, urgent=bool(args.urgent), **kw)
+        rec, token = notify_tokens.create(_qdir(args), args.name, args.source, urgent=bool(args.urgent), origin=args.origin, **kw)
     except notify_tokens.NotifyTokenError as e:
         print(f"levain notify token mint: {e}")
         return 2

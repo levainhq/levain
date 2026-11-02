@@ -156,7 +156,12 @@ _SCHEMA: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, source TEXT NOT NULL, "
     "title TEXT NOT NULL, body TEXT NOT NULL, priority TEXT NOT NULL CHECK (priority IN ('low','normal','urgent')), "
     "token TEXT NOT NULL, decision TEXT NOT NULL CHECK (decision IN ('pushed','held','recorded')), "
-    "ping_id INTEGER REFERENCES pings(id), dismissed_at TEXT)",
+    "ping_id INTEGER REFERENCES pings(id), dismissed_at TEXT, origin TEXT NOT NULL DEFAULT 'token')",
+    # the notification center's marks (levain.webpush.center): the one mutable table over the append-only record. ``is_read``
+    # is the operator's explicit read/unread for an item (``p<ping id>`` or ``n<notice id>``); ``deleted_at`` hides it. An
+    # item with no row is read when it predates the center's floors (meta), else unread.
+    "CREATE TABLE IF NOT EXISTS center_marks (item TEXT PRIMARY KEY, is_read INTEGER NOT NULL, read_at TEXT, "
+    "deleted_at TEXT)",
     "CREATE INDEX IF NOT EXISTS receipts_device_reported ON receipts (device_id, reported_at)",
     "CREATE INDEX IF NOT EXISTS targets_ping_sub ON targets (ping_id, subscription_id)",
     "CREATE INDEX IF NOT EXISTS deliveries_ping_sub ON deliveries (ping_id, subscription_id)",
@@ -226,9 +231,12 @@ class PushStore:
         if row is None or row[0] != STORE_FORMAT:
             return False
         for table, column in (("subscriptions", "subscribed"), ("subscriptions", "journal"), ("pings", "command"),
-                              ("held", "claimed_at")):
+                              ("held", "claimed_at"), ("notices", "origin")):
             if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
                 return False
+        if conn.execute("SELECT COUNT(*) FROM meta WHERE key IN ('center_floor_ping', 'center_floor_notice')"
+                        ).fetchone()[0] != 2:
+            return False
         return conn.execute("SELECT 1 FROM subscriptions WHERE device_id IS NULL AND retired_at IS NULL "
                             "LIMIT 1").fetchone() is None
 
@@ -256,6 +264,13 @@ class PushStore:
                 conn.execute("ALTER TABLE pings ADD COLUMN command INTEGER")
             if "claimed_at" not in {r[1] for r in conn.execute("PRAGMA table_info(held)")}:
                 conn.execute("ALTER TABLE held ADD COLUMN claimed_at TEXT")
+            if "origin" not in {r[1] for r in conn.execute("PRAGMA table_info(notices)")}:
+                conn.execute("ALTER TABLE notices ADD COLUMN origin TEXT NOT NULL DEFAULT 'token'")
+            # the center's floors: what existed when the center first came is history, read; set once, never moved
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('center_floor_ping', "
+                         "(SELECT CAST(COALESCE(MAX(id), 0) AS TEXT) FROM pings))")
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('center_floor_notice', "
+                         "(SELECT CAST(COALESCE(MAX(id), 0) AS TEXT) FROM notices))")
             # a subscription with no device is one no revoke can stop: none is stored any more, and any left is retired
             conn.execute("UPDATE subscriptions SET retired_at = ? WHERE device_id IS NULL AND retired_at IS NULL",
                          (now_stamp(),))
@@ -335,16 +350,16 @@ class PushStore:
 
     # --- notices -------------------------------------------------------------------------------------
     def add_notice(self, source: str, title: str, body: str, priority: str, token: str, decision: str,
-                   ping_id: int | None = None, *, now: float | None = None) -> int:
+                   ping_id: int | None = None, *, now: float | None = None, origin: str = "token") -> int:
         """Record one posted notice and prune in the same transaction: past the newest :data:`NOTICES_KEEP`, or older than
         :data:`NOTICES_DAYS` days, goes."""
         with self.write() as c:
             return self._insert_notice(c, source, title, body, priority, token, decision, ping_id,
-                                       time.time() if now is None else now)
+                                       time.time() if now is None else now, origin)
 
     def record_notice(self, kind: str, ref: str, display: str, source: str, title: str, body: str, priority: str,
                       token: str, decision: str, *, hold: tuple[str, str] | None = None,
-                      now: float | None = None) -> tuple[int | None, int]:
+                      now: float | None = None, origin: str = "token") -> tuple[int | None, int]:
         """A posted notice and its delivery record in ONE transaction: the ping (``pushed`` and ``held``; a ``recorded``
         notice has none), its held row (``held`` only, ``hold`` being ``(url, reason)`` as :meth:`add_ping` takes it),
         the notice row and the retention prune. Any failure rolls back all of it, so there is never a ping without its
@@ -354,15 +369,17 @@ class PushStore:
         at = time.time() if now is None else now
         with self.write() as c:
             ping_id = None if decision == "recorded" else self._insert_ping(c, kind, ref, display, body, None, hold)
-            return ping_id, self._insert_notice(c, source, title, body, priority, token, decision, ping_id, at)
+            return ping_id, self._insert_notice(c, source, title, body, priority, token, decision, ping_id, at, origin)
 
     @staticmethod
     def _insert_notice(c: sqlite3.Connection, source: str, title: str, body: str, priority: str, token: str,
-                       decision: str, ping_id: int | None, at: float) -> int:
-        nid = int(c.execute("INSERT INTO notices (at, source, title, body, priority, token, decision, ping_id) "
-                            "VALUES (?,?,?,?,?,?,?,?)",
+                       decision: str, ping_id: int | None, at: float, origin: str = "token") -> int:
+        if origin not in ("token", "flow"):
+            raise ValueError("a notice's origin is token or flow")
+        nid = int(c.execute("INSERT INTO notices (at, source, title, body, priority, token, decision, ping_id, origin) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
                             (time.strftime(STAMP, time.gmtime(at)), source, title, body, priority, token, decision,
-                             ping_id)).lastrowid)
+                             ping_id, origin)).lastrowid)
         c.execute("DELETE FROM notices WHERE at < ?", (time.strftime(STAMP, time.gmtime(at - NOTICES_DAYS * 86400)),))
         c.execute("DELETE FROM notices WHERE id NOT IN (SELECT id FROM notices ORDER BY id DESC LIMIT ?)",
                   (NOTICES_KEEP,))

@@ -406,7 +406,7 @@ def test_notice_roundtrip_dismiss_and_bounded_read(tmp_path):
     b = s.add_notice("alarm", "t2", "b2", "urgent", "Alarm", "pushed", now=NOW + 1)
     got = s.notices()
     assert [n["id"] for n in got] == [b, a] and got[0]["source"] == "alarm" and got[0]["dismissed_at"] is None
-    assert set(got[0]) == {"id", "at", "source", "title", "body", "priority", "token", "decision", "ping_id", "dismissed_at"}
+    assert set(got[0]) == {"id", "at", "source", "title", "body", "priority", "token", "decision", "ping_id", "dismissed_at", "origin"}
     assert s.dismiss_notice(a, now=NOW + 2) is True and s.dismiss_notice(a) is False and s.dismiss_notice(999) is False
     assert [n["id"] for n in s.notices()] == [b]
     assert [n["id"] for n in s.notices(include_dismissed=True)] == [b, a]

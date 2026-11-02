@@ -20,9 +20,9 @@ TITLE_MAX = 80
 BODY_MAX = 1000
 PRIORITIES = ("low", "normal", "urgent")      # three levels; there is no ``high``
 RANK = {p: i for i, p in enumerate(PRIORITIES)}
-# where a notice's push opens: a fixed link of Levain's own, never one the poster chose (a page without a notices view
-# falls back to the board)
-NOTICES_URL = "/?view=notices"
+# where a notice's push opens: a fixed link of Levain's own, never one the poster chose. The sender adds the item's own
+# id (``&n=<id>``, :func:`levain.webpush.center.push_url`), so a tap opens that notification
+NOTICES_URL = "/?view=notifications"
 # a title that opens with a bracketed label would read as another source's label once ours is put in front of it
 _OPENS_WITH_LABEL = re.compile(r"^\s*[\[【〔〖「『［⟦⸨].{0,60}?[\]】〕〗」』］⟧⸩]")
 

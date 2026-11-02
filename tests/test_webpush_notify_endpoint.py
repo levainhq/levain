@@ -146,7 +146,7 @@ def test_200_for_each_decision_under_each_mute_and_table(rig, table, word, prior
         waiting = PushStore(q).held_items()
         assert [h["ping_id"] for h in waiting] == ([pings[0]["id"]] if expect == "held" else [])
         if expect == "held":
-            assert waiting[0]["reason"] == (word or "active") and waiting[0]["url"] == "/?view=notices"
+            assert waiting[0]["reason"] == (word or "active") and waiting[0]["url"] == "/?view=notifications"
 
 
 def test_a_desk_in_use_holds_a_normal_notice_as_active(rig, monkeypatch):
@@ -180,7 +180,7 @@ def test_a_title_may_be_left_out_and_the_label_is_the_tokens(rig):
     {"body": "x", "retry": 30}, {"body": "x", "expire": 60}, {"body": "x", "ack": True}, {"body": "x", "receipt": "r"},
     {"body": "x", "user": "u"}, {"body": "x", "device": "d"}, {"body": "x", "to": "t"}, {"body": "x", "ttl": 5},
     {"body": "x", "timestamp": 1},
-    {"title": "no body"}, {}, [], "text", 7, None,
+    {}, {"priority": "normal"}, [], "text", 7, None,
 ])
 def test_400_for_a_bad_shape_or_any_extra_key(rig, payload):
     src, q = rig
@@ -451,10 +451,10 @@ def _capture_payloads(monkeypatch):
     seen, done = [], threading.Event()
     real = sender.build_payload
 
-    def spy(title, body, tag, url, ping_id):
+    def spy(title, body, tag, url, ping_id, badge=None):
         seen.append({"title": title, "body": body, "tag": tag, "url": url, "ping": ping_id})
         done.set()
-        return real(title, body, tag, url, ping_id)
+        return real(title, body, tag, url, ping_id, badge)
 
     monkeypatch.setattr(sender, "build_payload", spy)
     return seen, done
@@ -472,7 +472,7 @@ def test_a_pushed_notice_goes_out_under_a_fixed_tag_per_source_and_a_fixed_link(
             time.sleep(0.05)
     assert len(seen) == 3
     assert [s["tag"] for s in seen] == ["notify:alpha", "notify:alpha", "notify:beta"]   # one tag per source
-    assert all(s["url"] == "/?view=notices" for s in seen)
+    assert [s["url"] for s in seen] == [f"/?view=notifications&n=n{i}" for i in (1, 2, 3)]   # the item's own id
     assert [s["title"] for s in seen] == ["[alpha] Disk 90%", "[alpha] Disk 95%", "[beta] Down"]
     assert seen[0]["body"] == "root volume"
     assert sender.topic_for("notify:alpha") != sender.topic_for("notify:beta")
@@ -490,7 +490,7 @@ def test_markup_in_a_notice_is_carried_as_the_characters_it_is(rig, monkeypatch)
         assert _post(port, {"title": "<b>hi</b>", "body": text}, token=tok)[0] == 200
         assert done.wait(5)
     assert seen[0]["body"] == text and seen[0]["title"] == "[backup] <b>hi</b>"
-    assert seen[0]["url"] == "/?view=notices"                 # the poster's URL never became the link
+    assert seen[0]["url"] == "/?view=notifications&n=n1"      # the poster's URL never became the link
 
 
 def test_a_held_notice_is_released_by_the_existing_flush_with_a_summary_naming_its_sources(rig, monkeypatch):
@@ -514,11 +514,11 @@ def test_a_held_notice_is_released_by_the_existing_flush_with_a_summary_naming_i
     assert sorted(s["body"] for s in summaries) == ["1 ping held while you were asleep; they follow.",
                                                     "3 notices held: nightly-backup, site-monitor"]
     by_body = {s["body"]: s["url"] for s in summaries}
-    assert by_body["3 notices held: nightly-backup, site-monitor"] == "/?view=notices"
+    assert by_body["3 notices held: nightly-backup, site-monitor"] == "/?view=notifications"
     assert by_body["1 ping held while you were asleep; they follow."] == "/?view=needs"
     notices = [kw for _pid, kw in sent if kw["kind"] == "notify"]
     assert sorted(n["title"] for n in notices) == ["[nightly-backup] ran", "[nightly-backup] ran again", "[site-monitor] down"]
-    assert all(n["url"] == "/?view=notices" and n["ref"].startswith("notify:") for n in notices)
+    assert all(n["url"] == "/?view=notifications" and n["ref"].startswith("notify:") for n in notices)
     assert held.count(q) == 0
 
 
