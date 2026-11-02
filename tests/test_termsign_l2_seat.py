@@ -36,7 +36,7 @@ def human_terminal(monkeypatch, tmp_path):
     monkeypatch.setattr(consent_band, "_ancestors", lambda: iter(PLAIN_TERMINAL))
     monkeypatch.setattr(ts, "_real_key_dir", lambda: tmp_path / "no-real-keys")
 
-    def boom(path):
+    def boom(path, timeout=None):
         raise AssertionError("a test reached the default (real) signer factory")
     monkeypatch.setattr(ts, "default_signer_factory", boom)
 
@@ -85,8 +85,8 @@ def seen(store, env, n=2):
     return qs
 
 
-def real_factory(path):
-    return ckeys.ssh_signer(path, namespace=ts.NAMESPACE)
+def real_factory(path, timeout=None):
+    return ckeys.ssh_signer(path, namespace=ts.NAMESPACE, timeout=timeout)
 
 
 def sidecar(store):
@@ -113,9 +113,9 @@ def test_signed_answer_records_sidecar_and_verifies(store, env, keydir):
     qs = seen(store, env)
     calls = []
 
-    def factory(path):
+    def factory(path, timeout=None):
         calls.append(path)
-        return real_factory(path)
+        return real_factory(path, timeout)
 
     echo = seat(store, env, "1a, 2b because cheaper", keydir, factory)
     assert len(calls) == 1                                                       # ONE signature for the whole line
@@ -151,7 +151,7 @@ def test_free_text_entry_is_signed_as_text(store, env, keydir):
 # --- the six reasons ----------------------------------------------------------------------------------
 
 def _raises(msg):
-    def factory(path):
+    def factory(path, timeout=None):
         def signer(message):
             raise KeyError_(msg)
         return "SHA256:" + "A" * 43, signer
@@ -188,7 +188,7 @@ def test_each_reason_records_the_answer_unsigned_and_the_echo_says_why(store, en
 def test_a_signer_that_raises_anything_never_blocks_the_answer(store, env, keydir):
     seen(store, env, 1)
 
-    def factory(path):
+    def factory(path, timeout=None):
         raise RuntimeError("boom\nsecond line")
     echo = seat(store, env, "1a", keydir, factory)
     assert recorded(store) == [(1, "fix")]
@@ -221,7 +221,7 @@ def test_not_set_up_is_said_once_per_viewer(store, env, tmp_path):
 def test_relay_turn_is_neither_parsed_nor_signed(store, env, keydir):
     seen(store, env, 1)
 
-    def factory(path):
+    def factory(path, timeout=None):
         raise AssertionError("signed a relay turn")
     for text, environ in (("1a", {**env, "LEVAIN_TURN": "relay"}), ("levain: an answer was recorded 1a", env)):
         assert seat(store, env, text, keydir, factory, environ=environ) == ""
@@ -257,8 +257,8 @@ def test_a_row_that_moved_after_the_message_is_refused_never_signed_over(store, 
         return got + "-moved" if state["moved"] and q.n == 2 else got
     monkeypatch.setattr(band_view, "subject_version", version)
 
-    def factory(path):
-        fp, signer = real_factory(path)
+    def factory(path, timeout=None):
+        fp, signer = real_factory(path, timeout)
 
         def moved(message):
             sig = signer(message)
@@ -286,8 +286,8 @@ def test_signing_holds_no_store_lock_and_the_write_gets_its_own_bound(store, env
     seen(store, env, 1)
     probes = []
 
-    def factory(path):
-        fp, signer = real_factory(path)
+    def factory(path, timeout=None):
+        fp, signer = real_factory(path, timeout)
 
         def slow(message):
             c = sqlite3.connect(store.path, timeout=0.05, isolation_level=None)
@@ -311,8 +311,8 @@ def test_the_hook_renders_after_a_slow_sign_and_names_the_state(store, env, keyd
     seen(store, env, 2)
     monkeypatch.setattr(ts, "_real_key_dir", lambda: keydir)
 
-    def factory(path):
-        fp, signer = real_factory(path)
+    def factory(path, timeout=None):
+        fp, signer = real_factory(path, timeout)
 
         def slow(message):
             time.sleep(0.4)
@@ -494,8 +494,8 @@ def test_the_render_bound_is_rearmed_after_any_sign_step(store, env, keydir, mon
     monkeypatch.setattr(ts, "_real_key_dir", lambda: keydir)
     monkeypatch.setattr(band_view, "HOOK_BUSY_MS", 1000)
 
-    def factory(path):
-        fp, signer = real_factory(path)
+    def factory(path, timeout=None):
+        fp, signer = real_factory(path, timeout)
 
         def slow(message):
             time.sleep(0.5)                                                        # half the bound, not all of it

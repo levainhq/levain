@@ -40,7 +40,7 @@ def _no_real_key(tmp_path, monkeypatch):
     """The real home's key directory and the real signer are unreachable from every test."""
     monkeypatch.setattr(ts, "_real_key_dir", lambda: tmp_path / "no-real-keys")
 
-    def boom(path):
+    def boom(path, timeout=None):
         raise AssertionError("a test reached the default (real) signer factory")
     monkeypatch.setattr(ts, "default_signer_factory", boom)
 
@@ -264,7 +264,7 @@ def test_status_not_enrolled_and_enrolled(tmp_path):
 # --- sign: every reason ------------------------------------------------------------------------------
 
 def _factory(exc=None, signature="SIG"):
-    def make(path):
+    def make(path, timeout=None):
         def signer(message):
             if exc is not None:
                 raise exc
@@ -274,7 +274,7 @@ def _factory(exc=None, signature="SIG"):
 
 
 def test_sign_remote_never_looks_for_a_key():
-    def never(path):
+    def never(path, timeout=None):
         raise AssertionError("looked")
     out = ts.sign(_msg(), remote=True, signer_factory=never)
     assert (out.state, out.reason) == ("unsigned", "remote")
@@ -318,29 +318,53 @@ def test_sign_refuses_oversize_message(tmp_path):
     assert (out.state, out.reason) == ("unsigned", "signer-error")
 
 
-def test_sign_narrows_and_restores_the_ssh_signer_bound(tmp_path):
+def test_sign_hands_its_bound_to_the_factory_and_leaves_the_global_alone(tmp_path):
     d = tmp_path / "keys"
     _plain_key(d)
-    seen = []
+    got, seen_global = [], []
 
-    def make(path):
+    def make(path, timeout=None):
+        got.append(timeout)
+
         def signer(message):
-            seen.append(ckeys._SIGN_TIMEOUT)
+            seen_global.append(ckeys._SIGN_TIMEOUT)
             return "SIG"
         return "SHA256:" + "A" * 43, signer
     before = ckeys._SIGN_TIMEOUT
     out = ts.sign(_msg(), key_dir=d, signer_factory=make)
-    assert out.state == "signed" and seen == [ts.SIGN_BOUND_S] and ckeys._SIGN_TIMEOUT == before
-    ts.sign(_msg(), key_dir=d, signer_factory=_factory(KeyError_("x")))
-    assert ckeys._SIGN_TIMEOUT == before            # restored on the failure path too
+    assert out.state == "signed" and got == [ts.SIGN_BOUND_S] and seen_global == [before]
+    ts.sign(_msg(), key_dir=d, signer_factory=make, bound_s=3.5)
+    assert got[-1] == 3.5 and ckeys._SIGN_TIMEOUT == before
+
+
+def test_concurrent_signs_with_different_bounds_do_not_see_each_other(tmp_path):
+    import threading
+    d = tmp_path / "keys"
+    _plain_key(d)
+    both_in = threading.Barrier(2, timeout=5)
+    seen = {}
+
+    def make(path, timeout=None):
+        def signer(message):
+            both_in.wait()                       # both signs are inside the signer at once
+            seen[timeout] = ckeys._SIGN_TIMEOUT
+            return "SIG"
+        return "SHA256:" + "A" * 43, signer
+    outs = []
+    ts_ = [threading.Thread(target=lambda b=b: outs.append(ts.sign(_msg(), key_dir=d, signer_factory=make, bound_s=b)))
+           for b in (2.0, 7.0)]
+    [t.start() for t in ts_]
+    [t.join(10) for t in ts_]
+    assert [o.state for o in outs] == ["signed", "signed"]
+    assert set(seen) == {2.0, 7.0} and set(seen.values()) == {ckeys._SIGN_TIMEOUT}
 
 
 def test_default_factory_is_ssh_signer_in_our_namespace(monkeypatch):
     monkeypatch.undo()
     calls = []
     monkeypatch.setattr(ckeys, "ssh_signer", lambda p, **kw: calls.append((p, kw)) or ("fp", None))
-    assert ts.default_signer_factory(Path("/k")) == ("fp", None)
-    assert calls == [(Path("/k"), {"namespace": ts.NAMESPACE})]
+    assert ts.default_signer_factory(Path("/k"), 4.0) == ("fp", None)
+    assert calls == [(Path("/k"), {"namespace": ts.NAMESPACE, "timeout": 4.0})]
 
 
 def test_is_remote():
@@ -356,7 +380,7 @@ def signed_world(tmp_path):
     d = tmp_path / "keys"
     path = _plain_key(d)
     message = _msg()
-    out = ts.sign(message, key_dir=d, signer_factory=lambda p: ckeys.ssh_signer(p, namespace=ts.NAMESPACE))
+    out = ts.sign(message, key_dir=d, signer_factory=lambda p, t: ckeys.ssh_signer(p, namespace=ts.NAMESPACE, timeout=t))
     assert out.state == "signed", out
     return path, message, out, _signers(path)
 
@@ -649,6 +673,6 @@ def test_status_never_raises(tmp_path, monkeypatch):
 def test_sign_never_raises(tmp_path):
     d = tmp_path / "keys"
     _plain_key(d)
-    for factory in (_factory(ValueError("odd")), _factory(signature=None), lambda p: None):
+    for factory in (_factory(ValueError("odd")), _factory(signature=None), lambda p, t: None):
         out = ts.sign(_msg(), key_dir=d, signer_factory=factory)
         assert (out.state, out.reason) == ("unsigned", "signer-error"), out
