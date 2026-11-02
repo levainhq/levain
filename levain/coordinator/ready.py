@@ -492,6 +492,65 @@ def list_ready(store: CoordStore | Path | str, *, all: bool = False, repo: str |
     return out
 
 
+SEATS_SOURCE = "seats"
+
+
+def _seat_rows(conn: sqlite3.Connection) -> builtins.list:
+    """The live seats (SCHEMA section 5's roster projection) from the launch rows the coordinator already keeps: every launch
+    whose latest event is ``active``. ``token`` is the launch id, ``repo`` the launch's directory name (``levain`` when it has
+    none), ``name`` says harness, role and thread. A store before the launch tables reads as no seats."""
+    from levain.coordinator import lease
+
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'launch_events'").fetchone() is None:
+        return []
+    return [{"token": ln.launch_id, "repo": (os.path.basename((ln.cwd or "").rstrip("/")) or "levain"),
+             "name": " ".join([ln.harness, ln.role, *ln.threads])} for ln in lease._in_state(conn, "active")]
+
+
+def snapshot(store: CoordStore | Path | str, *, sources: Mapping[str, Any] | None = None, generated: str | None = None) -> dict:
+    """ONE consistent read of everything the board draws: :func:`list_ready` (every category) plus the journal's records
+    (``journal``, store order) plus the live seats as ``running`` projections (SCHEMA section 5), all in ONE read transaction, so a
+    card's journal line is never newer than its column. A source that cannot be read is named in ``unreadable`` (the seat roster
+    as ``seats``), never an empty column. No coordinator needed."""
+    st = _store_of(store)
+    merged: dict[str, Any] = dict(sources or {})
+    given = merged.pop("unreadable", ())
+    unreadable = [given] if isinstance(given, str) else [*given]
+    rows: builtins.list = []
+    records: builtins.list = []
+    seats: builtins.list = []
+    cols = ", ".join(_JOURNAL_FIELDS)
+
+    def q(conn: sqlite3.Connection) -> tuple:
+        cur = _current(conn), _diverged(conn)
+        recs = ([dict(zip(_JOURNAL_FIELDS, r)) for r in conn.execute(f"SELECT {cols} FROM ready_journal ORDER BY gseq")]
+                if _lifecycle_present(conn) else [])
+        try:
+            seat = _seat_rows(conn)
+        except (sqlite3.Error, ValueError, CoordError):
+            seat = None
+        return cur[0], cur[1], recs, seat
+
+    try:
+        rows, diverged, records, seat_rows = _read(st, q)
+        unreadable.extend(d.tag for d in diverged)
+        if seat_rows is None:
+            unreadable.append(SEATS_SOURCE)
+        else:
+            seats = seat_rows
+    except StoreAbsent:
+        if not _absent(st):
+            unreadable.append(STORE_SOURCE)
+    except _READ_ERRORS:
+        unreadable.append(STORE_SOURCE)
+    merged["store"] = [*rows, *(merged.get("store") or ())]
+    merged["seats"] = [*seats, *(merged.get("seats") or ())]
+    stamp = generated or datetime.now().astimezone().isoformat(timespec="seconds")
+    out = derive(merged, generated=stamp, unreadable=unreadable)
+    out["journal"] = records
+    return out
+
+
 list = list_ready       # the contract's verb (`ready.py list`); nothing in this module calls the builtin by name
 
 

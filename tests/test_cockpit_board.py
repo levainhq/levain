@@ -102,12 +102,29 @@ def test_an_unreadable_band_is_reported_with_the_hint(filled):
     assert "band" in out["unreadable"]
 
 
-def test_an_unreadable_journal_is_reported_and_cards_stay(filled, monkeypatch):
-    def boom(*a, **k):
-        raise OSError("gone")
-    monkeypatch.setattr(ready, "journal", boom)
+def test_the_cards_and_their_journal_lines_come_from_one_read_transaction(filled, monkeypatch):
+    """The journal line is never newer than its column: items and journal are ONE snapshot read, not two."""
+    reads = []
+    real = ready._read
+    monkeypatch.setattr(ready, "_read", lambda st, q: reads.append(q) or real(st, q))
     out = board.build(filled, QuestionStore(filled))
-    assert "journal" in out["unreadable"] and _cards(out)["levain:a"][1]["journal"] is None
+    assert len(reads) == 1 and out["unreadable"] == []
+    col, card = _cards(out)["levain:a"]
+    assert col == "running" and card["journal"]["who"] == "seat-9" and card["journal"]["to_category"] == "running"
+
+
+def test_a_live_launch_is_a_running_seat_card_with_no_journal_line_and_an_ended_one_is_not(filled):
+    """SCHEMA section 5: one `running` projection per live seat (`seat:<token>`), read-only, never writable."""
+    st = CoordStore(filled)
+    tok = st.coord_take()
+    live = st.launch_request(tok, harness="claude", role="coordinator", cwd=str(filled / "levain-wt"))
+    assert st.launch_activate(live.launch_id, harness_session_id="sess-live")[0]
+    out = board.build(filled, QuestionStore(filled))
+    col, card = _cards(out)[f"seat:{live.launch_id}"]
+    assert col == "running" and card["journal"] is None and card["repo"] == "levain-wt" and "claude coordinator" in card["title"]
+    assert out["unreadable"] == []
+    with pytest.raises(Exception):
+        ready.move(st, tok, f"seat:{live.launch_id}", to="done", who="desk", why="no.")     # a projection is never writable
 
 
 def test_build_writes_nothing(filled):
