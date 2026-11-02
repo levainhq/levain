@@ -53,12 +53,15 @@ def test_consent_equals_push_and_the_hold_is_zero_exactly_when_false(tmp_path, c
         idle = (lambda r=reading: r)
         pushes = presence.should_push(q, "consent", idle=idle, suggest=False).push
         to_devices, why = intent.approvals_to_devices(q, idle=idle)
+        blind = intent.approvals_route(q, idle=idle)[2]
         hold = mod.away_hold(st, agent, idle, queue_dir=q)
         away_now = mod.effective_away(st, idle, queue_dir=q)
         where = f"{label} / reading {reading}"
         assert to_devices == pushes, where
-        assert (hold > 0) == pushes, where
-        assert away_now[0] == pushes and away_now[1] == "intent", where
+        # the one named divergence: a follow that pushes only for want of a reading does not hold (L3 r1 complement 1)
+        assert blind == (pushes and reading is None and label in ("standing follow/10m", "follow 15m", "lets approvals")), where
+        assert (hold > 0) == (pushes and not blind), where
+        assert away_now[0] == (pushes and not blind) and away_now[1] == "intent", where
         assert hold in (0.0, auto_away.DEFAULT_HOLDS[agent]), where   # the length is per agent, never presence
     # a coverage check that the matrix is not all one answer
     outcomes = {intent.approvals_to_devices(q, idle=lambda: r)[0] for r in READINGS}
@@ -136,3 +139,51 @@ def test_the_hook_entry_points_hold_on_the_record_and_release_when_it_changes(tm
     assert not t.is_alive() and out.getvalue() == ""
     state, note = _row(q)
     assert state == "withdrawn" and note.startswith("away mode ended (follow: input at the laptop just now)")
+
+
+@pytest.mark.parametrize("setup", [lambda q: intent.apply_settings(q, devices="off"),
+                                   lambda q: intent.apply_settings(q, lets_through="nothing")])
+def test_a_standing_mark_that_holds_an_approval_also_pushes_it(tmp_path, cockpit, monkeypatch, setup):
+    """L3 r1 codex HIGH, reproduced (R1): a signed away mark held the request (away_state: word) while the consent ping
+    read should_push alone, so at devices off / lets nothing the phone never heard of what the hook waited on. The
+    consent ping now reads the one mark rule the hold reads (auto_away.approval_push)."""
+    import levain.webpush as webpush
+    from levain.webpush import sender
+
+    q = _scratch(tmp_path, cockpit)
+    setup(q)
+    spawned = []
+    monkeypatch.setattr(webpush, "live", lambda qd: True)
+    monkeypatch.setattr(sender, "spawn", lambda qd, **kw: spawned.append(kw) or True)
+    away.set_away(q, "claude_code", True)
+    marked = away.settings(q, "claude_code")
+    assert cc.away_hold(marked, "claude_code", lambda: 2.0, queue_dir=q) > 0          # the hook holds it ...
+    assert presence.should_push(q, "consent", idle=lambda: 2.0, suggest=False).push is False   # ... the record alone says no
+    assert cc.notify(marked, "levain: x", cwd=q, ref="request:1") is True               # ... and the approval goes
+    assert spawned[-1]["push"] is True and spawned[-1]["hold"] is None
+    # a non-approval ping under the mark still reads the record; an unmarked approval reads the record
+    plain = away.settings(q, "codex")
+    assert not plain.away_marked
+    assert cc.notify(plain, "levain: y", cwd=q, ref="request:2") is False and spawned[-1]["push"] is False
+    assert auto_away.approval_push(marked, q, "notify", idle=lambda: 2.0, suggest=False).push is False
+
+
+def test_no_laptop_reading_pushes_but_never_holds_and_the_line_names_it(tmp_path, cockpit, monkeypatch):
+    """L3 r1 complement MED #1, reproduced (R3): with no laptop input reading (Linux, an ioreg failure) follow reads as
+    devices on, so every approval was held up to the hold with nothing measured showing him away. The push stays
+    fail-open; the hold fails to the agent's own dialog, and the describe line's Approvals clause says so. A fresh remote
+    record (a measurement) still holds, as does an explicit devices on."""
+    q = _scratch(tmp_path, cockpit)
+    blind = lambda: None   # noqa: E731
+    st = away.settings(q, "codex")
+    assert presence.should_push(q, "consent", idle=blind, suggest=False).push is True
+    assert cx.away_hold(st, "codex", blind, queue_dir=q) == 0.0
+    assert cx.effective_away(st, blind, queue_dir=q)[:2] == (False, "intent")
+    assert ("Approvals: the agent's own dialog (no laptop input reading, so nothing measured shows you away; the ping "
+            "still reaches your devices).") in intent.describe_line(q, idle=blind)
+    presence.note_remote_activity(q, "remote-terminal")
+    assert cx.away_hold(st, "codex", blind, queue_dir=q) == auto_away.DEFAULT_HOLDS["codex"]
+    assert "Approvals:" not in intent.describe_line(q, idle=blind)
+    (q / "webpush" / presence.REMOTE_NAME).unlink()
+    intent.apply_settings(q, devices="on")
+    assert cx.away_hold(st, "codex", blind, queue_dir=q) == auto_away.DEFAULT_HOLDS["codex"]

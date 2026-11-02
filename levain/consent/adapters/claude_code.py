@@ -1323,7 +1323,8 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     a queue directory, the ping is also written to the notification record (``kind`` and ``ref``, ``request:<id>``
     or ``question:<n>``, name it there) by a detached child, with whether the notify command started, and that
     same child pushes it to each paired phone when one with pings on was live at that moment and
-    :func:`levain.webpush.presence.should_push` says so (a ping it holds is recorded and queued for the phone,
+    :func:`levain.consent.auto_away.approval_push` says so (``should_push``, except that an approval under a standing
+    signed away mark always goes: the hook is holding it for that answer) (a ping it holds is recorded and queued for the phone,
     :mod:`levain.webpush.held`, not pushed). With no ``cwd`` there
     is no queue directory, so nothing is recorded and no push is sent.
     True when the notify command or a push started; False when neither is configured or neither could start (a
@@ -1333,10 +1334,13 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     pushed = False
     if cwd is not None:
         try:
-            from levain.webpush import live, presence, sender
+            from levain.consent.auto_away import approval_push
+            from levain.webpush import live, sender
 
             paired = live(cwd)
-            said = presence.should_push(cwd, kind) if paired else None
+            # the mark-aware decider: a standing signed away mark holds the request for a signed answer, so its
+            # approval goes to the devices whatever the record says (the hold and the push read one mark rule)
+            said = approval_push(settings, cwd, kind) if paired else None
             phone = said is not None and said.push
             # a ping the rule holds waits in the held queue under the word that muted it, else as "active"
             hold = None if said is None or said.push else (said.by or "active")

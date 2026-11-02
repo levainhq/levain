@@ -19,7 +19,9 @@ stays on file, inert, until the next write replaces it.
 One lock (the presence lock, ``<queue>/webpush/.presence.lock``), one event stream (every write leaves one row in
 ``presence.log.jsonl``), one decider (:func:`should_push` in :mod:`levain.webpush.presence` calls :func:`_core` here) and one
 sentence (:func:`describe_line`), printed verbatim by every surface. Consent asks the same decider
-(:func:`approvals_to_devices`), so a push and a hold cannot diverge.
+(:func:`approvals_route`), so a push and a hold diverge in one named case only: a ``follow`` that pushes for want of a
+laptop input reading does not hold (the line's ``Approvals:`` clause says so). A write against a record that cannot be
+read is refused, never replaced.
 
 Stdlib only.
 """
@@ -41,7 +43,7 @@ from levain.webpush.presence import (ACTIVE_WINDOW_SECS, AWAY_GRACE_SECS, COORDI
 
 __all__ = ["VERSION", "FILE_NAME", "BACKUP_DIR", "DEVICES", "LETS", "LETS_CLASSES", "FOLLOW_DEFAULT", "FOLLOW_MIN",
            "FOLLOW_MAX", "PRESET_TABLE", "overlay_active", "overlay_ended", "devices_on_now", "decide", "read", "view",
-           "describe_line", "approvals_to_devices", "apply_preset", "apply_settings", "read_changes", "migrate",
+           "describe_line", "approvals_to_devices", "approvals_route", "apply_preset", "apply_settings", "read_changes", "migrate",
            "unmigrate", "legacy_word", "from_legacy"]
 
 VERSION = 1
@@ -359,6 +361,30 @@ def approvals_to_devices(queue_dir: Path | str | None, *, now: float | None = No
     return d.push, d.why
 
 
+def _blind(s: dict, eff: dict) -> bool:
+    """Whether a ``follow`` decision in sample ``s`` under settings ``eff`` reads as "devices on" ONLY because there is no
+    laptop input reading (no fresh remote record either): the rule's fail-open, not a measurement that he is away."""
+    return eff["devices"] == "follow" and s["reading"] is None and _remote_fresh(s["remote"], s["now"]) is None
+
+
+def approvals_route(queue_dir: Path | str | None, *, now: float | None = None,
+                    idle: Callable[[], float | None] | None = None) -> tuple[bool, str, bool]:
+    """``(to_devices, why, blind)``: :func:`approvals_to_devices` from the same one sample, plus ``blind``, true when the
+    record sends approvals to the devices only because ``follow`` has no laptop input reading (:func:`_blind`). The push
+    keeps that fail-open (a ping he did not need costs one notification); consent's HOLD does not (it would block the
+    agent on nothing measured), so consent reads ``blind`` and leaves the agent's own dialog to ask. A fault is
+    ``(True, why, False)``, as :func:`presence.should_push` reads it."""
+    at = time.time() if now is None else now
+    try:
+        d, _source, s = _core(queue_dir, "consent", at, idle, False)
+    except Exception:  # noqa: BLE001 - the same fault rule as should_push
+        return True, presence._FAULT, False
+    if not d.push or s["rec"]["status"] == "fault":
+        return d.push, d.why, False
+    eff = _eff(s["rec"], at, s["reading"], s["msg_at"])[0]
+    return True, d.why, _blind(s, eff)
+
+
 # --------------------------------------------------------------------------------------------------- the describe line
 def _base_text(base: dict) -> str:
     d = base["devices"]
@@ -390,14 +416,15 @@ def _who_text(ov: dict | None) -> str:
     return f" Set by {who} from your words: \"{ov['said']}\"{flag}."
 
 
-def _approvals_note(queue_dir: Path | str | None, to_devices: bool | None = None) -> str | None:
-    """The ``Approvals:`` clause, from consent's side (the signed away mark, a key that can sign). Consent provides
-    ``levain.consent.auto_away.approvals_note(queue_dir)``; until it does, or on any fault, there is none."""
+def _approvals_note(queue_dir: Path | str | None, to_devices: bool | None = None, *, blind: bool = False) -> str | None:
+    """The ``Approvals:`` clause, from consent's side (the signed away mark, a key that can sign, and ``blind``: the record
+    sends approvals to the devices only for want of a laptop reading, where consent's hold does not follow it). Consent
+    provides ``levain.consent.auto_away.approvals_note(queue_dir)``; until it does, or on any fault, there is none."""
     try:
         from levain.consent import auto_away
 
         fn = getattr(auto_away, "approvals_note", None)
-        return fn(queue_dir, to_devices=to_devices) if fn is not None else None
+        return fn(queue_dir, to_devices=to_devices, blind=blind) if fn is not None else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -485,7 +512,7 @@ def view(queue_dir: Path | str | None, *, now: float | None = None, idle: Callab
     if not st["fault"]:
         # ONE sample: whether the record itself sends approvals to the devices, so consent's clause names only a difference.
         to_dev = _decide(at, s["rec"], s["reading"], "approval", s["remote"], s["msg_at"])[0].push
-        approvals = _approvals_note(queue_dir, to_dev)
+        approvals = _approvals_note(queue_dir, to_dev, blind=to_dev and _blind(s, st["eff"]))
     ov = None if st["fault"] else st["ov"]
     window = s["rec"]["base"]["follow_after"] if st["fault"] else st["eff"]["follow_after"]
     out = {"state": d.state, "pushing": d.push, "reason": d.why, "source": source,
@@ -556,13 +583,27 @@ def _prior_for_log(rec: dict) -> dict:
 
 
 def _current(queue_dir: Path | str, ts: float) -> dict:
-    """The record to write against, under the lock. Old files with no ``intent.json`` are migrated first (with a backup, so
-    ``levain ping migrate --undo`` restores them): a write never layers a second truth over stale files."""
+    """The record to plan a write against, under the lock: :func:`read`'s result (a ``projection`` stays one until
+    :func:`_materialize`). A ``fault`` (an ``intent.json`` that is corrupt, unreadable or of another version) is REFUSED
+    with :class:`PresenceError`, never replaced by the default base: a write would silently destroy what is on file."""
     rec = read(queue_dir, ts)
-    if rec["status"] == "projection":
-        _migrate_locked(queue_dir, ts, via="first write")
-        rec = read(queue_dir, ts)
+    if rec["status"] == "fault":
+        raise PresenceError(f"intent.json is there but cannot be read ({rec['reason']}): nothing was changed; repair it, "
+                            "or move it aside (no intent.json reads as the default, or as your old files)")
     return rec
+
+
+def _materialize(queue_dir: Path | str, rec: dict, ts: float) -> dict:
+    """``rec`` as a file record, just before a write that has already been validated and planned: old files with no
+    ``intent.json`` are migrated first (with a backup, so ``levain ping migrate --undo`` restores them), so a write never
+    layers a second truth over stale files, and a refused write migrates nothing."""
+    if rec["status"] != "projection":
+        return rec
+    _migrate_locked(queue_dir, ts, via="first write")
+    got = read(queue_dir, ts)
+    if got["status"] != "file":
+        raise PresenceError("the migration left no readable intent.json: nothing was changed")
+    return got
 
 
 def _live(queue_dir: Path | str, ts: float, idle: Callable[[], float | None] | None, rec: dict) -> tuple[float | None, float | None]:
@@ -606,9 +647,9 @@ def apply_preset(queue_dir: Path | str, preset: str, *, duration: str | None = N
     held and may refuse; ``after`` runs under the same hold. Pings the new record frees are due now: the CALLER starts the flush
     after the write (``held.flush_if_due(queue_dir, throttle=False)``, outside the lock), as ``levain ping`` and flow's
     ``phone_bridge`` do; a library write never spawns a process."""
-    ts = time.time() if now is None else now
     strict = by is not None or wait is not None or precheck is not None
     with presence._locked(queue_dir, strict=strict, wait=wait):
+        ts = time.time() if now is None else now   # after the lock: a long wait must not date the write in the past
         if precheck is not None:
             try:
                 precheck()
@@ -625,7 +666,14 @@ def apply_preset(queue_dir: Path | str, preset: str, *, duration: str | None = N
 
 
 def _apply_preset_locked(queue_dir, word, duration, ts, by, said, match, via, idle) -> None:
-    rec = _current(queue_dir, ts)
+    try:
+        rec = _current(queue_dir, ts)
+    except PresenceError as e:
+        row = presence._log_row(ts, word, duration, by, said, None)
+        if via:
+            row["via"] = presence._clean(via, presence._FIELD_MAX)
+        presence._log_best_effort(queue_dir, {**row, "outcome": "refused", "why": presence._clean(str(e), presence._WHY_MAX)})
+        raise
     prior = _prior_for_log(rec)
     row = presence._log_row(ts, word, duration, by, said, prior)
     if via:
@@ -637,6 +685,8 @@ def _apply_preset_locked(queue_dir, word, duration, ts, by, said, match, via, id
             row["said_at"] = ev[1]
     try:
         action, new, why = _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle)
+        if action == "write" or (action == "clear" and rec["overlay"] is not None):
+            rec = _materialize(queue_dir, rec, ts)   # validated and planned against the projection: only now migrate
     except PresenceError as e:
         presence._log_best_effort(queue_dir, {**row, "outcome": "refused", "why": presence._clean(str(e), presence._WHY_MAX)})
         raise
@@ -722,14 +772,14 @@ def apply_settings(queue_dir: Path | str, *, devices: str | None = None, follow_
     ``until="switch"`` (the default) writes the BASE (the standing default) and clears the overlay: "until I switch it" is
     exactly what writing base means. ``until="input"`` or a duration writes an overlay with no preset, copying the effective
     settings with the changed fields."""
-    ts = time.time() if now is None else now
     word = _settings_word(devices, follow_after, lets_through, until)
     if by is not None:
         who = "the coordinator" if isinstance(by, dict) and by.get("role") == "coordinator" else "a seat"
         msg = (f"the presence settings are the operator's own: {who} may not change them "
                "(the operator sets them himself, from a terminal outside any agent session)")
         with presence._locked(queue_dir, strict=False):
-            presence._log_best_effort(queue_dir, {**presence._log_row(ts, word, None, by, None, None), "outcome": "refused", "why": msg})
+            t = time.time() if now is None else now
+            presence._log_best_effort(queue_dir, {**presence._log_row(t, word, None, by, None, None), "outcome": "refused", "why": msg})
         raise PresenceError(msg)
     if devices is None and follow_after is None and lets_through is None:
         raise PresenceError("set at least one of devices, follow_after or lets_through")
@@ -747,26 +797,34 @@ def apply_settings(queue_dir: Path | str, *, devices: str | None = None, follow_
             raise PresenceError("follow_after runs from 1 minute to 24 hours")
     strict = wait is not None or precheck is not None
     with presence._locked(queue_dir, strict=strict, wait=wait):
+        ts = time.time() if now is None else now   # after the lock: a long wait must not date the write in the past
+        refused = lambda e: presence._log_best_effort(   # noqa: E731
+            queue_dir, {**presence._log_row(ts, word, None, None, None, None), "outcome": "refused",
+                        "why": presence._clean(str(e), presence._WHY_MAX),
+                        **({"via": presence._clean(via, presence._FIELD_MAX)} if via else {})})
         if precheck is not None:
             try:
                 precheck()
             except PresenceError as e:
-                presence._log_best_effort(queue_dir, {**presence._log_row(ts, word, None, None, None, None), "outcome": "refused",
-                                                      "why": presence._clean(str(e), presence._WHY_MAX),
-                                                      **({"via": presence._clean(via, presence._FIELD_MAX)} if via else {})})
+                refused(e)
                 raise
-        rec = _current(queue_dir, ts)
+        try:
+            end = _until_arg(until, ts)   # validated before anything is read for writing, so a refusal migrates nothing
+            rec = _current(queue_dir, ts)
+        except PresenceError as e:
+            refused(e)
+            raise
         row = presence._log_row(ts, word, None, None, None, _prior_for_log(rec))
         if via:
             row["via"] = presence._clean(via, presence._FIELD_MAX)
         try:
-            end = _until_arg(until, ts)
             reading, msg_at = _live(queue_dir, ts, idle, rec)
             standing = rec["overlay"] is not None and overlay_active(rec, ts, _last_input(ts, reading), msg_at)
             cur = ({k: v for k, v in rec["overlay"].items() if k in ("devices", "follow_after", "lets_through")}
                    if standing else {k: rec["base"][k] for k in ("devices", "follow_after", "lets_through")})
             changed = {k: v for k, v in (("devices", devices), ("follow_after", None if follow is None else _intify(follow)),
                                          ("lets_through", lets_through)) if v is not None}
+            rec = _materialize(queue_dir, rec, ts)   # validated and planned against the projection: only now migrate
             if end is None:
                 base = {**rec["base"], **changed, "ts": ts, "via": via or "cli"}
                 new = {"base": base, "overlay": None}

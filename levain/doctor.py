@@ -3836,11 +3836,11 @@ def _check_consent_wiring(install: Path, hooks: Any, adapter: str) -> list[Check
         out.append(CheckResult(f"{label} away mode", True, detail, warn=mark.leave_refusal is not None))
     else:
         from levain.consent.auto_away import DEFAULT_HOLDS
-        from levain.webpush import intent
 
-        # the presence record decides (DESIGN §4): an approval is held for a signed answer exactly when it would reach
-        # the devices; the settings file's away words are not read (a file word that disagrees is named below)
-        push, why = intent.approvals_to_devices(qdir)
+        # the presence record decides (DESIGN §4): what the hook itself reads (effective_away: held for a signed answer
+        # when an approval reaches the devices AND an enrolled key could sign it, and not on a blind follow); the
+        # settings file's away words are not read (a file word that disagrees is named below)
+        push, _source, why = claude_code.effective_away(settings, queue_dir=qdir)
         hold = int(min(settings.away_hold_seconds if settings.away_hold_seconds > 0 else DEFAULT_HOLDS[mod.AGENT],
                        max(0.0, DEFAULT_MAX_HOLD - CLEANUP_RESERVE)))
         ignored = (f"; the settings file's away word ({'on' if settings.away_mode else 'off'}) is not read now"

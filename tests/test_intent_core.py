@@ -138,3 +138,70 @@ def test_migration_maps_a_word_and_a_route_to_one_record_is_idempotent_and_undoe
     assert intent.describe_line(q, now=NOW, idle=_idle(5.0)).startswith("Pings now: your devices (set for a while).")
     assert intent.unmigrate(q, now=NOW + 2)["status"] == "undone"
     assert {p.name: p.read_bytes() for p in d.glob("*.json")} == snap and not (d / intent.FILE_NAME).exists()
+
+
+def test_a_record_that_cannot_be_read_refuses_every_write_and_stays_byte_identical(tmp_path):
+    """L3 r1 codex HIGH, reproduced (R2): a newer-version (or corrupt) intent.json was replaced by the default base on the
+    next write (`levain ping away` destroyed it). Every write path refuses it now, with a repair pointer, as migrate does."""
+    import pytest
+
+    q = tmp_path
+    (q / "webpush").mkdir(mode=0o700)
+    for raw in (json.dumps({"version": 2, "base": {"devices": "off"}, "future": True}).encode(), b"{not json"):
+        (q / "webpush" / intent.FILE_NAME).write_bytes(raw)
+        for write in (lambda: intent.apply_preset(q, "away", now=NOW, idle=_idle(5.0)),
+                      lambda: intent.apply_preset(q, "back", now=NOW, idle=_idle(5.0)),
+                      lambda: intent.apply_settings(q, devices="on", now=NOW, idle=_idle(5.0)),
+                      lambda: intent.apply_settings(q, devices="off", until="30m", now=NOW, idle=_idle(5.0)),
+                      lambda: presence.set_word(q, "desk", now=NOW)):
+            with pytest.raises(presence.PresenceError, match="cannot be read.*repair it, or move it aside"):
+                write()
+            assert _file(q) == raw
+
+
+def test_a_refused_write_on_an_unmigrated_install_migrates_nothing(tmp_path):
+    """L3 r1 codex MED, reproduced (R6): an invalid preset or until on an install with only the old files refused, but had
+    already migrated them (intent.json written, the old files moved). The call is validated and planned against the
+    projection first; only a write that will happen migrates."""
+    import pytest
+
+    q = tmp_path
+    d = q / "webpush"
+    d.mkdir(mode=0o700)
+    old = json.dumps({"word": "away", "ts": NOW - 400})
+    (d / "presence.json").write_text(old)
+    for refused in (lambda: intent.apply_preset(q, "napping", now=NOW, idle=_idle(5.0)),
+                    lambda: intent.apply_preset(q, "away", duration="30m", now=NOW, idle=_idle(5.0)),
+                    lambda: intent.apply_settings(q, devices="on", until=5, now=NOW, idle=_idle(5.0))):
+        with pytest.raises(presence.PresenceError):
+            refused()
+        assert not (d / intent.FILE_NAME).exists() and (d / "presence.json").read_text() == old
+        assert not (d / intent.BACKUP_DIR).exists()
+    intent.apply_preset(q, "quiet", duration="30m", now=NOW, idle=_idle(5.0))   # a valid write still migrates first
+    assert _doc(q)["overlay"]["preset"] == "quiet" and not (d / "presence.json").exists()
+    assert len(list((d / intent.BACKUP_DIR).iterdir())) == 1
+
+
+def test_a_tap_alias_never_writes_the_base_nor_replaces_a_standing_preset(tmp_path):
+    """L3 r1 complement MED #2 = deepseek MED (two lineages), reproduced (R4): from a tap token `desk` rewrote the base
+    (the operator's standing devices off became follow, for good) and `devices` replaced a standing sleep. A tap alias is
+    a bounded overlay now (desk: a day, the retired route's default), refused over a standing preset; the operator's own
+    path keeps the base write."""
+    import pytest
+
+    q = tmp_path
+    intent.apply_settings(q, devices="off", now=NOW, idle=_idle(5.0))
+    presence.set_word(q, "desk", now=NOW, tap=True)
+    doc = _doc(q)
+    assert doc["base"]["devices"] == "off"
+    assert doc["overlay"]["devices"] == "follow" and doc["overlay"]["until"] == {"kind": "timer", "at": NOW + 86400}
+    with pytest.raises(presence.PresenceError, match="bounded while only"):
+        presence.set_word(q, "desk", duration="switch", now=NOW, tap=True)
+    intent.apply_preset(q, "sleep", now=NOW, idle=_idle(5.0))
+    before = _file(q)
+    for word in ("devices", "desk"):
+        with pytest.raises(presence.PresenceError, match="`sleep` stands"):
+            presence.set_word(q, word, now=NOW + 1, tap=True)
+        assert _file(q) == before
+    presence.set_word(q, "desk", now=NOW + 2)    # the operator's own path: unchanged, the base
+    assert _doc(q)["base"]["devices"] == "follow" and _doc(q)["overlay"] is None

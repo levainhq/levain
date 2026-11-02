@@ -548,21 +548,43 @@ _ROUTE_ALIASES = ("desk", "devices")   # the tap-token words of the retired rout
 def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, now: float | None = None,
              by: dict | None = None, said: str | None = None, match: object = None,
              via: str | None = None, wait: float | None = None,
-             precheck: "Callable[[], None] | None" = None, after: "Callable[[], None] | None" = None) -> dict | None:
+             precheck: "Callable[[], None] | None" = None, after: "Callable[[], None] | None" = None,
+             tap: bool = False) -> dict | None:
     """Compat (one release): :func:`levain.webpush.intent.apply_preset` for a preset word, ``devices`` (devices on, one hour by
     default) and ``desk`` (follow) for the old route words. Returns what :func:`read_word` reads after, ``None`` when no preset
-    stands. All arguments are :func:`levain.webpush.intent.apply_preset`'s."""
+    stands. All arguments but ``tap`` are :func:`levain.webpush.intent.apply_preset`'s.
+
+    ``tap`` (the caller holds a tap token, not the full credential): an alias writes a bounded overlay only, never the
+    base (``desk`` for a day by default, the retired route's own default), and neither alias replaces a standing preset
+    (``away``, ``quiet``, ``sleep``, ``loud``): that is refused under the lock, and ``back`` ends it. The operator's own
+    path (``tap`` false) is unchanged."""
     from levain.webpush import intent
 
     if word in _ROUTE_ALIASES:
         if by is not None:
             raise PresenceError(f"`{word}` is the operator's own word: a seat or the coordinator may not set it")
+        if tap:
+            if isinstance(duration, str) and duration.strip().lower() == "switch":
+                raise PresenceError(f"a tap's `{word}` sets a bounded while only, never your standing default")
+            outer = precheck
+
+            def precheck() -> None:   # runs under the presence lock, before anything is read for writing
+                if outer is not None:
+                    outer()
+                t = time.time() if now is None else now
+                rec = intent.read(queue_dir, t)
+                ov = rec["overlay"]
+                if rec["status"] in ("file", "projection") and ov is not None and ov.get("preset"):
+                    reading, msg_at = intent._live(queue_dir, t, None, rec)
+                    if intent.overlay_active(rec, t, intent._last_input(t, reading), msg_at):
+                        raise PresenceError(f"`{ov['preset']}` stands: a tap's `{word}` does not replace it "
+                                            "(`back` ends it)")
         if word == "devices":
             intent.apply_settings(queue_dir, devices="on", until=duration or "60m", via=via, wait=wait, now=now,
                                   precheck=precheck, after=after)
-        else:   # desk: the measurement decides again, which is follow
-            intent.apply_settings(queue_dir, devices="follow", until=duration or "switch", via=via, wait=wait, now=now,
-                                  precheck=precheck, after=after)
+        else:   # desk: the measurement decides again, which is follow; from a tap, for a bounded while only
+            intent.apply_settings(queue_dir, devices="follow", until=duration or ("24h" if tap else "switch"), via=via,
+                                  wait=wait, now=now, precheck=precheck, after=after)
     else:
         intent.apply_preset(queue_dir, word, duration=duration, now=now, by=by, said=said, match=match, via=via, wait=wait,
                             precheck=precheck, after=after)

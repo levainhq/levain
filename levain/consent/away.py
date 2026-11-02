@@ -4,8 +4,8 @@ Away mode is what lets a signed answer reach the agent: with it off, the hook as
 with none matching, withdraws the request at once so the agent's own dialog asks; with it on, the hook holds each
 request up to ``away_hold_seconds`` while ``levain consent answer`` or the phone signs one. Whether it is on is
 :func:`levain.consent.auto_away.away_state`: given the queue directory (every hook), a signed away mark, else the
-presence record (:func:`levain.webpush.intent.approvals_to_devices`: held exactly when an approval would reach the
-operator's devices); the words this module writes (``away_word``, ``away_mode``, ``away_idle_seconds``) are read only
+presence record (:func:`levain.webpush.intent.approvals_route`: held exactly when an approval would reach the
+operator's devices, except a ``follow`` that reaches them only for want of a laptop input reading); the words this module writes (``away_word``, ``away_mode``, ``away_idle_seconds``) are read only
 by a caller with no queue directory (one release): the explicit word (``auto``, the one ``levain init`` writes, is
 none), else input idle past ``away_idle_seconds`` on macOS, else off. A file with no ``away_word`` was written before
 auto-away existed: its ``away_mode`` is the word. ``levain consent away on|off|auto`` also set the record's base

@@ -2574,17 +2574,25 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
     rc, seen = 0, 0
     if args.action != "show":
         # the set phase: each agent's mark (or signed leave) first, then the record's base devices setting follows the
-        # word (DESIGN §4), then the report below reads the result; a failure leaves the record alone, so the marks and
-        # the record are not split by a half-done verb
+        # word (DESIGN §4), then the report below reads the result. Not atomic across agents (each takes its own
+        # signature): when ANY agent changed, the record follows the word, so a changed mark is never left beside a
+        # record that contradicts it, and a partial application is said plainly (and exits non-zero)
         word = {"on": True, "off": False, "auto": None}[args.action]
+        changed, failed = [], []
         for agent in agents:
             try:
                 if away.read(qdir, agent) is not None:
                     away.set_away(qdir, agent, word, args.hold, args.idle_after, signing_key=args.signing_key)
+                    changed.append(agent)
             except (OSError, ValueError, QueueStoreError) as e:
                 print(f"levain consent away: {agent}: {e}", file=sys.stderr)
+                failed.append(agent)
                 rc = 1
-        if rc == 0 and any(away.read(qdir, a) is not None for a in agents):
+        if changed and failed:
+            print(f"levain consent away: PARTLY applied: {args.action} for {', '.join(changed)}, NOT for "
+                  f"{', '.join(failed)} (see above); the presence record follows the word for the agents that changed",
+                  file=sys.stderr)
+        if changed:
             devices = {"on": "on", "off": "off", "auto": "follow"}[args.action]
             try:
                 intent.apply_settings(qdir, devices=devices, follow_after=args.idle_after if args.action == "auto" else None,

@@ -938,7 +938,7 @@
       prGen++;
       if (res.status === 200 && res.data && "line" in res.data) { paintPresence(res.data); ok = true; }
       else say("Could not set your presence (" + ((res.data && res.data.message) || res.status) + ").");
-    } catch (e) { console.warn('DBG', e && e.stack); say("Could not reach the cockpit."); }
+    } catch (e) { say("Could not reach the cockpit."); }
     finally {
       prBusy = false; prDisable(false);
       if (!ok) await readPresence();

@@ -2514,7 +2514,7 @@ class _Handler(GuardedHandler):
                                       via=via, wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
             else:       # set_word takes the presets and the two tap aliases (desk, devices) and calls apply_preset / apply_settings
                 presence.set_word(queue, word, duration=req.get("for") or None, by=None, via=via,
-                                  wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
+                                  wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after, tap=tap is not None)
         except presence.PresenceBusy:
             return {"error": "presence_busy", "message": "the presence record is busy right now; nothing was changed, try again"}, 503
         except presence.PresenceError as exc:

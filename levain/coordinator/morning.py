@@ -73,7 +73,7 @@ def away_from_drop(store: CoordStore, drop_id: str, *, token: object, agents: Se
     words = drop.words if len(drop.words) <= 200 else drop.words[:200] + "..."
     import time
 
-    from levain.webpush import held, intent, presence, quote
+    from levain.webpush import held, intent, quote
 
     qdir, said = Path(store.directory), " ".join(drop.words.split())[:300]   # the quote: the drop's own words
     try:
@@ -85,7 +85,7 @@ def away_from_drop(store: CoordStore, drop_id: str, *, token: object, agents: Se
             held.flush_if_due(qdir, throttle=False)
         except Exception:  # noqa: BLE001 - the record is written; the next gate call flushes
             pass
-    except (presence.PresenceError, OSError) as exc:   # the marks stand; the KNOW must still be filed
+    except Exception as exc:  # noqa: BLE001 - the marks stand; the KNOW must still be filed (match_drop's read included)
         record = f" The presence record was NOT changed ({str(exc)[:_FIELD]}); `levain ping status` says what it reads."
     text = (f"the coordinator read your drop {drop_id} ({words!r}) as away and set away ON for "
             f"{', '.join(marked)}: a SIGN from {'that agent' if len(marked) == 1 else 'those agents'} now waits "
