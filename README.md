@@ -425,7 +425,7 @@ levain serve --write --install-class reported --sign-queue-dir <levain home>/con
 tailscale serve --bg --https=443 http://127.0.0.1:7420
 ```
 
-`levain consent phone` is kept for compatibility only. With `--redirect-to <the cockpit's origin>` it serves one redirect page on the old phone port (7428 by default), so a link the phone already holds opens on the cockpit (a sign link opens on that request's sheet, with any token it carried dropped). It serves nothing else, makes no token and prints no link, and without `--redirect-to` it refuses. With Tailscale:
+The setup above is all most people need. `levain consent phone` is kept for compatibility only, and its Tailscale line below uses port 443 as well, so run it only if you are not already serving the cockpit on 443 (`tailscale serve reset` first). With `--redirect-to <the cockpit's origin>` it serves one redirect page on the old phone port (7428 by default), so a link the phone already holds opens on the cockpit (a sign link opens on that request's sheet, with any token it carried dropped). It serves nothing else, makes no token and prints no link, and without `--redirect-to` it refuses. With Tailscale:
 
 ```
 levain cockpit pair --short                                             # a code to type into the cockpit's pair card

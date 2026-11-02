@@ -23,7 +23,7 @@ _BAD = object()
 
 
 def _row(status=None, serve=None, which=lambda n: "/bin/tailscale"):
-    (r,) = doctor._check_phone_path(which=which, run=_run(status, serve), port=PORT)
+    (r,) = doctor._check_phone_path(which=which, run=_run(status, serve), port=PORT, app="/nonexistent/tailscale")
     return r
 
 

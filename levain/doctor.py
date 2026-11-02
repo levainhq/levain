@@ -399,7 +399,7 @@ def _tailscale_json(argv: list[str], run: Any) -> Any:
     import json
     try:
         r = run(argv)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, subprocess.TimeoutExpired):  # ValueError: output that is not decodable text
         return None
     if r.returncode != 0:
         return None
@@ -411,12 +411,15 @@ def _tailscale_json(argv: list[str], run: Any) -> Any:
 
 def _serve_url(key: str, dns: str) -> str:
     """The URL a ``Web`` key (``host:port``) is reached at: https, with the port when it is not 443."""
-    host, _, p = str(key).rpartition(":")
+    host, sep, p = str(key).rpartition(":")
+    if not sep:
+        host, p = str(key), ""
     host = host or dns or "the machine's ts.net name"
     return f"https://{host}" if p in ("", "443") else f"https://{host}:{p}"
 
 
-def _check_phone_path(*, which: Any = None, run: Any = None, port: int | None = None) -> list[CheckResult]:
+def _check_phone_path(*, which: Any = None, run: Any = None, port: int | None = None,
+                      app: str | None = None) -> list[CheckResult]:
     """This laptop's side of the phone path: Tailscale's state and the serve config. It cannot see the phone. Reads
     only (`tailscale status --json`, `tailscale serve status --json`), each bounded to 10 seconds. A funnel is a
     FAIL; a serve config it cannot read is a WARN, never an OK. Known edge, by intent: a serve config that
@@ -432,7 +435,8 @@ def _check_phone_path(*, which: Any = None, run: Any = None, port: int | None = 
     run = run or _bounded_tailscale
     port = DEFAULT_PORT if port is None else port
     fix_serve = f"Run `tailscale serve --bg --https=443 http://127.0.0.1:{port}`."
-    exe = which("tailscale") or (_TAILSCALE_APP if os.access(_TAILSCALE_APP, os.X_OK) else None)
+    app = _TAILSCALE_APP if app is None else app
+    exe = which("tailscale") or (app if os.access(app, os.X_OK) else None)
     if not exe:
         return [CheckResult(name, True, "tailscale not found, so a phone cannot reach this laptop",
                             "Install Tailscale on the laptop and the phone and sign in to the same tailnet "
@@ -456,7 +460,8 @@ def _check_phone_path(*, which: Any = None, run: Any = None, port: int | None = 
     if funnel:
         return [CheckResult(name, False, f"funnel is on for {', '.join(funnel)}: the cockpit is open to the internet",
                             "Run `tailscale funnel reset` now; the cockpit must be reachable from your tailnet only.")]
-    dns = str((status.get("Self") or {}).get("DNSName") or "").rstrip(".")
+    self_status = status.get("Self")
+    dns = str((self_status if isinstance(self_status, dict) else {}).get("DNSName") or "").rstrip(".")
     webs = serve.get("Web")
     for key, web in (webs.items() if isinstance(webs, dict) else ()):
         handlers = web.get("Handlers") if isinstance(web, dict) else None
