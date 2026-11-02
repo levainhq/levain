@@ -341,15 +341,6 @@ def test_confirm_identity_takes_dispatch_only_with_yes():
     assert e.value.name == "verb-not-allowed-for-caller"
 
 
-def test_the_dispatch_mark_is_refused_until_identity_writes_it(monkeypatch):
-    from levain.slot import identity as ID
-    monkeypatch.delattr(ID, "BASELINE_DISPATCH_KEY", raising=False)
-    req = argv("confirm-identity", "s-00000000000000c1", "yes", "--dispatch")
-    with pytest.raises(Refused) as e:
-        H._confirm_identity(None, req, None)               # refused before ctx is touched: nothing is written
-    assert e.value.name == "dispatch-mark-unbuilt"
-
-
 # ---- render: the routes rule and the API-key refusal ------------------------------------------------------------------
 
 TF = {"kind": "executor", "job_id": "j", "run_index": 0, "contract_digest": "sha256:" + "1" * 64,

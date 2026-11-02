@@ -5,8 +5,9 @@ baseline ``confirm-identity yes`` writes.
 * The identity call (:func:`identity_call`): one function per vendor. Codex has no server-validated call, so its
   observed id is the literal :data:`NOT_A_CHECK` (IG-2, published per §7.6 "not a check"). Claude's (IG-3, G1b):
   :mod:`levain.slot.identity_child` run AS THE SLOT through wall's ``identity`` target (start's
-  :func:`levain.slot.start.identity_capture`), its line judged by root (:func:`parse_profile_answer`): the profile's
-  ``account.uuid``.
+  :func:`levain.slot.start.identity_capture`), its line judged by root (:func:`parse_auth_answer`): a digest of the
+  ``orgId`` and email in the unmodified binary's own ``claude auth status --json``, computed in the child (root never
+  sees the email), a LOCAL-DATA claim (:data:`CLAIM`).
 * A ``login`` session's ``start`` runs it as its last step, after the vendor exits (:func:`record_login_identity`),
   and CASes the result into the state record's ``identity``: ``{observed_id}`` when the call answered, else
   ``{result: <refusal name>}``. A vendor that exited non-zero is not asked: ``{result: login-exit-nonzero}``.
@@ -20,10 +21,13 @@ baseline ``confirm-identity yes`` writes.
   baseline from :func:`read_slot_baseline`): the answer is recorded in the state record's ``identity`` and compared
   with the baseline's ``observed_id``; a difference refuses ``identity-changed``.
 
-* Claude's child refreshes the stored login once before it asks the profile (PIN_REFRESH_DESIGN), so the account it
-  names is the one the file's own refresh token belongs to. A refresh the server refuses as a dead login is
-  ``identity-expired``; one that did not reach an answer is ``identity-unreachable`` (:func:`parse_profile_answer`).
-  A line with no refresh is ``identity-unparsable`` for Claude.
+* Claude's child asks the unmodified binary and nothing else: Levain never opens the login file, never refreshes
+  it, and never speaks to a sign-in server (P7-A N-A1; this retired the earlier token refresh). A binary that says it
+  is not signed in is ``identity-expired``; one that did not answer in time, or is older than the child's minimum
+  version, is ``identity-unreachable`` (:func:`parse_auth_answer`).
+
+* A baseline may carry the unattended-use mark (``dispatch``, value ``yes``): ``confirm-identity yes --dispatch``
+  writes it; a later confirm without the flag writes a baseline with no mark.
 
 The baseline file is root's, 0600, replaced atomically (temp, fsync, rename, directory fsync). :func:`baseline_vendor`
 reads it, and also the earlier vendor-only shape with no ``format`` key.
@@ -46,6 +50,9 @@ from levain.slot.runtime_grammar import OPERATOR, RuntimeRequest
 
 BASELINE_FORMAT = "levain-baseline/1"
 BASELINE_KEYS = frozenset({"format", "vendor", "observed_id", "confirmed_at", "session"})
+#: the optional unattended-use mark; present only with the value :data:`BASELINE_DISPATCH_YES`.
+BASELINE_DISPATCH_KEY = "dispatch"
+BASELINE_DISPATCH_YES = "yes"
 BASELINE_NAME = "baseline"
 BASELINE_MODE = 0o600
 #: IG-2: the observed id of a vendor with no server-validated identity call.
@@ -75,15 +82,15 @@ def _claude_call(ctx: Optional[H.Ctx], a: Optional[R.Alloc], *, held: bool = Fal
     from levain.slot import start as SS
 
     if held:
-        return parse_profile_answer(*SS.identity_capture_held(ctx, a, states=(R.RENDERED,)), refreshed=True)
-    return parse_profile_answer(*SS.identity_capture(ctx, a), refreshed=True)
+        return parse_auth_answer(*SS.identity_capture_held(ctx, a, states=(R.RENDERED,)))
+    return parse_auth_answer(*SS.identity_capture(ctx, a))
 
 
 IDENTITY_CALLS: Mapping[str, Callable[..., str]] = {"codex": _codex_call, "claude": _claude_call}
 
 
 def identity_call(ctx: Optional[H.Ctx], vendor: str, a: Optional[R.Alloc] = None, *, held: bool = False) -> str:
-    """The stable account id the vendor's identity call observed, checked against §7.6's pattern (else
+    """The stable id the vendor's identity call observed, checked against §7.6's pattern (else
     ``identity-unparsable``), or :class:`Refused` by the call's own name. ``held`` reaches the vendor's callable
     (Codex ignores it)."""
     call = IDENTITY_CALLS.get(vendor)
@@ -95,34 +102,27 @@ def identity_call(ctx: Optional[H.Ctx], vendor: str, a: Optional[R.Alloc] = None
     return oid
 
 
-_OAUTH_WORD_RE = re.compile(r"[a-z_]{1,40}", re.ASCII)
-#: the child's fixed names for a refresh with no usable answer (``identity_child``): words, never a status or a token.
-_FIXED_NAME_RE = re.compile(r"[a-z\-]{1,32}", re.ASCII)
-
 #: §7.6: root reads at most this much of the identity call's stdout.
 PROFILE_ANSWER_MAX = 64 * 1024
+_FIXED_NAME_RE = re.compile(r"[a-z\-]{1,32}", re.ASCII)
+#: the child's ``id_digest``: a SHA-256 in lower-case hex.
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
+#: the claim an identity answer makes: the unmodified binary's own report from its local data. It stays this until U-A5
+#: (does ``auth status`` ask the server?) is measured on a signed-in slot; the names ``matched`` / ``not-a-check`` /
+#: ``identity-changed`` are kept and say nothing stronger.
+CLAIM = IC.CLAIM
 
 
-def parse_profile_answer(exit_code: int, out: bytes, *, refreshed: bool = True) -> str:
-    """IG-3 / PIN_REFRESH_DESIGN §4: root's judgement of :mod:`levain.slot.identity_child`'s line. The observed id is the
-    profile's ``account.uuid`` when the child exited 0, its line is within :data:`PROFILE_ANSWER_MAX`, the refresh
-    answered 200, the profile answered 200 and the body is JSON holding a uuid that fits ``OBSERVED_ID_RE``. A refresh
-    outcome is judged first, whatever the exit code:
+def parse_auth_answer(exit_code: int, out: bytes) -> str:
+    """IG-3 / P7-A N-A1: root's judgement of :mod:`levain.slot.identity_child`'s line. The observed id is the line's
+    ``id_digest`` (:func:`levain.slot.identity_child.id_digest`: 64 lower-case hex) when the child exited 0, the line
+    is within :data:`PROFILE_ANSWER_MAX`, and holds exactly ``claim`` :data:`CLAIM`, ``logged_in`` true and that
+    digest. Fail closed on any other shape.
 
-    * ``identity-expired``: the refresh answered 400 or 401 with the OAuth word ``invalid_grant`` (RFC 6749 §5.2: the
-      refresh token "is invalid, expired, revoked"; Claude Code's own test is ``status 400|401`` and
-      ``code==="invalid_grant"``), the login holds no refresh token, or the refresh rotated the token and the new one
-      could not be written (``lost-after-spend``); or the refresh was 200 and the profile 401/403. Signing in again
-      repairs each.
-    * ``identity-unreachable``: every other refresh that did not answer 200 (a fixed name instead of a status, 429,
-      5xx, a 403 with no OAuth word, any other 4xx, ``invalid_client`` / ``unauthorized_client`` / any other OAuth word:
-      a client or server fault a sign-in with the same client does not repair), and a refresh written back whose
-      profile ran out of the child's deadline (``refreshed-no-profile``). Both fail closed.
-
-    ``refreshed`` (the default; the Claude identity call passes it): a line without ``refresh: 200`` before its profile
-    answer is ``identity-unparsable``, so no path that skips the refresh can pass the gate on a stored access token
-    alone (PIN_REFRESH_DESIGN §0's swap). ``refreshed=False`` judges a profile-only line, for tests of the profile
-    call's own mechanics. Anything else is ``identity-unparsable``."""
+    * ``identity-expired``: the binary said it is not logged in (sign in to this slot again).
+    * ``identity-unreachable``: the binary did not answer in time (``timeout``), a retry, never a new login; or it is
+      older than the child's minimum version (``binary-too-old`` leads the detail), an upgrade of the vendor binary.
+    * ``identity-unparsable``: every other error name, a non-zero exit, a different claim or any other shape."""
     import json
 
     def bad(why: str) -> Refused:
@@ -136,54 +136,30 @@ def parse_profile_answer(exit_code: int, out: bytes, *, refreshed: bool = True) 
         if exit_code != 0:
             raise bad(f"identity call exit {exit_code}") from None
         raise bad("answer is not JSON") from None
-    if type(ans) is dict and "refresh" in ans:
-        ref = ans["refresh"]
-        word = ans.get("oauth_error")
-        word = word if type(word) is str and _OAUTH_WORD_RE.fullmatch(word) else None
-        if type(ref) is str:
-            if not _FIXED_NAME_RE.fullmatch(ref):
-                raise bad("refresh name")
-            if ref == IC.NO_REFRESH_TOKEN:
-                raise Refused(EXPIRED, "the stored login holds no refresh token (sign in to this slot again)")
-            if ref == IC.LOST_AFTER_SPEND:
-                raise Refused(EXPIRED, "the refresh rotated the login and the new one could not be written (sign in "
-                                       "to this slot again)")
-            if ref == IC.KEPT_AFTER_SPEND:
-                # start's promote_refresh_temp moved the new login into place, else it had refused identity-expired
-                raise Refused(UNREACHABLE, "the refresh answered but the child could not write it back; root moved "
-                                           "the new login into place")
-            if ref == IC.NO_PROFILE:
-                raise Refused(UNREACHABLE, "the refresh answered and was written back, but the profile did not answer "
-                                           "in time (the stored login is the new one)")
-            raise Refused(UNREACHABLE, f"the refresh did not reach an answer ({ref})")
-        if type(ref) is not int:
-            raise bad("refresh outcome")
-        if ref != 200:
-            if ref in (400, 401) and word == "invalid_grant":
-                raise Refused(EXPIRED, f"the refresh answered HTTP {ref} {word} (the stored login looks expired or "
-                                       "revoked: sign in to this slot again)")
-            raise Refused(UNREACHABLE, f"the refresh answered HTTP {ref}" + (f" {word}" if word else ""))
-    elif refreshed:
-        raise bad("no refresh")
+    if type(ans) is not dict:
+        raise bad("answer is not an object")
+    if set(ans) == {"error"}:
+        name = ans["error"]
+        if type(name) is not str or not _FIXED_NAME_RE.fullmatch(name):
+            raise bad("error name")
+        if name == "timeout":
+            raise Refused(UNREACHABLE, "the Claude binary's auth status did not answer in time")
+        if name == "binary-too-old":
+            raise Refused(UNREACHABLE, "binary-too-old: the Claude binary is older than "
+                          + ".".join(map(str, IC.MIN_VERSION)) + "; upgrade the vendor install")
+        raise bad(f"identity call: {name}")
+    if ans.get("claim") != CLAIM:
+        raise bad("claim")
+    if ans.get("logged_in") is False and set(ans) == {"claim", "logged_in"}:
+        raise Refused(EXPIRED, "the Claude binary reports the slot is not signed in (sign in to this slot again)")
+    if set(ans) != {"claim", "logged_in", "id_digest"} or ans["logged_in"] is not True:
+        raise bad("shape")
     if exit_code != 0:
         raise bad(f"identity call exit {exit_code}")
-    if type(ans) is not dict or type(ans.get("status")) is not int:
-        raise bad("no status")
-    if ans["status"] in (401, 403):
-        # a distinct name: the supervisor routes on the name alone and must tell the operator to sign in again
-        raise Refused(EXPIRED, f"HTTP {ans['status']} (the stored login looks expired or revoked: sign in to this slot "
-                               "again)")
-    if ans["status"] != 200:
-        raise bad(f"HTTP {ans['status']}")
-    try:
-        prof = json.loads(ans["body"]) if type(ans.get("body")) is str else None
-    except (ValueError, RecursionError):
-        prof = None
-    acct = prof.get("account") if type(prof) is dict else None
-    uuid = acct.get("uuid") if type(acct) is dict else None
-    if type(uuid) is not str or not R.OBSERVED_ID_RE.fullmatch(uuid):
-        raise bad("no account.uuid")
-    return uuid
+    oid = ans["id_digest"]
+    if type(oid) is not str or not _DIGEST_RE.fullmatch(oid):
+        raise bad("no id_digest")
+    return oid
 
 
 def read_record(ctx: H.Ctx, session: str) -> Optional[R.SessionState]:
@@ -221,17 +197,22 @@ def record_login_identity(ctx: H.Ctx, a: R.Alloc, exit_code: int) -> Dict[str, s
 
 # --- the baseline file (§2.1 ``L/slots/e<n>/baseline``) ----------------------------------------------------------------
 
-def baseline_bytes(*, vendor: str, observed_id: str, confirmed_at: str, session: str) -> bytes:
+def baseline_bytes(*, vendor: str, observed_id: str, confirmed_at: str, session: str, dispatch: bool = False) -> bytes:
     obj = {"format": BASELINE_FORMAT, "vendor": vendor, "observed_id": observed_id, "confirmed_at": confirmed_at,
            "session": session}
+    if dispatch:
+        obj[BASELINE_DISPATCH_KEY] = BASELINE_DISPATCH_YES
     check_baseline(obj)
     return canon.canonical_bytes(obj)
 
 
 def check_baseline(obj: object) -> Dict[str, str]:
-    """A :data:`BASELINE_FORMAT` object checked whole (exact keys, each value by its rule), else ``bad-baseline``."""
-    if type(obj) is not dict or set(obj) != BASELINE_KEYS or obj["format"] != BASELINE_FORMAT:
+    """A :data:`BASELINE_FORMAT` object checked whole (exact keys, plus the optional dispatch mark whose value is
+    exactly :data:`BASELINE_DISPATCH_YES`; each value by its rule), else ``bad-baseline``."""
+    if type(obj) is not dict or set(obj) - {BASELINE_DISPATCH_KEY} != BASELINE_KEYS or obj["format"] != BASELINE_FORMAT:
         raise Refused("bad-baseline", "keys or format")
+    if BASELINE_DISPATCH_KEY in obj and obj[BASELINE_DISPATCH_KEY] != BASELINE_DISPATCH_YES:
+        raise Refused("bad-baseline", "dispatch")
     if obj["vendor"] not in _VENDORS:
         raise Refused("bad-baseline", "vendor")
     if type(obj["observed_id"]) is not str or not R.OBSERVED_ID_RE.fullmatch(obj["observed_id"]):
@@ -270,13 +251,12 @@ def baseline_vendor(data: Optional[bytes]) -> Optional[str]:
 
 #: DECISION: the most a baseline file may hold; ``baseline_bytes`` writes well under this.
 BASELINE_MAX_BYTES = 4096
-#: the record's ``identity.result`` for a gate that matched, that found another account, and a vendor with no check.
+#: the record's ``identity.result`` for a gate that matched, that found another sign-in, and a vendor with no check.
 GATE_MATCHED = "matched"
 GATE_CHANGED = "identity-changed"
-#: the record's ``identity.result`` for a parked login a sign-in repairs (a refresh answered ``invalid_grant``, no
-#: refresh token, a rotated login that could not be written back, or a profile 401/403 on the refreshed token), and for
-#: a check that could not reach an answer (a refresh with no usable answer: network, 429, 5xx, a non-OAuth 403, any
-#: other OAuth word, an unwritable file before the token was spent). The second asks for a retry, never a new login.
+#: the record's ``identity.result`` for a login a sign-in repairs (the binary says it is not signed in), and for a
+#: check that could not reach an answer (the binary did not answer in time). The second asks for a retry, never a
+#: new login.
 EXPIRED = "identity-expired"
 UNREACHABLE = "identity-unreachable"
 _BASELINE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
@@ -362,7 +342,7 @@ def gate_check(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Dict[str,
              else GATE_CHANGED}
     _cas_gate_identity(ctx, a.session, ident)
     if not same:
-        raise Refused(GATE_CHANGED, f"{a.slot.tag}: the observed account is not the slot's baseline")
+        raise Refused(GATE_CHANGED, f"{a.slot.tag}: the observed sign-in is not the slot's baseline")
     return ident
 
 
@@ -422,13 +402,13 @@ def confirm_identity(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, o
         if not _slot_names_lease(ctx, a):
             raise Refused("slot-lease-moved", f"{a.slot.tag} no longer names {a.session}")
         data = baseline_bytes(vendor=a.vendor, observed_id=oid, confirmed_at=R.timestamp(ctx.seams.clock()),
-                              session=a.session)
+                              session=a.session, dispatch=bool(req.dispatch))
         ctx.call("CAS", session=a.session, generation=rec.generation, **{"from": rec.state, "to": rec.state},
                  fields={"identity": {"observed_id": oid, "result": CONFIRMED}})
         ctx.store.replace(("slots", a.slot.tag), BASELINE_NAME, data, mode=BASELINE_MODE)
     return {"baseline": BASELINE_WRITTEN}
 
 
-__all__ = ["BASELINE_FORMAT", "BASELINE_KEYS", "BASELINE_WRITTEN", "CONFIRMED", "IDENTITY_CALLS", "LOGIN_FAILED",
+__all__ = ["BASELINE_DISPATCH_KEY", "BASELINE_FORMAT", "CLAIM", "parse_auth_answer", "BASELINE_KEYS", "BASELINE_WRITTEN", "CONFIRMED", "IDENTITY_CALLS", "LOGIN_FAILED",
            "NOT_A_CHECK", "baseline_bytes", "baseline_vendor", "check_baseline", "confirm_identity", "gate_check",
            "identity_call", "read_slot_baseline", "record_login_identity", "EXPIRED", "UNREACHABLE"]
