@@ -5928,7 +5928,7 @@ def _check_codex_prompt_timeout(entries: list[dict], hooks_path: Path, install: 
                 f"{hooks_path} UserPromptSubmit timeout", False,
                 f"timeout {short!r}, shorter than the {PROMPT_HOOK_TIMEOUT_S} s a Touch ID answer can take: Codex "
                 "would kill the hook after the answer is recorded, before its echo",
-                "Run `levain update` (or `levain band hooks install`) to re-render it.", upgrade_pending=True)]
+                "Run `levain update` to re-render it.", upgrade_pending=True)]
     return []
 
 
