@@ -192,8 +192,17 @@ def _is_ours(handler: Any) -> bool:
 def is_live_root(root: Path) -> bool:
     try:
         return Path(root).expanduser().resolve() == (Path.home() / ".claude").resolve()
-    except OSError:
+    except (OSError, RuntimeError):
         return False
+
+
+def _is_live_settings(path: Path) -> bool:
+    """The settings file the root names resolves into the live ~/.claude (through any symlink chain)."""
+    try:
+        live = (Path.home() / ".claude").resolve()
+        return path.resolve() in (live / "settings.json", (live / "settings.json").resolve()) or is_live_root(path.resolve().parent)
+    except (OSError, RuntimeError):
+        return True  # cannot tell: treat as live
 
 
 def _load_settings(path: Path) -> dict:
@@ -236,7 +245,7 @@ def install(root: Path, *, live: bool = False, python: str | None = None) -> int
         print(f"refused: {root} is the live ~/.claude; pass --live to write there", file=sys.stderr)
         return 2
     path = Path(root).expanduser() / "settings.json"
-    if not live and is_live_root(path.resolve().parent):  # a symlinked settings.json into the live dir
+    if not live and _is_live_settings(path):  # a symlinked settings.json into the live dir
         print(f"refused: {path} resolves into the live ~/.claude; pass --live to write there", file=sys.stderr)
         return 2
     try:
@@ -275,7 +284,7 @@ def uninstall(root: Path, *, live: bool = False) -> int:
     if not path.exists():
         print(f"nothing to remove: {path} does not exist")
         return 0
-    if not live and is_live_root(path.resolve().parent):
+    if not live and _is_live_settings(path):
         print(f"refused: {path} resolves into the live ~/.claude; pass --live to write there", file=sys.stderr)
         return 2
     try:

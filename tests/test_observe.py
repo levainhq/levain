@@ -74,10 +74,11 @@ def test_install_refuses_and_writes_nothing_on_a_non_list_hook_entry_or_a_failed
     monkeypatch.setattr(observe, "_can_import", lambda py: True)
     assert cli.main(["observe", "install", "--settings-root", str(root)]) == 1
     assert cli.main(["observe", "uninstall", "--settings-root", str(root)]) == 1
+    assert (root / "settings.json").read_text() == before
     (root / "settings.json").write_text("{}")
     monkeypatch.setattr(observe, "_can_import", lambda py: False)
     assert cli.main(["observe", "install", "--settings-root", str(root)]) == 1
-    assert (root / "settings.json").read_text() == "{}" and before
+    assert (root / "settings.json").read_text() == "{}"
 
 
 def test_a_settings_symlink_into_the_live_dir_needs_live(tmp_path, monkeypatch):
