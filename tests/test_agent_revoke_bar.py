@@ -6,8 +6,10 @@ scratch SQLite file.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
+import time
 from datetime import timedelta
 
 import pytest
@@ -158,3 +160,110 @@ def test_r5_a_revoke_in_the_log_with_no_bar_gets_a_closed_from_log_bar_once(rig)
     assert row == [(AGENT, gone.seq, "from_log", 1)]
     assert rig.recover() == []
     print(*[f"{o.row}: {o.text}" for o in out], sep="\n")
+
+
+# --- L3 r1: one test per fix ----------------------------------------------------------------------------------------
+
+def _recover(rig: Rig, **kw) -> list[bars.Outcome]:
+    kw.setdefault("now", rig.now())
+    return bars.recover(rig.store, AgentAuthority(rig.world.root), rig.cockpit, anchor=auth.anchor_path(rig.world.root),
+                        attention=lambda key, text: rig.attention.append((key, text)), **kw)
+
+
+def test_the_default_store_id_is_the_stores_own_and_none_refuses(rig):
+    # behaviour: with no store_id the links are looked up under the autonomic store's meta id (never the cockpit
+    # log's), so a present link keeps the bar open; with no id to be had, recovery refuses and closes nothing
+    create(rig.world, 1)
+    bar = rig.open()
+    assert [o.row for o in _recover(rig)] == ["R0"] and rig.bar(bar.bar_id).closed_at is None
+    rig.store.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    rig.store.execute("INSERT INTO meta VALUES ('store_id', ?)", (STORE,))
+    assert [o.row for o in _recover(rig)] == ["R4"] and rig.bar(bar.bar_id).closed_at is None
+    assert [o.row for o in _recover(rig, store_id="store-" + "ef" * 16)] == ["R0"]
+
+
+def test_r5_skips_a_log_row_rewritten_after_the_replay(rig, monkeypatch):
+    # behaviour: a row changed between the verified replay and R5's read is not the replay's link, so no from_log bar
+    # is written from it and the outcome says why
+    create(rig.world, 1)
+    create(rig.world, 2)
+    real = AgentAuthority.replay
+
+    def replay_then_rewrite(self):
+        state = real(self)
+        rig.cockpit.execute("UPDATE authority_log SET record = ? WHERE seq = ?",
+                            (json.dumps(revoke_agent()), state.seq))
+        return state
+
+    monkeypatch.setattr(AgentAuthority, "replay", replay_then_rewrite)
+    assert [o.row for o in _recover(rig, store_id=STORE)] == ["R0"]
+    assert rig.store.execute("SELECT COUNT(*) FROM agent_bars").fetchone()[0] == 0
+
+
+def test_open_bar_waits_no_longer_than_its_bound_on_a_busy_store(rig, tmp_path, monkeypatch):
+    # behaviour: a connection with a 5 s busy timeout still gives up at BAR_BUSY_SECONDS, and gets its timeout back
+    store = sqlite3.connect(tmp_path / "autonomic.db", isolation_level=None, timeout=5.0)
+    holder = sqlite3.connect(tmp_path / "autonomic.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    monkeypatch.setattr(bars, "BAR_BUSY_SECONDS", 0.3)
+    start = time.monotonic()
+    with pytest.raises(sqlite3.OperationalError):
+        bars.open_bar(store, AGENT, head_seq=0, now=rig.now())
+    holder.execute("ROLLBACK")
+    assert time.monotonic() - start < 1.5
+    assert store.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+
+
+def test_a_naive_now_is_a_stale_signature_not_a_crash(rig):
+    # behaviour: a now with no timezone cannot be compared with the stored stamp; the signature is not used and the
+    # bar stays a bar
+    create(rig.world, 1)
+    bar = rig.open()
+    link = rig.prepare(bar)
+    assert bars.record_signature(rig.store, bar.bar_id, rig.sign(link), now=rig.now())
+    assert [o.row for o in _recover(rig, store_id=STORE, now=rig.now().replace(tzinfo=None))] == ["R4"]
+    assert rig.bar(bar.bar_id).closed_at is None
+
+
+def test_a_bar_whose_rows_raise_stays_open_and_the_table_goes_on(rig, monkeypatch):
+    # behaviour: an append that raises something unexpected leaves that bar open with an R0 saying why, and the next
+    # bar is still resolved
+    create(rig.world, 1)
+    first = rig.open()
+    link = rig.prepare(first)
+    assert bars.record_signature(rig.store, first.bar_id, rig.sign(link), now=rig.now())
+    second = rig.open(OTHER_AGENT)
+
+    def gone(*args, **kw):
+        raise OSError("ssh-keygen went away")
+
+    monkeypatch.setattr(auth, "append", gone)
+    out = _recover(rig, store_id=STORE)
+    assert sorted(o.row for o in out) == ["R0", "R3"]
+    assert rig.bar(first.bar_id).closed_at is None and rig.bar(second.bar_id).reason == "nothing_present"
+
+
+def test_r5_matches_the_agent_not_only_the_seq(rig):
+    # behaviour: R3 closing another agent's bar at a head that is a revoke_agent does not hide that revoke from R5
+    create(rig.world, 1)
+    other = rig.open(OTHER_AGENT)
+    gone = rig.world.link(revoke_agent())
+    assert sorted(o.row for o in _recover(rig, store_id=STORE)) == ["R3", "R5"]
+    assert rig.bar(other.bar_id).revoke_seq == gone.seq
+    assert rig.store.execute("SELECT revoke_seq FROM agent_bars WHERE agent_id = ? AND reason = 'from_log'",
+                             (AGENT,)).fetchall() == [(gone.seq,)]
+
+
+def test_r4_writes_no_attention_for_a_bar_closed_during_the_tick(rig, monkeypatch):
+    # behaviour: a bar abandoned after the tick read it gets no attention row, which would never clear
+    create(rig.world, 1)
+    bar = rig.open()
+    real = bars._r3
+
+    def abandon_then_r3(conn, cockpit, state, b, **kw):
+        assert bars.close_bar(conn, b.bar_id, revoke_seq=None, reason="abandoned", now=rig.now())
+        return real(conn, cockpit, state, b, **kw)
+
+    monkeypatch.setattr(bars, "_r3", abandon_then_r3)
+    assert [o.row for o in _recover(rig, store_id=STORE)] == ["R4"]
+    assert rig.attention == [] and rig.bar(bar.bar_id).reason == "abandoned"
