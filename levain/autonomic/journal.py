@@ -556,6 +556,14 @@ class RunJournal:
                 self._cancel_in(conn, run_id, "replay_digest_changed", run_receipt)
                 return EffectOutcome(EffectStatus.CANCELLED)
             return EffectOutcome(EffectStatus.REPLAYED, json.loads(eff[2]), receipt_id=eff[3])
+        # an effect that began and has no result may have acted: that outcome is read before the run's lifecycle,
+        # fence and registry for the same reason, so an ended or revoked run cannot relabel it as barred
+        if eff is not None and eff[1] == "unknown":
+            return EffectOutcome(EffectStatus.POISONED)
+        if eff is not None and eff[1] == "intent":
+            if self._lease_held(run_id, effect_id):
+                return EffectOutcome(EffectStatus.IN_FLIGHT)
+            return EffectOutcome(EffectStatus.POISONED)
         if cancelled:
             return EffectOutcome(EffectStatus.CANCELLED)
         if self._generation_in(conn, run[0]) > int(run[1]):
@@ -575,12 +583,6 @@ class RunJournal:
                 barred = registry_bars(conn, run[0], run_id)
             if barred is not None:
                 return EffectOutcome(EffectStatus.BARRED, barred)
-        if eff is not None and eff[1] == "unknown":
-            return EffectOutcome(EffectStatus.POISONED)
-        if eff is not None and eff[1] == "intent":
-            if self._lease_held(run_id, effect_id):
-                return EffectOutcome(EffectStatus.IN_FLIGHT)
-            return EffectOutcome(EffectStatus.POISONED)
         return None
 
     def peek(self, run_id: str, effect_id: str, *, digest: str | None = None,

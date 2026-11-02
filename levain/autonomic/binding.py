@@ -881,9 +881,12 @@ def agent_run_proof(conn: sqlite3.Connection, run_id: str) -> bool:
     """Whether ``run_id`` is the run of a launched agent occurrence, read in the caller's transaction. Row presence
     alone is too weak (a caller could reuse an agent's run id to skip a registry revoke), so every part must hold:
     the occurrence's ``binding_id`` is the run's, it is ``launched`` with a ``launch_epoch``, and the run id
-    recomputes from its ``{agent_id, kind, key}``. Any read that fails answers False, so the ordinary
+    recomputes from its ``{agent_id, kind, key}``. Any read that fails, and any value of the wrong type (SQLite's
+    column affinity admits a BLOB or a NULL where the schema means text), answers False, so the ordinary
     :func:`registry_bars` applies. This guards against a confused deputy; a process that can write this database
     already holds the keyless registry."""
+    if type(run_id) is not str:
+        return False
     try:
         run = conn.execute("SELECT binding_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         row = conn.execute("SELECT agent_id, kind, key, binding_id, state, launch_epoch FROM agent_occurrences "
@@ -893,12 +896,18 @@ def agent_run_proof(conn: sqlite3.Connection, run_id: str) -> bool:
     if run is None or row is None:
         return False
     agent_id, kind, key, binding_id, state, launch_epoch = row
-    if binding_id != run[0] or state != "launched" or launch_epoch is None:
+    if any(type(v) is not str for v in (agent_id, kind, key, binding_id, run[0])) or type(launch_epoch) is not int:
+        return False
+    if binding_id != run[0] or state != "launched":
         return False
     # the same digest as levain.agents.controller.run_id, which this leaf cannot import
-    text = json.dumps({"agent_id": agent_id, "kind": kind, "key": key}, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False)
-    return run_id == "run-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+    try:
+        text = json.dumps({"agent_id": agent_id, "kind": kind, "key": key}, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False)
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+    except (TypeError, ValueError):   # a lone surrogate in a str does not encode
+        return False
+    return run_id == "run-" + digest
 
 
 def _parse_json_registry(text: str) -> tuple[list[dict[str, Any]], str | None]:

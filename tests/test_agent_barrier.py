@@ -39,7 +39,8 @@ def _go(j, eid, ran=None, run=None):
                     fn=lambda: ran.append(eid) or "ok" if ran is not None else "ok")
 
 
-def _journal(tmp_path, *, launched: bool = True) -> RunJournal:
+def _journal(tmp_path, *, launched: bool = True, agent: object = AGENT, key: str = KEY,
+             run: str = RUN) -> RunJournal:
     """A registry-bearing ``/2`` store (what ``binding.py`` makes on any store that ever held a Binding) with one
     agent occurrence; ``launched`` writes the real ``admitted -> launched`` update."""
     j = RunJournal(tmp_path / "autonomic")
@@ -47,12 +48,18 @@ def _journal(tmp_path, *, launched: bool = True) -> RunJournal:
         conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('registry', '1')")
         conn.execute("INSERT INTO agent_occurrences (occurrence_id, agent_id, kind, key, state, epoch, window_key,"
                      " spec_hash, binding_id, run_id, admitted_at) VALUES ('oc-1', ?, ?, ?, 'admitted', 0, 'w',"
-                     " ?, ?, ?, 't')", (AGENT, KIND, KEY, "b" * 64, BINDING, RUN))
+                     " ?, ?, ?, 't')", (agent, KIND, key, "b" * 64, BINDING, run))
         if launched:
             conn.execute("UPDATE agent_occurrences SET state = 'launched', launch_epoch = 0, link_id = 'al-1',"
                          " link_incarnation = 'inc', launched_at = 't' WHERE occurrence_id = 'oc-1'")
-    j.start(RUN, binding_id=BINDING)
+    j.start(run, binding_id=BINDING)
     return j
+
+
+def _end(j, state: str, reason: str) -> None:
+    with j.db.write() as conn:
+        conn.execute("UPDATE agent_occurrences SET state = ?, epoch = epoch + 1, ended_at = 't', reason = ? "
+                     "WHERE occurrence_id = 'oc-1'", (state, reason))
 
 
 def test_e2c_arm_a_on_the_real_branch(tmp_path):
@@ -123,7 +130,8 @@ def test_a_corrupt_registry_still_bars_an_agent_run(tmp_path):
 
 def test_hold_and_peek_on_an_agent_run(tmp_path):
     # behaviour: peek and hold call _barrier too; a launched agent run is not barred by the registry, an ended
-    # one is (peek: a done effect REPLAYED, any other BARRED)
+    # one is (peek: a done effect REPLAYED, an effect never started BARRED; a started one without a result is
+    # test_an_unresolved_effect_outlives_the_end_of_its_agent_run's)
     j = _journal(tmp_path)
     assert j.peek(RUN, "nothing") is None
     assert _go(j, "e1").status is EffectStatus.DONE
@@ -136,6 +144,61 @@ def test_hold_and_peek_on_an_agent_run(tmp_path):
     assert out.status is EffectStatus.BARRED and out.result == "binding_absent"
     barred = j.peek(RUN, "e2")
     assert barred is not None and barred.status is EffectStatus.BARRED and barred.result == "binding_absent"
+
+
+def test_an_unresolved_effect_outlives_the_end_of_its_agent_run(tmp_path):
+    # behaviour: an effect that began and has no result is POISONED (no lease) or IN_FLIGHT (leased) after crash
+    # recovery or a failure ends the occurrence; it is never relabelled BARRED, and nothing runs it again
+    j = _journal(tmp_path)
+    with j.db.write() as conn:   # the row a process killed inside fn leaves: intent committed, no lease holder
+        conn.execute("INSERT INTO effects (run_id, effect_id, digest, pid, state) VALUES (?, 'e1', 'de1', 1, "
+                     "'intent')", (RUN,))
+    _end(j, "stopped", "crash_recovered")
+    assert j.peek(RUN, "e1", digest="de1").status is EffectStatus.POISONED
+    ran: list[str] = []
+    assert _go(j, "e1", ran).status is EffectStatus.POISONED and ran == []
+    assert (RUN, "e1") in j.poisoned()
+
+    j2 = _journal(tmp_path / "leased")
+    seen: list = []
+
+    def inside():   # the effect is running (intent committed, lease held) when the occurrence fails
+        _end(j2, "failed", "exited")
+        seen.append(j2.peek(RUN, "e2", digest="de2"))
+        return "ok"
+
+    j2.effect(RUN, "e2", digest="de2", fence="f", fence_now=lambda conn: "f", fn=inside)
+    assert seen[0].status is EffectStatus.IN_FLIGHT
+
+
+def test_the_proof_refuses_a_value_of_the_wrong_type(tmp_path):
+    # behaviour: a BLOB id bars the run (binding_absent) rather than raising out of _barrier; a NULL binding id or
+    # a text launch_epoch never passes the proof
+    j = _journal(tmp_path, agent=AGENT.encode())
+    out = j.peek(RUN, "e1")
+    assert out is not None and out.status is EffectStatus.BARRED and out.result == "binding_absent"
+    conn = sqlite3.connect(":memory:")   # tables without the real NOT NULL, so the NULL can be written
+    conn.execute("CREATE TABLE runs (run_id TEXT PRIMARY KEY, binding_id TEXT)")
+    conn.execute("CREATE TABLE agent_occurrences (agent_id, kind, key, binding_id, state, launch_epoch, run_id)")
+    conn.execute("INSERT INTO runs VALUES (?, NULL)", (RUN,))
+    conn.execute("INSERT INTO agent_occurrences VALUES (?, ?, ?, NULL, 'launched', 0, ?)", (AGENT, KIND, KEY, RUN))
+    assert binding.agent_run_proof(conn, RUN) is False
+    conn.execute("UPDATE runs SET binding_id = 'b'")
+    conn.execute("UPDATE agent_occurrences SET binding_id = 'b'")
+    assert binding.agent_run_proof(conn, RUN) is True
+    conn.execute("UPDATE agent_occurrences SET launch_epoch = '0'")
+    assert binding.agent_run_proof(conn, RUN) is False
+
+
+def test_the_run_id_copy_matches_the_controller_on_non_ascii_ids(tmp_path):
+    # behaviour: the leaf's derivation byte-matches controller.run_id for non-ASCII ids, so such an agent reaches
+    # fence_now instead of being barred binding_absent
+    agent, key = "agent-ü", "k-é漢"
+    run = controller_run_id(agent, KIND, key)
+    j = _journal(tmp_path, agent=agent, key=key, run=run)
+    with j.db.write() as conn:
+        assert binding.agent_run_proof(conn, run) is True
+    assert _go(j, "e1", run=run).status is EffectStatus.DONE
 
 
 def test_a_v3_store_with_no_agent_tables_is_unchanged():
