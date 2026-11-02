@@ -102,29 +102,90 @@ def test_an_unreadable_band_is_reported_with_the_hint(filled):
     assert "band" in out["unreadable"]
 
 
+def _sql(qdir, stmt):
+    import sqlite3
+    c = sqlite3.connect(str(qdir / "dispatch.db"))
+    c.execute(stmt)
+    c.commit()
+    c.close()
+
+
+_JOURNAL_V2 = ("INSERT INTO ready_journal (id, ver, gseq, ts, iso, at, repo, from_status, to_status, from_category, "
+               "to_category, who, why, source, applied_by, lease_token) VALUES ('levain:c', 2, 99999, 0, 'i', 'a', "
+               "'levain', 'backlog', 'running', 'backlog', 'running', 'sql', 'ahead', 'move', NULL, 1)")
+
+
 def test_the_cards_and_their_journal_lines_come_from_one_read_transaction(filled, monkeypatch):
-    """The journal line is never newer than its column: items and journal are ONE snapshot read, not two."""
-    reads = []
-    real = ready._read
-    monkeypatch.setattr(ready, "_read", lambda st, q: reads.append(q) or real(st, q))
+    """The snapshot is ONE read transaction: a journal record committed by another connection AFTER the items were read, inside
+    the same snapshot, is not seen (a per-statement autocommit read would see it and attach a line newer than the column)."""
+    st = CoordStore(filled)
+    real = ready._lifecycle_present
+    fired = []
+    calls = []
+
+    def late_commit(conn):
+        assert conn.in_transaction
+        calls.append(1)
+        if len(calls) == 3 and not fired:          # _current, _diverged, then the journal read: the items are already read
+            fired.append(1)
+            ready.move(st, st.coord_take(), "levain:c", to="ready", who="late", why="after the items were read.")
+        return real(conn)
+
+    monkeypatch.setattr(ready, "_lifecycle_present", late_commit)
     out = board.build(filled, QuestionStore(filled))
-    assert len(reads) == 1 and out["unreadable"] == []
+    assert fired and out["unreadable"] == []
+    col, card = _cards(out)["levain:c"]
+    assert col == "backlog" and card["journal"]["who"] == "desk"        # the add's line, not the later move
     col, card = _cards(out)["levain:a"]
     assert col == "running" and card["journal"]["who"] == "seat-9" and card["journal"]["to_category"] == "running"
 
 
 def test_a_live_launch_is_a_running_seat_card_with_no_journal_line_and_an_ended_one_is_not(filled):
-    """SCHEMA section 5: one `running` projection per live seat (`seat:<token>`), read-only, never writable."""
+    """SCHEMA section 5: one `running` projection per live seat (`seat:<token>`), read-only, never writable. A worker is
+    running while active; a coordinator with no live lease of its own is `waiting`, never `running`; no repo is guessed."""
     st = CoordStore(filled)
     tok = st.coord_take()
-    live = st.launch_request(tok, harness="claude", role="coordinator", cwd=str(filled / "levain-wt"))
+    from levain.coordinator.store import Part
+
+    drop = st.accept_drop("fix the build", surface="cli")[0]
+    thread = st.split(drop.drop_id, [Part("work", "fix the build")])[0]
+    live = st.launch_request(tok, harness="claude", role="worker", threads=[thread.thread_id], cwd=str(filled / "levain-wt"))
     assert st.launch_activate(live.launch_id, harness_session_id="sess-live")[0]
+    stale = st.launch_request(tok, harness="claude", role="coordinator", cwd=str(filled))
+    assert st.launch_activate(stale.launch_id, harness_session_id="sess-stale")[0]
     out = board.build(filled, QuestionStore(filled))
     col, card = _cards(out)[f"seat:{live.launch_id}"]
-    assert col == "running" and card["journal"] is None and card["repo"] == "levain-wt" and "claude coordinator" in card["title"]
+    assert col == "running" and card["journal"] is None and card["repo"] == "" and "claude worker" in card["title"]
+    col, card = _cards(out)[f"seat:{stale.launch_id}"]
+    assert col == "waiting" and "no live lease" in card["title"]
     assert out["unreadable"] == []
     with pytest.raises(Exception):
         ready.move(st, tok, f"seat:{live.launch_id}", to="done", who="desk", why="no.")     # a projection is never writable
+
+
+def test_a_journal_record_ahead_of_its_state_row_is_not_attached_to_the_card(filled):
+    _sql(filled, _JOURNAL_V2)
+    out = board.build(filled, QuestionStore(filled))
+    col, card = _cards(out)["levain:c"]
+    assert col == "backlog" and card["journal"]["who"] == "desk" and card["journal"]["to_category"] == "backlog"
+    assert "levain:c" in str(out["unreadable"])
+
+
+def test_an_unreadable_journal_is_named_and_the_cards_stay(filled, monkeypatch):
+    real = ready._lifecycle_present
+    calls = []
+
+    def flaky(conn):
+        calls.append(1)
+        if len(calls) == 3:          # _current, _diverged, then the journal read
+            raise ready.CoordError("the journal is damaged")
+        return real(conn)
+
+    monkeypatch.setattr(ready, "_lifecycle_present", flaky)
+    out = board.build(filled, QuestionStore(filled))
+    assert out["queue"] == "ok" and "journal" in out["unreadable"] and "coordinator" not in out["unreadable"]
+    col, card = _cards(out)["levain:a"]
+    assert col == "running" and card["journal"] is None
 
 
 def test_build_writes_nothing(filled):
