@@ -385,16 +385,188 @@ def test_a_prompt_notice_needs_a_phone_and_a_fault_says_nothing(tmp_path, monkey
     assert calls == []
 
 
-def test_an_away_hold_pings_through_the_hold_path_and_sends_no_notice(tmp_path, monkeypatch):
-    """When an away hold routed the request to his devices (the hold path's own ping), the dialog that asks after it
-    gets no second notice."""
+_AWAY_HOLD = 0.3
+
+
+def _away(marked=True):
+    return claude_code.AdapterSettings(away_mode=True, away_marked=marked, away_hold_seconds=_AWAY_HOLD)
+
+
+def _cx_decide(q, settings, **kw):
+    from levain.consent.adapters import codex
+    from tests._h4 import h4_env, h4_home
+
+    e = {**_pr_event(), "session_id": "s-codex"}
+    return codex.decide(e, q, settings, environ=h4_env(), home=h4_home(), **kw)
+
+
+def _held_ping(calls, q, agent):
+    """The one push an away hold sends for the request it filed (the gate's own ping shape), the request withdrawn."""
+    assert [(c["kind"], c["push"], c["hold"], c["url"]) for c in calls] == [("consent", True, None, "/?view=needs")]
+    assert calls[0]["ref"].startswith("request:")
+    rid = calls[0]["ref"].split(":", 1)[1]
+    assert calls[0]["body"].startswith(f"{agent} waits on you up to ") and f"(request {rid})." in calls[0]["body"]
+    assert q.get(rid)[1] == "withdrawn"                    # the hold ran out and left the call to the dialog
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_an_away_hold_pings_the_request_to_his_devices_once_and_sends_no_notice(tmp_path, monkeypatch, agent):
+    """THE REPRODUCTION (fails on 71992bce: nothing pushes at all, codex HIGH 1). Away on (a signed mark), a paired
+    phone, a key that can sign: a plain PermissionRequest is filed and held for a signed answer, and ONE push for that
+    request goes to his devices when the hold starts, as the gate pings its filed request. The dialog that asks after
+    the hold gets no second notice."""
+    from levain.consent.adapters import codex
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    mod = codex if agent == "codex" else claude_code
+    monkeypatch.setattr(mod, "nothing_can_decide", lambda s, **kw: False)
+    max_hold = _AWAY_HOLD + claude_code.CLEANUP_RESERVE
+    if agent == "codex":
+        assert _cx_decide(q, codex.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=_AWAY_HOLD),
+                          max_hold=max_hold) is None
+    else:
+        assert _cc_decide(q, _away(), max_hold=max_hold) is None
+    _held_ping(calls, q, agent)
+
+
+def test_an_away_hold_is_held_only_when_it_ran_and_pinged(tmp_path, monkeypatch):
+    """decide_ex's ``held``: True for a hold that ran with its ping started; the hook's own answer is unchanged."""
+    from tests._h4 import h4_env, h4_home
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    _spy(monkeypatch, ACTIVE)
+    monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)
+    out = claude_code.decide_ex(_pr_event(), q, _away(), environ=h4_env(), home=h4_home(), launch_nonce="",
+                                contained_launch=None, max_hold=_AWAY_HOLD + claude_code.CLEANUP_RESERVE)
+    assert isinstance(out, claude_code.Abstained) and out.reason == "hold_expired" and out.held is True
+
+
+def _no_wait_clock():
+    # the deadline and the hold read 0; every later read is past the deadline, so the wait after queue.file is 0
+    ticks = iter([0.0, 0.0])
+    return lambda: next(ticks, 1e9)
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_hold_the_deadline_left_no_wait_for_sends_the_dialog_notice(tmp_path, monkeypatch, agent):
+    """codex MED 2 (fails on 71992bce: held=True with no hold run, so neither a ping nor a notice). The hold was above
+    zero when the request was filed, but the deadline left no wait after it: no hold ran and nothing pinged, so the
+    dialog's prompt notice goes, once, for the filed request."""
+    from levain.consent.adapters import codex
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    held = []
+    monkeypatch.setattr(claude_code, "hold_for_answer", lambda *a, **kw: held.append(a) or (None, None))
+    monkeypatch.setattr(codex, "hold_for_answer", lambda *a, **kw: held.append(a) or (None, None))
+    mod = codex if agent == "codex" else claude_code
+    monkeypatch.setattr(mod, "nothing_can_decide", lambda s, **kw: False)
+    max_hold = _AWAY_HOLD + claude_code.CLEANUP_RESERVE
+    if agent == "codex":
+        assert _cx_decide(q, codex.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=_AWAY_HOLD),
+                          max_hold=max_hold, clock=_no_wait_clock()) is None
+    else:
+        from tests._h4 import h4_env, h4_home
+
+        out = claude_code.decide_ex(_pr_event(), q, _away(), environ=h4_env(), home=h4_home(), launch_nonce="",
+                                    contained_launch=None, max_hold=max_hold, clock=_no_wait_clock())
+        assert isinstance(out, claude_code.Abstained) and out.held is False and calls == []   # decide_ex sends no notice
+        assert _cc_decide(q, _away(), max_hold=max_hold, clock=_no_wait_clock()) is None
+    assert held == []                                                    # no hold ran
+    assert [(c["kind"], c["push"]) for c in calls] == [("consent", True)]
+    assert calls[0]["body"].startswith(f"{agent} asks in its own dialog: ")
+    assert calls[0]["ref"].startswith("request:")
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_an_away_hold_whose_ping_cannot_start_sends_the_dialog_notice(tmp_path, monkeypatch, agent):
+    """A hold ran but its ping could not start: ``held`` is false, so the dialog's notice goes (never neither)."""
+    from levain.consent.adapters import codex
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    monkeypatch.setattr(claude_code, "_notify_ex", lambda *a, **kw: (False, False, False))
+    mod = codex if agent == "codex" else claude_code
+    monkeypatch.setattr(mod, "nothing_can_decide", lambda s, **kw: False)
+    max_hold = _AWAY_HOLD + claude_code.CLEANUP_RESERVE
+    if agent == "codex":
+        assert _cx_decide(q, codex.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=_AWAY_HOLD),
+                          max_hold=max_hold) is None
+    else:
+        assert _cc_decide(q, _away(), max_hold=max_hold) is None
+    assert [(c["kind"], c["push"]) for c in calls] == [("consent", True)]
+    assert calls[0]["body"].startswith(f"{agent} asks in its own dialog: ")
+
+
+def test_an_away_hold_ping_is_said_once_per_request(tmp_path, monkeypatch):
+    """The dedupe: a ping already on record for the request is not sent again, and the hold still counts as pinged."""
+    from levain.webpush.store import PushStore
+
+    qdir = tmp_path / "q"
+    qdir.mkdir()
+    _phone(qdir)
+    calls = _spy(monkeypatch, ACTIVE)
+    s = _away()
+    assert claude_code.hold_ping(s, qdir, "claude_code", "Bash: touch x", "r7", 300.0) is True
+    PushStore(qdir).add_ping("consent", "request:r7", "levain", "x")   # what the spawned child records
+    assert claude_code.hold_ping(s, qdir, "claude_code", "Bash: touch x", "r7", 300.0) is True
+    assert [c["ref"] for c in calls] == ["request:r7"]
+    assert calls[0]["body"] == "claude_code waits on you up to 300 s: Bash: touch x (request r7)."
+
+
+def test_an_away_hold_ping_never_raises(tmp_path, monkeypatch):
+    qdir = tmp_path / "q"
+    qdir.mkdir()
+    _phone(qdir)
+
+    def boom(*a, **kw):
+        raise RuntimeError("notify")
+    monkeypatch.setattr(claude_code, "_notify_ex", boom)
+    assert claude_code.hold_ping(_away(), qdir, "claude_code", "x", "r1", 1.0) is False
+
+
+def test_an_away_hold_ping_under_a_mute_is_queued_not_pushed(tmp_path, monkeypatch):
+    """A mute still holds the ping (notify's existing hold path queues it under its word), and a queued ping counts as
+    the request's one ping (``hold_ping`` true), so no dialog notice follows it."""
+    qdir = tmp_path / "q"
+    qdir.mkdir()
+    _phone(qdir)
+    calls = _spy(monkeypatch, ACTIVE)
+    intent.apply_settings(qdir, lets_through="nothing", idle=lambda: ACTIVE)
+    assert claude_code.hold_ping(_away(marked=False), qdir, "claude_code", "Bash: touch x", "r3", 300.0) is True
+    assert [(c["kind"], c["push"], bool(c["hold"]), c["ref"]) for c in calls] == [("consent", False, True, "request:r3")]
+
+
+def test_a_mute_without_a_mark_starts_no_hold_and_says_nothing(tmp_path, monkeypatch):
+    """The hold is unchanged: under the explicit word with no signed mark the presence record decides, and a mute keeps
+    approvals off his devices, so no hold runs and nothing is filed for one; the dialog asks and the mute says nothing
+    (the prompt notice's own rule)."""
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    held = []
+    monkeypatch.setattr(claude_code, "hold_for_answer", lambda *a, **kw: held.append(a) or (None, None))
+    monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)
+    intent.apply_settings(q.directory, lets_through="nothing", idle=lambda: ACTIVE)
+    assert _cc_decide(q, _away(marked=False), max_hold=_AWAY_HOLD + claude_code.CLEANUP_RESERVE) is None
+    assert held == [] and calls == []
+
+
+def test_a_signed_mark_under_a_mute_still_holds_and_pushes(tmp_path, monkeypatch):
+    """The mark rule is unchanged: a standing signed mark holds the request and pushes its approval whatever the record
+    says (auto_away.marked_push), so the held request's one ping goes."""
     q = _consent_queue(tmp_path)
     _phone(q.directory)
     calls = _spy(monkeypatch, ACTIVE)
     monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)
-    away = claude_code.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=0.3)
-    assert _cc_decide(q, away, max_hold=0.3 + claude_code.CLEANUP_RESERVE) is None
-    assert calls == []
+    intent.apply_settings(q.directory, lets_through="nothing", idle=lambda: ACTIVE)
+    assert _cc_decide(q, _away(), max_hold=_AWAY_HOLD + claude_code.CLEANUP_RESERVE) is None
+    _held_ping(calls, q, "claude_code")
 
 
 def test_codex_dialog_at_an_active_laptop_pings_the_devices_once(tmp_path, monkeypatch):

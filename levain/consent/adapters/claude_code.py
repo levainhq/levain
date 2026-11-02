@@ -862,8 +862,9 @@ class Abstained:
     gate's allow was taken but the request it names could not be read, twice (``take_unread``, nothing filed,
     ``request`` ``None``, ``why`` the take's request id), or the hold ended without one (``hold_expired``: a zero hold,
     a timeout, away mode ending, a lost withdraw race; ``request`` the filed request, ``why`` ``""``). Each becomes
-    the operator's own question. ``held`` is whether an away hold started for it (a hold above zero: the request
-    was routed to his devices for a signed answer); a hook caller sends a prompt notice only when it is false."""
+    the operator's own question. ``held`` is whether an away hold ran for it AND its ping to his devices started
+    (:func:`hold_ping`); a hook caller sends a prompt notice only when it is false, so a dialog that asks after a
+    hold that never ran (the deadline left no wait) or whose ping could not start still pings once."""
     call: CoreCall
     reason: Literal["no_decider", "hold_expired", "take_unread"]
     request: ExternalGateRequest | None
@@ -898,15 +899,15 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, enviro
            claude_pid: int | None = None, **kw: Any) -> dict[str, Any] | None:
     """The hook's output for one event, or ``None`` for no decision: :func:`hook_output` of a :class:`Decided`
     result of :func:`decide_ex` (called with ``launch_nonce=""`` and ``contained_launch=None``), else ``None``. An
-    :class:`Abstained` result with no away hold (``held`` false) also sends one :func:`prompt_notice`: the dialog asks,
-    and his devices hear that it waits. Raises what :func:`decide_ex` raises; the caller (:func:`main`) turns that
-    into no decision."""
+    :class:`Abstained` result whose request no away hold pinged (``held`` false) also sends one :func:`prompt_notice`:
+    the dialog asks, and his devices hear that it waits. Raises what :func:`decide_ex` raises; the caller
+    (:func:`main`) turns that into no decision."""
     out = decide_ex(event, queue, settings, environ=environ, home=home, claude_pid=claude_pid, launch_nonce="",
                     contained_launch=None, **kw)
     if isinstance(out, Decided):
         return hook_output(out.decision)
     if isinstance(out, Abstained) and not out.held:
-        # the agent's own dialog asks and no away hold routed the request to his devices: one notice that it waits
+        # the agent's own dialog asks and no away hold pinged his devices about the request: one notice that it waits
         # (Phill 11-02, np-e642162b (a); :func:`prompt_notice`, which never raises)
         try:
             c = out.call
@@ -939,7 +940,8 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
     ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. The hold is
     :func:`away_hold` (``idle`` is its input-idle source, default the platform's); ``still_away`` (:func:`main`
     passes :func:`still_away_from`) ends a hold early when it says away mode ended (the operator is back, or no
-    key could sign), leaving the native dialog to ask. ``policy``
+    key could sign), leaving the native dialog to ask. A hold that will run (a wait above zero after the request is
+    filed) first pings the request to his devices (:func:`hold_ping`), and the result's ``held`` says so. ``policy``
     (default :func:`levain.consent.policy.decide`) is only ever reached through :func:`guarded_policy`, called with
     the event's ``permission_mode`` as ``posture`` (``None`` when absent: no grant matches) and the tool input the
     request was filed for, and never for a request filed at :data:`AGENT_CONFIG_TIER`: a direct caller cannot
@@ -1047,7 +1049,12 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
                                            contained_launch=contained_launch), request)
         wait = min(hold, max(0.0, deadline - clock()))
         back = None
+        held = False
         if got is None and wait > 0:
+            # a hold will run: his devices hear of the request now, as the gate pings its filed request (Phill 11-02,
+            # np-e642162b (a)); `held` is true only when the hold ran and its ping started
+            held = hold_ping(settings, queue.directory, AGENT, _notice_what(tool_name, tool_input), request.id, wait)
+            wait = min(wait, max(0.0, deadline - clock()))   # the ping's spawn time comes out of the hold, not the reserve
             got, back = hold_for_answer(queue, request, wait, tool_input=tool_input, posture=posture,
                                         still_away=still_away, contained_launch=contained_launch)
         if got is None:
@@ -1065,7 +1072,7 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
             # delivery of it: a deny with its own cause, never a card for a row levain already allowed
             return Declined(call, "contained_delivery_refused")
         return Decided(call, request, got) if got is not None else Abstained(call, "hold_expired", request, "",
-                                                                             held=hold > 0)
+                                                                             held=held)
     finally:
         if not settled:
             # An exception between file() and the withdraw: withdraw now so no ghost request stays answerable
@@ -1360,8 +1367,16 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
     True when the notify command or a push started; False when neither is configured or neither could start (a
     command that did not start is still written to the record, as not started). A failed ping never fails the
     gate."""
+    started, pushed, _recorded = _notify_ex(settings, message, cwd=cwd, kind=kind, ref=ref)
+    return started or pushed
+
+
+def _notify_ex(settings: AdapterSettings, message: str, *, cwd: Path | str | None, kind: str,
+               ref: str | None) -> tuple[bool, bool, bool]:
+    """:func:`notify`'s work: (the notify command started, a push started, the ping's record child started). A ping a
+    mute holds is recorded (queued for the phone) and not pushed: ``(…, False, True)``."""
     started = _notify_argv(settings, message, cwd=cwd)
-    pushed = False
+    pushed = recorded = False
     if cwd is not None:
         try:
             from levain.consent.auto_away import approval_push
@@ -1380,8 +1395,35 @@ def notify(settings: AdapterSettings, message: str, *, cwd: Path | str | None = 
                                         command=started if settings.notify_argv else None, push=phone, hold=hold)
                 pushed = recorded and phone
         except Exception:  # noqa: BLE001 - a failed ping never fails the gate
-            pushed = False
-    return started or pushed
+            pushed = recorded = False
+    return started, pushed, bool(recorded)
+
+
+def hold_ping(settings: AdapterSettings, queue_dir: Path | str, agent: str, what: str, request_id: str,
+              wait: float) -> bool:
+    """Phill 11-02 (np-e642162b (a)): *"yes we DO want these to be able to find us ASAP"*. The ping for a
+    PermissionRequest filed and about to be held for a signed answer (an away hold that will run: ``wait`` above zero),
+    sent exactly as the PreToolUse gate pings its filed request (:func:`notify`, kind ``consent``, ref
+    ``request:<id>``), so presence and mutes rule it the same way (a mute queues it, :mod:`levain.webpush.held`). Said
+    once per ref: a ping already on record for the request (:func:`levain.webpush.pinged`, with a phone paired) is not
+    sent again. True when the ping was started (the notify command, a push, or the record child that queues a held
+    one) or is already on record; False when nothing could start, so the caller lets the dialog's prompt notice go.
+    Never raises."""
+    ref = f"request:{request_id}"
+    try:
+        from levain.webpush import live, pinged
+
+        if live(queue_dir) and pinged(queue_dir, ref):
+            return True
+    except Exception:  # noqa: BLE001 - the dedupe read failed: try the ping
+        pass
+    try:
+        started, pushed, recorded = _notify_ex(
+            settings, f"levain: {agent} waits on you up to {math.ceil(wait):g} s: {what} (request {request_id}).",
+            cwd=queue_dir, kind="consent", ref=ref)
+        return started or pushed or recorded
+    except Exception:  # noqa: BLE001 - a failed ping never fails the hook
+        return False
 
 
 def prompt_ref(request_id: str | None) -> str:
