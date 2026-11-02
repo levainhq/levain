@@ -157,3 +157,147 @@ def test_a_notify_token_is_minted_once_with_its_curl_listed_without_a_hash_and_r
     assert v[5].startswith("Backup (nightly) | May wake you through sleep") and "sha256" not in v[5]
     assert v[8][0] is True and v[8][1] == "" and v[8][2] is False               # gone after a reload, and no token text left anywhere
     assert nt.list_public(q) == []
+
+
+# ---- fix round r1: the repaint, the unsequenced reads, the failed dismiss and the revoke of another token -------------------------
+STUB = """(() => {
+  window.__real = window.fetch; window.__log = []; window.__delays = { notices: [], tokens: [] }; window.__fail = false;
+  window.__status = 0; window.__extra = false; window.__nfExtra = false;
+  const json = (o, st) => new Response(JSON.stringify(o), { status: st || 200, headers: { 'Content-Type': 'application/json' } });
+  window.fetch = async (u, o) => {
+    const m = (o && o.method) || 'GET';
+    window.__log.push(m + ' ' + u);
+    if (u === '/webpush/notices/dismiss' && window.__fail) return json({ message: 'locked' }, 503);
+    if (m === 'GET' && u === '/webpush/notices' && window.__status) return json({}, window.__status);
+    const r = await window.__real(u, o);
+    let out = r;
+    if (m === 'GET' && u === '/webpush/notices' && window.__extra) {
+      const d = await r.clone().json(); d.notices.unshift({ id: 9999, at: d.notices[0].at, source: 'x', title: 'Fresh', body: '', priority: 'low',
+        decision: 'recorded', opened: false, revoked: false }); out = json(d);
+    }
+    if (m === 'GET' && u === '/webpush/notify/tokens' && window.__nfExtra) {
+      const d = await r.clone().json(); d.tokens.push({ name: 'Late', source: 'Late', urgent: false, rate_per_min: 1, rate_per_day: 1, last_used: null }); out = json(d);
+    }
+    const q = m === 'GET' && u === '/webpush/notices' ? window.__delays.notices : m === 'GET' && u === '/webpush/notify/tokens' ? window.__delays.tokens : null;
+    const d = q && q.shift();
+    if (d) await new Promise((res) => setTimeout(res, d));
+    return out;
+  };
+  return 1; })()"""
+VIS = "document.dispatchEvent(new Event('visibilitychange')) || 1"
+WAIT = "(async () => { await new Promise((r) => setTimeout(r, %d)); return 1; })()"
+GETS = "window.__log.filter((l) => l === 'GET /webpush/notices').length"
+
+
+def _rows():
+    return f"{SEC}.querySelectorAll('.nt-row').length"
+
+
+@needs_browser
+def test_a_toggle_and_a_changed_pulse_repaint_keep_the_focus_and_the_node(rig, tmp_path, monkeypatch):
+    src, q = rig
+    _seed(q)
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": f"{SEC} && !{SEC}.hidden && {_rows()} === 3", "ms": 20000},
+            {"eval": STUB},
+            {"eval": f"(() => {{ const t = {SEC}.querySelectorAll('.nt-toggle')[1]; t.focus(); window.__t = t; window.__row = t.closest('.nt-row'); t.click(); "
+                     "return [document.activeElement === t, t.isConnected, window.__row.classList.contains('nt-open'), t.getAttribute('aria-expanded')]; })()"},
+            # a list that changed under it: the pulse repaints, and focus goes back to the same row's Dismiss by id
+            {"eval": f"(() => {{ const d = {SEC}.querySelectorAll('.nt-dismiss')[2]; d.focus(); window.__id = d.closest('.nt-row').dataset.id; window.__extra = true; return 1; }})()"},
+            {"eval": VIS},
+            {"until": f"{SEC}.querySelectorAll('.nt-row').length === 4", "ms": 8000},
+            {"eval": f"[document.activeElement.className, document.activeElement.closest('.nt-row').dataset.id === window.__id, {SEC}.querySelectorAll('.nt-open').length]"},
+            # the same rows again: nothing is repainted, so a click mid-pulse is never swallowed
+            {"eval": f"(() => {{ window.__keep = {SEC}.querySelector('.nt-row'); return 1; }})()"},
+            {"eval": VIS},
+            {"eval": WAIT % 600},
+            {"eval": f"window.__keep.isConnected"},
+        ])
+    v = out["values"]
+    assert v[2] == [True, True, True, "true"]
+    assert v[6][0] == "dev-btn nt-dismiss" and v[6][1] is True and v[6][2] == 1
+    assert v[10] is True
+
+
+@needs_browser
+def test_a_slow_older_read_never_resurrects_a_dismissed_notice_and_the_pulse_does_not_double_fire(rig, tmp_path, monkeypatch):
+    src, q = rig
+    _seed(q)
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": f"{SEC} && !{SEC}.hidden && {_rows()} === 3", "ms": 20000},
+            {"eval": STUB},
+            {"eval": "window.__delays.notices.push(1800) || 1"},
+            {"eval": VIS}, {"eval": VIS}, {"eval": VIS},
+            {"eval": GETS},
+            {"do": f"{SEC}.querySelector('.nt-dismiss').click()", "until": f"{_rows()} === 2", "ms": 8000},
+            {"eval": WAIT % 2600},
+            {"eval": _rows()},
+        ])
+    v = out["values"]
+    assert v[6] == 1                      # three pulses while a read is out: one request
+    assert v[9] == 2                      # the old snapshot (three rows) landed after the dismiss and was dropped
+
+
+@needs_browser
+def test_a_failed_dismiss_keeps_its_message_and_does_not_read_again(rig, tmp_path, monkeypatch):
+    src, q = rig
+    _seed(q)
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": f"{SEC} && !{SEC}.hidden && {_rows()} === 3", "ms": 20000},
+            {"eval": STUB},
+            {"eval": "window.__fail = true"},
+            {"eval": f"{GETS}"},
+            {"do": f"{SEC}.querySelector('.nt-dismiss').click()", "until": f"!{SEC}.querySelector('.nt-note').hidden", "ms": 8000},
+            {"eval": WAIT % 800},
+            {"eval": f"[{SEC}.querySelector('.nt-note').hidden, {SEC}.querySelector('.nt-note').textContent, {_rows()}, {GETS}]"},
+        ])
+    v = out["values"]
+    assert v[6][0] is False and v[6][1].startswith("Could not dismiss (locked)") and v[6][2] == 3
+    assert v[6][3] == v[3]                # no read followed the failure
+
+
+@needs_browser
+def test_a_403_hides_the_notices_and_stops_asking(rig, tmp_path, monkeypatch):
+    src, q = rig
+    _seed(q)
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": f"{SEC} && !{SEC}.hidden && {_rows()} === 3", "ms": 20000},
+            {"eval": STUB},
+            {"eval": "window.__status = 403"},
+            {"eval": VIS}, {"eval": WAIT % 500}, {"eval": VIS}, {"eval": VIS}, {"eval": WAIT % 500},
+            {"eval": f"[{SEC}.hidden, {GETS}]"},
+        ])
+    assert out["values"][8] == [True, 1]
+
+
+@needs_browser
+def test_revoking_another_token_keeps_a_just_minted_secret_and_the_pulse_refreshes_the_list(rig, tmp_path, monkeypatch):
+    src, q = rig
+    nt.create(q, "Other")
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": "document.querySelector('.nf-row[data-name=Other]')", "ms": 20000},
+            {"eval": STUB},
+            {"do": "document.querySelector('.nf-name').value='Fresh'; document.querySelector('.nf-mint').click()",
+             "until": "!document.querySelector('.nf-new').hidden", "ms": 8000},
+            {"eval": "document.querySelector('.nf-token').value"},
+            {"do": "document.querySelector('.nf-row[data-name=Other] .nf-revoke').click()", "until": "!document.querySelector('.nf-row[data-name=Other]')", "ms": 8000},
+            {"eval": "[document.querySelector('.nf-new').hidden, document.querySelector('.nf-token') && document.querySelector('.nf-token').value]"},
+            # the token list follows a pulse, not only a reload
+            {"eval": "window.__nfExtra = true"},
+            {"eval": VIS},
+            {"until": "document.querySelector('.nf-row[data-name=Late]')", "ms": 8000},
+            # a slow older token read never paints over a revoke made after it began
+            {"eval": "window.__nfExtra = false; window.__delays.tokens.push(1800) || 1"},
+            {"eval": VIS},
+            {"do": "document.querySelector('.nf-row[data-name=Fresh] .nf-revoke').click()", "until": "!document.querySelector('.nf-row[data-name=Fresh]')", "ms": 8000},
+            {"eval": WAIT % 2600},
+            {"eval": "[...document.querySelectorAll('.nf-row')].map((r) => r.dataset.name)"},
+        ])
+    v = out["values"]
+    assert v[5][0] is False and v[5][1] == v[3]                      # the minted secret is still on screen
+    assert v[13] == []                                               # Late was a stub row and Fresh was revoked; the stale snapshot is dropped

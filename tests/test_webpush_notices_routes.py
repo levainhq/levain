@@ -121,3 +121,26 @@ def test_a_cross_site_read_is_refused(rig):
     with _signed(src, q) as (port, _):
         st, got, _ = _call(port, "GET", LIST, token=T, headers={"Sec-Fetch-Site": "cross-site"})
         assert st == 403 and "notices" not in got
+
+
+@pytest.mark.parametrize("nid", [0, -1, 2 ** 63, 10 ** 30])
+def test_dismiss_refuses_an_id_outside_the_store_range_with_400_not_503(rig, nid):
+    src, q = rig
+    _seed(q)
+    with _signed(src, q) as (port, _):
+        st, got, _ = _call(port, "POST", DISMISS, {"id": nid}, token=T)
+        assert st == 400 and got["error"] == "bad_request"
+    assert len(PushStore(q).notices()) == 1
+
+
+def test_any_failure_reading_the_token_list_degrades_to_untagged_not_a_crash(rig, monkeypatch):
+    src, q = rig
+    nt.create(q, "Backup")
+    _seed(q, source="Old", token="Old")
+
+    def boom(_q):
+        raise OSError("unreadable")
+    monkeypatch.setattr(nt, "list_public", boom)
+    with _signed(src, q) as (port, _):
+        st, got, _ = _call(port, "GET", LIST, token=T)
+        assert st == 200 and got["notices"][0]["revoked"] is False

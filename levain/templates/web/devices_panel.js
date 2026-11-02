@@ -670,7 +670,8 @@
   // carries) always has somewhere to land. Every field is set with textContent (el() does), never as markup, and a URL in a body
   // stays inert text: no link, no reply, no deep link. Dismiss is the one action. It carries no count and no badge, it is not in
   // Needs-you, the board, the tray or the agents graph, and nothing else on the page learns what it holds.
-  let ntSec = null, ntList = null, ntNote = null, ntOpen = new Set(), ntGone = false, ntBusy = false, ntAsked = false;
+  let ntSec = null, ntList = null, ntNote = null, ntOpen = new Set(), ntGone = false, ntBusy = false, ntAsked = false,
+      ntGen = 0, ntReadId = 0, ntReading = false, ntSig = "", ntKind = "";
   try { ntAsked = new URLSearchParams(window.location.search).get("view") === "notices"; } catch (_) { ntAsked = false; }
   function buildNotices() {
     ntSec = el("section", "ck-zone dev-zone nt-zone");
@@ -694,8 +695,18 @@
     grid.appendChild(panel);
     ntSec.appendChild(grid);
   }
-  function ntSay(msg) { ntNote.textContent = msg; ntNote.hidden = !msg; }
+  function ntSay(msg, kind) { ntNote.textContent = msg; ntNote.hidden = !msg; ntKind = msg ? (kind || "") : ""; }
   function paintNotices(rows) {
+    // the same rows again paint nothing (a pulse never swallows a click or drops focus); a changed list gives focus back by id
+    const sig = JSON.stringify(rows);
+    if (sig === ntSig && ntList.firstChild) return;
+    ntSig = sig;
+    let keep = null;
+    const act = document.activeElement;
+    if (act && ntList.contains(act)) {
+      const r = act.closest(".nt-row");
+      if (r) keep = [r.dataset.id, act.classList.contains("nt-dismiss") ? "nt-dismiss" : "nt-toggle"];
+    }
     ntList.replaceChildren();
     if (!rows.length) { ntList.appendChild(el("p", "dev-none nt-empty", "No notices right now.")); return; }
     for (const n of rows) {
@@ -717,7 +728,11 @@
       tg.setAttribute("aria-expanded", open ? "true" : "false");
       tg.appendChild(el("span", "nt-title", String(n.title || "")));
       if (n.body) tg.appendChild(el("span", "nt-body", String(n.body)));
-      tg.addEventListener("click", () => { if (ntOpen.has(n.id)) ntOpen.delete(n.id); else ntOpen.add(n.id); paintNotices(rows); });
+      tg.addEventListener("click", () => {
+        const now = !ntOpen.has(n.id);
+        if (now) ntOpen.add(n.id); else ntOpen.delete(n.id);
+        row.classList.toggle("nt-open", now); tg.setAttribute("aria-expanded", now ? "true" : "false");   // in place: focus stays
+      });
       main.appendChild(tg);
       row.appendChild(main);
       const dm = el("button", "dev-btn nt-dismiss", "Dismiss");
@@ -726,31 +741,44 @@
       row.appendChild(dm);
       ntList.appendChild(row);
     }
+    if (keep) {
+      for (const r of ntList.querySelectorAll(".nt-row")) {
+        if (r.dataset.id !== keep[0]) continue;
+        const c = r.querySelector("." + keep[1]);
+        if (c) c.focus({ preventScroll: true });
+        break;
+      }
+    }
   }
-  async function readNotices() {
-    if (ntGone || ntBusy) return;
-    if (!token()) { ntSec.hidden = true; return; }
+  async function readNotices(force) {
+    if (!ntSec || ntGone) return;
+    if (!force && (ntBusy || ntReading)) return;
+    const startedAt = ntGen, mine = ++ntReadId;     // only the newest read, begun after the last mutation, paints
+    ntReading = true;
     try {
+      if (!token()) { ntSec.hidden = true; return; }
       const res = await api("GET", "/webpush/notices", undefined, READ_TIMEOUT_MS);
+      if (startedAt !== ntGen || mine !== ntReadId) return;
       if (res.status === 200 && res.data && Array.isArray(res.data.notices)) {
-        paintNotices(res.data.notices); ntSay(""); ntSec.hidden = false;
+        paintNotices(res.data.notices); if (ntKind === "read") ntSay(""); ntSec.hidden = false;
         if (ntAsked) { ntAsked = false; try { window.history.replaceState(null, "", window.location.pathname + window.location.hash); } catch (_) { /* the address stays */ } toNotices(); }
-      } else if (res.status === 404) { ntSec.hidden = true; ntGone = true; }
-      else if (res.status === 403) ntSec.hidden = true;
-      else if (!ntSec.hidden) ntSay("The notices are unavailable right now.");
+      } else if (res.status === 404 || res.status === 403) { ntSec.hidden = true; ntGone = true; }
+      else if (!ntSec.hidden) ntSay("The notices are unavailable right now.", "read");
     } catch (_) { /* the next pulse tries again */ }
+    finally { if (mine === ntReadId) ntReading = false; }
   }
   async function dismissNotice(id) {
     if (ntBusy) return;
-    ntBusy = true; ntSay("");
+    ntBusy = true; ntGen++; ntSay("");
+    let ok = false;
     try {
       const res = await api("POST", "/webpush/notices/dismiss", { id: id });
-      // gone already (another device dismissed it) reads as a dismiss: the list is read again either way
-      if (res.status !== 200 && res.status !== 404) ntSay("Could not dismiss (" + ((res.data && res.data.message) || res.status) + ").");
-      ntOpen.delete(id);
-    } catch (_) { ntSay("Could not reach the cockpit."); }
-    finally { ntBusy = false; }
-    await readNotices();
+      // gone already (another device dismissed it) reads as a dismiss; a failure keeps its message until the next action
+      if (res.status === 200 || res.status === 404) { ok = true; ntOpen.delete(id); }
+      else ntSay("Could not dismiss (" + ((res.data && res.data.message) || res.status) + ").", "act");
+    } catch (_) { ntSay("Could not reach the cockpit.", "act"); }
+    finally { ntBusy = false; ntGen++; }
+    if (ok) await readNotices(true);
   }
   function toNotices() {
     if (!ntSec || ntSec.hidden) return;
@@ -761,7 +789,7 @@
   // ---- notify tokens: what lets one of your own services post a notice at you (POST /notify) -------------------------------
   // Shown wherever the full credential reads the list (the push family's gate lets nothing else through); the new token is
   // in the mint reply alone, shown once in this node and kept nowhere, and the list never carries a hash.
-  let nfPanel = null, nfList = null, nfNew = null, nfNote = null, nfName = null, nfSource = null, nfUrgent = null, nfBusy = false;
+  let nfPanel = null, nfList = null, nfNew = null, nfNote = null, nfName = null, nfSource = null, nfUrgent = null, nfBusy = false, nfGen = 0, nfReadId = 0, nfReading = false;
   function buildNotify() {
     nfPanel = el("div", "panel k-list dev-panel pr-panel nf-panel");
     nfPanel.dataset.modes = ALL_MODES;
@@ -821,12 +849,17 @@
     }
   }
   async function readNotify() {
+    if (nfBusy || nfReading) return;
     if (!token()) { nfShow(false); return; }
+    const startedAt = nfGen, mine = ++nfReadId;     // a read begun before a mutation never paints over it
+    nfReading = true;
     try {
       const res = await api("GET", "/webpush/notify/tokens", undefined, READ_TIMEOUT_MS);
+      if (startedAt !== nfGen || mine !== nfReadId) return;
       if (res.status === 200 && res.data && Array.isArray(res.data.tokens)) { paintNotify(res.data.tokens); nfShow(true); }
       else if (res.status === 403 || res.status === 404) nfShow(false);
     } catch (_) { /* the next pulse tries again */ }
+    finally { if (mine === nfReadId) nfReading = false; }
   }
   async function notifyCall(path, body) {
     nfSay("");
@@ -841,7 +874,7 @@
     const name = nfName.value.trim();
     if (!name) { nfSay("Give the notify token a name."); return; }
     if (nfBusy) return;     // a second mint would replace the first one's only shown secret
-    nfBusy = true;
+    nfBusy = true; nfGen++;
     try {
       const body = { name: name };
       const src = nfSource.value.trim();
@@ -851,7 +884,7 @@
       if (!got || !got.token) return;
       nfName.value = ""; nfSource.value = ""; nfUrgent.checked = false;
       showNewNotify(got.token, got.record || {});
-    } finally { nfBusy = false; }
+    } finally { nfBusy = false; nfGen++; }
   }
   function notifyCurl(tok) {
     return "curl -H \"Authorization: Bearer " + tok + "\" -H \"Content-Type: application/json\" -d '{\"title\":\"..\",\"body\":\"..\"}' "
@@ -859,6 +892,7 @@
   }
   function showNewNotify(tok, rec) {
     nfNew.replaceChildren();
+    nfNew.dataset.name = String(rec.name || "");
     nfNew.appendChild(el("div", "dev-name", "Token for " + (rec.name || "this service") + ": copy it now, it is not shown again"));
     const line = el("input", "dev-url nf-token");
     line.type = "text"; line.readOnly = true; line.value = tok;
@@ -879,12 +913,12 @@
   }
   async function revokeNotify(name) {
     if (nfBusy) return;
-    nfBusy = true;
+    nfBusy = true; nfGen++;
     try {
-      // the one-time secret on screen goes only when a revoke succeeded, never on a refusal
+      // the one-time secret on screen goes only when ITS token's revoke succeeded, never on a refusal or another token's
       const got = await notifyCall("/webpush/notify/tokens/revoke", { name: name });
-      if (got) { nfNew.hidden = true; nfNew.replaceChildren(); }
-    } finally { nfBusy = false; }
+      if (got && nfNew.dataset.name === name) { nfNew.hidden = true; nfNew.replaceChildren(); delete nfNew.dataset.name; }
+    } finally { nfBusy = false; nfGen++; }
   }
 
   function loadDur() {
@@ -1257,10 +1291,14 @@
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
     setTimeout(() => { refresh(); readPolicy(); readPresence(); readNotify(); readNotices(); }, 2500);
     // a tab brought back after a long time repaints at once, not at the next pulse
-    document.addEventListener("visibilitychange", () => { if (!document.hidden && !prGone && !prBusy) readPresence(); });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) return;
+      if (!prGone && !prBusy) readPresence();
+      readNotify(); readNotices();
+    });
     const pulse = setInterval(() => {
       if (gone && npGone && prGone) clearInterval(pulse);
-      else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); if (!prBusy) readPresence(); readNotices(); }
+      else if (!document.hidden) { if (!gone) refresh(); if (!npBusy) readPolicy(); if (!prBusy) readPresence(); readNotify(); readNotices(); }
     }, 30000);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();

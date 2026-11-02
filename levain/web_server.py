@@ -2566,7 +2566,7 @@ class _Handler(GuardedHandler):
             return {"error": "notices_unreadable", "message": type(exc).__name__}, 503
         try:
             live = {t["name"] for t in notify_tokens.list_public(queue)}
-        except notify_tokens.NotifyTokenError:
+        except Exception:  # noqa: BLE001 - any failure reading the token file tags nothing, the list still answers
             live = None      # the token file cannot be read whole: no row is tagged revoked on a guess
         return {"notices": [
             {"id": r["id"], "at": r["at"], "source": r["source"], "title": r["title"], "body": r["body"],
@@ -2583,7 +2583,7 @@ class _Handler(GuardedHandler):
         except (ValueError, UnicodeDecodeError):
             return {"error": "bad_json", "message": "body is not valid JSON"}, 400
         nid = req.get("id") if isinstance(req, dict) and set(req) == {"id"} else None
-        if isinstance(nid, bool) or not isinstance(nid, int):
+        if isinstance(nid, bool) or not isinstance(nid, int) or not 1 <= nid <= 2 ** 63 - 1:
             return {"error": "bad_request", "message": "send id as a whole number, and nothing else"}, 400
         try:
             done = PushStore(self.server.signer.queue_dir).dismiss_notice(nid)
