@@ -236,9 +236,11 @@ def migrate_agent_schema(conn: sqlite3.Connection) -> bool:
     reason."""
     own = not conn.in_transaction
     conn.execute("BEGIN IMMEDIATE" if own else f"SAVEPOINT {_SAVEPOINT}")
+    open_ = True    # the transaction (own) or the savepoint (joined) this call began and has not yet ended
     try:
         if agent_marker(conn) != AGENT_SCHEMA_V2:
             conn.execute("ROLLBACK" if own else f"RELEASE {_SAVEPOINT}")
+            open_ = False
             return False
         have = {r[1] for r in conn.execute("PRAGMA table_info(agent_reservations)")}
         if not have:
@@ -252,12 +254,20 @@ def migrate_agent_schema(conn: sqlite3.Connection) -> bool:
         if reason is not None:
             raise AgentSchemaNotMigrated(f"the /2 agent schema did not migrate cleanly: {reason}")
         conn.execute("COMMIT" if own else f"RELEASE {_SAVEPOINT}")
+        open_ = False
         return True
-    except BaseException:
-        if conn.in_transaction:
-            if own:
-                conn.execute("ROLLBACK")
-            else:
-                conn.execute(f"ROLLBACK TO {_SAVEPOINT}")
-                conn.execute(f"RELEASE {_SAVEPOINT}")
+    except BaseException as err:
+        # best-effort teardown: a failing ROLLBACK / RELEASE ("no such savepoint") must not replace the real error
+        if open_ and conn.in_transaction:
+            try:
+                if own:
+                    conn.execute("ROLLBACK")
+                else:
+                    conn.execute(f"ROLLBACK TO {_SAVEPOINT}")
+                    conn.execute(f"RELEASE {_SAVEPOINT}")
+            except sqlite3.Error:
+                pass
+        if isinstance(err, sqlite3.Error) and not isinstance(err, AgentSchemaNotMigrated):
+            # one error class for the opener to catch; the store is left /2 and the cause is chained
+            raise AgentSchemaNotMigrated(f"the /2 agent schema did not migrate cleanly: {err}") from err
         raise

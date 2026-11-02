@@ -714,3 +714,69 @@ def test_the_opener_touches_no_other_agent_marker(v2, marker):
     with AutonomicDB(v2.parent).write() as c:
         assert at.agent_marker(c) == marker
         assert c.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall() == before
+
+
+def _v2_with_a_view_for_the_reservations(v2):
+    c = connect(v2)
+    c.execute("ALTER TABLE agent_reservations RENAME TO res_old")
+    c.execute("CREATE VIEW agent_reservations AS SELECT * FROM res_old")
+    return c
+
+
+def test_a_sqlite_error_inside_the_migration_is_raised_as_agent_schema_not_migrated_and_chained(v2):
+    """L3 r2 (complement MED / deepseek): a view where the table was made ALTER raise a bare OperationalError."""
+    c = _v2_with_a_view_for_the_reservations(v2)
+    with pytest.raises(at.AgentSchemaNotMigrated, match="did not migrate cleanly") as ei:
+        at.migrate_agent_schema(c)
+    assert isinstance(ei.value.__cause__, sqlite3.OperationalError) and "view" in str(ei.value.__cause__).lower()
+    assert not c.in_transaction and at.agent_marker(c) == at.AGENT_SCHEMA_V2
+    c.close()
+
+
+def test_the_opener_opens_a_v2_store_whose_reservations_are_a_view_and_leaves_it_v2(v2):
+    from levain.agents.store import AgentStoreRefused, open_agent_store
+
+    _v2_with_a_view_for_the_reservations(v2).close()
+    with AutonomicDB(v2.parent).write() as c:
+        assert at.agent_marker(c) == at.AGENT_SCHEMA_V2
+    with pytest.raises(AgentStoreRefused):
+        open_agent_store(v2.parent)
+
+
+class _FailingConn:
+    """Delegates to a real connection but raises on the named statement prefix (sqlite3.Connection is not subclassable
+    for execute without a factory, so a thin proxy)."""
+
+    def __init__(self, conn, prefix, error):
+        self._c, self._prefix, self._error = conn, prefix, error
+
+    def execute(self, sql, *a):
+        if sql.startswith(self._prefix):
+            raise self._error
+        return self._c.execute(sql, *a)
+
+    @property
+    def in_transaction(self):
+        return self._c.in_transaction
+
+
+@pytest.mark.parametrize("prefix", ["RELEASE", "ROLLBACK TO"])
+def test_a_failing_savepoint_teardown_does_not_replace_the_original_error(v2, prefix):
+    """L3 r2 (complement LOW): 'no such savepoint' from the teardown masked the real failure."""
+    real = connect(v2)
+    real.execute("DROP TRIGGER agent_occurrences_one_fire")     # the check fails, so the handler runs
+    real.execute("BEGIN IMMEDIATE")
+    c = _FailingConn(real, prefix, sqlite3.OperationalError("no such savepoint: levain_agent_schema_v3"))
+    with pytest.raises(at.AgentSchemaNotMigrated, match="did not migrate cleanly"):
+        at.migrate_agent_schema(c)
+    real.close()
+
+
+def test_a_failing_release_on_the_success_path_raises_the_release_error_not_a_masking_one(v2):
+    real = connect(v2)
+    real.execute("BEGIN IMMEDIATE")
+    c = _FailingConn(real, "RELEASE", sqlite3.OperationalError("disk I/O error"))
+    with pytest.raises(at.AgentSchemaNotMigrated) as ei:
+        at.migrate_agent_schema(c)
+    assert "disk I/O error" in str(ei.value.__cause__)
+    real.close()
