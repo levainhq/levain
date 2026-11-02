@@ -151,21 +151,40 @@ def test_a_count_above_its_cap_is_a_breach_and_pauses_the_agent(store, actions, 
     assert _operation(store) == "paused"
 
 
-@pytest.mark.parametrize("usage", [
-    Usage(None, None, None, "t"),                                           # nothing read
-    Usage(None, None, None, "t", actions=None, tunnel_bytes=10, seconds=1),
-    Usage(None, None, None, "t", actions=-1, tunnel_bytes=10, seconds=1),
-    Usage(None, None, None, "t", actions=5, tunnel_bytes=None, seconds=1),  # a byte cap exists and no total was read
-    Usage(None, None, None, "t", actions=True, tunnel_bytes=10, seconds=1),
+@pytest.mark.parametrize("usage, used", [
+    (Usage(None, None, None, "t"), (20, 5_000_000, 3600)),                  # nothing read
+    (Usage(None, None, None, "t", actions=None, tunnel_bytes=10, seconds=1), (20, 10, 1)),
+    (Usage(None, None, None, "t", actions=-1, tunnel_bytes=10, seconds=1), (20, 10, 1)),
+    # a byte cap exists and no total was read: the readable action count is recorded, the byte cap stands in
+    (Usage(None, None, None, "t", actions=5, tunnel_bytes=None, seconds=1), (5, 5_000_000, 1)),
+    (Usage(None, None, None, "t", actions=True, tunnel_bytes=10, seconds=1), (20, 10, 1)),
 ])
-def test_unreadable_usage_records_the_caps_as_used_and_is_no_breach(store, usage):
+def test_an_unreadable_count_records_its_own_cap_as_used_and_is_no_breach(store, usage, used):
     _with_agent(store)
     _reserve(store)
     out = _settle(store, usage)
     assert (out.debited_usd_micros, out.breach, out.basis) == (0, False, "unreadable")
     r = _row(store)
-    assert (r["used_actions"], r["used_tunnel_bytes"]) == (20, 5_000_000)
+    assert (r["used_actions"], r["used_tunnel_bytes"], r["used_seconds"]) == used
     assert _operation(store) == "active"
+
+
+@pytest.mark.parametrize("usage, used", [
+    # L3 r1 (complement MED): 500 calls on a cap of 20 were masked as "unreadable" by a missing byte total
+    (Usage(None, None, None, "t", actions=500, tunnel_bytes=None, seconds=1), (500, 5_000_000)),
+    (Usage(None, None, None, "t", actions=500, tunnel_bytes="?", seconds=1), (500, 5_000_000)),
+    # and the other axis: a byte breach with no readable action count
+    (Usage(None, None, None, "t", actions=None, tunnel_bytes=5_000_000 + FRONT_READ_BUFFER + 1, seconds=1),
+     (20, 5_000_000 + FRONT_READ_BUFFER + 1)),
+])
+def test_a_known_breach_on_one_axis_stays_a_breach_whatever_the_other_reads(store, usage, used):
+    _with_agent(store)
+    _reserve(store)
+    out = _settle(store, usage)
+    assert (out.debited_usd_micros, out.breach, out.basis) == (0, True, "breach")
+    r = _row(store)
+    assert (r["used_actions"], r["used_tunnel_bytes"]) == used
+    assert _operation(store) == "paused"
 
 
 def test_a_run_with_no_byte_cap_needs_no_byte_total(store):
@@ -173,7 +192,55 @@ def test_a_run_with_no_byte_cap_needs_no_byte_total(store):
     _reserve(store, executor=_SubExec(action=ActionExposure(5, "turns", 600, None)))
     out = _settle(store, Usage(None, None, None, "t", actions=5))
     assert (out.breach, out.basis) == (False, "actual")
-    assert (_row(store)["used_actions"], _row(store)["used_tunnel_bytes"]) == (5, None)
+    r = _row(store)
+    assert (r["used_actions"], r["used_tunnel_bytes"], r["used_seconds"]) == (5, None, 600)
+
+
+@pytest.mark.parametrize("nbytes", [FRONT_READ_BUFFER + 1, 10**12, 2**63 + 5])
+def test_a_run_with_no_byte_cap_cannot_breach_on_bytes_and_records_what_it_reports(store, nbytes):
+    """L3 r1 (codex HIGH, deepseek HIGH): a NULL byte cap was read as a cap of 0, so 65537 bytes paused the agent."""
+    _with_agent(store)
+    _reserve(store, executor=_SubExec(action=ActionExposure(5, "turns", 600, None)))
+    out = _settle(store, Usage(None, None, None, "t", actions=5, tunnel_bytes=nbytes, seconds=9))
+    assert (out.breach, out.basis) == (False, "actual")
+    assert _row(store)["used_tunnel_bytes"] == min(nbytes, 2**63 - 1)
+    assert _operation(store) == "active"
+
+
+def test_a_run_with_no_byte_cap_still_breaches_on_actions(store):
+    _with_agent(store)
+    _reserve(store, executor=_SubExec(action=ActionExposure(5, "turns", 600, None)))
+    out = _settle(store, Usage(None, None, None, "t", actions=6, tunnel_bytes=10**9, seconds=9))
+    assert (out.breach, out.basis) == (True, "breach")
+    assert _operation(store) == "paused"
+
+
+HUGE = Limits(run_ceiling=2, budget_window_usd_micros=0, billing="subscription", budget_run_calls=2**64,
+              budget_run_tunnel_bytes=2**64, **SPAN)
+HUGE_B = Limits(run_ceiling=2, budget_window_usd_micros=0, billing="subscription", budget_run_calls=20,
+                budget_run_tunnel_bytes=2**64, **SPAN)
+
+
+@pytest.mark.parametrize("action, limits", [
+    (ActionExposure(1, "tool_calls", 2**63, None), SUB),                    # L3 r1 (codex, deepseek): OverflowError
+    (ActionExposure(1, "tool_calls", 10**30, 5), SUB),
+    (ActionExposure(2**63, "tool_calls", 60, None), HUGE),                  # a link cap past INTEGER range admits none
+    (ActionExposure(1, "tool_calls", 60, 2**63), HUGE_B),                   # bytes past range under a larger link cap
+    (ActionExposure(1, "tool_calls", 60, 5),                                # a link with no readable byte cap
+     Limits(run_ceiling=2, budget_window_usd_micros=0, billing="subscription", budget_run_calls=20,
+            budget_run_tunnel_bytes=None, **SPAN)),
+])
+def test_an_exposure_field_past_sqlite_integer_range_refuses_and_does_not_raise(store, action, limits):
+    _, out = _reserve(store, executor=_SubExec(action=action), limits=limits)
+    assert out == Refused("no_exposure")
+    with store.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM agent_reservations").fetchone()[0] == 0
+
+
+def test_the_largest_integer_deadline_is_still_reserved(store):
+    _, out = _reserve(store, executor=_SubExec(action=ActionExposure(1, "tool_calls", 2**63 - 1, None)))
+    assert out == Reserved(0)
+    assert _row(store)["cap_seconds"] == 2**63 - 1
 
 
 def test_settling_twice_reports_already_settled_and_keeps_the_first_usage(store):

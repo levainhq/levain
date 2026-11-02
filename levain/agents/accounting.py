@@ -160,21 +160,29 @@ def _is_positive(value: object) -> bool:
     return _is_amount(value) and value > 0  # type: ignore[operator]
 
 
+def _is_stored(value: object) -> bool:
+    """A positive integer a SQLite INTEGER column holds (binding a larger one raises ``OverflowError``)."""
+    return _is_positive(value) and value <= _MAX_MICROS  # type: ignore[operator]
+
+
 def _subscription_exposure(executor: object, limits: Limits) -> ActionExposure | None:
     """The executor's ``ActionExposure`` when it is a valid subscription statement, else None (refused fail-closed):
     no non-zero dollar exposure, an :class:`ActionExposure` whose ``actions`` and ``seconds`` are positive integers,
-    whose ``unit`` is a known one, whose ``actions`` and any ``tunnel_bytes`` are within the link's per-run caps."""
+    whose ``unit`` is a known one, whose ``actions`` and any ``tunnel_bytes`` are within the link's per-run caps, and
+    whose every stored field fits a SQLite INTEGER. ``seconds`` has no link cap to sit under (A0 r8: the wall-clock cap
+    is the spec's ``stop_at``, signed through ``spec_hash``, not a link field), so the INTEGER bound is its only one."""
     dollars = getattr(executor, "max_exposure_usd_micros", None)
     if type(dollars) is not int or dollars != 0:
         return None
     exp = getattr(executor, "action_exposure", None)
-    if not isinstance(exp, ActionExposure) or exp.unit not in _UNITS:
+    if not isinstance(exp, ActionExposure) or type(exp.unit) is not str or exp.unit not in _UNITS:
         return None
-    if not _is_positive(exp.actions) or not _is_positive(exp.seconds):
+    if not _is_stored(exp.actions) or not _is_stored(exp.seconds):
         return None
-    if not _is_positive(limits.budget_run_calls) or exp.actions > limits.budget_run_calls:
+    if not _is_stored(limits.budget_run_calls) or exp.actions > limits.budget_run_calls:
         return None
-    if exp.tunnel_bytes is not None and (not _is_positive(exp.tunnel_bytes)
+    if exp.tunnel_bytes is not None and (not _is_stored(exp.tunnel_bytes)
+                                         or not _is_amount(limits.budget_run_tunnel_bytes)
                                          or exp.tunnel_bytes > limits.budget_run_tunnel_bytes):
         return None
     return exp
@@ -311,25 +319,34 @@ def settle(conn: sqlite3.Connection, occurrence: Mapping | sqlite3.Row, usage: U
 def _settle_subscription(conn: sqlite3.Connection, me: str, agent: str, cap_actions: int | None,
                          cap_bytes: int | None, cap_seconds: int | None, usage: Usage) -> Settled:
     """Settle a subscription reservation (P7-A §2.2's rows): no dollars are debited whatever ``usd_micros`` says. A
-    count above its cap (actions above ``cap_actions``, bytes above ``cap_tunnel_bytes`` plus one front read buffer; a
-    run with no byte cap has none to pass) is a breach: the actual is recorded, the agent is paused in this
-    transaction and the caller ends the row ``failed``. An unreadable action count, or an unreadable byte total where a
-    byte cap exists, records the caps as used and is no breach. Seconds are recorded and judged by neither rule."""
+    count above its cap (actions above ``cap_actions``, bytes above ``cap_tunnel_bytes`` plus one front read buffer)
+    is a breach: the actual is recorded, the agent is paused in this transaction and the caller ends the row
+    ``failed``. Each axis is judged on its own: a known breach on one stays a breach whatever the other reads. An
+    unreadable count records its own cap as used (A0 r8's unreadable row) and, with no breach elsewhere, the basis is
+    ``unreadable``. Seconds are recorded (the cap when unreadable) and judged by neither rule.
+
+    A run with no byte cap (``cap_tunnel_bytes`` NULL) cannot breach on bytes. A0 r8 allows a None ``tunnel_bytes``
+    only for an executor that grants no process-starting tool (§2.6; P7-A §5: nothing it does escapes the action
+    limit), so such a run has no front, and the breach row's "bytes above max_tunnel_bytes plus one front read buffer"
+    has no cap and no buffer to measure against. A byte total it reports anyway is recorded as evidence, never judged
+    against an invented cap; that the run started no process is the executor's grant to keep, not this count's."""
     actions = getattr(usage, "actions", None)
     nbytes = getattr(usage, "tunnel_bytes", None)
     seconds = getattr(usage, "seconds", None)
     cap_a = int(cap_actions or 0)
     cap_b = None if cap_bytes is None else int(cap_bytes)
-    readable = _is_amount(actions) and (cap_b is None or _is_amount(nbytes))
-    if not readable:
-        used_a, used_b, basis, breach = cap_a, cap_b, "unreadable", False
-        used_s = cap_seconds if not _is_amount(seconds) else min(seconds, _MAX_MICROS)  # type: ignore[type-var]
+    a_read, b_read = _is_amount(actions), _is_amount(nbytes)
+    used_a = min(actions, _MAX_MICROS) if a_read else cap_a  # type: ignore[type-var]
+    used_b = min(nbytes, _MAX_MICROS) if b_read else cap_b  # type: ignore[type-var]
+    used_s = min(seconds, _MAX_MICROS) if _is_amount(seconds) else cap_seconds  # type: ignore[type-var]
+    breach = (a_read and actions > cap_a) or (  # type: ignore[operator]
+        cap_b is not None and b_read and nbytes > cap_b + FRONT_READ_BUFFER)  # type: ignore[operator]
+    if breach:
+        basis = "breach"
+    elif not a_read or (cap_b is not None and not b_read):
+        basis = "unreadable"
     else:
-        used_a = min(actions, _MAX_MICROS)  # type: ignore[type-var]
-        used_b = None if not _is_amount(nbytes) else min(nbytes, _MAX_MICROS)  # type: ignore[type-var]
-        used_s = None if not _is_amount(seconds) else min(seconds, _MAX_MICROS)  # type: ignore[type-var]
-        breach = actions > cap_a or (used_b is not None and used_b > (cap_b or 0) + FRONT_READ_BUFFER)  # type: ignore[operator]
-        basis = "breach" if breach else "actual"
+        basis = "actual"
     conn.execute("UPDATE agent_reservations SET state = 'settled', debited_usd_micros = 0, settled_reason = ?,"
                  " used_actions = ?, used_tunnel_bytes = ?, used_seconds = ? WHERE occurrence_id = ? AND state = 'open'",
                  (basis, used_a, used_b, used_s, me))

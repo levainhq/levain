@@ -17,7 +17,8 @@ import sqlite3
 
 __all__ = ["AGENT_SCHEMA", "AGENT_TABLES", "AGENT_TRIGGERS", "AGENT_OBJECT_DDL", "create_agent_objects",
            "ddl_agents", "agent_master", "reference_master", "has_agent_object", "agent_marker",
-           "check_agent_schema", "AGENT_SCHEMA_V2", "RESERVATION_COLUMNS_V3", "migrate_agent_schema"]
+           "check_agent_schema", "AGENT_SCHEMA_V2", "RESERVATION_COLUMNS_V3", "migrate_agent_schema",
+           "AgentSchemaNotMigrated"]
 
 # /1 named A0 r6's twelve-trigger text (F0 r1, never merged); a store carrying it is refused as an unknown marker.
 # /2 shipped in 0.11.27. /3 adds the seven subscription-route columns to agent_reservations (P7-A §4) and is the first
@@ -211,26 +212,37 @@ def check_agent_schema(conn: sqlite3.Connection) -> str | None:
     return None
 
 
+class AgentSchemaNotMigrated(sqlite3.DatabaseError):
+    """A ``/2`` store that does not reach the ``/3`` reference by the migration (its agent objects were altered by
+    hand): nothing of the migration is kept and the store stays ``/2``, which ``levain agents`` then refuses."""
+
+
+_SAVEPOINT = "levain_agent_schema_v3"
+
+
 def migrate_agent_schema(conn: sqlite3.Connection) -> bool:
     """Take a ``/2`` store to ``/3``: the seven reservation columns, then the marker, in ONE ``BEGIN IMMEDIATE``.
     Returns True when it migrated, False when the store was not a ``/2`` store (no marker, already ``/3``, or any other
     marker: all left untouched, so the caller's opener still refuses an unknown marker through
     :func:`check_agent_schema`).
 
-    Inside a caller's open transaction it joins it (the caller commits or rolls back); otherwise it opens its own.
-    A column already present is skipped, and the marker bump is the last write, so a second run, or one after a crash
-    (which rolled the whole transaction back), lands in the same place. After the writes the store must pass
-    :func:`check_agent_schema` against the ``/3`` reference; a ``/2`` store whose objects were altered by hand fails
-    that, nothing is kept, and the check's reason is raised as ``sqlite3.DatabaseError``."""
+    Inside a caller's open transaction it joins it under a SAVEPOINT (the caller commits or rolls back the whole);
+    otherwise it opens its own. On any failure its own writes are undone either way (the savepoint is rolled back to),
+    so a caller that catches the error and commits keeps no half-migrated or ``/3``-marked store. A column already
+    present is skipped, and the marker bump is the last write, so a second run, or one after a crash (which rolled the
+    whole transaction back), lands in the same place. After the writes the store must pass :func:`check_agent_schema`
+    against the ``/3`` reference; a ``/2`` store whose objects were altered by hand fails that (or has no
+    ``agent_reservations`` table to alter), nothing is kept, and :class:`AgentSchemaNotMigrated` is raised with the
+    reason."""
     own = not conn.in_transaction
-    if own:
-        conn.execute("BEGIN IMMEDIATE")
+    conn.execute("BEGIN IMMEDIATE" if own else f"SAVEPOINT {_SAVEPOINT}")
     try:
         if agent_marker(conn) != AGENT_SCHEMA_V2:
-            if own:
-                conn.execute("ROLLBACK")
+            conn.execute("ROLLBACK" if own else f"RELEASE {_SAVEPOINT}")
             return False
         have = {r[1] for r in conn.execute("PRAGMA table_info(agent_reservations)")}
+        if not have:
+            raise AgentSchemaNotMigrated("the /2 agent schema did not migrate cleanly: no agent_reservations table")
         for name, kind in RESERVATION_COLUMNS_V3:
             if name not in have:
                 conn.execute(f"ALTER TABLE agent_reservations ADD COLUMN {name} {kind}")
@@ -238,11 +250,14 @@ def migrate_agent_schema(conn: sqlite3.Connection) -> bool:
                      (AGENT_SCHEMA, AGENT_SCHEMA_V2))
         reason = check_agent_schema(conn)
         if reason is not None:
-            raise sqlite3.DatabaseError(f"the /2 agent schema did not migrate cleanly: {reason}")
-        if own:
-            conn.execute("COMMIT")
+            raise AgentSchemaNotMigrated(f"the /2 agent schema did not migrate cleanly: {reason}")
+        conn.execute("COMMIT" if own else f"RELEASE {_SAVEPOINT}")
         return True
     except BaseException:
-        if own and conn.in_transaction:
-            conn.execute("ROLLBACK")
+        if conn.in_transaction:
+            if own:
+                conn.execute("ROLLBACK")
+            else:
+                conn.execute(f"ROLLBACK TO {_SAVEPOINT}")
+                conn.execute(f"RELEASE {_SAVEPOINT}")
         raise

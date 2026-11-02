@@ -640,3 +640,77 @@ def test_the_migration_joins_a_callers_transaction_and_the_caller_decides(v2):
     c.execute("ROLLBACK")
     assert at.agent_marker(c) == at.AGENT_SCHEMA_V2
     c.close()
+
+
+def test_a_failed_migration_inside_a_callers_transaction_keeps_nothing_when_the_caller_commits(v2):
+    """L3 r1 (complement LOW): a joined failure left the ALTERs and the /3 marker pending for the caller to commit."""
+    c = connect(v2)
+    c.execute("DROP TRIGGER agent_occurrences_one_fire")
+    c.execute("BEGIN IMMEDIATE")
+    c.execute("INSERT INTO meta (key, value) VALUES ('caller_wrote', 'yes')")
+    with pytest.raises(at.AgentSchemaNotMigrated, match="did not migrate cleanly"):
+        at.migrate_agent_schema(c)
+    assert c.in_transaction    # the caller's transaction is still the caller's
+    c.execute("COMMIT")
+    assert at.agent_marker(c) == at.AGENT_SCHEMA_V2
+    assert c.execute("SELECT sql FROM sqlite_master WHERE name = 'agent_reservations'").fetchone()[0] \
+        == V2_RESERVATIONS_SQL
+    assert c.execute("SELECT value FROM meta WHERE key = 'caller_wrote'").fetchone()[0] == "yes"
+    c.close()
+
+
+def test_a_v2_store_with_no_reservation_table_is_not_migrated_and_says_so(v2):
+    c = connect(v2)
+    c.execute("DROP TABLE agent_reservations")
+    with pytest.raises(at.AgentSchemaNotMigrated, match="no agent_reservations table"):
+        at.migrate_agent_schema(c)
+    assert not c.in_transaction and at.agent_marker(c) == at.AGENT_SCHEMA_V2
+    c.close()
+
+
+# The /2 file these opener tests use is the `v2` fixture: the /3 opener's store with the seven columns dropped and the
+# marker set back. When this was written its whole sqlite_master (54 rows) and both markers were compared equal to a
+# store made by the d97184c4 opener (the P5c-3 tree, `git archive d97184c4`), so it stands for a 0.11.27 store.
+
+
+def test_the_opener_migrates_a_v2_store_and_open_agent_store_accepts_it(v2):
+    """L3 r1 (codex HIGH): the opener never migrated, so every 0.11.27 store was refused by `levain agents`."""
+    from levain.agents.store import open_agent_store
+
+    raw = connect(v2)
+    raw.execute("INSERT INTO bindings (binding_id, record, seq) VALUES ('b-old', '{}', 1)")
+    raw.close()
+    store = open_agent_store(v2.parent)
+    with store.read() as c:
+        assert at.agent_marker(c) == at.AGENT_SCHEMA and at.check_agent_schema(c) is None
+        assert c.execute("SELECT occurrence_id, reserved_usd_micros, debited_usd_micros, state, billing"
+                         " FROM agent_reservations ORDER BY occurrence_id").fetchall() \
+            == [("oc-1", 5, None, "open", None), ("oc-2", 7, 3, "settled", None)]
+        assert c.execute("SELECT binding_id FROM bindings").fetchall() == [("b-old",)]
+    with store.write() as c:    # and it is written as a /3 store
+        c.execute("UPDATE agent_reservations SET billing = 'subscription', cap_actions = 1 WHERE occurrence_id = 'oc-1'")
+
+
+def test_the_opener_leaves_an_altered_v2_store_v2_opens_the_rest_and_agents_refuse_it(v2):
+    from levain.agents.store import AgentStoreRefused, open_agent_store
+
+    raw = connect(v2)
+    raw.execute("DROP TRIGGER agent_occurrences_one_fire")
+    raw.close()
+    with AutonomicDB(v2.parent).write() as c:    # the bindings and the journal still open
+        assert at.agent_marker(c) == at.AGENT_SCHEMA_V2
+        assert c.execute("SELECT sql FROM sqlite_master WHERE name = 'agent_reservations'").fetchone()[0] \
+            == V2_RESERVATIONS_SQL
+    with pytest.raises(AgentStoreRefused, match="unknown agent schema marker 'levain-agent-schema/2'"):
+        open_agent_store(v2.parent)
+
+
+@pytest.mark.parametrize("marker", ["levain-agent-schema/1", "levain-agent-schema/4"])
+def test_the_opener_touches_no_other_agent_marker(v2, marker):
+    raw = connect(v2)
+    raw.execute("UPDATE meta SET value = ? WHERE key = 'agent_schema'", (marker,))
+    before = raw.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall()
+    raw.close()
+    with AutonomicDB(v2.parent).write() as c:
+        assert at.agent_marker(c) == marker
+        assert c.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall() == before
