@@ -344,11 +344,24 @@ def _reset_entity_process_latch():
     and nothing in levain clears it, because nothing should. A test process opens many entities, so
     without this every later test would run as an entity process. Both halves (the in-process flag
     and the env var) are reset here, and only here. Popped by hand both sides:
-    `monkeypatch.delenv` records nothing for an ABSENT var, so a latch set mid-test would survive."""
+    `monkeypatch.delenv` records nothing for an ABSENT var, so a latch set mid-test would survive.
+
+    `mark_entity_process` also writes `LEVAIN_SEAT=autonomous` (the band's D4 marker), which the
+    band reads as "no human reaches this seat"; left behind it turned every later band test
+    autonomous (test_operator_grants then test_band_view in one process). It is put back to what
+    the run started with, so an operator's own marker survives."""
     import levain.firing.binding as _binding
 
-    os.environ.pop("LEVAIN_ENTITY_PROCESS", None)
-    _binding._LATCHED = False
+    seat_before = os.environ.get("LEVAIN_SEAT")
+
+    def _reset():
+        os.environ.pop("LEVAIN_ENTITY_PROCESS", None)
+        _binding._LATCHED = False
+        if seat_before is None:
+            os.environ.pop("LEVAIN_SEAT", None)
+        else:
+            os.environ["LEVAIN_SEAT"] = seat_before
+
+    _reset()
     yield
-    os.environ.pop("LEVAIN_ENTITY_PROCESS", None)
-    _binding._LATCHED = False
+    _reset()
