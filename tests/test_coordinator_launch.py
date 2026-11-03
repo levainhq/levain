@@ -606,12 +606,11 @@ def test_coord_agent_never_installs_over_a_directory_with_files(tmp_home, qdir, 
     assert sorted(p.name for p in busy.iterdir()) == ["notes.txt"]
 
 
-def test_coord_agent_none_and_codex(qdir, capsys, tmp_path, monkeypatch):
+def test_coord_agent_none_and_a_removed_codex_coordinator(qdir, capsys):
     _main(qdir, capsys, "coord", "agent", "none")
     assert CoordStore(qdir).coord_setting().agent == "none"
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))      # a Codex with no Levain hook
     out = _main(qdir, capsys, "coord", "agent", "codex", rc=1)
-    assert "not set: Codex's consent hook is not live" in out.err
+    assert "Codex coordinator was removed" in out.err
     assert CoordStore(qdir).coord_setting().agent == "none"
 
 

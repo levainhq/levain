@@ -171,14 +171,6 @@ def _band_install(setting: dict[str, Any] | None) -> tuple[Path, str] | None:
     """``(install whose band hooks the coordinator runs, agent)``, or ``None`` when there is no install to check."""
     from levain.coordinator.launch import default_coordinator_dir
 
-    agent = str((setting or {}).get("agent") or "claude")
-    if agent == "codex":
-        from levain import host_guard
-        from levain.coordinator import codex_launch
-
-        work = Path((setting or {}).get("cwd") or codex_launch.default_directory())
-        owner = host_guard.codex_hooks_owner(work, codex_launch.codex_home())
-        return (Path(owner), "codex") if owner is not None else None
     install = Path((setting or {}).get("cwd") or default_coordinator_dir())
     return (install, "claude_code") if (install / "CLAUDE.md").is_file() else None
 
@@ -196,29 +188,13 @@ def band_row(setting: dict[str, Any] | None, now: float | None = None) -> RowIn 
     if found is None:
         return None
     install, agent = found
-    if agent == "codex":
-        from levain import band_hook
-        from levain.coordinator import codex_launch
-
-        work = Path((setting or {}).get("cwd") or codex_launch.default_directory())
-        try:
-            outside = codex_launch.workspace_band_problem(Path(install), work)
-        except Exception as exc:  # noqa: BLE001 - a check that could not run is said, never shown as a working band
-            return _row("band", "NEEDS YOU band", f"cannot check: {type(exc).__name__}: {str(exc)[:200]}")
-        if outside is not None:
-            return _row("band", "NEEDS YOU band cannot render", outside, f" · fix: {band_hook.INSTALL_COMMAND}")
     key, t = f"{install}|{agent}", time.monotonic() if now is None else now
     hit = _band_cache.get(key)
     if hit is None or t - hit[0] >= _BAND_TTL:
         # The check runs the hook's interpreter (bounded, but seconds when cold) inside the panel read: whatever it
         # returns, a check that could not run included, is held for the same TTL, so a slow probe blocks one read.
         try:
-            home = None
-            if agent == "codex":
-                from levain.coordinator import codex_launch
-
-                home = codex_launch.codex_home()
-            result = band_failure(None, install, agent, home)
+            result = band_failure(None, install, agent, None)
         except Exception:
             result = None
         hit = (t, result)

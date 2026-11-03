@@ -726,13 +726,6 @@ def test_codex_command_without_decisions_is_denied_with_the_pinned_decline(cs, c
     assert dict(other.attempt.reply) == {"decision": "decline"}
 
 
-def test_codex_deny_replies_match_the_wire_registry():
-    from levain.coordinator.codex_wire import SERVER_REQUESTS
-    assert dict(SERVER_REQUESTS["item/permissions/requestApproval"].reply) == {"permissions": {}}
-    for m in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-        assert dict(SERVER_REQUESTS[m].reply) == {"decision": "decline"}
-
-
 def test_latch_commits_when_a_codex_request_offers_no_decision(cs, codex, tmp_path):
     c = ctx(tmp_path)
     perm = _codex(cs, codex["launch"], c, kind="permission", decisions=None, tool="permissions", inp={"permissions": {}})

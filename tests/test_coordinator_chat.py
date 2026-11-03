@@ -113,7 +113,7 @@ def step(cs, message_id, state, **kw):
 # --- the static import test (B4 (b)'s static half, complement F10) -------------------------------------------------
 _MODULES = [Path(chat.__file__), Path(chat_lease.__file__)]
 _FORBIDDEN_MODULES = ("levain.coordinator.lease", "levain.coordinator.envelopes", "levain.coordinator.envelope",
-                      "levain.coordinator.launch", "levain.coordinator.codex_launch", "levain.coordinator.budget",
+                      "levain.coordinator.launch", "levain.coordinator.budget",
                       "levain.coordinator.review", "levain.coordinator.first_reader", "levain.coordinator.cli",
                       "levain.consent", "levain.broker", "levain.slot", "levain.dispatch")
 _STORE_NAMES = {"WORDS_MAX", "CoordError", "_append_only", "_in", "next_gseq", "schema_present"}

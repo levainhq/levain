@@ -383,8 +383,7 @@ def _deny_reply(row: ApprovalRow, cause: str) -> tuple[Mapping[str, Any], str]:
     Codex's, by the request's method: ``item/permissions/requestApproval`` (kind ``permission``) is denied with
     ``{"permissions": {}}`` and carries no decision list; a command or file-change approval uses the first refusing
     decision among its ``available_decisions`` (the list is optional on the wire), else the pinned default
-    ``{"decision": "decline"}``. (``codex_wire.SERVER_REQUESTS`` holds these replies; the literals are unconfirmed
-    against a live Codex.)"""
+    ``{"decision": "decline"}`` (the literals are unconfirmed against a live Codex)."""
     if row.spawn_nonce is not None or row.kind == "quarantine":
         return {"behavior": "deny", "message": f"Levain: the gate is not live ({cause})"}, "deny"
     if row.kind == "permission":

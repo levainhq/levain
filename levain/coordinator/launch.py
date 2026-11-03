@@ -30,8 +30,7 @@ does, in order:
   6. activation (:func:`levain.coordinator.lease.activate`). Refused (the lease was lost while it started): the
      session is stopped and the refusal returned.
 
-A ``codex`` launch is started by :func:`levain.coordinator.codex_launch.launch` instead, the same shape over the user's
-Codex app-server daemon (C3c). A coordinator launch is started, and so is a claude worker launch that names a
+A coordinator launch is started, and so is a claude worker launch that names a
 spawned role (P3: its brief is :func:`_worker_brief_text`); a worker with none is left pending. Once
 ``claude --bg`` returned 0, every way out of 5-6 that does not leave the launch active stops the sessions listed under
 its name in its directory, a Ctrl-C included; a process killed outright leaves its launch to expire, and the watcher
@@ -67,7 +66,7 @@ user-level settings, hooks and CLAUDE.md do not reach it unless ``levain coord a
 checks the user file too for ``disableAllHooks``, otherwise it says that file is not consulted). A drop delivered after a
 claude coordinator's spawn claim, still unsplit when its session is listed done, waits at most one watch pass: the watcher
 ends that coordinator and starts a fresh one, whose brief quotes the drop; `levain coord wake` does the same at once for a
-done coordinator running without the lease. A Codex coordinator, and a drop with no watcher running, still wait up to
+done coordinator running without the lease. A drop with no watcher running still waits up to
 LEASE_TTL + IDLE_GRACE; handing a drop into a running session is not built. A crashed spawn
 winner is not retried: its launch expires at LAUNCH_TTL and counts as a death. A session the read back listed in
 another directory than the launch's is not stopped (a name alone is not Levain's evidence); the launch fails and that
@@ -160,7 +159,7 @@ def worker_refusal(ln: Any, store: Any = None) -> WorkerRefusal | None:
 
 def _worker_check(ln: Any, store: Any = None) -> tuple[WorkerRefusal | None, str | None]:
     """``(why it cannot start or None, the resolved directory the checks ran on)``, before any spawn claim. It needs
-    a spawned role whose record verifies, a claude harness (a Codex worker is not built), a directory with no
+    a spawned role whose record verifies, a claude harness (a Codex worker is not launched here), a directory with no
     coordinator workspace at or above it (the door's own ancestor walk, :func:`levain.coordinator.door.workspace`)
     and, when the stored scope has a ``where``, inside it (:func:`instantiate.where_refusal`, on the same resolved
     path), and, given ``store``, a brief that can be built from the record and the thread now (:func:`instantiate.
@@ -277,8 +276,7 @@ def band_failure(rows: list | None, directory: Path, agent: str,
                  codex_home: Path | None = None) -> tuple[str, str] | None:
     """``(what is wrong, the command that fixes it)`` when a coordinator in ``directory`` could not show the NEEDS YOU
     band, else ``None``: doctor's own ``NEEDS YOU band hooks`` row (taken from ``rows`` when the check ran it, else
-    run here; never a second checker) failing. ``codex_home``: the Codex home whose hooks.json names the interpreter
-    (the one the Codex launcher uses)."""
+    run here; never a second checker) failing. ``codex_home``: the Codex home whose hooks.json names the interpreter."""
     from levain import doctor
 
     row = next((r for r in rows or () if r.name == doctor.BAND_HOOKS_ROW), None)
@@ -832,8 +830,8 @@ def _ours(store: CoordStore, row: dict[str, Any]) -> Any:
 
 
 def _lingering(store: CoordStore, rows: list[dict[str, Any]]) -> list[str]:
-    """The ids of the rows listed with a usable harness id that belong to a claude launch that is over (a codex launch
-    has its own daemon and never blocks a claude session)."""
+    """The ids of the rows listed with a usable harness id that belong to a claude launch that is over (a launch of another
+    harness never blocks a claude session)."""
     return [h for r in rows if (h := _harness_id(r)) is not None and (ln := _ours(store, r)) is not None
             and ln.harness == "claude" and ln.state in _OVER]
 
@@ -871,7 +869,7 @@ def _harness_id(row: dict[str, Any]) -> str | None:
     return None
 
 
-_BAND_AGENT = {"claude": "claude_code", "codex": "codex"}
+_BAND_AGENT = {"claude": "claude_code"}
 
 
 def _stop_episode(store: CoordStore) -> str | None:
@@ -942,9 +940,8 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
     ln = store.launch(launch_id)
     if ln is None:
         return Outcome(str(launch_id)[:40], False, refusal=f"no launch {str(launch_id)[:40]!r}")
-    if ln.harness not in ("claude", "codex"):
-        return Outcome(launch_id, False, refusal=f"launch {launch_id} is a {ln.harness} launch; only claude and codex "
-                                                 "are built")
+    if ln.harness != "claude":
+        return Outcome(launch_id, False, refusal=f"launch {launch_id} is a {ln.harness} launch; only claude is built")
     if ln.state != "pending":
         return Outcome(launch_id, False, refusal=f"launch {launch_id} is {ln.state}, not pending")
     # the launcher verifies confinement before the spawn, for both harnesses in one place (head rulings door r2 (b)
@@ -967,10 +964,6 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
                                                              f"({_refuse_worker(store, ln)})"))
         return Outcome(launch_id, False, refusal=_plain(f"review item: {why}; nothing was started (launch {launch_id} "
                                                          f"left pending, until {ln.until})"))
-    if ln.harness == "codex":
-        from levain.coordinator import codex_launch
-
-        return codex_launch.launch(store, ln)
     if checked is not None:
         # from here on a worker has ONE directory, the one its checks resolved: the hook check, the briefs directory,
         # the brief, its prompt and the spawn all take it, so a link in the asked path retargeted since cannot make
@@ -1167,7 +1160,7 @@ def migrate_setting(store: CoordStore) -> list[str]:
     from levain.coordinator import door
 
     got = store.coord_setting()
-    if got is None or got.agent not in ("claude", "codex") or not got.cwd:
+    if got is None or got.agent != "claude" or not got.cwd:
         return []
     why, migrated = door.admit(got.cwd)
     if migrated:
@@ -1204,15 +1197,13 @@ def watch_once(store: CoordStore) -> list[str]:
       (d) every listed session of a launch of THIS store that has ended, failed or expired is stopped,
           ``claude stop <id>``: matched by the ``sessionId`` its ``active`` row recorded, or by its name
           ``levain-<role>-<launch hex>`` naming such a launch (a session a failed or interrupted start left running).
-          The Codex launches get the same (b)-(d) through the Codex daemon
-          (:func:`levain.coordinator.codex_launch.watch_once`), run before this list is read;
           A pending launch's session is never stopped: its start may be in flight in another process. A session
           matched by name alone is stopped only when its row's ``cwd`` is that launch's realpath directory (a name is
           a string anyone can choose); every ``agents`` and ``stop`` call runs in the store's directory;
       (e) the brief of every launch that is over is deleted (:func:`_remove_briefs`);
       (f) every held question ping now due is sent (C5-1, :func:`levain.consent.band.release_held_pings`), on EVERY
-          pass, whatever ended (a)-(e) early (no ``claude`` on PATH, an unreadable list, a fault): in a Codex-only
-          install this pass may be the only checker (L3 r3).
+          pass, whatever ended (a)-(e) early (no ``claude`` on PATH, an unreadable list, a fault): an install
+          with no ``claude`` on PATH may have this pass as its only checker (L3 r3).
 
     Any other row in the list is never read further. When the list cannot be read, (b)-(d) do nothing: an unread list
     is no evidence of anything. A list read with no row is a listing like any other (L3 r1 G2): an active launch
@@ -1287,9 +1278,8 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
     # writes it expired, and only then does (d) stop the session it left
     store.coord_status()
     for ln in store.launches_unspawned():
-        if ln.harness not in ("claude", "codex"):
-            lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude and codex are built, left "
-                         "pending")
+        if ln.harness != "claude":
+            lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude is built, left pending")
             continue
         if ln.role == "worker" and (why := worker_refusal(ln, store)) is not None:
             if ln.role_ref and not why.transient:
@@ -1302,15 +1292,6 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
                      else f"launch {got.launch_id} not started: {got.refusal}"
                           + (f" (run once: {got.remedy})" if got.remedy else ""))
     lines.extend(_remove_briefs(store))
-    from levain.coordinator import codex_launch
-
-    # the Codex launches are watched through the user's Codex daemon, before (and whatever) claude's list reads: a
-    # fault there is a line, never the end of this pass's claude half
-    try:
-        lines.extend(codex_launch.watch_once(store))
-    except Exception as exc:  # noqa: BLE001 - the claude half still runs whatever the Codex half raised
-        lines.append(f"the Codex half of this pass faulted ({type(exc).__name__}: {str(exc)[:300]}); no Codex "
-                     "session observed")
     # the active launches are read BEFORE the list: a launch is active only after its read back saw it listed, so
     # every one read here was listed before the list below was taken, and a launch activated meanwhile is not judged
     active = [ln for ln in store.launches_active() if ln.harness == "claude" and ln.harness_session_id]
@@ -1670,7 +1651,7 @@ def wake_idle(store: CoordStore) -> tuple[Outcome | None, str]:
     same ``claude agents --json`` listing the watcher reads; a coordinator whose row is ``done`` is ended (cause
     :data:`levain.coordinator.lease.REPLACED`; you asked, so no unseen drop is needed), its session stopped and the
     fresh coordinator the same transaction asked for started. ``(outcome, line)``: the outcome None and the line why
-    when nothing was replaced (a row not done, a listing that cannot be read, a Codex coordinator)."""
+    when nothing was replaced (a row not done, a listing that cannot be read)."""
     way_out = "`levain coord release` ends it"
     idle = [ln for ln in store.launches_active() if ln.role == "coordinator"]
     if not idle:
