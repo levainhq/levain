@@ -17,6 +17,7 @@ The engine consumes only ``revision``, ``error``, ``provenance(key)`` and ``labe
 
 from __future__ import annotations
 
+import json
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -260,6 +261,96 @@ class RequestAuthority:
                 error = f"authority not initialised ({marker}): run {conn_init_hint(conn)}"
         labels = NO_LABELS if labeller is None else labeller.snapshot(conn, snap)
         return cls(now, labels, snap, error, source, empty, verifier_unavailable=verifier_down)
+
+
+# --- the agent-link signing card (A0 §3.2, §6.4; BUILD_PLAN P5a-2b) --------------------------------------------------
+
+# What an older levain does once a FORMAT_V4 link is the log's head. It is the result of replaying such a log through an
+# older build's readers (the last release before the agent-link kind), each reader's failure path run, not read:
+# tests/test_cockpit_agent_card.py holds the table-driven check that each of these still fails closed. A reader that
+# failed open here would be a security break and would stop the card, never become a line of it.
+UPGRADE_ORDER_LINE = (
+    "Upgrade order: the first agent link you sign is a levain-authority/4 link. From then on an OLDER levain "
+    "cannot read this log: its replay refuses at that link, so its consent queue, grants, dispatch signers, chat "
+    "egress keys and cockpit views each answer nothing and allow nothing (all refuse, none falls back to earlier "
+    "authority); its graduation coverage drops to none; and it can sign no link at all, a revoke included. Every "
+    "levain process on this machine that reads this cockpit must be the new build before you sign: stop each older "
+    "coordinator and daemon first.")
+
+
+class CardRefused(ValueError):
+    """The card will not be shown to sign: the link breaks a rule the log would also hold it to, or the card's own."""
+
+
+def open_bar_problem(grant: Mapping[str, Any]) -> str | None:
+    """Why this agent's link may not be signed because its revoke is open (A0 §6.10), or ``None``. A STUB: it is the
+    seam the open-bar check (P5c-2b) fills, and :func:`sign_card` consults it before anything is signed, so the check
+    has one place to land on this surface. Until then no bar is read and it answers ``None``."""
+    return None
+
+
+def _dollars(micros: int) -> str:
+    return f"${micros / 1_000_000:,.2f}"
+
+
+def agent_link_card(grant: Mapping[str, Any]) -> dict[str, Any]:
+    """The signing card for an ``agent-link`` record: every field the signature will cover (``fields``, the record as
+    it will be signed), the words around them (what fires, what it may spend, until when), the review date and the
+    upgrade-order line. Raises :class:`CardRefused` for a record that is not an agent link, and for one that acts
+    outward (``pushes`` or ``publishes`` non-empty, which is what DESIGN §4.1(d) calls confirm-class) without a
+    complete guard: a card is never offered for a link the log should not carry.
+
+    The review date is ``expires_at`` and is shown only when the agent calls a model or acts outward (a derived flag,
+    never stored)."""
+    from levain.authority import AGENT_LINK_KIND, _thaw
+    from levain.autonomic.coverage import guard_problem
+
+    if not isinstance(grant, Mapping) or grant.get("kind") != AGENT_LINK_KIND:
+        raise CardRefused(f"only an {AGENT_LINK_KIND} has this card")
+    caps = grant.get("capabilities")
+    if not isinstance(caps, Mapping):
+        raise CardRefused("the link carries no capabilities")
+    acts_outward = bool(caps.get("pushes") or caps.get("publishes"))
+    calls_model = bool(caps.get("model"))
+    if acts_outward:
+        why = guard_problem(_thaw(grant.get("guard")))
+        if why is not None:
+            raise CardRefused(f"this link acts outward, so it is signed with a complete guard: {why}")
+    expires = grant.get("expires_at")
+    billing = grant.get("billing", "api_key")
+    if billing == "subscription":
+        cost = (f"subscription billing: at most {grant.get('budget_run_calls')} calls and "
+                f"{grant.get('budget_run_tunnel_bytes')} tunnel bytes a run, no dollars")
+    else:
+        cost = (f"at most {_dollars(grant.get('budget_run_usd_micros', 0))} a run and "
+                f"{_dollars(grant.get('budget_window_usd_micros', 0))} a window")
+    where = "; ".join(f"{w.get('repo')} ({', '.join(w.get('paths', ()))})" for w in caps.get("where", ())) or "nowhere"
+    effects = [name for name in ("lands", "pushes", "publishes") if caps.get(name)]
+    review = (f"review by {expires}" if (calls_model or acts_outward) else None)
+    return {
+        "fields": json.loads(json.dumps(_thaw(dict(grant)))),
+        "fires": (f"agent {grant.get('agent_id')} at spec {str(grant.get('spec_hash'))[:12]}, binding "
+                  f"{grant.get('binding_id')}: {caps.get('harness')}/{caps.get('model') or 'no model'}, working in "
+                  f"{where}"),
+        "outward": (f"acts outward: {', '.join(effects)}" if acts_outward else
+                    ("changes the repo in place: lands" if caps.get("lands") else "acts on nothing outside its paths")),
+        "cost": f"{cost}; at most {grant.get('run_ceiling')} launches a window",
+        "until": f"expires {expires}",
+        "review": review,
+        "upgrade": UPGRADE_ORDER_LINE,
+    }
+
+
+def sign_card(data_root: Any, grant: Mapping[str, Any], **signing: Any) -> Any:
+    """The cockpit's sign path for the card: the card's own refusals, the open-bar seam, then the one signing entry
+    (:func:`levain.agents.signing.sign_agent_link`). ``signing`` is that entry's keywords."""
+    from levain.agents.signing import sign_agent_link
+
+    agent_link_card(grant)                      # a link the card would refuse is not signed either
+    why = open_bar_problem(grant)
+    if why is not None:
+        raise CardRefused(why)
+    return sign_agent_link(data_root, grant, **signing)
 
 
 # The outer boundary's authority for the reads it makes through ``Cockpit.read_one`` /
