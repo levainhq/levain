@@ -165,8 +165,9 @@ def test_a_resend_is_answered_from_the_record_before_the_launch_is_resolved(worl
 
 def test_a_resend_after_rotation_is_still_answered_from_the_record(world, store):
     first = say(world["svc"], world["thread"])
+    nxt = _thread(store, title="next")
     with store._write() as (conn, _now):
-        room.rotate(conn, _thread(store, title="next"))
+        room.rotate(conn, nxt)
     again = say(world["svc"], world["thread"])
     assert again.message_id == first.message_id and again.created is False
 
