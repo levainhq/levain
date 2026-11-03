@@ -11,7 +11,11 @@ add ``db`` (the anneal store), which registers the episode and section stores be
 from __future__ import annotations
 
 import json
+import os
 import sys
+
+# PYTHONSAFEPATH=1 keeps the script directory off sys.path; the fake inbox import below needs it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from levain.cockpit.broker import Broker
 from levain.cockpit.effects import SporeEffectStore
