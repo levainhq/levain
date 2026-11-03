@@ -1128,13 +1128,21 @@ def _canon_obj(data: bytes, what: str) -> dict:
     return obj
 
 
-def read_operator_uid(store: Store) -> int:
+def read_operator(store: Store) -> dict:
     from levain.slot.install_helper import parse_operator_record
 
     data = store.read(("policy",), "operator")
     if data is None:
         raise Refused("no-operator", "L/policy/operator")
-    return int(parse_operator_record(data)["uid"])
+    return parse_operator_record(data)
+
+
+def read_operator_uid(store: Store) -> int:
+    return int(read_operator(store)["uid"])
+
+
+def read_operator_name(store: Store) -> str:
+    return str(read_operator(store)["name"])
 
 
 def configured_slots(store: Store) -> Dict[str, frozenset]:

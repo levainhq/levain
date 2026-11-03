@@ -959,9 +959,10 @@ def run_rows(seams: H.Seams) -> List[Row]:
     store = H.Store(seams)
     try:
         slots = _slots(store)
+        operator = H.read_operator_name(store)
     finally:
         store.close()
-    rows = base_run_rows(host) + [r for s in slots for r in slot_run_rows(host, s)]   # type: ignore[arg-type]
+    rows = base_run_rows(host, operator) + [r for s in slots for r in slot_run_rows(host, s)]   # type: ignore[arg-type]
     base = RUN[host]                                                                   # type: ignore[index]
     return [replace(r, path=seams.R / r.path.relative_to(base)) for r in rows]
 
