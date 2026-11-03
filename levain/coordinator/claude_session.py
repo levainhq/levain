@@ -16,7 +16,11 @@ What the recorded runs (RM0, RM0B) fixed, and this module keeps:
 * An interrupt (``control_request`` subtype ``interrupt``) gets a ``control_response`` and then a ``result`` carrying
   ``error_during_execution``; the process lives on. That ``result`` is a ``turn_ended`` like any other.
 * A tool the child denies shows as an ``is_error`` ``tool_result`` and, on the turn's ``result``, a
-  ``permission_denials`` entry. :func:`canary_denied` requires both, because the ``init`` cannot show a deny rule.
+  ``permission_denials`` entry. :func:`canary_denied` requires both, under one ``tool_use`` id in the last ended turn,
+  because the ``init`` cannot show a deny rule.
+* A ``can_use_tool`` is answered only by :meth:`ClaudeSession.answer` (the coordinator's reply, verbatim); every other
+  inbound control request only by :meth:`ClaudeSession.reject_control`. A replayed request id is one event for the
+  life of the session.
 
 Positions are ``"<conn %08d>:<seq %012d>"``: ``seq`` is allocated as the session ingests a line, in stream order, and
 ``conn`` is fixed per spawn, so a resumed child's positions sort after the old child's. A read never returns more than
@@ -33,6 +37,8 @@ import json
 import os
 import queue
 import re
+import secrets
+import subprocess
 import threading
 import time
 import unicodedata
@@ -151,6 +157,10 @@ class PipeTransport:
                 stop()
             except Exception:  # noqa: BLE001 - a child that will not die is the caller's to find
                 pass
+        try:
+            self._proc.wait(3)                  # reap the killed child, bounded
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
 
 def _str(value: Any) -> str:
@@ -158,19 +168,42 @@ def _str(value: Any) -> str:
 
 
 def _cap(text: str) -> str:
-    raw = text.encode("utf-8")
-    return text if len(raw) <= _BODY_MAX else raw[:_BODY_MAX].decode("utf-8", "ignore")
+    """At most ``_BODY_MAX`` UTF-8 bytes, always encodable (a lone surrogate is replaced, never raised)."""
+    raw = text.encode("utf-8", "replace")
+    return raw[:_BODY_MAX].decode("utf-8", "ignore")
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _malformed(frame: Mapping[str, Any]) -> str | None:
+    """Why a parsed frame is not one this module can read (a container of the wrong type, or a string UTF-8 cannot
+    hold), or None. Checked before any handler sees the frame."""
+    for key in ("tool_result_meta", "permission_denials"):
+        if frame.get(key) is not None and not isinstance(frame.get(key), list):
+            return f"{key} is not a list"
+    message = frame.get("message")
+    if message is not None:
+        if not isinstance(message, Mapping):
+            return "message is not an object"
+        content = message.get("content")
+        if content is not None and not isinstance(content, (list, str)):
+            return "message.content is not a list or a string"
+    if frame.get("type") == "system" and frame.get("subtype") == "init":
+        for key in ("tools", "mcp_servers"):
+            if frame.get(key) is not None and not isinstance(frame.get(key), list):
+                return f"init {key} is not a list"
+    try:
+        json.dumps(frame, ensure_ascii=False).encode("utf-8")
+    except (UnicodeEncodeError, ValueError, TypeError):
+        return "a string in the frame is not encodable as UTF-8"
+    return None
 
 
 def _control_error(request_id: str, text: str) -> dict[str, Any]:
     """The error literal :func:`~levain.coordinator.driver._control_error` writes (a test holds the two equal)."""
     return {"type": "control_response", "response": {"subtype": "error", "request_id": request_id, "error": text}}
-
-
-def _control_deny(request_id: str, text: str) -> dict[str, Any]:
-    """A ``can_use_tool`` deny: a success control_response whose body is ``behavior: deny``."""
-    return {"type": "control_response", "response": {"subtype": "success", "request_id": request_id,
-                                                      "response": {"behavior": "deny", "message": text}}}
 
 
 def _blocks(content: Any) -> list[Mapping[str, Any]]:
@@ -221,9 +254,16 @@ class ClaudeSession:
         self._sent = 0
         self._calls: dict[str, str] = {}        # tool_use id -> tool name
         self._inbound: dict[str, str] = {}      # request_id -> subtype, until answered or cancelled
+        # request_id -> (subtype, digest of the request body) of every control_request ever emitted, for the life of
+        # the session: an identical replay is suppressed, a changed one is a protocol error (never a second event key)
+        self._seen_ctl: dict[str, tuple[str, str]] = {}
+        self._cancelled: set[str] = set()
+        self._conflicts = 0
         self._tools_of: dict[str, str | None] = {}
         self._replying: dict[str, str] = {}
-        self._acks: dict[str, tuple[str, Any]] = {}
+        self._int_n = 0
+        self._int_rid: str | None = None        # the one interrupt awaiting its control_response
+        self._int_ack: tuple[str, Any] | None = None
         self._denied: list[tuple[str, str, str | None]] = []
         self._recent: deque[dict[str, Any]] = deque(maxlen=_RECENT_FRAMES)
         self._ids = 0
@@ -255,6 +295,11 @@ class ClaudeSession:
             self._unclaimed += 1
         return tid
 
+    def _unparseable(self, digest: str, why: str) -> None:
+        """A digest-only error event. Its id carries the position it takes, so two identical bad lines are two keys."""
+        self._emit("error", f"unparseable:{digest[7:23]}:{self._seq + 1}", turn_id=self._open, body=why,
+                   raw_sha256=digest)
+
     def _ingest(self, raw: str) -> None:
         text = raw.strip()
         if not text:
@@ -265,11 +310,29 @@ class ClaudeSession:
         except ValueError:
             frame = None
         if not isinstance(frame, dict):
-            self._emit("error", f"unparseable:{digest[7:23]}", turn_id=self._open,
-                       body=f"a line that is not a JSON object ({len(text)} chars)", raw_sha256=digest)
+            self._unparseable(digest, f"a line that is not a JSON object ({len(text)} chars)")
             return
+        why = _malformed(frame)
+        if why is not None:
+            self._unparseable(digest, f"a frame this session cannot read: {why}")
+            return
+        shown, seq = len(self._shown), self._seq
+        last = self._recent[-1] if self._recent else None
+        try:
+            self._dispatch(frame, digest)
+        except NotLive:
+            raise
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not stop ingestion; its partial events go too
+            del self._shown[shown:]
+            self._seq = seq
+            if self._recent and self._recent[-1] is not last:
+                self._recent.pop()
+            self._unparseable(digest, f"a frame this session cannot read ({type(exc).__name__})")
+
+    def _dispatch(self, frame: dict[str, Any], digest: str) -> None:
         kind, sub = frame.get("type"), frame.get("subtype")
-        uid = frame.get("uuid") if isinstance(frame.get("uuid"), str) and frame.get("uuid") else digest[7:23]
+        uid = (frame.get("uuid") if isinstance(frame.get("uuid"), str) and frame.get("uuid")
+               else f"{digest[7:23]}:{self._seq + 1}")
         if kind == "system" and sub == "init":
             self._on_init(frame, uid)
         elif kind == "system" and sub in ("hook_started", "hook_response"):
@@ -288,9 +351,11 @@ class ClaudeSession:
         elif kind == "control_cancel_request":
             self._on_cancel(frame)
         elif kind == "control_response":
+            # only the response to the interrupt being awaited is kept; a late or unknown one is discarded
             resp = frame.get("response")
-            if isinstance(resp, Mapping) and isinstance(resp.get("request_id"), str):
-                self._acks[resp["request_id"]] = (_str(resp.get("subtype")), resp.get("response", resp.get("error")))
+            if (isinstance(resp, Mapping) and self._int_rid is not None and resp.get("request_id") == self._int_rid
+                    and self._int_ack is None):
+                self._int_ack = (_str(resp.get("subtype")), resp.get("response", resp.get("error")))
         elif kind == "system" and sub == "permission_denied":
             self._recent.append(frame)
         # every other line (rate_limit_event, hook_progress, status, stream deltas) is no event
@@ -337,7 +402,7 @@ class ClaudeSession:
         content = message.get("content") if isinstance(message, Mapping) else None
         agent = frame.get("parent_tool_use_id") if isinstance(frame.get("parent_tool_use_id"), str) else None
         decisions: dict[str, dict[str, str]] = {}
-        for meta in frame.get("tool_result_meta") or ():
+        for meta in _list(frame.get("tool_result_meta")):
             d = meta.get("permission_decision") if isinstance(meta, Mapping) else None
             if isinstance(d, Mapping) and isinstance(meta.get("id"), str):
                 decisions[meta["id"]] = {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str)}
@@ -366,12 +431,23 @@ class ClaudeSession:
         req = frame.get("request")
         subtype = req.get("subtype") if isinstance(req, Mapping) else None
         if not isinstance(rid, str) or not rid or not isinstance(subtype, str):
-            self._emit("error", f"unparseable:{digest[7:23]}", turn_id=self._open, raw_sha256=digest,
-                       body="a control_request with no request_id or subtype")
+            self._unparseable(digest, "a control_request with no request_id or subtype")
             return
-        # recorded before anything else sees the request; a replayed id keeps its first subtype (§8.1)
-        self._inbound.setdefault(rid, subtype)
-        subtype = self._inbound[rid]
+        body_digest = hashlib.sha256(json.dumps(req, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        seen = self._seen_ctl.get(rid)
+        if seen is not None:
+            # a replayed id: an identical request is suppressed (one event per id for the life of the session); a
+            # changed one never moves the original across the one door (§8.1): it stays pending as it was, and the
+            # change is a protocol error under its own key
+            if seen != (subtype, body_digest):
+                self._conflicts += 1
+                self._emit("error", f"control_changed:{rid}:{self._conn}-{self._conflicts}", turn_id=self._open,
+                           body=f"request {rid[:40]} replayed changed: {seen[0][:40]} -> {subtype[:40]}",
+                           control_subtype=subtype, raw_sha256=digest)
+            return
+        # recorded before anything else sees the request
+        self._seen_ctl[rid] = (subtype, body_digest)
+        self._inbound[rid] = subtype
         if subtype == APPROVAL_SUBTYPE:
             tool = req.get("tool_name") if isinstance(req.get("tool_name"), str) else None
             self._tools_of[rid] = tool
@@ -387,8 +463,10 @@ class ClaudeSession:
 
     def _on_cancel(self, frame: Mapping[str, Any]) -> None:
         rid = frame.get("request_id")
-        if isinstance(rid, str) and rid:
+        if isinstance(rid, str) and rid and rid not in self._cancelled:
+            self._cancelled.add(rid)
             self._inbound.pop(rid, None)
+            self._tools_of.pop(rid, None)
             self._emit("error", f"cancel:{rid}", turn_id=self._open, body="control request cancelled", cancel_of=rid)
 
     # --- DriverSession ----------------------------------------------------------------------------------------------
@@ -414,9 +492,9 @@ class ClaudeSession:
             i = self._init
             if i is None:
                 return SessionMeta(self._session_id, None, None, None, None, (), ())
-            servers = tuple(s.get("name") if isinstance(s, Mapping) else s for s in i.get("mcp_servers") or ())
+            servers = tuple(s.get("name") if isinstance(s, Mapping) else s for s in _list(i.get("mcp_servers")))
             return SessionMeta(self._session_id, i.get("permissionMode"), i.get("model"), i.get("claude_code_version"),
-                               i.get("cwd"), tuple(str(t) for t in i.get("tools") or ()),
+                               i.get("cwd"), tuple(str(t) for t in _list(i.get("tools"))),
                                tuple(str(s) for s in servers))
 
     def origin(self) -> str:
@@ -429,7 +507,9 @@ class ClaudeSession:
     def send(self, command: SendCommand) -> SendResult:
         """One stream-json user line. While a turn runs the vendor folds it in: the result names that turn and the
         line is counted into it (:meth:`turn_lines`); otherwise it names the turn the vendor will open for it. No steer
-        and no attachment is written (``not_delivered`` / :class:`NotSent`, before any byte)."""
+        and no attachment is written (``not_delivered`` / :class:`NotSent`, before any byte). Known edge: ``accepted``
+        means the line was flushed into the pipe, so a child that dies before reading it never runs it and no turn
+        ever ends with it (it stays in :meth:`pending_lines`)."""
         if command.mode == "steer":
             return SendResult("not_delivered", None, None, "the room's Claude session takes no steer")
         if command.attachments:
@@ -455,73 +535,116 @@ class ClaudeSession:
                                                                                                 "echoes no user line")
 
     def answer(self, command: ApprovalAnswer) -> CommandResult:
-        """The room answers no approval; nothing is written. A request this session holds is ``rejected`` (the way to
-        refuse it is :meth:`reject_control`), any other is ``no_such_request``."""
-        with self._io:
-            if self._inbound.get(command.raw_vendor_key) is None:
+        """The one door (the contract of :meth:`~levain.coordinator.driver.ScriptedSession.answer`): frame the
+        service's reply (``command.reply``, verbatim) as the success ``control_response`` to the recorded
+        ``can_use_tool`` ``raw_vendor_key`` and write it once. An id this session holds no request for is
+        ``no_such_request``; one whose recorded subtype is not an approval raises ``ValueError`` (nothing is written).
+        The room's argv runs ``dontAsk``, so an approval is not expected; one that arrives is surfaced as an
+        ``approval_request`` and this is how the service's answer (a deny) reaches the vendor. A ``behavior: deny``
+        reply is recorded in :meth:`denials`."""
+        key = command.raw_vendor_key
+        reply = dict(command.reply)
+        line = {"type": "control_response", "response": {"subtype": "success", "request_id": key, "response": reply}}
+
+        def check(subtype: str | None) -> CommandResult | None:
+            if subtype is None:
                 return CommandResult("no_such_request", "the session holds no such request")
-        return CommandResult("rejected", "the room answers no approval; reject_control denies it")
+            if subtype != APPROVAL_SUBTYPE:
+                raise ValueError(f"request {key[:40]} is {subtype[:40]}, not an approval")
+            return None
+
+        with self._io:
+            tool = self._tools_of.get(key)
+            done = self._reply_once(key, line, check, CommandResult("confirmed", "answered"))
+            if done.outcome == "confirmed":
+                self._tools_of.pop(key, None)
+                if reply.get("behavior") == "deny":
+                    self._denied.append((key, APPROVAL_SUBTYPE, tool))
+            return done
 
     def reject_control(self, request_id: str, text: str) -> CommandResult:
-        """Write the one refusal to a recorded inbound request: an error control_response for any subtype but
-        ``can_use_tool``, and for that a ``behavior: deny`` (recorded in :meth:`denials`). An id not recorded raises
-        ``ValueError("no such inbound request")``. One reply per request: a write that failed after its bytes may have
-        left, or one in flight, answers ``ambiguous`` and writes no second line."""
-        with self._io:
-            if request_id in self._replying:
-                return CommandResult("ambiguous", f"a reply to request {request_id[:40]} is being written or may "
-                                                  "already have reached the vendor")
-            subtype = self._inbound.get(request_id)
+        """Write the error literal (:func:`_control_error`) to a recorded NON-approval request, once. An id not
+        recorded raises ``ValueError("no such inbound request")``; a recorded ``can_use_tool`` raises too: no
+        approval, a deny included, leaves through this door (§8.1); :meth:`answer` is its one door."""
+        def check(subtype: str | None) -> CommandResult | None:
             if subtype is None:
                 raise ValueError("no such inbound request")
-            deny = subtype == APPROVAL_SUBTYPE
-            data = json.dumps((_control_deny if deny else _control_error)(request_id, text), sort_keys=True) + "\n"
-            self._replying[request_id] = "writing"
-            try:
-                self._t.write(data)
-            except TransportClosed as exc:
-                del self._replying[request_id]
-                return CommandResult("rejected", f"not written: {exc}")
-            except Exception as exc:  # noqa: BLE001 - the line reached the transport; whether it left is unknown
-                self._replying[request_id] = "ambiguous"
-                return CommandResult("ambiguous", f"the reply may have reached the vendor ({type(exc).__name__})")
+            if subtype == APPROVAL_SUBTYPE:
+                raise ValueError("a can_use_tool request is answered only through the one door, never rejected here")
+            return None
+
+        with self._io:
+            return self._reply_once(request_id, _control_error(request_id, text), check,
+                                    CommandResult("confirmed", "rejected with the error literal"))
+
+    def _reply_once(self, request_id: str, line: dict[str, Any], check: Callable[[str | None], CommandResult | None],
+                    done: CommandResult) -> CommandResult:
+        """The one reply to an inbound request (the shape of ScriptedSession's). A request whose reply is being
+        written, or whose write failed after its bytes may have left, is ``ambiguous`` and gets no second write.
+        Otherwise ``check`` (on the recorded subtype) may refuse or raise; a line JSON cannot hold raises before any
+        byte and leaves the request answerable; a write refused before any byte (:class:`TransportClosed`) is
+        ``rejected`` and leaves it answerable; any other write failure leaves it ``ambiguous``. The request is
+        forgotten only after its write succeeded. Called holding the io lock."""
+        if request_id in self._replying:
+            return CommandResult("ambiguous", f"a reply to request {request_id[:40]} is being written or may "
+                                              "already have reached the vendor")
+        refused = check(self._inbound.get(request_id))
+        if refused is not None:
+            return refused
+        data = json.dumps(line, sort_keys=True) + "\n"
+        self._replying[request_id] = "writing"
+        try:
+            self._t.write(data)
+        except TransportClosed as exc:
             del self._replying[request_id]
-            del self._inbound[request_id]
-            if deny:
-                self._denied.append((request_id, subtype, self._tools_of.pop(request_id, None)))
-        return CommandResult("confirmed", "denied" if deny else "rejected with the error literal")
+            return CommandResult("rejected", f"not written: {exc}")
+        except Exception as exc:  # noqa: BLE001 - the line reached the transport; whether it left is unknown
+            self._replying[request_id] = "ambiguous"
+            return CommandResult("ambiguous", f"the reply may have reached the vendor ({type(exc).__name__})")
+        del self._replying[request_id]
+        del self._inbound[request_id]
+        return done
 
     def denials(self) -> tuple[tuple[str, str, str | None], ...]:
-        """``(request_id, subtype, tool_name)`` of every ``can_use_tool`` this session denied."""
+        """``(request_id, subtype, tool_name)`` of every ``can_use_tool`` :meth:`answer` wrote a ``behavior: deny``
+        reply to."""
         with self._io:
             return tuple(self._denied)
 
     def interrupt(self, command: InterruptCommand) -> CommandResult:
         """The stream-json ``interrupt`` control request, then wait up to ``interrupt_wait`` for its response. A
         ``turn_id`` that is not the open turn writes nothing (a late interrupt must not abort the next turn). The
-        aborted turn's ``result`` arrives through :meth:`read` as a ``turn_ended``."""
-        rid = f"int-{command.op_id}"[:128]
+        aborted turn's ``result`` arrives through :meth:`read` as a ``turn_ended``. Each write mints its own request id
+        (never derived from ``op_id``), and only the response to that id confirms it: a late response to an earlier
+        interrupt is discarded."""
         with self._io:
             if self.closed:
                 return CommandResult("rejected", "the session is closed")
             self._pump(0.0)
             if command.turn_id is not None and command.turn_id != self._open:
                 return CommandResult("rejected", f"turn {command.turn_id} is not the open turn")
+            self._int_n += 1
+            rid = f"int-{self._conn}-{self._int_n}-{secrets.token_hex(8)}"
             data = json.dumps({"type": "control_request", "request_id": rid,
                                "request": {"subtype": "interrupt"}}, sort_keys=True) + "\n"
+            self._int_rid, self._int_ack = rid, None
             try:
-                self._t.write(data)
-            except TransportClosed as exc:
-                return CommandResult("rejected", f"not written: {exc}")
-            except Exception as exc:  # noqa: BLE001 - the bytes may have left
-                return CommandResult("ambiguous", f"the interrupt may have reached the vendor ({type(exc).__name__})")
-            deadline = self._clock() + self._interrupt_wait
-            while rid not in self._acks:
-                left = deadline - self._clock()
-                if left <= 0:
-                    return CommandResult("ambiguous", "no control_response to the interrupt in time")
-                self._pump(min(left, 0.05))
-            subtype, body = self._acks.pop(rid)
+                try:
+                    self._t.write(data)
+                except TransportClosed as exc:
+                    return CommandResult("rejected", f"not written: {exc}")
+                except Exception as exc:  # noqa: BLE001 - the bytes may have left
+                    return CommandResult("ambiguous",
+                                         f"the interrupt may have reached the vendor ({type(exc).__name__})")
+                deadline = self._clock() + self._interrupt_wait
+                while self._int_ack is None:
+                    left = deadline - self._clock()
+                    if left <= 0:
+                        return CommandResult("ambiguous", "no control_response to the interrupt in time")
+                    self._pump(min(left, 0.05))
+                subtype, body = self._int_ack
+            finally:
+                self._int_rid, self._int_ack = None, None
         if subtype == "success":
             return CommandResult("confirmed", "interrupted")
         return CommandResult("rejected", f"the vendor answered {subtype[:40]}: {_str(body)[:120]}")
@@ -648,8 +771,10 @@ def room_argv(*, mcp_config: str | os.PathLike[str], settings: str | os.PathLike
               session_id: str | None = None, resume: str | None = None, claude_bin: str = "claude") -> list[str]:
     """The §2.4 argv: read-only file tools, web search and the room's one MCP door, nothing else, ``dontAsk`` so a
     call outside the allow list is denied without a prompt. Exactly one of ``session_id`` (``--session-id``) and
-    ``resume`` (``--resume``). No ``--dangerously-skip-permissions`` and no ``--bare``: the child runs with his own
-    config chain, and the containment is these flags, the ``--settings`` rules and the open probe."""
+    ``resume`` (``--resume``). No ``--dangerously-skip-permissions``, no ``--bare`` and no ``--restricted``: the child
+    runs with his own USER config chain, and the containment is these flags, the ``--settings`` rules and the open
+    probe. ``--setting-sources user`` keeps a project or local ``.claude/settings*.json`` in the room's cwd from
+    installing hooks, plugins or rules (L3 r1: a repository-controlled settings file is code the room would run)."""
     if (session_id is None) == (resume is None):
         raise ValueError("exactly one of session_id and resume")
     for name, p in (("mcp_config", mcp_config), ("settings", settings)):
@@ -662,6 +787,7 @@ def room_argv(*, mcp_config: str | os.PathLike[str], settings: str | os.PathLike
              "--allowedTools", ",".join((*ROOM_TOOLS, ROOM_MCP_TOOL)),
              "--disallowedTools", ",".join(ROOM_DENIED_TOOLS),
              "--strict-mcp-config", "--mcp-config", str(mcp_config),
+             "--setting-sources", "user",
              "--settings", str(settings),
              "--permission-mode", "dontAsk"]
     argv += ["--session-id", session_id] if session_id is not None else ["--resume", resume or ""]
@@ -704,42 +830,59 @@ class CanaryVerdict(NamedTuple):
 
 def canary_denied(frames: Iterable[Mapping[str, Any]], decoy_path: str) -> CanaryVerdict:
     """The open-time deny check over raw frames (see :meth:`ClaudeSession.recent_frames`) after the launcher sent a
-    Read of ``decoy_path``, a file under a denied rule, and the turn ended: denied only when the Read was attempted,
-    its tool_result is ``is_error`` (and carries no accept decision), and the turn's ``result`` lists it in
-    ``permission_denials``. A refusal by the model, a returned content or a missing result is not denied."""
-    ids: set[str] = set()
-    errored: set[str] = set()
-    accepted: set[str] = set()
-    listed: set[str] = set()
-    for f in frames:
-        if not isinstance(f, Mapping):
-            continue
-        t = f.get("type")
-        msg = f.get("message") if isinstance(f.get("message"), Mapping) else {}
-        if t == "assistant":
+    Read of ``decoy_path``, a file under a denied rule, and the turn ended. Only the LAST ended turn is judged (the
+    frames after the previous ``result`` through the last one); an earlier turn's denial proves nothing about this
+    attempt. Denied only when that turn attempted the Read, at least one attempt carries BOTH proofs under its own
+    ``tool_use`` id (an ``is_error`` tool_result, and a ``permission_denials`` entry on the turn's ``result``), and
+    no attempt in the turn was accepted by a permission decision or returned a non-error result. A refusal by the
+    model, a returned content, a canary attempted after the last ``result`` (its turn has not ended) or a missing
+    result is not denied."""
+    seq = [f for f in frames if isinstance(f, Mapping)]
+    ends = [i for i, f in enumerate(seq) if f.get("type") == "result"]
+
+    def attempts(window: Iterable[Mapping[str, Any]]) -> list[str]:
+        out: list[str] = []
+        for f in window:
+            msg = f.get("message") if isinstance(f.get("message"), Mapping) else {}
+            if f.get("type") != "assistant":
+                continue
             for b in _blocks(msg.get("content")):
                 inp = b.get("input")
                 if (b.get("type") == "tool_use" and b.get("name") == "Read" and isinstance(inp, Mapping)
                         and inp.get("file_path") == decoy_path and isinstance(b.get("id"), str)):
-                    ids.add(b["id"])
-        elif t == "user":
-            for b in _blocks(msg.get("content")):
-                if b.get("type") == "tool_result" and b.get("is_error") is True and isinstance(b.get("tool_use_id"), str):
-                    errored.add(b["tool_use_id"])
-            for m in f.get("tool_result_meta") or ():
-                d = m.get("permission_decision") if isinstance(m, Mapping) else None
-                if isinstance(d, Mapping) and d.get("decision") == "accept" and isinstance(m.get("id"), str):
-                    accepted.add(m["id"])
-        elif t == "result":
-            for d in f.get("permission_denials") or ():
-                if isinstance(d, Mapping) and d.get("tool_name") == "Read" and isinstance(d.get("tool_use_id"), str):
-                    listed.add(d["tool_use_id"])
+                    out.append(b["id"])
+        return out
+
+    if attempts(seq[ends[-1] + 1:] if ends else seq):
+        return CanaryVerdict(False, "a canary Read was attempted in a turn that has not ended")
+    if not ends:
+        return CanaryVerdict(False, "the canary Read was never attempted")
+    window = seq[(ends[-2] + 1 if len(ends) > 1 else 0):ends[-1] + 1]
+    ids = set(attempts(window))
     if not ids:
         return CanaryVerdict(False, "the canary Read was never attempted")
+    errored: set[str] = set()
+    returned: set[str] = set()
+    accepted: set[str] = set()
+    for f in window:
+        if f.get("type") != "user":
+            continue
+        msg = f.get("message") if isinstance(f.get("message"), Mapping) else {}
+        for b in _blocks(msg.get("content")):
+            if b.get("type") == "tool_result" and isinstance(b.get("tool_use_id"), str):
+                (errored if b.get("is_error") is True else returned).add(b["tool_use_id"])
+        for m in _list(f.get("tool_result_meta")):
+            d = m.get("permission_decision") if isinstance(m, Mapping) else None
+            if isinstance(d, Mapping) and d.get("decision") == "accept" and isinstance(m.get("id"), str):
+                accepted.add(m["id"])
+    listed = {d["tool_use_id"] for d in _list(window[-1].get("permission_denials"))
+              if isinstance(d, Mapping) and d.get("tool_name") == "Read" and isinstance(d.get("tool_use_id"), str)}
     if ids & accepted:
-        return CanaryVerdict(False, "the canary Read was accepted by a permission decision")
+        return CanaryVerdict(False, "a canary Read was accepted by a permission decision")
     if not ids & errored:
         return CanaryVerdict(False, "the canary Read has no is_error tool_result")
-    if not ids & listed:
-        return CanaryVerdict(False, "the turn's result lists no permission_denials entry for the canary Read")
-    return CanaryVerdict(True, "the canary Read is an is_error result and a permission_denials entry")
+    if ids & returned:
+        return CanaryVerdict(False, "a canary Read returned a non-error result")
+    if not ids & errored & listed:
+        return CanaryVerdict(False, "the turn's result lists no permission_denials entry for an errored canary Read")
+    return CanaryVerdict(True, "the canary Read is an is_error result and a permission_denials entry under one id")

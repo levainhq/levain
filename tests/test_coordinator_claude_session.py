@@ -447,7 +447,8 @@ def test_interrupt_is_the_stream_json_control_request_and_the_process_survives()
     r = s.interrupt(InterruptCommand("op-int-1", "t1-1"))
     assert r.outcome == "confirmed"
     wrote = t.written[-1]
-    assert wrote == {"type": "control_request", "request_id": "int-op-int-1", "request": {"subtype": "interrupt"}}
+    assert wrote == {"type": "control_request", "request_id": wrote["request_id"], "request": {"subtype": "interrupt"}}
+    assert re.fullmatch(r"int-1-1-[0-9a-f]{16}", wrote["request_id"])
     t.feed(aborted())
     end = s.read(None).events[-1]
     assert end.kind == "turn_ended" and end.body == "error_during_execution aborted_streaming is_error"
@@ -506,20 +507,6 @@ def test_every_inbound_control_request_is_recorded_and_surfaced():
     assert "error:control:req-C" in evs
 
 
-def test_reject_control_denies_a_can_use_tool_and_records_it():
-    s, t = make()
-    t.feed(ctl_request("req-A", "can_use_tool", tool_name="Bash", input={"command": "ls"}))
-    s.read(None)
-    r = s.reject_control("req-A", "the room runs nothing")
-    assert r.outcome == "confirmed"
-    assert t.written[-1] == {"type": "control_response", "response": {
-        "subtype": "success", "request_id": "req-A", "response": {"behavior": "deny",
-                                                                   "message": "the room runs nothing"}}}
-    assert s.denials() == (("req-A", "can_use_tool", "Bash"),)
-    with pytest.raises(ValueError, match="no such inbound request"):
-        s.reject_control("req-A", "again")               # one reply per request
-
-
 def test_reject_control_writes_the_error_literal_for_any_other_subtype():
     s, t = make()
     t.feed(ctl_request("req-B", "mcp_message"), ctl_request("req-C", "something_new"))
@@ -528,13 +515,15 @@ def test_reject_control_writes_the_error_literal_for_any_other_subtype():
     assert t.written[-1] == driver._control_error("req-B", "no")
     assert s.reject_control("req-C", "no").outcome == "confirmed"
     assert s.denials() == ()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="no such inbound request"):
         s.reject_control("never-seen", "no")
+    with pytest.raises(ValueError, match="no such inbound request"):
+        s.reject_control("req-B", "again")               # one reply per request
 
 
 def test_a_failed_reply_is_ambiguous_and_never_written_twice():
     s, t = make()
-    t.feed(ctl_request("req-A", "can_use_tool", tool_name="Read", input={}))
+    t.feed(ctl_request("req-A", "mcp_message"))
     s.read(None)
     t.refuse = BrokenPipeError()
     assert s.reject_control("req-A", "no").outcome == "ambiguous"
@@ -552,18 +541,17 @@ def test_a_closed_transport_leaves_the_request_answerable():
     assert s.reject_control("req-A", "no").outcome == "confirmed"
 
 
-def test_answer_never_writes_and_a_cancelled_request_is_forgotten():
+def test_a_cancelled_request_is_forgotten():
     s, t = make()
     t.feed(ctl_request("req-A", "can_use_tool", tool_name="Bash", input={}))
     s.read(None)
-    cmd_ = ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "allow"})
-    assert s.answer(cmd_).outcome == "rejected" and t.written == []
-    assert s.answer(ApprovalAnswer("op-1", "ak-1", "nope", {})).outcome == "no_such_request"
     t.feed({"type": "control_cancel_request", "request_id": "req-A"})
     (e,) = s.read(s.position()).events
     assert e.kind == "error" and e.cancel_of == "req-A"
+    assert s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "no_such_request"
     with pytest.raises(ValueError):
         s.reject_control("req-A", "no")
+    assert t.written == []
 
 
 def test_a_replayed_request_id_keeps_its_first_subtype():
@@ -780,3 +768,280 @@ def test_canary_reads_the_sessions_own_recent_frames():
     t.feed(init(), *_canary(), text("it was denied"))
     s.read(None)
     assert canary_denied(s.recent_frames(), DECOY).denied
+
+
+# ---- L3 r1 (RMCF): each test below was written from a reproduced failure on 14016513 -------------------------------------
+def _bare_read(tid: str, body: str = "DECOY") -> dict:
+    f = tool_result(tid, body)
+    del f["tool_result_meta"]                             # content came back, no decision recorded
+    return f
+
+
+def test_canary_judges_only_the_last_turn_not_an_earlier_denied_one():
+    # codex 4: turn 1 denied the canary; turn 2's canary returned the decoy's content with no decision record
+    frames = [*_canary(), tool_use("toolu_d", DECOY), _bare_read("toolu_d"), result()]
+    v = canary_denied(frames, DECOY)
+    assert not v.denied, v.reason
+
+
+def test_canary_needs_one_attempt_carrying_both_proofs():
+    # codex 4: attempt a errored but is not listed; attempt b is listed but returned content
+    frames = [tool_use("toolu_a", DECOY), tool_result("toolu_a", "denied", error=True),
+              tool_use("toolu_b", DECOY), _bare_read("toolu_b"),
+              result(denials=[{"tool_name": "Read", "tool_use_id": "toolu_b", "tool_input": {"file_path": DECOY}}])]
+    v = canary_denied(frames, DECOY)
+    assert not v.denied, v.reason
+
+
+def test_canary_any_attempt_that_returned_content_is_not_denied():
+    frames = [tool_use("toolu_a", DECOY), tool_result("toolu_a", "denied", error=True),
+              tool_use("toolu_b", DECOY), _bare_read("toolu_b"),
+              result(denials=[{"tool_name": "Read", "tool_use_id": "toolu_a", "tool_input": {"file_path": DECOY}}])]
+    assert not canary_denied(frames, DECOY).denied
+
+
+def test_canary_attempted_after_the_last_result_is_not_yet_judged():
+    frames = [*_canary(), tool_use("toolu_e", DECOY)]
+    v = canary_denied(frames, DECOY)
+    assert not v.denied and "not ended" in v.reason
+
+
+def test_canary_tolerates_wrong_container_types():
+    frames = [tool_use("toolu_c", DECOY), {**tool_result("toolu_c", "x", error=True), "tool_result_meta": 1},
+              {**result(), "permission_denials": 5}]
+    assert not canary_denied(frames, DECOY).denied
+
+
+def test_answer_writes_the_services_reply_verbatim_once():
+    # codex 5: the one door writes the coordinator's durable reply
+    s, t = make()
+    t.feed(ctl_request("req-A", "can_use_tool", tool_name="Bash", input={"command": "ls"}))
+    s.read(None)
+    reply = {"behavior": "deny", "message": "the room runs nothing", "interrupt": False}
+    r = s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", reply))
+    assert r.outcome == "confirmed"
+    assert t.written == [{"type": "control_response", "response": {"subtype": "success", "request_id": "req-A",
+                                                                    "response": reply}}]
+    assert s.answer(ApprovalAnswer("op-2", "ak-1", "req-A", reply)).outcome == "no_such_request"
+    assert len(t.written) == 1
+    assert s.denials() == (("req-A", "can_use_tool", "Bash"),)
+
+
+def test_answer_refuses_a_non_approval_and_an_unknown_key():
+    s, t = make()
+    t.feed(ctl_request("req-B", "mcp_message"))
+    s.read(None)
+    with pytest.raises(ValueError):
+        s.answer(ApprovalAnswer("op-1", "ak-1", "req-B", {"behavior": "allow"}))
+    assert s.answer(ApprovalAnswer("op-1", "ak-1", "nope", {})).outcome == "no_such_request"
+    assert t.written == []
+    assert s.reject_control("req-B", "no").outcome == "confirmed"      # still answerable through its own door
+
+
+def test_answer_write_failure_is_ambiguous_and_never_written_twice():
+    s, t = make()
+    t.feed(ctl_request("req-A", "can_use_tool", tool_name="Read", input={}))
+    s.read(None)
+    t.refuse = BrokenPipeError()
+    assert s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "ambiguous"
+    t.refuse = None
+    assert s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "ambiguous"
+    assert t.written == []
+    s2, tt2 = make()
+    tt2.feed(ctl_request("req-A", "can_use_tool", tool_name="Read", input={}))
+    s2.read(None)
+    tt2.refuse = TransportClosed("gone")
+    assert s2.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "rejected"
+    tt2.refuse = None
+    assert s2.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "confirmed"
+
+
+def test_answer_with_a_reply_json_cannot_hold_leaves_it_answerable():
+    s, t = make()
+    t.feed(ctl_request("req-A", "can_use_tool", tool_name="Read", input={}))
+    s.read(None)
+    with pytest.raises((TypeError, ValueError)):
+        s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": object()}))
+    assert t.written == []
+    assert s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "confirmed"
+
+
+def test_reject_control_refuses_an_approval():
+    # codex 5: no approval, a deny included, leaves through the non-approval door
+    s, t = make()
+    t.feed(ctl_request("req-A", "can_use_tool", tool_name="Bash", input={"command": "ls"}))
+    s.read(None)
+    with pytest.raises(ValueError, match="one door"):
+        s.reject_control("req-A", "no")
+    assert t.written == []
+    assert s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "confirmed"
+
+
+def test_an_identical_replayed_control_request_is_suppressed():
+    # codex 6: the replay emitted a second event under the same key; record_event rolls the batch back on that
+    s, t = make()
+    t.feed(ctl_request("r", "mcp_message"), ctl_request("r", "mcp_message"))
+    evs = list(s.read(None).events)
+    assert [e.key for e in evs] == ["error:control:r"]
+    assert s.reject_control("r", "no").outcome == "confirmed"
+    t.feed(ctl_request("r", "mcp_message"))                     # a replay after the answer
+    assert s.read(s.position()).events == ()
+    with pytest.raises(ValueError):
+        s.reject_control("r", "no")                             # one reply per request
+    assert len(t.written) == 1
+
+
+def test_a_replay_with_a_changed_request_is_a_uniquely_keyed_protocol_error():
+    s, t = make()
+    t.feed(ctl_request("r", "mcp_message"), ctl_request("r", "can_use_tool", tool_name="Bash", input={}),
+           ctl_request("r", "can_use_tool", tool_name="Bash", input={}))
+    evs = list(s.read(None).events)
+    keys = [e.key for e in evs]
+    assert keys[0] == "error:control:r" and len(keys) == 3 and len(set(keys)) == 3
+    assert all(e.kind == "error" for e in evs) and "approval_request" not in {e.kind for e in evs}
+    assert all(e.control_subtype == "can_use_tool" and "changed" in e.body for e in evs[1:])
+    s.reject_control("r", "no")                                  # the original pending request is preserved
+    assert t.written[-1] == driver._control_error("r", "no")
+
+
+def test_a_changed_approval_input_under_the_same_id_is_not_a_new_approval():
+    s, t = make()
+    t.feed(ctl_request("r", "can_use_tool", tool_name="Read", input={"file_path": "/a"}),
+           ctl_request("r", "can_use_tool", tool_name="Bash", input={"command": "rm -rf /"}))
+    evs = list(s.read(None).events)
+    assert [e.kind for e in evs] == ["approval_request", "error"]
+    assert evs[0].tool_name == "Read" and len({e.key for e in evs}) == 2
+
+
+def test_a_repeated_cancel_emits_one_event():
+    s, t = make()
+    t.feed(ctl_request("r", "can_use_tool", tool_name="Read", input={}),
+           {"type": "control_cancel_request", "request_id": "r"},
+           {"type": "control_cancel_request", "request_id": "r"})
+    evs = list(s.read(None).events)
+    assert [e.key for e in evs] == ["approval_request:r", "error:cancel:r"]
+
+
+def test_identical_unparseable_lines_get_distinct_keys():
+    s, t = make()
+    t.feed("garbage\n", "garbage\n")
+    evs = list(s.read(None).events)
+    assert len(evs) == 2 and len({e.key for e in evs}) == 2
+
+
+def test_a_late_ack_never_confirms_a_later_interrupt():
+    # codex 8: reproduced on 14016513 (the second call confirmed without its own response)
+    now = [0.0]
+
+    def clock() -> float:
+        now[0] += 0.5
+        return now[0]
+    s, t = make(interrupt_wait=1.0, clock=clock)
+    assert s.interrupt(InterruptCommand("op-a", None)).outcome == "ambiguous"
+    first = t.written[-1]["request_id"]
+    t.feed(ctl_response(first))                                    # the late ack
+    assert s.interrupt(InterruptCommand("op-a", None)).outcome == "ambiguous"
+    second = t.written[-1]["request_id"]
+    assert second != first
+
+
+def test_interrupt_ids_are_unique_per_write_and_never_collide_by_truncation():
+    s, t = make(interrupt_wait=0.0)
+    a, b = "x" * 200 + "1", "x" * 200 + "2"
+    s.interrupt(InterruptCommand(a, None))
+    s.interrupt(InterruptCommand(b, None))
+    s.interrupt(InterruptCommand(a, None))
+    ids = [w["request_id"] for w in t.written]
+    assert len(set(ids)) == 3 and all(len(i) <= 128 and a[:20] not in i for i in ids)
+
+
+def test_an_unknown_control_response_is_discarded():
+    s, t = make(interrupt_wait=1.0)
+    t.feed(ctl_response("int-made-up"))
+    s.read(None)
+    t.on_write = lambda line: t.feed(ctl_response(line["request_id"]))
+    assert s.interrupt(InterruptCommand("op-1", None)).outcome == "confirmed"
+
+
+def _user_meta(meta) -> dict:
+    f = tool_result("toolu_m", "body")
+    f["tool_result_meta"] = meta
+    return f
+
+
+@pytest.mark.parametrize("frame", [
+    _user_meta(1),
+    _user_meta({"id": "toolu_m"}),
+    {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "a\ud800b"}]},
+     "uuid": "u-sur"},
+    {"type": "assistant", "message": "not a mapping", "uuid": "u-msg"},
+    {"type": "assistant", "message": {"content": 7}, "uuid": "u-content"},
+    {**result(), "permission_denials": 5},
+    {**init(), "tools": 5},
+    {**init(), "mcp_servers": "levain_room"},
+    {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_s",
+                                              "content": "x\udfffy"}]}, "uuid": "u-sur2"},
+    {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_q", "name": "Read",
+                                                   "input": {"file_path": "/a\ud801"}}]}, "uuid": "u-sur3"},
+])
+def test_a_malformed_valid_json_frame_is_a_digest_only_unparseable_event(frame):
+    # codex 9: tool_result_meta 1 raised TypeError and a lone surrogate raised UnicodeEncodeError out of read()
+    s, t = make()
+    t.feed(frame, text("after"))
+    evs = list(s.read(None).events)
+    bad = [e for e in evs if e.vendor_id.startswith("unparseable:")]
+    assert len(bad) == 1 and bad[0].kind == "error" and bad[0].raw_sha256.startswith("sha256:")
+    assert "body" not in bad[0].body and "\ud800" not in bad[0].body
+    assert [e.body for e in evs if e.kind == "agent_text"] == ["after"]          # the next frame still lands
+    for e in evs:
+        e.body.encode("utf-8")
+    s.meta()                                                                       # never raises either
+    assert all(f is not frame for f in s.recent_frames())
+
+
+def test_a_body_cap_never_raises_on_a_lone_surrogate():
+    assert cs._cap("a\ud800b").encode("utf-8")
+    assert cs._cap("\ud800" * (EVENT_BODY_MAX * 2)).encode("utf-8")
+
+
+class _StubbornProc:
+    """A Popen stand-in that ignores terminate; records what close() asked of it."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.dead = False
+        self.stdin = self
+        self.stdout = iter(())
+
+    def close(self) -> None:
+        self.calls.append("stdin.close")
+
+    def poll(self):
+        return 0 if self.dead and self.calls[-1].startswith("wait") else None
+
+    def wait(self, timeout=None):
+        self.calls.append(f"wait({timeout})")
+        if not self.dead:
+            import subprocess
+            raise subprocess.TimeoutExpired("x", timeout)
+        return -9
+
+    def terminate(self) -> None:
+        self.calls.append("terminate")
+
+    def kill(self) -> None:
+        self.calls.append("kill")
+        self.dead = True
+
+
+def test_close_waits_with_a_bound_after_kill():
+    # codex 10: close() killed and never reaped
+    p = _StubbornProc()
+    PipeTransport(p).close()
+    assert p.calls[-2:] == ["kill", "wait(3)"]
+
+
+def test_room_argv_loads_only_the_user_setting_source():
+    a = room_argv(mcp_config="/r/mcp.json", settings="/r/settings.json", session_id=SID)
+    assert val_of(a, "--setting-sources") == "user" and a.count("--setting-sources") == 1
+    assert "--restricted" not in a
