@@ -35,6 +35,7 @@ from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import envelope as env
 from levain.coordinator.door import door_ok, not_door
+from levain.coordinator.envelope_draft import MIN_LEFT as _MIN_LEFT
 from levain.coordinator.envelopes import EnvelopeStore
 from levain.coordinator.store import (KINDS, STATES, WORDS_MAX, CoordError, Drop, Part, Source, Thread, check_source,
                                       check_words, words_sha256)
@@ -425,22 +426,15 @@ def _effects(body: dict[str, Any], old: dict[str, Any] | None) -> list[str]:
     return L
 
 
-def _wider(old: dict[str, Any], new: dict[str, Any]) -> bool:
-    """True when ``new`` grants anything ``old`` did not: a later stop, a bigger budget, a repo or path outside old's, an
-    effect old did not hold, or the same target with other criteria."""
-    if parse_stamp(new["stop_at"]) > parse_stamp(old["stop_at"]):
-        return True
-    if any(new["budget"][k] > old["budget"][k] for k in env.BUDGET_KEYS):
-        return True
-    for w in new["where"]:
-        allowed = tuple(p for o in old["where"] if o["repo"] == w["repo"] for p in o["paths"])
-        if not allowed or any(not env.path_within(p, allowed) for p in w["paths"]):
-            return True
-    for kind in env.EFFECT_LISTS:
-        before = {env.effect_key(kind, e): e for e in old[kind]}
-        if any(before.get(env.effect_key(kind, e)) != e for e in new[kind]):
-            return True
-    return False
+_wider = env.widens          # the pure rule moved to envelope.py; this name stays for the call sites
+
+
+def _draft_line(body: dict[str, Any]) -> str:
+    """Whether a conversation draft sits behind this body. ``.get``: a stored /1 body has no ``draft`` key."""
+    d = body.get("draft")
+    if d is None:
+        return "  draft: none: no draft reviewed, you composed this body yourself"
+    return f"  draft: {d['draft_id']}#{d['revision']} (digest ...{d['digest'][-8:]})"
 
 
 def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds: bool = True,
@@ -448,7 +442,7 @@ def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds
     """An envelope body as the lines a human signs: where, each effect, the budget, the stop. One function for the
     echo, the sign view, the drop view and show, so what is signed is what was read."""
     now = now or _tick()
-    L = [f"  origin: {body['origin']}", "  where it may work:"]
+    L = [f"  origin: {body['origin']}", _draft_line(body), "  where it may work:"]
     for w in body["where"]:
         paths = ", ".join("the WHOLE repo (every file)" if p == "." else p for p in w["paths"])
         L.append(f"    {w['repo']}  paths: {paths}")
@@ -499,13 +493,79 @@ def _request_line(body: dict[str, Any], store: EnvelopeStore, words: str | None)
     return f"  for your words: {_shown(words[:120])}"
 
 
-def _view(body: dict[str, Any], store: EnvelopeStore, *, words: str | None = None) -> str:
-    old = _old_of(body, store)
+def _bound_rev(store: EnvelopeStore, envelope_id: str, thread_id: str) -> int | None:
+    with read_transaction(store._connect) as conn:
+        row = conn.execute("SELECT rev FROM envelope_binds WHERE envelope_id = ? AND thread_id = ?",
+                           (envelope_id, thread_id)).fetchone()
+    return None if row is None else row[0]
+
+
+def _bases(body: dict[str, Any], store: EnvelopeStore, authority: Any) -> list[tuple[Any, dict[str, Any], list[str], list[str]]]:
+    """Per bound thread, what the body is read against: ``(head, base, thread_ids, notes)``, one entry per distinct base
+    (threads whose bases are canonically equal share one). The base is the head AS NARROWED for that thread (what
+    authority the thread holds now), and the empty envelope when the head is killed or ended for it, or when
+    ``authority`` is given and the head's own signature no longer verifies under it: every value is then a new grant."""
+    head = _old_of(body, store)
+    if head is None:
+        return [(None, None, [], [])]
+    out: list[tuple[Any, dict[str, Any], list[str], list[str]]] = []
+    for b in body["binds"]:
+        t = b["thread_id"]
+        base, note = store.effective(head.envelope_id, t), ""
+        end = store.end_of(head.envelope_id, t)
+        if end is not None:
+            note = f"envelope {head.envelope_id} was {'killed' if end[0] == 'kill' else 'ended (its thread is done)'} "\
+                   f"for thread {t}: every value below is a new grant"
+        elif authority is not None:
+            why = env.refusal(head.payload, head.signature, authority, head.body, ssh_keygen=store._ssh_keygen)
+            if why is not None:
+                base = {**head.body, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": head.body["issued_at"]}
+                note = (f"envelope {head.envelope_id} no longer holds for thread {t}: the key that signed it, "
+                        f"{head.signer_fp}, is not valid now ({why}); every value below is a new grant")
+        for entry in out:
+            if canonical(entry[1]) == canonical(base):
+                entry[2].append(t)
+                entry[3].append(note)
+                break
+        else:
+            out.append((head, base, [t], [note]))
+    return out or [(None, None, [], [])]
+
+
+def _member_lines(body: dict[str, Any], store: EnvelopeStore, head: Any, thread_id: str) -> tuple[list[str], bool]:
+    """The drops a thread gained or lost between the revision the head was signed for and the one this body binds."""
+    bind = next(b for b in body["binds"] if b["thread_id"] == thread_id)
+    from_rev = _bound_rev(store, head.envelope_id, thread_id)
+    if from_rev is None or from_rev == bind["rev"]:
+        return [], False
+    with read_transaction(store._connect) as conn:
+        added, removed = store.members_diff(conn, thread_id, from_rev, bind["rev"])
+    lines = [f"  thread {thread_id} gained drops: {', '.join(added)}" if added else "",
+             f"  thread {thread_id} lost drops: {', '.join(removed)}" if removed else ""]
+    return [x for x in lines if x], bool(added)
+
+
+def _view(body: dict[str, Any], store: EnvelopeStore, *, words: str | None = None, authority: Any = None) -> str:
+    """What is shown before a signature. A body that supersedes is read PER THREAD against the head as narrowed for
+    that thread (never the head's signed body, which a kill or a drop would have made wider than what is in force);
+    sign and accept pass their ``authority`` snapshot, so a head whose key no longer holds is read as granting
+    nothing. Echo and extend pass none, and what they print is not the signing view."""
     L = [f"envelope {body['envelope_id']}  digest {env.envelope_digest(body)}", NOT_IN_FORCE_PLAIN,
-         _request_line(body, store, words), *_describe(body, store, old=None if old is None else old.body)]
-    if old is not None:
-        L.append(f"WIDER than {old.envelope_id}: that is why it needs your signature"
-                 if _wider(old.body, body) else f"not wider than {old.envelope_id}")
+         _request_line(body, store, words)]
+    sections = _bases(body, store, authority)
+    for i, (head, base, threads, notes) in enumerate(sections):
+        if head is not None and len(sections) > 1:
+            L.append(f"read against {head.envelope_id} as narrowed for thread{'s' if len(threads) > 1 else ''} "
+                     f"{', '.join(threads)}:")
+        L += _describe(body, store, old=base if head is not None else None, binds=i == 0)
+        L += list(dict.fromkeys(n for n in notes if n))
+        if head is None:
+            continue
+        for t in threads:
+            members, gained = _member_lines(body, store, head, t)
+            L += members
+            L.append(f"WIDER than {head.envelope_id} for thread {t}: that is why it needs your signature"
+                     if env.widens(base, body) or gained else f"not wider than {head.envelope_id} for thread {t}")
     L.append("if Levain later acts on it, it may do only this, nothing outside it.")
     return "\n".join(L)
 
@@ -612,17 +672,17 @@ def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
     if not shared:
         raise CoordError("these threads share no drop; one envelope covers threads that hold the same drop")
     drop = store.drop(shared[0])
-    heads = [store.head(t.thread_id) for t in threads]
-    first = heads[0]
-    if any((h is None) != (first is None) or (h is not None and h.envelope_id != first.envelope_id) for h in heads):
-        raise CoordError("these threads do not share one current envelope; echo them separately")
+    # the head, its effective envelope per thread and `seen` in ONE read: a seen read later could cover a narrowing
+    # the view never showed (store.basis raises the shared-head message)
+    first, _eff, seen = store.basis([t.thread_id for t in threads])
     where = _parse_where(args.where)
     now = _tick().replace(microsecond=0)
     body = {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
             "origin": "worded", "drop_id": drop.drop_id, "words_sha256": drop.words_sha256,
             "binds": [{"thread_id": t.thread_id, "rev": t.rev, "members_sha256": t.members_sha256} for t in threads],
-            "supersedes": None if first is None else {"envelope_id": first.envelope_id, "digest": first.digest},
-            "where": where, "lands": [_parse_land(s) for s in args.land], "pushes": [], "publishes": [],
+            "supersedes": None if first is None else {"envelope_id": first.envelope_id, "digest": first.digest,
+                                                       "seen": seen},
+            "draft": None, "where": where, "lands": [_parse_land(s) for s in args.land], "pushes": [], "publishes": [],
             "budget": _echo_budget(args.budget), "stop_at": utc_stamp(now + _parse_stop(args.stop)),
             "issued_at": utc_stamp(now)}
     text = canonical(body)
@@ -646,13 +706,13 @@ def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
 
     store = _store(args)
     t = store.thread(args.thread)
-    head = store.head(t.thread_id)
+    head, effs, seen = store.basis([t.thread_id])          # one read: the head, its effective envelope, `seen`
     if head is None:
         raise CoordError(f"thread {t.thread_id} has no envelope, so no budget to extend (levain envelope echo)")
     ended = store.end_of(head.envelope_id, t.thread_id)
     if ended is not None:
         raise CoordError(f"envelope {head.envelope_id} ended for this thread ({ended[0]}); a new one is an echo")
-    eff = store.effective(head.envelope_id, t.thread_id)
+    eff = effs[t.thread_id]
     now = _tick().replace(microsecond=0)
     if parse_stamp(eff["stop_at"]) - now < _MIN_LEFT:
         raise CoordError(f"envelope {head.envelope_id} has stopped or stops within 5 minutes; echo a new one")
@@ -673,8 +733,8 @@ def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
     body = {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
             "origin": "worded", "drop_id": drop.drop_id, "words_sha256": drop.words_sha256,
             "binds": [{"thread_id": t.thread_id, "rev": t.rev, "members_sha256": t.members_sha256}],
-            "supersedes": {"envelope_id": head.envelope_id, "digest": head.digest},
-            "where": eff["where"], "lands": eff["lands"], "pushes": eff["pushes"], "publishes": eff["publishes"],
+            "supersedes": {"envelope_id": head.envelope_id, "digest": head.digest, "seen": seen},
+            "draft": None, "where": eff["where"], "lands": eff["lands"], "pushes": eff["pushes"], "publishes": eff["publishes"],
             "budget": new_budget, "stop_at": eff["stop_at"], "issued_at": utc_stamp(now)}
     text = canonical(body)
     store.check_body(text)
@@ -707,7 +767,20 @@ def _accepted(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: 
                            "live": live, "authority_today": NOT_IN_FORCE, "signed_with_yes": yes}, "\n".join(text))
 
 
-_MIN_LEFT = timedelta(minutes=5)
+def _refuse_narrowed(store: EnvelopeStore, body: dict[str, Any]) -> None:
+    """Before a superseding body is shown for signing or accepting: refuse when a narrowing of its head newer than the
+    body's ``seen`` applies to a bound thread, so the view (which reads the head as it is now) is the base the
+    signature will be held to. A body already accepted is an exact retry, left to the store."""
+    sup = body["supersedes"]
+    if sup is None:
+        return
+    try:
+        store.envelope(body["envelope_id"])
+        return
+    except CoordError:
+        pass
+    if store.narrowed_since(sup["envelope_id"], [b["thread_id"] for b in body["binds"]], sup["seen"]):
+        raise CoordError(f"envelope {sup['envelope_id']} was narrowed after this body was echoed; echo again")
 
 
 def run_envelope_sign(args: argparse.Namespace, out: Any) -> int:
@@ -724,9 +797,10 @@ def run_envelope_sign(args: argparse.Namespace, out: Any) -> int:
         raise CoordError(f"envelope {stored.envelope_id} is already accepted; there is nothing to sign "
                          f"(levain envelope show {stored.envelope_id})")
     body = store.check_body(text)          # a body the store can only refuse is never shown for signing
+    _refuse_narrowed(store, body)
     if parse_stamp(body["stop_at"]) - _tick() < _MIN_LEFT:
         raise CoordError(f"envelope {body['envelope_id']} has stopped or stops within 5 minutes; echo again")
-    print(_view(body, store), file=sys.stderr if args.json else out, flush=True)
+    print(_view(body, store, authority=_snapshot(args, store)), file=sys.stderr if args.json else out, flush=True)
     _need_terminal(args, "signing")
     signer_fp, sign = dcli._signer(args, env.SIGN_NAMESPACE, "envelope sign")
     _confirm(args, "signing", _prompt(body, signer_fp, _signer_class(_snapshot(args, store), signer_fp)))
@@ -760,7 +834,8 @@ def run_envelope_accept(args: argparse.Namespace, out: Any) -> int:
         raise CoordError('the signature file is {"payload": ..., "signature": ...}')
     payload = sig["payload"]
     fp = payload.get("signer_fp") if isinstance(payload, dict) else None
-    print(_view(body, store), file=sys.stderr if args.json else out, flush=True)
+    _refuse_narrowed(store, body)
+    print(_view(body, store, authority=_snapshot(args, store)), file=sys.stderr if args.json else out, flush=True)
     if isinstance(fp, str):
         print(f"signed by {fp[:80]} ({_signer_class(_snapshot(args, store), fp)})"
               + (f", {str(sig['note'])[:80]}" if "note" in sig else ""), file=sys.stderr if args.json else out,
@@ -823,7 +898,7 @@ def _spec_body(spec: Any, words: str, source: Source, store: EnvelopeStore) -> d
     now = _tick().replace(microsecond=0)
     return {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
             "origin": "structured", "drop_id": "dr-" + secrets.token_hex(16), "words_sha256": words_sha256(words),
-            "binds": [], "supersedes": None, "where": where, "lands": lands, "pushes": pushes,
+            "binds": [], "supersedes": None, "draft": None, "where": where, "lands": lands, "pushes": pushes,
             "publishes": publishes, "budget": budget, "stop_at": utc_stamp(now + _parse_stop(stop)),
             "issued_at": utc_stamp(now)}
 

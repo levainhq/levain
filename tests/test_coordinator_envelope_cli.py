@@ -424,10 +424,10 @@ def test_m9_a_supersede_marks_each_effect_and_says_wider(run, repo, tmp_path, mo
     out = run("envelope", "echo", thread, "--where", f"{repo}=README,docs/,src/", "--land", f"{repo}=main",
               "--land", f"{repo}=other", "--stop", "2h", "-o", str(wider)).out
     assert f"= unchanged: {repo}  onto main" in out and f"+ added: {repo}  onto other" in out
-    assert f"WIDER than {first}: that is why it needs your signature" in out
+    assert f"WIDER than {first} for thread {thread}: that is why it needs your signature" in out
     narrower = tmp_path / "narrower.json"
     out = run("envelope", "echo", thread, "--where", f"{repo}=README", "--stop", "1h", "-o", str(narrower)).out
-    assert f"- removed: {repo}  onto main" in out and f"not wider than {first}" in out
+    assert f"- removed: {repo}  onto main" in out and f"not wider than {first} for thread {thread}" in out
     # the sign view carries the same marks
     assert f"+ added: {repo}  onto other" in run(*run.signed("envelope", "sign", str(wider), "--yes")).out
 
@@ -585,3 +585,61 @@ def test_final_stop_earlier_refuses_unicode_digits_and_an_unplaceable_year(run, 
     eid = got["body"]["envelope_id"]
     assert "--stop-earlier is" in run("envelope", "narrow", eid, "--stop-earlier", "٣٠m", rc=1).err
     assert "cannot place" in run("envelope", "narrow", eid, "--stop-earlier", "0001-01-01T00:00:00+05:00", rc=1).err
+
+
+# H1-1 (design r3 section 8, tests 15, 17, 18): what a superseding body is read against ------------------------------
+def test_echo_over_a_killed_head_shows_every_grant_added(run, repo, tmp_path, monkeypatch):
+    """The base is the head AS NARROWED, not its signed body (finding K): over a killed head every grant is new."""
+    _drop, thread = make_thread(run, repo, monkeypatch)
+    f, got = echo(run, repo, thread, tmp_path)
+    first = got["body"]["envelope_id"]
+    run(*run.signed("envelope", "sign", str(f), "--yes"))
+    run("envelope", "kill", first)
+    out = run("envelope", "echo", thread, "--where", f"{repo}=README,docs/", "--land", f"{repo}=main",
+              "--stop", "2h", "--budget", "tool_calls=50,tokens=0,hours=1").out
+    assert f"+ added: {repo}  onto main" in out and "= unchanged" not in out
+    assert f"WIDER than {first} for thread {thread}: that is why it needs your signature" in out
+    assert f"envelope {first} was killed for thread {thread}" in out
+
+
+def test_two_thread_direct_view_is_per_thread(run, repo, tmp_path, monkeypatch):
+    """One head bound to two threads, a kill scoped to one: two sections, each against its own thread's base (finding I)."""
+    monkeypatch.chdir(repo)
+    drop_id = run.json("drop", "synthetic words two threads")["drop_id"]
+    t1, t2 = (r["thread_id"] for r in run.json("drops", "split", drop_id, "--thread", "work:one", "--thread",
+                                                "work:two"))
+    args = ("--where", f"{repo}=README,docs/", "--land", f"{repo}=main", "--stop", "2h")
+    f = tmp_path / "both.json"
+    run("envelope", "echo", t1, t2, *args, "-o", str(f))
+    first = env.parse_body(f.read_text().rstrip("\n"))["envelope_id"]
+    run(*run.signed("envelope", "sign", str(f), "--yes"))
+    run("envelope", "kill", first, "--thread", t1)
+    out = run("envelope", "echo", t1, t2, *args).out
+    killed, other = out.split(f"read against {first} as narrowed for thread {t2}:")[0], \
+        out.split(f"read against {first} as narrowed for thread {t2}:")[1]
+    assert f"read against {first} as narrowed for thread {t1}:" in killed
+    assert f"+ added: {repo}  onto main" in killed and f"WIDER than {first} for thread {t1}:" in killed
+    assert f"= unchanged: {repo}  onto main" in other and f"not wider than {first} for thread {t2}" in other
+    assert "+ added" not in other and "WIDER than" not in other
+
+
+def test_successor_of_a_key_revoked_head_is_accepted_and_shown_new(repo, tmp_path, monkeypatch, own_log):
+    """Finding A: acceptance verifies the successor's key only, never the head's; the sign view reads the head as
+    granting nothing and names the revoked key."""
+    log, run = own_log
+    _drop, thread = make_thread(run, repo, monkeypatch)
+    f, got = echo(run, repo, thread, tmp_path)
+    first = got["body"]["envelope_id"]
+    run(*run.signed("envelope", "sign", str(f), "--yes"))
+    log.revoke("phone")
+    g = tmp_path / "successor.json"
+    run("envelope", "echo", thread, "--where", f"{repo}=README,docs/", "--land", f"{repo}=main", "--stop", "2h",
+        "--budget", "tool_calls=50,tokens=0,hours=1", "-o", str(g))
+    err = run(*run.signed("envelope", "sign", str(g), "--yes"), rc=1).err          # signed by the revoked key itself
+    assert "revoked" in err
+    stranger = ["--signing-key", str(run.keys["stranger"].path), "--data-root", run.root]
+    out = run("envelope", "sign", str(g), "--yes", *stranger).out
+    assert f"+ added: {repo}  onto main" in out and "= unchanged" not in out
+    assert f"envelope {first} no longer holds for thread {thread}" in out and run.keys["phone"].fp in out
+    assert f"WIDER than {first} for thread {thread}" in out
+    assert "accepted" in out and run.json("envelope", "list", "--thread", thread)[-1]["envelope_id"] != first
