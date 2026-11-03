@@ -2,7 +2,7 @@
 
 A gauge reports a value and its own staleness, and nothing else: it never writes, never fires anything and holds no
 gate semantics (flow's GATE/GAUGE/FEED ruling: a wrong gauge is a wrong number, so it must say how old the number is).
-The hooks that fill these in are registered by a later hunk in ``supervise.py``, not here.
+The win verifier at the end of this module is the ``verify`` hook's default; ``supervise.py`` builds it for its store.
 
 Absence is never health. A gauge with nothing to look at reports :data:`UNKNOWN`, not :data:`OK`; a quiet input and a
 dead input are different values (quiet means ``skipped-no-input``, dead means failure).
@@ -18,11 +18,13 @@ import re
 import sqlite3
 import stat
 from dataclasses import dataclass
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
 __all__ = ["OK", "QUIET", "DEAD", "UNKNOWN", "NOT_MEASURED", "STUB_MAX_BYTES", "DEFAULT_STALE_AFTER", "Gauge",
-           "input_liveness", "output_arrival", "fate_of_output", "run_health"]
+           "input_liveness", "output_arrival", "fate_of_output", "run_health", "WinContext", "WIN_UNVERIFIED", "WIN_FAILED",
+           "register_check", "win_verifier"]
 
 OK = "ok"
 QUIET = "quiet"            # nothing real to read: the fire is skipped-no-input, which is not a failure
@@ -231,3 +233,83 @@ def run_health(conn: sqlite3.Connection, agent_id: str, now: datetime, *, stale_
     when = _parse_stamp(ended) or _parse_stamp(launched) or _parse_stamp(admitted)
     value = {"done": OK, "failed": DEAD, "skipped-no-input": QUIET}.get(state, UNKNOWN)
     return _gauge(name, value, f"the latest run is {state}", when, now, stale_after)
+
+
+# --- the win verifier (BUILD_PLAN P8b-ii) ------------------------------------------------------------------------------
+#
+# ``Supervisor.finish`` calls the verify hook inside the fire, before the end is written, so the verifier runs in the
+# fire's process under the occurrence's grant. It judges only a ``done`` the run asked for. ``win.kind`` decides what
+# counts: ``human`` and ``inherited`` name no machine check (a named human verdict surface; the downstream's win) and
+# are accepted here; ``verifier`` and ``verified-restore`` name a check by ``win.check``, which must be a name
+# registered with :func:`register_check`. A run whose win names no registered check was not verified, so it fails
+# (:data:`WIN_UNVERIFIED`): a done that nothing checked is not a win. A check that raises fails the run as
+# ``verify_error`` through the hook's own rule.
+
+WIN_UNVERIFIED = "win_unverified"
+WIN_FAILED = "win_failed"
+_MACHINE_KINDS = frozenset({"verifier", "verified-restore"})
+_CHECKS: dict[str, Callable[["WinContext"], str | None]] = {}
+
+
+@dataclass(frozen=True)
+class WinContext:
+    """What a registered check is given: the occurrence, its spec as stored, and the end it is judging. Read-only."""
+    store: object
+    occurrence_id: str
+    agent_id: str
+    spec: dict
+    launched_at: str | None
+    end: object
+    now: datetime
+
+
+def register_check(name: str, check: Callable[[WinContext], str | None]) -> None:
+    """Register ``check`` under ``name`` (the ``win.check`` text of a spec). It returns None for a win or a reason."""
+    if not isinstance(name, str) or not name.strip() or not callable(check):
+        raise ValueError("a check needs a non-empty name and a callable")
+    if name in _CHECKS and _CHECKS[name] is not check:
+        raise ValueError(f"a check named {name!r} is already registered")
+    _CHECKS[name] = check
+
+
+def _stored_spec(store, occurrence_id: str) -> tuple[str, dict | None, str | None] | None:
+    with store.read() as conn:
+        row = conn.execute("SELECT o.agent_id, s.spec, o.launched_at FROM agent_occurrences o"
+                           " LEFT JOIN agent_specs s ON s.agent_id = o.agent_id AND s.spec_hash = o.spec_hash"
+                           " WHERE o.occurrence_id = ?", (occurrence_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        spec = json.loads(row[1]) if row[1] else None
+    except ValueError:
+        spec = None
+    return row[0], spec if isinstance(spec, dict) else None, row[2]
+
+
+def win_verifier(store, *, clock: Callable[[], datetime] | None = None) -> Callable[[object], str | None]:
+    """The ``verify`` hook for ``store``: None accepts the end, a reason fails a ``done``. Only a ``done`` is judged."""
+    now_of = clock or (lambda: datetime.now(timezone.utc))
+
+    def verify(end) -> str | None:
+        if getattr(end, "state", None) != "done":
+            return None
+        found = _stored_spec(store, end.occurrence_id)
+        if found is None:
+            return WIN_UNVERIFIED
+        agent_id, spec, launched = found
+        if spec is None:
+            return WIN_UNVERIFIED
+        win = spec.get("win")
+        if not isinstance(win, dict) or win.get("kind") in ("human", "inherited"):
+            return None      # no machine check is named: registration (refuse.py) is what requires a win
+        if win.get("kind") not in _MACHINE_KINDS:
+            return WIN_UNVERIFIED
+        check = _CHECKS.get(win.get("check"))
+        if check is None:
+            return WIN_UNVERIFIED
+        verdict = check(WinContext(store, end.occurrence_id, agent_id, spec, launched, end, now_of()))
+        if verdict is None:
+            return None
+        return verdict if type(verdict) is str and verdict.strip() and verdict != "completed" else WIN_FAILED
+
+    return verify

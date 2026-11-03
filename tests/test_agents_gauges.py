@@ -14,13 +14,13 @@ STUB = (b'{"error": {"type": "overloaded_error", "message": "Overloaded. The ups
         b'and no body; retry later or contact support with the request id req_0000000000000000"}}')
 
 
-def seed_run(store, state: str, ended: str, name: str = "scratch") -> str:
+def seed_run(store, state: str, ended: str, name: str = "scratch", spec_text: str = "{}") -> str:
     agent_id = "ag-" + name
     with store.write() as c:
         c.execute("INSERT INTO agents (agent_id, name, current_version, registration, operation, failure_streak, "
                   "created_at) VALUES (?,?,?,?,?,?,?)", (agent_id, name, 1, "registered", "active", 0, ended))
         c.execute("INSERT INTO agent_specs (agent_id, version, spec_hash, role_hash, spec, created_at) "
-                  "VALUES (?,?,?,?,?,?)", (agent_id, 1, "h", "r", "{}", ended))
+                  "VALUES (?,?,?,?,?,?)", (agent_id, 1, "h", "r", spec_text, ended))
         c.execute("INSERT INTO agent_occurrences (occurrence_id, agent_id, kind, key, state, reason, window_key, "
                   "spec_hash, binding_id, run_id, admitted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                   ("oc-1", agent_id, "scheduled", "k1", "admitted", None, "w", "h", "b", "run-1", ended))
@@ -194,3 +194,72 @@ def test_an_unreadable_input_is_dead_not_unknown(tmp_path):
         assert g.input_liveness(str(f), NOW).value == g.DEAD
     finally:
         f.chmod(0o600)
+
+
+# --- the win verifier (P8b-ii) --------------------------------------------------------------------------------------
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+
+def _win_store(tmp_path, win, spec_text=None):
+    store = open_agent_store(tmp_path / "s")
+    seed_run(store, "done", "2026-11-02T11:00:00Z", spec_text=spec_text if spec_text is not None else json.dumps({"win": win}))
+    return store
+
+
+def _end(state="done"):
+    return SimpleNamespace(occurrence_id="oc-1", state=state, reason="completed", usage=None)
+
+
+def test_a_registered_check_decides_a_done_and_a_failed_run_is_never_judged(tmp_path):
+    # behaviour: a verifier-kind win runs its named check; None accepts, a reason fails, a bad reason is win_failed
+    verdicts = iter([None, "no card filed", "completed"])
+    seen = []
+    g.register_check("t-card", lambda ctx: seen.append((ctx.agent_id, ctx.spec["win"]["kind"], ctx.launched_at))
+                     or next(verdicts))
+    win_rig = _win_store(tmp_path, {"kind": "verifier", "check": "t-card"})
+    v = g.win_verifier(win_rig, clock=lambda: NOW)
+    assert v(_end()) is None
+    assert v(_end()) == "no card filed"
+    assert v(_end()) == g.WIN_FAILED          # "completed" is done's alone
+    assert v(_end("failed")) is None and len(seen) == 3 and seen[0][0] == "ag-scratch"
+
+
+def test_a_machine_win_with_no_registered_check_is_unverified_not_a_win(tmp_path):
+    for kind in ("verifier", "verified-restore"):
+        win_rig = _win_store(tmp_path / kind, {"kind": kind, "check": "nobody-registered-this"})
+        assert g.win_verifier(win_rig)(_end()) == g.WIN_UNVERIFIED
+
+
+def test_a_human_or_inherited_win_names_no_machine_check(tmp_path):
+    for kind in ("human", "inherited"):
+        win_rig = _win_store(tmp_path / kind, {"kind": kind, "check": "x"})
+        assert g.win_verifier(win_rig)(_end()) is None
+
+
+def test_an_occurrence_with_no_stored_spec_or_an_unreadable_one_is_unverified(tmp_path):
+    win_rig = _win_store(tmp_path, None, spec_text="not json")
+    assert g.win_verifier(win_rig)(SimpleNamespace(occurrence_id="oc-none", state="done")) == g.WIN_UNVERIFIED
+    assert g.win_verifier(win_rig)(_end()) == g.WIN_UNVERIFIED
+
+
+def test_a_check_cannot_be_replaced_silently():
+    g.register_check("t-once", lambda ctx: None)
+    with pytest.raises(ValueError):
+        g.register_check("t-once", lambda ctx: None)
+    with pytest.raises(ValueError):
+        g.register_check("", lambda ctx: None)
+
+
+def test_the_supervisor_defaults_its_verify_hook_to_the_win_verifier(monkeypatch):
+    from levain.agents import supervise
+    sup = supervise.Supervisor.__new__(supervise.Supervisor)
+    built = []
+    monkeypatch.setattr(g, "win_verifier", lambda store, clock=None: built.append(store) or (lambda end: None))
+    store = SimpleNamespace(directory=None)
+    with pytest.raises(Exception):       # the rest of __init__ needs a real store; the verifier is built before it
+        supervise.Supervisor.__init__(sup, store, authority=None, clock=lambda: NOW)
+    assert built == [store]
