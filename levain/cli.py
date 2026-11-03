@@ -1475,6 +1475,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     iso_p.set_defaults(func=_cmd_setup_isolation)
 
+    hands_p = subparsers.add_parser(
+        "hands",
+        help="Sign the entity's own user in to Claude Code or Codex (its own login, never a copy of yours).",
+        description=(
+            "`levain hands login claude|codex` runs the vendor's own login AS the entity's user (the account "
+            "`levain setup-isolation` made), with the vendor's config home inside that user's home; "
+            "`levain hands status [claude|codex]` shows who each is signed in as. Your own ~/.claude and "
+            "~/.codex are never read or copied. Anything that runs as the entity's user can use the login, "
+            "and a logout is local to this machine."
+        ),
+    )
+    hands_p.add_argument("--path", type=Path, default=Path.cwd(), help="Entity directory (default: cwd).")
+    hands_sub = hands_p.add_subparsers(dest="hands_cmd", required=True)
+    hl_p = hands_sub.add_parser("login", help="Sign the entity's user in to a vendor CLI.")
+    hl_p.add_argument("vendor", choices=("claude", "codex"))
+    hl_p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
+    hs_p = hands_sub.add_parser("status", help="Show the entity's user's vendor logins (read-only).")
+    hs_p.add_argument("vendor", nargs="?", choices=("claude", "codex"), default=None)
+    hs_p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
+    hands_p.set_defaults(func=_cmd_hands)
+
     wsg_p = subparsers.add_parser(
         "ws-git",
         help="Run git in the entity's workspace as the entity's user, with hooks and the like off.",
@@ -4974,6 +4995,14 @@ def _cmd_ssh_add(args: argparse.Namespace) -> int:
         print(f"levain ssh-add: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+def _cmd_hands(args: argparse.Namespace) -> int:
+    from levain.firing import hands_login
+
+    if args.hands_cmd == "login":
+        return hands_login.cmd_hands_login(args.path, args.vendor)
+    return hands_login.cmd_hands_status(args.path, args.vendor)
 
 
 def _cmd_ws_git(args: argparse.Namespace) -> int:
