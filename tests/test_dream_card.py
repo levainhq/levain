@@ -424,8 +424,15 @@ def test_a_card_artifact_is_world_readable(tmp_path):
     import os
     import stat
     target = tmp_path / "occ" / "card_diff.txt"
-    cd._write(target, "x")
-    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644
+    old = os.umask(0o022)
+    try:
+        cd._write(target, "x")
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o644
+        os.umask(0o077)                                  # a private umask stays private
+        cd._write(tmp_path / "occ" / "card_his.json", "x")
+        assert stat.S_IMODE(os.stat(tmp_path / "occ" / "card_his.json").st_mode) == 0o600
+    finally:
+        os.umask(old)
 
 
 def test_a_malformed_recorded_continuity_hash_is_a_card_error(scratch):

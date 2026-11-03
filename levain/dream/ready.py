@@ -198,11 +198,10 @@ def _check1(src: Sources, agent: str, key: str, day: date, zone: str, now: datet
         if r.get("state") == "done" and (occurrence_dream_day(r, zone) == day):
             return Check(1, name, QUIET, f"dream-day {day} was already consolidated by {r.get('occurrence_id')}",
                          "already-dreamed")
-    # a manual run has its own window key (``m:<date>``), so a manual run in flight is looked for by kind or key prefix,
-    # for a scheduled evaluation as much as a manual one: either overlapping the other is the double launch
-    inflight = [r for r in rows if r.get("state") in ("admitted", "launched")
-                and (r.get("window_key") == key or r.get("kind") == "manual"
-                     or str(r.get("window_key") or "").startswith("m:"))]
+    # ANY admitted or launched row of this agent is a dream in flight, whatever its window or kind: a manual run, a
+    # scheduled run of the previous window and this window's own all overlap one consolidation. A row a crash left in
+    # either state keeps the answer quiet until recovery reaps it, and the detail names the row.
+    inflight = [r for r in rows if r.get("state") in ("admitted", "launched")]
     if inflight:
         return Check(1, name, QUIET, f"{inflight[0].get('occurrence_id')} is still in flight", "in-flight")
     launched = [r for r in rows if r.get("window_key") == key and r.get("state") in _LAUNCHED_STATES

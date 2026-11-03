@@ -227,7 +227,9 @@ def _write(path: Path, data: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(data)
-        os.chmod(name, 0o644)           # mkstemp makes 0600; the card artifacts were world-readable before it
+        umask = os.umask(0)             # mkstemp makes 0600; a plain write gives 0666 under the umask, so this does too
+        os.umask(umask)
+        os.chmod(name, 0o666 & ~umask)
         os.replace(name, path)
     except BaseException:
         with contextlib.suppress(OSError):

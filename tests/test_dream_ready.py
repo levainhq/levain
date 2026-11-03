@@ -589,3 +589,9 @@ def test_check1_a_scheduled_evaluation_sees_a_manual_run_in_flight_by_kind_and_b
     ent.occurrence("launched", kind="manual", window="m:2026-11-03", launched=utc(2026, 11, 3, 12, 0))
     v = ent.evaluate(manual=False)
     assert (v.verdict, v.check, v.kind) == (rd.QUIET, 1, "in-flight")
+
+
+def test_check1_a_manual_evaluation_sees_the_previous_windows_scheduled_run_in_flight(ent):
+    ent.occurrence("launched", window="w:2026-11-02T22:00", launched=utc(2026, 11, 3, 2, 0))
+    v = ent.evaluate(manual=True)
+    assert (v.verdict, v.check, v.kind) == (rd.QUIET, 1, "in-flight")
