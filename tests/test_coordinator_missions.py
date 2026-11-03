@@ -332,3 +332,38 @@ def test_the_same_signature_cannot_accept_twice_under_a_new_sign_request_id(stor
     n = sqlite3.connect(store.path).execute("SELECT COUNT(*) FROM mission_acceptances").fetchone()[0]
     assert n == 2
 
+
+
+# ---------------------------------------------------------------------------------------------- land-prep nits
+def _mission_tables(directory):
+    c = sqlite3.connect(directory / "dispatch.db")
+    try:
+        return {r[0] for r in c.execute("SELECT name FROM sqlite_master")} & {
+            "missions", "mission_revisions", "mission_acceptances"}
+    finally:
+        c.close()
+
+
+def test_a_mission_read_on_a_pre_mission_store_makes_no_tables_and_reads_empty(tmp_path, monkeypatch):
+    d = tmp_path / "dispatch"
+    tid, _ = _pre_missions_store(d, monkeypatch)
+    store = CoordStore(d, clock=Clock())
+    assert missions.list_missions(store) == []
+    assert _mission_tables(d) == set()                                # a read creates nothing
+    with pytest.raises(CoordError):
+        missions.get_mission(store, "mission-none")
+    with pytest.raises(CoordError):
+        missions.snapshot_of(store, "mission-none")
+    assert _mission_tables(d) == set()
+    missions.create_mission(store, [tid])                             # the first write still migrates
+    assert _mission_tables(d) == {"missions", "mission_revisions", "mission_acceptances"}
+
+
+def test_the_watermark_survives_a_store_with_attenuations_but_no_binds(store):
+    tid = _work(store)
+    conn = sqlite3.connect(":memory:")
+    for ddl in ("CREATE TABLE replies (gseq INT, thread_id TEXT)", "CREATE TABLE review_items (gseq INT, thread_id TEXT, "
+                "item_id TEXT)", "CREATE TABLE review_events (gseq INT, item_id TEXT)",
+                "CREATE TABLE envelope_attenuations (gseq INT, thread_id TEXT, envelope_id TEXT)"):
+        conn.execute(ddl)
+    assert missions._watermark(conn, [tid]) == 0

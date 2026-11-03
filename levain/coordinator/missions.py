@@ -140,6 +140,12 @@ def _has(conn: sqlite3.Connection, table: str) -> bool:
     return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
 
 
+def _reader(store: CoordStore):
+    """The connection a mission read opens: read-only, so it makes and migrates nothing (a store made before the
+    mission tables reads as having no missions)."""
+    return store.open_readonly
+
+
 def _latest(conn: sqlite3.Connection, mission_id: str) -> tuple[int, list[str], str]:
     row = conn.execute("SELECT rev, children, children_sha256 FROM mission_revisions WHERE mission_id = ? "
                        "ORDER BY rev DESC LIMIT 1", (mission_id,)).fetchone()
@@ -149,7 +155,7 @@ def _latest(conn: sqlite3.Connection, mission_id: str) -> tuple[int, list[str], 
 
 
 def _must_mission(conn: sqlite3.Connection, mission_id: Any) -> None:
-    if (not isinstance(mission_id, str) or _MISSION_ID.fullmatch(mission_id) is None
+    if (not isinstance(mission_id, str) or not _has(conn, "missions") or _MISSION_ID.fullmatch(mission_id) is None
             or conn.execute("SELECT 1 FROM missions WHERE mission_id = ?", (mission_id,)).fetchone() is None):
         raise CoordError(f"no mission {str(mission_id)[:40]!r}")
 
@@ -178,7 +184,7 @@ def _watermark(conn: sqlite3.Connection, children: Sequence[str]) -> int:
              (f"SELECT COALESCE(MAX(gseq), 0) FROM review_items WHERE thread_id IN ({marks})", args),
              (f"SELECT COALESCE(MAX(e.gseq), 0) FROM review_events e JOIN review_items i ON i.item_id = e.item_id "
               f"WHERE i.thread_id IN ({marks})", args)]
-    if _has(conn, "envelope_attenuations"):
+    if _has(conn, "envelope_attenuations") and _has(conn, "envelope_binds"):
         # a row with no thread id is envelope-wide: it applies to every thread the envelope is bound to
         parts.append((f"SELECT COALESCE(MAX(gseq), 0) FROM envelope_attenuations WHERE thread_id IN ({marks}) OR "
                       f"(thread_id IS NULL AND envelope_id IN (SELECT envelope_id FROM envelope_binds WHERE thread_id "
@@ -218,7 +224,7 @@ def _snapshot(conn: sqlite3.Connection, mission_id: str) -> Snapshot:
 
 def snapshot_of(store: CoordStore, mission_id: str) -> Snapshot:
     """The mission's complete current state as an acceptance would sign it now."""
-    with read_transaction(store._connect) as conn:
+    with read_transaction(_reader(store)) as conn:
         _must_mission(conn, mission_id)
         return _snapshot(conn, mission_id)
 
@@ -243,14 +249,16 @@ def _view(conn: sqlite3.Connection, mission_id: str) -> Mission:
 
 
 def get_mission(store: CoordStore, mission_id: str) -> Mission:
-    with read_transaction(store._connect) as conn:
+    with read_transaction(_reader(store)) as conn:
         _must_mission(conn, mission_id)
         return _view(conn, mission_id)
 
 
 def list_missions(store: CoordStore) -> list[Mission]:
     """Every mission, newest first."""
-    with read_transaction(store._connect) as conn:
+    with read_transaction(_reader(store)) as conn:
+        if not _has(conn, "missions"):
+            return []
         ids = [r[0] for r in conn.execute("SELECT mission_id FROM missions ORDER BY rowid DESC")]
         return [_view(conn, i) for i in ids]
 
@@ -354,7 +362,7 @@ def accept(store: CoordStore, mission_id: str, *, snapshot_sha256: str, sign_req
         raise CoordError("an acceptance names the snapshot digest and the sign request")
     stale = AcceptanceRefused("stale", f"mission {mission_id} moved since the card rendered (a child, a KNOW, an "
                               "attenuation or the membership changed); nothing was accepted; sign the new card")
-    with read_transaction(store._connect) as conn:
+    with read_transaction(_reader(store)) as conn:
         _must_mission(conn, mission_id)
         current = _snapshot(conn, mission_id)
     if current.sha256 != snapshot_sha256:
