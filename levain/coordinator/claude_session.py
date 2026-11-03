@@ -292,11 +292,13 @@ class ClaudeSession:
         # request_id -> (subtype, digest of the request body) of every control_request ever emitted, for the life of
         # the session: an identical replay is suppressed, a changed one is a protocol error (never a second event key)
         self._seen_ctl: dict[str, tuple[str, str]] = {}
+        self._altered: dict[str, set[tuple[str, str]]] = {}    # request_id -> the altered replays already reported
         self._cancelled: set[str] = set()
         self._conflicts = 0
         self._tools_of: dict[str, str | None] = {}
         self._replying: dict[str, str] = {}
         self._int_n = 0
+        self._int_lock = threading.Lock()       # one interrupt at a time; its wait holds this, never the io lock
         self._int_rid: str | None = None        # the one interrupt awaiting its control_response
         self._int_ack: tuple[str, Any] | None = None
         self._denied: list[tuple[str, str, str | None]] = []
@@ -320,7 +322,8 @@ class ClaudeSession:
         """Take what the transport has and fold it in, in arrival order. The io lock is held only for a non-blocking
         poll and its ingest; the wait between polls (at most ``_POLL_SLICE`` seconds each) is spent OUTSIDE it, so a
         long :meth:`read` cannot hold off :meth:`interrupt` (L3 r2). Ends on the first lines, at ``wait``, or once the
-        transport reports its end. (A caller already holding the lock, :meth:`interrupt`, keeps it while it waits.)"""
+        transport reports its end. A caller already holding the io lock keeps it across the wait, so only a ``0.0``
+        pump is ever called that way."""
         deadline = time.monotonic() + max(wait, 0.0)
         while True:
             with self._io:
@@ -496,12 +499,14 @@ class ClaudeSession:
         if seen is not None:
             # a replayed id: an identical request is suppressed (one event per id for the life of the session); a
             # changed one never moves the original across the one door (§8.1): it stays pending as it was, and the
-            # change is a protocol error under its own key
-            if seen != (subtype, body_digest):
+            # change is a protocol error under its own key, once per distinct alteration (a retransmitted altered copy
+            # is suppressed too, L3 r3)
+            if seen != (subtype, body_digest) and (subtype, body_digest) not in self._altered.get(rid, ()):
                 self._conflicts += 1
                 self._emit("error", f"control_changed:{rid}:{self._conn}-{self._conflicts}", turn_id=self._open,
                            body=f"request {rid[:40]} replayed changed: {seen[0][:40]} -> {subtype[:40]}",
                            control_subtype=subtype, raw_sha256=digest)
+                self._altered.setdefault(rid, set()).add((subtype, body_digest))   # after the event exists
             return
         # recorded before anything else sees the request
         self._seen_ctl[rid] = (subtype, body_digest)
@@ -678,37 +683,55 @@ class ClaudeSession:
         writes nothing (a late interrupt must not abort the next turn). The
         aborted turn's ``result`` arrives through :meth:`read` as a ``turn_ended``. Each write mints its own request id
         (never derived from ``op_id``), and only the response to that id confirms it: a late response to an earlier
-        interrupt is discarded."""
-        with self._io:
-            if self.closed:
-                return CommandResult("rejected", "the session is closed")
-            self._pump(0.0)
-            # before its init the turn is the one send() predicted (a line awaits, no turn is open): that id is live
-            pending = (f"t{self._conn}-{self._turns + 1}" if self._open is None and self._awaiting > 0 else None)
-            if command.turn_id is not None and command.turn_id not in (self._open, pending):
-                return CommandResult("rejected", f"turn {command.turn_id} is not the open turn")
-            self._int_n += 1
-            rid = f"int-{self._conn}-{self._int_n}-{secrets.token_hex(8)}"
-            data = json.dumps({"type": "control_request", "request_id": rid,
-                               "request": {"subtype": "interrupt"}}, sort_keys=True) + "\n"
-            self._int_rid, self._int_ack = rid, None
-            try:
+        interrupt is discarded.
+
+        Interrupts are serialised by their own lock; the io lock is held only to check, write and ingest, never across
+        the wait, so a :meth:`read` or :meth:`send` issued meanwhile waits at most one poll slice (L3 r3). Once the
+        child's output has ended no response can arrive, so the answer is ``ambiguous`` at once (L3 r3)."""
+        with self._int_lock:
+            with self._io:
+                if self.closed:
+                    return CommandResult("rejected", "the session is closed")
+                self._pump(0.0)
+                # before its init the turn is the one send() predicted (a line awaits, no turn is open): that id is live
+                pending = (f"t{self._conn}-{self._turns + 1}" if self._open is None and self._awaiting > 0 else None)
+                if command.turn_id is not None and command.turn_id not in (self._open, pending):
+                    return CommandResult("rejected", f"turn {command.turn_id} is not the open turn")
+                self._int_n += 1
+                rid = f"int-{self._conn}-{self._int_n}-{secrets.token_hex(8)}"
+                data = json.dumps({"type": "control_request", "request_id": rid,
+                                   "request": {"subtype": "interrupt"}}, sort_keys=True) + "\n"
+                self._int_rid, self._int_ack = rid, None
                 try:
                     self._t.write(data)
                 except TransportClosed as exc:
+                    self._int_rid = None
                     return CommandResult("rejected", f"not written: {exc}")
                 except Exception as exc:  # noqa: BLE001 - the bytes may have left
+                    self._int_rid = None
                     return CommandResult("ambiguous",
                                          f"the interrupt may have reached the vendor ({type(exc).__name__})")
+            try:
                 deadline = self._clock() + self._interrupt_wait
-                while self._int_ack is None:
+                while True:
+                    with self._io:
+                        ack, ended, closed = self._int_ack, self._eof_seen, self.closed
+                    if ack is not None:
+                        break
+                    if ended:       # every line the child wrote is already ingested: no response can follow
+                        return CommandResult("ambiguous", "the child's output ended with no control_response to the "
+                                                          "interrupt")
+                    if closed:
+                        return CommandResult("ambiguous", "the session closed with no control_response to the "
+                                                          "interrupt")
                     left = deadline - self._clock()
                     if left <= 0:
                         return CommandResult("ambiguous", "no control_response to the interrupt in time")
-                    self._pump(min(left, 0.05))
-                subtype, body = self._int_ack
+                    self._pump(min(left, _POLL_SLICE))
+                subtype, body = ack
             finally:
-                self._int_rid, self._int_ack = None, None
+                with self._io:
+                    self._int_rid, self._int_ack = None, None
         if subtype == "success":
             return CommandResult("confirmed", "interrupted")
         return CommandResult("rejected", f"the vendor answered {subtype[:40]}: {_str(body)[:120]}")
@@ -814,7 +837,8 @@ def _spellings(path: str) -> list[str]:
 
 def _check_rule_text(path: str) -> None:
     """A ``)`` would close the rule early (a malformed rule that denies something else); a control character is never
-    a path we mean. Both are refused, never escaped."""
+    a path we mean. Both are refused, never escaped. The message names the spelling refused (a symlink's target can
+    be the offending form)."""
     if ")" in path:
         raise ValueError(f"deny path {path[:80]!r} contains ')': the rule would be malformed")
     if any(unicodedata.category(c) == "Cc" for c in path):
@@ -824,11 +848,13 @@ def _check_rule_text(path: str) -> None:
 def _rules(path: str) -> list[str]:
     """The Read-family rule bodies for one deny path. An absolute path is spelled ``//abs`` (a single leading slash is
     RELATIVE to the settings source and silently matches nothing), once per :func:`_spellings` form; a plain one
-    denies itself and everything under it. A relative path is refused unless it is a ``**/`` glob."""
+    denies itself and everything under it. A relative path is refused unless it is a ``**/`` glob. EVERY spelled form
+    is checked as rule text, not only the path as given: a symlink's target becomes a rule too (L3 r3)."""
     _check_rule_text(path)
     if os.path.isabs(path):
         out: list[str] = []
         for spelled in _spellings(path):
+            _check_rule_text(spelled)
             if spelled == "/":
                 raise ValueError("denying the filesystem root is not a rule")
             body = "/" + spelled

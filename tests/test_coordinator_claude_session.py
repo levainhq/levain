@@ -893,8 +893,9 @@ def test_an_identical_replayed_control_request_is_suppressed():
 
 def test_a_replay_with_a_changed_request_is_a_uniquely_keyed_protocol_error():
     s, t = make()
+    # two DIFFERENT alterations (an identical altered retransmit is one error since L3 r3: see the RMCF3 test)
     t.feed(ctl_request("r", "mcp_message"), ctl_request("r", "can_use_tool", tool_name="Bash", input={}),
-           ctl_request("r", "can_use_tool", tool_name="Bash", input={}))
+           ctl_request("r", "can_use_tool", tool_name="Bash", input={"command": "ls"}))
     evs = list(s.read(None).events)
     keys = [e.key for e in evs]
     assert keys[0] == "error:control:r" and len(keys) == 3 and len(set(keys)) == 3
@@ -1264,3 +1265,99 @@ def test_a_cancel_clears_an_ambiguous_reply_and_nothing_is_written_twice():
     s.read(None)
     assert s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "no_such_request"
     assert t.written == []
+
+
+# ---- L3 r3 fixes (RMCF3) -------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("name", ["a)b", "a) Read(x", "a\x01b"])
+def test_a_symlinked_deny_path_whose_target_cannot_be_a_rule_is_refused(tmp_path, name):
+    # FIX 1: every spelled form is a rule, so every spelled form is validated, not only the path as given
+    real = tmp_path / name
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    with pytest.raises(ValueError, match=r"\)|control"):
+        room_settings_json(str(tmp_path / "elsewhere"), [str(link)])
+
+
+class _EndedTransport(FakeTransport):
+    """A child whose stdout has ended: every poll is empty and returns at once."""
+
+    eof = True
+    returncode = None
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.polls = 0
+
+    def poll(self, wait: float) -> list[str]:
+        self.polls += 1
+        return super().poll(wait)
+
+
+def test_an_interrupt_after_the_output_ended_is_ambiguous_at_once_and_never_spins():
+    # FIX 2: with stdout ended no control_response can arrive; waiting out interrupt_wait spun at full CPU
+    t = _EndedTransport()
+    s = ClaudeSession(t, session_id=SID, interrupt_wait=3.0)
+    t0 = time.monotonic()
+    r = s.interrupt(InterruptCommand("op-1", None))
+    assert r.outcome == "ambiguous" and "ended" in r.detail
+    assert time.monotonic() - t0 < 0.5 and t.polls < 10
+    assert t.written[-1]["request"] == {"subtype": "interrupt"}
+
+
+def test_a_read_issued_while_an_interrupt_waits_returns_within_a_slice():
+    # FIX 3: the interrupt's wait no longer holds the io lock
+    import threading
+    s, t = make(interrupt_wait=3.0)
+    out: list = []
+    waiter = threading.Thread(target=lambda: out.append(s.interrupt(InterruptCommand("op-1", None))), daemon=True)
+    waiter.start()
+    deadline = time.monotonic() + 2.0
+    while not t.written and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert t.written, "the interrupt was never written"
+    t0 = time.monotonic()
+    s.read(None)
+    assert time.monotonic() - t0 < 0.25
+    t.feed(ctl_response(t.written[-1]["request_id"]))
+    waiter.join(3.0)
+    assert out and out[0].outcome == "confirmed"
+
+
+def test_a_concurrent_second_interrupt_never_steals_the_first_ones_ack():
+    # FIX 3's guard: interrupts stay serialised once the io lock is released around the wait
+    import threading
+    s, t = make(interrupt_wait=3.0)
+    out: list = []
+    first = threading.Thread(target=lambda: out.append(("a", s.interrupt(InterruptCommand("op-a", None)))),
+                             daemon=True)
+    first.start()
+    deadline = time.monotonic() + 2.0
+    while not t.written and time.monotonic() < deadline:
+        time.sleep(0.01)
+    second = threading.Thread(target=lambda: out.append(("b", s.interrupt(InterruptCommand("op-b", None)))),
+                              daemon=True)
+    second.start()
+    time.sleep(0.1)
+    assert len(t.written) == 1                                   # the second waits its turn, writing nothing yet
+    t.feed(ctl_response(t.written[0]["request_id"]))
+    first.join(3.0)
+    deadline = time.monotonic() + 2.0
+    while len(t.written) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    t.feed(ctl_response(t.written[1]["request_id"]))
+    second.join(3.0)
+    assert dict(out) and dict(out)["a"].outcome == "confirmed" and dict(out)["b"].outcome == "confirmed"
+
+
+def test_a_retransmitted_altered_request_is_one_protocol_error():
+    # FIX 4: the same altered copy, sent again, is suppressed; a different alteration is its own error
+    s, t = make()
+    t.feed(ctl_request("r", "mcp_message"),
+           ctl_request("r", "can_use_tool", tool_name="Bash", input={}),
+           ctl_request("r", "can_use_tool", tool_name="Bash", input={}),
+           ctl_request("r", "can_use_tool", tool_name="Bash", input={}),
+           ctl_request("r", "can_use_tool", tool_name="Read", input={}))
+    evs = list(s.read(None).events)
+    changed = [e for e in evs if e.vendor_id.startswith("control_changed:")]
+    assert len(evs) == 3 and len(changed) == 2 and len({e.key for e in evs}) == 3
