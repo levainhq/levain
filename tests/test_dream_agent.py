@@ -33,6 +33,8 @@ from tests.test_dream_snapshot import Fake, add_episode, dream, text_n
 ZONE = "America/New_York"
 NY = ZoneInfo(ZONE)
 FEED = "digest"
+# the shape register_dream mints (``ag-...``); the literal "dream" is the agent's NAME, never its id
+AID = "ag-3f9a1c0de2b4"
 
 
 def utc(*a) -> datetime:
@@ -120,7 +122,7 @@ def test_the_window_has_21_slots_a_night_24_on_fall_back_and_18_on_spring_forwar
 # --------------------------------------------------------------------------------------------------- the input check
 
 def occurrence_row(day=date(2026, 11, 2), kind="scheduled"):
-    return {"occurrence_id": "oc-x", "agent_id": "dream", "kind": kind, "window_key": rd.window_key_for(day),
+    return {"occurrence_id": "oc-x", "agent_id": AID, "kind": kind, "window_key": rd.window_key_for(day),
             "launched_at": "2026-11-03T06:00:00Z"}
 
 
@@ -175,13 +177,13 @@ class Night:
             if live_seat_after is not None and i == live_seat_after:
                 self.ent.awake(["thread-a"], until=(slot + timedelta(days=1)).timestamp())
             self.conn.execute("BEGIN IMMEDIATE")
-            oid, outcome = ctl.claim(self.conn, agent_id="dream", kind="scheduled", key=schedule.slot_key(slot),
+            oid, outcome = ctl.claim(self.conn, agent_id=AID, kind="scheduled", key=schedule.slot_key(slot),
                                      spec_hash="sh", binding_id="b", window_key=schedule.window_key(trig, ZONE, slot),
                                      now=slot)
             self.conn.execute("COMMIT")
             assert outcome == ctl.CLAIMED
             at = slot.strftime("%Y-%m-%dT%H:%M:%SZ")
-            row = {"occurrence_id": oid, "agent_id": "dream", "kind": "scheduled",
+            row = {"occurrence_id": oid, "agent_id": AID, "kind": "scheduled",
                    "window_key": schedule.window_key(trig, ZONE, slot)}
             v = da.day_ready(self.ent.db, row, now=slot, zone=ZONE, agent_dir=self.ent.agent_dir,
                              coord_dir=self.ent.coord_dir)
@@ -245,18 +247,20 @@ def test_the_fall_back_night_has_24_slots_and_still_one_done(tmp_path):
 def test_three_nights_on_one_persistent_store(tmp_path):
     n = Night(tmp_path)
     root = n.ent.store_dir / "dream"
+    order: list[str] = []
     for d in (date(2026, 10, 30), date(2026, 10, 31), date(2026, 11, 1)):
         add_episode(n.ent.db, f"episode of {d}")
         slots, out = n.run(d)
+        order.extend(oid for oid, s in out if s == "done")      # real-clock stamps tie within a second: keep run order
         assert count(out).get("done") == 1, d      # check 1, 3 and 6 against the prior night's done: each night gets its own
     done = [r for r in n.rows() if r["state"] == "done"]
     assert len(done) == 3
     kept = [name for name, m in sn.snapshots(root) if m.get("post_files")]
     assert len(kept) == sn.KEEP_SNAPSHOTS == 2     # retention pruned the first night's snapshot
-    by_time = sorted(done, key=lambda r: r["launched_at"])
-    first_rb = sn.rollback(n.ent.db, root / by_time[2]["occurrence_id"])
+    assert sorted(order) == sorted(r["occurrence_id"] for r in done)
+    first_rb = sn.rollback(n.ent.db, root / order[2])
     assert first_rb.ok, first_rb
-    second_rb = sn.rollback(n.ent.db, root / by_time[1]["occurrence_id"])
+    second_rb = sn.rollback(n.ent.db, root / order[1])
     assert not second_rb.ok, "a rollback after a rollback must refuse: only the newest dream is one step back"
 
 
@@ -269,13 +273,13 @@ def test_a_night_with_a_live_seat_after_the_first_slots_files_one_card_and_a_sec
     day1, day2 = date(2026, 10, 30), date(2026, 10, 31)
     n.run(day1)
     after = datetime(2026, 10, 31, 5, 0, tzinfo=NY)
-    r1 = da.close_window(day=day1, now=after, zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED, occ_dir=tmp_path)
+    r1 = da.close_window(agent_id=AID, day=day1, now=after, zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED, occ_dir=tmp_path)
     assert r1.action == "filed" and r1.cls == "live-seat"
     assert r1.action == "filed" and len(filed(rs)) == 1
-    again = da.close_window(day=day1, now=after, zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
+    again = da.close_window(agent_id=AID, day=day1, now=after, zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
     assert again.action == "duplicate"
     n.run(day2)
-    r2 = da.close_window(day=day2, now=after + timedelta(days=1), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
+    r2 = da.close_window(agent_id=AID, day=day2, now=after + timedelta(days=1), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
     assert r2.action == "standing" and len(filed(rs)) == 1
     item = filed(rs)[0]
     assert item.body["kind"] == "did-not-consolidate" and item.body["reason"].startswith("live-seat: night did not")
@@ -291,10 +295,10 @@ def test_a_cleared_standing_item_lets_the_next_night_file_again(tmp_path):
     d1, d2 = date(2026, 10, 30), date(2026, 10, 31)
     n.run(d1)
     n.run(d2)
-    da.close_window(day=d1, now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
+    da.close_window(agent_id=AID, day=d1, now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
     first = filed(rs)[0]
     review.clear_item(rs, first.item_id, mode="manual")
-    r = da.close_window(day=d2, now=datetime(2026, 11, 1, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
+    r = da.close_window(agent_id=AID, day=d2, now=datetime(2026, 11, 1, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
     assert r.action == "filed" and len(filed(rs, include_cleared=True)) == 2
 
 
@@ -305,7 +309,7 @@ def test_a_failing_night_files_exactly_one_failed_card_not_one_per_slot(tmp_path
     q = tmp_path / "q"
     q.mkdir(mode=0o700)
     rs = CoordStore(q)
-    r = da.close_window(day=date(2026, 10, 30), now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(),
+    r = da.close_window(agent_id=AID, day=date(2026, 10, 30), now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(),
                         review_store=rs, feed=FEED)
     assert r.action == "filed" and r.cls == "failed" and "budget" in r.detail
     assert len(filed(rs)) == 1
@@ -317,7 +321,7 @@ def test_a_quiet_day_with_nothing_to_consolidate_files_no_card(tmp_path):
     assert count(out) == {"skipped-no-input": 21}
     q = tmp_path / "q"
     q.mkdir(mode=0o700)
-    r = da.close_window(day=date(2026, 10, 30), now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(),
+    r = da.close_window(agent_id=AID, day=date(2026, 10, 30), now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(),
                         review_store=CoordStore(q), feed=FEED)
     assert r.action == "quiet-day" and r.cls == ""
 
@@ -325,7 +329,7 @@ def test_a_quiet_day_with_nothing_to_consolidate_files_no_card(tmp_path):
 # ----------------------------------------------------------------------------------------- close_window, the gates
 
 def row(state, *, reason=None, key="2026-10-31T02:00:00Z", launched=None, day=date(2026, 10, 30)):
-    return {"agent_id": "dream", "kind": "scheduled", "window_key": rd.window_key_for(day), "state": state,
+    return {"agent_id": AID, "kind": "scheduled", "window_key": rd.window_key_for(day), "state": state,
             "reason": reason, "key": key, "occurrence_id": f"oc-{key}", "launched_at": launched}
 
 
@@ -341,6 +345,7 @@ CLOSED = datetime(2026, 10, 31, 5, 0, tzinfo=NY)
 
 def close(rs, rows, **kw):
     kw.setdefault("now", CLOSED)
+    kw.setdefault("agent_id", AID)
     return da.close_window(day=date(2026, 10, 30), zone=ZONE, rows=rows, review_store=rs, feed=FEED, **kw)
 
 
@@ -385,8 +390,8 @@ def test_a_slept_laptop_files_laptop_slept_and_two_missed_windows_raise_one_atte
     seen = []
     key = rd.window_key_for(date(2026, 10, 30))
     r = close(rs, [], missed_windows=[key], miss_streak=2, attention=lambda k, t: seen.append((k, t)))
-    assert r.action == "filed" and r.cls == "laptop-slept" and r.attention == ["dream-miss-streak:dream"]
-    assert seen[0][0] == "dream-miss-streak:dream"
+    assert r.action == "filed" and r.cls == "laptop-slept" and r.attention == [f"dream-miss-streak:{AID}"]
+    assert seen[0][0] == f"dream-miss-streak:{AID}"
     r1 = close(rs, [], missed_windows=[key], miss_streak=1, attention=lambda k, t: seen.append((k, t)))
     assert r1.action == "duplicate" and len(seen) == 1
 
@@ -396,7 +401,7 @@ def test_missed_rows_alone_are_a_slept_laptop(rs):
 
 
 def test_without_the_agent_feed_the_card_is_refused_and_nothing_is_filed(rs):
-    r = da.close_window(day=date(2026, 10, 30), now=CLOSED, zone=ZONE, review_store=rs,
+    r = da.close_window(agent_id=AID, day=date(2026, 10, 30), now=CLOSED, zone=ZONE, review_store=rs,
                         rows=[row("skipped-no-input", reason="quiet/live-seat: s")])
     assert (r.action == "refused") == ("agent" not in review.FEEDS)
     if r.action == "refused":
@@ -617,3 +622,150 @@ def test_the_win_registration_seam_registers_only_when_the_hook_exists():
 def test_a_run_that_cannot_be_built_exits_1_and_runs_nothing():
     run = da.make_run(lambda store, oid, epoch: (_ for _ in ()).throw(RuntimeError("no authority")))
     assert run(None, "oc-x", 0) == 1
+
+
+# ------------------------------------------------------------------------------ the registered id, the exclusion (L3 r1)
+
+def _claim(conn, slot, *, agent_id=AID, kind="scheduled", window="w"):
+    conn.execute("BEGIN IMMEDIATE")
+    oid, outcome = ctl.claim(conn, agent_id=agent_id, kind=kind, key=schedule.slot_key(slot), spec_hash="sh",
+                             binding_id="b", window_key=window, now=slot)
+    conn.execute("COMMIT")
+    assert outcome == ctl.CLAIMED
+    return oid
+
+
+def test_the_id_the_dream_runs_under_is_the_one_register_dream_minted(astore):
+    reg = da.register_dream(astore)
+    assert reg.agent_id.startswith("ag-") and reg.agent_id != da.NAME
+    assert not hasattr(da, "AGENT_ID_DEFAULT")
+
+
+def test_the_input_check_and_the_filer_take_the_agent_id_from_the_row_and_never_default_it(tmp_path):
+    import inspect
+
+    assert inspect.signature(da.close_window).parameters["agent_id"].default is inspect.Parameter.empty
+    assert "agent_id" not in inspect.signature(da.day_ready).parameters
+    ent = Entity(tmp_path)
+    now = datetime(2026, 11, 3, 1, 0, tzinfo=NY)
+    for bad in ({"agent_id": None}, {"agent_id": ""}, {"agent_id": "  "}, {"agent_id": 7}, {"occurrence_id": ""}):
+        v = da.day_ready(ent.db, {**occurrence_row(), **bad}, now=now, zone=ZONE, agent_dir=ent.agent_dir,
+                         coord_dir=ent.coord_dir)
+        assert not v.ok and v.state == rd.UNREADABLE, bad
+    gone = {k: v for k, v in occurrence_row().items() if k != "agent_id"}
+    assert not da.day_ready(ent.db, gone, now=now, zone=ZONE, agent_dir=ent.agent_dir, coord_dir=ent.coord_dir).ok
+    with pytest.raises(ValueError):
+        da.close_window(agent_id="", day=date(2026, 10, 30), now=CLOSED, zone=ZONE, rows=[], review_store=None)
+
+
+def test_a_prior_failed_run_of_the_registered_agent_is_seen_by_the_input_check(tmp_path):
+    n = Night(tmp_path)
+    slots, _ = n.run(date(2026, 10, 30), fail=True)
+    assert [r["state"] for r in n.rows()].count("failed") == 1      # one attempt, then the window is spent (check 6)
+    row = {"occurrence_id": "oc-next", "agent_id": AID, "kind": "scheduled", "window_key": n.rows()[0]["window_key"]}
+    v = da.make_on_input(n.ent.db, zone=ZONE, agent_dir=n.ent.agent_dir, coord_dir=n.ent.coord_dir,
+                         clock=lambda: slots[-1])(row)
+    assert not v.ok and v.state == rd.QUIET
+
+
+def test_the_occurrence_under_evaluation_is_excluded_by_the_id_the_hook_is_given_and_no_other(tmp_path):
+    ent = Entity(tmp_path)
+    conn = sqlite3.connect(ent.agent_dir / DB_NAME, isolation_level=None)
+    now = datetime(2026, 11, 3, 1, 0, tzinfo=NY)
+    key = rd.window_key_for(date(2026, 11, 2))
+    mine = _claim(conn, now, window=key)
+    row = {"occurrence_id": mine, "agent_id": AID, "kind": "scheduled", "window_key": key}
+    kw = dict(now=now, zone=ZONE, agent_dir=ent.agent_dir, coord_dir=ent.coord_dir)
+    assert da.day_ready(ent.db, row, **kw).ok          # its own admitted row is not "a dream in flight"
+    other = "oc-other-admitted"          # a second in-flight row (a crash leftover; claim itself would overlap-skip)
+    conn.execute("INSERT INTO agent_occurrences (occurrence_id, agent_id, kind, key, state, window_key, spec_hash,"
+                 " binding_id, run_id, admitted_at) VALUES (?, ?, 'scheduled', 'k-other', 'admitted', ?, 'sh', 'b',"
+                 " 'r-other', '2026-11-03T05:00:00Z')", (other, AID, key))
+    v = da.day_ready(ent.db, row, **kw)
+    assert not v.ok and v.kind == "in-flight" and other in v.reason       # a different admitted row still is
+    assert not da.day_ready(ent.db, {**row, "occurrence_id": "oc-not-mine"}, **kw).ok   # id decides, not the position
+
+
+def test_a_failed_row_that_never_launched_is_a_failed_window_not_a_quiet_day():
+    quiet = row("skipped-no-input", reason="quiet/nothing-to-consolidate: n", key="2026-10-31T02:00:00Z")
+    for state in ("failed", "stopped"):
+        died = row(state, reason="claim_refused", key="2026-10-31T01:00:00Z", launched=None)
+        cls, detail = da.classify_window([died, quiet])
+        assert cls == "failed" and "claim_refused" in detail, state
+
+
+def test_the_standing_rule_holds_across_three_nights_not_just_two(rs):
+    def night(day):
+        return da.close_window(agent_id=AID, day=day, now=datetime(day.year, day.month, day.day, 5, tzinfo=NY)
+                               + timedelta(days=1), zone=ZONE, review_store=rs, feed=FEED, rows=[
+            row("skipped-no-input", reason="quiet/live-seat: seat", day=day)])
+
+    d1 = date(2026, 10, 30)
+    assert night(d1).action == "filed"
+    assert night(d1 + timedelta(days=1)).action == "standing"
+    assert night(d1 + timedelta(days=2)).action == "standing"      # night 3 looks past night 2's suppressed item
+    assert len(filed(rs)) == 1
+    # newest-first processing cannot file a second card for a class that already stands
+    assert night(d1 - timedelta(days=1)).action == "standing"
+    assert len(filed(rs)) == 1
+
+
+def test_a_card_filed_by_someone_else_in_the_same_window_reads_duplicate_not_filed(rs, monkeypatch):
+    real = cd.file_card
+
+    def lost_race(store, c, **kw):
+        item, _ = real(store, c, **kw)
+        return item, False
+
+    monkeypatch.setattr(cd, "file_card", lost_race)
+    r = close(rs, [row("skipped-no-input", reason="unreadable/unreadable: x")])
+    assert r.action == "duplicate"
+
+
+def test_an_unreadable_snapshot_root_is_a_failed_drill_with_its_row_not_no_snapshot(tmp_path):
+    import os
+
+    root = tmp_path / "s" / "dream"
+    (root / "o1").mkdir(parents=True)
+    seen = []
+    os.chmod(root, 0)
+    try:
+        r = da.drill_tick(tmp_path / "s" / "memory.db", root, attention=lambda k, t: seen.append(k))
+    finally:
+        os.chmod(root, 0o700)
+    assert r.action == "failed" and seen == ["dream-drill"]
+
+
+def test_a_drill_failure_whose_row_could_not_be_raised_is_raised_again_on_the_next_tick(tmp_path):
+    db = tmp_path / "s" / "memory.db"
+    root = tmp_path / "s" / "dream"
+    (root / "o1" / "snap").mkdir(parents=True)
+    sn._write_json(root / "o1" / "snap" / sn.MANIFEST, {"occurrence": "o1", "taken_at": "2026-10-01T00:00:00Z",
+                                                        "post_files": {"continuity": "a" * 64}, "files": {}})
+    now = datetime(2026, 11, 3, tzinfo=timezone.utc)
+
+    class Bad:
+        outcome = "failed"
+        steps = [{"name": "hash", "status": "failed", "detail": "torn"}]
+
+        def as_dict(self):
+            return {"outcome": "failed", "at": now.isoformat(), "steps": self.steps}
+
+    def drill(*a, **k):                       # records like the real drill: the record lands before the row is raised
+        sn._write_json(root / sn.DRILL_RECORD, Bad().as_dict())
+        return Bad()
+
+    def boom(k, t):
+        raise OSError("attention store down")
+
+    assert da.drill_tick(db, root, now=now, attention=boom, drill=drill).action == "failed"
+    seen = []
+    again = da.drill_tick(db, root, now=now + timedelta(hours=1), attention=lambda k, t: seen.append((k, t)),
+                          drill=lambda *a, **k: 1 / 0)
+    assert again.action == "not-due" and seen and seen[0][0] == "dream-drill" and "torn" in seen[0][1]
+    # and a good drill whose resolve failed is resolved again
+    sn._write_json(root / sn.DRILL_RECORD, {"outcome": "ok", "at": now.isoformat(), "steps": []})
+    res = []
+    assert da.drill_tick(db, root, now=now + timedelta(hours=2), attention=lambda k, t: 1 / 0,
+                         resolve=res.append).action == "not-due"
+    assert res == ["dream-drill"]

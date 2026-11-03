@@ -175,18 +175,31 @@ def parse_recorded(text: object) -> tuple[str, str, str]:
     return "unknown", "unknown", s
 
 
+def _agent_id_of(row: Mapping[str, Any]) -> str:
+    """The agent id a registered occurrence row carries (``register_dream`` mints an ``ag-...`` id; the agent's NAME is
+    not its id). A row without one has no agent to judge: ValueError, never a default."""
+    aid = row.get("agent_id")
+    if not isinstance(aid, str) or not aid.strip():
+        raise ValueError("the occurrence row carries no agent_id")
+    return aid
+
+
 def day_ready(store_path: Path | str, row: Mapping[str, Any], *, now: datetime, zone: str,
-              agent_dir: Path | str | None, coord_dir: Path | str | None, agent_id: str = NAME) -> InputVerdict:
-    """The six checks for the dream-day ``row`` (an occurrence) consolidates. Never raises: any failure to even
-    start is ``unreadable``."""
+              agent_dir: Path | str | None, coord_dir: Path | str | None) -> InputVerdict:
+    """The six checks for the dream-day ``row`` (an occurrence) consolidates, for the agent id the row carries. Never
+    raises: any failure to even start is ``unreadable``."""
     close: Callable[[], None] = lambda: None   # noqa: E731
     try:
+        agent_id = _agent_id_of(row)
+        me = row.get("occurrence_id")
+        if not isinstance(me, str) or not me.strip():
+            raise ValueError("the occurrence row carries no occurrence_id")
         day = _ready.occurrence_dream_day(row, zone)
         manual = row.get("kind") == "manual"
         src, close = _ready.sources_for(store_path, agent_dir=agent_dir, coord_dir=coord_dir, now=now)
         # the occurrence under evaluation is itself an `admitted` row (the claim precedes the input check), and check 1
         # reads any admitted row of the agent as a dream in flight: it must not count itself
-        me, rows = row.get("occurrence_id"), src.occurrences
+        rows = src.occurrences
         src.occurrences = lambda: [r for r in rows() if r.get("occurrence_id") != me]
         v = _ready.evaluate(src, day=day, now=now, zone=zone, agent_id=agent_id, manual=manual)
     except Exception as exc:  # noqa: BLE001 - a predicate that cannot run has not said ready
@@ -313,10 +326,11 @@ def _row_time(r: Mapping[str, Any]) -> str:
 
 
 def classify_window(rows: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
-    """``(class, detail)`` of a closed window's scheduled rows with no ``done``: ``failed`` (a launched run failed or
-    stopped), ``laptop-slept`` (every slot missed), or the class of the LAST skipped slot's recorded reason. A class of
+    """``(class, detail)`` of a closed window's scheduled rows with no ``done``: ``failed`` (a run failed or stopped,
+    launched or not),``laptop-slept`` (every slot missed), or the class of the LAST skipped slot's recorded reason. A class of
     ``""`` is a quiet day that is not news. An unrecognised reason is its own class, so it is filed."""
-    launched = [r for r in rows if r.get("launched_at") and r.get("state") in ("failed", "stopped")]
+    # a run that died at the claim or the fence never launched; it is still a run that failed
+    launched = [r for r in rows if r.get("state") in ("failed", "stopped")]
     if launched:
         last = sorted(launched, key=_row_time)[-1]
         return "failed", f"{last.get('state')}: {last.get('reason') or 'no reason recorded'}"
@@ -338,7 +352,28 @@ def _class_of(reason: object) -> str:
     return str(reason or "").partition(": ")[0]
 
 
-def close_window(*, agent_id: str = NAME, day: date, now: datetime, zone: str, rows: Sequence[Mapping[str, Any]],
+def _open_same_class(review_store: Any, feed: str, agent_id: str, cls: str) -> bool:
+    """True when any open did-not-consolidate item of this agent, whatever its night, carries class ``cls``."""
+    from levain.autonomic.durable_sqlite import read_transaction
+    from levain.coordinator import review
+    from levain.coordinator.store import StoreAbsent
+
+    prefix = f"dream-night:{agent_id}:"
+    try:
+        with read_transaction(review_store.open_readonly) as conn:
+            ids = [r[0] for r in conn.execute(
+                "SELECT item_id FROM review_items WHERE feed = ? AND substr(dedupe_key, 1, ?) = ? ORDER BY rowid",
+                (feed, len(prefix), prefix)).fetchall()]
+    except StoreAbsent:
+        return False
+    for i in ids:
+        item = review.get_item(review_store, i)
+        if item.state == "open" and _class_of(item.body.get("reason")) == cls:
+            return True
+    return False
+
+
+def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Sequence[Mapping[str, Any]],
                  review_store: Any, occ_dir: Path | str | None = None, miss_streak: int = 0,
                  missed_windows: Sequence[str] = (),
                  attention: Callable[[str, str], None] | None = None, feed: str = CARD_FEED,
@@ -349,11 +384,16 @@ def close_window(*, agent_id: str = NAME, day: date, now: datetime, zone: str, r
     * The window is closed only from the next dream-day's start (05:00 local); before that, or while any row of the
       window is ``admitted`` or ``launched``, nothing is decided (the in-flight gate).
     * A ``done`` row, a quiet day that is not news, and a window with no rows file nothing.
-    * Standing-item rule: if the previous day's item is still open with the same class, nothing new is filed.
+    * Standing-item rule: if any of this agent's did-not-consolidate items is still open with the same class, nothing
+      new is filed (whatever night it was filed for, and whatever order the windows are closed in).
+    * ``agent_id`` is the registered agent's id (``register_dream``'s ``Registered.agent_id``, an ``ag-...``), never its
+      name; it has no default.
     * ``miss_streak`` (the controller's) of 2 or more raises one attention row keyed by agent. ``missed_windows`` are the
       windows the tick reported with a missed slot (``TickResult.missed_windows``); a window in them with no row
       files ``laptop-slept``.
     A card that cannot be filed (the ``agent`` feed is P8's) is ``refused``, with nothing filed."""
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        raise ValueError("close_window needs the registered agent's id")
     key = _ready.window_key_for(day)
     out = CloseResult("waiting", key)
     if now.tzinfo is None:
@@ -384,18 +424,17 @@ def close_window(*, agent_id: str = NAME, day: date, now: datetime, zone: str, r
         if _item_by_dedupe(review_store, feed, dedupe) is not None:
             out.action = "duplicate"
             return out
-        prev = _item_by_dedupe(review_store, feed, f"dream-night:{agent_id}:{(day - timedelta(days=1)).isoformat()}")
-        if prev is not None and prev.state == "open" and _class_of(prev.body.get("reason")) == cls:
+        if _open_same_class(review_store, feed, agent_id, cls):
             out.action = "standing"
             return out
         c = _card.build_card("did-not-consolidate", occurrence=f"window {key}", agent_id=agent_id, day=day.isoformat(),
                              reason=f"{cls}: night did not consolidate: {detail}", remedy=remedy,
                              out_dir=occ_dir if occ_dir is not None and Path(occ_dir).is_dir() else None)
-        _card.file_card(review_store, c, feed=feed)
+        _, new = _card.file_card(review_store, c, feed=feed)
     except Exception as exc:  # noqa: BLE001 - nothing filed is reported, never swallowed
         out.action, out.why = "refused", f"{type(exc).__name__}: {exc}"
         return out
-    out.action = "filed"
+    out.action = "filed" if new else "duplicate"
     return out
 
 
@@ -467,28 +506,60 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
     stays due, and raises the row only when the last recorded drill is more than two cadences old (or none exists and
     a snapshot does)."""
     run = drill or _snap.drill
+    key = "dream-drill"
+    ref = now or datetime.now(timezone.utc)
+
+    def raise_row(text: str) -> bool:
+        try:
+            attention(key, text)
+        except Exception:  # noqa: BLE001 - the recorded drill is re-read on the next tick and the row raised again
+            _log.warning("dream drill: the attention row could not be raised")
+            return False
+        return True
+
+    def settle() -> None:
+        if resolve is not None:
+            try:
+                resolve(key)
+            except Exception:  # noqa: BLE001 - re-attempted from the recorded drill on the next tick
+                _log.warning("dream drill: the attention row could not be resolved")
+
+    try:   # absence is "no snapshot"; a root that exists but cannot be read is a failure, never a quiet absence
+        Path(root).stat()
+        list(Path(root).iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return DrillTick("no-snapshot")
+    except OSError as exc:
+        raise_row(f"the dream snapshot root cannot be read: {type(exc).__name__}: {exc}")
+        return DrillTick("failed", f"snapshot root unreadable: {type(exc).__name__}")
     if not _snap.snapshots(root):
         return DrillTick("no-snapshot")
-    ref = now or datetime.now(timezone.utc)
     if not _snap.drill_due(root, ref):
+        # the state transition a drill owes (its row raised, or resolved) is re-derived from its record, so a callback
+        # that failed after the record was written is retried here rather than lost for a cadence
+        last = _snap.last_drill(root) or {}
+        if last.get("outcome") == "failed":
+            bad = "; ".join(f"{s.get('name')}: {s.get('detail')}" for s in last.get("steps") or []
+                            if s.get("status") == "failed") or "a step failed"
+            raise_row(f"the dream restore drill failed: {bad}")
+        elif last.get("outcome") == "ok":
+            settle()
         return DrillTick("not-due")
-    key = "dream-drill"
     try:
         res = run(store_path, root)
     except Exception as exc:  # noqa: BLE001 - a drill that raised proved nothing
-        attention(key, f"the dream restore drill raised {type(exc).__name__}: {exc}")
+        raise_row(f"the dream restore drill raised {type(exc).__name__}: {exc}")
         return DrillTick("failed", f"{type(exc).__name__}")
     if res.outcome == "failed":
         bad = "; ".join(f"{s['name']}: {s['detail']}" for s in res.steps if s.get("status") == "failed") or "a step failed"
-        attention(key, f"the dream restore drill failed: {bad}")
+        raise_row(f"the dream restore drill failed: {bad}")
         return DrillTick("failed", bad)
     if res.outcome == "deferred":
         last = _snap.last_drill(root)
         if last is None or _snap.drill_due(root, ref, 2 * _snap.DRILL_CADENCE_S):
-            attention(key, "no dream restore drill has run in two cadences: a writer held the store each time")
+            raise_row("no dream restore drill has run in two cadences: a writer held the store each time")
         return DrillTick("deferred")
-    if resolve is not None:
-        resolve(key)
+    settle()
     return DrillTick(res.outcome)
 
 
