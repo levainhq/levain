@@ -2784,12 +2784,14 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
   }
   body.ke .ck-phonetabs::-webkit-scrollbar { display: none; }
   body.ke .ck-phonetabs button {
-    flex: 1 1 auto; min-height: var(--hit-min); padding: 0 var(--sp-2); white-space: nowrap;
+    flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; min-height: var(--hit-min); padding: 0 var(--sp-2); white-space: nowrap;
     background: none; border: 0; border-radius: var(--r-md); color: var(--label); cursor: pointer;
     font: var(--fw-semibold) var(--fs-meta) var(--round);
   }
   body.ke .skycol { margin-top: var(--sec); }   /* the sky now follows the needs strip, not the band: the one section space between them */
   body.ke .ck-phonetabs button:active { background: var(--card-2); color: var(--text); }
+  /* the five tabs share the strip's width and shrink with it (a wider fallback font or a badge never cuts the strip at its edge): a label too long for its share ends in an ellipsis */
+  @media (max-width: 360px) { body.ke .ck-phonetabs { padding: 0 var(--sp-2); } body.ke .ck-phonetabs button { padding: 0 var(--sp-1); } }
   /* the Decisions view's rows (the open request, a standing grant, the drop): the command takes the row's width and its button
      the line under it at a thumb's height, in place of a button squeezing a wrapped command into a sliver beside it */
   body.ke .modal-body .consent-cmd { flex-direction: column; align-items: flex-start; }
