@@ -497,3 +497,87 @@ def test_verb_refuses_the_operators_live_store(tmp_path, monkeypatch):
     add_parsers(p.add_subparsers(dest="cmd"))
     args = p.parse_args(["dream", "ready", "--store-dir", str(live), "--zone", ZONE])
     assert args.func(args) == 2
+
+
+# ------------------------------------------------------------------------------------------- review fixes (L3 round 1)
+
+def test_a_manual_run_at_01_00_consolidated_the_night_that_is_still_running_not_the_one_before(ent):
+    """Reproduced: ``occurrence_dream_day`` took the 05:00-shifted day and then subtracted another day for the hour, so
+    a run-now at 01:00 on 11-03 (dream-day 11-02) was attributed to 11-01."""
+    row = {"occurrence_id": "m1", "kind": "manual", "launched_at": utc(2026, 11, 3, 6, 0)}      # 01:00 NY
+    assert rd.occurrence_dream_day(row, ZONE) == date(2026, 11, 2)
+    assert rd.manual_day_at(datetime(2026, 11, 3, 8, 0, tzinfo=NY), ZONE) == date(2026, 11, 2)
+    assert rd.manual_day_at(datetime(2026, 11, 3, 13, 59, tzinfo=NY), ZONE) == date(2026, 11, 2)
+    assert rd.manual_day_at(datetime(2026, 11, 3, 14, 0, tzinfo=NY), ZONE) == date(2026, 11, 3)
+    ent.occurrence("done", kind="manual", window="m:2026-11-03", launched=utc(2026, 11, 3, 6, 0),
+                   ended=utc(2026, 11, 3, 6, 20))
+    v = ent.evaluate(manual=True)
+    assert (v.check, v.kind) == (1, "already-dreamed"), v.reason
+
+
+def test_a_manual_catch_up_after_the_scheduled_attempt_failed_is_not_blocked_by_check_6(ent):
+    """Reproduced: check 6 refused the run-now the did-not-consolidate card names as the remedy."""
+    ent.occurrence("failed", launched=utc(2026, 11, 3, 8, 37), ended=utc(2026, 11, 3, 8, 39))   # 03:37 NY
+    now = datetime(2026, 11, 3, 8, 0, tzinfo=NY)
+    v = ent.evaluate(now=now, manual=True)
+    assert v.verdict == rd.READY and status(v, 6) == "waived", v.reason
+    assert ent.evaluate(now=NOW + timedelta(hours=3)).check == 6           # the scheduled path still holds the rule
+
+
+def test_a_manual_run_in_flight_is_in_flight_for_the_next_manual_run(ent):
+    """Reproduced: the in-flight test matched the scheduled window key only, so a second run-now read ready."""
+    now = datetime(2026, 11, 3, 8, 0, tzinfo=NY)
+    ent.occurrence("launched", kind="manual", window="m:2026-11-03", launched=utc(2026, 11, 3, 12, 30))
+    v = ent.evaluate(now=now, manual=True)
+    assert (v.check, v.kind) == (1, "in-flight"), v.reason
+
+
+def test_check3_excludes_only_the_one_wrap_an_own_occurrence_made(ent):
+    """Reproduced: every wrap inside an own occurrence's interval (plus slack) was excluded, so a foreign wrap landing
+    just after the run read as the run's own and the predicate said ready."""
+    ent.occurrence("done", window=rd.window_key_for(DAY - timedelta(days=1)), launched=utc(2026, 11, 2, 15, 0),
+                   ended=utc(2026, 11, 2, 15, 10))
+    own, foreign = utc(2026, 11, 2, 15, 8), utc(2026, 11, 2, 15, 14)
+    v = ent.evaluate(sources_patch=lambda s: setattr(s, "wraps", lambda: [(1, own), (2, foreign)]))
+    assert (v.verdict, v.check, v.kind) == (rd.QUIET, 3, "consolidated-today"), v.reason
+    assert "#2" in v.reason
+    v = ent.evaluate(sources_patch=lambda s: setattr(s, "wraps", lambda: [(1, own)]))
+    assert v.verdict == rd.READY, v.reason
+
+
+def test_check5_a_pending_launch_whose_spawn_is_claimed_is_still_a_live_seat(ent):
+    """Reproduced: ``launches_unspawned`` drops a claimed spawn and ``launches_active`` does not hold it yet."""
+    from levain.coordinator.store import CoordStore
+
+    lid = ent.pending_launch()
+    assert CoordStore(ent.coord_dir).launch_claim_spawn(lid, 4242)[1] is None
+    v = ent.evaluate()
+    assert (v.check, v.kind) == (5, "live-seat") and lid in v.reason
+
+
+def test_the_ready_verb_opens_the_store_without_writing_it(ent):
+    """Reproduced: a default ``Store`` open runs schema init, which fails ("attempt to write a readonly database") on a
+    store copy that is only readable; a read-only handle needs no write at all."""
+    files = [p for p in ent.store_dir.iterdir() if p.is_file()]
+    for p in files:
+        p.chmod(0o444)
+    try:
+        code, doc = run_verb(*common(ent))
+    finally:
+        for p in files:
+            p.chmod(0o644)
+    assert code == 0 and doc["verdict"] == "ready"
+
+
+def test_verb_default_day_for_a_manual_run_is_the_one_a_run_now_would_consolidate(ent):
+    argv = ["--store-dir", str(ent.store_dir), "--agent-dir", str(ent.agent_dir), "--coord-dir", str(ent.coord_dir),
+            "--zone", ZONE, "--now", datetime(2026, 11, 3, 8, 0, tzinfo=NY).isoformat(), "--json"]
+    assert run_verb(*argv, "--manual")[1]["day"] == "2026-11-02"
+    assert run_verb(*argv)[1]["day"] == "2026-11-03"
+
+
+def test_verb_a_store_that_will_not_open_is_unreadable_exit_3(ent):
+    """The comment in the verb says an unopenable store is unreadable; the exit code now agrees."""
+    (ent.store_dir / "memory.db").write_bytes(b"not a database" * 100)
+    code, _ = run_verb(*[a for a in common(ent) if a != "--json"])
+    assert code == 3

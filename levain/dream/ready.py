@@ -15,11 +15,13 @@ The six checks, each mapped from flow's ``dream.py`` ``gate``:
 
 1. no ``done`` occurrence for the window, and fewer than :data:`RUN_CEILING` launched (a backstop only)
 2. no wrap open, and the baton held by this install's session (when the store requires the baton)
-3. no wrap since the dream-day's start, apart from this agent's own ``done`` occurrences for OTHER dream-days
+3. no wrap since the dream-day's start, apart from the one wrap each of this agent's ``done`` occurrences for OTHER
+   dream-days made
 4. something to consolidate
 5. no live session: no live coordinator launch, no work thread in ``awake.json``, no other session in anneal's
    session registry (a hooked Claude Code session heartbeats there). Waived for a manual run
-6. the window's one scheduled attempt is not already spent (a launched run that failed or was stopped)
+6. the window's one scheduled attempt is not already spent (a launched run that failed or was stopped). Waived for a
+   manual run: the catch-up is the remedy for exactly that failure, and check 1's ceiling bounds it
 """
 from __future__ import annotations
 
@@ -44,8 +46,8 @@ DAY_START_HOUR = 5
 #: flow's ``MORNING_END_HOUR``: a manual run before this hour consolidates the PREVIOUS dream-day
 MORNING_END_HOUR = 14
 WINDOW = {"start": "22:00", "end": "05:00"}
-#: how far outside an occurrence's launched..ended span a wrap may sit and still be attributed to it
-OWN_WRAP_SLACK_S = 300.0
+#: clock skew allowed between an occurrence's launched..ended stamps and its wrap's ``wrapped_at``
+CLOCK_SKEW_S = 5.0
 #: anneal's session id for a Levain install (``levain.manifest.ANNEAL_SESSION_ID``), compared by value here so this
 #: module imports nothing heavy; a test pins the two together
 SESSION_ID = "levain"
@@ -149,6 +151,14 @@ def window_holding(now: datetime, zone: str) -> str | None:
     return window_key_for(opened)
 
 
+def manual_day_at(moment: datetime, zone: str) -> date:
+    """The dream-day a manual run launched at ``moment`` consolidates (flow's ``--now`` fallback): the calendar day
+    before when it launches before :data:`MORNING_END_HOUR` local, the calendar day itself after. Taken from the local
+    calendar date, NOT from :func:`dream_day_at`, which has already moved the small hours back to the night."""
+    local = moment.astimezone(ZoneInfo(zone))
+    return local.date() - timedelta(days=1) if local.hour < MORNING_END_HOUR else local.date()
+
+
 def occurrence_dream_day(row: Mapping[str, Any], zone: str) -> date:
     """The dream-day an occurrence consolidated (or would have). A scheduled one carries it in its window key. A
     manual one consolidates the PREVIOUS dream-day when it launched before 14:00 (flow's ``--now`` fallback) and the
@@ -163,9 +173,7 @@ def occurrence_dream_day(row: Mapping[str, Any], zone: str) -> date:
         raise SourceUnreadable(f"scheduled occurrence {row.get('occurrence_id')!r} has an unreadable window key {key!r}")
     if not row.get("launched_at"):
         raise SourceUnreadable(f"manual occurrence {row.get('occurrence_id')!r} has no launched_at")
-    launched = _when(row["launched_at"])
-    current = dream_day_at(launched, zone)
-    return current - timedelta(days=1) if launched.astimezone(ZoneInfo(zone)).hour < MORNING_END_HOUR else current
+    return manual_day_at(_when(row["launched_at"]), zone)
 
 
 # --------------------------------------------------------------------------------------------------------- the checks
@@ -190,9 +198,11 @@ def _check1(src: Sources, agent: str, key: str, day: date, zone: str, now: datet
         if r.get("state") == "done" and (occurrence_dream_day(r, zone) == day):
             return Check(1, name, QUIET, f"dream-day {day} was already consolidated by {r.get('occurrence_id')}",
                          "already-dreamed")
-    inflight = [r for r in rows if r.get("window_key") == key and r.get("state") in ("admitted", "launched")]
+    # a manual run has its own window key (``m:<date>``), so a manual run in flight is looked for by kind as well
+    inflight = [r for r in rows if r.get("state") in ("admitted", "launched")
+                and (r.get("window_key") == key or (manual and r.get("kind") == "manual"))]
     if inflight:
-        return Check(1, name, QUIET, f"{inflight[0].get('occurrence_id')} of this window is still in flight", "in-flight")
+        return Check(1, name, QUIET, f"{inflight[0].get('occurrence_id')} is still in flight", "in-flight")
     launched = [r for r in rows if r.get("window_key") == key and r.get("state") in _LAUNCHED_STATES
                 and r.get("launched_at")]
     if manual:
@@ -227,25 +237,28 @@ def _check3(src: Sources, agent: str, key: str, day: date, zone: str) -> Check:
     start = day_start(day, zone)
     rows = [r for r in _guard(src.occurrences, "the occurrence table") if r.get("agent_id") == agent
             and r.get("state") == "done"]
-    own_other: list[tuple[datetime, datetime]] = []
+    spans: list[tuple[datetime, datetime]] = []
     for r in rows:
         if occurrence_dream_day(r, zone) == day:
             continue                                 # a done occurrence of THIS day is check 1's, and counts here
         if not r.get("launched_at") or not r.get("ended_at"):
             raise SourceUnreadable(f"done occurrence {r.get('occurrence_id')!r} has no launched_at or ended_at")
-        slack = timedelta(seconds=OWN_WRAP_SLACK_S)
-        own_other.append((_when(r["launched_at"]) - slack, _when(r["ended_at"]) + slack))
-    foreign = []
-    for wid, at in _guard(src.wraps, "the wrap history"):
-        t = _when(at)
-        if t >= start and not any(lo <= t <= hi for lo, hi in own_other):
-            foreign.append((wid, t))
+        skew = timedelta(seconds=CLOCK_SKEW_S)
+        spans.append((_when(r["launched_at"]) - skew, _when(r["ended_at"]) + skew))
+    since = sorted(((_when(at), wid) for wid, at in _guard(src.wraps, "the wrap history") if _when(at) >= start))
+    # an occurrence made ONE wrap, the last inside its span (the baton keeps any other writer out of the span, and a
+    # wrap just after it is somebody else's); everything else since the day's start is foreign
+    for lo, hi in spans:
+        inside = [w for w in since if lo <= w[0] <= hi]
+        if inside:
+            since.remove(inside[-1])
+    foreign = [(wid, t) for t, wid in since]
     if foreign:
         wid, t = foreign[-1]
         return Check(3, name, QUIET, f"wrap #{wid} at {t.isoformat(timespec='seconds')} is since the dream-day's "
                                      f"start {start.isoformat(timespec='seconds')}", "consolidated-today")
     return Check(3, name, "pass", f"no wrap since {start.isoformat(timespec='seconds')}"
-                                  " (own dones for other days excluded)")
+                                  " (one wrap per own done occurrence for another day excluded)")
 
 
 def _check4(src: Sources) -> Check:
@@ -281,8 +294,11 @@ def _check5(src: Sources, manual: bool) -> Check:
                  + (f" ({'; '.join(src.absent)})" if src.absent else ""))
 
 
-def _check6(src: Sources, agent: str, key: str) -> Check:
+def _check6(src: Sources, agent: str, key: str, manual: bool) -> Check:
     name = "the window's attempt is not spent"
+    if manual:
+        return Check(6, name, "waived", "a manual run is the catch-up after a spent scheduled attempt; check 1's "
+                                        "ceiling bounds it")
     rows = [r for r in _guard(src.occurrences, "the occurrence table") if r.get("agent_id") == agent
             and r.get("window_key") == key and r.get("launched_at") and r.get("state") in _SPENT_STATES]
     if rows:
@@ -305,7 +321,7 @@ def evaluate(src: Sources, *, day: date, now: datetime, zone: str, agent_id: str
         (3, "no consolidate yet for the day", lambda: _check3(src, agent_id, key, day, zone)),
         (4, "something to consolidate", lambda: _check4(src)),
         (5, "no live session", lambda: _check5(src, manual)),
-        (6, "the window's attempt is not spent", lambda: _check6(src, agent_id, key)),
+        (6, "the window's attempt is not spent", lambda: _check6(src, agent_id, key, manual)),
     ]
     checks: list[Check] = []
     for n, name, run in jobs:
@@ -364,13 +380,13 @@ def _awake_threads(coord_dir: Path, now: datetime) -> list[str]:
 
 def sources_for(store_path: Path | str, *, agent_dir: Path | str | None = None, coord_dir: Path | str | None = None,
                 now: datetime | None = None) -> tuple[Sources, Callable[[], None]]:
-    """The real sources for the store at ``store_path``, and a ``close`` to call when done. Read-only except that an
-    anneal ``Store`` open may migrate an old schema, as the effect's own open does. A directory not given is an absent
+    """The real sources for the store at ``store_path``, and a ``close`` to call when done. The store is opened
+    ``read_only`` (no schema init, no migration, no write), so a store whose layout is unknown reads as unreadable. A directory not given is an absent
     source and is named in the check 5 detail."""
     from anneal_memory import Store, sessions
 
     now = now or datetime.now(timezone.utc)
-    store = Store(str(store_path), section_schema=None)
+    store = Store(str(store_path), section_schema=None, read_only=True)
     absent = []
     agent = Path(agent_dir) if agent_dir is not None else None
     coord = Path(coord_dir) if coord_dir is not None else None
@@ -382,12 +398,17 @@ def sources_for(store_path: Path | str, *, agent_dir: Path | str | None = None, 
     def launches() -> list[str]:
         if coord is None:
             return []
+        from levain.autonomic.durable_sqlite import read_transaction
+        from levain.coordinator import lease
         from levain.coordinator.door import readonly_store
 
         ro = readonly_store(coord)
         if ro is None:
             return []
-        return [ln.launch_id for ln in [*ro.launches_unspawned(), *ro.launches_active()]]
+        # every pending launch (a claimed spawn is no longer "unspawned" and is not yet "active") and every active
+        # one, in one read transaction
+        with read_transaction(ro._connect) as conn:
+            return [ln.launch_id for ln in [*lease._in_state(conn, "pending"), *lease._in_state(conn, "active")]]
 
     def other_sessions() -> list[str]:
         return [s["session_id"] for s in sessions.live_sessions(store.continuity_path) if s["session_id"] != SESSION_ID]

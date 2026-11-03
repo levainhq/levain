@@ -14,10 +14,13 @@ their count and the path of ``card_his.json``.
 """
 from __future__ import annotations
 
+import contextlib
 import difflib
 import hashlib
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -164,16 +167,26 @@ def _items(notes: Mapping[str, Any], key: str) -> list[dict[str, Any]]:
     return out
 
 
-def _eps(x: Mapping[str, Any]) -> str:
+def _episode_ids(x: Mapping[str, Any]) -> list[str]:
+    """The episode ids a note cites, as strings. The notes come from a model: a list or tuple is each of its items, any
+    other value is one id, and nothing here raises on the shape it finds."""
     e = x.get("episodes") or x.get("episode") or []
-    e = [e] if isinstance(e, str) else e
-    return f" [{', '.join(str(i) for i in e)}]" if e else ""
+    return [str(i) for i in e] if isinstance(e, (list, tuple)) else [str(e)]
+
+
+def _eps(x: Mapping[str, Any]) -> str:
+    e = _episode_ids(x)
+    return f" [{', '.join(e)}]" if e else ""
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s.lower())).strip()
 
 
 def _words_in_episode(words: str, cited: Sequence[str], source: Mapping[str, str]) -> bool:
-    norm = lambda s: re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s.lower())).strip()  # noqa: E731
-    w = norm(words)
-    return bool(w) and any(w in norm(source.get(c, "")) for c in cited)
+    """Whether ``words`` stand in a cited episode as whole words (a quote is not found inside a longer word)."""
+    w = _norm(words)
+    return bool(w) and any(f" {w} " in f" {_norm(source.get(c, ''))} " for c in cited)
 
 
 def split_notes(notes: Mapping[str, Any] | None, source: Mapping[str, str] | None = None
@@ -194,8 +207,7 @@ def split_notes(notes: Mapping[str, Any] | None, source: Mapping[str, str] | Non
         own.append(f"for Phill: {x.get('what', '?')}{_eps(x)}")
     for x in _items(notes, "retired"):
         words = str(x.get("his_words", ""))
-        cited = x.get("episodes") or x.get("episode") or []
-        cited = [cited] if isinstance(cited, str) else [str(c) for c in cited]
+        cited = _episode_ids(x)
         line = f"{x.get('what', '?')} — his words: \"{words or '?'}\"{_eps(x)}"
         if source is not None and not (len(words.split()) >= _SHORT_QUOTE_WORDS
                                        and _words_in_episode(words, cited, source)):
@@ -208,9 +220,18 @@ def split_notes(notes: Mapping[str, Any] | None, source: Mapping[str, str] | Non
 # ------------------------------------------------------------------------------------------------------------ the body
 
 def _write(path: Path, data: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    tmp.replace(path)
+    """Write ``data`` to ``path`` whole or not at all. The temporary file is this writer's own (two builders of one
+    occurrence's card never share one), and the directory is made when it is missing."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        os.replace(name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(name)
+        raise
 
 
 def _refusals(doc: Mapping[str, Any] | None) -> list[str]:
@@ -224,7 +245,8 @@ def _models(doc: Mapping[str, Any] | None, given: Sequence[str] | None) -> list[
     seen: list[str] = []
     for r in (doc or {}).get("composes") or []:
         if isinstance(r, dict):
-            for m in [r.get("model"), *(r.get("models_charged") or [])]:
+            charged = r.get("models_charged")
+            for m in [r.get("model"), *(charged if isinstance(charged, (list, tuple)) else [])]:
                 if isinstance(m, str) and m and m not in seen:
                     seen.append(m)
     return seen
@@ -289,6 +311,7 @@ def build_card(kind: str, *, occurrence: str, agent_id: str = "dream", day: str 
         artifacts["own"] = str(o / OWN_FILE)
         body["own"] = [_first(x, 80) for x in own]
         body["own_total"] = len(own)
+        body["own_shown"] = len(own)
         body["own_path"] = artifacts["own"]
     if size() > limit and body["own"]:
         keep = len(body["own"])
@@ -318,19 +341,37 @@ def build_card(kind: str, *, occurrence: str, agent_id: str = "dream", day: str 
 # ------------------------------------------------------------------------------------------------- from the pieces
 
 def texts_for(db_path: Path | str, occ_dir: Path | str) -> tuple[str, str]:
-    """``(prior, saved)`` continuity text of a dream: the snapshot's copy and the store's live text. A first dream
-    has no prior text. Raises :class:`CardError` when the snapshot is missing."""
+    """``(prior, saved)`` continuity text of one dream: the snapshot's copy, and the text the dream saved. The saved
+    text is the occurrence's own ``composed.continuity.md`` when its sha256 is the one the manifest recorded after the
+    save, else the store's live text when that is the recorded one (a later dream or an edit moves the live text, and
+    a card must describe THIS dream). A first dream has no prior text. Raises :class:`CardError` when the snapshot or
+    the saved text cannot be found."""
     from levain.dream import snapshot as sn
 
-    m = sn.read_manifest(occ_dir)
+    occ = Path(occ_dir)
+    m = sn.read_manifest(occ)
     if m is None:
-        raise CardError(f"no snapshot manifest under {Path(occ_dir) / sn.SNAP_DIR}")
-    ent = (m.get("files") or {}).get("continuity") or {}
+        raise CardError(f"no snapshot manifest under {occ / sn.SNAP_DIR}")
     prior = ""
+    ent = (m.get("files") or {}).get("continuity") or {}
     if ent.get("sha256") and ent.get("name"):
-        prior = (Path(occ_dir) / sn.SNAP_DIR / ent["name"]).read_text(encoding="utf-8")
-    live = sn.text_tier(db_path)["continuity"]
-    return prior, live.read_text(encoding="utf-8") if live.is_file() else ""
+        try:
+            prior = (occ / sn.SNAP_DIR / ent["name"]).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CardError(f"the snapshot's continuity copy {ent['name']!r} cannot be read ({exc})") from exc
+    recorded = (m.get("post_files") or {}).get("continuity")
+    if not recorded:
+        raise CardError("the manifest holds no post-save record: the text this dream saved is not known")
+    for path in (occ / "composed.continuity.md", sn.text_tier(db_path)["continuity"]):
+        try:
+            raw = path.read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if hashlib.sha256(raw).hexdigest() == recorded:
+            return prior, text
+    raise CardError("neither the occurrence's composed text nor the live continuity text is the text this dream saved "
+                    f"(sha256 {recorded[:12]}): a later write has moved the live text")
 
 
 def from_spec(spec: Mapping[str, Any], *, occ_dir: Path | str, db_path: Path | str | None = None,
@@ -338,7 +379,7 @@ def from_spec(spec: Mapping[str, Any], *, occ_dir: Path | str, db_path: Path | s
               day: str | None = None, manual: bool = False, slot: str | None = None,
               agent_id: str = "dream") -> Card:
     """A card from the spec recovery (``RecoverResult.card``) or a rollback (``RollbackResult.card``) returned, plus
-    the occurrence's own files: the snapshot's prior text, the live saved text (when ``db_path`` is given) and
+    the occurrence's own files: the snapshot's prior text, the text the dream saved (when ``db_path`` is given) and
     ``usage.json``. The spec's ``his`` lines (``unknown-commit``) are his."""
     occ = Path(occ_dir)
     kind = str(spec.get("kind"))

@@ -75,10 +75,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     rd.add_argument("--coord-dir", default=None, help="The coordinator queue directory (dispatch.db, awake.json); "
                                                       "omitted means no launches and no work threads.")
     rd.add_argument("--agent-id", default="dream")
-    rd.add_argument("--day", default=None, help="The dream-day YYYY-MM-DD (default: the one holding --now).")
+    rd.add_argument("--day", default=None, help="The dream-day YYYY-MM-DD (default: the one holding --now; with "
+                    "--manual, the one a run-now at --now would consolidate).")
     rd.add_argument("--now", default=None, help="An aware ISO time standing in for the clock (default: now).")
     rd.add_argument("--zone", default=None, help="An IANA zone (default: the TZ variable, else the host's zone file).")
-    rd.add_argument("--manual", action="store_true", help="Evaluate as a manual run (waives check 5).")
+    rd.add_argument("--manual", action="store_true", help="Evaluate as a manual run (waives checks 5 and 6).")
     rd.add_argument("--json", action="store_true")
     rd.set_defaults(func=run_dream_ready)
     dr = sub.add_parser("drill", allow_abbrev=False, help="Prove the latest snapshot restores, on a scratch copy.",
@@ -338,7 +339,10 @@ def run_dream_ready(args: argparse.Namespace) -> int:
         now = datetime.fromisoformat(args.now) if args.now else datetime.now(timezone.utc)
         if now.tzinfo is None:
             raise ValueError("--now must carry a timezone offset")
-        day = date.fromisoformat(args.day) if args.day else rd.dream_day_at(now, zone)
+        if args.day:
+            day = date.fromisoformat(args.day)
+        else:
+            day = rd.manual_day_at(now, zone) if args.manual else rd.dream_day_at(now, zone)
     except (ValueError, KeyError) as exc:
         print(f"levain dream ready: {exc}", file=sys.stderr)
         return 2
@@ -346,7 +350,7 @@ def run_dream_ready(args: argparse.Namespace) -> int:
         src, close = rd.sources_for(store_path, agent_dir=args.agent_dir, coord_dir=args.coord_dir, now=now)
     except Exception as exc:  # noqa: BLE001 — a store that will not open is unreadable, never ready
         print(f"levain dream ready: the store could not be opened ({type(exc).__name__}: {exc})", file=sys.stderr)
-        return 2
+        return 3
     try:
         v = rd.evaluate(src, day=day, now=now, zone=zone, agent_id=args.agent_id, manual=args.manual)
     finally:

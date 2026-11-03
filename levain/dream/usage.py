@@ -33,12 +33,18 @@ def to_usage(doc: dict[str, Any] | None) -> Usage:
     """A0's ``Usage`` for a usage document. On the Claude route (``unit == "usd_list"``) the dollars are the summed
     ``total_cost_usd`` of the composes, and only when every compose's was readable. On the token route there is no
     mapped price (R-D9), so ``usd_micros`` is None and the reservation is debited whole until A0 can state a token
-    exposure. A count that could not be read is None, never 0."""
+    exposure. A count that could not be read is None, never 0.
+
+    A subscription run settles on ``actions`` (the dream's turns), ``tunnel_bytes`` and ``seconds`` (A0 §2.2), not on
+    dollars. ``actions`` and ``seconds`` come from the record when it carries them. ``tunnel_bytes`` stays None: the
+    dream runs behind no byte-counting front, and a reservation that sets a byte cap reads as unreadable (its cap is
+    debited) rather than as zero."""
     if doc is None:
         return Usage(None, None, None, UNREADABLE_SOURCE)
     source = doc.get("source") if isinstance(doc.get("source"), str) and doc.get("source") else "dream:unknown"
     usd = _count(doc.get("actual_usd_micros")) if doc.get("unit") == "usd_list" and doc.get("readable") is True else None
-    return Usage(usd, _count(doc.get("input_tokens")), _count(doc.get("output_tokens")), source)
+    return Usage(usd, _count(doc.get("input_tokens")), _count(doc.get("output_tokens")), source,
+                 actions=_count(doc.get("turns")), tunnel_bytes=None, seconds=_count(doc.get("seconds")))
 
 
 def read_usage(occ_dir: Path | str) -> Usage:

@@ -314,3 +314,107 @@ def test_compose_refusals_ride_the_card_in_one_line_each():
     assert c.body["composes"] == {"n": 2, "refusals": ["compose 1: the saved text dropped the Decisions section"],
                                   "refusals_total": 1}
     assert c.body["models"] == ["m1", "m2"]
+
+
+# ------------------------------------------------------------------------------------------- review fixes (L3 round 1)
+
+def test_a_card_describes_its_own_dream_after_a_later_dream_moved_the_live_text(scratch):
+    """Reproduced: ``texts_for`` read the live continuity, so o1's card showed o2's text as what o1 saved."""
+    dream(scratch, "o1", _VALID)
+    add_episode(scratch, "two")
+    assert dream(scratch, "o2", text_n(2)).outcome == "saved"
+    prior, saved = cd.texts_for(scratch, occ(scratch, "o1"))
+    assert (prior, saved) == ("", _VALID)
+    # the occurrence's composed copy gone: the live text is not o1's any more, so there is no card to build
+    (occ(scratch, "o1") / "composed.continuity.md").unlink()
+    with pytest.raises(cd.CardError):
+        cd.texts_for(scratch, occ(scratch, "o1"))
+
+
+def test_a_missing_snapshot_copy_is_a_card_error_not_an_oserror(scratch):
+    dream(scratch, "o1", _VALID)
+    add_episode(scratch, "two")
+    dream(scratch, "o2", text_n(2))
+    m = sn.read_manifest(occ(scratch, "o2"))
+    (occ(scratch, "o2") / sn.SNAP_DIR / m["files"]["continuity"]["name"]).unlink()
+    with pytest.raises(cd.CardError):
+        cd.texts_for(scratch, occ(scratch, "o2"))
+
+
+def test_notes_the_model_wrote_in_the_wrong_shape_never_stop_the_card():
+    """Reproduced: an integer where a list of episode ids belongs raised TypeError out of ``build_card``."""
+    notes = {"contradictions": [{"what": "x", "episodes": 42}],
+             "retired": [{"what": "R", "his_words": "four words of his own", "episodes": 7}],
+             "for_phill": [{"what": "F", "episodes": {"a": 1}}]}
+    c = cd.build_card("consolidated", occurrence="o", notes=notes, source={})
+    assert c.authority_relevant and "[42]" in c.body["his"][0]
+    c2 = cd.build_card("consolidated", occurrence="o", usage_doc={"composes": [{"model": "m",
+                                                                             "models_charged": "abc"}]})
+    assert c2.body["models"] == ["m"]                   # a string is not a list of model ids
+
+
+def test_a_quote_is_not_found_inside_a_longer_word():
+    """Reproduced: ``"no prompts at all"`` matched inside ``"piano prompts at all"``."""
+    notes = {"retired": [{"what": "W", "his_words": "no prompts at all", "episodes": ["e"]}]}
+    c = cd.build_card("consolidated", occurrence="a", notes=notes, source={"e": "a piano prompts at all today"})
+    assert c.authority_relevant
+    ok = cd.build_card("consolidated", occurrence="b", notes=notes, source={"e": "I said no prompts at all, today"})
+    assert not ok.authority_relevant
+
+
+def test_a_card_builds_into_an_out_dir_that_does_not_exist_yet(tmp_path):
+    out = tmp_path / "a" / "b"
+    c = cd.build_card("consolidated", occurrence="o", prior=big_text(0, "a"), saved=big_text(1, "b"), out_dir=out)
+    assert (out / cd.DIFF_FILE).is_file() and c.artifacts["diff"] == str(out / cd.DIFF_FILE)
+
+
+def test_concurrent_builders_of_one_card_do_not_share_a_temporary_file(tmp_path):
+    """Reproduced: both writers used ``<name>.tmp``; one rename took the file out from under the other."""
+    import threading
+
+    errors: list[BaseException] = []
+    texts = [("x" * 50_000) + str(i) for i in range(8)]
+
+    def run(t):
+        try:
+            for _ in range(40):
+                cd._write(tmp_path / cd.DIFF_FILE, t)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(t,)) for t in texts]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert not errors, errors[:1]
+    assert (tmp_path / cd.DIFF_FILE).read_text() in texts
+    assert [p.name for p in tmp_path.iterdir()] == [cd.DIFF_FILE]
+
+
+def test_own_shown_is_set_whenever_the_own_list_was_cut_to_first_lines(tmp_path):
+    """Reproduced: a body that fit after the first-line cut carried ``own_total`` and no ``own_shown``."""
+    own = [f"entry {i}: " + "w" * 200 + "\nsecond line" for i in range(60)]
+    c = cd.build_card("consolidated", occurrence="o", own_extra=own, out_dir=tmp_path)
+    assert c.body["own_total"] == 60 and c.body["own_shown"] == len(c.body["own"]) == 60
+
+
+def test_the_usage_record_carries_the_subscription_axes(scratch):
+    """Reproduced: ``to_usage`` filled neither ``actions`` nor ``seconds``, so a subscription settle read every
+    dream as unreadable. The executor now records the child's ``num_turns`` and the compose seconds."""
+    import json as _json
+
+    from levain.dream import executor as ex
+
+    raw = _json.dumps({"subtype": "success", "is_error": False, "result": _VALID, "num_turns": 8,
+                       "total_cost_usd": 1.5, "usage": {"input_tokens": 1, "output_tokens": 2}}).encode()
+    assert ex.ClaudeMind("m").parse(raw, 0, 3.2).turns == 8
+    assert ex.ClaudeMind("m").parse(raw.replace(b'"num_turns": 8', b'"x": 1'), 0, 3.2).turns is None
+    dream(scratch, "o1", _VALID)
+    doc = us.read_doc(occ(scratch, "o1"))
+    assert isinstance(doc["seconds"], int) and "turns" in doc            # the fake mind reports no turn count
+    assert us.read_usage(occ(scratch, "o1")).actions is None             # unreadable, never 0
+    base = {"unit": "usd_list", "readable": True, "actual_usd_micros": 5, "input_tokens": 1, "output_tokens": 2,
+            "source": "dream:claude-p"}
+    u = us.to_usage({**base, "turns": 8, "seconds": 3181})
+    assert (u.actions, u.seconds) == (8, 3181)
+    assert us.to_usage({**base, "turns": None, "seconds": -1}).actions is None
+    assert us.to_usage({**base}).seconds is None
