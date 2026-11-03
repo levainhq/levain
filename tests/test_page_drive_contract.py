@@ -160,7 +160,8 @@ def test_act_until_does_not_run_its_action_again_once_the_condition_came_true_be
 
 
 @needs_browser
-def test_a_timeout_prints_the_page_state_after_its_named_line_and_keeps_the_exit_code(tmp_path: Path) -> None:
+def test_a_timeout_prints_the_page_state_after_its_named_line_and_keeps_the_exit_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LEVAIN_TEST_WAIT_SCALE", "0.1")                  # below 1 counts as 1: CI's own scale would double the 1500 ms the line names
     page = ("data:text/html,<div id='levain-modal'><p data-question-row>a</p><p data-question-row>b</p></div>"
             "<script>console.log('hello-' + 'from-the-page'); setTimeout(() => { throw new Error('late-' + 'page-error'); }, 100)</script>")
     r = _drive_at(tmp_path, page, [{"until": "document.querySelectorAll('#levain-modal [data-question-row]').length === 7", "ms": 1500}])
