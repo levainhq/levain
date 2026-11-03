@@ -2472,11 +2472,11 @@ def run_band_terminal_key(args: argparse.Namespace) -> int:
         rep = ts.status()
         print(rep.text, file=sys.stderr if rep.state == "warning" else sys.stdout)
         return 1 if rep.state == "warning" else 0
-    from levain.consent.band import AGENT_ANSWER_REFUSAL, EXIT_REFUSED, agent_session_caller
+    from levain.consent.band import EXIT_REFUSED, agent_session_caller
 
+    # the early refusal and create()'s own fence are one detector and one text (ts.session_refusal)
     if agent_session_caller():
-        print("levain band terminal-key: refused: run it from a fresh terminal, not inside an agent session "
-              f"({AGENT_ANSWER_REFUSAL})", file=sys.stderr)
+        print(f"levain band terminal-key: {ts.session_refusal()}", file=sys.stderr)
         return EXIT_REFUSED
     rep = ts.create()
     print(rep.text, file=sys.stdout if rep.created else sys.stderr)
