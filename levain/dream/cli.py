@@ -2,7 +2,7 @@
 
 D1-1a's ``run``: ``levain dream run --store-dir <copy> --mind claude|ollama`` consolidates a COPY of a store through
 :func:`levain.dream.executor.consolidate_store`. D1-1b added ``rollback``, ``recover`` and ``drill``; D1-1c added
-``ready`` (the day-ready predicate, read-only). The schedule is D1-2's. ``run`` refuses the operator's live store
+``ready`` (the day-ready predicate, read-only); D1-2 added ``enable`` (registers the role and spec; signs nothing). ``run`` refuses the operator's live store
 (``~/.anneal-memory``): it is for copies, and it is never pointed at that dir by default."""
 from __future__ import annotations
 
@@ -89,6 +89,15 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     dr.add_argument("--root", default=None, help="The occurrences dir (default dream/ beside the store's resolved memory.db).")
     dr.add_argument("--json", action="store_true")
     dr.set_defaults(func=run_dream_drill)
+    en = sub.add_parser("enable", allow_abbrev=False, help="Register the dream as a named agent and print its signing card.",
+                        description="Register the shipped `dream` role and AgentSpec in the agent store (idempotent) and "
+                                    "print the words its link's signing card carries. It signs nothing: the link is "
+                                    "his signature, and the dream launches only under a live signed link.")
+    en.add_argument("--agent-store-dir", type=Path, default=None,
+                    help="The autonomic store directory (default: $LEVAIN_HOME/autonomic).")
+    en.add_argument("--revise", action="store_true", help="Write a new version when the stored spec differs.")
+    en.add_argument("--json", action="store_true")
+    en.set_defaults(func=run_dream_enable)
 
 
 def _store_and_occurrence(p: argparse.ArgumentParser) -> None:
@@ -97,8 +106,39 @@ def _store_and_occurrence(p: argparse.ArgumentParser) -> None:
 
 
 def run_dream(args: argparse.Namespace) -> int:
-    print("levain dream: choose run, rollback, recover, ready or drill (see `levain dream --help`)", file=sys.stderr)
+    print("levain dream: choose run, rollback, recover, ready, drill or enable (see `levain dream --help`)",
+          file=sys.stderr)
     return 1
+
+
+def run_dream_enable(args: argparse.Namespace) -> int:
+    from levain.agents.store import AgentStoreRefused, get_default_zone, open_agent_store
+    from levain.dream import agent as da
+    from levain.dream import executor as ex
+
+    try:
+        store = open_agent_store(args.agent_store_dir)
+        zone = get_default_zone(store)
+        reg = da.register_dream(store, revise=args.revise)
+    except (AgentStoreRefused, da.EnableRefused) as exc:
+        print(f"levain dream enable: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - nothing was reported as registered
+        print(f"levain dream enable: cannot register ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return 1
+    r = ex.PER_RUN_LIMIT_USD_MICROS / 1_000_000
+    card = da.signing_card_text(str(zone), per_run_usd=r, night_usd=2 * r,
+                                expires="the link's expires_at (a link lasts at most 29 days)")
+    doc = {"agent_id": reg.agent_id, "spec_hash": reg.spec_hash, "role_hash": reg.role_hash, "version": reg.version,
+           "created": reg.created, "zone": reg.zone, "signing_card": card}
+    if args.json:
+        print(json.dumps(doc, sort_keys=True))
+    else:
+        print(f"{'registered' if reg.created else 'already registered'}: dream {reg.agent_id} v{reg.version} "
+              f"spec_hash {reg.spec_hash[:12]} role_hash {reg.role_hash[:12]}")
+        print(card)
+        print("Not signed. The dream launches only under a live signed agent link for this spec_hash.")
+    return 0
 
 
 def _refused(p: Path) -> str | None:
