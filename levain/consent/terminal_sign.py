@@ -383,18 +383,80 @@ def create(key_dir: Path | None = None, *, creator: Callable[..., Any] | None = 
     ``in_agent_session`` (default ``levain.consent.band.agent_session_caller``, the band's one detector) before the
     key directory is touched, and when a terminal key is already enrolled. ``creator`` is
     ``custody.create_touch_id``'s door and the only place a real key is made; tests inject theirs.
-    Never raises: a refusal, a failed creation, any exception on the way and a Ctrl-C are a report with ``created``
-    False."""
+    Never raises: a refusal, a failed creation, any exception on the way and a Ctrl-C are a report. ``created`` is
+    True once ``creator`` has returned a key, even when printing the instructions then fails; an interrupt at the
+    moment ``creator`` returns is told apart by looking for the key again."""
+    progress = _Progress()
     try:
-        return _create(key_dir, creator, in_agent_session)
+        return _create(key_dir, creator, in_agent_session, progress)
     except KeyboardInterrupt:
-        return CreateReport(False, "not created: cancelled")
+        return _after_failure(progress, "cancelled")
     except Exception as exc:  # noqa: BLE001 - the CLI prints a report, never a traceback
-        return CreateReport(False, f"not created: {_one_line(exc)}")
+        return _after_failure(progress, _one_line(exc))
+
+
+@dataclass
+class _Progress:
+    """How far :func:`_create` got, read by :func:`create` when something escapes it."""
+    key_dir: Path | None = None
+    started: bool = False            # the creator was called
+    made: Any = None                 # what it returned: the key is persisted from here on
+
+
+def _after_failure(progress: _Progress, why: str) -> CreateReport:
+    if progress.made is not None:
+        m = progress.made
+        return _created_report(m.path, m.public_path, m.public_key, f"stopped while printing ({why})")
+    if progress.started:
+        # the interrupt or failure came at the creator's return: custody removed its key, or the key is committed
+        try:
+            key = find_key(progress.key_dir)
+        except Exception as exc:  # noqa: BLE001 - neither answer is known, so neither is claimed
+            return CreateReport(False, f"{why}; whether the key was created cannot be told ({_one_line(exc)}); "
+                                       "`levain band terminal-key status` shows it")
+        if key is not None:
+            return _created_report(key.path, key.path.with_name(key.path.name + ".pub"), key.public_key,
+                                   f"stopped as creation finished ({why})")
+    return CreateReport(False, f"not created: {why}")
+
+
+def _created_report(path: Path, public_path: Path, public_key: str, note: str | None = None) -> CreateReport:
+    """The created report, built piece by piece: a piece that cannot be built is named, never a lost key."""
+    lines = [f"terminal key created: {path}"]
+    unprinted: list[str] = []
+    try:
+        lines += ["1. Flow: commit this line to scripts/needs_phill_signers (a reviewed commit):",
+                  f"   {signers_line(public_key)}"]
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - the key exists; say what is missing
+        unprinted.append(f"the signers line ({_one_line(exc)})")
+    try:
+        lines += ["2. Levain (only for ruling compose and the desk click path; replace the signing key word):",
+                  f"   {enroll_command(public_path)}"]
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - as above
+        unprinted.append(f"the enroll command ({_one_line(exc)})")
+    if note:
+        lines.append(f"note: {note}")
+    if unprinted:
+        lines.append(f"could not print {' and '.join(unprinted)}; the public key file is {public_path}, and "
+                     "`levain band terminal-key status` shows the key")
+    return CreateReport(True, "\n".join(lines), public_key)
+
+
+_STALE = "; choose another --label"
+
+
+def _not_created(exc: KeyError_) -> str:
+    """Custody's refusal, except where it advises a ``--label`` this verb does not take (its label is fixed)."""
+    text = _one_line(exc)
+    if _STALE not in text:
+        return f"not created: {text}"
+    what = text.split(": ", 1)[-1].split(_STALE, 1)[0]
+    return (f"not created: {what}, a leftover of an earlier terminal key; remove it, then run create again "
+            "(`levain band terminal-key status` shows the detail)")
 
 
 def _create(key_dir: Path | None, creator: Callable[..., Any] | None,
-            in_agent_session: Callable[[], bool] | None) -> CreateReport:
+            in_agent_session: Callable[[], bool] | None, progress: _Progress) -> CreateReport:
     if in_agent_session is None:
         from levain.consent.band import agent_session_caller as in_agent_session
     try:
@@ -414,19 +476,15 @@ def _create(key_dir: Path | None, creator: Callable[..., Any] | None,
                                    "(nothing was created)")
     if creator is None:
         from levain.cockpit.custody import create_touch_id as creator
+    progress.key_dir, progress.started = d, True
     try:
-        made = creator(d, KEY_LABEL)
+        progress.made = creator(d, KEY_LABEL)
     except KeyError_ as exc:
-        return CreateReport(False, f"not created: {_one_line(exc)}")
+        return CreateReport(False, _not_created(exc))
     except Exception as exc:  # noqa: BLE001 - as above
-        return CreateReport(False, f"not created: {type(exc).__name__}: {_one_line(exc)}")
-    line = signers_line(made.public_key)
-    return CreateReport(True, "\n".join((
-        f"terminal key created: {made.path}",
-        "1. Flow: commit this line to scripts/needs_phill_signers (a reviewed commit):",
-        f"   {line}",
-        "2. Levain (only for ruling compose and the desk click path; replace the signing key word):",
-        f"   {enroll_command(made.public_path)}")), made.public_key)
+        return CreateReport(False, f"not created: {_one_line(exc)}")
+    m = progress.made
+    return _created_report(m.path, m.public_path, m.public_key)
 
 
 # ---------------------------------------------------------------------------------------------------
