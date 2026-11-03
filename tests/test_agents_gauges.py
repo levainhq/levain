@@ -14,20 +14,22 @@ STUB = (b'{"error": {"type": "overloaded_error", "message": "Overloaded. The ups
         b'and no body; retry later or contact support with the request id req_0000000000000000"}}')
 
 
-def seed_run(store, state: str, ended: str, name: str = "scratch", spec_text: str = "{}") -> str:
-    agent_id = "ag-" + name
+def seed_run(store, state: str, ended: str, name: str = "scratch", spec_text: str = "{}", agent_id: str | None = None,
+             digest: str = "h") -> str:
+    agent_id = agent_id or "ag-" + name
     with store.write() as c:
         c.execute("INSERT INTO agents (agent_id, name, current_version, registration, operation, failure_streak, "
                   "created_at) VALUES (?,?,?,?,?,?,?)", (agent_id, name, 1, "registered", "active", 0, ended))
         c.execute("INSERT INTO agent_specs (agent_id, version, spec_hash, role_hash, spec, created_at) "
-                  "VALUES (?,?,?,?,?,?)", (agent_id, 1, "h", "r", spec_text, ended))
+                  "VALUES (?,?,?,?,?,?)", (agent_id, 1, digest, "r", spec_text, ended))
         c.execute("INSERT INTO agent_occurrences (occurrence_id, agent_id, kind, key, state, reason, window_key, "
                   "spec_hash, binding_id, run_id, admitted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                  ("oc-1", agent_id, "scheduled", "k1", "admitted", None, "w", "h", "b", "run-1", ended))
-        if state in ("done", "failed"):    # the triggers let a run reach a terminal state only through launched
+                  ("oc-1", agent_id, "scheduled", "k1", "admitted", None, "w", digest, "b", "run-1", ended))
+        if state in ("done", "failed", "launched"):    # a terminal state is reached only through launched
             c.execute("UPDATE agent_occurrences SET state = 'launched', launch_epoch = 0, link_id = 'l', "
                       "link_incarnation = 'i', launched_at = ?", (ended,))
-        c.execute("UPDATE agent_occurrences SET state = ?, reason = 'test', ended_at = ?", (state, ended))
+        if state != "launched":
+            c.execute("UPDATE agent_occurrences SET state = ?, reason = 'test', ended_at = ?", (state, ended))
     return agent_id
 
 
@@ -204,10 +206,37 @@ from types import SimpleNamespace
 import pytest
 
 
-def _win_store(tmp_path, win, spec_text=None):
+AID = "ag-" + "ab" * 16
+
+
+def _good_spec(win):
+    from levain.agents.spec import finalize_spec, parse_spec
+    return finalize_spec(parse_spec({
+        "name": "scratch", "role": {"name": "r", "role_hash": "0" * 64},
+        "input": {"source": "s", "liveness": "fresh within 1d"},
+        "output": {"class": "push", "destination": "d", "reader": "me", "moment": "every run"},
+        "trigger": {"kind": "schedule", "zone": "America/New_York", "cron": "0 7 * * *"},
+        "stop_at": 3600, "win": win}), "America/New_York")
+
+
+def _win_store(tmp_path, win, state="launched"):
+    """A store whose stored spec is real: parsed, canonical, and hashing to the occurrence's spec_hash."""
+    from levain.agents.spec import spec_hash
+    from levain.authority import _canonical
+    spec = _good_spec(win)
     store = open_agent_store(tmp_path / "s")
-    seed_run(store, "done", "2026-11-02T11:00:00Z", spec_text=spec_text if spec_text is not None else json.dumps({"win": win}))
+    seed_run(store, state, "2026-11-02T11:00:00Z", agent_id=AID, spec_text=_canonical(spec), digest=spec_hash(AID, spec))
     return store
+
+
+def _raw_store(tmp_path, spec_text, digest="h"):
+    store = open_agent_store(tmp_path / "raw")
+    seed_run(store, "launched", "2026-11-02T11:00:00Z", agent_id=AID, spec_text=spec_text, digest=digest)
+    return store
+
+
+def _unverified(verdict):
+    return isinstance(verdict, str) and verdict.startswith(g.WIN_UNVERIFIED)
 
 
 def _end(state="done"):
@@ -225,13 +254,13 @@ def test_a_registered_check_decides_a_done_and_a_failed_run_is_never_judged(tmp_
     assert v(_end()) is None
     assert v(_end()) == "no card filed"
     assert v(_end()) == g.WIN_FAILED          # "completed" is done's alone
-    assert v(_end("failed")) is None and len(seen) == 3 and seen[0][0] == "ag-scratch"
+    assert v(_end("failed")) is None and len(seen) == 3 and seen[0][0] == AID
 
 
 def test_a_machine_win_with_no_registered_check_is_unverified_not_a_win(tmp_path):
     for kind in ("verifier", "verified-restore"):
         win_rig = _win_store(tmp_path / kind, {"kind": kind, "check": "nobody-registered-this"})
-        assert g.win_verifier(win_rig)(_end()) == g.WIN_UNVERIFIED
+        assert _unverified(g.win_verifier(win_rig)(_end()))
 
 
 def test_a_human_or_inherited_win_names_no_machine_check(tmp_path):
@@ -241,9 +270,49 @@ def test_a_human_or_inherited_win_names_no_machine_check(tmp_path):
 
 
 def test_an_occurrence_with_no_stored_spec_or_an_unreadable_one_is_unverified(tmp_path):
-    win_rig = _win_store(tmp_path, None, spec_text="not json")
-    assert g.win_verifier(win_rig)(SimpleNamespace(occurrence_id="oc-none", state="done")) == g.WIN_UNVERIFIED
-    assert g.win_verifier(win_rig)(_end()) == g.WIN_UNVERIFIED
+    win_rig = _raw_store(tmp_path, "not json")
+    assert _unverified(g.win_verifier(win_rig)(SimpleNamespace(occurrence_id="oc-none", state="done")))
+    assert _unverified(g.win_verifier(win_rig)(_end()))
+
+
+@pytest.mark.parametrize("text", ["{}", "[]", "null", '"win"',
+                                  '{"win": {"kind": "human", "check": "x"}}'])
+def test_a_malformed_stored_spec_is_never_a_win(tmp_path, text):
+    # a '{}' spec, a non-object spec, or a hand-altered one with win.kind human is not a verified spec
+    verdict = g.win_verifier(_raw_store(tmp_path, text))(_end())
+    assert _unverified(verdict) and ":" in verdict
+
+
+def test_a_spec_that_does_not_hash_to_its_spec_hash_is_unverified(tmp_path):
+    from levain.agents.spec import spec_hash
+    from levain.authority import _canonical
+    real = _good_spec({"kind": "verifier", "check": "x"})
+    forged = _good_spec({"kind": "human", "check": "x"})           # a valid spec, but not the one that was hashed
+    store = _raw_store(tmp_path, _canonical(forged), digest=spec_hash(AID, real))
+    verdict = g.win_verifier(store)(_end())
+    assert _unverified(verdict) and "spec_hash" in verdict
+
+
+def test_a_malformed_win_is_unverified_whatever_the_stored_row_says(tmp_path, monkeypatch):
+    # defence in depth: even a row that passes the parse, with a win that is no mapping or an unknown kind, fails closed
+    from levain.agents import spec as spec_mod
+    store = _win_store(tmp_path, {"kind": "human", "check": "x"})
+    good = spec_mod._check_row
+    for bad in (None, "verifier", ["human"], {"kind": "bogus"}, {"check": "x"}):
+        def lie(agent_id, name, digest, text, bad=bad):
+            s = good(agent_id, name, digest, text)
+            s["win"] = bad
+            return s
+        monkeypatch.setattr(spec_mod, "_check_row", lie)
+        assert _unverified(g.win_verifier(store)(_end())), bad
+
+
+def test_a_check_name_that_is_not_text_is_unverified_not_an_error(tmp_path, monkeypatch):
+    from levain.agents import spec as spec_mod
+    store = _win_store(tmp_path, {"kind": "verifier", "check": "x"})
+    good = spec_mod._check_row
+    monkeypatch.setattr(spec_mod, "_check_row", lambda *a: {**good(*a), "win": {"kind": "verifier", "check": ["a"]}})
+    assert _unverified(g.win_verifier(store)(_end()))
 
 
 def test_a_check_cannot_be_replaced_silently():
@@ -252,6 +321,48 @@ def test_a_check_cannot_be_replaced_silently():
         g.register_check("t-once", lambda ctx: None)
     with pytest.raises(ValueError):
         g.register_check("", lambda ctx: None)
+
+
+def test_two_threads_registering_one_name_leave_exactly_one_winner(monkeypatch):
+    import threading
+    import time
+
+    class Slow(dict):                    # widens the check-then-insert window the lock must close
+        def __contains__(self, key):
+            hit = dict.__contains__(self, key)
+            time.sleep(0.05)
+            return hit
+
+    monkeypatch.setattr(g, "_CHECKS", Slow())
+    outcomes = []
+    barrier = threading.Barrier(2)
+
+    def go(fn):
+        barrier.wait()
+        try:
+            g.register_check("t-race", fn)
+            outcomes.append("ok")
+        except ValueError:
+            outcomes.append("refused")
+
+    a, b = (lambda ctx: None), (lambda ctx: "b")
+    threads = [threading.Thread(target=go, args=(f,)) for f in (a, b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(outcomes) == ["ok", "refused"]
+    assert g._CHECKS["t-race"] in (a, b)
+
+
+def test_a_check_does_not_run_for_a_grant_revoked_after_the_run_ended_its_work(tmp_path):
+    ran = []
+    g.register_check("t-revoked", lambda ctx: ran.append(1))
+    store = _win_store(tmp_path, {"kind": "verifier", "check": "t-revoked"})
+    with store.write() as c:             # a revocation raises the occurrence epoch past the launch's
+        c.execute("UPDATE agent_occurrences SET epoch = epoch + 1")
+    verdict = g.win_verifier(store)(_end())
+    assert _unverified(verdict) and "revoked" in verdict and ran == []
 
 
 def test_the_supervisor_defaults_its_verify_hook_to_the_win_verifier(monkeypatch):

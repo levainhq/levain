@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 from dataclasses import dataclass
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -248,6 +249,8 @@ def run_health(conn: sqlite3.Connection, agent_id: str, now: datetime, *, stale_
 WIN_UNVERIFIED = "win_unverified"
 WIN_FAILED = "win_failed"
 _MACHINE_KINDS = frozenset({"verifier", "verified-restore"})
+_NO_CHECK_KINDS = frozenset({"human", "inherited"})
+_CHECKS_LOCK = threading.Lock()
 _CHECKS: dict[str, Callable[["WinContext"], str | None]] = {}
 
 
@@ -264,30 +267,51 @@ class WinContext:
 
 
 def register_check(name: str, check: Callable[[WinContext], str | None]) -> None:
-    """Register ``check`` under ``name`` (the ``win.check`` text of a spec). It returns None for a win or a reason."""
+    """Register ``check`` under ``name`` (the ``win.check`` text of a spec). It returns None for a win or a reason.
+    The check-and-insert is one step under a lock: of two racing registrations of a name, one wins and one raises."""
     if not isinstance(name, str) or not name.strip() or not callable(check):
         raise ValueError("a check needs a non-empty name and a callable")
-    if name in _CHECKS and _CHECKS[name] is not check:
-        raise ValueError(f"a check named {name!r} is already registered")
-    _CHECKS[name] = check
+    with _CHECKS_LOCK:
+        if name in _CHECKS and _CHECKS[name] is not check:
+            raise ValueError(f"a check named {name!r} is already registered")
+        _CHECKS[name] = check
 
 
-def _stored_spec(store, occurrence_id: str) -> tuple[str, dict | None, str | None] | None:
+def _stored_spec(store, occurrence_id: str) -> tuple[str, dict | None, str | None, str] | None:
+    """``(agent_id, spec, launched_at, why)``: ``spec`` is None, with ``why`` naming what is wrong, unless the stored
+    row is the spec that was registered: it parses as a spec and re-hashes (the register-time function) to the
+    occurrence's ``spec_hash``. ``None`` when the occurrence is unknown."""
+    from levain.agents import spec as _spec
     with store.read() as conn:
-        row = conn.execute("SELECT o.agent_id, s.spec, o.launched_at FROM agent_occurrences o"
+        row = conn.execute("SELECT o.agent_id, s.spec, o.launched_at, o.spec_hash, a.name FROM agent_occurrences o"
                            " LEFT JOIN agent_specs s ON s.agent_id = o.agent_id AND s.spec_hash = o.spec_hash"
-                           " WHERE o.occurrence_id = ?", (occurrence_id,)).fetchone()
+                           " LEFT JOIN agents a ON a.agent_id = o.agent_id WHERE o.occurrence_id = ?",
+                           (occurrence_id,)).fetchone()
     if row is None:
         return None
+    agent_id, text, launched, digest, name = row
+    if text is None:
+        return agent_id, None, launched, "no stored spec for the occurrence's spec_hash"
     try:
-        spec = json.loads(row[1]) if row[1] else None
-    except ValueError:
-        spec = None
-    return row[0], spec if isinstance(spec, dict) else None, row[2]
+        spec = _spec._check_row(agent_id, name, digest, text)
+    except _spec.SpecError as exc:
+        return agent_id, None, launched, f"the stored spec is malformed ({str(exc)[:120]})"
+    except Exception as exc:                     # a hash that cannot be computed is a spec that cannot be verified
+        return agent_id, None, launched, f"the stored spec cannot be checked ({type(exc).__name__})"
+    return agent_id, spec, launched, ""
+
+
+def _grant_held(store, occurrence_id: str) -> bool:
+    """The occurrence is still ``launched`` under the epoch it launched with (no revocation or takeover since)."""
+    with store.read() as conn:
+        return conn.execute("SELECT 1 FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'"
+                            " AND epoch = launch_epoch", (occurrence_id,)).fetchone() is not None
 
 
 def win_verifier(store, *, clock: Callable[[], datetime] | None = None) -> Callable[[object], str | None]:
-    """The ``verify`` hook for ``store``: None accepts the end, a reason fails a ``done``. Only a ``done`` is judged."""
+    """The ``verify`` hook for ``store``: None accepts the end, a reason fails a ``done``. Only a ``done`` is judged.
+    Anything malformed fails closed as ``win_unverified: <what>``; only a known ``human`` / ``inherited`` win on a
+    spec that re-hashes to its ``spec_hash`` passes without a registered check."""
     now_of = clock or (lambda: datetime.now(timezone.utc))
 
     def verify(end) -> str | None:
@@ -295,18 +319,25 @@ def win_verifier(store, *, clock: Callable[[], datetime] | None = None) -> Calla
             return None
         found = _stored_spec(store, end.occurrence_id)
         if found is None:
-            return WIN_UNVERIFIED
-        agent_id, spec, launched = found
+            return f"{WIN_UNVERIFIED}: no such occurrence"
+        agent_id, spec, launched, why = found
         if spec is None:
-            return WIN_UNVERIFIED
+            return f"{WIN_UNVERIFIED}: {why}"
         win = spec.get("win")
-        if not isinstance(win, dict) or win.get("kind") in ("human", "inherited"):
-            return None      # no machine check is named: registration (refuse.py) is what requires a win
-        if win.get("kind") not in _MACHINE_KINDS:
-            return WIN_UNVERIFIED
-        check = _CHECKS.get(win.get("check"))
+        if not isinstance(win, dict):
+            return f"{WIN_UNVERIFIED}: the stored spec has no win mapping"
+        kind = win.get("kind")
+        if kind in _NO_CHECK_KINDS:
+            return None      # a named human verdict surface, or the downstream's win: no machine check is named
+        if kind not in _MACHINE_KINDS:
+            return f"{WIN_UNVERIFIED}: win.kind {str(kind)[:30]!r} is not a known kind"
+        name = win.get("check")
+        with _CHECKS_LOCK:
+            check = _CHECKS.get(name) if isinstance(name, str) else None
         if check is None:
-            return WIN_UNVERIFIED
+            return f"{WIN_UNVERIFIED}: no check is registered under win.check"
+        if not _grant_held(store, end.occurrence_id):    # the check may have effects: never for a revoked grant
+            return f"{WIN_UNVERIFIED}: grant revoked before the check ran"
         verdict = check(WinContext(store, end.occurrence_id, agent_id, spec, launched, end, now_of()))
         if verdict is None:
             return None
