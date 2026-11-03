@@ -420,6 +420,110 @@ def _note_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, An
 
 # a coordinator review queue row (levain.cockpit.coordinator_panels): clear on an open item that is not "yours to clear",
 # reopen on a cleared one
+# an agents panel row (levain.cockpit.agents_panel): pause and retire act on a live agent, resume on a paused one, renew on
+# one with a signed link for its current spec. Each handler calls the owner of the act in levain.agents and nothing
+# lower: a renew goes through the one signing entry, so the checks that entry gains reach it with no change here.
+_AGENT_PREFIX = "agent:"
+_AGENT_ROW = lambda r: str(r.get("id", "")).startswith(_AGENT_PREFIX)   # noqa: E731
+_PAUSABLE_AGENT_ROW = lambda r: _AGENT_ROW(r) and _facet(r, "agent_group") in ("firing", "unarmed")   # noqa: E731
+_RESUMABLE_AGENT_ROW = lambda r: _AGENT_ROW(r) and _facet(r, "agent_group") == "paused"   # noqa: E731
+_RETIRABLE_AGENT_ROW = lambda r: _AGENT_ROW(r) and _facet(r, "agent_group") in ("firing", "paused", "unarmed")   # noqa: E731
+_RENEWABLE_AGENT_ROW = lambda r: (_AGENT_ROW(r) and _facet(r, "agent_group") in ("firing", "paused", "unarmed")   # noqa: E731
+                                  and bool(_facet(r, "agent_link")))
+
+
+def _agent_target(target: dict[str, Any], params: dict[str, Any], allowed: tuple[str, ...] = ()) -> tuple[Any, str]:
+    """``(wiring, agent_id)`` of an agent verb's row; the params are only ``allowed`` ones."""
+    from levain.cockpit.agents_panel import AgentsWiring
+
+    extra = sorted(set(params) - set(allowed))
+    if extra:
+        raise EditError("bad_request", 400, f"this agent verb does not take {extra}")
+    rid = str((target.get("row") or {}).get("id", ""))
+    if not rid.startswith(_AGENT_PREFIX) or len(rid) == len(_AGENT_PREFIX):
+        raise EditError("bad_request", 400, f"{rid[:60]!r} is not an agents panel row")
+    return (target.get("agents") or AgentsWiring()), rid[len(_AGENT_PREFIX):]
+
+
+def _agent_store_write(wiring: Any) -> Any:
+    from levain.agents.store import AgentStoreRefused, open_agent_store
+    from levain.autonomic.db import StoreFormatError
+
+    try:
+        return open_agent_store(wiring.store_dir)
+    except AgentStoreRefused as exc:
+        raise EditError("not_built", 501, str(exc)) from None
+    except (StoreFormatError, sqlite3.Error, OSError) as exc:
+        raise EditError("source_unavailable", 503, f"the agent store cannot be opened now: {exc}") from None
+
+
+def _agent_operation_fire(operation: str) -> Callable[..., dict[str, Any]]:
+    """Pause or resume the agent and its whole feeder group together (:func:`levain.agents.spec.set_operation`)."""
+    def fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+        from levain.agents.spec import SpecError, set_operation
+        from levain.autonomic.db import StoreFormatError
+
+        wiring, agent_id = _agent_target(target, params)
+        store = _agent_store_write(wiring)
+        try:
+            members = set_operation(store, agent_id, operation)
+        except SpecError as exc:
+            raise EditError("refused", 409, str(exc)) from None
+        except (sqlite3.Error, StoreFormatError, OSError) as exc:
+            raise EditError("source_unavailable", 503, f"the agent store cannot be written now: {exc}") from None
+        return {"agent": agent_id, "operation": operation, "group": [m["name"] for m, _changed in members],
+                "changed": [m["name"] for m, changed in members if changed]}
+    return fire
+
+
+def _agent_retire_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any],
+                       confirm: bool) -> dict[str, Any]:
+    from levain.agents.spec import SpecError, retire_agent
+    from levain.autonomic.db import StoreFormatError
+
+    wiring, agent_id = _agent_target(target, params)
+    store = _agent_store_write(wiring)
+    try:
+        agent, reader, group = retire_agent(store, agent_id)
+    except SpecError as exc:
+        raise EditError("refused", 409, str(exc)) from None
+    except (sqlite3.Error, StoreFormatError, OSError) as exc:
+        raise EditError("source_unavailable", 503, f"the agent store cannot be written now: {exc}") from None
+    return {"agent": agent_id, "registration": agent["registration"], "reader": reader or None, "group_left": group}
+
+
+def _agent_renew_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any],
+                      confirm: bool) -> dict[str, Any]:
+    """Move the expiry of the agent's link (``days`` from now, default 29) through
+    :func:`levain.agents.signing.renew_agent_link`, signed by the laptop-presence key the cockpit's wiring names. A
+    cockpit that holds no such key refuses (501) and appends nothing: the log would refuse any other signer anyway."""
+    from datetime import timedelta
+
+    from levain.agents.cli import _signing_refusals
+    from levain.agents.signing import renew_agent_link
+    from levain.authority import AGENT_LINK_MAX
+
+    wiring, agent_id = _agent_target(target, params, ("days",))
+    days = params.get("days", 29)
+    if type(days) is not int or not 1 <= days <= AGENT_LINK_MAX.days:
+        raise EditError("bad_request", 400, f"'days' is a whole number from 1 to {AGENT_LINK_MAX.days}")
+    link_id = str(_facet(target.get("row"), "agent_link") or "")
+    if not link_id:
+        raise EditError("refused", 409, "no signed link covers this agent's current spec: sign one first "
+                                        "(levain agents sign)")
+    if wiring.signing is None or wiring.cockpit_root is None:
+        raise EditError("not_built", 501, "this cockpit holds no laptop-presence signing key, and only one renews a "
+                                          "link: run levain agents renew from the laptop")
+    try:
+        signer_fp, sign = wiring.signing()
+        new, expires_at = renew_agent_link(wiring.cockpit_root, link_id, life=timedelta(days=days),
+                                           signer_fp=signer_fp, sign=sign,
+                                           clock=wiring.now)
+    except _signing_refusals() as exc:
+        raise EditError("refused", 409, str(exc)) from None
+    return {"agent": agent_id, "link": link_id, "expires_at": expires_at, "seq": new.seq}
+
+
 _REVIEW_PREFIX = "review:"
 _CLEARABLE_REVIEW_ROW = lambda r: (str(r.get("id", "")).startswith(_REVIEW_PREFIX)   # noqa: E731
                                    and _facet(r, "review_state") == "open" and _facet(r, "review_authority") is False)
@@ -740,6 +844,17 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("review_clear_signed", "clear", "clears an item that is yours to clear, on your passkey's signature (it "
              "authorises nothing)", "row", fields=("item",), floor="C1", tier_fn=_const("C1"), reversible=False,
              fire=_review_signed_fire, applies_to=_SIGNABLE_REVIEW_ROW, sign=True),
+    VerbSpec("agent_pause", "pause", "pauses the agent and the agents that feed it: none fires until resumed", "row",
+             floor="C1", tier_fn=_const("C1"), fire=_agent_operation_fire("paused"), applies_to=_PAUSABLE_AGENT_ROW),
+    VerbSpec("agent_resume", "resume", "resumes a paused agent and its feeder group, and resets their failure streaks",
+             "row", floor="C1", tier_fn=_const("C1"), fire=_agent_operation_fire("active"),
+             applies_to=_RESUMABLE_AGENT_ROW),
+    VerbSpec("agent_renew", "renew", "moves the expiry of the agent's signed link, on the laptop-presence key this "
+             "cockpit holds (its terms stay)", "row", fields=("days",), floor="C1", tier_fn=_const("C1"),
+             confirm_required=True, reversible=False, fire=_agent_renew_fire, applies_to=_RENEWABLE_AGENT_ROW),
+    VerbSpec("agent_retire", "retire", "retires the agent for good: it never fires again", "row", floor="C1",
+             tier_fn=_const("C1"), confirm_required=True, reversible=False, fire=_agent_retire_fire,
+             applies_to=_RETIRABLE_AGENT_ROW),
     VerbSpec("operator_state", "set state", "sets your freeform state line", "value",
              fields=("text",), floor="C1", tier_fn=_const("C1"), fire=_operator_state_fire,
              legacy_kind="operator_state"),
@@ -1207,7 +1322,10 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
                               "dispatch_dir": dispatch_dir,
                               # the server's Signer (levain.consent.sign): a signed review clear is verified against
                               # its passkeys; None on a server that runs no passkey ceremony
-                              "signer": signer}
+                              "signer": signer,
+                              # the agents panel's wiring (levain.cockpit.agents_panel.AgentsWiring), None on a cockpit
+                              # that carries none: the agent verbs then act on this levain home's store
+                              "agents": getattr(cockpit, "agents_wiring", None)}
     if verb.binding == "value":
         supplied = req.get("panel_version")
         target["check"] = lambda: _check_value_version(cockpit, panel_id, supplied)
