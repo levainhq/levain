@@ -77,6 +77,22 @@ DYNAMIC_SITES = {
     "levain/firing/presence.py::<module>::" '# recover. An EXPLICIT map (not ``import_module(f"…{kind}")``) governs which modules may be': (),
 }
 LAZY_SITES = {
+    # operator: ``_landed`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::_landed::from levain.agents import bars': 'operator',
+    # operator: ``_lost`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::_lost::from levain.agents import bars': 'operator',
+    # operator: ``open_bar_for`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::open_bar_for::from levain.agents import bars': 'operator',
+    # operator: ``open_bar_for`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::open_bar_for::from levain.autonomic.db import DB_NAME as _STORE_DB, default_store_dir': 'operator',
+    # operator: ``revoke_agent_begin`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::revoke_agent_begin::from levain.agents import bars': 'operator',
+    # operator: ``revoke_agent_finish`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::revoke_agent_finish::from levain.agents import bars': 'operator',
+    # operator: ``revoke_agent_sign`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::revoke_agent_sign::from levain.agents import bars': 'operator',
+    # operator: ``revoke_agent_sign`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::revoke_agent_sign::from levain.cockpit.consent import utc_stamp': 'operator',
     # operator: ``_resolve`` <- ``pick_address`` <- ``creds._post`` / ``keys`` (the broker's dial); the root credential verbs only ``commit`` / ``remove`` files
     'levain/broker/upstream.py::_resolve::from levain.broker.front import system_resolve': 'operator',
     # operator: ``pick_address`` <- ``creds._post`` / ``keys`` (the broker's dial); the root credential verbs only ``commit`` / ``remove`` files
@@ -280,6 +296,14 @@ LAZY_SITES = {
     'levain/cockpit/authority.py::RequestAuthority.fence::from levain.cockpit.firejournal import authority_fence': 'root',
     'levain/cockpit/authority.py::RequestAuthority.policy::from levain.authority import genesis_policy': 'root',
     'levain/cockpit/authority.py::RequestAuthority.revision::from levain.cockpit.firejournal import authority_fence': 'root',
+    # operator: _agent_link_card has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process
+    'levain/cockpit/authority.py::_agent_link_card::from levain.authority import AGENT_LINK_KIND, _thaw': 'operator',
+    # operator: _agent_link_card has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process
+    'levain/cockpit/authority.py::_agent_link_card::from levain.autonomic.coverage import guard_problem': 'operator',
+    # operator: open_bar_problem has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process
+    'levain/cockpit/authority.py::open_bar_problem::from levain.agent_authority import OPEN_BAR_REFUSAL, AgentAuthorityError, open_bar_for': 'operator',
+    # operator: sign_card has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process
+    'levain/cockpit/authority.py::sign_card::from levain.agents.signing import sign_agent_link': 'operator',
     'levain/consent/queue.py::AuthoritySource.head::from levain.authority import log_head': 'root',
     'levain/dispatch/contract.py::git_env::from levain.launch import child_env': 'root',
     'levain/dispatch/published.py::sync::from levain.qbroker.grants import PUBLISHED_MAX   # here: grants imports this module': 'root',

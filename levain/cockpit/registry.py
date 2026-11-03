@@ -134,6 +134,13 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # a coordinator review queue row (levain.cockpit.coordinator_panels): its state and whether it is "yours to clear"
     "review_state": ("enum", _enum("open", "cleared")),
     "review_authority": ("bool", _is_bool),
+    # an agent row on the agents panel (levain.cockpit.agents_panel): the group it is drawn in, and the id of the agent
+    # link its verbs act on ("" when none is signed for its current spec), and the agent's version and store id its
+    # verbs' writes are checked against
+    "agent_group": ("enum", _enum("firing", "paused", "unarmed", "retired")),
+    "agent_link": ("str", _is_str),
+    "agent_version": ("int", _is_int),
+    "agent_store": ("str", _is_str),
     "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what the Build tab's session row draws (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
 }
@@ -409,6 +416,15 @@ register_ordering(
     Ordering("decision.review", lambda row, today: (),
              lambda row, today: "cleared" if row.facets.get("review_state") == "cleared" else "open",
              (("open", "Open"), ("cleared", "Cleared")), uncounted=frozenset({"cleared"})),
+    builtin=True,
+)
+# the agents panel (levain.cockpit.agents_panel): grouped by what the agent does now, by name inside a group; a retired
+# agent is history beside the rest and is not a figure on the panel's count
+register_ordering(
+    Ordering("agents.state", lambda row, today: (row.title.lower(), row.id),
+             lambda row, today: str(row.facets.get("agent_group") or "unarmed"),
+             (("firing", "Firing"), ("paused", "Paused"), ("unarmed", "Unarmed"), ("retired", "Retired")),
+             uncounted=frozenset({"retired"})),
     builtin=True,
 )
 # rows a migrated source already ordered (an external panel, design §6.2): one constant key, and the stable
