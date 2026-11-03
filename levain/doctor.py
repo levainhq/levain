@@ -151,6 +151,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_host_awake())
     core.extend(_check_cockpit_authority(install))
     core.extend(_check_authority_signers(install))
+    core.extend(_guarded("terminal key", _check_terminal_key))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
@@ -300,6 +301,22 @@ _ACTIVATION_FILES = ("posture.md", "recency_directives.md")
 # these two base files carry the identity slots (OPERATOR_NAME/ENTITY_NAME) that
 # matter most, so it is the right minimum.
 _RENDER_TARGET_SEEDS = ("world.md", "origin.md")
+
+
+def _check_terminal_key(key_dir: Path | None = None, **look: Any) -> CheckResult:
+    """The ``terminal key`` row (TERMSIGN): what ``levain band terminal-key status`` prints. No key is a fact said in
+    words, not a failure; a key whose Secure Enclave identity is missing or not biometric-protected is a warning.
+    Read-only."""
+    from levain.consent import terminal_sign
+
+    rep = terminal_sign.status(key_dir, **look)
+    if rep.state == "enrolled":
+        return CheckResult("terminal key", True, rep.text.removeprefix("terminal key: "))
+    if rep.state == "not enrolled":
+        return CheckResult("terminal key", True, rep.text, "`levain band terminal-key create` enrols one.",
+                           neutral=True)
+    return CheckResult("terminal key", True, rep.text.removeprefix("WARNING: "),
+                       "Re-check with `levain band terminal-key status`.", warn=True)
 
 
 def _check_consent_hooks(install: Path) -> list[CheckResult]:

@@ -2463,6 +2463,26 @@ def run_band_hooks(args: argparse.Namespace) -> int:
     return code
 
 
+def run_band_terminal_key(args: argparse.Namespace) -> int:
+    """``levain band terminal-key create|status`` (:mod:`levain.consent.terminal_sign`). ``create`` is the operator's
+    act at the laptop, so it is refused inside any agent session; ``status`` only reads."""
+    from levain.consent import terminal_sign as ts
+
+    if args.tk_verb == "status":
+        rep = ts.status()
+        print(rep.text, file=sys.stderr if rep.state == "warning" else sys.stdout)
+        return 1 if rep.state == "warning" else 0
+    from levain.consent.band import AGENT_ANSWER_REFUSAL, EXIT_REFUSED, agent_session_caller
+
+    if agent_session_caller():
+        print("levain band terminal-key: refused: run it from a fresh terminal, not inside an agent session "
+              f"({AGENT_ANSWER_REFUSAL})", file=sys.stderr)
+        return EXIT_REFUSED
+    rep = ts.create()
+    print(rep.text, file=sys.stdout if rep.created else sys.stderr)
+    return 0 if rep.created else EXIT_REFUSED
+
+
 def run_band_answer(args: argparse.Namespace) -> int:
     """``levain band answer "<line>"``: the same parser and path as the seat hook, channel ``cli`` and via ``cli``,
     bound to the view ``levain band`` last printed. Refused inside any agent session (Q1 (a)); the whole line must
@@ -2508,3 +2528,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                                   "rest of the settings file is left as it was."),
                        ("status", "Read the receipt and the live settings (and probe the recorded interpreter).")):
         hsub.add_parser(name, help=text).set_defaults(func=run_band_hooks, hooks_verb=name)
+    tk = sub.add_parser("terminal-key", help="The Touch ID key that signs band answers typed at the terminal: "
+                                             "create it once, or look at it.")
+    tsub = tk.add_subparsers(dest="tk_cmd", required=True)
+    for name, text in (("create", "Make the Secure Enclave key (Touch ID) and print the lines to commit."),
+                       ("status", "Read-only: is a terminal key enrolled, and is its identity biometric-protected.")):
+        tsub.add_parser(name, help=text).set_defaults(func=run_band_terminal_key, tk_verb=name)

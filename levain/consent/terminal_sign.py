@@ -42,7 +42,7 @@ from levain.trust_anchor import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_pr
 
 __all__ = ["AnswerClass", "Entry", "FAILED_REASONS", "KEY_LABEL", "MessageError", "NAMESPACE", "FORMAT",
            "ParsedMessage", "REASONS", "SCOPE_FIELDS", "SignOutcome", "StatusReport", "TerminalKey", "VerifyResult",
-           "answer_class", "build_message", "default_signer_factory", "event_time", "find_key", "fresh", "is_remote",
+           "answer_class", "build_message", "create", "default_signer_factory", "event_time", "find_key", "fresh", "is_remote",
            "parse_verified", "sign", "status", "target_id", "verify"]
 
 FORMAT = "levain-terminal-answer/1"
@@ -346,6 +346,49 @@ def status(key_dir: Path | None = None, *, sc_auth: Path | str = SC_AUTH, identi
     if ok is True:
         return StatusReport("enrolled", f"terminal key: enrolled ({fp}), {note}", key.public_key)
     return StatusReport("warning", f"WARNING: terminal key ({fp}): {note}", key.public_key)
+
+
+@dataclass(frozen=True)
+class CreateReport:
+    created: bool
+    text: str
+    public_key: str | None = None
+
+
+def signers_line(public_key: str, principal: str = "phill") -> str:
+    """The line flow's ``scripts/needs_phill_signers`` takes for this key (DESIGN section 3, step 2)."""
+    return f'{principal} namespaces="{NAMESPACE}" {" ".join(public_key.split()[:2])}'
+
+
+def create(key_dir: Path | None = None, *, creator: Callable[..., Any] | None = None) -> CreateReport:
+    """``terminal-key create``: one Secure Enclave key labelled :data:`KEY_LABEL` whose every signature needs Touch
+    ID, in the real levain home's key directory. Refuses (nothing created) when a terminal key is already enrolled.
+    ``creator`` is ``custody.create_touch_id``'s door and the only place a real key is made; tests inject theirs.
+    Never raises: a refusal or a failed creation is a report with ``created`` False."""
+    try:
+        if find_key(key_dir) is not None:
+            return CreateReport(False, "refused: a terminal key is already enrolled; `levain band terminal-key "
+                                       "status` shows it (nothing was created)")
+    except Exception as exc:  # noqa: BLE001 - a key directory that cannot be read is a refusal, never a creation
+        return CreateReport(False, f"refused: the key directory cannot be read: {_one_line(exc)} "
+                                   "(nothing was created)")
+    if creator is None:
+        from levain.cockpit.custody import create_touch_id as creator
+    d = Path(key_dir) if key_dir is not None else _real_key_dir()
+    try:
+        made = creator(d, KEY_LABEL)
+    except KeyError_ as exc:
+        return CreateReport(False, f"not created: {_one_line(exc)}")
+    except Exception as exc:  # noqa: BLE001 - as above
+        return CreateReport(False, f"not created: {type(exc).__name__}: {_one_line(exc)}")
+    line = signers_line(made.public_key)
+    return CreateReport(True, "\n".join((
+        f"terminal key created: {made.path}",
+        "1. Flow: commit this line to scripts/needs_phill_signers (a reviewed commit):",
+        f"   {line}",
+        "2. Levain (only for ruling compose and the desk click path):",
+        f"   levain cockpit enroll '{made.public_key}' --class laptop-presence --custody touch-id "
+        "--signing-key <a laptop-presence key>")), made.public_key)
 
 
 # ---------------------------------------------------------------------------------------------------
