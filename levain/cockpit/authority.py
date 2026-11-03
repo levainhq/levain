@@ -283,58 +283,81 @@ class CardRefused(ValueError):
 
 
 def open_bar_problem(grant: Mapping[str, Any]) -> str | None:
-    """Why this agent's link may not be signed because its revoke is open (A0 §6.10), or ``None``. A STUB: it is the
-    seam the open-bar check (P5c-2b) fills, and :func:`sign_card` consults it before anything is signed, so the check
-    has one place to land on this surface. Until then no bar is read and it answers ``None``."""
-    return None
+    """Why this agent's link may not be signed because its revoke is open (A0 §6.10), or ``None``. The seam the open-bar
+    check (P5c-2b) fills, consulted by :func:`sign_card` before anything is signed. Until that check exists no bar can
+    be read, so the seam REFUSES: a card that signed while it could not tell whether a bar was open would be a signing
+    path that fails open. P5c-2b replaces this body."""
+    return "the open-revoke-bar check is not built yet (P5c-2b), so this card cannot be signed"
 
 
 def _dollars(micros: int) -> str:
-    return f"${micros / 1_000_000:,.2f}"
+    """Exact: a micros count shown to its last digit, never rounded through a float (1_004_999 is $1.004999)."""
+    whole, frac = divmod(micros, 1_000_000)
+    return f"${whole:,}.{frac:06d}".rstrip("0").ljust(len(f"${whole:,}.00"), "0")
+
+
+def _micros(grant: Mapping[str, Any], key: str) -> int:
+    value = grant.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CardRefused(f"{key} is not a count of micros")
+    return value
 
 
 def agent_link_card(grant: Mapping[str, Any]) -> dict[str, Any]:
     """The signing card for an ``agent-link`` record: every field the signature will cover (``fields``, the record as
     it will be signed), the words around them (what fires, what it may spend, until when), the review date and the
-    upgrade-order line. Raises :class:`CardRefused` for a record that is not an agent link, and for one that acts
-    outward (``pushes`` or ``publishes`` non-empty, which is what DESIGN §4.1(d) calls confirm-class) without a
-    complete guard: a card is never offered for a link the log should not carry.
+    upgrade-order line. Raises :class:`CardRefused` for a record that is not an agent link, one with no ``expires_at``,
+    a malformed one (it never raises anything else), and one that acts outward (``pushes`` or ``publishes`` non-empty,
+    which is what DESIGN §4.1(d) calls confirm-class) without a complete guard: a card is never offered for a link the
+    log should not carry.
 
     The review date is ``expires_at`` and is shown only when the agent calls a model or acts outward (a derived flag,
     never stored)."""
+    try:
+        return _agent_link_card(grant)
+    except CardRefused:
+        raise
+    except (TypeError, AttributeError, ValueError, KeyError) as exc:
+        raise CardRefused(f"the link record is malformed: {type(exc).__name__}: {exc}") from exc
+
+
+def _agent_link_card(grant: Mapping[str, Any]) -> dict[str, Any]:
     from levain.authority import AGENT_LINK_KIND, _thaw
     from levain.autonomic.coverage import guard_problem
 
     if not isinstance(grant, Mapping) or grant.get("kind") != AGENT_LINK_KIND:
         raise CardRefused(f"only an {AGENT_LINK_KIND} has this card")
-    caps = grant.get("capabilities")
+    fields = json.loads(json.dumps(_thaw(dict(grant))))          # the snapshot: what the card shows is what is signed
+    caps = fields.get("capabilities")
     if not isinstance(caps, Mapping):
         raise CardRefused("the link carries no capabilities")
+    expires = fields.get("expires_at")
+    if not isinstance(expires, str) or not expires:
+        raise CardRefused("the link has no expires_at: the card shows the date it is signed until")
     acts_outward = bool(caps.get("pushes") or caps.get("publishes"))
     calls_model = bool(caps.get("model"))
     if acts_outward:
-        why = guard_problem(_thaw(grant.get("guard")))
+        why = guard_problem(_thaw(fields.get("guard")))
         if why is not None:
             raise CardRefused(f"this link acts outward, so it is signed with a complete guard: {why}")
-    expires = grant.get("expires_at")
-    billing = grant.get("billing", "api_key")
+    billing = fields.get("billing", "api_key")
     if billing == "subscription":
-        cost = (f"subscription billing: at most {grant.get('budget_run_calls')} calls and "
-                f"{grant.get('budget_run_tunnel_bytes')} tunnel bytes a run, no dollars")
+        cost = (f"subscription billing: at most {fields.get('budget_run_calls')} calls and "
+                f"{fields.get('budget_run_tunnel_bytes')} tunnel bytes a run, no dollars")
     else:
-        cost = (f"at most {_dollars(grant.get('budget_run_usd_micros', 0))} a run and "
-                f"{_dollars(grant.get('budget_window_usd_micros', 0))} a window")
+        cost = (f"at most {_dollars(_micros(fields, 'budget_run_usd_micros'))} a run and "
+                f"{_dollars(_micros(fields, 'budget_window_usd_micros'))} a window")
     where = "; ".join(f"{w.get('repo')} ({', '.join(w.get('paths', ()))})" for w in caps.get("where", ())) or "nowhere"
     effects = [name for name in ("lands", "pushes", "publishes") if caps.get(name)]
     review = (f"review by {expires}" if (calls_model or acts_outward) else None)
     return {
-        "fields": json.loads(json.dumps(_thaw(dict(grant)))),
-        "fires": (f"agent {grant.get('agent_id')} at spec {str(grant.get('spec_hash'))[:12]}, binding "
-                  f"{grant.get('binding_id')}: {caps.get('harness')}/{caps.get('model') or 'no model'}, working in "
+        "fields": fields,
+        "fires": (f"agent {fields.get('agent_id')} at spec {str(fields.get('spec_hash'))[:12]}, binding "
+                  f"{fields.get('binding_id')}: {caps.get('harness')}/{caps.get('model') or 'no model'}, working in "
                   f"{where}"),
         "outward": (f"acts outward: {', '.join(effects)}" if acts_outward else
                     ("changes the repo in place: lands" if caps.get("lands") else "acts on nothing outside its paths")),
-        "cost": f"{cost}; at most {grant.get('run_ceiling')} launches a window",
+        "cost": f"{cost}; at most {fields.get('run_ceiling')} launches a window",
         "until": f"expires {expires}",
         "review": review,
         "upgrade": UPGRADE_ORDER_LINE,
@@ -343,14 +366,16 @@ def agent_link_card(grant: Mapping[str, Any]) -> dict[str, Any]:
 
 def sign_card(data_root: Any, grant: Mapping[str, Any], **signing: Any) -> Any:
     """The cockpit's sign path for the card: the card's own refusals, the open-bar seam, then the one signing entry
-    (:func:`levain.agents.signing.sign_agent_link`). ``signing`` is that entry's keywords."""
+    (:func:`levain.agents.signing.sign_agent_link`). ``signing`` is that entry's keywords. What is signed is the card's
+    ``fields`` snapshot, taken once, so a later change to ``grant`` cannot reach the signature. No production caller
+    exists yet: ``levain agents sign`` signs through ``sign_agent_link`` directly and the cockpit does not offer the card."""
     from levain.agents.signing import sign_agent_link
 
-    agent_link_card(grant)                      # a link the card would refuse is not signed either
-    why = open_bar_problem(grant)
+    card = agent_link_card(grant)               # a link the card would refuse is not signed either
+    why = open_bar_problem(card["fields"])
     if why is not None:
         raise CardRefused(why)
-    return sign_agent_link(data_root, grant, **signing)
+    return sign_agent_link(data_root, card["fields"], **signing)
 
 
 # The outer boundary's authority for the reads it makes through ``Cockpit.read_one`` /

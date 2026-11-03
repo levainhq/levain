@@ -65,14 +65,19 @@ def _rows(world: World, tmp_path):
         q = queue("answer")
         req = q.file(agent="claude_code", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls"},
                      cwd="/tmp", hold=timedelta(hours=1))
-        with pytest.raises(AnswerRefused) as exc:
+        try:
             q.answer(req.id, {"decision": "allow", "signer_fp": "SHA256:x", "signed_at": "2026-01-01T00:00:00Z"}, "sig")
-        return "cannot be replayed" in str(exc.value)
+        except AnswerRefused as exc:
+            return "cannot be replayed" in str(exc)
+        return False
 
     def raises(exc_type, fn):
-        with pytest.raises(exc_type):
+        """True when the reader refused (``exc_type``), False when it did not: a probe the control run can fail."""
+        try:
             fn()
-        return True
+        except exc_type:
+            return True
+        return False
 
     def view():
         conn = sqlite3.connect(f"{world.db.resolve().as_uri()}?mode=ro", uri=True, isolation_level=None)
@@ -92,12 +97,9 @@ def _rows(world: World, tmp_path):
     return {
         "consent queue: _fresh_authority": lambda: queue("fresh")._fresh_authority() is None,
         "consent queue: answer": answer,
-        "consent queue: answer_by_grant": lambda: queue("grant").answer_by_grant("x", tool_input={}, posture="p") is None,
-        "consent queue: take_ruled_allow":
-            lambda: queue("take").take_ruled_allow("claude_code", "s", "Bash", {}, cwd="/tmp") is None,
-        "consent queue: _claim": lambda: queue("claim")._claim("claude_code", "s", step=None) == [],
-        "qbroker grants (via the queue's grant decision)":
-            lambda: queue("qb").answer_by_grant("x", tool_input={}, posture="p") is None,
+        # answer_by_grant, take_ruled_allow, _claim and the qbroker grant read were audited by reading (each goes through
+        # _fresh_authority, probed above) and have NO row: on an empty queue they answer None / [] with or without the
+        # narrowing (the control in the test below measured answer_by_grant doing so), so a row could not fail.
         "chat egress key liveness": lambda: raises(LivenessUnreadable,
                                                    lambda: AuthorityLiveness(source(), clock=clock).check("gp-x", "i")),
         "chat egress key setup (signing authority)": lambda: raises(
@@ -112,9 +114,10 @@ def test_every_audited_older_reader_fails_closed_on_a_v4_head(world, tmp_path, m
     first = _sign(world, link(world, 1))
     assert world.record(first.seq)["format"] == auth.FORMAT_V4
     rows = _rows(world, tmp_path)
-    # the probe can fail: the newer replay reads the same V4 head, so an unnarrowed reader is not closed
-    live = rows["consent queue: _fresh_authority"]
-    assert live() is False
+    # the control: the newer replay reads the same V4 head, so with no narrowing NO probe reports closed. A row that
+    # answers True here cannot tell the worlds apart and proves nothing.
+    control = {name: probe() for name, probe in rows.items()}
+    assert not any(control.values()), control
     # the older replay: the three formats it knew
     monkeypatch.setattr(auth, "_KNOWN_FORMATS", (auth.FORMAT, auth.FORMAT_V2, auth.FORMAT_V3))
     # an older process has never verified this chain: this one has (signing it), and its cache would answer for it
@@ -143,7 +146,7 @@ def test_the_card_shows_every_signed_field_the_review_date_and_the_upgrade_order
         agent_link_card({"kind": "graduation"})
 
 
-def test_a_confirm_class_link_with_no_guard_is_refused(world):
+def test_a_confirm_class_link_with_no_guard_is_refused(world, monkeypatch):
     unguarded = link(world, 1, capabilities=OUTWARD, guard=[])
     with pytest.raises(CardRefused, match="complete guard"):
         agent_link_card(unguarded)
@@ -152,21 +155,50 @@ def test_a_confirm_class_link_with_no_guard_is_refused(world):
     with pytest.raises(CardRefused):
         sign_card(world.root, unguarded, signer_fp=fp, sign=sign, clock=world.clock)
     assert world.state().seq == before                           # nothing was signed
-    # a complete guard passes the card and the signing path
+    # a complete guard passes the card; the signing path needs the open-bar seam to answer (P5c-2b fills it)
+    monkeypatch.setattr(card_mod, "open_bar_problem", lambda g: None)
     guarded = link(world, 1, capabilities=OUTWARD, guard=[dict(e) for e in TEST_GUARD])
     assert agent_link_card(guarded)["fields"]["guard"]
     assert auth.agent_links(sign_card(world.root, guarded, signer_fp=fp, sign=sign, clock=world.clock),
                             guarded["agent_id"], guarded["store_id"]) == [guarded["id"]]
 
 
-def test_the_card_refuses_to_sign_on_an_open_bar_through_the_seam(world, monkeypatch):
-    """P5c-2b fills ``open_bar_problem``; until then it is a stub that answers None. The seam is what is asserted:
-    the card's sign path consults it before anything is signed, and a reason it gives stops the signing."""
+def test_the_open_bar_seam_refuses_until_the_check_exists_and_a_reason_stops_the_signing(world, monkeypatch):
     fp, sign = world.keys["laptop"]
     grant = link(world, 1)
-    assert card_mod.open_bar_problem(grant) is None               # the stub: no bar is read yet
-    monkeypatch.setattr(card_mod, "open_bar_problem", lambda g: "a revoke is open for this agent: finish or abandon it")
     before = world.state().seq
+    # the shipped seam cannot read a bar, so it refuses: the card never signs open
+    assert "not built yet" in card_mod.open_bar_problem(grant)
+    with pytest.raises(CardRefused, match="not built yet"):
+        sign_card(world.root, grant, signer_fp=fp, sign=sign, clock=world.clock)
+    monkeypatch.setattr(card_mod, "open_bar_problem", lambda g: "a revoke is open for this agent: finish or abandon it")
     with pytest.raises(CardRefused, match="a revoke is open"):
         sign_card(world.root, grant, signer_fp=fp, sign=sign, clock=world.clock)
     assert world.state().seq == before
+
+
+def test_what_is_signed_is_the_snapshot_the_card_rendered(world, monkeypatch):
+    fp, sign = world.keys["laptop"]
+    grant = link(world, 1)
+    shown = agent_link_card(grant)["fields"]
+    # the seam runs between the card and the signing: a mutation there must not reach the signature
+    monkeypatch.setattr(card_mod, "open_bar_problem", lambda g: grant.update(run_ceiling=999) or None)
+    snap = sign_card(world.root, grant, signer_fp=fp, sign=sign, clock=world.clock)
+    assert grant["run_ceiling"] == 999 and shown["run_ceiling"] != 999
+    assert snap.policy.grants[grant["id"]]["run_ceiling"] == shown["run_ceiling"]
+
+
+def test_a_malformed_record_is_a_card_refusal_never_another_exception(world):
+    good = link(world, 1)
+    for bad in ({**good, "capabilities": {**good["capabilities"], "where": [3]}},
+                {**good, "capabilities": {**good["capabilities"], "where": 7}},
+                {**good, "budget_run_usd_micros": "1"}, {**good, "budget_window_usd_micros": -1},
+                {**good, "budget_run_usd_micros": True}, {**good, "guard": object(), "capabilities": OUTWARD},
+                {**good, "expires_at": None}, {k: v for k, v in good.items() if k != "expires_at"}, []):
+        with pytest.raises(CardRefused):
+            agent_link_card(bad)
+
+
+def test_dollars_are_exact_micros_never_rounded_through_a_float():
+    assert card_mod._dollars(1_004_999) == "$1.004999" and card_mod._dollars(1_000_000) == "$1.00"
+    assert card_mod._dollars(500_000) == "$0.50" and card_mod._dollars(0) == "$0.00"
