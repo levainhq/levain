@@ -655,7 +655,6 @@
   const PR_DURS = ["15m", "1h", "2h"];
   const PR_DEVICES = [["on", "On"], ["follow", "Follow"], ["off", "Off"]];
   const PR_AFTER = [5, 10, 15, 30, 60];                  // minutes of no input before follow turns devices on
-  const PR_LETS = [["everything", "Everything"], ["needs", "Approvals and needs"], ["approvals", "Approvals only"], ["nothing", "Nothing"]];
   const PR_UNTILS = [["switch", "I switch it"], ["for", "For…"], ["input", "Until I say or type"]];
   // the tap-token form names the words the server knows: the presets, and the two aliases (desk = follow, devices = on)
   const PR_TAP_WORDS = [["back", "Back"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"],
@@ -693,7 +692,29 @@
       out[v] = b; seg.appendChild(b);
     }
     host.appendChild(seg);
+    Object.defineProperty(out, "_seg", { value: seg });
     return out;
+  }
+  // the lets-through buttons carry the server's words (view.lets: value, label, describe); the page keeps no copy of them
+  function paintLets(btns, lets, onTap) {
+    const list = Array.isArray(lets) ? lets : [];
+    const keep = new Set(list.map((o) => String(o.value)));
+    // a level the server no longer offers leaves the page, so a stale button cannot post a value the server refuses
+    for (const k of Object.keys(btns)) {
+      if (!keep.has(k)) { btns[k].remove(); delete btns[k]; }
+    }
+    for (const o of list) {
+      let b = btns[o.value];
+      if (!b) {
+        b = el("button", "pr-big", "");
+        b.type = "button"; b.dataset.value = String(o.value);
+        // made while a write is in flight, it starts as disabled as its neighbours (prDisable only reaches buttons that exist)
+        b.disabled = prBusy;
+        b.addEventListener("click", () => onTap(o.value));
+        btns[o.value] = b; btns._seg.appendChild(b);
+      }
+      b.textContent = o.label; b.title = o.describe;
+    }
   }
   function labelled(host, text) { host.appendChild(el("div", "pr-sheet-lab", text)); }
   function pressed(btns, cur) { for (const [k, b] of Object.entries(btns)) b.setAttribute("aria-pressed", String(k) === String(cur) ? "true" : "false"); }
@@ -781,7 +802,7 @@
     prAfterCustom = minutesField(prSheet, "Minutes without input before devices come on", (n) => { prAfterOpen = false; setSetting({ follow_after: n * 60 }); });
 
     labelled(prSheet, "Lets through");
-    prLetsBtns = segment(prSheet, PR_LETS, "What reaches your devices", (v) => setSetting({ lets_through: v }));
+    prLetsBtns = segment(prSheet, [], "What reaches your devices", (v) => setSetting({ lets_through: v }));
 
     labelled(prSheet, "Until");
     prUntilBtns = segment(prSheet, PR_UNTILS, "How long the next setting you tap lasts", (v) => {
@@ -894,7 +915,7 @@
     stAfterCustom = minutesField(body, "Standing default: custom minutes", (n) => setStanding({ follow_after: n * 60 }));
     stAfterCustom.hidden = false;
     labelled(body, "Lets through");
-    stLetsBtns = segment(body, PR_LETS, "Standing default: what reaches your devices", (v) => setStanding({ lets_through: v }));
+    stLetsBtns = segment(body, [], "Standing default: what reaches your devices", (v) => setStanding({ lets_through: v }));
     stNote = el("p", "dev-note"); stNote.hidden = true;
     stNote.setAttribute("role", "status");
     body.appendChild(stNote);
@@ -1006,6 +1027,8 @@
     prAfterRow.hidden = eff.devices !== "follow";
     if (eff.devices !== "follow") prAfterOpen = false;
     paintAfter(prAfterBtns, prAfterCustom, eff.follow_after, prAfterOpen && eff.devices === "follow");
+    paintLets(prLetsBtns, v.lets, (x) => setSetting({ lets_through: x }));
+    paintLets(stLetsBtns, v.lets, (x) => setStanding({ lets_through: x }));
     pressed(prLetsBtns, eff.lets_through);
     pressed(prUntilBtns, prUntil);
     prForRow.hidden = prUntil !== "for";

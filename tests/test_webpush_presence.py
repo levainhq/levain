@@ -685,7 +685,7 @@ def test_cli_words_write_the_record_and_status_prints_the_one_line(tmp_path, cap
     monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: ACTIVE)
     assert _cli(tmp_path, "quiet", "20m") == 0
     assert presence.read_word(tmp_path)["word"] == "quiet"
-    assert "your devices, Approvals and needs (quiet)" in capsys.readouterr().out
+    assert f"your devices, {intent.lets_label('needs')} (quiet)" in capsys.readouterr().out
     assert _cli(tmp_path, "loud", "5") == 0
     assert "your devices (loud)" in capsys.readouterr().out
     assert _cli(tmp_path, "loud", "off") == 0
