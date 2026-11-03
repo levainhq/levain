@@ -205,14 +205,15 @@ def claude_listing(meta: Mapping[str, Any]) -> dict[str, dict[str, Any]] | None:
     return out
 
 
-def process_identity(pid: Any) -> tuple[str, str] | None:
+def process_identity(pid: Any, *, timeout: float = 5.0) -> tuple[str, str] | None:
     """The OS's start time and command line of process ``pid`` (``ps -o lstart= -o args=``), or ``None`` when none
-    can be read. The start time tells a pid's process from a later one that reused the pid."""
-    if type(pid) is not int or pid < 1:
+    can be read (``ps`` not done within ``timeout`` seconds included; a ``timeout`` <= 0 starts no ``ps``). The start
+    time tells a pid's process from a later one that reused the pid."""
+    if type(pid) is not int or pid < 1 or not timeout > 0:
         return None
     try:
         got = subprocess.run(["ps", "-ww", "-o", "lstart=", "-o", "args=", "-p", str(pid)], capture_output=True,
-                             text=True, timeout=5, stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin",
+                             text=True, timeout=timeout, stdin=subprocess.DEVNULL, env={"PATH": "/bin:/usr/bin",
                                                                                   "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         return None

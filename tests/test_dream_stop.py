@@ -57,6 +57,16 @@ FIRE = textwrap.dedent('''
         import signal
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         time.sleep(300)
+    if mode == "entering-save":
+        # the composing -> saving step with SIGTERM landing inside it: Progress.update sets its data before it writes
+        # the file, so the handler already reads "saving" while progress.json still says "composing"
+        with ex.fire_stop_handler(prog) as requested:
+            prog.data["phase"] = "saving"
+            while not requested:
+                time.sleep(0.01)
+            prog.update(phase="saving")
+            (occ / "saving").write_text("1")
+            time.sleep(300)                                  # the save, under its own reserve
     try:
         with ex.fire_stop_handler(prog):
             try:
@@ -67,6 +77,32 @@ FIRE = textwrap.dedent('''
     except ex.FireStopRequested:
         pass
     (occ / "fire-exit").write_text("clean")
+''')
+
+#: A fire that runs the REAL ClaudeMind.compose and is SIGKILLed the instant Popen returns: the spawn-to-journal window.
+COMPOSE_FIRE = textwrap.dedent('''
+    import json, os, signal, subprocess, sys
+    from pathlib import Path
+    from levain.consent.delivery import process_identity
+    from levain.dream import executor as ex
+
+    store_dir, occ_dir, occ_id, fake_claude = sys.argv[1:5]
+    occ = Path(occ_dir)
+    me = process_identity(os.getpid())
+    rec = Path(store_dir) / "fires" / (occ_id + ".json")
+    rec.write_text(json.dumps({"occurrence_id": occ_id, "pid": os.getpid(), "started": me[0], "args": me[1]}))
+    prog = ex.Progress(occ)
+    prog.update(phase="composing")
+    real = subprocess.Popen
+
+    def popen_then_die(*a, **k):
+        p = real(*a, **k)
+        (occ / "child.pid").write_text(str(p.pid))
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    subprocess.Popen = popen_then_die
+    ex.ClaudeMind("m", claude_bin=fake_claude).compose(ex.ComposeRequest(
+        package_text="p", instructions="i", occ_dir=occ, cap_usd_micros=1_000_000, timeout_s=60, progress=prog))
 ''')
 
 _spawned: list[subprocess.Popen] = []
@@ -327,8 +363,8 @@ def test_zombie_only_group_is_not_confirmed(world):
                               start_new_session=True)
     _spawned.append(leader)
     ident = process_identity(leader.pid)
-    (occ / "progress.json").write_text(json.dumps({"phase": "composing", "child_pid": leader.pid,
-                                                   "child_started_at": ident[0],
+    (occ / "progress.json").write_text(json.dumps({**dict.fromkeys(ex.PROGRESS_KEYS), "phase": "composing",
+                                                   "child_pid": leader.pid, "child_started_at": ident[0],
                                                    "child_argv": [sys.executable, "-c", "import time; time.sleep(300)",
                                                                   "--add-dir", str(occ)]}))
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -365,12 +401,81 @@ def test_a_fire_that_ignores_sigterm_is_killed_at_half_the_deadline(world):
     child = prog["child_pid"]
     t = time.monotonic()
     res = executor(world).stop(4)
-    assert time.monotonic() - t < 8
+    assert time.monotonic() - t < 4 + 0.5                    # the deadline, plus one poll and one return
     assert not alive(fire.pid)
     assert "SIGKILL to fire" in res.detail
     # the child was orphaned by the SIGKILL; stop() then ended it through the identity-checked path in the same call
     assert res.terminated is True, res.detail
     assert group_gone(child) is True
+
+
+def test_a_fire_that_enters_saving_after_the_sigterm_is_never_sigkilled(world):
+    """r1 (three lineages): stop() read "composing", the SIGTERM landed as the fire entered saving (its handler deferred),
+    and the SIGKILL at deadline/2 killed the save. progress.json is re-read before every escalation."""
+    fire, prog = start_fire(world, mode="entering-save")
+    res = executor(world).stop(2)
+    assert (world[1] / "saving").exists()                    # the SIGTERM landed and the fire went on into its save
+    assert alive(fire.pid), res.detail                       # and the save was not killed
+    assert res.terminated is False
+    assert "SIGTERM to fire" in res.detail and "SIGKILL to fire" not in res.detail
+    assert "phase 'saving' on the re-read before SIGKILL: no SIGKILL" in res.detail
+
+
+def test_a_fire_killed_between_spawn_and_journal_is_not_read_as_childless(world, tmp_path):
+    """r1 codex HIGH 1: the real ClaudeMind.compose, its fire SIGKILLed the instant Popen returned. progress.json must
+    not read as "no child" while the spawned child runs."""
+    store, occ, _, _ = world
+    fake = tmp_path / "fake-claude"
+    fake.write_text("#!/bin/sh\nsleep 300\n")
+    fake.chmod(0o755)
+    script = tmp_path / "compose_fire.py"
+    script.write_text(COMPOSE_FIRE)
+    p = subprocess.Popen([sys.executable, str(script), str(store), str(occ), OCC_ID, str(fake)],
+                         env=dict(os.environ, PYTHONPATH=str(REPO)), cwd=REPO, start_new_session=True)
+    _spawned.append(p)
+    assert p.wait(timeout=20) == -signal.SIGKILL
+    child = int((occ / "child.pid").read_text())
+    _groups.append(child)
+    assert alive(child)
+    res = executor(world).stop(1)
+    assert res.terminated is False, res.detail
+    assert alive(child)                                      # unidentified: nothing signalled it
+    assert "compose child group ended: False" in res.detail and "starting" in res.detail
+
+
+def test_stop_honours_its_deadline_when_ps_stalls(world):
+    """r1 codex MED 3: every identity probe's ps is capped to the time left, so a stalled ps cannot carry stop() past
+    deadline_s. The stall is a real process (sleep) standing in for ps."""
+    fire, prog = start_fire(world)
+    from levain.consent import delivery
+    real_run = subprocess.run
+
+    def stalled(args, **kw):
+        return real_run(["/bin/sleep", "3"], **kw) if args and args[0] == "ps" else real_run(args, **kw)
+
+    t = time.monotonic()
+    with mock.patch.object(delivery.subprocess, "run", side_effect=stalled):
+        res = executor(world).stop(0.5)
+    assert time.monotonic() - t < 0.5 + 0.5, res.detail
+    assert res.terminated is False
+    assert alive(fire.pid) and alive(prog["child_pid"])      # unreadable identity: no signal
+
+
+@pytest.mark.parametrize("edit", [{"phase": "savng"}, "drop-phase", "drop-child_pid"])
+def test_a_progress_record_off_the_schema_is_unreadable_and_gets_no_signal(world, edit):
+    """r1 codex MED 4: an unknown phase or a missing key is not "pre-save"."""
+    fire, prog = start_fire(world)
+    p = world[1] / "progress.json"
+    doc = json.loads(p.read_text())
+    if isinstance(edit, dict):
+        doc.update(edit)
+    else:
+        del doc[edit.split("-", 1)[1]]
+    p.write_text(json.dumps(doc))
+    res = executor(world).stop(1)
+    assert res.terminated is False
+    assert alive(fire.pid) and alive(prog["child_pid"])
+    assert "cannot be read" in res.detail and "SIGTERM" not in res.detail
 
 
 def test_signal_sites_are_the_ones_the_spec_allows():
@@ -397,3 +502,17 @@ def test_the_handler_does_not_unwind_a_save():
     with ex.fire_stop_handler(prog), pytest.raises(ex.FireStopRequested):
         os.kill(os.getpid(), signal.SIGTERM)
         time.sleep(1)
+
+
+def test_the_handler_raises_once_so_a_second_stop_cannot_abort_the_unwind():
+    """r1 complement MED 2: a second SIGTERM (stop() is called again next tick) while the fire unwinds through
+    end_child must not raise inside it and abandon the child's kill and reap."""
+    prog = ex.Progress(None)
+    prog.update(phase="composing")
+    with ex.fire_stop_handler(prog) as requested:
+        with pytest.raises(ex.FireStopRequested):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(1)
+        os.kill(os.getpid(), signal.SIGTERM)                 # the unwind is under way: recorded, not raised
+        time.sleep(0.05)
+        assert requested == [True, True]

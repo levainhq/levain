@@ -412,9 +412,9 @@ class ClaudeMind:
     """The ``claude -p`` mind (§2.3): flow's argv, started as an unreaped ``Popen`` that leads its own process group.
 
     The fire holds the handle (a ``confinement._Leader``, which reads the exit WITHOUT reaping) until it has seen the
-    group gone, and signals the child only through it. ``progress.json`` gets ``child_pid``, ``child_started_at`` (the
-    ``ps`` start time, as ``levain.consent.delivery.process_identity`` reads it) and ``child_argv`` as soon as the child
-    is started, and the child keys are cleared once the child is reaped. A model id with no price row has no cap, and
+    group gone, and signals the child only through it. ``progress.json`` gets ``child_argv`` before the spawn, then
+    ``child_pid`` and ``child_started_at`` (the ``ps`` start time, as ``levain.consent.delivery.process_identity`` reads
+    it) as soon as the child is started, and the child keys are cleared once the child is reaped. A model id with no price row has no cap, and
     this mind REFUSES to compose without one."""
 
     name = "claude"
@@ -465,6 +465,13 @@ class ClaudeMind:
         package_path = occ / "package.md"
         package_path.write_text(req.package_text, encoding="utf-8")
         argv = self.argv(occ, req.cap_usd_micros)
+        # Journalled BEFORE the spawn: a fire that dies between Popen and the child_pid write must leave "a child may
+        # be starting" (child_argv set, child_pid null), never a record stop() reads as "no child".
+        if req.progress is not None and not req.progress.update(child_argv=argv):
+            return ComposeResult(model=self.model, unit=self.unit,
+                                 error=("progress.json could not record the compose child's start "
+                                        f"({req.progress.write_error or 'not written'}); no child was started"),
+                                 fatal_outcome="failed")
         stderr_path = occ / f"claude-{req.attempt}.stderr"
         started = time.monotonic()
         with open(stderr_path, "wb") as err:
@@ -473,6 +480,8 @@ class ClaudeMind:
                 proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
                                         start_new_session=True, env=self.env, cwd=str(occ))
             except OSError as exc:
+                if req.progress is not None:
+                    req.progress.update(child_argv=None)   # no child exists; a failed clear keeps it (fail-closed)
                 raise ComposeUnavailable(f"cannot start {self.claude_bin!r}: {type(exc).__name__}: {exc}") from exc
         leader: Any = None
         chunks: list[bytes] = []
@@ -1435,7 +1444,7 @@ def exposure_refusal(model: str, facts_path: Path | str | None, *, table: Mappin
         return f"no price row for {model!r}: M is unknown, so the executor has no stated exposure"
     if limit_usd_micros - m < min_compose_usd_micros:
         return (f"R - M is {limit_usd_micros - m} micro-dollars, below the cheapest compose "
-                f"({min_compose_usd_micros}): the signing card proposes R = M + $14")
+                f"({min_compose_usd_micros}): R must be at least M + {min_compose_usd_micros}")
     if facts_path is None:
         return "the first-run facts file is not named"
     try:
@@ -1468,14 +1477,18 @@ def fire_stop_handler(progress: Progress):
     """The fire's SIGTERM handler (§2.6, "Inside the fire"). Before the save (``progress`` phase not ``saving``/``saved``)
     SIGTERM raises :class:`FireStopRequested`, which unwinds through ``compose``'s ``finally`` (``end_child``: SIGTERM,
     SIGKILL after a grace, reap, through the unreaped handle) and ``consolidate_store``'s cancel-by-token. From
-    ``saving`` on it only records the request: the save runs under its own reserve and is not killed. Main thread only
-    (``signal.signal`` raises ``ValueError`` elsewhere); the previous handler is restored on exit."""
+    ``saving`` on it only records the request: the save runs under its own reserve and is not killed. It raises once:
+    a later SIGTERM (``stop()`` again, next tick) arriving during the unwind is only recorded, so it cannot abort
+    ``end_child``'s kill and reap. Main thread only (``signal.signal`` raises ``ValueError`` elsewhere); the previous
+    handler is restored on exit."""
     requested: list[bool] = []
+    raised: list[bool] = []
 
     def _handler(signum: int, frame: Any) -> None:
         requested.append(True)
-        if progress.data.get("phase") in ("saving", "saved"):
+        if raised or progress.data.get("phase") in ("saving", "saved"):
             return
+        raised.append(True)
         raise FireStopRequested(f"signal {signum}")
 
     previous = signal.signal(signal.SIGTERM, _handler)
@@ -1544,12 +1557,13 @@ class DreamExecutor:
             and isinstance(doc.get("started"), str) and isinstance(doc.get("args"), str)
         return (doc, "") if ok else (None, "the fire identity record is malformed")
 
-    def _fire_state(self, rec: dict[str, Any]) -> tuple[str, str]:
+    def _fire_state(self, rec: dict[str, Any], t_end: float) -> tuple[str, str]:
         """``matches`` (the recorded fire is alive), ``ended`` (no process there, a different one, or a zombie) or
-        ``unreadable`` (``ps`` fails while the pid answers a probe). Sends nothing."""
+        ``unreadable`` (``ps`` fails, or is not done by ``t_end``, while the pid answers a probe). Sends nothing."""
         from levain.consent.delivery import process_identity
         pid = rec["pid"]
-        ident = process_identity(pid)
+        left = min(5.0, t_end - time.monotonic())
+        ident = process_identity(pid, timeout=left) if left > 0 else None
         if ident is None:
             try:
                 os.kill(pid, 0)                      # a probe, never a signal
@@ -1557,7 +1571,8 @@ class DreamExecutor:
                 return "ended", f"fire pid {pid}: no such process"
             except OSError:
                 pass
-            return "unreadable", f"fire pid {pid}: the process table cannot be read"
+            return "unreadable", (f"fire pid {pid}: the process table cannot be read" if left > 0 else
+                                  f"fire pid {pid}: the deadline was reached before its identity could be read")
         if "<defunct>" in ident[1]:
             return "ended", f"fire pid {pid}: defunct"
         if _norm(rec["started"]) != _norm(ident[0]) or _norm(rec["args"]) != _norm(ident[1]) \
@@ -1566,75 +1581,104 @@ class DreamExecutor:
         return "matches", f"fire pid {pid}: alive, identity matches"
 
     def _progress(self) -> tuple[dict[str, Any] | None, str]:
-        """``(doc, why)``: doc None with why ``absent`` or ``unreadable``."""
+        """``(doc, why)``: doc None with why ``absent`` or ``unreadable``. A record off :class:`Progress`'s schema (a
+        key of :data:`PROGRESS_KEYS` missing, or a phase not in :data:`PHASES` and not null) is unreadable: it cannot
+        show the save has not begun."""
         try:
             doc = json.loads((self.occ_dir / "progress.json").read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None, "absent"
         except (OSError, ValueError, UnicodeDecodeError):
             return None, "unreadable"
-        return (doc, "") if isinstance(doc, dict) else (None, "unreadable")
+        ok = isinstance(doc, dict) and all(k in doc for k in PROGRESS_KEYS) and (doc["phase"] is None or (
+            isinstance(doc["phase"], str) and doc["phase"] in PHASES))
+        return (doc, "") if ok else (None, "unreadable")
+
+    def _escalation_refused(self) -> str | None:
+        """Why no signal may go to the fire NOW, from ``progress.json`` re-read immediately before it, or None. The
+        fire's handler defers a SIGTERM from ``saving`` on; this keeps the escalation from killing that save."""
+        prog, pwhy = self._progress()
+        if pwhy == "unreadable":
+            return "progress.json cannot be read"
+        phase = None if prog is None else prog["phase"]
+        return f"phase {phase!r}" if phase in ("saving", "saved") else None
 
     def _stop(self, deadline_s: float) -> StopResult:
-        t_end = time.monotonic() + max(0.0, deadline_s)
-        half = max(0.0, deadline_s) / 2
+        deadline_s = max(0.0, deadline_s)
+        t_end = time.monotonic() + deadline_s
         notes: list[str] = []
         prog, pwhy = self._progress()
-        phase = None if prog is None else prog.get("phase")
+        phase = None if prog is None else prog["phase"]
         rec, rwhy = self._fire_record()
         signalling = pwhy != "unreadable" and phase not in ("saving", "saved")
         if pwhy == "unreadable":
-            notes.append("progress.json cannot be read: no signal, the phase is unknown")
+            notes.append("progress.json cannot be read (or is off its schema): no signal, the phase is unknown")
         elif not signalling:
             notes.append(f"phase {phase!r}: no signal, the save is not killed")
 
         fstate = "no-record"
         if rec is not None:
-            fstate, fnote = self._fire_state(rec)
+            fstate, fnote = self._fire_state(rec, t_end)
             notes.append(fnote)
             if signalling and fstate == "matches":
                 pid = rec["pid"]
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(pid, signal.SIGTERM)       # identity checked just above; the fire ends its own child
-                notes.append(f"SIGTERM to fire {pid}")
-                t_half = min(t_end, time.monotonic() + half)
-                while time.monotonic() < t_half and self._fire_state(rec)[0] == "matches":
-                    time.sleep(0.05)
-                fstate, fnote = self._fire_state(rec)  # re-check immediately before any SIGKILL
-                if fstate == "matches":
-                    with contextlib.suppress(ProcessLookupError, PermissionError):
-                        os.kill(pid, signal.SIGKILL)
-                    notes.append(f"SIGKILL to fire {pid} (still alive at deadline/2, identity re-checked)")
-                    while time.monotonic() < t_end and self._fire_state(rec)[0] == "matches":
+                refused = self._escalation_refused()
+                if refused is not None:
+                    signalling = False
+                    notes.append(f"{refused} on the re-read before SIGTERM: no signal, the save is not killed")
+                else:
+                    try:                                # identity checked just above; the fire ends its own child
+                        os.kill(pid, signal.SIGTERM)
+                        notes.append(f"SIGTERM to fire {pid}")
+                    except (ProcessLookupError, PermissionError) as exc:
+                        notes.append(f"SIGTERM to fire {pid} not delivered ({type(exc).__name__})")
+                    t_half = min(t_end, time.monotonic() + deadline_s / 2)
+                    while time.monotonic() < t_half and self._fire_state(rec, t_end)[0] == "matches":
                         time.sleep(0.05)
-                    fstate, fnote = self._fire_state(rec)
-                notes.append(fnote)
+                    fstate, fnote = self._fire_state(rec, t_end)   # identity re-checked immediately before SIGKILL
+                    refused = self._escalation_refused() if fstate == "matches" else None   # and the phase
+                    if refused is not None:
+                        signalling = False
+                        notes.append(f"{refused} on the re-read before SIGKILL: no SIGKILL, the save is not killed")
+                    elif fstate == "matches":
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                            notes.append(f"SIGKILL to fire {pid} (still alive at deadline/2, identity and phase "
+                                         "re-checked)")
+                        except (ProcessLookupError, PermissionError) as exc:
+                            notes.append(f"SIGKILL to fire {pid} not delivered ({type(exc).__name__})")
+                        while time.monotonic() < t_end and self._fire_state(rec, t_end)[0] == "matches":
+                            time.sleep(0.05)
+                        fstate, fnote = self._fire_state(rec, t_end)
+                    notes.append(fnote)
         else:
             notes.append(rwhy)
 
         if fstate == "ended" and pwhy != "unreadable":
             prog, pwhy = self._progress()          # the fire clears its child keys as it ends the child: read them AFTER
-        if signalling and fstate == "ended" and prog is not None and prog.get("child_pid") is not None:
+        if signalling and fstate == "ended" and prog is not None and prog["child_pid"] is not None \
+                and prog["phase"] not in ("saving", "saved"):
             from levain.dream import recover as _rc
             remaining = max(0.0, t_end - time.monotonic())
-            state, cnotes = _rc.end_orphan_child(prog, self.occ_dir, term_wait=remaining / 2, kill_wait=remaining / 2)
+            state, cnotes = _rc.end_orphan_child(prog, self.occ_dir, term_wait=remaining / 2,
+                                                 kill_wait=remaining / 2, deadline=t_end)
             notes.append(f"orphaned compose child: {state}" + (f" ({'; '.join(cnotes)})" if cnotes else ""))
 
         # the two-part end test; both must hold, and the detail names what each checked
         while True:
-            fire_ended, fire_detail = self._fire_ended(rec, rwhy)
+            fire_ended, fire_detail = self._fire_ended(rec, rwhy, t_end)
             child_ended, child_detail = self._child_group_ended(prog, pwhy)
             if (fire_ended and child_ended) or time.monotonic() >= t_end:
                 break
-            time.sleep(0.05)
+            time.sleep(min(0.05, max(0.0, t_end - time.monotonic())))
         done = fire_ended and child_ended
         return StopResult(done, "; ".join(notes + [f"fire ended: {fire_ended} ({fire_detail})",
                                                     f"compose child group ended: {child_ended} ({child_detail})"]))
 
-    def _fire_ended(self, rec: dict[str, Any] | None, why: str) -> tuple[bool, str]:
+    def _fire_ended(self, rec: dict[str, Any] | None, why: str, t_end: float) -> tuple[bool, str]:
         if rec is None:
             return False, why
-        state, note = self._fire_state(rec)
+        state, note = self._fire_state(rec, t_end)
         return state == "ended", note
 
     @staticmethod
@@ -1644,6 +1688,9 @@ class DreamExecutor:
                 (False, "progress.json cannot be read, so a child cannot be ruled out")
         pid = prog.get("child_pid")
         if pid is None:
+            if prog.get("child_argv") is not None or prog.get("child_started_at") is not None:
+                return False, ("a compose child may be starting: its argv is journalled with no child_pid, so a child "
+                               "cannot be ruled out")
             return True, "no child recorded (Ollama route, or no compose started)"
         if type(pid) is not int or pid < 1:
             return False, "the recorded child pid is malformed"
