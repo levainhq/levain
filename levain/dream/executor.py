@@ -333,6 +333,7 @@ class ComposeResult:
     output_tokens: int | None = None
     cache_read: int | None = None
     cache_creation: int | None = None
+    turns: int | None = None             # the child's num_turns (an Ollama compose is one call); None = unreadable
     models: list[str] = field(default_factory=list)   # the models that CHARGED, read back from the result json
     model: str | None = None
     seconds: float = 0.0
@@ -566,6 +567,7 @@ class ClaudeMind:
         out.output_tokens = _int_or_none(usage.get("output_tokens"))
         out.cache_read = _int_or_none(usage.get("cache_read_input_tokens"))
         out.cache_creation = _int_or_none(usage.get("cache_creation_input_tokens"))
+        out.turns = _int_or_none(doc.get("num_turns"))
         mu = doc.get("modelUsage")
         out.models = sorted(mu) if isinstance(mu, dict) else []
         stray = [m for m in out.models if m != self.model]
@@ -645,7 +647,7 @@ class OllamaMind:
         response = (self._client or self._default_client)(system, user)
         inp, outp = _response_usage(response)
         out = ComposeResult(model=self.model, seconds=time.monotonic() - started, unit=self.unit,
-                            input_tokens=inp, output_tokens=outp)
+                            input_tokens=inp, output_tokens=outp, turns=1)
         out.warnings.append(f"dollars unmapped for {self.model!r}: tokens are reported, never $0")
         out.text = _w._extract_neocortex(_w._completion_text(response))
         if not out.text.strip():
@@ -732,6 +734,7 @@ class _Ctx:
         self.mind = mind
         self.budget = budget
         self.composes: list[dict[str, Any]] = []
+        self.started = time.monotonic()          # the run's wall clock, for the subscription axis `seconds`
         self.spent = 0
         self.outcome: str | None = None
         self.instructions_sha256: str | None = None
@@ -755,6 +758,10 @@ def _write_usage(ctx: _Ctx) -> None:
         # A count that could not be read is None, never 0, on either route.
         "input_tokens": sum(c["input_tokens"] for c in ctx.composes) if tokens_readable else None,
         "output_tokens": sum(c["output_tokens"] for c in ctx.composes) if tokens_readable else None,
+        # the subscription route's axes (A0 §2.2): turns are the dream's actions; a count that could not be read is None
+        "turns": (sum(c["turns"] for c in ctx.composes)
+                  if all(c.get("turns") is not None for c in ctx.composes) else None),
+        "seconds": math.ceil(time.monotonic() - ctx.started),
         "readable": readable, "composes": ctx.composes, "outcome": ctx.outcome,
         "instructions_sha256": ctx.instructions_sha256,
         "source": getattr(ctx.mind, "source", "dream:unknown"),
@@ -769,7 +776,8 @@ def _write_usage(ctx: _Ctx) -> None:
 
 def _compose_row(n: int, res: ComposeResult) -> dict[str, Any]:
     return {"n": n, "usd_micros": res.usd_micros, "input_tokens": res.input_tokens, "output_tokens": res.output_tokens,
-            "cache_read": res.cache_read, "cache_creation": res.cache_creation, "seconds": round(res.seconds, 3),
+            "cache_read": res.cache_read, "cache_creation": res.cache_creation, "turns": res.turns,
+            "seconds": round(res.seconds, 3),
             "model": res.model, "models_charged": res.models, "error": res.error, "warnings": res.warnings}
 
 

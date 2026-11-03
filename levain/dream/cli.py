@@ -1,8 +1,8 @@
 """levain.dream.cli — ``levain dream`` (BUILD_PLAN r7 R-16; D1_EXECUTOR §11).
 
-D1-1a fills in ``run`` only: ``levain dream run --store-dir <copy> --mind claude|ollama`` consolidates a COPY of a store
-through :func:`levain.dream.executor.consolidate_store`. Bare ``levain dream`` still says it is not built (the schedule,
-``ready``, ``rollback`` and ``recover`` are D1-1b/c and D1-2's). ``run`` refuses the operator's live store
+D1-1a's ``run``: ``levain dream run --store-dir <copy> --mind claude|ollama`` consolidates a COPY of a store through
+:func:`levain.dream.executor.consolidate_store`. D1-1b added ``rollback``, ``recover`` and ``drill``; D1-1c added
+``ready`` (the day-ready predicate, read-only). The schedule is D1-2's. ``run`` refuses the operator's live store
 (``~/.anneal-memory``): it is for copies, and it is never pointed at that dir by default."""
 from __future__ import annotations
 
@@ -66,6 +66,22 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     rc.add_argument("--card-filed", action="store_true", help="The occurrence's card already exists.")
     rc.add_argument("--json", action="store_true")
     rc.set_defaults(func=run_dream_recover)
+    rd = sub.add_parser("ready", allow_abbrev=False, help="Is a dream due for this dream-day? (the day-ready predicate)",
+                        description="Run the six day-ready checks against a store COPY and print ready, quiet or "
+                                    "unreadable with every check recorded. Reads only; it consolidates nothing.")
+    rd.add_argument("--store-dir", required=True, help="A directory holding memory.db (or .levain/memory.db): a COPY.")
+    rd.add_argument("--agent-dir", default=None, help="The directory holding the agent store (autonomic.db) with the "
+                                                      "occurrence table; omitted means no occurrence history.")
+    rd.add_argument("--coord-dir", default=None, help="The coordinator queue directory (dispatch.db, awake.json); "
+                                                      "omitted means no launches and no work threads.")
+    rd.add_argument("--agent-id", default="dream")
+    rd.add_argument("--day", default=None, help="The dream-day YYYY-MM-DD (default: the one holding --now; with "
+                    "--manual, the one a run-now at --now would consolidate).")
+    rd.add_argument("--now", default=None, help="An aware ISO time standing in for the clock (default: now).")
+    rd.add_argument("--zone", default=None, help="An IANA zone (default: the TZ variable, else the host's zone file).")
+    rd.add_argument("--manual", action="store_true", help="Evaluate as a manual run (waives checks 5 and 6).")
+    rd.add_argument("--json", action="store_true")
+    rd.set_defaults(func=run_dream_ready)
     dr = sub.add_parser("drill", allow_abbrev=False, help="Prove the latest snapshot restores, on a scratch copy.",
                         description="Hash the latest snapshot, integrity-check its db backup, run the real rollback on a "
                                     "scratch copy of the store and open the result. Never touches the store itself.")
@@ -81,7 +97,7 @@ def _store_and_occurrence(p: argparse.ArgumentParser) -> None:
 
 
 def run_dream(args: argparse.Namespace) -> int:
-    print("levain dream: choose run, rollback, recover or drill (see `levain dream --help`)", file=sys.stderr)
+    print("levain dream: choose run, rollback, recover, ready or drill (see `levain dream --help`)", file=sys.stderr)
     return 1
 
 
@@ -282,3 +298,67 @@ def run_dream_drill(args: argparse.Namespace) -> int:
         for st in res.steps:
             print(f"  {st['name']:10s} {st['status']:8s} {st['detail']}")
     return 1 if res.outcome == "failed" else 0
+
+
+def _host_zone() -> str | None:
+    """An IANA zone name from ``TZ`` or the host's zone file, or None when neither names one."""
+    from zoneinfo import ZoneInfo
+
+    cands = [os.environ.get("TZ", "").lstrip(":")]
+    try:
+        link = os.path.realpath("/etc/localtime")
+        if "zoneinfo/" in link:
+            cands.append(link.split("zoneinfo/", 1)[1])
+    except OSError:
+        pass
+    for c in cands:
+        if c:
+            try:
+                ZoneInfo(c)
+                return c
+            except (KeyError, ValueError, OSError):
+                continue
+    return None
+
+
+def run_dream_ready(args: argparse.Namespace) -> int:
+    from datetime import date, datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    from levain.dream import ready as rd
+
+    store_path, err = _resolve_store(args.store_dir)
+    if store_path is None:
+        print(f"levain dream ready: {err}", file=sys.stderr)
+        return 2
+    zone = args.zone or _host_zone()
+    try:
+        if zone is None:
+            raise ValueError("no zone: pass --zone <IANA name> (the host's zone is not one this verb can name)")
+        ZoneInfo(zone)
+        now = datetime.fromisoformat(args.now) if args.now else datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("--now must carry a timezone offset")
+        if args.day:
+            day = date.fromisoformat(args.day)
+        else:
+            day = rd.manual_day_at(now, zone) if args.manual else rd.dream_day_at(now, zone)
+    except (ValueError, KeyError) as exc:
+        print(f"levain dream ready: {exc}", file=sys.stderr)
+        return 2
+    try:
+        src, close = rd.sources_for(store_path, agent_dir=args.agent_dir, coord_dir=args.coord_dir, now=now)
+    except Exception as exc:  # noqa: BLE001 — a store that will not open is unreadable, never ready
+        print(f"levain dream ready: the store could not be opened ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return 3
+    try:
+        v = rd.evaluate(src, day=day, now=now, zone=zone, agent_id=args.agent_id, manual=args.manual)
+    finally:
+        close()
+    if args.json:
+        print(json.dumps(v.as_dict(), sort_keys=True))
+    else:
+        print(f"levain dream ready: {v.verdict} for dream-day {v.day} ({v.reason})")
+        for c in v.checks:
+            print(f"  {c.n} {c.status:10s} {c.name}: {c.detail}")
+    return 0 if v.ready else (3 if v.verdict == rd.UNREADABLE else 1)
