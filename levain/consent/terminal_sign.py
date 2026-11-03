@@ -25,7 +25,6 @@ import re
 import secrets
 import stat
 import subprocess
-import threading
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -362,13 +361,13 @@ class SignOutcome:
     fingerprint: str | None = None
 
 
-SignerFactory = Callable[[Path], tuple[str, Signer]]
+SignerFactory = Callable[[Path, float], tuple[str, Signer]]    # (key path, the sign step's bound in seconds)
 
 
-def default_signer_factory(key_path: Path) -> tuple[str, Signer]:
-    """The one door to the real key: ``ssh_signer`` in :data:`NAMESPACE`. Calling the ``Signer`` it returns
-    raises the Touch ID prompt."""
-    return _keys.ssh_signer(key_path, namespace=NAMESPACE)
+def default_signer_factory(key_path: Path, timeout: float | None = None) -> tuple[str, Signer]:
+    """The one door to the real key: ``ssh_signer`` in :data:`NAMESPACE`, bounded by ``timeout`` seconds.
+    Calling the ``Signer`` it returns raises the Touch ID prompt."""
+    return _keys.ssh_signer(key_path, namespace=NAMESPACE, timeout=timeout)
 
 
 def is_remote(env: Mapping[str, str] | None = None, presence: str | None = None) -> bool:
@@ -376,9 +375,6 @@ def is_remote(env: Mapping[str, str] | None = None, presence: str | None = None)
     session. A false "local" costs a prompt nobody touches, which times out."""
     env = os.environ if env is None else env
     return bool(presence and "remote" in presence.lower()) or bool(env.get("SSH_CONNECTION") or env.get("SSH_TTY"))
-
-
-_bound_lock = threading.Lock()
 
 
 def _classify(exc: KeyError_) -> tuple[str, str]:
@@ -401,15 +397,9 @@ def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None
     unexpected failure is ``signer-error``). ``remote`` routes to ``unsigned/remote`` before any key is looked
     at, so no prompt reaches an unattended screen.
 
-    The bound (L3 r1, 2026-11-02): when this was written ``ssh_signer`` took no timeout argument, read the
-    module global ``keys._SIGN_TIMEOUT`` when its ``sign`` ran, and only that ``subprocess.run`` timeout could
-    end the ssh-keygen child (and with it the Touch ID sheet). So this narrows that global to ``bound_s`` for
-    the call and restores it after, under a lock that serialises terminal signs; a worker-thread bound was
-    rejected because it would leave the child, and the sheet, alive with nothing able to end it. The edge
-    that remains: in a process that also signs through ``keys.ssh_signer`` on another thread (an authority or
-    cockpit signer, not a terminal sign), a signature that starts while a terminal sign is in progress runs
-    with this bound instead of its own. A ``timeout`` argument on ``ssh_signer`` removes both the global write
-    and this edge."""
+    ``bound_s`` goes to the signer factory, which hands it to the signer as its own per-call timeout, so one
+    ``subprocess.run`` timeout ends the ssh-keygen child (and with it the Touch ID sheet) and no process-wide
+    value is touched."""
     if remote:
         return SignOutcome("unsigned", "remote", "the desk is remote")
     if not isinstance(message, (bytes, bytearray)) or len(message) > MAX_BYTES:
@@ -420,14 +410,8 @@ def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None
         if key is None:
             return SignOutcome("unsigned", "no-key", "no terminal key with a touch-id sidecar")
         factory = signer_factory or default_signer_factory
-        fp, signer = factory(key.path)
-        with _bound_lock:
-            old = _keys._SIGN_TIMEOUT
-            _keys._SIGN_TIMEOUT = min(old, bound_s)
-            try:
-                signature = signer(bytes(message))
-            finally:
-                _keys._SIGN_TIMEOUT = old
+        fp, signer = factory(key.path, bound_s)
+        signature = signer(bytes(message))
     except KeyError_ as exc:
         reason, detail = _classify(exc)
         return SignOutcome("unsigned", reason, detail)

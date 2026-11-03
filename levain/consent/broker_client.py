@@ -66,12 +66,13 @@ from typing import Any
 from levain.cockpit.consent import utc_stamp
 from levain.consent.record import ExternalGateRequest, redact_display, tool_input_digest
 from levain.qbroker import wire
+from levain.qbroker.broker import RUN_CALLS_KIND, RUN_DEADLINE_KIND
 
 __all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GATE_BACKOFF", "GATE_TOOL_USE_ID_MAX", "GO",
            "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY", "SLOW_POLL", "SOCKET_ENV",
            "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid",
            "file_and_hold", "GATE_FAILED", "GATE_GO", "GATE_HALTED", "GATE_OVER", "SLOT_HALT_TEXT",
-           "SLOT_LIMITS_FAILED_TEXT", "SLOT_OVER_TEXT", "file_ungated", "gate_check", "gate_request",
+           "SLOT_LIMITS_FAILED_TEXT", "SLOT_OVER_TEXT", "SLOT_RUN_CALLS_TEXT", "SLOT_RUN_DEADLINE_TEXT", "file_ungated", "gate_check", "gate_request",
            "grant_member", "hold_for_decision", "in_slot"]
 
 SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"
@@ -285,6 +286,18 @@ SLOT_LIMITS_FAILED_TEXT = ("levain: the limits gate could not run, so the action
                            "database (requests/limits/limits.db under the queue); do not retry this call and do not "
                            "achieve it another way.")
 
+# the two run-cap kinds of an over-limit GATE (P7-A3): a run's own caps, not the session limits above; the run ENDS
+# there, so the words say what happened and how another run starts (the cap is a fact of the run's ticket, and the
+# slot has no verb that raises it in place)
+SLOT_RUN_CALLS_TEXT = ("levain: STOPPED: this run reached its tool-call cap. This is not a fault and not a denial of "
+                       "the work. The run is over: do not try to continue it another way. Write a short summary of "
+                       "what is done and end your turn. The operator starts another run, with a ticket that carries a "
+                       "higher tool-call cap if more is needed.")
+SLOT_RUN_DEADLINE_TEXT = ("levain: STOPPED: this run reached its time limit. This is not a fault and not a denial of "
+                          "the work. The run is over: do not try to continue it another way. Write a short summary "
+                          "of what is done and end your turn. The operator starts another run, with a ticket that "
+                          "carries a later deadline if more time is needed.")
+
 
 def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
                sleep: Callable[[float], None] = time.sleep) -> str | None:
@@ -309,6 +322,10 @@ def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: 
         return SLOT_HALT_TEXT.format(r=detail)
     if verdict == GATE_FAILED:
         return SLOT_LIMITS_FAILED_TEXT.format(why=detail)
+    if detail == RUN_CALLS_KIND:
+        return SLOT_RUN_CALLS_TEXT
+    if detail == RUN_DEADLINE_KIND:
+        return SLOT_RUN_DEADLINE_TEXT
     label = limits.LABELS.get(detail) if isinstance(detail, str) else None
     # an unknown or missing kind names no budget it cannot name (L3 r2 complement LOW 1: "reached its a limit")
     return SLOT_OVER_TEXT.format(limit=f"its {label} limit" if label else "a configured limit")

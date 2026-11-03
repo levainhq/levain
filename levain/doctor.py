@@ -5903,6 +5903,40 @@ def _check_codex_gate_trust(install: Path, hooks_path: Path, codex_home: Path) -
                         "enabled, levain's hash)")]
 
 
+def _check_codex_prompt_timeout(entries: list[dict], hooks_path: Path, install: Path) -> list[CheckResult]:
+    """A failing row when a UserPromptSubmit handler that runs THIS install's ``user_prompt_submit.py`` has a timeout
+    shorter than a signing turn can take (the test the user-level band hooks apply,
+    :func:`levain.band_hook._short_timeout`); no row otherwise. Handlers naming any other script are not levain's to
+    fix and are ignored, wherever they sit among the entries."""
+    from levain.band_hook import PROMPT_HOOK_TIMEOUT_S, _short_timeout
+
+    expected = (install / "activation" / "hooks" / "user_prompt_submit.py").resolve()
+    if not isinstance(entries, list):
+        return []
+    for entry in entries:
+        handlers = entry.get("hooks") if isinstance(entry, dict) else None
+        if not isinstance(handlers, list):
+            continue
+        for hook in handlers:
+            if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
+                continue
+            try:
+                tokens = shlex.split(hook["command"])
+            except ValueError:
+                continue
+            if not any(_hook_token_path(tok, install) == expected for tok in tokens[1:]):
+                continue
+            short = _short_timeout(hook)
+            if short is None:
+                continue
+            return [CheckResult(
+                f"{hooks_path} UserPromptSubmit timeout", False,
+                f"timeout {short!r}, shorter than the {PROMPT_HOOK_TIMEOUT_S} s a Touch ID answer can take: Codex "
+                "would kill the hook after the answer is recorded, before its echo",
+                "Run `levain update` to re-render it.", upgrade_pending=True)]
+    return []
+
+
 def _check_codex(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("AGENTS.md", True, "present"))
@@ -5997,6 +6031,8 @@ def _check_codex(install: Path) -> list[CheckResult]:
                             f"wired to this install ({py})" if py else "wired",
                         )
                     )
+            # a Codex hooks.json rendered before the prompt hook's timeout grew still carries the short one
+            results.extend(_check_codex_prompt_timeout(ups, hooks_path, install))
             # only while the file is this install's: otherwise the rows above already say it is not wired
             if _hook_command_targets(ss, install, "session_start.py"):
                 results.extend(_check_transcript_hooks(install, hh, ("Stop", "PostToolUse"), "Codex"))
