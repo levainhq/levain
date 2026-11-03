@@ -2149,7 +2149,8 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             # from that name on any port (a cockpit behind a proxy, Phill 10-24 "2a"); every other link, exactly
             from levain.consent.passkey import authority_signature_problem
 
-            problem = authority_signature_problem(row.signature, signer.public_key, revoke=op in ("revoke_grant", "revoke_agent"))
+            problem = authority_signature_problem(
+                row.signature, signer.public_key, revoke=op in ("revoke_grant", "revoke_agent"))
             if problem is not None:
                 raise ReplayError(seq, f"the passkey signature is refused: {problem}"
                                        + (f" (signed by {signer.fingerprint}, quarantined: WebAuthn material stored "

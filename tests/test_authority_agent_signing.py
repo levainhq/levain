@@ -131,3 +131,34 @@ def test_no_caller_of_the_agent_link_prepare_outside_signing_py():
     assert {rel: names for rel, names in found.items() if names and rel != "agents/signing.py"} == {}
     # and no module prepares a link that is not in the inventory above
     assert sorted(found) == sorted(_CALLERS), sorted(set(found) ^ set(_CALLERS))
+
+
+@pytest.mark.parametrize("verb, args", [("sign", ["f.json"]), ("renew", ["al-0123456789ab"])])
+@pytest.mark.parametrize("days", ["0", str(auth.AGENT_LINK_MAX.days + 1), "99999999999"])
+def test_days_out_of_range_is_a_usage_error_before_any_key_is_asked_for(verb, args, days, monkeypatch, capsys):
+    import levain.cockpit.keys as keys
+    from levain.cli import main
+
+    monkeypatch.setattr(keys, "ssh_signer", lambda *a, **k: pytest.fail("the key was asked for"))
+    with pytest.raises(SystemExit) as exc:
+        main(["agents", verb, *args, "--data-root", "/nonexistent", "--signing-key", "/nonexistent", "--days", days])
+    assert exc.value.code == 2
+    assert "days" in capsys.readouterr().err
+
+
+def test_an_overflow_in_signing_prints_the_refusal_line_and_exits_1(world, monkeypatch, capsys):
+    import json
+
+    import levain.agents.signing as signing
+    import levain.cockpit.keys as keys
+    from levain.cli import main
+
+    def boom(*a, **k):
+        raise OverflowError("date value out of range")
+
+    monkeypatch.setattr(signing, "sign_agent_link", boom)
+    monkeypatch.setattr(keys, "ssh_signer", lambda *a, **k: ("SHA256:x", lambda m: ""))
+    f = world.root / "link.json"
+    f.write_text(json.dumps(link(world, 1)), encoding="utf-8")
+    assert main(["agents", "sign", str(f), "--data-root", str(world.root), "--signing-key", str(f)]) == 1
+    assert "levain agents sign: date value out of range" in capsys.readouterr().err

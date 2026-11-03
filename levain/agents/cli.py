@@ -425,15 +425,27 @@ def _add_signing_parsers(verbs: argparse._SubParsersAction) -> None:
     sign.add_argument("--data-root", dest="data_root", type=Path, required=True, help="The cockpit's data root.")
     sign.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
                       help="A laptop-presence key; it may ask for a touch or a passphrase.")
-    sign.add_argument("--days", type=int, default=29, help="Life of a link with no expires_at (default 29).")
+    sign.add_argument("--days", type=_link_days_arg, default=29, help="Life of a link with no expires_at (default 29).")
     sign.set_defaults(func=run_sign)
     renew = verbs.add_parser("renew", help="Move a live agent link's expiry (its terms stay).", allow_abbrev=False)
     renew.add_argument("link_id", help="The link's id (al-...).")
     renew.add_argument("--data-root", dest="data_root", type=Path, required=True, help="The cockpit's data root.")
     renew.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
                        help="A laptop-presence key; it may ask for a touch or a passphrase.")
-    renew.add_argument("--days", type=int, default=29, help="New life from now (default 29).")
+    renew.add_argument("--days", type=_link_days_arg, default=29, help="New life from now (default 29).")
     renew.set_defaults(func=run_renew)
+
+
+def _link_days_arg(text: str) -> int:
+    from levain.authority import AGENT_LINK_MAX
+
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text[:40]!r} is not an integer") from None
+    if not 1 <= value <= AGENT_LINK_MAX.days:
+        raise argparse.ArgumentTypeError(f"a link's life is 1 to {AGENT_LINK_MAX.days} days")
+    return value
 
 
 def _signing_refusals() -> tuple[type[BaseException], ...]:
@@ -441,8 +453,11 @@ def _signing_refusals() -> tuple[type[BaseException], ...]:
     from levain.cockpit.firejournal import CockpitFormatError
     from levain.cockpit.keys import KeyError_
 
+    # ssh_signer and its sign() raise KeyError_ for every expected failure (an ssh-keygen that cannot run, times out,
+    # exits non-zero or returns no valid signature) and VerifierUnavailable (an AuthorityError); anything else is a bug
+    # and keeps its traceback.
     return (KeyError_, AuthorityError, OSError, UnicodeDecodeError, sqlite3.Error, CockpitFormatError, SpecError,
-            ValueError)
+            ValueError, OverflowError)
 
 
 def run_sign(args: argparse.Namespace) -> int:
