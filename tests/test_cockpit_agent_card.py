@@ -194,7 +194,7 @@ def test_a_malformed_record_is_a_card_refusal_never_another_exception(world):
                 {**good, "capabilities": {**good["capabilities"], "where": 7}},
                 {**good, "budget_run_usd_micros": "1"}, {**good, "budget_window_usd_micros": -1},
                 {**good, "budget_run_usd_micros": True}, {**good, "guard": object(), "capabilities": OUTWARD},
-                {**good, "expires_at": None}, {k: v for k, v in good.items() if k != "expires_at"}, []):
+                {**good, "guard": [{1: "x"}]}, {**good, "expires_at": None}, {k: v for k, v in good.items() if k != "expires_at"}, []):
         with pytest.raises(CardRefused):
             agent_link_card(bad)
 

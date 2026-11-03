@@ -321,13 +321,26 @@ def agent_link_card(grant: Mapping[str, Any]) -> dict[str, Any]:
         raise CardRefused(f"the link record is malformed: {type(exc).__name__}: {exc}") from exc
 
 
+def _only_string_keys(node: Any) -> None:
+    if isinstance(node, Mapping):
+        for key, value in node.items():
+            if not isinstance(key, str):
+                raise CardRefused(f"the link record has a non-string key {key!r}")
+            _only_string_keys(value)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            _only_string_keys(item)
+
+
 def _agent_link_card(grant: Mapping[str, Any]) -> dict[str, Any]:
     from levain.authority import AGENT_LINK_KIND, _thaw
     from levain.autonomic.coverage import guard_problem
 
     if not isinstance(grant, Mapping) or grant.get("kind") != AGENT_LINK_KIND:
         raise CardRefused(f"only an {AGENT_LINK_KIND} has this card")
-    fields = json.loads(json.dumps(_thaw(dict(grant))))          # the snapshot: what the card shows is what is signed
+    thawed = _thaw(dict(grant))
+    _only_string_keys(thawed)                                    # the json round trip below would coerce 1 to "1"
+    fields = json.loads(json.dumps(thawed))                      # the snapshot: what the card shows is what is signed
     caps = fields.get("capabilities")
     if not isinstance(caps, Mapping):
         raise CardRefused("the link carries no capabilities")
