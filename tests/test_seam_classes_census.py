@@ -66,7 +66,7 @@ def test_the_classes_do_not_overlap() -> None:
 def test_every_table_of_the_maximal_database_is_in_exactly_one_class(maximal: Path) -> None:
     tables = _tables(maximal)
     assert "sqlite_sequence" in tables and sc.EXEMPT["sqlite_sequence"] == "SQLite's own"
-    assert len(tables) == 64 and len(set(tables)) == 64           # the census's 54, SQLite's, S0, S1, S2b's five, P3, S5
+    assert len(tables) == 67 and len(set(tables)) == 67           # the census's 54, SQLite's, S0, S1, S2b's five, P3, S5, CH-H2's three
     # `_r4` is the transient name of the review events' rebuild: gone by commit, so a finished store holds none
     assert not [t for t in tables if t.endswith("_r4")]
     known = sc.COUNTED | sc.INFRASTRUCTURE | set(sc.EXEMPT)

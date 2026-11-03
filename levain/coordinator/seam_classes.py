@@ -39,6 +39,8 @@ INFRASTRUCTURE: frozenset[str] = frozenset({
     "review_marks", "know_deliveries", "held_pings", "held_ping_releases",
     "chat_events", "chat_outbox_events", "chat_cursors", "chat_echoes", "chat_launch_checks",
     "turn_lease_events", "chat_egress_events",
+    # missions (CH-H2): append-only records with no gseq; a mission closes through its threads' own counted events
+    "missions", "mission_revisions", "mission_acceptances",
 })
 
 _DISPATCH = ("ordered by dispatch's own transitions; the open brief does not report dispatch jobs (the board and the "
