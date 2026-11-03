@@ -4,17 +4,18 @@ from __future__ import annotations
 from datetime import timedelta
 
 from levain.agents import controller as ctl
+from levain.agents import slots
 from tests import test_agents_claim as tc
 from tests.test_agents_claim import T0, _armed, _clock, _set_cursor, _store
 
 LATE = T0 + timedelta(minutes=19)  # 12:00 is past the 15 minute grace, so every slot of the stretch is missed
 
 
-def _ended(store, key, state, reason, *, launched):
+def _ended(store, key, state, reason, *, launched, at=T0):
     """One occurrence ended by hand: a run goes admitted -> launched -> done, a no-input skip ends admitted."""
     with store.write() as c:
         oid, outcome = ctl.claim(c, agent_id=tc.AG, kind="manual", key=key, spec_hash="h1", binding_id="b1",
-                                 window_key="m:x", now=T0)
+                                 window_key="m:x", now=at)
         assert outcome == ctl.CLAIMED
         if launched:
             c.execute("UPDATE agent_occurrences SET state='launched', launch_epoch=epoch, link_id='l1',"
@@ -70,3 +71,54 @@ def test_silence_is_found_in_one_pass_and_only_for_an_agent_that_fired_nothing(t
     _set_cursor(store, tc.AG, "2026-11-02T05:00:00Z")  # the same stretch, but the clock is back inside 12:00's grace
     heard = ctl.tick(store, _clock([T0]), _armed)
     assert heard.claimed == [(tc.AG, "2026-11-02T12:00:00Z")] and heard.missed[tc.AG] == 20 and heard.silent == []
+
+
+AFTER_NOV_1 = T0.replace(day=2, hour=4, minute=50)  # local 23:50 on Nov 1: after its last slot, before Nov 2's first
+
+
+def test_a_done_run_inside_the_backlog_resets_the_streak_for_the_windows_before_it(tmp_path):
+    store = _store(tmp_path)
+    _set_cursor(store, tc.AG, "2026-11-01T05:00:00Z")
+    _ended(store, "k-done", "done", "completed", launched=True, at=AFTER_NOV_1)
+    out = ctl.tick(store, _clock([LATE]), _armed)
+    assert out.missed_windows[tc.AG] == ["d:2026-11-01", "d:2026-11-02"]  # both are still reported
+    assert _streak(store) == 1  # only Nov 2 came after the done
+
+
+def test_a_done_between_two_windows_of_one_batch_resets_a_prior_streak(tmp_path):
+    store = _store(tmp_path)
+    _set_cursor(store, tc.AG, "2026-11-01T05:00:00Z")
+    ctl.tick(store, _clock([T0.replace(day=1, hour=6, minute=19)]), _armed)  # 05:20 .. 06:00 on Nov 1 missed
+    assert _streak(store) == 1
+    _ended(store, "k-done", "done", "completed", launched=True, at=AFTER_NOV_1)
+    out = ctl.tick(store, _clock([LATE]), _armed)  # the rest of Nov 1, then Nov 2, in one batch
+    assert out.missed_windows[tc.AG] == ["d:2026-11-01", "d:2026-11-02"] and _streak(store) == 1
+
+
+def test_a_no_slot_close_reaches_the_streak_and_a_manual_one_counts_by_its_admission(tmp_path):
+    store = _store(tmp_path)
+    _set_cursor(store, tc.AG, "2026-11-02T11:40:00Z")
+    assert ctl.tick(store, _clock([T0]), _armed).claimed == [(tc.AG, "2026-11-02T12:00:00Z")]
+    with store.write() as c:  # the cap is full, so 12:00 stays admitted until its grace runs out
+        for i in (1, 2):
+            slots.take(c, slots.OCCURRENCE, f"held-{i}", T0)
+    out = ctl.tick(store, _clock([T0 + timedelta(minutes=16)]), _armed)
+    assert out.no_slot == [(tc.AG, "2026-11-02T12:00:00Z")] and out.missed_windows[tc.AG] == ["d:2026-11-02"]
+    assert out.silent == [tc.AG] and _streak(store) == 1  # the walk had no slot to see, the close is the miss
+    with store.write() as c:
+        ctl.claim(c, agent_id=tc.AG, kind="manual", key="k-man", spec_hash="h1", binding_id="b1",
+                  window_key="m:2026-11-02", now=T0 + timedelta(minutes=17))
+    late = ctl.tick(store, _clock([T0 + timedelta(minutes=39)]), _armed)  # k-man past grace; 12:20 a walk miss
+    assert late.no_slot == [(tc.AG, "k-man")] and late.missed_windows[tc.AG] == ["m:2026-11-02", "d:2026-11-02"]
+    assert _streak(store) == 2  # the manual miss counts once and leaves d:2026-11-02 counted once
+    _ended(store, "k-done", "done", "completed", launched=True, at=T0 + timedelta(minutes=33))
+    assert _streak(store) == 0  # compared with the misses' instants, never with the manual key's text
+
+
+def test_silence_is_judged_once_per_agent_after_every_walk(tmp_path):
+    store = _store(tmp_path)
+    other = tc._register(store, name="job_push_check_2")
+    for ag in (tc.AG, other):
+        _set_cursor(store, ag, "2026-11-02T05:00:00Z")
+    out = ctl.tick(store, _clock([LATE]), _armed)
+    assert sorted(out.silent) == sorted([tc.AG, other]) and len(out.silent) == 2
