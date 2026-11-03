@@ -2249,7 +2249,7 @@
       results.replaceChildren();
       if (rows.length === 0) {
         results.appendChild(el("p", "empty",
-          q ? "no loops match “" + raw.trim() + "”" : "Nothing yet. What stays open after Sage sorts the Tray is listed here."));
+          q ? "no loops match “" + raw.trim() + "”" : "Nothing yet. What stays open after " + (view.entity_name || "the assistant") + " sorts the Tray is listed here."));
       } else {
         for (const s of rows) results.appendChild(sporeRow(s, verbs, "tier", entry.kind));
       }
@@ -2281,7 +2281,7 @@
 
   function renderTray(entry, view) {
     const p = renderSporeProjection(entry, view, view.tray,
-      "Nothing yet. Drop a thought in the box above and Sage sorts it.", "disposition");
+      "Nothing yet. Drop a thought in the box above and " + (view.entity_name || "the assistant") + " sorts it.", "disposition");
     // The dump box is the primary capture affordance — mounted under the title when
     // writable. A read-only port (mesh) shows the Tray but offers no dump (NO-THEATER).
     if (isVerbPanel(entry)) mountCaptureBox(p, buildTrayDump(view.entity_name || "the assistant"));
