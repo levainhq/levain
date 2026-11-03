@@ -1045,3 +1045,222 @@ def test_room_argv_loads_only_the_user_setting_source():
     a = room_argv(mcp_config="/r/mcp.json", settings="/r/settings.json", session_id=SID)
     assert val_of(a, "--setting-sources") == "user" and a.count("--setting-sources") == 1
     assert "--restricted" not in a
+
+
+# ---- L3 r2 fixes (RMCF2) -------------------------------------------------------------------------------------------------------
+def _deny(workdir, paths) -> list[str]:
+    return json.loads(room_settings_json(workdir, paths))["permissions"]["deny"]
+
+
+def test_a_symlinked_deny_path_is_compared_after_realpath(tmp_path):
+    # FIX 1: a deny path and a workdir that name one place under two spellings
+    real = tmp_path / "real"
+    (real / "room").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    with pytest.raises(ValueError, match="inside deny path"):
+        room_settings_json(str(real / "room"), [str(link)])
+    with pytest.raises(ValueError, match="inside deny path"):
+        room_settings_json(str(link / "room"), [str(real)])
+    deny = _deny(str(tmp_path / "elsewhere"), [str(link)])
+    target = os.path.realpath(str(real))
+    assert f"Read(/{target})" in deny and f"Read(/{target}/**)" in deny          # the target is denied too
+    assert f"Read(/{link})" in deny
+
+
+@pytest.mark.skipif(os.path.realpath("/tmp") == "/tmp", reason="/tmp is not a symlink here (macOS spells it /private/tmp)")
+def test_a_tmp_deny_path_catches_a_workdir_spelled_under_private_tmp():
+    with pytest.raises(ValueError, match="inside deny path"):
+        room_settings_json("/private/tmp/rmcf2-x/room", ["/tmp/rmcf2-x"])
+    deny = _deny("/Users/someone/room", ["/tmp/rmcf2-x"])
+    assert "Read(//private/tmp/rmcf2-x/**)" in deny and "Read(//tmp/rmcf2-x/**)" in deny
+
+
+def test_a_dotdot_deny_path_is_normalised_before_it_is_compared_or_spelled():
+    with pytest.raises(ValueError, match="inside deny path"):
+        room_settings_json("/Users/someone/.ssh/room", ["/Users/someone/x/../.ssh"])
+    with pytest.raises(ValueError, match="inside deny path"):
+        room_settings_json("/Users/someone/y/../.ssh/room", ["/Users/someone/.ssh"])
+    deny = _deny("/Users/someone/room", ["/Users/someone/x/../.ssh", "//Users/someone/.aws/"])
+    assert "Read(//Users/someone/.ssh/**)" in deny and not any(".." in r for r in deny)
+    assert "Read(//Users/someone/.aws)" in deny and not any(r.startswith("Read(///") for r in deny)
+
+
+@pytest.mark.parametrize("bad", ["/Users/someone/a)b", "/Users/someone/a) Read(//x", "**/.env)x",
+                                 "/Users/someone/a\nb", "/Users/someone/a\x00b", "**/.env\x7f"])
+def test_a_malformed_rule_text_is_refused(bad):
+    with pytest.raises(ValueError, match=r"\)|control"):
+        room_settings_json("/Users/someone/room", [bad])
+
+
+def test_a_double_slash_root_is_still_the_root():
+    with pytest.raises(ValueError):
+        room_settings_json("/Users/someone/room", ["//"])
+
+
+def _acks(t):
+    t.on_write = lambda line: t.feed(ctl_response(line["request_id"])) if line["type"] == "control_request" else None
+
+
+def test_interrupt_accepts_the_turn_send_predicted_before_its_init():
+    # FIX 2: send() before init names t1-1; that id must be interruptible while no turn is open
+    s, t = make(interrupt_wait=1.0)
+    _acks(t)
+    assert s.interrupt(InterruptCommand("op-0", "t1-1")).outcome == "rejected"     # no line awaits: never existed
+    tid = s.send(cmd()).vendor_turn_id
+    assert tid == "t1-1"
+    n = len(t.written)
+    assert s.interrupt(InterruptCommand("op-1", "t1-2")).outcome == "rejected" and len(t.written) == n
+    assert s.interrupt(InterruptCommand("op-2", tid)).outcome == "confirmed"
+    assert t.written[-1]["request"] == {"subtype": "interrupt"}
+
+
+_BAD_UTF8_CHILD = r"""
+import sys
+out = sys.stdout.buffer
+out.write(b'{"type":"assistant","message":{"content":[{"type":"text","text":"before"}]},"uuid":"u-1"}\n')
+out.write(b'\xff\xfe not utf-8\n')
+out.write(b'{"type":"assistant","message":{"content":[{"type":"text","text":"after"}]},"uuid":"u-2"}\n')
+out.flush()
+sys.stdin.readline()
+"""
+
+
+def _drain(s, until, limit=10.0):
+    got, deadline = [], time.monotonic() + limit
+    while time.monotonic() < deadline and not until(got):
+        got += s.read(None).events[len(got):]
+    return got
+
+
+def test_a_bad_byte_costs_one_line_and_the_end_of_output_is_reported_once():
+    # FIX 3: invalid UTF-8 on stdout must not silently end the session's output while the child lives
+    import subprocess
+    proc = subprocess.Popen([sys.executable, "-I", "-c", _BAD_UTF8_CHILD], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    t = PipeTransport(proc)
+    s = ClaudeSession(t, session_id="s", read_wait=0.2)
+    try:
+        got = _drain(s, lambda g: any(e.body == "after" for e in g))
+        assert [e.body for e in got if e.kind == "agent_text"] == ["before", "after"]
+        assert any(e.vendor_id.startswith("unparseable:") for e in got)
+        assert proc.poll() is None and not any(e.vendor_id.startswith("transport:") for e in got)
+        proc.stdin.write("\n")
+        proc.stdin.flush()
+        got = _drain(s, lambda g: any(e.vendor_id.startswith("transport:") for e in g))
+        ends = [e for e in got if e.vendor_id.startswith("transport:")]
+        assert len(ends) == 1 and ends[0].kind == "error" and "output ended" in ends[0].body
+        s.read(None)
+        assert len([e for e in s.read(None).events if e.vendor_id.startswith("transport:")]) == 1
+        t0 = time.monotonic()
+        assert t.poll(5.0) == [] and time.monotonic() - t0 < 1.0    # a poll after the end never waits
+    finally:
+        s.close()
+
+
+class _DeadPipeProc:
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.stdin = self
+        self.stdout = iter(())
+
+    def write(self, data):
+        raise self.exc
+
+    def flush(self):
+        raise self.exc
+
+    def close(self):
+        pass
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
+
+@pytest.mark.parametrize("exc", [BrokenPipeError(32, "Broken pipe"), ValueError("I/O operation on closed file.")])
+def test_a_dead_stdin_is_transport_closed_and_the_line_is_unsent(exc):
+    # FIX 4
+    t = PipeTransport(_DeadPipeProc(exc))
+    with pytest.raises(TransportClosed):
+        t.write("x\n")
+    s = ClaudeSession(t, session_id="s")
+    with pytest.raises(NotSent):
+        s.send(cmd())
+    assert s.pending_lines() == 0 and s.turn_lines("t1-1") == 0
+    t._closed = True
+
+
+def test_a_huge_tool_input_is_capped_on_tool_calls_and_approvals():
+    # FIX 5
+    big = {"file_path": "/a", "content": "x" * (1024 * 1024)}
+    s, t = make()
+    call = tool_use("toolu_big", "/a")
+    call["message"]["content"][0]["input"] = big
+    t.feed(init(), call, ctl_request("req-big", "can_use_tool", tool_name="Write", input=big))
+    evs = {e.kind: e for e in s.read(None).events}
+    full = json.dumps(big, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    for kind in ("tool_call", "approval_request"):
+        ti = evs[kind].tool_input
+        assert ti["levain_truncated"] is True and ti["bytes"] == len(full)
+        assert ti["sha256"] == "sha256:" + __import__("hashlib").sha256(full).hexdigest()
+        assert len(json.dumps(ti).encode("utf-8")) < 2 * EVENT_BODY_MAX
+        assert full.decode("utf-8").startswith(ti["head"]) and ti["head"]
+
+
+def test_a_deeply_nested_frame_is_a_digest_only_event_not_a_crash():
+    # FIX 6
+    depth = 100000
+    s, t = make()
+    t.feed('{"type":"assistant","x":' + "[" * depth + "]" * depth + "}\n", text("after"))
+    evs = list(s.read(None).events)
+    assert [e.body for e in evs if e.kind == "agent_text"] == ["after"]
+    assert any(e.vendor_id.startswith("unparseable:") for e in evs)
+    nested: list = []
+    for _ in range(depth):
+        nested = [nested]
+    assert cs._malformed({"type": "assistant", "x": nested}) == "the frame is nested too deeply"
+
+
+class _SlowTransport(FakeTransport):
+    """A poll honours its wait (blocks), as PipeTransport's does."""
+
+    def poll(self, wait: float) -> list[str]:
+        if not self.lines and wait > 0:
+            time.sleep(wait)
+        return super().poll(wait)
+
+
+def test_an_interrupt_never_waits_behind_a_long_read():
+    # FIX 7
+    import threading
+    t = _SlowTransport()
+    s = ClaudeSession(t, session_id=SID, read_wait=3.0, interrupt_wait=2.0)
+    _acks(t)
+    reader = threading.Thread(target=s.read, args=(None,), daemon=True)
+    reader.start()
+    time.sleep(0.2)
+    t0 = time.monotonic()
+    assert s.interrupt(InterruptCommand("op-1", None)).outcome == "confirmed"
+    assert time.monotonic() - t0 < 1.0
+    reader.join(5)
+
+
+def test_a_cancel_clears_an_ambiguous_reply_and_nothing_is_written_twice():
+    # FIX 8 (L3 r2 finding 5): the ambiguous marker leaves with the cancelled request
+    s, t = make()
+    t.feed(ctl_request("req-A", "can_use_tool", tool_name="Bash", input={"command": "ls"}))
+    s.read(None)
+    t.refuse = BrokenPipeError()
+    assert s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "ambiguous"
+    t.refuse = None
+    t.feed({"type": "control_cancel_request", "request_id": "req-A"})
+    s.read(None)
+    assert "req-A" not in s._replying and "req-A" not in s._inbound
+    assert s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "no_such_request"
+    t.feed(ctl_request("req-A", "can_use_tool", tool_name="Bash", input={"command": "ls"}))   # a replay
+    s.read(None)
+    assert s.answer(ApprovalAnswer("op-1", "ak-1", "req-A", {"behavior": "deny"})).outcome == "no_such_request"
+    assert t.written == []

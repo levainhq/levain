@@ -63,6 +63,7 @@ SEQ_MAX = 10 ** 12 - 1
 _BODY_MAX = 16 * 1024           # chat.EVENT_BODY_MAX (a test holds the two equal); this module imports no chat code
 _POS = re.compile(r"(\d{8}):(\d{12})")
 _RECENT_FRAMES = 256
+_POLL_SLICE = 0.02              # the longest a waiting pump sleeps between non-blocking polls
 
 ROOM_MCP_SERVER = "levain_room"
 ROOM_MCP_TOOL = "mcp__levain_room__propose_drop"
@@ -96,32 +97,52 @@ class Transport(Protocol):
 class PipeTransport:
     """A :class:`Transport` over a ``Popen`` the caller spawned with ``stdin``/``stdout`` pipes in text mode. A reader
     thread queues stdout lines; :meth:`close` ends stdin, then terminates, then kills the child. The caller owns the
-    spawn (argv, cwd, env)."""
+    spawn (argv, cwd, env).
+
+    stdout is read as BYTES when the text stream exposes ``.buffer`` and each line is decoded UTF-8 with
+    ``errors="replace"``, so one bad byte costs that line's fidelity, never the rest of the output (L3 r2). When the
+    stream ends, or fails, :attr:`eof` is set and :attr:`error` names a failure; the session reports both once."""
 
     def __init__(self, proc: Any) -> None:
         self._proc = proc
         self._q: queue.Queue[str | None] = queue.Queue()
         self._closed = False
         self.eof = False
+        self.error: str | None = None
         threading.Thread(target=self._read, daemon=True, name="claude-session-reader").start()
 
     def _read(self) -> None:
+        stream = self._proc.stdout
+        raw = getattr(stream, "buffer", None)
         try:
-            for line in self._proc.stdout:
-                self._q.put(line)
-        except (OSError, ValueError):
-            pass
+            if raw is not None:
+                for line in raw:
+                    self._q.put(line.decode("utf-8", "replace") if isinstance(line, bytes) else line)
+            else:
+                for line in stream:
+                    self._q.put(line.decode("utf-8", "replace") if isinstance(line, bytes) else line)
+        except (OSError, ValueError) as exc:
+            self.error = f"the child's stdout failed ({type(exc).__name__})"
         finally:
             self._q.put(None)
 
     def write(self, data: str) -> None:
+        """A dead reader end (``BrokenPipeError``) or a closed stdin (``ValueError``) is :class:`TransportClosed`: no
+        byte of the line can reach a child that is gone."""
         if self._closed or self._proc.poll() is not None:
             raise TransportClosed("the child has exited or the transport is closed")
-        self._proc.stdin.write(data)
-        self._proc.stdin.flush()
+        try:
+            self._proc.stdin.write(data)
+            self._proc.stdin.flush()
+        except BrokenPipeError as exc:
+            raise TransportClosed("the child's stdin is gone (broken pipe)") from exc
+        except ValueError as exc:
+            raise TransportClosed(f"the child's stdin is closed ({exc})"[:200]) from exc
 
     def poll(self, wait: float) -> list[str]:
         out: list[str] = []
+        if self.eof and self._q.empty():
+            return out                          # the end was already read: never wait on a queue nothing feeds
         try:
             first = self._q.get(timeout=wait) if wait > 0 else self._q.get_nowait()
         except queue.Empty:
@@ -173,6 +194,18 @@ def _cap(text: str) -> str:
     return raw[:_BODY_MAX].decode("utf-8", "ignore")
 
 
+def _cap_input(value: Any) -> Any:
+    """A vendor ``tool_input`` kept as given when its JSON is at most ``_BODY_MAX`` UTF-8 bytes; past that, a marker
+    holding the full JSON's digest and size and its capped head (the body cap's rule), never the whole value."""
+    if value is None:
+        return None
+    raw = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8", "replace")
+    if len(raw) <= _BODY_MAX:
+        return value
+    return {"levain_truncated": True, "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+            "head": raw[:_BODY_MAX].decode("utf-8", "ignore")}
+
+
 def _list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
@@ -196,6 +229,8 @@ def _malformed(frame: Mapping[str, Any]) -> str | None:
                 return f"init {key} is not a list"
     try:
         json.dumps(frame, ensure_ascii=False).encode("utf-8")
+    except RecursionError:
+        return "the frame is nested too deeply"
     except (UnicodeEncodeError, ValueError, TypeError):
         return "a string in the frame is not encodable as UTF-8"
     return None
@@ -267,6 +302,7 @@ class ClaudeSession:
         self._denied: list[tuple[str, str, str | None]] = []
         self._recent: deque[dict[str, Any]] = deque(maxlen=_RECENT_FRAMES)
         self._ids = 0
+        self._eof_seen = False
         self.closed = False
 
     # --- ingest -----------------------------------------------------------------------------------------------------
@@ -281,10 +317,32 @@ class ClaudeSession:
         return e
 
     def _pump(self, wait: float) -> None:
-        """Take what the transport has and fold it in, in arrival order. Holds the io lock."""
-        with self._io:
-            for raw in self._t.poll(wait):
-                self._ingest(raw)
+        """Take what the transport has and fold it in, in arrival order. The io lock is held only for a non-blocking
+        poll and its ingest; the wait between polls (at most ``_POLL_SLICE`` seconds each) is spent OUTSIDE it, so a
+        long :meth:`read` cannot hold off :meth:`interrupt` (L3 r2). Ends on the first lines, at ``wait``, or once the
+        transport reports its end. (A caller already holding the lock, :meth:`interrupt`, keeps it while it waits.)"""
+        deadline = time.monotonic() + max(wait, 0.0)
+        while True:
+            with self._io:
+                got = self._t.poll(0.0)
+                for raw in got:
+                    self._ingest(raw)
+                self._note_eof()
+            left = deadline - time.monotonic()
+            if got or left <= 0 or getattr(self._t, "eof", False):
+                return
+            time.sleep(min(left, _POLL_SLICE))
+
+    def _note_eof(self) -> None:
+        """Once the transport's output has ended, one ``error`` event says so with the child's exit status (a child
+        whose output ends is no longer readable, whether or not it lives). Called holding the io lock."""
+        if self._eof_seen or not getattr(self._t, "eof", False):
+            return
+        self._eof_seen = True
+        rc = getattr(self._t, "returncode", None)
+        why = getattr(self._t, "error", None) or "the child's output ended"
+        self._emit("error", f"transport:{self._conn}", turn_id=self._open,
+                   body=f"{why}; returncode {rc if isinstance(rc, int) else 'unknown'}"[:300])
 
     def _new_turn(self) -> str:
         self._turns += 1
@@ -307,7 +365,7 @@ class ClaudeSession:
         digest = "sha256:" + hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
         try:
             frame = json.loads(text)
-        except ValueError:
+        except (ValueError, RecursionError):
             frame = None
         if not isinstance(frame, dict):
             self._unparseable(digest, f"a line that is not a JSON object ({len(text)} chars)")
@@ -394,7 +452,7 @@ class ClaudeSession:
                 name = block.get("name") if isinstance(block.get("name"), str) else None
                 self._calls[block["id"]] = name or ""
                 self._emit("tool_call", block["id"], turn_id=self._open, call_id=block["id"], tool_name=name,
-                           tool_input=block.get("input"), agent_id=agent)
+                           tool_input=_cap_input(block.get("input")), agent_id=agent)
             # a thinking block (or any other) is not copied
 
     def _on_user(self, frame: Mapping[str, Any], uid: str) -> None:
@@ -453,7 +511,7 @@ class ClaudeSession:
             self._tools_of[rid] = tool
             reason, blocked = req.get("decision_reason_type"), req.get("blocked_path")
             self._emit("approval_request", rid, turn_id=self._open, request_key=rid, host=True, tool_name=tool,
-                       tool_input=req.get("input"), reason_type=reason if isinstance(reason, str) else None,
+                       tool_input=_cap_input(req.get("input")), reason_type=reason if isinstance(reason, str) else None,
                        blocked_path=blocked if isinstance(blocked, str) else None, control_subtype=subtype,
                        raw_sha256=digest, call_id=req.get("tool_use_id") if isinstance(req.get("tool_use_id"), str)
                        else None)
@@ -467,6 +525,9 @@ class ClaudeSession:
             self._cancelled.add(rid)
             self._inbound.pop(rid, None)
             self._tools_of.pop(rid, None)
+            # an ambiguous reply's marker ends with the request (L3 r2 finding 5): a later reply finds no request, and
+            # the permanent _seen_ctl keeps a replay from making it answerable again, so nothing is written twice
+            self._replying.pop(rid, None)
             self._emit("error", f"cancel:{rid}", turn_id=self._open, body="control request cancelled", cancel_of=rid)
 
     # --- DriverSession ----------------------------------------------------------------------------------------------
@@ -613,7 +674,8 @@ class ClaudeSession:
 
     def interrupt(self, command: InterruptCommand) -> CommandResult:
         """The stream-json ``interrupt`` control request, then wait up to ``interrupt_wait`` for its response. A
-        ``turn_id`` that is not the open turn writes nothing (a late interrupt must not abort the next turn). The
+        ``turn_id`` that is neither the open turn nor the one :meth:`send` predicted for a line no turn has claimed yet
+        writes nothing (a late interrupt must not abort the next turn). The
         aborted turn's ``result`` arrives through :meth:`read` as a ``turn_ended``. Each write mints its own request id
         (never derived from ``op_id``), and only the response to that id confirms it: a late response to an earlier
         interrupt is discarded."""
@@ -621,7 +683,9 @@ class ClaudeSession:
             if self.closed:
                 return CommandResult("rejected", "the session is closed")
             self._pump(0.0)
-            if command.turn_id is not None and command.turn_id != self._open:
+            # before its init the turn is the one send() predicted (a line awaits, no turn is open): that id is live
+            pending = (f"t{self._conn}-{self._turns + 1}" if self._open is None and self._awaiting > 0 else None)
+            if command.turn_id is not None and command.turn_id not in (self._open, pending):
                 return CommandResult("rejected", f"turn {command.turn_id} is not the open turn")
             self._int_n += 1
             rid = f"int-{self._conn}-{self._int_n}-{secrets.token_hex(8)}"
@@ -731,36 +795,72 @@ def default_deny_paths(home: str | os.PathLike[str]) -> tuple[str, ...]:
             "**/.env*", "**/*.keychain", "**/*.keychain-db", "**/*.p12")
 
 
+def _norm(path: str) -> str:
+    """An absolute path, ``..`` and repeated slashes resolved lexically, with exactly ONE leading slash (POSIX keeps a
+    leading ``//``; the rule spelling adds its own)."""
+    return "/" + os.path.normpath(path).lstrip("/")
+
+
+def _spellings(path: str) -> list[str]:
+    """The absolute spellings one deny path is denied under: its lexical form and, for a literal path, its
+    ``realpath`` too when that differs (macOS ``/tmp`` is ``/private/tmp``; a symlink names its target)."""
+    out = [_norm(path)]
+    if not _GLOB.search(path):
+        real = _norm(os.path.realpath(path))
+        if real != out[0]:
+            out.append(real)
+    return out
+
+
+def _check_rule_text(path: str) -> None:
+    """A ``)`` would close the rule early (a malformed rule that denies something else); a control character is never
+    a path we mean. Both are refused, never escaped."""
+    if ")" in path:
+        raise ValueError(f"deny path {path[:80]!r} contains ')': the rule would be malformed")
+    if any(unicodedata.category(c) == "Cc" for c in path):
+        raise ValueError(f"deny path {path[:80]!r} contains a control character")
+
+
 def _rules(path: str) -> list[str]:
     """The Read-family rule bodies for one deny path. An absolute path is spelled ``//abs`` (a single leading slash is
-    RELATIVE to the settings source and silently matches nothing); a plain one denies itself and everything under it.
-    A relative path is refused unless it is a ``**/`` glob."""
+    RELATIVE to the settings source and silently matches nothing), once per :func:`_spellings` form; a plain one
+    denies itself and everything under it. A relative path is refused unless it is a ``**/`` glob."""
+    _check_rule_text(path)
     if os.path.isabs(path):
-        body = "/" + path.rstrip("/") if path != "/" else None
-        if body is None:
-            raise ValueError("denying the filesystem root is not a rule")
-        return [body] if _GLOB.search(path) else [body, body + "/**"]
+        out: list[str] = []
+        for spelled in _spellings(path):
+            if spelled == "/":
+                raise ValueError("denying the filesystem root is not a rule")
+            body = "/" + spelled
+            out += [body] if _GLOB.search(spelled) else [body, body + "/**"]
+        return out
     if path.startswith("**/"):
         return [path]
     raise ValueError(f"deny path {path[:80]!r} is relative: a relative rule matches nothing here; use an absolute "
                      "path or a '**/' glob")
 
 
+def _inside(child: str, root: str) -> bool:
+    return child == root or child.startswith(root.rstrip("/") + "/")
+
+
 def room_settings_json(workdir: str | os.PathLike[str], deny_paths: Iterable[str | os.PathLike[str]]) -> str:
     """The ``--settings`` JSON for the room child: ``permissions.deny`` with a Read, Grep and Glob rule for every
     deny path, and ``permissions.blockReadsOutsideWorkingDirectories``. ``workdir`` must be absolute and not inside any
-    deny path (that would blind the room, not confine it)."""
+    deny path (that would blind the room, not confine it), compared lexically AND after ``realpath`` on both sides."""
     wd = str(workdir)
     if not os.path.isabs(wd):
         raise ValueError("workdir must be absolute")
+    wds = {_norm(wd), _norm(os.path.realpath(wd))}
     deny: list[str] = []
     for p in deny_paths:
         p = str(p)
+        bodies = _rules(p)                      # refuses a malformed or relative path before anything else
         if os.path.isabs(p) and not _GLOB.search(p):
-            root = p.rstrip("/")
-            if wd == root or wd.startswith(root + "/"):
-                raise ValueError(f"workdir {wd[:120]!r} is inside deny path {p[:120]!r}")
-        for body in _rules(p):
+            for root in _spellings(p):
+                if any(_inside(w, root) for w in wds):
+                    raise ValueError(f"workdir {wd[:120]!r} is inside deny path {p[:120]!r}")
+        for body in bodies:
             deny.extend(f"{tool}({body})" for tool in ("Read", "Grep", "Glob"))
     seen: set[str] = set()
     deny = [r for r in deny if not (r in seen or seen.add(r))]
