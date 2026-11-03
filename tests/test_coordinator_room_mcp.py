@@ -43,10 +43,6 @@ def qdir(tmp_path, monkeypatch):
 
 @pytest.fixture
 def store(qdir, monkeypatch):
-    widened = tuple(s.replace("'coordinator', 'worker'", "'coordinator', 'worker', 'room'", 1)
-                    if s.startswith("CREATE TABLE IF NOT EXISTS launches ") else s for s in lease.LEASE_SCHEMA)
-    assert widened != lease.LEASE_SCHEMA
-    monkeypatch.setattr(lease, "LEASE_SCHEMA", widened)
     s = EnvelopeStore(qdir, clock=Clock())
     s.coord_set_agent("none")
     ChatStore(s)._connect().close()

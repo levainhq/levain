@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from levain.coordinator import chat, lease, room
+from levain.coordinator import chat, room
 from levain.coordinator.chat import ChatStore
 from levain.coordinator.envelopes import EnvelopeStore
 from levain.coordinator.store import CoordError, Part, words_sha256
@@ -37,10 +37,6 @@ def qdir(tmp_path):
 
 @pytest.fixture
 def store(qdir, monkeypatch):
-    widened = tuple(s.replace("'coordinator', 'worker'", "'coordinator', 'worker', 'room'", 1)
-                    if s.startswith("CREATE TABLE IF NOT EXISTS launches ") else s for s in lease.LEASE_SCHEMA)
-    assert widened != lease.LEASE_SCHEMA
-    monkeypatch.setattr(lease, "LEASE_SCHEMA", widened)
     s = EnvelopeStore(qdir, clock=Clock())
     s.coord_set_agent("none")
     return s
