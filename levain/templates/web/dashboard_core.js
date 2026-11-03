@@ -8367,8 +8367,8 @@
   // ---- the markdown and the links ---------------------------------------------------------------------------------------
   // The page's own renderer (DOM nodes only; raw HTML paints as literal text), then two passes: a bare http(s) URL becomes a link,
   // and every link is held to the rule: only absolute http/https is live (target _blank, rel noopener noreferrer); any other
-  // scheme, or a relative path, stays its text. A notify-token sender's link shows its full address beside the anchor text, so
-  // the words never hide where it goes (Phill 4a).
+  // scheme, or a relative path, stays its text. Every link whose text is not its address shows the address beside the anchor text,
+  // so the words never hide where it goes (Phill 4a; for every sender since the detail view's markdown pass).
   function ncLinkify(root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
     const hits = [];
@@ -8393,7 +8393,7 @@
       node.parentNode.replaceChild(frag, node);
     }
   }
-  function ncHarden(root, origin) {
+  function ncHarden(root) {
     for (const a of Array.from(root.querySelectorAll("a"))) {
       let url = null;
       try { const u = new URL(a.getAttribute("href") || ""); if (u.protocol === "http:" || u.protocol === "https:") url = u; } catch (_) { /* relative or unreadable: inert */ }
@@ -8402,18 +8402,92 @@
       a.setAttribute("target", "_blank");
       a.setAttribute("rel", "noopener noreferrer");
       a.classList.add("nc-link");
-      if (origin === "token") {
-        const shown = a.textContent.trim();
-        if (shown !== url.href && shown !== (url.href.replace(/\/$/, ""))) a.after(el("span", "nc-fullurl", " (" + url.href + ")"));
-      }
+      // every sender's link shows where it goes, whoever wrote it: link text that is not the address gets the address beside it
+      const shown = a.textContent.trim();
+      if (shown !== url.href && shown !== (url.href.replace(/\/$/, ""))) a.after(el("span", "nc-fullurl", " (" + url.href + ")"));
     }
   }
-  function ncBody(md, origin) {
+  // A seat's notice often has the needs-phill shape `... OPTIONS: (a) x · (b) y REC: a (why) ...`. ncShape finds that shape in
+  // the markdown text and splits it: what came before, the options as keyed rows, the REC text, what came after. null when the
+  // text is not in that shape (or the label sits inside a code fence), and the body is then drawn as plain markdown. It only
+  // splits: no word of the stored body changes.
+  const NC_OPT_LABEL = /(^|\s)\**OPTIONS:\**[ \t]+/g;
+  const NC_REC_LABEL = /(^|\s)\**REC:\**[ \t]+/g;
+  const NC_OPT_KEY = /(^|[\s·;])(?:[-*][ \t]+)?\(([a-z0-9]{1,8})\)[ \t]*/g;
+  // the first match of a label in `text` (the tail of `full`) that is not inside a code fence (an odd count of fence lines before it)
+  function ncLabel(re, text, full) {
+    re.lastIndex = 0;
+    for (let m; (m = re.exec(text)); ) {
+      if ((full.slice(0, full.length - text.length + m.index).match(/^[ \t]*(```|~~~)/gm) || []).length % 2 === 0) return m;
+    }
+    return null;
+  }
+  function ncShape(md) {
+    const o = ncLabel(NC_OPT_LABEL, md, md);
+    if (!o) return null;
+    const at = o.index + o[1].length;
+    const afterOpt = o.index + o[0].length;
+    const rest = md.slice(afterOpt);
+    const r = ncLabel(NC_REC_LABEL, rest, md);
+    const stop = /\n[ \t]*\n/.exec(rest);
+    const rAt = r ? r.index + r[1].length : -1;
+    const optEnd = r && (!stop || rAt < stop.index) ? rAt : stop ? stop.index : rest.length;
+    const optText = rest.slice(0, optEnd);
+    const keys = [];
+    NC_OPT_KEY.lastIndex = 0;
+    for (let m; (m = NC_OPT_KEY.exec(optText)); ) keys.push({ key: m[2], from: m.index + m[1].length, start: m.index + m[0].length });
+    if (keys.length < 2 || optText.slice(0, keys[0].from).trim()) return null;
+    const opts = keys.map((k, i) => {
+      const end = i + 1 < keys.length ? keys[i + 1].from : optText.length;
+      return { key: k.key, text: optText.slice(k.start, end).replace(/[\s·;]+$/, "").trim() };
+    });
+    if (opts.some((x) => !x.text)) return null;
+    let rec = "", recKey = "", tail = "";
+    if (r && rAt === optEnd) {
+      const body = rest.slice(r.index + r[0].length);
+      const cut = /\n[ \t]*\n|\s\**[A-Z][A-Z0-9'+\/&-]{2,}:\**[ \t]/.exec(body);
+      rec = (cut ? body.slice(0, cut.index) : body).trim();
+      tail = cut ? body.slice(cut.index) : "";
+      const k = /^\(?([a-z0-9]{1,8})\)?(?![A-Za-z0-9])/i.exec(rec);
+      recKey = k ? k[1].toLowerCase() : "";
+    } else tail = rest.slice(optEnd);
+    return { before: md.slice(0, at).trim(), opts, rec, recKey, tail: tail.trim() };
+  }
+  function ncInline(into, text) {
+    const f = renderMarkdown(text);
+    if (f.childNodes.length === 1 && f.firstChild.nodeName === "P") into.append(...Array.from(f.firstChild.childNodes));
+    else into.appendChild(f);
+  }
+  function ncBody(md) {
     const host = el("div", "nc-body");
-    const frag = renderMarkdown(String(md || ""));
-    ncLinkify(frag);
-    ncHarden(frag, origin);
-    host.appendChild(frag);
+    const text = String(md || "");
+    const shape = ncShape(text);
+    if (!shape) host.appendChild(renderMarkdown(text));
+    else {
+      if (shape.before) host.appendChild(renderMarkdown(shape.before));
+      const opts = el("div", "nc-opts");
+      opts.appendChild(el("div", "nc-blabel", "Options"));
+      const ul = el("ul", "nc-optlist");
+      for (const o of shape.opts) {
+        const isRec = shape.recKey && o.key.toLowerCase() === shape.recKey;
+        const li = el("li", "nc-opt" + (isRec ? " nc-opt-rec" : ""));
+        li.appendChild(el("span", "nc-optkey", "(" + o.key + ")"));
+        const t = el("span", "nc-opttext"); ncInline(t, o.text); li.appendChild(t);
+        if (isRec) li.appendChild(el("span", "nc-recmark", "Rec"));
+        ul.appendChild(li);
+      }
+      opts.appendChild(ul);
+      host.appendChild(opts);
+      if (shape.rec) {
+        const rec = el("div", "nc-rec");
+        rec.appendChild(el("div", "nc-blabel", "Recommendation"));
+        rec.appendChild(renderMarkdown(shape.rec));
+        host.appendChild(rec);
+      }
+      if (shape.tail) host.appendChild(renderMarkdown(shape.tail));
+    }
+    ncLinkify(host);
+    ncHarden(host);
     return host;
   }
 
@@ -8728,7 +8802,7 @@
     tools.append(tg, dl);
     d.appendChild(tools);
     if (typeof it.image_url === "string" && /^\/[^/\\]/.test(it.image_url)) { const im = el("img", "nc-img"); im.src = it.image_url; im.alt = ""; d.appendChild(im); }
-    if (it.body) d.appendChild(ncBody(it.body, it.origin));
+    if (it.body) d.appendChild(ncBody(it.body));
     if (it.needs_ref && it.needs_open) {
       const nd = el("div", "nc-needsbox");
       const go = el("button", "nc-needsgo", "Answer on the Needs-you card →"); go.type = "button";

@@ -19,7 +19,7 @@ from typing import Any
 
 from levain.webpush.store import NOTICES_DAYS, NOTICES_KEEP, PAIRED_PREFIX, STAMP, PushStore, now_stamp
 
-__all__ = ["PAGE", "PAGE_MAX", "CenterError", "clear", "delete", "get", "list_items", "mark_all_read", "plain_preview",
+__all__ = ["PAGE", "PAGE_MAX", "CenterError", "clear", "delete", "get", "list_items", "mark_all_read", "plain_preview", "plain_text",
            "push_url", "set_read", "unread_count"]
 
 PAGE = 50                  # the default page
@@ -52,6 +52,28 @@ _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+", re.M)
 _QUOTE = re.compile(r"^\s{0,3}>\s?", re.M)
 _BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+", re.M)
 _EMPH = re.compile(r"(\*\*|\*|`|(?<!\w)_+|_+(?!\w))")
+
+
+# paired emphasis only, on one line: a lone `_` or `*` is text (a path, a snake_case name, a footnote star) and stays
+_PAIRED = ((re.compile(r"\*\*([^*\n]+?)\*\*"), r"\1"), (re.compile(r"(?<![\w*])\*([^*\n]+?)\*(?![\w*])"), r"\1"),
+           (re.compile(r"(?<!\w)__([^_\n]+?)__(?!\w)"), r"\1"), (re.compile(r"(?<!\w)_([^_\n]+?)_(?!\w)"), r"\1"),
+           (re.compile(r"`([^`\n]+)`"), r"\1"))
+
+
+def plain_text(markdown: str) -> str:
+    """The body as plain text with its line breaks kept: the same Markdown stripped as :func:`plain_preview` (fence lines,
+    link syntax to its text, heading, quote and list marks, paired emphasis and backticks; a lone mark stays), each line's own spacing tidied and
+    runs of blank lines folded to one. The push layer sends this, because a seat's question text is line-shaped."""
+    text = re.sub(r"^[ \t]*(?:```|~~~).*\n?", "", markdown or "", flags=re.M)   # a fence line goes whole, its newline with it
+    text = _IMAGE.sub(r"\1", text)
+    text = _LINK.sub(r"\1", text)
+    text = _HEADING.sub("", text)
+    text = _QUOTE.sub("", text)
+    text = _BULLET.sub("", text)
+    for pat, sub in _PAIRED:
+        text = pat.sub(sub, text)
+    lines = [" ".join(line.split()) for line in text.replace("\r\n", "\n").split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
 def plain_preview(markdown: str, limit: int = PREVIEW_MAX) -> str:
