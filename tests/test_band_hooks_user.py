@@ -555,7 +555,7 @@ def test_an_ide_session_is_shown_the_band(rig):
 def test_the_codex_hook_shows_the_band_in_the_coordinator_workspace_only_after_install(rig):
     rig.ask()
     inst = rig.make_install("codex")
-    ws = rig.tmp / "levain-home" / "coordinator-codex"
+    ws = rig.tmp / "levain-home" / "codex-workspace"
     ws.mkdir(parents=True)
     run = lambda script, payload, cwd=ws: rig.run_script("codex", script, payload, cwd, inst)  # noqa: E731
     assert run("user_prompt_submit.py", {"prompt": "hi"}) == ""               # before opt-in: the old silence
@@ -599,47 +599,6 @@ def test_doctor_row_not_installed_is_info_installed_passes_and_broken_fails(rig)
     assert band_hook.install(python=str(rig.tmp / "no-such-python"))[0] == 0
     row = doctor._check_user_band_hooks()
     assert not row.ok and "not a runnable interpreter" in row.detail
-
-
-def test_the_panel_line_names_the_install_command_for_a_codex_workspace_outside_the_install(rig, monkeypatch, tmp_path):
-    from levain.cockpit import coordinator_status as cs
-
-    owner = tmp_path / "owner"
-    owner.mkdir()
-    monkeypatch.setattr(cs, "_band_install", lambda setting: (owner, "codex"))
-    monkeypatch.setattr(cs, "_band_cache", {})
-    setting = {"agent": "codex", "cwd": str(rig.outside)}
-    row = cs.band_row(setting)
-    assert row is not None and "levain band hooks install" in str(row)
-    rig.verb("install")
-    monkeypatch.setattr("levain.coordinator.launch.band_failure", lambda *a, **k: None)
-    assert cs.band_row(setting) is None
-
-
-def test_the_panel_holds_a_failed_band_check_for_the_ttl_and_passes_the_launchers_codex_home(rig, monkeypatch, tmp_path):
-    from levain.cockpit import coordinator_status as cs
-    from levain.coordinator import codex_launch
-
-    owner = tmp_path / "owner"
-    owner.mkdir()
-    monkeypatch.setattr(cs, "_band_install", lambda setting: (owner, "codex"))
-    monkeypatch.setattr(cs, "_band_cache", {})
-    rig.verb("install")                                  # the workspace line is not the subject here
-    calls = []
-
-    def slow_then_raises(rows, directory, agent, codex_home=None):
-        calls.append(codex_home)
-        raise TimeoutError("probe ran out of time")
-
-    monkeypatch.setattr("levain.coordinator.launch.band_failure", slow_then_raises)
-    launcher_home = tmp_path / "launcher-codex-home"
-    monkeypatch.setattr(codex_launch, "codex_home", lambda: launcher_home)
-    setting = {"agent": "codex", "cwd": str(owner)}
-    for t in (100.0, 110.0, 159.0):
-        assert cs.band_row(setting, now=t) is None       # a check that could not run: no line, and not re-run
-    assert calls == [launcher_home]
-    cs.band_row(setting, now=161.0)                      # past the TTL: checked again
-    assert calls == [launcher_home, launcher_home]
 
 
 # --- round 2: remove and install never lose the operator's file, and say what they could not do ------------------
@@ -765,24 +724,6 @@ def test_the_probe_starts_python_as_the_hook_does(rig):
     assert band_hook.user_band_state()[0] == "installed"
 
 
-def test_a_codex_coordinator_outside_the_owning_install_needs_the_user_band(rig, monkeypatch):
-    # codex #2: outside the install whose hooks Codex runs, those hooks take the outside branch, which shows the band
-    # only once `levain band hooks install` wrote its receipt
-    from levain.coordinator import codex_launch as cx
-
-    owner = rig.make_install("codex")
-    monkeypatch.setattr(cx, "codex_home", lambda: rig.codex)
-    monkeypatch.setattr(cx, "hook_live", lambda d: (True, "wired to this install"))
-    ws = rig.lv / "coordinator-codex"
-    ws.mkdir()
-    live, why = cx.global_hook_live(ws)
-    assert not live and "the coordinator would show no NEEDS YOU band" in why
-    assert why.endswith("Fix: `levain band hooks install`") and str(ws) in why
-    assert cx.workspace_band_problem(owner, owner / "sub") is None        # inside: the install's own check answers
-    assert band_hook.install(python=str(rig.py))[0] == 0
-    assert cx.global_hook_live(ws)[0]
-
-
 # --- round 3 ---------------------------------------------------------------------------------------------------
 def _band_handlers(doc, event, script):
     return [h for g in doc["hooks"][event] for h in g["hooks"] if script in h.get("command", "")]
@@ -828,28 +769,6 @@ def test_a_codex_install_wired_through_a_project_hooks_file_stands_the_user_band
     assert capsys.readouterr().out == ""                                   # one band: the install's own
 
 
-def test_a_global_codex_install_shows_its_own_band_in_an_outside_workspace(rig, monkeypatch):
-    # a global-scope install's hooks take their full branch everywhere (should_fire), which renders the band, so an
-    # outside workspace with no user-level receipt is not a bandless launch
-    import importlib.util
-
-    from levain.coordinator import codex_launch as cx
-
-    owner = rig.make_install("codex")
-    (owner / ".levain" / "config.json").write_text(json.dumps({"scope": "global"}))
-    monkeypatch.setattr(cx, "codex_home", lambda: rig.codex)
-    assert band_hook.read_receipt() is None
-    assert cx.workspace_band_problem(owner, rig.outside) is None
-    spec = importlib.util.spec_from_file_location("_levain_hook_globalchk",
-                                                  owner / "activation" / "hooks" / "_levain_hook.py")
-    hookmod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(hookmod)
-    monkeypatch.chdir(rig.outside)
-    assert hookmod.install_root() == owner.resolve() and hookmod.should_fire()
-    (owner / ".levain" / "config.json").write_text(json.dumps({"scope": "install"}))
-    assert not hookmod.should_fire() and cx.workspace_band_problem(owner, rig.outside) is not None
-
-
 def test_two_threads_inside_band_probe_once_keep_their_own_results(rig, monkeypatch):
     import threading
 
@@ -887,20 +806,3 @@ def test_two_threads_inside_band_probe_once_keep_their_own_results(rig, monkeypa
         assert doctor._band_import_problem("/py") == "result 3"
     assert doctor._band_import_problem("/py") == "result 4"  # outside any block nothing is kept
 
-
-def test_the_panel_says_when_the_codex_workspace_check_could_not_run(rig, monkeypatch, tmp_path):
-    from levain.cockpit import coordinator_status as cs
-    from levain.coordinator import codex_launch
-
-    owner = tmp_path / "owner"
-    owner.mkdir()
-    monkeypatch.setattr(cs, "_band_install", lambda setting: (owner, "codex"))
-    monkeypatch.setattr(cs, "_band_cache", {})
-    monkeypatch.setattr("levain.coordinator.launch.band_failure", lambda *a, **k: None)
-
-    def broken(owner, work):
-        raise OSError("hooks.json unreadable")
-
-    monkeypatch.setattr(codex_launch, "workspace_band_problem", broken)
-    row = cs.band_row({"agent": "codex", "cwd": str(rig.outside)})
-    assert row is not None and "cannot check: OSError: hooks.json unreadable" in row.body

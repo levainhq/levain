@@ -184,13 +184,11 @@ def test_an_unread_release_is_the_first_read_and_the_coordinator_cannot_answer_i
 def test_a_watch_pass_releases_a_due_ping_whatever_claude_reads(desk, monkeypatch, claude):
     """L3 r3 (codex MED): ``watch_once`` released held pings only at its bottom, after the returns for no ``claude``
     on PATH and an unreadable session list, so in a Codex-only install a due ping stayed silent (red on 3540ae0c)."""
-    from levain.coordinator import codex_launch
     from levain.coordinator import launch as cl
 
     desk.coordinator()
     q, _ = desk.ask()
     desk.later(minutes=10)
-    monkeypatch.setattr(codex_launch, "watch_once", lambda store: [])
     monkeypatch.setattr(cl, "_harness", lambda: (None, {}) if claude == "unavailable" else ("/x/claude", {}))
     monkeypatch.setattr(cl, "_observed", lambda exe, env, cwd: None)
     lines = cl.watch_once(desk.store)

@@ -13,7 +13,7 @@ directory the session was launched in (measured, for ``claude -p`` and a Codex t
 
 A directory is a coordinator's workspace when the COORDINATOR RECORD names it (head ruling R1, 1021+19): a file in the
 default consent directory and the same file under the account's own home (from the password database), both outside
-every root a coordinator's turn can write (a Codex coordinator's sandbox writes its workspace, never the consent
+every root a coordinator's turn can write (a coordinator's sandbox writes its workspace, never the consent
 directory), written by ``levain coord agent`` before it records a setting and only ever added to; either naming a
 directory is enough. The record names real paths; directories are compared by device and inode as well as by
 spelling (a case-insensitive volume has many spellings of one). The workspace's own ``.levain/config.json`` role line
@@ -423,7 +423,7 @@ def admit(directory: str | Path) -> tuple[str | None, bool]:
             return None, False
         if not marked(Path(real)):
             return (f"{real} is not a coordinator's workspace (Levain's coordinator record does not name it); "
-                    "`levain coord agent claude` or `levain coord agent codex` makes and records one"), False
+                    "`levain coord agent claude` makes and records one"), False
         record(Path(real))
     except RecordUnreadable as exc:
         return unreadable(exc), False

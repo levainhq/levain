@@ -1531,13 +1531,14 @@ def user_layer_text(setting: Any) -> str:
 
 def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     """``levain coord agent``: for claude, the directory is made a Levain install for Claude Code first when it is not
-    one (``levain init``, non-interactive), and the setting is recorded only once its consent hook is live; codex is
-    :func:`_coord_agent_codex`. Either workspace goes in the coordinator record before the setting names it."""
+    one (``levain init``, non-interactive), and the setting is recorded only once its consent hook is live. The
+    workspace goes in the coordinator record before the setting names it. ``codex`` is refused: the Codex coordinator
+    was removed."""
     user_scope = None if args.user_scope is None else args.user_scope == "on"
     if args.agent is None:
         # `levain coord agent --user-scope on|off` alone: the standing setting is kept whole, only the layer choice moves
         if user_scope is None:
-            raise CoordError("name an agent (claude, codex or none), or give --user-scope on|off to change only that")
+            raise CoordError("name an agent (claude or none), or give --user-scope on|off to change only that")
         if args.cwd is not None or args.model is not None:
             raise CoordError("--user-scope alone keeps the agent, model and directory; name the agent to change them")
         checked = None
@@ -1566,11 +1567,12 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     from levain.coordinator import door
     from levain.coordinator.lease import check_model
 
+    if args.agent == "codex":        # before the model check: the removal is the reason, whatever the model says
+        raise CoordError("a Codex coordinator was removed: set claude or none. A Codex session you run yourself is "
+                         "still wrapped by the consent queue, and `levain session codex` runs one as a worker")
     check_model(args.model)          # before any install is made for it (the setting checks it again as it is written)
-    if args.agent == "codex":
-        return _coord_agent_codex(args, out, store)
     if args.agent != "claude":
-        raise CoordError(f"a {args.agent} coordinator cannot be launched yet; set claude, codex or none")
+        raise CoordError(f"a {args.agent} coordinator cannot be launched yet; set claude or none")
     from levain.coordinator.launch import default_coordinator_dir, setup_install, trust_remedy
 
     log = sys.stderr if args.json else out
@@ -1948,23 +1950,6 @@ def _record_workspace(target: Path) -> None:
         raise CoordError(f"not set: {target} could not be put in the coordinator record ({exc})") from exc
 
 
-def _coord_agent_codex(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
-    """``levain coord agent codex``: :func:`levain.coordinator.codex_launch.setup` makes the workspace (never the
-    operator's own Codex install, never his hooks file), then it is recorded and the setting written."""
-    from levain.coordinator import codex_launch
-
-    if args.user_scope is not None:
-        raise CoordError("--user-scope is for a claude coordinator (a Codex coordinator loads its own config)")
-    target, ready, detail = codex_launch.setup(args.cwd)
-    if not ready:
-        raise CoordError(f"not set: {detail}")
-    _record_workspace(target)
-    got = store.coord_set_agent("codex", model=args.model, cwd=str(target), user_scope=False)
-    _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "detail": detail},
-          f"coordinator agent: codex{f' ({got.model})' if got.model else ''} in {got.cwd}\n{detail}")
-    return 0
-
-
 def review_feeds() -> tuple[str, ...]:
     from levain.coordinator import review
 
@@ -2145,13 +2130,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                                        "claude coordinator running without the lease whose session is done is "
                                        "ended and a fresh one started.")
     ca = c_sub.add_parser(
-        "agent", help="Choose the coordinator a drop launches: claude or codex (each in its own workspace), or none.",
+        "agent", help="Choose the coordinator a drop launches: claude (in its own workspace), or none.",
         description="claude: drops with no coordinator start a Claude Code session in DIR (default "
                     "<levain home>/coordinator), which is made a Levain install for Claude Code first when it is not "
-                    "one. codex: they start a thread on your Codex app-server daemon in DIR (default "
-                    "<levain home>/coordinator-codex); Codex's consent hook must already be live (levain init "
-                    "--adapter codex). Either workspace is put in Levain's coordinator record, which the coordinator's "
-                    "door reads. none: drops only queue for you. Levain never edits a harness's trust list: run the "
+                    "one. The workspace is put in Levain's coordinator record, which the coordinator's "
+                    "door reads. codex: removed (a Codex coordinator is no longer launched). none: drops only queue for you. Levain never edits a harness's trust list: run the "
                     "printed line once and trust the directory.")
     ca.add_argument("agent", nargs="?", default=None, choices=("claude", "codex", "none"))
     ca.add_argument("--user-scope", choices=("on", "off"), default=None, dest="user_scope",
@@ -2159,8 +2142,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                          "CLAUDE.md (default off: it loads the project and local layers only). Alone "
                          "(no agent) it changes only this and keeps the standing agent, model and directory.")
     ca.add_argument("--cwd", type=Path, default=None, metavar="DIR",
-                    help="The directory the coordinator runs in (default: <levain home>/coordinator, or "
-                         "coordinator-codex): a missing or empty one, which Levain sets up, or a coordinator "
+                    help="The directory the coordinator runs in (default: <levain home>/coordinator): "
+                         "a missing or empty one, which Levain sets up, or a coordinator "
                          "workspace Levain set up before. Your own Levain install is refused.")
     ca.add_argument("--model", default=None, help="The model the session runs (default: the harness's own).")
     cl = c_sub.add_parser("launch", help="Start a pending launch's session now (default: the pending coordinator's).")

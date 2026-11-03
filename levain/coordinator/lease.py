@@ -35,7 +35,8 @@ token (:func:`claim_spawn`); the primary key is the compare-and-set, so a second
 the service; an operator ``take`` holds the lease for ``LEASE_TTL`` unless told otherwise; your take or release is what
 "until you look" reads. (C3b, 1020+50): ``unset`` is checked after a live lease, a running coordinator and a pending
 launch (those still say what a drop would do), before the death count; a setting is a whole row, never a field
-update. (C3c, 1021+18): :func:`set_agent` takes codex now that a codex launch is built. (C3b fix 1): a thread
+update. (C3c, 1021+18): :func:`set_agent` took codex while a codex launch was built; since the Codex coordinator's
+removal it refuses it, and a codex row an older install still holds wakes nothing (:func:`wake_state`). (C3b fix 1): a thread
 or drop write the fence lets through is recorded as a ``beat`` row by coordinator that moves nothing
 (:func:`record_write`), so "it wrote as coordinator" is one question over ``lease_events``. Stdlib only.
 """
@@ -57,18 +58,23 @@ from levain.contracts.canon import canonical
 from levain.coordinator.store import CoordError, _append_only, next_gseq
 
 __all__ = [
-    "BACKOFF", "HARNESSES", "MAX_SPAWNS_LIVE", "MAX_SPAWN_DEPTH", "SPAWN_PREFIX",
+    "BACKOFF", "CODEX_REMOVED", "CODEX_REMOVED_WHY", "HARNESSES", "MAX_SPAWNS_LIVE", "MAX_SPAWN_DEPTH", "SPAWN_PREFIX",
     "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
     "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "activate_room", "beat",
     "check_model", "claim", "by_harness_session", "claim_spawn", "end_done_worker", "end_launch", "end_unlisted", "fence", "launch",
     "lease", "launches", "LaunchThread", "mark_swept", "migrate_launch_roles", "open_room_launch", "over_unswept", "record_thread", "record_write", "release",
-    "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
+    "removed_coordinators", "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
     "wake_state", "HANDOFF_MAX", "refuse_unstarted_worker", "worker_handoff",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
 LAUNCH_KINDS = ("pending", "active", "failed", "expired", "ended")
-HARNESSES = ("claude", "codex")
+HARNESSES = ("claude", "codex")    # codex stays: launch rows and role specs written before its removal name it
+# the Codex coordinator was removed (1103-33): a codex coordinator launch an older install still holds is ended or
+# failed by the watcher with this cause (only a non-claude launch may carry it, so it relabels no claude death), and a
+# standing codex setting wakes nothing, for the reason below
+CODEX_REMOVED = "codex coordinator removed"
+CODEX_REMOVED_WHY = "the Codex coordinator was removed; run `levain coord agent claude` or `none`"
 # a worker refused at its spawn claim or activation because its thread's budget gauge is crossed (C6): a stop, never
 # a death
 BUDGET_CROSSED = "budget crossed"
@@ -913,6 +919,8 @@ def end_launch(conn: sqlite3.Connection, now: str, launch_id: str, kind: str, ca
     if cause in _SERVICE_CAUSES:
         raise _refused(f"cause {cause!r} is one the store writes itself")
     ln = _must_launch(conn, launch_id)
+    if cause == CODEX_REMOVED and ln.harness == "claude":
+        raise _refused(f"cause {cause!r} ends only a launch of a removed harness")
     if kind == "ended" and ln.state != "active" or kind != "ended" and ln.state != "pending":
         raise _refused(f"launch {launch_id} is {ln.state}; it cannot be {kind}")
     _launch_event(conn, now, launch_id, kind, _line("cause", cause) or kind)
@@ -986,6 +994,13 @@ def unspawned(conn: sqlite3.Connection) -> list[Launch]:
     """Pending launches no process has claimed the spawn of, oldest first."""
     return [ln for ln in _in_state(conn, "pending") if conn.execute(
         "SELECT 1 FROM launch_spawns WHERE launch_id = ?", (ln.launch_id,)).fetchone() is None]
+
+
+def removed_coordinators(conn: sqlite3.Connection) -> list[Launch]:
+    """Every coordinator launch not yet over (``pending``, its spawn claimed or not, or ``active``) whose harness is
+    not claude, the pending ones first: what the watcher's retirement pass ends (:data:`CODEX_REMOVED`)."""
+    return [ln for state in ("pending", "active") for ln in _in_state(conn, state, "coordinator")
+            if ln.harness != "claude"]
 
 
 def launch_dirs(conn: sqlite3.Connection) -> list[str]:
@@ -1322,6 +1337,8 @@ def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | No
     """Record your coordinator setting (writer: you only). ``cwd`` is stored as given, which the caller has resolved
     (Claude Code keys a directory's trust on its real path); agent ``none`` takes neither model nor directory.
     ``user_scope`` None keeps the standing setting's (off when there is none); any agent but claude is always off."""
+    if agent == "codex":
+        raise _refused(CODEX_REMOVED_WHY)
     if agent not in SETTING_AGENTS:
         raise _refused(f"the coordinator agent is one of {', '.join(SETTING_AGENTS)}")
     if agent == "none":
@@ -1342,9 +1359,13 @@ def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | No
 def set_user_scope(conn: sqlite3.Connection, now: str, user_scope: bool, *, cwd: str | None = None) -> Setting:
     """``levain coord agent --user-scope on|off`` alone, in the caller's ONE write transaction: the latest setting is
     read and its replacement (same agent, model and directory) appended under the same lock, so a concurrent change
-    is never undone by a stale copy. Refused unless the standing agent is claude; ``cwd``, when given, must still be
+    is never undone by a stale copy. Refused unless the standing agent is claude (a codex one with
+    :data:`CODEX_REMOVED_WHY`); ``cwd``, when given, must still be
     the standing directory (the one the caller checked the hook in)."""
     was = setting(conn)
+    if was is not None and was.agent == "codex":
+        # a setting an install upgraded from 0.11.15 still holds: the refusal names why it launches nothing
+        raise _refused(CODEX_REMOVED_WHY)
     if was is None or was.agent != "claude":
         raise _refused(f"--user-scope alone changes a claude coordinator, and the standing agent is "
                        f"{'not set' if was is None else was.agent} (levain coord agent claude --user-scope on|off "
@@ -1403,7 +1424,8 @@ def launch_death(conn: sqlite3.Connection, ln: Launch) -> bool | None:
     # writing as coordinator died idle
     wrote = _wrote_since(conn, ln.session_key)
     died = ln.state in ("failed", "expired") and ln.cause not in ("lease lost before active", BUDGET_CROSSED,
-                                                                       SEVERAL_THREADS, REPLACED, SPAWN_REFUSED) \
+                                                                       SEVERAL_THREADS, REPLACED, SPAWN_REFUSED,
+                                                                       CODEX_REMOVED) \
         or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
     # REPLACED (ended): its session finished a turn and was ended to make room, never a death, written or not
     if not died:
@@ -1452,8 +1474,8 @@ def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
 def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
     """What a drop arriving now would do, without writing: ``(state, why)``, state one of ``held`` (a live lease),
     ``launching`` (a pending coordinator launch), ``idle`` (a coordinator still running without the lease),
-    ``unset`` (no coordinator setting, or agent none: a drop only queues), ``backoff``, ``stopped`` (you look), or
-    ``wake``."""
+    ``unset`` (no coordinator setting, agent none, or a codex setting written before the Codex coordinator's removal:
+    a drop only queues), ``backoff``, ``stopped`` (you look), or ``wake``."""
     held = lease(conn, now)
     if held is not None and held.live:
         holder = None if held.holder == "operator" else _launch_by_key(conn, held.holder)
@@ -1478,6 +1500,8 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
     if chosen is None or chosen.agent == "none":
         how = "no coordinator agent is set" if chosen is None else "the coordinator agent is none"
         return "unset", f"{how}; drops queue for you (levain coord agent claude sets one)"
+    if chosen.agent != "claude":
+        return "unset", f"{CODEX_REMOVED_WHY}; drops queue for you until then"
     count, latest = _deaths(conn)
     if count >= MAX_DEATHS:
         return "stopped", (f"{count} coordinator launches in a row died; nothing launches until you look "
@@ -1505,7 +1529,7 @@ def wake(conn: sqlite3.Connection, now: str) -> Launch | None:
     session_key = "s-" + secrets.token_hex(8)
     token = _event(conn, now, "claim", session_key, token=None, until=_plus(now, LAUNCH_TTL), cause="bootstrap",
                    by="service")
-    chosen = setting(conn)          # wake_state answered wake: a harness is set
+    chosen = setting(conn)          # wake_state answered wake: the agent is claude
     return _pending(conn, now, token=token, harness=chosen.agent, role="coordinator", threads=(), model=chosen.model,
                     cwd=chosen.cwd, cause="wake", session_key=session_key, user_scope=chosen.user_scope)
 
