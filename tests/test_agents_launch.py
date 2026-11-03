@@ -880,31 +880,97 @@ def test_a_gate_killed_outright_still_takes_the_executor_with_it(tmp_path):
 
 def test_a_fire_whose_reaper_cannot_start_is_killed_and_reaped_before_the_error(rig, monkeypatch):
     # behaviour (codex MED r2): Popen started the fire and the reaper thread then failed to start; spawn_fire kills the
-    # fire's process group, reaps it and re-raises, so no fire runs with no owner
-    import threading
-    oid, _ = _launched(rig)
+    # fire's process group, reaps it and re-raises, so no fire runs with no owner. The failure is injected through
+    # controller's own thread seam (codex-test LOW r3), never by patching the threading or subprocess modules
     made = []
 
-    class Recorded(subprocess.Popen):
-        def __init__(self, *a, **k):
-            super().__init__(*a, **k)
-            made.append(self)
-
-    class NoThread(threading.Thread):
+    class NoThread:
+        def __init__(self, *, target, **_):
+            made.append(target.__self__)                              # target is the fire's Popen.wait
         def start(self):
             raise RuntimeError("can't start new thread")
 
-    monkeypatch.setattr(ctl.subprocess, "Popen", Recorded)
-    monkeypatch.setattr(ctl.threading, "Thread", NoThread)
-    with pytest.raises(RuntimeError, match="can't start new thread"):
-        ctl.spawn_fire(rig.store.directory, oid, argv=[sys.executable, "-c", "import time; time.sleep(60)"], env=ENV)
-    monkeypatch.undo()
-    (fire,) = made
+    oid, _ = _launched(rig)
+    monkeypatch.setattr(ctl, "_thread_factory", NoThread)
     try:
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            ctl.spawn_fire(rig.store.directory, oid, argv=[sys.executable, "-c", "import time; time.sleep(60)"],
+                           env=ENV)
+        (fire,) = made
         assert fire.returncode == -signal.SIGKILL, "the ownerless fire was left running"
         with pytest.raises(ChildProcessError):
             os.waitpid(fire.pid, os.WNOHANG)
     finally:
-        if fire.returncode is None:
-            fire.kill()
-            fire.wait(30)
+        for fire in made:
+            if fire.returncode is None:
+                fire.kill()
+                fire.wait(30)
+
+
+# --- P6-5b r4: the gate's setup failure path, a late signal, the drain's deadline ------------------------------------
+
+def _gate_variant(source: str, old: str, new: str) -> str:
+    """The gate with one injected change (the gate runs in a ``python -I`` child, so its source is the only seam)."""
+    assert source.count(old) == 1, f"the gate no longer contains {old!r} exactly once"
+    return source.replace(old, new)
+
+
+_GATE_PRELUDE = "import os, signal, sys, threading, time\n"
+
+
+@pytest.mark.parametrize("old, new", [
+    ("threading.Thread(", "no_thread("),                              # the reaper thread cannot even be made
+    ("signal.signal(s, on_signal)", "no_thread(s)"),                  # the reaper runs; a handler cannot be installed
+], ids=["thread-construction", "handler-install"])
+def test_a_gate_whose_setup_fails_after_the_fork_ends_the_group_and_exits_unproven(tmp_path, monkeypatch, old, new):
+    # behaviour (codex MED r3): a failure anywhere after the executor's fork kills and reaps the executor's group before
+    # the gate exits, and the gate's status is GATE_UNPROVEN, never a status a stop() may read as a termination proof.
+    # The injected failure waits until the executor is up (holding its flock), so its death is the gate's doing
+    child, lock, up = _sleeper(tmp_path)
+    raises = (_GATE_PRELUDE + "def no_thread(*a, **k):\n"
+              f"    [time.sleep(0.05) for _ in range(600) if not os.path.exists({str(up)!r})]\n"
+              "    raise MemoryError('injected')\n")
+    monkeypatch.setattr(ctl, "_GATE", _gate_variant(_gate_variant(ctl._GATE, _GATE_PRELUDE, raises), old, new))
+    gated = ctl.GatedChild(child)
+    try:
+        gated.release()
+        assert gated.process.wait(60) == ctl.GATE_UNPROVEN
+        executor = int(up.read_text())
+        assert _ended(lock, 0), "the executor outlived the gate's failed setup"
+        with pytest.raises(ProcessLookupError):                       # reaped by the gate itself, not left a zombie
+            os.kill(executor, 0)
+        assert ctl.GATE_UNPROVEN not in (0, ctl.GATE_REFUSED, ctl.GATE_NO_EXEC) and ctl.GATE_UNPROVEN < 128
+    finally:
+        gated.abort(1)
+        _reap_stray(lock, up)
+
+
+def test_a_signal_after_the_reaper_took_the_executors_status_does_not_replace_it(tmp_path, monkeypatch):
+    # behaviour (complement D3 r3): the executor exits 3 on its own and the reaper takes that status; a SIGTERM to the
+    # gate that lands after that (held open here by an injected pause) must not turn the exit into 128 + SIGTERM
+    taken = tmp_path / "taken"
+    monkeypatch.setattr(ctl, "_GATE", _gate_variant(
+        ctl._GATE, "    ending.acquire()\n",
+        f"    ending.acquire()\n    open({str(taken)!r}, 'w').close()\n    time.sleep(1.5)\n"))
+    gated = ctl.GatedChild([sys.executable, "-c", "import sys; sys.exit(3)"])
+    try:
+        gated.release()
+        _wait_for(taken, gated.process)
+        os.kill(gated.process.pid, signal.SIGTERM)
+        assert gated.process.wait(30) == 3
+    finally:
+        gated.abort(1)
+
+
+def test_a_group_that_never_drains_exits_unproven_at_the_deadline(tmp_path, monkeypatch):
+    # behaviour (complement D1 r3): a group whose members never leave (on Linux, zombies under a PID 1 that does not
+    # reap still count; simulated by a probe that always answers) does not hold the gate forever: past the drain
+    # deadline it exits GATE_UNPROVEN, which a stop() must not read as a termination proof
+    assert ctl._GATE == ctl._gate(ctl.GATE_DRAIN_S) and ctl.GATE_DRAIN_S == 10.0
+    monkeypatch.setattr(ctl, "_GATE", _gate_variant(ctl._gate(0.3), "os.killpg(anchor, 0)", "os.kill(os.getpid(), 0)"))
+    gated = ctl.GatedChild([sys.executable, "-c", "import sys; sys.exit(0)"])
+    try:
+        gated.release()
+        assert gated.process.wait(15) == ctl.GATE_UNPROVEN
+    finally:
+        gated.abort(1)
