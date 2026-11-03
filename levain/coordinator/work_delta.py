@@ -132,12 +132,16 @@ class WorkDelta(NamedTuple):
     many records are after ``since`` in all. ``through``: the greatest ``gseq`` among them (``since`` when none).
     ``unordered``: replies with no ``gseq``, which no cursor can place. ``unreplied``: the drops with no coordinator
     reply (:func:`levain.coordinator.drop_reply.unreplied`), a derived section: not a ``gseq`` record, so in neither
-    ``total`` nor ``through``, and shown even when nothing else is new."""
+    ``total`` nor ``through``, and shown even when nothing else is new. ``intake``: the intake card's derived lines
+    (:mod:`levain.coordinator.intake`) when a card is due, with ``intake_open`` the operator open it is due for (0:
+    none); also not a record, and also shown when nothing else is new."""
     lines: list[tuple[int, str]]
     total: int
     through: int
     unordered: int
     unreplied: tuple = ()
+    intake: tuple = ()
+    intake_open: int = 0
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -184,17 +188,25 @@ def work_delta(conn: sqlite3.Connection, since: int, limit: int = MAX_LINES, *, 
             from levain.coordinator import drop_reply            # it imports this module: read at call time
 
             silent = tuple(drop_reply.unreplied(conn, now, exclude_drop))
+        card, card_open = (), 0
+        if now is not None:
+            from levain.coordinator import intake
+
+            owed = intake.due(conn)                          # the same snapshot as the records above
+            if owed is not None:
+                card, card_open = tuple(intake.lines(owed)), owed.open_id
     finally:
         if own:
             conn.execute("ROLLBACK")              # a read snapshot: nothing to commit
     lines.sort(key=lambda g: g[0])
-    return WorkDelta(lines[:limit], total, through, unordered, silent)
+    return WorkDelta(lines[:limit], total, through, unordered, silent, card, card_open)
 
 
 def render(delta: WorkDelta) -> str:
-    """The block as the operator reads it; ``""`` when nothing is after the cursor and no drop is waiting for a reply.
-    The unreplied-drop lines follow the records (and stand alone, under a ``0 of 0`` head, when there are none)."""
-    if not delta.total and not delta.unreplied:
+    """The block as the operator reads it; ``""`` when nothing is after the cursor, no drop is waiting for a reply and no
+    intake card is due. The unreplied-drop lines follow the records (and stand alone, under a ``0 of 0`` head, when
+    there are none), then the intake card's lines: the head is first whichever of them the block holds."""
+    if not delta.total and not delta.unreplied and not delta.intake:
         return ""
     shown = delta.lines
     note = ""
@@ -211,16 +223,19 @@ def render(delta: WorkDelta) -> str:
     out.extend(f"  {drop_reply.unreplied_line(u)}" for u in delta.unreplied[:MAX_LINES])
     if len(delta.unreplied) > MAX_LINES:
         out.append(f"  +{len(delta.unreplied) - MAX_LINES} more drops with no reply")
+    out.extend(f"  {text}" for text in delta.intake)
     return "\n".join(out)
 
 
 class WorkBlock(NamedTuple):
     """``text``: the block (``""`` for nothing to say; the ``! not read`` line for a store that could not be read).
     ``through``: the cursor a verified reply would advance to (0 when it must not move). ``store_id``: the
-    ``meta.store_id`` of the store it was read from (``""`` when none was read), which :func:`advance` requires."""
+    ``meta.store_id`` of the store it was read from (``""`` when none was read), which :func:`advance` requires.
+    ``intake_open``: the operator open whose card the block carries (0: none), recorded once the reply verifies."""
     text: str
     through: int
     store_id: str = ""
+    intake_open: int = 0
 
 
 def _store_id(conn: sqlite3.Connection) -> str:
@@ -249,7 +264,7 @@ def read_block(directory: Path | str | None, viewer: str, busy_s: float) -> Work
         return WorkBlock(f"{HEAD}): {UNREAD}", 0)
     finally:
         conn.close()
-    return WorkBlock(render(delta), delta.through if delta.total else 0, store_id)
+    return WorkBlock(render(delta), delta.through if delta.total else 0, store_id, delta.intake_open)
 
 
 def advance(directory: Path | str | None, viewer: str, through: int, busy_s: float, store_id: str) -> bool:

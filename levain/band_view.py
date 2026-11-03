@@ -1802,7 +1802,7 @@ def _hook_render(store: QuestionStore, directory: Path | str, session: str, view
     except Exception:
         return echo, _no_commit
     block = text                             # the band as the seat reads it (the delta line in): what Stop compares
-    work_through, work_store = 0, ""
+    work_through, work_store, intake_open = 0, "", 0
     if coord:
         # the work delta rides ahead of the band, inside the one block Stop verifies; its cursor commits with the view
         try:
@@ -1810,6 +1810,7 @@ def _hook_render(store: QuestionStore, directory: Path | str, session: str, view
 
             work = work_delta.read_block(directory, viewer, deadline - time.monotonic())
             work_text, work_through, work_store = work.text, work.through, work.store_id
+            intake_open = work.intake_open
         except Exception:                 # never an empty block for a delta that could not be built
             work_text = "since your last message (Levain's record): ! not read (the work delta could not be built)"
         if work_text:
@@ -1820,7 +1821,7 @@ def _hook_render(store: QuestionStore, directory: Path | str, session: str, view
 
     def commit() -> None:
         if coord:                             # the coordinator's view is the Stop hook's to commit, after the reply verifies
-            _stage_view(directory, session, r, block, work_through, work_store)
+            _stage_view(directory, session, r, block, work_through, work_store, intake_open)
             return
         try:
             mark_closed_shown(store, r.closed)
@@ -1929,15 +1930,17 @@ def _remove_if(f: Path, expect: bytes | None) -> None:
 
 
 def _stage_view(directory: Path | str, session: str, r: "Rendered", block: str, work: int = 0,
-                store_id: str = "") -> None:
+                store_id: str = "", intake_open: int = 0) -> None:
     """Keep the view a coordinator turn was just shown for its Stop hook to commit: one record per SESSION (two
     coordinator sessions alive at once never share one), replaced atomically. ``work``: the work cursor
     (:mod:`levain.coordinator.work_delta`) that commits with the view (0: it does not move), and ``store_id`` the
-    coordinator store it was read from (the advance refuses another). Never raises."""
+    coordinator store it was read from (the advance refuses another). ``intake_open``: the operator open whose intake
+    card the block carries, recorded with the cursor (0: none). Never raises."""
     try:
         _replace(_session_file(directory, session, "staged"),
                  json.dumps({"session": session, "hwm": r.hwm, "shown": list(r.shown), "gen": r.gen,
-                             "closed": list(r.closed), "block": block, "work": work, "store_id": store_id}))
+                             "closed": list(r.closed), "block": block, "work": work, "store_id": store_id,
+                             "intake_open": intake_open}))
     except Exception:
         pass
 
@@ -1956,7 +1959,8 @@ def _read_staged(directory: Path | str, session: str) -> tuple[dict, bytes] | No
             return None
         return ({"hwm": int(rec["hwm"]), "shown": [int(n) for n in rec["shown"]], "gen": int(rec["gen"]),
                  "closed": [int(n) for n in rec["closed"]], "block": str(rec["block"]),
-                 "work": int(rec.get("work", 0)), "store_id": str(rec.get("store_id") or "")}, raw)
+                 "work": int(rec.get("work", 0)), "store_id": str(rec.get("store_id") or ""),
+                 "intake_open": int(rec.get("intake_open", 0))}, raw)
     except Exception:
         return None
 
@@ -1995,6 +1999,11 @@ def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, 
 
             left = HOOK_BUSY_MS / 1000 if deadline is None else deadline - time.monotonic()
             work_delta.advance(directory, viewer, st["work"], left, st["store_id"])
+        if st["intake_open"] > 0:             # the card is shown once: recorded only now the block was reprinted
+            from levain.coordinator import intake
+
+            left = HOOK_BUSY_MS / 1000 if deadline is None else deadline - time.monotonic()
+            intake.record(directory, st["intake_open"], "terminal", session, left, st["store_id"])
         _clear_staged(directory, session, raw)
         return None
     if payload.get("stop_hook_active") or not _claim_retry(directory, viewer, st["gen"]):

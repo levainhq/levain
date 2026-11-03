@@ -59,6 +59,8 @@ EXEMPT: dict[str, str] = {
                    "the next open reports as having happened since you left",
     "open_deliveries": "evidence that a build was handed over (C15 S2b); it moves no cursor and reports nothing",
     "open_acks": "the acknowledgement that moves the cursor (C15 S2b), not work the next open reports",
+    "intake_views": "which operator open's intake card a verified reply carried (C15 S5): a display record that makes "
+                    "'once' exact; it is not work the next open reports as having happened since you left",
     "open_unsequenced_cuts": "the per-table rowid an open showed of the unsequenced class (C15 S2b), the cut's own "
                              "bookkeeping",
     **{name: _DISPATCH for name in (

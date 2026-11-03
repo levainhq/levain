@@ -3,8 +3,8 @@ writers and readers underneath (:mod:`seam_handoffs`, :mod:`seam_build`, :mod:`s
 takes the parsed arguments, the output stream and the store, prints, and returns the exit code; a refusal is a
 :class:`CoordError` the caller (``cli._run_coord``) prints and turns into exit 1, as every other coord verb's.
 
-``coord close --plan`` (the operator-walk checklist) is not here: no read computes the walk's checklist yet, so the flag
-does not exist rather than print an invented one.
+``coord close --plan`` (the operator-walk checklist, :mod:`levain.coordinator.seam_plan`) is the read-only face of
+``coord close``: it writes nothing, so it takes no handoff body and no token.
 """
 from __future__ import annotations
 
@@ -83,9 +83,33 @@ def _prev_line(handoff: Any) -> str:
     return f"your next close names --prev-handoff-id {handoff.handoff_id}"
 
 
+def _run_plan(args: argparse.Namespace, out: Any, store: Any) -> int:
+    """``coord close --plan``: the walk's checklist, read-only (:mod:`levain.coordinator.seam_plan`)."""
+    from levain.coordinator import seam_plan
+
+    if args.body_file is not None:
+        raise CoordError("--plan prints the operator-walk checklist and writes no handoff, so it takes no --body-file; "
+                         "nothing was written")
+    lv = _lv(_active(store, args.token)[0]) if args.token is not None else _lv(None)
+    try:
+        lines = seam_plan.close_plan(store, args.queue_dir, store._clock(), lv)
+    except StoreAbsent:
+        raise CoordError("there is no coordinator store here, so there is no walk to derive") from None
+    _emit(out, args.json, {"plan": lines}, "operator walk (each line is read from the stores; nothing was written):\n" +
+          "\n".join(f"{i}. {ln}" for i, ln in enumerate(lines, 1)))
+    return 0
+
+
 def run_close(args: argparse.Namespace, out: Any, store: Any) -> int:
     from levain.coordinator.cli import _read_file
 
+    if getattr(args, "plan", False):
+        return _run_plan(args, out, store)
+    missing = [flag for flag, v in (("--kind", args.kind), ("--body-file", args.body_file),
+                                    ("--request-id", args.request_id), ("--token", args.token)) if v is None]
+    if missing:
+        raise CoordError(f"coord close needs {', '.join(missing)} (or --plan to read the walk's checklist); nothing "
+                         "was written")
     text = _read_file(args.body_file, _BODY_FILE_MAX, "the handoff body")
     try:
         body = json.loads(text, object_pairs_hook=_once)

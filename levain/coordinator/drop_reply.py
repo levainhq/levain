@@ -9,7 +9,9 @@ The reply carries a block FROZEN at write: the work delta of :mod:`levain.coordi
 the same operator cursor the terminal reply uses), then the question band as it stood, and the gseq range the block
 covers. Every later view of the reply shows that stored text, never a re-render. Writing it advances the operator's
 work cursor to the last record the block covered: a reply on these surfaces has no receipt, so it counts as delivered
-when written (DESIGN section 8). The reply's own row stays after the cursor, so the next terminal block names it.
+when written (DESIGN section 8). The reply's own row stays after the cursor, so the next terminal block names it. A
+block that carries the intake card (:mod:`levain.coordinator.intake`) records it in the same transaction, so a reply
+and its ``intake_views`` row commit together.
 
 "No reply yet" is derived, never stored: a drop with no coordinator reply after :data:`UNREPLIED_AFTER_MINUTES`
 (:func:`unreplied`). It stays after the reply window closes, as ``no reply, window closed``, for
@@ -114,6 +116,9 @@ def write_reply(store: CoordStore, drop_id: str, text: str, *, token: object) ->
             if delta.total and delta.through > since:
                 conn.execute("INSERT INTO operator_views (viewer, gseq, at) VALUES (?, ?, ?)",
                              (VIEWER, delta.through, now))
+            if delta.intake_open:               # the card this frozen block carries is shown with the reply row
+                conn.execute("INSERT INTO intake_views (open_id, via, ref, at) VALUES (?, 'drop_reply', ?, ?)",
+                             (delta.intake_open, reply_id, now))
     except sqlite3.IntegrityError as exc:
         raise CoordError(f"refused: {exc}") from exc
     return DropReply(reply_id, drop_id, gseq, now, body["surface"], body["received_at"], text, block, since, delta.through)

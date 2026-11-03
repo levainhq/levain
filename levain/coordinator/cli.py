@@ -2193,12 +2193,16 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "--prev-handoff-id (omit it when none exists): a late close behind a newer one is refused. "
                     "In the body, name rows by id (dr-..., item keys), never by ordinal: the next coordinator "
                     "sees ids, not your order. Each field is one line (a newline or control is refused). "
-                    "The operator-walk checklist (--plan) is not built.")
-    ccl.add_argument("--kind", required=True, choices=_seam_handoffs.KINDS)
-    ccl.add_argument("--body-file", dest="body_file", type=Path, required=True, metavar="PATH")
-    ccl.add_argument("--request-id", dest="request_id", required=True, metavar="ID")
+                    "--plan instead prints the operator-walk checklist (read-only; it writes nothing and takes no "
+                    "--body-file): what to walk with him before you write the operator handoff.")
+    ccl.add_argument("--plan", action="store_true",
+                     help="Print the operator-walk checklist, derived from the stores; writes nothing.")
+    ccl.add_argument("--kind", default=None, choices=_seam_handoffs.KINDS, help="Required unless --plan.")
+    ccl.add_argument("--body-file", dest="body_file", type=Path, default=None, metavar="PATH",
+                     help="Required unless --plan.")
+    ccl.add_argument("--request-id", dest="request_id", default=None, metavar="ID", help="Required unless --plan.")
     ccl.add_argument("--prev-handoff-id", dest="prev_handoff_id", type=int, default=None, metavar="H")
-    ccl.add_argument("--token", type=int, required=True, help="Your coordinator lease token.")
+    ccl.add_argument("--token", type=int, default=None, help="Your coordinator lease token (required unless --plan).")
     cop = c_sub.add_parser(
         "open", help="The brief for a seam, built from the stores; with --ack, acknowledge it.",
         description="Prints the open built for you (the one your launch was started with, else one for the latest "
