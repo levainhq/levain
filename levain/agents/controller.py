@@ -16,11 +16,17 @@ binding is minted by the launch slice, neither of which is this module's.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import re
+import signal
 import sqlite3
-from collections.abc import Callable, Collection
+import subprocess
+import sys
+import threading
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,7 +40,9 @@ from levain.agents.store import AgentStore, open_agent_store
 
 __all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurrence_id", "run_id", "claim",
            "close_no_slot", "tick", "heartbeat", "takeover", "Window", "LaunchResult", "launch",
-           "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE"]
+           "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE", "SESSION_GRACE_S",
+           "Ended", "settle_terminal", "GatedChild", "GATE_REFUSED", "fire_argv", "fire_record_path", "spawn_fire",
+           "claim_fire", "fire"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
@@ -290,38 +298,59 @@ def _expiry(at: datetime, lease_s: int) -> datetime:
     return moment.replace(microsecond=0) + timedelta(seconds=1) if moment.microsecond else moment
 
 
-def heartbeat(conn: sqlite3.Connection, occurrence_id: str, epoch: int, now: datetime, lease_s: int = LEASE_S) -> bool:
+SESSION_GRACE_S = 120  # [judged, against nothing measured]: what a session run's supervisor passes heartbeat
+
+
+def heartbeat(conn: sqlite3.Connection, occurrence_id: str, epoch: int, now: datetime, lease_s: int = LEASE_S, *,
+              session_grace_s: int | None = None) -> bool:
     """The supervisor's heartbeat: extend a ``launched`` row's lease to ``now + lease_s``. It is a compare-and-set on
     the epoch the holder launched or last renewed under and on the exact lease it read, so a holder that a takeover
     fenced (the epoch moved, the row left ``launched``) writes nothing and is told ``False``. A lease that has already
     lapsed (``now`` past it) is refused too: the row belongs to takeover from that moment, and a late holder must not
     postpone crash recovery. An absent or unreadable lease is refused, as takeover refuses it. The lease never moves
     backwards, so a renew computed from an earlier clock reading, or a wall clock set back, leaves the later lease in
-    place. Runs inside the caller's write transaction and takes its write lock first."""
+    place. Runs inside the caller's write transaction and takes its write lock first.
+
+    ``session_grace_s`` is for a run that opens an S1 session (the supervisor knows its executor; the row does not):
+    a row that has recorded no ``session_key`` by ``launched_at + session_grace_s`` is refused, so a fire that never
+    opened its session lapses to takeover instead of being renewed for ever. ``None`` (a sessionless run, the dream)
+    applies no such bound. A ``launched_at`` that cannot be read is refused under the bound."""
     if not conn.in_transaction:
         raise RuntimeError("a heartbeat runs inside the caller's write transaction")
+    if session_grace_s is not None and (type(session_grace_s) is not int or session_grace_s < 0):
+        raise ValueError("session_grace_s is a non-negative integer of seconds, or None")
     at = schedule._utc(now)
     _write_lock(conn)
-    row = conn.execute("SELECT lease_until FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'"
-                       " AND epoch = ?", (occurrence_id, epoch)).fetchone()
+    row = conn.execute("SELECT lease_until, session_key, launched_at FROM agent_occurrences WHERE occurrence_id = ?"
+                       " AND state = 'launched' AND epoch = ?", (occurrence_id, epoch)).fetchone()
     if row is None:
         return False
     lease = _lease(row[0])
     if lease is None or at > lease:
         return False
+    if session_grace_s is not None and row[1] is None:
+        launched = _lease(row[2])
+        if launched is None or at >= launched + timedelta(seconds=session_grace_s):
+            return False
     until = max(lease, _expiry(at, lease_s))
     cur = conn.execute("UPDATE agent_occurrences SET lease_until = ? WHERE occurrence_id = ? AND state = 'launched'"
                        " AND epoch = ? AND lease_until = ?", (_stamp(until), occurrence_id, epoch, row[0]))
     return cur.rowcount == 1
 
 
-def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime) -> bool:
+def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime,
+             usage: accounting.Usage | None = None, stopped: accounting.StopResult | None = None) -> bool:
     """Fenced takeover (A0 r7 section 2.3, lapse recovery): end a ``launched`` row whose lease has lapsed, writing
-    ``epoch + 1`` and ``crash_recovered`` in one statement. The lease is read here, inside the write transaction, and
-    the ``UPDATE`` is guarded by the exact value read, so a heartbeat that landed first or a takeover that already
-    ran leaves it with nothing to change (``False``). A live lease is never taken over; a lease that is absent or
-    unreadable is not evidence of a lapse, so it is refused too. Slot and reservation release belong to the
-    terminal transaction P6-5 wires around this. It takes the caller's write lock first, as :func:`heartbeat` does."""
+    ``epoch + 1`` and ``crash_recovered`` in one statement, settling its reservation and freeing its slot in the same
+    transaction (A0 §2.4's lapse row, through :func:`_end_launched`, the one end :func:`settle_terminal` uses). The
+    lease is read here, inside the write transaction, and the ``UPDATE`` is guarded by the exact value read, so a
+    heartbeat that landed first or a takeover that already ran leaves it with nothing to change (``False``), and
+    nothing is settled or freed. A live lease is never taken over; a lease that is absent or unreadable is not
+    evidence of a lapse, so it is refused too. ``usage`` is settled as read only together with ``stopped``, the
+    executor's own :class:`accounting.StopResult` with ``terminated`` True: a reading taken while the process may
+    still run is a snapshot, and settling it would free the slot below what the run goes on to spend. Without that
+    proof the end is unreadable whatever ``usage`` says (§2.4: all of the reservation is debited, or the caps recorded
+    on a subscription run). It takes the caller's write lock first, as :func:`heartbeat` does."""
     if not conn.in_transaction:
         raise RuntimeError("a takeover runs inside the caller's write transaction")
     at = schedule._utc(now)
@@ -333,10 +362,74 @@ def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime) -> boo
     lease = _lease(row[0])
     if lease is None or at <= lease:
         return False
-    cur = conn.execute("UPDATE agent_occurrences SET state = 'stopped', reason = 'crash_recovered', epoch = epoch + 1,"
-                       " ended_at = ? WHERE occurrence_id = ? AND state = 'launched' AND lease_until = ?",
-                       (_stamp(at), occurrence_id, row[0]))
-    return cur.rowcount == 1
+    proven = type(stopped) is accounting.StopResult and stopped.terminated is True
+    ended = _end_launched(conn, occurrence_id, "stopped", "crash_recovered",
+                          usage if usage is not None and proven else _UNREAD, at, "lease_until = ?", (row[0],),
+                          bump=True)
+    return ended.ended
+
+
+# --- the terminal transaction (A0 r8 §2.4's release table, §2.5 launched -> done/failed/stopped; P6-5b) --------------
+
+_UNREAD = accounting.Usage(None, None, None, "lapse-recovery")
+_ENDS = ("done", "failed", "stopped")
+
+
+@dataclass(frozen=True)
+class Ended:
+    """``ended`` is True when this call wrote the terminal state; then ``state``/``reason`` are what it wrote (a breach
+    found at settle writes ``failed``/``budget_breach`` whatever was asked), ``settled`` is the reservation's
+    :class:`accounting.Settled` and ``released`` whether a slot was freed. False: nothing was written."""
+    ended: bool
+    state: str | None = None
+    reason: str | None = None
+    settled: accounting.Settled | None = None
+    released: bool = False
+
+
+def _end_launched(conn: sqlite3.Connection, occurrence_id: str, state: str, reason: str, usage: accounting.Usage,
+                  at: datetime, guard: str, args: tuple, *, bump: bool) -> Ended:
+    """The one place a launched occurrence's slot is freed and its reservation settled (an admitted one holds neither,
+    A0 §2.4; :func:`close_no_slot`'s release on it is defensive): under the caller's write lock, the
+    row is read as ``launched`` under ``guard``; the reservation is settled, a breach turns the end into
+    ``failed``/``budget_breach``, the state is written under the same guard (with ``epoch + 1`` for lapse recovery)
+    and the slot is released. A row the guard does not find gets nothing written, settled or freed."""
+    _write_lock(conn)
+    where = f"occurrence_id = ? AND state = 'launched' AND {guard}"
+    if conn.execute(f"SELECT 1 FROM agent_occurrences WHERE {where}", (occurrence_id, *args)).fetchone() is None:
+        return Ended(False)
+    settled = accounting.settle(conn, {"occurrence_id": occurrence_id}, usage)
+    if settled.breach:
+        state, reason = "failed", "budget_breach"
+    cur = conn.execute("UPDATE agent_occurrences SET state = ?, reason = ?, ended_at = ?"
+                       + (", epoch = epoch + 1" if bump else "") + f" WHERE {where}",
+                       (state, reason, _stamp(at), occurrence_id, *args))
+    if cur.rowcount != 1:   # the lock is held since the read: only a trigger gets here; the caller rolls back
+        raise RuntimeError(f"occurrence {occurrence_id} moved inside its own terminal transaction")
+    return Ended(True, state, reason, settled, slots.release(conn, occurrence_id))
+
+
+def settle_terminal(conn: sqlite3.Connection, occurrence_id: str, epoch: int, state: str, reason: str,
+                    usage: accounting.Usage, now: datetime) -> Ended:
+    """End a launched occurrence (A0 §2.5 ``launched -> done/failed/stopped``) with its reservation settled against
+    ``usage`` (:func:`accounting.settle`, A0 §2.4's rows) and its slot released, inside the caller's write transaction.
+    ``epoch`` is the one the holder launched or last renewed under: a row a revoke or a takeover has fenced since, or
+    one already terminal, is not found, and nothing is written, settled or freed (``Ended(False)``), so a second call
+    is a no-op. ``usage`` is the executor's own ``usage()`` reading, never computed here. A breach overrides ``state``
+    with ``failed``/``budget_breach`` (the agent is paused in the same transaction). The supervisor calls this for a
+    run it stopped only after ``stop()`` reported ``terminated`` (§2.4's first row); ``awake.sync`` is the caller's,
+    after its commit. Raises on a bad argument before reading anything, and when the write fails: the caller's
+    transaction must then roll back."""
+    if not conn.in_transaction:
+        raise RuntimeError("a terminal state is written inside the caller's write transaction")
+    if state not in _ENDS:
+        raise ValueError(f"a launched occurrence ends {', '.join(_ENDS)}")
+    if type(reason) is not str or not reason or (state == "done") != (reason == "completed"):
+        raise ValueError("a terminal reason is a non-empty string, and 'completed' is done's and only done's")
+    if type(epoch) is not int:
+        raise ValueError("epoch is the integer the holder runs under")
+    return _end_launched(conn, occurrence_id, state, reason, usage, schedule._utc(now), "epoch = ?", (epoch,),
+                         bump=False)
 
 
 # --- the launch transaction (A0 r8 §2.4, §2.5; BUILD_PLAN P6-5a) ------------------------------------------------------
@@ -574,27 +667,254 @@ def record_session_key(conn: sqlite3.Connection, occurrence_id: str, launch_epoc
 
 @dataclass(frozen=True)
 class Started:
-    """``spawned`` is True when ``spawn`` was called (``value`` is what it returned); False with ``reason`` when the key
-    could not be recorded, in which case ``spawn`` was never called."""
+    """``spawned`` is True when the child ``spawn`` returned was released (``value`` is that child). False with
+    ``reason`` otherwise: either the key could not be recorded and ``spawn`` was never called (``value`` None), or the
+    row was ended or its lease lapsed before the release and the child was aborted unreleased (``value`` the child)."""
     spawned: bool
     reason: str | None = None
     value: object = None
 
 
-def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_epoch: int, session_key: str,
-              spawn: Callable[[str], object], *, clock: Callable[[], datetime]) -> Started:
-    """The spawn seam (P6-5b's fire calls it once the S1 session is open, before claude starts). The key is recorded
-    by :func:`record_session_key` in its own ``BEGIN IMMEDIATE``, and ``spawn(session_key)`` is called only after that
-    transaction COMMITTED, so the per-call fence can join the session to its occurrence from the first call. A refused
-    compare-and-set returns ``Started(False, reason)``; a store error raises. Either way ``spawn`` is not called, the
-    row stays ``launched`` holding its slot until its lease lapses and lapse recovery (:func:`takeover`) ends it
-    ``crash_recovered``; releasing the slot and the reservation is the terminal transaction around that call. A
-    caller whose ``spawn`` raised ends the run itself: a retry with another key is refused (the row names one).
+GATE_REFUSED = 75   # the gate's exit when it reads anything but the release byte (EOF: its holder closed or died)
+GATE_NO_EXEC = 127  # the gate's exit when the released argv could not be exec'd
+# The gate's exit when it cannot vouch that the executor's group is gone: the group did not drain within
+# GATE_DRAIN_S of its SIGKILL (complement D1 r3: on Linux a member reparented to a PID 1 that does not reap stays a
+# zombie, and zombies still count), or something after the executor's fork failed (codex MED r3: a thread that could
+# not be made or started, a handler that could not be installed). Positive, so it is reserved rather than negative,
+# and NEVER a termination proof. An executor that itself exits with this code reads the same: unproven, the safe side.
+GATE_UNPROVEN = 76
+GATE_DRAIN_S = 10.0
+# The gate, then the lifeline (P6-5b r3: codex HIGH r2, complement MED r2). Before the release: EOF exits
+# GATE_REFUSED, nothing ran. On the release byte, with SIGTERM/SIGINT/SIGHUP blocked, the gate forks an ANCHOR that
+# leads a new process group (setpgid in both processes, so neither order races) and then forks the executor INTO that
+# group (setpgid in both again; an executor that cannot join exits GATE_NO_EXEC without exec). The gate stays alone in
+# its own group, so nothing the executor's group receives reaches it. The anchor is never reaped before the end, so
+# the group's id cannot be reused while anyone signals it; it holds the read end of a pipe only the gate writes, and
+# the gate's death by any signal (SIGKILL included) EOFs it and it SIGKILLs the group. The gate then installs handlers
+# for the three signals (each records 128 + the signal and SIGKILLs the group) and unblocks them. A thread reaps the
+# executor; it then SIGKILLs the group (whatever the executor left there, a backgrounded child), reaps the anchor,
+# waits until no member of the group is left, and only then exits with the executor's status (a signal death as 128
+# + the signal) or a handled signal's 128 + signal. The main thread reads on the lifeline; EOF (the holder's abort or
+# death) SIGKILLs the group and leaves the exit to the reaper. A handled signal records its status only while the
+# reaper has not yet taken the executor's (complement D3 r3). The drain waits at most ``drain_s``, then exits
+# GATE_UNPROVEN. Everything after the executor's fork sits in one failure path: SIGKILL the group, let the reaper (or,
+# if it never started, the main thread) reap the executor and anchor and drain, then exit GATE_UNPROVEN (a reaper
+# that had already drained before the failure exits the executor's status, which is then true). Every exit
+# of the gate other than GATE_UNPROVEN is >= 0 and follows the group's end; GATE_UNPROVEN and a gate killed outright
+# (status < 0) prove nothing about the group.
+def _gate(drain_s: float) -> str:
+    return ("import os, signal, sys, threading, time\n"
+         "fd = int(sys.argv[1])\n"
+         f"if os.read(fd, 1) != b'1':\n    sys.exit({GATE_REFUSED})\n"
+         "SIGS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)\n"
+         "signal.pthread_sigmask(signal.SIG_BLOCK, SIGS)\n"
+         "tie_r, tie_w = os.pipe()\n"
+         "anchor = os.fork()\n"
+         "if anchor == 0:\n"
+         "    try:\n"
+         "        os.setpgid(0, 0)\n"
+         "        os.close(fd)\n"
+         "        os.close(tie_w)\n"
+         "        while os.read(tie_r, 1):\n"
+         "            pass\n"
+         "    finally:\n"
+         "        if os.getpgrp() == os.getpid():\n"   # never the gate's group
+         "            os.killpg(os.getpgrp(), signal.SIGKILL)\n"
+         "        os._exit(0)\n"
+         "os.close(tie_r)\n"
+         "try:\n"
+         "    os.setpgid(anchor, anchor)\n"
+         "except OSError:\n"
+         "    pass\n"
+         "pid = os.fork()\n"
+         "if pid == 0:\n"
+         "    try:\n"
+         "        os.setpgid(0, anchor)\n"
+         "        signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGS)\n"
+         "        os.close(fd)\n"
+         "        os.execvp(sys.argv[2], sys.argv[2:])\n"
+         "    finally:\n"
+         f"        os._exit({GATE_NO_EXEC})\n"
+         "try:\n"
+         "    os.setpgid(pid, anchor)\n"
+         "except OSError:\n"
+         "    pass\n"   # EACCES: it exec'd, so it joined first; ESRCH: it is gone
+         "ending = threading.Lock()\n"
+         "status = []\n"
+         "failed = []\n"
+         "def kill_group(code=None):\n"
+         "    if ending.acquire(blocking=False):\n"   # held for good once the reaper took the executor's status
+         "        if code is not None:\n"
+         "            status.append(code)\n"
+         "        try:\n"
+         "            os.killpg(anchor, signal.SIGKILL)\n"
+         "        except OSError:\n"
+         "            pass\n"
+         "        ending.release()\n"
+         "def on_signal(signum, frame):\n"
+         "    kill_group(128 + signum)\n"
+         "def finish():\n"
+         "    code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])\n"
+         "    ending.acquire()\n"
+         "    try:\n"
+         "        os.killpg(anchor, signal.SIGKILL)\n"
+         "    except OSError:\n"
+         "        pass\n"
+         "    os.waitpid(anchor, 0)\n"
+         f"    deadline = time.monotonic() + {float(drain_s)!r}\n"
+         "    while True:\n"
+         "        try:\n"
+         "            os.killpg(anchor, 0)\n"
+         "        except OSError:\n"
+         "            break\n"
+         "        if time.monotonic() >= deadline:\n"
+         f"            return {GATE_UNPROVEN}\n"
+         "        time.sleep(0.01)\n"
+         "    if failed:\n"
+         f"        return {GATE_UNPROVEN}\n"
+         "    return status[0] if status else code if code >= 0 else 128 - code\n"
+         "def run_reaper():\n"
+         f"    code = {GATE_UNPROVEN}\n"
+         "    try:\n"
+         "        code = finish()\n"
+         "    finally:\n"
+         "        os._exit(code)\n"
+         "started = False\n"
+         "try:\n"
+         "    reaper = threading.Thread(target=run_reaper, daemon=True)\n"
+         "    reaper.start()\n"
+         "    started = True\n"
+         "    for s in SIGS:\n"
+         "        signal.signal(s, on_signal)\n"
+         "    signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGS)\n"
+         "    while os.read(fd, 1):\n"
+         "        pass\n"
+         "    kill_group()\n"
+         "except BaseException:\n"   # codex MED r3: any failure after the executor's fork ends the run here, in order
+         "    try:\n"
+         "        failed.append(True)\n"
+         "        kill_group()\n"
+         "        if started:\n"
+         "            while True:\n"
+         "                reaper.join(3600)\n"
+         "        finish()\n"
+         "    finally:\n"
+         f"        os._exit({GATE_UNPROVEN})\n"
+         "while True:\n"
+         "    reaper.join(3600)\n")
 
-    ``clock`` is read inside the write lock, so the lease is judged at the moment the key commits. A takeover that
-    commits after the key and before ``spawn`` is not seen here: ``spawn`` runs, and the session it starts is stale
-    at the per-call fence from its first call (the row left ``launched`` and its epoch moved). Closing that window at
-    the process (a child started suspended and released only after a lease-checked commit) is P6-5b's to decide."""
+
+_GATE = _gate(GATE_DRAIN_S)
+
+
+def gate_proves_termination(returncode: int | None) -> bool:
+    """True only when a gate's ``returncode`` proves its executor's group is gone: an int (``bool`` excluded) that is
+    >= 0 and not :data:`GATE_UNPROVEN`. ``None`` (not reaped), a negative status (the gate killed outright) and
+    :data:`GATE_UNPROVEN` prove nothing."""
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        return False
+    return returncode >= 0 and returncode != GATE_UNPROVEN
+
+
+class GatedChild:
+    """A child started blocked: a ``python -I`` gate holds the read end of a pipe and runs ``argv`` only after it
+    reads the release byte; EOF (the holder closed its end, or died) exits :data:`GATE_REFUSED` without exec. The gate
+    leads its own session (``start_new_session``), and this object holds its unreaped ``Popen``, so the holder may
+    signal it (BUILD_PLAN §2, rule (a)); nobody signals it by a stored pid.
+
+    The pipe is also the run's LIFELINE (codex HIGH, P6-5b r1): :meth:`release` writes the byte and KEEPS the write
+    end, and the gate keeps the read end. The gate runs ``argv`` in a process group of its own, apart from the gate's
+    (P6-5b r3), and SIGKILLs that group when the write end closes (the holder's :meth:`abort`, or the holder's death by
+    any signal, SIGKILL included, which the kernel answers by closing its fds), when the executor exits on its own
+    (what it left in the group, a backgrounded child), and when the gate takes SIGTERM, SIGINT or SIGHUP (a ``stop()``
+    signalling ``process``: it exits 128 + the signal). A gate killed outright (SIGKILL) cannot act; the group's anchor
+    sees its death and SIGKILLs the group itself.
+
+    ``process`` is the gate. Every status it exits with is >= 0, and every one other than :data:`GATE_UNPROVEN` comes
+    only after no member of the executor's group is left: the executor's own (a signal death as 128 + the signal,
+    :data:`GATE_NO_EXEC` when ``argv`` could not be exec'd), or 128 + a signal the gate handled while the executor
+    still ran. Two statuses prove nothing about the group: a negative ``returncode`` (the gate killed outright) and
+    :data:`GATE_UNPROVEN` (the group did not drain within :data:`GATE_DRAIN_S` of its SIGKILL, or the gate's own setup
+    after the executor's fork failed). So an executor's ``stop()`` that reads termination off this child reads it through
+    :func:`gate_proves_termination` (never a bare non-negative test), and signals ``process`` with SIGTERM, never
+    SIGKILL first.
+
+    What the lifeline cannot reach: a descendant that leaves the group (``setsid``, its own ``setpgid``) or that this
+    user may not signal, and a holder that ``fork``\\ s without ``exec``, whose copy then holds the run open."""
+
+    def __init__(self, argv: Sequence[str], *, stdin=subprocess.DEVNULL, stdout=None, stderr=None,
+                 env: Mapping[str, str] | None = None, cwd: str | Path | None = None) -> None:
+        if not argv or any(type(a) is not str for a in argv):
+            raise ValueError("a gated child's argv is a non-empty list of strings")
+        read, write = os.pipe()             # both non-inheritable; pass_fds hands the child the read end only
+        self._write: int | None = write
+        self.released = False
+        try:
+            self.process = subprocess.Popen([sys.executable, "-I", "-c", _GATE, str(read), *argv], pass_fds=(read,),
+                                            start_new_session=True, close_fds=True, stdin=stdin, stdout=stdout,
+                                            stderr=stderr, env=None if env is None else dict(env), cwd=cwd)
+        except BaseException:
+            os.close(write)
+            self._write = None
+            raise
+        finally:
+            os.close(read)
+
+    def release(self) -> None:
+        """Let the child run. Once only. The write end stays open in this holder: it is the run's lifeline."""
+        if self._write is None or self.released:
+            raise RuntimeError("the gated child was already released or aborted")
+        self.released = True
+        os.write(self._write, b"1")
+
+    def abort(self, timeout: float = 5.0) -> int:
+        """Close the pipe and reap the gate. Unreleased, the gate exits :data:`GATE_REFUSED` and nothing ran;
+        released, the gate kills the executor's group and exits once it is gone. A gate that does not exit in
+        ``timeout`` has its own group killed through this unreaped handle (its pid is that group's id and cannot be
+        reused while it is unreaped), and the executor group's anchor then kills that group. Returns the gate's exit
+        status: negative only in that last case, which proves nothing about the executor's group (nor does
+        :data:`GATE_UNPROVEN`)."""
+        if self._write is not None:
+            fd, self._write = self._write, None
+            os.close(fd)
+        try:
+            return self.process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return self.process.wait()
+
+
+def _still_ours(conn: sqlite3.Connection, occurrence_id: str, launch_epoch: int, session_key: str,
+                now: datetime) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched' AND launch_epoch = ?"
+        " AND epoch = launch_epoch AND session_key = ? AND lease_until > ?",
+        (occurrence_id, launch_epoch, session_key, _stamp(schedule._utc(now)))).fetchone() is not None
+
+
+def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_epoch: int, session_key: str,
+              spawn: Callable[[str], GatedChild], *, clock: Callable[[], datetime]) -> Started:
+    """The spawn seam (the fire calls it once the S1 session is open, before claude starts). In order:
+
+    1. the key is recorded by :func:`record_session_key` in its own ``BEGIN IMMEDIATE``, which COMMITS first, so the
+       per-call fence can join the session to its occurrence from the child's first call;
+    2. ``spawn(session_key)`` starts the child GATED (a :class:`GatedChild`, or anything with its ``release`` and
+       ``abort``): it exists but has run nothing;
+    3. a second ``BEGIN IMMEDIATE`` re-reads the row (still ``launched`` at ``launch_epoch``, naming this key, its
+       lease live at ``clock()`` read inside the lock) and releases the child INSIDE that transaction. A takeover or a
+       revoke's epoch raise needs the same write lock, so none lands between the check and the release: the child
+       starts only while its row is live. A row that moved is answered by ``abort()`` (the child never execs) and
+       ``Started(False, reason, child)``.
+
+    A refused compare-and-set in step 1 returns ``Started(False, reason)`` and a store error raises; either way
+    ``spawn`` is not called, and the row, holding its slot, ends by lapse recovery (:func:`takeover`). Any error after
+    ``spawn`` returned, the release transaction's COMMIT included, aborts the child (released or not) before it
+    propagates. A released :class:`GatedChild` runs only while its holder keeps it: the caller holds
+    ``Started.value`` for the run's life, and its exit or death ends the run. A caller whose ``spawn`` raised ends the
+    run itself (:func:`settle_terminal`): a retry with another key is refused (the row names one)."""
     if not isinstance(store, AgentStore):
         store = open_agent_store(store)
     with store.write() as conn:
@@ -602,7 +922,179 @@ def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_
     if not recorded:
         return Started(False, "the session key was not recorded: the occurrence is not launched at that epoch, "
                               "its lease lapsed, it already names a session, or the key names another occurrence")
-    return Started(True, None, spawn(session_key))
+    child = spawn(session_key)
+    released = False
+    try:
+        with store.write() as conn:
+            if _still_ours(conn, occurrence_id, launch_epoch, session_key, clock()):
+                child.release()
+                released = True
+    except BaseException as exc:
+        # released or not: a release whose transaction did not end cleanly (its COMMIT raised) is aborted too, and
+        # for a GatedChild that ends the run through the lifeline. An abort that fails rides on the error as a note.
+        try:
+            child.abort()
+        except BaseException as also:
+            exc.add_note(f"start_run: the child's abort also failed: {also!r}")
+        raise
+    if not released:
+        child.abort()
+        return Started(False, "the occurrence was ended, fenced or its lease lapsed before the run was released; "
+                              "the child never ran", child)
+    return Started(True, None, child)
+
+
+# --- the fire: a separate session-leader process per launched occurrence (BUILD_PLAN P6-5, §2) ------------------------
+
+FIRES = "fires"
+FIRE_UNWIRED = 3       # the module entry's exit after its claim: no run body exists until P6-4a
+FIRE_NO_IDENTITY = 4   # the fire cannot read its own identity, or its command line does not name its occurrence
+_OCCURRENCE_RE = re.compile(r"oc-[0-9a-f]{32}")
+
+
+def _occurrence(occurrence_id: str) -> str:
+    if type(occurrence_id) is not str or _OCCURRENCE_RE.fullmatch(occurrence_id) is None:
+        raise ValueError("an occurrence id is oc-<32 hex>")
+    return occurrence_id
+
+
+def fire_argv(store_dir: Path | str, occurrence_id: str) -> list[str]:
+    """The fire's command line. It names the occurrence (BUILD_PLAN §2: the identity check needs the id on it). The
+    ``levain agents _fire`` verb delegates here once ``levain/agents/cli.py``'s owner wires it."""
+    return [sys.executable, "-m", "levain.agents.controller", "_fire", "--store", str(Path(store_dir)),
+            _occurrence(occurrence_id)]
+
+
+def fire_record_path(store_dir: Path | str, occurrence_id: str) -> Path:
+    """``<store>/fires/<occurrence_id>.json``: the fire's identity record, read by an executor's ``stop()``."""
+    return Path(store_dir) / FIRES / f"{_occurrence(occurrence_id)}.json"
+
+
+_thread_factory = threading.Thread   # spawn_fire's reaper thread; a seam so a test replaces it, not threading's own
+
+
+def spawn_fire(store_dir: Path | str, occurrence_id: str, *, argv: Sequence[str] | None = None,
+               log: Path | str | None = None, env: Mapping[str, str] | None = None) -> subprocess.Popen:
+    """Start the fire for an occurrence whose launch transaction has COMMITTED (the caller calls this after
+    :func:`launch` returned ``launched``): a separate OS process leading its own session, stdin closed, output
+    appended to ``log`` (default ``<store>/fires/<occurrence_id>.log``). The caller need not wait on it and never
+    signals it; stopping a fire is an executor's ``stop()``, through the identity record the fire writes. A daemon
+    thread of the launcher waits on the returned ``Popen``, so a fire nobody waits on leaves no zombie (its
+    ``returncode`` is set as it exits; a caller's own ``wait()`` returns the same status). A launcher that exits
+    first leaves the fire to be reaped by init. A reaper that cannot start has the fire's group SIGKILLed and reaped
+    before its error propagates. ``argv`` defaults to :func:`fire_argv`."""
+    occurrence_id = _occurrence(occurrence_id)
+    fires = Path(store_dir) / FIRES
+    fires.mkdir(mode=0o700, exist_ok=True)
+    with open(log if log is not None else fires / f"{occurrence_id}.log", "ab") as out:
+        proc = subprocess.Popen(list(argv) if argv is not None else fire_argv(store_dir, occurrence_id),
+                                start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, env=None if env is None else dict(env))
+    try:
+        _thread_factory(target=proc.wait, name=f"reap-{occurrence_id}", daemon=True).start()
+    except BaseException:
+        # codex MED r2: no reaper means no owner; the fire leads its session and is unreaped, so its pid is its
+        # group's id here and cannot name another group
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise
+    return proc
+
+
+def claim_fire(conn: sqlite3.Connection, occurrence_id: str, pid: int, now: datetime) -> int | None:
+    """The fire claims its own row: one compare-and-set writing ``pid`` on a row still ``launched`` with no fire yet, at
+    its launch epoch, inside its lease at ``now``. Returns the ``launch_epoch`` it runs under, or ``None`` when it
+    wrote nothing (a second fire, a late fire on a row lapse recovery ended, a fenced or lapsed row)."""
+    if not conn.in_transaction:
+        raise RuntimeError("a fire claims its row inside the caller's write transaction")
+    if type(pid) is not int or pid < 1:
+        raise ValueError("a fire's pid is a positive integer")
+    cur = conn.execute("UPDATE agent_occurrences SET pid = ? WHERE occurrence_id = ? AND state = 'launched'"
+                       " AND pid IS NULL AND epoch = launch_epoch AND lease_until > ?",
+                       (pid, occurrence_id, _stamp(schedule._utc(now))))
+    if cur.rowcount != 1:
+        return None
+    return conn.execute("SELECT launch_epoch FROM agent_occurrences WHERE occurrence_id = ?",
+                        (occurrence_id,)).fetchone()[0]
+
+
+def _record_is_dead(record: Path) -> bool:
+    """True only when the fire ``record`` names is known gone (no such pid, or the pid now another process's start
+    time). A record that cannot be read, or a process that cannot be told, is not dead: it is kept."""
+    from levain.consent.delivery import process_running
+    try:
+        held = json.loads(record.read_text())
+        pid, started = held["pid"], held["started"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    return type(started) is str and bool(started) and process_running(pid, started) is False
+
+
+def _claimed_pid(store: AgentStore, occurrence_id: str) -> object:
+    with store.read() as conn:
+        row = conn.execute("SELECT pid FROM agent_occurrences WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
+    return None if row is None else row[0]
+
+
+def fire(store: AgentStore | Path | str, occurrence_id: str, *,
+         run: Callable[[AgentStore, str, int], int], clock: Callable[[], datetime]) -> int:
+    """The fire process's body, in order: write the identity record (pid, ``ps`` start time and command line, read
+    on itself with :func:`levain.consent.delivery.process_identity`; temp, then an exclusive link, under the record's
+    lock: a fire that finds a record naming a process that may still run returns 0 before claiming, so no fire ever
+    replaces a live fire's identity; a record whose process is gone, by
+    :func:`levain.consent.delivery.process_running`, on a row no fire claimed, is replaced: that fire died between its
+    link and its claim), then :func:`claim_fire`, then
+    ``run(store, occurrence_id, launch_epoch)`` (P6-4a's supervisor). A fire that cannot identify itself, or whose
+    command line does not name its occurrence, claims nothing and returns :data:`FIRE_NO_IDENTITY`. A fire that does
+    not win the claim returns 0 having done nothing else: no effect, no compose, no spend."""
+    from levain.consent.delivery import process_identity   # here: the consent package is not the controller's closure
+    occurrence_id = _occurrence(occurrence_id)
+    if not isinstance(store, AgentStore):
+        store = open_agent_store(store)
+    pid = os.getpid()
+    identity = process_identity(pid)
+    if identity is None or occurrence_id not in identity[1].split():
+        return FIRE_NO_IDENTITY
+    record = fire_record_path(store.directory, occurrence_id)
+    record.parent.mkdir(mode=0o700, exist_ok=True)
+    tmp = record.with_name(f".{record.name}.{pid}.tmp")
+    tmp.write_text(json.dumps({"occurrence_id": occurrence_id, "pid": pid, "started": identity[0],
+                               "args": identity[1]}, sort_keys=True))
+    try:
+        with open(record.with_name(f".{record.name}.lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)    # fires of one occurrence read and replace the record one at a time
+            try:
+                os.link(tmp, record)    # exclusive: a fire never overwrites the identity another one's stop() reads
+            except FileExistsError:
+                if not _record_is_dead(record) or _claimed_pid(store, occurrence_id) is not None:
+                    return 0    # a fire that may run, or one that claimed: the record stays the row's fire's
+                os.replace(tmp, record)   # the recorded fire died between its link and its claim
+    finally:
+        tmp.unlink(missing_ok=True)
+    with store.write() as conn:
+        launch_epoch = claim_fire(conn, occurrence_id, pid, clock())
+    if launch_epoch is None:
+        return 0
+    return run(store, occurrence_id, launch_epoch)
+
+
+def _unwired_run(store: AgentStore, occurrence_id: str, launch_epoch: int) -> int:
+    print(f"levain agents _fire {occurrence_id}: no run body is wired yet (P6-4a); the occurrence ends by lapse "
+          "recovery", file=sys.stderr)
+    return FIRE_UNWIRED
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(prog="levain agents _fire")
+    parser.add_argument("verb", choices=["_fire"])
+    parser.add_argument("--store", required=True)
+    parser.add_argument("occurrence_id")
+    args = parser.parse_args(argv)
+    return fire(args.store, args.occurrence_id, run=_unwired_run, clock=lambda: datetime.now(timezone.utc))
 
 
 # --- the coordinator-lease probes over dispatch.db (levain.agents.slots.probe_over) -----------------------------------
@@ -644,3 +1136,7 @@ def dispatch_probes(directory: Path | str) -> tuple[Callable[[str], bool | None]
         return False if _read("SELECT 1 FROM launch_sweeps WHERE launch_id = ?", launch_id) else None
 
     return launch_over, session_alive
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
