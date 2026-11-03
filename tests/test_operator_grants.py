@@ -810,6 +810,7 @@ def test_the_run_banner_lists_the_grants_the_conversation_took_not_the_file_now(
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
     monkeypatch.delenv("LEVAIN_ENTITY_DIR", raising=False)
+    monkeypatch.setattr(conf.platform, "system", lambda: "Linux")
     monkeypatch.setattr(conf, "grants_apply", lambda system=None: True)
     monkeypatch.setattr(L, "host_read", lambda system=None: (0, None))   # no syscall
     grants([{"path": "/run/user/1/podman/podman.sock", "name": "podman", "why": "builds"}])

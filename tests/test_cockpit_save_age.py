@@ -161,7 +161,7 @@ def test_the_default_cockpits_health_panel_shows_an_age_that_moves_in_a_real_pag
     httpd = make_server(src, host="127.0.0.1", port=0, write_token="T")
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
-    grab = ("(function(){var d=document.querySelector('[role=dialog]');if(!d)return null;var t=d.innerText;"
+    grab = ("(function(){var d=document.querySelector('#levain-modal[role=dialog]');if(!d)return null;var t=d.innerText;"
             "var i=t.search(/last save/i);return i<0?null:t.slice(i,i+60)})()")
     steps = [
         {"until": "document.querySelector('[data-ck-panel=health]') !== null", "ms": 20000},
