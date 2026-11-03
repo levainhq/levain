@@ -70,10 +70,10 @@ def test_consent_equals_push_and_the_hold_is_zero_exactly_when_false(tmp_path, c
         away_now = mod.effective_away(st, idle, queue_dir=q)
         where = f"{label} / reading {reading}"
         assert to_devices == pushes, where
-        # the one named divergence: a follow that pushes only for want of a reading does not hold (L3 r1 complement 1)
-        assert blind == (pushes and reading is None and label in ("standing follow/10m", "follow 15m", "lets approvals")), where
-        assert (hold > 0) == (pushes and not blind), where
-        assert away_now[0] == (pushes and not blind) and away_now[1] == "intent", where
+        # follow reads the desk message alone (1a), so no laptop reading is ever a blind spot: a push holds
+        assert blind is False, where
+        assert (hold > 0) == pushes, where
+        assert away_now[0] == pushes and away_now[1] == "intent", where
         assert hold in (0.0, auto_away.DEFAULT_HOLDS[agent]), where   # the length is per agent, never presence
     # a coverage check that the matrix is not all one answer
     outcomes = set()
@@ -186,22 +186,19 @@ def test_a_standing_mark_that_holds_an_approval_also_pushes_it(tmp_path, cockpit
     assert auto_away.approval_push(marked, q, "notify", idle=lambda: 2.0, suggest=False).push is False
 
 
-def test_no_laptop_reading_pushes_but_never_holds_and_the_line_names_it(tmp_path, cockpit, monkeypatch):
-    """L3 r1 complement MED #1, reproduced (R3): with no laptop input reading (Linux, an ioreg failure) follow reads as
-    devices on, so every approval was held up to the hold with nothing measured showing him away. The push stays
-    fail-open; the hold fails to the agent's own dialog, and the describe line's Approvals clause says so. A fresh remote
-    record (a measurement) still holds, as does an explicit devices on."""
+def test_no_laptop_reading_is_not_a_blind_spot_and_a_missing_desk_message_still_holds(tmp_path, cockpit, monkeypatch):
+    """1a (Phill 11-03): follow reads the typed desk message alone, so a missing laptop input reading (Linux, an ioreg failure)
+    changes nothing and a fresh install (no desk message) holds approvals for a signed answer on the devices."""
     q = _scratch(tmp_path, cockpit)
     blind = lambda: None   # noqa: E731
     st = away.settings(q, "codex")
     assert presence.should_push(q, "consent", idle=blind, suggest=False).push is True
-    assert cx.away_hold(st, "codex", blind, queue_dir=q) == 0.0
-    assert cx.effective_away(st, blind, queue_dir=q)[:2] == (False, "intent")
-    assert ("Approvals: the agent's own dialog (no laptop input reading, so nothing measured shows you away; the ping "
-            "still reaches your devices).") in intent.describe_line(q, idle=blind)
+    assert intent.approvals_route(q, idle=blind)[2] is False
+    assert cx.away_hold(st, "codex", blind, queue_dir=q) == auto_away.DEFAULT_HOLDS["codex"]
+    assert cx.effective_away(st, blind, queue_dir=q)[:2] == (True, "intent")
+    assert "Approvals:" not in intent.describe_line(q, idle=blind)
     presence.note_remote_activity(q, "remote-terminal")
     assert cx.away_hold(st, "codex", blind, queue_dir=q) == auto_away.DEFAULT_HOLDS["codex"]
-    assert "Approvals:" not in intent.describe_line(q, idle=blind)
     (q / "webpush" / presence.REMOTE_NAME).unlink()
     intent.apply_settings(q, devices="on")
     assert cx.away_hold(st, "codex", blind, queue_dir=q) == auto_away.DEFAULT_HOLDS["codex"]

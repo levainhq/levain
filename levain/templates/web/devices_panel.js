@@ -654,6 +654,7 @@
   const PR_TIMED = ["quiet", "loud"];
   const PR_DURS = ["15m", "1h", "2h"];
   const PR_DEVICES = [["on", "On"], ["follow", "Follow"], ["off", "Off"]];
+  const PR_REFRESH_EVERY = 5;                            // pulses between device-list refreshes
   const PR_PULSE_MS = 6000;                              // how often an open page re-reads the server's Follow line while visible
   const PR_AFTER = [5, 10, 15, 30, 60];                  // minutes without a typed desk message before follow turns devices on
   const PR_UNTILS = [["switch", "I switch it"], ["for", "For…"], ["input", "Until I say or type"]];
@@ -665,7 +666,7 @@
   const PR_MIN = 1, PR_MAX = 1440;                        // custom minutes, as the server allows (1 minute to 24 hours)
   let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prSheetWho = null, prBtns = {}, prDurBtns = {},
       prEndLoud = null, prSheetNote = null, prLink = null, prDur = "1h", prSetSec = null, prTapList = null, prNote = null,
-      prNew = null, prName = null, prChecks = {}, prBusy = false, prGen = 0, prReadId = 0, prGone = false, prRefused = "", prCur = null,
+      prNew = null, prName = null, prChecks = {}, prBusy = false, prGen = 0, prRunning = null, prRerun = false, prGone = false, prRefused = "", prCur = null,
       prDevBtns = {}, prAfterBtns = {}, prAfterCustom = null, prAfterRow = null, prLetsBtns = {}, prUntilBtns = {}, prForRow = null,
       prForBtns = {}, prForCustom = null, prUntil = "switch", prForDur = "1h", prAfterOpen = false, prForOpen = false,
       stPanel = null, stDevBtns = {}, stAfterBtns = {}, stLetsBtns = {}, stAfterCustom = null, stAfterRow = null, stNote = null, stBusy = false;
@@ -1073,14 +1074,26 @@
 
 
 
-  async function readPresence() {
+  // ONE read in flight, like refresh(): a trigger (the pulse, a tab coming back, a focus, a write's repaint) that finds one running
+  // gets its promise back and queues exactly one rerun, so a slow server is never asked twice at once and a response is never
+  // dropped for a newer request that has not answered yet.
+  function readPresence() {
+    if (prRunning) { prRerun = true; return prRunning; }
+    prRunning = (async () => {
+      try { do { prRerun = false; await readPresenceOnce(); } while (prRerun && !prGone); }
+      catch (_) { /* the next pulse tries again */ }
+      finally { prRunning = null; prRerun = false; }
+    })();
+    return prRunning;
+  }
+  async function readPresenceOnce() {
     if (prGone) return;
     const tok = token();
     if (!tok || tok === prRefused) { prShow(false); return; }
-    const startedAt = prGen, mine = ++prReadId;   // only the newest read paints: a slow older one never overwrites it
+    const startedAt = prGen;   // a write that lands while this read is out makes it stale: the write's own reply paints
     try {
       const res = await api("GET", "/webpush/presence", undefined, READ_TIMEOUT_MS);
-      if (startedAt !== prGen || mine !== prReadId) return;
+      if (startedAt !== prGen) return;
       if (res.status === 200 && res.data && "line" in res.data) paintPresence(res.data);
       else if (res.status === 404) { prShow(false); prGone = true; }
       else if (res.status === 403) { prShow(false); prRefused = tok; }
@@ -1195,11 +1208,14 @@
     document.addEventListener("visibilitychange", reread);
     window.addEventListener("focus", reread);
     window.addEventListener("pageshow", reread);
-    const livePulse = setInterval(() => { if (prGone) clearInterval(livePulse); else reread(); }, PR_PULSE_MS);
+    // One timer: the Follow line every pulse, the device list every PR_REFRESH_EVERY pulses.
+    let ticks = 0;
     const pulse = setInterval(() => {
-      if (gone && prGone) clearInterval(pulse);
-      else if (!document.hidden) { if (!gone) refresh(); if (!prBusy) readPresence(); }
-    }, 30000);
+      if (gone && prGone) { clearInterval(pulse); return; }
+      if (document.hidden) return;
+      if (!gone && ++ticks % PR_REFRESH_EVERY === 0) refresh();
+      if (!prBusy) readPresence();
+    }, PR_PULSE_MS);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
 })();

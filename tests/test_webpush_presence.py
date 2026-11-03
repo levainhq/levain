@@ -52,6 +52,7 @@ def _typed(qdir, ago=ACTIVE, now=None):
 def decide(rec, idle, cls="other", **kw):
     """``idle`` is the laptop reading. 1a (Phill 11-03): follow reads the newest typed desk message, so with no overlay a reading
     here also stands for a message that old; an overlay's tests keep the laptop's input out of it (sensed input never ends a word)."""
+    # an `until: input` overlay leaves desk_msg_at unset on purpose: its case is the word ended by sensed input, not the desk
     if (rec["overlay"] is None or rec["overlay"]["until"]["kind"] != "input") and idle is not None:
         kw.setdefault("desk_msg_at", NOW - idle)
     return intent.decide(NOW, rec, idle, class_name=cls, **kw)
@@ -838,3 +839,14 @@ def test_read_sample_is_the_one_public_reading_of_the_rules_inputs(tmp_path):
     q2 = tmp_path / "q2"
     (q2 / "webpush").mkdir(parents=True, mode=0o700)
     assert intent.read_sample(q2, NOW, lambda: None)["reading"] is None   # no sensor, no desk message: unknown
+
+
+def test_devices_on_now_refuses_a_caller_written_for_idle_seconds():
+    """The second slot once held idle seconds; ``desk_msg_at`` is keyword-only and required, so an old caller fails loudly
+    instead of reading a small number as a 1970 desk message and pushing."""
+    eff = {"devices": "follow", "follow_after": FOLLOW, "lets_through": "everything", "preset": None, "layer": "base"}
+    with pytest.raises(TypeError):
+        intent.devices_on_now(eff, 5.0, None, NOW)
+    with pytest.raises(TypeError):
+        intent.devices_on_now(eff, None, NOW)
+    assert intent.devices_on_now(eff, None, NOW, desk_msg_at=NOW - 5)[0] is False

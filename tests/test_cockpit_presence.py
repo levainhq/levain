@@ -583,6 +583,7 @@ def test_the_view_agrees_with_the_push_decision_as_the_last_desk_message_ages(ri
     from levain.webpush import desk
 
     src, q = rig
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 5.0)   # the laptop's own input, which is not the desk
     with _signed(src, q) as (port, _):
         desk._write(q, desk.DESK_MESSAGE_NAME, {"at": time.time() - 5, "source": "test", "desk": ""})   # he typed to a desk just now
         got = _call(port, "GET", GET, token=T)[1]
@@ -639,15 +640,27 @@ def test_laptop_input_never_returns_follow_to_the_desk_only_a_typed_desk_message
 
 @needs_browser
 def test_an_open_page_follows_the_server_across_follow_after_without_a_reload(rig, tmp_path, monkeypatch):
-    """A cockpit left open (a phone's) re-reads the server's one derivation on a short pulse. A desk message sits just inside
-    ``follow_after``; the clock carries it past while the page is open, and the chip must flip with no reload, well inside the old
-    half-minute pulse (the wait is ms * LEVAIN_TEST_WAIT_SCALE, kept under 30 s at the CI scale of 2)."""
+    """A cockpit left open (a phone's) re-reads the server's one derivation on a short pulse. The desk message ages past
+    ``follow_after`` only AFTER the page has rendered and after its own startup re-read has been answered (the record changes on
+    the server a few seconds after the first presence request), so only the interval can show it with no reload; the wait is
+    ms * LEVAIN_TEST_WAIT_SCALE, kept under the old 30 s pulse at the CI scale of 2."""
     monkeypatch.setenv("LEVAIN_TEST_WAIT_SCALE", "2")
     from levain.webpush import desk
 
     src, q = rig
     intent.apply_settings(q, devices="follow", follow_after=60)
-    desk.note_desk_message(q, "test", now=time.time() - 52)
+    desk.note_desk_message(q, "test")                                    # just now: well inside follow_after
+    real, first, flipped = desk.read_desk_message, [], []
+
+    def reads(queue_dir, now=None):
+        if not first:
+            first.append(time.monotonic())
+        elif not flipped and time.monotonic() - first[0] > 4.0:           # past the 2.5 s startup re-read, before the 6 s pulse
+            desk._write(q, desk.DESK_MESSAGE_NAME, {"at": time.time() - 900, "source": "test", "desk": ""})
+            flipped.append(True)
+        return real(queue_dir, now)
+
+    monkeypatch.setattr(desk, "read_desk_message", reads)
     with _signed(src, q) as (port, _):
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
             {"until": _SHOWN, "ms": 20000},
@@ -658,3 +671,40 @@ def test_an_open_page_follows_the_server_across_follow_after_without_a_reload(ri
         ])
     v = out["values"]
     assert v[1] == "Follow → desk" and v[2] == v[-1] == 1, v
+    assert flipped, "the record never changed under the page: the test proved nothing"
+
+
+@needs_browser
+def test_a_slow_presence_read_still_paints_and_is_never_asked_twice_at_once(rig, tmp_path, monkeypatch):
+    """A server slower than the 6 s pulse: each tick used to supersede the read before it, so every answer was dropped and the
+    chip stayed hidden, with a new request piling on each tick. The page keeps ONE read in flight and paints its answer."""
+    import threading
+
+    from levain.webpush import desk
+
+    src, q = rig
+    real, lock, live, peak = desk.read_desk_message, threading.Lock(), [0], [0]
+
+    def slow(queue_dir, now=None):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        try:
+            time.sleep(7)
+            return real(queue_dir, now)
+        finally:
+            with lock:
+                live[0] -= 1
+
+    monkeypatch.setattr(desk, "read_desk_message", slow)
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 30000}, {"eval": _CHIP_TEXT}])
+    assert out["values"][1].startswith("Follow"), out["values"]
+    assert peak[0] == 1, f"{peak[0]} presence reads were in flight at once"
+
+
+def test_the_page_runs_one_timer_for_the_follow_line_and_the_device_list():
+    """Shape only: the 6 s and the 30 s timers both read the line; one timer now carries both."""
+    start = _asset("devices_panel.js").split("function start()")[1]
+    assert start.count("setInterval(") == 1 and "clearInterval(pulse)" in start
