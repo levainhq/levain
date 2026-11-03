@@ -43,7 +43,7 @@ from levain.contracts.canon import canonical
 from levain.coordinator.store import ACTORS, CoordError, CoordStore, _append_only, _in, next_gseq
 
 __all__ = ["FEEDS", "FEED_LABELS", "MODES", "NEAR_STOP", "NO_SPLIT_AFTER", "REVIEW_SCHEMA", "SIGNED", "SIGN_REQUEST_TTL",
-           "SIGN_TIER", "CoordNotFound", "Item", "SignedClearRefused", "body_fields", "clear_item", "clear_message",
+           "SIGN_TIER", "CoordNotFound", "Item", "SignedClearRefused", "body_fields", "item_text", "items_need_rebuild", "clear_item", "clear_message",
            "clear_signed", "collect_feeds", "feed_dead_seats", "feed_digest", "feed_end", "feed_envelopes", "feed_no_split",
            "file_clear_request", "file_item", "file_know", "QueuePage", "get_item", "last_pass", "list_items", "migrate_items",
            "push_answer", "push_sign", "queue_page", "record_pass", "reopen_item", "waiting_on_you"]
@@ -185,6 +185,19 @@ def body_fields(item: Item) -> dict[str, Any]:
     """An item's body as fields, for every surface that draws one: ``{}`` when the stored body is not a JSON object
     (the store holds whatever a feed wrote; a row is drawn either way)."""
     return item.body if isinstance(item.body, dict) else {}
+
+
+def item_text(item: Item) -> str:
+    """The one line of words an item shows on any surface: ``text``, else ``summary``, else ``reason``, else ``his``
+    (an agent card may carry only that; a list is joined with "; "), stripped, "" when none holds text."""
+    f = body_fields(item)
+    for key in ("text", "summary", "reason", "his"):
+        v = f.get(key)
+        if isinstance(v, (list, tuple)):
+            v = "; ".join(str(x) for x in v if x)
+        if v:
+            return str(v).strip()
+    return ""
 
 
 _COLS = "item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at"
@@ -390,6 +403,12 @@ def migrate_events(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def items_need_rebuild(table_sql: str) -> bool:
+    """True when the stored ``CREATE TABLE`` of ``review_items`` has a feed CHECK that omits a feed in :data:`FEEDS`.
+    The ONE test the store's ensure path (to turn foreign keys off before it) and :func:`migrate_items` share."""
+    return not all(f"'{f}'" in table_sql for f in FEEDS)
+
+
 def migrate_items(conn: sqlite3.Connection) -> bool:
     """A ``review_items`` made before a feed was added carries the narrower feed CHECK, and ``CREATE TABLE IF NOT
     EXISTS`` never widens it: the insert of the new feed's item dies in SQLite. This rebuilds that table with the
@@ -400,13 +419,15 @@ def migrate_items(conn: sqlite3.Connection) -> bool:
     and the index and triggers go with the old table and are made again by the schema statements and the gseq step
     that run next. True when it rebuilt; no table, or one whose CHECK already names every feed, is left as it is."""
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_items'").fetchone()
-    if row is None or all(f"'{f}'" in row[0] for f in FEEDS):
+    if row is None or not items_need_rebuild(row[0]):
         return False
     old = [r[1] for r in conn.execute("PRAGMA table_info(review_items)")]
-    create = REVIEW_SCHEMA[0].replace("CREATE TABLE IF NOT EXISTS review_items ", "CREATE TABLE review_items_feeds ", 1)
+    # the new table is the current schema as written, never spliced; the column a later step added (gseq) is added
+    # the way that step adds it, so a reformat of REVIEW_SCHEMA[0] cannot break the open of a store. A column the
+    # current schema lacks other than gseq fails the INSERT below, closed, and the whole ensure rolls back.
+    conn.execute(REVIEW_SCHEMA[0].replace("CREATE TABLE IF NOT EXISTS review_items ", "CREATE TABLE review_items_feeds ", 1))
     if "gseq" in old:
-        create = create[:-1] + ", gseq INTEGER)"
-    conn.execute(create)
+        conn.execute("ALTER TABLE review_items_feeds ADD COLUMN gseq INTEGER")
     cols = ", ".join(old)
     conn.execute(f"INSERT INTO review_items_feeds (rowid, {cols}) SELECT rowid, {cols} FROM review_items")
     conn.execute("DROP TABLE review_items")
