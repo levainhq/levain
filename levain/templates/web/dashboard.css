@@ -3249,6 +3249,19 @@ body.ke .dev-zone.pr-settings .zone-head { display: flex; }
 .nc-body code { font-family: var(--mono); font-size: .92em; }
 .nc-body blockquote { margin: 0 0 var(--sp-4); padding-left: var(--sp-4); border-left: 2px solid var(--hair-2); color: var(--label); }
 .nc-body a, .nc-link { color: var(--info); text-decoration: underline; text-underline-offset: 2px; }
+/* the needs-phill shape in a notice: the options as keyed rows, the recommended one marked, the REC text as its own block */
+.nc-blabel { margin: 0 0 var(--sp-3); color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); text-transform: uppercase; letter-spacing: .04em; }
+.nc-opts, .nc-rec { margin: 0 0 var(--sp-4); padding: var(--sp-3) var(--sp-4); border: 1px solid var(--hair); border-radius: var(--r-md); }
+.nc-opts .nc-optlist { list-style: none; margin: 0; padding: 0; }
+.nc-opt { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-3); padding: var(--sp-2) 0; }
+.nc-opt + .nc-opt { border-top: 1px solid var(--hair); }
+.nc-optkey { flex: none; min-width: 2.2em; font-weight: var(--fw-bold); color: var(--label); }
+.nc-opttext { flex: 1 1 12em; min-width: 0; overflow-wrap: anywhere; }
+.nc-recmark { flex: none; padding: 1px var(--sp-2); border: 1px solid var(--ok); border-radius: var(--r-sm); color: var(--ok); font-size: var(--fs-micro); font-weight: var(--fw-bold); }
+.nc-opt-rec .nc-optkey { color: var(--ok); }
+.nc-rec { border-color: var(--ok); }
+.nc-rec .nc-blabel { color: var(--ok); }
+.nc-rec > p:last-child, .nc-rec > :last-child { margin-bottom: 0; }
 .nc-fullurl { color: var(--label); font: var(--fs-meta)/1.4 var(--mono); overflow-wrap: anywhere; }
 .nc-needsbox { margin: var(--sp-5) 0 0; padding: var(--sp-4); background: var(--accent-soft); border: 1px solid var(--accent-line); border-radius: var(--r-md); }
 .nc-needsgo { display: inline-flex; align-items: center; min-height: var(--ctl-md); padding: 0 var(--sp-4); background: var(--accent); color: var(--on-accent); border: 0; border-radius: var(--r-md);

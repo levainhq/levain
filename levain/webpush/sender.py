@@ -56,11 +56,19 @@ def _fit(text: str, room: int) -> str:
     return text[:lo] + "..."
 
 
+# the characters of a body read for stripping: the strip comes FIRST and the cut to the payload budget after it (a body of long
+# links keeps its tail), so the read is bounded here and the strip patterns are bounded runs, never quadratic
+_STRIP_IN = 40000
+
+
 def build_payload(title: str, body: str, tag: str, url: str, ping_id: int, badge: "int | None" = None) -> bytes:
     """The JSON the service worker reads, at most :data:`ece.MAX_PLAINTEXT` bytes as SERIALIZED (quotes and control
     characters escape to two and six bytes, so the clip is by serialized size, never by raw length). ``badge``: the open
     Needs-you count at send time (an int 0..99); omitted when unknown (None, or anything but a plain int), so the worker
     leaves the icon as it is, never a wrong 0. Its few bytes are counted before the body is fitted."""
+    from levain.webpush import center      # lazy: center imports this package's store
+
+    body = center.plain_text(body[:_STRIP_IN])   # a lock screen shows plain text: the Markdown a seat wrote is stripped here
     payload = {"title": _fit(title, _TITLE_ROOM), "body": "", "tag": _fit(tag, _TAG_ROOM),
               "url": _fit(url, _URL_ROOM), "ping": ping_id}
     if type(badge) is int and 0 <= badge <= 99:

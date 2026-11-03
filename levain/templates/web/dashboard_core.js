@@ -2680,6 +2680,17 @@
   }
 
   // Block parser: line-based, single forward pass. Returns a DocumentFragment.
+  // The fence rule, one home: renderMarkdown draws a fenced block by it and the notification detail's shape finder (ncFenced) skips
+  // the same lines, so the two cannot disagree on where code is. An opener is a run of 3+ backticks or tildes with an info string
+  // that holds neither; a closer is a line of at least the opener's run, of the same character, and nothing else.
+  function mdFenceOpen(line) {
+    const m = /^([ \t]*)(```+|~~~+)[ \t]*([^`~]*)$/.exec(line);
+    return m ? { marker: m[2][0], len: m[2].length } : null;
+  }
+  function mdFenceCloses(line, open) {
+    const c = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(line);
+    return !!c && c[1][0] === open.marker && c[1].length >= open.len;
+  }
   function renderMarkdown(text) {
     const frag = document.createDocumentFragment();
     const lines = String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n");
@@ -2697,14 +2708,12 @@
       if (!line.trim()) { i++; continue; }  // blank line = block separator
 
       // fenced code (``` / ~~~): collect verbatim until the matching closing fence
-      const fence = /^([ \t]*)(```+|~~~+)[ \t]*([^`~]*)$/.exec(line);
+      const fence = mdFenceOpen(line);
       if (fence) {
-        const marker = fence[2][0], minLen = fence[2].length;
         i++;
         const buf = [];
         while (i < N) {
-          const cl = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(lines[i]);
-          if (cl && cl[1][0] === marker && cl[1].length >= minLen) { i++; break; }
+          if (mdFenceCloses(lines[i], fence)) { i++; break; }
           buf.push(lines[i]); i++;
         }
         const pre = el("pre", "md-pre");
@@ -8367,8 +8376,8 @@
   // ---- the markdown and the links ---------------------------------------------------------------------------------------
   // The page's own renderer (DOM nodes only; raw HTML paints as literal text), then two passes: a bare http(s) URL becomes a link,
   // and every link is held to the rule: only absolute http/https is live (target _blank, rel noopener noreferrer); any other
-  // scheme, or a relative path, stays its text. A notify-token sender's link shows its full address beside the anchor text, so
-  // the words never hide where it goes (Phill 4a).
+  // scheme, or a relative path, stays its text. Every link whose text is not its address shows the address beside the anchor text,
+  // so the words never hide where it goes (Phill 4a; for every sender since the detail view's markdown pass).
   function ncLinkify(root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
     const hits = [];
@@ -8393,7 +8402,7 @@
       node.parentNode.replaceChild(frag, node);
     }
   }
-  function ncHarden(root, origin) {
+  function ncHarden(root) {
     for (const a of Array.from(root.querySelectorAll("a"))) {
       let url = null;
       try { const u = new URL(a.getAttribute("href") || ""); if (u.protocol === "http:" || u.protocol === "https:") url = u; } catch (_) { /* relative or unreadable: inert */ }
@@ -8402,18 +8411,116 @@
       a.setAttribute("target", "_blank");
       a.setAttribute("rel", "noopener noreferrer");
       a.classList.add("nc-link");
-      if (origin === "token") {
-        const shown = a.textContent.trim();
-        if (shown !== url.href && shown !== (url.href.replace(/\/$/, ""))) a.after(el("span", "nc-fullurl", " (" + url.href + ")"));
-      }
+      // every sender's link shows where it goes, whoever wrote it: link text that is not the address gets the address beside it
+      const shown = a.textContent.trim();
+      if (shown !== url.href && shown !== (url.href.replace(/\/$/, ""))) a.after(el("span", "nc-fullurl", " (" + url.href + ")"));
     }
   }
-  function ncBody(md, origin) {
+  // A seat's notice often has the needs-phill shape `... OPTIONS: (a) x · (b) y REC: a (why) ...`. ncShape finds that shape in
+  // the markdown text and splits it: what came before, the options as keyed rows, the REC text, what came after. null when the
+  // text is not in that shape (or the label sits inside a code fence), and the body is then drawn as plain markdown. It only
+  // splits: no word of the stored body changes.
+  const NC_OPT_LABEL = /(^|\s)\**OPTIONS:\**[ \t]+/g;
+  const NC_REC_LABEL = /(^|\s)\**REC:\**[ \t]+/g;
+  // an option key is one lowercase letter in parentheses, and the keys of one list run (a), (b), (c) in order: any other "(x)" inside an
+  // option's prose is text
+  const NC_OPT_KEY = /(^|[\s·;])(?:[-*][ \t]+)?\(([a-z])\)[ \t]*/g;
+  // the [start, end) character ranges of `md` that are code fences, by the renderer's own rule (an unclosed fence runs to the end), in one pass
+  function ncFenced(md) {
+    const ranges = [];
+    let pos = 0, open = null, from = 0;
+    for (const line of md.split("\n")) {
+      const end = pos + line.length + 1;
+      if (open) { if (mdFenceCloses(line, open)) { ranges.push([from, end]); open = null; } }
+      else if ((open = mdFenceOpen(line))) from = pos;
+      pos = end;
+    }
+    if (open) ranges.push([from, md.length + 1]);
+    return ranges;
+  }
+  // the first match of a label in `text` (the tail of `full`) that is not inside a code fence; the matches ascend, so the ranges are walked once
+  function ncLabel(re, text, full, ranges) {
+    const base = full.length - text.length;
+    let k = 0;
+    re.lastIndex = 0;
+    for (let m; (m = re.exec(text)); ) {
+      const at = base + m.index + m[1].length;
+      while (k < ranges.length && ranges[k][1] <= at) k++;
+      if (!(k < ranges.length && ranges[k][0] <= at)) return m;
+    }
+    return null;
+  }
+  function ncShape(md) {
+    const ranges = ncFenced(md);
+    const o = ncLabel(NC_OPT_LABEL, md, md, ranges);
+    if (!o) return null;
+    const at = o.index + o[1].length;
+    const afterOpt = o.index + o[0].length;
+    const rest = md.slice(afterOpt);
+    const r = ncLabel(NC_REC_LABEL, rest, md, ranges);
+    if (!r) return null;          // the shape is OPTIONS and REC both; options alone are plain markdown
+    const stop = /\n[ \t]*\n/.exec(rest);
+    const rAt = r.index + r[1].length;
+    const optEnd = !stop || rAt < stop.index ? rAt : stop.index;
+    const optText = rest.slice(0, optEnd);
+    const keys = [];
+    NC_OPT_KEY.lastIndex = 0;
+    for (let m; (m = NC_OPT_KEY.exec(optText)); ) {
+      if (m[2] === String.fromCharCode(97 + keys.length)) keys.push({ key: m[2], from: m.index + m[1].length, start: m.index + m[0].length });
+    }
+    if (keys.length < 2 || optText.slice(0, keys[0].from).trim()) return null;
+    const opts = keys.map((k, i) => {
+      const end = i + 1 < keys.length ? keys[i + 1].from : optText.length;
+      return { key: k.key, text: optText.slice(k.start, end).replace(/[\s·;]+$/, "").trim() };
+    });
+    if (opts.some((x) => !x.text)) return null;
+    let rec = "", recKey = "", tail = "";
+    if (rAt === optEnd) {
+      const body = rest.slice(r.index + r[0].length);
+      const cut = /\n[ \t]*\n|\s\**[A-Z][A-Z0-9'+\/&-]{2,}:\**[ \t]/.exec(body);
+      rec = (cut ? body.slice(0, cut.index) : body).trim();
+      tail = cut ? body.slice(cut.index) : "";
+      // the recommended option is named by the REC's first word only as a key standing alone: "REC: a quick fix" is prose
+      const k = /^\(?([a-z])\)?(?=$|\s*[(:,.;\u2014\u2013-])/.exec(rec);
+      recKey = k && opts.some((x) => x.key === k[1]) ? k[1] : "";
+    } else tail = rest.slice(optEnd);
+    return { before: md.slice(0, at).trim(), opts, rec, recKey, tail: tail.trim() };
+  }
+  function ncInline(into, text) {
+    const f = renderMarkdown(text);
+    if (f.childNodes.length === 1 && f.firstChild.nodeName === "P") into.append(...Array.from(f.firstChild.childNodes));
+    else into.appendChild(f);
+  }
+  function ncBody(md) {
     const host = el("div", "nc-body");
-    const frag = renderMarkdown(String(md || ""));
-    ncLinkify(frag);
-    ncHarden(frag, origin);
-    host.appendChild(frag);
+    const text = String(md || "").replace(/\r\n?/g, "\n");
+    const shape = ncShape(text);
+    if (!shape) host.appendChild(renderMarkdown(text));
+    else {
+      if (shape.before) host.appendChild(renderMarkdown(shape.before));
+      const opts = el("div", "nc-opts");
+      opts.appendChild(el("div", "nc-blabel", "Options"));
+      const ul = el("ul", "nc-optlist");
+      for (const o of shape.opts) {
+        const isRec = shape.recKey && o.key.toLowerCase() === shape.recKey;
+        const li = el("li", "nc-opt" + (isRec ? " nc-opt-rec" : ""));
+        li.appendChild(el("span", "nc-optkey", "(" + o.key + ")"));
+        const t = el("span", "nc-opttext"); ncInline(t, o.text); li.appendChild(t);
+        if (isRec) li.appendChild(el("span", "nc-recmark", "Rec"));
+        ul.appendChild(li);
+      }
+      opts.appendChild(ul);
+      host.appendChild(opts);
+      if (shape.rec) {
+        const rec = el("div", "nc-rec");
+        rec.appendChild(el("div", "nc-blabel", "Recommendation"));
+        rec.appendChild(renderMarkdown(shape.rec));
+        host.appendChild(rec);
+      }
+      if (shape.tail) host.appendChild(renderMarkdown(shape.tail));
+    }
+    ncLinkify(host);
+    ncHarden(host);
     return host;
   }
 
@@ -8728,7 +8835,7 @@
     tools.append(tg, dl);
     d.appendChild(tools);
     if (typeof it.image_url === "string" && /^\/[^/\\]/.test(it.image_url)) { const im = el("img", "nc-img"); im.src = it.image_url; im.alt = ""; d.appendChild(im); }
-    if (it.body) d.appendChild(ncBody(it.body, it.origin));
+    if (it.body) d.appendChild(ncBody(it.body));
     if (it.needs_ref && it.needs_open) {
       const nd = el("div", "nc-needsbox");
       const go = el("button", "nc-needsgo", "Answer on the Needs-you card →"); go.type = "button";
