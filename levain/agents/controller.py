@@ -411,7 +411,12 @@ def _no_link_reason(state: _auth.AuthoritySnapshot, top: str | None, *, agent_id
 def _pick_link(conn: sqlite3.Connection, authority, state: _auth.AuthoritySnapshot, occ: dict, *, store_id: str,
                now: datetime) -> tuple[str, str]:
     """The occurrence's live link (A0 §3.2: the highest-born live link of its spec, here also of its Binding) and its
-    incarnation, or :class:`_Refusal` ``stopped``. A peek that cannot read the cover raises :class:`_Retry`."""
+    incarnation, or :class:`_Refusal` ``stopped``. A peek that cannot read the cover raises :class:`_Retry`.
+
+    The candidates and the grant terms the launch applies come from ``state``; ``peek`` answers from whatever replay
+    the shared authority holds when it runs, which another refresh may have replaced. So every peek's incarnation must
+    be ``state``'s own incarnation of that link: anything else (another incarnation of a revoked and recreated id, no
+    link, a value that is no incarnation) means the cover moved under the launch, and it is retried, never ended."""
     closed = conn.execute("SELECT MAX(revoke_seq) FROM agent_bars WHERE agent_id = ? AND closed_at IS NOT NULL",
                           (occ["agent_id"],)).fetchone()[0]
     closed = 0 if closed is None else closed
@@ -426,7 +431,10 @@ def _pick_link(conn: sqlite3.Connection, authority, state: _auth.AuthoritySnapsh
                                                closed_bar_revoke_seq=closed)
         except AgentCoverMoved as exc:
             raise _Retry(UNCLASSIFIED, f"the authority cover moved: {exc}") from exc
-        if live and incarnation:
+        if incarnation != _auth.agent_link_incarnation(state, gid):
+            raise _Retry(UNCLASSIFIED, f"the authority cover moved: link {gid} is another incarnation than the "
+                                       "launch's snapshot holds")
+        if live is True:
             return gid, incarnation
     raise _Refusal(STOPPED, _no_link_reason(state, candidates[0] if candidates else None, agent_id=occ["agent_id"],
                                             store_id=store_id, closed=closed, now=now))
@@ -440,7 +448,7 @@ def _end_admitted(conn: sqlite3.Connection, occurrence_id: str, state: str, reas
 
 
 def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authority, executor: accounting.Executor,
-           window: Window, now: datetime, store_id: str | None = None,
+           window: Window, now: datetime,
            launch_over: Callable[[str], bool | None] | None = None,
            session_alive: Callable[[str], bool | None] | None = None) -> LaunchResult:
     """The launch transaction (A0 §2.5 ``admitted -> launched``). ``authority`` is an
@@ -452,14 +460,16 @@ def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authori
     written after the reservation and slot work is rolled back to a savepoint, so a refused launch takes nothing.
     A cover that cannot be read and a full cap write nothing; the row stays ``admitted`` for the next tick.
 
-    The session key is not written here: the fire records it with :func:`start_run` once it has opened the session."""
+    The links are matched on the store's own id (its ``meta`` row), never a caller's: a link signed for another store
+    never admits here. The session key is not written here: the fire records it with :func:`start_run` once it has
+    opened the session."""
     if not isinstance(store, AgentStore):
         store = open_agent_store(store)
     at_dt = schedule._utc(now)
     at = _stamp(at_dt)
     with store.read() as conn:
         expired = slots.expired_launches(conn, at_dt)
-        sid = store_id if store_id is not None else _store_id_of(conn)
+        sid = _store_id_of(conn)
     over = slots.probe_over(expired, launch_over, session_alive)   # outside any write lock: a probe can be slow
     try:
         state = authority.refresh()
@@ -527,8 +537,11 @@ def _admit(conn: sqlite3.Connection, authority, state: _auth.AuthoritySnapshot, 
         if slot is None:
             raise _Retry(NO_SLOT, "every slot is held")
     except BaseException:
-        conn.execute("ROLLBACK TO agent_launch")
-        conn.execute("RELEASE agent_launch")
+        # SQLite may already have rolled the whole transaction back (RAISE(ROLLBACK), SQLITE_FULL), and the savepoint
+        # with it: then there is nothing to undo, and the error that did it is the one raised
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO agent_launch")
+            conn.execute("RELEASE agent_launch")
         raise
     conn.execute("RELEASE agent_launch")
     return link_id, incarnation, slot
@@ -536,22 +549,26 @@ def _admit(conn: sqlite3.Connection, authority, state: _auth.AuthoritySnapshot, 
 
 # --- the session key and the spawn seam (P7-0 §3.1; the join levain.qbroker.fence.AgentFences reads) -----------------
 
-def record_session_key(conn: sqlite3.Connection, occurrence_id: str, launch_epoch: int, session_key: str) -> bool:
+def record_session_key(conn: sqlite3.Connection, occurrence_id: str, launch_epoch: int, session_key: str,
+                       now: datetime) -> bool:
     """Record the S1 session id on a launched occurrence: one compare-and-set, inside the caller's write transaction.
-    It writes only on the row still ``launched`` at ``launch_epoch`` (no revoke raised its epoch since), with no key
-    yet, and only when no other occurrence names that key (AgentFences refuses a key two rows name). False when it
-    wrote nothing; a key that is no S1 session id raises ``ValueError``."""
+    It writes only on the row still ``launched`` at ``launch_epoch`` (no revoke raised its epoch since), whose lease
+    has not lapsed at ``now`` (a lapsed row is lapse recovery's even before :func:`takeover` runs), with no key yet,
+    and only when no other occurrence names that key (AgentFences refuses a key two rows name). False when it wrote
+    nothing; a key that is no S1 session id raises ``ValueError``."""
     if not conn.in_transaction:
         raise RuntimeError("a session key is recorded inside the caller's write transaction")
     if type(session_key) is not str or SESSION_KEY_RE.fullmatch(session_key) is None:
         raise ValueError("a session key is an S1 session id, s-<16 hex>")
     if type(launch_epoch) is not int:
         raise ValueError("launch_epoch is the integer the launch returned")
+    # Stamps hold whole seconds: at a truncated ``now`` equal to the lease the untruncated clock may be past it
+    # (takeover's ``at > lease``), so live is strictly before, and the boundary second is refused.
     cur = conn.execute(
         "UPDATE agent_occurrences SET session_key = ? WHERE occurrence_id = ? AND state = 'launched'"
-        " AND launch_epoch = ? AND epoch = launch_epoch AND session_key IS NULL"
+        " AND launch_epoch = ? AND epoch = launch_epoch AND lease_until > ? AND session_key IS NULL"
         " AND NOT EXISTS (SELECT 1 FROM agent_occurrences WHERE session_key = ?)",
-        (session_key, occurrence_id, launch_epoch, session_key))
+        (session_key, occurrence_id, launch_epoch, _stamp(schedule._utc(now)), session_key))
     return cur.rowcount == 1
 
 
@@ -565,20 +582,26 @@ class Started:
 
 
 def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_epoch: int, session_key: str,
-              spawn: Callable[[str], object]) -> Started:
+              spawn: Callable[[str], object], *, clock: Callable[[], datetime]) -> Started:
     """The spawn seam (P6-5b's fire calls it once the S1 session is open, before claude starts). The key is recorded
     by :func:`record_session_key` in its own ``BEGIN IMMEDIATE``, and ``spawn(session_key)`` is called only after that
     transaction COMMITTED, so the per-call fence can join the session to its occurrence from the first call. A refused
     compare-and-set returns ``Started(False, reason)``; a store error raises. Either way ``spawn`` is not called, the
     row stays ``launched`` holding its slot until its lease lapses and lapse recovery (:func:`takeover`) ends it
-    ``crash_recovered``; releasing the slot and the reservation is the terminal transaction around that call."""
+    ``crash_recovered``; releasing the slot and the reservation is the terminal transaction around that call. A
+    caller whose ``spawn`` raised ends the run itself: a retry with another key is refused (the row names one).
+
+    ``clock`` is read inside the write lock, so the lease is judged at the moment the key commits. A takeover that
+    commits after the key and before ``spawn`` is not seen here: ``spawn`` runs, and the session it starts is stale
+    at the per-call fence from its first call (the row left ``launched`` and its epoch moved). Closing that window at
+    the process (a child started suspended and released only after a lease-checked commit) is P6-5b's to decide."""
     if not isinstance(store, AgentStore):
         store = open_agent_store(store)
     with store.write() as conn:
-        recorded = record_session_key(conn, occurrence_id, launch_epoch, session_key)
+        recorded = record_session_key(conn, occurrence_id, launch_epoch, session_key, clock())
     if not recorded:
         return Started(False, "the session key was not recorded: the occurrence is not launched at that epoch, "
-                              "already names a session, or the key names another occurrence")
+                              "its lease lapsed, it already names a session, or the key names another occurrence")
     return Started(True, None, spawn(session_key))
 
 
@@ -592,7 +615,9 @@ def dispatch_probes(directory: Path | str) -> tuple[Callable[[str], bool | None]
     """``(launch_over, session_alive)`` reading ``<directory>/dispatch.db`` read-only, one short connection per call.
 
     ``launch_over``: True when the launch row is gone or its latest event is failed, expired or ended; False while it
-    is pending or active; None when it has no event. ``session_alive``: False only when the coordinator's watcher swept
+    is pending or active; None when it has no event. "Gone" is safe to answer only because :func:`slots.probe_over`
+    is fed :func:`slots.expired_launches`: a launch is probed only after its own slot lease (taken plus
+    ``slots.LEASE_S``, renewed by its watcher) expired, never while its coordinator may not have committed the row. ``session_alive``: False only when the coordinator's watcher swept
     the launch (``launch_sweeps``: it saw the session not running); otherwise None, because the store holds no live
     process; a dead session of an active launch is the watcher's to end, which ``launch_over`` then reads. A file or
     table that cannot be read raises, which :func:`slots.probe_over` reads as "cannot tell" (the slot is kept)."""

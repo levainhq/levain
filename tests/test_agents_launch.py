@@ -246,7 +246,10 @@ def test_the_session_key_is_committed_before_the_spawn_seam_runs(rig):
     # behaviour: start_run records the S1 session id and calls spawn only after that transaction committed: a
     # separate reader inside spawn already finds the one row the fence joins the session to
     from levain.slot.grammar import SESSION_RE
-    assert ctl.SESSION_KEY_RE.pattern == SESSION_RE.pattern
+    assert (ctl.SESSION_KEY_RE.pattern, ctl.SESSION_KEY_RE.flags) == (SESSION_RE.pattern, SESSION_RE.flags)
+    # every S1 consumer applies it with fullmatch (export, doctor, readset); the two agree on every edge
+    for probe in (KEY, KEY + "\n", KEY + "-v2", "S" + KEY[1:], KEY.upper(), "s-" + "a" * 15, "s-" + "a" * 17, ""):
+        assert bool(ctl.SESSION_KEY_RE.fullmatch(probe)) == bool(SESSION_RE.fullmatch(probe)), probe
     oid, epoch = _launched(rig)
     seen = []
 
@@ -254,7 +257,7 @@ def test_the_session_key_is_committed_before_the_spawn_seam_runs(rig):
         seen.append(_fence_rows(rig, key))
         return "child"
 
-    started = ctl.start_run(rig.store, oid, epoch, KEY, spawn)
+    started = ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=rig.now)
     assert started == ctl.Started(True, None, "child")
     assert seen == [[(oid,)]]
 
@@ -266,18 +269,19 @@ def test_a_session_key_that_cannot_be_recorded_never_reaches_the_spawn_seam(rig,
     calls = []
     spawn = calls.append
     oid, epoch = _launched(rig)
-    assert ctl.start_run(rig.store, oid, epoch, KEY, spawn).spawned is True
-    assert ctl.start_run(rig.store, oid, epoch, "s-" + "1" * 16, spawn).spawned is False      # a second key
+    run = lambda oid, epoch, key: ctl.start_run(rig.store, oid, epoch, key, spawn, clock=rig.now)  # noqa: E731
+    assert run(oid, epoch, KEY).spawned is True
+    assert run(oid, epoch, "s-" + "1" * 16).spawned is False                                  # a second key
     rig.finish(oid)
     other = rig.claim("k2")
     result = rig.launch(other)
     assert result.outcome == "launched"
-    assert ctl.start_run(rig.store, other, result.launch_epoch, KEY, spawn).spawned is False  # names another row
+    assert run(other, result.launch_epoch, KEY).spawned is False                              # names another row
     with rig.store.write() as c:                                                              # a revoke's bar step
         c.execute("UPDATE agent_occurrences SET epoch = epoch + 1 WHERE occurrence_id = ?", (other,))
-    assert ctl.start_run(rig.store, other, result.launch_epoch, "s-" + "2" * 16, spawn).spawned is False
+    assert run(other, result.launch_epoch, "s-" + "2" * 16).spawned is False
     with pytest.raises(ValueError):
-        ctl.start_run(rig.store, other, result.launch_epoch, "s-NOTHEX", spawn)
+        run(other, result.launch_epoch, "s-NOTHEX")
     # a write that fails at the store: a trigger standing for a full disk
     db = sqlite3.connect(tmp_path / "s" / "autonomic.db", isolation_level=None)
     db.execute("CREATE TRIGGER t_fail BEFORE UPDATE OF session_key ON agent_occurrences"
@@ -287,9 +291,11 @@ def test_a_session_key_that_cannot_be_recorded_never_reaches_the_spawn_seam(rig,
     third = rig.claim("k4")
     r3 = rig.launch(third)
     with pytest.raises(sqlite3.Error, match="disk full"):
-        ctl.start_run(rig.store, third, r3.launch_epoch, "s-" + "3" * 16, spawn)
+        run(third, r3.launch_epoch, "s-" + "3" * 16)
     assert rig.row(third)["session_key"] is None
     assert calls == [KEY]
+    with rig.store.write() as c:
+        c.execute("DROP TRIGGER t_fail")
 
 
 def test_a_crash_between_the_key_and_the_spawn_is_ended_by_lapse_recovery(rig):
@@ -298,7 +304,7 @@ def test_a_crash_between_the_key_and_the_spawn_is_ended_by_lapse_recovery(rig):
     # is then STALE at the fence (state and epoch moved), so it can make no call
     oid, epoch = _launched(rig)
     with rig.store.write() as c:
-        assert ctl.record_session_key(c, oid, epoch, KEY) is True
+        assert ctl.record_session_key(c, oid, epoch, KEY, rig.now()) is True
     row = rig.row(oid)
     fence, fence_now = agent_fence(row, authority=rig.authority, store_id=rig.sid, now=rig.now)
     lapse = rig.now(timedelta(seconds=ctl.LEASE_S + 1))
@@ -341,3 +347,158 @@ def test_dispatch_probes_read_the_coordinator_store(tmp_path):
     with pytest.raises(sqlite3.Error):
         nowhere_over("ln-a")
     assert slots.probe_over(["ln-a"], nowhere_over, None) == frozenset()
+
+
+# --- L3 r1 fixes: each test below was first run against the pre-fix code and failed there ---------------------------
+
+class Racing:
+    """The shared AgentAuthority, with another thread's refresh landing between the launch's refresh and its peek:
+    ``refresh`` returns the snapshot it replayed (S1), then ``between()`` changes the log and the inner authority is
+    refreshed again, so every later peek validates S2."""
+
+    def __init__(self, inner: AgentAuthority, between) -> None:
+        self.inner, self.between = inner, between
+
+    def refresh(self):
+        s1 = self.inner.refresh()
+        self.between()
+        self.inner.refresh()
+        return s1
+
+    def peek(self, *a, **kw):
+        return self.inner.peek(*a, **kw)
+
+
+def test_a_link_recreated_between_the_launch_refresh_and_its_peek_is_not_launched_under_the_old_terms(rig):
+    # behaviour (codex HIGH r1 #1): the link id the launch picked from its snapshot S1 was revoked and created again for
+    # another Binding before the peek; the peek answers from S2 with S2's incarnation. The launch must not admit S1's
+    # terms under S2's incarnation: it writes nothing and stays admitted (retried next tick from one snapshot)
+    gid = rig.link()
+    oid = rig.claim("k")
+
+    def recreate():
+        rig.world.link({"op": "revoke_grant", "grant_id": gid})
+        rig.world.link({"op": "create_grant", "grant": link_record(
+            rig.world, 1, agent=rig.agent, store=rig.sid, spec_hash=rig.spec_hash, binding_id="bind-fedcba9876543210")})
+
+    before = rig.row(oid)
+    result = ctl.launch(rig.store, oid, authority=Racing(rig.authority, recreate), executor=Exec(), window=WINDOW,
+                        now=rig.now(timedelta(hours=1)))         # after the recreate's own (clock-stepped) signing
+    assert result.outcome == "unclassified" and "moved" in result.reason
+    assert rig.row(oid) == before and rig.taken(oid) == ([], [])
+
+
+class Peeks:
+    """An authority whose peek answers ``answer`` for every link (the replay is the real one)."""
+
+    def __init__(self, inner: AgentAuthority, answer) -> None:
+        self.inner, self.answer = inner, answer
+
+    def refresh(self):
+        return self.inner.refresh()
+
+    def peek(self, *a, **kw):
+        return self.answer
+
+
+@pytest.mark.parametrize("answer", [(True, ""), (True, 0), (True, None)])
+def test_a_live_peek_with_an_incarnation_that_is_not_the_snapshots_is_retried_not_ended(rig, answer):
+    # behaviour (deepseek MED r1 #1): a live answer whose incarnation is falsy or not the snapshot's never ends the
+    # occurrence (stopped is terminal); it writes nothing and the row stays admitted
+    rig.link()
+    oid = rig.claim("k")
+    before = rig.row(oid)
+    result = ctl.launch(rig.store, oid, authority=Peeks(rig.authority, answer), executor=Exec(), window=WINDOW,
+                        now=rig.now())
+    assert result.outcome == "unclassified"
+    assert rig.row(oid) == before and rig.taken(oid) == ([], [])
+
+
+def test_a_link_signed_for_another_store_never_admits_and_the_store_id_is_not_the_callers(rig):
+    # behaviour (codex HIGH + complement LOW r1 #3): the store id the links are matched on is the store's own meta row;
+    # a link for the same agent/spec/Binding signed for another store ends the occurrence no_link, and no caller can
+    # name the other store's id
+    import inspect
+    assert "store_id" not in inspect.signature(ctl.launch).parameters
+    other = "store-" + "e" * 32
+    rig.world.link({"op": "create_grant", "grant": link_record(
+        rig.world, 1, agent=rig.agent, store=other, spec_hash=rig.spec_hash, binding_id=BINDING)})
+    oid = rig.claim("k")
+    _stopped(rig, oid, "no_link", rig.launch(oid))
+
+
+def test_a_session_key_is_not_recorded_on_a_lapsed_lease(rig):
+    # behaviour (codex HIGH r1 #2): a launch whose lease has lapsed belongs to lapse recovery even before takeover runs;
+    # its key is refused and spawn is never called. The same row inside its lease records it.
+    calls = []
+    oid, epoch = _launched(rig)
+    lapsed = lambda: rig.now(timedelta(seconds=ctl.LEASE_S + 1))  # noqa: E731
+    assert ctl.start_run(rig.store, oid, epoch, KEY, calls.append, clock=lapsed).spawned is False
+    with rig.store.write() as c:
+        assert ctl.record_session_key(c, oid, epoch, KEY, rig.now(timedelta(seconds=ctl.LEASE_S))) is False
+    assert rig.row(oid)["session_key"] is None and calls == []
+    live = lambda: rig.now(timedelta(seconds=ctl.LEASE_S - 1))  # noqa: E731
+    assert ctl.start_run(rig.store, oid, epoch, KEY, calls.append, clock=live).spawned is True
+    assert calls == [KEY]
+
+
+def test_a_takeover_between_the_key_commit_and_the_spawn_leaves_a_session_the_fence_reads_as_stale(rig):
+    # behaviour (the residue of codex HIGH r1 #2, closed downstream): takeover commits after the key and before spawn;
+    # spawn still runs (no suspended child here: P6-5b's), but the fence join finds the row stopped at epoch + 1, so
+    # every call the session makes is refused
+    oid, epoch = _launched(rig)
+    seen = []
+
+    def spawn(key):
+        with rig.store.write() as c:                                     # recovery, in another transaction
+            assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1))) is True
+        with rig.store.read() as c:                                      # the fence's join, then its state/epoch read
+            (found,), = c.execute("SELECT occurrence_id FROM agent_occurrences WHERE session_key = ? LIMIT 2",
+                                  (key,)).fetchall()
+            seen.append(c.execute("SELECT state, epoch FROM agent_occurrences WHERE occurrence_id = ?",
+                                  (found,)).fetchone())
+        return "child"
+
+    assert ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=rig.now) == ctl.Started(True, None, "child")
+    assert seen == [("stopped", epoch + 1)]
+    fence, fence_now = agent_fence(rig.row(oid) | {"launch_epoch": epoch}, authority=rig.authority, store_id=rig.sid,
+                                   now=rig.now)
+    with rig.store.read() as c:
+        assert fence_now(c) != fence
+
+
+def test_a_transaction_sqlite_already_rolled_back_raises_its_own_error_not_the_savepoints(rig, tmp_path):
+    # behaviour (complement MED r1 #5): a reservation write that SQLite answers by rolling the whole transaction back
+    # (RAISE(ROLLBACK), as SQLITE_FULL does) surfaces that error, not "no such savepoint"; nothing is written
+    rig.link()
+    oid = rig.claim("k")
+    db = sqlite3.connect(tmp_path / "s" / "autonomic.db", isolation_level=None)
+    db.execute("CREATE TRIGGER t_full BEFORE INSERT ON agent_reservations BEGIN SELECT RAISE(ROLLBACK, 'disk full'); END")
+    db.close()
+    before = rig.row(oid)
+    with pytest.raises(sqlite3.IntegrityError, match="disk full"):
+        rig.launch(oid)
+    assert rig.row(oid) == before and rig.taken(oid) == ([], [])
+
+
+def test_a_coordinator_slot_with_no_launch_row_is_probed_only_after_its_own_lease(rig, tmp_path):
+    # behaviour (complement MED r1 #6): launch_over answers True for a launch row that is gone, but only launch slots
+    # whose own lease (slots.LEASE_S from the take, renewed by the watcher) has expired are probed at all
+    # (slots.expired_launches), so a coordinator that took a slot and has not committed its launches row yet keeps it
+    db = sqlite3.connect(tmp_path / "dispatch.db")
+    for ddl in LEASE_SCHEMA:
+        db.execute(ddl)
+    db.commit()
+    db.close()
+    over, alive = ctl.dispatch_probes(tmp_path)
+    rig.link()
+    oid = rig.claim("k")
+    with rig.store.write() as c:
+        slots.take(c, slots.LAUNCH, "ln-young", rig.now())
+        slots.take(c, slots.LAUNCH, "ln-other", rig.now())
+    young = ctl.launch(rig.store, oid, authority=rig.authority, executor=Exec(), window=WINDOW,
+                       now=rig.now(timedelta(seconds=slots.LEASE_S - 1)), launch_over=over, session_alive=alive)
+    assert young.outcome == "no-slot" and rig.row(oid)["state"] == "admitted"
+    late = ctl.launch(rig.store, oid, authority=rig.authority, executor=Exec(), window=WINDOW,
+                      now=rig.now(timedelta(seconds=slots.LEASE_S)), launch_over=over, session_alive=alive)
+    assert late.outcome == "launched"
