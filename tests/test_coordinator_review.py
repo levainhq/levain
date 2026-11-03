@@ -16,7 +16,7 @@ from levain.consent import limits
 from levain.consent.ledger import Ledger
 from levain.consent.questions import QuestionStore
 from levain.coordinator import review
-from levain.coordinator.store import CoordError, CoordStore, Part
+from levain.coordinator.store import CoordError, CoordStore, Part, _all_gseq
 from tests.test_consent_queue import authority, keys  # noqa: F401  (module fixtures)
 from tests.test_coordinator_envelope import ctx, keys as env_keys, repo, snapshot, structured_thread  # noqa: F401
 from tests.test_coordinator_envelope import HOUR, NOW as ENV_NOW
@@ -661,3 +661,77 @@ def test_g4_a_dead_seat_run_with_nothing_to_expire_opens_no_write_transaction_fo
     monkeypatch.setattr(store, "_write", lambda *a, **k: (opened.append(1), real(*a, **k))[1])
     assert review.feed_dead_seats(store) == []
     assert opened == []
+
+
+# --- the ``agent`` feed (the dream's morning card) ---------------------------------------------------------------
+def test_the_agent_feed_files_once_per_key_and_has_its_own_label(store):
+    assert "agent" in review.FEEDS and review.FEED_LABELS["agent"]
+    a, new_a = review.file_item(store, "agent", {"reason": "dream"}, dedupe_key="agent:1")
+    b, new_b = review.file_item(store, "agent", {"reason": "dream"}, dedupe_key="agent:1")
+    assert new_a and not new_b and a.item_id == b.item_id and a.feed == "agent"
+    assert [i.item_id for i in review.list_items(store, feed="agent")] == [a.item_id]
+    assert review.list_items(store, feed="know") == []
+    assert review.clear_item(store, a.item_id).state == "cleared"
+
+
+def test_an_agent_item_with_his_is_authority_relevant_and_the_coordinator_cannot_clear_it(store):
+    item, _ = review.file_item(store, "agent", {"his": ["x"]}, dedupe_key="agent:his", authority_relevant=True)
+    assert item.authority_relevant
+    with pytest.raises(CoordError):
+        review.clear_item(store, item.item_id, mode="coordinator", token=_token(store))
+
+
+def test_an_unknown_feed_is_still_refused(store):
+    with pytest.raises(CoordError, match="agent"):
+        review.file_item(store, "nope", {"text": "x"}, dedupe_key="n")
+
+
+def _old_items_store(store):
+    """The store as it was before ``agent``: review_items rebuilt with the older feed CHECK, rows and an event kept."""
+    keep, _ = review.file_item(store, "know", {"text": "old"}, dedupe_key="old:1")
+    cleared, _ = review.file_item(store, "seat", {"text": "gone"}, dedupe_key="old:2")
+    review.clear_item(store, cleared.item_id)
+    conn = store._connect()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    cols = ", ".join(r[1] for r in conn.execute("PRAGMA table_info(review_items)"))
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'review_items'").fetchone()[0]
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(sql.replace("review_items", "review_items_old", 1).replace(", 'agent'", ""))
+    conn.execute(f"INSERT INTO review_items_old (rowid, {cols}) SELECT rowid, {cols} FROM review_items")
+    conn.execute("DROP TABLE review_items")
+    conn.execute("PRAGMA legacy_alter_table = ON")     # review_events' triggers name review_items, gone for the moment
+    conn.execute("ALTER TABLE review_items_old RENAME TO review_items")
+    conn.execute("PRAGMA legacy_alter_table = OFF")
+    conn.execute("COMMIT")
+    return conn, keep, cleared
+
+
+def test_a_store_made_before_agent_cannot_file_one_until_migrate_items_rebuilds_it(store):
+    conn, keep, cleared = _old_items_store(store)
+    assert "'agent'" not in conn.execute("SELECT sql FROM sqlite_master WHERE name = 'review_items'").fetchone()[0]
+    before = conn.execute("SELECT rowid, * FROM review_items ORDER BY rowid").fetchall()
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+        review.file_item(store, "agent", {"reason": "x"}, dedupe_key="agent:early")
+    conn.execute("BEGIN IMMEDIATE")
+    assert review.migrate_items(conn) is True
+    for stmt in store._statements():        # the ensure path's next step: the table's triggers come back
+        conn.execute(stmt)
+    _all_gseq(conn)
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert conn.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    conn.execute("COMMIT")
+    conn.execute("PRAGMA foreign_keys = ON")
+    assert conn.execute("SELECT rowid, * FROM review_items ORDER BY rowid").fetchall() == before
+    assert review.migrate_items(conn) is False
+    with pytest.raises(sqlite3.IntegrityError, match="never replaced"):
+        conn.execute("INSERT INTO review_items (item_id, feed, dedupe_key, body, authority_relevant, by, at) "
+                     "VALUES ('x', 'know', 'old:1', '{}', 0, 'service', 'now')")
+    new, made = review.file_item(store, "agent", {"reason": "x"}, dedupe_key="agent:late")
+    assert made and new.feed == "agent"
+    assert {i.item_id: i.state for i in review.list_items(store, include_cleared=True)} == {
+        keep.item_id: "open", cleared.item_id: "cleared", new.item_id: "open"}
+
+
+def test_migrate_items_leaves_a_current_or_absent_table_alone():
+    conn = sqlite3.connect(":memory:")
+    assert review.migrate_items(conn) is False
