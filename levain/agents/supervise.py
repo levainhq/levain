@@ -58,12 +58,15 @@ class Effected:
     ``outcome`` is the journal's last answer and ``tries`` how many times it was asked. ``waits`` is True when the cover
     stayed unreadable through the tries (the occurrence is still ``launched`` and the next pass retries). On a STALE,
     ``stop`` is the executor's answer (None when the row had already ended and nothing was asked), and ``ended`` what
-    the settle wrote (None when ``stop`` did not confirm, so nothing was written)."""
+    the settle wrote (None when ``stop`` did not confirm, or when the settle raised: nothing was written).
+    ``settle_error`` names the exception of a settle that raised after a confirmed stop; the row is then still
+    ``launched`` with its slot and reservation, for the tick side's reaper."""
     outcome: EffectOutcome
     tries: int
     waits: bool = False
     stop: accounting.StopResult | None = None
     ended: _ctl.Ended | None = None
+    settle_error: str | None = None
 
     @property
     def stale(self) -> bool:
@@ -73,10 +76,12 @@ class Effected:
 @dataclass(frozen=True)
 class End:
     """What an ended occurrence tells the hooks: the state and reason the settle wrote (``verify`` receives the state
-    and reason the run asked for, before the settle), the executor's reading and the settle's result."""
+    and reason the run asked for, before the settle), the executor's reading and the settle's result. When this
+    finish wrote nothing (``ended.ended`` False), ``state`` and ``reason`` are the row's as re-read after the settle
+    (a terminal row's end, or ``launched`` and None for a run a bar fenced), never the ones asked for."""
     occurrence_id: str
     state: str
-    reason: str
+    reason: str | None
     usage: accounting.Usage
     ended: _ctl.Ended | None = None
 
@@ -188,7 +193,12 @@ class Supervisor:
         stop = _executor_stop(executor, self._stop_deadline_s)
         if stop.terminated is not True:
             return Effected(outcome, tries, stop=stop)
-        ended = self._settle(occ["occurrence_id"], "stopped", None, _executor_usage(executor), occ)
+        try:
+            ended = self._settle_stopped(occ, _executor_usage(executor))
+        except Exception as exc:  # noqa: BLE001 - the stop is confirmed; the reaper settles the row it left launched
+            _log.warning("agent supervisor: the settle after a confirmed stop of %s raised %s: %s; the row stays"
+                         " launched for the reaper", occ["occurrence_id"], type(exc).__name__, exc)
+            return Effected(outcome, tries, stop=stop, settle_error=type(exc).__name__)
         return Effected(outcome, tries, stop=stop, ended=ended)
 
     def _stale_reason(self, conn: sqlite3.Connection, occ: dict, epoch: int) -> str:
@@ -200,29 +210,58 @@ class Supervisor:
             return "fenced"
         return "link_not_live"
 
-    def _settle(self, occurrence_id: str, state: str, reason: str | None, usage: accounting.Usage,
-                occ: dict) -> _ctl.Ended:
-        """One ``BEGIN IMMEDIATE``: the end under the epoch the row holds now (a revoke has raised it past the launch's,
-        which the fence already refused), so a row that ended first is not found and nothing is written twice."""
+    def _settle_stopped(self, occ: dict, usage: accounting.Usage) -> _ctl.Ended:
+        """The STALE path's settle, and the only one that adopts the epoch the row holds NOW. It runs only after
+        ``stop()`` answered ``StopResult(terminated=True)``: the process is gone, so the end it writes is the
+        revocation's own (``stopped``), and a revoke has usually raised the epoch past the launch's, which is why
+        the launch epoch would not find the row. One ``BEGIN IMMEDIATE``; a row that ended first is not found and
+        nothing is written twice."""
+        occurrence_id = occ["occurrence_id"]
         with self._store.write() as conn:
             row = conn.execute("SELECT epoch FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'",
                                (occurrence_id,)).fetchone()
             if row is None:
                 return _ctl.Ended(False)
-            return _ctl.settle_terminal(conn, occurrence_id, row[0], state,
-                                        reason or self._stale_reason(conn, occ, row[0]), usage, self._clock())
+            return _ctl.settle_terminal(conn, occurrence_id, row[0], "stopped",
+                                        self._stale_reason(conn, occ, row[0]), usage, self._clock())
+
+    def _settle_held(self, occurrence_id: str, epoch: int, state: str, reason: str,
+                     usage: accounting.Usage) -> _ctl.Ended:
+        """The fire's own end, under the epoch the fire launched with: a bar or takeover that raised the epoch since
+        fences this write (``Ended(False)``, nothing written), so a natural completion never outruns a revocation."""
+        with self._store.write() as conn:
+            return _ctl.settle_terminal(conn, occurrence_id, epoch, state, reason, usage, self._clock())
+
+    def _held(self, occurrence_id: str, epoch: object) -> bool:
+        with self._store.read() as conn:
+            return conn.execute("SELECT 1 FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'"
+                                " AND epoch = ?", (occurrence_id, epoch)).fetchone() is not None
+
+    def _as_stands(self, occurrence_id: str, usage: accounting.Usage) -> End:
+        """A finish that wrote nothing: the row's state and reason as they stand, never the ones asked for."""
+        with self._store.read() as conn:
+            state, reason = conn.execute("SELECT state, reason FROM agent_occurrences WHERE occurrence_id = ?",
+                                         (occurrence_id,)).fetchone()
+        return End(occurrence_id, state, reason, usage, _ctl.Ended(False))
 
     # --- the run's natural end: the hook points --------------------------------------------------------------------
 
     def finish(self, occurrence_id: str, executor: accounting.Executor, *, ok: bool = True,
                reason: str | None = None) -> End:
         """End a run that finished on its own: ``verify`` may turn a ``done`` into ``failed``, the settle writes the end
-        under the epoch the row holds, and ``on_end`` runs after the commit. ``ok=False`` ends ``failed`` with
-        ``reason`` (default ``run_failed``) and still runs both hooks. The caller says the executor's run is over; a
-        row that already ended gets no second settle."""
+        under the epoch the fire launched with, and ``on_end`` runs after the commit. ``ok=False`` ends ``failed`` with
+        ``reason`` (default ``run_failed``; 'completed' is done's alone, so it is ``run_failed`` too) and still runs
+        both hooks. The caller says the executor's run is over. A row that already ended, or that a bar or takeover
+        fenced since the launch, gets no settle and no hooks, and the End it returns is the row as it stands."""
         occ = self._occurrence(occurrence_id)
+        epoch = occ["launch_epoch"]
         usage = _executor_usage(executor)
-        state, why = ("done", "completed") if ok else ("failed", reason or "run_failed")
+        if not self._held(occurrence_id, epoch):      # verify may have effects: it never runs for a run already over
+            return self._as_stands(occurrence_id, usage)
+        if ok:
+            state, why = "done", "completed"
+        else:
+            state, why = "failed", reason if type(reason) is str and reason and reason != "completed" else "run_failed"
         if self._hooks.verify is not None:
             try:
                 verdict = self._hooks.verify(End(occurrence_id, state, why, usage))
@@ -230,9 +269,12 @@ class Supervisor:
                 _log.warning("agent supervisor: the verify hook raised %s", type(exc).__name__)
                 verdict = "verify_error"
             if verdict is not None and state == "done":
-                state, why = "failed", verdict if type(verdict) is str and verdict else "verify_error"
-        ended = self._settle(occurrence_id, state, why, usage, occ)
-        end = End(occurrence_id, ended.state or state, ended.reason or why, usage, ended)
+                good = type(verdict) is str and verdict and verdict != "completed"
+                state, why = "failed", verdict if good else "verify_error"
+        ended = self._settle_held(occurrence_id, epoch, state, why, usage)
+        if not ended.ended:
+            return self._as_stands(occurrence_id, usage)
+        end = End(occurrence_id, ended.state, ended.reason, usage, ended)
         if ended.ended and self._hooks.on_end is not None:
             try:
                 self._hooks.on_end(end)

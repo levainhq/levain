@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import ast
 import copy
+import logging
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from levain.agent_authority import AgentCoverMoved
-from levain.agents import supervise
+from levain.agents import bars, supervise
 from levain.agents.accounting import StopResult, Usage
 from levain.autonomic.journal import EffectStatus, RunJournal
 
@@ -237,5 +239,69 @@ def test_verify_may_fail_a_done_and_on_end_runs_after_the_commit_whatever_it_rai
     row = rig.row(oid)
     assert (end.state, end.reason) == ("failed", "no_win") and (row["state"], row["reason"]) == ("failed", "no_win")
     assert seen == [("failed", "no_win", "failed")] and rig.taken(oid) == ([], [("settled",)])
-    sup.finish(oid, Ex())
-    assert len(seen) == 1
+    again = sup.finish(oid, Ex())      # the default asks for done/completed: the durable end is reported instead
+    assert (again.state, again.reason, again.ended.ended) == ("failed", "no_win", False) and len(seen) == 1
+    ran = []
+    late = sup.effect(oid, "e1", digest="d1", fn=lambda: ran.append("e1") or "ok", executor=Ex())
+    assert late.stale and late.stop is None and ran == []      # an ended row's fence never holds
+
+
+# --- regressions (L3 r1) --------------------------------------------------------------------------------------------
+
+def _bar(rig) -> None:
+    """A revoke's first step on the real store: the open bar, every live occurrence's epoch raised."""
+    db = sqlite3.connect(rig.store.directory / "autonomic.db", isolation_level=None)
+    try:
+        bars.open_bar(db, rig.agent, head_seq=0, now=rig.now())
+    finally:
+        db.close()
+
+
+def test_a_finish_after_a_bar_loses_to_the_revocation_and_reports_the_row_as_it_stands(rig):
+    # behaviour: a bar raised between the start and a natural finish(ok=True) fences the fire: nothing is written,
+    # on_end is not called, End reports the row still launched; the confirmed stop then ends it stopped/barred
+    seen = []
+    sup, journal = _supervisor(rig, hooks=supervise.Hooks(on_end=seen.append))
+    oid = _fire(rig, "a", journal)
+    _bar(rig)
+    end = sup.finish(oid, Ex())
+    row = rig.row(oid)
+    assert (end.state, end.reason, end.ended.ended) == ("launched", None, False) and seen == []
+    assert row["state"] == "launched" and rig.taken(oid) == ([(1,)], [("open",)])
+    sup.begin_tick()
+    stopped = sup.effect(oid, "e1", digest="d1", fn=lambda: "ok", executor=Ex(True))
+    assert stopped.stale and stopped.ended.ended
+    assert (rig.row(oid)["state"], rig.row(oid)["reason"]) == ("stopped", "barred")
+
+
+def test_a_failed_end_never_carries_completed(rig):
+    # behaviour: a verifier answering "completed" fails the run as verify_error, and finish(ok=False,
+    # reason="completed") fails it as run_failed; both settle, so neither row is left launched holding its slot
+    sup, journal = _supervisor(rig, hooks=supervise.Hooks(verify=lambda end: "completed"))
+    first = _fire(rig, "a", journal)
+    second = _second_fire(rig, journal)
+    a = sup.finish(first, Ex())
+    b = sup.finish(second, Ex(), ok=False, reason="completed")
+    assert (a.state, a.reason, a.ended.ended) == ("failed", "verify_error", True)
+    assert (b.state, b.reason, b.ended.ended) == ("failed", "run_failed", True)
+    assert [(rig.row(o)["state"], rig.row(o)["reason"]) for o in (first, second)] == \
+        [("failed", "verify_error"), ("failed", "run_failed")]
+
+
+def test_a_settle_that_raises_after_a_confirmed_stop_leaves_the_row_launched_and_says_so(rig, monkeypatch, caplog):
+    # behaviour: the stop is confirmed, the settle raises: effect() returns (it does not raise) with the stop, no
+    # end and the error named; the row stays launched with its slot and reservation for the reaper; it is logged
+    sup, journal = _supervisor(rig)
+    oid = _fire(rig, "a", journal)
+    rig.world.link(revoke_agent(rig.agent, rig.sid), "laptop")
+
+    def raises(*a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ctl, "settle_terminal", raises)
+    sup.begin_tick()
+    with caplog.at_level(logging.WARNING, logger="levain.agents.supervise"):
+        held = sup.effect(oid, "e1", digest="d1", fn=lambda: "ok", executor=Ex(True))
+    assert held.stale and held.stop.terminated is True and held.ended is None
+    assert held.settle_error == "OperationalError" and "OperationalError" in caplog.text
+    assert rig.row(oid)["state"] == "launched" and rig.taken(oid) == ([(1,)], [("open",)])
