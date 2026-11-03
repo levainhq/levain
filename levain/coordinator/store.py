@@ -510,6 +510,7 @@ class CoordStore:
         (:meth:`_schema_current`'s reader gate)."""
         from levain.coordinator.lease import LEASE_SCHEMA
         from levain.coordinator.first_reader import FIRST_READER_SCHEMA
+        from levain.coordinator.intake import INTAKE_SCHEMA
         from levain.coordinator.ready import LIFECYCLE_SCHEMA
         from levain.coordinator.review import REVIEW_SCHEMA
         from levain.coordinator.seam_handoffs import SEAM_HANDOFF_SCHEMA
@@ -520,7 +521,8 @@ class CoordStore:
         # the lease is checked by every opener's coordinator writes, so its tables are every opener's; C13's lifecycle
         # tables (ready items + their journal) are additive, IF NOT EXISTS, like every statement here
         return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA,
-                *((*LIFECYCLE_SCHEMA, *OPERATOR_VIEWS_SCHEMA, *SEAM_SCHEMA, *SEAM_HANDOFF_SCHEMA, *OPEN_SCHEMA)
+                *((*LIFECYCLE_SCHEMA, *OPERATOR_VIEWS_SCHEMA, *SEAM_SCHEMA, *SEAM_HANDOFF_SCHEMA, *OPEN_SCHEMA,
+                  *INTAKE_SCHEMA)
                 if lifecycle else ()))
 
     def _connect(self, *, create: bool = True) -> sqlite3.Connection:

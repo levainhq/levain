@@ -478,12 +478,48 @@ def _open_section(store: CoordStore, launch: Any, lv: str, tail: str) -> list[st
             "acknowledge line again); rows that land after it come in the next open.", "",
             f"~~~ OPEN {fence}",
             *[unshowable.mark(line, allow="") for line in built.body.split("\n")],
-            f"~~~ END OPEN {fence}", "",
-            f"When you hand over (a rotation, or the operator leaving), write the handoff first: `{lv} coord close "
-            f"--kind rotation|operator --body-file PATH --request-id ID --prev-handoff-id H --token N {tail}` "
-            "(`coord open` prints the H to use; the body is JSON with state_line, in_flight, next, contingencies, "
-            "notes, attested_operator_present, attested_walked; `coord handoff show` reads one back). In it, name rows "
-            "by id (dr-..., item keys), never by ordinal: the next coordinator sees ids, not your order.", ""]
+            f"~~~ END OPEN {fence}", ""]
+
+
+#: The brief paragraph that asks the coordinator for "the day" above its status line on his arrival card. S5 option (a),
+#: the rec; option (b) differs by exactly this paragraph (set it to ``_DAY_STATUS_ONLY``) and option (c) drops the
+#: derived lines as well. Nothing checks the coordinator's lines; Levain's lines below them are verified like the band.
+_ARRIVAL_CARD = ("When the block Levain gives you carries a line starting `back:`, or you acknowledged an operator open "
+                 "this turn and are answering a drop with `coord reply` (Levain freezes the block under your text, "
+                 "and you never see it), this reply is his arrival card, shown once.")
+_DAY_PLAN = (
+    f"{_ARRIVAL_CARD} Above your status line (in a `coord reply`, at the top of --text) write at most 5 plain lines of "
+    "the day: what you will run today and in what order, and what you are holding until he answers. Do not restate a "
+    "work line, a `back:`, handoff or `next:` line, or a band item: they are directly below, and a restatement drifts "
+    "from the record. Name rows by id (dr-..., thread ids, band numbers as given), never by ordinal. Ask him nothing: "
+    "a question goes through `coord escalate` or the band's ask tool, and \"waits on you\" is never written. A reply "
+    "that is neither has no such section: it is the reply as always.")
+_DAY_STATUS_ONLY = (
+    f"{_ARRIVAL_CARD} Write only your status line (in a `coord reply`, a one-line --text): the lines Levain derived "
+    "are the card.")
+DAY_PARAGRAPH = _DAY_PLAN
+
+
+def _arrival_section(lv: str, tail: str) -> list[str]:
+    """How the coordinator meets him arriving and leaving (C15 S5). Always in the brief, also when the open could not be
+    built: it holds the verbs the operator seam runs on."""
+    return [
+        "## When he arrives or leaves",
+        "",
+        f"- On every turn that carries his words (an attended turn, or a wake whose drops are new), run `{lv} coord open "
+        f"--light --token N {tail}` first, before you reply. It consumes his signed return and prints the open waiting "
+        "for you with its exact acknowledge line (run it); when nothing waits it says \"no light open needed\".",
+        f"- {DAY_PARAGRAPH}",
+        f"- When his words say he is leaving: `{lv} coord away DROP_ID --token N {tail}`, then `{lv} coord close "
+        f"--plan {tail}` prints the walk checklist (it writes nothing); walk it with him, then write the handoff.",
+        f"- When you hand over (a rotation, or the operator leaving), write the handoff first: `{lv} coord close "
+        f"--kind rotation|operator --body-file PATH --request-id ID --prev-handoff-id H --token N {tail}` "
+        "(`coord open` prints the H to use; the body is JSON with state_line, in_flight, next, contingencies, "
+        "notes, attested_operator_present, attested_walked; `coord handoff show` reads one back). In it, name rows "
+        "by id (dr-..., item keys), never by ordinal: the next coordinator sees ids, not your order. For the "
+        "operator leaving, `next` and `contingencies` are the night plan.",
+        "",
+    ]
 
 
 def record_brief_delivery(store: CoordStore, launch_id: str) -> None:
@@ -672,6 +708,7 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         "and shows it where he reads it; you do not write the block. A drop with no reply after ten minutes shows on "
         "the Coordinator panel as `no reply yet`.",
         "",
+        *_arrival_section(lv, tail),
         "## How your turn ends",
         "",
         "Your words are the last thing in a session the operator may see in his agent view, where a question or "

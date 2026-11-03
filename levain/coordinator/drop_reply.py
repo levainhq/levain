@@ -9,7 +9,9 @@ The reply carries a block FROZEN at write: the work delta of :mod:`levain.coordi
 the same operator cursor the terminal reply uses), then the question band as it stood, and the gseq range the block
 covers. Every later view of the reply shows that stored text, never a re-render. Writing it advances the operator's
 work cursor to the last record the block covered: a reply on these surfaces has no receipt, so it counts as delivered
-when written (DESIGN section 8). The reply's own row stays after the cursor, so the next terminal block names it.
+when written (DESIGN section 8). The reply's own row stays after the cursor, so the next terminal block names it. A
+block that carries the intake card (:mod:`levain.coordinator.intake`) records it in the same transaction, so a reply
+and its ``intake_views`` row commit together.
 
 "No reply yet" is derived, never stored: a drop with no coordinator reply after :data:`UNREPLIED_AFTER_MINUTES`
 (:func:`unreplied`). It stays after the reply window closes, as ``no reply, window closed``, for
@@ -114,6 +116,9 @@ def write_reply(store: CoordStore, drop_id: str, text: str, *, token: object) ->
             if delta.total and delta.through > since:
                 conn.execute("INSERT INTO operator_views (viewer, gseq, at) VALUES (?, ?, ?)",
                              (VIEWER, delta.through, now))
+            if delta.intake_open:               # the card this frozen block carries is shown with the reply row
+                conn.execute("INSERT INTO intake_views (open_id, via, ref, at) VALUES (?, 'drop_reply', ?, ?)",
+                             (delta.intake_open, reply_id, now))
     except sqlite3.IntegrityError as exc:
         raise CoordError(f"refused: {exc}") from exc
     return DropReply(reply_id, drop_id, gseq, now, body["surface"], body["received_at"], text, block, since, delta.through)
@@ -134,19 +139,22 @@ class Unreplied(NamedTuple):
     closed: bool
 
 
-def unreplied(conn: sqlite3.Connection, now: str, exclude: str | None = None) -> list[Unreplied]:
+def unreplied(conn: sqlite3.Connection, now: str, exclude: str | None = None, *, every: bool = False) -> list[Unreplied]:
     """Each drop sent from the cockpit or the phone (the terminal's words were answered in the session) with no
     coordinator reply that is past :data:`UNREPLIED_AFTER_MINUTES` and not older than
     :data:`UNREPLIED_SHOWN_DAYS`, oldest first: ``closed`` once past the reply window, which stays on the line for the
     rest of those days (silence must not read as heard because a window ran out). ``now``: a store stamp. ``exclude``:
-    a drop being answered right now. The one derivation the panel and the work delta both read."""
+    a drop being answered right now. The one derivation the panel and the work delta both read. ``every``: the walk's
+    reading (``coord close --plan``): no age floor and no age ceiling, so a drop he sent a second ago and one a month
+    old are both counted; ``closed`` still says which can no longer be answered."""
+    floor, ceiling = (-1.0, 1e9) if every else (UNREPLIED_AFTER_MINUTES, UNREPLIED_SHOWN_DAYS)
     rows = conn.execute(
         "SELECT d.drop_id, d.surface, d.received_at, (julianday(?) - julianday(d.received_at)) * 24 > ? "
         "FROM drops d WHERE d.surface != 'cli' AND NOT EXISTS (SELECT 1 FROM replies r WHERE "
         "r.kind = 'coordinator_reply' AND r.ref_store = 'drops' AND r.ref_id = d.drop_id) AND d.drop_id IS NOT ? "
         "AND (julianday(?) - julianday(d.received_at)) * 1440 > ? "
         "AND (julianday(?) - julianday(d.received_at)) <= ? ORDER BY d.rowid",
-        (now, REPLY_WINDOW_HOURS, exclude, now, UNREPLIED_AFTER_MINUTES, now, UNREPLIED_SHOWN_DAYS)).fetchall()
+        (now, REPLY_WINDOW_HOURS, exclude, now, floor, now, ceiling)).fetchall()
     return [Unreplied(d, surface, at, bool(closed)) for d, surface, at, closed in rows]
 
 

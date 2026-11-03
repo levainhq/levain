@@ -156,10 +156,9 @@ def test_close_refusals_exit_one_on_stderr_and_write_nothing(world, qdir, tmp_pa
         "--prev-handoff-id", "1", "--token", str(world.token))
 
 
-def test_close_has_no_plan_flag_yet(qdir, capsys):
-    with pytest.raises(SystemExit):
-        main(["coord", "close", "--plan", "--queue-dir", str(qdir)])
-    capsys.readouterr()
+def test_close_without_plan_still_needs_its_flags(world, qdir, capsys):
+    err = run(qdir, capsys, "close", "--queue-dir", str(qdir), rc=1).err
+    assert "coord close needs --kind, --body-file, --request-id, --token" in err
 
 
 # --- coord open ----------------------------------------------------------------------------------------------------
