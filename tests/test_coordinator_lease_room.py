@@ -239,9 +239,9 @@ def test_an_unknown_unique_constraint_refuses_by_name(store, clock):
     _refused_rebuild(store, add, r"launches holds a constraint on harness, cwd, at")
 
 
-def _add_child(action):
+def _add_child(action, parent="launches"):
     def mutate(c):
-        c.execute("CREATE TABLE launch_notes (id INTEGER PRIMARY KEY, launch_id TEXT REFERENCES launches(launch_id) "
+        c.execute(f"CREATE TABLE launch_notes (id INTEGER PRIMARY KEY, launch_id TEXT REFERENCES {parent}(launch_id) "
                   f"ON DELETE {action})")
         c.execute("INSERT INTO launch_notes (launch_id) SELECT launch_id FROM launches")
     return mutate
@@ -251,6 +251,14 @@ def _add_child(action):
 def test_a_child_table_that_acts_on_delete_refuses_the_rebuild(store, clock, action):
     _a_store_with_history(store, clock)
     _refused_rebuild(store, _add_child(action), rf"launch_notes\(launch_id\) ON DELETE {action}")
+
+
+@pytest.mark.parametrize("parent", ["LAUNCHES", "Launches"])
+@pytest.mark.parametrize("action", ["CASCADE", "SET NULL"])
+def test_a_child_naming_launches_in_another_case_still_refuses_the_rebuild(store, clock, action, parent):
+    # SQLite names are case-insensitive, and foreign_key_list reports the spelling the child wrote
+    _a_store_with_history(store, clock)
+    _refused_rebuild(store, _add_child(action, parent), rf"launch_notes\(launch_id\) ON DELETE {action}")
 
 
 @pytest.mark.parametrize("action", ["NO ACTION", "RESTRICT"])
@@ -286,6 +294,44 @@ def test_a_newer_role_check_with_no_rows_of_it_refuses_by_name(store, clock):
         c.execute("COMMIT")
 
     _refused_rebuild(store, widen, "role CHECK this release does not know")
+
+
+def test_a_legacy_role_check_with_any_other_change_to_the_definition_refuses_by_name(store, clock):
+    _a_store_with_history(store, clock)
+
+    def add_check(c):
+        sql = c.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'launches'").fetchone()[0]
+        triggers = [r[0] for r in c.execute("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = "
+                                            "'launches'")]
+        cols = ", ".join(r[1] for r in c.execute("PRAGMA table_info(launches)"))
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(f"CREATE TEMP TABLE hold AS SELECT rowid AS rid, {cols} FROM launches")
+        c.execute("DROP TABLE launches")
+        c.execute(sql[:-1] + ", CHECK (token >= 0))")
+        c.execute(f"INSERT INTO launches (rowid, {cols}) SELECT rid, {cols} FROM hold")
+        c.execute("DROP TABLE hold")
+        for t in triggers:
+            c.execute(t)
+        c.execute("COMMIT")
+
+    _refused_rebuild(store, add_check, "table definition this release does not know")
+
+
+def test_the_legacy_text_with_its_alter_added_columns_appended_still_upgrades(store, clock):
+    # a table from before user_scope and role_ref carries them as ALTER appends, not inline
+    _a_store_with_history(store, clock)
+    _age(store)
+    c = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        c.execute("PRAGMA foreign_keys = OFF")
+        c.execute("ALTER TABLE launches DROP COLUMN role_ref")
+        c.execute("ALTER TABLE launches DROP COLUMN user_scope")
+        c.execute("ALTER TABLE launches ADD COLUMN user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1))")
+        c.execute("ALTER TABLE launches ADD COLUMN role_ref TEXT")
+    finally:
+        c.close()
+    CoordStore(store.path.parent).coord_status()
+    assert _NEW_ROLE in _db(store).execute("SELECT sql FROM sqlite_master WHERE name = 'launches'").fetchone()[0]
 
 
 def test_an_older_opener_leaves_the_new_table_alone(store, clock):
@@ -331,7 +377,6 @@ def test_a_room_launch_validates_what_it_is_given(store, clock):
             args = dict(harness="claude", model=None, cwd="/tmp", room_thread=thread, pid=1) | kw
             with pytest.raises(CoordError, match=match):
                 lease.open_room_launch(conn, now, **args)
-            conn.execute("SELECT 1")
         assert conn.execute("SELECT COUNT(*) FROM launches WHERE role = 'room'").fetchone() == (0,)
 
 
@@ -362,7 +407,7 @@ def test_a_room_launch_past_its_until_is_expired_not_activated(store, clock):
 def test_a_worker_activation_path_refuses_a_room_and_the_room_path_refuses_a_worker(store, clock):
     thread, worker = _a_store_with_history(store, clock)
     room = _open_room(store, thread)
-    with pytest.raises(lease.LeaseRefused, match="activates through activate_room|activate_room"):
+    with pytest.raises(lease.LeaseRefused, match="activate_room"):
         store.launch_activate(room.launch_id, harness_session_id="sid")
     with pytest.raises(lease.LeaseRefused, match="not a room"):
         _activate_room(store, worker)
@@ -421,6 +466,39 @@ def test_by_harness_session_maps_a_room_to_no_worker_unless_asked(store, clock):
         assert lease.by_harness_session(conn, "room-sid") is None
         assert lease.by_harness_session(conn, "room-sid", room=True).launch_id == room.launch_id
     assert store.launch_by_harness_session("room-sid") is None
+
+
+def test_a_room_sharing_a_workers_session_id_does_not_hide_the_worker(store, clock):
+    thread, _w = _a_store_with_history(store, clock)         # the coordinator is active as "probe-A"
+    coord = store.launch_by_harness_session("probe-A")
+    assert coord is not None and coord.role == "coordinator"
+    room = _open_room(store, thread)
+    with store._write() as (conn, now):                      # a duplicate the activation path refuses, written raw
+        lease._launch_event(conn, now, room.launch_id, "active", "spawned", harness_session_id="probe-A",
+                            argv_sha256=None)
+        assert lease.by_harness_session(conn, "probe-A").launch_id == coord.launch_id
+        assert lease.by_harness_session(conn, "probe-A", room=True).launch_id == room.launch_id
+    assert store.launch_by_harness_session("probe-A").launch_id == coord.launch_id
+
+
+def test_activate_room_refuses_a_session_id_another_launch_recorded(store, clock):
+    thread, _w = _a_store_with_history(store, clock)
+    room = _open_room(store, thread)
+    with pytest.raises(lease.LeaseRefused, match="already recorded"):
+        _activate_room(store, room.launch_id, sid="probe-A")
+    assert store.launch(room.launch_id).state == "pending"
+    assert _activate_room(store, room.launch_id, sid="room-own")[1] is None
+
+
+def test_a_room_on_a_closed_or_done_thread_is_refused(store, clock):
+    thread = _thread(store)
+    for state in ("done", "closed"):
+        with store._write() as (conn, now):
+            conn.execute("INSERT INTO thread_events (thread_id, seq, field, value, cause, by, at) "
+                         "SELECT ?, MAX(seq) + 1, 'state', ?, 'test', 'operator', ? FROM thread_events WHERE thread_id = ?",
+                         (thread, state, now, thread))
+        with pytest.raises(lease.LeaseRefused, match=f"is {state}"):
+            _open_room(store, thread)
 
 
 def test_the_watchers_lists_leave_a_room_out(store, clock):

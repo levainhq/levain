@@ -862,6 +862,10 @@ def open_room_launch(conn: sqlite3.Connection, now: str, *, harness: str, model:
     if not isinstance(room_thread, str) or re.fullmatch(r"th-[0-9a-f]{32}", room_thread) is None \
             or conn.execute("SELECT 1 FROM threads WHERE thread_id = ?", (room_thread,)).fetchone() is None:
         raise _refused(f"no room thread {str(room_thread)[:40]!r}")
+    state = conn.execute("SELECT value FROM thread_events WHERE thread_id = ? AND field = 'state' "
+                         "ORDER BY seq DESC LIMIT 1", (room_thread,)).fetchone()
+    if state is None or state[0] not in LIVE_THREAD_STATES:
+        raise _refused(f"room thread {room_thread} is {state[0] if state else 'stateless'}; a room opens on a live thread")
     if type(pid) is not int or pid <= 0:
         raise _refused("a room launch's spawn names the process that won it (a positive integer pid)")
     model = check_model(model)
@@ -893,6 +897,9 @@ def activate_room(conn: sqlite3.Connection, now: str, launch_id: str, *, harness
     if now >= ln.until:
         _launch_event(conn, now, launch_id, "expired", "pending past until")
         return _launch_row(conn, "launch_id", launch_id), f"launch {launch_id} was pending past {ln.until}"
+    if conn.execute("SELECT 1 FROM launch_events WHERE kind = 'active' AND harness_session_id = ? AND launch_id != ?",
+                    (hsid, launch_id)).fetchone() is not None:
+        raise _refused(f"harness session id {hsid!r} is already recorded by another launch")
     _launch_event(conn, now, launch_id, "active", "spawned", harness_session_id=hsid,
                   argv_sha256=_line("argv sha256", argv_sha256))
     return _launch_row(conn, "launch_id", launch_id), None
@@ -991,10 +998,11 @@ def by_harness_session(conn: sqlite3.Connection, harness_session_id: str, *, roo
     """The launch whose ``active`` row recorded ``harness_session_id`` (a session Levain started), or None. A room's
     session answers None unless ``room`` is set: every caller that reads a launch to learn which worker or coordinator
     a hook event came from sees a room as no launch at all, and only a room-aware caller asks for it."""
-    row = conn.execute("SELECT launch_id FROM launch_events WHERE kind = 'active' AND harness_session_id = ? "
-                       "ORDER BY gseq DESC LIMIT 1", (harness_session_id,)).fetchone()
-    ln = None if row is None else _launch_row(conn, "launch_id", row[0])
-    return None if ln is not None and ln.role == "room" and not room else ln
+    # the role is filtered before the newest is chosen: a room that shares a worker's session id must not hide it
+    row = conn.execute("SELECT e.launch_id FROM launch_events e JOIN launches l ON l.launch_id = e.launch_id "
+                       "WHERE e.kind = 'active' AND e.harness_session_id = ? AND (l.role = 'room') = ? "
+                       "ORDER BY e.gseq DESC LIMIT 1", (harness_session_id, 1 if room else 0)).fetchone()
+    return None if row is None else _launch_row(conn, "launch_id", row[0])
 
 
 def _in_state(conn: sqlite3.Connection, state: str, role: str | None = None) -> list[Launch]:
@@ -1134,6 +1142,24 @@ def migrate_settings(conn: sqlite3.Connection) -> None:
 _LEGACY_ROLES = ("coordinator", "worker")      # the role CHECK of every table made before the room role
 
 
+# the columns an earlier release added with ALTER TABLE: a legacy table holds them inline or appended, so both are
+# removed before two definitions are compared
+_ADDED_COLUMNS = (", user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1))", ", role_ref TEXT")
+
+
+def _norm_table_sql(sql: str) -> str:
+    sql = " ".join(sql.split())
+    for frag in _ADDED_COLUMNS:
+        sql = sql.replace(frag, "")
+    return sql.replace("CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ", 1)
+
+
+def _legacy_create() -> str:
+    """The ``launches`` CREATE as every release before the room role wrote it: the current text with the older role CHECK."""
+    cur = next(stmt for stmt in LEASE_SCHEMA if stmt.startswith("CREATE TABLE IF NOT EXISTS launches "))
+    return cur.replace(_in("role", ROLES), _in("role", _LEGACY_ROLES), 1)
+
+
 def _launches_role_stale(conn: sqlite3.Connection) -> bool:
     """Whether the file's ``launches`` table carries the known LEGACY ``role`` CHECK (the text of :data:`_LEGACY_ROLES`
     exactly), the one shape this release rebuilds. No such table, or the current CHECK: False. Any other role CHECK
@@ -1155,7 +1181,7 @@ def _cascading_children(conn: sqlite3.Connection) -> list[str]:
                   for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
                   if table != "launches"
                   for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")')
-                  if fk[2] == "launches" and fk[6].upper() not in ("NO ACTION", "RESTRICT"))
+                  if fk[2].lower() == "launches" and fk[6].upper() not in ("NO ACTION", "RESTRICT"))
 
 
 @functools.lru_cache(maxsize=1)
@@ -1185,8 +1211,8 @@ def _auto_keys(conn: sqlite3.Connection) -> frozenset[tuple[str, tuple[str, ...]
 def _launches_references(conn: sqlite3.Connection) -> set[tuple]:
     """``PRAGMA foreign_key_check`` rows (table, rowid, parent, fkid) of every foreign key that names ``launches``."""
     return {row for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-            if any(fk[2] == "launches" for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")'))
-            for row in conn.execute(f'PRAGMA foreign_key_check("{table}")') if row[2] == "launches"}
+            if any(fk[2].lower() == "launches" for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")'))
+            for row in conn.execute(f'PRAGMA foreign_key_check("{table}")') if row[2].lower() == "launches"}
 
 
 def migrate_launch_roles(conn: sqlite3.Connection) -> bool:
@@ -1231,6 +1257,12 @@ def migrate_launch_roles(conn: sqlite3.Connection) -> bool:
     if unfillable:
         raise CoordError(f"launches gains column(s) {', '.join(unfillable)} with no default for the rows it holds; "
                          "nothing was changed")
+    # the catch-all after the named checks above: any other difference from the legacy CREATE (a table CHECK, a
+    # collation, a changed column) is something a rebuild to the current text would silently drop
+    if _norm_table_sql(conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'launches'")
+                       .fetchone()[0]) != _norm_table_sql(_legacy_create()):
+        raise CoordError("launches carries a table definition this release does not know (a newer or hand-changed "
+                         "store); a rebuild would drop what it adds; nothing was changed")
     acting = _cascading_children(conn)
     if acting:
         raise CoordError(f"{', '.join(acting)} would act on its rows when launches is dropped and a rebuild cannot "
