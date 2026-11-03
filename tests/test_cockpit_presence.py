@@ -408,6 +408,32 @@ def test_the_chip_reads_the_record_and_the_sheet_posts_each_body_and_repaints_fr
 
 
 @needs_browser
+def test_a_lets_button_made_during_a_write_is_disabled_and_a_level_the_server_drops_leaves_the_page(rig, tmp_path, monkeypatch):
+    src, q = rig
+    group = "'#pr-sheet [aria-label=\"What reaches your devices\"] button'"
+    hook = ("(() => { window.__made = {}; const ap = Node.prototype.appendChild;"
+            " Node.prototype.appendChild = function (c) { if (c && c.tagName === 'BUTTON' && c.dataset && c.dataset.value === 'zz') window.__made.zz = c.disabled;"
+            " return ap.call(this, c); };"
+            # the reply to a presence write offers one more level and drops 'approvals'
+            " const f = window.fetch.bind(window); window.fetch = async (u, o) => { const r = await f(u, o);"
+            " if (!String(u).endsWith('/webpush/presence/set')) return r; const d = await r.json();"
+            " d.lets = d.lets.filter((x) => x.value !== 'approvals').concat([{value: 'zz', label: 'Extra', describe: 'x'}]);"
+            " return new Response(JSON.stringify(d), {status: r.status, headers: {'Content-Type': 'application/json'}}); }; return 1; })()")
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000},
+            _opened(),
+            {"eval": hook},
+            {"do": "document.querySelector('.pr-sheet-word[data-value=\"quiet\"]').click()", "until": f"{_CHIP_TEXT}.startsWith('Quiet')", "ms": 8000},
+            {"eval": "window.__made.zz"},
+            {"eval": f"[...document.querySelectorAll({group})].map(b => b.dataset.value)"},
+        ])
+    v = out["values"]
+    assert v[-2] is True, v                                    # made mid-write, it was born disabled
+    assert v[-1][-1] == "zz" and "approvals" not in v[-1], v     # the dropped level is gone, the new one is there
+
+
+@needs_browser
 def test_a_standing_overlay_shows_in_the_chip_with_its_time_left(rig, tmp_path, monkeypatch):
     src, q = rig
     presence.set_word(q, "quiet", duration="1h")

@@ -697,11 +697,19 @@
   }
   // the lets-through buttons carry the server's words (view.lets: value, label, describe); the page keeps no copy of them
   function paintLets(btns, lets, onTap) {
-    for (const o of Array.isArray(lets) ? lets : []) {
+    const list = Array.isArray(lets) ? lets : [];
+    const keep = new Set(list.map((o) => String(o.value)));
+    // a level the server no longer offers leaves the page, so a stale button cannot post a value the server refuses
+    for (const k of Object.keys(btns)) {
+      if (!keep.has(k)) { btns[k].remove(); delete btns[k]; }
+    }
+    for (const o of list) {
       let b = btns[o.value];
       if (!b) {
         b = el("button", "pr-big", "");
         b.type = "button"; b.dataset.value = String(o.value);
+        // made while a write is in flight, it starts as disabled as its neighbours (prDisable only reaches buttons that exist)
+        b.disabled = prBusy;
         b.addEventListener("click", () => onTap(o.value));
         btns[o.value] = b; btns._seg.appendChild(b);
       }

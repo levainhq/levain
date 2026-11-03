@@ -101,7 +101,6 @@ def test_the_lets_through_words_are_the_same_string_in_every_surface(rig, capsys
     classes = {"approval": "approval", "attention": "attention", "other": "other"}
     for o in view["lets"]:
         members = intent.LETS_CLASSES[o["value"]]
-        text = (o["label"] + " " + o["describe"]).lower()
         # the words name exactly the member classes: each member's word appears, no non-member's does
         for c in classes:
             word = intent._CLASS_WORDS[c][0]
@@ -110,7 +109,10 @@ def test_the_lets_through_words_are_the_same_string_in_every_surface(rig, capsys
         assert o == {"value": o["value"], "label": intent.lets_label(o["value"]), "describe": intent.lets_describe(o["value"])}
     words = {o["value"]: o["label"] for o in view["lets"]}
     assert len(set(words.values())) == len(words)
-    for key, words in words.items():
+    for key, label in words.items():
         rc, printed = _cli(capsys, q, "lets", key, "--for", "1h")
         assert rc == 0, printed
-        assert f"Lets through: {words}." in printed == _status(capsys, q) == intent.describe_line(q, idle=lambda: IDLE), key
+        assert f"Lets through: {label}." in printed, key
+        status = _status(capsys, q)
+        assert printed == status, key
+        assert status == intent.describe_line(q, idle=lambda: IDLE), key
