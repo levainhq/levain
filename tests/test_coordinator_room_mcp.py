@@ -319,3 +319,39 @@ def test_the_real_process_proposes_for_its_bound_launch_only(store, qdir, world,
     assert replies[2]["result"]["isError"] is False and "A card is waiting" in replies[2]["result"]["content"][0]["text"]
     assert replies[3]["error"]["code"] == -32602
     assert len(proposals(qdir)) == 1
+
+
+# --- L3 r1 fixes ---------------------------------------------------------------------------------------------------
+def test_initialize_answers_the_version_the_door_implements():
+    r = room_mcp.handle(NOLAUNCH, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                   "params": {"protocolVersion": "9999-01-01"}})
+    assert r["result"]["protocolVersion"] == room_mcp._PROTOCOL
+
+
+def test_a_store_that_cannot_be_opened_is_a_tool_error_not_a_protocol_error(monkeypatch, world):
+    from levain.dispatch.jobs import JobStoreError
+    import levain.consent.queue as queue
+
+    for exc in (JobStoreError("consent directory mode is not 0700"), OSError("disk gone")):
+        def boom(exc=exc):
+            raise exc
+        monkeypatch.setattr(queue, "default_queue_dir", boom)
+        r = call(world["launch"], {"quote_ids": [world["m1"]], "summary": "gist"})
+        assert "error" not in r and r["result"]["isError"] is True
+        assert "machine fault" in r["result"]["content"][0]["text"]
+
+
+def test_a_stream_with_no_line_end_is_given_up_on_not_spun_on():
+    class Endless:
+        def __init__(self):
+            self.reads = 0
+
+        def readline(self, n=-1):
+            self.reads += 1
+            assert self.reads < 10_000, "unbounded drain"
+            return b"x" * n
+
+    out = io.StringIO()
+    room_mcp.serve(NOLAUNCH, Endless(), out)
+    replies = [json.loads(l) for l in out.getvalue().splitlines()]
+    assert len(replies) == 1 and "frame over" in replies[0]["error"]["message"]

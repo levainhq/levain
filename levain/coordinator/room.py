@@ -37,7 +37,8 @@ _PROPOSAL_ID = re.compile(r"pr-[0-9a-f]{32}")
 # the open room: the latest room event is an 'opened' (a room that rotated is closed; a store with no event has none)
 _LATEST_KIND = "(SELECT kind FROM room_events ORDER BY seq DESC LIMIT 1)"
 _LATEST_THREAD = "(SELECT room_thread FROM room_events ORDER BY seq DESC LIMIT 1)"
-_ROOM_IS_OPEN = f"({_LATEST_KIND} = 'opened' AND {_LATEST_THREAD} = NEW.room_thread)"
+# COALESCE: with no room event at all both subqueries are NULL, and NOT NULL is NULL, which a WHEN reads as false (open)
+_ROOM_IS_OPEN = f"COALESCE({_LATEST_KIND} = 'opened' AND {_LATEST_THREAD} = NEW.room_thread, 0)"
 
 ROOM_SCHEMA: tuple[str, ...] = (
     "CREATE TABLE IF NOT EXISTS room_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, "
@@ -45,6 +46,10 @@ ROOM_SCHEMA: tuple[str, ...] = (
     f"kind TEXT NOT NULL CHECK ({_in('kind', ROOM_EVENT_KINDS)}), at TEXT NOT NULL, "
     f"by TEXT NOT NULL CHECK ({_in('by', _BY)}))",
     *_append_only("room_events", "a room event"),
+    # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row reusing any key
+    "CREATE TRIGGER IF NOT EXISTS room_events_no_replace BEFORE INSERT ON room_events WHEN EXISTS (SELECT 1 FROM room_events WHERE "
+    "seq = NEW.seq OR gseq = NEW.gseq OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a room event is never replaced'); END",
     "CREATE TRIGGER IF NOT EXISTS room_events_one_open BEFORE INSERT ON room_events WHEN NEW.kind = 'opened' AND "
     f"COALESCE({_LATEST_KIND}, 'rotated') = 'opened' BEGIN SELECT RAISE(ABORT, 'one room is open at a time'); END",
     "CREATE TRIGGER IF NOT EXISTS room_events_opened_once BEFORE INSERT ON room_events WHEN NEW.kind = 'opened' AND "
@@ -59,6 +64,10 @@ ROOM_SCHEMA: tuple[str, ...] = (
     "summary_sha256 TEXT NOT NULL, about TEXT REFERENCES threads(thread_id), at TEXT NOT NULL, "
     f"CHECK (length(words) <= {WORDS_MAX}), CHECK (length(summary) <= {SUMMARY_MAX}))",
     *_append_only("drop_proposals", "a drop proposal"),
+    # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row reusing any key
+    "CREATE TRIGGER IF NOT EXISTS drop_proposals_no_replace BEFORE INSERT ON drop_proposals WHEN EXISTS (SELECT 1 FROM drop_proposals WHERE "
+    "proposal_id = NEW.proposal_id OR gseq = NEW.gseq OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a drop proposal is never replaced'); END",
     "CREATE TRIGGER IF NOT EXISTS drop_proposals_room BEFORE INSERT ON drop_proposals WHEN NOT "
     f"{_ROOM_IS_OPEN} BEGIN SELECT RAISE(ABORT, 'a proposal is made in the open room'); END",
     "CREATE TRIGGER IF NOT EXISTS drop_proposals_launch BEFORE INSERT ON drop_proposals WHEN NOT EXISTS (SELECT 1 FROM "
@@ -71,10 +80,14 @@ ROOM_SCHEMA: tuple[str, ...] = (
     f"at TEXT NOT NULL, by TEXT NOT NULL CHECK ({_in('by', _BY)}), "
     "CHECK ((kind = 'committed') = (drop_id IS NOT NULL)))",
     *_append_only("proposal_events", "a proposal event"),
+    # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row reusing any key
+    "CREATE TRIGGER IF NOT EXISTS proposal_events_no_replace BEFORE INSERT ON proposal_events WHEN EXISTS (SELECT 1 FROM proposal_events WHERE "
+    "seq = NEW.seq OR proposal_id = NEW.proposal_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a proposal event is never replaced'); END",
     # a proposal is settled once, and a commit lands only in its own room while that room is still the open one
     "CREATE TRIGGER IF NOT EXISTS proposal_events_commits_open BEFORE INSERT ON proposal_events WHEN "
     "NEW.kind = 'committed' AND NOT EXISTS (SELECT 1 FROM drop_proposals p WHERE p.proposal_id = NEW.proposal_id "
-    f"AND {_LATEST_KIND} = 'opened' AND {_LATEST_THREAD} = p.room_thread) "
+    f"AND COALESCE({_LATEST_KIND} = 'opened' AND {_LATEST_THREAD} = p.room_thread, 0)) "
     "BEGIN SELECT RAISE(ABORT, 'a proposal expires when its room rotates'); END",
 
     "CREATE TABLE IF NOT EXISTS drop_notes (drop_id TEXT PRIMARY KEY REFERENCES drops(drop_id), gseq INTEGER NOT NULL "
@@ -83,6 +96,10 @@ ROOM_SCHEMA: tuple[str, ...] = (
     "proposal_id TEXT NOT NULL UNIQUE REFERENCES drop_proposals(proposal_id), body TEXT NOT NULL, "
     "body_sha256 TEXT NOT NULL, at TEXT NOT NULL)",
     *_append_only("drop_notes", "a drop note"),
+    # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row reusing any key
+    "CREATE TRIGGER IF NOT EXISTS drop_notes_no_replace BEFORE INSERT ON drop_notes WHEN EXISTS (SELECT 1 FROM drop_notes WHERE "
+    "drop_id = NEW.drop_id OR gseq = NEW.gseq OR proposal_id = NEW.proposal_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a drop note is never replaced'); END",
     # the note is exactly the proposal's summary, filed for the drop that proposal's commit made
     "CREATE TRIGGER IF NOT EXISTS drop_notes_is_the_summary BEFORE INSERT ON drop_notes WHEN NOT EXISTS (SELECT 1 FROM "
     "drop_proposals p JOIN proposal_events e ON e.proposal_id = p.proposal_id WHERE p.proposal_id = NEW.proposal_id "
@@ -213,7 +230,7 @@ def propose(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str], summ
     if room is None or room not in json.loads(row[1]):
         raise CoordError(f"launch {launch_id} is not a launch of the open room")
     if isinstance(quote, (str, bytes)) or not isinstance(quote, Sequence) or not 1 <= len(quote) <= QUOTE_MAX \
-            or len(set(quote)) != len(quote):
+            or not all(isinstance(q, str) for q in quote) or len(set(quote)) != len(quote):
         raise CoordError(f"a proposal quotes 1 to {QUOTE_MAX} distinct messages of his")
     bodies = []
     for mid in quote:
@@ -255,8 +272,11 @@ def dismiss(conn: sqlite3.Connection, proposal_id: str, *, by: str = "operator",
         raise CoordError(f"proposal {proposal_id} is already {p.state}")
     if by not in _BY:
         raise CoordError(f"a proposal event is by {' or '.join(_BY)}")
-    conn.execute("INSERT INTO proposal_events (proposal_id, kind, drop_id, at, by) VALUES (?, 'dismissed', NULL, ?, ?)",
-                 (proposal_id, _stamp(now), by))
+    try:
+        conn.execute("INSERT INTO proposal_events (proposal_id, kind, drop_id, at, by) VALUES (?, 'dismissed', NULL, ?, ?)",
+                     (proposal_id, _stamp(now), by))
+    except sqlite3.IntegrityError as exc:       # a concurrent or retried dismiss lost the one settle
+        raise CoordError(f"proposal {proposal_id} is already settled ({exc})") from None
     return _proposal(conn, proposal_id)
 
 
@@ -274,8 +294,8 @@ def commit(store: CoordStore, proposal_id: str, words: str, outbox_id: str, surf
         p = _proposal(conn, proposal_id)
         if p.state != "open":
             raise CoordError(f"proposal {proposal_id} is {p.state}; only an open proposal is committed")
-        made = store._insert_drop(conn, now, **drop)
         try:
+            made = store._insert_drop(conn, now, **drop)
             conn.execute("INSERT INTO proposal_events (proposal_id, kind, drop_id, at, by) "
                          "VALUES (?, 'committed', ?, ?, 'operator')", (proposal_id, made.drop_id, now))
             conn.execute("INSERT INTO drop_notes (drop_id, gseq, author, room_thread, launch_id, proposal_id, body, "

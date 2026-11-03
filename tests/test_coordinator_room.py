@@ -294,3 +294,84 @@ def test_ensure_is_idempotent_and_adds_only_its_own_objects(store, qdir):
     after = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
     assert before < after and {"room_events", "drop_proposals", "proposal_events", "drop_notes"} <= after - before
     assert all(n.split("_")[0] in ("room", "drop", "proposal", "sqlite") for n in after - before if not n.startswith("sqlite_"))
+
+
+# --- L3 r1 fixes ---------------------------------------------------------------------------------------------------
+def test_insert_or_replace_cannot_rewrite_any_room_table(store, cs, world, qdir):
+    mid = say(cs, world["thread"], "keep me", n=1)
+    p = db(store, lambda c: room.propose(c, world["launch"], [mid], "gist"))
+    drop, _ = room.commit(store, p.proposal_id, p.words, "ob-commit01", "cockpit")
+    c = raw(qdir)
+    before = {t: c.execute(f"SELECT * FROM {t}").fetchall()
+              for t in ("room_events", "drop_proposals", "proposal_events", "drop_notes")}
+    gs = lambda t: c.execute(f"SELECT gseq FROM {t}").fetchone()[0]
+    attempts = [
+        "INSERT OR REPLACE INTO room_events (seq, gseq, room_thread, kind, at, by) VALUES "
+        f"(1, 880001, '{world['thread']}', 'rotated', 'x', 'service')",
+        "INSERT OR REPLACE INTO room_events (gseq, room_thread, kind, at, by) VALUES "
+        f"({gs('room_events')}, '{world['thread']}', 'rotated', 'x', 'service')",
+        "INSERT OR REPLACE INTO drop_proposals (proposal_id, gseq, room_thread, launch_id, quoted, words, words_sha256, "
+        f"summary, summary_sha256, about, at) VALUES ('{p.proposal_id}', 880002, '{world['thread']}', '{world['launch']}', "
+        "'[]', 'w', 'x', 'changed', 'x', NULL, 'x')",
+        "INSERT OR REPLACE INTO proposal_events (seq, proposal_id, kind, drop_id, at, by) VALUES "
+        f"(1, '{p.proposal_id}', 'dismissed', NULL, 'x', 'operator')",
+        "INSERT OR REPLACE INTO proposal_events (proposal_id, kind, drop_id, at, by) VALUES "
+        f"('{p.proposal_id}', 'dismissed', NULL, 'x', 'operator')",
+        "INSERT OR REPLACE INTO drop_notes (drop_id, gseq, author, room_thread, launch_id, proposal_id, body, body_sha256, "
+        f"at) VALUES ('{drop.drop_id}', 880003, 'room', '{world['thread']}', '{world['launch']}', '{p.proposal_id}', "
+        "'gist', 'x', 'x')",
+    ]
+    for sql in attempts:
+        with pytest.raises(sqlite3.IntegrityError, match="never replaced"):
+            c.execute(sql)
+    after = {t: c.execute(f"SELECT * FROM {t}").fetchall() for t in before}
+    assert after == before
+    assert db(store, lambda cn: room.get_proposal(cn, p.proposal_id)).state == "committed"
+
+
+def test_an_empty_room_events_table_refuses_a_rotation_and_a_proposal(store, qdir):
+    thread = make_thread(store)
+    launch = make_launch(store, qdir, thread)
+    c = raw(qdir)
+    room.ensure(c)
+    assert c.execute("SELECT count(*) FROM room_events").fetchone()[0] == 0
+    with pytest.raises(sqlite3.IntegrityError, match="only the open room rotates"):
+        c.execute("INSERT INTO room_events (gseq, room_thread, kind, at, by) VALUES (990001, ?, 'rotated', 'x', 'service')",
+                  (thread,))
+    with pytest.raises(sqlite3.IntegrityError, match="open room"):
+        c.execute("INSERT INTO drop_proposals (proposal_id, gseq, room_thread, launch_id, quoted, words, words_sha256, "
+                  "summary, summary_sha256, about, at) VALUES ('pr-' || hex(randomblob(16)), 990002, ?, ?, '[]', 'w', 'x', "
+                  "'s', 'x', NULL, 'x')", (thread, launch))
+
+
+def test_a_concurrent_dismiss_is_a_named_error(store, cs, world, qdir):
+    mid = say(cs, world["thread"], "never mind", n=1)
+    p = db(store, lambda c: room.propose(c, world["launch"], [mid], "gist"))
+    stale = room.get_proposal(raw(qdir), p.proposal_id)
+    assert stale.state == "open"
+    db(store, lambda c: room.dismiss(c, p.proposal_id))
+    # the loser read 'open' before the winner settled: its insert hits the unique key, not a raw sqlite3 error
+    real = room._proposal
+    try:
+        room._proposal = lambda conn, pid: stale
+        with pytest.raises(CoordError, match="already settled"):
+            db(store, lambda c: room.dismiss(c, p.proposal_id))
+    finally:
+        room._proposal = real
+
+
+@pytest.mark.parametrize("bad", [[[]], [["cm-" + "0" * 32]], [{}], [None], [1], [b"cm-x"]])
+def test_an_unhashable_or_non_string_quote_is_a_coord_error(store, cs, world, bad):
+    with pytest.raises(CoordError):
+        db(store, lambda c: room.propose(c, world["launch"], bad, "gist"))
+
+
+def test_commit_surfaces_a_drops_table_integrity_error_as_a_coord_error(store, cs, world, qdir, monkeypatch):
+    mid = say(cs, world["thread"], "once", n=1)
+    p = db(store, lambda c: room.propose(c, world["launch"], [mid], "gist"))
+
+    def boom(self, conn, now, **kw):
+        raise sqlite3.IntegrityError("CHECK constraint failed: drops")
+    monkeypatch.setattr(EnvelopeStore, "_insert_drop", boom)
+    with pytest.raises(CoordError, match="CHECK constraint"):
+        room.commit(store, p.proposal_id, p.words, "ob-commit01", "cockpit")

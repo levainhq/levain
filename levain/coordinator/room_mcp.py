@@ -35,6 +35,8 @@ LAUNCH_ENV = "LEVAIN_ROOM_LAUNCH"
 _PROTOCOL = "2025-06-18"
 # [seat] one JSON-RPC frame's byte cap
 FRAME_MAX = 256 * 1024
+# [seat] how much of one over-cap frame is read looking for its line end before the stream is given up on
+_DRAIN_MAX = 16 * FRAME_MAX
 _NAME = "propose_drop"
 _ARGS = frozenset({"quote_ids", "summary", "about"})
 # keys a model might reach for to hand the door words of its own: refused by name so the refusal says why
@@ -119,6 +121,7 @@ def _propose(launch_id: str, params: dict[str, Any]) -> dict[str, Any]:
     from levain.coordinator import lease, room
     from levain.coordinator.envelopes import EnvelopeStore
     from levain.coordinator.store import CoordError, StoreAbsent
+    from levain.dispatch.jobs import JobStoreError
 
     ids, summary, about = _arguments(params.get("arguments"))
     try:
@@ -133,7 +136,7 @@ def _propose(launch_id: str, params: dict[str, Any]) -> dict[str, Any]:
             proposal = room.propose(conn, ln.launch_id, ids, summary, about, now=now)
     except (CoordError, StoreAbsent) as exc:       # StoreAbsent is a CoordError, named for what it says
         return _refused(str(exc))
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, JobStoreError, OSError) as exc:
         return _text(f"levain room: a machine fault, nothing was proposed ({type(exc).__name__}: {exc}); try again",
                      True)
     return _text(f"levain room: proposal {proposal.proposal_id} made. A card is waiting for your tap; nothing is sent "
@@ -166,8 +169,8 @@ def handle(launch_id: str, msg: Any) -> dict[str, Any] | None:
         if spoof:
             raise _RpcError(INVALID_PARAMS, f"refused: a call never names its own launch or session ({', '.join(spoof)})")
         if method == "initialize":
-            version = params.get("protocolVersion")
-            return _ok(rid, {"protocolVersion": version if isinstance(version, str) else _PROTOCOL,
+            # the version this door implements, whatever the client asked for: the client decides whether it can speak it
+            return _ok(rid, {"protocolVersion": _PROTOCOL,
                              "capabilities": {"tools": {}}, "serverInfo": {"name": "levain_room", "version": "1"}})
         if method == "tools/list":
             return _ok(rid, {"tools": [TOOL]})
@@ -191,10 +194,17 @@ def _frames(stream: Any):
         if not line:
             return
         if len(line) > FRAME_MAX and not line.endswith(b"\n" if isinstance(line, bytes) else "\n"):
-            while True:
+            drained = 0
+            while drained < _DRAIN_MAX:
                 rest = reader.readline(FRAME_MAX)
-                if not rest or rest.endswith(b"\n" if isinstance(rest, bytes) else "\n"):
+                if not rest:
                     break
+                if rest.endswith(b"\n" if isinstance(rest, bytes) else "\n"):
+                    break
+                drained += len(rest)
+            else:
+                yield None      # no line end in _DRAIN_MAX bytes: a wedged or hostile stream, the session ends
+                return
             yield None
             continue
         yield line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
