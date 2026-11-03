@@ -344,7 +344,8 @@ def _decide(now: float, rec: dict, reading: float | None, class_name: str, remot
     source = "word" if ov is not None else "measured"
     if class_name not in LETS_CLASSES[eff["lets_through"]]:
         label = preset or "your setting"
-        return Decision(False, "muted", f"{label}: lets through {lets_label(eff["lets_through"])}", preset or "lets"), source
+        level = eff["lets_through"]
+        return Decision(False, "muted", f"{label}: lets through {lets_label(level)}", preset or "lets"), source
     if on:
         return Decision(True, "pushing", why, preset), source
     if class_name == "attention":
