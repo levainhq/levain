@@ -198,6 +198,32 @@ def test_the_open_bar_seam_reads_a_real_store_and_a_reason_stops_the_signing(wor
     assert "nothing was signed" in card_mod.open_bar_problem(grant, junk)
 
 
+def test_a_store_the_process_may_not_read_refuses_and_is_never_taken_for_no_bar(world, tmp_path):
+    # codex r4 HIGH: Path.exists() answers False for a permission error on Python 3.14, so an inaccessible store read as
+    # "no open bar" and the card signed; open_bar_for now stats the file and refuses on anything but "not found"
+    import os
+    from levain.autonomic.agent_tables import create_agent_objects
+    from levain.agent_authority import AgentAuthorityError, open_bar_for
+
+    grant = link(world, 1)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    store = sqlite3.connect(locked / "autonomic.db", isolation_level=None)
+    create_agent_objects(store)
+    store.close()
+    os.chmod(locked, 0)
+    try:
+        if os.access(locked / "autonomic.db", os.R_OK):
+            pytest.skip("this process can read through a mode-0 directory (root)")
+        with pytest.raises(AgentAuthorityError, match="cannot be read"):
+            open_bar_for(grant["agent_id"], locked)
+        assert "nothing was signed" in card_mod.open_bar_problem(grant, locked)
+    finally:
+        os.chmod(locked, 0o700)
+    # a store that is simply absent is still no bar
+    assert open_bar_for(grant["agent_id"], tmp_path / "absent") is None
+
+
 def test_what_is_signed_is_the_snapshot_the_card_rendered(world, monkeypatch):
     fp, sign = world.keys["laptop"]
     grant = link(world, 1)
