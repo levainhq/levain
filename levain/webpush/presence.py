@@ -326,8 +326,8 @@ def policy_view(queue_dir: Path | str | None) -> dict:
                         for p, r in intent.PRESET_TABLE.items()}}
 
 
-POLICY_RETIRED = ("the notification policy is retired: each preset says what it lets through (quiet and sleep: Approvals and needs, i.e. approvals "
-                  "and attention items), and `levain ping lets everything|needs|approvals|nothing [--for 1h]` changes it")
+POLICY_RETIRED = ("the notification policy is retired: each preset says what it lets through (`levain ping policy show` "
+                  "prints each preset's level), and `levain ping lets everything|needs|approvals|nothing [--for 1h]` changes it")
 
 
 def set_policy(queue_dir: Path | str, mute: str, cls: str, value: str, *, by: dict | None = None,

@@ -84,8 +84,8 @@ def register(subparsers) -> None:
     ending(dv)
     dv.set_defaults(func=_devices)
     lt = common(sub.add_parser(
-        "lets", help="What reaches your devices: everything, needs (Approvals and needs), approvals or nothing (operator only).",
-        description="Everything; needs (Approvals and needs: approvals plus attention items); approvals (Approvals only); nothing (Nothing). Held pings wait for "
+        "lets", help="What reaches your devices: " + ", ".join(_intent_lets()) + " (each level's words are generated from what it passes).",
+        description="; ".join(f"{k} ({_intent_label(k)})" for k in _intent_lets()) + ". Held pings wait for "
                     "your devices (or the setting to widen) and are pushed then. With neither --for nor --until-input the "
                     "setting becomes your standing default."))
     lt.add_argument("level", choices=_intent_lets())
@@ -119,6 +119,12 @@ def register(subparsers) -> None:
     pset.add_argument("value", nargs="?")
     pset.set_defaults(func=_policy_retired, what="set")
     common(psub.add_parser("reset", help="Refused: the policy is retired (exit 2).")).set_defaults(func=_policy_retired, what="reset")
+
+
+def _intent_label(level: str) -> str:
+    from levain.webpush import intent
+
+    return intent.lets_label(level)
 
 
 def _intent_lets() -> tuple[str, ...]:
@@ -300,7 +306,7 @@ def _policy_show(args: argparse.Namespace) -> int:
     print("what each preset lets through (the notification policy is retired):")
     for name, r in intent.PRESET_TABLE.items():
         end = "your next word or a message you type into a session" if r["until"] == "input" else "a timer (default 60 min)"
-        print(f"  {name:<6} devices {r['devices']:<3}  lets through {intent._LETS_WORDS[r['lets_through']]:<19}  until {end}")
+        print(f"  {name:<6} devices {r['devices']:<3}  lets through {intent.lets_label(r['lets_through']):<40}  until {end}")
     print("  back   clears the preset and returns to your standing default (a standing loud is left)")
     print("retired: change it with `levain ping lets everything|needs|approvals|nothing [--for 1h | --until-input]`")
     return 0

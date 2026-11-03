@@ -110,7 +110,7 @@ def test_sleep_lets_approvals_and_high_priority_through_and_mutes_the_rest(tmp_p
     for kind in ("notify", "question"):
         got = _push(q, kind, 5.0)
         assert (got.push, got.state, got.by) == (False, "muted", "sleep"), kind
-    assert _push(q, "notify", 5.0).why == "sleep: lets through Approvals and needs"
+    assert _push(q, "notify", 5.0).why == f"sleep: lets through {intent.lets_label('needs')}"
 
 
 def test_migration_maps_a_word_and_a_route_to_one_record_is_idempotent_and_undoes_byte_identical(tmp_path):

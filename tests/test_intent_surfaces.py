@@ -88,17 +88,29 @@ def test_a_refused_write_leaves_every_surface_on_the_line_it_had(rig, capsys):
 
 
 def test_the_lets_through_words_are_the_same_string_in_every_surface(rig, capsys):
-    """Phill 11-02: each level's visible words name what it includes, identically in describe_line, ``levain ping status`` and the
-    presence sheet's JS table (PR_LETS); the record keys stay everything|needs|approvals|nothing."""
-    import re
+    """Phill 11-02, 11-03 (12a): each level's visible words are GENERATED from its member classes, so the label lists exactly
+    what the level passes, and the cockpit payload, describe_line and ``levain ping status`` print the same string. The page keeps no
+    copy; the record keys stay everything|needs|approvals|nothing."""
     from pathlib import Path
 
     src, q = rig
     js = (Path(intent.__file__).resolve().parent.parent / "templates" / "web" / "devices_panel.js").read_text()
-    sheet = dict(re.findall(r'\["(everything|needs|approvals|nothing)", "([^"]+)"\]', js.split("const PR_LETS", 1)[1].split(";", 1)[0]))
-    assert sheet == intent._LETS_WORDS == {"everything": "Everything", "needs": "Approvals and needs",
-                                           "approvals": "Approvals only", "nothing": "Nothing"}
-    for key, words in intent._LETS_WORDS.items():
+    assert "PR_LETS" not in js and "Approvals and needs" not in js and "Approvals only" not in js
+    view = intent.view(q, idle=lambda: IDLE)
+    assert [o["value"] for o in view["lets"]] == list(intent.LETS) == list(intent.LETS_CLASSES)
+    classes = {"approval": "approval", "attention": "attention", "other": "other"}
+    for o in view["lets"]:
+        members = intent.LETS_CLASSES[o["value"]]
+        text = (o["label"] + " " + o["describe"]).lower()
+        # the words name exactly the member classes: each member's word appears, no non-member's does
+        for c in classes:
+            word = intent._CLASS_WORDS[c][0]
+            assert (word in o["label"].lower()) == (c in members), (o, c)
+        assert (o["label"] == "Nothing") == (not members), o
+        assert o == {"value": o["value"], "label": intent.lets_label(o["value"]), "describe": intent.lets_describe(o["value"])}
+    words = {o["value"]: o["label"] for o in view["lets"]}
+    assert len(set(words.values())) == len(words)
+    for key, words in words.items():
         rc, printed = _cli(capsys, q, "lets", key, "--for", "1h")
         assert rc == 0, printed
         assert f"Lets through: {words}." in printed == _status(capsys, q) == intent.describe_line(q, idle=lambda: IDLE), key

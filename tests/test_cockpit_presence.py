@@ -389,6 +389,7 @@ def test_the_chip_reads_the_record_and_the_sheet_posts_each_body_and_repaints_fr
             {"do": "document.querySelector('#pr-sheet [aria-label=\"Whether pings reach your devices\"] [data-value=\"off\"]').click()",
              "until": f"{_CHIP_TEXT}.startsWith('Desk only')", "ms": 8000},
             {"do": "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))", "until": "document.getElementById('pr-sheet').hidden", "ms": 4000},
+            {"eval": "[...document.querySelectorAll('#pr-sheet [aria-label=\"What reaches your devices\"] button')].map(b => [b.dataset.value, b.textContent, b.title])"},
             {"eval": f"document.activeElement===({_CHIP})"},
         ])
     v = out["values"]
@@ -396,7 +397,10 @@ def test_the_chip_reads_the_record_and_the_sheet_posts_each_body_and_repaints_fr
     assert v[2] == ["Away", "Back", "Quiet", "Sleep", "Loud"]
     assert v[4] is True and v[5].startswith("Pings now: ")                 # focus in the sheet, which opens on the server's own line
     assert v[7][0] is False and v[7][1] == "2h" and "quiet" in v[7][2]     # the sheet stays open to show the new line; the pick is remembered
-    assert "Lets through: Approvals only" in v[10][0] and "a message you type into a session" in v[10][0] and v[10][1] == "switch"
+    from levain.webpush import intent
+    assert f"Lets through: {intent.lets_label('approvals')}" in v[10][0] and "a message you type into a session" in v[10][0] and v[10][1] == "switch"
+    from levain.webpush import intent as _in
+    assert v[-2] == [[o["value"], o["label"], o["describe"]] for o in _in.lets_options()]     # the buttons read the server's words
     assert v[-1] is True
     rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
     assert [r["word"] for r in rows][:3] == ["quiet", "away", "set lets approvals until input"]

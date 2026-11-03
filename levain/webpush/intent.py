@@ -44,7 +44,7 @@ from levain.webpush import desk, presence
 from levain.webpush.presence import (ACTIVE_WINDOW_SECS, COORDINATOR_WORDS, MAX_SECS, MIN_SECS, SEAT_WORDS,
                                      TIMED, WORDS, Decision, PresenceError, kind_class, parse_duration)
 
-__all__ = ["VERSION", "FILE_NAME", "BACKUP_DIR", "DEVICES", "LETS", "LETS_CLASSES", "FOLLOW_DEFAULT", "FOLLOW_MIN",
+__all__ = ["VERSION", "FILE_NAME", "BACKUP_DIR", "DEVICES", "LETS", "LETS_CLASSES", "lets_label", "lets_describe", "lets_options", "FOLLOW_DEFAULT", "FOLLOW_MIN",
            "FOLLOW_MAX", "PRESET_TABLE", "overlay_active", "overlay_ended", "devices_on_now", "decide", "read", "view",
            "describe_line", "approvals_to_devices", "approvals_route", "approval_notice", "apply_preset", "apply_settings", "read_changes", "migrate",
            "unmigrate", "legacy_word", "from_legacy", "read_sample"]
@@ -63,7 +63,45 @@ LETS_CLASSES = {"everything": frozenset({"approval", "attention", "other"}),
                 "needs": frozenset({"approval", "attention"}),
                 "approvals": frozenset({"approval"}),
                 "nothing": frozenset()}
-_LETS_WORDS = {"everything": "Everything", "needs": "Approvals and needs", "approvals": "Approvals only", "nothing": "Nothing"}
+# how each class is named when a level's label lists what it passes; a new class with no entry is named by its own key
+_CLASS_WORDS = {"approval": ("approvals", "approval prompts"), "attention": ("attention items", "attention items"),
+                "other": ("other pings", "other pings")}
+_CLASS_ORDER = ("approval", "attention", "other")
+
+
+def _join(parts: list[str]) -> str:
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def lets_label(level: str) -> str:
+    """The visible name of a lets-through level, generated from its member classes (``LETS_CLASSES``) so it always lists
+    what the level passes: ``Approvals and attention items``. An empty level reads ``Nothing``."""
+    members = _members(level)
+    if not members:
+        return "Nothing"
+    text = _join([_CLASS_WORDS.get(c, (c, c))[0] for c in members])
+    return text[:1].upper() + text[1:]
+
+
+def lets_describe(level: str) -> str:
+    """The one line saying what a level passes, generated from the same members as :func:`lets_label`."""
+    members = _members(level)
+    if not members:
+        return "Passes no ping to your devices."
+    return "Passes " + _join([_CLASS_WORDS.get(c, (c, c))[1] for c in members]) + " to your devices."
+
+
+def _members(level: str) -> list[str]:
+    got = LETS_CLASSES[level]
+    return [c for c in _CLASS_ORDER if c in got] + sorted(c for c in got if c not in _CLASS_ORDER)
+
+
+def lets_options() -> list[dict]:
+    """What the cockpit paints for the lets-through control: one entry per level, in ``LETS`` order, each
+    ``{value, label, describe}``. The page carries no copy of these words."""
+    return [{"value": k, "label": lets_label(k), "describe": lets_describe(k)} for k in LETS]
+
+
 # what each preset writes (devices is always `on`; follow_after is the base's; `back` and `loud off` write nothing)
 PRESET_TABLE = {"away": {"devices": "on", "lets_through": "everything", "until": "input"},
                 "quiet": {"devices": "on", "lets_through": "needs", "until": "timer"},
@@ -306,7 +344,7 @@ def _decide(now: float, rec: dict, reading: float | None, class_name: str, remot
     source = "word" if ov is not None else "measured"
     if class_name not in LETS_CLASSES[eff["lets_through"]]:
         label = preset or "your setting"
-        return Decision(False, "muted", f"{label}: lets through {_LETS_WORDS[eff['lets_through']]}", preset or "lets"), source
+        return Decision(False, "muted", f"{label}: lets through {lets_label(eff["lets_through"])}", preset or "lets"), source
     if on:
         return Decision(True, "pushing", why, preset), source
     if class_name == "attention":
@@ -436,7 +474,7 @@ def _base_text(base: dict) -> str:
     d = base["devices"]
     text = f"follow, after {_mins(base['follow_after'])}" if d == "follow" else f"devices {d}"
     if base["lets_through"] != "everything":
-        text += f", lets through {_LETS_WORDS[base['lets_through']]}"
+        text += f", lets through {lets_label(base['lets_through'])}"
     return text
 
 
@@ -494,7 +532,7 @@ def _line(queue_dir: Path | str | None, s: dict, st: dict, *, approvals: str | N
     now, rec, eff, ov, lets = s["now"], st["rec"], st["eff"], st["ov"], st["lets"]
     where = "your devices" if st["goes"] else "the desk only"
     if st["goes"] and lets in ("needs", "approvals"):
-        where += f", {_LETS_WORDS[lets]}"
+        where += f", {lets_label(lets)}"
     if not st["goes"]:
         # what reaches the devices whatever the desk is doing: an attention item (Phill 10-27), the notice that an
         # approval prompt waits in the agent's own dialog (Phill 11-02, approval_notice) and the ping about a request
@@ -504,7 +542,7 @@ def _line(queue_dir: Path | str | None, s: dict, st: dict, *, approvals: str | N
         if through:
             where += ", except " + " and ".join(through)
     dev = {"on": "on", "off": "off"}.get(eff["devices"]) or f"follow, after {_mins(eff['follow_after'])}"
-    line = (f"Pings now: {where} ({st['why']}). Devices: {dev}. Lets through: {_LETS_WORDS[lets]}. "
+    line = (f"Pings now: {where} ({st['why']}). Devices: {dev}. Lets through: {lets_label(lets)}. "
             f"Until: {_until_text(rec, ov, now)}.")
     if approvals:
         line += f" Approvals: {approvals}."
@@ -540,7 +578,7 @@ def view(queue_dir: Path | str | None, *, now: float | None = None, idle: Callab
     ``word`` (the deciding preset), ``remote``, ``you``, ``desk``; plus ``line`` and ``chip`` (:func:`describe_line`,
     DESIGN §7), ``status`` (``file|default|projection|fault``), ``reason_fault``, ``base``, ``overlay`` (standing, else
     ``None``), ``ended`` (why an overlay on file has ended), ``effective`` (the settings in force), ``on`` (devices on now),
-    ``where`` (``devices|desk``), ``held`` and ``approvals`` (the consent clause, or ``None``). ``reading`` (the raw laptop
+    ``where`` (``devices|desk``), ``lets`` (:func:`lets_options`), ``held`` and ``approvals`` (the consent clause, or ``None``). ``reading`` (the raw laptop
     idle) lets a caller that sampled it once hand it in."""
     at = time.time() if now is None else now
     try:
@@ -551,7 +589,8 @@ def view(queue_dir: Path | str | None, *, now: float | None = None, idle: Callab
                 "word": None, "remote": None, "you": None, "desk": None, "line": _FAULT_LINE,
                 "chip": {"word": "Check", "tail": "→ devices", "state": "fault"}, "status": "fault",
                 "reason_fault": "the sample faulted", "base": _default_base(), "overlay": None, "ended": None,
-                "effective": None, "on": True, "where": "devices", "held": 0, "approvals": None}
+                "effective": None, "on": True, "where": "devices", "held": 0, "approvals": None,
+                "lets": lets_options()}
     st = _state(queue_dir, s)
     try:
         from levain.webpush import held
@@ -576,7 +615,7 @@ def view(queue_dir: Path | str | None, *, now: float | None = None, idle: Callab
            "ended": None if st["fault"] else st["ended"],
            "effective": None if st["fault"] else {k: v for k, v in st["eff"].items() if k not in ("by", "said", "verified")},
            "on": True if st["fault"] else st["on"], "where": "devices" if st["fault"] or st["goes"] else "desk",
-           "held": held_n, "approvals": approvals}
+           "held": held_n, "approvals": approvals, "lets": lets_options()}
     return out
 
 
