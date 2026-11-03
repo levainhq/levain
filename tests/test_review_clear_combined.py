@@ -268,6 +268,23 @@ def test_the_phone_queue_draws_an_item_whose_body_is_not_an_object(tmp_path) -> 
     assert {i["item_id"]: i["text"] for i in view["open"]} == {page.open[0].item_id: "fine", "rv-" + "1" * 32: ""}
 
 
+def test_an_agent_card_has_its_text_on_the_phone_in_the_panels_order(tmp_path) -> None:
+    from datetime import datetime, timezone
+
+    from levain.coordinator.phone import CoordPhone
+
+    store = CoordStore(_dir(tmp_path))
+    review.file_item(store, "agent", {"reason": "why", "his": "his words"}, dedupe_key="a1")
+    review.file_item(store, "agent", {"summary": "sum", "reason": "why"}, dedupe_key="a2")
+    review.file_item(store, "agent", {"text": "txt", "summary": "sum", "reason": "why"}, dedupe_key="a3")
+    with review.read_transaction(store.open_readonly) as conn:
+        page = review.queue_page(conn, open_limit=10, cleared_limit=10)
+    phone = CoordPhone.__new__(CoordPhone)
+    phone._clock = lambda: datetime.now(timezone.utc)
+    view = phone.review_view(store, page)
+    assert sorted(i["text"] for i in view["open"]) == ["sum", "txt", "why"]
+
+
 def test_the_panel_and_the_phone_take_an_items_fields_from_one_helper() -> None:
     import inspect
 

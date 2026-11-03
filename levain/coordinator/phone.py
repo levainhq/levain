@@ -309,9 +309,11 @@ class CoordPhone:
         from levain.coordinator import review
 
         def row(i: Any) -> dict[str, Any]:
+            f = review.body_fields(i)       # the cockpit panel's fallback order (coordinator_panels._review_row)
             return {"item_id": i.item_id, "feed": i.feed, "label": review.FEED_LABELS.get(i.feed, i.feed),
                     "authority_relevant": i.authority_relevant,
-                    "text": visible(str(review.body_fields(i).get("text", ""))[:300]), "at": i.at, "state": i.state,
+                    "text": visible(str(f.get("text") or f.get("summary") or f.get("reason") or "")[:300]),
+                    "at": i.at, "state": i.state,
                     "cleared_at": i.last[3] if i.state == "cleared" and i.last is not None else None,
                     "version": review_version(i)}
 
