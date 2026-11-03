@@ -314,3 +314,51 @@ def test_start_through_the_launchd_provider_bootstraps_and_kickstarts(host, caps
     kick = [c for c in calls if c[:3] == ["launchctl", "kickstart", "-k"]]
     assert len(kick) == 2 and all(c[3].endswith("/" + daemon.DEFAULT_FENCE_LABEL) for c in kick)
     assert verbs.count("bootstrap") == 2
+
+
+def test_start_creates_the_absent_agent_store_before_installing(host, capsys):
+    store = host.tmp / "home" / "autonomic"
+    assert not store.exists()
+    rc, out = _start(host, capsys)
+    assert rc == 0, out.err
+    assert store.is_dir()                       # launchd exits 78 (EX_CONFIG) on a missing WorkingDirectory
+    assert host.provider.installed[0].working_dir == store.resolve()
+
+
+def test_update_creates_the_absent_agent_store_before_installing(host):
+    store = host.tmp / "update-home" / "autonomic"
+    line = A.refresh_fence_after_update(host.install, provider=host.provider, agent_store=store)
+    assert store.is_dir() and line.startswith("agent fence:") and "not installed" not in line
+    assert host.provider.installed[0].working_dir == store.resolve()
+
+
+def test_update_says_and_installs_nothing_when_the_agent_store_cannot_be_created(host):
+    blocker = host.tmp / "update-blocker"
+    blocker.write_text("a regular file")
+    line = A.refresh_fence_after_update(host.install, provider=host.provider, agent_store=blocker / "autonomic")
+    assert line.startswith("agent fence: not installed:") and "could not be created" in line
+    assert host.provider.installed == []
+
+
+def test_a_store_this_user_cannot_enter_installs_nothing(host, capsys):
+    import os
+    store = host.tmp / "locked-store"
+    store.mkdir()
+    for mode in (0o000, 0o500):   # not enterable at all, and enterable but not writable (the fence writes its store)
+        store.chmod(mode)
+        try:
+            if os.access(store, os.W_OK):
+                pytest.skip("this user can write a read-only directory (root)")
+            rc = A.run_fence_start(argparse.Namespace(path=host.install, store_dir=store))
+            err = capsys.readouterr().err
+            assert rc == 1 and "not a directory this user can enter and write" in err and host.provider.installed == []
+        finally:
+            store.chmod(0o700)
+
+
+def test_start_refuses_and_installs_nothing_when_the_agent_store_cannot_be_created(host, capsys):
+    blocker = host.tmp / "blocker"
+    blocker.write_text("a regular file")
+    rc = A.run_fence_start(argparse.Namespace(path=host.install, store_dir=blocker / "autonomic"))
+    err = capsys.readouterr().err
+    assert rc == 1 and "could not be created" in err and host.provider.installed == []

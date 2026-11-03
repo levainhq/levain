@@ -79,14 +79,27 @@ def _group_gone(pgid: int) -> bool | None:
     return False
 
 
-def _identity_matches(pid: int, started: Any, argv: Any, occ_dir: Path) -> bool | None:
+def _ident(pid: int, deadline: float | None) -> tuple[str, str] | None:
+    """``process_identity``, its ``ps`` capped to the time left before ``deadline`` (a ``time.monotonic()`` value) when
+    one is given."""
+    from levain.consent.delivery import process_identity
+
+    if deadline is None:
+        return process_identity(pid)
+    return process_identity(pid, timeout=min(5.0, deadline - time.monotonic()))
+
+
+def _until(wait: float, deadline: float | None) -> float:
+    until = time.monotonic() + wait
+    return until if deadline is None else min(until, deadline)
+
+
+def _identity_matches(pid: int, started: Any, argv: Any, occ_dir: Path, deadline: float | None = None) -> bool | None:
     """Does the process at ``pid`` still look like the recorded compose child: same start time, same command line, and
     this occurrence's dir is the value of the recorded ``--add-dir`` argument (an exact argv element, never a substring
     or a basename: ``o1`` must not match ``o10``). True = it matches; False = a live process is there that does not
-    (the recorded one has ended); None = ``ps`` could not be read."""
-    from levain.consent.delivery import process_identity
-
-    ident = process_identity(pid)
+    (the recorded one has ended); None = ``ps`` could not be read (before ``deadline``, when one is given)."""
+    ident = _ident(pid, deadline)
     if ident is None:
         try:
             os.kill(pid, 0)          # a probe, never a signal: no process there at all is a definite "ended"
@@ -136,25 +149,32 @@ def _by_hand(pgid: int, occ_dir: Path, store_dir: Path | None = None) -> str:
 
 
 def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, store_dir: Path | None = None, term_wait: float = TERM_WAIT_S,
-                     kill_wait: float = KILL_WAIT_S) -> tuple[str, list[str]]:
+                     kill_wait: float = KILL_WAIT_S, deadline: float | None = None) -> tuple[str, list[str]]:
     """End the compose child ``progress.json`` names, if it outlived its fire. A signal goes to a process whose
     identity was checked just before it, never to a stored integer: SIGTERM to the group, then SIGKILL only while the
     leader is still verified to be the recorded process (a group whose leader has exited is never signalled by number),
     and only ``ProcessLookupError`` on the group counts as ended. Returns ``(state, notes)``, ``state`` one of
     ``none-recorded``, ``ended`` (no process of ours is left), ``not-confirmed`` (no signal could safely be sent, or the
-    group was not seen gone)."""
+    group was not seen gone). ``deadline`` (a ``time.monotonic()`` value, ``DreamExecutor.stop``'s) caps every wait and
+    every ``ps`` here: a probe it cuts short reads as unreadable, so no signal and never "ended"."""
     pid = prog.get("child_pid")
     notes: list[str] = []
+    if pid is None and (prog.get("child_argv") is not None or prog.get("child_started_at") is not None):
+        # the compose journals child_argv BEFORE its spawn: a fire that died before the child_pid write may have left
+        # a child nobody can identify, so nothing is signalled and nothing is called ended
+        return "not-confirmed", ["a compose child may have been started without its pid being recorded (child_argv "
+                                 "is journalled, child_pid is not); no signal was sent. Check for a process whose "
+                                 f"command line carries --add-dir {occ_dir}, end it by hand, then rerun "
+                                 f"`{_rerun_command(occ_dir, store_dir)}`"]
     if type(pid) is not int or pid < 1:
         return "none-recorded", notes
     started, argv = prog.get("child_started_at"), prog.get("child_argv")
-    m = _identity_matches(pid, started, argv, occ_dir)
+    m = _identity_matches(pid, started, argv, occ_dir, deadline)
     if m is None:
         return "not-confirmed", [f"child pid {pid}: the process table could not be read; no signal was sent. "
                                  f"{_by_hand(pid, occ_dir, store_dir)}"]
     if m is False:
-        from levain.consent.delivery import process_identity
-        ident = process_identity(pid)
+        ident = _ident(pid, deadline)
         if ident is not None and isinstance(started, str) and started and \
                 " ".join(started.split()) != " ".join(str(ident[0]).split()):
             # a live process holds the number and started at another time than the recorded child: positive evidence
@@ -181,24 +201,28 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, store_dir: Path | N
         # and a group signal would miss it (or hit another group): no signal, and never "ended"
         return "not-confirmed", [f"child pid {pid}: is not a process-group leader; no signal was sent. "
                                  f"{_by_hand(pid, occ_dir, store_dir)}"]
+    if deadline is not None and time.monotonic() >= deadline:
+        return "not-confirmed", [f"child pid {pid}: the deadline passed during the identity check; no signal was "
+                                 f"sent. {_by_hand(pid, occ_dir, store_dir)}"]
     if leads:
         try:
             os.killpg(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
-    deadline = time.monotonic() + term_wait
-    while time.monotonic() < deadline and _group_gone(pid) is not True:
-        time.sleep(0.05)
-    if _group_gone(pid) is False and _identity_matches(pid, started, argv, occ_dir) is True:
+    until = _until(term_wait, deadline)
+    while time.monotonic() < until and _group_gone(pid) is not True:
+        time.sleep(min(0.05, max(0.0, until - time.monotonic())))
+    if _group_gone(pid) is False and _identity_matches(pid, started, argv, occ_dir, deadline) is True \
+            and (deadline is None or time.monotonic() < deadline):
         # the leader is still the recorded process, so its number is still its own and the group id cannot belong to
         # anyone else. Once the leader has gone nothing here reserves the number (recovery holds no handle to it), so
         # the group is never signalled by number again: it is reported not seen gone and recovery stays retryable
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signal.SIGKILL)
     if _group_gone(pid) is not True:
-        deadline = time.monotonic() + kill_wait
-        while time.monotonic() < deadline and _group_gone(pid) is not True:
-            time.sleep(0.05)
+        until = _until(kill_wait, deadline)
+        while time.monotonic() < until and _group_gone(pid) is not True:
+            time.sleep(min(0.05, max(0.0, until - time.monotonic())))
     if _group_gone(pid) is True:
         notes.append(f"child pid {pid}: ended")
         return "ended", notes
