@@ -144,6 +144,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
         # install never gets.
         core.extend(_check_unix_sockets(install))
         core.extend(_check_hands_isolation(install))
+    core.extend(_check_hands_login(install))
     core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
     core.extend(_check_autonomic_store())
@@ -3111,6 +3112,45 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
         f"hands user {cfg.hands_user} is set up: headless chat, --task and seats run the entity's bash "
         f"as it, in {cfg.hands_workspace}; the interactive REPL runs bash as you, since you read every turn",
     ), *extra]
+
+
+def _check_hands_login(install: Path) -> list[CheckResult]:
+    """One row per vendor: the hands account's credential file (owner / mode, read as the hands user) and the last
+    login or logout outcome. The file is not a login: no vendor status runs here, so a present file reads "present,
+    not verified" (`levain hands status` asks the vendor). A file state that cannot be read is a warning
+    (``unknown``), never OK. Silent where the entity has no hands account."""
+    try:
+        from levain.firing import hands_login
+        hands = hands_login.load_hands_identity(install)
+    except Exception:  # noqa: BLE001 — no hands account (or a config _check_confinement already reports)
+        return []
+    outcomes = hands_login.read_outcomes(install)
+    rows: list[CheckResult] = []
+    for vendor in hands_login.VENDORS:
+        name = f"hands login {vendor}"
+        last = outcomes.get(vendor, {})
+        last_s = f"; last: {last.get('outcome', '?')} {last.get('at', '')}".rstrip() if last else "; last: none recorded"
+        try:
+            cred = hands_login.credential_state(hands, vendor, entity_dir=install)
+        except Exception as exc:  # noqa: BLE001
+            rows.append(CheckResult(name, True, f"unknown: not determinable ({exc}){last_s}",
+                                    hint=f"`levain hands status {vendor}` asks the vendor", warn=True))
+            continue
+        if cred is None:
+            rows.append(CheckResult(name, True, f"no credential file{last_s}", neutral=True))
+            continue
+        owner, _, mode = cred.partition(" ")
+        detail = f"credential file present, not verified; owner {owner}, mode {mode}{last_s}"
+        if owner != hands.user or mode != "600":
+            rows.append(CheckResult(
+                name, True, detail,
+                hint=f"expected {hands.user} 600; log out with `levain hands logout {vendor}` and sign in again",
+                warn=True))
+        else:
+            rows.append(CheckResult(name, True, detail))
+    return rows
+
+
 def _check_floor_placeholders() -> list[CheckResult]:
     """Sweep the Linux floor's session placeholders (an absent ``~/.netrc`` the bash floor masks over
     an empty 0444 file while a session runs): remove the ones whose session is gone, which a crash
