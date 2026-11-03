@@ -389,6 +389,7 @@ def test_the_chip_reads_the_record_and_the_sheet_posts_each_body_and_repaints_fr
             {"do": "document.querySelector('#pr-sheet [aria-label=\"Whether pings reach your devices\"] [data-value=\"off\"]').click()",
              "until": f"{_CHIP_TEXT}.startsWith('Desk only')", "ms": 8000},
             {"do": "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))", "until": "document.getElementById('pr-sheet').hidden", "ms": 4000},
+            {"eval": "[...document.querySelectorAll('#pr-sheet [aria-label=\"What reaches your devices\"] button')].map(b => [b.dataset.value, b.textContent, b.title])"},
             {"eval": f"document.activeElement===({_CHIP})"},
         ])
     v = out["values"]
@@ -396,11 +397,40 @@ def test_the_chip_reads_the_record_and_the_sheet_posts_each_body_and_repaints_fr
     assert v[2] == ["Away", "Back", "Quiet", "Sleep", "Loud"]
     assert v[4] is True and v[5].startswith("Pings now: ")                 # focus in the sheet, which opens on the server's own line
     assert v[7][0] is False and v[7][1] == "2h" and "quiet" in v[7][2]     # the sheet stays open to show the new line; the pick is remembered
-    assert "Lets through: Approvals only" in v[10][0] and "a message you type into a session" in v[10][0] and v[10][1] == "switch"
+    from levain.webpush import intent
+    assert f"Lets through: {intent.lets_label('approvals')}" in v[10][0] and "a message you type into a session" in v[10][0] and v[10][1] == "switch"
+    from levain.webpush import intent as _in
+    assert v[-2] == [[o["value"], o["label"], o["describe"]] for o in _in.lets_options()]     # the buttons read the server's words
     assert v[-1] is True
     rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
     assert [r["word"] for r in rows][:3] == ["quiet", "away", "set lets approvals until input"]
     assert rows[3]["word"] == "set devices off"
+
+
+@needs_browser
+def test_a_lets_button_made_during_a_write_is_disabled_and_a_level_the_server_drops_leaves_the_page(rig, tmp_path, monkeypatch):
+    src, q = rig
+    group = "'#pr-sheet [aria-label=\"What reaches your devices\"] button'"
+    hook = ("(() => { window.__made = {}; const ap = Node.prototype.appendChild;"
+            " Node.prototype.appendChild = function (c) { if (c && c.tagName === 'BUTTON' && c.dataset && c.dataset.value === 'zz') window.__made.zz = c.disabled;"
+            " return ap.call(this, c); };"
+            # the reply to a presence write offers one more level and drops 'approvals'
+            " const f = window.fetch.bind(window); window.fetch = async (u, o) => { const r = await f(u, o);"
+            " if (!String(u).endsWith('/webpush/presence/set')) return r; const d = await r.json();"
+            " d.lets = d.lets.filter((x) => x.value !== 'approvals').concat([{value: 'zz', label: 'Extra', describe: 'x'}]);"
+            " return new Response(JSON.stringify(d), {status: r.status, headers: {'Content-Type': 'application/json'}}); }; return 1; })()")
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000},
+            _opened(),
+            {"eval": hook},
+            {"do": "document.querySelector('.pr-sheet-word[data-value=\"quiet\"]').click()", "until": f"{_CHIP_TEXT}.startsWith('Quiet')", "ms": 8000},
+            {"eval": "window.__made.zz"},
+            {"eval": f"[...document.querySelectorAll({group})].map(b => b.dataset.value)"},
+        ])
+    v = out["values"]
+    assert v[-2] is True, v                                    # made mid-write, it was born disabled
+    assert v[-1][-1] == "zz" and "approvals" not in v[-1], v     # the dropped level is gone, the new one is there
 
 
 @needs_browser
