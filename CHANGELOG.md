@@ -21,6 +21,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **The Decisions panel has no standing answer box.** The "answer by number and letter" box (with its send button) at the top of the NEEDS YOU band is gone from the cockpit's Decisions panel. A decision is answered on its own card: an option button on its band row, or that card's own write-in; with nothing waiting the panel shows history and no input. Freeform words to the desk go through the Drop.
 - **The sign-in identity check no longer refreshes or reads the login token.** It now asks the unmodified `claude` binary `claude auth status --json` as the slot and records a SHA-256 digest of the organisation id and the sign-in email it reports, as a local-data claim; the email itself is hashed inside the slot and never stored. The organisation id alone is shared by every member of a Team or Enterprise organisation, so two members of one organisation now read as different sign-ins, and an answer with no email is refused. Levain never opens the slot's credential file or contacts a sign-in server for it. A `claude` binary older than 2.1.301 is refused (`identity-unreachable`, detail `binary-too-old`), since older builds could lose the sign-in when a short command exited during a token refresh. The binary's output is read under a size cap, and a run that overflows it or times out is killed with its whole process group. Existing Claude slot baselines hold the old id, so each Claude slot's baseline needs one re-confirm after upgrading.
 
+### Fixed
+- **The Codex consent canary no longer allows provider-side web search.** Its Codex launch now pins `web_search="disabled"` the way a slot's does.
+
 ## [0.11.27] — 2026-10-31
 
 ### Added
