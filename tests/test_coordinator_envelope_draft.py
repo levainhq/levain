@@ -484,3 +484,145 @@ def test_the_builder_lets_a_verifier_fault_propagate(ctx, monkeypatch):
     monkeypatch.setattr(env, "refusal", down)
     with pytest.raises(VerifierUnavailable):
         built(ctx, r1)
+
+
+# L3 h11 r1 (lane H1-1d) ---------------------------------------------------------------------------------------------
+# 2**62 is parse_body's own bound, and the canonical reader already refuses it (over 2**53 - 1): the largest seen a
+# body can carry is 2**53 - 1, the forged horizon codex's HIGH needs
+@pytest.mark.parametrize("past", [2 ** 62, 2 ** 53 - 1, "high+5"])
+def test_a_seen_past_the_high_water_is_refused_at_check_and_at_accept(ctx, past):
+    """FIX 1 (codex HIGH): ``seen`` is the signed horizon; a value above the store's high-water was never written by an
+    echo. One signed while the head is live and accepted after a kill would otherwise pass the narrowed-after check."""
+    hd, head, t = head_thread(ctx)
+    sup = {"envelope_id": head["envelope_id"], "digest": env.envelope_digest(head),
+           "seen": ctx.seen() + 5 if past == "high+5" else past}
+    body, signed = ctx.worded(hd, t, supersedes=sup)
+    refused = "outside" if past == 2 ** 62 else "no echo from this store wrote it"
+    with pytest.raises(CoordError, match=refused):
+        ctx.store.check_body(canonical(body))                        # what sign runs before the view
+    assert ctx.store.attenuate(head["envelope_id"], "kill")          # the head killed after the forged body was signed
+    with pytest.raises(CoordError, match=refused):
+        ctx.accept(signed)
+    assert envelopes(ctx) == [(head["envelope_id"],)]
+
+
+def _revoked_phone(tmp_path, keys):
+    from tests.test_consent_queue import Log
+
+    (tmp_path / "revoked-auth").mkdir()
+    lg = Log(tmp_path / "revoked-auth", keys)
+    for name, cls in (("laptop", "laptop-presence"), ("phone", "display-phone")):
+        lg.enrol(name, cls)
+    lg.revoke("phone")
+    return lg.source()
+
+
+@pytest.mark.parametrize("how", ["kill", "revoked"])
+def test_a_head_that_grants_nothing_shows_every_budget_key_new_in_the_draft(ctx, tmp_path, how):
+    """FIX 2: the empty base zeroes the budget, so a successor with the head's own budget lists every key as new."""
+    hd, head, t = head_thread(ctx)
+    f = fields_for(ctx, budget=dict(head["budget"]))
+    authority = ctx.snap
+    if how == "kill":
+        ctx.store.attenuate(head["envelope_id"], "kill")
+    else:
+        authority = _revoked_phone(tmp_path, ctx.keys)
+    r1 = drafts.create(ctx.store, t.thread_id, f, cites_for(hd, f), by="operator")
+    _t, _p, _s, against = drafts.draft_sign_bytes(ctx.store, r1.draft_id, 1, r1.digest, authority=authority,
+                                                  signer_fp=ctx.keys["laptop"].fp, signed_at=ctx.clk[0])
+    assert against.base_kind == "revoked"
+    assert against.diff["budget"] == {k: (0, head["budget"][k]) for k in env.BUDGET_KEYS}
+
+
+@pytest.mark.parametrize("how", ["kill", "ended", "revoked"])
+def test_the_cli_base_of_a_head_that_grants_nothing_has_no_budget(ctx, tmp_path, how):
+    """FIX 2, the direct view: killed, ended and key-revoked heads share the one empty base, budget zeroed."""
+    from levain.coordinator import cli as ccli
+
+    hd, head, t = head_thread(ctx)
+    sup = {"envelope_id": head["envelope_id"], "digest": env.envelope_digest(head)}
+    body, _signed = ctx.worded(hd, t, supersedes=sup, budget=dict(head["budget"]))
+    authority = ctx.snap
+    if how == "kill":
+        ctx.store.attenuate(head["envelope_id"], "kill")
+    elif how == "ended":
+        ctx.store.set_state(t.thread_id, "done", by="coordinator", token=_lease(ctx.store))
+    else:
+        authority = _revoked_phone(tmp_path, ctx.keys)
+    ((_head, base, threads, notes),) = ccli._bases(body, ctx.store.sign_basis(body), authority)
+    assert threads == [t.thread_id] and "every value below is a new grant" in notes[0]
+    assert base["budget"] == {k: 0 for k in env.BUDGET_KEYS} and base["where"] == [] and base["lands"] == []
+
+
+def test_a_rule_refuses_a_drop_attached_between_its_read_and_its_write(ctx, monkeypatch):
+    """FIX 3: the rule's fields come from the anchor it read; a newer drop attached before the lock is refused, never
+    written under the new anchor with the old drop's fields. Both rules."""
+    d, t = ctx.plain_thread("fix the readme")
+    real = drafts._rule_write
+    late = []
+
+    def attach_then_write(*a, **k):
+        if not late:
+            late.append(ctx.plain("a later drop"))
+            ctx.store.split(late[0].drop_id, [Part("work", attach=t.thread_id)])
+        return real(*a, **k)
+
+    monkeypatch.setattr(drafts, "_rule_write", attach_then_write)
+    with pytest.raises(DraftStale, match="newer drop was attached"):
+        drafts.drop_rule(ctx.store, t.thread_id, by="operator")
+    assert ctx.rows("SELECT * FROM envelope_drafts") == []
+    r1 = drafts.drop_rule(ctx.store, t.thread_id, by="operator")          # re-run: read and write agree
+    assert r1.proposal["drop_id"] == late[0].drop_id and r1.cites[0]["ref"] == late[0].drop_id
+    spec = {"where": [{"repo": ctx.path, "paths": ["README"]}]}
+    correction = ctx.plain(json.dumps(spec))
+    late.clear()
+    with pytest.raises(DraftStale, match="newer drop was attached"):
+        drafts.spec_rule(ctx.store, t.thread_id, correction.drop_id, by="operator")
+    assert [r[0] for r in ctx.rows("SELECT revision FROM envelope_drafts")] == [1]
+
+
+def test_drop_rule_never_overwrites_a_where_already_chosen(ctx):
+    """FIX 5: drop/1 fills a blank where; over a series whose where was set (here by spec/1) it carries that where."""
+    d, t = ctx.plain_thread("fix the readme")
+    r1 = drafts.drop_rule(ctx.store, t.thread_id, by="operator")
+    assert r1.proposal["where"] == [{"repo": ctx.path, "paths": ["."]}]
+    correction = ctx.plain(json.dumps({"where": [{"repo": ctx.path, "paths": ["README"]}]}))
+    r2 = drafts.spec_rule(ctx.store, t.thread_id, correction.drop_id, by="operator")
+    r3 = drafts.drop_rule(ctx.store, t.thread_id, by="operator")
+    assert r3.revision == r2.revision + 1
+    assert r3.proposal["where"] == [{"repo": ctx.path, "paths": ["README"]}]
+    assert [c["ref"] for c in r3.cites if c["field"] == "where"] == [correction.drop_id]
+
+
+@pytest.mark.parametrize("binds", [3, None, "x"])
+def test_a_proposal_whose_binds_is_not_a_list_is_a_draft_error(ctx, binds):
+    """FIX 6: a corrupt stored row raises the draft error every reader catches, never a TypeError."""
+    _d, _t, r1 = make(ctx)
+    with pytest.raises(ed.DraftError):
+        ed.check_proposal({**r1.proposal, "binds": binds})
+    conn = raw(ctx)
+    try:
+        conn.execute("DROP TRIGGER IF EXISTS envelope_drafts_no_update")
+        names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND "
+                                            "tbl_name = 'envelope_drafts'")]
+        for n in names:
+            conn.execute(f"DROP TRIGGER {n}")
+        conn.execute("UPDATE envelope_drafts SET proposal = ? WHERE draft_id = ?",
+                     (canonical({**r1.proposal, "binds": binds}), r1.draft_id))
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(CoordError, match="not a revision this reader reads"):
+        drafts.latest(ctx.store, r1.draft_id)
+
+
+def test_an_accepted_id_reused_by_another_body_is_still_checked_for_narrowing(ctx):
+    """FIX 6: the exact-retry short cut holds only for the very body stored under the id."""
+    from levain.coordinator import cli as ccli
+
+    hd, head, t = head_thread(ctx)
+    sup = {"envelope_id": head["envelope_id"], "digest": env.envelope_digest(head)}
+    body, _signed = ctx.worded(hd, t, supersedes=sup, envelope_id=head["envelope_id"])   # an id already stored
+    ctx.store.attenuate(head["envelope_id"], "kill")
+    with pytest.raises(CoordError, match="narrowed after this body was echoed"):
+        ccli._refuse_narrowed(body, ctx.store.sign_basis(body))

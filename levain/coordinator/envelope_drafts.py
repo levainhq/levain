@@ -440,29 +440,50 @@ def withdraw(store: EnvelopeStore, draft_id: str, *, by: str = "operator") -> in
 # --- the rules (design r3 §2.5): a pure function of what the lock holds and the arguments, never a model call ---------
 def _rule_write(store: EnvelopeStore, thread_id: str, fields: Mapping[str, Any], cites: list[dict[str, str]], *,
                 by: str, token: object, stop_span: timedelta | None = None,
-                expect: tuple[str, str] | None = None) -> Draft:
+                expect: tuple[str, str] | None = None, observed: tuple[int, tuple[str, str] | None] | None = None,
+                blanks: tuple[str, ...] = ()) -> Draft:
     """A rule's write: the thread's unclosed series gains revision N+1 (the parent's other values and cites carry), else
-    a new series starts. ``expect`` is ``(drop_id, words_sha256)`` of the record the rule read before the lock: it must
-    still be that record's words."""
+    a new series starts. Under the lock: ``expect`` is ``(drop_id, words_sha256)`` of the record the rule read before
+    the lock, which must still be that record's words; ``observed`` is ``(thread rev, anchor)`` as the rule read them,
+    which must still hold, so no field is derived from one drop and anchored to a newer one (L3 h11 r1, three seats);
+    a field in ``blanks`` is set only where the unclosed series has no value for it yet, so a rule that fills blanks
+    never overwrites a value someone chose (L3 h11 r1 complement)."""
     by = store._actor(by, ("operator", "coordinator"))
     with store._write(by, token) as (conn, now):
         if expect is not None:
             row = conn.execute("SELECT words_sha256 FROM drops WHERE drop_id = ?", (expect[0],)).fetchone()
             if row is None or row[0] != expect[1]:
                 raise CoordError(f"drop {expect[0]} is not the record this rule read")
+        if observed is not None:
+            t = store._must_thread(conn, thread_id)
+            if (t.rev, _anchor(conn, t.members)) != observed:
+                raise DraftStale(f"thread {thread_id} changed since this rule read it (a newer drop was attached, or "
+                                 "its members moved); re-run the rule")
         target = _unclosed(conn, thread_id)
+        given, wanted = dict(fields), list(cites)
+        for k in blanks:
+            if target is not None and target.proposal[k] is not None and k in given:
+                del given[k]
+                wanted = [c for c in wanted if c["field"] != k]
         return _write_revision(store, conn, now, thread_id=thread_id,
-                               draft_id=None if target is None else target.draft_id, fields=fields, cites=cites,
+                               draft_id=None if target is None else target.draft_id, fields=given, cites=wanted,
                                parent=None if target is None else target.digest, by=by, carry=target is not None,
                                stop_span=stop_span)
 
 
+def _observed(store: EnvelopeStore, conn: sqlite3.Connection, thread_id: str) -> tuple[int, tuple[str, str] | None]:
+    """``(rev, anchor)`` of a thread, as a rule reads it before the lock and :func:`_rule_write` compares under it."""
+    t = store._must_thread(conn, thread_id)
+    return t.rev, _anchor(conn, t.members)
+
+
 def drop_rule(store: EnvelopeStore, thread_id: str, *, by: str, token: object = None) -> Draft:
     """``drop/1``: from the thread's latest member drop, ``where`` = the repo it was sent from (``paths`` the whole
-    repo) when it was sent from a work tree or picked; nothing else. A drop with no repo leaves every value null."""
+    repo) when it was sent from a work tree or picked, and only when the unclosed series has no ``where`` yet; nothing
+    else. A drop with no repo leaves every value null."""
     with read_transaction(store._connect) as conn:
-        t = store._must_thread(conn, thread_id)
-        anchor = _anchor(conn, t.members)
+        observed = _observed(store, conn, thread_id)
+        anchor = observed[1]
         drop = None if anchor is None else store._drop(conn, anchor[0])
     if drop is None:
         raise CoordError(f"thread {thread_id} holds no drops; nothing to draft for")
@@ -471,7 +492,8 @@ def drop_rule(store: EnvelopeStore, thread_id: str, *, by: str, token: object = 
     if drop.source.how in ("cwd", "picker") and drop.source.repo:
         fields["where"] = [{"repo": drop.source.repo, "paths": ["."]}]
         cites.append({"field": "where", "kind": "drop", "ref": drop.drop_id, "digest": drop.words_sha256})
-    return _rule_write(store, thread_id, fields, cites, by=by, token=token, expect=(drop.drop_id, drop.words_sha256))
+    return _rule_write(store, thread_id, fields, cites, by=by, token=token, expect=(drop.drop_id, drop.words_sha256),
+                       observed=observed, blanks=("where",))
 
 
 def spec_rule(store: EnvelopeStore, thread_id: str, drop_id: str, *, by: str, token: object = None) -> Draft:
@@ -483,6 +505,7 @@ def spec_rule(store: EnvelopeStore, thread_id: str, drop_id: str, *, by: str, to
 
     with read_transaction(store._connect) as conn:
         drop = store._must_drop(conn, drop_id)
+        observed = _observed(store, conn, thread_id)
     try:
         spec = json.loads(drop.words)
     except ValueError:
@@ -498,7 +521,7 @@ def spec_rule(store: EnvelopeStore, thread_id: str, drop_id: str, *, by: str, to
     named = [*fields, *(["stop_at"] if stop_span is not None else [])]
     cites = [{"field": k, "kind": "drop", "ref": drop.drop_id, "digest": drop.words_sha256} for k in named]
     return _rule_write(store, thread_id, fields, cites, by=by, token=token, stop_span=stop_span,
-                       expect=(drop.drop_id, drop.words_sha256))
+                       expect=(drop.drop_id, drop.words_sha256), observed=observed)
 
 
 # --- reading, for every surface that only displays ---------------------------------------------------------------
@@ -572,7 +595,7 @@ def draft_sign_bytes(store: EnvelopeStore, draft_id: str, revision: int, draft_d
             added, removed = store.members_diff(conn, d.thread_id, from_rev, bind_rev)
     base_kind, why = "none", None
     if head is None:
-        base = {**ed.empty_base(d.proposal), "budget": {k: 0 for k in env.BUDGET_KEYS}}
+        base = ed.empty_base(d.proposal)
     else:
         base_kind = "effective"
         base = effective

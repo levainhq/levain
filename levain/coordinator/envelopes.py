@@ -49,7 +49,7 @@ from levain.dispatch.adopt import GitFault, branch_problem
 from levain.dispatch.contract import MAX_LIFETIME, git_env
 
 __all__ = ["ATTENUATIONS", "ENVELOPE_SCHEMA", "NARROW_KEYS", "NOT_IN_FORCE", "Envelope", "EnvelopeConflict",
-           "EnvelopeStale", "EnvelopeStore", "narrow_scope"]
+           "EnvelopeStale", "EnvelopeStore", "SignBasis", "ThreadBasis", "narrow_scope", "seen_past"]
 
 ATTENUATIONS = ("kill", "stop_earlier", "drop_effect", "thread_done")
 NOT_IN_FORCE = ("before S1 places the control principal the coordinator grants nothing (C0 §2): this effect is a "
@@ -88,6 +88,47 @@ ENVELOPE_SCHEMA: tuple[str, ...] = (
 
 
 NARROW_KEYS = ("where", *env.EFFECT_LISTS)
+
+
+def _high_water(conn: sqlite3.Connection) -> int:
+    """The store-wide sequence high-water: what an echo records as ``supersedes.seen``."""
+    return conn.execute("SELECT COALESCE(MAX(gseq), 0) FROM gseq").fetchone()[0]
+
+
+def seen_past(body: Mapping[str, Any], high: int) -> str | None:
+    """Why a superseding body's ``seen`` cannot be honest, or None. An echo writes ``seen`` from this store's own
+    high-water, which only grows, so a value above the high-water now was never written by one (L3 h11 r1 codex
+    HIGH: a horizon past every event would let a later kill pass the narrowed-after check)."""
+    sup = body["supersedes"]
+    if sup is None or sup["seen"] <= high:
+        return None
+    return (f"this body says it was composed as of store event {sup['seen']}, but this store's last event is {high}: "
+            "no echo from this store wrote it; echo again")
+
+
+@dataclass(frozen=True)
+class ThreadBasis:
+    """One bound thread as a superseding body is read against it: the head as narrowed for the thread, the row that
+    ended it there (``(kind, by, at)``) or None, the revision the head was bound at, and the member drops the thread
+    gained and lost between that revision and the body's."""
+    effective: dict[str, Any]
+    end: tuple[str, str, str] | None
+    from_rev: int | None
+    added: list[str]
+    removed: list[str]
+
+
+@dataclass(frozen=True)
+class SignBasis:
+    """Everything a view of a body read before a signature, from ONE read transaction (:meth:`EnvelopeStore.sign_basis`):
+    the store's high-water, the envelope already stored under the body's id, the head it supersedes as stored, each
+    bound thread's :class:`ThreadBasis`, and whether a narrowing of the head newer than the body's ``seen`` applies
+    to a bound thread."""
+    high: int
+    stored: Envelope | None
+    head: Envelope | None
+    threads: dict[str, ThreadBasis]
+    narrowed: bool
 
 
 def _effect_target(kind: str, effect: Mapping[str, Any]) -> str:
@@ -211,6 +252,11 @@ class EnvelopeStore(CoordStore):
         real path, each land's branch by F11's branch_problem), with no signature: what echo runs before writing a
         file and sign runs before asking, so a body the store can only refuse is never signed. Raises CoordError."""
         body = self._parsed(body_text)
+        if body["supersedes"] is not None:
+            with read_transaction(self._connect) as conn:
+                forged = seen_past(body, _high_water(conn))
+            if forged is not None:
+                raise CoordError(forged)
         self._disk_checks(body)
         return body
 
@@ -372,6 +418,9 @@ class EnvelopeStore(CoordStore):
             stored = self._same_or_conflict(conn, body, payload, signature)
             if stored is not None:
                 return stored, False
+            forged = seen_past(body, _high_water(conn))          # before this write takes a sequence number of its own
+            if forged is not None:
+                raise CoordError(forged)
             if drafted:
                 self._draft_admit(conn, now, body)
             drop = self._must_drop(conn, body["drop_id"])
@@ -764,11 +813,41 @@ class EnvelopeStore(CoordStore):
         """The row that ended ``envelope_id`` for ``thread_id`` (a kill, envelope-wide or for that thread, or its thread
         going done or closed) as ``(kind, by, at)``, the first one written; None while none has."""
         with read_transaction(self._connect) as conn:
-            row = conn.execute(
-                "SELECT kind, by, at FROM envelope_attenuations WHERE envelope_id = ? AND kind IN ('kill', "
-                "'thread_done') AND (thread_id IS NULL OR thread_id IS ?) ORDER BY gseq LIMIT 1",
-                (envelope_id, thread_id)).fetchone()
+            return self._end_of(conn, envelope_id, thread_id)
+
+    @staticmethod
+    def _end_of(conn: sqlite3.Connection, envelope_id: str, thread_id: str | None) -> tuple[str, str, str] | None:
+        row = conn.execute(
+            "SELECT kind, by, at FROM envelope_attenuations WHERE envelope_id = ? AND kind IN ('kill', "
+            "'thread_done') AND (thread_id IS NULL OR thread_id IS ?) ORDER BY gseq LIMIT 1",
+            (envelope_id, thread_id)).fetchone()
         return None if row is None else (row[0], row[1], row[2])
+
+    def sign_basis(self, body: Mapping[str, Any]) -> SignBasis:
+        """What a view of ``body`` before a signature reads, in ONE read transaction (L3 h11 r1 codex MED: views built
+        from separate reads rendered a base a concurrent kill had already replaced): the high-water first, so every
+        later read in the block is of the store at that point; then the envelope stored under the body's id, the head
+        it supersedes and, per bound thread, the head as narrowed, its end, its bound revision, the member diff and
+        the narrowed-after-``seen`` predicate acceptance runs. A body that supersedes nothing reads the high-water and
+        the stored id only."""
+        sup = body["supersedes"]
+        threads: dict[str, ThreadBasis] = {}
+        narrowed = False
+        with read_transaction(self._connect) as conn:
+            high = _high_water(conn)
+            stored = self._envelope(conn, body["envelope_id"])
+            head = None if sup is None else self._envelope(conn, sup["envelope_id"])
+            for b in body["binds"] if head is not None else ():
+                t = b["thread_id"]
+                row = conn.execute("SELECT rev FROM envelope_binds WHERE envelope_id = ? AND thread_id = ?",
+                                   (head.envelope_id, t)).fetchone()
+                from_rev = None if row is None else row[0]
+                added, removed = ([], []) if from_rev is None or from_rev == b["rev"] else \
+                    self.members_diff(conn, t, from_rev, b["rev"])
+                threads[t] = ThreadBasis(self._effective(conn, head.envelope_id, t),
+                                         self._end_of(conn, head.envelope_id, t), from_rev, added, removed)
+                narrowed = narrowed or self._narrowed_after(conn, head.envelope_id, t, sup["seen"])
+        return SignBasis(high, stored, head, threads, narrowed)
 
     def basis(self, thread_ids: Sequence[str]) -> tuple[Envelope | None, dict[str, dict[str, Any]], int]:
         """What a body composed now supersedes, read in ONE transaction: the head the threads share, its effective
@@ -781,15 +860,9 @@ class EnvelopeStore(CoordStore):
             if any((h is None) != (first is None) or (h is not None and h.envelope_id != first.envelope_id)
                    for h in heads):
                 raise CoordError("these threads do not share one current envelope; echo them separately")
-            seen = conn.execute("SELECT COALESCE(MAX(gseq), 0) FROM gseq").fetchone()[0]
+            seen = _high_water(conn)
             eff = {} if first is None else {t: self._effective(conn, first.envelope_id, t) for t in thread_ids}
         return first, eff, seen
-
-    def narrowed_since(self, envelope_id: str, thread_ids: Sequence[str], seen: int) -> bool:
-        """True when a narrowing of ``envelope_id`` that applies to any of ``thread_ids`` was written after store
-        point ``seen``: what a body superseding it was not shown. One read transaction."""
-        with read_transaction(self._connect) as conn:
-            return any(self._narrowed_after(conn, envelope_id, t, seen) for t in thread_ids)
 
     @staticmethod
     def members_diff(conn: sqlite3.Connection, thread_id: str, from_rev: int, to_rev: int) -> tuple[list[str], list[str]]:

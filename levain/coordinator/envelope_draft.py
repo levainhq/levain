@@ -148,7 +148,7 @@ def check_proposal(proposal: Any) -> dict[str, Any]:
         raise DraftError("only the editable values, and supersedes, may be null")
     if proposal["format"] != env.BODY_FORMAT or proposal["origin"] != "worded":
         raise DraftError(f"a draft proposal is a worded {env.BODY_FORMAT} envelope")
-    if len(proposal["binds"]) != 1:
+    if not isinstance(proposal["binds"], list) or len(proposal["binds"]) != 1:
         raise DraftError("a draft binds exactly one thread")
     check_fields({k: proposal[k] for k in EDITABLE})
     ref = {"draft_id": "ed-" + "0" * 32, "revision": 1, "digest": "sha256:" + "0" * 64}
@@ -239,10 +239,11 @@ def draft_body(proposal: Mapping[str, Any], draft_id: str, revision: int, digest
 
 # --- the two diffs a signer is shown ----------------------------------------------------------------------------
 def empty_base(body: Mapping[str, Any]) -> dict[str, Any]:
-    """What a head that grants nothing is diffed as: no where, no effect, a stop at its issue time (the same envelope
-    a kill leaves, :meth:`levain.coordinator.envelopes.EnvelopeStore._effective`), so every value of a successor is
-    new."""
-    return {**body, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": body["issued_at"]}
+    """What a head that grants nothing (killed, ended, its key no longer valid, or none at all) is diffed as: no where,
+    no effect, a stop at its issue time and every budget key zero, so every value of a successor is new, its budget
+    included (L3 h11 r1: a budget kept from the head read as "unchanged" while all of it was newly granted)."""
+    return {**body, "where": [], **{k: [] for k in env.EFFECT_LISTS}, "stop_at": body["issued_at"],
+            "budget": {k: 0 for k in env.BUDGET_KEYS}}
 
 
 def field_diff(prev: Mapping[str, Any] | None, new: Mapping[str, Any]) -> list[dict[str, Any]]:

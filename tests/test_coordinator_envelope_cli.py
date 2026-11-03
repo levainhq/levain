@@ -668,3 +668,65 @@ def test_sign_refuses_a_body_narrowed_since_its_echo_before_the_view(run, repo, 
     ext = run.json("envelope", "extend", thread, "--budget", "tool_calls=99")["body"]
     assert ext["supersedes"]["envelope_id"] == first and isinstance(ext["supersedes"]["seen"], int)
     assert ext["draft"] is None
+
+
+# L3 h11 r1 (lane H1-1d) ---------------------------------------------------------------------------------------------
+def _successor(run, repo, thread, tmp_path, name="next.json"):
+    g = tmp_path / name
+    run("envelope", "echo", thread, "--where", f"{repo}=README,docs/", "--land", f"{repo}=main", "--stop", "1h",
+        "-o", str(g))
+    return g, env.parse_body(g.read_text().rstrip("\n"))
+
+
+@pytest.mark.parametrize("forged", [2 ** 53 - 1, 5])
+def test_sign_refuses_a_seen_past_the_store_and_the_view_names_the_horizon(run, repo, tmp_path, monkeypatch, forged):
+    """FIX 1: a seen above the store's high-water was never written by an echo (refused before any view); an honest
+    one is printed in plain words, and a narrowing after it refuses the signature (echo again)."""
+    from levain.contracts.canon import canonical
+
+    _drop, thread = make_thread(run, repo, monkeypatch)
+    f, got = echo(run, repo, thread, tmp_path)
+    first = got["body"]["envelope_id"]
+    run(*run.signed("envelope", "sign", str(f), "--yes"))
+    g, body = _successor(run, repo, thread, tmp_path)
+    seen = body["supersedes"]["seen"]
+    out = run("envelope", "echo", thread, "--where", f"{repo}=README", "--stop", "1h").out
+    assert f"as of store event {seen}; any narrowing of {first} after event {seen} refuses this body" in out
+    bad = tmp_path / "forged.json"
+    forged_seen = forged if forged != 5 else seen + 5
+    bad.write_text(canonical({**body, "supersedes": {**body["supersedes"], "seen": forged_seen}}) + "\n")
+    err = run(*run.signed("envelope", "sign", str(bad), "--yes"), rc=1)
+    assert f"composed as of store event {forged_seen}, but this store's last event is" in err.err
+    assert "NOT IN FORCE" not in err.out and not (tmp_path / "forged.json.sig.json").exists()
+    run("envelope", "kill", first)
+    err = run(*run.signed("envelope", "sign", str(g), "--yes"), rc=1).err
+    assert f"envelope {first} was narrowed after this body was echoed; echo again" in err
+
+
+def test_a_kill_between_the_view_reads_cannot_split_the_view(run, repo, tmp_path, monkeypatch):
+    """FIX 4: the sign view reads head, base, end and the narrowed predicate in one transaction. A kill committed after
+    the base was read is not in the view at all (no "killed" note over an unchanged base); the signature over that view
+    is then refused by acceptance, because the kill is past the body's seen."""
+    from levain.coordinator.envelopes import EnvelopeStore
+
+    _drop, thread = make_thread(run, repo, monkeypatch)
+    f, got = echo(run, repo, thread, tmp_path)
+    first = got["body"]["envelope_id"]
+    run(*run.signed("envelope", "sign", str(f), "--yes"))
+    g, _body = _successor(run, repo, thread, tmp_path)
+    real = EnvelopeStore.__dict__["_effective"].__func__
+    fired = []
+
+    def read_then_kill(cls, conn, envelope_id, thread_id):
+        out = real(cls, conn, envelope_id, thread_id)
+        if not fired:
+            fired.append(EnvelopeStore(run.q).attenuate(first, "kill"))          # another connection, committed now
+        return out
+
+    monkeypatch.setattr(EnvelopeStore, "_effective", classmethod(read_then_kill))
+    out = run(*run.signed("envelope", "sign", str(g), "--yes"), rc=1)
+    assert fired == [True]
+    assert "was killed" not in out.out and f"= unchanged: {repo}  onto main" in out.out
+    assert f"supersedes {first}\n  as of store event " in out.out          # the sign view names its horizon
+    assert f"envelope {first} was narrowed after this body was shown; echo again" in out.err
+    assert not (tmp_path / "next.json.sig.json").exists()
