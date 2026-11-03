@@ -47,10 +47,10 @@ def register(subparsers) -> None:
 
     for word, text in (("quiet", "Hold phone pushes for a while (default 60 min), except what needs you (approvals and "
                                  "attention items); one summary and the held pings follow when it ends."),
-                       ("sleep", "Hold phone pushes until your next keyboard or mouse input at this Mac, except approvals and "
-                                 "high-priority items (read from the Mac's input idle time); one summary and the held pings follow."),
+                       ("sleep", "Hold phone pushes until you say another word or type a message into a session, except approvals and "
+                                 "high-priority items; one summary and the held pings follow."),
                        ("loud", "Push every ping for a while (default 60 min), over everything else; `loud off` ends it."),
-                       ("away", "Push to your devices at once until you next type here."),
+                       ("away", "Push to your devices at once until you say another word or type a message into a session."),
                        ("back", "Clear away, quiet or sleep and return to your standing default; a standing loud is left "
                                 "(`loud off`).")):
         w = common(sub.add_parser(word, help=text))
@@ -71,7 +71,7 @@ def register(subparsers) -> None:
         g.add_argument("--for", dest="for_", default=None, metavar="DUR",
                        help="Only for this long (30, 30m or 2h; 1 minute to 24 h), then your standing default again.")
         g.add_argument("--until-input", dest="until_input", action="store_true",
-                       help="Only until your next keyboard or mouse input at this Mac, then your standing default again.")
+                       help="Only until you say another word or type a message into a session (sensed keyboard or mouse input does not end it), then your standing default again.")
 
     dv = common(sub.add_parser(
         "devices", help="Whether pings reach your devices: on, off, or follow where you are (operator only).",
@@ -84,8 +84,8 @@ def register(subparsers) -> None:
     ending(dv)
     dv.set_defaults(func=_devices)
     lt = common(sub.add_parser(
-        "lets", help="What reaches your devices: everything, needs, approvals or nothing (operator only).",
-        description="Everything; needs (approvals and attention items); approvals (approvals alone); nothing. Held pings wait for "
+        "lets", help="What reaches your devices: everything, needs (Approvals and needs), approvals or nothing (operator only).",
+        description="Everything; needs (Approvals and needs: approvals plus attention items); approvals (Approvals only); nothing (Nothing). Held pings wait for "
                     "your devices (or the setting to widen) and are pushed then. With neither --for nor --until-input the "
                     "setting becomes your standing default."))
     lt.add_argument("level", choices=_intent_lets())
@@ -299,8 +299,8 @@ def _policy_show(args: argparse.Namespace) -> int:
         return 0
     print("what each preset lets through (the notification policy is retired):")
     for name, r in intent.PRESET_TABLE.items():
-        end = "your next input at this Mac" if r["until"] == "input" else "a timer (default 60 min)"
-        print(f"  {name:<6} devices {r['devices']:<3}  lets through {intent._LETS_WORDS[r['lets_through']]:<14}  until {end}")
+        end = "your next word or a message you type into a session" if r["until"] == "input" else "a timer (default 60 min)"
+        print(f"  {name:<6} devices {r['devices']:<3}  lets through {intent._LETS_WORDS[r['lets_through']]:<19}  until {end}")
     print("  back   clears the preset and returns to your standing default (a standing loud is left)")
     print("retired: change it with `levain ping lets everything|needs|approvals|nothing [--for 1h | --until-input]`")
     return 0

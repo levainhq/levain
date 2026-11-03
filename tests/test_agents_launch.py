@@ -7,9 +7,14 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import shutil
+import signal
 import sqlite3
-from datetime import timedelta
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -234,6 +239,21 @@ def _launched(rig: Rig) -> tuple[str, int]:
     return oid, result.launch_epoch
 
 
+class Gate:
+    """A gated child that records what start_run did with it (spawn, release, abort), in ``log``."""
+
+    def __init__(self, key, log, value=None):
+        self.key, self.log, self.value = key, log, value
+        log.append(("spawn", key))
+
+    def release(self):
+        self.log.append(("release", self.key))
+
+    def abort(self):
+        self.log.append(("abort", self.key))
+        return ctl.GATE_REFUSED
+
+
 def _fence_rows(rig: Rig, key: str) -> list:
     # levain.qbroker.fence.AgentFences' join, as it reads it (seat/1102-7-p72fix); a fresh read transaction, so only
     # what is committed is seen
@@ -251,23 +271,23 @@ def test_the_session_key_is_committed_before_the_spawn_seam_runs(rig):
     for probe in (KEY, KEY + "\n", KEY + "-v2", "S" + KEY[1:], KEY.upper(), "s-" + "a" * 15, "s-" + "a" * 17, ""):
         assert bool(ctl.SESSION_KEY_RE.fullmatch(probe)) == bool(SESSION_RE.fullmatch(probe)), probe
     oid, epoch = _launched(rig)
-    seen = []
+    seen, log = [], []
 
     def spawn(key):
         seen.append(_fence_rows(rig, key))
-        return "child"
+        return Gate(key, log)
 
     started = ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=rig.now)
-    assert started == ctl.Started(True, None, "child")
-    assert seen == [[(oid,)]]
+    assert started.spawned is True and started.value.key == KEY
+    assert seen == [[(oid,)]] and log == [("spawn", KEY), ("release", KEY)]
 
 
 def test_a_session_key_that_cannot_be_recorded_never_reaches_the_spawn_seam(rig, tmp_path):
     # behaviour: every refused compare-and-set (a key another row names, a second key, an epoch a bar raised, a row
     # that is not launched) returns Started(False) and a failing write raises; spawn is never called, so no claude
     # starts for a session the fence cannot see
-    calls = []
-    spawn = calls.append
+    log = []
+    spawn = lambda key: Gate(key, log)  # noqa: E731
     oid, epoch = _launched(rig)
     run = lambda oid, epoch, key: ctl.start_run(rig.store, oid, epoch, key, spawn, clock=rig.now)  # noqa: E731
     assert run(oid, epoch, KEY).spawned is True
@@ -293,7 +313,7 @@ def test_a_session_key_that_cannot_be_recorded_never_reaches_the_spawn_seam(rig,
     with pytest.raises(sqlite3.Error, match="disk full"):
         run(third, r3.launch_epoch, "s-" + "3" * 16)
     assert rig.row(third)["session_key"] is None
-    assert calls == [KEY]
+    assert log == [("spawn", KEY), ("release", KEY)]
     with rig.store.write() as c:
         c.execute("DROP TRIGGER t_fail")
 
@@ -313,6 +333,7 @@ def test_a_crash_between_the_key_and_the_spawn_is_ended_by_lapse_recovery(rig):
         assert ctl.takeover(c, oid, lapse) is True
     ended = rig.row(oid)
     assert (ended["state"], ended["reason"], ended["epoch"]) == ("stopped", "crash_recovered", epoch + 1)
+    assert rig.taken(oid) == ([], [("settled",)])                     # P6-5b: takeover settles and frees
     assert _fence_rows(rig, KEY) == [(oid,)]
     with rig.store.read() as c:
         assert fence_now(c) != fence
@@ -431,40 +452,47 @@ def test_a_session_key_is_not_recorded_on_a_lapsed_lease(rig):
     # behaviour (codex HIGH r1 #2): a launch whose lease has lapsed belongs to lapse recovery even before takeover runs;
     # its key is refused and spawn is never called. The same row inside its lease records it.
     calls = []
+    spawn = lambda key: Gate(key, calls)  # noqa: E731
     oid, epoch = _launched(rig)
     lapsed = lambda: rig.now(timedelta(seconds=ctl.LEASE_S + 1))  # noqa: E731
-    assert ctl.start_run(rig.store, oid, epoch, KEY, calls.append, clock=lapsed).spawned is False
+    assert ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=lapsed).spawned is False
     with rig.store.write() as c:
         assert ctl.record_session_key(c, oid, epoch, KEY, rig.now(timedelta(seconds=ctl.LEASE_S))) is False
     assert rig.row(oid)["session_key"] is None and calls == []
     live = lambda: rig.now(timedelta(seconds=ctl.LEASE_S - 1))  # noqa: E731
-    assert ctl.start_run(rig.store, oid, epoch, KEY, calls.append, clock=live).spawned is True
-    assert calls == [KEY]
+    assert ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=live).spawned is True
+    assert calls == [("spawn", KEY), ("release", KEY)]
 
 
-def test_a_takeover_between_the_key_commit_and_the_spawn_leaves_a_session_the_fence_reads_as_stale(rig):
-    # behaviour (the residue of codex HIGH r1 #2, closed downstream): takeover commits after the key and before spawn;
-    # spawn still runs (no suspended child here: P6-5b's), but the fence join finds the row stopped at epoch + 1, so
-    # every call the session makes is refused
+def test_a_takeover_between_the_key_commit_and_the_release_never_lets_the_child_run(rig, tmp_path):
+    # behaviour (P6-5b ruling (ii), closing the residue of codex HIGH r1 #2): takeover commits after the key and after
+    # the gated child exists, before the release; start_run's lease-checked transaction finds the row stopped and
+    # aborts the child, which exits GATE_REFUSED without exec (its marker is never written). The row ends settled with
+    # its slot freed, and the session the key names is still STALE at the fence. The same gate on a live row runs.
     oid, epoch = _launched(rig)
-    seen = []
+    marker = tmp_path / "ran"
+    argv = [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('ran')"]
 
     def spawn(key):
+        child = ctl.GatedChild(argv)
         with rig.store.write() as c:                                     # recovery, in another transaction
             assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1))) is True
-        with rig.store.read() as c:                                      # the fence's join, then its state/epoch read
-            (found,), = c.execute("SELECT occurrence_id FROM agent_occurrences WHERE session_key = ? LIMIT 2",
-                                  (key,)).fetchall()
-            seen.append(c.execute("SELECT state, epoch FROM agent_occurrences WHERE occurrence_id = ?",
-                                  (found,)).fetchone())
-        return "child"
+        return child
 
-    assert ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=rig.now) == ctl.Started(True, None, "child")
-    assert seen == [("stopped", epoch + 1)]
+    started = ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=rig.now)
+    assert started.spawned is False and started.value.process.returncode == ctl.GATE_REFUSED
+    assert not marker.exists()
+    assert (rig.row(oid)["state"], rig.row(oid)["epoch"]) == ("stopped", epoch + 1)
+    assert rig.taken(oid) == ([], [("settled",)])
     fence, fence_now = agent_fence(rig.row(oid) | {"launch_epoch": epoch}, authority=rig.authority, store_id=rig.sid,
                                    now=rig.now)
     with rig.store.read() as c:
         assert fence_now(c) != fence
+    live = rig.claim("k2")
+    result = rig.launch(live)
+    ran = ctl.start_run(rig.store, live, result.launch_epoch, "s-" + "4" * 16, lambda key: ctl.GatedChild(argv),
+                        clock=rig.now)
+    assert ran.spawned is True and ran.value.process.wait(30) == 0 and marker.read_text() == "ran"
 
 
 def test_a_transaction_sqlite_already_rolled_back_raises_its_own_error_not_the_savepoints(rig, tmp_path):
@@ -502,3 +530,455 @@ def test_a_coordinator_slot_with_no_launch_row_is_probed_only_after_its_own_leas
     late = ctl.launch(rig.store, oid, authority=rig.authority, executor=Exec(), window=WINDOW,
                       now=rig.now(timedelta(seconds=slots.LEASE_S)), launch_over=over, session_alive=alive)
     assert late.outcome == "launched"
+
+
+# --- P6-5b: the fire process and c9 (a crash between the launch commit and the first effect) -------------------------
+
+ROOT = str(Path(ctl.__file__).resolve().parents[2])   # the fire imports the levain under test, not an installed one
+ENV = dict(os.environ, PYTHONPATH=ROOT)
+# a fire whose run body (P6-4a's) marks that it began and then blocks: the moment between the claim and the first
+# effect, held open so the test can kill the real process there
+BLOCKING_FIRE = ("import sys, time; from datetime import datetime; from levain.agents import controller as ctl; "
+                 "oid, store, mark, at = sys.argv[1:5]; now = datetime.fromisoformat(at); "
+                 "sys.exit(ctl.fire(store, oid, clock=lambda: now, "
+                 "run=lambda s, o, e: (open(mark, 'w').write(str(e)), time.sleep(120), 9)[2]))")
+
+
+def _settlement(rig: Rig, oid: str) -> tuple:
+    with rig.store.read() as c:
+        return c.execute("SELECT state, debited_usd_micros, settled_reason FROM agent_reservations"
+                         " WHERE occurrence_id = ?", (oid,)).fetchone()
+
+
+def _wait_for(path: Path, proc: subprocess.Popen, seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not path.exists():
+        assert proc.poll() is None, f"the fire exited {proc.returncode} before {path.name}"
+        assert time.monotonic() < deadline, f"no {path.name} in {seconds}s"
+        time.sleep(0.05)
+
+
+def test_c9_the_launcher_dies_before_the_fire_exists_and_lapse_recovery_settles_it(rig):
+    # behaviour (c9, first cut): the launch commits (slot 1, an open reservation of 100_000) and no fire is ever
+    # spawned. Nothing renews the lease; takeover ends the row stopped/crash_recovered at epoch + 1, debits all of the
+    # reservation (unreadable usage, A0 §2.4's lapse row) and frees the slot, which the next launch takes
+    oid, epoch = _launched(rig)
+    assert rig.taken(oid) == ([(1,)], [("open",)]) and rig.row(oid)["pid"] is None
+    with rig.store.write() as c:
+        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1))) is True
+    row = rig.row(oid)
+    assert (row["state"], row["reason"], row["epoch"]) == ("stopped", "crash_recovered", epoch + 1)
+    assert rig.taken(oid) == ([], [("settled",)]) and _settlement(rig, oid) == ("settled", 100_000, "unreadable")
+    with rig.store.write() as c:                                     # a second recovery changes nothing
+        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 2))) is False
+    nxt = rig.claim("k2")
+    assert rig.launch(nxt, later=timedelta(seconds=ctl.LEASE_S + 2)).slot == 1
+
+
+def test_c9_crash_after_launch_commit(rig, tmp_path):
+    # behaviour (c9, the BUILD_PLAN P6-5 Done line): the REAL fire process writes its identity record (matching
+    # process_identity of the live fire), claims its row (pid), and is killed before its first effect; lapse recovery
+    # ends the row stopped/crash_recovered with its slot freed and its reservation settled. A late fire on the settled
+    # row claims nothing and exits 0 having run nothing
+    from levain.consent.delivery import process_identity
+    oid, epoch = _launched(rig)
+    began = tmp_path / "began"
+    argv = [sys.executable, "-c", BLOCKING_FIRE, oid, str(rig.store.directory), str(began), rig.now().isoformat()]
+    proc = ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=ENV)
+    try:
+        _wait_for(began, proc)
+        assert os.getsid(proc.pid) == proc.pid                     # a session leader: no signal of its reaches us
+        record = json.loads(ctl.fire_record_path(rig.store.directory, oid).read_text())
+        assert record["pid"] == proc.pid == rig.row(oid)["pid"] and began.read_text() == str(epoch)
+        assert process_identity(proc.pid) == (record["started"], record["args"]) and oid in record["args"].split()
+        os.killpg(proc.pid, signal.SIGKILL)                         # our own unreaped Popen (BUILD_PLAN §2, rule a)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(30)
+    assert rig.row(oid)["state"] == "launched" and rig.taken(oid) == ([(1,)], [("open",)])
+    with rig.store.write() as c:
+        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1))) is True
+    row = rig.row(oid)
+    assert (row["state"], row["reason"], row["epoch"]) == ("stopped", "crash_recovered", epoch + 1)
+    assert rig.taken(oid) == ([], [("settled",)]) and _settlement(rig, oid) == ("settled", 100_000, "unreadable")
+    ctl.fire_record_path(rig.store.directory, oid).unlink()          # so the late fire reaches its claim
+    late = tmp_path / "late"
+    argv[5] = str(late)
+    assert ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=ENV).wait(60) == 0
+    assert not late.exists() and rig.row(oid)["pid"] == record["pid"]
+
+
+def test_the_fire_entry_claims_once_and_a_second_fire_does_nothing(tmp_path):
+    # behaviour: spawn_fire's default argv (the module entry) runs in its own session, writes its identity record,
+    # claims the row with its pid, and exits FIRE_UNWIRED (no run body until P6-4a). A second fire finds the record,
+    # claims nothing and exits 0; the first fire's identity and pid stay. The entry judges the lease on the real clock,
+    # so the launch is stamped at wall-now (the rig's clock minus the 30 s rig.now adds): the slack is the whole lease.
+    rig = Rig(tmp_path)
+    rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
+    oid, _ = _launched(rig)
+    first = ctl.spawn_fire(rig.store.directory, oid, env=ENV)
+    assert first.wait(60) == ctl.FIRE_UNWIRED
+    assert first.args == ctl.fire_argv(rig.store.directory, oid)
+    record = json.loads(ctl.fire_record_path(rig.store.directory, oid).read_text())
+    assert record["pid"] == first.pid == rig.row(oid)["pid"] and record["args"].split()[-1] == oid
+    assert "no run body is wired" in (Path(rig.store.directory) / "fires" / f"{oid}.log").read_text()
+    second = ctl.spawn_fire(rig.store.directory, oid, env=ENV)
+    assert second.wait(60) == 0
+    assert json.loads(ctl.fire_record_path(rig.store.directory, oid).read_text()) == record
+    assert rig.row(oid)["pid"] == first.pid
+
+
+# --- P6-5b r2: the gated child's lifeline, the commit after the release, the fire's reaper, a dead fire's record -----
+
+# the executor stand-in: holds an exclusive flock on ``lock`` for as long as it lives (the kernel drops it at its
+# death, so the test sees the death without signalling or probing a pid), then says it is up and sleeps
+SLEEPER = ("import fcntl, os, sys, time; f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+           "open(sys.argv[2] + '.t', 'w').write(str(os.getpid())); os.replace(sys.argv[2] + '.t', sys.argv[2]); "
+           "time.sleep(90)")
+# a fire whose run body opens the run through start_run with a GATED sleeper, marks the release, and blocks
+RELEASING_FIRE = ("import sys, time; from datetime import datetime; from levain.agents import controller as ctl\n"
+                  "oid, store, mark, at, key, *child = sys.argv[1:]; now = datetime.fromisoformat(at)\n"
+                  "def run(s, o, e):\n"
+                  "    started = ctl.start_run(s, o, e, key, lambda k: ctl.GatedChild(child), clock=lambda: now)\n"
+                  "    open(mark, 'w').write(str(started.spawned)); time.sleep(120); return 9\n"
+                  "sys.exit(ctl.fire(store, oid, clock=lambda: now, run=run))")
+
+
+def _sleeper(tmp_path: Path) -> tuple[list[str], Path, Path]:
+    lock, up = tmp_path / "sleeper.lock", tmp_path / "sleeper.up"
+    return [sys.executable, "-c", SLEEPER, str(lock), str(up)], lock, up
+
+
+def _ended(lock: Path, seconds: float = 15.0) -> bool:
+    """True once nobody holds ``lock`` (the sleeper is dead), within ``seconds``."""
+    import fcntl
+    deadline = time.monotonic() + seconds
+    with open(lock, "a") as f:
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    return False
+                time.sleep(0.05)
+
+
+def _reap_stray(lock: Path, up: Path) -> None:
+    # test hygiene only: a sleeper a failing case left alive is killed, so no 90 s process outlives the test
+    if up.exists() and not _ended(lock, 0):
+        os.kill(int(up.read_text()), signal.SIGKILL)
+
+
+def test_a_fire_killed_after_the_release_takes_its_executor_with_it(rig, tmp_path):
+    # behaviour (codex HIGH r1 #1, the lifeline): the REAL fire claims, opens the run through start_run and releases
+    # a gated executor (a sleeper in its own session), then is SIGKILLed. The gate keeps the pipe's read end after
+    # the release and only the fire holds the write end, so the fire's death EOFs it and the gate ends its own process
+    # group: the executor exits, and nothing the takeover then settles keeps running
+    oid, epoch = _launched(rig)
+    child, lock, up = _sleeper(tmp_path)
+    released = tmp_path / "released"
+    argv = [sys.executable, "-c", RELEASING_FIRE, oid, str(rig.store.directory), str(released), rig.now().isoformat(),
+            KEY, *child]
+    proc = ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=ENV)
+    try:
+        _wait_for(released, proc)
+        _wait_for(up, proc)
+        assert released.read_text() == "True" and not _ended(lock, 0)          # the executor runs
+        sleeper = int(up.read_text())
+        assert os.getsid(sleeper) != os.getsid(proc.pid)                       # outside the fire's session
+        os.killpg(proc.pid, signal.SIGKILL)                                    # our own unreaped Popen (rule a)
+        proc.wait(30)
+        assert _ended(lock), "the executor outlived its fire"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(30)
+        _reap_stray(lock, up)
+    with rig.store.write() as c:
+        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1))) is True
+    assert rig.taken(oid) == ([], [("settled",)]) and _settlement(rig, oid) == ("settled", 100_000, "unreadable")
+
+
+def test_a_released_child_runs_until_its_holder_lets_go_and_exits_with_the_executors_status(tmp_path):
+    # behaviour: after the release the executor runs while the holder keeps its end; abort() then ends the run (the
+    # gate kills the executor's group before it exits), and an executor that exits on its own hands its status to the
+    # holder's wait
+    child, lock, up = _sleeper(tmp_path)
+    gated = ctl.GatedChild(child)
+    try:
+        gated.release()
+        _wait_for(up, gated.process)
+        assert not _ended(lock, 0.3)
+        gated.abort()
+        assert _ended(lock)
+    finally:
+        _reap_stray(lock, up)
+    own = ctl.GatedChild([sys.executable, "-c", "import sys; sys.exit(7)"])
+    own.release()
+    assert own.process.wait(30) == 7
+    killed = ctl.GatedChild([sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"])
+    killed.release()
+    assert killed.process.wait(30) == 128 + signal.SIGTERM
+    missing = ctl.GatedChild([str(tmp_path / "no-such-program")])
+    missing.release()
+    assert missing.process.wait(30) == 127
+
+
+def test_a_commit_that_fails_after_the_release_aborts_the_child_and_raises_the_commit_error(rig, monkeypatch):
+    # behaviour (codex MED r1 #3, deepseek MED #1): the release ran inside the transaction and its COMMIT then
+    # fails: start_run aborts the released child (the lifeline ends the run) and raises the commit's error; an
+    # abort that itself fails rides on it as a note, never in its place (complement LOW r1 #3)
+    oid, epoch = _launched(rig)
+    real, log = rig.store.write, []
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def write():
+        before = len(log)
+        with real() as c:
+            yield c
+        if any(entry[0] == "release" for entry in log[before:]):
+            raise sqlite3.OperationalError("commit failed")      # the transaction the release ran inside
+
+    monkeypatch.setattr(rig.store, "write", write)
+    with pytest.raises(sqlite3.OperationalError, match="commit failed"):
+        ctl.start_run(rig.store, oid, epoch, KEY, lambda key: Gate(key, log), clock=rig.now)
+    assert log == [("spawn", KEY), ("release", KEY), ("abort", KEY)]
+
+    class Stuck(Gate):
+        def abort(self):
+            super().abort()
+            raise ChildProcessError("wait failed")
+
+    rig.finish(oid)
+    other = rig.claim("k2")
+    result = rig.launch(other)
+    with pytest.raises(sqlite3.OperationalError, match="commit failed") as err:
+        ctl.start_run(rig.store, other, result.launch_epoch, "s-" + "5" * 16, lambda key: Stuck(key, log),
+                      clock=rig.now)
+    assert any("wait failed" in note for note in err.value.__notes__)
+
+
+def test_a_fire_nobody_waits_on_is_reaped_by_the_launcher(rig, tmp_path):
+    # behaviour (complement MED r1 #3, codex MED #4): spawn_fire's caller never waits on the fire, and the fire
+    # still leaves no zombie: the launcher reaps it as it exits (returncode set with no wait or poll by the test,
+    # and the pid is no longer this process's child)
+    oid, _ = _launched(rig)
+    proc = ctl.spawn_fire(rig.store.directory, oid, argv=[sys.executable, "-c", "pass"], env=ENV)
+    deadline = time.monotonic() + 30
+    while proc.returncode is None:
+        assert time.monotonic() < deadline, "the fire was never reaped"
+        time.sleep(0.05)
+    assert proc.returncode == 0
+    with pytest.raises(ChildProcessError):
+        os.waitpid(proc.pid, os.WNOHANG)
+
+
+def test_a_record_left_by_a_dead_fire_is_replaced_and_a_live_fires_is_not(rig, tmp_path):
+    # behaviour (complement LOW r1 #2): a fire killed after its identity link and before its claim leaves a record
+    # naming a process that is gone; the next fire replaces it (under the record's lock, so two fires never unlink
+    # each other's) and claims. A record naming a LIVE process is never replaced: that fire exits 0, claiming nothing.
+    # (A dead fire that DID claim keeps its record: the fire-entry test's second fire.)
+    from levain.consent.delivery import process_identity
+    oid, epoch = _launched(rig)
+    path = ctl.fire_record_path(rig.store.directory, oid)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    started, args = process_identity(os.getpid())
+    live = {"occurrence_id": oid, "pid": os.getpid(), "started": started, "args": args}
+    path.write_text(json.dumps(live))
+    began = tmp_path / "began"
+    argv = [sys.executable, "-c", BLOCKING_FIRE, oid, str(rig.store.directory), str(began), rig.now().isoformat()]
+    assert ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=ENV).wait(60) == 0
+    assert json.loads(path.read_text()) == live and rig.row(oid)["pid"] is None and not began.exists()
+    dead = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    gone = {"occurrence_id": oid, "pid": dead.pid, "started": process_identity(dead.pid)[0], "args": "x " + oid}
+    dead.kill()
+    dead.wait(30)
+    path.write_text(json.dumps(gone))
+    proc = ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=ENV)
+    try:
+        _wait_for(began, proc)
+        assert json.loads(path.read_text())["pid"] == proc.pid == rig.row(oid)["pid"]
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(30)
+
+
+# --- P6-5b r3: the executor's own process group, the gate's signal handlers, a fire whose reaper cannot start -------
+
+# an executor stand-in that backgrounds a SLEEPER (same process group, as a tool's child would be), waits for it to be
+# up, gives the test a second to read its group, and exits 5 on its own
+FORKING_EXECUTOR = ("import os, subprocess, sys, time; subprocess.Popen([sys.executable, '-c', sys.argv[1], *sys.argv[2:]]); "
+                    "[time.sleep(0.05) for _ in range(600) if not os.path.exists(sys.argv[3])]; time.sleep(1); sys.exit(5)")
+
+
+def _group_gone(pgid: int) -> bool:
+    """True when no process is left in group ``pgid`` (read the instant the gate was reaped: the gate's own exit,
+    not a later kill, must be what ended it)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def test_an_executor_that_exits_on_its_own_takes_its_backgrounded_children_with_it(tmp_path):
+    # behaviour (codex HIGH r2): the executor leads a process group of its own, apart from the gate's; when it exits on
+    # its own, the gate SIGKILLs what it left in that group (a backgrounded child) and exits with the executor's status
+    # only once that group is gone: no descendant outlives the gate unguarded
+    _, lock, up = _sleeper(tmp_path)
+    gated = ctl.GatedChild([sys.executable, "-c", FORKING_EXECUTOR, SLEEPER, str(lock), str(up)])
+    try:
+        gated.release()
+        _wait_for(up, gated.process)
+        group = os.getpgid(int(up.read_text()))
+        assert group != gated.process.pid                             # the executor's group is not the gate's
+        assert gated.process.wait(30) == 5
+        assert _group_gone(group), "the gate exited before the executor's group was gone"
+        assert _ended(lock, 0), "a backgrounded child outlived the gate"
+    finally:
+        _reap_stray(lock, up)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+def test_a_signal_to_the_gate_ends_the_executors_group_first(tmp_path, sig):
+    # behaviour (complement MED r2): ``process`` is the gate, so an executor's stop() that signals its pid reaches the
+    # gate, not the executor; the gate kills the executor's group, waits for it to be gone, and exits 128 + the signal
+    child, lock, up = _sleeper(tmp_path)
+    gated = ctl.GatedChild(child)
+    try:
+        gated.release()
+        _wait_for(up, gated.process)
+        group = os.getpgid(int(up.read_text()))
+        assert group != gated.process.pid                             # the executor is not in the gate's group
+        os.kill(gated.process.pid, sig)
+        assert gated.process.wait(30) == 128 + sig
+        assert _group_gone(group), "the gate exited before the executor's group was gone"
+        assert _ended(lock, 0), "the executor outlived its gate's signal"
+    finally:
+        _reap_stray(lock, up)
+
+
+def test_a_gate_killed_outright_still_takes_the_executor_with_it(tmp_path):
+    # behaviour: the gate cannot catch SIGKILL; the executor group's anchor holds a pipe only the gate writes, so the
+    # gate's death EOFs it and the anchor SIGKILLs the group. The gate's status is then the signal (-9), never >= 0: a
+    # non-negative status is the proof the group is gone
+    child, lock, up = _sleeper(tmp_path)
+    gated = ctl.GatedChild(child)
+    try:
+        gated.release()
+        _wait_for(up, gated.process)
+        os.kill(gated.process.pid, signal.SIGKILL)
+        assert gated.process.wait(30) == -signal.SIGKILL
+        assert _ended(lock), "the executor outlived its gate's SIGKILL"
+    finally:
+        _reap_stray(lock, up)
+
+
+def test_a_fire_whose_reaper_cannot_start_is_killed_and_reaped_before_the_error(rig, monkeypatch):
+    # behaviour (codex MED r2): Popen started the fire and the reaper thread then failed to start; spawn_fire kills the
+    # fire's process group, reaps it and re-raises, so no fire runs with no owner. The failure is injected through
+    # controller's own thread seam (codex-test LOW r3), never by patching the threading or subprocess modules
+    made = []
+
+    class NoThread:
+        def __init__(self, *, target, **_):
+            made.append(target.__self__)                              # target is the fire's Popen.wait
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    oid, _ = _launched(rig)
+    monkeypatch.setattr(ctl, "_thread_factory", NoThread)
+    try:
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            ctl.spawn_fire(rig.store.directory, oid, argv=[sys.executable, "-c", "import time; time.sleep(60)"],
+                           env=ENV)
+        (fire,) = made
+        assert fire.returncode == -signal.SIGKILL, "the ownerless fire was left running"
+        with pytest.raises(ChildProcessError):
+            os.waitpid(fire.pid, os.WNOHANG)
+    finally:
+        for fire in made:
+            if fire.returncode is None:
+                fire.kill()
+                fire.wait(30)
+
+
+# --- P6-5b r4: the gate's setup failure path, a late signal, the drain's deadline ------------------------------------
+
+def _gate_variant(source: str, old: str, new: str) -> str:
+    """The gate with one injected change (the gate runs in a ``python -I`` child, so its source is the only seam)."""
+    assert source.count(old) == 1, f"the gate no longer contains {old!r} exactly once"
+    return source.replace(old, new)
+
+
+_GATE_PRELUDE = "import os, signal, sys, threading, time\n"
+
+
+@pytest.mark.parametrize("old, new", [
+    ("threading.Thread(", "no_thread("),                              # the reaper thread cannot even be made
+    ("signal.signal(s, on_signal)", "no_thread(s)"),                  # the reaper runs; a handler cannot be installed
+], ids=["thread-construction", "handler-install"])
+def test_a_gate_whose_setup_fails_after_the_fork_ends_the_group_and_exits_unproven(tmp_path, monkeypatch, old, new):
+    # behaviour (codex MED r3): a failure anywhere after the executor's fork kills and reaps the executor's group before
+    # the gate exits, and the gate's status is GATE_UNPROVEN, never a status a stop() may read as a termination proof.
+    # The injected failure waits until the executor is up (holding its flock), so its death is the gate's doing
+    child, lock, up = _sleeper(tmp_path)
+    raises = (_GATE_PRELUDE + "def no_thread(*a, **k):\n"
+              f"    [time.sleep(0.05) for _ in range(600) if not os.path.exists({str(up)!r})]\n"
+              "    raise MemoryError('injected')\n")
+    monkeypatch.setattr(ctl, "_GATE", _gate_variant(_gate_variant(ctl._GATE, _GATE_PRELUDE, raises), old, new))
+    gated = ctl.GatedChild(child)
+    try:
+        gated.release()
+        assert gated.process.wait(60) == ctl.GATE_UNPROVEN
+        executor = int(up.read_text())
+        assert _ended(lock, 0), "the executor outlived the gate's failed setup"
+        with pytest.raises(ProcessLookupError):                       # reaped by the gate itself, not left a zombie
+            os.kill(executor, 0)
+        assert ctl.GATE_UNPROVEN not in (0, ctl.GATE_REFUSED, ctl.GATE_NO_EXEC) and ctl.GATE_UNPROVEN < 128
+    finally:
+        gated.abort(1)
+        _reap_stray(lock, up)
+
+
+def test_a_signal_after_the_reaper_took_the_executors_status_does_not_replace_it(tmp_path, monkeypatch):
+    # behaviour (complement D3 r3): the executor exits 3 on its own and the reaper takes that status; a SIGTERM to the
+    # gate that lands after that (held open here by an injected pause) must not turn the exit into 128 + SIGTERM
+    taken = tmp_path / "taken"
+    monkeypatch.setattr(ctl, "_GATE", _gate_variant(
+        ctl._GATE, "    ending.acquire()\n",
+        f"    ending.acquire()\n    open({str(taken)!r}, 'w').close()\n    time.sleep(1.5)\n"))
+    gated = ctl.GatedChild([sys.executable, "-c", "import sys; sys.exit(3)"])
+    try:
+        gated.release()
+        _wait_for(taken, gated.process)
+        os.kill(gated.process.pid, signal.SIGTERM)
+        assert gated.process.wait(30) == 3
+    finally:
+        gated.abort(1)
+
+
+def test_a_group_that_never_drains_exits_unproven_at_the_deadline(tmp_path, monkeypatch):
+    # behaviour (complement D1 r3): a group whose members never leave (on Linux, zombies under a PID 1 that does not
+    # reap still count; simulated by a probe that always answers) does not hold the gate forever: past the drain
+    # deadline it exits GATE_UNPROVEN, which a stop() must not read as a termination proof
+    assert ctl._GATE == ctl._gate(ctl.GATE_DRAIN_S) and ctl.GATE_DRAIN_S == 10.0
+    monkeypatch.setattr(ctl, "_GATE", _gate_variant(ctl._gate(0.3), "os.killpg(anchor, 0)", "os.kill(os.getpid(), 0)"))
+    gated = ctl.GatedChild([sys.executable, "-c", "import sys; sys.exit(0)"])
+    try:
+        gated.release()
+        assert gated.process.wait(15) == ctl.GATE_UNPROVEN
+    finally:
+        gated.abort(1)
+
+
+@pytest.mark.parametrize("rc,want", [
+    (None, False), (True, False), (False, False), (-9, False), (-15, False), (0, True), (1, True),
+    (76, False), (127, True), (143, True), (255, True),
+])
+def test_gate_proves_termination(rc, want):
+    assert ctl.gate_proves_termination(rc) is want

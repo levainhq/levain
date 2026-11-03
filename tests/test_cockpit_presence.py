@@ -359,7 +359,7 @@ def test_the_page_carries_the_chip_and_the_script_the_sheet_and_no_client_name()
     js = _asset("devices_panel.js")
     for needle in ("/webpush/presence", "/webpush/presence/set", "/webpush/presence/token/new", "/webpush/presence/token/revoke",
                    "Tap tokens", "X-Levain-Presence-Token", "Copy", "presence-settings", "pr-settings-grid", "Standing default",
-                   "Lets through", "My next input", "chip.word"):
+                   "Lets through", "Until I say or type", "chip.word"):
         assert needle in js, needle
     for gone in ("Pings go to", "buildPolicy", "/webpush/policy", "route_source", "PR_ROUTES"):   # the route row and the policy block are gone
         assert gone not in js, gone
@@ -380,7 +380,7 @@ def test_the_chip_reads_the_record_and_the_sheet_posts_each_body_and_repaints_fr
              "until": f"{_CHIP_TEXT}.startsWith('Quiet 1')", "ms": 8000},
             {"eval": "[document.getElementById('pr-sheet').hidden, localStorage.getItem('levain_presence_for'), document.querySelector('.pr-sheet-text').textContent]"},
             {"do": "document.querySelector('.pr-sheet-word[data-value=\"away\"]').click()", "until": f"{_CHIP_TEXT}.startsWith('Away')", "ms": 8000},
-            # a setting with Until = My next input: an overlay with no preset, then the choice goes back to I switch it
+            # a setting with Until = Until I say or type: an overlay with no preset, then the choice goes back to I switch it
             {"do": "document.querySelector('#pr-sheet [aria-label=\"How long the next setting you tap lasts\"] [data-value=\"input\"]').click(); "
                    "document.querySelector('#pr-sheet [aria-label=\"What reaches your devices\"] [data-value=\"approvals\"]').click()",
              "until": f"{_CHIP_TEXT}.startsWith('For a while')", "ms": 8000},
@@ -396,7 +396,7 @@ def test_the_chip_reads_the_record_and_the_sheet_posts_each_body_and_repaints_fr
     assert v[2] == ["Away", "Back", "Quiet", "Sleep", "Loud"]
     assert v[4] is True and v[5].startswith("Pings now: ")                 # focus in the sheet, which opens on the server's own line
     assert v[7][0] is False and v[7][1] == "2h" and "quiet" in v[7][2]     # the sheet stays open to show the new line; the pick is remembered
-    assert "Lets through: approvals only" in v[10][0] and "your next input" in v[10][0] and v[10][1] == "switch"
+    assert "Lets through: Approvals only" in v[10][0] and "a message you type into a session" in v[10][0] and v[10][1] == "switch"
     assert v[-1] is True
     rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
     assert [r["word"] for r in rows][:3] == ["quiet", "away", "set lets approvals until input"]

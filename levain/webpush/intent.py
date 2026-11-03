@@ -20,8 +20,9 @@ One lock (the presence lock, ``<queue>/webpush/.presence.lock``), one event stre
 ``presence.log.jsonl``), one decider (:func:`should_push` in :mod:`levain.webpush.presence` calls :func:`_core` here) and one
 sentence (:func:`describe_line`), printed verbatim by every surface. Consent asks the same decider
 (:func:`approvals_route`), so a push and a hold diverge in one named case only: a ``follow`` that pushes for want of a
-laptop input reading does not hold (the line's ``Approvals:`` clause says so). A write against a record that cannot be
-read is refused, never replaced.
+laptop input reading does not hold (the line's ``Approvals:`` clause says so). A prompt left to the agent's own dialog
+still sends a NOTICE to the devices whenever ``lets_through`` admits approvals (:func:`approval_notice`): a notice, never
+a hold. A write against a record that cannot be read is refused, never replaced.
 
 Stdlib only.
 """
@@ -38,13 +39,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 from levain.webpush import desk, presence
-from levain.webpush.presence import (ACTIVE_WINDOW_SECS, AWAY_GRACE_SECS, COORDINATOR_WORDS, MAX_SECS, MIN_SECS, SEAT_WORDS,
-                                     SLEEP_BLIND_SECS, TIMED, WORDS, Decision, PresenceError, kind_class, parse_duration)
+from levain.webpush.presence import (ACTIVE_WINDOW_SECS, COORDINATOR_WORDS, MAX_SECS, MIN_SECS, SEAT_WORDS,
+                                     TIMED, WORDS, Decision, PresenceError, kind_class, parse_duration)
 
 __all__ = ["VERSION", "FILE_NAME", "BACKUP_DIR", "DEVICES", "LETS", "LETS_CLASSES", "FOLLOW_DEFAULT", "FOLLOW_MIN",
            "FOLLOW_MAX", "PRESET_TABLE", "overlay_active", "overlay_ended", "devices_on_now", "decide", "read", "view",
-           "describe_line", "approvals_to_devices", "approvals_route", "apply_preset", "apply_settings", "read_changes", "migrate",
-           "unmigrate", "legacy_word", "from_legacy"]
+           "describe_line", "approvals_to_devices", "approvals_route", "approval_notice", "apply_preset", "apply_settings", "read_changes", "migrate",
+           "unmigrate", "legacy_word", "from_legacy", "read_sample"]
 
 VERSION = 1
 FILE_NAME = "intent.json"
@@ -60,7 +61,7 @@ LETS_CLASSES = {"everything": frozenset({"approval", "attention", "other"}),
                 "needs": frozenset({"approval", "attention"}),
                 "approvals": frozenset({"approval"}),
                 "nothing": frozenset()}
-_LETS_WORDS = {"everything": "everything", "needs": "needs only", "approvals": "approvals only", "nothing": "nothing"}
+_LETS_WORDS = {"everything": "Everything", "needs": "Approvals and needs", "approvals": "Approvals only", "nothing": "Nothing"}
 # what each preset writes (devices is always `on`; follow_after is the base's; `back` and `loud off` write nothing)
 PRESET_TABLE = {"away": {"devices": "on", "lets_through": "everything", "until": "input"},
                 "quiet": {"devices": "on", "lets_through": "needs", "until": "timer"},
@@ -215,9 +216,10 @@ def read(queue_dir: Path | str | None, now: float | None = None) -> dict:
 # --------------------------------------------------------------------------------------------------- the pure rules
 def overlay_ended(rec: dict, now: float, last_input_at: float | None, desk_msg_at: float | None) -> str | None:
     """Why the overlay in ``rec`` (a :func:`read` result) has ended at ``now``, or ``None`` while it stands (or when there is
-    no overlay). ``timer``: ``now`` past ``at``. ``input``: a desk message after the overlay's ``ts`` (no grace), or laptop
-    input after ``ts + AWAY_GRACE_SECS`` (the parting instruction), or, with no laptop reading at all, ``SLEEP_BLIND_SECS`` after
-    ``ts``. Remote input never ends it. Pure."""
+    no overlay). ``timer``: ``now`` past ``at``. ``desk message``: a typed turn into a session after the overlay's ``ts`` (no
+    grace). An until-input overlay (an explicit word, away / sleep or a setting) STANDS until another word of his or that
+    typed turn (Phill np-a93deaf7 "2a", 11-02): sensed laptop input, fresh or stale, present or missing, never ends it.
+    Remote input never ends it. Pure."""
     ov = rec.get("overlay")
     if ov is None:
         return None
@@ -226,9 +228,7 @@ def overlay_ended(rec: dict, now: float, last_input_at: float | None, desk_msg_a
         return "timer" if now >= until["at"] else None
     if desk_msg_at is not None and desk_msg_at > ov["ts"]:
         return "desk message"
-    if last_input_at is None:
-        return "no input reading for an hour" if now >= ov["ts"] + SLEEP_BLIND_SECS else None
-    return "input at the laptop" if last_input_at > ov["ts"] + AWAY_GRACE_SECS else None
+    return None
 
 
 def overlay_active(rec: dict, now: float, last_input_at: float | None, desk_msg_at: float | None) -> bool:
@@ -285,15 +285,17 @@ def _eff(rec: dict, now: float, reading: float | None, desk_msg_at: float | None
 
 
 def decide(now: float, rec: dict, reading: float | None, *, class_name: str, remote: dict | None = None,
-           desk_msg_at: float | None = None) -> Decision:
+           desk_msg_at: float | None = None, filed: bool = False) -> Decision:
     """Whether a ping of ``class_name`` is pushed at ``now``. Pure. ``rec`` is a :func:`read` result; ``reading`` the laptop
-    idle seconds with a desk message counted as input. A fault reads as push (a ping he did not need costs one
-    notification, one he needed and never got costs the day)."""
-    return _decide(now, rec, reading, class_name, remote, desk_msg_at)[0]
+    idle seconds with a desk message counted as input. ``filed``: the ping is about a request already FILED and waiting
+    for a signed answer (an approval-class ping from a consent hook or gate), which goes whatever the desk or devices
+    setting is doing (only a mute holds it). A fault reads as push (a ping he did not need costs one notification, one
+    he needed and never got costs the day)."""
+    return _decide(now, rec, reading, class_name, remote, desk_msg_at, filed)[0]
 
 
 def _decide(now: float, rec: dict, reading: float | None, class_name: str, remote: dict | None,
-            desk_msg_at: float | None) -> tuple[Decision, str]:
+            desk_msg_at: float | None, filed: bool = False) -> tuple[Decision, str]:
     if rec["status"] == "fault":
         return Decision(True, "pushing", _FAULT_WHY), "measured"
     eff, ov, _ended = _eff(rec, now, reading, desk_msg_at)
@@ -305,6 +307,16 @@ def _decide(now: float, rec: dict, reading: float | None, class_name: str, remot
         return Decision(False, "muted", f"{label}: lets through {_LETS_WORDS[eff['lets_through']]}", preset or "lets"), source
     if on:
         return Decision(True, "pushing", why, preset), source
+    if class_name == "attention":
+        # Phill 10-27: an attention item pings his phone "even when pings are not otherwise on" (the desk being active, or devices
+        # off, holds the other classes, never this one); only a mute (lets_through) holds it, above.
+        return Decision(True, "pushing", "an attention item reaches your devices whatever the desk is doing", preset), source
+    if filed and class_name == "approval":
+        # Phill 11-02 (np-e642162b (a)): "yes we DO want these to be able to find us ASAP". A request already filed and
+        # held for a signed answer has no dialog to fall back to, so its ping is the only way it finds him. This is the
+        # PING's decision only: the hold's question (approvals_to_devices, approvals_route) never passes ``filed``.
+        return Decision(True, "pushing", "a filed request waits on your signed answer: it reaches your devices "
+                                         "whatever the desk is doing", preset), source
     return Decision(False, "holding", why), source
 
 
@@ -335,13 +347,28 @@ def _sample(queue_dir: Path | str | None, now: float, idle: Callable[[], float |
             "remote": remote}
 
 
+def read_sample(queue_dir: Path | str | None, now: float | None = None,
+                idle: Callable[[], float | None] | None = None) -> dict:
+    """The ONE public reading of the presence rule's inputs, for callers outside levain (flow's phone bridge). One sample:
+    ``record`` (a :func:`read` result), ``reading`` (the laptop's input idle seconds, a desk message counted in; ``None``
+    when unknown), ``last_input_at`` (that reading as a clock time), ``desk_message_at``, ``remote`` (the fresh
+    remote-activity record or ``None``), ``overlay_active`` (whether the record's overlay stands at ``now``) and ``now``.
+    Raises what :func:`read` and the sensor raise; callers decide how a fault reads."""
+    t = time.time() if now is None else now
+    smp = _sample(queue_dir, t, idle)
+    last = _last_input(t, smp["reading"])
+    return {"record": smp["rec"], "reading": smp["reading"], "last_input_at": last, "desk_message_at": smp["msg_at"],
+            "remote": smp["remote"], "overlay_active": overlay_active(smp["rec"], t, last, smp["msg_at"]), "now": t}
+
+
 def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Callable[[], float | None] | None,
-          suggest: bool, remote: object = _UNSET, raw: object = _UNSET) -> tuple[Decision, str, dict]:
+          suggest: bool, remote: object = _UNSET, raw: object = _UNSET, filed: bool = False) -> tuple[Decision, str, dict]:
     """The one place the rule is read: ``(decision, source, sample)``. Both :func:`presence.should_push` and the status
-    (:func:`view`) call it, so the push and the line cannot diverge. Raises on a fault; the callers read that as push."""
+    (:func:`view`) call it, so the push and the line cannot diverge. ``filed``: see :func:`decide`. Raises on a fault;
+    the callers read that as push."""
     at = time.time() if now is None else now
     s = _sample(queue_dir, at, idle, raw=raw, remote=remote)
-    d, source = _decide(at, s["rec"], s["reading"], kind_class(kind), s["remote"], s["msg_at"])
+    d, source = _decide(at, s["rec"], s["reading"], kind_class(kind), s["remote"], s["msg_at"], filed)
     if suggest:   # a delivery: keep what it saw and said, and the event rows (never a fault of the rule)
         try:
             ov = s["rec"]["overlay"] if source == "word" else None
@@ -385,6 +412,22 @@ def approvals_route(queue_dir: Path | str | None, *, now: float | None = None,
     return True, d.why, _blind(s, eff)
 
 
+def approval_notice(queue_dir: Path | str | None, *, now: float | None = None,
+                    idle: Callable[[], float | None] | None = None) -> tuple[bool, str]:
+    """``(send, why)``: whether a NOTICE that an approval prompt waits in the agent's own dialog goes to his devices
+    (Phill 11-02, np-e642162b (a): *"yes we DO want these to be able to find us ASAP"*). It goes whenever the record's
+    ``lets_through`` admits approvals, whatever the desk or the devices setting is doing; only a mute holds it. It
+    starts no hold and is not :func:`approvals_to_devices` (the hold's question, unchanged): the dialog stays where
+    the agent asked. Read from the same one sample as the decider (:func:`_core`); a fault reads as send, as
+    :func:`presence.should_push` reads it."""
+    at = time.time() if now is None else now
+    try:
+        d, _source, _s = _core(queue_dir, "consent", at, idle, False)
+    except Exception:  # noqa: BLE001 - the same fault rule as should_push
+        return True, presence._FAULT
+    return d.state != "muted", d.why
+
+
 # --------------------------------------------------------------------------------------------------- the describe line
 def _base_text(base: dict) -> str:
     d = base["devices"]
@@ -394,16 +437,14 @@ def _base_text(base: dict) -> str:
     return text
 
 
-def _until_text(rec: dict, ov: dict | None, now: float, blind: bool) -> str:
+def _until_text(rec: dict, ov: dict | None, now: float) -> str:
     if ov is None:
         return "I switch it"
     then = _base_text(rec["base"])
     u = ov["until"]
     if u["kind"] == "timer":
         return f"{_clock(u['at'], now)} (then {then})"
-    if blind:
-        return f"your next input, or {_clock(ov['ts'] + SLEEP_BLIND_SECS, now)} with no input reading (then {then})"
-    return f"your next input at the laptop (then {then})"
+    return f"another word of yours or a message you type into a session (then {then})"
 
 
 def _who_text(ov: dict | None) -> str:
@@ -451,10 +492,17 @@ def _line(queue_dir: Path | str | None, s: dict, st: dict, *, approvals: str | N
     where = "your devices" if st["goes"] else "the desk only"
     if st["goes"] and lets in ("needs", "approvals"):
         where += f", {_LETS_WORDS[lets]}"
+    if not st["goes"]:
+        # what reaches the devices whatever the desk is doing: an attention item (Phill 10-27), the notice that an
+        # approval prompt waits in the agent's own dialog (Phill 11-02, approval_notice) and the ping about a request
+        # filed and held for a signed answer (the same ruling, decide's ``filed``); a mute holds all of them
+        through = [w for c, w in (("approval", "approval prompts"), ("attention", "attention items"))
+                   if c in LETS_CLASSES[lets]]
+        if through:
+            where += ", except " + " and ".join(through)
     dev = {"on": "on", "off": "off"}.get(eff["devices"]) or f"follow, after {_mins(eff['follow_after'])}"
-    blind = ov is not None and ov["until"]["kind"] == "input" and s["reading"] is None
     line = (f"Pings now: {where} ({st['why']}). Devices: {dev}. Lets through: {_LETS_WORDS[lets]}. "
-            f"Until: {_until_text(rec, ov, now, blind)}.")
+            f"Until: {_until_text(rec, ov, now)}.")
     if approvals:
         line += f" Approvals: {approvals}."
     if held_n:

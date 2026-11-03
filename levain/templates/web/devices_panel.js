@@ -505,17 +505,17 @@
   // every POST /webpush/presence/set returns the same view after the write. Nothing here composes the sentence or keeps a state of
   // its own: what the cockpit shows after a tap is what `levain ping status` prints at that instant.
   // Writes: {preset, for?} (away back quiet sleep loud) or {devices?, follow_after?, lets_through?, until}; `until` is "switch"
-  // (the standing default, base), "input" (my next input at the laptop) or a duration (15m, 1h, 90m).
+  // (the standing default, base), "input" (my next word, or a message I type into a session) or a duration (15m, 1h, 90m).
   const PR_PRESETS = [["away", "Away"], ["back", "Back"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"]];
-  const PR_GLOSS = { away: "devices on until your next input at the laptop", back: "your standing default again",
-                     quiet: "only what needs you reaches you, for a while", sleep: "only what needs you reaches you, until your next input",
+  const PR_GLOSS = { away: "devices on until your next word or a message you type into a session", back: "your standing default again",
+                     quiet: "only what needs you reaches you, for a while", sleep: "only what needs you reaches you, until your next word or a message you type into a session",
                      loud: "everything reaches you, for a while" };
   const PR_TIMED = ["quiet", "loud"];
   const PR_DURS = ["15m", "1h", "2h"];
   const PR_DEVICES = [["on", "On"], ["follow", "Follow"], ["off", "Off"]];
   const PR_AFTER = [5, 10, 15, 30, 60];                  // minutes of no input before follow turns devices on
-  const PR_LETS = [["everything", "Everything"], ["needs", "Needs only"], ["approvals", "Approvals only"], ["nothing", "Nothing"]];
-  const PR_UNTILS = [["switch", "I switch it"], ["for", "For…"], ["input", "My next input"]];
+  const PR_LETS = [["everything", "Everything"], ["needs", "Approvals and needs"], ["approvals", "Approvals only"], ["nothing", "Nothing"]];
+  const PR_UNTILS = [["switch", "I switch it"], ["for", "For…"], ["input", "Until I say or type"]];
   // the tap-token form names the words the server knows: the presets, and the two aliases (desk = follow, devices = on)
   const PR_TAP_WORDS = [["back", "Back"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"],
                         ["desk", "Desk (follow)"], ["devices", "Devices (on)"]];
@@ -591,7 +591,10 @@
     prSheet.id = "pr-sheet";
     prSheet.setAttribute("role", "dialog");
     prSheet.setAttribute("aria-label", "Presence");
+    prSheet.setAttribute("data-sheet-dismiss", "(max-width: 720px)");   // a bottom sheet on a phone: dragged down it closes (dashboard_core.js)
+    prSheet.addEventListener("levain:sheet-dismiss", (e) => { e.preventDefault(); closeSheet(true); });
     prSheet.hidden = true;
+    prSheet.appendChild(el("div", "sheet-grabber"));
     prSheetText = el("p", "pr-sheet-text");        // THE line, verbatim from the server
     prSheetText.setAttribute("aria-live", "polite");
     prSheet.appendChild(prSheetText);

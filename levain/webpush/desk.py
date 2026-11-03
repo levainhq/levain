@@ -143,7 +143,7 @@ def note_desk_message(queue_dir: Path | str, source: str, *, desk: str | None = 
     """The operator sent a message to a desk from the laptop. It is laptop input: it records the message as activity
     (:func:`adjust_reading`), ends an ``until: input`` overlay (``away``, ``sleep``) by READING and never by writing the intent
     record, and leaves one presence-log row. ``source`` names the caller (required). Returns ``{at, ended, cleared}``
-    (``ended``: the preset it ended, ``"setting"`` for a setting made until his next input, else ``None``; ``cleared`` is the
+    (``ended``: the preset it ended, ``"setting"`` for a setting made until his next typed message, else ``None``; ``cleared`` is the
     same value, for callers that read the old key). An older message than the one on file never replaces it. Raises
     :class:`PresenceError` for a missing source or a lock/file fault: the caller decides whether that matters."""
     src = str(source or "").strip()

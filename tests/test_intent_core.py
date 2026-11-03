@@ -63,20 +63,19 @@ def test_follow_pushes_at_the_threshold_and_not_before_and_a_custom_time_applies
     assert "after 15 min" in intent.describe_line(q, now=NOW, idle=_idle(5.0))
 
 
-def test_an_until_input_overlay_ends_by_reading_never_by_a_write(tmp_path):
+def test_an_until_input_overlay_ends_by_a_typed_turn_never_by_sensed_input_or_a_write(tmp_path):
     q = tmp_path
     intent.apply_preset(q, "away", now=NOW, idle=_idle(5.0))
     before = _file(q)
-    # input 100 s after the word is the parting instruction (inside the 180 s grace): still away, though he is at the laptop
-    assert _push(q, "ping", 200.0, now=NOW + 300).push is True
-    # input 200 s after the word is past the grace: the overlay is over and follow reads the desk
-    got = _push(q, "ping", 100.0, now=NOW + 300)
-    assert (got.push, got.state) == (False, "holding")
-    # the same through the sensing writer: events only, the record byte-identical
+    # np-a93deaf7 "2a" (the 17:52 row): input at the laptop, inside the old grace or past it, fresh or stale, never ends the word
+    for reading in (200.0, 100.0, 5.0, 3600.0, None):
+        got = _push(q, "ping", reading, now=NOW + 300)
+        assert (got.push, got.state) == (True, "pushing"), reading
+    # the same through the sensing writer: no event, the record byte-identical
     for _ in range(2):
         desk.observe(q, NOW + 300, 100.0)
     assert _file(q) == before
-    assert [r["word"] for r in presence.read_log(q) if str(r.get("word", "")).startswith("ended")] == ["ended away"]
+    assert [r["word"] for r in presence.read_log(q) if str(r.get("word", "")).startswith("ended")] == []
     # a desk message one second after the word ends it at once (no grace), the record untouched
     intent.apply_preset(q, "sleep", now=NOW + 1000, idle=_idle(5.0))
     before = _file(q)
@@ -111,7 +110,7 @@ def test_sleep_lets_approvals_and_high_priority_through_and_mutes_the_rest(tmp_p
     for kind in ("notify", "question"):
         got = _push(q, kind, 5.0)
         assert (got.push, got.state, got.by) == (False, "muted", "sleep"), kind
-    assert _push(q, "notify", 5.0).why == "sleep: lets through needs only"
+    assert _push(q, "notify", 5.0).why == "sleep: lets through Approvals and needs"
 
 
 def test_migration_maps_a_word_and_a_route_to_one_record_is_idempotent_and_undoes_byte_identical(tmp_path):
@@ -205,3 +204,24 @@ def test_a_tap_alias_never_writes_the_base_nor_replaces_a_standing_preset(tmp_pa
         assert _file(q) == before
     presence.set_word(q, "desk", now=NOW + 2)    # the operator's own path: unchanged, the base
     assert _doc(q)["base"]["devices"] == "follow" and _doc(q)["overlay"] is None
+
+
+def test_an_attention_item_pushes_while_he_is_active_at_the_laptop_and_when_devices_are_off_but_never_through_a_mute(tmp_path):
+    """Phill 10-27: an attention row "will get picked up in the band here in the terminal, go to cockpit, and ping my phone even
+    when pings are not otherwise on"; the class is attention, dated and notify_urgent (presence.KIND_CLASSES). Under follow at
+    an active laptop, 1b held every class until the hold ceiling (flow 4, 11-02): every state below must push an attention kind
+    and still hold approvals and other pings as the record says."""
+    q = tmp_path
+    attention = ("attention", "dated", "notify_urgent")
+    for kind in attention:
+        assert _push(q, kind, 5.0).push is True, kind                      # follow, input 5 s ago: the desk is active
+    assert _push(q, "notify", 5.0).push is False                           # other: held as before
+    assert _push(q, "consent", 5.0).push is False                          # approvals follow the record (the design question is the operator's)
+    intent.apply_settings(q, devices="off", now=NOW, idle=_idle(5.0))      # pings off
+    for kind in attention:
+        assert _push(q, kind, 5.0).push is True, kind
+    assert _push(q, "notify", 5.0).push is False and _push(q, "consent", 5.0).push is False
+    intent.apply_settings(q, devices="follow", lets_through="approvals", now=NOW, idle=_idle(5.0))   # a mute for attention: stays muted
+    for kind in attention:
+        got = _push(q, kind, 5.0)
+        assert (got.push, got.state) == (False, "muted"), kind

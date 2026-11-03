@@ -97,8 +97,13 @@ def test_sleep_lets_a_held_approval_through_at_once_and_the_rest_wait_until_his_
     # Phill 10-25: in sleep an approval still reaches him, and an ordinary ping waits
     assert held.flush(tmp_path, now=NOW + 600, idle=lambda: 600.0 + 50) == 1
     assert b"approval held before the ruling" in sent[-1] and held.count(tmp_path) == 1
-    # he types: the sleep is over, and at the laptop follow keeps the ordinary ping for the desk
+    # sensed input at the laptop does not end a set sleep (np-a93deaf7 "2a"): the ordinary ping still waits
     assert held.flush(tmp_path, now=NOW + 700, idle=lambda: 20.0) == 0
+    # he types a message into a session: the sleep is over, and at the laptop follow keeps the ordinary ping for the desk
+    from levain.webpush import desk
+
+    desk.note_desk_message(tmp_path, "test-hook", now=NOW + 701)
+    assert held.flush(tmp_path, now=NOW + 702, idle=lambda: 5.0) == 0
     # ten minutes without input: devices on, the ordinary ping goes after its summary
     assert held.flush(tmp_path, now=NOW + 1400, idle=lambda: 700.0) == 1
     assert b"asleep" in sent[-2] and b"ordinary held by sleep" in sent[-1]
@@ -217,6 +222,7 @@ def test_the_send_child_flushes_held_pings_after_a_push_but_not_after_a_held_one
     base = {"title": "t", "body": "b", "ref": None, "url": "/"}
     assert run({**base, "push": True, "hold": None}) == 0 and flushed == [tmp_path]
     assert run({**base, "push": False, "hold": "active"}) == 0 and flushed == [tmp_path]
+    assert run({**base, "push": False, "hold": "lets"}) == 0   # a mute from his base lets-through setting is a valid reason: refusing it dropped the ping (11-02)
     assert run({**base, "push": False, "hold": 3}) == 2   # a hold that is not a word is refused
     assert child.main(["flush", "--queue-dir", str(tmp_path)]) == 0 and flushed == [tmp_path, tmp_path]
 
@@ -410,16 +416,15 @@ def test_h5_a_flush_already_running_makes_a_second_one_stand_down(tmp_path, monk
     assert held.flush(tmp_path, now=NOW, idle=lambda: INACTIVE) == 1
 
 
-def test_h6_sleep_without_an_idle_reading_ends_at_a_bound_and_status_says_so(tmp_path):
-    from levain.webpush.presence import SLEEP_BLIND_SECS
-
+def test_h6_sleep_without_an_idle_reading_stands_until_a_word_or_a_typed_turn(tmp_path):
     set_word(tmp_path, "sleep", now=NOW)
     rec = intent.read(tmp_path)
     assert intent.decide(NOW + 60, rec, None, class_name="other").push is False                     # no reading: it cannot see his input
-    assert intent.decide(NOW + SLEEP_BLIND_SECS + 1, rec, None, class_name="other").push is True     # ... so it ends at the bound
-    text = presence.describe(tmp_path, now=NOW + 60, idle=lambda: None)
-    assert "with no input reading" in text
-    assert "with no input reading" not in presence.describe(tmp_path, now=NOW + 60, idle=lambda: 5000.0)
+    assert intent.decide(NOW + 10 * 3600, rec, None, class_name="other").push is False             # ... and no bound ends it (np-a93deaf7 "2a")
+    for idle in (lambda: None, lambda: 5000.0, lambda: 5.0):
+        text = presence.describe(tmp_path, now=NOW + 60, idle=idle)
+        assert "no input reading" not in text and "a message you type into a session" in text
+
 
 
 # --- fix round r2: E1/H1 (every device answered or was retired), H5 (one spawn under a burst) --------------------------
