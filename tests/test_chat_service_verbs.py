@@ -178,28 +178,25 @@ def test_release_frees_the_turn_and_refuses_a_stranger(svc, world):
 
 # --- message_thread ------------------------------------------------------------------------------------------------------
 def test_message_thread_names_where_a_send_went(svc, world):
-    assert svc.message_thread("ob-00000001") is None
+    assert svc.message_thread("tab-a", "ob-00000001") is None
     epoch = svc.turn_claim(world["launch"], ME)
     r = send(svc, world, epoch)
-    got = svc.message_thread("ob-00000001")
+    got = svc.message_thread("tab-a", "ob-00000001")
     assert got == MessageThread(r.message_id, world["thread"], world["launch"], epoch)
+    assert svc.message_thread("iphone-1", "ob-00000001") is None           # another client's id answers nothing
 
 
 def test_message_thread_is_a_copy(svc, world):
     send(svc, world, svc.turn_claim(world["launch"], ME))
-    got = svc.message_thread("ob-00000001")
+    got = svc.message_thread("tab-a", "ob-00000001")
     with pytest.raises(dataclasses.FrozenInstanceError):
         got.thread_id = "th-other"                                         # type: ignore[misc]
-    assert svc.message_thread("ob-00000001").thread_id == world["thread"]
+    assert svc.message_thread("tab-a", "ob-00000001").thread_id == world["thread"]
 
 
-# --- session -------------------------------------------------------------------------------------------------------------
-def test_session_is_the_attached_one_or_none(svc, world, cs):
-    assert svc.session(world["launch"]) is svc.scripted
+# --- session: a snapshot of the meta read at attach, never the live session ----------------------------------------
+def test_session_is_the_attached_ones_meta_or_none(svc, world, cs):
+    assert svc.session(world["launch"]) == svc.scripted.meta() and svc.session(world["launch"]) is not svc.scripted
     assert svc.session("ln-" + "0" * 16) is None
     svc.detach(world["launch"])
     assert svc.session(world["launch"]) is None
-
-
-def test_the_private_routes_are_still_there():
-    assert hasattr(ChatService, "_session") and "_chat" in ChatService.__init__.__code__.co_names

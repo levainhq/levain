@@ -69,8 +69,8 @@ from levain.contracts.canon import canonical
 from levain.coordinator import chat_lease
 from levain.coordinator.chat_lease import TURN_LEASE_SCHEMA, TurnLease, TurnRefused, TurnView
 from levain.coordinator.chat_approvals import APPROVAL_SCHEMA, APPROVAL_VIEW_ARMS
-from levain.coordinator.chat_tripwires import (ControlReply, Trip, TripwireContext, TripwireWindow, control_line,
-                                               mode_trip, reported_mode_trip)
+from levain.coordinator.chat_tripwires import (MODE, ControlReply, Trip, TripwireContext, TripwireWindow,
+                                               control_line, mode_trip, reported_mode_trip)
 from levain.coordinator.driver import (CommandResult, InterruptCommand, LivenessEvidence, NotSent, SendCommand,
                                        SendResult, SessionMeta)
 from levain.coordinator.store import WORDS_MAX, CoordError, _append_only, _in, next_gseq, schema_present
@@ -79,8 +79,8 @@ __all__ = [
     "ATTACHMENTS_MAX", "AUTHOR_KINDS", "AUTHOR_SURFACES", "CHAT_SCHEMA", "COMPOSER_STATES", "EVENT_BODY_MAX",
     "EVENT_KINDS", "INTERRUPT_DEADLINE", "MODES", "OUTBOX_STATES", "PROBE_GAP", "PROBE_TRIES", "READ_DEADLINE",
     "RECIPIENTS", "CHECK_KINDS", "CHECK_SOURCES", "SEND_FAULT_POINTS", "ChatEvent", "ChatMessage", "ChatService",
-    "ChatStore", "Composer", "EventConflict", "Liveness", "MessageConflict", "MessageThread", "OutboxRefused", "SendReceipt",
-    "TimelineRow", "TurnLease", "TurnRefused", "TurnView", "Verdict", "body_sha256", "canary_verdict_id",
+    "ChatStore", "Composer", "EventConflict", "Liveness", "MessageConflict", "MessageThread", "OutboxRefused",
+    "ROOM_PERMISSION_MODE", "RoomRotated", "SendReceipt", "TimelineRow", "TurnLease", "TurnRefused", "TurnView", "Verdict", "body_sha256", "canary_verdict_id",
     "composer_state", "liveness", "outbox_state", "outbox_step", "record_check", "record_cursor", "record_event",
     "record_message", "timeline",
 ]
@@ -148,7 +148,8 @@ REPLY_KIND_CASE = ("CASE {col} WHEN 'drop_receipt' THEN 'reply_receipt' WHEN 'si
                    "WHEN 'coordinator_reply' THEN 'reply_coordinator' END")
 
 CHAT_SCHEMA: tuple[str, ...] = (
-    # §2.1: what a principal said, once. launch_id = the recipient worker launch; NULL = the coordinator / the thread
+    # §2.1: what a principal said, once. launch_id = the recipient worker or room launch (recipient 'worker' names a
+    # launch's vendor session, RM-D2); NULL = the coordinator / the thread
     "CREATE TABLE IF NOT EXISTS chat_messages (message_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE, "
     "thread_id TEXT NOT NULL REFERENCES threads(thread_id), launch_id TEXT REFERENCES launches(launch_id), "
     f"recipient TEXT NOT NULL CHECK ({_in('recipient', RECIPIENTS)}), "
@@ -168,11 +169,12 @@ CHAT_SCHEMA: tuple[str, ...] = (
     "CREATE TRIGGER IF NOT EXISTS chat_messages_no_replace BEFORE INSERT ON chat_messages WHEN EXISTS (SELECT 1 FROM "
     "chat_messages WHERE message_id = NEW.message_id OR outbox_id = NEW.outbox_id OR gseq = NEW.gseq OR "
     "rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a chat message is never replaced'); END",
-    # a message to a worker goes to a worker launch holding the message's thread
+    # a launch-addressed message goes to a worker or room launch holding the message's thread (RM-D2, Q-H1 (ii):
+    # recipient 'worker' names "a launch's vendor session"; the launch's role says which kind it is)
     "CREATE TRIGGER IF NOT EXISTS chat_messages_worker BEFORE INSERT ON chat_messages WHEN NEW.launch_id IS NOT NULL "
     "AND NOT EXISTS (SELECT 1 FROM launches l, json_each(l.threads) j WHERE l.launch_id = NEW.launch_id "
-    "AND l.role = 'worker' AND j.value = NEW.thread_id) "
-    "BEGIN SELECT RAISE(ABORT, 'a chat message to a worker names a worker launch of its thread'); END",
+    "AND l.role IN ('worker', 'room') AND j.value = NEW.thread_id) "
+    "BEGIN SELECT RAISE(ABORT, 'a chat message to a launch names a worker or room launch of its thread'); END",
     # §2.2: the delivery state machine
     "CREATE TABLE IF NOT EXISTS chat_outbox_events (message_id TEXT NOT NULL REFERENCES chat_messages(message_id), "
     f"seq INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, state TEXT NOT NULL CHECK ({_in('state', OUTBOX_STATES)}), "
@@ -497,10 +499,10 @@ def record_message(conn: sqlite3.Connection, now: str, *, thread_id: str, recipi
         return stored, False
     # the chat_messages_worker trigger's own query, so a caller catching CoordError never meets its IntegrityError
     if launch_id is not None and conn.execute(
-            "SELECT 1 FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? AND l.role = 'worker' "
+            "SELECT 1 FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? AND l.role IN ('worker', 'room') "
             "AND j.value = ?", (launch_id, thread_id)).fetchone() is None:
-        raise CoordError(f"launch {launch_id} is not a worker launch of its thread {thread_id}; a chat message to a "
-                         "worker names a worker launch of its thread")
+        raise CoordError(f"launch {launch_id} is not a worker or room launch of its thread {thread_id}; a chat message "
+                         "to a launch names a worker or room launch of its thread")
     message_id = "cm-" + secrets.token_hex(16)
     conn.execute("INSERT INTO chat_messages (message_id, gseq, thread_id, launch_id, recipient, author_kind, "
                  "author_surface, client_id, outbox_id, mode, expected_turn_id, owner_epoch, body, body_sha256, "
@@ -586,18 +588,35 @@ def _worker_launch(conn: sqlite3.Connection, launch_id: object) -> str:
     if row is None:
         raise CoordError(f"no launch {launch_id}")
     if row[0] != "worker":
-        raise CoordError(f"launch {launch_id} is the coordinator's; only a worker launch has a vendor thread here")
+        raise CoordError(f"launch {launch_id} is the coordinator's; only a worker launch has a vendor thread here"
+                         if row[0] == "coordinator" else f"launch {launch_id} is a {row[0]} launch; only a worker "
+                         "launch takes this record")
     return launch_id
+
+
+def _chat_launch(conn: sqlite3.Connection, launch_id: object) -> str:
+    """The launch's role if it is a worker or a room launch, running or ended (an ended one still takes its
+    backfill). A coordinator launch holds no thread, so its events would reach no timeline while its cursor moved past
+    them. The approval records keep :func:`_worker_launch`: a room raises no approval (DESIGN_ROOM §3.1 B6-B8)."""
+    if not isinstance(launch_id, str) or _LAUNCH_ID.fullmatch(launch_id) is None:
+        raise CoordError(f"no launch {str(launch_id)[:40]!r}")
+    row = conn.execute("SELECT role FROM launches WHERE launch_id = ?", (launch_id,)).fetchone()
+    if row is None:
+        raise CoordError(f"no launch {launch_id}")
+    if row[0] not in ("worker", "room"):
+        raise CoordError(f"launch {launch_id} is the coordinator's; only a worker or room launch has a vendor thread "
+                         "here")
+    return row[0]
 
 
 def record_event(conn: sqlite3.Connection, now: str, *, launch_id: str, key: str, pos: str, kind: str, body: str,
                  normalized: str, turn_id: str | None = None, call_id: str | None = None,
                  backfill: bool = False) -> tuple[ChatEvent, bool]:
-    """Record one vendor event of a worker launch in the caller's transaction: ``(event, True)``; a replay of a
+    """Record one vendor event of a worker or room launch in the caller's transaction: ``(event, True)``; a replay of a
     recorded key with the same content (both digests included) writes nothing: ``(stored, False)``; the same key with
     other content raises :class:`EventConflict`. The digests are of the WHOLE body (the reconciliation matches them
     against a message's); the stored body is clipped to :data:`EVENT_BODY_MAX` bytes."""
-    _worker_launch(conn, launch_id)
+    _chat_launch(conn, launch_id)
     _line("a vendor event key", key)
     _line("a vendor position", pos)
     if kind not in EVENT_KINDS:
@@ -635,8 +654,8 @@ def record_cursor(conn: sqlite3.Connection, now: str, *, launch_id: str, vendor_
                   complete_through: str | None, gap: bool) -> int:
     """The driver's cursor after a batch, in the batch's own transaction (§2.4); the row's seq. ``complete_through``
     is the vendor position up to which the driver asserts it read everything: the only basis for an absence. A worker
-    launch's only."""
-    _worker_launch(conn, launch_id)
+    or room launch's only."""
+    _chat_launch(conn, launch_id)
     for name, value in (("a vendor cursor", vendor_cursor), ("a complete-through position", complete_through)):
         if value is not None:
             _line(name, value, 4096)
@@ -893,7 +912,7 @@ def record_check(conn: sqlite3.Connection, now: str, launch_id: str, kind: str, 
                    for v in (canary_verdict_id, containment_digest))):
         raise CoordError("a canary verdict id and a containment digest ride together, 64 lowercase hex each, on a live "
                          "activation row that names its child")
-    _worker_launch(conn, launch_id)
+    _chat_launch(conn, launch_id)
     if kind not in CHECK_KINDS:
         raise CoordError(f"a launch check is one of {', '.join(CHECK_KINDS)}")
     if not (source in CHECK_SOURCES or (source.startswith("tripwire:") and len(source) > 9 and kind == "not_live")):
@@ -1081,7 +1100,7 @@ def composer_state(conn: sqlite3.Connection, now: str, launch_id: str, owner: st
     unresolved = tuple(r[0] for r in conn.execute(
         "SELECT m.message_id FROM chat_messages m WHERE m.launch_id = ? AND (SELECT o.state FROM chat_outbox_events o "
         "WHERE o.message_id = m.message_id ORDER BY o.seq DESC LIMIT 1) = 'ambiguous' ORDER BY m.gseq", (launch_id,)))
-    _role, state, _harness = _launch_state(conn, launch_id)
+    role, state, _harness = _launch_state(conn, launch_id)
     if state != "active":
         return Composer("ended", f"the launch is {state}", None, False, unresolved)
     if not attached:
@@ -1091,6 +1110,8 @@ def composer_state(conn: sqlite3.Connection, now: str, launch_id: str, owner: st
         return Composer("not_live", fold.why_not, None, fold.latched and fold.latest == "live", unresolved)
     if not fold.enabled and not _first_send_open(conn, launch_id):
         return Composer("checking", fold.why_not, None, False, unresolved)
+    if role == "room":
+        return Composer("writable", None, None, False, unresolved)       # no turn lease: two surfaces interleave
     view = chat_lease.view(conn, now, launch_id, owner)
     if view.state == "taken":
         return Composer("taken", f"the turn is held ({view.holder})", view.holder, False, unresolved)
@@ -1127,7 +1148,7 @@ class Anomaly:
 def record_anomaly(conn: sqlite3.Connection, now: str, *, launch_id: str, message_id: str | None, key: str,
                    kind: str, detail: str) -> int:
     """One ``chat_anomalies`` row in the caller's transaction; its seq."""
-    _worker_launch(conn, launch_id)
+    _chat_launch(conn, launch_id)
     if kind not in ANOMALY_KINDS:
         raise CoordError(f"an anomaly is one of {', '.join(ANOMALY_KINDS)}")
     _line("a vendor event key", key)
@@ -1164,6 +1185,75 @@ def _launch_state(conn: sqlite3.Connection, launch_id: str) -> tuple[str | None,
     row = conn.execute("SELECT l.role, (SELECT kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY "
                        "seq DESC LIMIT 1), l.harness FROM launches l WHERE l.launch_id = ?", (launch_id,)).fetchone()
     return (None, None, None) if row is None else row
+
+
+# --- the room (DESIGN_ROOM §2.3, §3.4): read with this module's own SELECTs, never room.py's writers ---------------
+# [seat] how often send_room re-resolves a room launch replaced between its read and its write
+_ROOM_TRIES = 3
+# the room's argv mode (DESIGN_ROOM §2.4: a call outside its allow list is denied without a prompt)
+ROOM_PERMISSION_MODE = "dontAsk"
+
+
+class RoomRotated(CoordError):
+    """The room thread a surface named is not the open room (rotated, or never opened): nothing was written; the
+    surface re-reads the room."""
+
+
+class _RoomMoved(Exception):
+    """The room's running launch changed between send_room's read and its write: nothing was written, resolve again."""
+
+
+def _open_room(conn: sqlite3.Connection) -> str | None:
+    """The open room thread (the latest room event is an ``opened``), or None; a store with no room record has none."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'room_events'").fetchone() is None:
+        return None
+    row = conn.execute("SELECT room_thread, kind FROM room_events ORDER BY seq DESC LIMIT 1").fetchone()
+    return row[0] if row is not None and row[1] == "opened" else None
+
+
+def _open_room_launch(conn: sqlite3.Connection, room_thread: str) -> str | None:
+    """The newest ``active`` room launch holding ``room_thread``, or None."""
+    row = conn.execute("SELECT l.launch_id FROM launches l, json_each(l.threads) j WHERE l.role = 'room' AND "
+                       "j.value = ? AND (SELECT e.kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY "
+                       "e.seq DESC LIMIT 1) = 'active' ORDER BY l.gseq DESC LIMIT 1", (room_thread,)).fetchone()
+    return None if row is None else row[0]
+
+
+def _room_target(conn: sqlite3.Connection, room_thread: object) -> str:
+    """The launch a line to ``room_thread`` goes to: refused (:class:`RoomRotated`) unless it is the open room, and
+    refused (CoordError) when the room has no running launch."""
+    if not isinstance(room_thread, str) or _THREAD_ID.fullmatch(room_thread) is None:
+        raise CoordError(f"no room thread {str(room_thread)[:40]!r}")
+    if _open_room(conn) != room_thread:
+        raise RoomRotated(f"room {room_thread} is not the open room (it rotated, or was never opened); nothing was "
+                          "written")
+    launch_id = _open_room_launch(conn, room_thread)
+    if launch_id is None:
+        raise CoordError(f"room {room_thread} has no running launch; nothing was written")
+    return launch_id
+
+
+def _is_mode_line(e: Any) -> bool:
+    """An event a driver gives a line that reports a permission mode (``error:mode:<id>``, its body the mode)."""
+    return getattr(e, "kind", None) == "error" and isinstance(getattr(e, "vendor_id", None), str) \
+        and e.vendor_id.startswith(MODE)
+
+
+def _room_mode_trip(permission_mode: Any) -> Trip | None:
+    """``mode_changed`` for a room: anything but :data:`ROOM_PERMISSION_MODE` latches, an unreadable report too."""
+    if permission_mode == ROOM_PERMISSION_MODE:
+        return None
+    return Trip("mode_changed", f"the room reports permission mode {str(permission_mode)[:60]!r}, not "
+                                f"{ROOM_PERMISSION_MODE!r}")
+
+
+def _read_meta(session: Any) -> SessionMeta | None:
+    """A session's meta, bounded by :data:`READ_DEADLINE`, or None when it cannot be read as a :class:`SessionMeta`."""
+    try:
+        got = _bounded(session.meta, READ_DEADLINE)
+    except Exception:  # noqa: BLE001 - _Overdue included: an unread meta is None, never a guess
+        return None
+    return got if type(got) is SessionMeta else None
 
 
 def _anchor(conn: sqlite3.Connection, launch_id: str) -> str | None:
@@ -1231,7 +1321,7 @@ class _LaunchRead:
 
 
 def _launch_read(conn: sqlite3.Connection, launch_id: str) -> _LaunchRead:
-    _worker_launch(conn, launch_id)
+    _chat_launch(conn, launch_id)
     attempts = tuple(_Attempt(*r) for r in conn.execute(
         "SELECT o.message_id, o.op_id, o.vendor_anchor, m.body_norm_sha256, (SELECT l.state FROM chat_outbox_events l "
         "WHERE l.message_id = o.message_id ORDER BY l.seq DESC LIMIT 1), (SELECT l.vendor_item_id FROM "
@@ -1303,7 +1393,7 @@ def _absent(read: _LaunchRead, lt: Callable[[str, str], bool], correlated: bool)
 def _last_cursor(conn: sqlite3.Connection, launch_id: str) -> str | None:
     """The vendor cursor of the launch's newest persisted batch, a None one included (None before the first): where a
     resumed ``read`` starts (§2.4). An older cursor is never carried past a batch that returned none."""
-    _worker_launch(conn, launch_id)
+    _chat_launch(conn, launch_id)
     row = conn.execute("SELECT vendor_cursor FROM chat_cursors WHERE launch_id = ? ORDER BY seq DESC LIMIT 1",
                        (launch_id,)).fetchone()
     return None if row is None else row[0]
@@ -1369,7 +1459,8 @@ def _echo_or_outside(conn: sqlite3.Connection, now: str, item: ChatEvent, window
                      (launch_id, item.vendor_event_key, found[0], next_gseq(conn, now),
                       _cause_text(f"same turn {item.vendor_turn_id}; equal normalized digest; sole candidate"), now))
         return
-    if _launch_state(conn, launch_id)[1] == "active":
+    # a room holds no turn lease (DESIGN_ROOM §3.1 B3): an outside line there is a line of the conversation
+    if _launch_state(conn, launch_id)[:2] == ("worker", "active"):
         chat_lease.outside(conn, now, launch_id, "terminal",
                            cause=f"a user item from outside Levain ({len(found)} candidate sends)")
 
@@ -1470,7 +1561,7 @@ def _bounded(fn: Callable[[], Any], seconds: float) -> Any:
 
 class ChatService:
     """Walks the send path over a :class:`ChatStore` and the :class:`~levain.coordinator.driver.DriverSession` s
-    attached to it, one per worker launch. Every verdict is the service's, from rows and raw vendor evidence; a
+    attached to it, one per worker or room launch. Every verdict is the service's, from rows and raw vendor evidence; a
     session decides nothing. ``fault(point)`` is the crash-matrix seam, called at each of
     :data:`SEND_FAULT_POINTS` with a launch's mutex held: a hook must not call back into the service for that launch
     (test-only; the mutex is not re-entrant).
@@ -1535,6 +1626,7 @@ class ChatService:
         self._sleep = sleep
         self._tripwires = tripwires
         self._windows: dict[str, TripwireWindow] = {}   # launch -> its attached session's tripwire window
+        self._metas: dict[str, SessionMeta | None] = {}  # launch -> its session's meta, read once at attach (C4)
         self._seat_item = seat_item
         self._filed: dict[str, set[str]] = {}            # launch -> the seat items' dedupe keys filed while attached
         # launch -> the control events this session was sent something for, by the event's identity (its stream
@@ -1556,15 +1648,20 @@ class ChatService:
 
     def attach(self, launch_id: str, session: Any) -> None:
         """The launch's one session. Refused while another is attached: :meth:`detach` it first. The refusal does
-        not wait for a send in flight (a session in use is an attached one)."""
+        not wait for a send in flight (a session in use is an attached one). The session's meta is read here, once,
+        under the launch's mutex and bounded by :data:`READ_DEADLINE`, and kept for :meth:`session_meta` (None when it
+        could not be read): no reader calls the driver for it."""
         with self._guard:
             self._refuse_second(launch_id)
-        with self._launch_lock(launch_id), self._guard:
-            self._refuse_second(launch_id)
-            self._sessions[launch_id] = session
-            self._wedged.discard(launch_id)           # a wedge belongs to the session that left a call unanswered
-            self._windows.pop(launch_id, None)        # so does a tripwire window: a new child is watched from zero
-            self._handled.pop(launch_id, None)
+        with self._launch_lock(launch_id):
+            meta = _read_meta(session)
+            with self._guard:
+                self._refuse_second(launch_id)
+                self._sessions[launch_id] = session
+                self._metas[launch_id] = meta
+                self._wedged.discard(launch_id)       # a wedge belongs to the session that left a call unanswered
+                self._windows.pop(launch_id, None)    # so does a tripwire window: a new child is watched from zero
+                self._handled.pop(launch_id, None)
 
     def _wedge(self, launch_id: str, session: Any) -> None:
         """``session`` left a driver call unanswered: the launch's session is used no more until it is detached.
@@ -1596,6 +1693,7 @@ class ChatService:
                     held = self._sessions.get(launch_id)
                     self._unpinned.wait_for(lambda: not self._pins.get(id(held)), timeout=INTERRUPT_DEADLINE)
                     session = self._sessions.pop(launch_id, None)
+                    self._metas.pop(launch_id, None)
                     self._wedged.discard(launch_id)
                     self._windows.pop(launch_id, None)
                     self._handled.pop(launch_id, None)
@@ -1627,14 +1725,51 @@ class ChatService:
     def send(self, launch_id: str, *, author_kind: str, author_surface: str, client_id: str, outbox_id: str,
              body: str, mode: str = "queue", expected_turn_id: str | None = None,
              expected_epoch: int | None = None, attachments: Sequence[dict[str, Any]] = ()) -> SendReceipt:
-        """One message to a running worker, sent at most once. ``author_surface:client_id`` is the AUTHENTICATED
-        owner (the caller derives it from the client's session, never from a request body); an operator's send is
-        fenced under ``expected_epoch``. A resend of a stored ``outbox_id`` sends nothing again."""
+        """One message to a running worker or room launch, sent at most once. ``author_surface:client_id`` is the
+        AUTHENTICATED owner (the caller derives it from the client's session, never from a request body); an operator's
+        send to a worker is fenced under ``expected_epoch``; a room's is queue-only and names no epoch (C3). A resend
+        of a stored ``outbox_id`` sends nothing again. A surface talking to the room calls :meth:`send_room`."""
         if not isinstance(launch_id, str) or _LAUNCH_ID.fullmatch(launch_id) is None:
             raise CoordError(f"no worker launch {str(launch_id)[:40]!r}")
-        owner = f"{author_surface}:{client_id}"
         # a launch that does not exist gets no lock: the registry holds attached and real launches only
-        self._chat._read(lambda conn: self._need_worker(conn, launch_id))
+        self._chat._read(lambda conn: self._need_chat_launch(conn, launch_id))
+        return self._send(launch_id, None, author_kind=author_kind, author_surface=author_surface,
+                          client_id=client_id, outbox_id=outbox_id, body=body, mode=mode,
+                          expected_turn_id=expected_turn_id, expected_epoch=expected_epoch, attachments=attachments)
+
+    def send_room(self, room_thread: str, *, author_surface: str, client_id: str, outbox_id: str, body: str,
+                  attachments: Sequence[dict[str, Any]] = ()) -> SendReceipt:
+        """Your line to the room (C5, DESIGN_ROOM §3.4): the request names the room THREAD the surface drew, never a
+        launch. A stored ``outbox_id`` is answered from its record first, before any launch is resolved, so a resend
+        after a restart or a rotation sends nothing again. Otherwise the room thread must be the open room
+        (:class:`RoomRotated`, nothing written) and its running room launch is resolved INSIDE the transaction that
+        writes ``pending``: a launch replaced between the read and the write is re-resolved, and the row never names a
+        launch that was not the room's running one when it committed."""
+        stored = self._chat._read(lambda conn: _message(conn, "outbox_id", outbox_id)) \
+            if isinstance(outbox_id, str) else None
+        kw = dict(author_kind="operator", author_surface=author_surface, client_id=client_id, outbox_id=outbox_id,
+                  body=body, mode="queue", expected_turn_id=None, expected_epoch=None, attachments=attachments)
+        if stored is not None:
+            if stored.launch_id is None or stored.thread_id != room_thread:
+                raise MessageConflict(f"outbox_id {outbox_id} is already stored for a different message "
+                                      f"({stored.message_id}); nothing was written")
+            return self._send(stored.launch_id, None, **kw)
+        for _ in range(_ROOM_TRIES):
+            launch_id = self._chat._read(lambda conn: _room_target(conn, room_thread))
+            try:
+                return self._send(launch_id, room_thread, **kw)
+            except _RoomMoved:
+                continue
+        raise CoordError(f"the room's launch changed {_ROOM_TRIES} times while this line was being sent; nothing was "
+                         "written; send it again")
+
+    def _send(self, launch_id: str, room_thread: str | None, *, author_kind: str, author_surface: str,
+              client_id: str, outbox_id: str, body: str, mode: str, expected_turn_id: str | None,
+              expected_epoch: int | None, attachments: Sequence[dict[str, Any]]) -> SendReceipt:
+        """The send path under the launch's mutex. With ``room_thread``, the write's own transaction checks that
+        ``launch_id`` is still that open room's running launch (else :class:`RoomRotated` or :class:`_RoomMoved`,
+        with nothing written)."""
+        owner = f"{author_surface}:{client_id}"
         with self._launch_lock(launch_id):
             session = self._session(launch_id)
             caps = normalized = None
@@ -1647,7 +1782,9 @@ class ChatService:
                 caps = _caps_snapshot(session.capabilities())
                 normalized = _plain_norm(session.normalize(body)) if isinstance(body, str) else body
             with self._chat._write() as (conn, now):
-                self._need_worker(conn, launch_id)
+                self._need_chat_launch(conn, launch_id)
+                if room_thread is not None and _room_target(conn, room_thread) != launch_id:
+                    raise _RoomMoved(launch_id)
                 row = conn.execute("SELECT j.value FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? "
                                    "LIMIT 1", (launch_id,)).fetchone()
                 if row is None:
@@ -1662,7 +1799,7 @@ class ChatService:
                     latest = _latest_row(conn, m.message_id)
                     return SendReceipt(m.message_id, outbox_id, latest[0] if latest else "pending",
                                        latest[1] if latest else "", False)
-                why = self._preflight(conn, now, m, caps, owner)
+                why = self._preflight(conn, now, m, caps, owner, session)
                 if why and launch_id in self._wedged:
                     why = "the launch's driver session stopped answering; it is detached and replaced before any send"
                 outbox_step(conn, now, m.message_id, "refused" if why else "pending", cause=why or "preflight passed")
@@ -1672,25 +1809,45 @@ class ChatService:
             return self._attempt_and_call(m, session, caps, owner)
 
     @staticmethod
-    def _need_worker(conn: sqlite3.Connection, launch_id: str) -> None:
+    def _need_chat_launch(conn: sqlite3.Connection, launch_id: str) -> str:
+        """C1: the launch's role, a worker or a room; anything else is refused."""
         role, _state, _h = _launch_state(conn, launch_id)
-        if role != "worker":
+        if role not in ("worker", "room"):
             raise CoordError(f"no worker launch {launch_id!r}")
+        return role
 
-    def _preflight(self, conn: sqlite3.Connection, now: str, m: ChatMessage, caps: Any, owner: str) -> str | None:
-        """B1 launch state, B2 the §4.2 fold, B3 the fence (yours only; the coordinator queues unfenced, B11), B9 a
-        steer names the vendor's open turn. The first no, as a cause; None when all pass. ``caps`` is
+    def _interrupting(self, session: Any) -> bool:
+        """An interrupt is waiting on ``session`` (its pin is held until the session's call returns)."""
+        with self._guard:
+            return session is not None and bool(self._pins.get(id(session)))
+
+    def _preflight(self, conn: sqlite3.Connection, now: str, m: ChatMessage, caps: Any, owner: str,
+                   session: Any) -> str | None:
+        """B1 launch state, no interrupt waiting on the session, B2 the §4.2 fold, B3 the fence (a worker's, yours
+        only; the coordinator queues unfenced, B11; a room has none: queue-only, no epoch, never the coordinator's),
+        B9 a steer names the vendor's open turn. The first no, as a cause; None when all pass. ``caps`` is
         ``(steer, queue)`` as plain bools, copied from the attached session's capabilities before the transaction
         (None: no session)."""
-        _role, state, _h = _launch_state(conn, m.launch_id)
+        role, state, _h = _launch_state(conn, m.launch_id)
         if state != "active":
-            return _cause_text(f"launch {m.launch_id} is {state}; only a running worker takes a message")
+            return _cause_text(f"launch {m.launch_id} is {state}; only a running worker or room launch takes a "
+                               "message")
         if caps is None:
             return "no driver session is attached to this launch"
+        if self._interrupting(session):
+            # a line written while the stop waits would be aborted by it, or its ack read as the stop's
+            return "an interrupt is waiting on this launch's session; send again once it has answered"
         fold = liveness(conn, m.launch_id)
         if not fold.enabled and not _first_send_open(conn, m.launch_id):
             return _cause_text(f"the gate is not live: {fold.why_not}")
-        if m.author_kind == "operator":
+        if role == "room":
+            if m.author_kind != "operator":
+                return "the coordinator never writes into a room"
+            if m.owner_epoch is not None:
+                return "a room send names no epoch: a room holds no turn lease"
+            if m.mode == "steer":
+                return "a room message is queued; the vendor folds it into a running turn"
+        elif m.author_kind == "operator":
             try:
                 chat_lease.turn_fence(conn, now, m.launch_id, m.owner_epoch, owner)
             except TurnRefused as exc:
@@ -1719,7 +1876,7 @@ class ChatService:
             if latest != "pending":
                 row = _latest_row(conn, m.message_id)
                 return SendReceipt(m.message_id, m.outbox_id, row[0], row[1], True)
-            why = self._preflight(conn, now, m, caps, owner)
+            why = self._preflight(conn, now, m, caps, owner, session)
             anchor = None if why else _anchor(conn, m.launch_id)
             if why is None and anchor is None:
                 why = "no vendor position yet"
@@ -2088,7 +2245,7 @@ class ChatService:
                 raise CoordError("an activation accepts only a canary verdict that passed")
             verdict_id = canary_verdict_id(canary)
         # a launch that does not exist gets no lock: the registry holds attached and real launches only
-        self._chat._read(lambda conn: _worker_launch(conn, launch_id))
+        self._chat._read(lambda conn: _chat_launch(conn, launch_id))
         with self._launch_lock(launch_id):
             seq = self._activation_row(launch_id, kind, detail, digest, spawn_nonce, verdict_id, containment_digest)
             self._stale_handled(launch_id)
@@ -2128,7 +2285,7 @@ class ChatService:
         """Your re-enable (§4.2): clears a latch only while the latest check read live again. ``owner`` is the
         authenticated client. The service never writes this row itself."""
         owner = chat_lease.check_owner(owner)
-        self._chat._read(lambda conn: _worker_launch(conn, launch_id))
+        self._chat._read(lambda conn: _chat_launch(conn, launch_id))
         with self._launch_lock(launch_id):
             with self._chat._write() as (conn, now):
                 seq = record_check(conn, now, launch_id, "reenabled", "operator", f"re-enabled by {owner}",
@@ -2158,20 +2315,33 @@ class ChatService:
 
     def turn_release(self, launch_id: str, epoch: int, owner: str) -> None:
         """Give back an epoch ``owner`` claimed for a send that moved nothing; refused for an epoch that is not
-        ``owner``'s live one, as the store refuses."""
-        self._chat.turn_release(launch_id, epoch, owner)
+        ``owner``'s live one, as the store refuses. It takes the launch's mutex, so it never lands between another
+        send's preflight and its outcome under the same epoch (L3_cvr_r1 codex MED: a release inside that window let
+        another client claim the turn while that send was still in flight)."""
+        self._chat._read(lambda conn: _chat_launch(conn, launch_id))
+        with self._launch_lock(launch_id):
+            self._chat.turn_release(launch_id, epoch, owner)
 
-    def message_thread(self, outbox_id: str) -> MessageThread | None:
-        """Where the stored message with this client ``outbox_id`` went (thread, launch and the epoch it was sent
-        under), or None when none is stored: the lookup a resend is answered from. A copy of four fields, not the
-        stored row."""
-        m = self._chat._read(lambda conn: _message(conn, "outbox_id", outbox_id))
-        return None if m is None else MessageThread(m.message_id, m.thread_id, m.launch_id, m.owner_epoch)
+    def message_thread(self, client_id: str, outbox_id: str) -> MessageThread | None:
+        """Where the message ``client_id`` stored under ``outbox_id`` went (thread, launch and the epoch it was sent
+        under), or None when that client stored none: another client's id answers nothing. A copy of four fields, not
+        the stored row."""
+        m = self._chat._read(lambda conn: _message(conn, "outbox_id", outbox_id)) if isinstance(outbox_id, str) \
+            else None
+        if m is None or m.client_id != client_id:
+            return None
+        return MessageThread(m.message_id, m.thread_id, m.launch_id, m.owner_epoch)
 
-    def session(self, launch_id: str) -> Any:
-        """The driver session attached to the launch, or None. This is the live object (a reader asks its ``meta``);
-        a caller changes the launch's session only through :meth:`attach` and :meth:`detach`."""
-        return self._session(launch_id)
+    def session_meta(self, launch_id: str) -> SessionMeta | None:
+        """C4: the attached session's meta as read once at :meth:`attach`, or None (no session, or a meta that could
+        not be read then). No driver method runs: a poll costs one dict read."""
+        with self._guard:
+            return self._metas.get(launch_id) if launch_id in self._sessions else None
+
+    def session(self, launch_id: str) -> SessionMeta | None:
+        """The same snapshot as :meth:`session_meta`, never the live driver session: a caller reaches the session only
+        through this service's own verbs."""
+        return self.session_meta(launch_id)
 
     def _watch(self, launch_id: str, session: Any, claude: bool, raws: Sequence[Any], seen: Sequence[Any],
                backfill: Sequence[bool], fresh: Sequence[bool], crossed: str | None,
@@ -2185,9 +2355,21 @@ class ChatService:
         if not claude:
             return None, [], at, []
         window, early, controls = self._window(launch_id), [], []
-        mode = self._mode(launch_id, session)
+        room = self._chat._read(lambda conn: _launch_state(conn, launch_id)[0]) == "room"
+        mode = self._mode(launch_id, session, room)
         early += [mode] if mode is not None else []
         new = [(i, raw, e) for i, (raw, e, old, f) in enumerate(zip(raws, seen, backfill, fresh)) if f and not old]
+        if room:
+            # a room runs dontAsk (DESIGN_ROOM §2.4): its own mode reports are judged here and never reach the
+            # worker rule (which accepts only 'default'); every other line goes through the window as a worker's
+            kept = []
+            for i, raw, e in new:
+                if _is_mode_line(raw):
+                    trip = _room_mode_trip(raw.body)
+                    (at[i] if crossed is None else early).extend([trip] if trip is not None else [])
+                else:
+                    kept.append((i, raw, e))
+            new = kept
 
         def control(e: _Seen, trip: Trip | None, reply: ControlReply | None) -> None:
             stop = trip if trip is not None and trip.interrupt else None
@@ -2229,9 +2411,10 @@ class ChatService:
                 ctx = None
         return TripwireWindow(ctx if isinstance(ctx, TripwireContext) else None)
 
-    def _mode(self, launch_id: str, session: Any) -> Trip | None:
+    def _mode(self, launch_id: str, session: Any, room: bool = False) -> Trip | None:
         """``mode_changed`` from the session's meta (its init, or a later line that reported a change), bounded by
-        :data:`READ_DEADLINE`; a meta that cannot be read trips it too (an overdue one also wedges the session)."""
+        :data:`READ_DEADLINE`; a meta that cannot be read trips it too (an overdue one also wedges the session). A
+        room's mode is :data:`ROOM_PERMISSION_MODE` (or none reported yet)."""
         try:
             meta = _bounded(session.meta, READ_DEADLINE)
         except _Overdue:
@@ -2241,6 +2424,8 @@ class ChatService:
             return Trip("mode_changed", f"could not read the session's permission mode: {type(exc).__name__}")
         if type(meta) is not SessionMeta:
             return Trip("mode_changed", "could not read the session's permission mode: the session returned no meta")
+        if room:
+            return None if meta.permission_mode is None else _room_mode_trip(meta.permission_mode)
         return mode_trip(meta.permission_mode)
 
     def _answer_controls(self, launch_id: str, session: Any, controls: Sequence[_Control]) -> list[str]:

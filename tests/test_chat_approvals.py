@@ -883,3 +883,14 @@ def test_cancel_after_decision_observed_writes_nothing(cs, claude, tmp_path):
     _ev(cs, row, "decision_observed", decision="deny")
     record_cancelled(cs, launch_id=row.launch_id, vendor_request_key=row.vendor_request_key, cause="not_live", tag="x")
     assert events(cs, row.launch_id, row.vendor_request_key) == ["decision_observed"]
+
+
+# --- RM-D2: an input the driver truncated is deny-only -------------------------------------------------------------
+def test_a_request_whose_tool_input_was_truncated_is_denied_on_a_live_launch(cs, claude, tmp_path):
+    marker = {"levain_truncated": True, "sha256": "sha256:" + "e" * 64, "bytes": 99999, "head": '{"command": "rm'}
+    got = host(cs, claude["launch"], ctx(tmp_path), tool_input=marker)
+    assert got.disposition == "denied" and got.attempt is not None
+    assert dict(got.attempt.reply)["behavior"] == "deny"
+    assert events(cs, claude["launch"], got.row.vendor_request_key) == ["decision_observed", "answer_attempted"]
+    whole = host(cs, claude["launch"], ctx(tmp_path), tool_use_id="toolu_2")      # an untruncated one still routes
+    assert whole.disposition == "routed"

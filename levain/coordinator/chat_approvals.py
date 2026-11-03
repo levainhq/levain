@@ -484,6 +484,10 @@ def arrive(conn: sqlite3.Connection, now: str, *, launch_id: str, raw_vendor_key
                   approval_id=approval_id, kind=kind, route="core" if kind == "host" else "native",
                   decisions=tuple(available_decisions or ()), tool_name=tool_name, digest=digest, nonce=spawn_nonce,
                   tagged=agent_config_tagged(harness, tool_name, tool_input, ctx, protected=protected))
+    if isinstance(tool_input, Mapping) and tool_input.get("levain_truncated") is True:
+        # the driver kept only a marker for an input past its body cap: nobody can be shown what an allow would allow,
+        # and the digest and the agent-config tag were computed over the marker, so the one answer is a deny
+        return Arrival("denied", row, _deny_attempt(conn, now, row, cause="its tool input was truncated"))
     fold = chat.liveness(conn, launch_id)
     if not fold.enabled and not (fold.latest == "probing" and not fold.latched):
         return Arrival("denied", row, _deny_attempt(conn, now, row, cause="gate not live"))
