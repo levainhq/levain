@@ -62,6 +62,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     show.add_argument("--version", type=_version_arg, default=None, help="A version (default: the latest).")
     show.set_defaults(func=run_role_show)
     _add_p2_parsers(verbs)
+    _add_signing_parsers(verbs)
 
 
 def run_agents(args: argparse.Namespace) -> int:
@@ -409,4 +410,83 @@ def run_zone(args: argparse.Namespace) -> int:
     except (sqlite3.Error, StoreFormatError) as exc:
         return _fail("zone", f"the store refused it: {exc}")
     print(f"default zone: {zone}")
+    return 0
+
+
+# --- sign, renew (P5a-2a): both through levain.agents.signing, the one signing entry ---------------------------------
+
+def _add_signing_parsers(verbs: argparse._SubParsersAction) -> None:
+    sign = verbs.add_parser("sign", help="Sign an agent link from a JSON file (a laptop-presence key).",
+                            allow_abbrev=False,
+                            description="Sign the agent link in FILE: its terms as the log's record has them. A "
+                                        "missing id is drawn, a missing kind is agent-link, and a missing expires_at "
+                                        "is --days from now.")
+    sign.add_argument("file", type=Path, help="The link record (JSON).")
+    sign.add_argument("--data-root", dest="data_root", type=Path, required=True, help="The cockpit's data root.")
+    sign.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                      help="A laptop-presence key; it may ask for a touch or a passphrase.")
+    sign.add_argument("--days", type=int, default=29, help="Life of a link with no expires_at (default 29).")
+    sign.set_defaults(func=run_sign)
+    renew = verbs.add_parser("renew", help="Move a live agent link's expiry (its terms stay).", allow_abbrev=False)
+    renew.add_argument("link_id", help="The link's id (al-...).")
+    renew.add_argument("--data-root", dest="data_root", type=Path, required=True, help="The cockpit's data root.")
+    renew.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                       help="A laptop-presence key; it may ask for a touch or a passphrase.")
+    renew.add_argument("--days", type=int, default=29, help="New life from now (default 29).")
+    renew.set_defaults(func=run_renew)
+
+
+def _signing_refusals() -> tuple[type[BaseException], ...]:
+    from levain.authority import AuthorityError
+    from levain.cockpit.firejournal import CockpitFormatError
+    from levain.cockpit.keys import KeyError_
+
+    return (KeyError_, AuthorityError, OSError, UnicodeDecodeError, sqlite3.Error, CockpitFormatError, SpecError,
+            ValueError)
+
+
+def run_sign(args: argparse.Namespace) -> int:
+    import secrets
+    from datetime import datetime, timedelta, timezone
+
+    from levain.agents.signing import sign_agent_link
+    from levain.authority import AGENT_LINK_KIND
+    from levain.cockpit.consent import utc_stamp
+    from levain.cockpit.keys import ssh_signer
+
+    try:
+        grant = load_json(args.file.read_text(encoding="utf-8"))
+        if not isinstance(grant, dict):
+            raise ValueError("the link file is not a JSON object")
+        now = datetime.now(timezone.utc)
+        grant.setdefault("kind", AGENT_LINK_KIND)
+        grant.setdefault("id", "al-" + secrets.token_hex(6))
+        grant.setdefault("expires_at", utc_stamp(now + timedelta(days=args.days)))
+        signer_fp, sign = ssh_signer(args.signing_key)
+        new = sign_agent_link(args.data_root, grant, signer_fp=signer_fp, sign=sign,
+                              clock=lambda: datetime.now(timezone.utc))
+    except _signing_refusals() as exc:
+        return _fail("sign", exc)
+    print(f"signed: {grant['id']} at seq {new.seq}, until {grant['expires_at']}")
+    if new.anchor_warning:
+        print(f"warning: {new.anchor_warning}", file=sys.stderr)
+    return 0
+
+
+def run_renew(args: argparse.Namespace) -> int:
+    from datetime import datetime, timedelta, timezone
+
+    from levain.agents.signing import renew_agent_link
+    from levain.cockpit.keys import ssh_signer
+
+    try:
+        signer_fp, sign = ssh_signer(args.signing_key)
+        new, expires_at = renew_agent_link(args.data_root, args.link_id, life=timedelta(days=args.days),
+                                           signer_fp=signer_fp, sign=sign,
+                                           clock=lambda: datetime.now(timezone.utc))
+    except _signing_refusals() as exc:
+        return _fail("renew", exc)
+    print(f"renewed: {args.link_id} at seq {new.seq}, until {expires_at}")
+    if new.anchor_warning:
+        print(f"warning: {new.anchor_warning}", file=sys.stderr)
     return 0

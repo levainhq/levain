@@ -248,10 +248,9 @@ def test_a_revoke_agent_removing_two_links_signs_at_rank_1(tmp_path):
 
 
 def test_any_enrolled_key_but_a_passkey_revokes_an_agent_through_the_new_op(world):
-    # the passkey's own revoke_agent branch is P5a-2's; until it is built a passkey's revoke_agent is refused whole
+    # the passkey's own revoke_agent branch is covered in test_authority_agent_signing.py
     create(world, 1)
     create(world, 2)
-    assert "signs consent answers and grant revokes only" in world.refused(revoke_agent(), "pk")
     after = world.link(revoke_agent(), "phone")
     assert auth.agent_links(after, AGENT, STORE) == []
 
