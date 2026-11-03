@@ -780,3 +780,22 @@ def test_a_status_read_writes_no_decision_row_and_a_delivery_does_and_a_fault_re
         raise RuntimeError("no idle")
     got = presence.effective(tmp_path, NOW, idle=boom)                    # no reading: follow reads him inactive and pushes
     assert got["pushing"] is True and got["state"] == "pushing"
+
+
+def test_a_remote_turn_after_away_still_pushes_and_follow_with_fresh_remote_still_pushes(tmp_path):
+    """Desk 7 / Phill np-a93deaf7 "2a": an away word stands against sensed laptop input, and remote work (a remote-terminal
+    or remote-control turn) never counts as the desk: with away set the laptop reading cannot hold the ping, and in follow
+    mode a fresh remote record still pushes before the laptop reading is consulted."""
+    for source in ("remote-terminal", "remote-control"):
+        q = tmp_path / f"away-{source}"
+        (q / "webpush").mkdir(parents=True, mode=0o700)
+        intent._write_record(q, {"base": _rec()["base"], "overlay": AWAY(ts=NOW - 1000)})
+        (q / "webpush" / presence.REMOTE_NAME).write_text(json.dumps({"at": NOW - 30.0, "source": source}))
+        got = presence.should_push(q, "ping", now=NOW, idle=lambda: 0.0, suggest=False)
+        assert got.push is True and got.state == "pushing", (source, got)
+        q2 = tmp_path / f"follow-{source}"
+        (q2 / "webpush").mkdir(parents=True, mode=0o700)
+        intent._write_record(q2, {"base": _rec()["base"], "overlay": None})
+        (q2 / "webpush" / presence.REMOTE_NAME).write_text(json.dumps({"at": NOW - 30.0, "source": source}))
+        got2 = presence.should_push(q2, "ping", now=NOW, idle=lambda: 0.0, suggest=False)
+        assert got2.push is True and got2.state == "pushing" and "remote" in got2.why, (source, got2)
