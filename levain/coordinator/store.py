@@ -506,9 +506,11 @@ class CoordStore:
     # --- store ---------------------------------------------------------------------------------------------------
     def _statements(self, *, base: bool = False, lifecycle: bool = True) -> tuple[str, ...]:
         """The schema this opener makes. ``base`` is the plain coordinator's alone, without a subclass's added tables.
-        ``lifecycle=False`` leaves out the additive tables, C13's, the operator's work cursor and S0's migration bounds
+        ``lifecycle=False`` leaves out the additive tables, C13's, the operator's work cursor, S0's migration bounds and the
+        missions'
         (:meth:`_schema_current`'s reader gate)."""
         from levain.coordinator.lease import LEASE_SCHEMA
+        from levain.coordinator.missions import MISSION_SCHEMA
         from levain.coordinator.first_reader import FIRST_READER_SCHEMA
         from levain.coordinator.intake import INTAKE_SCHEMA
         from levain.coordinator.ready import LIFECYCLE_SCHEMA
@@ -522,7 +524,7 @@ class CoordStore:
         # tables (ready items + their journal) are additive, IF NOT EXISTS, like every statement here
         return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA,
                 *((*LIFECYCLE_SCHEMA, *OPERATOR_VIEWS_SCHEMA, *SEAM_SCHEMA, *SEAM_HANDOFF_SCHEMA, *OPEN_SCHEMA,
-                  *INTAKE_SCHEMA)
+                  *INTAKE_SCHEMA, *MISSION_SCHEMA)
                 if lifecycle else ()))
 
     def _connect(self, *, create: bool = True) -> sqlite3.Connection:
