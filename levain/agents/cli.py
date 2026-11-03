@@ -63,6 +63,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     show.set_defaults(func=run_role_show)
     _add_p2_parsers(verbs)
     _add_signing_parsers(verbs)
+    _add_revoke_parsers(verbs)
     _add_fence_parsers(verbs)
 
 
@@ -506,6 +507,175 @@ def run_renew(args: argparse.Namespace) -> int:
     if new.anchor_warning:
         print(f"warning: {new.anchor_warning}", file=sys.stderr)
     return 0
+
+
+# ---- revoke (P5c-2c): the bar protocol's two surfaces, through levain.agent_authority's steps -----------------------
+
+REVOKE_SIGN_ROUNDS = 3      # gestures one run asks for: a head that moved (or a bar prepared again) asks for one more
+
+
+def _add_revoke_parsers(verbs: argparse._SubParsersAction) -> None:
+    rv = verbs.add_parser(
+        "revoke", help="Revoke all of an agent's links (a laptop-presence key), or --abandon an open revoke.",
+        allow_abbrev=False,
+        description="Bar the agent now, then sign one revoke link and append it (A0 section 2.2). --abandon AGENT "
+                    "closes the agent's open bar without a signature; a bar is never deleted, and a revoke that "
+                    "landed first stands.")
+    rv.add_argument("agent", help="The agent id (ag-...).")
+    rv.add_argument("--abandon", action="store_true", help="Close the agent's open bar instead of revoking.")
+    rv.add_argument("--data-root", dest="data_root", type=Path, default=None,
+                    help="The cockpit's data root (a revoke needs it; --abandon does not).")
+    rv.add_argument("--signing-key", dest="signing_key", type=Path, default=None,
+                    help="A laptop-presence key; it may ask for a touch or a passphrase (a revoke needs it).")
+    rv.set_defaults(func=run_revoke)
+
+
+def _utcnow():
+    """The revoke verbs' clock (one place to replace it)."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)
+
+
+def _raise_attention(key: str, text: str) -> None:
+    """The abandon's attention record: printed, keyed. (The agent store holds no attention table yet, so the line on
+    stderr is the record a caller can route.)"""
+    print(f"attention [{key}]: {text}", file=sys.stderr)
+
+
+def run_revoke(args: argparse.Namespace) -> int:
+    if args.abandon:
+        return _run_abandon(args)
+    if args.data_root is None or args.signing_key is None:
+        return _fail("revoke", "a revoke needs --data-root and --signing-key")
+    return _run_revoke_signed(args)
+
+
+def _run_revoke_signed(args: argparse.Namespace) -> int:
+    from levain import agent_authority as aa
+    from levain.agents import bars
+    from levain.authority import anchor_path
+    from levain.cockpit.keys import _journal, ssh_signer
+
+    store = _open(args)
+    if store is None:
+        return 1
+    clock = lambda: _utcnow()      # noqa: E731  (looked up per call)
+    begun = False          # begin has run: a bar may be open, so every later failure says the agent stays barred
+    bar_id: str | None = None
+    try:
+        signer_fp, sign = ssh_signer(args.signing_key)
+        db = _journal(args.data_root)
+        with db.autocommit() as cockpit:
+            autonomic = store._db._connect()        # a connection with no transaction open: the steps own theirs
+            try:
+                sid, why = bars._store_id(autonomic, None)
+                if sid is None:
+                    return _fail("revoke", why)
+                anchor = anchor_path(db.data_root)
+                begun = True
+                step = aa.revoke_agent_begin(autonomic, cockpit, args.agent, store_id=sid, signer_fp=signer_fp,
+                                             clock=clock)
+                bar_id = step.bar_id
+                _say(step)
+                rounds = 0
+                while step.state in ("prepared", "stale_head", "reprepared"):
+                    if rounds >= REVOKE_SIGN_ROUNDS:
+                        print(f"the agent stays barred; the revoke is not signed in: run `levain agents revoke "
+                              f"{args.agent}` again, or --abandon it", file=sys.stderr)
+                        return 1
+                    rounds += 1
+                    step = aa.revoke_agent_sign(autonomic, step.bar_id, sign, clock=clock)
+                    if step.state != "signed":
+                        _say(step)
+                        continue
+                    step = aa.revoke_agent_finish(autonomic, cockpit, step.bar_id, clock=clock, anchor=anchor)
+                    _say(step)
+                if step.state not in _REVOKE_TERMINAL:
+                    return _fail("revoke", f"unexpected revoke state {step.state!r}: {step.text}" + _STAYS_BARRED)
+            finally:
+                autonomic.close()
+    except aa.AgentAuthorityError as exc:
+        landed = _landed_seq(args, bar_id) if bar_id is not None else None
+        if landed is not None:
+            print(f"the revoke had already landed at seq {landed}")
+            return 0
+        return _fail("revoke", f"{exc}" + (_STAYS_BARRED if begun else ""))
+    except (_signing_refusals() + (StoreFormatError,)) as exc:
+        return _fail("revoke", f"{exc}" + (_STAYS_BARRED if begun else ""))
+    return 0     # landed, landed on an abandoned bar, or abandoned: each is the true outcome (A0 section 2.2)
+
+
+_REVOKE_TERMINAL = ("landed", "landed_bar_abandoned", "abandoned")
+_STAYS_BARRED = "; the agent stays barred; run revoke again or --abandon"
+
+
+def _say(step) -> None:
+    """Print a revoke step; an abandoned one says plainly that nothing was revoked (the exit stays 0, c6(b))."""
+    if step.state == "abandoned":
+        print(f"{step.text}; the agent is NOT revoked")
+    else:
+        print(step.text)
+
+
+def _landed_seq(args: argparse.Namespace, bar_id: str) -> int | None:
+    """The seq this call's own bar closed with, when a concurrent revoke landed it first; None otherwise (or on any
+    store trouble: the caller then reports the failure it already has)."""
+    from levain.agents import bars
+
+    try:
+        store = _open(args)
+        if store is None:
+            return None
+        conn = store._db._connect()
+        try:
+            bar = bars.read_bar(conn, bar_id)
+        finally:
+            conn.close()
+    except (sqlite3.Error, StoreFormatError):
+        return None
+    if bar is not None and bar.reason in ("signed", "from_log") and bar.revoke_seq is not None:
+        return bar.revoke_seq
+    return None
+
+
+def _run_abandon(args: argparse.Namespace) -> int:
+    from levain.agents import bars
+
+    store = _open(args)
+    if store is None:
+        return 1
+    try:
+        autonomic = store._db._connect()
+        try:
+            bar = bars.open_bar_of(autonomic, args.agent)
+            if bar is None:
+                return _no_open_bar(autonomic, args.agent)
+            if bars.close_bar(autonomic, bar.bar_id, revoke_seq=None, reason="abandoned", now=_utcnow()):
+                _raise_attention(f"agent-abandon:{bar.bar_id}",
+                                 f"the revoke of {args.agent} was abandoned; the agent's links stand as signed")
+                print(f"abandoned: the bar {bar.bar_id} is closed; nothing was appended")
+                return 0
+            return _no_open_bar(autonomic, args.agent, bar_id=bar.bar_id)     # step 4 closed it between the two
+        finally:
+            autonomic.close()
+    except (sqlite3.Error, StoreFormatError) as exc:
+        return _fail("revoke", f"the store refused it: {exc}")
+
+
+def _no_open_bar(autonomic: sqlite3.Connection, agent_id: str, *, bar_id: str | None = None) -> int:
+    """The abandon found no row to close. With a ``bar_id`` this call saw the bar open and lost the close: say what the
+    bar's own record says (a revoke that landed first stands). With none, no revoke was ever open to this call: 1."""
+    from levain.agents import bars
+
+    row = bars.read_bar(autonomic, bar_id) if bar_id is not None else None
+    if row is not None and not isinstance(row, bars.Bar):
+        row = bars._bar(row)
+    if row is not None and row.reason in ("signed", "from_log") and row.revoke_seq is not None:
+        print(f"the revoke had already landed at seq {row.revoke_seq}; nothing to abandon")
+        return 0
+    print(f"levain agents revoke: no open revoke for {agent_id}; nothing to abandon", file=sys.stderr)
+    return 1
 
 
 # ---- the agent fence (P7-2 wiring, shape C): `levain agents fence start|status` -----------------------------------
