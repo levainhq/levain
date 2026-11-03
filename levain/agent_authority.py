@@ -270,8 +270,12 @@ def open_bar_for(agent_id: str, store_dir: Path | str | None = None):
     from levain.autonomic.db import DB_NAME as _STORE_DB, default_store_dir
 
     path = (default_store_dir() if store_dir is None else Path(store_dir)) / _STORE_DB
-    if not path.exists():
+    try:
+        path.stat()          # not Path.exists(): on Python 3.14 that answers False for a permission error, which would read an inaccessible store as "no bar"
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise AgentAuthorityError(f"the agent's bar cannot be read: {type(exc).__name__}") from exc
     try:
         conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=2.0)
         try:
