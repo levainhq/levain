@@ -62,7 +62,7 @@ __all__ = [
     "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat",
     "check_model", "claim", "by_harness_session", "claim_spawn", "end_done_worker", "end_launch", "end_unlisted", "fence", "launch",
     "lease", "launches", "LaunchThread", "mark_swept", "over_unswept", "record_thread", "record_write", "release",
-    "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
+    "removed_coordinators", "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
     "wake_state", "HANDOFF_MAX", "refuse_unstarted_worker", "worker_handoff",
 ]
 
@@ -932,6 +932,13 @@ def unspawned(conn: sqlite3.Connection) -> list[Launch]:
     """Pending launches no process has claimed the spawn of, oldest first."""
     return [ln for ln in _in_state(conn, "pending") if conn.execute(
         "SELECT 1 FROM launch_spawns WHERE launch_id = ?", (ln.launch_id,)).fetchone() is None]
+
+
+def removed_coordinators(conn: sqlite3.Connection) -> list[Launch]:
+    """Every coordinator launch not yet over (``pending``, its spawn claimed or not, or ``active``) whose harness is
+    not claude, the pending ones first: what the watcher's retirement pass ends (:data:`CODEX_REMOVED`)."""
+    return [ln for state in ("pending", "active") for ln in _in_state(conn, state, "coordinator")
+            if ln.harness != "claude"]
 
 
 def launch_dirs(conn: sqlite3.Connection) -> list[str]:

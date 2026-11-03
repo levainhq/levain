@@ -2678,11 +2678,10 @@ def _legacy_codex_setting(store, cwd):
                      "VALUES (?, 'codex', NULL, ?, 0, 'operator', ?)", (lease.next_gseq(conn, now), cwd, now))
 
 
-def _legacy_codex_launch(store, cwd):
+def _legacy_codex_launch(store, cwd, key="s-c0dec0dec0dec0de"):
     """A pending Codex coordinator launch and its bootstrap claim, as a wake under that setting wrote them before the
     upgrade (the same two rows :func:`levain.coordinator.lease.wake` writes)."""
     with store._write() as (conn, now):
-        key = "s-" + "c0dec0dec0dec0de"
         token = lease._event(conn, now, "claim", key, token=None, until=lease._plus(now, lease.LAUNCH_TTL),
                              cause="bootstrap", by="service")
         return lease._pending(conn, now, token=token, harness="codex", role="coordinator", threads=(), model=None,
@@ -2758,3 +2757,81 @@ def test_an_active_codex_coordinator_is_ended_and_fenced_by_the_watcher(qdir, wo
         assert lease.launch_death(c, lease.launch(c, launch_id)) is False
     assert s.coord_status()["wake"] == "unset"
     assert not any(launch_id in line and "codex coordinator removed" in line for line in cl.watch_once(s))
+
+
+def test_two_spawn_claimed_pending_codex_launches_both_retire_on_one_pass(qdir, workdir, fake):
+    # L3 r2 (codex MED, deepseek): the pass read the unspawned launches plus only the NEWEST pending coordinator, so of
+    # two whose spawns an older launcher had claimed the older stayed pending until its TTL, and then read as a death
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    ids = [_legacy_codex_launch(s, str(workdir.resolve()), key=f"s-c0dec0dec0dec0d{i}") for i in (1, 2)]
+    with s._write() as (conn, now):
+        for i in ids:
+            conn.execute("INSERT INTO launch_spawns (launch_id, gseq, pid, at) VALUES (?, ?, ?, ?)",
+                         (i, lease.next_gseq(conn, now), os.getpid(), now))
+    assert s.launches_unspawned() == []
+    lines = cl.watch_once(s)
+    for i in ids:
+        got = s.launch(i)
+        assert (got.state, got.cause) == ("failed", "codex coordinator removed"), (i, lines)
+        with sqlite3.connect(qdir / "dispatch.db") as c:
+            assert lease.launch_death(c, lease.launch(c, i)) is not True
+    assert fake.spawns() == []
+
+
+# What `levain coord agent codex` (0.11.15 until its removal) wrote into the workspace for an interpreter at this path,
+# rendered by that release's own `install.codex_coordinator_rules` (a literal here, so the test does not read the
+# render it checks)
+_OLD_PY = "/opt/py 3/bin/python3"
+_OLD_RULE = (
+    "# Written by Levain for its coordinator (np-6843ca07 (a)). Codex runs exactly these commands without asking:\n"
+    "# '/opt/py 3/bin/python3' -P -m levain coord | drops | thread ...\n"
+    "# Every other command is decided as before. Codex loads this file only while you trust this directory.\n"
+    "prefix_rule(\n"
+    '    pattern = ["/opt/py 3/bin/python3", "-P", "-m", "levain", ["coord", "drops", "thread"]],\n'
+    '    decision = "allow",\n'
+    '    justification = "Levain coordinator verbs: they grant nothing (a signed envelope still does)",\n'
+    '    match = [["/opt/py 3/bin/python3", "-P", "-m", "levain", "coord", "status"], ["/opt/py 3/bin/python3", "-P", '
+    '"-m", "levain", "drops", "status"], ["/opt/py 3/bin/python3", "-P", "-m", "levain", "thread", "status"]],\n'
+    '    not_match = [["/opt/py 3/bin/python3", "-P", "-m", "levain", "team", "record"], ["/opt/py 3/bin/python3", '
+    '"-P", "-m", "levain", "coordinator"], ["levain", "coord"]],\n'
+    ")\n"
+)
+
+
+def _rule_at(ws):
+    return ws / ".codex" / "rules" / "levain-coordinator.rules"
+
+
+def test_retirement_removes_only_the_exact_legacy_codex_rule_in_the_launch_workspace(qdir, tmp_path, fake):
+    # L3 r2 (codex + deepseek HIGH): the removed writer left a rule pre-approving `<py> -P -m levain coord ...` in the
+    # coordinator's workspace, so the orphan Codex thread could still run `coord take` / `coord release` unasked
+    s = CoordStore(qdir)
+    spaces = {name: tmp_path / f"ws-{name}" for name in ("exact", "changed", "none", "link", "other")}
+    for ws in spaces.values():
+        ws.mkdir()
+    for name in ("exact", "changed", "other"):
+        _rule_at(spaces[name]).parent.mkdir(parents=True)
+    _rule_at(spaces["exact"]).write_text(_OLD_RULE, encoding="utf-8")
+    _rule_at(spaces["changed"]).write_text(_OLD_RULE + "# mine\n", encoding="utf-8")
+    (spaces["other"] / ".codex" / "rules" / "mine.rules").write_text(_OLD_RULE, encoding="utf-8")
+    _rule_at(spaces["link"]).parent.mkdir(parents=True)
+    target = tmp_path / "elsewhere.rules"
+    target.write_text(_OLD_RULE, encoding="utf-8")
+    _rule_at(spaces["link"]).symlink_to(target)
+    outside = tmp_path / ".codex" / "rules"
+    outside.mkdir(parents=True)
+    (outside / "levain-coordinator.rules").write_text(_OLD_RULE, encoding="utf-8")
+    _legacy_codex_setting(s, str(spaces["exact"].resolve()))
+    ids = {name: _legacy_codex_launch(s, str(ws.resolve()), key=f"s-c0dec0dec0de{n:04d}")
+           for n, (name, ws) in enumerate(spaces.items())}
+    lines = cl.watch_once(s)
+    assert all(s.launch(i).state == "failed" for i in ids.values()), lines
+    assert not os.path.lexists(_rule_at(spaces["exact"])), lines
+    assert any(str(_rule_at(spaces["exact"].resolve())) in line for line in lines), lines
+    assert _rule_at(spaces["changed"]).read_text(encoding="utf-8") == _OLD_RULE + "# mine\n"
+    assert (spaces["other"] / ".codex" / "rules" / "mine.rules").read_text(encoding="utf-8") == _OLD_RULE
+    assert os.path.islink(_rule_at(spaces["link"])) and target.read_text(encoding="utf-8") == _OLD_RULE
+    assert (outside / "levain-coordinator.rules").exists()               # never outside a recorded workspace
+    assert not (spaces["none"] / ".codex").exists()
+    assert cl.watch_once(s) is not None                                  # a second pass: nothing to do, no raise

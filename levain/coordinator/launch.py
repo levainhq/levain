@@ -1277,22 +1277,94 @@ def _single_flight(directory: Path) -> Iterator[bool]:
 
 
 def _retire_removed(store: CoordStore, lines: list[str]) -> None:
-    """(a0) of :func:`watch_once`: end every active, and fail every pending, coordinator launch whose harness is not
-    claude, cause :data:`levain.coordinator.lease.CODEX_REMOVED`. A launch that moved on since it was read is a line,
-    never a raise; one already over is not read again, so a second pass writes nothing."""
-    over = [(ln, "ended") for ln in store.launches_active() if ln.role == "coordinator" and ln.harness != "claude"]
-    pending = {ln.launch_id: ln for ln in store.launches_unspawned()}
-    newest = store.pending_coordinator()           # one whose spawn an older launcher claimed is not unspawned
-    if newest is not None:
-        pending.setdefault(newest.launch_id, newest)
-    over += [(ln, "failed") for ln in pending.values() if ln.role == "coordinator" and ln.harness != "claude"]
-    for ln, kind in over:
+    """(a0) of :func:`watch_once`: end every active, and fail every pending (its spawn claimed or not), coordinator
+    launch whose harness is not claude, cause :data:`levain.coordinator.lease.CODEX_REMOVED`, and take the Codex
+    rule that pre-approved its levain commands out of its workspace (:func:`_remove_legacy_codex_rule`). A launch that
+    moved on since it was read is a line, never a raise; one already over is not read again, so a second pass writes
+    nothing."""
+    from levain.autonomic.durable_sqlite import read_transaction
+
+    with read_transaction(store.open_readonly) as conn:
+        over = lease_mod.removed_coordinators(conn)
+    for ln in over:
+        kind = "ended" if ln.state == "active" else "failed"
         try:
             store.launch_end(ln.launch_id, kind, lease_mod.CODEX_REMOVED)
         except (CoordError, sqlite3.Error) as exc:
             lines.append(f"launch {ln.launch_id}: a {ln.harness} coordinator, not retired ({exc})")
             continue
         lines.append(f"launch {ln.launch_id} {kind}: {lease_mod.CODEX_REMOVED} (its lease, if it held one, released)")
+        if (removed := _remove_legacy_codex_rule(ln.cwd)) is not None:
+            lines.append(f"launch {ln.launch_id}: {removed}")
+
+
+# The rule `levain coord agent codex` wrote into the Codex coordinator's workspace (every release from 0.11.15 until the
+# verb's removal wrote the same text: the removed
+# `levain.install.codex_coordinator_rules`): Codex ran `<python> -P -m levain` coord / drops / thread from that
+# directory without asking, `coord take` and `coord release` among them, which need no launch. Kept here, frozen, only
+# so a retired launch's workspace loses that file when it still holds exactly what the writer wrote; a file that says
+# anything else is the operator's and stays.
+_LEGACY_CODEX_RULE_REL = (".codex", "rules", "levain-coordinator.rules")
+_LEGACY_CODEX_PATTERN = re.compile(r"^    pattern = (\[.*\]),$", re.MULTILINE)
+_LEGACY_CODEX_RULE_MAX = 64 * 1024
+
+
+def _legacy_codex_rule(python_path: str) -> str:
+    """What the removed writer wrote for an interpreter at ``python_path``, character for character."""
+    base = [python_path, "-P", "-m", "levain"]
+    verbs = ["coord", "drops", "thread"]
+
+    def lit(value: object) -> str:
+        return json.dumps(value, ensure_ascii=False)
+
+    return (
+        "# Written by Levain for its coordinator (np-6843ca07 (a)). Codex runs exactly these commands without asking:\n"
+        f"# {shlex.quote(python_path)} -P -m levain {' | '.join(verbs)} ...\n"
+        "# Every other command is decided as before. Codex loads this file only while you trust this directory.\n"
+        "prefix_rule(\n"
+        f"    pattern = {lit([*base, verbs])},\n"
+        '    decision = "allow",\n'
+        '    justification = "Levain coordinator verbs: they grant nothing (a signed envelope still does)",\n'
+        f"    match = {lit([[*base, verb, 'status'] for verb in verbs])},\n"
+        f"    not_match = {lit([[*base, 'team', 'record'], [*base, 'coordinator'], ['levain', 'coord']])},\n"
+        ")\n"
+    )
+
+
+def _remove_legacy_codex_rule(cwd: str | None) -> str | None:
+    """Remove ``<cwd>/.codex/rules/levain-coordinator.rules`` when it is a plain file holding exactly
+    :func:`_legacy_codex_rule` for the interpreter its own pattern names: a line saying so (or that the removal
+    failed). ``None``, touching nothing, for every other case: no workspace, a missing file, a file that differs, or a
+    symlink anywhere on the way. Nothing outside ``cwd`` and no other file is ever removed."""
+    if not cwd or not os.path.isabs(cwd):
+        return None
+    workspace = Path(cwd)
+    path = workspace.joinpath(*_LEGACY_CODEX_RULE_REL)
+    try:
+        if any(os.path.islink(d) or not d.is_dir() for d in (workspace, path.parent.parent, path.parent)):
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            held = os.fstat(fh.fileno())
+            raw = fh.read(_LEGACY_CODEX_RULE_MAX + 1)
+        if not stat.S_ISREG(held.st_mode) or len(raw) > _LEGACY_CODEX_RULE_MAX:
+            return None
+        text = raw.decode("utf-8")
+        m = _LEGACY_CODEX_PATTERN.search(text)
+        python_path = json.loads(m.group(1))[0] if m else None
+        if not isinstance(python_path, str) or not python_path or not python_path.isprintable() \
+                or text != _legacy_codex_rule(python_path):
+            return None
+        now = os.lstat(path)
+        if (now.st_dev, now.st_ino) != (held.st_dev, held.st_ino):
+            return None                                 # replaced since it was read: not the file that was checked
+    except (OSError, ValueError, IndexError, TypeError):  # UnicodeDecodeError and a JSON error are ValueErrors
+        return None
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        return f"{path}: the Codex coordinator's pre-approval rule could not be removed ({exc})"
+    return f"{path}: the Codex coordinator's pre-approval rule removed"
 
 
 def _watch_pass(store: CoordStore, lines: list[str]) -> None:
