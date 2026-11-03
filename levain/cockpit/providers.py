@@ -347,10 +347,18 @@ def spore_row_version(raw: Mapping[str, Any]) -> str:
 
 # a fresh install has no spore store until something is dropped: each panel says what fills it
 SPORE_EMPTY = {
-    "tray": "Nothing yet. Drop a thought in the box above and Sage sorts it.",
-    "loops": "Nothing yet. What stays open after Sage sorts the Tray is listed here.",
+    "tray": "Nothing yet. Drop a thought in the box above and {entity} sorts it.",
+    "loops": "Nothing yet. What stays open after {entity} sorts the Tray is listed here.",
     "keep": "Nothing yet. Add a note above to keep something handy.",
 }
+# what the Tray's capture box says when the install has no name for its entity (dashboard_core.js ``buildTrayDump`` says the same)
+SPORE_EMPTY_ENTITY = "the assistant"
+
+
+def spore_empty(bucket: str, entity: Any) -> str:
+    """The panel's empty sentence, naming the install's own entity (never a fixed name)."""
+    name = entity.strip() if isinstance(entity, str) and entity.strip() else SPORE_EMPTY_ENTITY
+    return SPORE_EMPTY[bucket].replace("{entity}", name)
 
 
 def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
@@ -427,10 +435,21 @@ TOP_MAX_BEGIN = 110
 def _spore_provider(
     source: SubstrateSource, bucket: str, *, apply_hold: bool = True
 ) -> Callable[[ReadContext], Result]:
+    seen = [False]      # the store has existed on a read: a later absence stays a fault, as the engine reads it
+
     def read(ctx: ReadContext) -> Result:
         path = source.anneal.spores_json
         if not path.exists():
-            return Absent(f"no spore store at {path}")
+            if seen[0]:
+                return Absent(f"no spore store at {path}")
+            # never present: the panel is empty, and its sentence names the entity as the view resolves it on THIS read
+            # (config name, else the origin.md H1), so a rename shows without a restart
+            try:
+                name = _view(source, ctx).entity_name
+            except Exception:       # noqa: BLE001 — a view that cannot be built still leaves an empty panel
+                name = _configured_entity_name(source)
+            return Read(rows=(), empty=spore_empty(bucket, name))
+        seen[0] = True
         view = _view(source, ctx)
         bad = _view_fault(view, "open_spores")
         if bad:
@@ -460,7 +479,7 @@ def _spore_provider(
         if view_full:
             skipped += ((1, f"the substrate view stopped at {VIEW_SPORE_LIMIT} rows; at least this many more exist"),)
         return Read(rows=tuple(rows), filtered=((filtered, "surface date not reached"),) if filtered else (),
-                    skipped=skipped)
+                    skipped=skipped, empty=spore_empty(bucket, view.entity_name))
     return read
 
 
@@ -600,13 +619,18 @@ def _entity_label(source: SubstrateSource) -> str:
     """The ``agent`` facet of the entity's own rows, read narrowly (no substrate view): the source's
     name, else the install config's. The panel's view also falls back to origin.md's H1; a facet
     is display only (the row version covers the stored record)."""
+    return _configured_entity_name(source) or "entity"
+
+
+def _configured_entity_name(source: SubstrateSource) -> str | None:
+    """The source's own entity name, else the install config's; None when neither names one."""
     if source.entity_name:
         return source.entity_name
     if source.install_root is not None:
         name = _read_levain_config(source.install_root).get("entity_name")
         if isinstance(name, str) and name.strip():
             return name.strip()
-    return "entity"
+    return None
 
 
 def _episode_read_one(source: SubstrateSource) -> Callable[[ReadContext, str], Result]:
@@ -1634,7 +1658,8 @@ def build_default_cockpit(
             pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank, size=size,
             order=order, views=views, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
             label_key=spore_label_key,
-            empty=SPORE_EMPTY[bucket], absent_is_empty=True, verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
+            # the registered text is the fallback only: a store that does not exist yet answers per read with the view's name
+            empty=spore_empty(bucket, _configured_entity_name(source)), absent_is_empty=True, verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
             **spore_common))
     ck.register(ProviderSpec(
         "episodes", "triage-list", "Recent episodes", "feed", _episodes(source, feeds), region="operate", rank=40,

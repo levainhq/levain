@@ -157,3 +157,19 @@ def test_act_until_does_not_run_its_action_again_once_the_condition_came_true_be
     r = _drive(tmp_path, [{"do": do, "until": "window.__ok", "ms": 10000, "every": 200}, {"eval": "new Promise(r => setTimeout(() => r(window.__n), 600))"}])
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["values"][-1] == 1, r.stdout
+
+
+@needs_browser
+def test_a_timeout_prints_the_page_state_after_its_named_line_and_keeps_the_exit_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LEVAIN_TEST_WAIT_SCALE", "0.1")                  # below 1 counts as 1: CI's own scale would double the 1500 ms the line names
+    page = ("data:text/html,<div id='levain-modal'><p data-question-row>a</p><p data-question-row>b</p></div>"
+            "<script>console.log('hello-' + 'from-the-page'); setTimeout(() => { throw new Error('late-' + 'page-error'); }, 100)</script>")
+    r = _drive_at(tmp_path, page, [{"until": "document.querySelectorAll('#levain-modal [data-question-row]').length === 7", "ms": 1500}])
+    assert r.returncode == 1 and "until never came true within 1500ms" in r.stderr, (r.returncode, r.stderr)
+    head, _, block = r.stderr.partition("--- page state at the timeout ---")
+    assert block, r.stderr                                           # the block follows the unchanged line, never replaces it
+    for label in ("PAGE URL:", "READY STATE: complete", "MODAL: #levain-modal exists=true [data-question-row] count=2",
+                  "CONSOLE (last 20", "console.log: hello-from-the-page", "page error: Error: late-page-error", "BODY TEXT (first 600):", "SCREENSHOT: ",
+                  "--- end page state ---"):
+        assert label in block, (label, r.stderr)
+    assert len(block) < 4100, len(block)

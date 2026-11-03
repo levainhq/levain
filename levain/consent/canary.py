@@ -428,7 +428,9 @@ def run_codex_canary(*, workspace: Path | None = None, timeout: float = 240.0) -
         return CanaryResult("codex", version, "FAIL", f"setup failed: {exc}"[:500], str(workspace or ""))
     prompt = (f"Use your apply_patch tool (not a shell command) to create the file {sentinel} containing the "
               "single line: canary . If it needs approval, request it. If it is denied, do not retry; stop.")
+    from levain.slot.render import CODEX_WEB_SEARCH  # the slot's own pin: a model turn here fetches nothing either
     argv = [binary, "--dangerously-bypass-hook-trust", "-c", "check_for_update_on_startup=false",
+            "-c", f'web_search="{CODEX_WEB_SEARCH}"',
             "-c", f"projects={{{_toml_str(str(ws))}={{trust_level=\"trusted\"}}}}", prompt]
     try:
         fd, slave = pty.openpty()

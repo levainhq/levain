@@ -210,10 +210,14 @@ if (!ws) {
   pageWsUrl = targets.find((t) => t.type === "page").webSocketDebuggerUrl;
   ws = await within(openSocket(pageWsUrl, "chrome's page"), 15000, "the page websocket");
 }
-let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = [];   // trail: what a timeout dump reports of the page's refusals and prompts
+let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = []; const consoleLog = [];   // consoleLog: the page's console output and errors, for the timeout block; trail: what a timeout dump reports of the page's refusals and prompts
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
+  if (d.method === "Runtime.consoleAPICalled") consoleLog.push(`console.${d.params.type}: ` + (d.params.args || []).map((a) => String(a.value !== undefined ? a.value : (a.description || a.type))).join(" ").slice(0, 300));
+  if (d.method === "Runtime.exceptionThrown") consoleLog.push("page error: " + String(d.params.exceptionDetails?.exception?.description || d.params.exceptionDetails?.text).slice(0, 300));
+  if (d.method === "Log.entryAdded") consoleLog.push(`log.${d.params.entry.level}: ${String(d.params.entry.text).slice(0, 300)}`);
+  if (consoleLog.length > 200) consoleLog.shift();
   if (d.method === "Page.loadEventFired") loads++;
   if (trail.length > 50) trail.shift();          // a page refused in a loop keeps its last 50
   if (d.method === "Page.javascriptDialogOpening") dialogs.push(`${d.params.type}: ${String(d.params.message)}`);
@@ -234,6 +238,7 @@ const send = (method, params = {}) => new Promise((res, rej) => {
   try { ws.send(JSON.stringify({ id: i, method, params })); } catch (e) { pend.delete(i); rej(e); }
 });
 await send("Page.enable"); await send("Network.enable");
+for (const m of ["Runtime.enable", "Log.enable"]) { try { await Promise.race([send(m), sleep(3000)]); } catch {} }   // console capture is best-effort: never a reason to fail a drive
 await send("Page.navigate", { url });
 const values = [];
 // an act-until re-run's own result key, and whether a `do` source parses as one expression (compiled here in node, never run)
@@ -267,12 +272,32 @@ for (const end = Date.now() + scaled(15000); Date.now() < end;) {
 // a wait that fails the drive leaves a PNG of what the page showed beside the steps file (the test's tmp dir),
 // and its path on stderr, so the failure can be read rather than guessed at
 // (each call is raced against ~3 s: a wedged page must not turn the named failure into the runner's timeout)
+// the diagnostic block a timeout prints AFTER its named failure line: page state through one probe that cannot throw, the
+// last 20 console messages / page errors, and the screenshot path; capped at 4000 characters, never able to change the exit
+const timeoutBlock = async (shotPath) => {
+  try {
+    const probe = await evaluateOutcome("(() => { try { const m = document.querySelector('#levain-modal'); return JSON.stringify({ url: location.href, ready: document.readyState, modal: !!m, rows: m ? m.querySelectorAll('[data-question-row]').length : null, text: String((document.body && document.body.innerText) || '').slice(0, 600) }); } catch (e) { return JSON.stringify({ probe_error: String(e) }); } })()", 3000);
+    let o = {}; try { o = JSON.parse(probe.value); } catch { o = { probe_error: probe.error || "no answer" }; }
+    const lines = ["--- page state at the timeout ---",
+      `PAGE URL: ${o.url ?? "?"}`, `READY STATE: ${o.ready ?? "?"}`,
+      `MODAL: #levain-modal exists=${o.modal ?? "?"} [data-question-row] count=${o.rows ?? "?"}` + (o.probe_error ? ` (probe error: ${o.probe_error})` : ""),
+      `CONSOLE (last 20 of ${consoleLog.length}):`, ...consoleLog.slice(-20).map((c) => "  " + c),
+      "BODY TEXT (first 600):", String(o.text ?? "").replace(/\n{2,}/g, "\n"),
+      `SCREENSHOT: ${shotPath || "none"}`, "--- end page state ---"];
+    console.error(lines.join("\n").slice(0, 4000));
+  } catch {}
+};
 const shotOnTimeout = async (n) => {
+  let shotPath = null;
+  try { await shotOnTimeoutInner(n, (p) => { shotPath = p; }); } catch {}
+  await timeoutBlock(shotPath);
+};
+const shotOnTimeoutInner = async (n, setPath) => {
   try {
     const r = await sendWithin(3000, "Page.captureScreenshot", { format: "png" });
     if (!r.result?.data) return;
     const p = join(dirname(stepsPath), `timeout-step-${n}.png`);
-    writeFileSync(p, Buffer.from(r.result.data, "base64"));
+    writeFileSync(p, Buffer.from(r.result.data, "base64")); setPath(p);
     console.error(`screenshot at the timeout: ${p}`);
     const t = await evaluateOutcome("document.body.innerText", 3000);
     // the page's own state beside its text: which tab, which address, which kept keys (a timeout names where the page was)
