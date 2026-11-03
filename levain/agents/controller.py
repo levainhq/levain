@@ -42,7 +42,7 @@ __all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurren
            "close_no_slot", "tick", "heartbeat", "takeover", "Window", "LaunchResult", "launch",
            "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE", "SESSION_GRACE_S",
            "Ended", "settle_terminal", "GatedChild", "GATE_REFUSED", "fire_argv", "fire_record_path", "spawn_fire",
-           "claim_fire", "fire"]
+           "claim_fire", "fire", "miss_streak"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
@@ -51,6 +51,7 @@ OVERLAP = "skipped-overlap"
 LEASE_S = 900  # A0 r7 section 2.3 [judged]: the coordinator slot's lease
 
 CURSOR_PREFIX = "tick_cursor:"
+STREAK_PREFIX = "miss_streak:"
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -114,6 +115,8 @@ class TickResult:
     changed: list[str] = field(default_factory=list)                 # lifecycle moved mid-tick: left for next tick
     clamped: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, cursor): a cursor past the clock
     no_slot: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, key): admitted, past grace, no slot
+    missed_windows: dict[str, list[str]] = field(default_factory=dict)  # agent_id -> windows with a missed slot, once each
+    silent: list[str] = field(default_factory=list)                  # agents whose walk saw missed slots and fired nothing
 
 
 def _agents(conn: sqlite3.Connection) -> list[tuple]:
@@ -245,7 +248,54 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
                 _settle(conn, agent_id, cursor, floor, out)
                 continue
         _walk(store, agent_id, snap, trigger, binding, cursor, floor, now, out)
+        if out.missed_windows.get(agent_id) and not any(
+                a == agent_id for a, _ in out.claimed + out.overlapped + out.duplicates):
+            out.silent.append(agent_id)  # a whole stretch went by and this one pass is the first to see it
     return out
+
+
+def _read_streak(conn: sqlite3.Connection, agent_id: str) -> tuple[int, str, str] | None:
+    row = conn.execute("SELECT value FROM agent_settings WHERE key = ?", (STREAK_PREFIX + agent_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        count, window, at = row[0].split("|", 2)
+        return int(count), window, at
+    except ValueError:
+        return None  # unreadable: no streak is claimed on a value nobody can read
+
+
+def _record_misses(conn: sqlite3.Connection, agent_id: str, misses: list[tuple[str, str]],
+                   out: TickResult) -> None:
+    """``misses`` is ``(window_key, slot_key)`` in slot order. A window counts once however many of its slots went by
+    (a closed-lid night is one miss), and a window already counted by an earlier chunk or tick is not counted twice."""
+    if not misses:
+        return
+    prior = _read_streak(conn, agent_id)
+    count, last = (prior[0], prior[1]) if prior else (0, "")
+    if prior is not None and _cleared(conn, agent_id, prior[2]):
+        count, last = 0, ""
+    for window, _ in misses:
+        if window != last:
+            count, last = count + 1, window
+        if window not in out.missed_windows.setdefault(agent_id, []):
+            out.missed_windows[agent_id].append(window)
+    conn.execute("INSERT INTO agent_settings (key, value) VALUES (?, ?)"
+                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                 (STREAK_PREFIX + agent_id, f"{count}|{last}|{misses[-1][1]}"))
+
+
+def _cleared(conn: sqlite3.Connection, agent_id: str, since: str) -> bool:
+    """A ``done`` run admitted after the last missed slot ends the streak; a ``skipped-no-input`` neither counts nor
+    clears (BUILD_PLAN gate counting)."""
+    return conn.execute("SELECT 1 FROM agent_occurrences WHERE agent_id = ? AND state = 'done' AND admitted_at >= ?",
+                        (agent_id, since)).fetchone() is not None
+
+
+def miss_streak(conn: sqlite3.Connection, agent_id: str) -> int:
+    """Consecutive windows with a missed slot and no ``done`` run since; 0 when none or the record is unreadable."""
+    row = _read_streak(conn, agent_id)
+    return 0 if row is None or _cleared(conn, agent_id, row[2]) else row[0]
 
 
 def _walk(store: AgentStore, agent_id: str, snap: tuple, trigger: dict, binding: str, cursor: datetime,
@@ -259,16 +309,19 @@ def _walk(store: AgentStore, agent_id: str, snap: tuple, trigger: dict, binding:
             if _state(conn, agent_id) != snap or _cursor(conn, agent_id) != cursor:
                 out.changed.append(agent_id)
                 return
+            misses = []
             for slot in slots:
                 key = schedule.slot_key(slot)
                 # first seen NOW, whichever chunk the slot sits in
                 if schedule.classify(slot, now) != schedule.DUE:
                     out.missed[agent_id] = out.missed.get(agent_id, 0) + 1
+                    misses.append((schedule.window_key(trigger, zone, slot), key))
                     continue
                 _, outcome = claim(conn, agent_id=agent_id, kind="scheduled", key=key, spec_hash=snap[3],
                                    binding_id=binding, window_key=schedule.window_key(trigger, zone, slot), now=now)
                 {CLAIMED: out.claimed, OVERLAP: out.overlapped, DUPLICATE: out.duplicates}[outcome].append(
                     (agent_id, key))
+            _record_misses(conn, agent_id, misses, out)
             _set_cursor(conn, agent_id, upto)
         cursor = upto
 
