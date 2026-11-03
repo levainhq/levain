@@ -974,3 +974,11 @@ def test_a_group_that_never_drains_exits_unproven_at_the_deadline(tmp_path, monk
         assert gated.process.wait(15) == ctl.GATE_UNPROVEN
     finally:
         gated.abort(1)
+
+
+@pytest.mark.parametrize("rc,want", [
+    (None, False), (True, False), (False, False), (-9, False), (-15, False), (0, True), (1, True),
+    (76, False), (127, True), (143, True), (255, True),
+])
+def test_gate_proves_termination(rc, want):
+    assert ctl.gate_proves_termination(rc) is want

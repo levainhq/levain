@@ -807,6 +807,15 @@ def _gate(drain_s: float) -> str:
 _GATE = _gate(GATE_DRAIN_S)
 
 
+def gate_proves_termination(returncode: int | None) -> bool:
+    """True only when a gate's ``returncode`` proves its executor's group is gone: an int (``bool`` excluded) that is
+    >= 0 and not :data:`GATE_UNPROVEN`. ``None`` (not reaped), a negative status (the gate killed outright) and
+    :data:`GATE_UNPROVEN` prove nothing."""
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        return False
+    return returncode >= 0 and returncode != GATE_UNPROVEN
+
+
 class GatedChild:
     """A child started blocked: a ``python -I`` gate holds the read end of a pipe and runs ``argv`` only after it
     reads the release byte; EOF (the holder closed its end, or died) exits :data:`GATE_REFUSED` without exec. The gate
@@ -826,8 +835,8 @@ class GatedChild:
     :data:`GATE_NO_EXEC` when ``argv`` could not be exec'd), or 128 + a signal the gate handled while the executor
     still ran. Two statuses prove nothing about the group: a negative ``returncode`` (the gate killed outright) and
     :data:`GATE_UNPROVEN` (the group did not drain within :data:`GATE_DRAIN_S` of its SIGKILL, or the gate's own setup
-    after the executor's fork failed). So an executor's ``stop()`` that reads termination off this child reads it as
-    reaped with ``returncode >= 0`` and ``returncode != GATE_UNPROVEN``, and signals ``process`` with SIGTERM, never
+    after the executor's fork failed). So an executor's ``stop()`` that reads termination off this child reads it through
+    :func:`gate_proves_termination` (never a bare non-negative test), and signals ``process`` with SIGTERM, never
     SIGKILL first.
 
     What the lifeline cannot reach: a descendant that leaves the group (``setsid``, its own ``setpgid``) or that this
