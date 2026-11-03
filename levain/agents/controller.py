@@ -336,16 +336,18 @@ def heartbeat(conn: sqlite3.Connection, occurrence_id: str, epoch: int, now: dat
 
 
 def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime,
-             usage: accounting.Usage | None = None) -> bool:
+             usage: accounting.Usage | None = None, stopped: accounting.StopResult | None = None) -> bool:
     """Fenced takeover (A0 r7 section 2.3, lapse recovery): end a ``launched`` row whose lease has lapsed, writing
     ``epoch + 1`` and ``crash_recovered`` in one statement, settling its reservation and freeing its slot in the same
     transaction (A0 §2.4's lapse row, through :func:`_end_launched`, the one end :func:`settle_terminal` uses). The
     lease is read here, inside the write transaction, and the ``UPDATE`` is guarded by the exact value read, so a
     heartbeat that landed first or a takeover that already ran leaves it with nothing to change (``False``), and
     nothing is settled or freed. A live lease is never taken over; a lease that is absent or unreadable is not
-    evidence of a lapse, so it is refused too. ``usage`` is unreadable unless the caller can read the executor's
-    record by now (§2.4: then all of the reservation is debited, or the caps recorded on a subscription run). It takes
-    the caller's write lock first, as :func:`heartbeat` does."""
+    evidence of a lapse, so it is refused too. ``usage`` is settled as read only together with ``stopped``, the
+    executor's own :class:`accounting.StopResult` with ``terminated`` True: a reading taken while the process may
+    still run is a snapshot, and settling it would free the slot below what the run goes on to spend. Without that
+    proof the end is unreadable whatever ``usage`` says (§2.4: all of the reservation is debited, or the caps recorded
+    on a subscription run). It takes the caller's write lock first, as :func:`heartbeat` does."""
     if not conn.in_transaction:
         raise RuntimeError("a takeover runs inside the caller's write transaction")
     at = schedule._utc(now)
@@ -357,8 +359,10 @@ def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime,
     lease = _lease(row[0])
     if lease is None or at <= lease:
         return False
+    proven = type(stopped) is accounting.StopResult and stopped.terminated is True
     ended = _end_launched(conn, occurrence_id, "stopped", "crash_recovered",
-                          usage if usage is not None else _UNREAD, at, "lease_until = ?", (row[0],), bump=True)
+                          usage if usage is not None and proven else _UNREAD, at, "lease_until = ?", (row[0],),
+                          bump=True)
     return ended.ended
 
 

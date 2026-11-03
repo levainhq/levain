@@ -6,12 +6,13 @@ was first run as a script against that rig (P65B_DESIGN.md).
 """
 from __future__ import annotations
 
+import dataclasses
 from datetime import timedelta
 
 import pytest
 
 from levain.agents import controller as ctl
-from levain.agents.accounting import Usage
+from levain.agents.accounting import StopResult, Usage
 from tests.test_agents_launch import Rig, _launched  # noqa: F401  (the rig, its skips and its fixtures)
 from tests.test_agents_launch import pytestmark  # noqa: F401
 
@@ -94,15 +95,35 @@ def test_a_subscription_run_records_the_counts_its_executor_read(rig):
 
 
 def test_lapse_recovery_routes_through_the_same_end(rig):
-    # behaviour: takeover is settle_terminal's end with epoch + 1 and crash_recovered; a usage the caller could read by
-    # then is settled as actual (§2.4's lapse row "unless the executor's usage record is readable by then")
+    # behaviour: takeover is settle_terminal's end with epoch + 1 and crash_recovered; a usage the caller read is
+    # settled as actual only with the executor's stop() proving termination (§2.4's lapse row "unless the executor's
+    # usage record is readable by then", held to the first row's "after stop() reports terminated")
     oid, epoch = _launched(rig)
     with rig.store.write() as c:
-        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1)), Usage(30_000, 1, 1, "t")) is True
+        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1)), Usage(30_000, 1, 1, "t"),
+                            StopResult(True, "exited")) is True
     row = rig.row(oid)
     assert (row["state"], row["reason"], row["epoch"]) == ("stopped", "crash_recovered", epoch + 1)
     assert _reservation(rig, oid)[:3] == ("settled", 30_000, "actual") and rig.taken(oid)[0] == []
     assert _end(rig, oid, epoch + 1, "stopped", "stop_at", Usage(None, None, None, "t")) == ctl.Ended(False)
+
+
+@pytest.mark.parametrize("proof", [None, StopResult(False, "cannot tell"), True, "terminated"])
+def test_a_takeover_usage_without_a_termination_proof_settles_the_whole_reservation(rig, proof):
+    # behaviour (codex HIGH + complement MED r1): a readable usage is a snapshot unless the executor observed its
+    # process end; without StopResult(terminated=True) takeover debits all of the reservation, whatever usage says, so
+    # a live executor whose lease lapsed cannot be settled at a partial figure and keep spending past it
+    oid, _ = _launched(rig)
+    with rig.store.write() as c:
+        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1)), Usage(30_000, 1, 1, "t"),
+                            proof) is True
+    assert _reservation(rig, oid)[:3] == ("settled", 100_000, "unreadable") and rig.taken(oid)[0] == []
+
+
+def test_the_unreadable_marker_is_immutable(rig):
+    # complement/deepseek LOW r1: the shared lapse-recovery usage cannot be changed by anything it is passed to
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ctl._UNREAD.usd_micros = 1  # type: ignore[misc]
 
 
 @pytest.mark.parametrize("state, reason, epoch", [("done", "stop_at", 0), ("failed", "completed", 0),
