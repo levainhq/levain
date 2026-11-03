@@ -445,3 +445,42 @@ def test_a_superseding_body_without_seen_is_refused_by_parse_body(ctx):
     with pytest.raises(CoordError, match="supersedes"):
         ctx.accept(ctx.sign(b))
     assert envelopes(ctx) == [(head["envelope_id"],)]
+
+
+# the rules, and the builder's one machine fault -------------------------------------------------------------------------
+def test_drop_rule_then_spec_rule_make_a_signable_draft_from_cited_drops(ctx):
+    d, t = ctx.plain_thread("fix the readme")
+    r1 = drafts.drop_rule(ctx.store, t.thread_id, by="operator")           # the drop was sent from a work tree
+    assert r1.proposal["where"] == [{"repo": ctx.path, "paths": ["."]}] and r1.proposal["lands"] is None
+    assert r1.cites == [{"field": "where", "kind": "drop", "ref": d.drop_id, "digest": d.words_sha256}]
+    spec = {"where": [{"repo": ctx.path, "paths": ["README"]}], "lands": [{"repo": ctx.path, "onto": "main"}],
+            "pushes": [], "publishes": [], "budget": dict(BUDGET), "stop": "2h"}
+    correction = ctx.plain(json.dumps(spec))                                # sent after the series began, not a member
+    r2 = drafts.spec_rule(ctx.store, t.thread_id, correction.drop_id, by="operator")
+    assert (r2.draft_id, r2.revision) == (r1.draft_id, 2)                   # the unclosed series, not a new one
+    assert r2.proposal["where"] == [{"repo": ctx.path, "paths": ["README"]}]
+    assert r2.proposal["stop_at"] == utc_stamp(NOW + 2 * HOUR) and ed.is_complete(r2.proposal)
+    assert {c["ref"] for c in r2.cites} == {correction.drop_id}
+    signed, since, against = built(ctx, r2)
+    assert {x["field"] for x in since} >= {"lands", "stop_at", "budget"} and against.base_kind == "none"
+    stored, created = ctx.accept(signed)
+    assert created and ctx.store.threads_of_envelope(stored.envelope_id) == [t.thread_id]
+    free = ctx.plain("please make it faster")
+    t2 = ctx.plain_thread("other")[1]
+    with pytest.raises(CoordError, match="not an envelope spec"):
+        drafts.spec_rule(ctx.store, t2.thread_id, free.drop_id, by="operator")
+
+
+def test_the_builder_lets_a_verifier_fault_propagate(ctx, monkeypatch):
+    from levain.authority import VerifierUnavailable
+
+    hd, head, t = head_thread(ctx)
+    f = fields_for(ctx)
+    r1 = drafts.create(ctx.store, t.thread_id, f, cites_for(hd, f), by="operator")
+
+    def down(*a, **k):
+        raise VerifierUnavailable("ssh-keygen is not here")
+
+    monkeypatch.setattr(env, "refusal", down)
+    with pytest.raises(VerifierUnavailable):
+        built(ctx, r1)
