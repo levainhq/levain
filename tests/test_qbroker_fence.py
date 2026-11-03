@@ -5,11 +5,14 @@ fence step runs before the run's count. The session is joined to its occurrence 
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -19,9 +22,9 @@ from levain.agents import controller
 from levain.autonomic.agent_tables import create_agent_objects
 from levain.consent import broker_client
 from levain.consent.broker_client import BrokerError
-from levain.qbroker import __main__ as qmain, broker as qbroker, fence as qfence, operator
+from levain.qbroker import __main__ as qmain, broker as qbroker, fence as qfence, fence_server, operator
 from levain.qbroker.broker import Resolved
-from levain.qbroker.fence import AgentFences, Unfenceable
+from levain.qbroker.fence import AgentFences, RemoteFences, Unfenceable
 from levain.slot import tickets
 import tests.test_qbroker as base
 from tests.test_qbroker import RUN, make_broker
@@ -364,32 +367,79 @@ def production(L, tmp_path, *extra):
     return qmain.build_broker(args, limits_owner=ME)
 
 
-def test_the_production_broker_fences_a_revoked_agent_session(rig, L, tmp_path, monkeypatch):
-    b = production(L, tmp_path, "--agent-store", str(tmp_path / "autonomic"), "--cockpit-root", str(rig.world.root))
-    assert isinstance(b._fence, AgentFences)
-    who = Resolved(session=SESSION, kind="dispatch", run=rig.run)
-    monkeypatch.setattr(b, "_resolve", lambda slot, cap, **kw: who)
-    assert go2(b)[0]["gate"] == "go"
-    rig.world.link(revoke_agent())
-    got = go2(b)[0]
-    assert got["gate"] == "fenced" and "no longer live" in got["reason"]
+@pytest.fixture
+def fence_run():
+    """A short R (a unix socket path is bounded) holding ``fence/`` as the fence server demands it: mine, 0750."""
+    top = Path(tempfile.mkdtemp(prefix="fen-", dir="/tmp"))
+    (top / "fence").mkdir()
+    os.chmod(top / "fence", 0o750)
+    yield top
+    shutil.rmtree(top)
 
 
-@pytest.mark.parametrize("extra", [(), ("--agent-store", "/nonexistent"), ("--cockpit-root", "/nonexistent")])
-def test_the_production_broker_without_an_agent_store_refuses_every_dispatch_session(rig, L, tmp_path, monkeypatch,
-                                                                                     extra):
+def serve_fence(rig, run_dir, *, broker_uid=None, operator_uid=None, fences=None, **kw):
+    """The real fence server over ``rig``'s real AgentFences, on ``run_dir/fence/fence.sock``. Both ends run as this
+    uid here, so the server takes this uid as the broker's and a uid no process has as the operator's (the one seam
+    a laptop cannot cross: two real accounts, P72_WIRING_DESIGN section 6)."""
+    me = os.geteuid()
+    srv = fence_server.FenceServer(rig.fences if fences is None else fences, qfence.fence_socket_path(run_dir),
+                                   broker_uid=me if broker_uid is None else broker_uid,
+                                   operator_uid=me + 100_000 if operator_uid is None else operator_uid,
+                                   expected_gid=os.stat(run_dir / "fence").st_gid,
+                                   store=rig.db.parent, cockpit_root=rig.world.root, **kw)
+    srv.start()
+    return srv
+
+
+def test_the_production_broker_fences_a_revoked_agent_session_through_the_fence_server(rig, L, tmp_path, monkeypatch,
+                                                                                       fence_run):
+    srv = serve_fence(rig, fence_run)
+    try:
+        b = production(L, tmp_path, "--fence-socket", str(qfence.fence_socket_path(fence_run)),
+                       "--fence-uid", str(os.geteuid()))
+        assert isinstance(b._fence, RemoteFences)
+        who = Resolved(session=SESSION, kind="dispatch", run=rig.run)
+        monkeypatch.setattr(b, "_resolve", lambda slot, cap, **kw: who)
+        assert go2(b)[0]["gate"] == "go"
+        rig.world.link(revoke_agent())
+        got = go2(b)[0]
+        assert got["gate"] == "fenced" and "no longer live" in got["reason"]
+    finally:
+        srv.stop()
+
+
+@pytest.mark.parametrize("extra", [(), ("--fence-socket", "/nonexistent"), ("--fence-uid", "501"),
+                                   ("--fence-socket", "/x", "--fence-uid", "0")])
+def test_the_production_broker_without_a_fence_refuses_every_dispatch_session(rig, L, tmp_path, monkeypatch, extra):
     b = production(L, tmp_path, *extra)
     assert isinstance(b._fence, Unfenceable)
     monkeypatch.setattr(b, "_resolve", lambda slot, cap, **kw: Resolved(session=SESSION, kind="dispatch",
                                                                         run=rig.run))
     got = go2(b)[0]
-    assert got["gate"] == "limits-failed" and qmain.NO_AGENT_STORE in got["reason"]
+    assert got["gate"] == "limits-failed" and qmain.NO_FENCE in got["reason"]
     monkeypatch.setattr(b, "_resolve", lambda slot, cap, **kw: base.SESSION_A)
     assert gate(b, slot=1, cap="cap-a")["gate"] == "go"          # an interactive session is not a run
 
 
-def test_the_service_namespace_builds_a_refusing_fence():
-    # levain.slot.services.qbroker builds with a Namespace of store and run alone
+def test_the_production_broker_with_its_fence_down_refuses_every_dispatch_session(rig, L, tmp_path, monkeypatch,
+                                                                                   fence_run):
+    b = production(L, tmp_path, "--fence-socket", str(qfence.fence_socket_path(fence_run)),
+                   "--fence-uid", str(os.geteuid()))
+    monkeypatch.setattr(b, "_resolve", lambda slot, cap, **kw: Resolved(session=SESSION, kind="dispatch",
+                                                                        run=rig.run))
+    got = go2(b)[0]
+    assert got["gate"] == "limits-failed" and "the agent fence is not running" in got["reason"]
+    assert rig.calls()["known"] is False
+
+
+def test_the_old_store_flags_are_gone_from_the_broker():
+    # moved to the fence server (the operator's stores are out of _levain_qbroker's reach, P7-0 U4)
+    for flag in ("--agent-store", "--cockpit-root"):
+        with pytest.raises(SystemExit):
+            qmain.parse_args(["--slot", "1", flag, "/x"])
+
+
+def test_the_service_namespace_without_a_fence_builds_a_refusing_fence():
     assert isinstance(qmain.build_fence(argparse.Namespace(store="/x", run="/y")), Unfenceable)
 
 

@@ -26,6 +26,7 @@ import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 from levain.qbroker import __main__ as QM
+from levain.qbroker.fence import fence_socket_path
 from levain.qbroker.server import SlotListener, socket_path
 from levain.slot import Refused
 from levain.slot import records as R
@@ -177,6 +178,24 @@ class Slots:
         self._missed.clear()
 
 
+def fence_namespace(seams: H.Seams, *, log: Callable[[str], None] = _log) -> argparse.Namespace:
+    """What :func:`levain.qbroker.__main__.build_broker` builds from: ``L`` and ``R``, and the agent fence (P7-2
+    wiring): the socket ``R/fence/fence.sock`` and the uid it must be served by, the operator's from
+    ``L/policy/operator`` (read once, at start). An operator record that cannot be read leaves the uid out, so
+    :func:`levain.qbroker.__main__.build_fence` refuses every dispatch session (fail closed) until a restart reads it."""
+    try:
+        store = H.Store(seams)
+        try:
+            uid: Optional[int] = H.read_operator_uid(store)
+        finally:
+            store.close()
+    except Exception as e:   # noqa: BLE001 - no operator uid is no fence, never an unfenced go
+        log(f"the operator record could not be read ({type(e).__name__}: {e}); every dispatch session is refused")
+        uid = None
+    return argparse.Namespace(store=str(seams.L), run=str(seams.R), fence_socket=str(fence_socket_path(seams.R)),
+                              fence_uid=uid)
+
+
 def serve(seams: H.Seams, *, limits_owner: int = 0, rescan_s: float = RESCAN_S,
           stop: Optional[threading.Event] = None, log: Callable[[str], None] = _log,
           build: Callable[..., object] = QM.build_broker, listener: Callable[..., SlotListener] = SlotListener) -> int:
@@ -195,7 +214,7 @@ def serve(seams: H.Seams, *, limits_owner: int = 0, rescan_s: float = RESCAN_S,
             stop = threading.Event()
             for s in (signal.SIGTERM, signal.SIGINT):
                 old[s] = signal.signal(s, lambda *_: stop.set())   # type: ignore[union-attr]
-        broker = build(argparse.Namespace(store=str(seams.L), run=str(seams.R)), limits_owner=limits_owner)
+        broker = build(fence_namespace(seams, log=log), limits_owner=limits_owner)
         slots = Slots(broker, seams, log=log, listener=listener)
         while not stop.is_set():
             slots.sync()
@@ -228,7 +247,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 __all__ = ["ACCOUNT", "EX_INSTANCE_HELD", "EX_WRONG_USER", "INSTANCE_LOCK", "INSTANCE_WAIT_S", "MISSES_TO_STOP",
-           "RESCAN_S", "Slots", "main", "scan", "serve", "take_instance_lock"]
+           "RESCAN_S", "Slots", "fence_namespace", "main", "scan", "serve", "take_instance_lock"]
 
 
 if __name__ == "__main__":

@@ -165,6 +165,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_slot_limits())
     core.extend(_check_slot_keys())
     core.extend(_check_slot_services())
+    core.extend(_guarded("agent fence", _check_agent_fence))
     for r in core:
         _emit(r)
     print(spend_cap_note())
@@ -2014,6 +2015,124 @@ def _check_slot_services(*, host: str | None = None, store: Path | None = None, 
     rows += _guarded("agent control", lambda: _check_control(host, up, answer))
     rows += _guarded("agent held sessions", lambda: _check_held(answer, beat, when))
     return rows
+
+
+# --- the agent fence (P7-2 wiring, shape C: levain.qbroker.fence_server) ------------------------------------------
+
+#: DECISION: one deadline for the fence server's STATUS answer (its probes wait at most two short SQLite busy waits)
+_FENCE_ASK_S = 3.0
+#: DECISION: the largest STATUS answer read (two paths and three short texts)
+_FENCE_STATUS_MAX = 4096
+_FENCE_NOT_RUNNING = "not running. Every dispatch session's tool calls are refused until it runs."
+
+
+def _fence_start() -> str:
+    from levain.daemon import DEFAULT_FENCE_LABEL
+
+    return (f"Start the operator's agent fence service (launchd label {DEFAULT_FENCE_LABEL}, or the systemd --user "
+            "unit of that name). It must run as you, never root.")
+
+
+def _ask_fence_status(path: Path, me: int, deadline: float, peer_uid: Any = None) -> tuple[str, Any]:
+    """One ``STATUS`` on the fence socket, inside ``deadline`` as a whole: ``("answer", fields)``, ``("down", why)``
+    (nothing listens), ``("peer", uid)`` (served by another uid: the broker refuses it, and STATUS is not sent),
+    ``("refused", name)`` or ``("silent", why)``. Nothing here raises."""
+    import socket
+
+    from levain.qbroker import wire
+
+    if peer_uid is None:
+        from levain.qbroker.peercred import peer_uid
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(max(deadline - _clock(), 0.001))
+            s.connect(str(path))
+            uid = peer_uid(s)
+            if uid != me:
+                return "peer", uid
+            s.settimeout(max(deadline - _clock(), 0.001))
+            wire.write_frame(s, {"v": 1, "op": "STATUS", "id": 1})
+            ans = wire.read_frame(s, timeout=max(deadline - _clock(), 0.001), max_frame=_FENCE_STATUS_MAX)
+    except (FileNotFoundError, ConnectionRefusedError) as exc:
+        return "down", type(exc).__name__
+    except (TimeoutError, socket.timeout):
+        return "silent", "no answer in time"
+    except Exception as exc:  # noqa: BLE001 - any other failure is "did not answer"
+        return "silent", type(exc).__name__
+    if type(ans) is not dict or ans.get("id") != 1 or type(ans.get("ok")) is not bool:
+        return "silent", "closed without an answer" if ans is None else "an answer off its shape"
+    if ans["ok"] is not True:
+        why = ans.get("refused")
+        return "refused", why[:40] if type(why) is str and why else "an unnamed refusal"
+    return "answer", ans
+
+
+def _check_agent_fence(*, host: str | None = None, store: Path | None = None, run: Path | None = None,
+                       uid: int | None = None, ask: Any = None, lstat: Any = None,
+                       qbroker_gid: Any = None) -> list[CheckResult]:
+    """The ``agent fence`` row (P7-2 wiring): the operator-uid service the queue broker asks, once per dispatch GATE,
+    whether the session's agent is still current. Read as the OPERATOR: the socket's owner, group and mode (the
+    broker's peer check and its group are what keep every other uid off it), then the server's ``STATUS``: what it
+    reads and whether it can read it. No row before the isolation install. ``ask``/``lstat``/``qbroker_gid``/``uid``:
+    a test's seams (``ask(path, me)`` returns what :func:`_ask_fence_status` does)."""
+    import grp
+    import stat as st_mod
+
+    from levain import unshowable
+    from levain.qbroker.fence import fence_socket_path
+    from levain.slot import layout
+
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    run = run if run is not None else layout.RUN.get(host)
+    if store is None or run is None or not (store / "policy").is_dir():
+        return []
+    name = "agent fence"
+    me = os.getuid() if uid is None and hasattr(os, "getuid") else uid
+    if me == 0:
+        return [CheckResult(name, True, "not asked: run as root, and the fence serves its STATUS to the operator",
+                            "Run `levain doctor` as the operator to see it.", neutral=True)]
+    path = fence_socket_path(run)
+    try:
+        st = (lstat or os.lstat)(path)
+    except FileNotFoundError:
+        return [CheckResult(name, False, _FENCE_NOT_RUNNING, _fence_start())]
+    except OSError as exc:
+        return [CheckResult(name, False, f"its socket {path} cannot be read ({type(exc).__name__}); every dispatch "
+                            "session's tool calls are refused while the queue broker cannot reach it",
+                            f"Run `{layout.repair_line(host)}`.")]
+    try:
+        gid = (qbroker_gid or (lambda: grp.getgrnam("_levain_qbroker").gr_gid))()
+    except KeyError:
+        return [CheckResult(name, False, "there is no _levain_qbroker group, so no queue broker can reach it",
+                            f"Run `{layout.repair_line(host)}`.")]
+    if not st_mod.S_ISSOCK(st.st_mode) or st.st_uid != me or st.st_gid != gid or st_mod.S_IMODE(st.st_mode) != 0o660:
+        return [CheckResult(name, False, f"its socket {path} is not owner you (uid {me}), group _levain_qbroker, "
+                            "0660; the queue broker refuses it", "Stop the fence service, remove the socket and "
+                            f"start it again; if it comes back the same, run `{layout.repair_line(host)}`.")]
+    kind, val = (ask or (lambda p, u: _ask_fence_status(p, u, _clock() + _FENCE_ASK_S)))(path, me)
+    if kind == "down":
+        return [CheckResult(name, False, _FENCE_NOT_RUNNING + f" (its socket is there, but {val})", _fence_start())]
+    if kind == "peer":
+        return [CheckResult(name, False, f"its socket {path} is served by uid {val}, not you; the queue broker "
+                            "refuses it, so every dispatch session's tool calls are refused", _fence_start())]
+    if kind != "answer":
+        return [CheckResult(name, False, f"running but does not answer ({unshowable.mark(str(val)[:60], allow='')}); "
+                            "dispatch sessions are refused", "Look at the fence service's log; restart it.")]
+    store_error, authority_error = val.get("store_error"), val.get("authority_error")
+    for what, err in (("the agent store", store_error), ("the authority log", authority_error)):
+        if err is not None:
+            why = unshowable.mark(err[:120], allow="") if type(err) is str else "an unnamed error"
+            return [CheckResult(name, False, f"running but cannot read {what} ({why}). Dispatch sessions are refused.",
+                                "Check that the fence service runs as you and names this install's store and "
+                                "cockpit root.")]
+    where = val.get("store")
+    where = unshowable.mark(where[:200], allow="") if type(where) is str else "?"
+    seq = val.get("seq")
+    seq_text = str(seq) if type(seq) is int else "?"
+    return [CheckResult(name, True, f"running (store {where}, authority seq {seq_text}). Dispatch sessions are "
+                        "checked on every tool call.")]
 
 
 def _check_host_awake() -> list[CheckResult]:

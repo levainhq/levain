@@ -439,6 +439,47 @@ def build_feeds_spec(
     )
 
 
+# --- the agent fence (P7-2 wiring, shape C) ---
+# A fourth unit: RESIDENT, like the cockpit, because the queue broker asks it on every dispatch GATE and refuses the
+# GATE when it is down.
+DEFAULT_FENCE_LABEL = "com.levainhq.levain.fence"
+# the module the unit runs; a string, so this stdlib-only leaf imports nothing of the qbroker package
+FENCE_MODULE = "levain.qbroker.fence_server"
+
+
+def build_fence_spec(
+    *,
+    agent_store: Path,
+    cockpit_root: Path,
+    run_dir: Path | None = None,
+    label: str = DEFAULT_FENCE_LABEL,
+    log_dir: Path | None = None,
+) -> DaemonSpec:
+    """The resident spec for the operator's agent fence server (:mod:`levain.qbroker.fence_server`): it reads the
+    operator's autonomic store and cockpit authority as their owner and answers the queue broker on
+    ``R/fence/fence.sock``. Per-user and never root, as every spec here (the providers refuse root); keep-alive and at
+    login, because while it is down every dispatch session's tool calls are refused.
+
+    Run as ``<this interpreter> -m levain.qbroker.fence_server``: the module is not a ``levain`` verb, and the
+    interpreter is the one this levain runs in (never ``realpath``'d, for the reason :func:`_levain_invocation` gives).
+    ``--run`` is EMITTED only when given; without it the server uses this host's ``R``."""
+    invocation = [sys.executable]
+    argv = [*invocation, "-m", FENCE_MODULE,
+            "--agent-store", str(agent_store.expanduser().resolve()),
+            "--cockpit-root", str(cockpit_root.expanduser().resolve())]
+    if run_dir is not None:
+        argv += ["--run", str(run_dir)]
+    logs = (log_dir or _default_log_dir()).expanduser().resolve()
+    return DaemonSpec(
+        label=label,
+        argv=argv,
+        working_dir=agent_store.expanduser().resolve(),
+        env=_daemon_env(invocation),
+        stdout_log=logs / f"{label}.log",
+        stderr_log=logs / f"{label}.err",
+    )
+
+
 # --- the provider interface ------------------------------------------------------------------
 
 class DaemonProvider(ABC):

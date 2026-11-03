@@ -11,7 +11,9 @@ occurrence's ``run_id`` is ``run-<32 hex>`` (:func:`levain.agents.controller.run
 ``r-<16 hex>`` (:func:`levain.slot.tickets.new_run_id`)."""
 from __future__ import annotations
 
+import itertools
 import re
+import socket
 import sqlite3
 import threading
 import time
@@ -22,9 +24,36 @@ from typing import Any
 from urllib.parse import quote
 
 from levain.agent_authority import AgentCoverMoved, agent_fence
+from levain.qbroker import wire
 from levain.qbroker.broker import FenceUnavailable, Resolved
+from levain.qbroker.peercred import peer_uid as _peer_uid
 
-__all__ = ["FENCE_DB_TIMEOUT", "AgentFences", "Unfenceable"]
+__all__ = ["ANSWER_MAX", "FENCE_DB_TIMEOUT", "FENCE_DIR", "FENCE_SOCKET", "FENCE_TIMEOUT_S", "REQUEST_MAX",
+           "SESSION_RE", "TEXT_RE", "AgentFences", "RemoteFences", "Unfenceable", "fence_socket_path"]
+
+# --- the operator-uid fence server's wire (P7-2 wiring, shape C; the server is levain.qbroker.fence_server) --------
+# R/fence/: owner the operator, group _levain_qbroker, 0750 (setgid on Linux, so the socket takes the group)
+FENCE_DIR = "fence"
+FENCE_SOCKET = "fence.sock"
+# the largest request the server reads: FENCE {session} is under 80 bytes, so 256 leaves room and nothing more
+REQUEST_MAX = 256
+# the largest FENCE answer the broker reads: a reason or a why is at most TEXT_MAX characters
+ANSWER_MAX = 512
+TEXT_MAX = 200
+# a session as QUEUE-RESOLVE names it (levain.slot.grammar.SESSION_RE), the one argument FENCE takes
+SESSION_RE = re.compile(r"s-[0-9a-f]{16}")
+# a reason or a why the server may send: printable ASCII, bounded (it reaches the agent in GATE's reason)
+TEXT_RE = re.compile(r"[\x20-\x7e]{1,%d}" % TEXT_MAX)
+# PROVISIONAL (head rules): the broker's whole FENCE exchange (connect, ask, answer). It must cover one AgentFences
+# check that refreshes the authority replay, whose busy wait is agent_authority._REFRESH_BUSY_TIMEOUT (2.0 s), plus
+# the fence's own store reads (FENCE_DB_TIMEOUT each); and it must end before the hook's own deadline on the GATE
+# (levain.consent.broker_client.IO_TIMEOUT, 5.0 s), so the hook reads the broker's limits-failed and its reason, not
+# its own timeout. A check that needs more (a second refresh, a slow ssh-keygen) runs out and is limits-failed.
+FENCE_TIMEOUT_S = 3.0
+
+
+def fence_socket_path(run_dir: Path | str) -> Path:
+    return Path(run_dir) / FENCE_DIR / FENCE_SOCKET
 
 # how long the fence waits on autonomic.db before the read fails (and GATE answers limits-failed)
 FENCE_DB_TIMEOUT = 0.25
@@ -165,3 +194,95 @@ class AgentFences:
                         (occurrence["agent_id"],)).fetchone() is not None:
             return "the agent is barred"
         return "the agent's authority link is no longer live or no longer the one it launched under"
+
+
+# a refusal name the fence server may send (the wire's own refusal-name form)
+_REFUSAL_NAME = re.compile(r"[a-z][a-z0-9-]{0,63}")
+_FENCE_MALFORMED = "the agent fence answered out of shape"
+
+
+class RemoteFences:
+    """The broker's :data:`FenceSource` under shape C (P7-2 wiring): every check is asked of the operator-uid fence
+    server (:mod:`levain.qbroker.fence_server`, which runs :class:`AgentFences` unchanged) over ``path``, one
+    connection per check, and the answer is that server's.
+
+    The server's uid is read from the kernel right after connect and must be ``server_uid`` (the operator's, from
+    ``L/policy/operator``) before the session is sent. The whole exchange is bounded by ``timeout_s``
+    (:data:`FENCE_TIMEOUT_S`). Anything but a well-formed ``current`` or ``fenced`` answer raises
+    :class:`FenceUnavailable` (GATE answers ``limits-failed``): no socket, a refused connect, a wrong peer, a timeout,
+    a frame off its shape or over :data:`ANSWER_MAX`, an answer to another id, or the server's own refusal. A session
+    no agent row names is answered ``current`` by the server, as :class:`AgentFences` answers it. An interactive
+    session (no run) is never asked about, as :class:`AgentFences` never reads one. Stdlib and 3.9-valid: the broker
+    runs under root's interpreter as ``_levain_qbroker``."""
+
+    def __init__(self, path: Path | str, server_uid: int, timeout_s: float = FENCE_TIMEOUT_S, *,
+                 peer_uid: Callable[[socket.socket], int] = _peer_uid) -> None:
+        self._path, self._server_uid, self._timeout, self._peer_uid = str(path), server_uid, timeout_s, peer_uid
+        self._ids = itertools.count(1)
+        self._ids_mutex = threading.Lock()
+
+    def __call__(self, who: Resolved) -> str | None:
+        if who.run is None:
+            return None
+        if not isinstance(who.session, str) or SESSION_RE.fullmatch(who.session) is None:
+            raise FenceUnavailable("the session is not an S1 session id, so the agent fence was not asked")
+        with self._ids_mutex:
+            rid = next(self._ids)
+        try:
+            got = self._ask(rid, who.session, time.monotonic() + self._timeout)
+        except FenceUnavailable:
+            raise
+        except (socket.timeout, TimeoutError):      # 3.9: socket.timeout is an OSError, not a TimeoutError
+            raise FenceUnavailable(f"the agent fence did not answer within {self._timeout:g} s") from None
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            raise FenceUnavailable(f"the agent fence is not running ({type(exc).__name__})") from None
+        except wire.FrameError as exc:
+            raise FenceUnavailable(f"{_FENCE_MALFORMED} ({exc.name})") from None
+        except OSError as exc:
+            raise FenceUnavailable(f"the agent fence cannot be reached ({type(exc).__name__})") from None
+        return self._verdict(rid, got)
+
+    @staticmethod
+    def _left(deadline: float) -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("the fence exchange ran out of time")
+        return left
+
+    def _ask(self, rid: int, session: str, deadline: float) -> Any:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(self._left(deadline))
+            sock.connect(self._path)
+            try:
+                uid = self._peer_uid(sock)
+            except OSError as exc:
+                raise FenceUnavailable(f"the agent fence socket's peer cannot be read ({type(exc).__name__})") \
+                    from None
+            if uid != self._server_uid:
+                raise FenceUnavailable(f"the agent fence socket is served by uid {uid}, not the operator's uid "
+                                       f"{self._server_uid}")
+            sock.settimeout(self._left(deadline))
+            wire.write_frame(sock, {"v": wire.VERSION, "op": "FENCE", "id": rid, "session": session})
+            return wire.read_frame(sock, timeout=self._left(deadline), max_frame=ANSWER_MAX)
+
+    @staticmethod
+    def _verdict(rid: int, got: Any) -> str | None:
+        if got is None:
+            raise FenceUnavailable("the agent fence closed the connection without an answer")
+        # exact types: 0 == False and True == 1 in Python, and neither is the server's answer
+        if not isinstance(got, dict) or type(got.get("id")) is not int or got["id"] != rid \
+                or type(got.get("ok")) is not bool:
+            raise FenceUnavailable(_FENCE_MALFORMED)
+        if got["ok"] is False:
+            name, why = got.get("refused"), got.get("why")
+            if not set(got) <= {"id", "ok", "refused", "why"} or type(name) is not str \
+                    or _REFUSAL_NAME.fullmatch(name) is None \
+                    or (why is not None and (type(why) is not str or TEXT_RE.fullmatch(why) is None)):
+                raise FenceUnavailable(_FENCE_MALFORMED)
+            raise FenceUnavailable(f"the agent fence refused ({name})" + (f": {why}" if why else ""))
+        if set(got) == {"id", "ok", "current"} and got["current"] is True:
+            return None
+        reason = got.get("fenced")
+        if set(got) == {"id", "ok", "fenced"} and type(reason) is str and TEXT_RE.fullmatch(reason) is not None:
+            return reason
+        raise FenceUnavailable(_FENCE_MALFORMED)

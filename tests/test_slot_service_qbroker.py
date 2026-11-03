@@ -469,3 +469,46 @@ def test_serve_restores_the_signals_and_frees_the_lock_whatever_a_stop_raises(la
     assert again is not None
     os.close(again)
     assert any("RuntimeError: stop failed" in m for m in logs)
+
+
+# --- the agent fence (P7-2 wiring): R/fence/fence.sock, served by the operator's uid from L/policy/operator --------
+
+def test_the_service_asks_the_fence_socket_as_the_operators_uid(layout):
+    from levain.qbroker.fence import RemoteFences
+    from levain.slot.install_helper import operator_record_text
+
+    L, R = layout
+    (L / "policy" / "operator").write_text(operator_record_text("phill", 4242))
+    ns = SQ.fence_namespace(seams(L, R), log=lambda m: pytest.fail(m))
+    assert (ns.store, ns.run, ns.fence_socket, ns.fence_uid) == (str(L), str(R), str(R / "fence" / "fence.sock"), 4242)
+    fence = QM.build_fence(ns)
+    assert isinstance(fence, RemoteFences) and (fence._path, fence._server_uid) == (ns.fence_socket, 4242)
+
+
+@pytest.mark.parametrize("record", [None, b"{}", b"not json"])
+def test_an_operator_record_that_cannot_be_read_refuses_every_dispatch_session(layout, record):
+    from levain.qbroker.fence import Unfenceable
+
+    L, R = layout
+    if record is not None:
+        (L / "policy" / "operator").write_bytes(record)
+    logs = []
+    ns = SQ.fence_namespace(seams(L, R), log=logs.append)
+    assert ns.fence_uid is None and isinstance(QM.build_fence(ns), Unfenceable)
+    assert len(logs) == 1 and "every dispatch session is refused" in logs[0]
+
+
+def test_serve_builds_the_broker_with_the_fence(layout):
+    from levain.slot.install_helper import operator_record_text
+
+    L, R = layout
+    (L / "policy" / "operator").write_text(operator_record_text("phill", 4242))
+    seen = []
+    stop = threading.Event()
+    stop.set()
+
+    def build(ns, *, limits_owner):
+        seen.append(ns)
+        return "broker"
+    assert SQ.serve(seams(L, R), limits_owner=ME, stop=stop, log=lambda m: None, build=build) == 0
+    assert (seen[0].fence_socket, seen[0].fence_uid) == (str(R / "fence" / "fence.sock"), 4242)
