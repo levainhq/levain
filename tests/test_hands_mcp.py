@@ -546,3 +546,51 @@ def test_a_passkey_revokes_an_entry_and_a_key_never_enrolled_does_not(tmp_path):
     assert e["id"] in world.state().policy.grants
     world.link({"op": "revoke_grant", "grant_id": e["id"]}, "pk")
     assert e["id"] not in world.state().policy.grants
+
+
+# --- M1C: L3 r2 residuals -----------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["ghp_" + "a" * 30, "github_pat_" + "b" * 30, "sk-" + "c" * 24, "xoxb-1234567890-abc",
+                                   "AKIA" + "A" * 16, "Bearer abcdefghijkl", "token abcdefghijkl"])
+def test_a_token_shaped_env_value_is_refused_under_a_non_secret_key(value):
+    problems = hm.registration_problems(_entry(env={"CONFIG": value}), home=HOME)
+    assert _said(problems, "hands account's own environment"), problems
+
+
+def test_a_plain_long_env_value_is_not_guessed_at():
+    assert hm.registration_problems(_entry(env={"DATA_DIR": "/var/lib/x/" + "a" * 60, "MODE": "A" * 44}),
+                                    home=HOME) == []
+
+
+@pytest.mark.parametrize("flag", ["--no-auth", "--no-token", "--without-password", "--no-api-key"])
+def test_a_negated_secret_flag_is_not_a_secret_flag(flag):
+    assert hm.registration_problems(_entry(args=[flag, "serve"]), home=HOME) == []
+    assert hm.registration_problems(_entry(args=[flag + "=true"]), home=HOME) == []
+
+
+def test_a_secret_flag_stays_refused():
+    assert _said(hm.registration_problems(_entry(args=["--auth-token", "x"]), home=HOME), "secret-named flag")
+
+
+@pytest.mark.parametrize("arg", ["https://ghp_abc@host/x", "--url=https://user@host/x", "git+ssh://git@host/x"])
+def test_bare_userinfo_in_an_argv_url_is_refused(arg):
+    assert _said(hm.registration_problems(_entry(args=[arg]), home=HOME), "looks like a credential")
+
+
+@pytest.mark.parametrize("url", ["https://ghp_abc@host.example/x", "https://@host.example/x"])
+def test_bare_userinfo_in_a_remote_url_is_refused(url):
+    problems = hm.registration_problems(_entry(name="r", transport="remote", command="", url=url,
+                                               callback_port=49300), home=HOME)
+    assert _said(problems, "userinfo"), problems
+
+
+@pytest.mark.parametrize("url, ok", [("https://%zz/mcp", False), ("https://exa%6dple.com/mcp", False),
+                                     ("https://-bad-.example/mcp", False), ("https://a..b/mcp", False),
+                                     ("https://bad_host.example/mcp", False), ("https://" + "a" * 64 + ".example/mcp", False),
+                                     ("https://mcp.example.com./mcp", True), ("https://xn--bcher-kva.example/mcp", True),
+                                     ("https://203.0.113.9/mcp", True), ("https://[2001:db8::1]/mcp", True),
+                                     ("http://[::1]:9/mcp", True), ("http://localhost:9/mcp", True)])
+def test_a_url_host_is_ldh_or_an_ip_literal(url, ok):
+    problems = hm.registration_problems(_entry(name="r", transport="remote", command="", url=url,
+                                               callback_port=49300), home=HOME)
+    assert (problems == []) is ok, problems

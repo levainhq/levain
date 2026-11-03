@@ -62,7 +62,8 @@ class HandsMcpRefused(Exception):
 # the words that say a name holds a credential; ``auth`` only as a word of its own (``--author`` is not one)
 _SECRET_WORDS = r"(?:token|secret|password|passwd|api[-_]?key|apikey|bearer|credential|auth(?:orization)?(?![a-z]))"
 # a flag whose NAME says its value is a credential, `--api-key=V` or `--api-key V`
-_SECRET_FLAG = re.compile(r"^-{1,2}[A-Za-z0-9_.-]*" + _SECRET_WORDS + r"[A-Za-z0-9_.-]*$", re.I)
+# (a ``--no-``/``--without-`` prefix negates the setting, so it is not a flag that carries a credential)
+_SECRET_FLAG = re.compile(r"^(?!-{1,2}(?:no|without)-)-{1,2}[A-Za-z0-9_.-]*" + _SECRET_WORDS + r"[A-Za-z0-9_.-]*$", re.I)
 # an env name or a url query name that says its value is a credential: the flag's words, and ``key`` as a word
 _SECRET_NAME = re.compile(_SECRET_WORDS + r"|key(?![a-z])", re.I)
 # env names that change what code the server's interpreter or loader runs
@@ -71,9 +72,10 @@ _LOADER_ENV = re.compile(r"(?:LD_|DYLD_)[A-Z0-9_]*|NODE_OPTIONS|NODE_PATH|PYTHON
 # well-known credential spellings and a bare high-entropy run
 _SECRET_VALUE = re.compile(r"(?:^|[=:\s])(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
                            r"gho_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|"
-                           r"lin_api_[A-Za-z0-9]{20,}|(?:bearer|basic)\s+\S{8,})", re.I)
+                           r"lin_api_[A-Za-z0-9]{20,}|(?:bearer|basic|token)\s+\S{8,})", re.I)
 _LONG_RUN = re.compile(r"(?:^|[=:/])[A-Za-z0-9+/_-]{40,}={0,2}$")
-_USERINFO = re.compile(r"://[^/\s@]*:[^/\s@]*@")
+_USERINFO = re.compile(r"://[^/\s@]*@")                  # any userinfo: a bare token before the ``@`` is a credential too
+_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 
 
 def _under(path: str, home: str) -> bool:
@@ -208,12 +210,22 @@ def registration_problems(entry: Mapping[str, Any], *, home: str) -> list[str]:
         for k, v in sorted(entry["env"].items()):
             if _LOADER_ENV.fullmatch(k):
                 problems.append(f"the env name {k!r} changes what the server's loader or interpreter runs")
-            elif v and _SECRET_NAME.search(k):
-                problems.append(f"the env name {k!r} says it holds a credential, and the entry is signed in "
-                                f"plaintext: {_NO_SECRET}")
+            elif v and (_SECRET_NAME.search(k) or _SECRET_VALUE.search(v)):
+                problems.append(f"the env name {k!r} says it holds a credential, or its value is shaped like one, "
+                                f"and the entry is signed in plaintext: {_NO_SECRET}")
     else:
         problems += _url_problems(entry["url"])
     return problems
+
+
+def _host_ok(host: str) -> bool:
+    """An IP literal, or a name of LDH labels (letters, digits, hyphen; no leading or trailing hyphen; at most 63 each)."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return all(_LABEL.fullmatch(lb) for lb in host.removesuffix(".").split("."))
 
 
 def _url_problems(url: str) -> list[str]:
@@ -229,6 +241,8 @@ def _url_problems(url: str) -> list[str]:
     problems: list[str] = []
     if parts.username is not None or parts.password is not None:
         problems.append("a remote url carries no userinfo")
+    if host and not _host_ok(host):
+        problems.append("a remote url host is a name of letters, digits and hyphens (or an IP literal), no escapes")
     if parts.scheme == "https":
         if not host:
             problems.append("a remote url names a host")
