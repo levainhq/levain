@@ -22,7 +22,8 @@ What the fire side owns:
   ``returncode``, so :func:`levain.agents.controller.gate_proves_termination` is the executor's to apply to its own
   child.
 * **The hook points** ``on_end`` and ``verify`` (:class:`Hooks`, the module's :data:`HOOKS`), called by
-  :meth:`Supervisor.finish`, the run's natural end. Both default to nothing. P8b registers into :data:`HOOKS`.
+  :meth:`Supervisor.finish`, the run's natural end. ``on_end`` defaults to nothing; ``verify`` defaults to P8b's win verifier
+  (:func:`levain.agents.gauges.win_verifier`).
 
 The tick side is :meth:`Supervisor.reap` (P6-4b), the second writer of this module, called from
 :func:`levain.agents.controller.tick`: lease renewal first, the ``stop_at`` pass from ``autonomic.db`` and the clock
@@ -43,7 +44,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from levain.agent_authority import AgentAuthority, AgentAuthorityError, agent_fence
-from levain.agents import accounting, controller as _ctl, role as _role, spec as _spec
+from levain.agents import accounting, controller as _ctl, gauges as _gauges, role as _role, spec as _spec
 from levain.agents.store import AgentStore
 from levain.autonomic.journal import EffectOutcome, EffectStatus, RunJournal
 
@@ -159,6 +160,7 @@ class Supervisor:
         self._authority = authority
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._hooks = HOOKS if hooks is None else hooks
+        self._win_verify = _gauges.win_verifier(store, clock=clock)   # P8b: the verify hook's default
         self._stop_deadline_s = stop_deadline_s
         self._journal = journal if journal is not None else RunJournal(store.directory)
         with store.read() as conn:
@@ -472,9 +474,10 @@ class Supervisor:
             state, why = "done", "completed"
         else:
             state, why = "failed", reason if type(reason) is str and reason and reason != "completed" else "run_failed"
-        if self._hooks.verify is not None:
+        verify = self._hooks.verify or self._win_verify
+        if verify is not None:
             try:
-                verdict = self._hooks.verify(End(occurrence_id, state, why, usage))
+                verdict = verify(End(occurrence_id, state, why, usage))
             except Exception as exc:  # noqa: BLE001 - a verifier that cannot answer has not verified
                 _log.warning("agent supervisor: the verify hook raised %s", type(exc).__name__)
                 verdict = "verify_error"

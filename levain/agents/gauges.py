@@ -2,7 +2,7 @@
 
 A gauge reports a value and its own staleness, and nothing else: it never writes, never fires anything and holds no
 gate semantics (flow's GATE/GAUGE/FEED ruling: a wrong gauge is a wrong number, so it must say how old the number is).
-The hooks that fill these in are registered by a later hunk in ``supervise.py``, not here.
+The win verifier at the end of this module is the ``verify`` hook's default; ``supervise.py`` builds it for its store.
 
 Absence is never health. A gauge with nothing to look at reports :data:`UNKNOWN`, not :data:`OK`; a quiet input and a
 dead input are different values (quiet means ``skipped-no-input``, dead means failure).
@@ -17,12 +17,15 @@ import os
 import re
 import sqlite3
 import stat
+import threading
 from dataclasses import dataclass
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
 __all__ = ["OK", "QUIET", "DEAD", "UNKNOWN", "NOT_MEASURED", "STUB_MAX_BYTES", "DEFAULT_STALE_AFTER", "Gauge",
-           "input_liveness", "output_arrival", "fate_of_output", "run_health"]
+           "input_liveness", "output_arrival", "fate_of_output", "run_health", "WinContext", "WIN_UNVERIFIED", "WIN_FAILED",
+           "register_check", "win_verifier"]
 
 OK = "ok"
 QUIET = "quiet"            # nothing real to read: the fire is skipped-no-input, which is not a failure
@@ -231,3 +234,113 @@ def run_health(conn: sqlite3.Connection, agent_id: str, now: datetime, *, stale_
     when = _parse_stamp(ended) or _parse_stamp(launched) or _parse_stamp(admitted)
     value = {"done": OK, "failed": DEAD, "skipped-no-input": QUIET}.get(state, UNKNOWN)
     return _gauge(name, value, f"the latest run is {state}", when, now, stale_after)
+
+
+# --- the win verifier (BUILD_PLAN P8b-ii) ------------------------------------------------------------------------------
+#
+# ``Supervisor.finish`` calls the verify hook inside the fire, before the end is written, so the verifier runs in the
+# fire's process under the occurrence's grant. It judges only a ``done`` the run asked for. ``win.kind`` decides what
+# counts: ``human`` and ``inherited`` name no machine check (a named human verdict surface; the downstream's win) and
+# are accepted here; ``verifier`` and ``verified-restore`` name a check by ``win.check``, which must be a name
+# registered with :func:`register_check`. A run whose win names no registered check was not verified, so it fails
+# (:data:`WIN_UNVERIFIED`): a done that nothing checked is not a win. A check that raises fails the run as
+# ``verify_error`` through the hook's own rule.
+
+WIN_UNVERIFIED = "win_unverified"
+WIN_FAILED = "win_failed"
+_MACHINE_KINDS = frozenset({"verifier", "verified-restore"})
+_NO_CHECK_KINDS = frozenset({"human", "inherited"})
+_CHECKS_LOCK = threading.Lock()
+_CHECKS: dict[str, Callable[["WinContext"], str | None]] = {}
+
+
+@dataclass(frozen=True)
+class WinContext:
+    """What a registered check is given: the occurrence, its spec as stored, and the end it is judging. Read-only."""
+    store: object
+    occurrence_id: str
+    agent_id: str
+    spec: dict
+    launched_at: str | None
+    end: object
+    now: datetime
+
+
+def register_check(name: str, check: Callable[[WinContext], str | None]) -> None:
+    """Register ``check`` under ``name`` (the ``win.check`` text of a spec). It returns None for a win or a reason.
+    The check-and-insert is one step under a lock: of two racing registrations of a name, one wins and one raises."""
+    if not isinstance(name, str) or not name.strip() or not callable(check):
+        raise ValueError("a check needs a non-empty name and a callable")
+    with _CHECKS_LOCK:
+        if name in _CHECKS and _CHECKS[name] is not check:
+            raise ValueError(f"a check named {name!r} is already registered")
+        _CHECKS[name] = check
+
+
+def _stored_spec(store, occurrence_id: str) -> tuple[str, dict | None, str | None, str] | None:
+    """``(agent_id, spec, launched_at, why)``: ``spec`` is None, with ``why`` naming what is wrong, unless the stored
+    row is the spec that was registered: it parses as a spec and re-hashes (the register-time function) to the
+    occurrence's ``spec_hash``. ``None`` when the occurrence is unknown."""
+    from levain.agents import spec as _spec
+    with store.read() as conn:
+        row = conn.execute("SELECT o.agent_id, s.spec, o.launched_at, o.spec_hash, a.name FROM agent_occurrences o"
+                           " LEFT JOIN agent_specs s ON s.agent_id = o.agent_id AND s.spec_hash = o.spec_hash"
+                           " LEFT JOIN agents a ON a.agent_id = o.agent_id WHERE o.occurrence_id = ?",
+                           (occurrence_id,)).fetchone()
+    if row is None:
+        return None
+    agent_id, text, launched, digest, name = row
+    if text is None:
+        return agent_id, None, launched, "no stored spec for the occurrence's spec_hash"
+    try:
+        spec = _spec._check_row(agent_id, name, digest, text)
+    except _spec.SpecError as exc:
+        return agent_id, None, launched, f"the stored spec is malformed ({str(exc)[:120]})"
+    except Exception as exc:                     # a hash that cannot be computed is a spec that cannot be verified
+        return agent_id, None, launched, f"the stored spec cannot be checked ({type(exc).__name__})"
+    return agent_id, spec, launched, ""
+
+
+def _grant_held(store, occurrence_id: str) -> bool:
+    """The occurrence is still ``launched`` under the epoch it launched with (no revocation or takeover since)."""
+    with store.read() as conn:
+        return conn.execute("SELECT 1 FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'"
+                            " AND epoch = launch_epoch", (occurrence_id,)).fetchone() is not None
+
+
+def win_verifier(store, *, clock: Callable[[], datetime] | None = None) -> Callable[[object], str | None]:
+    """The ``verify`` hook for ``store``: None accepts the end, a reason fails a ``done``. Only a ``done`` is judged.
+    Anything malformed fails closed as ``win_unverified: <what>``; only a known ``human`` / ``inherited`` win on a
+    spec that re-hashes to its ``spec_hash`` passes without a registered check."""
+    now_of = clock or (lambda: datetime.now(timezone.utc))
+
+    def verify(end) -> str | None:
+        if getattr(end, "state", None) != "done":
+            return None
+        found = _stored_spec(store, end.occurrence_id)
+        if found is None:
+            return f"{WIN_UNVERIFIED}: no such occurrence"
+        agent_id, spec, launched, why = found
+        if spec is None:
+            return f"{WIN_UNVERIFIED}: {why}"
+        win = spec.get("win")
+        if not isinstance(win, dict):
+            return f"{WIN_UNVERIFIED}: the stored spec has no win mapping"
+        kind = win.get("kind")
+        if kind in _NO_CHECK_KINDS:
+            return None      # a named human verdict surface, or the downstream's win: no machine check is named
+        if kind not in _MACHINE_KINDS:
+            return f"{WIN_UNVERIFIED}: win.kind {str(kind)[:30]!r} is not a known kind"
+        name = win.get("check")
+        with _CHECKS_LOCK:
+            check = _CHECKS.get(name) if isinstance(name, str) else None
+        if check is None:
+            return f"{WIN_UNVERIFIED}: no check is registered under win.check"
+        if not _grant_held(store, end.occurrence_id):    # the check may have effects: never for a revoked grant
+            return f"{WIN_UNVERIFIED}: grant revoked before the check ran"
+        verdict = check(WinContext(store, end.occurrence_id, agent_id, spec, launched, end, now_of()))
+        if verdict is None:
+            return None
+        return verdict if type(verdict) is str and verdict.strip() and verdict != "completed" else WIN_FAILED
+
+    return verify
