@@ -119,7 +119,7 @@ class _Source(NamedTuple):
 _SOURCES: tuple[_Source, ...] = (
     _Source("replies", "replies", "gseq", "kind, ref_store, ref_id, body", _reply_line),
     _Source("launch_events", "launch_events e JOIN launches l ON l.launch_id = e.launch_id", "e.gseq",
-            "e.kind, e.launch_id, l.role, e.cause", _launch_line),
+            "e.kind, e.launch_id, l.role, e.cause", _launch_line, "l.role != 'room'"),
     # a beat is the holder staying alive, a frequent record and never news (the design lists claim, release, lapse, takeover)
     _Source("lease_events", "lease_events", "gseq", "kind, holder, cause, by", _lease_line, "kind != 'beat'"),
     _Source("ready_journal", "ready_journal", "gseq", "id, from_category, to_category, who", _ready_line),
