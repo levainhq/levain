@@ -1713,7 +1713,9 @@ class _GrantKind:
     passkey may revoke a grant of it (:func:`passkey_revocable`). ``expires``: a grant of it carries ``expires_at``
     (the opt-in does not, so it is never renewed). ``max_life``: the most a renew may set its expiry past the renew's
     own time, beside the generic renew bound. ``fixed``: the refusal for any change to a grant of it but a renew
-    (its kind included), raised from ``change`` and from :func:`_grant_change`."""
+    (its kind included), raised from ``change`` and from :func:`_grant_change`. ``renew_signer_class``: the key class
+    a renew of a grant of it needs, beside the generic renew's rank (a generic renew is rank 2, which a display-phone
+    ssh key reaches); None: the generic rule alone."""
     validate: Callable[[Mapping[str, Any], str, datetime | None], dict[str, Any]]
     change: Callable[[Mapping[str, Any], Mapping[str, Any], datetime, datetime], str]
     append_checks: tuple[Callable[[list[Any]], None], ...] = ()
@@ -1723,6 +1725,7 @@ class _GrantKind:
     expires: bool = True
     max_life: timedelta | None = None
     fixed: str | None = None
+    renew_signer_class: str | None = None
 
 
 # Every kind this levain knows, by the grant's ``kind`` (``None``: an egress grant, which carries none); any other
@@ -1754,7 +1757,7 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
     GRADUATION_PHONE_KIND: _GrantKind(validate=_validate_graduation_phone, change=_graduation_phone_change,
                                       passkey_revocable=True, expires=False, fixed=_GRADUATION_PHONE_FIXED),
     AGENT_LINK_KIND: _GrantKind(validate=_validate_agent_link, change=_agent_link_change, passkey_revocable=True,
-                                max_life=AGENT_LINK_MAX, fixed=_AGENT_LINK_FIXED),
+                                max_life=AGENT_LINK_MAX, fixed=_AGENT_LINK_FIXED, renew_signer_class=LAPTOP),
 })
 
 
@@ -1917,6 +1920,16 @@ def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: st
                                  f"{gid[:80]!r}, beyond a graduation policy and the graduation opt-in")
         if op == "renew" and not graduation_grant(target):
             raise AuthorityError(f"a {PASSKEY} key renews a graduation policy only, never grant {gid[:80]!r}")
+        return
+    if op == "revoke_agent":
+        # its own branch: the op names an agent, not a grant_id. Every link of the agent goes in one act, so each must
+        # be one a passkey may revoke, and there must be at least one
+        aid, sid = rec["agent_id"], rec["agent_store_id"]
+        mine = [g for g in policy.grants.values() if agent_link(g) and g["agent_id"] == aid and g["store_id"] == sid]
+        if not mine:
+            raise AuthorityError(f"a {PASSKEY} key revokes an agent's links the policy holds: none for {str(aid)[:80]!r}")
+        if not all(passkey_revocable(g) for g in mine):
+            raise AuthorityError(f"a {PASSKEY} key revokes only links of a kind that takes a passkey revoke")
         return
     refusal = (f"a {PASSKEY} key signs consent answers and grant revokes only, never another authority link, but for "
                "one graduation act per link: a graduation policy's renew, or, named by the live opt-in, one graduation "
@@ -2104,6 +2117,11 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
                 rank = need
             if ranks[signer.key_class] < rank:
                 raise AuthorityError(f"a {signer.key_class} key cannot sign this {op}")
+            if op == "renew":
+                need_class = _grant_kind(state.policy.grants[rec["grant_id"]]).renew_signer_class
+                if need_class is not None and ranks[signer.key_class] < ranks[need_class]:
+                    raise AuthorityError(f"a {signer.key_class} key cannot sign this renew: this grant's renew needs "
+                                         f"a {need_class} key")
             if isinstance(need, StandingPolicy):
                 _graduation_step_checks(state.policy, need, keys, op)
                 _agent_link_step_checks(state.policy, need, op, at)
@@ -2131,7 +2149,8 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             # from that name on any port (a cockpit behind a proxy, Phill 10-24 "2a"); every other link, exactly
             from levain.consent.passkey import authority_signature_problem
 
-            problem = authority_signature_problem(row.signature, signer.public_key, revoke=op == "revoke_grant")
+            problem = authority_signature_problem(
+                row.signature, signer.public_key, revoke=op in ("revoke_grant", "revoke_agent"))
             if problem is not None:
                 raise ReplayError(seq, f"the passkey signature is refused: {problem}"
                                        + (f" (signed by {signer.fingerprint}, quarantined: WebAuthn material stored "
