@@ -988,7 +988,9 @@ def test_gate_proves_termination(rc, want):
 
 def test_no_input_ends_skipped_no_input_and_takes_nothing(rig):
     # behaviour: a hook that answers False ends the admitted row skipped-no-input before the launch transaction, so it
-    # never held a slot or a reservation, even with no link to admit; the hook was handed the row's identity
+    # never held a slot or a reservation; the hook was handed the row's identity. The ended row no longer reads as the
+    # agent's live one, so the next claim is a claim, not an overlap (the downstream consumer of the new state)
+    rig.link()
     oid = rig.claim("k")
     seen = []
     result = rig.launch(oid, on_input=lambda occ: seen.append(occ) or False)
@@ -999,6 +1001,7 @@ def test_no_input_ends_skipped_no_input_and_takes_nothing(rig):
     assert seen == [{"agent_id": rig.agent, "kind": "manual", "key": "k", "window_key": "m:2026-10-25",
                      "spec_hash": rig.spec_hash, "binding_id": BINDING, "occurrence_id": oid}]
     assert rig.launch(oid, on_input=lambda occ: True).outcome == "not-admitted"   # ended rows are not asked again
+    rig.claim("k2")   # asserts CLAIMED
 
 
 def test_the_default_and_a_present_input_both_go_on_to_the_launch(rig):
@@ -1012,24 +1015,49 @@ def test_the_default_and_a_present_input_both_go_on_to_the_launch(rig):
     assert rig.row(second)["state"] == "launched"
 
 
-@pytest.mark.parametrize("answer", ["raise", None, 0, "yes"])
-def test_an_input_check_that_cannot_answer_writes_nothing_and_leaves_the_row_admitted(rig, answer):
-    # behaviour: a hook that raises or answers a non-bool is dead input, never quiet: nothing written, no slot
-    oid = rig.claim("k")
-    before = rig.row(oid)
-
+def _dead_hook(answer):
     def hook(occ):
         if answer == "raise":
             raise OSError("unreadable")
         return answer
-    result = rig.launch(oid, on_input=hook)
+    return hook
+
+
+@pytest.mark.parametrize("answer", ["raise", None, 0, "yes"])
+def test_an_input_check_that_cannot_answer_writes_nothing_and_leaves_the_row_admitted(rig, answer):
+    # behaviour: a hook that raises or answers a non-bool is dead input, never quiet: within the grace nothing is
+    # written and no slot is taken
+    rig.link()
+    oid = rig.claim("k")
+    before = rig.row(oid)
+    result = rig.launch(oid, on_input=_dead_hook(answer))
     assert result.outcome == "unclassified" and "input check" in result.reason
     assert rig.row(oid) == before and rig.taken(oid) == ([], [])
+
+
+@pytest.mark.parametrize("answer", ["raise", None])
+def test_a_hook_that_stays_unanswerable_past_the_grace_ends_the_row_missed_and_does_not_wedge_the_agent(rig, answer):
+    # behaviour (L3 r1, complement MED 1): a hook that never answers would leave the row admitted, the agent's live
+    # row, so every later claim would be skipped-overlap. Past its grace the row ends missed / input_unreadable, is
+    # counted as a miss (dead, not quiet), holds nothing, and the next claim is a claim
+    rig.link()
+    oid = rig.claim("k")
+    assert rig.launch(oid, on_input=_dead_hook(answer), later=timedelta(minutes=14)).outcome == "unclassified"
+    assert rig.row(oid)["state"] == "admitted"
+    result = rig.launch(oid, on_input=_dead_hook(answer), later=timedelta(minutes=16))
+    assert (result.outcome, result.reason) == ("missed", "input_unreadable")
+    row = rig.row(oid)
+    assert (row["state"], row["reason"]) == ("missed", "input_unreadable") and row["ended_at"]
+    assert row["launched_at"] is None and rig.taken(oid) == ([], [])
+    with rig.store.read() as c:
+        assert ctl.miss_streak(c, rig.agent) == 1
+    rig.claim("k2")   # asserts CLAIMED: before the bound this was skipped-overlap for as long as the hook failed
 
 
 def test_a_row_that_moved_while_the_hook_ran_is_not_ended_by_its_answer(rig):
     # behaviour: the hook runs outside the write lock; if the row left admitted meanwhile, a "no input" answer
     # writes nothing
+    rig.link()
     oid = rig.claim("k")
 
     def hook(occ):
@@ -1040,3 +1068,70 @@ def test_a_row_that_moved_while_the_hook_ran_is_not_ended_by_its_answer(rig):
     result = rig.launch(oid, on_input=hook)
     assert result.outcome == "not-admitted"
     assert (rig.row(oid)["state"], rig.row(oid)["reason"]) == ("missed", "no_slot")
+
+
+@pytest.mark.parametrize("answer", [False, "raise"])
+def test_a_row_whose_epoch_alone_moved_while_the_hook_ran_stays_admitted_and_is_retried(rig, answer):
+    # behaviour (L3 r1, codex HIGH): open_bar raises an admitted row's epoch and leaves it admitted. A "no input" (or,
+    # past the grace, an unreadable) answer given for the old epoch writes nothing and is UNCLASSIFIED, retryable,
+    # never NOT_ADMITTED: the row is still admitted and its unique key means it is never claimed again. The next call
+    # decides it: here the bar is real, so it ends stopped / barred without asking the hook
+    rig.link()
+    oid = rig.claim("k")
+    asked = []
+
+    def hook(occ):
+        asked.append(occ["occurrence_id"])
+        with rig.store.write() as c:
+            c.execute("INSERT INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar) VALUES"
+                      " ('ab-0000000000000001', ?, 't', 1)", (rig.agent,))
+            c.execute("UPDATE agent_occurrences SET epoch = epoch + 1 WHERE occurrence_id = ?", (oid,))
+        return _dead_hook(answer)(occ)
+    later = timedelta(minutes=16) if answer == "raise" else timedelta(0)
+    result = rig.launch(oid, on_input=hook, later=later)
+    assert result.outcome == "unclassified" and "epoch moved" in result.reason
+    row = rig.row(oid)
+    assert (row["state"], row["epoch"], row["reason"], row["ended_at"]) == ("admitted", 1, None, None)
+    _stopped(rig, oid, "barred", rig.launch(oid, on_input=hook, later=later))
+    assert asked == [oid]
+
+
+@pytest.mark.parametrize("case", ["no_link", "barred", "revoked", "budget"])
+def test_the_launchs_refusals_run_before_the_hook_and_are_reported_as_themselves(rig, case):
+    # behaviour (head's ruling, L3 r1): an agent without authority or budget never has its input read, and its
+    # refusal is written as the refusal, never as quiet. (Before r1 the hook ran first: "even with no link to admit"
+    # a False answer ended the row skipped-no-input.)
+    if case != "no_link":
+        rig.link()
+    oid = rig.claim("k")
+    if case == "barred":
+        with rig.store.write() as c:
+            c.execute("INSERT INTO agent_bars (bar_id, agent_id, barred_at, head_seq_at_bar) VALUES"
+                      " ('ab-0000000000000001', ?, 't', 1)", (rig.agent,))
+    elif case == "revoked":
+        rig.world.link(revoke_agent(rig.agent, rig.sid))
+    asked = []
+    result = rig.launch(oid, Exec(10_000_000) if case == "budget" else None,
+                        on_input=lambda occ: asked.append(occ) or False)
+    assert asked == []
+    if case == "budget":
+        assert (result.outcome, result.reason) == ("skipped-budget", "budget_window")
+        assert rig.row(oid)["state"] == "skipped-budget" and rig.taken(oid) == ([], [])
+    else:
+        _stopped(rig, oid, case, result)
+
+
+def test_a_full_cap_still_asks_the_hook_and_no_input_ends_the_row_quiet(rig):
+    # behaviour: a full cap is not a refusal, so the hook is asked; "no input" ends the row skipped-no-input rather
+    # than leaving it admitted to be closed missed / no_slot at its grace (a quiet window is never a miss); a present
+    # input still waits for a slot, and the dry run of the refusals took nothing
+    rig.link()
+    quiet, busy = rig.claim("k"), None
+    with rig.store.write() as c:
+        assert slots.take(c, slots.LAUNCH, "ln-a", rig.now()) == 1
+        assert slots.take(c, slots.LAUNCH, "ln-b", rig.now()) == 2
+    assert rig.launch(quiet, on_input=lambda occ: False).outcome == "skipped-no-input"
+    busy = rig.claim("k2")
+    before = rig.row(busy)
+    assert rig.launch(busy, on_input=lambda occ: True).outcome == "no-slot"
+    assert rig.row(busy) == before and rig.taken(busy) == ([], [])
