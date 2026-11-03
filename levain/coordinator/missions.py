@@ -53,11 +53,12 @@ MISSION_SCHEMA: tuple[str, ...] = (
     "rev INTEGER NOT NULL, children TEXT NOT NULL, children_sha256 TEXT NOT NULL, "
     f"cause TEXT NOT NULL CHECK ({_in('cause', _CAUSES)}), by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator')), "
     "at TEXT NOT NULL, PRIMARY KEY (mission_id, rev))",
-    # the sign request id is unique where set: one signature accepts once
+    # the sign request id and the signature's own digest are each unique: one signature accepts once, whatever id it
+    # arrives under
     "CREATE TABLE IF NOT EXISTS mission_acceptances (acceptance_id TEXT PRIMARY KEY, "
     "mission_id TEXT NOT NULL REFERENCES missions(mission_id), mission_revision INTEGER NOT NULL, "
     "snapshot TEXT NOT NULL, snapshot_sha256 TEXT NOT NULL, sign_request_id TEXT NOT NULL UNIQUE, "
-    "signer_fp TEXT NOT NULL, at TEXT NOT NULL)",
+    "signature_sha256 TEXT NOT NULL UNIQUE, signer_fp TEXT NOT NULL, at TEXT NOT NULL)",
     *_append_only("missions", "a mission"),
     *_append_only("mission_revisions", "a mission revision"),
     *_append_only("mission_acceptances", "a mission acceptance"),
@@ -178,7 +179,10 @@ def _watermark(conn: sqlite3.Connection, children: Sequence[str]) -> int:
              (f"SELECT COALESCE(MAX(e.gseq), 0) FROM review_events e JOIN review_items i ON i.item_id = e.item_id "
               f"WHERE i.thread_id IN ({marks})", args)]
     if _has(conn, "envelope_attenuations"):
-        parts.append((f"SELECT COALESCE(MAX(gseq), 0) FROM envelope_attenuations WHERE thread_id IN ({marks})", args))
+        # a row with no thread id is envelope-wide: it applies to every thread the envelope is bound to
+        parts.append((f"SELECT COALESCE(MAX(gseq), 0) FROM envelope_attenuations WHERE thread_id IN ({marks}) OR "
+                      f"(thread_id IS NULL AND envelope_id IN (SELECT envelope_id FROM envelope_binds WHERE thread_id "
+                      f"IN ({marks})))", (*args, *args)))
     return max(conn.execute(sql, a).fetchone()[0] for sql, a in parts)
 
 
@@ -318,29 +322,49 @@ def detach(store: CoordStore, mission_id: str, thread_id: str, *, by: str = "ope
         return _view(conn, mission_id)
 
 
+def _proof(message: str, answer: object) -> tuple[str, str]:
+    """The verifier's answer as (signer fingerprint, digest of what was verified). A verifier that holds the signature
+    returns ``(fingerprint, signature_bytes)`` and the digest is over those bytes; one that returns only a fingerprint
+    is bound by the message it was shown and that fingerprint (the same signer over the same state is one signature)."""
+    if isinstance(answer, tuple) and len(answer) == 2 and isinstance(answer[1], (bytes, bytearray)):
+        fp, raw = answer[0], bytes(answer[1])
+    else:
+        fp, raw = answer, (message + "\0" + str(answer)).encode("utf-8")
+    if not isinstance(fp, str) or not fp:
+        raise AcceptanceRefused("signature", "the signature was not verified; nothing was accepted")
+    return fp, "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 def accept(store: CoordStore, mission_id: str, *, snapshot_sha256: str, sign_request_id: str,
-           verify: Callable[[str], str]) -> MissionAcceptance:
+           verify: Callable[[str], str | tuple[str, bytes]]) -> MissionAcceptance:
     """Close the mission on the operator's signature over the snapshot he saw (the compare-and-swap).
 
     ``verify(message)`` is the caller's check of its sign request: it takes :func:`accept_message` for the snapshot
-    ``snapshot_sha256`` names and returns the signer's fingerprint, or raises :class:`AcceptanceRefused` (``signature``).
-    It runs before the write. Inside the write transaction the CURRENT snapshot is recomputed and its digest must equal
-    ``snapshot_sha256``, so a signature over an older state accepts nothing; the mission must be ready (every child
-    done or closed) and carry no un-ACKed KNOW. The coordinator never accepts: this write is the operator's."""
+    ``snapshot_sha256`` names and returns the signer's fingerprint (or ``(fingerprint, signature_bytes)``), or raises
+    :class:`AcceptanceRefused` (``signature``). It runs before the write, and only for the CURRENT state: a digest that
+    is not the current snapshot's is refused as stale before any message is built. Inside the write transaction the
+    snapshot is recomputed again and must still equal ``snapshot_sha256``, so a signature over an older state accepts
+    nothing; the mission must be ready (every child done or closed) and carry no un-ACKed KNOW. One signature accepts
+    once: a second acceptance carrying the same verified signature is a replay under any sign request id.
+
+    The coordinator never accepts: this write is the operator's. Whether the fingerprint ``verify`` returns IS the
+    operator's key is ``verify``'s to decide, not this module's: it owns the sign request and the key it was signed
+    with, and this module records the fingerprint it is handed."""
     if not isinstance(snapshot_sha256, str) or not isinstance(sign_request_id, str) or not sign_request_id:
         raise CoordError("an acceptance names the snapshot digest and the sign request")
+    stale = AcceptanceRefused("stale", f"mission {mission_id} moved since the card rendered (a child, a KNOW, an "
+                              "attenuation or the membership changed); nothing was accepted; sign the new card")
     with read_transaction(store._connect) as conn:
         _must_mission(conn, mission_id)
         current = _snapshot(conn, mission_id)
-    message = (f"levain mission accept {mission_id} {current.body['mission_revision']} {snapshot_sha256}")
-    signer = verify(message)
-    if not isinstance(signer, str) or not signer:
-        raise AcceptanceRefused("signature", f"the signature over mission {mission_id} was not verified; nothing was accepted")
+    if current.sha256 != snapshot_sha256:
+        raise stale
+    message = accept_message(mission_id, current)
+    signer, signature_sha256 = _proof(message, verify(message))
     with store._write("operator", None) as (conn, now):
         snap = _snapshot(conn, mission_id)
         if snap.sha256 != snapshot_sha256 or message != accept_message(mission_id, snap):
-            raise AcceptanceRefused("stale", f"mission {mission_id} moved since the card rendered (a child, a KNOW, an "
-                                    "attenuation or the membership changed); nothing was accepted; sign the new card")
+            raise stale
         if not snap.body["children"] or not snap.ready:
             raise AcceptanceRefused("not_ready", f"mission {mission_id} has a child that is not done; nothing was accepted")
         if snap.unacked_item_ids:
@@ -349,13 +373,13 @@ def accept(store: CoordStore, mission_id: str, *, snapshot_sha256: str, sign_req
         acceptance_id = "ma-" + secrets.token_hex(16)
         try:
             conn.execute("INSERT INTO mission_acceptances (acceptance_id, mission_id, mission_revision, snapshot, "
-                          "snapshot_sha256, sign_request_id, signer_fp, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          "snapshot_sha256, sign_request_id, signature_sha256, signer_fp, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                           (acceptance_id, mission_id, snap.body["mission_revision"], canonical(snap.body), snap.sha256,
-                           sign_request_id, signer, now))
+                           sign_request_id, signature_sha256, signer, now))
         except sqlite3.IntegrityError as exc:
-            if "sign_request_id" not in str(exc):
+            if "sign_request_id" not in str(exc) and "signature_sha256" not in str(exc):
                 raise
-            raise AcceptanceRefused("replay", f"sign request {sign_request_id} already accepted a mission; "
-                                    "nothing was accepted; sign again") from None
+            raise AcceptanceRefused("replay", f"that signature (sign request {sign_request_id}) already accepted a "
+                                    "mission; nothing was accepted; sign again") from None
         return MissionAcceptance(acceptance_id, mission_id, snap.body["mission_revision"], snap.sha256, sign_request_id,
                                  signer, now)

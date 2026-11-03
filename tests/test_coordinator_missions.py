@@ -226,3 +226,109 @@ def test_the_evidence_digest_moves_when_a_worker_writes_a_know(store):
     review.file_know(store, ids[0], "tests pass", token=_token(store))
     s2 = missions.snapshot_of(store, m.mission_id)
     assert len(s2.body["evidence_digests"]) == len(s1.body["evidence_digests"]) + 1
+
+
+# ---------------------------------------------------------------------------------------------- L3 round 1 fixes
+def _pre_missions_store(directory, monkeypatch):
+    """A coordinator store made before the mission tables existed: the store is made with MISSION_SCHEMA empty."""
+    directory.mkdir(mode=0o700)
+    with monkeypatch.context() as m:
+        m.setattr(missions, "MISSION_SCHEMA", ())
+        old = CoordStore(directory, clock=Clock())
+        tid = _work(old)
+        item, _ = review.file_know(old, tid, "made before missions", token=_token(old))
+    c = sqlite3.connect(directory / "dispatch.db")
+    names = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
+    c.close()
+    assert not names & {"missions", "mission_revisions", "mission_acceptances"} and "review_items" in names
+    return tid, item.item_id
+
+
+def test_a_store_made_before_missions_is_still_read_only_current_and_loses_nothing(tmp_path, monkeypatch):
+    d = tmp_path / "dispatch"
+    tid, item_id = _pre_missions_store(d, monkeypatch)
+    store = CoordStore(d, clock=Clock())
+    store.open_readonly().close()                                    # not StoreAbsent
+    assert [i.item_id for i in review.list_items(store)] == [item_id]
+    c = sqlite3.connect(d / "dispatch.db")
+    assert "missions" not in {r[0] for r in c.execute("SELECT name FROM sqlite_master")}    # a reader made nothing
+    c.close()
+    m = missions.create_mission(store, [tid])                        # the first mission write migrates it
+    other = CoordStore(d, clock=Clock())
+    assert [x.mission_id for x in missions.list_missions(other)] == [m.mission_id]
+    assert [i.item_id for i in review.list_items(other)] == [item_id] and other.thread(tid).state == "open"
+    c = sqlite3.connect(d / "dispatch.db")
+    assert {"missions", "mission_revisions", "mission_acceptances"} <= {r[0] for r in c.execute(
+        "SELECT name FROM sqlite_master")}
+    c.close()
+
+
+def _env_mission(tmp_path):
+    """A mission over one thread bound to an envelope, in an EnvelopeStore (the bind row is written directly: the
+    signed envelope path is not what is under test)."""
+    from levain.coordinator.envelopes import EnvelopeStore
+    from levain.coordinator.store import next_gseq
+
+    d = tmp_path / "env"
+    d.mkdir(mode=0o700)
+    store = EnvelopeStore(d, clock=Clock())
+    tid = _work(store)
+    _done(store, tid)
+    drop_id = store.thread(tid).members[0]
+    with store._write("operator", None) as (conn, now):
+        conn.execute("INSERT INTO envelopes (envelope_id, gseq, origin, drop_id, body, digest, payload, signature, "
+                     "signer_fp, signer_class, supersedes, stop_at, accepted_at) VALUES ('env-1', ?, 'structured', ?, "
+                     "'{}', 'd', '{}', 's', 'fp', 'operator', NULL, ?, ?)", (next_gseq(conn, now), drop_id, now, now))
+        conn.execute("INSERT INTO envelope_binds (envelope_id, thread_id, rev, gseq, at) VALUES ('env-1', ?, 1, ?, ?)",
+                     (tid, next_gseq(conn, now), now))
+    return store, missions.create_mission(store, [tid])
+
+
+def test_an_envelope_wide_attenuation_after_render_moves_the_snapshot(tmp_path):
+    store, m = _env_mission(tmp_path)
+    rendered = missions.snapshot_of(store, m.mission_id)
+    assert rendered.body["children"][0]["envelope_chain_head"] == "env-1"
+    with store._write("operator", None) as (conn, now):                 # thread_id NULL: it applies to every bound thread
+        from levain.coordinator.store import next_gseq
+        conn.execute("INSERT INTO envelope_attenuations (envelope_id, thread_id, kind, value, by, gseq, at) VALUES "
+                     "('env-1', NULL, 'kill', '', 'operator', ?, ?)", (next_gseq(conn, now), now))
+    now_snap = missions.snapshot_of(store, m.mission_id)
+    assert now_snap.body["review_watermark_gseq"] > rendered.body["review_watermark_gseq"]
+    with pytest.raises(AcceptanceRefused) as e:
+        missions.accept(store, m.mission_id, snapshot_sha256=rendered.sha256, sign_request_id="sr-1", verify=Signer())
+    assert e.value.why == "stale"
+
+
+def test_a_stale_digest_is_refused_before_anything_is_asked_to_verify_it(store):
+    m, ids = _ready_mission(store)
+    rendered = missions.snapshot_of(store, m.mission_id)
+    extra = _work(store, "late")
+    _done(store, extra)
+    missions.attach(store, m.mission_id, extra)                          # revision 2: the old digest was never signed
+    v = Signer()
+    with pytest.raises(AcceptanceRefused) as e:
+        missions.accept(store, m.mission_id, snapshot_sha256=rendered.sha256, sign_request_id="sr-1", verify=v)
+    assert e.value.why == "stale" and v.seen == []                      # no message nobody signed was ever built
+
+
+def test_the_same_signature_cannot_accept_twice_under_a_new_sign_request_id(store):
+    m, _ = _ready_mission(store)
+    s = missions.snapshot_of(store, m.mission_id)
+    missions.accept(store, m.mission_id, snapshot_sha256=s.sha256, sign_request_id="sr-1", verify=Signer())
+    with pytest.raises(AcceptanceRefused) as e:
+        missions.accept(store, m.mission_id, snapshot_sha256=s.sha256, sign_request_id="sr-2", verify=Signer())
+    assert e.value.why == "replay"
+    # a verifier that hands back the signature bytes binds to them: the same bytes under a new id is a replay too
+    m2, _ = _ready_mission(store)
+    s2 = missions.snapshot_of(store, m2.mission_id)
+    missions.accept(store, m2.mission_id, snapshot_sha256=s2.sha256, sign_request_id="sr-3",
+                    verify=lambda _m: ("SHA256:abc", b"sig-bytes"))
+    m3, _ = _ready_mission(store)
+    s3 = missions.snapshot_of(store, m3.mission_id)
+    with pytest.raises(AcceptanceRefused) as e:
+        missions.accept(store, m3.mission_id, snapshot_sha256=s3.sha256, sign_request_id="sr-4",
+                        verify=lambda _m: ("SHA256:abc", b"sig-bytes"))
+    assert e.value.why == "replay"
+    n = sqlite3.connect(store.path).execute("SELECT COUNT(*) FROM mission_acceptances").fetchone()[0]
+    assert n == 2
+
