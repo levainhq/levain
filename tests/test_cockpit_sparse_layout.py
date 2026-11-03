@@ -54,7 +54,7 @@ def test_an_empty_card_is_its_header_and_one_line_not_a_populated_height(tmp_pat
     vals = _page(tmp_path, [{"eval": """(async () => { await new Promise(r => setTimeout(r, 400));
       const empties = [...document.querySelectorAll('.ck-zgrid .panel')].filter(p => p.querySelector('.ck-count[hidden]'));   // descendants of a column included
       const out = empties.map(p => [p.dataset.ckPanel, p.classList.contains('ck-is-empty') || p.classList.contains('ck-dash'), p.getBoundingClientRect().height, getComputedStyle(p).display]);
-      const tall = [...document.querySelectorAll('.ck-zgrid .panel.ck-h-tall')].filter(p => !p.classList.contains('ck-is-empty') && p.getBoundingClientRect().height > 0).map(p => p.getBoundingClientRect().height);
+      const tall = [...document.querySelectorAll('.ck-zgrid .panel.ck-h-tall')].filter(p => !p.classList.contains('ck-is-empty') && !p.classList.contains('ck-dash') && p.getBoundingClientRect().height > 0).map(p => p.getBoundingClientRect().height);
       return { out, tall: tall.length ? Math.min(...tall) : 0 }; })()"""}])
     got = vals[1]
     assert got["out"], vals

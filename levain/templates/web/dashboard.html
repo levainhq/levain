@@ -51,11 +51,12 @@
         </div>
       </div>
     </header>
-    <!-- The narrow page's views, one jump each (drawn only under the stylesheet's 720px break; dashboard_core.js wires the clicks). -->
+    <!-- The page's views, one jump each, at every width (dashboard_core.js wires the clicks). Notifications opens the notification
+         center; its pill is the unread count, Needs you carries the waiting count. -->
     <nav class="ck-phonetabs" id="ck-phonetabs" aria-label="Views">
-      <button type="button" data-phone-jump="needs">Needs you</button>
+      <button type="button" data-phone-jump="needs">Needs you<span class="ck-tabcount ck-needs-count" data-nc-needs hidden></span></button>
       <button type="button" data-phone-jump="board">Board</button>
-      <button type="button" data-phone-jump="notes">Notifications</button>
+      <button type="button" data-phone-jump="notifications" aria-haspopup="dialog">Notifications<span class="ck-tabcount ck-pill" data-nc-unread hidden></span></button>
       <button type="button" data-phone-jump="grants">Grants</button>
       <button type="button" data-phone-jump="drop">Drop</button>
     </nav>
@@ -83,7 +84,7 @@
     <div class="ck-secthead frame" id="ck-h-widgets" hidden><h3>At a glance</h3><span>one answer each</span></div>
     <section class="ck-widgets frame" id="ck-widgets" data-ck-region="widgets" hidden></section>
     <p class="stateline frame" id="state" hidden></p>
-    <p class="sub frame" id="store">connecting…</p>
+    <p class="sub frame" id="store" data-cold>connecting…</p>
     <!-- Modes 1-4 show subsets of the board; the keys are ignored while typing. -->
     <main class="frame"><div class="grid" id="board"></div></main>
     <footer class="deck-foot">sovereign · localhost · governed — the substrate, escaped the session</footer>

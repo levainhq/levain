@@ -311,7 +311,8 @@ class CoordPhone:
         def row(i: Any) -> dict[str, Any]:
             return {"item_id": i.item_id, "feed": i.feed, "label": review.FEED_LABELS.get(i.feed, i.feed),
                     "authority_relevant": i.authority_relevant,
-                    "text": visible(str(review.body_fields(i).get("text", ""))[:300]), "at": i.at, "state": i.state,
+                    "text": visible(review.item_text(i)[:300]),
+                    "at": i.at, "state": i.state,
                     "cleared_at": i.last[3] if i.state == "cleared" and i.last is not None else None,
                     "version": review_version(i)}
 
