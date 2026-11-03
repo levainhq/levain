@@ -270,11 +270,13 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
     # an agent whose state moved mid-pass may have fired in a chunk that never ran, so it is not judged silent
     fired = {a for a, _ in out.claimed + out.overlapped + out.duplicates}
     moved = set(out.changed)
-    out.silent.extend(a for a in out.missed_windows if a not in fired and a not in moved)
+    out.silent.extend(a for a in out.missed_windows if out.missed_windows[a] and a not in fired and a not in moved)
     return out
 
 
 def _report_windows(out: TickResult, agent_id: str, windows: list[str]) -> None:
+    if not windows:
+        return  # nothing missed: never create an empty key
     seen = out.missed_windows.setdefault(agent_id, [])
     known = set(seen)
     for window in dict.fromkeys(windows):

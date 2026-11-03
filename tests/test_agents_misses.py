@@ -73,6 +73,13 @@ def test_silence_is_found_in_one_pass_and_only_for_an_agent_that_fired_nothing(t
     assert heard.claimed == [(tc.AG, "2026-11-02T12:00:00Z")] and heard.missed[tc.AG] == 20 and heard.silent == []
 
 
+def test_a_walked_agent_that_missed_nothing_is_not_silent_and_has_no_missed_windows_key(tmp_path):
+    store = _store(tmp_path)
+    _set_cursor(store, tc.AG, "2026-11-02T11:50:00Z")  # the walk sees no slot at all before now
+    idle = ctl.tick(store, _clock([T0 - timedelta(minutes=5)]), _armed)
+    assert idle.silent == [] and tc.AG not in idle.missed_windows and idle.claimed == []
+
+
 AFTER_NOV_1 = T0.replace(day=2, hour=4, minute=50)  # local 23:50 on Nov 1: after its last slot, before Nov 2's first
 
 
