@@ -561,6 +561,7 @@ def settle_terminal(conn: sqlite3.Connection, occurrence_id: str, epoch: int, st
 LAUNCHED = "launched"
 STOPPED = "stopped"
 SKIPPED_BUDGET = "skipped-budget"
+SKIPPED_NO_INPUT = "skipped-no-input"   # the on_input hook answered "no input": the row ends, holding nothing
 NO_SLOT = "no-slot"              # the row stays admitted: retried each tick until its grace (close_no_slot)
 UNCLASSIFIED = "unclassified"    # the cover could not be read: nothing written, the row stays admitted
 NOT_ADMITTED = "not-admitted"    # the row is not admitted (already launched or ended): nothing written
@@ -583,14 +584,17 @@ class Window:
 
 @dataclass(frozen=True)
 class LaunchResult:
-    """``outcome`` is :data:`LAUNCHED`, :data:`STOPPED` or :data:`SKIPPED_BUDGET` (the row's new state; ``reason`` is the
-    one written), or :data:`NO_SLOT`, :data:`UNCLASSIFIED` or :data:`NOT_ADMITTED` (nothing written; ``reason`` says
+    """``outcome`` is :data:`LAUNCHED`, :data:`STOPPED`, :data:`SKIPPED_BUDGET` or :data:`SKIPPED_NO_INPUT` (the row's
+    new state; ``reason`` is the one written), or :data:`NO_SLOT`, :data:`UNCLASSIFIED` or :data:`NOT_ADMITTED` (nothing written; ``reason`` says
     why). ``launch_epoch`` is what a fire hands :func:`start_run`."""
     outcome: str
     reason: str | None = None
     slot: int | None = None
     link_id: str | None = None
     launch_epoch: int | None = None
+
+
+InputCheck = Callable[[dict], bool]   # the on_input hook: the occurrence's identity in, "input present" out
 
 
 class _Refusal(Exception):
@@ -664,11 +668,59 @@ def _end_admitted(conn: sqlite3.Connection, occurrence_id: str, state: str, reas
         raise RuntimeError(f"occurrence {occurrence_id} left admitted inside its own launch transaction")
 
 
+NO_INPUT = "no_input"
+
+
+def check_input(store: AgentStore, occurrence_id: str, on_input: InputCheck | None, now: datetime) -> LaunchResult | None:
+    """The ``on_input`` hook point, run between the claim and the launch (BUILD_PLAN §4.0: "claim -> input check ->
+    ``skipped-no-input``", its own transaction). ``on_input(occurrence)`` receives the row's ``agent_id``, ``kind``,
+    ``key``, ``window_key``, ``spec_hash``, ``binding_id`` and ``occurrence_id`` and answers ``True`` (input present) or
+    ``False`` (none). With no hook the default is "input present". Returns ``None`` to go on to the launch, or the
+    :class:`LaunchResult` that ends it:
+
+    * ``False`` ends the ``admitted`` row ``skipped-no-input`` with reason :data:`NO_INPUT`, in one transaction that
+      writes nothing else, so the occurrence never held a slot or a reservation (A0 §2.4).
+    * Anything but a real ``bool``, or a hook that raises, is :data:`UNCLASSIFIED`: nothing is written and the row stays
+      ``admitted``. An input that cannot be read is dead, not quiet, and a quiet window neither counts nor resets a gate.
+    * A row that is not ``admitted`` is :data:`NOT_ADMITTED`, written nothing.
+
+    The hook runs outside any write lock, because it may be slow (it reads whatever the agent is to work on); the row
+    is read again under the lock, and ends only if it is still the admitted row the hook was asked about."""
+    cols = ("agent_id", "kind", "key", "state", "epoch", "window_key", "spec_hash", "binding_id")
+    with store.read() as conn:
+        row = conn.execute("SELECT " + ", ".join(cols) + " FROM agent_occurrences WHERE occurrence_id = ?",
+                           (occurrence_id,)).fetchone()
+    if row is None:
+        return LaunchResult(NOT_ADMITTED, "no such occurrence")
+    occ = dict(zip(cols, row), occurrence_id=occurrence_id)
+    if occ["state"] != "admitted":
+        return LaunchResult(NOT_ADMITTED, f"the occurrence is {occ['state']}")
+    if on_input is None:
+        return None
+    try:
+        present = on_input({k: v for k, v in occ.items() if k not in ("state", "epoch")})
+    except Exception as exc:  # noqa: BLE001 - a hook that cannot answer is never read as "no input"
+        return LaunchResult(UNCLASSIFIED, f"the input check failed: {type(exc).__name__}")
+    if type(present) is not bool:
+        return LaunchResult(UNCLASSIFIED, f"the input check answered {type(present).__name__}, not a bool")
+    if present:
+        return None
+    with store.write() as conn:
+        cur = conn.execute("UPDATE agent_occurrences SET state = 'skipped-no-input', reason = ?, ended_at = ?"
+                           " WHERE occurrence_id = ? AND state = 'admitted' AND epoch = ?",
+                           (NO_INPUT, _stamp(schedule._utc(now)), occurrence_id, occ["epoch"]))
+        if cur.rowcount != 1:
+            return LaunchResult(NOT_ADMITTED, "the occurrence moved while its input was checked")
+    return LaunchResult(SKIPPED_NO_INPUT, NO_INPUT)
+
+
 def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authority, executor: accounting.Executor,
            window: Window, now: datetime,
            launch_over: Callable[[str], bool | None] | None = None,
-           session_alive: Callable[[str], bool | None] | None = None) -> LaunchResult:
-    """The launch transaction (A0 §2.5 ``admitted -> launched``). ``authority`` is an
+           session_alive: Callable[[str], bool | None] | None = None,
+           on_input: InputCheck | None = None) -> LaunchResult:
+    """The launch transaction (A0 §2.5 ``admitted -> launched``). Before anything else it runs :func:`check_input`
+    with ``on_input``; an answer there ends the call. ``authority`` is an
     :class:`~levain.agent_authority.AgentAuthority`; it is refreshed here, before the write lock. In one
     ``BEGIN IMMEDIATE`` the row is read, the agent's operation, spec and bar, the predicate (a live link), the
     reservation (:func:`accounting.reserve`, held to the admitted link's signed terms) and a slot
@@ -682,6 +734,9 @@ def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authori
     opened the session."""
     if not isinstance(store, AgentStore):
         store = open_agent_store(store)
+    skipped = check_input(store, occurrence_id, on_input, now)
+    if skipped is not None:
+        return skipped
     at_dt = schedule._utc(now)
     at = _stamp(at_dt)
     with store.read() as conn:

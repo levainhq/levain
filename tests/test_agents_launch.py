@@ -92,9 +92,9 @@ class Rig:
         assert outcome == ctl.CLAIMED
         return oid
 
-    def launch(self, oid, executor=None, later=timedelta(0)):
+    def launch(self, oid, executor=None, later=timedelta(0), **kw):
         return ctl.launch(self.store, oid, authority=self.authority, executor=executor or Exec(), window=WINDOW,
-                          now=self.now(later))
+                          now=self.now(later), **kw)
 
     def row(self, oid):
         with self.store.read() as c:
@@ -982,3 +982,61 @@ def test_a_group_that_never_drains_exits_unproven_at_the_deadline(tmp_path, monk
 ])
 def test_gate_proves_termination(rc, want):
     assert ctl.gate_proves_termination(rc) is want
+
+
+# --- the on_input hook point (BUILD_PLAN §4.0: claim -> input check -> skipped-no-input) -------------------------------
+
+def test_no_input_ends_skipped_no_input_and_takes_nothing(rig):
+    # behaviour: a hook that answers False ends the admitted row skipped-no-input before the launch transaction, so it
+    # never held a slot or a reservation, even with no link to admit; the hook was handed the row's identity
+    oid = rig.claim("k")
+    seen = []
+    result = rig.launch(oid, on_input=lambda occ: seen.append(occ) or False)
+    assert (result.outcome, result.reason) == ("skipped-no-input", "no_input")
+    row = rig.row(oid)
+    assert (row["state"], row["reason"]) == ("skipped-no-input", "no_input") and row["ended_at"]
+    assert row["launched_at"] is None and row["launch_epoch"] is None and rig.taken(oid) == ([], [])
+    assert seen == [{"agent_id": rig.agent, "kind": "manual", "key": "k", "window_key": "m:2026-10-25",
+                     "spec_hash": rig.spec_hash, "binding_id": BINDING, "occurrence_id": oid}]
+    assert rig.launch(oid, on_input=lambda occ: True).outcome == "not-admitted"   # ended rows are not asked again
+
+
+def test_the_default_and_a_present_input_both_go_on_to_the_launch(rig):
+    # behaviour: no hook means "input present"; a hook answering True changes nothing about the launch
+    rig.link()
+    first = rig.claim("k1")
+    assert rig.launch(first).outcome == "launched"
+    rig.finish(first)
+    second = rig.claim("k2")
+    assert rig.launch(second, on_input=lambda occ: True).outcome == "launched"
+    assert rig.row(second)["state"] == "launched"
+
+
+@pytest.mark.parametrize("answer", ["raise", None, 0, "yes"])
+def test_an_input_check_that_cannot_answer_writes_nothing_and_leaves_the_row_admitted(rig, answer):
+    # behaviour: a hook that raises or answers a non-bool is dead input, never quiet: nothing written, no slot
+    oid = rig.claim("k")
+    before = rig.row(oid)
+
+    def hook(occ):
+        if answer == "raise":
+            raise OSError("unreadable")
+        return answer
+    result = rig.launch(oid, on_input=hook)
+    assert result.outcome == "unclassified" and "input check" in result.reason
+    assert rig.row(oid) == before and rig.taken(oid) == ([], [])
+
+
+def test_a_row_that_moved_while_the_hook_ran_is_not_ended_by_its_answer(rig):
+    # behaviour: the hook runs outside the write lock; if the row left admitted meanwhile, a "no input" answer
+    # writes nothing
+    oid = rig.claim("k")
+
+    def hook(occ):
+        with rig.store.write() as c:
+            c.execute("UPDATE agent_occurrences SET state = 'missed', reason = 'no_slot', ended_at = 'x'"
+                      " WHERE occurrence_id = ?", (oid,))
+        return False
+    result = rig.launch(oid, on_input=hook)
+    assert result.outcome == "not-admitted"
+    assert (rig.row(oid)["state"], rig.row(oid)["reason"]) == ("missed", "no_slot")
