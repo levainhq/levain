@@ -1131,11 +1131,31 @@ def migrate_settings(conn: sqlite3.Connection) -> None:
     migrate_launch_roles(conn)
 
 
+_LEGACY_ROLES = ("coordinator", "worker")      # the role CHECK of every table made before the room role
+
+
 def _launches_role_stale(conn: sqlite3.Connection) -> bool:
-    """Whether the file's ``launches`` table carries a ``role`` CHECK other than :data:`ROLES`' (a table made by an earlier
-    release). No such table: False (its CREATE makes it)."""
+    """Whether the file's ``launches`` table carries the known LEGACY ``role`` CHECK (the text of :data:`_LEGACY_ROLES`
+    exactly), the one shape this release rebuilds. No such table, or the current CHECK: False. Any other role CHECK
+    is a newer or hand-changed store (an extra role with no rows yet looks like a legacy table otherwise): refused by
+    name, never narrowed."""
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'launches'").fetchone()
-    return row is not None and _in("role", ROLES) not in row[0]
+    if row is None or _in("role", ROLES) in row[0]:
+        return False
+    if _in("role", _LEGACY_ROLES) in row[0]:
+        return True
+    raise CoordError("launches carries a role CHECK this release does not know (a newer store); a rebuild would "
+                     "narrow it; nothing was changed")
+
+
+def _cascading_children(conn: sqlite3.Connection) -> list[str]:
+    """``table(column) ON DELETE <action>`` of every foreign key naming ``launches`` whose delete action is not NO ACTION or
+    RESTRICT: dropping the parent would run that action on the child's rows, and recreating the parent does not undo it."""
+    return sorted(f"{table}({fk[3]}) ON DELETE {fk[6]}"
+                  for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+                  if table != "launches"
+                  for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")')
+                  if fk[2] == "launches" and fk[6].upper() not in ("NO ACTION", "RESTRICT"))
 
 
 @functools.lru_cache(maxsize=1)
@@ -1170,15 +1190,15 @@ def _launches_references(conn: sqlite3.Connection) -> set[tuple]:
 
 
 def migrate_launch_roles(conn: sqlite3.Connection) -> bool:
-    """``launches`` made before the ``room`` role (its ``role`` CHECK lists the older roles) is rebuilt with the current
+    """``launches`` made before the ``room`` role (its ``role`` CHECK is the legacy text, the older roles) is rebuilt with the current
     CHECK. The table is the parent of ``launch_events``, ``launch_spawns`` and every chat table's key, and this
     runs in the opener's transaction, where the foreign-key pragma cannot be changed, so the usual new-table-then-rename
     is not available: a rename rewrites every child's reference, and a dropped parent leaves them dangling at commit.
     The rows are held in a temp table (``rowid`` and every column the old table holds, ``gseq`` among them), the old
     table dropped, the new one created under its own name and refilled with the held rows; every child's deferred
     check resolves as its parent row returns. The old table's triggers go with it and are recreated from
-    :data:`LEASE_SCHEMA`. The copy is counted before the drop; the foreign keys that name ``launches`` must be no
-    worse than before, and ``PRAGMA integrity_check`` must answer ``ok``: any failure raises and the caller's
+    :data:`LEASE_SCHEMA`. The copy is counted before the drop; the foreign keys that name ``launches`` (and the store's, whole) must be no
+    worse than before, none may act on delete (a CASCADE or SET NULL child refuses the rebuild), and ``PRAGMA quick_check`` must answer ``ok``: any failure raises and the caller's
     transaction rolls back. A table holding what this release does not know (a column the current ``CREATE`` lacks,
     a generated column, an index or trigger outside :data:`LEASE_SCHEMA`, or one whose text differs) is a newer or
     hand-changed store: the rebuild raises and changes nothing. Runs only inside the caller's ``BEGIN IMMEDIATE``.
@@ -1211,10 +1231,15 @@ def migrate_launch_roles(conn: sqlite3.Connection) -> bool:
     if unfillable:
         raise CoordError(f"launches gains column(s) {', '.join(unfillable)} with no default for the rows it holds; "
                          "nothing was changed")
+    acting = _cascading_children(conn)
+    if acting:
+        raise CoordError(f"{', '.join(acting)} would act on its rows when launches is dropped and a rebuild cannot "
+                         "restore them; nothing was changed")
     cols = ", ".join(r[1] for r in old_x)
     create = next(stmt for stmt in LEASE_SCHEMA if stmt.startswith("CREATE TABLE IF NOT EXISTS launches ")) \
         .replace("CREATE TABLE IF NOT EXISTS launches ", "CREATE TABLE launches ", 1)
     before = _launches_references(conn)
+    before_all = set(conn.execute("PRAGMA foreign_key_check").fetchall())
     deferred = conn.execute("PRAGMA defer_foreign_keys").fetchone()[0]
     conn.execute("PRAGMA defer_foreign_keys = ON")
     try:
@@ -1236,7 +1261,12 @@ def migrate_launch_roles(conn: sqlite3.Connection) -> bool:
         if broken:
             raise CoordError(f"the launches rebuild left a dangling reference ({str(broken[:3])[:200]}); "
                              "nothing was changed")
-        check = conn.execute("PRAGMA integrity_check").fetchall()
+        after_all = sorted(set(conn.execute("PRAGMA foreign_key_check").fetchall()) - before_all)
+        if after_all:
+            raise CoordError(f"the launches rebuild left a foreign key broken ({str(after_all[:3])[:200]}); "
+                             "nothing was changed")
+        # quick_check, not integrity_check: this runs inside the opener's write lock, and a full scan held it
+        check = conn.execute("PRAGMA quick_check").fetchall()
         if check != [("ok",)]:
             raise CoordError(f"the launches rebuild left the store failing its integrity check "
                              f"({str(check[:3])[:200]}); nothing was changed")

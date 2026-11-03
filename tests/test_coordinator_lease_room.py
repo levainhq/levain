@@ -239,6 +239,55 @@ def test_an_unknown_unique_constraint_refuses_by_name(store, clock):
     _refused_rebuild(store, add, r"launches holds a constraint on harness, cwd, at")
 
 
+def _add_child(action):
+    def mutate(c):
+        c.execute("CREATE TABLE launch_notes (id INTEGER PRIMARY KEY, launch_id TEXT REFERENCES launches(launch_id) "
+                  f"ON DELETE {action})")
+        c.execute("INSERT INTO launch_notes (launch_id) SELECT launch_id FROM launches")
+    return mutate
+
+
+@pytest.mark.parametrize("action", ["CASCADE", "SET NULL", "SET DEFAULT"])
+def test_a_child_table_that_acts_on_delete_refuses_the_rebuild(store, clock, action):
+    _a_store_with_history(store, clock)
+    _refused_rebuild(store, _add_child(action), rf"launch_notes\(launch_id\) ON DELETE {action}")
+
+
+@pytest.mark.parametrize("action", ["NO ACTION", "RESTRICT"])
+def test_a_child_with_no_delete_action_does_not_block_the_rebuild(store, clock, action):
+    _a_store_with_history(store, clock)
+    _age(store)
+    c = sqlite3.connect(store.path, isolation_level=None)
+    try:
+        c.execute("PRAGMA foreign_keys = OFF")
+        _add_child(action)(c)
+    finally:
+        c.close()
+    CoordStore(store.path.parent).coord_status()
+    assert _NEW_ROLE in _db(store).execute("SELECT sql FROM sqlite_master WHERE name = 'launches'").fetchone()[0]
+
+
+def test_a_newer_role_check_with_no_rows_of_it_refuses_by_name(store, clock):
+    _a_store_with_history(store, clock)
+
+    def widen(c):
+        sql = c.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'launches'").fetchone()[0]
+        triggers = [r[0] for r in c.execute("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = "
+                                            "'launches'")]
+        cols = ", ".join(r[1] for r in c.execute("PRAGMA table_info(launches)"))
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(f"CREATE TEMP TABLE hold AS SELECT rowid AS rid, {cols} FROM launches")
+        c.execute("DROP TABLE launches")
+        c.execute(sql.replace(_OLD_ROLE, "role TEXT NOT NULL CHECK (role IN ('coordinator', 'worker', 'scribe'))"))
+        c.execute(f"INSERT INTO launches (rowid, {cols}) SELECT rid, {cols} FROM hold")
+        c.execute("DROP TABLE hold")
+        for t in triggers:
+            c.execute(t)
+        c.execute("COMMIT")
+
+    _refused_rebuild(store, widen, "role CHECK this release does not know")
+
+
 def test_an_older_opener_leaves_the_new_table_alone(store, clock):
     # what an earlier release does to a store this release made: its CREATE ... IF NOT EXISTS statements change nothing
     thread, _w = _a_store_with_history(store, clock)
