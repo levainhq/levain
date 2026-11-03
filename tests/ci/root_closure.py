@@ -337,6 +337,8 @@ LAZY_SITES = {
     # operator: <- ``_validate_egress_key`` (the replay's grant validation, as ``egress_key_host_problem``) and ``levain/chat_egress/advert.py``
     'levain/authority.py::egress_key_repo_problem::from levain.chat_egress.advert import KEYLESS_ESCAPES': 'operator',
     'levain/authority.py::egress_key_repo_problem::from levain.chat_egress.parse import canonical_path': 'operator',
+    # operator: <- ``_grant_append_checks`` / the renew branch of ``_append_only_checks`` <- ``prepare`` / ``append`` (the signer's process: ``cli``, ``cockpit.keys``, ``consent.grants``, ``agents``, ``chat_egress.key_setup``); never the replay (``_step``)
+    'levain/authority.py::_hands_mcp_check::from levain import hands_mcp': 'operator',
     # operator: a ``Cockpit`` method; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py`` (``git grep -n 'Cockpit(' -- levain``), not in the closure; engine is here only as ``levain/cockpit/__init__.py``'s import
     'levain/cockpit/engine.py::Cockpit._note_decision_one::from levain.consent.notes import NoteStoreError': 'operator',
     # operator: a ``Cockpit`` method; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``, not in the closure

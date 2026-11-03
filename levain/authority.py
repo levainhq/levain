@@ -58,7 +58,7 @@ __all__ = [
     "CONSENT_GRANTABLE_TOOLS", "CONSENT_POSTURES", "CONSENT_SHELL_TOOLS",
     "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3", "FORMAT_V4",
     "GRADUATION_CREATE_RANK",
-    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
+    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
     "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
@@ -1492,6 +1492,22 @@ def _graduation_phone_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: 
 # at most that past its own. ``store_id`` here is the AUTONOMIC store's id (the record's own base ``store_id`` is the
 # cockpit's); a reader holds it to the store it reads. ``guard`` is the guard itself, not a hash. Nothing here reads
 # the autonomic store: whether a link is live for a launch is a reader's question (levain.agent_authority, a later slice: BUILD_PLAN P5c-1).
+# A hands MCP entry (levain 15 M1, ``levain.hands_mcp``): one server the hands account's own MCP list carries, signed
+# like an egress setup record: fixed terms under its id (a renew moves only the expiry, at most 30 days past its link),
+# any enrolled key revokes it, the phone passkey included (a revoke only narrows: L3 r1). At most one LIVE entry per
+# name and per remote callback port, judged at append against the live entries (:func:`_hands_mcp_unique_check`). ``server_sha256`` is the digest of the table the entry renders; the replay holds it
+# only to a sha256 (a later renderer change must not refuse an old log) and the append and render check it.
+HANDS_MCP_KIND = "hands-mcp"
+_HANDS_MCP_FIELDS = frozenset({"id", "kind", "name", "transport", "command", "args", "env", "url", "identity_kind",
+                               "callback_port", "server_sha256", "expires_at"})
+_HANDS_MCP_ID = re.compile(r"hm-[0-9a-f]{12}")
+_HANDS_MCP_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+_HANDS_MCP_ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_HANDS_MCP_TRANSPORTS = ("stdio", "remote")
+_HANDS_MCP_IDENTITIES = ("dedicated", "operator")
+_HANDS_MCP_MAX = 64
+_HANDS_MCP_FIXED = "a hands MCP entry's terms are fixed: revoke it and register another"
+
 AGENT_LINK_KIND = "agent-link"
 AGENT_LINK_MAX = _CONSENT_GRANT_MAX
 # two shapes are accepted, no loosening between them: the shipped one (a link written before the subscription route,
@@ -1696,6 +1712,127 @@ def agent_link_incarnation(state: AuthoritySnapshot, link_id: str) -> str | None
     return f"{born}:{hashlib.sha256(meaning.encode()).hexdigest()}"
 
 
+def _validate_hands_mcp(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A hands MCP entry's shape (:data:`HANDS_MCP_KIND`): exactly its fields, each in its form. A stdio entry names a
+    command (and may carry args and env) and no url, with callback port 0; a remote entry names a url and no command,
+    args or env, with a callback port from 1024 to 65535. What an entry may name (a command outside the operator's
+    home, no credential in argv, an https or loopback url) is an append rule (``levain.hands_mcp``), not a replay
+    rule, so no later rule change refuses the log."""
+    if set(grant) != _HANDS_MCP_FIELDS:
+        raise AuthorityError(f"{what} (a hands MCP entry) must carry exactly {', '.join(sorted(_HANDS_MCP_FIELDS))}")
+    if grant["kind"] != HANDS_MCP_KIND:
+        raise AuthorityError(f"{what}.kind must be {HANDS_MCP_KIND!r}")
+    for name, pattern, shape in (("id", _HANDS_MCP_ID, "hm- and 12 lowercase hex digits"),
+                                 ("name", _HANDS_MCP_NAME, "a lowercase name of 1 to 32 characters (a-z, 0-9, _ -)"),
+                                 ("server_sha256", _SHA256_HEX, "64 lowercase hex digits")):
+        if not isinstance(grant[name], str) or not pattern.fullmatch(grant[name]):
+            raise AuthorityError(f"{what}.{name} must be {shape}")
+    if grant["transport"] not in _HANDS_MCP_TRANSPORTS or type(grant["transport"]) is not str:
+        raise AuthorityError(f"{what}.transport must be one of {', '.join(_HANDS_MCP_TRANSPORTS)}")
+    if grant["identity_kind"] not in _HANDS_MCP_IDENTITIES or type(grant["identity_kind"]) is not str:
+        raise AuthorityError(f"{what}.identity_kind must be one of {', '.join(_HANDS_MCP_IDENTITIES)}")
+    command = _agent_text(grant["command"], f"{what}.command", _AGENT_PATH_MAX, empty=True)
+    url = _agent_text(grant["url"], f"{what}.url", 2048, empty=True)
+    args = grant["args"]
+    if not isinstance(args, (list, tuple)) or len(args) > _HANDS_MCP_MAX:
+        raise AuthorityError(f"{what}.args must be a list of at most {_HANDS_MCP_MAX} texts")
+    for a in args:
+        _agent_text(a, f"{what}.args", _AGENT_PATH_MAX, empty=True)
+    env = grant["env"]
+    if not isinstance(env, Mapping) or len(env) > _HANDS_MCP_MAX:
+        raise AuthorityError(f"{what}.env must be a mapping of at most {_HANDS_MCP_MAX} names to texts")
+    for k, v in env.items():
+        if not isinstance(k, str) or not _HANDS_MCP_ENV_KEY.fullmatch(k):
+            raise AuthorityError(f"{what}.env names must match {_HANDS_MCP_ENV_KEY.pattern}")
+        _agent_text(v, f"{what}.env", _AGENT_PATH_MAX, empty=True)
+    port = grant["callback_port"]
+    if type(port) is not int:
+        raise AuthorityError(f"{what}.callback_port must be an integer")
+    if grant["transport"] == "stdio":
+        if not command or url or port != 0:
+            raise AuthorityError(f"{what} (a stdio entry) names a command, no url, and callback_port 0")
+    elif not url or command or args or env or not 1024 <= port <= 65535:
+        raise AuthorityError(f"{what} (a remote entry) names a url and no command, args or env, and a "
+                             "callback_port from 1024 to 65535")
+    expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    if at is not None and expires - at > _CONSENT_GRANT_MAX:
+        raise AuthorityError(f"{what} may last at most 30 days past its link's time")
+    if not _finite_json(grant):
+        raise AuthorityError(f"{what} must be finite JSON (no NaN or Infinity)")
+    return _thaw(grant)
+
+
+def _hands_mcp_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
+    """A hands MCP entry's change: ``renew`` when only its expiry moved later; anything else is refused."""
+    rest = lambda g: _canonical({k: v for k, v in g.items() if k != "expires_at"})   # noqa: E731
+    if rest(o) == rest(n) and n_exp > o_exp:
+        return "renew"
+    raise AuthorityError(_HANDS_MCP_FIXED)
+
+
+def _hands_mcp_check(grants: list[Any], after: str = "") -> None:
+    """At append and at a renew, every hands MCP entry meets the registration-time rules and carries the digest of the
+    table it renders (``levain.hands_mcp``): judged against the appender's own home and files, so an append rule.
+    ``after``: the renew's tail naming the grant (one signed before a rule is revoked and created again)."""
+    from levain import hands_mcp
+    for grant in grants:
+        if not (isinstance(grant, Mapping) and grant.get("kind") == HANDS_MCP_KIND):
+            continue
+        entry = _thaw(grant)
+        problems = hands_mcp.registration_problems(entry, home=os.path.expanduser("~"))
+        if not problems and hands_mcp.server_sha256(entry) != entry["server_sha256"]:
+            problems = [hands_mcp.DIGEST_REFUSAL]
+        if problems:
+            raise AuthorityError(f"hands MCP entry {str(entry['id'])[:40]!r}: " + "; ".join(problems) + after)
+
+
+def _hands_mcp_live(grant: Any, now: datetime) -> bool:
+    if not (isinstance(grant, Mapping) and grant.get("kind") == HANDS_MCP_KIND):
+        return False
+    try:
+        return _parse_stamp(grant["expires_at"], "expires_at") > now
+    except (AuthorityError, KeyError, OverflowError):
+        return False
+
+
+def _hands_mcp_unique_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
+    """At append (L3 r1): a create, a loosen or a renew that brings in, changes or extends a hands MCP entry may not
+    leave two LIVE entries of one name, or two live remote entries pinning one callback port; either would make every
+    render of the hands account's list refuse. Judged with the appender's clock (liveness reads expiry), so an append
+    rule; a log a foreign writer left holding two is refused at render (``levain.hands_mcp``)."""
+    op = rec["op"]
+    if op == "create_grant":
+        grant = rec["grant"]
+        if not isinstance(grant, Mapping) or not isinstance(grant.get("id"), str):
+            return
+        after = {**state.policy.grants, grant["id"]: grant}
+        touched = [grant["id"]]
+    elif op == "loosen":
+        after = rec["policy"]["grants"]
+        old = state.policy.grants
+        touched = [gid for gid, g in after.items()
+                   if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))]
+    elif op == "renew":
+        after = state.policy.grants
+        touched = [rec["grant_id"]]
+    else:
+        return
+    live = {gid: g for gid, g in after.items() if _hands_mcp_live(g, now)}
+    for gid in touched:
+        g = live.get(gid)
+        if g is None:
+            continue
+        for oid, o in live.items():
+            if oid == gid:
+                continue
+            if o["name"] == g["name"]:
+                raise AuthorityError(f"one live hands MCP entry per name: {g['name']!r} is already live as "
+                                     f"{oid[:40]!r}; revoke it first")
+            if g["transport"] == o["transport"] == "remote" and g["callback_port"] == o["callback_port"]:
+                raise AuthorityError(f"one live hands MCP entry per callback port: {g['callback_port']} is already "
+                                     f"pinned by {oid[:40]!r}; revoke it first or register on another port")
+
+
 def _refuse_unknown_kind(grants: list[Any]) -> None:
     """At append: this levain writes no grant of a kind it does not know (it holds one a newer levain wrote, inert)."""
     for grant in grants:
@@ -1756,6 +1893,9 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
                                 passkey_revocable=True, max_life=GRADUATION_GRANT_MAX, fixed=_GRADUATION_FIXED),
     GRADUATION_PHONE_KIND: _GrantKind(validate=_validate_graduation_phone, change=_graduation_phone_change,
                                       passkey_revocable=True, expires=False, fixed=_GRADUATION_PHONE_FIXED),
+    HANDS_MCP_KIND: _GrantKind(validate=_validate_hands_mcp, change=_hands_mcp_change,
+                               append_checks=(_hands_mcp_check,), renew_checks=(_hands_mcp_check,),
+                               passkey_revocable=True, fixed=_HANDS_MCP_FIXED),
     AGENT_LINK_KIND: _GrantKind(validate=_validate_agent_link, change=_agent_link_change, passkey_revocable=True,
                                 max_life=AGENT_LINK_MAX, fixed=_AGENT_LINK_FIXED, renew_signer_class=LAPTOP),
 })
@@ -2481,6 +2621,7 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     other per-kind append rule (:data:`_GRANT_KINDS`), a kind this levain does not know refused; and the setup
     record's one-live rule (:func:`_egress_key_append_check`)."""
     _egress_key_append_check(state, rec, now)
+    _hands_mcp_unique_check(state, rec, now)
     if rec["op"] == "create_grant":
         _grant_append_checks([rec["grant"]])
     elif rec["op"] == "loosen":
