@@ -296,6 +296,14 @@ LAZY_SITES = {
     'levain/cockpit/authority.py::RequestAuthority.fence::from levain.cockpit.firejournal import authority_fence': 'root',
     'levain/cockpit/authority.py::RequestAuthority.policy::from levain.authority import genesis_policy': 'root',
     'levain/cockpit/authority.py::RequestAuthority.revision::from levain.cockpit.firejournal import authority_fence': 'root',
+    # operator: _agent_link_card has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process
+    'levain/cockpit/authority.py::_agent_link_card::from levain.authority import AGENT_LINK_KIND, _thaw': 'operator',
+    # operator: _agent_link_card has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process
+    'levain/cockpit/authority.py::_agent_link_card::from levain.autonomic.coverage import guard_problem': 'operator',
+    # operator: open_bar_problem has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process
+    'levain/cockpit/authority.py::open_bar_problem::from levain.agent_authority import OPEN_BAR_REFUSAL, AgentAuthorityError, open_bar_for': 'operator',
+    # operator: sign_card has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process
+    'levain/cockpit/authority.py::sign_card::from levain.agents.signing import sign_agent_link': 'operator',
     'levain/consent/queue.py::AuthoritySource.head::from levain.authority import log_head': 'root',
     'levain/dispatch/contract.py::git_env::from levain.launch import child_env': 'root',
     'levain/dispatch/published.py::sync::from levain.qbroker.grants import PUBLISHED_MAX   # here: grants imports this module': 'root',

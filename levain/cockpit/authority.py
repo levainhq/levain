@@ -282,12 +282,24 @@ class CardRefused(ValueError):
     """The card will not be shown to sign: the link breaks a rule the log would also hold it to, or the card's own."""
 
 
-def open_bar_problem(grant: Mapping[str, Any]) -> str | None:
-    """Why this agent's link may not be signed because its revoke is open (A0 §6.10), or ``None``. The seam the open-bar
-    check (P5c-2b) fills, consulted by :func:`sign_card` before anything is signed. Until that check exists no bar can
-    be read, so the seam REFUSES: a card that signed while it could not tell whether a bar was open would be a signing
-    path that fails open. P5c-2b replaces this body."""
-    return "the open-revoke-bar check is not built yet (P5c-2b), so this card cannot be signed"
+def open_bar_problem(grant: Mapping[str, Any], store_dir: Any = None) -> str | None:
+    """Why this agent's link may not be signed because its revoke is open (A0 §6.10), or ``None``. Consulted by
+    :func:`sign_card` before anything is signed. The open bar is read from the autonomic store at ``store_dir`` (default:
+    the store every ``levain agents`` verb opens) by :func:`levain.agent_authority.open_bar_for`: an open bar returns the
+    refusal text, a closed or absent one passes, and a bar that cannot be read refuses too, since a card that signed
+    while it could not tell whether a bar was open would be a signing path that fails open. The read and the append are
+    two steps, so a bar committed between them can still be passed: A0 §6.10's known edge, the same one
+    ``sign_agent_link`` holds."""
+    from levain.agent_authority import OPEN_BAR_REFUSAL, AgentAuthorityError, open_bar_for
+
+    agent_id = grant.get("agent_id")
+    if type(agent_id) is not str:
+        return None     # the card and the log's own rules refuse a link with no agent
+    try:
+        bar = open_bar_for(agent_id, store_dir)
+    except AgentAuthorityError as exc:
+        return f"{exc}: nothing was signed"
+    return OPEN_BAR_REFUSAL if bar is not None else None
 
 
 def _dollars(micros: int) -> str:
@@ -379,13 +391,13 @@ def _agent_link_card(grant: Mapping[str, Any]) -> dict[str, Any]:
 
 def sign_card(data_root: Any, grant: Mapping[str, Any], **signing: Any) -> Any:
     """The cockpit's sign path for the card: the card's own refusals, the open-bar seam, then the one signing entry
-    (:func:`levain.agents.signing.sign_agent_link`). ``signing`` is that entry's keywords. What is signed is the card's
+    (:func:`levain.agents.signing.sign_agent_link`). ``signing`` is that entry's keywords; its ``store_dir`` (the autonomic store) is the one the open bar is read from. What is signed is the card's
     ``fields`` snapshot, taken once, so a later change to ``grant`` cannot reach the signature. No production caller
     exists yet: ``levain agents sign`` signs through ``sign_agent_link`` directly and the cockpit does not offer the card."""
     from levain.agents.signing import sign_agent_link
 
     card = agent_link_card(grant)               # a link the card would refuse is not signed either
-    why = open_bar_problem(card["fields"])
+    why = open_bar_problem(card["fields"], signing.get("store_dir"))
     if why is not None:
         raise CardRefused(why)
     return sign_agent_link(data_root, card["fields"], **signing)

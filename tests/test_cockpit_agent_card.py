@@ -156,25 +156,46 @@ def test_a_confirm_class_link_with_no_guard_is_refused(world, monkeypatch):
         sign_card(world.root, unguarded, signer_fp=fp, sign=sign, clock=world.clock)
     assert world.state().seq == before                           # nothing was signed
     # a complete guard passes the card; the signing path needs the open-bar seam to answer (P5c-2b fills it)
-    monkeypatch.setattr(card_mod, "open_bar_problem", lambda g: None)
+    monkeypatch.setattr(card_mod, "open_bar_problem", lambda g, store_dir=None: None)
     guarded = link(world, 1, capabilities=OUTWARD, guard=[dict(e) for e in TEST_GUARD])
     assert agent_link_card(guarded)["fields"]["guard"]
     assert auth.agent_links(sign_card(world.root, guarded, signer_fp=fp, sign=sign, clock=world.clock),
                             guarded["agent_id"], guarded["store_id"]) == [guarded["id"]]
 
 
-def test_the_open_bar_seam_refuses_until_the_check_exists_and_a_reason_stops_the_signing(world, monkeypatch):
+def test_the_open_bar_seam_reads_a_real_store_and_a_reason_stops_the_signing(world, tmp_path):
+    from levain.agent_authority import OPEN_BAR_REFUSAL
+    from levain.agents import bars
+    from levain.autonomic.agent_tables import create_agent_objects
+
     fp, sign = world.keys["laptop"]
     grant = link(world, 1)
+    store_dir = tmp_path / "autonomic"
+    store_dir.mkdir()
+    store = sqlite3.connect(store_dir / "autonomic.db", isolation_level=None)
+    create_agent_objects(store)
+    now = world.clock.now + timedelta(minutes=5)
     before = world.state().seq
-    # the shipped seam cannot read a bar, so it refuses: the card never signs open
-    assert "not built yet" in card_mod.open_bar_problem(grant)
-    with pytest.raises(CardRefused, match="not built yet"):
-        sign_card(world.root, grant, signer_fp=fp, sign=sign, clock=world.clock)
-    monkeypatch.setattr(card_mod, "open_bar_problem", lambda g: "a revoke is open for this agent: finish or abandon it")
+    # no bar: the seam passes
+    assert card_mod.open_bar_problem(grant, store_dir) is None
+    # an open bar: refused with the reason, and sign_card signs nothing
+    bar = bars.open_bar(store, grant["agent_id"], head_seq=before, now=now)
+    assert card_mod.open_bar_problem(grant, store_dir) == OPEN_BAR_REFUSAL
     with pytest.raises(CardRefused, match="a revoke is open"):
-        sign_card(world.root, grant, signer_fp=fp, sign=sign, clock=world.clock)
+        sign_card(world.root, grant, signer_fp=fp, sign=sign, clock=world.clock, store_dir=store_dir)
     assert world.state().seq == before
+    # another agent's bar does not bar this one
+    assert card_mod.open_bar_problem({**grant, "agent_id": "someone-else"}, store_dir) is None
+    # a closed bar: the seam passes and the card signs
+    assert bars.close_bar(store, bar.bar_id, revoke_seq=None, reason="abandoned", now=now)
+    assert card_mod.open_bar_problem(grant, store_dir) is None
+    snap = sign_card(world.root, grant, signer_fp=fp, sign=sign, clock=world.clock, store_dir=store_dir)
+    assert snap.seq == before + 1
+    # a store that cannot be read refuses (never taken for no bar)
+    junk = tmp_path / "junk"
+    junk.mkdir()
+    (junk / "autonomic.db").write_bytes(b"this is not a database" * 100)
+    assert "nothing was signed" in card_mod.open_bar_problem(grant, junk)
 
 
 def test_what_is_signed_is_the_snapshot_the_card_rendered(world, monkeypatch):
@@ -182,7 +203,7 @@ def test_what_is_signed_is_the_snapshot_the_card_rendered(world, monkeypatch):
     grant = link(world, 1)
     shown = agent_link_card(grant)["fields"]
     # the seam runs between the card and the signing: a mutation there must not reach the signature
-    monkeypatch.setattr(card_mod, "open_bar_problem", lambda g: grant.update(run_ceiling=999) or None)
+    monkeypatch.setattr(card_mod, "open_bar_problem", lambda g, store_dir=None: grant.update(run_ceiling=999) or None)
     snap = sign_card(world.root, grant, signer_fp=fp, sign=sign, clock=world.clock)
     assert grant["run_ceiling"] == 999 and shown["run_ceiling"] != 999
     assert snap.policy.grants[grant["id"]]["run_ceiling"] == shown["run_ceiling"]
