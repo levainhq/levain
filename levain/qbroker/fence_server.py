@@ -419,22 +419,31 @@ def main(argv: list[str] | None = None) -> int:
                          broker_uid=broker_uid, operator_uid=me, expected_gid=broker_gid, store=store,
                          cockpit_root=root)
     done = threading.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: done.set())
+    # handlers are installed only on the main thread (signal.signal raises elsewhere) and put back on every exit,
+    # so an in-process caller never keeps a handler that swallows its own later SIGINT
+    previous: dict[int, object] = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, lambda *_: done.set())
     try:
-        server.start()
-    except InstanceHeld as exc:
-        print(f"levain fence: {exc}", file=sys.stderr)
-        return EX_HELD
-    except (PermissionError, FileExistsError, FileNotFoundError) as exc:
-        print(f"levain fence: {exc}", file=sys.stderr)
-        return EX_NOPERM
-    log.info("serving %s for uid %d (operator uid %d)", server.path, broker_uid, me)
-    # the accept loop's death ends the wait too, so a server that cannot accept exits (1) and is restarted
-    threading.Thread(target=lambda: (server.died.wait(), done.set()), name="fence-watch", daemon=True).start()
-    done.wait()
-    server.stop()
-    return 1 if server.died.is_set() else 0
+        try:
+            server.start()
+        except InstanceHeld as exc:
+            print(f"levain fence: {exc}", file=sys.stderr)
+            return EX_HELD
+        except (PermissionError, FileExistsError, FileNotFoundError) as exc:
+            print(f"levain fence: {exc}", file=sys.stderr)
+            return EX_NOPERM
+        log.info("serving %s for uid %d (operator uid %d)", server.path, broker_uid, me)
+        # the accept loop's death ends the wait too, so a server that cannot accept exits (1) and is restarted
+        threading.Thread(target=lambda: (server.died.wait(), done.set()), name="fence-watch", daemon=True).start()
+        done.wait()
+        server.stop()
+        return 1 if server.died.is_set() else 0
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
 
 
 if __name__ == "__main__":

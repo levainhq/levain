@@ -492,6 +492,34 @@ def test_main_exits_held_while_another_server_holds_the_lock(rig, fence_run, mon
         first.stop()
 
 
+def _held_main(rig, fence_run, monkeypatch):
+    import grp
+    import pwd
+    gid = os.stat(fence_run / "fence").st_gid
+    monkeypatch.setattr(FS.pwd, "getpwnam", lambda n: pwd.struct_passwd(("q", "*", OTHER, 0, "", "/", "/bin/sh")))
+    monkeypatch.setattr(FS.grp, "getgrnam", lambda n: grp.struct_group(("q", "*", gid, [])))
+    first = serve_fence(rig, fence_run)
+    try:
+        return FS.main(["--agent-store", str(rig.db.parent), "--cockpit-root", str(rig.world.root),
+                        "--run", str(fence_run)])
+    finally:
+        first.stop()
+
+
+def test_main_restores_the_signal_handlers_it_installed(rig, fence_run, monkeypatch):
+    import signal
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+    assert _held_main(rig, fence_run, monkeypatch) == FS.EX_HELD
+    assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
+
+
+def test_a_sigint_after_main_returned_still_interrupts(rig, fence_run, monkeypatch):
+    import signal
+    assert _held_main(rig, fence_run, monkeypatch) == FS.EX_HELD
+    with pytest.raises(KeyboardInterrupt):
+        signal.raise_signal(signal.SIGINT)
+
+
 class _BrokenListener:
     def accept(self):
         raise RuntimeError("not an OSError")
