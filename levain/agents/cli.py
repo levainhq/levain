@@ -792,6 +792,13 @@ def install_fence(install: Path, *, provider=None, **kw) -> str:
     from levain import daemon
 
     spec = fence_spec(install, **kw)
+    # the unit's WorkingDirectory is the agent store; launchd exits 78 (EX_CONFIG) when it is absent, so it exists
+    # before anything is installed (the store's own mode; the umask can only narrow it). Failing to make it installs nothing.
+    try:
+        Path(spec.working_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise FenceSetupError(f"the agent store {spec.working_dir} does not exist and could not be created "
+                              f"({type(exc).__name__}: {exc}); nothing was installed") from exc
     if provider is None:
         provider = daemon.select_provider()
     note = ""

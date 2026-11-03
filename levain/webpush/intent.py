@@ -19,8 +19,10 @@ stays on file, inert, until the next write replaces it.
 One lock (the presence lock, ``<queue>/webpush/.presence.lock``), one event stream (every write leaves one row in
 ``presence.log.jsonl``), one decider (:func:`should_push` in :mod:`levain.webpush.presence` calls :func:`_core` here) and one
 sentence (:func:`describe_line`), printed verbatim by every surface. Consent asks the same decider
-(:func:`approvals_route`), so a push and a hold diverge in one named case only: a ``follow`` that pushes for want of a
-laptop input reading does not hold (the line's ``Approvals:`` clause says so). A prompt left to the agent's own dialog
+(:func:`approvals_route`), so a push and a hold diverge in two named cases only: a ``follow`` that pushes for want of a
+laptop input reading does not hold (the line's ``Approvals:`` clause says so), and the ping about a request already
+filed (``filed``, :func:`decide`) pushes whatever the desk or devices setting is doing, where the hold's question never
+passes ``filed``. Both are pinned in ``tests/test_webpush_push_hold_cases.py``. A prompt left to the agent's own dialog
 still sends a NOTICE to the devices whenever ``lets_through`` admits approvals (:func:`approval_notice`): a notice, never
 a hold. A write against a record that cannot be read is refused, never replaced.
 
@@ -383,7 +385,8 @@ def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Call
 def approvals_to_devices(queue_dir: Path | str | None, *, now: float | None = None,
                          idle: Callable[[], float | None] | None = None) -> tuple[bool, str]:
     """Whether an approval reaches his devices for a signed answer right now, and why: literally ``should_push(queue_dir,
-    "consent")`` with ``suggest=False``, so the push and the hold cannot diverge (consent reads this, DESIGN §4)."""
+    "consent")`` with ``suggest=False``, so it is the hold's question; a push differs from it only in the two cases the module docstring
+    names (consent reads this, DESIGN §4)."""
     d = presence.should_push(queue_dir, "consent", now=now, idle=idle, suggest=False)
     return d.push, d.why
 
