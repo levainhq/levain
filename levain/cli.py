@@ -1481,7 +1481,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "`levain hands login claude|codex` runs the vendor's own login AS the entity's user (the account "
             "`levain setup-isolation` made), with the vendor's config home inside that user's home; "
-            "`levain hands status [claude|codex]` shows who each is signed in as. Your own ~/.claude and "
+            "`levain hands logout claude|codex` ends it (locally; the provider's page revokes); `levain hands status [claude|codex]` shows who each is signed in as. Your own ~/.claude and "
             "~/.codex are never read or copied. Anything that runs as the entity's user can use the login, "
             "and a logout is local to this machine."
         ),
@@ -1491,6 +1491,9 @@ def build_parser() -> argparse.ArgumentParser:
     hl_p = hands_sub.add_parser("login", help="Sign the entity's user in to a vendor CLI.")
     hl_p.add_argument("vendor", choices=("claude", "codex"))
     hl_p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
+    hlo_p = hands_sub.add_parser("logout", help="Sign the entity's user out of a vendor CLI (local only).")
+    hlo_p.add_argument("vendor", choices=("claude", "codex"))
+    hlo_p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
     hs_p = hands_sub.add_parser("status", help="Show the entity's user's vendor logins (read-only).")
     hs_p.add_argument("vendor", nargs="?", choices=("claude", "codex"), default=None)
     hs_p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
@@ -5002,6 +5005,8 @@ def _cmd_hands(args: argparse.Namespace) -> int:
 
     if args.hands_cmd == "login":
         return hands_login.cmd_hands_login(args.path, args.vendor)
+    if args.hands_cmd == "logout":
+        return hands_login.cmd_hands_logout(args.path, args.vendor)
     return hands_login.cmd_hands_status(args.path, args.vendor)
 
 

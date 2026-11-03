@@ -22,10 +22,12 @@ says so (:data:`LOGIN_NOTICE`).
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -43,9 +45,11 @@ VENDORS = ("claude", "codex")
 #: writes there, the login argv and the status argv (the program is found on the hands PATH).
 _VENDOR = {
     "claude": {"env": "CLAUDE_CONFIG_DIR", "dir": ".claude", "cred": ".credentials.json",
-               "login": ("claude", "auth", "login"), "status": ("claude", "auth", "status")},
+               "login": ("claude", "auth", "login"), "status": ("claude", "auth", "status"),
+               "logout": ("claude", "auth", "logout"), "page": "https://claude.ai/settings (the account's active sessions)"},
     "codex": {"env": "CODEX_HOME", "dir": ".codex", "cred": "auth.json",
-              "login": ("codex", "login", "--device-auth"), "status": ("codex", "login", "status")},
+              "login": ("codex", "login", "--device-auth"), "status": ("codex", "login", "status"),
+              "logout": ("codex", "logout"), "page": "https://chatgpt.com/ (Settings, Security, the signed-in devices)"},
 }
 
 #: The line Codex's hands ``config.toml`` must carry; the same pair ``slot/render.py codex_config`` pins.
@@ -55,6 +59,10 @@ CODEX_STORE_LINE = f'{CODEX_STORE_KEY} = "file"\n'
 LOGIN_NOTICE = (
     "Anything that runs as the hands account can use this login. A logout here is local to this machine; "
     "to cut the login off at the provider, end the session on the provider's own account page."
+)
+LOGOUT_NOTICE = (
+    "This logout is LOCAL ONLY: it ended the login on this machine, and neither vendor is known to revoke the "
+    "token at the provider. Revoke it there: {page}. Anything that ran as the hands account could have used the login."
 )
 NO_HANDS = "this entity has no hands account; run `sudo levain setup-isolation` first"
 
@@ -279,6 +287,7 @@ def cmd_hands_login(entity_dir: Path | str, vendor: str) -> int:
     except (HandsLoginError, OSError, subprocess.SubprocessError) as exc:
         print(f"hands login: {exc}")
         return 1
+    record_outcome(entity_dir, vendor, "logged-in" if st.logged_in else "failed")
     print(_line(st))
     if st.credential and st.credential.split()[-1] != "600":
         print(f"warning: the credential file's mode is {st.credential.split()[-1]}, not 600")
@@ -296,3 +305,91 @@ def cmd_hands_status(entity_dir: Path | str, vendor: str | None) -> int:
         print(_line(st))
     print(LOGIN_NOTICE)
     return 0 if all(r.logged_in for r in rows) or vendor is None else 1
+
+
+# --- logout (V2) -----------------------------------------------------------------------------------------------
+
+#: The operator-side record of the last login/logout outcome per vendor (a doctor row reads it).
+OUTCOME_FILE = "hands-login.json"
+
+
+def logout_argv(hands: HandsIdentity, vendor: str) -> list[str]:
+    _check_vendor(vendor)
+    return [*_launch_prefix(hands, vendor), *_VENDOR[vendor]["logout"]]
+
+
+def remove_argv(hands: HandsIdentity, vendor: str) -> list[str]:
+    """Remove exactly the one credential file, as the hands user: the fallback when the vendor's logout leaves it."""
+    _check_vendor(vendor)
+    return _as_hands_argv(hands, vendor, "/bin/rm", "-f", "--", credential_path(hands, vendor))
+
+
+def _outcome_path(entity_dir: Path | str) -> Path:
+    return Path(entity_dir) / ".levain" / OUTCOME_FILE
+
+
+def read_outcomes(entity_dir: Path | str) -> dict[str, dict[str, str]]:
+    try:
+        data = json.loads(_outcome_path(entity_dir).read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def record_outcome(entity_dir: Path | str, vendor: str, outcome: str) -> None:
+    """Best effort: the record is a convenience for the doctor row, never a gate."""
+    try:
+        data = read_outcomes(entity_dir)
+        data[vendor] = {"outcome": outcome, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        path = _outcome_path(entity_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, sort_keys=True))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def run_logout(hands: HandsIdentity, vendor: str, entity_dir: Path | str) -> str:
+    """End the hands user's login for ``vendor``: take the hands lock (a live session refuses), stop every
+    process of the hands user, run the vendor's logout as it, verify the credential file is gone and remove that one
+    file as the hands user if not. Returns ``nothing`` (nothing was signed in, nothing run), ``logged-out`` or
+    ``file-removed``; raises :class:`HandsLoginError` when it could not finish."""
+    _check_vendor(vendor)
+    if credential_state(hands, vendor) is None and not run_status(hands, vendor).logged_in:
+        return "nothing"
+    fd = hands_live.take_exclusive(entity_dir)
+    if fd is None:
+        raise HandsLoginError("a session of this entity is open; logout waits until it ends")
+    try:
+        left = hands_live.sweep_hands_user(hands.user, uid=hands.uid)
+        if left:
+            raise HandsLoginError(f"the hands account's processes were not stopped, so nothing was logged out: {left}")
+        rc, out = _run(logout_argv(hands, vendor))
+        if credential_state(hands, vendor) is None and rc == 0:
+            return "logged-out"
+        rc2, out2 = _run(remove_argv(hands, vendor))
+        if rc2 != 0 or credential_state(hands, vendor) is not None:
+            raise HandsLoginError(f"the credential file {credential_path(hands, vendor)} is still there "
+                                  f"({(out2 or out).strip()[:200]})")
+        return "file-removed"
+    finally:
+        os.close(fd)
+
+
+def cmd_hands_logout(entity_dir: Path | str, vendor: str) -> int:
+    try:
+        hands = load_hands_identity(entity_dir)
+        how = run_logout(hands, vendor, entity_dir)
+    except (HandsLoginError, OSError, subprocess.SubprocessError) as exc:
+        if not isinstance(exc, HandsLoginError) or str(exc) != NO_HANDS:
+            record_outcome(entity_dir, vendor, "failed")
+        print(f"hands logout: {exc}")
+        return 1
+    if how == "nothing":
+        print(f"hands {vendor}: nothing signed in, nothing to log out")
+        return 0
+    record_outcome(entity_dir, vendor, how)
+    print(f"hands {vendor}: signed out ({how})")
+    print(LOGOUT_NOTICE.format(page=_VENDOR[vendor]["page"]))
+    return 0
