@@ -398,6 +398,35 @@ def test_the_session_grace_is_per_row_from_the_roles_executor(rig):
     assert out.renewed == [dream]
 
 
+def test_a_stored_spec_that_no_longer_hashes_keeps_the_session_bound(rig):
+    # behaviour (codex r2, introduced MED): a spec text that parses and names a dream role but no longer hashes to its
+    # spec_hash is not trusted for its role: the row keeps the bound and lapses
+    from levain.agents import role as role_mod
+    from tests.test_agents_launch import ROLES
+    role_mod.add_role(rig.store, ROLES["notify-role"])
+    clock = Clock(rig)
+    sup, journal = _sup(rig, clock)
+    dream = _fire(rig, "a", journal)
+    _claimed(rig, dream, 1, session=False)
+    with rig.store.write() as c:                                 # corruption stand-in: the store's own trigger refuses this
+        c.execute("DROP TRIGGER agent_specs_frozen")
+        c.execute("UPDATE agent_specs SET spec = spec || ' '")
+    clock.advance(ctl.SESSION_GRACE_S + 60)
+    assert sup.reap(lambda row: Ex(True)).renewed == []
+
+
+def test_an_explicit_none_grace_still_bounds_a_session_role(rig):
+    # behaviour (codex r2 #2): session_grace_s=None never means "renew a sessionless-looking row forever"
+    from tests.test_agents_launch import ROLES  # noqa: F401
+    clock = Clock(rig)
+    sup, journal = _sup(rig, clock)
+    sup._session_grace_s = None
+    unread = _fire(rig, "a", journal)                            # its role is not a registered dream role
+    _claimed(rig, unread, 1, session=False)
+    clock.advance(ctl.SESSION_GRACE_S + 60)
+    assert sup.reap(lambda row: Ex(True)).renewed == []
+
+
 def test_a_tick_reads_its_clock_again_after_the_reaper(rig, monkeypatch):
     # behaviour (codex/deepseek r1 #3): the claims and the expiry pass use the clock as it reads after the reaper
     clock = Clock(rig)

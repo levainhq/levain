@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from levain.agent_authority import AgentAuthority, AgentAuthorityError, agent_fence
-from levain.agents import accounting, controller as _ctl, role as _role
+from levain.agents import accounting, controller as _ctl, role as _role, spec as _spec
 from levain.agents.store import AgentStore
 from levain.autonomic.journal import EffectOutcome, EffectStatus, RunJournal
 
@@ -296,14 +296,20 @@ class Supervisor:
         a corrupt row), keeps the bound. ``seen`` caches it by ``spec_hash`` for one pass."""
         digest = row["spec_hash"]
         if digest not in seen:
+            bound = self._session_grace_s if self._session_grace_s is not None else _ctl.SESSION_GRACE_S
             try:
                 with self._store.read() as conn:
                     found = conn.execute("SELECT spec FROM agent_specs WHERE spec_hash = ?", (digest,)).fetchone()
-                role = _role.role_by_hash(self._store, json.loads(found[0])["role"]["role_hash"]) if found else None
+                # the stored text must still hash to its spec_hash, canonical form and all, before its role is trusted
+                # (the check spec._check_row makes); the role lookup is its own read, outside the one above
+                spec = _spec.parse_spec_text(found[0]) if found else None
+                trusted = (spec is not None and _spec.spec_hash(row["agent_id"], spec) == digest
+                           and _spec._canonical(spec) == found[0])
+                role = _role.role_by_hash(self._store, spec["role"]["role_hash"]) if trusted else None
                 dream = role is not None and role["executor"] == "dream"
             except Exception:  # noqa: BLE001 - an unreadable role is not evidence of a sessionless run
                 dream = False
-            seen[digest] = None if dream else self._session_grace_s
+            seen[digest] = None if dream else bound
         return seen[digest]
 
     def _renew(self, row: dict, session_grace_s: int | None) -> bool:
