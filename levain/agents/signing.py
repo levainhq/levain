@@ -2,8 +2,8 @@
 
 :func:`sign_agent_link` creates an ``agent-link`` and :func:`renew_agent_link` moves one's expiry. They are the only
 functions that prepare an agent-link append or renew: ``levain agents sign|renew``, the cockpit signing card and the
-renew verb call these and nothing lower, so a check added here (the open-bar check, a later slice) has one call site
-every surface passes. ``tests/test_authority_agent_signing.py`` walks ``levain/`` with ``ast`` to keep it so.
+renew verb call these and nothing lower, so the open-bar check made here has one call site every surface passes.
+``tests/test_authority_agent_signing.py`` walks ``levain/`` with ``ast`` to keep it so.
 
 The log's own rules judge every link (the kind's validation, the laptop-only renew, the rank and the format); nothing
 here repeats them. What is here is the shape of the gesture: judge on the head the replay just read, sign outside any
@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from levain.agent_authority import OPEN_BAR_REFUSAL, AgentAuthorityError, open_bar_for
 from levain.authority import (AGENT_LINK_KIND, AGENT_LINK_MAX, AuthorityError, AuthoritySnapshot, StaleHead,
                               VerifierUnavailable, agent_link, anchor_path, append, prepare)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
@@ -25,6 +26,20 @@ from levain.cockpit.keys import KeyError_, _capture, _journal, _now, _signing_au
 __all__ = ["renew_agent_link", "sign_agent_link"]
 
 Signer = Callable[[bytes], str]
+
+
+def _refuse_open_bar(agent_id: object, store_dir: Path | str | None) -> None:
+    """A link is not signed while its agent's revoke is open (A0 section 2.2): the open bar is read from the autonomic
+    store, and a bar that cannot be read refuses too. The append writes the cockpit's log, so a bar committed after this
+    read can still be passed: A0 section 6.10's known edge."""
+    if type(agent_id) is not str:
+        return      # the log's own rules refuse a link with no agent
+    try:
+        bar = open_bar_for(agent_id, store_dir)
+    except AgentAuthorityError as exc:
+        raise KeyError_(f"{exc}: nothing was signed") from None
+    if bar is not None:
+        raise KeyError_(OPEN_BAR_REFUSAL)
 
 
 def _sign_op(data_root: Path | str, op: Mapping[str, Any], *, signer_fp: str, sign: Signer,
@@ -54,28 +69,33 @@ def _sign_op(data_root: Path | str, op: Mapping[str, Any], *, signer_fp: str, si
 
 def sign_agent_link(data_root: Path | str, grant: Mapping[str, Any], *, signer_fp: str, sign: Signer,
                     clock: Callable[[], datetime], ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-                    marker_directory: Path | None = None) -> AuthoritySnapshot:
+                    marker_directory: Path | None = None, store_dir: Path | str | None = None) -> AuthoritySnapshot:
     """Create ``grant``, an ``agent-link`` record, by a link ``signer_fp`` signs. The log refuses it unless the signer
-    is a laptop-presence key and the record is a valid link."""
+    is a laptop-presence key and the record is a valid link. Refused while the agent's revoke is open, judged from the
+    autonomic store at ``store_dir`` (default: the store every ``levain agents`` verb opens)."""
     if not isinstance(grant, Mapping) or grant.get("kind") != AGENT_LINK_KIND:
         raise KeyError_(f"only an {AGENT_LINK_KIND} is signed here")
     return _sign_op(data_root, {"op": "create_grant", "grant": dict(grant)}, signer_fp=signer_fp, sign=sign,
                     clock=clock, ssh_keygen=ssh_keygen, marker_directory=marker_directory, now=_now(clock),
-                    check=lambda state: None)
+                    check=lambda state: _refuse_open_bar(grant.get("agent_id"), store_dir))
 
 
 def renew_agent_link(data_root: Path | str, link_id: str, *, life: timedelta, signer_fp: str, sign: Signer,
                      clock: Callable[[], datetime], ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-                     marker_directory: Path | None = None) -> tuple[AuthoritySnapshot, str]:
+                     marker_directory: Path | None = None,
+                     store_dir: Path | str | None = None) -> tuple[AuthoritySnapshot, str]:
     """Move the expiry of the live agent link ``link_id`` to ``life`` after now (its terms and incarnation stay).
-    Returns the snapshot and the new ``expires_at``. The log refuses a signer that is not a laptop-presence key."""
+    Returns the snapshot and the new ``expires_at``. The log refuses a signer that is not a laptop-presence key, and
+    this refuses while the link's agent has an open revoke (``store_dir`` as in :func:`sign_agent_link`)."""
     if not timedelta(0) < life <= AGENT_LINK_MAX:
         raise KeyError_(f"a renew is for more than nothing and at most {AGENT_LINK_MAX.days} days")
     now = _now(clock)
 
     def check(state: AuthoritySnapshot) -> None:
-        if not agent_link(state.policy.grants.get(link_id)):
+        grant = state.policy.grants.get(link_id)
+        if not agent_link(grant):
             raise KeyError_(f"no agent link {str(link_id)[:80]!r}")
+        _refuse_open_bar(grant.get("agent_id"), store_dir)
 
     expires_at = utc_stamp(now + life)
     op = {"op": "renew", "grant_id": link_id, "expires_at": expires_at, "signed_at": utc_stamp(now)}
