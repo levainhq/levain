@@ -56,9 +56,9 @@ def _fit(text: str, room: int) -> str:
     return text[:lo] + "..."
 
 
-# the characters of a body read for stripping: a push carries a few KB at most, and the link pattern is quadratic on a
-# long run of unclosed brackets, so a 100 KB body is cut before it is read, not after
-_STRIP_IN = 8000
+# the characters of a body read for stripping: the strip comes FIRST and the cut to the payload budget after it (a body of long
+# links keeps its tail), so the read is bounded here and the strip patterns are bounded runs, never quadratic
+_STRIP_IN = 40000
 
 
 def build_payload(title: str, body: str, tag: str, url: str, ping_id: int, badge: "int | None" = None) -> bytes:

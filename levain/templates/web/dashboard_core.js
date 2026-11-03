@@ -2680,6 +2680,17 @@
   }
 
   // Block parser: line-based, single forward pass. Returns a DocumentFragment.
+  // The fence rule, one home: renderMarkdown draws a fenced block by it and the notification detail's shape finder (ncFenced) skips
+  // the same lines, so the two cannot disagree on where code is. An opener is a run of 3+ backticks or tildes with an info string
+  // that holds neither; a closer is a line of at least the opener's run, of the same character, and nothing else.
+  function mdFenceOpen(line) {
+    const m = /^([ \t]*)(```+|~~~+)[ \t]*([^`~]*)$/.exec(line);
+    return m ? { marker: m[2][0], len: m[2].length } : null;
+  }
+  function mdFenceCloses(line, open) {
+    const c = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(line);
+    return !!c && c[1][0] === open.marker && c[1].length >= open.len;
+  }
   function renderMarkdown(text) {
     const frag = document.createDocumentFragment();
     const lines = String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n");
@@ -2697,14 +2708,12 @@
       if (!line.trim()) { i++; continue; }  // blank line = block separator
 
       // fenced code (``` / ~~~): collect verbatim until the matching closing fence
-      const fence = /^([ \t]*)(```+|~~~+)[ \t]*([^`~]*)$/.exec(line);
+      const fence = mdFenceOpen(line);
       if (fence) {
-        const marker = fence[2][0], minLen = fence[2].length;
         i++;
         const buf = [];
         while (i < N) {
-          const cl = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(lines[i]);
-          if (cl && cl[1][0] === marker && cl[1].length >= minLen) { i++; break; }
+          if (mdFenceCloses(lines[i], fence)) { i++; break; }
           buf.push(lines[i]); i++;
         }
         const pre = el("pre", "md-pre");
@@ -8413,29 +8422,52 @@
   // splits: no word of the stored body changes.
   const NC_OPT_LABEL = /(^|\s)\**OPTIONS:\**[ \t]+/g;
   const NC_REC_LABEL = /(^|\s)\**REC:\**[ \t]+/g;
-  const NC_OPT_KEY = /(^|[\s·;])(?:[-*][ \t]+)?\(([a-z0-9]{1,8})\)[ \t]*/g;
-  // the first match of a label in `text` (the tail of `full`) that is not inside a code fence (an odd count of fence lines before it)
-  function ncLabel(re, text, full) {
+  // an option key is one lowercase letter in parentheses, and the keys of one list run (a), (b), (c) in order: any other "(x)" inside an
+  // option's prose is text
+  const NC_OPT_KEY = /(^|[\s·;])(?:[-*][ \t]+)?\(([a-z])\)[ \t]*/g;
+  // the [start, end) character ranges of `md` that are code fences, by the renderer's own rule (an unclosed fence runs to the end), in one pass
+  function ncFenced(md) {
+    const ranges = [];
+    let pos = 0, open = null, from = 0;
+    for (const line of md.split("\n")) {
+      const end = pos + line.length + 1;
+      if (open) { if (mdFenceCloses(line, open)) { ranges.push([from, end]); open = null; } }
+      else if ((open = mdFenceOpen(line))) from = pos;
+      pos = end;
+    }
+    if (open) ranges.push([from, md.length + 1]);
+    return ranges;
+  }
+  // the first match of a label in `text` (the tail of `full`) that is not inside a code fence; the matches ascend, so the ranges are walked once
+  function ncLabel(re, text, full, ranges) {
+    const base = full.length - text.length;
+    let k = 0;
     re.lastIndex = 0;
     for (let m; (m = re.exec(text)); ) {
-      if ((full.slice(0, full.length - text.length + m.index).match(/^[ \t]*(```|~~~)/gm) || []).length % 2 === 0) return m;
+      const at = base + m.index + m[1].length;
+      while (k < ranges.length && ranges[k][1] <= at) k++;
+      if (!(k < ranges.length && ranges[k][0] <= at)) return m;
     }
     return null;
   }
   function ncShape(md) {
-    const o = ncLabel(NC_OPT_LABEL, md, md);
+    const ranges = ncFenced(md);
+    const o = ncLabel(NC_OPT_LABEL, md, md, ranges);
     if (!o) return null;
     const at = o.index + o[1].length;
     const afterOpt = o.index + o[0].length;
     const rest = md.slice(afterOpt);
-    const r = ncLabel(NC_REC_LABEL, rest, md);
+    const r = ncLabel(NC_REC_LABEL, rest, md, ranges);
+    if (!r) return null;          // the shape is OPTIONS and REC both; options alone are plain markdown
     const stop = /\n[ \t]*\n/.exec(rest);
-    const rAt = r ? r.index + r[1].length : -1;
-    const optEnd = r && (!stop || rAt < stop.index) ? rAt : stop ? stop.index : rest.length;
+    const rAt = r.index + r[1].length;
+    const optEnd = !stop || rAt < stop.index ? rAt : stop.index;
     const optText = rest.slice(0, optEnd);
     const keys = [];
     NC_OPT_KEY.lastIndex = 0;
-    for (let m; (m = NC_OPT_KEY.exec(optText)); ) keys.push({ key: m[2], from: m.index + m[1].length, start: m.index + m[0].length });
+    for (let m; (m = NC_OPT_KEY.exec(optText)); ) {
+      if (m[2] === String.fromCharCode(97 + keys.length)) keys.push({ key: m[2], from: m.index + m[1].length, start: m.index + m[0].length });
+    }
     if (keys.length < 2 || optText.slice(0, keys[0].from).trim()) return null;
     const opts = keys.map((k, i) => {
       const end = i + 1 < keys.length ? keys[i + 1].from : optText.length;
@@ -8443,13 +8475,14 @@
     });
     if (opts.some((x) => !x.text)) return null;
     let rec = "", recKey = "", tail = "";
-    if (r && rAt === optEnd) {
+    if (rAt === optEnd) {
       const body = rest.slice(r.index + r[0].length);
       const cut = /\n[ \t]*\n|\s\**[A-Z][A-Z0-9'+\/&-]{2,}:\**[ \t]/.exec(body);
       rec = (cut ? body.slice(0, cut.index) : body).trim();
       tail = cut ? body.slice(cut.index) : "";
-      const k = /^\(?([a-z0-9]{1,8})\)?(?![A-Za-z0-9])/i.exec(rec);
-      recKey = k ? k[1].toLowerCase() : "";
+      // the recommended option is named by the REC's first word only as a key standing alone: "REC: a quick fix" is prose
+      const k = /^\(?([a-z])\)?(?=$|\s*[(:,.;\u2014\u2013-])/.exec(rec);
+      recKey = k && opts.some((x) => x.key === k[1]) ? k[1] : "";
     } else tail = rest.slice(optEnd);
     return { before: md.slice(0, at).trim(), opts, rec, recKey, tail: tail.trim() };
   }
@@ -8460,7 +8493,7 @@
   }
   function ncBody(md) {
     const host = el("div", "nc-body");
-    const text = String(md || "");
+    const text = String(md || "").replace(/\r\n?/g, "\n");
     const shape = ncShape(text);
     if (!shape) host.appendChild(renderMarkdown(text));
     else {

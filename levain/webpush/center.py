@@ -46,17 +46,27 @@ class CenterError(Exception):
 
 # --- the preview -----------------------------------------------------------------------------------------------------
 _FENCE = re.compile(r"^\s*(```|~~~).*$", re.M)
-_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
-_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_FENCE_LINE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})[^`~\n]*(?:\n|$)", re.M)   # a whole fence line (the page renderer's rule); prose that merely starts with ``` stays
+# link text and address are bounded runs (and the text takes no `[`): a body of unclosed brackets stays linear, not quadratic
+_IMAGE = re.compile(r"!\[([^\]\[\n]{0,500})\]\([^)\n]{0,2000}\)")
+_LINK = re.compile(r"\[([^\]\[\n]{0,500})\]\([^)\n]{0,2000}\)")
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+", re.M)
 _QUOTE = re.compile(r"^\s{0,3}>\s?", re.M)
 _BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+", re.M)
+# the same three marks for plain_text, which keeps its line breaks: horizontal space only, so a mark never eats the blank line before it
+_HEADING_T = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.M)
+_QUOTE_T = re.compile(r"^[ \t]{0,3}>[ \t]?", re.M)
+_BULLET_T = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+", re.M)
 _EMPH = re.compile(r"(\*\*|\*|`|(?<!\w)_+|_+(?!\w))")
 
 
-# paired emphasis only, on one line: a lone `_` or `*` is text (a path, a snake_case name, a footnote star) and stays
-_PAIRED = ((re.compile(r"\*\*([^*\n]+?)\*\*"), r"\1"), (re.compile(r"(?<![\w*])\*([^*\n]+?)\*(?![\w*])"), r"\1"),
-           (re.compile(r"(?<!\w)__([^_\n]+?)__(?!\w)"), r"\1"), (re.compile(r"(?<!\w)_([^_\n]+?)_(?!\w)"), r"\1"),
+# paired emphasis only, on one line, and only where the marks could be CommonMark delimiters: the opener is followed by a
+# non-space and the closer is preceded by one (`2 * 3 * 4` and `Use ** not ** as glob` are text), and an `_` pair never touches a
+# word character (a path, a snake_case name). A lone `_` or `*` is text and stays.
+_PAIRED = ((re.compile(r"\*\*(?=[^\s*])([^*\n]*?[^\s*])\*\*"), r"\1"),
+           (re.compile(r"(?<![\w*])\*(?=[^\s*])([^*\n]*?[^\s*])\*(?![\w*])"), r"\1"),
+           (re.compile(r"(?<!\w)__(?=[^\s_])([^_\n]*?[^\s_])__(?!\w)"), r"\1"),
+           (re.compile(r"(?<!\w)_(?=[^\s_])([^_\n]*?[^\s_])_(?!\w)"), r"\1"),
            (re.compile(r"`([^`\n]+)`"), r"\1"))
 
 
@@ -64,12 +74,12 @@ def plain_text(markdown: str) -> str:
     """The body as plain text with its line breaks kept: the same Markdown stripped as :func:`plain_preview` (fence lines,
     link syntax to its text, heading, quote and list marks, paired emphasis and backticks; a lone mark stays), each line's own spacing tidied and
     runs of blank lines folded to one. The push layer sends this, because a seat's question text is line-shaped."""
-    text = re.sub(r"^[ \t]*(?:```|~~~).*\n?", "", markdown or "", flags=re.M)   # a fence line goes whole, its newline with it
+    text = _FENCE_LINE.sub("", markdown or "")   # a fence line goes whole, its newline with it
     text = _IMAGE.sub(r"\1", text)
     text = _LINK.sub(r"\1", text)
-    text = _HEADING.sub("", text)
-    text = _QUOTE.sub("", text)
-    text = _BULLET.sub("", text)
+    text = _HEADING_T.sub("", text)
+    text = _QUOTE_T.sub("", text)
+    text = _BULLET_T.sub("", text)
     for pat, sub in _PAIRED:
         text = pat.sub(sub, text)
     lines = [" ".join(line.split()) for line in text.replace("\r\n", "\n").split("\n")]

@@ -36,6 +36,8 @@ NOT_THE_SHAPE = {
     "No keys": "No keys here\n\nOPTIONS: do something sensible REC: fine",
     "One key": "One key here\n\nOPTIONS: (a) only one choice REC: a",
     "In a fence": "In a fence\n\n```\nOPTIONS: (a) one · (b) two REC: a\n```\n\nplain after",
+    "No REC": "No rec here\n\nOPTIONS: (a) enable · (b) disable",
+    "Fence not closed": "Fence not closed\n\n````\n```not-a-close\nOPTIONS: (a) one · (b) two REC: a\n````\n\nplain after",
 }
 
 
@@ -61,6 +63,26 @@ def test_the_push_text_is_plain() -> None:
         out = json.loads(sender.build_payload("t", hostile, "tag", "/", 1))
         assert len(sender._dumps(out)) <= 4096 + 600
     assert time.monotonic() - started < 5.0
+
+
+def test_the_push_text_keeps_what_is_not_emphasis_and_the_blank_line_before_a_list() -> None:
+    plain = {"2 * 3 * 4": "2 * 3 * 4", "a _ b _ c": "a _ b _ c", "Use ** not ** as glob": "Use ** not ** as glob",
+             "**bold** *em* _em_ __strong__ `c`": "bold em em strong c", "para one\n\n- a\n- b\n\n## H\n\n> q": "para one\n\na\nb\n\nH\n\nq",
+             "```py\ncode\n```": "code"}
+    for body, want in plain.items():
+        assert json.loads(sender.build_payload("t", body, "tag", "/", 1))["body"] == want, body
+    assert json.loads(sender.build_payload("t", "```inline``` text stays", "tag", "/", 1))["body"].endswith("text stays")   # a line that only starts with ``` is not a fence line
+
+
+def test_the_strip_comes_before_the_cut_so_the_actionable_tail_survives() -> None:
+    body = "".join(f"[link {i}](https://example.org/{'p' * 150}/{i}) " for i in range(100)) + "\n\nCRITICAL ACTION: reply today"
+    assert len(body) > 8000 and body.index("CRITICAL") > 8000
+    got = json.loads(sender.build_payload("t", body, "tag", "/", 1))["body"]
+    assert got.endswith("CRITICAL ACTION: reply today") and "https://" not in got and not got.endswith("..."), got
+    started = time.monotonic()
+    for hostile in ("[(" * 50000, "[a](" * 25000, "![" * 50000, "*a " * 40000, "_a " * 40000):
+        sender.build_payload("t", hostile, "tag", "/", 1)
+    assert time.monotonic() - started < 3.0
 
 
 @needs_browser
@@ -93,7 +115,7 @@ def test_a_seats_notice_draws_headers_lists_code_a_visible_link_and_the_options_
         out = _drive(tmp_path, _url(port), [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": f"{PILL} && !{PILL}.hidden && 1", "ms": 40000}, OPEN, OPENED, *steps])
     for got in _json(out):
         assert got["h"] == ["What happened"] and got["ul"] == 2 and got["ol"] == 2, got
-        assert got["strong"] == ["hosting", "Wednesday"] or got["strong"] == ["hosting"], got
+        assert got["strong"] == ["hosting", "Wednesday"], got
         assert got["em"] == ["yes or no"] and got["pre"] == ["rocket plan --site 357460\nOPTIONS: (x) this is code"], got
         assert got["links"] == ["https://mail.example/t/42", "https://example.org/plan"], got
         assert got["full"] == [" (https://mail.example/t/42)"], got                         # the address shows beside text that is not the address
@@ -127,11 +149,49 @@ def test_hostile_and_huge_bodies_stay_text_and_a_body_off_the_shape_is_plain_mar
         out = _drive(tmp_path, _url(port), [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": f"{PILL} && !{PILL}.hidden && 1", "ms": 40000}, OPEN,
                                             {"until": f"{ROWS_}.length >= 9 && 1", "ms": 30000}, *steps])
         took = time.monotonic() - started
-    hostile, huge, nokeys, one, fence = _json(out)
+    hostile, huge, nokeys, one, fence, norec, notclose = _json(out)
     assert hostile["pwn"] == 0 and hostile["tags"] == 0 and hostile["onattr"] == 0, hostile
     assert hostile["hrefs"] == [], hostile                                    # javascript:, data:, a tab-split scheme and a relative path: none is live
     assert "<script>window.pwnd = 1</script>" in hostile["text"] and "<img" in hostile["text"] and "<b>raw</b>" in hostile["text"], hostile
     assert huge["pwn"] == 0 and huge["tags"] == 0 and huge["links"] == 3000 and took < 60, (huge["tags"], huge["links"], took)
-    for odd in (nokeys, one, fence):
+    for odd in (nokeys, one, fence, norec, notclose):
         assert odd["blocks"] == 0, odd
     assert "OPTIONS: do something sensible" in nokeys["text"] and "OPTIONS: (a) one" in fence["text"], (nokeys, fence)
+
+
+SHAPE_FALSE_POSITIVES = ("Shape\n\nOPTIONS: (a) upgrade to Python (3) today · (b) defer a *quick* sum · (d) skipped key REC: a quick fix is safest")
+
+
+@needs_browser
+def test_an_option_key_is_a_letter_in_order_and_the_rec_names_an_option_only_as_a_key(tmp_path: Path) -> None:
+    r = Rig(tmp_path)
+    _add(r.q, SHAPE_FALSE_POSITIVES)
+    _add(r.q, "Plain shapes\n\nOPTIONS: (a) enable it · (b) disable it\n\nMath stays math: 2 * 3 * 4 and a _ b _ c and Use ** not ** as glob")
+    huge = "Pathological\n\n```\n" + "OPTIONS: (a) x · (b) y REC: a\n" * 3500 + "\n" + "OPTIONS: " * 2000
+    assert len(huge) > 100_000
+    _add(r.q, huge)
+    probe = (f"JSON.stringify({{ opts: [...{MODAL}.querySelectorAll('.nc-opt')].map(o => [o.querySelector('.nc-optkey').textContent,"
+             f" o.querySelector('.nc-opttext').textContent, o.classList.contains('nc-opt-rec')]),"
+             f" blocks: {MODAL}.querySelectorAll('.nc-opts, .nc-rec').length, text: {MODAL}.querySelector('.nc-body').textContent.slice(0, 400) }})")
+    shots = os.environ.get("S4MD_SHOTS")
+    steps = [*_open("Shape"), {"eval": probe}]
+    if shots:
+        Path(shots).mkdir(parents=True, exist_ok=True)
+        wait = {"eval": "new Promise(r => setTimeout(r, 700)).then(() => 1)"}
+        steps += [wait, {"shot": str(Path(shots) / "shape_false_positives_1280.png"), "full": False},
+                  {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, wait,
+                  {"shot": str(Path(shots) / "shape_false_positives_390.png"), "full": False},
+                  *_open("Plain shapes"), wait, {"shot": str(Path(shots) / "plain_shapes_390.png"), "full": False},
+                  {"emulate": {"w": 1280, "h": 900, "dpr": 1}}, wait, {"shot": str(Path(shots) / "plain_shapes_1280.png"), "full": False}]
+    steps += [{"eval": f"(() => {{ const t = performance.now(); {_row('Pathological', '.nc-main')}.click(); return new Promise((res) => {{ const tick = () => {{"
+                       f" if ({MODAL}.querySelector('.nc-dtitle').textContent === 'Pathological') res(JSON.stringify({{ ms: performance.now() - t,"
+                       f" blocks: {MODAL}.querySelectorAll('.nc-opts, .nc-rec').length }})); else setTimeout(tick, 5); }}; tick(); }}); }})()"}]
+    with _signed(r.src, r.q) as (port, _):
+        r.seed(port)
+        out = _drive(tmp_path, _url(port), [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": f"{PILL} && !{PILL}.hidden && 1", "ms": 40000}, OPEN, OPENED,
+                                            {"until": f"{ROWS_}.length >= 3 && 1", "ms": 30000}, *steps])
+    results = _json(out)
+    got, timing = results[0], results[-1]
+    assert got["opts"] == [["(a)", "upgrade to Python (3) today", False], ["(b)", "defer a quick sum · (d) skipped key", False]], got
+    assert got["blocks"] == 2, got                                             # the options block and the rec block; "a quick fix" names no option
+    assert timing["blocks"] == 0 and timing["ms"] < 2000, timing               # all of it code (an unclosed fence), 100 KB, drawn in well under a second or two
