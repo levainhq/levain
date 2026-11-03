@@ -7,9 +7,14 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import shutil
+import signal
 import sqlite3
-from datetime import timedelta
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -234,6 +239,21 @@ def _launched(rig: Rig) -> tuple[str, int]:
     return oid, result.launch_epoch
 
 
+class Gate:
+    """A gated child that records what start_run did with it (spawn, release, abort), in ``log``."""
+
+    def __init__(self, key, log, value=None):
+        self.key, self.log, self.value = key, log, value
+        log.append(("spawn", key))
+
+    def release(self):
+        self.log.append(("release", self.key))
+
+    def abort(self):
+        self.log.append(("abort", self.key))
+        return ctl.GATE_REFUSED
+
+
 def _fence_rows(rig: Rig, key: str) -> list:
     # levain.qbroker.fence.AgentFences' join, as it reads it (seat/1102-7-p72fix); a fresh read transaction, so only
     # what is committed is seen
@@ -251,23 +271,23 @@ def test_the_session_key_is_committed_before_the_spawn_seam_runs(rig):
     for probe in (KEY, KEY + "\n", KEY + "-v2", "S" + KEY[1:], KEY.upper(), "s-" + "a" * 15, "s-" + "a" * 17, ""):
         assert bool(ctl.SESSION_KEY_RE.fullmatch(probe)) == bool(SESSION_RE.fullmatch(probe)), probe
     oid, epoch = _launched(rig)
-    seen = []
+    seen, log = [], []
 
     def spawn(key):
         seen.append(_fence_rows(rig, key))
-        return "child"
+        return Gate(key, log)
 
     started = ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=rig.now)
-    assert started == ctl.Started(True, None, "child")
-    assert seen == [[(oid,)]]
+    assert started.spawned is True and started.value.key == KEY
+    assert seen == [[(oid,)]] and log == [("spawn", KEY), ("release", KEY)]
 
 
 def test_a_session_key_that_cannot_be_recorded_never_reaches_the_spawn_seam(rig, tmp_path):
     # behaviour: every refused compare-and-set (a key another row names, a second key, an epoch a bar raised, a row
     # that is not launched) returns Started(False) and a failing write raises; spawn is never called, so no claude
     # starts for a session the fence cannot see
-    calls = []
-    spawn = calls.append
+    log = []
+    spawn = lambda key: Gate(key, log)  # noqa: E731
     oid, epoch = _launched(rig)
     run = lambda oid, epoch, key: ctl.start_run(rig.store, oid, epoch, key, spawn, clock=rig.now)  # noqa: E731
     assert run(oid, epoch, KEY).spawned is True
@@ -293,7 +313,7 @@ def test_a_session_key_that_cannot_be_recorded_never_reaches_the_spawn_seam(rig,
     with pytest.raises(sqlite3.Error, match="disk full"):
         run(third, r3.launch_epoch, "s-" + "3" * 16)
     assert rig.row(third)["session_key"] is None
-    assert calls == [KEY]
+    assert log == [("spawn", KEY), ("release", KEY)]
     with rig.store.write() as c:
         c.execute("DROP TRIGGER t_fail")
 
@@ -313,6 +333,7 @@ def test_a_crash_between_the_key_and_the_spawn_is_ended_by_lapse_recovery(rig):
         assert ctl.takeover(c, oid, lapse) is True
     ended = rig.row(oid)
     assert (ended["state"], ended["reason"], ended["epoch"]) == ("stopped", "crash_recovered", epoch + 1)
+    assert rig.taken(oid) == ([], [("settled",)])                     # P6-5b: takeover settles and frees
     assert _fence_rows(rig, KEY) == [(oid,)]
     with rig.store.read() as c:
         assert fence_now(c) != fence
@@ -431,40 +452,47 @@ def test_a_session_key_is_not_recorded_on_a_lapsed_lease(rig):
     # behaviour (codex HIGH r1 #2): a launch whose lease has lapsed belongs to lapse recovery even before takeover runs;
     # its key is refused and spawn is never called. The same row inside its lease records it.
     calls = []
+    spawn = lambda key: Gate(key, calls)  # noqa: E731
     oid, epoch = _launched(rig)
     lapsed = lambda: rig.now(timedelta(seconds=ctl.LEASE_S + 1))  # noqa: E731
-    assert ctl.start_run(rig.store, oid, epoch, KEY, calls.append, clock=lapsed).spawned is False
+    assert ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=lapsed).spawned is False
     with rig.store.write() as c:
         assert ctl.record_session_key(c, oid, epoch, KEY, rig.now(timedelta(seconds=ctl.LEASE_S))) is False
     assert rig.row(oid)["session_key"] is None and calls == []
     live = lambda: rig.now(timedelta(seconds=ctl.LEASE_S - 1))  # noqa: E731
-    assert ctl.start_run(rig.store, oid, epoch, KEY, calls.append, clock=live).spawned is True
-    assert calls == [KEY]
+    assert ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=live).spawned is True
+    assert calls == [("spawn", KEY), ("release", KEY)]
 
 
-def test_a_takeover_between_the_key_commit_and_the_spawn_leaves_a_session_the_fence_reads_as_stale(rig):
-    # behaviour (the residue of codex HIGH r1 #2, closed downstream): takeover commits after the key and before spawn;
-    # spawn still runs (no suspended child here: P6-5b's), but the fence join finds the row stopped at epoch + 1, so
-    # every call the session makes is refused
+def test_a_takeover_between_the_key_commit_and_the_release_never_lets_the_child_run(rig, tmp_path):
+    # behaviour (P6-5b ruling (ii), closing the residue of codex HIGH r1 #2): takeover commits after the key and after
+    # the gated child exists, before the release; start_run's lease-checked transaction finds the row stopped and
+    # aborts the child, which exits GATE_REFUSED without exec (its marker is never written). The row ends settled with
+    # its slot freed, and the session the key names is still STALE at the fence. The same gate on a live row runs.
     oid, epoch = _launched(rig)
-    seen = []
+    marker = tmp_path / "ran"
+    argv = [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('ran')"]
 
     def spawn(key):
+        child = ctl.GatedChild(argv)
         with rig.store.write() as c:                                     # recovery, in another transaction
             assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1))) is True
-        with rig.store.read() as c:                                      # the fence's join, then its state/epoch read
-            (found,), = c.execute("SELECT occurrence_id FROM agent_occurrences WHERE session_key = ? LIMIT 2",
-                                  (key,)).fetchall()
-            seen.append(c.execute("SELECT state, epoch FROM agent_occurrences WHERE occurrence_id = ?",
-                                  (found,)).fetchone())
-        return "child"
+        return child
 
-    assert ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=rig.now) == ctl.Started(True, None, "child")
-    assert seen == [("stopped", epoch + 1)]
+    started = ctl.start_run(rig.store, oid, epoch, KEY, spawn, clock=rig.now)
+    assert started.spawned is False and started.value.process.returncode == ctl.GATE_REFUSED
+    assert not marker.exists()
+    assert (rig.row(oid)["state"], rig.row(oid)["epoch"]) == ("stopped", epoch + 1)
+    assert rig.taken(oid) == ([], [("settled",)])
     fence, fence_now = agent_fence(rig.row(oid) | {"launch_epoch": epoch}, authority=rig.authority, store_id=rig.sid,
                                    now=rig.now)
     with rig.store.read() as c:
         assert fence_now(c) != fence
+    live = rig.claim("k2")
+    result = rig.launch(live)
+    ran = ctl.start_run(rig.store, live, result.launch_epoch, "s-" + "4" * 16, lambda key: ctl.GatedChild(argv),
+                        clock=rig.now)
+    assert ran.spawned is True and ran.value.process.wait(30) == 0 and marker.read_text() == "ran"
 
 
 def test_a_transaction_sqlite_already_rolled_back_raises_its_own_error_not_the_savepoints(rig, tmp_path):
@@ -502,3 +530,100 @@ def test_a_coordinator_slot_with_no_launch_row_is_probed_only_after_its_own_leas
     late = ctl.launch(rig.store, oid, authority=rig.authority, executor=Exec(), window=WINDOW,
                       now=rig.now(timedelta(seconds=slots.LEASE_S)), launch_over=over, session_alive=alive)
     assert late.outcome == "launched"
+
+
+# --- P6-5b: the fire process and c9 (a crash between the launch commit and the first effect) -------------------------
+
+ROOT = str(Path(ctl.__file__).resolve().parents[2])   # the fire imports the levain under test, not an installed one
+ENV = dict(os.environ, PYTHONPATH=ROOT)
+# a fire whose run body (P6-4a's) marks that it began and then blocks: the moment between the claim and the first
+# effect, held open so the test can kill the real process there
+BLOCKING_FIRE = ("import sys, time; from datetime import datetime; from levain.agents import controller as ctl; "
+                 "oid, store, mark, at = sys.argv[1:5]; now = datetime.fromisoformat(at); "
+                 "sys.exit(ctl.fire(store, oid, clock=lambda: now, "
+                 "run=lambda s, o, e: (open(mark, 'w').write(str(e)), time.sleep(120), 9)[2]))")
+
+
+def _settlement(rig: Rig, oid: str) -> tuple:
+    with rig.store.read() as c:
+        return c.execute("SELECT state, debited_usd_micros, settled_reason FROM agent_reservations"
+                         " WHERE occurrence_id = ?", (oid,)).fetchone()
+
+
+def _wait_for(path: Path, proc: subprocess.Popen, seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not path.exists():
+        assert proc.poll() is None, f"the fire exited {proc.returncode} before {path.name}"
+        assert time.monotonic() < deadline, f"no {path.name} in {seconds}s"
+        time.sleep(0.05)
+
+
+def test_c9_the_launcher_dies_before_the_fire_exists_and_lapse_recovery_settles_it(rig):
+    # behaviour (c9, first cut): the launch commits (slot 1, an open reservation of 100_000) and no fire is ever
+    # spawned. Nothing renews the lease; takeover ends the row stopped/crash_recovered at epoch + 1, debits all of the
+    # reservation (unreadable usage, A0 §2.4's lapse row) and frees the slot, which the next launch takes
+    oid, epoch = _launched(rig)
+    assert rig.taken(oid) == ([(1,)], [("open",)]) and rig.row(oid)["pid"] is None
+    with rig.store.write() as c:
+        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1))) is True
+    row = rig.row(oid)
+    assert (row["state"], row["reason"], row["epoch"]) == ("stopped", "crash_recovered", epoch + 1)
+    assert rig.taken(oid) == ([], [("settled",)]) and _settlement(rig, oid) == ("settled", 100_000, "unreadable")
+    with rig.store.write() as c:                                     # a second recovery changes nothing
+        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 2))) is False
+    nxt = rig.claim("k2")
+    assert rig.launch(nxt, later=timedelta(seconds=ctl.LEASE_S + 2)).slot == 1
+
+
+def test_c9_crash_after_launch_commit(rig, tmp_path):
+    # behaviour (c9, the BUILD_PLAN P6-5 Done line): the REAL fire process writes its identity record (matching
+    # process_identity of the live fire), claims its row (pid), and is killed before its first effect; lapse recovery
+    # ends the row stopped/crash_recovered with its slot freed and its reservation settled. A late fire on the settled
+    # row claims nothing and exits 0 having run nothing
+    from levain.consent.delivery import process_identity
+    oid, epoch = _launched(rig)
+    began = tmp_path / "began"
+    argv = [sys.executable, "-c", BLOCKING_FIRE, oid, str(rig.store.directory), str(began), rig.now().isoformat()]
+    proc = ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=ENV)
+    try:
+        _wait_for(began, proc)
+        assert os.getsid(proc.pid) == proc.pid                     # a session leader: no signal of its reaches us
+        record = json.loads(ctl.fire_record_path(rig.store.directory, oid).read_text())
+        assert record["pid"] == proc.pid == rig.row(oid)["pid"] and began.read_text() == str(epoch)
+        assert process_identity(proc.pid) == (record["started"], record["args"]) and oid in record["args"].split()
+        os.killpg(proc.pid, signal.SIGKILL)                         # our own unreaped Popen (BUILD_PLAN §2, rule a)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(30)
+    assert rig.row(oid)["state"] == "launched" and rig.taken(oid) == ([(1,)], [("open",)])
+    with rig.store.write() as c:
+        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1))) is True
+    row = rig.row(oid)
+    assert (row["state"], row["reason"], row["epoch"]) == ("stopped", "crash_recovered", epoch + 1)
+    assert rig.taken(oid) == ([], [("settled",)]) and _settlement(rig, oid) == ("settled", 100_000, "unreadable")
+    ctl.fire_record_path(rig.store.directory, oid).unlink()          # so the late fire reaches its claim
+    late = tmp_path / "late"
+    argv[5] = str(late)
+    assert ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=ENV).wait(60) == 0
+    assert not late.exists() and rig.row(oid)["pid"] == record["pid"]
+
+
+def test_the_fire_entry_claims_once_and_a_second_fire_does_nothing(tmp_path):
+    # behaviour: spawn_fire's default argv (the module entry) runs in its own session, writes its identity record,
+    # claims the row with its pid, and exits FIRE_UNWIRED (no run body until P6-4a). A second fire finds the record,
+    # claims nothing and exits 0; the first fire's identity and pid stay. The rig's clock is set near the wall clock,
+    # because the entry judges the lease on the real clock.
+    rig = Rig(tmp_path)
+    rig.world.clock.now = datetime.now(timezone.utc) - timedelta(minutes=5)
+    oid, _ = _launched(rig)
+    first = ctl.spawn_fire(rig.store.directory, oid, env=ENV)
+    assert first.wait(60) == ctl.FIRE_UNWIRED
+    assert first.args == ctl.fire_argv(rig.store.directory, oid)
+    record = json.loads(ctl.fire_record_path(rig.store.directory, oid).read_text())
+    assert record["pid"] == first.pid == rig.row(oid)["pid"] and record["args"].split()[-1] == oid
+    assert "no run body is wired" in (Path(rig.store.directory) / "fires" / f"{oid}.log").read_text()
+    second = ctl.spawn_fire(rig.store.directory, oid, env=ENV)
+    assert second.wait(60) == 0
+    assert json.loads(ctl.fire_record_path(rig.store.directory, oid).read_text()) == record
+    assert rig.row(oid)["pid"] == first.pid

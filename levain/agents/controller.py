@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
-from collections.abc import Callable, Collection
+import subprocess
+import sys
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,7 +37,9 @@ from levain.agents.store import AgentStore, open_agent_store
 
 __all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurrence_id", "run_id", "claim",
            "close_no_slot", "tick", "heartbeat", "takeover", "Window", "LaunchResult", "launch",
-           "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE"]
+           "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE", "SESSION_GRACE_S",
+           "Ended", "settle_terminal", "GatedChild", "GATE_REFUSED", "fire_argv", "fire_record_path", "spawn_fire",
+           "claim_fire", "fire"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
@@ -290,38 +295,57 @@ def _expiry(at: datetime, lease_s: int) -> datetime:
     return moment.replace(microsecond=0) + timedelta(seconds=1) if moment.microsecond else moment
 
 
-def heartbeat(conn: sqlite3.Connection, occurrence_id: str, epoch: int, now: datetime, lease_s: int = LEASE_S) -> bool:
+SESSION_GRACE_S = 120  # [judged, against nothing measured]: what a session run's supervisor passes heartbeat
+
+
+def heartbeat(conn: sqlite3.Connection, occurrence_id: str, epoch: int, now: datetime, lease_s: int = LEASE_S, *,
+              session_grace_s: int | None = None) -> bool:
     """The supervisor's heartbeat: extend a ``launched`` row's lease to ``now + lease_s``. It is a compare-and-set on
     the epoch the holder launched or last renewed under and on the exact lease it read, so a holder that a takeover
     fenced (the epoch moved, the row left ``launched``) writes nothing and is told ``False``. A lease that has already
     lapsed (``now`` past it) is refused too: the row belongs to takeover from that moment, and a late holder must not
     postpone crash recovery. An absent or unreadable lease is refused, as takeover refuses it. The lease never moves
     backwards, so a renew computed from an earlier clock reading, or a wall clock set back, leaves the later lease in
-    place. Runs inside the caller's write transaction and takes its write lock first."""
+    place. Runs inside the caller's write transaction and takes its write lock first.
+
+    ``session_grace_s`` is for a run that opens an S1 session (the supervisor knows its executor; the row does not):
+    a row that has recorded no ``session_key`` by ``launched_at + session_grace_s`` is refused, so a fire that never
+    opened its session lapses to takeover instead of being renewed for ever. ``None`` (a sessionless run, the dream)
+    applies no such bound. A ``launched_at`` that cannot be read is refused under the bound."""
     if not conn.in_transaction:
         raise RuntimeError("a heartbeat runs inside the caller's write transaction")
+    if session_grace_s is not None and (type(session_grace_s) is not int or session_grace_s < 0):
+        raise ValueError("session_grace_s is a non-negative integer of seconds, or None")
     at = schedule._utc(now)
     _write_lock(conn)
-    row = conn.execute("SELECT lease_until FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'"
-                       " AND epoch = ?", (occurrence_id, epoch)).fetchone()
+    row = conn.execute("SELECT lease_until, session_key, launched_at FROM agent_occurrences WHERE occurrence_id = ?"
+                       " AND state = 'launched' AND epoch = ?", (occurrence_id, epoch)).fetchone()
     if row is None:
         return False
     lease = _lease(row[0])
     if lease is None or at > lease:
         return False
+    if session_grace_s is not None and row[1] is None:
+        launched = _lease(row[2])
+        if launched is None or at >= launched + timedelta(seconds=session_grace_s):
+            return False
     until = max(lease, _expiry(at, lease_s))
     cur = conn.execute("UPDATE agent_occurrences SET lease_until = ? WHERE occurrence_id = ? AND state = 'launched'"
                        " AND epoch = ? AND lease_until = ?", (_stamp(until), occurrence_id, epoch, row[0]))
     return cur.rowcount == 1
 
 
-def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime) -> bool:
+def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime,
+             usage: accounting.Usage | None = None) -> bool:
     """Fenced takeover (A0 r7 section 2.3, lapse recovery): end a ``launched`` row whose lease has lapsed, writing
-    ``epoch + 1`` and ``crash_recovered`` in one statement. The lease is read here, inside the write transaction, and
-    the ``UPDATE`` is guarded by the exact value read, so a heartbeat that landed first or a takeover that already
-    ran leaves it with nothing to change (``False``). A live lease is never taken over; a lease that is absent or
-    unreadable is not evidence of a lapse, so it is refused too. Slot and reservation release belong to the
-    terminal transaction P6-5 wires around this. It takes the caller's write lock first, as :func:`heartbeat` does."""
+    ``epoch + 1`` and ``crash_recovered`` in one statement, settling its reservation and freeing its slot in the same
+    transaction (A0 §2.4's lapse row, through :func:`_end_launched`, the one end :func:`settle_terminal` uses). The
+    lease is read here, inside the write transaction, and the ``UPDATE`` is guarded by the exact value read, so a
+    heartbeat that landed first or a takeover that already ran leaves it with nothing to change (``False``), and
+    nothing is settled or freed. A live lease is never taken over; a lease that is absent or unreadable is not
+    evidence of a lapse, so it is refused too. ``usage`` is unreadable unless the caller can read the executor's
+    record by now (§2.4: then all of the reservation is debited, or the caps recorded on a subscription run). It takes
+    the caller's write lock first, as :func:`heartbeat` does."""
     if not conn.in_transaction:
         raise RuntimeError("a takeover runs inside the caller's write transaction")
     at = schedule._utc(now)
@@ -333,10 +357,72 @@ def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime) -> boo
     lease = _lease(row[0])
     if lease is None or at <= lease:
         return False
-    cur = conn.execute("UPDATE agent_occurrences SET state = 'stopped', reason = 'crash_recovered', epoch = epoch + 1,"
-                       " ended_at = ? WHERE occurrence_id = ? AND state = 'launched' AND lease_until = ?",
-                       (_stamp(at), occurrence_id, row[0]))
-    return cur.rowcount == 1
+    ended = _end_launched(conn, occurrence_id, "stopped", "crash_recovered",
+                          usage if usage is not None else _UNREAD, at, "lease_until = ?", (row[0],), bump=True)
+    return ended.ended
+
+
+# --- the terminal transaction (A0 r8 §2.4's release table, §2.5 launched -> done/failed/stopped; P6-5b) --------------
+
+_UNREAD = accounting.Usage(None, None, None, "lapse-recovery")
+_ENDS = ("done", "failed", "stopped")
+
+
+@dataclass(frozen=True)
+class Ended:
+    """``ended`` is True when this call wrote the terminal state; then ``state``/``reason`` are what it wrote (a breach
+    found at settle writes ``failed``/``budget_breach`` whatever was asked), ``settled`` is the reservation's
+    :class:`accounting.Settled` and ``released`` whether a slot was freed. False: nothing was written."""
+    ended: bool
+    state: str | None = None
+    reason: str | None = None
+    settled: accounting.Settled | None = None
+    released: bool = False
+
+
+def _end_launched(conn: sqlite3.Connection, occurrence_id: str, state: str, reason: str, usage: accounting.Usage,
+                  at: datetime, guard: str, args: tuple, *, bump: bool) -> Ended:
+    """The one place a launched occurrence's slot is freed and its reservation settled (an admitted one holds neither,
+    A0 §2.4; :func:`close_no_slot`'s release on it is defensive): under the caller's write lock, the
+    row is read as ``launched`` under ``guard``; the reservation is settled, a breach turns the end into
+    ``failed``/``budget_breach``, the state is written under the same guard (with ``epoch + 1`` for lapse recovery)
+    and the slot is released. A row the guard does not find gets nothing written, settled or freed."""
+    _write_lock(conn)
+    where = f"occurrence_id = ? AND state = 'launched' AND {guard}"
+    if conn.execute(f"SELECT 1 FROM agent_occurrences WHERE {where}", (occurrence_id, *args)).fetchone() is None:
+        return Ended(False)
+    settled = accounting.settle(conn, {"occurrence_id": occurrence_id}, usage)
+    if settled.breach:
+        state, reason = "failed", "budget_breach"
+    cur = conn.execute("UPDATE agent_occurrences SET state = ?, reason = ?, ended_at = ?"
+                       + (", epoch = epoch + 1" if bump else "") + f" WHERE {where}",
+                       (state, reason, _stamp(at), occurrence_id, *args))
+    if cur.rowcount != 1:   # the lock is held since the read: only a trigger gets here; the caller rolls back
+        raise RuntimeError(f"occurrence {occurrence_id} moved inside its own terminal transaction")
+    return Ended(True, state, reason, settled, slots.release(conn, occurrence_id))
+
+
+def settle_terminal(conn: sqlite3.Connection, occurrence_id: str, epoch: int, state: str, reason: str,
+                    usage: accounting.Usage, now: datetime) -> Ended:
+    """End a launched occurrence (A0 §2.5 ``launched -> done/failed/stopped``) with its reservation settled against
+    ``usage`` (:func:`accounting.settle`, A0 §2.4's rows) and its slot released, inside the caller's write transaction.
+    ``epoch`` is the one the holder launched or last renewed under: a row a revoke or a takeover has fenced since, or
+    one already terminal, is not found, and nothing is written, settled or freed (``Ended(False)``), so a second call
+    is a no-op. ``usage`` is the executor's own ``usage()`` reading, never computed here. A breach overrides ``state``
+    with ``failed``/``budget_breach`` (the agent is paused in the same transaction). The supervisor calls this for a
+    run it stopped only after ``stop()`` reported ``terminated`` (§2.4's first row); ``awake.sync`` is the caller's,
+    after its commit. Raises on a bad argument before reading anything, and when the write fails: the caller's
+    transaction must then roll back."""
+    if not conn.in_transaction:
+        raise RuntimeError("a terminal state is written inside the caller's write transaction")
+    if state not in _ENDS:
+        raise ValueError(f"a launched occurrence ends {', '.join(_ENDS)}")
+    if type(reason) is not str or not reason or (state == "done") != (reason == "completed"):
+        raise ValueError("a terminal reason is a non-empty string, and 'completed' is done's and only done's")
+    if type(epoch) is not int:
+        raise ValueError("epoch is the integer the holder runs under")
+    return _end_launched(conn, occurrence_id, state, reason, usage, schedule._utc(now), "epoch = ?", (epoch,),
+                         bump=False)
 
 
 # --- the launch transaction (A0 r8 §2.4, §2.5; BUILD_PLAN P6-5a) ------------------------------------------------------
@@ -574,27 +660,95 @@ def record_session_key(conn: sqlite3.Connection, occurrence_id: str, launch_epoc
 
 @dataclass(frozen=True)
 class Started:
-    """``spawned`` is True when ``spawn`` was called (``value`` is what it returned); False with ``reason`` when the key
-    could not be recorded, in which case ``spawn`` was never called."""
+    """``spawned`` is True when the child ``spawn`` returned was released (``value`` is that child). False with
+    ``reason`` otherwise: either the key could not be recorded and ``spawn`` was never called (``value`` None), or the
+    row was ended or its lease lapsed before the release and the child was aborted unreleased (``value`` the child)."""
     spawned: bool
     reason: str | None = None
     value: object = None
 
 
-def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_epoch: int, session_key: str,
-              spawn: Callable[[str], object], *, clock: Callable[[], datetime]) -> Started:
-    """The spawn seam (P6-5b's fire calls it once the S1 session is open, before claude starts). The key is recorded
-    by :func:`record_session_key` in its own ``BEGIN IMMEDIATE``, and ``spawn(session_key)`` is called only after that
-    transaction COMMITTED, so the per-call fence can join the session to its occurrence from the first call. A refused
-    compare-and-set returns ``Started(False, reason)``; a store error raises. Either way ``spawn`` is not called, the
-    row stays ``launched`` holding its slot until its lease lapses and lapse recovery (:func:`takeover`) ends it
-    ``crash_recovered``; releasing the slot and the reservation is the terminal transaction around that call. A
-    caller whose ``spawn`` raised ends the run itself: a retry with another key is refused (the row names one).
+GATE_REFUSED = 75   # the gate's exit when it reads anything but the release byte (EOF: its holder closed or died)
+_GATE = ("import os, sys\n"
+         "fd = int(sys.argv[1])\n"
+         "go = os.read(fd, 1)\n"
+         "os.close(fd)\n"
+         f"if go != b'1':\n    sys.exit({GATE_REFUSED})\n"
+         "os.execvp(sys.argv[2], sys.argv[2:])\n")
 
-    ``clock`` is read inside the write lock, so the lease is judged at the moment the key commits. A takeover that
-    commits after the key and before ``spawn`` is not seen here: ``spawn`` runs, and the session it starts is stale
-    at the per-call fence from its first call (the row left ``launched`` and its epoch moved). Closing that window at
-    the process (a child started suspended and released only after a lease-checked commit) is P6-5b's to decide."""
+
+class GatedChild:
+    """A child started blocked: a ``python -I`` gate holds the read end of a pipe and ``execvp``\\ s ``argv`` only after
+    it reads the release byte; EOF (the holder closed its end, or died) exits :data:`GATE_REFUSED` without exec. The
+    child leads its own session (``start_new_session``), and this object holds its unreaped ``Popen``, so the holder
+    may signal it (BUILD_PLAN §2, rule (a)); nobody signals it by a stored pid."""
+
+    def __init__(self, argv: Sequence[str], *, stdin=subprocess.DEVNULL, stdout=None, stderr=None,
+                 env: Mapping[str, str] | None = None, cwd: str | Path | None = None) -> None:
+        if not argv or any(type(a) is not str for a in argv):
+            raise ValueError("a gated child's argv is a non-empty list of strings")
+        read, write = os.pipe()             # both non-inheritable; pass_fds hands the child the read end only
+        self._write: int | None = write
+        try:
+            self.process = subprocess.Popen([sys.executable, "-I", "-c", _GATE, str(read), *argv], pass_fds=(read,),
+                                            start_new_session=True, close_fds=True, stdin=stdin, stdout=stdout,
+                                            stderr=stderr, env=None if env is None else dict(env), cwd=cwd)
+        except BaseException:
+            os.close(write)
+            self._write = None
+            raise
+        finally:
+            os.close(read)
+
+    def release(self) -> None:
+        """Let the child exec. Once only."""
+        if self._write is None:
+            raise RuntimeError("the gated child was already released or aborted")
+        fd, self._write = self._write, None
+        try:
+            os.write(fd, b"1")
+        finally:
+            os.close(fd)
+
+    def abort(self, timeout: float = 5.0) -> int:
+        """Never release it: close the pipe (the gate exits :data:`GATE_REFUSED`) and reap it. A gate that does not
+        exit in ``timeout`` is killed through this unreaped handle. Returns its exit status."""
+        if self._write is not None:
+            fd, self._write = self._write, None
+            os.close(fd)
+        try:
+            return self.process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            return self.process.wait()
+
+
+def _still_ours(conn: sqlite3.Connection, occurrence_id: str, launch_epoch: int, session_key: str,
+                now: datetime) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched' AND launch_epoch = ?"
+        " AND epoch = launch_epoch AND session_key = ? AND lease_until > ?",
+        (occurrence_id, launch_epoch, session_key, _stamp(schedule._utc(now)))).fetchone() is not None
+
+
+def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_epoch: int, session_key: str,
+              spawn: Callable[[str], GatedChild], *, clock: Callable[[], datetime]) -> Started:
+    """The spawn seam (the fire calls it once the S1 session is open, before claude starts). In order:
+
+    1. the key is recorded by :func:`record_session_key` in its own ``BEGIN IMMEDIATE``, which COMMITS first, so the
+       per-call fence can join the session to its occurrence from the child's first call;
+    2. ``spawn(session_key)`` starts the child GATED (a :class:`GatedChild`, or anything with its ``release`` and
+       ``abort``): it exists but has run nothing;
+    3. a second ``BEGIN IMMEDIATE`` re-reads the row (still ``launched`` at ``launch_epoch``, naming this key, its
+       lease live at ``clock()`` read inside the lock) and releases the child INSIDE that transaction. A takeover or a
+       revoke's epoch raise needs the same write lock, so none lands between the check and the release: the child
+       starts only while its row is live. A row that moved is answered by ``abort()`` (the child never execs) and
+       ``Started(False, reason, child)``.
+
+    A refused compare-and-set in step 1 returns ``Started(False, reason)`` and a store error raises; either way
+    ``spawn`` is not called, and the row, holding its slot, ends by lapse recovery (:func:`takeover`). Any error after
+    ``spawn`` returned aborts the child before it propagates. A caller whose ``spawn`` raised ends the run itself
+    (:func:`settle_terminal`): a retry with another key is refused (the row names one)."""
     if not isinstance(store, AgentStore):
         store = open_agent_store(store)
     with store.write() as conn:
@@ -602,7 +756,130 @@ def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_
     if not recorded:
         return Started(False, "the session key was not recorded: the occurrence is not launched at that epoch, "
                               "its lease lapsed, it already names a session, or the key names another occurrence")
-    return Started(True, None, spawn(session_key))
+    child = spawn(session_key)
+    released = False
+    try:
+        with store.write() as conn:
+            if _still_ours(conn, occurrence_id, launch_epoch, session_key, clock()):
+                child.release()
+                released = True
+    finally:
+        if not released:
+            child.abort()
+    if not released:
+        return Started(False, "the occurrence was ended, fenced or its lease lapsed before the run was released; "
+                              "the child never ran", child)
+    return Started(True, None, child)
+
+
+# --- the fire: a separate session-leader process per launched occurrence (BUILD_PLAN P6-5, §2) ------------------------
+
+FIRES = "fires"
+FIRE_UNWIRED = 3       # the module entry's exit after its claim: no run body exists until P6-4a
+FIRE_NO_IDENTITY = 4   # the fire cannot read its own identity, or its command line does not name its occurrence
+_OCCURRENCE_RE = re.compile(r"oc-[0-9a-f]{32}")
+
+
+def _occurrence(occurrence_id: str) -> str:
+    if type(occurrence_id) is not str or _OCCURRENCE_RE.fullmatch(occurrence_id) is None:
+        raise ValueError("an occurrence id is oc-<32 hex>")
+    return occurrence_id
+
+
+def fire_argv(store_dir: Path | str, occurrence_id: str) -> list[str]:
+    """The fire's command line. It names the occurrence (BUILD_PLAN §2: the identity check needs the id on it). The
+    ``levain agents _fire`` verb delegates here once ``levain/agents/cli.py``'s owner wires it."""
+    return [sys.executable, "-m", "levain.agents.controller", "_fire", "--store", str(Path(store_dir)),
+            _occurrence(occurrence_id)]
+
+
+def fire_record_path(store_dir: Path | str, occurrence_id: str) -> Path:
+    """``<store>/fires/<occurrence_id>.json``: the fire's identity record, read by an executor's ``stop()``."""
+    return Path(store_dir) / FIRES / f"{_occurrence(occurrence_id)}.json"
+
+
+def spawn_fire(store_dir: Path | str, occurrence_id: str, *, argv: Sequence[str] | None = None,
+               log: Path | str | None = None, env: Mapping[str, str] | None = None) -> subprocess.Popen:
+    """Start the fire for an occurrence whose launch transaction has COMMITTED (the caller calls this after
+    :func:`launch` returned ``launched``): a separate OS process leading its own session, stdin closed, output
+    appended to ``log`` (default ``<store>/fires/<occurrence_id>.log``). The caller does not wait on it and never
+    signals it; stopping a fire is an executor's ``stop()``, through the identity record the fire writes. ``argv``
+    defaults to :func:`fire_argv`."""
+    occurrence_id = _occurrence(occurrence_id)
+    fires = Path(store_dir) / FIRES
+    fires.mkdir(mode=0o700, exist_ok=True)
+    with open(log if log is not None else fires / f"{occurrence_id}.log", "ab") as out:
+        return subprocess.Popen(list(argv) if argv is not None else fire_argv(store_dir, occurrence_id),
+                                start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, env=None if env is None else dict(env))
+
+
+def claim_fire(conn: sqlite3.Connection, occurrence_id: str, pid: int, now: datetime) -> int | None:
+    """The fire claims its own row: one compare-and-set writing ``pid`` on a row still ``launched`` with no fire yet, at
+    its launch epoch, inside its lease at ``now``. Returns the ``launch_epoch`` it runs under, or ``None`` when it
+    wrote nothing (a second fire, a late fire on a row lapse recovery ended, a fenced or lapsed row)."""
+    if not conn.in_transaction:
+        raise RuntimeError("a fire claims its row inside the caller's write transaction")
+    if type(pid) is not int or pid < 1:
+        raise ValueError("a fire's pid is a positive integer")
+    cur = conn.execute("UPDATE agent_occurrences SET pid = ? WHERE occurrence_id = ? AND state = 'launched'"
+                       " AND pid IS NULL AND epoch = launch_epoch AND lease_until > ?",
+                       (pid, occurrence_id, _stamp(schedule._utc(now))))
+    if cur.rowcount != 1:
+        return None
+    return conn.execute("SELECT launch_epoch FROM agent_occurrences WHERE occurrence_id = ?",
+                        (occurrence_id,)).fetchone()[0]
+
+
+def fire(store: AgentStore | Path | str, occurrence_id: str, *,
+         run: Callable[[AgentStore, str, int], int], clock: Callable[[], datetime]) -> int:
+    """The fire process's body, in order: write the identity record (pid, ``ps`` start time and command line, read
+    on itself with :func:`levain.consent.delivery.process_identity`; temp, then an exclusive link: a fire that finds
+    a record already there returns 0 before claiming, so no fire ever replaces another's identity), then
+    :func:`claim_fire`, then
+    ``run(store, occurrence_id, launch_epoch)`` (P6-4a's supervisor). A fire that cannot identify itself, or whose
+    command line does not name its occurrence, claims nothing and returns :data:`FIRE_NO_IDENTITY`. A fire that does
+    not win the claim returns 0 having done nothing else: no effect, no compose, no spend."""
+    from levain.consent.delivery import process_identity   # here: the consent package is not the controller's closure
+    occurrence_id = _occurrence(occurrence_id)
+    if not isinstance(store, AgentStore):
+        store = open_agent_store(store)
+    pid = os.getpid()
+    identity = process_identity(pid)
+    if identity is None or occurrence_id not in identity[1].split():
+        return FIRE_NO_IDENTITY
+    record = fire_record_path(store.directory, occurrence_id)
+    record.parent.mkdir(mode=0o700, exist_ok=True)
+    tmp = record.with_name(f".{record.name}.{pid}.tmp")
+    tmp.write_text(json.dumps({"occurrence_id": occurrence_id, "pid": pid, "started": identity[0],
+                               "args": identity[1]}, sort_keys=True))
+    try:
+        os.link(tmp, record)    # exclusive: a second fire never overwrites the identity the first one's stop() reads
+    except FileExistsError:
+        return 0
+    finally:
+        tmp.unlink()
+    with store.write() as conn:
+        launch_epoch = claim_fire(conn, occurrence_id, pid, clock())
+    if launch_epoch is None:
+        return 0
+    return run(store, occurrence_id, launch_epoch)
+
+
+def _unwired_run(store: AgentStore, occurrence_id: str, launch_epoch: int) -> int:
+    print(f"levain agents _fire {occurrence_id}: no run body is wired yet (P6-4a); the occurrence ends by lapse "
+          "recovery", file=sys.stderr)
+    return FIRE_UNWIRED
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(prog="levain agents _fire")
+    parser.add_argument("verb", choices=["_fire"])
+    parser.add_argument("--store", required=True)
+    parser.add_argument("occurrence_id")
+    args = parser.parse_args(argv)
+    return fire(args.store, args.occurrence_id, run=_unwired_run, clock=lambda: datetime.now(timezone.utc))
 
 
 # --- the coordinator-lease probes over dispatch.db (levain.agents.slots.probe_over) -----------------------------------
@@ -644,3 +921,7 @@ def dispatch_probes(directory: Path | str) -> tuple[Callable[[str], bool | None]
         return False if _read("SELECT 1 FROM launch_sweeps WHERE launch_id = ?", launch_id) else None
 
     return launch_over, session_alive
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
