@@ -418,7 +418,7 @@ def test_with_no_setting_a_drop_only_queues(qdir, fake):
 
 def test_the_setting_is_yours_and_append_only(qdir, workdir):
     store = CoordStore(qdir)
-    with pytest.raises(lease.LeaseRefused, match="absolute path"):          # codex runs in a directory too (C3c)
+    with pytest.raises(lease.LeaseRefused, match="Codex coordinator was removed"):     # never written again
         store.coord_set_agent("codex", cwd="relative")
     with pytest.raises(lease.LeaseRefused, match="absolute path"):
         store.coord_set_agent("claude", cwd="relative")
@@ -1548,11 +1548,13 @@ def test_a_launch_asked_for_before_the_column_reads_as_off(qdir, workdir):
 
 def test_user_scope_never_sticks_to_a_non_claude_setting(qdir, workdir, capsys):
     s = CoordStore(qdir)
-    s.coord_set_agent("codex", cwd=str(workdir.resolve()))
+    _legacy_codex_setting(s, str(workdir.resolve()))
     out = _main(qdir, capsys, "coord", "agent", "--user-scope", "on", rc=1)
     assert "claude" in out.err and s.coord_setting().user_scope is False
     # the store never writes a 1 on a non-claude row, so a later `coord agent claude` has nothing to inherit
-    assert s.coord_set_agent("codex", cwd=str(workdir.resolve()), user_scope=True).user_scope is False
+    s.coord_set_agent("none")
+    with pytest.raises(lease.LeaseRefused, match="no --model"):
+        s.coord_set_agent("none", cwd=str(workdir.resolve()), user_scope=True)
     assert rows(qdir, "SELECT user_scope FROM coord_settings ORDER BY seq DESC LIMIT 1") == [(0,)]
     assert s.coord_set_agent("claude", cwd=str(workdir.resolve())).user_scope is False
     # a codex row that carries a 1 anyway (written before this fix) reads as off and is not inherited
@@ -2665,3 +2667,94 @@ def test_a_stale_band_install_is_refused_naming_levain_update_and_update_clears_
     assert (target / "activation" / "hooks" / "stop.py").read_bytes() != old
     assert cl.band_problem(None, target, "claude_code") is None, lines
     assert cl.hook_live(target, user_scope=False)[0]
+
+
+# --- an install still set to the removed Codex coordinator (L3 r1 of the deletion) -----------------------------------
+def _legacy_codex_setting(store, cwd):
+    """A ``coord_settings`` row ``agent=codex`` as v0.11.15's ``levain coord agent codex`` wrote it: the store no longer
+    writes one, an install upgraded from then still holds it."""
+    with store._write() as (conn, now):
+        conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, by, at) "
+                     "VALUES (?, 'codex', NULL, ?, 0, 'operator', ?)", (lease.next_gseq(conn, now), cwd, now))
+
+
+def _legacy_codex_launch(store, cwd):
+    """A pending Codex coordinator launch and its bootstrap claim, as a wake under that setting wrote them before the
+    upgrade (the same two rows :func:`levain.coordinator.lease.wake` writes)."""
+    with store._write() as (conn, now):
+        key = "s-" + "c0dec0dec0dec0de"
+        token = lease._event(conn, now, "claim", key, token=None, until=lease._plus(now, lease.LAUNCH_TTL),
+                             cause="bootstrap", by="service")
+        return lease._pending(conn, now, token=token, harness="codex", role="coordinator", threads=(), model=None,
+                              cwd=cwd, cause="wake", session_key=key).launch_id
+
+
+def test_a_standing_codex_setting_wakes_nothing_and_says_why(qdir, workdir, fake):
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    d, _ = s.accept_drop("fix the build", surface="cli")
+    assert s.woken_launch(d.drop_id) is None
+    st = s.coord_status()
+    assert st["wake"] == "unset" and "Codex coordinator was removed" in st["why"], st
+    assert "levain coord agent claude" in st["why"]
+    assert rows(qdir, "SELECT count(*) FROM launches") == [(0,)]
+
+
+def test_the_store_never_writes_a_codex_setting(qdir, workdir):
+    s = CoordStore(qdir)
+    with pytest.raises(lease.LeaseRefused, match="Codex coordinator was removed"):
+        s.coord_set_agent("codex", cwd=str(workdir.resolve()))
+    assert s.coord_setting() is None
+
+
+def test_user_scope_alone_on_a_codex_setting_names_the_removal(qdir, workdir, capsys):
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    for flag in ("on", "off"):
+        out = _main(qdir, capsys, "coord", "agent", "--user-scope", flag, rc=1)
+        assert "Codex coordinator was removed" in out.err and "levain coord agent claude" in out.err, out.err
+    assert s.coord_setting().agent == "codex"
+    assert rows(qdir, "SELECT count(*) FROM coord_settings") == [(1,)]
+
+
+def test_coord_agent_codex_names_the_removal_before_checking_the_model(qdir, capsys):
+    out = _main(qdir, capsys, "coord", "agent", "codex", "--model", "not a model!", rc=1)
+    assert "Codex coordinator was removed" in out.err, out.err
+
+
+def test_a_pending_codex_launch_is_retired_by_the_watcher_not_left_to_expire(qdir, workdir, fake):
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    launch_id = _legacy_codex_launch(s, str(workdir.resolve()))
+    assert s.coord_lease().live
+    lines = cl.watch_once(s)
+    got = s.launch(launch_id)
+    assert (got.state, got.cause) == ("failed", "codex coordinator removed"), lines
+    assert any(launch_id in line and "codex coordinator removed" in line for line in lines), lines
+    assert s.coord_lease() is None or not s.coord_lease().live           # its bootstrap claim went with it
+    with sqlite3.connect(qdir / "dispatch.db") as c:
+        assert lease.launch_death(c, lease.launch(c, launch_id)) is not True   # a retirement, never a death
+    assert s.coord_status()["wake"] == "unset" and fake.spawns() == []
+    assert not any(launch_id in line for line in cl.watch_once(s))      # idempotent: nothing left to retire
+
+
+def test_an_active_codex_coordinator_is_ended_and_fenced_by_the_watcher(qdir, workdir, fake):
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    launch_id = _legacy_codex_launch(s, str(workdir.resolve()))
+    assert s.launch_claim_spawn(launch_id, os.getpid())[1] is None
+    got, why = s.launch_activate(launch_id, harness_session_id="019a-codex-thread")
+    assert why is None and got.state == "active"
+    token = s.coord_lease().token
+    assert s.coord_beat(token).live                                       # the orphan thread's beat, before the pass
+    lines = cl.watch_once(s)
+    ended = s.launch(launch_id)
+    assert (ended.state, ended.cause) == ("ended", "codex coordinator removed"), lines
+    with pytest.raises(lease.LeaseRefused):
+        s.coord_beat(token)                                               # its next beat is refused
+    with pytest.raises(lease.LeaseRefused, match="only an active coordinator"):
+        s.coord_claim(launch_id, ended.session_key)                       # and it cannot claim again
+    with sqlite3.connect(qdir / "dispatch.db") as c:
+        assert lease.launch_death(c, lease.launch(c, launch_id)) is False
+    assert s.coord_status()["wake"] == "unset"
+    assert not any(launch_id in line and "codex coordinator removed" in line for line in cl.watch_once(s))

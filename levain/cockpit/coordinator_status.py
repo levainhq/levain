@@ -168,9 +168,12 @@ _band_cache: dict[str, tuple[float, tuple[str, str] | None]] = {}
 
 
 def _band_install(setting: dict[str, Any] | None) -> tuple[Path, str] | None:
-    """``(install whose band hooks the coordinator runs, agent)``, or ``None`` when there is no install to check."""
+    """``(install whose band hooks the coordinator runs, agent)``, or ``None`` when there is no install to check: a
+    setting naming an agent no longer launched (codex, removed) is never probed as a Claude Code workspace."""
     from levain.coordinator.launch import default_coordinator_dir
 
+    if (setting or {}).get("agent") not in (None, "claude", "none"):
+        return None
     install = Path((setting or {}).get("cwd") or default_coordinator_dir())
     return (install, "claude_code") if (install / "CLAUDE.md").is_file() else None
 
@@ -184,6 +187,9 @@ def band_row(setting: dict[str, Any] | None, now: float | None = None) -> RowIn 
     from levain.cockpit.coordinator_panels import _row
     from levain.coordinator.launch import band_failure
 
+    if (setting or {}).get("agent") == "codex":
+        # a setting an install upgraded from 0.11.15 still holds: no band renders, and the row names why
+        return _row("band", "NEEDS YOU band", "Codex coordinator removed", " · fix: levain coord agent claude")
     found = _band_install(setting)
     if found is None:
         return None

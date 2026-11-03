@@ -1496,10 +1496,10 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     from levain.coordinator import door
     from levain.coordinator.lease import check_model
 
-    check_model(args.model)          # before any install is made for it (the setting checks it again as it is written)
-    if args.agent == "codex":
+    if args.agent == "codex":        # before the model check: the removal is the reason, whatever the model says
         raise CoordError("a Codex coordinator was removed: set claude or none. A Codex session you run yourself is "
                          "still wrapped by the consent queue, and `levain session codex` runs one as a worker")
+    check_model(args.model)          # before any install is made for it (the setting checks it again as it is written)
     if args.agent != "claude":
         raise CoordError(f"a {args.agent} coordinator cannot be launched yet; set claude or none")
     from levain.coordinator.launch import default_coordinator_dir, setup_install, trust_remedy

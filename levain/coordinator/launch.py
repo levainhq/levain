@@ -1172,6 +1172,11 @@ def watch_once(store: CoordStore) -> list[str]:
     """One pass of ``levain coord watch``; the lines say what it did (the watch's first pass is preceded by
     :func:`migrate_setting`). In order:
 
+      (a0) every coordinator launch of a harness other than claude (a Codex coordinator an install upgraded from
+           0.11.15 still holds) is retired through the store's own end, cause ``codex coordinator removed``: an
+           ``active`` one is written ``ended``, so the lease its session held is released and every coordinator verb
+           it sends after is refused by the fence (its process is not stopped: Levain no longer speaks to it); a
+           ``pending`` one is written ``failed`` at once rather than left to expire. Neither is a death;
       (a) every pending coordinator launch no process has claimed the spawn of is started (:func:`launch_session`;
           its one-spawner compare-and-set makes a double start impossible), so a drop written from the phone or the
           cockpit, which start nothing themselves, still gets its coordinator. A claude worker launch that names a
@@ -1271,12 +1276,32 @@ def _single_flight(directory: Path) -> Iterator[bool]:
         mine.release()
 
 
+def _retire_removed(store: CoordStore, lines: list[str]) -> None:
+    """(a0) of :func:`watch_once`: end every active, and fail every pending, coordinator launch whose harness is not
+    claude, cause :data:`levain.coordinator.lease.CODEX_REMOVED`. A launch that moved on since it was read is a line,
+    never a raise; one already over is not read again, so a second pass writes nothing."""
+    over = [(ln, "ended") for ln in store.launches_active() if ln.role == "coordinator" and ln.harness != "claude"]
+    pending = {ln.launch_id: ln for ln in store.launches_unspawned()}
+    newest = store.pending_coordinator()           # one whose spawn an older launcher claimed is not unspawned
+    if newest is not None:
+        pending.setdefault(newest.launch_id, newest)
+    over += [(ln, "failed") for ln in pending.values() if ln.role == "coordinator" and ln.harness != "claude"]
+    for ln, kind in over:
+        try:
+            store.launch_end(ln.launch_id, kind, lease_mod.CODEX_REMOVED)
+        except (CoordError, sqlite3.Error) as exc:
+            lines.append(f"launch {ln.launch_id}: a {ln.harness} coordinator, not retired ({exc})")
+            continue
+        lines.append(f"launch {ln.launch_id} {kind}: {lease_mod.CODEX_REMOVED} (its lease, if it held one, released)")
+
+
 def _watch_pass(store: CoordStore, lines: list[str]) -> None:
     """(a)-(e) of :func:`watch_once`, its lines appended to ``lines``; it returns early when ``claude`` cannot be
     read."""
     # lapses and expiries are written first: a launch whose starter was killed outright stays pending until someone
     # writes it expired, and only then does (d) stop the session it left
     store.coord_status()
+    _retire_removed(store, lines)
     for ln in store.launches_unspawned():
         if ln.harness != "claude":
             lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude is built, left pending")
