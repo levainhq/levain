@@ -227,7 +227,7 @@ def create(queue_dir: Path | str, name: str, source: str | None = None, *, max_p
     live tokens and cannot change afterwards. ``urgent=True`` is the only way a token may post an urgent notice, and it
     raises the ceiling to ``urgent``; ``max_priority="urgent"`` without it is a refusal. ``origin`` is ``token`` (a service
     the operator gave a key: its links show in full) or ``flow`` (flow's own poster: it may name the notice's source, and
-    its links render as Levain's own); the HTTP mint route never takes it, the operator's terminal does."""
+    its links render as Levain's own); the HTTP mint route never takes it."""
     if origin not in ("token", "flow"):
         raise NotifyTokenError("a token's origin is token or flow")
     if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name != name.strip():

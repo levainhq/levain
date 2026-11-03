@@ -1,5 +1,5 @@
 """The notify endpoint (N2): ``POST /notify`` on a real server over a scratch queue, its delivery through the existing
-push and held paths, the token admin routes and the ``levain notify token`` CLI. Built from the hand runs of the N2 brief:
+push and held paths, the token admin routes and the ``levain notify token list`` CLI. Built from the hand runs of the N2 brief:
 curl-shaped posts for every status, the confinement of a notify token to its one route, the fixed tag and link on the
 enqueued ping, and a held notice released by the existing flush with a summary that names its sources."""
 from __future__ import annotations
@@ -641,54 +641,25 @@ def test_no_response_or_log_line_carries_a_token(rig, caplog, capfd):
     assert tok not in json.dumps(PushStore(q).notices()) and tok not in json.dumps(PushStore(q).record())
 
 
-# ---- the mint CLI ---------------------------------------------------------------------------------------------------
+# ---- the list CLI ---------------------------------------------------------------------------------------------------
 
-def test_the_mint_cli_round_trips_against_a_scratch_queue_and_the_server(rig, capsys):
-    src, q = rig
-    assert main(["notify", "token", "mint", "--name", "Flow Hub", "--urgent", "--queue-dir", str(q), "--json"]) == 0
-    out = json.loads(capsys.readouterr().out)
-    tok = out["token"]
-    assert tok.startswith("lvn_") and out["record"]["source"] == "flow-hub" and out["record"]["urgent"] is True
-    assert tok not in (q / "webpush" / nt.FILE_NAME).read_text()
-    assert nt.verify(q, tok)["name"] == "Flow Hub"
-    # the plain form prints the token once, the curl and the alias
-    assert main(["notify", "token", "mint", "--name", "Plain", "--queue-dir", str(q)]) == 0
-    text = capsys.readouterr().out
-    assert "shown once" in text and "X-Levain-Notify-Token" in text and "Authorization: Bearer" in text
-    # list: no secret
+def test_the_list_cli_shows_the_live_tokens_and_never_a_secret(rig, capsys):
+    _src, q = rig
+    _rec, tok = nt.create(q, "Flow Hub", urgent=True)
+    nt.create(q, "Plain")
     assert main(["notify", "token", "list", "--queue-dir", str(q)]) == 0
     listing = capsys.readouterr().out
     assert "Flow Hub" in listing and "Plain" in listing and tok not in listing
     assert main(["notify", "token", "list", "--queue-dir", str(q), "--json"]) == 0
     assert [r["name"] for r in json.loads(capsys.readouterr().out)] == ["Flow Hub", "Plain"]
-    # the server over the same queue accepts the minted token, then refuses it once the CLI revokes it
-    with _signed(src, q) as (port, _):
-        assert _post(port, {"body": "x", "priority": "low"}, token=tok)[0] == 200
-        assert main(["notify", "token", "revoke", "Flow Hub", "--queue-dir", str(q)]) == 0
-        assert "revoked" in capsys.readouterr().out
-        assert _post(port, {"body": "x", "priority": "low"}, token=tok)[0] == 403
-    assert main(["notify", "token", "revoke", "Flow Hub", "--queue-dir", str(q)]) == 1
-    assert main(["notify", "token", "mint", "--name", "Plain", "--queue-dir", str(q)]) == 2        # a live name is taken
-    assert "already exists" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("extra", [["--max-priority", "urgent"], ["--rate-per-min", "0"], ["--source", "Bad Label"]])
-def test_the_mint_cli_refuses_a_bad_request_and_mints_nothing(rig, capsys, extra):
+@pytest.mark.parametrize("verb", [["mint", "--name", "x"], ["revoke", "x"]])
+def test_the_terminal_mint_and_revoke_verbs_are_gone(rig, verb):
     _src, q = rig
-    assert main(["notify", "token", "mint", "--name", "x", "--queue-dir", str(q), *extra]) == 2
+    with pytest.raises(SystemExit):
+        main(["notify", "token", *verb, "--queue-dir", str(q)])
     assert nt.list_public(q) == []
-
-
-def test_the_mint_cli_is_refused_inside_an_agent_session(rig, capsys, monkeypatch):
-    from levain.consent import band
-
-    _src, q = rig
-    _mint(q, "Hub")
-    monkeypatch.setattr(band, "agent_process", lambda: object())
-    assert main(["notify", "token", "mint", "--name", "mine", "--queue-dir", str(q)]) == 2
-    assert main(["notify", "token", "revoke", "Hub", "--queue-dir", str(q)]) == 2
-    assert [r["name"] for r in nt.list_public(q)] == ["Hub"]
-    assert main(["notify", "token", "list", "--queue-dir", str(q)]) == 0          # a read is open
 
 
 # ---- L3 r1: a token that is not live never holds a request slot ------------------------------------------------------
