@@ -11,14 +11,19 @@ from tests.test_pair_card_w1b import _drive, needs_browser
 
 PHONE = {"emulate": {"w": 430, "h": 932, "dpr": 2, "mobile": True}}
 SHEET = "document.getElementById('pr-sheet')"
-# a one-finger drag from `el` straight down by each dy in turn (one touchstart, a touchmove per dy, one touchend)
+# a one-finger drag from `el` straight down by each dy in turn (one touchstart, a touchmove per dy, one touchend). The events are
+# dispatched back to back, so the helper's Date.now()-based flick speed would otherwise depend on which millisecond each event
+# lands in (a short drag read as a fast flick about 1 run in 40); Date.now is held to a 100 ms step per event for the drag.
 DRAG = r"""window.__drag = (el, dys, x) => {
   const r = el.getBoundingClientRect(); const cx = x == null ? r.left + 20 : x; const y0 = r.top + 6;
   const mk = (type, y) => { const t = new Touch({identifier: 1, target: el, clientX: cx, clientY: y});
     return new TouchEvent(type, {touches: type === 'touchend' ? [] : [t], changedTouches: [t], bubbles: true, cancelable: true}); };
-  el.dispatchEvent(mk('touchstart', y0)); let prevented = 0;
-  for (const dy of dys) { const ev = mk('touchmove', y0 + dy); el.dispatchEvent(ev); if (ev.defaultPrevented) prevented++; }
-  el.dispatchEvent(mk('touchend', y0 + dys[dys.length - 1])); return prevented; }; 1"""
+  const realNow = Date.now; let clock = realNow.call(Date); Date.now = () => clock;
+  try {
+    el.dispatchEvent(mk('touchstart', y0)); let prevented = 0;
+    for (const dy of dys) { clock += 100; const ev = mk('touchmove', y0 + dy); el.dispatchEvent(ev); if (ev.defaultPrevented) prevented++; }
+    clock += 100; el.dispatchEvent(mk('touchend', y0 + dys[dys.length - 1])); return prevented;
+  } finally { Date.now = realNow; } }; 1"""
 
 
 def test_the_helper_is_shared_and_the_presence_sheet_opts_in():
