@@ -15,7 +15,7 @@ from tests.test_cockpit_narrow_layout_rig import (DESKTOP, NEEDS, PHONE_TOUCH, S
 
 HIT_MIN = 44   # the stylesheet's --hit-min
 GRANTS_HEAD = "[...document.querySelectorAll('#levain-modal .ext-grouphead')].find(h => /standing grants/.test(h.textContent))"
-NOTES = "[...document.querySelectorAll('.card, .panel, section, div')].find(e => /^Notification record/.test(e.textContent.trim()) && e.textContent.length < 400)"
+NOTES = "[...document.querySelectorAll('.card, .panel, section, div')].find(e => /^Notifications/.test(e.textContent.trim()) && e.textContent.length < 400)"
 
 
 def _look(out_dir: Path, name: str, find: str) -> list:

@@ -117,8 +117,7 @@ def _review_row(i: Any, now: datetime) -> RowIn:
 
     label = review.FEED_LABELS.get(i.feed, i.feed)
     mine = " · yours to clear" if i.authority_relevant else ""
-    body = review.body_fields(i)
-    text = str(body.get("text") or body.get("summary") or body.get("reason") or "").strip()
+    text = review.item_text(i)
     if i.state == "cleared" and i.last is not None:
         head = f"{label} · cleared {_age(i.last[3], now)}{mine}"
     else:

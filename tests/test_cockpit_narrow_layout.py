@@ -1,6 +1,6 @@
 """OS-3, the narrow layout: at a phone's width (390, touch) the cockpit draws the strip that jumps to each phone view, puts what waits
 on him before the graph, keeps every view's content one tap away and never scrolls sideways; at a desktop's width (1440) the strip
-is not drawn and the order is the wide page's own. Browser tests: each drives the page once over the narrow-layout rig."""
+the strip is drawn too (S4.2) and the order is the wide page's own. Browser tests: each drives the page once over the narrow-layout rig."""
 from __future__ import annotations
 
 import json
@@ -13,7 +13,7 @@ from tests.test_cockpit_narrow_layout_rig import (DESKTOP, NEEDS, PHONE_TOUCH, S
 CSS = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.css"
 HTML = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.html"
 
-TABS = ["needs", "board", "notes", "grants", "drop"]
+TABS = ["needs", "board", "notifications", "grants", "drop"]
 
 # where things sit and how the strip draws, as one JSON string
 LAYOUT = """(() => { const q = (s) => document.querySelector(s);
@@ -40,7 +40,9 @@ def test_a_phone_gets_the_strip_the_needs_first_and_a_jump_to_each_page_view(tmp
     url = f"{rig.origin}/#write_token={TOK}"
     steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, SETTLE, {"eval": LAYOUT},
              *_jump("needs", "#ck-needs"), *_jump("board", ".panel[data-ck-panel=\"tray\"]"),
-             *_jump("notes", ".panel[data-ck-panel=\"notifications\"]")]
+             {"eval": "document.querySelector('[data-phone-jump=notifications]').click(); 1"},
+             {"until": "document.querySelector('#levain-modal .nc-root') && 1", "ms": 20000},
+             {"eval": "JSON.stringify({ which: 'notifications', modal: !!document.querySelector('#levain-modal .nc-root') })"}]
     with rig.serving():
         values = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
     layout, jumps = values[0], {v["which"]: v for v in values[1:]}
@@ -54,10 +56,10 @@ def test_a_phone_gets_the_strip_the_needs_first_and_a_jump_to_each_page_view(tmp
     assert layout["stripTop"] < layout["band"] < layout["needs"] < layout["sky"], layout
     # the drop sits directly under the strip (Phill 10-30), before the graph
     assert layout["needs"] < layout["drop"] < layout["sky"], layout
-    # the board and notification tabs land their block below the sticky strip; needs is at the top already
-    for which in ("board", "notes"):
-        j = jumps[which]
-        assert j["top"] is not None and 40 <= j["top"] < 140 and j["y"] > 0, j
+    # the board tab lands its block below the sticky strip; needs is at the top already; Notifications opens the center's focus view (S4.2)
+    j = jumps["board"]
+    assert j["top"] is not None and 40 <= j["top"] < 140 and j["y"] > 0, j
+    assert jumps["notifications"]["modal"] is True, jumps["notifications"]
     assert jumps["needs"]["top"] is not None and 40 <= jumps["needs"]["top"] < 140, jumps["needs"]
 
 
@@ -144,15 +146,15 @@ def _hidden_jump(mode: str, which: str, panel: str) -> list:
 
 @needs_browser
 @needs_ssh
-def test_the_board_and_notification_tabs_reveal_a_panel_the_saved_tab_hides(tmp_path: Path, monkeypatch) -> None:
+def test_the_board_tab_reveals_a_panel_the_saved_tab_hides(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
     steps = [*PHONE_TOUCH, {"until": NEEDS, "ms": 30000}, SETTLE]
     for mode in ("build", "memory"):
-        steps += _hidden_jump(mode, "board", ".panel[data-ck-panel=\"tray\"]") + _hidden_jump(mode, "notes", ".panel[data-ck-panel=\"notifications\"]")
+        steps += _hidden_jump(mode, "board", ".panel[data-ck-panel=\"tray\"]")
     with rig.serving():
         got = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
-    assert len(got) == 4, got
+    assert len(got) == 2, got
     for g in got:
         assert not g["drawnBefore"], g   # the saved tab really hid it
         assert g["drawnAfter"] and g["tab"] == "board" and 40 <= g["top"] < 140, g   # the tap revealed its tab and landed under the strip
@@ -160,7 +162,7 @@ def test_the_board_and_notification_tabs_reveal_a_panel_the_saved_tab_hides(tmp_
 
 @needs_browser
 @needs_ssh
-def test_a_desktop_draws_no_strip_and_keeps_the_graph_above_the_needs(tmp_path: Path, monkeypatch) -> None:
+def test_a_desktop_draws_the_strip_and_keeps_the_graph_above_the_needs(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     url = f"{rig.origin}/#write_token={TOK}"
     with rig.serving():
@@ -168,17 +170,17 @@ def test_a_desktop_draws_no_strip_and_keeps_the_graph_above_the_needs(tmp_path: 
                                      {"emulate": {"w": 721, "h": 900, "dpr": 1}}, SETTLE, {"eval": LAYOUT}])["values"]
     layouts = [json.loads(v) for v in out if isinstance(v, str) and v.startswith("{")]
     assert len(layouts) == 2, layouts
-    for layout in layouts:   # the widest width the narrow block does not reach draws what the desktop does
-        assert layout["display"] == "none" and layout["heroDisplay"] != "contents", layout
+    for layout in layouts:   # the widest width the narrow block does not reach draws what the desktop does, and the strip at every width (S4.2)
+        assert layout["display"] == "flex" and layout["position"] == "sticky" and layout["heroDisplay"] != "contents", layout
         assert layout["band"] < layout["sky"] < layout["needs"], layout   # the wide page's own order
 
 
-def test_the_strip_is_hidden_by_default_and_drawn_only_in_the_narrow_block() -> None:
+def test_the_strip_is_hidden_by_default_and_drawn_in_the_narrow_block_and_the_wide_one() -> None:
     css = CSS.read_text()
     assert re.search(r"(^|\n)\.ck-phonetabs\s*\{\s*display:\s*none\s*;?\s*\}", css)
     narrow = css.split("OS-3: THE NARROW LAYOUT", 1)[1]
     blocks = narrow.split("@media")[1:]
     drawn = [b for b in blocks if re.search(r"\.ck-phonetabs\s*\{[^}]*display:\s*flex", b)]
-    assert len(drawn) == 1 and drawn[0].lstrip().startswith("(max-width: 720px)"), "the strip is drawn in one block: the 720px break"
+    assert len(drawn) == 2 and {d.lstrip().split(")", 1)[0] for d in drawn} == {"(max-width: 720px", "(min-width: 721px"}, "the strip is drawn at every width: the 720px break and the one above it"
     html = HTML.read_text()
     assert [html.count(f'data-phone-jump="{t}"') for t in TABS] == [1] * len(TABS)

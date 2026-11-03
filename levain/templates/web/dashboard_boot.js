@@ -964,7 +964,8 @@
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "visible") load({ passive: true });
   });
-  load();
+  // the first read settles (drawn, refused or failed): the cold-start placeholder under #store (data-cold, dashboard.css) goes
+  load().finally(function () { if (storeEl) storeEl.removeAttribute("data-cold"); });
 })();
 
 // CH-U1a: the Build tab's Threads zone. The coordinator's threads and one thread's stream, read-only, drawn by
