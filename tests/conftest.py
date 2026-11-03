@@ -338,6 +338,11 @@ def _no_real_routes_trust_helper():
         yield
 
 
+#: ``LEVAIN_SEAT`` as the run found it, read once when this file is imported (before any test runs),
+#: so a value a test leaked can never become the baseline the next test restores.
+_RUN_SEAT_AT_IMPORT = os.environ.get("LEVAIN_SEAT")
+
+
 @pytest.fixture(autouse=True)
 def _reset_entity_process_latch():
     """`$LEVAIN_ENTITY_PROCESS` is a one-way latch by design (spore-438): opening an entity sets it
@@ -352,7 +357,7 @@ def _reset_entity_process_latch():
     the run started with, so an operator's own marker survives."""
     import levain.firing.binding as _binding
 
-    seat_before = os.environ.get("LEVAIN_SEAT")
+    seat_before = _RUN_SEAT_AT_IMPORT
 
     def _reset():
         os.environ.pop("LEVAIN_ENTITY_PROCESS", None)
