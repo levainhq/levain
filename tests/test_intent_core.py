@@ -25,6 +25,13 @@ def _push(q, kind, idle, now=NOW):
     return presence.should_push(q, kind, now=now, idle=_idle(idle), suggest=False)
 
 
+def _push_msg(q, kind, since, now=NOW):
+    """1a (Phill 11-03): follow reads the newest typed desk message, so ``since`` is how long ago he last sent one. The laptop's own
+    input is held at 0 s to show it changes nothing."""
+    desk._write(q, desk.DESK_MESSAGE_NAME, {"at": now - since, "source": "test", "desk": ""})
+    return presence.should_push(q, kind, now=now, idle=_idle(0.0), suggest=False)
+
+
 def test_presets_write_exactly_their_table_and_back_clears_the_overlay_but_not_a_standing_loud(tmp_path):
     q = tmp_path
     want = {"away": ("everything", {"kind": "input"}),
@@ -53,13 +60,13 @@ def test_presets_write_exactly_their_table_and_back_clears_the_overlay_but_not_a
 
 def test_follow_pushes_at_the_threshold_and_not_before_and_a_custom_time_applies(tmp_path):
     q = tmp_path
-    assert _push(q, "consent", 599.0).push is False      # the default base: follow, 600 s
-    assert _push(q, "consent", 600.0).push is True
-    assert _push(q, "consent", 5.0).push is False        # input again: devices off
+    assert _push_msg(q, "consent", 599.0).push is False      # the default base: follow, 600 s
+    assert _push_msg(q, "consent", 600.0).push is True
+    assert _push_msg(q, "consent", 5.0).push is False        # a desk message again: the desk
     intent.apply_settings(q, devices="follow", follow_after="15m", now=NOW, idle=_idle(5.0))   # his standing default
     assert _doc(q)["base"]["follow_after"] == 900 and _doc(q)["overlay"] is None
-    assert _push(q, "consent", 899.0).push is False
-    assert _push(q, "consent", 900.0).push is True
+    assert _push_msg(q, "consent", 899.0).push is False
+    assert _push_msg(q, "consent", 900.0).push is True
     assert "after 15 min" in intent.describe_line(q, now=NOW, idle=_idle(5.0))
 
 
@@ -214,14 +221,14 @@ def test_an_attention_item_pushes_while_he_is_active_at_the_laptop_and_when_devi
     q = tmp_path
     attention = ("attention", "dated", "notify_urgent")
     for kind in attention:
-        assert _push(q, kind, 5.0).push is True, kind                      # follow, input 5 s ago: the desk is active
-    assert _push(q, "notify", 5.0).push is False                           # other: held as before
-    assert _push(q, "consent", 5.0).push is False                          # approvals follow the record (the design question is the operator's)
+        assert _push_msg(q, kind, 5.0).push is True, kind                      # follow, input 5 s ago: the desk is active
+    assert _push_msg(q, "notify", 5.0).push is False                           # other: held as before
+    assert _push_msg(q, "consent", 5.0).push is False                          # approvals follow the record (the design question is the operator's)
     intent.apply_settings(q, devices="off", now=NOW, idle=_idle(5.0))      # pings off
     for kind in attention:
-        assert _push(q, kind, 5.0).push is True, kind
-    assert _push(q, "notify", 5.0).push is False and _push(q, "consent", 5.0).push is False
+        assert _push_msg(q, kind, 5.0).push is True, kind
+    assert _push_msg(q, "notify", 5.0).push is False and _push_msg(q, "consent", 5.0).push is False
     intent.apply_settings(q, devices="follow", lets_through="approvals", now=NOW, idle=_idle(5.0))   # a mute for attention: stays muted
     for kind in attention:
-        got = _push(q, kind, 5.0)
+        got = _push_msg(q, kind, 5.0)
         assert (got.push, got.state) == (False, "muted"), kind

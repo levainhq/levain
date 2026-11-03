@@ -579,18 +579,19 @@ def test_the_remote_word_is_refused_with_a_message_and_a_token_that_lists_it_fai
         assert _call(port, "POST", SET, {"word": "away"}, headers=_tap(tok))[0] == 200
 
 
-def test_the_view_agrees_with_the_push_decision_as_the_laptop_goes_idle(rig, monkeypatch):
+def test_the_view_agrees_with_the_push_decision_as_the_last_desk_message_ages(rig, monkeypatch):
+    from levain.webpush import desk
+
     src, q = rig
-    idle = [5.0]
-    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: idle[0])
     with _signed(src, q) as (port, _):
+        desk._write(q, desk.DESK_MESSAGE_NAME, {"at": time.time() - 5, "source": "test", "desk": ""})   # he typed to a desk just now
         got = _call(port, "GET", GET, token=T)[1]
         assert (got["state"], got["pushing"], got["source"], got["since"]) == ("holding", False, "measured", None)
         assert got["pushing"] is presence.should_push(q, "ping", suggest=False).push and got["chip"]["state"] == "desk"
-        idle[0] = 900.0                                             # the desk went idle: the same record now pushes
+        desk._write(q, desk.DESK_MESSAGE_NAME, {"at": time.time() - 900, "source": "test", "desk": ""})   # 15 min on: the same record pushes
         got = _call(port, "GET", GET, token=T)[1]
-        assert (got["state"], got["pushing"], got["source"]) == ("pushing", True, "measured") and "no input for 15 min" in got["reason"]
-        assert got["you"]["state"] == "away" and got["desk"]["live"] is False and got["chip"]["state"] == "devices"
+        assert (got["state"], got["pushing"], got["source"]) == ("pushing", True, "measured") and "no desk message for 15 min" in got["reason"]
+        assert got["you"]["state"] == "here" and got["desk"]["live"] is False and got["chip"]["state"] == "devices"   # laptop input (5 s) is not the desk
         _call(port, "POST", SET, {"preset": "quiet", "for": "1h"}, token=T)
         got = _call(port, "GET", GET, token=T)[1]
         assert got["source"] == "word" and abs(got["since"] - time.time()) < 30 and got["effective"]["lets_through"] == "needs"
@@ -607,11 +608,53 @@ def _chip_when(rig, tmp_path, monkeypatch, idle_secs):
 
 @needs_browser
 def test_the_chip_paints_the_servers_chip_not_a_state_of_its_own(rig, tmp_path, monkeypatch):
-    assert _chip_when(rig, tmp_path, monkeypatch, 900.0) == ("Follow → devices", "devices")    # away from the laptop: follow reads devices
-    assert _chip_when(rig, tmp_path, monkeypatch, 5.0) == ("Follow → desk", "desk")            # at the laptop: the desk
+    # 1a (Phill 11-03): laptop input of any age is not a desk message, so Follow stays on devices
+    assert _chip_when(rig, tmp_path, monkeypatch, 900.0) == ("Follow → devices", "devices")
+    assert _chip_when(rig, tmp_path, monkeypatch, 5.0) == ("Follow → devices", "devices")
 
 
 def test_the_panel_copy_says_what_the_next_setting_does_and_what_the_standing_default_is():
     js = _asset("devices_panel.js")
     assert "then goes back to I switch it" in js and "What Back returns to" in js
     assert "paintChip" in js and "v.line" in js
+
+
+def test_laptop_input_never_returns_follow_to_the_desk_only_a_typed_desk_message_does(rig, monkeypatch):
+    """Phill 11-03 "1a": keyboard, mouse and a screen wake are not a desk message. Every reader (a cockpit on the laptop, one on the
+    phone, the terminal line) gets this from the one server derivation."""
+    from levain.webpush import desk
+
+    src, q = rig
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 0.0)       # input at the laptop just now
+    with _signed(src, q) as (port, _):
+        for _reader in ("laptop page", "phone page"):
+            got = _call(port, "GET", GET, token=T)[1]
+            assert got["chip"]["state"] == "devices" and got["pushing"] is True, got["line"]
+        assert got["line"] == intent.describe_line(q, idle=lambda: 0.0)                       # the terminal's sentence is the same
+        desk.note_desk_message(q, "test")
+        for _reader in ("laptop page", "phone page"):
+            got = _call(port, "GET", GET, token=T)[1]
+            assert got["chip"]["state"] == "desk" and got["pushing"] is False and "desk message just now" in got["reason"], got["line"]
+
+
+@needs_browser
+def test_an_open_page_follows_the_server_across_follow_after_without_a_reload(rig, tmp_path, monkeypatch):
+    """A cockpit left open (a phone's) re-reads the server's one derivation on a short pulse. A desk message sits just inside
+    ``follow_after``; the clock carries it past while the page is open, and the chip must flip with no reload, well inside the old
+    half-minute pulse (the wait is ms * LEVAIN_TEST_WAIT_SCALE, kept under 30 s at the CI scale of 2)."""
+    monkeypatch.setenv("LEVAIN_TEST_WAIT_SCALE", "2")
+    from levain.webpush import desk
+
+    src, q = rig
+    intent.apply_settings(q, devices="follow", follow_after=60)
+    desk.note_desk_message(q, "test", now=time.time() - 52)
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000},
+            {"eval": _CHIP_TEXT},
+            {"eval": "performance.getEntriesByType('navigation').length"},
+            {"until": f"{_CHIP_TEXT} === 'Follow → devices'", "ms": 10000},
+            {"eval": "performance.getEntriesByType('navigation').length"},
+        ])
+    v = out["values"]
+    assert v[1] == "Follow → desk" and v[2] == v[-1] == 1, v

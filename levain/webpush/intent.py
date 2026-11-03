@@ -6,7 +6,7 @@ one another, and the operator feeling in control of how residue and approvals re
 
 ``<queue_dir>/webpush/intent.json`` (0600, written only here) holds two layers, each carrying the same three settings:
 
-- ``devices``: ``on`` | ``off`` | ``follow`` (follow: devices on after ``follow_after`` seconds of no laptop input);
+- ``devices``: ``on`` | ``off`` | ``follow`` (follow: devices on after ``follow_after`` seconds without a typed desk message);
 - ``follow_after``: seconds, 60 to 86400 (default 600), used only under ``follow``;
 - ``lets_through``: ``everything`` ⊃ ``needs`` (approvals + attention) ⊃ ``approvals`` ⊃ ``nothing``.
 
@@ -293,10 +293,11 @@ def _ago(secs: float) -> str:
     return "just now" if m < 1 else f"{m} min ago"
 
 
-def devices_on_now(eff: dict, reading: float | None, remote: dict | None, now: float) -> tuple[bool, str]:
-    """``(on, why)``: whether pings go to his devices under the effective settings ``eff`` at ``now``. ``reading`` is the
-    laptop's input idle seconds (a desk message counted as input), ``None`` when unknown. Remote input feeds ``follow`` only
-    and never counts as the desk. ``eff`` may carry ``preset`` and ``layer`` (``overlay``): they only name the reason."""
+def devices_on_now(eff: dict, desk_msg_at: float | None, remote: dict | None, now: float) -> tuple[bool, str]:
+    """``(on, why)``: whether pings go to his devices under the effective settings ``eff`` at ``now``. ``follow`` returns to the
+    desk ONLY on a typed desk message (Phill 11-03, "1a"): laptop keyboard or mouse input, a screen wake included, never counts.
+    ``desk_msg_at`` is the newest desk message's clock time, ``None`` when there is none. Remote input feeds ``follow``
+    only and never counts as the desk. ``eff`` may carry ``preset`` and ``layer`` (``overlay``): they only name the reason."""
     d = eff["devices"]
     if d == "on":
         if eff.get("preset"):
@@ -304,15 +305,16 @@ def devices_on_now(eff: dict, reading: float | None, remote: dict | None, now: f
         return True, "set for a while" if eff.get("layer") == "overlay" else "devices on"
     if d == "off":
         return False, "devices off"
-    if reading is None:
-        return True, "follow: no laptop input reading"
     rage = _remote_fresh(remote, now)
     if rage is not None:
         what = "remote terminal input" if remote["source"] == "remote-terminal" else "remote control turn"
         return True, f"follow: {what} {int(rage // 60)} min ago"
-    if reading >= eff["follow_after"]:
-        return True, f"follow: no input for {int(reading // 60)} min"
-    return False, f"follow: input at the laptop {_ago(reading)}"
+    if desk_msg_at is None:
+        return True, "follow: no desk message"
+    age = max(0.0, now - desk_msg_at)
+    if age >= eff["follow_after"]:
+        return True, f"follow: no desk message for {int(age // 60)} min"
+    return False, f"follow: desk message {_ago(age)}"
 
 
 def _eff(rec: dict, now: float, reading: float | None, desk_msg_at: float | None) -> tuple[dict, dict | None, str | None]:
@@ -327,7 +329,7 @@ def _eff(rec: dict, now: float, reading: float | None, desk_msg_at: float | None
 def decide(now: float, rec: dict, reading: float | None, *, class_name: str, remote: dict | None = None,
            desk_msg_at: float | None = None, filed: bool = False) -> Decision:
     """Whether a ping of ``class_name`` is pushed at ``now``. Pure. ``rec`` is a :func:`read` result; ``reading`` the laptop
-    idle seconds with a desk message counted as input. ``filed``: the ping is about a request already FILED and waiting
+    idle seconds (it feeds the ``until: input`` overlays only; ``follow`` reads ``desk_msg_at``, Phill 11-03 "1a"). ``filed``: the ping is about a request already FILED and waiting
     for a signed answer (an approval-class ping from a consent hook or gate), which goes whatever the desk or devices
     setting is doing (only a mute holds it). A fault reads as push (a ping he did not need costs one notification, one
     he needed and never got costs the day)."""
@@ -339,7 +341,7 @@ def _decide(now: float, rec: dict, reading: float | None, class_name: str, remot
     if rec["status"] == "fault":
         return Decision(True, "pushing", _FAULT_WHY), "measured"
     eff, ov, _ended = _eff(rec, now, reading, desk_msg_at)
-    on, why = devices_on_now(eff, reading, remote, now)
+    on, why = devices_on_now(eff, desk_msg_at, remote, now)
     preset = (ov or {}).get("preset") or ""
     source = "word" if ov is not None else "measured"
     if class_name not in LETS_CLASSES[eff["lets_through"]]:
@@ -518,7 +520,7 @@ def _state(queue_dir: Path | str | None, s: dict) -> dict:
     if rec["status"] == "fault":
         return {"fault": True, "rec": rec}
     eff, ov, ended = _eff(rec, now, reading, s["msg_at"])
-    on, why = devices_on_now(eff, reading, s["remote"], now)
+    on, why = devices_on_now(eff, s["msg_at"], s["remote"], now)
     lets = eff["lets_through"]
     goes = on and lets != "nothing"
     if lets == "nothing":

@@ -45,6 +45,13 @@ def idle(monkeypatch):
     return now
 
 
+def _msg(qdir, secs):
+    """1a (Phill 11-03): follow reads the newest typed desk message, so a laptop reading of ``secs`` is a message that old."""
+    from levain.webpush import desk
+
+    desk._write(qdir, desk.DESK_MESSAGE_NAME, {"at": time.time() - secs, "source": "test", "desk": ""})
+
+
 EVENTS = {
     "claude_code": (cc, {"hook_event_name": "PermissionRequest", "session_id": "s", "cwd": "/tmp", "tool_name": "Write",
                          "tool_input": {"file_path": "/tmp/x.txt", "content": "hi"}, "permission_mode": "default",
@@ -105,25 +112,25 @@ def test_the_word_off_mid_hold_releases_to_the_agents_dialog(qdir, idle, capsys)
 def test_input_idle_holds_and_input_releases(qdir, idle, capsys, tmp_path):
     # runs S0, I1 and X1: an init file (no word) holds while input idle is past the threshold, and stops holding
     # when input idle drops under it (lane B measured HIDIdleTime snapping to ~0 on input)
-    idle[0] = 700.0
+    _msg(qdir, 700.0)
     t, out, _ = _hook(cc, EVENTS["claude_code"][1], qdir)
     _wait_pending(qdir)
-    idle[0] = 2.0
+    _msg(qdir, 2.0)
     t.join(10)
     assert not t.is_alive() and out.getvalue() == ""
-    assert _row(qdir) == ("withdrawn", "away mode ended (follow: input at the laptop just now); the native dialog stands")
+    assert _row(qdir) == ("withdrawn", "away mode ended (follow: desk message just now); the native dialog stands")
     # run_h2 (a): an idle hold whose cockpit can no longer sign (its database gone) is released at the recheck
     (tmp_path / "own").mkdir()
     own = _cockpit(tmp_path / "own")
     settings = json.loads((qdir / cc.SETTINGS_NAME).read_text())
     (qdir / cc.SETTINGS_NAME).write_text(json.dumps({**settings, "cockpit_data_root": str(own)}))
-    idle[0] = 700.0
+    _msg(qdir, 700.0)
     t, out, _ = _hook(cc, {**EVENTS["claude_code"][1], "tool_use_id": "tu-2"}, qdir)
     _wait_pending(qdir)
     os.rename(own / "cockpit.db", own / "cockpit.db.gone")
     t.join(10)
     assert not t.is_alive() and out.getvalue() == "" and _row(qdir) == (
-        "withdrawn", "away mode ended (follow: no input for 11 min, but no enrolled key could sign an answer); "
+        "withdrawn", "away mode ended (follow: no desk message for 11 min, but no enrolled key could sign an answer); "
                      "the native dialog stands")
 
 
@@ -139,9 +146,10 @@ def test_the_record_decides_and_the_verbs_write_it(qdir, idle, capsys):
     (legacy / cx.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": root, "away_mode": False,
                                                        "away_hold_seconds": 90.0}, indent=2) + "\n")
     idle[0] = 4000.0
+    _msg(qdir.parent / 'legacy', 4000.0)
     cli(["consent", "away", "show", "--agent", "codex", "--queue-dir", str(legacy)])
     out = capsys.readouterr().out
-    assert "codex: away mode ON, holds up to 90s" in out and "set by follow: no input for 66 min" in out
+    assert "codex: away mode ON, holds up to 90s" in out and "set by follow: no desk message for 66 min" in out
     assert "follows your presence record" in out and out.rstrip().splitlines()[-1].startswith("Pings now: your devices")
     # the legacy path (a caller with no queue directory, for one release) still reads the word: explicit off
     assert auto_away.away_state(cx.load_settings(legacy), lambda: 4000.0)[:2] == (False, "word")
@@ -151,12 +159,13 @@ def test_the_record_decides_and_the_verbs_write_it(qdir, idle, capsys):
     assert "away mode ON, holds up to 90s" in capsys.readouterr().out  # the 0.11.4 hold is kept, not defaulted
     assert json.loads((legacy / cx.SETTINGS_NAME).read_text())["away_hold_seconds"] == 90.0
     idle[0] = 213.0
+    _msg(qdir, 213.0)
     cli(["consent", "away", "show", "--agent", "codex", "--queue-dir", str(qdir)])
     assert "codex: away mode off; answers verify against" in (out := capsys.readouterr().out)
-    assert "set by follow: input at the laptop 3 min ago" in out
+    assert "set by follow: desk message 3 min ago" in out
     assert cli(["consent", "away", "auto", "--idle-after", "120", "--agent", "codex", "--queue-dir", str(qdir)]) == 0
     assert "codex: away mode ON, holds up to 120s" in (out := capsys.readouterr().out)
-    assert "set by follow: no input for 3 min" in out and "Devices: follow, after 2 min." in out
+    assert "set by follow: no desk message for 3 min" in out and "Devices: follow, after 2 min." in out
     assert cli(["consent", "away", "on", "--idle-after", "5", "--queue-dir", str(qdir)]) == 2
     assert cli(["consent", "away", "auto", "--idle-after", "5", "--queue-dir", str(qdir)]) == 2   # under the follow floor
     assert "60 to 86400" in capsys.readouterr().err

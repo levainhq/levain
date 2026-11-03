@@ -12,7 +12,9 @@ import pytest
 from levain.consent import auto_away, away
 from levain.consent.adapters import claude_code as cc
 from levain.consent.adapters import codex as cx
-from levain.webpush import intent, presence
+import time
+
+from levain.webpush import desk, intent, presence
 from tests.test_consent_away import _cockpit, _key, _queue
 
 READINGS = (2.0, 899.0, 900.0, 5000.0, None)   # at the laptop · just under 15 min · at 15 min · long gone · no reading
@@ -42,6 +44,15 @@ def _scratch(tmp_path, cockpit):
     return q
 
 
+def _message_age(q, secs):
+    """1a (Phill 11-03): follow reads the newest typed desk message, so a reading of ``secs`` is a message that old (``None``: none)."""
+    path = q / "webpush" / desk.DESK_MESSAGE_NAME
+    if secs is None:
+        path.unlink(missing_ok=True)
+    else:
+        desk._write(q, desk.DESK_MESSAGE_NAME, {"at": time.time() - secs, "source": "test", "desk": ""})
+
+
 @pytest.mark.parametrize("agent,mod", [("claude_code", cc), ("codex", cx)])
 def test_consent_equals_push_and_the_hold_is_zero_exactly_when_false(tmp_path, cockpit, agent, mod):
     q = _scratch(tmp_path, cockpit)
@@ -50,6 +61,7 @@ def test_consent_equals_push_and_the_hold_is_zero_exactly_when_false(tmp_path, c
         intent.apply_preset(q, "back")                  # each state starts from the standing record
         intent.apply_settings(q, devices="follow", follow_after=600, lets_through="everything")
         setup(q)
+        _message_age(q, reading)
         idle = (lambda r=reading: r)
         pushes = presence.should_push(q, "consent", idle=idle, suggest=False).push
         to_devices, why = intent.approvals_to_devices(q, idle=idle)
@@ -64,7 +76,10 @@ def test_consent_equals_push_and_the_hold_is_zero_exactly_when_false(tmp_path, c
         assert away_now[0] == (pushes and not blind) and away_now[1] == "intent", where
         assert hold in (0.0, auto_away.DEFAULT_HOLDS[agent]), where   # the length is per agent, never presence
     # a coverage check that the matrix is not all one answer
-    outcomes = {intent.approvals_to_devices(q, idle=lambda: r)[0] for r in READINGS}
+    outcomes = set()
+    for r in READINGS:
+        _message_age(q, r)
+        outcomes.add(intent.approvals_to_devices(q, idle=lambda: r)[0])
     assert outcomes == {True, False}
 
 
@@ -135,10 +150,11 @@ def test_the_hook_entry_points_hold_on_the_record_and_release_when_it_changes(tm
     t, out, _started = _hook(mod, event, q)
     _wait_pending(q)
     intent.apply_preset(q, "back")
+    desk.note_desk_message(q, "test")     # 1a: `back` is follow, and only a typed desk message returns follow to the desk
     t.join(10)
     assert not t.is_alive() and out.getvalue() == ""
     state, note = _row(q)
-    assert state == "withdrawn" and note.startswith("away mode ended (follow: input at the laptop just now)")
+    assert state == "withdrawn" and note.startswith("away mode ended (follow: desk message just now)")
 
 
 @pytest.mark.parametrize("setup", [lambda q: intent.apply_settings(q, devices="off"),

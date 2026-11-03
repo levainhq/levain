@@ -1,6 +1,7 @@
 """Held phone pings: queued when the presence rule holds them, released once when it next says push."""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -22,6 +23,14 @@ def _as_operator(monkeypatch):
     from levain.consent import band
 
     monkeypatch.setattr(band, "agent_process", lambda: None)
+
+
+def _typed(qdir, ago, now=NOW):
+    """1a (Phill 11-03): follow returns to the desk only on a typed desk message, so "at the laptop" is a message sent ``ago`` s before
+    ``now``; the laptop's own input counts for nothing."""
+    from levain.webpush import desk
+
+    desk._write(qdir, desk.DESK_MESSAGE_NAME, {"at": now - ago, "source": "test", "desk": ""})
 
 
 def _phone(qdir):
@@ -60,12 +69,14 @@ def test_active_held_pings_wait_for_the_window_then_push_once(tmp_path, monkeypa
     _phone(tmp_path)
     sent = _fake(monkeypatch)
     _hold(tmp_path, "active")
-    assert held.flush(tmp_path, now=NOW, idle=lambda: ACTIVE) == 0
-    assert held.due(tmp_path, now=NOW, idle=lambda: ACTIVE) is False
-    assert held.due(tmp_path, now=NOW, idle=lambda: INACTIVE) is True
-    assert held.flush(tmp_path, now=NOW, idle=lambda: INACTIVE) == 1
+    _typed(tmp_path, ACTIVE)
+    later = NOW + INACTIVE
+    assert held.flush(tmp_path, now=NOW, idle=lambda: 0.0) == 0
+    assert held.due(tmp_path, now=NOW, idle=lambda: 0.0) is False
+    assert held.due(tmp_path, now=later, idle=lambda: 0.0) is True
+    assert held.flush(tmp_path, now=later, idle=lambda: 0.0) == 1
     assert len(sent) == 1
-    assert held.flush(tmp_path, now=NOW, idle=lambda: INACTIVE) == 0   # at most once
+    assert held.flush(tmp_path, now=later, idle=lambda: 0.0) == 0   # at most once
     assert held.count(tmp_path) == 0
 
 
@@ -78,13 +89,15 @@ def test_a_quiet_that_ends_sends_one_summary_then_the_held_pings_once_his_device
     inside = NOW + 300
     assert held.flush(tmp_path, now=inside, idle=lambda: INACTIVE) == 0   # still quiet
     after = NOW + 700
-    assert held.flush(tmp_path, now=after, idle=lambda: ACTIVE) == 0   # the quiet is over, but he is at the laptop: follow keeps them for the desk
+    _typed(tmp_path, ACTIVE, now=after)
+    assert held.flush(tmp_path, now=after, idle=lambda: 0.0) == 0   # the quiet is over, but he just sent a desk message: follow keeps them for the desk
     assert held.count(tmp_path) == 2 and sent == []
-    assert held.flush(tmp_path, now=after, idle=lambda: INACTIVE) == 2   # walked away: devices on, one summary first
+    after += INACTIVE
+    assert held.flush(tmp_path, now=after, idle=lambda: 0.0) == 2   # no message for the follow time: devices on, one summary first
     assert [b"held while you were quiet" in d for d in sent] == [True, False, False]
     assert b"2 pings" in sent[0]
     assert [b"first" in d for d in sent[1:]] == [True, False] and b"second" in sent[2]
-    assert held.flush(tmp_path, now=after, idle=lambda: INACTIVE) == 0
+    assert held.flush(tmp_path, now=after, idle=lambda: 0.0) == 0
     assert len(sent) == 3
 
 
@@ -114,12 +127,13 @@ def test_loud_releases_everything_at_once_and_back_ends_a_quiet_release(tmp_path
     sent = _fake(monkeypatch)
     _hold(tmp_path, "active")
     set_word(tmp_path, "loud", duration="60", now=NOW)
-    assert held.flush(tmp_path, now=NOW + 1, idle=lambda: ACTIVE) == 1      # loud: devices on whatever the laptop does
+    assert held.flush(tmp_path, now=NOW + 1, idle=lambda: 0.0) == 1      # loud: devices on whatever the laptop does
     set_word(tmp_path, "quiet", duration="60", now=NOW + 2)
     _hold(tmp_path, "quiet")
     set_word(tmp_path, "back", now=NOW + 5)
-    assert held.flush(tmp_path, now=NOW + 6, idle=lambda: ACTIVE) == 0      # back: follow again, and he is at the laptop
-    assert held.flush(tmp_path, now=NOW + 7, idle=lambda: INACTIVE) == 1
+    _typed(tmp_path, 1.0, now=NOW + 6)
+    assert held.flush(tmp_path, now=NOW + 6, idle=lambda: 0.0) == 0      # back: follow again, and he just sent a desk message
+    assert held.flush(tmp_path, now=NOW + 7 + INACTIVE, idle=lambda: 0.0) == 1
     assert len(sent) == 3
 
 
@@ -153,9 +167,10 @@ def test_flush_if_due_starts_the_child_only_when_something_is_due(tmp_path, monk
     _hold(tmp_path, "active")
     started = []
     monkeypatch.setattr(held.subprocess, "Popen", lambda argv, **kw: started.append(argv))
-    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: ACTIVE)
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 0.0)   # the laptop's own input decides nothing (1a)
+    _typed(tmp_path, ACTIVE, now=time.time())
     assert held.flush_if_due(tmp_path) is False and started == []
-    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: INACTIVE)
+    _typed(tmp_path, INACTIVE, now=time.time())
     assert held.flush_if_due(tmp_path) is True
     assert started[0][-3:-1] == ["flush", "--queue-dir"] or "flush" in started[0]
 
@@ -172,7 +187,8 @@ def test_wiring_notify_queues_a_held_ping_under_its_reason(tmp_path, monkeypatch
     _phone(tmp_path)
     calls = []
     monkeypatch.setattr(sender, "spawn", lambda qdir, **kw: calls.append(kw) or True)
-    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: ACTIVE)
+    monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: 0.0)
+    _typed(tmp_path, ACTIVE, now=time.time())
 
     def ping(kind):
         return claude_code.notify(claude_code.AdapterSettings(), "levain: x", cwd=tmp_path, kind=kind, ref="request:r1")

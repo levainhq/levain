@@ -138,9 +138,16 @@ def test_200_for_each_decision_under_each_mute(rig, word, priority, expect, monk
             assert waiting[0]["reason"] == (word or "active") and waiting[0]["url"] == "/?view=notifications"
 
 
+def _typed(q, ago=5.0):
+    from levain.webpush import desk
+
+    desk._write(q, desk.DESK_MESSAGE_NAME, {"at": time.time() - ago, "source": "test", "desk": ""})
+
+
 def test_a_desk_in_use_holds_a_normal_notice_as_active(rig, monkeypatch):
     src, q = rig
     IDLE["v"] = 5.0
+    _typed(q)                                    # 1a (Phill 11-03): in use = a desk message just now
     tok = _mint(q)
     with _signed(src, q) as (port, _):
         monkeypatch.setattr(held, "flush_if_due", lambda *a, **k: False)
@@ -498,8 +505,10 @@ def test_a_held_notice_is_released_by_the_existing_flush_with_a_summary_naming_i
     monkeypatch.setattr(sender, "deliver", lambda qdir, store, pid, **kw: sent.append((pid, kw)) or [(1, 201)])
     assert held.flush(q, idle=lambda: 9999.0) == 0 and sent == []         # still asleep: nothing goes
     presence.set_word(q, "back")
-    assert held.flush(q, idle=lambda: 5.0) == 0                           # back, but he is at the laptop: follow keeps them for the desk
-    assert held.flush(q, idle=lambda: 9999.0) == 4                        # walked away: devices on
+    _typed(q)
+    assert held.flush(q, idle=lambda: 5.0) == 0                           # back, but he just sent a desk message: follow keeps them for the desk
+    _typed(q, 9999.0)
+    assert held.flush(q, idle=lambda: 5.0) == 4                           # no message for the follow time (his laptop input is no matter): devices on
     summaries = [kw for _pid, kw in sent if kw["kind"] == "summary"]
     assert sorted(s["body"] for s in summaries) == ["1 ping held while you were asleep; they follow.",
                                                     "3 notices held: nightly-backup, site-monitor"]

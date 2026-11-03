@@ -654,7 +654,8 @@
   const PR_TIMED = ["quiet", "loud"];
   const PR_DURS = ["15m", "1h", "2h"];
   const PR_DEVICES = [["on", "On"], ["follow", "Follow"], ["off", "Off"]];
-  const PR_AFTER = [5, 10, 15, 30, 60];                  // minutes of no input before follow turns devices on
+  const PR_PULSE_MS = 6000;                              // how often an open page re-reads the server's Follow line while visible
+  const PR_AFTER = [5, 10, 15, 30, 60];                  // minutes without a typed desk message before follow turns devices on
   const PR_UNTILS = [["switch", "I switch it"], ["for", "For…"], ["input", "Until I say or type"]];
   // the tap-token form names the words the server knows: the presets, and the two aliases (desk = follow, devices = on)
   const PR_TAP_WORDS = [["back", "Back"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"],
@@ -896,7 +897,7 @@
     ph.appendChild(el("h2", null, "Standing default"));
     stPanel.appendChild(ph);
     const body = el("div", "pbody dev-body");
-    body.appendChild(el("p", "dev-note pr-intro", "What Back returns to, and what holds when nothing else is set. Follow brings pings to your devices once you have had no input at the laptop for the time you choose."));
+    body.appendChild(el("p", "dev-note pr-intro", "What Back returns to, and what holds when nothing else is set. Follow brings pings to your devices until you next type a message to a desk, once the time you choose has passed."));
     labelled(body, "Devices");
     stDevBtns = segment(body, PR_DEVICES, "Standing default: whether pings reach your devices", (v) => setStanding({ devices: v }));
     const ar = el("div", "pr-sheet-seg pr-sub");
@@ -1188,8 +1189,13 @@
     readPresence();
     // The cockpit stores its token a moment after load when the link carried one; look again, then keep a slow pulse.
     setTimeout(() => { refresh(); readPresence(); }, 2500);
-    // a tab brought back after a long time repaints at once, not at the next pulse
-    document.addEventListener("visibilitychange", () => { if (!document.hidden && !prGone && !prBusy) readPresence(); });
+    // The Follow line is the server's one derivation, re-read while the page is visible so a second cockpit (a phone's) never
+    // keeps a state the laptop's already left: on a short pulse, when the tab comes back, and when the window gains focus.
+    const reread = () => { if (!document.hidden && !prGone && !prBusy) readPresence(); };
+    document.addEventListener("visibilitychange", reread);
+    window.addEventListener("focus", reread);
+    window.addEventListener("pageshow", reread);
+    const livePulse = setInterval(() => { if (prGone) clearInterval(livePulse); else reread(); }, PR_PULSE_MS);
     const pulse = setInterval(() => {
       if (gone && prGone) clearInterval(pulse);
       else if (!document.hidden) { if (!gone) refresh(); if (!prBusy) readPresence(); }

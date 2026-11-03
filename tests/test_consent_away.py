@@ -167,7 +167,17 @@ def test_a_replaced_mark_row_never_re_latests_a_left_mark(qdir):
     conn.close()
 
 
+def _at_the_desk(qdir):
+    """1a (Phill 11-03): follow reads the desk as "here" only after a typed desk message, so the record's default reads "away" until one."""
+    import time
+
+    from levain.webpush import desk
+
+    desk._write(qdir, desk.DESK_MESSAGE_NAME, {"at": time.time() - 2, "source": "test", "desk": ""})
+
+
 def test_on_without_hold_uses_the_default_and_show_writes_nothing(qdir, capsys):
+    _at_the_desk(qdir)
     before = (qdir / cc.SETTINGS_NAME).read_bytes()
     assert main(["consent", "away", "--queue-dir", str(qdir)]) == 0
     assert (qdir / cc.SETTINGS_NAME).read_bytes() == before
@@ -290,6 +300,7 @@ def test_a_huge_integer_hold_reads_as_malformed_everywhere(qdir, cockpit, action
     (qdir / cc.SETTINGS_NAME).write_text(f'{{"cockpit_data_root": "{cockpit}", "away_mode": true, '
                                          f'"away_hold_seconds": {"9" * 400}}}')
     assert cc.load_settings(qdir).away_hold_seconds == 0.0  # the hook's own reader: malformed -> 0
+    _at_the_desk(qdir)
     assert main(["consent", "away", action, "--queue-dir", str(qdir)]) == 0
     assert "codex: away mode off" in capsys.readouterr().out  # --agent all went on past claude_code
 
