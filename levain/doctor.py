@@ -3112,9 +3112,13 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
         f"hands user {cfg.hands_user} is set up: headless chat, --task and seats run the entity's bash "
         f"as it, in {cfg.hands_workspace}; the interactive REPL runs bash as you, since you read every turn",
     ), *extra]
+
+
 def _check_hands_login(install: Path) -> list[CheckResult]:
-    """One row per vendor: is the hands account signed in, as whom (owner / mode of the credential file, read as the
-    hands user) and the last login or logout outcome. Silent where the entity has no hands account."""
+    """One row per vendor: the hands account's credential file (owner / mode, read as the hands user) and the last
+    login or logout outcome. The file is not a login: no vendor status runs here, so a present file reads "present,
+    not verified" (`levain hands status` asks the vendor). A file state that cannot be read is a warning
+    (``unknown``), never OK. Silent where the entity has no hands account."""
     try:
         from levain.firing import hands_login
         hands = hands_login.load_hands_identity(install)
@@ -3127,21 +3131,23 @@ def _check_hands_login(install: Path) -> list[CheckResult]:
         last = outcomes.get(vendor, {})
         last_s = f"; last: {last.get('outcome', '?')} {last.get('at', '')}".rstrip() if last else "; last: none recorded"
         try:
-            cred = hands_login.credential_state(hands, vendor)
+            cred = hands_login.credential_state(hands, vendor, entity_dir=install)
         except Exception as exc:  # noqa: BLE001
-            rows.append(CheckResult(name, True, f"not determinable ({exc})"))
+            rows.append(CheckResult(name, True, f"unknown: not determinable ({exc}){last_s}",
+                                    hint=f"`levain hands status {vendor}` asks the vendor", warn=True))
             continue
         if cred is None:
-            rows.append(CheckResult(name, True, f"not signed in{last_s}", neutral=True))
+            rows.append(CheckResult(name, True, f"no credential file{last_s}", neutral=True))
             continue
         owner, _, mode = cred.partition(" ")
+        detail = f"credential file present, not verified; owner {owner}, mode {mode}{last_s}"
         if owner != hands.user or mode != "600":
             rows.append(CheckResult(
-                name, True, f"signed in; credential file owner {owner}, mode {mode}{last_s}",
+                name, True, detail,
                 hint=f"expected {hands.user} 600; log out with `levain hands logout {vendor}` and sign in again",
                 warn=True))
         else:
-            rows.append(CheckResult(name, True, f"signed in; credential file owner {owner}, mode {mode}{last_s}"))
+            rows.append(CheckResult(name, True, detail))
     return rows
 
 

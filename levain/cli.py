@@ -1488,7 +1488,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hands_p.add_argument("--path", type=Path, default=Path.cwd(), help="Entity directory (default: cwd).")
     hands_sub = hands_p.add_subparsers(dest="hands_cmd", required=True)
-    hl_p = hands_sub.add_parser("login", help="Sign the entity's user in to a vendor CLI.")
+    hl_p = hands_sub.add_parser("login", help="Sign the entity's user in to a vendor CLI (macOS; refused on Linux, "
+                                              "where the entity's user has no egress for it yet).")
     hl_p.add_argument("vendor", choices=("claude", "codex"))
     hl_p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
     hlo_p = hands_sub.add_parser("logout", help="Sign the entity's user out of a vendor CLI (local only).")
