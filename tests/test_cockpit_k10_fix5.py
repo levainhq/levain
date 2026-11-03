@@ -329,10 +329,17 @@ ISOLATE = {"eval": "(() => { const V = window.LevainTopologyView, o = V.render; 
 H_PAUSED = {"until": "((document.querySelector('#h6 .tv-rbadge') || {textContent: ''}).textContent).includes('live paused')", "ms": 8000}
 
 
+# The host drives the page's one topology module, whose replay state is a singleton the real page also owns: on any panel
+# refresh that leaves no replayable topology the page calls leaveReplay(true), which clears the host's state without a
+# resume. A host test owns that state, so the page's silent teardown is dropped (FLK 1103-33: CI flake, resumes 1 vs 2).
+NO_PAGE_TEARDOWN = ("(() => { const V = window.LevainTopologyView, o = V.leaveReplay; "
+                    "V.leaveReplay = function (silent) { return silent ? undefined : o.apply(this, arguments); }; return 1; })()")
+
+
 def _host_run(tmp_path, monkeypatch, steps, tag="a"):
     (tmp_path / tag).mkdir(exist_ok=True)
     _root, src = _sessions_fixture(tmp_path / tag, monkeypatch)
-    return _run(tmp_path, src, [{"until": STRIP}, {"eval": HOST}, {"eval": SPY}, *steps])
+    return _run(tmp_path, src, [{"until": STRIP}, {"eval": HOST}, {"eval": NO_PAGE_TEARDOWN}, {"eval": SPY}, *steps])
 
 
 @needs_browser
