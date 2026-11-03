@@ -871,7 +871,9 @@
         // fields and not their widgets, so a widget is chosen from the field's name (a known edge).
         // a form panel names its verb: the action is the one offered under that name, and no other
         const formVerb = view.extra_panels[pid].form ? view.extra_panels[pid].form.verb : (view.extra_panels[pid].compose ? view.extra_panels[pid].compose.verb : null);
-        const ownOf = (a) => (!isObj(a.target) || typeof a.target.row_id !== "string") && (formVerb === null || a.verb === formVerb);
+        // band_answer is the Decisions panel's one panel-level verb and is never a box of its own: a decision is answered on its card
+        // (np-573adb40 "1a"), so the raw {text, store_id, view_id} form it would draw at the top of the modal is not offered
+        const ownOf = (a) => a.verb !== "band_answer" && (!isObj(a.target) || typeof a.target.row_id !== "string") && (formVerb === null || a.verb === formVerb);
         // an action a browser cannot perform (laptop-only, refused) draws nothing: the panel's rows already name the laptop command.
         // A text panel keeps its read-first editor whatever the gesture (its own design, held by the editor tests):
         // only the editor verb, the one whose head has exactly one field, new_body (dashboard_core.js mounts that alone as an editor)

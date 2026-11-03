@@ -101,3 +101,31 @@ def test_the_tile_counts_the_rows_and_the_modal_lists_them(tmp_path: Path) -> No
     assert out[4] in ("applied", False), out        # False is the answer for a changed shape; the page then reloads the board itself
     assert "a new one" in out[5] and "merge the branch" not in out[5], out
     assert out[6] == [True, True], out
+
+
+MODAL_BOXES = "(() => { const m = document.getElementById('levain-modal'); return [m.querySelectorAll('.tray-dump, textarea').length, m.innerText.replace(/\\s+/g, ' ').toLowerCase()]; })()"
+
+
+@needs_browser
+def test_the_decisions_modal_draws_no_answer_box_with_rows_waiting_or_none(tmp_path: Path) -> None:
+    """The band_answer verb is the panel's one panel-level action; the generic compose mount drew it as a raw box (a textarea and an
+    "answer" button) at the top of this modal after the standing band box was removed (Phill 11-03). A decision is answered on its card."""
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, httpd):
+        httpd.get_cockpit().attach_decision_source(ProviderSpec(
+            "decisions", "triage-list", "Decisions waiting", "gate", lambda c: Read(rows=_rows()), region="widgets", face="count", rank=-1,
+            order="decision.queue", facets=frozenset({"stopped", "at"}), version_fields=("what", "np_version"), rowset="needs_phill",
+            read_one=lambda c, rid: Read(rows=tuple(r for r in _rows() if r.id == rid)), search_fields=("title", "body"),
+            empty="nothing is waiting on you."))
+        waiting = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE}, {"eval": f"{TILE}.click(); 1"}, {"until": "document.querySelector('#levain-modal .modal-body .xbody')"},
+            {"eval": MODAL_BOXES},
+        ])["values"][-1]
+    assert waiting[0] == 0 and "cut the release" in waiting[1] and "merge the branch" in waiting[1], waiting
+    _root, src, _ids = _install(tmp_path / "none")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        none = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": TILE}, {"eval": f"{TILE}.click(); 1"}, {"until": "document.querySelector('#levain-modal .modal-body .xbody')"},
+            {"eval": MODAL_BOXES},
+        ])["values"][-1]
+    assert none[0] == 0 and "nothing is waiting on you" in none[1], none
