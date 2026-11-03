@@ -953,15 +953,22 @@ class Revoker:
 
 # --- §4.2 step 1: R/ and the wake socket (the main process) --------------------------------------------------------
 
-def run_rows(seams: H.Seams) -> List[Row]:
-    """§2.2's run-dir rows for this host and every configured slot, rooted at ``seams.R``."""
+def run_rows(seams: H.Seams, *, log: Callable[[str], None] = _log_to_stderr) -> List[Row]:
+    """§2.2's run-dir rows for this host and every configured slot, rooted at ``seams.R``. ``R/fence/`` is in them
+    only when ``L/policy/operator`` reads (its owner is the operator's name); a record that does not read is logged and
+    every other row is still made."""
     host = seams.host
     store = H.Store(seams)
     try:
         slots = _slots(store)
+        try:
+            operator: Optional[str] = H.read_operator_name(store)
+        except Exception as e:   # noqa: BLE001 - only R/fence/ needs the name; the rest of the boot pass goes on
+            log(f"boot: run dir: R/fence not made: the operator record could not be read ({type(e).__name__}: {e})")
+            operator = None
     finally:
         store.close()
-    rows = base_run_rows(host) + [r for s in slots for r in slot_run_rows(host, s)]   # type: ignore[arg-type]
+    rows = base_run_rows(host, operator) + [r for s in slots for r in slot_run_rows(host, s)]   # type: ignore[arg-type]
     base = RUN[host]                                                                   # type: ignore[index]
     return [replace(r, path=seams.R / r.path.relative_to(base)) for r in rows]
 
@@ -971,7 +978,7 @@ def boot_dirs(seams: H.Seams, *, log: Callable[[str], None] = _log_to_stderr) ->
     creator, §22; Linux: tmpfiles made them and this re-checks). Never through a link: a row whose path is not a
     directory is named and left as it is. Returns the problems."""
     problems: List[str] = []
-    for row in run_rows(seams):
+    for row in run_rows(seams, log=log):
         p = str(row.path)
         try:
             try:

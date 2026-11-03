@@ -79,7 +79,7 @@ def test_tmpfiles_conf_matches_run_dirs():
     w = [s for s in plan.steps if s.write and s.write[0] == TMPFILES_CONF]
     assert len(w) == 1 and w[0].write[2] == 0o644
     lines = [ln for ln in w[0].write[1].splitlines() if not ln.startswith("#")]
-    rows = base_run_rows("linux") + [r for s in plan.allocation.slots for r in slot_run_rows("linux", s)]
+    rows = base_run_rows("linux", OP) + [r for s in plan.allocation.slots for r in slot_run_rows("linux", s)]
     assert lines == [f"d {r.path} {r.mode:04o} {r.owner} {r.group} -" for r in rows]
     assert {r.path for r in rows} == {r.path for r in plan.rows if str(r.path).startswith(str(RUN["linux"]))}
     assert "d /run/levain/gw/slot1 2750 _levain_gw1 _levain_s1 -" in lines            # setgid kept

@@ -34,7 +34,7 @@ def host_os() -> HostOS:
 
 def run_dir_row(host: HostOS, service: str) -> Row:
     want = RUN[host] / RUN_DIR_OF[service]
-    return next(r for r in base_run_rows(host) if r.path == want)
+    return next(r for r in base_run_rows(host, "-") if r.path == want)
 
 
 def _is_root_dir(st: os.stat_result, mode: int) -> bool:

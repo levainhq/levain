@@ -439,6 +439,47 @@ def build_feeds_spec(
     )
 
 
+# --- the agent fence (P7-2 wiring, shape C) ---
+# A fourth unit: RESIDENT, like the cockpit, because the queue broker asks it on every dispatch GATE and refuses the
+# GATE when it is down.
+DEFAULT_FENCE_LABEL = "com.levainhq.levain.fence"
+# the module the unit runs; a string, so this stdlib-only leaf imports nothing of the qbroker package
+FENCE_MODULE = "levain.qbroker.fence_server"
+
+
+def build_fence_spec(
+    *,
+    agent_store: Path,
+    cockpit_root: Path,
+    run_dir: Path,
+    label: str = DEFAULT_FENCE_LABEL,
+    log_dir: Path | None = None,
+) -> DaemonSpec:
+    """The resident spec for the operator's agent fence server (:mod:`levain.qbroker.fence_server`): it reads the
+    operator's autonomic store and cockpit authority as their owner and answers the queue broker on
+    ``R/fence/fence.sock``. Per-user and never root, as every spec here (the providers refuse root); keep-alive and at
+    login, because while it is down every dispatch session's tool calls are refused.
+
+    Run as ``<this interpreter> -m levain.qbroker.fence_server``: the module is not a ``levain`` verb, and the
+    interpreter is the one this levain runs in (never ``realpath``'d, for the reason :func:`_levain_invocation` gives).
+    ``run_dir`` is required: the caller passes the ``R`` the broker and ``levain doctor`` look in
+    (``levain.slot.layout.RUN``), so the server never binds where they do not look."""
+    invocation = [sys.executable]
+    argv = [*invocation, "-m", FENCE_MODULE,
+            "--agent-store", str(agent_store.expanduser().resolve()),
+            "--cockpit-root", str(cockpit_root.expanduser().resolve()),
+            "--run", str(run_dir)]
+    logs = (log_dir or _default_log_dir()).expanduser().resolve()
+    return DaemonSpec(
+        label=label,
+        argv=argv,
+        working_dir=agent_store.expanduser().resolve(),
+        env=_daemon_env(invocation),
+        stdout_log=logs / f"{label}.log",
+        stderr_log=logs / f"{label}.err",
+    )
+
+
 # --- the provider interface ------------------------------------------------------------------
 
 class DaemonProvider(ABC):
@@ -471,6 +512,13 @@ class DaemonProvider(ABC):
     @abstractmethod
     def restart(self, label: str) -> str:
         """Restart the running service (pick up new code / a crashed instance)."""
+
+    @abstractmethod
+    def installed_argv(self, label: str) -> list[str] | None:
+        """The argv of the unit on disk for ``label``, read back from the unit file (no service-manager call), or
+        None when no unit file exists. Raises :class:`DaemonError` when a unit file exists but its argv cannot be
+        read. Added for the agent fence (P7-2 wiring r2): ``levain update`` reads the installed fence unit's roots
+        before it would replace them."""
 
 
 def _run(cmd: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
@@ -660,6 +708,25 @@ class LaunchdProvider(DaemonProvider):
                         else f"NOT yet running ({st.detail}) — check the log at {spec.stdout_log}")
         return (f"installed {spec.label}\n  unit:   {plist_path}\n"
                 f"  domain: {domain} (per-user, no sudo)\n  status: {run_line}")
+
+    def installed_argv(self, label: str) -> list[str] | None:
+        import plistlib
+
+        path = self._plist_path(label)
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise DaemonError(f"{path} could not be read: {exc}") from exc
+        try:
+            doc = plistlib.loads(data)
+        except Exception as exc:   # noqa: BLE001 - plistlib raises several types for a malformed file
+            raise DaemonError(f"{path} is not a readable plist: {exc}") from exc
+        argv = doc.get("ProgramArguments") if isinstance(doc, dict) else None
+        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+            raise DaemonError(f"{path} has no ProgramArguments list of strings")
+        return list(argv)
 
     def uninstall(self, label: str) -> str:
         _refuse_root()
@@ -1169,6 +1236,27 @@ class SystemdUserProvider(DaemonProvider):
         return (f"installed {spec.label}\n  unit:   {units}\n"
                 f"  domain: systemd --user (per-user, no sudo)\n"
                 f"  linger: {linger}\n  status: {run_line}")
+
+    def installed_argv(self, label: str) -> list[str] | None:
+        """The inverse of :meth:`render_unit`'s ``ExecStart`` line: undo :func:`_systemd_exec_arg`'s doubling of
+        ``\\``, ``%`` and ``$`` in one left-to-right pass, then ``shlex.split`` the quoted words."""
+        path = self._service_path(label)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError) as exc:
+            raise DaemonError(f"{path} could not be read: {exc}") from exc
+        lines = [ln[len("ExecStart="):] for ln in text.splitlines() if ln.startswith("ExecStart=")]
+        if len(lines) != 1:
+            raise DaemonError(f"{path} has {len(lines)} ExecStart lines, not one")
+        try:
+            argv = shlex.split(re.sub(r"\\\\|%%|\$\$", lambda m: m.group(0)[0], lines[0]))
+        except ValueError as exc:
+            raise DaemonError(f"{path}'s ExecStart could not be split: {exc}") from exc
+        if not argv:
+            raise DaemonError(f"{path}'s ExecStart is empty")
+        return argv
 
     def uninstall(self, label: str) -> str:
         _refuse_root()

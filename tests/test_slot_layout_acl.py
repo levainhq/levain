@@ -70,7 +70,7 @@ def test_a_row_with_no_acl_still_applies(tmp_path):
 
 def _all_rows(host):
     slots = (SlotId("egress", 0), SlotId("none", 0))
-    return (LY.base_store_rows(host, "op") + LY.slot_rows(host, slots) + LY.base_run_rows(host)
+    return (LY.base_store_rows(host, "op") + LY.slot_rows(host, slots) + LY.base_run_rows(host, "op")
             + [LY.reserve_row(host)])
 
 
