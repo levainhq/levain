@@ -5,7 +5,8 @@ steps run as the current user. No real login, no user created, no keychain, no l
 
 Shim knobs (environment the fake prefix passes): SHIM_HANG (the login leaves a child holding the output open),
 SHIM_KEYSTORE (the login is kept in that file, not the credential file: a non-file store), SHIM_LOGOUT_FAIL /
-SHIM_LOGOUT_NOOP / SHIM_LOGOUT_HANG / SHIM_LEAVE (logout branches). The sweep is a recorder that also kills the
+SHIM_LOGOUT_NOOP / SHIM_LOGOUT_HANG / SHIM_LEAVE (logout branches), SHIM_STATUS_SAYS / SHIM_STATUS_RC (the status
+prints that line on stderr and exits that code, default 1: a failed status). The sweep is a recorder that also kills the
 pids a hanging shim wrote, as the real sweep kills every process of the hands user."""
 from __future__ import annotations
 
@@ -49,6 +50,7 @@ case "$1 $2" in
     if [ -n "$SHIM_KEYSTORE" ]; then rm -f "$SHIM_KEYSTORE"; fi
     exit 0;;
   "auth status")
+    if [ -n "$SHIM_STATUS_SAYS" ]; then echo "$SHIM_STATUS_SAYS" >&2; exit "${SHIM_STATUS_RC:-1}"; fi
     if [ -f "$CRED" ] || { [ -n "$SHIM_KEYSTORE" ] && [ -f "$SHIM_KEYSTORE" ]; }; then
       echo '{"loggedIn": true, "email": "hands@example.test", "subscriptionType": "max"}'; exit 0
     fi
@@ -64,15 +66,19 @@ case "$1 $2" in
     echo "Visit https://auth.openai.com/codex/device and enter ABCD-12345"
     grep -q '^cli_auth_credentials_store = "file"$' "$CODEX_HOME/config.toml" || { echo "no pin" >&2; exit 3; }
     umask 077
-    echo '{"tokens":{}}' > "$CODEX_HOME/auth.json"
+    if [ -n "$SHIM_KEYSTORE" ]; then echo k > "$SHIM_KEYSTORE"; else echo '{"tokens":{}}' > "$CODEX_HOME/auth.json"; fi
     exit 0;;
   "logout ")
     if [ -n "$SHIM_LOGOUT_FAIL" ]; then echo "logout failed" >&2; exit 1; fi
     [ -n "$SHIM_LEAVE" ] || rm -f "$CODEX_HOME/auth.json"
+    if [ -n "$SHIM_KEYSTORE" ]; then rm -f "$SHIM_KEYSTORE"; fi
     exit 0;;
   "login status")
-    if [ -f "$CODEX_HOME/auth.json" ]; then echo "Logged in using ChatGPT"; exit 0; fi
-    echo "Not logged in"; exit 1;;
+    if [ -n "$SHIM_STATUS_SAYS" ]; then echo "$SHIM_STATUS_SAYS" >&2; exit "${SHIM_STATUS_RC:-1}"; fi
+    if [ -f "$CODEX_HOME/auth.json" ] || { [ -n "$SHIM_KEYSTORE" ] && [ -f "$SHIM_KEYSTORE" ]; }; then
+      echo "Logged in using ChatGPT"; exit 0
+    fi
+    echo "Not logged in" >&2; exit 1;;
 esac
 exit 2
 """
@@ -377,6 +383,7 @@ def test_an_unreadable_config_fails_the_login_and_keeps_the_file(rig, capsys):
     finally:
         cfg.chmod(0o600)
     assert cfg.read_text() == 'model = "x"\n'
+    assert "codex" not in hands_login.read_outcomes(rig.entity)       # L3 r2: a pre-flight failure records nothing
 
 
 def test_an_existing_config_home_has_its_mode_repaired(rig):
@@ -407,24 +414,65 @@ def test_status_that_cannot_run_is_unknown_and_fails_the_verb(rig, capsys):
     assert "a password is required" in out and "not signed in" not in out
 
 
-def test_a_session_open_during_status_is_left_alone_after_a_status_timeout(rig, monkeypatch):
-    """The sweep after a status that ran out takes the hands lock first; while a session holds it, nothing is
-    stopped and the row says so."""
+def test_status_runs_nothing_while_a_session_holds_the_hands_lock(rig, capsys, monkeypatch):
+    """L3 r2 of V1/V2 (codex MED, item 4 residual): an unlocked status that ran out while a session held the lock
+    was killed and its descendant left with no sweep allowed. The status now takes the lock for its whole read;
+    while it is held nothing runs, the state is unknown and the verb exits nonzero."""
     monkeypatch.setattr(hands_login, "STEP_TIMEOUT", 1.0)
     rig.knobs["SHIM_LOGOUT_HANG"] = "1"
     monkeypatch.setitem(hands_login._VENDOR["claude"], "status", ("claude", "auth", "logout"))
     fd = hands_live.take_exclusive(rig.entity)
     try:
         st = hands_login.run_status(rig.h, "claude", entity_dir=rig.entity)
+        assert hands_login.cmd_hands_status(rig.entity, None) == 1
     finally:
         os.close(fd)
-    assert st.state == "unknown" and "a session holds the hands lock" in st.error
-    assert not any(c.startswith("SWEEP") for c in rig.calls())
-    for pid in rig.pids.read_text().split():
+    try:
+        assert st.state == "unknown" and "a session of this entity is open" in st.error
+        assert rig.calls() == [] and not rig.pids.exists()                 # nothing ran as hands
+        out = capsys.readouterr().out
+        assert "hands claude: unknown" in out and "hands codex: unknown" in out
+    finally:
+        for pid in (rig.pids.read_text().split() if rig.pids.exists() else []):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_a_status_that_runs_out_is_swept_under_the_lock_it_took(rig, monkeypatch):
+    """A guard for the same fix (this half held before it too): with no session, the status holds the lock it took,
+    so the sweep after it ran out runs under it and the descendant is gone."""
+    monkeypatch.setattr(hands_login, "STEP_TIMEOUT", 1.0)
+    rig.knobs["SHIM_LOGOUT_HANG"] = "1"
+    monkeypatch.setitem(hands_login._VENDOR["claude"], "status", ("claude", "auth", "logout"))
+    st = hands_login.run_status(rig.h, "claude", entity_dir=rig.entity)
+    assert st.state == "unknown" and "did not finish" in st.error
+    assert [c for c in rig.calls() if c.startswith("SWEEP")] == ["SWEEP levain-hands %d lock-held=True" % os.getuid()]
+    pid = int(rig.pids.read_text().split()[0])
+    deadline = time.monotonic() + 3.0          # the killed child is reaped by init, not by this process
+    while time.monotonic() < deadline:
         try:
-            os.kill(int(pid), signal.SIGKILL)
+            os.kill(pid, 0)
         except ProcessLookupError:
-            pass
+            break
+        time.sleep(0.05)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_a_config_refusal_does_not_overwrite_the_last_outcome(rig, capsys):
+    """L3 r2 of V1/V2 (complement + codex MED, item 7 residual): a pre-flight refusal in the config home (here a
+    keyring pin) changed nothing about the login, so it records nothing."""
+    assert hands_login.cmd_hands_login(rig.entity, "codex") == 0
+    capsys.readouterr()
+    cfg = rig.hands_home / ".codex" / "config.toml"
+    cfg.write_text('cli_auth_credentials_store = "keyring"\n')
+    assert hands_login.cmd_hands_login(rig.entity, "codex") == 1
+    out = capsys.readouterr().out
+    assert "other than" in out and "the login was not started" in out
+    assert hands_login.read_outcomes(rig.entity)["codex"]["outcome"] == "logged-in"
+    assert sum(c == "login --device-auth" for c in rig.calls()) == 1      # only the first login launched
 
 
 # --- refusal, parsing, the verb ------------------------------------------------------------------------------
@@ -449,8 +497,23 @@ def test_hands_for_is_untouched_and_vendor_blind():
 @pytest.mark.parametrize("vendor,rc,text,want", [
     ("claude", 0, '{"loggedIn": true, "email": "a@b.c", "orgName": "Org"}', ("in", "a@b.c / Org")),
     ("claude", 1, '{"loggedIn": false}', ("out", "")),
-    ("claude", 1, "Not logged in", ("out", "")),
+    ("claude", 1, "Not logged in. Run claude auth login to authenticate.", ("out", "")),
     ("claude", 0, "Logged in as a@b.c", ("in", "Logged in as a@b.c")),
+    # L3 r2 (codex HIGH): only the vendor's complete signed-out answer, with its exit code, is OUT
+    ("claude", 1, "could not determine whether logged out: keychain locked", ("unknown", "")),
+    ("claude", 1, "Error: not logged in to the keychain", ("unknown", "")),
+    ("claude", 1, "Not logged in", ("unknown", "")),                 # not claude's line
+    ("claude", 0, '{"loggedIn": false}', ("unknown", "")),           # signed out, but not with its exit code
+    ("claude", 2, '{"loggedIn": false}', ("unknown", "")),
+    ("claude", 0, "Not logged in. Run claude auth login to authenticate.", ("unknown", "")),
+    ("claude", 0, "Session ok; previously logged out", ("unknown", "")),   # a mention is never an IN either
+    ("codex", 1, "Error checking login status: could not determine whether logged out: keychain locked",
+     ("unknown", "")),
+    ("codex", 1, "Error checking login status: Not logged in to keyring", ("unknown", "")),
+    ("codex", 2, "Not logged in", ("unknown", "")),
+    ("codex", 0, "Not logged in", ("unknown", "")),
+    ("codex", 1, '{"loggedIn": false}', ("unknown", "")),            # codex does not answer in JSON
+    ("codex", 1, "WARNING: a deprecated key in config.toml\nNot logged in\n", ("out", "")),
     ("claude", 0, '{"email": "a@b.c"}', ("unknown", "")),             # no loggedIn: not a yes
     ("claude", 1, '{"loggedIn": true}', ("unknown", "")),            # a yes with a failed exit
     ("claude", 126, "sudo: unable to execute /usr/bin/env: Permission denied", ("unknown", "")),

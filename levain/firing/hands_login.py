@@ -17,8 +17,9 @@ What runs, always as the hands user through :func:`~levain.firing.confinement.ha
 Then ``claude auth status`` / ``codex login status`` as hands, reduced to one account line.
 
 Login and logout each hold the entity's hands lock for the whole transaction, so neither runs beside a session
-or beside the other. A state that could not be read is its own result (``unknown``), never "signed out": a
-status that cannot be determined refuses a logout and fails ``hands status`` (L3 r1 of V1/V2, codex HIGH 1).
+or beside the other; ``hands status`` takes it for its read too (L3 r2), so a status that runs out is swept. A
+state that could not be read is its own result (``unknown``), never "signed out": a status that cannot be
+determined refuses a logout and fails ``hands status`` (L3 r1 of V1/V2, codex HIGH 1).
 Every run as the hands account is bounded; one that runs out (or is interrupted) is killed and then the hands
 account's processes are swept, because what sudo started runs as another uid and outlives a killed sudo.
 
@@ -174,6 +175,15 @@ _URL = re.compile(r"https://[^\s\"'<>]+")
 _CODE = re.compile(r"\b[A-Z0-9]{4,5}-[A-Z0-9]{4,5}\b")
 _OFF = re.compile(r"not\s+logged\s+in|logged\s+out", re.I)
 
+#: Per vendor: the vendor's complete signed-out line and the exit code it comes with. Read from the shipped programs
+#: on 11-03 (L3 r2 of V1/V2, codex HIGH): claude 2.1.317 ``auth status`` exits 1 when signed out, printing
+#: ``{"loggedIn": false}`` (and, with ``--text``, this line); codex ``login status`` printed exactly this line on
+#: stderr and exited 1 against an empty file-store ``CODEX_HOME``. Its errors read ``Error checking login status: ...``.
+_SIGNED_OUT = {"claude": ("Not logged in. Run claude auth login to authenticate.", 1),
+               "codex": ("Not logged in", 1)}
+#: The vendors whose status answers in JSON (``loggedIn``).
+_STRUCTURED = frozenset({"claude"})
+
 
 def surface(text: str) -> tuple[list[str], list[str]]:
     """The sign-in URLs and device codes in a login's output, in order, without duplicates."""
@@ -192,26 +202,33 @@ def surface(text: str) -> tuple[list[str], list[str]]:
 def parse_status(vendor: str, returncode: int, text: str) -> tuple[str, str]:
     """(state, one account line) from ``claude auth status`` (JSON, or text) or ``codex login status``.
 
-    OUT only on the vendor's own word (``"loggedIn": false``, or "not logged in" / "logged out" in the text);
-    IN only on exit 0 with a positive answer; anything else (a nonzero exit that says neither, a JSON reply
-    without ``loggedIn``, no output) is UNKNOWN."""
+    OUT only on the vendor's complete signed-out answer with the exit code it uses for it (:data:`_SIGNED_OUT`):
+    ``"loggedIn": false`` from a vendor that answers in JSON, or the signed-out line as a whole line. IN only on
+    exit 0 with a positive answer. Anything else is UNKNOWN: a nonzero exit with other prose, a JSON reply without
+    ``loggedIn``, no output, and any reply that merely mentions being logged in or out (an error such as "could not
+    determine whether logged out: keychain locked" says nothing about the login)."""
     _check_vendor(vendor)
     body = text.strip()
+    off_line, off_rc = _SIGNED_OUT[vendor]
     try:
         data = json.loads(body)
     except ValueError:
         data = None
     if isinstance(data, dict):
+        if vendor not in _STRUCTURED:
+            return UNKNOWN, ""
         on = data.get("loggedIn")
-        if on is False:
+        if on is False and returncode == off_rc:
             return OUT, ""
         if on is True and returncode == 0:
             return IN, " / ".join(str(data[k]) for k in ("email", "orgName", "subscriptionType") if data.get(k))
         return UNKNOWN, ""
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if off_line in lines:
+        return (OUT, "") if returncode == off_rc else (UNKNOWN, "")
     if _OFF.search(body):
-        return OUT, ""
-    first = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
-    return (IN, first) if returncode == 0 and first else (UNKNOWN, "")
+        return UNKNOWN, ""
+    return (IN, lines[0]) if returncode == 0 and lines else (UNKNOWN, "")
 
 
 # --- runners ---------------------------------------------------------------------------------------------------
@@ -452,8 +469,21 @@ def _run_login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, emit: 
 
 def run_status(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str, held: bool = False) -> Status:
     """The vendor's own status and the credential file's owner/mode, both as hands. Never raises for a status
-    that cannot be read: that is ``state == UNKNOWN`` with the reason in ``error``."""
+    that cannot be read: that is ``state == UNKNOWN`` with the reason in ``error``.
+
+    Always under the hands lock: the caller's (``held``), or one taken here for the whole read, so a vendor status
+    that runs out is swept like every other run as hands. While a session (or a login, a logout, ws-git) holds it,
+    nothing runs and the state is UNKNOWN: an unlocked status that ran out could leave a descendant no sweep was
+    allowed to stop (L3 r2 of V1/V2, codex MED)."""
     _check_vendor(vendor)
+    if not held:
+        try:
+            with hands_lock(entity_dir, "hands status"):
+                return run_status(hands, vendor, entity_dir=entity_dir, held=True)
+        except HandsRefused as exc:
+            return Status(vendor, UNKNOWN, "", "", None, str(exc))
+        except OSError as exc:
+            return Status(vendor, UNKNOWN, "", "", None, f"the hands lock could not be taken ({exc})")
     try:
         r = run_as_hands_bounded(hands, status_argv(hands, vendor), entity_dir=entity_dir, held=held,
                                  what=f"{vendor} status")
@@ -479,7 +509,14 @@ def login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, *, emit: Ca
     if refusal:
         raise HandsRefused(refusal)
     with hands_lock(entity_dir, "a login"):
-        ensure_config_home(hands, vendor, entity_dir=entity_dir)
+        try:
+            ensure_config_home(hands, vendor, entity_dir=entity_dir)
+        except HandsRefused:
+            raise
+        except HandsLoginError as exc:
+            # Before the vendor login launches nothing about the login has changed, so a failure here is a
+            # refusal and the last recorded outcome stands (L3 r2 of V1/V2, complement + codex MED).
+            raise HandsRefused(f"{exc}; the login was not started") from None
         res = _run_login(hands, vendor, entity_dir, emit or _write_out, LOGIN_TIMEOUT if timeout is None else timeout)
         st = run_status(hands, vendor, entity_dir=entity_dir, held=True) if res.returncode == 0 else None
     return res, st

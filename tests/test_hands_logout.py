@@ -169,6 +169,28 @@ def test_a_login_outside_the_file_logs_out_when_the_vendor_does(rig, capsys, tmp
     assert not (tmp_path / "keystore").exists()
 
 
+@pytest.mark.parametrize("vendor,says", [
+    ("claude", "could not determine whether logged out: keychain locked"),
+    ("codex", "Error checking login status: could not determine whether logged out: keychain locked"),
+])
+def test_a_failed_status_that_mentions_logged_out_refuses_the_logout(rig, capsys, tmp_path, vendor, says):
+    """L3 r2 of V1/V2 (codex HIGH): a login outside the file (a non-file store), then a status that FAILS with a
+    diagnostic merely containing "logged out". That parsed as signed out, so the logout answered "nothing signed in"
+    and left the login active. It is unknown: the logout refuses, changes nothing and records nothing."""
+    keystore = tmp_path / "keystore"
+    rig.knobs["SHIM_KEYSTORE"] = str(keystore)
+    assert hands_login.cmd_hands_login(rig.entity, vendor) == 0
+    capsys.readouterr()
+    rig.knobs["SHIM_STATUS_SAYS"] = says
+    rig.log.write_text("")
+    assert hands_login.cmd_hands_logout(rig.entity, vendor) == 1
+    out = capsys.readouterr().out
+    assert "nothing signed in" not in out and "cannot tell whether" in out and "keychain locked" in out
+    assert keystore.exists()
+    assert not any(c.startswith("SWEEP") or "logout" in c for c in rig.calls())
+    assert hands_login.read_outcomes(rig.entity)[vendor]["outcome"] == "logged-in"
+
+
 def test_the_no_op_check_is_inside_the_lock(rig, capsys):
     """V2 codex HIGH 3 / complement LOW 2: with nothing signed in but a session holding the lock, the logout is
     refused instead of answering "nothing" from outside it."""
