@@ -614,7 +614,9 @@ def test_two_thread_direct_view_is_per_thread(run, repo, tmp_path, monkeypatch):
     first = env.parse_body(f.read_text().rstrip("\n"))["envelope_id"]
     run(*run.signed("envelope", "sign", str(f), "--yes"))
     run("envelope", "kill", first, "--thread", t1)
-    out = run("envelope", "echo", t1, t2, *args).out
+    # an hour, not two: a stop even a second later than the head's is wider, which would make this clock-dependent
+    out = run("envelope", "echo", t1, t2, "--where", f"{repo}=README,docs/", "--land", f"{repo}=main",
+              "--stop", "1h").out
     killed, other = out.split(f"read against {first} as narrowed for thread {t2}:")[0], \
         out.split(f"read against {first} as narrowed for thread {t2}:")[1]
     assert f"read against {first} as narrowed for thread {t1}:" in killed
@@ -643,3 +645,26 @@ def test_successor_of_a_key_revoked_head_is_accepted_and_shown_new(repo, tmp_pat
     assert f"envelope {first} no longer holds for thread {thread}" in out and run.keys["phone"].fp in out
     assert f"WIDER than {first} for thread {thread}" in out
     assert "accepted" in out and run.json("envelope", "list", "--thread", thread)[-1]["envelope_id"] != first
+
+
+@pytest.mark.parametrize("narrowing", [("narrow", "--stop-earlier", "30m"), ("kill",)])
+def test_sign_refuses_a_body_narrowed_since_its_echo_before_the_view(run, repo, tmp_path, monkeypatch, narrowing):
+    """The up-front check (design 4.1): the sign view reads the CURRENT head, so a body echoed before a narrowing is
+    refused here, in words, rather than shown against a base it was not composed over."""
+    _drop, thread = make_thread(run, repo, monkeypatch)
+    f, got = echo(run, repo, thread, tmp_path)
+    first = got["body"]["envelope_id"]
+    run(*run.signed("envelope", "sign", str(f), "--yes"))
+    g = tmp_path / "next.json"
+    run("envelope", "echo", thread, "--where", f"{repo}=README", "--stop", "1h", "-o", str(g))
+    body = env.parse_body(g.read_text().rstrip("\n"))
+    assert isinstance(body["supersedes"]["seen"], int) and body["draft"] is None
+    run("envelope", narrowing[0], first, *narrowing[1:])
+    out = run(*run.signed("envelope", "sign", str(g), "--yes"), rc=1)
+    assert f"envelope {first} was narrowed after this body was echoed; echo again" in out.err
+    assert "NOT IN FORCE" not in out.out and not (tmp_path / "next.json.sig.json").exists()
+    if narrowing[0] == "kill":
+        return          # extend over an ended head is refused elsewhere; the seen it writes is read below
+    ext = run.json("envelope", "extend", thread, "--budget", "tool_calls=99")["body"]
+    assert ext["supersedes"]["envelope_id"] == first and isinstance(ext["supersedes"]["seen"], int)
+    assert ext["draft"] is None
