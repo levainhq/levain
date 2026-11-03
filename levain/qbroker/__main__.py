@@ -5,7 +5,9 @@ when the socket is in group ``_levain_s<n>``; resolves caps through ``R/control/
 ``L/queue/`` and the answer-signer snapshot under ``L/policy/`` (verified by ``L/routes/trust.pub``), and the signed
 contracts dispatch publishes under ``L/contracts/`` (CONTRACT §26 S1-b; files owned by ``_levain_dispatch``: with no
 such user, no contract grant applies and every call goes to the queue), and the slot limits under ``L/policy/limits``
-(:class:`levain.qbroker.limits.PolicyLimits`, owned by root). Runs until SIGTERM or SIGINT.
+(:class:`levain.qbroker.limits.PolicyLimits`, owned by root); and, for the agent fence (P7-2), the operator's
+autonomic store and cockpit root read-only when both are given, else every dispatch session's GATE is refused
+(:func:`build_fence`). Runs until SIGTERM or SIGINT.
 """
 from __future__ import annotations
 
@@ -18,7 +20,10 @@ import sys
 import threading
 from pathlib import Path
 
-from levain.qbroker.broker import Broker
+from levain.agent_authority import AgentAuthority
+from levain.autonomic.db import DB_NAME
+from levain.qbroker.broker import Broker, FenceSource
+from levain.qbroker.fence import AgentFences, Unfenceable
 from levain.qbroker.control import ControlResolver
 from levain.qbroker.limits import PolicyLimits
 from levain.qbroker.server import SlotListener, socket_path
@@ -37,7 +42,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--store", default=_DEFAULT_STORE, help="L, the store root")
     ap.add_argument("--run", default=_DEFAULT_RUN, help="R, the run directory")
     ap.add_argument("--slot", type=int, action="append", required=True, help="a configured slot (repeatable)")
+    ap.add_argument("--agent-store", default=None,
+                    help="the operator's autonomic store directory (its autonomic.db), read-only, for the agent fence")
+    ap.add_argument("--cockpit-root", default=None,
+                    help="the operator's cockpit directory (cockpit.db and the authority anchor), read-only")
     return ap.parse_args(argv)
+
+
+# GATE's limits-failed reason for every dispatch session while the broker has no agent store to fence it against
+NO_AGENT_STORE = ("the queue broker has no agent store to fence dispatch sessions against (--agent-store and "
+                  "--cockpit-root), so no dispatch session is let through")
+
+
+def build_fence(args: argparse.Namespace) -> FenceSource:
+    """The broker's agent fence (P7-2). Both the operator's autonomic store and cockpit root are needed; without
+    either, :class:`levain.qbroker.fence.Unfenceable`, so every dispatch session's GATE answers ``limits-failed``
+    (fail closed), never an unfenced go. L3 r1 (P7-2 fix): the service unit was found to pass neither, and the
+    operator's store to be created 0700 under the operator's home, out of ``_levain_qbroker``'s reach (P7-0 U4)."""
+    agent_store, cockpit_root = getattr(args, "agent_store", None), getattr(args, "cockpit_root", None)
+    if not agent_store or not cockpit_root:
+        logging.getLogger("levain.qbroker").error("no agent store: %s", NO_AGENT_STORE)
+        return Unfenceable(NO_AGENT_STORE)
+    return AgentFences(Path(agent_store) / DB_NAME, AgentAuthority(cockpit_root))
 
 
 def build_broker(args: argparse.Namespace, *, limits_owner: int = 0) -> Broker:
@@ -51,7 +77,7 @@ def build_broker(args: argparse.Namespace, *, limits_owner: int = 0) -> Broker:
     return Broker(QueueStore(store_root / "queue"), ControlResolver(run_dir / "control" / "control.sock"),
                   SignersSource(store_root / "policy", store_root / "routes" / "trust.pub"),
                   contracts=store_root / CONTRACTS_DIR, contracts_owner=dispatch_uid,
-                  limits=PolicyLimits(store_root / "policy", owner=limits_owner))
+                  limits=PolicyLimits(store_root / "policy", owner=limits_owner), fence=build_fence(args))
 
 
 def main(argv: list[str] | None = None) -> int:
