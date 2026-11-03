@@ -677,28 +677,96 @@ class Started:
 
 GATE_REFUSED = 75   # the gate's exit when it reads anything but the release byte (EOF: its holder closed or died)
 GATE_NO_EXEC = 127  # the gate's exit when the released argv could not be exec'd
-# The gate, then the lifeline. Before the release: EOF exits GATE_REFUSED, nothing ran. On the release byte it forks
-# the executor into its own process group (the gate leads it: start_new_session) and keeps the read end. A thread
-# reaps the executor and exits with its status (a signal death as 128 + the signal). The main thread reads on: the
-# holder writes nothing more, so the read returns only at EOF, the holder closed its end (abort) or died, and the gate
-# then SIGKILLs its whole process group, itself included, so no executor outlives its holder.
-_GATE = ("import os, signal, sys, threading\n"
+# The gate, then the lifeline (P6-5b r3: codex HIGH r2, complement MED r2). Before the release: EOF exits
+# GATE_REFUSED, nothing ran. On the release byte, with SIGTERM/SIGINT/SIGHUP blocked, the gate forks an ANCHOR that
+# leads a new process group (setpgid in both processes, so neither order races) and then forks the executor INTO that
+# group (setpgid in both again; an executor that cannot join exits GATE_NO_EXEC without exec). The gate stays alone in
+# its own group, so nothing the executor's group receives reaches it. The anchor is never reaped before the end, so
+# the group's id cannot be reused while anyone signals it; it holds the read end of a pipe only the gate writes, and
+# the gate's death by any signal (SIGKILL included) EOFs it and it SIGKILLs the group. The gate then installs handlers
+# for the three signals (each records 128 + the signal and SIGKILLs the group) and unblocks them. A thread reaps the
+# executor; it then SIGKILLs the group (whatever the executor left there, a backgrounded child), reaps the anchor,
+# waits until no member of the group is left, and only then exits with the executor's status (a signal death as 128
+# + the signal) or a handled signal's 128 + signal. The main thread reads on the lifeline; EOF (the holder's abort or
+# death) SIGKILLs the group and leaves the exit to the reaper. Every exit of the gate is >= 0 and follows the group's
+# end; a gate killed outright (status < 0) is the one exit that proves nothing about the group.
+_GATE = ("import os, signal, sys, threading, time\n"
          "fd = int(sys.argv[1])\n"
          f"if os.read(fd, 1) != b'1':\n    sys.exit({GATE_REFUSED})\n"
+         "SIGS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)\n"
+         "signal.pthread_sigmask(signal.SIG_BLOCK, SIGS)\n"
+         "tie_r, tie_w = os.pipe()\n"
+         "anchor = os.fork()\n"
+         "if anchor == 0:\n"
+         "    try:\n"
+         "        os.setpgid(0, 0)\n"
+         "        os.close(fd)\n"
+         "        os.close(tie_w)\n"
+         "        while os.read(tie_r, 1):\n"
+         "            pass\n"
+         "    finally:\n"
+         "        if os.getpgrp() == os.getpid():\n"   # never the gate's group
+         "            os.killpg(os.getpgrp(), signal.SIGKILL)\n"
+         "        os._exit(0)\n"
+         "os.close(tie_r)\n"
+         "try:\n"
+         "    os.setpgid(anchor, anchor)\n"
+         "except OSError:\n"
+         "    pass\n"
          "pid = os.fork()\n"
          "if pid == 0:\n"
          "    try:\n"
+         "        os.setpgid(0, anchor)\n"
+         "        signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGS)\n"
          "        os.close(fd)\n"
          "        os.execvp(sys.argv[2], sys.argv[2:])\n"
          "    finally:\n"
          f"        os._exit({GATE_NO_EXEC})\n"
+         "try:\n"
+         "    os.setpgid(pid, anchor)\n"
+         "except OSError:\n"
+         "    pass\n"   # EACCES: it exec'd, so it joined first; ESRCH: it is gone
+         "ending = threading.Lock()\n"
+         "status = []\n"
+         "def kill_group():\n"
+         "    if ending.acquire(blocking=False):\n"   # held for good once the reaper reaps the anchor
+         "        try:\n"
+         "            os.killpg(anchor, signal.SIGKILL)\n"
+         "        except OSError:\n"
+         "            pass\n"
+         "        ending.release()\n"
+         "def on_signal(signum, frame):\n"
+         "    status.append(128 + signum)\n"
+         "    kill_group()\n"
          "def reap():\n"
          "    code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])\n"
-         "    os._exit(code if code >= 0 else 128 - code)\n"
-         "threading.Thread(target=reap, daemon=True).start()\n"
+         "    ending.acquire()\n"
+         "    try:\n"
+         "        os.killpg(anchor, signal.SIGKILL)\n"
+         "    except OSError:\n"
+         "        pass\n"
+         "    os.waitpid(anchor, 0)\n"
+         "    while True:\n"
+         "        try:\n"
+         "            os.killpg(anchor, 0)\n"
+         "        except OSError:\n"
+         "            break\n"
+         "        time.sleep(0.01)\n"
+         "    os._exit(status[0] if status else code if code >= 0 else 128 - code)\n"
+         "reaper = threading.Thread(target=reap, daemon=True)\n"
+         "try:\n"
+         "    reaper.start()\n"
+         "except BaseException:\n"   # the class of codex MED r2: no reaper thread, so end the run here, in order
+         "    kill_group()\n"
+         "    reap()\n"
+         "for s in SIGS:\n"
+         "    signal.signal(s, on_signal)\n"
+         "signal.pthread_sigmask(signal.SIG_UNBLOCK, SIGS)\n"
          "while os.read(fd, 1):\n"
          "    pass\n"
-         "os.killpg(os.getpgrp(), signal.SIGKILL)\n")
+         "kill_group()\n"
+         "while True:\n"
+         "    reaper.join(3600)\n")
 
 
 class GatedChild:
@@ -708,13 +776,21 @@ class GatedChild:
     signal it (BUILD_PLAN §2, rule (a)); nobody signals it by a stored pid.
 
     The pipe is also the run's LIFELINE (codex HIGH, P6-5b r1): :meth:`release` writes the byte and KEEPS the write
-    end, the gate forks ``argv`` into its process group and keeps the read end, and when the write end closes (the
-    holder's :meth:`abort`, or the holder's death by any signal, SIGKILL included, which the kernel answers by closing
-    its fds) the gate SIGKILLs the whole group. ``process`` is the gate; its exit status is the executor's (a signal
-    death as 128 + the signal, :data:`GATE_NO_EXEC` when ``argv`` could not be exec'd). What the lifeline cannot
-    reach: a descendant that leaves the process group (``setsid``, its own ``setpgid``) is not in the group the gate
-    kills, and a holder that ``fork``\\ s without ``exec`` copies the write end into the copy, which then holds the
-    run open."""
+    end, and the gate keeps the read end. The gate runs ``argv`` in a process group of its own, apart from the gate's
+    (P6-5b r3), and SIGKILLs that group when the write end closes (the holder's :meth:`abort`, or the holder's death by
+    any signal, SIGKILL included, which the kernel answers by closing its fds), when the executor exits on its own
+    (what it left in the group, a backgrounded child), and when the gate takes SIGTERM, SIGINT or SIGHUP (a ``stop()``
+    signalling ``process``: it exits 128 + the signal). A gate killed outright (SIGKILL) cannot act; the group's anchor
+    sees its death and SIGKILLs the group itself.
+
+    ``process`` is the gate. Every status it exits with is >= 0 and comes only after no member of the executor's group
+    is left: the executor's own (a signal death as 128 + the signal, :data:`GATE_NO_EXEC` when ``argv`` could not be
+    exec'd), or 128 + a signal the gate handled. A negative ``returncode`` (the gate killed outright) proves nothing
+    about the group, so an executor's ``stop()`` that reads termination off this child reads it as reaped with
+    ``returncode >= 0``, and signals ``process`` with SIGTERM, never SIGKILL first.
+
+    What the lifeline cannot reach: a descendant that leaves the group (``setsid``, its own ``setpgid``) or that this
+    user may not signal, and a holder that ``fork``\\ s without ``exec``, whose copy then holds the run open."""
 
     def __init__(self, argv: Sequence[str], *, stdin=subprocess.DEVNULL, stdout=None, stderr=None,
                  env: Mapping[str, str] | None = None, cwd: str | Path | None = None) -> None:
@@ -743,9 +819,10 @@ class GatedChild:
 
     def abort(self, timeout: float = 5.0) -> int:
         """Close the pipe and reap the gate. Unreleased, the gate exits :data:`GATE_REFUSED` and nothing ran;
-        released, the gate kills its process group, the executor with it. A gate that does not exit in ``timeout`` has
-        its group killed through this unreaped handle (its pid is the group's id and cannot be reused while it is
-        unreaped). Returns the gate's exit status."""
+        released, the gate kills the executor's group and exits once it is gone. A gate that does not exit in
+        ``timeout`` has its own group killed through this unreaped handle (its pid is that group's id and cannot be
+        reused while it is unreaped), and the executor group's anchor then kills that group. Returns the gate's exit
+        status: negative only in that last case, which proves nothing about the executor's group."""
         if self._write is not None:
             fd, self._write = self._write, None
             os.close(fd)
@@ -850,7 +927,8 @@ def spawn_fire(store_dir: Path | str, occurrence_id: str, *, argv: Sequence[str]
     signals it; stopping a fire is an executor's ``stop()``, through the identity record the fire writes. A daemon
     thread of the launcher waits on the returned ``Popen``, so a fire nobody waits on leaves no zombie (its
     ``returncode`` is set as it exits; a caller's own ``wait()`` returns the same status). A launcher that exits
-    first leaves the fire to be reaped by init. ``argv`` defaults to :func:`fire_argv`."""
+    first leaves the fire to be reaped by init. A reaper that cannot start has the fire's group SIGKILLed and reaped
+    before its error propagates. ``argv`` defaults to :func:`fire_argv`."""
     occurrence_id = _occurrence(occurrence_id)
     fires = Path(store_dir) / FIRES
     fires.mkdir(mode=0o700, exist_ok=True)
@@ -858,7 +936,17 @@ def spawn_fire(store_dir: Path | str, occurrence_id: str, *, argv: Sequence[str]
         proc = subprocess.Popen(list(argv) if argv is not None else fire_argv(store_dir, occurrence_id),
                                 start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL, stdout=out,
                                 stderr=subprocess.STDOUT, env=None if env is None else dict(env))
-    threading.Thread(target=proc.wait, name=f"reap-{occurrence_id}", daemon=True).start()
+    try:
+        threading.Thread(target=proc.wait, name=f"reap-{occurrence_id}", daemon=True).start()
+    except BaseException:
+        # codex MED r2: no reaper means no owner; the fire leads its session and is unreaped, so its pid is its
+        # group's id here and cannot name another group
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise
     return proc
 
 

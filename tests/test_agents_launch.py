@@ -703,7 +703,8 @@ def test_a_fire_killed_after_the_release_takes_its_executor_with_it(rig, tmp_pat
 
 def test_a_released_child_runs_until_its_holder_lets_go_and_exits_with_the_executors_status(tmp_path):
     # behaviour: after the release the executor runs while the holder keeps its end; abort() then ends the run (the
-    # group goes with the gate), and an executor that exits on its own hands its status to the holder's wait
+    # gate kills the executor's group before it exits), and an executor that exits on its own hands its status to the
+    # holder's wait
     child, lock, up = _sleeper(tmp_path)
     gated = ctl.GatedChild(child)
     try:
@@ -804,3 +805,106 @@ def test_a_record_left_by_a_dead_fire_is_replaced_and_a_live_fires_is_not(rig, t
     finally:
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait(30)
+
+
+# --- P6-5b r3: the executor's own process group, the gate's signal handlers, a fire whose reaper cannot start -------
+
+# an executor stand-in that backgrounds a SLEEPER (same process group, as a tool's child would be), waits for it to be
+# up, gives the test a second to read its group, and exits 5 on its own
+FORKING_EXECUTOR = ("import os, subprocess, sys, time; subprocess.Popen([sys.executable, '-c', sys.argv[1], *sys.argv[2:]]); "
+                    "[time.sleep(0.05) for _ in range(600) if not os.path.exists(sys.argv[3])]; time.sleep(1); sys.exit(5)")
+
+
+def _group_gone(pgid: int) -> bool:
+    """True when no process is left in group ``pgid`` (read the instant the gate was reaped: the gate's own exit,
+    not a later kill, must be what ended it)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def test_an_executor_that_exits_on_its_own_takes_its_backgrounded_children_with_it(tmp_path):
+    # behaviour (codex HIGH r2): the executor leads a process group of its own, apart from the gate's; when it exits on
+    # its own, the gate SIGKILLs what it left in that group (a backgrounded child) and exits with the executor's status
+    # only once that group is gone: no descendant outlives the gate unguarded
+    _, lock, up = _sleeper(tmp_path)
+    gated = ctl.GatedChild([sys.executable, "-c", FORKING_EXECUTOR, SLEEPER, str(lock), str(up)])
+    try:
+        gated.release()
+        _wait_for(up, gated.process)
+        group = os.getpgid(int(up.read_text()))
+        assert group != gated.process.pid                             # the executor's group is not the gate's
+        assert gated.process.wait(30) == 5
+        assert _group_gone(group), "the gate exited before the executor's group was gone"
+        assert _ended(lock, 0), "a backgrounded child outlived the gate"
+    finally:
+        _reap_stray(lock, up)
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+def test_a_signal_to_the_gate_ends_the_executors_group_first(tmp_path, sig):
+    # behaviour (complement MED r2): ``process`` is the gate, so an executor's stop() that signals its pid reaches the
+    # gate, not the executor; the gate kills the executor's group, waits for it to be gone, and exits 128 + the signal
+    child, lock, up = _sleeper(tmp_path)
+    gated = ctl.GatedChild(child)
+    try:
+        gated.release()
+        _wait_for(up, gated.process)
+        group = os.getpgid(int(up.read_text()))
+        assert group != gated.process.pid                             # the executor is not in the gate's group
+        os.kill(gated.process.pid, sig)
+        assert gated.process.wait(30) == 128 + sig
+        assert _group_gone(group), "the gate exited before the executor's group was gone"
+        assert _ended(lock, 0), "the executor outlived its gate's signal"
+    finally:
+        _reap_stray(lock, up)
+
+
+def test_a_gate_killed_outright_still_takes_the_executor_with_it(tmp_path):
+    # behaviour: the gate cannot catch SIGKILL; the executor group's anchor holds a pipe only the gate writes, so the
+    # gate's death EOFs it and the anchor SIGKILLs the group. The gate's status is then the signal (-9), never >= 0: a
+    # non-negative status is the proof the group is gone
+    child, lock, up = _sleeper(tmp_path)
+    gated = ctl.GatedChild(child)
+    try:
+        gated.release()
+        _wait_for(up, gated.process)
+        os.kill(gated.process.pid, signal.SIGKILL)
+        assert gated.process.wait(30) == -signal.SIGKILL
+        assert _ended(lock), "the executor outlived its gate's SIGKILL"
+    finally:
+        _reap_stray(lock, up)
+
+
+def test_a_fire_whose_reaper_cannot_start_is_killed_and_reaped_before_the_error(rig, monkeypatch):
+    # behaviour (codex MED r2): Popen started the fire and the reaper thread then failed to start; spawn_fire kills the
+    # fire's process group, reaps it and re-raises, so no fire runs with no owner
+    import threading
+    oid, _ = _launched(rig)
+    made = []
+
+    class Recorded(subprocess.Popen):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+
+    class NoThread(threading.Thread):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(ctl.subprocess, "Popen", Recorded)
+    monkeypatch.setattr(ctl.threading, "Thread", NoThread)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        ctl.spawn_fire(rig.store.directory, oid, argv=[sys.executable, "-c", "import time; time.sleep(60)"], env=ENV)
+    monkeypatch.undo()
+    (fire,) = made
+    try:
+        assert fire.returncode == -signal.SIGKILL, "the ownerless fire was left running"
+        with pytest.raises(ChildProcessError):
+            os.waitpid(fire.pid, os.WNOHANG)
+    finally:
+        if fire.returncode is None:
+            fire.kill()
+            fire.wait(30)
