@@ -56,14 +56,21 @@ class World:
             binding_id=BINDING)})
         set_operation(self.rig.store, self.ids["paused"], "paused")
         retire_agent(self.rig.store, self.ids["retired"])
+        self.ck = Cockpit(entity=lambda ctx: {"name": "t"})
         self.wiring = AgentsWiring(store_dir=tmp / "s", cockpit_root=self.rig.world.root if cockpit_root else None,
                                    signing=lambda: self.rig.world.keys["laptop"], clock=lambda: self.rig.now())
-        self.ck = Cockpit(entity=lambda ctx: {"name": "t"})
-        self.ck.discover(agents_discoverer(lambda: self.wiring), retire=True)
-        self.ck.agents_wiring = self.wiring
+        self.ck.discover(agents_discoverer(self.ck), retire=True)
         self.reg = VerbRegistry()
         self.ck.attach_verbs(VerbView(self.reg, self.ck, REPORTED))
         self.ck.manifest(CLOSED)                     # discovery runs on a manifest, as in the server
+
+    @property
+    def wiring(self) -> AgentsWiring:
+        return self.ck.agents_wiring
+
+    @wiring.setter
+    def wiring(self, value: AgentsWiring) -> None:
+        self.ck.agents_wiring = value            # the one place the panel and the verbs both read it
 
     def panel(self) -> dict:
         self.ck.manifest(CLOSED)
@@ -169,7 +176,8 @@ def test_the_panel_never_writes_and_a_missing_store_draws_nothing_and_makes_noth
     empty = tmp_path / "never"
     empty.mkdir()
     ck = Cockpit(entity=lambda ctx: {"name": "t"})
-    ck.discover(agents_discoverer(lambda: AgentsWiring(store_dir=empty)), retire=True)
+    ck.agents_wiring = AgentsWiring(store_dir=empty)
+    ck.discover(agents_discoverer(ck), retire=True)
     ids = [p for z in ck.manifest(CLOSED)["regions"]["zones"] for p in z["panels"]]
     assert AGENTS_ID not in ids and list(empty.iterdir()) == []
 
@@ -202,7 +210,6 @@ def test_each_verb_is_a_kernel_verbspec_calling_its_owner_and_the_signing_entry_
     # no signing key held: refused, 501, nothing appended
     world.wiring = AgentsWiring(store_dir=world.wiring.store_dir, cockpit_root=world.wiring.cockpit_root,
                                 clock=world.wiring.clock)
-    world.ck.agents_wiring = world.wiring
     with pytest.raises(EditError) as ei:
         world.post("agent_renew", "firing", {"days": 29}, confirm=True)
     assert ei.value.code == "not_built"
@@ -213,3 +220,131 @@ def test_each_verb_is_a_kernel_verbspec_calling_its_owner_and_the_signing_entry_
     assert world.post("agent_retire", "unarmed", confirm=True)["registration"] == "retired"
     assert world.group_of("unarmed") == "retired"
     assert calls == ["set_operation", "set_operation", "renew_agent_link", "retire_agent"]
+
+
+# --- L3 r1 fixes: each case below was first reproduced against the r1 tree (/tmp/p9a_fix1/repro.py in the lane) ---
+
+def _revise(world: World, name: str) -> int:
+    from levain.agents.spec import get_agent
+
+    spec = copy.deepcopy(_spec("w-" + name))
+    spec["trigger"]["cron"] = f"{10 + get_agent(world.rig.store, world.ids[name])['current_version']} 4 * * *"
+    return register_spec(world.rig.store, spec, "America/New_York", revise=True)[2]
+
+
+def _race(world: World, monkeypatch, act) -> None:
+    """Run ``act`` after the dispatch has matched the row to its render and before the handler writes: what a second
+    process landing in that gap does."""
+    import levain.cockpit.verbs as verbs_mod
+
+    real = verbs_mod._agent_target
+
+    def racing(target, params, allowed=()):
+        out = real(target, params, allowed)
+        act(target)
+        return out
+    monkeypatch.setattr(verbs_mod, "_agent_target", racing)
+
+
+def _log_seqs(world: World) -> list[int]:
+    log = sqlite3.connect(world.rig.world.db)
+    try:
+        return [r[0] for r in log.execute("SELECT seq FROM authority_log ORDER BY seq")]
+    finally:
+        log.close()
+
+
+def test_the_panel_and_the_verbs_read_one_wiring_and_a_verb_with_none_refuses(world, tmp_path, monkeypatch):
+    # behaviour (codex H1, deepseek H2): r1 drew the panel from store A and retired the same agent id in the levain
+    # home's default store B when the cockpit's own attribute was unset. Now a cockpit with no agents wiring draws no
+    # agents panel, and an agent verb handed no wiring refuses and touches no store
+    from levain.agents.spec import get_agent
+    from levain.agents.store import open_agent_store
+    import levain.cockpit.verbs as verbs_mod
+
+    home = tmp_path / "homeB"
+    shutil.copytree(world.wiring.store_dir, home / "autonomic")
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    row = world.ck.read_one(AGENTS_ID, world.rid("unarmed")).value
+    world.ck.agents_wiring = None
+    ids = [p for z in world.ck.manifest(CLOSED)["regions"]["zones"] for p in z["panels"]]
+    assert AGENTS_ID not in ids
+    for fire in (verbs_mod._agent_retire_fire, verbs_mod._agent_operation_fire("paused")):
+        with pytest.raises(EditError) as ei:
+            fire(object(), {}, {"row": row, "agents": None}, True)
+        assert ei.value.code == "not_built"
+    assert get_agent(open_agent_store(home / "autonomic"), world.ids["unarmed"])["registration"] == "registered"
+
+
+def test_retire_and_pause_check_the_version_the_row_showed_inside_their_write(world, monkeypatch):
+    # behaviour (codex H2): r1 retired version 2 of an agent whose version 1 the operator confirmed, when a revise
+    # landed between the dispatch's row check and the write. Now the write refuses as stale and changes nothing
+    from levain.agents.spec import get_agent
+
+    _race(world, monkeypatch, lambda target: _revise(world, "firing"))
+    with pytest.raises(EditError) as ei:
+        world.post("agent_retire", "firing", confirm=True)
+    assert ei.value.code == "stale"
+    agent = get_agent(world.rig.store, world.ids["firing"])
+    assert agent["registration"] == "registered" and agent["current_version"] == 2
+    with pytest.raises(EditError) as ei:
+        world.post("agent_pause", "firing")              # the race revises again: version 3 under a version-2 row
+    assert ei.value.code == "stale" and get_agent(world.rig.store, world.ids["firing"])["operation"] == "active"
+
+
+@pytest.mark.parametrize("what", ["revise", "retire"])
+def test_renew_refuses_when_the_agent_moved_after_the_row_check_and_appends_nothing(world, monkeypatch, what):
+    # behaviour (codex H3): r1 renewed the link of a spec that a revise had just superseded and said it renewed the
+    # agent. Now a revise or a retire landing after the dispatch's row check refuses before the signature
+    world.rig.world.clock.now += timedelta(days=1)
+    before = _log_seqs(world)
+    act = {"revise": lambda target: _revise(world, "firing"),
+           "retire": lambda target: retire_agent(world.rig.store, world.ids["firing"])}[what]
+    _race(world, monkeypatch, act)
+    with pytest.raises(EditError) as ei:
+        world.post("agent_renew", "firing", {"days": 29}, confirm=True)
+    assert ei.value.code == "stale" and "nothing was signed" in str(ei.value)
+    assert _log_seqs(world) == before
+
+
+def test_renew_refuses_a_link_id_that_names_another_agents_link(world, monkeypatch):
+    world.rig.world.clock.now += timedelta(days=1)
+    world.rig.n = 1                                           # World signed al-000000000001 itself
+    other = world.rig.link()                                  # a link for the rig's own agent, not w-firing
+    before = _log_seqs(world)
+    _race(world, monkeypatch, lambda target: target["row"]["facets"].__setitem__("agent_link", other))
+    with pytest.raises(EditError) as ei:
+        world.post("agent_renew", "firing", {"days": 29}, confirm=True)
+    assert ei.value.code == "stale" and "does not cover" in str(ei.value) and _log_seqs(world) == before
+
+
+def test_a_store_error_while_renewing_is_source_unavailable_not_a_refusal(world, monkeypatch):
+    # behaviour (codex L5): r1 answered a locked or broken journal as a policy refusal (409)
+    import levain.agents.signing as signing
+
+    def locked(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(signing, "renew_agent_link", locked)
+    with pytest.raises(EditError) as ei:
+        world.post("agent_renew", "firing", {"days": 29}, confirm=True)
+    assert ei.value.code == "source_unavailable"
+
+
+def test_a_pause_wins_over_an_unreadable_log_and_one_bad_judgement_is_one_row(tmp_path, monkeypatch):
+    # behaviour (codex M4, complement M1, deepseek M4): r1 drew a paused agent as Unarmed when the log could not be
+    # read, so resume was not offered; and any error but AgentAuthorityError faulted the whole panel
+    blind = World(tmp_path, cockpit_root=False)
+    row = blind.ck.read_one(AGENTS_ID, blind.rid("paused")).value
+    assert row["facets"]["agent_group"] == "paused" and row["facets"]["agent_link"] == ""
+    assert blind.post("agent_resume", "paused")["operation"] == "active"
+    from levain.agent_authority import AgentAuthority
+
+    (tmp_path / "seeing").mkdir()
+    seeing = World(tmp_path / "seeing")
+    monkeypatch.setattr(AgentAuthority, "peek", lambda self, *a, **k: (_ for _ in ()).throw(KeyError("spec_hash")))
+    panel = seeing.panel()
+    bodies = {r["id"]: r for r in panel["rows"]}
+    assert "firing" not in _groups(panel)
+    assert "arming unknown" in bodies[seeing.rid("firing")]["body"]
+    assert bodies[seeing.rid("firing")]["facets"]["agent_link"] == ""
+    assert bodies[seeing.rid("paused")]["group"] == "paused"

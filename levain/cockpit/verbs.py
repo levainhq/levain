@@ -418,8 +418,6 @@ def _note_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, An
     return {"dismissed": n}
 
 
-# a coordinator review queue row (levain.cockpit.coordinator_panels): clear on an open item that is not "yours to clear",
-# reopen on a cleared one
 # an agents panel row (levain.cockpit.agents_panel): pause and retire act on a live agent, resume on a paused one, renew on
 # one with a signed link for its current spec. Each handler calls the owner of the act in levain.agents and nothing
 # lower: a renew goes through the one signing entry, so the checks that entry gains reach it with no change here.
@@ -432,41 +430,60 @@ _RENEWABLE_AGENT_ROW = lambda r: (_AGENT_ROW(r) and _facet(r, "agent_group") in 
                                   and bool(_facet(r, "agent_link")))
 
 
-def _agent_target(target: dict[str, Any], params: dict[str, Any], allowed: tuple[str, ...] = ()) -> tuple[Any, str]:
-    """``(wiring, agent_id)`` of an agent verb's row; the params are only ``allowed`` ones."""
+def _agent_target(target: dict[str, Any], params: dict[str, Any],
+                  allowed: tuple[str, ...] = ()) -> tuple[Any, str, int, str]:
+    """``(wiring, agent_id, version, store_id)`` of an agent verb's row: the version and store the row was read at
+    (the dispatch has just re-read it and matched it to the render). The params are only ``allowed`` ones. A cockpit
+    that carries no agents wiring refuses: the verb never guesses a store (the panel reads the same wiring)."""
     from levain.cockpit.agents_panel import AgentsWiring
 
     extra = sorted(set(params) - set(allowed))
     if extra:
         raise EditError("bad_request", 400, f"this agent verb does not take {extra}")
-    rid = str((target.get("row") or {}).get("id", ""))
+    row = target.get("row")
+    rid = str((row or {}).get("id", ""))
     if not rid.startswith(_AGENT_PREFIX) or len(rid) == len(_AGENT_PREFIX):
         raise EditError("bad_request", 400, f"{rid[:60]!r} is not an agents panel row")
-    return (target.get("agents") or AgentsWiring()), rid[len(_AGENT_PREFIX):]
+    wiring = target.get("agents")
+    if not isinstance(wiring, AgentsWiring):
+        raise EditError("not_built", 501, "this cockpit carries no agents wiring: no agent store is named to act on")
+    version, store_id = _facet(row, "agent_version"), _facet(row, "agent_store")
+    if type(version) is not int or not isinstance(store_id, str) or not store_id:
+        raise EditError("stale", 409, f"row {rid[:60]!r} names no agent version and store: look at it again")
+    return wiring, rid[len(_AGENT_PREFIX):], version, store_id
 
 
-def _agent_store_write(wiring: Any) -> Any:
+def _agent_store_write(wiring: Any, store_id: str) -> Any:
+    """The writable agent store of ``wiring``, refused unless it is the store ``store_id`` the row was read from."""
     from levain.agents.store import AgentStoreRefused, open_agent_store
     from levain.autonomic.db import StoreFormatError
 
     try:
-        return open_agent_store(wiring.store_dir)
+        store = open_agent_store(wiring.store_dir)
+        with store.read() as conn:
+            held = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
     except AgentStoreRefused as exc:
         raise EditError("not_built", 501, str(exc)) from None
     except (StoreFormatError, sqlite3.Error, OSError) as exc:
         raise EditError("source_unavailable", 503, f"the agent store cannot be opened now: {exc}") from None
+    if held is None or str(held[0]) != store_id:      # a store's id is written once: no later write can move it
+        raise EditError("stale", 409, "the agent store the cockpit names now is not the one this row was read from")
+    return store
 
 
 def _agent_operation_fire(operation: str) -> Callable[..., dict[str, Any]]:
-    """Pause or resume the agent and its whole feeder group together (:func:`levain.agents.spec.set_operation`)."""
+    """Pause or resume the agent and its whole feeder group together (:func:`levain.agents.spec.set_operation`), only
+    while the agent is at the version the row showed (checked inside the write)."""
     def fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
-        from levain.agents.spec import SpecError, set_operation
+        from levain.agents.spec import AgentMoved, SpecError, set_operation
         from levain.autonomic.db import StoreFormatError
 
-        wiring, agent_id = _agent_target(target, params)
-        store = _agent_store_write(wiring)
+        wiring, agent_id, version, store_id = _agent_target(target, params)
+        store = _agent_store_write(wiring, store_id)
         try:
-            members = set_operation(store, agent_id, operation)
+            members = set_operation(store, agent_id, operation, expect_version=version)
+        except AgentMoved as exc:
+            raise EditError("stale", 409, str(exc)) from None
         except SpecError as exc:
             raise EditError("refused", 409, str(exc)) from None
         except (sqlite3.Error, StoreFormatError, OSError) as exc:
@@ -478,13 +495,15 @@ def _agent_operation_fire(operation: str) -> Callable[..., dict[str, Any]]:
 
 def _agent_retire_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any],
                        confirm: bool) -> dict[str, Any]:
-    from levain.agents.spec import SpecError, retire_agent
+    from levain.agents.spec import AgentMoved, SpecError, retire_agent
     from levain.autonomic.db import StoreFormatError
 
-    wiring, agent_id = _agent_target(target, params)
-    store = _agent_store_write(wiring)
+    wiring, agent_id, version, store_id = _agent_target(target, params)
+    store = _agent_store_write(wiring, store_id)
     try:
-        agent, reader, group = retire_agent(store, agent_id)
+        agent, reader, group = retire_agent(store, agent_id, expect_version=version)
+    except AgentMoved as exc:
+        raise EditError("stale", 409, str(exc)) from None
     except SpecError as exc:
         raise EditError("refused", 409, str(exc)) from None
     except (sqlite3.Error, StoreFormatError, OSError) as exc:
@@ -496,14 +515,21 @@ def _agent_renew_fire(scope: "WriteScope", params: dict[str, Any], target: dict[
                       confirm: bool) -> dict[str, Any]:
     """Move the expiry of the agent's link (``days`` from now, default 29) through
     :func:`levain.agents.signing.renew_agent_link`, signed by the laptop-presence key the cockpit's wiring names. A
-    cockpit that holds no such key refuses (501) and appends nothing: the log would refuse any other signer anyway."""
+    cockpit that holds no such key refuses (501) and appends nothing: the log would refuse any other signer anyway.
+
+    Before signing, the agent store and the log are read again: the agent must still be registered at the version the
+    row showed, and the link must name this agent, this store and its current spec hash (link ids count up per log,
+    so an id alone could name another agent's link). Anything else refuses as stale and appends nothing. A change
+    landing during the signature itself is not seen; the link it renews then covers a spec no longer current, which
+    arms nothing (a spec hash is never current again)."""
     from datetime import timedelta
 
     from levain.agents.cli import _signing_refusals
     from levain.agents.signing import renew_agent_link
     from levain.authority import AGENT_LINK_MAX
+    from levain.cockpit.firejournal import CockpitFormatError
 
-    wiring, agent_id = _agent_target(target, params, ("days",))
+    wiring, agent_id, version, store_id = _agent_target(target, params, ("days",))
     days = params.get("days", 29)
     if type(days) is not int or not 1 <= days <= AGENT_LINK_MAX.days:
         raise EditError("bad_request", 400, f"'days' is a whole number from 1 to {AGENT_LINK_MAX.days}")
@@ -514,16 +540,49 @@ def _agent_renew_fire(scope: "WriteScope", params: dict[str, Any], target: dict[
     if wiring.signing is None or wiring.cockpit_root is None:
         raise EditError("not_built", 501, "this cockpit holds no laptop-presence signing key, and only one renews a "
                                           "link: run levain agents renew from the laptop")
+    _renew_target_holds(wiring, agent_id, version, store_id, link_id)
     try:
         signer_fp, sign = wiring.signing()
         new, expires_at = renew_agent_link(wiring.cockpit_root, link_id, life=timedelta(days=days),
                                            signer_fp=signer_fp, sign=sign,
                                            clock=wiring.now)
+    except (sqlite3.Error, OSError, CockpitFormatError) as exc:     # before the refusals, which also name these
+        raise EditError("source_unavailable", 503, f"the authority log cannot be written now: {exc}") from None
     except _signing_refusals() as exc:
         raise EditError("refused", 409, str(exc)) from None
     return {"agent": agent_id, "link": link_id, "expires_at": expires_at, "seq": new.seq}
 
 
+def _renew_target_holds(wiring: Any, agent_id: str, version: int, store_id: str, link_id: str) -> None:
+    """Refuse (stale, 409) unless agent ``agent_id`` of store ``store_id`` is registered at ``version`` and
+    ``link_id`` is an agent link for exactly that agent, store and current spec hash in the log a renew appends to."""
+    from levain.agent_authority import AgentAuthority
+    from levain.authority import agent_link
+
+    store = _agent_store_write(wiring, store_id)
+    try:
+        with store.read() as conn:
+            row = conn.execute("SELECT a.registration, a.current_version, s.spec_hash FROM agents a JOIN agent_specs s"
+                               " ON s.agent_id = a.agent_id AND s.version = a.current_version WHERE a.agent_id = ?",
+                               (agent_id,)).fetchone()
+    except (sqlite3.Error, OSError) as exc:
+        raise EditError("source_unavailable", 503, f"the agent store cannot be read now: {exc}") from None
+    if row is None or row[0] != "registered" or row[1] != version:
+        raise EditError("stale", 409, f"agent {agent_id} is no longer registered at version {version}: look at it "
+                                      "again (nothing was signed)")
+    try:
+        grant = AgentAuthority(wiring.cockpit_root).refresh().policy.grants.get(link_id)
+    except Exception as exc:  # noqa: BLE001 - the replay's own errors propagate unwrapped; any is "cannot read now"
+        raise EditError("source_unavailable", 503,
+                        f"the authority log cannot be read now ({type(exc).__name__})") from None
+    if not agent_link(grant) or (grant.get("agent_id"), grant.get("store_id"),
+                                 grant.get("spec_hash")) != (agent_id, store_id, row[2]):
+        raise EditError("stale", 409, f"link {link_id[:40]!r} does not cover agent {agent_id}'s current spec in this "
+                                      "store: look at it again (nothing was signed)")
+
+
+# a coordinator review queue row (levain.cockpit.coordinator_panels): clear on an open item that is not "yours to clear",
+# reopen on a cleared one
 _REVIEW_PREFIX = "review:"
 _CLEARABLE_REVIEW_ROW = lambda r: (str(r.get("id", "")).startswith(_REVIEW_PREFIX)   # noqa: E731
                                    and _facet(r, "review_state") == "open" and _facet(r, "review_authority") is False)
@@ -1323,8 +1382,9 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
                               # the server's Signer (levain.consent.sign): a signed review clear is verified against
                               # its passkeys; None on a server that runs no passkey ceremony
                               "signer": signer,
-                              # the agents panel's wiring (levain.cockpit.agents_panel.AgentsWiring), None on a cockpit
-                              # that carries none: the agent verbs then act on this levain home's store
+                              # the agents panel's wiring, the attribute the panel reads (agents_panel.cockpit_wiring);
+                              # an agent verb refuses unless it is an AgentsWiring (checked there, so a verb that is not
+                              # an agent verb never imports the agents modules)
                               "agents": getattr(cockpit, "agents_wiring", None)}
     if verb.binding == "value":
         supplied = req.get("panel_version")

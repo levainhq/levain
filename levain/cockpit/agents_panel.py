@@ -38,12 +38,12 @@ from levain.cockpit.engine import ProviderSpec, ReadContext
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
 __all__ = ["AGENTS_ID", "AGENT_ORDER", "AGENT_ROW_PREFIX", "AGENT_VERBS", "AgentsWiring", "RETIRED_SHOWN",
-           "agents_discoverer"]
+           "agents_discoverer", "cockpit_wiring"]
 
 AGENTS_ID = "agents"
 AGENT_ROW_PREFIX = "agent:"
 AGENT_ORDER = "agents.state"
-AGENT_FACETS = frozenset({"agent_group", "agent_link"})
+AGENT_FACETS = frozenset({"agent_group", "agent_link", "agent_version", "agent_store"})
 # the verbs an agent row offers (levain.cockpit.verbs registers them); `run now` has no owner yet and is not here
 AGENT_VERBS = ("agent_pause", "agent_resume", "agent_renew", "agent_retire")
 # the retired agents listed after the live ones, by name; older ones are in `levain agents list --all`
@@ -61,7 +61,8 @@ class AgentsWiring:
     home's), ``cockpit_root`` the cockpit's data root (the authority log, and where a renew appends), ``signing`` a
     callable returning ``(signer_fp, sign)`` of a laptop-presence key (None: this cockpit holds none, so a renew is
     refused and says so), ``clock`` the instant the panel judges arming at. A cockpit carries it as
-    ``cockpit.agents_wiring``; the verbs read it from there."""
+    ``cockpit.agents_wiring``, the ONE place the panel (:func:`agents_discoverer`) and the verbs both read it: a
+    cockpit that carries none draws no agents panel, and an agent verb on it refuses (never a default store)."""
 
     store_dir: Path | None = None
     cockpit_root: Path | None = None
@@ -70,6 +71,12 @@ class AgentsWiring:
 
     def now(self) -> datetime:
         return (self.clock or (lambda: datetime.now(timezone.utc)))()
+
+
+def cockpit_wiring(cockpit: Any) -> AgentsWiring | None:
+    """The cockpit's agents wiring, or None when it carries none."""
+    wiring = getattr(cockpit, "agents_wiring", None)
+    return wiring if isinstance(wiring, AgentsWiring) else None
 
 
 def _one_line(text: object, limit: int = 300) -> str:
@@ -98,7 +105,8 @@ class _Arming:
 def _links(arming: _Arming, agent_id: str, spec_hash: str, store_id: str) -> list[str]:
     """The agent's links for its CURRENT spec, highest-born first (the launch's candidates, without the binding)."""
     state = arming.state
-    assert state is not None
+    if state is None:
+        raise RuntimeError("_links is asked only of an arming whose log was read")
     return sorted((g for g in _auth.agent_links(state, agent_id, store_id)
                    if state.policy.grants[g]["spec_hash"] == spec_hash),
                   key=lambda g: state.grant_born.get(g) or 0, reverse=True)
@@ -106,15 +114,33 @@ def _links(arming: _Arming, agent_id: str, spec_hash: str, store_id: str) -> lis
 
 def _judge(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any], store_id: str, now: datetime
            ) -> tuple[str, str, str, str]:
-    """``(group, words, link id or "", expiry or "")`` of one REGISTERED agent."""
+    """``(group, words, link id or "", expiry or "")`` of one REGISTERED agent. A pause wins over anything the log
+    says, read or not (pause and resume need only the store); a log that cannot be judged for this agent leaves its
+    link details empty and an active agent Unarmed, never the whole panel a fault (the store's own errors still are)."""
+    paused = agent["operation"] != "active"
+    if arming.state is None or arming.authority is None:
+        return ("paused", "paused", "", "") if paused else ("unarmed", f"arming unknown: {arming.why}", "", "")
+    try:
+        return _judge_read(arming, conn, agent, store_id, now, paused)
+    except sqlite3.Error:
+        raise                          # the agent store's bar read: the store is unreadable, the panel says so
+    except Exception as exc:  # noqa: BLE001 - a log that cannot be judged is never health, and never one row's fault
+        why = ("the authority moved while it was read" if isinstance(exc, AgentAuthorityError)
+               else "the authority log could not be judged")
+        return ("paused", "paused", "", "") if paused else (
+            "unarmed", f"arming unknown: {why} ({type(exc).__name__})", "", "")
+
+
+def _judge_read(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any], store_id: str, now: datetime,
+                paused: bool) -> tuple[str, str, str, str]:
     from levain.agents.controller import _no_link_reason
 
     if arming.state is None or arming.authority is None:
-        return "unarmed", f"arming unknown: {arming.why}", "", ""
+        raise RuntimeError("_judge_read is asked only of an arming whose log was read")
     cands = _links(arming, agent["agent_id"], agent["spec_hash"], store_id)
     top = cands[0] if cands else ""
     expiry = str(arming.state.policy.grants[top]["expires_at"]) if top else ""
-    if agent["operation"] != "active":
+    if paused:
         return "paused", "paused", top, expiry
     if conn.execute("SELECT 1 FROM agent_bars WHERE agent_id = ? AND closed_at IS NULL",
                     (agent["agent_id"],)).fetchone() is not None:
@@ -136,16 +162,18 @@ def _judge(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any], sto
                        "signer_revoked": "a signer of its link is no longer trusted"}.get(reason, reason), top, expiry
 
 
-def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str) -> RowIn:
+def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, store_id: str) -> RowIn:
     streak = f" · {agent['failure_streak']} failed in a row" if agent["failure_streak"] else ""
     until = f" · link until {expiry}" if expiry and group != "retired" else ""
     body = _one_line(f"{agent['name']} · v{agent['current_version']} · {words}{streak}{until}")
     stored = {"agent_id": agent["agent_id"], "name": agent["name"], "version": agent["current_version"],
               "spec_hash": agent["spec_hash"], "registration": agent["registration"],
               "operation": agent["operation"], "failure_streak": agent["failure_streak"], "group": group,
-              "words": words, "link": link, "expires_at": expiry}
+              "words": words, "link": link, "expires_at": expiry, "store_id": store_id}
+    # agent_version and agent_store are what a verb's write checks the agent against, inside its own transaction
     return RowIn(id=AGENT_ROW_PREFIX + agent["agent_id"], title=_one_line(agent["name"], 120), body=body,
-                 facets={"agent_group": group, "agent_link": link}, stored=stored)
+                 facets={"agent_group": group, "agent_link": link, "agent_version": agent["current_version"],
+                         "agent_store": store_id}, stored=stored)
 
 
 def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[RowIn, ...], str | None] | None:
@@ -165,20 +193,19 @@ def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[R
         store_id = str(store_id_row[0])
         found = [dict(zip(("agent_id", "name", "current_version", "registration", "operation", "failure_streak",
                            "spec_hash"), r))
-                 for r in conn.execute(_AGENT_SQL + " ORDER BY a.name, a.created_at").fetchall()]
+                 for r in (conn.execute(_AGENT_SQL + " ORDER BY a.name, a.created_at") if only is None else
+                           conn.execute(_AGENT_SQL + " WHERE a.agent_id = ?", (only,))).fetchall()]
         retired_seen = 0
         for a in found:
-            if only is not None and a["agent_id"] != only:
-                continue
             if a["registration"] == "retired":
                 retired_seen += 1
                 if only is None and retired_seen > RETIRED_SHOWN:
                     older += 1
                     continue
-                rows.append(_row(a, "retired", "retired", "", ""))
+                rows.append(_row(a, "retired", "retired", "", "", store_id))
                 continue
             group, words, link, expiry = _judge(arming, conn, a, store_id, now)
-            rows.append(_row(a, group, words, link, expiry))
+            rows.append(_row(a, group, words, link, expiry, store_id))
     note = None
     if arming.why is not None:
         note = f"Arming is unknown: {arming.why}; no agent is shown as firing."
@@ -194,16 +221,26 @@ def _unreadable(exc: Exception) -> Result:
     return Fault(f"agents panel fault, not the store: {type(exc).__name__}: {_one_line(exc)}")
 
 
-def agents_discoverer(wiring: Callable[[], AgentsWiring]) -> Callable[[ReadContext], list[ProviderSpec]]:
-    """The agents panel for the install NOW (register with ``Cockpit.discover(..., retire=True)``): none while the
-    install has no agent store, so an install that never used agents draws no empty card. ``wiring`` is asked on every
-    read."""
+def agents_discoverer(cockpit: Any) -> Callable[[ReadContext], list[ProviderSpec]]:
+    """The agents panel for the install NOW (register with ``cockpit.discover(agents_discoverer(cockpit),
+    retire=True)``): none while the cockpit carries no ``agents_wiring`` or the install has no agent store, so an
+    install that never used agents draws no empty card. The wiring is read from the cockpit (:func:`cockpit_wiring`)
+    on every read, the same place the agent verbs read it."""
     def discover(ctx: ReadContext) -> list[ProviderSpec]:
+        held = cockpit_wiring(cockpit)
+        if held is None:
+            return []
         try:
-            if open_agent_store_view(wiring().store_dir).path is None:
+            if open_agent_store_view(held.store_dir).path is None:
                 return []
         except (AgentStoreRefused, StoreFormatError, sqlite3.Error, OSError):
             pass                       # a store that is there and unreadable: the panel draws and says so
+
+        def wiring() -> AgentsWiring:
+            now = cockpit_wiring(cockpit)
+            if now is None:
+                raise AgentStoreRefused("the cockpit no longer carries an agents wiring")
+            return now
 
         # a fresh callable per pass: a retired panel's state is matched to its spec by the callable's identity
         def agents_read(ctx: ReadContext) -> Result:
