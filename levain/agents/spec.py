@@ -56,7 +56,7 @@ from typing import Any
 from levain.agents.store import AgentStore, canonical_zone
 from levain.authority import _canonical
 
-__all__ = ["SpecError", "SPEC_FIELDS", "parse_spec", "parse_spec_text", "load_json", "finalize_spec", "spec_hash",
+__all__ = ["AgentMoved", "SpecError", "SPEC_FIELDS", "parse_spec", "parse_spec_text", "load_json", "finalize_spec", "spec_hash",
            "canonical_spec", "register_spec", "register_specs", "mint_agent_id", "find_revert", "list_agents", "get_agent", "set_operation", "retire_agent",
            "resolve_agent", "feeder_group", "stored_specs", "can_fire"]
 
@@ -84,6 +84,16 @@ _CRON_FIELDS = ("minute", "hour", "day-of-month", "month", "day-of-week")
 
 class SpecError(ValueError):
     """A spec file or an agent lookup is refused; the message names the field or the name."""
+
+
+class AgentMoved(SpecError):
+    """The agent is not at the version the caller saw (``expect_version``): nothing was written."""
+
+
+def _expect(agent: dict[str, Any], expect_version: int | None) -> None:
+    if expect_version is not None and agent["current_version"] != expect_version:
+        raise AgentMoved(f"agent {agent['agent_id']} is at version {agent['current_version']} now, not "
+                         f"{expect_version}: look at it again")
 
 
 def _exact(obj: Any, allowed: tuple[str, ...], where: str) -> dict[str, Any]:
@@ -524,15 +534,19 @@ def feeder_group(store: AgentStore, ref: str) -> list[dict[str, Any]]:
         return _group(conn, resolve_agent(conn, ref))
 
 
-def set_operation(store: AgentStore, ref: str, operation: str) -> list[tuple[dict[str, Any], bool]]:
+def set_operation(store: AgentStore, ref: str, operation: str, *,
+                  expect_version: int | None = None) -> list[tuple[dict[str, Any], bool]]:
     """``pause`` / ``resume`` the agent and its whole feeder group together (DESIGN §3.2). Return
     ``[(agent, changed)]``. Setting ``active`` is resume, the only writer of it, and resets the failure streak of each
-    member it moves from paused; a member whose operation does not change is not touched (its streak stands)."""
+    member it moves from paused; a member whose operation does not change is not touched (its streak stands).
+    ``expect_version``: refuse (:class:`AgentMoved`) unless the agent is at that version, judged in the write."""
     if operation not in ("paused", "active"):
         raise SpecError("operation is paused or active")
     out = []
     with store.write() as conn:
-        for member in _group(conn, resolve_agent(conn, ref)):
+        agent = resolve_agent(conn, ref)
+        _expect(agent, expect_version)
+        for member in _group(conn, agent):
             changed = member["operation"] != operation
             if changed and operation == "active":
                 conn.execute("UPDATE agents SET operation = 'active', failure_streak = 0 WHERE agent_id = ?",
@@ -544,13 +558,16 @@ def set_operation(store: AgentStore, ref: str, operation: str) -> list[tuple[dic
     return out
 
 
-def retire_agent(store: AgentStore, ref: str) -> tuple[dict[str, Any], str, list[str]]:
+def retire_agent(store: AgentStore, ref: str, *,
+                 expect_version: int | None = None) -> tuple[dict[str, Any], str, list[str]]:
     """Set the registration axis to ``retired`` (DESIGN §4.3); the operation axis is untouched. Return the agent,
-    the output's reader and the other members of its feeder group (what the retirement leaves dangling)."""
+    the output's reader and the other members of its feeder group (what the retirement leaves dangling).
+    ``expect_version``: refuse (:class:`AgentMoved`) unless the agent is at that version, judged in the write."""
     with store.write() as conn:
         agent = resolve_agent(conn, ref)
         if agent["registration"] == "retired":
             raise SpecError(f"agent {agent['agent_id']} is already retired")
+        _expect(agent, expect_version)
         group = [g["name"] for g in _group(conn, agent) if g["agent_id"] != agent["agent_id"]]
         text = conn.execute("SELECT spec FROM agent_specs WHERE agent_id = ? AND version = ?",
                             (agent["agent_id"], agent["current_version"])).fetchone()[0]
