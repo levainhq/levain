@@ -139,19 +139,22 @@ class Unreplied(NamedTuple):
     closed: bool
 
 
-def unreplied(conn: sqlite3.Connection, now: str, exclude: str | None = None) -> list[Unreplied]:
+def unreplied(conn: sqlite3.Connection, now: str, exclude: str | None = None, *, every: bool = False) -> list[Unreplied]:
     """Each drop sent from the cockpit or the phone (the terminal's words were answered in the session) with no
     coordinator reply that is past :data:`UNREPLIED_AFTER_MINUTES` and not older than
     :data:`UNREPLIED_SHOWN_DAYS`, oldest first: ``closed`` once past the reply window, which stays on the line for the
     rest of those days (silence must not read as heard because a window ran out). ``now``: a store stamp. ``exclude``:
-    a drop being answered right now. The one derivation the panel and the work delta both read."""
+    a drop being answered right now. The one derivation the panel and the work delta both read. ``every``: the walk's
+    reading (``coord close --plan``): no age floor and no age ceiling, so a drop he sent a second ago and one a month
+    old are both counted; ``closed`` still says which can no longer be answered."""
+    floor, ceiling = (-1.0, 1e9) if every else (UNREPLIED_AFTER_MINUTES, UNREPLIED_SHOWN_DAYS)
     rows = conn.execute(
         "SELECT d.drop_id, d.surface, d.received_at, (julianday(?) - julianday(d.received_at)) * 24 > ? "
         "FROM drops d WHERE d.surface != 'cli' AND NOT EXISTS (SELECT 1 FROM replies r WHERE "
         "r.kind = 'coordinator_reply' AND r.ref_store = 'drops' AND r.ref_id = d.drop_id) AND d.drop_id IS NOT ? "
         "AND (julianday(?) - julianday(d.received_at)) * 1440 > ? "
         "AND (julianday(?) - julianday(d.received_at)) <= ? ORDER BY d.rowid",
-        (now, REPLY_WINDOW_HOURS, exclude, now, UNREPLIED_AFTER_MINUTES, now, UNREPLIED_SHOWN_DAYS)).fetchall()
+        (now, REPLY_WINDOW_HOURS, exclude, now, floor, now, ceiling)).fetchall()
     return [Unreplied(d, surface, at, bool(closed)) for d, surface, at, closed in rows]
 
 

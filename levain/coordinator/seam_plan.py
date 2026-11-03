@@ -14,7 +14,8 @@ from typing import Any, Callable
 
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import utc_stamp
-from levain.coordinator import drop_reply, morning, ready
+from levain.coordinator import drop_reply, morning, ready, seam_open
+from levain.coordinator import lease as _leases
 from levain.coordinator.seam import _cap, _clean
 from levain.coordinator.seam_open import open_tables_present
 from levain.coordinator.store import CoordStore
@@ -36,6 +37,15 @@ def _guard(name: str, fn: Callable[[], str]) -> str:
         return f"{name}: cannot-derive ({type(exc).__name__}: {_cap(exc, 160)})"
 
 
+def _active_launch(conn: sqlite3.Connection, now: str) -> Any:
+    """The active coordinator launch holding the live lease (the one an acknowledgement would come from), or ``None``."""
+    held = _leases.lease(conn, now)
+    if held is None or not held.live or held.holder == "operator":
+        return None
+    ln = _leases._launch_by_key(conn, held.holder)
+    return ln if ln is not None and ln.role == "coordinator" and ln.state == "active" else None
+
+
 def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, lv: str) -> list[str]:
     """The walk's checklist at ``now`` (an aware datetime), one line per section, in the order the walk goes. ``lv``:
     how the commands in it spell levain. Raises when the coordinator store itself cannot be opened (the verb says so)."""
@@ -51,6 +61,7 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
         except Exception as exc:  # noqa: BLE001
             band_why = f"{type(exc).__name__}: {_cap(exc, 160)}"
         card: dict[str, Any] | None = None
+        card_why = "no morning card could be built"
         if band_items is not None:                  # an unreadable queue directory reads as empty: with the band unread,
             try:                                    # the queue parts are unknown, and are said so rather than counted 0
                 card = morning.card(store, queue_dir=qdir, conn=conn, now=now)
@@ -90,11 +101,19 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
                     f": they wait for his morning card ({lv} coord morning)")
 
         def drops() -> str:
-            got = drop_reply.unreplied(conn, read_at)
+            got = drop_reply.unreplied(conn, read_at, every=True)      # the walk counts every one, not the panel's window
             if not got:
                 return "drops with no reply: 0"
-            return (f"drops with no reply: {len(got)} ({_ids([u.drop_id for u in got])}): answer each with "
-                    f"{lv} coord reply DROP_ID --text-file PATH")
+            open_ = [u for u in got if not u.closed]
+            shut = [u for u in got if u.closed]
+            parts = []
+            if open_:
+                parts.append(f"{len(open_)} ({_ids([u.drop_id for u in open_])}): answer each with "
+                             f"{lv} coord reply DROP_ID --text-file PATH")
+            if shut:
+                parts.append(f"{len(shut)} past the reply window ({_ids([u.drop_id for u in shut])}), which can no "
+                             "longer be answered: name each id in the handoff's in_flight or notes")
+            return "drops with no reply: " + "; ".join(parts if open_ else ["0 to answer", *parts])
 
         def board() -> str:
             out = ready.list_ready(store, all=True, generated=read_at, conn=conn)
@@ -112,12 +131,34 @@ def close_plan(store: CoordStore, queue_dir: Path | str | None, now: datetime, l
         def unacked() -> str:
             if not open_tables_present(conn):
                 return "unacknowledged opens: 0 (this store has no open tables: nothing was ever built)"
-            rows = conn.execute("SELECT b.open_id FROM open_builds b WHERE NOT EXISTS (SELECT 1 FROM open_acks a WHERE "
-                                "a.open_id = b.open_id) ORDER BY b.open_id").fetchall()
+            rows = conn.execute("SELECT b.open_id, b.seam_kind, b.handoff_id FROM open_builds b WHERE NOT EXISTS (SELECT 1 "
+                                "FROM open_acks a WHERE a.open_id = b.open_id) ORDER BY b.open_id").fetchall()
             if not rows:
                 return "unacknowledged opens: 0"
-            return (f"unacknowledged opens: {len(rows)} ({_ids([f'#{r[0]}' for r in rows])}): "
-                    f"acknowledge or leave each named: {lv} coord open --ack OPEN_ID --token N")
+            active = _active_launch(conn, read_at)
+            mine: list[str] = []
+            others: list[str] = []
+            for open_id, seam, handoff_id in rows:
+                handed = active is not None and conn.execute(
+                    "SELECT 1 FROM open_deliveries WHERE open_id = ? AND recipient_launch_id = ?",
+                    (open_id, active.launch_id)).fetchone() is not None
+                own = (handed and seam in seam_open.PREDECESSOR_HANDOFF_SEAMS and handoff_id is not None
+                       and (conn.execute("SELECT writer FROM seam_handoffs WHERE handoff_id = ?",
+                                         (handoff_id,)).fetchone() or ("",))[0] == active.session_key)
+                if handed and not own:      # the verb's own rules (seam_open.acknowledge), read, not repeated as a guess
+                    need = " --read-back-file PATH" if seam in seam_open.PREDECESSOR_HANDOFF_SEAMS else ""
+                    mine.append(f"{lv} coord open --ack {open_id}{need} --token N")
+                else:
+                    others.append(f"#{open_id}")
+            tail = []
+            if mine:
+                tail.append("acknowledge with " + "; ".join(mine[:MAX_IDS]) + (f"; +{len(mine) - MAX_IDS} more"
+                                                                             if len(mine) > MAX_IDS else "") +
+                            (" (PATH holds your restatement of the handoff)" if any("PATH" in m for m in mine) else ""))
+            if others:
+                tail.append(f"not acknowledgeable from this launch ({_ids(others)}; handed to an earlier launch, to none, "
+                            "or built from your own handoff): name each in the handoff's notes, or leave it")
+            return f"unacknowledged opens: {len(rows)} ({_ids([f'#{r[0]}' for r in rows])}): " + "; ".join(tail)
 
         def away(c: dict[str, Any]) -> str:
             states = c["away"]

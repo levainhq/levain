@@ -1802,7 +1802,7 @@ def _hook_render(store: QuestionStore, directory: Path | str, session: str, view
     except Exception:
         return echo, _no_commit
     block = text                             # the band as the seat reads it (the delta line in): what Stop compares
-    work_through, work_store, intake_open = 0, "", 0
+    work_through, work_store, intake_open, intake_lines = 0, "", 0, ()
     if coord:
         # the work delta rides ahead of the band, inside the one block Stop verifies; its cursor commits with the view
         try:
@@ -1810,7 +1810,7 @@ def _hook_render(store: QuestionStore, directory: Path | str, session: str, view
 
             work = work_delta.read_block(directory, viewer, deadline - time.monotonic())
             work_text, work_through, work_store = work.text, work.through, work.store_id
-            intake_open = work.intake_open
+            intake_open, intake_lines = work.intake_open, work.intake
         except Exception:                 # never an empty block for a delta that could not be built
             work_text = "since your last message (Levain's record): ! not read (the work delta could not be built)"
         if work_text:
@@ -1821,7 +1821,7 @@ def _hook_render(store: QuestionStore, directory: Path | str, session: str, view
 
     def commit() -> None:
         if coord:                             # the coordinator's view is the Stop hook's to commit, after the reply verifies
-            _stage_view(directory, session, r, block, work_through, work_store, intake_open)
+            _stage_view(directory, session, r, block, work_through, work_store, intake_open, intake_lines)
             return
         try:
             mark_closed_shown(store, r.closed)
@@ -1930,17 +1930,18 @@ def _remove_if(f: Path, expect: bytes | None) -> None:
 
 
 def _stage_view(directory: Path | str, session: str, r: "Rendered", block: str, work: int = 0,
-                store_id: str = "", intake_open: int = 0) -> None:
+                store_id: str = "", intake_open: int = 0, intake_lines: tuple = ()) -> None:
     """Keep the view a coordinator turn was just shown for its Stop hook to commit: one record per SESSION (two
     coordinator sessions alive at once never share one), replaced atomically. ``work``: the work cursor
     (:mod:`levain.coordinator.work_delta`) that commits with the view (0: it does not move), and ``store_id`` the
     coordinator store it was read from (the advance refuses another). ``intake_open``: the operator open whose intake
-    card the block carries, recorded with the cursor (0: none). Never raises."""
+    card the block carries, recorded with the cursor (0: none), and ``intake_lines`` the card's lines as they stand in the
+    block (taken out of it if another delivery shows the card first). Never raises."""
     try:
         _replace(_session_file(directory, session, "staged"),
                  json.dumps({"session": session, "hwm": r.hwm, "shown": list(r.shown), "gen": r.gen,
                              "closed": list(r.closed), "block": block, "work": work, "store_id": store_id,
-                             "intake_open": intake_open}))
+                             "intake_open": intake_open, "intake_lines": list(intake_lines)}))
     except Exception:
         pass
 
@@ -1960,7 +1961,8 @@ def _read_staged(directory: Path | str, session: str) -> tuple[dict, bytes] | No
         return ({"hwm": int(rec["hwm"]), "shown": [int(n) for n in rec["shown"]], "gen": int(rec["gen"]),
                  "closed": [int(n) for n in rec["closed"]], "block": str(rec["block"]),
                  "work": int(rec.get("work", 0)), "store_id": str(rec.get("store_id") or ""),
-                 "intake_open": int(rec.get("intake_open", 0))}, raw)
+                 "intake_open": int(rec.get("intake_open", 0)),
+                 "intake_lines": [str(x) for x in rec.get("intake_lines", [])]}, raw)
     except Exception:
         return None
 
@@ -1986,6 +1988,19 @@ def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, 
         missing, altered = _reprint_check(View(st["hwm"], tuple(st["shown"]), None), st["block"], message)
         ok = not missing and not altered
     if ok:
+        if st["intake_open"] > 0:             # the card is shown once: recorded only now the block was reprinted
+            from levain.coordinator import intake
+
+            left = HOOK_BUSY_MS / 1000 if deadline is None else deadline - time.monotonic()
+            won = intake.record_outcome(directory, st["intake_open"], "terminal", session, left, st["store_id"])
+            if won == intake.ALREADY and st["intake_lines"] and not payload.get("stop_hook_active"):
+                # another delivery (a drop reply, another turn) carried this card first: this reply's copy is a repeat.
+                # Ask once for the block without it, and let that reprint commit. A write that merely failed is not this
+                # case: the repeat is the cheap error and the commit goes on.
+                fresh = _without_card(st["block"], st["intake_lines"])
+                if fresh != st["block"] and _claim_retry(directory, viewer, st["gen"]):
+                    if _restage(directory, session, st, fresh):
+                        return _STALE_CARD_REASON
         try:
             mark_closed_shown(store, st["closed"])
         except Exception:
@@ -1999,11 +2014,6 @@ def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, 
 
             left = HOOK_BUSY_MS / 1000 if deadline is None else deadline - time.monotonic()
             work_delta.advance(directory, viewer, st["work"], left, st["store_id"])
-        if st["intake_open"] > 0:             # the card is shown once: recorded only now the block was reprinted
-            from levain.coordinator import intake
-
-            left = HOOK_BUSY_MS / 1000 if deadline is None else deadline - time.monotonic()
-            intake.record(directory, st["intake_open"], "terminal", session, left, st["store_id"])
         _clear_staged(directory, session, raw)
         return None
     if payload.get("stop_hook_active") or not _claim_retry(directory, viewer, st["gen"]):
@@ -2013,6 +2023,41 @@ def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, 
     # the check wants the work lines at the front of the block: a retry that named only the band would fail it again
     work = st["block"].startswith(work_delta.HEAD)
     return _reprint_reason(missing, work=work, band=not work or "\nNEEDS YOU · " in st["block"])
+
+
+_STALE_CARD_REASON = ("[Levain NEEDS YOU band] The arrival card in the block you were given was already shown to the "
+                      "operator by another reply. Reprint the block once more at the end of your reply without the card "
+                      "lines (the \"back:\", \"handoff #\" and \"next:\" lines under the work head), everything else exactly "
+                      "as given. Do not answer or renumber any item.")
+
+
+def _without_card(block: str, card: list[str]) -> str:
+    """``block`` with the contiguous ``card`` lines taken out (``block`` unchanged when they are not found as given), and
+    the work head with them when it is left over nothing (``0 of 0``, no line under it)."""
+    from levain.coordinator import work_delta
+
+    lines = block.split("\n")
+    n = len(card)
+    at = next((i for i in range(len(lines) - n + 1) if lines[i:i + n] == card), None) if n else None
+    if at is None:
+        return block
+    lines = lines[:at] + lines[at + n:]
+    if (lines and lines[0].startswith(work_delta.HEAD) and lines[0].endswith(", 0 of 0):")
+            and (len(lines) == 1 or not lines[1].startswith("  "))):
+        lines = lines[1:]
+    return "\n".join(lines)
+
+
+def _restage(directory: Path | str, session: str, st: dict, block: str) -> bool:
+    """Replace this session's staged view by the same view with ``block`` and no card; ``False`` when it could not be."""
+    try:
+        _replace(_session_file(directory, session, "staged"),
+                 json.dumps({"session": session, "hwm": st["hwm"], "shown": list(st["shown"]), "gen": st["gen"],
+                             "closed": list(st["closed"]), "block": block, "work": st["work"],
+                             "store_id": st["store_id"], "intake_open": 0, "intake_lines": []}))
+        return True
+    except Exception:
+        return False
 
 
 def _reprint_reason(missing: list[int], *, work: bool = False, band: bool = True) -> str:

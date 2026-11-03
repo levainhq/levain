@@ -25,11 +25,13 @@ from levain.cockpit.consent import utc_stamp
 from levain.coordinator.seam_open import _no_replace
 from levain.coordinator.store import CoordStore, _append_only
 
-__all__ = ["BACK", "INTAKE_SCHEMA", "IntakeDue", "LINE_MAX", "VIEW_VIA", "due", "lines", "record"]
+__all__ = ["ALREADY", "BACK", "FAILED", "INTAKE_SCHEMA", "IntakeDue", "LINE_MAX", "RECORDED", "VIEW_VIA", "due", "lines",
+           "record", "record_outcome"]
 
 LINE_MAX = 160
 BACK = "back: "                    # the first intake line starts so (the brief keys "the day" on it)
 VIEW_VIA = ("terminal", "drop_reply")
+RECORDED, ALREADY, FAILED = "recorded", "already", "failed"     # what :func:`record_outcome` says
 _VIA_SQL = ", ".join(repr(v) for v in VIEW_VIA)
 
 INTAKE_SCHEMA: tuple[str, ...] = (
@@ -66,21 +68,20 @@ def due(conn: sqlite3.Connection) -> IntakeDue | None:
         return None
     shown = (conn.execute("SELECT COALESCE(MAX(open_id), 0) FROM intake_views").fetchone()[0]
              if "intake_views" in have else 0)
-    row = conn.execute(
-        "SELECT b.open_id, b.signal_kind, b.signal_key, (SELECT MIN(a.acknowledged_at) FROM open_acks a WHERE "
-        "a.open_id = b.open_id), b.handoff_id FROM open_builds b WHERE b.seam_kind = 'operator' AND b.open_id > ? "
-        "AND EXISTS (SELECT 1 FROM open_acks a WHERE a.open_id = b.open_id) ORDER BY b.open_id DESC LIMIT 1",
-        (shown,)).fetchone()
-    if row is None:
-        return None
     # a cold launch's open (signal 'launch') is built over the latest handoff, so the launch a drop starts after he came
     # back opens over the handoff the card already showed: a second card of the same handoff is not a second arrival
-    # (measured: s5/RUN.md, scenario cold). A leave's open is a return and is always due.
-    if row[1] == "launch" and row[4] is not None and "intake_views" in have and conn.execute(
-            "SELECT 1 FROM intake_views v JOIN open_builds o ON o.open_id = v.open_id WHERE o.handoff_id = ?",
-            (row[4],)).fetchone() is not None:
+    # (measured: s5/RUN.md, scenario cold). A leave's open is a return and is always due. The exclusion is in the
+    # candidate query, before ORDER BY ... LIMIT, so an older acknowledged return behind such a launch is still found.
+    carded = (" AND NOT (b.signal_kind = 'launch' AND b.handoff_id IS NOT NULL AND EXISTS (SELECT 1 FROM intake_views v "
+              "JOIN open_builds o ON o.open_id = v.open_id WHERE o.handoff_id = b.handoff_id))"
+              if "intake_views" in have else "")
+    row = conn.execute(
+        "SELECT b.open_id, b.signal_kind, b.signal_key, (SELECT MIN(a.acknowledged_at) FROM open_acks a WHERE "
+        "a.open_id = b.open_id) FROM open_builds b WHERE b.seam_kind = 'operator' AND b.open_id > ? "
+        "AND EXISTS (SELECT 1 FROM open_acks a WHERE a.open_id = b.open_id)" + carded +
+        " ORDER BY b.open_id DESC LIMIT 1", (shown,)).fetchone()
+    if row is None:
         return None
-    row = row[:4]
     handoff = (conn.execute("SELECT handoff_id, seam_kind, written_at, body FROM seam_handoffs ORDER BY handoff_id DESC "
                             "LIMIT 1").fetchone() if "seam_handoffs" in have else None)
     return IntakeDue(*row, *(handoff if handoff is not None else (None, None, None, None)))
@@ -135,23 +136,29 @@ def lines(d: IntakeDue) -> list[str]:
 
 
 def record(directory: Path | str | None, open_id: int, via: str, ref: str, busy_s: float, store_id: str) -> bool:
+    """:func:`record_outcome` as a bool: True only when this call wrote the row."""
+    return record_outcome(directory, open_id, via, ref, busy_s, store_id) == RECORDED
+
+
+def record_outcome(directory: Path | str | None, open_id: int, via: str, ref: str, busy_s: float, store_id: str) -> str:
     """Append ``intake_views(open_id, via, ref, now)``: one bounded write, called only after the reply that carried the
     card verified. ``store_id`` is the one the card was read from; another store (``dispatch.db`` replaced between the
-    read and the Stop) is refused. A store from before the table gets it here. ``False`` (nothing written) for another
-    store, an open this store does not hold, a card already shown or any failure: the next reply repeats the card, the
-    cheap error. Never raises."""
+    read and the Stop) is refused. A store from before the table gets it here. The answer is :data:`RECORDED`;
+    :data:`ALREADY` when another delivery recorded this open (or a later one) first, so the card this caller carried is
+    a repeat; or :data:`FAILED` (nothing written) for another store, an open this store does not hold, a bad argument
+    or a failed write: the next reply repeats the card, the cheap error. Never raises."""
     if (not isinstance(open_id, int) or isinstance(open_id, bool) or open_id <= 0 or via not in VIEW_VIA
             or not isinstance(ref, str) or not ref or not isinstance(store_id, str) or not store_id):
-        return False
+        return FAILED
     try:
         store = CoordStore(directory)
         store._check_directory_readonly()
         if not store.path.exists():
-            return False
+            return FAILED
         wait = max(0.0, busy_s)
         conn = sqlite3.connect(store.path.resolve().as_uri() + "?mode=rw", uri=True, timeout=wait, isolation_level=None)
     except Exception:                                            # noqa: BLE001
-        return False
+        return FAILED
     try:
         conn.execute(f"PRAGMA busy_timeout = {int(wait * 1000)}")
         conn.execute("PRAGMA synchronous = FULL")
@@ -160,20 +167,20 @@ def record(directory: Path | str | None, open_id: int, via: str, ref: str, busy_
             row = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
             if row is None or str(row[0]) != store_id or "open_builds" not in _names(conn):
                 conn.execute("ROLLBACK")
-                return False
+                return FAILED
             if "intake_views" not in _names(conn):
                 for stmt in INTAKE_SCHEMA:
                     conn.execute(stmt)
-            elif conn.execute("SELECT 1 FROM intake_views WHERE open_id = ?", (open_id,)).fetchone() is not None:
+            elif conn.execute("SELECT 1 FROM intake_views WHERE open_id >= ?", (open_id,)).fetchone() is not None:
                 conn.execute("ROLLBACK")
-                return False
+                return ALREADY
             if conn.execute("SELECT 1 FROM open_builds WHERE open_id = ?", (open_id,)).fetchone() is None:
                 conn.execute("ROLLBACK")
-                return False
+                return FAILED
             now = utc_stamp(datetime.now(timezone.utc))
             conn.execute("INSERT INTO intake_views (open_id, via, ref, at) VALUES (?, ?, ?, ?)", (open_id, via, ref, now))
             conn.execute("COMMIT")
-            return True
+            return RECORDED
         except BaseException:
             try:
                 conn.execute("ROLLBACK")
@@ -181,6 +188,6 @@ def record(directory: Path | str | None, open_id: int, via: str, ref: str, busy_
                 pass
             raise
     except Exception:                                            # noqa: BLE001
-        return False
+        return FAILED
     finally:
         conn.close()

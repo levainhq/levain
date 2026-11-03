@@ -422,3 +422,143 @@ def test_option_b_is_one_paragraph(pending, monkeypatch):
     monkeypatch.setattr(cl, "DAY_PARAGRAPH", cl._DAY_STATUS_ONLY)
     sec = _arrival_section(cl._brief_text(pending, pending.launch(pending.launch_id)))
     assert cl._DAY_STATUS_ONLY in sec and "at most 5 plain lines" not in sec
+
+
+# L3 round 1 fixes (project_memory/1103-20_L3_c15s5_r1.txt) -----------------------------------------------------------
+def _cold_launch_acked(arr):
+    """A cold launch a drop woke after he came back: its `operator`/`launch` open, delivered and acknowledged."""
+    from levain.coordinator import lease as _lease, seam_build, seam_open, seam_verbs
+    import os
+
+    arr.coord("release", "--by", "coordinator", "--token", str(arr.token))
+    old = arr.store.launch_by_harness_session(SID)
+    with arr.store._write() as (conn, now):
+        _lease._launch_event(conn, now, old.launch_id, "ended", "session done")
+    d, _ = arr.store.accept_drop("back, from the phone", surface="phone")
+    lid = arr.store.woken_launch(d.drop_id)
+    arr.store.launch_claim_spawn(lid, os.getpid())
+    built = seam_build.starter_build(arr.store, lid, pid=os.getpid(), kind=seam_verbs.open_kind(arr.store),
+                                     queue_dir=arr.q)
+    arr.store.launch_activate(lid, harness_session_id="h-" + lid)
+    token2 = arr.store.coord_status()["lease"]["token"]
+    seam_open.record_delivery(arr.store, built.open_id, "launch_brief", recipient=lid)
+    arr.coord("open", "--ack", str(built.open_id), "--token", str(token2))
+    return built
+
+
+def test_an_older_pending_away_return_is_not_lost_behind_a_carded_cold_launch(arr):
+    """codex #1: the newest candidate is a cold launch over a handoff whose card was shown; the away-return before it,
+    acknowledged and never carded, is still owed."""
+    arr.leave_and_return()
+    arr.turn("morning")
+    arr.open_and_ack()
+    arr.turn("plan?")                                    # open 1's card is shown and recorded
+    assert len(arr.views()) == 1
+    arr.away(True)
+    arr.away(False)
+    second = arr.open_and_ack()                          # a second return, acknowledged, its card not yet shown
+    built = _cold_launch_acked(arr)
+    assert built.open_id > second and built.signal_kind == "launch"
+    owed = _due(arr.store)
+    assert owed is not None and owed.open_id == second
+
+
+def test_a_stale_terminal_card_is_not_delivered_when_another_delivery_won(arr):
+    """codex #2: the card was staged for the terminal, a reply recorded it first; the terminal's Stop must not commit a
+    second card: it asks once for the block without the card lines, and that reprint commits."""
+    arr.leave_and_return()
+    arr.turn("morning")
+    open_id = arr.open_and_ack()
+    ctx = arr.ups("plan?")
+    assert "back:" in ctx
+    sid = sql(arr.store, "SELECT value FROM meta WHERE key = 'store_id'")[0][0]
+    assert intake.record(arr.q, open_id, "drop_reply", "rp-won", 2.0, sid)           # the other delivery wins
+    retry = arr.stop(arr.reply(ctx))
+    assert retry and "already shown" in json.loads(retry)["reason"]
+    assert arr.views() == [(open_id, "drop_reply", "rp-won")]
+    card_free = "\n".join(ln for ln in ctx.splitlines() if not ln.strip().startswith(("back:", "handoff #", "next:")))
+    assert "back:" not in card_free
+    assert arr.stop(arr.reply(card_free)) == ""
+    assert arr.views() == [(open_id, "drop_reply", "rp-won")]
+    assert "back:" not in arr.ups("and now?")
+
+
+def test_record_says_already_shown_apart_from_a_failed_write(arr):
+    arr.leave_and_return()
+    arr.turn("morning")
+    open_id = arr.open_and_ack()
+    sid = sql(arr.store, "SELECT value FROM meta WHERE key = 'store_id'")[0][0]
+    assert intake.record_outcome(arr.q, open_id, "terminal", "s", 2.0, "another-store-id") == intake.FAILED
+    assert intake.record_outcome(arr.q, open_id, "terminal", "s", 2.0, sid) == intake.RECORDED
+    assert intake.record_outcome(arr.q, open_id, "drop_reply", "rp-x", 2.0, sid) == intake.ALREADY
+
+
+def test_a_drop_reply_after_a_terminal_record_proceeds_without_the_card(tmp_path, capsys):
+    """deepseek #2 does not hold: the reply reads `due` and inserts inside ONE write transaction, so a row recorded
+    before it is simply not owed (no IntegrityError); pinned here."""
+    w = World(tmp_path, capsys)
+    w.run("coord", "close", "--kind", "operator", "--body-file", str(body_file(tmp_path, _body())), "--request-id", "r1",
+          "--token", str(w.token), "--queue-dir", str(w.q))
+    w.away("claude_code")
+    w.away("claude_code", on=False)
+    open_id = int(w.coord("open").split("--ack ")[1].split()[0])
+    w.coord("open", "--ack", str(open_id))
+    sid = sql(w.store, "SELECT value FROM meta WHERE key = 'store_id'")[0][0]
+    assert intake.record(w.q, open_id, "terminal", "s", 2.0, sid)
+    d, _ = w.store.accept_drop("morning from the phone", surface="phone")
+    got = drop_reply.write_reply(w.store, d.drop_id, "on it", token=w.token)
+    assert "back:" not in got.block and len(sql(w.store, "SELECT * FROM intake_views")) == 1
+
+
+def test_plan_counts_every_unanswered_drop_and_lists_the_closed_window_ones_apart(tmp_path, capsys):
+    """codex #3: a drop a second old is already owed an answer; one past the window cannot be, and says what to do."""
+    w = World(tmp_path, capsys)
+    fresh, _ = w.store.accept_drop("just now", surface="phone")
+    now = datetime.now(timezone.utc)
+    plan = seam_plan.close_plan(w.store, w.q, now, "levain")
+    assert plan[2].startswith(f"drops with no reply: 1 ({fresh.drop_id})") and "coord reply DROP_ID" in plan[2]
+    late = seam_plan.close_plan(w.store, w.q, now + timedelta(hours=26), "levain")
+    assert "past the reply window" in late[2] and fresh.drop_id in late[2] and "coord reply DROP_ID" not in late[2]
+    assert "handoff" in late[2]
+    old = seam_plan.close_plan(w.store, w.q, now + timedelta(days=9), "levain")
+    assert "past the reply window" in old[2] and fresh.drop_id in old[2]
+    w.store.accept_drop("terminal words", surface="cli")                         # answered in the session: never listed
+    assert seam_plan.close_plan(w.store, w.q, now, "levain")[2].count("dr-") == 1
+
+
+def test_plan_names_the_ack_command_that_works_and_sorts_out_the_opens_that_cannot_be_acknowledged(tmp_path, capsys):
+    """codex #4: a rotation open needs --read-back-file; an open never delivered to this launch cannot be acknowledged."""
+    from levain.coordinator import seam_build
+
+    w = World(tmp_path, capsys)
+    w.run("coord", "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path, _body())), "--request-id", "r1",
+          "--token", str(w.token), "--queue-dir", str(w.q))
+    _rewrite_writer(w.store, "previous-session")
+    rot_id = int(w.coord("open").split("--ack ")[1].split()[0])                  # built and delivered to this launch
+    orphan = seam_build.build(w.store, kind="light", signal_kind="silence", signal_key="dr-x", queue_dir=w.q,
+                              token=w.token)                                       # built, never handed to anyone
+    plan = seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc), "levain")[4]
+    assert plan.startswith("unacknowledged opens: 2 ")
+    assert f"coord open --ack {rot_id} --read-back-file PATH --token N" in plan
+    assert f"coord open --ack {orphan.open_id} " not in plan
+    assert "not acknowledgeable" in plan and f"#{orphan.open_id}" in plan.split("not acknowledgeable")[1]
+    (tmp_path / "rb.txt").write_text("the handoff restated")
+    w.coord("open", "--ack", str(rot_id), "--read-back-file", str(tmp_path / "rb.txt"))        # the printed form works
+
+
+def test_plan_survives_a_card_that_is_none(tmp_path, capsys, monkeypatch):
+    """deepseek #1: morning.card returning None must read as cannot-derive on its two lines, not as a NameError."""
+    w = World(tmp_path, capsys)
+    monkeypatch.setattr(morning, "card", lambda *a, **kw: None)
+    plan = seam_plan.close_plan(w.store, w.q, datetime.now(timezone.utc), "levain")
+    assert len(plan) == 7
+    assert plan[1].startswith("undecided SIGNs and crossed budgets: cannot-derive (") and "NameError" not in plan[1]
+    assert plan[5].startswith("away: cannot-derive (") and "NameError" not in plan[5]
+
+
+def test_plan_on_no_store_says_so(tmp_path, capsys):
+    """deepseek #3 does not hold: open_readonly raises StoreAbsent for a missing store; pinned here."""
+    q = tmp_path / "empty"
+    q.mkdir(mode=0o700)
+    assert main(["coord", "close", "--plan", "--queue-dir", str(q)]) == 1
+    assert "there is no coordinator store here" in capsys.readouterr().err

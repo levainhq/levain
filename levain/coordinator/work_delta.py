@@ -231,11 +231,14 @@ class WorkBlock(NamedTuple):
     """``text``: the block (``""`` for nothing to say; the ``! not read`` line for a store that could not be read).
     ``through``: the cursor a verified reply would advance to (0 when it must not move). ``store_id``: the
     ``meta.store_id`` of the store it was read from (``""`` when none was read), which :func:`advance` requires.
-    ``intake_open``: the operator open whose card the block carries (0: none), recorded once the reply verifies."""
+    ``intake_open``: the operator open whose card the block carries (0: none), recorded once the reply verifies;
+    ``intake``: the card's lines exactly as they stand in ``text`` (so a card another delivery already showed can be taken
+    out of the block)."""
     text: str
     through: int
     store_id: str = ""
     intake_open: int = 0
+    intake: tuple = ()
 
 
 def _store_id(conn: sqlite3.Connection) -> str:
@@ -264,7 +267,8 @@ def read_block(directory: Path | str | None, viewer: str, busy_s: float) -> Work
         return WorkBlock(f"{HEAD}): {UNREAD}", 0)
     finally:
         conn.close()
-    return WorkBlock(render(delta), delta.through if delta.total else 0, store_id, delta.intake_open)
+    return WorkBlock(render(delta), delta.through if delta.total else 0, store_id, delta.intake_open,
+                     tuple(f"  {t}" for t in delta.intake))
 
 
 def advance(directory: Path | str | None, viewer: str, through: int, busy_s: float, store_id: str) -> bool:
