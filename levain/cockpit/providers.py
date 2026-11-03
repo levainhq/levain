@@ -435,10 +435,21 @@ TOP_MAX_BEGIN = 110
 def _spore_provider(
     source: SubstrateSource, bucket: str, *, apply_hold: bool = True
 ) -> Callable[[ReadContext], Result]:
+    seen = [False]      # the store has existed on a read: a later absence stays a fault, as the engine reads it
+
     def read(ctx: ReadContext) -> Result:
         path = source.anneal.spores_json
         if not path.exists():
-            return Absent(f"no spore store at {path}")
+            if seen[0]:
+                return Absent(f"no spore store at {path}")
+            # never present: the panel is empty, and its sentence names the entity as the view resolves it on THIS read
+            # (config name, else the origin.md H1), so a rename shows without a restart
+            try:
+                name = _view(source, ctx).entity_name
+            except Exception:       # noqa: BLE001 — a view that cannot be built still leaves an empty panel
+                name = _configured_entity_name(source)
+            return Read(rows=(), empty=spore_empty(bucket, name))
+        seen[0] = True
         view = _view(source, ctx)
         bad = _view_fault(view, "open_spores")
         if bad:
@@ -1647,7 +1658,7 @@ def build_default_cockpit(
             pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank, size=size,
             order=order, views=views, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
             label_key=spore_label_key,
-            # a store that does not exist yet never reaches a read, so the registered text carries the name the config holds
+            # the registered text is the fallback only: a store that does not exist yet answers per read with the view's name
             empty=spore_empty(bucket, _configured_entity_name(source)), absent_is_empty=True, verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
             **spore_common))
     ck.register(ProviderSpec(

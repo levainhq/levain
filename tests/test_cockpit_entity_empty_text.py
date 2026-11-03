@@ -52,6 +52,23 @@ def test_a_store_that_does_not_exist_yet_names_the_configured_entity(tmp_path: P
         assert NAME in p["empty"] and OLD not in p["empty"], p["empty"]
 
 
+def test_a_store_that_does_not_exist_yet_names_the_origin_h1_entity(tmp_path: Path) -> None:
+    ck = build_default_cockpit(_install(tmp_path, store=False, config=False))
+    for pid in ("tray", "loops"):
+        p = ck.panel(pid, credential_class="token")
+        assert p["status"] == "empty", p["status"]
+        assert NAME in p["empty"] and OLD not in p["empty"], p["empty"]
+
+
+def test_a_rename_with_no_store_shows_on_the_next_read(tmp_path: Path) -> None:
+    src = _install(tmp_path, store=False, config=True)
+    ck = build_default_cockpit(src)
+    assert NAME in ck.panel("tray", credential_class="token")["empty"]
+    (src.install_root / ".levain" / "config.json").write_text(json.dumps({"entity_name": "Sol"}), encoding="utf-8")
+    p = ck.panel("tray", credential_class="token")
+    assert "Sol" in p["empty"] and NAME not in p["empty"], p["empty"]
+
+
 @needs_browser
 def test_the_page_names_the_entity_in_the_empty_tray_and_loops(tmp_path: Path) -> None:
     src = _install(tmp_path, store=True, config=False)
