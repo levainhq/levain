@@ -41,6 +41,7 @@ from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.consent.queue import RULING_SKEW
 from levain.contracts.canon import canonical
 from levain.coordinator import envelope as env
+from levain.coordinator.envelope_draft import ENVELOPE_DRAFT_SCHEMA
 from levain.coordinator.store import (
     SCHEMA, CoordError, CoordStore, Drop, Source, _append_only, _in, members_sha256, next_gseq,
 )
@@ -196,7 +197,9 @@ class EnvelopeStore(CoordStore):
     """The coordinator store with envelopes (C2). Every check that reads the disk (repo realpaths) runs before the
     write lock; everything that reads the store runs inside one ``BEGIN IMMEDIATE`` with the clock read under it."""
 
-    _SCHEMA = SCHEMA + ENVELOPE_SCHEMA
+    # the draft tables sit here, never in the base SCHEMA: a read-only surface's currency check asks only for the base,
+    # so a store made before drafts stays readable until a writer brings it current
+    _SCHEMA = SCHEMA + ENVELOPE_SCHEMA + ENVELOPE_DRAFT_SCHEMA
 
     def __init__(self, directory: Any = None, *, ssh_keygen: Any = None, **kw: Any) -> None:
         super().__init__(directory, **kw)
@@ -298,6 +301,14 @@ class EnvelopeStore(CoordStore):
              env.envelope_digest(body), canonical(dict(payload)), signature, payload["signer_fp"], signer_class,
              None if sup is None else sup["envelope_id"], body["stop_at"], now))
 
+    @staticmethod
+    def _narrowed_after(conn: sqlite3.Connection, envelope_id: str, thread_id: str, seen: int) -> bool:
+        """True when a narrowing that applies to ``envelope_id`` for ``thread_id`` (the predicate of
+        :meth:`_attenuations`) was written after store point ``seen``. The one check every superseding body meets, in
+        :meth:`_bind_checked`, drafted or composed at a terminal."""
+        return conn.execute("SELECT 1 FROM envelope_attenuations WHERE envelope_id = ? AND (thread_id IS NULL OR "
+                            "thread_id IS ?) AND gseq > ?", (envelope_id, thread_id, seen)).fetchone() is not None
+
     @classmethod
     def _bind_checked(cls, conn: sqlite3.Connection, now: str, envelope_id: str, body: Mapping[str, Any],
                       binds: Sequence[tuple[str, int, str]]) -> None:
@@ -325,6 +336,9 @@ class EnvelopeStore(CoordStore):
             elif head is None or head.envelope_id != sup["envelope_id"] or head.digest != sup["digest"]:
                 raise CoordError(f"the envelope supersedes {sup['envelope_id']}, which is not thread {thread_id}'s "
                                  "current envelope; echo again")
+            elif cls._narrowed_after(conn, head.envelope_id, thread_id, sup["seen"]):
+                # the signature covers the head AS NARROWED up to store point `seen`; a narrowing since is another head
+                raise EnvelopeStale(f"envelope {head.envelope_id} was narrowed after this body was shown; echo again")
         for thread_id, rev, _msha in binds:
             conn.execute("INSERT INTO envelope_binds (envelope_id, thread_id, rev, gseq, at) VALUES (?, ?, ?, ?, ?)",
                          (envelope_id, thread_id, rev, cls._next_gseq(conn, now), now))
@@ -342,13 +356,24 @@ class EnvelopeStore(CoordStore):
             again = None          # not this exact record: the full checks below give the refusal
         if again is not None and again.origin == "worded":
             return again, False
+        try:
+            parsed = self._parsed(body_text)
+        except CoordError:
+            parsed = None          # _checked below gives the refusal
+        drafted = parsed is not None and parsed["draft"] is not None
+        if drafted:
+            self._draft_preflight(parsed)
         body, signer_class = self._checked(body_text, payload, signature, authority)
         if body["origin"] != "worded":
             raise CoordError("a structured envelope arrives with its drop (accept_drop), never later")
+        if drafted:
+            self._draft_rederive(body)
         with self._write() as (conn, now):
             stored = self._same_or_conflict(conn, body, payload, signature)
             if stored is not None:
                 return stored, False
+            if drafted:
+                self._draft_admit(conn, now, body)
             drop = self._must_drop(conn, body["drop_id"])
             self._admit(conn, now, body, payload, drop)
             binds = [(self._must_thread(conn, b["thread_id"]).thread_id, b["rev"], b["members_sha256"])
@@ -356,6 +381,31 @@ class EnvelopeStore(CoordStore):
             self._insert(conn, now, body, payload, signature, signer_class)
             self._bind_checked(conn, now, body["envelope_id"], body, binds)
             return self._envelope(conn, body["envelope_id"]), True
+
+    # --- a drafted body's checks (H1-1): the rows are read in envelope_drafts, the one home of a draft's state ----------
+    def _draft_preflight(self, body: Mapping[str, Any]) -> None:
+        """A read transaction before any signature check: the named revision is the series' latest, unsigned (or
+        signed by this very envelope, which the write's conflict check words), unwithdrawn, not lapsed, complete, and
+        its stored digest is the one the body names. :class:`DraftStale` otherwise. Not authoritative: the write
+        transaction runs it again (:meth:`_draft_admit`)."""
+        from levain.coordinator import envelope_drafts as ed
+
+        with read_transaction(self._connect) as conn:
+            ed.admit_check(conn, self._stamp(), body, cites=False)
+
+    def _draft_rederive(self, body: Mapping[str, Any]) -> None:
+        """Outside the lock: the stored row's digest is its own record's, and the body is byte for byte the stored
+        proposal and its draft reference (a hand-edited file that names a real revision is refused here)."""
+        from levain.coordinator import envelope_drafts as ed
+
+        with read_transaction(self._connect) as conn:
+            ed.rederive_check(conn, body)
+
+    def _draft_admit(self, conn: sqlite3.Connection, now: str, body: Mapping[str, Any]) -> None:
+        """:meth:`_draft_preflight` again under the write lock, and every cite re-checked against its record."""
+        from levain.coordinator import envelope_drafts as ed
+
+        ed.admit_check(conn, now, body, cites=True)
 
     def accept_drop(self, words: str, *, surface: str, outbox_id: str | None = None, sent_at: str | None = None,
                     source: Source = Source(), envelope: tuple[str, Mapping[str, Any], str] | None = None,
@@ -719,6 +769,39 @@ class EnvelopeStore(CoordStore):
                 "'thread_done') AND (thread_id IS NULL OR thread_id IS ?) ORDER BY gseq LIMIT 1",
                 (envelope_id, thread_id)).fetchone()
         return None if row is None else (row[0], row[1], row[2])
+
+    def basis(self, thread_ids: Sequence[str]) -> tuple[Envelope | None, dict[str, dict[str, Any]], int]:
+        """What a body composed now supersedes, read in ONE transaction: the head the threads share, its effective
+        envelope per thread, and ``seen``, the store-wide sequence high-water a superseding body records
+        (``supersedes.seen``). One transaction matters: a ``seen`` read later could cover a narrowing the view never
+        showed. ``(None, {}, seen)`` when the threads have no envelope."""
+        with read_transaction(self._connect) as conn:
+            heads = [self._head(conn, t) for t in thread_ids]
+            first = heads[0] if heads else None
+            if any((h is None) != (first is None) or (h is not None and h.envelope_id != first.envelope_id)
+                   for h in heads):
+                raise CoordError("these threads do not share one current envelope; echo them separately")
+            seen = conn.execute("SELECT COALESCE(MAX(gseq), 0) FROM gseq").fetchone()[0]
+            eff = {} if first is None else {t: self._effective(conn, first.envelope_id, t) for t in thread_ids}
+        return first, eff, seen
+
+    def narrowed_since(self, envelope_id: str, thread_ids: Sequence[str], seen: int) -> bool:
+        """True when a narrowing of ``envelope_id`` that applies to any of ``thread_ids`` was written after store
+        point ``seen``: what a body superseding it was not shown. One read transaction."""
+        with read_transaction(self._connect) as conn:
+            return any(self._narrowed_after(conn, envelope_id, t, seen) for t in thread_ids)
+
+    @staticmethod
+    def members_diff(conn: sqlite3.Connection, thread_id: str, from_rev: int, to_rev: int) -> tuple[list[str], list[str]]:
+        """``(added, removed)``: the drop ids a thread's revision ``to_rev`` holds and ``from_rev`` did not, and the
+        reverse, read from its append-only revisions."""
+        def members(rev: int) -> list[str]:
+            row = conn.execute("SELECT members FROM thread_revisions WHERE thread_id = ? AND rev = ?",
+                               (thread_id, rev)).fetchone()
+            return [] if row is None else list(json.loads(row[0]))
+
+        before, after = members(from_rev), members(to_rev)
+        return [d for d in after if d not in before], [d for d in before if d not in after]
 
     def head(self, thread_id: str) -> Envelope | None:
         """The thread's current envelope (the one a new echo for it supersedes), or None."""

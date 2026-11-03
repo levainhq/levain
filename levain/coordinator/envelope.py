@@ -35,18 +35,22 @@ from levain.contracts.canon import canonical, canonical_bytes, parse
 from levain.dispatch.registry import CRITERION_INT_MAX, CRITERION_KEYS
 
 __all__ = [
-    "BODY_FORMAT", "BODY_KEYS", "BODY_MAX", "BUDGET_KEYS", "BUDGET_MAX", "EFFECT_LISTS", "EnvelopeError",
-    "PAYLOAD_KEYS", "SIGN_FORMAT", "SIGN_NAMESPACE", "SIGN_TIER", "effect_identity", "effect_key",
-    "envelope_digest", "parse_body", "path_within", "refusal", "sign_message", "sign_payload",
+    "BODY_FORMAT", "BODY_FORMAT_V1", "BODY_KEYS", "BODY_MAX", "BUDGET_KEYS", "BUDGET_MAX", "DRAFT_ID_RE",
+    "DRAFT_REVISIONS_MAX", "EFFECT_LISTS", "EnvelopeError", "PAYLOAD_KEYS", "SIGN_FORMAT", "SIGN_NAMESPACE",
+    "SIGN_TIER", "effect_identity", "effect_key", "envelope_digest", "parse_body", "path_within", "refusal",
+    "sign_message", "sign_payload", "widens",
 ]
 
-BODY_FORMAT = "levain-thread-envelope/1"
+BODY_FORMAT = "levain-thread-envelope/2"
+# the format before the signed draft envelope (H1): named only to word the refusal of a body still written in it
+BODY_FORMAT_V1 = "levain-thread-envelope/1"
 SIGN_FORMAT = "levain-thread-envelope-sign/1"
 SIGN_NAMESPACE = "levain-thread-envelope"
 SIGN_TIER = "T2"
 
 BODY_KEYS = frozenset({"format", "store_id", "envelope_id", "origin", "drop_id", "words_sha256", "binds",
-                       "supersedes", "where", "lands", "pushes", "publishes", "budget", "stop_at", "issued_at"})
+                       "supersedes", "where", "lands", "pushes", "publishes", "budget", "stop_at", "issued_at",
+                       "draft"})
 PAYLOAD_KEYS = frozenset({"format", "store_id", "envelope_id", "digest", "signer_fp", "signed_at"})
 BUDGET_KEYS = ("tool_calls", "tokens", "dollars_cents", "hours")
 EFFECT_LISTS = ("lands", "pushes", "publishes")
@@ -64,6 +68,9 @@ _ENVELOPE_ID = re.compile(r"ev-[0-9a-f]{32}")
 _DROP_ID = re.compile(r"dr-[0-9a-f]{32}")
 _THREAD_ID = re.compile(r"th-[0-9a-f]{32}")
 _SHA = re.compile(r"sha256:[0-9a-f]{64}")
+DRAFT_ID_RE = re.compile(r"ed-[0-9a-f]{32}")
+# the most revisions one draft series holds [seat, UNMEASURED]; the draft table's CHECK and the body's shape share it
+DRAFT_REVISIONS_MAX = 256
 _STORE_ID = re.compile(r"[0-9a-f]{32}")
 _PACKAGE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?")
 _VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+!_-]{0,63}")
@@ -207,6 +214,12 @@ def parse_body(text: Any) -> dict[str, Any]:
         body = parse(text.encode("utf-8"))
     except (ValueError, UnicodeEncodeError) as exc:
         raise EnvelopeError(f"an envelope body is canonical JSON: {str(exc)[:160]}") from None
+    if isinstance(body, dict) and body.get("format") == BODY_FORMAT_V1:
+        # before the key-set check, so a body written before the upgrade says this and not "wrong keys"
+        eid = body.get("envelope_id")
+        shown = eid if isinstance(eid, str) and _ENVELOPE_ID.fullmatch(eid) is not None else "<id>"
+        raise EnvelopeError(f"a {BODY_FORMAT_V1} body is no longer accepted; if it was accepted before the upgrade, "
+                            f"`levain envelope show {shown}` shows it")
     if not isinstance(body, dict) or set(body) != BODY_KEYS:
         raise EnvelopeError(f"an envelope body has exactly the keys {sorted(BODY_KEYS)}")
     if canonical(body) != text:
@@ -244,12 +257,25 @@ def parse_body(text: Any) -> dict[str, Any]:
         raise EnvelopeError("a worded envelope binds the thread revisions its echo covered")
     sup = body["supersedes"]
     if sup is not None:
-        sup = _exact(sup, {"envelope_id", "digest"}, "supersedes")
+        sup = _exact(sup, {"envelope_id", "digest", "seen"}, "supersedes")
         if not isinstance(sup["envelope_id"], str) or _ENVELOPE_ID.fullmatch(sup["envelope_id"]) is None \
                 or sup["envelope_id"] == body["envelope_id"]:
             raise EnvelopeError("supersedes.envelope_id is another envelope's id")
         if not isinstance(sup["digest"], str) or _SHA.fullmatch(sup["digest"]) is None:
             raise EnvelopeError("supersedes.digest is sha256: and 64 hex")
+        if type(sup["seen"]) is not int or not 0 <= sup["seen"] <= 2 ** 62:
+            raise EnvelopeError("supersedes.seen is the store sequence point the signer was shown, an integer from 0")
+    draft = body["draft"]
+    if draft is not None:
+        draft = _exact(draft, {"draft_id", "revision", "digest"}, "draft")
+        if not isinstance(draft["draft_id"], str) or DRAFT_ID_RE.fullmatch(draft["draft_id"]) is None:
+            raise EnvelopeError("draft.draft_id is ed- and 32 hex")
+        if type(draft["revision"]) is not int or not 1 <= draft["revision"] <= DRAFT_REVISIONS_MAX:
+            raise EnvelopeError(f"draft.revision is an integer from 1 to {DRAFT_REVISIONS_MAX}")
+        if not isinstance(draft["digest"], str) or _SHA.fullmatch(draft["digest"]) is None:
+            raise EnvelopeError("draft.digest is sha256: and 64 hex")
+        if body["origin"] == "structured":
+            raise EnvelopeError("a structured envelope is signed at send, with no draft behind it")
     where = _where(body["where"])
     scope = {w["repo"]: tuple(w["paths"]) for w in where}
     lands = _list(body["lands"], "lands")
@@ -304,6 +330,25 @@ def parse_body(text: Any) -> dict[str, Any]:
     if parse_stamp(_stamp(body["stop_at"], "stop_at")) <= issued:
         raise EnvelopeError("stop_at is after issued_at")
     return body
+
+
+def widens(base: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
+    """True when ``new`` grants anything ``base`` did not: a later stop, a bigger budget, a repo or path outside base's,
+    an effect base did not hold, or the same target with other criteria. Pure: ``base`` is any body-shaped dict (a
+    signed body, an effective envelope, or the empty envelope of a head that grants nothing)."""
+    if parse_stamp(new["stop_at"]) > parse_stamp(base["stop_at"]):
+        return True
+    if any(new["budget"][k] > base["budget"][k] for k in BUDGET_KEYS):
+        return True
+    for w in new["where"]:
+        allowed = tuple(p for o in base["where"] if o["repo"] == w["repo"] for p in o["paths"])
+        if not allowed or any(not path_within(p, allowed) for p in w["paths"]):
+            return True
+    for kind in EFFECT_LISTS:
+        before = {effect_key(kind, e): e for e in base[kind]}
+        if any(before.get(effect_key(kind, e)) != e for e in new[kind]):
+            return True
+    return False
 
 
 def envelope_digest(body: Mapping[str, Any]) -> str:
