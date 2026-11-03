@@ -77,6 +77,22 @@ DYNAMIC_SITES = {
     "levain/firing/presence.py::<module>::" '# recover. An EXPLICIT map (not ``import_module(f"…{kind}")``) governs which modules may be': (),
 }
 LAZY_SITES = {
+    # operator: ``_landed`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::_landed::from levain.agents import bars': 'operator',
+    # operator: ``_lost`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::_lost::from levain.agents import bars': 'operator',
+    # operator: ``open_bar_for`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::open_bar_for::from levain.agents import bars': 'operator',
+    # operator: ``open_bar_for`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::open_bar_for::from levain.autonomic.db import DB_NAME as _STORE_DB, default_store_dir': 'operator',
+    # operator: ``revoke_agent_begin`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::revoke_agent_begin::from levain.agents import bars': 'operator',
+    # operator: ``revoke_agent_finish`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::revoke_agent_finish::from levain.agents import bars': 'operator',
+    # operator: ``revoke_agent_sign`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::revoke_agent_sign::from levain.agents import bars': 'operator',
+    # operator: ``revoke_agent_sign`` runs only from the operator's agent verbs (``levain agents renew`` / ``revoke`` via ``agents.signing`` / ``agents.cli``)
+    'levain/agent_authority.py::revoke_agent_sign::from levain.cockpit.consent import utc_stamp': 'operator',
     # operator: ``_resolve`` <- ``pick_address`` <- ``creds._post`` / ``keys`` (the broker's dial); the root credential verbs only ``commit`` / ``remove`` files
     'levain/broker/upstream.py::_resolve::from levain.broker.front import system_resolve': 'operator',
     # operator: ``pick_address`` <- ``creds._post`` / ``keys`` (the broker's dial); the root credential verbs only ``commit`` / ``remove`` files
