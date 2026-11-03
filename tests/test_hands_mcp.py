@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
+import tempfile
 import tomllib
 from datetime import datetime, timedelta, timezone
 
@@ -21,8 +23,11 @@ from .chat_egress.keys_rig import Cockpit
 NOW = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
 EXP = "2026-12-03T12:00:00.000000Z"
 
+# a command every test host holds as root's, outside every home, in no group- or world-writable directory
+TRUSTED = "/bin/sh"
+
 STDIO = hm.build_entry(name="files", transport="stdio", identity_kind="dedicated", expires_at=EXP,
-                       command="/usr/local/bin/files-mcp", args=["--root", "/srv/shared"],
+                       command=TRUSTED, args=["--root", "/srv/shared"],
                        env={"ZED": "z", "ALPHA": 'a"b'}, entry_id="hm-000000000001")
 REMOTE = hm.build_entry(name="linear", transport="remote", identity_kind="operator", expires_at=EXP,
                         url="https://mcp.linear.example/mcp", callback_port=49300, entry_id="hm-000000000002")
@@ -30,7 +35,7 @@ REMOTE = hm.build_entry(name="linear", transport="remote", identity_kind="operat
 CODEX_EXPECTED = '''mcp_oauth_credentials_store = "file"
 
 [mcp_servers.files]
-command = "/usr/local/bin/files-mcp"
+command = "/bin/sh"
 args = ["--root", "/srv/shared"]
 default_tools_approval_mode = "prompt"
 [mcp_servers.files.env]
@@ -51,7 +56,7 @@ CLAUDE_EXPECTED = '''{
         "--root",
         "/srv/shared"
       ],
-      "command": "/usr/local/bin/files-mcp",
+      "command": "/bin/sh",
       "env": {
         "ALPHA": "a\\"b",
         "ZED": "z"
@@ -74,7 +79,7 @@ def ck(tmp_path):
 
 def _entry(**kw):
     base = dict(name="files", transport="stdio", identity_kind="dedicated", expires_at=EXP,
-                command="/usr/local/bin/files-mcp", args=[], env={}, entry_id="hm-0000000000aa")
+                command=TRUSTED, args=[], env={}, entry_id="hm-0000000000aa")
     return hm.build_entry(**{**base, **kw})
 
 
@@ -99,15 +104,17 @@ def test_the_rendered_files_parse_and_carry_the_pinned_terms():
 
 
 def test_a_control_character_in_a_value_is_escaped_never_emitted_raw():
-    table = hm.codex_server_table({**STDIO, "args": ["a\x7fb"]})
+    table = hm.render_codex_toml([_entry(args=["a\x7fb"])])
     assert "\x7f" not in table and "\\u007f" in table
 
 
 def test_two_entries_of_one_name_or_one_callback_port_are_refused_not_merged():
     with pytest.raises(hm.HandsMcpRefused, match="one name"):
         hm.render_codex_toml([STDIO, {**STDIO, "id": "hm-0000000000bb"}])
+    other = hm.build_entry(name="other", transport="remote", identity_kind="dedicated", expires_at=EXP,
+                           url="https://other.example/mcp", callback_port=REMOTE["callback_port"])
     with pytest.raises(hm.HandsMcpRefused, match="callback port"):
-        hm.render_claude_json([REMOTE, {**REMOTE, "name": "other"}])
+        hm.render_claude_json([REMOTE, other])
 
 
 def test_the_claude_path_beside_cc_mcp_config_adds_the_registry_and_leaves_the_canary_check_alone(tmp_path):
@@ -117,9 +124,9 @@ def test_the_claude_path_beside_cc_mcp_config_adds_the_registry_and_leaves_the_c
     assert set(base["mcpServers"]) == {"anneal_memory"}        # the one-server check still stands
     both = hg.cc_mcp_registry_config(ent, "/usr/bin/python3", [STDIO, REMOTE])
     assert both["mcpServers"]["anneal_memory"] == base["mcpServers"]["anneal_memory"]
-    assert both["mcpServers"]["files"] == hm.claude_server(STDIO)
-    with pytest.raises(hg.HostRefusal, match="already carries"):
-        hg.cc_mcp_registry_config(ent, "/usr/bin/python3", [{**STDIO, "name": "anneal_memory"}])
+    assert both["mcpServers"]["files"] == json.loads(hm.render_claude_json([STDIO]))["mcpServers"]["files"]
+    with pytest.raises(hg.HostRefusal, match="anneal_memory"):
+        hg.cc_mcp_registry_config(ent, "/usr/bin/python3", [_entry(name="anneal_memory")])
 
 
 def test_hands_for_is_mode_based_with_no_vendor_branch():
@@ -137,15 +144,15 @@ HOME = "/Users/operator"
 def test_a_clean_entry_passes_the_registration_rules():
     assert hm.registration_problems(STDIO, home=HOME) == []
     assert hm.registration_problems(REMOTE, home=HOME) == []
-    assert hm.registration_problems(_entry(command="npx", args=["-y", "some-server@1.2.3"]), home=HOME) == []
+    assert hm.registration_problems(_entry(args=["-y", "some-server@1.2.3", "--author", "bob"]), home=HOME) == []
 
 
 @pytest.mark.parametrize("kw, said", [
     (dict(command="/Users/operator/bin/mcp"), "under the operator's home"),
     (dict(command="/Users/operator"), "under the operator's home"),
-    (dict(command="/Users/operator/../operator/x"), "bare name or an absolute path"),
-    (dict(command="~/bin/mcp"), "bare name or an absolute path"),
-    (dict(command="./mcp"), "bare name or an absolute path"),
+    (dict(command="/Users/operator/../operator/x"), "absolute path"),
+    (dict(command="~/bin/mcp"), "absolute path"),
+    (dict(command="./mcp"), "absolute path"),
     (dict(args=["--token=abc123"]), "looks like a credential"),
     (dict(args=["--api-key", "abc123"]), "follows the secret-named flag"),
     (dict(args=["--password", "hunter2"]), "follows the secret-named flag"),
@@ -268,3 +275,196 @@ def test_an_enrolled_key_revokes_an_entry_and_it_is_no_longer_rendered(ck):
     ck.link({"op": "create_grant", "grant": e})
     ck.link({"op": "revoke_grant", "grant_id": e["id"]})
     assert hm.live_entries(ck.state().policy.grants, datetime.now(timezone.utc)) == ([], [])
+
+
+# --- L3 r1: the command is one nobody but root or the operator can replace, at registration and at render ---------
+
+def _exe(path, mode=0o755):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(mode)
+    return str(path)
+
+
+def _said(problems, what):
+    return any(what in p for p in problems)
+
+
+def test_a_command_that_does_not_exist_yet_is_refused():
+    # /tmp/late-mcp: outside the operator's home, absent today, creatable tomorrow by any local account
+    late = f"/tmp/late-mcp-{os.getpid()}"
+    assert not os.path.lexists(late)
+    assert _said(hm.registration_problems(_entry(command=late), home=HOME), "does not exist")
+
+
+def test_a_bare_name_is_refused_since_the_hands_path_picks_what_it_runs():
+    assert _said(hm.registration_problems(_entry(command="npx"), home=HOME), "absolute path")
+
+
+def test_a_command_in_a_sticky_world_writable_directory_is_refused_whole():
+    fd, path = tempfile.mkstemp(dir="/tmp", prefix="levain-hm-")
+    os.close(fd)
+    try:
+        os.chmod(path, 0o755)
+        assert _said(hm.registration_problems(_entry(command=path), home=HOME), "writable by group or world")
+    finally:
+        os.unlink(path)
+
+
+@pytest.mark.parametrize("mode, said", [(0o775, "writable by group or world"), (0o757, "writable by group or world"),
+                                        (0o644, "not executable")])
+def test_a_command_file_another_account_can_rewrite_or_cannot_run_is_refused(tmp_path, mode, said):
+    cmd = _exe(tmp_path / "bin" / "mcp", mode)
+    assert _said(hm.registration_problems(_entry(command=cmd), home=HOME), said)
+
+
+def test_a_command_under_a_group_writable_directory_is_refused(tmp_path):
+    cmd = _exe(tmp_path / "shared" / "bin" / "mcp")
+    (tmp_path / "shared").chmod(0o775)
+    assert _said(hm.registration_problems(_entry(command=cmd), home=HOME), "writable by group or world")
+
+
+def test_a_command_that_is_a_directory_is_refused(tmp_path):
+    (tmp_path / "d").mkdir()
+    assert _said(hm.registration_problems(_entry(command=str(tmp_path / "d")), home=HOME), "not a regular file")
+
+
+def test_a_symlink_to_a_rewritable_target_is_judged_by_its_target(tmp_path):
+    target = _exe(tmp_path / "loose" / "mcp")
+    (tmp_path / "loose").chmod(0o777)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "mcp").symlink_to(target)
+    assert _said(hm.registration_problems(_entry(command=str(tmp_path / "bin" / "mcp")), home=HOME),
+                 "writable by group or world")
+
+
+def test_a_command_owned_by_another_account_is_refused(tmp_path, monkeypatch):
+    cmd = _exe(tmp_path / "bin" / "mcp")
+    me = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: me + 1)            # the file's owner is now not the operator
+    assert _said(hm.registration_problems(_entry(command=cmd), home=HOME), "owned by root or the operator")
+
+
+def test_a_case_variant_of_the_home_is_still_the_home_on_darwin(tmp_path, monkeypatch):
+    home = tmp_path / "Home"
+    home.mkdir()
+    monkeypatch.setattr(hm.sys, "platform", "darwin")
+    variant = str(tmp_path / "HOME" / "bin" / "mcp")
+    assert _said(hm.registration_problems(_entry(command=variant), home=str(home)), "under the operator's home")
+
+
+def test_every_renderer_refuses_a_command_that_no_longer_passes_and_live_entries_skips_it():
+    gone = _entry(command=f"/tmp/late-mcp-{os.getpid()}")          # its own digest: only the file is wrong
+    for render in (hm.render_codex_toml, hm.render_claude_json, hm.codex_toml, hm.claude_servers):
+        with pytest.raises(hm.HandsMcpRefused, match="does not exist"):
+            render([gone])
+    assert hm.live_entries({gone["id"]: gone}, NOW) == ([], [(gone["id"], "command")])
+
+
+# --- L3 r1: the renderers take only an entry whose digest is its own ----------------------------------------------
+
+@pytest.mark.parametrize("patch", [{"command": "/tmp/replaced"}, {"command": "/bin/echo"}, {"args": ["--other"]},
+                                   {"name": "renamed"}])
+def test_every_renderer_refuses_an_entry_changed_under_its_old_digest(tmp_path, patch):
+    changed = {**STDIO, **patch}
+    assert changed["server_sha256"] == STDIO["server_sha256"]
+    for render in (hm.render_codex_toml, hm.render_claude_json, hm.codex_toml, hm.claude_servers):
+        with pytest.raises(hm.HandsMcpRefused, match="digest"):
+            render([changed])
+    ent = tmp_path / "ent"
+    ent.mkdir()
+    with pytest.raises(hg.HostRefusal, match="digest"):
+        hg.cc_mcp_registry_config(ent, "/usr/bin/python3", [changed])
+
+
+def test_a_reserved_name_is_refused_at_render_and_a_registry_refusal_is_a_host_refusal(tmp_path):
+    with pytest.raises(hm.HandsMcpRefused, match="levain_band"):
+        hm.claude_servers([_entry(name="levain_band")])
+    ent = tmp_path / "ent"
+    ent.mkdir()
+    with pytest.raises(hg.HostRefusal, match="one name"):
+        hg.cc_mcp_registry_config(ent, "/usr/bin/python3", [STDIO, {**STDIO, "id": "hm-0000000000bb"}])
+
+
+# --- L3 r1: malformed urls refuse, never raise ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("url", ["http://[::1", "https://example.com:bad/mcp", "https://exa mple.com/mcp",
+                                 "https://example.com:99999/mcp"])
+def test_a_malformed_url_is_a_refusal_not_a_raw_error(url):
+    problems = hm.registration_problems(_entry(name="r", transport="remote", command="", url=url,
+                                               callback_port=49300), home=HOME)
+    assert _said(problems, "malformed"), problems
+
+
+@pytest.mark.parametrize("url, ok", [("http://127.0.0.2:8080/mcp", True),
+                                     ("https://mcp.example.com/mcp?api_key=abcdef", False),
+                                     ("https://mcp.example.com/mcp?team=core", True)])
+def test_loopback_is_the_whole_block_and_a_secret_query_is_refused(url, ok):
+    assert (hm.registration_problems(_entry(name="r", transport="remote", command="", url=url, callback_port=49300),
+                                     home=HOME) == []) is ok
+
+
+# --- L3 r1 / head: env is signed in plaintext, so it carries no secret ----------------------------------------------
+
+@pytest.mark.parametrize("key", ["GITHUB_TOKEN", "API_KEY", "OPENAI_APIKEY", "DB_PASSWORD", "CLIENT_SECRET",
+                                 "AWS_CREDENTIALS", "MY_AUTH", "SSH_KEY"])
+def test_a_literal_value_for_a_secret_named_env_key_is_refused(key):
+    problems = hm.registration_problems(_entry(env={key: "x"}), home=HOME)
+    assert _said(problems, "hands account's own environment"), problems
+
+
+@pytest.mark.parametrize("key", ["DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "NODE_OPTIONS", "PYTHONPATH"])
+def test_a_loader_env_key_is_refused(key):
+    assert _said(hm.registration_problems(_entry(env={key: "/x"}), home=HOME), "loader")
+
+
+def test_a_non_secret_env_value_stays_allowed():
+    assert hm.registration_problems(_entry(env={"LOG_LEVEL": "debug", "AUTHOR": "bob", "KEYBOARD": "us"}),
+                                    home=HOME) == []
+
+
+# --- L3 r1: two live entries never share a name or a callback port --------------------------------------------------
+
+def test_a_second_live_entry_of_one_name_or_one_callback_port_is_refused_at_append(ck):
+    a = _fresh(STDIO)
+    ck.link({"op": "create_grant", "grant": a})
+    with pytest.raises(auth.AuthorityError, match="per name"):
+        ck.link({"op": "create_grant", "grant": _fresh(STDIO, entry_id="hm-0000000000bb")})
+    r = _fresh(REMOTE)
+    ck.link({"op": "create_grant", "grant": r})
+    with pytest.raises(auth.AuthorityError, match="callback port"):
+        ck.link({"op": "create_grant", "grant": _fresh(REMOTE, name="other", entry_id="hm-0000000000cc")})
+    full = json.loads(json.dumps(ck.state().policy.as_dict()))
+    full["grants"]["hm-0000000000dd"] = _fresh(STDIO, entry_id="hm-0000000000dd")
+    with pytest.raises(auth.AuthorityError, match="per name"):
+        ck.link({"op": "loosen", "policy": full})
+    live, skipped = hm.live_entries(ck.state().policy.grants, datetime.now(timezone.utc))
+    assert skipped == [] and hm.render_codex_toml(live)                    # the list stays renderable
+
+
+def test_an_expired_entry_does_not_hold_its_name(ck):
+    now = datetime.now(timezone.utc)
+    a = _fresh(STDIO, expires_at=hm.lease_expiry(now, timedelta(days=1)))
+    ck.link({"op": "create_grant", "grant": a}, at=now)
+    later = now + timedelta(days=2)
+    b = _fresh(STDIO, entry_id="hm-0000000000bb", expires_at=hm.lease_expiry(later))
+    ck.link({"op": "create_grant", "grant": b}, at=later)
+    assert [e["id"] for e in hm.live_entries(ck.state().policy.grants, later)[0]] == [b["id"]]
+
+
+# --- L3 r1: a revoke only shrinks authority, so the phone passkey revokes an entry ----------------------------------
+
+def test_a_passkey_revokes_an_entry_and_a_key_never_enrolled_does_not(tmp_path):
+    pytest.importorskip("cryptography")
+    from tests.test_authority_graduation_kind import T0, World
+    from tests.test_passkey_custody_derived import WebAuthnKey
+    world = World(tmp_path)
+    e = hm.build_entry(name="linear", transport="remote", identity_kind="operator", url="https://mcp.example.com/mcp",
+                       expires_at=hm.lease_expiry(T0, timedelta(days=20)), entry_id="hm-0000000000ee")
+    world.link({"op": "create_grant", "grant": e})
+    stranger = WebAuthnKey()
+    world.keys["stranger"] = (stranger.fp, lambda m: stranger.sign(m, auth.NAMESPACE))
+    world.refused({"op": "revoke_grant", "grant_id": e["id"]}, "stranger")
+    assert e["id"] in world.state().policy.grants
+    world.link({"op": "revoke_grant", "grant_id": e["id"]}, "pk")
+    assert e["id"] not in world.state().policy.grants

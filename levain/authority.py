@@ -1494,7 +1494,8 @@ def _graduation_phone_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: 
 # the autonomic store: whether a link is live for a launch is a reader's question (levain.agent_authority, a later slice: BUILD_PLAN P5c-1).
 # A hands MCP entry (levain 15 M1, ``levain.hands_mcp``): one server the hands account's own MCP list carries, signed
 # like an egress setup record: fixed terms under its id (a renew moves only the expiry, at most 30 days past its link),
-# any enrolled key revokes it. ``server_sha256`` is the digest of the table the entry renders; the replay holds it
+# any enrolled key revokes it, the phone passkey included (a revoke only narrows: L3 r1). At most one LIVE entry per
+# name and per remote callback port, judged at append against the live entries (:func:`_hands_mcp_unique_check`). ``server_sha256`` is the digest of the table the entry renders; the replay holds it
 # only to a sha256 (a later renderer change must not refuse an old log) and the append and render check it.
 HANDS_MCP_KIND = "hands-mcp"
 _HANDS_MCP_FIELDS = frozenset({"id", "kind", "name", "transport", "command", "args", "env", "url", "identity_kind",
@@ -1769,9 +1770,10 @@ def _hands_mcp_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetim
     raise AuthorityError(_HANDS_MCP_FIXED)
 
 
-def _hands_mcp_check(grants: list[Any]) -> None:
+def _hands_mcp_check(grants: list[Any], after: str = "") -> None:
     """At append and at a renew, every hands MCP entry meets the registration-time rules and carries the digest of the
-    table it renders (``levain.hands_mcp``): judged against the appender's own home, so an append rule."""
+    table it renders (``levain.hands_mcp``): judged against the appender's own home and files, so an append rule.
+    ``after``: the renew's tail naming the grant (one signed before a rule is revoked and created again)."""
     from levain import hands_mcp
     for grant in grants:
         if not (isinstance(grant, Mapping) and grant.get("kind") == HANDS_MCP_KIND):
@@ -1779,9 +1781,56 @@ def _hands_mcp_check(grants: list[Any]) -> None:
         entry = _thaw(grant)
         problems = hands_mcp.registration_problems(entry, home=os.path.expanduser("~"))
         if not problems and hands_mcp.server_sha256(entry) != entry["server_sha256"]:
-            problems = ["server_sha256 is not the digest of the table this entry renders"]
+            problems = [hands_mcp.DIGEST_REFUSAL]
         if problems:
-            raise AuthorityError(f"hands MCP entry {str(entry['id'])[:40]!r}: " + "; ".join(problems))
+            raise AuthorityError(f"hands MCP entry {str(entry['id'])[:40]!r}: " + "; ".join(problems) + after)
+
+
+def _hands_mcp_live(grant: Any, now: datetime) -> bool:
+    if not (isinstance(grant, Mapping) and grant.get("kind") == HANDS_MCP_KIND):
+        return False
+    try:
+        return _parse_stamp(grant["expires_at"], "expires_at") > now
+    except (AuthorityError, KeyError, OverflowError):
+        return False
+
+
+def _hands_mcp_unique_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
+    """At append (L3 r1): a create, a loosen or a renew that brings in, changes or extends a hands MCP entry may not
+    leave two LIVE entries of one name, or two live remote entries pinning one callback port; either would make every
+    render of the hands account's list refuse. Judged with the appender's clock (liveness reads expiry), so an append
+    rule; a log a foreign writer left holding two is refused at render (``levain.hands_mcp``)."""
+    op = rec["op"]
+    if op == "create_grant":
+        grant = rec["grant"]
+        if not isinstance(grant, Mapping) or not isinstance(grant.get("id"), str):
+            return
+        after = {**state.policy.grants, grant["id"]: grant}
+        touched = [grant["id"]]
+    elif op == "loosen":
+        after = rec["policy"]["grants"]
+        old = state.policy.grants
+        touched = [gid for gid, g in after.items()
+                   if gid not in old or _canonical(_thaw(old[gid])) != _canonical(_thaw(g))]
+    elif op == "renew":
+        after = state.policy.grants
+        touched = [rec["grant_id"]]
+    else:
+        return
+    live = {gid: g for gid, g in after.items() if _hands_mcp_live(g, now)}
+    for gid in touched:
+        g = live.get(gid)
+        if g is None:
+            continue
+        for oid, o in live.items():
+            if oid == gid:
+                continue
+            if o["name"] == g["name"]:
+                raise AuthorityError(f"one live hands MCP entry per name: {g['name']!r} is already live as "
+                                     f"{oid[:40]!r}; revoke it first")
+            if g["transport"] == o["transport"] == "remote" and g["callback_port"] == o["callback_port"]:
+                raise AuthorityError(f"one live hands MCP entry per callback port: {g['callback_port']} is already "
+                                     f"pinned by {oid[:40]!r}; revoke it first or register on another port")
 
 
 def _refuse_unknown_kind(grants: list[Any]) -> None:
@@ -1845,8 +1894,8 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
     GRADUATION_PHONE_KIND: _GrantKind(validate=_validate_graduation_phone, change=_graduation_phone_change,
                                       passkey_revocable=True, expires=False, fixed=_GRADUATION_PHONE_FIXED),
     HANDS_MCP_KIND: _GrantKind(validate=_validate_hands_mcp, change=_hands_mcp_change,
-                               append_checks=(_hands_mcp_check,),
-                               renew_checks=(lambda g, after: _hands_mcp_check(g),), fixed=_HANDS_MCP_FIXED),
+                               append_checks=(_hands_mcp_check,), renew_checks=(_hands_mcp_check,),
+                               passkey_revocable=True, fixed=_HANDS_MCP_FIXED),
     AGENT_LINK_KIND: _GrantKind(validate=_validate_agent_link, change=_agent_link_change, passkey_revocable=True,
                                 max_life=AGENT_LINK_MAX, fixed=_AGENT_LINK_FIXED, renew_signer_class=LAPTOP),
 })
@@ -2572,6 +2621,7 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     other per-kind append rule (:data:`_GRANT_KINDS`), a kind this levain does not know refused; and the setup
     record's one-live rule (:func:`_egress_key_append_check`)."""
     _egress_key_append_check(state, rec, now)
+    _hands_mcp_unique_check(state, rec, now)
     if rec["op"] == "create_grant":
         _grant_append_checks([rec["grant"]])
     elif rec["op"] == "loosen":
