@@ -105,4 +105,6 @@ def test_codex_canary_launch_pins_web_search_to_the_slots_value(tmp_path, monkey
     assert len(launches) == 1
     argv = launches[0]
     pairs = [(argv[i], argv[i + 1]) for i in range(len(argv) - 1)]
-    assert ("-c", f'web_search="{CODEX_WEB_SEARCH}"') in pairs
+    # The literal is asserted beside the slot's constant: a constant that changed its text (quoted, or "live") must fail here.
+    assert CODEX_WEB_SEARCH == "disabled"
+    assert ("-c", 'web_search="disabled"') in pairs
