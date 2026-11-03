@@ -558,6 +558,9 @@ def refresh_fence_after_update(install: Path, *, provider=None, **kw) -> str | N
         return None
     except FenceSetupError as exc:
         return f"agent fence: not installed: {exc}"
+    except Exception as exc:   # noqa: BLE001 - said, never the reason the update fails
+        return (f"agent fence: the unit could not be installed ({type(exc).__name__}: {exc}); every dispatch "
+                "session's tool calls are refused until `levain agents fence start` succeeds")
     command = f"levain agents fence start --path {Path(install).expanduser().resolve()}"
     try:
         if provider is None:

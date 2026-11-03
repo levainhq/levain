@@ -154,6 +154,16 @@ def test_a_failed_fence_install_is_said_and_never_fails_the_update(host, monkeyp
     assert len(lines) == 1 and "could not be installed" in lines[0] and "levain agents fence start" in lines[0]
 
 
+def test_a_fence_spec_oserror_is_said_and_never_escapes_the_update(host, monkeypatch):
+    def boom(install, **kw):
+        raise OSError("resolve failed")
+    monkeypatch.setattr(A, "fence_spec", boom)
+    line = A.refresh_fence_after_update(host.install)
+    assert "could not be installed (OSError: resolve failed)" in line and "levain agents fence start" in line
+    [via_update] = _update(host, monkeypatch)
+    assert "OSError" in via_update
+
+
 # --- two installs on one host (P7-2 wiring r2, codex HIGH): one fence unit, one install's roots ------------------
 
 def _other_install(host) -> Path:
