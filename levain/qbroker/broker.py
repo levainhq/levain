@@ -142,7 +142,7 @@ from levain.slot import limits_doc
 __all__ = ["ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
            "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
            "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_CALLS_KIND", "RUN_DEADLINE_KIND", "RUN_KEYS", "RUN_OPTIONAL_KEYS",
-           "RUN_STATE_FORMAT", "run_state_path", "SLOT_CLASS", "Broker", "Resolved",
+           "RUN_STATE_FORMAT", "run_state_path", "FenceSource", "FenceUnavailable", "SLOT_CLASS", "Broker", "Resolved",
            "Resolver", "resolved_from", "slot_ref", "stored_request"]
 
 log = logging.getLogger("levain.qbroker")
@@ -209,7 +209,7 @@ _ANSWER_ROW_KEYS = frozenset({"format", "payload", "signature"})
 # the tier whose undecided row halts its session (the GATE verb): the slot gate files every irreversible-class call
 # here (claude_code / codex slot_gate, tier=AGENT_CONFIG_TIER), every reversible one at broker_client.UNGATED_TIER
 HALT_TIER = AGENT_CONFIG_TIER
-GATE_VERDICTS = ("go", "halted", "over-limit", "limits-failed")
+GATE_VERDICTS = ("go", "halted", "fenced", "over-limit", "limits-failed")
 _GATE_OVER = frozenset({"crossed", "halted"})
 # a halting-index row whose last receipt is one of these is settled and leaves the index (Broker._halted_on)
 _SETTLED = frozenset({"allowed", "denied"})
@@ -218,11 +218,17 @@ _GATE_REQUIRED = _GATE_KEYS - {"tool_use_id"}
 # the limits in force for (agent, resolved session): every one of limits_doc.SLOT_KINDS, or LimitsUnavailable
 # raised (levain.qbroker.limits.PolicyLimits is the one in production)
 LimitsSource = Callable[[str, str], "Mapping[str, float]"]
+# the agent fence for a resolved session (P7-2, A0 section 2.3): ``None`` when the session's authority is as it was
+# launched, else the current side's reason (a non-empty string) for the `fenced` verdict; any exception is an
+# unreadable fence, which GATE answers `limits-failed`, never go
+# (production's is :func:`levain.qbroker.__main__.build_fence`'s)
+FenceSource = Callable[["Resolved"], "str | None"]
 # the counter's directory under requests/ (limits.db and its failure files)
 LIMITS_DIR = "limits"
 # the longest tool_use_id a GATE frame may carry (the counter keys a repeat by it; levain.consent.limits takes the same)
 TOOL_USE_ID_MAX = 256
 # GATE's limits-failed reason when that directory cannot be used (Broker._limits_dir)
+FENCE_ANSWER_MALFORMED = "the agent fence answered neither current nor a reason"
 LIMITS_DIR_FAILED = "the limits directory requests/limits could not be used as the broker's own 0700 directory"
 # GATE's limits-failed reason when the settings callable answers anything but every slot kind (slot_limits)
 LIMITS_SETTINGS_FAILED = "the broker's limits settings did not name calls, active_hours and repeat"
@@ -261,6 +267,10 @@ class Resolved:
     session: str
     kind: str
     run: Mapping[str, Any] | None
+
+
+class FenceUnavailable(Exception):
+    """A fence that cannot decide: its message names why, and GATE answers ``limits-failed`` with it."""
 
 
 class Resolver(Protocol):
@@ -395,13 +405,15 @@ class Broker:
                  answer_burst: int = ANSWER_BURST, gate_rate: float = GATE_RATE, gate_burst: int = GATE_BURST,
                  resolve_ttl: float = RESOLVE_TTL,
                  receipts: Receipts | None = None, contracts: Path | str | None = None,
-                 contracts_owner: int | None = None, limits: LimitsSource | None = None) -> None:
+                 contracts_owner: int | None = None, limits: LimitsSource | None = None,
+                 fence: FenceSource | None = None) -> None:
         """``contracts``: the directory dispatch publishes signed contracts in (``L/contracts/``, CONTRACT §26 S1-b),
         whose files must be owned by ``contracts_owner`` (dispatch's uid); without both, no grant ever applies.
         ``limits``: the GATE verb's settings callable (module docstring); ``None``, no limits configured (a test's
         broker: production passes :class:`levain.qbroker.limits.PolicyLimits`, :func:`levain.qbroker.__main__.build_broker`)."""
         self._store = store
         self._limits = limits
+        self._fence = fence
         self._limits_dir_logged = False
         self._receipts = receipts if receipts is not None else Receipts(store.root)
         self._contracts = None if contracts is None else Path(contracts)
@@ -845,9 +857,10 @@ class Broker:
         halting = self._halted_on(who.session)
         if halting is not None:
             return wire.answer(rid, gate="halted", request_id=halting)
-        # SEAM (P7-2): the agent fence step is NOT implemented here. It was planned for this point, before the run's
-        # count, so a STALE session would answer `fenced` and count nothing (P7-A subscription route, section 3.2
-        # "Fence-aware, restart-safe"); until P7-2 lands, a stale session's call is counted against its run.
+        # the fence before the run's count (P7-A section 3.2): a stale session is `fenced` and counts nothing
+        fenced = self._gate_fence(rid, who)
+        if fenced is not None:
+            return fenced
         over = self._gate_run(rid, who.run, tool_name, digest, tid)
         if over is not None:
             return over
@@ -860,6 +873,27 @@ class Broker:
         # judges a latch a newer one wrote (stack L3 r1 codex HIGH)
         with lock:
             return self._gate_limited(slot, rid, agent, who.session, tool_name, digest, tid)
+
+    def _gate_fence(self, rid: int, who: Resolved) -> dict[str, Any] | None:
+        """The agent fence step (P7-2): ``None`` to go on, else GATE's answer. Only a run (a dispatch session) is
+        fenced; a fence that cannot be read is ``limits-failed``, never a go."""
+        if self._fence is None or who.run is None:
+            return None
+        try:
+            reason = self._fence(who)
+        except FenceUnavailable as exc:
+            log.warning("qbroker: the agent fence of run %s cannot decide: %s", who.run.get("run_id"), exc)
+            return wire.answer(rid, gate="limits-failed", reason=f"the agent fence could not decide: {exc}"[:512])
+        except Exception as exc:  # noqa: BLE001 - an unreadable fence is not a go
+            log.warning("qbroker: the agent fence of run %s could not be read (%s)", who.run.get("run_id"),
+                        type(exc).__name__)
+            return wire.answer(rid, gate="limits-failed",
+                               reason=f"the agent fence could not be read ({type(exc).__name__})"[:512])
+        if reason is None:
+            return None
+        if not isinstance(reason, str) or not reason:
+            return wire.answer(rid, gate="limits-failed", reason=FENCE_ANSWER_MALFORMED)
+        return wire.answer(rid, gate="fenced", reason=reason[:512])
 
     def _gate_limited(self, slot: int, rid: int, agent: str, session: str, tool_name: str, digest: str,
                       tid: str | None) -> dict[str, Any]:

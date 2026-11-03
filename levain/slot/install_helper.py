@@ -633,7 +633,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
     revived = tuple(a for a in accounts if a.name in reuse.revive)
     groups = shared_groups_of(alloc, cmd.operator)
     early = policy_rows(host)
-    rows = ([r for r in base_store_rows(host, cmd.operator) if r not in early] + base_run_rows(host)
+    rows = ([r for r in base_store_rows(host, cmd.operator) if r not in early] + base_run_rows(host, cmd.operator)
             + slot_rows(host, alloc.slots))
     package = source or _levain_package()
     services, skipped = units.built_services(host, package, exists=program_exists)
@@ -641,7 +641,7 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
         restricted = (bwrap.userns_restricted() if read_sysctl is None
                       else bwrap.userns_restricted(read_sysctl))
         confinement = [*bwrap.bwrap_steps(apparmor_userns_restricted=restricted), *netns.netns_steps(alloc.slots)]
-        boot_dirs = tmpfiles_steps(host, alloc.slots)
+        boot_dirs = tmpfiles_steps(host, alloc.slots, cmd.operator)
     else:
         # Each egress slot's lo0 alias (§24) before the rules that name it.
         confinement = [*pf.alias_steps(alloc.slots), *pf.load_steps(alloc.slots, alloc.ids)]
@@ -1047,7 +1047,7 @@ def plan_replenish(cmd: InstallCommand, facts: HostFacts, *, slots: int | None, 
                        if s not in resumed)
     if host == "linux":
         # Every slot in service keeps its boot-time run dirs; the slots' bwrap re-copied if the system's changed.
-        confinement = [*netns.netns_steps(alloc.slots), *tmpfiles_steps(host, in_service + alloc.slots),
+        confinement = [*netns.netns_steps(alloc.slots), *tmpfiles_steps(host, in_service + alloc.slots, str(rec["name"])),
                        *bwrap.copy_steps()]
     else:
         # The rules re-rendered for every slot in service, the new ones with it, so no slot runs
@@ -1714,13 +1714,13 @@ def plan_repair(cmd: InstallCommand, facts: HostFacts, rf: RepairFacts, *,
             return ok, why
         return gen_mod.write_record_durably(shape_path, gen_mod.shape_text(new))
 
-    rows = base_store_rows(host, operator) + base_run_rows(host) + slot_rows(host, slots)
+    rows = base_store_rows(host, operator) + base_run_rows(host, operator) + slot_rows(host, slots)
     ids = {a.name: a.uid for a in accts}
     if host == "darwin":
         confinement = [*pf.alias_steps(slots), *pf.load_steps(slots, ids)]
     else:
         confinement = [*bwrap.bwrap_steps(apparmor_userns_restricted=restricted), *netns.netns_steps(slots),
-                       *tmpfiles_steps(host, slots)]
+                       *tmpfiles_steps(host, slots, operator)]
     steps: list[Step] = []
     if finished is not None:
         steps.append(Step(f"remove the finished repair journal {INTENT_PATH[host]} (its txn is install-shape's "

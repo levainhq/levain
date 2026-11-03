@@ -63,20 +63,19 @@ def test_follow_pushes_at_the_threshold_and_not_before_and_a_custom_time_applies
     assert "after 15 min" in intent.describe_line(q, now=NOW, idle=_idle(5.0))
 
 
-def test_an_until_input_overlay_ends_by_reading_never_by_a_write(tmp_path):
+def test_an_until_input_overlay_ends_by_a_typed_turn_never_by_sensed_input_or_a_write(tmp_path):
     q = tmp_path
     intent.apply_preset(q, "away", now=NOW, idle=_idle(5.0))
     before = _file(q)
-    # input 100 s after the word is the parting instruction (inside the 180 s grace): still away, though he is at the laptop
-    assert _push(q, "ping", 200.0, now=NOW + 300).push is True
-    # input 200 s after the word is past the grace: the overlay is over and follow reads the desk
-    got = _push(q, "ping", 100.0, now=NOW + 300)
-    assert (got.push, got.state) == (False, "holding")
-    # the same through the sensing writer: events only, the record byte-identical
+    # np-a93deaf7 "2a" (the 17:52 row): input at the laptop, inside the old grace or past it, fresh or stale, never ends the word
+    for reading in (200.0, 100.0, 5.0, 3600.0, None):
+        got = _push(q, "ping", reading, now=NOW + 300)
+        assert (got.push, got.state) == (True, "pushing"), reading
+    # the same through the sensing writer: no event, the record byte-identical
     for _ in range(2):
         desk.observe(q, NOW + 300, 100.0)
     assert _file(q) == before
-    assert [r["word"] for r in presence.read_log(q) if str(r.get("word", "")).startswith("ended")] == ["ended away"]
+    assert [r["word"] for r in presence.read_log(q) if str(r.get("word", "")).startswith("ended")] == []
     # a desk message one second after the word ends it at once (no grace), the record untouched
     intent.apply_preset(q, "sleep", now=NOW + 1000, idle=_idle(5.0))
     before = _file(q)

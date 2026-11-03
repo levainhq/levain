@@ -70,7 +70,7 @@ def test_the_claims_the_rows_rest_on_still_hold():
     # the reaper's directory is closed to an operator outside levain-wake, and the operator's STATUS needs no argument
     from levain.slot import layout
 
-    row = next(r for r in layout.base_run_rows("linux") if r.path.name == "reaper")
+    row = next(r for r in layout.base_run_rows("linux", "op") if r.path.name == "reaper")
     assert (row.group, row.mode) == ("levain-wake", 0o750)
     assert "STATUS" in C.PEER_VERBS["operator"] and C._ARGS["STATUS"][1] == frozenset()
 

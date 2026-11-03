@@ -3,7 +3,9 @@
 Since presence 1b (Phill 11-02) the rule lives in :mod:`levain.webpush.intent`: ONE record (``intent.json``) with a standing
 ``base`` and an ``overlay`` (a preset or a setting for a while), each carrying ``devices`` (on / off / follow), ``follow_after``
 (seconds; default 600) and ``lets_through`` (everything / needs / approvals / nothing). Sensing (laptop idle, remote input, a
-desk message, desk liveness) is shown and feeds only ``follow`` and ``until: input``; it never rewrites the record. This module
+desk message, desk liveness) is shown and feeds ``follow``; it never rewrites the record. An explicit word or setting made
+until input (away, sleep) stands until another word of his or a message he types into a session (the desk message): sensed
+laptop input never ends it (Phill 11-02). This module
 keeps what the record shares with its callers:
 
 - the vocabulary the record is written with: the preset words (:data:`WORDS`), who may set which (:data:`SEAT_WORDS`,
@@ -45,17 +47,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["ACTIVE_WINDOW_SECS", "AWAY_GRACE_SECS", "DEFAULT_SECS", "MAX_SECS", "SLEEP_BLIND_SECS", "URGENT_KINDS", "WORDS", "Decision", "KIND_CLASSES", "DEFAULT_CELLS", "kind_class",
+__all__ = ["ACTIVE_WINDOW_SECS", "DEFAULT_SECS", "MAX_SECS", "URGENT_KINDS", "WORDS", "Decision", "KIND_CLASSES", "DEFAULT_CELLS", "kind_class",
            "read_policy", "set_policy", "reset_policy", "policy_sentences", "policy_view", "policy_is_default",
            "REMOTE_SOURCES", "REMOTE_FAULT", "note_remote_activity", "read_remote_activity", "PresenceError", "PresenceBusy", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "read_legacy_word", "set_word", "should_push", "effective"]
 
 
 ACTIVE_WINDOW_SECS = 5 * 60
-AWAY_GRACE_SECS = 3 * 60
 DEFAULT_SECS = 60 * 60
 MAX_SECS = 24 * 3600
 MIN_SECS = 60
-SLEEP_BLIND_SECS = DEFAULT_SECS   # with no idle reading, `sleep` cannot see his next input: it ends this long after the word
 WORDS = ("away", "back", "sleep", "quiet", "loud")
 TIMED = ("quiet", "loud")
 SEAT_WORDS = ("away",)

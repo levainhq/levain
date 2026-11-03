@@ -744,6 +744,9 @@ def _key_setup_callers(tree: ast.AST) -> bool:
 PER_ACT_APPENDERS = {
     ("cockpit/keys.py", "_append"): ("sign_and_append",),
     ("cli.py", "_signed_append"): ("append", "prepare"),
+    # agents.signing._sign_op (P5a-2a): prepare and append in two separate autocommit blocks of one journal it opens
+    # per act, the signature taken between them OUTSIDE any transaction (_check_the_signing_module holds that)
+    ("agents/signing.py", "_sign_op"): ("append", "prepare"),
 }
 
 
@@ -787,6 +790,56 @@ def _check_per_act_append(fn: ast.FunctionDef | ast.AsyncFunctionDef, names: tup
 HANDED_APPENDERS = {
     ("agents/bars.py", "_r2"): "cockpit",
 }
+
+
+# The revoke steps of agent_authority.py: handed the cockpit connection by their caller, they open none. (file, function):
+# (the parameter, the levain.authority acts the function may make). The caller side is the revoke verbs' (P5c-2c).
+HANDED_STEPS = {
+    ("agent_authority.py", "_prepare_onto"): ("cockpit", ("prepare",)),
+    ("agent_authority.py", "revoke_agent_finish"): ("cockpit", ("append",)),
+}
+
+
+def _check_handed_step(fn: ast.FunctionDef, param: str, acts: tuple[str, ...]) -> None:
+    """``fn`` makes each of ``acts`` through ``param`` alone: the bare parameter is the first argument of every
+    ``_auth.<act>`` call, ``fn`` never rebinds it, builds no connection and declares no global state."""
+    assert not [n for n in ast.walk(fn) if isinstance(n, (ast.Global, ast.Nonlocal))], f"{fn.name}: global state"
+    assert param in {a.arg for a in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs)}, f"{fn.name}: no {param}"
+    assert _rebinds(fn, param) == [], f"{fn.name}: {param} is rebound"
+    for act in acts:
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and _dotted(n.func) == f"_auth.{act}"]
+        assert calls, f"{fn.name}: no _auth.{act} call"
+        for call in calls:
+            first = call.args[0] if call.args else None
+            assert isinstance(first, ast.Name) and first.id == param, \
+                f"{fn.name}:{call.lineno} {act} off the handed {param}"
+    builders = ("_journal", "CockpitDB", "autocommit", "connect", "Connection")
+    built = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call) and _dotted(n.func) is not None
+             and _dotted(n.func).split(".")[-1] in builders]
+    assert built == [], f"{fn.name}: builds a connection itself at {built}"
+
+
+def test_the_handed_step_guard_sees_a_step_off_its_handed_connection(tmp_path):
+    # the guard above is not vacuous: an append off another connection, a rebound parameter, or a connection the
+    # step builds fails it
+    root = tmp_path / "levain"
+    shutil.copytree(LEVAIN, root, ignore=shutil.ignore_patterns("__pycache__"))
+    path = root / "agent_authority.py"
+    src = path.read_text(encoding="utf-8")
+    for old, new, why in (
+            ("_auth.append(cockpit, link,", "_auth.append(autonomic, link,", "append off the handed cockpit"),
+            ("    from levain.agents import bars\n\n    bar = bars.read_bar(autonomic, bar_id)\n    if bar is None or bar.closed_at is not None:\n        return RevokeStep(\"abandoned\", bar_id, None, _ABANDONED)\n    link = _unsigned(bar)\n    if link is None or bar.pending_signature is None:",
+             "    from levain.agents import bars\n\n    cockpit = autonomic\n    bar = bars.read_bar(autonomic, bar_id)\n    link = _unsigned(bar)\n    if link is None or bar.pending_signature is None:",
+             "cockpit is rebound"),
+            ("    kw = {} if ssh_keygen is None else {\"ssh_keygen\": ssh_keygen}\n    try:\n        try:\n            new = _auth.append(",
+             "    cockpit = sqlite3.connect(':memory:')\n    try:\n        try:\n            new = _auth.append(",
+             "cockpit is rebound")):
+        assert src.count(old) == 1, old
+        path.write_text(src.replace(old, new), encoding="utf-8")
+        with pytest.raises(AssertionError, match=why):
+            _check_the_appenders(root)
+    path.write_text(src, encoding="utf-8")
+    _check_the_appenders(root)
 
 
 def _rebinds(fn: ast.AST, param: str) -> list[int]:
@@ -849,6 +902,20 @@ def _check_handed_append(tree: ast.Module, name: str, param: str) -> None:
         f"{name}: not recover's {param} in the {param} slot"
 
 
+def _check_the_signing_module(tree: ast.Module) -> None:
+    """agents/signing.py is a NAMED appender: only ``_sign_op`` prepares or appends, only ``sign_agent_link`` and
+    ``renew_agent_link`` call it (one direct call each), and ``_sign_op`` takes the signature (``sign(...)``) outside
+    every ``with ...autocommit()`` block, so a touch never holds a transaction."""
+    op = _function(tree, "_sign_op")
+    calls = [n for n in ast.walk(op) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "sign"]
+    assert len(calls) == 1, "_sign_op: not exactly one sign() call"
+    inside = [n for w in ast.walk(op) if isinstance(w, ast.With) for n in ast.walk(w) if n is calls[0]]
+    assert inside == [], "_sign_op: sign() inside a with block (a transaction held across the touch)"
+    callers = sorted(f.name for f in tree.body if isinstance(f, ast.FunctionDef) and f.name != "_sign_op"
+                     for n in ast.walk(f) if isinstance(n, ast.Name) and n.id == "_sign_op")
+    assert callers == ["renew_agent_link", "sign_agent_link"], f"_sign_op callers: {callers}"
+
+
 def _check_the_appenders(root: Path) -> None:
     """The S3a-2 MUST (a) guard over the package at ``root`` (the installed one, or a planted copy)."""
     appenders = []
@@ -861,7 +928,15 @@ def _check_the_appenders(root: Path) -> None:
     # act that opens its journal per act, the same shape as keys._append; PER_ACT_APPENDERS holds both to it below.
     # agents.bars._r2 appends a bar's stored signature through the cockpit connection recover hands it; it opens none
     # and is held to that by HANDED_APPENDERS below.
-    assert sorted(appenders) == [("agents/bars.py", "_r2", "append"),
+    # agent_authority._prepare_onto and revoke_agent_finish prepare and append the agent revoke through the cockpit
+    # connection their caller hands them (HANDED_STEPS below); they open none.
+    # agents.signing._sign_op signs and appends an agent link: sign_agent_link and renew_agent_link are its only
+    # callers, it signs outside any transaction, and PER_ACT_APPENDERS holds its connections to the per-act shape.
+    assert sorted(appenders) == [("agent_authority.py", "_prepare_onto", "prepare"),
+                                 ("agent_authority.py", "revoke_agent_finish", "append"),
+                                 ("agents/bars.py", "_r2", "append"),
+                                 ("agents/signing.py", "_sign_op", "append"),
+                                 ("agents/signing.py", "_sign_op", "prepare"),
                                  ("chat_egress/key_setup.py", "setup_key", "append"),
                                  ("chat_egress/key_setup.py", "setup_key", "prepare"),
                                  ("cli.py", "_signed_append", "append"),
@@ -871,6 +946,9 @@ def _check_the_appenders(root: Path) -> None:
                                  ("consent/grants.py", "prepare_revoke", "prepare")]
     for (rel, name), calls in PER_ACT_APPENDERS.items():
         _check_per_act_append(_function(ast.parse((root / rel).read_text(encoding="utf-8")), name), calls)
+    _check_the_signing_module(ast.parse((root / "agents" / "signing.py").read_text(encoding="utf-8")))
+    for (rel, name), (param, acts) in HANDED_STEPS.items():
+        _check_handed_step(_function(ast.parse((root / rel).read_text(encoding="utf-8")), name), param, acts)
     for (rel, name), param in HANDED_APPENDERS.items():
         _check_handed_append(ast.parse((root / rel).read_text(encoding="utf-8")), name, param)
     callers = [str(path.relative_to(root)) for path in sorted(root.rglob("*.py"))
@@ -955,6 +1033,35 @@ def test_the_appender_guard_sees_an_append_off_its_per_act_connection(tmp_path, 
     assert src.count(old) == 1, old
     (root / rel).write_text(src.replace(old, new), encoding="utf-8")
     with pytest.raises(AssertionError, match=why):
+        _check_the_appenders(root)
+
+
+def test_the_appender_guard_sees_a_second_appender_in_signing_or_a_new_module(tmp_path):
+    # the signing entry is a NAMED allowance, not a general one: another function in signing.py that appends, or a
+    # new module that does, fails the inventory; a second caller of _sign_op or a sign() inside a with fails its scope
+    root = tmp_path / "levain"
+    shutil.copytree(LEVAIN, root, ignore=shutil.ignore_patterns("__pycache__"))
+    _check_the_appenders(root)
+    signing = root / "agents" / "signing.py"
+    src = signing.read_text(encoding="utf-8")
+    signing.write_text(src + "\n\ndef sneaky(conn, link, sig, now):\n    return append(conn, link, sig, now=now)\n",
+                       encoding="utf-8")
+    with pytest.raises(AssertionError, match="sneaky"):
+        _check_the_appenders(root)
+    signing.write_text(src + "\n\ndef sneaky(db, op):\n    return _sign_op(db, op)\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="_sign_op callers"):
+        _check_the_appenders(root)
+    old = "        signature = sign(link.message)\n"
+    assert src.count(old) == 1
+    signing.write_text(src.replace(old, "        with db.autocommit():\n            signature = sign(link.message)\n"),
+                       encoding="utf-8")
+    with pytest.raises(AssertionError, match="sign\\(\\) inside a with"):
+        _check_the_appenders(root)
+    signing.write_text(src, encoding="utf-8")
+    planted = root / "agents" / "planted_agent.py"
+    planted.write_text("from levain.authority import append\ndef go(conn, link, sig, now):\n"
+                       "    return append(conn, link, sig, now=now)\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="planted_agent"):
         _check_the_appenders(root)
 
 

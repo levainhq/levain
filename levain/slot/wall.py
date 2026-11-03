@@ -912,7 +912,7 @@ def view_ancestor_modes() -> dict:
     source ``install`` makes the host's dirs from."""
     from levain.slot.layout import base_run_rows, base_store_rows
 
-    rows = base_store_rows("linux", "-") + base_run_rows("linux")
+    rows = base_store_rows("linux", "-") + base_run_rows("linux", "-")
     return {str(r.path): r.mode for r in rows if r.kind == "dir"}
 
 

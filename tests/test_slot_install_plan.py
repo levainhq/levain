@@ -378,6 +378,8 @@ def test_store_layout(host):
             assert order.index(str(L / rel.rsplit("/", 1)[0])) < order.index(str(L / rel)), rel
     assert rows[L / "reserve"] == ("root", root_grp, 0o600, "file")
     assert rows[RUN[host] / "control"] == ("_levain_control", "levain-control", 0o2750, "dir")
+    # P7-2 wiring: R/fence/ is the operator's (the fence server binds there), group _levain_qbroker; setgid on Linux only
+    assert rows[RUN[host] / "fence"] == (OP, "_levain_qbroker", 0o2750 if host == "linux" else 0o750, "dir")
     assert L == (Path("/private/var/levain") if host == "darwin" else Path("/var/levain"))
     # L/routes/base.json: §4.3's base map, no routes, canonical, root 0644, never over an existing map
     base = [s for s in plan.steps if s.write and s.write[0] == L / "routes" / "base.json"]

@@ -10,7 +10,7 @@ import pytest
 
 from levain.consent.adapters import claude_code
 from levain.webpush import intent, presence, sender
-from levain.webpush.presence import AWAY_GRACE_SECS, PresenceError, set_word
+from levain.webpush.presence import PresenceError, set_word
 from tests._push_fixtures import phone
 
 NOW = 1_000_000.0
@@ -92,26 +92,28 @@ def test_loud_overrides_an_active_laptop_and_an_ordinary_ping():
     assert decide(_rec(LOUD()), ACTIVE, "other").state == "pushing"
 
 
-def test_sleep_ends_at_input_past_the_grace_and_the_grace_is_every_until_input_presets():
-    s = _rec(SLEEP())   # said 100 s ago
-    assert decide(s, 50.0).state == "muted"            # input 50 s ago is 50 s after the word: the parting instruction
-    assert decide(s, None).state == "muted"            # no reading: it ends only at the blind bound (SLEEP_BLIND_SECS)
-    ended = decide(_rec(SLEEP(ts=NOW - 1000)), 50.0)   # input 950 s after the word is past the 180 s grace
-    assert (ended.push, ended.state) == (False, "holding")
+def test_sleep_stands_against_sensed_input_fresh_or_stale_or_missing():
+    """np-a93deaf7 "2a": a set sleep ends on a word of his or a typed turn, never on sensed laptop input."""
+    old = _rec(SLEEP(ts=NOW - 1000))     # said 1000 s ago, so any input reading below is past the old 180 s grace
+    for reading in (50.0, 400.0, 5000.0, None):      # a fresh reading, a stale one, one older than the word, no reading at all
+        d = decide(old, reading)
+        assert (d.push, d.state, d.by) == (False, "muted", "sleep"), reading
+    stale_word = _rec(SLEEP(ts=NOW - 10 * 3600))      # even hours later, with no reading, it stands (no blind bound)
+    assert decide(stale_word, None).state == "muted"
 
 
-def test_a_sleep_with_no_idle_reading_ends_at_the_blind_bound():
-    old = _rec(SLEEP(ts=NOW - presence.SLEEP_BLIND_SECS - 1))
-    assert decide(old, None, "other").push is True and "no laptop input reading" in decide(old, None).why
-
-
-def test_away_pushes_at_once_until_input_past_the_grace():
+def test_away_stands_against_sensed_input_the_shape_of_the_1752_row():
     a = _rec(AWAY(ts=NOW - 600))
-    # input 10 s ago is 590 s after the word: past the 180 s grace, so the word is spent and follow reads the desk
-    assert decide(a, ACTIVE).push is False
-    # input 1 s after the word is the parting instruction: still away
-    assert decide(_rec(AWAY(ts=NOW - 100)), 99.0).push is True
-    assert AWAY_GRACE_SECS == 180
+    for reading in (10.0, 99.0, 590.0, 5000.0, None):   # input past the old grace, fresh and stale, and none
+        assert decide(a, reading).push is True, reading
+
+
+def test_a_desk_message_ends_a_set_away_and_a_set_sleep():
+    for ov in (AWAY(ts=NOW - 600), SLEEP(ts=NOW - 600)):
+        rec = _rec(ov)
+        assert intent.overlay_ended(rec, NOW, 5.0, NOW - 100) == "desk message"
+        assert intent.overlay_ended(rec, NOW, 5.0, NOW - 700) is None      # a message before the word does not
+        assert intent.overlay_ended(rec, NOW, 5.0, None) is None           # sensed input alone does not
 
 
 def test_remote_is_no_longer_a_presence_word(tmp_path):
@@ -758,7 +760,11 @@ def test_effective_is_the_same_answer_as_should_push_for_every_overlay_idle_and_
     intent._write_record(q, {"base": _rec()["base"], "overlay": QUIET(60)})
     got = presence.effective(q, NOW, idle=lambda: 900.0)
     assert got["source"] == "word" and got["word"] == "quiet" and got["since"] == NOW - 100
-    intent._write_record(q, {"base": _rec()["base"], "overlay": AWAY(ts=NOW - 1000)})   # spent: he typed after the grace
+    from levain.webpush import desk
+
+    intent._write_record(q, {"base": _rec()["base"], "overlay": AWAY(ts=NOW - 1000)})
+    assert presence.effective(q, NOW, idle=lambda: 5.0)["source"] == "word"       # sensed input, past the old grace, does not spend it
+    desk.note_desk_message(q, "test-hook", now=NOW - 500)                          # a typed turn into a session does
     assert presence.effective(q, NOW, idle=lambda: 5.0)["source"] == "measured"
 
 
@@ -774,3 +780,44 @@ def test_a_status_read_writes_no_decision_row_and_a_delivery_does_and_a_fault_re
         raise RuntimeError("no idle")
     got = presence.effective(tmp_path, NOW, idle=boom)                    # no reading: follow reads him inactive and pushes
     assert got["pushing"] is True and got["state"] == "pushing"
+
+
+def test_a_remote_turn_after_away_still_pushes_and_follow_with_fresh_remote_still_pushes(tmp_path):
+    """Desk 7 / Phill np-a93deaf7 "2a": an away word stands against sensed laptop input, and remote work (a remote-terminal
+    or remote-control turn) never counts as the desk: with away set the laptop reading cannot hold the ping, and in follow
+    mode a fresh remote record still pushes before the laptop reading is consulted."""
+    for source in ("remote-terminal", "remote-control"):
+        q = tmp_path / f"away-{source}"
+        (q / "webpush").mkdir(parents=True, mode=0o700)
+        intent._write_record(q, {"base": _rec()["base"], "overlay": AWAY(ts=NOW - 1000)})
+        (q / "webpush" / presence.REMOTE_NAME).write_text(json.dumps({"at": NOW - 30.0, "source": source}))
+        got = presence.should_push(q, "ping", now=NOW, idle=lambda: 0.0, suggest=False)
+        assert got.push is True and got.state == "pushing", (source, got)
+        q2 = tmp_path / f"follow-{source}"
+        (q2 / "webpush").mkdir(parents=True, mode=0o700)
+        intent._write_record(q2, {"base": _rec()["base"], "overlay": None})
+        (q2 / "webpush" / presence.REMOTE_NAME).write_text(json.dumps({"at": NOW - 30.0, "source": source}))
+        got2 = presence.should_push(q2, "ping", now=NOW, idle=lambda: 0.0, suggest=False)
+        assert got2.push is True and got2.state == "pushing" and "remote" in got2.why, (source, got2)
+
+
+def test_read_sample_is_the_one_public_reading_of_the_rules_inputs(tmp_path):
+    """flow's phone bridge reads presence through ONE public function, not intent's private helpers: the record, the idle
+    reading (a desk message counted in), the desk message time, the remote record, the overlay's standing."""
+    q = tmp_path / "q"
+    (q / "webpush").mkdir(parents=True, mode=0o700)
+    intent._write_record(q, {"base": _rec()["base"], "overlay": AWAY(ts=NOW - 1000)})
+    (q / "webpush" / presence.REMOTE_NAME).write_text(json.dumps({"at": NOW - 30.0, "source": "remote-terminal"}))
+    got = intent.read_sample(q, NOW, lambda: 5.0)
+    assert set(got) == {"record", "reading", "last_input_at", "desk_message_at", "remote", "overlay_active", "now"}
+    assert got["record"]["status"] == "file" and got["reading"] == 5.0 and got["last_input_at"] == NOW - 5.0
+    assert got["desk_message_at"] is None and got["remote"]["source"] == "remote-terminal" and got["now"] == NOW
+    assert got["overlay_active"] is True   # 2a: sensed laptop input (5 s ago) does not end an away word
+    from levain.webpush import desk
+
+    desk.note_desk_message(q, "test-hook", now=NOW + 10)
+    after = intent.read_sample(q, NOW + 20, lambda: 500.0)
+    assert after["desk_message_at"] == NOW + 10 and after["overlay_active"] is False   # a typed turn ends it
+    q2 = tmp_path / "q2"
+    (q2 / "webpush").mkdir(parents=True, mode=0o700)
+    assert intent.read_sample(q2, NOW, lambda: None)["reading"] is None   # no sensor, no desk message: unknown
