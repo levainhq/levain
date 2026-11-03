@@ -16,7 +16,8 @@ What it holds, in the coordinator's own store (``dispatch.db``):
 - **The feeds**, each reading data already on disk and filing an item once per ``dedupe_key`` (a feed run twice files
   nothing the second time, and a cleared item is not re-filed by the condition that made it): a drop with no split
   receipt, a launch that died, an envelope near its stop, a Q13 End, the unseen digest (Q15), every KNOW, and the
-  coordinator's own flagged doubts and contradictions.
+  coordinator's own flagged doubts and contradictions. The ``agent`` feed is filed by the dream's morning card
+  (``levain.dream.card``), not by :func:`collect_feeds`.
 
 NOT here: any panel (cockpit and phone belong to the K lanes), the push itself (the notification layer), and the thread
 budget gauge (C6). The envelope feed reads ``stop_at`` because the meter is C6's.
@@ -42,17 +43,17 @@ from levain.contracts.canon import canonical
 from levain.coordinator.store import ACTORS, CoordError, CoordStore, _append_only, _in, next_gseq
 
 __all__ = ["FEEDS", "FEED_LABELS", "MODES", "NEAR_STOP", "NO_SPLIT_AFTER", "REVIEW_SCHEMA", "SIGNED", "SIGN_REQUEST_TTL",
-           "SIGN_TIER", "CoordNotFound", "Item", "SignedClearRefused", "body_fields", "clear_item", "clear_message",
+           "SIGN_TIER", "CoordNotFound", "Item", "SignedClearRefused", "body_fields", "item_text", "items_need_rebuild", "clear_item", "clear_message",
            "clear_signed", "collect_feeds", "feed_dead_seats", "feed_digest", "feed_end", "feed_envelopes", "feed_no_split",
-           "file_clear_request", "file_item", "file_know", "QueuePage", "get_item", "last_pass", "list_items",
+           "file_clear_request", "file_item", "file_know", "QueuePage", "get_item", "last_pass", "list_items", "migrate_items",
            "push_answer", "push_sign", "queue_page", "record_pass", "reopen_item", "waiting_on_you"]
 
-FEEDS = ("receipt", "seat", "envelope", "end", "digest", "know", "doubt", "contradiction")
+FEEDS = ("receipt", "seat", "envelope", "end", "digest", "know", "doubt", "contradiction", "agent")
 # a seat's words for each feed: the ONE table every surface draws from (the cockpit panel, the phone route); the
 # stored name stays the item's ``feed``
 FEED_LABELS = {"receipt": "Drop not split", "seat": "Seat died", "envelope": "Envelope near its stop",
                "end": "Session ended at a limit", "digest": "Unseen digest", "know": "Know", "doubt": "Doubt",
-               "contradiction": "Contradiction"}
+               "contradiction": "Contradiction", "agent": "Agent card"}
 MODES = ("manual", "fresh", "coordinator")
 # c4-mut R4: the mode of a clear the operator's passkey signed. Never a caller's to pick (MODES are): only
 # clear_signed writes it, and the table holds a signed event to the sign request it names (and only a signed one
@@ -184,6 +185,19 @@ def body_fields(item: Item) -> dict[str, Any]:
     """An item's body as fields, for every surface that draws one: ``{}`` when the stored body is not a JSON object
     (the store holds whatever a feed wrote; a row is drawn either way)."""
     return item.body if isinstance(item.body, dict) else {}
+
+
+def item_text(item: Item) -> str:
+    """The one line of words an item shows on any surface: ``text``, else ``summary``, else ``reason``, else ``his``
+    (an agent card may carry only that; a list is joined with "; "), stripped, "" when none holds text."""
+    f = body_fields(item)
+    for key in ("text", "summary", "reason", "his"):
+        v = f.get(key)
+        if isinstance(v, (list, tuple)):
+            v = "; ".join(str(x) for x in v if x)
+        if v:
+            return str(v).strip()
+    return ""
 
 
 _COLS = "item_id, thread_id, feed, dedupe_key, body, authority_relevant, by, at"
@@ -386,6 +400,43 @@ def migrate_events(conn: sqlite3.Connection) -> bool:
                  "SELECT rowid, item_id, seq, op, mode, by, at FROM review_events")
     conn.execute("DROP TABLE review_events")
     conn.execute("ALTER TABLE review_events_r4 RENAME TO review_events")
+    return True
+
+
+def items_need_rebuild(table_sql: str) -> bool:
+    """True when the stored ``CREATE TABLE`` of ``review_items`` has a feed CHECK that omits a feed in :data:`FEEDS`.
+    The ONE test the store's ensure path (to turn foreign keys off before it) and :func:`migrate_items` share."""
+    return not all(f"'{f}'" in table_sql for f in FEEDS)
+
+
+def migrate_items(conn: sqlite3.Connection) -> bool:
+    """A ``review_items`` made before a feed was added carries the narrower feed CHECK, and ``CREATE TABLE IF NOT
+    EXISTS`` never widens it: the insert of the new feed's item dies in SQLite. This rebuilds that table with the
+    current CHECK by the procedure :func:`migrate_events` follows (a new table, every column and the ``rowid``
+    copied, the old one dropped, the new one renamed), and is the ONE function the store's ensure path calls for it,
+    inside its ``BEGIN IMMEDIATE`` with foreign keys OFF (``review_events`` names this table) and the dangling-key and
+    integrity checks after, as for ``replies``. The old table's gseq column, index and triggers: the column is copied,
+    and the index and triggers go with the old table and are made again by the schema statements and the gseq step
+    that run next. True when it rebuilt; no table, or one whose CHECK already names every feed, is left as it is."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_items'").fetchone()
+    if row is None or not items_need_rebuild(row[0]):
+        return False
+    old = [r[1] for r in conn.execute("PRAGMA table_info(review_items)")]
+    # the new table is the current schema as written, never spliced; the column a later step added (gseq) is added
+    # the way that step adds it, so a reformat of REVIEW_SCHEMA[0] cannot break the open of a store. A column the
+    # current schema lacks other than gseq fails the INSERT below, closed, and the whole ensure rolls back.
+    conn.execute(REVIEW_SCHEMA[0].replace("CREATE TABLE IF NOT EXISTS review_items ", "CREATE TABLE review_items_feeds ", 1))
+    if "gseq" in old:
+        conn.execute("ALTER TABLE review_items_feeds ADD COLUMN gseq INTEGER")
+    cols = ", ".join(old)
+    conn.execute(f"INSERT INTO review_items_feeds (rowid, {cols}) SELECT rowid, {cols} FROM review_items")
+    conn.execute("DROP TABLE review_items")
+    legacy = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    conn.execute("PRAGMA legacy_alter_table = ON")
+    try:
+        conn.execute("ALTER TABLE review_items_feeds RENAME TO review_items")
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table = {'ON' if legacy else 'OFF'}")
     return True
 
 

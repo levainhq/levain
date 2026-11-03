@@ -549,16 +549,18 @@ class CoordStore:
             if "threads" not in _names(conn):
                 raise StoreAbsent(f"{self.path} holds no coordinator store")
             JobStore._ensure_schema(conn)      # the dispatch store's own format steps, as its own opener runs them
-        from levain.coordinator.review import ensure_one_signature, migrate_events
+        from levain.coordinator.review import ensure_one_signature, items_need_rebuild, migrate_events, migrate_items
 
         # a constraint rebuild of a table other tables point at runs with foreign keys off (a no-op inside a
         # transaction, so it is set here), and the keys are checked again before the commit. The setting is put back
         # to what the connection had, whatever happens, including a BEGIN that finds the store busy
         old_replies = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'replies'").fetchone()
         rebuild_replies = old_replies is not None and "coordinator_reply" not in old_replies[0]
+        old_items = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_items'").fetchone()
+        rebuild_items = old_items is not None and items_need_rebuild(old_items[0])
         keys_before = conn.execute("PRAGMA foreign_keys").fetchone()[0]
         try:
-            if rebuild_replies:
+            if rebuild_replies or rebuild_items:
                 conn.execute("PRAGMA foreign_keys = OFF")
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -567,6 +569,8 @@ class CoordStore:
                 rebuilt: list[str] = ["review_events"] if migrate_events(conn) else []
                 if rebuild_replies and migrate_reply_kinds(conn):
                     rebuilt.append("replies")
+                if rebuild_items and migrate_items(conn):
+                    rebuilt.append("review_items")
                 for stmt in self._statements():
                     conn.execute(stmt)
                 refresh_timeline_view(conn)
@@ -589,7 +593,7 @@ class CoordStore:
                 _rollback(conn)
                 raise
         finally:
-            if rebuild_replies:
+            if rebuild_replies or rebuild_items:
                 conn.execute(f"PRAGMA foreign_keys = {'ON' if keys_before else 'OFF'}")
 
     def _open_existing(self) -> sqlite3.Connection:
