@@ -198,9 +198,11 @@ def _check1(src: Sources, agent: str, key: str, day: date, zone: str, now: datet
         if r.get("state") == "done" and (occurrence_dream_day(r, zone) == day):
             return Check(1, name, QUIET, f"dream-day {day} was already consolidated by {r.get('occurrence_id')}",
                          "already-dreamed")
-    # a manual run has its own window key (``m:<date>``), so a manual run in flight is looked for by kind as well
+    # a manual run has its own window key (``m:<date>``), so a manual run in flight is looked for by kind or key prefix,
+    # for a scheduled evaluation as much as a manual one: either overlapping the other is the double launch
     inflight = [r for r in rows if r.get("state") in ("admitted", "launched")
-                and (r.get("window_key") == key or (manual and r.get("kind") == "manual"))]
+                and (r.get("window_key") == key or r.get("kind") == "manual"
+                     or str(r.get("window_key") or "").startswith("m:"))]
     if inflight:
         return Check(1, name, QUIET, f"{inflight[0].get('occurrence_id')} is still in flight", "in-flight")
     launched = [r for r in rows if r.get("window_key") == key and r.get("state") in _LAUNCHED_STATES

@@ -227,6 +227,7 @@ def _write(path: Path, data: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(data)
+        os.chmod(name, 0o644)           # mkstemp makes 0600; the card artifacts were world-readable before it
         os.replace(name, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -360,6 +361,8 @@ def texts_for(db_path: Path | str, occ_dir: Path | str) -> tuple[str, str]:
         except (OSError, UnicodeDecodeError) as exc:
             raise CardError(f"the snapshot's continuity copy {ent['name']!r} cannot be read ({exc})") from exc
     recorded = (m.get("post_files") or {}).get("continuity")
+    if recorded is not None and not (isinstance(recorded, str) and len(recorded) == 64):
+        raise CardError(f"the manifest's recorded continuity hash is not a sha256: {str(recorded)[:20]!r}")
     if not recorded:
         raise CardError("the manifest holds no post-save record: the text this dream saved is not known")
     for path in (occ / "composed.continuity.md", sn.text_tier(db_path)["continuity"]):

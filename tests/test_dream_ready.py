@@ -581,3 +581,11 @@ def test_verb_a_store_that_will_not_open_is_unreadable_exit_3(ent):
     (ent.store_dir / "memory.db").write_bytes(b"not a database" * 100)
     code, _ = run_verb(*[a for a in common(ent) if a != "--json"])
     assert code == 3
+
+
+def test_check1_a_scheduled_evaluation_sees_a_manual_run_in_flight_by_kind_and_by_key_prefix(ent):
+    """Reproduced by review: the manual in-flight match applied to manual evaluations only, so a scheduled one read ready
+    beside a launched manual run; the match is by ``kind`` or the ``m:`` key prefix, whichever the row carries."""
+    ent.occurrence("launched", kind="manual", window="m:2026-11-03", launched=utc(2026, 11, 3, 12, 0))
+    v = ent.evaluate(manual=False)
+    assert (v.verdict, v.check, v.kind) == (rd.QUIET, 1, "in-flight")

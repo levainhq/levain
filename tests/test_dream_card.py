@@ -418,3 +418,20 @@ def test_the_usage_record_carries_the_subscription_axes(scratch):
     assert (u.actions, u.seconds) == (8, 3181)
     assert us.to_usage({**base, "turns": None, "seconds": -1}).actions is None
     assert us.to_usage({**base}).seconds is None
+
+
+def test_a_card_artifact_is_world_readable(tmp_path):
+    import os
+    import stat
+    target = tmp_path / "occ" / "card_diff.txt"
+    cd._write(target, "x")
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644
+
+
+def test_a_malformed_recorded_continuity_hash_is_a_card_error(scratch):
+    dream(scratch, "o1", _VALID)
+    m = sn.read_manifest(occ(scratch, "o1"))
+    m.setdefault("post_files", {})["continuity"] = 7
+    sn._write_manifest(occ(scratch, "o1"), m)
+    with pytest.raises(cd.CardError):
+        cd.texts_for(scratch, occ(scratch, "o1"))

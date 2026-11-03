@@ -734,6 +734,7 @@ class _Ctx:
         self.mind = mind
         self.budget = budget
         self.composes: list[dict[str, Any]] = []
+        self.started = time.monotonic()          # the run's wall clock, for the subscription axis `seconds`
         self.spent = 0
         self.outcome: str | None = None
         self.instructions_sha256: str | None = None
@@ -760,7 +761,7 @@ def _write_usage(ctx: _Ctx) -> None:
         # the subscription route's axes (A0 §2.2): turns are the dream's actions; a count that could not be read is None
         "turns": (sum(c["turns"] for c in ctx.composes)
                   if all(c.get("turns") is not None for c in ctx.composes) else None),
-        "seconds": math.ceil(sum(c["seconds"] for c in ctx.composes)),
+        "seconds": math.ceil(time.monotonic() - ctx.started),
         "readable": readable, "composes": ctx.composes, "outcome": ctx.outcome,
         "instructions_sha256": ctx.instructions_sha256,
         "source": getattr(ctx.mind, "source", "dream:unknown"),
