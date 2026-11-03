@@ -308,7 +308,10 @@ _FRONT_KEYS = frozenset({"uid", "pending", "pid", "start"})
 TICKET_FACT_KEYS = frozenset({"job_id", "run_index", "contract_digest", "kind", "route", "routemap_generation",
                               "route_policy_digest", "model_requested", "egress_routes", "reserved_microdollars",
                               "verifier_generation", "verifier_id", "verifier", "verifier_steps",
-                              "driver_input_digest", "input_bundle_digest"})
+                              "driver_input_digest", "input_bundle_digest",
+                              # c7.14: a passthrough ticket's axis and per-run caps; `deadline` is ATTACH's absolute
+                              # reading of `deadline_s` (CONTROL's clock at the bind), answered beside the facts
+                              "auth", "vendor", "max_calls", "max_tunnel_bytes", "deadline_s", "deadline"})
 TICKET_FACT_REQUIRED = frozenset({"job_id", "run_index", "contract_digest", "kind", "egress_routes",
                                   "reserved_microdollars"})
 TICKET_VERIFIER_KEYS = frozenset({"verifier_generation", "verifier_id", "verifier_artifact_digest",
@@ -329,8 +332,13 @@ def _ticket_facts(value: object) -> dict[str, object]:
             _enum(v, where, _TICKET_KINDS)
         elif k.endswith("_digest"):
             _match(v, where, _DIGEST_RE)
-        elif k in ("run_index", "reserved_microdollars", "routemap_generation", "verifier_generation"):
+        elif k in ("run_index", "reserved_microdollars", "routemap_generation", "verifier_generation",
+                   "max_calls", "max_tunnel_bytes", "deadline_s", "deadline"):
             _uint(v, where)
+        elif k == "auth":
+            _enum(v, where, ("brokered", "passthrough"))
+        elif k == "vendor":
+            _enum(v, where, VENDORS)
         elif k == "egress_routes":
             _str_list(v, where, _ROUTE_ID_RE, MAX_ROUTES)
         elif k == "route":

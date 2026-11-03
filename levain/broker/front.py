@@ -123,6 +123,23 @@ class FrontPolicy:
     brokered: Mapping[str, RoutePolicy] = field(default_factory=dict)   # route id -> its policy
     #: render's incarnation for the session (the STATUS connection's `H`); None in a file without one.
     incarnation: Optional[int] = None
+    #: P7-A §3.2: total bytes, both directions, across every passthrough tunnel of the session. None = no cap.
+    tunnel_bytes_cap: Optional[int] = None
+    #: P7-A §3.2: absolute wall-clock (epoch seconds) after which no passthrough CONNECT is admitted. None = none.
+    deadline: Optional[float] = None
+
+
+def _limit_fields(doc: dict) -> tuple[Optional[int], Optional[float]]:
+    """The two optional passthrough limits of a policy document, each fail-closed: a present key that is not an int in
+    (0, ``norm.PT_CAP_MAX``] (cap) or a number in (0, ``norm.PT_DEADLINE_MAX``] (deadline), a bool included, is a
+    :class:`PolicyError`. The bounds are compared, never converted, so a huge JSON integer (``10**400``) or a NaN /
+    infinity is refused by the same test instead of overflowing."""
+    cap, dl = doc.get("tunnel_bytes_cap"), doc.get("deadline")
+    if "tunnel_bytes_cap" in doc and (type(cap) is not int or not 0 < cap <= norm.PT_CAP_MAX):
+        raise PolicyError(f"tunnel_bytes_cap must be a positive integer, at most {norm.PT_CAP_MAX}")
+    if "deadline" in doc and (type(dl) not in (int, float) or not 0 < dl <= norm.PT_DEADLINE_MAX):
+        raise PolicyError(f"deadline must be a positive finite number (epoch seconds), at most {norm.PT_DEADLINE_MAX}")
+    return cap, dl
 
 
 def load_policy(data: bytes) -> FrontPolicy:
@@ -131,14 +148,18 @@ def load_policy(data: bytes) -> FrontPolicy:
     key, any `credential` field (the front holds no key), a duplicate route id, a host admitted
     by two CONNECT routes (so whether a tunnel is passthrough is never ambiguous), a CONNECT host that is also a
     brokered route's host (a brokered session's vendor API traffic must go through the data plane, never a tunnel),
-    and a `subscription_passthrough` route in a dispatch-ticket session (CONTRACT §4.1: dispatch may NEVER use one)."""
+    and a `subscription_passthrough` route in a dispatch-ticket session unless the file carries a valid
+    `tunnel_bytes_cap` (P7-A: a dispatch passthrough session is bounded by bytes; `deadline` is optional and, when
+    present, validated the same way)."""
     try:
         doc = json.loads(data)
     except (ValueError, UnicodeDecodeError) as e:
         raise PolicyError(f"not JSON: {e}") from None
     if not isinstance(doc, dict) or not {"format", "kind", "session", "routes"} <= set(doc) \
-            or not set(doc) <= {"format", "kind", "session", "routes", "incarnation"}:
-        raise PolicyError("top level must be exactly {format, kind, session, routes, incarnation?}")
+            or not set(doc) <= {"format", "kind", "session", "routes", "incarnation", "tunnel_bytes_cap", "deadline"}:
+        raise PolicyError("top level must be exactly {format, kind, session, routes, incarnation?, "
+                          "tunnel_bytes_cap?, deadline?}")
+    cap, deadline = _limit_fields(doc)
     inc = doc.get("incarnation")
     if inc is not None and (not isinstance(inc, int) or isinstance(inc, bool) or inc < 0):
         raise PolicyError("incarnation must be an unsigned integer")
@@ -170,8 +191,9 @@ def load_policy(data: bytes) -> FrontPolicy:
             brokered_hosts.add(pol.upstream.host)
             brokered[route] = pol
             continue
-        if typ == "subscription_passthrough" and doc["kind"] in DISPATCH_KINDS:
-            raise PolicyError(f"route {route}: a {doc['kind']} session may not carry a subscription_passthrough route")
+        if typ == "subscription_passthrough" and doc["kind"] in DISPATCH_KINDS and cap is None:
+            raise PolicyError(f"route {route}: a {doc['kind']} session may carry a subscription_passthrough route "
+                              f"only with a tunnel_bytes_cap")
         for h in pol.hosts:
             if h in connect:
                 raise PolicyError(f"host {h} admitted by two routes ({connect[h].route}, {route})")
@@ -179,7 +201,7 @@ def load_policy(data: bytes) -> FrontPolicy:
     both = sorted(brokered_hosts & set(connect))
     if both:
         raise PolicyError(f"CONNECT routes admit brokered hosts {both}")
-    return FrontPolicy(doc["session"], doc["kind"], connect, brokered, inc)
+    return FrontPolicy(doc["session"], doc["kind"], connect, brokered, inc, cap, deadline)
 
 
 # --- addresses ------------------------------------------------------------------------------------------------
@@ -1122,6 +1144,74 @@ class Front:
         #: client connections being served: the MAX_CONNS count.
         self.clients = 0
         self.bound: Optional[tuple[str, int]] = None
+        #: P7-A §3.2: bytes moved across every passthrough tunnel, both directions, since this front started. Only
+        #: bytes handed to an open writer are counted, so the total never exceeds ``policy.tunnel_bytes_cap``.
+        self.pt_total = 0
+        #: latched when the cap is reached or a chunk would pass it; never cleared for the life of the front.
+        self.pt_exhausted = False
+        #: every passthrough connection from its upstream open to its end: id(counts) -> (counts, client writer,
+        #: upstream writer). Exhaustion closes them all and marks each ``counts["cut"]``.
+        self._pt_open: dict[int, tuple[dict, asyncio.StreamWriter, asyncio.StreamWriter]] = {}
+
+    def _pt_left(self) -> Optional[float]:
+        """Seconds until the passthrough deadline (<= 0 once past it); None when the session has none."""
+        dl = self.policy.deadline
+        return None if dl is None else dl - time.time()
+
+    def _pt_expired(self) -> bool:
+        left = self._pt_left()
+        return left is not None and left <= 0
+
+    def _pt_admit(self) -> None:
+        """Refuse a passthrough CONNECT past the deadline or after exhaustion. Asked before the upstream opens and
+        again after, before the 200: the open can take seconds, and the limits may pass during it."""
+        if self._pt_expired():
+            raise Refused("passthrough-deadline", "past-deadline")
+        if self.pt_exhausted:
+            raise Refused("passthrough-bytes-exhausted", "cap-reached")
+
+    def _pt_take(self, n: int, own: dict) -> tuple[bool, Optional[dict]]:
+        """Reserve ``n`` passthrough bytes the caller writes next, with no await between this and its write. False
+        (nothing counted) when the session is exhausted or ``n`` would pass the cap; the latter latches exhaustion and
+        closes every passthrough connection, the caller's included, so the chunk is dropped whole. Returns ``(taken, record)``: ``record`` is the exhaustion log record when this
+        call latched it, else None; the caller logs it, because the log writer is reached only from coroutines. A
+        reservation that lands exactly on the cap latches exhaustion and closes every OTHER connection; the caller's (``own``, its
+        counts) is marked cut but left open, so its accepted chunk is written before the caller ends it."""
+        cap = self.policy.tunnel_bytes_cap
+        if cap is None:
+            self.pt_total += n
+            return True, None
+        if self.pt_exhausted:
+            return False, None
+        if self.pt_total + n > cap:
+            return False, self._pt_exhaust()
+        self.pt_total += n
+        if self.pt_total == cap:
+            return True, self._pt_exhaust(spare=own)
+        return True, None
+
+    def _pt_exhaust(self, spare: Optional[dict] = None) -> dict:
+        """Latch exhaustion and cut the connections; returns the record the async caller logs (no log write here)."""
+        self.pt_exhausted = True
+        rec = {"event": "passthrough-bytes-exhausted", "cap": self.policy.tunnel_bytes_cap, "total": self.pt_total}
+        for counts, c, u in list(self._pt_open.values()):
+            counts["cut"] = True
+            if counts is not spare:
+                c.close()
+                u.close()
+        return rec
+
+    async def _pt_drain(self, w: asyncio.StreamWriter) -> bool:
+        """Drain a passthrough writer, bounded by the deadline when there is one: False when it passes first."""
+        left = self._pt_left()
+        if left is None:
+            await w.drain()
+            return True
+        try:
+            await asyncio.wait_for(w.drain(), max(left, 0.0))
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     def _log(self, rec: dict) -> None:
         head = {"at": round(time.time(), 3), "session": self.policy.session}
@@ -1213,7 +1303,15 @@ class Front:
                 return
             target = req.target
             route, port = connect_target(self.policy, target)
+            if route.passthrough:
+                self._pt_admit()
             ureader, uwriter, addr = await self._open_upstream(route, port)
+            if route.passthrough:
+                try:
+                    self._pt_admit()
+                except Refused:
+                    uwriter.close()
+                    raise
         except Refused as r:
             await self._refuse(reader, writer, r, target)
             return
@@ -1222,30 +1320,66 @@ class Front:
         _keepalive(writer)
         _keepalive(uwriter)
         self.live.add(uwriter)
-        counts: dict = {"up": 0, "down": 0}   # byte counts, plus "end" once the relay has finished
+        # byte counts, plus "end" once the relay has finished, and "cut" once the passthrough cap ended this connection
+        counts: dict = {"up": 0, "down": 0}
         relaying = False
+        if route.passthrough:   # from here on, exhaustion closes this connection too (no await since _pt_admit)
+            self._pt_open[id(counts)] = (counts, writer, uwriter)
         try:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
+            hello_wait = HEAD_TIMEOUT_S
+            if route.passthrough and (dl_left := self._pt_left()) is not None:
+                hello_wait = max(min(hello_wait, dl_left), 0.0)
+            pt_refusal = None   # why a passthrough hello is not forwarded, once a limit decides it
             try:
-                hello, body = await asyncio.wait_for(read_client_hello(reader), HEAD_TIMEOUT_S)
+                hello, body = await asyncio.wait_for(read_client_hello(reader), hello_wait)
                 if client_hello_sni(body) != route.host:
                     raise Refused("host-not-allowed", "sni-mismatch")
             except (asyncio.IncompleteReadError, asyncio.TimeoutError):
-                self._log({"event": "refused", "refused": "malformed", "detail": "tls-hello-incomplete",
-                           "host": route.host, "address": addr})
-                return
+                if route.passthrough and (counts.get("cut") or self._pt_expired()):
+                    pt_refusal = "passthrough-bytes-exhausted" if counts.get("cut") else "passthrough-deadline"
+                else:
+                    self._log({"event": "refused", "refused": "malformed", "detail": "tls-hello-incomplete",
+                               "host": route.host, "address": addr})
+                    return
             except Refused as r:
                 # after the 200 there is no HTTP answer to give: the client sees the tunnel close
                 self._log({"event": "refused", "refused": r.name, "detail": r.detail, "host": route.host,
                            "address": addr})
                 return
+            if route.passthrough and pt_refusal is None:
+                if self._pt_expired():
+                    pt_refusal = "passthrough-deadline"
+                elif counts.get("cut"):
+                    pt_refusal = "passthrough-bytes-exhausted"
+                elif uwriter.is_closing():   # shut down meanwhile: nothing is counted or forwarded
+                    return
+                else:
+                    taken, ex_rec = self._pt_take(len(hello), counts)
+                    if ex_rec is not None:
+                        self._log(ex_rec)
+                    if not taken:
+                        pt_refusal = "passthrough-bytes-exhausted"
+            if pt_refusal is not None:
+                self._log({"event": "refused", "refused": pt_refusal, "detail": "hello", "host": route.host,
+                           "address": addr})
+                return
             relaying = True
-            counts["up"] = len(hello)
             uwriter.write(hello)
-            await uwriter.drain()
-            await self._relay(reader, writer, ureader, uwriter, counts)
+            counts["up"] = len(hello)
+            if route.passthrough:
+                if counts.get("cut"):   # the hello took the last of the cap: written, then the tunnel ends
+                    counts["end"] = "bytes-exhausted"
+                    return
+                if not await self._pt_drain(uwriter):
+                    counts["end"] = "deadline"
+                    return
+            else:
+                await uwriter.drain()
+            await self._relay(reader, writer, ureader, uwriter, counts, route.passthrough)
         finally:
+            self._pt_open.pop(id(counts), None)
             uwriter.close()
             self.live.discard(uwriter)
             if relaying:   # also on cancellation (shutdown): a tunnel that carried bytes is never left out of the log
@@ -1255,7 +1389,8 @@ class Front:
                 self._log({"event": "tunnel", "route": route.route, "passthrough": route.passthrough,
                            "host": route.host, "port": port, "address": addr,
                            "bytes_up": counts["up"], "bytes_down": counts["down"],
-                           "end": counts.get("end", "aborted")})
+                           "end": counts.get("end", "aborted"),
+                           **({"passthrough_total": self.pt_total} if route.passthrough else {})})
 
     async def _open_upstream(self, route: ConnectRoute, port: int):
         try:
@@ -1284,7 +1419,7 @@ class Front:
                 pass
         raise Refused("upstream-timeout" if timed_out == len(addrs) else "upstream-error", "connect")
 
-    async def _relay(self, creader, cwriter, ureader, uwriter, counts: dict) -> None:
+    async def _relay(self, creader, cwriter, ureader, uwriter, counts: dict, passthrough: bool = False) -> None:
         """Copy both ways until both ends are done. A broken direction ends both; after one direction ends cleanly
         the other gets HALF_CLOSE_S to finish (a client that fully closed looks like a half-close from here, and an
         upstream that never answers the FIN would otherwise hold the tunnel open). A tunnel on which NO byte has moved
@@ -1295,27 +1430,54 @@ class Front:
 
         async def pump(src: asyncio.StreamReader, dst: asyncio.StreamWriter, key: str) -> str:
             """-> how this direction ended: "eof" (cleanly), "idle", "broken" (an OSError), or "error:<type>" for
-            anything else raised while copying, which is recorded instead of escaping as an unhandled exception."""
+            anything else raised while copying, which is recorded instead of escaping as an unhandled exception. A
+            passthrough direction also ends "deadline", and "bytes-exhausted" once the cap has cut this tunnel (an
+            EOF or a broken stream caused by that cut is reported as the cut)."""
             try:
                 while True:
                     left = last[0] + IDLE_S - loop.time()
                     if left <= 0:
                         return "idle"   # the whole tunnel has been quiet for IDLE_S
+                    if passthrough and (dl_left := self._pt_left()) is not None:
+                        # an open passthrough tunnel ends at the deadline too, not only the next CONNECT
+                        if dl_left <= 0:
+                            return "deadline"
+                        left = min(left, dl_left)
                     try:
                         chunk = await asyncio.wait_for(src.read(_CHUNK), left)
                     except asyncio.TimeoutError:
                         continue       # re-judged against the other direction's last byte
                     if not chunk:
                         break
+                    if passthrough:
+                        # judged again here, after the read's await and with none before the write: a chunk read
+                        # across the deadline, or onto a writer the cap closed meanwhile, is dropped, never forwarded
+                        if self._pt_expired():
+                            return "deadline"
+                        if counts.get("cut") or dst.is_closing():
+                            return "bytes-exhausted" if counts.get("cut") else "broken"
+                        taken, ex_rec = self._pt_take(len(chunk), counts)
+                        if ex_rec is not None:
+                            self._log(ex_rec)
+                        if not taken:
+                            return "bytes-exhausted"
                     last[0] = loop.time()
-                    counts[key] += len(chunk)
                     dst.write(chunk)
-                    await dst.drain()
+                    counts[key] += len(chunk)
+                    if passthrough:
+                        if counts.get("cut"):
+                            return "bytes-exhausted"   # this chunk took the last of the cap: written, then the end
+                        if not await self._pt_drain(dst):
+                            return "deadline"
+                    else:
+                        await dst.drain()
+                if passthrough and counts.get("cut"):
+                    return "bytes-exhausted"
                 if dst.can_write_eof():
                     dst.write_eof()   # half-close: the other direction keeps flowing
                 return "eof"
             except (OSError, asyncio.IncompleteReadError):
-                return "broken"
+                return "bytes-exhausted" if passthrough and counts.get("cut") else "broken"
             except Exception as e:   # noqa: BLE001 - see the docstring
                 return f"error:{type(e).__name__}"
 

@@ -46,6 +46,7 @@ import os
 import sqlite3
 import sys
 import time
+import types
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
@@ -56,22 +57,25 @@ from levain.band_shorthand import ItemInfo, Parse, Refusal, View, parse
 from levain.band_sources import Extra, Extras, NotOffered, read_extras, sheet_text
 from levain.coordinator.review import require_aware_now
 from levain.cockpit.consent import ConsentError, utc_stamp
-from levain.consent.questions import (HOOK_BUSY_MS, Question, QuestionStore, _now_utc, _select, open_ended_of,
-                                     read_deadline)
+from levain.consent.questions import (ANSWER_CHANNELS, HOOK_BUSY_MS, _TEXT_MAX, Answer, Question, QuestionStore, _answer_of, _now_utc,
+                                     _select, open_ended_of, read_deadline)
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
            "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed", "session_band_state",
            "run_band", "run_band_answer", "AnswerCommitted", "AuthorityItem", "BandSnapshot", "PickNotOffered",
            "QUESTION_VERSION_FIELDS", "VersionMoved", "VersionedQuestionStore", "answer_item", "answerable",
-           "subject_for", "subject_version", "summary"]
+           "subject_for", "subject_version", "summary", "Signing", "answer_sign_of", "allocate", "ALLOCATABLE_SOURCES"]
 
 COMPACT_AFTER = 12
 _COMPACT_WHAT = 100
 _LETTERS = "abcdef"                       # an option's display letter is its position; the stored key never shows
-# a number shown must be final: this is the one place numbers are made, and nothing rewrites or removes one
+# a number shown must be final: this is the one place numbers are made, and nothing rewrites or removes one.
+# The table's body is one constant so the L3 rebuild (:func:`_migrate_band_items`) makes exactly the schema's table.
+_ITEMS_BODY = ("(n INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL CHECK (source "
+               "IN ('question','consent','sign','extend','host')), ref TEXT NOT NULL, numbered_at TEXT NOT NULL, "
+               "UNIQUE (source, ref))")
 BAND_SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS band_items (n INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL CHECK (source "
-    "IN ('question','consent','sign','extend')), ref TEXT NOT NULL, numbered_at TEXT NOT NULL, UNIQUE (source, ref))",
+    "CREATE TABLE IF NOT EXISTS band_items " + _ITEMS_BODY,
     # an item's closing, shown once to a hook: written once (a viewer's own delta is S2)
     "CREATE TABLE IF NOT EXISTS band_closed_shown (n INTEGER PRIMARY KEY REFERENCES band_items(n), at TEXT NOT NULL)",
     "CREATE TRIGGER IF NOT EXISTS band_items_frozen BEFORE UPDATE ON band_items "
@@ -100,15 +104,70 @@ BAND_SCHEMA = (
     "PRIMARY KEY (viewer, gen))",
     # S2 (D14): the sidecar of a band answer; the `answers` table and its channel CHECK are untouched
     "CREATE TABLE IF NOT EXISTS answer_context (question_id TEXT PRIMARY KEY REFERENCES answers(question_id), "
-    "via TEXT NOT NULL CHECK (via IN ('seat','cli','cockpit','phone')), viewer TEXT, seen_through INTEGER, note TEXT)",
+    "via TEXT NOT NULL CHECK (via IN ('seat','cli','cockpit','phone')), viewer TEXT, seen_through INTEGER, note TEXT, "
+    "sig TEXT, message TEXT, signer_fp TEXT, sign_state TEXT, sign_reason TEXT)",
     "CREATE TRIGGER IF NOT EXISTS answer_context_frozen BEFORE UPDATE ON answer_context "
     "BEGIN SELECT RAISE(ABORT, 'answer context is append-only'); END",
     "CREATE TRIGGER IF NOT EXISTS answer_context_kept BEFORE DELETE ON answer_context "
     "BEGIN SELECT RAISE(ABORT, 'answer context is append-only'); END",
 )
 
+# TERMSIGN L3: sources a caller outside Levain may allocate under (:func:`allocate`); the others are Levain's own
+ALLOCATABLE_SOURCES = ("host",)
+# The authority items' sources, named rather than everything-but-question: readers here were written to take only
+# these, so a source added after them is not read as an authority item. Written knowing that a binary from before
+# ``host`` (it excluded only 'question'), run against a migrated store, would read a host row as an authority number
+# whose source it cannot read: listed as unknown, never closed, nothing recorded.
+_AUTHORITY_SOURCES = ("consent", "sign", "extend")
+_AUTHORITY_IN = "(" + ", ".join(f"'{s}'" for s in _AUTHORITY_SOURCES) + ")"
+
+
+def _migrate_band_items(conn: sqlite3.Connection) -> None:
+    """Rebuild a ``band_items`` made before ``host`` was a source (its CHECK is part of the table, so it cannot be
+    altered): the rows keep their numbers and the AUTOINCREMENT high-water mark survives. The table's triggers go with
+    the drop and are made again by the caller's :data:`BAND_SCHEMA` pass, in the same transaction. Idempotent.
+
+    Built to hold whether or not the connection enforces foreign keys (``band_closed_shown`` references these rows,
+    and the pragma that turns enforcement off is a no-op inside the caller's transaction): the checks are deferred to
+    COMMIT, the rows are parked in a TEMP table, and the table is made again under its own name (no rename, so no
+    reference is rewritten), so every reference resolves again before COMMIT. A foreign-key violation the rebuild added
+    raises and the whole write rolls back."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'band_items'").fetchone()
+    if row is None or "'host'" in (row[0] or ""):
+        return
+    conn.execute("PRAGMA defer_foreign_keys = ON")       # resets itself at COMMIT or ROLLBACK
+    broken = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+    seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'band_items'").fetchone()
+    conn.execute("CREATE TEMP TABLE band_items_rows AS SELECT n, source, ref, numbered_at FROM main.band_items")
+    conn.execute("DROP TABLE main.band_items")
+    conn.execute("CREATE TABLE main.band_items " + _ITEMS_BODY)
+    conn.execute("INSERT INTO main.band_items (n, source, ref, numbered_at) SELECT n, source, ref, numbered_at "
+                 "FROM temp.band_items_rows ORDER BY n")
+    conn.execute("DROP TABLE temp.band_items_rows")
+    if seq is not None:
+        cur = conn.execute("UPDATE main.sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'band_items'", (seq[0],))
+        if cur.rowcount == 0:
+            conn.execute("INSERT INTO main.sqlite_sequence (name, seq) VALUES ('band_items', ?)", (seq[0],))
+    if len(conn.execute("PRAGMA foreign_key_check").fetchall()) > broken:
+        raise sqlite3.IntegrityError("the band_items rebuild left a reference to a band number without its row; "
+                                     "nothing was changed")
+
+
 CONTRACT = ("[Levain NEEDS YOU band] When a NEEDS YOU block is in your context, end every reply with it exactly as "
             "Levain last gave it: do not renumber, reorder, drop or answer its items, and say what each one blocks.")
+
+
+# TERMSIGN L2: what a store made before the signing columns lacks. Each is nullable, so a row written by any other
+# path (or before) reads as "no signing was attempted"; the frozen-update trigger covers them with the rest.
+_SIGN_COLUMNS = ("sig", "message", "signer_fp", "sign_state", "sign_reason")
+
+
+def _ensure_sign_columns(conn: sqlite3.Connection) -> None:
+    """Add the signing columns to an ``answer_context`` made without them (idempotent; inside the caller's write)."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(answer_context)")}
+    for col in _SIGN_COLUMNS:
+        if col not in have:
+            conn.execute(f"ALTER TABLE answer_context ADD COLUMN {col} TEXT")
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -198,6 +257,7 @@ def _number(store: QuestionStore, refs: list[Any], deadline: float, now: datetim
         # no question was ever filed here: the store is set up for the first number, inside the same deadline
         store.ready_by(deadline)
         with store._write_by(deadline) as conn:
+            _migrate_band_items(conn)
             for stmt in BAND_SCHEMA:
                 conn.execute(stmt)
             stamp = utc_stamp(now if now is not None else _now_utc(store._clock))   # ``now`` given: no clock is read
@@ -216,6 +276,50 @@ def _number(store: QuestionStore, refs: list[Any], deadline: float, now: datetim
         if _busy(exc):
             return {}
         raise
+
+
+def allocate(store: QuestionStore, source: str, refs: Sequence[str], *, deadline: float | None = None,
+             now: datetime | None = None) -> dict[str, int]:
+    """Number items of a caller outside Levain in the band's one number space (TERMSIGN L3).
+
+    ``source`` must be one of :data:`ALLOCATABLE_SOURCES` (today ``"host"``); anything else raises ``ValueError``, as
+    does a ``refs`` entry that is not a non-empty string. Returns ``{ref: n}`` for every ref given, in ONE write
+    waited for until ``deadline`` (``time.monotonic()``; ``None``: the 2 s hook bound). A ref already allocated under
+    this source keeps its number (idempotent, never a second one); new refs are numbered in the order given. The lock
+    still busy at the deadline: nothing is written and ``{}`` comes back, so the caller tells a missing key from a
+    number. An empty ``refs`` returns ``{}`` without touching the store. Any other store error is raised.
+    Numbers are never reused and never change, and Levain's shorthand parse skips a number allocated here silently."""
+    if source not in ALLOCATABLE_SOURCES:
+        raise ValueError(f"unknown band source {source!r}: allocate takes one of {', '.join(ALLOCATABLE_SOURCES)}")
+    keys = list(refs)
+    if any(not isinstance(r, str) or not r for r in keys):
+        raise ValueError("a band ref is a non-empty string")
+    if not keys:
+        return {}
+    limit = (time.monotonic() + HOOK_BUSY_MS / 1000) if deadline is None else deadline
+    got = _number(store, [(source, r) for r in dict.fromkeys(keys)], limit, now)
+    return {r: got[(source, r)] for r in keys if (source, r) in got}
+
+
+def _host_numbers(store: QuestionStore, ns: set[int]) -> set[int] | None:
+    """Which of ``ns`` are allocated to ``host`` (one read-only snapshot; absent store or table: none). ``None``: the
+    read failed (a held lock past the read bound, an I/O error), so whose numbers they are is not known."""
+    if not ns:
+        return set()
+    try:
+        with store._peek() as conn:
+            if conn is None or "band_items" not in _tables(conn):
+                return set()
+            # in chunks under SQLite's oldest bound-variable limit (999), however many numbers the line named
+            got: set[int] = set()
+            todo = sorted(ns)
+            for i in range(0, len(todo), 500):
+                part = todo[i:i + 500]
+                got.update(r[0] for r in conn.execute("SELECT n FROM band_items WHERE source = 'host' AND n IN "
+                                                      f"({','.join('?' * len(part))})", part))
+            return got
+    except sqlite3.Error:
+        return None
 
 
 def mark_closed_shown(store: QuestionStore, closed: list[int]) -> None:
@@ -267,7 +371,7 @@ def _extra_state(store: QuestionStore, extras: Extras) -> tuple[dict[tuple[str, 
         if conn is None or "band_items" not in _tables(conn):
             return {}, []
         have = _tables(conn)
-        rows = conn.execute("SELECT n, source, ref FROM band_items WHERE source != 'question' ORDER BY n").fetchall()
+        rows = conn.execute(f"SELECT n, source, ref FROM band_items WHERE source IN {_AUTHORITY_IN} ORDER BY n").fetchall()
         shown_closed = ({r[0] for r in conn.execute("SELECT n FROM band_closed_shown")}
                         if "band_closed_shown" in have else set())
     numbers = {(src, ref): n for n, src, ref in rows}
@@ -531,7 +635,7 @@ def _extras_of(store: QuestionStore, view: View) -> tuple[dict[int, Extra], set[
         if conn is None or "band_items" not in _tables(conn):
             return {}, set()
         refs = {n: (src, ref) for n in view.open_list for src, ref in [r for r in conn.execute(
-            "SELECT source, ref FROM band_items WHERE n = ? AND source != 'question'", (n,))]}
+            f"SELECT source, ref FROM band_items WHERE n = ? AND source IN {_AUTHORITY_IN}", (n,))]}
     if not refs:
         return {}, set()
     try:
@@ -568,12 +672,56 @@ def _plan_on(store: QuestionStore, view: View | None, text: str
     infos = {n: _info_of(q) for n, q in questions.items()}
     infos.update({n: _info_of_extra(e) for n, e in extras.items()})
     plan = parse(text, view, infos, _store_id_of(store))
+    plan = _without_host(store, plan, text)
     if unknown and any(r.n in unknown for r in plan.refused):
         plan = dataclasses.replace(plan, refused=tuple(
             Refusal(r.n, f"{r.n}: its source could not be read just now, so Levain cannot tell it is still open; "
                          "nothing opened (try again)") if r.n in unknown and "not open in the band" in r.reason
             else r for r in plan.refused))
     return plan, view, questions, extras
+
+
+_HOST_PROBE = View(0, (), "")        # a view nothing is open in: parse names every number the line typed, as a refusal
+_ABOUT_THE_NUMBER = ("was filed after the band you saw", "was not open in the band you saw")   # what a host number gets
+
+
+def _without_host(store: QuestionStore, plan: Parse, text: str) -> Parse:
+    """TERMSIGN L3: a number allocated to ``host`` belongs to another surface's footer, so the parse drops its refusal
+    without a word; nothing is left to say and nothing recorded: the prompt is no band answer (parse's own ``rest`` and
+    ``hint`` are kept).
+
+    Parse's early exits (no band shown to this viewer, a band from another store) refuse the line as a whole, with no
+    number. For those the line is parsed once more against an empty view to learn the numbers it typed: a line that
+    named only host numbers, and no sweep, is silent too."""
+    if not plan.refused:
+        return plan
+    named = {r.n for r in plan.refused if r.n is not None}
+    whole: set[int] = set()                              # the numbers behind a whole-line refusal, if it has only those
+    if not (plan.actions or plan.sheets) and any(r.n is None for r in plan.refused):
+        probe = parse(text, _HOST_PROBE, {}, None)
+        if probe.refused and all(r.n is not None for r in probe.refused):
+            whole = {r.n for r in probe.refused if r.n is not None}
+    if not (named or whole):
+        return plan
+    host = _host_numbers(store, named | whole)           # the one read this adds, and only when something was refused
+    if host is None:
+        # Unknown is not "none": reading every number as Levain's would resurrect the wrong refusal ("filed after",
+        # "no band was shown") at exactly the moment the store is busy. Say instead what is true, and record nothing.
+        # No second read is tried: the peek already waited its bound, and a prompt pays it once.
+        def why(ns: list[int], what: str) -> str:
+            return (f"Levain could not read just now whose {'number' if len(ns) == 1 else 'numbers'} "
+                    f"{', '.join(map(str, ns))} {'is' if len(ns) == 1 else 'are'}; {what} (try again)")
+        kept = tuple(Refusal(r.n, why([r.n], "nothing recorded for it"))
+                     if r.n is not None and any(s in r.reason for s in _ABOUT_THE_NUMBER)
+                     else Refusal(None, why(sorted(whole), "nothing recorded")) if r.n is None and whole
+                     else r for r in plan.refused)
+        return dataclasses.replace(plan, refused=kept)
+    if not host:
+        return plan
+    kept = tuple(r for r in plan.refused if r.n not in host and not (r.n is None and whole and whole <= host))
+    if not (plan.actions or plan.sheets or kept):
+        return dataclasses.replace(plan, matched=False, refused=())
+    return dataclasses.replace(plan, refused=kept)
 
 
 def plan_for(store: QuestionStore, viewer: str, text: str) -> tuple[Parse, View | None, dict[int, Question]]:
@@ -604,9 +752,144 @@ class Applied(NamedTuple):
     answered: tuple[str, ...] = ()      # the ids of the questions recorded (what a delivery is asked for)
 
 
+@dataclasses.dataclass(frozen=True)
+class Signing:
+    """One signing attempt over the entries of one typed line (TERMSIGN L2). ``state`` is ``signed`` or ``unsigned``
+    (``reason`` then one of ``terminal_sign.REASONS``, ``detail`` its first line); ``message`` / ``sig`` /
+    ``fp`` are what was signed and the signature; ``versions`` maps each SIGNED question id to the row version the
+    message names, which the write checks again inside its transaction."""
+    state: str
+    reason: str | None = None
+    detail: str = ""
+    message: str | None = None
+    sig: str | None = None
+    fp: str | None = None
+    versions: Mapping[str, str] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # read-only once built: the same object sits in every entry of the line, and the write checks against it
+        object.__setattr__(self, "versions", types.MappingProxyType(dict(self.versions)))
+
+
+_SIGN_WORDS = {
+    "no-key": "terminal signing is not set up (levain band terminal-key create)",
+    "remote": "the desk is remote, so no Touch ID prompt was raised",
+    "unavailable": "Touch ID was unavailable",
+    "cancelled": "you cancelled Touch ID",
+    "timeout": "no touch in time",
+}
+
+
+def _no_key_noted(store: QuestionStore, viewer: str) -> bool:
+    """True when this viewer already has an answer recorded unsigned for want of a key: the not-set-up line is
+    said once, at its first answer. A store without the signing columns, or one that cannot be read, says False."""
+    try:
+        with store._peek() as conn:
+            if conn is None or "answer_context" not in _tables(conn):
+                return False
+            if "sign_reason" not in {r[1] for r in conn.execute("PRAGMA table_info(answer_context)")}:
+                return False
+            return conn.execute("SELECT 1 FROM answer_context WHERE viewer = ? AND sign_reason = 'no-key' LIMIT 1",
+                                (viewer,)).fetchone() is not None
+    except Exception:  # noqa: BLE001 - the line is then said again, which costs a sentence
+        return False
+
+
+def _sign_note(by_state: Mapping[str, Sequence[str]], signing: "Signing | None", quiet_no_key: bool) -> str | None:
+    """The echo's sentence on the sign state, in plain words (``signed (Touch ID, laptop): 1a``), or ``None``."""
+    parts: list[str] = []
+    if by_state.get("signed"):
+        parts.append("signed (Touch ID, laptop): " + ", ".join(by_state["signed"]))
+    if by_state.get("unsigned") and signing is not None and not quiet_no_key:
+        why = _SIGN_WORDS.get(signing.reason or "") or f"the signer failed: {signing.detail or 'unknown'}"
+        parts.append(f"recorded UNSIGNED ({why}): " + ", ".join(by_state["unsigned"]))
+    return "; ".join(parts) or None
+
+
+def _check_provenance(e: Mapping[str, Any]) -> tuple[str, Any]:
+    """The answer and the per-entry checks of :meth:`QuestionStore.answer_with_context`, the same tests in the same
+    order with the same words (``via``, ``viewer``, ``seen_through``, ``note``), so the signed write refuses exactly
+    what the unsigned one does. Returns ``(kind, value)`` of the answer; raises :class:`ConsentError`."""
+    via, viewer, seen, note = e.get("via"), e.get("viewer"), e.get("seen_through"), e.get("note")
+    kind, value = _answer_of(e.get("option"), e.get("text"))
+    if via not in ("seat", "cli", "cockpit", "phone"):
+        raise ConsentError(f"via must be seat, cli, cockpit or phone: {via!r}")
+    if viewer is not None and (not isinstance(viewer, str) or "\x00" in viewer):
+        raise ConsentError("viewer must be a string with no NUL")
+    if seen is not None and (not isinstance(seen, int) or isinstance(seen, bool) or seen < 0):
+        raise ConsentError("seen_through must be a band number")
+    if note is not None and (not isinstance(note, str) or len(note) > _TEXT_MAX or "\x00" in note):
+        raise ConsentError(f"note must be at most {_TEXT_MAX} characters with no NUL")
+    return kind, value
+
+
+def _answer_signed(store: QuestionStore, entries: list[dict[str, Any]], *, channel: str,
+                   deadline: float | None, require: Callable[[sqlite3.Connection], None] | None = None) -> list[Any]:
+    """:meth:`QuestionStore.answer_with_context` for the seat hook: the same one write, each answer with its
+    ``answer_context`` row, plus the signing columns (the base method inserts only the original five). An entry
+    may carry ``sign`` (a :class:`Signing`): a SIGNED one is recorded only if the row still has the version the
+    message names, read again here under the write lock (a moved row is that item's refusal, never an answer over
+    stale bytes). Migrates a store made before the columns. Lock waits, savepoints, ``require`` (run after the schema,
+    before any entry; whatever it raises rolls back the whole write and is raised), the per-entry checks
+    (:func:`_check_provenance`) and results as the base method."""
+    if channel not in ANSWER_CHANNELS:
+        raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
+    out: list[Any] = []
+    with (store._write_by(deadline) if deadline is not None else store._write()) as conn:
+        for stmt in BAND_SCHEMA:
+            conn.execute(stmt)
+        _ensure_sign_columns(conn)
+        if require is not None:
+            require(conn)
+        stamp = utc_stamp(_now_utc(store._clock))
+        for e in entries:
+            conn.execute("SAVEPOINT answer_entry")
+            try:
+                note, sign = e.get("note"), e.get("sign")
+                kind, value = _check_provenance(e)
+                q = store._by_ref(conn, e.get("ref"))
+                if q is None:
+                    raise ConsentError(f"no such question: {e.get('ref')!r}")
+                signed = isinstance(sign, Signing) and sign.state == "signed" and q.id in sign.versions
+                if signed and subject_version(q) != sign.versions[q.id]:
+                    raise ConsentError("it changed after you saw it (the signed version is not its version now); "
+                                       "nothing recorded for it")
+                store._record(conn, q, kind, value, channel, stamp)
+                cols = (None,) * 5
+                if isinstance(sign, Signing):
+                    cols = ((sign.sig, sign.message, sign.fp, "signed", None) if signed else
+                            (None, None, None, "unsigned", sign.reason))
+                conn.execute("INSERT INTO answer_context (question_id, via, viewer, seen_through, note, sig, message, "
+                             "signer_fp, sign_state, sign_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (q.id, e.get("via"), e.get("viewer"), e.get("seen_through"), note, *cols))
+            except (ConsentError, sqlite3.IntegrityError) as exc:
+                conn.execute("ROLLBACK TO answer_entry")
+                conn.execute("RELEASE answer_entry")
+                out.append(exc if isinstance(exc, ConsentError) else ConsentError(str(exc)))
+                continue
+            conn.execute("RELEASE answer_entry")
+            out.append(Answer(q.id, kind, value, channel, stamp))
+    return out
+
+
+def answer_sign_of(store: QuestionStore, question_id: str) -> dict[str, Any] | None:
+    """The signing record of one answer (``sig``, ``message``, ``signer_fp``, ``sign_state``, ``sign_reason``), or
+    ``None`` when the answer has no sidecar row or its store predates the columns (no signing was attempted)."""
+    with store._peek() as conn:
+        if conn is None or "answer_context" not in _tables(conn):
+            return None
+        cur = conn.execute("SELECT * FROM answer_context WHERE question_id = ?", (question_id,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        got = dict(zip([c[0] for c in cur.description], row))
+    return {k: got.get(k) for k in _SIGN_COLUMNS}
+
+
 def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question], *, viewer: str, via: str,
                seen_through: int, deadline: float | None = None, extras: dict[int, Extra] | None = None,
-               channel: str = "cli", require: Callable[[sqlite3.Connection], None] | None = None) -> Applied:
+               channel: str = "cli", require: Callable[[sqlite3.Connection], None] | None = None,
+               sign_with: Callable[[list[tuple[Any, Question]]], "Signing | None"] | None = None) -> Applied:
     """Record ``plan.actions`` with their ``answer_context`` sidecars (via, viewer, the view's ``seen_through``, the
     note verbatim) through ONE :meth:`QuestionStore.answer_with_context` write (``channel``: ``cli`` by default, the
     human channel a terminal or a seat's typing is; the cockpit and the phone pass their own, S5a): an answer and its
@@ -622,7 +905,14 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
     An authority item (``plan.sheets``, D8 SIG-ONLY) records NOTHING here: its existing signing ceremony is named with
     the pick preselected (``Applied.sheets``), and only if the item is still open now: each is read again here, at
     apply time, so an item closed since the plan was made opens nothing. No ruling, signature or answer is written
-    for it by this function."""
+    for it by this function.
+
+    ``sign_with`` (TERMSIGN L2, the seat hook only): called ONCE with the ``(action, question)`` pairs that are about
+    to be recorded, after every per-item refusal and before the write, outside any store lock. It returns a
+    :class:`Signing` (one signature over one message naming every information entry) or ``None``. The write then
+    stores that outcome in each entry's ``answer_context`` row in the same transaction, and an entry whose row
+    moved between the message and the write is refused for that item, never recorded over stale bytes. A signer
+    that raises is an unsigned ``signer-error``: signing never blocks recording."""
     recorded: list[str] = []
     refused = [r.reason for r in plan.refused]
     sheets: list[str] = []
@@ -690,10 +980,29 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
         except Exception as exc:                              # one item's failure never costs the others
             refused.append(f"{act.n}: {exc}")
     ids: list[str] = []
+    by_state: dict[str, list[str]] = {}
+    quiet_no_key = False
+    if sign_with is not None and todo:
+        todo_pairs = [(act, questions[act.n]) for act, _ in todo]
+        try:
+            signing = sign_with(todo_pairs)
+        except Exception as exc:                              # noqa: BLE001 - the answer is recorded whatever the signer did
+            signing = Signing("unsigned", "signer-error", type(exc).__name__,
+                              versions={q.id: "" for _, q in todo_pairs if _question_kind(q) == "information"})
+        if signing is not None:
+            for act, entry in todo:
+                if questions[act.n].id in signing.versions:
+                    entry["sign"] = signing
+            quiet_no_key = signing.reason == "no-key" and _no_key_noted(store, viewer)
+            if deadline is not None:                          # the sign step may have run past the hook's bound: the write has its own
+                deadline = max(deadline, time.monotonic() + HOOK_BUSY_MS / 1000)
     if todo or require is not None:
         try:
-            results: list[Any] = store.answer_with_context([e for _, e in todo], channel=channel, schema=BAND_SCHEMA,
-                                                           deadline=deadline, require=require)
+            results: list[Any] = (_answer_signed(store, [e for _, e in todo], channel=channel, deadline=deadline,
+                                                 require=require)
+                                  if sign_with is not None else
+                                  store.answer_with_context([e for _, e in todo], channel=channel, schema=BAND_SCHEMA,
+                                                            deadline=deadline, require=require))
         except Exception as exc:                              # rolled back whole: nothing of it was stored
             if require is not None:                           # a surface: 409 / 503, never a per-item refusal
                 raise
@@ -706,15 +1015,19 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
             else:
                 recorded.append(act.label)
                 ids.append(entry["ref"])
+                if isinstance(entry.get("sign"), Signing):
+                    by_state.setdefault(entry["sign"].state, []).append(act.label)
+    sign_note = _sign_note(by_state, next((e["sign"] for _, e in todo if isinstance(e.get("sign"), Signing)), None),
+                           quiet_no_key)
     try:
-        echo = format_echo(recorded, refused, via, plan.hint, sheets)
+        echo = format_echo(recorded, refused, via, plan.hint, sheets, sign_note)
     except Exception:                                         # what was recorded is said, whatever the formatting
         echo = "[Levain band answer] recorded: " + (", ".join(recorded) or "nothing")
     return Applied(recorded, refused, echo, tuple(sheets), tuple(ids))
 
 
 def format_echo(recorded: list[str], refused: list[str], via: str, hint: str | None = None,
-                sheets: list[str] | None = None) -> str:
+                sheets: list[str] | None = None, sign_note: str | None = None) -> str:
     """The echo: exactly what was recorded and refused (``recorded: 1a (you, seat); refused: 16 ...``), and the
     signing sheets opened for authority items (``signature needed, nothing recorded: 16a: ...``)."""
     if hint and not recorded and not refused and not sheets:
@@ -723,6 +1036,8 @@ def format_echo(recorded: list[str], refused: list[str], via: str, hint: str | N
     line = f"[Levain band answer] recorded: {got}"
     if refused:
         line += "; refused: " + "; ".join(refused)
+    if sign_note:
+        line += f"; {sign_note}"
     if hint:
         line += f"; {hint}"
     if sheets:
@@ -1222,18 +1537,83 @@ def _is_relay(prompt: str, environ: Mapping[str, str]) -> bool:
     return environ.get("LEVAIN_TURN") == "relay" or prompt.lstrip().startswith("levain:")
 
 
+def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse, session: str,
+                     environ: Mapping[str, str], signer_factory: Any = None, key_dir: Path | None = None,
+                     on_sign: Callable[[], None] | None = None, *, view_id: int | None = None
+                     ) -> Callable[[list[tuple[Any, Question]]], Signing | None]:
+    """The ``sign_with`` of a seat's typed answer (TERMSIGN L2): after a full parse, ONE message naming every
+    information entry about to be recorded (item, row version as read for the plan, the question, the answer), signed
+    once, outside any store lock. Authority entries are not signed here. It never raises: a message that cannot be
+    built or a signer that fails is an unsigned outcome naming why (``terminal_sign.REASONS``).
+
+    ``view_id``: the view (``band_views.seq``) the plan was PARSED against, which the message names (DESIGN §2). It
+    is never re-read here: a view another hook of this viewer commits between the parse and the sign would otherwise
+    scope the signature to a band the line was not read from. ``None`` (no view): unsigned, ``signer-error``."""
+    def sign_with(pairs: list[tuple[Any, Question]]) -> Signing | None:
+        from levain.consent import terminal_sign as ts
+
+        entries: list[Any] = []
+        versions: dict[str, str] = {}
+        info_ids = {q.id: "" for _, q in pairs if _question_kind(q) == "information"}
+        try:
+            for act, q in pairs:
+                if _question_kind(q) != "information":
+                    continue
+                version = subject_version(q)
+                if act.text is not None:
+                    entry = ts.Entry(q.id, version, q.what, "information", text=act.text, note=act.note)
+                else:
+                    letter = act.pick or ""
+                    entry = ts.Entry(q.id, version, q.what, "information",
+                                     answer=f"({letter}) {q.options[_LETTERS.index(letter)][1]}", note=act.note)
+                entries.append(entry)
+                versions[q.id] = version
+            if not entries:
+                return None
+            sid = _store_id_of(store)
+            if view_id is None or sid is None:
+                return Signing("unsigned", "signer-error", "no view or store id to bind the message to", versions=info_ids)
+            rest = (plan.rest or "").strip()
+            at = prompt.rfind(rest) if rest else -1
+            block = (prompt[:at] if at >= 0 else prompt).strip()
+            typed = " / ".join(ln.strip() for ln in block.splitlines() if ln.strip())
+            message = ts.build_message(store=f"levain-questions:{sid}", install=sid, session=session, view=str(view_id),
+                                       typed=typed, typed_block=None if typed == block else block, entries=entries)
+        except Exception as exc:  # noqa: BLE001 - signing never blocks recording
+            # every information entry of the line, never a map the loop left half-built
+            return Signing("unsigned", "signer-error", f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}",
+                           versions=info_ids)
+        if on_sign is not None:
+            on_sign()
+        out = ts.sign(message, key_dir=key_dir, signer_factory=signer_factory, remote=ts.is_remote(environ))
+        if out.state == "signed":
+            return Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint, versions)
+        return Signing("unsigned", out.reason, out.detail, versions=versions)
+
+    return sign_with
+
+
 def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mapping[str, str],
-                 deadline: float | None = None) -> str:
+                 deadline: float | None = None, session: str | None = None, signer_factory: Any = None,
+                 key_dir: Path | None = None, on_sign: Callable[[], None] | None = None) -> str:
     """Parse the human's prompt text; on a full parse record it (via ``seat``, the lock waited for until
     ``deadline``) and return the echo. A prompt that is no answer line, a relay turn or an empty one: ``""``. Raises
-    only before anything is recorded (a store that cannot be read); :func:`apply_plan` never raises."""
+    only before anything is recorded (a store that cannot be read); :func:`apply_plan` never raises.
+
+    With a harness ``session`` the answer is also SIGNED (TERMSIGN L2, :func:`_terminal_signer`): the outcome is
+    recorded beside the answer and the echo names it. Without one (a direct call, no hook payload) nothing is
+    signed. ``signer_factory`` and ``key_dir`` are for tests; ``on_sign`` is told when a sign step is about to run. Left alone they reach the real Secure Enclave key."""
     if not isinstance(prompt, str) or not prompt.strip() or _is_relay(prompt, environ):
         return ""
-    plan, view, questions, extras = plan_for_full(store, viewer, prompt)
+    got = _newest_view(store, viewer)           # read ONCE: the plan and the signed message name the same view
+    plan, view, questions, extras = _plan_on(store, got[0] if got is not None else None, prompt)
     if not plan.matched:
         return format_echo([], [], "seat", plan.hint) if plan.hint else ""
+    sign_with = (_terminal_signer(store, viewer, prompt, plan, session, environ, signer_factory, key_dir,
+                                  on_sign, view_id=got[1] if got is not None else None) if session else None)
     return apply_plan(store, plan, questions, viewer=viewer, via="seat",
-                      seen_through=view.seen_through if view else 0, deadline=deadline, extras=extras).echo
+                      seen_through=view.seen_through if view else 0, deadline=deadline, extras=extras,
+                      sign_with=sign_with).echo
 
 
 def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> str:
@@ -1389,10 +1769,22 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
     if coord:
         _clear_staged(directory, session)        # a turn of this session that never reached Stop leaves no view to commit
     echo = ""
+    signed_ran: list[bool] = []
     try:
-        echo = _seat_answer(store, viewer, payload.get("prompt"), env, deadline)
+        echo = _seat_answer(store, viewer, payload.get("prompt"), env, deadline, session=session,
+                            on_sign=lambda: signed_ran.append(True))
     except Exception:                         # fail open before anything is recorded: the prompt passes untouched
         echo = ""
+    if signed_ran and deadline is not None:   # a sign step waited on a touch: the render gets a full bound of its own
+        deadline = max(deadline, time.monotonic() + HOOK_BUSY_MS / 1000)
+        with read_deadline(deadline):
+            return _hook_render(store, directory, session, viewer, coord, echo, deadline)
+    return _hook_render(store, directory, session, viewer, coord, echo, deadline)
+
+
+def _hook_render(store: QuestionStore, directory: Path | str, session: str, viewer: str, coord: bool, echo: str,
+                 deadline: float) -> tuple[str, Callable[[], None]]:
+    """The render half of :func:`_hook_prompt`: the band after the echo, and the ``commit`` that records its view."""
     try:
         prev = last_view(store, viewer)
         r = render_full(store, deadline=deadline)

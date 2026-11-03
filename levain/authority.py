@@ -67,7 +67,7 @@ __all__ = [
     "CONSENT_CONTAINED_SHELL_KIND", "contained_shell_grant",
     "consent_grant", "consent_grant_tool_problem", "consent_revocable", "consent_tool_shape_problem",
     "consent_resolved_workspace", "consent_mcp_declaration", "consent_mcp_input_fits", "consent_mcp_tool_problem",
-    "agent_last_revoke", "agent_link", "agent_link_arms", "agent_link_incarnation", "agent_links",
+    "agent_last_revoke", "agent_link", "agent_link_terms", "agent_link_arms", "agent_link_incarnation", "agent_links",
     "consent_root_problem", "consent_tool_problem", "consent_workspace_problem", "create_schema", "custody_mismatch",
     "custody_problem", "egress_key_conflicts", "egress_key_host_problem", "egress_key_incarnation", "egress_key_live",
     "egress_key_record", "egress_key_repo_problem", "graduation_grant", "graduation_incarnation", "graduation_links",
@@ -1494,9 +1494,16 @@ def _graduation_phone_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: 
 # the autonomic store: whether a link is live for a launch is a reader's question (levain.agent_authority, a later slice: BUILD_PLAN P5c-1).
 AGENT_LINK_KIND = "agent-link"
 AGENT_LINK_MAX = _CONSENT_GRANT_MAX
-_AGENT_LINK_FIELDS = frozenset({"id", "kind", "agent_id", "store_id", "spec_hash", "role_hash", "binding_id",
-                                "capabilities", "budget_run_usd_micros", "budget_window_usd_micros", "run_ceiling",
-                                "expires_at", "guard"})
+# two shapes are accepted, no loosening between them: the shipped one (a link written before the subscription route,
+# which reads as billing "api_key" with zero action caps: it could only sign dollar budgets, and those bind only an
+# API-key route) and the one that adds the route's three fields (P7-A §2.2). A record with some of the three is neither.
+_AGENT_LINK_FIELDS_SHIPPED = frozenset({"id", "kind", "agent_id", "store_id", "spec_hash", "role_hash", "binding_id",
+                                        "capabilities", "budget_run_usd_micros", "budget_window_usd_micros",
+                                        "run_ceiling", "expires_at", "guard"})
+_AGENT_LINK_ROUTE_FIELDS = frozenset({"billing", "budget_run_calls", "budget_run_tunnel_bytes"})
+_AGENT_LINK_FIELDS = _AGENT_LINK_FIELDS_SHIPPED | _AGENT_LINK_ROUTE_FIELDS
+_AGENT_LINK_SHAPES = (_AGENT_LINK_FIELDS_SHIPPED, _AGENT_LINK_FIELDS)
+_AGENT_BILLINGS = ("api_key", "subscription")
 _AGENT_LINK_ID = re.compile(r"al-[0-9a-f]{12}")
 _AGENT_ID = re.compile(r"ag-[0-9a-f]{32}")
 # an agent link's store id has the shape of a graduation policy's
@@ -1571,13 +1578,16 @@ def _agent_capabilities(caps: Any, what: str) -> None:
 
 
 def _validate_agent_link(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
-    """An agent link's shape (:data:`AGENT_LINK_KIND`): exactly :data:`_AGENT_LINK_FIELDS` (a ``review_by`` or any
-    other field is unknown and refused), every id and hash in its form, money and counts integers (a float or a bool
+    """An agent link's shape (:data:`AGENT_LINK_KIND`): exactly one of the two accepted field sets (the shipped one or
+    the one with the route's three fields added; a ``review_by``, a partial set of the three or any other field is
+    unknown and refused), the route's rule on the new shape (``subscription``: both dollar budgets 0 and both action
+    caps above 0; ``api_key``: both action caps 0), every id and hash in its form, money and counts integers (a float or a bool
     is no integer here), an expiry at most :data:`AGENT_LINK_MAX` past the link's ``at``, and a ``guard`` that is a
     list of objects. What the guard's entries must say is an append rule, not a replay rule (as for a graduation
     policy), so a replay never refuses the log over a guard's contents."""
-    if set(grant) != _AGENT_LINK_FIELDS:
-        raise AuthorityError(f"{what} (an agent link) must carry exactly {', '.join(sorted(_AGENT_LINK_FIELDS))}")
+    if set(grant) not in _AGENT_LINK_SHAPES:
+        raise AuthorityError(f"{what} (an agent link) must carry exactly {', '.join(sorted(_AGENT_LINK_FIELDS_SHIPPED))}"
+                             f", or those and {', '.join(sorted(_AGENT_LINK_ROUTE_FIELDS))}")
     if grant["kind"] != AGENT_LINK_KIND:
         raise AuthorityError(f"{what}.kind must be {AGENT_LINK_KIND!r}")
     for name, pattern, shape in (("id", _AGENT_LINK_ID, "al- and 12 lowercase hex digits"),
@@ -1593,6 +1603,20 @@ def _validate_agent_link(grant: Mapping[str, Any], what: str, at: datetime | Non
         value = grant[name]
         if type(value) is not int or not 0 <= value <= _AGENT_INT_MAX:
             raise AuthorityError(f"{what}.{name} must be an integer from 0 to {_AGENT_INT_MAX} (no floats)")
+    if "billing" in grant:
+        if grant["billing"] not in _AGENT_BILLINGS or type(grant["billing"]) is not str:
+            raise AuthorityError(f"{what}.billing must be one of {', '.join(_AGENT_BILLINGS)}")
+        for name in ("budget_run_calls", "budget_run_tunnel_bytes"):
+            value = grant[name]
+            if type(value) is not int or not 0 <= value <= _AGENT_INT_MAX:
+                raise AuthorityError(f"{what}.{name} must be an integer from 0 to {_AGENT_INT_MAX} (no floats)")
+        calls, nbytes = grant["budget_run_calls"], grant["budget_run_tunnel_bytes"]
+        if grant["billing"] == "subscription":
+            if grant["budget_run_usd_micros"] or grant["budget_window_usd_micros"] or calls <= 0 or nbytes <= 0:
+                raise AuthorityError(f"{what} (a subscription link) must sign both dollar budgets 0 and both action "
+                                     "caps (budget_run_calls, budget_run_tunnel_bytes) above 0")
+        elif calls or nbytes:
+            raise AuthorityError(f"{what} (an api_key link) must sign both action caps 0")
     expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
     if at is not None and expires - at > AGENT_LINK_MAX:
         raise AuthorityError(f"{what} may last at most {AGENT_LINK_MAX.days} days past its link's time")
@@ -1617,6 +1641,14 @@ def agent_link(grant: Any) -> bool:
     """Whether ``grant`` is an agent link this levain knows (:data:`AGENT_LINK_KIND`)."""
     return isinstance(grant, Mapping) and grant.get("kind") == AGENT_LINK_KIND \
         and _grant_kind(grant) is _GRANT_KINDS[AGENT_LINK_KIND]
+
+
+def agent_link_terms(grant: Mapping[str, Any]) -> tuple[str, int, int]:
+    """``(billing, budget_run_calls, budget_run_tunnel_bytes)`` of a validated agent link. A link in the shipped shape
+    reads as ``("api_key", 0, 0)``: faithful, since it could only have signed dollar budgets."""
+    if "billing" not in grant:
+        return ("api_key", 0, 0)
+    return (grant["billing"], grant["budget_run_calls"], grant["budget_run_tunnel_bytes"])
 
 
 def agent_links(state: AuthoritySnapshot, agent_id: str, agent_store_id: str) -> list[str]:

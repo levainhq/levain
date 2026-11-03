@@ -24,8 +24,8 @@ from tests.test_slot_s2f3_start import _S, _blob, _rendered, _world
 from tests.vendor_tree import vendor_installed, vendor_prefix  # noqa: F401 - autouse, the real vendor check
 
 E0 = SlotId("egress", 0)
-UUID = "4b8e0c1a-1d2e-4f00-9a7b-0123456789ab"       # give_credential's claude baseline
-OTHER = "9d2f7a55-0000-4000-8000-00000000beef"
+UUID = "4b8e0c1a1d2e4f009a7b0123456789ab4b8e0c1a1d2e4f009a7b0123456789ab"       # give_credential's claude baseline
+OTHER = "9d2f7a55" * 7 + "0000beef"
 PASS = ["claude-sub", "github"]
 CRED = {"claude": ".credentials.json", "codex": "auth.json"}
 
@@ -207,14 +207,20 @@ def test_claude_differ_refuses_identity_changed_with_the_credential_back_before_
 # --- test 8: every failure of the call --------------------------------------------------------------------------------
 
 def _ans(status=200, body=None):
-    body = {"account": {"uuid": UUID}} if body is None else body
-    return json.dumps({"refresh": 200, "status": status,
-                       "body": body if isinstance(body, str) else json.dumps(body)}).encode() + b"\n"
+    if body is not None:
+        line = {"claim": "local-data", "logged_in": True, "id_digest": body}
+    elif status == 200:
+        line = {"claim": "local-data", "logged_in": True, "id_digest": UUID}
+    elif status in (401, 403):
+        line = {"claim": "local-data", "logged_in": False}
+    else:
+        line = {"error": "exit-nonzero"}
+    return json.dumps(line).encode() + b"\n"
 
 
 @pytest.mark.parametrize("answer", [
-    (1, b"{}"), (0, b"x" * (ID.PROFILE_ANSWER_MAX + 1)), (0, b"not json"), (0, _ans(500)), (0, _ans(body={})),
-    (0, _ans(body={"account": {"uuid": "bad uuid"}})), (0, b'{"status":200}\n')])
+    (1, b"{}"), (0, b"x" * (ID.PROFILE_ANSWER_MAX + 1)), (0, b"not json"), (0, _ans(500)), (0, _ans(body=7)),
+    (0, _ans(body="bad uuid")), (0, b'{"status":200}\n')])
 def test_each_unparsable_answer_refuses_and_parks_back(env, answer):
     w, la, _ = env
     s = _gated(w, la)
@@ -229,9 +235,9 @@ def test_each_unparsable_answer_refuses_and_parks_back(env, answer):
                                          (500, "identity-unparsable")])
 def test_an_auth_failure_answer_says_the_login_looks_expired(status, name):
     with pytest.raises(Refused) as e:
-        ID.parse_profile_answer(0, _ans(status))
+        ID.parse_auth_answer(0, _ans(status))
     assert e.value.name == name
-    assert f"HTTP {status}" in str(e.value) and ("expired or revoked" in str(e.value)) is (name == "identity-expired")
+    assert ("sign in to this slot again" in str(e.value)) is (name == "identity-expired")
 
 
 def test_a_capture_that_times_out_refuses_identity_unparsable(env):
@@ -312,6 +318,17 @@ def test_claude_with_a_not_a_check_baseline_is_identity_changed(env):
 def test_a_claude_answer_of_not_a_check_never_matches_a_not_a_check_baseline(env):
     w, la, _ = env
     s = _gated(w, la, baseline_id="not-a-check", profile="not-a-check")
+    # root's parse takes a 64-hex digest only (L3 r1, 1102-5), so the line is refused before the gate compares
+    assert w.main(["start", s])[1]["refused"] == "identity-unparsable"
+    assert w.state(s).fields["identity"] == {"result": "identity-unparsable"}
+    _back_in_keep(w, s)
+
+
+def test_the_gate_itself_never_matches_a_claude_not_a_check(env, monkeypatch):
+    """The gate's own vendor guard, reached by a Claude call that answered ``not-a-check`` past the parse."""
+    w, la, _ = env
+    s = _gated(w, la, baseline_id="not-a-check")
+    monkeypatch.setitem(ID.IDENTITY_CALLS, "claude", lambda ctx, a, held=False: "not-a-check")
     assert w.main(["start", s])[1]["refused"] == "identity-changed"
     assert w.state(s).fields["identity"] == {"observed_id": "not-a-check", "result": "identity-changed"}
     _back_in_keep(w, s)
