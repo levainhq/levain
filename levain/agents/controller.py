@@ -16,13 +16,16 @@ binding is minted by the launch slice, neither of which is this module's.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -673,19 +676,45 @@ class Started:
 
 
 GATE_REFUSED = 75   # the gate's exit when it reads anything but the release byte (EOF: its holder closed or died)
-_GATE = ("import os, sys\n"
+GATE_NO_EXEC = 127  # the gate's exit when the released argv could not be exec'd
+# The gate, then the lifeline. Before the release: EOF exits GATE_REFUSED, nothing ran. On the release byte it forks
+# the executor into its own process group (the gate leads it: start_new_session) and keeps the read end. A thread
+# reaps the executor and exits with its status (a signal death as 128 + the signal). The main thread reads on: the
+# holder writes nothing more, so the read returns only at EOF, the holder closed its end (abort) or died, and the gate
+# then SIGKILLs its whole process group, itself included, so no executor outlives its holder.
+_GATE = ("import os, signal, sys, threading\n"
          "fd = int(sys.argv[1])\n"
-         "go = os.read(fd, 1)\n"
-         "os.close(fd)\n"
-         f"if go != b'1':\n    sys.exit({GATE_REFUSED})\n"
-         "os.execvp(sys.argv[2], sys.argv[2:])\n")
+         f"if os.read(fd, 1) != b'1':\n    sys.exit({GATE_REFUSED})\n"
+         "pid = os.fork()\n"
+         "if pid == 0:\n"
+         "    try:\n"
+         "        os.close(fd)\n"
+         "        os.execvp(sys.argv[2], sys.argv[2:])\n"
+         "    finally:\n"
+         f"        os._exit({GATE_NO_EXEC})\n"
+         "def reap():\n"
+         "    code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])\n"
+         "    os._exit(code if code >= 0 else 128 - code)\n"
+         "threading.Thread(target=reap, daemon=True).start()\n"
+         "while os.read(fd, 1):\n"
+         "    pass\n"
+         "os.killpg(os.getpgrp(), signal.SIGKILL)\n")
 
 
 class GatedChild:
-    """A child started blocked: a ``python -I`` gate holds the read end of a pipe and ``execvp``\\ s ``argv`` only after
-    it reads the release byte; EOF (the holder closed its end, or died) exits :data:`GATE_REFUSED` without exec. The
-    child leads its own session (``start_new_session``), and this object holds its unreaped ``Popen``, so the holder
-    may signal it (BUILD_PLAN §2, rule (a)); nobody signals it by a stored pid."""
+    """A child started blocked: a ``python -I`` gate holds the read end of a pipe and runs ``argv`` only after it
+    reads the release byte; EOF (the holder closed its end, or died) exits :data:`GATE_REFUSED` without exec. The gate
+    leads its own session (``start_new_session``), and this object holds its unreaped ``Popen``, so the holder may
+    signal it (BUILD_PLAN §2, rule (a)); nobody signals it by a stored pid.
+
+    The pipe is also the run's LIFELINE (codex HIGH, P6-5b r1): :meth:`release` writes the byte and KEEPS the write
+    end, the gate forks ``argv`` into its process group and keeps the read end, and when the write end closes (the
+    holder's :meth:`abort`, or the holder's death by any signal, SIGKILL included, which the kernel answers by closing
+    its fds) the gate SIGKILLs the whole group. ``process`` is the gate; its exit status is the executor's (a signal
+    death as 128 + the signal, :data:`GATE_NO_EXEC` when ``argv`` could not be exec'd). What the lifeline cannot
+    reach: a descendant that leaves the process group (``setsid``, its own ``setpgid``) is not in the group the gate
+    kills, and a holder that ``fork``\\ s without ``exec`` copies the write end into the copy, which then holds the
+    run open."""
 
     def __init__(self, argv: Sequence[str], *, stdin=subprocess.DEVNULL, stdout=None, stderr=None,
                  env: Mapping[str, str] | None = None, cwd: str | Path | None = None) -> None:
@@ -693,6 +722,7 @@ class GatedChild:
             raise ValueError("a gated child's argv is a non-empty list of strings")
         read, write = os.pipe()             # both non-inheritable; pass_fds hands the child the read end only
         self._write: int | None = write
+        self.released = False
         try:
             self.process = subprocess.Popen([sys.executable, "-I", "-c", _GATE, str(read), *argv], pass_fds=(read,),
                                             start_new_session=True, close_fds=True, stdin=stdin, stdout=stdout,
@@ -705,25 +735,27 @@ class GatedChild:
             os.close(read)
 
     def release(self) -> None:
-        """Let the child exec. Once only."""
-        if self._write is None:
+        """Let the child run. Once only. The write end stays open in this holder: it is the run's lifeline."""
+        if self._write is None or self.released:
             raise RuntimeError("the gated child was already released or aborted")
-        fd, self._write = self._write, None
-        try:
-            os.write(fd, b"1")
-        finally:
-            os.close(fd)
+        self.released = True
+        os.write(self._write, b"1")
 
     def abort(self, timeout: float = 5.0) -> int:
-        """Never release it: close the pipe (the gate exits :data:`GATE_REFUSED`) and reap it. A gate that does not
-        exit in ``timeout`` is killed through this unreaped handle. Returns its exit status."""
+        """Close the pipe and reap the gate. Unreleased, the gate exits :data:`GATE_REFUSED` and nothing ran;
+        released, the gate kills its process group, the executor with it. A gate that does not exit in ``timeout`` has
+        its group killed through this unreaped handle (its pid is the group's id and cannot be reused while it is
+        unreaped). Returns the gate's exit status."""
         if self._write is not None:
             fd, self._write = self._write, None
             os.close(fd)
         try:
             return self.process.wait(timeout)
         except subprocess.TimeoutExpired:
-            self.process.kill()
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             return self.process.wait()
 
 
@@ -751,8 +783,10 @@ def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_
 
     A refused compare-and-set in step 1 returns ``Started(False, reason)`` and a store error raises; either way
     ``spawn`` is not called, and the row, holding its slot, ends by lapse recovery (:func:`takeover`). Any error after
-    ``spawn`` returned aborts the child before it propagates. A caller whose ``spawn`` raised ends the run itself
-    (:func:`settle_terminal`): a retry with another key is refused (the row names one)."""
+    ``spawn`` returned, the release transaction's COMMIT included, aborts the child (released or not) before it
+    propagates. A released :class:`GatedChild` runs only while its holder keeps it: the caller holds
+    ``Started.value`` for the run's life, and its exit or death ends the run. A caller whose ``spawn`` raised ends the
+    run itself (:func:`settle_terminal`): a retry with another key is refused (the row names one)."""
     if not isinstance(store, AgentStore):
         store = open_agent_store(store)
     with store.write() as conn:
@@ -767,10 +801,16 @@ def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_
             if _still_ours(conn, occurrence_id, launch_epoch, session_key, clock()):
                 child.release()
                 released = True
-    finally:
-        if not released:
+    except BaseException as exc:
+        # released or not: a release whose transaction did not end cleanly (its COMMIT raised) is aborted too, and
+        # for a GatedChild that ends the run through the lifeline. An abort that fails rides on the error as a note.
+        try:
             child.abort()
+        except BaseException as also:
+            exc.add_note(f"start_run: the child's abort also failed: {also!r}")
+        raise
     if not released:
+        child.abort()
         return Started(False, "the occurrence was ended, fenced or its lease lapsed before the run was released; "
                               "the child never ran", child)
     return Started(True, None, child)
@@ -806,16 +846,20 @@ def spawn_fire(store_dir: Path | str, occurrence_id: str, *, argv: Sequence[str]
                log: Path | str | None = None, env: Mapping[str, str] | None = None) -> subprocess.Popen:
     """Start the fire for an occurrence whose launch transaction has COMMITTED (the caller calls this after
     :func:`launch` returned ``launched``): a separate OS process leading its own session, stdin closed, output
-    appended to ``log`` (default ``<store>/fires/<occurrence_id>.log``). The caller does not wait on it and never
-    signals it; stopping a fire is an executor's ``stop()``, through the identity record the fire writes. ``argv``
-    defaults to :func:`fire_argv`."""
+    appended to ``log`` (default ``<store>/fires/<occurrence_id>.log``). The caller need not wait on it and never
+    signals it; stopping a fire is an executor's ``stop()``, through the identity record the fire writes. A daemon
+    thread of the launcher waits on the returned ``Popen``, so a fire nobody waits on leaves no zombie (its
+    ``returncode`` is set as it exits; a caller's own ``wait()`` returns the same status). A launcher that exits
+    first leaves the fire to be reaped by init. ``argv`` defaults to :func:`fire_argv`."""
     occurrence_id = _occurrence(occurrence_id)
     fires = Path(store_dir) / FIRES
     fires.mkdir(mode=0o700, exist_ok=True)
     with open(log if log is not None else fires / f"{occurrence_id}.log", "ab") as out:
-        return subprocess.Popen(list(argv) if argv is not None else fire_argv(store_dir, occurrence_id),
+        proc = subprocess.Popen(list(argv) if argv is not None else fire_argv(store_dir, occurrence_id),
                                 start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL, stdout=out,
                                 stderr=subprocess.STDOUT, env=None if env is None else dict(env))
+    threading.Thread(target=proc.wait, name=f"reap-{occurrence_id}", daemon=True).start()
+    return proc
 
 
 def claim_fire(conn: sqlite3.Connection, occurrence_id: str, pid: int, now: datetime) -> int | None:
@@ -835,12 +879,32 @@ def claim_fire(conn: sqlite3.Connection, occurrence_id: str, pid: int, now: date
                         (occurrence_id,)).fetchone()[0]
 
 
+def _record_is_dead(record: Path) -> bool:
+    """True only when the fire ``record`` names is known gone (no such pid, or the pid now another process's start
+    time). A record that cannot be read, or a process that cannot be told, is not dead: it is kept."""
+    from levain.consent.delivery import process_running
+    try:
+        held = json.loads(record.read_text())
+        pid, started = held["pid"], held["started"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    return type(started) is str and bool(started) and process_running(pid, started) is False
+
+
+def _claimed_pid(store: AgentStore, occurrence_id: str) -> object:
+    with store.read() as conn:
+        row = conn.execute("SELECT pid FROM agent_occurrences WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
+    return None if row is None else row[0]
+
+
 def fire(store: AgentStore | Path | str, occurrence_id: str, *,
          run: Callable[[AgentStore, str, int], int], clock: Callable[[], datetime]) -> int:
     """The fire process's body, in order: write the identity record (pid, ``ps`` start time and command line, read
-    on itself with :func:`levain.consent.delivery.process_identity`; temp, then an exclusive link: a fire that finds
-    a record already there returns 0 before claiming, so no fire ever replaces another's identity), then
-    :func:`claim_fire`, then
+    on itself with :func:`levain.consent.delivery.process_identity`; temp, then an exclusive link, under the record's
+    lock: a fire that finds a record naming a process that may still run returns 0 before claiming, so no fire ever
+    replaces a live fire's identity; a record whose process is gone, by
+    :func:`levain.consent.delivery.process_running`, on a row no fire claimed, is replaced: that fire died between its
+    link and its claim), then :func:`claim_fire`, then
     ``run(store, occurrence_id, launch_epoch)`` (P6-4a's supervisor). A fire that cannot identify itself, or whose
     command line does not name its occurrence, claims nothing and returns :data:`FIRE_NO_IDENTITY`. A fire that does
     not win the claim returns 0 having done nothing else: no effect, no compose, no spend."""
@@ -858,11 +922,16 @@ def fire(store: AgentStore | Path | str, occurrence_id: str, *,
     tmp.write_text(json.dumps({"occurrence_id": occurrence_id, "pid": pid, "started": identity[0],
                                "args": identity[1]}, sort_keys=True))
     try:
-        os.link(tmp, record)    # exclusive: a second fire never overwrites the identity the first one's stop() reads
-    except FileExistsError:
-        return 0
+        with open(record.with_name(f".{record.name}.lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)    # fires of one occurrence read and replace the record one at a time
+            try:
+                os.link(tmp, record)    # exclusive: a fire never overwrites the identity another one's stop() reads
+            except FileExistsError:
+                if not _record_is_dead(record) or _claimed_pid(store, occurrence_id) is not None:
+                    return 0    # a fire that may run, or one that claimed: the record stays the row's fire's
+                os.replace(tmp, record)   # the recorded fire died between its link and its claim
     finally:
-        tmp.unlink()
+        tmp.unlink(missing_ok=True)
     with store.write() as conn:
         launch_epoch = claim_fire(conn, occurrence_id, pid, clock())
     if launch_epoch is None:

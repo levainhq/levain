@@ -612,10 +612,10 @@ def test_c9_crash_after_launch_commit(rig, tmp_path):
 def test_the_fire_entry_claims_once_and_a_second_fire_does_nothing(tmp_path):
     # behaviour: spawn_fire's default argv (the module entry) runs in its own session, writes its identity record,
     # claims the row with its pid, and exits FIRE_UNWIRED (no run body until P6-4a). A second fire finds the record,
-    # claims nothing and exits 0; the first fire's identity and pid stay. The rig's clock is set near the wall clock,
-    # because the entry judges the lease on the real clock.
+    # claims nothing and exits 0; the first fire's identity and pid stay. The entry judges the lease on the real clock,
+    # so the launch is stamped at wall-now (the rig's clock minus the 30 s rig.now adds): the slack is the whole lease.
     rig = Rig(tmp_path)
-    rig.world.clock.now = datetime.now(timezone.utc) - timedelta(minutes=5)
+    rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
     oid, _ = _launched(rig)
     first = ctl.spawn_fire(rig.store.directory, oid, env=ENV)
     assert first.wait(60) == ctl.FIRE_UNWIRED
@@ -627,3 +627,180 @@ def test_the_fire_entry_claims_once_and_a_second_fire_does_nothing(tmp_path):
     assert second.wait(60) == 0
     assert json.loads(ctl.fire_record_path(rig.store.directory, oid).read_text()) == record
     assert rig.row(oid)["pid"] == first.pid
+
+
+# --- P6-5b r2: the gated child's lifeline, the commit after the release, the fire's reaper, a dead fire's record -----
+
+# the executor stand-in: holds an exclusive flock on ``lock`` for as long as it lives (the kernel drops it at its
+# death, so the test sees the death without signalling or probing a pid), then says it is up and sleeps
+SLEEPER = ("import fcntl, os, sys, time; f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+           "open(sys.argv[2] + '.t', 'w').write(str(os.getpid())); os.replace(sys.argv[2] + '.t', sys.argv[2]); "
+           "time.sleep(90)")
+# a fire whose run body opens the run through start_run with a GATED sleeper, marks the release, and blocks
+RELEASING_FIRE = ("import sys, time; from datetime import datetime; from levain.agents import controller as ctl\n"
+                  "oid, store, mark, at, key, *child = sys.argv[1:]; now = datetime.fromisoformat(at)\n"
+                  "def run(s, o, e):\n"
+                  "    started = ctl.start_run(s, o, e, key, lambda k: ctl.GatedChild(child), clock=lambda: now)\n"
+                  "    open(mark, 'w').write(str(started.spawned)); time.sleep(120); return 9\n"
+                  "sys.exit(ctl.fire(store, oid, clock=lambda: now, run=run))")
+
+
+def _sleeper(tmp_path: Path) -> tuple[list[str], Path, Path]:
+    lock, up = tmp_path / "sleeper.lock", tmp_path / "sleeper.up"
+    return [sys.executable, "-c", SLEEPER, str(lock), str(up)], lock, up
+
+
+def _ended(lock: Path, seconds: float = 15.0) -> bool:
+    """True once nobody holds ``lock`` (the sleeper is dead), within ``seconds``."""
+    import fcntl
+    deadline = time.monotonic() + seconds
+    with open(lock, "a") as f:
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    return False
+                time.sleep(0.05)
+
+
+def _reap_stray(lock: Path, up: Path) -> None:
+    # test hygiene only: a sleeper a failing case left alive is killed, so no 90 s process outlives the test
+    if up.exists() and not _ended(lock, 0):
+        os.kill(int(up.read_text()), signal.SIGKILL)
+
+
+def test_a_fire_killed_after_the_release_takes_its_executor_with_it(rig, tmp_path):
+    # behaviour (codex HIGH r1 #1, the lifeline): the REAL fire claims, opens the run through start_run and releases
+    # a gated executor (a sleeper in its own session), then is SIGKILLed. The gate keeps the pipe's read end after
+    # the release and only the fire holds the write end, so the fire's death EOFs it and the gate ends its own process
+    # group: the executor exits, and nothing the takeover then settles keeps running
+    oid, epoch = _launched(rig)
+    child, lock, up = _sleeper(tmp_path)
+    released = tmp_path / "released"
+    argv = [sys.executable, "-c", RELEASING_FIRE, oid, str(rig.store.directory), str(released), rig.now().isoformat(),
+            KEY, *child]
+    proc = ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=ENV)
+    try:
+        _wait_for(released, proc)
+        _wait_for(up, proc)
+        assert released.read_text() == "True" and not _ended(lock, 0)          # the executor runs
+        sleeper = int(up.read_text())
+        assert os.getsid(sleeper) != os.getsid(proc.pid)                       # outside the fire's session
+        os.killpg(proc.pid, signal.SIGKILL)                                    # our own unreaped Popen (rule a)
+        proc.wait(30)
+        assert _ended(lock), "the executor outlived its fire"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(30)
+        _reap_stray(lock, up)
+    with rig.store.write() as c:
+        assert ctl.takeover(c, oid, rig.now(timedelta(seconds=ctl.LEASE_S + 1))) is True
+    assert rig.taken(oid) == ([], [("settled",)]) and _settlement(rig, oid) == ("settled", 100_000, "unreadable")
+
+
+def test_a_released_child_runs_until_its_holder_lets_go_and_exits_with_the_executors_status(tmp_path):
+    # behaviour: after the release the executor runs while the holder keeps its end; abort() then ends the run (the
+    # group goes with the gate), and an executor that exits on its own hands its status to the holder's wait
+    child, lock, up = _sleeper(tmp_path)
+    gated = ctl.GatedChild(child)
+    try:
+        gated.release()
+        _wait_for(up, gated.process)
+        assert not _ended(lock, 0.3)
+        gated.abort()
+        assert _ended(lock)
+    finally:
+        _reap_stray(lock, up)
+    own = ctl.GatedChild([sys.executable, "-c", "import sys; sys.exit(7)"])
+    own.release()
+    assert own.process.wait(30) == 7
+    killed = ctl.GatedChild([sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"])
+    killed.release()
+    assert killed.process.wait(30) == 128 + signal.SIGTERM
+    missing = ctl.GatedChild([str(tmp_path / "no-such-program")])
+    missing.release()
+    assert missing.process.wait(30) == 127
+
+
+def test_a_commit_that_fails_after_the_release_aborts_the_child_and_raises_the_commit_error(rig, monkeypatch):
+    # behaviour (codex MED r1 #3, deepseek MED #1): the release ran inside the transaction and its COMMIT then
+    # fails: start_run aborts the released child (the lifeline ends the run) and raises the commit's error; an
+    # abort that itself fails rides on it as a note, never in its place (complement LOW r1 #3)
+    oid, epoch = _launched(rig)
+    real, log = rig.store.write, []
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def write():
+        before = len(log)
+        with real() as c:
+            yield c
+        if any(entry[0] == "release" for entry in log[before:]):
+            raise sqlite3.OperationalError("commit failed")      # the transaction the release ran inside
+
+    monkeypatch.setattr(rig.store, "write", write)
+    with pytest.raises(sqlite3.OperationalError, match="commit failed"):
+        ctl.start_run(rig.store, oid, epoch, KEY, lambda key: Gate(key, log), clock=rig.now)
+    assert log == [("spawn", KEY), ("release", KEY), ("abort", KEY)]
+
+    class Stuck(Gate):
+        def abort(self):
+            super().abort()
+            raise ChildProcessError("wait failed")
+
+    rig.finish(oid)
+    other = rig.claim("k2")
+    result = rig.launch(other)
+    with pytest.raises(sqlite3.OperationalError, match="commit failed") as err:
+        ctl.start_run(rig.store, other, result.launch_epoch, "s-" + "5" * 16, lambda key: Stuck(key, log),
+                      clock=rig.now)
+    assert any("wait failed" in note for note in err.value.__notes__)
+
+
+def test_a_fire_nobody_waits_on_is_reaped_by_the_launcher(rig, tmp_path):
+    # behaviour (complement MED r1 #3, codex MED #4): spawn_fire's caller never waits on the fire, and the fire
+    # still leaves no zombie: the launcher reaps it as it exits (returncode set with no wait or poll by the test,
+    # and the pid is no longer this process's child)
+    oid, _ = _launched(rig)
+    proc = ctl.spawn_fire(rig.store.directory, oid, argv=[sys.executable, "-c", "pass"], env=ENV)
+    deadline = time.monotonic() + 30
+    while proc.returncode is None:
+        assert time.monotonic() < deadline, "the fire was never reaped"
+        time.sleep(0.05)
+    assert proc.returncode == 0
+    with pytest.raises(ChildProcessError):
+        os.waitpid(proc.pid, os.WNOHANG)
+
+
+def test_a_record_left_by_a_dead_fire_is_replaced_and_a_live_fires_is_not(rig, tmp_path):
+    # behaviour (complement LOW r1 #2): a fire killed after its identity link and before its claim leaves a record
+    # naming a process that is gone; the next fire replaces it (under the record's lock, so two fires never unlink
+    # each other's) and claims. A record naming a LIVE process is never replaced: that fire exits 0, claiming nothing.
+    # (A dead fire that DID claim keeps its record: the fire-entry test's second fire.)
+    from levain.consent.delivery import process_identity
+    oid, epoch = _launched(rig)
+    path = ctl.fire_record_path(rig.store.directory, oid)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    started, args = process_identity(os.getpid())
+    live = {"occurrence_id": oid, "pid": os.getpid(), "started": started, "args": args}
+    path.write_text(json.dumps(live))
+    began = tmp_path / "began"
+    argv = [sys.executable, "-c", BLOCKING_FIRE, oid, str(rig.store.directory), str(began), rig.now().isoformat()]
+    assert ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=ENV).wait(60) == 0
+    assert json.loads(path.read_text()) == live and rig.row(oid)["pid"] is None and not began.exists()
+    dead = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    gone = {"occurrence_id": oid, "pid": dead.pid, "started": process_identity(dead.pid)[0], "args": "x " + oid}
+    dead.kill()
+    dead.wait(30)
+    path.write_text(json.dumps(gone))
+    proc = ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=ENV)
+    try:
+        _wait_for(began, proc)
+        assert json.loads(path.read_text())["pid"] == proc.pid == rig.row(oid)["pid"]
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(30)
