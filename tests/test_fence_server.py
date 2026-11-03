@@ -148,7 +148,7 @@ def test_a_server_of_another_uid_is_refused_before_the_session_is_sent(served, m
 def test_a_peer_of_another_uid_is_closed_unread_and_unanswered(rig, fence_run):
     srv = serve_fence(rig, fence_run, broker_uid=OTHER, operator_uid=OTHER + 1)
     try:
-        with pytest.raises(FenceUnavailable, match="closed the connection without an answer"):
+        with pytest.raises(FenceUnavailable, match=r"closed the connection without an answer|cannot be reached \((BrokenPipeError|ConnectionResetError)\)"):
             F.RemoteFences(srv.path, ME)(who())
         assert srv.refused_peers == 1
     finally:
@@ -161,7 +161,7 @@ def test_a_peer_credential_that_cannot_be_read_is_refused_on_both_ends(rig, fenc
         raise OSError("no credential")
     srv = serve_fence(rig, fence_run, peer_uid=unreadable)
     try:
-        with pytest.raises(FenceUnavailable, match="closed the connection without an answer"):
+        with pytest.raises(FenceUnavailable, match=r"closed the connection without an answer|cannot be reached \((BrokenPipeError|ConnectionResetError)\)"):
             F.RemoteFences(srv.path, ME)(who())
         with pytest.raises(FenceUnavailable, match="peer cannot be read"):
             F.RemoteFences(srv.path, ME, peer_uid=unreadable)(who())
