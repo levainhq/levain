@@ -1413,6 +1413,19 @@ def cc_mcp_config(entity: str | os.PathLike[str], python: str) -> dict[str, Any]
     return cfg
 
 
+def cc_mcp_registry_config(entity: str | os.PathLike[str], python: str,
+                           entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The hands account's Claude ``--mcp-config`` body: :func:`cc_mcp_config`'s one server, unchanged and judged by the
+    same template check, plus the registry's own servers (``levain.hands_mcp``) rendered by the one renderer. An entry
+    never takes ``anneal_memory``'s name. :func:`_check_mcp` still vets only that one server: nothing here widens
+    what it accepts, so a profile that carries registry servers is vetted by whatever launches the hands account."""
+    from levain import hands_mcp
+    cfg = cc_mcp_config(entity, python)
+    extra = hands_mcp.claude_servers(entries)
+    if set(extra) & set(cfg["mcpServers"]):
+        raise HostRefusal("a registry entry takes the name of a server the hosted profile already carries")
+    return {"mcpServers": {**cfg["mcpServers"], **extra}}
+
 def _check_mcp(cfg: Mapping[str, Any], entity: Path, roots: Sequence[Path]) -> list[str]:
     """The one MCP server runs outside the sandbox with the entity as its cwd, so it must start
     isolated from the cwd (`-P` or `-I` first, L3 r1 complement 11), from an interpreter outside
