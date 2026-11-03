@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from collections import Counter
@@ -792,13 +793,6 @@ def install_fence(install: Path, *, provider=None, **kw) -> str:
     from levain import daemon
 
     spec = fence_spec(install, **kw)
-    # the unit's WorkingDirectory is the agent store; launchd exits 78 (EX_CONFIG) when it is absent, so it exists
-    # before anything is installed (the store's own mode; the umask can only narrow it). Failing to make it installs nothing.
-    try:
-        Path(spec.working_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
-    except OSError as exc:
-        raise FenceSetupError(f"the agent store {spec.working_dir} does not exist and could not be created "
-                              f"({type(exc).__name__}: {exc}); nothing was installed") from exc
     if provider is None:
         provider = daemon.select_provider()
     note = ""
@@ -810,7 +804,22 @@ def install_fence(install: Path, *, provider=None, **kw) -> str:
         new = _unit_roots(spec.argv)
         if old is not None and old != new:
             note = f"replacing the fence unit for {_roots_text(old)} with this install's {_roots_text(new)}\n"
+    _ensure_fence_store(spec)
     return note + provider.install(spec)
+
+
+def _ensure_fence_store(spec) -> None:
+    """The unit's WorkingDirectory is the agent store, and launchd exits 78 (EX_CONFIG) when it is absent or cannot be
+    entered, so it is made (the store's own mode; the umask can only narrow it) and checked immediately before either
+    install path hands the unit to the provider. Raises :class:`FenceSetupError`; nothing is installed after it."""
+    store = Path(spec.working_dir)
+    try:
+        store.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise FenceSetupError(f"the agent store {store} does not exist and could not be created "
+                              f"({type(exc).__name__}: {exc}); nothing was installed") from exc
+    if not (store.is_dir() and os.access(store, os.R_OK | os.X_OK)):
+        raise FenceSetupError(f"the agent store {store} is not a directory this user can enter; nothing was installed")
 
 
 def refresh_fence_after_update(install: Path, *, provider=None, **kw) -> str | None:
@@ -846,6 +855,10 @@ def refresh_fence_after_update(install: Path, *, provider=None, **kw) -> str | N
         if old is not None and old != new:
             return (f"agent fence: left alone: the installed unit fences {_roots_text(old)}, not this install's "
                     f"{_roots_text(new)}; `{command}` points it here")
+        try:
+            _ensure_fence_store(spec)
+        except FenceSetupError as exc:
+            return f"agent fence: not installed: {exc}"
         result = provider.install(spec)
     except Exception as exc:   # noqa: BLE001 - said, never the reason the update fails
         return (f"agent fence: the unit could not be installed ({type(exc).__name__}: {exc}); every dispatch "

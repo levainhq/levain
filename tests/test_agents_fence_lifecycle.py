@@ -325,6 +325,36 @@ def test_start_creates_the_absent_agent_store_before_installing(host, capsys):
     assert host.provider.installed[0].working_dir == store.resolve()
 
 
+def test_update_creates_the_absent_agent_store_before_installing(host):
+    store = host.tmp / "update-home" / "autonomic"
+    line = A.refresh_fence_after_update(host.install, provider=host.provider, agent_store=store)
+    assert store.is_dir() and line.startswith("agent fence:") and "not installed" not in line
+    assert host.provider.installed[0].working_dir == store.resolve()
+
+
+def test_update_says_and_installs_nothing_when_the_agent_store_cannot_be_created(host):
+    blocker = host.tmp / "update-blocker"
+    blocker.write_text("a regular file")
+    line = A.refresh_fence_after_update(host.install, provider=host.provider, agent_store=blocker / "autonomic")
+    assert line.startswith("agent fence: not installed:") and "could not be created" in line
+    assert host.provider.installed == []
+
+
+def test_a_store_this_user_cannot_enter_installs_nothing(host, capsys):
+    import os
+    store = host.tmp / "locked-store"
+    store.mkdir()
+    store.chmod(0o000)
+    try:
+        if os.access(store, os.X_OK):
+            pytest.skip("this user can enter a mode-000 directory (root)")
+        rc = A.run_fence_start(argparse.Namespace(path=host.install, store_dir=store))
+        err = capsys.readouterr().err
+        assert rc == 1 and "not a directory this user can enter" in err and host.provider.installed == []
+    finally:
+        store.chmod(0o700)
+
+
 def test_start_refuses_and_installs_nothing_when_the_agent_store_cannot_be_created(host, capsys):
     blocker = host.tmp / "blocker"
     blocker.write_text("a regular file")
