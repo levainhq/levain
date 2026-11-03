@@ -18,18 +18,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
-from levain.agents import schedule, slots
+from levain import authority as _auth
+from levain.agent_authority import AgentCoverMoved
+from levain.agents import accounting, schedule, slots
 from levain.agents.spec import _check_row
 from levain.agents.store import AgentStore, open_agent_store
 
 __all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurrence_id", "run_id", "claim",
-           "close_no_slot", "tick", "heartbeat", "takeover"]
+           "close_no_slot", "tick", "heartbeat", "takeover", "Window", "LaunchResult", "launch",
+           "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
@@ -332,3 +337,310 @@ def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime) -> boo
                        " ended_at = ? WHERE occurrence_id = ? AND state = 'launched' AND lease_until = ?",
                        (_stamp(at), occurrence_id, row[0]))
     return cur.rowcount == 1
+
+
+# --- the launch transaction (A0 r8 §2.4, §2.5; BUILD_PLAN P6-5a) ------------------------------------------------------
+
+LAUNCHED = "launched"
+STOPPED = "stopped"
+SKIPPED_BUDGET = "skipped-budget"
+NO_SLOT = "no-slot"              # the row stays admitted: retried each tick until its grace (close_no_slot)
+UNCLASSIFIED = "unclassified"    # the cover could not be read: nothing written, the row stays admitted
+NOT_ADMITTED = "not-admitted"    # the row is not admitted (already launched or ended): nothing written
+
+# levain.slot.grammar.SESSION_RE's pattern (the S1 session id AgentFences joins on); not imported, because that module
+# brings the slot package's closure into the controller. tests/test_agents_launch.py pins the two patterns equal.
+SESSION_KEY_RE = re.compile(r"s-[0-9a-f]{16}")
+_STORE_ID = re.compile(r"store-[0-9a-f]{32}")
+
+
+@dataclass(frozen=True)
+class Window:
+    """What the launch's ceiling and budget count over, from the schedule (``accounting.Limits``' span fields): UTC ISO
+    ``span_start`` inclusive, ``span_end`` exclusive, and, for a MANUAL launch only, the scheduled window holding now
+    (``None``: none does). The signed limits themselves are read from the link the launch admits, never from here."""
+    span_start: str
+    span_end: str
+    scheduled_window_key: str | None = None
+
+
+@dataclass(frozen=True)
+class LaunchResult:
+    """``outcome`` is :data:`LAUNCHED`, :data:`STOPPED` or :data:`SKIPPED_BUDGET` (the row's new state; ``reason`` is the
+    one written), or :data:`NO_SLOT`, :data:`UNCLASSIFIED` or :data:`NOT_ADMITTED` (nothing written; ``reason`` says
+    why). ``launch_epoch`` is what a fire hands :func:`start_run`."""
+    outcome: str
+    reason: str | None = None
+    slot: int | None = None
+    link_id: str | None = None
+    launch_epoch: int | None = None
+
+
+class _Refusal(Exception):
+    def __init__(self, state: str, reason: str) -> None:
+        super().__init__(reason)
+        self.state, self.reason = state, reason
+
+
+class _Retry(Exception):
+    def __init__(self, outcome: str, reason: str) -> None:
+        super().__init__(reason)
+        self.outcome, self.reason = outcome, reason
+
+
+def _store_id_of(conn: sqlite3.Connection) -> str:
+    row = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
+    if row is None or type(row[0]) is not str or _STORE_ID.fullmatch(row[0]) is None:
+        raise ValueError("the agent store holds no well-formed store id")
+    return row[0]
+
+
+def _no_link_reason(state: _auth.AuthoritySnapshot, top: str | None, *, agent_id: str, store_id: str,
+                    closed: int, now: datetime) -> str:
+    """Why no candidate link is live, named from the highest-born one (or from the log when there is none)."""
+    if top is None:
+        return "revoked" if _auth.agent_last_revoke(state, agent_id, store_id) else "no_link"
+    born = state.grant_born.get(top) or 0
+    if born <= max(_auth.agent_last_revoke(state, agent_id, store_id), closed):
+        return "revoked"
+    if not _auth.agent_link_arms(state, top, now=now, closed_bar_revoke_seq=closed):
+        return "expired"
+    return "signer_revoked"
+
+
+def _pick_link(conn: sqlite3.Connection, authority, state: _auth.AuthoritySnapshot, occ: dict, *, store_id: str,
+               now: datetime) -> tuple[str, str]:
+    """The occurrence's live link (A0 §3.2: the highest-born live link of its spec, here also of its Binding) and its
+    incarnation, or :class:`_Refusal` ``stopped``. A peek that cannot read the cover raises :class:`_Retry`.
+
+    The candidates and the grant terms the launch applies come from ``state``; ``peek`` answers from whatever replay
+    the shared authority holds when it runs, which another refresh may have replaced. So every peek's incarnation must
+    be ``state``'s own incarnation of that link: anything else (another incarnation of a revoked and recreated id, no
+    link, a value that is no incarnation) means the cover moved under the launch, and it is retried, never ended."""
+    closed = conn.execute("SELECT MAX(revoke_seq) FROM agent_bars WHERE agent_id = ? AND closed_at IS NOT NULL",
+                          (occ["agent_id"],)).fetchone()[0]
+    closed = 0 if closed is None else closed
+    candidates = sorted(
+        (gid for gid in _auth.agent_links(state, occ["agent_id"], store_id)
+         if state.policy.grants[gid]["spec_hash"] == occ["spec_hash"]
+         and state.policy.grants[gid]["binding_id"] == occ["binding_id"]),
+        key=lambda gid: state.grant_born.get(gid) or 0, reverse=True)
+    for gid in candidates:
+        try:
+            live, incarnation = authority.peek(gid, agent_id=occ["agent_id"], store_id=store_id, now=now,
+                                               closed_bar_revoke_seq=closed)
+        except AgentCoverMoved as exc:
+            raise _Retry(UNCLASSIFIED, f"the authority cover moved: {exc}") from exc
+        if incarnation != _auth.agent_link_incarnation(state, gid):
+            raise _Retry(UNCLASSIFIED, f"the authority cover moved: link {gid} is another incarnation than the "
+                                       "launch's snapshot holds")
+        if live is True:
+            return gid, incarnation
+    raise _Refusal(STOPPED, _no_link_reason(state, candidates[0] if candidates else None, agent_id=occ["agent_id"],
+                                            store_id=store_id, closed=closed, now=now))
+
+
+def _end_admitted(conn: sqlite3.Connection, occurrence_id: str, state: str, reason: str, at: str) -> None:
+    cur = conn.execute("UPDATE agent_occurrences SET state = ?, reason = ?, ended_at = ? WHERE occurrence_id = ?"
+                       " AND state = 'admitted'", (state, reason, at, occurrence_id))
+    if cur.rowcount != 1:
+        raise RuntimeError(f"occurrence {occurrence_id} left admitted inside its own launch transaction")
+
+
+def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authority, executor: accounting.Executor,
+           window: Window, now: datetime,
+           launch_over: Callable[[str], bool | None] | None = None,
+           session_alive: Callable[[str], bool | None] | None = None) -> LaunchResult:
+    """The launch transaction (A0 §2.5 ``admitted -> launched``). ``authority`` is an
+    :class:`~levain.agent_authority.AgentAuthority`; it is refreshed here, before the write lock. In one
+    ``BEGIN IMMEDIATE`` the row is read, the agent's operation, spec and bar, the predicate (a live link), the
+    reservation (:func:`accounting.reserve`, held to the admitted link's signed terms) and a slot
+    (:func:`slots.take`) are checked in that order, and either the row becomes ``launched`` (its launch columns,
+    ``launched_at`` and a lease of :data:`LEASE_S`) or it ends with the refusal's state and reason. Every refusal is
+    written after the reservation and slot work is rolled back to a savepoint, so a refused launch takes nothing.
+    A cover that cannot be read and a full cap write nothing; the row stays ``admitted`` for the next tick.
+
+    The links are matched on the store's own id (its ``meta`` row), never a caller's: a link signed for another store
+    never admits here. The session key is not written here: the fire records it with :func:`start_run` once it has
+    opened the session."""
+    if not isinstance(store, AgentStore):
+        store = open_agent_store(store)
+    at_dt = schedule._utc(now)
+    at = _stamp(at_dt)
+    with store.read() as conn:
+        expired = slots.expired_launches(conn, at_dt)
+        sid = _store_id_of(conn)
+    over = slots.probe_over(expired, launch_over, session_alive)   # outside any write lock: a probe can be slow
+    try:
+        state = authority.refresh()
+    except Exception as exc:  # noqa: BLE001 - a replay that cannot finish is never read as "nothing live"
+        return LaunchResult(UNCLASSIFIED, f"the authority cannot be replayed: {type(exc).__name__}")
+    try:
+        with store.write() as conn:
+            row = conn.execute("SELECT agent_id, kind, key, state, epoch, window_key, spec_hash, binding_id"
+                               " FROM agent_occurrences WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
+            if row is None:
+                raise _Retry(NOT_ADMITTED, "no such occurrence")
+            occ = dict(zip(("agent_id", "kind", "key", "state", "epoch", "window_key", "spec_hash", "binding_id"), row),
+                       occurrence_id=occurrence_id)
+            if occ["state"] != "admitted":
+                raise _Retry(NOT_ADMITTED, f"the occurrence is {occ['state']}")
+            try:
+                link_id, incarnation, slot = _admit(conn, authority, state, occ, executor=executor, window=window,
+                                                    store_id=sid, now=at_dt, over=over)
+            except _Refusal as refusal:
+                _end_admitted(conn, occurrence_id, refusal.state, refusal.reason, at)
+                return LaunchResult(refusal.state, refusal.reason)
+            cur = conn.execute(
+                "UPDATE agent_occurrences SET state = 'launched', launch_epoch = epoch, link_id = ?,"
+                " link_incarnation = ?, launched_at = ?, lease_until = ? WHERE occurrence_id = ?"
+                " AND state = 'admitted' AND epoch = ?",
+                (link_id, incarnation, at, _stamp(_expiry(at_dt, LEASE_S)), occurrence_id, occ["epoch"]))
+            if cur.rowcount != 1:
+                raise RuntimeError(f"occurrence {occurrence_id} moved inside its own launch transaction")
+            return LaunchResult(LAUNCHED, None, slot, link_id, occ["epoch"])
+    except _Retry as retry:   # raised inside the transaction: it rolled back, so nothing was written
+        return LaunchResult(retry.outcome, retry.reason)
+
+
+def _admit(conn: sqlite3.Connection, authority, state: _auth.AuthoritySnapshot, occ: dict, *,
+           executor: accounting.Executor, window: Window, store_id: str, now: datetime,
+           over: Collection[str]) -> tuple[str, str, int]:
+    """The launch's checks after the row is read: ``(link_id, incarnation, slot)``, or :class:`_Refusal` /
+    :class:`_Retry`. The reservation and the slot are taken under a savepoint that is rolled back on any refusal."""
+    agent = conn.execute("SELECT a.registration, a.operation, s.spec_hash FROM agents a JOIN agent_specs s"
+                         " ON s.agent_id = a.agent_id AND s.version = a.current_version WHERE a.agent_id = ?",
+                         (occ["agent_id"],)).fetchone()
+    if agent is None or agent[0] != "registered":
+        raise _Refusal(STOPPED, "retired")
+    if agent[1] != "active":
+        raise _Refusal(STOPPED, "paused")
+    if agent[2] != occ["spec_hash"]:
+        raise _Refusal(STOPPED, "spec_moved")
+    if conn.execute("SELECT 1 FROM agent_bars WHERE agent_id = ? AND closed_at IS NULL",
+                    (occ["agent_id"],)).fetchone() is not None:
+        raise _Refusal(STOPPED, "barred")
+    link_id, incarnation = _pick_link(conn, authority, state, occ, store_id=store_id, now=now)
+    grant = state.policy.grants[link_id]
+    billing, calls, tunnel = _auth.agent_link_terms(grant)
+    limits = accounting.Limits(run_ceiling=grant["run_ceiling"],
+                               budget_window_usd_micros=grant["budget_window_usd_micros"],
+                               scheduled_window_key=window.scheduled_window_key, span_start=window.span_start,
+                               span_end=window.span_end, billing=billing, budget_run_calls=calls,
+                               budget_run_tunnel_bytes=tunnel)
+    conn.execute("SAVEPOINT agent_launch")
+    try:
+        taken = accounting.reserve(conn, occ, executor, limits=limits)
+        if isinstance(taken, accounting.Refused):
+            raise _Refusal(taken.state, taken.reason)
+        slot = slots.take(conn, slots.OCCURRENCE, occ["occurrence_id"], now, over)
+        if slot is None:
+            raise _Retry(NO_SLOT, "every slot is held")
+    except BaseException:
+        # SQLite may already have rolled the whole transaction back (RAISE(ROLLBACK), SQLITE_FULL), and the savepoint
+        # with it: then there is nothing to undo, and the error that did it is the one raised
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO agent_launch")
+            conn.execute("RELEASE agent_launch")
+        raise
+    conn.execute("RELEASE agent_launch")
+    return link_id, incarnation, slot
+
+
+# --- the session key and the spawn seam (P7-0 §3.1; the join levain.qbroker.fence.AgentFences reads) -----------------
+
+def record_session_key(conn: sqlite3.Connection, occurrence_id: str, launch_epoch: int, session_key: str,
+                       now: datetime) -> bool:
+    """Record the S1 session id on a launched occurrence: one compare-and-set, inside the caller's write transaction.
+    It writes only on the row still ``launched`` at ``launch_epoch`` (no revoke raised its epoch since), whose lease
+    has not lapsed at ``now`` (a lapsed row is lapse recovery's even before :func:`takeover` runs), with no key yet,
+    and only when no other occurrence names that key (AgentFences refuses a key two rows name). False when it wrote
+    nothing; a key that is no S1 session id raises ``ValueError``."""
+    if not conn.in_transaction:
+        raise RuntimeError("a session key is recorded inside the caller's write transaction")
+    if type(session_key) is not str or SESSION_KEY_RE.fullmatch(session_key) is None:
+        raise ValueError("a session key is an S1 session id, s-<16 hex>")
+    if type(launch_epoch) is not int:
+        raise ValueError("launch_epoch is the integer the launch returned")
+    # Stamps hold whole seconds: at a truncated ``now`` equal to the lease the untruncated clock may be past it
+    # (takeover's ``at > lease``), so live is strictly before, and the boundary second is refused.
+    cur = conn.execute(
+        "UPDATE agent_occurrences SET session_key = ? WHERE occurrence_id = ? AND state = 'launched'"
+        " AND launch_epoch = ? AND epoch = launch_epoch AND lease_until > ? AND session_key IS NULL"
+        " AND NOT EXISTS (SELECT 1 FROM agent_occurrences WHERE session_key = ?)",
+        (session_key, occurrence_id, launch_epoch, _stamp(schedule._utc(now)), session_key))
+    return cur.rowcount == 1
+
+
+@dataclass(frozen=True)
+class Started:
+    """``spawned`` is True when ``spawn`` was called (``value`` is what it returned); False with ``reason`` when the key
+    could not be recorded, in which case ``spawn`` was never called."""
+    spawned: bool
+    reason: str | None = None
+    value: object = None
+
+
+def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_epoch: int, session_key: str,
+              spawn: Callable[[str], object], *, clock: Callable[[], datetime]) -> Started:
+    """The spawn seam (P6-5b's fire calls it once the S1 session is open, before claude starts). The key is recorded
+    by :func:`record_session_key` in its own ``BEGIN IMMEDIATE``, and ``spawn(session_key)`` is called only after that
+    transaction COMMITTED, so the per-call fence can join the session to its occurrence from the first call. A refused
+    compare-and-set returns ``Started(False, reason)``; a store error raises. Either way ``spawn`` is not called, the
+    row stays ``launched`` holding its slot until its lease lapses and lapse recovery (:func:`takeover`) ends it
+    ``crash_recovered``; releasing the slot and the reservation is the terminal transaction around that call. A
+    caller whose ``spawn`` raised ends the run itself: a retry with another key is refused (the row names one).
+
+    ``clock`` is read inside the write lock, so the lease is judged at the moment the key commits. A takeover that
+    commits after the key and before ``spawn`` is not seen here: ``spawn`` runs, and the session it starts is stale
+    at the per-call fence from its first call (the row left ``launched`` and its epoch moved). Closing that window at
+    the process (a child started suspended and released only after a lease-checked commit) is P6-5b's to decide."""
+    if not isinstance(store, AgentStore):
+        store = open_agent_store(store)
+    with store.write() as conn:
+        recorded = record_session_key(conn, occurrence_id, launch_epoch, session_key, clock())
+    if not recorded:
+        return Started(False, "the session key was not recorded: the occurrence is not launched at that epoch, "
+                              "its lease lapsed, it already names a session, or the key names another occurrence")
+    return Started(True, None, spawn(session_key))
+
+
+# --- the coordinator-lease probes over dispatch.db (levain.agents.slots.probe_over) -----------------------------------
+
+DISPATCH_TIMEOUT = 0.25   # [judged] seconds a probe waits on a locked dispatch.db; a timeout is "cannot tell"
+_OVER_KINDS = ("failed", "expired", "ended")
+
+
+def dispatch_probes(directory: Path | str) -> tuple[Callable[[str], bool | None], Callable[[str], bool | None]]:
+    """``(launch_over, session_alive)`` reading ``<directory>/dispatch.db`` read-only, one short connection per call.
+
+    ``launch_over``: True when the launch row is gone or its latest event is failed, expired or ended; False while it
+    is pending or active; None when it has no event. "Gone" is safe to answer only because :func:`slots.probe_over`
+    is fed :func:`slots.expired_launches`: a launch is probed only after its own slot lease (taken plus
+    ``slots.LEASE_S``, renewed by its watcher) expired, never while its coordinator may not have committed the row. ``session_alive``: False only when the coordinator's watcher swept
+    the launch (``launch_sweeps``: it saw the session not running); otherwise None, because the store holds no live
+    process; a dead session of an active launch is the watcher's to end, which ``launch_over`` then reads. A file or
+    table that cannot be read raises, which :func:`slots.probe_over` reads as "cannot tell" (the slot is kept)."""
+    path = Path(directory) / "dispatch.db"
+
+    def _read(sql: str, launch_id: str) -> list[tuple]:
+        conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, isolation_level=None,
+                               timeout=DISPATCH_TIMEOUT)
+        try:
+            conn.execute("BEGIN")
+            return conn.execute(sql, (launch_id,)).fetchall()
+        finally:
+            conn.close()
+
+    def launch_over(launch_id: str) -> bool | None:
+        rows = _read("SELECT l.launch_id, (SELECT kind FROM launch_events e WHERE e.launch_id = l.launch_id"
+                     " ORDER BY e.seq DESC LIMIT 1) FROM launches l WHERE l.launch_id = ?", launch_id)
+        if not rows:
+            return True
+        kind = rows[0][1]
+        return None if kind is None else kind in _OVER_KINDS
+
+    def session_alive(launch_id: str) -> bool | None:
+        return False if _read("SELECT 1 FROM launch_sweeps WHERE launch_id = ?", launch_id) else None
+
+    return launch_over, session_alive

@@ -64,15 +64,18 @@ __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo
            "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed", "session_band_state",
            "run_band", "run_band_answer", "AnswerCommitted", "AuthorityItem", "BandSnapshot", "PickNotOffered",
            "QUESTION_VERSION_FIELDS", "VersionMoved", "VersionedQuestionStore", "answer_item", "answerable",
-           "subject_for", "subject_version", "summary", "Signing", "answer_sign_of"]
+           "subject_for", "subject_version", "summary", "Signing", "answer_sign_of", "allocate", "ALLOCATABLE_SOURCES"]
 
 COMPACT_AFTER = 12
 _COMPACT_WHAT = 100
 _LETTERS = "abcdef"                       # an option's display letter is its position; the stored key never shows
-# a number shown must be final: this is the one place numbers are made, and nothing rewrites or removes one
+# a number shown must be final: this is the one place numbers are made, and nothing rewrites or removes one.
+# The table's body is one constant so the L3 rebuild (:func:`_migrate_band_items`) makes exactly the schema's table.
+_ITEMS_BODY = ("(n INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL CHECK (source "
+               "IN ('question','consent','sign','extend','host')), ref TEXT NOT NULL, numbered_at TEXT NOT NULL, "
+               "UNIQUE (source, ref))")
 BAND_SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS band_items (n INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL CHECK (source "
-    "IN ('question','consent','sign','extend')), ref TEXT NOT NULL, numbered_at TEXT NOT NULL, UNIQUE (source, ref))",
+    "CREATE TABLE IF NOT EXISTS band_items " + _ITEMS_BODY,
     # an item's closing, shown once to a hook: written once (a viewer's own delta is S2)
     "CREATE TABLE IF NOT EXISTS band_closed_shown (n INTEGER PRIMARY KEY REFERENCES band_items(n), at TEXT NOT NULL)",
     "CREATE TRIGGER IF NOT EXISTS band_items_frozen BEFORE UPDATE ON band_items "
@@ -108,6 +111,47 @@ BAND_SCHEMA = (
     "CREATE TRIGGER IF NOT EXISTS answer_context_kept BEFORE DELETE ON answer_context "
     "BEGIN SELECT RAISE(ABORT, 'answer context is append-only'); END",
 )
+
+# TERMSIGN L3: sources a caller outside Levain may allocate under (:func:`allocate`); the others are Levain's own
+ALLOCATABLE_SOURCES = ("host",)
+# The authority items' sources, named rather than everything-but-question: readers here were written to take only
+# these, so a source added after them is not read as an authority item. Written knowing that a binary from before
+# ``host`` (it excluded only 'question'), run against a migrated store, would read a host row as an authority number
+# whose source it cannot read: listed as unknown, never closed, nothing recorded.
+_AUTHORITY_SOURCES = ("consent", "sign", "extend")
+_AUTHORITY_IN = "(" + ", ".join(f"'{s}'" for s in _AUTHORITY_SOURCES) + ")"
+
+
+def _migrate_band_items(conn: sqlite3.Connection) -> None:
+    """Rebuild a ``band_items`` made before ``host`` was a source (its CHECK is part of the table, so it cannot be
+    altered): the rows keep their numbers and the AUTOINCREMENT high-water mark survives. The table's triggers go with
+    the drop and are made again by the caller's :data:`BAND_SCHEMA` pass, in the same transaction. Idempotent.
+
+    Built to hold whether or not the connection enforces foreign keys (``band_closed_shown`` references these rows,
+    and the pragma that turns enforcement off is a no-op inside the caller's transaction): the checks are deferred to
+    COMMIT, the rows are parked in a TEMP table, and the table is made again under its own name (no rename, so no
+    reference is rewritten), so every reference resolves again before COMMIT. A foreign-key violation the rebuild added
+    raises and the whole write rolls back."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'band_items'").fetchone()
+    if row is None or "'host'" in (row[0] or ""):
+        return
+    conn.execute("PRAGMA defer_foreign_keys = ON")       # resets itself at COMMIT or ROLLBACK
+    broken = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+    seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'band_items'").fetchone()
+    conn.execute("CREATE TEMP TABLE band_items_rows AS SELECT n, source, ref, numbered_at FROM main.band_items")
+    conn.execute("DROP TABLE main.band_items")
+    conn.execute("CREATE TABLE main.band_items " + _ITEMS_BODY)
+    conn.execute("INSERT INTO main.band_items (n, source, ref, numbered_at) SELECT n, source, ref, numbered_at "
+                 "FROM temp.band_items_rows ORDER BY n")
+    conn.execute("DROP TABLE temp.band_items_rows")
+    if seq is not None:
+        cur = conn.execute("UPDATE main.sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'band_items'", (seq[0],))
+        if cur.rowcount == 0:
+            conn.execute("INSERT INTO main.sqlite_sequence (name, seq) VALUES ('band_items', ?)", (seq[0],))
+    if len(conn.execute("PRAGMA foreign_key_check").fetchall()) > broken:
+        raise sqlite3.IntegrityError("the band_items rebuild left a reference to a band number without its row; "
+                                     "nothing was changed")
+
 
 CONTRACT = ("[Levain NEEDS YOU band] When a NEEDS YOU block is in your context, end every reply with it exactly as "
             "Levain last gave it: do not renumber, reorder, drop or answer its items, and say what each one blocks.")
@@ -213,6 +257,7 @@ def _number(store: QuestionStore, refs: list[Any], deadline: float, now: datetim
         # no question was ever filed here: the store is set up for the first number, inside the same deadline
         store.ready_by(deadline)
         with store._write_by(deadline) as conn:
+            _migrate_band_items(conn)
             for stmt in BAND_SCHEMA:
                 conn.execute(stmt)
             stamp = utc_stamp(now if now is not None else _now_utc(store._clock))   # ``now`` given: no clock is read
@@ -231,6 +276,50 @@ def _number(store: QuestionStore, refs: list[Any], deadline: float, now: datetim
         if _busy(exc):
             return {}
         raise
+
+
+def allocate(store: QuestionStore, source: str, refs: Sequence[str], *, deadline: float | None = None,
+             now: datetime | None = None) -> dict[str, int]:
+    """Number items of a caller outside Levain in the band's one number space (TERMSIGN L3).
+
+    ``source`` must be one of :data:`ALLOCATABLE_SOURCES` (today ``"host"``); anything else raises ``ValueError``, as
+    does a ``refs`` entry that is not a non-empty string. Returns ``{ref: n}`` for every ref given, in ONE write
+    waited for until ``deadline`` (``time.monotonic()``; ``None``: the 2 s hook bound). A ref already allocated under
+    this source keeps its number (idempotent, never a second one); new refs are numbered in the order given. The lock
+    still busy at the deadline: nothing is written and ``{}`` comes back, so the caller tells a missing key from a
+    number. An empty ``refs`` returns ``{}`` without touching the store. Any other store error is raised.
+    Numbers are never reused and never change, and Levain's shorthand parse skips a number allocated here silently."""
+    if source not in ALLOCATABLE_SOURCES:
+        raise ValueError(f"unknown band source {source!r}: allocate takes one of {', '.join(ALLOCATABLE_SOURCES)}")
+    keys = list(refs)
+    if any(not isinstance(r, str) or not r for r in keys):
+        raise ValueError("a band ref is a non-empty string")
+    if not keys:
+        return {}
+    limit = (time.monotonic() + HOOK_BUSY_MS / 1000) if deadline is None else deadline
+    got = _number(store, [(source, r) for r in dict.fromkeys(keys)], limit, now)
+    return {r: got[(source, r)] for r in keys if (source, r) in got}
+
+
+def _host_numbers(store: QuestionStore, ns: set[int]) -> set[int] | None:
+    """Which of ``ns`` are allocated to ``host`` (one read-only snapshot; absent store or table: none). ``None``: the
+    read failed (a held lock past the read bound, an I/O error), so whose numbers they are is not known."""
+    if not ns:
+        return set()
+    try:
+        with store._peek() as conn:
+            if conn is None or "band_items" not in _tables(conn):
+                return set()
+            # in chunks under SQLite's oldest bound-variable limit (999), however many numbers the line named
+            got: set[int] = set()
+            todo = sorted(ns)
+            for i in range(0, len(todo), 500):
+                part = todo[i:i + 500]
+                got.update(r[0] for r in conn.execute("SELECT n FROM band_items WHERE source = 'host' AND n IN "
+                                                      f"({','.join('?' * len(part))})", part))
+            return got
+    except sqlite3.Error:
+        return None
 
 
 def mark_closed_shown(store: QuestionStore, closed: list[int]) -> None:
@@ -282,7 +371,7 @@ def _extra_state(store: QuestionStore, extras: Extras) -> tuple[dict[tuple[str, 
         if conn is None or "band_items" not in _tables(conn):
             return {}, []
         have = _tables(conn)
-        rows = conn.execute("SELECT n, source, ref FROM band_items WHERE source != 'question' ORDER BY n").fetchall()
+        rows = conn.execute(f"SELECT n, source, ref FROM band_items WHERE source IN {_AUTHORITY_IN} ORDER BY n").fetchall()
         shown_closed = ({r[0] for r in conn.execute("SELECT n FROM band_closed_shown")}
                         if "band_closed_shown" in have else set())
     numbers = {(src, ref): n for n, src, ref in rows}
@@ -546,7 +635,7 @@ def _extras_of(store: QuestionStore, view: View) -> tuple[dict[int, Extra], set[
         if conn is None or "band_items" not in _tables(conn):
             return {}, set()
         refs = {n: (src, ref) for n in view.open_list for src, ref in [r for r in conn.execute(
-            "SELECT source, ref FROM band_items WHERE n = ? AND source != 'question'", (n,))]}
+            f"SELECT source, ref FROM band_items WHERE n = ? AND source IN {_AUTHORITY_IN}", (n,))]}
     if not refs:
         return {}, set()
     try:
@@ -583,12 +672,56 @@ def _plan_on(store: QuestionStore, view: View | None, text: str
     infos = {n: _info_of(q) for n, q in questions.items()}
     infos.update({n: _info_of_extra(e) for n, e in extras.items()})
     plan = parse(text, view, infos, _store_id_of(store))
+    plan = _without_host(store, plan, text)
     if unknown and any(r.n in unknown for r in plan.refused):
         plan = dataclasses.replace(plan, refused=tuple(
             Refusal(r.n, f"{r.n}: its source could not be read just now, so Levain cannot tell it is still open; "
                          "nothing opened (try again)") if r.n in unknown and "not open in the band" in r.reason
             else r for r in plan.refused))
     return plan, view, questions, extras
+
+
+_HOST_PROBE = View(0, (), "")        # a view nothing is open in: parse names every number the line typed, as a refusal
+_ABOUT_THE_NUMBER = ("was filed after the band you saw", "was not open in the band you saw")   # what a host number gets
+
+
+def _without_host(store: QuestionStore, plan: Parse, text: str) -> Parse:
+    """TERMSIGN L3: a number allocated to ``host`` belongs to another surface's footer, so the parse drops its refusal
+    without a word; nothing is left to say and nothing recorded: the prompt is no band answer (parse's own ``rest`` and
+    ``hint`` are kept).
+
+    Parse's early exits (no band shown to this viewer, a band from another store) refuse the line as a whole, with no
+    number. For those the line is parsed once more against an empty view to learn the numbers it typed: a line that
+    named only host numbers, and no sweep, is silent too."""
+    if not plan.refused:
+        return plan
+    named = {r.n for r in plan.refused if r.n is not None}
+    whole: set[int] = set()                              # the numbers behind a whole-line refusal, if it has only those
+    if not (plan.actions or plan.sheets) and any(r.n is None for r in plan.refused):
+        probe = parse(text, _HOST_PROBE, {}, None)
+        if probe.refused and all(r.n is not None for r in probe.refused):
+            whole = {r.n for r in probe.refused if r.n is not None}
+    if not (named or whole):
+        return plan
+    host = _host_numbers(store, named | whole)           # the one read this adds, and only when something was refused
+    if host is None:
+        # Unknown is not "none": reading every number as Levain's would resurrect the wrong refusal ("filed after",
+        # "no band was shown") at exactly the moment the store is busy. Say instead what is true, and record nothing.
+        # No second read is tried: the peek already waited its bound, and a prompt pays it once.
+        def why(ns: list[int], what: str) -> str:
+            return (f"Levain could not read just now whose {'number' if len(ns) == 1 else 'numbers'} "
+                    f"{', '.join(map(str, ns))} {'is' if len(ns) == 1 else 'are'}; {what} (try again)")
+        kept = tuple(Refusal(r.n, why([r.n], "nothing recorded for it"))
+                     if r.n is not None and any(s in r.reason for s in _ABOUT_THE_NUMBER)
+                     else Refusal(None, why(sorted(whole), "nothing recorded")) if r.n is None and whole
+                     else r for r in plan.refused)
+        return dataclasses.replace(plan, refused=kept)
+    if not host:
+        return plan
+    kept = tuple(r for r in plan.refused if r.n not in host and not (r.n is None and whole and whole <= host))
+    if not (plan.actions or plan.sheets or kept):
+        return dataclasses.replace(plan, matched=False, refused=())
+    return dataclasses.replace(plan, refused=kept)
 
 
 def plan_for(store: QuestionStore, viewer: str, text: str) -> tuple[Parse, View | None, dict[int, Question]]:
