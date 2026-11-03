@@ -24,31 +24,59 @@ What the fire side owns:
 * **The hook points** ``on_end`` and ``verify`` (:class:`Hooks`, the module's :data:`HOOKS`), called by
   :meth:`Supervisor.finish`, the run's natural end. Both default to nothing. P8b registers into :data:`HOOKS`.
 
-The reaper, ``stop_at``, the tick's order and the unconfirmed-stop attention row are the tick side's.
+The tick side is :meth:`Supervisor.reap` (P6-4b), the second writer of this module, called from
+:func:`levain.agents.controller.tick`: lease renewal first, the ``stop_at`` pass from ``autonomic.db`` and the clock
+alone, then the shared cover refresh and the STALE classification, then ``stop(STOP_DEADLINE_S)`` serially, each end
+through the guarded settle and only on ``StopResult(terminated=True)``. A stop's outcome is read only as that exact
+``StopResult`` (the executor applies :func:`levain.agents.controller.gate_proves_termination` to its own child; the
+result carries no returncode for the reaper to judge). Not covered: a row with neither ``session_key`` nor ``pid`` is
+asked nothing (lapse recovery's), and a dead supervisor is lapse recovery's too.
 """
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 from levain.agent_authority import AgentAuthority, AgentAuthorityError, agent_fence
 from levain.agents import accounting, controller as _ctl
 from levain.agents.store import AgentStore
 from levain.autonomic.journal import EffectOutcome, EffectStatus, RunJournal
 
-__all__ = ["MAX_TRIES", "STOP_DEADLINE_S", "Effected", "End", "Hooks", "HOOKS", "Supervisor"]
+__all__ = ["MAX_TRIES", "LEASE_S", "STOP_DEADLINE_S", "ATTENTION_PREFIX", "Effected", "End", "Hooks", "HOOKS",
+           "Reaped", "Supervisor"]
 
 _log = logging.getLogger("levain.agents.supervise")
 
 MAX_TRIES = 3          # A0 §2.3: the effect is tried at most this many times in one pass
 STOP_DEADLINE_S = 10   # A0 r6 §2.3 [judged by A0]: what a stop() may wait
+LEASE_S = _ctl.LEASE_S  # A0 r6 §2.3 [judged by A0], 900: defined once, in the controller, which the heartbeat shares
+ATTENTION_PREFIX = "agent-stop-unconfirmed:"
+STOP_AT_REASON = "stop_at"
 
 _OCCURRENCE_COLUMNS = ("occurrence_id", "agent_id", "run_id", "state", "epoch", "launch_epoch", "link_id",
                        "link_incarnation", "spec_hash", "binding_id")
+
+
+@dataclass
+class Reaped:
+    """What one :meth:`Supervisor.reap` pass did, by occurrence id. ``renewed`` are the leases it extended, ``due`` the
+    rows past ``stop_at``, ``stale`` the rows whose fence moved, ``unclassified`` the rows whose cover could not be
+    read this tick (nothing done for them), ``asked`` the rows ``stop()`` was called for, ``ended`` those it settled,
+    ``unconfirmed`` those left ``launched`` after an unconfirmed stop, ``settle_errors`` a settle that raised after a
+    confirmed stop (the row stays ``launched``; the next pass asks again)."""
+    renewed: list[str] = field(default_factory=list)
+    due: list[str] = field(default_factory=list)
+    stale: list[str] = field(default_factory=list)
+    unclassified: list[str] = field(default_factory=list)
+    asked: list[str] = field(default_factory=list)
+    ended: list[str] = field(default_factory=list)
+    unconfirmed: list[str] = field(default_factory=list)
+    settle_errors: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -120,7 +148,7 @@ class Supervisor:
 
     def __init__(self, store: AgentStore, *, authority: AgentAuthority, clock: Callable[[], datetime] | None = None,
                  hooks: Hooks | None = None, stop_deadline_s: float = STOP_DEADLINE_S,
-                 journal: RunJournal | None = None) -> None:
+                 journal: RunJournal | None = None, session_grace_s: int | None = _ctl.SESSION_GRACE_S) -> None:
         self._store = store
         self._authority = authority
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -131,6 +159,8 @@ class Supervisor:
             self._store_id = _ctl._store_id_of(conn)
         self._lock = threading.Lock()
         self._refreshed: bool | None = None   # this tick's one refresh: None not yet, True read, False failed
+        self._session_grace_s = session_grace_s
+        self._raised: set[str] = set()        # attention keys this process already raised
 
     # --- the tick's shared refresh ---------------------------------------------------------------------------------
 
@@ -210,7 +240,7 @@ class Supervisor:
             return "fenced"
         return "link_not_live"
 
-    def _settle_stopped(self, occ: dict, usage: accounting.Usage) -> _ctl.Ended:
+    def _settle_stopped(self, occ: dict, usage: accounting.Usage, reason: str | None = None) -> _ctl.Ended:
         """The STALE path's settle, and the only one that adopts the epoch the row holds NOW. It runs only after
         ``stop()`` answered ``StopResult(terminated=True)``: the process is gone, so the end it writes is the
         revocation's own (``stopped``), and a revoke has usually raised the epoch past the launch's, which is why
@@ -223,7 +253,7 @@ class Supervisor:
             if row is None:
                 return _ctl.Ended(False)
             return _ctl.settle_terminal(conn, occurrence_id, row[0], "stopped",
-                                        self._stale_reason(conn, occ, row[0]), usage, self._clock())
+                                        reason or self._stale_reason(conn, occ, row[0]), usage, self._clock())
 
     def _settle_held(self, occurrence_id: str, epoch: int, state: str, reason: str,
                      usage: accounting.Usage) -> _ctl.Ended:
@@ -243,6 +273,135 @@ class Supervisor:
             state, reason = conn.execute("SELECT state, reason FROM agent_occurrences WHERE occurrence_id = ?",
                                          (occurrence_id,)).fetchone()
         return End(occurrence_id, state, reason, usage, _ctl.Ended(False))
+
+    # --- the tick side: the reaper (P6-4b) -------------------------------------------------------------------------
+
+    def _launched(self) -> list[dict]:
+        columns = _OCCURRENCE_COLUMNS + ("launched_at", "session_key", "pid")
+        with self._store.read() as conn:
+            rows = conn.execute(f"SELECT {', '.join(columns)} FROM agent_occurrences WHERE state = 'launched'"
+                                " ORDER BY launched_at, occurrence_id").fetchall()
+        return [dict(zip(columns, row)) for row in rows]
+
+    def _renew(self, row: dict) -> bool:
+        try:
+            with self._store.write() as conn:
+                return _ctl.heartbeat(conn, row["occurrence_id"], row["epoch"], self._clock(), LEASE_S,
+                                      session_grace_s=self._session_grace_s)
+        except Exception as exc:  # noqa: BLE001 - one row's renewal failing never stops the others'
+            _log.warning("agent supervisor: the lease renewal of %s raised %s: %s", row["occurrence_id"],
+                         type(exc).__name__, exc)
+            return False
+
+    def _past_stop_at(self, row: dict, now: datetime) -> bool:
+        """From ``autonomic.db`` and the clock alone: ``launched_at + stop_at`` (the spec whose hash is the
+        occurrence's) is at or before ``now``. A spec or stamp that cannot be read is not evidence of a deadline."""
+        launched = _ctl._lease(row["launched_at"])
+        if launched is None:
+            return False
+        try:
+            with self._store.read() as conn:
+                found = conn.execute("SELECT spec FROM agent_specs WHERE spec_hash = ?", (row["spec_hash"],)).fetchone()
+            stop_at = json.loads(found[0])["stop_at"] if found else None
+        except Exception:  # noqa: BLE001
+            return False
+        if type(stop_at) is not int or stop_at < 0:
+            return False
+        return now >= launched + timedelta(seconds=stop_at)
+
+    def _is_stale(self, row: dict) -> bool | None:
+        """True when the fence an effect would build differs from the one now; None when the cover cannot be read."""
+        try:
+            fence, fence_now = agent_fence(row, authority=self._authority, store_id=self._store_id, now=self._clock)
+            with self._store.read() as conn:
+                return fence_now(conn) != fence
+        except Exception:  # noqa: BLE001 - AgentCoverMoved, AgentAuthorityError, a store error: all "cannot tell"
+            return None
+
+    def reap(self, executor_of: Callable[[dict], accounting.Executor | None], *,
+             attention: Callable[[str, str], None] | None = None,
+             resolve: Callable[[str], None] | None = None) -> Reaped:
+        """One tick's reaper (A0 r6 §2.3, §5.10), in this order: (1) renew the lease of every ``launched`` row;
+        (2) pick the rows past ``stop_at``, from ``autonomic.db`` and the clock alone, so it holds while the cover is
+        unreadable; (3) the shared refresh and the STALE classification (UNCLASSIFIED does nothing); (4) ``stop()``
+        for each row to stop, serially, and the guarded settle only on ``StopResult(terminated=True)``.
+
+        ``executor_of(row)`` gives the executor for a ``launched`` row (a mapping with its ``occurrence_id``,
+        ``session_key`` and ``pid``); a row with neither key is never asked. ``attention(key, text)`` upserts on its key
+        and is called once per key per process; ``resolve(key)`` is called, idempotently, when the row is no longer
+        ``launched`` after the attempt."""
+        self.begin_tick()
+        out = Reaped()
+        rows = self._launched()
+        for row in rows:
+            if self._renew(row):
+                out.renewed.append(row["occurrence_id"])
+        now = self._clock()
+        reasons: dict[str, str] = {}
+        for row in rows:
+            if self._past_stop_at(row, now):
+                out.due.append(row["occurrence_id"])
+                reasons[row["occurrence_id"]] = STOP_AT_REASON
+        if self.refresh_once():
+            for row in rows:
+                stale = self._is_stale(row)
+                if stale is None:
+                    out.unclassified.append(row["occurrence_id"])
+                elif stale:
+                    out.stale.append(row["occurrence_id"])
+        else:
+            out.unclassified.extend(r["occurrence_id"] for r in rows)
+        wanted = set(out.due) | set(out.stale)
+        for row in rows:
+            oid = row["occurrence_id"]
+            if oid not in wanted or (row["session_key"] is None and row["pid"] is None):
+                continue
+            self._stop_and_settle(row, reasons.get(oid), executor_of, attention, resolve, out)
+        return out
+
+    def _stop_and_settle(self, row: dict, reason: str | None, executor_of, attention, resolve, out: Reaped) -> None:
+        oid = row["occurrence_id"]
+        key = ATTENTION_PREFIX + oid
+        try:
+            executor = executor_of(row)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("agent supervisor: no executor for %s (%s)", oid, type(exc).__name__)
+            executor = None
+        if executor is None:
+            stop = accounting.StopResult(False, "no executor to ask")
+        else:
+            stop = _executor_stop(executor, self._stop_deadline_s)
+        out.asked.append(oid)
+        if stop.terminated is not True:
+            out.unconfirmed.append(oid)
+            if attention is not None and key not in self._raised:
+                self._raised.add(key)
+                try:
+                    attention(key, f"occurrence {oid}: asked to stop; not confirmed ended ({stop.detail})")
+                except Exception as exc:  # noqa: BLE001 - a missing row is retried next tick
+                    self._raised.discard(key)
+                    _log.warning("agent supervisor: the attention row for %s raised %s", oid, type(exc).__name__)
+            return
+        try:
+            occ = self._occurrence(oid)
+            usage = _executor_usage(executor)
+            self._settle_stopped(occ, usage, reason)
+        except Exception as exc:  # noqa: BLE001 - confirmed, but the row stays launched; the next pass asks again
+            _log.warning("agent supervisor: the settle after a confirmed stop of %s raised %s: %s; the row stays"
+                         " launched", oid, type(exc).__name__, exc)
+            out.settle_errors[oid] = type(exc).__name__
+            return
+        with self._store.read() as conn:
+            still = conn.execute("SELECT 1 FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'",
+                                 (oid,)).fetchone()
+        if still is None:
+            out.ended.append(oid)
+            self._raised.discard(key)
+            if resolve is not None:
+                try:
+                    resolve(key)
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("agent supervisor: resolving %s raised %s", key, type(exc).__name__)
 
     # --- the run's natural end: the hook points --------------------------------------------------------------------
 
