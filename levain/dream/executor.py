@@ -48,12 +48,16 @@ Known edges:
 
 ``consolidate_store`` never raises for an outcome it can name (the journal poisons an effect that raises): it returns a
 :class:`ConsolidateResult` whose ``outcome`` is one of :data:`OUTCOMES`. Out-of-band exits (``TurnTimeout`` from a
-caller's deadline, ``KeyboardInterrupt``) cancel our wrap by token and propagate, exactly as ``wrap.py`` does.
+caller's deadline, ``KeyboardInterrupt``) cancel our wrap by token and propagate, exactly as ``wrap.py`` does; a
+:class:`FireStopRequested` also sets the journal back as above when the cancel did not fail (the handler defers from a
+durable ``saving`` on, so it is never raised while a save may be running).
 
-NOT here (D1-1s's, after P5c-3): the ``Executor`` protocol, ``max_exposure_usd_micros`` and ``stop()``. This module
-imports nothing from ``levain/agents/accounting.py`` and defines no ``StopResult``. It keeps what ``stop()`` will read:
-the ``progress.json`` keys, and the ``claude`` child started as an unreaped ``Popen`` leading its own process group,
-held by the fire, which signals it only through that handle.
+D1-1s (the bottom of this module): :class:`DreamExecutor`, P5c-3's ``Executor`` (imported from
+``levain/agents/accounting.py``; neither it nor ``StopResult`` is defined here). It states ``max_exposure_usd_micros =
+R`` only when the one-call ceiling ``M`` is known and §2.4's two first-run facts are recorded, reads ``usage.json``, and
+implements ``stop()`` per §2.6. The ``claude`` child is an unreaped ``Popen`` leading its own process group, held by the
+fire, which signals it only through that handle (:func:`fire_stop_handler`); ``stop()`` signals the fire, or an orphaned
+child group, only after an identity check, and never a stored integer.
 """
 from __future__ import annotations
 
@@ -79,6 +83,7 @@ from pathlib import Path
 from typing import Any
 
 from levain import wrap as _w
+from levain.agents.accounting import Executor, StopResult, Usage
 from levain.firing.crystallization import CrystallizationRefused, refuse_crystallization
 from levain.firing.deadline import TurnDeadline, TurnTimeout
 
@@ -171,34 +176,73 @@ PROGRESS_KEYS = ("wrap_token", "phase", "last_wrap_before", "composed_sha256", "
 PHASES = ("composing", "saving", "saved")
 
 
+class _StopGate:
+    """The state :func:`fire_stop_handler` keeps on the :class:`Progress` it reads: ``held`` (a count of open
+    :meth:`Progress.hold_stop` regions), ``pending`` (a SIGTERM arrived inside one) and ``raised`` (the one
+    :class:`FireStopRequested` has been raised)."""
+
+    __slots__ = ("held", "pending", "raised")
+
+    def __init__(self) -> None:
+        self.held = 0
+        self.pending = False
+        self.raised = False
+
+
 class Progress:
     """``<occurrence dir>/progress.json``, always carrying exactly :data:`PROGRESS_KEYS` (``null`` until set), written
-    atomically (temp name, then rename). With no occurrence dir it keeps the values and writes nothing."""
+    atomically (temp name, then rename). With no occurrence dir it keeps the values and writes nothing.
+
+    ``data`` changes only after the file has been written (r2): the fire's SIGTERM handler decides from ``data``, so
+    it can never act on a phase ``stop()`` cannot read on disk. A failed write leaves ``data`` as it was."""
 
     def __init__(self, occ_dir: Path | None) -> None:
         self.path = None if occ_dir is None else Path(occ_dir) / "progress.json"
         self.data: dict[str, Any] = dict.fromkeys(PROGRESS_KEYS)
         self.write_error: str | None = None
+        self.stop_gate = _StopGate()
+
+    def hold_stop(self) -> None:
+        """Open a region in which the fire's SIGTERM handler records a stop instead of raising it."""
+        self.stop_gate.held += 1
+
+    def release_stop(self) -> None:
+        """Close a :meth:`hold_stop` region. Closing the outermost one raises :class:`FireStopRequested` when a
+        SIGTERM arrived inside it and none has been raised yet: a stop that arrived before the save was durably
+        begun cancels the run, whatever phase the region wrote."""
+        gate = self.stop_gate
+        gate.held -= 1
+        if gate.held == 0 and gate.pending:
+            gate.pending = False
+            if not gate.raised:
+                gate.raised = True
+                raise FireStopRequested("SIGTERM, held until the fire could unwind")
 
     def update(self, **values: Any) -> bool:
-        """Set keys and write the file; False when it could not be written (never raises)."""
+        """Set keys and write the file; False when it could not be written. Never raises, except the
+        :class:`FireStopRequested` of a SIGTERM held while the write was in flight (:meth:`release_stop`)."""
         unknown = set(values) - set(PROGRESS_KEYS)
         if unknown:
             raise KeyError(f"not a progress.json key: {sorted(unknown)}")
         if values.get("phase") is not None and values["phase"] not in PHASES:
             raise ValueError(f"not a progress phase: {values['phase']!r}")
-        self.data.update(values)
         if self.path is None:
+            self.data.update(values)
             return True
         tmp = self.path.with_name(self.path.name + ".tmp")
+        self.hold_stop()
         try:
-            tmp.write_text(json.dumps(self.data, sort_keys=True), encoding="utf-8")
-            os.replace(tmp, self.path)
-        except OSError as exc:
-            self.write_error = f"{type(exc).__name__}: {exc}"
-            return False
-        self.write_error = None
-        return True
+            try:
+                tmp.write_text(json.dumps({**self.data, **values}, sort_keys=True), encoding="utf-8")
+                os.replace(tmp, self.path)
+            except OSError as exc:
+                self.write_error = f"{type(exc).__name__}: {exc}"
+                return False
+            self.data.update(values)                 # the disk first, then what the handler reads
+            self.write_error = None
+            return True
+        finally:
+            self.release_stop()
 
 
 # ------------------------------------------------------------------------------------------------ hooks (§2.2)
@@ -409,9 +453,9 @@ class ClaudeMind:
     """The ``claude -p`` mind (§2.3): flow's argv, started as an unreaped ``Popen`` that leads its own process group.
 
     The fire holds the handle (a ``confinement._Leader``, which reads the exit WITHOUT reaping) until it has seen the
-    group gone, and signals the child only through it. ``progress.json`` gets ``child_pid``, ``child_started_at`` (the
-    ``ps`` start time, as ``levain.consent.delivery.process_identity`` reads it) and ``child_argv`` as soon as the child
-    is started, and the child keys are cleared once the child is reaped. A model id with no price row has no cap, and
+    group gone, and signals the child only through it. ``progress.json`` gets ``child_argv`` before the spawn, then
+    ``child_pid`` and ``child_started_at`` (the ``ps`` start time, as ``levain.consent.delivery.process_identity`` reads
+    it) as soon as the child is started, and the child keys are cleared once the child is reaped. A model id with no price row has no cap, and
     this mind REFUSES to compose without one."""
 
     name = "claude"
@@ -462,15 +506,44 @@ class ClaudeMind:
         package_path = occ / "package.md"
         package_path.write_text(req.package_text, encoding="utf-8")
         argv = self.argv(occ, req.cap_usd_micros)
-        stderr_path = occ / f"claude-{req.attempt}.stderr"
-        started = time.monotonic()
-        with open(stderr_path, "wb") as err:
+        # A SIGTERM from here until child_pid is journalled is HELD (the fire's handler records it) and raised inside
+        # the try below, whose finally ends the child: an unwind between the child_argv journal and the child_pid
+        # journal would leave a marker no stop() can settle, or a child nobody recorded. A handler-level hold, not
+        # pthread_sigmask: a blocked mask is inherited across Popen, so the child could never be SIGTERMed.
+        proc: subprocess.Popen | None = None
+        released = req.progress is None
+        if req.progress is not None:
+            req.progress.hold_stop()
+        try:
+            # Journalled BEFORE the spawn: a fire that dies between Popen and the child_pid write must leave "a child
+            # may be starting" (child_argv set, child_pid null), never a record stop() reads as "no child".
+            if req.progress is not None and not req.progress.update(child_argv=argv):
+                return ComposeResult(model=self.model, unit=self.unit,
+                                     error=("progress.json could not record the compose child's start "
+                                            f"({req.progress.write_error or 'not written'}); no child was started"),
+                                     fatal_outcome="failed")
+            stderr_path = occ / f"claude-{req.attempt}.stderr"
+            started = time.monotonic()
             try:
-                # cwd = the occurrence dir: the child's Read/Glob/Grep must not reach the fire's own cwd.
-                proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
-                                        start_new_session=True, env=self.env, cwd=str(occ))
-            except OSError as exc:
-                raise ComposeUnavailable(f"cannot start {self.claude_bin!r}: {type(exc).__name__}: {exc}") from exc
+                err = open(stderr_path, "wb")
+            except OSError:
+                if req.progress is not None:
+                    req.progress.update(child_argv=None)   # no child exists; a failed clear keeps it (fail-closed)
+                raise
+            with err:
+                try:
+                    # cwd = the occurrence dir: the child's Read/Glob/Grep must not reach the fire's own cwd.
+                    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
+                                            start_new_session=True, env=self.env, cwd=str(occ))
+                except OSError as exc:
+                    if req.progress is not None:
+                        req.progress.update(child_argv=None)   # no child exists; a failed clear keeps it
+                    raise ComposeUnavailable(f"cannot start {self.claude_bin!r}: {type(exc).__name__}: "
+                                             f"{exc}") from exc
+        finally:
+            if proc is None and not released:
+                released = True
+                req.progress.release_stop()       # no child: a held SIGTERM is raised here
         leader: Any = None
         chunks: list[bytes] = []
         threads: list[threading.Thread] = []
@@ -484,11 +557,15 @@ class ClaudeMind:
             # Inside the try: a constructor that raises must still leave the child killed and reaped (finally).
             leader = _Leader(proc)
             ident = process_identity(proc.pid)
-            if req.progress is not None and not req.progress.update(
-                    child_pid=proc.pid, child_started_at=ident[0] if ident else None, child_argv=argv):
+            journalled = req.progress is None or req.progress.update(
+                child_pid=proc.pid, child_started_at=ident[0] if ident else None, child_argv=argv)
+            if not journalled:
                 # A child stop() cannot find is a child nobody can end after a fire death: end it now, fail closed.
                 record_error = req.progress.write_error or "progress.json not written"
-            else:
+            if not released:
+                released = True
+                req.progress.release_stop()       # a SIGTERM held since the child_argv journal is raised HERE
+            if journalled:
                 data = self.prompt(req, package_path).encode("utf-8")
 
                 def _feed() -> None:
@@ -530,6 +607,9 @@ class ClaudeMind:
                         stream.close()
             # Not ended: the child_* keys stay for stop()/recovery, and the pipes stay open: closing stdout under a
             # drain thread still blocked in read() can hang this thread on the stream's lock.
+            if not released:
+                released = True                   # only when the try raised before its release: after the cleanup
+                req.progress.release_stop()
         if not ended:
             return ComposeResult(model=self.model, seconds=seconds, unit=self.unit, warnings=warnings,
                                  error=f"the compose child (pid {proc.pid}) could not be confirmed gone",
@@ -1335,7 +1415,14 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
               file=sys.stderr, flush=True)
         return _fail("deadline", 5, f"the wall-clock bound fired (cancel: {outcome})")
     except BaseException as exc:
-        _w._note_cancel_outcome(exc, _w._cancel_our_wrap(store, wrap_token))
+        outcome = _w._cancel_our_wrap(store, wrap_token)
+        _w._note_cancel_outcome(exc, outcome)
+        if isinstance(exc, FireStopRequested) and outcome != "failed":
+            # FireStopRequested is never raised while a save may be running (the handler defers from a durable
+            # "saving" on), so nothing of ours committed; it can be raised as the "saving" write closes, which leaves
+            # the journal reading "saving" for a save that never started.
+            with contextlib.suppress(Exception):
+                _journal_cancelled()
         raise
     finally:
         stack.close()
@@ -1400,3 +1487,326 @@ def _classify_failed_save(store: Any, exc: Exception, wrap_token: str, last_wrap
         return ConsolidateResult("failed", 1, "wrap cleared by another program", refusals=refusals, **base)
     print(_unclassified(remedies.save_unknown))
     return ConsolidateResult("unknown", 1, f"save unknown: {type(exc).__name__}: {exc}", refusals=refusals, **base)
+
+
+# ============================================================================================ D1-1s: the Executor (§2.4, §2.6)
+
+FIRST_RUN_FILE = "first_run.json"
+
+
+class ExposureRefused(ValueError):
+    """The executor cannot state its exposure (A0 §2.6: an executor that cannot is refused, fail-closed)."""
+
+
+def write_first_run_facts(path: Path | str, *, model: str, models_charged: list[str], m_usd_micros: int,
+                          limit_usd_micros: int = PER_RUN_LIMIT_USD_MICROS) -> None:
+    """Record §2.4's two first-run facts, read by a person from D1-1a's first Claude-route result json: (1) which models
+    charged in a compose (only the pinned one), (2) the computed ``M`` for the pinned id against ``R``."""
+    doc = {"model": model, "models_charged": sorted(models_charged), "m_usd_micros": m_usd_micros,
+           "r_usd_micros": limit_usd_micros}
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(doc, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def exposure_refusal(model: str, facts_path: Path | str | None, *, table: Mapping[str, PriceRow] | None = None,
+                     limit_usd_micros: int = PER_RUN_LIMIT_USD_MICROS,
+                     min_compose_usd_micros: int = MIN_COMPOSE_USD_MICROS) -> str | None:
+    """Why a Claude-route launch is refused, or None. Refused when ``M`` is unknown (no price row), when ``R - M``
+    cannot start one compose, or when §2.4's two first-run facts are not recorded for this model and this ``M``/``R``."""
+    m = one_call_ceiling(model, table)
+    if m is None:
+        return f"no price row for {model!r}: M is unknown, so the executor has no stated exposure"
+    if limit_usd_micros - m < min_compose_usd_micros:
+        return (f"R - M is {limit_usd_micros - m} micro-dollars, below the cheapest compose "
+                f"({min_compose_usd_micros}): R must be at least M + {min_compose_usd_micros}")
+    if facts_path is None:
+        return "the first-run facts file is not named"
+    try:
+        facts = json.loads(Path(facts_path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return f"the first-run facts are not recorded ({facts_path} is absent)"
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return f"the first-run facts cannot be read ({type(exc).__name__}: {exc})"
+    if not isinstance(facts, dict):
+        return "the first-run facts file is not a record"
+    if facts.get("model") != model:
+        return f"the first-run facts are for {facts.get('model')!r}, not {model!r}"
+    if facts.get("models_charged") != [model]:
+        return (f"first-run fact 1 not met: models charged were {facts.get('models_charged')!r}, "
+                f"not only {model!r}")
+    if facts.get("m_usd_micros") != m or facts.get("r_usd_micros") != limit_usd_micros:
+        return (f"first-run fact 2 not met: recorded M/R {facts.get('m_usd_micros')!r}/{facts.get('r_usd_micros')!r} "
+                f"is not the computed {m}/{limit_usd_micros}")
+    return None
+
+
+class FireStopRequested(BaseException):
+    """Raised in the fire's main thread by its SIGTERM handler before the save begins. A ``BaseException`` so it passes
+    every ``except Exception``; ``compose``'s ``finally`` then ends the child through its handle, and
+    ``consolidate_store`` cancels the wrap by token."""
+
+
+@contextlib.contextmanager
+def fire_stop_handler(progress: Progress):
+    """The fire's SIGTERM handler (§2.6, "Inside the fire"). Before the save (``progress`` phase not ``saving``/``saved``)
+    SIGTERM raises :class:`FireStopRequested`, which unwinds through ``compose``'s ``finally`` (``end_child``: SIGTERM,
+    SIGKILL after a grace, reap, through the unreaped handle) and ``consolidate_store``'s cancel-by-token. From
+    ``saving`` on it only records the request: the save runs under its own reserve and is not killed. It raises once:
+    a later SIGTERM (``stop()`` again, next tick) arriving during the unwind is only recorded, so it cannot abort
+    ``end_child``'s kill and reap. Inside a :meth:`Progress.hold_stop` region (every ``progress.json`` write, and
+    ``compose`` from its ``child_argv`` journal to its ``child_pid`` journal) the stop is held and raised when the
+    region closes. Main thread only (``signal.signal`` raises ``ValueError`` elsewhere); the previous handler is
+    restored on exit."""
+    requested: list[bool] = []
+    gate = progress.stop_gate
+    gate.pending = False
+    gate.raised = False
+
+    def _handler(signum: int, frame: Any) -> None:
+        requested.append(True)
+        if gate.raised or progress.data.get("phase") in ("saving", "saved"):
+            return
+        if gate.held:
+            gate.pending = True
+            return
+        gate.raised = True
+        raise FireStopRequested(f"signal {signum}")
+
+    previous = signal.signal(signal.SIGTERM, _handler)
+    try:
+        yield requested
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _norm(text: Any) -> str:
+    return " ".join(str(text).split())
+
+
+#: The least time ``stop()`` gives its first identity probe and SIGTERM, whatever ``deadline_s`` (one ``ps`` measured
+#: 2-3 ms on 2026-11-03): ``stop(0)`` still signals the fire, and may overrun 0 by up to this much.
+STOP_FIRST_PROBE_FLOOR_S = 0.25
+
+
+class DreamExecutor:
+    """The dream's A0 ``Executor`` (D1_EXECUTOR §2.4, §2.6). ``max_exposure_usd_micros`` is ``R`` on the Claude route,
+    stated only after :func:`exposure_refusal` passes (the constructor raises :class:`ExposureRefused` otherwise); the
+    Ollama route spends no dollars and states 0. ``agent_store_dir`` is the agent store's directory (the fire's identity
+    record is ``<agent_store_dir>/fires/<occurrence_id>.json``, written by ``controller.fire``); ``occ_dir`` holds
+    ``progress.json`` and ``usage.json``."""
+
+    def __init__(self, *, agent_store_dir: Path | str, occurrence_id: str, occ_dir: Path | str,
+                 route: str = "claude", model: str = DEFAULT_CLAUDE_MODEL, facts_path: Path | str | None = None,
+                 table: Mapping[str, PriceRow] | None = None,
+                 limit_usd_micros: int = PER_RUN_LIMIT_USD_MICROS) -> None:
+        if route not in ("claude", "ollama"):
+            raise ValueError("route is claude or ollama")
+        self.agent_store_dir = Path(agent_store_dir)
+        self.progress_fault: str | None = None       # why the last progress.json read was unreadable
+        self.occurrence_id = occurrence_id
+        self.occ_dir = Path(occ_dir)
+        self.route = route
+        self.model = model
+        if route == "claude":
+            why = exposure_refusal(model, facts_path, table=table, limit_usd_micros=limit_usd_micros)
+            if why is not None:
+                raise ExposureRefused(why)
+            self.max_exposure_usd_micros: int = limit_usd_micros
+        else:
+            self.max_exposure_usd_micros = 0
+
+    # ------------------------------------------------------------------------------------------------------ usage
+    def usage(self) -> Usage:
+        from levain.dream import usage as _usage
+        try:
+            return _usage.read_usage(self.occ_dir)
+        except Exception:  # noqa: BLE001 — usage() never raises: unreadable is usd_micros=None
+            return Usage(None, None, None, _usage.UNREADABLE_SOURCE)
+
+    # ------------------------------------------------------------------------------------------------------ stop
+    def stop(self, deadline_s: float) -> StopResult:
+        """§2.6. Idempotent, never raises, ``terminated=False`` whenever it cannot tell. Waits at most ``deadline_s``,
+        except that the first identity probe and SIGTERM get at least :data:`STOP_FIRST_PROBE_FLOOR_S`; a probe
+        already running when the deadline passes is not cut short beyond its own ``ps`` cap."""
+        try:
+            return self._stop(float(deadline_s))
+        except Exception as exc:  # noqa: BLE001
+            return StopResult(False, f"stop could not complete ({type(exc).__name__}: {exc}); nothing assumed ended")
+
+    def _fire_record(self) -> tuple[dict[str, Any] | None, str]:
+        from levain.agents.controller import fire_record_path
+        try:
+            path = fire_record_path(self.agent_store_dir, self.occurrence_id)
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None, "no fire identity record"
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            return None, f"the fire identity record cannot be read ({type(exc).__name__})"
+        ok = isinstance(doc, dict) and type(doc.get("pid")) is int and doc["pid"] > 0 \
+            and isinstance(doc.get("started"), str) and isinstance(doc.get("args"), str)
+        return (doc, "") if ok else (None, "the fire identity record is malformed")
+
+    def _fire_state(self, rec: dict[str, Any], t_end: float) -> tuple[str, str]:
+        """``matches`` (the recorded fire is alive), ``ended`` (no process there, a different one, or a zombie) or
+        ``unreadable`` (``ps`` fails, or is not done by ``t_end``, while the pid answers a probe). Sends nothing."""
+        from levain.consent.delivery import process_identity
+        pid = rec["pid"]
+        left = min(5.0, t_end - time.monotonic())
+        ident = process_identity(pid, timeout=left) if left > 0 else None
+        if ident is None:
+            try:
+                os.kill(pid, 0)                      # a probe, never a signal
+            except ProcessLookupError:
+                return "ended", f"fire pid {pid}: no such process"
+            except OSError:
+                pass
+            return "unreadable", (f"fire pid {pid}: the process table cannot be read" if left > 0 else
+                                  f"fire pid {pid}: the deadline was reached before its identity could be read")
+        if "<defunct>" in ident[1]:
+            return "ended", f"fire pid {pid}: defunct"
+        if _norm(rec["started"]) != _norm(ident[0]) or _norm(rec["args"]) != _norm(ident[1]) \
+                or self.occurrence_id not in ident[1].split():
+            return "ended", f"fire pid {pid}: another process holds the number now"
+        return "matches", f"fire pid {pid}: alive, identity matches"
+
+    def _progress(self) -> tuple[dict[str, Any] | None, str]:
+        """``(doc, why)``: doc None with why ``absent`` or ``unreadable``. A record off :class:`Progress`'s schema (a
+        key of :data:`PROGRESS_KEYS` missing, or a phase not in :data:`PHASES` and not null) is unreadable: it cannot
+        show the save has not begun."""
+        self.progress_fault = None
+        try:
+            doc = json.loads((self.occ_dir / "progress.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None, "absent"
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            self.progress_fault = type(exc).__name__
+            return None, "unreadable"
+        if not isinstance(doc, dict):
+            self.progress_fault = "not a JSON object"
+        elif [k for k in PROGRESS_KEYS if k not in doc]:
+            self.progress_fault = f"missing key(s) {[k for k in PROGRESS_KEYS if k not in doc]}"
+        elif not (doc["phase"] is None or (isinstance(doc["phase"], str) and doc["phase"] in PHASES)):
+            self.progress_fault = f"phase {doc['phase']!r} is not one of {list(PHASES)}"
+        return (doc, "") if self.progress_fault is None else (None, "unreadable")
+
+    def _escalation_refused(self) -> str | None:
+        """Why no signal may go to the fire NOW, from ``progress.json`` re-read immediately before it, or None. The
+        fire's handler defers a SIGTERM from ``saving`` on; this keeps the escalation from killing that save."""
+        prog, pwhy = self._progress()
+        if pwhy == "unreadable":
+            return "progress.json cannot be read"
+        phase = None if prog is None else prog["phase"]
+        return f"phase {phase!r}" if phase in ("saving", "saved") else None
+
+    def _stop(self, deadline_s: float) -> StopResult:
+        deadline_s = max(0.0, deadline_s)
+        t0 = time.monotonic()
+        t_end = t0 + deadline_s
+        # The first identity probe and its SIGTERM get at least the floor: stop(0) is "signal now, do not wait", not
+        # a pure poll (r2 deepseek 3). Everything after them keeps to t_end.
+        t_first = max(t_end, t0 + STOP_FIRST_PROBE_FLOOR_S)
+        notes: list[str] = []
+        prog, pwhy = self._progress()
+        phase = None if prog is None else prog["phase"]
+        rec, rwhy = self._fire_record()
+        signalling = pwhy != "unreadable" and phase not in ("saving", "saved")
+        if pwhy == "unreadable":
+            notes.append(f"progress.json cannot be read (or is off its schema: {self.progress_fault}): no signal, "
+                         "the phase is unknown")
+        elif not signalling:
+            notes.append(f"phase {phase!r}: no signal, the save is not killed")
+
+        def _wait(until: float) -> None:
+            while time.monotonic() < until and self._fire_state(rec, t_end)[0] == "matches":
+                time.sleep(min(0.05, max(0.0, until - time.monotonic())))
+
+        fstate = "no-record"
+        if rec is not None:
+            fstate, fnote = self._fire_state(rec, t_first)
+            notes.append(fnote)
+            if signalling and fstate == "matches":
+                pid = rec["pid"]
+                refused = self._escalation_refused()
+                if refused is not None:
+                    signalling = False
+                    notes.append(f"{refused} on the re-read before SIGTERM: no signal, the save is not killed")
+                elif time.monotonic() >= t_first:
+                    notes.append(f"the deadline passed during the identity check: no SIGTERM to fire {pid}")
+                else:
+                    try:                                # identity checked just above; the fire ends its own child
+                        os.kill(pid, signal.SIGTERM)
+                        notes.append(f"SIGTERM to fire {pid}")
+                    except (ProcessLookupError, PermissionError) as exc:
+                        notes.append(f"SIGTERM to fire {pid} not delivered ({type(exc).__name__})")
+                    _wait(min(t_end, time.monotonic() + deadline_s / 2))
+                    fstate, fnote = self._fire_state(rec, t_end)   # identity re-checked immediately before SIGKILL
+                    refused = self._escalation_refused() if fstate == "matches" else None   # and the phase
+                    if refused is not None:
+                        signalling = False
+                        notes.append(f"{refused} on the re-read before SIGKILL: no SIGKILL, the save is not killed")
+                    elif fstate == "matches" and time.monotonic() >= t_end:
+                        notes.append(f"the deadline passed during the re-checks: no SIGKILL to fire {pid}")
+                    elif fstate == "matches":
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                            notes.append(f"SIGKILL to fire {pid} (still alive at deadline/2, identity and phase "
+                                         "re-checked)")
+                        except (ProcessLookupError, PermissionError) as exc:
+                            notes.append(f"SIGKILL to fire {pid} not delivered ({type(exc).__name__})")
+                        _wait(t_end)
+                        fstate, fnote = self._fire_state(rec, t_end)
+                    notes.append(fnote)
+        else:
+            notes.append(rwhy)
+
+        if fstate == "ended" and pwhy != "unreadable":
+            prog, pwhy = self._progress()          # the fire clears its child keys as it ends the child: read them AFTER
+        if signalling and fstate == "ended" and prog is not None and prog["child_pid"] is not None \
+                and prog["phase"] not in ("saving", "saved"):
+            from levain.dream import recover as _rc
+            remaining = max(0.0, t_end - time.monotonic())
+            state, cnotes = _rc.end_orphan_child(prog, self.occ_dir, term_wait=remaining / 2,
+                                                 kill_wait=remaining / 2, deadline=t_end)
+            notes.append(f"orphaned compose child: {state}" + (f" ({'; '.join(cnotes)})" if cnotes else ""))
+
+        # the two-part end test; both must hold, and the detail names what each checked
+        while True:
+            fire_ended, fire_detail = self._fire_ended(rec, rwhy, t_end)
+            child_ended, child_detail = self._child_group_ended(prog, pwhy)
+            if (fire_ended and child_ended) or time.monotonic() >= t_end:
+                break
+            time.sleep(min(0.05, max(0.0, t_end - time.monotonic())))
+        done = fire_ended and child_ended
+        return StopResult(done, "; ".join(notes + [f"fire ended: {fire_ended} ({fire_detail})",
+                                                    f"compose child group ended: {child_ended} ({child_detail})"]))
+
+    def _fire_ended(self, rec: dict[str, Any] | None, why: str, t_end: float) -> tuple[bool, str]:
+        if rec is None:
+            return False, why
+        state, note = self._fire_state(rec, t_end)
+        return state == "ended", note
+
+    @staticmethod
+    def _child_group_ended(prog: dict[str, Any] | None, pwhy: str) -> tuple[bool, str]:
+        if prog is None:
+            return (True, "progress.json absent, no child recorded") if pwhy == "absent" else \
+                (False, "progress.json cannot be read, so a child cannot be ruled out")
+        pid = prog.get("child_pid")
+        if pid is None:
+            if prog.get("child_argv") is not None or prog.get("child_started_at") is not None:
+                return False, ("a compose child may be starting: its argv is journalled with no child_pid, so a child "
+                               "cannot be ruled out")
+            return True, "no child recorded (Ollama route, or no compose started)"
+        if type(pid) is not int or pid < 1:
+            return False, "the recorded child pid is malformed"
+        try:
+            os.killpg(pid, 0)                        # a probe, never read as identity
+        except ProcessLookupError:
+            return True, f"group {pid}: no such group"
+        except PermissionError:
+            return False, f"group {pid}: PermissionError (a zombie-only group on macOS), not confirmed gone"
+        except OSError as exc:
+            return False, f"group {pid}: {type(exc).__name__}, not confirmed gone"
+        return False, f"group {pid}: still has a member"
+
