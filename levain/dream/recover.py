@@ -201,6 +201,9 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, store_dir: Path | N
         # and a group signal would miss it (or hit another group): no signal, and never "ended"
         return "not-confirmed", [f"child pid {pid}: is not a process-group leader; no signal was sent. "
                                  f"{_by_hand(pid, occ_dir, store_dir)}"]
+    if deadline is not None and time.monotonic() >= deadline:
+        return "not-confirmed", [f"child pid {pid}: the deadline passed during the identity check; no signal was "
+                                 f"sent. {_by_hand(pid, occ_dir, store_dir)}"]
     if leads:
         try:
             os.killpg(pid, signal.SIGTERM)
@@ -208,8 +211,9 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, store_dir: Path | N
             pass
     until = _until(term_wait, deadline)
     while time.monotonic() < until and _group_gone(pid) is not True:
-        time.sleep(0.05)
-    if _group_gone(pid) is False and _identity_matches(pid, started, argv, occ_dir, deadline) is True:
+        time.sleep(min(0.05, max(0.0, until - time.monotonic())))
+    if _group_gone(pid) is False and _identity_matches(pid, started, argv, occ_dir, deadline) is True \
+            and (deadline is None or time.monotonic() < deadline):
         # the leader is still the recorded process, so its number is still its own and the group id cannot belong to
         # anyone else. Once the leader has gone nothing here reserves the number (recovery holds no handle to it), so
         # the group is never signalled by number again: it is reported not seen gone and recovery stays retryable
@@ -218,7 +222,7 @@ def end_orphan_child(prog: dict[str, Any], occ_dir: Path, *, store_dir: Path | N
     if _group_gone(pid) is not True:
         until = _until(kill_wait, deadline)
         while time.monotonic() < until and _group_gone(pid) is not True:
-            time.sleep(0.05)
+            time.sleep(min(0.05, max(0.0, until - time.monotonic())))
     if _group_gone(pid) is True:
         notes.append(f"child pid {pid}: ended")
         return "ended", notes
