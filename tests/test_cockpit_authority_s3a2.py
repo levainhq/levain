@@ -831,8 +831,9 @@ def test_the_handed_step_guard_sees_a_step_off_its_handed_connection(tmp_path):
             ("    from levain.agents import bars\n\n    bar = bars.read_bar(autonomic, bar_id)\n    if bar is None or bar.closed_at is not None:\n        return RevokeStep(\"abandoned\", bar_id, None, _ABANDONED)\n    link = _unsigned(bar)\n    if link is None or bar.pending_signature is None:",
              "    from levain.agents import bars\n\n    cockpit = autonomic\n    bar = bars.read_bar(autonomic, bar_id)\n    link = _unsigned(bar)\n    if link is None or bar.pending_signature is None:",
              "cockpit is rebound"),
-            ("    kw = {} if ssh_keygen is None else {\"ssh_keygen\": ssh_keygen}\n    try:\n        _auth.append(",
-             "    cockpit = sqlite3.connect(':memory:')\n    try:\n        _auth.append(", "cockpit is rebound")):
+            ("    kw = {} if ssh_keygen is None else {\"ssh_keygen\": ssh_keygen}\n    try:\n        try:\n            new = _auth.append(",
+             "    cockpit = sqlite3.connect(':memory:')\n    try:\n        try:\n            new = _auth.append(",
+             "cockpit is rebound")):
         assert src.count(old) == 1, old
         path.write_text(src.replace(old, new), encoding="utf-8")
         with pytest.raises(AssertionError, match=why):

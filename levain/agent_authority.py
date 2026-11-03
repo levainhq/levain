@@ -226,16 +226,19 @@ def agent_fence(occurrence: Mapping[str, object], *, authority: AgentAuthority, 
 #
 # Three steps over the bar rows of ``levain.agents.bars``: begin (the bar, then the prepared link), sign (the gesture,
 # recorded on the bar before anything is appended) and finish (the append, then the close). A step reports what
-# happened as a :class:`RevokeStep` and returns; the one outcome that is worth a raise is a link the log refuses.
-# Every write to a bar is guarded ``closed_at IS NULL`` in ``bars``: a write that touches no row means an abandon closed
-# the bar meanwhile, and the step then says so and returns, because the closed bar is frozen by a trigger and an
-# unguarded UPDATE would abort after a revoke had landed.
+# happened as a :class:`RevokeStep` and returns; the outcomes worth a raise are a link the log refuses and a verifier
+# that cannot run (``VerifierUnavailable``, raised as itself: a retry, never a refusal).
+# Every write to a bar is guarded ``closed_at IS NULL``: a write that touches no row means an abandon closed the bar
+# meanwhile, and the step then says so and returns, because the closed bar is frozen by a trigger and an unguarded
+# UPDATE would abort after a revoke had landed. The signature's write and the stale-head re-prepare are also guarded on
+# the exact pending link the step read (L3 r1), so a link prepared again in between is reported, never overwritten.
 # The cockpit connection is autocommit with no transaction open (``levain.authority.append`` owns its own).
 
 # The refusal a signing surface gives while the agent's revoke is open; the one text for ``sign`` and ``renew``.
 OPEN_BAR_REFUSAL = "a revoke is open for this agent: finish or abandon it"
 
 _ABANDONED = "the revoke was abandoned; nothing was appended"
+_REPREPARED = "the revoke link was prepared again meanwhile: nothing was recorded; sign it again"
 
 
 @dataclass(frozen=True)
@@ -243,9 +246,10 @@ class RevokeStep:
     """What one revoke step did. ``state`` is one of ``prepared`` (begin: the link waits for a signature),
     ``signed`` (sign: the signature is on the bar), ``landed`` (finish: appended, the bar closed signed),
     ``landed_bar_abandoned`` (appended; an abandon had closed the bar, so R5 records it ``from_log`` at the next tick;
-    the revoke stands), ``abandoned`` (the bar was closed before this step's write; nothing was appended) and
-    ``stale_head`` (the head moved: the bar stays open, re-prepared, and wants one more signature). ``seq`` is the
-    revoke link's seq where one is known."""
+    the revoke stands), ``abandoned`` (the bar was closed before this step's write; nothing was appended),
+    ``reprepared`` (another step prepared the bar's link again before this step's write; nothing was recorded or
+    appended, and the bar's current link wants a signature) and ``stale_head`` (the head moved: the bar stays open,
+    re-prepared, and wants one more signature). ``seq`` is the revoke link's seq where one is known."""
     state: str
     bar_id: str
     seq: int | None
@@ -288,39 +292,70 @@ def _unsigned(bar) -> _auth.UnsignedLink | None:
     return _auth.UnsignedLink(seq, prev, rec, fp)
 
 
-def _prepare_onto(autonomic: sqlite3.Connection, cockpit: sqlite3.Connection, bar_id: str, agent_id: str, *,
-                  store_id: str, signer_fp: str, now: datetime, ssh_keygen: Path | str | None,
-                  last_error: str | None = None) -> bool:
-    """Prepare the ``revoke_agent`` link on the current head and record it on the bar in ONE guarded UPDATE: the four
-    ``pending_*`` fields, the stored signature and its time nulled together (a stale signature never pairs with a new
-    record), ``attempts`` up by one and ``last_error`` as given. False: the bar is closed. The log's own refusal (no
-    agent-link to remove, a signer it does not know) raises."""
+_PENDING = ("pending_record", "pending_prev", "pending_seq", "pending_signer_fp")
+
+
+def _write(autonomic: sqlite3.Connection, set_sql: str, params: tuple, bar_id: str, *,
+           holding: _auth.UnsignedLink | None = None) -> bool:
+    """One bar write guarded ``closed_at IS NULL`` and, with ``holding``, on the bar still holding that exact pending
+    link (a compare-and-swap: a re-prepare between the read and the write makes it touch no row)."""
+    where, extra = "", ()
+    if holding is not None:
+        where = "".join(f" AND {c} = ?" for c in _PENDING)
+        extra = (holding.record, holding.prev_hash, holding.seq, holding.signer_fp)
+    return autonomic.execute(f"UPDATE agent_bars SET {set_sql} WHERE bar_id = ? AND closed_at IS NULL{where}",
+                             (*params, bar_id, *extra)).rowcount == 1
+
+
+def _lost(autonomic: sqlite3.Connection, bar_id: str, seq: int | None) -> RevokeStep:
+    """The step for a guarded write that touched no row: the bar closed (an abandon) or was prepared again."""
     from levain.agents import bars
 
+    now = bars.read_bar(autonomic, bar_id)
+    if now is None or now.closed_at is not None:
+        return RevokeStep("abandoned", bar_id, seq, _ABANDONED)
+    return RevokeStep("reprepared", bar_id, now.pending_seq, _REPREPARED)
+
+
+def _prepare_onto(autonomic: sqlite3.Connection, cockpit: sqlite3.Connection, bar_id: str, agent_id: str, *,
+                  store_id: str, signer_fp: str, now: datetime, ssh_keygen: Path | str | None,
+                  last_error: str | None = None, holding: _auth.UnsignedLink | None = None) -> bool:
+    """Prepare the ``revoke_agent`` link on the current head and record it on the bar in ONE guarded UPDATE: the four
+    ``pending_*`` fields, the stored signature and its time nulled together (a stale signature never pairs with a new
+    record), ``attempts`` up by one and ``last_error`` as given. False: the bar is closed, or (with ``holding``) no
+    longer holds that link. The log's own refusal (no agent-link to remove, a signer it does not know) raises
+    :class:`AgentAuthorityError`; a verifier that cannot run raises as itself."""
     kw = {} if ssh_keygen is None else {"ssh_keygen": ssh_keygen}
     try:
         link = _auth.prepare(cockpit, {"op": "revoke_agent", "agent_id": agent_id, "agent_store_id": store_id},
                              signer_fp=signer_fp, now=now, **kw)
+    except _auth.VerifierUnavailable:
+        raise
     except _auth.AuthorityError as exc:
         raise AgentAuthorityError(f"the revoke cannot be prepared: {exc}") from exc
-    return bars._guarded(autonomic, "pending_record = ?, pending_prev = ?, pending_seq = ?, pending_signer_fp = ?,"
-                                    " pending_signature = NULL, pending_signed_at = NULL, attempts = attempts + 1,"
-                                    " last_error = ?",
-                         (link.record, link.prev_hash, link.seq, link.signer_fp, last_error), bar_id)
+    return _write(autonomic, "pending_record = ?, pending_prev = ?, pending_seq = ?, pending_signer_fp = ?,"
+                             " pending_signature = NULL, pending_signed_at = NULL, attempts = attempts + 1,"
+                             " last_error = ?",
+                  (link.record, link.prev_hash, link.seq, link.signer_fp, last_error), bar_id, holding=holding)
 
 
 def revoke_agent_begin(autonomic: sqlite3.Connection, cockpit: sqlite3.Connection, agent_id: str, *, store_id: str,
                        signer_fp: str, clock: Callable[[], datetime],
                        ssh_keygen: Path | str | None = None) -> RevokeStep:
-    """Steps 1 and 2. The bar is written first, with the epoch of every live occurrence of the agent raised, in one
-    ``BEGIN IMMEDIATE`` (a second revoke reuses the open bar); then the link is prepared on the current head and its four
-    fields recorded on the bar. The bar stays when the prepare is refused: the agent is barred, and recovery (R3, R4)
-    decides what the bar becomes. ``autonomic`` and ``cockpit`` are autocommit connections with no transaction open."""
+    """Steps 1 and 2. ``store_id`` must be the autonomic store's own (its ``meta`` row, where there is one). The bar is
+    written first, with the epoch of every live occurrence of the agent raised, in one ``BEGIN IMMEDIATE`` (a second
+    revoke reuses the open bar, and its re-prepare drops any signature already recorded on it); then the link is
+    prepared on the current head and its four fields recorded on the bar. The bar stays when the prepare is refused:
+    the agent is barred, and recovery (R3, R4) decides what the bar becomes. ``autonomic`` and ``cockpit`` are
+    autocommit connections with no transaction open."""
     from levain.agents import bars
 
+    sid, why = bars._store_id(autonomic, store_id)
+    if sid is None:
+        raise AgentAuthorityError(f"no revoke begun: {why}")
     head = _auth.log_head(cockpit)
     bar = bars.open_bar(autonomic, agent_id, head_seq=0 if head is None else int(head[0]), now=clock())
-    if not _prepare_onto(autonomic, cockpit, bar.bar_id, agent_id, store_id=store_id, signer_fp=signer_fp, now=clock(),
+    if not _prepare_onto(autonomic, cockpit, bar.bar_id, agent_id, store_id=sid, signer_fp=signer_fp, now=clock(),
                          ssh_keygen=ssh_keygen):
         return RevokeStep("abandoned", bar.bar_id, None, _ABANDONED)
     return RevokeStep("prepared", bar.bar_id, bars.read_bar(autonomic, bar.bar_id).pending_seq,
@@ -331,8 +366,10 @@ def revoke_agent_sign(autonomic: sqlite3.Connection, bar_id: str, sign: Callable
                       clock: Callable[[], datetime]) -> RevokeStep:
     """Step 3. The link is rebuilt from the bar's own row (so a crash after the gesture loses nothing), signed outside
     any transaction, and the signature and the time it was recorded go to the bar in one UPDATE, before anything is
-    appended."""
+    appended. That UPDATE finds the bar still holding the link that was signed, or touches no row: a bar prepared
+    again during the gesture reports ``reprepared`` and keeps no signature."""
     from levain.agents import bars
+    from levain.cockpit.consent import utc_stamp
 
     bar = bars.read_bar(autonomic, bar_id)
     if bar is None or bar.closed_at is not None:
@@ -341,18 +378,65 @@ def revoke_agent_sign(autonomic: sqlite3.Connection, bar_id: str, sign: Callable
     if link is None:
         raise AgentAuthorityError("the bar has no prepared revoke link to sign")
     signature = sign(link.message)
-    if not bars.record_signature(autonomic, bar_id, signature, now=clock()):
-        return RevokeStep("abandoned", bar_id, link.seq, _ABANDONED)
+    if not _write(autonomic, "pending_signature = ?, pending_signed_at = ?", (signature, utc_stamp(clock())), bar_id,
+                  holding=link):
+        return _lost(autonomic, bar_id, link.seq)
     return RevokeStep("signed", bar_id, link.seq, "the signature is recorded on the bar")
 
 
-def revoke_agent_finish(autonomic: sqlite3.Connection, cockpit: sqlite3.Connection, bar_id: str, *, store_id: str,
+def _store_of(link: _auth.UnsignedLink) -> str:
+    """The ``agent_store_id`` the bar's pending record names: the store this revoke was begun for."""
+    try:
+        sid = json.loads(link.record).get("agent_store_id")
+    except (ValueError, AttributeError):
+        sid = None
+    if type(sid) is not str:
+        raise AgentAuthorityError("the bar's pending record names no agent store")
+    return sid
+
+
+def _landed(autonomic: sqlite3.Connection, bar_id: str, seq: int, *, now: datetime, warning: str | None) -> RevokeStep:
+    """Close the bar signed at ``seq`` after its link is in the log. A close that touches no row reads the frozen row:
+    closed signed at ``seq`` (recovery's R1 got there first) is ``landed``; anything else is an abandon (R5's)."""
+    from levain.agents import bars
+
+    tail = "" if warning is None else f"; warning: {warning}"
+    if not bars.close_bar(autonomic, bar_id, revoke_seq=seq, reason="signed", now=now):
+        row = bars.read_bar(autonomic, bar_id)
+        if row is None or (row.reason, row.revoke_seq) != ("signed", seq):
+            return RevokeStep("landed_bar_abandoned", bar_id, seq,
+                              f"revoke landed at seq {seq}; the bar had been abandoned; it is recorded from_log at the "
+                              f"next tick (R5){tail}")
+    return RevokeStep("landed", bar_id, seq, f"revoke landed at seq {seq}; the bar is closed{tail}")
+
+
+def _in_log(cockpit: sqlite3.Connection, link: _auth.UnsignedLink, ssh_keygen: Path | str | None) -> bool:
+    """Whether the verified, anchored replay of the cockpit's log (:meth:`AgentAuthority.replay` on the connection's
+    own file) holds ``link`` itself at its seq: same prev and record. A replay that cannot finish raises
+    :class:`AgentAuthorityError` (a verifier that cannot run raises as itself), never a False."""
+    try:
+        row = next((r for r in cockpit.execute("PRAGMA database_list") if r[1] == "main"), None)
+        db = Path(row[2]) if row is not None and row[2] else None
+        if db is None or db.name != DB_NAME:
+            raise AgentAuthorityError("the cockpit connection is not a cockpit journal on disk")
+        state = AgentAuthority(db.parent, ssh_keygen=ssh_keygen).replay()
+    except (_auth.VerifierUnavailable, AgentAuthorityError):
+        raise
+    except Exception as exc:  # noqa: BLE001 - a log that cannot be replayed is never read as "not landed"
+        raise AgentAuthorityError(f"the log cannot be replayed to look for this revoke: {type(exc).__name__}") from exc
+    return state.hash_at(link.seq) == _auth._link_hash(link.prev_hash, link.record)
+
+
+def revoke_agent_finish(autonomic: sqlite3.Connection, cockpit: sqlite3.Connection, bar_id: str, *,
                         clock: Callable[[], datetime], anchor: Path | None,
                         ssh_keygen: Path | str | None = None) -> RevokeStep:
     """Steps 4 and 5. The recorded signature is appended; on success the bar closes ``signed`` at the link's seq. A head
-    that moved leaves the bar open, records ``stale_head`` and re-prepares on the new head, which drops the stale
-    signature: the caller signs once more (the agent stays barred meanwhile). A bar an abandon closed meanwhile ends
-    the step with the true outcome, never a raise."""
+    that moved is first checked for the bar's own link (an append that landed before a crash, or recovery's): if the
+    verified log holds it, the bar closes ``landed``. Otherwise the bar stays open, records ``stale_head`` and
+    re-prepares on the new head for the store its own record names, which drops the stale signature: the caller signs
+    once more (the agent stays barred meanwhile). A bar an abandon closed, or another step prepared again, meanwhile
+    ends the step with the true outcome, never a raise. A verifier that cannot run raises as itself, with
+    ``last_error`` ``verifier_unavailable``: a retry, never a refusal."""
     from levain.agents import bars
 
     bar = bars.read_bar(autonomic, bar_id)
@@ -361,27 +445,30 @@ def revoke_agent_finish(autonomic: sqlite3.Connection, cockpit: sqlite3.Connecti
     link = _unsigned(bar)
     if link is None or bar.pending_signature is None:
         raise AgentAuthorityError("the bar has no signed revoke link to append")
+    store_id = _store_of(link)
     kw = {} if ssh_keygen is None else {"ssh_keygen": ssh_keygen}
     try:
-        _auth.append(cockpit, link, bar.pending_signature, now=clock(), anchor=anchor, **kw)
-    except _auth.StaleHead:
         try:
-            prepared = _prepare_onto(autonomic, cockpit, bar_id, bar.agent_id, store_id=store_id,
-                                     signer_fp=link.signer_fp, now=clock(), ssh_keygen=ssh_keygen,
-                                     last_error="stale_head")
-        except AgentAuthorityError:
-            bars._guarded(autonomic, "last_error = ?", ("stale_head",), bar_id)    # the bar stays open and says why
-            raise
-        if not prepared:
-            return RevokeStep("abandoned", bar_id, link.seq, _ABANDONED)
-        return RevokeStep("stale_head", bar_id, bars.read_bar(autonomic, bar_id).pending_seq,
-                          "the authority log moved: nothing was appended; the revoke link was prepared again and "
-                          "needs one more signature")
+            new = _auth.append(cockpit, link, bar.pending_signature, now=clock(), anchor=anchor, **kw)
+        except _auth.StaleHead:
+            if _in_log(cockpit, link, ssh_keygen):
+                return _landed(autonomic, bar_id, link.seq, now=clock(), warning=None)
+            try:
+                prepared = _prepare_onto(autonomic, cockpit, bar_id, bar.agent_id, store_id=store_id,
+                                         signer_fp=link.signer_fp, now=clock(), ssh_keygen=ssh_keygen,
+                                         last_error="stale_head", holding=link)
+            except AgentAuthorityError:
+                bars._guarded(autonomic, "last_error = ?", ("stale_head",), bar_id)    # the bar stays open and says why
+                raise
+            if not prepared:
+                return _lost(autonomic, bar_id, link.seq)
+            return RevokeStep("stale_head", bar_id, bars.read_bar(autonomic, bar_id).pending_seq,
+                              "the authority log moved: nothing was appended; the revoke link was prepared again and "
+                              "needs one more signature")
+    except _auth.VerifierUnavailable:
+        bars._guarded(autonomic, "last_error = ?", ("verifier_unavailable",), bar_id)
+        raise
     except _auth.AuthorityError as exc:
         bars._guarded(autonomic, "last_error = ?", (f"append_refused:{type(exc).__name__}",), bar_id)
         raise AgentAuthorityError(f"the log refused the revoke: {exc}") from exc
-    if bars.close_bar(autonomic, bar_id, revoke_seq=link.seq, reason="signed", now=clock()):
-        return RevokeStep("landed", bar_id, link.seq, f"revoke landed at seq {link.seq}; the bar is closed")
-    return RevokeStep("landed_bar_abandoned", bar_id, link.seq,
-                      f"revoke landed at seq {link.seq}; the bar had been abandoned; it is recorded from_log at the "
-                      "next tick (R5)")
+    return _landed(autonomic, bar_id, link.seq, now=clock(), warning=new.anchor_warning)

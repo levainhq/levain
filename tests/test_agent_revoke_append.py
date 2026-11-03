@@ -59,8 +59,7 @@ class Rig:
         return aa.revoke_agent_sign(self.store, step.bar_id, self.sign, clock=self.clock)
 
     def finish(self, step: aa.RevokeStep) -> aa.RevokeStep:
-        return aa.revoke_agent_finish(self.store, self.cockpit, step.bar_id, store_id=STORE, clock=self.clock,
-                                      anchor=self.anchor)
+        return aa.revoke_agent_finish(self.store, self.cockpit, step.bar_id, clock=self.clock, anchor=self.anchor)
 
     def bar(self, step: aa.RevokeStep) -> bars.Bar:
         row = bars.read_bar(self.store, step.bar_id)
@@ -313,3 +312,116 @@ def test_a_bar_that_cannot_be_read_refuses_and_a_missing_store_does_not(rig, tmp
         renew_agent_link(rig.world.root, LINK, life=timedelta(days=30), signer_fp=rig.fp, sign=rig.sign,
                          clock=rig.clock, store_dir=junk)
     assert auth.agent_last_revoke(rig.world.state(), AGENT, STORE) == 0
+
+
+# --- review fixes r1 (L3_p5c2b_r1): each test is the reproduced failure -------------------------------------------
+
+def test_a_signature_made_over_a_link_that_was_prepared_again_is_not_recorded(rig):
+    # behaviour: a second begin re-prepares the bar while he signs; the old link's signature is never paired with the
+    # new record: the step says "reprepared", the bar holds no signature, and one more gesture lands the revoke
+    begun = rig.begin()
+
+    def reprepare_while_signing(message: bytes) -> str:
+        rig.world.clock.now += timedelta(seconds=1)     # the re-prepared record carries a later `at`
+        rig.begin()
+        return rig.sign(message)
+
+    step = aa.revoke_agent_sign(rig.store, begun.bar_id, reprepare_while_signing, clock=rig.clock)
+    row = rig.bar(begun)
+    assert (step.state, step.stands) == ("reprepared", False)
+    assert (row.pending_signature, row.pending_signed_at, row.attempts) == (None, None, 2)
+    done = rig.finish(rig.signed(step))
+    assert done.state == "landed" and rig.revokes() == done.seq
+
+
+def test_finish_after_its_own_link_landed_closes_the_bar_landed(rig):
+    # behaviour: the append committed and the process died before the close (c5); a later link moved the head. The
+    # retry meets StaleHead, finds the bar's exact link in the verified log, and closes the bar signed at its seq
+    signed = rig.signed(rig.begin())
+    row = rig.bar(signed)
+    link_ = auth.UnsignedLink(row.pending_seq, row.pending_prev, row.pending_record, row.pending_signer_fp)
+    auth.append(rig.cockpit, link_, row.pending_signature, now=rig.clock(), anchor=rig.anchor)
+    sign_agent_link(rig.world.root, link(rig.world, 3, agent=OTHER_AGENT), signer_fp=rig.fp, sign=rig.sign,
+                    clock=rig.clock)
+    assert rig.world.state().seq == row.pending_seq + 1
+    done = rig.finish(signed)
+    closed = rig.bar(signed)
+    assert (done.state, done.seq) == ("landed", row.pending_seq)
+    assert (closed.reason, closed.revoke_seq, closed.attempts) == ("signed", row.pending_seq, 1)
+
+
+def test_the_stale_head_reprepare_keeps_the_store_the_bar_was_begun_for(rig):
+    # behaviour: finish takes no store id; the re-prepare after a moved head names the store of the bar's own record
+    signed = rig.signed(rig.begin())
+    rig.world.clock.now += timedelta(days=1)
+    renew_agent_link(rig.world.root, LINK, life=timedelta(days=30), signer_fp=rig.fp, sign=rig.sign, clock=rig.clock,
+                     store_dir=rig.tmp / "none")
+    with pytest.raises(TypeError):
+        aa.revoke_agent_finish(rig.store, rig.cockpit, signed.bar_id, store_id="store-" + "cd" * 16,
+                               clock=rig.clock, anchor=rig.anchor)
+    stale = rig.finish(signed)
+    assert stale.state == "stale_head"
+    import json
+    assert json.loads(rig.bar(signed).pending_record)["agent_store_id"] == STORE
+
+
+def test_begin_refuses_a_store_id_that_is_not_the_autonomic_stores_own(rig):
+    # behaviour: the store's own meta row names its id; a begin for another id refuses before any bar is written
+    rig.store.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    rig.store.execute("INSERT INTO meta (key, value) VALUES ('store_id', ?)", ("store-" + "cd" * 16,))
+    with pytest.raises(aa.AgentAuthorityError, match="not this store's"):
+        rig.begin()
+    assert bars.open_bar_of(rig.store, AGENT) is None
+
+
+def test_a_verifier_that_cannot_run_is_raised_as_itself_never_as_a_refusal(rig, monkeypatch):
+    # behaviour: ssh-keygen failing to run is "retry", not "the log refused": finish re-raises VerifierUnavailable,
+    # records last_error verifier_unavailable and leaves the bar open; begin's prepare re-raises it too
+    signed = rig.signed(rig.begin())
+    real_append, real_prepare = auth.append, auth.prepare
+
+    def no_verifier(*args, **kw):
+        raise auth.VerifierUnavailable("ssh-keygen could not run")
+
+    monkeypatch.setattr(auth, "append", no_verifier)
+    with pytest.raises(auth.VerifierUnavailable):
+        rig.finish(signed)
+    row = rig.bar(signed)
+    assert row.closed_at is None and row.last_error == "verifier_unavailable"
+    assert row.pending_signature is not None
+    monkeypatch.setattr(auth, "append", real_append)
+    monkeypatch.setattr(auth, "prepare", no_verifier)
+    with pytest.raises(auth.VerifierUnavailable):
+        rig.begin()
+    monkeypatch.setattr(auth, "prepare", real_prepare)
+
+
+def test_a_bar_recovery_closed_signed_during_the_append_is_reported_landed(rig, monkeypatch):
+    # behaviour: R1 closes this bar signed at the link's seq between the append and finish's own close; the guarded
+    # close touches no row, and the step reads the frozen row and says landed, never landed_bar_abandoned
+    signed = rig.signed(rig.begin())
+    real = auth.append
+
+    def append_then_recover(*args, **kw):
+        out = real(*args, **kw)
+        ran = bars.recover(rig.store, aa.AgentAuthority(rig.world.root), rig.cockpit, now=rig.clock(),
+                           anchor=rig.anchor, store_id=STORE)
+        assert [o.row for o in ran] == ["R1"]
+        return out
+
+    monkeypatch.setattr(auth, "append", append_then_recover)
+    done = rig.finish(signed)
+    assert (done.state, done.stands) == ("landed", True)
+    assert (rig.bar(signed).reason, rig.bar(signed).revoke_seq) == ("signed", done.seq)
+
+
+def test_an_anchor_left_behind_is_said_in_the_landed_step(rig, monkeypatch):
+    # behaviour: the revoke committed and the anchor could not advance: the step is landed and its text says so
+    signed = rig.signed(rig.begin())
+
+    def anchor_fails(*args, **kw):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(auth, "advance_anchor", anchor_fails)
+    done = rig.finish(signed)
+    assert done.state == "landed" and "the anchor is behind" in done.text
