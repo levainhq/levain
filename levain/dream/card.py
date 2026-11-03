@@ -20,7 +20,7 @@ import hashlib
 import json
 import os
 import re
-import tempfile
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -223,13 +223,11 @@ def _write(path: Path, data: str) -> None:
     """Write ``data`` to ``path`` whole or not at all. The temporary file is this writer's own (two builders of one
     occurrence's card never share one), and the directory is made when it is missing."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    name = str(path.parent / f"{path.name}.{uuid.uuid4().hex}.tmp")        # this writer's own name, never shared
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)        # the kernel applies the umask; none is touched here
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(data)
-        umask = os.umask(0)             # mkstemp makes 0600; a plain write gives 0666 under the umask, so this does too
-        os.umask(umask)
-        os.chmod(name, 0o666 & ~umask)
         os.replace(name, path)
     except BaseException:
         with contextlib.suppress(OSError):
