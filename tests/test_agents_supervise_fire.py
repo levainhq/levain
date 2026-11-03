@@ -123,7 +123,10 @@ def test_only_the_supervisor_calls_the_agent_journal_effect_path():
             builders.add(path.name)
         if calls_effect(tree):
             effectors.add(path.name)
-    assert builders - {"agent_authority.py"} == {"supervise.py"}   # nobody else even names the fence builder
+    # qbroker/fence.py (the operator-uid fence service) builds the agent fence to ANSWER a fence question and never
+    # fires through the journal, so it is a named builder that must not be an effector
+    assert builders - {"agent_authority.py", "fence.py"} == {"supervise.py"}   # nobody else even names the fence builder
+    assert "fence.py" not in effectors
     assert "supervise.py" in effectors
     calls = calls_effect(ast.parse((LEVAIN / "agents" / "supervise.py").read_text()))
     assert len(calls) == 1
