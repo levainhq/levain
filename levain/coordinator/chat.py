@@ -79,7 +79,7 @@ __all__ = [
     "ATTACHMENTS_MAX", "AUTHOR_KINDS", "AUTHOR_SURFACES", "CHAT_SCHEMA", "COMPOSER_STATES", "EVENT_BODY_MAX",
     "EVENT_KINDS", "INTERRUPT_DEADLINE", "MODES", "OUTBOX_STATES", "PROBE_GAP", "PROBE_TRIES", "READ_DEADLINE",
     "RECIPIENTS", "CHECK_KINDS", "CHECK_SOURCES", "SEND_FAULT_POINTS", "ChatEvent", "ChatMessage", "ChatService",
-    "ChatStore", "Composer", "EventConflict", "Liveness", "MessageConflict", "OutboxRefused", "SendReceipt",
+    "ChatStore", "Composer", "EventConflict", "Liveness", "MessageConflict", "MessageThread", "OutboxRefused", "SendReceipt",
     "TimelineRow", "TurnLease", "TurnRefused", "TurnView", "Verdict", "body_sha256", "canary_verdict_id",
     "composer_state", "liveness", "outbox_state", "outbox_step", "record_check", "record_cursor", "record_event",
     "record_message", "timeline",
@@ -345,6 +345,16 @@ class ChatMessage:
     attachments: tuple[dict[str, Any], ...]
     draft_ref: str | None
     at: str
+
+
+@dataclass(frozen=True)
+class MessageThread:
+    """The routing facts of a stored message, for a reader that must not hold the row (see
+    :meth:`ChatService.message_thread`)."""
+    message_id: str
+    thread_id: str
+    launch_id: str | None
+    owner_epoch: int | None
 
 
 @dataclass(frozen=True)
@@ -2131,6 +2141,37 @@ class ChatService:
         attached = self._session(launch_id) is not None and launch_id not in self._wedged
         return self._chat._read(lambda conn: composer_state(conn, self._chat._opener._stamp(), launch_id, owner,
                                                             attached=attached))
+
+    # --- public verbs for a surface that composes and sends (the cockpit used to reach ``_chat`` and ``_session``) ----
+    def turn_view(self, launch_id: str, owner: str) -> TurnView:
+        """What ``owner``'s composer shows for the launch's turn (yours, free or taken), through the store's own
+        read; the value is a frozen view, so nothing the caller does to it reaches the lease."""
+        return self._chat.turn_view(launch_id, owner)
+
+    def turn_claim(self, launch_id: str, owner: str) -> int:
+        """``owner`` claims the launch's free turn; its epoch, for the :meth:`send` that follows. This is the same
+        lease claim the store makes (:func:`chat_lease.claim`, one write transaction): ``owner`` must be an
+        authenticated client, the launch a running worker, and no epoch live, else a refusal (CoordError). The epoch
+        it returns is then judged by :meth:`send`'s own preflight (the turn fence), exactly as an epoch claimed any
+        other way."""
+        return self._chat.turn_claim(launch_id, owner)
+
+    def turn_release(self, launch_id: str, epoch: int, owner: str) -> None:
+        """Give back an epoch ``owner`` claimed for a send that moved nothing; refused for an epoch that is not
+        ``owner``'s live one, as the store refuses."""
+        self._chat.turn_release(launch_id, epoch, owner)
+
+    def message_thread(self, outbox_id: str) -> MessageThread | None:
+        """Where the stored message with this client ``outbox_id`` went (thread, launch and the epoch it was sent
+        under), or None when none is stored: the lookup a resend is answered from. A copy of four fields, not the
+        stored row."""
+        m = self._chat._read(lambda conn: _message(conn, "outbox_id", outbox_id))
+        return None if m is None else MessageThread(m.message_id, m.thread_id, m.launch_id, m.owner_epoch)
+
+    def session(self, launch_id: str) -> Any:
+        """The driver session attached to the launch, or None. This is the live object (a reader asks its ``meta``);
+        a caller changes the launch's session only through :meth:`attach` and :meth:`detach`."""
+        return self._session(launch_id)
 
     def _watch(self, launch_id: str, session: Any, claude: bool, raws: Sequence[Any], seen: Sequence[Any],
                backfill: Sequence[bool], fresh: Sequence[bool], crossed: str | None,
