@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1101-receipts-3';
+const SW_VERSION = '1102-center-1';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -251,6 +251,19 @@ self.addEventListener('activate', (e) => e.waitUntil((async () => {
   await self.clients.claim();
 })()));
 
+// The app-icon badge: the push payload's `badge` is the open Needs-you count at send time (never a notice count), the only
+// source the worker has (it holds no credential). A plain int > 0 sets it, 0 clears it, anything else (absent, not an int)
+// leaves the icon as it is. Feature-detected and caught: a failing badge never touches the notification.
+function applyBadge(n) {
+  try {
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) return Promise.resolve();
+    const nav = self.navigator;
+    if (!nav) return Promise.resolve();
+    if (n > 0) return typeof nav.setAppBadge === 'function' ? Promise.resolve(nav.setAppBadge(n)).catch(() => {}) : Promise.resolve();
+    return typeof nav.clearAppBadge === 'function' ? Promise.resolve(nav.clearAppBadge()).catch(() => {}) : Promise.resolve();
+  } catch (_) { return Promise.resolve(); }
+}
+
 self.addEventListener('push', (e) => {
   const t0 = Date.now();
   let d = {};
@@ -270,6 +283,7 @@ self.addEventListener('push', (e) => {
       data: { url: d.url || '/', ping: d.ping },
     }));
   } catch (err) { shown = Promise.reject(err); }
+  const badged = applyBadge(d.badge);   // after the notification is asked for; its failure is its own
   trace('sw-version', { version: SW_VERSION, on: 'push' });
   trace('push', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
   const ping = typeof d.ping === 'number' ? d.ping : Number(d.ping);
@@ -282,7 +296,7 @@ self.addEventListener('push', (e) => {
                                  shown.then(() => sendReceipt(ping, 'shown', Date.now(), b, hashP), () => false)]);
     if (r.some((x) => x === true)) await drainReceipts(b);
   });
-  e.waitUntil(Promise.allSettled([shown, receipts]).finally(traceSettled));
+  e.waitUntil(Promise.allSettled([shown, badged, receipts]).finally(traceSettled));
   shown.catch((err) => trace('show-failed', { error: err && err.name || 'error' }));
 });
 

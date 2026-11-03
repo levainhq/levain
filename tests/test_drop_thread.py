@@ -262,7 +262,9 @@ def test_the_list_is_a_scroll_container_so_show_more_does_not_grow_the_page(tmp_
              " vh: innerHeight, doc: document.documentElement.scrollHeight, scrolls: document.querySelector('#ck-drop .drop-list').scrollHeight > document.querySelector('#ck-drop .drop-list').clientHeight})")
     expand = {"eval": "document.querySelector('#ck-drop .drop-more').click(); 1"}
     for kw in ({"w": 1280}, {"touch": True}):
-        steps = _boot(_init(_many(40)), [{"eval": probe}, expand, SETTLE, {"eval": probe}], **kw)
+        # the Devices zone (with Notify tokens, S4.2) draws itself at its own first read: the page is measured after that, so it is not what grows
+        steps = _boot(_init(_many(40)), [{"until": "document.querySelector('.nf-panel') && !document.querySelector('.nf-panel').hidden && 1", "ms": 30000}, SETTLE,
+                                         {"eval": probe}, expand, SETTLE, {"eval": probe}], **kw)
         before, after = _all(_run(tmp_path / ("touch" if kw.get("touch") else "wide"), monkeypatch, steps))
         assert before["oy"] == "auto" and after["oy"] == "auto", (kw, before)
         assert after["list"] <= after["vh"] * 0.6 + 1 and after["scrolls"] is True, (kw, after)
