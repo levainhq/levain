@@ -122,3 +122,48 @@ def test_silence_is_judged_once_per_agent_after_every_walk(tmp_path):
         _set_cursor(store, ag, "2026-11-02T05:00:00Z")
     out = ctl.tick(store, _clock([LATE]), _armed)
     assert sorted(out.silent) == sorted([tc.AG, other]) and len(out.silent) == 2
+
+
+NOV_3 = T0 + timedelta(hours=18)  # 06:00Z on Nov 3, local 01:00: the second local date's first hour
+
+
+def test_a_late_no_slot_close_of_an_already_counted_window_counts_once_and_keeps_the_order(tmp_path):
+    # codex r2 MED, reproduced: 12:00 on Nov 2 stays admitted while a slot is free, the walks count Nov 2 and Nov 3,
+    # then the cap fills and the old 12:00 closes as no_slot with a marker older than every one already counted
+    store = _store(tmp_path)
+    _set_cursor(store, tc.AG, "2026-11-02T11:40:00Z")
+    assert ctl.tick(store, _clock([T0]), _armed).claimed == [(tc.AG, "2026-11-02T12:00:00Z")]
+    walked = ctl.tick(store, _clock([NOV_3 + timedelta(minutes=19)]), _armed)
+    assert walked.no_slot == [] and walked.missed_windows[tc.AG] == ["d:2026-11-02", "d:2026-11-03"]
+    assert _streak(store) == 2
+    with store.write() as c:
+        for i in (1, 2):
+            slots.take(c, slots.OCCURRENCE, f"held-{i}", NOV_3 + timedelta(minutes=19))
+    late = ctl.tick(store, _clock([NOV_3 + timedelta(minutes=19, seconds=30)]), _armed)  # before 06:20 is claimed
+    assert late.no_slot == [(tc.AG, "2026-11-02T12:00:00Z")] and late.claimed == [] and _streak(store) == 2
+    _ended(store, "k-done", "done", "completed", launched=True, at=NOV_3 - timedelta(hours=2))
+    assert _streak(store) == 1  # the done sits between the two windows: Nov 2 is still the older one
+
+
+def test_one_window_seen_by_a_walk_and_then_by_a_no_slot_close_counts_once(tmp_path):
+    store = _store(tmp_path)
+    _set_cursor(store, tc.AG, "2026-11-02T11:40:00Z")
+    ctl.tick(store, _clock([T0]), _armed)  # 12:00 admitted, a slot free, so it stays admitted past its grace
+    assert ctl.tick(store, _clock([T0 + timedelta(minutes=39)]), _armed).missed_windows[tc.AG] == ["d:2026-11-02"]
+    with store.write() as c:
+        for i in (1, 2):
+            slots.take(c, slots.OCCURRENCE, f"held-{i}", T0 + timedelta(minutes=39))
+    out = ctl.tick(store, _clock([T0 + timedelta(minutes=39)]), _armed)
+    assert out.no_slot == [(tc.AG, "2026-11-02T12:00:00Z")] and _streak(store) == 1
+
+
+def test_an_unreadable_streak_value_reads_as_0_and_the_next_miss_starts_over(tmp_path):
+    store = _store(tmp_path)
+    for junk in (b"\xff\x00", 7, "2|d:2026-11-02|2026-11-02T12:00:00Z", '[["2026-11-02T12:00:00Z"]]'):
+        with store.write() as c:
+            c.execute("INSERT INTO agent_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET"
+                      " value = excluded.value", (ctl.STREAK_PREFIX + tc.AG, junk))
+        assert _streak(store) == 0
+    _set_cursor(store, tc.AG, "2026-11-02T05:00:00Z")
+    ctl.tick(store, _clock([LATE]), _armed)
+    assert _streak(store) == 1

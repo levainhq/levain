@@ -53,6 +53,7 @@ LEASE_S = 900  # A0 r7 section 2.3 [judged]: the coordinator slot's lease
 
 CURSOR_PREFIX = "tick_cursor:"
 STREAK_PREFIX = "miss_streak:"
+STREAK_CAP = 16  # P6-2b r2 [judged]: the counted windows kept per agent; a longer streak reads as this many
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -169,16 +170,21 @@ def _admitted_since(kind: str, key: str, admitted_at: str) -> datetime | None:
         return None
 
 
-def close_no_slot(conn: sqlite3.Connection, now: datetime,
-                  over: Collection[str] = ()) -> list[tuple[str, str, str, str]]:
+def close_no_slot(conn: sqlite3.Connection, now: datetime, over: Collection[str] = ()) -> list[tuple[str, str]]:
     """End as ``missed`` / ``no_slot`` every ``admitted`` occurrence past its grace while the cap is full (A0 §2.4:
-    a named occurrence is retried each tick, and only the grace running out ends it). Returns ``(agent_id, key,
-    window_key, marker)``, ``marker`` being the instant its grace began (:func:`_admitted_since`); each close reaches
-    the miss streak in this same transaction.
+    a named occurrence is retried each tick, and only the grace running out ends it). Returns ``(agent_id, key)``;
+    each close reaches the miss streak in this same transaction.
     It reclaims the expired coordinator leases in ``over`` (probed by the caller, :func:`slots.probe_over`) first, and
     does nothing while a slot is free: an occurrence still admitted past grace with a slot free was not left by the
     cap, so ``no_slot`` would be a false reason. A cap nobody can read decides nothing here: the tick goes on for
     the other agents and the occurrences stay admitted. Runs in the caller's write transaction."""
+    return [(agent_id, key) for agent_id, key, _, _ in _close_no_slot_detailed(conn, now, over)]
+
+
+def _close_no_slot_detailed(conn: sqlite3.Connection, now: datetime,
+                            over: Collection[str] = ()) -> list[tuple[str, str, str, str]]:
+    """:func:`close_no_slot`, returning ``(agent_id, key, window_key, marker)`` for :func:`tick`'s report, ``marker``
+    being the instant the occurrence's grace began (:func:`_admitted_since`)."""
     try:
         if slots.free(conn, now, over) > 0:
             return []
@@ -186,7 +192,7 @@ def close_no_slot(conn: sqlite3.Connection, now: datetime,
         return []
     at = _stamp(now)
     closed = []
-    misses: dict[str, list[tuple[str, str, bool]]] = {}
+    misses: dict[str, list[tuple[str, str]]] = {}
     for oid, agent_id, kind, key, admitted_at, window in conn.execute(
             "SELECT occurrence_id, agent_id, kind, key, admitted_at, window_key FROM agent_occurrences"
             " WHERE state = 'admitted' ORDER BY admitted_at, occurrence_id").fetchall():
@@ -197,7 +203,9 @@ def close_no_slot(conn: sqlite3.Connection, now: datetime,
                      " WHERE occurrence_id = ? AND state = 'admitted'", (at, oid))
         slots.release(conn, oid)  # an admitted occurrence holds nothing (A0 §2.4), so this frees nothing today
         closed.append((agent_id, key, window, _stamp(since)))
-        misses.setdefault(agent_id, []).append((window, _stamp(since), kind == "scheduled"))
+        # a scheduled miss is counted by its schedule window, a manual one by its own occurrence
+        misses.setdefault(agent_id, []).append(
+            (window if kind == "scheduled" else "occurrence:" + oid, _stamp(since)))
     for agent_id, theirs in misses.items():
         _record_misses(conn, agent_id, theirs)
     return closed
@@ -226,7 +234,7 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
         expired = slots.expired_launches(conn, now)
     over = slots.probe_over(expired, launch_over, session_alive)  # outside any write lock: a probe can be slow
     with store.write() as conn:
-        for agent_id, key, window, _ in close_no_slot(conn, now, over):
+        for agent_id, key, window, _ in _close_no_slot_detailed(conn, now, over):
             out.no_slot.append((agent_id, key))
             out.missed[agent_id] = out.missed.get(agent_id, 0) + 1
             _report_windows(out, agent_id, [window])
@@ -259,8 +267,10 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
         _walk(store, agent_id, snap, trigger, binding, cursor, floor, now, out)
     # judged once per agent, after every close and walk of this pass: a whole stretch went by and this one pass is
     # the first to see it
+    # an agent whose state moved mid-pass may have fired in a chunk that never ran, so it is not judged silent
     fired = {a for a, _ in out.claimed + out.overlapped + out.duplicates}
-    out.silent.extend(a for a in out.missed_windows if a not in fired)
+    moved = set(out.changed)
+    out.silent.extend(a for a in out.missed_windows if a not in fired and a not in moved)
     return out
 
 
@@ -273,62 +283,69 @@ def _report_windows(out: TickResult, agent_id: str, windows: list[str]) -> None:
             known.add(window)
 
 
-def _read_streak(conn: sqlite3.Connection, agent_id: str) -> tuple[int, str, str] | None:
+def _read_streak(conn: sqlite3.Connection, agent_id: str) -> list[tuple[str, str]] | None:
+    """The counted misses as ``(marker, identity)`` in time order, or ``None`` when absent or unreadable: no streak is
+    claimed on a value nobody can read."""
     row = conn.execute("SELECT value FROM agent_settings WHERE key = ?", (STREAK_PREFIX + agent_id,)).fetchone()
     if row is None:
         return None
     try:
-        count, window, at = row[0].split("|", 2)
-        return int(count), window, at
-    except ValueError:
-        return None  # unreadable: no streak is claimed on a value nobody can read
+        entries = []
+        for marker, identity in json.loads(row[0]):
+            if not isinstance(marker, str) or not isinstance(identity, str):
+                raise ValueError("a streak entry is two strings")
+            entries.append((marker, identity))
+        return sorted(entries)
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
-def _record_misses(conn: sqlite3.Connection, agent_id: str, misses: list[tuple[str, str, bool]]) -> None:
-    """``misses`` is ``(window_key, marker, scheduled)``: ``marker`` is the instant the miss is dated by (a scheduled
-    slot's own key, a manual occurrence's admission). A window counts once however many of its slots went by (a
-    closed-lid night is one miss), and a window already counted by an earlier chunk or tick is not counted twice. A
-    manual miss has no schedule window: it counts once and leaves the window dedup alone.
+def _last_done(conn: sqlite3.Connection, agent_id: str) -> str | None:
+    """The latest ``done`` run's admission; a ``skipped-no-input`` neither counts nor clears (BUILD_PLAN gate
+    counting)."""
+    return conn.execute("SELECT MAX(admitted_at) FROM agent_occurrences WHERE agent_id = ? AND state = 'done'",
+                        (agent_id,)).fetchone()[0]
 
-    Design (P6-2b r1): the counter stays a stored record, not a derivation, because a walk's missed slots are never
-    written as rows (only ``no_slot`` closes are), so the windows cannot be read back. It is written in the same
-    BEGIN IMMEDIATE transaction as the walk chunk or the close that produced the misses, read after that lock, and the
-    reset is applied per miss in time order: a ``done`` run admitted at or after the previous miss and before this
-    one ends the streak before this one counts."""
+
+def _since_done(entries: list[tuple[str, str]], last_done: str | None) -> list[tuple[str, str]]:
+    # a done run admitted at or after a miss's marker ends the streak up to that miss
+    return entries if last_done is None else [e for e in entries if e[0] > last_done]
+
+
+def _record_misses(conn: sqlite3.Connection, agent_id: str, misses: list[tuple[str, str]]) -> None:
+    """``misses`` is ``(identity, marker)``: ``identity`` is a scheduled miss's window key or a manual occurrence's
+    own, ``marker`` the instant the miss is dated by (a scheduled slot's own key, a manual occurrence's admission). An
+    identity counts once however many of its slots went by (a closed-lid night is one miss) and whichever path saw it
+    first: a walk, or a ``no_slot`` close arriving after later windows were counted.
+
+    Design (P6-2b r2): the record is the bounded, time-ordered set of counted ``(marker, identity)`` pairs, and the
+    streak is derived from it when read: the pairs whose marker is after the latest ``done`` run's admission. A late
+    marker goes in at its place in time if its identity is absent and is ignored if present, so it never reorders or
+    re-counts the streak (r1's ``count + last`` could not tell an older window from a new one). The set keeps the
+    newest :data:`STREAK_CAP` pairs, so a longer streak reads as that many; the gauge fires at 2. It stays a stored
+    record because a walk's missed slots are never written as rows (only ``no_slot`` closes are), and it is read and
+    written inside the BEGIN IMMEDIATE transaction of the walk chunk or close that produced the misses."""
     if not misses:
         return
     if not conn.in_transaction:
         raise RuntimeError("the miss streak is written inside the caller's write transaction")
-    misses = sorted(misses, key=lambda m: m[1])
-    prior = _read_streak(conn, agent_id)
-    count, last, at = prior if prior else (0, "", "")
-    done = [r[0] for r in conn.execute(
-        "SELECT admitted_at FROM agent_occurrences WHERE agent_id = ? AND state = 'done' AND admitted_at >= ?"
-        " AND admitted_at < ? ORDER BY admitted_at", (agent_id, at, misses[-1][1]))]
-    for window, marker, scheduled in misses:
-        if bisect.bisect_left(done, at) < bisect.bisect_left(done, marker):  # a done in [at, marker)
-            count, last = 0, ""
-        if not scheduled:
-            count += 1
-        elif window != last:
-            count, last = count + 1, window
-        at = max(at, marker)  # a manual miss dated before the last one never moves the clear point back
+    last_done = _last_done(conn, agent_id)
+    entries = _since_done(_read_streak(conn, agent_id) or [], last_done)  # what a done cleared is dropped here
+    known = {identity for _, identity in entries}
+    for identity, marker in sorted(misses, key=lambda m: m[1]):  # a window's earliest slot in this batch dates it
+        if identity in known or (last_done is not None and marker <= last_done):
+            continue
+        bisect.insort(entries, (marker, identity))
+        known.add(identity)
     conn.execute("INSERT INTO agent_settings (key, value) VALUES (?, ?)"
                  " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                 (STREAK_PREFIX + agent_id, f"{count}|{last}|{at}"))
-
-
-def _cleared(conn: sqlite3.Connection, agent_id: str, since: str) -> bool:
-    """A ``done`` run admitted at or after the last miss's marker ends the streak; a ``skipped-no-input`` neither
-    counts nor clears (BUILD_PLAN gate counting)."""
-    return conn.execute("SELECT 1 FROM agent_occurrences WHERE agent_id = ? AND state = 'done' AND admitted_at >= ?",
-                        (agent_id, since)).fetchone() is not None
+                 (STREAK_PREFIX + agent_id, json.dumps([list(e) for e in entries[-STREAK_CAP:]])))
 
 
 def miss_streak(conn: sqlite3.Connection, agent_id: str) -> int:
-    """Consecutive windows with a missed slot and no ``done`` run since; 0 when none or the record is unreadable."""
-    row = _read_streak(conn, agent_id)
-    return 0 if row is None or _cleared(conn, agent_id, row[2]) else row[0]
+    """Consecutive windows with a missed slot and no ``done`` run since, at most :data:`STREAK_CAP`; 0 when none or
+    the record is unreadable."""
+    return len(_since_done(_read_streak(conn, agent_id) or [], _last_done(conn, agent_id)))
 
 
 def _walk(store: AgentStore, agent_id: str, snap: tuple, trigger: dict, binding: str, cursor: datetime,
@@ -348,14 +365,14 @@ def _walk(store: AgentStore, agent_id: str, snap: tuple, trigger: dict, binding:
                 # first seen NOW, whichever chunk the slot sits in
                 if schedule.classify(slot, now) != schedule.DUE:
                     out.missed[agent_id] = out.missed.get(agent_id, 0) + 1
-                    misses.append((schedule.window_key(trigger, zone, slot), key, True))
+                    misses.append((schedule.window_key(trigger, zone, slot), key))
                     continue
                 _, outcome = claim(conn, agent_id=agent_id, kind="scheduled", key=key, spec_hash=snap[3],
                                    binding_id=binding, window_key=schedule.window_key(trigger, zone, slot), now=now)
                 {CLAIMED: out.claimed, OVERLAP: out.overlapped, DUPLICATE: out.duplicates}[outcome].append(
                     (agent_id, key))
             _record_misses(conn, agent_id, misses)
-            _report_windows(out, agent_id, [w for w, _, _ in misses])
+            _report_windows(out, agent_id, [w for w, _ in misses])
             _set_cursor(conn, agent_id, upto)
         cursor = upto
 
