@@ -344,15 +344,16 @@ def test_a_store_this_user_cannot_enter_installs_nothing(host, capsys):
     import os
     store = host.tmp / "locked-store"
     store.mkdir()
-    store.chmod(0o000)
-    try:
-        if os.access(store, os.X_OK):
-            pytest.skip("this user can enter a mode-000 directory (root)")
-        rc = A.run_fence_start(argparse.Namespace(path=host.install, store_dir=store))
-        err = capsys.readouterr().err
-        assert rc == 1 and "not a directory this user can enter" in err and host.provider.installed == []
-    finally:
-        store.chmod(0o700)
+    for mode in (0o000, 0o500):   # not enterable at all, and enterable but not writable (the fence writes its store)
+        store.chmod(mode)
+        try:
+            if os.access(store, os.W_OK):
+                pytest.skip("this user can write a read-only directory (root)")
+            rc = A.run_fence_start(argparse.Namespace(path=host.install, store_dir=store))
+            err = capsys.readouterr().err
+            assert rc == 1 and "not a directory this user can enter and write" in err and host.provider.installed == []
+        finally:
+            store.chmod(0o700)
 
 
 def test_start_refuses_and_installs_nothing_when_the_agent_store_cannot_be_created(host, capsys):

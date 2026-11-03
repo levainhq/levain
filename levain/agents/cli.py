@@ -818,8 +818,9 @@ def _ensure_fence_store(spec) -> None:
     except OSError as exc:
         raise FenceSetupError(f"the agent store {store} does not exist and could not be created "
                               f"({type(exc).__name__}: {exc}); nothing was installed") from exc
-    if not (store.is_dir() and os.access(store, os.R_OK | os.X_OK)):
-        raise FenceSetupError(f"the agent store {store} is not a directory this user can enter; nothing was installed")
+    if not (store.is_dir() and os.access(store, os.R_OK | os.W_OK | os.X_OK)):
+        raise FenceSetupError(f"the agent store {store} is not a directory this user can enter and write; "
+                              "nothing was installed")
 
 
 def refresh_fence_after_update(install: Path, *, provider=None, **kw) -> str | None:
