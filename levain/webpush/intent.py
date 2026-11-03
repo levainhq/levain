@@ -45,7 +45,7 @@ from levain.webpush.presence import (ACTIVE_WINDOW_SECS, COORDINATOR_WORDS, MAX_
 __all__ = ["VERSION", "FILE_NAME", "BACKUP_DIR", "DEVICES", "LETS", "LETS_CLASSES", "FOLLOW_DEFAULT", "FOLLOW_MIN",
            "FOLLOW_MAX", "PRESET_TABLE", "overlay_active", "overlay_ended", "devices_on_now", "decide", "read", "view",
            "describe_line", "approvals_to_devices", "approvals_route", "approval_notice", "apply_preset", "apply_settings", "read_changes", "migrate",
-           "unmigrate", "legacy_word", "from_legacy"]
+           "unmigrate", "legacy_word", "from_legacy", "read_sample"]
 
 VERSION = 1
 FILE_NAME = "intent.json"
@@ -345,6 +345,20 @@ def _sample(queue_dir: Path | str | None, now: float, idle: Callable[[], float |
         remote = presence.read_remote_activity(queue_dir, now)
     return {"rec": rec, "now": now, "raw": raw_idle, "reading": reading, "msg_at": msg["at"] if msg else None,
             "remote": remote}
+
+
+def read_sample(queue_dir: Path | str | None, now: float | None = None,
+                idle: Callable[[], float | None] | None = None) -> dict:
+    """The ONE public reading of the presence rule's inputs, for callers outside levain (flow's phone bridge). One sample:
+    ``record`` (a :func:`read` result), ``reading`` (the laptop's input idle seconds, a desk message counted in; ``None``
+    when unknown), ``last_input_at`` (that reading as a clock time), ``desk_message_at``, ``remote`` (the fresh
+    remote-activity record or ``None``), ``overlay_active`` (whether the record's overlay stands at ``now``) and ``now``.
+    Raises what :func:`read` and the sensor raise; callers decide how a fault reads."""
+    t = time.time() if now is None else now
+    smp = _sample(queue_dir, t, idle)
+    last = _last_input(t, smp["reading"])
+    return {"record": smp["rec"], "reading": smp["reading"], "last_input_at": last, "desk_message_at": smp["msg_at"],
+            "remote": smp["remote"], "overlay_active": overlay_active(smp["rec"], t, last, smp["msg_at"]), "now": t}
 
 
 def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Callable[[], float | None] | None,

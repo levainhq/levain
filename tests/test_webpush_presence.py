@@ -799,3 +799,25 @@ def test_a_remote_turn_after_away_still_pushes_and_follow_with_fresh_remote_stil
         (q2 / "webpush" / presence.REMOTE_NAME).write_text(json.dumps({"at": NOW - 30.0, "source": source}))
         got2 = presence.should_push(q2, "ping", now=NOW, idle=lambda: 0.0, suggest=False)
         assert got2.push is True and got2.state == "pushing" and "remote" in got2.why, (source, got2)
+
+
+def test_read_sample_is_the_one_public_reading_of_the_rules_inputs(tmp_path):
+    """flow's phone bridge reads presence through ONE public function, not intent's private helpers: the record, the idle
+    reading (a desk message counted in), the desk message time, the remote record, the overlay's standing."""
+    q = tmp_path / "q"
+    (q / "webpush").mkdir(parents=True, mode=0o700)
+    intent._write_record(q, {"base": _rec()["base"], "overlay": AWAY(ts=NOW - 1000)})
+    (q / "webpush" / presence.REMOTE_NAME).write_text(json.dumps({"at": NOW - 30.0, "source": "remote-terminal"}))
+    got = intent.read_sample(q, NOW, lambda: 5.0)
+    assert set(got) == {"record", "reading", "last_input_at", "desk_message_at", "remote", "overlay_active", "now"}
+    assert got["record"]["status"] == "file" and got["reading"] == 5.0 and got["last_input_at"] == NOW - 5.0
+    assert got["desk_message_at"] is None and got["remote"]["source"] == "remote-terminal" and got["now"] == NOW
+    assert got["overlay_active"] is True   # 2a: sensed laptop input (5 s ago) does not end an away word
+    from levain.webpush import desk
+
+    desk.note_desk_message(q, "test-hook", now=NOW + 10)
+    after = intent.read_sample(q, NOW + 20, lambda: 500.0)
+    assert after["desk_message_at"] == NOW + 10 and after["overlay_active"] is False   # a typed turn ends it
+    q2 = tmp_path / "q2"
+    (q2 / "webpush").mkdir(parents=True, mode=0o700)
+    assert intent.read_sample(q2, NOW, lambda: None)["reading"] is None   # no sensor, no desk message: unknown
