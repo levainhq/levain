@@ -19,10 +19,15 @@ from levain.slot import layout
 class FakeProvider:
     def __init__(self) -> None:
         self.installed: list[daemon.DaemonSpec] = []
+        self.on_disk: list[str] | None = None     # the argv of the unit already installed (None: no unit)
 
     def install(self, spec: daemon.DaemonSpec) -> str:
         self.installed.append(spec)
+        self.on_disk = list(spec.argv)
         return f"installed {spec.label}\n  status: running"
+
+    def installed_argv(self, label: str) -> list[str] | None:
+        return self.on_disk
 
     def status(self, label: str) -> daemon.DaemonStatus:
         return daemon.DaemonStatus(installed=bool(self.installed), running=bool(self.installed), detail="fake")
@@ -149,6 +154,127 @@ def test_a_failed_fence_install_is_said_and_never_fails_the_update(host, monkeyp
     assert len(lines) == 1 and "could not be installed" in lines[0] and "levain agents fence start" in lines[0]
 
 
+# --- two installs on one host (P7-2 wiring r2, codex HIGH): one fence unit, one install's roots ------------------
+
+def _other_install(host) -> Path:
+    other = host.tmp / "other-entity"
+    (other / ".levain").mkdir(parents=True)
+    return other
+
+
+def _update(host, monkeypatch) -> list[str]:
+    from levain import band_hook, update
+
+    (host.install / ".levain").mkdir(exist_ok=True)
+    monkeypatch.setattr(update, "_run_update", lambda path, **kw: 0)
+    monkeypatch.setattr(band_hook, "refresh_after_update", lambda: None)
+    lines: list[str] = []
+    assert update.run_update(host.install, emit=lines.append) == 0
+    return lines
+
+
+def test_update_leaves_a_unit_that_fences_another_install_and_says_so(host, monkeypatch):
+    other = _other_install(host)
+    host.provider.on_disk = A.fence_spec(other).argv          # install B's unit is the one on this host
+    lines = _update(host, monkeypatch)
+    assert host.provider.installed == []                       # A's update never replaced it
+    [line] = lines
+    _, mine = A.fence_roots(host.install)
+    _, theirs = A.fence_roots(other)
+    assert str(mine) in line and str(theirs) in line
+    assert f"levain agents fence start --path {host.install.resolve()}" in line
+    assert host.provider.on_disk == A.fence_spec(other).argv
+
+
+def test_update_leaves_a_unit_whose_agent_store_differs(host, monkeypatch):
+    host.provider.on_disk = A.fence_spec(host.install, agent_store=host.tmp / "elsewhere").argv
+    [line] = _update(host, monkeypatch)
+    assert host.provider.installed == [] and str((host.tmp / "elsewhere").resolve()) in line
+
+
+def test_update_with_the_same_roots_reinstalls_idempotently(host, monkeypatch):
+    host.provider.on_disk = A.fence_spec(host.install).argv
+    lines = _update(host, monkeypatch) + _update(host, monkeypatch)
+    first, second = host.provider.installed
+    assert first == second and lines == [f"agent fence: installed {daemon.DEFAULT_FENCE_LABEL}"] * 2
+
+
+def test_update_leaves_a_unit_it_cannot_read_and_says_so(host, monkeypatch):
+    def unreadable(label):
+        raise daemon.DaemonError("the plist is not a plist")
+    host.provider.installed_argv = unreadable
+    [line] = _update(host, monkeypatch)
+    assert host.provider.installed == []
+    assert "could not be read" in line and "the plist is not a plist" in line
+    assert "levain agents fence start" in line
+
+
+def test_update_leaves_a_unit_that_is_not_a_fence_units_shape(host, monkeypatch):
+    host.provider.on_disk = ["/usr/bin/python3", "-m", "something.else"]
+    [line] = _update(host, monkeypatch)
+    assert host.provider.installed == [] and "could not be read" in line
+
+
+def test_explicit_start_replaces_another_installs_unit_and_names_both_roots(host, capsys):
+    other = _other_install(host)
+    host.provider.on_disk = A.fence_spec(other).argv
+    rc, out = _start(host, capsys)
+    assert rc == 0, out.err
+    [spec] = host.provider.installed
+    assert spec == A.fence_spec(host.install)
+    _, mine = A.fence_roots(host.install)
+    _, theirs = A.fence_roots(other)
+    assert f"replacing the fence unit for {theirs}" in out.out and str(mine) in out.out
+
+
+def test_explicit_start_replaces_a_unit_it_cannot_read(host, capsys):
+    def unreadable(label):
+        raise daemon.DaemonError("garbled")
+    host.provider.installed_argv = unreadable
+    rc, out = _start(host, capsys)
+    assert rc == 0 and len(host.provider.installed) == 1 and "could not be read" in out.out
+
+
+def test_explicit_start_on_the_same_roots_says_nothing_extra(host, capsys):
+    assert _start(host, capsys)[0] == 0
+    rc, out = _start(host, capsys)
+    assert rc == 0 and "replacing" not in out.out and "could not be read" not in out.out
+
+
+# --- reading an installed unit back, through the real providers ----------------------------------------------
+
+_ODD = ["/opt/py thon/bin/python3", "-m", daemon.FENCE_MODULE, "--agent-store", "/a/100%/$HOME/s'q\\x",
+        "--cockpit-root", "/c/root", "--run", "/r"]
+
+
+def _odd_spec(tmp: Path) -> daemon.DaemonSpec:
+    return daemon.DaemonSpec(label=daemon.DEFAULT_FENCE_LABEL, argv=list(_ODD), working_dir=tmp, env={"PATH": "/bin"},
+                             stdout_log=tmp / "o.log", stderr_log=tmp / "e.log")
+
+
+def test_launchd_reads_back_the_argv_it_rendered(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon.LaunchdProvider, "UNIT_DIR", tmp_path)
+    p = daemon.LaunchdProvider()
+    assert p.installed_argv(daemon.DEFAULT_FENCE_LABEL) is None
+    (tmp_path / f"{daemon.DEFAULT_FENCE_LABEL}.plist").write_text(p.render_unit(_odd_spec(tmp_path)))
+    assert p.installed_argv(daemon.DEFAULT_FENCE_LABEL) == _ODD
+    (tmp_path / f"{daemon.DEFAULT_FENCE_LABEL}.plist").write_text("not a plist")
+    with pytest.raises(daemon.DaemonError):
+        p.installed_argv(daemon.DEFAULT_FENCE_LABEL)
+
+
+def test_systemd_reads_back_the_argv_it_rendered(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon.SystemdUserProvider, "UNIT_DIR", tmp_path)
+    p = daemon.SystemdUserProvider()
+    assert p.installed_argv(daemon.DEFAULT_FENCE_LABEL) is None
+    unit = tmp_path / f"{daemon.DEFAULT_FENCE_LABEL}.service"
+    unit.write_text(p.render_unit(_odd_spec(tmp_path)))
+    assert p.installed_argv(daemon.DEFAULT_FENCE_LABEL) == _ODD
+    unit.write_text("[Service]\nType=simple\n")
+    with pytest.raises(daemon.DaemonError):
+        p.installed_argv(daemon.DEFAULT_FENCE_LABEL)
+
+
 # --- the real launchd provider, launchctl recorded ------------------------------------------------------------
 
 def test_start_through_the_launchd_provider_bootstraps_and_kickstarts(host, capsys, monkeypatch):
@@ -168,6 +294,11 @@ def test_start_through_the_launchd_provider_bootstraps_and_kickstarts(host, caps
         assert rc == 0, out.err
     plist = host.tmp / "LaunchAgents" / f"{daemon.DEFAULT_FENCE_LABEL}.plist"
     assert plist.is_file() and str(host.R) in plist.read_text()
+    # a second install's update reads the plist the first wrote and leaves it, with no launchctl call at all
+    before = list(calls)
+    lines = _update(argparse.Namespace(**{**vars(host), "install": _other_install(host)}), monkeypatch)
+    assert calls == before and len(lines) == 1 and "left alone" in lines[0] and str(host.R) in plist.read_text()
+    assert str(A.fence_roots(host.install)[1]) in plist.read_text()
     verbs = [c[1] for c in calls if c[0] == "launchctl"]
     # each start: bootout, bootstrap, kickstart -k (the start), then the status read
     kick = [c for c in calls if c[:3] == ["launchctl", "kickstart", "-k"]]

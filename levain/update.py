@@ -81,7 +81,8 @@ def run_update(
             # P7-2 wiring: the operator's agent fence unit names this interpreter and this install's cockpit root, and
             # the queue broker refuses every dispatch GATE while it is down; update re-installs it through the same
             # provider install `levain agents fence start` uses (idempotent). Hosts without the isolation install
-            # have nothing to fence. Said, never the reason the update fails.
+            # have nothing to fence. P7-2 wiring r2: a unit holding another install's roots, or one it cannot read,
+            # is left alone and said (one host has one fence unit). Said, never the reason the update fails.
             from levain.agents.cli import refresh_fence_after_update
             fence_line = refresh_fence_after_update(install)
             if fence_line:

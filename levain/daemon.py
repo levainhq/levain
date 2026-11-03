@@ -513,6 +513,13 @@ class DaemonProvider(ABC):
     def restart(self, label: str) -> str:
         """Restart the running service (pick up new code / a crashed instance)."""
 
+    @abstractmethod
+    def installed_argv(self, label: str) -> list[str] | None:
+        """The argv of the unit on disk for ``label``, read back from the unit file (no service-manager call), or
+        None when no unit file exists. Raises :class:`DaemonError` when a unit file exists but its argv cannot be
+        read. Added for the agent fence (P7-2 wiring r2): ``levain update`` reads the installed fence unit's roots
+        before it would replace them."""
+
 
 def _run(cmd: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
     from levain.launch import child_env
@@ -701,6 +708,25 @@ class LaunchdProvider(DaemonProvider):
                         else f"NOT yet running ({st.detail}) — check the log at {spec.stdout_log}")
         return (f"installed {spec.label}\n  unit:   {plist_path}\n"
                 f"  domain: {domain} (per-user, no sudo)\n  status: {run_line}")
+
+    def installed_argv(self, label: str) -> list[str] | None:
+        import plistlib
+
+        path = self._plist_path(label)
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise DaemonError(f"{path} could not be read: {exc}") from exc
+        try:
+            doc = plistlib.loads(data)
+        except Exception as exc:   # noqa: BLE001 - plistlib raises several types for a malformed file
+            raise DaemonError(f"{path} is not a readable plist: {exc}") from exc
+        argv = doc.get("ProgramArguments") if isinstance(doc, dict) else None
+        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+            raise DaemonError(f"{path} has no ProgramArguments list of strings")
+        return list(argv)
 
     def uninstall(self, label: str) -> str:
         _refuse_root()
@@ -1210,6 +1236,27 @@ class SystemdUserProvider(DaemonProvider):
         return (f"installed {spec.label}\n  unit:   {units}\n"
                 f"  domain: systemd --user (per-user, no sudo)\n"
                 f"  linger: {linger}\n  status: {run_line}")
+
+    def installed_argv(self, label: str) -> list[str] | None:
+        """The inverse of :meth:`render_unit`'s ``ExecStart`` line: undo :func:`_systemd_exec_arg`'s doubling of
+        ``\\``, ``%`` and ``$`` in one left-to-right pass, then ``shlex.split`` the quoted words."""
+        path = self._service_path(label)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError) as exc:
+            raise DaemonError(f"{path} could not be read: {exc}") from exc
+        lines = [ln[len("ExecStart="):] for ln in text.splitlines() if ln.startswith("ExecStart=")]
+        if len(lines) != 1:
+            raise DaemonError(f"{path} has {len(lines)} ExecStart lines, not one")
+        try:
+            argv = shlex.split(re.sub(r"\\\\|%%|\$\$", lambda m: m.group(0)[0], lines[0]))
+        except ValueError as exc:
+            raise DaemonError(f"{path}'s ExecStart could not be split: {exc}") from exc
+        if not argv:
+            raise DaemonError(f"{path}'s ExecStart is empty")
+        return argv
 
     def uninstall(self, label: str) -> str:
         _refuse_root()
