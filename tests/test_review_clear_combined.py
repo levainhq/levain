@@ -268,6 +268,23 @@ def test_the_phone_queue_draws_an_item_whose_body_is_not_an_object(tmp_path) -> 
     assert {i["item_id"]: i["text"] for i in view["open"]} == {page.open[0].item_id: "fine", "rv-" + "1" * 32: ""}
 
 
+def test_an_agent_card_has_its_text_on_the_phone_in_the_panels_order(tmp_path) -> None:
+    from datetime import datetime, timezone
+
+    from levain.coordinator.phone import CoordPhone
+
+    store = CoordStore(_dir(tmp_path))
+    review.file_item(store, "agent", {"reason": "why", "his": "his words"}, dedupe_key="a1")
+    review.file_item(store, "agent", {"summary": "sum", "reason": "why"}, dedupe_key="a2")
+    review.file_item(store, "agent", {"text": "txt", "summary": "sum", "reason": "why"}, dedupe_key="a3")
+    with review.read_transaction(store.open_readonly) as conn:
+        page = review.queue_page(conn, open_limit=10, cleared_limit=10)
+    phone = CoordPhone.__new__(CoordPhone)
+    phone._clock = lambda: datetime.now(timezone.utc)
+    view = phone.review_view(store, page)
+    assert sorted(i["text"] for i in view["open"]) == ["sum", "txt", "why"]
+
+
 def test_the_panel_and_the_phone_take_an_items_fields_from_one_helper() -> None:
     import inspect
 
@@ -277,4 +294,45 @@ def test_the_panel_and_the_phone_take_an_items_fields_from_one_helper() -> None:
     for mod in (cp, ph):
         src = inspect.getsource(mod)
         assert "i.body.get(" not in src and "isinstance(i.body, dict)" not in src, mod.__name__
-        assert "review.body_fields(" in src, mod.__name__
+        assert "review.item_text(" in src, mod.__name__
+
+
+def test_a_blank_text_and_a_his_only_body_read_the_same_in_the_panel_row_and_the_phone(tmp_path) -> None:
+    from datetime import datetime, timezone
+
+    from levain.cockpit.coordinator_panels import _review_row
+    from levain.coordinator.phone import CoordPhone
+
+    store = CoordStore(_dir(tmp_path))
+    review.file_item(store, "agent", {"text": "", "summary": "s"}, dedupe_key="b1")
+    review.file_item(store, "agent", {"his": "only his"}, dedupe_key="b2")
+    review.file_item(store, "agent", {"his": ["one", "two"]}, dedupe_key="b3")
+    with review.read_transaction(store.open_readonly) as conn:
+        page = review.queue_page(conn, open_limit=10, cleared_limit=10)
+    phone = CoordPhone.__new__(CoordPhone)
+    phone._clock = lambda: datetime.now(timezone.utc)
+    view = {i["item_id"]: i["text"] for i in phone.review_view(store, page)["open"]}
+    now = datetime.now(timezone.utc)
+    for item in page.open:
+        assert _review_row(item, now).body.endswith(view[item.item_id]), item.item_id
+    assert sorted(view.values()) == ["one; two", "only his", "s"]
+
+
+def test_a_reformatted_review_schema_still_migrates_an_old_check_store(monkeypatch) -> None:
+    conn = sqlite3.connect(":memory:")
+    base = review.REVIEW_SCHEMA[0]
+    # an old-CHECK table: the current one with the newest feed's name removed from its stored CHECK
+    conn.execute(base.replace(", 'agent'", ""))
+    conn.execute("ALTER TABLE review_items ADD COLUMN gseq INTEGER")
+    conn.execute("INSERT INTO review_items (item_id, feed, dedupe_key, body, authority_relevant, by, at, gseq) "
+                 "VALUES ('a', 'know', 'k', '{}', 0, 'service', 'now', 7)")
+    assert review.items_need_rebuild(conn.execute("SELECT sql FROM sqlite_master WHERE name = 'review_items'").fetchone()[0])
+    for tail in ("\n", ";", " \n;"):
+        monkeypatch.setattr(review, "REVIEW_SCHEMA", (base + tail, *review.REVIEW_SCHEMA[1:]))
+        assert review.migrate_items(conn) is True
+        assert conn.execute("SELECT item_id, gseq FROM review_items").fetchall() == [("a", 7)]
+        conn.execute("DROP TABLE review_items")        # back to an old-CHECK table for the next tail
+        conn.execute(base.replace(", 'agent'", ""))
+        conn.execute("ALTER TABLE review_items ADD COLUMN gseq INTEGER")
+        conn.execute("INSERT INTO review_items (item_id, feed, dedupe_key, body, authority_relevant, by, at, gseq) "
+                     "VALUES ('a', 'know', 'k', '{}', 0, 'service', 'now', 7)")
