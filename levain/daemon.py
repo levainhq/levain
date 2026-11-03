@@ -451,7 +451,7 @@ def build_fence_spec(
     *,
     agent_store: Path,
     cockpit_root: Path,
-    run_dir: Path | None = None,
+    run_dir: Path,
     label: str = DEFAULT_FENCE_LABEL,
     log_dir: Path | None = None,
 ) -> DaemonSpec:
@@ -462,13 +462,13 @@ def build_fence_spec(
 
     Run as ``<this interpreter> -m levain.qbroker.fence_server``: the module is not a ``levain`` verb, and the
     interpreter is the one this levain runs in (never ``realpath``'d, for the reason :func:`_levain_invocation` gives).
-    ``--run`` is EMITTED only when given; without it the server uses this host's ``R``."""
+    ``run_dir`` is required: the caller passes the ``R`` the broker and ``levain doctor`` look in
+    (``levain.slot.layout.RUN``), so the server never binds where they do not look."""
     invocation = [sys.executable]
     argv = [*invocation, "-m", FENCE_MODULE,
             "--agent-store", str(agent_store.expanduser().resolve()),
-            "--cockpit-root", str(cockpit_root.expanduser().resolve())]
-    if run_dir is not None:
-        argv += ["--run", str(run_dir)]
+            "--cockpit-root", str(cockpit_root.expanduser().resolve()),
+            "--run", str(run_dir)]
     logs = (log_dir or _default_log_dir()).expanduser().resolve()
     return DaemonSpec(
         label=label,

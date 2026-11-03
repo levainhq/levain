@@ -18,11 +18,16 @@ Any other peer uid is closed unread and unanswered. A request is one frame of at
 ``R/fence/`` is the operator's, group ``_levain_qbroker``, mode 0750 (setgid on Linux): the server refuses to start
 unless it finds that shape, and refuses to serve unless the socket it binds is in that group (mode 0660), so no slot
 uid can reach the socket and the broker's peer check refuses any other process bound there. Never runs as root.
+
+One server per ``R/fence/``: it holds ``R/fence/fence.lock`` (flock) for its life, and a second refuses to start
+(:data:`EX_HELD`) without touching the socket; on stop it unlinks the socket path only while the path still names the
+socket it bound.
 """
 from __future__ import annotations
 
 import argparse
 import errno
+import fcntl
 import grp
 import logging
 import os
@@ -49,8 +54,8 @@ from levain.qbroker.fence import (FENCE_DB_TIMEOUT, REQUEST_MAX, SESSION_RE, TEX
                                   fence_socket_path)
 from levain.qbroker.peercred import peer_uid as _peer_uid
 
-__all__ = ["BROKER_ACCOUNT", "EX_CONFIG", "EX_NOPERM", "MAX_CONNECTIONS", "REQUEST_READ_S", "FenceServer",
-           "dir_problem", "main"]
+__all__ = ["BROKER_ACCOUNT", "EX_CONFIG", "EX_HELD", "EX_NOPERM", "INSTANCE_LOCK", "MAX_CONNECTIONS", "REQUEST_READ_S",
+           "FenceServer", "InstanceHeld", "dir_problem", "main"]
 
 log = logging.getLogger("levain.qbroker.fence_server")
 
@@ -64,11 +69,17 @@ REQUEST_READ_S = 2.0
 ANSWER_WRITE_S = 2.0
 # after an accept() error that is not the listener's own close, the pause before the next
 ACCEPT_BACKOFF = 0.1
+EX_HELD = 75            # EX_TEMPFAIL: another instance holds R/fence/fence.lock
 EX_NOPERM = 77          # run as root, or a socket dir of the wrong shape
 EX_CONFIG = 78          # no broker account
+#: the per-service instance lock, beside the socket in R/fence/ (the operator's 0600 file), held for the server's life
+INSTANCE_LOCK = "fence.lock"
 _DIR_MODES = (0o750, 0o2750)
 _JSON_INT_MAX = 2 ** 53 - 1
-_DEFAULT_RUN = "/private/var/run/levain" if sys.platform == "darwin" else "/run/levain"
+
+
+class InstanceHeld(RuntimeError):
+    """Another fence server holds ``R/fence/fence.lock``: this one refuses to start and touches no socket."""
 
 
 def _text(s: str) -> str:
@@ -111,19 +122,56 @@ class FenceServer:
         self._conns: set = set()
         self._conns_lock = threading.Lock()
         self._stopped = False
+        # the bound socket's (st_dev, st_ino): stop() unlinks the path only while it still names that socket
+        self._bound: tuple[int, int] | None = None
+        self._lock_fd: int | None = None
+        # refused_peers and last_error are written by connection threads and read by STATUS
+        self._stats_lock = threading.Lock()
         self.refused_peers = 0
         self.last_error: str | None = None
+        #: set when the accept loop ends on an error it cannot serve past (main then exits, and the supervisor's
+        #: keep-alive starts a new server)
+        self.died = threading.Event()
 
     # --- the listener -------------------------------------------------------------------------------------------
 
     def start(self) -> None:
         """Refuses (:class:`PermissionError`) unless the socket's directory has :func:`dir_problem`'s shape, owned by
-        this process's uid (the operator's, as :func:`main` runs it), and the bound socket is in ``expected_gid``; a
-        stale socket at ``path`` is replaced, anything else there refuses."""
+        this process's uid (the operator's, as :func:`main` runs it), and the bound socket is in ``expected_gid``.
+        Refuses (:class:`InstanceHeld`) while another server holds the instance lock, before it touches the socket
+        path. Holding the lock, a socket left at ``path`` is a dead server's and is replaced; anything else there
+        refuses."""
         st = os.lstat(self.path.parent)
         why = dir_problem(st, owner=os.geteuid(), gid=self.expected_gid)
         if why is not None:
             raise PermissionError(f"{self.path.parent} {why}: refusing to serve")
+        self._take_lock()
+        try:
+            self._bind_and_listen()
+        except BaseException:
+            self._release_lock()
+            raise
+
+    def _take_lock(self) -> None:
+        lock = self.path.parent / INSTANCE_LOCK
+        fd = os.open(str(lock), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise InstanceHeld(f"another agent fence server holds {lock}: refusing to start (stop the running one "
+                               "first, or leave it serving)") from None
+        except BaseException:
+            os.close(fd)
+            raise
+        self._lock_fd = fd
+
+    def _release_lock(self) -> None:
+        fd, self._lock_fd = self._lock_fd, None
+        if fd is not None:
+            os.close(fd)        # closing the last descriptor releases the flock
+
+    def _bind_and_listen(self) -> None:
         try:
             st = os.lstat(self.path)
         except FileNotFoundError:
@@ -133,10 +181,10 @@ class FenceServer:
                 raise FileExistsError(f"{self.path} exists and is not a socket")
             os.unlink(self.path)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        bound = False
         try:
             sock.bind(str(self.path))
-            bound = True
+            st = os.lstat(self.path)
+            self._bound = (st.st_dev, st.st_ino)
             os.chmod(self.path, 0o660)
             st = os.lstat(self.path)
             if not stat.S_ISSOCK(st.st_mode) or st.st_gid != self.expected_gid:
@@ -145,8 +193,7 @@ class FenceServer:
             sock.listen(MAX_CONNECTIONS)
         except BaseException:
             sock.close()
-            if bound:
-                self._unlink()
+            self._unlink()
             raise
         self._sock = sock
         thread = threading.Thread(target=self._accept_loop, name="fence-accept", daemon=True)
@@ -160,8 +207,14 @@ class FenceServer:
         self._thread = thread
 
     def _unlink(self) -> None:
+        """Remove the socket path only while it still names the socket this server bound (another server may have
+        bound the path since)."""
+        bound, self._bound = self._bound, None
+        if bound is None:
+            return
         try:
-            if stat.S_ISSOCK(os.lstat(self.path).st_mode):
+            st = os.lstat(self.path)
+            if stat.S_ISSOCK(st.st_mode) and (st.st_dev, st.st_ino) == bound:
                 os.unlink(self.path)
         except FileNotFoundError:
             pass
@@ -183,10 +236,18 @@ class FenceServer:
                 pass
             sock.close()
             self._unlink()
-        if self._thread is not None:
+        if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
+        self._release_lock()
 
     def _accept_loop(self) -> None:
+        try:
+            self._accept_forever()
+        except Exception:   # noqa: BLE001 - said, then the process exits so the supervisor restarts it
+            log.exception("fence: the accept loop failed; the server stops serving")
+            self.died.set()
+
+    def _accept_forever(self) -> None:
         while True:
             sock = self._sock
             if sock is None:
@@ -227,7 +288,8 @@ class FenceServer:
                 uid = None
             role = "broker" if uid == self.broker_uid else "operator" if uid == self.operator_uid else None
             if role is None:
-                self.refused_peers += 1
+                with self._stats_lock:
+                    self.refused_peers += 1
                 log.warning("fence: refused a peer of uid %s", uid)
                 return
             try:
@@ -285,15 +347,19 @@ class FenceServer:
         return wire.answer(rid, fenced=_text(reason))
 
     def _unavailable(self, rid: int, why: str) -> dict:
-        self.last_error = _text(why)
-        log.warning("fence: cannot decide: %s", self.last_error)
-        return {**wire.refusal(rid, "fence-unavailable"), "why": self.last_error}
+        text = _text(why)
+        with self._stats_lock:
+            self.last_error = text
+        log.warning("fence: cannot decide: %s", text)
+        return {**wire.refusal(rid, "fence-unavailable"), "why": text}
 
     def status(self) -> dict:
         seq, authority_error = self._probe_authority()
+        store_error = self._probe_store()
+        with self._stats_lock:
+            last_error = self.last_error
         return {"store": str(self.store), "cockpit_root": str(self.cockpit_root), "seq": seq,
-                "store_error": self._probe_store(), "authority_error": authority_error,
-                "last_error": self.last_error}
+                "store_error": store_error, "authority_error": authority_error, "last_error": last_error}
 
     def _probe_store(self) -> str | None:
         try:
@@ -330,7 +396,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="python -m levain.qbroker.fence_server")
     ap.add_argument("--agent-store", required=True, help="the operator's autonomic store directory (its autonomic.db)")
     ap.add_argument("--cockpit-root", required=True, help="the operator's cockpit directory (the authority log)")
-    ap.add_argument("--run", default=_DEFAULT_RUN, help="R, the run directory (the socket is R/fence/fence.sock)")
+    ap.add_argument("--run", required=True, help="R, the run directory (the socket is R/fence/fence.sock)")
     return ap.parse_args(argv)
 
 
@@ -352,18 +418,23 @@ def main(argv: list[str] | None = None) -> int:
     server = FenceServer(AgentFences(store / AGENT_DB_NAME, AgentAuthority(root)), fence_socket_path(args.run),
                          broker_uid=broker_uid, operator_uid=me, expected_gid=broker_gid, store=store,
                          cockpit_root=root)
+    done = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: done.set())
     try:
         server.start()
+    except InstanceHeld as exc:
+        print(f"levain fence: {exc}", file=sys.stderr)
+        return EX_HELD
     except (PermissionError, FileExistsError, FileNotFoundError) as exc:
         print(f"levain fence: {exc}", file=sys.stderr)
         return EX_NOPERM
     log.info("serving %s for uid %d (operator uid %d)", server.path, broker_uid, me)
-    done = threading.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: done.set())
+    # the accept loop's death ends the wait too, so a server that cannot accept exits (1) and is restarted
+    threading.Thread(target=lambda: (server.died.wait(), done.set()), name="fence-watch", daemon=True).start()
     done.wait()
     server.stop()
-    return 0
+    return 1 if server.died.is_set() else 0
 
 
 if __name__ == "__main__":

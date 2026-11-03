@@ -492,10 +492,33 @@ def test_an_operator_record_that_cannot_be_read_refuses_every_dispatch_session(l
     L, R = layout
     if record is not None:
         (L / "policy" / "operator").write_bytes(record)
-    logs = []
-    ns = SQ.fence_namespace(seams(L, R), log=logs.append)
+    logs, slept = [], []
+    ns = SQ.fence_namespace(seams(L, R), log=logs.append, sleep=slept.append)
     assert ns.fence_uid is None and isinstance(QM.build_fence(ns), Unfenceable)
-    assert len(logs) == 1 and "every dispatch session is refused" in logs[0]
+    assert len(logs) == SQ.OPERATOR_READS and "every dispatch session is refused" in logs[-1]
+    assert slept == [SQ.OPERATOR_RETRY_S] * (SQ.OPERATOR_READS - 1)
+
+
+def test_a_transient_operator_record_failure_at_start_heals_within_the_retries(layout, monkeypatch):
+    """L3 r1 (deepseek MED): one failed read at broker start no longer disables the fence for the broker's life."""
+    from levain.qbroker.fence import RemoteFences
+    from levain.slot.install_helper import operator_record_text
+
+    L, R = layout
+    (L / "policy" / "operator").write_text(operator_record_text("phill", 4242))
+    real, calls = SQ.H.read_operator_uid, []
+
+    def flaky(store):
+        calls.append(1)
+        if len(calls) < SQ.OPERATOR_READS:
+            raise OSError("EAGAIN")
+        return real(store)
+    monkeypatch.setattr(SQ.H, "read_operator_uid", flaky)
+    logs, slept = [], []
+    ns = SQ.fence_namespace(seams(L, R), log=logs.append, sleep=slept.append)
+    assert ns.fence_uid == 4242 and isinstance(QM.build_fence(ns), RemoteFences)
+    assert len(calls) == SQ.OPERATOR_READS and len(slept) == SQ.OPERATOR_READS - 1
+    assert len(logs) == SQ.OPERATOR_READS - 1 and all("trying again" in m for m in logs)
 
 
 def test_serve_builds_the_broker_with_the_fence(layout):

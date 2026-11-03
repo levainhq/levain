@@ -165,7 +165,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_slot_limits())
     core.extend(_check_slot_keys())
     core.extend(_check_slot_services())
-    core.extend(_guarded("agent fence", _check_agent_fence))
+    core.extend(_guarded("agent fence", lambda: _check_agent_fence(install=path)))
     for r in core:
         _emit(r)
     print(spend_cap_note())
@@ -2029,8 +2029,8 @@ _FENCE_NOT_RUNNING = "not running. Every dispatch session's tool calls are refus
 def _fence_start() -> str:
     from levain.daemon import DEFAULT_FENCE_LABEL
 
-    return (f"Start the operator's agent fence service (launchd label {DEFAULT_FENCE_LABEL}, or the systemd --user "
-            "unit of that name). It must run as you, never root.")
+    return (f"Start it, as you and never root: `levain agents fence start` (it installs the per-user unit "
+            f"{DEFAULT_FENCE_LABEL}).")
 
 
 def _ask_fence_status(path: Path, me: int, deadline: float, peer_uid: Any = None) -> tuple[str, Any]:
@@ -2057,6 +2057,8 @@ def _ask_fence_status(path: Path, me: int, deadline: float, peer_uid: Any = None
         return "down", type(exc).__name__
     except (TimeoutError, socket.timeout):
         return "silent", "no answer in time"
+    except wire.FrameError as exc:
+        return "silent", f"its answer was refused as {exc.name}"
     except Exception as exc:  # noqa: BLE001 - any other failure is "did not answer"
         return "silent", type(exc).__name__
     if type(ans) is not dict or ans.get("id") != 1 or type(ans.get("ok")) is not bool:
@@ -2067,14 +2069,42 @@ def _ask_fence_status(path: Path, me: int, deadline: float, peer_uid: Any = None
     return "answer", ans
 
 
+#: STATUS's fields and the types each may take (levain.qbroker.fence_server.FenceServer.status)
+_FENCE_STATUS_FIELDS: dict[str, tuple[type, ...]] = {
+    "store": (str,), "cockpit_root": (str,), "seq": (int, type(None)), "store_error": (str, type(None)),
+    "authority_error": (str, type(None)), "last_error": (str, type(None))}
+
+
+def _fence_status_problem(val: Any) -> str | None:
+    """Why a STATUS answer is not the whole schema with typed fields, or None."""
+    if type(val) is not dict:
+        return "not an object"
+    missing = sorted(set(_FENCE_STATUS_FIELDS) - set(val))
+    if missing:
+        return "no " + ", ".join(missing)
+    for key, types in _FENCE_STATUS_FIELDS.items():
+        if type(val[key]) not in types:
+            return f"{key} is a {type(val[key]).__name__}"
+    if val["seq"] is None and val["authority_error"] is None:
+        return "no authority seq and no authority error"
+    return None
+
+
 def _check_agent_fence(*, host: str | None = None, store: Path | None = None, run: Path | None = None,
                        uid: int | None = None, ask: Any = None, lstat: Any = None,
-                       qbroker_gid: Any = None) -> list[CheckResult]:
+                       qbroker_gid: Any = None, install: Path | None = None,
+                       expected: tuple[Path, Path] | None = None) -> list[CheckResult]:
     """The ``agent fence`` row (P7-2 wiring): the operator-uid service the queue broker asks, once per dispatch GATE,
     whether the session's agent is still current. Read as the OPERATOR: the socket's owner, group and mode (the
-    broker's peer check and its group are what keep every other uid off it), then the server's ``STATUS``: what it
-    reads and whether it can read it. No row before the isolation install. ``ask``/``lstat``/``qbroker_gid``/``uid``:
-    a test's seams (``ask(path, me)`` returns what :func:`_ask_fence_status` does)."""
+    broker's peer check and its group are what keep every other uid off it), then the server's ``STATUS``: the whole
+    schema, typed, and the agent store and cockpit root it reads, which must be the ones ``expected`` names (from
+    ``install``: :func:`levain.agents.cli.fence_roots`), since a server reading another store answers "no agent row"
+    for every real agent session. No row before the isolation install. ``ask``/``lstat``/``qbroker_gid``/``uid``: a
+    test's seams (``ask(path, me)`` returns what :func:`_ask_fence_status` does)."""
+    name = "agent fence"
+    if not hasattr(os, "getuid"):
+        return [CheckResult(name, True, "not applicable: this host has no POSIX uids, so no isolation install",
+                            neutral=True)]
     import grp
     import stat as st_mod
 
@@ -2088,8 +2118,7 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
     run = run if run is not None else layout.RUN.get(host)
     if store is None or run is None or not (store / "policy").is_dir():
         return []
-    name = "agent fence"
-    me = os.getuid() if uid is None and hasattr(os, "getuid") else uid
+    me = os.getuid() if uid is None else uid
     if me == 0:
         return [CheckResult(name, True, "not asked: run as root, and the fence serves its STATUS to the operator",
                             "Run `levain doctor` as the operator to see it.", neutral=True)]
@@ -2120,19 +2149,39 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
     if kind != "answer":
         return [CheckResult(name, False, f"running but does not answer ({unshowable.mark(str(val)[:60], allow='')}); "
                             "dispatch sessions are refused", "Look at the fence service's log; restart it.")]
-    store_error, authority_error = val.get("store_error"), val.get("authority_error")
-    for what, err in (("the agent store", store_error), ("the authority log", authority_error)):
+    shape = _fence_status_problem(val)
+    if shape is not None:
+        return [CheckResult(name, False, f"running but its STATUS answer is off its shape ({shape}); dispatch "
+                            "sessions cannot be shown to be checked", "Restart the fence service on this levain: "
+                            "`levain agents fence start`.")]
+    show = lambda text, n=200: unshowable.mark(text[:n], allow="")   # noqa: E731
+    if expected is None and install is not None:
+        from levain.agents.cli import fence_roots
+
+        try:
+            expected = fence_roots(install)
+        except Exception as exc:  # noqa: BLE001 - an install whose roots cannot be named fails this row only
+            return [CheckResult(name, False, f"running, but which cockpit root {install} must be fenced on cannot be "
+                                f"told ({type(exc).__name__}); dispatch sessions cannot be shown to be checked",
+                                "Run `levain doctor --path <install>` on the install whose agents dispatch.")]
+    if expected is None:
+        return [CheckResult(name, False, "running, but no expected store and cockpit root were given to compare its "
+                            "STATUS with", "This is a defect in `levain doctor`; report it.")]
+    for what, got, want in (("agent store", val["store"], expected[0]),
+                            ("cockpit root", val["cockpit_root"], expected[1])):
+        if Path(got) != Path(want).expanduser().resolve():
+            return [CheckResult(name, False, f"running but reads the {what} {show(got)}, not this install's "
+                                f"{show(str(want))}; every agent session of this install is answered as no agent's",
+                                f"If {show(str(install or '?'))} is the install whose agents dispatch, reinstall the "
+                                "fence for it: `levain agents fence start --path <install>`; if not, run `levain "
+                                "doctor --path <that install>`.")]
+    for what, err in (("the agent store", val["store_error"]), ("the authority log", val["authority_error"])):
         if err is not None:
-            why = unshowable.mark(err[:120], allow="") if type(err) is str else "an unnamed error"
-            return [CheckResult(name, False, f"running but cannot read {what} ({why}). Dispatch sessions are refused.",
-                                "Check that the fence service runs as you and names this install's store and "
-                                "cockpit root.")]
-    where = val.get("store")
-    where = unshowable.mark(where[:200], allow="") if type(where) is str else "?"
-    seq = val.get("seq")
-    seq_text = str(seq) if type(seq) is int else "?"
-    return [CheckResult(name, True, f"running (store {where}, authority seq {seq_text}). Dispatch sessions are "
-                        "checked on every tool call.")]
+            return [CheckResult(name, False, f"running but cannot read {what} ({show(err, 120)}). Dispatch sessions "
+                                "are refused.", "Check that the fence service runs as you and names this install's "
+                                "store and cockpit root.")]
+    return [CheckResult(name, True, f"running (store {show(val['store'])}, authority seq {val['seq']}). Dispatch "
+                        "sessions are checked on every tool call.")]
 
 
 def _check_host_awake() -> list[CheckResult]:

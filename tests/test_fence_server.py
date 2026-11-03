@@ -401,14 +401,14 @@ def test_one_uid_for_broker_and_operator_is_refused(rig, fence_run):
 
 def test_main_never_runs_as_root(monkeypatch):
     monkeypatch.setattr(FS.os, "geteuid", lambda: 0)
-    assert FS.main(["--agent-store", "/x", "--cockpit-root", "/y"]) == FS.EX_NOPERM
+    assert FS.main(["--agent-store", "/x", "--cockpit-root", "/y", "--run", "/r"]) == FS.EX_NOPERM
 
 
 def test_main_without_the_broker_account_exits_config(monkeypatch):
     def missing(name):
         raise KeyError(name)
     monkeypatch.setattr(FS.pwd, "getpwnam", missing)
-    assert FS.main(["--agent-store", "/x", "--cockpit-root", "/y"]) == FS.EX_CONFIG
+    assert FS.main(["--agent-store", "/x", "--cockpit-root", "/y", "--run", "/r"]) == FS.EX_CONFIG
 
 
 def test_main_refuses_a_fence_dir_it_cannot_find(monkeypatch, tmp_path):
@@ -426,17 +426,95 @@ def test_the_timeout_covers_a_refresh_and_ends_before_the_hooks():
 
 
 def test_the_fence_unit_is_resident_per_user_and_runs_the_server(tmp_path):
-    spec = daemon.build_fence_spec(agent_store=tmp_path / "a", cockpit_root=tmp_path / "c", log_dir=tmp_path)
+    spec = daemon.build_fence_spec(agent_store=tmp_path / "a", cockpit_root=tmp_path / "c", run_dir=Path("/r"),
+                                   log_dir=tmp_path)
     assert spec.label == daemon.DEFAULT_FENCE_LABEL and spec.keep_alive and spec.run_at_login
     assert spec.start_interval is None
     assert spec.argv[:3] == [sys.executable, "-m", "levain.qbroker.fence_server"] == [sys.executable, "-m",
                                                                                      FS.__name__]
     assert spec.argv[3:] == ["--agent-store", str((tmp_path / "a").resolve()),
-                             "--cockpit-root", str((tmp_path / "c").resolve())]
+                             "--cockpit-root", str((tmp_path / "c").resolve()), "--run", "/r"]
     args = FS.parse_args(spec.argv[3:])
-    assert (args.agent_store, args.cockpit_root) == (spec.argv[4], spec.argv[6])
-    with_run = daemon.build_fence_spec(agent_store=tmp_path / "a", cockpit_root=tmp_path / "c", run_dir=Path("/r"))
-    assert with_run.argv[-2:] == ["--run", "/r"]
+    assert (args.agent_store, args.cockpit_root, args.run) == (spec.argv[4], spec.argv[6], "/r")
+
+
+def test_the_unit_and_the_server_both_require_R():
+    """No default R on either side: the caller threads layout.RUN through, so the server never binds where the
+    broker and doctor do not look."""
+    with pytest.raises(TypeError):
+        daemon.build_fence_spec(agent_store=Path("/a"), cockpit_root=Path("/c"))   # type: ignore[call-arg]
+    with pytest.raises(SystemExit):
+        FS.parse_args(["--agent-store", "/a", "--cockpit-root", "/c"])
+
+
+# --- one server per R/fence (L3 r1, codex HIGH) ------------------------------------------------------------------
+
+def test_a_second_instance_is_refused_while_the_first_lives(rig, fence_run):
+    first = serve_fence(rig, fence_run)
+    try:
+        ino = os.lstat(first.path).st_ino
+        with pytest.raises(FS.InstanceHeld, match="fence.lock"):
+            serve_fence(rig, fence_run)
+        assert os.lstat(first.path).st_ino == ino          # the live socket was not unlinked or replaced
+        assert F.RemoteFences(first.path, ME)(who()) is None
+    finally:
+        first.stop()
+    again = serve_fence(rig, fence_run)                    # the lock goes with the first server's stop
+    again.stop()
+
+
+def test_stop_never_removes_a_socket_another_server_bound(rig, fence_run):
+    first = serve_fence(rig, fence_run)
+    os.unlink(first.path)
+    other = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        other.bind(str(first.path))
+        ino = os.lstat(first.path).st_ino
+        first.stop()
+        assert stat.S_ISSOCK(os.lstat(first.path).st_mode) and os.lstat(first.path).st_ino == ino
+    finally:
+        other.close()
+        os.unlink(first.path)
+
+
+def test_main_exits_held_while_another_server_holds_the_lock(rig, fence_run, monkeypatch):
+    import grp
+    import pwd
+    gid = os.stat(fence_run / "fence").st_gid
+    monkeypatch.setattr(FS.pwd, "getpwnam", lambda n: pwd.struct_passwd(("q", "*", OTHER, 0, "", "/", "/bin/sh")))
+    monkeypatch.setattr(FS.grp, "getgrnam", lambda n: grp.struct_group(("q", "*", gid, [])))
+    first = serve_fence(rig, fence_run)
+    try:
+        assert FS.main(["--agent-store", str(rig.db.parent), "--cockpit-root", str(rig.world.root),
+                        "--run", str(fence_run)]) == FS.EX_HELD
+        assert F.RemoteFences(first.path, ME)(who()) is None
+    finally:
+        first.stop()
+
+
+class _BrokenListener:
+    def accept(self):
+        raise RuntimeError("not an OSError")
+
+    def shutdown(self, how):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_an_accept_loop_that_fails_is_logged_and_marks_the_server_dead(rig, fence_run, caplog):
+    srv = serve_fence(rig, fence_run)
+    real = srv._sock
+    try:
+        srv._sock = _BrokenListener()       # read by the loop's next turn
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.connect(str(srv.path))         # wakes the loop's accept on the real listener
+        assert srv.died.wait(5)
+        assert any("accept loop failed" in r.getMessage() for r in caplog.records)
+    finally:
+        srv.stop()
+        real.close()
 
 
 def test_the_fence_socket_is_under_R():

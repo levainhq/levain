@@ -200,11 +200,15 @@ def slot_store_rows(host: HostOS, slot: SlotId) -> list[Row]:
     return rows
 
 
-def base_run_rows(host: HostOS, operator: str) -> list[Row]:
+def base_run_rows(host: HostOS, operator: str | None) -> list[Row]:
     """The run-dir rows that do not depend on the slots (CONTRACT §2.2). ``operator`` owns ``R/fence/``, the dir the
     operator-uid fence server binds in; it is group ``_levain_qbroker`` so the queue broker (and no slot uid) reaches
-    the socket, and setgid on Linux so the socket takes that group (a BSD dir hands its group down without it)."""
+    the socket, and setgid on Linux so the socket takes that group (a BSD dir hands its group down without it).
+    ``operator`` None (the reaper's boot pass when ``L/policy/operator`` cannot be read): every row but ``R/fence/``,
+    which no owner is better than a wrong one for."""
     R = RUN[host]
+    fence = [] if operator is None else [Row(R / "fence", operator, "_levain_qbroker",
+                                             0o2750 if host == "linux" else 0o750)]
     return [
         _root(host, R, 0o755),
         _root(host, R / "gw", 0o755),
@@ -217,7 +221,7 @@ def base_run_rows(host: HostOS, operator: str) -> list[Row]:
         # (the operator, keys, qbroker, dispatch) is in. macOS gives a new entry its directory's group either way.
         Row(R / "control", "_levain_control", "levain-control", 0o2750),
         Row(R / "reaper", "root", "levain-wake", 0o750),
-        Row(R / "fence", operator, "_levain_qbroker", 0o2750 if host == "linux" else 0o750),
+        *fence,
     ]
 
 

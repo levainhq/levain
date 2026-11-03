@@ -69,3 +69,50 @@ def test_the_reaper_boot_pass_makes_it(tmp_path, host):
     # the kernel then drops setgid from the fchmod (the row's own mode is asserted above)
     assert stat.S_IMODE(os.lstat(w.R / "fence").st_mode) & 0o777 == row.mode & 0o777
     assert ("", OP_UID, 4242) not in w.chowns and any(c[1:] == (OP_UID, 4242) for c in w.chowns)
+
+
+# --- L3 r1: a bad operator record costs only R/fence (complement MED) -------------------------------------------
+
+@pytest.mark.parametrize("host", HOSTS)
+@pytest.mark.parametrize("record", [None, b"{}", b"not json"])
+def test_an_unreadable_operator_record_drops_only_the_fence_row(tmp_path, host, record):
+    w = World(tmp_path, host=host)
+    op = w.L / "policy" / "operator"
+    if record is None:
+        op.unlink()
+    else:
+        op.write_bytes(record)
+    w.seams.account_uid = lambda name: {"phill": OP_UID}.get(name, 800)
+    w.seams.group_gid = lambda g: 700
+    logs: list[str] = []
+    paths = {r.path for r in reaper.run_rows(w.seams, log=logs.append)}
+    assert w.R / "fence" not in paths
+    assert {w.R / "control", w.R / "keys", w.R / "qb", w.R / "reaper"} <= paths
+    assert len(logs) == 1 and "R/fence not made" in logs[0]
+    logs.clear()
+    assert reaper.boot_dirs(w.seams, log=logs.append) == []
+    assert (w.R / "qb").is_dir() and (w.R / "keys").is_dir() and not (w.R / "fence").exists()
+    assert any("R/fence not made" in m for m in logs)
+
+
+# --- L3 r1: the fence row's group exists before the row is made (deepseek MED); no group_gid seam here -----------
+
+def _qbroker_group_made(step) -> bool:
+    a = tuple(step.argv or ())
+    return bool(a) and ((a[0].endswith("groupadd") and a[-1] == "_levain_qbroker")
+                        or (a[0].endswith("dscl") and a[2:4] == ("-create", "/Groups/_levain_qbroker") and len(a) == 4))
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_setup_makes_the_qbroker_group_before_the_fence_dir(host, monkeypatch):
+    from levain.firing import hands
+    from tests.test_slot_install_order import _plan
+
+    real = hands.shutil.which
+    monkeypatch.setattr(hands.shutil, "which", lambda n, path=None: real(n, path=path) or f"/usr/sbin/{n}")
+    steps = list(_plan(host).steps)
+    made = next(i for i, s in enumerate(steps) if _qbroker_group_made(s))
+    fence = str(layout.RUN[host] / "fence")
+    uses = [i for i, s in enumerate(steps)
+            if (s.argv and s.argv[-1] == fence) or (s.write is not None and fence in s.write[1])]
+    assert uses and made < min(uses), (made, uses)

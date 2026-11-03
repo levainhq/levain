@@ -78,6 +78,14 @@ def run_update(
             band_line = refresh_after_update()
             if band_line:
                 emit(band_line)
+            # P7-2 wiring: the operator's agent fence unit names this interpreter and this install's cockpit root, and
+            # the queue broker refuses every dispatch GATE while it is down; update re-installs it through the same
+            # provider install `levain agents fence start` uses (idempotent). Hosts without the isolation install
+            # have nothing to fence. Said, never the reason the update fails.
+            from levain.agents.cli import refresh_fence_after_update
+            fence_line = refresh_fence_after_update(install)
+            if fence_line:
+                emit(fence_line)
             # anneal 1.0 (KL-19): an update that leaves a usable store also leaves its consolidate
             # baton held by the entity's session, the same rule `init` applies (a store whose claim
             # failed at init, or one an older install never claimed, is reconciled here too).
