@@ -151,8 +151,6 @@ def test_a_clean_entry_passes_the_registration_rules():
     (dict(command="/Users/operator/bin/mcp"), "under the operator's home"),
     (dict(command="/Users/operator"), "under the operator's home"),
     (dict(command="/Users/operator/../operator/x"), "absolute path"),
-    (dict(command="~/bin/mcp"), "absolute path"),
-    (dict(command="./mcp"), "absolute path"),
     (dict(args=["--token=abc123"]), "looks like a credential"),
     (dict(args=["--api-key", "abc123"]), "follows the secret-named flag"),
     (dict(args=["--password", "hunter2"]), "follows the secret-named flag"),
@@ -166,6 +164,11 @@ def test_a_clean_entry_passes_the_registration_rules():
 def test_a_stdio_entry_the_rules_refuse(kw, said):
     problems = hm.registration_problems(_entry(**kw), home=HOME)
     assert any(said in p for p in problems), problems
+
+
+@pytest.mark.parametrize("cmd", ["~/bin/mcp", "./mcp"])
+def test_a_relative_command_in_a_foreign_signed_entry_is_refused(cmd):
+    assert _said(hm.registration_problems(_bare(cmd), home=HOME), "absolute path")
 
 
 def test_a_symlink_into_the_home_is_still_under_the_home(tmp_path):
@@ -297,8 +300,83 @@ def test_a_command_that_does_not_exist_yet_is_refused():
     assert _said(hm.registration_problems(_entry(command=late), home=HOME), "does not exist")
 
 
-def test_a_bare_name_is_refused_since_the_hands_path_picks_what_it_runs():
-    assert _said(hm.registration_problems(_entry(command="npx"), home=HOME), "absolute path")
+def _bare(cmd):
+    """An entry as a foreign writer would sign it: a bare command, never resolved, its own digest."""
+    e = dict(STDIO, command=cmd)
+    e["server_sha256"] = hm.server_sha256(e)
+    return e
+
+
+def test_a_bare_name_in_a_signed_entry_is_refused_the_stored_command_is_always_absolute():
+    assert _said(hm.registration_problems(_bare("npx"), home=HOME), "absolute path")
+
+
+def _trusted(tmp_path, monkeypatch, name="npx", mode=0o755):
+    d = tmp_path / "trusted"
+    exe = _exe(d / name, mode)
+    monkeypatch.setattr(hm, "TRUSTED_COMMAND_DIRS", (str(tmp_path / "nowhere"), str(d)))
+    return d, exe
+
+
+def test_a_bare_name_resolves_through_the_trusted_dirs_and_the_signed_entry_holds_the_absolute_path(tmp_path, monkeypatch):
+    _, exe = _trusted(tmp_path, monkeypatch)
+    e = _entry(command="npx")
+    assert e["command"] == exe and e["server_sha256"] == hm.server_sha256(e)
+    assert hm.registration_problems(e, home=HOME) == []
+    assert f'command = "{exe}"' in hm.render_codex_toml([e])
+    assert json.loads(hm.render_claude_json([e]))["mcpServers"]["files"]["command"] == exe
+
+
+def test_the_callers_path_is_never_read(tmp_path, monkeypatch):
+    other = tmp_path / "onpath"
+    _exe(other / "npx")
+    monkeypatch.setenv("PATH", str(other))
+    monkeypatch.setattr(hm, "TRUSTED_COMMAND_DIRS", (str(tmp_path / "empty"),))
+    with pytest.raises(hm.HandsMcpRefused, match="not an executable in"):
+        _entry(command="npx")
+
+
+def test_an_unresolved_name_is_refused_naming_the_searched_dirs(tmp_path, monkeypatch):
+    monkeypatch.setattr(hm, "TRUSTED_COMMAND_DIRS", (str(tmp_path / "a"), str(tmp_path / "b")))
+    with pytest.raises(hm.HandsMcpRefused) as exc:
+        _entry(command="uvx")
+    assert str(tmp_path / "a") in str(exc.value) and str(tmp_path / "b") in str(exc.value)
+
+
+@pytest.mark.parametrize("cmd", ["./npx", "bin/npx", "~/npx", "../npx", ".."])
+def test_a_name_with_a_slash_that_is_not_absolute_stays_refused(tmp_path, monkeypatch, cmd):
+    _trusted(tmp_path, monkeypatch)
+    with pytest.raises(hm.HandsMcpRefused, match="absolute path or a bare name"):
+        _entry(command=cmd)
+
+
+def test_the_default_trusted_dirs_are_the_three_fixed_ones():
+    assert hm.TRUSTED_COMMAND_DIRS == ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin")
+
+
+def test_a_bare_name_that_resolves_to_a_group_writable_file_is_refused_by_the_existing_checks(tmp_path, monkeypatch):
+    _trusted(tmp_path, monkeypatch, mode=0o775)
+    assert _said(hm.registration_problems(_entry(command="npx"), home=HOME), "writable by group or world")
+
+
+def test_a_bare_name_that_resolves_to_a_foreign_owned_file_is_refused_by_the_existing_checks(tmp_path, monkeypatch):
+    _trusted(tmp_path, monkeypatch)
+    e = _entry(command="npx")
+    me = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: me + 1)
+    assert _said(hm.registration_problems(e, home=HOME), "owned by root or the operator")
+
+
+def test_a_bare_name_resolving_to_a_link_into_a_loose_tree_is_judged_by_its_target(tmp_path, monkeypatch):
+    target = _exe(tmp_path / "loose" / "npx-cli")
+    (tmp_path / "loose").chmod(0o777)
+    d = tmp_path / "trusted"
+    d.mkdir()
+    (d / "npx").symlink_to(target)
+    monkeypatch.setattr(hm, "TRUSTED_COMMAND_DIRS", (str(d),))
+    e = _entry(command="npx")
+    assert e["command"] == str(d / "npx")                       # the link is stored, as the file the name found
+    assert _said(hm.registration_problems(e, home=HOME), "writable by group or world")
 
 
 def test_a_command_in_a_sticky_world_writable_directory_is_refused_whole():

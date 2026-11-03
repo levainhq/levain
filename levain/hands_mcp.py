@@ -38,12 +38,15 @@ from urllib.parse import parse_qsl, urlsplit
 
 __all__ = ["CLAUDE_TYPE", "DIGEST_REFUSAL", "HandsMcpRefused", "RESERVED_NAMES", "build_entry", "claude_servers",
            "codex_toml", "command_problems", "default_callback_port", "lease_expiry", "live_entries",
-           "registration_problems", "render_claude_json", "render_codex_toml", "secret_in_arg", "server_sha256"]
+           "registration_problems", "render_claude_json", "render_codex_toml", "resolve_command", "secret_in_arg", "server_sha256", "TRUSTED_COMMAND_DIRS"]
 
 # the names the hands account's own servers never take: the two Levain itself writes into a vendor config
 RESERVED_NAMES = frozenset({"anneal_memory", "levain_band"})
 CALLBACK_PORT_LOW, CALLBACK_PORT_HIGH = 49200, 49999
 CLAUDE_TYPE = {"stdio": "stdio", "remote": "http"}
+# where a bare command name (``npx``, ``uvx``) is looked up when an entry is BUILT: a fixed list, never the caller's PATH
+# or environment. A module constant so a test can point it at a scratch directory.
+TRUSTED_COMMAND_DIRS: tuple[str, ...] = ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin")
 CODEX_STORE_LINE = 'mcp_oauth_credentials_store = "file"'
 APPROVAL_MODE = "prompt"
 DIGEST_REFUSAL = "server_sha256 is not the digest of the table this entry renders"
@@ -103,6 +106,24 @@ def _loose_dir(path: str, uid: int) -> str | None:
         d = parent
 
 
+def resolve_command(cmd: str) -> str:
+    """``cmd`` as the absolute path the entry will store. An absolute ``cmd`` is returned as given (judged later by
+    :func:`command_problems`); a bare name (no slash) is looked up in :data:`TRUSTED_COMMAND_DIRS` in order, the first
+    executable regular file (a link followed) winning, and the caller's PATH and environment are never read. A bare name
+    nobody holds there, or a name with a slash that is not absolute, raises :class:`HandsMcpRefused`. What is signed is
+    then what runs: the stored path, which :func:`command_problems` judges at registration and at every render."""
+    if cmd.startswith("/") or not cmd:
+        return cmd
+    if "/" in cmd or "\0" in cmd or cmd in (".", ".."):
+        raise HandsMcpRefused(f"the command {cmd[:120]!r} must be an absolute path or a bare name with no slash")
+    for d in TRUSTED_COMMAND_DIRS:
+        cand = os.path.join(d, cmd)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    raise HandsMcpRefused(f"the command {cmd[:120]!r} is not an executable in {', '.join(TRUSTED_COMMAND_DIRS)}; "
+                          "name its absolute path")
+
+
 def command_problems(cmd: str, *, home: str) -> list[str]:
     """Why a stdio ``cmd`` is not one only root or the operator can replace, empty when it is: an absolute path, not
     under the operator's ``home``, that exists; every symlink on the way is followed and each one's directory is judged
@@ -110,7 +131,8 @@ def command_problems(cmd: str, *, home: str) -> list[str]:
     uid) with no group or world write bit, and no directory above it, nor above any link to it, is writable by group
     or world or owned by another account. The rule that fails is named. Judged at registration and again at render."""
     if not cmd.startswith("/") or ".." in cmd.split("/"):
-        return [f"the command {cmd[:120]!r} must be an absolute path (a bare name is whatever the hands PATH finds)"]
+        return [f"the command {cmd[:120]!r} must be an absolute path (a bare name is resolved "
+                f"when the entry is built, :func:`resolve_command`, and the resolved path is what is stored)"]
     if _under(cmd, home):
         return [f"the command {cmd[:120]!r} is under the operator's home: the hands account runs nothing the "
                 "operator can rewrite"]
@@ -378,7 +400,11 @@ def build_entry(*, name: str, transport: str, identity_kind: str, expires_at: st
                 args: Sequence[str] = (), env: Mapping[str, str] | None = None, url: str = "",
                 callback_port: int | None = None, entry_id: str | None = None) -> dict[str, Any]:
     """An entry in the signed shape, its digest filled. A stdio entry's ``callback_port`` is 0 and a remote one's
-    defaults to :func:`default_callback_port`. Not validated here: the log's validate and append rules judge it."""
+    defaults to :func:`default_callback_port`. A stdio ``command`` that is a bare name is resolved to its absolute path
+    first (:func:`resolve_command`, which raises :class:`HandsMcpRefused` when no trusted directory holds it) and the
+    digest is of the resolved entry. Otherwise not validated here: the log's validate and append rules judge it."""
+    if transport == "stdio":
+        command = resolve_command(command)
     if callback_port is None:
         callback_port = default_callback_port(name) if transport == "remote" else 0
     entry: dict[str, Any] = {
