@@ -226,12 +226,12 @@ class World:
 
     def give_credential(self, slot: SlotId, vendor: str = "claude", *, baseline: bool = True,
                         observed_id: str | None = None) -> None:
-        """``observed_id`` defaults to ``not-a-check`` for codex and a fixed uuid for claude."""
+        """``observed_id`` defaults to ``not-a-check`` for codex and a fixed id digest for claude."""
         d = slot.slot_dir(self.L)
         (d / "keep" / H.CREDENTIAL_NAME[vendor]).write_bytes(b"{}")
         if baseline:
             if observed_id is None:
-                observed_id = "not-a-check" if vendor == "codex" else "4b8e0c1a-1d2e-4f00-9a7b-0123456789ab"
+                observed_id = "not-a-check" if vendor == "codex" else "4b8e0c1a1d2e4f009a7b0123456789ab4b8e0c1a1d2e4f009a7b0123456789ab"
             (d / "baseline").write_bytes(canon.canonical_bytes(
                 {"format": "levain-baseline/1", "vendor": vendor, "observed_id": observed_id,
                  "confirmed_at": "2026-10-20T00:00:00Z", "session": "s-00000000000000ba"}))

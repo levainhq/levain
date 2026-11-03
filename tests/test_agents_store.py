@@ -107,7 +107,7 @@ def test_a_marked_store_with_a_dropped_trigger_is_refused_and_reopened_it_still_
             open_agent_store(d)
         text = str(e.value)
         assert "agent_occurrences_one_fire" in text
-        assert "run the levain that wrote marker levain-agent-schema/2" in text
+        assert "run the levain that wrote marker levain-agent-schema/3" in text
     assert not any(r[1] == "agent_occurrences_one_fire" for r in master(d / DB_NAME))
 
 
@@ -124,11 +124,11 @@ def test_a_weakened_trigger_body_is_refused(tmp_path):
 def test_an_unknown_marker_is_refused_and_named(tmp_path):
     d = tmp_path / "m2"
     open_agent_store(d)
-    edit(d, "UPDATE meta SET value = 'levain-agent-schema/3' WHERE key = 'agent_schema'")
+    edit(d, "UPDATE meta SET value = 'levain-agent-schema/4' WHERE key = 'agent_schema'")
     with pytest.raises(AgentStoreRefused) as e:
         open_agent_store(d)
-    assert "unknown agent schema marker 'levain-agent-schema/3'" in str(e.value)
-    assert "run the levain that wrote marker levain-agent-schema/3" in str(e.value)
+    assert "unknown agent schema marker 'levain-agent-schema/4'" in str(e.value)
+    assert "run the levain that wrote marker levain-agent-schema/4" in str(e.value)
 
 
 def test_a_refusal_touches_agents_only_the_autonomic_db_still_opens(tmp_path):
@@ -188,7 +188,7 @@ def run_cli(capsys, *argv: str) -> tuple[int, str, str]:
 def test_levain_agents_passes_a_clean_store(tmp_path, capsys):
     rc, out, err = run_cli(capsys, "--store-dir", str(tmp_path / "ok"))
     assert rc == 0 and err == ""
-    assert out.startswith("agent schema levain-agent-schema/2: ok")
+    assert out.startswith("agent schema levain-agent-schema/3: ok")
 
 
 def test_levain_agents_refuses_a_3_store(tmp_path, capsys):

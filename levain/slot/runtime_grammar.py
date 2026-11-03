@@ -42,6 +42,8 @@ KINDS = ("interactive", "login", "dispatch", "planner", "verifier")   # §5.1 pr
 VENDORS = ("claude", "codex")                                          # §5.1 prepare, §5.3 vendor
 AUTHS = ("brokered", "passthrough", "none")                            # §5.1 prepare
 CONFIRM_ANSWERS = ("yes", "no")                                        # §5.1 confirm-identity
+#: c7.14 §5.1 confirm-identity: `yes --dispatch` also writes `dispatch: yes` into the baseline.
+DISPATCH_FLAG = "--dispatch"
 #: §5.1 adopt-verify: ``--bundle-digest sha256:<64 lowercase hex>``, the digest adopt-open's answer gave.
 BUNDLE_DIGEST_FLAG = "--bundle-digest"
 _BUNDLE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}", re.ASCII)
@@ -127,6 +129,7 @@ class RuntimeRequest:
     auth: str | None = None
     slot: int | None = None
     answer: str | None = None      # confirm-identity yes|no
+    dispatch: bool = False         # confirm-identity yes --dispatch (c7.14)
     bundle_digest: str | None = None   # adopt-verify ``sha256:<hex>``
 
     @property
@@ -269,9 +272,16 @@ def parse_runtime_argv(argv: Sequence[str], *, configured_slots: SlotConfig, cal
         _arity(verb, rest, 0, 1)
         return RuntimeRequest(verb, caller, session=_session(rest[0]) if rest else None)
     if verb == "confirm-identity":
-        _arity(verb, rest, 2, 2)
-        return RuntimeRequest(verb, caller, session=_session(rest[0]),
-                              answer=_enum(rest[1], "answer", CONFIRM_ANSWERS))
+        _arity(verb, rest, 2, 3)         # <session> yes|no [--dispatch]
+        answer = _enum(rest[1], "answer", CONFIRM_ANSWERS)
+        dispatch = len(rest) == 3
+        if dispatch:
+            if rest[2] != DISPATCH_FLAG:
+                raise Refused("extra-argv", f"{verb}: {rest[2][:64]!r}")        # the verb's old arity word
+            if answer != "yes":
+                # the mark is a consent; a `no` consents to nothing
+                raise Refused("bad-token", f"{DISPATCH_FLAG} goes with yes, not {answer}")
+        return RuntimeRequest(verb, caller, session=_session(rest[0]), answer=answer, dispatch=dispatch)
     if verb == "adopt-verify":   # exactly <session> --bundle-digest sha256:<hex>, in that order
         _arity(verb, rest, 3, 3)
         session = _session(rest[0])

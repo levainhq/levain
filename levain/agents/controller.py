@@ -9,7 +9,8 @@ deferred ``BEGIN`` that has read nothing yet gets the same answer as one in ``BE
 that read first holds a snapshot and gets SQLite's busy error, which writes nothing.
 
 ``tick`` walks every registered, active agent's slots since its stored cursor, in the agent's stored zone, with an
-injected clock. What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
+injected clock. Before the walk it ends every admitted occurrence the full cap has held past its grace
+(:func:`close_no_slot`); ``launch_over`` and ``session_alive`` are the coordinator-lease probes (see :mod:`slots`). What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
 binding_id | None``; ``None`` means the agent is not armed), because arming is derived from the authority log and a
 binding is minted by the launch slice, neither of which is this module's.
 """
@@ -18,20 +19,23 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from levain.agents import schedule
+from levain.agents import schedule, slots
 from levain.agents.spec import _check_row
 from levain.agents.store import AgentStore, open_agent_store
 
-__all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "TickResult", "occurrence_id", "run_id", "claim", "tick"]
+__all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurrence_id", "run_id", "claim",
+           "close_no_slot", "tick", "heartbeat", "takeover"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
 OVERLAP = "skipped-overlap"
+
+LEASE_S = 900  # A0 r7 section 2.3 [judged]: the coordinator slot's lease
 
 CURSOR_PREFIX = "tick_cursor:"
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
@@ -96,6 +100,7 @@ class TickResult:
     refused: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, why): a stored spec that fails
     changed: list[str] = field(default_factory=list)                 # lifecycle moved mid-tick: left for next tick
     clamped: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, cursor): a cursor past the clock
+    no_slot: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, key): admitted, past grace, no slot
 
 
 def _agents(conn: sqlite3.Connection) -> list[tuple]:
@@ -136,8 +141,48 @@ def _settle(conn: sqlite3.Connection, agent_id: str, cursor: datetime | None, fl
         _set_cursor(conn, agent_id, floor)
 
 
+def _admitted_since(kind: str, key: str, admitted_at: str) -> datetime | None:
+    """When an admitted occurrence's grace began: a scheduled key is its slot's instant (the grace
+    :func:`schedule.classify` already measures), any other key has none, so its own admission. A stamp that does
+    not parse gives ``None``: the row is never closed on a time nobody can read."""
+    try:
+        admitted = datetime.strptime(admitted_at, _STAMP).replace(tzinfo=timezone.utc)
+        return datetime.strptime(key, _STAMP).replace(tzinfo=timezone.utc) if kind == "scheduled" else admitted
+    except (ValueError, TypeError):
+        return None
+
+
+def close_no_slot(conn: sqlite3.Connection, now: datetime, over: Collection[str] = ()) -> list[tuple[str, str]]:
+    """End as ``missed`` / ``no_slot`` every ``admitted`` occurrence past its grace while the cap is full (A0 §2.4:
+    a named occurrence is retried each tick, and only the grace running out ends it). Returns ``(agent_id, key)``.
+    It reclaims the expired coordinator leases in ``over`` (probed by the caller, :func:`slots.probe_over`) first, and
+    does nothing while a slot is free: an occurrence still admitted past grace with a slot free was not left by the
+    cap, so ``no_slot`` would be a false reason. A cap nobody can read decides nothing here: the tick goes on for
+    the other agents and the occurrences stay admitted. Runs in the caller's write transaction."""
+    try:
+        if slots.free(conn, now, over) > 0:
+            return []
+    except ValueError:
+        return []
+    at = _stamp(now)
+    closed = []
+    for oid, agent_id, kind, key, admitted_at in conn.execute(
+            "SELECT occurrence_id, agent_id, kind, key, admitted_at FROM agent_occurrences WHERE state = 'admitted'"
+            " ORDER BY admitted_at, occurrence_id").fetchall():
+        since = _admitted_since(kind, key, admitted_at)
+        if since is None or schedule.classify(since, now) != schedule.MISSED:
+            continue
+        conn.execute("UPDATE agent_occurrences SET state = 'missed', reason = 'no_slot', ended_at = ?"
+                     " WHERE occurrence_id = ? AND state = 'admitted'", (at, oid))
+        slots.release(conn, oid)  # an admitted occurrence holds nothing (A0 §2.4), so this frees nothing today
+        closed.append((agent_id, key))
+    return closed
+
+
 def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
-         binding_of: Callable[[str, str], str | None]) -> TickResult:
+         binding_of: Callable[[str, str], str | None],
+         session_alive: Callable[[str], bool | None] | None = None,
+         launch_over: Callable[[str], bool | None] | None = None) -> TickResult:
     """One controller pass. ``store`` is an opened :class:`AgentStore` or a store directory; a directory is opened
     through :func:`open_agent_store`, so a refused agent schema raises ``AgentStoreRefused`` with its named reason
     before anything is read or written.
@@ -152,6 +197,14 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
     now = schedule._utc(clock())  # a naive clock reading is refused up front
     floor = now.replace(second=0, microsecond=0)
     out = TickResult()
+    # first, so an occurrence the cap held past its grace no longer reads as a live previous one to this tick's claims
+    with store.read() as conn:
+        expired = slots.expired_launches(conn, now)
+    over = slots.probe_over(expired, launch_over, session_alive)  # outside any write lock: a probe can be slow
+    with store.write() as conn:
+        for agent_id, key in close_no_slot(conn, now, over):
+            out.no_slot.append((agent_id, key))
+            out.missed[agent_id] = out.missed.get(agent_id, 0) + 1  # the miss streak (P6-2b) counts it
     with store.read() as conn:
         agents = _agents(conn)
     for agent_id, name, operation, version, digest, text in agents:
@@ -205,3 +258,77 @@ def _walk(store: AgentStore, agent_id: str, snap: tuple, trigger: dict, binding:
                     (agent_id, key))
             _set_cursor(conn, agent_id, upto)
         cursor = upto
+
+
+def _write_lock(conn: sqlite3.Connection) -> None:
+    # A write that matches no row still takes SQLite's write lock, so the lease read after it is the one the CAS
+    # compares against. A caller in a deferred BEGIN that has read nothing yet gets the same answer as one in BEGIN
+    # IMMEDIATE; one that read first holds a snapshot, and if a rival committed since then it gets SQLite's busy error
+    # here, before anything is written.
+    conn.execute("UPDATE agent_occurrences SET lease_until = lease_until WHERE 0")
+
+
+def _lease(value: object) -> datetime | None:
+    """A stored lease, or ``None`` when it is absent or unreadable (neither is evidence of a lapse or of life)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, _STAMP).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _expiry(at: datetime, lease_s: int) -> datetime:
+    # Stamps hold whole seconds and the lapse test compares the untruncated clock, so the expiry is rounded up:
+    # a lease is never shorter than asked for, and heartbeat and takeover share the boundary ``at > lease``.
+    moment = at + timedelta(seconds=lease_s)
+    return moment.replace(microsecond=0) + timedelta(seconds=1) if moment.microsecond else moment
+
+
+def heartbeat(conn: sqlite3.Connection, occurrence_id: str, epoch: int, now: datetime, lease_s: int = LEASE_S) -> bool:
+    """The supervisor's heartbeat: extend a ``launched`` row's lease to ``now + lease_s``. It is a compare-and-set on
+    the epoch the holder launched or last renewed under and on the exact lease it read, so a holder that a takeover
+    fenced (the epoch moved, the row left ``launched``) writes nothing and is told ``False``. A lease that has already
+    lapsed (``now`` past it) is refused too: the row belongs to takeover from that moment, and a late holder must not
+    postpone crash recovery. An absent or unreadable lease is refused, as takeover refuses it. The lease never moves
+    backwards, so a renew computed from an earlier clock reading, or a wall clock set back, leaves the later lease in
+    place. Runs inside the caller's write transaction and takes its write lock first."""
+    if not conn.in_transaction:
+        raise RuntimeError("a heartbeat runs inside the caller's write transaction")
+    at = schedule._utc(now)
+    _write_lock(conn)
+    row = conn.execute("SELECT lease_until FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'"
+                       " AND epoch = ?", (occurrence_id, epoch)).fetchone()
+    if row is None:
+        return False
+    lease = _lease(row[0])
+    if lease is None or at > lease:
+        return False
+    until = max(lease, _expiry(at, lease_s))
+    cur = conn.execute("UPDATE agent_occurrences SET lease_until = ? WHERE occurrence_id = ? AND state = 'launched'"
+                       " AND epoch = ? AND lease_until = ?", (_stamp(until), occurrence_id, epoch, row[0]))
+    return cur.rowcount == 1
+
+
+def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime) -> bool:
+    """Fenced takeover (A0 r7 section 2.3, lapse recovery): end a ``launched`` row whose lease has lapsed, writing
+    ``epoch + 1`` and ``crash_recovered`` in one statement. The lease is read here, inside the write transaction, and
+    the ``UPDATE`` is guarded by the exact value read, so a heartbeat that landed first or a takeover that already
+    ran leaves it with nothing to change (``False``). A live lease is never taken over; a lease that is absent or
+    unreadable is not evidence of a lapse, so it is refused too. Slot and reservation release belong to the
+    terminal transaction P6-5 wires around this. It takes the caller's write lock first, as :func:`heartbeat` does."""
+    if not conn.in_transaction:
+        raise RuntimeError("a takeover runs inside the caller's write transaction")
+    at = schedule._utc(now)
+    _write_lock(conn)
+    row = conn.execute("SELECT lease_until FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'",
+                       (occurrence_id,)).fetchone()
+    if row is None:
+        return False
+    lease = _lease(row[0])
+    if lease is None or at <= lease:
+        return False
+    cur = conn.execute("UPDATE agent_occurrences SET state = 'stopped', reason = 'crash_recovered', epoch = epoch + 1,"
+                       " ended_at = ? WHERE occurrence_id = ? AND state = 'launched' AND lease_until = ?",
+                       (_stamp(at), occurrence_id, row[0]))
+    return cur.rowcount == 1
