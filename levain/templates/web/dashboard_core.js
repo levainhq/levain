@@ -8192,7 +8192,7 @@
   // write says what did not land and the list is the server's. Every field is set through el()/textContent or the markdown
   // renderer's DOM nodes, never innerHTML: this page shares a document with the write token.
   const NC_PATH = "/webpush/center", NC_POLL_MS = 30000, NC_TIMEOUT_MS = 15000, NC_PANEL_ROWS = 5, NC_SWIPE_PX = 96, NC_REFRESH_MAX = 200;   // 200 is the server's page cap
-  const NC_ID = /^[pn][0-9]{1,19}$/;
+  const NC_ID = /^[pn][1-9][0-9]{0,17}$/;
   const nc = { sig: "", items: [], unread: 0, total: 0, needs: 0, next: null, status: "idle", goodAt: 0, readId: 0, wgen: 0, busy: 0 };
   // status: idle (never read) | ok | error (never read, last try failed) | noauth (no/refused token) | absent (this server has no center)
   const ncUi = { sel: null, pinned: null, filter: "", banner: null, menu: false, detail: false, gone: "", more: false };
