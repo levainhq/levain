@@ -7,7 +7,9 @@ then the presence record: an approval is held for a signed answer exactly when i
 named exception: when ``follow`` reads "devices on" only because there is no laptop input reading (Linux, an
 ``ioreg`` failure), the ping still goes (fail-open) but the hold does not (the agent's own dialog asks), and the
 describe line's ``Approvals:`` clause says so. The mark rule (:func:`mark_stands`) is shared with the approval push
-(:func:`approval_push`), so a standing mark that holds a request also pushes it. The settings file's ``away_word``, ``away_mode`` and ``away_idle_seconds`` are not
+(:func:`approval_push`), so a standing mark that holds a request also pushes it. The PING about a request already
+filed and held is wider than the hold (Phill 11-02, np-e642162b (a)): :func:`approval_push` sends it whatever the desk
+or devices setting is doing, unless a mute holds it; the hold's own question above is unchanged. The settings file's ``away_word``, ``away_mode`` and ``away_idle_seconds`` are not
 read then; the one threshold is the record's ``follow_after``. With no queue directory (an old caller, kept for one
 release) the legacy order stands: the explicit word, then input idle (no keyboard, mouse or trackpad input for
 ``away_idle_seconds``, default :data:`IDLE_THRESHOLD`), then off. Input idle is read only on macOS, from ``ioreg``'s
@@ -110,11 +112,16 @@ def approval_push(settings: Any, queue_dir: Path | str | None, kind: str = "cons
     """Whether a ping of ``kind`` from a consent hook goes to the devices: the mark-aware decider. An approval-class ping
     (:func:`levain.webpush.presence.kind_class`) under a standing mark (:func:`mark_stands`) is pushed, since the hold is
     then waiting on exactly that device for a signed answer; everything else is
-    :func:`levain.webpush.presence.should_push`. Returns its :class:`~levain.webpush.presence.Decision`."""
+    :func:`levain.webpush.presence.should_push` with ``filed``: every approval-class ping a consent hook or gate sends is
+    about a request it FILED and holds for a signed answer, with no dialog to fall back to, so it goes whatever the desk
+    or devices setting is doing and only a mute holds it (Phill 11-02, np-e642162b (a)). That is this ping's push only:
+    the hold (:func:`away_state`, :func:`levain.webpush.intent.approvals_route`) reads the record without ``filed``.
+    Returns its :class:`~levain.webpush.presence.Decision`."""
     from levain.webpush import presence
 
     forced = marked_push(mark_stands(settings), kind)
-    return forced if forced is not None else presence.should_push(queue_dir, kind, idle=idle, suggest=suggest)
+    return forced if forced is not None else presence.should_push(queue_dir, kind, idle=idle, suggest=suggest,
+                                                                  filed=True)
 
 
 def marked_push(why: str | None, kind: str) -> Any:

@@ -45,7 +45,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from levain.autonomic.agent_tables import agent_marker, ddl_agents, has_agent_object
+from levain.autonomic.agent_tables import (AgentSchemaNotMigrated, agent_marker, ddl_agents, has_agent_object,
+                                           migrate_agent_schema)
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 
@@ -215,6 +216,13 @@ class AutonomicDB:
             # a new store gets its audit table here; a /1 store is migrated (marker and table, in this
             # transaction); any other marker raises and the transaction rolls back, leaving the store as it was
             migrate_to_v2(conn)
+            # an agent schema /2 store (0.11.27) is taken to /3 here, inside this transaction (P7-A §4). One whose agent
+            # objects do not reach /3 is left /2 (the migration undid its own writes) and the rest of the store opens
+            # as before: `levain agents` refuses it. Any other agent marker is not touched here.
+            try:
+                migrate_agent_schema(conn)
+            except AgentSchemaNotMigrated:
+                pass
             # the agent tables (A0 §3.5): DDL only on a store holding no agent marker and no agent object; a store
             # with either gets none from the opener, and `levain agents` is what refuses it (check_agent_schema)
             if agent_marker(conn) is None and not has_agent_object(conn):

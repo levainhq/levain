@@ -9,7 +9,8 @@ through, and only that:
 - a ping held by a mute goes when the rule says push for it (the mute ended or widened AND his devices are on), preceded by
   ONE summary push for the batch;
 - an approval-class ping goes whenever a signed consent away mark stands, whatever the record says (the mark-aware
-  decider a new ping meets, :func:`levain.consent.auto_away.marked_push`).
+  decider a new ping meets, :func:`levain.consent.auto_away.marked_push`), and otherwise as soon as no mute holds it (it is
+  about a request filed and held for a signed answer: :func:`levain.webpush.intent.decide`'s ``filed``).
 
 A flush takes a held ping with a lease (:meth:`PushStore.claim_held`) and marks it released only after a push to the phone
 succeeded (:meth:`PushStore.release_held`): a failed push, a raised error or a flush that dies leaves it held, and it is
@@ -105,7 +106,10 @@ def plan(items: list[dict], rec: dict, reading: float | None, now: float, remote
     ``reading`` the laptop idle seconds with a desk message counted as input. A held ping is released exactly when the rule
     now says push for its kind: lifting a mute does not push a ping while his devices are still off. ``mark`` (why a consent
     away mark stands, :func:`levain.consent.auto_away.any_mark_stands`) releases an approval-class ping whatever the record
-    says, by the same decider a new one meets (:func:`levain.consent.auto_away.marked_push`). Pure."""
+    says, by the same decider a new one meets (:func:`levain.consent.auto_away.marked_push`). A held approval-class ping is
+    one :func:`levain.consent.adapters.claude_code.notify` sent (a request filed and held, a limit hold, a ruling-delivery
+    notice: each waits on him, and only that function holds one), so it is decided with
+    ``filed`` as a new one is (:func:`levain.consent.auto_away.approval_push`): released once no mute holds it. Pure."""
     from levain.consent.auto_away import marked_push
     from levain.webpush import intent
 
@@ -113,7 +117,8 @@ def plan(items: list[dict], rec: dict, reading: float | None, now: float, remote
     muted: list[dict] = []
     for item in items:
         d = marked_push(mark, item["kind"]) or intent.decide(
-            now, rec, reading, class_name=presence.kind_class(item["kind"]), remote=remote, desk_msg_at=desk_msg_at)
+            now, rec, reading, class_name=presence.kind_class(item["kind"]), remote=remote, desk_msg_at=desk_msg_at,
+            filed=True)
         if d.push:
             (active if item["reason"] == "active" else muted).append(item)
     return active, muted

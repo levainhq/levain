@@ -50,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "login after the identity check (Codex has no server-checked identity: not a check).")
     p.add_argument("--login", action="store_true",
                    help="A login session: sign the slot in to the vendor (needs --auth passthrough).")
+    p.add_argument("--dispatch", action="store_true",
+                   help="With --login: a yes at the confirm also marks this slot's login for unattended runs "
+                        "(dispatch). Your consent that agents may spend this login without you at the desk.")
     return p
 
 
@@ -61,11 +64,13 @@ def parse(argv: Sequence[str]) -> Any:
         # DECISION: a login session exists to store the slot's own vendor credential (§5.1 prepare: kind `login`
         # is the passthrough first login); a brokered slot never holds one.
         raise Refused("login-needs-passthrough", "--login signs the slot in; use it with --auth passthrough")
+    if args.dispatch and not args.login:
+        raise Refused("dispatch-needs-login", "--dispatch marks the login you are signing in; use it with --login")
     if args.auth == "passthrough" and not args.login and args.vendor not in IDENTITY_GATED:
         # A vendor with no identity call cannot be started on its stored login: refused here, before a slot is taken.
         raise Refused("passthrough-needs-identity-gate", f"{args.vendor} has no identity call")
     return Request(vendor=args.vendor, repo=args.repo, auth=args.auth,
-                   kind="login" if args.login else "interactive", slot=args.slot)
+                   kind="login" if args.login else "interactive", slot=args.slot, dispatch=args.dispatch)
 
 
 def main(argv: Optional[Sequence[str]] = None, *, run: Optional[Callable[[Any], int]] = None,

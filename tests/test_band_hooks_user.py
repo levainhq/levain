@@ -204,6 +204,46 @@ def test_status_reads_the_receipt_and_the_live_settings(rig, capsys):
     assert rig.verb("status") == 1 and "broken" in capsys.readouterr().err
 
 
+def _set_prompt_timeout(settings, value):
+    doc = json.loads(settings.read_text())
+    for g in doc["hooks"]["UserPromptSubmit"]:
+        for h in g["hooks"]:
+            if band_hook.is_ours(h):
+                if value is None:
+                    h.pop("timeout", None)
+                else:
+                    h["timeout"] = value
+    settings.write_text(json.dumps(doc, indent=2) + "\n")
+
+
+def _prompt_timeouts(settings):
+    doc = json.loads(settings.read_text())
+    return [h.get("timeout") for g in doc["hooks"]["UserPromptSubmit"] for h in g["hooks"] if band_hook.is_ours(h)]
+
+
+def test_an_install_from_before_signing_keeps_its_short_timeout_until_reinstalled_and_status_names_it(rig, capsys):
+    """TERMSIGN L2 r1 (complement MED): the timeout is written into settings.json at install, so an install made
+    while it was 10 s keeps 10 s. Status (and so doctor's row) names it; install, re-run or by `levain update`,
+    rewrites it, idempotently."""
+    assert band_hook.install(python=str(rig.py))[0] == 0
+    assert _prompt_timeouts(rig.settings) == [band_hook.PROMPT_HOOK_TIMEOUT_S]
+    _set_prompt_timeout(rig.settings, 10)                                     # what an earlier release wrote
+    state, detail = band_hook.user_band_state(probe=False)
+    assert state == "broken" and "timeout 10" in detail and "levain band hooks install" in detail
+    assert doctor._check_user_band_hooks().ok is False
+    assert rig.verb("install") == 0
+    assert _prompt_timeouts(rig.settings) == [band_hook.PROMPT_HOOK_TIMEOUT_S]
+    once = rig.settings.read_text()
+    assert rig.verb("install") == 0 and rig.settings.read_text() == once      # idempotent
+    assert band_hook.user_band_state(probe=False)[0] == "installed"
+    _set_prompt_timeout(rig.settings, 10)
+    assert "re-written" in band_hook.refresh_after_update()                   # `levain update` rewrites it too
+    assert _prompt_timeouts(rig.settings) == [band_hook.PROMPT_HOOK_TIMEOUT_S]
+    _set_prompt_timeout(rig.settings, None)                                   # none named: the harness's default
+    assert band_hook.user_band_state(probe=False)[0] == "installed"
+    capsys.readouterr()
+
+
 def test_a_symlinked_settings_file_stays_a_symlink_and_its_target_is_edited(rig):
     dot = rig.tmp / "dotfiles"
     dot.mkdir()

@@ -267,11 +267,13 @@ def test_wiring_walked_away_pushes(tmp_path, monkeypatch):
     assert [c["push"] for c in calls] == [True]
 
 
-def test_wiring_a_consent_at_an_active_laptop_stays_with_the_agents_own_dialog(tmp_path, monkeypatch):
+def test_wiring_a_filed_consent_at_an_active_laptop_pushes(tmp_path, monkeypatch):
+    """notify() with an approval-class kind is always a ping about a FILED request held for a signed answer (no
+    dialog): Phill 11-02 (np-e642162b (a)) it goes to his devices at an active laptop too. Was push False before."""
     _phone(tmp_path)
     calls = _spy(monkeypatch, ACTIVE)
-    assert _notify(tmp_path, "consent") is False
-    assert [c["push"] for c in calls] == [False]
+    assert _notify(tmp_path, "consent") is True
+    assert [c["push"] for c in calls] == [True]
 
 
 def test_wiring_quiet_holds_an_ordinary_ping_and_loud_pushes_again(tmp_path, monkeypatch):
@@ -383,16 +385,187 @@ def test_a_prompt_notice_needs_a_phone_and_a_fault_says_nothing(tmp_path, monkey
     assert calls == []
 
 
-def test_an_away_hold_pings_through_the_hold_path_and_sends_no_notice(tmp_path, monkeypatch):
-    """When an away hold routed the request to his devices (the hold path's own ping), the dialog that asks after it
-    gets no second notice."""
+_AWAY_HOLD = 0.3
+
+
+def _away(marked=True):
+    return claude_code.AdapterSettings(away_mode=True, away_marked=marked, away_hold_seconds=_AWAY_HOLD)
+
+
+def _cx_decide(q, settings, **kw):
+    from levain.consent.adapters import codex
+    from tests._h4 import h4_env, h4_home
+
+    e = {**_pr_event(), "session_id": "s-codex"}
+    return codex.decide(e, q, settings, environ=h4_env(), home=h4_home(), **kw)
+
+
+def _held_ping(calls, q, agent):
+    """The one push an away hold sends for the request it filed (the gate's own ping shape), the request withdrawn."""
+    assert [(c["kind"], c["push"], c["hold"], c["url"]) for c in calls] == [("consent", True, None, "/?view=needs")]
+    assert calls[0]["ref"].startswith("request:")
+    rid = calls[0]["ref"].split(":", 1)[1]
+    assert calls[0]["body"].startswith(f"{agent} waits on you up to ") and f"(request {rid})." in calls[0]["body"]
+    assert q.get(rid)[1] == "withdrawn"                    # the hold ran out and left the call to the dialog
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_an_away_hold_pings_the_request_to_his_devices_once_and_sends_no_notice(tmp_path, monkeypatch, agent):
+    """THE REPRODUCTION (fails on 71992bce: nothing pushes at all, codex HIGH 1). Away on (a signed mark), a paired
+    phone, a key that can sign: a plain PermissionRequest is filed and held for a signed answer, and ONE push for that
+    request goes to his devices when the hold starts, as the gate pings its filed request. The dialog that asks after
+    the hold gets no second notice."""
+    from levain.consent.adapters import codex
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    mod = codex if agent == "codex" else claude_code
+    monkeypatch.setattr(mod, "nothing_can_decide", lambda s, **kw: False)
+    max_hold = _AWAY_HOLD + claude_code.CLEANUP_RESERVE
+    if agent == "codex":
+        assert _cx_decide(q, codex.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=_AWAY_HOLD),
+                          max_hold=max_hold) is None
+    else:
+        assert _cc_decide(q, _away(), max_hold=max_hold) is None
+    _held_ping(calls, q, agent)
+
+
+def test_an_away_hold_is_held_only_when_it_ran_and_pinged(tmp_path, monkeypatch):
+    """decide_ex's ``held``: True for a hold that ran with its ping started; the hook's own answer is unchanged."""
+    from tests._h4 import h4_env, h4_home
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    _spy(monkeypatch, ACTIVE)
+    monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)
+    out = claude_code.decide_ex(_pr_event(), q, _away(), environ=h4_env(), home=h4_home(), launch_nonce="",
+                                contained_launch=None, max_hold=_AWAY_HOLD + claude_code.CLEANUP_RESERVE)
+    assert isinstance(out, claude_code.Abstained) and out.reason == "hold_expired" and out.held is True
+
+
+def _no_wait_clock():
+    # the deadline and the hold read 0; every later read is past the deadline, so the wait after queue.file is 0
+    ticks = iter([0.0, 0.0])
+    return lambda: next(ticks, 1e9)
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_hold_the_deadline_left_no_wait_for_sends_the_dialog_notice(tmp_path, monkeypatch, agent):
+    """codex MED 2 (fails on 71992bce: held=True with no hold run, so neither a ping nor a notice). The hold was above
+    zero when the request was filed, but the deadline left no wait after it: no hold ran and nothing pinged, so the
+    dialog's prompt notice goes, once, for the filed request."""
+    from levain.consent.adapters import codex
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    held = []
+    monkeypatch.setattr(claude_code, "hold_for_answer", lambda *a, **kw: held.append(a) or (None, None))
+    monkeypatch.setattr(codex, "hold_for_answer", lambda *a, **kw: held.append(a) or (None, None))
+    mod = codex if agent == "codex" else claude_code
+    monkeypatch.setattr(mod, "nothing_can_decide", lambda s, **kw: False)
+    max_hold = _AWAY_HOLD + claude_code.CLEANUP_RESERVE
+    if agent == "codex":
+        assert _cx_decide(q, codex.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=_AWAY_HOLD),
+                          max_hold=max_hold, clock=_no_wait_clock()) is None
+    else:
+        from tests._h4 import h4_env, h4_home
+
+        out = claude_code.decide_ex(_pr_event(), q, _away(), environ=h4_env(), home=h4_home(), launch_nonce="",
+                                    contained_launch=None, max_hold=max_hold, clock=_no_wait_clock())
+        assert isinstance(out, claude_code.Abstained) and out.held is False and calls == []   # decide_ex sends no notice
+        assert _cc_decide(q, _away(), max_hold=max_hold, clock=_no_wait_clock()) is None
+    assert held == []                                                    # no hold ran
+    assert [(c["kind"], c["push"]) for c in calls] == [("consent", True)]
+    assert calls[0]["body"].startswith(f"{agent} asks in its own dialog: ")
+    assert calls[0]["ref"].startswith("request:")
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_an_away_hold_whose_ping_cannot_start_sends_the_dialog_notice(tmp_path, monkeypatch, agent):
+    """A hold ran but its ping could not start: ``held`` is false, so the dialog's notice goes (never neither)."""
+    from levain.consent.adapters import codex
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    monkeypatch.setattr(claude_code, "_notify_ex", lambda *a, **kw: (False, False, False))
+    mod = codex if agent == "codex" else claude_code
+    monkeypatch.setattr(mod, "nothing_can_decide", lambda s, **kw: False)
+    max_hold = _AWAY_HOLD + claude_code.CLEANUP_RESERVE
+    if agent == "codex":
+        assert _cx_decide(q, codex.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=_AWAY_HOLD),
+                          max_hold=max_hold) is None
+    else:
+        assert _cc_decide(q, _away(), max_hold=max_hold) is None
+    assert [(c["kind"], c["push"]) for c in calls] == [("consent", True)]
+    assert calls[0]["body"].startswith(f"{agent} asks in its own dialog: ")
+
+
+def test_an_away_hold_ping_is_never_silenced_by_a_faulting_dedupe_read(tmp_path, monkeypatch):
+    """L3 round c (complement MED 1): the request id was minted for this hook call, so nothing can have pinged it; a
+    `pinged` read that faults reads as "already pinged" and used to silence both this ping and the dialog's notice."""
+    import levain.webpush as wp
+
+    qdir = tmp_path / "q"
+    qdir.mkdir()
+    _phone(qdir)
+    calls = _spy(monkeypatch, ACTIVE)
+    monkeypatch.setattr(wp, "pinged", lambda *a, **kw: True)   # what a locked pings DB reads as
+    assert claude_code.hold_ping(_away(), qdir, "claude_code", "Bash: touch x", "r7", 300.0) is True
+    assert [c["ref"] for c in calls] == ["request:r7"]
+    assert calls[0]["body"] == "claude_code waits on you up to 300 s: Bash: touch x (request r7)."
+
+
+def test_an_away_hold_ping_never_raises(tmp_path, monkeypatch):
+    qdir = tmp_path / "q"
+    qdir.mkdir()
+    _phone(qdir)
+
+    def boom(*a, **kw):
+        raise RuntimeError("notify")
+    monkeypatch.setattr(claude_code, "_notify_ex", boom)
+    assert claude_code.hold_ping(_away(), qdir, "claude_code", "x", "r1", 1.0) is False
+
+
+def test_an_away_hold_ping_under_a_mute_is_queued_not_pushed(tmp_path, monkeypatch):
+    """A mute still holds the ping (notify's existing hold path queues it under its word), and a queued ping counts as
+    the request's one ping (``hold_ping`` true), so no dialog notice follows it."""
+    qdir = tmp_path / "q"
+    qdir.mkdir()
+    _phone(qdir)
+    calls = _spy(monkeypatch, ACTIVE)
+    intent.apply_settings(qdir, lets_through="nothing", idle=lambda: ACTIVE)
+    assert claude_code.hold_ping(_away(marked=False), qdir, "claude_code", "Bash: touch x", "r3", 300.0) is True
+    assert [(c["kind"], c["push"], bool(c["hold"]), c["ref"]) for c in calls] == [("consent", False, True, "request:r3")]
+
+
+def test_a_mute_without_a_mark_starts_no_hold_and_says_nothing(tmp_path, monkeypatch):
+    """The hold is unchanged: under the explicit word with no signed mark the presence record decides, and a mute keeps
+    approvals off his devices, so no hold runs and nothing is filed for one; the dialog asks and the mute says nothing
+    (the prompt notice's own rule)."""
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    held = []
+    monkeypatch.setattr(claude_code, "hold_for_answer", lambda *a, **kw: held.append(a) or (None, None))
+    monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)
+    intent.apply_settings(q.directory, lets_through="nothing", idle=lambda: ACTIVE)
+    assert _cc_decide(q, _away(marked=False), max_hold=_AWAY_HOLD + claude_code.CLEANUP_RESERVE) is None
+    assert held == [] and calls == []
+
+
+def test_a_signed_mark_under_a_mute_still_holds_and_pushes(tmp_path, monkeypatch):
+    """The mark rule is unchanged: a standing signed mark holds the request and pushes its approval whatever the record
+    says (auto_away.marked_push), so the held request's one ping goes."""
     q = _consent_queue(tmp_path)
     _phone(q.directory)
     calls = _spy(monkeypatch, ACTIVE)
     monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)
-    away = claude_code.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=0.3)
-    assert _cc_decide(q, away, max_hold=0.3 + claude_code.CLEANUP_RESERVE) is None
-    assert calls == []
+    intent.apply_settings(q.directory, lets_through="nothing", idle=lambda: ACTIVE)
+    assert _cc_decide(q, _away(), max_hold=_AWAY_HOLD + claude_code.CLEANUP_RESERVE) is None
+    _held_ping(calls, q, "claude_code")
 
 
 def test_codex_dialog_at_an_active_laptop_pings_the_devices_once(tmp_path, monkeypatch):
@@ -406,6 +579,91 @@ def test_codex_dialog_at_an_active_laptop_pings_the_devices_once(tmp_path, monke
     assert codex.decide(e, q, codex.AdapterSettings(), environ=h4_env(), home=h4_home()) is None
     assert [(c["kind"], c["push"]) for c in calls] == [("consent", True)]
     assert calls[0]["body"].startswith("codex asks in its own dialog: ")
+
+
+# --- a request FILED and held for a signed answer, no dialog (Phill 11-02, np-e642162b (a), the same ruling) ------------
+
+def _gated_edit(ws, posture, **extra):
+    (ws / ".claude").mkdir(parents=True, exist_ok=True)
+    return {"hook_event_name": "PreToolUse", "session_id": "s-filed", "cwd": str(ws), "permission_mode": posture,
+            "tool_name": "Edit", "tool_use_id": f"tu-{posture}",
+            "tool_input": {"file_path": str(ws / ".claude" / "settings.json"), "old_string": "a", "new_string": "b"},
+            **extra}
+
+
+@pytest.mark.parametrize("posture", ["bypassPermissions", "acceptEdits", "auto"])
+def test_a_filed_and_held_request_at_an_active_laptop_pushes_its_ping(tmp_path, monkeypatch, posture):
+    """THE REPRODUCTION (fails on 6c5236c2: the ping is recorded held "active", push False). A gated T3 call in a
+    non-default posture, him active at the laptop (follow reading 5 s), a key could sign: the request is filed and held
+    for a signed answer (no dialog will ask), and its ping goes to his devices. The hold's own question is unchanged."""
+    from tests._h4 import h4_env, h4_home
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)   # a key could sign
+    assert intent.approvals_to_devices(q.directory, idle=lambda: ACTIVE)[0] is False   # the hold's question: unchanged
+    settings = claude_code.AdapterSettings(gate_hold_seconds=0.2)
+    out = claude_code.gate(_gated_edit(tmp_path / "ws", posture), q, settings, home=h4_home(), environ=h4_env(),
+                           sleep=lambda s: None)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"          # held to D, never passed
+    assert [(c["kind"], c["push"], c["hold"]) for c in calls] == [("consent", True, None)]
+    assert calls[0]["ref"].startswith("request:")
+    assert q.get(calls[0]["ref"].split(":", 1)[1]) is not None                # the request was filed
+
+
+def test_a_filed_codex_request_at_an_active_laptop_pushes_its_ping(tmp_path, monkeypatch):
+    from levain.consent.adapters import codex
+    from tests._h4 import h4_env, h4_home
+
+    q = _consent_queue(tmp_path)
+    _phone(q.directory)
+    calls = _spy(monkeypatch, ACTIVE)
+    monkeypatch.setattr(codex, "nothing_can_decide", lambda s, **kw: False)
+    ws = tmp_path / "ws"
+    (ws / ".codex").mkdir(parents=True)
+    event = {"hook_event_name": "PreToolUse", "session_id": "s-cx", "turn_id": "t1", "transcript_path": None,
+             "cwd": str(ws), "model": "m", "permission_mode": "bypassPermissions", "tool_name": "apply_patch",
+             "tool_input": {"command": "*** Begin Patch\n*** Add File: .codex/hooks.json\n+{}\n*** End Patch"},
+             "tool_use_id": "call-cx"}
+    out = codex.gate(event, q, codex.AdapterSettings(gate_hold_seconds=0.2), home=h4_home(), environ=h4_env(),
+                     codex_dir=ws / ".codex", sleep=lambda s: None)
+    assert out is not None                                                    # held to D, never passed
+    assert [(c["kind"], c["push"], c["hold"]) for c in calls] == [("consent", True, None)]
+    assert calls[0]["ref"].startswith("request:")
+
+
+def test_a_filed_request_ping_is_still_held_by_a_mute(tmp_path, monkeypatch):
+    """Only a mute (lets_through not admitting approvals) holds the ping about a filed request, under its word."""
+    _phone(tmp_path)
+    calls = _spy(monkeypatch, ACTIVE)
+    intent.apply_settings(tmp_path, lets_through="nothing", idle=lambda: ACTIVE)
+    for kind in ("consent", "push", "reping"):
+        assert _notify(tmp_path, kind) is False
+    assert [c["push"] for c in calls] == [False] * 3 and all(c["hold"] for c in calls)
+
+
+def test_a_filed_request_ping_goes_with_devices_off_and_other_pings_still_hold(tmp_path, monkeypatch):
+    _phone(tmp_path)
+    calls = _spy(monkeypatch, INACTIVE)
+    intent.apply_settings(tmp_path, devices="off", idle=lambda: INACTIVE)
+    for kind in ("consent", "push", "reping"):
+        assert _notify(tmp_path, kind) is True
+    assert _notify(tmp_path, "ruling") is False            # an other-class ping: held as before
+    assert [c["push"] for c in calls] == [True, True, True, False]
+    assert intent.approvals_to_devices(tmp_path, idle=lambda: INACTIVE)[0] is False   # the hold's question: unchanged
+
+
+def test_a_held_approval_ping_is_released_at_an_active_laptop_once_the_mute_ends():
+    """held.plan reads the rule a new filed-request ping meets: an approval ping held by a mute goes once the mute
+    ends, at the laptop too; an other-class ping held the same way waits for his devices."""
+    from levain.webpush import held
+
+    rec = intent.read(None, 0.0)
+    items = [{"kind": "consent", "reason": "quiet"}, {"kind": "ruling", "reason": "quiet"},
+             {"kind": "reping", "reason": "active"}]
+    active, muted = held.plan(items, rec, 5.0, 1000.0)
+    assert [i["kind"] for i in muted] == ["consent"] and [i["kind"] for i in active] == ["reping"]
 
 
 # --- the CLI words ----------------------------------------------------------------------------------------------------

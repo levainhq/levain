@@ -26,6 +26,7 @@ Stdlib only.
 """
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -36,16 +37,19 @@ from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent import record
 from levain.contracts import ContractError
 from levain.contracts.canon import canonical_bytes, parse
-from levain.qbroker.broker import stored_request
+from levain.qbroker.broker import (RUN_CALLS_KIND, RUN_DEADLINE_KIND, RUN_STATE_FORMAT, _calls_ok, _deadline_ok,
+                                   run_state_path, stored_request)
 from levain.qbroker.receipts import Receipts, ReceiptsError
 from levain.qbroker.seam import answer_refusal
 from levain.qbroker.signers import SignersSnapshot
-from levain.qbroker.store import ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, valid_request_id
+from levain.qbroker.store import ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed, _read_untrusted, valid_request_id
 
-__all__ = ["CLAIM_KEYS", "Listed", "OperatorError", "answer_payload", "rows", "write_answer"]
+__all__ = ["CLAIM_KEYS", "Listed", "OperatorError", "answer_payload", "rows", "run_state", "write_answer"]
 
 # the request fields only the hook vouches for
 CLAIM_KEYS = ("agent", "agent_session_id", "cwd", "display")
+# the keys of a published run state (tests/test_qbroker_run_caps.py reads GATE's own through run_state)
+_RUN_STATE_KEYS = frozenset({"format", "run_id", "calls", "cap", "deadline", "tripped"})
 _SETTLED = frozenset({"allowed", "denied", "expired"})
 
 
@@ -127,6 +131,41 @@ def rows(root: Path | str, *, now: datetime | None = None) -> list[Listed]:
             state=_state(recorded.get(rid), request.expires_at, stamp), answered=store.has_answer(rid),
             claims={k: getattr(request, k) for k in CLAIM_KEYS}))
     return sorted(out, key=lambda r: (r.received_at, r.request_id))
+
+
+def run_state(root: Path | str, run_id: str, *, now: float | None = None) -> dict[str, Any]:
+    """``RUN-STATE {run_id}`` (P7-A3, read-only): ``{calls, cap, tripped, kind, known}`` for one run, read from the
+    state GATE published beside the request rows (the operator cannot open the broker's own counter directory).
+    ``tripped`` is True once the run's call cap latched or its deadline passed (``kind`` names which). ``known`` is
+    False for a run GATE has not yet judged: that reads ``tripped`` False and is NOT evidence of health, only of no
+    call so far. A queue that cannot be opened, or a state file that is there and unreadable, not this run's, or not
+    one GATE could have written, is :class:`OperatorError` (fail closed), never a quiet zero."""
+    if not isinstance(run_id, str) or not run_id:
+        raise OperatorError("RUN-STATE wants a run id")
+    try:
+        store = QueueStore(root, create=False)
+        path = run_state_path(store.requests, run_id)
+        data = _read_untrusted(path)
+        doc = None if data is None else _parsed(data)
+    except (ValueError, OSError) as exc:
+        raise OperatorError(f"the state of run {run_id} cannot be read ({exc})") from None
+    if doc is None:
+        return {"calls": 0, "cap": None, "tripped": False, "kind": None, "known": False}
+    calls, cap, deadline, kind = doc.get("calls"), doc.get("cap"), doc.get("deadline"), doc.get("tripped")
+    # the broker's own range checks: a state GATE publishes holds the caps it resolved, and a kind only for a cap the
+    # run has
+    if set(doc) != _RUN_STATE_KEYS or doc["format"] != RUN_STATE_FORMAT or doc["run_id"] != run_id \
+            or type(calls) is not int or calls < 0 \
+            or (cap is None and deadline is None) \
+            or (cap is not None and not _calls_ok(cap)) \
+            or (deadline is not None and not _deadline_ok(deadline)) \
+            or kind not in (None, RUN_CALLS_KIND, RUN_DEADLINE_KIND) \
+            or (kind == RUN_CALLS_KIND and cap is None) \
+            or (kind == RUN_DEADLINE_KIND and deadline is None):
+        raise OperatorError(f"the state of run {run_id} is not a run state")
+    if kind is None and deadline is not None and (time.time() if now is None else now) >= deadline:
+        kind = RUN_DEADLINE_KIND
+    return {"calls": calls, "cap": cap, "tripped": kind is not None, "kind": kind, "known": True}
 
 
 def _request(store: QueueStore, request_id: str) -> tuple[dict[str, Any], record.ExternalGateRequest]:

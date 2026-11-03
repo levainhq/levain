@@ -300,7 +300,7 @@ def _policy_show(args: argparse.Namespace) -> int:
     print("what each preset lets through (the notification policy is retired):")
     for name, r in intent.PRESET_TABLE.items():
         end = "your next input at this Mac" if r["until"] == "input" else "a timer (default 60 min)"
-        print(f"  {name:<6} devices {r['devices']:<3}  lets through {intent._LETS_WORDS[r["lets_through"]]:<19}  until {end}")
+        print(f"  {name:<6} devices {r['devices']:<3}  lets through {intent._LETS_WORDS[r['lets_through']]:<19}  until {end}")
     print("  back   clears the preset and returns to your standing default (a standing loud is left)")
     print("retired: change it with `levain ping lets everything|needs|approvals|nothing [--for 1h | --until-input]`")
     return 0

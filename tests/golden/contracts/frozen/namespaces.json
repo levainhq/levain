@@ -102,6 +102,11 @@
    "namespace": "levain-review-clear",
    "status": "shipped",
    "owner": "levain/coordinator/review.py"
+  },
+  {
+   "namespace": "levain-terminal-answer",
+   "status": "shipped",
+   "owner": "levain/consent/terminal_sign.py"
   }
  ],
  "families": [

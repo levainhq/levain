@@ -55,6 +55,9 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     REVIEW_CLEAR_NAMESPACE: ("shipped", "levain/coordinator/review.py",
                              "the operator's passkey clear of a 'yours to clear' coordinator review item, over the "
                              "item's id, state and last event"),
+    "levain-terminal-answer": ("shipped", "levain/consent/terminal_sign.py",
+                               "the laptop Touch ID key's signature over a band answer typed at the terminal "
+                               "(TERMSIGN; message format levain-terminal-answer/1)"),
 }
 
 # The levain namespaces levain's OWN sign requests are filed in (levain.consent.sign serves them on every Signer,

@@ -762,7 +762,7 @@ def signing_public_key(key_path: Path) -> str:
 
 
 def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-               namespace: str = NAMESPACE) -> tuple[str, Signer]:
+               namespace: str = NAMESPACE, timeout: float | None = None) -> tuple[str, Signer]:
     """``(fingerprint, sign)`` for the signing key at ``key_path``: a private key (or an agent-held
     key's public half) that ``ssh-keygen -Y sign -f`` accepts, its public half read from ``<path>.pub``
     (or ``key_path`` itself when it is the ``.pub``). ``sign`` runs ``ssh-keygen -Y sign`` in
@@ -772,7 +772,10 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     The key's sidecar (``levain.cockpit.custody``, written by ``levain cockpit key create``) names its
     provider, which ``sign`` sets as ``SSH_SK_PROVIDER`` itself; an ``SSH_SK_PROVIDER`` in the environment
     still wins. A passphrase key (its sidecar says so, or its file is encrypted) is always signed from the
-    file with no agent, so ssh-keygen asks the passphrase for every signature and nothing caches it."""
+    file with no agent, so ssh-keygen asks the passphrase for every signature and nothing caches it.
+
+    ``timeout`` bounds one signature's wait in seconds; ``None`` keeps the module default. It was added so a
+    caller that wants a shorter bound for its own signer does not have to change the module's global."""
     from levain.cockpit.custody import APPLE_PROVIDER, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
     key_path = Path(key_path).expanduser()
     public_key = signing_public_key(key_path)
@@ -793,8 +796,8 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
             env.pop("SSH_AUTH_SOCK", None)
         try:
             cp = subprocess.run([str(ssh_keygen), "-Y", "sign", "-f", str(key_path), "-n", namespace],
-                                input=message, stdout=subprocess.PIPE, timeout=_SIGN_TIMEOUT, check=False,
-                                env=env)
+                                input=message, stdout=subprocess.PIPE,
+                                timeout=_SIGN_TIMEOUT if timeout is None else timeout, check=False, env=env)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise KeyError_(f"ssh-keygen could not sign ({type(exc).__name__})") from None
         if cp.returncode != 0:

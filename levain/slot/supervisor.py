@@ -905,6 +905,7 @@ class Request:
     auth: str = "brokered"       # brokered | passthrough
     kind: str = "interactive"    # interactive | login
     slot: Optional[int] = None
+    dispatch: bool = False       # login only (c7.14): a yes also marks the slot's login for unattended runs
 
 
 @dataclass
@@ -1639,12 +1640,15 @@ class Supervisor:
         else:
             prompt = (f"levain: this login is {name} account {oid} (the server's answer). Keep it as this slot's "
                       f"{name} baseline? [y/N] ")
+        if self.req.dispatch:
+            prompt = prompt.replace(" [y/N] ", f" A yes also lets unattended runs (dispatch) use this {name} login. [y/N] ")
         answer = (self.s.confirm or self._ask)(prompt)
         if answer is None or self.stop_signal is not None:
             self.say("no answer: no baseline written")
             return
         try:
-            res = self.helper("confirm-identity", session, "yes" if answer else "no", stdin=None)
+            res = self.helper("confirm-identity", session, "yes" if answer else "no",
+                              *(("--dispatch",) if answer and self.req.dispatch else ()), stdin=None)
         except Refused as e:
             self.say(f"no baseline written: refused {e.name}")
             return
