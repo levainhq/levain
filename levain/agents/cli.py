@@ -561,6 +561,8 @@ def _run_revoke_signed(args: argparse.Namespace) -> int:
     if store is None:
         return 1
     clock = lambda: _utcnow()      # noqa: E731  (looked up per call)
+    begun = False          # begin has run: a bar may be open, so every later failure says the agent stays barred
+    bar_id: str | None = None
     try:
         signer_fp, sign = ssh_signer(args.signing_key)
         db = _journal(args.data_root)
@@ -571,9 +573,11 @@ def _run_revoke_signed(args: argparse.Namespace) -> int:
                 if sid is None:
                     return _fail("revoke", why)
                 anchor = anchor_path(db.data_root)
+                begun = True
                 step = aa.revoke_agent_begin(autonomic, cockpit, args.agent, store_id=sid, signer_fp=signer_fp,
                                              clock=clock)
-                print(step.text)
+                bar_id = step.bar_id
+                _say(step)
                 rounds = 0
                 while step.state in ("prepared", "stale_head", "reprepared"):
                     if rounds >= REVOKE_SIGN_ROUNDS:
@@ -583,17 +587,56 @@ def _run_revoke_signed(args: argparse.Namespace) -> int:
                     rounds += 1
                     step = aa.revoke_agent_sign(autonomic, step.bar_id, sign, clock=clock)
                     if step.state != "signed":
-                        print(step.text)
+                        _say(step)
                         continue
                     step = aa.revoke_agent_finish(autonomic, cockpit, step.bar_id, clock=clock, anchor=anchor)
-                    print(step.text)
+                    _say(step)
+                if step.state not in _REVOKE_TERMINAL:
+                    return _fail("revoke", f"unexpected revoke state {step.state!r}: {step.text}" + _STAYS_BARRED)
             finally:
                 autonomic.close()
     except aa.AgentAuthorityError as exc:
-        return _fail("revoke", f"{exc}")
-    except _signing_refusals() as exc:
-        return _fail("revoke", exc)
+        landed = _landed_seq(args, bar_id) if bar_id is not None else None
+        if landed is not None:
+            print(f"the revoke had already landed at seq {landed}")
+            return 0
+        return _fail("revoke", f"{exc}" + (_STAYS_BARRED if begun else ""))
+    except (_signing_refusals() + (StoreFormatError,)) as exc:
+        return _fail("revoke", f"{exc}" + (_STAYS_BARRED if begun else ""))
     return 0     # landed, landed on an abandoned bar, or abandoned: each is the true outcome (A0 section 2.2)
+
+
+_REVOKE_TERMINAL = ("landed", "landed_bar_abandoned", "abandoned")
+_STAYS_BARRED = "; the agent stays barred; run revoke again or --abandon"
+
+
+def _say(step) -> None:
+    """Print a revoke step; an abandoned one says plainly that nothing was revoked (the exit stays 0, c6(b))."""
+    if step.state == "abandoned":
+        print(f"{step.text}; the agent is NOT revoked")
+    else:
+        print(step.text)
+
+
+def _landed_seq(args: argparse.Namespace, bar_id: str) -> int | None:
+    """The seq this call's own bar closed with, when a concurrent revoke landed it first; None otherwise (or on any
+    store trouble: the caller then reports the failure it already has)."""
+    from levain.agents import bars
+
+    try:
+        store = _open(args)
+        if store is None:
+            return None
+        conn = store._db._connect()
+        try:
+            bar = bars.read_bar(conn, bar_id)
+        finally:
+            conn.close()
+    except (sqlite3.Error, StoreFormatError):
+        return None
+    if bar is not None and bar.reason in ("signed", "from_log") and bar.revoke_seq is not None:
+        return bar.revoke_seq
+    return None
 
 
 def _run_abandon(args: argparse.Namespace) -> int:
@@ -621,11 +664,11 @@ def _run_abandon(args: argparse.Namespace) -> int:
 
 
 def _no_open_bar(autonomic: sqlite3.Connection, agent_id: str, *, bar_id: str | None = None) -> int:
-    """The abandon found no row to close: say what the bar's own record says. A revoke that landed first stands."""
+    """The abandon found no row to close. With a ``bar_id`` this call saw the bar open and lost the close: say what the
+    bar's own record says (a revoke that landed first stands). With none, no revoke was ever open to this call: 1."""
     from levain.agents import bars
 
-    row = bars.read_bar(autonomic, bar_id) if bar_id is not None else autonomic.execute(
-        f"{bars._SELECT} WHERE agent_id = ? ORDER BY barred_at DESC, rowid DESC LIMIT 1", (agent_id,)).fetchone()
+    row = bars.read_bar(autonomic, bar_id) if bar_id is not None else None
     if row is not None and not isinstance(row, bars.Bar):
         row = bars._bar(row)
     if row is not None and row.reason in ("signed", "from_log") and row.revoke_seq is not None:

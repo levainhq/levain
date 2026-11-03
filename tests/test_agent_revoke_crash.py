@@ -253,10 +253,21 @@ def test_c8_an_abandon_racing_the_append_leaves_the_revoke_standing_and_exits_ze
     assert (from_log.reason, from_log.revoke_seq) == ("from_log", rig.revokes())
     monkeypatch.setattr(auth, "append", real_append)
 
-    # (b) step 4 closed first: the abandon touches no row and says the revoke had already landed, exit 0
+    # (b) step 4 closed first (the abandon saw the bar open, lost the close): it touches no row and says the revoke had
+    # already landed, exit 0. With no bar ever seen open, a stale landed bar is not this (exit 1, no open revoke).
     other = "ag-" + "d4" * 16
     create(rig.world, 3, agent=other, store=rig.store_id)
-    assert rig.revoke(other) == 0
+    aa.revoke_agent_begin(rig.conn, _cockpit(rig), other, store_id=rig.store_id, signer_fp=rig.fp,
+                          clock=lambda: rig.world.clock.now)
+    real_close = bars.close_bar
+
+    def step4_got_there_first(conn, bar_id, *, revoke_seq, reason, now):
+        real_close(conn, bar_id, revoke_seq=9, reason="signed", now=now)
+        return False
+
+    monkeypatch.setattr(bars, "close_bar", step4_got_there_first)
     capsys.readouterr()
     assert rig.abandon(other) == 0
-    assert f"the revoke had already landed at seq {rig.revokes_of(other)}; nothing to abandon" in capsys.readouterr().out
+    assert "the revoke had already landed at seq 9; nothing to abandon" in capsys.readouterr().out
+    monkeypatch.setattr(bars, "close_bar", real_close)
+    assert rig.abandon(other) == 1

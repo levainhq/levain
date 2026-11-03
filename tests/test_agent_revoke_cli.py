@@ -102,11 +102,77 @@ def test_abandon_closes_the_open_bar_abandoned_with_a_null_seq_and_an_attention_
     assert rig.revokes() == 0
 
 
-def test_abandon_with_nothing_open_says_so_and_with_a_landed_revoke_reports_its_seq(rig, capsys):
+def test_abandon_with_nothing_open_says_so_even_when_an_old_revoke_landed(rig, capsys):
     assert rig.abandon() == 1 and "no open revoke" in capsys.readouterr().err
     assert rig.revoke() == 0
-    seq = rig.revokes()
     capsys.readouterr()
-    assert rig.abandon() == 0
-    assert f"the revoke had already landed at seq {seq}; nothing to abandon" in capsys.readouterr().out
+    assert rig.abandon() == 1          # no open bar was ever seen by this call: a stale landed bar is not "lost the race"
+    assert "no open revoke" in capsys.readouterr().err
     assert len(rig.bars()) == 1
+
+
+def test_abandon_that_loses_the_close_to_a_landing_revoke_reports_its_seq(rig, capsys, monkeypatch):
+    aa.revoke_agent_begin(rig.conn, sqlite3.connect(rig.world.db, isolation_level=None), AGENT,
+                          store_id=rig.store_id, signer_fp=rig.fp, clock=lambda: rig.world.clock.now)
+    real = bars.close_bar
+
+    def lose(conn, bar_id, *, revoke_seq, reason, now):
+        real(conn, bar_id, revoke_seq=7, reason="signed", now=now)      # the revoke's finish got there first
+        return False
+
+    monkeypatch.setattr(bars, "close_bar", lose)
+    assert rig.abandon() == 0
+    assert "the revoke had already landed at seq 7; nothing to abandon" in capsys.readouterr().out
+
+
+def test_a_finish_that_loses_to_a_concurrent_landing_reports_it_and_exits_0(rig, capsys, monkeypatch):
+    real = aa.revoke_agent_finish
+
+    def lands_then_refuses(autonomic, cockpit, bar_id, **kw):
+        real(autonomic, cockpit, bar_id, **kw)       # the other process's revoke landed; ours cannot prepare
+        raise aa.AgentAuthorityError("the revoke cannot be prepared: no agent-link to remove")
+
+    monkeypatch.setattr(aa, "revoke_agent_finish", lands_then_refuses)
+    assert rig.revoke() == 0
+    cap = capsys.readouterr()
+    (bar,) = rig.bars()
+    assert f"already landed at seq {bar.revoke_seq}" in cap.out and bar.revoke_seq
+
+
+def test_a_failure_after_begin_says_the_agent_stays_barred(rig, capsys, monkeypatch):
+    def refuse(*a, **k):
+        raise aa.AgentAuthorityError("the revoke cannot be prepared")
+
+    monkeypatch.setattr(aa, "_prepare_onto", refuse)
+    assert rig.revoke() == 1
+    err = capsys.readouterr().err
+    assert "the agent stays barred; run revoke again or --abandon" in err
+    (bar,) = rig.bars()
+    assert bar.closed_at is None
+
+
+def test_an_abandoned_result_says_not_revoked_and_exits_0(rig, capsys, monkeypatch):
+    monkeypatch.setattr(aa, "revoke_agent_sign", lambda autonomic, bar_id, sign, **kw: aa.RevokeStep(
+        "abandoned", bar_id, None, "the revoke was abandoned; nothing was appended"))
+    assert rig.revoke() == 0
+    assert "NOT revoked" in capsys.readouterr().out
+
+
+def test_a_store_error_is_a_one_line_failure_not_a_traceback(rig, capsys, monkeypatch):
+    from levain.autonomic.db import StoreFormatError
+
+    for exc in (sqlite3.OperationalError("database is locked"), StoreFormatError("bad store")):
+        def boom(*a, _e=exc, **k):
+            raise _e
+
+        monkeypatch.setattr(aa, "revoke_agent_begin", boom)
+        assert rig.revoke() == 1
+        err = capsys.readouterr().err
+        assert err.count("\n") == 1 and str(exc) in err and "Traceback" not in err
+
+
+def test_an_unknown_terminal_state_is_a_failure_not_success(rig, capsys, monkeypatch):
+    monkeypatch.setattr(aa, "revoke_agent_finish", lambda autonomic, cockpit, bar_id, **kw: aa.RevokeStep(
+        "refused", bar_id, None, "policy refused"))
+    assert rig.revoke() == 1
+    assert "unexpected revoke state 'refused'" in capsys.readouterr().err
