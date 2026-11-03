@@ -15,7 +15,7 @@ from levain.slot.services import keys as SK
 
 
 def _control_row(host):
-    return next(r for r in layout.base_run_rows(host) if r.path == layout.RUN[host] / "control")
+    return next(r for r in layout.base_run_rows(host, "op") if r.path == layout.RUN[host] / "control")
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
@@ -23,7 +23,7 @@ def test_r_control_is_setgid_levain_control(host):
     row = _control_row(host)
     assert (row.owner, row.group, row.mode) == ("_levain_control", "levain-control", 0o2750)
     if host == "linux":    # the boot-time copy keeps the setgid bit
-        assert f"d {row.path} 2750 _levain_control levain-control -" in layout.tmpfiles_text(host, ())
+        assert f"d {row.path} 2750 _levain_control levain-control -" in layout.tmpfiles_text(host, (), "op")
     steps = layout.row_steps(host, [row])
     assert steps[-1].argv[-2:] == ("2750", str(row.path))   # the mode last, so no chown clears it
 

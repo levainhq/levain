@@ -780,7 +780,7 @@ def test_view_ancestors_precede_their_binds_with_layouts_modes(slot, kw):
     for b in binds:
         anc = [str(a) for a in reversed(PurePosixPath(b).parents) if str(a) != "/"]
         assert all(a in made for a in anc) and [m for m in made if m in anc] == anc    # parents first
-    rows = {str(r.path): r.mode for r in base_store_rows("linux", "-") + base_run_rows("linux") if r.kind == "dir"}
+    rows = {str(r.path): r.mode for r in base_store_rows("linux", "-") + base_run_rows("linux", "-") if r.kind == "dir"}
     for p, mode in dirs:
         assert mode == rows.get(p, 0o755), p                         # §2.1 / §2.2's row, where it has one
     assert ("/var/levain", 0o755) in dirs and ("/var/levain/live", 0o711) in dirs

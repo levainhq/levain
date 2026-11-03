@@ -66,16 +66,18 @@ def _recv_exact(sock: socket.socket, n: int, deadline: float | None, started: bo
     return b"".join(chunks)
 
 
-def read_frame(sock: socket.socket, *, timeout: float | None = None) -> dict[str, Any] | None:
-    """The next message, or ``None`` at EOF. The length is checked before a byte of the body is read. With
-    ``timeout``, the whole frame must arrive within that many seconds of this call, however it is dripped in:
-    :class:`TimeoutError` when nothing came, a ``frame-timeout`` FrameError when part of it did."""
+def read_frame(sock: socket.socket, *, timeout: float | None = None,
+               max_frame: int = MAX_FRAME) -> dict[str, Any] | None:
+    """The next message, or ``None`` at EOF. The length is checked against ``max_frame`` (at most :data:`MAX_FRAME`)
+    before a byte of the body is read. With ``timeout``, the whole frame must arrive within that many seconds of this
+    call, however it is dripped in: :class:`TimeoutError` when nothing came, a ``frame-timeout`` FrameError when part
+    of it did."""
     deadline = None if timeout is None else time.monotonic() + timeout
     head = _recv_exact(sock, _LEN.size, deadline, False)
     if head is None:
         return None
     (n,) = _LEN.unpack(head)
-    if n > MAX_FRAME:
+    if n > min(max_frame, MAX_FRAME):
         raise FrameError("frame-too-large")
     body = _recv_exact(sock, n, deadline, True) if n else b""
     if body is None:

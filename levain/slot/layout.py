@@ -200,9 +200,15 @@ def slot_store_rows(host: HostOS, slot: SlotId) -> list[Row]:
     return rows
 
 
-def base_run_rows(host: HostOS) -> list[Row]:
-    """The run-dir rows that do not depend on the slots (CONTRACT §2.2)."""
+def base_run_rows(host: HostOS, operator: str | None) -> list[Row]:
+    """The run-dir rows that do not depend on the slots (CONTRACT §2.2). ``operator`` owns ``R/fence/``, the dir the
+    operator-uid fence server binds in; it is group ``_levain_qbroker`` so the queue broker (and no slot uid) reaches
+    the socket, and setgid on Linux so the socket takes that group (a BSD dir hands its group down without it).
+    ``operator`` None (the reaper's boot pass when ``L/policy/operator`` cannot be read): every row but ``R/fence/``,
+    which no owner is better than a wrong one for."""
     R = RUN[host]
+    fence = [] if operator is None else [Row(R / "fence", operator, "_levain_qbroker",
+                                             0o2750 if host == "linux" else 0o750)]
     return [
         _root(host, R, 0o755),
         _root(host, R / "gw", 0o755),
@@ -215,6 +221,7 @@ def base_run_rows(host: HostOS) -> list[Row]:
         # (the operator, keys, qbroker, dispatch) is in. macOS gives a new entry its directory's group either way.
         Row(R / "control", "_levain_control", "levain-control", 0o2750),
         Row(R / "reaper", "root", "levain-wake", 0o750),
+        *fence,
     ]
 
 
@@ -425,23 +432,23 @@ def single_filesystem_steps(host: HostOS, slots: Iterable[SlotId]) -> list[Step]
 TMPFILES_CONF = Path("/etc/tmpfiles.d/levain.conf")
 
 
-def tmpfiles_text(host: HostOS, slots: Iterable[SlotId]) -> str:
+def tmpfiles_text(host: HostOS, slots: Iterable[SlotId], operator: str) -> str:
     """One ``d`` line per §2.2 dir (the base rows, then each slot's), parents first, with the row's
     owner, group and mode (setgid kept); systemd applies it before any unit starts."""
-    rows = base_run_rows(host) + [r for s in sorted(set(slots)) for r in slot_run_rows(host, s)]
+    rows = base_run_rows(host, operator) + [r for s in sorted(set(slots)) for r in slot_run_rows(host, s)]
     lines = ["# Written by the Levain install helper (CONTRACT §22); removed by its undo verb."]
     lines += [f"d {r.path} {r.mode:04o} {r.owner} {r.group} -" for r in rows]
     return "\n".join(lines) + "\n"
 
 
-def tmpfiles_steps(host: HostOS, slots: Iterable[SlotId]) -> list[Step]:
+def tmpfiles_steps(host: HostOS, slots: Iterable[SlotId], operator: str) -> list[Step]:
     """Write ``/etc/tmpfiles.d/levain.conf`` for ``slots`` (every slot in service) and apply it now.
     Setup and replenish run the same list. Linux only."""
     if host != "linux":
         raise Refused("unsupported-host", f"{host}: tmpfiles.d is Linux's")
     return [
         Step(f"write {TMPFILES_CONF} (the run dirs systemd recreates at boot)",
-             write=(TMPFILES_CONF, tmpfiles_text(host, slots), 0o644)),
+             write=(TMPFILES_CONF, tmpfiles_text(host, slots, operator), 0o644)),
         Step(f"apply {TMPFILES_CONF.name}", (_abs("systemd-tmpfiles"), "--create", TMPFILES_CONF.name)),
     ]
 
@@ -466,7 +473,7 @@ def shared_group_rows(host: HostOS, operator: str) -> list[Row]:
     """Every store and run dir whose row names a shared group (§1.2)."""
     from levain.slot.ids import SHARED_GROUPS
 
-    return [r for r in base_store_rows(host, operator) + base_run_rows(host) if r.group in SHARED_GROUPS]
+    return [r for r in base_store_rows(host, operator) + base_run_rows(host, operator) if r.group in SHARED_GROUPS]
 
 
 def ungroup_steps(host: HostOS, operator: str) -> list[Step]:

@@ -273,7 +273,7 @@ def test_setup_and_boot_make_the_run_front_dir():
         assert row in rows and layout.STORE[host] / "gw" / "slot2" in {r.path for r in rows}
     # Linux: systemd-tmpfiles makes R/ at boot from these lines
     assert f"d {layout.RUN['linux']}/gw/slot2 2750 _levain_gw2 _levain_s2 -" in \
-        layout.tmpfiles_text("linux", [SlotId("egress", 2)]).splitlines()
+        layout.tmpfiles_text("linux", [SlotId("egress", 2)], "op").splitlines()
 
 
 # --- T8 / T9: verify-only ----------------------------------------------------------------------------------------------

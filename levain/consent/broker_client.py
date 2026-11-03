@@ -71,9 +71,9 @@ from levain.qbroker.broker import RUN_CALLS_KIND, RUN_DEADLINE_KIND
 __all__ = ["BROKER_ACCOUNT", "CAP_ENV", "FAST_POLLS", "GATE_BACKOFF", "GATE_TOOL_USE_ID_MAX", "GO",
            "IO_TIMEOUT", "PENDING_REFUSALS", "REQUEST_RETRY", "SLOW_POLL", "SOCKET_ENV",
            "BrokerClient", "BrokerError", "UNGATED_TIER", "broker_uid",
-           "file_and_hold", "GATE_FAILED", "GATE_GO", "GATE_HALTED", "GATE_OVER", "SLOT_HALT_TEXT",
-           "SLOT_LIMITS_FAILED_TEXT", "SLOT_OVER_TEXT", "SLOT_RUN_CALLS_TEXT", "SLOT_RUN_DEADLINE_TEXT", "file_ungated", "gate_check", "gate_request",
-           "grant_member", "hold_for_decision", "in_slot"]
+           "file_and_hold", "GATE_FAILED", "GATE_GO", "GATE_FENCED", "GATE_HALTED", "GATE_OVER", "SLOT_FENCED_TEXT",
+           "SLOT_RUN_CALLS_TEXT", "SLOT_RUN_DEADLINE_TEXT", "SLOT_HALT_TEXT", "SLOT_LIMITS_FAILED_TEXT",
+           "SLOT_OVER_TEXT", "file_ungated", "gate_check", "gate_request", "grant_member", "hold_for_decision", "in_slot"]
 
 SOCKET_ENV = "LEVAIN_QUEUE_SOCKET"
 CAP_ENV = "LEVAIN_QUEUE_CAP"
@@ -263,13 +263,16 @@ class BrokerClient:
             return GATE_HALTED, got["request_id"]
         if verdict == GATE_OVER and keys == {"gate", "kind"} and (got["kind"] is None or isinstance(got["kind"], str)):
             return GATE_OVER, got["kind"]
+        if verdict == GATE_FENCED and keys == {"gate", "reason"} and isinstance(got["reason"], str) and got["reason"]:
+            return GATE_FENCED, got["reason"]
         if verdict == GATE_FAILED and keys == {"gate", "reason"} and isinstance(got["reason"], str):
             return GATE_FAILED, got["reason"]
-        raise BrokerError("malformed", "GATE answered none of go, halted, over-limit, limits-failed")
+        raise BrokerError("malformed", "GATE answered none of go, halted, fenced, over-limit, limits-failed")
 
 
-# GATE's four answers (levain.qbroker.broker.GATE_VERDICTS)
+# GATE's answers (levain.qbroker.broker.GATE_VERDICTS)
 GATE_GO, GATE_HALTED, GATE_OVER, GATE_FAILED = "go", "halted", "over-limit", "limits-failed"
+GATE_FENCED = "fenced"
 # the slot's halt words: the operator side numbers gaps, the hook names the halting request
 SLOT_HALT_TEXT = ("levain: this session is halted on request {r}: an irreversible call's hold ended with no answer. "
                   "No further tool calls are allowed. Write a short summary of what is done and end your turn.")
@@ -279,6 +282,10 @@ SLOT_OVER_TEXT = ("levain: STOPPED by a budget the operator set: this session re
                   "a fault and not a denial of the work. Do not try to continue it another way; the session goes on "
                   "only when the operator raises that limit in the slot limits settings (levain limits set --slots), "
                   "or starts a new session.")
+# a fenced GATE: the session's authority is no longer what it launched under; the reason is the current side's
+SLOT_FENCED_TEXT = ("levain: STOPPED: this session's authority has changed since it launched ({why}). This is not a "
+                    "fault and not a denial of this one call. Do not try to continue it another way; the session ends "
+                    "here and the operator side decides whether the work is run again.")
 # a limits-failed GATE: the gate itself failed, not a budget; the reason names which part (the settings or the counter)
 SLOT_LIMITS_FAILED_TEXT = ("levain: the limits gate could not run, so the action was NOT taken: {why}. This is a fault "
                            "of the limits gate, not a budget. The operator fixes what that names: the slot limits "
@@ -297,13 +304,14 @@ SLOT_RUN_DEADLINE_TEXT = ("levain: STOPPED: this run reached its time limit. Thi
                           "the work. The run is over: do not try to continue it another way. Write a short summary "
                           "of what is done and end your turn. The operator starts another run, with a ticket that "
                           "carries a later deadline if more time is needed.")
+_RUN_OVER_TEXT = {RUN_CALLS_KIND: SLOT_RUN_CALLS_TEXT, RUN_DEADLINE_KIND: SLOT_RUN_DEADLINE_TEXT}
 
 
 def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: Any, tool_use_id: str | None,
                sleep: Callable[[float], None] = time.sleep) -> str | None:
     """The slot gate's first step on EVERY PreToolUse, before the call is classified: ``None`` on the broker's GO
-    (the gate goes on), else the deny text (:data:`SLOT_HALT_TEXT`, :data:`SLOT_OVER_TEXT` or
-    :data:`SLOT_LIMITS_FAILED_TEXT`). A ``rate-limited`` GATE is sent again after each pause of :data:`GATE_BACKOFF`
+    (the gate goes on), else the deny text (:data:`SLOT_HALT_TEXT`, :data:`SLOT_FENCED_TEXT`, :data:`SLOT_OVER_TEXT` (a run's
+    own caps: :data:`SLOT_RUN_CALLS_TEXT`, :data:`SLOT_RUN_DEADLINE_TEXT`) or :data:`SLOT_LIMITS_FAILED_TEXT`). A ``rate-limited`` GATE is sent again after each pause of :data:`GATE_BACKOFF`
     (bounded); a refusal past the last, or any other failure, raises :class:`BrokerError` (the caller denies: fail closed)."""
     from levain.consent import limits
 
@@ -320,12 +328,12 @@ def gate_check(client: BrokerClient, *, agent: str, tool_name: str, tool_input: 
         return None
     if verdict == GATE_HALTED:
         return SLOT_HALT_TEXT.format(r=detail)
+    if verdict == GATE_FENCED:
+        return SLOT_FENCED_TEXT.format(why=detail)
     if verdict == GATE_FAILED:
         return SLOT_LIMITS_FAILED_TEXT.format(why=detail)
-    if detail == RUN_CALLS_KIND:
-        return SLOT_RUN_CALLS_TEXT
-    if detail == RUN_DEADLINE_KIND:
-        return SLOT_RUN_DEADLINE_TEXT
+    if detail in _RUN_OVER_TEXT:
+        return _RUN_OVER_TEXT[detail]
     label = limits.LABELS.get(detail) if isinstance(detail, str) else None
     # an unknown or missing kind names no budget it cannot name (L3 r2 complement LOW 1: "reached its a limit")
     return SLOT_OVER_TEXT.format(limit=f"its {label} limit" if label else "a configured limit")

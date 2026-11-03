@@ -63,6 +63,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     show.set_defaults(func=run_role_show)
     _add_p2_parsers(verbs)
     _add_signing_parsers(verbs)
+    _add_fence_parsers(verbs)
 
 
 def run_agents(args: argparse.Namespace) -> int:
@@ -505,3 +506,211 @@ def run_renew(args: argparse.Namespace) -> int:
     if new.anchor_warning:
         print(f"warning: {new.anchor_warning}", file=sys.stderr)
     return 0
+
+
+# ---- the agent fence (P7-2 wiring, shape C): `levain agents fence start|status` -----------------------------------
+
+class FenceSetupError(Exception):
+    """The operator's fence unit cannot be built for this host (no isolation install, no cockpit root)."""
+
+
+class NoIsolationInstall(FenceSetupError):
+    """This host has no isolation install (no ``L/policy``): no queue broker to fence for."""
+
+
+def _add_fence_parsers(verbs: argparse._SubParsersAction) -> None:
+    fence = verbs.add_parser(
+        "fence", help="The operator's agent fence service the queue broker asks on every dispatch tool call.",
+        allow_abbrev=False,
+        description="The agent fence runs as you (never root) and answers the queue broker, once per dispatch GATE, "
+                    "whether the session's agent is still current. While it is down every dispatch session's tool "
+                    "calls are refused. A host has one fence unit, for one install. `start` installs and starts it "
+                    "for this install (idempotent), replacing a unit another install holds; `levain update` runs "
+                    "the same install but leaves another install's unit alone. `status` shows the unit and the "
+                    "server's own STATUS.")
+    fverbs = fence.add_subparsers(dest="fence_verb", metavar="VERB", required=True)
+    for verb, fn, text in (("start", run_fence_start, "Install and start the per-user fence unit (idempotent)."),
+                           ("status", run_fence_status, "The fence unit's state and the server's STATUS.")):
+        p = fverbs.add_parser(verb, help=text, allow_abbrev=False)
+        p.add_argument("--path", type=Path, default=None,
+                       help="The install whose cockpit root the fence reads (default: cwd).")
+        p.set_defaults(func=fn)
+
+
+def _host() -> str:
+    return "darwin" if sys.platform == "darwin" else "linux"
+
+
+def fence_roots(install: Path, *, agent_store: Path | None = None) -> tuple[Path, Path]:
+    """The agent store and cockpit root the fence server reads for ``install``, resolved: ``agent_store`` (default
+    :func:`levain.autonomic.db.default_store_dir`, the store every ``levain agents`` verb opens) and the install's
+    cockpit root, derived as ``levain serve --write`` derives it (its write scope's ledger root's ``cockpit/``).
+    ``levain doctor`` compares the server's STATUS with these."""
+    from levain.autonomic.db import default_store_dir
+    from levain.dashboard import _resolve_source
+
+    scope = _resolve_source(Path(install).expanduser()).write_scope
+    if scope is None:
+        raise FenceSetupError(f"{install} has no writable install, so it has no cockpit root to fence on")
+    store = agent_store if agent_store is not None else default_store_dir()
+    return Path(store).expanduser().resolve(), (scope.ledger_root / "cockpit").expanduser().resolve()
+
+
+def fence_spec(install: Path, *, agent_store: Path | None = None, host: str | None = None,
+               store_root: Path | None = None, run_dir: Path | None = None):
+    """The fence unit's :class:`levain.daemon.DaemonSpec` for ``install``, with ``run_dir`` = this host's ``R``
+    (:data:`levain.slot.layout.RUN`, where the queue broker and ``levain doctor`` look). Refuses
+    (:class:`FenceSetupError`) on a host without the isolation install (no ``L/policy``): there is no broker to answer
+    and no ``_levain_qbroker`` account, so the server could only exit. ``store_root``/``run_dir``: a test's seams."""
+    from levain import daemon
+    from levain.slot import layout
+
+    host = host or _host()
+    L = store_root if store_root is not None else layout.STORE.get(host)
+    R = run_dir if run_dir is not None else layout.RUN.get(host)
+    if L is None or R is None or not (Path(L) / "policy").is_dir():
+        raise NoIsolationInstall("this host has no isolation install (no L/policy), so there is no queue broker to "
+                              "fence for: run `levain slot install` first")
+    store, cockpit = fence_roots(install, agent_store=agent_store)
+    return daemon.build_fence_spec(agent_store=store, cockpit_root=cockpit, run_dir=Path(R))
+
+
+class UnreadableFenceUnit(Exception):
+    """The fence unit on disk exists but its agent store and cockpit root cannot be read from it."""
+
+
+def _unit_roots(argv: list[str]) -> tuple[Path, Path]:
+    """The ``(agent store, cockpit root)`` a fence unit's argv names, as :func:`levain.daemon.build_fence_spec`
+    renders them (``<python> -m <FENCE_MODULE> --agent-store S --cockpit-root C --run R``). Raises
+    :class:`UnreadableFenceUnit` for any other shape."""
+    from levain import daemon
+
+    try:
+        at = next(i for i in range(len(argv) - 1) if argv[i] == "-m" and argv[i + 1] == daemon.FENCE_MODULE)
+    except StopIteration:
+        raise UnreadableFenceUnit(f"its command does not run {daemon.FENCE_MODULE}") from None
+    rest = argv[at + 2:]
+    found: dict[str, str] = {}
+    for flag in ("--agent-store", "--cockpit-root"):
+        hits = [i for i, a in enumerate(rest) if a == flag]
+        if len(hits) != 1 or hits[0] + 1 >= len(rest):
+            raise UnreadableFenceUnit(f"its command does not name {flag} exactly once")
+        found[flag] = rest[hits[0] + 1]
+    return Path(found["--agent-store"]), Path(found["--cockpit-root"])
+
+
+def _installed_fence_roots(provider) -> tuple[Path, Path] | None:
+    """The roots of the fence unit already installed on this host, read from its unit file through the provider
+    (never from a running server's STATUS), or None when there is no unit. Raises on a unit that cannot be read."""
+    from levain import daemon
+
+    argv = provider.installed_argv(daemon.DEFAULT_FENCE_LABEL)
+    return None if argv is None else _unit_roots(argv)
+
+
+def _roots_text(roots: tuple[Path, Path]) -> str:
+    store, cockpit = roots
+    return f"{cockpit} (agent store {store})"
+
+
+def install_fence(install: Path, *, provider=None, **kw) -> str:
+    """``levain agents fence start``: install and start the fence unit through the provider every ``levain daemon
+    install*`` verb uses (:meth:`levain.daemon.DaemonProvider.install`: idempotent, resident, kickstarted now and at
+    login). The operator named this install, so a unit holding another install's roots (one host has one fence unit
+    and one ``R/fence/fence.sock``) is replaced, and the returned text names the old roots and the new. Raises
+    :class:`FenceSetupError` or :class:`levain.daemon.DaemonError`."""
+    from levain import daemon
+
+    spec = fence_spec(install, **kw)
+    if provider is None:
+        provider = daemon.select_provider()
+    note = ""
+    try:
+        old = _installed_fence_roots(provider)
+    except Exception as exc:   # noqa: BLE001 - said; the operator asked for this install's unit
+        note = f"the installed fence unit could not be read ({type(exc).__name__}: {exc}); replacing it\n"
+    else:
+        new = _unit_roots(spec.argv)
+        if old is not None and old != new:
+            note = f"replacing the fence unit for {_roots_text(old)} with this install's {_roots_text(new)}\n"
+    return note + provider.install(spec)
+
+
+def refresh_fence_after_update(install: Path, *, provider=None, **kw) -> str | None:
+    """``levain update``'s step: re-install the fence unit so an upgrade re-writes it from the interpreter and paths it
+    now runs from (the unit names both). None on a host without the isolation install (nothing to fence).
+
+    The automatic path never takes the host's one fence unit from another install (P7-2 wiring r2, codex HIGH): a
+    unit whose recorded agent store or cockpit root differs from this install's, or one whose roots cannot be read,
+    is left alone, and the line returned names both and the explicit command that replaces it. A failure is said in
+    the line returned, never the reason the update fails: ``levain doctor``'s ``agent fence`` row and every refused
+    dispatch GATE say it too."""
+    from levain import daemon
+
+    try:
+        spec = fence_spec(install, **kw)
+    except NoIsolationInstall:
+        return None
+    except FenceSetupError as exc:
+        return f"agent fence: not installed: {exc}"
+    except Exception as exc:   # noqa: BLE001 - said, never the reason the update fails
+        return (f"agent fence: the unit could not be installed ({type(exc).__name__}: {exc}); every dispatch "
+                "session's tool calls are refused until `levain agents fence start` succeeds")
+    command = f"levain agents fence start --path {Path(install).expanduser().resolve()}"
+    try:
+        if provider is None:
+            provider = daemon.select_provider()
+        try:
+            old = _installed_fence_roots(provider)
+        except Exception as exc:   # noqa: BLE001 - an unread unit is left alone, and said
+            return (f"agent fence: left alone: the installed unit could not be read ({type(exc).__name__}: {exc}); "
+                    f"`{command}` replaces it")
+        new = _unit_roots(spec.argv)
+        if old is not None and old != new:
+            return (f"agent fence: left alone: the installed unit fences {_roots_text(old)}, not this install's "
+                    f"{_roots_text(new)}; `{command}` points it here")
+        result = provider.install(spec)
+    except Exception as exc:   # noqa: BLE001 - said, never the reason the update fails
+        return (f"agent fence: the unit could not be installed ({type(exc).__name__}: {exc}); every dispatch "
+                "session's tool calls are refused until `levain agents fence start` succeeds")
+    return "agent fence: " + result.splitlines()[0] if result else "agent fence: installed"
+
+
+def run_fence_start(args: argparse.Namespace) -> int:
+    from levain import daemon
+
+    install = args.path if args.path is not None else Path.cwd()
+    try:
+        print(install_fence(install, agent_store=args.store_dir))
+    except (NotImplementedError, FenceSetupError, daemon.DaemonError) as exc:
+        return _fail("fence start", exc)
+    return 0
+
+
+def run_fence_status(args: argparse.Namespace) -> int:
+    from levain import daemon, doctor
+
+    install = args.path if args.path is not None else Path.cwd()
+    try:
+        provider = daemon.select_provider()
+    except NotImplementedError as exc:
+        return _fail("fence status", exc)
+    st = provider.status(daemon.DEFAULT_FENCE_LABEL)
+    print(f"{daemon.DEFAULT_FENCE_LABEL}: installed={st.installed} running={st.running}")
+    print(f"  {st.detail}")
+    try:
+        expected = fence_roots(install, agent_store=args.store_dir)
+    except FenceSetupError as exc:
+        return _fail("fence status", exc)
+    rows = doctor._check_agent_fence(expected=expected)
+    if not rows:
+        print("agent fence: this host has no isolation install, so nothing is fenced")
+        return 1
+    ok = True
+    for r in rows:
+        print(f"agent fence: {r.detail}")
+        if not r.ok:
+            ok = False
+            if r.hint:
+                print(f"  {r.hint}")
+    return 0 if ok else 1
