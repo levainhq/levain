@@ -223,10 +223,12 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
          reaper: Callable[[], object] | None = None) -> TickResult:
     """One controller pass. ``reaper`` (P6-4b: ``Supervisor.reap`` with its executor and attention callbacks bound) runs
     first, so the leases of launched rows are renewed before anything that could take long; one that raises is
-    logged and recorded in ``reaper_error`` and never stops the claims.
- ``store`` is an opened :class:`AgentStore` or a store directory; a directory is opened
-    through :func:`open_agent_store`, so a refused agent schema raises ``AgentStoreRefused`` with its named reason
-    before anything is read or written.
+    logged and recorded in ``reaper_error`` and never stops the claims. The clock is read again after it, so the
+    claims and the expiry pass judge the time it is, not the time before the stops.
+
+    ``store`` is an opened :class:`AgentStore` or a store directory; a directory is opened through
+    :func:`open_agent_store`, so a refused agent schema raises ``AgentStoreRefused`` with its named reason before
+    anything is read or written.
 
     An agent that does not fire this tick (no cursor yet, unarmed, paused, or a stored spec that fails its integrity
     check) has its cursor moved to ``now`` without firing, so arming, resuming or repairing it later releases no
@@ -236,7 +238,6 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
     if not isinstance(store, AgentStore):
         store = open_agent_store(store)
     now = schedule._utc(clock())  # a naive clock reading is refused up front
-    floor = now.replace(second=0, microsecond=0)
     out = TickResult()
     if reaper is not None:
         try:
@@ -244,6 +245,8 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
         except Exception as exc:  # noqa: BLE001 - the reaper's failure must not cost the pass its claims
             _log.warning("agent tick: the reaper raised %s: %s", type(exc).__name__, exc)
             out.reaper_error = type(exc).__name__
+        now = schedule._utc(clock())  # the stops may have taken long: the claims judge the clock as it reads now
+    floor = now.replace(second=0, microsecond=0)
     # first, so an occurrence the cap held past its grace no longer reads as a live previous one to this tick's claims
     with store.read() as conn:
         expired = slots.expired_launches(conn, now)

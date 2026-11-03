@@ -239,6 +239,7 @@ def test_a_row_that_ended_on_its_own_is_not_settled_twice(rig):
     row = rig.row(oid)
     assert ex.stops == 1 and (row["state"], row["reason"]) == ("done", "completed")
     assert out.settle_errors == {} and rig.taken(oid) == ([], [("settled",)])
+    assert out.ended == []                                          # the reaper settled nothing: the end is the run's
     assert att.resolved == [supervise.ATTENTION_PREFIX + oid]       # the attention key is cleared either way
     again, _ = _reap(sup, ex, att)
     assert ex.stops == 1 and again.asked == []
@@ -263,10 +264,13 @@ def test_a_slow_stop_does_not_let_a_healthy_rows_lease_lapse(rig):
 
     # first's agent is revoked; the healthy one belongs to a second agent
     _revoke(rig)
+    renewed_at = clock()                      # the revoke is a world record, which moves the clock
     ex = Ex(False, on_stop=stall)
     out = sup.reap(lambda row: ex)
     assert set(out.renewed) == {first, healthy}
     assert _lease(rig, healthy) > before
+    # renewed at the clock reading before the stall (a renewal after it would read 3 leases later)
+    assert _lease(rig, healthy) == ctl._stamp(ctl._expiry(renewed_at, ctl.LEASE_S))
     assert rig.row(healthy)["state"] == "launched"
     with rig.store.write() as c:             # at the clock the stall ended on, the renewed lease had been extended
         assert ctl.takeover(c, healthy, clock() - timedelta(seconds=3 * ctl.LEASE_S - 100)) is False
@@ -338,3 +342,126 @@ def test_a_tick_runs_the_reaper_first_and_survives_a_reaper_that_raises(rig):
 
     out = ctl.tick(rig.store, clock, lambda a, d: None, reaper=boom)
     assert out.reaper_error == "RuntimeError"
+
+
+# --- r1 review fixes (L3_p64b_r1) -----------------------------------------------------------------------------------
+
+def _revoke_also(rig, oid):
+    rig.world.link(revoke_agent(rig.row(oid)["agent_id"], rig.sid), "laptop")
+
+
+def test_the_stop_phase_stops_asking_past_its_budget_and_a_deferred_row_goes_first_next_pass(rig):
+    # behaviour (codex r1 #1): one stop() that overruns its deadline past STOP_BUDGET_S leaves the other rows to
+    # stop unasked this pass (their leases already renewed, still inside them) and asks them first on the next
+    clock = Clock(rig)
+    sup, journal = _sup(rig, clock)
+    first = _fire(rig, "a", journal)
+    second = _second_fire(rig, journal)
+    _claimed(rig, first, 1)
+    _claimed(rig, second, 2)
+    _revoke(rig)
+    _revoke_also(rig, second)
+    asked = []
+
+    def executor_of(row):
+        def overrun():
+            asked.append(row["occurrence_id"])
+            if row["occurrence_id"] == first:
+                clock.advance(supervise.STOP_BUDGET_S + 1)
+        return Ex(False, on_stop=overrun)
+
+    out = sup.reap(executor_of)
+    assert asked == [first] and out.deferred == [second] and out.asked == [first]
+    assert supervise.STOP_BUDGET_S + supervise.STOP_DEADLINE_S < ctl.LEASE_S
+    with rig.store.write() as c:              # the deferred row's lease, renewed before the stops, still holds
+        assert ctl.takeover(c, second, clock()) is False
+    asked.clear()
+    again = sup.reap(executor_of)
+    assert asked[0] == second and again.asked[0] == second
+
+
+def test_the_session_grace_is_per_row_from_the_roles_executor(rig):
+    # behaviour (codex r1 #2): a dream (sessionless) row with a pid and no session_key keeps being renewed past
+    # SESSION_GRACE_S; in the same store, a row whose role is a session executor (or cannot be read: the bound holds)
+    # is refused at the grace and lapses to takeover
+    from levain.agents import role as role_mod
+    from tests.test_agents_launch import ROLES
+    role_mod.add_role(rig.store, ROLES["notify-role"])          # the rig agent's role, executor "dream"
+    clock = Clock(rig)
+    sup, journal = _sup(rig, clock)
+    dream = _fire(rig, "a", journal)
+    unread = _second_fire(rig, journal)                         # its role (local-role) is not registered
+    _claimed(rig, dream, 1, session=False)
+    _claimed(rig, unread, 2, session=False)
+    clock.advance(ctl.SESSION_GRACE_S + 60)
+    out = sup.reap(lambda row: Ex(True))
+    assert out.renewed == [dream]
+
+
+def test_a_tick_reads_its_clock_again_after_the_reaper(rig, monkeypatch):
+    # behaviour (codex/deepseek r1 #3): the claims and the expiry pass use the clock as it reads after the reaper
+    clock = Clock(rig)
+    seen = []
+    real = ctl.slots.expired_launches
+    monkeypatch.setattr(ctl.slots, "expired_launches", lambda conn, now: seen.append(now) or real(conn, now))
+    ctl.tick(rig.store, clock, lambda a, d: None, reaper=lambda: clock.advance(900))
+    assert seen == [clock()]
+
+
+def test_an_unconfirmed_rows_attention_is_resolved_when_it_ends_on_its_own(rig):
+    # behaviour (complement r1 #1, codex r1 #4): the row the attention named finishes between passes; the next pass
+    # resolves the key although the row is no longer launched
+    clock = Clock(rig)
+    sup, journal = _sup(rig, clock)
+    oid = _fire(rig, "a", journal)
+    _claimed(rig, oid)
+    _revoke(rig)
+    att = Attention()
+    _reap(sup, Ex(False), att)
+    assert list(att.rows) == [supervise.ATTENTION_PREFIX + oid]
+    rig.finish(oid)
+    clock.advance(60)
+    _reap(sup, Ex(False), att)
+    assert att.rows == {} and att.resolved == [supervise.ATTENTION_PREFIX + oid]
+
+
+def test_a_resolve_that_raises_is_tried_again_next_pass(rig):
+    # behaviour (codex r1 #4, deepseek r1 #4): the key is kept until its resolve succeeds
+    clock = Clock(rig)
+    sup, journal = _sup(rig, clock)
+    oid = _fire(rig, "a", journal)
+    _claimed(rig, oid)
+    _revoke(rig)
+    att = Attention()
+    _reap(sup, Ex(False), att)
+    fails = [1]
+
+    def resolve(key):
+        if fails:
+            fails.pop()
+            raise OSError("cockpit busy")
+        att.resolve(key)
+
+    clock.advance(60)
+    done = sup.reap(lambda row: Ex(True), attention=att.upsert, resolve=resolve)
+    assert done.ended == [oid] and list(att.rows) == [supervise.ATTENTION_PREFIX + oid]
+    clock.advance(60)
+    sup.reap(lambda row: Ex(True), attention=att.upsert, resolve=resolve)
+    assert att.rows == {}
+
+
+def test_no_executor_is_not_asked_and_a_settle_that_writes_nothing_is_named(rig, monkeypatch):
+    # behaviour (codex r1 #5, complement r1 #6): `asked` holds only rows stop() was called for; a confirmed stop whose
+    # settle wrote nothing while the row stays launched is a settle error, not a silent drop
+    clock = Clock(rig)
+    sup, journal = _sup(rig, clock)
+    oid = _fire(rig, "a", journal)
+    _claimed(rig, oid)
+    _revoke(rig)
+    out = sup.reap(lambda row: None)
+    assert out.asked == [] and out.unconfirmed == [oid]
+    monkeypatch.setattr(ctl, "settle_terminal", lambda *a, **k: ctl.Ended(False))
+    clock.advance(60)
+    out = sup.reap(lambda row: Ex(True))
+    assert out.asked == [oid] and out.ended == [] and out.settle_errors == {oid: "not_settled"}
+    assert rig.row(oid)["state"] == "launched"

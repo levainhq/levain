@@ -43,18 +43,21 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from levain.agent_authority import AgentAuthority, AgentAuthorityError, agent_fence
-from levain.agents import accounting, controller as _ctl
+from levain.agents import accounting, controller as _ctl, role as _role
 from levain.agents.store import AgentStore
 from levain.autonomic.journal import EffectOutcome, EffectStatus, RunJournal
 
-__all__ = ["MAX_TRIES", "LEASE_S", "STOP_DEADLINE_S", "ATTENTION_PREFIX", "Effected", "End", "Hooks", "HOOKS",
-           "Reaped", "Supervisor"]
+__all__ = ["MAX_TRIES", "LEASE_S", "STOP_DEADLINE_S", "STOP_BUDGET_S", "ATTENTION_PREFIX", "Effected", "End", "Hooks",
+           "HOOKS", "Reaped", "Supervisor"]
 
 _log = logging.getLogger("levain.agents.supervise")
 
 MAX_TRIES = 3          # A0 §2.3: the effect is tried at most this many times in one pass
 STOP_DEADLINE_S = 10   # A0 r6 §2.3 [judged by A0]: what a stop() may wait
 LEASE_S = _ctl.LEASE_S  # A0 r6 §2.3 [judged by A0], 900: defined once, in the controller, which the heartbeat shares
+# [judged, L3 r1]: the stop phase's wall time, from just after the renewals; no stop() is begun past it, so a stop
+# begun inside it and honouring its deadline ends inside the lease the renewals just wrote
+STOP_BUDGET_S = LEASE_S // 2
 ATTENTION_PREFIX = "agent-stop-unconfirmed:"
 STOP_AT_REASON = "stop_at"
 
@@ -67,8 +70,10 @@ class Reaped:
     """What one :meth:`Supervisor.reap` pass did, by occurrence id. ``renewed`` are the leases it extended, ``due`` the
     rows past ``stop_at``, ``stale`` the rows whose fence moved, ``unclassified`` the rows whose cover could not be
     read this tick (nothing done for them), ``asked`` the rows ``stop()`` was called for, ``ended`` those it settled,
-    ``unconfirmed`` those left ``launched`` after an unconfirmed stop, ``settle_errors`` a settle that raised after a
-    confirmed stop (the row stays ``launched``; the next pass asks again)."""
+    ``unconfirmed`` those left ``launched`` after an unconfirmed stop (or with no executor to ask), ``settle_errors`` a
+    settle that raised, or wrote nothing while the row stayed ``launched`` (``not_settled``), after a confirmed stop
+    (the next pass asks again), ``deferred`` the rows to stop that were not asked because the pass was past
+    :data:`STOP_BUDGET_S` (the next pass asks them first)."""
     renewed: list[str] = field(default_factory=list)
     due: list[str] = field(default_factory=list)
     stale: list[str] = field(default_factory=list)
@@ -77,6 +82,7 @@ class Reaped:
     ended: list[str] = field(default_factory=list)
     unconfirmed: list[str] = field(default_factory=list)
     settle_errors: dict[str, str] = field(default_factory=dict)
+    deferred: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -159,8 +165,9 @@ class Supervisor:
             self._store_id = _ctl._store_id_of(conn)
         self._lock = threading.Lock()
         self._refreshed: bool | None = None   # this tick's one refresh: None not yet, True read, False failed
-        self._session_grace_s = session_grace_s
-        self._raised: set[str] = set()        # attention keys this process already raised
+        self._session_grace_s = session_grace_s  # what a row whose role is not read as a dream (sessionless) passes
+        self._raised: set[str] = set()        # attention keys this process raised and has not resolved
+        self._deferred: set[str] = set()      # rows the last pass left unasked past STOP_BUDGET_S
 
     # --- the tick's shared refresh ---------------------------------------------------------------------------------
 
@@ -283,11 +290,27 @@ class Supervisor:
                                 " ORDER BY launched_at, occurrence_id").fetchall()
         return [dict(zip(columns, row)) for row in rows]
 
-    def _renew(self, row: dict) -> bool:
+    def _session_grace(self, row: dict, seen: dict) -> int | None:
+        """The heartbeat's ``session_grace_s`` for this row, from its role's executor: None only for a role read as
+        ``dream`` (a sessionless run); a session role, or one that cannot be read (an unregistered spawned worker's,
+        a corrupt row), keeps the bound. ``seen`` caches it by ``spec_hash`` for one pass."""
+        digest = row["spec_hash"]
+        if digest not in seen:
+            try:
+                with self._store.read() as conn:
+                    found = conn.execute("SELECT spec FROM agent_specs WHERE spec_hash = ?", (digest,)).fetchone()
+                role = _role.role_by_hash(self._store, json.loads(found[0])["role"]["role_hash"]) if found else None
+                dream = role is not None and role["executor"] == "dream"
+            except Exception:  # noqa: BLE001 - an unreadable role is not evidence of a sessionless run
+                dream = False
+            seen[digest] = None if dream else self._session_grace_s
+        return seen[digest]
+
+    def _renew(self, row: dict, session_grace_s: int | None) -> bool:
         try:
             with self._store.write() as conn:
                 return _ctl.heartbeat(conn, row["occurrence_id"], row["epoch"], self._clock(), LEASE_S,
-                                      session_grace_s=self._session_grace_s)
+                                      session_grace_s=session_grace_s)
         except Exception as exc:  # noqa: BLE001 - one row's renewal failing never stops the others'
             _log.warning("agent supervisor: the lease renewal of %s raised %s: %s", row["occurrence_id"],
                          type(exc).__name__, exc)
@@ -329,14 +352,17 @@ class Supervisor:
         ``executor_of(row)`` gives the executor for a ``launched`` row (a mapping with its ``occurrence_id``,
         ``session_key`` and ``pid``); a row with neither key is never asked. ``attention(key, text)`` upserts on its key
         and is called once per key per process; ``resolve(key)`` is called, idempotently, when the row is no longer
-        ``launched`` after the attempt."""
+        ``launched`` after the attempt, and again on a later pass for a key this process raised whose row has since
+        left ``launched`` by any path, or whose resolve raised. No ``stop()`` is begun once the pass is
+        :data:`STOP_BUDGET_S` past the renewals; those rows are ``deferred`` and asked first on the next pass."""
         self.begin_tick()
         out = Reaped()
         rows = self._launched()
+        graces: dict = {}
         for row in rows:
-            if self._renew(row):
+            if self._renew(row, self._session_grace(row, graces)):
                 out.renewed.append(row["occurrence_id"])
-        now = self._clock()
+        now = started = self._clock()
         reasons: dict[str, str] = {}
         for row in rows:
             if self._past_stop_at(row, now):
@@ -352,12 +378,33 @@ class Supervisor:
         else:
             out.unclassified.extend(r["occurrence_id"] for r in rows)
         wanted = set(out.due) | set(out.stale)
-        for row in rows:
+        for row in sorted(rows, key=lambda r: r["occurrence_id"] not in self._deferred):  # stable: launched order
             oid = row["occurrence_id"]
             if oid not in wanted or (row["session_key"] is None and row["pid"] is None):
                 continue
+            if self._clock() - started >= timedelta(seconds=STOP_BUDGET_S):
+                out.deferred.append(oid)
+                continue
             self._stop_and_settle(row, reasons.get(oid), executor_of, attention, resolve, out)
+        self._deferred = set(out.deferred)
+        live = {r["occurrence_id"] for r in rows}
+        for key in sorted(self._raised):          # raised here, and its row left launched since (or a resolve raised)
+            if key[len(ATTENTION_PREFIX):] not in live:
+                self._resolve(key, resolve)
         return out
+
+    def _resolve(self, key: str, resolve) -> None:
+        """Resolve ``key``, keeping it for the next pass until a resolve succeeds."""
+        if resolve is None:
+            self._raised.discard(key)
+            return
+        try:
+            resolve(key)
+        except Exception as exc:  # noqa: BLE001 - kept: the next pass tries again
+            self._raised.add(key)
+            _log.warning("agent supervisor: resolving %s raised %s", key, type(exc).__name__)
+            return
+        self._raised.discard(key)
 
     def _stop_and_settle(self, row: dict, reason: str | None, executor_of, attention, resolve, out: Reaped) -> None:
         oid = row["occurrence_id"]
@@ -371,7 +418,7 @@ class Supervisor:
             stop = accounting.StopResult(False, "no executor to ask")
         else:
             stop = _executor_stop(executor, self._stop_deadline_s)
-        out.asked.append(oid)
+            out.asked.append(oid)
         if stop.terminated is not True:
             out.unconfirmed.append(oid)
             if attention is not None and key not in self._raised:
@@ -385,7 +432,7 @@ class Supervisor:
         try:
             occ = self._occurrence(oid)
             usage = _executor_usage(executor)
-            self._settle_stopped(occ, usage, reason)
+            ended = self._settle_stopped(occ, usage, reason)
         except Exception as exc:  # noqa: BLE001 - confirmed, but the row stays launched; the next pass asks again
             _log.warning("agent supervisor: the settle after a confirmed stop of %s raised %s: %s; the row stays"
                          " launched", oid, type(exc).__name__, exc)
@@ -394,14 +441,12 @@ class Supervisor:
         with self._store.read() as conn:
             still = conn.execute("SELECT 1 FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'",
                                  (oid,)).fetchone()
-        if still is None:
+        if still is not None:          # confirmed, yet the guarded settle wrote nothing: named, asked again next pass
+            out.settle_errors[oid] = "not_settled"
+            return
+        if ended.ended:
             out.ended.append(oid)
-            self._raised.discard(key)
-            if resolve is not None:
-                try:
-                    resolve(key)
-                except Exception as exc:  # noqa: BLE001
-                    _log.warning("agent supervisor: resolving %s raised %s", key, type(exc).__name__)
+        self._resolve(key, resolve)    # ended by this settle or by another path: the attention row is over either way
 
     # --- the run's natural end: the hook points --------------------------------------------------------------------
 
