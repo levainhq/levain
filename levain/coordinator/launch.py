@@ -1290,10 +1290,13 @@ def _retire_removed(store: CoordStore, lines: list[str]) -> None:
         kind = "ended" if ln.state == "active" else "failed"
         try:
             store.launch_end(ln.launch_id, kind, lease_mod.CODEX_REMOVED)
-        except (CoordError, sqlite3.Error) as exc:
+        except (LeaseRefused, CoordError, sqlite3.Error) as exc:
             lines.append(f"launch {ln.launch_id}: a {ln.harness} coordinator, not retired ({exc})")
-            continue
-        lines.append(f"launch {ln.launch_id} {kind}: {lease_mod.CODEX_REMOVED} (its lease, if it held one, released)")
+        else:
+            lines.append(f"launch {ln.launch_id} {kind}: {lease_mod.CODEX_REMOVED} "
+                         "(its lease, if it held one, released)")
+        # L3 r3: the rule goes whether or not this pass wrote the launch over (one that raced to its end elsewhere
+        # is never read again, so its workspace would keep the pre-approval)
         if (removed := _remove_legacy_codex_rule(ln.cwd)) is not None:
             lines.append(f"launch {ln.launch_id}: {removed}")
 
@@ -1331,23 +1334,21 @@ def _legacy_codex_rule(python_path: str) -> str:
     )
 
 
-def _remove_legacy_codex_rule(cwd: str | None) -> str | None:
-    """Remove ``<cwd>/.codex/rules/levain-coordinator.rules`` when it is a plain file holding exactly
-    :func:`_legacy_codex_rule` for the interpreter its own pattern names: a line saying so (or that the removal
-    failed). ``None``, touching nothing, for every other case: no workspace, a missing file, a file that differs, or a
-    symlink anywhere on the way. Nothing outside ``cwd`` and no other file is ever removed."""
-    if not cwd or not os.path.isabs(cwd):
-        return None
-    workspace = Path(cwd)
-    path = workspace.joinpath(*_LEGACY_CODEX_RULE_REL)
+def _exact_legacy_codex_rule(path: Path) -> os.stat_result | None:
+    """The ``lstat`` of ``path`` when it is a plain file holding exactly :func:`_legacy_codex_rule` for the
+    interpreter its own pattern names; ``None`` for anything else (a missing file, a symlink, a FIFO or other
+    non-regular file, a file that differs). Never blocks: a non-regular file is never opened, and the open is
+    non-blocking besides."""
     try:
-        if any(os.path.islink(d) or not d.is_dir() for d in (workspace, path.parent.parent, path.parent)):
+        if not stat.S_ISREG(os.lstat(path).st_mode):
             return None
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as fh:
             held = os.fstat(fh.fileno())
+            if not stat.S_ISREG(held.st_mode):
+                return None
             raw = fh.read(_LEGACY_CODEX_RULE_MAX + 1)
-        if not stat.S_ISREG(held.st_mode) or len(raw) > _LEGACY_CODEX_RULE_MAX:
+        if len(raw) > _LEGACY_CODEX_RULE_MAX:
             return None
         text = raw.decode("utf-8")
         m = _LEGACY_CODEX_PATTERN.search(text)
@@ -1355,25 +1356,76 @@ def _remove_legacy_codex_rule(cwd: str | None) -> str | None:
         if not isinstance(python_path, str) or not python_path or not python_path.isprintable() \
                 or text != _legacy_codex_rule(python_path):
             return None
-        now = os.lstat(path)
-        if (now.st_dev, now.st_ino) != (held.st_dev, held.st_ino):
-            return None                                 # replaced since it was read: not the file that was checked
     except (OSError, ValueError, IndexError, TypeError):  # UnicodeDecodeError and a JSON error are ValueErrors
         return None
+    return held
+
+
+def _remove_legacy_codex_rule(cwd: str | None) -> str | None:
+    """Remove ``<cwd>/.codex/rules/levain-coordinator.rules`` when it is a plain file holding exactly
+    :func:`_legacy_codex_rule` for the interpreter its own pattern names: a line saying so (or what stopped it).
+    ``None``, touching nothing, for every other case: no workspace, a missing file, a non-regular file, a file that
+    differs, or a symlink anywhere on the way. Nothing outside ``cwd`` and no other file is ever removed.
+
+    The file is first renamed, atomically, to a private name in its own directory, and only the file found under that
+    name is checked again and unlinked: a file put in its place after the first check is never the one removed. One
+    that fails the second check goes back only while its own name is still free, else it stays under the private name
+    and the line names it."""
+    if not cwd or not os.path.isabs(cwd):
+        return None
+    workspace = Path(cwd)
+    path = workspace.joinpath(*_LEGACY_CODEX_RULE_REL)
     try:
-        os.unlink(path)
+        if any(os.path.islink(d) or not d.is_dir() for d in (workspace, path.parent.parent, path.parent)):
+            return None
+    except OSError:
+        return None
+    if _exact_legacy_codex_rule(path) is None:
+        return None
+    held = path.with_name(f".{path.name}.retiring-{secrets.token_hex(8)}")
+    try:
+        os.rename(path, held)
+    except FileNotFoundError:
+        return None                                     # gone since it was checked: nothing of ours to remove
     except OSError as exc:
         return f"{path}: the Codex coordinator's pre-approval rule could not be removed ({exc})"
-    return f"{path}: the Codex coordinator's pre-approval rule removed"
+    checked = _exact_legacy_codex_rule(held)
+    if checked is not None:
+        try:
+            now = os.lstat(held)
+            if (now.st_dev, now.st_ino) == (checked.st_dev, checked.st_ino):
+                os.unlink(held)
+                return f"{path}: the Codex coordinator's pre-approval rule removed"
+        except OSError as exc:
+            return f"{path}: the Codex coordinator's pre-approval rule could not be removed ({exc}); it is at {held}"
+    # not the file that was checked: it goes back under its own name only while that name is still free
+    try:
+        os.link(held, path, follow_symlinks=False)      # fails, never replaces, when the name was taken meanwhile
+    except FileExistsError:
+        return f"{path}: changed while it was being removed and its name was taken since; it was left at {held}"
+    except OSError:
+        if os.path.lexists(path):                       # a directory or a file system without hard links
+            return f"{path}: changed while it was being removed and its name was taken since; it was left at {held}"
+        try:
+            os.rename(held, path)
+        except OSError as exc:
+            return f"{path}: changed while it was being removed and could not be put back ({exc}); it is at {held}"
+        return None
+    try:
+        os.unlink(held)
+    except OSError as exc:
+        return f"{path}: changed while it was being removed, put back, but {held} remains ({exc})"
+    return None
 
 
 def _watch_pass(store: CoordStore, lines: list[str]) -> None:
     """(a)-(e) of :func:`watch_once`, its lines appended to ``lines``; it returns early when ``claude`` cannot be
     read."""
-    # lapses and expiries are written first: a launch whose starter was killed outright stays pending until someone
-    # writes it expired, and only then does (d) stop the session it left
-    store.coord_status()
+    # a removed harness's coordinator launches are retired before any expiry is written, so one already past its TTL
+    # ends with that cause and is not counted as a death; then lapses and expiries: a launch whose starter was killed
+    # outright stays pending until someone writes it expired, and only then does (d) stop the session it left
     _retire_removed(store, lines)
+    store.coord_status()
     for ln in store.launches_unspawned():
         if ln.harness != "claude":
             lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude is built, left pending")

@@ -2835,3 +2835,117 @@ def test_retirement_removes_only_the_exact_legacy_codex_rule_in_the_launch_works
     assert (outside / "levain-coordinator.rules").exists()               # never outside a recorded workspace
     assert not (spaces["none"] / ".codex").exists()
     assert cl.watch_once(s) is not None                                  # a second pass: nothing to do, no raise
+
+
+_THEIRS = "# the operator's own rule, put here after the watcher's check\n"
+
+
+def _swap_at_the_destructive_step(monkeypatch, rule, then=None):
+    """The first rename, replace or unlink of ``rule`` finds it already replaced, atomically, by the operator's own
+    file (what another process can do between any check and the step that acts on it); ``then`` runs after that step."""
+    real = {name: getattr(os, name) for name in ("rename", "replace", "unlink")}
+    fired = []
+
+    def hooked(name):
+        def call(src, *args, **kwargs):
+            if fired or os.fspath(src) != os.fspath(rule):
+                return real[name](src, *args, **kwargs)
+            fired.append(name)
+            theirs = rule.with_name("theirs.tmp")
+            theirs.write_text(_THEIRS, encoding="utf-8")
+            real["replace"](theirs, rule)
+            got = real[name](src, *args, **kwargs)
+            if then is not None:
+                then()
+            return got
+        return call
+
+    for name in real:
+        monkeypatch.setattr(os, name, hooked(name))
+    return fired
+
+
+def _exact_rule(tmp_path):
+    ws = tmp_path / "ws"
+    _rule_at(ws).parent.mkdir(parents=True)
+    _rule_at(ws).write_text(_OLD_RULE, encoding="utf-8")
+    return ws, _rule_at(ws)
+
+
+def test_a_rule_replaced_after_the_check_is_never_the_one_removed(tmp_path, monkeypatch):
+    # L3 r3 (codex MED): the inode was compared, then the path unlinked, so a file put there in between was deleted
+    # unread; the file is now moved to a private name and only what is found under it is checked and removed
+    ws, rule = _exact_rule(tmp_path)
+    fired = _swap_at_the_destructive_step(monkeypatch, rule)
+    got = cl._remove_legacy_codex_rule(str(ws))
+    assert fired, "the removal never reached a rename or unlink of the rule"
+    assert rule.read_text(encoding="utf-8") == _THEIRS, got             # theirs, back under its own name
+    assert os.listdir(rule.parent) == [rule.name], got                   # and no private copy left behind
+
+
+def test_a_replaced_rule_whose_name_was_taken_again_stays_at_its_private_name(tmp_path, monkeypatch):
+    ws, rule = _exact_rule(tmp_path)
+    fired = _swap_at_the_destructive_step(monkeypatch, rule,
+                                          then=lambda: rule.write_text("# newer\n", encoding="utf-8"))
+    got = cl._remove_legacy_codex_rule(str(ws))
+    assert fired and rule.read_text(encoding="utf-8") == "# newer\n", got
+    kept = [n for n in os.listdir(rule.parent) if n != rule.name]
+    assert len(kept) == 1 and kept[0].startswith(f".{rule.name}.retiring-"), (kept, got)
+    assert (rule.parent / kept[0]).read_text(encoding="utf-8") == _THEIRS
+    assert got is not None and kept[0] in got                             # the one line names where it is
+
+
+def test_a_fifo_at_the_rule_path_never_blocks_the_pass(tmp_path):
+    # L3 r3 (complement MED): the path was opened read-only before its type was checked, and a FIFO blocks that open
+    ws = tmp_path / "ws"
+    rule = _rule_at(ws)
+    rule.parent.mkdir(parents=True)
+    os.mkfifo(rule)
+    out = []
+    worker = threading.Thread(target=lambda: out.append(cl._remove_legacy_codex_rule(str(ws))), daemon=True)
+    worker.start()
+    worker.join(5)
+    try:
+        assert not worker.is_alive(), "the removal blocked opening a FIFO"
+    finally:
+        if worker.is_alive():                                             # let the old code's open return
+            os.close(os.open(rule, os.O_WRONLY | os.O_NONBLOCK))
+            worker.join(5)
+    assert out == [None] and stat.S_ISFIFO(os.lstat(rule).st_mode)
+
+
+def test_the_rule_goes_even_when_the_launch_raced_to_its_end(qdir, tmp_path, monkeypatch):
+    # L3 r3 (complement MED): a launch_end that raised skipped the rule, and the launch, over, was never read again
+    s = CoordStore(qdir)
+    ws, rule = _exact_rule(tmp_path)
+    launch_id = _legacy_codex_launch(s, str(ws.resolve()))
+
+    def raced(*args, **kwargs):
+        raise lease.LeaseRefused("a launch moves pending -> active -> ended, or ends failed or expired")
+
+    monkeypatch.setattr(s, "launch_end", raced)
+    lines = []
+    cl._retire_removed(s, lines)
+    assert not os.path.lexists(rule), lines
+    assert any(launch_id in line and "not retired" in line for line in lines), lines
+    assert any(str(_rule_at(ws.resolve())) in line and "removed" in line for line in lines), lines
+
+
+def test_a_codex_launch_already_past_its_ttl_is_retired_never_expired_as_a_death(qdir, workdir, fake, monkeypatch):
+    # L3 r3 (complement, deepseek LOW): the expiries were written first, so a spawn-claimed Codex launch past
+    # LAUNCH_TTL on the first pass after the upgrade expired with the TTL cause and counted as a death
+    from datetime import timedelta
+
+    s = CoordStore(qdir)
+    t = [datetime.now(timezone.utc)]
+    monkeypatch.setattr(s, "_clock", lambda: t[0])
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    launch_id = _legacy_codex_launch(s, str(workdir.resolve()))
+    assert s.launch_claim_spawn(launch_id, os.getpid())[1] is None
+    t[0] += lease.LAUNCH_TTL + timedelta(seconds=1)
+    lines = cl.watch_once(s)
+    got = s.launch(launch_id)
+    assert (got.state, got.cause) == ("failed", "codex coordinator removed"), lines
+    with sqlite3.connect(qdir / "dispatch.db") as c:
+        assert lease.launch_death(c, lease.launch(c, launch_id)) is not True
+    assert fake.spawns() == []
