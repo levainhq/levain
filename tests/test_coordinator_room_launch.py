@@ -36,7 +36,7 @@ def flag(name):
     return argv[argv.index(name) + 1] if name in argv else None
 
 base = os.environ["FAKE_DIR"]
-n = len([f for f in os.listdir(base) if f.startswith("spawn-")]) + 1
+n = len([f for f in os.listdir(base) if f.startswith("spawn-") and f.endswith(".argv")]) + 1
 open(os.path.join(base, "spawn-%d.argv" % n), "w").write(json.dumps(argv))
 open(os.path.join(base, "spawn-%d.env" % n), "w").write(json.dumps(sorted(os.environ)))
 mode = open(os.path.join(base, "mode")).read().split() if os.path.exists(os.path.join(base, "mode")) else ["ok"]
