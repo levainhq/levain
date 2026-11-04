@@ -834,7 +834,7 @@ def _cluster_ends(text: str) -> list[int]:
     return ends
 
 
-def post_notice(text: str, *, runner: Callable[..., Any] = subprocess.Popen) -> Any:
+def post_notice(text: str, *, runner: Callable[..., Any] | None = None) -> Any:
     """Show ``text`` as a macOS notification, macOS only; the process, or None when nothing was started. The text
     travels as an ``osascript`` argument and never inside the script, so a row's words cannot become AppleScript.
     The child is detached with no stdio and never waited on: the hook's time budget is not spent on a display aid.
@@ -842,11 +842,15 @@ def post_notice(text: str, *, runner: Callable[..., Any] = subprocess.Popen) -> 
     if sys.platform != "darwin":
         return None
     try:
-        return runner([_OSASCRIPT, "-e", "on run argv",
-                       "-e", f'display notification (item 1 of argv) with title "{NOTICE_TITLE}"',
-                       "-e", "end run", str(text)],
-                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                      start_new_session=True)
+        from levain.launch import child_env
+        argv = [_OSASCRIPT, "-e", "on run argv",
+                "-e", f'display notification (item 1 of argv) with title "{NOTICE_TITLE}"',
+                "-e", "end run", str(text)]
+        if runner is None:   # the real spawn, called directly so the explicit-environment scan sees its env
+            return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True, env=child_env())
+        return runner(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                      start_new_session=True, env=child_env())
     except Exception:  # noqa: BLE001 - a notice is never worth the answer
         return None
 
