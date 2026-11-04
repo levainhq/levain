@@ -242,8 +242,16 @@ async function carryShellForward() {
   const names = await caches.keys();
   if (names.includes(SHELL_CACHE) && await (await caches.open(SHELL_CACHE)).match(SHELL_KEY)) return;
   for (const n of names.filter((x) => x.startsWith('levain-shell-v') && x !== SHELL_CACHE).sort().reverse()) {
-    const hit = await (await caches.open(n)).match(SHELL_KEY);
-    if (hit) { await (await caches.open(SHELL_CACHE)).put(SHELL_KEY, hit); return; }
+    const from = await caches.open(n);
+    if (!await from.match(SHELL_KEY)) continue;
+    // the whole previous generation (the page and the assets it names), never just '/'
+    const to = await caches.open(SHELL_CACHE);
+    for (const k of await from.keys()) {
+      const u = new URL(k.url), key = u.pathname + u.search;
+      const hit = await from.match(key);
+      if (hit) await to.put(key, hit);
+    }
+    return;
   }
 }
 
@@ -261,27 +269,52 @@ async function precacheShell() {
   try {
     const r = await fetch(SHELL_KEY, { credentials: 'same-origin', cache: 'reload' });
     if (!shellCacheable(r)) return;
-    let html = '';
-    try { html = await r.clone().text(); } catch (_) { /* the shell alone is still worth keeping */ }
-    const cache = await caches.open(SHELL_CACHE);
-    await cache.put(SHELL_KEY, r);
-    // The CSS/JS the shell page itself names (derived from its markup, never a list that can rot): without them an offline
-    // cold open is an unstyled, script-less page. Each is best effort; none can fail the install.
-    await Promise.allSettled(shellAssets(html).map(async (p) => {
-      const a = await fetch(p, { credentials: 'same-origin', cache: 'reload' });
-      if (a && a.status === 200 && !a.redirected) await cache.put(p, a);
-    }));
+    await commitShell(r);
   } catch (_) { /* offline at install: the next successful navigation fills it */ }
 }
-// Same-origin absolute paths named by <script src> and <link rel=stylesheet href> in the shell html, query and fragment dropped.
+// One coherent generation: '/' is committed only AFTER every CSS/JS its markup names has been fetched and validated, so a
+// cached '/' never points at an asset the cache lacks. Any failure commits nothing (the previous generation keeps serving;
+// a first install with a failing asset caches nothing and the app behaves as it did before the shell cache).
+async function commitShell(resp) {
+  let html = '';
+  try { html = await resp.clone().text(); } catch (_) { /* no markup: the shell alone */ }
+  const staged = await Promise.all(shellAssets(html).map(async (a) => {
+    const r = await fetch(a.key, { credentials: 'same-origin', cache: 'reload' });
+    if (!assetOk(r, a.kind)) return null;
+    // read the body now: an unread response holds its connection, and a shell of more assets than the browser's per-host
+    // limit would wait on itself
+    return [a.key, new Response(await r.arrayBuffer(), { status: 200, headers: { 'content-type': r.headers.get('content-type') } })];
+  }));
+  if (staged.some((x) => !x)) return false;
+  const cache = await caches.open(SHELL_CACHE);
+  for (const [k, r] of staged) await cache.put(k, r);
+  await cache.put(SHELL_KEY, resp);
+  return true;
+}
+// Same-origin absolute URLs named by <script src> and <link rel=stylesheet href> in the shell html, as {key: path+query, kind}.
+// The exact URL (query included) is what the worker caches and what it later intercepts.
 function shellAssets(html) {
-  const out = new Set();
-  const add = (v) => { if (/^\/(?!\/)/.test(v) && !NO_INTERCEPT.some((p) => v === p || v.startsWith(p + '/'))) out.add(v.split(/[?#]/)[0]); };
-  for (const m of html.matchAll(/<script\b[^>]*?\bsrc\s*=\s*"([^"]+)"/gi)) add(m[1]);
+  const out = new Map();
+  const add = (v, kind) => {
+    if (!/^\/(?!\/)/.test(v)) return;
+    let u; try { u = new URL(v.split('#')[0], 'https://shell.invalid'); } catch (_) { return; }
+    if (NO_INTERCEPT.some((p) => u.pathname === p || u.pathname.startsWith(p + '/'))) return;
+    const key = u.pathname + u.search;
+    if (!out.has(key)) out.set(key, { key, kind });
+  };
+  const attr = (tag, name) => { const m = new RegExp('\\b' + name + '\\s*=\\s*(?:"([^"]+)"|\'([^\']+)\')', 'i').exec(tag); return m ? (m[1] || m[2]) : null; };
+  for (const m of html.matchAll(/<script\b[^>]*>/gi)) { const v = attr(m[0], 'src'); if (v) add(v, 'script'); }
   for (const m of html.matchAll(/<link\b[^>]*>/gi)) {
-    if (/\brel\s*=\s*"stylesheet"/i.test(m[0])) { const h = /\bhref\s*=\s*"([^"]+)"/i.exec(m[0]); if (h) add(h[1]); }
+    const rel = attr(m[0], 'rel');
+    if (rel && /^stylesheet$/i.test(rel.trim())) { const h = attr(m[0], 'href'); if (h) add(h, 'style'); }
   }
-  return [...out];
+  return [...out.values()];
+}
+// A 200, not redirected, with a content type that fits the kind: a soft-200 HTML error page or captive portal is not an asset.
+function assetOk(r, kind) {
+  if (!r || r.status !== 200 || r.redirected) return false;
+  const ct = r.headers.get('content-type') || '';
+  return kind === 'script' ? /javascript|ecmascript/i.test(ct) : kind === 'style' ? /text\/css/i.test(ct) : false;
 }
 function shellCacheable(r) {
   return !!r && r.status === 200 && !r.redirected && /text\/html/i.test(r.headers.get('content-type') || '');
@@ -313,7 +346,7 @@ async function navigateNetworkFirst(e, req, bare) {
     if (bare && shellCacheable(r)) {
       // off the critical path: the page never waits on Cache Storage (a slow or full cache costs the copy, not the page)
       const copy = r.clone();
-      e.waitUntil((async () => { try { await (await caches.open(SHELL_CACHE)).put(SHELL_KEY, copy); } catch (_) { /* best effort */ } })());
+      e.waitUntil((async () => { try { await commitShell(copy); } catch (_) { /* best effort; '/' is replaced only with its assets */ } })());
     }
     return r;
   } catch (err) {
@@ -327,21 +360,28 @@ async function navigateNetworkFirst(e, req, bare) {
   }
 }
 // The shell's own scripts and styles: network first (a reload never sees a skewed page), written through to the shell cache
-// (the worker's cache.put ignores the server's no-store), answered from it when the network fails.
-async function assetNetworkFirst(req, path, done) {
+// OFF the response path (the worker's cache.put ignores the server's no-store) and only for an exact URL the cached shell
+// names, with a content type that fits; answered from the cache when the network fails.
+async function assetNetworkFirst(e, req, key, kind) {
   try {
     const r = await fetch(req);
-    if (r && r.status === 200 && !r.redirected) {
-      try { await (await caches.open(SHELL_CACHE)).put(path, r.clone()); } catch (_) { /* best effort */ }
+    if (assetOk(r, kind)) {
+      const copy = r.clone();
+      e.waitUntil((async () => {
+        try {
+          const hit = await (await caches.open(SHELL_CACHE)).match(SHELL_KEY);
+          if (hit && shellAssets(await hit.text()).some((a) => a.key === key)) await (await caches.open(SHELL_CACHE)).put(key, copy);
+        } catch (_) { /* best effort */ }
+      })());
     }
     return r;
   } catch (err) {
     try {
-      const hit = await (await caches.open(SHELL_CACHE)).match(path);
+      const hit = await (await caches.open(SHELL_CACHE)).match(key);
       if (hit) return hit;
     } catch (_) { /* fall through */ }
     return Response.error();
-  } finally { done(); }
+  }
 }
 self.addEventListener('fetch', (e) => {
   const req = e.request;
@@ -351,10 +391,7 @@ self.addEventListener('fetch', (e) => {
   if (u.origin !== self.location.origin) return;
   if (NO_INTERCEPT.some((p) => u.pathname === p || u.pathname.startsWith(p + '/'))) return;
   if (req.mode !== 'navigate') {
-    if ((req.destination === 'script' || req.destination === 'style') && !u.search) {
-      let done; e.waitUntil(new Promise((r) => { done = r; }));
-      e.respondWith(assetNetworkFirst(req, u.pathname, done));
-    }
+    if (req.destination === 'script' || req.destination === 'style') e.respondWith(assetNetworkFirst(e, req, u.pathname + u.search, req.destination));
     return;
   }
   e.respondWith(navigateNetworkFirst(e, req, u.pathname === SHELL_KEY && !u.search));

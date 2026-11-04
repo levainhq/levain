@@ -317,25 +317,69 @@ def test_install_precaches_the_shell_without_skipping_waiting_and_a_failed_fetch
     assert all(not es for _, es in _run("install", "redirected")["shells"])         # a redirect is not a shell
 
 
+SHELL_HTML = ('<link rel="stylesheet" href="/dashboard.css"><script src="/b.js?v=2"></script>')
+
+
 @needs_node
 def test_install_precaches_the_css_and_js_the_shell_names_and_an_offline_asset_fetch_is_answered_from_the_cache() -> None:
     """Reproduced red before the fix: only '/' was cached, so an offline cold open was an unstyled page. The asset list is
-    derived from the shell's own markup (same-origin scripts and stylesheets; not /webpush/, not a cross-origin one, not an icon)."""
+    derived from the shell's own markup (same-origin scripts and stylesheets; not /webpush/, not a cross-origin one, not an
+    icon), the exact URL with its query, single- or double-quoted."""
     got = _run("install", "assets")
     entries = {e: b for _, es in got["shells"] for e, b in es}
-    assert sorted(entries) == ["/", "/a.js", "/b.js", "/dashboard.css"], entries                # b.js: the query is dropped
+    assert sorted(entries) == ["/", "/a.js", "/b.js?v=2", "/dashboard.css", "/q.css", "/q.js"], entries
     assert entries["/dashboard.css"] == "ASSET /dashboard.css", entries
     off = _fetch(url="https://box.example/dashboard.css", mode="no-cors", destination="style", net="down", shell=True, cached="/dashboard.css")
     assert off["responded"] is True and off["body"] == "CACHED /dashboard.css", off
     miss = _fetch(url="https://box.example/other.js", mode="no-cors", destination="script", net="down", shell=True)
     assert miss["responded"] is True and miss["status"] == 0, miss                               # a miss is a network error, as without a worker
-    live = _fetch(url="https://box.example/dashboard.css", mode="no-cors", destination="style", net="ok", shell=True, cached="/dashboard.css")
-    assert live["body"] == "<html>live</html>", live                                              # online: the network wins
-    assert [e for _, es in live["shells"] for e, _b in es if e == "/dashboard.css"], live         # and is written through
+    live = _fetch(url="https://box.example/dashboard.css", mode="no-cors", destination="style", net="ok", shell=True,
+                  shellHtml=SHELL_HTML, cached="/dashboard.css")
+    assert live["body"] == "LIVE /dashboard.css", live                                            # online: the network wins
+    assert [b for _, es in live["shells"] for e, b in es if e == "/dashboard.css"] == ["LIVE /dashboard.css"], live   # and is written through
     for m in (dict(destination="image"), dict(destination="script", method="POST"), dict(destination="script", url="https://other.example/x.js"),
-              dict(destination="script", url="https://box.example/webpush/x.js"), dict(destination="script", url="https://box.example/x.js?t=SECRET")):
+              dict(destination="script", url="https://box.example/webpush/x.js")):
         got = _fetch(**{"url": "https://box.example/x.js", "mode": "no-cors", "net": "down", **m})
         assert got["responded"] is False, m
+
+
+@needs_node
+def test_a_query_versioned_shell_asset_is_cached_and_served_by_its_exact_url_and_any_other_query_stays_network_only() -> None:
+    """N1: the install stores '/b.js?v=2' and the fetch handler must intercept that exact request (it used to refuse every
+    query, so the cached copy was never served offline). A query the shell does not name is never cached."""
+    off = _fetch(url="https://box.example/b.js?v=2", mode="no-cors", destination="script", net="down", shell=True, cached="/b.js?v=2")
+    assert off["responded"] is True and off["body"] == "CACHED /b.js?v=2", off
+    on = _fetch(url="https://box.example/b.js?v=2", mode="no-cors", destination="script", net="ok", shell=True, shellHtml=SHELL_HTML)
+    assert [b for _, es in on["shells"] for e, b in es if e == "/b.js?v=2"] == ["LIVE /b.js?v=2"], on
+    other = _fetch(url="https://box.example/b.js?t=SECRET", mode="no-cors", destination="script", net="ok", shell=True, shellHtml=SHELL_HTML)
+    assert other["body"] == "LIVE /b.js?t=SECRET" and all(e == "/" for _, es in other["shells"] for e, _b in es), other   # network only
+
+
+@needs_node
+def test_a_failed_or_soft_200_asset_commits_no_shell_and_a_prior_generation_is_carried_whole() -> None:
+    """Reproduced red: '/' was committed before its assets, so one failed asset left a fresh shell with a missing dependency."""
+    for mode in ("badasset", "softhtml"):
+        got = _run("install", mode)
+        assert got["skipWaiting"] is False and all(not es for _, es in got["shells"]), (mode, got)   # install succeeds, nothing cached
+        prior = {n: dict(es) for n, es in _run("install", mode + ":prior")["shells"]}
+        cur = [v for n, v in prior.items() if n != "levain-shell-vOLD"]
+        assert cur == [{"/": "<html>old shell</html>", "/dashboard.css": "OLD CSS", "/a.js": "OLD A"}], (mode, prior)   # the whole old generation
+
+
+@needs_node
+def test_content_type_gates_the_write_through_and_a_refresh_replaces_the_shell_only_with_its_assets() -> None:
+    soft = _fetch(url="https://box.example/dashboard.css", mode="no-cors", destination="style", net="ok", shell=True, shellHtml=SHELL_HTML,
+                  ctype="text/html")
+    assert all(e == "/" for _, es in soft["shells"] for e, _b in es), soft                       # an HTML error page is never written
+    js_as_css = _fetch(url="https://box.example/b.js?v=2", mode="no-cors", destination="script", net="ok", shell=True, shellHtml=SHELL_HTML,
+                       ctype="text/css")
+    assert all(e == "/" for _, es in js_as_css["shells"] for e, _b in es), js_as_css
+    new_html = '<link rel="stylesheet" href="/dashboard.css">NEW'
+    good = _fetch(url="https://box.example/", net="ok", shell=True, html=new_html)
+    cached = {e: b for _, es in good["shells"] for e, b in es}
+    assert cached == {"/": new_html, "/dashboard.css": "LIVE /dashboard.css"}, good               # the refresh stages its assets, then commits '/'
+    bad = _fetch(url="https://box.example/", net="ok", shell=True, html=new_html, assetFail=["/dashboard.css"])
+    assert {e: b for _, es in bad["shells"] for e, b in es} == {"/": "<html>cached shell</html>"}, bad   # '/' is NOT replaced
 
 
 @needs_node

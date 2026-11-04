@@ -256,21 +256,34 @@ function fire(type, ev) {
     await fire('notificationclick', { notification: { close: () => {}, data: { url: '/' } } });
     log.openedAfterNoPing = [...dbs.get('levain-sw-2').stores.get('opened').entries()].length;
   } else if (scenario === 'install') {
-    // mode: ok | down | redirected | notice ; the shell fetch behaves as said; install must never throw or hold the worker out
+    // mode: ok | down | redirected | assets | badasset | softhtml, optionally ':prior' (an older generation exists; activation runs after)
+    const [md, prior] = mode.split(':');
+    const ctypeOf = (path) => (/\.css(\?|$)/.test(path) ? 'text/css' : 'application/javascript');
+    if (prior) {
+      cacheStores.set('levain-shell-vOLD', new Map([['/', '<html>old shell</html>'], ['/dashboard.css', 'OLD CSS'], ['/a.js', 'OLD A']]));
+      cacheNames.add('levain-shell-vOLD');
+    }
     sandbox.fetch = async (url) => {
       log.fetched = (log.fetched || []).concat([String(url)]);
-      if (mode === 'down') throw new TypeError('network down');
-      if (mode === 'assets' && String(url) !== '/') return new Response('ASSET ' + url, { status: 200, headers: { 'content-type': 'text/plain' } });
-      const html = mode === 'assets'
+      if (md === 'down') throw new TypeError('network down');
+      const withAssets = ['assets', 'badasset', 'softhtml'].includes(md);
+      if (withAssets && String(url) !== '/') {
+        if (md === 'badasset' && String(url) === '/dashboard.css') return new Response('nope', { status: 404, headers: { 'content-type': 'text/css' } });
+        if (md === 'softhtml' && String(url) === '/a.js') return new Response('<html>portal</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+        return new Response('ASSET ' + url, { status: 200, headers: { 'content-type': ctypeOf(String(url)) } });
+      }
+      const html = withAssets
         ? '<link rel="stylesheet" href="/dashboard.css"><script src="/a.js"></script><script src="https://cdn.example/x.js"></script>' +
-          '<script src="/webpush/z.js"></script><link rel="icon" href="/icon.png"><script src="/b.js?v=2"></script>'
+          '<script src="/webpush/z.js"></script><link rel="icon" href="/icon.png"><script src="/b.js?v=2"></script>' +
+          "<script src='/q.js'></script><link rel='stylesheet' href='/q.css'>"
         : '<html>shell</html>';
       const r = new Response(html, { status: 200, headers: { 'content-type': 'text/html' } });
-      if (mode === 'redirected') Object.defineProperty(r, 'redirected', { value: true });
+      if (md === 'redirected') Object.defineProperty(r, 'redirected', { value: true });
       return r;
     };
     await fire('install', {});
-    log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v')).map(([n, m]) => [n, [...m.entries()]]);
+    if (prior) await fire('activate', {});
+    log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v') && cacheNames.has(n)).map(([n, m]) => [n, [...m.entries()]]);
   } else if (scenario === 'carry') {
     // an older shell exists, the current one is empty (its install fetch failed): activation carries it forward
     cacheStores.set('levain-shell-vOLD', new Map([['/', '<html>old shell</html>']])); cacheNames.add('levain-shell-vOLD');
@@ -283,12 +296,18 @@ function fire(type, ev) {
     // mode: JSON {url, method, mode, net: 'down'|'ok'|'500', shell: bool}; records respondWith, the response and the cache writes
     const m = JSON.parse(mode);
     const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
-    if (m.shell) { cacheStores.set(shellName, new Map([['/', '<html>cached shell</html>']])); cacheNames.add(shellName); }
+    if (m.shell) { cacheStores.set(shellName, new Map([['/', m.shellHtml || '<html>cached shell</html>']])); cacheNames.add(shellName); }
     if (m.cached) { cacheStores.get(shellName).set(m.cached, 'CACHED ' + m.cached); }
     sandbox.fetch = async (req) => {
       log.fetchedNet = (log.fetchedNet || 0) + 1;
       if (m.net === 'down') throw new TypeError('network down');
-      return new Response('<html>live</html>', { status: m.net === '500' ? 500 : 200, headers: { 'content-type': 'text/html' } });
+      const path = new URL(typeof req === 'string' ? req : req.url, 'https://box.example');
+      const key = path.pathname + path.search;
+      if (key !== '/' && /\.(css|js)$/.test(path.pathname)) {
+        if ((m.assetFail || []).includes(key)) return new Response('nope', { status: 404, headers: { 'content-type': 'text/css' } });
+        return new Response('LIVE ' + key, { status: 200, headers: { 'content-type': m.ctype || (/\.css$/.test(path.pathname) ? 'text/css' : 'application/javascript') } });
+      }
+      return new Response(m.html || '<html>live</html>', { status: m.net === '500' ? 500 : 200, headers: { 'content-type': 'text/html' } });
     };
     const ev = { request: { url: m.url, method: m.method || 'GET', mode: m.mode || 'navigate', destination: m.destination || 'document' } };
     let handed = null;
