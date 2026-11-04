@@ -228,16 +228,23 @@ def _terminal_signed(path):
     return msg, {"format": ts.FORMAT, "message": msg.decode(), "sig": _sign(path, msg, ts.NAMESPACE), "entry": 1}
 
 
-@pytest.mark.parametrize("via", ["phone", "cli", "agent", None])
+@pytest.mark.parametrize("via", ["phone", "cli", "agent", ""])
 def test_a_terminal_signature_transplanted_onto_another_channel_is_channel_mismatch(world, via):
     path, signers = world
     _, block = _terminal_signed(path)
     ev = {"ts": "2026-11-03T21:04:30Z", "answer": "(a) Add a Levain 1.0 row", "via": via, "signed": block}
-    if via is None:
-        del ev["via"]
     got = ts.answer_class(ev, ROW, _ctx(signers, **TSCOPE))
     assert (got.state, got.reason) == ("failed", "channel-mismatch"), got
     assert ts.answer_class({**ev, "via": "seat"}, ROW, _ctx(signers, **TSCOPE)).state == "signed-terminal"
+
+
+def test_a_terminal_block_passed_without_its_label_is_judged_by_its_namespace(world):
+    """flow's needs_phill_sign reads a terminal answer as {ts, signed, answer} with no via: that call must keep
+    verifying (the transplant this closes is a via that names another channel)."""
+    path, signers = world
+    _, block = _terminal_signed(path)
+    ev = {"ts": "2026-11-03T21:04:30Z", "answer": "(a) Add a Levain 1.0 row", "signed": block}
+    assert ts.answer_class(ev, ROW, _ctx(signers, **TSCOPE)).state == "signed-terminal"
 
 
 def _terminal_countersign(path, **kw):
