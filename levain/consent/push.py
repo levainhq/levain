@@ -82,7 +82,7 @@ import shutil
 import stat
 import subprocess
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -91,7 +91,7 @@ from levain.launch import child_env
 
 __all__ = ["GIT_CANDIDATES", "MAX_OBJECT_ENTRIES", "MIRROR_CONFIG", "PUSH_CONFIG", "TRUSTED_PATH", "PushOutcomeUnknown",
            "PushRecordIncomplete", "PushRefused", "PushResult", "append_line", "branch_matches", "branch_problem",
-           "canonical_remote", "execute", "git_bin", "git_env", "push_argv", "push_protocol", "repo_key"]
+           "canonical_remote", "execute", "git_bin", "git_env", "git_isolation_args", "git_isolation_env", "push_argv", "push_protocol", "repo_key"]
 
 # The git levain runs, by absolute path; the first that passes :func:`git_bin`'s ownership test is used.
 GIT_CANDIDATES: tuple[str, ...] = ("/usr/bin/git",)
@@ -367,6 +367,34 @@ def git_env(protocols: str = "") -> dict[str, str]:
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
     env["GIT_ALLOW_PROTOCOL"] = protocols
     return env
+
+
+# The operator-side git isolation, ONE place (1104-8): every operator git that acts on an operator repo (dispatch/adopt.py,
+# slot/adopt_take.py, slot/adopt_view.py) takes its `-c` list and env overlay from here, so the two cannot drift.
+# core.hooksPath covers the hooks directory only; core.fsmonitor=false stops a configured fsmonitor command;
+# hook.reference-transaction.enabled=false stops a config-defined hook (git >= 2.54) on update-ref.
+GIT_ISOLATION_CONFIG: tuple[str, ...] = ("core.hooksPath=/dev/null", "core.fsmonitor=false",
+                                         "hook.reference-transaction.enabled=false")
+
+
+def git_isolation_args(git: str, repo_dir: str, *, work_tree: str | None = None,
+                       extra_config: Sequence[str] = ()) -> list[str]:
+    """``[git, -c <isolation>..., -c <extra>..., --git-dir=<repo_dir>[, --work-tree=<work_tree>]]``: the explicit git
+    directory means git never discovers a repository; the caller appends the subcommand."""
+    argv = [git]
+    for c in (*GIT_ISOLATION_CONFIG, *extra_config):
+        argv += ["-c", c]
+    argv.append(f"--git-dir={repo_dir}")
+    if work_tree is not None:
+        argv.append(f"--work-tree={work_tree}")
+    return argv
+
+
+def git_isolation_env() -> dict[str, str]:
+    """The env values every operator git carries on top of its own scrubbed base: no global or system git config, no
+    lazy fetch, no replace refs."""
+    return {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1"}
 
 
 def _root_owned(path: str, *, want_dir: bool) -> bool:

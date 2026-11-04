@@ -209,14 +209,16 @@ def _block(css: str, opener: str) -> dict[str, str]:
     return {m.group(1): m.group(2).strip() for m in re.finditer(r"(--[\w-]+)\s*:\s*([^;]+);", body)}
 
 
-def test_the_two_light_blocks_agree_and_the_three_tokens_are_the_phones() -> None:
+_LIGHT_TOKENS = {"--base": "oklch(0.975 0.006 265)", "--accent": "oklch(0.66 0.17 55)", "--contrast": "oklch(0.2 0.03 265)"}
+
+
+def test_the_two_light_blocks_agree_and_the_three_tokens_are_the_ones_the_phone_page_had() -> None:
     css = (WEB / "dashboard.css").read_text(encoding="utf-8")
     by_system = _block(css, ':root:not([data-theme="dark"]) {')
     by_switch = _block(css, ':root[data-theme="light"] {')
     assert by_system == by_switch                                          # one light, reached two ways
-    phone = _block((WEB / "phone.css").read_text(encoding="utf-8"), ":root {")
-    for token in ("--base", "--accent", "--contrast"):
-        assert by_switch[token] == phone[token], token                     # the page's light is the phone's three tokens
+    for token, value in _LIGHT_TOKENS.items():
+        assert by_switch[token] == value, token                            # the page's light is the old phone page's three tokens
     # the fill under white text was 3.3:1: the orange button carries dark text in light, and the dark theme keeps its own
     assert by_switch["--on-accent"] == by_switch["--contrast"]
     assert "color-scheme: dark" in css.split(":root[data-theme=\"light\"]")[0]   # native form chrome follows the theme, not a fixed dark

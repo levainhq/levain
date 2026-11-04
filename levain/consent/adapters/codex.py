@@ -260,6 +260,11 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     if agent_config and unconfined(cwd, home=home, environ=environ, codex_home=codex_dir):
         return None  # an unconfined session (Q10 D2): Codex's approval answers, as the gate left it to the mode
     hold = min(away_hold(settings, AGENT, idle, queue_dir=Path(queue.directory)), max(0.0, deadline - clock()))
+    if hold > 0 and settings.cockpit_data_root and not Path(settings.cockpit_data_root).is_dir():
+        # the configured cockpit is not there: no answer can verify, and Codex shows no dialog during a hold (1104-8 L3 r1)
+        print(f"levain consent hook: not holding, cockpit_data_root {settings.cockpit_data_root} "
+              "does not exist; the approval dialog stands", file=sys.stderr)
+        hold = 0.0
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER, model=event.get("model"))

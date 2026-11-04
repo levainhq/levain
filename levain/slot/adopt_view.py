@@ -63,6 +63,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from levain.consent import push
 from levain.contracts import canon
 from levain.slot import SUDO, Refused, adopt_preview, adopt_take, adopt_verify, bundlefmt
 from levain.slot.grammar import SESSION_RE
@@ -280,7 +281,7 @@ def show_warnings(ans: Mapping[str, object], verb: str, err: IO[str]) -> List[st
 
 
 def _git(seams: Seams, repo: Path, *args: str) -> "subprocess.CompletedProcess[bytes]":
-    argv = [seams.git or "git", "-c", "core.hooksPath=/dev/null", *adopt_take.repo_args(repo), *args]
+    argv = [*push.git_isolation_args(seams.git or "git", os.path.join(str(repo), ".git"), work_tree=str(repo)), *args]
     _note(seams.log, "spawn " + " ".join(argv[1:]))
     try:
         return seams.spawn(argv, cwd=str(repo), env=adopt_take.git_env(), stdin=subprocess.DEVNULL,

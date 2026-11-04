@@ -1197,9 +1197,8 @@ def _answer_class(answer: Any, row: Any, context: Any) -> AnswerClass:
     if signed is not None:
         fmt = signed.get("format") if isinstance(signed, Mapping) else None
         if fmt == FORMAT:
-            # a via naming another channel is a transplant; an event with no via is judged by its namespace (flow's
-            # needs_phill_sign reader passes the terminal block without the event's label)
-            if via is not None and via not in TERMINAL_VIAS:
+            # a via that is absent or names another channel is a transplant (flow's needs_phill_sign passes "terminal")
+            if via not in TERMINAL_VIAS:
                 return _failed("channel-mismatch", "a terminal-namespace signature on an answer not made at a terminal")
             spec = _TERMINAL
         elif fmt == DESK_FORMAT:

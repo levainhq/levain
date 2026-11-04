@@ -2444,9 +2444,6 @@ def test_a_noted_receipt_renders_as_noted_on_the_phone_not_as_zero_threads():
     r = type("R", (), {"body": {"stage": "noted", "why": "an fyi", "threads": []}, "at": "2026-10-30T10:00:00Z"})()
     row = ph.CoordPhone._receipt(r) if hasattr(ph, "CoordPhone") else None
     assert row is not None and row["stage"] == "noted" and row["why"] == "an fyi"
-    js = (Path(__file__).parent.parent / "levain" / "templates" / "web" / "phone.js").read_text()
-    assert 'noted: "noted"' in js
-    assert 'if (!receipts.some((r) => r.stage === "split" || r.stage === "noted"))' in js
 
 
 # --- L3 r1 (1030-47) on the JSON split and the text files ------------------------------------------------------------

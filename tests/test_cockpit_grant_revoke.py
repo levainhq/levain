@@ -37,7 +37,7 @@ from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_sign_origin import _Passkey
 from tests.test_cockpit_sign_routes import _call, _serving
 from tests.test_grant_phone import RP, world  # noqa: F401  (world is a fixture)
-from tests.test_phone_grants_tab import _grant
+from tests._grant_helpers import _grant
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 

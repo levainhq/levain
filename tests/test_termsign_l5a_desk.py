@@ -238,13 +238,14 @@ def test_a_terminal_signature_transplanted_onto_another_channel_is_channel_misma
     assert ts.answer_class({**ev, "via": "seat"}, ROW, _ctx(signers, **TSCOPE)).state == "signed-terminal"
 
 
-def test_a_terminal_block_passed_without_its_label_is_judged_by_its_namespace(world):
-    """flow's needs_phill_sign reads a terminal answer as {ts, signed, answer} with no via: that call must keep
-    verifying (the transplant this closes is a via that names another channel)."""
+def test_a_terminal_block_passed_without_its_label_is_refused_by_name(world):
+    """1104-8: flow's needs_phill_sign passes via "terminal" since ab6249cf6, so a terminal block with no via is no
+    longer judged by its namespace: it is channel-mismatch."""
     path, signers = world
     _, block = _terminal_signed(path)
     ev = {"ts": "2026-11-03T21:04:30Z", "answer": "(a) Add a Levain 1.0 row", "signed": block}
-    assert ts.answer_class(ev, ROW, _ctx(signers, **TSCOPE)).state == "signed-terminal"
+    got = ts.answer_class(ev, ROW, _ctx(signers, **TSCOPE))
+    assert (got.state, got.reason) == ("failed", "channel-mismatch"), got
 
 
 def _terminal_countersign(path, **kw):

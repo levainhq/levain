@@ -2,19 +2,10 @@
 "ordinary prose" outright; the pairing code and repo boxes keep their code/identifier attributes."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 WEB = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web"
 PROSE = {"autocapitalize": "sentences", "autocorrect": "on", "spellcheck": "true", "inputmode": "text", "autocomplete": "off"}
-
-
-def test_phone_drop_textarea_is_prose():
-    html = (WEB / "phone.html").read_text()
-    tag = re.search(r'<textarea[^>]*id="drop-words"[^>]*>', html, re.S).group(0)
-    for k, v in PROSE.items():
-        assert f'{k}="{v}"' in tag, (k, tag)
-    assert "one-time-code" not in tag
 
 
 def test_cockpit_drop_textarea_is_prose():
@@ -26,7 +17,6 @@ def test_cockpit_drop_textarea_is_prose():
 
 
 def test_code_and_repo_boxes_keep_their_attributes():
-    assert 'autocapitalize="off" autocorrect="off"' in (WEB / "phone.html").read_text()
     assert 'input.autocomplete = "one-time-code"' in (WEB / "dashboard_boot.js").read_text()
 
 
@@ -42,9 +32,7 @@ def test_every_drop_textarea_has_a_dash_free_name():
     """Phill 11-04, on his iPhone: Safari's AutoFill showed "AutoFill Contact" and his phone numbers on the Drop box (not on a
     page whose box carried a dash-free id and name: variant K of ~/Desktop/ios_autofill_variants). The WebKit classifier is closed
     code and its one reported trigger is a dash in a field's name (Apple Developer Forums 764041), so each Drop box names itself
-    `dropwords`. The three boxes are the phone page's, the cockpit hero and the envelope sheet's."""
-    phone = (WEB / "phone.html").read_text()
-    assert 'name="dropwords"' in re.search(r'<textarea[^>]*id="drop-words"[^>]*>', phone, re.S).group(0)
+    `dropwords`. The boxes are the cockpit hero and the envelope sheet's."""
     for fname, anchor in (("dashboard_core.js", 'words.id = "ck-drop-words"'), ("sign.js", 'words.id = "drop-words"')):
         js = (WEB / fname).read_text()
         i = js.index(anchor)
@@ -53,21 +41,16 @@ def test_every_drop_textarea_has_a_dash_free_name():
 
 def test_the_other_dashed_text_fields_of_the_drop_flow_have_dash_free_names():
     """The sweep behind the Drop box fix (11-04): every free-text or identifier field whose id carries a dash and that is not a
-    contact field names itself without one. Left alone on purpose: the three type=number inputs on the phone page (drop-calls,
-    drop-tokens, drop-hours; numeric, untested) and the filter and pairing inputs (no id and no name at all)."""
-    assert 'name="droponto"' in re.search(r'<input[^>]*id="drop-onto"[^>]*>', (WEB / "phone.html").read_text(), re.S).group(0)
+    contact field names itself without one. Left alone on purpose: the filter and pairing inputs (no id and no name at all)."""
     ef = (WEB / "envelope_form.js").read_text()
     assert 'repo.setAttribute("name", "droprepo")' in ef[ef.index('repo.id = "drop-repo"'):][:400]
     sj = (WEB / "sign.js").read_text()
     assert 'box.setAttribute("name", "writein")' in sj[sj.index('box.id = "sheet-write-in"'):][:400]
 
 
-def test_the_phone_and_shared_envelope_forms_both_name_their_repo_and_branch_boxes():
-    """L3 r1 (codex + complement): the sweep covered one of each pair. The phone page carries its own repo and branch inputs, the
-    shared envelope form builds the same two, and the signing sheet's cancellation reason is a free-text field too."""
-    phone = (WEB / "phone.html").read_text()
-    assert 'name="droprepo"' in re.search(r'<input[^>]*id="drop-repo"[^>]*>', phone, re.S).group(0)
-    assert 'name="droponto"' in re.search(r'<input[^>]*id="drop-onto"[^>]*>', phone, re.S).group(0)
+def test_the_shared_envelope_form_names_its_repo_and_branch_boxes():
+    """L3 r1 (codex + complement): the shared envelope form builds the repo and branch inputs, and the signing sheet's
+    cancellation reason is a free-text field too."""
     ef = (WEB / "envelope_form.js").read_text()
     assert 'onto.setAttribute("name", "droponto")' in ef[ef.index('onto.id = "drop-onto"'):][:300]
     sj = (WEB / "sign.js").read_text()
@@ -77,7 +60,7 @@ def test_the_phone_and_shared_envelope_forms_both_name_their_repo_and_branch_box
 def test_no_drop_box_sits_in_a_form_that_a_name_could_submit():
     """L3 r1 (deepseek MED, refuted by grep): a named control inside a submitting <form> would send its words; none of the Drop
     boxes is in one (the web templates read them by id and never use FormData, getElementsByName or form.elements)."""
-    for name in ("phone.html", "dashboard.html", "sign.html"):      # the pages that host a Drop box or the signing sheet (init.html is the setup form, no Drop box)
+    for name in ("dashboard.html", "sign.html"):      # the pages that host a Drop box or the signing sheet (init.html is the setup form, no Drop box)
         assert "<form" not in (WEB / name).read_text(), name
     for fname in ("dashboard_core.js", "envelope_form.js", "sign.js"):
         src = (WEB / fname).read_text()

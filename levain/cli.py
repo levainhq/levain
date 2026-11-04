@@ -1512,6 +1512,19 @@ def build_parser() -> argparse.ArgumentParser:
     hs_p = hands_sub.add_parser("status", help="Show the entity's user's vendor logins (read-only).")
     hs_p.add_argument("vendor", nargs="?", choices=("claude", "codex"), default=None)
     hs_p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
+    hm_p = hands_sub.add_parser("mcp", help="Sign the entity's user in to a REGISTERED MCP server, take one out, "
+                                            "or list them (Claude; macOS).")
+    hm_sub = hm_p.add_subparsers(dest="hands_mcp_cmd", required=True)
+    for _verb, _help in (("signin", "Sign in to one registered remote MCP server as the entity's user."),
+                         ("remove", "Log out of and remove a server `signin` added (local only)."),
+                         ("list", "Show registered servers against what the entity's user holds (read-only).")):
+        _p = hm_sub.add_parser(_verb, help=_help)
+        if _verb != "list":
+            _p.add_argument("name", help="The registered server's name.")
+        _p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
+        if _verb != "remove":
+            _p.add_argument("--data-root", type=Path, default=None, help="The cockpit data root holding the authority "
+                                                                          "log (default: <path>/.levain/cockpit).")
     hands_p.set_defaults(func=_cmd_hands)
 
     wsg_p = subparsers.add_parser(
@@ -2695,7 +2708,15 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
                 " (Codex shows no dialog until the hold ends)"
         else:
             line = f"{agent}: away mode off"
-        line += f"; WARN: {reason}" if reason else f"; answers verify against {got.cockpit_data_root}"
+        if on and got.cockpit_data_root and not Path(got.cockpit_data_root).is_dir():
+            # a hold there queues nowhere an answer can verify: a failing status, not a warning (1104-8)
+            line += (f"; FAIL: the configured cockpit_data_root {got.cockpit_data_root} does not exist or is not a "
+                     "directory, so nothing can answer a held request (the hook will not hold)")
+            rc = 1
+            if reason:
+                line += f"; WARN: {reason}"
+        else:
+            line += f"; WARN: {reason}" if reason else f"; answers verify against {got.cockpit_data_root}"
         line += f"; set by {why}"
         if got.away_marked:
             try:
@@ -4304,6 +4325,35 @@ def _ask(prompt: str) -> bool:
         return False
 
 
+_KEEP_MEANING = (
+    "Keeping a key keeps it at its class. A laptop-presence key has FULL authority over this laptop's presence:\n"
+    "whoever holds it can sign what this laptop's presence signs. A key that lives on this laptop (a file under\n"
+    "~/.ssh, an agent's key) is not a recovery path: lose the laptop and you lose the key with it. Keep only a\n"
+    "key you made for this; an everyday SSH or GitHub key is a no. Anything but y or yes keeps nothing.\n")
+
+
+def _keep_prompt(fp: str, what: str, plan: object, signer_fp: str, signer_pub: str, signer_custody: str) -> str:
+    """The keep question for one key: what keeping means, the key's class, type and custody as the store knows them
+    (a legacy row's custody is 'unstated'; the store holds no comment, only the fingerprint), then the ask."""
+    from levain.authority import LAPTOP
+
+    key_type, custody, cls = "?", "unstated", "?"
+    if fp == signer_fp:
+        key_type, custody, cls = (signer_pub.split() or ["?"])[0], signer_custody, LAPTOP
+    else:
+        for r in plan.rows:                                     # type: ignore[attr-defined]
+            if r.fingerprint == fp:
+                key_type, cls = r.key_type, r.key_class
+                break
+    for k in plan.log_keys:                                     # type: ignore[attr-defined]
+        if k.fingerprint == fp:                                 # a key the log already holds keeps ITS custody and class
+            custody, cls = k.custody, k.key_class
+            if k.public_key and key_type == "?":
+                key_type = (k.public_key.split() or ["?"])[0]
+            break
+    return f"\n{_KEEP_MEANING}  class {cls}, key type {key_type}, custody {custody}\nkeep {fp}{what}? [y/N] "
+
+
 def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
     from levain.authority import LAPTOP
     from levain.cockpit.custody import declared_custody
@@ -4363,7 +4413,7 @@ def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
                 what = (" (the log's genesis)" if fp == plan.genesis and fp != signer_fp else
                         " (the signing key, the genesis)" if fp == signer_fp and plan.genesis in (None, fp) else
                         " (the signing key)" if fp == signer_fp else "")
-                if _ask(f"keep {fp}{what}? [y/N] "):
+                if _ask(_keep_prompt(fp, what, plan, signer_fp, signer_pub, signer_custody)):
                     confirmed.add(fp)
         else:
             sys.stdout.flush()
@@ -5019,6 +5069,13 @@ def _cmd_ssh_add(args: argparse.Namespace) -> int:
 def _cmd_hands(args: argparse.Namespace) -> int:
     from levain.firing import hands_login
 
+    if args.hands_cmd == "mcp":
+        from levain.firing import hands_mcp_login
+        if args.hands_mcp_cmd == "signin":
+            return hands_mcp_login.cmd_signin(args.path, args.name, args.data_root)
+        if args.hands_mcp_cmd == "remove":
+            return hands_mcp_login.cmd_remove(args.path, args.name)
+        return hands_mcp_login.cmd_list(args.path, args.data_root)
     if args.hands_cmd == "login":
         return hands_login.cmd_hands_login(args.path, args.vendor)
     if args.hands_cmd == "logout":
