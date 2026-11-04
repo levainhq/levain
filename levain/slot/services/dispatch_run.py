@@ -726,8 +726,6 @@ def _parser(host: str) -> argparse.ArgumentParser:
     ap.add_argument("--store-dir", default=str(STORE[host]), help="L: the store root (gw logs, queue, dispatch)")
     ap.add_argument("--operator-record", default=None)
     ap.add_argument("--operator-uid", type=int, default=None)
-    ap.add_argument("--agent-store-dir", default=None, help="the operator's agent store dir (default <home>/.levain/autonomic)")
-    ap.add_argument("--cockpit-root", default=None, help="default: the agent store's session_install.json")
     return ap
 
 
@@ -751,9 +749,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from levain.slot.layout import operator_record_path
         from levain.slot.services.control import _operator_uid
         op_uid = a.operator_uid if a.operator_uid is not None else _operator_uid(Path(a.operator_record or operator_record_path(host)))
-        store_dir = Path(a.agent_store_dir) if a.agent_store_dir else Path(pwd.getpwuid(op_uid).pw_dir) / ".levain" / "autonomic"
-        cockpit = Path(a.cockpit_root) if a.cockpit_root else _cockpit_root(store_dir)
-        server = build_server(host, Path(a.store_dir), Path(a.control), op_uid, store_dir, cockpit)
+        server = build_server(host, Path(a.store_dir), Path(a.control), op_uid)
         listener = _bind(Path(a.socket))
     except (Refused, SystemExit, KeyError, OSError, ValueError) as exc:
         print(f"levain dispatch-run: refused: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
@@ -772,16 +768,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
-def _cockpit_root(store_dir: Path) -> Path:
-    from levain.agents.session_wire import read_install
-    return Path(read_install(store_dir).cockpit_root)
-
-
-def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, agent_store_dir: Optional[Path] = None,
-                 cockpit_root: Optional[Path] = None) -> RunServer:
+def build_server(host: str, store: Path, control_sock: Path, operator_uid: int) -> RunServer:
     """The production wiring: the real ports behind :class:`RealLauncher`, and the authority REPLICA at
-    ``<store>/dispatch/authority`` behind :func:`replica_verifier`. ``agent_store_dir`` and ``cockpit_root`` are the
-    operator-home readers of the earlier shape: accepted and IGNORED (slice B2 drops them with ``main``'s flags)."""
+    ``<store>/dispatch/authority`` behind :func:`replica_verifier`. Nothing of the operator's home is read or named: the operator's
+    authority reaches the replica only through SYNC."""
     from levain.qbroker.peercred import peer_uid
     from levain.slot.dispatch_runtime import DispatchControlPort, HelperSlotRuntime
     index_dir = store / "dispatch" / "sessions"

@@ -1,0 +1,160 @@
+"""P7-1 S10b slice B2: the operator-side client SYNCs the dispatch server's authority replica before LAUNCH and RELEASE,
+and ``main`` no longer reads the operator's home.
+
+The client is the REAL ``DispatchSessionLauncher`` with an ``AuthorityFeed``, the server the REAL ``RunServer`` over a
+replica-backed verifier (the production shape), both in-process over socketpairs. Not held here (VM): the real cross-uid frame.
+"""
+from __future__ import annotations
+
+import shutil
+import sys
+from pathlib import Path
+
+import pytest
+
+from levain.agents import session as S
+from levain.agents import session_client as C
+from levain.agents import session_wire as W
+from levain.slot.services import dispatch_run as D
+from tests.test_agents_authority_replica import Wire, _source, rig  # noqa: F401  (rig is the fixture)
+from tests.test_agents_session_launch import EXP, _occurrence
+from tests.test_authority_agent_link import revoke_agent
+
+pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+
+
+@pytest.fixture
+def wire(rig, tmp_path):
+    w = Wire(rig, tmp_path)
+    yield w
+    w.close()
+
+
+def _client(rig, wire):
+    return C.DispatchSessionLauncher(wire.conn, lambda occ: C.link_proof(rig.store, rig.world.root, occ, now=rig.now()),
+                                     C.AuthorityFeed(rig.store, rig.world.root))
+
+
+def _launch(oid, key="s-00000000000000d1"):
+    return S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP)
+
+
+def test_the_client_syncs_an_empty_replica_then_launches_and_releases(rig, wire):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    assert wire.replica.head() == (0, "")
+    child = _client(rig, wire).spawn(_launch(oid))
+    assert child.session == "sess-1" and wire.replica.head()[0] == wire.head()["seq"]
+    child.release()
+    assert child.released is True and wire.runtime.children[0].released is True
+    child._conn.close()
+
+
+def test_the_client_syncs_in_chunks_when_the_ledger_is_large(rig, wire, monkeypatch):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    monkeypatch.setattr(C, "_SYNC_CHUNK_ROWS", 1)
+    sent = []
+    real = C._Conn.request
+
+    def spy(self, op, expect, **kw):
+        if op == "SYNC" and kw["rows"]:
+            sent.append(len(kw["rows"]))
+        return real(self, op, expect, **kw)
+    monkeypatch.setattr(C._Conn, "request", spy)
+    child = _client(rig, wire).spawn(_launch(oid))
+    assert len(sent) == len(_source(rig)) and set(sent) == {1} and len(sent) > 1
+    child._conn.close()
+
+
+def test_a_revoke_appended_between_launch_and_release_refuses_at_release(rig, wire):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    child = _client(rig, wire).spawn(_launch(oid))
+    rig.world.link(revoke_agent(rig.row(oid)["agent_id"], rig.sid))             # signed after LAUNCH
+    with pytest.raises(RuntimeError, match="link-not-standing"):                # the client SYNCed it; the server re-verified
+        child.release()
+    assert wire.replica.head()[0] == wire.head()["seq"]
+    assert wire.runtime.children[0].released is False and wire.runtime.ended == ["sess-1"]
+    child.abort()
+    child._conn.close()
+
+
+def test_ledger_stale_is_already_synced_after_one_more_head_read(rig, wire, monkeypatch):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    real = C._Conn.request
+    state = {"n": 0}
+
+    def spy(self, op, expect, **kw):
+        if op == "SYNC" and kw["rows"] and state["n"] == 0:
+            state["n"] = 1
+            wire.sync()                                      # another fire SYNCs the same rows first
+        return real(self, op, expect, **kw)
+    monkeypatch.setattr(C._Conn, "request", spy)
+    child = _client(rig, wire).spawn(_launch(oid))
+    assert state["n"] == 1 and child.session == "sess-1"
+    child._conn.close()
+
+
+def test_a_server_ledger_that_forked_is_a_named_standing_refusal(rig, wire):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    wire.sync()
+    # a different operator ledger at the same seq: the replica's own head is not on this chain
+    import dataclasses
+    rows = _source(rig)
+    other = wire.replica
+    import sqlite3
+    db = sqlite3.connect(other.db_path)
+    db.execute("UPDATE authority_log SET hash = ? WHERE seq = ?", ("0" * 64, rows[-1].seq))
+    db.commit()
+    db.close()
+    with pytest.raises(C.LauncherRefused) as exc:
+        _client(rig, wire).spawn(_launch(oid))
+    assert exc.value.name in ("ledger-fork", "ledger-unverifiable", "authority-unreadable", "replica-unreadable")
+    assert wire.runtime.children == []
+
+
+def test_a_server_ahead_of_the_client_is_ledger_behind_transient(rig, wire):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    wire.sync()
+    feed = C.AuthorityFeed(rig.store, rig.world.root)
+    real = feed.read
+
+    def stale(occ):
+        r = real(occ)
+        return C.AuthorityRead((r.head[0] - 1, "x"), r.bar)
+    feed.read = stale
+    cl = C.DispatchSessionLauncher(wire.conn, lambda occ: C.link_proof(rig.store, rig.world.root, occ, now=rig.now()), feed)
+    with pytest.raises(C.LauncherRefused) as exc:
+        cl.spawn(_launch(oid))
+    assert exc.value.name == "ledger-behind" and exc.value.reason_class == "transient"
+
+
+def test_the_registered_launcher_builds_with_the_feed(rig):
+    W.write_install(rig.store.directory, cockpit_root=rig.world.root, launcher=C.LAUNCHER_NAME)
+    got = W.resolve_launcher(rig.store, W.read_install(rig.store.directory))
+    assert isinstance(got._feed, C.AuthorityFeed)
+
+
+def test_main_takes_neither_the_agent_store_nor_the_cockpit_root_and_opens_nothing_of_the_operators_home(tmp_path, monkeypatch):
+    ap = D._parser("darwin")
+    for flag in ("--agent-store-dir", "--cockpit-root"):
+        with pytest.raises(SystemExit):
+            ap.parse_args([flag, "/x"])
+    opened = []
+    import builtins
+    real_open = builtins.open
+    monkeypatch.setattr(builtins, "open", lambda f, *a, **k: (opened.append(str(f)), real_open(f, *a, **k))[1])
+    import pwd
+    home_calls = []
+    real_pw = pwd.getpwuid
+    monkeypatch.setattr(pwd, "getpwuid", lambda u: (home_calls.append(u), real_pw(u))[1])
+    seen = {}
+    monkeypatch.setattr(D, "build_server", lambda host, store, ctl, uid, *a, **k: seen.update(args=(store, ctl, uid, a, k)) or (_ for _ in ()).throw(OSError("stop")))
+    monkeypatch.setattr(D.os, "geteuid", lambda: 4242)
+    monkeypatch.setattr(D.pwd, "getpwnam", lambda n: type("P", (), {"pw_uid": 4242})())
+    rc = D.main(["--operator-uid", "501", "--store-dir", str(tmp_path / "L"), "--control", str(tmp_path / "c.sock"),
+                 "--socket", str(tmp_path / "r.sock")])
+    assert rc == D.EX_CONFIG
+    store, ctl, uid, a, k = seen["args"]
+    assert (uid, a, k) == (501, (), {}) and home_calls == []
+    home = Path.home()
+    assert not [p for p in opened if p.startswith(str(home / ".levain"))]
+    assert not [x for x in (str(store), str(ctl), *sys.argv) if "/.levain/autonomic" in x]
