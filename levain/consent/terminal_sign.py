@@ -1060,7 +1060,9 @@ def answer_class(answer: Mapping[str, Any], row: Mapping[str, Any] | None = None
     and an ``at`` fresh against the answer's own ``ts``. A countersign is a later event ``{of_ts, ts, session,
     view, signed}``: its signed ``countersign-of`` must name the answer (:func:`target_id`), its store and install
     are the context's, its session and view its own event's, and its ``at`` is bounded by its own ``ts``; it
-    confirms the answer the original event recorded. Any missing expected field fails closed.
+    confirms the answer the original event recorded. A desk countersign ``{of_ts, ts, surface, origin, view, signed}``
+    is scoped like a direct answer: every field from the context (the reader's origin, surface and view), and the
+    event's own surface, origin and view must each equal them. Any missing expected field fails closed.
 
     Order: a ``signed`` block that re-verifies (its format picks the namespace and the parser; a format that
     disagrees with ``via`` is ``channel-mismatch``), else a verifying countersign (marked late; a verified desk
@@ -1072,15 +1074,22 @@ def answer_class(answer: Mapping[str, Any], row: Mapping[str, Any] | None = None
         return _failed("classifier-error", f"the answer could not be classified: {_one_line(exc)}")
 
 
+_DESK_READER_FIELDS = ("surface", "origin", "view")
+
+
 def _scope_for(spec: _Spec, c: Mapping[str, Any], cs: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """The scope a reader expects: from its context for a direct answer; for a countersign the reader's store and
-    install and the event's own other fields."""
-    if cs is None:
+    """The scope a reader expects: from its context for a direct answer and for a desk countersign (the reader's own
+    origin, surface and view: the event's claims are only compared against them, :func:`_desk_claims_agree`); for a
+    terminal countersign the reader's store and install and the event's own session and view."""
+    if cs is None or spec.channel == "desk":
         return {name: c.get(name) for name in spec.scope_fields}
-    if spec.channel == "desk":
-        return {"store": c.get("store"), "install": c.get("install"), "surface": cs.get("surface"),
-                "origin": cs.get("origin"), "view": cs.get("view")}
     return {"store": c.get("store"), "install": c.get("install"), "session": cs.get("session"), "view": cs.get("view")}
+
+
+def _desk_claims_agree(cs: Mapping[str, Any], scope: Mapping[str, Any]) -> bool:
+    """A desk countersign event's own surface, origin and view each name what the reader expects (an absent claim
+    does not agree)."""
+    return all(isinstance(cs.get(n), str) and cs.get(n) == scope.get(n) for n in _DESK_READER_FIELDS)
 
 
 def _answer_class(answer: Any, row: Any, context: Any) -> AnswerClass:
@@ -1123,8 +1132,10 @@ def _answer_class(answer: Any, row: Any, context: Any) -> AnswerClass:
             spec = _DESK
         else:
             continue
-        got, parsed = _signed(spec, block, answer, row, ctx, _scope_for(spec, c, cs), cs.get("ts"), target,
-                              want=cs.get("countersign"))
+        scope = _scope_for(spec, c, cs)
+        if spec.channel == "desk" and not _desk_claims_agree(cs, scope):
+            continue
+        got, parsed = _signed(spec, block, answer, row, ctx, scope, cs.get("ts"), target, want=cs.get("countersign"))
         if got.state != "signed-terminal":
             continue
         if getattr(parsed, "countersign", None) == "disown":      # a verified disown outranks every confirm

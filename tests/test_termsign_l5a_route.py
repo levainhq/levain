@@ -40,6 +40,7 @@ def _guards(tmp_path, monkeypatch):
     monkeypatch.setattr(ts, "default_signer_factory", boom)
     monkeypatch.setattr(ts, "default_desk_signer_factory", boom)
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    monkeypatch.setattr(band_view, "_cockpit_origins", lambda: frozenset({ORIGIN}), raising=False)   # their cockpit
 
 
 @pytest.fixture
@@ -717,3 +718,41 @@ def test_a_credential_named_outside_the_form_answers_under_its_own_viewer(store,
 
 def test_a_duplicate_waits_longer_than_a_touch_can_take():
     assert desk_click._WAIT_S > ts.SIGN_BOUND_S
+
+
+# --- L3 r2 W1: the history reader's scope is its own, never the signed message's ---------------------------------
+
+def _resigned(keydir, message: str, old: str, new: str) -> tuple[str, str]:
+    """The stored message with one line moved, signed again by the enrolled key: a valid signature over other scope."""
+    assert old in message
+    moved = message.replace(old, new)
+    return moved, ckeys.ssh_signer(keydir / ts.KEY_LABEL, namespace=ts.DESK_NAMESPACE)[1](moved.encode())
+
+
+@pytest.mark.parametrize("what", ["origin", "view", "surface"])
+def test_a_stored_signature_under_another_origin_surface_or_view_is_failed(store, keydir, monkeypatch, what):
+    q = file_q(store)
+    sid, vid = _shown(store)
+    other_view = band_view.band_payload(store, "cockpit:other")["view_id"]        # a view another credential holds
+    got, status = _text(store, keydir, _text_req(store, "1a"), factory=Calls())
+    assert status == 200 and got["signed"], got
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    band_view._badge_cache.clear()
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok) == "signed: Touch ID, laptop (desk)"
+    real = band_view.answer_sign_of(store, q.id)
+    old, new = {"origin": (f"origin: {ORIGIN}\n", "origin: http://127.0.0.1:8765\n"),
+                "view": (f"view: {vid}\n", f"view: {other_view}\n"),
+                "surface": ("surface: web\n", "surface: other\n")}[what]
+    message, sig = _resigned(keydir, real["message"], old, new)
+    monkeypatch.setattr(band_view, "answer_sign_of", lambda st, qid: {**real, "message": message, "sig": sig})
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok) == "signature failed (scope-mismatch)", what
+
+
+def test_the_reader_names_the_origins_it_accepts(rig, store, keydir):
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    band_view._badge_cache.clear()
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok,
+                                  origins=["http://localhost:7420"]) == "signature failed (scope-mismatch)"
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok, origins=[ORIGIN]) == "signed: Touch ID, laptop (desk)"
