@@ -1128,7 +1128,8 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
         return path
     # Stage everything that can fail (every read, temp file, write and fsync) BEFORE the first rename, so a failure
     # leaves the old instructions copy and the old facts file untouched; the two renames are all that is left, and a
-    # failure of the second puts the first back. The pair is never left half-installed.
+    # failure of the second puts the first back (best effort: if that put-back itself fails the pair can be mixed
+    # until the next seed, which re-copies the instructions).
     staged: list[str] = []
     dest = d / SHADOW_INSTRUCTIONS
     instr_tmp = backup_tmp = None
