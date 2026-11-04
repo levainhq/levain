@@ -345,7 +345,8 @@ class RoomLauncher:
     def _open(self, room_thread: str, resume: Optional[str]) -> RoomHandle:
         with self._store._write() as (conn, now):
             ln = lease.open_room_launch(conn, now, harness="claude", model=self._setting.model,
-                                        cwd=self._setting.cwd, room_thread=room_thread, pid=os.getpid())
+                                        cwd=self._setting.cwd, room_thread=room_thread, pid=os.getpid(),
+                                        resumed_from=resume)
         launch_id = ln.launch_id
         nonce = secrets.token_hex(16)
         workdir = self._run_dir / launch_id

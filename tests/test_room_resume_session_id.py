@@ -1,15 +1,17 @@
 """RM-E seam 2: a resumed room conversation reports the session id it was resumed from (RM0 run D: same session_id,
-history kept), so the room's own ended launch on the same room thread is no claim on that id. Any other launch, and a
-room launch still running, still is."""
+history kept), so when a pending room launch ASKED to resume that id (``resumed_from``), an ended room launch of the
+same harness sharing its room thread is no claim on it. Any other launch, a room launch still running, and an id the
+launch did not ask for, still is."""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from levain.coordinator import lease, room
 from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import Part
+from levain.coordinator.store import Part, next_gseq
 
 T0 = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
 
@@ -37,10 +39,11 @@ def _thread(store, title="the room"):
     return store.split(d.drop_id, [Part("note", title)])[0].thread_id
 
 
-def _open(store, thread):
+def _open(store, thread, resumed_from=None, harness="claude"):
+    kw = {} if resumed_from is None else {"resumed_from": resumed_from}
     with store._write() as (conn, now):
-        return lease.open_room_launch(conn, now, harness="claude", model=None, cwd=str(store.path.parent),
-                                      room_thread=thread, pid=4242).launch_id
+        return lease.open_room_launch(conn, now, harness=harness, model=None, cwd=str(store.path.parent),
+                                      room_thread=thread, pid=4242, **kw).launch_id
 
 
 def _activate(store, launch, sid):
@@ -60,18 +63,66 @@ def test_a_resumed_room_launch_takes_the_id_its_ended_predecessor_recorded(store
     first = _open(store, thread)
     assert _activate(store, first, "sid-1")[1] is None
     _end(store, first)
-    second = _open(store, thread)
+    second = _open(store, thread, resumed_from="sid-1")
     got, why = _activate(store, second, "sid-1")
     assert why is None and got.state == "active"
     with store._write() as (conn, _now):
         assert lease.by_harness_session(conn, "sid-1", room=True).launch_id == second
+    # a chain: a third launch resuming the same conversation is not held by either ended predecessor
+    _end(store, second)
+    third = _open(store, thread, resumed_from="sid-1")
+    assert _activate(store, third, "sid-1")[1] is None
+    # the pending row's ask is not read as the launch's own session id
+    assert store.launch(third).harness_session_id == "sid-1"
+
+
+def test_a_room_launch_that_did_not_ask_to_resume_cannot_take_the_id(store):
+    """FAILS on the RM-E tip (L3_rme_r1 codex MED 6): any ended same-thread room launch exempted its id."""
+    thread = _thread(store)
+    first = _open(store, thread)
+    assert _activate(store, first, "sid-1")[1] is None
+    _end(store, first)
+    for asked in (None, "sid-other"):
+        second = _open(store, thread, resumed_from=asked)
+        with pytest.raises(lease.LeaseRefused, match="already recorded"):
+            _activate(store, second, "sid-1")
+        _end(store, second, "failed")
+
+
+def test_another_harness_room_on_the_same_thread_cannot_take_the_id(store):
+    """FAILS on the RM-E tip (L3_rme_r1 codex MED 6): an ended Claude room's id was open to a Codex room."""
+    thread = _thread(store)
+    first = _open(store, thread)
+    assert _activate(store, first, "sid-1")[1] is None
+    _end(store, first)
+    other = _open(store, thread, resumed_from="sid-1", harness="codex")
+    with pytest.raises(lease.LeaseRefused, match="already recorded"):
+        _activate(store, other, "sid-1")
+
+
+def test_thread_membership_not_the_verbatim_array_decides_the_same_room(store):
+    """L3_rme_r1 deepseek LOW-MED 2: a predecessor whose threads array differs in text (an extra member) but holds the
+    room thread is the same room. open_room_launch writes one thread and a launch row is append-only, so the
+    predecessor is written by hand here."""
+    thread, extra = _thread(store), _thread(store, "extra")
+    first = "ln-" + "1" * 32
+    with store._write() as (conn, now):
+        conn.execute("INSERT INTO launches (launch_id, gseq, session_key, harness, role, threads, model, cwd, token, "
+                     "placement, at, user_scope, role_ref) VALUES (?, ?, 's-0000000000000001', 'claude', 'room', ?, "
+                     "NULL, NULL, ?, 'operator-uid', ?, 0, NULL)",
+                     (first, next_gseq(conn, now), json.dumps([extra, thread]), lease.ROOM_TOKEN, now))
+        lease._launch_event(conn, now, first, "pending", "room opened", until=now)
+        lease._launch_event(conn, now, first, "active", "spawned", harness_session_id="sid-1")
+        lease._launch_event(conn, now, first, "ended", "test")
+    second = _open(store, thread, resumed_from="sid-1")
+    assert _activate(store, second, "sid-1")[1] is None
 
 
 def test_a_room_launch_still_running_keeps_its_id(store):
     thread = _thread(store)
     first = _open(store, thread)
     assert _activate(store, first, "sid-1")[1] is None
-    second = _open(store, thread)
+    second = _open(store, thread, resumed_from="sid-1")
     with pytest.raises(lease.LeaseRefused, match="already recorded"):
         _activate(store, second, "sid-1")
     assert store.launch(second).state == "pending"
@@ -82,6 +133,6 @@ def test_another_rooms_ended_launch_keeps_its_id(store):
     first = _open(store, a)
     assert _activate(store, first, "sid-1")[1] is None
     _end(store, first)
-    other = _open(store, b)
+    other = _open(store, b, resumed_from="sid-1")
     with pytest.raises(lease.LeaseRefused, match="already recorded"):
         _activate(store, other, "sid-1")
