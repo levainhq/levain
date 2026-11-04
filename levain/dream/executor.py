@@ -826,6 +826,9 @@ class _Ctx:
         #: True once this run holds the store lock and owns the occurrence dir: before that, progress.json and
         #: usage.json may belong to a LIVE run and are never written (a lock-held exit writes neither).
         self.owns_occ = False
+        #: True once ``_consolidate_store``'s cleanup has opened its stop hold; ``consolidate_store`` closes it after
+        #: ``_write_usage``, so the usage record is written whatever the SIGTERM timing.
+        self.cleanup_held = False
 
 
 def _write_usage(ctx: _Ctx) -> None:
@@ -992,7 +995,16 @@ def consolidate_store(
             res.spent_usd_micros = ctx.spent
             return res
         finally:
-            _write_usage(ctx)
+            # The stop stays held through the usage write (the spend record); a SIGTERM held meanwhile is raised at
+            # the closes below, after usage.json is on disk.
+            progress.hold_stop()
+            try:
+                _write_usage(ctx)
+            finally:
+                progress.release_stop()
+                if ctx.cleanup_held:
+                    ctx.cleanup_held = False
+                    progress.release_stop()
 
 
 def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind: Any, composer: str | None,
@@ -1177,9 +1189,11 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                 print(f"{L}: a prior wrap is still in progress (started {started_at}).\n"
                       + _remedy(remedies.prior_wrap, store_path, wrap_token) + extra)
                 return _fail("precondition", 2, "prior wrap in progress")
+            progress.hold_stop()          # a destructive discard is not aborted half-done; a held stop raises below
             try:
                 discarded = _w._discard_prior_wrap(store, prior_token)
             except WrapOwnershipError:
+                progress.release_stop()
                 from levain.manifest import anneal_invocation
 
                 print(f"{L}: the prior wrap was not cleared: another consolidate replaced it, or its metadata cannot "
@@ -1193,6 +1207,10 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                       "it straight after wrap-status and only if that wrap is the dead one. Keep the `--db` shown "
                       "here: without it anneal reads ~/.anneal-memory.")
                 return _fail("precondition", 2, "prior wrap not cleared")
+            except BaseException:
+                progress.release_stop()
+                raise
+            progress.release_stop()
             if not discarded:
                 print(f"{L}: the prior wrap was already gone; continuing.")
             elif unattended and not reset:
@@ -1210,12 +1228,18 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
         # Step 2: the snapshot hook, after any orphan is cleared and before anything is prepared.
         manifest = None
         if not dry_run:
+            progress.hold_stop()          # the snapshot hook writes files non-atomically; a stop waits for it
             try:
                 manifest = on_snapshot(store, occ_dir)
             except Exception as exc:  # noqa: BLE001 — a refused snapshot is a named outcome; this run's wrap was
                 # never opened (an orphan discarded above stays discarded: that discard did write the store)
+                progress.release_stop()
                 print(f"{L}: the snapshot was refused ({type(exc).__name__}: {exc}); nothing was prepared or saved.")
                 return _fail("snapshot-refused", 2, f"{type(exc).__name__}: {exc}")
+            except BaseException:
+                progress.release_stop()
+                raise
+            progress.release_stop()
 
         session_id = ANNEAL_SESSION_ID if store.consolidate_requires_baton() else None
         prepare_entered = True
@@ -1439,6 +1463,11 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                 _journal_cancelled()
         raise
     finally:
+        # Held until consolidate_store has written usage.json (see there): a stop landing in this teardown or in the
+        # usage write must not abort it half-done. Opened here rather than at the call so every path that reached
+        # this try, refused/empty/dry-run included, is covered.
+        progress.hold_stop()
+        ctx.cleanup_held = True
         stack.close()
         store.close()
         _w._unlock_wrap(lock)

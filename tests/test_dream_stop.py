@@ -750,7 +750,7 @@ def _run_store_fire(tmp_path, handle_stop):
         for i in range(3):
             s.record(content=f"Turn {i}: helped.", episode_type="observation", source="t")
     claude = root / "claude"
-    claude.write_text(f'#!/bin/sh\necho $$ > "{root}/child.pid"\nsleep 300\n')
+    claude.write_text(f'#!/bin/sh\necho $$ > "{root}/child.pid"\nexec sleep 300\n')
     claude.chmod(0o755)
     (root / "fire.py").write_text(STORE_FIRE)
     p = subprocess.Popen([sys.executable, str(root / "fire.py"), str(root), "stop" if handle_stop else "plain"],
@@ -760,9 +760,16 @@ def _run_store_fire(tmp_path, handle_stop):
     while not (root / "child.pid").exists():
         assert time.monotonic() < end and p.poll() is None, "the compose child did not start"
         time.sleep(0.05)
-    time.sleep(0.3)
     cpid = int((root / "child.pid").read_text())
-    _groups.append(cpid)
+    _groups.append(cpid)                    # the child leads its own group: teardown kills the group, not one pid
+    while True:                             # the journal names the child once the handler's hold region has closed
+        try:
+            if json.loads((root / "occ" / "progress.json").read_text()).get("child_pid") is not None:
+                break
+        except (OSError, ValueError):
+            pass
+        assert time.monotonic() < end and p.poll() is None, "the child was never journalled"
+        time.sleep(0.02)
     os.kill(p.pid, signal.SIGTERM)
     p.wait(timeout=30)
     return root, p, cpid
@@ -793,3 +800,84 @@ def test_without_handle_stop_a_sigterm_is_a_plain_kill(tmp_path):
     assert p.returncode == -signal.SIGTERM and not (root / "unwound").exists()
     assert _alive(cpid)                                           # the failure this seam closes
     assert json.loads((root / "occ" / "progress.json").read_text())["phase"] == "composing"
+
+
+# ------------------------------------------------ L3 r1: the stop is held across the cleanup, the discard and the snapshot
+
+def _stop_world(tmp_path, episodes=0):
+    from anneal_memory import FLOW_SCHEMA, Store
+    root = tmp_path / "w"
+    (root / "store").mkdir(parents=True)
+    with Store(str(root / "store" / "memory.db"), section_schema=FLOW_SCHEMA) as s:
+        for i in range(episodes):
+            s.record(content=f"Turn {i}: helped.", episode_type="observation", source="t")
+    return root
+
+
+def _fire_store(root, **kw):
+    pin = "test-model-1"
+    row = ex.PriceRow(context_window=200_000, max_output=40_000, input_micros_per_mtok=20_000_000,
+                      output_micros_per_mtok=25_000_000, source="t", read_on="2026-10-31")
+    return ex.consolidate_store(root / "store" / "memory.db",
+                                mind=ex.ClaudeMind(pin, claude_bin=str(root / "no-claude")), max_seconds=3000,
+                                budget=ex.Budget.for_model(pin, {pin: row}), occurrence_dir=root / "occ",
+                                handle_stop=True, **kw)
+
+
+def _term_once(real):
+    """Wrap ``real`` so the first call delivers a SIGTERM to this process just before it runs."""
+    fired = []
+
+    def wrapper(*a, **k):
+        if not fired:
+            fired.append(True)
+            os.kill(os.getpid(), signal.SIGTERM)
+        return real(*a, **k)
+
+    return wrapper
+
+
+def test_a_sigterm_during_the_usage_write_after_a_refused_run_still_writes_usage(tmp_path):
+    root = _stop_world(tmp_path, episodes=0)               # nothing to consolidate: "empty", raised stays False
+    with mock.patch.object(ex, "_write_usage", _term_once(ex._write_usage)):
+        with pytest.raises(ex.FireStopRequested):          # raised once the record is on disk, not inside it
+            _fire_store(root)
+    usage = json.loads((root / "occ" / "usage.json").read_text())
+    assert usage["outcome"] == "empty"
+
+
+def test_a_sigterm_during_the_snapshot_hook_lets_the_hook_finish(tmp_path):
+    root = _stop_world(tmp_path, episodes=3)
+    done = []
+
+    def snap(store, occ_dir):
+        os.kill(os.getpid(), signal.SIGTERM)
+        done.append(True)                                  # a stop raised in here would never reach this line
+        return {}
+
+    with pytest.raises(ex.FireStopRequested):
+        _fire_store(root, on_snapshot=snap)
+    assert done == [True]
+    assert (root / "occ" / "usage.json").exists()
+
+
+def test_a_sigterm_during_the_prior_wrap_discard_lets_the_discard_finish(tmp_path):
+    from anneal_memory import Store
+    from anneal_memory.continuity import prepare_wrap
+    from levain import wrap as _w
+    root = _stop_world(tmp_path, episodes=3)
+    with Store(str(root / "store" / "memory.db"), project_name="store") as s:
+        prepare_wrap(s, wrap_token="a" * 32)
+    finished = []
+    real = _w._discard_prior_wrap
+
+    def discard(*a, **k):
+        os.kill(os.getpid(), signal.SIGTERM)
+        out = real(*a, **k)
+        finished.append(out)
+        return out
+
+    with mock.patch.object(_w, "_discard_prior_wrap", discard):
+        with pytest.raises(ex.FireStopRequested):
+            _fire_store(root, reset=True)
+    assert finished == [True]
