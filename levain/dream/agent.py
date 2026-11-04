@@ -806,10 +806,13 @@ def shadow_store_refusal(store_path: Path | str, flow_root: Path | str | None = 
 
 
 def shadow_binding(*, shadow_flow_root: Path | str, store_path: Path | str, coord_dir: Path | str,
-                   cockpit_root: Path | str, flow_instructions: Path | str, model: str | None = None,
-                   claude_bin: str | None = None) -> str:
+                   cockpit_root: Path | str, flow_instructions: Path | str, zone: str,
+                   facts_path: Path | str | None, model: str | None = None, claude_bin: str | None = None) -> str:
     """The install facts a shadow's spec binds (:data:`SHADOW_SOURCE` + this is its ``input.source``): every path it
-    reads or writes, the authority root, the instructions SOURCE and the compose's model and binary, canonical JSON.
+    reads or writes, the authority root, the instructions SOURCE, the zone that picks the dream day, the first-run
+    facts file the executor reads (``facts_path``, None when the install names none) and the compose's model and
+    binary, canonical JSON. ``zone`` and ``facts_path`` are required, never defaulted: a caller that forgets one
+    would bind a spec the install can change without a new signed link.
     The instructions are bound by path, not by content: each seed re-copies flow's file so the night composes with
     what flow's own dream read, and the card names the sha256 each night composed with."""
     def p(v: Path | str) -> str:
@@ -817,6 +820,7 @@ def shadow_binding(*, shadow_flow_root: Path | str, store_path: Path | str, coor
 
     return json.dumps({"flow_root": p(shadow_flow_root), "scratch_store": p(store_path), "coord_dir": p(coord_dir),
                        "cockpit_root": p(cockpit_root), "flow_instructions": p(flow_instructions),
+                       "zone": str(zone), "facts_path": None if facts_path is None else p(facts_path),
                        "instructions_policy": "re-copied read-only at each seed",
                        "model": model or "claude-opus-5-5", "claude_bin": claude_bin or "claude"}, sort_keys=True)
 
@@ -827,8 +831,8 @@ def _binding_of_doc(doc: Mapping[str, Any]) -> str | None:
         return None
     return shadow_binding(shadow_flow_root=doc["shadow_flow_root"], store_path=doc["store_path"],
                           coord_dir=doc["coord_dir"], cockpit_root=doc["cockpit_root"],
-                          flow_instructions=doc.get("flow_instructions") or "", model=doc.get("model"),
-                          claude_bin=doc.get("claude_bin"))
+                          flow_instructions=doc.get("flow_instructions") or "", zone=doc["zone"],
+                          facts_path=doc.get("facts_path"), model=doc.get("model"), claude_bin=doc.get("claude_bin"))
 
 
 def current_binding(agent_dir: Path | str) -> str | None:
@@ -883,12 +887,34 @@ def check_bound(agent_dir: Path | str, row: Mapping[str, Any], inst: DreamInstal
         return
     want = SHADOW_SOURCE + shadow_binding(shadow_flow_root=inst.shadow_flow_root, store_path=inst.store_path,
                                           coord_dir=inst.coord_dir, cockpit_root=inst.cockpit_root,
-                                          flow_instructions=inst.flow_instructions or "", model=inst.model,
-                                          claude_bin=inst.claude_bin)
+                                          flow_instructions=inst.flow_instructions or "", zone=inst.zone,
+                                          facts_path=inst.facts_path, model=inst.model, claude_bin=inst.claude_bin)
     if source != want:
         raise InstallRefused("the shadow install facts are not the ones the occurrence's spec binds (they changed "
                              "after that spec was registered, or it is not a shadow spec): run `levain dream enable` "
                              "with these facts and --revise, and sign the new link")
+
+
+def _stage_bytes(data: bytes, dest: Path, *, mode: int, text_prefix: str | None = None) -> str:
+    """Write ``data`` to a fsynced temp file in ``dest``'s directory at ``mode`` and return its path; nothing at
+    ``dest`` is touched. The temp file is removed when the write fails."""
+    import os
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(prefix=(text_prefix or dest.name + "."), suffix=".tmp", dir=str(dest.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp
 
 
 def copy_instructions(src: Path | str, dest: Path | str) -> str:
@@ -897,17 +923,11 @@ def copy_instructions(src: Path | str, dest: Path | str) -> str:
     Returns the copy's sha256. Raises ``OSError`` when ``src`` cannot be read or ``dest`` written."""
     import hashlib
     import os
-    import tempfile
 
     data = Path(src).expanduser().read_bytes()
     dest = Path(dest)
-    fd, tmp = tempfile.mkstemp(prefix=dest.name + ".", suffix=".tmp", dir=str(dest.parent))
+    tmp = _stage_bytes(data, dest, mode=0o444)
     try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, 0o444)
         os.replace(tmp, dest)
     except BaseException:
         try:
@@ -1106,26 +1126,57 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
             raise InstallRefused(f"{path}: {key} {v!r} is not a non-empty string")
     if check_only:
         return path
-    if shadow:
-        try:
-            copy_instructions(doc["flow_instructions"], d / SHADOW_INSTRUCTIONS)
-        except OSError as exc:
-            raise InstallRefused(f"{path}: flow_instructions could not be copied to {d / SHADOW_INSTRUCTIONS} "
-                                 f"({type(exc).__name__}: {exc})") from exc
-    fd, tmp = tempfile.mkstemp(prefix=INSTALL_FILE + ".", dir=str(d))
+    # Stage everything that can fail (every read, temp file, write and fsync) BEFORE the first rename, so a failure
+    # leaves the old instructions copy and the old facts file untouched; the two renames are all that is left, and a
+    # failure of the second puts the first back. The pair is never left half-installed.
+    staged: list[str] = []
+    dest = d / SHADOW_INSTRUCTIONS
+    instr_tmp = backup_tmp = None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+        if shadow:
+            try:
+                data = Path(doc["flow_instructions"]).expanduser().read_bytes()
+                instr_tmp = _stage_bytes(data, dest, mode=0o444)
+                staged.append(instr_tmp)
+                try:
+                    old = dest.read_bytes()
+                except FileNotFoundError:
+                    old = None
+                if old is not None:
+                    backup_tmp = _stage_bytes(old, dest, mode=0o444)
+                    staged.append(backup_tmp)
+            except OSError as exc:
+                raise InstallRefused(f"{path}: flow_instructions could not be copied to {dest} "
+                                     f"({type(exc).__name__}: {exc})") from exc
+        facts_tmp = _stage_bytes((json.dumps(doc, indent=2, sort_keys=True) + "\n").encode("utf-8"), path, mode=0o600,
+                                 text_prefix=INSTALL_FILE + ".")
+        staged.append(facts_tmp)
+        if instr_tmp is not None:
+            os.replace(instr_tmp, dest)
+            staged.remove(instr_tmp)
+            try:
+                os.replace(facts_tmp, path)
+                staged.remove(facts_tmp)
+            except BaseException:
+                # the facts did not land: put the old instructions copy back (or remove the first one)
+                try:
+                    if backup_tmp is not None:
+                        os.replace(backup_tmp, dest)
+                        staged.remove(backup_tmp)
+                    else:
+                        os.unlink(dest)
+                except OSError:
+                    pass
+                raise
+        else:
+            os.replace(facts_tmp, path)
+            staged.remove(facts_tmp)
+    finally:
+        for leftover in staged:
+            try:
+                os.unlink(leftover)
+            except OSError:
+                pass
     read_install(d)
     return path
 
