@@ -601,9 +601,24 @@ def notice_text(entries: Sequence[Entry], *, channel: str = "terminal") -> str:
         return f"{prefix}Touch ID to sign"
     first = entries[0]
     said = first.answer if first.answer is not None else (first.text or "")
-    said = " ".join(_CTRL.sub(" ", said).split())[:NOTICE_CUT]
+    said = _shown(said)[:NOTICE_CUT]
     more = f" (+{len(entries) - 1} more)" if len(entries) > 1 else ""
-    return f"{prefix}Touch ID to sign: {first.item} {said}".rstrip() + more
+    return f"{prefix}Touch ID to sign: {_shown(first.item)} {said}".rstrip() + more
+
+
+def _shown(value: Any) -> str:
+    """``value`` as the notice may display it: format characters (Unicode Cf: bidi embeddings, overrides and
+    isolates, zero-width characters, U+FEFF) removed, so an agent-filed label cannot reorder or hide what the
+    operator reads before he touches; control characters (Cc, C0 and C1) and line/paragraph separators become a
+    space; whitespace runs collapse. The display only: the signed entry keeps the row's words byte for byte,
+    because the verifier binds it to the row by equality."""
+    out = []
+    for ch in str(value):
+        cat = unicodedata.category(ch)
+        if cat == "Cf":
+            continue
+        out.append(" " if cat in ("Cc", "Zl", "Zp") else ch)
+    return " ".join("".join(out).split())
 
 
 def post_notice(text: str, *, runner: Callable[..., Any] = subprocess.Popen) -> Any:

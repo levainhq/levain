@@ -58,6 +58,9 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     "levain-terminal-answer": ("shipped", "levain/consent/terminal_sign.py",
                                "the laptop Touch ID key's signature over a band answer typed at the terminal "
                                "(TERMSIGN; message format levain-terminal-answer/1)"),
+    "levain-desk-answer": ("reserved", "levain/consent/terminal_sign.py",
+                           "the laptop Touch ID key's signature over a desk answer (TERMSIGN L5a designs its "
+                           "message format; reserved so the key's signers line can name it at enrolment)"),
 }
 
 # The levain namespaces levain's OWN sign requests are filed in (levain.consent.sign serves them on every Signer,

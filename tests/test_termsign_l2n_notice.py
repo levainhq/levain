@@ -41,6 +41,26 @@ def test_a_long_answer_is_cut_and_control_characters_flattened():
     assert ts.notice_text([_entry(text="x\ny\x00z")]) == "Touch ID to sign: np-1 x y z"
 
 
+def test_a_bidi_override_in_an_option_label_cannot_reorder_the_notice():
+    # U+202E RIGHT-TO-LEFT OVERRIDE would display "(a) approve" as "evorppa (a)"; U+2066/U+2069 an isolate pair
+    out = ts.notice_text([_entry(answer="(a) ‮approve‬ ⁦x⁩")])
+    assert out == "Touch ID to sign: np-1 (a) approve x"
+
+
+def test_a_c1_control_and_zero_width_characters_in_an_option_label_are_not_shown():
+    out = ts.notice_text([_entry(answer="(b) de​ny\u0085all﻿\u009b2J")])
+    assert out == "Touch ID to sign: np-1 (b) deny all 2J"
+    assert all(0x20 <= ord(c) < 0x7f for c in out)
+
+
+def test_the_signed_entry_keeps_the_row_words_the_notice_cleans():
+    label = "(a) ‮approve‬"
+    msg = ts.build_message(store="flow-needs-phill", install="i1", session="s1", view="1", typed="1a",
+                           entries=[_entry(answer=label)], nonce="0" * 16,
+                           at=ts.datetime(2026, 11, 3, tzinfo=ts.timezone.utc))
+    assert ts.parse_verified(msg).entries[0].answer == label
+
+
 def test_text_never_begins_with_a_dash():
     assert ts.notice_text([_entry(text="-e evil")]).startswith("Touch ID")
     assert ts.notice_text([]) == "Touch ID to sign"
@@ -112,15 +132,33 @@ def _seen_store(qdir, env):
     return store
 
 
-def test_no_key_and_remote_post_nothing(tmp_path, qdir, env, keydir):
+def _record_signs(monkeypatch):
+    """Every ``ts.sign`` call's ``remote``: the proof a case reached the signer and was not stopped earlier."""
+    seen, real = [], ts.sign
+
+    def sign(message, **kw):
+        seen.append(kw.get("remote"))
+        return real(message, **kw)
+    monkeypatch.setattr(ts, "sign", sign)
+    return seen
+
+
+def test_no_key_posts_nothing(tmp_path, qdir, env, monkeypatch):
     store = _seen_store(qdir, env)
+    signs = _record_signs(monkeypatch)
     empty = tmp_path / "empty-keys"
     empty.mkdir(mode=0o700)
     _answer(store, env, empty)
-    assert ts.post_notice.posted == []
-    store2_env = dict(env, SSH_CONNECTION="1.2.3.4 1 5.6.7.8 22")
-    _answer(store, env, keydir, environ=store2_env)
-    assert ts.post_notice.posted == []
+    assert signs == [False] and ts.post_notice.posted == []
+
+
+def test_remote_posts_nothing_though_a_key_is_there(qdir, env, keydir, monkeypatch):
+    # its own store and question: the signer is reached (signs == [True]) with a key find_key would return
+    store = _seen_store(qdir, env)
+    signs = _record_signs(monkeypatch)
+    assert ts.find_key(keydir) is not None
+    _answer(store, env, keydir, environ=dict(env, SSH_CONNECTION="1.2.3.4 1 5.6.7.8 22"))
+    assert signs == [True] and ts.post_notice.posted == []
 
 
 def test_a_failing_key_lookup_posts_nothing_and_the_answer_is_still_recorded(qdir, env, keydir, monkeypatch):
