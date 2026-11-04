@@ -7,7 +7,10 @@ A fire for such an occurrence runs :func:`run_session`. The module owns three th
   the agent's own uid's to rewrite and there is no front to count bytes (P7-A section 6). The run ticket's ``auth``
   follows the link's ``billing`` (``subscription`` -> ``passthrough``, ``api_key`` -> ``brokered``), and the caps the
   executor states must equal the caps the launch reserved (``agent_reservations``), read back from the store, never
-  from the caller. The harness is ``claude``: a codex role waits for the codex plan.
+  from the caller; so must its dollars. A subscription session needs a tunnel byte cap (its role holds Bash, so a
+  nested client is reachable and bytes are its one bound) and reserved seconds equal to its spec's ``stop_at``. The
+  store keeps no exposure unit, so a session's is read as ``tool_calls``: a caller stating ``turns`` fails the
+  equality (fail-closed). The harness is ``claude``: a codex role waits for the codex plan.
 * **The brief** (:func:`render_brief`): the role's template filled from typed slot values, then P4's recall quoted as
   DATA in a fenced block (a recalled line never closes the fence), then the launch's own facts.
 * **The run** (:func:`run_session`): ``controller.start_run`` records the session key and spawns the launcher's child
@@ -21,9 +24,21 @@ The launcher is a seam (:class:`SessionLauncher`). :class:`UnwiredLauncher` is t
 in this module, and nothing here has launched a real session. ``tests/test_agents_session_launch.py`` drives the
 whole path against a stub.
 
-Not covered: the per-call fence and session supervision (P7-2); a reaper-side executor for a session row (the
-:class:`SessionExecutor` below can stop only a child its own process holds, so a reaper that builds one from a row
-gets ``terminated=False`` and the row keeps its slot); the real launcher.
+Not covered: the per-call fence and session supervision (P7-2); the real launcher; and a reaper-side stop. An
+in-process stop works (the fire's own executor holds the child). A reaper built from a row cannot stop a session:
+its executor holds no child and answers ``StopResult(False, ...)``, the supervisor raises one attention row and the
+row stays ``launched``, while the same reaper tick renews the lease of every launched row with a session key, so a
+dead session's lease is renewed and lapse takeover never fires, holding slot and reservation. Whether a production
+caller wires a reaper to session rows: ``git grep -n -e "Supervisor(" -e "sup.reap(" -- levain/agents levain/dream``
+(on 11-04, besides this docstring, it named the dream's supervisor only, and no ``Supervisor.reap`` caller); a fire-record stop like
+``DreamExecutor._stop`` is the prerequisite for wiring one [routed to STATUS_1_0.md by levain 24, 11-04].
+
+Nothing imports this module from an entry point: ``controller.run_agent`` looks run bodies up by agent NAME
+(``RUN_BODIES``), so a session role's fire ends unwired until a real launcher exists [routed by levain 24, 11-04].
+
+Which "dispatch run path" P7-1 waits on (P7-A section 6) is not settled by the design text. This module was built on
+the build lane's reading, NOT verified: P7-1 needs this launch effect, not ``jobs.py``'s dispatch-job run method, and
+dispatch wave 3 is the API-key route's work, gated on the OpenRouter credential (3c-10).
 """
 from __future__ import annotations
 
