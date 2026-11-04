@@ -330,3 +330,33 @@ def test_fire_factory_gives_the_card_the_occurrences_day_manual_and_slot(tmp_pat
     assert kw["day"] == _r.occurrence_dream_day(row, "America/New_York").isoformat()
     with pytest.raises(ValueError, match="not in the agent store"):
         da.fire_factory(rig.store, "oc-" + "0" * 32, 0)
+
+
+def test_fire_factory_gives_a_scheduled_card_its_window_key_as_the_slot(tmp_path, monkeypatch):
+    # C1: the occurrence row carries window_key, never a "key" column named slot
+    from levain.dream import executor as _ex
+    monkeypatch.setattr(_ex, "DreamExecutor", lambda **kw: object())
+    rig = Rig(tmp_path)
+    rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
+    rig.link()
+    with rig.store.write() as c:
+        oid, outcome = ctl.claim(c, agent_id=rig.agent, kind="scheduled", key="s1", spec_hash=rig.spec_hash,
+                                 binding_id="bind-0123456789abcdef", window_key="w:2026-11-02:22:00", now=rig.now())
+    assert outcome == ctl.CLAIMED
+    da.write_install(rig.store.directory, **_facts(tmp_path))
+    kw = da.fire_factory(rig.store, oid, 0)
+    assert kw["manual"] is False and kw["slot"] == "w:2026-11-02:22:00"
+
+
+def test_write_install_checks_the_merged_model_before_replacing_a_working_install(tmp_path):
+    # C2: the check ran after os.replace, so a bad value corrupted a working install although the call raised
+    f = _facts(tmp_path)
+    ad = tmp_path / "ag"
+    ad.mkdir()
+    da.write_install(ad, **f, model="claude-x")
+    before = (ad / da.INSTALL_FILE).read_bytes()
+    for bad in ({"model": ""}, {"claude_bin": "  "}):
+        with pytest.raises(da.InstallRefused):
+            da.write_install(ad, **f, **bad)
+        assert (ad / da.INSTALL_FILE).read_bytes() == before
+    assert [p.name for p in ad.iterdir()] == [da.INSTALL_FILE]

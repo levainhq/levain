@@ -27,6 +27,7 @@ by the ``levain dream shadow`` verb's explicit ``--flow-root``.
 """
 from __future__ import annotations
 
+import contextlib
 import difflib
 import hashlib
 import json
@@ -257,6 +258,21 @@ def _unlock(handle: Any) -> None:
     from levain import wrap as _w
 
     _w._unlock_wrap(handle)
+
+
+@contextlib.contextmanager
+def night_lock(flow_day: FlowDay, shadow_db: Path | str):
+    """Hold the night-level lock of the scratch directory of ``shadow_db`` (after the real-store guard, creating the
+    directory), so two shadow verbs, or a verb and a night, cannot interleave seed and episode check on it. A directory
+    another process holds raises :class:`ShadowRefused` (unreadable) with the store busy."""
+    shadow_db = Path(shadow_db)
+    _guard_target(shadow_db, flow_day)
+    shadow_db.parent.mkdir(parents=True, exist_ok=True)
+    handle = _lock(shadow_db.parent, NIGHT_LOCK)
+    try:
+        yield
+    finally:
+        _unlock(handle)
 
 
 def _guard_target(shadow_db: Path, flow_day: FlowDay) -> None:
@@ -566,60 +582,57 @@ def run_night(flow_root: Path | str, day: date | str, shadow_db: Path | str, occ
                                                f"{fd.run_dir / COMPOSED} cannot be read ({type(exc).__name__}: {exc})",
                            flow_day=fd)
     shadow_db = Path(shadow_db)
-    night = None
     try:
-        _guard_target(shadow_db, fd)
-        shadow_db.parent.mkdir(parents=True, exist_ok=True)
-        night = _lock(shadow_db.parent, NIGHT_LOCK)
-        seed(fd, shadow_db)
-        v = episode_check(fd, shadow_db)
-        if not v.ready:
-            return NightResult("skipped-no-input", f"{v.verdict}/{v.kind}: {v.reason}", flow_day=fd)
-        try:
-            text, usage_doc = compose(fd, shadow_db, Path(occ_dir))
-        except Exception as exc:  # noqa: BLE001 — a compose that died is a failed night, not an input verdict
-            return NightResult("failed", f"compose raised {type(exc).__name__}: {exc}", flow_day=fd)
-        try:
-            card = shadow_card(fd, text, occurrence=occurrence, occ_dir=occ_dir, usage_doc=usage_doc,
-                               agent_id=agent_id or "dream", flow_text=flow_text)
-        except (ShadowRefused, _card.CardError, OSError) as exc:
-            return NightResult("failed", f"the comparison card could not be built: {exc}", flow_day=fd)
-        return NightResult("composed", "", card, fd)
+        with night_lock(fd, shadow_db):
+            seed(fd, shadow_db)
+            v = episode_check(fd, shadow_db)
+            if not v.ready:
+                return NightResult("skipped-no-input", f"{v.verdict}/{v.kind}: {v.reason}", flow_day=fd)
+            try:
+                text, usage_doc = compose(fd, shadow_db, Path(occ_dir))
+            except Exception as exc:  # noqa: BLE001 — a compose that died is a failed night, not an input verdict
+                return NightResult("failed", f"compose raised {type(exc).__name__}: {exc}", flow_day=fd)
+            try:
+                card = shadow_card(fd, text, occurrence=occurrence, occ_dir=occ_dir, usage_doc=usage_doc,
+                                   agent_id=agent_id or "dream", flow_text=flow_text)
+            except (ShadowRefused, _card.CardError, OSError) as exc:
+                return NightResult("failed", f"the comparison card could not be built: {exc}", flow_day=fd)
+            return NightResult("composed", "", card, fd)
     except ShadowRefused as exc:
         return NightResult("skipped-no-input", f"{_ready.UNREADABLE}/{exc.kind}: {exc.why}", flow_day=fd)
     except OSError as exc:
         return NightResult("skipped-no-input", f"{_ready.UNREADABLE}/{KIND_UNREADABLE}: the shadow directory "
                                                f"{shadow_db.parent} cannot be used ({type(exc).__name__}: {exc})",
                            flow_day=fd)
-    finally:
-        if night is not None:
-            _unlock(night)
 
 
 def shadow_input(flow_root: Path | str, shadow_db: Path | str, row: Mapping[str, Any], *, zone: str,
                  occurrences: Callable[[], Sequence[Mapping[str, Any]]] | None = None, agent_id: str | None = None):
     """The shadow's input check for one occurrence row, in the dream's ``InputVerdict`` shape (so the same adapter
-    that gives the controller its bool applies): day-ready, then seed and the episode check. It seeds the SCRATCH
-    store only. Never raises."""
+    that gives the controller its bool applies): day-ready, then seed and the episode check under the night lock. It
+    seeds the SCRATCH store only. ``occurrences`` (the shadow's own history) is required, as in :func:`run_night`:
+    without it an already-shadowed day cannot be ruled out, so the check answers unreadable. Never raises."""
     from levain.dream.agent import InputVerdict
 
+    if occurrences is None:
+        return InputVerdict(False, _ready.UNREADABLE, KIND_UNREADABLE,
+                            "no shadow occurrence history was given, so an already-shadowed day cannot be ruled out")
     me = row.get("occurrence_id")
     try:
         day = _ready.occurrence_dream_day(row, zone)
-        rows = occurrences
-        if rows is not None:
-            full = rows
-            rows = lambda: [r for r in full() if r.get("occurrence_id") != me]  # noqa: E731
+        full = occurrences
+        rows = lambda: [r for r in full() if r.get("occurrence_id") != me]  # noqa: E731
         v = day_ready(flow_root, day, occurrences=rows, zone=zone, agent_id=agent_id)
         if v.ready and v.flow_day is not None:
             try:
-                seed(v.flow_day, shadow_db)
+                with night_lock(v.flow_day, shadow_db):
+                    seed(v.flow_day, shadow_db)
+                    v = episode_check(v.flow_day, shadow_db)
             except ShadowRefused as exc:
                 return InputVerdict(False, _ready.UNREADABLE, exc.kind, exc.why)
             except OSError as exc:
                 return InputVerdict(False, _ready.UNREADABLE, KIND_UNREADABLE,
                                     f"the shadow directory cannot be used ({type(exc).__name__}: {exc})")
-            v = episode_check(v.flow_day, shadow_db)
     except Exception as exc:  # noqa: BLE001 — a check that cannot run has not said ready
         return InputVerdict(False, _ready.UNREADABLE, KIND_UNREADABLE, f"{type(exc).__name__}: {exc}")
     return InputVerdict(v.ready, v.verdict, v.kind, v.reason)
@@ -627,4 +640,4 @@ def shadow_input(flow_root: Path | str, shadow_db: Path | str, row: Mapping[str,
 
 __all__ = ["FlowDay", "SourceVerdict", "ShadowRefused", "ShadowDiff", "NightResult", "EpisodeSet", "Seeded",
            "read_flow_day", "verify_snapshot", "day_ready", "seed", "episode_check", "compare_episode_sets",
-           "diff_outputs", "shadow_card", "run_night", "shadow_input", "flow_refusals", "package_ids"]
+           "diff_outputs", "shadow_card", "run_night", "night_lock", "shadow_input", "flow_refusals", "package_ids"]

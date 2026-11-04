@@ -488,17 +488,18 @@ def test_a_compose_that_raises_ends_the_night_failed(flow, shadow_db, tmp_path):
 
 def test_the_shadow_input_check_speaks_the_dreams_verdict_and_the_controller_bool(flow, shadow_db):
     row = {"occurrence_id": "occ-9", "agent_id": "ag-1", "kind": "scheduled", "window_key": "w:2026-11-02:22:00"}
-    v = sh.shadow_input(flow.root, shadow_db, row, zone="America/New_York", agent_id="ag-1")
+    v = sh.shadow_input(flow.root, shadow_db, row, zone="America/New_York", occurrences=lambda: [], agent_id="ag-1")
     assert v.ok and v.state == rd.READY
     assert da.bool_on_input(lambda r: v)(row) is True
     pkg = json.loads((flow.run / sh.PACKAGE).read_text())
     pkg["episode_count"], pkg["package"] = 77, {}
     (flow.run / sh.PACKAGE).write_text(json.dumps(pkg))
-    v2 = sh.shadow_input(flow.root, shadow_db, row, zone="America/New_York", agent_id="ag-1")
+    v2 = sh.shadow_input(flow.root, shadow_db, row, zone="America/New_York", occurrences=lambda: [], agent_id="ag-1")
     assert (v2.ok, v2.state, v2.kind) == (False, rd.QUIET, sh.KIND_DIVERGED)
     assert da.parse_recorded(v2.recorded())[:2] == (rd.QUIET, sh.KIND_DIVERGED)
     assert da.bool_on_input(lambda r: v2)(row) is False
-    bad = sh.shadow_input(flow.root, shadow_db, {"kind": "scheduled", "window_key": "garbage"}, zone="America/New_York")
+    bad = sh.shadow_input(flow.root, shadow_db, {"kind": "scheduled", "window_key": "garbage"}, zone="America/New_York",
+                          occurrences=lambda: [])
     assert (bad.ok, bad.state) == (False, rd.UNREADABLE)
 
 
@@ -692,3 +693,51 @@ def test_the_own_store_check_fails_closed_when_it_cannot_resolve(flow, shadow_db
     monkeypatch.setattr(Path, "resolve", boom)
     with pytest.raises(sh.ShadowRefused, match="cannot tell"):
         sh.seed(fd, shadow_db)
+
+
+# --- D1 L3 r3 fixes (C3, C4) -------------------------------------------------------------------------------------------
+
+def test_a_second_verb_on_a_held_scratch_dir_is_busy_and_does_not_seed(flow, tmp_path):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    held = sh._lock(scratch, sh.NIGHT_LOCK)
+    try:
+        code, out = run_verb("--flow-root", str(flow.root), "--day", DAY, "--shadow-dir", str(scratch), "--json")
+    finally:
+        sh._unlock(held)
+    doc = json.loads(out)
+    assert code == 3 and "busy" in doc["seed"]["why"] and not (scratch / "memory.db").exists()
+
+
+def test_shadow_input_on_a_held_scratch_dir_answers_busy_not_ready(flow, shadow_db):
+    row = {"occurrence_id": "occ-9", "agent_id": "ag-1", "kind": "scheduled", "window_key": "w:2026-11-02:22:00"}
+    shadow_db.parent.mkdir(parents=True, exist_ok=True)
+    held = sh._lock(shadow_db.parent, sh.NIGHT_LOCK)
+    try:
+        v = sh.shadow_input(flow.root, shadow_db, row, zone="America/New_York", occurrences=lambda: [], agent_id="ag-1")
+    finally:
+        sh._unlock(held)
+    assert not v.ok and "busy" in v.reason and not shadow_db.exists()
+
+
+def test_shadow_input_without_the_history_is_refused_typed(flow, shadow_db):
+    row = {"occurrence_id": "occ-9", "agent_id": "ag-1", "kind": "scheduled", "window_key": "w:2026-11-02:22:00"}
+    v = sh.shadow_input(flow.root, shadow_db, row, zone="America/New_York", agent_id="ag-1")
+    assert (v.ok, v.state, v.kind) == (False, rd.UNREADABLE, sh.KIND_UNREADABLE) and not shadow_db.exists()
+
+
+def test_composed_without_an_occurrence_dir_exits_2_before_any_seed(flow, tmp_path):
+    composed = tmp_path / "c.md"
+    composed.write_text(SHADOW_TEXT)
+    scratch = tmp_path / "s"
+    code, _ = run_verb("--flow-root", str(flow.root), "--day", DAY, "--shadow-dir", str(scratch),
+                       "--composed", str(composed))
+    assert code == 2 and not scratch.exists()
+
+
+def test_an_undecodable_composed_file_is_a_typed_exit_3_not_a_traceback(flow, tmp_path, capsys):
+    composed = tmp_path / "c.md"
+    composed.write_bytes(b"\xff\xfe\x00bad")
+    code, _ = run_verb("--flow-root", str(flow.root), "--day", DAY, "--shadow-dir", str(tmp_path / "s"),
+                       "--composed", str(composed), "--occurrence-dir", str(tmp_path / "occ"))
+    assert code == 3 and "levain dream shadow:" in capsys.readouterr().err

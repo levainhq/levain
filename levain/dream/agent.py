@@ -786,6 +786,10 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
         _fact_path(doc, "facts_path", path, kind="file", writing=True)
     if not isinstance(zone, str) or not zone.strip():
         raise InstallRefused(f"{path} lacks zone")
+    for key in ("model", "claude_bin"):
+        v = doc.get(key)
+        if v is not None and (not isinstance(v, str) or not v.strip()):
+            raise InstallRefused(f"{path}: {key} {v!r} is not a non-empty string")
     fd, tmp = tempfile.mkstemp(prefix=INSTALL_FILE + ".", dir=str(d))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -834,7 +838,7 @@ def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str,
         raise ValueError(f"occurrence {occurrence_id} is not in the agent store at {store.directory}")
     is_manual = row.get("kind") == "manual"
     card_facts = {"day": _ready.occurrence_dream_day(row, inst.zone).isoformat(), "manual": is_manual,
-                  "slot": None if is_manual else str(row.get("key") or "") or None}
+                  "slot": None if is_manual else str(row.get("window_key") or "") or None}
     occ_dir = inst.store_path.parent / "dream" / occurrence_id
     review_store = CoordStore(inst.coord_dir)
 
