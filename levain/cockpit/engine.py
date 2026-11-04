@@ -2900,6 +2900,37 @@ def _kb(n: float) -> str:
     return f"{n / 1e6:.1f} MB" if n > 1e6 else f"{round(n / 1e3)} kB"
 
 
+def _run_time(dg: dict[str, Any]) -> str | None:
+    """'last run 02:56 (scheduler)' or 'newest episode 02:56 (no run recorded)', the clock time in the offset the
+    contributor wrote; None when the digest carries no readable last_run_at (an older roster)."""
+    at = dg.get("last_run_at")
+    if not _is_iso(at):
+        return None
+    hm = _parse_iso(at).strftime("%H:%M")
+    return f"newest episode {hm} (no run recorded)" if dg.get("last_run_source") == "episode" else f"last run {hm}"
+
+
+def _status_part(dg: dict[str, Any], parts: list[str]) -> None:
+    """The scheduler's status, verbatim, as TEXT: it is never mapped to a tone ('skipped' is a clean night for one
+    job and is also what an empty-output run may be recorded as)."""
+    st = dg.get("last_run_status")
+    if isinstance(st, str) and st:
+        parts.append(f"status {st}")
+
+
+def _run_reading(dg: dict[str, Any]) -> dict[str, Any] | None:
+    """An alarm reading for a stateless resident whose digest says its run failed or is late; None otherwise."""
+    failed, late = dg.get("run_failed") is True, dg.get("run_late") is True
+    if not (failed or late):
+        return None
+    parts = (["last run failed"] if failed else []) + (["run late"] if late else [])
+    t = _run_time(dg)
+    if t is not None:
+        parts.append(t)
+    _status_part(dg, parts)
+    return {"tone": "alarm", "text": " · ".join(parts)}
+
+
 def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
     """Health PER KIND, the one place the fleet rules live. ``tone`` is ok | alarm | neutral | unknown;
     only a RESIDENT member whose silence is a signal can be ``alarm``. An on-call member (and a member the
@@ -2926,6 +2957,10 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
         return out                                              # never an alarm: a neutral fact
     if dg is None:
         return {**out, "tone": "unknown", "text": "no data"}
+    if not stateful:
+        run = _run_reading(dg)
+        if run is not None:                                    # a failed or late run: its own words, never "write path"
+            return {**out, **run}
     if dg.get("available") is False:
         return {**out, "tone": "alarm", "text": "write path unavailable"}
     if dg.get("available") is not True:
@@ -2942,7 +2977,16 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
         parts.append(text)
 
     if not stateful:
-        parts.append("running")
+        # a stateless resident (a role run on a schedule) is read from its last run, never from a bare "running"
+        t = _run_time(dg)
+        if t is None:
+            parts.append("no run time reported")      # an older roster: today's tone (ok), and no health word
+        else:
+            parts.append(t)
+        _status_part(dg, parts)
+        eps = dg.get("episodes_24h")
+        if isinstance(eps, (int, float)) and not isinstance(eps, bool) and math.isfinite(eps) and eps >= 0 and eps == int(eps):
+            parts.append(f"{int(eps)} episodes in 24 h")
     else:
         eps = dg.get("episodes_24h")
         if eps is None:

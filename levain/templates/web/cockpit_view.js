@@ -1029,9 +1029,16 @@
   // The Fleet card (KE4): resident / on call / roundtable, drawn from the kernel's own fleet_group and health.
   // Accent is the kernel's tone "alarm" alone, which only a resident member whose silence is a signal can carry;
   // an on-call member's last call, failed or not, is a neutral fact.
-  const FLEET_GROUPS = [["resident", "Resident \u00b7 judged by their writing"], ["on_call", "On call \u00b7 judged by their last answer"],
-                        ["roundtable", "Roundtable"]];
-  const fleetGroupOf = (r) => r.fleet_group || (r.group === "roundtable" ? "roundtable" : r.cadence === "resident" ? "resident" : "on_call");
+  // The resident group splits by the unit's kind: an AGENT builds partnership memory and is judged by its writing, a ROLE
+  // holds judgment on a schedule. A row without `kind` (an older roster) falls back to what it does carry: stateful is
+  // an agent, stateless a role. A `job` kind is machine-checkable and belongs to a Jobs panel, not here.
+  const FLEET_GROUPS = [["resident", "Agents \u00b7 judged by their writing"], ["role", "Roles \u00b7 run on a schedule"],
+                        ["on_call", "On call \u00b7 judged by their last answer"], ["roundtable", "Roundtable"]];
+  const isRoleRow = (r) => r.kind === "role" || (r.kind !== "agent" && r.memory === "stateless");
+  const fleetGroupOf = (r) => {
+    const g = r.fleet_group || (r.group === "roundtable" ? "roundtable" : r.cadence === "resident" ? "resident" : "on_call");
+    return g === "resident" && isRoleRow(r) ? "role" : g;
+  };
   function fleetRow(r) {
     const h = isObj(r.health) ? r.health : { tone: "unknown", text: "no data", at: null, memory: "" };
     const alarm = h.tone === "alarm";

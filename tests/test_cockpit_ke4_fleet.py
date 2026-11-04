@@ -3,6 +3,8 @@ semantics), the page draws it. Resident+stateful is judged by its writing, on-ca
 the roundtable's seats fold into one group, retired members are hidden with a count."""
 from __future__ import annotations
 
+import json
+import os
 from datetime import datetime, timedelta, timezone
 
 from levain.cockpit.engine import Cockpit, ProviderSpec, Read
@@ -148,3 +150,110 @@ def test_f4_digest_numerics_never_crash_and_read_unknown() -> None:
                              search=lambda q, n: [{**RES, "digest": {"available": True, "episodes_24h": float("inf")}}]))
     p = ck.panel("p", q="flow")
     assert p["value"]["rows"][0]["health"]["tone"] == "unknown" or "search_error" in p
+
+
+# ---- the stateless resident reading (a role run on a schedule): a time, its source, a status as text ----
+ROLE = {**ROW, "name": "diogenes", "kind": "role", "memory": "stateless", "wrap_every": None,
+        "digest": {"available": True, "episodes_24h": 33, "last_run_at": "2026-11-04T02:56:47-05:00",
+                   "last_run_status": "skipped", "run_failed": False, "run_late": False, "last_run_source": "scheduler"}}
+
+
+def _role(**dg):
+    return _rows({**ROLE, "digest": {**ROLE["digest"], **dg}})["diogenes"]["health"]
+
+
+def test_stateless_resident_never_reads_running_and_shows_its_last_run_time() -> None:
+    h = _role()
+    assert "running" not in h["text"]
+    assert h["text"].startswith("last run 02:56") and "33 episodes in 24 h" in h["text"]
+    assert "skipped" in h["text"] and h["tone"] == "ok"      # shown as text; the tone comes from the facts, not the word
+
+
+def test_stateless_resident_names_the_source_when_no_run_is_recorded() -> None:
+    h = _role(last_run_source="episode", last_run_status=None, run_failed=None, run_late=None)
+    assert "newest episode 02:56" in h["text"] and "no run recorded" in h["text"] and h["tone"] == "ok"
+
+
+def test_failed_and_late_runs_are_alarms_with_their_own_words() -> None:
+    f = _role(run_failed=True, available=False)
+    assert f["tone"] == "alarm" and "last run failed" in f["text"] and "write path" not in f["text"]
+    late = _role(run_late=True, available=False)
+    assert late["tone"] == "alarm" and "run late" in late["text"] and "write path" not in late["text"] and "02:56" in late["text"]
+    both = _role(run_failed=True, run_late=True, available=False)
+    assert "failed" in both["text"] and "late" in both["text"]
+
+
+def test_a_status_is_text_never_a_health_word() -> None:
+    for s in ("skipped", "ok", "success", "weird"):
+        h = _role(last_run_status=s)
+        assert f"status {s}" in h["text"] and h["tone"] == "ok"
+    assert "status" not in _role(last_run_status=None)["text"]
+
+
+def test_old_roster_shape_degrades_without_error_and_never_reads_running() -> None:
+    h = _rows({**ROLE, "digest": {"available": True, "episodes_24h": 33}})["diogenes"]["health"]
+    assert h["tone"] == "ok" and h["text"] == "no run time reported · 33 episodes in 24 h"     # today's tone, no health word
+    dead = _rows({**ROLE, "digest": {"available": False}})["diogenes"]["health"]
+    assert dead["tone"] == "alarm" and dead["text"] == "write path unavailable"       # unchanged for the old shape
+    junk = _role(last_run_at="not a time", run_failed="yes", run_late=1)
+    assert "running" not in junk["text"] and "no run time reported" in junk["text"]
+
+
+def test_a_stateful_resident_is_unchanged_by_the_run_fields() -> None:
+    h = _rows({**RES, "digest": {**RES["digest"], "run_failed": True, "last_run_at": "2026-11-04T02:56:47-05:00"}})["flow"]["health"]
+    assert h["tone"] == "ok" and "4 episodes in 24 h" in h["text"]
+
+
+# ---- the page: headings per kind, and the role's reading drawn (real headless Chrome over a served cockpit) ----
+
+from pathlib import Path
+
+from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_k2a import _install
+from tests.test_cockpit_scroll_keep_page import _Served
+
+
+@needs_browser
+def test_the_fleet_card_heads_agents_and_roles_apart_and_reads_a_roles_last_run(tmp_path: Path) -> None:
+    """`LEVAIN_FLEET_SHOTS=<dir>` keeps the screenshots there and `LEVAIN_FLEET_PREFIX` names them (before | after)."""
+    from levain.cockpit.providers import build_default_cockpit
+
+    shots = Path(os.environ.get("LEVAIN_FLEET_SHOTS") or tmp_path)
+    shots.mkdir(parents=True, exist_ok=True)
+    prefix = os.environ.get("LEVAIN_FLEET_PREFIX") or "after"
+    rows = [
+        RES,
+        {**ROLE, "kind": "role"},
+        {**ROLE, "name": "ontime", "kind": "role", "digest": {**ROLE["digest"], "last_run_status": "ok"}},
+        {**ROLE, "name": "late", "kind": "role", "digest": {**ROLE["digest"], "run_late": True, "available": False}},
+        {**ROLE, "name": "old", "digest": {"available": True, "episodes_24h": 3}},          # an older roster: no kind, no run fields
+        {**OC, "last_call": {"at": datetime.now(timezone.utc).isoformat(), "outcome": "ok"}},
+    ]
+    _root, src, _ids = _install(tmp_path)
+    ck = build_default_cockpit(src)
+    ck.register(ProviderSpec(id="fleetcard", kind="roster", title="Fleet", priority="feed", region="operate",
+                             read=lambda c: Read(value={"rows": rows})))
+    panel = "document.querySelector('[data-ck-panel=fleetcard]')"
+    facts = (f"JSON.stringify({{groups: [...{panel}.querySelectorAll('.fl-group')].map(g => [g.dataset.ckFleetGroup, "
+             f"g.querySelector('.grp-h').textContent, [...g.querySelectorAll('.fl .n')].map(n => n.textContent)]), "
+             f"d: [...{panel}.querySelectorAll('.fl')].map(f => f.querySelector('.n').textContent + '|' + f.querySelector('.d').textContent + '|' + f.querySelector('.d').className)}})")
+    with _Served(src, cockpit=ck, surface_tokens={"browser": "T"}, install_class="reported") as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1440, "h": 1000, "dpr": 1}},
+            {"until": f"{panel} && {panel}.querySelectorAll('.fl').length === {len(rows)}"},
+            {"eval": f"{panel}.scrollIntoView(); 1"},
+            {"shot": str(shots / f"fleet_{prefix}_desktop.png")},
+            {"eval": facts},
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            {"eval": f"{panel}.scrollIntoView(); 1"},
+            {"until": "document.documentElement.scrollWidth <= window.innerWidth + 1"},
+            {"shot": str(shots / f"fleet_{prefix}_phone.png")},
+        ])
+    f = json.loads([v for v in out["values"] if isinstance(v, str) and v.startswith("{")][0])
+    groups = {g[0]: g for g in f["groups"]}
+    assert groups["resident"][1:] == ["Agents · judged by their writing", ["flow"]]
+    assert groups["role"][1] == "Roles · run on a schedule" and groups["role"][2] == ["diogenes", "ontime", "late", "old"]
+    d = {x.split("|")[0]: x.split("|")[1:] for x in f["d"]}
+    assert d["diogenes"][0].startswith("last run 02:56") and "running" not in d["diogenes"][0] and "bad" not in d["diogenes"][1]
+    assert d["late"][0].startswith("run late") and "bad" in d["late"][1]
+    assert d["old"][0].startswith("no run time reported")
