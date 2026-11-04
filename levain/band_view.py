@@ -1464,15 +1464,16 @@ def answer_text(store: QuestionStore, text: str, *, viewer: str, channel: str, s
                       require=_still_newest(viewer, store_id, view_id))
 
 
-def _still_version(subject: Mapping[str, Any]) -> Callable[[sqlite3.Connection], None]:
+def _still_version(subject: Mapping[str, Any], *, ruled: bool = False) -> Callable[[sqlite3.Connection], None]:
     """The versioned answer's check, run INSIDE its write transaction: it loads the row over the transaction's own
     ``conn`` (a second connection would not see it) and recomputes the version. The row gone, answered or changed is
-    :class:`VersionMoved`; then a question that signs on its own card is :class:`AuthorityItem`."""
+    :class:`VersionMoved`; then a question that signs on its own card is :class:`AuthorityItem`, unless ``ruled``
+    (its linked ruling was applied from the signed message just now: only that option is then recordable)."""
     def check(conn: sqlite3.Connection) -> None:
         q = QuestionStore._by_ref(conn, subject["id"])
         if q is None or q.id != subject["id"] or q.answer is not None or subject_version(q) != subject["version"]:
             raise VersionMoved("the item changed since it was shown to you, so nothing was recorded")
-        if _question_kind(q) == "authority":
+        if _question_kind(q) == "authority" and not ruled:
             raise AuthorityItem("this item signs on its own card; nothing was recorded")
     return check
 
@@ -1524,14 +1525,28 @@ def answer_item(store: Any, subject: Mapping[str, Any], *, pick: str | None, tex
     return Applied([label], [], format_echo([label], [], channel), (), (q.id,))
 
 
+class RuledNotRecorded(Exception):
+    """A desk click's ruling ALLOW was applied by the queue and the answer was then not recorded: ``cause`` is why.
+    The ruling stands (it is the queue's record); the item stays open. Not a ``ValueError``, see :class:`VersionMoved`."""
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+class RulingNotApplied(Exception):
+    """A desk click was signed and the queue refused its carried ruling; nothing was recorded. Not a ``ValueError``."""
+
+
 def answer_item_desk(store: Any, subject: Mapping[str, Any], *, pick: str | None, text: str | None, viewer: str,
-                     signing: Signing) -> Applied:
+                     signing: Signing, ruled: bool = False) -> Applied:
     """:func:`answer_item` for a click the laptop key SIGNED (TERMSIGN L5a): the same one-item write, channel
     ``cockpit``, recorded with the signing columns. ``signing`` must be a signed attempt whose message names this
     row at the version the write finds INSIDE its transaction (:func:`_still_version`), else the row is
     :class:`VersionMoved` and nothing is recorded (the signature is discarded). An unsigned ``signing`` is
     ``ValueError``: the desk records a click only with its signature. A foreign host store is ``ValueError`` too
-    (it takes a desk answer through its own capabilities, not built yet)."""
+    (it takes a desk answer through its own capabilities, not built yet). ``ruled`` (TERMSIGN L5b): the queue applied
+    the linked ruling ALLOW this click carried, so an authority question's LINKED option, and only it, is recorded."""
     if signing.state != "signed" or not signing.sig or not signing.message:
         raise ValueError("a desk answer is recorded only with its signature; nothing was recorded")
     if (pick is None) == (text is None):
@@ -1543,16 +1558,17 @@ def answer_item_desk(store: Any, subject: Mapping[str, Any], *, pick: str | None
     q = store.get(subject["id"])
     if q is None or q.id != subject["id"] or subject_version(q) != subject["version"]:
         raise VersionMoved("the item changed since it was shown to you, so nothing was recorded")
-    if _question_kind(q) == "authority":
-        raise AuthorityItem("this item signs on its own card; nothing was recorded")
     option, said = _key_of(q, pick, text)
+    if _question_kind(q) == "authority" and not (ruled and text is None and q.link is not None
+                                                 and option == q.link.option):
+        raise AuthorityItem("this item signs on its own card; nothing was recorded")
     entry: dict[str, Any] = {"ref": q.id, "via": "cockpit", "viewer": viewer, "seen_through": None, "note": None,
                              "sign": signing}
     if option is not None:
         entry["option"] = option
     else:
         entry["text"] = said
-    (result,) = _answer_signed(store, [entry], channel="cockpit", require=_still_version(subject),
+    (result,) = _answer_signed(store, [entry], channel="cockpit", require=_still_version(subject, ruled=ruled),
                                deadline=time.monotonic() + HOOK_BUSY_MS / 1000)
     if isinstance(result, ConsentError):
         raise result
@@ -1561,29 +1577,49 @@ def answer_item_desk(store: Any, subject: Mapping[str, Any], *, pick: str | None
 
 
 def _desk_typed_signer(store: QuestionStore, text: str, *, surface: str, origin: str, view_id: int,
-                       signer_factory: Any = None, key_dir: Path | None = None, notify: Any = None
-                       ) -> Callable[[list[tuple[Any, Question]]], Signing | None]:
+                       signer_factory: Any = None, key_dir: Path | None = None, notify: Any = None,
+                       queue_for: Callable[[Question], Any] | None = None, sign_info: bool = True,
+                       environ: Mapping[str, str] | None = None
+                       ) -> Callable[..., Signing | None]:
     """The ``sign_with`` of a line typed in the cockpit's band box (TERMSIGN L5a): after a full parse, ONE
     ``levain-desk-answer/1`` message with ``gesture: typed`` naming every information entry about to be recorded,
     signed once, outside any store lock, the notice posted first. It never raises: a message that cannot be built or
-    a signer that fails is an unsigned outcome naming why. ``view_id``: the view the plan was parsed against."""
-    def sign_with(pairs: list[tuple[Any, Question]]) -> Signing | None:
+    a signer that fails is an unsigned outcome naming why. ``view_id``: the view the plan was parsed against.
+
+    ``rulings`` (TERMSIGN L5b, as :func:`_terminal_signer`): the linked picks of the line each get an authority
+    entry carrying the ruling ALLOW the queue builds for the terminal key, inside the same message and touch; after a
+    successful sign the queue applies each (in the desk format), and ``Signing.ruled`` names those it applied.
+    ``sign_info`` False (the desk policy leaves information unsigned): information entries are not signed, only
+    rulings are, and an information answer of the line is recorded unsigned."""
+    def sign_with(pairs: list[tuple[Any, Question]], rulings: Sequence[tuple[Any, Question]] = ()) -> Signing | None:
         from levain.consent import terminal_sign as ts
 
-        info_ids = {q.id: "" for _, q in pairs if _question_kind(q) == "information"}
+        info_ids = {q.id: "" for _, q in pairs if sign_info and _question_kind(q) == "information"}
+        carried: dict[str, tuple[str, str, Any]] = {}
         try:
-            entries, versions = _info_entries(pairs, with_note=False)
+            entries, versions = _info_entries(pairs, with_note=False) if sign_info else ([], {})
+            if rulings:
+                key = ts.find_key(key_dir)
+                for sh, q in rulings if key is not None else ():
+                    try:
+                        queue = (queue_for or _default_queue_for(os.environ if environ is None else environ))(q)
+                        entry, request_id, version = _ruling_entry(q, sh.pick, key, queue)
+                    except Exception:  # noqa: BLE001 - this item keeps its sheet; the line's others are unaffected
+                        continue
+                    entries.append(entry)
+                    carried[q.id] = (request_id, version, queue)
             if not entries:
                 return None
             sid = _store_id_of(store)
             if sid is None:
-                return Signing("unsigned", "signer-error", "no store id to bind the message to", versions=info_ids)
+                return Signing("unsigned", "signer-error", "no store id to bind the message to", versions=info_ids,
+                               ruling_refusals={qid: "the answer was not signed" for qid in carried})
             message = ts.build_desk_message(store=f"levain-questions:{sid}", install=sid, surface=surface,
                                             origin=origin, view=str(view_id), gesture="typed",
                                             typed=" ".join(text.split()) or text, entries=entries)
         except Exception as exc:  # noqa: BLE001 - signing never blocks recording
             return Signing("unsigned", "signer-error", f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}",
-                           versions=info_ids)
+                           versions=info_ids, ruling_refusals={qid: "the answer was not signed" for qid in carried})
         key = None
         try:
             key = ts.find_key(key_dir)
@@ -1593,8 +1629,13 @@ def _desk_typed_signer(store: QuestionStore, text: str, *, surface: str, origin:
             pass
         out = ts.sign(message, key=key, key_dir=key_dir, signer_factory=signer_factory or ts.default_desk_signer_factory)
         if out.state == "signed":
-            return Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint, versions)
-        return Signing("unsigned", out.reason, out.detail, versions=versions)
+            scope = {"store": f"levain-questions:{sid}", "install": sid, "surface": surface, "origin": origin,
+                     "view": str(view_id)}
+            ruled, refusals = _apply_carried(carried, message, out.signature, scope, versions)
+            return Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint, versions,
+                           ruled, refusals)
+        return Signing("unsigned", out.reason, out.detail, versions=versions,
+                       ruling_refusals={qid: "the answer was not signed" for qid in carried})
 
     return sign_with
 
@@ -1602,7 +1643,8 @@ def _desk_typed_signer(store: QuestionStore, text: str, *, surface: str, origin:
 def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: str, view_id: int, surface: str,
                      origin: str, signer_factory: Any = None, key_dir: Path | None = None, notify: Any = None,
                      deadline: float | None = None, policy: str | None = None,
-                     outcome: list[Signing] | None = None) -> Applied:
+                     outcome: list[Signing] | None = None, queue_for: Callable[[Question], Any] | None = None
+                     ) -> Applied:
     """:func:`answer_text` for the cockpit's band box, signed with the laptop key where the desk ``policy``
     (:data:`levain.desk_click.DESK_POLICY` by default) signs an information answer (policy (a), ``all``): the plan is
     made from the view the text names, one desk message is signed over its information entries, and the answers are
@@ -1610,14 +1652,16 @@ def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: 
     that cancels or times out leaves the line UNRECORDED: the whole line is refused (``ValueError``, nothing
     recorded) so the box keeps his words, unlike a seat's typed line, which records unsigned. Under a policy that
     leaves information unsigned (NP-A (b), ``authority``) the line is :func:`answer_text`, unsigned, raising no
-    sheet; its authority entries open their own sheets either way. Each signing attempt is appended to
+    sheet, except that a LINKED pick of the line is signed with its ruling (TERMSIGN L5b) whatever the policy: it is
+    an authority item, and the signature is the act. Each signing attempt is appended to
     ``outcome``. A foreign store is ``ValueError`` as in :func:`answer_text`."""
     from levain import desk_click
 
-    if not desk_click.requires_sign("information", desk_click.DESK_POLICY if policy is None else policy):
-        return answer_text(store, text, viewer=viewer, channel="cockpit", store_id=store_id, view_id=view_id,
-                           deadline=deadline)
+    signs_info = desk_click.requires_sign("information", desk_click.DESK_POLICY if policy is None else policy)
     if _foreign(store):
+        if not signs_info:
+            return answer_text(store, text, viewer=viewer, channel="cockpit", store_id=store_id, view_id=view_id,
+                               deadline=deadline)
         raise ValueError("this cockpit's questions are answered on their own cards, not by band shorthand; nothing was recorded")
     view = _view_by_id(store, viewer, view_id)
     if view is None:
@@ -1625,15 +1669,19 @@ def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: 
     plan, view, questions, extras = _plan_on(store, view, text)
     if not plan.matched or plan.rest.strip():
         raise ValueError(plan.hint or "the whole text must be band answers, e.g. `1a, 2: rec`; nothing was recorded")
+    if not signs_info and not any(getattr(questions.get(sh.n), "link", None) is not None for sh in plan.sheets):
+        return answer_text(store, text, viewer=viewer, channel="cockpit", store_id=store_id, view_id=view_id,
+                           deadline=deadline)             # nothing on the line is signed: the ordinary write
     inner = _desk_typed_signer(store, text, surface=surface, origin=origin, view_id=view_id,
-                               signer_factory=signer_factory, key_dir=key_dir, notify=notify)
+                               signer_factory=signer_factory, key_dir=key_dir, notify=notify, queue_for=queue_for,
+                               sign_info=signs_info)
 
-    def sign_with(pairs: list[tuple[Any, Question]]) -> Signing | None:
-        got = inner(pairs)
+    def sign_with(pairs: list[tuple[Any, Question]], rulings: Sequence[tuple[Any, Question]] = ()) -> Signing | None:
+        got = inner(pairs, rulings)
         if got is not None:
             if outcome is not None:
                 outcome.append(got)
-            if got.state != "signed":
+            if signs_info and got.state != "signed":
                 raise _DeskUnsigned(got)
         return got
     try:
@@ -1770,6 +1818,26 @@ def _ruling_entry(q: Question, letter: str, key: Any, queue: Any) -> tuple[Any, 
     return entry, link.request_id, version
 
 
+def _apply_carried(carried: Mapping[str, tuple[str, str, Any]], message: bytes, signature: str,
+                   scope: Mapping[str, str], versions: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Apply, through the queue and nowhere else, each ruling ALLOW ``carried`` in the signed ``message`` (terminal or
+    desk format alike: the queue reads the format off the message). ``carried`` maps a question id to ``(request id,
+    row version, queue)``. Returns ``(ruled, refusals)``: the request each applied ruling was for, and why the
+    others were not (their items keep the signing sheet). An applied ruling's row version is added to ``versions``.
+    Never raises."""
+    ruled: dict[str, str] = {}
+    refusals: dict[str, str] = {}
+    for qid, (request_id, version, queue) in carried.items():
+        try:
+            queue.answer_terminal_ruling(request_id, message, signature, item=qid, row_version=version, scope=scope)
+        except Exception as exc:  # noqa: BLE001 - not applied: the item keeps its sheet, and says why
+            refusals[qid] = _one_line(exc)
+        else:
+            ruled[qid] = request_id
+            versions[qid] = version
+    return ruled, refusals
+
+
 def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse, session: str,
                      environ: Mapping[str, str], signer_factory: Any = None, key_dir: Path | None = None,
                      on_sign: Callable[[], None] | None = None, *, view_id: int | None = None,
@@ -1834,18 +1902,8 @@ def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse
                 pass
         out = ts.sign(message, key_dir=key_dir, signer_factory=signer_factory, remote=remote)
         if out.state == "signed":
-            ruled: dict[str, str] = {}
-            refusals: dict[str, str] = {}
             scope = {"store": f"levain-questions:{sid}", "install": sid, "session": session, "view": str(view_id)}
-            for qid, (request_id, version, queue) in carried.items():
-                try:
-                    queue.answer_terminal_ruling(request_id, message, out.signature, item=qid, row_version=version,
-                                                 scope=scope)
-                except Exception as exc:  # noqa: BLE001 - not applied: the item keeps its sheet, and says why
-                    refusals[qid] = _one_line(exc)
-                else:
-                    ruled[qid] = request_id
-                    versions[qid] = version
+            ruled, refusals = _apply_carried(carried, message, out.signature, scope, versions)
             return Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint, versions,
                            ruled, refusals)
         return Signing("unsigned", out.reason, out.detail, versions=versions,

@@ -41,6 +41,7 @@ class DeskRow:
     options: tuple[tuple[str, str], ...]
     answered: bool = False
     recordable: bool = True
+    ruling_pick: str | None = None     # an authority row's display letter whose pick is its linked ruling ALLOW (L5b)
 
 
 class DeskHost(Protocol):
@@ -51,7 +52,12 @@ class DeskHost(Protocol):
 
     def record(self, row: DeskRow, pick: str | None, text: str | None, viewer: str, signing: Any) -> Any:
         """Record the signed answer, checking the row's version again inside the write. Raises
-        :class:`levain.band_view.VersionMoved` when it moved (nothing recorded)."""
+        :class:`levain.band_view.VersionMoved` when it moved (nothing recorded).
+
+    A host that takes an authority row's linked pick (``DeskRow.ruling_pick``) also offers ``ruling_entry(row, pick,
+    key)`` (the authority entry carrying the ruling the queue would build now, plus what ``record_ruled`` needs;
+    raises when it would not) and ``record_ruled(row, pick, viewer, signing, carried, scope)`` (apply the ruling
+    from the signed message, then record the answer only if it applied)."""
 
 
 @dataclass(frozen=True)
@@ -288,7 +294,9 @@ def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, polic
         return refuse("bad_request", "that option is not offered", 400)
     if not requires_sign(row.kind, policy):
         return refuse("desk_unsigned", "this answer is recorded unsigned; use the ordinary path", 422)
-    if not row.recordable:
+    ruling = (row.kind == "authority" and pick is not None and row.ruling_pick == pick
+              and hasattr(host, "ruling_entry") and hasattr(host, "record_ruled"))
+    if not row.recordable and not ruling:
         return refuse("desk_authority_pending", "this item cannot be signed at the desk yet; nothing was recorded", 422)
     try:
         key = (find_key or ts.find_key)(key_dir)
@@ -299,8 +307,15 @@ def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, polic
     if not state.lock.acquire(blocking=False):
         return refuse("sign_busy", "a Touch ID sheet is already open", 409)
     try:
-        said = {"answer": f"({pick}) " + dict(row.options)[pick]} if pick is not None else {"text": text}
-        entry = ts.Entry(row.id, row.version, row.what, row.kind, **said)
+        carried = None
+        if ruling:
+            try:
+                entry, carried = host.ruling_entry(row, pick, key)
+            except Exception as exc:  # noqa: BLE001 - the queue would not build this ruling now: no sheet is raised
+                return refuse("desk_authority_pending", f"no ruling can be signed for this item now: {exc}", 422)
+        else:
+            said = {"answer": f"({pick}) " + dict(row.options)[pick]} if pick is not None else {"text": text}
+            entry = ts.Entry(row.id, row.version, row.what, row.kind, **said)
         try:
             message = ts.build_desk_message(store=scope[0], install=scope[1], surface=surface, origin=req.origin,
                                             view="item", gesture="click", entries=[entry], at=at, nonce=nonce)
@@ -318,7 +333,19 @@ def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, polic
         signing = band_view.Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint,
                                     {row.id: row.version})
         try:
-            done = host.record(row, pick, text, viewer, signing)
+            if carried is not None:
+                done = host.record_ruled(row, pick, viewer, signing, carried,
+                                         {"store": scope[0], "install": scope[1], "surface": surface,
+                                          "origin": req.origin, "view": "item"})
+            else:
+                done = host.record(row, pick, text, viewer, signing)
+        except band_view.RulingNotApplied as exc:
+            return finish(_refuse("ruling_refused", f"Touch ID signed, but the ruling was not applied ({exc}); "
+                                                    "nothing was recorded", 409, signed=True, ruled=False))
+        except band_view.RuledNotRecorded as exc:
+            return finish(_refuse("ruled_not_recorded", f"the signed ruling was applied, but the answer was not "
+                                                        f"recorded ({exc}); the item is still open", 409,
+                                  signed=True, ruled=True))
         except band_view.VersionMoved:
             return finish(_refuse("stale", "the item changed while you signed; the signature was discarded and "
                                            "nothing was recorded", 409))
@@ -333,6 +360,7 @@ def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, polic
         will = can_deliver and bool(getattr(done, "answered", ()))
         return finish(({"recorded": list(getattr(done, "recorded", [])), "signed": True, "channel": "desk",
                         "badge": "signed: Touch ID, laptop (desk)", "echo": getattr(done, "echo", ""),
+                        **({"ruled": True} if carried is not None else {}),
                         "delivery": "started" if will else "none"}, 200), done)
     finally:
         state.lock.release()
@@ -443,10 +471,11 @@ class LevainDeskHost:
     """The desk host over a levain :class:`~levain.consent.questions.QuestionStore`. A foreign host store (flow's
     ``NeedsQuestions``) has no ``scope`` here: it takes a desk answer through capabilities it does not offer yet, so
     :meth:`scope` is None and the route reports ``desk_unsupported``. An authority item is not ``recordable``: its
-    ruling travels in the signed message only after L4."""
+    ruling travels in the signed message (L5b), only for its linked pick."""
 
-    def __init__(self, store: Any) -> None:
+    def __init__(self, store: Any, *, queue_for: Callable[[Any], Any] | None = None) -> None:
         self.store = store
+        self._queue_for = queue_for        # tests; None reaches the install's own consent queue
 
     def scope(self) -> tuple[str, str] | None:
         from levain import band_view
@@ -464,8 +493,45 @@ class LevainDeskHost:
             return None
         kind = band_view._question_kind(q)
         options = tuple((band_view._LETTERS[i], label) for i, (_, label) in enumerate(q.options[:len(band_view._LETTERS)]))
+        linked = None
+        if kind == "authority" and getattr(q, "link", None) is not None:
+            linked = next((letter for letter, (key, _) in zip(band_view._LETTERS, q.options) if key == q.link.option),
+                          None)
         return DeskRow(q.id, band_view.subject_version(q), q.what, kind, options, q.answer is not None,
-                       recordable=kind == "information")
+                       recordable=kind == "information", ruling_pick=linked)
+
+    def ruling_entry(self, row: DeskRow, pick: str, key: Any) -> tuple[Any, Any]:
+        """The authority entry that carries the ruling ALLOW for ``row``'s linked request, and the
+        ``(request id, version, queue)`` :meth:`record_ruled` applies it with. Raises when the queue would not
+        build it now (the request is gone, decided, or in another queue)."""
+        import os
+
+        from levain import band_view
+
+        q = self.store.get(row.id)
+        if q is None or q.id != row.id or band_view.subject_version(q) != row.version:
+            raise ValueError("the item changed")
+        queue = (self._queue_for or band_view._default_queue_for(os.environ))(q)
+        entry, request_id, version = band_view._ruling_entry(q, pick, key, queue)
+        return entry, (request_id, version, queue)
+
+    def record_ruled(self, row: DeskRow, pick: str, viewer: str, signing: Any, carried: Any,
+                     scope: Mapping[str, str]) -> Any:
+        """Apply the signed ruling through the queue (the only authority), then record the linked answer. The
+        answer is recorded only if the ruling applied (:class:`~levain.band_view.RulingNotApplied` otherwise); an
+        answer refused after the ruling applied is :class:`~levain.band_view.RuledNotRecorded`."""
+        from levain import band_view
+
+        versions = dict(signing.versions)
+        ruled, refusals = band_view._apply_carried({row.id: carried}, signing.message.encode("utf-8"),
+                                                   signing.sig, scope, versions)
+        if row.id not in ruled:
+            raise band_view.RulingNotApplied(refusals.get(row.id, "the queue did not apply it"))
+        try:
+            return band_view.answer_item_desk(self.store, {"kind": "question", "id": row.id, "version": row.version},
+                                              pick=pick, text=None, viewer=viewer, signing=signing, ruled=True)
+        except Exception as exc:  # noqa: BLE001 - the ruling stands; the caller says so
+            raise band_view.RuledNotRecorded(exc) from None
 
     def record(self, row: DeskRow, pick: str | None, text: str | None, viewer: str, signing: Any) -> Any:
         from levain import band_view
