@@ -26,9 +26,9 @@ Before step 1 writes anything, :func:`check_prerequisites` holds every bundle pr
 (``base-missing``).
 
 His git runs here on trusted input only: ``cat-file -e <oid>`` once per prerequisite, ``rev-parse --git-path
-objects`` and ``update-ref``, each through :func:`_git` with :func:`git_env`, ``-c core.hooksPath=/dev/null`` and
-``--git-dir=<repo>/.git --work-tree=<repo>`` (:func:`repo_args`: never a discovered repository); update-ref also gets
-``-c hook.reference-transaction.enabled=false`` (it runs the ``reference-transaction`` hook otherwise). A spawn that
+objects`` and ``update-ref``, each through :func:`_git` with :func:`git_env` and ``push.git_isolation_args`` (the one shared operator-git isolation:
+``core.hooksPath``/``core.fsmonitor`` off, ``hook.reference-transaction.enabled=false``, and
+``--git-dir=<repo>/.git --work-tree=<repo>``, as :func:`repo_args`: never a discovered repository). A spawn that
 cannot start or outlives its timeout is ``take-failed:<errno name>`` / ``take-failed:timeout``, as is an OSError reading
 the private copies.
 
@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from levain import unshowable
+from levain.consent import push
 from levain.slot import Refused, adopt_verify, bundlefmt
 from levain.slot.grammar import SESSION_RE
 
@@ -324,8 +325,8 @@ def git_env() -> Dict[str, str]:
     from levain.launch import child_env
 
     env = {k: v for k, v in child_env().items() if not k.upper().startswith("GIT_")}
-    env.update({"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_LAZY_FETCH": "1",
-                "GIT_NO_REPLACE_OBJECTS": "1", "LC_ALL": "C"})
+    env.update(push.git_isolation_env())
+    env["LC_ALL"] = "C"
     return env
 
 
@@ -341,10 +342,8 @@ def _git(git: str, repo: Path, *args: str, config: Tuple[str, ...] = (),
     """His git, run once, ``-c core.hooksPath=/dev/null`` then a ``-c`` per ``config`` entry, then
     :func:`repo_args`. A spawn that outlives ``_GIT_TIMEOUT`` = ``take-failed:timeout``; one that cannot start (no
     such git, his repo dir gone) = ``take-failed:<errno name>``."""
-    argv = [git, "-c", "core.hooksPath=/dev/null"]
-    for c in config:
-        argv += ["-c", c]
-    argv += [*repo_args(repo), *args]
+    argv = [*push.git_isolation_args(git, os.path.join(str(repo), ".git"), work_tree=str(repo), extra_config=config),
+            *args]
     _note(log, "spawn " + " ".join(argv[1:]))
     what = "git " + args[0]
     try:
@@ -562,7 +561,7 @@ def create_ref(git: str, repo: Path, session: str, which: str, oid: str, object_
     ref = ref_name(session, which)
     zero = "0" * bundlefmt.OID_HEX[object_format]
     r = _git(git, repo, "update-ref", "--no-deref", "--create-reflog", ref, oid, zero,
-             config=("hook.reference-transaction.enabled=false",), log=log)
+             log=log)
     if r.returncode == 0:
         return ref
     err = r.stderr.decode("utf-8", "replace")

@@ -23,8 +23,9 @@ Levain prints the operator's own ``git -C <worktree> merge --ff-only <sha>`` and
 worktree); else the swap, then ``adopted``. A branch that reads neither is MOVED BASE: ``failed`` (``base_moved``),
 which releases the write files so the planner can re-file, and the job's staged refs are deleted.
 
-Every git call goes through :func:`_git`: the never-PATH ``git_bin()``, ``core.hooksPath=/dev/null``,
-``core.fsmonitor=false``, an explicit ``--git-dir``, the consent push path's ``git_env("")`` plus contract.py's
+Every git call goes through :func:`_git`: the never-PATH ``git_bin()``, the shared operator-git isolation
+(``push.git_isolation_args`` / ``git_isolation_env``: hooksPath, fsmonitor, config-hooks off, explicit ``--git-dir``,
+no global or system config), the consent push path's ``git_env("")`` plus contract.py's
 graft-file guard, ``cwd=/``, no stdin
 unless one is fed, bytes out, a timeout. So no hook, fsmonitor, filter, textconv or external diff of the repository
 ever runs here. The change set (:func:`change_set`) comes from the plumbing ``diff-tree --raw`` and ``cat-file``
@@ -194,12 +195,12 @@ def _git(repo: str, *args: str, feed: bytes | None = None,
     try:
         # core.commitGraph=false: a commit-graph file in the object store can report a parent the commit object does
         # not hold (L2 1020+17, run), so parents and ancestry are read from the objects themselves
-        argv = [push.git_bin(), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-                "-c", "core.commitGraph=false",
-                f"--git-dir={_git_dir(repo)}", *args]
+        argv = [*push.git_isolation_args(push.git_bin(), _git_dir(repo), extra_config=("core.commitGraph=false",)),
+                *args]
     except push.PushRefused as exc:
         raise GitFault(str(exc)) from None
     env = push.git_env("")
+    env.update(push.git_isolation_env())
     # contract.py's guard, which the push env does not carry: a graft file rewrites the parents a commit reports
     env["GIT_GRAFT_FILE"] = _NO_GRAFT_FILE
     if extra_env:
