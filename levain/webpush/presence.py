@@ -212,7 +212,10 @@ def decide(now: float, word: dict | None, idle: float | None, *, urgent: bool = 
     from levain.webpush import intent
 
     cls = class_name if class_name in CLASSES else ("approval" if urgent else "other")
-    return intent.decide(now, intent.from_legacy(word, route, now), idle, class_name=cls, remote=remote)
+    # intent: the wrapper keeps the pre-1a answer for a caller still on the old API, where the laptop's idle seconds were the
+    # activity signal; the same instant as a message time is ``now - idle`` (no reading: no message).
+    return intent.decide(now, intent.from_legacy(word, route, now), idle, class_name=cls, remote=remote,
+                         desk_msg_at=None if idle is None else now - idle)
 
 
 def _policy_path(queue_dir: Path | str) -> Path:
