@@ -1059,7 +1059,7 @@ def _launch_session(store: CoordStore, launch_id: str, holds: list[Any] | None =
     got, why = store.launch_claim_spawn(launch_id, os.getpid())
     if why is not None:
         # a refused claim is not this call's to release over: another pass may hold the spawn (and rely on the slot
-        # this call took or found), and every other refusal writes the launch over, so the watcher's sweep frees it
+        # this call took or found); a refusal that leaves the launch pending keeps the slot to the watcher's sweep
         if hold is not None and holds is not None:
             holds.remove(hold)
         return Outcome(launch_id, False, refusal=why)
