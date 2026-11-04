@@ -15,15 +15,19 @@ from levain.autonomic.binding import BindingStore
 from levain.autonomic.journal import EffectStatus, RunJournal
 from levain.coordinator.store import CoordStore
 from levain.dream import agent as da
-from tests.test_agents_launch import BINDING, Rig, rig  # noqa: F401
+from tests.test_agents_dispatch import _dream_rig
+from tests.test_agents_launch import BINDING, Rig
+
 from tests.test_agents_supervise_fire import Ex
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
 
-def _rename(rig: Rig, name: str) -> None:
-    with rig.store.write() as c:
-        c.execute("UPDATE agents SET name = ? WHERE agent_id = ?", (name, rig.agent))
+@pytest.fixture
+def rig(tmp_path):
+    # a rig SIGNED under the dream's name with its dream-executor role in the store: a run reads the signed name and
+    # the pinned role's executor (1104-8 F1), so this is the one agent whose fire reaches a body
+    return _dream_rig(tmp_path)
 
 
 def _runs(rig):
@@ -41,15 +45,15 @@ def _run_of(rig: Rig, oid: str):
 def _launched(rig: Rig, key: str = "k") -> str:
     rig.link()
     oid = rig.claim(key)
-    assert rig.launch(oid).outcome == "launched"
+    assert rig.launch(oid, on_input=None).outcome == "launched"
     return oid
 
 
 def _fire(rig: Rig, oid: str, epoch: int = 0):
     """``run_agent`` for ``oid`` with a body that records that it ran; returns (exit code, ran)."""
     seen = []
-    _rename(rig, "x")
-    code = ctl.run_agent(rig.store, oid, epoch, bodies={"x": lambda: (lambda s, o, e: seen.append(o) or 0)})
+    _name, executor, _why = ctl._pinned_executor(rig.store, oid)    # the body keyed by the role's executor, the signed name kept
+    code = ctl.run_agent(rig.store, oid, epoch, bodies={executor: lambda: (lambda s, o, e: seen.append(o) or 0)})
     return code, seen == [oid]
 
 
@@ -140,7 +144,6 @@ def test_the_named_binding_is_not_a_registry_row_so_binding_store_admit_cannot_j
 
 def test_the_dream_fire_with_no_hand_started_run_reaches_its_effect_and_ends_done(rig, tmp_path, monkeypatch):
     oid = _launched(rig)
-    _rename(rig, "dream")
     calls = []
 
     def factory(store, occurrence_id, epoch):    # the real factory's Supervisor: the DEFAULT journal, no start

@@ -93,7 +93,9 @@ def test_the_dream_stays_reachable_by_its_own_executor(tmp_path):
     seen = []
     rig = Rig(tmp_path, name="dream")
     add_role(rig.store, parse_role(ROLES["notify-role"]))
+    rig.link()
     oid = rig.claim("k")
+    assert rig.launch(oid, on_input=None).outcome == "launched"     # a fire runs a body only for a launched row
     assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": lambda: (lambda s, o, e: seen.append(o) or 0)}) == 0
     assert seen == [oid]
 

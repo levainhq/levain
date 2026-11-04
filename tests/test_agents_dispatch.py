@@ -107,7 +107,8 @@ def test_run_agent_reads_the_executor_from_the_row_and_an_unknown_one_refuses_un
     assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": bodies["someone-else"]}) == ctl.FIRE_UNWIRED and seen == []
     (tmp_path / "signed").mkdir()
     dream = _dream_rig(tmp_path / "signed")                        # signed "dream": the dream's body runs
-    signed = dream.claim("k")
+    dream.link()
+    signed = _fire_ready(dream)                                    # launched: the launch admitted its run
     assert ctl.run_agent(dream.store, signed, 0, bodies={"dream": bodies["someone-else"]}) == 0 and seen == [signed]
     assert ctl.run_agent(rig.store, "oc-" + "0" * 32, 0, bodies=bodies) == ctl.FIRE_UNWIRED
     assert "no run body is wired" in capsys.readouterr().err
