@@ -23,7 +23,9 @@ env:
   # shard job partitions its own collection with it.
   # 4 shards: the 3.12 job ran ~55-67 min unsharded, so four shards of ~15-17 min leave headroom under the cap
   # while the per-job install (~1 min) stays small. Rebalance from the per-shard durations in a run's job list.
-  TEST_SHARDS: "4"
+  # 6 shards (11-03): on the bundle7 sha two of four shards ran past the 45-minute cap (shards 0 and 3 took 18-19
+  # minutes), because the weight is a count of `def test_` lines and the new files hold few, slow tests.
+  TEST_SHARDS: "6"
 
 jobs:
   plan:
