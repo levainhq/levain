@@ -77,10 +77,11 @@ def test_the_phone_and_shared_envelope_forms_both_name_their_repo_and_branch_box
 def test_no_drop_box_sits_in_a_form_that_a_name_could_submit():
     """L3 r1 (deepseek MED, refuted by grep): a named control inside a submitting <form> would send its words; none of the Drop
     boxes is in one (the web templates read them by id and never use FormData, getElementsByName or form.elements)."""
-    assert "<form" not in (WEB / "phone.html").read_text()
+    for name in ("phone.html", "dashboard.html", "sign.html"):      # the pages that host a Drop box or the signing sheet (init.html is the setup form, no Drop box)
+        assert "<form" not in (WEB / name).read_text(), name
     for fname in ("dashboard_core.js", "envelope_form.js", "sign.js"):
         src = (WEB / fname).read_text()
         assert 'el("form"' not in src and 'createElement("form")' not in src, fname
     for fname in sorted(p.name for p in WEB.glob("*.js")):
         src = (WEB / fname).read_text()
-        assert "FormData" not in src and "getElementsByName" not in src, fname
+        assert "FormData" not in src and "getElementsByName" not in src and ".elements[" not in src, fname
