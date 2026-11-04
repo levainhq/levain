@@ -28,16 +28,17 @@ from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import envelope as env
 from levain.coordinator import envelope_draft as ed
-from levain.coordinator.envelopes import EnvelopeStore
+from levain.coordinator.envelopes import NOT_IN_FORCE, EnvelopeStore
 from levain.coordinator.store import CoordError, next_gseq
 
 __all__ = [
-    "AgainstHead", "Draft", "DraftStale", "DraftState", "RULES", "admit_check", "cite_label", "create",
-    "draft_sign_bytes", "drop_rule", "latest", "lapse_reason", "rederive_check", "revise", "spec_rule", "state_of",
-    "unclosed_series", "withdraw",
+    "AgainstHead", "AuthorityFacet", "Card", "Draft", "DraftStale", "DraftState", "HeadState", "RULES",
+    "admit_check", "authority_facet", "cards", "cite_label", "create", "draft_sign_bytes", "drop_rule", "head_state",
+    "label", "latest", "lapse_reason", "rederive_check", "renew_rule", "replace_rule", "revise", "spec_rule",
+    "state_of", "unclosed_series", "withdraw",
 ]
 
-RULES = ("drop/1", "spec/1")
+RULES = ("drop/1", "spec/1", "renew/1", "replace/1")
 _UNAUTH = "as reported by the sender; not authenticated before S1"
 _EDIT_SPEC = ("where", "lands", "pushes", "publishes", "budget")
 
@@ -559,6 +560,27 @@ def state_of(store: EnvelopeStore, draft_id: str, revision: int | None = None) -
         return DraftState("lapsed" if lapsed else "open", lapsed, complete)
 
 
+# --- the diff base, shared by the builder and the cards -------------------------------------------------------------
+_END_WHY = {"kill": "killed", "thread_done": "its thread ended"}
+
+
+def _key_why(refused: str) -> str:
+    return f"the key that signed it no longer holds ({refused})"
+
+
+def _base(proposal: Mapping[str, Any], head: Any, why: str | None, effective: Mapping[str, Any] | None
+          ) -> tuple[str, str | None, dict[str, Any]]:
+    """``(base_kind, why, base)`` a proposal is diffed against: no head -> ``none`` and the empty envelope; a head that
+    grants nothing (``why`` names the reason: killed, ended, its key no longer holds) -> ``revoked`` and the empty
+    envelope, so every value is a new grant; else ``effective``, the head as narrowed."""
+    if head is None:
+        return "none", None, ed.empty_base(proposal)
+    if why is not None:
+        return "revoked", why, ed.empty_base(head.body)
+    assert effective is not None
+    return "effective", None, dict(effective)
+
+
 # --- the builder --------------------------------------------------------------------------------------------------
 def draft_sign_bytes(store: EnvelopeStore, draft_id: str, revision: int, draft_digest: str, *,
                      authority: AuthoritySnapshot, signer_fp: str, signed_at: Any
@@ -593,23 +615,17 @@ def draft_sign_bytes(store: EnvelopeStore, draft_id: str, revision: int, draft_d
             from_rev = conn.execute("SELECT rev FROM envelope_binds WHERE envelope_id = ? AND thread_id = ?",
                                     (head.envelope_id, d.thread_id)).fetchone()[0]
             added, removed = store.members_diff(conn, d.thread_id, from_rev, bind_rev)
-    base_kind, why = "none", None
-    if head is None:
-        base = ed.empty_base(d.proposal)
-    else:
-        base_kind = "effective"
-        base = effective
+    why = None
+    if head is not None:
         if ended is not None:
-            base_kind, why = "revoked", "killed" if ended == "kill" else "its thread ended"
+            why = _END_WHY[ended]
         else:
             # intent: a verifier that cannot run raises out of here as a machine fault; "never refuses" means no
             # verdict refusal, so the head's key state chooses the diff base and nothing else
             refused = env.refusal(head.payload, head.signature, authority, head.body, ssh_keygen=store._ssh_keygen)
             if refused is not None:
-                base_kind, why = "revoked", f"the key that signed it no longer holds ({refused})"
-        if base_kind == "revoked":
-            base = ed.empty_base(head.body)
-    assert base is not None
+                why = _key_why(refused)
+    base_kind, why, base = _base(d.proposal, head, why, effective)
     against = AgainstHead(base_kind, why, ed.against_diff(base, d.proposal), added, removed,
                           env.widens(base, d.proposal) or bool(added))
     body = ed.draft_body(d.proposal, d.draft_id, d.revision, d.digest)
@@ -617,3 +633,388 @@ def draft_sign_bytes(store: EnvelopeStore, draft_id: str, revision: int, draft_d
     store.check_body(body_text)          # the shape and the disk checks a body the store can only refuse is never signed over
     payload = env.sign_payload(body, signer_fp=signer_fp, signed_at=signed_at)
     return body_text, payload, since, against
+
+
+# === H1-2: the head's state, the cards, and the two rules that repair a head ===========================================
+# A read model (frame P8: views over thread cards, never a second store) and two rules. Nothing below writes except
+# the rules, and a rule reads nothing outside the store under its lock: the gauge's disk read and the verifier call
+# are made BEFORE the lock and handed in as a HeadState (design r3 finding E).
+#
+# Intent worth keeping: a kill is never undone. The revoked head stays killed, no pin on it revives, and a replacement
+# is a new envelope signed afresh whose ceiling is its own body; this module only ever DRAFTS that replacement.
+
+@dataclass(frozen=True)
+class HeadState:
+    """The thread's head, derived (design r3 §5.1). ``kind``: ``none``; ``revoked`` (``reason`` killed, or key: the
+    signing key no longer holds); ``ended`` (thread_done: the work facet shows its review, never a lapse); ``lapsed``
+    (``reason`` the first of thread_changed, stop, budget, budget_unreadable; ``lapses`` EVERY one present, since a
+    renewal repairs them all); ``live``. ``crossed`` is the gauge's crossed set as read; ``ref`` the budget SIGN
+    record's ref_id (``<thread>/<head>``), ``reply_id`` that record once the coordinator has filed it; ``detail`` why a
+    budget cannot be metered or a key no longer holds; ``note`` is NOT_IN_FORCE beside a live head (before S1 no row is
+    authority)."""
+    kind: str
+    reason: str | None
+    envelope_id: str | None
+    since: str | None
+    ref: str | None
+    lapses: tuple[str, ...] = ()
+    crossed: tuple[str, ...] = ()
+    detail: str | None = None
+    note: str | None = None
+    reply_id: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.__dict__.items()}
+
+
+@dataclass(frozen=True)
+class AuthorityFacet:
+    """Two fields, so an open draft over a live head never hides the live grant: the head's state and the thread's one
+    OPEN draft (its unclosed series' latest revision, not lapsed), or None."""
+    head: HeadState
+    draft: Draft | None
+
+
+@dataclass(frozen=True)
+class Card:
+    """One card a thread shows. ``line`` is its words; ``actions`` the verbs it offers; ``detail`` plain data (never
+    the writer principal, never a claim of authorship: design r3 finding J)."""
+    kind: str
+    line: str
+    actions: tuple[str, ...]
+    head: HeadState
+    detail: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "line": self.line, "actions": list(self.actions), "head": self.head.as_dict(),
+                "detail": self.detail}
+
+
+@dataclass(frozen=True)
+class _Snap:
+    """What one read transaction held: nothing here needs a second read except the verifier call on the head."""
+    now: str
+    thread: Any
+    head: Any
+    rows: list[tuple[str, str]]
+    bind_rev: int | None
+    kill_at: str | None
+    done_at: str | None
+    gauge: Any
+    reply_id: str | None
+    members: tuple[list[dict[str, str]], list[dict[str, str]]]     # added, removed since the head's bound revision
+    draft: Draft | None                                            # the unclosed series' latest revision
+    draft_lapse: str | None
+    view: dict[str, Any] | None
+
+
+_LAPSE_LINES = {
+    "stop": "envelope ran out (stop time / budget): extend?",
+    "budget": "envelope ran out (stop time / budget): extend?",
+    "thread_changed": "the thread changed since you signed: re-sign for it as it is now?",
+}
+_REVOKED_LINES = {
+    "killed": "you revoked this envelope: sign a replacement or close",
+    "key": "the key that signed this was revoked: sign a replacement with your current key, or close",
+    "thread_done": "this thread ended and was reopened: sign a new envelope for it, or close",
+}
+_AGAINST_LINES = {
+    "effective": "against the head as narrowed",
+    "revoked": "the head no longer authorises anything (killed / its key revoked / its thread ended): every value "
+               "below is a new grant",
+    "none": "no head",
+}
+_CITE_NOTE = "cited by the drafter: a claim of relevance, not proof the record supports the field"
+
+
+def _has(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone() is not None
+
+
+def _first_end(conn: sqlite3.Connection, envelope_id: str, thread_id: str, kind: str) -> str | None:
+    row = conn.execute("SELECT at FROM envelope_attenuations WHERE envelope_id = ? AND kind = ? AND (thread_id IS NULL "
+                       "OR thread_id IS ?) ORDER BY gseq LIMIT 1", (envelope_id, kind, thread_id)).fetchone()
+    return None if row is None else row[0]
+
+
+def _with_words(conn: sqlite3.Connection, ids: list[str]) -> list[dict[str, str]]:
+    out = []
+    for i in ids:
+        row = conn.execute("SELECT words FROM drops WHERE drop_id = ?", (i,)).fetchone()
+        out.append({"drop_id": i, "words": "" if row is None else row[0]})
+    return out
+
+
+def _view_inputs(store: EnvelopeStore, conn: sqlite3.Connection, d: Draft, head: Any) -> dict[str, Any]:
+    """What an ENVELOPE card shows about an open draft, read in the snapshot's transaction."""
+    bind_rev = d.proposal["binds"][0]["rev"]
+    parent = _row(conn, d.draft_id, d.revision - 1) if d.revision > 1 else None
+    effective: dict[str, Any] | None = None
+    added: list[str] = []
+    removed: list[str] = []
+    if head is not None:
+        effective = store._effective(conn, head.envelope_id, d.thread_id)
+        row = conn.execute("SELECT rev FROM envelope_binds WHERE envelope_id = ? AND thread_id = ?",
+                           (head.envelope_id, d.thread_id)).fetchone()
+        if row is not None:
+            added, removed = store.members_diff(conn, d.thread_id, row[0], bind_rev)
+    anchor = conn.execute("SELECT words FROM drops WHERE drop_id = ?", (d.proposal["drop_id"],)).fetchone()
+    return {"parent": None if parent is None else parent.proposal, "effective": effective,
+            "added": _with_words(conn, added), "removed": _with_words(conn, removed),
+            "anchor": {"drop_id": d.proposal["drop_id"], "words": "" if anchor is None else anchor[0]},
+            "cites": [{"field": c["field"], **cite_label(conn, d, c)} for c in d.cites]}
+
+
+def _snapshot(store: EnvelopeStore, thread_id: str, queue_dir: Any, *, view: bool) -> _Snap:
+    """One read-only transaction: the thread, its head and the head's narrowings, the gauge, the SIGN record, the
+    unclosed series. It creates nothing (a store older than drafts or envelopes reads as holding none), and takes no
+    write lock."""
+    from levain.coordinator import budget
+
+    with _reading(store) as conn:
+        now = store._stamp()
+        thread = store._must_thread(conn, thread_id)
+        head = EnvelopeStore._head(conn, thread_id) if _has(conn, "envelope_binds") else None
+        rows: list[tuple[str, str]] = []
+        bind_rev = kill_at = done_at = gauge = reply_id = None
+        added: list[dict[str, str]] = []
+        removed: list[dict[str, str]] = []
+        if head is not None:
+            rows = EnvelopeStore._attenuations(conn, head.envelope_id, thread_id)
+            bind_rev = conn.execute("SELECT rev FROM envelope_binds WHERE envelope_id = ? AND thread_id = ?",
+                                    (head.envelope_id, thread_id)).fetchone()[0]
+            kill_at = _first_end(conn, head.envelope_id, thread_id, "kill")
+            done_at = _first_end(conn, head.envelope_id, thread_id, "thread_done")
+            gauge = budget.gauge(conn, queue_dir, thread_id)
+            if thread.rev != bind_rev:
+                a, r = store.members_diff(conn, thread_id, bind_rev, thread.rev)
+                added, removed = _with_words(conn, a), _with_words(conn, r)
+            if _has(conn, "replies"):
+                row = conn.execute("SELECT reply_id FROM replies WHERE kind = 'sign' AND ref_store = ? AND ref_id = ?",
+                                   (budget.SIGN_REF, f"{thread_id}/{head.envelope_id}")).fetchone()
+                reply_id = None if row is None else row[0]
+        draft = _unclosed(conn, thread_id)
+        lapse = None if draft is None else lapse_reason(conn, now, thread_id, draft.proposal)
+        shown = None if not view or draft is None or lapse is not None else _view_inputs(store, conn, draft, head)
+    return _Snap(now, thread, head, rows, bind_rev, kill_at, done_at, gauge, reply_id, (added, removed), draft, lapse,
+                 shown)
+
+
+def _key_refusal(store: EnvelopeStore, s: _Snap, authority: AuthoritySnapshot) -> str | None:
+    """The ONE verifier call on the head, outside every transaction: why its signing key no longer holds, or None. A
+    killed head needs none (killed outranks). A verifier that cannot run propagates as a machine fault."""
+    if s.head is None or s.kill_at is not None:
+        return None
+    return env.refusal(s.head.payload, s.head.signature, authority, s.head.body, ssh_keygen=store._ssh_keygen)
+
+
+def _classify(store: EnvelopeStore, s: _Snap, key_refused: str | None) -> HeadState:
+    """First match wins (design r3 §5.1): none, killed, key, ended, then every lapse reason present, else live."""
+    h = s.head
+    if h is None:
+        return HeadState("none", None, None, None, None)
+    eid = h.envelope_id
+    if s.kill_at is not None:
+        return HeadState("revoked", "killed", eid, s.kill_at, None)
+    if key_refused is not None:
+        return HeadState("revoked", "key", eid, None, None, detail=key_refused)
+    if s.done_at is not None:
+        return HeadState("ended", "thread_done", eid, s.done_at, None)
+    lapses: list[str] = []
+    since = None
+    if s.thread.rev != s.bind_rev:
+        lapses.append("thread_changed")
+    stop = EnvelopeStore._stop(h, s.rows)
+    if parse_stamp(s.now) >= stop:
+        lapses.append("stop")
+        since = utc_stamp(stop)
+    g = s.gauge
+    crossed = () if g is None else tuple(g.crossed)
+    if crossed:
+        lapses.append("budget")
+    if g is not None and g.unreadable is not None:
+        lapses.append("budget_unreadable")
+    if lapses:
+        ref = f"{s.thread.thread_id}/{eid}" if "budget" in lapses else None
+        return HeadState("lapsed", lapses[0], eid, since, ref, tuple(lapses), crossed,
+                         None if g is None else g.unreadable, None, s.reply_id if ref else None)
+    return HeadState("live", None, eid, None, None, note=NOT_IN_FORCE)
+
+
+def head_state(store: EnvelopeStore, thread_id: str, *, authority: AuthoritySnapshot, queue_dir: Any) -> HeadState:
+    """The thread's head, derived: one read transaction (plus the gauge's disk read inside it) and one verifier call
+    outside it, never inside a write. The rules below take THIS value as their pre-read input."""
+    s = _snapshot(store, thread_id, queue_dir, view=False)
+    return _classify(store, s, _key_refusal(store, s, authority))
+
+
+def authority_facet(store: EnvelopeStore, thread_id: str, *, authority: AuthoritySnapshot,
+                    queue_dir: Any) -> AuthorityFacet:
+    """``(head_state, open_draft)``: the open draft is the unclosed series' latest revision when it is not lapsed."""
+    s = _snapshot(store, thread_id, queue_dir, view=False)
+    return AuthorityFacet(_classify(store, s, _key_refusal(store, s, authority)),
+                          s.draft if s.draft_lapse is None else None)
+
+
+def label(facet: AuthorityFacet) -> str:
+    """The one word a thread's authority shows (frame §3.1, with the precedence of §5.1): ENVELOPE while a draft is
+    open (above REVOKED and LAPSED, and above LIVE: the facet still carries the live head), else the head's kind.
+    ENDED is the work facet's review, never LAPSED."""
+    if facet.draft is not None:
+        return "ENVELOPE"
+    return {"none": "NONE", "revoked": "REVOKED", "ended": "ENDED", "lapsed": "LAPSED", "live": "LIVE"}[facet.head.kind]
+
+
+def _fill_from_base(p: Mapping[str, Any], base: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """An incomplete proposal made diffable: each unset value stands as the base's own (so it reads as unchanged), and
+    the unset names are returned to be shown as unset."""
+    out, unset = dict(p), []
+    for k in ed.EDITABLE:
+        if p[k] is None:
+            out[k] = base[k]
+            unset.append(k)
+    if p["budget"] is not None:
+        out["budget"] = {k: (base["budget"][k] if v is None else v) for k, v in p["budget"].items()}
+        unset += [f"budget.{k}" for k, v in p["budget"].items() if v is None]
+    return out, unset
+
+
+def _envelope_card(store: EnvelopeStore, s: _Snap, hs: HeadState) -> Card:
+    d, v = s.draft, s.view
+    assert d is not None and v is not None
+    why = None
+    if hs.kind in ("revoked", "ended"):
+        why = _key_why(hs.detail or "") if hs.reason == "key" else _END_WHY["kill" if hs.reason == "killed"
+                                                                            else "thread_done"]
+    base_kind, why, base = _base(d.proposal, s.head, why, v["effective"])
+    filled, unset = _fill_from_base(d.proposal, base)
+    added = [x["drop_id"] for x in v["added"]]
+    against = {"base_kind": base_kind, "reason": why, "line": _AGAINST_LINES[base_kind],
+               "diff": ed.against_diff(base, filled), "members_added": v["added"], "members_removed": v["removed"],
+               "wider": env.widens(base, filled) or bool(added)}
+    complete = not unset
+    capped = d.revision >= env.DRAFT_REVISIONS_MAX
+    fields = [{"field": k, "value": d.proposal[k], "cites": [c for c in v["cites"] if c["field"] == k]}
+              for k in ed.EDITABLE]
+    line = "a draft envelope" + ("" if complete else f" (not signable yet: {', '.join(unset)} still unset)")
+    if capped:
+        line += "; this draft cannot take another revision: withdraw to continue"
+    detail = {"draft_id": d.draft_id, "revision": d.revision, "digest": d.digest, "complete": complete,
+              "unset": unset, "capped": capped, "anchor": v["anchor"], "fields": fields, "cite_note": _CITE_NOTE,
+              "since_parent": ed.field_diff(v["parent"], d.proposal), "against": against}
+    return Card("ENVELOPE", line, ("sign", "withdraw") if complete else ("withdraw",), hs, detail)
+
+
+def cards(store: EnvelopeStore, thread_id: str, *, authority: AuthoritySnapshot, queue_dir: Any) -> list[Card]:
+    """The card a thread shows now (none, or one): ENVELOPE while a draft is open; else REVOKED (killed, key, or a
+    reopened thread whose head ended: ``replace`` and ``close``, NEVER ``extend``); else LAPSED (``extend`` and
+    ``close``; a budget that cannot be metered offers only ``close``). A done or closed thread shows none: its work
+    facet is review. Reading creates nothing, and files no SIGN record (the budget lapse IS the existing one)."""
+    s = _snapshot(store, thread_id, queue_dir, view=True)
+    hs = _classify(store, s, _key_refusal(store, s, authority))
+    if s.thread.state in ("done", "closed"):
+        return []
+    if s.view is not None:
+        return [_envelope_card(store, s, hs)]
+    if hs.kind in ("revoked", "ended"):
+        return [Card("REVOKED", _REVOKED_LINES[hs.reason or ""], ("replace", "close"), hs, {"since": hs.since})]
+    if hs.kind == "lapsed":
+        detail: dict[str, Any] = {"lapses": list(hs.lapses), "since": hs.since, "ref": hs.ref,
+                                  "reply_id": hs.reply_id, "crossed": list(hs.crossed)}
+        if "thread_changed" in hs.lapses:
+            detail["members_added"], detail["members_removed"] = s.members[0], s.members[1]
+        if hs.reason == "budget_unreadable":
+            return [Card("LAPSED", f"the budget cannot be metered ({hs.detail})", ("close",), hs, detail)]
+        return [Card("LAPSED", _LAPSE_LINES[hs.reason or ""], ("extend", "close"), hs, detail)]
+    return []
+
+
+# --- the two rules that repair a head --------------------------------------------------------------------------------
+def _rule_locked(store: EnvelopeStore, thread_id: str, derive: Any, *, by: str, token: object) -> Draft:
+    """A rule whose fields are read from the store UNDER the lock (``derive(conn, now) -> (fields, cites,
+    stop_span)``): the thread's unclosed series gains revision N+1 (a rebase), else a new series starts. The gauge and
+    the verifier are not reached from here: what they said arrived in the HeadState the caller read before the lock."""
+    by = store._actor(by, ("operator", "coordinator"))
+    with store._write(by, token) as (conn, now):
+        fields, cites, stop_span = derive(conn, now)
+        target = _unclosed(conn, thread_id)
+        return _write_revision(store, conn, now, thread_id=thread_id,
+                               draft_id=None if target is None else target.draft_id, fields=fields, cites=cites,
+                               parent=None if target is None else target.digest, by=by, carry=target is not None,
+                               stop_span=stop_span)
+
+
+def _head_under_lock(store: EnvelopeStore, conn: sqlite3.Connection, thread_id: str, hs: HeadState) -> Any:
+    """The head the pre-read state described, re-read under the lock; :class:`DraftStale` when the thread's head is
+    another envelope now (the state was read before the lock and is not trusted past it)."""
+    head = store._head(conn, thread_id)
+    if head is None or hs.envelope_id is None or head.envelope_id != hs.envelope_id:
+        raise DraftStale(f"thread {thread_id}'s head is not the envelope this state was read for; read it again")
+    return head
+
+
+def _signed_span(head: Any) -> timedelta:
+    """The length he chose: the SIGNED body's stop less its issue time, capped at the longest an envelope lives."""
+    from levain.dispatch.contract import MAX_LIFETIME
+
+    return min(parse_stamp(head.body["stop_at"]) - parse_stamp(head.body["issued_at"]), MAX_LIFETIME)
+
+
+def _envelope_cites(head: Any, fields: Mapping[str, Any]) -> list[dict[str, str]]:
+    return [{"field": k, "kind": "envelope", "ref": head.envelope_id, "digest": head.digest}
+            for k in sorted(fields) if fields[k] is not None]
+
+
+def renew_rule(store: EnvelopeStore, thread_id: str, hs: HeadState, *, by: str, token: object = None) -> Draft:
+    """``renew/1``: a head that is ``lapsed`` (for any reason) or ``live`` gets a successor for the thread as it is now:
+    ``where``, effects and ``budget`` from the head's EFFECTIVE envelope (a narrowing counts), ``stop_at`` = now plus the
+    SIGNED length, and every key in ``hs.crossed`` left unset (the crossed-budget default: he picks the number). It
+    repairs every lapse present, not only the first. Refused on a head that is revoked or ended: a kill is never
+    undone, so there is no extend there (``replace/1`` is the way). ``hs`` is the state read BEFORE the lock; under the
+    lock the head must still be that envelope and still not killed or ended."""
+    if hs.kind not in ("lapsed", "live"):
+        raise CoordError(f"thread {thread_id}'s head is {hs.kind}"
+                         f"{'' if hs.reason is None else ' (' + hs.reason + ')'}: there is no extend there; sign a "
+                         "replacement")
+
+    def derive(conn: sqlite3.Connection, now: str) -> tuple[dict[str, Any], list[dict[str, str]], timedelta]:
+        head = _head_under_lock(store, conn, thread_id, hs)
+        rows = store._attenuations(conn, head.envelope_id, thread_id)
+        if any(k in ("kill", "thread_done") for k, _v in rows):
+            raise CoordError(f"envelope {head.envelope_id} was ended; there is no extend there; sign a replacement")
+        eff = store._effective(conn, head.envelope_id, thread_id)
+        fields: dict[str, Any] = {k: eff[k] for k in ("where", *env.EFFECT_LISTS)}
+        fields["budget"] = {k: (None if k in hs.crossed else eff["budget"][k]) for k in env.BUDGET_KEYS}
+        fields["stop_at"] = None                       # set by the span below, cited to the head like the rest
+        return fields, _envelope_cites(head, {**fields, "stop_at": True}), _signed_span(head)
+
+    return _rule_locked(store, thread_id, derive, by=by, token=token)
+
+
+def replace_rule(store: EnvelopeStore, thread_id: str, hs: HeadState, *, prefill: bool = True, by: str,
+                 token: object = None) -> Draft:
+    """``replace/1``: a head that is ``revoked`` (killed, or its key no longer holds) or ``ended`` on a thread reopened
+    since gets a replacement draft. ``prefill`` (P2 option a, the recommendation): ``where``, effects and ``budget``
+    from the head's SIGNED body less its ``drop_effect`` narrowings; without it (option b) those stay unset. ``stop_at``
+    is the signed length either way. It revives nothing: the revoked head stays killed, no pin moves, and the
+    replacement's ceiling is its own body. A head not killed or ended under the lock (and not read as key-revoked) is
+    refused: a live head is renewed, not replaced."""
+    if hs.kind not in ("revoked", "ended"):
+        raise CoordError(f"thread {thread_id}'s head is {hs.kind}: only a revoked or ended head is replaced")
+
+    def derive(conn: sqlite3.Connection, now: str) -> tuple[dict[str, Any], list[dict[str, str]], timedelta]:
+        head = _head_under_lock(store, conn, thread_id, hs)
+        rows = store._attenuations(conn, head.envelope_id, thread_id)
+        if hs.reason != "key" and not any(k in ("kill", "thread_done") for k, _v in rows):
+            raise DraftStale(f"envelope {head.envelope_id} is not revoked or ended now; read its state again")
+        fields: dict[str, Any] = {k: None for k in ed.EDITABLE}
+        if prefill:
+            dropped = {v for k, v in rows if k == "drop_effect"}
+            body = head.body
+            fields["where"] = body["where"]
+            for k in env.EFFECT_LISTS:
+                fields[k] = [e for e in body[k] if env.effect_identity(k, e) not in dropped]
+            fields["budget"] = dict(body["budget"])
+        return fields, _envelope_cites(head, {**fields, "stop_at": True}), _signed_span(head)
+
+    return _rule_locked(store, thread_id, derive, by=by, token=token)
