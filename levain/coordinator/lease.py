@@ -903,8 +903,14 @@ def activate_room(conn: sqlite3.Connection, now: str, launch_id: str, *, harness
     if now >= ln.until:
         _launch_event(conn, now, launch_id, "expired", "pending past until")
         return _launch_row(conn, "launch_id", launch_id), f"launch {launch_id} was pending past {ln.until}"
-    if conn.execute("SELECT 1 FROM launch_events WHERE kind = 'active' AND harness_session_id = ? AND launch_id != ?",
-                    (hsid, launch_id)).fetchone() is not None:
+    # a resumed conversation reports the id it was resumed from, so the room's own earlier launch on this same room
+    # thread, once it has ended, is no claim on the id; any other launch, or a room launch still running, is
+    if conn.execute(
+            "SELECT 1 FROM launch_events e JOIN launches o ON o.launch_id = e.launch_id WHERE e.kind = 'active' AND "
+            "e.harness_session_id = ? AND e.launch_id != ? AND NOT (o.role = 'room' AND o.threads = (SELECT threads "
+            "FROM launches WHERE launch_id = ?) AND (SELECT k.kind FROM launch_events k WHERE k.launch_id = "
+            "o.launch_id ORDER BY k.seq DESC LIMIT 1) IN ('ended', 'failed', 'expired'))",
+            (hsid, launch_id, launch_id)).fetchone() is not None:
         raise _refused(f"harness session id {hsid!r} is already recorded by another launch")
     _launch_event(conn, now, launch_id, "active", "spawned", harness_session_id=hsid,
                   argv_sha256=_line("argv sha256", argv_sha256))
