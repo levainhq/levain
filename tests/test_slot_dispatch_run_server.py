@@ -18,6 +18,7 @@ import plistlib
 import shutil
 import socket
 import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -299,6 +300,84 @@ def test_shutdown_ends_every_live_session_and_refuses_new_launches(rig, env):
     text = Path(D.__file__).read_text()
     body = text[text.index("def main("):]
     assert body.index("server.shutdown(") < body.index("close()")
+
+
+class GatedStartRuntime(FakeRuntime):
+    def __init__(self):
+        super().__init__()
+        self.gate, self.entered = threading.Event(), threading.Event()
+
+    def start(self, req):
+        self.entered.set()
+        self.gate.wait(10)
+        return super().start(req)
+
+
+def test_a_spawn_in_flight_at_shutdown_is_registered_first_and_the_deadline_is_absolute(rig, tmp_path):
+    """codex MED r2 :502 / finding 5: the spawn is tracked BEFORE it blocks, shutdown returns by its deadline with it
+    still unproven on the record (the reaper's), and the spawn ENDs itself when it lands."""
+    runtime = GatedStartRuntime()
+    env = Env(rig, tmp_path, runtime=runtime)
+    oid, key, got = _occurrence(rig, billing="subscription", exposure=EXP), "s-00000000000000a5", {}
+
+    def fire():
+        try:
+            env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+        except L.LauncherRefused as exc:
+            got["exc"] = exc
+    t = threading.Thread(target=fire, daemon=True)
+    t.start()
+    assert runtime.entered.wait(5)
+    assert key in env.server._live                   # registered before the blocking spawn
+    t0 = time.monotonic()
+    env.server.shutdown(0.3)
+    assert time.monotonic() - t0 < 2.0
+    assert env.launcher.index.get(key)["state"] != "ended"
+    runtime.gate.set()
+    t.join(10)
+    assert got["exc"].name == "server-stopping" and runtime.ended == ["sess-1"]
+    env.drain()
+
+
+def test_shutdown_returns_by_its_deadline_when_holder_teardowns_block(rig, tmp_path):
+    """complement/deepseek MED r2: a blocking ABORT/END per holder must not push shutdown past launchd's 20 s."""
+    runtime = BlockingRuntime()
+    env = Env(rig, tmp_path, runtime=runtime)
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    keys = ["s-00000000000000b7", "s-00000000000000b8"]
+    held = [env.client().spawn(S.SessionLaunch(oid, k, "claude", "sonnet", "b", "passthrough", EXP)) for k in keys]
+    t0 = time.monotonic()
+    env.server.shutdown(0.5)                         # never released: each is ABORTed, and END blocks
+    assert time.monotonic() - t0 < 2.0
+    assert all(env.launcher.index.get(k)["state"] != "ended" for k in keys)
+    runtime.gate.set()
+    for _ in range(200):
+        if all(env.launcher.index.get(k)["state"] == "ended" for k in keys):
+            break
+        time.sleep(0.02)
+    for child in held:
+        child._conn.close()
+    env.drain()
+    assert all(env.launcher.index.get(k)["state"] == "ended" for k in keys)
+
+
+def test_an_unproven_end_after_a_refused_release_stays_registered_and_shutdown_retries_it(rig, env):
+    """codex MED r2 :465: an END that does not prove keeps the session registered (no retry loop here: shutdown and
+    the reaper's END are the retries)."""
+    oid, key = _occurrence(rig, billing="subscription", exposure=EXP), "s-00000000000000c2"
+    child = env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    env.runtime.end_ok = False
+    env.bar_of = lambda agent: (True, 0)
+    with pytest.raises(RuntimeError, match="agent-barred"):
+        child.release()
+    job = env.server._jobs[key]
+    assert job.done.wait(5) and job.result.terminated is False
+    assert key in env.server._live
+    env.runtime.end_ok = True
+    env.server.shutdown(5)
+    assert env.launcher.index.get(key)["state"] == "ended" and key not in env.server._live
+    child._conn.close()
+    env.drain()
 
 
 def test_a_holder_eof_and_a_reaper_end_on_one_session_make_one_teardown(rig, tmp_path):
