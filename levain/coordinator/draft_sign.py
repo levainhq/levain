@@ -101,6 +101,12 @@ def _view_lines(against: Any) -> list[str]:
              "revoked": "the head no longer authorises anything (killed / its key revoked / its thread ended): every "
                         "value below is a new grant",
              "none": "no head"}
+    if against.base_kind not in heads:
+        # a kind the sheet has no words for: the builder grew one this page cannot describe, so it shows no Sign.
+        # Not DraftStale: reviewing again would meet the same kind.
+        from levain.coordinator.store import CoordError
+
+        raise CoordError(f"the head is of a kind this sheet cannot describe ({str(against.base_kind)[:40]})")
     lines = [heads[against.base_kind] + (f" ({against.reason})" if against.reason and against.base_kind == "revoked"
                                          else "")]
     if against.wider:
@@ -241,7 +247,9 @@ def _review(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
             "signer_fp": key.fingerprint, "store_id": store.store_id(), "until": now + REVIEW_TTL, "minted": None}
     # the builder IS the check: it raises DraftStale before any verifier call or byte when the draft is not signable
     body_text, _payload, since, against = _built(phone, store, kept, key, now)
+    view = _view_lines(against)          # before the review is kept: a head the sheet cannot describe keeps nothing
     kept["against"] = _against(against)
+    kept["body_text"] = body_text
     review_id = "dv-" + secrets.token_hex(16)
     with phone._lock:
         for rid in [r for r, v in phone._draft_reviews.items() if v["until"] <= now]:
@@ -250,7 +258,7 @@ def _review(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
             del phone._draft_reviews[next(iter(phone._draft_reviews))]
         phone._draft_reviews[review_id] = kept
     return {"review_id": review_id, "body_text": body_text, "rp_id": phone.rp_id, "since_parent": since,
-            "against": kept["against"], "view": _view_lines(against), "store_id": kept["store_id"]}
+            "against": kept["against"], "view": view, "store_id": kept["store_id"]}
 
 
 def _kept(phone: Any, review_id: Any, device: str) -> dict[str, Any]:
@@ -280,9 +288,10 @@ def _challenge(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
     now = phone._clock()
     # again, with signed_at now: a long read of the sheet is never a stale signature, and a draft that moved is refused
     body_text, payload, _since, against = _built(phone, store, kept, key, now)
-    if _against(against) != kept["against"]:
+    if _against(against) != kept["against"] or body_text != kept["body_text"]:
         # the sheet said what this signature grants against the head (as narrowed, or every value new); a head whose
-        # key was revoked or that was narrowed since makes those words untrue for the same bytes, so no challenge
+        # key was revoked or that was narrowed since makes those words untrue for the same bytes, so no challenge.
+        # The body is compared too: the sheet showed it, and the challenge signs only the body the review showed
         raise drafts.DraftStale("what this signature grants against the head is no longer what the sheet showed (its "
                                 "key was revoked, or it was narrowed or ended, since the review): review it again")
     kept["minted"] = {"body_text": body_text, "payload": payload}

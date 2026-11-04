@@ -419,6 +419,45 @@ def test_a_fault_after_a_withdrawal_answers_the_withdrawal(rig, monkeypatch):
     assert got["cards"] is not None or "read the cards again" in got["cards_note"]
 
 
+def test_a_head_kind_the_sheet_cannot_describe_keeps_no_review(rig, monkeypatch):
+    # G3: the builder answering a base_kind the sheet has no words for is refused in words, with no review to sign
+    from dataclasses import replace
+
+    from levain.coordinator import envelope_drafts as drafts
+
+    d = rig.extend()
+    real = drafts.draft_sign_bytes
+
+    def drifted(*a, **k):
+        body_text, payload, since, against = real(*a, **k)
+        return body_text, payload, since, replace(against, base_kind="partial")
+
+    monkeypatch.setattr(drafts, "draft_sign_bytes", drifted)
+    with pytest.raises(CoordRefused) as exc:
+        rig.review(d)
+    assert refused(exc) == (422, "refused") and "cannot describe" in exc.value.message
+    assert rig.cp._draft_reviews == {}
+
+
+def test_a_body_that_differs_from_the_review_mints_no_challenge(rig, monkeypatch):
+    # G4: the challenge signs only the body the review showed, compared as well as the diffs
+    from levain.coordinator import envelope_drafts as drafts
+
+    d = rig.extend()
+    r = rig.review(d)
+    real = drafts.draft_sign_bytes
+
+    def other_body(*a, **k):
+        body_text, payload, since, against = real(*a, **k)
+        return body_text + " ", payload, since, against
+
+    monkeypatch.setattr(drafts, "draft_sign_bytes", other_body)
+    with pytest.raises(CoordRefused) as exc:
+        rig.challenge(r)
+    assert refused(exc) == (409, "draft_stale")
+    assert rig.cp._draft_reviews[r["review_id"]]["minted"] is None
+
+
 def test_a_machine_fault_at_accept_keeps_the_review_for_the_retry(rig, monkeypatch):
     # F9: the spend/keep split: a verifier that cannot run is not a verdict, so the same request may be sent again
     from levain.authority import VerifierUnavailable
