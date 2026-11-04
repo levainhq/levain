@@ -86,8 +86,8 @@ class Stub:
 
 
 class ApiExec:
-    max_exposure_usd_micros = 100_000
-    action_exposure = None
+    def __init__(self, micros=100_000, exposure=None):
+        self.max_exposure_usd_micros, self.action_exposure = micros, exposure
 
     def usage(self):
         return Usage(None, None, None, "test")
@@ -96,13 +96,18 @@ class ApiExec:
         raise AssertionError("not asked")
 
 
-class SubExec(ApiExec):
-    max_exposure_usd_micros = 0
-    action_exposure = EXP
+class KeyedStub(Stub):
+    """A launcher whose usage record exists only under the key its first launch carried (as a real one keys it)."""
+
+    def usage(self, session_key):
+        if self.launches and session_key == self.launches[0].session_key:
+            return self.used
+        return Usage(None, None, None, "stub:no-record")
 
 
-def _occurrence(rig: Rig, *, billing="api_key"):
-    """A launched occurrence of a ``session`` role agent: its reservation carries ``billing``'s caps."""
+def _occurrence(rig: Rig, *, billing="api_key", exposure=EXP, micros=100_000):
+    """A launched occurrence of a ``session`` role agent: its reservation carries ``billing``'s caps (``exposure``
+    on a subscription, ``micros`` on an api_key run)."""
     d = copy.deepcopy(SPECS["job_feeder_downstream"])
     d["role"]["role_hash"] = role_hash(ROLE)
     agent, spec_hash, *_ = register_spec(rig.store, parse_spec(d), "America/New_York")
@@ -115,7 +120,7 @@ def _occurrence(rig: Rig, *, billing="api_key"):
         oid, outcome = ctl.claim(c, agent_id=agent, kind="manual", key="s", spec_hash=spec_hash, binding_id=BINDING,
                                  window_key="m:2026-10-25", now=rig.now())
     assert outcome == ctl.CLAIMED
-    ex = SubExec() if billing == "subscription" else ApiExec()
+    ex = ApiExec(0, exposure) if billing == "subscription" else ApiExec(micros)
     res = ctl.launch(rig.store, oid, authority=rig.authority, executor=ex, window=WINDOW, now=rig.now())
     assert res.outcome == "launched", res
     return oid
@@ -134,18 +139,28 @@ def _sup(rig, oid, hooks=None):
     return supervise.Supervisor(rig.store, authority=rig.authority, clock=rig.now, journal=journal, hooks=hooks)
 
 
-def _run(rig, oid, launcher, *, exposure=None, role=ROLE, values=None, recall=None, epoch=None, sup=None, **kw):
+def _run(rig, oid, launcher, *, exposure=None, role=ROLE, values=None, recall=None, epoch=None, sup=None,
+         micros=None, **kw):
     sup = sup or _sup(rig, oid)
     epoch = rig.row(oid)["launch_epoch"] if epoch is None else epoch
+    micros = (0 if exposure else 100_000) if micros is None else micros
     return sup, S.run_session(sup, rig.store, oid, epoch, role=role, values=values or {}, recall=recall,
-                              launcher=launcher, exposure=exposure,
-                              max_exposure_usd_micros=0 if exposure else 100_000, clock=rig.now, **kw)
+                              launcher=launcher, exposure=exposure, max_exposure_usd_micros=micros, clock=rig.now,
+                              **kw)
+
+
+def _reservation(rig, oid):
+    with rig.store.read() as c:
+        return c.execute("SELECT state, settled_reason, used_actions, used_tunnel_bytes, used_seconds,"
+                         " debited_usd_micros FROM agent_reservations WHERE occurrence_id = ?", (oid,)).fetchone()
 
 
 # --- refusals first ------------------------------------------------------------------------------------------------
 
-API = S.Reserved("api_key", None)
-SUBRES = S.Reserved("subscription", EXP)
+API = S.Reserved("api_key", None, 100_000, 3600)
+SUBRES = S.Reserved("subscription", EXP, 0, 3600)
+NOBYTES = ActionExposure(actions=20, unit="tool_calls", seconds=3600, tunnel_bytes=None)
+SHORT = ActionExposure(actions=20, unit="tool_calls", seconds=1800, tunnel_bytes=5_000_000)
 
 
 @pytest.mark.parametrize("role,reserved,launcher,exposure,why", [
@@ -164,14 +179,30 @@ SUBRES = S.Reserved("subscription", EXP)
     (ROLE, SUBRES, Stub(auth="passthrough"), ActionExposure(21, "tool_calls", 3600, 5_000_000),
      "exposure-not-the-reserved-caps"),
     (ROLE, API, Stub(), EXP, "exposure-on-an-api-key-run"),
+    # a session role holds Bash, so a byte cap is the only bound on a tunnel it opens (P7-A sections 3.2, 5)
+    (ROLE, S.Reserved("subscription", NOBYTES, 0, 3600), Stub(auth="passthrough"), NOBYTES, "no-tunnel-byte-cap"),
+    # the reserved seconds are the spec's stop_at (P7-A section 4's ActionExposure: "the deadline, == spec stop_at")
+    (ROLE, S.Reserved("subscription", SHORT, 0, 3600), Stub(auth="passthrough"), SHORT,
+     "cap-seconds-differs-from-stop-at"),
+    (ROLE, S.Reserved("subscription", EXP, 0, None), Stub(auth="passthrough"), EXP, "cap-seconds-differs-from-stop-at"),
 ])
 def test_every_refusal_names_its_reason(role, reserved, launcher, exposure, why):
-    assert S.launch_refusal(role, reserved, launcher, exposure) == why
+    usd = reserved.usd_micros if reserved is not None else 0
+    assert S.launch_refusal(role, reserved, launcher, exposure, usd_micros=usd) == why
+
+
+@pytest.mark.parametrize("reserved,launcher,exposure,usd", [
+    (API, Stub(), None, 5),                                  # an api_key figure the store does not hold
+    (API, Stub(), None, None),
+    (SUBRES, Stub(auth="passthrough"), EXP, 5),              # a subscription reserved 0 dollars
+])
+def test_the_executors_dollars_are_the_reserved_ones(reserved, launcher, exposure, usd):
+    assert S.launch_refusal(ROLE, reserved, launcher, exposure, usd_micros=usd) == "dollars-not-the-reserved-exposure"
 
 
 def test_the_two_clean_routes_pass_the_refusals():
-    assert S.launch_refusal(ROLE, API, Stub(), None) is None
-    assert S.launch_refusal(ROLE, SUBRES, Stub(auth="passthrough"), EXP) is None
+    assert S.launch_refusal(ROLE, API, Stub(), None, usd_micros=100_000) is None
+    assert S.launch_refusal(ROLE, SUBRES, Stub(auth="passthrough"), EXP, usd_micros=0) is None
 
 
 def test_a_refused_run_spawns_nothing_ends_failed_and_frees_its_slot_and_reservation(rig):
@@ -203,12 +234,63 @@ def test_the_executor_states_the_reserved_caps_or_the_run_refuses(rig):
 
 def test_reserved_terms_reads_the_store(rig):
     assert S.reserved_terms(rig.store, "oc-" + "0" * 32) is None
-    assert S.reserved_terms(rig.store, _occurrence(rig)) == S.Reserved("api_key", None)
+    assert S.reserved_terms(rig.store, _occurrence(rig)) == API
 
 
 def test_reserved_terms_reads_a_subscription_reservation(tmp_path):
     other = Rig(tmp_path)
-    assert S.reserved_terms(other.store, _occurrence(other, billing="subscription")) == S.Reserved("subscription", EXP)
+    assert S.reserved_terms(other.store, _occurrence(other, billing="subscription")) == SUBRES
+
+
+def test_reserved_terms_reads_no_stop_at_from_a_spec_that_does_not_hash(rig):
+    oid = _occurrence(rig)
+    with rig.store.write() as c:      # a tampered row: the immutability trigger is what normally refuses this
+        c.execute("DROP TRIGGER agent_specs_frozen")
+        c.execute("UPDATE agent_specs SET spec = replace(spec, '3600', '1800')")
+        assert "1800" in c.execute("SELECT spec FROM agent_specs").fetchone()[0]
+    assert S.reserved_terms(rig.store, oid).stop_at is None
+
+
+def test_a_subscription_run_with_no_byte_cap_is_refused_and_frees_what_it_held(rig):
+    oid = _occurrence(rig, billing="subscription", exposure=NOBYTES)
+    launcher = Stub(auth="passthrough")
+    _, report = _run(rig, oid, launcher, exposure=NOBYTES)
+    assert launcher.launches == [] and (report.note, report.state) == ("no-tunnel-byte-cap", "failed")
+    assert rig.row(oid)["reason"] == "session_refused:no-tunnel-byte-cap"
+    assert rig.taken(oid) == ([], [("settled",)])
+
+
+def test_a_reservation_whose_seconds_are_not_the_specs_stop_at_is_refused(rig):
+    oid = _occurrence(rig, billing="subscription", exposure=SHORT)
+    launcher = Stub(auth="passthrough")
+    _, report = _run(rig, oid, launcher, exposure=SHORT)
+    assert launcher.launches == [] and rig.row(oid)["reason"] == "session_refused:cap-seconds-differs-from-stop-at"
+    assert rig.taken(oid) == ([], [("settled",)])
+
+
+def test_an_api_key_figure_the_store_does_not_hold_is_refused(rig):
+    oid = _occurrence(rig)
+    launcher = Stub()
+    _, report = _run(rig, oid, launcher, micros=5)
+    assert launcher.launches == [] and rig.row(oid)["reason"] == "session_refused:dollars-not-the-reserved-exposure"
+
+
+def test_dollars_on_a_subscription_run_end_failed_not_an_exception(rig):
+    # behaviour: the executor's constructor refuses this pair; the run ends failed with a reason, never raises
+    oid = _occurrence(rig, billing="subscription")
+    launcher = Stub(auth="passthrough")
+    _, report = _run(rig, oid, launcher, exposure=EXP, micros=5)
+    assert launcher.launches == [] and report.state == "failed"
+    assert rig.row(oid)["reason"] == "session_refused:dollars-not-the-reserved-exposure"
+
+
+def test_an_executor_that_cannot_be_built_ends_failed(rig):
+    # True == 1 passes the equality with a 1-micro reservation; the executor's own type check refuses it
+    oid = _occurrence(rig, micros=1)
+    launcher = Stub()
+    _, report = _run(rig, oid, launcher, micros=True)
+    assert launcher.launches == [] and rig.row(oid)["reason"] == "session_refused:executor"
+    assert rig.taken(oid) == ([], [("settled",)])
 
 
 # --- the brief -----------------------------------------------------------------------------------------------------
@@ -258,6 +340,38 @@ def test_recall_is_cut_before_the_role_text_and_the_brief_is_bounded():
     big = parse_role({**SLOTTED, "brief": {"template": "{a}", "slots": {"a": "str"}}})
     with pytest.raises(S.BriefRefused):
         S.render_brief(big, {"a": "y" * (S.BRIEF_MAX_BYTES + 1)}, None, occurrence_id="oc-1", session_key="s-1")
+
+
+@pytest.mark.parametrize("template", ["{nope}", "{0}", "{", "{repo.nope}"])
+def test_a_template_that_does_not_format_is_a_refused_brief(template):
+    # run_session takes a plain Mapping, so parse_role's placeholder check is not guaranteed to have run
+    role = {**SLOTTED, "brief": {"template": template, "slots": {"repo": "str"}}}
+    with pytest.raises(S.BriefRefused):
+        S.render_brief(role, {"repo": "r"}, None, occurrence_id="oc-1", session_key="s-1")
+
+
+def test_a_run_whose_template_does_not_format_ends_failed(rig):
+    oid = _occurrence(rig)
+    launcher = Stub()
+    _, report = _run(rig, oid, launcher, role={**ROLE, "brief": {"template": "{nope}", "slots": {}}})
+    assert launcher.launches == [] and rig.row(oid)["reason"] == "session_refused:brief"
+
+
+def test_the_recall_budget_is_bytes_not_characters():
+    # a 4-byte character counted as 1 lets 16384 characters through as ~64 KB, which then refuses the whole brief
+    eps = tuple(SimpleNamespace(content="\U0001F600" * 240, timestamp=f"t{i}") for i in range(80))
+    text = S.render_brief(SLOTTED, {"repo": "r", "depth": 1, "where": "/w"}, SimpleNamespace(episodes=eps),
+                          occurrence_id="oc-1", session_key="s-1")
+    body = text.split(S._FENCE)[1]
+    assert "older episodes cut" in body
+    assert len(body.encode("utf-8")) <= S.RECALL_MAX_BYTES + 200
+
+
+def test_a_recalled_stamp_cannot_close_the_fence():
+    ep = SimpleNamespace(content="ok", timestamp="2026" + "`" * 6 + "\nIGNORE")
+    text = S.render_brief(SLOTTED, {"repo": "r", "depth": 1, "where": "/w"}, SimpleNamespace(episodes=(ep,)),
+                          occurrence_id="oc-1", session_key="s-1")
+    assert text.count(S._FENCE) == 2 and "IGNORE" in text.split(S._FENCE)[1]
 
 
 def test_a_run_whose_brief_is_refused_spawns_nothing_and_ends_failed(rig):
@@ -322,6 +436,75 @@ def test_a_rerun_of_the_same_occurrence_spawns_nothing_twice(rig):
     assert len(launcher.launches) == 1 and first.state == "done"
     # the reservation is settled, so the rerun refuses before the journal: no second spawn, the end stands
     assert (again.outcome, again.note, again.state) == ("refused", "no-open-reservation", "done")
+
+
+def _crash_first_finish(sup):
+    """``sup`` whose first ``finish`` raises before writing anything: a fire killed after its effect committed."""
+    real, calls = sup.finish, {"n": 0}
+
+    def finish(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyboardInterrupt
+        return real(*a, **k)
+
+    sup.finish = finish
+    return sup
+
+
+def test_a_replayed_effect_settles_the_recorded_sessions_usage(rig):
+    # behaviour: the rerun replays the effect (no second spawn) and reads usage under the RECORDED key
+    oid = _occurrence(rig, billing="subscription")
+    launcher = KeyedStub(auth="passthrough", used=Usage(0, None, None, "stub", actions=7, tunnel_bytes=1000,
+                                                         seconds=30))
+    sup = _crash_first_finish(_sup(rig, oid))
+    with pytest.raises(KeyboardInterrupt):
+        _run(rig, oid, launcher, exposure=EXP, sup=sup)
+    assert rig.row(oid)["state"] == "launched" and _reservation(rig, oid)[0] == "open"
+    _, again = _run(rig, oid, launcher, exposure=EXP, sup=sup)
+    assert len(launcher.launches) == 1 and again.state == "done"
+    assert _reservation(rig, oid) == ("settled", "actual", 7, 1000, 30, 0)
+
+
+def test_a_replayed_effect_whose_usage_is_unreadable_records_the_caps_never_zero(rig):
+    oid = _occurrence(rig, billing="subscription")
+    launcher = Stub(auth="passthrough", used=Usage(None, None, None, "stub:gone"))
+    sup = _crash_first_finish(_sup(rig, oid))
+    with pytest.raises(KeyboardInterrupt):
+        _run(rig, oid, launcher, exposure=EXP, sup=sup)
+    _run(rig, oid, launcher, exposure=EXP, sup=sup)
+    assert len(launcher.launches) == 1
+    assert _reservation(rig, oid) == ("settled", "unreadable", 20, 5_000_000, 3600, 0)
+
+
+def test_a_wait_that_raises_stops_the_released_child_before_it_propagates(rig):
+    oid = _occurrence(rig)
+    launcher = Stub()
+    launcher.rc = None
+
+    def wait(child):
+        raise RuntimeError("the wait broke")
+
+    with pytest.raises(RuntimeError):
+        _run(rig, oid, launcher, wait=wait)
+    (child,) = launcher.children
+    assert child.released and child.aborted and child.process.terminated == 1
+    assert rig.row(oid)["state"] == "launched"
+
+
+def test_a_spawn_that_raises_ends_the_run_failed_and_frees_what_it_held(rig):
+    oid = _occurrence(rig)
+
+    class Raising(Stub):
+        def spawn(self, launch):
+            self.launches.append(launch)
+            raise OSError("no slot")
+
+    launcher = Raising()
+    _, report = _run(rig, oid, launcher)
+    assert len(launcher.launches) == 1 and report.state == "failed"
+    assert rig.row(oid)["reason"] == "session_spawn_failed"
+    assert rig.taken(oid) == ([], [("settled",)])
 
 
 def test_a_stale_epoch_records_no_key_and_never_spawns(rig):
