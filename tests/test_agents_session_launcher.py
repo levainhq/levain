@@ -221,12 +221,13 @@ def test_the_mint_request_is_the_passthrough_ticket_the_exposure_states(tmp_path
     assert f == {"attempt_id": KEY, "job_id": "occ-1", "run_index": 0, "contract_digest": f["contract_digest"],
                  "kind": "executor", "egress_routes": [], "reserved_microdollars": 0, "auth": "passthrough",
                  "vendor": "claude", "model_requested": "sonnet", "max_calls": 20, "max_tunnel_bytes": 5_000_000,
-                 "deadline_s": 3600}
+                 "deadline_s": 3600, "brief_digest": f["brief_digest"]}
     assert f["contract_digest"].startswith("sha256:") and len(f["contract_digest"]) == 71
     T.check_facts(f)                                            # the server's own shape function agrees
     (start,) = runtime.starts
     assert (start.run_id, start.session_key, start.harness, start.model, start.brief, start.hooks) \
         == (RUN, KEY, "claude", "sonnet", "the brief", ("levain_gate", "levain_queue"))
+    assert start.brief_digest == f["brief_digest"]
 
 
 def test_the_launcher_mints_through_the_real_control_handler(st, tmp_path):
@@ -259,8 +260,27 @@ def test_the_launcher_mints_through_the_real_control_handler(st, tmp_path):
     again = to.call("RUN-TICKET-MINT", attempt_id=KEY, job_id="job-1", run_index=0,
                     contract_digest=line["facts"]["contract_digest"], kind="executor", egress_routes=[],
                     reserved_microdollars=0, auth="passthrough", vendor="claude", model_requested="sonnet",
-                    max_calls=20, max_tunnel_bytes=5_000_000, deadline_s=3600)
+                    max_calls=20, max_tunnel_bytes=5_000_000, deadline_s=3600,
+                    brief_digest=line["facts"]["brief_digest"])
     assert again["run_id"] == rec["run_id"]
+    # the journaled mint holds the digest of the exact brief bytes, and the request digest covers it: the same
+    # attempt with every other fact equal and another brief digest is a conflict, not a second ticket
+    import hashlib
+    assert line["facts"]["brief_digest"] == "sha256:" + hashlib.sha256(b"the brief").hexdigest()
+    with pytest.raises(Refused) as e:
+        to.call("RUN-TICKET-MINT", attempt_id=KEY, job_id="job-1", run_index=0,
+                contract_digest=line["facts"]["contract_digest"], kind="executor", egress_routes=[],
+                reserved_microdollars=0, auth="passthrough", vendor="claude", model_requested="sonnet",
+                max_calls=20, max_tunnel_bytes=5_000_000, deadline_s=3600,
+                brief_digest="sha256:" + hashlib.sha256(b"another brief").hexdigest())
+    assert e.value.name == "attempt-conflict"
+    # the launcher's own second spawn of the key with a different brief (a fresh index, so it reaches the handler)
+    other = L.RealLauncher(to, FakeRuntime(), FakeSources(), L.SessionIndex(tmp_path / "idx2"))
+    different = S.SessionLaunch("job-1", KEY, "claude", "sonnet", "a different brief", "passthrough", EXP)
+    with pytest.raises(L.LauncherRefused) as e2:
+        other.spawn(different)
+    assert e2.value.name == "mint-refused:attempt-conflict"
+    assert len(real.lines()) == 1
     # bind the ticket the launcher handed the slot (what ATTACH of the ticket-bound lease journals): once it is
     # bound, a replay is attempt-closed and STATUS names the session but no run id, so the index is its only record
     (start,) = runtime.starts
@@ -271,7 +291,7 @@ def test_the_launcher_mints_through_the_real_control_handler(st, tmp_path):
         to.call("RUN-TICKET-MINT", attempt_id=KEY, job_id="job-1", run_index=0,
                 contract_digest=line["facts"]["contract_digest"], kind="executor", egress_routes=[],
                 reserved_microdollars=0, auth="passthrough", vendor="claude", model_requested="sonnet",
-                max_calls=20, max_tunnel_bytes=5_000_000, deadline_s=3600)
+                max_calls=20, max_tunnel_bytes=5_000_000, deadline_s=3600, brief_digest=line["facts"]["brief_digest"])
     assert e.value.name == "attempt-closed"
 
 
@@ -1086,8 +1106,8 @@ def test_r3_4_a_standing_mint_refusal_still_holds_the_key(tmp_path):
 
 def test_r3_4_a_retake_is_exclusive(tmp_path):
     idx = L.SessionIndex(tmp_path / "idx")
-    idx.create(KEY, "refused", reason="mint:locked", reason_class="transient")
-    retake = L.RealLauncher._retakable
+    idx.create(KEY, "refused", reason="mint:locked", reason_class="transient", occurrence_id="occ-1")
+    retake = lambda rec: L.RealLauncher._retakable(rec, "occ-1")  # noqa: E731
     assert idx.claim(KEY, "pending", retake, n=1) is True
     assert idx.claim(KEY, "pending", retake, n=2) is False         # the record is now pending: not retakable
     assert idx.get(KEY)["n"] == 1

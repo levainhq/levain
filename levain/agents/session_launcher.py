@@ -66,12 +66,14 @@ from levain.agents import controller as _ctl
 from levain.agents.accounting import StopResult, Usage
 from levain.agents.session import S1_DISPATCH, SessionLaunch
 from levain.slot import Refused, write_all
+from levain.slot import stage
 from levain.slot import tickets as T
 from levain.slot.records import RETAINED
 from levain.slot.runtime_grammar import _MODEL_RE as _RENDER_MODEL_RE
 
 __all__ = ["VENDOR", "HOOKS", "LauncherRefused", "ControlPort", "SlotStart", "SlotHandle", "SlotRuntime",
-           "UsageSources", "SessionIndex", "RealLauncher", "HeldChild", "teardown_proves", "end_by_teardown"]
+           "UsageSources", "SessionIndex", "RealLauncher", "HeldChild", "teardown_proves", "end_by_teardown",
+           "stage_brief_for"]
 
 _log = logging.getLogger("levain.agents.session_launcher")
 
@@ -154,13 +156,15 @@ class ControlPort(Protocol):
 @dataclass(frozen=True)
 class SlotStart:
     """What the slot runtime is asked to start: the minted ``ticket`` (a bearer capability, handed over here and kept
-    nowhere else), the run it belongs to, the recorded session key, the harness, model and brief, and the fence hooks."""
+    nowhere else), the run it belongs to, the recorded session key, the harness, model and brief, the digest of the
+    brief's exact bytes (the value the ticket was minted with: computed once, before the mint), and the fence hooks."""
     ticket: str
     run_id: str
     session_key: str
     harness: str
     model: str
     brief: str
+    brief_digest: str
     hooks: tuple[str, ...]
 
 
@@ -177,11 +181,38 @@ class SlotRuntime(Protocol):
     """The credential slot's start and S1 END. ``start`` is failure-atomic like the launcher's ``spawn``: one that
     raises has left no S1 session live. ``end(session)`` answers exactly True only when the helper's teardown answer
     proves the slot uid's group gone, and False otherwise: an adapter implements it as :func:`end_by_teardown` over
-    the helper's teardown call. The launcher counts nothing but ``True`` itself as proof (:func:`_end_proven`)."""
+    the helper's teardown call. The launcher counts nothing but ``True`` itself as proof (:func:`_end_proven`).
+
+    What the production adapter owes the brief channel (p71 S8; the launcher cannot enforce these, it states them):
+
+    1. ``start`` writes ``req.brief`` into its lease-peer staging dir with :func:`stage_brief_for` AFTER the helper's
+       ``prepare`` and BEFORE ``render``, and raises (failure-atomically, as ``start`` already must) when the written
+       bytes' digest is not ``req.brief_digest``.
+    2. The gated child's ``returncode`` is the runtime helper's PROCESS EXIT STATUS through sudo (0: the vendor exited
+       0; 2: ``EXIT_VENDOR``, the vendor failed; 1: a helper refusal; 70: internal), never a value parsed from the
+       helper's stdout.
+    3. The child's stdout is drained and discarded (bounded) and never parsed: a slot process can write lines shaped
+       like the helper's answer.
+    4. The ticket is never written down."""
 
     def start(self, req: SlotStart) -> SlotHandle: ...
 
     def end(self, session: str) -> bool: ...
+
+
+def stage_brief_for(req: SlotStart, staging_dir: "str | os.PathLike[str]") -> None:
+    """The reference for obligation (1) of :class:`SlotRuntime`: write ``req.brief`` to ``staging_dir/brief.md`` with
+    :func:`levain.slot.stage.write_brief` and check the digest it answers is the one the ticket was minted with. A
+    mismatch removes the file this call wrote and raises ``LauncherRefused("brief-digest-drift")``; the detail carries
+    digests only. An invalid brief or an existing ``brief.md`` raises the stage primitive's own
+    :class:`levain.slot.Refused` (``brief-invalid``, ``staging-dest-exists``) and leaves any existing file as it was."""
+    got = stage.write_brief(staging_dir, req.brief)
+    if got != req.brief_digest:
+        try:
+            os.unlink(os.path.join(os.fspath(staging_dir), stage.BRIEF_NAME))
+        except FileNotFoundError:
+            pass
+        raise LauncherRefused("brief-digest-drift", f"staged {got}, ticket {req.brief_digest}")
 
 
 @runtime_checkable
@@ -495,15 +526,16 @@ class RealLauncher:
         # never as nothing), and creating it is the existence check: a key already held is refused before any mint.
         # The one record a spawn may take over is a TRANSIENT mint refusal's: a refused mint journals nothing, so the
         # same attempt id may mint again (test_r3_4_a_refused_mint_journals_nothing_..., against the real handler)
-        if not self.index.claim(key, "pending", self._retakable, occurrence_id=launch.occurrence_id,
-                                created_s=self.clock()):
+        if not self.index.claim(key, "pending", lambda rec: self._retakable(rec, launch.occurrence_id),
+                                occurrence_id=launch.occurrence_id, created_s=self.clock()):
             raise LauncherRefused("session-key-already-used", f"the index already holds state {self._existing(key)!r}")
         # AUTHORITY: whoever builds a launcher can mint for any occurrence_id and caps; run_session is the guard,
         # with CONTROL's ceiling behind it
         ticket, run_id = self._mint(key, facts)
         try:
             self.index.put(key, "minted", occurrence_id=launch.occurrence_id, run_id=run_id, created_s=self.clock())
-            handle = self.runtime.start(SlotStart(ticket, run_id, key, launch.harness, launch.model, launch.brief, HOOKS))
+            handle = self.runtime.start(SlotStart(ticket, run_id, key, launch.harness, launch.model, launch.brief,
+                                                   str(facts["brief_digest"]), HOOKS))
         except Exception as exc:
             held = self._undo(key, ticket, run_id, launch.occurrence_id)
             if held is None:
@@ -536,9 +568,11 @@ class RealLauncher:
                          lambda: self._ended_on_record(key))
 
     @staticmethod
-    def _retakable(rec: Mapping[str, Any]) -> bool:
-        """A record a new spawn of its key may replace: a mint CONTROL refused for a transient reason."""
-        return rec.get("state") == "refused" and rec.get("reason_class") == "transient"
+    def _retakable(rec: Mapping[str, Any], occurrence_id: str) -> bool:
+        """A record a new spawn of its key may replace: a mint CONTROL refused for a transient reason, for THIS
+        occurrence (a record that names no occurrence, or another, is not retaken)."""
+        return rec.get("state") == "refused" and rec.get("reason_class") == "transient" \
+            and rec.get("occurrence_id") == occurrence_id
 
     def _refuse_before_allocating(self, launch: SessionLaunch) -> None:
         why = None
@@ -559,10 +593,26 @@ class RealLauncher:
             why = ("exposure-unit-not-tool-calls", str(launch.exposure.unit))
         elif launch.exposure.tunnel_bytes is None:
             why = ("no-tunnel-byte-cap", "a passthrough ticket carries a byte cap")
+        else:
+            why = self._brief_problem(launch.brief)
         if why is None:
             return
         self._tombstone(launch.session_key, "refused", why[0], new=True)
         raise LauncherRefused(*why)
+
+    @staticmethod
+    def _brief_problem(brief: object) -> tuple[str, str] | None:
+        """The reason a brief cannot be staged, or None. Details name the problem, never the text."""
+        if type(brief) is not str:
+            return ("brief-invalid", "not text")
+        try:
+            data = stage.brief_bytes(brief)
+            stage.validate_brief(data)
+        except Refused as exc:
+            return ("brief-invalid", exc.detail)
+        if len(data) > stage.BRIEF_CAP:
+            return ("brief-cap", f"{len(data)} bytes, the cap is {stage.BRIEF_CAP}")
+        return None
 
     def _tombstone(self, key: str, state: str, reason: str, *, new: bool = False, **extra: Any) -> None:
         """A zero-usage record. ``new``: only where the key holds no record (a refusal of a key some other spawn
@@ -592,6 +642,7 @@ class RealLauncher:
             "attempt_id": launch.session_key, "job_id": launch.occurrence_id, "run_index": 0,
             "contract_digest": f"sha256:{digest}", "kind": "executor", "egress_routes": [],
             "reserved_microdollars": 0, "auth": self.auth, "vendor": VENDOR, "model_requested": launch.model,
+            "brief_digest": stage.brief_digest(stage.brief_bytes(launch.brief)),
             "max_calls": exp.actions, "max_tunnel_bytes": exp.tunnel_bytes, "deadline_s": exp.seconds}
         try:
             T.check_attempt_id(fields["attempt_id"])
@@ -610,7 +661,7 @@ class RealLauncher:
             # index says pending: usage reads the caps until a stop proves otherwise)
             cls = _reason_class(exc.name)
             if exc.name != "control-down":
-                self._tombstone(key, "refused", f"mint:{exc.name}", reason_class=cls)
+                self._tombstone(key, "refused", f"mint:{exc.name}", reason_class=cls, occurrence_id=fields["job_id"])
             raise LauncherRefused(f"mint-refused:{exc.name}", exc.detail, reason_class=cls) from None
         except Exception as exc:  # noqa: BLE001 - not a CONTROL answer: it may have minted, so the record stays pending
             raise LauncherRefused("mint-failed", f"{type(exc).__name__}; the record is left pending",
