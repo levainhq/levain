@@ -327,7 +327,7 @@ def test_the_renewals_run_before_the_coordinator_directory_is_read(rig, monkeypa
     order: list = []
     real = supervise.Supervisor.reap
     monkeypatch.setattr(supervise.Supervisor, "reap", lambda self, *a, **k: (order.append("reap"), real(self, *a, **k))[1])
-    monkeypatch.setattr(T, "_install_coord_dir", lambda st: (order.append("coord"), None)[1])
+    monkeypatch.setattr(T, "_install_coord_dir", lambda st, notes: (order.append("coord"), None)[1])
     assert T.run_tick(rig.store, clock=rig.now, authority=rig.authority, launcher_of=lambda: None) == T.EXIT_OK
     assert order[0] == "reap"
 
@@ -432,3 +432,112 @@ def test_the_default_store_finds_the_default_coordinator_queue(rig, monkeypatch,
     (q / "dispatch.db").write_bytes(b"")
     assert T._coord_dir_for(rig.store, None) == q
     assert T._coord_dir_for(rig.store, tmp_path / "given") == tmp_path / "given"
+
+
+# --- L3 r2 fix round -----------------------------------------------------------------------------------------------
+
+def test_a_refused_install_does_not_renew_a_row_it_cannot_stop(rig, monkeypatch, capsys):  # noqa: F811
+    """codex HIGH :415 (r2): with no install files the production launcher cannot be built (it reads the same refused
+    install), so the session row could be renewed every tick and never stopped. Such a row is NOT renewed: its lease
+    lapses to takeover, as it did when the tick refused before reaping, and the tick names it."""
+    oid, _key = _session_row(rig)
+    renewed = []
+    real = supervise.Supervisor._renew
+    monkeypatch.setattr(supervise.Supervisor, "_renew",
+                        lambda self, row, grace: (renewed.append(row["occurrence_id"]), real(self, row, grace))[1])
+    clock = Clock(rig)
+    clock.advance(60)
+    code = T.run_tick(rig.store, clock=clock)          # production launcher_of and authority; no install files
+    assert code == T.EXIT_REFUSED
+    assert renewed == []
+    err = capsys.readouterr().err
+    assert "not renewed" in err and oid in err and "lapse" in err
+    assert "can be renewed but never" not in err      # exit 4's sentence does not describe a row that was not renewed
+
+
+def test_the_soft_bound_still_names_unlaunchable_rows(rig, monkeypatch, capsys):  # noqa: F811
+    """deepseek MED 2 / complement C (r2): a pass the graceful bound ended after its reaper met session rows with no
+    launcher still names them (exit 3 is kept: the pass did not finish)."""
+    from levain.agents import session_wire as W
+    W.write_install(rig.store.directory, cockpit_root=rig.world.root, launcher=None)
+    oid, _key = _session_row(rig)
+
+    def slow_tick(st, clock, binding_of, session_alive, launch_over, reaper):
+        reaper()
+        time.sleep(10)
+    monkeypatch.setattr(ctl, "tick", slow_tick)
+    clock = Clock(rig)
+    clock.advance(60)
+    code = T.run_tick(rig.store, clock=clock, authority=rig.authority, soft_s=3.0, hard_s=9.0)
+    assert code == T.EXIT_SOFT_TIMEOUT
+    err = capsys.readouterr().err
+    assert "graceful bound" in err and "no session launcher" in err and oid in err
+
+
+def test_the_soft_bound_is_not_swallowed_by_the_refused_branch(rig, monkeypatch):  # noqa: F811
+    """complement MED (r2): the refused branch wraps the reaper in `except Exception`; TurnTimeout derives from
+    BaseException, so the graceful bound passes through it (exit 3, never a reaper_error exit 2)."""
+    from levain.firing.deadline import TurnTimeout
+    assert issubclass(TurnTimeout, BaseException) and not issubclass(TurnTimeout, Exception)
+
+    def timed_out(self, *a, **k):
+        raise TurnTimeout(T.TICK_SOFT_BOUND_S)
+    monkeypatch.setattr(supervise.Supervisor, "reap", timed_out)
+    assert T.run_tick(rig.store, clock=rig.now, launcher_of=lambda: FakeSessionClient()) == T.EXIT_SOFT_TIMEOUT
+
+
+def test_an_unreadable_dream_install_is_named_not_read_as_absent(rig, capsys):  # noqa: F811
+    """deepseek MED 3 (r2): a dream install that exists but cannot be read is named as such when the probes need it,
+    instead of the tick saying only "no coordinator directory"."""
+    from levain.agents import slots
+    from levain.dream import agent as DA
+    (rig.store.directory / DA.INSTALL_FILE).write_text("{not json")
+    with rig.store.write() as c:
+        c.execute("INSERT INTO agent_slots (slot, owner_kind, owner_id, taken_at, expires_at) VALUES (1, ?, 'ln-1', ?, ?)",
+                  (slots.LAUNCH, "2026-01-01T00:00:00Z", "2026-01-01T00:15:00Z"))
+    assert T.run_tick(rig.store, clock=rig.now, authority=rig.authority, launcher_of=lambda: None) == T.EXIT_OK
+    err = capsys.readouterr().err
+    assert "dream install" in err and "cannot be read" in err
+    with rig.store.read() as c:
+        assert c.execute("SELECT owner_id FROM agent_slots").fetchall() == [("ln-1",)]
+
+
+def test_the_real_reap_stops_rows_in_the_rotated_order(rig, monkeypatch):  # noqa: F811
+    """UNSETTLED (i), r2: Supervisor.reap's stop loop is a STABLE sort on (deferred, withheld); with neither (a fresh
+    supervisor, no proven-dead fire) it keeps the order `_RotatingSupervisor._launched` returns. Driven through the real
+    reap, a fake executor recording the order."""
+    n = 5
+    rows = [{"occurrence_id": f"oc-{i:03d}", "agent_id": "ag-x", "run_id": None, "state": "launched", "epoch": 1,
+             "launch_epoch": 1, "link_id": None, "link_incarnation": None, "spec_hash": "sha256:none",
+             "binding_id": BINDING, "launched_at": f"2026-11-04T00:00:{i:02d}Z", "session_key": f"s-{i:016x}",
+             "pid": None} for i in range(n)]
+    clock = Clock(rig)
+    asked: list = []
+    monkeypatch.setattr(supervise.Supervisor, "_launched", lambda self: [dict(r) for r in rows])
+    monkeypatch.setattr(supervise.Supervisor, "_renew", lambda self, row, grace: True)
+    monkeypatch.setattr(supervise.Supervisor, "_past_stop_at", lambda self, row, now: True)
+    monkeypatch.setattr(supervise.Supervisor, "refresh_once", lambda self: False)
+    monkeypatch.setattr(T, "executor_of_factory",
+                        lambda store, **kw: (lambda row: _UnprovenStop(row["occurrence_id"], clock, asked)))
+    for _tick in range(n):
+        asked.clear()
+        k = (int(clock().timestamp()) // T.TICK_INTERVAL_S) % n
+        T.run_tick(rig.store, clock=clock, authority=rig.authority, launcher_of=lambda: None)
+        ids = [r["occurrence_id"] for r in rows]
+        assert asked == ids[k:] + ids[:k]
+        clock.advance(T.TICK_INTERVAL_S)
+
+
+def test_an_expired_newest_link_does_not_disarm_a_live_older_one(rig):  # noqa: F811
+    """UNSETTLED (iii), r2: `AgentAuthority.peek` answers (False, incarnation) for a link that is merely not live
+    (expired); it raises only when the cover moved. So an expired newest link is skipped and the older live one arms."""
+    from datetime import timedelta
+    from tests.test_authority_agent_link import link as link_record
+    rig.link()                                                     # older, 29 days
+    rig.n += 1
+    rig.world.link({"op": "create_grant", "grant": link_record(
+        rig.world, rig.n, agent=rig.agent, store=rig.sid, spec_hash=rig.spec_hash,
+        binding_id="bind-fedcba9876543210", days=1)}, "laptop")    # newest, 1 day
+    assert T.binding_of_factory(rig.store, rig.authority, rig.now)(rig.agent, rig.spec_hash) == "bind-fedcba9876543210"
+    later = lambda: rig.now(timedelta(days=2))  # noqa: E731
+    assert T.binding_of_factory(rig.store, rig.authority, later)(rig.agent, rig.spec_hash) == BINDING

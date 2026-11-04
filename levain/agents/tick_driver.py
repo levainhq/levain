@@ -17,13 +17,20 @@ THE BOUND, as arithmetic (a test pins it from these constants, never from a rest
   :data:`WORST_RENEW_GAP_S` = ``TICK_INTERVAL_S + TICK_HARD_BOUND_S + TICK_PRE_RENEW_BOUND_S`` = 720 s, under the
   900 s lease (``controller.LEASE_S``). A dead-fire session row whose renewal is withheld until its own stop answers
   (P7-1 S3) is outside this sum by design: it may lapse to takeover.
-* an install that names no usable cockpit still renews: the tick runs the reaper alone (no authority: nothing is
-  classified STALE, rows past ``stop_at`` are still stopped), claims nothing, and exits :data:`EXIT_REFUSED`.
+* inside the reaper, a session row's dead-fire probe (P7-1 S3) runs just before that row's renewal (on a refused
+  install, so does every row's executor build), so a slow probe delays the renewals after it; the authority replay
+  runs after every renewal. That in-reap time is not in the sum.
+* an install that names no usable cockpit runs the reaper alone (no authority: nothing is classified STALE, rows past
+  ``stop_at`` are still stopped) over ONLY the rows this process has an executor to stop; a row it could not stop is
+  not renewed (renewing it would keep it launched with nothing able to end it), so its lease lapses to takeover, and
+  the tick names it. It claims nothing and exits :data:`EXIT_REFUSED`.
 
 STARVATION: the supervisor's "deferred rows first" memory is process-local and this process lives for one pass, so the
 tick rotates the launched rows' order by the tick's minute instead (:class:`_RotatingSupervisor`: the row at
 ``minute % len(rows)`` leads), so when the stop budget runs out no fixed set of rows leads every pass; with a tick
-every minute each row leads once in ``len(rows)`` minutes. Nothing new is stored.
+every minute and a stable row set each row leads once in ``len(rows)`` minutes. ``Supervisor.reap`` keeps that order
+within its stable partition (proven-dead-fire rows first), so rows outside that group can still wait while that group
+alone fills the stop budget. Nothing new is stored.
 
 A sleeping laptop coalesces missed launchd ticks, so leases lapse during sleep and the first tick on wake runs lapse
 recovery (``takeover``). That is designed behaviour, not an alarm.
@@ -61,9 +68,10 @@ TICK_SOFT_BOUND_S = 540
 TICK_PRE_RENEW_BOUND_S = 60
 #: the worst gap between two renewals of one non-withheld row (the invariant the lease needs to exceed).
 WORST_RENEW_GAP_S = TICK_INTERVAL_S + TICK_HARD_BOUND_S + TICK_PRE_RENEW_BOUND_S
-#: exit codes: 0 a pass ran; 1 refused (store, install: with an install refusal the renewals still ran, the claims did
-#: not); 2 the reaper raised; 3 the graceful bound fired; 4 a launched session row had no session launcher to END it
-#: (none is registered in this process: the run server's wiring, S10b); 70 the watchdog took the process.
+#: exit codes: 0 a pass ran; 1 refused (store, install: with an install refusal the renewals of rows it could stop
+#: still ran, the claims did not); 2 the reaper raised; 3 the graceful bound fired; 4 a launched session row was renewed
+#: with no session launcher to END it (none is registered in this process: the run server's wiring, S10b); 70 the
+#: watchdog took the process.
 EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_NO_LAUNCHER, EXIT_HARD_TIMEOUT = 0, 1, 2, 3, 4, 70
 
 __all__ = ["TICK_INTERVAL_S", "TICK_HARD_BOUND_S", "TICK_SOFT_BOUND_S", "TICK_PRE_RENEW_BOUND_S", "WORST_RENEW_GAP_S",
@@ -269,23 +277,27 @@ def _cockpit_root(store: AgentStore) -> Path:
     return root
 
 
-def _install_coord_dir(store: AgentStore) -> Path | None:
+def _install_coord_dir(store: AgentStore, notes: list[str]) -> Path | None:
     """The coordinator queue directory the dream install names (its dispatch.db feeds the slot-lease probes), else
-    None (no dream install, or one that cannot be read: the caller names the absence)."""
+    None. No install file is a plain None; a file that exists but cannot be read (refused, corrupt, unreadable) is
+    also None, and its cause goes in ``notes`` so the tick never reports it as merely absent."""
     from levain.dream import agent as _da
     try:
+        if not (Path(store.directory) / _da.INSTALL_FILE).exists():
+            return None
         return _da.read_install(store.directory).coord_dir
-    except Exception:  # noqa: BLE001 - InstallRefused, or a read that failed some other way: no directory named
+    except Exception as exc:  # noqa: BLE001 - named, never read as "no install"
+        notes.append(f"the dream install cannot be read for its coordinator directory ({type(exc).__name__}: {exc})")
         return None
 
 
-def _coord_dir_for(store: AgentStore, given: Path | str | None) -> Path | None:
+def _coord_dir_for(store: AgentStore, given: Path | str | None, notes: list[str] | None = None) -> Path | None:
     """The coordinator directory for the probes: ``--coord-dir``, else the dream install's, else, for the DEFAULT
     agent store only, the default consent queue (``<levain home>/consent``, where the coordinator keeps
     ``dispatch.db``) when a ``dispatch.db`` is there. None when none of these names one."""
     if given is not None:
         return Path(given)
-    found = _install_coord_dir(store)
+    found = _install_coord_dir(store, notes if notes is not None else [])
     if found is not None:
         return found
     from levain.autonomic.db import default_store_dir
@@ -308,7 +320,7 @@ def _lazy_probes(store: AgentStore, given: Path | str | None, notes: list[str]) 
 
     def probes() -> tuple | None:
         if not cell:
-            where = _coord_dir_for(store, given)
+            where = _coord_dir_for(store, given, notes)
             if where is None:
                 notes.append("an expired coordinator launch slot cannot be probed: no coordinator directory (pass "
                              "--coord-dir, or install the dream, which names one); the slot is kept")
@@ -334,12 +346,15 @@ class _RotatingSupervisor(_sup.Supervisor):
     lives one pass loses; the rotation is the stateless stand-in: the stop order starts at a different row each minute,
     so no row stays behind rows that keep using the budget up. Renewals happen in the same rotated order."""
 
-    def __init__(self, *args: Any, rotation: int, **kw: Any) -> None:
+    def __init__(self, *args: Any, rotation: int, keep: Callable[[dict], bool] | None = None, **kw: Any) -> None:
         super().__init__(*args, **kw)
         self._rotation = rotation
+        self._keep = keep       # a row it rejects is neither renewed nor stopped this pass (the refused-install tick)
 
     def _launched(self) -> list[dict]:
         rows = super()._launched()
+        if self._keep is not None:
+            rows = [r for r in rows if self._keep(r)]
         if not rows:
             return rows
         k = self._rotation % len(rows)
@@ -398,11 +413,22 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
             except (_wire.InstallRefused, _da.InstallRefused, OSError) as exc:
                 refusal, auth = exc, _NoAuthority(exc)
         attention, resolve = attention_sink(stream)
-        sup = _RotatingSupervisor(st, authority=auth, clock=clock,
-                                  rotation=int(started.timestamp()) // TICK_INTERVAL_S)
         executor_of = executor_of_factory(st, launcher_of=launcher_of or session_launcher_of(st),
                                           dream_executor_of=dream_of or dream_executor_of(st))
         seen["executor_of"] = executor_of
+        unstoppable: list[str] = []
+
+        def stoppable(row: dict) -> bool:
+            # the refused-install tick renews only a row it could stop: a renewal of a row nothing can stop would keep
+            # it launched forever, where an unrenewed lease lapses to takeover (the recovery the refusal had before)
+            if executor_of(row) is not None:
+                return True
+            unstoppable.append(row["occurrence_id"])
+            return False
+
+        sup = _RotatingSupervisor(st, authority=auth, clock=clock,
+                                  rotation=int(started.timestamp()) // TICK_INTERVAL_S,
+                                  keep=stoppable if refusal is not None else None)
 
         def reaper() -> Any:
             lag = (clock() - started).total_seconds()
@@ -413,14 +439,21 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
             return sup.reap(executor_of, attention=attention, resolve=resolve)
 
         if refusal is not None:
-            # the install names no usable cockpit: renew and stop what the store alone shows due; claim nothing
-            notes.append(f"{refusal}; the renewals ran, no window was claimed")
+            # the install names no usable cockpit: renew the rows this process could stop and stop what the store
+            # alone shows due; leave every other row's lease to lapse; claim nothing
+            notes.append(f"{refusal}; the renewals of stoppable rows ran, no window was claimed")
             seen["refused"] = True
             try:
-                reaper()
+                reaper()            # TurnTimeout is a BaseException: the graceful bound passes through this handler
             except Exception as exc:  # noqa: BLE001
                 _log.warning("agent tick: the reaper raised %s: %s", type(exc).__name__, exc)
                 seen["reaper_error"] = type(exc).__name__
+            finally:                # named on the graceful bound too
+                if unstoppable:
+                    why = dict(executor_of.no_launcher).get(unstoppable[0], "no executor could be built for it")
+                    notes.append(f"{len(unstoppable)} launched row(s) have no executor that could stop them while "
+                                 f"the install is refused ({why}; first: {unstoppable[0]}): they were not renewed, "
+                                 "and their leases lapse to takeover")
             return None
         session_alive, launch_over = _lazy_probes(st, coord_dir, notes)
         return _ctl.tick(st, clock, binding_of_factory(st, auth, clock), session_alive, launch_over, reaper=reaper)
@@ -428,20 +461,25 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
     def say(text: str) -> None:
         print(f"levain agents tick: {text}", file=stream or sys.stderr, flush=True)
 
+    def report() -> list:
+        """Every note, then the renewed-but-never-ENDed rows (exit 4's case). A refused-install tick renews no row it
+        cannot stop (its own note names them), so there exit 4's case cannot arise and 1 never hides a 4."""
+        for note in notes:
+            say(note)
+        rows = [] if seen.get("refused") else list(getattr(seen.get("executor_of"), "no_launcher", []))
+        if rows:
+            say(f"{len(rows)} launched session row(s) have no session launcher, so they can be renewed but never "
+                f"ENDed ({rows[0][1]}; first: {rows[0][0]}). No launcher is registered in this process until the run "
+                "server's launcher is wired (S10b).")
+        return rows
+
     try:
         out = bounded(work, soft_s=soft_s, hard_s=hard_s, stream=stream)
     except TurnTimeout:
-        for note in notes:
-            say(note)
+        report()
         say(f"the graceful bound ({soft_s:.0f}s) fired; the next tick resumes.")
         return EXIT_SOFT_TIMEOUT
-    for note in notes:
-        say(note)
-    unlaunchable = getattr(seen.get("executor_of"), "no_launcher", [])
-    if unlaunchable:
-        say(f"{len(unlaunchable)} launched session row(s) have no session launcher, so they can be renewed but never "
-            f"ENDed ({unlaunchable[0][1]}; first: {unlaunchable[0][0]}). No launcher is registered in this process "
-            "until the run server's launcher is wired (S10b).")
+    unlaunchable = report()
     error = seen.get("reaper_error") or getattr(out, "reaper_error", None)
     if error:
         say(f"the reaper raised {error}; the pass is not clean.")
