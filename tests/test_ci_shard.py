@@ -208,8 +208,34 @@ def test_measure_turns_progress_timestamps_into_per_file_seconds():
     out = shard.measure(NODES2, 1, [(REAL, 0)], NONE, run="9", sha="abc", root=GONE)
     assert out["files"] == {"tests/a.py": 2.0, "tests/b.py": 8.0}
     assert out["measured_from"]["run"] == "9" and out["per_test"] == 2.5
-    with pytest.raises(AssertionError, match="log shows"):
+    with pytest.raises(ValueError, match="log shows"):
         shard.measure(NODES2 + "tests/c.py::t\n" * 50, 1, [(REAL, 0)], NONE, root=GONE)
+
+
+def test_the_count_guard_is_a_real_raise_not_an_assert():
+    import ast
+    tree = ast.parse(_SHARD.read_text(encoding="utf-8"))
+    measure = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "measure")
+    assert not [n for n in ast.walk(measure) if isinstance(n, ast.Assert)]     # python -O elides asserts
+
+
+def test_a_chunk_with_an_empty_rounded_range_keeps_its_seconds():
+    nodes = "tests/a.py::t\n" * 50 + "tests/b.py::t\n" * 50
+    log = _log("2026-11-04T02:00:00.0Z start", "2026-11-04T02:00:05.0Z " + "." * 50 + "    [ 50%]",
+               "2026-11-04T02:00:07.0Z .    [ 51%]", "2026-11-04T02:00:10.0Z " + "." * 50 + "    [100%]")
+    out = shard.measure(nodes, 1, [(log, 0)], NONE, root=GONE)["files"]
+    assert round(sum(out.values()), 1) == 10.0, out
+
+
+@pytest.mark.parametrize("body", ['{"files": {"a.py": NaN}, "per_test": 1}', '{"files": {"a.py": Infinity}, "per_test": 1}',
+                                  '{"files": {"a.py": 1}, "per_test": NaN}', '{"files": {"a.py": 1}, "per_test": Infinity}',
+                                  '{"files": {"a.py": "x"}, "per_test": 1}', '{"files": {"a.py": null}, "per_test": 1}',
+                                  '{"files": {"a.py": 1}, "per_test": "x"}'])
+def test_non_finite_or_non_numeric_weights_fail_naming_the_path(tmp_path, body):
+    bad = tmp_path / "w.json"
+    bad.write_text(body)
+    with pytest.raises(ValueError, match="w.json"):
+        shard.load_weights(bad)
 
 
 def test_measure_rebuilds_the_plan_with_the_weights_the_run_used():

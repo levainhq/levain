@@ -27,7 +27,9 @@ successful `test` run on main:
     gh api repos/levainhq/levain/actions/jobs/<pytest job id>/logs > shard<K>.log     (EVERY shard job of one Python)
     git show <sha>:tests/ci/shard_weights.json > plan_weights.json     (the weights that run planned with; skip if none)
     python tests/ci/shard.py weights --nodes nodes.txt --shards N --plan-weights plan_weights.json|none --run <run id> \
-        --sha <sha> --root <checkout of <sha>> --log 0:shard0.log --log 1:shard1.log ...  > tests/ci/shard_weights.json
+        --sha <sha> --root <checkout of <sha>> --log 0:shard0.log --log 1:shard1.log ...  > /tmp/shard_weights.new \
+        && mv /tmp/shard_weights.new tests/ci/shard_weights.json
+(never redirect straight onto the committed file: a refusal would truncate it first and break every later plan.)
 `nodes.txt` is `pytest --collect-only -q` at that sha under that Python, and `N` the TEST_SHARDS the run used. The log-to-
 file pairing needs the run's own plan, which is planned from the files on disk (`--root`, a checkout of that sha) and the
 weights file the run's checkout held: `--plan-weights` names it (`none` when that sha had no shard_weights.json), and it is
@@ -36,6 +38,7 @@ smeared over each chunk's tests, so the figure is a balance proxy, not a profile
 changing TEST_SHARDS.
 """
 import json
+import math
 import os
 import re
 import sys
@@ -69,10 +72,15 @@ def load_weights(path=WEIGHTS):
     except FileNotFoundError:
         return {}, 1.0
     data = json.loads(text)
-    files, per_test = data["files"], float(data["per_test"])
-    if not isinstance(files, dict) or per_test <= 0:
+    files, per_test = data["files"], data["per_test"]
+    if not isinstance(files, dict):
         raise ValueError(f"{path}: needs a files object and a positive per_test")
-    return {str(k): float(v) for k, v in files.items()}, per_test
+    for v in [per_test, *files.values()]:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            raise ValueError(f"{path}: weights must be finite numbers, got {v!r}")
+    if per_test <= 0:
+        raise ValueError(f"{path}: needs a files object and a positive per_test")
+    return {str(k): float(v) for k, v in files.items()}, float(per_test)
 
 
 def weight(rel_path, root=ROOT, weights=None):
@@ -190,13 +198,17 @@ def measure(nodes_text, n, logs, plan_weights, run="", sha="", root=ROOT):
         seq = [f for f in shards[k] for _ in range(count[f])]
         chunks = _chunks(text, k)
         done = sum(c for c, _ in chunks)
-        assert done and abs(done - len(seq)) <= 0.02 * len(seq), f"shard {k}: log shows {done} tests, plan has {len(seq)}"
+        if not (done and abs(done - len(seq)) <= 0.02 * len(seq)):
+            raise ValueError(f"shard {k}: log shows {done} tests, plan has {len(seq)}")
         got, scale, cum = defaultdict(float), len(seq) / done, 0
         for c, dt in chunks:
             a, b = round(cum * scale), round((cum + c) * scale)
             cum += c
-            for f in seq[a:b]:
-                got[f] += dt / max(1, b - a)
+            if b > a:
+                for f in seq[a:b]:
+                    got[f] += dt / (b - a)
+            else:       # the chunk rounds to no tests: its seconds go to the nearest test, never dropped
+                got[seq[min(a, len(seq) - 1)]] += dt
         seconds.update(got)
     files = {f: round(v, 1) for f, v in sorted(seconds.items())}
     tests = sum(count[f] for f in files)
