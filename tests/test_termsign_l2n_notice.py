@@ -35,30 +35,35 @@ def test_text_from_a_free_text_entry_and_the_desk_prefix():
     assert ts.notice_text([_entry(text="hi")], channel="desk") == "Desk: Touch ID to sign: np-1 hi"
 
 
-def test_a_long_answer_is_cut_and_control_characters_flattened():
+def test_a_long_answer_is_cut_and_control_characters_marked():
     out = ts.notice_text([_entry(text="a" * 200)])
     assert out == "Touch ID to sign: np-1 " + "a" * 80
-    assert ts.notice_text([_entry(text="x\ny\x00z")]) == "Touch ID to sign: np-1 x y z"
+    assert ts.notice_text([_entry(text="x\ny\x00z")]) == "Touch ID to sign: np-1 x⟨U+000A⟩y⟨U+0000⟩z"
 
 
 def test_a_bidi_override_in_an_option_label_cannot_reorder_the_notice():
-    # U+202E RIGHT-TO-LEFT OVERRIDE would display "(a) approve" as "evorppa (a)"; U+2066/U+2069 an isolate pair
+    # U+202E RIGHT-TO-LEFT OVERRIDE would display "(a) approve" as "evorppa (a)"; U+2066/U+2069 an isolate pair.
+    # Each is shown as a marker, never dropped, so the notice can differ from the bytes only visibly.
     out = ts.notice_text([_entry(answer="(a) ‮approve‬ ⁦x⁩")])
-    assert out == "Touch ID to sign: np-1 (a) approve x"
+    assert out == "Touch ID to sign: np-1 (a) ⟨U+202E⟩approve⟨U+202C⟩ ⟨U+2066⟩x⟨U+2069⟩"
 
 
-def test_a_c1_control_and_zero_width_characters_in_an_option_label_are_not_shown():
+def test_a_c1_control_and_zero_width_characters_in_an_option_label_are_marked():
     out = ts.notice_text([_entry(answer="(b) de​ny\u0085all﻿\u009b2J")])
-    assert out == "Touch ID to sign: np-1 (b) deny all 2J"
-    assert all(0x20 <= ord(c) < 0x7f for c in out)
+    assert out == "Touch ID to sign: np-1 (b) de⟨U+200B⟩ny⟨U+0085⟩all⟨U+FEFF⟩⟨U+009B⟩2J"
 
 
-def test_the_signed_entry_keeps_the_row_words_the_notice_cleans():
-    label = "(a) ‮approve‬"
-    msg = ts.build_message(store="flow-needs-phill", install="i1", session="s1", view="1", typed="1a",
-                           entries=[_entry(answer=label)], nonce="0" * 16,
-                           at=ts.datetime(2026, 11, 3, tzinfo=ts.timezone.utc))
-    assert ts.parse_verified(msg).entries[0].answer == label
+def test_a_label_the_notice_would_mark_is_never_signed():
+    # the verifier binds the signed entry to its row by equality, so a label that does not show as itself is
+    # refused at build rather than signed under a notice that shows it otherwise
+    try:
+        ts.build_message(store="flow-needs-phill", install="i1", session="s1", view="1", typed="1a",
+                         entries=[_entry(answer="(a) ‮approve‬")], nonce="0" * 16,
+                         at=ts.datetime(2026, 11, 3, tzinfo=ts.timezone.utc))
+    except ts.MessageError as exc:
+        assert "U+202E" in str(exc)
+    else:
+        raise AssertionError("a bidi override in the answer was signed")
 
 
 def test_text_never_begins_with_a_dash():

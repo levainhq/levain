@@ -70,7 +70,6 @@ _AT = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 _AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _FP = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 _PRINCIPAL = re.compile(r"[A-Za-z0-9._-]{1,64}")
-_CTRL = re.compile(r"[\x00-\x1f\x7f\u2028\u2029]")
 
 
 class MessageError(ValueError):
@@ -99,13 +98,27 @@ class Entry:
     ruling: str | None = None
 
 
+def _hidden(value: str) -> str | None:
+    """The first character of ``value`` a person cannot see, named (``U+202E (RIGHT-TO-LEFT OVERRIDE) at character
+    3``), or ``None``. The one rule, :mod:`levain.unshowable`, the question store already holds every label and
+    question to when it is filed: every control (C0, DEL, C1, newline and tab included), every format character (bidi
+    embeddings, overrides and isolates, zero-width characters, U+FEFF), the line and paragraph separators, surrogates,
+    invisible spaces. Held here again, at build and at parse, so that a row which never passed filing (written before
+    that rule, or straight into the file) is refused rather than signed: the verifier binds an entry to its row by
+    equality, so the words signed must be the words shown."""
+    from levain import unshowable
+
+    return unshowable.describe(value)
+
+
 def _line(value: Any, what: str, *, limit: int = LINE_MAX) -> str:
     if not isinstance(value, str) or not value:
         raise MessageError(f"{what} is empty or not text")
-    if _CTRL.search(value):
-        raise MessageError(f"{what} holds a line break or control character")
     if len(value) > limit:
         raise MessageError(f"{what} is longer than {limit} characters")
+    hidden = _hidden(value)
+    if hidden is not None:
+        raise MessageError(f"{what} holds a character that does not show as itself: {hidden}")
     return value
 
 
@@ -194,7 +207,7 @@ def _field(lines: list[str], i: int, name: str, rx: re.Pattern[str] | None = Non
     if i >= len(lines) or not lines[i].startswith(f"{prefix}{name}: "):
         raise MessageError(f"line {i + 1}: {name!r} is missing or out of place")
     value = lines[i][len(prefix) + len(name) + 2:]
-    if not value or (rx is not None and rx.fullmatch(value) is None) or _CTRL.search(value):
+    if not value or (rx is not None and rx.fullmatch(value) is None) or _hidden(value) is not None:
         raise MessageError(f"line {i + 1}: {name!r} is not in its form")
     return value, i + 1
 
@@ -607,18 +620,14 @@ def notice_text(entries: Sequence[Entry], *, channel: str = "terminal") -> str:
 
 
 def _shown(value: Any) -> str:
-    """``value`` as the notice may display it: format characters (Unicode Cf: bidi embeddings, overrides and
-    isolates, zero-width characters, U+FEFF) removed, so an agent-filed label cannot reorder or hide what the
-    operator reads before he touches; control characters (Cc, C0 and C1) and line/paragraph separators become a
-    space; whitespace runs collapse. The display only: the signed entry keeps the row's words byte for byte,
-    because the verifier binds it to the row by equality."""
-    out = []
-    for ch in str(value):
-        cat = unicodedata.category(ch)
-        if cat == "Cf":
-            continue
-        out.append(" " if cat in ("Cc", "Zl", "Zp") else ch)
-    return " ".join("".join(out).split())
+    """``value`` as the notice may display it: every character :mod:`levain.unshowable` calls unshowable shown as a
+    visible ``⟨U+XXXX⟩`` marker (never dropped, so what he reads can only differ from the bytes visibly), and
+    whitespace runs collapsed. Every entry that reaches the notice has passed :func:`build_message`, which refuses
+    those characters, so on the signing path no marker is ever needed: the notice shows the signed words, with only
+    runs of whitespace collapsed (and the cut :func:`notice_text` makes)."""
+    from levain import unshowable
+
+    return " ".join(unshowable.mark(str(value), "⟨U+{:04X}⟩", allow="").split())
 
 
 def post_notice(text: str, *, runner: Callable[..., Any] = subprocess.Popen) -> Any:
