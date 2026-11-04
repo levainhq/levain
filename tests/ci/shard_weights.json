@@ -646,7 +646,6 @@
   "tests/test_pair_page.py": 9.7,
   "tests/test_passkey_answer.py": 1.6,
   "tests/test_passkey_custody_derived.py": 10.1,
-  "tests/test_phone_app.py": 0.6,
   "tests/test_phone_dispatch.py": 0.1,
   "tests/test_phone_redirect.py": 0.6,
   "tests/test_phone_sign.py": 0.3,

@@ -84,7 +84,7 @@
     color-scheme: dark;   /* native form chrome follows the theme: the light blocks below set light */
   }
 
-  /* THE THEME (F6): one token set, two themes. The tokens above are the dark set. Light is the phone's (phone.css), by system
+  /* THE THEME (F6): one token set, two themes. The tokens above are the dark set. Light follows the system
      preference unless the page's switch chose (html[data-theme]); every derived token recomputes from the three. */
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) {

@@ -107,15 +107,15 @@ def test_a_queue_or_card_that_cannot_be_read_is_its_own_note_and_never_an_empty_
 def test_no_phone_module_calls_the_stores_review_transitions_and_the_verb_kernel_is_plain_only() -> None:
     """The one review write on the phone port is ``coord_review`` (a paired device: c4mut,
     tests/test_review_clear_paths.py), and it is only a transport: the clear and the reopen are the cockpit verb
-    kernel's (``levain.cockpit.verbs``, through ``PhoneApp.fire``: c4mut fix r1 F1). Neither the phone port, the phone
+    kernel's (``levain.cockpit.verbs``, c4mut fix r1 F1). Neither the phone port nor the
     app nor the coordinator routes' own module calls the store's transitions."""
     import inspect
 
-    from levain import phone_app, phone_server
+    from levain import phone_server
     from levain.cockpit import verbs
     from levain.coordinator import phone
 
-    for mod in (phone, phone_server, phone_app):
+    for mod in (phone, phone_server):
         src = Path(mod.__file__).read_text(encoding="utf-8")
         assert "clear_item" not in src and "reopen_item" not in src, mod.__name__
     assert "plain_only=True" in inspect.getsource(verbs._review_fire)

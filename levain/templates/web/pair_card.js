@@ -12,7 +12,7 @@
   const WRITE_TOKEN_KEY = "levain_write_token";   // MUST equal dashboard_boot.js WRITE_TOKEN_KEY
   const PAIRED_MARK_KEY = "levain_paired_device"; // MUST equal dashboard_boot.js PAIRED_MARK_KEY
   const TOKEN_HEADER = "X-Levain-Write-Token";
-  const OLD_PHONE_KEYS = ["levain-phone-token", "levain-device-token"];   // phone_app.js: sessionStorage and localStorage
+  const OLD_PHONE_KEYS = ["levain-phone-token", "levain-device-token"];   // the old phone page: sessionStorage and localStorage
   const SW_DB = "levain-sw-2";                    // MUST equal levain/webpush/static/sw.js (slice C): version 1, store "opened"
   const SW_STORE = "opened";
   const OPENED_MESSAGE = "levain-opened";
@@ -44,7 +44,7 @@
   }
 
   // ---- the claim --------------------------------------------------------------------------------------------------
-  // The phone port kept its token where phone_app.js put it; this origin now holds the cockpit, so those keys go, in both storages.
+  // The phone port kept its token where the old phone page put it; this origin now holds the cockpit, so those keys go, in both storages.
   function purgeOldPhoneKeys() {
     for (const name of ["sessionStorage", "localStorage"]) {
       try { for (const k of OLD_PHONE_KEYS) window[name].removeItem(k); } catch (_) { /* a blocked storage holds none */ }

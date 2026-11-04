@@ -217,36 +217,3 @@ def test_a_missing_item_at_the_write_is_404_on_the_cockpit(served, monkeypatch) 
     st, out = _fire(port, tok, "review_clear", row)
     assert (st, out.get("error")) == (404, "not_found"), out
     assert not store.directory.exists()
-
-
-# --- the phone: a transport into the phone app's one kernel write (F1), the version it drew (F2), the device asked
-# again (F3) -----------------------------------------------------------------------------------------------------
-
-from tests.test_phone_app import _raise_on_the_laptop, install  # noqa: E402,F401  (fixture)
-
-
-
-
-def _drawn(base: str, token: str, item_id: str) -> "str | None":
-    """The version the phone's queue drew for ``item_id`` (None when the listing carries none)."""
-    import json
-    import urllib.request
-
-    req = urllib.request.Request(base + "/coord.json", headers={"X-Levain-Phone-Token": token})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        rv = json.loads(r.read())["coord_review"]
-    return next(i.get("version") for i in rv["open"] + rv["cleared"] if i["item_id"] == item_id)
-
-
-def _body(version: "str | None") -> dict:
-    return {"version": version} if version is not None else {}
-
-
-
-
-
-
-
-
-
-
