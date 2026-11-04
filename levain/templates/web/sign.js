@@ -543,6 +543,7 @@
       const box = el("input", "sheet-write-in");
       box.type = "text";
       box.id = "sheet-write-in";
+      box.setAttribute("name", "writein");        // dash-free, like the Drop box (Safari AutoFill Contact, 11-04)
       box.maxLength = Number(wi.max) || 200;
       box.placeholder = "or write your own answer";
       controls.push(box);

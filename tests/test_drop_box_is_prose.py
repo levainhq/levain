@@ -49,3 +49,14 @@ def test_every_drop_textarea_has_a_dash_free_name():
         js = (WEB / fname).read_text()
         i = js.index(anchor)
         assert '["name", "dropwords"]' in js[i:i + 1500], fname
+
+
+def test_the_other_dashed_text_fields_of_the_drop_flow_have_dash_free_names():
+    """The sweep behind the Drop box fix (11-04): every free-text or identifier field whose id carries a dash and that is not a
+    contact field names itself without one. Left alone on purpose: the three type=number inputs on the phone page (drop-calls,
+    drop-tokens, drop-hours; numeric, untested) and the filter and pairing inputs (no id and no name at all)."""
+    assert 'name="droponto"' in re.search(r'<input[^>]*id="drop-onto"[^>]*>', (WEB / "phone.html").read_text(), re.S).group(0)
+    ef = (WEB / "envelope_form.js").read_text()
+    assert 'repo.setAttribute("name", "droprepo")' in ef[ef.index('repo.id = "drop-repo"'):][:400]
+    sj = (WEB / "sign.js").read_text()
+    assert 'box.setAttribute("name", "writein")' in sj[sj.index('box.id = "sheet-write-in"'):][:400]

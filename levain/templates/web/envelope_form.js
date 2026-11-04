@@ -157,6 +157,7 @@
     const gRepo = group("env-repo", "Where it may work", "The repo the coordinator may change. Nothing outside it.");
     const repo = el("input");           // the typed path: shown only for "Another folder…" (or when no folder is known)
     repo.id = "drop-repo";
+    repo.setAttribute("name", "droprepo");        // dash-free, like the Drop box (Safari AutoFill Contact, 11-04)
     repo.type = "text";
     repo.placeholder = "/Users/you/project";
     repo.setAttribute("aria-label", "the full path of a folder");
