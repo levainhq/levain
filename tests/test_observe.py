@@ -138,3 +138,17 @@ def test_event_log_is_bounded_by_rotation_and_refuses_a_symlink(tmp_path, monkey
     live.symlink_to(target)
     observe.record(tmp_path / "c.json", SECRET_EVENT)   # counts still written, the symlink never followed
     assert target.read_text() == "keep"
+
+
+def test_event_log_survives_a_fifo_swap_and_tightens_a_loose_file(tmp_path):
+    """L3 r1 (codex): a FIFO at the log path must not block the hook; a 0644 file made by hand ends 0600."""
+    import os
+    fifo = tmp_path / observe.EVENTS_NAME
+    os.mkfifo(fifo)
+    observe.append_event(tmp_path, SECRET_EVENT)   # lstat refuses a non-regular file: returns, never blocks
+    fifo.unlink()
+    log = tmp_path / observe.EVENTS_NAME
+    log.write_text("")
+    os.chmod(log, 0o644)
+    observe.append_event(tmp_path, SECRET_EVENT)
+    assert log.stat().st_mode & 0o777 == 0o600 and len(_events(tmp_path)) == 1

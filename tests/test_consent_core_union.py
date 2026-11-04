@@ -333,6 +333,23 @@ def test_missing_cockpit_root_refuses_the_hold_and_the_dialog_stands(tmp_path, c
     assert "not holding" in err and "no-such-cockpit" in err and err.count("\n") == 1
 
 
+def test_codex_refuses_a_hold_against_a_missing_cockpit_root_too(tmp_path, capsys):
+    """L3 r1 (complement, codex): Codex shows no dialog during a hold, so the same guard applies there."""
+    from levain.consent.adapters import codex
+    from tests._h4 import h4_env, h4_home
+    class CQ(Q):
+        def file(self, **kw):
+            return super().file(**{"event_id": None, **kw})
+
+    q = CQ("allow")
+    settings = codex.AdapterSettings(away_mode=True, away_marked=True, away_hold_seconds=20,
+                                     cockpit_data_root=str(tmp_path / "no-such-cockpit"))
+    codex.decide({**_event(), "session_id": "s-codex"}, q, settings, environ=h4_env(), home=h4_home(),
+                 idle=lambda: None)
+    assert "not holding" in capsys.readouterr().err
+    assert q.filed[0]["hold"].total_seconds() < 20   # filed for the minimum, never the 20 s hold
+
+
 def test_an_existing_cockpit_root_still_holds(tmp_path):
     root = tmp_path / "cockpit"
     root.mkdir()

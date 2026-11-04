@@ -119,8 +119,11 @@ def append_event(directory: Path, event: Any, now: datetime | None = None) -> No
             os.replace(log, Path(directory) / (EVENTS_NAME + ".1"))
     except FileNotFoundError:
         pass
-    fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):   # swapped for a FIFO or device after the lstat: write nothing
+            return
+        os.fchmod(fd, 0o600)   # a file made earlier by a restore or by hand is not left readable by others
         os.write(fd, line)
     finally:
         os.close(fd)
