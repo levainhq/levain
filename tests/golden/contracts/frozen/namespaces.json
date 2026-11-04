@@ -107,6 +107,11 @@
    "namespace": "levain-terminal-answer",
    "status": "shipped",
    "owner": "levain/consent/terminal_sign.py"
+  },
+  {
+   "namespace": "levain-desk-answer",
+   "status": "reserved",
+   "owner": "levain/consent/terminal_sign.py"
   }
  ],
  "families": [
