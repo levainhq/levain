@@ -1,5 +1,5 @@
 """CH-U1 slice 3: the thread view's collapsed tool lines (state kept across polls), the model read, the inert approval
-line and the composer dock's styles, through the real ``make_server`` beside a ChatService over a ScriptedSession."""
+line and the work thread's Stop styles, through the real ``make_server`` beside a ChatService over a ScriptedSession."""
 from __future__ import annotations
 
 import json
@@ -75,16 +75,18 @@ def test_no_model_list_or_choice_is_offered_by_the_body_or_the_page(qdir, clock)
     """The driver capabilities carry no model list and the service has no verb that sets a model: nothing is offered."""
     svc, _cs, world, _s = _tooled(qdir, clock)
     body = threads.thread_stream(qdir, world["thread"], svc)
-    assert "models" not in body and "models" not in json.dumps(body["composer"])
+    assert "models" not in body and "composer" not in body
     js = (CSS.parent / "thread_view.js").read_text()
     assert not re.search(r"createElement\(\"select\"|\"select\"", js)
 
 
-def test_the_dock_has_styles_for_every_control_it_draws():
+def test_the_work_thread_has_styles_for_every_control_it_draws_and_no_composer_styles_remain():
     css = CSS.read_text()
-    for cls in ("tv-dock", "tv-input", "tv-actions", "tv-send", "tv-stop", "tv-sendnote", "tv-toggle", "tv-peek", "tv-model"):
+    for cls in ("tv-dock", "tv-stop", "tv-sendnote", "tv-toggle", "tv-peek", "tv-model"):
         assert re.search(r"\.%s\b" % cls, css), cls
-    assert "var(--" in css and not re.search(r"\.tv-(send|stop|input)[^{]*\{[^}]*#[0-9a-fA-F]{3,6}\b", css)
+    for gone in ("tv-input", "tv-send", "tv-actions", "tv-composer", "tv-mark"):
+        assert not re.search(r"\.%s\b" % gone, css), gone          # the composer and the reconcile are the room's (.rv-*)
+    assert "var(--" in css and not re.search(r"\.tv-stop[^{]*\{[^}]*#[0-9a-fA-F]{3,6}\b", css)
 
 
 _FOLD = """(() => { const v = [...document.querySelectorAll('.tv-fold')];
@@ -97,10 +99,10 @@ def test_a_tool_run_draws_collapsed_opens_on_click_and_keeps_its_state_across_po
     svc, cs, world, s = _tooled(qdir, clock)
     _root, src, _ids = _install(tmp_path)
     boot = ('window.__tv = LevainThreadView.mount(document.getElementById("host"),'
-            ' {pollMs: 150, compose: true, headers: () => ({"X-Levain-Write-Token": "%s"})});' % TOKEN)
+            ' {pollMs: 150, headers: () => ({"X-Levain-Write-Token": "%s"})});' % TOKEN)
     extra = {"/tvc.html": ("text/html; charset=utf-8", _PAGE.encode()),
              "/tvc.js": ("text/javascript; charset=utf-8", boot.encode())}
-    with _serve(src, write_token=TOKEN, thread_chat=svc, extra_assets=extra) as (base, _h):
+    with _serve(src, write_token=TOKEN, chat_service=svc, extra_assets=extra) as (base, _h):
         out = _drive(tmp_path, base + "/tvc.html", [
             {"until": "document.querySelector('.tv-row')"},
             {"eval": "document.querySelector('.tv-row').click(); 1"},
@@ -117,7 +119,6 @@ def test_a_tool_run_draws_collapsed_opens_on_click_and_keeps_its_state_across_po
             {"eval": "document.querySelectorAll('select').length"},
             {"eval": "document.querySelectorAll('.tv-fold')[0].querySelector('.tv-toggle').click(); 1"},
             {"eval": _FOLD},
-            {"eval": "document.querySelector('.tv-input') !== null && getComputedStyle(document.querySelector('.tv-dock')).display"},
         ])
     v = out["values"]
     first, opened, later, closed = (json.loads(v[i]) for i in (3, 6, 8, 14))
@@ -143,19 +144,19 @@ def test_the_styled_thread_fits_a_390_phone_with_no_sideways_scroll(tmp_path, qd
     _root, src, _ids = _install(tmp_path)
     boot = ('document.documentElement.setAttribute("data-theme", "%s");'
             'window.__tv = LevainThreadView.mount(document.getElementById("host"),'
-            ' {pollMs: 0, compose: true, headers: () => ({"X-Levain-Write-Token": "%s"})});' % (scheme, TOKEN))
+            ' {pollMs: 0, headers: () => ({"X-Levain-Write-Token": "%s"})});' % (scheme, TOKEN))
     extra = {"/tvc.html": ("text/html; charset=utf-8", _STYLED.encode()),
              "/tvc.js": ("text/javascript; charset=utf-8", boot.encode())}
     shot = tmp_path / f"thread-{scheme}.png"
-    with _serve(src, write_token=TOKEN, thread_chat=svc, extra_assets=extra) as (base, _h):
+    with _serve(src, write_token=TOKEN, chat_service=svc, extra_assets=extra) as (base, _h):
         out = _drive(tmp_path, base + "/tvc.html", [
             {"emulate": {"w": 390, "h": 800, "dpr": 2, "mobile": True}},
             {"until": "document.querySelector('.tv-row')"},
             {"eval": "document.querySelector('.tv-row').click(); 1"},
-            {"until": "document.querySelectorAll('.tv-fold').length === 4 && document.querySelector('.tv-input')"},
+            {"until": "document.querySelectorAll('.tv-fold').length === 4"},
             {"eval": "document.querySelectorAll('.tv-fold')[1].querySelector('.tv-toggle').click(); 1"},
             {"eval": "document.documentElement.scrollWidth <= window.innerWidth"},
-            {"eval": "getComputedStyle(document.querySelector('.tv-send')).backgroundColor !== 'rgba(0, 0, 0, 0)'"},
+            {"eval": "document.querySelectorAll('.tv-input, .tv-send').length === 0"},
             {"shot": str(shot), "full": True},
         ])
     assert out["values"][4] is True and out["values"][5] is True and shot.exists()

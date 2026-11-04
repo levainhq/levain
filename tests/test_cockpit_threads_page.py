@@ -59,7 +59,7 @@ def test_the_list_opens_a_thread_and_draws_it_as_text(tmp_path, seeded):
                      " approval: document.querySelector('.tv-vendor_approval_request .tv-body').textContent,"
                      " bold: document.querySelectorAll('.tv-body b').length,"
                      " text: document.querySelector('.tv-message .tv-body').textContent,"
-                     " composer: document.querySelector('.tv-composer').textContent})"},
+                     " composer: document.querySelectorAll('.tv-composer, .tv-input, .tv-send').length})"},
             {"shot": str(shot)},
         ])
     finally:
@@ -70,7 +70,7 @@ def test_the_list_opens_a_thread_and_draws_it_as_text(tmp_path, seeded):
     assert (got["unverified"], got["open"], got["done"]) == (1, 1, 1), got
     assert got["links"] == 0 and "answer it in Needs you" in got["approval"], got
     assert got["bold"] == 0 and "<b>build</b>" in got["text"], got     # the thread's words never become markup
-    assert "read-only" in got["composer"], got
+    assert got["composer"] == 0, got            # a work thread draws no composer: the operator talks in the room
     assert shot.is_file()
 
 
@@ -80,7 +80,7 @@ _RACE = """
   const pending = {};
   const f = (url) => new Promise((ok, no) => { pending[url] = {ok, no}; });
   const body = (name) => ({ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(
-    {thread_id: name, gap: false, composer: null, before: [], stream: []}))});
+    {thread_id: name, gap: false, before: [], stream: []}))});
   const tv = LevainThreadView.mount(host, {fetch: f, pollMs: 0});
   const A = "/cockpit/thread/A.json", B = "/cockpit/thread/B.json";
   tv.open("A"); tv.open("B");
@@ -123,14 +123,14 @@ def test_a_late_reply_for_an_abandoned_navigation_never_repaints(tmp_path, seede
 
 
 @needs_browser
-def test_a_launch_with_an_unreadable_composer_is_not_called_launchless(tmp_path, seeded):
+def test_the_thread_model_has_no_composer_and_an_answered_approval_leaks_no_body(tmp_path, seeded):
     qdir, _world = seeded
     httpd = _serve(qdir)
     try:
         out = _drive(tmp_path, f"http://127.0.0.1:{httpd.server_address[1]}/", [
             {"until": "document.querySelector('.tv-row')"},
-            {"eval": "JSON.stringify({unread: LevainThreadView.threadModel({thread_id: 't', launch_id: 'L1', composer: null}).composer,"
-                     " none: LevainThreadView.threadModel({thread_id: 't', launch_id: null, composer: null}).composer,"
+            {"eval": "JSON.stringify({composer: 'composer' in LevainThreadView.threadModel({thread_id: 't', launch_id: 'L1'}),"
+                     " launch: LevainThreadView.threadModel({thread_id: 't', launch_id: 'L1'}).launchId,"
                      " answered: LevainThreadView.threadModel({thread_id: 't', stream: [{kind: 'vendor_approval_resolved', body: 'leak'}]})"
                      ".stream[0].text})"},
         ])
@@ -138,6 +138,5 @@ def test_a_launch_with_an_unreadable_composer_is_not_called_launchless(tmp_path,
         httpd.shutdown()
         httpd.server_close()
     got = json.loads(next(v for v in reversed(out["values"]) if isinstance(v, str)))
-    assert got["unread"] == "The launch's state could not be read.", got
-    assert got["none"] == "This thread has no worker launch.", got
+    assert got["composer"] is False and got["launch"] == "L1", got
     assert got["answered"] == "An approval was answered.", got

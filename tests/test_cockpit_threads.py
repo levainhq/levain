@@ -46,13 +46,13 @@ def seeded(qdir, clock):
     return qdir, world
 
 
-def test_the_list_names_the_thread_with_its_latest_gseq_and_composer(seeded):
+def test_the_list_names_the_thread_with_its_latest_gseq_and_carries_no_composer(seeded):
     qdir, world = seeded
     out = threads.thread_list(qdir)
     [row] = out["threads"]
     assert row["thread_id"] == world["thread"] and row["launch_id"] == world["launch"]
     assert row["latest_gseq"] is not None and row["latest_at"]
-    assert row["composer"]["state"] == "no_session"       # nothing is attached in a read-only view
+    assert "composer" not in row                           # a work thread has no composer in 1.0 (the room is the one)
 
 
 def test_the_stream_is_in_gseq_order_and_a_tool_is_open_until_its_result(seeded):
@@ -154,9 +154,7 @@ def test_a_store_missing_a_table_degrades_that_part_not_the_response(seeded, tmp
     st, one = threads.serve_threads(f"{threads.THREAD_PREFIX}{world['thread']}.json", "", directory=part)
     assert st == 200 and one["thread_id"] == world["thread"]
     if missing == "launches":
-        assert one["launch_id"] is None and one["composer"] is None
-    if missing in ("chat_messages", "chat_outbox_events"):
-        assert one["composer"] is None
+        assert one["launch_id"] is None
     if missing == "chat_events":
         assert one["gap"] is False and not any("tool" in i for i in one["stream"])
 

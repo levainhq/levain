@@ -1668,7 +1668,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # whether the cockpit draws levain's own Work board when no provider brings one (make_server's work_board)
     work_board: bool = True
     # the ChatService the thread view's write routes act through (CH-U1b); None serves none of them
-    thread_chat: "ChatService | None" = None
+    chat_service: "ChatService | None" = None
     # the dispatch family's sign, cancel and authorise (OS-2), built by make_server beside the Signer; None serves no
     # dispatch signing route
     dispatch_sheet: "DispatchSheet | None" = None
@@ -3267,41 +3267,41 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
-    def _thread_owner(self) -> str:
-        """The authenticated client a thread composer acts as: ``cockpit:<surface token name>``, or ``phone:<device id>``
-        for a paired device (the credential's name, verified in ``_credential``, never anything a client claims). A
-        request with no full credential reads as the view's own read-only owner."""
+    def _thread_owner(self) -> str | None:
+        """The authenticated client a stop or a room line acts as: ``cockpit:<surface token name>``, or ``phone:<device id>``
+        for a paired device (the credential's name, verified in ``_credential``, never anything a client claims). None when
+        the request holds no full credential, or a name that makes no client (a credential named exactly the paired
+        prefix has no device id and reads as a cockpit name, never as a phone with an empty id)."""
         cred = self._credential(required=False)
         name = cred.get("name") if cred.get("class") == "token" else None
-        if not isinstance(name, str):
-            return cockpit_threads.VIEW_OWNER
-        owner = ("phone:" + name[len(PAIRED_PREFIX):]) if name.startswith(PAIRED_PREFIX) else "cockpit:" + name
+        if not isinstance(name, str) or not name:
+            return None
+        phone = name.startswith(PAIRED_PREFIX) and len(name) > len(PAIRED_PREFIX)
+        owner = ("phone:" + name[len(PAIRED_PREFIX):]) if phone else "cockpit:" + name
         try:
             chat_lease.check_owner(owner)
         except CoordError:
-            return cockpit_threads.VIEW_OWNER
+            return None
         return owner
 
-    def _thread_post(self, thread_id: str, action: str, req: Any) -> tuple[dict[str, Any], int]:
-        """``POST /cockpit/thread/<th-id>/{send,stop,mark}`` (CH-U1b): the operator's line to a running worker and the stop of
-        its turn, reached only past ``do_POST``'s write gate (a surface token on every bind). The dispatch store is
-        the consent directory's, as the thread reads resolve it."""
+    def _store_directory(self) -> Any:
+        """The dispatch store's directory as the thread reads resolve it, or None when the reader names none."""
         reader = self.server.consent_reader
         if not hasattr(reader, "directory"):
-            return {"error": "not_found", "message": "no such thread recorded"}, 404
+            return None
         from levain.consent.queue import default_queue_dir
 
-        directory = reader.directory if reader.directory is not None else default_queue_dir()
-        service = self.server.thread_chat
-        # a send, a stop and a mark alike act only for a named credential (fail closed: the view's own owner acts for no one)
-        owner = self._thread_owner()
-        if owner == cockpit_threads.VIEW_OWNER:
-            return {"error": "forbidden", "message": f"a {action} needs a named credential"}, 403
-        if action in ("send", "mark"):
-            post = cockpit_threads.post_send if action == "send" else cockpit_threads.post_mark
-            status, payload = post(service, directory, thread_id, owner, req)
-        else:
-            status, payload = cockpit_threads.post_stop(service, directory, thread_id, req)
+        return reader.directory if reader.directory is not None else default_queue_dir()
+
+    def _thread_post(self, thread_id: str, action: str, req: Any) -> tuple[dict[str, Any], int]:
+        """``POST /cockpit/thread/<th-id>/stop``: the operator's stop of a work thread's turn, reached only past
+        ``do_POST``'s write gate (a surface token on every bind). The dispatch store is the consent directory's."""
+        directory = self._store_directory()
+        if directory is None or action != "stop":
+            return {"error": "not_found", "message": "no such thread recorded"}, 404
+        if self._thread_owner() is None:      # a stop acts only for a named credential (fail closed)
+            return {"error": "forbidden", "message": "a stop needs a named credential"}, 403
+        status, payload = cockpit_threads.post_stop(self.server.chat_service, directory, thread_id, req)
         return payload, status
 
     def _serve_threads(self, path: str, *, head: bool) -> None:
@@ -3327,7 +3327,7 @@ class _Handler(GuardedHandler):
             try:
                 status, payload = cockpit_threads.serve_threads(
                     path, "", directory=reader.directory if reader.directory is not None else default_queue_dir(),
-                    service=self.server.thread_chat, owner=self._thread_owner())
+                    service=self.server.chat_service)
             finally:
                 self.server.request_gate.release()
         self._send(cockpit_threads.encode(payload), "application/json; charset=utf-8", status=status, head=head,
@@ -4043,7 +4043,7 @@ class _Handler(GuardedHandler):
         desk = (route in (_DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE)
                 and getattr(self.server, "question_store", None) is not None)
         # and the thread view's write routes (CH-U1b): the same gate; served only beside a ChatService
-        thread = cockpit_threads.post_route(route) if self.server.thread_chat is not None else None
+        thread = cockpit_threads.post_route(route) if self.server.chat_service is not None else None
         # and web push (OS-4): a token on every bind
         push = route in _PUSH_POST and self.server.signer is not None
         if push:
@@ -4454,7 +4454,7 @@ def make_server(
     compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None,
     coordinator_verbs: bool = False,
     work_board: bool = True,
-    thread_chat: "ChatService | None" = None,
+    chat_service: "ChatService | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -4833,7 +4833,7 @@ def make_server(
     # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
     httpd.work_board = work_board
-    httpd.thread_chat = thread_chat
+    httpd.chat_service = chat_service
     httpd.verb_registry = verb_registry
     httpd._cockpit_lock = threading.Lock()
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
