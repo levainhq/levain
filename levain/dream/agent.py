@@ -164,8 +164,8 @@ def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expire
 
 
 def shadow_signing_card_text(zone: str, *, flow_root: Path | str, scratch: Path | str, coord_dir: Path | str,
-                             agent_dir: Path | str, flow_instructions: Path | str, model: str, per_run_usd: float,
-                             night_usd: float, expires: str) -> str:
+                             agent_dir: Path | str, flow_instructions: Path | str, facts_path: Path | str | None,
+                             model: str, per_run_usd: float, night_usd: float, expires: str) -> str:
     """The signing card's words for a SHADOW install (D1_EXECUTOR section 8): what it reads, every place it writes and
     what it costs, from the install's own facts and the caller's ``R``. The spec the link signs binds these facts
     (:func:`shadow_binding`), so the card describes the object signed."""
@@ -177,8 +177,9 @@ def shadow_signing_card_text(zone: str, *, flow_root: Path | str, scratch: Path 
             f"run state plus a read-only copy of flow's instructions file {flow_instructions} in its agent store "
             f"{agent_dir}. None of these may sit inside ~/.anneal-memory or {flow_root}; it never writes flow's memory "
             "text, and it never sends, pushes or publishes. The compose is given read tools (Read, Glob, Grep) and no "
-            "write tool; this card does not bound what those read tools can open. It composes with "
-            f"{model}, a paid model call at list price, and spends at most ${per_run_usd:.2f} a run and "
+            "write tool; this card does not bound what those read tools can open. It reads its first-run facts from "
+            f"{facts_path if facts_path is not None else 'no file (none named)'}, a file whose contents set what the "
+            f"executor will run. It composes with {model}, a paid model call at list price, and spends at most ${per_run_usd:.2f} a run and "
             f"${night_usd:.2f} a night (2 runs), the same limits as a live dream. These paths and the model are bound "
             "into the spec this link signs: an enable that changes one writes a new spec (--revise), which needs a new "
             "signed link, and a fire whose facts differ from its spec's refuses. Undo: nothing to undo, the scratch "
