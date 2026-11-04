@@ -492,12 +492,13 @@ def test_fire_state_the_recorded_live_fire_is_matches_and_never_signalled():
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", oid])
     try:
         ident = None
-        for _ in range(50):
-            ident = process_identity(proc.pid)
-            if ident is not None:
+        for _ in range(100):      # a venv launcher re-execs the real interpreter (macOS): wait for two equal reads
+            seen = process_identity(proc.pid)
+            if seen is not None and seen == ident and oid in seen[1].split():
                 break
-            time.sleep(0.05)
-        assert ident is not None
+            ident = seen
+            time.sleep(0.15)
+        assert ident is not None and oid in ident[1].split()
         assert S._fire_state(_rec(proc.pid, ident[0], ident[1], oid), 5) == "matches"
         assert proc.poll() is None                      # still alive: the reader sent nothing
     finally:
