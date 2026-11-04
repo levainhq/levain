@@ -12,8 +12,8 @@ The slot is taken and released in the agent store's own transactions. What this 
   ``<levain home>/coordinator``. Only the install's own coordinator directory is slotted (:func:`agent_dir`): a
   coordinator store anywhere else (a test's, a copy's) has no agent store beside it and launches unslotted, so it never
   writes the operator's real ``autonomic.db``.
-* **The fallback.** The agent schema is checked once per process per store (:func:`slot_state`, a read that writes and
-  creates nothing). No agent schema, or a ``/3`` store, launches unslotted and silent. Any other reason launches
+* **The fallback.** The agent schema is checked per process per store (:func:`slot_state`, a read that writes and
+  creates nothing; a refusal or the no-schema answer is kept, any other fault is asked again). No agent schema, or a ``/3`` store, launches unslotted and silent. Any other reason launches
   unslotted with one attention row keyed ``agent-schema-refused``. The agent schema never refuses a launch.
 * **No slot free.** :class:`SlotFull`: the launch stays pending and the thread stays queued, as for every other
   refusal that leaves a launch pending.
@@ -22,7 +22,11 @@ The slot is taken and released in the agent store's own transactions. What this 
   :func:`levain.agents.controller.dispatch_probes`), and :func:`sweep` releases it once the launch is over.
 
 An unreadable slot table or a garbled cap is a refusal that leaves the launch pending (:class:`SlotFault`): the cap
-fails closed, as on the agent side. Only the agent SCHEMA fails open.
+fails closed, as on the agent side. Only the agent SCHEMA fails open. A garbled cap has no repair surface (no CLI
+writes ``max_slots``): it is repaired in the store by hand.
+
+Only a coordinator launch takes a slot here. A spawned worker is capped by ``levain.coordinator.lease.MAX_SPAWNS_LIVE``
+and takes none; "slot" in this module is always the agent slot of ``agent_slots``.
 """
 from __future__ import annotations
 

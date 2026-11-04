@@ -408,3 +408,17 @@ def test_a_failing_attention_callback_is_swallowed_and_raised_once(store, astore
 
     assert ls.slot_state(d, boom) is False and ls.slot_state(d, boom) is False
     assert len(seen) == 1 and seen[0][0] == ls.ATTENTION_KEY and seen[0][1].startswith("launches run unslotted: ")
+
+
+def test_a_launch_that_ended_between_passes_frees_its_slot_before_the_next_start(store, astore, fake, live_hook):
+    """F3, the top of the pass: C1 ended after the last sweep, the table is full, and a pending launch waits."""
+    _cap(astore, 2)
+    first_id = woken(store)
+    assert cl.launch_session(store, first_id).started
+    _occupy(astore)
+    fake.gone()
+    store.launch_end(first_id, "ended", "done")
+    store.accept_drop("the next thing", surface="cli")           # a drop from elsewhere: a pending launch, no starter
+    lines = cl.watch_once(store)
+    assert any("started: claude attach" in x for x in lines), lines
+    assert sorted(k for _s, k, _o, _e in _held(astore)) == ["launch", "occurrence"]
