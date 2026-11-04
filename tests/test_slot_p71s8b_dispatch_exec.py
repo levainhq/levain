@@ -411,9 +411,8 @@ def test_11_the_kind_matrix_of_vendor_argv_is_unchanged_but_for_the_executor():
     for kind, tk in (("interactive", None), ("login", None), ("planner", "planner"), ("dispatch", "planner")):
         assert SS.vendor_argv("linux", "claude", s, kind=kind, ticket_kind=tk) == today, kind
     assert SS.vendor_argv("linux", "claude", s) == today                               # the old three-argument call
-    for tk in ("executor", "planner"):
-        assert SS.vendor_argv("linux", "codex", s, kind="dispatch", ticket_kind=tk) == (
-            f"{prefix}/bin/codex", *RD.CODEX_LAUNCH_ARGS)
+    assert SS.vendor_argv("linux", "codex", s, kind="dispatch", ticket_kind="planner") == (
+        f"{prefix}/bin/codex", *RD.CODEX_LAUNCH_ARGS)
     assert SS.vendor_argv("linux", "codex", s) == (f"{prefix}/bin/codex", *RD.CODEX_LAUNCH_ARGS)
     with pytest.raises(Refused) as e:
         SS.vendor_argv("linux", "claude", s, kind="dispatch", ticket_kind=None)
@@ -679,6 +678,19 @@ def test_18_a_brokered_executor_on_codex_is_refused_at_the_point_of_use():
     RD.check_ticket(G.RenderBlob(vendor="claude", routes=("glm",), model="m"), "dispatch", "egress", "tk", brokered)
     bare = {k: v for k, v in brokered.items() if k != "brief_digest"}
     RD.check_ticket(G.RenderBlob(vendor="codex", routes=("glm",), model="m"), "dispatch", "egress", "tk", bare)
+
+
+def test_18b_an_executor_ticket_on_codex_never_reaches_the_interactive_argv():
+    """An executor ticket on codex has no print-mode form and no brief: vendor_argv refuses it by name instead of
+    returning codex's interactive argv (which would carry no brief), for a ticket with or without a brief."""
+    s = "s-00000000000000a1"
+    with pytest.raises(Refused) as e:
+        SS.vendor_argv("linux", "codex", s, kind="dispatch", ticket_kind="executor")
+    assert e.value.name == "executor-vendor-unsupported"
+    # check_ticket's vendor-mismatch gate still speaks first for a passthrough executor ticket on the wrong blob
+    # (test_ticket_vendor_mismatch in the passthrough tests); a non-dispatch kind is untouched
+    assert SS.vendor_argv("linux", "codex", s, kind="interactive", ticket_kind="executor")[-len(RD.CODEX_LAUNCH_ARGS):] \
+        == tuple(RD.CODEX_LAUNCH_ARGS)
 
 
 def test_19_write_brief_is_0600_under_a_restrictive_umask(tmp_path):

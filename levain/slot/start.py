@@ -184,7 +184,8 @@ def vendor_argv(host: str, vendor: str, session: str, *, kind: Optional[str] = N
     system prompt's addition from ``<S>/in/brief.md``, and stream-json output (``--verbose`` is its requirement).
     Every token is a constant or derived from the session id; no brief byte is ever a token. No permission, tool or
     model flag: those live in the rendered layer. A ``dispatch`` session whose ticket facts are absent is refused
-    ``ticket-facts-missing``: ``start`` never guesses the interactive form for a ticketed session. Every other input
+    ``ticket-facts-missing``: ``start`` never guesses the interactive form for a ticketed session. An executor
+    ticket on any other vendor is refused ``executor-vendor-unsupported`` (no brief would reach it). Every other input
     returns what it returned before."""
     from levain.slot.layout import STORE
     from levain.slot.root_tree import VENDOR_PREFIX
@@ -192,6 +193,9 @@ def vendor_argv(host: str, vendor: str, session: str, *, kind: Optional[str] = N
     binary = f"{VENDOR_PREFIX[host]}/bin/{vendor}"
     if kind == "dispatch" and ticket_kind is None:
         raise Refused("ticket-facts-missing", "a dispatch session without its ticket's kind")
+    if kind == "dispatch" and ticket_kind == "executor" and vendor != "claude":
+        raise Refused("executor-vendor-unsupported", f"an executor ticket on {vendor!s:.16}: only claude has the "
+                                                     "print-mode exec that carries a brief")
     if vendor == "claude":
         S = f"{STORE[host]}/live/{session}"
         if kind == "dispatch" and ticket_kind == "executor":
