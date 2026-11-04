@@ -595,3 +595,12 @@ def test_check1_a_manual_evaluation_sees_the_previous_windows_scheduled_run_in_f
     ent.occurrence("launched", window="w:2026-11-02T22:00", launched=utc(2026, 11, 3, 2, 0))
     v = ent.evaluate(manual=True)
     assert (v.verdict, v.check, v.kind) == (rd.QUIET, 1, "in-flight")
+
+
+def test_a_manual_row_with_no_launched_at_is_ready_through_the_agent_check(ent):
+    """G2 strengthened (D1 L3 r3): not merely 'launched_at is absent from the reason', the verdict is READY."""
+    from levain.dream import agent as da
+
+    row = {"occurrence_id": "m-new", "agent_id": "dream", "kind": "manual", "state": "admitted", "launched_at": None}
+    v = da.day_ready(ent.db, row, now=NOW, zone=ZONE, agent_dir=ent.agent_dir, coord_dir=ent.coord_dir)
+    assert v.state == rd.READY and "launched_at" not in v.reason, v.reason

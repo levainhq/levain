@@ -360,6 +360,21 @@ def test_the_shipped_price_table_invents_no_price(scratch, stub, tmp_path, monke
     assert (r.outcome, r.exit_code) == ("budget", 2) and stub.calls() == 0
 
 
+def test_the_opus_5_5_row_is_the_one_phill_signed():
+    row = ex.PRICE_TABLE["claude-opus-5-5"]
+    signed = ("claude-opus-5-5", 1_000_000, 128_000, 8_000_000, 20_000_000,
+              "https://platform.claude.com/docs/en/about-claude/pricing", "2026-11-03")
+    got = ("claude-opus-5-5", row.context_window, row.max_output, row.input_micros_per_mtok, row.output_micros_per_mtok,
+           row.source, row.read_on)
+    assert got == signed, "this row is signed by Phill np-f16016c5; a change to it needs his word"
+    assert ex.one_call_ceiling("claude-opus-5-5") == 10_560_000            # $10.56
+    assert ex.one_call_ceiling("claude-opus-5-5") < ex.PER_RUN_LIMIT_USD_MICROS
+    assert ex.one_call_ceiling("a-model-with-no-row") is None
+    b = ex.Budget.for_model("claude-opus-5-5")
+    assert b.m_usd_micros == 10_560_000 and b.model == "claude-opus-5-5"
+    assert b.next_cap(0) == ex.PER_RUN_LIMIT_USD_MICROS - 10_560_000
+
+
 def test_start_rule_is_r_minus_m_minus_spent_and_floors_at_the_cheapest_compose():
     b = ex.Budget(m_usd_micros=M)
     assert b.next_cap(0) == 15_000_000                            # R $20 − M $5
@@ -601,7 +616,7 @@ def test_dream_run_refuses_the_live_store_dir_and_a_model_with_no_row(scratch, t
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     assert cli.main(["dream", "run", "--store-dir", str(live), "--mind", "ollama"]) == 2
     assert "COPY" in capsys.readouterr().err
-    assert cli.main(["dream", "run", "--store-dir", str(scratch.parent), "--mind", "claude"]) == 2
+    assert cli.main(["dream", "run", "--store-dir", str(scratch.parent), "--mind", "claude", "--model", "unpriced"]) == 2
     assert "no price row" in capsys.readouterr().err
     assert _store_state(scratch) == (None, 0, 3)
     assert cli.main(["dream"]) == 1                                # the bare command names the verbs

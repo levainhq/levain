@@ -599,6 +599,7 @@ class LaunchResult:
     launch_epoch: int | None = None
 
 
+DEFAULT_INPUT: object = object()   # launch(on_input=DEFAULT_INPUT): the agent's own hook; None stays "no check"
 InputCheck = Callable[[dict], bool]   # the on_input hook: the occurrence's identity in, "input present" out
 
 
@@ -788,10 +789,12 @@ def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authori
            window: Window, now: datetime,
            launch_over: Callable[[str], bool | None] | None = None,
            session_alive: Callable[[str], bool | None] | None = None,
-           on_input: InputCheck | None = None) -> LaunchResult:
+           on_input: InputCheck | None | object = DEFAULT_INPUT) -> LaunchResult:
     """The launch transaction (A0 §2.5 ``admitted -> launched``). ``authority`` is an
     :class:`~levain.agent_authority.AgentAuthority`; it is refreshed here, before the write lock.
 
+    ``on_input`` left at :data:`DEFAULT_INPUT` is :func:`_default_input_check`: the dream's hook for the dream, none
+    for any other agent. An explicit ``None`` is no input check, for any agent.
     With ``on_input``, the launch's refusals are judged first, in their own write transaction that takes nothing
     (:func:`_refusal_first`): a refusal ends the row with its own state and reason and the hook is never run. Only
     then is :func:`check_input` run, at the epoch those refusals were judged at; an answer there ends the call. A
@@ -808,6 +811,8 @@ def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authori
     opened the session."""
     if not isinstance(store, AgentStore):
         store = open_agent_store(store)
+    if on_input is DEFAULT_INPUT:
+        on_input = _default_input_check(store, occurrence_id)
     at_dt = schedule._utc(now)
     at = _stamp(at_dt)
     with store.read() as conn:
@@ -1205,7 +1210,7 @@ def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_
 # --- the fire: a separate session-leader process per launched occurrence (BUILD_PLAN P6-5, §2) ------------------------
 
 FIRES = "fires"
-FIRE_UNWIRED = 3       # the module entry's exit after its claim: no run body exists until P6-4a
+FIRE_UNWIRED = 3       # the module entry's exit after its claim, for an agent no run body is registered for
 FIRE_NO_IDENTITY = 4   # the fire cannot read its own identity, or its command line does not name its occurrence
 _OCCURRENCE_RE = re.compile(r"oc-[0-9a-f]{32}")
 
@@ -1340,9 +1345,56 @@ def fire(store: AgentStore | Path | str, occurrence_id: str, *,
 
 
 def _unwired_run(store: AgentStore, occurrence_id: str, launch_epoch: int) -> int:
-    print(f"levain agents _fire {occurrence_id}: no run body is wired yet (P6-4a); the occurrence ends by lapse "
+    print(f"levain agents _fire {occurrence_id}: no run body is wired for this agent; the occurrence ends by lapse "
           "recovery", file=sys.stderr)
     return FIRE_UNWIRED
+
+
+RunBody = Callable[[AgentStore, str, int], int]
+DREAM = "dream"
+
+
+def _dream_body() -> RunBody:
+    from levain.dream import agent as dream_agent   # here: the dream is not the controller's import closure
+    return dream_agent.dream_run
+
+
+# An agent name -> the resolver of its run body. A name absent here has no run body: its fire refuses unwired.
+RUN_BODIES: dict[str, Callable[[], RunBody]] = {DREAM: _dream_body}
+
+
+def _agent_name(store: AgentStore, agent_id: str) -> str | None:
+    with store.read() as conn:
+        row = conn.execute("SELECT name FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
+    return None if row is None else row[0]
+
+
+def run_agent(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
+              bodies: Mapping[str, Callable[[], RunBody]] | None = None) -> int:
+    """The fire's run body: the one registered for the occurrence's agent (:data:`RUN_BODIES`), else
+    :func:`_unwired_run`. The agent is read from the occurrence's own row, never from the fire's command line. A row
+    or agent that cannot be read has no run body."""
+    with store.read() as conn:
+        row = conn.execute("SELECT agent_id FROM agent_occurrences WHERE occurrence_id = ?",
+                           (occurrence_id,)).fetchone()
+    name = None if row is None else _agent_name(store, row[0])
+    resolve = (RUN_BODIES if bodies is None else bodies).get(name) if name is not None else None
+    if resolve is None:
+        return _unwired_run(store, occurrence_id, launch_epoch)
+    return resolve()(store, occurrence_id, launch_epoch)
+
+
+def _default_input_check(store: AgentStore, occurrence_id: str) -> InputCheck | None:
+    """The ``on_input`` hook for an occurrence whose caller passed none: the dream's, for the dream; ``None`` (input
+    present) for every other agent. A dream whose install facts are absent gets a hook that raises when run, which
+    :func:`check_input` reads as dead input."""
+    with store.read() as conn:
+        row = conn.execute("SELECT a.name FROM agent_occurrences o JOIN agents a ON a.agent_id = o.agent_id"
+                           " WHERE o.occurrence_id = ?", (occurrence_id,)).fetchone()
+    if row is None or row[0] != DREAM:
+        return None
+    from levain.dream import agent as dream_agent
+    return dream_agent.install_on_input(store.directory)
 
 
 def _main(argv: Sequence[str] | None = None) -> int:
@@ -1352,7 +1404,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--store", required=True)
     parser.add_argument("occurrence_id")
     args = parser.parse_args(argv)
-    return fire(args.store, args.occurrence_id, run=_unwired_run, clock=lambda: datetime.now(timezone.utc))
+    return fire(args.store, args.occurrence_id, run=run_agent, clock=lambda: datetime.now(timezone.utc))
 
 
 # --- the coordinator-lease probes over dispatch.db (levain.agents.slots.probe_over) -----------------------------------
