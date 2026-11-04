@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.authority import _pipe_reading
+from levain.launch import child_env
 from levain.authority_sig import (VerifierUnavailable, _sshsig_type_and_flags, presence_missing,
                                   sshsig_public_key)
 from levain.cockpit import keys as _keys
@@ -842,7 +843,6 @@ def post_notice(text: str, *, runner: Callable[..., Any] | None = None) -> Any:
     if sys.platform != "darwin":
         return None
     try:
-        from levain.launch import child_env
         argv = [_OSASCRIPT, "-e", "on run argv",
                 "-e", f'display notification (item 1 of argv) with title "{NOTICE_TITLE}"',
                 "-e", "end run", str(text)]
