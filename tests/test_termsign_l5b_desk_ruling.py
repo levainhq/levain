@@ -584,3 +584,80 @@ def test_a_line_on_a_gone_view_under_the_default_policy_is_stale_band_not_desk_u
                                        key_dir=world["keydir"], notify=lambda t: None)
     assert (status, got.get("error")) == (409, "stale_band"), (status, got)
     assert asked == [] and answers(store) == [] and state_of(world) == "undecided"
+
+
+# --- L5b r3 C1: a ruling applied, then the line's write refused, is ruled_not_recorded whatever refused it ----------
+
+def _newer_view(store):
+    """What another tab does while the sheet is open: a new item arrives and the tab reads the band, recording a
+    newer view for the same viewer (an unchanged band would match the old view, not record one)."""
+    store.file(agent="claude_code", agent_session_id="s2", what="Another thing?", options=OPTS, rec="push",
+               blocks="nothing", cwd="/w")
+    band_view.band_payload(store, "cockpit:web")
+
+def test_a_view_moved_during_the_sheet_after_the_ruling_applied_is_ruled_not_recorded(world, own_queue):
+    """The linked pick is signed against view V1; while the sheet is open another tab records V2. The queue applies
+    the ruling, then the line's write finds V1 no longer newest (StaleBand). The reply says the ruling was applied
+    and the answer was not recorded (never ``stale_band`` / "nothing was recorded"), and the queue is allowed."""
+    store = world["store"]
+
+    def factory(path, timeout=None):
+        fp, signer = real_desk(path, timeout)
+
+        def sign(message):
+            _newer_view(store)                                          # another tab: a newer view, mid-sheet
+            return signer(message)
+        return fp, sign
+
+    body, status = _route_line(world, "1a", txn="txn-moved-01", factory=factory)
+    assert (status, body.get("error")) == (409, "ruled_not_recorded"), (status, body)
+    assert body["signed"] is True and body["ruled"] is True and "still open" in body["message"]
+    assert state_of(world) == "allowed"
+    assert answers(store) == [] and store.get(world["q"].id).answer is None
+
+
+def test_answer_text_desk_raises_ruled_not_recorded_with_the_cause_once_a_ruling_applied(world):
+    store = world["store"]
+    b = band_view.band_payload(store, "cockpit:web")
+
+    def factory(path, timeout=None):
+        fp, signer = real_desk(path, timeout)
+
+        def sign(message):
+            _newer_view(store)
+            return signer(message)
+        return fp, sign
+
+    with pytest.raises(band_view.RuledNotRecorded) as got:
+        band_view.answer_text_desk(store, "1a", viewer="cockpit:web", store_id=b["store_id"], view_id=b["view_id"],
+                                   surface="web", origin=ORIGIN, signer_factory=factory, key_dir=world["keydir"],
+                                   notify=lambda t: None, policy="authority", queue_for=lambda _q: world["queue"])
+    assert isinstance(got.value.cause, band_view.StaleBand)
+    assert state_of(world) == "allowed" and answers(store) == []
+
+
+def test_a_view_moved_with_no_ruling_applied_is_still_stale_band(world, own_queue):
+    """The other side of C1: when the queue refused the ruling, a moved view is the ordinary stale band."""
+    store = world["store"]
+
+    class Refusing:
+        queue_id = world["queue"].queue_id
+        ruling_payload = staticmethod(world["queue"].ruling_payload)
+
+        def answer_terminal_ruling(self, *a, **kw):
+            raise AnswerRefused("no ruling is authority")
+
+    def factory(path, timeout=None):
+        fp, signer = real_desk(path, timeout)
+
+        def sign(message):
+            _newer_view(store)
+            return signer(message)
+        return fp, sign
+
+    b = band_view.band_payload(store, "cockpit:web")
+    with pytest.raises(band_view.StaleBand):
+        band_view.answer_text_desk(store, "1a", viewer="cockpit:web", store_id=b["store_id"], view_id=b["view_id"],
+                                   surface="web", origin=ORIGIN, signer_factory=factory, key_dir=world["keydir"],
+                                   notify=lambda t: None, policy="authority", queue_for=lambda _q: Refusing())
+    assert state_of(world) == "undecided" and answers(store) == []
