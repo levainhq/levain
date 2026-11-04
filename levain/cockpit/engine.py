@@ -2979,9 +2979,16 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
         run = _run_reading(dg)
         if run is not None:                                    # a failed or late run: its own words, never "write path"
             return {**out, **run}
+    src = dg.get("last_run_source") if is_role else None
+    if src == "gate":
+        # a scheduler STOP (skipped_low_energy, pre-filtered): last_run_at is null and the status names the gate.
+        # It is a stop, never a run time, and says nothing about liveness either way.
+        stop = ["scheduler stop"]
+        _status_part(dg, stop)
+        return {**out, "tone": "neutral", "text": " · ".join(stop)}
     if dg.get("available") is False:
         return {**out, "tone": "alarm", "text": "write path unavailable"}
-    if dg.get("available") is not True:
+    if dg.get("available") is not True and src != "episode":
         return {**out, "tone": "unknown", "text": "no liveness data"}
     # tone ranks alarm > unknown > ok; evidence that is missing or unreadable is never read as health
     rank = {"ok": 0, "unknown": 1, "alarm": 2}
@@ -3026,6 +3033,8 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
                 note("alarm", f"last wrap overdue (due every {row['wrap_every']})")
             else:
                 parts.append(f"wraps every {row['wrap_every']}")
+    if src == "episode" and tone == "ok":
+        tone = "neutral"          # the newest episode is a time with its source, not a liveness verdict (no run was recorded)
     out["tone"], out["text"] = tone, " · ".join(parts)
     return out
 

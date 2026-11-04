@@ -171,7 +171,24 @@ def test_stateless_resident_never_reads_running_and_shows_its_last_run_time() ->
 
 def test_stateless_resident_names_the_source_when_no_run_is_recorded() -> None:
     h = _role(last_run_source="episode", last_run_status=None, run_failed=None, run_late=None)
-    assert "newest episode 02:56" in h["text"] and "no run recorded" in h["text"] and h["tone"] == "ok"
+    assert "newest episode 02:56" in h["text"] and "no run recorded" in h["text"]
+    assert h["tone"] == "neutral"      # a time with its source, not a liveness verdict
+    unk = _role(last_run_source="episode", last_run_status=None, run_failed=None, run_late=None, available=None)
+    assert "newest episode 02:56" in unk["text"] and unk["tone"] == "neutral"     # an unknown `available` does not hide it
+
+
+def test_a_scheduler_stop_reads_as_a_stop_never_as_a_run_time_or_as_health() -> None:
+    h = _role(last_run_source="gate", last_run_at=None, last_run_status="skipped_low_energy",
+              run_failed=None, run_late=None, available=None)
+    assert h["text"] == "scheduler stop · status skipped_low_energy" and h["tone"] == "neutral"
+    assert "last run" not in h["text"] and "newest episode" not in h["text"]
+
+
+def test_run_flags_are_three_valued_null_is_unknown_never_on_time() -> None:
+    # run_late / available null = UNKNOWN: a reader that tests `not run_late` would read it as on time
+    h = _role(run_late=None, run_failed=None, available=None)
+    assert h["tone"] == "unknown" and "no liveness data" in h["text"]
+    assert _role(run_late=True, available=None)["tone"] == "alarm"
 
 
 def test_failed_and_late_runs_are_alarms_with_their_own_words() -> None:
