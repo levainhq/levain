@@ -756,3 +756,55 @@ def test_the_reader_names_the_origins_it_accepts(rig, store, keydir):
     assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok,
                                   origins=["http://localhost:7420"]) == "signature failed (scope-mismatch)"
     assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok, origins=[ORIGIN]) == "signed: Touch ID, laptop (desk)"
+
+
+# --- L3 r2 W2: one verifier per signature in flight ----------------------------------------------------------------
+
+def _wait_until(cond, limit=10.0):
+    import time
+    end = time.monotonic() + limit
+    while not cond() and time.monotonic() < end:
+        time.sleep(0.02)
+    return cond()
+
+
+def test_renders_while_a_slow_verifier_runs_start_no_second_one(rig, store, keydir):
+    import time
+
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    release = threading.Event()
+    asked: list[str] = []
+
+    def slow(pk):
+        asked.append(pk)
+        release.wait(10)
+        return True, "bio"
+    band_view._badge_cache.clear()
+    renders = [band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=slow, deadline=time.monotonic() + 0.05)
+               for _ in range(5)]
+    assert renders == [{}] * 5                                   # no render waited for the verifier
+    assert _wait_until(lambda: len(asked) >= 1)
+    time.sleep(0.2)
+    assert len(asked) == 1, asked                                # N renders -> ONE verifier
+    release.set()
+    assert _wait_until(lambda: not getattr(band_view, "_badge_inflight", set()))
+    after = band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=slow)
+    assert after == {q.id: "signed: Touch ID, laptop (desk)"} and len(asked) == 1      # served from the cache
+
+
+def test_a_verifier_that_raises_frees_its_signature_for_the_next_render(rig, store, keydir):
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    asked: list[str] = []
+
+    def boom(pk):
+        asked.append(pk)
+        raise RuntimeError("sc_auth fell over")
+    band_view._badge_cache.clear()
+    first = band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=boom)
+    assert first == {q.id: "signature failed (classifier-error)"}          # shown, never cached
+    assert _wait_until(lambda: not getattr(band_view, "_badge_inflight", set()))
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    assert band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=ok) == {q.id: "signed: Touch ID, laptop (desk)"}
+    assert len(asked) == 1
