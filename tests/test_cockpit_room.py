@@ -755,3 +755,105 @@ def test_f9_a_stored_undelivered_line_answers_409_on_the_unresolved_path_as_on_t
         w.svc.send_room = real
         status2, body2 = _call(base, "/cockpit/room/send", w.body())
         assert (status2, body2["error"]) == (status, body["error"])
+
+
+# --- RM-F fix round 1: the page (F6, F7, F11) -----------------------------------------------------------------------------
+
+_UNTIL_READY = {"until": "document.querySelector('.rv-input') && !document.querySelector('.rv-send').disabled"}
+
+
+def _post_from_page(path, body):
+    """A page-side POST with the write token, for a test that changes the room while the page polls."""
+    return ("fetch('/cockpit/room/%s', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Levain-Write-Token': '%s'},"
+            " body: JSON.stringify(%s)}).then(r => r.status)" % (path, TOKEN, json.dumps(body)))
+
+
+@needs_browser
+def test_f11_the_drop_button_drops_the_draft_verbatim(tmp_path, w):
+    with _serve_room(tmp_path, w, extra_assets=_assets(_boot())) as (base, _h):
+        _drive(tmp_path, base + "/rvc.html", [
+            _UNTIL_READY,
+            {"eval": "document.querySelector('.rv-input').value = ' drop <i>this</i> '; document.querySelector('.rv-drop').click(); 1"},
+            {"until": "document.querySelector('.rv-sendnote').textContent.indexOf('Dropped:') === 0 && document.querySelector('.rv-input').value === ''"},
+        ])
+    assert w.drops() == [(" drop <i>this</i> ", "cockpit")] and w.lines() == [] and w.session.written == []
+
+
+@needs_browser
+def test_f11_the_stop_button_interrupts_the_room(tmp_path, w):
+    with _serve_room(tmp_path, w, extra_assets=_assets(_boot())) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [
+            _UNTIL_READY,
+            {"eval": "document.querySelector('.rv-stop').click(); 1"},
+            {"until": "['Stopped.', 'Nothing was running to stop.'].includes(document.querySelector('.rv-sendnote').textContent) && "
+                      "document.querySelector('.rv-sendnote').textContent"},
+        ])
+    assert out["values"][2] in ("Stopped.", "Nothing was running to stop.")
+
+
+@needs_browser
+def test_f11_the_rotate_button_opens_a_new_conversation_naming_the_room_it_shows(tmp_path, w):
+    old = w.thread
+    with _serve_room(tmp_path, w, extra_assets=_assets(_boot())) as (base, _h):
+        _drive(tmp_path, base + "/rvc.html", [
+            _UNTIL_READY,
+            {"eval": "document.querySelector('.rv-rotate').click(); 1"},
+            {"until": "document.querySelector('.rv-sendnote').textContent === 'A new conversation is open.' && window.__rv.model().thread"},
+        ])
+        status, got = _call(base, cockpit_room.ROOM_PATH, method="GET")
+    assert got["room_thread"] != old
+
+
+@needs_browser
+def test_f11_the_mark_buttons_resolve_an_ambiguous_line(tmp_path, amb):
+    w = amb
+    with _serve_room(tmp_path, w, extra_assets=_assets(_boot())) as (base, _h):
+        _drive(tmp_path, base + "/rvc.html", [
+            _UNTIL_READY,
+            {"eval": "document.querySelector('.rv-input').value = 'maybe'; document.querySelector('.rv-send').click(); 1"},
+            {"until": "document.querySelector('.rv-mark-yes')"},
+            {"eval": "document.querySelector('.rv-mark-yes').click(); 1"},
+            {"until": "!document.querySelector('.rv-mark')"},
+        ])
+        message = _first_message_id(w)
+    assert _states(w, message)[-1] == "accepted"
+
+
+@needs_browser
+def test_f6_a_poll_that_changes_the_room_keeps_a_cards_focus_caret_and_draft(tmp_path, w):
+    with _serve_room(tmp_path, w, "first") as (base0, _h):
+        _call(base0, "/cockpit/room/send", w.body("tell the desk hello"))
+    w.propose(_first_message_id(w), "He greeted the desk.")
+    more = _post_from_page("send", w.body("a later line", "ob-00000002"))
+    with _serve_room(tmp_path, w, extra_assets=_assets(_boot())) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [
+            {"until": "document.querySelector('.rv-cardwords')"},
+            {"eval": "var t = document.querySelector('.rv-cardwords'); t.value = 'edited words'; t.dispatchEvent(new Event('input', {bubbles: true}));"
+                     " t.focus(); t.setSelectionRange(3, 6); window.__ta = t; 1"},
+            {"eval": more},
+            {"until": "[...document.querySelectorAll('.rv-text')].some(n => n.textContent === 'a later line')"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 500))"},
+            {"eval": "JSON.stringify({same: document.querySelector('.rv-cardwords') === window.__ta, focus: document.activeElement === window.__ta,"
+                     " caret: [window.__ta.selectionStart, window.__ta.selectionEnd], value: window.__ta.value,"
+                     " cards: document.querySelectorAll('.rv-card').length})"},
+        ])
+    got = json.loads(out["values"][5])
+    assert got == {"same": True, "focus": True, "caret": [3, 6], "value": "edited words", "cards": 1}
+
+
+@needs_browser
+def test_f7_an_older_poll_response_never_redraws_over_a_newer_one(tmp_path, w):
+    slow = ("fetch: (function () { var n = 0, real = window.fetch.bind(window); return function (u, o) {"
+            " if (String(u).indexOf('room.json') < 0) return real(u, o); var k = ++n;"
+            " return real(u, o).then(function (res) { return k === 2 ? new Promise(function (r) { setTimeout(function () { r(res); }, 1200); }) : res; }); }; })(), ")
+    with _serve_room(tmp_path, w, extra_assets=_assets(_boot(slow))) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [
+            _UNTIL_READY,
+            {"eval": "new Promise(r => setTimeout(() => r(1), 450))"},        # poll 2 is now out, answering late with the old room
+            {"eval": "document.querySelector('.rv-input').value = 'fresh line'; document.querySelector('.rv-send').click(); 1"},
+            {"until": "[...document.querySelectorAll('.rv-text')].some(n => n.textContent === 'fresh line')"},
+            {"eval": "new Promise(r => { var gone = 0, t0 = Date.now(), iv = setInterval(() => {"
+                     " if (![...document.querySelectorAll('.rv-text')].some(n => n.textContent === 'fresh line')) gone++;"
+                     " if (Date.now() - t0 > 1600) { clearInterval(iv); r(gone); } }, 15); })"},
+        ])
+    assert out["values"][4] == 0

@@ -154,13 +154,32 @@
     return card;
   }
 
+  // The stream is redrawn whole; the cards are kept: a card's element persists across redraws while its state, words and
+  // summary are unchanged, so a textarea keeps its focus and caret while the room streams. Order is reconciled by
+  // moving only the nodes that are out of place (a node already in its slot is never re-inserted, which would blur it).
   function renderRoom(doc, host, m, hooks, ui, drafts) {
-    clear(host);
-    if (m.model) host.appendChild(el(doc, "div", "rv-head", m.model));
-    if (m.gap) host.appendChild(el(doc, "div", "rv-gap", "Some lines may be missing from this conversation."));
-    if (!m.stream.length) host.appendChild(el(doc, "div", "rv-note", m.open ? "Nothing has been said yet." : m.words));
-    m.stream.forEach(function (l) { host.appendChild(renderLine(doc, l, hooks, ui)); });
-    m.proposals.forEach(function (c) { host.appendChild(renderCard(doc, c, hooks, drafts)); });
+    var st = host.__rv;
+    if (!st || st.streamBox.parentNode !== host || st.cardsBox.parentNode !== host) {
+      clear(host);
+      st = host.__rv = { streamBox: el(doc, "div", "rv-stream"), cardsBox: el(doc, "div", "rv-cards"), cards: {} };
+      host.appendChild(st.streamBox); host.appendChild(st.cardsBox);
+    }
+    clear(st.streamBox);
+    if (m.model) st.streamBox.appendChild(el(doc, "div", "rv-head", m.model));
+    if (m.gap) st.streamBox.appendChild(el(doc, "div", "rv-gap", "Some lines may be missing from this conversation."));
+    if (!m.stream.length) st.streamBox.appendChild(el(doc, "div", "rv-note", m.open ? "Nothing has been said yet." : m.words));
+    m.stream.forEach(function (l) { st.streamBox.appendChild(renderLine(doc, l, hooks, ui)); });
+    var keep = {};
+    m.proposals.forEach(function (c, i) {
+      var key = c.state + "\u0000" + c.words + "\u0000" + c.summary, have = own(st.cards, c.id) ? st.cards[c.id] : null;
+      if (!have || have.key !== key) { st.cards[c.id] = have = { key: key, node: renderCard(doc, c, hooks, drafts) }; }
+      keep[c.id] = true;
+      if (st.cardsBox.children[i] !== have.node) st.cardsBox.insertBefore(have.node, st.cardsBox.children[i] || null);
+    });
+    Object.keys(st.cards).forEach(function (id) {
+      if (!own(keep, id)) { var n = st.cards[id].node; if (n.parentNode) n.parentNode.removeChild(n); delete st.cards[id]; }
+    });
+    while (st.cardsBox.children.length > m.proposals.length) st.cardsBox.removeChild(st.cardsBox.lastChild);
   }
 
   // mount(host, {fetch, headers, pollMs, speech, storage}): returns {stop, refresh, model}. Polls while mounted and redraws
@@ -173,7 +192,7 @@
     var pollMs = opts.pollMs == null ? 2000 : opts.pollMs;
     var Speech = opts.speech === undefined ? (root.SpeechRecognition || root.webkitSpeechRecognition) : opts.speech;
     var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
-    var stopped = false, timer = 0, last = "", thread = null, current = null, ui = { open: {} }, drafts = {};
+    var stopped = false, timer = 0, gen = 0, last = "", thread = null, current = null, ui = { open: {} }, drafts = {};
     var wrap = el(doc, "div", "rv"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock");
     wrap.appendChild(body); wrap.appendChild(dock); host.appendChild(wrap);
     var ta = el(doc, "textarea", "rv-input"), actions = el(doc, "div", "rv-actions"),
@@ -262,7 +281,7 @@
     if (rotB) rotB.addEventListener("click", function () {
       if (rotB.disabled) return;
       rotB.disabled = true; note.textContent = "Starting a new conversation...";
-      post("rotate", {}).then(function (r) {
+      post("rotate", { room_thread_id: current && current.thread }).then(function (r) {
         note.textContent = r.status === 200 ? "A new conversation is open." : ((r.json && r.json.message) || "No new conversation was started.");
         last = ""; return pull();
       }).catch(function () { note.textContent = "The server could not be reached."; }).then(paintDock);
@@ -323,11 +342,12 @@
 
     function pull() {
       if (stopped) return Promise.resolve();
+      var mine = ++gen;       // a response older than the newest request is dropped, as the work-thread view does
       return f(ROOM_PATH, { cache: "no-store", headers: headers() }).then(function (res) {
-        if (stopped) return null;
+        if (stopped || mine !== gen) return null;
         if (!res.ok) { clear(body); body.appendChild(el(doc, "div", "rv-note", res.status === 403 ? "This page carries no token for the room." : "The room could not be read.")); last = ""; return null; }
         return res.text().then(function (t) {
-          if (stopped) return;
+          if (stopped || mine !== gen) return;
           if (t !== last) {
             last = t;
             current = roomModel(JSON.parse(t));
