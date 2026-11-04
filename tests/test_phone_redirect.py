@@ -105,11 +105,23 @@ def test_it_serves_the_page_and_its_script_and_nothing_else() -> None:
         status, hdrs, body = _get(page, "/phone_redirect.js")
         assert status == 200 and hdrs["content-type"].startswith("text/javascript") and b"location.replace" in body
         for path in ("/consent.json", "/coord.json", f"/sign/{RID}/state", "/webpush/key", "/sw.js",
-                     "/app.webmanifest", "/phone.js", "/app/state.json", "/passkey/key-line"):
+                     "/app.webmanifest", "/phone.js", "/phone.css", "/phone_app.js", "/phone_app.css",
+                     "/app/state.json", "/passkey/key-line"):
             status, _, _ = _get(page, path, {"X-Levain-Phone-Token": SECRET})
             assert status == 404, path
         status, _, _ = _get(page, "/consent/x/answer", {"Content-Type": "application/json"}, method="POST")
         assert status in (404, 405, 501)
+
+
+def test_the_old_phone_page_and_its_scripts_are_not_shipped() -> None:
+    """OS-6: the page, its two scripts and two stylesheets are deleted, not guarded; the redirect page and its script are
+    the only phone-named files left in the web templates."""
+    from levain.web_server import load_web_asset
+
+    for gone in ("phone.html", "phone.js", "phone.css", "phone_app.js", "phone_app.css"):
+        with pytest.raises(FileNotFoundError):
+            load_web_asset(gone)
+    assert "location.replace" in load_web_asset("phone_redirect.js")
 
 
 def test_it_mints_no_token() -> None:
