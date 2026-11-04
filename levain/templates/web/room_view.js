@@ -197,7 +197,7 @@
     if (Speech) {
       micB = el(doc, "button", "rv-mic", "Dictate");
       micB.setAttribute("type", "button");
-      micB.setAttribute("title", "Heard on this device only, and only while this page is open");
+      micB.setAttribute("title", "On-device dictation where this browser provides it, and only while this page is open");
       actions.appendChild(micB);
     }
     var rotB = null;
@@ -229,6 +229,7 @@
       if (ta.value === text) { ta.value = ""; try { if (store) store.removeItem("levain.room.draft"); } catch (e) { /* no storage */ } }
     }
     sendB.addEventListener("click", function () {
+      endDictation();
       var text = ta.value;
       if (!current || !current.thread || !text.trim() || sendB.disabled || flight.send) return;
       if (sendId === null || sendText !== text) sendId = newId();      // one id per draft text: a resend reuses it
@@ -247,6 +248,7 @@
       });
     });
     dropB.addEventListener("click", function () {
+      endDictation();
       var text = ta.value;
       if (!current || !text.trim() || dropB.disabled || flight.drop) return;
       if (dropId === null || dropText !== text) dropId = newId();
@@ -277,27 +279,60 @@
         last = ""; return pull();
       }).catch(function () { note.textContent = "The server could not be reached."; }).then(paintDock);
     });
+    // dictation state: dbase = the text before the transcript, heard = the transcript already placed in the box
+    var dbase = "", heard = "", lastHeard = "";
+    function endDictation() {
+      var r = rec; rec = null;
+      if (micB) micB.textContent = "Dictate";
+      if (r) { r.onresult = null; r.onend = null; r.onerror = null; try { r.stop(); } catch (e) { /* already stopped */ } }
+    }
     if (micB) {
+      var lang = doc.documentElement.lang || (root.navigator && root.navigator.language) || "en-US";
+      micB.style.display = "none";                     // shown only once the browser says on-device dictation is available
+      if (typeof Speech.available === "function") {
+        var asked;
+        try { asked = Speech.available({ langs: [lang], processLocally: true }); } catch (e) { asked = null; }
+        if (asked && asked.then) {
+          asked.then(function (st) {
+            if (st === "unavailable") { micB.remove(); }
+            else if (st === "downloadable" || st === "downloading") {
+              micB.remove();
+              if (!note.textContent) note.textContent = "On-device dictation is not installed on this browser; the keyboard dictation key works.";
+            } else micB.style.display = "";
+          }, function () { micB.style.display = ""; });
+        } else micB.style.display = "";
+      } else micB.style.display = "";
+      ta.addEventListener("input", function () { if (rec) { dbase = ta.value; heard = lastHeard; } });
       micB.addEventListener("click", function () {
-        if (rec) { rec.stop(); return; }
-        var r = new Speech(), base = ta.value ? ta.value.replace(/\s*$/, " ") : "";
-        r.interimResults = true; r.continuous = false; r.processLocally = true;
+        if (rec) { endDictation(); return; }
+        var r = new Speech();
+        dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
+        r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
+        if (r.processLocally !== true) { note.textContent = "This browser will not keep dictation on this device, so it is off; the keyboard dictation key works."; return; }
         r.onresult = function (ev) {
+          if (rec !== r) return;                       // a late result from a recognizer that was ended
           var t = "";
           for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
-          ta.value = base + t;
+          lastHeard = t;
+          ta.value = dbase + (heard && t.indexOf(heard) === 0 ? t.slice(heard.length) : t);
           try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ }
         };
-        r.onend = function () { rec = null; micB.textContent = "Dictate"; };
+        r.onend = function () { if (rec === r) endDictation(); };
         r.onerror = function (ev) {
-          rec = null; micB.textContent = "Dictate";
-          note.textContent = ev && ev.error === "language-not-supported" ? "On-device dictation is not installed for this language; the keyboard's dictation key works here." : "Dictation stopped.";
+          if (rec !== r) return;
+          endDictation();
+          var c = ev && ev.error;
+          note.textContent = c === "language-not-supported" ? "On-device dictation is not installed for this language; the keyboard's dictation key works here."
+            : (c === "not-allowed" || c === "service-not-allowed") ? "Dictation needs permission to use the microphone; allow it in the browser's site settings."
+            : c === "audio-capture" ? "No microphone was found for dictation."
+            : c === "no-speech" ? "Heard nothing."
+            : "Dictation stopped.";
         };
         rec = r; micB.textContent = "Stop dictating";
-        try { r.start(); } catch (e) { rec = null; micB.textContent = "Dictate"; }
+        try { r.start(); } catch (e) { endDictation(); }
       });
       // foreground only: leaving the page ends dictation
-      var leave = function () { if (rec) rec.stop(); };
+      var leave = function () { if (rec) endDictation(); };
       doc.addEventListener("visibilitychange", function () { if (doc.visibilityState === "hidden") leave(); });
       root.addEventListener && root.addEventListener("blur", leave);
     }
@@ -354,7 +389,7 @@
     function loop() { if (!stopped && pollMs > 0) timer = setTimeout(function () { pull().then(loop); }, pollMs); }
     paintDock();
     pull().then(loop);
-    return { stop: function () { stopped = true; clearTimeout(timer); if (rec) rec.stop(); }, refresh: function () { last = ""; return pull(); }, model: function () { return current; } };
+    return { stop: function () { stopped = true; clearTimeout(timer); endDictation(); }, refresh: function () { last = ""; return pull(); }, model: function () { return current; } };
   }
 
   var api = { roomModel: roomModel, lineModel: lineModel, sendWords: sendWords, renderRoom: renderRoom, mount: mount };

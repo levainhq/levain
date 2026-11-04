@@ -35,6 +35,21 @@ window.__started = [];
 class Local { start() { window.__started.push({local: this.processLocally}); } stop() {} }
 Local.prototype.processLocally = false;
 class Cloud { start() { window.__started.push({cloud: true}); } stop() {} }
+window.__recs = [];
+function res(t) { return {results: [[{transcript: t}]]}; }
+class Live {
+  constructor() { window.__recs.push(this); this.stops = 0; this.lang = ""; }
+  start() { window.__started.push({live: true}); if (window.__err) this.onerror({error: window.__err}); }
+  stop() { this.stops++; }
+  emit(t) { if (this.onresult) this.onresult(res(t)); }
+  fire(t) { this.__r = res(t); }
+}
+Object.defineProperty(Live.prototype, "processLocally", {get() { return this._pl === true; }, set(v) { this._pl = v; }, configurable: true});
+class Ignores extends Live {}
+Object.defineProperty(Ignores.prototype, "processLocally", {get() { return false; }, set(v) {}, configurable: true});
+class Unavailable extends Live { static available() { return Promise.resolve("unavailable"); } }
+class Downloadable extends Live { static available() { return Promise.resolve("downloadable"); } }
+class Installed extends Live { static available() { return Promise.resolve("available"); } }
 """
 
 
@@ -46,7 +61,8 @@ def test_the_room_boxes_are_prose_with_dash_free_names():
     for k, v in PROSE.items():
         assert f'["{k}", "{v}"]' in body, k
     assert '["name", name]' in body
-    assert "one-time-code" not in js and "inputmode=\"none\"" not in js and '"none"' not in re.findall(r'"inputmode"[^)]*', js)[0]
+    assert "one-time-code" not in js and 'inputmode="none"' not in js and '["inputmode", "none"]' not in js
+    assert '"none"' not in js[js.index("function prose("):][:400]
 
 
 def test_the_phone_rules_exist_and_use_tokens_only():
@@ -98,6 +114,7 @@ return JSON.stringify({noSideScroll: document.documentElement.scrollWidth <= win
 
 @needs_browser
 def test_the_dock_fits_a_390_phone_with_every_control_whole(tmp_path, w):
+    """Structural only: the computed position is `sticky`, which cannot show that the dock sticks to the viewport edge."""
     with _serve_room(tmp_path, w, extra_assets=_assets(_boot("Local"))) as (base, _h):
         out = _drive(tmp_path, base + "/rvc.html", [
             {"emulate": {"w": 390, "h": 800, "dpr": 2, "mobile": True}},
@@ -107,3 +124,90 @@ def test_the_dock_fits_a_390_phone_with_every_control_whole(tmp_path, w):
     g = json.loads(out["values"][1])
     assert g["noSideScroll"] and g["inside"] and g["tall"] and g["unclipped"] and g["sendWide"], g
     assert g["n"] == 5 and g["rows"] <= 3 and g["input16"] >= 16 and g["sticky"] == "sticky", g
+
+
+# --- the voice, F1-F4 of the r1 findings -----------------------------------------------------------------------------
+
+_N = [0]
+
+
+def _run(tmp_path, w, speech, steps):
+    _N[0] += 1
+    with _serve_room(tmp_path, w, name="e%d" % _N[0], extra_assets=_assets(_boot(speech))) as (base, _h):
+        return _drive(tmp_path, base + "/rvc.html", [
+            {"until": "document.querySelector('.rv-input') && !document.querySelector('.rv-send').disabled"}] + steps), w
+
+
+@needs_browser
+def test_a_late_result_after_send_does_not_bring_the_sent_line_back(tmp_path, w):
+    """F1, reproduced first: Send while dictating, then the recognizer fires a late result with the pre-send base."""
+    out, w = _run(tmp_path, w, "Live", [
+        {"eval": "document.querySelector('.rv-mic').click(); __recs[0].emit('hello there');"
+                 " const ta = document.querySelector('.rv-input'); const was = ta.value;"
+                 " document.querySelector('.rv-send').click(); __recs[0].emit('hello there again'); JSON.stringify({was, stops: __recs[0].stops})"},
+        {"until": "document.querySelector('.rv-sendnote').textContent === 'Sent.'"},
+        {"eval": "__recs[0].emit('late and unwanted'); JSON.stringify({v: document.querySelector('.rv-input').value,"
+                 " label: document.querySelector('.rv-mic').textContent})"},
+    ])
+    assert json.loads(out["values"][1]) == {"was": "hello there", "stops": 1}
+    assert json.loads(out["values"][3]) == {"v": "", "label": "Dictate"}
+    assert [r[3] for r in w.lines()] == ["hello there"]
+
+
+@needs_browser
+def test_drop_also_ends_dictation_first(tmp_path, w):
+    out, _w = _run(tmp_path, w, "Live", [
+        {"eval": "document.querySelector('.rv-mic').click(); __recs[0].emit('for the desk');"
+                 " document.querySelector('.rv-drop').click(); __recs[0].emit('and more'); JSON.stringify({stops: __recs[0].stops,"
+                 " v: document.querySelector('.rv-input').value})"},
+    ])
+    assert json.loads(out["values"][1]) == {"stops": 1, "v": "for the desk"}
+
+
+@needs_browser
+def test_a_recognizer_that_ignores_processlocally_never_starts(tmp_path, w):
+    """F2: the property exists on the prototype but the setter does nothing, so reading it back is the only proof."""
+    out, _w = _run(tmp_path, w, "Ignores", [
+        {"eval": "document.querySelector('.rv-mic').click(); JSON.stringify({started: __started.length,"
+                 " note: document.querySelector('.rv-sendnote').textContent, label: document.querySelector('.rv-mic').textContent})"},
+    ])
+    got = json.loads(out["values"][1])
+    assert got["started"] == 0 and got["label"] == "Dictate" and "keep dictation on this device" in got["note"], got
+
+
+@needs_browser
+def test_the_mic_follows_availability_not_capability(tmp_path, w):
+    out, _w = _run(tmp_path, w, "Unavailable", [{"eval": "document.querySelectorAll('.rv-mic').length"}])
+    assert out["values"][1] == 0
+    out, _w = _run(tmp_path, w, "Downloadable", [
+        {"until": "document.querySelector('.rv-sendnote').textContent"},
+        {"eval": "JSON.stringify({mics: document.querySelectorAll('.rv-mic').length, started: __started.length,"
+                 " note: document.querySelector('.rv-sendnote').textContent})"}])
+    got = json.loads(out["values"][2])
+    assert got["mics"] == 0 and got["started"] == 0 and "not installed" in got["note"] and "keyboard dictation key" in got["note"], got
+    out, _w = _run(tmp_path, w, "Installed", [
+        {"until": "document.querySelector('.rv-mic') && document.querySelector('.rv-mic').style.display !== 'none'"},
+        {"eval": "document.querySelector('.rv-mic').click(); __recs[0].lang"}])
+    assert out["values"][2] != ""            # lang is set explicitly from the document / browser language
+
+
+@needs_browser
+def test_dictation_errors_read_by_code(tmp_path, w):
+    want = {"not-allowed": "permission", "service-not-allowed": "permission", "audio-capture": "No microphone",
+            "no-speech": "Heard nothing", "language-not-supported": "not installed for this language", "network": "Dictation stopped."}
+    for code, words in want.items():
+        out, _w = _run(tmp_path, w, "Live", [
+            {"eval": "window.__err = '%s'; document.querySelector('.rv-mic').click();"
+                     " JSON.stringify({n: document.querySelector('.rv-sendnote').textContent, l: document.querySelector('.rv-mic').textContent})" % code}])
+        got = json.loads(out["values"][1])
+        assert words in got["n"] and got["l"] == "Dictate", (code, got)
+
+
+@needs_browser
+def test_typing_during_dictation_is_kept_and_the_next_result_extends_it(tmp_path, w):
+    """F4: the next result must not overwrite what was typed in between."""
+    out, _w = _run(tmp_path, w, "Live", [
+        {"eval": "const ta = document.querySelector('.rv-input'); document.querySelector('.rv-mic').click(); __recs[0].emit('one two');"
+                 " ta.value = ta.value + ' typed'; ta.dispatchEvent(new Event('input')); __recs[0].emit('one two three'); ta.value"},
+    ])
+    assert out["values"][1] == "one two typed three"
