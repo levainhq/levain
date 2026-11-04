@@ -170,6 +170,7 @@ class Supervisor:
         self._session_grace_s = session_grace_s  # what a row whose role is not read as a dream (sessionless) passes
         self._raised: set[str] = set()        # attention keys this process raised and has not resolved
         self._deferred: set[str] = set()      # rows the last pass left unasked past STOP_BUDGET_S
+        self._unstopped: set[str] = set()     # session rows whose stop was asked and not confirmed: not renewed (P7-1 S3)
 
     # --- the tick's shared refresh ---------------------------------------------------------------------------------
 
@@ -368,6 +369,8 @@ class Supervisor:
         rows = self._launched()
         graces: dict = {}
         for row in rows:
+            if row["session_key"] is not None and row["occurrence_id"] in self._unstopped:
+                continue   # a session this reaper was asked to stop and could not: its lease lapses to takeover, never renewed
             if self._renew(row, self._session_grace(row, graces)):
                 out.renewed.append(row["occurrence_id"])
         now = started = self._clock()
@@ -396,6 +399,7 @@ class Supervisor:
             self._stop_and_settle(row, reasons.get(oid), executor_of, attention, resolve, out)
         self._deferred = set(out.deferred)
         live = {r["occurrence_id"] for r in rows}
+        self._unstopped &= live
         for key in sorted(self._raised):          # raised here, and its row left launched since (or a resolve raised)
             if key[len(ATTENTION_PREFIX):] not in live:
                 self._resolve(key, resolve)
@@ -429,6 +433,8 @@ class Supervisor:
             out.asked.append(oid)
         if stop.terminated is not True:
             out.unconfirmed.append(oid)
+            if row["session_key"] is not None:
+                self._unstopped.add(oid)
             if attention is not None and key not in self._raised:
                 self._raised.add(key)
                 try:
@@ -454,6 +460,7 @@ class Supervisor:
             return
         if ended.ended:
             out.ended.append(oid)
+        self._unstopped.discard(oid)
         self._resolve(key, resolve)    # ended by this settle or by another path: the attention row is over either way
 
     # --- the run's natural end: the hook points --------------------------------------------------------------------

@@ -124,22 +124,23 @@ def test_a_revoke_mid_run_ends_stopped_only_after_a_confirmed_stop(rig):
 
 # --- 2: a stop that never confirms ---------------------------------------------------------------------------------
 
-def test_a_never_confirming_stop_stays_launched_holds_the_slot_renews_the_lease_and_raises_one_attention_row(rig):
-    # behaviour: terminated=False leaves the row launched with slot and reservation, the lease renewed every tick,
-    # stop() asked again each tick, and exactly one attention row naming the occurrence
+def test_a_never_confirming_stop_stays_launched_holds_the_slot_stops_renewing_the_lease_and_raises_one_attention_row(rig):
+    # behaviour: terminated=False leaves the row launched with slot and reservation, stop() asked again each tick,
+    # and exactly one attention row naming the occurrence. The row is a session row (it has a key): the pass that
+    # first fails to stop it renewed it before asking; later passes do not renew it (P7-1 S3), so its lease can lapse
     clock = Clock(rig)
     sup, journal = _sup(rig, clock)
     oid = _fire(rig, "a", journal)
     _claimed(rig, oid)
     _revoke(rig)
     ex, att = Ex(False), Attention()
-    leases = []
+    initial, leases = _lease(rig, oid), []
     for _ in range(3):
         clock.advance(400)       # past the first lease: only a renewal each tick keeps the row from lapsing
         out, _ = _reap(sup, ex, att)
         assert out.unconfirmed == [oid] and out.ended == []
         leases.append(_lease(rig, oid))
-    assert leases == sorted(set(leases)) and len(leases) == 3     # moved forward every tick
+    assert len(leases) == 3 and initial < leases[0] == leases[1] == leases[2]    # renewed by the first pass, frozen after it
     assert rig.row(oid)["state"] == "launched" and rig.taken(oid) == ([(1,)], [("open",)])
     assert ex.stops == 3
     assert list(att.rows) == [supervise.ATTENTION_PREFIX + oid] and att.calls == 1 and oid in att.rows[
