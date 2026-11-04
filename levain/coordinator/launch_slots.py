@@ -149,11 +149,11 @@ def take(coord, launch_id: str, *, clock: Callable[[], datetime] | None = None,
     directory = agent_dir(coord.directory)
     if directory is None or not slot_state(directory, attention):
         return None
-    store = _open(directory)
-    if store is None:
-        return None
     now = _now(clock)
     try:
+        store = _open(directory)
+        if store is None:
+            return None
         with store.read() as conn:
             expired = slots.expired_launches(conn, now)
         over = slots.probe_over(expired, *dispatch_probes(coord.directory))   # outside the write lock
@@ -173,10 +173,10 @@ def release(hold: Hold) -> bool:
     A hold this call did not take is not released."""
     if not hold.fresh:
         return False
-    store = _open(hold.directory)
-    if store is None:
-        return False
     try:
+        store = _open(hold.directory)
+        if store is None:
+            return False
         with store.write() as conn:
             return slots.release(conn, hold.launch_id)
     except Exception:  # noqa: BLE001 - see the docstring

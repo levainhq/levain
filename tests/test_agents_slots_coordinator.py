@@ -422,3 +422,29 @@ def test_a_launch_that_ended_between_passes_frees_its_slot_before_the_next_start
     lines = cl.watch_once(store)
     assert any("started: claude attach" in x for x in lines), lines
     assert sorted(k for _s, k, _o, _e in _held(astore)) == ["launch", "occurrence"]
+
+
+def test_a_locked_agent_store_at_open_is_a_slot_fault_and_the_launch_stays_pending(store, astore, fake, live_hook,
+                                                                                    monkeypatch):
+    def locked(directory):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("levain.agents.store.open_agent_store", locked)
+    launch_id = woken(store)
+    with pytest.raises(ls.SlotFault, match="database is locked"):
+        ls.take(store, launch_id)
+    got = cl.launch_session(store, launch_id)                      # does not raise: the pass survives
+    assert not got.started and "left pending" in got.refusal, got
+    assert store.launch(launch_id).state == "pending" and fake.spawns() == []
+
+
+def test_release_never_raises_when_the_agent_store_cannot_be_opened(store, astore, monkeypatch):
+    launch_id = woken(store)
+    hold = ls.take(store, launch_id)
+    assert hold is not None and hold.fresh
+
+    def locked(directory):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("levain.agents.store.open_agent_store", locked)
+    assert ls.release(hold) is False
