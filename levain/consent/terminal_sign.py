@@ -1,5 +1,8 @@
 """levain.consent.terminal_sign: the signer core of TERMSIGN, a band answer typed at the terminal and signed with
-the laptop's Touch ID key (design: project_memory/1102-5/TERMSIGN/DESIGN.md).
+the laptop's Touch ID key (design: project_memory/1102-5/TERMSIGN/DESIGN.md). A click in the cockpit at the laptop
+is the same key in a sibling format and namespace (``levain-desk-answer/1``, :data:`DESK_NAMESPACE`; design
+project_memory/1103-19/L5_DESIGN.md): the two are told apart by the format line and the namespace, and one
+:func:`_signed` binds either to its row.
 
 The signature is the only evidence; every other field is a label. One typed line is one message
 (``levain-terminal-answer/1``, SSHSIG namespace :data:`NAMESPACE`) that names, per entry, the row it answers and
@@ -42,15 +45,22 @@ from levain.cockpit.custody import SC_AUTH, SIDECAR_SUFFIX, TOUCH_ID, ctk_status
 from levain.cockpit.keys import KeyError_, Signer, signing_public_key
 from levain.trust_anchor import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
 
-__all__ = ["AnswerClass", "Entry", "FAILED_REASONS", "KEY_LABEL", "MessageError", "NAMESPACE", "FORMAT",
-           "ParsedMessage", "REASONS", "SCOPE_FIELDS", "SignOutcome", "StatusReport", "TerminalKey", "VerifyResult",
-           "answer_class", "build_message", "create", "default_signer_factory", "enroll_command", "event_time",
-           "find_key", "fresh", "is_remote", "parse_verified", "session_refusal", "sign", "status", "target_id",
-           "verify"]
+__all__ = ["AnswerClass", "DESK_FORMAT", "DESK_NAMESPACE", "DESK_SCOPE_FIELDS", "DESK_VIAS", "Entry", "FAILED_REASONS",
+           "KEY_LABEL", "MessageError", "NAMESPACE", "FORMAT", "ParsedDesk", "ParsedMessage", "REASONS",
+           "SCOPE_FIELDS", "SignOutcome", "StatusReport", "TERMINAL_VIAS", "TerminalKey", "VerifyResult", "answer_class",
+           "build_desk_message", "build_message", "create", "default_desk_signer_factory", "default_signer_factory",
+           "desk_origin", "desk_surface",
+           "enroll_command", "event_time", "find_key", "fresh", "is_remote", "parse_desk_verified", "parse_verified",
+           "session_refusal", "sign", "status", "target_id", "verify"]
 
 FORMAT = "levain-terminal-answer/1"
 NAMESPACE = "levain-terminal-answer"
-DESK_NAMESPACE = "levain-desk-answer"   # named in the signers line only; its format is L5a's
+DESK_FORMAT = "levain-desk-answer/1"
+DESK_NAMESPACE = "levain-desk-answer"
+DESK_VIAS = ("cockpit", "cockpit-desk")    # Levain's answer_context.via 'cockpit'; flow's resolve-event label
+TERMINAL_VIAS = ("terminal", "seat")       # the seat hook records 'seat'; a resolve event labels it 'terminal'
+GESTURES = ("click", "typed")
+COUNTERSIGNS = ("confirm", "disown")
 SIGNERS_NAMESPACES = f"{NAMESPACE},{DESK_NAMESPACE}"
 KEY_LABEL = "levain-terminal"
 MAX_BYTES = 8 * 1024
@@ -70,6 +80,8 @@ _AT = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 _AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _FP = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 _PRINCIPAL = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_ORIGIN = re.compile(r"http://(localhost|127\.0\.0\.1)(:[0-9]{1,5})?")
+_DESK_VIEW = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
 
 class MessageError(ValueError):
@@ -259,6 +271,14 @@ def parse_verified(signed: bytes) -> ParsedMessage:
     counter = None
     if i < len(lines) and lines[i].startswith("countersign-of: "):
         counter, i = _field(lines, i, "countersign-of", _VERSION)
+    entries = _parse_entries(lines, i, allow_note=True)
+    return ParsedMessage(store, install, session, view, typed_sha, typed, nonce, at, entries, counter,
+                         hashlib.sha256(bytes(signed)).hexdigest())
+
+
+def _parse_entries(lines: list[str], i: int, *, allow_note: bool) -> tuple[Entry, ...]:
+    """The entry blocks from line ``i`` to the end, strictly (shared by both formats; ``allow_note`` False for the
+    desk format, which has no ``note`` line)."""
     entries: list[Entry] = []
     while i < len(lines):
         number, i = _field(lines, i, "entry", re.compile(r"[1-9][0-9]{0,2}"))
@@ -273,7 +293,7 @@ def parse_verified(signed: bytes) -> ParsedMessage:
             answer, i = _field(lines, i, "answer", prefix="  ")
         else:
             free, i = _field(lines, i, "text", prefix="  ")
-        if i < len(lines) and lines[i].startswith("  note: "):
+        if allow_note and i < len(lines) and lines[i].startswith("  note: "):
             note, i = _field(lines, i, "note", prefix="  ")
         if i < len(lines) and lines[i].startswith("  ruling: "):
             ruling, i = _field(lines, i, "ruling", prefix="  ")
@@ -285,8 +305,121 @@ def parse_verified(signed: bytes) -> ParsedMessage:
         entries.append(Entry(item, version, asked, kind, answer, free, note, ruling))
     if not entries:
         raise MessageError("the message answers no entry")
-    return ParsedMessage(store, install, session, view, typed_sha, typed, nonce, at, tuple(entries), counter,
-                         hashlib.sha256(bytes(signed)).hexdigest())
+    return tuple(entries)
+
+
+# --- the desk format (TERMSIGN L5a; design 1103-19/L5_DESIGN.md section 1) -------------------------------------
+
+
+@dataclass(frozen=True)
+class ParsedDesk:
+    store: str
+    install: str
+    surface: str
+    origin: str
+    view: str
+    gesture: str
+    typed_sha256: str | None
+    typed: str | None
+    nonce: str
+    at: datetime
+    entries: tuple[Entry, ...]
+    countersign_of: str | None = None
+    countersign: str | None = None
+    message_sha256: str = ""
+
+
+def _at_text(at: datetime | None) -> str:
+    if at is not None and (not isinstance(at, datetime) or at.tzinfo is None or at.utcoffset() is None):
+        raise MessageError("`at` must be an aware datetime")
+    return (at or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime(_AT_FORMAT)
+
+
+def build_desk_message(*, store: str, install: str, surface: str, origin: str, view: str, gesture: str,
+                       entries: Sequence[Entry], typed: str | None = None, typed_block: str | None = None,
+                       nonce: str | None = None, at: datetime | None = None, countersign_of: str | None = None,
+                       countersign: str | None = None) -> bytes:
+    """The bytes the laptop key signs for a click (or a line typed) in the cockpit: ``levain-desk-answer/1``, signed in
+    :data:`DESK_NAMESPACE`. There is no ``via`` line: the format line and the namespace are the channel. A ``click``
+    names exactly one entry and carries no ``typed`` lines; ``typed`` names both and one entry or more.
+    ``countersign_of`` and ``countersign`` (``confirm`` or ``disown``) come together or not at all. ``view`` is the
+    band view the card was drawn from, or the literal ``item`` for a one-item click. Raises :class:`MessageError`
+    for a field out of form, an entry with a ``note``, or a message over :data:`MAX_BYTES`."""
+    entries = tuple(entries)
+    if not entries:
+        raise MessageError("a message answers at least one entry")
+    if gesture not in GESTURES:
+        raise MessageError(f"gesture is one of {', '.join(GESTURES)}")
+    if (gesture == "click") != (typed is None) or (gesture == "click" and typed_block is not None):
+        raise MessageError("a click carries no typed line and a typed gesture carries one")
+    if gesture == "click" and len(entries) != 1:
+        raise MessageError("a click answers exactly one entry")
+    if any(e.note is not None for e in entries):
+        raise MessageError("a desk entry has no note")
+    if (countersign_of is None) != (countersign is None) or (countersign is not None and countersign not in COUNTERSIGNS):
+        raise MessageError("countersign-of and countersign (confirm or disown) come together")
+    nonce = secrets.token_hex(8) if nonce is None else nonce
+    lines = [DESK_FORMAT, f"store: {_pattern(store, _STORE, 'store')}", f"install: {_pattern(install, _ID, 'install')}",
+             f"surface: {_pattern(surface, _ID, 'surface')}", f"origin: {_pattern(origin, _ORIGIN, 'origin')}",
+             f"view: {_pattern(view, _DESK_VIEW, 'view')}", f"gesture: {gesture}"]
+    if gesture == "typed":
+        said = _line(unicodedata.normalize("NFC", typed) if isinstance(typed, str) else typed, "typed")
+        lines += [f"typed-sha256: {_sha(said if typed_block is None else typed_block)}", f"typed: {said}"]
+    lines += [f"nonce: {_pattern(nonce, _NONCE, 'nonce')}", f"at: {_at_text(at)}"]
+    if countersign_of is not None:
+        lines += [f"countersign-of: {_pattern(countersign_of, _VERSION, 'countersign-of')}",
+                  f"countersign: {countersign}"]
+    for n, e in enumerate(entries, 1):
+        lines.extend(_entry_lines(n, e))
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    if len(data) > MAX_BYTES:
+        raise MessageError(f"the message is {len(data)} bytes; the bound is {MAX_BYTES}")
+    return data
+
+
+def parse_desk_verified(signed: bytes) -> ParsedDesk:
+    """The fields of desk bytes that VERIFIED, read as strictly as :func:`parse_verified`: the order
+    :func:`build_desk_message` writes, nothing before, between or after, a click with its one entry and no typed
+    lines, a typed gesture with both typed lines, ``countersign`` present exactly when ``countersign-of`` is."""
+    if not isinstance(signed, (bytes, bytearray)) or len(signed) > MAX_BYTES:
+        raise MessageError("not a message of this format, or over the size bound")
+    try:
+        text = bytes(signed).decode("utf-8")
+    except UnicodeDecodeError:
+        raise MessageError("the message is not UTF-8") from None
+    if not text.endswith("\n") or text.endswith("\n\n"):
+        raise MessageError("the message does not end in exactly one newline")
+    lines = text[:-1].split("\n")
+    if lines[0] != DESK_FORMAT:
+        raise MessageError("not a levain-desk-answer/1 message")
+    i = 1
+    store, i = _field(lines, i, "store", _STORE)
+    install, i = _field(lines, i, "install", _ID)
+    surface, i = _field(lines, i, "surface", _ID)
+    origin, i = _field(lines, i, "origin", _ORIGIN)
+    view, i = _field(lines, i, "view", _DESK_VIEW)
+    gesture, i = _field(lines, i, "gesture", re.compile("|".join(GESTURES)))
+    typed_sha = typed = None
+    if gesture == "typed":
+        typed_sha, i = _field(lines, i, "typed-sha256", _SHA)
+        typed, i = _field(lines, i, "typed")
+        if len(typed) > LINE_MAX or unicodedata.normalize("NFC", typed) != typed:
+            raise MessageError("the typed line is over the bound or not NFC")
+    nonce, i = _field(lines, i, "nonce", _NONCE)
+    at_text, i = _field(lines, i, "at", _AT)
+    try:
+        at = datetime.strptime(at_text, _AT_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise MessageError("`at` is not a time") from None
+    counter = which = None
+    if i < len(lines) and lines[i].startswith("countersign-of: "):
+        counter, i = _field(lines, i, "countersign-of", _VERSION)
+        which, i = _field(lines, i, "countersign", re.compile("|".join(COUNTERSIGNS)))
+    entries = _parse_entries(lines, i, allow_note=False)
+    if gesture == "click" and len(entries) != 1:
+        raise MessageError("a click answers exactly one entry")
+    return ParsedDesk(store, install, surface, origin, view, gesture, typed_sha, typed, nonce, at, entries, counter,
+                      which, hashlib.sha256(bytes(signed)).hexdigest())
 
 
 def fresh(parsed: ParsedMessage, event_ts: datetime) -> bool:
@@ -552,6 +685,12 @@ def default_signer_factory(key_path: Path, timeout: float | None = None) -> tupl
     return _keys.ssh_signer(key_path, namespace=NAMESPACE, timeout=timeout)
 
 
+def default_desk_signer_factory(key_path: Path, timeout: float | None = None) -> tuple[str, Signer]:
+    """:func:`default_signer_factory` for the desk format: the same key, signing in :data:`DESK_NAMESPACE`. The only
+    other door to the real key."""
+    return _keys.ssh_signer(key_path, namespace=DESK_NAMESPACE, timeout=timeout)
+
+
 def is_remote(env: Mapping[str, str] | None = None, presence: str | None = None) -> bool:
     """Routing only (never evidence): the desk is remote when the presence says so or the hook runs in an ssh
     session. A false "local" costs a prompt nobody touches, which times out."""
@@ -736,12 +875,16 @@ def _refuse(problem: str, **kw: Any) -> VerifyResult:
 
 
 def verify(message: bytes, sig: str, signers: str, principal: str, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-           ctk: Callable[[str], tuple[bool | None, str]] | None = None, timeout: float = 10.0) -> VerifyResult:
-    """Whether ``sig`` is an SSHSIG over ``message`` in :data:`NAMESPACE` by a key ``signers`` (the text of an
+           ctk: Callable[[str], tuple[bool | None, str]] | None = None, timeout: float = 10.0,
+           namespace: str = NAMESPACE) -> VerifyResult:
+    """Whether ``sig`` is an SSHSIG over ``message`` in ``namespace`` (:data:`NAMESPACE`, or :data:`DESK_NAMESPACE`
+    for a desk click; any other is refused) by a key ``signers`` (the text of an
     allowed-signers file) lists for ``principal``. Stock ``ssh-keygen -Y verify``; the signers and the signature
     reach it through pipes. A FIDO signature must carry the user-presence flag. The key's live CTK status on this
     Mac (``ctk``, default :func:`ctk_status`) is read from the signature's own key: False refuses, None only
     weakens the claim. Raises :class:`VerifierUnavailable` when ssh-keygen cannot run (never a verdict)."""
+    if namespace not in (NAMESPACE, DESK_NAMESPACE):
+        return _refuse("the namespace is not one this module signs in")
     if not isinstance(message, (bytes, bytearray)) or len(message) > MAX_BYTES:
         return _refuse("the message is over the size bound")
     if not isinstance(principal, str) or _PRINCIPAL.fullmatch(principal) is None:
@@ -765,7 +908,7 @@ def verify(message: bytes, sig: str, signers: str, principal: str, *, ssh_keygen
         fds.append(_pipe_reading(signers_bytes))
         fds.append(_pipe_reading(sig_bytes))
         cp = subprocess.run([str(keygen), "-Y", "verify", "-f", f"/dev/fd/{fds[0]}", "-I", principal,
-                             "-n", NAMESPACE, "-s", f"/dev/fd/{fds[1]}"], input=bytes(message),
+                             "-n", namespace, "-s", f"/dev/fd/{fds[1]}"], input=bytes(message),
                             capture_output=True, timeout=timeout, env=dict(_VERIFY_ENV), pass_fds=tuple(fds))
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         raise VerifierUnavailable(f"ssh-keygen could not verify a terminal signature ({type(exc).__name__})") from None
@@ -778,7 +921,7 @@ def verify(message: bytes, sig: str, signers: str, principal: str, *, ssh_keygen
     if cp.returncode != 0:
         return _refuse("the signature does not verify for this principal in this namespace", flags=flags,
                        public_key=public_key)
-    good = re.compile(r'Good "' + re.escape(NAMESPACE) + r'" signature for ' + re.escape(principal)
+    good = re.compile(r'Good "' + re.escape(namespace) + r'" signature for ' + re.escape(principal)
                       + r' with \S+ key (SHA256:[A-Za-z0-9+/]{43})')
     out = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
     found = [m.group(1) for line in out.splitlines() if (m := good.match(line.strip()))]
@@ -800,7 +943,7 @@ def verify(message: bytes, sig: str, signers: str, principal: str, *, ssh_keygen
     else:
         claim = f"signed by the enrolled laptop key ({fp_claimed}), custody touch-id as recorded"
     return VerifyResult(True, fp_claimed, flags, present, verified, live, detail, public_key, claim,
-                        "signed: Touch ID, laptop")
+                        "signed: Touch ID, laptop" + (" (desk)" if namespace == DESK_NAMESPACE else ""))
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -809,18 +952,64 @@ def verify(message: bytes, sig: str, signers: str, principal: str, *, ssh_keygen
 
 @dataclass(frozen=True)
 class AnswerClass:
-    state: str          # signed-terminal | unsigned-terminal | agent-resolved | legacy | failed
+    state: str          # signed-terminal | disowned | unsigned-terminal | agent-resolved | legacy | failed
     signer_fp: str | None = None
     claim: str = ""
     detail: str = ""
     late: bool = False
     reason: str = ""    # failed only: one of FAILED_REASONS
+    channel: str = ""   # signed-terminal and disowned: where he signed, "terminal" or "desk"
+
+    @property
+    def badge(self) -> str:
+        """The words a reader shows for this state (empty when there is nothing to show)."""
+        if self.state == "signed-terminal":
+            return "signed: Touch ID, laptop" + (" (desk)" if self.channel == "desk" else "")
+        if self.state == "disowned":
+            return "you said this answer was not you"
+        return ""
+
+
+def desk_origin(host: Any, port: int) -> str | None:
+    """The one origin a desk message signs: ``http://<host>`` for the request's validated ``Host`` when it names
+    this server's own port on ``localhost`` or ``127.0.0.1`` (case folded), else None (the route refuses)."""
+    if not isinstance(host, str) or not isinstance(port, int) or isinstance(port, bool):
+        return None
+    h = host.lower()
+    if h not in (f"localhost:{port}", f"127.0.0.1:{port}"):
+        return None
+    return f"http://{h}"
+
+
+def desk_surface(name: Any) -> str:
+    """The surface a desk message signs for a cockpit credential ``name``: the name itself when it is in the
+    message's form and does not start with ``x--``, else ``x--`` and the SHA-256 of its UTF-8 bytes (so two names
+    never sign as one, and a name outside the form is never collapsed to another credential's)."""
+    text = name if isinstance(name, str) else ""
+    if _ID.fullmatch(text) and not text.startswith("x--"):
+        return text
+    return "x--" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 # why a signed block is `failed` (machine-readable; `detail` says it in words)
 FAILED_REASONS = ("malformed", "verifier-unavailable", "bad-signature", "scope-mismatch", "countersign-mismatch",
-                  "not-this-row", "answer-mismatch", "stale", "classifier-error")
+                  "not-this-row", "answer-mismatch", "stale", "classifier-error", "channel-mismatch")
 SCOPE_FIELDS = ("store", "install", "session", "view")
+DESK_SCOPE_FIELDS = ("store", "install", "surface", "origin", "view")
+
+
+@dataclass(frozen=True)
+class _Spec:
+    """What differs between the two signed formats; every binding check is the one :func:`_signed`."""
+    format: str
+    namespace: str
+    parse: Callable[[bytes], Any]
+    scope_fields: tuple[str, ...]
+    channel: str
+
+
+_TERMINAL = _Spec(FORMAT, NAMESPACE, parse_verified, SCOPE_FIELDS, "terminal")
+_DESK = _Spec(DESK_FORMAT, DESK_NAMESPACE, parse_desk_verified, DESK_SCOPE_FIELDS, "desk")
 
 
 @dataclass
@@ -880,60 +1069,70 @@ def _recorded(answer: Mapping[str, Any]) -> tuple[str, str] | None:
     return None
 
 
-def _terminal_signed(signed: Any, recorded: Mapping[str, Any], row: Mapping[str, Any] | None, ctx: _Ctx,
-                     scope: Mapping[str, Any], event_ts: Any, countersign_of: str | None) -> AnswerClass:
-    """Good only if the signature verifies in the terminal namespace, the bytes parse, the four signed scope
-    fields equal ``scope``, the signed ``countersign-of`` is exactly ``countersign_of`` (absent on a direct
-    answer), the entry the block names is the row it is attached to (item, row_version, asked), the answer
-    ``recorded`` holds is the signed one in kind and value, and ``at`` is fresh against ``event_ts``."""
-    if not isinstance(signed, Mapping) or signed.get("format") != FORMAT:
-        return _failed("malformed", "not a terminal signature")
+def _signed(spec: _Spec, signed: Any, recorded: Mapping[str, Any], row: Mapping[str, Any] | None, ctx: _Ctx,
+            scope: Mapping[str, Any], event_ts: Any, countersign_of: str | None,
+            want: str | None = None) -> tuple[AnswerClass, Any]:
+    """Good only if the signature verifies in ``spec``'s namespace, the bytes parse as ``spec``'s format, the
+    signed scope fields equal ``scope``, the signed ``countersign-of`` is exactly ``countersign_of`` (absent on a
+    direct answer), a signed ``countersign`` value (desk format) agrees with ``want`` when the event names one, the
+    entry the block names is the row it is attached to (item, row_version, asked), the answer ``recorded`` holds is
+    the signed one in kind and value, and ``at`` is fresh against ``event_ts``. Returns the class and, when the
+    bytes parsed, the parse (so a caller can read the signed ``countersign`` value)."""
+    noun = f"{spec.channel} signature"
+    if not isinstance(signed, Mapping) or signed.get("format") != spec.format:
+        return _failed("malformed", f"not a {noun}"), None
     message, sig = signed.get("message"), signed.get("sig")
     if not isinstance(message, str) or not isinstance(sig, str):
-        return _failed("malformed", "the signed block carries no message and signature")
+        return _failed("malformed", "the signed block carries no message and signature"), None
     try:
         raw = message.encode("utf-8")
     except UnicodeError:
-        return _failed("malformed", "the signed message is not UTF-8 encodable")
+        return _failed("malformed", "the signed message is not UTF-8 encodable"), None
     try:
-        got = verify(raw, sig, ctx.signers, ctx.principal, ssh_keygen=ctx.ssh_keygen, ctk=ctx.ctk)
+        got = verify(raw, sig, ctx.signers, ctx.principal, ssh_keygen=ctx.ssh_keygen, ctk=ctx.ctk,
+                     namespace=spec.namespace)
     except (VerifierUnavailable, KeyError_, OSError, subprocess.SubprocessError) as exc:
-        return _failed("verifier-unavailable", f"the signature could not be checked: {_one_line(exc)}")
+        return _failed("verifier-unavailable", f"the signature could not be checked: {_one_line(exc)}"), None
     if not got.ok:
-        return _failed("bad-signature", got.problem)
+        return _failed("bad-signature", got.problem), None
     try:
-        parsed = parse_verified(raw)
+        parsed = spec.parse(raw)
     except MessageError as exc:
-        return _failed("malformed", f"signed bytes are not a terminal answer: {exc}")
+        return _failed("malformed", f"signed bytes are not a {spec.channel} answer: {exc}"), None
     if signed.get("message_sha256") not in (None, parsed.message_sha256):
-        return _failed("malformed", "message_sha256 is not the message's")
-    for name in SCOPE_FIELDS:
-        want = scope.get(name)
-        if not isinstance(want, str) or not want or getattr(parsed, name) != want:
-            return _failed("scope-mismatch", f"the signed {name} is not this answer's (or the reader named none)")
+        return _failed("malformed", "message_sha256 is not the message's"), parsed
+    for name in spec.scope_fields:
+        have = scope.get(name)
+        if not isinstance(have, str) or not have or getattr(parsed, name) != have:
+            return _failed("scope-mismatch", f"the signed {name} is not this answer's (or the reader named none)"), parsed
     if countersign_of is None and parsed.countersign_of is not None:
-        return _failed("countersign-mismatch", "a countersign message presented as a direct answer")
+        return _failed("countersign-mismatch", "a countersign message presented as a direct answer"), parsed
     if countersign_of is not None and parsed.countersign_of != countersign_of:
-        return _failed("countersign-mismatch", "the signed countersign-of does not name this answer")
+        return _failed("countersign-mismatch", "the signed countersign-of does not name this answer"), parsed
+    if countersign_of is not None:
+        # the kind a countersign SIGNED: the desk format names it; the terminal format can only confirm
+        kind = parsed.countersign if spec.channel == "desk" else "confirm"
+        if kind not in COUNTERSIGNS or (want is not None and want != kind):
+            return _failed("countersign-mismatch", "the signed countersign is not the kind this event claims"), parsed
     n = signed.get("entry")
     if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= len(parsed.entries):
-        return _failed("not-this-row", "the event names no entry of the signed message")
+        return _failed("not-this-row", "the event names no entry of the signed message"), parsed
     entry = parsed.entries[n - 1]
     if not isinstance(row, Mapping):
-        return _failed("not-this-row", "no row to bind the entry to")
+        return _failed("not-this-row", "no row to bind the entry to"), parsed
     if (entry.item != row.get("id") or entry.row_version != row.get("row_version")
             or entry.asked != row.get("what")):
-        return _failed("not-this-row", "the signed entry is not this row (item, version or question)")
+        return _failed("not-this-row", "the signed entry is not this row (item, version or question)"), parsed
     kept = _recorded(recorded)
     signed_answer = ("answer", entry.answer) if entry.answer is not None else ("text", entry.text)
     if kept is None or kept != signed_answer:
-        return _failed("answer-mismatch", "the recorded answer is not the signed one (kind or words)")
+        return _failed("answer-mismatch", "the recorded answer is not the signed one (kind or words)"), parsed
     when = event_time(event_ts)
     if when is None:
-        return _failed("stale", "the event has no aware time to bound the signature by")
+        return _failed("stale", "the event has no aware time to bound the signature by"), parsed
     if not fresh(parsed, when):
-        return _failed("stale", "the signature is not within ten minutes before the event")
-    return AnswerClass("signed-terminal", got.fingerprint, got.claim)
+        return _failed("stale", "the signature is not within ten minutes before the event"), parsed
+    return AnswerClass("signed-terminal", got.fingerprint, got.claim, channel=spec.channel), parsed
 
 
 def answer_class(answer: Mapping[str, Any], row: Mapping[str, Any] | None = None, context: Mapping[str, Any] | None = None
@@ -948,14 +1147,36 @@ def answer_class(answer: Mapping[str, Any], row: Mapping[str, Any] | None = None
     and an ``at`` fresh against the answer's own ``ts``. A countersign is a later event ``{of_ts, ts, session,
     view, signed}``: its signed ``countersign-of`` must name the answer (:func:`target_id`), its store and install
     are the context's, its session and view its own event's, and its ``at`` is bounded by its own ``ts``; it
-    confirms the answer the original event recorded. Any missing expected field fails closed.
+    confirms the answer the original event recorded. A desk countersign ``{of_ts, ts, surface, origin, view, signed}``
+    is scoped like a direct answer: every field from the context (the reader's origin, surface and view), and the
+    event's own surface, origin and view must each equal them. Any missing expected field fails closed.
 
-    Order: a ``signed`` block that re-verifies, else a verifying countersign (marked late), else the labels,
+    Order: a ``signed`` block that re-verifies (its format picks the namespace and the parser; a format that
+    disagrees with ``via`` is ``channel-mismatch``), else a verifying countersign (marked late; a verified desk
+    ``disown`` makes the state ``disowned``), else the labels,
     which never confer anything. No field a hook or CLI writes is read as evidence."""
     try:
         return _answer_class(answer, row, context)
     except Exception as exc:  # noqa: BLE001 - the chokepoint classifies, it never crashes a reader
         return _failed("classifier-error", f"the answer could not be classified: {_one_line(exc)}")
+
+
+_DESK_READER_FIELDS = ("surface", "origin", "view")
+
+
+def _scope_for(spec: _Spec, c: Mapping[str, Any], cs: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """The scope a reader expects: from its context for a direct answer and for a desk countersign (the reader's own
+    origin, surface and view: the event's claims are only compared against them, :func:`_desk_claims_agree`); for a
+    terminal countersign the reader's store and install and the event's own session and view."""
+    if cs is None or spec.channel == "desk":
+        return {name: c.get(name) for name in spec.scope_fields}
+    return {"store": c.get("store"), "install": c.get("install"), "session": cs.get("session"), "view": cs.get("view")}
+
+
+def _desk_claims_agree(cs: Mapping[str, Any], scope: Mapping[str, Any]) -> bool:
+    """A desk countersign event's own surface, origin and view each name what the reader expects (an absent claim
+    does not agree)."""
+    return all(isinstance(cs.get(n), str) and cs.get(n) == scope.get(n) for n in _DESK_READER_FIELDS)
 
 
 def _answer_class(answer: Any, row: Any, context: Any) -> AnswerClass:
@@ -964,19 +1185,55 @@ def _answer_class(answer: Any, row: Any, context: Any) -> AnswerClass:
     c = dict(context or {})
     ctx = _Ctx(c.get("signers", ""), c.get("principal", "phill"), c.get("ssh_keygen", DEFAULT_SSH_KEYGEN),
                c.get("ctk"), tuple(c.get("countersigns") or ()), c.get("store"), c.get("install"))
-    if answer.get("signed") is not None:
-        scope = {name: c.get(name) for name in SCOPE_FIELDS}
-        return _terminal_signed(answer.get("signed"), answer, row, ctx, scope, answer.get("ts"), None)
+    via = answer.get("via")
+    signed = answer.get("signed")
+    if signed is not None:
+        fmt = signed.get("format") if isinstance(signed, Mapping) else None
+        if fmt == FORMAT:
+            # a via naming another channel is a transplant; an event with no via is judged by its namespace (flow's
+            # needs_phill_sign reader passes the terminal block without the event's label)
+            if via is not None and via not in TERMINAL_VIAS:
+                return _failed("channel-mismatch", "a terminal-namespace signature on an answer not made at a terminal")
+            spec = _TERMINAL
+        elif fmt == DESK_FORMAT:
+            if via not in DESK_VIAS:
+                return _failed("channel-mismatch", "a desk-namespace signature on an answer that was not made at the desk")
+            spec = _DESK
+        else:
+            return _failed("malformed", "not a terminal signature")
+        return _signed(spec, signed, answer, row, ctx, _scope_for(spec, c), answer.get("ts"), None)[0]
     target = target_id(answer)
+    confirmed: AnswerClass | None = None
     for cs in ctx.countersigns:
         if target is None or not isinstance(cs, Mapping) or cs.get("of_ts") != answer.get("ts") \
                 or cs.get("signed") is None:
             continue
-        scope = {"store": ctx.store, "install": ctx.install, "session": cs.get("session"), "view": cs.get("view")}
-        got = _terminal_signed(cs.get("signed"), answer, row, ctx, scope, cs.get("ts"), target)
-        if got.state == "signed-terminal":
-            return AnswerClass(got.state, got.signer_fp, got.claim, "countersigned later", late=True)
-    via = answer.get("via")
+        block = cs.get("signed")
+        fmt = block.get("format") if isinstance(block, Mapping) else None
+        # a countersign has its own channel: one that names its via must name a label of its format's channel; one
+        # that names none is judged by its namespace alone
+        cs_via = cs.get("via")
+        if fmt == FORMAT and (cs_via is None or cs_via in TERMINAL_VIAS):
+            spec = _TERMINAL
+        elif fmt == DESK_FORMAT and (cs_via is None or cs_via in DESK_VIAS):
+            spec = _DESK
+        else:
+            continue
+        scope = _scope_for(spec, c, cs)
+        if spec.channel == "desk" and not _desk_claims_agree(cs, scope):
+            continue
+        got, parsed = _signed(spec, block, answer, row, ctx, scope, cs.get("ts"), target, want=cs.get("countersign"))
+        if got.state != "signed-terminal":
+            continue
+        if getattr(parsed, "countersign", None) == "disown":      # a verified disown outranks every confirm
+            return AnswerClass("disowned", got.signer_fp, got.claim, "disowned later", late=True, channel=spec.channel)
+        if confirmed is None:
+            confirmed = AnswerClass(got.state, got.signer_fp, got.claim, "countersigned later", late=True,
+                                    channel=spec.channel)
+    if confirmed is not None:
+        return confirmed
+    if via == "cockpit-desk":      # only a signed desk write carries this label; a bare one is a forgery signal
+        return _failed("channel-mismatch", "the desk label without a desk signature")
     if via == "terminal":
         un = answer.get("unsigned")
         reason = un.get("reason") if isinstance(un, Mapping) else None

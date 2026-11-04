@@ -2121,6 +2121,18 @@ class ConsentQueue:
         return Ruling(request_id=request.id, ruling=decision, signer_fp=payload["signer_fp"], decided_at=stamp,
                       signed_at=payload["signed_at"], request_digest=request.digest, gap=gap[0])
 
+    @staticmethod
+    def _carrier(message: bytes) -> tuple[Callable[[bytes], Any], str, tuple[str, ...], str]:
+        """``(parse, namespace, scope fields, noun)`` of the signed format a ruling was carried in, read from the
+        message's first line: the terminal answer or the desk answer (TERMSIGN L5b). Each is judged by its own
+        parser and in its own SSHSIG namespace; there is no other. Anything else is a terminal answer, whose parser
+        then refuses it."""
+        from levain.consent import terminal_sign as ts
+
+        if message.split(b"\n", 1)[0] == ts.DESK_FORMAT.encode("ascii"):
+            return ts.parse_desk_verified, ts.DESK_NAMESPACE, ts.DESK_SCOPE_FIELDS, "desk answer"
+        return ts.parse_verified, ts.NAMESPACE, ts.SCOPE_FIELDS, "terminal answer"
+
     def _terminal_message(self, request_id: str) -> bytes | None:
         """The terminal answer a ruled request's ruling was carried in (:meth:`answer_terminal_ruling`), or ``None``
         for a ruling signed on its own."""
@@ -2156,39 +2168,40 @@ class ConsentQueue:
         from levain.authority_sig import _signers_line
         from levain.consent import terminal_sign as ts
 
+        parse, namespace, _scope, noun = ConsentQueue._carrier(message)
         why = ConsentQueue._ruling_record_refusal(request, queue_id, gap, payload)
         if why is not None:
             return why
         if payload["decision"] != "allow":
-            return "a terminal answer carries a ruling ALLOW only"
+            return f"a {noun} carries a ruling ALLOW only"
         try:
             text = ruling_message(dict(payload)).decode("utf-8")
-            parsed = ts.parse_verified(message)
+            parsed = parse(message)
         except (ConsentError, ts.MessageError, UnicodeError) as exc:
-            return f"the terminal answer or its ruling is not well formed: {exc}"
+            return f"the {noun} or its ruling is not well formed: {exc}"
         if sum(1 for e in parsed.entries if e.ruling == text) != 1:
-            return "the terminal answer carries this ruling in no entry, or in more than one"
+            return f"the {noun} carries this ruling in no entry, or in more than one"
         signer_fp = payload["signer_fp"]
         key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
         refused = _key_refusal(key, "allow", request, noun="ruling")
         if refused is not None:
             return refused[1]
         if key.key_class != LAPTOP:
-            return f"key class {key.key_class} cannot sign a terminal ruling: it needs {LAPTOP}"
+            return f"key class {key.key_class} cannot sign a {noun} ruling: it needs {LAPTOP}"
         problem = custody_mismatch(key.public_key, key.custody)
         if problem is not None:
             return problem
         principal = "authority-signer"
         keygen: dict[str, Any] = {} if self._ssh_keygen is None else {"ssh_keygen": self._ssh_keygen}
         try:
-            got = ts.verify(message, signature, _signers_line(principal, ts.NAMESPACE, key.public_key), principal,
-                            ctk=ctk, **keygen)
+            got = ts.verify(message, signature, _signers_line(principal, namespace, key.public_key), principal,
+                            ctk=ctk, namespace=namespace, **keygen)
         except (VerifierUnavailable, ts.KeyError_) as exc:
-            return f"the terminal answer could not be verified: {exc}"
+            return f"the {noun} could not be verified: {exc}"
         if not got.ok:
-            return f"the terminal answer's signature does not verify: {got.problem}"
+            return f"the {noun}'s signature does not verify: {got.problem}"
         if got.fingerprint != key.fingerprint or got.fingerprint != payload["signer_fp"]:
-            return "the terminal answer is signed by another key than the ruling's signer"
+            return f"the {noun} is signed by another key than the ruling's signer"
         return None
 
     def answer_terminal_ruling(self, request_id: str, message: bytes, signature: str, *, item: str,
@@ -2210,14 +2223,15 @@ class ConsentQueue:
         if not isinstance(message, (bytes, bytearray)) or not isinstance(signature, str):
             raise AnswerRefused("a terminal ruling needs the signed message and its signature")
         message = bytes(message)
+        parse, _namespace, scope_fields, noun = self._carrier(message)
         try:
-            parsed = ts.parse_verified(message)
+            parsed = parse(message)
         except ts.MessageError as exc:
-            raise AnswerRefused(f"not a terminal answer: {exc}") from None
-        for name in ts.SCOPE_FIELDS:
+            raise AnswerRefused(f"not a {noun}: {exc}") from None
+        for name in scope_fields:
             want = scope.get(name) if isinstance(scope, Mapping) else None
             if not isinstance(want, str) or not want or getattr(parsed, name) != want:
-                raise AnswerRefused(f"the terminal answer's {name} is not the one this ruling was asked for")
+                raise AnswerRefused(f"the {noun}'s {name} is not the one this ruling was asked for")
         if parsed.countersign_of is not None:
             raise AnswerRefused("a countersign carries no ruling")
         entries = [e for e in parsed.entries if e.item == item]
