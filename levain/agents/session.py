@@ -142,19 +142,12 @@ class Reserved:
 
 
 def _signed_by_spec(store: AgentStore, occurrence_id: str) -> tuple[int | None, str | None]:
-    """``(stop_at, role_hash)`` of the spec the occurrence launched under, trusted only when the stored text
-    re-hashes to the occurrence's ``spec_hash`` in canonical form (the check ``spec._check_row`` makes). Each is None
-    when it cannot be read."""
+    """``(stop_at, role_hash)`` of the spec the occurrence launched under, read through
+    :func:`levain.agents.spec.occurrence_spec` (re-hashed, signed name equal to the row's). Each is None when it
+    cannot be read."""
     from levain.agents import spec as _spec
     try:
-        with store.read() as conn:
-            row = conn.execute("SELECT o.agent_id, o.spec_hash, s.spec FROM agent_occurrences o JOIN agent_specs s"
-                               " ON s.spec_hash = o.spec_hash WHERE o.occurrence_id = ?", (occurrence_id,)).fetchone()
-        if row is None or not isinstance(row[2], str):
-            return None, None
-        spec = _spec.parse_spec_text(row[2])
-        if _spec.spec_hash(row[0], spec) != row[1] or _spec.canonical_spec(spec) != row[2]:
-            return None, None
+        spec = _spec.occurrence_spec(store, occurrence_id)
     except Exception:  # noqa: BLE001 - an unreadable spec signs nothing; the caller refuses on None
         return None, None
     stop_at = spec.get("stop_at")
