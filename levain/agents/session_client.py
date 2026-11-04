@@ -1,0 +1,665 @@
+"""levain.agents.session_client: the operator-side client of the dispatch run server, and the wire codec both halves
+share (BUILD_PLAN P7-1 slices S9 + S10a; design ``1104-27_S10_DESIGN.md`` sections 2, 3.2-3.4, 6 F1/F12).
+
+The shape (design section 2, option (a)): :class:`levain.agents.session_launcher.RealLauncher` runs, unchanged, inside a
+``_levain_dispatch`` process (the run server, S10b); the fire (the operator uid) holds this client in its place. The
+client is a :class:`levain.agents.session.SessionLauncher` AND a :class:`levain.agents.session.SessionEnder`, so
+``run_session`` spawns through it and the reaper's ``RowSessionExecutor`` ends through it, with one name per side and
+one act (S9, finding A: ``RealLauncher`` itself has only ``stop``, which stays server-internal).
+
+**The wire (``levain-run/1``).** A unix stream; every frame is a 4-byte big-endian length plus canonical JSON
+(:mod:`levain.contracts.canon`: ints, no floats, so every duration is whole milliseconds), at most
+:data:`RUN_FRAME_MAX` bytes (a brief alone may be 64 KiB, so :data:`levain.slot.FRAME_MAX` does not fit). One request,
+one answer, on the connection that asked. A request is ``{"p": "levain-run/1", "op", "id", ...}``; an answer is
+``{"id", "ok": true, ...}`` or ``{"id", "ok": false, "refused": <name>[, "detail", "reason_class"]}``. Both halves
+decode through the strict functions here (exact key sets, exact types), so a field neither side names is a wire
+error, never silently carried.
+
+* A **holder** connection is one session's lifeline: ``LAUNCH`` (typed launch + the signature proof), then ``RELEASE``,
+  ``WAIT`` (a bounded long-poll; ``timeout_ms`` 0 is a poll), ``TERM`` and ``ABORT``. Its EOF is the server's cue to
+  END the session (design 3.4); the client therefore CLOSES it on any fault.
+* A **short** connection carries ``USAGE`` or ``END`` for a session key and nothing else.
+
+**What never crosses.** The ticket and the run id are minted and kept on the dispatch uid (design port items (2), (3)):
+no request has a field for either, no answer may carry one (an answer with any key outside its exact set is a wire
+fault), and the client holds neither. The only identity the client sends is the occurrence and the session key the
+supervisor recorded.
+
+**Q1 = (b): what the client carries so the server can verify his signature at the point of use** (:class:`LinkProof`).
+Derived, not invented: the fire already holds the occurrence's signed spec (``spec_hash``) and the agent link it
+launched under (``link_id``), both on the occurrence row, and the link is a signed record in the cockpit authority log
+(``levain.authority``). The proof is that link's born and current log rows (``seq``, ``prev_hash``, ``record``,
+``signer_fp``, ``signature``: the signed message is ``prev_hash + "\\n" + record``) plus the occurrence id and spec
+hash. **What his existing signature does and does not cover** (said here because the design's wording over-reads it):
+the link's signature covers the spec hash, the agent, the store, the binding and the per-run budgets; it cannot cover
+an occurrence id, which does not exist when he signs. The occurrence id travels beside the proof, not inside the
+signature, so the server's check is: a valid signature by an enrolled key over a link that names this spec hash, and
+the requested exposure within the link's budgets. S10b verifies; nothing in this module judges a signature.
+
+**Any transport fault reads as unproven.** A holder that loses its server answers
+:data:`levain.agents.controller.GATE_UNPROVEN` from ``poll`` and ``wait`` (never a termination proof, so the run is
+never ``done`` on a broken wire and keeps its slot for the reaper); ``usage`` that cannot be read is the caps; an
+``end_session`` that cannot be answered is ``StopResult(False, ...)``. A ``spawn`` that fails BEFORE the request is
+sent raises (nothing was allocated); one that fails after it returns a down child instead of raising, because the
+server may hold a session (the launcher contract: a launcher that cannot undo what it allocated must not raise).
+"""
+from __future__ import annotations
+
+import logging
+import re
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from levain.agents import controller as _ctl
+from levain.agents.accounting import ActionExposure, StopResult, Usage
+from levain.agents.session import S1_DISPATCH, SessionLaunch
+from levain.agents.session_launcher import LauncherRefused
+from levain.contracts import ContractError, canon
+
+__all__ = ["PROTOCOL", "RUN_FRAME_MAX", "LAUNCHER_NAME", "WAIT_SLICE_S", "WireError", "ProofUnavailable", "LinkRow",
+           "LinkProof", "encode_run_frame", "read_run_frame", "check_run_request", "ok_answer", "refused_answer",
+           "launch_to_wire", "launch_from_wire", "usage_to_wire", "usage_from_wire", "link_proof",
+           "default_run_socket", "unix_connector", "DispatchSessionLauncher", "build_launcher"]
+
+_log = logging.getLogger("levain.agents.session_client")
+
+PROTOCOL = "levain-run/1"
+LAUNCHER_NAME = "s1-dispatch"
+#: [judged by this slice] a launch carries a brief of up to 64 KiB (``session.BRIEF_MAX_BYTES``); canonical JSON writes a
+#: control character as six bytes, so the bound sits well above the worst case and well below anything unbounded.
+RUN_FRAME_MAX = 512 * 1024
+#: [judged] one WAIT is a slice of this many seconds, so a TERM or ABORT sent from another thread waits at most this long
+#: for the holder connection (one request is in flight on it at a time).
+WAIT_SLICE_S = 2.0
+_ANSWER_MARGIN_S = 5.0          # a socket's patience beyond the slice the server was asked to hold
+_CONNECT_S = 10.0
+#: [judged by this slice] LAUNCH answers after the server's mint, lease, prepare, render and gated start (sudo, a pty, a
+#: bundle): it may take far longer than a RELEASE. A LAUNCH that outlasts this is a down child, and the closed holder
+#: makes the server END whatever it had started.
+LAUNCH_ANSWER_S = 120.0
+_LEN = struct.Struct(">I")
+_NAME_RE = re.compile(r"[a-z0-9][a-z0-9:_.-]{0,95}")        # a refusal name the client will repeat
+_DETAIL_MAX = 400
+_INT_MAX = 2 ** 53 - 1
+
+
+class WireError(ValueError):
+    """A frame that is not ``levain-run/1``'s shape: the connection that carried it is dropped."""
+
+
+class ProofUnavailable(RuntimeError):
+    """The signed link the occurrence launched under cannot be turned into a proof. ``standing`` is True when a retry
+    meets the same answer (the log names another spec or agent), False when the log was merely unreadable."""
+
+    def __init__(self, detail: str, *, standing: bool) -> None:
+        super().__init__(detail)
+        self.standing = standing
+
+
+# --- framing -------------------------------------------------------------------------------------------------------
+
+def encode_run_frame(obj: Mapping[str, object]) -> bytes:
+    try:
+        data = canon.canonical_bytes(dict(obj))
+        canon.parse(data)               # the codec's own refusals (a float, an oversized integer) hold on the way out too
+    except (TypeError, ValueError, ContractError) as exc:
+        raise WireError(f"not canonical JSON ({type(exc).__name__})") from None
+    if len(data) > RUN_FRAME_MAX:
+        raise WireError(f"frame of {len(data)} bytes is over {RUN_FRAME_MAX}")
+    return _LEN.pack(len(data)) + data
+
+
+def _recv_exact(sock: socket.socket, n: int, *, eof_ok: bool) -> bytes | None:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            if eof_ok and not buf:
+                return None
+            raise WireError("EOF inside a frame")
+        buf += chunk
+    return bytes(buf)
+
+
+def read_run_frame(sock: socket.socket) -> dict | None:
+    """One frame's object; None on a clean EOF between frames. Raises :class:`WireError` (and the socket's own
+    ``OSError`` / ``socket.timeout``, which a caller treats alike)."""
+    head = _recv_exact(sock, _LEN.size, eof_ok=True)
+    if head is None:
+        return None
+    (n,) = _LEN.unpack(head)
+    if n == 0 or n > RUN_FRAME_MAX:
+        raise WireError(f"frame length {n}")
+    data = _recv_exact(sock, n, eof_ok=False)
+    assert data is not None
+    try:
+        obj = canon.parse(data)
+    except ContractError as exc:
+        raise WireError(str(exc)) from None
+    if type(obj) is not dict or canon.canonical_bytes(obj) != data:
+        raise WireError("not a canonical JSON object")
+    return obj
+
+
+def _exact(obj: object, keys: tuple[str, ...], where: str, *, optional: tuple[str, ...] = ()) -> dict:
+    if type(obj) is not dict:
+        raise WireError(f"{where} is not an object")
+    extra = set(obj) - set(keys) - set(optional)
+    missing = set(keys) - set(obj)
+    if extra or missing:
+        raise WireError(f"{where}: unexpected {sorted(extra)} missing {sorted(missing)}")
+    return obj
+
+
+def _int(v: object, where: str, *, lo: int = 0, none: bool = False) -> int | None:
+    if v is None and none:
+        return None
+    if type(v) is not int or not lo <= v <= _INT_MAX:
+        raise WireError(f"{where} is not an integer in range")
+    return v
+
+
+def _str(v: object, where: str, *, max_len: int) -> str:
+    if type(v) is not str or len(v) > max_len:
+        raise WireError(f"{where} is not a short string")
+    return v
+
+
+def check_run_request(obj: dict) -> tuple[int, str]:
+    """``{"p": PROTOCOL, "op", "id", ...}`` -> ``(id, op)``. A protocol other than this one is
+    ``WireError("protocol-mismatch")`` (design F12: the server answers ``protocol-mismatch``, standing, and guesses no field)."""
+    if obj.get("p") != PROTOCOL:
+        raise WireError("protocol-mismatch")
+    op, rid = obj.get("op"), obj.get("id")
+    if type(op) is not str or not op or type(rid) is not int or not 0 <= rid <= _INT_MAX:
+        raise WireError("a request carries a string op and an integer id")
+    return rid, op
+
+
+def ok_answer(rid: int | None, **fields: object) -> dict[str, object]:
+    return {"id": rid, "ok": True, **fields}
+
+
+def refused_answer(rid: int | None, name: str, detail: str = "", reason_class: str = "standing") -> dict[str, object]:
+    out: dict[str, object] = {"id": rid, "ok": False, "refused": name}
+    if detail:
+        out["detail"] = detail[:_DETAIL_MAX]
+    if reason_class != "standing":
+        out["reason_class"] = reason_class
+    return out
+
+
+# --- the typed bodies ------------------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LinkRow:
+    """One authority-log row of the signed link: the signed message is ``prev_hash + "\\n" + record``."""
+    seq: int
+    prev_hash: str
+    record: str
+    signer_fp: str
+    signature: str
+
+
+@dataclass(frozen=True)
+class LinkProof:
+    """What the client carries so the server can verify his signature at the point of use (Q1 = (b)): the occurrence,
+    the spec hash it launched under, the link and the store it names, and the link's ``born`` row (the create, which
+    names the spec hash and the budgets) and ``current`` row (the last create or renew; the same row when never
+    renewed)."""
+    occurrence_id: str
+    spec_hash: str
+    link_id: str
+    store_id: str
+    born: LinkRow
+    current: LinkRow
+
+
+_ROW_KEYS = ("seq", "prev_hash", "record", "signer_fp", "signature")
+_EXPOSURE_KEYS = ("actions", "unit", "seconds", "tunnel_bytes")
+_LAUNCH_KEYS = ("occurrence_id", "session_key", "harness", "model", "brief", "auth", "exposure")
+_PROOF_KEYS = ("occurrence_id", "spec_hash", "link_id", "store_id", "born", "current")
+
+
+def _row_to_wire(r: LinkRow) -> dict[str, object]:
+    return {"seq": r.seq, "prev_hash": r.prev_hash, "record": r.record, "signer_fp": r.signer_fp,
+            "signature": r.signature}
+
+
+def _row_from_wire(o: object, where: str) -> LinkRow:
+    o = _exact(o, _ROW_KEYS, where)
+    return LinkRow(_int(o["seq"], f"{where}.seq", lo=1), _str(o["prev_hash"], f"{where}.prev_hash", max_len=128),
+                   _str(o["record"], f"{where}.record", max_len=64 * 1024),
+                   _str(o["signer_fp"], f"{where}.signer_fp", max_len=256),
+                   _str(o["signature"], f"{where}.signature", max_len=16 * 1024))
+
+
+def launch_to_wire(launch: SessionLaunch, proof: LinkProof) -> dict[str, object]:
+    """The LAUNCH body: the typed :class:`SessionLaunch` fields and the proof. No ticket, no run id, no mint field."""
+    ex = launch.exposure
+    return {"launch": {"occurrence_id": launch.occurrence_id, "session_key": launch.session_key,
+                       "harness": launch.harness, "model": launch.model, "brief": launch.brief, "auth": launch.auth,
+                       "exposure": None if ex is None else {"actions": ex.actions, "unit": ex.unit,
+                                                            "seconds": ex.seconds, "tunnel_bytes": ex.tunnel_bytes}},
+            "proof": {"occurrence_id": proof.occurrence_id, "spec_hash": proof.spec_hash, "link_id": proof.link_id,
+                      "store_id": proof.store_id, "born": _row_to_wire(proof.born),
+                      "current": _row_to_wire(proof.current)}}
+
+
+def launch_from_wire(request: Mapping[str, object]) -> tuple[SessionLaunch, LinkProof]:
+    """The server's decode of a LAUNCH request: ``(SessionLaunch, LinkProof)`` or :class:`WireError`. The proof's
+    occurrence must be the launch's own."""
+    body = {k: v for k, v in request.items() if k not in ("p", "op", "id")}
+    body = _exact(body, ("launch", "proof"), "LAUNCH")
+    lo = _exact(body["launch"], _LAUNCH_KEYS, "launch")
+    ex = lo["exposure"]
+    exposure = None
+    if ex is not None:
+        ex = _exact(ex, _EXPOSURE_KEYS, "launch.exposure")
+        exposure = ActionExposure(_int(ex["actions"], "exposure.actions"), _str(ex["unit"], "exposure.unit", max_len=32),
+                                  _int(ex["seconds"], "exposure.seconds"),
+                                  _int(ex["tunnel_bytes"], "exposure.tunnel_bytes", none=True))
+    launch = SessionLaunch(_str(lo["occurrence_id"], "occurrence_id", max_len=128),
+                           _str(lo["session_key"], "session_key", max_len=128),
+                           _str(lo["harness"], "harness", max_len=64), _str(lo["model"], "model", max_len=256),
+                           _str(lo["brief"], "brief", max_len=RUN_FRAME_MAX), _str(lo["auth"], "auth", max_len=32),
+                           exposure)
+    po = _exact(body["proof"], _PROOF_KEYS, "proof")
+    proof = LinkProof(_str(po["occurrence_id"], "proof.occurrence_id", max_len=128),
+                      _str(po["spec_hash"], "proof.spec_hash", max_len=128),
+                      _str(po["link_id"], "proof.link_id", max_len=128),
+                      _str(po["store_id"], "proof.store_id", max_len=128),
+                      _row_from_wire(po["born"], "proof.born"), _row_from_wire(po["current"], "proof.current"))
+    if proof.occurrence_id != launch.occurrence_id:
+        raise WireError("the proof names another occurrence than the launch")
+    return launch, proof
+
+
+_USAGE_KEYS = ("usd_micros", "input_tokens", "output_tokens", "source", "actions", "tunnel_bytes", "seconds")
+
+
+def usage_to_wire(u: Usage) -> dict[str, object]:
+    return {"usd_micros": u.usd_micros, "input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
+            "source": u.source, "actions": u.actions, "tunnel_bytes": u.tunnel_bytes, "seconds": u.seconds}
+
+
+def usage_from_wire(o: object) -> Usage:
+    o = _exact(o, _USAGE_KEYS, "usage")
+    return Usage(_int(o["usd_micros"], "usd_micros", none=True), _int(o["input_tokens"], "input_tokens", none=True),
+                 _int(o["output_tokens"], "output_tokens", none=True), _str(o["source"], "source", max_len=200),
+                 actions=_int(o["actions"], "actions", none=True),
+                 tunnel_bytes=_int(o["tunnel_bytes"], "tunnel_bytes", none=True),
+                 seconds=_int(o["seconds"], "seconds", none=True))
+
+
+# --- the proof, derived from what the fire already holds ---------------------------------------------------------------
+
+def link_proof(store: Any, cockpit_root: Path | str, occurrence_id: str) -> LinkProof:
+    """The :class:`LinkProof` of ``occurrence_id``: its row's ``spec_hash`` and ``link_id``, and that link's born and
+    current rows read from the cockpit authority log at ``cockpit_root`` after a verified replay
+    (:class:`levain.agent_authority.AgentAuthority`). Raises :class:`ProofUnavailable` for a row with no link, a link
+    that is not an agent link of this occurrence's agent and spec hash, or a log that does not read."""
+    from levain import authority as _auth
+    from levain.agent_authority import AgentAuthority
+    from levain.cockpit.firejournal import DB_NAME
+    try:
+        with store.read() as conn:
+            row = conn.execute("SELECT agent_id, spec_hash, link_id FROM agent_occurrences WHERE occurrence_id = ?",
+                               (occurrence_id,)).fetchone()
+            sid = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
+    except Exception as exc:  # noqa: BLE001
+        raise ProofUnavailable(f"the agent store does not read ({type(exc).__name__})", standing=False) from None
+    if row is None or type(row[2]) is not str or not row[2] or sid is None:
+        raise ProofUnavailable("the occurrence row names no signed link", standing=True)
+    agent_id, spec_hash, link_id = row
+    try:
+        state = AgentAuthority(cockpit_root).replay()
+    except Exception as exc:  # noqa: BLE001 - a replay that fails proves nothing
+        raise ProofUnavailable(f"the authority log does not replay ({type(exc).__name__})", standing=False) from None
+    grant = state.policy.grants.get(link_id)
+    born, current = state.grant_born.get(link_id), state.grant_seqs.get(link_id)
+    if not _auth.agent_link(grant) or born is None or current is None or grant["spec_hash"] != spec_hash \
+            or grant["agent_id"] != agent_id or grant["store_id"] != sid[0]:
+        raise ProofUnavailable("the link the occurrence launched under is not a standing link of its agent and spec",
+                               standing=True)
+    rows: dict[int, LinkRow] = {}
+    try:
+        db = sqlite3.connect(f"file:{Path(cockpit_root) / DB_NAME}?mode=ro", uri=True, timeout=5.0)
+        try:
+            for seq in {born, current}:
+                got = db.execute("SELECT seq, prev_hash, record, signer_fp, signature FROM authority_log"
+                                 " WHERE seq = ?", (seq,)).fetchone()
+                if got is None or not all(type(c) is str for c in got[1:]):
+                    raise ProofUnavailable(f"log row {seq} is absent or not text", standing=False)
+                rows[seq] = LinkRow(*got)
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        raise ProofUnavailable(f"the authority log rows do not read ({type(exc).__name__})", standing=False) from None
+    return LinkProof(occurrence_id, spec_hash, link_id, sid[0], rows[born], rows[current])
+
+
+# --- the connection ---------------------------------------------------------------------------------------------------
+
+class _Down(Exception):
+    """The wire failed (connect, send, receive, off-shape answer, EOF): the connection is closed, nothing is known."""
+
+
+class _Refused(Exception):
+    def __init__(self, name: str, detail: str, reason_class: str) -> None:
+        super().__init__(name)
+        self.name, self.detail, self.reason_class = name, detail, reason_class
+
+
+class _Conn:
+    """One socket, one request in flight at a time. A fault of any kind closes it (on a holder connection that close is
+    the server's cue to END the session, design 3.4) and raises :class:`_Down`."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock: socket.socket | None = sock
+        self._mu = threading.Lock()
+        self._next = 0
+
+    @property
+    def alive(self) -> bool:
+        return self._sock is not None
+
+    def close(self) -> None:
+        sock, self._sock = self._sock, None
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def request(self, op: str, expect: tuple[str, ...], *, timeout: float = _CONNECT_S, **fields: object) -> dict:
+        """The answer's fields (exactly ``expect``), or :class:`_Refused` for a named refusal, or :class:`_Down`."""
+        with self._mu:
+            sock = self._sock
+            if sock is None:
+                raise _Down("closed")
+            self._next += 1
+            rid = self._next
+            try:
+                frame = encode_run_frame({**fields, "p": PROTOCOL, "op": op, "id": rid})
+                sock.settimeout(timeout)
+                sock.sendall(frame)
+                ans = read_run_frame(sock)
+            except (OSError, WireError) as exc:
+                self.close()
+                raise _Down(f"{op}: {type(exc).__name__}") from None
+            if ans is None:
+                self.close()
+                raise _Down(f"{op}: EOF")
+            try:
+                return self._shape(ans, rid, expect)
+            except WireError as exc:
+                self.close()
+                raise _Down(f"{op}: {exc}") from None
+
+    @staticmethod
+    def _shape(ans: dict, rid: int, expect: tuple[str, ...]) -> dict:
+        if ans.get("id") != rid:
+            raise WireError("an answer for another request")
+        if ans.get("ok") is True:
+            _exact({k: v for k, v in ans.items() if k not in ("id", "ok")}, expect, "answer")
+            return {k: v for k, v in ans.items() if k not in ("id", "ok")}
+        if ans.get("ok") is False:
+            _exact(ans, ("id", "ok", "refused"), "refusal", optional=("detail", "reason_class"))
+            name = ans["refused"]
+            if type(name) is not str or _NAME_RE.fullmatch(name) is None:
+                raise WireError("a refusal name off the grammar")
+            detail = ans.get("detail", "")
+            if type(detail) is not str:
+                raise WireError("a refusal detail that is not text")
+            cls = ans.get("reason_class", "standing")
+            if cls not in ("transient", "standing"):
+                raise WireError("a reason class off the grammar")
+            raise _Refused(name, detail[:_DETAIL_MAX], cls)
+        raise WireError("an answer that is neither ok nor refused")
+
+
+def _exit_code(v: object, where: str) -> int:
+    if type(v) is not int or not -1024 <= v <= 1024:
+        raise WireError(f"{where} is not an exit status")
+    return v
+
+
+# --- the gated child, remote ------------------------------------------------------------------------------------------
+
+class _RemoteProcess:
+    """The ``process`` of a :class:`_RemoteChild`: ``poll``, ``wait`` and ``terminate`` as a Popen's. The exit it answers
+    is the server's (which holds END behind it) or :data:`levain.agents.controller.GATE_UNPROVEN` once the wire has
+    failed."""
+
+    def __init__(self, conn: _Conn | None) -> None:
+        self._conn = conn
+        self._rc: int | None = None
+        self._lost = conn is None
+
+    @property
+    def returncode(self) -> int | None:
+        return self._rc
+
+    def _lose(self) -> int:
+        self._lost = True
+        if self._conn is not None:
+            self._conn.close()
+        self._rc = _ctl.GATE_UNPROVEN
+        return self._rc
+
+    def _slice(self, seconds: float) -> int | None:
+        """One WAIT of at most ``seconds``: the exit once the server says so, else None. A fault is unproven."""
+        if self._rc is not None:
+            return self._rc
+        if self._lost or self._conn is None:
+            return self._lose()
+        try:
+            ans = self._conn.request("WAIT", ("exited", "returncode"), timeout=seconds + _ANSWER_MARGIN_S,
+                                     timeout_ms=int(max(0.0, seconds) * 1000))
+            if type(ans["exited"]) is not bool:
+                raise WireError("exited is not a boolean")
+            if not ans["exited"]:
+                if ans["returncode"] is not None:
+                    raise WireError("a returncode before the exit")
+                return None
+            self._rc = _exit_code(ans["returncode"], "returncode")
+            return self._rc
+        except (_Down, _Refused, WireError):
+            return self._lose()
+
+    def poll(self) -> int | None:
+        return self._slice(0.0)
+
+    def wait(self, timeout: float | None = None) -> int:
+        end = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        while True:
+            left = WAIT_SLICE_S if end is None else min(WAIT_SLICE_S, end - time.monotonic())
+            got = self._slice(max(0.0, left))
+            if got is not None:
+                return got
+            if end is not None and time.monotonic() >= end:
+                raise subprocess.TimeoutExpired("dispatch session", float(timeout or 0.0))
+
+    def terminate(self) -> None:
+        """TERM: the server reaches the gate, and END does the real work (design finding G). A fault is silent: the
+        closed holder is the server's cue to END anyway."""
+        if self._conn is None or self._lost or self._rc is not None:
+            return
+        try:
+            self._conn.request("TERM", ())
+        except (_Down, _Refused):
+            self._lose()
+
+
+class _RemoteChild:
+    """The gated child the client answers: ``release``, ``abort`` and a ``process`` (design 3.2). ``session`` is the S1
+    session id the server answered, None for a child whose LAUNCH answer was lost."""
+
+    def __init__(self, conn: _Conn | None, session: str | None) -> None:
+        self._conn = conn
+        self.session = session
+        self.process = _RemoteProcess(conn)
+        self.released = False
+
+    def release(self) -> None:
+        """RELEASE. A failure raises: the caller (``start_run``, inside the store's lock) aborts the child, and the
+        server treats ABORT the same whether or not the release landed (design T3)."""
+        if self._conn is None:
+            raise RuntimeError("the dispatch run server did not answer LAUNCH: nothing to release")
+        try:
+            self._conn.request("RELEASE", ())
+        except _Down as exc:
+            self.process._lose()
+            raise RuntimeError(f"the dispatch run server is unreachable at RELEASE ({exc})") from None
+        except _Refused as exc:
+            raise RuntimeError(f"the dispatch run server refused RELEASE: {exc.name}") from None
+        self.released = True
+
+    def abort(self, timeout: float = 5.0) -> int:
+        """ABORT: nothing runs, or the session is ENDed. The exit is the server's, GATE_UNPROVEN when it cannot say."""
+        if self._conn is None or self.process._lost:
+            return self.process._lose()
+        try:
+            ans = self._conn.request("ABORT", ("returncode",), timeout=max(0.0, float(timeout)) + _ANSWER_MARGIN_S,
+                                     timeout_ms=int(max(0.0, float(timeout)) * 1000))
+            rc = _exit_code(ans["returncode"], "returncode")
+        except (_Down, _Refused, WireError):
+            return self.process._lose()
+        self.process._rc = rc
+        return rc
+
+
+# --- the launcher --------------------------------------------------------------------------------------------------------
+
+def default_run_socket() -> Path:
+    """[judged by this slice, S10b confirms] where the run server listens: ``dispatch/run.sock`` under the host's run
+    directory (:data:`levain.slot.layout.RUN`). S10b owns the path; a launcher built with another ``connect`` ignores it."""
+    from levain.slot import layout
+    return layout.RUN["darwin" if sys.platform == "darwin" else "linux"] / "dispatch" / "run.sock"
+
+
+def unix_connector(path: Path | str, *, timeout: float = _CONNECT_S) -> Callable[[], socket.socket]:
+    def connect() -> socket.socket:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(str(path))
+        except OSError:
+            sock.close()
+            raise
+        return sock
+    return connect
+
+
+class DispatchSessionLauncher:
+    """A :class:`levain.agents.session.SessionLauncher` and :class:`levain.agents.session.SessionEnder` over the run
+    server (module docstring). ``connect()`` returns a connected socket (raising ``OSError``); ``proof_of(occurrence_id)``
+    returns the occurrence's :class:`LinkProof` (raising :class:`ProofUnavailable`)."""
+
+    route = S1_DISPATCH
+    auth = "passthrough"
+
+    def __init__(self, connect: Callable[[], socket.socket], proof_of: Callable[[str], LinkProof]) -> None:
+        self._connect = connect
+        self._proof_of = proof_of
+
+    # -- spawn ---------------------------------------------------------------------------------------------------------
+
+    def spawn(self, launch: SessionLaunch) -> Any:
+        try:
+            proof = self._proof_of(launch.occurrence_id)
+        except ProofUnavailable as exc:
+            raise LauncherRefused("link-proof-unavailable", str(exc),
+                                  reason_class="standing" if exc.standing else "transient") from None
+        body = launch_to_wire(launch, proof)
+        try:
+            encode_run_frame({**body, "p": PROTOCOL, "op": "LAUNCH", "id": 1})      # too big: refused before any connect
+        except WireError as exc:
+            raise LauncherRefused("launch-frame-refused", str(exc)) from None
+        try:
+            sock = self._connect()
+        except OSError as exc:
+            raise LauncherRefused("dispatch-unreachable", f"{type(exc).__name__}", reason_class="transient") from None
+        conn = _Conn(sock)
+        try:
+            ans = conn.request("LAUNCH", ("session",), timeout=LAUNCH_ANSWER_S, **body)
+            session = _str(ans["session"], "session", max_len=128)
+        except _Refused as exc:
+            conn.close()
+            raise LauncherRefused(exc.name, exc.detail, reason_class=exc.reason_class) from None
+        except (_Down, WireError) as exc:
+            # the request may have been delivered: the server may hold a session, so this must not raise (a raising
+            # spawn promises nothing is live). The closed holder is the server's cue to END; this child proves nothing.
+            _log.warning("LAUNCH for %s lost its answer (%s): returning a down child", launch.session_key, exc)
+            conn.close()
+            return _RemoteChild(None, None)
+        return _RemoteChild(conn, session)
+
+    # -- usage and end, keyed by the recorded session key -----------------------------------------------------------------
+
+    def _short(self, op: str, expect: tuple[str, ...], timeout: float, **fields: object) -> dict:
+        sock = self._connect()
+        conn = _Conn(sock)
+        try:
+            return conn.request(op, expect, timeout=timeout, **fields)
+        finally:
+            conn.close()
+
+    def usage(self, session_key: str) -> Usage:
+        """The server's usage for the key; never raises. Anything unreadable is the caps."""
+        try:
+            if _ctl.SESSION_KEY_RE.fullmatch(session_key) is None:
+                return Usage(None, None, None, "session:dispatch-bad-key")
+            ans = self._short("USAGE", ("usage",), _CONNECT_S, session_key=session_key)
+            return usage_from_wire(ans["usage"])
+        except WireError:
+            return Usage(None, None, None, "session:dispatch-protocol")
+        except Exception:  # noqa: BLE001 - usage() never raises; unreadable debits the whole reservation
+            return Usage(None, None, None, "session:dispatch-unreachable")
+
+    def end_session(self, session_key: str, deadline_s: float) -> StopResult:
+        """The S1 END for the key (``SessionEnder``): ``StopResult(True, ...)`` only when the server answers
+        ``terminated: true`` exactly. Never raises."""
+        try:
+            if _ctl.SESSION_KEY_RE.fullmatch(session_key) is None:
+                return StopResult(False, "the session key is off the grammar; nothing asked")
+            deadline = max(0.0, float(deadline_s))
+            ans = self._short("END", ("terminated", "detail"), deadline + _ANSWER_MARGIN_S, session_key=session_key,
+                              deadline_ms=int(deadline * 1000))
+            detail = _str(ans["detail"], "detail", max_len=_DETAIL_MAX)
+            if ans["terminated"] is True:
+                return StopResult(True, detail)
+            if ans["terminated"] is False:
+                return StopResult(False, detail)
+            raise WireError("terminated is not a boolean")
+        except _Refused as exc:
+            return StopResult(False, f"the dispatch run server refused END: {exc.name}")
+        except (_Down, WireError, OSError) as exc:
+            return StopResult(False, f"the dispatch run server did not answer END ({type(exc).__name__}); "
+                                     "nothing assumed ended")
+        except Exception as exc:  # noqa: BLE001 - end_session never raises
+            return StopResult(False, f"END could not complete ({type(exc).__name__}); nothing assumed ended")
+
+
+def build_launcher(store: Any) -> DispatchSessionLauncher:
+    """The builder ``session_wire`` registers under :data:`LAUNCHER_NAME`: the production client for ``store`` (its
+    proofs read the install's cockpit authority log; the socket is :func:`default_run_socket`)."""
+    from levain.agents.session_wire import read_install
+    install = read_install(store.directory)
+    return DispatchSessionLauncher(unix_connector(default_run_socket()),
+                                   lambda occ: link_proof(store, install.cockpit_root, occ))
