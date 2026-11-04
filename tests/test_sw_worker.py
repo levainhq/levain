@@ -48,7 +48,9 @@ def test_a_tap_writes_the_ping_id_to_opened_makes_no_fetch_and_the_worker_hears_
     """Reproduced red on the base worker: a tap read the token from IndexedDB and called fetch('/webpush/opened')."""
     got = _run("click")
     assert got["fetches"] == 0, got
-    assert "message" not in got["listeners"], got                    # no token can be handed to this worker
+    # no token can be handed to this worker: its one message listener (update flow, 1104-27) acts only on
+    # {type: "levain-skip-waiting"} and reads nothing else (test_only_the_page_message_skips_waiting)
+    assert "message" in got["listeners"], got
     assert got["db"] == {"version": 1, "stores": ["opened"]}, got
     (key, tapped), = got["opened"]
     assert key == "42" and isinstance(tapped, int) and tapped > 1_700_000_000_000, got
@@ -268,3 +270,69 @@ def test_every_page_a_window_can_show_loads_the_open_listener() -> None:
     web = SW.parent.parent.parent / "templates" / "web"
     for page in ("dashboard.html", "sign.html", "pair.html"):
         assert '<script src="/sw_open.js"></script>' in (web / page).read_text(encoding="utf-8"), page
+
+
+def _fetch(**m) -> dict:
+    return _run("fetch", json.dumps(m))
+
+
+@needs_node
+def test_an_offline_navigation_gets_the_cached_shell_or_the_offline_page_never_a_browser_error() -> None:
+    """Reproduced red on main (239660c9): the worker had no fetch listener, so a navigation with the network down was
+    the browser's own error page. Now: network first; the cached shell when there is one, else the offline text."""
+    shell = _fetch(url="https://box.example/", net="down", shell=True)
+    assert shell["responded"] is True and shell["body"] == "<html>cached shell</html>", shell
+    off = _fetch(url="https://box.example/", net="down", shell=False)
+    assert off["status"] == 503 and "text/html" in off["ctype"], off
+    assert "Can't reach your cockpit. Is Tailscale on?" in off["body"] and "Retry" in off["body"], off
+    assert "safe-area-inset" in off["body"], off                                   # safe-area aware
+    # a navigation to anything but the shell page never shows a cached dashboard in its place
+    other = _fetch(url="https://box.example/sign/9?x=1", net="down", shell=True)
+    assert "Can't reach your cockpit" in other["body"], other
+    live = _fetch(url="https://box.example/", net="ok", shell=True)
+    assert live["body"] == "<html>live</html>", live                                # online: the network wins
+
+
+@needs_node
+def test_the_fetch_handler_never_touches_posts_subresources_webpush_cockpit_or_a_credentialed_url() -> None:
+    for m in (dict(url="https://box.example/", method="POST"), dict(url="https://box.example/app.js", mode="cors"),
+              dict(url="https://box.example/webpush/subscribe", net="down"), dict(url="https://box.example/cockpit/x", net="down"),
+              dict(url="https://other.example/", net="down")):
+        assert _fetch(**m)["responded"] is False, m
+    # only the bare shell page is ever written to the cache: no query (a credential rides there), not a 500
+    for u, net in (("https://box.example/?token=sekrit", "ok"), ("https://box.example/sign/3", "ok"), ("https://box.example/", "500")):
+        got = _fetch(url=u, net=net, shell=False)
+        assert all(not entries for _, entries in got["shells"]), (u, got)
+    ok = _fetch(url="https://box.example/", net="ok", shell=False)
+    assert [e for _, es in ok["shells"] for e, _b in es] == ["/"], ok
+
+
+@needs_node
+def test_install_precaches_the_shell_without_skipping_waiting_and_a_failed_fetch_never_blocks_install() -> None:
+    got = _run("install", "ok")
+    assert got["skipWaiting"] is False, got                                          # the page asks for it, never the worker
+    assert [e for _, es in got["shells"] for e, _b in es] == ["/"], got
+    assert _run("install", "down")["skipWaiting"] is False
+    assert all(not es for _, es in _run("install", "redirected")["shells"])         # a redirect is not a shell
+
+
+@needs_node
+def test_only_the_page_message_skips_waiting() -> None:
+    assert _run("message", json.dumps({"type": "levain-skip-waiting"}))["skipWaiting"] is True
+    for junk in ({"type": "other"}, "levain-skip-waiting", None):
+        assert _run("message", json.dumps(junk))["skipWaiting"] is False, junk
+
+
+def test_no_notification_in_the_worker_carries_an_actions_key() -> None:
+    """Phill 11-04: no notification action buttons, on any platform, ever. Parsed from the source, not a run."""
+    import re
+    src = SW.read_text()
+    calls = [m.start() for m in re.finditer(r"showNotification\(", src)]
+    assert calls, "no showNotification call found: the pin would pass vacuously"
+    for at in calls:
+        depth, i = 0, src.index("(", at)
+        for j in range(i, len(src)):
+            depth += (src[j] == "(") - (src[j] == ")")
+            if depth == 0:
+                break
+        assert not re.search(r"\bactions\b", src[at:j]), src[at:j]

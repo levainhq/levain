@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1102-center-1';
+const SW_VERSION = '1104-pwasw-1';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -21,7 +21,10 @@ const OPEN_CACHE = 'levain-open', OPEN_PREFIX = '/__levain_open/';
 // work of one event ends RECEIPT_BUDGET_MS after the event started.
 const RECEIPT_CACHE = 'levain-receipts', RECEIPT_PREFIX = '/__levain_receipt/';
 const RECEIPT_BUDGET_MS = 4000, RECEIPT_DRAIN = 5, RECEIPT_QUEUE_CAP = 200, RECEIPT_MAX_AGE_MS = 86400000;
-const CACHES_KEEP = [OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE];
+// The offline shell: the cockpit page '/' cached under a name that carries this worker's own version, so a new worker
+// precaches its own copy and activation deletes every older `levain-shell-v*` (dropOldCaches: not in CACHES_KEEP).
+const SHELL_CACHE = 'levain-shell-v' + SW_VERSION, SHELL_KEY = '/';
+const CACHES_KEEP = [OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE, SHELL_CACHE];
 // How long a 'for: new' entry lives (and how long the worker keeps one after a successful openWindow): the window between
 // openWindow and the opened page's first script run. The page's own limit for 'new' entries is the same figure (sw_open.js).
 const NEW_TTL_MS = 30000;  // a cold-started Home Screen app can take seconds to run its first script; the claim is
@@ -238,7 +241,65 @@ async function dropOldCaches() {
   await Promise.all(names.filter((n) => n.startsWith('levain-') && !CACHES_KEEP.includes(n)).map((n) => caches.delete(n)));
 }
 
-self.addEventListener('install', () => self.skipWaiting());
+// No skipWaiting here: a new worker waits until the page, which shows "New version available. Tap to reload.", posts
+// {type: 'levain-skip-waiting'} (the first install has no controller and activates at once anyway). The shell precache
+// is best effort: a failed or redirected fetch leaves the cache empty and never fails the install.
+async function precacheShell() {
+  try {
+    const r = await fetch(SHELL_KEY, { credentials: 'same-origin', cache: 'reload' });
+    if (!shellCacheable(r)) return;
+    await (await caches.open(SHELL_CACHE)).put(SHELL_KEY, r);
+  } catch (_) { /* offline at install: the next successful navigation fills it */ }
+}
+function shellCacheable(r) {
+  return !!r && r.status === 200 && !r.redirected && /text\/html/i.test(r.headers.get('content-type') || '');
+}
+self.addEventListener('install', (e) => e.waitUntil(precacheShell()));
+self.addEventListener('message', (e) => {
+  const d = e.data;
+  if (d && typeof d === 'object' && d.type === 'levain-skip-waiting') self.skipWaiting();
+});
+
+// Navigations only: network first, the cached shell (or the offline page) when the network fails. Never cached and never
+// intercepted: anything but a same-origin GET navigation, /webpush/ and /cockpit/ (data), and any URL with a query. Only
+// the bare '/' (no query: a credential would ride there) is ever written; a fragment never reaches a worker.
+const NO_INTERCEPT = ['/webpush/', '/cockpit/'];
+const OFFLINE_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+  '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Levain</title>' +
+  '<style>html,body{margin:0;height:100%;background:#14110f;color:#f1ebe3;font:17px/1.4 -apple-system,system-ui,sans-serif}' +
+  'body{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:20px;' +
+  'padding:calc(24px + env(safe-area-inset-top)) calc(24px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) calc(24px + env(safe-area-inset-left))}' +
+  'a{color:#14110f;background:#f1ebe3;padding:12px 28px;border-radius:12px;text-decoration:none;font-weight:600}</style></head>' +
+  '<body><p>Can\'t reach your cockpit. Is Tailscale on?</p><a href="">Retry</a></body></html>';
+function offlineResponse() {
+  return new Response(OFFLINE_HTML, { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+async function navigateNetworkFirst(req, bare) {
+  try {
+    const r = await fetch(req);
+    if (bare && shellCacheable(r)) {
+      try { await (await caches.open(SHELL_CACHE)).put(SHELL_KEY, r.clone()); } catch (_) { /* a full cache never costs the page */ }
+    }
+    return r;
+  } catch (err) {
+    if (new URL(req.url).pathname === SHELL_KEY) {
+      try {
+        const hit = await (await caches.open(SHELL_CACHE)).match(SHELL_KEY);
+        if (hit) return hit;
+      } catch (_) { /* fall through to the offline page */ }
+    }
+    return offlineResponse();
+  }
+}
+self.addEventListener('fetch', (e) => {
+  const req = e.request;
+  if (!req || req.mode !== 'navigate' || req.method !== 'GET') return;
+  let u;
+  try { u = new URL(req.url); } catch (_) { return; }
+  if (u.origin !== self.location.origin) return;
+  if (NO_INTERCEPT.some((p) => u.pathname.startsWith(p))) return;
+  e.respondWith(navigateNetworkFirst(req, u.pathname === SHELL_KEY && !u.search));
+});
 // the pre-fix4 pending target: ONE singleton key in the same cache; no claim path reads it any more, so it is deleted
 async function dropLegacyPending() {
   if (typeof caches === 'undefined') return;
