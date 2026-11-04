@@ -360,3 +360,13 @@ def test_write_install_checks_the_merged_model_before_replacing_a_working_instal
             da.write_install(ad, **f, **bad)
         assert (ad / da.INSTALL_FILE).read_bytes() == before
     assert [p.name for p in ad.iterdir()] == [da.INSTALL_FILE]
+
+
+def test_fire_factory_binds_a_consolidate_that_handles_a_stop(tmp_path, monkeypatch):
+    from levain.dream import executor as ex
+    monkeypatch.setattr(ex, "DreamExecutor", lambda **kw: object())
+    rig, oid = _fire_row_rig(tmp_path)
+    seen = {}
+    monkeypatch.setattr(ex, "consolidate_store", lambda *a, **kw: seen.update(kw))
+    da.fire_factory(rig.store, oid, 0)["consolidate"]()
+    assert seen["handle_stop"] is True

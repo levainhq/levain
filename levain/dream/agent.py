@@ -856,7 +856,7 @@ def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str,
         mind = ex.ClaudeMind(inst.model, claude_bin=inst.claude_bin)
         return ex.consolidate_store(inst.store_path, mind=mind, composer=inst.model, max_seconds=ex.DREAM_BUDGET_S,
                                     budget=ex.Budget.for_model(inst.model), occurrence_dir=occ_dir,
-                                    on_snapshot=on_snapshot, on_saved=on_saved, label="levain dream")
+                                    on_snapshot=on_snapshot, on_saved=on_saved, label="levain dream", handle_stop=True)
 
     return {"sup": sup, "store_path": inst.store_path, "occ_dir": occ_dir, "executor": executor,
             "consolidate": consolidate, "review_store": review_store, **card_facts}

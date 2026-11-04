@@ -717,3 +717,79 @@ def test_the_handler_raises_once_so_a_second_stop_cannot_abort_the_unwind():
         os.kill(os.getpid(), signal.SIGTERM)                 # the unwind is under way: recorded, not raised
         time.sleep(0.05)
         assert requested == [True, True]
+
+
+# --------------------------------------------------- the production seam: consolidate_store(handle_stop=True)
+
+STORE_FIRE = textwrap.dedent('''
+    import fcntl, sys
+    from pathlib import Path
+    from levain.dream import executor as ex
+
+    root = Path(sys.argv[1])
+    pin = "test-model-1"
+    row = ex.PriceRow(context_window=200_000, max_output=40_000, input_micros_per_mtok=20_000_000,
+                      output_micros_per_mtok=25_000_000, source="t", read_on="2026-10-31")
+    try:
+        ex.consolidate_store(root / "store" / "memory.db", mind=ex.ClaudeMind(pin, claude_bin=str(root / "claude")),
+                             max_seconds=3000, budget=ex.Budget.for_model(pin, {pin: row}),
+                             occurrence_dir=root / "occ", handle_stop=sys.argv[2] == "stop")
+    except ex.FireStopRequested:
+        with open(root / "store" / "wrap.lock", "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)        # raises if the unwind left the lock held
+        (root / "unwound").write_text("1")
+        sys.exit(0)
+''')
+
+
+def _run_store_fire(tmp_path, handle_stop):
+    from anneal_memory import FLOW_SCHEMA, Store
+    root = tmp_path / "w"
+    (root / "store").mkdir(parents=True)
+    with Store(str(root / "store" / "memory.db"), section_schema=FLOW_SCHEMA) as s:
+        for i in range(3):
+            s.record(content=f"Turn {i}: helped.", episode_type="observation", source="t")
+    claude = root / "claude"
+    claude.write_text(f'#!/bin/sh\necho $$ > "{root}/child.pid"\nsleep 300\n')
+    claude.chmod(0o755)
+    (root / "fire.py").write_text(STORE_FIRE)
+    p = subprocess.Popen([sys.executable, str(root / "fire.py"), str(root), "stop" if handle_stop else "plain"],
+                         env=dict(os.environ, PYTHONPATH=str(REPO)), cwd=REPO, start_new_session=True)
+    _spawned.append(p)
+    end = time.monotonic() + 30
+    while not (root / "child.pid").exists():
+        assert time.monotonic() < end and p.poll() is None, "the compose child did not start"
+        time.sleep(0.05)
+    time.sleep(0.3)
+    cpid = int((root / "child.pid").read_text())
+    _groups.append(cpid)
+    os.kill(p.pid, signal.SIGTERM)
+    p.wait(timeout=30)
+    return root, p, cpid
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def test_a_real_consolidate_unwinds_on_sigterm_with_handle_stop(tmp_path):
+    root, p, cpid = _run_store_fire(tmp_path, True)
+    assert p.returncode == 0 and (root / "unwound").exists()      # FireStopRequested reached the caller, lock free
+    deadline = time.monotonic() + 5
+    while _alive(cpid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not _alive(cpid)                                       # the compose child was ended through its handle
+    prog = json.loads((root / "occ" / "progress.json").read_text())
+    assert prog["phase"] is None and prog["wrap_token"] is None and prog["child_pid"] is None
+    assert (root / "occ" / "usage.json").exists()                 # the finally ran
+
+
+def test_without_handle_stop_a_sigterm_is_a_plain_kill(tmp_path):
+    root, p, cpid = _run_store_fire(tmp_path, False)
+    assert p.returncode == -signal.SIGTERM and not (root / "unwound").exists()
+    assert _alive(cpid)                                           # the failure this seam closes
+    assert json.loads((root / "occ" / "progress.json").read_text())["phase"] == "composing"

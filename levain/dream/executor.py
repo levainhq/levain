@@ -940,6 +940,7 @@ def consolidate_store(
     read_wrap_schema: Callable[[Any], Any] | None = None,
     remedies: Remedies | None = None,
     require_lock: bool = True,
+    handle_stop: bool = False,
 ) -> ConsolidateResult:
     """One consolidate on the store at ``store_path`` (a ``memory.db``). See the module docstring.
 
@@ -963,27 +964,35 @@ def consolidate_store(
     ``fcntl`` (the dream's single-writer is the lock); ``levain wrap`` passes False and keeps its documented
     best-effort proceed. ``progress.json`` and ``usage.json`` are written only once the store lock is held and the
     occurrence dir holds no live run record.
+
+    ``handle_stop`` installs :func:`fire_stop_handler` on the run's own :class:`Progress` for the whole call, so a
+    SIGTERM (an executor's ``stop()``) unwinds it: the compose child is ended through its handle, our wrap is
+    cancelled by token, the lock is released, and :class:`FireStopRequested` propagates to the caller. Only a dream
+    fire passes it; it is ignored off the main thread (``signal.signal`` raises there).
     """
     store_path = Path(store_path)
     occ_dir = None if occurrence_dir is None else Path(occurrence_dir).expanduser().resolve()
     ctx = _Ctx(occ_dir, mind, budget)
     progress = Progress(occ_dir)
-    try:
-        res = _consolidate_store(
-            ctx, progress, store_path, mind=mind, composer=composer, max_seconds=max_seconds,
-            save_reserve=save_reserve, budget=budget, instructions_path=instructions_path,
-            on_snapshot=on_snapshot or _no_snapshot, on_saved=on_saved or _no_saved, max_composes=max_composes,
-            dry_run=dry_run, reset=reset, unattended=unattended, own_deadline=own_deadline,
-            hard_exit_code=hard_exit_code, label=label, project_name=project_name or store_path.parent.name,
-            constitution=constitution, report=report or _default_report,
-            acquire_lock=acquire_lock, read_wrap_schema=read_wrap_schema,
-            remedies=remedies or DREAM_REMEDIES, require_lock=require_lock)
-        ctx.outcome = res.outcome
-        res.composes = list(ctx.composes)
-        res.spent_usd_micros = ctx.spent
-        return res
-    finally:
-        _write_usage(ctx)
+    with contextlib.ExitStack() as stop_scope:
+        if handle_stop and threading.current_thread() is threading.main_thread():
+            stop_scope.enter_context(fire_stop_handler(progress))
+        try:
+            res = _consolidate_store(
+                ctx, progress, store_path, mind=mind, composer=composer, max_seconds=max_seconds,
+                save_reserve=save_reserve, budget=budget, instructions_path=instructions_path,
+                on_snapshot=on_snapshot or _no_snapshot, on_saved=on_saved or _no_saved, max_composes=max_composes,
+                dry_run=dry_run, reset=reset, unattended=unattended, own_deadline=own_deadline,
+                hard_exit_code=hard_exit_code, label=label, project_name=project_name or store_path.parent.name,
+                constitution=constitution, report=report or _default_report,
+                acquire_lock=acquire_lock, read_wrap_schema=read_wrap_schema,
+                remedies=remedies or DREAM_REMEDIES, require_lock=require_lock)
+            ctx.outcome = res.outcome
+            res.composes = list(ctx.composes)
+            res.spent_usd_micros = ctx.spent
+            return res
+        finally:
+            _write_usage(ctx)
 
 
 def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind: Any, composer: str | None,
