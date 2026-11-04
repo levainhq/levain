@@ -1,8 +1,8 @@
 """P7-1 S3: the reaper-side stop for session rows (known edge (a)).
 
 A reaper built from a ``launched`` row holds no child. ``session.session_executor_of`` gives it an executor that stops a
-session only when the row is its own, the fire is proven dead, and the launcher's ``end_session`` answers exactly
-``StopResult(True, ...)``. Refusals first; then the lease of a row that cannot be stopped; then the one clean stop.
+session only when the row is its own and the launcher's ``end_session`` answers exactly ``StopResult(True, ...)``; the
+fire may be alive (S11b), and its proven death only decides whether an unconfirmed end lets the lease lapse. Refusals first; then the lease of a row that cannot be stopped; then the one clean stop.
 Stores are real ``/2`` agent stores with real launched occurrences; the launcher and the process table are stubs.
 """
 from __future__ import annotations
@@ -81,8 +81,26 @@ def _row(rig, oid):
     return {k: got[k] for k in ("occurrence_id", "agent_id", "session_key", "pid", "epoch", "spec_hash")}
 
 
-def _executor(rig, oid, launcher, fire_state=DEAD):
-    return S.RowSessionExecutor(rig.store, _row(rig, oid), launcher, fire_state=fire_state)
+def _executor(rig, oid, launcher, fire_state=DEAD, clock=lambda: 0.0):
+    # a frozen monotonic clock by default: a stop's END is then asked the whole deadline, exactly
+    return S.RowSessionExecutor(rig.store, _row(rig, oid), launcher, fire_state=fire_state, clock=clock)
+
+
+class Mono:
+    """A monotonic clock the fire probe advances: ``spend(s, state)`` is a fire_state that takes ``s`` seconds."""
+
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+    def spend(self, seconds, state):
+        def probe(rec, deadline):
+            self.asked = deadline
+            self.t += seconds
+            return state(rec, deadline)
+        return probe
 
 
 def _sup(rig, clock, **kw):
@@ -208,11 +226,35 @@ def test_a_stop_that_raises_inside_is_not_a_confirmation(rig):
     oid, _ = _session_row(rig)
     boom = lambda rec, deadline: (_ for _ in ()).throw(RuntimeError("ps exploded"))   # noqa: E731
     launcher = Ender(StopResult(False, "not proven"))
-    result = _executor(rig, oid, launcher, boom).stop(10)       # a probe that raised proved no death: not frozen
-    assert result.terminated is False
+    probed = _executor(rig, oid, launcher, boom)
+    result = probed.stop(10)       # a probe that raised proved no death: not frozen
+    assert result.terminated is False and probed.end_unproven is False and len(launcher.ended) == 1
     ex = _executor(rig, oid, Ender(RuntimeError("front down")), DEAD)
     ex.stop(10)
     assert ex.end_unproven is True
+
+
+@pytest.mark.parametrize("state", [DEAD, ALIVE, FOGGY], ids=["dead", "alive", "unreadable"])
+def test_a_stop_waits_at_most_its_deadline_the_end_gets_only_what_the_probe_left(rig, state):
+    # L3 r1 (codex MED): one absolute deadline at entry; the probe's time comes out of END's allowance
+    oid, key = _session_row(rig)
+    clock, launcher = Mono(), Ender()
+    result = _executor(rig, oid, launcher, clock.spend(4.0, state), clock).stop(10)
+    assert clock.asked == 10.0                                     # the probe is bounded by the same deadline
+    assert result.terminated is True and launcher.ended == [(key, 6.0)]
+
+
+@pytest.mark.parametrize("state, frozen", [(DEAD, True), (ALIVE, False), (FOGGY, False)],
+                         ids=["dead", "alive", "unreadable"])
+@pytest.mark.parametrize("spent", [10.0, 12.5], ids=["exactly", "over"])
+def test_a_probe_that_spent_the_whole_deadline_asks_no_end(rig, state, frozen, spent):
+    oid, _ = _session_row(rig)
+    clock, launcher = Mono(), Ender()
+    ex = _executor(rig, oid, launcher, clock.spend(spent, state), clock)
+    result = ex.stop(10)
+    assert result.terminated is False and "no time" in result.detail
+    assert launcher.ended == []                                    # END is never asked with no budget left
+    assert ex.end_unproven is frozen        # a proven-dead fire whose end could not be confirmed still lapses
 
 
 def test_end_unproven_marks_only_a_dead_fire_whose_end_failed_and_every_stop_resets_it(rig):
@@ -337,7 +379,7 @@ def test_a_reaper_end_of_a_live_fire_leaves_the_fires_finish_nothing_to_write(ri
     out = sup.reap(of)
     assert out.due == [oid] and out.ended == [oid] and out.frozen == []
     assert (rig.row(oid)["state"], rig.row(oid)["reason"]) == ("stopped", "stop_at")
-    assert launcher.ended == [(key, float(supervise.STOP_DEADLINE_S))]
+    assert [k for k, _ in launcher.ended] == [key] and 0 < launcher.ended[0][1] <= supervise.STOP_DEADLINE_S
     before = dict(rig.row(oid))
     end = sup.finish(oid, _executor(rig, oid, launcher, ALIVE), ok=True)
     assert (end.state, end.reason) == ("stopped", "stop_at") and end.ended.ended is False
@@ -470,7 +512,7 @@ def test_a_stub_session_whose_fire_died_is_stopped_and_its_slot_and_reservation_
     row = rig.row(oid)
     assert out.asked == [oid] and out.ended == [oid] and out.unconfirmed == [] and out.frozen == []
     assert (row["state"], row["reason"]) == ("stopped", "link_not_live")   # the revoke drops the link
-    assert launcher.ended == [(key, float(supervise.STOP_DEADLINE_S))]
+    assert [k for k, _ in launcher.ended] == [key] and 0 < launcher.ended[0][1] <= supervise.STOP_DEADLINE_S
     assert rig.taken(oid) == ([], [("settled",)]) and att.rows == {}
 
 

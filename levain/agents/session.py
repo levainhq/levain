@@ -53,6 +53,7 @@ import logging
 import re
 import secrets
 import subprocess
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -562,17 +563,20 @@ class RowSessionExecutor:
     else is ``terminated=False`` with the reason, and nothing is signalled by this class itself.
 
     Two answers for the supervisor's lease (r1 F1/F2), both derived on each call from the store, the fire's identity
-    record and the process table, never remembered: :meth:`fire_proven_dead` (every refusal before the end passes and
-    the fire is proven dead: the supervisor withholds the row's renewal until its stop answers), and, after
-    :meth:`stop`, ``end_unproven``, True only when that stop PROVED the fire dead and ``end_session`` then failed to
-    confirm (the one row whose lease is left to lapse)."""
+    record and the process table, never remembered: :meth:`fire_proven_dead` (the row and launcher checks pass and the
+    fire is proven dead; a lease probe only, :meth:`stop` does not need it to end a session: the supervisor withholds
+    the row's renewal until its stop answers), and, after :meth:`stop`, ``end_unproven``, True only when that stop
+    PROVED the fire dead and ``end_session`` then failed to confirm or was not asked for lack of time (the one row
+    whose lease is left to lapse). A stop waits at most its deadline: the probe and the end share it."""
 
     def __init__(self, store: AgentStore, row: Mapping[str, Any], launcher: Any, *,
-                 fire_state: Callable[[Mapping[str, Any], float], str] | None = None) -> None:
+                 fire_state: Callable[[Mapping[str, Any], float], str] | None = None,
+                 clock: Callable[[], float] | None = None) -> None:
         self.store = store
         self.occurrence_id, self.agent_id, self.session_key = row["occurrence_id"], row["agent_id"], row["session_key"]
         self.launcher = launcher
         self._fire_state = fire_state or _fire_state
+        self._clock = clock or time.monotonic
         self.max_exposure_usd_micros = 0
         self.action_exposure = None
         self.end_unproven = False
@@ -634,7 +638,7 @@ class RowSessionExecutor:
             return "the fire's identity record is malformed or another occurrence's", None
         state = self._fire_state(rec, deadline_s)
         if state != "ended":
-            return f"the fire is not proven dead ({state}): the session is not ended from here", None
+            return f"the fire is not proven dead ({state})", None
         return None, end
 
     def _stop(self, deadline_s: float) -> StopResult:
@@ -646,10 +650,18 @@ class RowSessionExecutor:
             return StopResult(False, "the launcher has no end_session: nothing can end the session")
         # S11b (Q2 = a): a barred or due session is ended whether its fire lives or not; END keeps the work. The fire's
         # death is read BEFORE the end (the end may kill it) and only decides end_unproven, the one row whose lease
-        # lapses to takeover when the end then fails to confirm; a live or unreadable fire keeps its lease.
-        dead = self.fire_proven_dead(deadline_s)
-        self.end_unproven = dead        # only a proven end below clears it (a raise keeps it)
-        got = end(self.session_key, max(0.0, deadline_s))
+        # lapses to takeover when the end then fails to confirm; a live or unreadable fire keeps its lease. It is not
+        # re-read after a failed end: END's answer carries no fire state, so a death seen then cannot be told from one
+        # END caused; a fire that died on its own in between keeps its lease this pass and is proven dead on the next.
+        # ONE deadline for the whole stop (L3 r1): the probe and END share it, END gets only what the probe left, and
+        # with nothing left END is not asked at all (Executor.stop waits at most deadline_s; the reaper stops serially).
+        until = self._clock() + max(0.0, deadline_s)
+        dead = self.fire_proven_dead(until - self._clock())
+        self.end_unproven = dead        # only a proven end below clears it (a raise or no time left keeps it)
+        left = until - self._clock()
+        if left <= 0:
+            return StopResult(False, "no time was left in the stop's deadline to ask the session end; nothing ended")
+        got = end(self.session_key, left)
         if type(got) is StopResult and got.terminated is True:
             self.end_unproven = False
             return StopResult(True, f"the session ended ({'fire dead' if dead else 'fire not proven dead'}): {got.detail}")
