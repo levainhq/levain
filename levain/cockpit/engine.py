@@ -2980,7 +2980,7 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
         # a stateless resident (a role run on a schedule) is read from its last run, never from a bare "running"
         t = _run_time(dg)
         if t is None:
-            parts.append("no run time reported")      # an older roster: today's tone (ok), and no health word
+            note("unknown", "no run time reported")   # an older roster: absence of a run time is never health
         else:
             parts.append(t)
         _status_part(dg, parts)

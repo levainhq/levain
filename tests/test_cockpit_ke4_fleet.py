@@ -107,7 +107,7 @@ def test_f1_missing_or_unreadable_evidence_is_unknown_never_ok() -> None:
     assert h["nullwrap"]["tone"] == "unknown"
     assert h["noavail"]["tone"] == "unknown" and "no liveness data" in h["noavail"]["text"]
     assert h["empty"]["tone"] == "unknown" and "no liveness data" in h["empty"]["text"]
-    assert h["stateless_ok"]["tone"] == "ok"
+    assert h["stateless_ok"]["tone"] == "unknown" and "no run time reported" in h["stateless_ok"]["text"]
     # an alarm outranks unknown: silent AND no wrap time is still an alarm
     assert _at([{**RES, "digest": {"available": True, "episodes_24h": 0}}])["flow"]["tone"] == "alarm"
 
@@ -192,7 +192,7 @@ def test_a_status_is_text_never_a_health_word() -> None:
 
 def test_old_roster_shape_degrades_without_error_and_never_reads_running() -> None:
     h = _rows({**ROLE, "digest": {"available": True, "episodes_24h": 33}})["diogenes"]["health"]
-    assert h["tone"] == "ok" and h["text"] == "no run time reported · 33 episodes in 24 h"     # today's tone, no health word
+    assert h["tone"] == "unknown" and h["text"] == "no run time reported · 33 episodes in 24 h"     # absence of a run time is not health
     dead = _rows({**ROLE, "digest": {"available": False}})["diogenes"]["health"]
     assert dead["tone"] == "alarm" and dead["text"] == "write path unavailable"       # unchanged for the old shape
     junk = _role(last_run_at="not a time", run_failed="yes", run_late=1)
