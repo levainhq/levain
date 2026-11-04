@@ -6,7 +6,9 @@ What stands alone here, each part failing closed:
   judged by the real ``parse_role`` / ``parse_spec`` / ``check_spec`` before anything is written.
 * :func:`signing_card_text`: the words the link's signing card carries (§6).
 * :func:`day_ready` / :func:`make_on_input`: the day-ready predicate as the input check. Anything that raises is
-  ``unreadable``, never ready. The hook POINT is not on main: :func:`unwired_on_input` is the default and refuses.
+  ``unreadable``, never ready. The hook point is the controller's ``check_input`` (``launch(on_input=...)``), which
+  takes a plain ``bool``: :func:`bool_on_input` and :func:`install_on_input` adapt this verdict to it, and the
+  controller resolves the dream's hook by agent name when a caller passes none.
 * :func:`win_check`: the dream's win (§9, "Win verifier") in the shape of ``supervise.Hooks.verify``.
   :func:`register_win_check` hands it to P8b's ``gauges.register_check`` once that exists; until a caller passes one,
   nothing registers it.
@@ -14,6 +16,9 @@ What stands alone here, each part failing closed:
 * :func:`pause_notice`, :func:`renewal_check`, :func:`drill_tick`: the pause's attention row (§4.4), the expiry
   renewal card and expiry row (F14), and the drill on its own 7-day cadence (F12).
 * :func:`run_body` / :func:`make_run`: the fire's body for a dream occurrence, with every dependency passed in.
+* :func:`read_install` / :func:`fire_factory` / :func:`dream_run`: the install facts the fire reads from the agent
+  store's directory, the factory that builds :func:`run_body`'s arguments from them, and the ``fire(run=...)`` callable
+  the controller dispatches a dream occurrence to.
 
 An attention row is a callable ``attention(key, text)`` that upserts on its key (the shape ``Supervisor.reap`` takes);
 the agent store holds no attention table.
@@ -216,8 +221,8 @@ def day_ready(store_path: Path | str, row: Mapping[str, Any], *, now: datetime, 
 
 def make_on_input(store_path: Path | str, *, zone: str, agent_dir: Path | str | None, coord_dir: Path | str | None,
                   clock: Callable[[], datetime] | None = None) -> Callable[[Mapping[str, Any]], InputVerdict]:
-    """The dream's input check for the ``on_input`` hook point, as ``fn(occurrence_row) -> InputVerdict``. The hook
-    point's own signature is P6-5's; this is the dream's half."""
+    """The dream's input check, as ``fn(occurrence_row) -> InputVerdict``. The controller's hook point takes a plain
+    ``bool``: :func:`bool_on_input` is the adapter."""
     clk = clock or (lambda: datetime.now(timezone.utc))
 
     def on_input(row: Mapping[str, Any]) -> InputVerdict:
@@ -227,8 +232,18 @@ def make_on_input(store_path: Path | str, *, zone: str, agent_dir: Path | str | 
 
 
 def unwired_on_input(row: Mapping[str, Any]) -> InputVerdict:
-    """The seam's default until the ``on_input`` hook point exists: no occurrence is ever ready."""
+    """A verdict that never admits: no occurrence is ever ready."""
     return InputVerdict(False, _ready.UNREADABLE, "unwired", "the on_input hook point is not wired to the dream")
+
+
+def bool_on_input(check: Callable[[Mapping[str, Any]], InputVerdict]) -> Callable[[Mapping[str, Any]], bool]:
+    """``check`` in the shape ``launch(on_input=...)`` takes: the verdict's ``ok``. The controller reads a ``bool`` as
+    present or absent input and anything else (or a raise) as dead input, so the verdict's state and reason do not
+    reach the row; they stay in :func:`day_ready` for ``levain dream ready``."""
+    def on_input(row: Mapping[str, Any]) -> bool:
+        return check(row).ok is True
+
+    return on_input
 
 
 # ------------------------------------------------------------------------------------------------------- win check
@@ -641,3 +656,95 @@ def make_run(factory: Callable[[Any, str, int], Mapping[str, Any]]) -> Callable[
             return 1
 
     return run
+
+
+# --------------------------------------------------------------------------------------------- the install, the dispatch
+
+INSTALL_FILE = "dream_install.json"
+_INSTALL_KEYS = ("store_path", "cockpit_root", "coord_dir", "zone")
+
+
+@dataclass(frozen=True)
+class DreamInstall:
+    """What a dream occurrence needs that the agent store does not hold: the install's anneal ``memory.db``, the cockpit
+    root its authority log is replayed from, the coordinator queue directory (the review store and the live-session
+    reads), the install's zone, and the first-run facts file the Claude route's exposure check reads."""
+    store_path: Path
+    cockpit_root: Path
+    coord_dir: Path
+    zone: str
+    facts_path: Path | None = None
+    model: str = "claude-opus-5-5"
+    claude_bin: str = "claude"
+
+
+def read_install(agent_dir: Path | str) -> DreamInstall:
+    """The install facts from ``<agent_dir>/dream_install.json``. A file that is absent, unreadable or missing a key
+    raises ``ValueError`` naming it: a dream that cannot find its install does not run."""
+    path = Path(agent_dir) / INSTALL_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"the dream install facts cannot be read from {path} ({type(exc).__name__})") from exc
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    missing = [k for k in _INSTALL_KEYS if not isinstance(doc.get(k), str) or not doc[k].strip()]
+    if missing:
+        raise ValueError(f"{path} lacks {', '.join(missing)}")
+    facts = doc.get("facts_path")
+    return DreamInstall(Path(doc["store_path"]).expanduser(), Path(doc["cockpit_root"]).expanduser(),
+                        Path(doc["coord_dir"]).expanduser(), doc["zone"],
+                        None if facts is None else Path(facts).expanduser(),
+                        doc.get("model") or "claude-opus-5-5", doc.get("claude_bin") or "claude")
+
+
+def install_on_input(agent_dir: Path | str, *, clock: Callable[[], datetime] | None = None
+                     ) -> Callable[[Mapping[str, Any]], bool]:
+    """The ``launch(on_input=...)`` hook for the install in ``agent_dir``. The install is read when the hook runs, so a
+    missing file raises there, which the controller reads as dead input (the row stays ``admitted``, then ends
+    ``missed`` past its grace), never as a quiet day."""
+    def on_input(row: Mapping[str, Any]) -> bool:
+        inst = read_install(agent_dir)
+        return bool_on_input(make_on_input(inst.store_path, zone=inst.zone, agent_dir=agent_dir,
+                                           coord_dir=inst.coord_dir, clock=clock))(row)
+
+    return on_input
+
+
+def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str, Any]:
+    """The keyword arguments of :func:`run_body` for a dream occurrence, built from the install facts in the agent
+    store's directory: the supervisor over the install's authority log, the dream's executor, the consolidate with the
+    snapshot hooks bound, and the coordinator's review store. Nothing here runs the compose. A failure to build
+    raises, and :func:`make_run` reads that as a run that did not start."""
+    from levain.agent_authority import AgentAuthority
+    from levain.agents import supervise
+    from levain.coordinator.store import CoordStore
+    from levain.dream import executor as ex
+
+    inst = read_install(store.directory)
+    occ_dir = inst.store_path.parent / "dream" / occurrence_id
+    review_store = CoordStore(inst.coord_dir)
+
+    def verify(end: Any) -> str | None:
+        return win_check(end, locate=lambda oid: (inst.store_path, inst.store_path.parent / "dream" / oid,
+                                                  review_store))
+
+    executor = ex.DreamExecutor(agent_store_dir=store.directory, occurrence_id=occurrence_id, occ_dir=occ_dir,
+                                route="claude", model=inst.model, facts_path=inst.facts_path)
+    sup = supervise.Supervisor(store, authority=AgentAuthority(inst.cockpit_root),
+                               hooks=supervise.Hooks(verify=verify))
+
+    def consolidate() -> Any:
+        on_snapshot, on_saved = _snap.hooks()
+        mind = ex.ClaudeMind(inst.model, claude_bin=inst.claude_bin)
+        return ex.consolidate_store(inst.store_path, mind=mind, composer=inst.model, max_seconds=ex.DREAM_BUDGET_S,
+                                    budget=ex.Budget.for_model(inst.model), occurrence_dir=occ_dir,
+                                    on_snapshot=on_snapshot, on_saved=on_saved, label="levain dream")
+
+    return {"sup": sup, "store_path": inst.store_path, "occ_dir": occ_dir, "executor": executor,
+            "consolidate": consolidate, "review_store": review_store}
+
+
+def dream_run(store: Any, occurrence_id: str, launch_epoch: int) -> int:
+    """The ``fire(run=...)`` callable for a dream occurrence: :func:`run_body` over :func:`fire_factory`."""
+    return make_run(fire_factory)(store, occurrence_id, launch_epoch)
