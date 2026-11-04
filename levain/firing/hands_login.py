@@ -35,6 +35,8 @@ import os
 import platform
 import queue
 import re
+import secrets
+import stat
 import subprocess
 import sys
 import threading
@@ -410,12 +412,12 @@ def _write_out(s: str) -> None:
 
 
 def _run_login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, emit: Callable[[str], None],
-               timeout: float) -> LoginResult:
+               timeout: float, argv: list[str] | None = None) -> LoginResult:
     """The vendor login as the hands user, under the caller's hands lock. The caller's stdin is inherited (Claude's
     paste-code prompt reads the code there); output goes to ``emit`` as it arrives, a prompt without a newline
     included. Reading and waiting share one deadline; on it, or on any exception or interrupt, sudo is killed and
     the hands account swept, then a :class:`HandsLoginError` is raised (an interrupt passes through)."""
-    proc = subprocess.Popen(login_argv(hands, vendor), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    proc = subprocess.Popen(login_argv(hands, vendor) if argv is None else argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             cwd="/", env=child_env())
     chunks: "queue.Queue[bytes | None]" = queue.Queue()
 
@@ -610,13 +612,68 @@ def remove_argv(hands: HandsIdentity, vendor: str) -> list[str]:
     return _as_hands_argv(hands, vendor, "/bin/rm", "-f", "--", credential_path(hands, vendor))
 
 
+class RecordFileRefused(OSError):
+    """An operator-side record under ``<entity>/.levain/`` is a symlink or not a regular file: refused, never
+    followed. ``.levain`` is writable by the entity's hands, so whatever stands at a record's path may be planted."""
+
+
+def read_record_json(path: Path) -> object | None:
+    """The JSON at ``path``, or None when nothing is there. Opened with ``O_NOFOLLOW`` (and ``O_NONBLOCK``, so a
+    planted FIFO cannot hang the read) and checked by ``fstat`` on the open descriptor: a symlink or a non-regular
+    file raises :class:`RecordFileRefused`; other faults raise ``OSError`` or ``ValueError``."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if os.path.islink(path):
+            raise RecordFileRefused(f"{path} is a symlink, not a record; it was not followed") from None
+        raise exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RecordFileRefused(f"{path} is not a regular file; it was not read")
+        chunks = []
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+    finally:
+        os.close(fd)
+    return json.loads(b"".join(chunks).decode("utf-8"))
+
+
+def write_record_json(path: Path, data: object) -> None:
+    """Replace ``path`` with ``data`` as JSON: a fresh temp of a random name beside it (``O_CREAT | O_EXCL |
+    O_NOFOLLOW``, mode 0600, so nothing planted under any name is opened or truncated), written in full, fsync'd,
+    then renamed over ``path`` (a rename replaces a planted symlink itself, never its target). The temp is removed
+    on any failure. Raises ``OSError``."""
+    tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        try:
+            view = memoryview(json.dumps(data, sort_keys=True).encode("utf-8"))
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _outcome_path(entity_dir: Path | str) -> Path:
     return Path(entity_dir) / ".levain" / OUTCOME_FILE
 
 
 def read_outcomes(entity_dir: Path | str) -> dict[str, dict[str, str]]:
     try:
-        data = json.loads(_outcome_path(entity_dir).read_text())
+        data = read_record_json(_outcome_path(entity_dir))
     except (OSError, ValueError):
         return {}
     return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
@@ -635,9 +692,7 @@ def record_outcome(entity_dir: Path | str, vendor: str, outcome: str) -> None:
             fcntl.flock(lk, fcntl.LOCK_EX)
             data = read_outcomes(entity_dir)
             data[vendor] = {"outcome": outcome, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-            tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(data, sort_keys=True))
-            os.replace(tmp, path)
+            write_record_json(path, data)
         finally:
             os.close(lk)
     except OSError:
