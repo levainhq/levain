@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -655,6 +656,51 @@ def test_fix1_a_stop_behind_a_hung_send_closes_the_session(store, cs, monkeypatc
         session.release.set()
         sender.join(5)
     assert not sender.is_alive()
+
+
+class CloseSlow(SendHung):
+    """A hung send whose close takes a while and records how many closes run at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.live_closes = self.peak_closes = 0
+        self.close_started = threading.Event()
+        self._cl = threading.Lock()
+
+    def close(self):
+        with self._cl:
+            self.live_closes += 1
+            self.peak_closes = max(self.peak_closes, self.live_closes)
+        self.close_started.set()
+        time.sleep(0.25)
+        with self._cl:
+            self.live_closes -= 1
+        super().close()
+
+
+def test_a_stop_by_close_keeps_its_pin_until_the_close_returns_so_detach_cannot_close_twice(store, cs, monkeypatch):
+    """L3_rmd2_r3 codex MED: the stop-by-close dropped its pin before the bounded close finished, so a hung send that
+    returned late let detach() close the same session while the stop's close was still running. The pin now stays
+    until the close returns, and detach waits on it."""
+    monkeypatch.setattr(chat, "INTERRUPT_DEADLINE", 0.6)
+    thread, launch, svc = _held_room(store, cs, "room-sid-c2")
+    session = _attach(svc, cs, launch, CloseSlow())
+    sender = threading.Thread(target=lambda: say(svc, thread))
+    sender.start()
+    stopper = None
+    try:
+        assert session.entered.wait(5)
+        stopper = threading.Thread(target=lambda: svc.interrupt(launch, None))
+        stopper.start()
+        assert session.close_started.wait(5)             # the stop's close is running (the send is still hung)
+        session.release.set()                            # the hung send now returns late
+        svc.detach(launch)                               # must wait for the pin, not close beside the stop's close
+    finally:
+        session.release.set()
+        sender.join(5)
+        if stopper is not None:
+            stopper.join(5)
+    assert session.peak_closes == 1, f"{session.peak_closes} closes of one session ran at once"
 
 
 def test_fix3_a_turn_release_of_a_room_launch_is_refused_at_the_service(world, monkeypatch):

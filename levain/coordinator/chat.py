@@ -2346,7 +2346,6 @@ class ChatService:
         released, then ``session.close()`` runs bounded by :data:`INTERRUPT_DEADLINE`. The session stays attached,
         wedged, until :meth:`detach` forgets it. The receipt is ``ambiguous`` and says the session was closed."""
         self._wedge(launch_id, session)
-        unpin()
         head = (f"a send on this session had not returned within {INTERRUPT_DEADLINE:g} s, so the session was closed "
                 "instead of interrupted")
         tail = "; it is used no more until it is detached"
@@ -2358,6 +2357,10 @@ class ChatService:
         except Exception as exc:  # noqa: BLE001 - a close that raises is reported, never lost
             return CommandResult("ambiguous", _cause_text(f"{head}, and its close raised {type(exc).__name__}: "
                                                           f"{_said(exc)}{tail}"))
+        finally:
+            # the pin stays until the close has returned (or timed out): detach() waits on the pin, so a hung send that
+            # returns late cannot close the same session while this close is still running (L3_rmd2_r3 codex MED)
+            unpin()
         return CommandResult("ambiguous", f"{head} (closing is the stop){tail}")
 
     # --- liveness: the activation writer, the probe, your re-enable, the composer (§4.1-§4.3, H9) -------------
