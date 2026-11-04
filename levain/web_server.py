@@ -1674,6 +1674,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     chat_service: "ChatService | None" = None
     # the room's host (RM-F): its ChatService, CoordStore and the launcher's verbs; None serves no room write route
     room_host: "cockpit_room.RoomHost | None" = None
+    # the RoomServe make_server started (RM-G2); server_close stops it. None: this server holds no room
+    room_serve: "Any" = None
     # the dispatch family's sign, cancel and authorise (OS-2), built by make_server beside the Signer; None serves no
     # dispatch signing route
     dispatch_sheet: "DispatchSheet | None" = None
@@ -1765,6 +1767,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
             self.published_origin = None
         self.stream_stop.set()      # open streams end first: nothing is left holding a thread
         self.stream_watcher.stop()
+        if self.room_serve is not None:
+            self.room_serve.stop()      # the pump and the room's child end; stop() never raises
         if self.broker is not None:
             self.broker.stop()
         if self.coord_sheet is not None:
@@ -3324,7 +3328,9 @@ class _Handler(GuardedHandler):
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
             try:
-                status, payload = cockpit_room.serve_room(path, directory=directory, service=self.server.chat_service)
+                host = self.server.room_host
+                status, payload = cockpit_room.serve_room(path, directory=directory, service=self.server.chat_service,
+                                                          view=host.view if host is not None else None)
             finally:
                 self.server.request_gate.release()
         self._send(cockpit_room.encode(payload), "application/json; charset=utf-8", status=status, head=head,
@@ -3349,6 +3355,8 @@ class _Handler(GuardedHandler):
             status, payload = cockpit_room.post_room_mark(host, directory, owner, req)
         elif action == "drop":
             status, payload = cockpit_room.post_room_drop(host, owner, req)
+        elif action == "open":
+            status, payload = cockpit_room.post_room_open(host, owner, req)
         else:
             status, payload = cockpit_room.post_room_rotate(host, directory, owner, req)
         return payload, status
@@ -4521,6 +4529,7 @@ def make_server(
     work_board: bool = True,
     chat_service: "ChatService | None" = None,
     room_host: "cockpit_room.RoomHost | None" = None,
+    room_serve: "Any" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -4878,6 +4887,13 @@ def make_server(
         raise ValueError("refusing signer: this server has no surface token for its sign routes to require (a "
                          "read-only source given no write_token or surface_tokens); pass a write_token")
 
+    if room_serve is not None:
+        if chat_service is not None or room_host is not None:
+            raise ValueError("refusing room_serve: it brings its own ChatService and room host (ONE service serves the "
+                             "room's reads and its writes); pass it instead of chat_service and room_host")
+        from levain.cockpit.room import host_from
+
+        chat_service, room_host = room_serve.service, host_from(room_serve)
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     assets[_SHEET_PAGE] = load_web_asset(_SHEET_PAGE).encode("utf-8")
     httpd = _LevainHTTPServer((host, port), _Handler)
@@ -4901,6 +4917,7 @@ def make_server(
     httpd.work_board = work_board
     httpd.chat_service = chat_service
     httpd.room_host = room_host
+    httpd.room_serve = None         # set only once the RoomServe has started, at the very end
     httpd.verb_registry = verb_registry
     httpd._cockpit_lock = threading.Lock()
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
@@ -4992,6 +5009,18 @@ def make_server(
         httpd.broker = _build_broker(source, install_class, httpd, extra_effects)
         # one reader over one queue directory for the decisions panel's rows and the consent body route alike
         httpd.consent_reader = _consent_reader()
+        if room_serve is not None:
+            # the room's routes read the consent directory's dispatch.db; the serve writes the one it was built over.
+            # They are one directory or this server refuses: a page reading one store while the room writes another
+            # would show an empty room forever.
+            from levain.consent.queue import default_queue_dir
+
+            want = Path(room_serve.directory).resolve()
+            have = Path(default_queue_dir()).resolve()
+            if want != have:
+                raise ValueError(f"refusing room_serve: it writes {want} but the cockpit reads {have}; build the "
+                                 "RoomServe over the consent queue directory")
+            httpd.consent_reader.directory = have      # pinned: a LEVAIN_HOME changed since is not re-resolved
         from levain.consent.questions import QuestionStore
 
         # over the reader's own directory only (None is the default queue): a reader without the attribute gets no
@@ -5080,6 +5109,17 @@ def make_server(
                 (httpd.broker.data_root / SERVED_VERBS_NAME).unlink(missing_ok=True)
             except OSError as stale:
                 _log.warning("cockpit: an earlier served-verbs record may remain: %s", stale)
+    if room_serve is not None:
+        # the last fallible step: recover() then the pump. A serve that cannot recover serves nothing and holds nothing.
+        try:
+            room_serve.start()
+        except BaseException:
+            try:
+                room_serve.stop()
+            finally:
+                httpd.server_close()
+            raise
+        httpd.room_serve = room_serve        # server_close stops it
     return httpd
 
 
@@ -5108,6 +5148,7 @@ def run_web_server(
     install_class: str | None = None,
     sign_queue_dir: "Path | None" = None,
     sign_host: str | None = None,
+    room: "Path | None" = None,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -5204,7 +5245,25 @@ def run_web_server(
             print(chat_err, file=sys.stderr)
             return 1
 
+    room_serve = None
+    if room is not None:
+        # the cockpit's one Claude room (RM-G2): opt-in, because the room's child has hands and reads the operator's tree
+        if not write:
+            print("refusing --room: the room takes writes (its lines, stop and drop), which need the write token; "
+                  "pass --write", file=sys.stderr)
+            return 1
+        try:
+            room_serve = _build_room_serve(room)
+        except (ValueError, OSError, RuntimeError) as exc:
+            print(f"refusing --room: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:    # noqa: BLE001 - a CoordError (a store that will not open, a launcher that refuses its setting)
+            print(f"refusing --room: {exc}", file=sys.stderr)
+            return 1
+
     sign_kw: dict[str, Any] = {} if signer is None else {"signer": signer, "extra_hosts": frozenset({sign_host})}
+    if room_serve is not None:
+        sign_kw["room_serve"] = room_serve
     try:
         # the Coordinator panel's verbs exactly when the watcher below runs beside this server
         httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,
@@ -5212,15 +5271,23 @@ def run_web_server(
     # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback — or
     # make_server's own refusal of the signer or its name
     except ValueError as exc:
+        if room_serve is not None:
+            room_serve.stop()
         print(str(exc), file=sys.stderr)
         return 1
     except OSError as exc:
+        if room_serve is not None:
+            room_serve.stop()
         print(
             f"Could not bind {host}:{port} — {exc}.\n"
             "The port may be in use; try `levain serve --port <N>`.",
             file=sys.stderr,
         )
         return 1
+    except BaseException:
+        if room_serve is not None:
+            room_serve.stop()
+        raise
 
     # str-coerce the bound address (socket address types are loosely str|bytes;
     # AF_INET yields a str, but coerce so the f-strings below can't ever render a
@@ -5234,6 +5301,8 @@ def run_web_server(
     print(f"  store: {source.anneal.episodic_db}")
     mode = "GOVERNED WRITABLE" if source.write_scope is not None else "read-only"
     print(f"  {mode} · localhost-only · Ctrl+C to stop")
+    if room_serve is not None:
+        print(f"  room: one Claude room · its tools see {room} first · recovered {room_serve.recovered or 'nothing'}")
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
@@ -5290,6 +5359,22 @@ def run_web_server(
             if watcher is not None:      # stopped last, and whatever the closes above raised
                 watcher.stop()
     return 0
+
+
+def _build_room_serve(room: Path) -> Any:
+    """The :class:`~levain.coordinator.room_serve.RoomServe` ``levain serve --room DIR`` hands ``make_server``, over the
+    consent queue's ``dispatch.db`` (the file the cockpit's room reads). ``DIR`` is where the room's file tools see first:
+    an existing directory. Built here, started by ``make_server`` after every refusal has passed."""
+    from levain.consent.queue import default_queue_dir
+    from levain.coordinator.envelopes import EnvelopeStore
+    from levain.coordinator.room_launch import RoomSetting
+    from levain.coordinator.room_serve import RoomServe
+
+    cwd = Path(room).expanduser().resolve()
+    if not cwd.is_dir():
+        raise ValueError(f"{cwd} is not a directory (it is where the room's file tools see first)")
+    queue = Path(default_queue_dir()).resolve()
+    return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd)), run_dir=str(queue / "room-run"))
 
 
 def _serve_signer(queue_dir: Path, host: str) -> "Signer":

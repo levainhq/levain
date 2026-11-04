@@ -67,7 +67,7 @@ class World:
         if self.ensure_error is not None:
             raise self.ensure_error
 
-    def _rotate(self):
+    def _rotate(self, expected=None):
         new = _thread(self.store, title="the next room")
         with self.store._write() as (conn, _now):
             room.rotate(conn, new)
@@ -673,7 +673,7 @@ def test_f4_the_rotation_answers_the_open_room_whatever_the_host_returns(tmp_pat
     old = w.thread
     real = w._rotate
 
-    def returns_old():
+    def returns_old(_expected=None):
         real()
         return old
 

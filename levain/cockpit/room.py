@@ -13,7 +13,10 @@ Writes act through a :class:`RoomHost` the mount was given, for an authenticated
 * ``send`` (``send_room``): the line is the operator's, queued, no turn lease, no epoch. A stored ``outbox_id`` is answered
   from the record BEFORE any launch is opened, so a resend after a restart opens nothing. A receipt that moved nothing is
   a 409 named by its state; ``pending`` and ``attempted`` are never a 200; ``accepted`` and ``ambiguous`` are.
-* ``stop`` (unfenced, B5), ``mark`` (an ambiguous line, delivered or not), ``rotate`` (the host's own verb).
+* ``open``: the first-need open. With no room open the page shows an Open button and every other control dark; an
+  open room is answered as it stands, never opened twice.
+* ``stop`` (unfenced, B5), ``mark`` (an ambiguous line, delivered or not), ``rotate`` (the host's own verb, fenced by
+  the room the page drew).
 * ``drop``: the composer's text, verbatim, as a drop from this surface. No model turn and no note.
 * ``proposal/<id>/commit`` and ``/dismiss``: his tap on a card. The drop's words are the bytes the card's field held
   (his adopted quote or his edit), the room's summary only ever rides as the labelled note
@@ -38,11 +41,13 @@ from levain.cockpit.consent import utc_stamp
 from levain.coordinator import chat
 from levain.coordinator import room as coordroom
 from levain.coordinator.chat_lease import check_owner
+from levain.coordinator.room_launch import RoomLaunchError
+from levain.coordinator.room_serve import RoomServeError
 from levain.coordinator.store import SURFACES, WORDS_MAX, CoordError, DropConflict
 
 ROOM_PATH = "/cockpit/room.json"
 ROOM_PREFIX = "/cockpit/room/"
-ROOM_ACTIONS = ("send", "stop", "mark", "drop", "rotate")
+ROOM_ACTIONS = ("send", "stop", "mark", "drop", "rotate", "open")
 PROPOSAL_ACTIONS = ("commit", "dismiss")
 READ_OWNER = "cockpit:room-read"        # a room composer ignores its owner (no lease); the read still needs a well-formed one
 PROPOSALS_MAX = 50
@@ -57,13 +62,32 @@ _UNDELIVERED = ("refused", "cancelled", "not_delivered")
 class RoomHost:
     """What the mount hands the room routes. ``service`` is the ChatService and ``store`` the CoordStore over the same
     ``dispatch.db`` (for a drop). ``ensure()`` opens or reopens the room's running launch (``RoomLauncher.ensure``) and
-    raises a CoordError when it cannot; None means the launch is kept elsewhere. ``rotate()`` makes the next room thread
-    the open room; None serves no rotation. Its return value is NOT read: the landed ``coordroom.rotate`` returns the OLD
-    thread and another host may return the new one, so the route answers with the open room it re-reads."""
+    raises a CoordError when it cannot; None means the launch is kept elsewhere. ``rotate(expected_room)`` makes the next
+    room thread the open room when ``expected_room`` (the thread the page drew) still is the open one, and raises
+    ``RoomRotated`` when it is not (the check and the act are one step, so two stale taps rotate once); None serves no
+    rotation. Its return value is NOT read: the landed ``coordroom.rotate`` returns the OLD thread and another host may
+    return the new one, so the route answers with the open room it re-reads.
+
+    A host built from a :class:`~levain.coordinator.room_serve.RoomServe` (:func:`host_from`) also carries ``send``
+    (``RoomServe.send``: ordered against recover, the open and the launch, called with ``room_thread=`` the page's),
+    ``stop(launch_id)`` (``RoomServe.interrupt``), ``open()`` (the first-need open, ``RoomServe.ensure_room``) and
+    ``view()`` (the pump's last error). Without ``send`` a send is ``ensure()`` then ``service.send_room``; without
+    ``stop`` a stop is ``service.interrupt``; without ``open`` the route serves none."""
     service: Any
     store: Any
     ensure: Callable[[], Any] | None = None
-    rotate: Callable[[], Any] | None = None
+    rotate: Callable[[str], Any] | None = None
+    send: Callable[..., Any] | None = None
+    stop: Callable[[str], Any] | None = None
+    open: Callable[[], Any] | None = None
+    view: Callable[[], Mapping[str, Any]] | None = None
+
+
+def host_from(rs: Any) -> RoomHost:
+    """The host a ``levain serve`` mounts over its :class:`~levain.coordinator.room_serve.RoomServe`: ONE ChatService
+    (``rs.service``, the one ``make_server`` reads through), the store, and every verb the serve orders."""
+    return RoomHost(rs.service, rs.store, rotate=rs.rotate, send=rs.send, stop=rs.interrupt, open=rs.ensure_room,
+                    view=rs.view)
 
 
 def is_room_path(path: str) -> bool:
@@ -180,14 +204,24 @@ def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
         conn.close()
 
 
-def serve_room(path: str, *, directory: Path | str, service: Any = None) -> tuple[int, dict[str, Any]]:
-    """``(status, body)`` for ``GET /cockpit/room.json``: a store that cannot be read is a 500 with a fixed sentence."""
+def serve_room(path: str, *, directory: Path | str, service: Any = None,
+               view: Callable[[], Mapping[str, Any]] | None = None) -> tuple[int, dict[str, Any]]:
+    """``(status, body)`` for ``GET /cockpit/room.json``: a store that cannot be read is a 500 with a fixed sentence.
+    ``view`` (the host's, when a serve holds the room) adds ``room_error``: the pump's or the launch's last error, or
+    None, so a room that cannot start says why on the page instead of staying silent."""
     if path != ROOM_PATH:
         return 404, {"error": "not_found", "message": "no such room route"}
     try:
-        return 200, room_read(directory, service)
+        body = room_read(directory, service)
     except Exception:       # the boundary: whatever broke, the caller gets the fixed sentence and no detail
         return 500, {"error": "internal", "message": "the room record could not be read"}
+    if view is not None:
+        try:
+            err = view().get("last_error")
+        except Exception:   # a serve that is stopped or not started has no error to report
+            err = None
+        body["room_error"] = err if isinstance(err, str) and err else None
+    return 200, body
 
 
 # --- writes -----------------------------------------------------------------------------------------------------------
@@ -303,6 +337,9 @@ def post_room_send(host: RoomHost, directory: Path | str, owner: str | None, req
         room_thread = req["room_thread_id"]
     kw = dict(author_surface=who[0], client_id=who[1], outbox_id=req["outbox_id"], body=req["body"])
     try:
+        if host.send is not None:
+            # the serve orders recover, the open and the line itself (and answers a stored outbox_id before opening)
+            return _answer(host.send(room_thread=room_thread, **kw))
         if host.ensure is not None and not _stored_outbox(directory, req["outbox_id"]):
             try:
                 host.ensure()
@@ -313,6 +350,8 @@ def post_room_send(host: RoomHost, directory: Path | str, owner: str | None, req
         return _refusal("room_rotated", str(exc), 409)
     except chat.MessageConflict as exc:
         return _refusal("outbox_conflict", str(exc), 409)
+    except (RoomServeError, RoomLaunchError) as exc:
+        return _refusal("room_unavailable", str(exc), 409)
     except CoordError as exc:
         return _refusal("send_refused", str(exc), 400)
     except Exception:       # noqa: BLE001 - never a bare 500 for a line that may be written: read the outbox
@@ -339,7 +378,7 @@ def post_room_stop(host: RoomHost, directory: Path | str, owner: str | None, req
     if launch is None:
         return _refusal("no_session", "the room has no launch to stop", 409)
     try:
-        got = host.service.interrupt(launch, None)
+        got = host.stop(launch) if host.stop is not None else host.service.interrupt(launch, None)
     except CoordError as exc:
         return _refusal("no_session", str(exc), 409)
     return (409 if got.outcome == "rejected" else 200), {"outcome": got.outcome, "detail": got.detail}
@@ -390,11 +429,13 @@ def post_room_rotate(host: RoomHost, directory: Path | str, owner: str | None, r
         return _refusal("forbidden", "a rotation needs a named credential", 403)
     if host.rotate is None:
         return _refusal("not_found", "this server serves no room rotation", 404)
-    _room, refused = _need_room(directory, req)
+    room_thread, refused = _need_room(directory, req)
     if refused is not None:
         return refused
     try:
-        host.rotate()
+        host.rotate(room_thread)      # the host checks the page's room again inside the act: two stale taps rotate once
+    except chat.RoomRotated as exc:
+        return _refusal("room_rotated", str(exc), 409)
     except CoordError as exc:
         return _refusal("rotate_refused", str(exc), 409)
     conn = threads._open(directory)
@@ -406,6 +447,29 @@ def post_room_rotate(host: RoomHost, directory: Path | str, owner: str | None, r
     if opened is None:
         return _refusal("rotate_unsettled", "the rotation ran but no open room is recorded; read the room again", 409)
     return 200, {"room_thread": opened}
+
+
+def post_room_open(host: RoomHost, owner: str | None, req: Any) -> tuple[int, dict[str, Any]]:
+    """``POST /cockpit/room/open {}``: open the room (a thread and its running launch) when none is open. It names no
+    room: an already open room is answered as it stands (two tabs opening at once open one room), nothing is opened
+    twice. A page with no room has every other control dark, so this is how a first room starts. A launch that cannot
+    open is a 409 ``room_unavailable`` carrying the reason."""
+    if not isinstance(req, dict):
+        return _refusal("bad_request", "body must be a JSON object", 400)
+    if _owner_parts(owner) is None:
+        return _refusal("forbidden", "opening the room needs a named credential", 403)
+    if host.open is None:
+        return _refusal("not_found", "this server serves no room opening", 404)
+    try:
+        handle = host.open()
+    except (RoomServeError, RoomLaunchError) as exc:
+        return _refusal("room_unavailable", str(exc), 409)
+    except CoordError as exc:
+        return _refusal("open_refused", str(exc), 409)
+    thread = getattr(handle, "room_thread", None)
+    if not isinstance(thread, str):
+        return _refusal("open_unsettled", "the room opened but did not name its thread; read the room again", 409)
+    return 200, {"room_thread": thread}
 
 
 def _surface(owner: str | None) -> str | None:

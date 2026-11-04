@@ -42,7 +42,7 @@ import threading
 from typing import Any, Callable, Mapping, Optional
 
 from levain.coordinator import room
-from levain.coordinator.chat import ChatService, ChatStore, SendReceipt, _message, _open_room
+from levain.coordinator.chat import ChatService, ChatStore, RoomRotated, SendReceipt, _message, _open_room
 from levain.coordinator.room_launch import (RoomHandle, RoomLauncher, RoomSetting, make_probe, make_tripwires)
 from levain.coordinator.store import CoordError
 
@@ -89,6 +89,16 @@ class RoomServe:
         self._thread: Optional[threading.Thread] = None
         self.recovered: dict[str, int] = {}
         self.last_error: Optional[str] = None
+
+    @property
+    def store(self) -> Any:
+        """The coordinator store the room's tables live in (the cockpit's drop and proposal routes write through it)."""
+        return self._store
+
+    @property
+    def directory(self) -> Any:
+        """The directory of that store's ``dispatch.db``: the one the cockpit's room reads must be pointed at."""
+        return self._store.path.parent
 
     # --- lifecycle -------------------------------------------------------------------------------------------------
     def start(self) -> dict[str, int]:
@@ -229,15 +239,27 @@ class RoomServe:
             return {"room_thread": thread, "launch_id": None if held is None else held.launch_id,
                     "last_error": self.last_error}
 
-    def rotate(self) -> str:
+    def interrupt(self, launch_id: str) -> Any:
+        """His Stop: the service's unfenced interrupt of ``launch_id`` (the room's newest launch, which the route reads
+        from the record). It does NOT take this serve's lock, so a stop is never queued behind a send in flight; the
+        service orders it against its own reads."""
+        self._ready()
+        return self.service.interrupt(launch_id, None)
+
+    def rotate(self, expected_room: Optional[str] = None) -> str:
         """His "new conversation": a new room thread opened, the old one rotated, in one transaction. With no room
-        open it raises (:class:`RoomServeError`) before writing anything; the first send opens a room. The next send
+        open it raises (:class:`RoomServeError`) before writing anything; the first send opens a room. ``expected_room``
+        is the room thread the surface drew: checked INSIDE that transaction, under the lock, so two taps on one stale
+        page rotate once (the second is :class:`~levain.coordinator.chat.RoomRotated`, nothing written). The next send
         opens the new room's child (the launcher ends the old one). Returns the new room thread."""
         with self._lock:
             self._ready()
             with self._store._write() as (conn, now):
-                if room.current_room(conn) is None:
+                current = room.current_room(conn)
+                if current is None:
                     raise RoomServeError("no room is open to rotate; nothing was done")
+                if expected_room is not None and current != expected_room:
+                    raise RoomRotated("the room changed since this page drew it; nothing was rotated")
                 new = self._store.bare_thread(conn, now, _TITLE)
                 room.rotate(conn, new, now=now)
             old = self._handle

@@ -2768,8 +2768,9 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-input:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; border-color: var(--accent-line); }
 .rv .rv-input:disabled { opacity: .55; cursor: not-allowed; }
 .rv .rv-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
-.rv .rv-send, .rv .rv-drop, .rv .rv-stop, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-md); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
-.rv .rv-send { background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); }
+.rv .rv-send, .rv .rv-drop, .rv .rv-stop, .rv .rv-open, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-md); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+.rv .rv-send, .rv .rv-open { background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); }
+.rv .rv-open[hidden] { display: none; }
 .rv .rv-send:hover:not(:disabled) { filter: brightness(1.08); }
 .rv .rv-drop, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { background: none; color: var(--text); border: 1px solid var(--label); }
 .rv .rv-stop { background: none; color: var(--text); border: 1px solid var(--bad); }

@@ -976,6 +976,7 @@
   "use strict";
   const WRITE_TOKEN_KEY = "levain_write_token";
   let section = null, host = null, view = null;
+  let roomSection = null, roomHost = null, roomView = null;     // RM-G2: the cockpit's one Claude room, beside the threads
 
   function el(tag, cls, text) {
     const n = document.createElement(tag);
@@ -1006,6 +1007,33 @@
     section.appendChild(grid);
     const main = document.querySelector("main.frame");
     if (main) main.appendChild(section); else document.body.appendChild(section);
+    buildRoom(main);
+  }
+
+  // The room's zone (room_view.js over GET /cockpit/room.json and POST /cockpit/room/*), mounted under the same rule as the
+  // threads: only on the Build tab, only on a visible page, only with a write token. A server with no room answers its
+  // read an empty room and the page says so; a server that mounts no room routes answers 404 and the view says it could not read.
+  function buildRoom(main) {
+    if (!window.LevainRoomView) return;
+    roomSection = el("section", "ck-zone th-zone rv-zone");
+    roomSection.dataset.zone = "room";
+    roomSection.dataset.modes = "build";
+    roomSection.hidden = true;
+    const head = el("div", "zone-head");
+    head.appendChild(el("div", "zone-title", "Room"));
+    head.appendChild(el("span", "zone-gloss", "one conversation with Claude, kept by this server"));
+    roomSection.appendChild(head);
+    const grid = el("div", "ck-zgrid th-grid");
+    const panel = el("div", "panel k-list th-panel");
+    panel.dataset.modes = "build";
+    const ph = el("div", "phead");
+    ph.appendChild(el("h2", null, "The room"));
+    panel.appendChild(ph);
+    roomHost = el("div", "pbody rv-body-host");
+    panel.appendChild(roomHost);
+    grid.appendChild(panel);
+    roomSection.appendChild(grid);
+    if (main) main.appendChild(roomSection); else document.body.appendChild(roomSection);
   }
 
   function sync() {
@@ -1014,10 +1042,21 @@
     if (want && !view) {
       host.replaceChildren();
       const T = window.LevainCockpitTransport;
-      view = window.LevainThreadView.mount(host, { headers: () => (T ? T.headers() : {}) });
+      view = window.LevainThreadView.mount(host, { headers: () => (T ? T.headers() : {}), stop: true });
     } else if (!want && view) {
       view.stop();
       view = null;
+    }
+    if (roomSection) {
+      roomSection.hidden = !token();
+      if (want && !roomView) {
+        roomHost.replaceChildren();
+        const T = window.LevainCockpitTransport;
+        roomView = window.LevainRoomView.mount(roomHost, { headers: () => (T ? T.headers() : {}), probe: false });
+      } else if (!want && roomView) {
+        roomView.stop();
+        roomView = null;
+      }
     }
   }
 

@@ -1081,6 +1081,18 @@ def build_parser() -> argparse.ArgumentParser:
             "server admits besides loopback."
         ),
     )
+    web_p.add_argument(
+        "--room",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Serve the cockpit's one Claude room (needs --write). DIR is where the room's file tools see first (an "
+            "existing directory). The room is a Claude child with hands, started when you open it from the cockpit, "
+            "kept by this server, and ended when it stops; nothing starts it before you ask. Its record lives in the "
+            "consent queue's dispatch.db."
+        ),
+    )
     web_p.set_defaults(func=_cmd_serve)
 
     serve_p = subparsers.add_parser(
@@ -4408,6 +4420,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         install_class=args.install_class,
         sign_queue_dir=args.sign_queue_dir,
         sign_host=args.sign_host,
+        room=args.room,
     )
 
 

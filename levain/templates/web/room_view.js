@@ -47,13 +47,16 @@
   function lineModel(it) {
     var you = it.kind === "message" && it.source === "operator";
     var room = it.kind === "vendor_agent_text";
+    // the session reports its permission mode on every turn as an error-kind row; the expected mode is not an error, and a
+    // row that reads "Error" on every turn trains the eye past the one that is (any other mode is still drawn)
+    var modeNoise = it.kind === "vendor_error" && it.body === "dontAsk";
     var text = it.body == null ? "" : String(it.body);
     if (it.kind === "vendor_approval_request") text = "The room asked for something it cannot have; nothing was granted.";
     if (it.kind === "vendor_approval_resolved") text = "";
     return {
       gseq: it.gseq, ref: it.ref == null ? "" : String(it.ref), at: it.at || "",
       who: you ? "You" : (room ? "The room" : ""), cls: you ? "rv-you" : (room ? "rv-room" : (it.kind === "vendor_error" ? "rv-error" : "")),
-      kind: String(it.kind), text: text, collapsible: own(COLLAPSED, it.kind), hidden: own(HIDDEN, it.kind),
+      kind: String(it.kind), text: text, collapsible: own(COLLAPSED, it.kind), hidden: own(HIDDEN, it.kind) || modeNoise,
       ambiguous: it.kind === "message" && it.status === "ambiguous",
       truncated: it.truncated === true, tool: it.tool ? { open: it.tool.open === true } : null
     };
@@ -68,6 +71,7 @@
       state: st, words: thread === null ? "No room is open." : (c && c.why && st !== "writable" ? COMPOSER_WORDS[st] + " (" + c.why + ")" : COMPOSER_WORDS[st]),
       model: typeof body.model === "string" && body.model ? "Model in use: " + body.model : "",
       gap: body.gap === true,
+      error: typeof body.room_error === "string" ? body.room_error : "",
       stream: (body.stream || []).map(lineModel).filter(function (l) { return !l.hidden; }),
       proposals: (body.proposals || []).map(function (p) {
         return { id: String(p.proposal_id), state: String(p.state), words: String(p.words == null ? "" : p.words),
@@ -172,6 +176,7 @@
     }
     clear(st.streamBox);
     if (m.model) st.streamBox.appendChild(el(doc, "div", "rv-head", m.model));
+    if (m.error) st.streamBox.appendChild(el(doc, "div", "rv-note rv-error", "The room reported: " + m.error));
     if (m.gap) st.streamBox.appendChild(el(doc, "div", "rv-gap", "Some lines may be missing from this conversation."));
     if (!m.stream.length) st.streamBox.appendChild(el(doc, "div", "rv-note", m.open ? "Nothing has been said yet." : m.words));
     m.stream.forEach(function (l) { st.streamBox.appendChild(renderLine(doc, l, hooks, ui)); });
@@ -206,10 +211,12 @@
     wrap.appendChild(body); wrap.appendChild(dock); host.appendChild(wrap);
     var ta = el(doc, "textarea", "rv-input"), actions = el(doc, "div", "rv-actions"),
       sendB = el(doc, "button", "rv-send", "Send"), dropB = el(doc, "button", "rv-drop", "Drop"),
-      stopB = el(doc, "button", "rv-stop", "Stop"), note = el(doc, "div", "rv-sendnote");
+      stopB = el(doc, "button", "rv-stop", "Stop"), note = el(doc, "div", "rv-sendnote"),
+      openB = el(doc, "button", "rv-open", "Open the room");
     ta.setAttribute("rows", "3"); ta.setAttribute("aria-label", "Message to the room");
     prose(ta, "roomdraft");
-    [sendB, dropB, stopB].forEach(function (b) { b.setAttribute("type", "button"); });
+    [sendB, dropB, stopB, openB].forEach(function (b) { b.setAttribute("type", "button"); });
+    openB.hidden = true;           // shown only once a read says no room is open: with none, every other control is dark
     note.setAttribute("role", "status");
     actions.appendChild(sendB); actions.appendChild(dropB); actions.appendChild(stopB);
     var micB = null, rec = null;
@@ -221,8 +228,8 @@
     }
     var rotB = null;
     if (opts.rotate !== false) { rotB = el(doc, "button", "rv-rotate", "New conversation"); rotB.setAttribute("type", "button"); actions.appendChild(rotB); }
-    dock.appendChild(ta); dock.appendChild(actions); dock.appendChild(note);
-    var flight = { send: false, drop: false, stop: false }, sendId = null, sendText = null, dropId = null, dropText = null;
+    dock.appendChild(openB); dock.appendChild(ta); dock.appendChild(actions); dock.appendChild(note);
+    var flight = { send: false, drop: false, stop: false, open: false }, sendId = null, sendText = null, dropId = null, dropText = null;
     try { if (store && store.getItem("levain.room.draft")) ta.value = store.getItem("levain.room.draft"); } catch (e) { /* no storage */ }
     ta.addEventListener("input", function () { try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ } });
 
@@ -238,6 +245,8 @@
       stopB.disabled = !m || !m.canStop || flight.stop;
       ta.disabled = !m || !m.open;
       if (rotB) rotB.disabled = !m || !m.open;
+      openB.hidden = !m || m.open;
+      openB.disabled = flight.open;
     }
     function post(path, payload) {
       var h = Object.assign({ "Content-Type": "application/json" }, headers());
@@ -280,6 +289,15 @@
         paintDock();
       }).catch(function () { flight.drop = false; note.textContent = "The server could not be reached; the drop may or may not have gone. Dropping again will not duplicate it."; paintDock(); });
     });
+    openB.addEventListener("click", function () {
+      if (openB.disabled || flight.open) return;
+      flight.open = true; paintDock(); note.textContent = "Opening the room...";
+      post("open", {}).then(function (r) {
+        note.textContent = r.status === 200 ? "The room is open." : ((r.json && r.json.message) ? "Not opened: " + r.json.message : "Not opened: the server answered " + r.status + ".");
+        last = ""; return pull();
+      }).catch(function () { note.textContent = "The server could not be reached; the room may or may not have opened."; })
+        .then(function () { flight.open = false; paintDock(); });
+    });
     stopB.addEventListener("click", function () {
       if (!current || !current.thread || stopB.disabled || flight.stop) return;
       flight.stop = true; paintDock(); note.textContent = "Stopping...";
@@ -308,7 +326,10 @@
     if (micB) {
       var lang = doc.documentElement.lang || (root.navigator && root.navigator.language) || "en-US";
       micB.style.display = "none";                     // shown only once the browser says on-device dictation is available
-      if (typeof Speech.available === "function") {
+      // probe:false skips the availability question. MEASURED 2026-11-04 (RM-G2): SpeechRecognition.available({processLocally:true})
+      // froze the renderer of the installed headless Google Chrome on a bare page, so the cockpit page asks it nowhere; the mic
+      // is then shown on the prototype test alone and the click-time processLocally readback and onerror stay the guard.
+      if (opts.probe !== false && typeof Speech.available === "function") {
         var asked;
         try { asked = Speech.available({ langs: [lang], processLocally: true }); } catch (e) { asked = null; }
         if (asked && asked.then) {
