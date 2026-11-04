@@ -17,13 +17,17 @@ Confinement is a bound, not a scanner of arbitrary arguments. The drill runs und
 temp dir and private to you, ``LEVAIN_HOME`` (if set) is inside ``S``, only the cockpit subcommands the drill uses are asked for, and
 every argument (the value of ``--opt=value`` included; a bare name counts) resolves, with ``~`` expanded and relative to
 ``S``, which becomes the working directory; single-dash options are refused. It also drops
-``SSH_AUTH_SOCK`` so a software key cannot reach the operator's real agent.
+``SSH_AUTH_SOCK`` so a software key cannot reach the operator's real agent. What it does NOT bound: the CLI's
+coordinator-door check may read one record file (``consent/coordinator_workspaces.json``) under the account's real
+levain home; it decides by the working directory (now the scratch directory), reads nothing else there and writes
+nothing. No key, cockpit store or ledger of the real account is read or written. Single process, not thread-safe.
 
 Usage (from a checkout, or with PYTHONPATH naming one): ``python3 scripts/termsign_drill_cli.py cockpit keys --data-root <S>/data``
 """
 from __future__ import annotations
 
 import os
+import stat
 import sys
 import tempfile
 
@@ -45,16 +49,23 @@ def _scratch() -> tuple[str | None, str | None]:
     """``(scratch, None)`` when HOME is ``<scratch>/home`` with ``<scratch>`` a private directory of ours directly
     inside the system temp dir, else ``(None, why)``."""
     home = os.environ.get("HOME", "")
-    if not home or os.path.basename(_real(home)) != "home":
+    lh = os.environ.get("LEVAIN_HOME")
+    if not os.path.isabs(home) or (lh and not os.path.isabs(lh)):
+        return None, "HOME (and LEVAIN_HOME, if set) must be absolute paths"
+    if os.path.basename(_real(home)) != "home":
         return None, "HOME is not <scratch>/home; set S=$(mktemp -d) and HOME=$S/home first"
     scratch = os.path.dirname(_real(home))
     tmp = _real(tempfile.gettempdir())
     if os.path.dirname(scratch) != tmp:
         return None, "the scratch directory is not a direct child of the system temp dir (use S=$(mktemp -d))"
-    st = os.stat(scratch)
+    try:
+        st = os.stat(scratch)
+    except OSError:
+        return None, "the scratch directory does not exist"
+    if not stat.S_ISDIR(st.st_mode):
+        return None, "the scratch path is not a directory"
     if st.st_uid != os.getuid() or st.st_mode & 0o077:
         return None, "the scratch directory is not private to you (mode 0700, yours): use S=$(mktemp -d)"
-    lh = os.environ.get("LEVAIN_HOME")
     if lh and not _inside(lh, scratch):
         return None, "LEVAIN_HOME points outside the scratch directory; unset it"
     return scratch, None
@@ -97,16 +108,22 @@ def main(argv: list[str]) -> int:
         return out
 
     scratch, _ = _scratch()
-    old_cwd, old_sock = os.getcwd(), os.environ.pop("SSH_AUTH_SOCK", None)
-    os.chdir(scratch)                      # a bare name, or an omitted --data-root (it defaults to the cwd), lands in scratch
-    launch.allowed_env = allowed_env
+    askpass = os.environ.get("SSH_ASKPASS")
+    old_cwd, old_sock, old_askpass = os.getcwd(), os.environ.get("SSH_AUTH_SOCK"), askpass
     try:
+        os.environ.pop("SSH_AUTH_SOCK", None)
+        if askpass:
+            os.environ["SSH_ASKPASS"] = os.path.abspath(askpass)       # resolved before the cwd changes
+        os.chdir(scratch)                  # a bare name, or an omitted --data-root (it defaults to the cwd), lands in scratch
+        launch.allowed_env = allowed_env
         return cli.main(argv)
     finally:
         launch.allowed_env = original
         os.chdir(old_cwd)
         if old_sock is not None:
             os.environ["SSH_AUTH_SOCK"] = old_sock
+        if old_askpass is not None:
+            os.environ["SSH_ASKPASS"] = old_askpass
 
 
 if __name__ == "__main__":

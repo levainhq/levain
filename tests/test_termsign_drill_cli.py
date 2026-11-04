@@ -130,3 +130,28 @@ def test_main_runs_the_cli_inside_scratch_and_restores_cwd_and_agent(scratch, mo
     assert os.path.realpath(seen["cwd"]) == os.path.realpath(s) and seen["sock"] is None
     assert os.getcwd() == os.path.realpath(tmp_path) or os.getcwd() == str(tmp_path)
     assert os.environ["SSH_AUTH_SOCK"] == "/x/agent.sock"
+
+
+def test_relative_or_missing_scratch_is_refused_not_a_traceback(scratch, monkeypatch, tmp_path):
+    mod, s = scratch
+    monkeypatch.setenv("HOME", "../S/home")
+    assert "absolute" in mod._refusal(["cockpit", "keys"])
+    monkeypatch.setenv("HOME", str(s / "home"))
+    monkeypatch.setenv("LEVAIN_HOME", "rel")
+    assert "absolute" in mod._refusal(["cockpit", "keys"])
+    monkeypatch.delenv("LEVAIN_HOME")
+    monkeypatch.setenv("HOME", str(tmp_path / "gone" / "home"))
+    assert mod._refusal(["cockpit", "keys"]) is not None
+
+
+def test_a_relative_askpass_is_made_absolute_before_the_chdir(scratch, monkeypatch, tmp_path):
+    from levain import cli
+
+    mod, s = scratch
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SSH_ASKPASS", "askpass.sh")
+    seen = {}
+    monkeypatch.setattr(cli, "main", lambda argv: seen.update(a=os.environ["SSH_ASKPASS"]) or 0)
+    assert mod.main(["cockpit", "keys"]) == 0
+    assert os.path.isabs(seen["a"]) and seen["a"].endswith("/askpass.sh") and not seen["a"].startswith(str(s))
+    assert os.environ["SSH_ASKPASS"] == "askpass.sh"
