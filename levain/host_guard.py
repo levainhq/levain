@@ -82,12 +82,6 @@ _TEMPLATES = Path(__file__).resolve().parent / "templates" / "adapters"
 _CC_SETTINGS_TEMPLATE = _TEMPLATES / "claude-code" / "settings.template.json"
 _CC_MCP_TEMPLATE = _TEMPLATES / "claude-code" / "mcp.template.json"
 
-_MANAGED_SETTINGS = {
-    "darwin": Path("/Library/Application Support/ClaudeCode"),
-    "linux": Path("/etc/claude-code"),
-}
-
-
 # ---------------------------------------------------------------------------- paths
 
 
@@ -1498,16 +1492,14 @@ def _get(d: Any, keys: Sequence[str]) -> Any:
 def load_managed_settings(platform: str = sys.platform) -> list[tuple[str, Any]]:
     """Every managed settings document on this machine as (path, parsed JSON). Unparseable files
     are returned as (path, _MISSING) so the check refuses rather than skipping them."""
-    base = _MANAGED_SETTINGS.get("linux" if platform.startswith("linux") else platform)
+    from levain.consent.adapters.claude_code import MANAGED_BASES, managed_settings_files
+
+    base = MANAGED_BASES.get("linux" if platform.startswith("linux") else platform)
     if base is None:
         return []
     docs: list[tuple[str, Any]] = []
-    files = [base / "managed-settings.json"]
-    dropins = base / "managed-settings.d"
-    if dropins.is_dir():
-        files += sorted(dropins.glob("*.json"))
-    for f in files:
-        if f.exists():
+    for f in managed_settings_files(platform):
+        if os.path.lexists(f):
             try:
                 docs.append((str(f), json.loads(f.read_text(encoding="utf-8"))))
             except (OSError, ValueError):

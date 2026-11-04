@@ -1167,10 +1167,35 @@ UNCONFINED_ENV = "LEVAIN_UNCONFINED"
 ATTENDED_POSTURES = ("default",)
 # the machine-wide settings every session loads too (L3 r1 G3): Codex's system config, Claude Code's managed
 # settings (macOS, Linux). A missing one sets nothing
+# the ONE owner of where Claude Code's managed settings live (host_guard.load_managed_settings reads through it)
+MANAGED_BASES: dict[str, Path] = {
+    "darwin": Path("/Library/Application Support/ClaudeCode"),
+    "linux": Path("/etc/claude-code"),
+}
+
+
+def managed_settings_files(platform: str = sys.platform) -> list[Path]:
+    """The managed settings files for ``platform``: ``managed-settings.json`` then the sorted ``managed-settings.d/*.json``.
+    A drop-in directory that cannot be listed is returned as a path itself, so the caller's read of it fails and
+    refuses (fail closed), never skipped."""
+    base = MANAGED_BASES.get("linux" if platform.startswith("linux") else platform)
+    if base is None:
+        return []
+    files = [base / "managed-settings.json"]
+    dropins = base / "managed-settings.d"
+    try:
+        if dropins.is_dir():
+            files += [dropins / n for n in sorted(os.listdir(dropins)) if n.endswith(".json")]
+        elif os.path.lexists(dropins):
+            files.append(dropins)
+    except OSError:
+        files.append(dropins)
+    return files
+
+
 SYSTEM_SETTINGS_FILES: tuple[tuple[str, Path], ...] = (
     ("toml", Path("/etc/codex/config.toml")),
-    ("json", Path("/Library/Application Support/ClaudeCode/managed-settings.json")),
-    ("json", Path("/etc/claude-code/managed-settings.json")),
+    *(("json", b / "managed-settings.json") for b in MANAGED_BASES.values()),
 )
 
 

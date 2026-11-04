@@ -20,6 +20,7 @@ import pytest
 
 from levain import host_canary as hc
 from levain import host_guard as hg
+from levain.consent.adapters import claude_code as cc
 
 
 # ---------------------------------------------------------------------------- fixtures
@@ -213,10 +214,28 @@ def test_trust_managed_records_exactly_the_commands_in_force(home, monkeypatch, 
     base = tmp_path / "managed"
     base.mkdir()
     (base / "managed-settings.json").write_text(json.dumps(_managed(_GUARD)))
-    monkeypatch.setitem(hg._MANAGED_SETTINGS, "darwin", base)
+    monkeypatch.setitem(cc.MANAGED_BASES, "darwin", base)
     cmds = hg.trust_managed(platform="darwin", home=home)
     assert cmds == [_GUARD]
     assert hg.load_managed_trust(platform="darwin", home=home) == frozenset({hg._sha(_GUARD)})
+
+
+def test_unlistable_managed_dropin_dir_refuses_not_skipped(monkeypatch, tmp_path):
+    """One owner of the managed list (cc.managed_settings_files): a drop-in directory that cannot be listed comes back
+    as an unparseable document, which check_managed_settings refuses (it was silently an empty listing)."""
+    base = tmp_path / "managed"
+    dropins = base / "managed-settings.d"
+    dropins.mkdir(parents=True)
+    (dropins / "10.json").write_text("{}")
+    monkeypatch.setitem(cc.MANAGED_BASES, "darwin", base)
+    assert hg.load_managed_settings("darwin") == [(str(dropins / "10.json"), {})]   # control: listable
+    dropins.chmod(0)
+    try:
+        docs = hg.load_managed_settings("darwin")
+        assert docs and all(d is hg._MISSING for _, d in docs)
+        assert hg.check_managed_settings(docs, ())
+    finally:
+        dropins.chmod(0o755)
 
 
 @pytest.mark.parametrize("sandbox", [
