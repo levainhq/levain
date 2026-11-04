@@ -1472,7 +1472,18 @@ def _default_input_check(store: AgentStore, occurrence_id: str) -> InputCheck | 
     """The ``on_input`` hook for an occurrence whose caller passed none: the dream's, for the dream; ``None`` (input
     present) for every other agent. A dream whose install facts are absent gets a hook that raises when run, which
     :func:`check_input` reads as dead input."""
-    name, _executor, why = _pinned_executor(store, occurrence_id)   # the SIGNED name, re-hashed, never the mutable row
+    from levain.agents import spec as _spec
+    # Known edge, ruled at inputcheck2 round 1: agents.name can move between this check and the launch transaction;
+    # the row then launches and run_agent refuses it unwired (fail closed), holding its slot until lapse recovery.
+    # Only the signed NAME is read here (never the role or executor): an ordinary agent's unreadable role row must not
+    # end its row MISSED, and a transient read error raises when the hook runs, which check_input retries within grace.
+    try:
+        name = _spec.occurrence_spec(store, occurrence_id)["name"]   # the SIGNED name, re-hashed, never the mutable row
+        why = ""
+    except _spec.SpecError as exc:
+        name, why = None, f"its signed spec is refused: {exc}"
+    except Exception as exc:  # noqa: BLE001 - an unreadable row verifies nothing; the hook raises when run
+        name, why = None, f"its row or spec is unreadable ({type(exc).__name__})"
     if name is None:
         def unknown_agent(row: Mapping) -> bool:
             raise RuntimeError(f"the occurrence's agent cannot be read or verified from its spec: {why}")

@@ -51,7 +51,7 @@ def _fire_ready(rig: Rig):
     return oid    # no hand start: the launch admitted the run
 
 
-def test_a_mutated_agents_name_row_never_gives_an_agent_the_dreams_hook_or_body(rig, capsys):
+def test_a_mutated_agents_name_row_never_gives_an_agent_the_dreams_hook_or_body(rig):
     # behaviour: which agent an occurrence IS comes from the frozen spec its spec_hash names, never from the mutable
     # agents.name row; a row renamed to "dream" after registration matches no signed name: no dream hook (the default
     # hook is dead input, the row stays admitted) and no run body (unwired)
@@ -67,7 +67,7 @@ def test_a_mutated_agents_name_row_never_gives_an_agent_the_dreams_hook_or_body(
     assert res.outcome == ctl.UNCLASSIFIED and rig.row(oid)["state"] == "admitted"
 
 
-def test_a_dream_spec_whose_name_row_is_renamed_is_held_not_launched_unchecked(tmp_path, capsys):
+def test_a_dream_spec_whose_name_row_is_renamed_is_held_not_launched_unchecked(tmp_path):
     rig = _dream_rig(tmp_path)
     rig.link()
     oid = rig.claim("k")
@@ -78,7 +78,7 @@ def test_a_dream_spec_whose_name_row_is_renamed_is_held_not_launched_unchecked(t
         ctl.FIRE_UNWIRED and seen == []
 
 
-def test_a_spec_that_does_not_hash_to_its_spec_hash_names_no_agent_and_the_launch_is_held(rig, monkeypatch, capsys):
+def test_a_spec_that_does_not_hash_to_its_spec_hash_names_no_agent_and_the_launch_is_held(rig, monkeypatch):
     # behaviour: the spec is re-hashed on the way out; one that fails names no agent: no body (unwired) and the default
     # hook is dead input, so the row stays admitted and is never launched unchecked
     rig.link()
@@ -86,6 +86,10 @@ def test_a_spec_that_does_not_hash_to_its_spec_hash_names_no_agent_and_the_launc
     assert ctl._pinned_executor(rig.store, oid)[0] == "job_push_check"
     monkeypatch.setattr(spec_mod, "spec_hash", lambda agent_id, spec: "0" * 64)
     assert ctl._pinned_executor(rig.store, oid)[0] is None
+    hook = ctl._default_input_check(rig.store, oid)
+    assert callable(hook)
+    with pytest.raises(RuntimeError, match="cannot be read or verified"):
+        hook({})
     assert ctl.run_agent(rig.store, oid, 0) == ctl.FIRE_UNWIRED
     res = rig.launch(oid)
     assert res.outcome == ctl.UNCLASSIFIED and rig.row(oid)["state"] == "admitted"
@@ -436,3 +440,19 @@ def test_fire_factory_binds_a_consolidate_that_handles_a_stop(tmp_path, monkeypa
     monkeypatch.setattr(ex, "consolidate_store", lambda *a, **kw: seen.update(kw))
     da.fire_factory(rig.store, oid, 0)["consolidate"]()
     assert seen["handle_stop"] is True
+
+
+def test_an_ordinary_agent_gets_no_hook_whatever_its_role_row_holds_and_a_mismatch_still_does(rig, monkeypatch):
+    # behaviour: the default hook reads only the signed name; an unreadable role row never gives a non-dream agent the
+    # raising hook (it launches as before); a signed-name mismatch still gets the raising one
+    rig.link()
+    oid = rig.claim("k")
+    from levain.agents import role as role_mod
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("role row unreadable")
+    monkeypatch.setattr(role_mod, "role_by_hash", boom)
+    assert ctl._default_input_check(rig.store, oid) is None
+    assert rig.launch(oid).outcome == "launched"
+    _rename(rig, "other")
+    assert callable(ctl._default_input_check(rig.store, oid))
