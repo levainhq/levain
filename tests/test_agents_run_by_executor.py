@@ -54,11 +54,12 @@ def test_the_executor_decides_not_the_name(rig, monkeypatch):
     assert len(launcher.launches) == 1
 
 
-def test_a_session_occurrence_with_no_factory_installed_ends_unwired_by_name(rig, capsys):
+def test_a_session_occurrence_with_no_factory_override_uses_the_production_factory(rig, capsys):
+    # S2b: the production default is session_wire.fire_factory; with no install file it builds no run (the row stays
+    # launched for lapse recovery), where S1 ended it unwired by name
     oid = _session_occurrence(rig)
     assert ctl.SESSION_FACTORY is None
-    assert ctl.run_agent(rig.store, oid, rig.row(oid)["launch_epoch"]) == ctl.FIRE_UNWIRED
-    assert "the session executor has no factory installed" in capsys.readouterr().err
+    assert ctl.run_agent(rig.store, oid, rig.row(oid)["launch_epoch"]) == 1
     assert rig.row(oid)["state"] == "launched"
 
 

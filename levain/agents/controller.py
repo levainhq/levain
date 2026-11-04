@@ -1361,17 +1361,17 @@ def _dream_body() -> RunBody:
 
 
 # The session executor's seam: ``factory(store, occurrence_id, epoch)`` builds :func:`levain.agents.session.run_session`'s
-# keyword arguments (``sup``, ``role``, ``values``, ``recall``, ``launcher``, ``exposure``). None until an install
-# supplies one, and a session occurrence's fire then ends unwired by name; the default launcher stays the one that
-# refuses (``session.UnwiredLauncher``), so nothing here starts a real session.
+# keyword arguments (``sup``, ``role``, ``values``, ``recall``, ``launcher``, ``exposure``). None is the production
+# default and resolves to :func:`levain.agents.session_wire.fire_factory` when the run body is built (a lazy import:
+# session_wire imports session, which imports this module); a non-None value is an override (a test's). Nothing
+# launches until the install file names a registered launcher: with none the factory's launcher is the one that
+# refuses (``session.UnwiredLauncher``) and the run ends ``session_refused:launcher-not-wired``, settled at zero.
 SESSION_FACTORY: Callable[[AgentStore, str, int], Mapping[str, Any]] | None = None
 
 
 def _session_body() -> RunBody:
-    from levain.agents import session   # here: session imports this module
-    factory = SESSION_FACTORY
-    if factory is None:
-        return lambda store, oid, epoch: _unwired_run(store, oid, epoch, "the session executor has no factory installed")
+    from levain.agents import session, session_wire   # here: both import this module
+    factory = SESSION_FACTORY if SESSION_FACTORY is not None else session_wire.fire_factory
     return session.make_run(factory)
 
 

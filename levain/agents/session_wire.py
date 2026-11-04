@@ -4,7 +4,8 @@
 arguments for one session occurrence, from the store and ONE install-fact source: ``<store dir>/session_install.json``
 (:func:`read_install`, :func:`write_install`). Nothing else supplies a launcher.
 
-* ``sup``: a ``Supervisor`` over the install's authority log (``cockpit_root``).
+* ``sup``: a ``Supervisor`` over the install's authority log (``cockpit_root``) and the agent ``RunJournal``, into which
+  the factory first admits the occurrence's run (``journal.start``, once; a replay is a no-op).
 * ``role``: the role the occurrence's signed spec pins (:func:`session._signed_by_spec`), read from the store by hash. A pinned role that is not in the
   store raises (the run is not built; :func:`levain.agents.session.make_run` reads that as a run that did not start).
 * ``exposure`` and ``max_exposure_usd_micros``: the open reservation's own terms (:func:`session.reserved_terms`), so
@@ -161,20 +162,28 @@ def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
     not start. ``clock`` is a test seam (the supervisor's and the run's time)."""
     from levain.agent_authority import AgentAuthority
     from levain.agents import recall as _recall, supervise
+    from levain.autonomic.journal import RunJournal
 
     install = read_install(store.directory)
     launcher = resolve_launcher(store, install)
     reserved = _session.reserved_terms(store, occurrence_id)
     role = _pinned_role(store, _session._signed_by_spec(store, occurrence_id)[1])
     with store.read() as conn:
-        row = conn.execute("SELECT agent_id FROM agent_occurrences WHERE occurrence_id = ?",
-                           (occurrence_id,)).fetchone()
+        row = conn.execute("SELECT agent_id, run_id, binding_id, state, launch_epoch, epoch FROM agent_occurrences"
+                           " WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
     if row is None:
         raise InstallRefused(f"occurrence {occurrence_id} is not in the agent store")
     recall = None
     if install.episodic_path is not None:
         recall = _recall.recall_agent_episodes_at(install.episodic_path, row[0], now=datetime.now(timezone.utc))
-    sup = supervise.Supervisor(store, authority=AgentAuthority(install.cockpit_root), clock=clock)
+    journal = RunJournal(store.directory)
+    if row[3] == "launched" and row[4] == launch_epoch and row[5] == launch_epoch:
+        # the run's admission into the agent journal, before the effect: nothing else in the production fire path
+        # starts it (``sup.effect`` raises ``run ... was never started``). Only for the occurrence this fire holds
+        # (``run_session`` ends any other ``not_held`` before it settles anything); ``start`` is a no-op on a run
+        # already admitted, so a replay keeps its original admission.
+        journal.start(row[1], binding_id=row[2])
+    sup = supervise.Supervisor(store, authority=AgentAuthority(install.cockpit_root), clock=clock, journal=journal)
     extra = {} if clock is None else {"clock": clock}   # a test seam: production passes none and both read real time
     return {**extra, "sup": sup, "role": role, "values": dict(install.values), "recall": recall, "launcher": launcher,
             "exposure": None if reserved is None else reserved.exposure,
