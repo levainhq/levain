@@ -58,18 +58,20 @@ class Exec:
         return StopResult(False, "stub")
 
 
-def _spec(cron="*/30 * * * *"):
+def _spec(cron="*/30 * * * *", name=None):
     d = copy.deepcopy(SPECS["job_push_check"])
+    if name is not None:
+        d["name"] = name
     d["role"]["role_hash"] = role_hash(ROLES[d["role"]["name"]])
     d["trigger"]["cron"] = cron
     return parse_spec(d)
 
 
 class Rig:
-    def __init__(self, tmp: Path) -> None:
+    def __init__(self, tmp: Path, name: str | None = None) -> None:
         self.world = World(tmp)
         self.store = open_agent_store(tmp / "s")
-        self.agent, self.spec_hash, *_ = register_spec(self.store, _spec(), "America/New_York")
+        self.agent, self.spec_hash, *_ = register_spec(self.store, _spec(name=name), "America/New_York")
         with self.store.read() as c:
             self.sid = c.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()[0]
         self.authority = AgentAuthority(self.world.root)

@@ -28,23 +28,41 @@ def _rename(rig: Rig, name: str) -> None:
         c.execute("UPDATE agents SET name = ? WHERE agent_id = ?", (name, rig.agent))
 
 
-def _fire_ready(rig: Rig, name: str):
+def _fire_ready(rig: Rig):
     oid = rig.claim("k")
-    assert rig.launch(oid).outcome == "launched"
-    _rename(rig, name)
+    assert rig.launch(oid, on_input=None).outcome == "launched"   # the dream's own launch needs its install (below)
     RunJournal(rig.store.directory).start(rig.row(oid)["run_id"], binding_id="bind-0123456789abcdef")
     return oid
+
+
+def test_a_mutated_agents_name_row_never_gives_an_agent_the_dreams_hook_or_body(rig, capsys):
+    # behaviour: which agent an occurrence IS comes from the frozen spec its spec_hash names, never from the mutable
+    # agents.name row; a row renamed to "dream" after registration stays the stub's agent (no hook, no dream body)
+    rig.link()
+    oid = rig.claim("k")
+    _rename(rig, "dream")
+    assert ctl._default_input_check(rig.store, oid) is None
+    assert rig.launch(oid).outcome == "launched"
+    assert ctl.run_agent(rig.store, oid, 0) == ctl.FIRE_UNWIRED
+    assert "no run body is wired" in capsys.readouterr().err
+
+
+def test_a_dream_spec_keeps_its_hook_and_body_when_its_name_row_is_renamed(tmp_path):
+    rig = Rig(tmp_path, name="dream")
+    rig.link()
+    oid = rig.claim("k")
+    _rename(rig, "something-else")
+    assert callable(ctl._default_input_check(rig.store, oid))
 
 
 def test_a_scheduled_fire_of_the_dream_no_longer_ends_unwired(tmp_path):
     # behaviour: the module entry, run for a dream occurrence with no install facts, builds no run and exits 1 with
     # the row left launched; before the dispatch it exited FIRE_UNWIRED for every agent
-    rig = Rig(tmp_path)
+    rig = Rig(tmp_path, name="dream")
     rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
     rig.link()
     oid = rig.claim("k")
-    assert rig.launch(oid).outcome == "launched"
-    _rename(rig, "dream")        # launched under the stub's name: the dream's own launch needs its install (below)
+    assert rig.launch(oid, on_input=None).outcome == "launched"   # the dream's own launch needs its install (below)
     proc = ctl.spawn_fire(rig.store.directory, oid, env=ENV)
     assert proc.wait(60) == 1
     assert rig.row(oid)["state"] == "launched" and rig.row(oid)["pid"] == proc.pid
@@ -58,11 +76,12 @@ def test_an_agent_with_no_run_body_still_refuses_unwired(tmp_path):
     assert ctl.spawn_fire(rig.store.directory, oid, env=ENV).wait(60) == ctl.FIRE_UNWIRED
 
 
-def test_the_dream_occurrence_reaches_its_executor_once_and_ends_done(rig, tmp_path, monkeypatch):
-    # behaviour: run_agent resolves the dream's body by the agent's name; the body builds run_body's arguments from the
+def test_the_dream_occurrence_reaches_its_executor_once_and_ends_done(tmp_path, monkeypatch):
+    # behaviour: run_agent resolves the dream's body by the spec's name; the body builds run_body's arguments from the
     # install, runs the one consolidate under the supervisor, and the row ends done
+    rig = Rig(tmp_path, name="dream")
     rig.link()
-    oid = _fire_ready(rig, "dream")
+    oid = _fire_ready(rig)
     calls = []
 
     def factory(store, occurrence_id, epoch):
@@ -79,35 +98,37 @@ def test_the_dream_occurrence_reaches_its_executor_once_and_ends_done(rig, tmp_p
     assert calls == [oid] and rig.row(oid)["state"] == "done"
 
 
-def test_run_agent_reads_the_agent_from_the_row_and_an_unknown_one_refuses_unwired(rig, capsys):
+def test_run_agent_reads_the_agent_from_the_row_and_an_unknown_one_refuses_unwired(tmp_path, capsys):
     seen = []
+    rig = Rig(tmp_path, name="someone-else")
     oid = rig.claim("k")
     bodies = {"someone-else": lambda: (lambda s, o, e: seen.append(o) or 0)}
-    assert ctl.run_agent(rig.store, oid, 0, bodies=bodies) == ctl.FIRE_UNWIRED and seen == []
-    _rename(rig, "someone-else")
+    assert ctl.run_agent(rig.store, oid, 0, bodies={"nobody": bodies["someone-else"]}) == ctl.FIRE_UNWIRED
+    assert seen == []
     assert ctl.run_agent(rig.store, oid, 0, bodies=bodies) == 0 and seen == [oid]
     assert ctl.run_agent(rig.store, "oc-" + "0" * 32, 0, bodies=bodies) == ctl.FIRE_UNWIRED
     assert "no run body is wired" in capsys.readouterr().err
 
 
-def test_only_the_dream_has_an_input_hook(rig):
+def test_only_the_dream_has_an_input_hook(rig, tmp_path):
     # behaviour: launch's default hook is the dream's for the dream (with no install facts it raises when run, so the
     # row stays admitted: dead input), and absent for any other agent, which launches as it always did
     rig.link()
     other = rig.claim("a")
     assert rig.launch(other).outcome == "launched"
     assert ctl._default_input_check(rig.store, other) is None
-    rig.finish(other)
-    _rename(rig, "dream")
-    oid = rig.claim("b")
-    assert callable(ctl._default_input_check(rig.store, oid))
-    res = rig.launch(oid)
-    assert res.outcome == ctl.UNCLASSIFIED and rig.row(oid)["state"] == "admitted"
+    (tmp_path / "d").mkdir()
+    drig = Rig(tmp_path / "d", name="dream")
+    drig.link()
+    oid = drig.claim("b")
+    assert callable(ctl._default_input_check(drig.store, oid))
+    res = drig.launch(oid)
+    assert res.outcome == ctl.UNCLASSIFIED and drig.row(oid)["state"] == "admitted"
 
 
-def test_the_dream_hook_admits_through_the_verdict_and_a_quiet_day_ends_skipped(rig, monkeypatch):
+def test_the_dream_hook_admits_through_the_verdict_and_a_quiet_day_ends_skipped(tmp_path, monkeypatch):
+    rig = Rig(tmp_path, name="dream")
     rig.link()
-    _rename(rig, "dream")
     monkeypatch.setattr(da, "install_on_input", lambda agent_dir, **kw: (lambda row: False))
     oid = rig.claim("c")
     res = rig.launch(oid)
@@ -195,12 +216,11 @@ def test_enable_with_a_store_dir_writes_the_facts_a_fire_then_gets_past(tmp_path
 def test_a_fire_with_the_enabled_facts_gets_past_install_to_its_next_refusal(tmp_path):
     # behaviour: with the facts file `dream enable` writes, the fire no longer ends on the missing install; whatever
     # it meets next is named in its log (no Opus compose runs: the facts file's exposure check refuses first)
-    rig = Rig(tmp_path)
+    rig = Rig(tmp_path, name="dream")
     rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
     rig.link()
     oid = rig.claim("k")
-    assert rig.launch(oid).outcome == "launched"
-    _rename(rig, "dream")
+    assert rig.launch(oid, on_input=None).outcome == "launched"
     da.write_install(rig.store.directory, **_facts(tmp_path))
     proc = ctl.spawn_fire(rig.store.directory, oid, env=ENV)
     code = proc.wait(60)
@@ -220,9 +240,9 @@ def test_bool_on_input_raises_on_an_unreadable_verdict_so_the_day_stays_retryabl
         da.bool_on_input(lambda row: unwired)({})
 
 
-def test_an_unreadable_memory_db_is_not_recorded_as_a_quiet_day(rig, tmp_path):
+def test_an_unreadable_memory_db_is_not_recorded_as_a_quiet_day(tmp_path):
+    rig = Rig(tmp_path, name="dream")
     rig.link()
-    _rename(rig, "dream")
     f = _facts(tmp_path)
     f["store_path"].write_bytes(b"this is not a sqlite database" * 50)
     da.write_install(rig.store.directory, **f)
@@ -241,9 +261,9 @@ def test_a_manual_dream_checked_while_admitted_is_judged_on_its_own_day_not_unre
     assert "launched_at" not in v.reason
 
 
-def test_an_explicit_none_on_input_still_means_no_input_check(rig):
+def test_an_explicit_none_on_input_still_means_no_input_check(tmp_path):
+    rig = Rig(tmp_path, name="dream")
     rig.link()
-    _rename(rig, "dream")
     oid = rig.claim("g3")
     assert callable(ctl._default_input_check(rig.store, oid))
     res = rig.launch(oid, on_input=None)

@@ -1363,21 +1363,26 @@ def _dream_body() -> RunBody:
 RUN_BODIES: dict[str, Callable[[], RunBody]] = {DREAM: _dream_body}
 
 
-def _agent_name(store: AgentStore, agent_id: str) -> str | None:
+def _occurrence_agent_name(store: AgentStore, occurrence_id: str) -> str | None:
+    """The name of the agent an occurrence runs, read from the frozen spec its own ``spec_hash`` names (the hash binds
+    the agent_id and the whole spec, and a stored spec cannot change), never from the ``agents.name`` row, which
+    nothing freezes. ``None`` when the row, its spec or the spec's name cannot be read: that is no agent."""
     with store.read() as conn:
-        row = conn.execute("SELECT name FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
-    return None if row is None else row[0]
+        row = conn.execute("SELECT s.spec FROM agent_occurrences o JOIN agent_specs s ON s.spec_hash = o.spec_hash"
+                           " AND s.agent_id = o.agent_id WHERE o.occurrence_id = ?", (occurrence_id,)).fetchone()
+    try:
+        name = None if row is None else json.loads(row[0])["name"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return name if isinstance(name, str) else None
 
 
 def run_agent(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
               bodies: Mapping[str, Callable[[], RunBody]] | None = None) -> int:
     """The fire's run body: the one registered for the occurrence's agent (:data:`RUN_BODIES`), else
-    :func:`_unwired_run`. The agent is read from the occurrence's own row, never from the fire's command line. A row
-    or agent that cannot be read has no run body."""
-    with store.read() as conn:
-        row = conn.execute("SELECT agent_id FROM agent_occurrences WHERE occurrence_id = ?",
-                           (occurrence_id,)).fetchone()
-    name = None if row is None else _agent_name(store, row[0])
+    :func:`_unwired_run`. The agent is read from the occurrence's own spec (:func:`_occurrence_agent_name`), never from
+    the fire's command line or the mutable ``agents.name`` row. A row or spec that cannot be read has no run body."""
+    name = _occurrence_agent_name(store, occurrence_id)
     resolve = (RUN_BODIES if bodies is None else bodies).get(name) if name is not None else None
     if resolve is None:
         return _unwired_run(store, occurrence_id, launch_epoch)
@@ -1388,10 +1393,7 @@ def _default_input_check(store: AgentStore, occurrence_id: str) -> InputCheck | 
     """The ``on_input`` hook for an occurrence whose caller passed none: the dream's, for the dream; ``None`` (input
     present) for every other agent. A dream whose install facts are absent gets a hook that raises when run, which
     :func:`check_input` reads as dead input."""
-    with store.read() as conn:
-        row = conn.execute("SELECT a.name FROM agent_occurrences o JOIN agents a ON a.agent_id = o.agent_id"
-                           " WHERE o.occurrence_id = ?", (occurrence_id,)).fetchone()
-    if row is None or row[0] != DREAM:
+    if _occurrence_agent_name(store, occurrence_id) != DREAM:
         return None
     from levain.dream import agent as dream_agent
     return dream_agent.install_on_input(store.directory)
