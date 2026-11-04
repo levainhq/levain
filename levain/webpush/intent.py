@@ -602,7 +602,7 @@ def view(queue_dir: Path | str | None, *, now: float | None = None, idle: Callab
                 "chip": {"word": "Check", "tail": "→ devices", "state": "fault"}, "status": "fault",
                 "reason_fault": "the sample faulted", "base": _default_base(), "overlay": None, "ended": None,
                 "effective": None, "on": True, "where": "devices", "held": 0, "approvals": None,
-                "lets": lets_options()}
+                "lets": lets_options(), "presets": _presets_view(None, _default_base())}
     st = _state(queue_dir, s)
     try:
         from levain.webpush import held
@@ -706,7 +706,12 @@ def _write_presets(queue_dir: Path | str, presets: dict) -> None:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             try:
-                os.write(fd, data)
+                view_ = memoryview(data)
+                while view_:
+                    n = os.write(fd, view_)
+                    if n <= 0:
+                        raise OSError("short write")
+                    view_ = view_[n:]
             finally:
                 os.close(fd)
             os.replace(tmp, _presets_path(queue_dir))
@@ -967,6 +972,15 @@ def _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle, ending=None) -
                 raise PresenceError(f"he set `{name}` himself at {at}, after the sentence you quote; he ends it himself")
         elif not ev[0]:
             note = f"unverified: {ev[2]}"
+    if ending is not None:
+        if by is not None:
+            raise PresenceError("the ending of a preset is the operator's own to choose")
+        if ending not in _UNTIL_KINDS or word == "back" or (word == "loud" and (duration or "").strip().lower() == "off"):
+            raise PresenceError("a preset ends on `input` or on a `timer` (Back and `loud off` have no ending)")
+        _, fault = _load_presets(queue_dir)
+        if fault:   # before anything is written: the ending could not be remembered, so the activation is refused too
+            raise PresenceError(f"presets.json is there but cannot be read ({fault}): nothing was changed; repair it, "
+                                "or move it aside (no file is the system defaults)")
     if word == "loud" and (duration or "").strip().lower() == "off":
         if ov is not None and ov["preset"] == "loud":
             return "clear", None, "loud off"
@@ -975,15 +989,17 @@ def _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle, ending=None) -
         return "keep", None, "back leaves a standing loud"
     if word == "back":
         return "clear", None, ""
-    if ending is not None:
-        if by is not None:
-            raise PresenceError("the ending of a preset is the operator's own to choose")
-        if ending not in _UNTIL_KINDS:
-            raise PresenceError("a preset ends on `input` or on a `timer`")
     base = rec["base"]
     custom, _fault = _load_presets(queue_dir)   # an unreadable options file reads as the system defaults
     spec = _spec(word, custom, base)
-    kind = ending or spec["until"]
+    if ending is not None:
+        kind = ending
+    elif by is not None:
+        kind = PRESET_TABLE[word]["until"]    # a seat or the coordinator never inherits the operator's remembered ending
+    elif duration and word in TIMED:
+        kind = "timer"                        # a duration the caller gave outranks the remembered type
+    else:
+        kind = spec["until"]
     if kind != "timer" and duration:
         raise PresenceError(f"`{word}` takes no duration")
     new: dict = {"preset": word, "devices": spec["devices"], "follow_after": spec["follow_after"],

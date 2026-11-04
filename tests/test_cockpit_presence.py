@@ -756,6 +756,11 @@ def test_a_preset_keeps_the_options_it_was_changed_to_and_only_the_ending_type_o
         _call(port, "POST", SET, {"preset": "back"}, token=T)
         _call(port, "POST", SET, {"preset": "away"}, token=T)
         assert _overlay(q)["until"]["kind"] == "timer" and abs(_overlay(q)["until"]["at"] - (time.time() + presence.DEFAULT_SECS)) < 30
+        # Quiet remembered to end on input still takes a duration a caller gives, and an ending Back cannot have is refused
+        _call(port, "POST", SET, {"preset": "quiet", "ending": "input"}, token=T)
+        assert _call(port, "POST", SET, {"preset": "quiet", "for": "30m"}, token=T)[0] == 200 and _overlay(q)["until"]["kind"] == "timer"
+        assert _call(port, "POST", SET, {"preset": "back", "ending": "garbage"}, token=T)[0] == 422
+        _call(port, "POST", SET, {"preset": "away"}, token=T)
         # a change to the preset that stands lands now and keeps how it ends
         end = _overlay(q)["until"]
         _call(port, "POST", SET, {"customize": "away", "devices": "follow"}, token=T)

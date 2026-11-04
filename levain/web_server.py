@@ -2554,17 +2554,17 @@ class _Handler(GuardedHandler):
                 presence_tokens.stamp(queue, name)
         try:
             if "customize" in req or "reset" in req:
-                name = req.get("customize", req.get("reset"))
+                target = req.get("customize", req.get("reset"))
                 common = dict(via=via, wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
                 if "reset" in req:
-                    intent.reset_preset(queue, name, **common)
-                elif name == "back":      # Back's options ARE the standing default
+                    intent.reset_preset(queue, target, **common)
+                elif target == "back":      # Back's options ARE the standing default
                     if "until" in req:
                         raise presence.PresenceError("Back has no ending: it is the standing default")
                     intent.apply_settings(queue, devices=req.get("devices"), follow_after=req.get("follow_after"),
                                           lets_through=req.get("lets_through"), until="switch", by=None, **common)
                 else:
-                    intent.set_preset_options(queue, name, devices=req.get("devices"), follow_after=req.get("follow_after"),
+                    intent.set_preset_options(queue, target, devices=req.get("devices"), follow_after=req.get("follow_after"),
                                               lets_through=req.get("lets_through"), until=req.get("until"), **common)
             elif "ending" in req:
                 intent.apply_preset(queue, word, duration=req.get("for") or None, ending=req["ending"], by=None, via=via,

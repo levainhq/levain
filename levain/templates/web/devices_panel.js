@@ -1104,7 +1104,9 @@
     const sel = selected();
     if (!sel || sel === "back") return Promise.resolve(false);
     const ov = prCur && prCur.overlay;
-    if (!dur && ov && ov.until && ov.until.kind === kind) return Promise.resolve(true);   // already how it ends
+    const own = prCur && prCur.presets && prCur.presets[sel];
+    // already how it ends AND already what the preset remembers: nothing to write
+    if (!dur && ov && ov.until && ov.until.kind === kind && own && own.options.until === kind) return Promise.resolve(true);
     const body = { preset: sel, ending: kind };
     if (kind === "timer") body.for = dur || "1h";
     return writePresence(body);
