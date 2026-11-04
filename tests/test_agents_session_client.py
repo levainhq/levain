@@ -163,7 +163,7 @@ class Server:
         raise AssertionError(op)
 
     def client(self, rig):
-        return C.DispatchSessionLauncher(self.connect, lambda occ: C.link_proof(rig.store, rig.world.root, occ))
+        return C.DispatchSessionLauncher(self.connect, lambda occ: C.link_proof(rig.store, rig.world.root, occ, now=rig.now()))
 
     def frames(self):
         """Every frame that crossed, parsed, in wire order of arrival (both directions)."""
@@ -261,9 +261,28 @@ def test_a_renewed_link_carries_both_its_born_and_its_current_row(rig, srv):
     later = A._parse_stamp(grant["expires_at"], "expires_at") + timedelta(hours=1)
     rig.world.link({"op": "renew", "grant_id": link_id, "expires_at": utc_stamp(later), "signed_at": utc_stamp(at)},
                    "laptop")
-    proof = C.link_proof(rig.store, rig.world.root, oid)
+    proof = C.link_proof(rig.store, rig.world.root, oid, now=rig.now())
     assert proof.born.seq < proof.current.seq and json.loads(proof.current.record)["op"] == "renew"
     assert grant["spec_hash"] == proof.spec_hash
+
+
+def test_a_link_lapsed_by_the_clock_is_refused_by_the_client_too(rig):
+    from datetime import timedelta
+    oid = _sub_occurrence(rig)
+    C.link_proof(rig.store, rig.world.root, oid, now=rig.now())
+    with pytest.raises(C.ProofUnavailable, match="expired"):
+        C.link_proof(rig.store, rig.world.root, oid, now=rig.now(timedelta(days=400)))
+
+
+def test_a_long_end_detail_and_a_nonstring_key_do_not_undo_a_proven_stop(rig, srv):
+    oid, key = _session_row(rig)
+    srv.launcher.spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "the brief", "passthrough", EXP))
+    real = srv.launcher.stop
+    srv.launcher.stop = lambda k, d: StopResult(real(k, d).terminated, "x" * 5000)
+    client = srv.client(rig)
+    got = client.end_session(key, 3)
+    assert got.terminated is True and len(got.detail) <= 400
+    assert client.end_session(None, 3).terminated is False and client.usage(None).actions is None
 
 
 @pytest.mark.parametrize("how", ["no-link", "revoked", "no-occurrence"])
@@ -289,7 +308,7 @@ def test_no_server_at_all_raises_a_transient_refusal_with_nothing_allocated(rig,
     def down():
         raise ConnectionRefusedError(2, "no socket")
     oid = _sub_occurrence(rig)
-    client = C.DispatchSessionLauncher(down, lambda occ: C.link_proof(rig.store, rig.world.root, occ))
+    client = C.DispatchSessionLauncher(down, lambda occ: C.link_proof(rig.store, rig.world.root, occ, now=rig.now()))
     with pytest.raises(L.LauncherRefused) as e:
         client.spawn(S.SessionLaunch(oid, "s-0123456789abcdef", "claude", "sonnet", "b", "passthrough", EXP))
     assert (e.value.name, e.value.reason_class) == ("dispatch-unreachable", "transient")
@@ -490,7 +509,7 @@ def test_the_ticket_and_the_run_id_appear_in_no_frame_in_either_direction(rig, t
 
 def test_the_codec_refuses_any_field_it_does_not_name(rig, srv):
     oid = _sub_occurrence(rig)
-    proof = C.link_proof(rig.store, rig.world.root, oid)
+    proof = C.link_proof(rig.store, rig.world.root, oid, now=rig.now())
     launch = S.SessionLaunch(oid, "s-0123456789abcdef", "claude", "sonnet", "b", "passthrough", EXP)
     good = {"p": C.PROTOCOL, "op": "LAUNCH", "id": 1, **C.launch_to_wire(launch, proof)}
     assert C.launch_from_wire(good) == (launch, proof)
@@ -519,7 +538,7 @@ def test_no_string_in_the_client_names_a_mint_field():
 
 def test_a_brief_at_its_cap_fits_in_one_frame_and_a_larger_frame_is_refused_before_any_connect(rig, srv):
     oid = _sub_occurrence(rig)
-    proof = C.link_proof(rig.store, rig.world.root, oid)
+    proof = C.link_proof(rig.store, rig.world.root, oid, now=rig.now())
     worst = "\u0001" * S.BRIEF_MAX_BYTES                                           # six bytes each in canonical JSON
     C.encode_run_frame({"p": C.PROTOCOL, "op": "LAUNCH", "id": 1, **C.launch_to_wire(
         S.SessionLaunch(oid, "s-0123456789abcdef", "claude", "sonnet", worst, "passthrough", EXP), proof)})
@@ -545,3 +564,13 @@ def test_the_client_is_registered_and_resolves_from_the_install(rig, monkeypatch
     reaper = S.session_executor_of(rig.store, got, agent_id=rig.row(oid)["agent_id"])
     assert callable(getattr(reaper({"agent_id": rig.row(oid)["agent_id"], "session_key": "s-0123456789abcdef",
                                     "occurrence_id": oid}).launcher, "end_session"))
+
+
+def test_a_recorded_exit_is_never_downgraded_by_a_later_abort_or_terminate(rig, srv):
+    oid = _sub_occurrence(rig)
+    kid = srv.client(rig).spawn(S.SessionLaunch(oid, "s-0123456789abcdef", "claude", "sonnet", "b", "passthrough", EXP))
+    kid.release()
+    assert kid.process.wait(5) == 0
+    assert kid.abort() == 0 and kid.abort(float("nan")) == 0
+    kid.process.terminate()
+    assert kid.process.poll() == 0 and kid.process.wait() == 0

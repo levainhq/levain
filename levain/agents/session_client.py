@@ -54,6 +54,7 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.parse import quote
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -171,6 +172,12 @@ def _int(v: object, where: str, *, lo: int = 0, none: bool = False) -> int | Non
 def _str(v: object, where: str, *, max_len: int) -> str:
     if type(v) is not str or len(v) > max_len:
         raise WireError(f"{where} is not a short string")
+    return v
+
+
+def _text(v: object, where: str) -> str:
+    if type(v) is not str:
+        raise WireError(f"{where} is not text")
     return v
 
 
@@ -295,7 +302,7 @@ def usage_to_wire(u: Usage) -> dict[str, object]:
 def usage_from_wire(o: object) -> Usage:
     o = _exact(o, _USAGE_KEYS, "usage")
     return Usage(_int(o["usd_micros"], "usd_micros", none=True), _int(o["input_tokens"], "input_tokens", none=True),
-                 _int(o["output_tokens"], "output_tokens", none=True), _str(o["source"], "source", max_len=200),
+                 _int(o["output_tokens"], "output_tokens", none=True), _text(o["source"], "source")[:200],
                  actions=_int(o["actions"], "actions", none=True),
                  tunnel_bytes=_int(o["tunnel_bytes"], "tunnel_bytes", none=True),
                  seconds=_int(o["seconds"], "seconds", none=True))
@@ -303,10 +310,10 @@ def usage_from_wire(o: object) -> Usage:
 
 # --- the proof, derived from what the fire already holds ---------------------------------------------------------------
 
-def link_proof(store: Any, cockpit_root: Path | str, occurrence_id: str) -> LinkProof:
+def link_proof(store: Any, cockpit_root: Path | str, occurrence_id: str, *, now: Any = None) -> LinkProof:
     """The :class:`LinkProof` of ``occurrence_id``: its row's ``spec_hash`` and ``link_id``, and that link's born and
     current rows read from the cockpit authority log at ``cockpit_root`` after a verified replay
-    (:class:`levain.agent_authority.AgentAuthority`). Raises :class:`ProofUnavailable` for a row with no link, a link
+    (:class:`levain.agent_authority.AgentAuthority`); ``now`` (an aware datetime, default the real clock) is a test seam. Raises :class:`ProofUnavailable` for a row with no link, a link
     that is not an agent link of this occurrence's agent and spec hash, or a log that does not read."""
     from levain import authority as _auth
     from levain.agent_authority import AgentAuthority
@@ -318,7 +325,9 @@ def link_proof(store: Any, cockpit_root: Path | str, occurrence_id: str) -> Link
             sid = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
     except Exception as exc:  # noqa: BLE001
         raise ProofUnavailable(f"the agent store does not read ({type(exc).__name__})", standing=False) from None
-    if row is None or type(row[2]) is not str or not row[2] or sid is None:
+    if sid is None:
+        raise ProofUnavailable("the agent store holds no store id", standing=True)
+    if row is None or type(row[2]) is not str or not row[2]:
         raise ProofUnavailable("the occurrence row names no signed link", standing=True)
     agent_id, spec_hash, link_id = row
     try:
@@ -331,9 +340,15 @@ def link_proof(store: Any, cockpit_root: Path | str, occurrence_id: str) -> Link
             or grant["agent_id"] != agent_id or grant["store_id"] != sid[0]:
         raise ProofUnavailable("the link the occurrence launched under is not a standing link of its agent and spec",
                                standing=True)
+    # best effort on the client (the server re-judges standing, freshness and the signers against ITS OWN replay: two
+    # historical rows are not proof of current standing): refuse a link already lapsed or born before a revoke
+    from datetime import datetime, timezone
+    if not _auth.agent_link_arms(state, link_id, now=now or datetime.now(timezone.utc)):
+        raise ProofUnavailable("the link is expired or was revoked", standing=True)
     rows: dict[int, LinkRow] = {}
     try:
-        db = sqlite3.connect(f"file:{Path(cockpit_root) / DB_NAME}?mode=ro", uri=True, timeout=5.0)
+        db = sqlite3.connect("file:" + quote(str(Path(cockpit_root) / DB_NAME), safe="/") + "?mode=ro", uri=True,
+                             timeout=5.0)
         try:
             for seq in {born, current}:
                 got = db.execute("SELECT seq, prev_hash, record, signer_fp, signature FROM authority_log"
@@ -459,7 +474,8 @@ class _RemoteProcess:
         self._lost = True
         if self._conn is not None:
             self._conn.close()
-        self._rc = _ctl.GATE_UNPROVEN
+        if self._rc is None:        # monotonic: a recorded server exit is never downgraded by a later wire failure
+            self._rc = _ctl.GATE_UNPROVEN
         return self._rc
 
     def _slice(self, seconds: float) -> int | None:
@@ -478,6 +494,7 @@ class _RemoteProcess:
                     raise WireError("a returncode before the exit")
                 return None
             self._rc = _exit_code(ans["returncode"], "returncode")
+            self._conn.close()          # the run is over and its exit is held: the holder is done
             return self._rc
         except (_Down, _Refused, WireError):
             return self._lose()
@@ -532,15 +549,18 @@ class _RemoteChild:
 
     def abort(self, timeout: float = 5.0) -> int:
         """ABORT: nothing runs, or the session is ENDed. The exit is the server's, GATE_UNPROVEN when it cannot say."""
+        if self.process._rc is not None:
+            return self.process._rc
         if self._conn is None or self.process._lost:
             return self.process._lose()
         try:
             ans = self._conn.request("ABORT", ("returncode",), timeout=max(0.0, float(timeout)) + _ANSWER_MARGIN_S,
                                      timeout_ms=int(max(0.0, float(timeout)) * 1000))
             rc = _exit_code(ans["returncode"], "returncode")
-        except (_Down, _Refused, WireError):
+        except Exception:  # noqa: BLE001 - abort never raises (a nan or inf timeout included): unproven
             return self.process._lose()
         self.process._rc = rc
+        self._conn.close()
         return rc
 
 
@@ -623,7 +643,7 @@ class DispatchSessionLauncher:
     def usage(self, session_key: str) -> Usage:
         """The server's usage for the key; never raises. Anything unreadable is the caps."""
         try:
-            if _ctl.SESSION_KEY_RE.fullmatch(session_key) is None:
+            if type(session_key) is not str or _ctl.SESSION_KEY_RE.fullmatch(session_key) is None:
                 return Usage(None, None, None, "session:dispatch-bad-key")
             ans = self._short("USAGE", ("usage",), _CONNECT_S, session_key=session_key)
             return usage_from_wire(ans["usage"])
@@ -636,12 +656,14 @@ class DispatchSessionLauncher:
         """The S1 END for the key (``SessionEnder``): ``StopResult(True, ...)`` only when the server answers
         ``terminated: true`` exactly. Never raises."""
         try:
-            if _ctl.SESSION_KEY_RE.fullmatch(session_key) is None:
+            if type(session_key) is not str or _ctl.SESSION_KEY_RE.fullmatch(session_key) is None:
                 return StopResult(False, "the session key is off the grammar; nothing asked")
             deadline = max(0.0, float(deadline_s))
             ans = self._short("END", ("terminated", "detail"), deadline + _ANSWER_MARGIN_S, session_key=session_key,
                               deadline_ms=int(deadline * 1000))
-            detail = _str(ans["detail"], "detail", max_len=_DETAIL_MAX)
+            if type(ans["detail"]) is not str:
+                raise WireError("detail is not text")
+            detail = ans["detail"][:_DETAIL_MAX]            # a long detail never undoes a proven stop
             if ans["terminated"] is True:
                 return StopResult(True, detail)
             if ans["terminated"] is False:
