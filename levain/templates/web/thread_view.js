@@ -100,6 +100,14 @@
   function renderThread(doc, host, m) {
     clear(host);
     host.appendChild(el(doc, "h3", "tv-title", m.id));
+    if (/^[A-Za-z0-9._:-]{1,160}$/.test(m.id)) {
+      // the head card (extend, replace or sign a successor) lives on the drop sheet, the one page the passkey signs on
+      var card = el(doc, "a", "tv-card-link", "Head card: extend, replace or sign a successor");
+      card.setAttribute("href", "/sign/drop#thread=" + encodeURIComponent(m.id));
+      card.setAttribute("target", "_blank");
+      card.setAttribute("rel", "noopener");
+      host.appendChild(card);
+    }
     if (m.gap) host.appendChild(el(doc, "div", "tv-gap", "The driver could not catch up: lines may be missing from this stream."));
     if (m.before.length) {
       var blk = el(doc, "div", "tv-before");
