@@ -117,6 +117,9 @@ from levain.cockpit.routes import EVENTS_PATH, is_cockpit_path
 from levain.cockpit import stream as cockpit_stream
 from levain.cockpit import board as cockpit_board
 from levain.cockpit import threads as cockpit_threads
+from levain.cockpit import room as cockpit_room
+from levain.coordinator import chat_lease
+from levain.coordinator.store import CoordError
 from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb,
                                   record_served_verbs, retier)
 
@@ -134,6 +137,7 @@ from levain.writes import (
 )
 
 if TYPE_CHECKING:
+    from levain.coordinator.chat import ChatService
     from levain.consent.grant_phone import GrantPhone
     from levain.consent.sign import Signer
 
@@ -1149,6 +1153,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/envelope_form.js": ("envelope_form.js", "text/javascript; charset=utf-8"),
     # The thread view (CH-U1a): the Build tab's Threads zone, over GET /cockpit/threads.json and /cockpit/thread/<id>.json.
     "/thread_view.js": ("thread_view.js", "text/javascript; charset=utf-8"),
+    # The room view (RM-F): the cockpit's one Claude room, over GET /cockpit/room.json and POST /cockpit/room/*.
+    "/room_view.js": ("room_view.js", "text/javascript; charset=utf-8"),
     # The board painters (C12): the board-kind panel's grouped tab and its six columns draw with these. GET /cockpit/board.json
     # is served for external readers; no page zone reads it.
     "/board_view.js": ("board_view.js", "text/javascript; charset=utf-8"),
@@ -1291,7 +1297,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/edit",
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
-    _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, _COORD_LIST, _COORD_SHEET,
+    _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, cockpit_room.ROOM_PATH, _COORD_LIST, _COORD_SHEET,
     cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE,
     _PAIR_OFFER, _PAIR_REVOKE, _PAIR_LIST, _PAIR_CLAIM,
     _NOTIFY_PATH,
@@ -1299,7 +1305,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
                                        _GRANT_PREFIX, _SHEET_PREFIX, _COORD_PREFIX, _PUSH_PREFIX,
-                                       cockpit_threads.THREAD_PREFIX, _NOTE_BODY_PREFIX, _DISPATCH_PREFIX, _PENDING_PREFIX)
+                                       cockpit_threads.THREAD_PREFIX, cockpit_room.ROOM_PREFIX, _NOTE_BODY_PREFIX, _DISPATCH_PREFIX, _PENDING_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -1666,6 +1672,12 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     consent_sheet: "ConsentSheet | None" = None
     # whether the cockpit draws levain's own Work board when no provider brings one (make_server's work_board)
     work_board: bool = True
+    # the ChatService the work thread's Stop acts through; None serves none of it
+    chat_service: "ChatService | None" = None
+    # the room's host (RM-F): its ChatService, CoordStore and the launcher's verbs; None serves no room write route
+    room_host: "cockpit_room.RoomHost | None" = None
+    # the RoomServe make_server started (RM-G2); server_close stops it. None: this server holds no room
+    room_serve: "Any" = None
     # the dispatch family's sign, cancel and authorise (OS-2), built by make_server beside the Signer; None serves no
     # dispatch signing route
     dispatch_sheet: "DispatchSheet | None" = None
@@ -1757,6 +1769,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
             self.published_origin = None
         self.stream_stop.set()      # open streams end first: nothing is left holding a thread
         self.stream_watcher.stop()
+        if self.room_serve is not None:
+            # the pump and the room's child end. stop() waits for a send in flight (an open can take the launcher's
+            # open deadline), and says so here rather than leave a Ctrl-C silent
+            self.room_serve.stop(on_wait=lambda: print(
+                "  waiting for the room's line in flight to finish before the room stops...", file=sys.stderr, flush=True))
         if self.broker is not None:
             self.broker.stop()
         if self.coord_sheet is not None:
@@ -3264,6 +3281,91 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
+    def _thread_owner(self) -> str | None:
+        """The authenticated client a stop or a room line acts as: ``cockpit:<surface token name>``, or ``phone:<device id>``
+        for a paired device (the credential's name, verified in ``_credential``, never anything a client claims). None when
+        the request holds no full credential, or a name that makes no client (a credential named exactly the paired
+        prefix has no device id and reads as a cockpit name, never as a phone with an empty id)."""
+        cred = self._credential(required=False)
+        name = cred.get("name") if cred.get("class") == "token" else None
+        if not isinstance(name, str) or not name:
+            return None
+        phone = name.startswith(PAIRED_PREFIX) and len(name) > len(PAIRED_PREFIX)
+        owner = ("phone:" + name[len(PAIRED_PREFIX):]) if phone else "cockpit:" + name
+        try:
+            chat_lease.check_owner(owner)
+        except CoordError:
+            return None
+        return owner
+
+    def _store_directory(self) -> Any:
+        """The dispatch store's directory as the thread reads resolve it, or None when the reader names none."""
+        reader = self.server.consent_reader
+        if not hasattr(reader, "directory"):
+            return None
+        from levain.consent.queue import default_queue_dir
+
+        return reader.directory if reader.directory is not None else default_queue_dir()
+
+    def _thread_post(self, thread_id: str, action: str, req: Any) -> tuple[dict[str, Any], int]:
+        """``POST /cockpit/thread/<th-id>/stop``: the operator's stop of a work thread's turn, reached only past
+        ``do_POST``'s write gate (a surface token on every bind). The dispatch store is the consent directory's."""
+        directory = self._store_directory()
+        if directory is None or action != "stop":
+            return {"error": "not_found", "message": "no such thread recorded"}, 404
+        if self._thread_owner() is None:      # a stop acts only for a named credential (fail closed)
+            return {"error": "forbidden", "message": "a stop needs a named credential"}, 403
+        status, payload = cockpit_threads.post_stop(self.server.chat_service, directory, thread_id, req)
+        return payload, status
+
+    def _serve_room(self, path: str, *, head: bool) -> None:
+        """``GET /cockpit/room.json`` (RM-F): the open room, read-only, behind the thread record's gate (a surface token on
+        every bind, before the store is opened). The dispatch store is the consent directory's."""
+        if not self._off_box_token_valid():
+            self._gated_read_403("the room record needs", head=head)
+            return
+        directory = self._store_directory()
+        if directory is None:
+            status, payload = 200, {"room_thread": None, "launch_id": None, "composer": None, "model": None, "gap": False,
+                                    "stream": [], "proposals": []}
+        else:
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                return
+            try:
+                host = self.server.room_host
+                status, payload = cockpit_room.serve_room(path, directory=directory, service=self.server.chat_service,
+                                                          view=host.view if host is not None else None)
+            finally:
+                self.server.request_gate.release()
+        self._send(cockpit_room.encode(payload), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
+    def _room_post(self, route: tuple[str, str | None], req: Any) -> tuple[dict[str, Any], int]:
+        """``POST /cockpit/room/*`` (RM-F), reached only past ``do_POST``'s write gate (a surface token on every bind).
+        The owner is derived from the credential here and never from the body."""
+        host = self.server.room_host
+        directory = self._store_directory()
+        if host is None or directory is None:
+            return {"error": "not_found", "message": "no such room"}, 404
+        action, proposal = route
+        owner = self._thread_owner()
+        if proposal is not None:
+            status, payload = cockpit_room.post_proposal(host, owner, proposal, action, req)
+        elif action == "send":
+            status, payload = cockpit_room.post_room_send(host, directory, owner, req)
+        elif action == "stop":
+            status, payload = cockpit_room.post_room_stop(host, directory, owner, req)
+        elif action == "mark":
+            status, payload = cockpit_room.post_room_mark(host, directory, owner, req)
+        elif action == "drop":
+            status, payload = cockpit_room.post_room_drop(host, owner, req)
+        elif action == "open":
+            status, payload = cockpit_room.post_room_open(host, owner, req)
+        else:
+            status, payload = cockpit_room.post_room_rotate(host, directory, owner, req)
+        return payload, status
+
     def _serve_threads(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the coordinator's threads and
         one thread's stream, read-only (:func:`levain.cockpit.threads.serve_threads`). A thread carries the operator's
@@ -3286,7 +3388,8 @@ class _Handler(GuardedHandler):
                 return
             try:
                 status, payload = cockpit_threads.serve_threads(
-                    path, "", directory=reader.directory if reader.directory is not None else default_queue_dir())
+                    path, "", directory=reader.directory if reader.directory is not None else default_queue_dir(),
+                    service=self.server.chat_service)
             finally:
                 self.server.request_gate.release()
         self._send(cockpit_threads.encode(payload), "application/json; charset=utf-8", status=status, head=head,
@@ -3662,6 +3765,9 @@ class _Handler(GuardedHandler):
         if path.startswith(_SESSION_LOG_PREFIX) and path.endswith(_SESSION_LOG_SUFFIX):
             self._serve_session_log(path, head=head)
             return
+        if cockpit_room.is_room_path(path):
+            self._serve_room(path, head=head)
+            return
         if cockpit_threads.is_threads_path(path):
             self._serve_threads(path, head=head)
             return
@@ -4001,13 +4107,17 @@ class _Handler(GuardedHandler):
         # and the desk click (TERMSIGN L5a): the same gate, served beside a question store
         desk = (route in (_DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE)
                 and getattr(self.server, "question_store", None) is not None)
+        # and the thread view's write routes (CH-U1b): the same gate; served only beside a ChatService
+        thread = cockpit_threads.post_route(route) if self.server.chat_service is not None else None
+        # and the room's write routes (RM-F): the same gate; served only beside a room host
+        room = cockpit_room.post_route(route) if self.server.room_host is not None else None
         # and web push (OS-4): a token on every bind
         push = route in _PUSH_POST and self.server.signer is not None
         if push:
             if not self._push_gate_ok(route):
                 return self._token_403("credential_required")
         elif (sign is not None or compose or grant is not None or consent is not None or dispatch is not None
-                or coord is not None or key_line or desk) and not self._off_box_token_valid():
+                or coord is not None or key_line or desk or thread is not None or room is not None) and not self._off_box_token_valid():
             return self._token_403("credential_required")
         if self._write_token_required() and not (self._push_gate_ok(route) if push else self._off_box_token_valid()):
             return self._token_403("forbidden")
@@ -4023,7 +4133,7 @@ class _Handler(GuardedHandler):
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
                 and consent is None and dispatch is None and coord is None and not push and not key_line
-                and not desk):
+                and not desk and thread is None and room is None):
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -4155,6 +4265,28 @@ class _Handler(GuardedHandler):
                 # the laptop's own Touch ID signs the click: no read-only refusal applies to it
                 try:
                     payload, status = self._desk_post(req, route)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if thread is not None:
+                # the operator's own line or stop through the ChatService: the credential is the authority, the owner is
+                # derived from it, and no read-only refusal applies (it acts through the entity's floor, as chat does)
+                try:
+                    payload, status = self._thread_post(thread[0], thread[1], req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if room is not None:
+                # the operator's own line, stop, mark, drop or card tap through the room host: the credential is the
+                # authority and the owner is derived from it; no read-only refusal applies (it acts through the floor)
+                try:
+                    payload, status = self._room_post(room, req)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -4400,6 +4532,9 @@ def make_server(
     compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None,
     coordinator_verbs: bool = False,
     work_board: bool = True,
+    chat_service: "ChatService | None" = None,
+    room_host: "cockpit_room.RoomHost | None" = None,
+    room_serve: "Any" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -4757,6 +4892,13 @@ def make_server(
         raise ValueError("refusing signer: this server has no surface token for its sign routes to require (a "
                          "read-only source given no write_token or surface_tokens); pass a write_token")
 
+    if room_serve is not None:
+        if chat_service is not None or room_host is not None:
+            raise ValueError("refusing room_serve: it brings its own ChatService and room host (ONE service serves the "
+                             "room's reads and its writes); pass it instead of chat_service and room_host")
+        from levain.cockpit.room import host_from
+
+        chat_service, room_host = room_serve.service, host_from(room_serve)
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     assets[_SHEET_PAGE] = load_web_asset(_SHEET_PAGE).encode("utf-8")
     httpd = _LevainHTTPServer((host, port), _Handler)
@@ -4778,6 +4920,9 @@ def make_server(
     # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
     httpd.work_board = work_board
+    httpd.chat_service = chat_service
+    httpd.room_host = room_host
+    httpd.room_serve = None         # set only once the RoomServe has started, at the very end
     httpd.verb_registry = verb_registry
     httpd._cockpit_lock = threading.Lock()
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
@@ -4869,6 +5014,18 @@ def make_server(
         httpd.broker = _build_broker(source, install_class, httpd, extra_effects)
         # one reader over one queue directory for the decisions panel's rows and the consent body route alike
         httpd.consent_reader = _consent_reader()
+        if room_serve is not None:
+            # the room's routes read the consent directory's dispatch.db; the serve writes the one it was built over.
+            # They are one directory or this server refuses: a page reading one store while the room writes another
+            # would show an empty room forever.
+            from levain.consent.queue import default_queue_dir
+
+            want = Path(room_serve.directory).resolve()
+            have = Path(default_queue_dir()).resolve()
+            if want != have:
+                raise ValueError(f"refusing room_serve: it writes {want} but the cockpit reads {have}; build the "
+                                 "RoomServe over the consent queue directory")
+            httpd.consent_reader.directory = have      # pinned: a LEVAIN_HOME changed since is not re-resolved
         from levain.consent.questions import QuestionStore
 
         # over the reader's own directory only (None is the default queue): a reader without the attribute gets no
@@ -4957,6 +5114,17 @@ def make_server(
                 (httpd.broker.data_root / SERVED_VERBS_NAME).unlink(missing_ok=True)
             except OSError as stale:
                 _log.warning("cockpit: an earlier served-verbs record may remain: %s", stale)
+    if room_serve is not None:
+        # the last fallible step: recover() then the pump. A serve that cannot recover serves nothing and holds nothing.
+        try:
+            room_serve.start()
+        except BaseException:
+            try:
+                room_serve.stop()
+            finally:
+                httpd.server_close()
+            raise
+        httpd.room_serve = room_serve        # server_close stops it
     return httpd
 
 
@@ -4985,6 +5153,7 @@ def run_web_server(
     install_class: str | None = None,
     sign_queue_dir: "Path | None" = None,
     sign_host: str | None = None,
+    room: "Path | None" = None,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -5081,7 +5250,25 @@ def run_web_server(
             print(chat_err, file=sys.stderr)
             return 1
 
+    room_serve = None
+    if room is not None:
+        # the cockpit's one Claude room (RM-G2): opt-in, because the room's child reads the operator's tree
+        if not write:
+            print("refusing --room: the room takes writes (its lines, stop and drop), which need the write token; "
+                  "pass --write", file=sys.stderr)
+            return 1
+        try:
+            room_serve = _build_room_serve(room)
+        except (ValueError, OSError, RuntimeError) as exc:
+            print(f"refusing --room: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:    # noqa: BLE001 - a CoordError (a store that will not open, a launcher that refuses its setting)
+            print(f"refusing --room: {exc}", file=sys.stderr)
+            return 1
+
     sign_kw: dict[str, Any] = {} if signer is None else {"signer": signer, "extra_hosts": frozenset({sign_host})}
+    if room_serve is not None:
+        sign_kw["room_serve"] = room_serve
     try:
         # the Coordinator panel's verbs exactly when the watcher below runs beside this server
         httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,
@@ -5089,15 +5276,23 @@ def run_web_server(
     # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback — or
     # make_server's own refusal of the signer or its name
     except ValueError as exc:
+        if room_serve is not None:
+            room_serve.stop()
         print(str(exc), file=sys.stderr)
         return 1
     except OSError as exc:
+        if room_serve is not None:
+            room_serve.stop()
         print(
             f"Could not bind {host}:{port} — {exc}.\n"
             "The port may be in use; try `levain serve --port <N>`.",
             file=sys.stderr,
         )
         return 1
+    except BaseException:
+        if room_serve is not None:
+            room_serve.stop()
+        raise
 
     # str-coerce the bound address (socket address types are loosely str|bytes;
     # AF_INET yields a str, but coerce so the f-strings below can't ever render a
@@ -5111,6 +5306,9 @@ def run_web_server(
     print(f"  store: {source.anneal.episodic_db}")
     mode = "GOVERNED WRITABLE" if source.write_scope is not None else "read-only"
     print(f"  {mode} · localhost-only · Ctrl+C to stop")
+    if room_serve is not None:
+        print(f"  room: one Claude room · its tools see {Path(room).expanduser().resolve()} first · recovered "
+              f"{room_serve.recovered or 'nothing'}")
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
@@ -5167,6 +5365,92 @@ def run_web_server(
             if watcher is not None:      # stopped last, and whatever the closes above raised
                 watcher.stop()
     return 0
+
+
+def _build_room_serve(room: Path) -> Any:
+    """The :class:`~levain.coordinator.room_serve.RoomServe` ``levain serve --room DIR`` hands ``make_server``, over the
+    consent queue's ``dispatch.db`` (the file the cockpit's room reads). ``DIR`` is where the room's file tools see first:
+    an existing directory. Built here, started by ``make_server`` after every refusal has passed."""
+    from levain.consent.queue import default_queue_dir
+    from levain.coordinator.envelopes import EnvelopeStore
+    from levain.coordinator.room_launch import RoomSetting
+    from levain.coordinator.room_serve import RoomServe
+
+    cwd = _canonical_path(Path(room).expanduser())
+    if not cwd.is_dir():
+        raise ValueError(f"{cwd} is not a directory (it is where the room's file tools see first)")
+    queue = _canonical_path(Path(default_queue_dir()))
+    _room_dir_refusal(cwd, queue)
+    # the deny rules are written from these spellings: the canonical ones the refusal checked (roomfix2 K1)
+    return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd)), run_dir=str(queue / "room-run"),
+                     launcher_kw={"home": str(_canonical_path(Path.home())), "levain_home": str(queue.parent)})
+
+
+def _canonical_path(p: Path) -> Path:
+    """``p`` resolved AND spelled as the filesystem spells it (roomfix2 K1). ``Path.resolve()`` follows links but keeps
+    the case it was given, so on a case-insensitive filesystem ``/USERS/me`` resolves to itself. The nearest existing
+    ancestor is asked for its own path (``F_GETPATH`` where the platform has it: macOS, which also answers a firmlink
+    alias with the canonical name); the part that does not exist yet is joined on as given."""
+    import fcntl
+    import os
+
+    p = p.resolve()
+    tail: list = []
+    base = p
+    while not base.exists() and base != base.parent:
+        tail.append(base.name)
+        base = base.parent
+    getpath = getattr(fcntl, "F_GETPATH", None)
+    if getpath is not None:
+        fd = os.open(base, os.O_RDONLY)
+        try:
+            base = Path(os.fsdecode(fcntl.fcntl(fd, getpath, bytes(1024)).split(b"\0", 1)[0]))
+        finally:
+            os.close(fd)
+    return base.joinpath(*reversed(tail))
+
+
+def _room_dir_refusal(cwd: Path, queue: Path) -> None:
+    """Refuse a ``--room DIR`` that would make the room's read boundary too wide (roomfix1 C1): the user's home, any
+    ancestor of it (``/``, ``/Users``), a directory holding levain's own home or its consent queue (its stores, tokens and
+    keys), or one inside levain's home. Every side is compared by identity (roomfix2 K1: a spelling the filesystem takes
+    as the same directory, a case alias or a second mount, is the same directory): each path and each of its parents
+    is matched by canonical spelling and, where both exist, by ``(st_dev, st_ino)``; a stat that fails refuses. The
+    deny rules still cover the credential paths inside an allowed DIR; this refuses the DIRs where they would be the
+    only line. ``ValueError`` naming the reason."""
+    import os
+
+    home = _canonical_path(Path.home())          # $HOME, else the password database's (os.path.expanduser)
+    levain_home = queue.parent
+
+    def ident(p: Path):                          # (st_dev, st_ino), or None for a path that does not exist
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValueError(f"--room: {p} cannot be checked ({type(exc).__name__}); the room is not opened") from exc
+        return (st.st_dev, st.st_ino)
+
+    def inside(child: Path, root: Path) -> bool:
+        if child == root or root in child.parents:
+            return True
+        want = ident(root)
+        return want is not None and any(ident(c) == want for c in (child, *child.parents))
+
+    if inside(home, cwd):
+        # named by identity too (roomfix3 LOW): a spelling only the (st_dev, st_ino) match catches is still home itself
+        own = ident(cwd)
+        same = cwd == home or (own is not None and own == ident(home))
+        what = ("your home directory" if same
+                else f"a directory that holds your home directory ({home})")
+        raise ValueError(f"{cwd} is {what}: the room's file tools would read all of it; pass a project directory")
+    for own, name in ((levain_home, "levain's home"), (queue, "levain's consent queue")):
+        if inside(own, cwd):
+            raise ValueError(f"{cwd} holds {name} ({own}): the room's file tools would read levain's own stores and "
+                             "keys; pass a directory outside it")
+    if inside(cwd, levain_home):
+        raise ValueError(f"{cwd} is inside levain's home ({levain_home}); pass a directory outside it")
 
 
 def _serve_signer(queue_dir: Path, host: str) -> "Signer":

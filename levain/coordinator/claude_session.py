@@ -68,6 +68,9 @@ _POLL_SLICE = 0.02              # the longest a waiting pump sleeps between non-
 
 ROOM_MCP_SERVER = "levain_room"
 ROOM_MCP_TOOL = "mcp__levain_room__propose_drop"
+# WebSearch is an EGRESS channel, kept by design (roomfix1 C4, routed to the operator): the room can send search queries
+# built from what it has read (a file under its cwd, a search result), so those words can reach a search provider. It
+# has no fetch (WebFetch is denied), no shell and no write. `levain serve --room`'s help says this in plain words.
 ROOM_TOOLS = ("Read", "Grep", "Glob", "WebSearch")
 ROOM_DENIED_TOOLS = ("Bash", "Edit", "Write", "NotebookEdit", "WebFetch")
 _ROOM_INIT_TOOLS = frozenset((*ROOM_TOOLS, ROOM_MCP_TOOL))
@@ -942,14 +945,28 @@ class ClaudeSession:
 _GLOB = re.compile(r"[*?\[{]")
 
 
-def default_deny_paths(home: str | os.PathLike[str]) -> tuple[str, ...]:
-    """The credential paths the room's Read/Grep/Glob must not reach (absolute ones under ``home``, plus the
-    ``**/`` globs for dotenv files and keychain exports)."""
+# the credential and agent-config paths under the user's home the room's file tools must not reach (roomfix1 C1 added
+# the token files of git hosts, package registries and container/cluster tools, and the agents' own config and
+# transcripts: ~/.claude.json, ~/.claude, ~/.codex)
+_HOME_DENY = (".ssh", ".aws", ".gnupg", ".config/gcloud", "Library/Keychains", ".netrc", ".npmrc", ".pypirc",
+              ".git-credentials", ".config/gh", ".docker", ".kube", ".claude.json", ".claude", ".codex")
+
+
+def default_deny_paths(home: str | os.PathLike[str],
+                       levain_home: str | os.PathLike[str] | None = None) -> tuple[str, ...]:
+    """The credential paths the room's Read/Grep/Glob must not reach: :data:`_HOME_DENY` under ``home``, levain's own
+    home when given (its stores, tokens, keys and consent queue), plus the ``**/`` globs for dotenv files and keychain
+    exports."""
     h = str(home)
     if not os.path.isabs(h):
         raise ValueError("home must be absolute")
-    return (f"{h}/.ssh", f"{h}/.aws", f"{h}/.gnupg", f"{h}/.config/gcloud", f"{h}/Library/Keychains",
-            "**/.env*", "**/*.keychain", "**/*.keychain-db", "**/*.p12")
+    own: tuple[str, ...] = ()
+    if levain_home is not None:
+        lh = str(levain_home)
+        if not os.path.isabs(lh):
+            raise ValueError("levain_home must be absolute")
+        own = (lh,)
+    return (*(f"{h}/{p}" for p in _HOME_DENY), *own, "**/.env*", "**/*.keychain", "**/*.keychain-db", "**/*.p12")
 
 
 def _norm(path: str) -> str:
