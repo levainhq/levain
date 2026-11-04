@@ -177,10 +177,12 @@ def shadow_signing_card_text(zone: str, *, flow_root: Path | str, scratch: Path 
             f"run state plus a read-only copy of flow's instructions file {flow_instructions} in its agent store "
             f"{agent_dir}. None of these may sit inside ~/.anneal-memory or {flow_root}; it never writes flow's memory "
             "text, and it never sends, pushes or publishes. The compose is given read tools (Read, Glob, Grep) and no "
-            "write tool; this card does not bound what those read tools can open. It reads its first-run facts from "
-            f"{facts_path if facts_path is not None else 'no file (none named)'}, a file whose contents set what the "
-            f"executor will run. It composes with {model}, a paid model call at list price, and spends at most ${per_run_usd:.2f} a run and "
-            f"${night_usd:.2f} a night (2 runs), the same limits as a live dream. These paths and the model are bound "
+            "write tool; this card does not bound what those read tools can open. "
+            + (f"It reads its first-run facts from {facts_path}, a file whose contents set what the executor will run. "
+               if facts_path is not None else
+               "No first-run facts file is named, so every fire refuses until one is. ")
+            + f"It composes with {model}, a paid model call at list price, and spends at most ${per_run_usd:.2f} a run "
+            f"and ${night_usd:.2f} a night (2 runs), the same limits as a live dream. These paths and the model are bound "
             "into the spec this link signs: an enable that changes one writes a new spec (--revise), which needs a new "
             "signed link, and a fire whose facts differ from its spec's refuses. Undo: nothing to undo, the scratch "
             "store is a copy. Stop it with `levain agents pause`, `retire` or `revoke`, or by deleting the install "

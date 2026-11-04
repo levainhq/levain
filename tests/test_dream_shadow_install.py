@@ -813,7 +813,9 @@ def test_the_shadow_signing_card_names_the_facts_file_the_link_signs(env, flow, 
     common = dict(flow_root="/f", scratch="/s", coord_dir="/c", agent_dir="/a", flow_instructions="/i", model="m",
                   per_run_usd=1.0, night_usd=2.0, expires="x")
     assert str(facts) in da.shadow_signing_card_text("UTC", facts_path=facts, **common)
-    assert "none named" in da.shadow_signing_card_text("UTC", facts_path=None, **common)
+    none_card = da.shadow_signing_card_text("UTC", facts_path=None, **common)
+    assert "every fire refuses" in none_card and "first-run facts from" not in none_card
+    assert "It composes with m, a paid model call" in none_card and "a run and $2.00 a night" in none_card
 
 
 def _pair(ag):
