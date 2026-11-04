@@ -23,8 +23,9 @@ canary proves the ``--settings`` file took effect (the first decoy is outside th
 rule, so either the outside-cwd block or the deny rule answers it; it does not tell which, and it does not exercise
 each deny path). The scope decoy (roomfix1 C2) can be answered only by the outside-cwd block: its Read refused is the
 proof that the read scope the child really runs with (his user settings, an allow rule) is no wider than the cwd AT THAT
-PATH; a widening that covers other places only is not seen by it, and :func:`settings_scope_refusal` refuses the one
-widening the settings files name (``permissions.additionalDirectories``) before any spawn. The child runs with
+PATH; a widening that covers other places only is not seen by it, and :func:`settings_scope_refusal` refuses, before
+any spawn, the widenings the settings files can name (``permissions.additionalDirectories`` and a file tool's
+path-specific allow rule outside the cwd). The child runs with
 :func:`room_env`, an allowlisted environment (roomfix1 C3). The check's own events (the canary Reads, their denials,
 the child's reply) are in the room's stream like any turn.
 
@@ -66,6 +67,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import plistlib
+import re
 import secrets
 import shutil
 import signal
@@ -114,8 +117,10 @@ _CANARY_NAME = ".env.levain-room-canary"
 _SCOPE_NAME = "levain-room-scope-canary.txt"
 _SOURCES = ("user_permanent", "config")
 # the settings files a child run with ``--setting-sources user`` still loads outside his user file: the managed (policy)
-# settings, per platform (a seam: a test points it at its own)
-MANAGED_SETTINGS = ("/Library/Application Support/ClaudeCode/managed-settings.json", "/etc/claude-code/managed-settings.json")
+# settings, per platform (a seam: a test points it at its own). The .plist is the macOS MDM profile's domain (roomfix2
+# K3, from the L3 finding; UNVERIFIED that the claude CLI reads it: reading one it does not load can only refuse more)
+MANAGED_SETTINGS = ("/Library/Application Support/ClaudeCode/managed-settings.json", "/etc/claude-code/managed-settings.json",
+                    "/Library/Managed Preferences/com.anthropic.claudecode.plist")
 # what of the serve's environment the room's child gets (roomfix1 C3): what a claude CLI needs to find his account, its
 # config and the network, what the room's MCP door (a python child of it) needs to import levain and find its store, and
 # nothing else. A name a caller adds is ``RoomLauncher(env_keep=...)``.
@@ -134,25 +139,41 @@ def room_env(environ: Mapping[str, str], keep: tuple = ()) -> dict:
     path to another store) stays out of the child and the processes it starts."""
     names = set(ENV_KEEP) | set(keep)
     env = {k: v for k, v in environ.items() if k in names or k.startswith(ENV_KEEP_PREFIXES)}
+    if env.get("CLAUDE_CONFIG_DIR") == "":
+        del env["CLAUDE_CONFIG_DIR"]           # read as unset by settings_scope_refusal: the child gets it unset too
     env[ROOM_ENV] = "1"
     return env
 
 
 def settings_scope_refusal(environ: Mapping[str, str], home: str,
-                           managed: Optional[tuple] = None) -> Optional[str]:
-    """Why the settings the room's child will load widen its read scope, or None (roomfix1 C2). ``--setting-sources user``
-    still loads his user ``settings.json`` (``$CLAUDE_CONFIG_DIR`` or ``<home>/.claude``) and the managed settings; a
-    ``permissions.additionalDirectories`` in any of them adds directories outside the room's cwd to what its file tools
-    may read, so the room refuses to open. A file that is present but cannot be read as a JSON object is refused too
-    (fail closed: what it would add cannot be said). A missing file adds nothing."""
-    config = environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude")
+                           managed: Optional[tuple] = None, cwd: Optional[str] = None) -> Optional[str]:
+    """Why the settings the room's child will load widen its read scope, or None (roomfix1 C2, roomfix2 K2/K3).
+    ``--setting-sources user`` still loads his user ``settings.json`` (``$CLAUDE_CONFIG_DIR`` or ``<home>/.claude``) and
+    the managed settings. The room refuses to open when any of them names ``permissions.additionalDirectories`` (it adds
+    directories outside the room's cwd to what its file tools may read) or a path-specific ``permissions.allow`` rule for
+    a file tool whose path reaches outside ``cwd`` (:func:`_allow_rule_outside`; a bare ``Read`` allow does not widen
+    the scope: the open check's scope decoy was denied on a real claude with one, RETURN_land_room 2026-11-04). A
+    ``CLAUDE_CONFIG_DIR`` that is not absolute is refused (roomfix2 K2): the child runs in the room's cwd, so a relative
+    one would name a different directory there than the one read here. A file that is present but cannot be read as a
+    JSON object (or, for a profile, a property list) is refused too (fail closed: what it would add cannot be said). A
+    missing file adds nothing."""
+    config = environ.get("CLAUDE_CONFIG_DIR")
+    if config and not os.path.isabs(config):
+        return _one_line(f"CLAUDE_CONFIG_DIR {config!r} is not an absolute path: the room's child runs in the room's "
+                         "directory and would read its settings from a different place than levain checks; set it absolute",
+                         400)
+    config = config or os.path.join(home, ".claude")
     for path in (os.path.join(config, "settings.json"), *(MANAGED_SETTINGS if managed is None else managed)):
         try:
-            with open(path, encoding="utf-8") as f:
-                doc = json.load(f)
+            if path.endswith(".plist"):
+                with open(path, "rb") as fb:
+                    doc = plistlib.load(fb)
+            else:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
         except FileNotFoundError:
             continue
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, plistlib.InvalidFileException) as exc:
             return _one_line(f"the settings file {path} the room's child loads cannot be read ({type(exc).__name__}); "
                              "what it adds to the room's read scope cannot be said", 400)
         perms = doc.get("permissions") if isinstance(doc, dict) else None
@@ -164,7 +185,53 @@ def settings_scope_refusal(environ: Mapping[str, str], home: str,
             return _one_line(f"the settings file {path} the room's child loads names permissions.additionalDirectories "
                              f"({len(extra) if isinstance(extra, list) else 'not a list'}): the room's file tools could "
                              "read outside its cwd; remove them, or run the room under another CLAUDE_CONFIG_DIR", 400)
+        allow = (perms or {}).get("allow", [])
+        if not isinstance(allow, list):
+            return _one_line(f"the settings file {path} the room's child loads has a permissions.allow that is not a "
+                             "list", 400)
+        for rule in allow:
+            if isinstance(rule, str) and _allow_rule_outside(rule, cwd, home, os.path.dirname(path)):
+                return _one_line(f"the settings file {path} the room's child loads allows {rule!r}: that rule lets the "
+                                 "room's file tools read outside its directory; remove it, or run the room under another "
+                                 "CLAUDE_CONFIG_DIR", 400)
     return None
+
+
+# the file tools whose path-specific allow rules can widen what the room reads: its own (Read, Grep, Glob) and the edit
+# tools (an edit permission may carry a read one; the room cannot use those tools, but a rule for them is refused the same)
+_FILE_RULE = re.compile(r"\s*(Read|Grep|Glob|LS|NotebookRead|Edit|Write|MultiEdit|NotebookEdit)\s*\((.*)\)\s*", re.S)
+_GLOB_CHARS = "*?[{"
+
+
+def _allow_rule_outside(rule: str, cwd: Optional[str], home: str, settings_dir: str) -> bool:
+    """Whether the allow rule ``rule`` names a path, for a file tool, that reaches outside ``cwd`` (roomfix2 K3). A bare
+    tool name (``Read``) and a rule for any other tool are not path rules: False. The path follows Claude Code's rule
+    syntax: ``//p`` absolute, ``~/p`` under ``home``, ``/p`` under the settings file's directory, anything else under the
+    cwd. Its literal part (up to the last ``/`` before the first glob character) must resolve inside ``cwd``; with no
+    ``cwd`` given every path rule reaches outside."""
+    m = _FILE_RULE.fullmatch(rule)
+    if m is None:
+        return False
+    spec = m.group(2).strip()
+    if spec in ("", "*", "**"):
+        return False                         # the tool's whole default scope: no wider than the bare rule
+    if cwd is None:
+        return True
+    if spec.startswith("//"):
+        path = spec[1:]
+    elif spec == "~" or spec.startswith("~/"):
+        path = os.path.join(home, spec[2:])
+    elif spec.startswith("/"):
+        path = os.path.join(settings_dir, spec[1:])
+    else:
+        path = os.path.join(cwd, spec)
+    cut = min((i for i in (path.find(c) for c in _GLOB_CHARS) if i >= 0), default=-1)
+    literal = path if cut < 0 else path[:path.rfind("/", 0, cut) + 1] or "/"
+    root, base = os.path.realpath(literal), os.path.realpath(cwd)
+    if os.path.exists(root) and os.path.exists(base) and os.path.samefile(root, base):
+        return False
+    inside = root == base or root.startswith(base.rstrip("/") + "/")
+    return not inside
 
 
 class RoomLaunchError(CoordError):
@@ -512,7 +579,7 @@ class RoomLauncher:
         scope_dir: Optional[str] = None
         try:
             env = room_env(self._environ if self._environ is not None else os.environ, self._env_keep)
-            widened = settings_scope_refusal(env, self._home)
+            widened = settings_scope_refusal(env, self._home, cwd=self._setting.cwd)
             if widened is not None:
                 raise RoomLaunchError(widened)
             scope_dir, scope = self._scope_decoy()

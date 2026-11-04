@@ -1061,6 +1061,95 @@ def test_c2_a_settings_file_that_cannot_be_read_refuses_and_a_missing_one_adds_n
     assert room_launch.settings_scope_refusal({}, str(home), managed=()) is None
 
 
+# --- roomfix2 K2: a relative CLAUDE_CONFIG_DIR; K3: path-specific allow rules ------------------------------------------
+def _scope_launcher(world, extra_env):
+    lr = RoomLauncher(world["cs"], world["svc"], RoomSetting(str(world["cwd"]), claude_bin=str(world["script"])),
+                      run_dir=str(world["run"]), home=str(world["home"]), env_keep=("FAKE_DIR",),
+                      environ={**os.environ, "FAKE_DIR": str(world["fake"]), **extra_env})
+    world["launchers"].append(lr)
+    return lr
+
+
+def test_k2_a_relative_config_dir_is_refused_before_any_spawn(world, monkeypatch):
+    """FINDINGS_room_r2 K2: a relative CLAUDE_CONFIG_DIR was joined against the SERVER's cwd, while the child (cwd = the
+    room's DIR) loads DIR/<rel>/settings.json. Reproduced here: the file the child would load widens the scope and the
+    server's cwd holds no such file, so the check passed."""
+    monkeypatch.setattr(room_launch, "MANAGED_SETTINGS", ())
+    (world["cwd"] / "cfg").mkdir()
+    (world["cwd"] / "cfg" / "settings.json").write_text(json.dumps({"permissions": {"additionalDirectories": ["/"]}}))
+    assert not os.path.exists(os.path.join(os.getcwd(), "cfg", "settings.json"))
+    lr = _scope_launcher(world, {"CLAUDE_CONFIG_DIR": "cfg"})
+    with pytest.raises(RoomLaunchError, match="CLAUDE_CONFIG_DIR 'cfg' is not an absolute path"):
+        lr.ensure()
+    assert spawns(world) == []
+    for rel in ("~/cfg", "./cfg"):
+        assert "not an absolute path" in room_launch.settings_scope_refusal({"CLAUDE_CONFIG_DIR": rel}, str(world["home"]),
+                                                                            managed=(), cwd=str(world["cwd"]))
+
+
+def test_k2_an_empty_config_dir_is_unset_for_the_child_as_it_is_for_the_check():
+    env = room_launch.room_env({"PATH": "/bin", "CLAUDE_CONFIG_DIR": ""})
+    assert "CLAUDE_CONFIG_DIR" not in env
+    assert room_launch.room_env({"CLAUDE_CONFIG_DIR": "/abs/cfg"})["CLAUDE_CONFIG_DIR"] == "/abs/cfg"
+
+
+_OUTSIDE = ["Read(//{other}/**)", "Read(~/private/**)", "Read(~)", "Grep(/notes/**)", "Glob(../sibling/**)",
+            "Read(//**)", "Edit(//{other}/x)", "Read( //{other}/a*b )", "Read(//{cwd}-twin/**)"]
+_INSIDE = ["Read", "Grep", "Read(**)", "Read(*)", "Read(./src/**)", "Read(src/*.py)", "Read(//{cwd}/**)",
+           "Read(//{cwd})", "Bash(ls:*)", "WebFetch(domain:example.com)", "mcp__levain_room__drop"]
+
+
+def _rule_world(tmp_path):
+    home, cwd, other = tmp_path / "h", tmp_path / "proj", tmp_path / "other"
+    for d in (home / ".claude", cwd / "src", other):
+        d.mkdir(parents=True)
+    return home, cwd, other
+
+
+@pytest.mark.parametrize("rule", _OUTSIDE)
+def test_k3_a_path_specific_file_allow_rule_outside_the_room_refuses(tmp_path, rule):
+    """FINDINGS_room_r2 K3: the check saw only additionalDirectories; a path-specific Read allow outside the cwd widens
+    the read scope while the one scope decoy (a fresh temp dir) can still be denied."""
+    home, cwd, other = _rule_world(tmp_path)
+    r = rule.format(other=str(other).lstrip("/"), cwd=str(cwd).lstrip("/"))
+    (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Read", r]}}))
+    why = room_launch.settings_scope_refusal({}, str(home), managed=(), cwd=str(cwd))
+    assert why is not None and "allows" in why and "outside its directory" in why, (r, why)
+
+
+@pytest.mark.parametrize("rule", _INSIDE)
+def test_k3_a_bare_rule_another_tool_or_a_path_inside_the_room_adds_nothing(tmp_path, rule):
+    home, cwd, _other = _rule_world(tmp_path)
+    r = rule.format(cwd=str(cwd).lstrip("/"))
+    (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": [r], "ask": ["Read(//**)"]}}))
+    assert room_launch.settings_scope_refusal({}, str(home), managed=(), cwd=str(cwd)) is None, r
+
+
+def test_k3_a_managed_file_or_profile_with_an_outside_rule_refuses_and_allow_must_be_a_list(tmp_path):
+    import plistlib
+    home, cwd, other = _rule_world(tmp_path)
+    managed = tmp_path / "managed-settings.json"
+    managed.write_text(json.dumps({"permissions": {"allow": [f"Read(/{other}/**)"]}}))
+    assert "allows" in room_launch.settings_scope_refusal({}, str(home), managed=(str(managed),), cwd=str(cwd))
+    prof = tmp_path / "com.anthropic.claudecode.plist"
+    prof.write_bytes(plistlib.dumps({"permissions": {"allow": [f"Read(/{other}/**)"]}}))
+    assert "allows" in room_launch.settings_scope_refusal({}, str(home), managed=(str(prof),), cwd=str(cwd))
+    prof.write_bytes(b"not a plist")
+    assert "cannot be read" in room_launch.settings_scope_refusal({}, str(home), managed=(str(prof),), cwd=str(cwd))
+    (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": "Read"}}))
+    assert "not a list" in room_launch.settings_scope_refusal({}, str(home), managed=(), cwd=str(cwd))
+
+
+def test_k3_the_launcher_refuses_an_outside_rule_before_any_spawn(world, tmp_path, monkeypatch):
+    monkeypatch.setattr(room_launch, "MANAGED_SETTINGS", ())
+    (world["home"] / ".claude").mkdir()
+    (world["home"] / ".claude" / "settings.json").write_text(
+        json.dumps({"permissions": {"allow": [f"Read(/{tmp_path}/elsewhere/**)"]}}))
+    with pytest.raises(RoomLaunchError, match="outside its directory"):
+        _scope_launcher(world, {}).ensure()
+    assert spawns(world) == []
+
+
 def test_c3_the_child_gets_an_allowlisted_environment(world):
     secret = {"LEVAIN_TEST_SECRET": "s3cret", "AWS_SECRET_ACCESS_KEY": "x", "GITHUB_TOKEN": "y", "LC_ALL": "C"}
     lr = RoomLauncher(world["cs"], world["svc"], RoomSetting(str(world["cwd"]), claude_bin=str(world["script"])),
