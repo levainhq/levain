@@ -2900,6 +2900,53 @@ def _kb(n: float) -> str:
     return f"{n / 1e6:.1f} MB" if n > 1e6 else f"{round(n / 1e3)} kB"
 
 
+def _run_time(dg: dict[str, Any]) -> str | None:
+    """'last run 02:56 (scheduler)' or 'newest episode 02:56 (no run recorded)', the clock time in the offset the
+    contributor wrote; None when the digest carries no readable last_run_at (an older roster)."""
+    at = dg.get("last_run_at")
+    if not _is_iso(at):
+        return None
+    hm = _parse_iso(at).strftime("%H:%M")
+    return f"newest episode {hm} (no run recorded)" if dg.get("last_run_source") == "episode" else f"last run {hm}"
+
+
+def _status_part(dg: dict[str, Any], parts: list[str]) -> None:
+    """The scheduler's status, verbatim, as TEXT: it is never mapped to a tone ('skipped' is a clean night for one
+    job and is also what an empty-output run may be recorded as)."""
+    st = dg.get("last_run_status")
+    if isinstance(st, str) and st:
+        parts.append("status " + " ".join(st.split())[:40])
+
+
+def _nonneg_int(v: Any) -> int | None:
+    """A count as an int, or None when it is not a non-negative whole number (a huge int never reaches float)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if 0 <= v <= 10**9 else None
+    if isinstance(v, float) and math.isfinite(v) and 0 <= v <= 10**9 and v == int(v):
+        return int(v)
+    return None
+
+
+def _flag_unreadable(dg: dict[str, Any]) -> bool:
+    """A run flag that is present but neither a bool nor null: evidence that cannot be read is never health."""
+    return any(k in dg and dg[k] is not None and not isinstance(dg[k], bool) for k in ("run_failed", "run_late"))
+
+
+def _run_reading(dg: dict[str, Any]) -> dict[str, Any] | None:
+    """An alarm reading for a stateless resident whose digest says its run failed or is late; None otherwise."""
+    failed, late = dg.get("run_failed") is True, dg.get("run_late") is True
+    if not (failed or late):
+        return None
+    parts = (["last run failed"] if failed else []) + (["run late"] if late else [])
+    t = _run_time(dg)
+    if t is not None:
+        parts.append(t)
+    _status_part(dg, parts)
+    return {"tone": "alarm", "text": " · ".join(parts)}
+
+
 def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
     """Health PER KIND, the one place the fleet rules live. ``tone`` is ok | alarm | neutral | unknown;
     only a RESIDENT member whose silence is a signal can be ``alarm``. An on-call member (and a member the
@@ -2909,6 +2956,8 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
     dg = row.get("digest") if isinstance(row.get("digest"), dict) else None
     lc = row.get("last_call") if isinstance(row.get("last_call"), dict) else None
     stateful = row.get("memory") == "stateful"
+    # the same rule the page groups by: kind decides, and memory only when a row carries no kind (an older roster)
+    is_role = row.get("kind") == "role" or (row.get("kind") is None and not stateful)
     if stateful:
         sb = dg.get("store_bytes") if dg else None
         mem = "memory" + (f" {_kb(sb)}" if isinstance(sb, (int, float)) and not isinstance(sb, bool) and sb else "")
@@ -2926,9 +2975,20 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
         return out                                              # never an alarm: a neutral fact
     if dg is None:
         return {**out, "tone": "unknown", "text": "no data"}
+    if is_role:
+        run = _run_reading(dg)
+        if run is not None:                                    # a failed or late run: its own words, never "write path"
+            return {**out, **run}
+    src = dg.get("last_run_source") if is_role else None
+    if src == "gate":
+        # a scheduler STOP (skipped_low_energy, pre-filtered): last_run_at is null and the status names the gate.
+        # It is a stop, never a run time, and says nothing about liveness either way.
+        stop = ["scheduler stop"]
+        _status_part(dg, stop)
+        return {**out, "tone": "neutral", "text": " · ".join(stop)}
     if dg.get("available") is False:
         return {**out, "tone": "alarm", "text": "write path unavailable"}
-    if dg.get("available") is not True:
+    if dg.get("available") is not True and src != "episode":
         return {**out, "tone": "unknown", "text": "no liveness data"}
     # tone ranks alarm > unknown > ok; evidence that is missing or unreadable is never read as health
     rank = {"ok": 0, "unknown": 1, "alarm": 2}
@@ -2941,18 +3001,29 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
             tone = t
         parts.append(text)
 
-    if not stateful:
-        parts.append("running")
+    if is_role:
+        # a role run on a schedule is read from its last run, never from a bare "running"
+        t = _run_time(dg)
+        if t is None:
+            note("unknown", "no run time reported")   # an older roster: absence of a run time is never health
+        else:
+            parts.append(t)
+        if _flag_unreadable(dg):
+            note("unknown", "run state unreadable")
+        _status_part(dg, parts)
+        n = _nonneg_int(dg.get("episodes_24h"))
+        if n is not None:
+            parts.append(f"{n} episodes in 24 h")
     else:
         eps = dg.get("episodes_24h")
         if eps is None:
             note("unknown", "episodes_24h not reported")
-        elif isinstance(eps, bool) or not isinstance(eps, (int, float)) or not math.isfinite(eps) or eps < 0 or eps != int(eps):
+        elif (n := _nonneg_int(eps)) is None:
             note("unknown", "episodes_24h unreadable")
-        elif eps == 0:
+        elif n == 0:
             note("alarm", "no episodes in 24 h, it should be writing")
         else:
-            parts.append(f"{int(eps)} episodes in 24 h")
+            parts.append(f"{n} episodes in 24 h")
         every = _wrap_every_s(row.get("wrap_every"))
         if every is not None:
             lw = dg.get("last_wrap_at")
@@ -2962,6 +3033,8 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
                 note("alarm", f"last wrap overdue (due every {row['wrap_every']})")
             else:
                 parts.append(f"wraps every {row['wrap_every']}")
+    if src == "episode" and tone == "ok":
+        tone = "neutral"          # the newest episode is a time with its source, not a liveness verdict (no run was recorded)
     out["tone"], out["text"] = tone, " · ".join(parts)
     return out
 
