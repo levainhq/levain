@@ -735,6 +735,29 @@ def test_the_until_row_shows_the_ending_the_record_holds_after_a_preset_is_tappe
     assert v[-1] == ["timer", "1h"], v   # Quiet ends on a timer: the row says so and shows its duration
 
 
+@needs_browser
+def test_i_switch_it_makes_the_preset_the_standing_default_and_the_row_paints_the_record(rig, tmp_path, monkeypatch):
+    """Until offers I switch it again (no schema change: the direct write with until=switch). On Back it is pressed because no
+    overlay is on file; after Away + I switch it the overlay is gone and Away's options are the base."""
+    src, q = rig
+    pressed = "[...document.querySelectorAll('" + _UNTIL_SEL + "')].map(b => b.dataset.value)"
+    sw = "document.querySelector('#pr-sheet [aria-label=\"How long this preset lasts\"] [data-value=\"switch\"]')"
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000},
+            _opened(),
+            {"eval": pressed},
+            {"do": "document.querySelector('.pr-sheet-word[data-value=\"away\"]').click()", "until": f"{_CHIP_TEXT}.startsWith('Away')", "ms": 8000},
+            {"eval": pressed},
+            {"do": f"{sw}.click()", "until": f"{pressed}[0] === 'switch'", "ms": 8000},
+            {"eval": pressed},
+        ])
+    rec = json.loads((q / "webpush" / intent.FILE_NAME).read_text())
+    assert rec["overlay"] is None and rec["base"]["devices"] == "on", rec
+    v = [x for x in out["values"] if isinstance(x, list)]      # the eval results (the do/until steps answer True)
+    assert v == [["switch"], ["input"], ["switch"]], out["values"]
+
+
 def _overlay(q) -> dict:
     return json.loads((q / "webpush" / intent.FILE_NAME).read_text())["overlay"]
 

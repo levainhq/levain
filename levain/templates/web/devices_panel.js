@@ -658,7 +658,7 @@
   const PR_REFRESH_EVERY = 5;                            // pulses between device-list refreshes
   const PR_PULSE_MS = 6000;                              // how often an open page re-reads the server's Follow line while visible
   const PR_AFTER = [5, 10, 15, 30, 60];                  // minutes without a typed desk message before follow turns devices on
-  const PR_ENDS = [["input", "Until I say or type"], ["timer", "For…"]];
+  const PR_ENDS = [["input", "Until I say or type"], ["timer", "For…"], ["switch", "I switch it"]];
   // the tap-token form names the words the server knows: the presets, and the two aliases (desk = follow, devices = on)
   const PR_TAP_WORDS = [["back", "Back"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"],
                         ["desk", "Desk (follow)"], ["devices", "Devices (on)"]];
@@ -800,7 +800,7 @@
     // disagree with the line above it; a tap re-activates the preset with that ending, and the TYPE is remembered for next time.
     prUntilLab = el("div", "pr-sheet-lab", "Until");
     prSheet.appendChild(prUntilLab);
-    prUntilBtns = segment(prSheet, PR_ENDS, "How long this preset lasts", (v) => setEnding(v));
+    prUntilBtns = segment(prSheet, PR_ENDS, "How long this preset lasts", (v) => (v === "switch" ? setStanding() : setEnding(v)));
     prForRow = el("div", "pr-sheet-seg pr-sub");
     prForRow.setAttribute("role", "group");
     prForRow.setAttribute("aria-label", "How long");
@@ -816,7 +816,7 @@
     prForBtns.custom = fc; prForRow.appendChild(fc);
     prSheet.appendChild(prForRow);
     prForCustom = minutesField(prSheet, "Minutes this preset lasts", (n) => { prForOpen = false; setEnding("timer", n + "m"); });
-    prSheet.appendChild(el("p", "pr-sheet-hint pr-until-note", "A time applies to this activation only; Until I say or type or For… is what the preset remembers."));
+    prSheet.appendChild(el("p", "pr-sheet-hint pr-until-note", "A time applies to this activation only; Until I say or type or For… is what the preset remembers; I switch it keeps its options as your standing default."));
 
     prSheetWho = el("p", "pr-sheet-who");          // what is sensed: read only
     prSheet.appendChild(prSheetWho);
@@ -1002,10 +1002,11 @@
     paintLets(prLetsBtns, v.lets, (x) => customize({ lets_through: x }));
     pressed(prLetsBtns, opts.lets_through);
     // Until: the record's own end for the preset that stands (Back has none, a command's overlay is not ours to re-time)
-    const showUntil = !!(ov && ov.preset);
+    // no overlay = the standing default holds until he switches it: "I switch it" is what the record says then, never a page state
+    const showUntil = !ov || !!ov.preset;
     prUntilLab.hidden = !showUntil; prUntilBtns._seg.hidden = !showUntil;
-    const timer = showUntil && ov.until && ov.until.kind === "timer";
-    pressed(prUntilBtns, showUntil ? (timer ? "timer" : "input") : "");
+    const timer = !!(ov && ov.preset && ov.until && ov.until.kind === "timer");
+    pressed(prUntilBtns, !showUntil ? "" : !ov ? "switch" : timer ? "timer" : "input");
     prForRow.hidden = !timer;
     if (!timer) prForOpen = false;
     const mins = timer ? Math.round((Number(ov.until.at) - Number(ov.ts)) / 60) : 0;
@@ -1099,10 +1100,20 @@
     if (!sel) { sheetSay("A command set this for a while. Tap a preset to change its options."); return Promise.resolve(false); }
     return writePresence(Object.assign({ customize: sel }, partial));
   }
+  // "I switch it": the preset's own options become the standing default and the overlay clears (the direct write with until
+  // "switch", which the server already takes); nothing is added to the record's shape. Back's options ARE the standing default, so it is a no-op there.
+  function setStanding() {
+    const sel = selected();
+    const own = sel && prCur && prCur.presets && prCur.presets[sel];
+    if (!sel || sel === "back" || !own || !(prCur.overlay && prCur.overlay.preset)) return Promise.resolve(true);
+    const o = own.options;
+    return writePresence({ devices: o.devices, follow_after: o.follow_after, lets_through: o.lets_through, until: "switch" });
+  }
   // a tap on Until re-activates the standing preset with that ending; the type is remembered, the time is not
   function setEnding(kind, dur) {
     const sel = selected();
-    if (!sel || sel === "back") return Promise.resolve(false);
+    if (!sel) return Promise.resolve(false);
+    if (sel === "back") { sheetSay("Back has no ending: it is your standing default, until you switch it."); return Promise.resolve(false); }
     const ov = prCur && prCur.overlay;
     const own = prCur && prCur.presets && prCur.presets[sel];
     // already how it ends AND already what the preset remembers: nothing to write
