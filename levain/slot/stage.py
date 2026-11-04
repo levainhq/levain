@@ -16,7 +16,9 @@ Wire from the reader to root, over the pipe: ``R`` + 1-byte length + refusal nam
 ``accepted_size`` + exactly that many bytes + one trailer byte, ``E`` (EOF where it should be) or ``X`` (an extra
 byte). A pipe EOF before the trailer is an early EOF.
 
-:func:`make_bundle` is the supervisor's side (§5.4 1): the bundle the reader later copies.
+:func:`make_bundle` is the supervisor's side (§5.4 1): the bundle the reader later copies. The staged names are
+``repo.bundle``, ``driver_input.json`` and ``brief.md`` (the agent's task text, p71 S8; :func:`write_brief` is its
+supervisor side, :func:`stage_brief` root's copy).
 """
 from __future__ import annotations
 
@@ -49,14 +51,16 @@ HEADER_LEN = 16
 CHUNK = 64 * 1024
 POLL_SLICE_S = 1.0                  # DECISION: how often root re-reads the clock while the reader is silent
 
+BRIEF_CAP = 256 * 1024             # c7.15 V33 [judged, 11-04, against V25: a brief plus a P4 recall pack]
 BUNDLE_NAME = "repo.bundle"
 DRIVER_INPUT_NAME = "driver_input.json"
+BRIEF_NAME = "brief.md"
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}", re.ASCII)
 _NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}", re.ASCII)
 #: The names the reader may send back; anything else from the pipe is ``staging-reader-failed``.
 _READER_REFUSALS = frozenset({"staging-missing", "staging-not-regular", "staging-open-failed",
-                              "staging-raced", "bundle-cap", "driver-input-mismatch"})
+                              "staging-raced", "bundle-cap", "driver-input-mismatch", "brief-cap"})
 
 _O_READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 _O_DIR = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
@@ -428,6 +432,84 @@ def stage_driver_input(staging: int | str | os.PathLike[str], dest_dir: int | st
                       cap_refusal="driver-input-mismatch", validate=parse_driver_input, **seams)
 
 
+# --- the agent's brief (p71 S8 D2, D3) ---------------------------------------------------------------------------
+
+def brief_bytes(text: str) -> bytes:
+    """The exact bytes of a brief: strict UTF-8, no normalisation, no BOM, no newline added. A lone surrogate
+    is ``brief-invalid``."""
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise Refused("brief-invalid", "utf-8") from None
+
+
+def brief_digest(data: bytes) -> str:
+    """``sha256:<hex>`` over the exact brief bytes (the ticket's ``brief_digest``)."""
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def validate_brief(data: bytes) -> None:
+    """Refuses ``brief-invalid``, in this order: empty, a NUL byte, not strict UTF-8. Nothing else."""
+    if len(data) == 0:
+        raise Refused("brief-invalid", "empty")
+    if b"\x00" in data:
+        raise Refused("brief-invalid", "NUL")
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("brief-invalid", "utf-8") from None
+
+
+def stage_brief(staging: int | str | os.PathLike[str], dest_dir: int | str | os.PathLike[str], *,
+                staging_uid: int, staging_gid: int, dest_gid: int, brief_digest: str | None,
+                **seams) -> StageResult:
+    """``L/staging/<session>/brief.md`` -> ``<S>/in/brief.md``: ``BRIEF_CAP``, no header, the ticket's
+    ``brief_digest`` (``brief-mismatch``, checked before the content), then :func:`validate_brief`. Root :
+    ``dest_gid`` 0440."""
+    if brief_digest is None:
+        raise Refused("brief-mismatch", "no digest")
+    return stage_copy(staging, BRIEF_NAME, BRIEF_CAP, False, brief_digest, dest_dir=dest_dir, dest_name=BRIEF_NAME,
+                      staging_uid=staging_uid, staging_gid=staging_gid, dest_gid=dest_gid, mode=0o440,
+                      digest_refusal="brief-mismatch", cap_refusal="brief-cap", validate=validate_brief, **seams)
+
+
+def write_brief(staging_dir: int | str | os.PathLike[str], text: str) -> str:
+    """The lease peer's side (like :func:`make_bundle`): writes the brief to ``staging_dir/brief.md``, a fresh
+    file (``O_EXCL|O_NOFOLLOW``, 0600), every byte, fsynced with its directory; returns its digest. An invalid
+    brief is never written; an existing name is ``staging-dest-exists`` and is not touched."""
+    data = brief_bytes(text)
+    validate_brief(data)
+    dfd = staging_dir if isinstance(staging_dir, int) else os.open(os.fspath(staging_dir), _O_DIR)
+    try:
+        try:
+            fd = os.open(BRIEF_NAME, _O_DEST, 0o600, dir_fd=dfd)
+        except FileExistsError:
+            raise Refused("staging-dest-exists", BRIEF_NAME) from None
+        except OSError as e:   # O_NOFOLLOW|O_EXCL on a dangling symlink is EEXIST above; ELOOP otherwise
+            if e.errno in (errno.ELOOP, errno.EMLINK):
+                raise Refused("staging-dest-exists", BRIEF_NAME) from None
+            raise
+        try:
+            write_all(fd, data)
+            os.fsync(fd)
+        except BaseException:
+            os.close(fd)
+            fd = -1
+            try:
+                os.unlink(BRIEF_NAME, dir_fd=dfd)
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        os.fsync(dfd)
+    finally:
+        if not isinstance(staging_dir, int):
+            os.close(dfd)
+    return brief_digest(data)
+
+
 # --- the supervisor's side: the bundle (§5.4 1) ----------------------------------------------------------------------
 
 _GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
@@ -497,7 +579,8 @@ def make_bundle(repo: str | os.PathLike[str], branch: str, out: str | os.PathLik
 
 
 __all__ = [
-    "BUNDLE_CAP", "STAGE_DEADLINE_S", "DRIVER_INPUT_CAP", "BUNDLE_HEADERS", "StageResult", "Reader", "RunAs",
+    "BUNDLE_CAP", "STAGE_DEADLINE_S", "DRIVER_INPUT_CAP", "BRIEF_CAP", "BRIEF_NAME", "brief_bytes",
+    "brief_digest", "validate_brief", "stage_brief", "write_brief", "BUNDLE_HEADERS", "StageResult", "Reader", "RunAs",
     "drop_to_lease_peer", "fork_run_as", "thread_run_as", "reader", "stage_copy", "stage_bundle",
     "stage_driver_input", "make_bundle",
 ]
