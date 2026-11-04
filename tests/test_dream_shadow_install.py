@@ -637,7 +637,7 @@ def test_live_facts_never_run_under_a_shadow_spec(env, flow, tmp_path):
 
 @pytest.mark.parametrize("where", ["coord-live", "coord-flow", "agent-live", "agent-flow"])
 def test_a_card_queue_or_agent_store_inside_a_protected_root_is_refused(env, flow, tmp_path, where):
-    # reproduced on d300015b: each of these wrote the facts file (the card queue and agent store were never judged)
+    # reproduced on d300015b for coord-live: the facts were written (the card queue and agent store were never judged)
     live = tmp_path / "home" / ".anneal-memory"
     target = {"coord-live": live / "q", "coord-flow": flow.root / "q", "agent-live": live / "ag",
               "agent-flow": flow.root / "ag"}[where]
@@ -669,7 +669,7 @@ def test_a_hand_written_card_queue_in_the_live_store_is_refused_at_read_and_fire
 
 def test_a_scratch_dir_swapped_for_a_symlink_after_the_check_is_refused_under_the_lock(env, flow, tmp_path,
                                                                                        monkeypatch):
-    # reproduced on d300015b: the hook seeded through the symlink, writing lock, marker and db into the live store
+    # reproduced on d300015b: the hook seeded through the symlink, writing files into the live store directory
     _shadow(env, flow)                                     # scratch absent: the install's checks pass
     row = _row(env)
     live = tmp_path / "home" / ".anneal-memory" / "x"
@@ -702,8 +702,9 @@ def test_a_scratch_dir_holding_a_symlink_is_refused_under_the_lock(env, flow, tm
 # -------------------------------------------- L3 r1 #4: the sha on the card is the sha of the bytes the compose was given
 
 def test_the_card_sha_is_the_composes_bytes_even_after_a_re_enable_and_a_replay(env, flow, monkeypatch):
-    # reproduced on d300015b: the card read the sha from a dict filled only by this process's compose, so a replayed
-    # card said "not recorded", and a re-enable between stamp and compose moved the file the compose read
+    # reproduced on d300015b: the card read the sha from a dict filled only by this process's compose, so a card built
+    # by a fresh closure (a replay) said "not recorded". The replacement of the agent store's copy mid-compose stands
+    # for an enable (write_install takes no night lock): the card still names the bytes the compose was given.
     inst = _seeded(env, flow)
     occ = env["scratch"] / "dream" / "oc-r"
     composed_with = {}
