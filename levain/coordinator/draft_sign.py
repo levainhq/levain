@@ -1,26 +1,36 @@
-"""levain.coordinator.draft_sign: H1-3, the sign flow of a draft envelope on the phone port and the cockpit sheet.
+"""levain.coordinator.draft_sign: H1-3, the sign flow of a draft envelope, as CoordPhone actions the cockpit carries.
 
-The journey from a lapsed or revoked head to a signed successor, each step one :meth:`CoordPhone.step` action (so the
-phone port and the cockpit's ``/cockpit/coord/<action>`` carry it by name, behind the gate the envelope drop already
-has). Nothing here is a new signer or a new credential path: the passkey ceremony, the SSHSIG conversion, the authority
+The journey from a lapsed or revoked head to a signed successor, each step one :meth:`CoordPhone.step` action, written
+for the cockpit's ``/cockpit/coord/<action>`` (``CoordSheet`` in ``levain/web_server.py``), which carries it by name
+behind the gate the envelope drop already has. The phone port's own ``/coord/`` routes were retired in W1b slice C, so
+the doors that carry these actions are the ones that build a ``CoordPhone``: ``git grep -n "CoordPhone(" -- levain``.
+Nothing here is a new signer or a new credential path: the passkey ceremony, the SSHSIG conversion, the authority
 read and the store's own verification are the ones ``envelope-review`` / ``envelope-challenge`` / ``drop`` use.
 
 - ``draft-cards`` {thread_id, store_id}: the card the thread shows now (LAPSED / REVOKED / ENVELOPE, or none). Reads.
 - ``draft-rule`` {thread_id, store_id, rule, head[, prefill]}: ``rule`` is ``renew`` (the LAPSED card's *extend*) or
   ``replace`` (the REVOKED card's *replace*); ``head`` is the envelope id the card showed. The rule writes an UNSIGNED
   draft (it grants nothing) from the head state read now, and a head that is not the one the card showed is refused.
-- ``draft-withdraw`` {draft_id, revision, store_id}: the card's *withdraw*.
+- ``draft-withdraw`` {draft_id, revision, store_id}: the card's *withdraw*, of exactly ``revision``: the store compares
+  it under the same write lock as the withdrawal, so a revision that landed after the card was read is refused.
 - ``draft-review`` {draft_id, revision, digest, signer_fp, store_id}: runs the builder (``draft_sign_bytes``) and answers
-  the diffs IT returns; the sign control renders these, never a cached card's. KEEPS the request under a review id.
+  the diffs IT returns; the sign control renders these, never a cached card's. KEEPS the request and the diffs it
+  answered under a review id.
 - ``draft-challenge`` {review_id}: Sign tapped. Runs the builder again with ``signed_at`` now, so a draft that went stale
-  while the sheet was read is refused before any byte is built; answers the payload and the WebAuthn challenge.
+  while the sheet was read is refused before any byte is built, and so are diffs that are no longer the ones the review
+  answered (the head's key revoked or the head narrowed since): the page reviews again. Answers the payload and the
+  WebAuthn challenge.
 - ``draft-accept`` {review_id, body_text, payload, authenticator_data, client_data_json, signature}: the assertion
   turned into an SSHSIG and handed to :meth:`EnvelopeStore.accept_envelope`, which re-derives the body from the stored
   revision and re-checks everything under its lock. The body and payload must be the ones the challenge minted for this
-  review, and a review is used once.
+  review, and a review is spent by the store's answer (a definitive refusal spends it too; a fault on this machine
+  keeps it for the retry). Once the envelope is stored, a fault reading the cards that follow answers the envelope with
+  ``cards: None`` and a ``cards_note``, never a refusal.
 
-A kept review is held by the phone object (``CoordPhone._draft_reviews``), bound to the device that made it, and expires
-with :data:`levain.coordinator.phone.REVIEW_TTL`. No kept state is trusted past the store: the acceptance never reads it.
+A kept review is held by the phone object (``CoordPhone._draft_reviews``), bound to the ``device`` the door passes, and
+expires with :data:`levain.coordinator.phone.REVIEW_TTL`. The cockpit passes one constant device for every page, so the
+binding separates devices only on a door that resolves a paired device per request. No kept state is trusted past the
+store: the acceptance never reads it.
 """
 from __future__ import annotations
 
@@ -114,6 +124,23 @@ def _cards(store: Any, thread_id: str) -> list[dict[str, Any]]:
                                               queue_dir=store.directory)]
 
 
+def _cards_after(store: Any, thread_id: str) -> dict[str, Any]:
+    """The cards for a reply to a write that has COMMITTED. Reading them makes another verifier call; whatever it
+    raises, the write stands, so the reply says what was written and asks for the cards again rather than becoming a
+    refusal that claims nothing changed."""
+    try:
+        return {"cards": _cards(store, thread_id)}
+    except Exception as exc:  # noqa: BLE001  (any fault here is after the commit; the reply must still report it)
+        return {"cards": None, "cards_note": f"the cards could not be read just now ({type(exc).__name__}): "
+                                              "read the cards again"}
+
+
+def _against(against: Any) -> dict[str, Any]:
+    return {"base_kind": against.base_kind, "reason": against.reason, "diff": against.diff,
+            "members_added": against.members_added, "members_removed": against.members_removed,
+            "wider": against.wider}
+
+
 def handle(phone: Any, action: str, req: dict[str, Any], device: str) -> dict[str, Any]:
     from levain.coordinator.phone import CoordRefused
 
@@ -154,22 +181,46 @@ def _rule(phone: Any, req: dict[str, Any]) -> dict[str, Any]:
     else:
         d = drafts.replace_rule(store, req["thread_id"], hs, prefill=req.get("prefill", True), by="operator")
     return {"draft": {"draft_id": d.draft_id, "revision": d.revision, "digest": d.digest, "thread_id": d.thread_id},
-            "cards": _cards(store, req["thread_id"]), "store_id": store.store_id()}
+            **_cards_after(store, req["thread_id"]), "store_id": store.store_id()}
 
 
 def _withdraw(phone: Any, req: dict[str, Any]) -> dict[str, Any]:
     from levain.coordinator import envelope_drafts as drafts
+    from levain.coordinator.phone import CoordRefused
+    from levain.coordinator.store import CoordError
 
     _text(req, "draft_id")
+    if type(req["revision"]) is not int:
+        raise CoordRefused(400, "bad_request", "revision is an integer")
     store = _store(phone, req["store_id"])
+    try:
+        revision = drafts.withdraw(store, req["draft_id"], by="operator", expect_revision=req["revision"])
+    except drafts.DraftStale:
+        raise
+    except CoordError as exc:
+        raise drafts.DraftStale(_not_withdrawn(store, req["draft_id"], exc)) from None
     newest = drafts.latest(store, req["draft_id"])
-    if newest is None:
-        raise drafts.DraftStale(f"there is no draft {req['draft_id']}")
-    if newest.revision != req["revision"]:
-        raise drafts.DraftStale(f"draft {req['draft_id']} moved on to revision {newest.revision}; read the card again")
-    revision = drafts.withdraw(store, req["draft_id"], by="operator")
-    return {"withdrawn": {"draft_id": req["draft_id"], "revision": revision},
-            "cards": _cards(store, newest.thread_id), "store_id": store.store_id()}
+    out: dict[str, Any] = {"withdrawn": {"draft_id": req["draft_id"], "revision": revision}}
+    if newest is not None:
+        out.update(_cards_after(store, newest.thread_id))
+    return {**out, "store_id": store.store_id()}
+
+
+def _not_withdrawn(store: Any, draft_id: str, exc: Exception) -> str:
+    """The words for a withdrawal the store refused: what the series is (signed, withdrawn, absent), never the table's
+    own refusal text. Signed and withdrawn are terminal, so reading them after the refusal names what refused it."""
+    from levain.coordinator import envelope_drafts as drafts
+    from levain.coordinator.store import CoordError
+
+    try:
+        st = drafts.state_of(store, draft_id)
+    except CoordError:
+        return f"there is no draft {draft_id}"
+    if st.kind == "signed":
+        return f"draft {draft_id} is already signed (envelope {st.reason}); there is nothing to withdraw"
+    if st.kind == "withdrawn":
+        return f"draft {draft_id} is already withdrawn"
+    raise exc
 
 
 def _review(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
@@ -185,6 +236,7 @@ def _review(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
             "signer_fp": key.fingerprint, "store_id": store.store_id(), "until": now + REVIEW_TTL, "minted": None}
     # the builder IS the check: it raises DraftStale before any verifier call or byte when the draft is not signable
     body_text, _payload, since, against = _built(phone, store, kept, key, now)
+    kept["against"] = _against(against)
     review_id = "dv-" + secrets.token_hex(16)
     with phone._lock:
         for rid in [r for r, v in phone._draft_reviews.items() if v["until"] <= now]:
@@ -193,10 +245,7 @@ def _review(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
             del phone._draft_reviews[next(iter(phone._draft_reviews))]
         phone._draft_reviews[review_id] = kept
     return {"review_id": review_id, "body_text": body_text, "rp_id": phone.rp_id, "since_parent": since,
-            "against": {"base_kind": against.base_kind, "reason": against.reason, "diff": against.diff,
-                        "members_added": against.members_added, "members_removed": against.members_removed,
-                        "wider": against.wider},
-            "view": _view_lines(against), "store_id": kept["store_id"]}
+            "against": kept["against"], "view": _view_lines(against), "store_id": kept["store_id"]}
 
 
 def _kept(phone: Any, review_id: Any, device: str) -> dict[str, Any]:
@@ -216,6 +265,7 @@ def _kept(phone: Any, review_id: Any, device: str) -> dict[str, Any]:
 def _challenge(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
     from levain.consent.passkey import challenge
     from levain.coordinator import envelope as env
+    from levain.coordinator import envelope_drafts as drafts
     from levain.coordinator.phone import _b64u
 
     _text(req, "review_id")
@@ -224,7 +274,12 @@ def _challenge(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
     store = _store(phone, kept["store_id"])          # the store the review read, never one a later request names
     now = phone._clock()
     # again, with signed_at now: a long read of the sheet is never a stale signature, and a draft that moved is refused
-    body_text, payload, _since, _against = _built(phone, store, kept, key, now)
+    body_text, payload, _since, against = _built(phone, store, kept, key, now)
+    if _against(against) != kept["against"]:
+        # the sheet said what this signature grants against the head (as narrowed, or every value new); a head whose
+        # key was revoked or that was narrowed since makes those words untrue for the same bytes, so no challenge
+        raise drafts.DraftStale("what this signature grants against the head is no longer what the sheet showed (its "
+                                "key was revoked, or it was narrowed or ended, since the review): review it again")
     kept["minted"] = {"body_text": body_text, "payload": payload}
     return {"payload": payload, "rp_id": phone.rp_id,
             "challenge": _b64u(challenge(env.sign_message(payload), namespace=env.SIGN_NAMESPACE)),
@@ -243,9 +298,7 @@ def _accept(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
     if req["body_text"] != minted["body_text"] or req["payload"] != minted["payload"]:
         raise CoordRefused(422, "refused", "the body or payload is not the one this review's challenge was minted for: "
                                            "nothing was signed")
-    key = phone._key(kept["signer_fp"])
-    if not isinstance(req["payload"], dict) or req["payload"].get("signer_fp") != key.fingerprint:
-        raise CoordRefused(422, "refused", "the payload names another signer than this review's")
+    key = phone._key(kept["signer_fp"])          # the payload is the minted one, so it already names this signer
     store = _store(phone, kept["store_id"])
     signature = to_sshsig(key.public_key, b64url_decode(req["authenticator_data"], "authenticator_data"),
                           b64url_decode(req["client_data_json"], "client_data_json"),
@@ -268,9 +321,9 @@ def _accept(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
         phone._draft_reviews.pop(req["review_id"], None)
     return {"created": created, "envelope": {"envelope_id": stored.envelope_id, "signer_fp": stored.signer_fp,
                                               "signer_class": stored.signer_class},
-            "cards": _cards(store, kept_thread(store, stored)), "store_id": store.store_id()}
+            **_cards_after(store, _bound_thread(stored)), "store_id": store.store_id()}
 
 
-def kept_thread(store: Any, stored: Any) -> str:
+def _bound_thread(stored: Any) -> str:
     """The thread a draft envelope was bound to (a drafted body binds exactly one)."""
     return stored.body["binds"][0]["thread_id"]

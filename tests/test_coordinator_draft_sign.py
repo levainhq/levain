@@ -76,10 +76,32 @@ class Rig:
     def challenge(self, r: dict, device: str = DEV):
         return self.call("draft-challenge", device, review_id=r["review_id"])
 
-    def sign(self, r: dict, device: str = DEV, **assert_kw):
+    def sign(self, r: dict, device: str = DEV, passkey=None, **assert_kw):
         c = self.challenge(r, device)
-        a = self.world["phone"].assertion(c["challenge"], **assert_kw)
+        a = (passkey or self.world["phone"]).assertion(c["challenge"], **assert_kw)
         return c, {"review_id": r["review_id"], "body_text": r["body_text"], "payload": c["payload"], **a}
+
+    def link(self, op: dict) -> None:
+        """One authority-log link the laptop key signs (an enrol or a revoke), as the operator's own laptop would."""
+        import sqlite3
+
+        from tests._phone_fixtures import _enrol
+
+        root = self.world["root"]
+        conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
+        try:
+            _enrol(conn, root, root.parent / "laptop", self.world["laptop_fp"], op)
+        finally:
+            conn.close()
+
+    def second_passkey(self):
+        """Another display-phone passkey enrolled in the log, so the head's key can be revoked while a signer remains."""
+        from tests.test_dispatch_phone import SoftPasskey
+
+        p = SoftPasskey()
+        self.link({"op": "enrol", "fingerprint": p.fp, "public_key": p.line, "class": "display-phone",
+                   "custody": "passkey"})
+        return p
 
     def accept(self, req: dict, device: str = DEV):
         return self.call("draft-accept", device, **req)
@@ -124,11 +146,15 @@ def test_an_unsigned_accept_stores_nothing(rig):
     with pytest.raises(CoordRefused) as exc:
         rig.accept({"review_id": r["review_id"], "body_text": r["body_text"], "payload": c["payload"]})
     assert exc.value.status == 400
-    # an assertion that is not the passkey's answer to THIS challenge (another challenge's, so wrong bytes)
-    other = rig.world["phone"].assertion(c["challenge"][:-2] + "AA")
+    # an assertion that is not the passkey's answer to THIS challenge: a well-formed answer to other bytes
+    from levain.coordinator.phone import _b64u
+
+    wrong = _b64u(b"\x00" * 32)
+    assert wrong != c["challenge"]
+    other = rig.world["phone"].assertion(wrong)
     with pytest.raises(CoordRefused) as exc:
         rig.accept({"review_id": r["review_id"], "body_text": r["body_text"], "payload": c["payload"], **other})
-    assert exc.value.status in (422, 503)
+    assert exc.value.status == 422
     assert rig.envelopes() == before
 
 
@@ -187,7 +213,198 @@ def test_a_head_narrowed_after_render_is_refused(rig):
     with pytest.raises(CoordRefused) as exc:
         rig.accept(req)
     assert refused(exc) == (409, "draft_stale")
+    # a definitive refusal spends the review: the same request again is not retried against the store
+    with pytest.raises(CoordRefused) as exc:
+        rig.accept(req)
+    assert refused(exc) == (409, "review_gone")
     assert rig.envelopes() == before
+
+
+def test_a_head_key_revoked_between_review_and_sign_is_refused_at_the_challenge(rig):
+    # F1: the review showed "against the head as narrowed"; the head's key revoked before Sign makes every value a new
+    # grant, so the bytes the challenge would mint are not the ones the sheet described
+    p2 = rig.second_passkey()
+    d = rig.extend()
+    r = rig.review(d, signer_fp=p2.fp)
+    assert r["against"]["base_kind"] == "effective"
+    rig.link({"op": "revoke_key", "fingerprint": rig.world["phone"].fp})          # the head's signing key
+    before = rig.envelopes()
+    with pytest.raises(CoordRefused) as exc:
+        rig.challenge(r)
+    assert refused(exc) == (409, "draft_stale")
+    assert "review it again" in exc.value.message
+    assert rig.envelopes() == before
+    # a fresh review shows the head as it is now, and that one signs
+    r2 = rig.review(d, signer_fp=p2.fp)
+    assert r2["against"]["base_kind"] == "revoked" and r2["against"]["wider"] is True
+    _c, req = rig.sign(r2, passkey=p2)
+    assert rig.accept(req)["created"] is True
+
+
+def test_a_withdraw_that_meets_a_newer_revision_under_the_lock_withdraws_nothing(rig, monkeypatch):
+    # F2: the revision lands between the page's read and the withdrawal's write; the write must refuse, not withdraw N+1
+    from levain.coordinator import envelope_drafts as drafts
+
+    d = rig.extend()
+    real = drafts.withdraw
+
+    def landing_first(store, draft_id, **kw):
+        moved = rig.call("draft-rule", thread_id=rig.tid, rule="renew", head=rig.head)["draft"]
+        assert moved["revision"] == d["revision"] + 1
+        return real(store, draft_id, **kw)
+
+    monkeypatch.setattr(drafts, "withdraw", landing_first)
+    with pytest.raises(CoordRefused) as exc:
+        rig.call("draft-withdraw", draft_id=d["draft_id"], revision=d["revision"])
+    assert refused(exc) == (409, "draft_stale")
+    assert rig.rows("SELECT revision FROM envelope_draft_withdrawals") == []
+
+
+def test_a_withdraw_revision_must_be_an_integer(rig):
+    # F5: True and 1.0 compare equal to 1 and must not stand for it
+    d = rig.extend()
+    for bad in (True, 1.0, "1"):
+        with pytest.raises(CoordRefused) as exc:
+            rig.call("draft-withdraw", draft_id=d["draft_id"], revision=bad)
+        assert refused(exc) == (400, "bad_request"), bad
+    assert rig.rows("SELECT revision FROM envelope_draft_withdrawals") == []
+
+
+def test_withdraw_of_a_signed_or_withdrawn_series_says_so_in_words(rig):
+    # F9: the table's trigger refuses it; the operator reads what happened, not the trigger's text
+    d = rig.extend()
+    r = rig.review(d)
+    _c, req = rig.sign(r)
+    assert rig.accept(req)["created"] is True
+    with pytest.raises(CoordRefused) as exc:
+        rig.call("draft-withdraw", draft_id=d["draft_id"], revision=d["revision"])
+    assert refused(exc) == (409, "draft_stale")
+    assert "already signed" in exc.value.message and "unsigned draft" not in exc.value.message
+    with pytest.raises(CoordRefused) as exc:
+        rig.call("draft-withdraw", draft_id="dr-" + "0" * 32, revision=1)
+    assert refused(exc) == (409, "draft_stale")
+
+
+def test_a_second_withdraw_tap_says_the_series_is_withdrawn(rig):
+    d = rig.extend()
+    assert rig.call("draft-withdraw", draft_id=d["draft_id"], revision=d["revision"])["withdrawn"]
+    with pytest.raises(CoordRefused) as exc:
+        rig.call("draft-withdraw", draft_id=d["draft_id"], revision=d["revision"])
+    assert refused(exc) == (409, "draft_stale")
+    assert "already withdrawn" in exc.value.message and "never replaced" not in exc.value.message
+
+
+def test_a_cards_fault_after_the_envelope_is_stored_answers_the_envelope(rig, monkeypatch):
+    # F3: the acceptance committed; a verifier that cannot run for the cards that follow must not read as unsigned
+    from levain.authority import VerifierUnavailable
+    from levain.coordinator import draft_sign
+
+    d = rig.extend()
+    r = rig.review(d)
+    _c, req = rig.sign(r)
+    before = rig.envelopes()
+
+    def down(*_a, **_k):
+        raise VerifierUnavailable("ssh-keygen is not answering")
+
+    monkeypatch.setattr(draft_sign, "_cards", down)
+    got = rig.accept(req)
+    assert got["created"] is True and got["cards"] is None and "read the cards again" in got["cards_note"]
+    assert got["envelope"]["envelope_id"] in rig.envelopes() and len(rig.envelopes()) == len(before) + 1
+    monkeypatch.undo()
+    with pytest.raises(CoordRefused) as exc:               # the review was spent by the acceptance
+        rig.accept(req)
+    assert refused(exc) == (409, "review_gone")
+
+
+def test_a_machine_fault_at_accept_keeps_the_review_for_the_retry(rig, monkeypatch):
+    # F9: the spend/keep split: a verifier that cannot run is not a verdict, so the same request may be sent again
+    from levain.authority import VerifierUnavailable
+
+    d = rig.extend()
+    r = rig.review(d)
+    _c, req = rig.sign(r)
+    before = rig.envelopes()
+    real = EnvelopeStore.accept_envelope
+
+    def down(self, *a, **k):
+        raise VerifierUnavailable("ssh-keygen is not answering")
+
+    monkeypatch.setattr(EnvelopeStore, "accept_envelope", down)
+    with pytest.raises(CoordRefused) as exc:
+        rig.accept(req)
+    assert exc.value.status == 503
+    assert rig.envelopes() == before
+    monkeypatch.setattr(EnvelopeStore, "accept_envelope", real)
+    assert rig.accept(req)["created"] is True
+
+
+def test_two_signatures_over_one_review_store_one_envelope(rig, monkeypatch):
+    # F7: two accepts on one review that both pass the review check before either spends it (a second tab, a double
+    # tap): two DIFFERENT passkey signatures over the one payload. The store keeps one; the other is refused.
+    d = rig.extend()
+    r = rig.review(d)
+    c, req1 = rig.sign(r)
+    req2 = {**req1, **rig.world["phone"].assertion(c["challenge"])}
+    assert req2["signature"] != req1["signature"]
+    before = rig.envelopes()
+    real = EnvelopeStore.accept_envelope
+    second: dict = {}
+
+    def racing(self, *a, **k):
+        out = real(self, *a, **k)
+        if not second:
+            second["seen"] = True
+            try:
+                second["got"] = rig.accept(req2)
+            except CoordRefused as exc:
+                second["refused"] = (exc.status, exc.error)
+        return out
+
+    monkeypatch.setattr(EnvelopeStore, "accept_envelope", racing)
+    got = rig.accept(req1)
+    assert got["created"] is True
+    assert "got" not in second and second["refused"][0] == 409, second
+    assert len(rig.envelopes()) == len(before) + 1
+
+
+def test_a_review_expires_with_the_ttl(rig):
+    from levain.coordinator.phone import REVIEW_TTL
+
+    d = rig.extend()
+    r = rig.review(d)
+    rig.clock.t += REVIEW_TTL
+    with pytest.raises(CoordRefused) as exc:
+        rig.challenge(r)
+    assert refused(exc) == (409, "review_gone")
+
+
+def test_a_double_sign_tap_mints_a_second_challenge_and_only_the_latest_signs(rig):
+    d = rig.extend()
+    r = rig.review(d)
+    rig.clock.t += timedelta(seconds=2)
+    c1, req1 = rig.sign(r)
+    rig.clock.t += timedelta(seconds=2)             # a second tap: signed_at moves, so the payload is another one
+    c2, req2 = rig.sign(r)
+    assert c1["payload"] != c2["payload"]
+    before = rig.envelopes()
+    with pytest.raises(CoordRefused) as exc:
+        rig.accept(req1)
+    assert refused(exc) == (422, "refused")
+    assert rig.envelopes() == before
+    assert rig.accept(req2)["created"] is True
+
+
+def test_the_oldest_review_is_dropped_past_reviews_kept(rig, monkeypatch):
+    from levain.coordinator import phone as phone_mod
+
+    monkeypatch.setattr(phone_mod, "REVIEWS_KEPT", 2)
+    d = rig.extend()
+    first, second, third = rig.review(d), rig.review(d), rig.review(d)
+    with pytest.raises(CoordRefused) as exc:
+        rig.challenge(first)
+    assert refused(exc) == (409, "review_gone")
+    assert rig.challenge(second)["payload"] and rig.challenge(third)["payload"]
 
 
 def test_a_rule_over_a_head_the_card_did_not_show_is_refused_and_writes_no_draft(rig):
