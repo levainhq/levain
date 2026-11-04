@@ -68,9 +68,11 @@ _RULES: tuple[tuple[str, re.Pattern[bytes]], ...] = tuple((n, re.compile(p)) for
 #: (``[A-Za-z0-9_.-]``, at most 256), which may be quoted. A name is secret when it holds a secret word. ONE NAMED
 #: EXEMPTION (head-ruled): the plural ``tokens`` as its last word (``tokens``, ``input_tokens``, ``max-tokens``) is a
 #: usage counter, not a secret, so ``AUTH_TOKENS=...`` holding a real credential list is NOT a finding; the past-64
-#: check ignores this exemption (accepted). EVERY separator follows one rule: the name must start the line or follow
-#: a ``,`` / ``{`` / whitespace boundary, and its VALUE is the rest of the line, never cut at a quote, bracket or
-#: delimiter (a cut is how rounds 1-5 kept letting a credential through). Fail closed, no exemptions: a reference, a
+#: check ignores this exemption (accepted). EVERY separator follows one rule: the name is that run whatever byte
+#: precedes it (``(password=``, ``?token=``, ``a=password=`` all count), and its VALUE is the rest of the line, never
+#: cut at a quote, bracket or delimiter (a cut, or a rule about what may precede a name, is how rounds 1-5 kept
+#: letting a credential through). A name the separator does not directly follow (``x["password"] = ...``) is not
+#: seen (open, routed to the head). Fail closed, no exemptions: a reference, a
 #: placeholder, a line of code or prose under a secret name is a finding like any other, and so is a value that is
 #: only a YAML block indicator or that ends in a ``\`` continuation, whose secret lies on lines this rule does not
 #: read. The role withholds the path.
@@ -78,7 +80,6 @@ _SECRET_NAME = re.compile(rb"SECRET|TOKEN|PASSWORD|PASSWD|API[_.-]?KEY|PRIVATE[_
 _PLURAL_TOKENS = (b"_TOKENS", b"-TOKENS", b".TOKENS")
 _SEPARATOR = re.compile(rb"[=:]")
 _SEPARATOR_MAX = 64
-_BOUNDARY = frozenset(b",{ \t\r\f\v")
 _NAME_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
 _NAME_MAX = 256
 _BLOCK_INDICATOR = re.compile(rb"[|>][-+0-9]{0,2}")
@@ -103,15 +104,11 @@ def _trailing_name(p: bytes) -> tuple[bytes, bytes] | None:
     return name, rest
 
 
-def _key_name(segment: bytes, at_line_start: bool) -> bytes | None:
-    """The name before a separator (``segment`` runs from the line start or the previous separator to it), or
-    ``None`` unless it starts the line or follows a ``,`` / ``{`` / whitespace boundary inside the segment."""
+def _key_name(segment: bytes) -> bytes | None:
+    """The name before a separator (``segment`` runs from the line start or the previous separator to it): its
+    maximal trailing run of name bytes, whatever byte precedes it, else ``None``."""
     got = _trailing_name(segment.rstrip())
-    if got is None:
-        return None
-    if not got[1]:
-        return got[0] if at_line_start else None
-    return got[0] if got[1][-1] in _BOUNDARY else None
+    return None if got is None else got[0]
 
 
 def _is_secret_name(name: bytes) -> bool:
@@ -145,7 +142,7 @@ def _secret_line(body: bytes, upper: bytes, start: int, end: int) -> bool:
     for k, sep in enumerate(_SEPARATOR.finditer(body, start, end)):
         if k == _SEPARATOR_MAX:
             return _SECRET_NAME.search(upper, prev.end(), end) is not None
-        name = _key_name(body[start if prev is None else prev.end():sep.start()], prev is None)
+        name = _key_name(body[start if prev is None else prev.end():sep.start()])
         if name is not None and _is_secret_name(name) and _secret_value(body[sep.end():end]):
             return True
         prev = sep

@@ -287,11 +287,10 @@ def test_secret_assignment_examines_every_key_and_accepts_any_prefix(text):
     "usage.tokens = abcdefghijklmnopq\n",
     "max-tokens: 1234567890123456\n",
     '{"input_tokens": 1, "output_tokens": 2, "cache_read_tokens": 300000000000000}\n',
-    # (1) later keys keep the short-value floor, and a later name needs a `,` `{` or whitespace boundary
+    # (1) later keys keep the short-value floor (the `&` boundary pin that sat here is deleted: round 6 refuses it)
     '{"user":"bob","password":"short"}\n',
     "{a: 1, token: short}\n",
     "export FOO=bar PASSWORD=short\n",
-    "url=http://h.example/?a=1&token=abcdefghijklmnop\n",   # `&` is not a boundary
 ])
 def test_secret_assignment_later_keys_and_plurals_are_precise(text):
     assert scan_blob(text.encode()) is None
@@ -308,7 +307,7 @@ def test_secret_assignment_later_keys_and_plurals_are_precise(text):
     "a=1 token=x and then some long trailing prose words\n",
     'rows = _get(url, token="T")["rows"]\n',
     'done = store.set_state(tid, by="coordinator", token=_lease(store))\n',
-    # (2) the first key follows the same rule as a later one: a boundary, or the line start, before the name
+    # (2) the first key follows the same rule as a later one, whatever precedes its name
     "docker run -e PASSWORD=actual-secret-123456\n",
     "echo TOKEN=actual-secret-123456\n",
     "sudo API_KEY=actual-secret-123456\n",
@@ -316,6 +315,29 @@ def test_secret_assignment_later_keys_and_plurals_are_precise(text):
     "Enter your password: then press return to continue\n",
 ])
 def test_every_key_takes_the_rest_of_the_line_and_one_name_rule(text):
+    assert scan_blob(text.encode()) == "secret-assignment"
+
+
+@pytest.mark.parametrize("text", [
+    # (1) a list item with a quoted key, the leading `-` against the quote (refused before round 5, passed at round 5)
+    "-'password': actual-secret-123456\n",
+    "  -'password': actual-secret-123456\n",
+    '-"token": actual-secret-123456\n',
+    # (2) no rule about the byte before a name: a name is the maximal run of name bytes before the separator
+    'connect(password="actual-secret-123456")\n',
+    "https://h.example/?token=actual-secret-123456\n",
+    "url=http://h.example/?a=1&token=abcdefghijklmnop\n",
+    "x;password=actual-secret-123456\n",
+    "a=password=actual-secret-123456\n",
+    "a:password=actual-secret-123456\n",
+    "[api_key=actual-secret-123456]\n",
+    "cmd|token=actual-secret-123456\n",
+    # (3) a block indicator followed by a comment, as a later key, still fails closed
+    "token: | #x\n  actual-secret-123456\n",
+    "a: 1, token: | #x\n  actual-secret-123456\n",
+    "a: 1, password: >-  # note\n  actual-secret-123456\n",
+])
+def test_a_name_counts_whatever_byte_precedes_it(text):
     assert scan_blob(text.encode()) == "secret-assignment"
 
 
