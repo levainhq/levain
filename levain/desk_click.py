@@ -114,11 +114,6 @@ class DeskState:
         if flight is not None:
             flight[1].set()
 
-    def replace(self, txn: str, result: tuple[dict[str, Any], int]) -> None:
-        with self._guard:
-            if txn in self._done:
-                self._done[txn] = (self._done[txn][0], result)
-
     def finished(self, txn: str) -> tuple[dict[str, Any], int] | None:
         with self._guard:
             done = self._done.get(txn)
@@ -236,26 +231,23 @@ def _desk_answer(req: DeskRequest, host: DeskHost, state: DeskState, policy: str
     if first is not None:
         return first
     try:
-        result, done = _desk_answer_owned(req, host, state, policy, signer_factory, key_dir, notify, find_key, at,
-                                          nonce, subject, pick, text, txn, deliver is not None)
+        return _desk_answer_owned(req, host, state, policy, signer_factory, key_dir, notify, find_key, at,
+                                  nonce, subject, pick, text, txn, deliver)
     finally:
         state.end(txn, None)            # a result from the prompt on was remembered already; this frees the rest
-    return _deliver(state, txn, result, done, deliver)
 
 
-def _deliver(state: DeskState, txn: str, result: tuple[dict[str, Any], int], done: Any,
-             deliver: Callable[[Any], None] | None) -> tuple[dict[str, Any], int]:
-    """Start delivery for a recorded answer AFTER its result is remembered. A thread that cannot start leaves the
-    answer as recorded and says delivery was deferred (``levain question deliver`` retries it)."""
-    body, status = result
-    if status != 200 or done is None or body.get("delivery") != "started" or deliver is None:
-        return body, status
+def _delivery(deliver: Callable[[Any], None] | None, done: Any, answered: Any) -> str:
+    """The delivery status of a recorded answer, decided BEFORE its result is remembered (so a duplicate woken by
+    :meth:`DeskState.end` reads the final one): ``none`` with nothing to deliver, ``started`` when the delivery thread
+    started, ``deferred`` when it could not (the answer stays recorded; ``levain question deliver`` retries it)."""
+    if deliver is None or not answered:
+        return "none"
     try:
         _start_delivery(deliver, done)
     except Exception:  # noqa: BLE001 - the answer is recorded; only its delivery waits
-        body = {**body, "delivery": "deferred"}
-        state.replace(txn, (body, status))
-    return body, status
+        return "deferred"
+    return "started"
 
 
 def _start_delivery(deliver: Callable[[Any], None], done: Any) -> None:
@@ -265,11 +257,10 @@ def _start_delivery(deliver: Callable[[Any], None], done: Any) -> None:
 def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, policy: str, signer_factory: Any,
                        key_dir: Any, notify: Callable[[str], Any] | None, find_key: Callable[..., Any] | None, at: Any,
                        nonce: str | None, subject: dict[str, str], pick: str | None, text: str | None, txn: str,
-                       can_deliver: bool
-                       ) -> tuple[tuple[dict[str, Any], int], Any]:
-    """The click from the row re-read on, for the caller that owns ``client_txn``: its result and what was recorded
-    (None when nothing was). A result from the prompt on is remembered for replay BEFORE the sign lock is
-    released; a refusal before it is not kept, so the same request may be sent again."""
+                       deliver: Callable[[Any], None] | None) -> tuple[dict[str, Any], int]:
+    """The click from the row re-read on, for the caller that owns ``client_txn``: its result. A result from the prompt
+    on is remembered for replay BEFORE the sign lock is released, with its delivery status already final; a refusal
+    before it is not kept, so the same request may be sent again."""
     from levain import band_view
     from levain.cockpit.keys import KeyError_
     from levain.consent import terminal_sign as ts
@@ -277,12 +268,12 @@ def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, polic
     viewer = f"cockpit:{req.surface if isinstance(req.surface, str) and req.surface else 'web'}"
     surface = ts.desk_surface(req.surface)      # the signed identity; the viewer keeps the credential's own name
 
-    def finish(result: tuple[dict[str, Any], int], done: Any = None) -> tuple[tuple[dict[str, Any], int], Any]:
+    def finish(result: tuple[dict[str, Any], int]) -> tuple[dict[str, Any], int]:
         state.end(txn, result)          # remembered while the sign lock is still held
-        return result, done
+        return result
 
-    def refuse(*a: Any, **kw: Any) -> tuple[tuple[dict[str, Any], int], Any]:
-        return _refuse(*a, **kw), None
+    def refuse(*a: Any, **kw: Any) -> tuple[dict[str, Any], int]:
+        return _refuse(*a, **kw)
 
     scope = host.scope()
     if scope is None:
@@ -357,11 +348,11 @@ def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, polic
             return finish(_refuse("answer_refused", str(exc), 422))
         except Exception as exc:  # noqa: BLE001 - remembered, so a retry of this request never prompts again
             return finish(_refuse("internal", type(exc).__name__, 500))
-        will = can_deliver and bool(getattr(done, "answered", ()))
+        delivery = _delivery(deliver, done, getattr(done, "answered", ()))
         return finish(({"recorded": list(getattr(done, "recorded", [])), "signed": True, "channel": "desk",
                         "badge": "signed: Touch ID, laptop (desk)", "echo": getattr(done, "echo", ""),
                         **({"ruled": True} if carried is not None else {}),
-                        "delivery": "started" if will else "none"}, 200), done)
+                        "delivery": delivery}, 200))
     finally:
         state.lock.release()
 
@@ -402,38 +393,36 @@ def _desk_text(req: DeskRequest, store: Any, state: DeskState, policy: str, sign
     if first is not None:
         return first
     try:
-        result, done = _desk_text_owned(req, store, state, policy, signer_factory, key_dir, notify, find_key, b, txn,
-                                        deliver is not None)
+        return _desk_text_owned(req, store, state, policy, signer_factory, key_dir, notify, find_key, b, txn, deliver)
     finally:
         state.end(txn, None)
-    return _deliver(state, txn, result, done, deliver)
 
 
 def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str, signer_factory: Any, key_dir: Any,
                      notify: Callable[[str], Any] | None, find_key: Callable[..., Any] | None, b: Mapping[str, Any],
-                     txn: str, can_deliver: bool) -> tuple[tuple[dict[str, Any], int], Any]:
+                     txn: str, deliver: Callable[[Any], None] | None) -> tuple[dict[str, Any], int]:
     import sqlite3
 
     from levain import band_view
     from levain.consent import terminal_sign as ts
     from levain.consent.questions import QuestionStoreError
 
-    def finish(result: tuple[dict[str, Any], int], done: Any = None) -> tuple[tuple[dict[str, Any], int], Any]:
+    def finish(result: tuple[dict[str, Any], int]) -> tuple[dict[str, Any], int]:
         state.end(txn, result)          # remembered while the sign lock is still held
-        return result, done
+        return result
 
     if not requires_sign("information", policy):
-        return _refuse("desk_unsigned", "this line is recorded unsigned; use the ordinary path", 422), None
+        return _refuse("desk_unsigned", "this line is recorded unsigned; use the ordinary path", 422)
     viewer = f"cockpit:{req.surface if isinstance(req.surface, str) and req.surface else 'web'}"
     surface = ts.desk_surface(req.surface)      # the signed identity; the viewer keeps the credential's own name
     try:
         key = (find_key or ts.find_key)(key_dir)
     except Exception as exc:  # noqa: BLE001
-        return _refuse("key_unreadable", f"the Touch ID key cannot be read: {type(exc).__name__}", 503), None
+        return _refuse("key_unreadable", f"the Touch ID key cannot be read: {type(exc).__name__}", 503)
     if key is None:
-        return _refuse("no_key", "no Touch ID key is enrolled; use the ordinary path", 409), None
+        return _refuse("no_key", "no Touch ID key is enrolled; use the ordinary path", 409)
     if not state.lock.acquire(blocking=False):
-        return _refuse("sign_busy", "a Touch ID sheet is already open", 409), None
+        return _refuse("sign_busy", "a Touch ID sheet is already open", 409)
     try:
         signings: list[Any] = []
         try:
@@ -443,12 +432,12 @@ def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str
                 policy=policy, outcome=signings)
         except band_view.StaleBand as exc:       # before the prompt (no view) or inside the write after it
             got = _refuse("stale_band", str(exc), 409)
-            return finish(got) if signings else (got, None)
+            return finish(got) if signings else got
         except ValueError as exc:
             if str(exc).startswith("Touch ID"):
                 return finish(_refuse("unsigned", str(exc), 409))
             got = _refuse("answer_refused", str(exc), 422)
-            return finish(got) if signings else (got, None)
+            return finish(got) if signings else got
         except (QuestionStoreError, OSError, sqlite3.Error) as exc:
             return finish(_refuse("source_unavailable", f"the question store cannot answer now: {exc}", 503))
         except Exception as exc:  # noqa: BLE001 - remembered, so a retry of this request never prompts again
@@ -459,10 +448,9 @@ def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str
             # the box keeps his words
             return finish(_refuse("answer_refused", "; ".join(done.refused) or "nothing was recorded", 422,
                                   refused=list(done.refused)))
-        will = can_deliver and bool(done.answered)
+        delivery = _delivery(deliver, done, done.answered)
         return finish(({"recorded": done.recorded, "refused": done.refused, "sheets": list(done.sheets),
-                        "echo": done.echo, "signed": signed, "channel": "desk",
-                        "delivery": "started" if will else "none"}, 200), done)
+                        "echo": done.echo, "signed": signed, "channel": "desk", "delivery": delivery}, 200))
     finally:
         state.lock.release()
 

@@ -45,10 +45,11 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import types
 import urllib.parse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
@@ -1939,70 +1940,121 @@ def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mappin
 
 BADGE_BUDGET_S = 1.5          # the most a band render spends on history badges; a row not verified by then shows none
 _BADGE_CACHE_MAX = 256
-_badge_cache: "dict[tuple[str, str], str]" = {}     # (question id, digest of key + message + sig) -> verdict
+_badge_cache: "dict[tuple[str, str], str]" = {}     # (question id, :func:`_badge_digest`) -> verdict
+# the (question id, digest) pairs a worker is verifying now: a render that finds one starts no second verifier
+_badge_inflight: "set[tuple[str, str]]" = set()
+_badge_inflight_lock = threading.Lock()
+
+
+def _badge_digest(public_key: str, message: str, sig: str, origins: frozenset[str]) -> str:
+    import hashlib
+
+    return hashlib.sha256("\0".join((public_key, message, sig, *sorted(origins))).encode("utf-8")).hexdigest()
+
+
+def _cockpit_origins() -> frozenset[str]:
+    """The origins the installed cockpit service serves a desk page at: its loopback names on the service's port."""
+    from levain.daemon import DEFAULT_PORT
+
+    return frozenset(f"http://{host}:{DEFAULT_PORT}" for host in ("localhost", "127.0.0.1"))
 
 
 def answer_badge(store: Any, question_id: str, *, key_dir: Path | None = None,
-                 ctk: Callable[[str], tuple[bool | None, str]] | None = None) -> str:
+                 ctk: Callable[[str], tuple[bool | None, str]] | None = None,
+                 origins: Collection[str] | None = None) -> str:
     """What a reader shows beside an answered item: the one :func:`terminal_sign.answer_class` verdict on its signature
     (``signed: Touch ID, laptop`` / ``... (desk)``), ``signature failed (<reason>)`` for a signed claim that does not
     verify, and ``""`` for an unsigned answer, a store with no enrolled key, or anything unreadable. Never raises.
 
-    The reader's trust root is the enrolled terminal key. The store keeps no pre-answer row version and no page
-    origin, so the version, view, (terminal) session and (desk) origin the scope is checked against are the ones the
-    signed message names; the store, install, surface (from the recorded viewer, as
-    :func:`terminal_sign.desk_surface` signs it), the question's id and words, the answer and the time are checked
-    against what the store holds."""
+    The reader's trust root is the enrolled terminal key. The scope comes from the reader, never from the message: the
+    store and install from the store; the (desk) origin one of ``origins`` (default :func:`_cockpit_origins`); the
+    surface from the recorded viewer, as :func:`terminal_sign.desk_surface` signs it; the view ``item`` for a desk
+    click, else a band view the store holds for that viewer. The store keeps no pre-answer row version and no harness
+    session, so those two are the ones the signed message names; the question's id and words, the answer and the time
+    are checked against what the store holds."""
     try:
         from levain.consent import terminal_sign as ts
 
         key = ts.find_key(key_dir)
         if key is None:
             return ""
-        return _badge_of(store, question_id, key, _shared_ctk(ctk))
+        return _badge_of(store, question_id, key, _shared_ctk(ctk), _origins(origins))
     except Exception:  # noqa: BLE001 - a display aid never breaks the band
         return ""
 
 
+def _origins(origins: Collection[str] | None) -> frozenset[str]:
+    return _cockpit_origins() if origins is None else frozenset(o for o in origins if isinstance(o, str))
+
+
 def answer_badges(store: Any, question_ids: Sequence[str], *, deadline: float | None = None,
-                  key_dir: Path | None = None, ctk: Callable[[str], tuple[bool | None, str]] | None = None
-                  ) -> dict[str, str]:
+                  key_dir: Path | None = None, ctk: Callable[[str], tuple[bool | None, str]] | None = None,
+                  origins: Collection[str] | None = None) -> dict[str, str]:
     """:func:`answer_badge` for several answered items within ONE bound: ``deadline`` (``time.monotonic()``; default
     now + :data:`BADGE_BUDGET_S`, never later than that). One key lookup and one CTK check serve every row; the
     verifying runs on a worker thread, and a row not verified by the deadline is left out (no badge), so a slow
-    ssh-keygen or sc_auth never holds the caller. A verdict reached later is kept for the next render. Holds no
-    store transaction while it verifies (each read is its own). Never raises."""
-    import threading
-
+    ssh-keygen or sc_auth never holds the caller. A verdict reached later is kept for the next render; a signature a
+    worker of an earlier render is still verifying gets no second verifier (that row shows no badge this time). Holds
+    no store transaction while it verifies (each read is its own). Never raises."""
     ids = [q for q in dict.fromkeys(question_ids) if isinstance(q, str)]
     if not ids:
         return {}
     cap = time.monotonic() + BADGE_BUDGET_S
     until = cap if deadline is None else min(deadline, cap)
     got: dict[str, str] = {}
+    try:
+        from levain.consent import terminal_sign as ts
+
+        key = ts.find_key(key_dir)
+        if key is None:
+            return {}
+        allowed = _origins(origins)
+    except Exception:  # noqa: BLE001 - a display aid never breaks the band
+        return {}
+    # the cheap part here (stored signature, digest, cache); a signature another render is verifying is skipped
+    claimed: list[tuple[str, tuple[str, str]]] = []
+    for qid in ids:
+        try:
+            sign = answer_sign_of(store, qid)
+            if not sign or sign.get("sign_state") != "signed" or not sign.get("message") or not sign.get("sig"):
+                continue
+            k = (qid, _badge_digest(key.public_key, sign["message"], sign["sig"], allowed))
+        except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
+            continue
+        cached = _badge_cache.get(k)
+        if cached is not None:
+            if cached:
+                got[qid] = cached
+            continue
+        with _badge_inflight_lock:
+            if k in _badge_inflight:
+                continue
+            _badge_inflight.add(k)
+        claimed.append((qid, k))
+    if not claimed:
+        return got
+    found: dict[str, str] = {}
 
     def work() -> None:
-        try:
-            from levain.consent import terminal_sign as ts
-
-            key = ts.find_key(key_dir)
-            if key is None:
-                return
-            shared = _shared_ctk(ctk)
-            for qid in ids:
-                try:
-                    got[qid] = _badge_of(store, qid, key, shared)
-                except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
-                    got[qid] = ""
-        except Exception:  # noqa: BLE001
-            return
+        shared = _shared_ctk(ctk)
+        for qid, k in claimed:
+            try:
+                found[qid] = _badge_of(store, qid, key, shared, allowed)
+            except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
+                found[qid] = ""
+            finally:
+                with _badge_inflight_lock:
+                    _badge_inflight.discard(k)
 
     t = threading.Thread(target=work, name="levain-answer-badges", daemon=True)
     try:
         t.start()
     except RuntimeError:
-        return {}
+        with _badge_inflight_lock:
+            _badge_inflight.difference_update(k for _, k in claimed)
+        return got
     t.join(max(0.0, until - time.monotonic()))
+    got.update((qid, v) for qid, v in list(found.items()) if v)
     return {qid: got[qid] for qid in ids if got.get(qid)}
 
 
@@ -2018,9 +2070,8 @@ def _shared_ctk(ctk: Callable[[str], tuple[bool | None, str]] | None) -> Callabl
     return check
 
 
-def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple[bool | None, str]]) -> str:
-    import hashlib
-
+def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple[bool | None, str]],
+              origins: frozenset[str]) -> str:
     from levain.consent import terminal_sign as ts
 
     sign = answer_sign_of(store, question_id)
@@ -2030,21 +2081,31 @@ def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple
     if q is None or q.answer is None:
         return ""
     message = sign["message"]
-    digest = hashlib.sha256("\0".join((key.public_key, message, sign["sig"])).encode("utf-8")).hexdigest()
+    digest = _badge_digest(key.public_key, message, sign["sig"], origins)
     cached = _badge_cache.get((question_id, digest))
     if cached is not None:
         return cached
-    with store._peek() as conn:
-        via, viewer = conn.execute("SELECT via, viewer FROM answer_context WHERE question_id = ?",
-                                   (question_id,)).fetchone()
     raw = message.encode("utf-8")
     desk = message.startswith(ts.DESK_FORMAT + "\n")
     parsed = ts.parse_desk_verified(raw) if desk else ts.parse_verified(raw)
+    with store._peek() as conn:
+        via, viewer = conn.execute("SELECT via, viewer FROM answer_context WHERE question_id = ?",
+                                   (question_id,)).fetchone()
+        # the view the reader expects: a desk click's fixed "item", else a band view the store holds for THIS viewer
+        if desk and parsed.gesture == "click":
+            view = "item" if parsed.view == "item" else None
+        else:
+            held = parsed.view.isdigit() and conn.execute(
+                "SELECT 1 FROM band_views WHERE seq = ? AND viewer = ?", (int(parsed.view), viewer)).fetchone()
+            view = parsed.view if held else None
     sid = _store_id_of(store)
+    signed_origin = getattr(parsed, "origin", None)
     context: dict[str, Any] = {
         "signers": f'phill namespaces="{ts.SIGNERS_NAMESPACES}" {key.public_key}\n', "principal": "phill",
-        "ctk": ctk, "store": f"levain-questions:{sid}", "install": sid, "view": parsed.view,
-        "session": getattr(parsed, "session", None), "origin": getattr(parsed, "origin", None),
+        "ctk": ctk, "store": f"levain-questions:{sid}", "install": sid, "view": view,
+        "session": getattr(parsed, "session", None),
+        # the reader's own origins; the signed one is only compared against them
+        "origin": signed_origin if signed_origin in origins else None,
         "surface": ts.desk_surface(viewer.split(":", 1)[1]) if isinstance(viewer, str) and viewer.startswith("cockpit:")
         else None}
     a = q.answer

@@ -409,3 +409,26 @@ def test_a_surface_outside_the_form_signs_as_its_own_digest_never_as_another():
     assert a != "web" and a != b and a.startswith("x--") and b == "work_laptop"
     assert ts.desk_surface("x--abc") != "x--abc"                 # a name shaped like a digest is encoded too
     assert ts.build_desk_message(**dict(BASE, surface=a), view="item", gesture="click", entries=[E])
+
+
+# --- L3 r2 W1: a desk countersign is scoped by the reader, the event's claims only compared ------------------------
+
+@pytest.mark.parametrize("field,value", [("origin", "http://127.0.0.1:8765"), ("surface", "phone-2"), ("view", "7")])
+def test_a_desk_countersign_signed_and_claimed_elsewhere_is_not_confirmed(world, field, value):
+    """The countersign's message and its event both name another origin, surface or view than the reader's: the
+    signature verifies and the event agrees with it, but the reader's context decides, so nothing is confirmed."""
+    path, signers = world
+    original = {"ts": "2026-11-03T20:00:00Z", "answer": "(a) Add a Levain 1.0 row", "via": "cockpit"}
+
+    def cs_for(**over):
+        msg = _click(countersign_of="2026-11-03T20:00:00Z", countersign="confirm", **over)
+        claims = {"surface": "web", "view": "item", "origin": "http://localhost:8765", **over}
+        return {"of_ts": "2026-11-03T20:00:00Z", "ts": "2026-11-03T21:04:30Z", **claims, "via": "cockpit-desk",
+                "signed": {"format": ts.DESK_FORMAT, "message": msg.decode(), "sig": _sign(path, msg, ts.DESK_NAMESPACE),
+                           "entry": 1}}
+    assert ts.answer_class(original, ROW, _ctx(signers, countersigns=[cs_for()])).state == "signed-terminal"
+    got = ts.answer_class(original, ROW, _ctx(signers, countersigns=[cs_for(**{field: value})]))
+    assert got.state == "agent-resolved", (field, got)
+    # the same countersign read by a reader whose context names that value confirms
+    assert ts.answer_class(original, ROW, _ctx(signers, countersigns=[cs_for(**{field: value})], **{field: value})
+                           ).state == "signed-terminal"

@@ -40,6 +40,7 @@ def _guards(tmp_path, monkeypatch):
     monkeypatch.setattr(ts, "default_signer_factory", boom)
     monkeypatch.setattr(ts, "default_desk_signer_factory", boom)
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    monkeypatch.setattr(band_view, "_cockpit_origins", lambda: frozenset({ORIGIN}), raising=False)   # their cockpit
 
 
 @pytest.fixture
@@ -717,3 +718,136 @@ def test_a_credential_named_outside_the_form_answers_under_its_own_viewer(store,
 
 def test_a_duplicate_waits_longer_than_a_touch_can_take():
     assert desk_click._WAIT_S > ts.SIGN_BOUND_S
+
+
+# --- L3 r2 W1: the history reader's scope is its own, never the signed message's ---------------------------------
+
+def _resigned(keydir, message: str, old: str, new: str) -> tuple[str, str]:
+    """The stored message with one line moved, signed again by the enrolled key: a valid signature over other scope."""
+    assert old in message
+    moved = message.replace(old, new)
+    return moved, ckeys.ssh_signer(keydir / ts.KEY_LABEL, namespace=ts.DESK_NAMESPACE)[1](moved.encode())
+
+
+@pytest.mark.parametrize("what", ["origin", "view", "surface"])
+def test_a_stored_signature_under_another_origin_surface_or_view_is_failed(store, keydir, monkeypatch, what):
+    q = file_q(store)
+    sid, vid = _shown(store)
+    other_view = band_view.band_payload(store, "cockpit:other")["view_id"]        # a view another credential holds
+    got, status = _text(store, keydir, _text_req(store, "1a"), factory=Calls())
+    assert status == 200 and got["signed"], got
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    band_view._badge_cache.clear()
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok) == "signed: Touch ID, laptop (desk)"
+    real = band_view.answer_sign_of(store, q.id)
+    old, new = {"origin": (f"origin: {ORIGIN}\n", "origin: http://127.0.0.1:8765\n"),
+                "view": (f"view: {vid}\n", f"view: {other_view}\n"),
+                "surface": ("surface: web\n", "surface: other\n")}[what]
+    message, sig = _resigned(keydir, real["message"], old, new)
+    monkeypatch.setattr(band_view, "answer_sign_of", lambda st, qid: {**real, "message": message, "sig": sig})
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok) == "signature failed (scope-mismatch)", what
+
+
+def test_the_reader_names_the_origins_it_accepts(rig, store, keydir):
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    band_view._badge_cache.clear()
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok,
+                                  origins=["http://localhost:7420"]) == "signature failed (scope-mismatch)"
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok, origins=[ORIGIN]) == "signed: Touch ID, laptop (desk)"
+
+
+# --- L3 r2 W2: one verifier per signature in flight ----------------------------------------------------------------
+
+def _wait_until(cond, limit=10.0):
+    import time
+    end = time.monotonic() + limit
+    while not cond() and time.monotonic() < end:
+        time.sleep(0.02)
+    return cond()
+
+
+def test_renders_while_a_slow_verifier_runs_start_no_second_one(rig, store, keydir):
+    import time
+
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    release = threading.Event()
+    asked: list[str] = []
+
+    def slow(pk):
+        asked.append(pk)
+        release.wait(10)
+        return True, "bio"
+    band_view._badge_cache.clear()
+    renders = [band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=slow, deadline=time.monotonic() + 0.05)
+               for _ in range(5)]
+    assert renders == [{}] * 5                                   # no render waited for the verifier
+    assert _wait_until(lambda: len(asked) >= 1)
+    time.sleep(0.2)
+    assert len(asked) == 1, asked                                # N renders -> ONE verifier
+    release.set()
+    assert _wait_until(lambda: not getattr(band_view, "_badge_inflight", set()))
+    after = band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=slow)
+    assert after == {q.id: "signed: Touch ID, laptop (desk)"} and len(asked) == 1      # served from the cache
+
+
+def test_a_verifier_that_raises_frees_its_signature_for_the_next_render(rig, store, keydir):
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    asked: list[str] = []
+
+    def boom(pk):
+        asked.append(pk)
+        raise RuntimeError("sc_auth fell over")
+    band_view._badge_cache.clear()
+    first = band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=boom)
+    assert first == {q.id: "signature failed (classifier-error)"}          # shown, never cached
+    assert _wait_until(lambda: not getattr(band_view, "_badge_inflight", set()))
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    assert band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=ok) == {q.id: "signed: Touch ID, laptop (desk)"}
+    assert len(asked) == 1
+
+
+# --- L3 r2 W3: a duplicate never reads a delivery status the first caller does not get ----------------------------
+
+def test_a_concurrent_duplicate_reads_the_final_delivery_status(rig, store, monkeypatch):
+    """The delivery thread cannot start, and a duplicate of the request is waiting on the first: both get
+    ``deferred``. Thread start is held until the duplicate has had its chance to read, so a status cached before the
+    start outcome is seen by it."""
+    q = file_q(store)
+    dup: list = []
+    threads: list[threading.Thread] = []
+    sent = body(q)
+
+    def no_thread(deliver, done):
+        threads[0].join(1.0)            # let a woken duplicate read whatever is cached by now
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(desk_click, "_start_delivery", no_thread)
+
+    def during():
+        t = threading.Thread(target=lambda: dup.append(rig(sent, factory=calls, delivered=lambda done: None)))
+        threads.append(t)
+        t.start()
+    calls = Calls(during=during)
+    first = rig(sent, factory=calls, delivered=lambda done: None)
+    threads[0].join(10)
+    assert first[1] == 200 and first[0]["delivery"] == "deferred", first
+    assert dup == [first], dup
+    assert calls.n == 1 and answers(store) == [(q.id, "ship")]
+
+
+def test_the_text_route_decides_delivery_before_it_remembers(store, keydir, monkeypatch):
+    q = file_q(store)
+    state = desk_click.DeskState()
+
+    def no_thread(deliver, done):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(desk_click, "_start_delivery", no_thread)
+    request = _text_req(store, "1a", txn="txn-text-dlv")
+    got, status = desk_click.desk_text(request, store, state, policy="all", signer_factory=Calls(), key_dir=keydir,
+                                       notify=lambda t: None, deliver=lambda done: None)
+    assert status == 200 and got["delivery"] == "deferred", got
+    assert state.finished("txn-text-dlv") == (got, 200)
+    assert answers(store) == [(q.id, "ship")]
