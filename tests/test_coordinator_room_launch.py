@@ -41,7 +41,9 @@ open(os.path.join(base, "spawn-%d.argv" % n), "w").write(json.dumps(argv))
 mode = open(os.path.join(base, "mode")).read().split() if os.path.exists(os.path.join(base, "mode")) else ["ok"]
 mode, model = mode[0], (mode[1] if len(mode) > 1 else "fake-model")
 sid = flag("--session-id") or flag("--resume")
-if mode == "exit_early":
+if mode == "stale_sid":
+    sid = open(os.path.join(base, "stale_sid")).read().strip()
+if mode == "exit_early" or (mode == "resume_rejected" and "--resume" in argv):
     sys.stderr.write("boom: the fake exits at once\n"); sys.exit(3)
 if mode == "deaf":
     time.sleep(600)
@@ -54,7 +56,9 @@ def out(f):
 def init():
     tools = ["Glob", "Grep", "Read", "WebSearch", "mcp__levain_room__propose_drop"]
     if mode == "bad_tools": tools.append("Bash")
-    out({{"type": "system", "subtype": "init", "cwd": os.getcwd(), "tools": tools,
+    cwd = os.getcwd()
+    if mode == "wrong_cwd" or (mode == "cwd_flip" and inits > 1): cwd = os.path.dirname(cwd)
+    out({{"type": "system", "subtype": "init", "cwd": cwd, "tools": tools,
          "mcp_servers": [{{"name": "levain_room", "status": "connected"}}], "model": model,
          "permissionMode": "default" if mode == "bad_mode" else "dontAsk", "claude_code_version": "2.1.317"}})
 def tool(tid, name, path, body, decision, error=False):
@@ -92,6 +96,8 @@ for line in sys.stdin:
             result([{{"tool_name": "Read", "tool_use_id": "toolu_c"}}])
         if mode == "deaf_after_open":
             time.sleep(600)
+        if mode == "exit_after_open":
+            sys.exit(0)
         continue
     if text.startswith("read2 "):
         tool(tid(), "Read", text.split(" ", 1)[1], "file body", CFG)
@@ -552,3 +558,249 @@ def test_item3_ending_a_launch_whose_send_is_hung_completes_and_ends_the_launch(
     send.join(10)
     assert box["end"] == "NotSent" and state(world, h.launch_id) == "ended"
     assert world["svc"].session_meta(h.launch_id) is None
+
+
+# --- rme-fix1: L3_rme_r1 findings, each reproduced on the RM-E tip --------------------------------------------------------
+def new_thread(w, title="the next room"):
+    d = w["store"].accept_drop(title, surface="cli")[0]
+    return w["store"].split(d.drop_id, [Part("note", title)])[0].thread_id
+
+
+def rotate_to(w, thread):
+    with w["store"]._write() as (conn, _now):
+        room.rotate(conn, thread)
+
+
+def capture_spawns(w):
+    """A spawn seam that keeps every child it started."""
+    procs = []
+
+    def spawn(argv, *, cwd, env, stderr):
+        p = room_launch._spawn(argv, cwd=cwd, env=env, stderr=stderr)
+        procs.append(p)
+        return p
+    return procs, spawn
+
+
+@pytest.mark.parametrize("point", ["attach", "live", "read_next"])
+def test_c1_a_send_in_the_activation_window_is_never_permanently_refused(world, point):
+    """FAILS on the RM-E tip (codex HIGH 1): the launch was resolvable before it was attached, live and given a vendor
+    position, so a send in that window was stored refused or cancelled for good under its outbox_id."""
+    svc, seen = world["svc"], []
+
+    def race():
+        if seen:
+            return
+        try:
+            seen.append(say(world, "hello", outbox="ob-race0001").state)
+        except CoordError as exc:
+            seen.append(f"nothing written: {exc}")
+
+    if point == "attach":
+        orig_attach = svc.attach
+        svc.attach = lambda lid, s: (race(), orig_attach(lid, s))[1]
+    elif point == "live":
+        orig_activate = svc.activate
+
+        def activate(lid, kind, *a, **kw):
+            if kind == "live":
+                race()
+            return orig_activate(lid, kind, *a, **kw)
+        svc.activate = activate
+    else:
+        orig_read = svc.read_next
+        svc.read_next = lambda lid: (race(), orig_read(lid))[1]
+    lr = launcher(world)
+    h = lr.ensure()
+    for name in ("attach", "activate", "read_next"):
+        svc.__dict__.pop(name, None)
+    assert len(seen) == 1
+    again = say(world, "hello", outbox="ob-race0001")
+    assert again.state not in ("refused", "cancelled"), (seen, again)
+    settle(world, h.launch_id, 2, seconds=30)
+
+
+def test_c2_an_open_whose_child_reports_another_cwd_fails(world):
+    """FAILS on the RM-E tip (codex HIGH 2): the reported cwd was never compared with the launch's."""
+    mode(world, "wrong_cwd")
+    with pytest.raises(RoomLaunchError, match="cwd"):
+        launcher(world).ensure()
+
+
+def test_c2_the_rooms_probe_latches_a_missing_malformed_or_changed_cwd(world):
+    """FAILS on the RM-E tip: the room's probe (every later boundary) ignored cwd."""
+    lr = launcher(world)
+    h = lr.ensure()
+    ev = lr._live[h.launch_id].session.liveness_evidence()
+    probe = make_probe(world["cs"])
+    assert probe(h.launch_id, ev).live
+    for cwd in (str(world["cwd"].parent), None, 7, "relative/dir", ""):
+        raw = dict(ev.raw)
+        if cwd is None:
+            raw.pop("cwd", None)
+        else:
+            raw["cwd"] = cwd
+        assert not probe(h.launch_id, ev._replace(raw=raw)).live, cwd
+
+
+def test_c2_a_cwd_that_changes_in_a_live_session_latches_the_room(world):
+    """FAILS on the RM-E tip: the send's boundary probe accepted the second init's other cwd."""
+    mode(world, "cwd_flip")
+    lr = launcher(world)
+    h = lr.ensure()
+    say(world, "hello", outbox="ob-00000001")
+    end = time.monotonic() + 30
+    while time.monotonic() < end and world["cs"]._read(lambda conn: liveness(conn, h.launch_id)).enabled:
+        try:
+            world["svc"].read_next(h.launch_id)
+        except CoordError:
+            pass
+        time.sleep(0.05)
+    assert not world["cs"]._read(lambda conn: liveness(conn, h.launch_id)).enabled
+
+
+def test_c3_a_room_rotated_during_the_open_fails_the_launch_and_stops_its_child(world):
+    """FAILS on the RM-E tip (codex HIGH 3): the launcher activated the room it read before the open check."""
+    other = new_thread(world)
+    svc = world["svc"]
+    orig_activate = svc.activate
+
+    def activate(lid, kind, *a, **kw):
+        if kind == "probing":
+            rotate_to(world, other)
+        return orig_activate(lid, kind, *a, **kw)
+    svc.activate = activate
+    procs, spawn = capture_spawns(world)
+    lr = launcher(world, spawn=spawn)
+    try:
+        with pytest.raises(RoomLaunchError, match="rotated"):
+            lr.ensure()
+    finally:
+        svc.__dict__.pop("activate", None)
+    [launch] = world["cs"]._read(lambda conn: [r[0] for r in conn.execute(
+        "SELECT launch_id FROM launches WHERE role = 'room'").fetchall()])
+    assert state(world, launch) == "failed" and procs and all(p.poll() is not None for p in procs)
+
+
+def test_c4_a_child_reporting_another_session_id_than_it_was_given_fails(world):
+    """FAILS on the RM-E tip (codex MED 4): a fresh start whose child reports an old ended id was accepted."""
+    lr = launcher(world)
+    h1 = lr.ensure()
+    lr.end(h1.launch_id, "test")
+    (world["fake"] / "stale_sid").write_text(h1.harness_session_id)
+    mode(world, "stale_sid")
+    with pytest.raises(RoomLaunchError, match="session id"):
+        lr.ensure(fresh=True)
+
+
+def test_c5_ensure_after_a_rotation_ends_the_old_rooms_launch(world):
+    """FAILS on the RM-E tip (codex MED 5): the old room's launch stayed active with its child running."""
+    lr = launcher(world)
+    h1 = lr.ensure()
+    proc = lr._live[h1.launch_id].proc
+    nxt = new_thread(world)
+    rotate_to(world, nxt)
+    h2 = lr.ensure()
+    assert h2.room_thread == nxt and state(world, h1.launch_id) == "ended" and proc.poll() is not None
+    assert list(lr._live) == [h2.launch_id]
+
+
+def test_c5_recycle_ends_a_launch_whose_room_rotated(world):
+    """FAILS on the RM-E tip: recycle_idle kept a busy-or-recent launch of a room that is no longer open."""
+    lr = launcher(world)
+    h1 = lr.ensure()
+    rotate_to(world, new_thread(world))
+    assert lr.recycle_idle() == [h1.launch_id] and state(world, h1.launch_id) == "ended"
+
+
+def test_c7_a_rejected_resume_retries_once_fresh_and_says_so(world):
+    """FAILS on the RM-E tip (complement MED 1): a resume the vendor rejects failed every reopen."""
+    lr = launcher(world)
+    h1 = lr.ensure()
+    lr.end(h1.launch_id, "test")
+    mode(world, "resume_rejected")
+    h2 = lr.ensure()
+    assert not h2.resumed and h2.resume_failed == h1.harness_session_id
+    assert h2.harness_session_id != h1.harness_session_id
+    argvs = spawns(world)
+    assert len(argvs) == 3 and "--resume" in argvs[1] and "--session-id" in argvs[2]
+    rooms = world["cs"]._read(lambda conn: [r[0] for r in conn.execute(
+        "SELECT launch_id FROM launches WHERE role = 'room' ORDER BY gseq").fetchall()])
+    assert state(world, rooms[1]) == "failed" and "exited" in cause(world, rooms[1])
+    probing = world["cs"]._read(lambda conn: conn.execute(
+        "SELECT detail FROM chat_launch_checks WHERE launch_id = ? AND kind = 'probing' ORDER BY seq LIMIT 1",
+        (h2.launch_id,)).fetchone()[0])
+    assert h1.harness_session_id in probing and "fresh" in probing
+    assert lr.ensure().resume_failed == h1.harness_session_id         # the record stays with the launch
+
+
+def test_c7_the_fresh_retry_runs_once_never_a_loop(world):
+    lr = launcher(world)
+    h1 = lr.ensure()
+    lr.end(h1.launch_id, "test")
+    mode(world, "exit_early")
+    with pytest.raises(RoomLaunchError, match="exited"):
+        lr.ensure()
+    assert len(spawns(world)) == 3
+
+
+def test_c8_an_already_active_resumed_launch_still_says_resumed(world):
+    """FAILS on the RM-E tip (complement LOW 4)."""
+    lr = launcher(world)
+    lr.end(lr.ensure().launch_id, "test")
+    h2 = lr.ensure()
+    assert h2.resumed and lr.ensure() == h2
+
+
+def test_c8_the_containment_digest_does_not_depend_on_the_deny_list_order(monkeypatch):
+    """FAILS on the RM-E tip (deepseek LOW 5)."""
+    settings = json.dumps({"permissions": {"deny": []}})
+    a = room_launch.containment_digest(settings)
+    monkeypatch.setattr(room_launch, "ROOM_DENIED_TOOLS", tuple(reversed(room_launch.ROOM_DENIED_TOOLS)))
+    assert room_launch.containment_digest(settings) == a
+
+
+def test_c8_a_child_that_exits_after_its_open_check_is_not_activated(world):
+    """FAILS on the RM-E tip (deepseek LOW 1): the open check declared live a child that had already exited."""
+    mode(world, "exit_after_open")
+    procs, spawn = capture_spawns(world)
+    svc = world["svc"]
+    orig_read = svc.read_next
+
+    def read_next(lid):
+        procs[-1].wait(20)                       # deterministic: the child has exited by the time it is read
+        return orig_read(lid)
+    svc.read_next = read_next
+    try:
+        with pytest.raises(RoomLaunchError, match="exited"):
+            launcher(world, spawn=spawn).ensure()
+    finally:
+        svc.__dict__.pop("read_next", None)
+
+
+def test_c8_ending_a_launch_closes_its_session_even_when_it_was_never_attached(world, monkeypatch):
+    """FAILS on the RM-E tip (deepseek LOW 3): a failed open never closed its session (its reader thread and pipes
+    waited for GC)."""
+    made = []
+
+    class Recording(room_launch.RoomSession):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            made.append(self)
+    monkeypatch.setattr(room_launch, "RoomSession", Recording)
+    mode(world, "bad_tools")
+    with pytest.raises(RoomLaunchError):
+        launcher(world).ensure()
+    assert made and all(s.closed for s in made)
+
+
+def test_c8_a_spawn_that_fails_still_records_not_live(world):
+    """Pins deepseek LOW 6 as not a defect: with no probing row before it (the spawn raised), the not_live row is
+    still written (this passes on the RM-E tip too; nothing was changed for it)."""
+    def spawn(*_a, **_kw):
+        raise OSError("no such claude")
+    with pytest.raises(RoomLaunchError, match="no such claude"):
+        launcher(world, spawn=spawn).ensure()
+    [launch] = world["cs"]._read(lambda conn: [r[0] for r in conn.execute(
+        "SELECT launch_id FROM launches WHERE role = 'room'").fetchall()])
+    assert ("not_live", "activation") in checks(world, launch) and state(world, launch) == "failed"

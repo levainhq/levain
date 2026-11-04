@@ -11,8 +11,13 @@ own, spawns ``claude`` through :func:`~levain.coordinator.claude_session.room_ar
 fixed turn asking the child to Read a decoy file the deny rules cover. That one turn is both the child's first
 ``init`` (the child reports none before a turn starts, UNMEASURED beyond RM0's runs) and the canary
 (:func:`~levain.coordinator.claude_session.canary_denied`) the chat service requires of a Claude ``live`` row. The
-child is live only if :func:`~levain.coordinator.claude_session.open_probe` accepts that ``init`` AND the canary was
-denied; otherwise the launch ends ``failed`` with a ``not_live`` activation row and nothing was ever attached. The
+child is live only if :func:`~levain.coordinator.claude_session.open_probe` accepts that ``init``, its ``cwd``
+resolves to the launch's recorded cwd, its ``session_id`` is the one it was given (``--session-id`` or ``--resume``), it
+has not exited, AND the canary was denied; otherwise the launch ends ``failed`` with a ``not_live`` activation row.
+The launch is attached, recorded ``live`` and given its vendor position while still ``pending``, so a ``send_room``
+resolves nothing to it until :func:`~levain.coordinator.lease.activate_room` makes it ``active``, the last step, in a
+transaction that also requires its room thread to still be the open room. Every later boundary probe
+(:func:`room_probe`) holds the child to the same cwd. The
 canary proves the ``--settings`` file took effect (the decoy is outside the room's cwd and matches the dotenv rule, so
 either the outside-cwd block or the deny rule answers it); it does not tell which, and it does not exercise each deny
 path. The check's own events (the canary Read, its denial, the child's reply) are in the room's stream like any turn.
@@ -39,11 +44,14 @@ session lock), which ends the blocked write with a broken pipe, and only then ru
 mutex and a hung send holds it. ``claude_session.py`` is untouched; its ``close`` taking the lock stays an RM-G
 follow-up.
 
-**Resume and lapse.** A new launch resumes the room thread's newest recorded conversation (``--resume <id>``; the child
-reports the id it was resumed from, which :func:`~levain.coordinator.lease.activate_room` accepts for the room's own
-ended launch). :meth:`RoomLauncher.recycle_idle` ends a quiet child (no turn open, no unsettled line, nothing recorded
-for :data:`IDLE_SECONDS`); the next ``ensure`` resumes. ``ensure`` also replaces a launch whose child exited, one this
-process holds no session for (a restarted ``levain serve``), and one the service latched ``not_live``. The service's
+**Resume and lapse.** A new launch resumes the room thread's newest recorded conversation (``--resume <id>``, recorded
+as the pending launch's ``resumed_from``; the child reports the id it was resumed from, which
+:func:`~levain.coordinator.lease.activate_room` accepts only for an id the launch asked to resume). A resume whose
+child exits before its open check ends is retried once as a fresh session, and the handle's ``resume_failed`` and the
+launch's probing row name the abandoned id. :meth:`RoomLauncher.recycle_idle` ends a quiet child (no turn open, no
+unsettled line, nothing recorded for :data:`IDLE_SECONDS`); the next ``ensure`` resumes. ``ensure`` also replaces a
+launch whose child exited, one this process holds no session for (a restarted ``levain serve``), and one the service
+latched ``not_live``. Both ``ensure`` and ``recycle_idle`` end every held launch of a room that rotated. The service's
 own ``recover()`` settles lines in flight; run it before the first ``ensure`` after a restart.
 
 Stdlib plus levain. The spawn is a seam (``spawn``) so a test can supply a child of its own."""
@@ -62,7 +70,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, Mapping, NamedTuple, Optional
 
 from levain.cockpit.consent import parse_stamp
 from levain.coordinator import lease
@@ -78,7 +86,7 @@ from levain.coordinator.store import CoordError
 
 __all__ = [
     "IDLE_SECONDS", "KILL_WAIT", "OPEN_DEADLINE", "RoomCanary", "RoomHandle", "RoomLaunchError", "RoomLauncher",
-    "RoomSession", "RoomSetting", "make_probe", "make_tripwires", "room_probe", "room_tripwire_context",
+    "RoomSession", "RoomSetting", "cwd_refusal", "make_probe", "make_tripwires", "room_probe", "room_tripwire_context",
 ]
 
 # [seat] the open check must finish well inside lease.LAUNCH_TTL (the launch is pending until it does)
@@ -97,6 +105,10 @@ _SOURCES = ("user_permanent", "config")
 
 class RoomLaunchError(CoordError):
     """The room could not be opened or kept; the message says why. Nothing was attached."""
+
+
+class _ChildExited(RoomLaunchError):
+    """The child exited before its open check ended (with ``--resume`` in its argv, the resume is the suspect)."""
 
 
 @dataclass(frozen=True)
@@ -118,10 +130,14 @@ class RoomCanary:
 
 
 class RoomHandle(NamedTuple):
+    """``resumed``: the launch was opened with ``--resume``. ``resume_failed``: the session id whose resume exited
+    before its open check ended, so this launch is a fresh start in its place (None otherwise). Both describe the
+    launch, whichever :meth:`RoomLauncher.ensure` call returns it."""
     launch_id: str
     room_thread: str
     harness_session_id: str
     resumed: bool
+    resume_failed: Optional[str] = None
 
 
 def _stop_child(proc: Any) -> None:
@@ -155,10 +171,31 @@ class RoomSession(ClaudeSession):
 
 
 # ---- the service's two seams for a room launch ------------------------------------------------------------------------
-def room_probe(launch_id: str, evidence: LivenessEvidence) -> Verdict:
-    """The room's verdict on one ``init``: live only for exactly its tools, its one connected door, under ``dontAsk``."""
-    got = open_probe(evidence.raw if isinstance(evidence, LivenessEvidence) else None)
-    return Verdict(got.live, got.reason)
+def cwd_refusal(raw: Any, cwd: Optional[str]) -> Optional[str]:
+    """Why the child's reported ``cwd`` is not the launch's recorded one (both resolved), or None when it is. A launch
+    with no absolute recorded cwd, and a missing, malformed or different reported one, are refusals: the cwd is the
+    room's filesystem boundary (``blockReadsOutsideWorkingDirectories``)."""
+    got = raw.get("cwd") if isinstance(raw, Mapping) else None
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return "the room launch has no recorded cwd to hold its child to"
+    if not isinstance(got, str) or not got or not os.path.isabs(got):
+        return "the room child reported no usable cwd"
+    try:
+        same = os.path.realpath(got) == os.path.realpath(cwd)
+    except (OSError, ValueError):
+        same = False
+    return None if same else _one_line(f"the room child reports cwd {got[:120]!r}, not its launch's {cwd[:120]!r}")
+
+
+def room_probe(launch_id: str, evidence: LivenessEvidence, cwd: Optional[str] = None) -> Verdict:
+    """The room's verdict on one ``init``: live only for exactly its tools, its one connected door, under ``dontAsk``,
+    in the launch's recorded ``cwd`` (no ``cwd`` given is not live)."""
+    raw = evidence.raw if isinstance(evidence, LivenessEvidence) else None
+    got = open_probe(raw)
+    if not got.live:
+        return Verdict(False, got.reason)
+    why = cwd_refusal(raw, cwd)
+    return Verdict(False, why) if why is not None else Verdict(True, got.reason)
 
 
 def room_tripwire_context(cwd: str) -> TripwireContext:
@@ -174,11 +211,13 @@ def room_tripwire_context(cwd: str) -> TripwireContext:
 
 def make_probe(store: ChatStore, other: Optional[Callable[[str, LivenessEvidence], Verdict]] = None
                ) -> Callable[[str, LivenessEvidence], Verdict]:
-    """The one ``probe`` a ChatService takes: a room launch gets :func:`room_probe`, any other launch gets ``other``
-    (no verdict at all, which latches, when there is none)."""
+    """The one ``probe`` a ChatService takes: a room launch gets :func:`room_probe` over its recorded cwd, any other
+    launch gets ``other`` (no verdict at all, which latches, when there is none)."""
     def probe(launch_id: str, evidence: LivenessEvidence) -> Verdict:
-        if store._read(lambda conn: _launch_state(conn, launch_id)[0]) == "room":
-            return room_probe(launch_id, evidence)
+        row = store._read(lambda conn: conn.execute("SELECT role, cwd FROM launches WHERE launch_id = ?",
+                                                    (launch_id,)).fetchone())
+        if row is not None and row[0] == "room":
+            return room_probe(launch_id, evidence, row[1])
         if other is None:
             return Verdict(False, "no probe is configured for this launch")
         return other(launch_id, evidence)
@@ -213,7 +252,7 @@ def mcp_config_json(launch_id: str, python: str) -> str:
 
 def containment_digest(settings_json: str) -> str:
     """64 hex: the containment policy a spawn ran under (tool flags, mode, sources, deny rules, door name)."""
-    policy = {"tools": list(ROOM_TOOLS), "denied": list(ROOM_DENIED_TOOLS), "mode": ROOM_PERMISSION_MODE,
+    policy = {"tools": list(ROOM_TOOLS), "denied": sorted(ROOM_DENIED_TOOLS), "mode": ROOM_PERMISSION_MODE,
               "setting_sources": "user", "settings": json.loads(settings_json), "door": ROOM_MCP_TOOL}
     return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -226,8 +265,11 @@ def _spawn(argv: list, *, cwd: str, env: dict, stderr: Any) -> Any:
 class _Live:
     """What the launcher holds for one running room launch."""
 
-    def __init__(self, launch_id: str, session: RoomSession, proc: Any, workdir: Path) -> None:
+    def __init__(self, launch_id: str, session: RoomSession, proc: Any, workdir: Path, *, room_thread: str,
+                 session_id: str, resumed: bool, resume_failed: Optional[str]) -> None:
         self.launch_id, self.session, self.proc, self.workdir = launch_id, session, proc, workdir
+        self.room_thread, self.session_id, self.resumed, self.resume_failed = (room_thread, session_id, resumed,
+                                                                               resume_failed)
 
 
 class RoomLauncher:
@@ -268,7 +310,7 @@ class RoomLauncher:
 
     # --- reads ------------------------------------------------------------------------------------------------------
     def _newest(self, room_thread: str) -> Optional[tuple]:
-        """``(launch_id, state, harness_session_id)`` of the room thread's newest room launch, or None."""
+        """``(launch_id, latest launch event kind)`` of the room thread's newest room launch, or None."""
         def read(conn: Any) -> Optional[tuple]:
             row = conn.execute(
                 "SELECT l.launch_id, (SELECT e.kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY "
@@ -310,9 +352,13 @@ class RoomLauncher:
         """The open room's running launch, opened (or reopened, resuming the room thread's newest conversation unless
         ``fresh``) when it has none. A launch that is active but whose child exited, that this process holds no session
         for, or that the service latched is ended first. Raises :class:`RoomLaunchError` when there is no open room or
-        the open check fails; the failed launch is ended and nothing stays attached."""
+        the open check fails; the failed launch is ended and nothing stays attached. Every launch this process holds
+        for a room thread that is no longer the open room is ended first (a rotation leaves no child behind). A resume
+        whose child exits before its open check ends is retried ONCE as a fresh session (``resume_failed`` on the
+        handle names the abandoned id); a fresh open that fails is not retried."""
         with self._lock:
             room_thread = self._store._read(_open_room)
+            self._end_rotated(room_thread)
             if room_thread is None:
                 raise RoomLaunchError("there is no open room; nothing was opened")
             newest = self._newest(room_thread)
@@ -325,24 +371,32 @@ class RoomLauncher:
                     why = "room child exited"
                 elif self._store._read(lambda conn: liveness(conn, newest[0])).latched:
                     why = "room latched not live"
-                if why is None and newest[1] == "active":
-                    sid = self._store._read(lambda conn: self._resume_for(conn, newest[0]))
-                    return RoomHandle(newest[0], room_thread, sid or "", False)
+                if held is not None and why is None and newest[1] == "active":
+                    return RoomHandle(newest[0], room_thread, held.session_id, held.resumed, held.resume_failed)
                 self.end(newest[0], why or "room launch replaced")
             resume = None if fresh else self._resume_id(room_thread)
-            return self._open(room_thread, resume)
+            try:
+                return self._open(room_thread, resume)
+            except _ChildExited:
+                if resume is None:
+                    raise
+                # a resume the vendor rejects (a pruned or corrupt conversation) would fail every reopen the same way
+                return self._open(room_thread, None, resume_failed=resume)
 
-    @staticmethod
-    def _resume_for(conn: Any, launch_id: str) -> Optional[str]:
-        row = conn.execute("SELECT harness_session_id FROM launch_events WHERE launch_id = ? AND kind = 'active' "
-                           "ORDER BY seq DESC LIMIT 1", (launch_id,)).fetchone()
-        return None if row is None else row[0]
+    def _end_rotated(self, room_thread: Optional[str]) -> list:
+        """End every held launch whose room thread is not ``room_thread`` (the open room, or None). The ids ended."""
+        out = []
+        for launch_id, held in list(self._live.items()):
+            if held.room_thread != room_thread:
+                self._end(launch_id, "room rotated")
+                out.append(launch_id)
+        return out
 
     def _next_conn(self) -> int:
         self._conn += 1
         return self._conn
 
-    def _open(self, room_thread: str, resume: Optional[str]) -> RoomHandle:
+    def _open(self, room_thread: str, resume: Optional[str], *, resume_failed: Optional[str] = None) -> RoomHandle:
         with self._store._write() as (conn, now):
             ln = lease.open_room_launch(conn, now, harness="claude", model=self._setting.model,
                                         cwd=self._setting.cwd, room_thread=room_thread, pid=os.getpid(),
@@ -350,24 +404,24 @@ class RoomLauncher:
         launch_id = ln.launch_id
         nonce = secrets.token_hex(16)
         workdir = self._run_dir / launch_id
+        sid = resume or str(uuid.uuid4())             # the one id the child is given, and must report
         proc = session = None
         try:
-            argv, decoy, stderr_path = self._write_files(workdir, launch_id, resume)
+            argv, decoy, stderr_path = self._write_files(workdir, launch_id, resume, sid)
             env = dict(self._environ if self._environ is not None else os.environ)
             env[ROOM_ENV] = "1"
             with open(stderr_path, "ab") as errf:
                 proc = self._spawn(argv, cwd=self._setting.cwd, env=env, stderr=errf)
-            session = RoomSession(PipeTransport(proc), child=proc, conn=self._next_conn(),
-                                  session_id=resume or argv[argv.index("--session-id") + 1])
-            self._live[launch_id] = _Live(launch_id, session, proc, workdir)
-            self._svc.activate(launch_id, "probing", "room spawned", spawn_nonce=nonce)
-            init = self._open_check(session, proc, decoy, stderr_path)
-            sid = init.raw.get("session_id")
+            session = RoomSession(PipeTransport(proc), child=proc, conn=self._next_conn(), session_id=sid)
+            self._live[launch_id] = _Live(launch_id, session, proc, workdir, room_thread=room_thread, session_id=sid,
+                                          resumed=resume is not None, resume_failed=resume_failed)
+            self._svc.activate(launch_id, "probing", "room spawned" if resume_failed is None else _one_line(
+                f"room spawned as a fresh session after the resume of {resume_failed} exited", 200), spawn_nonce=nonce)
+            init = self._open_check(session, proc, decoy, stderr_path, sid)
             digest = "sha256:" + hashlib.sha256(json.dumps(argv, sort_keys=True).encode()).hexdigest()
-            with self._store._write() as (conn, now):
-                got, why = lease.activate_room(conn, now, launch_id, harness_session_id=sid, argv_sha256=digest)
-            if why is not None:
-                raise RoomLaunchError(f"the room launch could not be activated: {why}")
+            # the launch stays pending, so send_room resolves nothing to it, until it is attached, live and holds a
+            # vendor position; activation is the last step (L3_rme_r1 codex HIGH 1: a send in between was stored
+            # refused or cancelled for good under its outbox_id)
             self._svc.attach(launch_id, session)
             self._svc.activate(launch_id, "live", "room open check passed", evidence=init, spawn_nonce=nonce,
                                canary=RoomCanary(True, decoy, "the canary Read was denied"),
@@ -378,7 +432,17 @@ class RoomLauncher:
             fold = self._store._read(lambda conn: liveness(conn, launch_id))
             if not fold.enabled:
                 raise RoomLaunchError(f"the room was turned off by its own open check: {fold.why_not}")
-            return RoomHandle(launch_id, room_thread, sid, resume is not None)
+            if proc.poll() is not None:
+                raise RoomLaunchError(f"the room child exited (code {proc.returncode}) before it was activated"
+                                      f"{self._tail(stderr_path)}")
+            with self._store._write() as (conn, now):
+                # the room read at the top of ensure may have rotated during the open check (codex HIGH 3)
+                if _open_room(conn) != room_thread:
+                    raise RoomLaunchError(f"room {room_thread} rotated during the open; this launch is not activated")
+                got, why = lease.activate_room(conn, now, launch_id, harness_session_id=sid, argv_sha256=digest)
+            if why is not None:
+                raise RoomLaunchError(f"the room launch could not be activated: {why}")
+            return RoomHandle(launch_id, room_thread, sid, resume is not None, resume_failed)
         except BaseException as exc:
             if proc is not None and launch_id not in self._live:
                 _stop_child(proc)                        # spawned, but not yet held: nothing else will stop it
@@ -390,7 +454,7 @@ class RoomLauncher:
                                       ) from exc
             raise
 
-    def _write_files(self, workdir: Path, launch_id: str, resume: Optional[str]) -> tuple:
+    def _write_files(self, workdir: Path, launch_id: str, resume: Optional[str], sid: str) -> tuple:
         self._run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         workdir.mkdir(mode=0o700)
         os.chmod(workdir, 0o700)
@@ -409,12 +473,14 @@ class RoomLauncher:
         decoy_dir.mkdir(mode=0o700)
         decoy = put("decoy/" + _CANARY_NAME, "DECOY\n")
         argv = room_argv(mcp_config=mcp, settings=settings, model=self._setting.model, claude_bin=self._setting.claude_bin,
-                         **({"resume": resume} if resume else {"session_id": str(uuid.uuid4())}))
+                         **({"resume": resume} if resume else {"session_id": sid}))
         return argv, str(decoy), stderr
 
-    def _open_check(self, session: RoomSession, proc: Any, decoy: str, stderr_path: Path) -> LivenessEvidence:
-        """Send the canary turn, wait for it to end, and return the ``init`` it produced once the probe and the canary
-        accept it. Raises :class:`RoomLaunchError` with the reason otherwise."""
+    def _open_check(self, session: RoomSession, proc: Any, decoy: str, stderr_path: Path,
+                    sid: str) -> LivenessEvidence:
+        """Send the canary turn, wait for it to end, and return the ``init`` it produced once the probe, the launch's
+        cwd, the session id the child was given (``sid``) and the canary all accept it. Raises
+        :class:`RoomLaunchError` with the reason otherwise (:class:`_ChildExited` when the child exited first)."""
         try:
             sent = session.send(SendCommand("room-open-check", CANARY_PROMPT.format(path=decoy), (), "queue", None))
         except Exception as exc:  # noqa: BLE001
@@ -429,21 +495,28 @@ class RoomLauncher:
             if ended:
                 break
             if proc.poll() is not None and session.output_ended:
-                raise RoomLaunchError(f"the room child exited (code {proc.returncode}) before its open check ended"
-                                      f"{self._tail(stderr_path)}")
+                raise _ChildExited(f"the room child exited (code {proc.returncode}) before its open check ended"
+                                   f"{self._tail(stderr_path)}")
             if time.monotonic() > deadline:
                 raise RoomLaunchError(f"the room's open check did not end within {self._deadline:g} s"
                                       f"{self._tail(stderr_path)}")
             time.sleep(_POLL)
+        if proc.poll() is not None:
+            raise RoomLaunchError(f"the room child exited (code {proc.returncode}) after its open check"
+                                  f"{self._tail(stderr_path)}")
         probe = open_probe(init.raw)
         if not probe.live:
             raise RoomLaunchError(f"the room could not open with its read-only tools: {probe.reason}")
+        why = cwd_refusal(init.raw, self._setting.cwd)
+        if why is not None:
+            raise RoomLaunchError(f"the room could not open in its cwd: {why}")
+        got = init.raw.get("session_id")
+        if got != sid:
+            raise RoomLaunchError(_one_line(f"the room child reports session id {str(got)[:60]!r}, not the "
+                                            f"{sid[:60]!r} it was given"))
         verdict = canary_denied(session.recent_frames(), decoy)
         if not verdict.denied:
             raise RoomLaunchError(f"the room's open check found its deny rules not holding: {verdict.reason}")
-        sid = init.raw.get("session_id")
-        if not isinstance(sid, str) or not sid:
-            raise RoomLaunchError("the room child reported no session id")
         return init
 
     @staticmethod
@@ -471,6 +544,10 @@ class RoomLauncher:
         held = self._live.pop(launch_id, None)
         if held is not None:
             _stop_child(held.proc)                       # first, with no lock: it frees a send blocked in the pipe
+            try:
+                held.session.close()                     # a session never attached is closed by nothing else
+            except Exception:  # noqa: BLE001 - the launch must still end
+                pass
         try:
             self._svc.detach(launch_id)
         except Exception:  # noqa: BLE001 - the launch must still end
@@ -496,9 +573,10 @@ class RoomLauncher:
     # --- lapse ------------------------------------------------------------------------------------------------------
     def recycle_idle(self) -> list:
         """End the room's child if it has been quiet for the idle time: no turn open, no unsettled line, nothing recorded
-        for the launch since. The next :meth:`ensure` resumes. The ids ended."""
-        out = []
+        for the launch since. The next :meth:`ensure` resumes. A launch whose room thread is no longer the open room is
+        ended whatever its activity (a rotation). The ids ended."""
         with self._lock:
+            out = self._end_rotated(self._store._read(_open_room))
             for launch_id, held in list(self._live.items()):
                 if held.proc.poll() is not None or held.session.pending_lines() or self._unsettled(launch_id):
                     continue
