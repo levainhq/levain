@@ -4291,26 +4291,30 @@ def _ask(prompt: str) -> bool:
 
 
 _KEEP_MEANING = (
-    "Keeping a key gives it FULL authority over this laptop's presence: whoever holds it can sign what this\n"
-    "laptop's presence signs. A key that lives on this laptop (a file under ~/.ssh, an agent's key) is not a\n"
-    "recovery path: lose the laptop and you lose the key with it. Keep only a key you made for this; an\n"
-    "everyday SSH or GitHub key is a no. Anything but y keeps nothing.\n")
+    "Keeping a key keeps it at its class. A laptop-presence key has FULL authority over this laptop's presence:\n"
+    "whoever holds it can sign what this laptop's presence signs. A key that lives on this laptop (a file under\n"
+    "~/.ssh, an agent's key) is not a recovery path: lose the laptop and you lose the key with it. Keep only a\n"
+    "key you made for this; an everyday SSH or GitHub key is a no. Anything but y or yes keeps nothing.\n")
 
 
 def _keep_prompt(fp: str, what: str, plan: object, signer_fp: str, signer_pub: str, signer_custody: str) -> str:
-    """The keep question for one key: what keeping means, the key's type and custody as the store knows them
+    """The keep question for one key: what keeping means, the key's class, type and custody as the store knows them
     (a legacy row's custody is 'unstated'; the store holds no comment, only the fingerprint), then the ask."""
-    key_type, custody = "?", "unstated"
+    from levain.authority import LAPTOP
+
+    key_type, custody, cls = "?", "unstated", "?"
     if fp == signer_fp:
-        key_type, custody = (signer_pub.split() or ["?"])[0], signer_custody
+        key_type, custody, cls = (signer_pub.split() or ["?"])[0], signer_custody, LAPTOP
     else:
         for r in plan.rows:                                     # type: ignore[attr-defined]
             if r.fingerprint == fp:
-                key_type = r.key_type
+                key_type, cls = r.key_type, r.key_class
         for k in plan.log_keys:                                 # type: ignore[attr-defined]
             if k.fingerprint == fp:
-                custody = k.custody
-    return f"\n{_KEEP_MEANING}  key type {key_type}, custody {custody}\nkeep {fp}{what}? [y/N] "
+                custody, cls = k.custody, k.key_class
+                if k.public_key and key_type == "?":
+                    key_type = k.public_key.split()[0]
+    return f"\n{_KEEP_MEANING}  class {cls}, key type {key_type}, custody {custody}\nkeep {fp}{what}? [y/N] "
 
 
 def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:

@@ -728,7 +728,7 @@ def test_keep_prompt_states_what_keeping_means_before_asking(v2, monkeypatch):
         assert "FULL authority over this laptop's presence" in p
         assert "not a\nrecovery path" in p or "not a recovery path" in " ".join(p.split())
         assert p.rstrip().endswith("? [y/N]")
-    assert "custody passphrase" in seen[0] and "custody unstated" in seen[1]
+    assert "class laptop-presence" in seen[0] and "custody passphrase" in seen[0] and "custody unstated" in seen[1]
     assert k["P"].fingerprint in seen[1] and "key type ssh-" in seen[1]
 
 
