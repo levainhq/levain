@@ -652,7 +652,7 @@ def make_run(factory: Callable[[Any, str, int], Mapping[str, Any]]) -> Callable[
             sup = kw.pop("sup")
             return run_body(sup, occurrence_id, launch_epoch, **kw).code
         except Exception as exc:  # noqa: BLE001
-            _log.warning("dream run for %s could not be built or ran out: %s", occurrence_id, type(exc).__name__)
+            _log.warning("dream run for %s could not be built or ran out: %s: %s", occurrence_id, type(exc).__name__, exc)
             return 1
 
     return run
@@ -678,24 +678,87 @@ class DreamInstall:
     claude_bin: str = "claude"
 
 
+INSTALL_SCHEMA = 1
+
+
+class InstallRefused(ValueError):
+    """The install facts cannot be written or trusted; the message names the file and the one fact at fault."""
+
+
+def _fact_path(doc: Mapping[str, Any], key: str, path: Path, *, kind: str) -> Path:
+    raw = doc.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        raise InstallRefused(f"{path} lacks {key}")
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        raise InstallRefused(f"{path}: {key} {raw!r} is not an absolute path")
+    exists = p.is_file() if kind == "file" else p.is_dir()
+    if not exists:
+        raise InstallRefused(f"{path} is stale: {key} {raw!r} is no longer {'a file' if kind == 'file' else 'a directory'}")
+    return p
+
+
 def read_install(agent_dir: Path | str) -> DreamInstall:
-    """The install facts from ``<agent_dir>/dream_install.json``. A file that is absent, unreadable or missing a key
-    raises ``ValueError`` naming it: a dream that cannot find its install does not run."""
+    """The install facts from ``<agent_dir>/dream_install.json``. A file that is absent, unreadable, of another schema,
+    missing a key, holding a relative path, or naming a path that no longer exists raises :class:`InstallRefused`
+    (a ``ValueError``) naming the file and the fact: a dream that cannot find its install does not run."""
     path = Path(agent_dir) / INSTALL_FILE
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, UnicodeDecodeError) as exc:
-        raise ValueError(f"the dream install facts cannot be read from {path} ({type(exc).__name__})") from exc
+        raise InstallRefused(f"the dream install facts cannot be read from {path} ({type(exc).__name__}); "
+                             "run `levain dream enable --store-dir <dir>`") from exc
     if not isinstance(doc, dict):
-        raise ValueError(f"{path} is not a JSON object")
-    missing = [k for k in _INSTALL_KEYS if not isinstance(doc.get(k), str) or not doc[k].strip()]
-    if missing:
-        raise ValueError(f"{path} lacks {', '.join(missing)}")
+        raise InstallRefused(f"{path} is not a JSON object")
+    if doc.get("schema") != INSTALL_SCHEMA:
+        raise InstallRefused(f"{path} has schema {doc.get('schema')!r}, not {INSTALL_SCHEMA}; "
+                             "run `levain dream enable --store-dir <dir>` again")
+    zone = doc.get("zone")
+    if not isinstance(zone, str) or not zone.strip():
+        raise InstallRefused(f"{path} lacks zone")
+    store_path = _fact_path(doc, "store_path", path, kind="file")
+    cockpit_root = _fact_path(doc, "cockpit_root", path, kind="dir")
+    coord_dir = _fact_path(doc, "coord_dir", path, kind="dir")
     facts = doc.get("facts_path")
-    return DreamInstall(Path(doc["store_path"]).expanduser(), Path(doc["cockpit_root"]).expanduser(),
-                        Path(doc["coord_dir"]).expanduser(), doc["zone"],
+    return DreamInstall(store_path, cockpit_root, coord_dir, zone,
                         None if facts is None else Path(facts).expanduser(),
                         doc.get("model") or "claude-opus-5-5", doc.get("claude_bin") or "claude")
+
+
+def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root: Path | str, coord_dir: Path | str,
+                  zone: str, facts_path: Path | str | None = None) -> Path:
+    """Write ``<agent_dir>/dream_install.json`` atomically (a temp file in the directory, fsynced, mode 0600, renamed
+    over the old one) from absolute paths that must exist, and read it back through :func:`read_install`. Raises
+    :class:`InstallRefused` before writing anything when a fact is not usable."""
+    import os
+    import tempfile
+
+    d = Path(agent_dir)
+    path = d / INSTALL_FILE
+    doc: dict[str, Any] = {"schema": INSTALL_SCHEMA, "store_path": str(store_path), "cockpit_root": str(cockpit_root),
+                           "coord_dir": str(coord_dir), "zone": zone}
+    if facts_path is not None:
+        doc["facts_path"] = str(facts_path)
+    for key, kind in (("store_path", "file"), ("cockpit_root", "dir"), ("coord_dir", "dir")):
+        _fact_path(doc, key, path, kind=kind)
+    if not isinstance(zone, str) or not zone.strip():
+        raise InstallRefused(f"{path} lacks zone")
+    fd, tmp = tempfile.mkstemp(prefix=INSTALL_FILE + ".", dir=str(d))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    read_install(d)
+    return path
 
 
 def install_on_input(agent_dir: Path | str, *, clock: Callable[[], datetime] | None = None

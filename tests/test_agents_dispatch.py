@@ -120,12 +120,90 @@ def test_bool_on_input_is_the_verdicts_ok_and_nothing_else():
     assert da.bool_on_input(lambda row: ok)({}) is True and da.bool_on_input(lambda row: no)({}) is False
 
 
+def _facts(tmp_path):
+    db = tmp_path / "st" / "memory.db"
+    db.parent.mkdir()
+    db.write_bytes(b"")
+    ck, cd = tmp_path / "ck", tmp_path / "cd"
+    ck.mkdir()
+    cd.mkdir()
+    return dict(store_path=db, cockpit_root=ck, coord_dir=cd, zone="America/New_York")
+
+
 def test_read_install_refuses_what_it_cannot_read(tmp_path):
-    with pytest.raises(ValueError, match="cannot be read"):
+    with pytest.raises(da.InstallRefused, match="cannot be read"):
         da.read_install(tmp_path)
-    (tmp_path / da.INSTALL_FILE).write_text(json.dumps({"store_path": "/x"}))
-    with pytest.raises(ValueError, match="lacks cockpit_root"):
+    (tmp_path / da.INSTALL_FILE).write_text(json.dumps({"schema": 1, "store_path": "/x"}))
+    with pytest.raises(da.InstallRefused, match="lacks zone"):
         da.read_install(tmp_path)
-    (tmp_path / da.INSTALL_FILE).write_text(json.dumps({"store_path": "/x", "cockpit_root": "/c", "coord_dir": "/q",
-                                                       "zone": "America/New_York"}))
-    assert da.read_install(tmp_path).zone == "America/New_York"
+    (tmp_path / da.INSTALL_FILE).write_text(json.dumps({"store_path": "/x", "zone": "z"}))
+    with pytest.raises(da.InstallRefused, match="schema None"):
+        da.read_install(tmp_path)
+
+
+def test_write_install_is_atomic_0600_and_round_trips(tmp_path):
+    f = _facts(tmp_path)
+    ad = tmp_path / "ag"
+    ad.mkdir()
+    path = da.write_install(ad, **f)
+    assert path.stat().st_mode & 0o777 == 0o600 and [p.name for p in ad.iterdir()] == [da.INSTALL_FILE]
+    inst = da.read_install(ad)
+    assert inst.store_path == f["store_path"] and inst.zone == "America/New_York"
+
+
+def test_a_stale_or_relative_install_is_refused_by_name(tmp_path):
+    f = _facts(tmp_path)
+    ad = tmp_path / "ag"
+    ad.mkdir()
+    da.write_install(ad, **f)
+    f["coord_dir"].rmdir()
+    with pytest.raises(da.InstallRefused, match="stale: coord_dir"):
+        da.read_install(ad)
+    with pytest.raises(da.InstallRefused, match="coord_dir"):
+        da.write_install(ad, **{**f, "coord_dir": "rel/dir"})
+    doc = json.loads((ad / da.INSTALL_FILE).read_text())
+    doc["cockpit_root"] = "rel"
+    (ad / da.INSTALL_FILE).write_text(json.dumps(doc))
+    with pytest.raises(da.InstallRefused, match="not an absolute path"):
+        da.read_install(ad)
+
+
+def test_enable_with_a_store_dir_writes_the_facts_a_fire_then_gets_past(tmp_path, capsys):
+    import argparse
+    from levain.agents import store as agent_store
+    from levain.dream.cli import add_parsers
+
+    f = _facts(tmp_path)
+    ag = tmp_path / "ag"
+    agent_store.set_default_zone(agent_store.open_agent_store(ag), "America/New_York")
+    p = argparse.ArgumentParser()
+    add_parsers(p.add_subparsers())
+    args = p.parse_args(["dream", "enable", "--agent-store-dir", str(ag), "--json"])
+    assert args.func(args) == 0 and json.loads(capsys.readouterr().out)["install_facts"] is None
+    with pytest.raises(da.InstallRefused, match="cannot be read"):      # the state before: nothing wrote the file
+        da.read_install(ag)
+    args = p.parse_args(["dream", "enable", "--agent-store-dir", str(ag), "--store-dir", str(f["store_path"].parent),
+                         "--cockpit-root", str(f["cockpit_root"]), "--coord-dir", str(f["coord_dir"]), "--json"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["install_facts"] == str(ag / da.INSTALL_FILE)
+    assert da.read_install(ag).coord_dir == f["coord_dir"].resolve()
+    bad = p.parse_args(["dream", "enable", "--agent-store-dir", str(ag), "--store-dir", str(tmp_path / "nope"),
+                        "--cockpit-root", str(f["cockpit_root"]), "--coord-dir", str(f["coord_dir"])])
+    assert bad.func(bad) == 1 and "no memory.db" in capsys.readouterr().err
+
+
+def test_a_fire_with_the_enabled_facts_gets_past_install_to_its_next_refusal(tmp_path):
+    # behaviour: with the facts file `dream enable` writes, the fire no longer ends on the missing install; whatever
+    # it meets next is named in its log (no Opus compose runs: the facts file's exposure check refuses first)
+    rig = Rig(tmp_path)
+    rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
+    rig.link()
+    oid = rig.claim("k")
+    assert rig.launch(oid).outcome == "launched"
+    _rename(rig, "dream")
+    da.write_install(rig.store.directory, **_facts(tmp_path))
+    proc = ctl.spawn_fire(rig.store.directory, oid, env=ENV)
+    code = proc.wait(60)
+    log = (rig.store.directory / "fires" / f"{oid}.log").read_text()
+    assert "cannot be read" not in log and "stale" not in log
+    assert code == 1 and "ExposureRefused" in log
