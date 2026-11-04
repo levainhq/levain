@@ -153,6 +153,22 @@ def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expire
             f"counted as consolidated and are not offered again. Until: {expires}, review by the same date.")
 
 
+def shadow_signing_card_text(zone: str, *, flow_root: Path | str, scratch: Path | str, model: str, per_run_usd: float,
+                             night_usd: float, expires: str) -> str:
+    """The signing card's words for a SHADOW install (D1_EXECUTOR section 8): what it reads, where it writes and what
+    it costs, from the install's own facts and the caller's ``R``. The link it describes is the same spec_hash as a
+    live install's; the words differ because what the dream does under it differs."""
+    return (f"Dream runs as a SHADOW of flow's dream, once a night between 22:00 and 05:00 ({zone}), and only for a "
+            f"day flow's own dream has committed. Its input is flow's committed pre-dream snapshot, read from "
+            f"{flow_root} (read only, hashes checked) and copied into the scratch store {scratch}. Its output goes to "
+            "that scratch store only: it never writes ~/.anneal-memory, flow's memory text or anything under flow's "
+            "state, and it never sends, pushes or publishes. Each night it files one comparison card (its text against "
+            f"flow's). It composes with {model}, a paid model call at list price, and spends at most "
+            f"${per_run_usd:.2f} a run and ${night_usd:.2f} a night (2 runs), the same limits as a live dream. Undo: "
+            "nothing to undo, the scratch store is a copy. Stop it with `levain agents pause`, `retire` or `revoke`, "
+            f"or by deleting the install facts file. Until: {expires}, review by the same date.")
+
+
 # ------------------------------------------------------------------------------------------------------ input check
 
 @dataclass(frozen=True)
@@ -700,13 +716,19 @@ class DreamInstall:
     model: str = "claude-opus-5-5"
     claude_bin: str = "claude"
     #: a SHADOW install (D1_EXECUTOR section 8): flow's ``state/dream`` root this install reads as input. Set, the
-    #: install's ``store_path`` is a scratch copy re-seeded each night, and ``instructions_path`` is the read-only copy
-    #: of flow's instructions the compose is given.
+    #: install's ``store_path`` is a scratch copy re-seeded each night, ``flow_instructions`` is flow's instructions
+    #: file, and ``instructions_path`` is the read-only copy of it (``SHADOW_INSTRUCTIONS`` in the agent store's
+    #: directory, re-copied at each seed) the compose is given.
     shadow_flow_root: Path | None = None
     instructions_path: Path | None = None
+    flow_instructions: Path | None = None
 
 
 INSTALL_SCHEMA = 1
+#: the read-only copy of flow's instructions a shadow install composes with, in the agent store's directory
+SHADOW_INSTRUCTIONS = "shadow_instructions.md"
+#: the install facts only a shadow install carries; a write that does not pass ``shadow_flow_root`` drops them all
+SHADOW_FACTS = ("shadow_flow_root", "flow_instructions")
 
 
 class InstallRefused(ValueError):
@@ -731,10 +753,76 @@ def _fact_path(doc: Mapping[str, Any], key: str, path: Path, *, kind: str, writi
     return p
 
 
+def shadow_store_refusal(store_path: Path | str, flow_root: Path | str | None = None) -> str | None:
+    """Why ``store_path`` may not be a shadow install's scratch store, or None. Refused: a relative path; a store or a
+    store directory that RESOLVES (symlinks followed) inside the operator's live store ``~/.anneal-memory``
+    (case-insensitive); and, given ``flow_root``, one inside flow's ``state/dream`` root (a seed would write under
+    flow's state). The one check the enable, the read of the facts and the fire all call."""
+    from levain.firing.isolation import _is_within_ci, flow_store_dir
+
+    sp = Path(store_path).expanduser()
+    if not sp.is_absolute():
+        return f"store_path {str(store_path)!r} is not an absolute path"
+    live = flow_store_dir().resolve()
+    for p in (sp, sp.parent):
+        if _is_within_ci(p.resolve(), live):
+            return (f"a shadow store_path {str(store_path)!r} resolves inside the operator's live store "
+                    "(~/.anneal-memory): a shadow only ever seeds a scratch copy")
+    if flow_root is not None:
+        root = Path(flow_root).expanduser().resolve()
+        for p in (sp, sp.parent):
+            if _is_within_ci(p.resolve(), root):
+                return (f"a shadow store_path {str(store_path)!r} resolves inside flow's dream root {root}: a seed "
+                        "would write under flow's state")
+    return None
+
+
+def copy_instructions(src: Path | str, dest: Path | str) -> str:
+    """Copy flow's instructions file ``src`` to ``dest`` read-only (0444), replacing it atomically (a temp file in
+    ``dest``'s directory renamed over it, so a compose reading ``dest`` sees the old copy or the new one, never half).
+    Returns the copy's sha256. Raises ``OSError`` when ``src`` cannot be read or ``dest`` written."""
+    import hashlib
+    import os
+    import tempfile
+
+    data = Path(src).expanduser().read_bytes()
+    dest = Path(dest)
+    fd, tmp = tempfile.mkstemp(prefix=dest.name + ".", suffix=".tmp", dir=str(dest.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o444)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return hashlib.sha256(data).hexdigest()
+
+
+def install_kind(agent_dir: Path | str) -> str | None:
+    """``"shadow"`` or ``"live"`` for the install facts file in ``agent_dir``, or None when there is none (or it is
+    not a JSON object, which no fire can read either)."""
+    try:
+        doc = json.loads((Path(agent_dir) / INSTALL_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    return "shadow" if doc.get("shadow_flow_root") is not None else "live"
+
+
 def read_install(agent_dir: Path | str) -> DreamInstall:
-    """The install facts from ``<agent_dir>/dream_install.json``. A file that is absent, unreadable, of another schema,
-    missing a key, holding a relative path, or naming a path that no longer exists raises :class:`InstallRefused`
-    (a ``ValueError``) naming the file and the fact: a dream that cannot find its install does not run."""
+    """The install facts from ``<agent_dir>/dream_install.json``. A file that is absent, unreadable or of another
+    schema, or a fact that is missing, malformed or no longer usable, raises :class:`InstallRefused` (a ``ValueError``)
+    naming the file and the fact: a dream that cannot find its install does not run. Every path fact must be absolute;
+    each one the run reads must exist (the scratch store of a shadow install is created by its first seed, so it need
+    not); a shadow store is refused by :func:`shadow_store_refusal` here too, so a hand-written file cannot point a
+    fire at the live store."""
     path = Path(agent_dir) / INSTALL_FILE
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
@@ -756,8 +844,11 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
     else:
         # a shadow store is created by the first seed: its path must be absolute, never required to exist yet
         raw = doc.get("store_path")
-        if not isinstance(raw, str) or not raw.strip() or not Path(raw).expanduser().is_absolute():
+        if not isinstance(raw, str) or not raw.strip():
             raise InstallRefused(f"{path}: store_path {raw!r} is not an absolute path")
+        why = shadow_store_refusal(raw, shadow_root)
+        if why:
+            raise InstallRefused(f"{path}: {why}")
         store_path = Path(raw).expanduser()
     cockpit_root = _fact_path(doc, "cockpit_root", path, kind="dir")
     coord_dir = _fact_path(doc, "coord_dir", path, kind="dir")
@@ -770,29 +861,42 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
         v = doc.get(key)
         if v is not None and (not isinstance(v, str) or not v.strip()):
             raise InstallRefused(f"{path}: {key} {v!r} is not a non-empty string")
-    instr = None
-    if doc.get("instructions_path") is not None:
-        if shadow_root is None:
-            raise InstallRefused(f"{path}: instructions_path is a shadow install fact, and this install is not a shadow")
-        instr = _fact_path(doc, "instructions_path", path, kind="file")
-    if shadow_root is not None and instr is None:
-        raise InstallRefused(f"{path} is a shadow install without instructions_path: the comparison needs flow's "
-                             "instructions, so a shadow never composes under Levain's own")
+    instr = src = None
+    if doc.get("flow_instructions") is not None and shadow_root is None:
+        raise InstallRefused(f"{path}: flow_instructions is a shadow install fact, and this install is not a shadow")
+    if shadow_root is not None:
+        if doc.get("flow_instructions") is None:
+            raise InstallRefused(f"{path} is a shadow install without flow_instructions: the comparison needs flow's "
+                                 "instructions, so a shadow never composes under Levain's own")
+        src = _fact_path(doc, "flow_instructions", path, kind="file")
+        instr = Path(agent_dir) / SHADOW_INSTRUCTIONS
+        if not instr.is_file():
+            raise InstallRefused(f"{path}: the shadow's instructions copy {instr} is missing; run `levain dream enable` "
+                                 "again")
     return DreamInstall(store_path, cockpit_root, coord_dir, zone,
                         None if facts is None else Path(facts).expanduser(),
                         doc.get("model") or "claude-opus-5-5", doc.get("claude_bin") or "claude",
-                        shadow_root, instr)
+                        shadow_root, instr, src)
 
 
 def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root: Path | str, coord_dir: Path | str,
                   zone: str, facts_path: Path | str | None = None, model: str | None = None,
                   claude_bin: str | None = None, shadow_flow_root: Path | str | None = None,
-                  instructions_path: Path | str | None = None) -> Path:
+                  flow_instructions: Path | str | None = None, replace_install: bool = False,
+                  check_only: bool = False) -> Path:
     """Write ``<agent_dir>/dream_install.json`` atomically (a temp file in the directory, fsynced, mode 0600, renamed
-    over the old one) from absolute paths that must exist, and read it back through :func:`read_install`. Raises
-    :class:`InstallRefused` before writing anything when a fact is not usable. The optional facts (``facts_path``,
-    ``model``, ``claude_bin``) are MERGED: one not passed keeps the value the existing file holds, so re-running
-    ``enable`` never erases what the operator set."""
+    over the old one), and read it back through :func:`read_install`. The checks :func:`read_install` makes are made
+    here first (the instructions copy aside: this call makes it), plus two only an enable needs: a shadow's flow root
+    must hold ``ledger.jsonl``, and its scratch directory, if it exists, must be empty or carry the shadow marker. A
+    refusal raises :class:`InstallRefused` before anything is written; ``check_only`` makes every check and writes
+    nothing.
+
+    The mode-agnostic optional facts (``facts_path``, ``model``, ``claude_bin``) are MERGED: one not passed keeps the
+    value the existing file holds, so re-running ``enable`` never erases what the operator set. The shadow facts
+    (:data:`SHADOW_FACTS`) are never merged: a call without ``shadow_flow_root`` writes a live install. A call that
+    would turn an existing live install into a shadow, or a shadow into a live one, is refused naming the switch unless
+    ``replace_install`` is passed, since both kinds answer to the same signed link. A shadow write copies
+    ``flow_instructions`` read-only to :data:`SHADOW_INSTRUCTIONS` beside the facts file before writing them."""
     import os
     import tempfile
 
@@ -806,29 +910,45 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
         prior = {}
     if not isinstance(prior, dict):
         prior = {}
-    for key, given in (("facts_path", facts_path), ("model", model), ("claude_bin", claude_bin),
-                       ("shadow_flow_root", shadow_flow_root), ("instructions_path", instructions_path)):
+    for key, given in (("facts_path", facts_path), ("model", model), ("claude_bin", claude_bin)):
         if given is not None:
             doc[key] = str(given)
         elif prior.get(key) is not None:
             doc[key] = prior[key]
+    for key, given in (("shadow_flow_root", shadow_flow_root), ("flow_instructions", flow_instructions)):
+        if given is not None:
+            doc[key] = str(given)
     shadow = "shadow_flow_root" in doc
+    if prior and not replace_install:
+        was = "shadow" if prior.get("shadow_flow_root") is not None else "live"
+        now = "shadow" if shadow else "live"
+        if was != now:
+            raise InstallRefused(f"{path} holds a {was} install and this would replace it with a {now} install; both "
+                                 "answer to the same signed link, so the switch is never silent: pass --replace-install "
+                                 "(replace_install=True) to make it")
     if shadow:
-        _fact_path(doc, "shadow_flow_root", path, kind="dir", writing=True)
-        if "instructions_path" not in doc:
-            raise InstallRefused(f"{path}: a shadow install needs instructions_path (flow's instructions, read-only)")
-        _fact_path(doc, "instructions_path", path, kind="file", writing=True)
-        sp = Path(str(store_path)).expanduser()
-        if not sp.is_absolute():
-            raise InstallRefused(f"{path}: store_path {str(store_path)!r} is not an absolute path")
-        from levain.firing.isolation import _is_within_ci, flow_store_dir
-        if _is_within_ci(sp.resolve(), flow_store_dir().resolve()):
-            raise InstallRefused(f"{path}: a shadow store_path {str(store_path)!r} resolves inside the operator's live "
-                                 "store (~/.anneal-memory): a shadow only ever seeds a scratch copy")
+        root = _fact_path(doc, "shadow_flow_root", path, kind="dir", writing=True)
+        if not (root / "ledger.jsonl").is_file():
+            raise InstallRefused(f"{path}: shadow_flow_root {str(root)!r} carries no ledger.jsonl, so it is not flow's "
+                                 "state/dream directory")
+        if "flow_instructions" not in doc:
+            raise InstallRefused(f"{path}: a shadow install needs flow_instructions (flow's instructions file)")
+        _fact_path(doc, "flow_instructions", path, kind="file", writing=True)
+        why = shadow_store_refusal(store_path, root)
+        if why:
+            raise InstallRefused(f"{path}: {why}")
+        from levain.dream import shadow as _shadow
+        scratch = Path(store_path).expanduser().parent
+        if scratch.exists() and not scratch.is_dir():
+            raise InstallRefused(f"{path}: the scratch directory {scratch} is not a directory")
+        if scratch.is_dir() and not (scratch / _shadow.MARKER).exists() and any(
+                x.name != _shadow.NIGHT_LOCK for x in scratch.iterdir()):
+            raise InstallRefused(f"{path}: the scratch directory {scratch} is not empty and carries no "
+                                 f"{_shadow.MARKER} marker, so every seed would refuse it")
         keys = (("cockpit_root", "dir"), ("coord_dir", "dir"))
     else:
-        if "instructions_path" in doc:
-            raise InstallRefused(f"{path}: instructions_path is a shadow install fact (pass shadow_flow_root too)")
+        if "flow_instructions" in doc:
+            raise InstallRefused(f"{path}: flow_instructions is a shadow install fact (pass shadow_flow_root too)")
         keys = (("store_path", "file"), ("cockpit_root", "dir"), ("coord_dir", "dir"))
     for key, kind in keys:
         _fact_path(doc, key, path, kind=kind, writing=True)
@@ -840,6 +960,14 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
         v = doc.get(key)
         if v is not None and (not isinstance(v, str) or not v.strip()):
             raise InstallRefused(f"{path}: {key} {v!r} is not a non-empty string")
+    if check_only:
+        return path
+    if shadow:
+        try:
+            copy_instructions(doc["flow_instructions"], d / SHADOW_INSTRUCTIONS)
+        except OSError as exc:
+            raise InstallRefused(f"{path}: flow_instructions could not be copied to {d / SHADOW_INSTRUCTIONS} "
+                                 f"({type(exc).__name__}: {exc})") from exc
     fd, tmp = tempfile.mkstemp(prefix=INSTALL_FILE + ".", dir=str(d))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -875,8 +1003,13 @@ def install_on_input(agent_dir: Path | str, *, clock: Callable[[], datetime] | N
 
 def _shadow_check(inst: DreamInstall, agent_dir: Path | str) -> Callable[[Mapping[str, Any]], InputVerdict]:
     """A shadow install's input check: flow's committed day (and the seed and the episode check under the night lock)
-    in place of the six checks, which are about a live store a shadow does not have."""
+    in place of the six checks, which are about a live store a shadow does not have. A seed that passes the episode
+    check re-copies flow's instructions file to the read-only copy under the same lock, so the night composes with
+    the instructions flow's own dream read that day, never the ones copied at enable."""
     from levain.dream import shadow as _shadow
+
+    def recopy() -> None:
+        copy_instructions(inst.flow_instructions, inst.instructions_path)
 
     def check(row: Mapping[str, Any]) -> InputVerdict:
         try:
@@ -884,7 +1017,8 @@ def _shadow_check(inst: DreamInstall, agent_dir: Path | str) -> Callable[[Mappin
         except ValueError as exc:
             return InputVerdict(False, _ready.UNREADABLE, "unreadable", str(exc))
         return _shadow.shadow_input(inst.shadow_flow_root, inst.store_path, row, zone=inst.zone,
-                                    occurrences=lambda: _ready._read_occurrences(Path(agent_dir)), agent_id=agent_id)
+                                    occurrences=lambda: _ready._read_occurrences(Path(agent_dir)), agent_id=agent_id,
+                                    on_seeded=recopy)
 
     return check
 
@@ -937,14 +1071,25 @@ def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str,
 def _shadow_run(inst: DreamInstall, day: str, occurrence_id: str, occ_dir: Path, consolidate: Callable[[], Any]):
     """``(consolidate, saved_card)`` for a shadow install: the consolidate runs under the scratch directory's night
     lock and only on a store still seeded from THIS day's snapshot (the marker names the run), with flow's instructions
-    copy as the compose's instructions; the card is the comparison against flow's composed text. Raises before the
-    run exists when flow's day is not readable."""
+    copy as the compose's instructions; the card is the comparison against flow's composed text, stamped with the
+    sha256 of the instructions copy the compose was given. Raises before the run exists when the scratch store is
+    refused (:func:`shadow_store_refusal`) or flow's day is not readable."""
+    import hashlib
+
     from levain.dream import executor as ex
     from levain.dream import shadow as _shadow
     from levain.dream import usage as _usage
 
+    # The same containment check as the enable and read_install, again at the fire: a DreamInstall built any other way
+    # must not reach the night lock (which creates the scratch directory) with the live store. That check is relative to
+    # $HOME, so the night lock's own guard (the store flow's snapshot manifest names as `anneal_db`) stays as the second
+    # check: it catches flow's store wherever it lives, under another $HOME included.
+    why = shadow_store_refusal(inst.store_path, inst.shadow_flow_root)
+    if why:
+        raise InstallRefused(why)
     fd = _shadow.read_flow_day(inst.shadow_flow_root, day)
     instr = inst.instructions_path
+    stamp: dict[str, str] = {}
 
     def guarded() -> Any:
         try:
@@ -955,6 +1100,11 @@ def _shadow_run(inst: DreamInstall, day: str, occurrence_id: str, occ_dir: Path,
                     marker = None
                 if not isinstance(marker, dict) or marker.get("run_id") != fd.run_id:
                     return ex.ConsolidateResult("precondition", 2, f"the shadow store is not seeded from flow's {fd.run_id}")
+                try:
+                    stamp["sha256"] = hashlib.sha256(Path(instr).read_bytes()).hexdigest()
+                except OSError as exc:
+                    return ex.ConsolidateResult("precondition", 2, f"the shadow's instructions copy {instr} cannot be "
+                                                                   f"read ({type(exc).__name__}: {exc})")
                 return consolidate_with_instructions()
         except _shadow.ShadowRefused as exc:
             return ex.ConsolidateResult("precondition", 2, f"shadow store busy or refused: {exc.why}")
@@ -970,7 +1120,8 @@ def _shadow_run(inst: DreamInstall, day: str, occurrence_id: str, occ_dir: Path,
     def saved_card() -> _card.Card:
         _prior, saved = _card.texts_for(inst.store_path, occ_dir)
         return _shadow.shadow_card(fd, saved, occurrence=occurrence_id, occ_dir=occ_dir,
-                                   usage_doc=_usage.read_doc(occ_dir))
+                                   usage_doc=_usage.read_doc(occ_dir),
+                                   instructions=(Path(instr), stamp.get("sha256")))
 
     return guarded, saved_card
 

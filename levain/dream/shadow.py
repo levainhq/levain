@@ -520,9 +520,11 @@ def _refusal_lines(flow: Sequence[str], shadow: Sequence[str]) -> list[str]:
 
 def shadow_card(flow_day: FlowDay, shadow_text: str, *, occurrence: str, occ_dir: Path | str,
                 usage_doc: Mapping[str, Any] | None = None, agent_id: str = "dream", flow_text: str | None = None,
-                reason: str = "") -> _card.Card:
+                reason: str = "", instructions: tuple[Path, str | None] | None = None) -> _card.Card:
     """The comparison card: ``card_diff.txt`` beside the occurrence and counts in the card's ``own`` block. The card
-    is never ``authority_relevant``: it carries no ``his`` entry, and the compose's notes are not read at all."""
+    is never ``authority_relevant``: it carries no ``his`` entry, and the compose's notes are not read at all.
+    ``instructions`` is ``(the instructions copy the compose was given, its sha256 or None)``, stamped as an ``own``
+    line so two nights' cards say whether they measured the same instructions."""
     occ = Path(occ_dir)
     if flow_text is None:
         try:
@@ -536,6 +538,10 @@ def shadow_card(flow_day: FlowDay, shadow_text: str, *, occurrence: str, occ_dir
     shadow_refs = _card._refusals(usage_doc)
     own = [*d.own_lines(), *_refusal_lines(flow_refusals(flow_day.run_dir), shadow_refs),
            f"shadow: full diff {occ / _card.DIFF_FILE} (sha256 {sha[:16]})"]
+    if instructions is not None:
+        ipath, isha = instructions
+        own.append(f"shadow: instructions {ipath} (sha256 {isha[:16]})" if isha else
+                   f"shadow: instructions {ipath} (sha256 not recorded)")
     return _card.build_card("consolidated", occurrence=occurrence, agent_id=agent_id, day=flow_day.day,
                             reason=reason or f"shadow night against flow's {flow_day.run_id}; nothing was saved to a real store",
                             own_extra=own, usage_doc=usage_doc, out_dir=occ,
@@ -607,11 +613,14 @@ def run_night(flow_root: Path | str, day: date | str, shadow_db: Path | str, occ
 
 
 def shadow_input(flow_root: Path | str, shadow_db: Path | str, row: Mapping[str, Any], *, zone: str,
-                 occurrences: Callable[[], Sequence[Mapping[str, Any]]] | None = None, agent_id: str | None = None):
+                 occurrences: Callable[[], Sequence[Mapping[str, Any]]] | None = None, agent_id: str | None = None,
+                 on_seeded: Callable[[], None] | None = None):
     """The shadow's input check for one occurrence row, in the dream's ``InputVerdict`` shape (so the same adapter
     that gives the controller its bool applies): day-ready, then seed and the episode check under the night lock. It
     seeds the SCRATCH store only. ``occurrences`` (the shadow's own history) is required, as in :func:`run_night`:
-    without it an already-shadowed day cannot be ruled out, so the check answers unreadable. Never raises."""
+    without it an already-shadowed day cannot be ruled out, so the check answers unreadable. ``on_seeded`` runs
+    under the same lock after a seed whose episode check passed; one that raises makes the answer unreadable. Never
+    raises."""
     from levain.dream.agent import InputVerdict
 
     if occurrences is None:
@@ -628,6 +637,12 @@ def shadow_input(flow_root: Path | str, shadow_db: Path | str, row: Mapping[str,
                 with night_lock(v.flow_day, shadow_db):
                     seed(v.flow_day, shadow_db)
                     v = episode_check(v.flow_day, shadow_db)
+                    if v.ready and on_seeded is not None:
+                        try:
+                            on_seeded()
+                        except Exception as exc:  # noqa: BLE001 — a seeded night without its inputs is not ready
+                            return InputVerdict(False, _ready.UNREADABLE, KIND_UNREADABLE,
+                                                f"after the seed: {type(exc).__name__}: {exc}")
             except ShadowRefused as exc:
                 return InputVerdict(False, _ready.UNREADABLE, exc.kind, exc.why)
             except OSError as exc:
