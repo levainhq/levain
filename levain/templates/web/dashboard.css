@@ -2711,13 +2711,74 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .th-body .tv-body { margin: var(--sp-1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); color: var(--text); }
 .th-body .tv-gap { margin: 0 0 var(--sp-4); padding: var(--sp-3) var(--sp-4); border-radius: var(--r-sm); border: 1px solid var(--bad); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
 .th-body .tv-before { margin: 0 0 var(--sp-4); padding-bottom: var(--sp-2); border-bottom: 1px dashed var(--hair-2); }
-.th-body .tv-composer { margin-top: var(--sp-5); padding: var(--sp-4) var(--sp-5); border: 1px dashed var(--hair-2); border-radius: var(--r-md); color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
+.th-body .tv-authority { margin: 0 0 var(--sp-4); padding: var(--sp-3) var(--sp-4); border-left: 3px solid var(--info); border-radius: var(--r-sm); background: var(--card-2); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); overflow-wrap: anywhere; }
+.th-body .tv-authority-none, .th-body .tv-authority-ended, .th-body .tv-authority-expired { border-left-color: var(--hair-2); color: var(--label); }
+.th-body .tv-authority-unreadable { border-left-color: var(--warn); }
+/* CH-U1 slice 3: collapsed tool lines, the model line, and the work thread's Stop dock. Every colour is a token the
+   page's light and dark themes already define, so both themes follow without a second block. */
+.th-body .tv-model { margin: calc(var(--sp-2) * -1) 0 var(--sp-4); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); overflow-wrap: anywhere; }
+.th-body .tv-fold { padding-block: var(--sp-1); }
+.th-body .tv-toggle { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-4); width: 100%; min-height: 32px; box-sizing: border-box; margin: 0; padding: var(--sp-1) 0;
+  background: none; border: 0; text-align: left; cursor: pointer; color: var(--label); }
+.th-body .tv-toggle::before { content: "\25B8"; flex: none; color: var(--meta); }
+.th-body .tv-toggle[aria-expanded="true"]::before { content: "\25BE"; }
+.th-body .tv-toggle:hover .tv-kind { text-decoration: underline; text-decoration-color: var(--faint); }
+.th-body .tv-toggle:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+.th-body .tv-peek { flex: 1 1 100%; order: 5; padding-left: var(--sp-6); box-sizing: border-box; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--label); }
+.th-body .tv-toggle .tv-who, .th-body .tv-toggle .tv-at { flex: none; }
+.th-body .tv-body[hidden] { display: none; }
+.tv-dock { margin-top: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
+.tv-dock:empty { display: none; }
+.tv-dock .tv-stop { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-md); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans);
+  background: none; color: var(--text); border: 1px solid var(--bad); }
+.tv-dock .tv-stop:hover:not(:disabled) { background: color-mix(in oklch, var(--bad) 14%, transparent); }
+.tv-dock .tv-stop:disabled { opacity: .45; cursor: not-allowed; }
+.tv-dock .tv-stop:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
+.tv-dock .tv-sendnote { min-height: 1.5em; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); overflow-wrap: anywhere; }
 @media (max-width: 640px) {
+  .th-body .tv-toggle { min-height: var(--hit-min, 44px); }
   .th-body { padding-inline: var(--sp-5); }
   .th-body .tv-back { min-height: var(--hit-min, 44px); }
   .th-body .tv-row { min-height: var(--hit-min, 44px); grid-template-columns: minmax(0, 1fr); }   /* one column: the id keeps its width */
   .th-body .tv-row .tv-at, .th-body .tv-state { grid-column: 1; grid-row: auto; text-align: left; }
   .th-body .tv-head .tv-at { margin-left: 0; }
+}
+
+/* RM-F: the cockpit's one Claude room (room_view.js, rv-*): the conversation, the dock (draft, Send, Drop, Stop, mic), the
+   proposal card and the ambiguous-line reconcile. Colours are tokens the page's light and dark themes already define. */
+.rv { display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
+.rv .rv-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-4); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
+.rv .rv-note { margin: 0; color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); overflow-wrap: anywhere; }
+.rv .rv-gap { padding: var(--sp-3) var(--sp-4); border: 1px solid var(--bad); border-radius: var(--r-sm); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
+.rv .rv-line { border-left: 3px solid var(--hair-2); padding: var(--sp-2) var(--sp-4); }
+.rv .rv-you { border-left-color: var(--info); }
+.rv .rv-room { border-left-color: var(--accent-line); }
+.rv .rv-error { border-left-color: var(--bad); }
+.rv .rv-who { font: var(--fw-semibold) var(--fs-micro)/1.5 var(--mono); color: var(--label); }
+.rv .rv-text { margin: var(--sp-1) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--text); }
+.rv .rv-mark { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); margin: var(--sp-2) 0 0; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); }
+.rv .rv-mark button { min-height: var(--hit-min, 44px); }
+.rv .rv-card { padding: var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-md); background: var(--card-2); display: flex; flex-direction: column; gap: var(--sp-3); }
+.rv .rv-card textarea { width: 100%; box-sizing: border-box; min-height: 72px; resize: vertical; padding: var(--sp-3) var(--sp-4); background: var(--card); color: var(--text);
+  border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
+.rv .rv-summary { padding: var(--sp-3) var(--sp-4); border-left: 3px solid var(--hair-2); color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); white-space: pre-wrap; overflow-wrap: anywhere; }
+.rv .rv-dock { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
+.rv .rv-input { width: 100%; box-sizing: border-box; min-height: 72px; resize: vertical; padding: var(--sp-3) var(--sp-4); background: var(--card-2); color: var(--text);
+  border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
+.rv .rv-input:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 1px; border-color: var(--accent-line); }
+.rv .rv-input:disabled { opacity: .55; cursor: not-allowed; }
+.rv .rv-actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
+.rv .rv-send, .rv .rv-drop, .rv .rv-stop, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-md); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+.rv .rv-send { background: var(--accent); color: var(--on-accent); border: 1px solid var(--accent); }
+.rv .rv-send:hover:not(:disabled) { filter: brightness(1.08); }
+.rv .rv-drop, .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { background: none; color: var(--text); border: 1px solid var(--label); }
+.rv .rv-stop { background: none; color: var(--text); border: 1px solid var(--bad); }
+.rv .rv-stop:hover:not(:disabled) { background: color-mix(in oklch, var(--bad) 14%, transparent); }
+.rv button:disabled { opacity: .45; cursor: not-allowed; }
+.rv button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
+.rv .rv-sendnote { min-height: 1.5em; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .rv .rv-actions > button { flex: 1 1 0; }
 }
 
 /* C12: the board kind's painters (board_view.js, bd-*). The panel lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */
