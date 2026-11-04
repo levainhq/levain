@@ -149,7 +149,7 @@ def test_a_transient_record_that_names_no_occurrence_is_not_retaken(tmp_path):
 # --- binding ----------------------------------------------------------------------------------------------------------
 
 def test_the_digest_rides_the_mint_and_reaches_the_runtime_as_the_same_value(tmp_path):
-    brief = "café ☃ \"quoted\"\nnew line\ttab"
+    brief = "  café ☃ \"quoted\"\nnew line\ttab\n"
     ln, control, runtime = build(tmp_path)
     ln.spawn(launch_with(brief))
     (op, fields), *_ = control.calls
