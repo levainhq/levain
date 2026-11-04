@@ -23,13 +23,14 @@
   var FAULT_RETRY_MS = [5000, 15000, 60000];
   var PENDING_RETRY_MS = [5000, 15000, 60000];   // the last step repeats while a reload is still pending
   var RELOAD_GAP_MS = 10000;
+  var HELLO_MS = 8000;               // a connection that has not said hello by now is dead: the chip says stale, the retry runs
   var DRAW_WAIT_MS = 30000;          // how long the stream waits for a first draw before saying it is not live
 
   var T = null, V = null;
   var chip = null;
   var abort = null, watchdog = 0, retryTimer = 0, pollTimer = 0, reloadTimer = 0;
   var attempt = 0, staleSince = null, epoch = null, started = false, paused = false, gaveUp = false;
-  var lastId = null, pollTag = null;
+  var lastId = null, pollTag = null, lastConnect = 0;
   var pending = false, pendingAttempt = 0, lastReload = 0, reloadGen = 0, reloading = false;
   var withPosition = false;           // this connection named a last event, so its hello may be a replay
   var faults = Object.create(null);   // panel id -> { n, timer }
@@ -150,9 +151,9 @@
     }
   }
 
-  function arm() {
+  function arm(ms) {
     root.clearTimeout(watchdog);
-    watchdog = root.setTimeout(function () { if (abort) abort.abort(); }, HEARTBEAT_MS * 2 + 2000);
+    watchdog = root.setTimeout(function () { if (abort) abort.abort(); }, ms || HEARTBEAT_MS * 2 + 2000);
   }
 
   function drop() {
@@ -170,10 +171,11 @@
 
   function connect() {
     if (paused) return;
+    lastConnect = Date.now();
     ensureChip();
     var ctl = new AbortController();
     abort = ctl;
-    arm();
+    arm(HELLO_MS);
     var headers = readHeaders();
     withPosition = !!lastId;
     if (lastId) headers["Last-Event-ID"] = lastId;
@@ -247,6 +249,20 @@
     if (gaveUp) { if (root.LevainCockpitHeld) { gaveUp = false; connect(); } else whenDrawn(Date.now() + DRAW_WAIT_MS); return; }
     connect();
   }
+
+  // the app came back to the front (pwa_resume.js) without the page having been hidden first (a frozen page, a restored one):
+  // a stream that is not live is dead or stuck, so it is replaced now rather than at its watchdog
+  document.addEventListener("levain:resume", function () {
+    if (!started || paused || document.hidden) return;
+    paintChip();
+    // the visible edge just opened a stream (resume() above): one is enough
+    if (Date.now() - lastConnect < 1500) return;
+    // otherwise whatever is open crossed a freeze nobody announced, and cannot be trusted as live
+    root.clearTimeout(retryTimer);
+    if (abort) { var a = abort; abort = null; a.abort(); }
+    attempt = 0;
+    connect();
+  });
 
   // the first hello is compared with what the board was drawn from, so it waits for the first draw
   function whenDrawn(deadline) {
