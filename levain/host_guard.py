@@ -82,12 +82,6 @@ _TEMPLATES = Path(__file__).resolve().parent / "templates" / "adapters"
 _CC_SETTINGS_TEMPLATE = _TEMPLATES / "claude-code" / "settings.template.json"
 _CC_MCP_TEMPLATE = _TEMPLATES / "claude-code" / "mcp.template.json"
 
-_MANAGED_SETTINGS = {
-    "darwin": Path("/Library/Application Support/ClaudeCode"),
-    "linux": Path("/etc/claude-code"),
-}
-
-
 # ---------------------------------------------------------------------------- paths
 
 
@@ -1498,22 +1492,34 @@ def _get(d: Any, keys: Sequence[str]) -> Any:
 def load_managed_settings(platform: str = sys.platform) -> list[tuple[str, Any]]:
     """Every managed settings document on this machine as (path, parsed JSON). Unparseable files
     are returned as (path, _MISSING) so the check refuses rather than skipping them."""
-    base = _MANAGED_SETTINGS.get("linux" if platform.startswith("linux") else platform)
+    from levain.consent.adapters.claude_code import MANAGED_BASES, managed_settings_files
+
+    base = MANAGED_BASES.get("linux" if platform.startswith("linux") else platform)
     if base is None:
         return []
     docs: list[tuple[str, Any]] = []
-    files = [base / "managed-settings.json"]
-    dropins = base / "managed-settings.d"
-    if dropins.is_dir():
-        files += sorted(dropins.glob("*.json"))
-    for f in files:
-        if f.exists():
-            try:
-                docs.append((str(f), json.loads(f.read_text(encoding="utf-8"))))
-            except (OSError, ValueError):
-                docs.append((str(f), _MISSING))
+    for f in managed_settings_files(platform):
+        try:
+            os.lstat(f)
+        except (FileNotFoundError, NotADirectoryError):
+            continue   # absent: sets nothing
+        except OSError:
+            docs.append((str(f), _MISSING))   # cannot even be looked at: refuse, never skip
+            continue
+        try:
+            if not stat.S_ISREG(os.stat(f).st_mode):   # a FIFO would block the read; a directory cannot parse
+                raise OSError("not a regular file")
+            docs.append((str(f), json.loads(f.read_text(encoding="utf-8"))))
+        except (OSError, ValueError, RecursionError):
+            docs.append((str(f), _MISSING))
     mcp = base / "managed-mcp.json"
-    if mcp.exists():
+    try:
+        os.lstat(mcp)
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except OSError:
+        docs.append((str(mcp), _MISSING))   # an unsearchable base: refuse, never raise
+    else:
         docs.append((str(mcp), {"__managed_mcp__": True}))
     return docs
 
