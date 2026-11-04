@@ -9,10 +9,21 @@ THE BOUND, as arithmetic (a test pins it from these constants, never from a rest
 * a graceful SIGALRM bound fires at :data:`TICK_SOFT_BOUND_S`; the hard-exit watchdog (``levain.firing.deadline``,
   layer 2: ``os._exit``) fires at :data:`TICK_HARD_BOUND_S` whatever the main thread is doing;
 * ``TICK_HARD_BOUND_S >= STOP_BUDGET_S + STOP_DEADLINE_S``: a full stop phase fits inside one tick;
-* the reaper renews every launched row at the TOP of a tick, so the worst gap between two renewals of one row is one
-  interval plus a tick that ran to its hard bound: :data:`WORST_RENEW_GAP_S` = ``TICK_INTERVAL_S + TICK_HARD_BOUND_S``
-  = 660 s, under the 900 s lease (``controller.LEASE_S``): a row renewed at the top of tick k is renewed again before
-  it lapses even when tick k hung until the watchdog took the process down.
+* the renewals are the first thing a tick does after the store opens: before them run only the store open, the two
+  install-file reads that name the cockpit and the supervisor's construction (the coordinator directory, its
+  ``dispatch.db`` and the claims all come AFTER the reaper). That phase is held to :data:`TICK_PRE_RENEW_BOUND_S`, and
+  a tick that overran it says so on stderr (a gauge: the renewals still run). So the worst gap between two renewals of
+  one non-withheld row is one interval, a tick that ran to its hard bound and the next tick's pre-renewal phase:
+  :data:`WORST_RENEW_GAP_S` = ``TICK_INTERVAL_S + TICK_HARD_BOUND_S + TICK_PRE_RENEW_BOUND_S`` = 720 s, under the
+  900 s lease (``controller.LEASE_S``). A dead-fire session row whose renewal is withheld until its own stop answers
+  (P7-1 S3) is outside this sum by design: it may lapse to takeover.
+* an install that names no usable cockpit still renews: the tick runs the reaper alone (no authority: nothing is
+  classified STALE, rows past ``stop_at`` are still stopped), claims nothing, and exits :data:`EXIT_REFUSED`.
+
+STARVATION: the supervisor's "deferred rows first" memory is process-local and this process lives for one pass, so the
+tick rotates the launched rows' order by the tick's minute instead (:class:`_RotatingSupervisor`: the row at
+``minute % len(rows)`` leads), so when the stop budget runs out no fixed set of rows leads every pass; with a tick
+every minute each row leads once in ``len(rows)`` minutes. Nothing new is stored.
 
 A sleeping laptop coalesces missed launchd ticks, so leases lapse during sleep and the first tick on wake runs lapse
 recovery (``takeover``). That is designed behaviour, not an alarm.
@@ -45,20 +56,26 @@ TICK_INTERVAL_S = 60
 TICK_HARD_BOUND_S = 600
 #: the graceful SIGALRM bound (``TurnTimeout``), a grace before the hard one so a healthy unwind is never cut short.
 TICK_SOFT_BOUND_S = 540
-#: the worst gap between two renewals of one row (the invariant the lease needs to exceed).
-WORST_RENEW_GAP_S = TICK_INTERVAL_S + TICK_HARD_BOUND_S
-#: exit codes: 0 a pass ran; 1 refused (store, install); 3 the graceful bound fired; 70 the watchdog took the process.
-EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_HARD_TIMEOUT = 0, 1, 2, 3, 70
+#: what the phase before the renewals (store open, the cockpit's install reads, the supervisor) may take; past it the
+#: tick names the overrun on stderr.
+TICK_PRE_RENEW_BOUND_S = 60
+#: the worst gap between two renewals of one non-withheld row (the invariant the lease needs to exceed).
+WORST_RENEW_GAP_S = TICK_INTERVAL_S + TICK_HARD_BOUND_S + TICK_PRE_RENEW_BOUND_S
+#: exit codes: 0 a pass ran; 1 refused (store, install: with an install refusal the renewals still ran, the claims did
+#: not); 2 the reaper raised; 3 the graceful bound fired; 4 a launched session row had no session launcher to END it
+#: (none is registered in this process: the run server's wiring, S10b); 70 the watchdog took the process.
+EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_NO_LAUNCHER, EXIT_HARD_TIMEOUT = 0, 1, 2, 3, 4, 70
 
-__all__ = ["TICK_INTERVAL_S", "TICK_HARD_BOUND_S", "TICK_SOFT_BOUND_S", "WORST_RENEW_GAP_S", "EXIT_OK", "EXIT_REFUSED", "EXIT_REAPER_ERROR",
-           "EXIT_SOFT_TIMEOUT", "EXIT_HARD_TIMEOUT", "bounded", "executor_of_factory", "binding_of_factory",
-           "attention_sink", "run_tick"]
+__all__ = ["TICK_INTERVAL_S", "TICK_HARD_BOUND_S", "TICK_SOFT_BOUND_S", "TICK_PRE_RENEW_BOUND_S", "WORST_RENEW_GAP_S",
+           "EXIT_OK", "EXIT_REFUSED", "EXIT_REAPER_ERROR", "EXIT_SOFT_TIMEOUT", "EXIT_NO_LAUNCHER", "EXIT_HARD_TIMEOUT",
+           "bounded", "executor_of_factory", "binding_of_factory", "attention_sink", "run_tick"]
 
 
 def _hard_report(seconds: float) -> str:
-    return (f"levain agents tick: still running {seconds:.0f}s after it started (the graceful bound did not land); "
-            "the process is exiting now. launchd starts the next tick; a child already asked to stop is not signalled "
-            "again by this exit, and no lease can lapse inside one tick (the worst renewal gap is under the lease).")
+    # ``seconds`` is the GRACEFUL bound (TurnDeadline passes its own), so the text names it as that
+    return (f"levain agents tick: still running past its graceful bound ({seconds:.0f}s), at its hard bound; the "
+            "process is exiting now. launchd starts the next tick; a child already asked to stop is not signalled "
+            "again by this exit.")
 
 
 def bounded(fn: Callable[[], Any], *, soft_s: float, hard_s: float, stream=None) -> Any:
@@ -87,19 +104,28 @@ def executor_of_factory(store: AgentStore, *, launcher_of: Callable[[], Any],
       its attention row and asks nothing);
     * ``dream`` -> ``dream_executor_of(row)``;
     * anything else, anything unreadable, a row with no session key (for a session role), or a builder that raises -> None.
+
+    A session row met with no usable launcher (the builder raised, gave None, or gave the unwired default) is recorded
+    on the returned callable's ``no_launcher`` list (``(occurrence_id, why)``): :func:`run_tick` names those rows and
+    exits :data:`EXIT_NO_LAUNCHER`, so a tick that can renew a session but never END it is never a clean exit.
     """
-    from levain.agents.session import RowSessionExecutor
+    from levain.agents.session import RowSessionExecutor, UnwiredLauncher
 
     pinned = pinned_of or _ctl._pinned_executor
-    launcher_cell: list = []
+    launcher_cell: list = []      # [(launcher or None, why)]
+    no_launcher: list[tuple[str, str]] = []
 
-    def launcher() -> Any:
+    def launcher() -> tuple[Any, str]:
         if not launcher_cell:
             try:
-                launcher_cell.append(launcher_of())
+                got = launcher_of()
+                why = ("no launcher was built" if got is None else
+                       "the install names no launcher (the unwired default)" if isinstance(got, UnwiredLauncher) else "")
+                launcher_cell.append((None if why else got, why))
             except Exception as exc:  # noqa: BLE001 - a launcher that cannot be built ends nothing
-                _log.warning("agent tick: no session launcher (%s: %s)", type(exc).__name__, exc)
-                launcher_cell.append(None)
+                launcher_cell.append((None, f"{type(exc).__name__}: {exc}"))
+            if launcher_cell[0][0] is None:
+                _log.warning("agent tick: no session launcher (%s)", launcher_cell[0][1])
         return launcher_cell[0]
 
     def executor_of(row: dict) -> Any:
@@ -108,19 +134,27 @@ def executor_of_factory(store: AgentStore, *, launcher_of: Callable[[], Any],
             if kind == "session":
                 if type(row.get("session_key")) is not str:
                     return None
-                got = launcher()
-                return None if got is None else RowSessionExecutor(store, row, got)
+                got, why = launcher()
+                if got is None:
+                    if all(oid != row["occurrence_id"] for oid, _ in no_launcher):
+                        no_launcher.append((row["occurrence_id"], why))
+                    return None
+                return RowSessionExecutor(store, row, got)
             if kind == "dream" and dream_executor_of is not None:
                 return dream_executor_of(row)
         except Exception as exc:  # noqa: BLE001 - a row that cannot be routed is asked nothing, and says so
             _log.warning("agent tick: row %s has no executor (%s: %s)", row.get("occurrence_id"), type(exc).__name__, exc)
         return None
 
+    executor_of.no_launcher = no_launcher  # type: ignore[attr-defined]
     return executor_of
 
 
 def session_launcher_of(store: AgentStore) -> Callable[[], Any]:
-    """``launcher_of`` for the store's ``session_install.json`` (``session_wire.resolve_launcher``)."""
+    """``launcher_of`` for the store's ``session_install.json`` (``session_wire.resolve_launcher``). Nothing under
+    ``levain/`` calls ``register_launcher`` yet (the run server's launcher is S10b's to wire), so an install that names
+    a launcher refuses here and one that names none gives the unwired default: either way the router records the
+    session rows it met and :func:`run_tick` exits :data:`EXIT_NO_LAUNCHER`."""
     def build() -> Any:
         from levain.agents import session_wire as _wire
         return _wire.resolve_launcher(store, _wire.read_install(store.directory))
@@ -143,10 +177,13 @@ def dream_executor_of(store: AgentStore) -> Callable[[Mapping[str, Any]], Any]:
 # --- binding_of ---------------------------------------------------------------------------------------------------
 
 def binding_of_factory(store: AgentStore, authority: Any, clock: Callable[[], datetime]) -> Callable[[str, str], str | None]:
-    """``binding_of(agent_id, spec_hash)``: the ``binding_id`` of the agent's highest-born LIVE link of that spec (the
-    rule ``controller._pick_link`` applies at launch), or None (not armed). The authority log is replayed once per
-    driver; a log that cannot be replayed arms nothing (None, logged): the window is missed visibly, never claimed on a
-    guess."""
+    """``binding_of(agent_id, spec_hash)``: the ``binding_id`` of the agent's highest-born LIVE link of that spec, or
+    None (not armed). LIVE is judged as ``controller._pick_link`` judges it at launch: through ``authority.peek``
+    (unexpired, born after the last revoke and closed bar, AND both its born and current signers still active keys),
+    with the peek's incarnation checked against this driver's replay. So a link whose signer was revoked is unarmed
+    here (the agent is reported unarmed) instead of claimed and then refused at launch as ``signer_revoked``. The
+    authority log is replayed once per driver; a log that cannot be replayed, a cover that moved, or a grant that
+    lacks its fields arms nothing (None, logged): the window is missed visibly, never claimed on a guess."""
     from levain import authority as _auth
 
     cell: list = []
@@ -170,14 +207,26 @@ def binding_of_factory(store: AgentStore, authority: Any, clock: Callable[[], da
             closed = conn.execute("SELECT MAX(revoke_seq) FROM agent_bars WHERE agent_id = ? AND closed_at IS NOT NULL",
                                   (agent_id,)).fetchone()[0] or 0
         now = clock()
-        live = [gid for gid in _auth.agent_links(snap, agent_id, store_id)
-                if snap.policy.grants[gid]["spec_hash"] == spec_hash
-                and _auth.agent_link_arms(snap, gid, now=now, closed_bar_revoke_seq=closed)]
-        if not live:
-            return None
-        top = max(live, key=lambda gid: snap.grant_born.get(gid) or 0)
-        binding = snap.policy.grants[top].get("binding_id")
-        return binding if type(binding) is str and binding else None
+        grants = snap.policy.grants
+        candidates = sorted((gid for gid in _auth.agent_links(snap, agent_id, store_id)
+                             if (grants.get(gid) or {}).get("spec_hash") == spec_hash),
+                            key=lambda gid: snap.grant_born.get(gid) or 0, reverse=True)
+        for gid in candidates:
+            try:
+                live, incarnation = authority.peek(gid, agent_id=agent_id, store_id=store_id, now=now,
+                                                   closed_bar_revoke_seq=closed)
+            except Exception as exc:  # noqa: BLE001 - a cover that moved or cannot be read arms nothing this tick
+                _log.warning("agent tick: link %s could not be peeked (%s: %s); %s is not armed this tick", gid,
+                             type(exc).__name__, exc, agent_id)
+                return None
+            if incarnation != _auth.agent_link_incarnation(snap, gid):
+                _log.warning("agent tick: link %s moved under this tick's replay; %s is not armed this tick", gid,
+                             agent_id)
+                return None
+            if live is True:
+                binding = grants[gid].get("binding_id")
+                return binding if type(binding) is str and binding else None
+        return None
 
     return binding_of
 
@@ -221,12 +270,94 @@ def _cockpit_root(store: AgentStore) -> Path:
 
 
 def _install_coord_dir(store: AgentStore) -> Path | None:
-    """The coordinator queue directory the dream install names (its dispatch.db feeds the slot-lease probes), else None."""
+    """The coordinator queue directory the dream install names (its dispatch.db feeds the slot-lease probes), else
+    None (no dream install, or one that cannot be read: the caller names the absence)."""
     from levain.dream import agent as _da
     try:
         return _da.read_install(store.directory).coord_dir
-    except _da.InstallRefused:
+    except Exception:  # noqa: BLE001 - InstallRefused, or a read that failed some other way: no directory named
         return None
+
+
+def _coord_dir_for(store: AgentStore, given: Path | str | None) -> Path | None:
+    """The coordinator directory for the probes: ``--coord-dir``, else the dream install's, else, for the DEFAULT
+    agent store only, the default consent queue (``<levain home>/consent``, where the coordinator keeps
+    ``dispatch.db``) when a ``dispatch.db`` is there. None when none of these names one."""
+    if given is not None:
+        return Path(given)
+    found = _install_coord_dir(store)
+    if found is not None:
+        return found
+    from levain.autonomic.db import default_store_dir
+    from levain.consent.queue import default_queue_dir
+    try:
+        if Path(store.directory).resolve() == default_store_dir():
+            queue = default_queue_dir()
+            if (queue / "dispatch.db").is_file():
+                return queue
+    except Exception:  # noqa: BLE001 - an environment that cannot be read names no directory
+        pass
+    return None
+
+
+def _lazy_probes(store: AgentStore, given: Path | str | None, notes: list[str]) -> tuple[Callable, Callable]:
+    """``(session_alive, launch_over)`` for ``controller.tick``, resolved on their FIRST call (the claims phase, after the
+    reaper's renewals), never before. With no coordinator directory both answer None ("cannot tell": the expired
+    launch slot is kept, never freed on a guess) and the tick names that in ``notes``."""
+    cell: list = []
+
+    def probes() -> tuple | None:
+        if not cell:
+            where = _coord_dir_for(store, given)
+            if where is None:
+                notes.append("an expired coordinator launch slot cannot be probed: no coordinator directory (pass "
+                             "--coord-dir, or install the dream, which names one); the slot is kept")
+                cell.append(None)
+            else:
+                cell.append(_ctl.dispatch_probes(where))     # (launch_over, session_alive)
+        return cell[0]
+
+    def session_alive(launch_id: str) -> bool | None:
+        got = probes()
+        return None if got is None else got[1](launch_id)
+
+    def launch_over(launch_id: str) -> bool | None:
+        got = probes()
+        return None if got is None else got[0](launch_id)
+
+    return session_alive, launch_over
+
+
+class _RotatingSupervisor(_sup.Supervisor):
+    """The supervisor for one tick process, its launched rows rotated by ``rotation`` (the tick's minute). The
+    supervisor keeps "rows deferred past the stop budget go first next pass" in process memory, which a process that
+    lives one pass loses; the rotation is the stateless stand-in: the stop order starts at a different row each minute,
+    so no row stays behind rows that keep using the budget up. Renewals happen in the same rotated order."""
+
+    def __init__(self, *args: Any, rotation: int, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self._rotation = rotation
+
+    def _launched(self) -> list[dict]:
+        rows = super()._launched()
+        if not rows:
+            return rows
+        k = self._rotation % len(rows)
+        return rows[k:] + rows[:k]
+
+
+class _NoAuthority:
+    """The authority stand-in for a tick whose install names no usable cockpit: every read raises the refusal, which
+    the supervisor reads as "cannot tell" (UNCLASSIFIED: no STALE stop) and the tick never claims through."""
+
+    def __init__(self, refusal: Exception) -> None:
+        self._refusal = refusal
+
+    def refresh(self) -> Any:
+        raise self._refusal
+
+    def peek(self, *a: Any, **k: Any) -> Any:
+        raise self._refusal
 
 
 def _utc() -> datetime:
@@ -239,38 +370,84 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
              dream_of: Callable[[Mapping[str, Any]], Any] | None = None,
              soft_s: float = TICK_SOFT_BOUND_S, hard_s: float = TICK_HARD_BOUND_S, stream=None) -> int:
     """One bounded pass: ``controller.tick`` with this module's reaper. Returns an exit code (see :data:`EXIT_OK`).
-    The seams (``clock``, ``authority``, ``launcher_of``, ``dream_of``) are tests'; production passes none."""
+    The seams (``clock``, ``authority``, ``launcher_of``, ``dream_of``) are tests'; production passes none.
+
+    Order (the renewal-gap arithmetic in the module docstring rests on it): open the store, name the cockpit, build the
+    supervisor, then the reaper (renewals first); the coordinator directory and its ``dispatch.db`` are read only by the
+    claims phase, lazily. Every line the pass has to say (an install refusal, a late renewal phase, session rows with
+    no launcher, probes with no coordinator directory) goes to stderr as ``levain agents tick: ...``."""
     from levain.agent_authority import AgentAuthority
+    from levain.agents import session_wire as _wire
+    from levain.dream import agent as _da
     from levain.firing.deadline import TurnTimeout
 
     clock = clock or _utc
+    notes: list[str] = []
+    seen: dict = {}
 
     def work() -> Any:
-        # everything that can block (store open, install reads, the probes' dispatch.db) runs INSIDE the bound
-        nonlocal coord_dir
+        # everything that can block runs INSIDE the bound; only what the renewals need runs before them
+        started = clock()
         st = store if isinstance(store, AgentStore) else open_agent_store(store)
-        auth = authority if authority is not None else AgentAuthority(_cockpit_root(st))
+        refusal = None
+        if authority is not None:
+            auth = authority
+        else:
+            try:
+                auth = AgentAuthority(_cockpit_root(st))
+            except (_wire.InstallRefused, _da.InstallRefused, OSError) as exc:
+                refusal, auth = exc, _NoAuthority(exc)
         attention, resolve = attention_sink(stream)
-        sup = _sup.Supervisor(st, authority=auth, clock=clock)
+        sup = _RotatingSupervisor(st, authority=auth, clock=clock,
+                                  rotation=int(started.timestamp()) // TICK_INTERVAL_S)
         executor_of = executor_of_factory(st, launcher_of=launcher_of or session_launcher_of(st),
                                           dream_executor_of=dream_of or dream_executor_of(st))
-        if coord_dir is None:
-            coord_dir = _install_coord_dir(st)
-        probes: tuple = ()
-        if coord_dir is not None:
-            launch_over, session_alive = _ctl.dispatch_probes(coord_dir)   # (launch_over, session_alive)
-            probes = (session_alive, launch_over)                          # tick takes (session_alive, launch_over)
-        return _ctl.tick(st, clock, binding_of_factory(st, auth, clock), *probes,
-                         reaper=lambda: sup.reap(executor_of, attention=attention, resolve=resolve))
+        seen["executor_of"] = executor_of
+
+        def reaper() -> Any:
+            lag = (clock() - started).total_seconds()
+            if lag > TICK_PRE_RENEW_BOUND_S:
+                notes.append(f"the renewals began {lag:.0f}s into the tick, past the {TICK_PRE_RENEW_BOUND_S}s the "
+                             f"renewal-gap bound allows ({WORST_RENEW_GAP_S}s against the {_ctl.LEASE_S}s lease): a "
+                             "lease the previous tick renewed may have lapsed")
+            return sup.reap(executor_of, attention=attention, resolve=resolve)
+
+        if refusal is not None:
+            # the install names no usable cockpit: renew and stop what the store alone shows due; claim nothing
+            notes.append(f"{refusal}; the renewals ran, no window was claimed")
+            seen["refused"] = True
+            try:
+                reaper()
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("agent tick: the reaper raised %s: %s", type(exc).__name__, exc)
+                seen["reaper_error"] = type(exc).__name__
+            return None
+        session_alive, launch_over = _lazy_probes(st, coord_dir, notes)
+        return _ctl.tick(st, clock, binding_of_factory(st, auth, clock), session_alive, launch_over, reaper=reaper)
+
+    def say(text: str) -> None:
+        print(f"levain agents tick: {text}", file=stream or sys.stderr, flush=True)
 
     try:
         out = bounded(work, soft_s=soft_s, hard_s=hard_s, stream=stream)
     except TurnTimeout:
-        print(f"levain agents tick: the graceful bound ({soft_s:.0f}s) fired; the next tick resumes.",
-              file=stream or sys.stderr, flush=True)
+        for note in notes:
+            say(note)
+        say(f"the graceful bound ({soft_s:.0f}s) fired; the next tick resumes.")
         return EXIT_SOFT_TIMEOUT
-    if getattr(out, "reaper_error", None):
-        print(f"levain agents tick: the reaper raised {out.reaper_error}; claims ran, the pass is not clean.",
-              file=stream or sys.stderr, flush=True)
+    for note in notes:
+        say(note)
+    unlaunchable = getattr(seen.get("executor_of"), "no_launcher", [])
+    if unlaunchable:
+        say(f"{len(unlaunchable)} launched session row(s) have no session launcher, so they can be renewed but never "
+            f"ENDed ({unlaunchable[0][1]}; first: {unlaunchable[0][0]}). No launcher is registered in this process "
+            "until the run server's launcher is wired (S10b).")
+    error = seen.get("reaper_error") or getattr(out, "reaper_error", None)
+    if error:
+        say(f"the reaper raised {error}; the pass is not clean.")
         return EXIT_REAPER_ERROR
+    if seen.get("refused"):
+        return EXIT_REFUSED
+    if unlaunchable:
+        return EXIT_NO_LAUNCHER
     return EXIT_OK

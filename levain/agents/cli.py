@@ -96,7 +96,7 @@ def run_tick(args: argparse.Namespace) -> int:
         return 0
     try:
         return tick_driver.run_tick(args.store_dir, coord_dir=args.coord_dir)
-    except (AgentStoreRefused, ValueError) as exc:      # ValueError: a refused install file (both InstallRefused are)
+    except (AgentStoreRefused, ValueError) as exc:      # an install refusal is the driver's own (it still renews, exit 1)
         print(f"levain agents: {exc}", file=sys.stderr)
         return 1
     except (StoreFormatError, sqlite3.Error, OSError) as exc:

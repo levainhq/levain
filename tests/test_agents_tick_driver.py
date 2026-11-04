@@ -39,10 +39,10 @@ def test_the_bound_is_arithmetic_from_the_constants():
     assert T.TICK_SOFT_BOUND_S < T.TICK_HARD_BOUND_S
     # a full stop phase fits in one tick
     assert T.TICK_HARD_BOUND_S >= supervise.STOP_BUDGET_S + supervise.STOP_DEADLINE_S
-    # the worst gap between two renewals of one row is one interval plus a tick that ran to its hard bound
-    assert T.WORST_RENEW_GAP_S == T.TICK_INTERVAL_S + T.TICK_HARD_BOUND_S == 660
+    # the worst gap between two renewals of one row is one interval, a tick that ran to its hard bound, and the next
+    # tick's phase before its renewals (L3 r1 codex: setup precedes the reaper, so it is in the sum)
+    assert T.WORST_RENEW_GAP_S == T.TICK_INTERVAL_S + T.TICK_HARD_BOUND_S + T.TICK_PRE_RENEW_BOUND_S == 720
     assert T.WORST_RENEW_GAP_S < ctl.LEASE_S == supervise.LEASE_S == 900
-    assert T.TICK_INTERVAL_S + T.TICK_HARD_BOUND_S < ctl.LEASE_S
 
 
 def test_the_unit_runs_every_interval_and_exits_each_time(tmp_path):
@@ -275,3 +275,160 @@ def test_install_files_naming_two_cockpits_are_refused(rig, tmp_path):  # noqa: 
     (b / "m.db").write_text("")
     with pytest.raises(W.InstallRefused, match="will not guess"):
         T._cockpit_root(store)
+
+
+# --- L3 r1 fix round -----------------------------------------------------------------------------------------------
+
+class _UnprovenStop:
+    """An executor whose stop uses its whole deadline (the clock moves on by it) and never proves the end."""
+
+    def __init__(self, oid, clock, asked):
+        self.oid, self.clock, self.asked = oid, clock, asked
+
+    def stop(self, deadline_s):
+        self.asked.append(self.oid)
+        self.clock.advance(deadline_s)
+        return StopResult(False, "the end was not proven")
+
+    def usage(self):
+        return Usage(0, 0, 0, "fake")
+
+
+def test_stale_rows_are_not_starved_by_a_fresh_supervisor_each_tick(rig, monkeypatch):  # noqa: F811
+    """codex HIGH :254: one process per tick loses the supervisor's deferred-first memory. With 100 rows to stop, each
+    stop using its 10 s deadline, one pass asks 45 (STOP_BUDGET_S / STOP_DEADLINE_S); every row must still be asked
+    within a bounded number of ticks, not the same oldest 45 forever."""
+    n = 100
+    rows = [{"occurrence_id": f"oc-{i:03d}", "agent_id": "ag-x", "run_id": None, "state": "launched", "epoch": 1,
+             "launch_epoch": 1, "link_id": None, "link_incarnation": None, "spec_hash": "sha256:none",
+             "binding_id": BINDING, "launched_at": f"2026-11-04T00:{i // 60:02d}:{i % 60:02d}Z",
+             "session_key": f"s-{i:016x}", "pid": None} for i in range(n)]
+    clock = Clock(rig)
+    asked: list = []
+    monkeypatch.setattr(supervise.Supervisor, "_launched", lambda self: [dict(r) for r in rows])
+    monkeypatch.setattr(supervise.Supervisor, "_renew", lambda self, row, grace: True)
+    monkeypatch.setattr(supervise.Supervisor, "_past_stop_at", lambda self, row, now: True)
+    monkeypatch.setattr(supervise.Supervisor, "refresh_once", lambda self: False)
+    monkeypatch.setattr(T, "executor_of_factory",
+                        lambda store, **kw: (lambda row: _UnprovenStop(row["occurrence_id"], clock, asked)))
+    ever: set = set()
+    for _tick in range(n):
+        asked.clear()
+        T.run_tick(rig.store, clock=clock, authority=rig.authority, launcher_of=lambda: None)
+        assert len(asked) == supervise.STOP_BUDGET_S // supervise.STOP_DEADLINE_S
+        ever.update(asked)
+        clock.advance(T.TICK_INTERVAL_S)
+    assert ever == {r["occurrence_id"] for r in rows}
+
+
+def test_the_renewals_run_before_the_coordinator_directory_is_read(rig, monkeypatch):  # noqa: F811
+    """codex HIGH :248 / deepseek HIGH 1, 2, MED 4: nothing the renewals do not need (the dream install's coordinator
+    directory, dispatch.db) runs before them."""
+    order: list = []
+    real = supervise.Supervisor.reap
+    monkeypatch.setattr(supervise.Supervisor, "reap", lambda self, *a, **k: (order.append("reap"), real(self, *a, **k))[1])
+    monkeypatch.setattr(T, "_install_coord_dir", lambda st: (order.append("coord"), None)[1])
+    assert T.run_tick(rig.store, clock=rig.now, authority=rig.authority, launcher_of=lambda: None) == T.EXIT_OK
+    assert order[0] == "reap"
+
+
+def test_a_late_renewal_phase_is_named(rig, capsys):  # noqa: F811
+    """codex HIGH :248's constructed sequence: the next tick reaches its renewals 301 s in. The renewals still run, and
+    the tick says the gap bound was overrun instead of passing silently."""
+    from datetime import timedelta
+    base = rig.now()
+    calls = []
+
+    def clock():
+        calls.append(1)
+        return base if len(calls) == 1 else base + timedelta(seconds=301)
+
+    assert T.run_tick(rig.store, clock=clock, authority=rig.authority, launcher_of=lambda: None) == T.EXIT_OK
+    err = capsys.readouterr().err
+    assert "renewals began 301s into the tick" in err and "may have lapsed" in err
+
+
+def test_an_install_naming_no_cockpit_still_renews_and_claims_nothing(rig, monkeypatch, capsys):  # noqa: F811
+    """deepseek HIGH 1: a broken or absent install file stops the claims, never the renewals."""
+    oid, _key = _session_row(rig)
+    renewed = []
+    real = supervise.Supervisor._renew
+    monkeypatch.setattr(supervise.Supervisor, "_renew",
+                        lambda self, row, grace: (renewed.append(row["occurrence_id"]), real(self, row, grace))[1])
+    claimed = []
+    monkeypatch.setattr(ctl, "tick", lambda *a, **k: claimed.append(1))
+    clock = Clock(rig)
+    clock.advance(60)
+    code = T.run_tick(rig.store, clock=clock, launcher_of=lambda: FakeSessionClient())   # no install files: refused
+    assert code == T.EXIT_REFUSED
+    assert renewed == [oid] and claimed == []
+    assert "no window was claimed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("launcher", ["not-registered", None], ids=["names-an-unregistered-one", "names-none"])
+def test_a_session_row_with_no_registered_launcher_is_loud(rig, capsys, launcher):  # noqa: F811
+    """complement MED :107/:119: through the real read_install + resolve_launcher (no injection). Nothing registers a
+    launcher in the tick process yet (S10b), so a session row is renewed but can never be ENDed: never a clean exit."""
+    from levain.agents import session_wire as W
+    W.write_install(rig.store.directory, cockpit_root=rig.world.root, launcher=launcher)
+    oid, _key = _session_row(rig)
+    clock = Clock(rig)
+    clock.advance(60)
+    code = T.run_tick(rig.store, clock=clock, authority=rig.authority)
+    assert code == T.EXIT_NO_LAUNCHER
+    err = capsys.readouterr().err
+    assert "no session launcher" in err and oid in err and "S10b" in err
+
+
+def test_binding_of_does_not_arm_a_link_whose_signer_was_revoked(rig):  # noqa: F811
+    """codex MED :173: a link signed by a second laptop key that is later revoked arms nothing (launch would refuse it
+    signer_revoked after the window was claimed and its cursor moved)."""
+    from tests.test_consent_queue import Key
+    import levain.authority as auth
+    second = Key(rig.world.tmp / "keys", "laptop2")
+    rig.world.link({"op": "enrol", "fingerprint": second.fp, "public_key": second.public_key,
+                    "class": "laptop-presence", "custody": "passphrase"})
+    rig.world.keys["laptop2"] = (second.fp, lambda m: second.sign(m, auth.NAMESPACE))
+    rig.link(signer="laptop2")
+    assert T.binding_of_factory(rig.store, rig.authority, rig.now)(rig.agent, rig.spec_hash) == BINDING
+    rig.world.link({"op": "revoke_key", "fingerprint": rig.world.fp("laptop2")})
+    assert T.binding_of_factory(rig.store, rig.authority, rig.now)(rig.agent, rig.spec_hash) is None
+
+
+def test_binding_of_arms_nothing_when_the_cover_moves(rig):  # noqa: F811
+    rig.link()
+
+    class Moving:
+        def refresh(self):
+            return rig.authority.refresh()
+
+        def peek(self, *a, **k):
+            raise __import__("levain.agent_authority", fromlist=["x"]).AgentCoverMoved("the log head moved")
+
+    assert T.binding_of_factory(rig.store, Moving(), rig.now)(rig.agent, rig.spec_hash) is None
+
+
+def test_expired_launch_slots_with_no_coordinator_directory_are_named(rig, capsys):  # noqa: F811
+    """codex MED :257: a session-only store, no --coord-dir, no dream install: the expired launch slot is kept and the
+    tick says why, instead of passing no probes silently."""
+    from levain.agents import slots
+    with rig.store.write() as c:
+        c.execute("INSERT INTO agent_slots (slot, owner_kind, owner_id, taken_at, expires_at) VALUES (1, ?, 'ln-1', ?, ?)",
+                  (slots.LAUNCH, "2026-01-01T00:00:00Z", "2026-01-01T00:15:00Z"))
+    assert T.run_tick(rig.store, clock=rig.now, authority=rig.authority, launcher_of=lambda: None) == T.EXIT_OK
+    assert "no coordinator directory" in capsys.readouterr().err
+    with rig.store.read() as c:
+        assert c.execute("SELECT owner_id FROM agent_slots").fetchall() == [("ln-1",)]
+
+
+def test_the_default_store_finds_the_default_coordinator_queue(rig, monkeypatch, tmp_path):  # noqa: F811
+    from levain.autonomic import db
+    from levain.consent import queue
+    q = tmp_path / "consent"
+    q.mkdir()
+    monkeypatch.setattr(db, "default_store_dir", lambda: rig.store.directory.resolve())
+    monkeypatch.setattr(queue, "default_queue_dir", lambda: q)
+    assert T._coord_dir_for(rig.store, None) is None          # no dispatch.db there yet
+    (q / "dispatch.db").write_bytes(b"")
+    assert T._coord_dir_for(rig.store, None) == q
+    assert T._coord_dir_for(rig.store, tmp_path / "given") == tmp_path / "given"
