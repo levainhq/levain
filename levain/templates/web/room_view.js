@@ -151,7 +151,7 @@
     ta.setAttribute("rows", "3"); ta.setAttribute("aria-label", "The words to drop");
     prose(ta, "roomcardwords");
     ta.value = own(drafts, c.id) ? drafts[c.id] : c.words;     // an edit survives a redraw
-    ta.addEventListener("input", function () { drafts[c.id] = ta.value; });
+    ta.addEventListener("input", function () { drafts[c.id] = ta.value; if (hooks.saveCards) hooks.saveCards(); });
     card.appendChild(ta);
     card.appendChild(el(doc, "div", "rv-summary-label rv-note", "The room's summary (information, not your words)"));
     card.appendChild(el(doc, "div", "rv-summary", c.summary));
@@ -229,9 +229,34 @@
     var rotB = null;
     if (opts.rotate !== false) { rotB = el(doc, "button", "rv-rotate", "New conversation"); rotB.setAttribute("type", "button"); actions.appendChild(rotB); }
     dock.appendChild(openB); dock.appendChild(ta); dock.appendChild(actions); dock.appendChild(note);
-    var flight = { send: false, drop: false, stop: false, open: false }, sendId = null, sendText = null, dropId = null, dropText = null;
+    var flight = { send: false, drop: false, stop: false, open: false };
     try { if (store && store.getItem("levain.room.draft")) ta.value = store.getItem("levain.room.draft"); } catch (e) { /* no storage */ }
     ta.addEventListener("input", function () { try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ } });
+    // The outbox id a line or a drop was last tried under, and the cards' edits, are kept beside the draft (roomfix1 R2):
+    // the dashboard unmounts this view whenever the page is hidden (an app switch on the phone), and a remount that minted
+    // a new id would send a line twice after an unanswered try. The store is the truth across mounts of one tab; with no
+    // store they live in this mount only.
+    var mem = {};
+    function kept(key) {
+      if (store) { try { var raw = store.getItem(key); return raw === null ? null : JSON.parse(raw); } catch (e) { /* fall back */ } }
+      return own(mem, key) ? mem[key] : null;
+    }
+    function keep(key, v) {
+      mem[key] = v;
+      try { if (store) { if (v === null) store.removeItem(key); else store.setItem(key, JSON.stringify(v)); } } catch (e) { /* no storage */ }
+    }
+    // the id to try `text` under: the kept one when it was tried for these exact words, else a new one (kept at once)
+    function tryId(key, text) {
+      var p = kept(key);
+      var id = (p && typeof p.id === "string" && p.text === text) ? p.id : newId();
+      keep(key, { id: id, text: text });
+      return id;
+    }
+    function settle(key, id) { var p = kept(key); if (p && p.id === id) keep(key, null); }
+    var savedCards = kept("levain.room.cards");
+    if (!savedCards || typeof savedCards !== "object") savedCards = {};
+    var cardsThread = typeof savedCards.thread === "string" ? savedCards.thread : null;
+    drafts = savedCards.drafts && typeof savedCards.drafts === "object" ? savedCards.drafts : {};
 
     function newId() {
       var c = root.crypto;
@@ -260,13 +285,12 @@
       endDictation();
       var text = ta.value;
       if (!current || !current.thread || !text.trim() || sendB.disabled || flight.send) return;
-      if (sendId === null || sendText !== text) sendId = newId();      // one id per draft text: a resend reuses it
-      sendText = text;
+      var sendId = tryId("levain.room.send", text);                     // one id per draft text: a resend reuses it
       flight.send = true; paintDock(); note.textContent = "Sending...";
       post("send", { room_thread_id: current.thread, body: text, outbox_id: sendId }).then(function (r) {
         flight.send = false;
-        if (r.status === 200 && r.json && r.json.receipt) { clearDraft(text); sendId = null; sendText = null; }
-        else if (r.status < 500 && r.status !== 202) sendId = null;
+        if (r.status === 200 && r.json && r.json.receipt) { clearDraft(text); settle("levain.room.send", sendId); }
+        else if (r.status < 500 && r.status !== 202) settle("levain.room.send", sendId);
         note.textContent = sendWords(r.status, r.json);
         last = ""; paintDock(); return pull();
       }).catch(function () {
@@ -279,13 +303,12 @@
       endDictation();
       var text = ta.value;
       if (!current || !text.trim() || dropB.disabled || flight.drop) return;
-      if (dropId === null || dropText !== text) dropId = newId();
-      dropText = text;
+      var dropId = tryId("levain.room.drop", text);
       flight.drop = true; paintDock(); note.textContent = "Dropping...";
       post("drop", { words: text, outbox_id: dropId }).then(function (r) {
         flight.drop = false;
-        if (r.status === 200) { clearDraft(text); dropId = null; dropText = null; note.textContent = "Dropped: your words went to the desk."; }
-        else { if (r.status < 500) dropId = null; note.textContent = (r.json && r.json.message) ? "Not dropped: " + r.json.message : "Not dropped: the server answered " + r.status + "."; }
+        if (r.status === 200) { clearDraft(text); settle("levain.room.drop", dropId); note.textContent = "Dropped: your words went to the desk."; }
+        else { if (r.status < 500) settle("levain.room.drop", dropId); note.textContent = (r.json && r.json.message) ? "Not dropped: " + r.json.message : "Not dropped: the server answered " + r.status + "."; }
         paintDock();
       }).catch(function () { flight.drop = false; note.textContent = "The server could not be reached; the drop may or may not have gone. Dropping again will not duplicate it."; paintDock(); });
     });
@@ -389,11 +412,11 @@
         if (!words.trim()) { cnote.textContent = "Nothing to drop: the field is empty."; return; }
         btns.forEach(function (b) { b.disabled = true; });
         var key = card.id + "|" + words;
-        if (!hooks.ids[key]) hooks.ids[key] = newId();
+        if (!own(hooks.ids, key)) { hooks.ids[key] = newId(); saveCards(); }
         cnote.textContent = "Dropping...";
         post("proposal/" + encodeURIComponent(card.id) + "/commit", { words: words, outbox_id: hooks.ids[key] }).then(function (r) {
-          if (r.status === 200) { delete drafts[card.id]; last = ""; pull(); return; }
-          if (r.status < 500) delete hooks.ids[key];
+          if (r.status === 200) { delete drafts[card.id]; saveCards(); last = ""; pull(); return; }
+          if (r.status < 500) { delete hooks.ids[key]; saveCards(); }
           cnote.textContent = "Not dropped: " + ((r.json && r.json.message) || "the server answered " + r.status + ".");
           btns.forEach(function (b) { b.disabled = card.state === "expired" && b.className === "rv-commit"; });
         }).catch(function () { cnote.textContent = "The server could not be reached; dropping again will not duplicate it."; btns.forEach(function (b) { b.disabled = false; }); });
@@ -401,13 +424,16 @@
       onDismiss: function (card, cnote, btns) {
         btns.forEach(function (b) { b.disabled = true; });
         post("proposal/" + encodeURIComponent(card.id) + "/dismiss", {}).then(function (r) {
-          if (r.status === 200) { delete drafts[card.id]; last = ""; pull(); return; }
+          if (r.status === 200) { delete drafts[card.id]; saveCards(); last = ""; pull(); return; }
           cnote.textContent = "Not dismissed: " + ((r.json && r.json.message) || "the server answered " + r.status + ".");
           btns.forEach(function (b) { b.disabled = false; });
         }).catch(function () { cnote.textContent = "The server could not be reached."; btns.forEach(function (b) { b.disabled = false; }); });
       },
-      ids: {}
+      ids: savedCards.ids && typeof savedCards.ids === "object" ? savedCards.ids : {},
+      saveCards: function () { saveCards(); }
     };
+    // a stopped mount writes nothing: the mount that replaced it owns the kept cards
+    function saveCards() { if (!stopped) keep("levain.room.cards", { thread: cardsThread, drafts: drafts, ids: hooks.ids }); }
 
     function pull() {
       if (stopped) return Promise.resolve();
@@ -420,7 +446,11 @@
           if (t !== last) {
             last = t;
             current = roomModel(JSON.parse(t));
-            if (current.thread !== thread) { ui.open = {}; drafts = {}; thread = current.thread; }
+            if (current.thread !== thread) {
+              ui.open = {}; thread = current.thread;
+              // the kept edits belong to the room they were made in: another room starts with none
+              if (thread !== cardsThread) { drafts = {}; hooks.ids = {}; cardsThread = thread; saveCards(); }
+            }
             renderRoom(doc, body, current, hooks, ui, drafts);
           }
           paintDock();

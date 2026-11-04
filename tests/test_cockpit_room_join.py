@@ -377,6 +377,80 @@ def test_the_real_page_opens_the_room_sends_and_shows_the_reply(tmp_path, qdir):
     assert [m["body"] for m in mine] == ["hello page"]
 
 
+# the page is hidden and shown again (an app switch on the phone): dashboard_boot's sync() unmounts the room view on
+# hidden and mounts a new one on visible
+_HIDE_AND_SHOW = ("Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => 'hidden'});"
+                  " document.dispatchEvent(new Event('visibilitychange'));"
+                  " Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => 'visible'});"
+                  " document.dispatchEvent(new Event('visibilitychange')); 1")
+_TO_THE_ROOM = [
+    {"until": "document.querySelector('[data-mode-tab=board]')"},
+    {"eval": f"localStorage.setItem('levain_write_token', {json.dumps(TOKEN)}); window.__pre = 1; location.reload(); 1"},
+    {"until": "!window.__pre && document.querySelector('.rv-zone') && document.querySelector('[data-mode-tab=build]')"},
+]
+
+
+@needs_browser
+def test_a_line_tried_before_an_app_switch_is_sent_again_under_the_same_outbox_id(tmp_path, qdir):
+    """roomfix1 R2 (reproduced): the outbox id lived in the mount's closure, and the dashboard unmounts the room view when
+    the page is hidden; after an unanswered send (here a 503 the page never saw land) an app switch minted a NEW id, so
+    "Sending again will not duplicate it" was false across the remount. The id is kept beside the draft."""
+    rs, launcher, src = _rig(tmp_path, qdir)
+    first_fails = ("window.__ids = []; const real = window.fetch;"
+                   " window.fetch = function (u, o) { if (String(u).endsWith('/cockpit/room/send')) {"
+                   " window.__ids.push(JSON.parse(o.body).outbox_id);"
+                   " if (window.__ids.length === 1) return Promise.resolve(new Response('{\"error\": \"busy\"}',"
+                   " {status: 503, headers: {'Content-Type': 'application/json'}})); }"
+                   " return real.apply(this, arguments); }; 1")
+    with _serve(src, write_token=TOKEN, room_serve=rs) as (base, _h):
+        out = _drive(tmp_path, base + "/", _TO_THE_ROOM + [
+            {"eval": first_fails},
+            {"do": "document.querySelector('[data-mode-tab=build]').click(); 1",
+             "until": "document.querySelector('.rv-zone .rv-open') && !document.querySelector('.rv-zone .rv-open').hidden"},
+            {"eval": "document.querySelector('.rv-open').click(); 1"},
+            {"until": "!document.querySelector('.rv-input').disabled && document.querySelector('.rv-open').hidden"},
+            {"eval": "const ta = document.querySelector('.rv-input'); ta.value = 'hello twice'; ta.dispatchEvent(new Event('input')); "
+                     "document.querySelector('.rv-send').click(); 1"},
+            {"until": "window.__ids.length === 1 && !document.querySelector('.rv-send').disabled"},
+            {"eval": _HIDE_AND_SHOW},
+            {"until": "document.querySelectorAll('.rv-input').length === 1 && !document.querySelector('.rv-input').disabled"
+                      " && document.querySelector('.rv-input').value === 'hello twice'"},
+            {"eval": "document.querySelector('.rv-send').click(); 1"},
+            {"until": "window.__ids.length === 2 && [...document.querySelectorAll('.rv-line')].some(l => l.textContent.includes('hello twice'))"},
+            {"eval": "JSON.stringify(window.__ids)"},
+        ])
+        mine = [i["body"] for i in _get(base)[1]["stream"] if i["kind"] == "message"]
+    ids = json.loads(out["values"][-1])
+    assert len(ids) == 2 and ids[0] == ids[1], ids
+    assert mine == ["hello twice"]
+
+
+@needs_browser
+def test_an_edit_to_a_card_survives_an_app_switch(tmp_path, qdir):
+    """roomfix1 R2: a card's edited words lived in the mount's closure and were lost when the page was hidden."""
+    from levain.coordinator import room as coordroom
+    rs, launcher, src = _rig(tmp_path, qdir)
+    with _serve(src, write_token=TOKEN, room_serve=rs) as (base, _h):
+        thread = _call(base, "/cockpit/room/open", {})[1]["room_thread"]
+        assert _call(base, "/cockpit/room/send", {"room_thread_id": thread, "body": "quote me", "outbox_id": "ob-00000009"})[0] == 200
+        launch = _get(base)[1]["launch_id"]
+        c = sqlite3.connect(qdir / "dispatch.db")
+        try:
+            mid = c.execute("SELECT message_id FROM chat_messages WHERE body = 'quote me'").fetchone()[0]
+        finally:
+            c.close()
+        with rs.store._write() as (conn, now):
+            coordroom.propose(conn, launch, [mid], "the room's summary", now=now)
+        out = _drive(tmp_path, base + "/", _TO_THE_ROOM + [
+            {"do": "document.querySelector('[data-mode-tab=build]').click(); 1", "until": "document.querySelector('.rv-cardwords')"},
+            {"eval": "const t = document.querySelector('.rv-cardwords'); t.value = 'my edited words'; t.dispatchEvent(new Event('input')); 1"},
+            {"eval": _HIDE_AND_SHOW},
+            {"until": "document.querySelectorAll('.rv-cardwords').length === 1"},
+            {"eval": "document.querySelector('.rv-cardwords').value"},
+        ])
+    assert out["values"][-1] == "my edited words"
+
+
 @needs_browser
 def test_the_dashboard_never_asks_the_browser_whether_dictation_is_available(tmp_path, qdir):
     """Reproduced 2026-11-04: `SpeechRecognition.available({processLocally: true})` froze the renderer of the installed
