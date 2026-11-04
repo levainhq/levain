@@ -78,3 +78,25 @@ def test_the_worker_is_registered_at_load_without_a_tap(tmp_path: Path) -> None:
             {"until": "navigator.serviceWorker.getRegistration().then(r => !!r && r.scope.endsWith('/'))", "ms": 10000},
         ])
     assert out["values"][0] is True, out["values"]
+
+
+def test_the_standalone_page_pads_every_edge_by_its_safe_area_inset() -> None:
+    """black-translucent + viewport-fit=cover draws the page under the clock, notch and home indicator: the top container,
+    the side gutters, the fixed update bar and the full-screen overlays must each add env(safe-area-inset-*)."""
+    css = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.css").read_text()
+    for needle in ("  .deck { padding-top: env(safe-area-inset-top, 0px);", "max(var(--gutter), env(safe-area-inset-left, 0px))",
+                   "max(var(--gutter), env(safe-area-inset-right, 0px))", "left: calc(var(--sp-5) + env(safe-area-inset-left, 0px))",
+                   "height: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))"):
+        assert needle in css, needle
+
+
+@needs_browser
+def test_a_status_bar_inset_pushes_the_masthead_below_the_clock(tmp_path: Path) -> None:
+    _root, src, _ids = _install(tmp_path)
+    with _serve_plain(src) as url:
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 430, "h": 932, "dpr": 3, "mobile": True, "safe": {"top": 59, "bottom": 34, "left": 0, "right": 0}}},
+            {"until": "document.querySelector('.masthead') && 1", "ms": 10000},
+            {"eval": "document.querySelector('.masthead').getBoundingClientRect().top >= 59"},
+        ])
+    assert out["values"][-1] is True
