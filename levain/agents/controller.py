@@ -802,7 +802,8 @@ def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authori
     ``BEGIN IMMEDIATE`` the row is read, the agent's operation, spec and bar, the predicate (a live link), the
     reservation (:func:`accounting.reserve`, held to the admitted link's signed terms) and a slot
     (:func:`slots.take`) are checked in that order, and either the row becomes ``launched`` (its launch columns,
-    ``launched_at`` and a lease of :data:`LEASE_S`) or it ends with the refusal's state and reason. Every refusal is
+    ``launched_at`` and a lease of :data:`LEASE_S`) and its run is admitted in the journal at the binding's current
+    generation (:func:`_admit_run_in`), or it ends with the refusal's state and reason. Every refusal is
     written after the reservation and slot work is rolled back to a savepoint, so a refused launch takes nothing.
     A cover that cannot be read and a full cap write nothing; the row stays ``admitted`` for the next tick.
 
@@ -854,6 +855,7 @@ def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authori
                 (link_id, incarnation, at, _stamp(_expiry(at_dt, LEASE_S)), occurrence_id, occ["epoch"]))
             if cur.rowcount != 1:
                 raise RuntimeError(f"occurrence {occurrence_id} moved inside its own launch transaction")
+            _admit_run_in(conn, occurrence_id)
             return LaunchResult(LAUNCHED, None, slot, link_id, occ["epoch"])
     except _Retry as retry:   # raised inside the transaction: it rolled back, so nothing was written
         return LaunchResult(retry.outcome, retry.reason)
@@ -1212,7 +1214,7 @@ def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_
 FIRES = "fires"
 FIRE_UNWIRED = 3       # the module entry's exit after its claim, for an agent no run body is registered for
 FIRE_NO_IDENTITY = 4   # the fire cannot read its own identity, or its command line does not name its occurrence
-FIRE_NOT_HELD = 5      # the occurrence is not the one this fire holds: no run was admitted, no effect was reached
+FIRE_NOT_HELD = 5      # fire_refusal named a reason (a row this fire does not hold, a run fenced since launch): no body ran
 _OCCURRENCE_RE = re.compile(r"oc-[0-9a-f]{32}")
 
 
@@ -1370,21 +1372,47 @@ def _agent_name(store: AgentStore, agent_id: str) -> str | None:
     return None if row is None else row[0]
 
 
-def admit_run(store: AgentStore, occurrence_id: str, launch_epoch: int, *, journal=None) -> bool:
-    """Admit the occurrence's run in the agent ``RunJournal`` before any body runs, once, for the occurrence this fire
-    holds: ``launched`` at ``launch_epoch`` with no revoke since (the claim's own epoch guard). Returns False, having
-    started nothing, for any other row. Idempotent: ``RunJournal.start`` of a known run id is a no-op, so a replay (or
-    another admitter of the same run) keeps the first admission. ``journal`` defaults to the store's own, the one the
-    supervisor's default also opens."""
-    with store.read() as conn:
-        row = conn.execute("SELECT run_id, binding_id FROM agent_occurrences WHERE occurrence_id = ?"
-                           " AND state = 'launched' AND launch_epoch = ? AND epoch = launch_epoch",
-                           (occurrence_id, launch_epoch)).fetchone()
-    if row is None:
-        return False
+NOT_LAUNCHED = "not_launched"   # fire_refusal: no such row, or it is not launched
+EPOCH_MOVED = "epoch_moved"     # fire_refusal: a revoke, bar or takeover raised the epoch, or the fire's is another
+RUN_NOT_ADMITTED = "run_not_admitted"   # fire_refusal: the launch admitted no run for this row (launched before it did)
+# (the run's own barriers name themselves: EffectStatus.FENCED "fenced", CANCELLED "cancelled", BARRED "barred")
+_ADMISSION_PROBE = "\x00admission"   # no body's effect id: the barrier peeked for the run, never for one of its effects
+
+
+def _admit_run_in(conn: sqlite3.Connection, occurrence_id: str) -> None:
+    """Admit the occurrence's run in the agent ``RunJournal``, in the caller's LAUNCH transaction: the one that judged
+    the agent fireable (its registration, operation, spec and bar, and a live link: :func:`_admit`). Like
+    :meth:`~levain.autonomic.binding.BindingStore.admit`, the fireability test and the start commit together, at the
+    binding's generation read in that transaction, so the run carries the generation current at launch and a fence
+    raised after it stops the run (the journal's barrier) rather than becoming its baseline. ``BindingStore.admit``
+    itself cannot judge it: a named Binding is never a ``bindings`` row (A0 r8 §2.3), so it would refuse every agent
+    run. A run id the journal knows is left as it is (``_start_in``)."""
     from levain.autonomic.journal import RunJournal   # here: the journal is not the controller's import closure
-    (journal if journal is not None else RunJournal(store.directory)).start(row[0], binding_id=row[1])
-    return True
+    run, binding = conn.execute("SELECT run_id, binding_id FROM agent_occurrences WHERE occurrence_id = ?",
+                                (occurrence_id,)).fetchone()
+    RunJournal._start_in(conn, run, binding, RunJournal._generation_in(conn, binding))
+
+
+def fire_refusal(store: AgentStore, occurrence_id: str, launch_epoch: int) -> str | None:
+    """Why the fire holding ``launch_epoch`` must not run its body, or ``None``. It admits nothing: the launch did
+    (:func:`_admit_run_in`). In order: the row must be ``launched`` (:data:`NOT_LAUNCHED`) at ``launch_epoch`` with no
+    epoch raised since (:data:`EPOCH_MOVED`, the claim's own guard); its run must be in the journal
+    (:data:`RUN_NOT_ADMITTED`: a row launched before the launch admitted runs is never admitted late, at whatever generation
+    is current); and the journal's own barrier for that run, the one every effect meets, must stop nothing (its
+    status's value: a fence past the launch generation is ``fenced``)."""
+    with store.read() as conn:
+        row = conn.execute("SELECT state, epoch, launch_epoch, run_id FROM agent_occurrences WHERE occurrence_id = ?",
+                           (occurrence_id,)).fetchone()
+    if row is None or row[0] != "launched":
+        return NOT_LAUNCHED
+    if row[2] != launch_epoch or row[1] != row[2]:
+        return EPOCH_MOVED
+    from levain.autonomic.journal import RunJournal   # here: the journal is not the controller's import closure
+    try:
+        barrier = RunJournal(store.directory).peek(row[3], _ADMISSION_PROBE)
+    except KeyError:
+        return RUN_NOT_ADMITTED
+    return None if barrier is None else barrier.status.value
 
 
 def run_agent(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
@@ -1399,9 +1427,10 @@ def run_agent(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
     resolve = (RUN_BODIES if bodies is None else bodies).get(name) if name is not None else None
     if resolve is None:
         return _unwired_run(store, occurrence_id, launch_epoch)
-    if not admit_run(store, occurrence_id, launch_epoch):
-        print(f"levain agents _fire {occurrence_id}: the occurrence is not launched at this fire's epoch; no run was "
-              "admitted and no effect was reached", file=sys.stderr)
+    why = fire_refusal(store, occurrence_id, launch_epoch)
+    if why is not None:
+        print(f"levain agents _fire {occurrence_id}: refused ({why}); no run body ran and no effect was reached",
+              file=sys.stderr)
         return FIRE_NOT_HELD
     return resolve()(store, occurrence_id, launch_epoch)
 

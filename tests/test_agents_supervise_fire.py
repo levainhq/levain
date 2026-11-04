@@ -66,8 +66,7 @@ class Ex:
 def _fire(rig: Rig, key: str, journal: RunJournal) -> str:
     """A launched occurrence with its journal run started."""
     oid = rig.claim(key)
-    assert rig.launch(oid).outcome == "launched"
-    assert ctl.admit_run(rig.store, oid, 0, journal=journal)    # the fire path's own admission, not a hand start
+    assert rig.launch(oid).outcome == "launched"    # the launch admits the run: no hand start
     return oid
 
 
@@ -84,8 +83,7 @@ def _second_fire(rig: Rig, journal: RunJournal) -> str:
                                  window_key="m:2026-10-25", now=rig.now())
     assert outcome == ctl.CLAIMED
     assert ctl.launch(rig.store, oid, authority=rig.authority, executor=Exec(), window=WINDOW,
-                      now=rig.now()).outcome == "launched"
-    assert ctl.admit_run(rig.store, oid, 0, journal=journal)    # the fire path's own admission, not a hand start
+                      now=rig.now()).outcome == "launched"    # the launch admits the run: no hand start
     return oid
 
 

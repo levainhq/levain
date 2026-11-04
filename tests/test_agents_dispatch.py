@@ -32,7 +32,7 @@ def _fire_ready(rig: Rig, name: str):
     oid = rig.claim("k")
     assert rig.launch(oid).outcome == "launched"
     _rename(rig, name)
-    return oid    # no hand start: run_agent admits the run itself
+    return oid    # no hand start: the launch admitted the run
 
 
 def test_a_scheduled_fire_of_the_dream_no_longer_ends_unwired(tmp_path):
@@ -82,7 +82,7 @@ def test_run_agent_reads_the_agent_from_the_row_and_an_unknown_one_refuses_unwir
     seen = []
     rig.link()
     oid = rig.claim("k")
-    assert rig.launch(oid).outcome == "launched"    # a fire holds a launched row; run_agent admits only that
+    assert rig.launch(oid).outcome == "launched"    # a fire runs a body only for a launched row it holds
     bodies = {"someone-else": lambda: (lambda s, o, e: seen.append(o) or 0)}
     assert ctl.run_agent(rig.store, oid, 0, bodies=bodies) == ctl.FIRE_UNWIRED and seen == []
     _rename(rig, "someone-else")
