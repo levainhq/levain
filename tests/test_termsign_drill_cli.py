@@ -25,6 +25,7 @@ def scratch(monkeypatch, tmp_path):
     mod = _load()
     s = tmp_path / "S"
     (s / "home").mkdir(parents=True)
+    s.chmod(0o700)
     monkeypatch.setattr(mod.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setenv("HOME", str(s / "home"))
     monkeypatch.delenv("LEVAIN_HOME", raising=False)
@@ -39,7 +40,7 @@ def test_script_is_executable():
 def test_script_has_one_fixed_message_and_no_passphrase_handling():
     text = SCRIPT.read_text()
     assert text.count("print(") == 1                              # the fixed refusal line, never an env value
-    assert "getenv" not in text and "os.environ[" not in text and "logging" not in text
+    assert "logging" not in text and "stderr.write" not in text and "stdout.write" not in text
 
 
 def test_refuses_an_unconfined_home(monkeypatch, tmp_path):
@@ -69,9 +70,11 @@ def test_every_path_form_must_be_inside_scratch(scratch, monkeypatch, tmp_path):
     assert mod._refusal(["cockpit", "keys", "--data-root", outside]) is not None
     assert mod._refusal(["cockpit", "keys", f"--data-root={outside}"]) is not None           # the = form
     assert mod._refusal(["cockpit", "keys", "--signing-key", "~/.ssh/id_x"]) is None         # ~ is the scratch HOME
-    monkeypatch.chdir(tmp_path)
-    assert mod._refusal(["cockpit", "keys", "--signing-key", "real/.ssh/id_x"]) is not None  # relative to cwd
-    assert mod._refusal(["cockpit", "keys", "--data-root", "S/d"]) is None
+    monkeypatch.chdir(tmp_path)                                                              # cwd is irrelevant: names resolve in S
+    assert mod._refusal(["cockpit", "keys", "--signing-key", "id_x", "--data-root", "data"]) is None   # bare names land in S
+    assert mod._refusal(["cockpit", "keys", "--signing-key", "../real/.ssh/id_x"]) is not None
+    assert mod._refusal(["cockpit", "keys", "-k/real/.ssh/id_x"]) is not None                   # short option, attached value
+    assert mod._refusal(["cockpit", "keys", "--data-root", "d"]) is None
     assert mod._refusal(["cockpit", "revoke", "SHA256:ab/cd+ef", "--signing-key", inside]) is None  # fingerprint holds "/"
 
 
@@ -105,6 +108,25 @@ def test_passes_only_the_askpass_names_through_for_one_call(scratch, monkeypatch
     assert seen["env"]["SSH_ASKPASS"] == "/x/askpass.sh"
     assert seen["env"]["SSH_ASKPASS_REQUIRE"] == "force"
     assert "SOME_OTHER_SECRETISH" not in seen["env"]
-    assert "SSH_AUTH_SOCK" not in os.environ                         # the real agent is out of reach
     assert launch.allowed_env is before                              # restored once the call ends
     assert launch.child_env().get("SSH_ASKPASS") is None
+
+
+def test_a_shared_scratch_dir_is_refused(scratch):
+    mod, s = scratch
+    s.chmod(0o755)
+    assert "private" in mod._refusal(["cockpit", "keys"])
+
+
+def test_main_runs_the_cli_inside_scratch_and_restores_cwd_and_agent(scratch, monkeypatch, tmp_path):
+    from levain import cli
+
+    mod, s = scratch
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/x/agent.sock")
+    monkeypatch.chdir(tmp_path)
+    seen = {}
+    monkeypatch.setattr(cli, "main", lambda argv: seen.update(cwd=os.getcwd(), sock=os.environ.get("SSH_AUTH_SOCK")) or 0)
+    assert mod.main(["cockpit", "keys"]) == 0
+    assert os.path.realpath(seen["cwd"]) == os.path.realpath(s) and seen["sock"] is None
+    assert os.getcwd() == os.path.realpath(tmp_path) or os.getcwd() == str(tmp_path)
+    assert os.environ["SSH_AUTH_SOCK"] == "/x/agent.sock"

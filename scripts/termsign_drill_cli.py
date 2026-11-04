@@ -14,9 +14,9 @@ which ``ssh-keygen`` runs.
 
 Confinement is a bound, not a scanner of arbitrary arguments. The drill runs under a scratch directory ``S``
 (``S=$(mktemp -d)``, ``HOME=$S/home``). The wrapper refuses unless HOME is ``<S>/home`` with ``S`` inside the system
-temp dir, ``LEVAIN_HOME`` (if set) is inside ``S``, only the cockpit subcommands the drill uses are asked for, and
-every argument that is a path (it contains a separator, or starts with ``~`` or ``.``; the value of ``--opt=value``
-included) resolves, with ``~`` expanded and relative to the working directory, inside ``S``. It also drops
+temp dir and private to you, ``LEVAIN_HOME`` (if set) is inside ``S``, only the cockpit subcommands the drill uses are asked for, and
+every argument (the value of ``--opt=value`` included; a bare name counts) resolves, with ``~`` expanded and relative to
+``S``, which becomes the working directory; single-dash options are refused. It also drops
 ``SSH_AUTH_SOCK`` so a software key cannot reach the operator's real agent.
 
 Usage (from a checkout, or with PYTHONPATH naming one): ``python3 scripts/termsign_drill_cli.py cockpit keys --data-root <S>/data``
@@ -41,28 +41,41 @@ def _inside(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
-def _is_pathy(token: str) -> bool:
-    return not token.startswith("SHA256:") and (os.sep in token or token.startswith(("~", ".")))     # a fingerprint may hold "/"
+def _scratch() -> tuple[str | None, str | None]:
+    """``(scratch, None)`` when HOME is ``<scratch>/home`` with ``<scratch>`` a private directory of ours directly
+    inside the system temp dir, else ``(None, why)``."""
+    home = os.environ.get("HOME", "")
+    if not home or os.path.basename(_real(home)) != "home":
+        return None, "HOME is not <scratch>/home; set S=$(mktemp -d) and HOME=$S/home first"
+    scratch = os.path.dirname(_real(home))
+    tmp = _real(tempfile.gettempdir())
+    if os.path.dirname(scratch) != tmp:
+        return None, "the scratch directory is not a direct child of the system temp dir (use S=$(mktemp -d))"
+    st = os.stat(scratch)
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        return None, "the scratch directory is not private to you (mode 0700, yours): use S=$(mktemp -d)"
+    lh = os.environ.get("LEVAIN_HOME")
+    if lh and not _inside(lh, scratch):
+        return None, "LEVAIN_HOME points outside the scratch directory; unset it"
+    return scratch, None
 
 
 def _refusal(argv: list[str]) -> str | None:
-    """Why this run would not be confined to the scratch directory, or None."""
-    home = os.environ.get("HOME", "")
-    if not home or os.path.basename(os.path.normpath(home)) != "home":
-        return "HOME is not <scratch>/home; set S=$(mktemp -d) and HOME=$S/home first"
-    scratch = os.path.dirname(_real(home))
-    tmp = _real(tempfile.gettempdir())
-    if scratch == tmp or not _inside(scratch, tmp):
-        return "the scratch directory is not a new directory inside the system temp dir (use S=$(mktemp -d))"
-    lh = os.environ.get("LEVAIN_HOME")
-    if lh and not _inside(lh, scratch):
-        return "LEVAIN_HOME points outside the scratch directory; unset it"
+    """Why this run would not be confined to the scratch directory, or None. Every argument (and the value after the
+    ``=`` of a ``--opt=value``) is read as a path relative to the scratch directory, which ``main`` also makes the
+    working directory, so a bare name or an omitted ``--data-root`` lands inside it; one that resolves outside is
+    refused. A single-dash option (``-xVALUE``) is refused outright."""
+    scratch, why = _scratch()
+    if scratch is None:
+        return why
     if tuple(argv[:2]) not in ALLOWED:
         return "not a drill command (cockpit keys | enroll | revoke | ledger)"
     for a in argv:
-        for token in ([a] if not a.startswith("-") else [a.partition("=")[2]]):
-            if token and _is_pathy(token) and not _inside(token, scratch):
-                return f"a path argument is outside the scratch directory: {token}"
+        if a.startswith("-") and not a.startswith("--"):
+            return f"short options are not allowed in the drill: {a}"
+        token = a.partition("=")[2] if a.startswith("--") else a
+        if token and not _inside(os.path.join(scratch, os.path.expanduser(token)), scratch):
+            return f"an argument names a path outside the scratch directory: {token}"
     return None
 
 
@@ -83,12 +96,17 @@ def main(argv: list[str]) -> int:
                 out[k] = v
         return out
 
-    os.environ.pop("SSH_AUTH_SOCK", None)
+    scratch, _ = _scratch()
+    old_cwd, old_sock = os.getcwd(), os.environ.pop("SSH_AUTH_SOCK", None)
+    os.chdir(scratch)                      # a bare name, or an omitted --data-root (it defaults to the cwd), lands in scratch
     launch.allowed_env = allowed_env
     try:
         return cli.main(argv)
     finally:
         launch.allowed_env = original
+        os.chdir(old_cwd)
+        if old_sock is not None:
+            os.environ["SSH_AUTH_SOCK"] = old_sock
 
 
 if __name__ == "__main__":

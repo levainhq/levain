@@ -4309,11 +4309,13 @@ def _keep_prompt(fp: str, what: str, plan: object, signer_fp: str, signer_pub: s
         for r in plan.rows:                                     # type: ignore[attr-defined]
             if r.fingerprint == fp:
                 key_type, cls = r.key_type, r.key_class
-        for k in plan.log_keys:                                 # type: ignore[attr-defined]
-            if k.fingerprint == fp:
-                custody, cls = k.custody, k.key_class
-                if k.public_key and key_type == "?":
-                    key_type = k.public_key.split()[0]
+                break
+    for k in plan.log_keys:                                     # type: ignore[attr-defined]
+        if k.fingerprint == fp:                                 # a key the log already holds keeps ITS custody and class
+            custody, cls = k.custody, k.key_class
+            if k.public_key and key_type == "?":
+                key_type = k.public_key.split()[0]
+            break
     return f"\n{_KEEP_MEANING}  class {cls}, key type {key_type}, custody {custody}\nkeep {fp}{what}? [y/N] "
 
 
