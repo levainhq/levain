@@ -108,6 +108,9 @@ class RoomLaunchError(CoordError):
     """The room could not be opened or kept; the message says why. Nothing was attached."""
 
 
+_NOTSENT_GRACE = 1.0     # s a first-write NotSent waits for a mid-exit child before it counts as still alive
+
+
 class _ChildExited(RoomLaunchError):
     """The child exited before its open check ended, or was gone at its first write (with ``--resume`` in its argv,
     the resume is the suspect)."""
@@ -487,8 +490,16 @@ class RoomLauncher:
         try:
             sent = session.send(SendCommand("room-open-check", CANARY_PROMPT.format(path=decoy), (), "queue", None))
         except NotSent as exc:
-            # the child is gone (or its stdin is) before the first line: the same suspect as an exit mid-check
-            # (L3_rme_r2 codex OPEN 1: this was a plain failure, so a rejected resume was never retried fresh)
+            # a dead transport is proof of a dead child only once the child is actually gone (a short grace catches
+            # one mid-exit); a live child with a transient dead pipe is a plain failure, so the history is kept
+            # (L3_rme_r2 codex OPEN 1 made this retry fresh; L3_rme_r3 NotSent: only for a child that has exited)
+            try:
+                proc.wait(timeout=_NOTSENT_GRACE)
+            except Exception:  # noqa: BLE001  (TimeoutExpired: the child is still alive)
+                pass
+            if proc.poll() is None:
+                raise RoomLaunchError(f"the open check could not be sent while the room child is still running: "
+                                      f"{_one_line(str(exc))}{self._tail(stderr_path)}") from exc
             raise _ChildExited(f"the room child exited or closed its stdin before its open check could be sent "
                                f"(exit code {proc.poll()}): "
                                f"{_one_line(str(exc))}{self._tail(stderr_path)}") from exc

@@ -20,7 +20,7 @@ from levain.coordinator import chat, lease, room, room_launch
 from levain.coordinator.chat import ChatService, ChatStore, liveness
 from levain.coordinator.chat_tripwires import TripwireContext
 from levain.coordinator.claude_session import ClaudeSession, PipeTransport, ROOM_MCP_TOOL, ROOM_TOOLS
-from levain.coordinator.driver import LivenessEvidence, SendCommand
+from levain.coordinator.driver import LivenessEvidence, NotSent, SendCommand
 from levain.coordinator.envelopes import EnvelopeStore
 from levain.coordinator.room_launch import (RoomLauncher, RoomLaunchError, RoomSetting, make_probe, make_tripwires,
                                             room_tripwire_context)
@@ -775,6 +775,34 @@ def test_rme_fix2_r1_a_resumed_child_dead_at_the_first_write_retries_once_fresh(
         "SELECT detail FROM chat_launch_checks WHERE launch_id = ? AND kind = 'probing' ORDER BY seq LIMIT 1",
         (h2.launch_id,)).fetchone()[0])
     assert h1.harness_session_id in probing and "fresh" in probing
+
+
+def test_rme_fix3_a_live_resumed_child_with_a_dead_first_write_is_a_plain_failure_never_retried_fresh(world, monkeypatch):
+    """FAILS on the ff49d7ea tip (L3_rme_r3 NotSent): any first-write NotSent was read as a dead child, so a healthy
+    resumed child with a transient dead pipe was replaced by a fresh one and its history abandoned."""
+    monkeypatch.setattr(room_launch, "_NOTSENT_GRACE", 0.05, raising=False)
+    lr = launcher(world)
+    h1 = lr.ensure()
+    lr.end(h1.launch_id, "test")
+    real = room_launch.RoomSession.send
+    last = []
+
+    def spawn(argv, *, cwd, env, stderr):
+        last.append("--resume" in argv)
+        return room_launch._spawn(argv, cwd=cwd, env=env, stderr=stderr)
+
+    def send(self, cmd):
+        if last and last[-1]:                                # the resume child's open check: a live child, a dead pipe
+            raise NotSent("transient dead pipe")
+        return real(self, cmd)
+
+    lr._spawn = spawn
+    monkeypatch.setattr(room_launch.RoomSession, "send", send)
+    with pytest.raises(RoomLaunchError, match="still running") as ei:
+        lr.ensure()
+    assert not isinstance(ei.value, room_launch._ChildExited)
+    argvs = spawns(world)
+    assert len(argvs) == 2 and "--resume" in argvs[1]       # one resume spawn, no fresh one
 
 
 def test_rme_fix2_r1_a_fresh_child_dead_at_the_first_write_is_a_plain_failure_never_retried(world):
