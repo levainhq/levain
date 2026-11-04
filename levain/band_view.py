@@ -1585,7 +1585,14 @@ def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse
                            versions=info_ids)
         if on_sign is not None:
             on_sign()
-        out = ts.sign(message, key_dir=key_dir, signer_factory=signer_factory, remote=ts.is_remote(environ))
+        remote = ts.is_remote(environ)
+        if not remote:
+            try:
+                if ts.find_key(key_dir) is not None:    # a notice only where a Touch ID sheet is about to follow
+                    ts.post_notice(ts.notice_text(entries))
+            except Exception:  # noqa: BLE001 - sign() below names whatever is wrong with the key
+                pass
+        out = ts.sign(message, key_dir=key_dir, signer_factory=signer_factory, remote=remote)
         if out.state == "signed":
             return Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint, versions)
         return Signing("unsigned", out.reason, out.detail, versions=versions)

@@ -26,6 +26,7 @@ import secrets
 import shlex
 import stat
 import subprocess
+import sys
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -565,6 +566,46 @@ def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None
     if not isinstance(signature, str) or not signature:
         return SignOutcome("unsigned", "signer-error", "the signer returned no signature")
     return SignOutcome("signed", None, "", signature, fp)
+
+
+# ---------------------------------------------------------------------------------------------------
+# the notice that names what the Touch ID sheet will sign (DESIGN section 5.4)
+
+NOTICE_TITLE = "Levain: Touch ID"
+NOTICE_CUT = 80                    # characters of the first entry's answer or text
+_OSASCRIPT = "/usr/bin/osascript"
+
+
+def notice_text(entries: Sequence[Entry], *, channel: str = "terminal") -> str:
+    """The one line the notification shows: ``Touch ID to sign: <item> <answer or text>`` for the first entry (cut at
+    :data:`NOTICE_CUT` characters) plus `` (+N more)``; channel ``desk`` prefixes ``Desk: ``. Pure, and rendered from
+    the entries the message holds, never from anything the agent says. It always begins with a letter, so as an
+    ``osascript`` argument it can never read as an option."""
+    prefix = "Desk: " if channel == "desk" else ""
+    if not entries:
+        return f"{prefix}Touch ID to sign"
+    first = entries[0]
+    said = first.answer if first.answer is not None else (first.text or "")
+    said = " ".join(_CTRL.sub(" ", said).split())[:NOTICE_CUT]
+    more = f" (+{len(entries) - 1} more)" if len(entries) > 1 else ""
+    return f"{prefix}Touch ID to sign: {first.item} {said}".rstrip() + more
+
+
+def post_notice(text: str, *, runner: Callable[..., Any] = subprocess.Popen) -> Any:
+    """Show ``text`` as a macOS notification, macOS only; the process, or None when nothing was started. The text
+    travels as an ``osascript`` argument and never inside the script, so a row's words cannot become AppleScript.
+    The child is detached with no stdio and never waited on: the hook's time budget is not spent on a display aid.
+    Never raises."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        return runner([_OSASCRIPT, "-e", "on run argv",
+                       "-e", f'display notification (item 1 of argv) with title "{NOTICE_TITLE}"',
+                       "-e", "end run", str(text)],
+                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                      start_new_session=True)
+    except Exception:  # noqa: BLE001 - a notice is never worth the answer
+        return None
 
 
 # ---------------------------------------------------------------------------------------------------
