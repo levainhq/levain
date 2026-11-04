@@ -25,8 +25,11 @@ done, in one transaction with its thread.
 
 **One lock orders the seam.** :meth:`send` holds it across the service's send, so a stop or a rotate waits for a line
 in flight and a line naming no room lands on the room that was open
-when it began. The pump takes it only to drop a handle. After a rotation the held handle is None until the next send,
-by design: the old child's late output is not read.
+when it began. The pump takes it to take its handle and to recycle (so an idle recycle never lands between a send's
+open and its recorded line), and never across a vendor read. The lock order is RoomServe, then the launcher, then the
+service, on every path. A rotation ends the old launch under the lock and the held handle is None until the next send,
+by design: the old child's late output is not read. :meth:`stop` waits behind a send in flight without bound, by
+design.
 
 NOT HERE: the HTTP routes and the page's token (the cockpit's room routes, RM-F, are the callers). A route calls the
 three methods above and maps the exceptions; ``levain serve`` builds one :class:`RoomServe` and calls :meth:`start`
@@ -79,6 +82,7 @@ class RoomServe:
         self._interval = pump_interval
         self._lock = threading.RLock()
         self._started = False
+        self._recovered = False
         self._stopped = False
         self._handle: Optional[RoomHandle] = None
         self._stop_evt = threading.Event()
@@ -95,11 +99,14 @@ class RoomServe:
                 raise RoomServeError("the room was stopped; build a new one")
             if self._started:
                 return self.recovered
-            self.chat_store._connect().close()                 # the chat tables exist before recover reads them
-            self.recovered = self.service.recover()
+            if not self._recovered:
+                self.chat_store._connect().close()             # the chat tables exist before recover reads them
+                self.recovered = self.service.recover()
+                self._recovered = True
+            thread = threading.Thread(target=self._run, name="levain-room-pump", daemon=True)
+            thread.start()                                     # a start that raises leaves the serve not started
+            self._thread = thread
             self._started = True
-            self._thread = threading.Thread(target=self._run, name="levain-room-pump", daemon=True)
-            self._thread.start()
             return self.recovered
 
     def stop(self) -> None:
@@ -133,22 +140,30 @@ class RoomServe:
         """One pump step (the loop's body, callable by a test): recycle an idle child, then read the held launch. The
         count of new events. Raises what the step raised; the loop records it. A held launch whose child exited is
         ended and dropped, and :attr:`last_error` says so; the next send resumes it."""
-        self._ready()
-        handle = self._handle
-        ended = self.launcher.recycle_idle()
-        if handle is not None and handle.launch_id in ended:
-            self._drop_handle(handle)
-            return 0
-        if handle is None:
-            return 0
+        with self._lock:
+            # the recycle is under the lock a send holds across its open and its recorded line: an idle child is not
+            # ended between a send's ensure() and the line landing
+            self._ready()
+            handle = self._handle
+            ended = self.launcher.recycle_idle()
+            if handle is not None and handle.launch_id in ended:
+                self._handle = None
+                return 0
+            if handle is None:
+                return 0
         if not self.launcher.child_alive(handle.launch_id):
             with self._lock:
                 if self._handle is handle:
-                    self.launcher.end(handle.launch_id, "room child exited")
-                    self._handle = None
+                    try:
+                        self.launcher.end(handle.launch_id, "room child exited")
+                    finally:
+                        self._handle = None
                     self.last_error = (f"the room's child exited (launch {handle.launch_id}); the next send "
                                        "resumes the conversation")
             return 0
+        with self._lock:
+            if self._handle is not handle:       # a rotate or send replaced the handle since this step took it
+                return 0
         try:
             got = self.service.read_next(handle.launch_id)
         except Exception:
@@ -158,11 +173,6 @@ class RoomServe:
         if got:
             self.last_error = None
         return got
-
-    def _drop_handle(self, handle: RoomHandle) -> None:
-        with self._lock:
-            if self._handle is handle:
-                self._handle = None
 
     def _run(self) -> None:
         while not self._stop_evt.is_set():
@@ -215,11 +225,12 @@ class RoomServe:
     def view(self) -> dict[str, Any]:
         """What a route hands the page, with no side effect (it opens nothing): the open room thread (None when no room
         is open), the launch the pump holds, and the last pump or stop error."""
-        self._ready()
-        thread = self.chat_store._read(_open_room)
-        held = self._handle
-        return {"room_thread": thread, "launch_id": None if held is None else held.launch_id,
-                "last_error": self.last_error}
+        with self._lock:                         # one snapshot: never a new room paired with the old launch
+            self._ready()
+            thread = self.chat_store._read(_open_room)
+            held = self._handle
+            return {"room_thread": thread, "launch_id": None if held is None else held.launch_id,
+                    "last_error": self.last_error}
 
     def rotate(self) -> str:
         """His "new conversation": a new room thread opened, the old one rotated, in one transaction. With no room
@@ -231,13 +242,20 @@ class RoomServe:
                 if room.current_room(conn) is None:
                     raise RoomServeError("no room is open to rotate; nothing was done")
                 new = self._store.bare_thread(conn, now, _TITLE)
-                room.rotate(conn, new)
-            self._handle = None
+                room.rotate(conn, new, now=now)
+            old = self._handle
+            try:
+                if old is not None:              # ended under the lock: the pump reads nothing from a rotated launch
+                    self.launcher.end(old.launch_id, "room rotated")
+            except Exception as exc:  # noqa: BLE001 - the rotation is committed; the pump's recycle ends a leftover
+                self.last_error = f"rotate: the old launch did not end: {type(exc).__name__}: {str(exc)[:200]}"
+            finally:
+                self._handle = None
             return new
 
     # --- the thread -----------------------------------------------------------------------------------------------
     def _open_new_room(self) -> str:
         with self._store._write() as (conn, now):
             thread = self._store.bare_thread(conn, now, _TITLE)
-            room.open_room_thread(conn, thread)
+            room.open_room_thread(conn, thread, now=now)
         return thread

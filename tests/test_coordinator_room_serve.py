@@ -248,14 +248,14 @@ def test_a_tab_that_drew_a_rotated_room_is_refused_and_the_new_room_takes_the_ne
     try:
         rs.send(author_surface="cockpit", client_id="tab-a", outbox_id="ob-00000001", body="one")
         old = rs.view()["room_thread"]
-        first_launch = launcher.handle.launch_id
-        new = rs.rotate()
+        n_ensures = launcher.ensures
+        new = rs.rotate()                                      # ends the old launch
         assert new != old and rs.view()["room_thread"] == new
         old_session = launcher.session
         written = len(old_session.written)
         with pytest.raises(RoomRotated):
             rs.send(author_surface="cockpit", client_id="tab-a", outbox_id="ob-00000002", body="stale", room_thread=old)
-        assert launcher.handle.launch_id == first_launch      # nothing opened for the refused line
+        assert launcher.handle is None and launcher.ensures == n_ensures   # nothing opened for the refused line
         r = rs.send(author_surface="cockpit", client_id="tab-b", outbox_id="ob-00000003", body="fresh", room_thread=new)
         assert r.state == "accepted" and launcher.handle.room_thread == new
         assert len(old_session.written) == written                    # the stale line wrote nothing to the vendor
