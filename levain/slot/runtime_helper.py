@@ -27,6 +27,7 @@ import base64
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import re
 import selectors
@@ -496,6 +497,55 @@ def gateway_front_args(host: str, slot: SlotId, *, run: Path, store: Path, slot_
     return (*shape, "--policy", str(gw / FRONT_POLICY_NAME),
             "--log", str(store / "gw" / f"slot{slot.index}" / FRONT_LOG_NAME),
             "--keys", str(run / "keys" / "front.sock"), "--go-fd", str(GO_FD))
+
+
+_PASSTHROUGH_TAIL_BYTES = 1 << 20
+_INT64_MAX = 2**63 - 1
+
+
+def read_passthrough_total(log_path: object) -> Optional[int]:
+    """The front's cumulative passthrough byte total, read from its tunnel log: the ``passthrough_total`` of the LAST
+    line that is a JSON object with ``event`` ``tunnel`` and an int (not a bool) ``passthrough_total`` in
+    ``0 .. 2**63-1``. Only the last 1 MiB of a regular file is read (the first, partial line of a tail is dropped);
+    lines split on ``\\n`` alone. Torn, non-JSON and other-event lines are skipped; a tunnel still open at the front's
+    death has no line and counts nowhere. ``None`` when the path is missing, unreadable, a symlink or not a regular
+    file (a FIFO never blocks), or holds no such line. Never raises."""
+    try:
+        fd = os.open(log_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)  # type: ignore[call-overload]
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            off = max(0, st.st_size - _PASSTHROUGH_TAIL_BYTES)
+            if off:
+                os.lseek(fd, off, os.SEEK_SET)
+            chunks: List[bytes] = []
+            left = _PASSTHROUGH_TAIL_BYTES + 1
+            while left > 0:
+                c = os.read(fd, min(left, 1 << 16))
+                if not c:
+                    break
+                chunks.append(c)
+                left -= len(c)
+        finally:
+            os.close(fd)
+        lines = b"".join(chunks).split(b"\n")
+        if off:
+            lines = lines[1:]
+        total: Optional[int] = None
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(rec, dict) or rec.get("event") != "tunnel":
+                continue
+            v = rec.get("passthrough_total")
+            if type(v) is int and 0 <= v <= _INT64_MAX:
+                total = v
+        return total
+    except Exception:
+        return None
 
 
 def front_session_routes(base: Mapping[str, object], routes: Sequence[str], *,
@@ -3546,7 +3596,7 @@ __all__ = ["BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ctx", "DirRo
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",
            "session_lock_name", "session_owner_uid", "slot_owned_dir_ok", "spawn_front", "spawn_target", "status",
-           "front_policy_bytes", "front_session_routes", "gateway_front_args", "prepare_front_log",
+           "front_policy_bytes", "front_session_routes", "read_passthrough_total", "gateway_front_args", "prepare_front_log",
            "account_in_range", "check_front_log_dirs",
            "refuse_ticketed_front", "stub_front_args", "wait_child", "write_front_policy"]
 
