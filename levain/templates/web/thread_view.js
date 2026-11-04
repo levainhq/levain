@@ -1,7 +1,8 @@
 // levain thread_view.js — the cockpit's work-thread view (CH-U1a read half; a Stop for a running turn).
 //
 // A pure view-model plus a renderer for the two JSON bodies levain/cockpit/threads.py serves: the thread list and one
-// thread's stream. Read-only unless mount is given {stop: true}: then a thread that names a launch carries a Stop that
+// thread's stream. Read-only unless mount is given {stop: true}: then a thread that names a launch the server reports
+// `stoppable` (its service holds a session for it) carries a Stop that
 // posts to /cockpit/thread/<id>/stop and never decides anything itself: whether a stop landed is the server's word,
 // drawn as given. A work thread has NO composer: the operator talks in the room (room_view.js), and steering a work thread
 // is a drop. Every word that came from a thread is set with textContent, never as markup. The stream is drawn in the
@@ -226,7 +227,9 @@
           if (stopped || g !== gen || t === last) return;
           last = t;
           var j = JSON.parse(t);
-          if (which) { renderThread(doc, body, threadModel(j), ui); paintStop(which, j.launch_id); }
+          // a Stop only where the server says one can reach a session (j.stoppable): with no chat service the route is a
+          // 404, and the room's service holds no work launch (409), so a Stop there could never succeed
+          if (which) { renderThread(doc, body, threadModel(j), ui); paintStop(which, j.stoppable === true ? j.launch_id : null); }
           else { renderList(doc, body, listModel(j), function (id) { api.open(id); }); paintStop(null, null); }
         });
       }).catch(function () { if (!stopped && g === gen) say("The thread record could not be read."); });

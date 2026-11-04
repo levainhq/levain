@@ -190,3 +190,41 @@ def test_a_work_thread_draws_a_stop_and_no_composer(tmp_path, live):
         ])
     assert json.loads(out["values"][3]) == {"input": 0}
     assert _rows(cs) == []
+
+
+# --- roomfix1 R3: a Stop only where the server can reach a session -----------------------------------------------------
+
+def test_the_thread_body_says_whether_a_stop_can_reach_a_session(tmp_path, live):
+    """The page drew a Stop on every thread naming a launch, even where it could never succeed: with no chat service the
+    route is a 404, and under `levain serve --room` the room's service holds no work launch (409 no_session). The thread
+    body now carries `stoppable`: true only while the server's service holds a usable session for that launch."""
+    from levain.cockpit import threads as cockpit_threads
+    svc, cs, world, session = live
+    _root, src, _ids = _install(tmp_path)
+    path = f"/cockpit/thread/{world['thread']}.json"
+    with _serve(src, write_token=TOKEN, chat_service=svc) as (base, _h):
+        assert _call(base, path, None, method="GET")[1]["stoppable"] is True
+        svc.detach(world["launch"])
+        assert _call(base, path, None, method="GET")[1]["stoppable"] is False
+    directory = cs._opener.path.parent
+    assert cockpit_threads.thread_stream(directory, world["thread"], None)["stoppable"] is False      # no service
+    other = ChatService(cs)                      # a service that holds no session for this launch (the room's case)
+    try:
+        assert cockpit_threads.thread_stream(directory, world["thread"], other)["stoppable"] is False
+    finally:
+        other.close()
+
+
+@needs_browser
+def test_a_work_thread_whose_launch_no_session_holds_draws_no_stop(tmp_path, live):
+    svc, cs, world, session = live
+    svc.detach(world["launch"])
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, write_token=TOKEN, chat_service=svc, extra_assets=_assets(_BOOT)) as (base, _h):
+        out = _drive(tmp_path, base + "/tvc.html", [
+            {"until": "document.querySelector('.tv-row')"},
+            {"eval": "document.querySelector('.tv-row').click(); 1"},
+            {"until": "document.querySelector('.tv-title')"},
+            {"eval": "new Promise(r => setTimeout(() => r(document.querySelectorAll('.tv-stop').length), 300))"},
+        ])
+    assert out["values"][-1] == 0

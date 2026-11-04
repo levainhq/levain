@@ -190,6 +190,20 @@ def model_in_use(service: Any, launch: str | None) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+def stoppable(service: Any, launch: str | None) -> bool:
+    """Whether the page's Stop for this launch can reach a session: the server mounts a ChatService (the stop route is
+    served only then) AND that service holds a usable session for the launch (``ChatService.has_session``). False for a
+    server with no service (the stop route is a 404), for the room's service under ``levain serve --room`` (it holds
+    room launches only, so a work-thread stop is a 409 ``no_session``), and for a service lacking the method. A dict
+    read, never a driver call. The page draws its Stop only when this is true (roomfix1 R3)."""
+    if service is None or launch is None:
+        return False
+    try:
+        return service.has_session(launch) is True
+    except Exception:       # noqa: BLE001 - a service that cannot say is a Stop that is not drawn
+        return False
+
+
 def _chat_readable(conn: sqlite3.Connection) -> bool:
     """Whether ``chat_timeline`` can be read: the view exists and every table it joins is present."""
     try:
@@ -306,6 +320,7 @@ def thread_stream(directory: Path | str, thread_id: str, service: Any = None) ->
             done = {(lid, c) for (lid, k), (c, _t, _b) in facts.items() if k.startswith("tool_result:") and c}
             launch = _worker_launch(conn, thread_id)
             return {"thread_id": thread_id, "launch_id": launch, "gap": gap, "model": model_in_use(service, launch),
+                    "stoppable": stoppable(service, launch),
                     "authority": authority_header(conn, thread_id),
                     "before": [_item(r, facts, done) for r in before],
                     "stream": [_item(r, facts, done) for r in merged]}
