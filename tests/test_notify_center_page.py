@@ -52,7 +52,7 @@ def _post_notice(port: int, token: str, payload: dict) -> str:
 
 
 class Rig:
-    """A queue with one waiting approval (a ping that is about a Needs-you item), a dated ping, a token notice and a flow notice."""
+    """A queue with one waiting approval (a ping that is about a Needs-you item), a dated ping, two token notices (a second sender, "mail")."""
 
     def __init__(self, tmp_path: Path) -> None:
         self.src = _install(tmp_path)[1]
@@ -68,12 +68,12 @@ class Rig:
         st.add_ping("question", f"question:{qn.n}", "levain", "claude_code asks: Ship it?")
         st.add_ping("dated", None, "levain", "Due today: hosting.com reschedule")
         _, self.token = nt.create(self.q, "Backup")
-        _, self.flow = nt.create(self.q, "flow poster", "flow", origin="flow")
+        _, self.flow = nt.create(self.q, "Mail digest", "mail")
 
     def seed(self, port: int) -> dict[str, str]:
         ids = {"token": _post_notice(port, self.token, {"title": "B2 backup finished", "body": TOKEN_BODY}),
-               "flow": _post_notice(port, self.flow, {"title": "Inbox digest", "body": FLOW_BODY, "source": "email"}),
-               "low": _post_notice(port, self.flow, {"title": "Diogenes daily", "body": "one LOW", "priority": "low", "source": "diogenes"})}
+               "flow": _post_notice(port, self.flow, {"title": "Inbox digest", "body": FLOW_BODY}),
+               "low": _post_notice(port, self.flow, {"title": "Diogenes daily", "body": "one LOW", "priority": "low"})}
         return ids
 
 
@@ -222,7 +222,7 @@ def test_a_push_tap_opens_that_item_marked_read_and_a_deleted_one_says_so(tmp_pa
 @needs_browser
 def test_a_token_senders_links_show_their_full_address_and_a_hostile_link_is_only_text(tmp_path: Path) -> None:
     """A notify-token sender's link shows its full URL beside the anchor text; a javascript:, mailto: or relative link is plain text, never
-    a link; a flow notice's link is a normal link that shows its address too; raw HTML paints as literal text; every live link is _blank with rel noopener."""
+    a link; a second token's link shows its address too; raw HTML paints as literal text; every live link is _blank with rel noopener."""
     r = Rig(tmp_path)
 
     def detail(title: str) -> list:
@@ -240,8 +240,8 @@ def test_a_token_senders_links_show_their_full_address_and_a_hostile_link_is_onl
     assert tok["full"] == [" (https://argus.example/backups/1.log)"] and tok["note"] is True, tok          # the bare URL is its own address
     assert "click" in tok["text"] and "mail" in tok["text"] and "rel" in tok["text"], tok                    # the hostile links keep their words
     assert flow["links"] == [["https://mail.example/t/1", "_blank", "noopener noreferrer", "Open the thread"]], flow
-    assert flow["full"] == [" (https://mail.example/t/1)"], flow                                             # the address shows for every sender, not only a token's
-    assert flow["scripts"] == 0 and "<b>raw html</b>" in flow["text"] and flow["note"] is False, flow
+    assert flow["full"] == [" (https://mail.example/t/1)"], flow                                             # the address shows for every sender
+    assert flow["scripts"] == 0 and "<b>raw html</b>" in flow["text"] and flow["note"] is True, flow
 
 
 @needs_browser

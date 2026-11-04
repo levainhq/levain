@@ -1180,7 +1180,7 @@ _NOTIFY_TOKENS_REVOKE = "/webpush/notify/tokens/revoke"
 # the whole request body, refused on its declared length before it is read: in bytes, sized so a title and a body at
 # their character maxima in 4-byte UTF-8 still fit
 _NOTIFY_MAX_REQUEST = 8192
-_NOTIFY_KEYS = frozenset({"title", "body", "priority", "source"})
+_NOTIFY_KEYS = frozenset({"title", "body", "priority"})
 _NOTIFY_DEFAULT_TITLE = "Notice"            # a post with no title carries this; the source label is put in front of it
 _NOTIFY_MINT_KEYS = frozenset({"name", "source", "urgent", "max_priority", "rate_per_min", "rate_per_day",
                                "urgent_per_hour"})
@@ -1257,7 +1257,7 @@ def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
     hold = (notify.NOTICES_URL, reason or "active") if decision == "held" else None
     # the ping, its held row and the notice are one transaction: a failure stores none of them, and the caller says so
     ping_id, nid = PushStore(queue).record_notice(adm.kind, ref, adm.display, adm.source, adm.title, adm.body,
-                                                  adm.priority, adm.token, decision, hold=hold, origin=adm.origin)
+                                                  adm.priority, adm.token, decision, hold=hold)
     if decision == "pushed":
         try:
             threading.Thread(target=_push_notice, args=(queue, ping_id, adm.kind, ref, adm.display, adm.body),
@@ -2696,7 +2696,7 @@ class _Handler(GuardedHandler):
         return raw if len(raw) <= 128 and _HEADER_SAFE_TOKEN.fullmatch(raw) else ""
 
     def _notify_post(self) -> None:
-        """``POST /notify {title?, body?, priority?, source?}`` (a title or a body; ``source`` only from a flow-origin token): a notice from a service, as a doorbell and nothing more. Every
+        """``POST /notify {title?, body?, priority?}`` (a title or a body): a notice from a service, as a doorbell and nothing more. Every
         refusal that does not need the body is sent before a byte of it is read, and closes the connection so the unread
         body is never taken for the next request (no route, a missing credential, a token that is not a live one, the
         content type, the length, a busy server). The token is checked from the header alone, with no lock and before a
@@ -2736,11 +2736,11 @@ class _Handler(GuardedHandler):
                 return self._send_json({"error": "bad_json", "message": "body is not valid JSON"}, 400)
             if not isinstance(req, dict) or not set(req) <= _NOTIFY_KEYS or not (req.keys() & {"body", "title"}):
                 return self._send_json({"error": "bad_request", "message": "send a title or a body, and only priority "
-                                        "(and, from flow's own token, source) besides: a notice is text, nothing else"}, 400)
+                                        "besides: a notice is text, nothing else"}, 400)
             queue = signer.queue_dir
             try:
                 adm = notify_tokens.admit(queue, supplied, req.get("title", _NOTIFY_DEFAULT_TITLE), req.get("body"),
-                                          req.get("priority"), source=req.get("source"), no_body="body" not in req)
+                                          req.get("priority"), no_body="body" not in req)
             except NotifyRefused as exc:
                 headers = [("Retry-After", str(int(exc.retry_after) + 1))] if exc.status == 429 else None
                 return self._send(json.dumps({"error": exc.error, "message": str(exc)}).encode("utf-8"),

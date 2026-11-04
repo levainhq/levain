@@ -3140,7 +3140,6 @@ body.ke .dev-zone.pr-settings .zone-head { display: flex; }
 .nc-chip { padding: 2px var(--sp-3); border-radius: var(--r-pill); border: 1px solid var(--hair-2); font: var(--fw-semibold) var(--fs-micro)/1.2 var(--round);
   white-space: nowrap; max-width: 14em; overflow: hidden; text-overflow: ellipsis; }
 .nc-chip.o-levain { color: var(--accent); background: color-mix(in oklch, var(--accent) 14%, transparent); border-color: transparent; }
-.nc-chip.o-flow { color: var(--info); background: color-mix(in oklch, var(--info) 14%, transparent); border-color: transparent; }
 .nc-chip.o-token { color: var(--violet); background: color-mix(in oklch, var(--violet) 14%, transparent); border-color: transparent; }
 .nc-chip.p-urgent { background: var(--accent); color: var(--on-accent); border-color: var(--accent); text-transform: uppercase; letter-spacing: var(--track-caps); }
 .nc-chip.p-low { color: var(--meta); background: none; text-transform: uppercase; letter-spacing: var(--track-caps); }
