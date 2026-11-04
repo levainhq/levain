@@ -626,3 +626,33 @@ def test_a_read_that_fails_after_a_lost_reply_does_not_leave_send_dead(tmp_path:
     with rig.serving():
         out = drive_touch(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
     assert len(_posted(out)) == 2, out["posts"]
+
+
+# ---- 1103-46 herofix: a read that is not clean must not take the keyboard from the box ------------------------------------------------
+
+BREAK_READS = ("(() => { const f = window.fetch; window.fetch = function (u, o) { const url = typeof u === 'string' ? u : (u && u.url) || '';"
+               " if (url.indexOf('/cockpit/coord/drops.json') >= 0) return Promise.resolve(new Response('{}', {status: 503}));"
+               " return f.apply(this, arguments); }; return 1; })()")
+BOX_STATE = (f"JSON.stringify({{t: '__T__', boxOff: {BOX}.disabled, sendOff: document.querySelector('#ck-drop [data-coord-drop=send]').disabled,"
+             " envOff: document.querySelector('#ck-drop [data-coord-drop=envelope]').disabled, bad: !!document.querySelector('#ck-drop .drop-note.bad'),"
+             f" focused: document.activeElement === {BOX}, value: {BOX}.value}})")
+STALE_REPLAY = {"eval": "new Promise(r => setTimeout(r, 3600)).then(() => { document.dispatchEvent(new Event('visibilitychange')); return 1; })"}
+SETTLE_BAD = {"until": "!!document.querySelector('#ck-drop .drop-note.bad')", "ms": 20000}
+
+
+@needs_browser
+@needs_ssh
+@pytest.mark.parametrize("case", ["draft", "focused", "empty"])
+def test_a_failed_drop_read_leaves_a_focused_or_drafted_box_enabled_and_send_off(case: str, tmp_path: Path, monkeypatch) -> None:
+    rig = FullRig(tmp_path, monkeypatch)
+    prep = {"draft": [_type("half a thought"), {"eval": f"{BOX}.blur(); 1"}],
+            "focused": [{"eval": f"{BOX}.focus(); 1"}], "empty": []}[case]
+    steps = [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000}, *prep,
+             {"eval": BREAK_READS}, STALE_REPLAY, SETTLE_BAD, SETTLE, {"eval": BOX_STATE.replace("__T__", "s")}]
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", steps)
+    s = _tagged(out)["s"]
+    assert s["bad"] and s["sendOff"] and s["envOff"], s                  # the buttons follow the failed read, always
+    assert s["boxOff"] is (case == "empty"), s                           # only an empty, unfocused box goes off
+    if case == "draft":
+        assert s["value"] == "half a thought", s
