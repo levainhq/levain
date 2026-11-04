@@ -5305,7 +5305,8 @@ def run_web_server(
     mode = "GOVERNED WRITABLE" if source.write_scope is not None else "read-only"
     print(f"  {mode} · localhost-only · Ctrl+C to stop")
     if room_serve is not None:
-        print(f"  room: one Claude room · its tools see {room} first · recovered {room_serve.recovered or 'nothing'}")
+        print(f"  room: one Claude room · its tools see {Path(room).expanduser().resolve()} first · recovered "
+              f"{room_serve.recovered or 'nothing'}")
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")

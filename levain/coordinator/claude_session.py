@@ -68,6 +68,9 @@ _POLL_SLICE = 0.02              # the longest a waiting pump sleeps between non-
 
 ROOM_MCP_SERVER = "levain_room"
 ROOM_MCP_TOOL = "mcp__levain_room__propose_drop"
+# WebSearch is an EGRESS channel, kept by design (roomfix1 C4, routed to the operator): the room can send search queries
+# built from what it has read (a file under its cwd, a search result), so those words can reach a search provider. It
+# has no fetch (WebFetch is denied), no shell and no write. `levain serve --room`'s help says this in plain words.
 ROOM_TOOLS = ("Read", "Grep", "Glob", "WebSearch")
 ROOM_DENIED_TOOLS = ("Bash", "Edit", "Write", "NotebookEdit", "WebFetch")
 _ROOM_INIT_TOOLS = frozenset((*ROOM_TOOLS, ROOM_MCP_TOOL))
