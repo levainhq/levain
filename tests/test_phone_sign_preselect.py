@@ -66,7 +66,7 @@ _PICKED = ("(() => { const c = document.querySelector('.req.sign.linked'); if (!
 
 
 def _legacy_link(page: str, rid: str, token: str) -> str:
-    """The phone page's own link shape (phone.js reads it until OS-6 deletes the page): ``deep_link`` builds the
+    """The phone page's own link shape (the deleted phone page read it): ``deep_link`` builds the
     cockpit sheet's now, with no token, so these page tests build the legacy one by hand."""
     from urllib.parse import quote
 

@@ -103,7 +103,7 @@ def test_neither_the_cockpit_nor_the_phone_app_ships_a_band_answer_box() -> None
     # Phill 11-01 ("1a" twice): a decision is answered on its own card; freeform words go through the Drop
     from levain.web_server import load_web_asset
 
-    for name in ("dashboard_core.js", "phone.js", "dashboard.css", "phone.css"):
+    for name in ("dashboard_core.js", "dashboard.css", "phone.css"):
         text = load_web_asset(name)
         assert "band-box" not in text and "band-send" not in text and "bandDraft" not in text, name
 

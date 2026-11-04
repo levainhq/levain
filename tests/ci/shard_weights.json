@@ -648,7 +648,6 @@
   "tests/test_passkey_custody_derived.py": 10.1,
   "tests/test_phone_dispatch.py": 0.1,
   "tests/test_phone_grants_tab.py": 2.1,
-  "tests/test_phone_page.py": 0.5,
   "tests/test_phone_redirect.py": 0.6,
   "tests/test_phone_sign.py": 0.3,
   "tests/test_phone_sign_preselect.py": 0.1,
