@@ -808,3 +808,46 @@ def test_a_verifier_that_raises_frees_its_signature_for_the_next_render(rig, sto
     ok = lambda pk: (True, "bio")        # noqa: E731
     assert band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=ok) == {q.id: "signed: Touch ID, laptop (desk)"}
     assert len(asked) == 1
+
+
+# --- L3 r2 W3: a duplicate never reads a delivery status the first caller does not get ----------------------------
+
+def test_a_concurrent_duplicate_reads_the_final_delivery_status(rig, store, monkeypatch):
+    """The delivery thread cannot start, and a duplicate of the request is waiting on the first: both get
+    ``deferred``. Thread start is held until the duplicate has had its chance to read, so a status cached before the
+    start outcome is seen by it."""
+    q = file_q(store)
+    dup: list = []
+    threads: list[threading.Thread] = []
+    sent = body(q)
+
+    def no_thread(deliver, done):
+        threads[0].join(1.0)            # let a woken duplicate read whatever is cached by now
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(desk_click, "_start_delivery", no_thread)
+
+    def during():
+        t = threading.Thread(target=lambda: dup.append(rig(sent, factory=calls, delivered=lambda done: None)))
+        threads.append(t)
+        t.start()
+    calls = Calls(during=during)
+    first = rig(sent, factory=calls, delivered=lambda done: None)
+    threads[0].join(10)
+    assert first[1] == 200 and first[0]["delivery"] == "deferred", first
+    assert dup == [first], dup
+    assert calls.n == 1 and answers(store) == [(q.id, "ship")]
+
+
+def test_the_text_route_decides_delivery_before_it_remembers(store, keydir, monkeypatch):
+    q = file_q(store)
+    state = desk_click.DeskState()
+
+    def no_thread(deliver, done):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(desk_click, "_start_delivery", no_thread)
+    request = _text_req(store, "1a", txn="txn-text-dlv")
+    got, status = desk_click.desk_text(request, store, state, policy="all", signer_factory=Calls(), key_dir=keydir,
+                                       notify=lambda t: None, deliver=lambda done: None)
+    assert status == 200 and got["delivery"] == "deferred", got
+    assert state.finished("txn-text-dlv") == (got, 200)
+    assert answers(store) == [(q.id, "ship")]
