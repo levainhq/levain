@@ -699,3 +699,52 @@ def test_l2_no_stdin_at_all_is_the_not_a_terminal_refusal(v2, monkeypatch, capsy
     monkeypatch.setattr(sys, "stdin", None)
     assert _cli("--signing-key", str(k["A"].path), "--data-root", str(root)) == 1
     assert "stdin is not a terminal" in capsys.readouterr().err
+
+
+# --- the keep prompt says what keeping means (1104-8) -------------------------------------------------
+
+def _prompts(monkeypatch, answers):
+    """Record every input() prompt; answer from `answers` (an exhausted list raises EOFError, as a closed stdin)."""
+    import builtins
+    seen, it = [], iter(answers)
+
+    def fake(prompt=""):
+        seen.append(prompt)
+        try:
+            return next(it)
+        except StopIteration:
+            raise EOFError from None
+    monkeypatch.setattr(builtins, "input", fake)
+    return seen
+
+
+def test_keep_prompt_states_what_keeping_means_before_asking(v2, monkeypatch):
+    root, k = v2
+    _no_tty(monkeypatch, tty=True)
+    seen = _prompts(monkeypatch, ["y", "y", "n", "y"])
+    assert _cli("--signing-key", str(k["A"].path), "--data-root", str(root)) == 0
+    assert len(seen) == 4
+    for p in seen:
+        assert "FULL authority over this laptop's presence" in p
+        assert "not a\nrecovery path" in p or "not a recovery path" in " ".join(p.split())
+        assert p.rstrip().endswith("? [y/N]")
+    assert "custody passphrase" in seen[0] and "custody unstated" in seen[1]
+    assert k["P"].fingerprint in seen[1] and "key type ssh-" in seen[1]
+
+
+def test_keep_default_is_no_and_empty_answer_keeps_nothing_but_the_signer_refusal(v2, monkeypatch, capsys):
+    root, k = v2
+    _no_tty(monkeypatch, tty=True)
+    _prompts(monkeypatch, ["", "", "", ""])
+    rc = _cli("--signing-key", str(k["A"].path), "--data-root", str(root))
+    assert rc == 1                                   # the signing key itself was not kept: init refuses
+    assert _log(root) == [] and _uninitialised(root)
+    assert "refused" in capsys.readouterr().err
+
+
+def test_keep_yes_still_keeps_exactly_as_before(v2, monkeypatch):
+    root, k = v2
+    _no_tty(monkeypatch, tty=True)
+    _prompts(monkeypatch, ["y", "yes", "", "N"])
+    assert _cli("--signing-key", str(k["A"].path), "--data-root", str(root)) == 0
+    assert [x[3] for x in _log(root)] == [k[n].fingerprint for n in "AP"]

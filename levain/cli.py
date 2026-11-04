@@ -4290,6 +4290,29 @@ def _ask(prompt: str) -> bool:
         return False
 
 
+_KEEP_MEANING = (
+    "Keeping a key gives it FULL authority over this laptop's presence: whoever holds it can sign what this\n"
+    "laptop's presence signs. A key that lives on this laptop (a file under ~/.ssh, an agent's key) is not a\n"
+    "recovery path: lose the laptop and you lose the key with it. Keep only a key you made for this; an\n"
+    "everyday SSH or GitHub key is a no. Anything but y keeps nothing.\n")
+
+
+def _keep_prompt(fp: str, what: str, plan: object, signer_fp: str, signer_pub: str, signer_custody: str) -> str:
+    """The keep question for one key: what keeping means, the key's type and custody as the store knows them
+    (a legacy row's custody is 'unstated'; the store holds no comment, only the fingerprint), then the ask."""
+    key_type, custody = "?", "unstated"
+    if fp == signer_fp:
+        key_type, custody = signer_pub.split()[0], signer_custody
+    else:
+        for r in plan.rows:                                     # type: ignore[attr-defined]
+            if r.fingerprint == fp:
+                key_type = r.key_type
+        for k in plan.log_keys:                                 # type: ignore[attr-defined]
+            if k.fingerprint == fp:
+                custody = k.custody
+    return f"\n{_KEEP_MEANING}  key type {key_type}, custody {custody}\nkeep {fp}{what}? [y/N] "
+
+
 def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
     from levain.authority import LAPTOP
     from levain.cockpit.custody import declared_custody
@@ -4349,7 +4372,7 @@ def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
                 what = (" (the log's genesis)" if fp == plan.genesis and fp != signer_fp else
                         " (the signing key, the genesis)" if fp == signer_fp and plan.genesis in (None, fp) else
                         " (the signing key)" if fp == signer_fp else "")
-                if _ask(f"keep {fp}{what}? [y/N] "):
+                if _ask(_keep_prompt(fp, what, plan, signer_fp, signer_pub, signer_custody)):
                     confirmed.add(fp)
         else:
             sys.stdout.flush()
