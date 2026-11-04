@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -614,3 +613,67 @@ def test_an_old_store_with_the_worker_only_trigger_is_migrated_on_open(store, cs
     sql = fresh_cs._read(lambda conn: conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chat_messages_worker'").fetchone()[0])
     assert "'room'" in sql
+
+
+# --- RM-D2C: L3_rmd2_r2 fixes ------------------------------------------------------------------------------------
+class SendHung(Counting):
+    """A session whose send enters and then blocks until released (a slow or hung driver)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered, self.release = threading.Event(), threading.Event()
+        self.interrupts = 0
+
+    def send(self, command):
+        self.entered.set()
+        self.release.wait(5)
+        return super().send(command)
+
+    def interrupt(self, command):
+        self.interrupts += 1
+        return CommandResult("confirmed", "interrupted")
+
+
+def test_fix1_a_stop_behind_a_hung_send_closes_the_session(store, cs, monkeypatch):
+    """L3_rmd2_r2 complement MED: the send's driver call has no deadline of its own; an interrupt that waited
+    INTERRUPT_DEADLINE for it does not give up with nothing done: it wedges the session and closes it (the stop that
+    always works), and its receipt says so. FIX 2 (complement LOW): that branch leaves the session wedged."""
+    monkeypatch.setattr(chat, "INTERRUPT_DEADLINE", 0.2)
+    thread, launch, svc = _held_room(store, cs, "room-sid-c1")
+    session = _attach(svc, cs, launch, SendHung())
+    sender = threading.Thread(target=lambda: say(svc, thread))
+    sender.start()
+    try:
+        assert session.entered.wait(5)
+        got = svc.interrupt(launch, None)
+        assert got.outcome == "ambiguous" and "closed" in got.detail and "not returned" in got.detail
+        assert session.closed is True and session.interrupts == 0
+        with pytest.raises(CoordError, match="stopped answering"):      # FIX 2: wedged, the pin gone
+            svc.interrupt(launch, None)
+        assert svc.composer(launch, "cockpit:tab-a").state != "writable"
+    finally:
+        session.release.set()
+        sender.join(5)
+    assert not sender.is_alive()
+
+
+def test_fix3_a_turn_release_of_a_room_launch_is_refused_at_the_service(world, monkeypatch):
+    """codex 6: turn_release gates with the worker-only check, so a room launch never reaches the lease layer."""
+    reached = []
+    monkeypatch.setattr(world["svc"]._chat, "turn_release", lambda *a: reached.append(a))
+    with pytest.raises(CoordError, match="only a worker launch"):
+        world["svc"].turn_release(world["launch"], 1, "cockpit:tab-a")
+    assert reached == []
+
+
+def test_fix4_a_stored_room_resend_is_answered_with_the_launch_role_unresolved(world, cs, monkeypatch):
+    """codex 7: a stored receipt comes from the record alone; the stored launch's role is not needed for it."""
+    first = say(world["svc"], world["thread"])
+    real = chat._launch_state
+    monkeypatch.setattr(chat, "_launch_state",
+                        lambda conn, lid: (None, None, None) if lid == world["launch"] else real(conn, lid))
+    again = say(world["svc"], world["thread"])
+    assert (again.message_id, again.state, again.created) == (first.message_id, "accepted", False)
+    assert world["session"].sends == 1
+    with pytest.raises(chat.MessageConflict):           # the record still answers only the same line
+        say(world["svc"], world["thread"], body="something else")

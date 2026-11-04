@@ -1595,9 +1595,9 @@ class ChatService:
     a send's driver call never overlap on one session: :meth:`_attempt_and_call` decides which goes first under
     ``_guard``.
 
-    A driver call that has not returned by its deadline (a read, an evidence read, an interrupt) WEDGES the session:
-    the call is left in flight and nothing else is called on that session until it is detached (a new attach starts
-    unwedged).
+    A driver call that has not returned by its deadline (a read, an evidence read, an interrupt, or a send an interrupt
+    waited out: that one also closes the session) WEDGES the session: the call is left in flight and nothing else is
+    called on that session until it is detached (a new attach starts unwedged).
 
     Liveness (§4.1-§4.2): ``probe(launch_id, evidence)`` is the service's verdict function (the launcher's; CH-D2 /
     CH-D3 give the vendor ones) and returns a :class:`Verdict`. A session supplies only
@@ -1778,7 +1778,9 @@ class ChatService:
         writes ``pending``: a launch replaced between the read and the write is re-resolved, and the row never names a
         launch that was not the room's running one when it committed. A stored ``outbox_id`` replays only a line this
         same client sent to a ROOM launch on this room thread; any other stored message is a conflict (L3_rmd2_r1:
-        codex MED 4, a worker's line on the same thread; deepseek MED 3, another client's id)."""
+        codex MED 4, a worker's line on the same thread; deepseek MED 3, another client's id). A stored receipt is
+        PERMANENT for its ``outbox_id``, a ``refused`` or ``cancelled`` one included (a wedged session's line, a send
+        cancelled for an interrupt): the surface mints a new ``outbox_id`` to try the line again."""
         def stored_read(conn: sqlite3.Connection) -> tuple[ChatMessage | None, str | None]:
             m = _message(conn, "outbox_id", outbox_id)
             role = None if m is None or m.launch_id is None else _launch_state(conn, m.launch_id)[0]
@@ -1791,7 +1793,9 @@ class ChatService:
             if (stored.author_surface, stored.client_id) != (author_surface, client_id):
                 raise MessageConflict(f"outbox_id {outbox_id} is already stored by another client; nothing was "
                                       "written")
-            if stored.launch_id is None or stored_role != "room" or stored.thread_id != room_thread:
+            # a role that cannot be resolved does not hold the receipt back (codex 7): it sends nothing, and it is
+            # only ever this client's own line on this room thread
+            if stored.launch_id is None or stored_role not in ("room", None) or stored.thread_id != room_thread:
                 raise MessageConflict(f"outbox_id {outbox_id} is already stored for a different message "
                                       f"({stored.message_id}); nothing was written")
             return self._send(stored.launch_id, None, **kw)
@@ -1823,18 +1827,21 @@ class ChatService:
                 caps = _caps_snapshot(session.capabilities())
                 normalized = _plain_norm(session.normalize(body)) if isinstance(body, str) else body
             with self._chat._write() as (conn, now):
-                role = self._need_chat_launch(conn, launch_id)
                 replay = _message(conn, "outbox_id", outbox_id) if isinstance(outbox_id, str) else None
-                if role == "room":
-                    if replay is None:
-                        # every NEW room line is fenced here, whichever verb carried it (codex HIGH 1)
-                        if room_thread is None:
-                            raise CoordError(f"launch {launch_id} is a room launch; a line to the room goes through "
-                                             "send_room; nothing was written")
-                        if _room_target(conn, room_thread) != launch_id:
-                            raise _RoomMoved(launch_id)
+                # a stored line is answered by record_message's stored branch, from the record alone: the launch's
+                # role is not resolved for it (L3_rmd2_r2 codex 7)
+                role = None if replay is not None else self._need_chat_launch(conn, launch_id)
+                if replay is not None:
+                    thread_id = replay.thread_id          # record_message still compares it, and the launch id
+                elif role == "room":
+                    # every NEW room line is fenced here, whichever verb carried it (codex HIGH 1)
+                    if room_thread is None:
+                        raise CoordError(f"launch {launch_id} is a room launch; a line to the room goes through "
+                                         "send_room; nothing was written")
+                    if _room_target(conn, room_thread) != launch_id:
+                        raise _RoomMoved(launch_id)
                     # the room thread the line names, never the launch's first thread in JSON order (deepseek MED 2)
-                    thread_id = room_thread if replay is None else replay.thread_id
+                    thread_id = room_thread
                 else:
                     row = conn.execute("SELECT j.value FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? "
                                        "LIMIT 1", (launch_id,)).fetchone()
@@ -2261,12 +2268,14 @@ class ChatService:
         it writes nothing (the in-flight approval rows a stop cancels are CH-D1c's). It does not wait on the launch's
         mutex: a stop never queues behind a send's preflight or outcome. It waits only for a send already past the
         arbiter (:meth:`_attempt_and_call`) to return from the session's send call, inside the same
-        :data:`INTERRUPT_DEADLINE` (past it: ``ambiguous``, nothing sent). A driver that raises, or returns
-        anything but a :class:`~levain.coordinator.driver.CommandResult`, is ``ambiguous``; so is one that has not
-        answered within :data:`INTERRUPT_DEADLINE`, and that one also wedges the session (no further call reaches it,
-        an interrupt included, until it is detached). The session is pinned until its call returns: :meth:`detach` refuses a new
-        interrupt meanwhile and waits for the pin, at most :data:`INTERRUPT_DEADLINE`, before it closes the session
-        (an interrupt reaches only the session it pinned; one stuck past the deadline is closed under it).
+        :data:`INTERRUPT_DEADLINE`; past it the session is wedged and CLOSED instead (:meth:`_stop_by_close`, its
+        close bounded by a second :data:`INTERRUPT_DEADLINE`), and the ``ambiguous`` receipt says so. A driver that
+        raises, or returns anything but a :class:`~levain.coordinator.driver.CommandResult`, is ``ambiguous``; so is
+        one that has not answered within :data:`INTERRUPT_DEADLINE`, and that one also wedges the session (no further
+        call reaches it, an interrupt included, until it is detached). The session is pinned until its call returns:
+        :meth:`detach` refuses a new interrupt meanwhile and waits for the pin, at most :data:`INTERRUPT_DEADLINE`,
+        before it closes the session (an interrupt reaches only the session it pinned; one stuck past the deadline is
+        closed under it).
         ``turn_id`` is None or one line of plain text, as a recorded vendor turn id is (:func:`record_event`)."""
         if turn_id is not None:
             _line("an interrupt's turn id", turn_id)
@@ -2305,10 +2314,12 @@ class ChatService:
             with self._guard:
                 clear = self._unpinned.wait_for(lambda: not self._sending.get(id(session)),
                                                 timeout=INTERRUPT_DEADLINE)
-            if not clear:
-                unpin()
-                return CommandResult("ambiguous", f"a send on this session had not returned within "
-                                                  f"{INTERRUPT_DEADLINE:g} s; the interrupt was not sent")
+        except BaseException:
+            unpin()
+            raise
+        if not clear:
+            return self._stop_by_close(launch_id, session, unpin)
+        try:
             got = _bounded(call, max(0.0, deadline - time.monotonic()))
         except _Overdue:
             self._wedge(launch_id, session)
@@ -2325,6 +2336,29 @@ class ChatService:
                 "confirmed", "ambiguous", "rejected", "no_such_request"):
             return CommandResult("ambiguous", "the driver returned no command result")
         return CommandResult(got.outcome, _cause_text(got.detail if type(got.detail) is str else got.outcome))
+
+    def _stop_by_close(self, launch_id: str, session: Any, unpin: Callable[[], None]) -> CommandResult:
+        """:meth:`interrupt`'s way out when a send's driver call (which has no deadline of its own) had not returned
+        within :data:`INTERRUPT_DEADLINE`: the stop is still made, by closing the session, the stop that is always
+        available (§4.3; L3_rmd2_r2 complement MED); a driver whose close waits on that same send call reports it here
+        as overdue. The session is wedged first, so nothing else is called on
+        it (L3_rmd2_r2 complement LOW: the pin is never dropped with the session left usable), then its pin is
+        released, then ``session.close()`` runs bounded by :data:`INTERRUPT_DEADLINE`. The session stays attached,
+        wedged, until :meth:`detach` forgets it. The receipt is ``ambiguous`` and says the session was closed."""
+        self._wedge(launch_id, session)
+        unpin()
+        head = (f"a send on this session had not returned within {INTERRUPT_DEADLINE:g} s, so the session was closed "
+                "instead of interrupted")
+        tail = "; it is used no more until it is detached"
+        try:
+            _bounded(session.close, INTERRUPT_DEADLINE)
+        except _Overdue:
+            return CommandResult("ambiguous", f"{head}, and its close had not returned within "
+                                              f"{INTERRUPT_DEADLINE:g} s either{tail}")
+        except Exception as exc:  # noqa: BLE001 - a close that raises is reported, never lost
+            return CommandResult("ambiguous", _cause_text(f"{head}, and its close raised {type(exc).__name__}: "
+                                                          f"{_said(exc)}{tail}"))
+        return CommandResult("ambiguous", f"{head} (closing is the stop){tail}")
 
     # --- liveness: the activation writer, the probe, your re-enable, the composer (§4.1-§4.3, H9) -------------
     def activate(self, launch_id: str, kind: str, detail: str, *, evidence: LivenessEvidence | None = None,
@@ -2420,8 +2454,9 @@ class ChatService:
         """Give back an epoch ``owner`` claimed for a send that moved nothing; refused for an epoch that is not
         ``owner``'s live one, as the store refuses. It takes the launch's mutex, so it never lands between another
         send's preflight and its outcome under the same epoch (L3_cvr_r1 codex MED: a release inside that window let
-        another client claim the turn while that send was still in flight)."""
-        self._chat._read(lambda conn: _chat_launch(conn, launch_id))
+        another client claim the turn while that send was still in flight). A room launch holds no turn lease and is
+        refused here, before the lease layer (L3_rmd2_r2 codex 6)."""
+        self._chat._read(lambda conn: _worker_launch(conn, launch_id))
         with self._launch_lock(launch_id):
             self._chat.turn_release(launch_id, epoch, owner)
 
