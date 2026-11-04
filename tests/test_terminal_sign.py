@@ -454,6 +454,20 @@ def test_class_signed_terminal(signed_world):
     assert got.state == "signed-terminal" and got.signer_fp == out.fingerprint and not got.late
 
 
+@pytest.mark.parametrize("drop_key", [True, False])
+def test_a_terminal_signature_without_a_via_is_refused_by_name(signed_world, drop_key):
+    """1104-8: a terminal-format signature on an answer that names no channel is channel-mismatch, never judged by its
+    namespace alone (flow passes via "terminal" since ab6249cf6, so the namespace fallback is gone)."""
+    path, message, out, signers = signed_world
+    ev = _event(out, message)
+    if drop_key:
+        del ev["via"]
+    else:
+        ev["via"] = None
+    got = ts.answer_class(ev, ROW, _ctx(signers))
+    assert (got.state, got.reason) == ("failed", "channel-mismatch"), got
+
+
 @pytest.mark.parametrize("row_patch,ev_patch,ctx_patch,why", [
     ({"id": "np-other"}, {}, {}, "item"),
     ({"row_version": "rv-moved"}, {}, {}, "version"),
