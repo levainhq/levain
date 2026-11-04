@@ -955,6 +955,29 @@ def test_r3_2_an_index_failure_after_a_start_with_a_proven_end_records_ended_wit
     assert (ln.usage(KEY).actions, ln.usage(KEY).tunnel_bytes) == (2, 20)
 
 
+def test_r3_2_a_stop_that_found_its_session_by_status_records_it_so_usage_reads_it(tmp_path):
+    ctl_ = FakeControl(**{"RUN-TICKET-STATUS": lambda f: {"ticket": "t", "state": "bound", "session": "sess-4"}})
+    src = FakeSources(calls=1, bytes_=44, seconds=4)
+    ln, _, runtime = build(tmp_path, control=ctl_, sources=src)
+    ln.index.put(KEY, "minted", run_id=RUN)
+    assert ln.stop(KEY).terminated is True and runtime.ended == ["sess-4"]
+    rec = ln.index.get(KEY)
+    assert rec["state"] == "ended" and rec["session"] == "sess-4"
+    assert ln.usage(KEY).tunnel_bytes == 44 and ("bytes", "sess-4") in src.asked
+
+
+def test_r3_2_a_proven_end_after_the_minted_write_failed_records_ended_not_pending(tmp_path, monkeypatch):
+    ln, _, runtime = build(tmp_path, control=FakeControl(**BOUND9))
+    real_put = ln.index.put
+    monkeypatch.setattr(ln.index, "put", lambda k, s, **kw: (_ for _ in ()).throw(OSError("x")) if s == "minted"
+                        else real_put(k, s, **kw))
+    with pytest.raises(OSError):
+        ln.spawn(launch())
+    rec = ln.index.get(KEY)
+    assert runtime.ended == ["sess-9"] and rec["state"] == "ended" and rec["session"] == "sess-9"
+    assert rec["run_id"] == RUN and ln.usage(KEY).actions == 7
+
+
 # r3-3 MED: an index record is written whole or not at all; a record that does not parse reads unreadable
 
 def test_r3_3_a_short_os_write_still_writes_the_whole_record(tmp_path, monkeypatch):
