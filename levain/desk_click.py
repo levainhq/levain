@@ -439,7 +439,9 @@ def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str
             got = _refuse("answer_refused", str(exc), 422)
             return finish(got) if signings else got
         except (QuestionStoreError, OSError, sqlite3.Error) as exc:
-            return finish(_refuse("source_unavailable", f"the question store cannot answer now: {exc}", 503))
+            # remembered only once a prompt ran: a store blip before any sheet leaves the request id free to retry
+            got = _refuse("source_unavailable", f"the question store cannot answer now: {exc}", 503)
+            return finish(got) if signings else got
         except Exception as exc:  # noqa: BLE001 - remembered, so a retry of this request never prompts again
             return finish(_refuse("internal", type(exc).__name__, 500))
         signed = bool(done.recorded) and any(getattr(g, "state", None) == "signed" for g in signings)

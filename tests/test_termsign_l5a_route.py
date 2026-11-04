@@ -28,6 +28,7 @@ from tests.test_cockpit_k2a import TOKEN, _install, _serve
 
 OPTS = [("ship", "Ship it tonight"), ("hold", "Hold for the morning")]
 ORIGIN = "http://localhost:8765"
+_REAL_COCKPIT_ORIGINS = band_view._cockpit_origins     # the autouse guard replaces it; X3 tests the real one
 
 
 @pytest.fixture(autouse=True)
@@ -850,4 +851,138 @@ def test_the_text_route_decides_delivery_before_it_remembers(store, keydir, monk
                                        notify=lambda t: None, deliver=lambda done: None)
     assert status == 200 and got["delivery"] == "deferred", got
     assert state.finished("txn-text-dlv") == (got, 200)
+    assert answers(store) == [(q.id, "ship")]
+
+
+# --- L3 r3 X1: a cached verdict is keyed by the reader's store and the recorded answer ----------------------------
+
+def _copy_store(store, tmp_path, name: str, change: str | None = None) -> QuestionStore:
+    """A second store holding store A's rows byte for byte (the same signed block, the same question id), with one
+    reader-side fact moved."""
+    other = QuestionStore(tmp_path / name)
+    other.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with sqlite3.connect(store.path) as a, sqlite3.connect(other.path) as b:
+        a.backup(b)
+        if change:      # the copy is a hand-built store: its write-once triggers do not bind the test's edit
+            for (trigger,) in b.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall():
+                b.execute(f'DROP TRIGGER "{trigger}"')
+            b.execute(change)
+    return other
+
+
+@pytest.mark.parametrize("moved", [
+    "UPDATE meta SET value = 'store-b' WHERE key = 'store_id'",                     # another store and install
+    "UPDATE answer_context SET viewer = 'cockpit:other'",                           # another recorded viewer
+    "UPDATE answers SET value = 'hold'",                                            # another recorded answer
+])
+def test_a_verdict_cached_in_one_store_is_never_served_for_another(rig, store, keydir, tmp_path, moved):
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    band_view._badge_cache.clear()
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok) == "signed: Touch ID, laptop (desk)"
+    assert band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=ok) == {q.id: "signed: Touch ID, laptop (desk)"}
+    other = _copy_store(store, tmp_path, "b", moved)
+    assert band_view.answer_badge(other, q.id, key_dir=keydir, ctk=ok).startswith("signature failed"), moved
+    assert band_view.answer_badges(other, [q.id], key_dir=keydir, ctk=ok)[q.id].startswith("signature failed"), moved
+    same = _copy_store(store, tmp_path, "c")                                          # nothing moved: still signed
+    assert band_view.answer_badge(same, q.id, key_dir=keydir, ctk=ok) == "signed: Touch ID, laptop (desk)"
+
+
+# --- L3 r3 X2: the caller's snapshot never iterates verdicts a late worker is writing --------------------------------
+
+def test_a_worker_writing_during_the_snapshot_waits_for_it():
+    verdicts = band_view._Verdicts()
+    verdicts.put("q-1", "signed: Touch ID, laptop (desk)")
+    wrote = threading.Event()
+    blocked: list[bool] = []
+
+    class Busy(dict):
+        def items(self):
+            # the worker reaches its write in the middle of the caller's snapshot
+            t = threading.Thread(target=lambda: (verdicts.put("q-2", "late"), wrote.set()))
+            t.start()
+            t.join(0.2)
+            blocked.append(not wrote.is_set())
+            return super().items()
+    verdicts._got = Busy(verdicts._got)
+    assert verdicts.snapshot() == [("q-1", "signed: Touch ID, laptop (desk)")]
+    assert blocked == [True]                         # the write waited for the snapshot, it never changed it mid-read
+    assert wrote.wait(2) and dict(verdicts.snapshot())["q-2"] == "late"
+
+
+# --- L3 r3 X3: the reader's origins include the installed cockpit's own port ------------------------------------------
+
+class _Unit:
+    def __init__(self, argv):
+        self.argv = argv
+
+    def installed_argv(self, label):
+        return self.argv
+
+
+@pytest.mark.parametrize("form", ["split", "joined"])
+def test_a_desk_signature_from_a_cockpit_on_another_port_reads_signed(tmp_path, store, keydir, monkeypatch, form):
+    from levain import daemon
+
+    _STORE["s"] = store
+    q = file_q(store)
+    band_view.band_payload(store, "cockpit:web")
+    prev, _vid = band_view._newest_view(store, "cockpit:web")
+    _root, src, _ids = _install(tmp_path)
+    monkeypatch.setattr(desk_click, "DESK_POLICY", "all")
+    monkeypatch.setattr(ts, "default_desk_signer_factory", real_desk)
+    monkeypatch.setattr(ts, "post_notice", lambda text, **kw: None)
+    good = {"subject": {"id": q.id, "version": band_view.subject_version(q)}, "pick": "b", "client_txn": "txn-port-001"}
+    with _serve(src, write_token=TOKEN) as (base, httpd):
+        port = httpd.server_address[1]
+        status, got = _http(f"{base}/cockpit/desk/answer", good, headers={"Host": f"localhost:{port}"})
+    assert status == 200 and got["signed"], got
+    assert port != daemon.DEFAULT_PORT
+    monkeypatch.setattr(band_view, "_cockpit_origins", _REAL_COCKPIT_ORIGINS)      # the reader's own, not the guard's
+    monkeypatch.setattr(ts, "_real_key_dir", lambda: keydir)
+    monkeypatch.setattr(ts, "ctk_status", lambda pk, **kw: (True, "bio"))
+    argv = ["levain", "serve", "--write", *(["--port", str(port)] if form == "split" else [f"--port={port}"])]
+    monkeypatch.setattr(daemon, "select_provider", lambda system=None: _Unit(argv))
+    band_view._badge_cache.clear()
+    line = band_view._delta_line(store, prev, [])
+    assert "answered via cockpit, signed: Touch ID, laptop (desk)" in line, line
+    # no installed unit: the default port alone, and this cockpit's signature is not one of the reader's origins
+    monkeypatch.setattr(daemon, "select_provider", lambda system=None: _Unit(None))
+    band_view._badge_cache.clear()
+    assert "signature failed (scope-mismatch)" in band_view._delta_line(store, prev, [])
+
+
+def test_an_unreadable_or_portless_unit_leaves_the_default_origins(monkeypatch):
+    from levain import daemon
+
+    class Broken:
+        def installed_argv(self, label):
+            raise daemon.DaemonError("unreadable")
+    default = {f"http://{h}:{daemon.DEFAULT_PORT}" for h in ("localhost", "127.0.0.1")}
+    for provider in (Broken(), _Unit(None), _Unit(["levain", "serve"]), _Unit(["levain", "--port", "nope"])):
+        monkeypatch.setattr(daemon, "select_provider", lambda system=None, p=provider: p)
+        assert _REAL_COCKPIT_ORIGINS() == default
+
+
+# --- L3 r3 X4: a store error before any prompt is not remembered for the request id ---------------------------------
+
+def test_a_store_error_before_any_prompt_leaves_the_request_free_to_retry(store, keydir, monkeypatch):
+    q = file_q(store)
+    state = desk_click.DeskState()
+    real = band_view.answer_text_desk
+    blips = [sqlite3.OperationalError("database is locked")]
+
+    def once(*a, **kw):
+        if blips:
+            raise blips.pop()
+        return real(*a, **kw)
+    monkeypatch.setattr(band_view, "answer_text_desk", once)
+    calls = Calls()
+    request = _text_req(store, "1a", txn="txn-text-blip")
+    got, status = _text(store, keydir, request, factory=calls, state=state)
+    assert (status, got["error"]) == (503, "source_unavailable") and calls.n == 0
+    assert state.finished("txn-text-blip") is None
+    got, status = _text(store, keydir, request, factory=calls, state=state)
+    assert status == 200 and got["signed"] and calls.n == 1, got
     assert answers(store) == [(q.id, "ship")]

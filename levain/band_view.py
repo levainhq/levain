@@ -1946,17 +1946,76 @@ _badge_inflight: "set[tuple[str, str]]" = set()
 _badge_inflight_lock = threading.Lock()
 
 
-def _badge_digest(public_key: str, message: str, sig: str, origins: frozenset[str]) -> str:
-    import hashlib
+def _badge_scope(store: Any, question_id: str) -> list[Any] | None:
+    """What a badge verdict reads from the store besides the signature: the store id (its install), the recorded via
+    and viewer, the answer (kind, value, time) and the question's words and options. ONE snapshot; ``None`` when any
+    of it is missing (no verdict to key). A cached verdict is keyed by this too, so a block copied into another store,
+    or beside another recorded answer, is verified there afresh, never served the first store's verdict."""
+    with store._peek() as conn:
+        if conn is None:
+            return None
+        sid = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
+        ctx = conn.execute("SELECT via, viewer FROM answer_context WHERE question_id = ?", (question_id,)).fetchone()
+        ans = conn.execute("SELECT kind, value, answered_at FROM answers WHERE question_id = ?",
+                           (question_id,)).fetchone()
+        q = conn.execute("SELECT what, options FROM questions WHERE id = ?", (question_id,)).fetchone()
+    if sid is None or ctx is None or ans is None or q is None:
+        return None
+    return [sid[0], *ctx, *ans, *q]
 
-    return hashlib.sha256("\0".join((public_key, message, sig, *sorted(origins))).encode("utf-8")).hexdigest()
+
+def _badge_digest(public_key: str, message: str, sig: str, origins: frozenset[str], scope: list[Any]) -> str:
+    import hashlib
+    import json
+
+    return hashlib.sha256(json.dumps([public_key, message, sig, sorted(origins), scope],
+                                     default=str).encode("utf-8")).hexdigest()
+
+
+def _installed_cockpit_port() -> int | None:
+    """The ``--port`` of the installed cockpit service, read back from its unit file (no service-manager call);
+    ``None`` when there is no unit, it names no port, or it cannot be read."""
+    from levain import daemon
+
+    try:
+        argv = daemon.select_provider().installed_argv(daemon.DEFAULT_LABEL)
+    except Exception:  # noqa: BLE001 - no provider on this OS, an unreadable unit: no installed port
+        return None
+    for i, arg in enumerate(argv or ()):
+        value = argv[i + 1] if arg == "--port" and i + 1 < len(argv) else (
+            arg[len("--port="):] if arg.startswith("--port=") else None)
+        if value is not None and value.isdigit() and 0 < int(value) < 65536:
+            return int(value)
+    return None
 
 
 def _cockpit_origins() -> frozenset[str]:
-    """The origins the installed cockpit service serves a desk page at: its loopback names on the service's port."""
+    """The origins the cockpit serves a desk page at: its loopback names on the default port and on the installed
+    service's own port (``levain daemon install --port``), read from the unit when the reader passes none."""
     from levain.daemon import DEFAULT_PORT
 
-    return frozenset(f"http://{host}:{DEFAULT_PORT}" for host in ("localhost", "127.0.0.1"))
+    ports = {DEFAULT_PORT}
+    installed = _installed_cockpit_port()
+    if installed is not None:
+        ports.add(installed)
+    return frozenset(f"http://{host}:{port}" for host in ("localhost", "127.0.0.1") for port in ports)
+
+
+class _Verdicts:
+    """The worker's verdicts, read by the caller after a timed join while the worker may still be writing: every
+    write and the caller's snapshot hold one lock, so the snapshot never iterates a dict that is changing."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._got: dict[str, str] = {}
+
+    def put(self, qid: str, verdict: str) -> None:
+        with self._lock:
+            self._got[qid] = verdict
+
+    def snapshot(self) -> list[tuple[str, str]]:
+        with self._lock:
+            return list(self._got.items())
 
 
 def answer_badge(store: Any, question_id: str, *, key_dir: Path | None = None,
@@ -2018,7 +2077,10 @@ def answer_badges(store: Any, question_ids: Sequence[str], *, deadline: float | 
             sign = answer_sign_of(store, qid)
             if not sign or sign.get("sign_state") != "signed" or not sign.get("message") or not sign.get("sig"):
                 continue
-            k = (qid, _badge_digest(key.public_key, sign["message"], sign["sig"], allowed))
+            scope = _badge_scope(store, qid)
+            if scope is None:
+                continue
+            k = (qid, _badge_digest(key.public_key, sign["message"], sign["sig"], allowed, scope))
         except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
             continue
         cached = _badge_cache.get(k)
@@ -2033,15 +2095,17 @@ def answer_badges(store: Any, question_ids: Sequence[str], *, deadline: float | 
         claimed.append((qid, k))
     if not claimed:
         return got
-    found: dict[str, str] = {}
+    found = _Verdicts()
 
     def work() -> None:
         shared = _shared_ctk(ctk)
         for qid, k in claimed:
             try:
-                found[qid] = _badge_of(store, qid, key, shared, allowed)
+                verdict = _badge_of(store, qid, key, shared, allowed)
             except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
-                found[qid] = ""
+                verdict = ""
+            try:
+                found.put(qid, verdict)
             finally:
                 with _badge_inflight_lock:
                     _badge_inflight.discard(k)
@@ -2054,7 +2118,7 @@ def answer_badges(store: Any, question_ids: Sequence[str], *, deadline: float | 
             _badge_inflight.difference_update(k for _, k in claimed)
         return got
     t.join(max(0.0, until - time.monotonic()))
-    got.update((qid, v) for qid, v in list(found.items()) if v)
+    got.update((qid, v) for qid, v in found.snapshot() if v)
     return {qid: got[qid] for qid in ids if got.get(qid)}
 
 
@@ -2081,16 +2145,18 @@ def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple
     if q is None or q.answer is None:
         return ""
     message = sign["message"]
-    digest = _badge_digest(key.public_key, message, sign["sig"], origins)
+    scope = _badge_scope(store, question_id)
+    if scope is None:
+        return ""
+    digest = _badge_digest(key.public_key, message, sign["sig"], origins, scope)
     cached = _badge_cache.get((question_id, digest))
     if cached is not None:
         return cached
     raw = message.encode("utf-8")
     desk = message.startswith(ts.DESK_FORMAT + "\n")
     parsed = ts.parse_desk_verified(raw) if desk else ts.parse_verified(raw)
+    via, viewer = scope[1], scope[2]            # the recorded context the cache key holds, never a second read of it
     with store._peek() as conn:
-        via, viewer = conn.execute("SELECT via, viewer FROM answer_context WHERE question_id = ?",
-                                   (question_id,)).fetchone()
         # the view the reader expects: a desk click's fixed "item", else a band view the store holds for THIS viewer
         if desk and parsed.gesture == "click":
             view = "item" if parsed.view == "item" else None
@@ -2130,9 +2196,11 @@ def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple
     return verdict
 
 
-def _delta_line(store: QuestionStore, prev: View | None, shown: list[int], deadline: float | None = None) -> str:
+def _delta_line(store: QuestionStore, prev: View | None, shown: list[int], deadline: float | None = None,
+                origins: Collection[str] | None = None) -> str:
     """The viewer's delta since its last view: new numbers, closed ones with how (D4 §4). The signature badges are
-    read after the read transaction closes, within ``deadline`` (:func:`answer_badges`)."""
+    read after the read transaction closes, within ``deadline`` (:func:`answer_badges`), against the reader's
+    ``origins`` (default :func:`_cockpit_origins`)."""
     if prev is None:
         return "first band on this seat"
     new = [n for n in shown if n > prev.seen_through or n not in prev.open_list]
@@ -2152,7 +2220,7 @@ def _delta_line(store: QuestionStore, prev: View | None, shown: list[int], deadl
                     if row:
                         refs[n] = row[1]
         if refs:
-            badges = answer_badges(store, list(refs.values()), deadline=deadline)
+            badges = answer_badges(store, list(refs.values()), deadline=deadline, origins=origins)
             for n, ref in refs.items():
                 if badges.get(ref):
                     how[n] += f", {badges[ref]}"
