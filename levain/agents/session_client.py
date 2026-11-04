@@ -428,7 +428,7 @@ class _Conn:
 
     @staticmethod
     def _shape(ans: dict, rid: int, expect: tuple[str, ...]) -> dict:
-        if ans.get("id") != rid:
+        if type(ans.get("id")) is not int or ans["id"] != rid:
             raise WireError("an answer for another request")
         if ans.get("ok") is True:
             _exact({k: v for k, v in ans.items() if k not in ("id", "ok")}, expect, "answer")
@@ -465,6 +465,18 @@ class _RemoteProcess:
         self._conn = conn
         self._rc: int | None = None
         self._lost = conn is None
+        self._rc_mu = threading.Lock()
+
+    def _publish(self, rc: int) -> int:
+        """Record an exit once: the first one stands (a server exit is never downgraded to unproven, nor the reverse
+        overwritten by a late racer), and the holder closes after it."""
+        with self._rc_mu:
+            if self._rc is None:
+                self._rc = rc
+            out = self._rc
+        if self._conn is not None:
+            self._conn.close()
+        return out
 
     @property
     def returncode(self) -> int | None:
@@ -472,11 +484,7 @@ class _RemoteProcess:
 
     def _lose(self) -> int:
         self._lost = True
-        if self._conn is not None:
-            self._conn.close()
-        if self._rc is None:        # monotonic: a recorded server exit is never downgraded by a later wire failure
-            self._rc = _ctl.GATE_UNPROVEN
-        return self._rc
+        return self._publish(_ctl.GATE_UNPROVEN)       # monotonic: a recorded server exit is never downgraded
 
     def _slice(self, seconds: float) -> int | None:
         """One WAIT of at most ``seconds``: the exit once the server says so, else None. A fault is unproven."""
@@ -493,9 +501,7 @@ class _RemoteProcess:
                 if ans["returncode"] is not None:
                     raise WireError("a returncode before the exit")
                 return None
-            self._rc = _exit_code(ans["returncode"], "returncode")
-            self._conn.close()          # the run is over and its exit is held: the holder is done
-            return self._rc
+            return self._publish(_exit_code(ans["returncode"], "returncode"))
         except (_Down, _Refused, WireError):
             return self._lose()
 
@@ -559,9 +565,7 @@ class _RemoteChild:
             rc = _exit_code(ans["returncode"], "returncode")
         except Exception:  # noqa: BLE001 - abort never raises (a nan or inf timeout included): unproven
             return self.process._lose()
-        self.process._rc = rc
-        self._conn.close()
-        return rc
+        return self.process._publish(rc)
 
 
 # --- the launcher --------------------------------------------------------------------------------------------------------
