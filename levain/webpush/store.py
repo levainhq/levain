@@ -373,16 +373,16 @@ class PushStore:
 
     # --- notices -------------------------------------------------------------------------------------
     def add_notice(self, source: str, title: str, body: str, priority: str, token: str, decision: str,
-                   ping_id: int | None = None, *, now: float | None = None, origin: str = "token") -> int:
+                   ping_id: int | None = None, *, now: float | None = None) -> int:
         """Record one posted notice and prune in the same transaction: past the newest :data:`NOTICES_KEEP`, or older than
         :data:`NOTICES_DAYS` days, goes."""
         with self.write() as c:
             return self._insert_notice(c, source, title, body, priority, token, decision, ping_id,
-                                       time.time() if now is None else now, origin)
+                                       time.time() if now is None else now)
 
     def record_notice(self, kind: str, ref: str, display: str, source: str, title: str, body: str, priority: str,
                       token: str, decision: str, *, hold: tuple[str, str] | None = None,
-                      now: float | None = None, origin: str = "token") -> tuple[int | None, int]:
+                      now: float | None = None) -> tuple[int | None, int]:
         """A posted notice and its delivery record in ONE transaction: the ping (``pushed`` and ``held``; a ``recorded``
         notice has none), its held row (``held`` only, ``hold`` being ``(url, reason)`` as :meth:`add_ping` takes it),
         the notice row and the retention prune. Any failure rolls back all of it, so there is never a ping without its
@@ -392,17 +392,15 @@ class PushStore:
         at = time.time() if now is None else now
         with self.write() as c:
             ping_id = None if decision == "recorded" else self._insert_ping(c, kind, ref, display, body, None, hold)
-            return ping_id, self._insert_notice(c, source, title, body, priority, token, decision, ping_id, at, origin)
+            return ping_id, self._insert_notice(c, source, title, body, priority, token, decision, ping_id, at)
 
     @staticmethod
     def _insert_notice(c: sqlite3.Connection, source: str, title: str, body: str, priority: str, token: str,
-                       decision: str, ping_id: int | None, at: float, origin: str = "token") -> int:
-        if origin not in ("token", "flow"):
-            raise ValueError("a notice's origin is token or flow")
-        nid = int(c.execute("INSERT INTO notices (at, source, title, body, priority, token, decision, ping_id, origin) "
-                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                       decision: str, ping_id: int | None, at: float) -> int:
+        nid = int(c.execute("INSERT INTO notices (at, source, title, body, priority, token, decision, ping_id) "
+                            "VALUES (?,?,?,?,?,?,?,?)",
                             (time.strftime(STAMP, time.gmtime(at)), source, title, body, priority, token, decision,
-                             ping_id, origin)).lastrowid)
+                             ping_id)).lastrowid)
         c.execute("DELETE FROM notices WHERE at < ?", (time.strftime(STAMP, time.gmtime(at - NOTICES_DAYS * 86400)),))
         c.execute("DELETE FROM notices WHERE id NOT IN (SELECT id FROM notices ORDER BY id DESC LIMIT ?)",
                   (NOTICES_KEEP,))

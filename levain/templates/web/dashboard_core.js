@@ -8539,7 +8539,7 @@
   // ---- the row (one component: the panel's compact row and the focus view's full row) ----------------------------------
   function ncChips(it) {
     const f = document.createDocumentFragment();
-    f.appendChild(el("span", "nc-chip o-" + (it.origin === "token" || it.origin === "flow" ? it.origin : "levain"), it.source || it.origin || ""));
+    f.appendChild(el("span", "nc-chip o-" + (it.origin === "token" ? it.origin : "levain"), it.source || it.origin || ""));
     if (it.priority === "urgent" || it.priority === "low") f.appendChild(el("span", "nc-chip p-" + it.priority, it.priority));
     return f;
   }

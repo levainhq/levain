@@ -547,11 +547,12 @@ def _notice_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict
     r = rd.c.execute("SELECT * FROM notices WHERE id = ?", (num,)).fetchone()
     if r is None:
         return None
-    origin = r["origin"] if r["origin"] in ("token", "flow") else "token"
-    return {"id": f"n{num}", "origin": origin, "source": r["source"], "title": r["title"], "body": r["body"],
+    if r["origin"] != "token":   # a deleted origin on disk is refused (the item is left out), never read as a token's
+        return None
+    return {"id": f"n{num}", "origin": "token", "source": r["source"], "title": r["title"], "body": r["body"],
             "preview": plain_preview(r["body"]), "at": _iso(r["at"]), "priority": r["priority"], "read": read,
             "read_at": _iso(read_at) if read else None, "needs_ref": None, "needs_open": False,
-            "token_name": r["token"] if origin == "token" else None, "image_url": None,
+            "token_name": r["token"], "image_url": None,
             "delivery": _delivery(rd, r["ping_id"])}
 
 
