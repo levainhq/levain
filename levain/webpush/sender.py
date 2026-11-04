@@ -19,6 +19,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from levain.webpush import ece, vapid
 from levain.webpush.store import PushStore, PushStoreError, data_text
@@ -80,6 +81,46 @@ def build_payload(title: str, body: str, tag: str, url: str, ping_id: int, badge
     return data
 
 
+def supports_declarative(endpoint: str) -> bool:
+    """True when the subscription's push service is Apple's (``web.push.apple.com``): the only service whose clients
+    (iOS and iPadOS 18.4+, Safari 18.4+) read a Declarative Web Push body (RFC 8030 ``web_push`` payloads). Derived from
+    the stored endpoint, never from a user-agent string. An Apple client older than 18.4 ignores the extra fields and
+    reads the legacy ones, so the one payload below serves both."""
+    host = (urlsplit(endpoint).hostname or "").lower()
+    return host == "push.apple.com" or host.endswith(".push.apple.com")
+
+
+def declarative_payload(data: bytes) -> bytes:
+    """``data`` (the legacy payload :func:`build_payload` made) with the Declarative Web Push members added:
+    ``web_push: 8030`` and ``notification {title, body, navigate, tag}`` (the same text and the same relative url, so
+    nothing here hard-codes an origin), ``app_badge`` when the legacy payload has ``badge``, and ``mutable: true`` so the
+    worker still runs on a client that has one (the tap trace, receipts and the badge stay the worker's). There is NO
+    ``actions`` member: a notification here has no buttons, on any platform. The legacy members stay at the top level, so
+    a client that does not read declarative payloads shows the push exactly as before. Returns ``data`` unchanged when the
+    added members would not fit :data:`ece.MAX_PLAINTEXT` after the body is clipped by as much as it takes."""
+    try:
+        legacy = json.loads(data.decode("utf-8"))
+        notif = {"title": legacy["title"], "body": legacy["body"], "navigate": legacy["url"]}
+        if legacy.get("tag"):
+            notif["tag"] = legacy["tag"]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return data
+    out = {"web_push": 8030, "notification": notif, **legacy, "mutable": True}
+    if isinstance(legacy.get("badge"), int):
+        out["app_badge"] = legacy["badge"]
+    # the body appears twice now: clip it (both copies) until the whole fits
+    body = legacy["body"]
+    for _ in range(40):
+        enc = _dumps(out)
+        if len(enc) <= ece.MAX_PLAINTEXT:
+            return enc
+        if not body:
+            break
+        body = _fit(body, _jlen(body) // 2) if _jlen(body) > 8 else ""
+        out["body"] = notif["body"] = body
+    return data
+
+
 def topic_for(ref: str | None) -> str | None:
     """The RFC 8030 section 5.4 ``Topic`` for a ping about ``ref``: a re-ping of the same request replaces the one
     still queued for an offline phone. 32 url-safe characters; None when the ping has no ref (a test ping)."""
@@ -107,6 +148,8 @@ def _prepare(queue_dir: Path, sub: dict, data: bytes, topic: str | None) -> "url
     endpoint = valid_endpoint(sub["endpoint"])
     if endpoint is None:
         return None
+    if supports_declarative(endpoint):
+        data = declarative_payload(data)
     try:
         body = ece.encrypt(data, ece.b64d(sub["p256dh"]), ece.b64d(sub["auth"]))
     except Exception:   # noqa: BLE001 - bad keys: recorded as status 0, never raised at the gate
