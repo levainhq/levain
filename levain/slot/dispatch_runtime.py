@@ -83,7 +83,8 @@ class StreamDrain:
     that). Memory is bounded by one read chunk plus ``keep`` whatever the stream writes. :meth:`start` runs it on a
     daemon thread; :meth:`run` is the loop itself."""
 
-    def __init__(self, stream: Any, *, keep: int = 0, chunk: int = 65536) -> None:
+    def __init__(self, stream: Any, *, keep: int = 0, chunk: int = 65536, close: bool = False) -> None:
+        self._close = close
         self._stream, self._keep, self._chunk = stream, max(0, keep), chunk
         self._tail = bytearray()
         self.total = 0
@@ -91,6 +92,16 @@ class StreamDrain:
         self.thread: "threading.Thread | None" = None
 
     def run(self) -> None:
+        try:
+            self._loop()
+        finally:
+            if self._close:                       # the reader closes its own end: a close from another thread can block
+                try:
+                    self._stream.close()
+                except (OSError, ValueError):
+                    pass
+
+    def _loop(self) -> None:
         read = getattr(self._stream, "read1", None) or self._stream.read
         while True:
             try:
@@ -161,8 +172,8 @@ class HelperSlotRuntime:
         except OSError as e:
             raise Refused("helper-unrunnable", f"{verb}: {e.strerror or e}") from None
         wall = self._deadlines.get(verb, HELPER_DEADLINE_DEFAULT_S)
-        out_d = StreamDrain(p.stdout, keep=_HELPER_OUT_MAX).start()
-        err_d = StreamDrain(p.stderr, keep=_ERR_TAIL).start()
+        out_d = StreamDrain(p.stdout, keep=_HELPER_OUT_MAX, close=True).start()
+        err_d = StreamDrain(p.stderr, keep=_ERR_TAIL, close=True).start()
         try:
             try:
                 if stdin is not None:
@@ -175,16 +186,15 @@ class HelperSlotRuntime:
             except subprocess.TimeoutExpired:
                 raise Refused("helper-timeout", f"{verb} did not answer in {wall}s") from None
             for d in (out_d, err_d):
-                d.thread.join(wall)               # type: ignore[union-attr]
+                d.thread.join(min(wall, 5.0))               # type: ignore[union-attr]
         finally:
             if p.poll() is None:
                 self._end_helper(p)
-            for f in (p.stdin, p.stdout, p.stderr):
-                if f is not None:
-                    try:
-                        f.close()
-                    except OSError:
-                        pass
+            if p.stdin is not None:
+                try:
+                    p.stdin.close()
+                except OSError:
+                    pass
         if err_d.tail.strip():
             _log.info("helper %s stderr: %s", verb, _safe(err_d.tail))
         if out_d.total > _HELPER_OUT_MAX:
@@ -239,15 +249,22 @@ class HelperSlotRuntime:
                              stdin=canon.canonical_bytes({"lease_nonce": nonce, "ticket": req.ticket}), lease=lease)
             session, _slot = prepare_answer(prep, host=self.host, store=self._store)   # type: ignore[arg-type]
         except BaseException:
-            lease.close()                    # the session is not known: CONTROL revokes on EOF, the root reaper ENDs
+            try:
+                lease.close()
+            except Exception:  # noqa: BLE001 - never mask the refusal that is being raised
+                _log.warning("closing the lease failed")
+            # the session is not known: CONTROL revokes on EOF, the root reaper ENDs
             raise
         with self._mu:
             shut = self._closed
             if not shut:
                 self._leases[session] = lease
         if shut:                                  # close() ran meanwhile: END it, refuse; the lease's EOF is the backstop
-            self.end(session)
-            lease.close()
+            try:
+                self.end(session)
+                lease.close()
+            except Exception:  # noqa: BLE001 - never mask the refusal below
+                _log.warning("ending a session refused at shutdown failed")
             raise LauncherRefused("runtime-closed", "the dispatch runtime is shutting down", reason_class="transient")
         child = None
         try:

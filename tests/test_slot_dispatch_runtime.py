@@ -350,6 +350,7 @@ def test_a_chatty_vendor_cannot_block_or_forge_the_gate(rt_rig):
     assert handle.child.process.wait(60) == 2                      # the helper's exit status, never stdout
     out_drain, err_drain = rt._drains[SESSION]
     out_drain.thread.join(10)
+    err_drain.thread.join(10)
     assert out_drain.total == 3 * 2**20 and fake_answer.encode() in rt.stderr_tail(SESSION)
     handle.child.abort()
 
