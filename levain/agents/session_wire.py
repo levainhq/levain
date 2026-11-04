@@ -213,7 +213,17 @@ def _episode_hooks(store: AgentStore, install: SessionInstall, agent_id: str, ro
         except Exception as exc:  # noqa: BLE001
             _log.warning("session episode for %s was not written: %s", end.occurrence_id, type(exc).__name__)
 
-    return supervise.Hooks(on_end=on_end)
+    base = supervise.HOOKS   # compose, never replace: a verifier or audit hook the process installed still runs
+
+    def chained(end: Any) -> None:
+        if base.on_end is not None:
+            try:
+                base.on_end(end)
+            except Exception as exc:  # noqa: BLE001 - the end is committed; one hook's failure must not skip the other
+                _log.warning("agent on_end hook raised %s", type(exc).__name__)
+        on_end(end)
+
+    return supervise.Hooks(verify=base.verify, on_end=chained)
 
 
 def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,

@@ -174,6 +174,17 @@ def test_a_failed_run_also_leaves_its_episode_under_the_agent_id(rig, monkeypatc
     assert "ended failed" in doc["episodes"][0]["content"]
 
 
+def test_show_json_says_when_the_episode_list_may_be_cut_short(rig, monkeypatch, capsys, tmp_path):
+    from types import SimpleNamespace
+    from levain.agents import recall
+    oid = _occ(rig)
+    _install(rig, launcher=None, episodic_path=_episodic(tmp_path))
+    monkeypatch.setattr(recall, "recall_agent_episodes_at",
+                        lambda *a, **k: SimpleNamespace(episodes=(), scanned=7, truncated=True))
+    _, doc = _show(rig, capsys, _agent_id(rig, oid))
+    assert "may be incomplete" in doc["episodes_note"] and "truncated=True" in doc["episodes_note"]
+
+
 def test_another_agents_episodes_are_not_shown_under_this_one(rig, monkeypatch, capsys, tmp_path):
     from levain.firing.anneal import AnnealFiring
     from levain.firing.contract import CaptureRequest
@@ -193,6 +204,18 @@ def test_the_session_win_check_registers_once_and_idempotently(rig):
     W.register_session_win_check()
     W.register_session_win_check()
     assert gauges._CHECKS[W.SESSION_WIN_CHECK] is W.session_win_check
+
+
+def test_the_episode_hooks_compose_with_the_process_hooks_never_replace_them(rig, monkeypatch, tmp_path):
+    from levain.agents import supervise
+    seen: list = []
+    verdict = lambda end: "deployment_says_no"   # noqa: E731
+    monkeypatch.setattr(supervise, "HOOKS", supervise.Hooks(verify=verdict, on_end=lambda e: seen.append(e.state)))
+    install = _install(rig, launcher="stub", episodic_path=str(_episodic(tmp_path)))
+    hooks = W._episode_hooks(rig.store, W.read_install(rig.store.directory), "agent-x", None)
+    assert hooks.verify is verdict                       # the process verifier still decides a win
+    hooks.on_end(supervise.End("occ", "done", None, None))
+    assert seen == ["done"]                              # the process audit hook still runs, then the episode
 
 
 def test_no_install_episodic_path_means_no_episode_hook(rig, monkeypatch, capsys):

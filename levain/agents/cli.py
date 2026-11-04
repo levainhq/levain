@@ -387,6 +387,9 @@ def _show_json(store, a: dict) -> int:
     if path is not None:
         try:
             found = _recall.recall_agent_episodes_at(path, a["agent_id"], now=datetime.now(timezone.utc))
+            if found.truncated or len(found.episodes) >= _recall.DEFAULT_LIMIT:
+                note = (f"episodes may be incomplete: newest {_recall.DEFAULT_LIMIT} within the last "
+                        f"{_recall.DEFAULT_WINDOW_DAYS} days (scanned {found.scanned}, truncated={found.truncated})")
             episodes = [{"episode_id": getattr(e, "id", None), "type": str(getattr(getattr(e, "type", None), "value",
                                                                                     getattr(e, "type", None))),
                          "source": getattr(e, "source", None), "timestamp": getattr(e, "timestamp", None),
