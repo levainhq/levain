@@ -89,6 +89,24 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     dr.add_argument("--root", default=None, help="The occurrences dir (default dream/ beside the store's resolved memory.db).")
     dr.add_argument("--json", action="store_true")
     dr.set_defaults(func=run_dream_drill)
+    sh = sub.add_parser("shadow", allow_abbrev=False, help="Dry shadow night: read flow's snapshot, seed a scratch store, diff.",
+                        description="Read flow's committed pre-dream snapshot for a dream-day (read-only, hash-checked). "
+                                    "With --shadow-dir, seed it into that SCRATCH store and compare the episode set; "
+                                    "with --composed too, diff an already-composed shadow output against flow's and "
+                                    "write card_diff.txt. Composes nothing and files nothing.")
+    sh.add_argument("--flow-root", required=True, type=Path, help="Flow's state/dream directory (read only).")
+    sh.add_argument("--day", required=True, help="The dream-day YYYY-MM-DD.")
+    sh.add_argument("--shadow-dir", type=Path, default=None,
+                    help="A scratch directory to seed (created with a .levain-shadow marker; a non-empty directory "
+                         "without it is refused). Omitted: only the reader and the hash check run.")
+    sh.add_argument("--composed", type=Path, default=None, help="A file holding the shadow's composed neocortex text.")
+    sh.add_argument("--occurrence-dir", type=Path, default=None, help="Where card_diff.txt goes (needs --composed).")
+    sh.add_argument("--occurrence", default="shadow-dry", help="The occurrence id the card names.")
+    sh.add_argument("--agent-dir", default=None, help="The shadow's agent store dir, for the no-shadow-done check.")
+    sh.add_argument("--agent-id", default=None)
+    sh.add_argument("--zone", default=None, help="An IANA zone (needed with --agent-dir).")
+    sh.add_argument("--json", action="store_true")
+    sh.set_defaults(func=run_dream_shadow)
     en = sub.add_parser("enable", allow_abbrev=False, help="Register the dream as a named agent and print its signing card.",
                         description="Register the shipped `dream` role and AgentSpec in the agent store (idempotent) and "
                                     "print the words its link's signing card carries. It signs nothing: the link is "
@@ -438,3 +456,55 @@ def run_dream_ready(args: argparse.Namespace) -> int:
         for c in v.checks:
             print(f"  {c.n} {c.status:10s} {c.name}: {c.detail}")
     return 0 if v.ready else (3 if v.verdict == rd.UNREADABLE else 1)
+
+
+def run_dream_shadow(args: argparse.Namespace) -> int:
+    from levain.dream import card as card_mod
+    from levain.dream import ready as rd
+    from levain.dream import shadow as sh
+
+    out: dict[str, object] = {"day": args.day}
+    zone = args.zone or (_host_zone() if args.agent_dir else None)
+    occurrences = None
+    if args.agent_dir:
+        agent_dir = Path(args.agent_dir)
+        occurrences = lambda: rd._read_occurrences(agent_dir)  # noqa: E731
+    v = sh.day_ready(args.flow_root, args.day, occurrences=occurrences, zone=zone, agent_id=args.agent_id)
+    out["day_ready"] = {"verdict": v.verdict, "kind": v.kind, "reason": v.reason}
+    code = 0 if v.ready else (3 if v.verdict == rd.UNREADABLE else 1)
+    if v.ready and args.shadow_dir is not None and v.flow_day is not None:
+        db = args.shadow_dir / "memory.db"
+        try:
+            seeded = sh.seed(v.flow_day, db)
+        except sh.ShadowRefused as exc:
+            out["seed"] = {"refused": exc.kind, "why": exc.why}
+            code = 3
+        else:
+            out["seed"] = {"db": str(seeded.db), "files": list(seeded.files)}
+            ev = sh.episode_check(v.flow_day, db)
+            out["episodes"] = {"verdict": ev.verdict, "kind": ev.kind, "reason": ev.reason}
+            code = 0 if ev.ready else (3 if ev.verdict == rd.UNREADABLE else 1)
+            if ev.ready and args.composed is not None:
+                if args.occurrence_dir is None:
+                    print("levain dream shadow: --composed needs --occurrence-dir", file=sys.stderr)
+                    return 2
+                try:
+                    text = args.composed.read_text(encoding="utf-8")
+                    c = sh.shadow_card(v.flow_day, text, occurrence=args.occurrence, occ_dir=args.occurrence_dir)
+                except (OSError, sh.ShadowRefused, card_mod.CardError) as exc:
+                    print(f"levain dream shadow: {exc}", file=sys.stderr)
+                    return 3
+                out["card"] = c.as_dict()
+    if args.json:
+        print(json.dumps(out, sort_keys=True, default=str))
+    else:
+        print(f"levain dream shadow: day-ready {v.verdict}{'/' + v.kind if v.kind else ''}: {v.reason}")
+        if "seed" in out:
+            print(f"  seed: {out['seed']}")
+        if "episodes" in out:
+            e = out["episodes"]
+            print(f"  episodes: {e['verdict']}{'/' + e['kind'] if e['kind'] else ''}: {e['reason']}")  # type: ignore[index]
+        if "card" in out:
+            for line in out["card"]["body"]["own"]:  # type: ignore[index]
+                print(f"  {line}")
+    return code
