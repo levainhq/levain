@@ -528,12 +528,12 @@ def test_last_error_clears_on_a_good_open_and_a_step_racing_a_stop_records_nothi
         rs.stop()
     (tmp_path / "two").mkdir()
     _store2, rs2, _l2 = scripted(tmp_path / "two")
-    monkeypatch.setattr(rs2, "pump_once", lambda: (_ for _ in ()).throw(RoomServeError("stopped")))
-    rs2._stop_evt.set()
+    def stopping_step():
+        rs2._stop_evt.set()                  # the stop lands mid-step, and the step finds the room stopped
+        raise RoomServeError("stopped")
+    monkeypatch.setattr(rs2, "pump_once", stopping_step)
     rs2._run()
     assert rs2.last_error is None
-    rs2._stop_evt.clear()
-    rs2.last_error = None
 
 
 def test_stop_says_when_the_pump_would_not_stop(tmp_path, monkeypatch):
