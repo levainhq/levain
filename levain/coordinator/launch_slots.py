@@ -42,7 +42,8 @@ ATTENTION_KEY = "agent-schema-refused"
 _UNSLOTTED = "unslotted"
 _SLOTS = "slots"
 
-# per process, per agent store directory: (mode, reason). The answer of the first schema check is kept (A0 §2.4)
+# per process, per agent store directory: (mode, reason). A refusal and the no-schema answer are kept (A0 §2.4);
+# a transient fault is not (slot_state)
 _STATE: dict[str, tuple[str, str | None]] = {}
 _RAISED: set[str] = set()
 
@@ -90,22 +91,29 @@ def agent_dir(coordinator_dir: Path | str) -> Path | None:
 
 
 def slot_state(directory: Path, attention: Callable[[str, str], None] | None = None) -> bool:
-    """True when launches take slots on the agent store at ``directory``; False when they launch unslotted. The schema
-    check runs once per process per directory and its answer is kept; the attention row is raised at most once per
-    process."""
+    """True when launches take slots on the agent store at ``directory``; False when they launch unslotted. A refusal
+    (``AgentStoreRefused``) and the no-schema / ``/3`` answer are KEPT for the process, as A0 §2.4 says. Any other
+    fault (a locked database, an ``OSError``) says nothing about the schema: that call launches unslotted, the answer
+    is NOT kept, and the next call checks again.
+
+    The attention row is a line on stderr, ``attention [agent-schema-refused]: ...``, raised at most once per process
+    per directory (the agent store has no attention table and no coordinator-side writer exists; the shape is
+    ``levain.agents.cli._raise_attention``'s). A transient fault is therefore heard once, not on every launch it
+    touches."""
     from levain.agents.store import STORE_V3_REASON, AgentStoreRefused, open_agent_store_view
 
     key = str(directory)
-    if key not in _STATE:
+    answer = _STATE.get(key)
+    if answer is None:
         try:
             view = open_agent_store_view(directory)
         except AgentStoreRefused as exc:
-            _STATE[key] = (_UNSLOTTED, None if str(exc) == STORE_V3_REASON else str(exc))
+            answer = _STATE[key] = (_UNSLOTTED, None if str(exc) == STORE_V3_REASON else str(exc))
         except Exception as exc:  # noqa: BLE001 - nothing about the agent store may refuse a coordinator launch
-            _STATE[key] = (_UNSLOTTED, f"{type(exc).__name__}: {exc}"[:300])
+            answer = (_UNSLOTTED, f"{type(exc).__name__}: {exc}"[:300])        # this call only: not kept
         else:
-            _STATE[key] = (_UNSLOTTED, None) if view.path is None else (_SLOTS, None)
-    mode, reason = _STATE[key]
+            answer = _STATE[key] = (_UNSLOTTED, None) if view.path is None else (_SLOTS, None)
+    mode, reason = answer
     if reason is not None and key not in _RAISED:
         _RAISED.add(key)
         try:

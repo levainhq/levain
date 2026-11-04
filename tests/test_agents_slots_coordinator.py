@@ -14,7 +14,7 @@ from levain.coordinator import launch as cl
 from levain.coordinator import launch_slots as ls
 from levain.coordinator.store import CoordStore
 # the fake `claude` and the launch fixtures are test_coordinator_launch's own
-from tests.test_coordinator_launch import (fake, live_hook, qdir, workdir, woken,  # noqa: F401
+from tests.test_coordinator_launch import (clock, fake, live_hook, qdir, workdir, woken,  # noqa: F401
                                            _levain_home)
 
 NOW = datetime.now(timezone.utc)
@@ -131,7 +131,9 @@ def test_an_expired_lease_of_a_launch_still_pending_is_not_reclaimed(store, asto
 
 # --- the watcher's sweep -----------------------------------------------------------------------------------------
 def test_the_sweep_releases_an_over_launch_and_renews_a_live_one(store, astore, fake, live_hook):
-    live, dead = woken(store), "ln-ended-and-gone"      # a launch row that is gone reads as over
+    # the second id is DEFENSIVE: launches are append-only, so a row that is gone cannot occur; the sweep still
+    # reads it as over. The real case, an ended launch, is test_the_watch_pass_runs_the_sweep's
+    live, dead = woken(store), "ln-ended-and-gone"
     t0 = NOW - timedelta(minutes=10)
     ls.take(store, live, clock=lambda: t0)
     ls.take(store, dead, clock=lambda: t0)
@@ -141,6 +143,15 @@ def test_the_sweep_releases_an_over_launch_and_renews_a_live_one(store, astore, 
     assert set(after) == {live} and after[live] > before[live]
     assert lines == [f"launch {dead}: slot released (the launch is over)"]
     assert ls.sweep(store, clock=lambda: NOW) == []                            # nothing left to change
+
+
+def test_the_sweep_releases_the_slot_of_a_launch_that_really_ended(store, astore):
+    launch_id = woken(store)
+    ls.take(store, launch_id)
+    assert ls.sweep(store) == [] and len(_held(astore)) == 1                   # pending: renewed, kept
+    store.launch_end(launch_id, "failed", "the starter died")
+    assert ls.sweep(store) == [f"launch {launch_id}: slot released (the launch is over)"]
+    assert _held(astore) == []
 
 
 def test_the_watch_pass_runs_the_sweep(store, astore, fake, live_hook):
@@ -188,7 +199,8 @@ def test_a_refused_schema_launches_unslotted_with_exactly_one_attention_row(stor
     assert second.started, second
     err = capsys.readouterr().err
     assert err.count(f"attention [{ls.ATTENTION_KEY}]") == 1, err
-    assert "agent_schema" in err or "marker" in err
+    assert (f"attention [{ls.ATTENTION_KEY}]: launches run unslotted: unknown agent schema marker "
+            "'levain-agent-schema/1': the agent tables in this store are not the ones this levain writes") in err, err
     c = sqlite3.connect(astore.path)
     try:
         assert c.execute("SELECT count(*) FROM agent_slots").fetchone()[0] == 0   # a table it did not trust, untouched
@@ -211,3 +223,188 @@ def test_a_garbled_cap_refuses_and_leaves_the_launch_pending(store, astore, fake
     got = cl.launch_session(store, launch_id)
     assert not got.started and store.launch(launch_id).state == "pending" and fake.spawns() == []
     assert _held(astore) == []
+
+
+# --- review round 1 ----------------------------------------------------------------------------------------------
+def test_spawned_workers_take_no_agent_slot_only_the_coordinator_does(store, astore, home, fake, live_hook, workdir,
+                                                                       tmp_path):
+    """F1: workers are capped by lease.MAX_SPAWNS_LIVE already. With the default cap (2) a coordinator and four
+    workers all start, and the table holds the coordinator's slot alone."""
+    from levain.agents import instantiate as inst
+    from levain.coordinator.store import Part
+    from tests.test_agents_spawn import role
+
+    token = store.coord_take()
+    for n in range(4):
+        wdir = tmp_path / f"worker-{n}"
+        wdir.mkdir()
+        d, _ = store.accept_drop(f"work {n}", surface="cli")
+        (t,) = store.split(d.drop_id, [Part("work", f"w{n}")], by="operator")
+        ln = inst.spawn_worker(store, token, thread_id=t.thread_id, cwd=str(wdir.resolve()), agent_store=astore,
+                               inline=role(), slots={"topic": "x"})
+        got = cl.launch_session(store, ln.launch_id)
+        assert got.started, (n, got)
+    assert _held(astore) == []                               # four workers, none of them in the table
+    store.coord_release()
+    first = cl.launch_session(store, woken(store))
+    assert first.started, first
+    assert [(k, o) for _s, k, o, _e in _held(astore)] == [("launch", first.launch_id)]
+
+
+def test_a_claim_lost_to_another_pass_does_not_release_the_winners_slot(store, astore, fake, live_hook):
+    """F2, L2's repro: pass A takes the slot (fresh), pass B finds it (not fresh) and wins the spawn claim; A's claim
+    is refused. A must not release by owner id: B's running launch would lose its slot."""
+    launch_id = woken(store)
+    real = store.launch_claim_spawn
+
+    def b_wins_first(lid, pid):
+        theirs = ls.take(store, lid)                       # pass B: finds A's slot
+        assert theirs is not None and not theirs.fresh
+        assert real(lid, 999999)[1] is None                # B wins the claim
+        return real(lid, pid)                              # A's claim: refused
+
+    store.launch_claim_spawn = b_wins_first
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "already being started" in got.refusal, got
+    assert [o for _s, _k, o, _e in _held(astore)] == [launch_id]
+
+
+def test_a_replacement_coordinator_starts_in_the_pass_that_ends_its_predecessor(store, astore, fake, live_hook,
+                                                                               clock):
+    """F3: the ended coordinator still holds its slot when the replacement starts, and another occupant fills the
+    rest: the sweep must run before the start phase or the replacement gets SlotFull for a whole pass."""
+    from datetime import timedelta
+
+    _cap(astore, 2)
+    ln = cl.launch_session(store, woken(store))
+    assert ln.started, ln
+    _occupy(astore)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=2)
+    store.accept_drop("a drop the silent coordinator never saw", surface="cli")
+    lines = cl.watch_once(store)
+    assert any(f"launch {ln.launch_id} ended: " in x for x in lines), lines
+    assert len(fake.spawns()) == 2, lines
+    assert sorted(k for _s, k, _o, _e in _held(astore)) == ["launch", "occurrence"]
+
+
+def test_a_transient_fault_on_the_schema_check_is_not_remembered(store, astore, home, fake, live_hook, monkeypatch,
+                                                                 capsys):
+    """F4: only a refusal or the no-schema answer is kept for the process. A locked database launches unslotted that
+    once, says so on stderr, and the next launch checks again and takes its slot."""
+    import levain.agents.store as agent_store
+
+    real = agent_store.open_agent_store_view
+    calls = []
+
+    def flaky(directory):
+        calls.append(directory)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(directory)
+
+    monkeypatch.setattr(agent_store, "open_agent_store_view", flaky)
+    first_id = woken(store)
+    assert cl.launch_session(store, first_id).started
+    assert _held(astore) == []                                               # unslotted, that once
+    assert "attention [agent-schema-refused]: launches run unslotted: OperationalError: database is locked" in \
+        capsys.readouterr().err
+    fake.gone()
+    store.launch_end(first_id, "ended", "done")
+    second_id = woken(store, "another drop")
+    assert cl.launch_session(store, second_id).started
+    assert [o for _s, _k, o, _e in _held(astore)] == [second_id] and len(calls) == 2   # asked again, slotted
+
+
+def test_a_refusal_and_the_no_schema_answer_are_remembered(store, home, fake, live_hook, monkeypatch):
+    import levain.agents.store as agent_store
+
+    calls = []
+    real = agent_store.open_agent_store_view
+
+    def counting(directory):
+        calls.append(1)
+        return real(directory)
+
+    monkeypatch.setattr(agent_store, "open_agent_store_view", counting)
+    d = home / "autonomic"
+    assert ls.slot_state(d) is False and ls.slot_state(d) is False           # no agent store: asked once
+    assert len(calls) == 1
+
+
+# --- review round 1: the faults and the guards ------------------------------------------------------------------
+def test_a_locked_slot_table_is_a_slot_fault_and_the_launch_stays_pending(store, astore, fake, live_hook, monkeypatch):
+    def locked(conn, *a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(slots, "take", locked)
+    launch_id = woken(store)
+    with pytest.raises(ls.SlotFault, match="database is locked"):
+        ls.take(store, launch_id)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "database is locked" in got.refusal and "left pending" in got.refusal, got
+    assert store.launch(launch_id).state == "pending" and fake.spawns() == []
+
+
+def test_a_schema_that_moved_after_the_check_launches_unslotted_and_releases_nothing(store, astore, monkeypatch):
+    from levain.agents.store import AgentStoreRefused
+
+    launch_id = woken(store)
+    hold = ls.take(store, launch_id)
+    assert hold is not None and ls.slot_state(hold.directory)
+
+    def moved(directory):
+        raise AgentStoreRefused("the schema moved")
+
+    monkeypatch.setattr("levain.agents.store.open_agent_store", moved)
+    assert ls.take(store, "ln-other") is None                      # _open said None: launches unslotted
+    assert ls.release(hold) is False and ls.sweep(store) == []
+    monkeypatch.undo()
+    assert [o for _s, _k, o, _e in _held(astore)] == [launch_id]   # nothing was touched
+
+
+def test_the_sweep_keeps_a_slot_whose_state_cannot_be_told(store, astore, monkeypatch):
+    a, b = woken(store), "ln-never-recorded"
+    t0 = NOW - timedelta(minutes=10)
+    ls.take(store, a, clock=lambda: t0)
+    ls.take(store, b, clock=lambda: t0)
+    before = {o: e for _s, _k, o, e in _held(astore)}
+
+    def probes(directory):
+        def over(launch_id):
+            if launch_id == a:
+                return None                         # no event: cannot tell
+            raise OSError("dispatch.db unreadable")
+        return over, lambda _l: None
+
+    monkeypatch.setattr("levain.agents.controller.dispatch_probes", probes)
+    assert ls.sweep(store, clock=lambda: NOW) == []
+    assert {o: e for _s, _k, o, e in _held(astore)} == before      # neither released nor renewed
+
+
+def test_a_control_c_between_the_take_and_the_claim_releases_the_slot(store, astore, fake, live_hook):
+    launch_id = woken(store)
+
+    def interrupted(lid, pid):
+        raise KeyboardInterrupt
+
+    store.launch_claim_spawn = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        cl.launch_session(store, launch_id)
+    assert _held(astore) == [] and fake.spawns() == []
+
+
+def test_a_failing_attention_callback_is_swallowed_and_raised_once(store, astore, home):
+    d = home / "autonomic"
+    c = sqlite3.connect(astore.path)
+    c.execute("UPDATE meta SET value = 'levain-agent-schema/1' WHERE key = 'agent_schema'")
+    c.commit()
+    c.close()
+    seen = []
+
+    def boom(key, text):
+        seen.append((key, text))
+        raise RuntimeError("no one is listening")
+
+    assert ls.slot_state(d, boom) is False and ls.slot_state(d, boom) is False
+    assert len(seen) == 1 and seen[0][0] == ls.ATTENTION_KEY and seen[0][1].startswith("launches run unslotted: ")

@@ -1035,20 +1035,28 @@ def _launch_session(store: CoordStore, launch_id: str, holds: list[Any] | None =
     held = _handover_blocked(store, exe_, env_)
     if held:
         return left(f"{held}; retried when it is gone")
-    # the slot (P6-3b): taken before the spawn claim, so a full cap leaves the launch pending like every other refusal
-    # here; whoever does not start the launch releases it (launch_session), and the watcher's sweep renews or releases it
+    # the AGENT slot (P6-3b; the table the named fires share, ``agent_slots``, not lease.MAX_SPAWNS_LIVE's cap on
+    # spawned workers): only a coordinator launch takes one, before the spawn claim, so a full cap leaves the launch
+    # pending like every other refusal here. A spawned worker is already capped by MAX_SPAWNS_LIVE and takes none.
+    # Whoever does not start the launch releases it (launch_session), and the watcher's sweep renews or releases it
     from levain.coordinator import launch_slots
 
-    try:
-        hold = launch_slots.take(store, launch_id)
-    except launch_slots.SlotFull as exc:
-        return left(f"{exc}; retried when one is free")
-    except launch_slots.SlotFault as exc:
-        return left(str(exc))
-    if hold is not None and holds is not None:
-        holds.append(hold)
+    hold = None
+    if ln.role == "coordinator":
+        try:
+            hold = launch_slots.take(store, launch_id)
+        except launch_slots.SlotFull as exc:
+            return left(f"{exc}; retried when one is free")
+        except launch_slots.SlotFault as exc:
+            return left(str(exc))
+        if hold is not None and holds is not None:
+            holds.append(hold)
     got, why = store.launch_claim_spawn(launch_id, os.getpid())
     if why is not None:
+        # a refused claim is not this call's to release over: another pass may hold the spawn (and rely on the slot
+        # this call took or found), and every other refusal writes the launch over, so the watcher's sweep frees it
+        if hold is not None and holds is not None:
+            holds.remove(hold)
         return Outcome(launch_id, False, refusal=why)
     if checked is not None:
         got = dataclasses.replace(got, cwd=checked)
@@ -1494,6 +1502,7 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
     # outright stays pending until someone writes it expired, and only then does (d) stop the session it left
     _retire_removed(store, lines)
     store.coord_status()
+    lines.extend(_sweep_slots(store))          # a launch that ended between passes frees its slot before a start needs it
     for ln in store.launches_unspawned():
         if ln.harness != "claude":
             lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude is built, left pending")
@@ -1579,6 +1588,9 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
                      f"{_stop(exe, hid, cwd=str(store.directory), env=env)}")
     # the fresh coordinators start after (d) stopped the done ones they replace; a fault starting one is a line, so
     # the briefs below are still removed
+    # the launch slots of the launches this pass ended are freed first: a replacement coordinator is started below
+    # while the one it replaces would otherwise still hold its slot, and a full table would refuse it for a pass
+    lines.extend(_sweep_slots(store))                          # never raises
     for launch_id in fresh:
         try:
             got = launch_session(store, launch_id)
