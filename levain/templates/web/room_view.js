@@ -91,6 +91,11 @@
     if (text != null) n.textContent = text;
     return n;
   }
+  // ordinary prose for the phone's keyboard (autocorrect, the dictation key); a dash-free name keeps Safari's AutoFill off it
+  function prose(node, name) {
+    [["name", name], ["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["autocomplete", "off"]]
+      .forEach(function (kv) { node.setAttribute(kv[0], kv[1]); });
+  }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
   // hooks: onMark(ref, delivered, note, done), onCommit(card, words, note, buttons), onDismiss(card, note, buttons); ui.open keyed by gseq
@@ -140,6 +145,7 @@
     card.appendChild(el(doc, "div", "rv-note", c.state === "expired" ? "This card is from an earlier conversation and cannot be sent." : "The room can drop this to the desk. Nothing is sent until you tap."));
     var ta = el(doc, "textarea", "rv-cardwords");
     ta.setAttribute("rows", "3"); ta.setAttribute("aria-label", "The words to drop");
+    prose(ta, "roomcardwords");
     ta.value = own(drafts, c.id) ? drafts[c.id] : c.words;     // an edit survives a redraw
     ta.addEventListener("input", function () { drafts[c.id] = ta.value; });
     card.appendChild(ta);
@@ -191,6 +197,9 @@
     var headers = opts.headers || function () { return {}; };
     var pollMs = opts.pollMs == null ? 2000 : opts.pollMs;
     var Speech = opts.speech === undefined ? (root.SpeechRecognition || root.webkitSpeechRecognition) : opts.speech;
+    // Dictation is on-device or absent: a browser whose recognizer cannot be told to stay local (it would send the audio to
+    // the browser vendor's cloud) gets no control, and the keyboard's own dictation key fills the draft box instead.
+    if (Speech && !(Speech.prototype && "processLocally" in Speech.prototype)) Speech = null;
     var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
     var stopped = false, timer = 0, gen = 0, last = "", thread = null, current = null, ui = { open: {} }, drafts = {};
     var wrap = el(doc, "div", "rv"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock");
@@ -199,6 +208,7 @@
       sendB = el(doc, "button", "rv-send", "Send"), dropB = el(doc, "button", "rv-drop", "Drop"),
       stopB = el(doc, "button", "rv-stop", "Stop"), note = el(doc, "div", "rv-sendnote");
     ta.setAttribute("rows", "3"); ta.setAttribute("aria-label", "Message to the room");
+    prose(ta, "roomdraft");
     [sendB, dropB, stopB].forEach(function (b) { b.setAttribute("type", "button"); });
     note.setAttribute("role", "status");
     actions.appendChild(sendB); actions.appendChild(dropB); actions.appendChild(stopB);
@@ -206,7 +216,7 @@
     if (Speech) {
       micB = el(doc, "button", "rv-mic", "Dictate");
       micB.setAttribute("type", "button");
-      micB.setAttribute("title", "Your browser's own speech service hears this, only while this page is open");
+      micB.setAttribute("title", "On-device dictation where this browser provides it, and only while this page is open");
       actions.appendChild(micB);
     }
     var rotB = null;
@@ -238,6 +248,7 @@
       if (ta.value === text) { ta.value = ""; try { if (store) store.removeItem("levain.room.draft"); } catch (e) { /* no storage */ } }
     }
     sendB.addEventListener("click", function () {
+      endDictation();
       var text = ta.value;
       if (!current || !current.thread || !text.trim() || sendB.disabled || flight.send) return;
       if (sendId === null || sendText !== text) sendId = newId();      // one id per draft text: a resend reuses it
@@ -256,6 +267,7 @@
       });
     });
     dropB.addEventListener("click", function () {
+      endDictation();
       var text = ta.value;
       if (!current || !text.trim() || dropB.disabled || flight.drop) return;
       if (dropId === null || dropText !== text) dropId = newId();
@@ -286,24 +298,60 @@
         last = ""; return pull();
       }).catch(function () { note.textContent = "The server could not be reached."; }).then(paintDock);
     });
+    // dictation state: dbase = the text before the transcript, heard = the transcript already placed in the box
+    var dbase = "", heard = "", lastHeard = "";
+    function endDictation() {
+      var r = rec; rec = null;
+      if (micB) micB.textContent = "Dictate";
+      if (r) { r.onresult = null; r.onend = null; r.onerror = null; try { r.stop(); } catch (e) { /* already stopped */ } }
+    }
     if (micB) {
+      var lang = doc.documentElement.lang || (root.navigator && root.navigator.language) || "en-US";
+      micB.style.display = "none";                     // shown only once the browser says on-device dictation is available
+      if (typeof Speech.available === "function") {
+        var asked;
+        try { asked = Speech.available({ langs: [lang], processLocally: true }); } catch (e) { asked = null; }
+        if (asked && asked.then) {
+          asked.then(function (st) {
+            if (st === "unavailable") { micB.remove(); }
+            else if (st === "downloadable" || st === "downloading") {
+              micB.remove();
+              if (!note.textContent) note.textContent = "On-device dictation is not installed on this browser; the keyboard dictation key works.";
+            } else micB.style.display = "";
+          }, function () { micB.style.display = ""; });
+        } else micB.style.display = "";
+      } else micB.style.display = "";
+      ta.addEventListener("input", function () { if (rec) { dbase = ta.value; heard = lastHeard; } });
       micB.addEventListener("click", function () {
-        if (rec) { rec.stop(); return; }
-        var r = new Speech(), base = ta.value ? ta.value.replace(/\s*$/, " ") : "";
-        r.interimResults = true; r.continuous = false;
+        if (rec) { endDictation(); return; }
+        var r = new Speech();
+        dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
+        r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
+        if (r.processLocally !== true) { note.textContent = "This browser will not keep dictation on this device, so it is off; the keyboard dictation key works."; return; }
         r.onresult = function (ev) {
+          if (rec !== r) return;                       // a late result from a recognizer that was ended
           var t = "";
           for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
-          ta.value = base + t;
+          lastHeard = t;
+          ta.value = dbase + (heard && t.indexOf(heard) === 0 ? t.slice(heard.length) : t);
           try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ }
         };
-        r.onend = function () { rec = null; micB.textContent = "Dictate"; };
-        r.onerror = function () { rec = null; micB.textContent = "Dictate"; };
+        r.onend = function () { if (rec === r) endDictation(); };
+        r.onerror = function (ev) {
+          if (rec !== r) return;
+          endDictation();
+          var c = ev && ev.error;
+          note.textContent = c === "language-not-supported" ? "On-device dictation is not installed for this language; the keyboard's dictation key works here."
+            : (c === "not-allowed" || c === "service-not-allowed") ? "Dictation needs permission to use the microphone; allow it in the browser's site settings."
+            : c === "audio-capture" ? "No microphone was found for dictation."
+            : c === "no-speech" ? "Heard nothing."
+            : "Dictation stopped.";
+        };
         rec = r; micB.textContent = "Stop dictating";
-        try { r.start(); } catch (e) { rec = null; micB.textContent = "Dictate"; }
+        try { r.start(); } catch (e) { endDictation(); }
       });
       // foreground only: leaving the page ends dictation
-      var leave = function () { if (rec) rec.stop(); };
+      var leave = function () { if (rec) endDictation(); };
       doc.addEventListener("visibilitychange", function () { if (doc.visibilityState === "hidden") leave(); });
       root.addEventListener && root.addEventListener("blur", leave);
     }
@@ -361,7 +409,7 @@
     function loop() { if (!stopped && pollMs > 0) timer = setTimeout(function () { pull().then(loop); }, pollMs); }
     paintDock();
     pull().then(loop);
-    return { stop: function () { stopped = true; clearTimeout(timer); if (rec) rec.stop(); }, refresh: function () { last = ""; return pull(); }, model: function () { return current; } };
+    return { stop: function () { stopped = true; clearTimeout(timer); endDictation(); }, refresh: function () { last = ""; return pull(); }, model: function () { return current; } };
   }
 
   var api = { roomModel: roomModel, lineModel: lineModel, sendWords: sendWords, renderRoom: renderRoom, mount: mount };

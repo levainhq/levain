@@ -2777,8 +2777,16 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv button:disabled { opacity: .45; cursor: not-allowed; }
 .rv button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
 .rv .rv-sendnote { min-height: 1.5em; font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); overflow-wrap: anywhere; }
+/* RM-H, the phone (390 px is the width the thread fold test uses): the draft box and a card's words are 16px so iOS does not zoom
+   the page on focus; the dock stays under the thumb with the home indicator's inset; Send takes its own row, the rest sit two to a
+   row at the touch size, so no label is squeezed and nothing scrolls sideways. */
+@media (pointer: coarse), (max-width: 640px) { .rv .rv-input, .rv .rv-card textarea { font-size: 16px; } }
 @media (max-width: 640px) {
-  .rv .rv-actions > button { flex: 1 1 0; }
+  .rv .rv-dock { position: sticky; bottom: 0; z-index: 1; background: var(--bg, var(--card)); padding-top: var(--sp-3); padding-bottom: env(safe-area-inset-bottom, 0px); }
+  .rv .rv-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rv .rv-actions > button { min-width: 0; padding-inline: var(--sp-3); overflow-wrap: anywhere; }
+  .rv .rv-actions > .rv-send { grid-column: 1 / -1; }
+  .rv .rv-card button { width: 100%; }
 }
 
 /* C12: the board kind's painters (board_view.js, bd-*). The panel lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */
