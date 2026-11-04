@@ -701,7 +701,7 @@ class InstallRefused(ValueError):
     """The install facts cannot be written or trusted; the message names the file and the one fact at fault."""
 
 
-def _fact_path(doc: Mapping[str, Any], key: str, path: Path, *, kind: str) -> Path:
+def _fact_path(doc: Mapping[str, Any], key: str, path: Path, *, kind: str, writing: bool = False) -> Path:
     raw = doc.get(key)
     if not isinstance(raw, str) or not raw.strip():
         raise InstallRefused(f"{path} lacks {key}")
@@ -710,7 +710,12 @@ def _fact_path(doc: Mapping[str, Any], key: str, path: Path, *, kind: str) -> Pa
         raise InstallRefused(f"{path}: {key} {raw!r} is not an absolute path")
     exists = p.is_file() if kind == "file" else p.is_dir()
     if not exists:
-        raise InstallRefused(f"{path} is stale: {key} {raw!r} is no longer {'a file' if kind == 'file' else 'a directory'}")
+        what = "a file" if kind == "file" else "a directory"
+        if writing and not p.exists():
+            raise InstallRefused(f"{path}: {key} {raw!r} does not exist (never created)")
+        if writing:
+            raise InstallRefused(f"{path}: {key} {raw!r} is not {what}")
+        raise InstallRefused(f"{path} is stale: {key} {raw!r} is no longer {what}")
     return p
 
 
@@ -738,6 +743,8 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
     facts = doc.get("facts_path")
     if facts is not None and (not isinstance(facts, str) or not facts.strip()):
         raise InstallRefused(f"{path}: facts_path {facts!r} is not a path string")
+    if facts is not None and not Path(facts).expanduser().is_absolute():
+        raise InstallRefused(f"{path}: facts_path {facts!r} is not an absolute path")
     for key in ("model", "claude_bin"):
         v = doc.get(key)
         if v is not None and (not isinstance(v, str) or not v.strip()):
@@ -748,10 +755,13 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
 
 
 def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root: Path | str, coord_dir: Path | str,
-                  zone: str, facts_path: Path | str | None = None) -> Path:
+                  zone: str, facts_path: Path | str | None = None, model: str | None = None,
+                  claude_bin: str | None = None) -> Path:
     """Write ``<agent_dir>/dream_install.json`` atomically (a temp file in the directory, fsynced, mode 0600, renamed
     over the old one) from absolute paths that must exist, and read it back through :func:`read_install`. Raises
-    :class:`InstallRefused` before writing anything when a fact is not usable."""
+    :class:`InstallRefused` before writing anything when a fact is not usable. The optional facts (``facts_path``,
+    ``model``, ``claude_bin``) are MERGED: one not passed keeps the value the existing file holds, so re-running
+    ``enable`` never erases what the operator set."""
     import os
     import tempfile
 
@@ -759,10 +769,21 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
     path = d / INSTALL_FILE
     doc: dict[str, Any] = {"schema": INSTALL_SCHEMA, "store_path": str(store_path), "cockpit_root": str(cockpit_root),
                            "coord_dir": str(coord_dir), "zone": zone}
-    if facts_path is not None:
-        doc["facts_path"] = str(facts_path)
+    try:
+        prior = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        prior = {}
+    if not isinstance(prior, dict):
+        prior = {}
+    for key, given in (("facts_path", facts_path), ("model", model), ("claude_bin", claude_bin)):
+        if given is not None:
+            doc[key] = str(given)
+        elif prior.get(key) is not None:
+            doc[key] = prior[key]
     for key, kind in (("store_path", "file"), ("cockpit_root", "dir"), ("coord_dir", "dir")):
-        _fact_path(doc, key, path, kind=kind)
+        _fact_path(doc, key, path, kind=kind, writing=True)
+    if "facts_path" in doc:
+        _fact_path(doc, "facts_path", path, kind="file", writing=True)
     if not isinstance(zone, str) or not zone.strip():
         raise InstallRefused(f"{path} lacks zone")
     fd, tmp = tempfile.mkstemp(prefix=INSTALL_FILE + ".", dir=str(d))
@@ -807,6 +828,13 @@ def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str,
     from levain.dream import executor as ex
 
     inst = read_install(store.directory)
+    row = next((r for r in _ready._read_occurrences(Path(store.directory)) if r.get("occurrence_id") == occurrence_id),
+               None)
+    if row is None:
+        raise ValueError(f"occurrence {occurrence_id} is not in the agent store at {store.directory}")
+    is_manual = row.get("kind") == "manual"
+    card_facts = {"day": _ready.occurrence_dream_day(row, inst.zone).isoformat(), "manual": is_manual,
+                  "slot": None if is_manual else str(row.get("key") or "") or None}
     occ_dir = inst.store_path.parent / "dream" / occurrence_id
     review_store = CoordStore(inst.coord_dir)
 
@@ -827,7 +855,7 @@ def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str,
                                     on_snapshot=on_snapshot, on_saved=on_saved, label="levain dream")
 
     return {"sup": sup, "store_path": inst.store_path, "occ_dir": occ_dir, "executor": executor,
-            "consolidate": consolidate, "review_store": review_store}
+            "consolidate": consolidate, "review_store": review_store, **card_facts}
 
 
 def dream_run(store: Any, occurrence_id: str, launch_epoch: int) -> int:

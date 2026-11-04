@@ -261,3 +261,72 @@ def test_read_install_refuses_non_string_optional_facts_by_name(tmp_path):
         (ad / da.INSTALL_FILE).write_text(json.dumps({**base, key: bad}))
         with pytest.raises(da.InstallRefused, match=key):
             da.read_install(ad)
+
+
+# --- D1 L3 r2 fixes, commit A (A1-A3) ----------------------------------------------------------------------------------
+
+def test_rewriting_the_install_keeps_the_facts_the_operator_set(tmp_path):
+    # A1: a second `enable` names only the paths; facts_path, model and claude_bin set earlier must survive it
+    f = _facts(tmp_path)
+    ad = tmp_path / "ag"
+    ad.mkdir()
+    facts = tmp_path / "facts.json"
+    facts.write_text("{}")
+    da.write_install(ad, **f, facts_path=facts, model="claude-x", claude_bin="/opt/claude")
+    da.write_install(ad, **f)
+    inst = da.read_install(ad)
+    assert inst.facts_path == facts and inst.model == "claude-x" and inst.claude_bin == "/opt/claude"
+    other = tmp_path / "facts2.json"
+    other.write_text("{}")
+    da.write_install(ad, **f, facts_path=other)         # a flag that is passed overwrites
+    assert da.read_install(ad).facts_path == other and da.read_install(ad).model == "claude-x"
+
+
+def test_a_relative_or_missing_facts_path_is_refused_by_name_at_write_and_read(tmp_path):
+    # A3
+    f = _facts(tmp_path)
+    ad = tmp_path / "ag"
+    ad.mkdir()
+    with pytest.raises(da.InstallRefused, match="facts_path.*not an absolute path"):
+        da.write_install(ad, **f, facts_path="rel/facts.json")
+    with pytest.raises(da.InstallRefused, match="facts_path.*does not exist"):
+        da.write_install(ad, **f, facts_path=tmp_path / "nope.json")
+    assert not (ad / da.INSTALL_FILE).exists()
+    da.write_install(ad, **f)
+    doc = json.loads((ad / da.INSTALL_FILE).read_text())
+    doc["facts_path"] = "rel/facts.json"
+    (ad / da.INSTALL_FILE).write_text(json.dumps(doc))
+    with pytest.raises(da.InstallRefused, match="facts_path.*not an absolute path"):
+        da.read_install(ad)
+
+
+def test_a_never_created_default_dir_says_never_created_not_stale(tmp_path):
+    f = _facts(tmp_path)
+    ad = tmp_path / "ag"
+    ad.mkdir()
+    with pytest.raises(da.InstallRefused, match=r"coord_dir.*does not exist \(never created\)"):
+        da.write_install(ad, **{**f, "coord_dir": tmp_path / "never"})
+
+
+def _fire_row_rig(tmp_path):
+    rig = Rig(tmp_path)
+    rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
+    rig.link()
+    oid = rig.claim("k")
+    assert rig.launch(oid).outcome == "launched"
+    da.write_install(rig.store.directory, **_facts(tmp_path))
+    return rig, oid
+
+
+def test_fire_factory_gives_the_card_the_occurrences_day_manual_and_slot(tmp_path, monkeypatch):
+    # A2: the occurrence row (manual, launched) decides what the card says; no executor is built for real here
+    from levain.dream import executor as _ex
+    monkeypatch.setattr(_ex, "DreamExecutor", lambda **kw: object())
+    rig, oid = _fire_row_rig(tmp_path)
+    kw = da.fire_factory(rig.store, oid, 0)
+    row = rig.row(oid)
+    assert kw["manual"] is True and kw["slot"] is None
+    from levain.dream import ready as _r
+    assert kw["day"] == _r.occurrence_dream_day(row, "America/New_York").isoformat()
+    with pytest.raises(ValueError, match="not in the agent store"):
+        da.fire_factory(rig.store, "oc-" + "0" * 32, 0)
