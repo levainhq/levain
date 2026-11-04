@@ -254,6 +254,14 @@ def _start_delivery(deliver: Callable[[Any], None], done: Any) -> None:
     threading.Thread(target=deliver, args=(done,), name="levain-answer-delivery", daemon=True).start()
 
 
+def _surface_name(req: DeskRequest) -> str:
+    """The credential name a desk request records and signs: ``req.surface`` when it is a non-empty string, else
+    ``web``. The viewer (``cockpit:<name>``) and the signed surface (:func:`terminal_sign.desk_surface`) are both
+    derived from THIS value, so the reader, which recomputes the surface from the recorded viewer, finds the one
+    that was signed."""
+    return req.surface if isinstance(req.surface, str) and req.surface else "web"
+
+
 def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, policy: str, signer_factory: Any,
                        key_dir: Any, notify: Callable[[str], Any] | None, find_key: Callable[..., Any] | None, at: Any,
                        nonce: str | None, subject: dict[str, str], pick: str | None, text: str | None, txn: str,
@@ -265,8 +273,9 @@ def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, polic
     from levain.cockpit.keys import KeyError_
     from levain.consent import terminal_sign as ts
 
-    viewer = f"cockpit:{req.surface if isinstance(req.surface, str) and req.surface else 'web'}"
-    surface = ts.desk_surface(req.surface)      # the signed identity; the viewer keeps the credential's own name
+    name = _surface_name(req)
+    viewer = f"cockpit:{name}"
+    surface = ts.desk_surface(name)             # the signed identity, from the SAME name the viewer records
 
     def finish(result: tuple[dict[str, Any], int]) -> tuple[dict[str, Any], int]:
         state.end(txn, result)          # remembered while the sign lock is still held
@@ -367,8 +376,11 @@ def desk_text(req: DeskRequest, store: Any, state: DeskState, *, policy: str = D
     walls as :func:`desk_answer`: not local 403 ``desk_remote``; a line on which nothing would be signed (the policy
     leaves information unsigned and the line holds no linked pick) 422 ``desk_unsigned``, nothing asked or recorded
     (the page uses the ordinary band path); no key 409 ``no_key``; a held lock 409 ``sign_busy``; a replayed request
-    id returns its first result. A cancelled or timed-out touch records NOTHING (409 ``unsigned``, the box keeps his
-    words); a stale view is 409 ``stale_band``; a line that does not parse is 422. ``queue_for`` (tests): the consent
+    id returns its first result. Under the ``all`` policy a cancelled or timed-out touch records NOTHING (409
+    ``unsigned``, the box keeps his words); under the default ``authority`` policy it records the line's information
+    answers unsigned and leaves the linked pick's sheet owed, 200 (:func:`levain.band_view.answer_text_desk`). A
+    ruling applied whose answer then did not record is 409 ``ruled_not_recorded`` whatever refused the answer; a stale
+    view with no ruling applied is 409 ``stale_band``; a line that does not parse is 422. ``queue_for`` (tests): the consent
     queue a linked question's request lives in; ``None`` is the install's own. Never raises."""
     try:
         return _desk_text(req, store, state, policy, signer_factory, key_dir, notify, deliver, find_key, queue_for)
@@ -417,14 +429,15 @@ def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str
         state.end(txn, result)          # remembered while the sign lock is still held
         return result
 
-    viewer = f"cockpit:{req.surface if isinstance(req.surface, str) and req.surface else 'web'}"
+    name = _surface_name(req)
+    viewer = f"cockpit:{name}"
     # a policy that leaves information unsigned still signs a LINKED pick (its ruling is the act): read the line
     # first, and refuse only a line on which nothing would be signed (answer_text_desk re-checks it inside, so a line
     # that changes between this read and the write is refused there, never written unsigned)
     if not requires_sign("information", policy) and not band_view.desk_line_rules(
             store, b["text"], viewer=viewer, view_id=b["view_id"]):
         return _refuse("desk_unsigned", "this line is recorded unsigned; use the ordinary path", 422)
-    surface = ts.desk_surface(req.surface)      # the signed identity; the viewer keeps the credential's own name
+    surface = ts.desk_surface(name)             # the signed identity, from the SAME name the viewer records
     try:
         key = (find_key or ts.find_key)(key_dir)
     except Exception as exc:  # noqa: BLE001
@@ -442,6 +455,10 @@ def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str
                 policy=policy, outcome=signings, queue_for=queue_for, unsigned=False)
         except band_view.DeskLineUnsigned as exc:  # raised before any sheet: the request id stays free to retry
             return _refuse("desk_unsigned", str(exc), 422)
+        except band_view.RuledNotRecorded as exc:  # a ruling applied, then the line's write raised (any cause)
+            return finish(_refuse("ruled_not_recorded", f"the signed ruling was applied, but the answer was not "
+                                                        f"recorded ({exc}); the item is still open", 409,
+                                  signed=True, ruled=True))
         except band_view.StaleBand as exc:       # before the prompt (no view) or inside the write after it
             got = _refuse("stale_band", str(exc), 409)
             return finish(got) if signings else got
@@ -454,8 +471,9 @@ def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str
             # remembered only once a prompt ran: a store blip before any sheet leaves the request id free to retry
             got = _refuse("source_unavailable", f"the question store cannot answer now: {exc}", 503)
             return finish(got) if signings else got
-        except Exception as exc:  # noqa: BLE001 - remembered, so a retry of this request never prompts again
-            return finish(_refuse("internal", type(exc).__name__, 500))
+        except Exception as exc:  # noqa: BLE001 - remembered once a prompt ran, so a retry never prompts again
+            got = _refuse("internal", type(exc).__name__, 500)
+            return finish(got) if signings else got
         signed = bool(done.recorded) and any(getattr(g, "state", None) == "signed" for g in signings)
         if not done.recorded and not done.sheets:
             # every row the line named was answered elsewhere while the sheet was open: nothing was recorded, so

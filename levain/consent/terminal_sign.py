@@ -972,13 +972,16 @@ class AnswerClass:
 
 def desk_origin(host: Any, port: int) -> str | None:
     """The one origin a desk message signs: ``http://<host>`` for the request's validated ``Host`` when it names
-    this server's own port on ``localhost`` or ``127.0.0.1`` (case folded), else None (the route refuses)."""
-    if not isinstance(host, str) or not isinstance(port, int) or isinstance(port, bool):
+    this server's own port on ``localhost`` or ``127.0.0.1`` (case folded), else None (the route refuses). The port
+    is 1..65535 and the assembled origin is one :func:`build_desk_message` accepts (``_ORIGIN``), so an origin this
+    returns never fails later inside the click as a ``MessageError``."""
+    if not isinstance(host, str) or not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         return None
     h = host.lower()
     if h not in (f"localhost:{port}", f"127.0.0.1:{port}"):
         return None
-    return f"http://{h}"
+    origin = f"http://{h}"
+    return origin if _ORIGIN.fullmatch(origin) else None
 
 
 def desk_surface(name: Any) -> str:

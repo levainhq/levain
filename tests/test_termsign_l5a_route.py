@@ -1112,3 +1112,96 @@ def test_an_installed_port_of_non_ascii_digits_leaves_the_default_origins(monkey
             return ["levain", "serve", "--port", "١٢٣"]
     monkeypatch.setattr(daemon, "select_provider", lambda: _P())
     assert band_view._installed_cockpit_port() is None
+
+
+# --- L5b r3 C2-C5 (combination L3) --------------------------------------------------------------------------------
+
+def _badge_threads_done():
+    return not any(t.name == "levain-answer-badges" and t.is_alive() for t in threading.enumerate())
+
+
+def test_an_expired_worker_never_overwrites_the_newer_workers_verdict(rig, store, keydir, monkeypatch):
+    """C2: worker 1's claim expires while its CTK check hangs; worker 2 takes the row and caches a failure; worker 1
+    then returns True. Its verdict is discarded (neither cached nor published), so the cache keeps worker 2's."""
+    import time
+
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    monkeypatch.setattr(band_view, "_BADGE_CLAIM_S", 0.2, raising=False)
+    hang = threading.Event()
+
+    def old_true(pk):
+        hang.wait(10)
+        return True, "bio"
+    band_view._badge_cache.clear()
+    try:
+        assert band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=old_true,
+                                       deadline=time.monotonic() + 0.05) == {}
+        time.sleep(0.3)                                             # worker 1's claim is now expired
+        newer = band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=lambda pk: (False, "not biometric"))
+    finally:
+        hang.set()
+    assert newer == {q.id: "signature failed (bad-signature)"}, newer
+    assert _wait_until(_badge_threads_done)                           # worker 1 has returned True by now
+    assert _wait_until(lambda: not band_view._badge_inflight)
+    assert set(band_view._badge_cache.values()) == {"signature failed (bad-signature)"}, band_view._badge_cache
+    again = band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=lambda pk: (True, "bio"))
+    assert again == {q.id: "signature failed (bad-signature)"}        # served from the cache, never worker 1's True
+
+
+@pytest.mark.parametrize("surface", ["", None, 7])
+def test_an_empty_or_non_string_surface_signs_and_reads_as_web(store, keydir, surface):
+    """C3: the viewer falls back to `web`, and the signed surface is derived from that same name, so the history
+    badge verifies (never `signature failed (scope-mismatch)`), on the typed line and on the click."""
+    q1, q2 = file_q(store, "First?"), file_q(store, "Second?")
+    sid, vid = _shown(store)
+    typed = desk_click.DeskRequest(True, surface, ORIGIN, {"text": "1a", "store_id": sid, "view_id": vid,
+                                                           "client_txn": "txn-surf-001"})
+    got, status = desk_click.desk_text(typed, store, desk_click.DeskState(), policy="all", signer_factory=Calls(),
+                                       key_dir=keydir, notify=lambda t: None)
+    assert status == 200 and got["signed"], got
+    _STORE["s"] = store
+    clicked = desk_click.DeskRequest(True, surface, ORIGIN, body(q2, txn="txn-surf-002"))
+    got, status = desk_click.desk_answer(clicked, desk_click.LevainDeskHost(store), desk_click.DeskState(),
+                                         policy="all", signer_factory=Calls(), key_dir=keydir, notify=lambda t: None)
+    assert status == 200 and got["signed"], got
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    for q in (q1, q2):
+        _via, viewer, _state, _has, message = context(store, q.id)
+        assert viewer == "cockpit:web" and ts.parse_desk_verified(message.encode()).surface == "web"
+        assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok) == "signed: Touch ID, laptop (desk)"
+
+
+def test_the_desk_origin_refuses_a_port_no_message_can_carry():
+    """C4: port 0, past 65535 or of six digits is no origin, so the route refuses it before any click."""
+    for port in (0, 65536, 100000, 1234567, -1):
+        assert ts.desk_origin(f"localhost:{port}", port) is None, port
+        assert ts.desk_origin(f"127.0.0.1:{port}", port) is None, port
+    for port in (1, 8765, 65535):
+        origin = ts.desk_origin(f"localhost:{port}", port)
+        assert origin == f"http://localhost:{port}"
+        assert ts.build_desk_message(store="levain-questions:abc", install="abc", surface="web", origin=origin,
+                                     view="item", gesture="click",
+                                     entries=[ts.Entry("q-1", "v1", "Ship?", "information", answer="(a) yes")])
+
+
+def test_an_unexpected_error_before_any_prompt_leaves_the_request_free_to_retry(store, keydir, monkeypatch):
+    """C5: an error of no known class raised before any sheet is not remembered for the request id."""
+    q = file_q(store)
+    state = desk_click.DeskState()
+    real = band_view.answer_text_desk
+    blips = [AttributeError("a cast bug in the parse")]
+
+    def once(*a, **kw):
+        if blips:
+            raise blips.pop()
+        return real(*a, **kw)
+    monkeypatch.setattr(band_view, "answer_text_desk", once)
+    calls = Calls()
+    request = _text_req(store, "1a", txn="txn-text-attr")
+    got, status = _text(store, keydir, request, factory=calls, state=state)
+    assert (status, got["error"]) == (500, "internal") and calls.n == 0
+    assert state.finished("txn-text-attr") is None
+    got, status = _text(store, keydir, request, factory=calls, state=state)
+    assert status == 200 and got["signed"] and calls.n == 1, got
+    assert answers(store) == [(q.id, "ship")]
