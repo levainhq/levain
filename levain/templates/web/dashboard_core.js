@@ -8822,6 +8822,91 @@
       if (c) c.focus({ preventScroll: true });
     }
   }
+  // A flow Needs-you ping's detail (S4MD-2): the ask first, then the words. `it.needs` is the center's reading of the push body
+  // (levain/webpush/center.py needs_wire): repo, the whole text, the stop text, the options and the sign link. Each option is a link
+  // to the existing sign page with `&choice=<key>` (the page's own pick contract), so nothing is sent from here and no address is
+  // shown. Text only; the body goes through the same renderer, linkify and harden as every notification.
+  function ncDomain(href) { try { return new URL(href).hostname.replace(/^www\./, ""); } catch (_) { return ""; } }
+  function ncNeedsBody(n) {
+    const host = el("div", "nc-body nc-nbody");
+    const CF = window.LevainCardFormat;
+    const secs = CF ? CF.sections(n.what, n.headline) : [{ label: null, blocks: [{ kind: "paragraph", text: n.what }] }];
+    const rec = n.rec || "";
+    for (const sec of secs) {
+      if (CF && CF.repeatsRows(sec, n.options, rec)) continue;
+      if (sec.label) host.appendChild(el("div", "nc-blabel", sec.label.charAt(0) + sec.label.slice(1).toLowerCase()));
+      for (const b of sec.blocks) {
+        if (b.kind === "list") {
+          if (b.lead) host.appendChild(renderMarkdown(b.lead));
+          // the card format ends a list only at a "Label: ..." sentence, so a plain closing sentence rides on the last item; when the
+          // items are lower-case phrases, a capitalised word after a closing mark in the LAST one starts that sentence
+          const items = b.items.slice();
+          let after = "";
+          const last = items.length ? items[items.length - 1] : "";
+          const cut = /^[^A-Z]/.test(last) ? /[)\]`*.!?]\s+(?=[A-Z][a-z]+\s)/.exec(last) : null;
+          if (cut) { items[items.length - 1] = last.slice(0, cut.index + 1); after = last.slice(cut.index + cut[0].length); }
+          const ul = el("ul", "nc-nlist");
+          for (const t of items) { const li = el("li"); ncInline(li, t); ul.appendChild(li); }
+          host.appendChild(ul);
+          if (after) host.appendChild(renderMarkdown(after));
+        } else host.appendChild(renderMarkdown(b.text));
+      }
+    }
+    ncLinkify(host);
+    ncHarden(host);
+    for (const sp of Array.from(host.querySelectorAll(".nc-fullurl"))) {      // his rule: a link shows its domain, the page shows the rest
+      const a = sp.previousElementSibling;
+      const dom = a && a.getAttribute("href") ? ncDomain(a.getAttribute("href")) : "";
+      if (dom) sp.textContent = " (" + dom + ")"; else sp.remove();
+    }
+    return host;
+  }
+  function ncNeedsDetail(d, it, n) {
+    const meta = el("div", "nc-dmeta");
+    meta.appendChild(el("span", "nc-chip nc-repo", n.repo));
+    meta.appendChild(el("span", "nc-time", ncWhen(it.at, true)));
+    d.appendChild(meta);
+    d.appendChild(el("h2", "nc-dtitle", n.title || it.title || "(no title)"));
+    const ask = el("section", "nc-ask"); ask.setAttribute("aria-label", "Your answer");
+    const live = !!n.sign_url && n.sign_open !== false;
+    if (n.options.length) {
+      ask.appendChild(el("div", "nc-blabel", "Your answer"));
+      const list = el("div", "nc-picks"); list.setAttribute("role", "list");
+      for (const o of n.options) {
+        const isRec = n.rec && o.key === n.rec;
+        const row = el(live ? "a" : "div", "nc-pick" + (isRec ? " is-rec" : "") + (live ? "" : " is-inert"));
+        if (live) row.setAttribute("href", n.sign_url + "&choice=" + encodeURIComponent(o.key));
+        row.setAttribute("role", "listitem");
+        row.appendChild(el("span", "nc-pickkey", o.key));
+        row.appendChild(el("span", "nc-picktext", o.text));
+        if (isRec) row.appendChild(el("span", "nc-recmark", "Rec"));
+        list.appendChild(row);
+      }
+      ask.appendChild(list);
+      ask.appendChild(el("p", "nc-note", live ? "An option opens the sign page for that option; you sign there with Face ID. Nothing is sent from here."
+        : n.sign_url ? "This sign request is closed." : "No sign page for this item: answer at the desk."));
+    }
+    if (live) {
+      const go = el("a", "nc-signgo", n.options.length ? "Open the sign page" : "Sign your answer");
+      go.setAttribute("href", n.sign_url);
+      ask.appendChild(go);
+    }
+    if (ask.childNodes.length) d.appendChild(ask);
+    const body = ncNeedsBody(n);
+    if (body.childNodes.length) { const w = el("section", "nc-nsec"); w.appendChild(el("div", "nc-blabel", "Detail")); w.appendChild(body); d.appendChild(w); }
+    if (n.stopped) { const w = el("section", "nc-nsec nc-quiet"); w.appendChild(el("div", "nc-blabel", "Stopped")); w.appendChild(el("p", "nc-nstop", n.stopped)); d.appendChild(w); }
+    const dv = ncDelivery(it.delivery);
+    if (dv) d.appendChild(el("p", "nc-delivery", "Delivery: " + dv));
+    const foot = el("div", "nc-tools nc-foot");
+    const tg = el("button", "nc-btn nc-toggle nc-ghost"); tg.type = "button"; tg.dataset.tool = "toggle";
+    tg.append(ncIcon("mail"), document.createTextNode(it.read ? " Mark unread" : " Mark read"));
+    tg.addEventListener("click", () => { ncSetRead(it.id, !it.read); });
+    const dl = el("button", "nc-btn nc-delete nc-ghost"); dl.type = "button"; dl.dataset.tool = "delete";
+    dl.append(ncIcon("trash"), document.createTextNode(" Delete"));
+    dl.addEventListener("click", () => { ncDelete(it.id); });
+    foot.append(tg, dl);
+    d.appendChild(foot);
+  }
   function ncFillDetail() {
     if (!ncLive()) return;
     const r = ncRoot._nc, d = r.detail;
@@ -8832,6 +8917,11 @@
     d.replaceChildren();
     if (ncUi.gone) d.appendChild(el("p", "nc-gone", ncUi.gone));
     if (!it) { if (!ncUi.gone) d.appendChild(el("p", "nc-none", "Nothing selected.")); return; }
+    if (it.needs && Array.isArray(it.needs.options)) {
+      ncNeedsDetail(d, it, it.needs);
+      if (keepTool) { const c = d.querySelector('[data-tool="' + keepTool + '"]'); if (c) c.focus({ preventScroll: true }); }
+      return;
+    }
     const meta = el("div", "nc-dmeta");
     meta.appendChild(ncChips(it));
     meta.appendChild(el("span", "nc-time", ncWhen(it.at, true)));

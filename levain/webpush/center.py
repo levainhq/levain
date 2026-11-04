@@ -19,8 +19,8 @@ from typing import Any
 
 from levain.webpush.store import NOTICES_DAYS, NOTICES_KEEP, PAIRED_PREFIX, STAMP, PushStore, now_stamp
 
-__all__ = ["PAGE", "PAGE_MAX", "CenterError", "clear", "delete", "get", "list_items", "mark_all_read", "plain_preview", "plain_text",
-           "push_url", "set_read", "unread_count"]
+__all__ = ["PAGE", "PAGE_MAX", "CenterError", "clear", "delete", "get", "list_items", "mark_all_read", "needs_wire", "plain_preview",
+           "plain_text", "push_url", "set_read", "unread_count"]
 
 PAGE = 50                  # the default page
 PAGE_MAX = 200
@@ -100,11 +100,105 @@ def plain_preview(markdown: str, limit: int = PREVIEW_MAX) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+# --- a flow Needs-you ping, read back into its parts ---------------------------------------------------------------------
+# flow's push body for a needs row is `repo: what` / an options line / a sign or answer line, every field collapsed to one
+# line (flow stores the row itself as one line). The words are all there; the structure is not,
+# so the detail view reads the body back into parts, and takes what the push shortens (the options' full text, the stop text)
+# from the sign request the body's link names, which the queue directory holds.
+_WIRE_HEAD = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]{0,79}): (\S.*)")
+_WIRE_SIGN = re.compile(r".*\(Face ID\): (https?://\S+)")
+_WIRE_SIGN_ID = re.compile(r"/sign/([A-Za-z0-9][A-Za-z0-9._-]{0,120})(?=[#?]|$)")
+_WIRE_OPT_SPLIT = re.compile(r"\s·\s(?=[a-z0-9]{1,8}\)\s|Rec\s[a-z0-9]{1,8}$)")
+_WIRE_OPT = re.compile(r"([a-z0-9]{1,8})\)\s+(\S.*)")
+_WIRE_REC = re.compile(r"Rec ([a-z0-9]{1,8})")
+_SENTENCE_END = re.compile(r"[.!?](?=\s)")
+HEADLINE_MAX = 200
+
+
+def _headline(text: str) -> str:
+    """The first sentence that ends 20 or more characters in and inside 200 (the card format's rule), else the text up to 200."""
+    flat = " ".join((text or "").split())
+    for m in _SENTENCE_END.finditer(flat):
+        cut = m.start() + 1
+        if cut > HEADLINE_MAX:
+            break
+        if cut >= 20:
+            return flat[:cut]
+    return flat if len(flat) <= HEADLINE_MAX else flat[:160].rsplit(" ", 1)[0]
+
+
+def _signed_fields(message: str) -> dict[str, str]:
+    """``asked`` and ``stopped`` from a needs-phill sign request's message (``item: ...`` ``asked: ...`` lines); only what is there."""
+    got: dict[str, str] = {}
+    for line in (message or "").split("\n"):
+        m = re.fullmatch(r"(asked|stopped): (.*)", line.rstrip("\r"))
+        if m and m.group(1) not in got:
+            got[m.group(1)] = m.group(2)
+    return got
+
+
+def needs_wire(body: str, queue_dir: Path | None = None) -> dict[str, Any] | None:
+    """The parts of a flow Needs-you ping's body, or None when the body is not in that shape (the detail view then draws it as
+    plain Markdown). ``{repo, what, headline, title, stopped, options [{key, text}], rec, sign_url, sign_open}`` (``sign_open`` None when the request was not read). ``sign_url`` is the
+    base sign link (a pick appends ``&choice=<key>``, the sign page's own contract); with a readable, open sign request in
+    ``queue_dir`` the options carry their full text and ``stopped`` is the request's. A request that cannot be read leaves the
+    push's own words."""
+    lines = [ln.strip() for ln in (body or "").split("\n") if ln.strip()]
+    head = _WIRE_HEAD.fullmatch(lines[0]) if lines else None
+    if head is None:
+        return None
+    opts: list[dict[str, str]] = []
+    rec = None
+    saw_opts = False
+    sign_url = None
+    for ln in lines[1:]:
+        m = _WIRE_SIGN.fullmatch(ln)
+        if m:
+            sign_url = re.sub(r"&choice=[a-z0-9]{1,8}$", "", m.group(1))
+            continue
+        if ln == "No listed options.":
+            saw_opts = True
+            continue
+        if not saw_opts and _WIRE_OPT.match(ln):
+            parts = _WIRE_OPT_SPLIT.split(ln)
+            r = _WIRE_REC.fullmatch(parts[-1]) if parts else None
+            if r:
+                rec, parts = r.group(1), parts[:-1]
+            rows = [_WIRE_OPT.fullmatch(p) for p in parts]
+            if rows and all(rows):
+                opts = [{"key": m2.group(1), "text": m2.group(2)} for m2 in rows if m2]
+                saw_opts = True
+    if not saw_opts:
+        return None
+    out: dict[str, Any] = {"repo": head.group(1), "what": head.group(2), "stopped": None, "options": opts, "rec": rec,
+                           "sign_url": sign_url, "sign_open": None}
+    rid = _WIRE_SIGN_ID.search(sign_url or "")
+    if rid and queue_dir is not None:
+        try:
+            from levain.consent import sign
+
+            req = sign.read_request(Path(queue_dir), rid.group(1))
+            if req.refused is None and req.namespace == "flow-needs-phill":
+                fields = _signed_fields(req.message)
+                if fields.get("stopped"):
+                    out["stopped"] = fields["stopped"]
+                if fields.get("asked"):
+                    out["what"] = fields["asked"]       # the push may have cut the text; the signed line is whole
+                if req.options and [k for k, _ in req.options] == [o["key"] for o in opts]:
+                    out["options"] = [{"key": k, "text": t} for k, t in req.options]
+                out["sign_open"] = sign.state_of(Path(queue_dir), rid.group(1)) == "open"
+        except Exception:  # noqa: BLE001 - the push's own words stand; the sign page is the authority on the request
+            pass
+    out["headline"] = _headline(out["what"])
+    out["title"] = plain_preview(out["headline"], HEADLINE_MAX)     # the detail's title: plain, whole
+    return out
+
+
 def _first_line(body: str, source: str) -> str:
     for line in (body or "").splitlines():
-        line = line.strip()
+        line = plain_preview(line.strip(), TITLE_MAX)
         if line:
-            return line if len(line) <= TITLE_MAX else line[: TITLE_MAX - 1].rstrip() + "…"
+            return line
     return _LABEL_OF_SOURCE.get(source, "levain")
 
 
@@ -303,7 +397,9 @@ def _ping_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict[s
     needs_ref = ("consent:" + ref[len("request:"):]) if ref and ref.startswith("request:") else (
         ref if ref and ref.startswith("question:") else None)
     body = r["body"] or ""
-    return {"id": f"p{num}", "origin": "levain", "source": source, "title": _first_line(body, source), "body": body,
+    needs = needs_wire(body, rd.queue_dir) if source == "needs" else None
+    title = plain_preview(needs["headline"], TITLE_MAX) if needs else _first_line(body, source)
+    return {"id": f"p{num}", "origin": "levain", "source": source, "title": title, "body": body, "needs": needs,
             "preview": plain_preview(body), "at": _iso(r["at"]), "priority": "normal", "read": read,
             "read_at": _iso(read_at) if read else None, "needs_ref": needs_ref,
             "needs_open": bool(needs_ref) and rd.needs_open(ref), "token_name": None, "image_url": None,
