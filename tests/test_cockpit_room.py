@@ -472,7 +472,7 @@ def test_a_dismissed_card_is_settled_and_a_card_of_a_rotated_room_cannot_be_comm
         p2 = w.propose(message2)
         w._rotate()
         status, body = _call(base, f"/cockpit/room/proposal/{p2.proposal_id}/commit", {"words": "two", "outbox_id": "ob-card0003"})
-        assert status == 409 and body["error"] == "proposal_settled"
+        assert status == 409 and body["error"] == "proposal_expired"
         status, body = _call(base, "/cockpit/room/proposal/pr-" + "0" * 32 + "/commit", {"words": "two", "outbox_id": "ob-card0004"})
         assert status == 404
     assert w.drops() == []
@@ -495,7 +495,7 @@ def test_a_malformed_commit_is_a_400_and_the_card_stays_open(tmp_path, w, req):
 
 def test_rotation_opens_a_new_conversation_and_the_old_page_is_refused(tmp_path, w):
     with _serve_room(tmp_path, w) as (base, _h):
-        status, body = _call(base, "/cockpit/room/rotate", {})
+        status, body = _call(base, "/cockpit/room/rotate", {"room_thread_id": w.thread})
         assert status == 200 and body["room_thread"] != w.thread
         status, got = _call(base, cockpit_room.ROOM_PATH, method="GET")
         assert got["room_thread"] == body["room_thread"] and got["stream"] == []
@@ -591,3 +591,167 @@ def test_the_page_script_never_says_restricted_or_limited():
     js = (Path(cockpit_room.__file__).resolve().parents[1] / "templates" / "web" / "room_view.js").read_text().lower()
     for word in ("talk-only", "restricted", "limited", "read-only"):
         assert word not in js, word
+
+
+# --- RM-F fix round 1 (FINDINGS_rmf_r1): reproductions first --------------------------------------------------------------
+
+def test_f1_a_committed_card_shows_the_words_that_were_dropped_not_the_proposals(tmp_path, w):
+    with _serve_room(tmp_path, w) as (base, _h):
+        _call(base, "/cockpit/room/send", w.body("hello there"))
+        p = w.propose(_first_message_id(w))
+        status, _b = _call(base, f"/cockpit/room/proposal/{p.proposal_id}/commit",
+                           {"words": "COMPLETELY DIFFERENT", "outbox_id": "ob-card0001"})
+        assert status == 200
+        status, got = _call(base, cockpit_room.ROOM_PATH, method="GET")
+    [card] = got["proposals"]
+    assert card["state"] == "committed" and card["words"] == "COMPLETELY DIFFERENT"
+    assert w.drops() == [("COMPLETELY DIFFERENT", "cockpit")]
+
+
+def test_f2_a_rotation_names_the_room_it_rotates_and_a_stale_page_is_refused(tmp_path, w):
+    with _serve_room(tmp_path, w) as (base, _h):
+        old = w.thread
+        status, first = _call(base, "/cockpit/room/rotate", {"room_thread_id": old})
+        assert status == 200 and first["room_thread"] != old
+        status, body = _call(base, "/cockpit/room/rotate", {"room_thread_id": old})      # the second tap, same stale page
+        assert status == 409 and body["error"] == "room_rotated", body
+        status, got = _call(base, cockpit_room.ROOM_PATH, method="GET")
+        assert got["room_thread"] == first["room_thread"]                                # nothing rotated again
+        for req in ({}, {"room_thread_id": "th-short"}, {"room_thread_id": 7}):
+            status, body = _call(base, "/cockpit/room/rotate", req)
+            assert status == 400 and body["error"] == "bad_request", (req, body)
+    opened = sqlite3.connect(w.store.path)
+    try:
+        assert opened.execute("SELECT count(*) FROM room_events WHERE kind = 'rotated'").fetchone()[0] == 1
+    finally:
+        opened.close()
+
+
+def _each_post_route(w):
+    """(path, body) for every room POST route, so a class-wide refusal is exercised on all of them."""
+    pid = "pr-" + "0" * 32
+    return [("send", w.body()), ("stop", {"room_thread_id": w.thread}),
+            ("mark", {"room_thread_id": w.thread, "message_id": "cm-" + "0" * 32, "delivered": True}),
+            ("drop", {"words": "x", "outbox_id": "ob-drop0001"}), ("rotate", {"room_thread_id": w.thread}),
+            (f"proposal/{pid}/commit", {"words": "x", "outbox_id": "ob-card0001"}), (f"proposal/{pid}/dismiss", {})]
+
+
+@pytest.mark.parametrize("owner", [None, "cockpit:bad name", "cockpit:", "phone:", "nobody:x", "paired-"])
+def test_f3_every_room_post_route_refuses_an_unnamed_credential_before_acting(w, owner):
+    host = w.host
+    for path, req in _each_post_route(w):
+        route = cockpit_room.post_route("/cockpit/room/" + path)
+        action, pid = route
+        if pid is not None:
+            status, body = cockpit_room.post_proposal(host, owner, pid, action, req)
+        elif action == "send":
+            status, body = cockpit_room.post_room_send(host, w.store.path.parent, owner, req)
+        elif action == "stop":
+            status, body = cockpit_room.post_room_stop(host, w.store.path.parent, owner, req)
+        elif action == "mark":
+            status, body = cockpit_room.post_room_mark(host, w.store.path.parent, owner, req)
+        elif action == "drop":
+            status, body = cockpit_room.post_room_drop(host, owner, req)
+        else:
+            status, body = cockpit_room.post_room_rotate(host, w.store.path.parent, owner, req)
+        assert status == 403 and body["error"] == "forbidden", (path, owner, status, body)
+    assert w.lines() == [] and w.drops() == [] and w.session.written == []
+
+
+def test_f3_the_mount_hands_a_credential_with_no_client_name_to_every_route(tmp_path, w, monkeypatch):
+    from levain import web_server
+    monkeypatch.setattr(web_server._Handler, "_thread_owner", lambda self: None)
+    with _serve_room(tmp_path, w) as (base, _h):
+        for path, req in _each_post_route(w):
+            status, body = _call(base, "/cockpit/room/" + path, req)
+            assert status == 403 and body["error"] == "forbidden", (path, status, body)
+    assert w.lines() == [] and w.drops() == [] and w.session.written == []
+
+
+def test_f4_the_rotation_answers_the_open_room_whatever_the_host_returns(tmp_path, w):
+    # the landed coordroom.rotate returns the OLD thread; the route must answer the room it re-reads
+    old = w.thread
+    real = w._rotate
+
+    def returns_old():
+        real()
+        return old
+
+    w.host.rotate = returns_old
+    with _serve_room(tmp_path, w) as (base, _h):
+        status, body = _call(base, "/cockpit/room/rotate", {"room_thread_id": old})
+        assert status == 200 and body["room_thread"] != old
+        status, got = _call(base, cockpit_room.ROOM_PATH, method="GET")
+        assert got["room_thread"] == body["room_thread"]
+
+
+def test_f5_each_proposal_refusal_has_its_own_name_and_status(tmp_path, w):
+    pid0 = "pr-" + "0" * 32
+    with _serve_room(tmp_path, w) as (base, _h):
+        _call(base, "/cockpit/room/send", w.body("one"))
+        p = w.propose(_first_message_id(w))
+        got = _call(base, f"/cockpit/room/proposal/{pid0}/dismiss", {})
+        assert got[0] == 404 and got[1]["error"] == "no_proposal", got
+        got = _call(base, f"/cockpit/room/proposal/{pid0}/commit", {"words": "x", "outbox_id": "ob-card0001"})
+        assert got[0] == 404 and got[1]["error"] == "no_proposal", got
+        got = _call(base, f"/cockpit/room/proposal/{p.proposal_id}/commit", {"words": "x\x00", "outbox_id": "ob-card0001"})
+        assert got[0] == 400 and got[1]["error"] == "bad_words", got
+        # a drop made elsewhere under an outbox id: this proposal cannot reuse it
+        status, _b = _call(base, "/cockpit/room/drop", {"words": "one", "outbox_id": "ob-shared01"})
+        assert status == 200
+        got = _call(base, f"/cockpit/room/proposal/{p.proposal_id}/commit", {"words": "one", "outbox_id": "ob-shared01"})
+        assert got[0] == 409 and got[1]["error"] == "outbox_conflict", got
+        got = _call(base, f"/cockpit/room/proposal/{p.proposal_id}/commit", {"words": "other", "outbox_id": "ob-shared01"})
+        assert got[0] == 409 and got[1]["error"] == "outbox_conflict", got
+        assert _call(base, f"/cockpit/room/proposal/{p.proposal_id}/commit", {"words": "one", "outbox_id": "ob-card0002"})[0] == 200
+        got = _call(base, f"/cockpit/room/proposal/{p.proposal_id}/dismiss", {})
+        assert got[0] == 409 and got[1]["error"] == "proposal_settled", got
+        # the drop door: an outbox id reused for other words is the same named conflict
+        got = _call(base, "/cockpit/room/drop", {"words": "different", "outbox_id": "ob-shared01"})
+        assert got[0] == 409 and got[1]["error"] == "outbox_conflict", got
+        # a rotated room's card is expired, named so
+        _call(base, "/cockpit/room/send", w.body("two", "ob-00000002"))
+        m2 = w.cs._read(lambda c: c.execute("SELECT message_id FROM chat_messages ORDER BY gseq DESC").fetchone()[0])
+        p2 = w.propose(m2)
+        w._rotate()
+        got = _call(base, f"/cockpit/room/proposal/{p2.proposal_id}/commit", {"words": "two", "outbox_id": "ob-card0003"})
+        assert got[0] == 409 and got[1]["error"] == "proposal_expired", got
+
+
+def test_f8_a_store_missing_drop_notes_degrades_nothing_and_the_read_creates_nothing(tmp_path, w):
+    with _serve_room(tmp_path, w) as (base, _h):
+        _call(base, "/cockpit/room/send", w.body("one"))
+    p = w.propose(_first_message_id(w))
+    part = tmp_path / "part8"
+    part.mkdir()
+    src = sqlite3.connect(w.store.path)
+    dst = sqlite3.connect(part / "dispatch.db")
+    src.backup(dst)
+    src.close()
+    dst.execute("DROP TABLE drop_notes")
+    dst.commit(); dst.close()
+    status, got = cockpit_room.serve_room(cockpit_room.ROOM_PATH, directory=part)
+    assert status == 200 and got["room_thread"] == w.thread
+    assert [c["proposal_id"] for c in got["proposals"]] == [p.proposal_id] and got["proposals"][0]["state"] == "open"
+    again = sqlite3.connect(part / "dispatch.db")
+    try:
+        assert again.execute("SELECT count(*) FROM sqlite_master WHERE name = 'drop_notes'").fetchone()[0] == 0
+    finally:
+        again.close()
+
+
+def test_f9_a_stored_undelivered_line_answers_409_on_the_unresolved_path_as_on_the_replay_path(tmp_path, qdir):
+    w = World(qdir, scripted("not_sent"))
+    real = w.svc.send_room
+
+    def boom(*a, **k):
+        real(*a, **k)
+        raise RuntimeError("after the write")
+
+    w.svc.send_room = boom
+    with _serve_room(tmp_path, w) as (base, _h):
+        status, body = _call(base, "/cockpit/room/send", w.body())
+        assert status == 409 and body["error"] == "not_delivered", body
+        w.svc.send_room = real
+        status2, body2 = _call(base, "/cockpit/room/send", w.body())
+        assert (status2, body2["error"]) == (status, body["error"])

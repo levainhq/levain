@@ -38,7 +38,7 @@ from levain.cockpit.consent import utc_stamp
 from levain.coordinator import chat
 from levain.coordinator import room as coordroom
 from levain.coordinator.chat_lease import check_owner
-from levain.coordinator.store import SURFACES, WORDS_MAX, CoordError
+from levain.coordinator.store import SURFACES, WORDS_MAX, CoordError, DropConflict
 
 ROOM_PATH = "/cockpit/room.json"
 ROOM_PREFIX = "/cockpit/room/"
@@ -58,11 +58,12 @@ class RoomHost:
     """What the mount hands the room routes. ``service`` is the ChatService and ``store`` the CoordStore over the same
     ``dispatch.db`` (for a drop). ``ensure()`` opens or reopens the room's running launch (``RoomLauncher.ensure``) and
     raises a CoordError when it cannot; None means the launch is kept elsewhere. ``rotate()`` makes the next room thread
-    the open room and returns its id; None serves no rotation."""
+    the open room; None serves no rotation. Its return value is NOT read: the landed ``coordroom.rotate`` returns the OLD
+    thread and another host may return the new one, so the route answers with the open room it re-reads."""
     service: Any
     store: Any
     ensure: Callable[[], Any] | None = None
-    rotate: Callable[[], str] | None = None
+    rotate: Callable[[], Any] | None = None
 
 
 def is_room_path(path: str) -> bool:
@@ -122,17 +123,25 @@ def _composer(conn: sqlite3.Connection, launch: str | None, service: Any) -> dic
 
 
 def _proposals(conn: sqlite3.Connection, room_thread: str) -> list[dict[str, Any]]:
+    """The open room's drop proposals, each in the state the record holds. Read-only SQL, never the coordinator's
+    ``get_proposal`` (it creates a missing room table, which a ``mode=ro`` connection cannot): a store missing a table
+    degrades only this part. A committed card carries the words of the DROP it made (his bytes), never the proposal's."""
     if not (threads._has(conn, "drop_proposals") and threads._has(conn, "proposal_events")):
         return []
+    has_drops = threads._has(conn, "drops")
     out = []
-    ids = [r[0] for r in conn.execute("SELECT proposal_id FROM drop_proposals WHERE room_thread = ? ORDER BY gseq DESC "
-                                      "LIMIT ?", (room_thread, PROPOSALS_MAX))]
-    for pid in reversed(ids):
-        p = coordroom.get_proposal(conn, pid)
-        drop = conn.execute("SELECT drop_id FROM proposal_events WHERE proposal_id = ? AND kind = 'committed'",
-                            (pid,)).fetchone()
-        out.append({"proposal_id": p.proposal_id, "state": p.state, "quoted": list(p.quoted), "words": p.words,
-                    "summary": p.summary, "about": p.about, "at": p.at, "drop_id": drop[0] if drop else None})
+    rows = conn.execute("SELECT proposal_id, quoted, words, summary, about, at FROM drop_proposals WHERE room_thread = ? "
+                        "ORDER BY gseq DESC LIMIT ?", (room_thread, PROPOSALS_MAX)).fetchall()
+    for pid, quoted, words, summary, about, at in reversed(rows):
+        event = conn.execute("SELECT kind, drop_id FROM proposal_events WHERE proposal_id = ? ORDER BY seq LIMIT 1",
+                             (pid,)).fetchone()
+        state, drop_id = (event[0], event[1] if event[0] == "committed" else None) if event else ("open", None)
+        if drop_id is not None and has_drops:
+            made = conn.execute("SELECT words FROM drops WHERE drop_id = ?", (drop_id,)).fetchone()
+            if made is not None:
+                words = made[0]
+        out.append({"proposal_id": pid, "state": state, "quoted": json.loads(quoted), "words": words,
+                    "summary": summary, "about": about, "at": at, "drop_id": drop_id})
     return out
 
 
@@ -272,6 +281,8 @@ def _settled(directory: Path | str, outbox_id: str) -> tuple[int, dict[str, Any]
             conn.close()
     if state is None:
         return _refusal("send_failed", "the line was not written; send it again", 500)
+    if state in _UNDELIVERED:       # the same state answers 409 on the replay path (`_answer`): one answer, not two
+        return _refusal(state, f"the line is stored ({state.replace('_', ' ')}) and was not delivered", 409)
     return _refusal("unresolved", f"the line is stored ({state.replace('_', ' ')}) but the send did not finish; it is "
                     "not sent again", 202)
 
@@ -308,11 +319,14 @@ def post_room_send(host: RoomHost, directory: Path | str, owner: str | None, req
         return _settled(directory, req["outbox_id"])
 
 
-def post_room_stop(host: RoomHost, directory: Path | str, req: Any) -> tuple[int, dict[str, Any]]:
+def post_room_stop(host: RoomHost, directory: Path | str, owner: str | None, req: Any) -> tuple[int, dict[str, Any]]:
     """``POST /cockpit/room/stop {room_thread_id}``: the operator's interrupt of whatever the room is running. Unfenced
-    (B5): it names no turn and takes no lease; a stop that lands on a replaced launch interrupts the same conversation."""
+    (B5): it names no turn and takes no lease; a stop that lands on a replaced launch interrupts the same conversation.
+    It acts only for a named credential, as the work-thread stop does."""
     if not isinstance(req, dict):
         return _refusal("bad_request", "body must be a JSON object", 400)
+    if _owner_parts(owner) is None:
+        return _refusal("forbidden", "a stop needs a named credential", 403)
     room_thread, refused = _need_room(directory, req)
     if refused is not None:
         return refused
@@ -365,19 +379,33 @@ def post_room_mark(host: RoomHost, directory: Path | str, owner: str | None, req
     return 200, {"message_id": message, "state": state}
 
 
-def post_room_rotate(host: RoomHost, owner: str | None, req: Any) -> tuple[int, dict[str, Any]]:
-    """``POST /cockpit/room/rotate {}``: a new conversation, his control. The host's own verb makes the new room thread
-    the open one; a host with none serves none."""
+def post_room_rotate(host: RoomHost, directory: Path | str, owner: str | None, req: Any) -> tuple[int, dict[str, Any]]:
+    """``POST /cockpit/room/rotate {room_thread_id}``: a new conversation, his control, fenced like every room write: a
+    page that drew a room that is no longer the open one is a 409 ``room_rotated`` and nothing rotates (two taps on one
+    stale page rotate once). The host's own verb makes the new room thread the open one; a host with none serves none.
+    The answer is the open room READ AFTER the rotation, never the host's return value."""
     if not isinstance(req, dict):
         return _refusal("bad_request", "body must be a JSON object", 400)
     if _owner_parts(owner) is None:
         return _refusal("forbidden", "a rotation needs a named credential", 403)
     if host.rotate is None:
         return _refusal("not_found", "this server serves no room rotation", 404)
+    _room, refused = _need_room(directory, req)
+    if refused is not None:
+        return refused
     try:
-        return 200, {"room_thread": host.rotate()}
+        host.rotate()
     except CoordError as exc:
         return _refusal("rotate_refused", str(exc), 409)
+    conn = threads._open(directory)
+    try:
+        opened = _open_room(conn) if conn is not None else None
+    finally:
+        if conn is not None:
+            conn.close()
+    if opened is None:
+        return _refusal("rotate_unsettled", "the rotation ran but no open room is recorded; read the room again", 409)
+    return 200, {"room_thread": opened}
 
 
 def _surface(owner: str | None) -> str | None:
@@ -403,6 +431,8 @@ def post_room_drop(host: RoomHost, owner: str | None, req: Any) -> tuple[int, di
         return _refusal("forbidden", "a drop needs a named credential from the cockpit or the phone", 403)
     try:
         drop, created = host.store.accept_drop(words, surface=surface, outbox_id=outbox)
+    except DropConflict as exc:
+        return _refusal("outbox_conflict", str(exc), 409)
     except CoordError as exc:
         return _refusal("drop_refused", str(exc), 409)
     return 200, {"drop_id": drop.drop_id, "created": created}
@@ -418,10 +448,11 @@ def post_proposal(host: RoomHost, owner: str | None, proposal_id: str, action: s
         return _refusal("forbidden", f"a {action} needs a named credential from the cockpit or the phone", 403)
     if action == "dismiss":
         try:
+            # the coordinator exposes no public write context for a dismiss: the store's own transaction, as its tests use
             with host.store._write() as (conn, now):
                 coordroom.dismiss(conn, proposal_id, now=now)
         except CoordError as exc:
-            return _refusal("proposal_settled", str(exc), 409)
+            return _proposal_refusal(exc)
         return 200, {"proposal_id": proposal_id, "state": "dismissed"}
     words, outbox = req.get("words"), req.get("outbox_id")
     if not isinstance(words, str) or not words.strip() or len(words) > WORDS_MAX:
@@ -431,11 +462,28 @@ def post_proposal(host: RoomHost, owner: str | None, proposal_id: str, action: s
                         "(starting with a letter or digit)", 400)
     try:
         drop, created = coordroom.commit(host.store, proposal_id, words, outbox, surface)
+    except DropConflict as exc:
+        return _refusal("outbox_conflict", str(exc), 409)
     except CoordError as exc:
-        text = str(exc)
-        return _refusal("not_found" if text.startswith("no proposal") else "proposal_settled", text,
-                        404 if text.startswith("no proposal") else 409)
+        return _proposal_refusal(exc)
     return 200, {"proposal_id": proposal_id, "drop_id": drop.drop_id, "created": created}
+
+
+def _proposal_refusal(exc: CoordError) -> tuple[int, dict[str, Any]]:
+    """A named answer per case. The coordinator raises one error type for these, so the case is read from its sentence;
+    a sentence it does not know is a generic 409 ``proposal_refused``, never a wrong specific name."""
+    text = str(exc)
+    if text.startswith("no proposal"):
+        return _refusal("no_proposal", text, 404)
+    if text.startswith("a drop "):      # `_check_words`: needs words, too long, NUL, not UTF-8
+        return _refusal("bad_words", text, 400)
+    if text.startswith("outbox_id ") and "not this proposal's" in text:
+        return _refusal("outbox_conflict", text, 409)
+    if " is expired" in text:
+        return _refusal("proposal_expired", text, 409)
+    if " is already " in text or " is committed" in text or " is dismissed" in text:
+        return _refusal("proposal_settled", text, 409)
+    return _refusal("proposal_refused", text, 409)
 
 
 def encode(body: Mapping[str, Any]) -> bytes:

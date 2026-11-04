@@ -3344,13 +3344,13 @@ class _Handler(GuardedHandler):
         elif action == "send":
             status, payload = cockpit_room.post_room_send(host, directory, owner, req)
         elif action == "stop":
-            status, payload = cockpit_room.post_room_stop(host, directory, req)
+            status, payload = cockpit_room.post_room_stop(host, directory, owner, req)
         elif action == "mark":
             status, payload = cockpit_room.post_room_mark(host, directory, owner, req)
         elif action == "drop":
             status, payload = cockpit_room.post_room_drop(host, owner, req)
         else:
-            status, payload = cockpit_room.post_room_rotate(host, owner, req)
+            status, payload = cockpit_room.post_room_rotate(host, directory, owner, req)
         return payload, status
 
     def _serve_threads(self, path: str, *, head: bool) -> None:
