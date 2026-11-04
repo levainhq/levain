@@ -50,7 +50,8 @@ const indexedDB = {
 
 // --- Cache Storage ---------------------------------------------------------------------------------------------------
 const cacheNames = new Set();
-const cacheCtypes = new Map();   // 'cache|key' -> content-type, when a test pins one
+const cacheCtypes = new Map();
+const cacheHeaders = new Map(); // 'cache|key' -> every header of the stored response   // 'cache|key' -> content-type, when a test pins one
 let putFailKey = null;           // the next put to this key in a shell cache throws once
 const cacheStores = new Map();   // cache name -> Map(request key -> body text)
 const caches = {
@@ -65,9 +66,9 @@ const caches = {
     return {
       put: async (k, r) => {
         if (n.startsWith('levain-shell-v') && putFailKey === k) { putFailKey = null; throw new TypeError('quota'); }
-        cacheCtypes.set(n + '|' + k, r.headers.get('content-type') || guess(k)); m.set(k, await r.text());
+        cacheCtypes.set(n + '|' + k, r.headers.get('content-type') || guess(k)); cacheHeaders.set(n + '|' + k, [...r.headers.entries()]); m.set(k, await r.text());
       },
-      match: async (k) => (m.has(k) ? new Response(m.get(k), { headers: { 'content-type': cacheCtypes.get(n + '|' + k) || guess(k) } }) : undefined),
+      match: async (k) => (m.has(k) ? new Response(m.get(k), { headers: [...(cacheHeaders.get(n + '|' + k) || []), ['content-type', cacheCtypes.get(n + '|' + k) || guess(k)]].reduce((h, [a, b]) => { h.set(a, b); return h; }, new Headers()) }) : undefined),
       delete: async (k) => m.delete(k),
       keys: async () => [...m.keys()].map((k) => ({ url: 'https://box.example' + k })),
     };
@@ -100,7 +101,7 @@ const self_ = {
   },
 };
 const sandbox = {
-  self: self_, indexedDB, caches, Response, Math,
+  self: self_, indexedDB, caches, Response, Headers, Math,
   console: { info: (m) => log.console.push(['info', String(m)]), warn: (m) => log.console.push(['warn', String(m)]) },
   URL, clearTimeout, MessageChannel, TextEncoder, AbortController, crypto: require('crypto').webcrypto,
   // a wait of 5 s or more is recorded and shortened, so the worker's NEW_TTL_MS hold after a successful openWindow does not slow the rig
@@ -313,6 +314,7 @@ function fire(type, ev) {
     const m = JSON.parse(mode);
     const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
     if (m.shell) { cacheStores.set(shellName, new Map([['/', m.shellHtml || '<html>cached shell</html>']])); cacheNames.add(shellName); }
+    if (m.shellHeaders) cacheHeaders.set(shellName + '|/', Object.entries(m.shellHeaders));
     for (const k of m.stray || []) cacheStores.get(shellName).set(k, 'STRAY');
     if (m.putFail) putFailKey = m.putFail;
     if (m.cached) { cacheStores.get(shellName).set(m.cached, 'CACHED ' + m.cached); }
@@ -338,6 +340,30 @@ function fire(type, ev) {
       log.status = r.status; log.ctype = r.headers.get('content-type'); log.body = await r.text();
     }
     await Promise.all(log.waits || []);
+    log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v')).map(([n, mm]) => [n, [...mm.entries()]]);
+    log.rootCsp = (cacheHeaders.get(shellName + '|/') || []).filter(([h]) => h === 'content-security-policy').map(([, v]) => v);
+  } else if (scenario === 'overlap') {
+    // two navigations to '/' in flight together; runs[i] = {html, putFail}: the i-th '/' fetch answers that html
+    const m = JSON.parse(mode);
+    const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
+    cacheStores.set(shellName, new Map([['/', m.shellHtml]])); cacheNames.add(shellName);
+    let nav = 0;
+    sandbox.fetch = async (req) => {
+      const p = new URL(typeof req === 'string' ? req : req.url, 'https://box.example'), key = p.pathname + p.search;
+      if (key !== '/') return new Response('LIVE ' + key, { status: 200, headers: { 'content-type': /\.css$/.test(key) ? 'text/css' : 'application/javascript' } });
+      return new Response(m.runs[nav++].html, { status: 200, headers: { 'content-type': 'text/html' } });
+    };
+    if (m.putFail) putFailKey = m.putFail;
+    const waits = [];
+    for (let i = 0; i < m.runs.length; i++) {
+      const ev = { request: { url: 'https://box.example/', method: 'GET', mode: 'navigate', destination: 'document' } };
+      let handed = null;
+      ev.respondWith = (p) => { handed = Promise.resolve(p); };
+      ev.waitUntil = (p) => { waits.push(Promise.resolve(p)); };
+      for (const fn of listeners.fetch || []) fn(ev);
+      await handed;
+    }
+    await Promise.all(waits);
     log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v')).map(([n, mm]) => [n, [...mm.entries()]]);
   }
   console.log(JSON.stringify(log));

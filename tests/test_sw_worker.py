@@ -443,3 +443,35 @@ def test_an_offline_asset_is_served_only_when_the_cached_shell_names_that_exact_
     unnamed = _fetch(url="https://box.example/old.js", mode="no-cors", destination="script", net="down", shell=True, shellHtml=SHELL_HTML,
                      cached="/old.js")
     assert unnamed.get("body") != "CACHED /old.js", unnamed
+
+
+def _whole(got: dict) -> dict:
+    return {e: b for _, es in got["shells"] for e, b in es}
+
+
+@needs_node
+def test_two_overlapping_commits_end_with_the_second_generation_whole() -> None:
+    """FIX ROUND 4 (red on b87bcce6): commit A's prune deleted the asset only commit B's '/' names."""
+    a = '<script src="/a1.js"></script>A'
+    b = '<script src="/a2.js"></script>B'
+    got = _whole(_run("overlap", json.dumps({"shellHtml": SHELL_HTML, "runs": [{"html": a}, {"html": b}]})))
+    assert got == {"/": b, "/a2.js": "LIVE /a2.js"}, got
+
+
+@needs_node
+def test_a_failing_commit_overlapping_a_successful_one_does_not_revert_it() -> None:
+    """FIX ROUND 4 (red on b87bcce6): the failing older commit's rollback restored its snapshot over the newer commit."""
+    a = '<script src="/a1.js"></script>A'
+    b = '<script src="/a2.js"></script>B'
+    got = _whole(_run("overlap", json.dumps({"shellHtml": SHELL_HTML, "putFail": "/", "runs": [{"html": a}, {"html": b}]})))
+    assert got == {"/": b, "/a2.js": "LIVE /a2.js"}, got
+
+
+@needs_node
+def test_a_restore_after_a_failed_put_keeps_every_header_of_the_cached_shell() -> None:
+    """FIX ROUND 4 (red on b87bcce6): the rollback rebuilt saved entries with only Content-Type, dropping the CSP."""
+    csp = "default-src 'self'"
+    html = '<link rel="stylesheet" href="/dashboard.css">N'
+    got = _fetch(url="https://box.example/", net="ok", shell=True, shellHtml=SHELL_HTML, shellHeaders={"content-security-policy": csp},
+                 cached="/dashboard.css", html=html, putFail="/")
+    assert _whole(got)["/"] == SHELL_HTML and got["rootCsp"] == [csp], got

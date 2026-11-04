@@ -237,7 +237,18 @@ function dropOldDatabase() {
 
 // A new worker whose install could not fetch '/' would otherwise delete the last good shell and leave nothing for an
 // outage: before the old caches go, the newest older shell's copy is carried into the current cache when that is empty.
-async function carryShellForward() {
+// Every mutation of the shell cache (commit with its snapshot/write/rollback/prune, the activation carry, the runtime
+// write-through) runs through this ONE chain, so no two ever interleave. Network fetches and validation stay outside it;
+// only cache reads of existing state and the writes run inside. A rejected task is observed by its caller and never poisons
+// the chain.
+let shellChain = Promise.resolve();
+function serial(fn) {
+  const run = shellChain.then(fn);
+  shellChain = run.then(() => {}, () => {});
+  return run;
+}
+function carryShellForward() { return serial(carryShellForwardNow); }
+async function carryShellForwardNow() {
   if (typeof caches === 'undefined') return;
   const names = await caches.keys();
   if (names.includes(SHELL_CACHE) && await (await caches.open(SHELL_CACHE)).match(SHELL_KEY)) return;
@@ -248,12 +259,12 @@ async function carryShellForward() {
     // Only the old '/' and exactly the assets it names, each held to the same gate as a fresh write. An old generation
     // that fails it (a missing or query-mismatched asset, an HTML body under a script key) carries NOTHING: the app falls
     // to the network, honest, rather than a half shell. Everything else in the old cache is dropped with it.
-    if (!shellCacheable(page.clone())) return;
+    if (!shellCacheable(page.clone())) { drain(page); return; }
     const html = await page.clone().text();
     const staged = [];
     for (const a of shellAssets(html)) {
       const hit = await from.match(a.key);
-      if (!assetOk(hit, a.kind)) return;
+      if (!assetOk(hit, a.kind)) { drain(hit); return; }
       staged.push([a.key, new Response(await hit.arrayBuffer(), { status: 200, headers: { 'content-type': hit.headers.get('content-type') } })]);
     }
     const to = await caches.open(SHELL_CACHE);
@@ -298,12 +309,16 @@ async function commitShell(resp) {
     } catch (_) { return null; }
   }));
   if (staged.some((x) => !x)) return false;
+  return serial(() => writeShell(resp, staged));
+}
+async function writeShell(resp, staged) {
   const cache = await caches.open(SHELL_CACHE);
   // the live cache is written assets first, '/' last; a put that throws midway puts back what it overwrote (and removes
   // what it added) so an old '/' is never left naming assets of another generation
   const keys = [...staged.map(([k]) => k), SHELL_KEY];
   const before = new Map();
-  for (const k of keys) { const h = await cache.match(k); before.set(k, h ? new Response(await h.arrayBuffer(), { status: 200, headers: { 'content-type': h.headers.get('content-type') || '' } }) : null); }
+  // status, statusText and EVERY header are kept (a CSP on '/' must survive a restore)
+  for (const k of keys) { const h = await cache.match(k); before.set(k, h ? new Response(await h.arrayBuffer(), { status: h.status, statusText: h.statusText, headers: new Headers(h.headers) }) : null); }
   try {
     for (const [k, r] of staged) await cache.put(k, r);
     await cache.put(SHELL_KEY, resp);
@@ -394,19 +409,24 @@ async function assetNetworkFirst(e, req, key, kind) {
     const r = await fetch(req);
     if (assetOk(r, kind)) {
       const copy = r.clone();
-      e.waitUntil((async () => {
+      e.waitUntil(serial(async () => {
         try {
-          const hit = await (await caches.open(SHELL_CACHE)).match(SHELL_KEY);
-          if (hit && shellAssets(await hit.text()).some((a) => a.key === key)) await (await caches.open(SHELL_CACHE)).put(key, copy);
+          const c = await caches.open(SHELL_CACHE);
+          const hit = await c.match(SHELL_KEY);
+          if (hit && shellAssets(await hit.text()).some((a) => a.key === key)) await c.put(key, copy);
+          else drain(copy);
         } catch (_) { /* best effort */ }
-      })());
+      }));
     }
     return r;
   } catch (err) {
     try {
-      const c = await caches.open(SHELL_CACHE);
-      const page = await c.match(SHELL_KEY);
-      const hit = page && shellAssets(await page.text()).some((a) => a.key === key) ? await c.match(key) : null;
+      // check-and-read as one critical section: a commit cannot swap '/' between the two
+      const hit = await serial(async () => {
+        const c = await caches.open(SHELL_CACHE);
+        const page = await c.match(SHELL_KEY);
+        return page && shellAssets(await page.text()).some((a) => a.key === key) ? await c.match(key) : null;
+      });
       if (hit) return hit;
     } catch (_) { /* fall through */ }
     return Response.error();
