@@ -1088,7 +1088,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help=(
             "Serve the cockpit's one Claude room (needs --write). DIR is where the room's file tools see first (an "
-            "existing directory). The room is a Claude child with hands, started when you open it from the cockpit, "
+            "existing directory). The room is a Claude child (read and search tools, no shell) started when you open it from the cockpit, "
             "kept by this server, and ended when it stops; nothing starts it before you ask. Its record lives in the "
             "consent queue's dispatch.db."
         ),

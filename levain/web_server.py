@@ -5247,7 +5247,7 @@ def run_web_server(
 
     room_serve = None
     if room is not None:
-        # the cockpit's one Claude room (RM-G2): opt-in, because the room's child has hands and reads the operator's tree
+        # the cockpit's one Claude room (RM-G2): opt-in, because the room's child reads the operator's tree
         if not write:
             print("refusing --room: the room takes writes (its lines, stop and drop), which need the write token; "
                   "pass --write", file=sys.stderr)
