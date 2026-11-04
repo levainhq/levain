@@ -10,8 +10,8 @@ listed files) for the case where no contract lists the files: the files are ever
 * Fail closed, whole. Any refusal (an unreadable path, a symlink or submodule that is not withheld, a path on the
   policy's NEVER list, a content-scan hit, a size bound) refuses the whole snapshot by name; nothing is trimmed to fit
   and no partial snapshot is left behind.
-* The CONTENT of every included blob is scanned (private-key armor, common token prefixes, ``.env``-shaped
-  assignments). A hit names the path and the rule, never the matched text. The scan is a floor, not a proof: it finds
+* The CONTENT of every included blob is scanned (private-key armor, common token prefixes, secret-named
+  assignments in ``.env``, shell, YAML, JSON and code shapes). A hit names the path and the rule, never the matched text. The scan is a floor, not a proof: it finds
   the shapes it knows. A false positive (a secret-named assignment of 12 bytes or more that holds no secret) is
   cleared only by the role withholding that path: the scan has no exemptions, and a role can only withhold.
 * The :class:`Manifest` is a plain deterministic record: HEAD, the withhold list and its digest, and every included
@@ -62,22 +62,82 @@ _RULES: tuple[tuple[str, re.Pattern[bytes]], ...] = tuple((n, re.compile(p)) for
     ("slack-token", rb"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
     ("google-api-key", rb"\bAIza[0-9A-Za-z_-]{35}\b"),
 ))
-#: The ``.env``-shaped assignment rule, in two linear steps: the NAME (one bounded character run anchored at a line
-#: start, then ``=`` or ``:``), then the VALUE: the rest of that line. Fail closed, no exemptions: a reference, a
-#: placeholder or a line of code under a secret name is a finding like any other, and the role withholds its path.
-_ASSIGN_NAME = re.compile(rb"(?m)^[ \t]*(?:export[ \t]+)?([A-Za-z0-9_]{1,256})[ \t]*[=:]")
-_SECRET_NAME = re.compile(rb"SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY")
+#: The assignment rule, one line at a time, every step linear and bounded. Only a line holding a secret word is
+#: parsed. Its first ``=`` or ``:`` is the separator. Before it, the NAME is the last run of name bytes
+#: (``[A-Za-z0-9_.-]``, at most 256), which may be quoted. Only these may come before the name: whitespace, one
+#: ``{`` / ``,`` / ``-`` marker, and up to 64 bytes of prefix words (``export``, ``ENV``, ``const``, ...). After it,
+#: the VALUE is the rest of that line. Fail closed, no exemptions: a reference, a placeholder or a line of code under
+#: a secret name is a finding like any other, and so is a value that is only a YAML block indicator or that ends in a
+#: ``\`` continuation, whose secret lies on lines this rule does not read. The role withholds the path.
+_SECRET_NAME = re.compile(rb"SECRET|TOKEN|PASSWORD|PASSWD|API[_.-]?KEY|PRIVATE[_.-]?KEY")
+_SEPARATOR = re.compile(rb"[=:]")
+_NAME_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+_NAME_MAX = 256
+_PREFIX_MAX = 64
+_PREFIX_WORDS = frozenset((b"export", b"env", b"const", b"let", b"var", b"val", b"readonly", b"local", b"declare",
+                           b"set", b"final", b"static", b"private", b"public", b"protected"))
+_BLOCK_INDICATOR = re.compile(rb"[|>][-+0-9]{0,2}")
 _ASSIGN_MIN = 12
 
 
-def _secret_value(body: bytes, start: int) -> bool:
-    """Whether the assignment value after the separator at ``body[start]`` is ``_ASSIGN_MIN`` bytes or more: the rest
-    of the line, surrounding whitespace and ONE layer of matching quotes stripped, no escapes read, nothing exempted."""
-    end = body.find(b"\n", start)
-    value = (body[start:] if end < 0 else body[start:end]).strip()
+def _assignment_name(prefix: bytes) -> bytes | None:
+    """The assigned name in ``prefix`` (a line up to its first separator), or ``None`` when it is not an assignment."""
+    p = prefix.strip()
+    if p[:1] in (b"{", b",", b"-"):
+        p = p[1:].lstrip()
+    quote = p[-1:] if p[-1:] in (b'"', b"'") else b""
+    if quote:
+        p = p[:-1]
+    i, lo = len(p), max(0, len(p) - _NAME_MAX - 1)
+    while i > lo and p[i - 1] in _NAME_BYTES:
+        i -= 1
+    name, rest = p[i:], p[:i]
+    if not name or len(name) > _NAME_MAX:
+        return None
+    if quote:
+        if rest[-1:] != quote:
+            return None
+        rest = rest[:-1]
+    if len(rest) > _PREFIX_MAX or any(w.lower() not in _PREFIX_WORDS for w in rest.split()):
+        return None
+    return name
+
+
+def _secret_value(value: bytes) -> bool:
+    """Whether an assignment value (the rest of the line after the separator) is a finding: a YAML block indicator
+    alone (a trailing ``#`` comment allowed) or a trailing ``\\`` continuation, else ``_ASSIGN_MIN`` bytes or more
+    once surrounding whitespace and ONE layer of matching quotes are stripped. No escapes read, nothing exempted."""
+    value = value.strip()
+    if value.endswith(b"\\"):
+        return True
+    head = value.split(None, 1)
+    if head and _BLOCK_INDICATOR.fullmatch(head[0]) is not None and (len(head) == 1 or head[1][:1] == b"#"):
+        return True
     if len(value) >= 2 and value[:1] in (b'"', b"'") and value[-1:] == value[:1]:
         value = value[1:-1]
     return len(value) >= _ASSIGN_MIN
+
+
+def _secret_assignment(body: bytes) -> bool:
+    """Whether any line of ``body`` assigns a value that is a finding to a secret-named name. Each line holding a
+    secret word is parsed once, so the scan stays linear in ``len(body)``."""
+    upper = body.upper()
+    line_end = -1
+    for m in _SECRET_NAME.finditer(upper):
+        if m.start() < line_end:
+            continue
+        start = body.rfind(b"\n", 0, m.start()) + 1
+        line_end = body.find(b"\n", m.start())
+        if line_end < 0:
+            line_end = len(body)
+        sep = _SEPARATOR.search(body, start, line_end)
+        if sep is None:
+            continue
+        name = _assignment_name(body[start:sep.start()])
+        if (name is not None and _SECRET_NAME.search(name.upper()) is not None
+                and _secret_value(body[sep.end():line_end])):
+            return True
+    return False
 
 
 class SnapshotRefused(DispatchError):
@@ -94,9 +154,8 @@ def scan_blob(body: bytes) -> str | None:
     for name, rx in _RULES:
         if rx.search(body) is not None:
             return name
-    for m in _ASSIGN_NAME.finditer(body):
-        if _SECRET_NAME.search(m.group(1).upper()) is not None and _secret_value(body, m.end()):
-            return "secret-assignment"
+    if _secret_assignment(body):
+        return "secret-assignment"
     return None
 
 

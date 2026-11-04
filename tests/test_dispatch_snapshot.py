@@ -195,8 +195,52 @@ def test_secret_assignment_fails_closed_on_every_value_of_twelve_bytes_or_more(t
     "PASSWORD='elevenbytes'\n",                        # 11 bytes once one layer of quotes is stripped
     'TOKEN=""\n',
     "PASSWORD_HINT\n",                                 # no assignment at all
+    "Please enter your password to continue with the setup\n",   # prose: no separator
+    "the token is stored in the keychain and never in a file\n",
+    "Enter your password: then press return to continue\n",     # prose words before the name are not a prefix
+    "if token == 'abcdefghijklmnop':\n",               # `if` is not an assignment prefix
 ])
 def test_secret_assignment_ignores_short_values_and_non_assignments(text):
+    assert scan_blob(text.encode()) is None
+
+
+@pytest.mark.parametrize("text", [
+    # (1) JSON / quoted keys, with a leading `{`, `,` or `-` list marker
+    '  "PASSWORD": "actual-secret-123456"\n',
+    '{"password":"actual-secret-123456"}\n',
+    '  , "token": "actual-secret-123456"\n',
+    "- 'api_key': actual-secret-123456\n",
+    "  - password: actual-secret-123456\n",
+    # (2) hyphen and dot names, and common prefixes
+    "db-password: actual-secret-123456\n",
+    "api-key: actual-secret-123456\n",
+    "db.password=actual-secret-123456\n",
+    "export PASSWORD=actual-secret-123456\n",
+    "ENV PASSWORD=actual-secret-123456\n",
+    'const token = "actual-secret-123456"\n',
+    "        self.token = actual_secret_123456\n",
+    "  --password=actual-secret-123456 \\\n",
+    # (3) YAML block scalars and trailing-backslash continuations: the key alone is a finding (fail closed)
+    "password: |\n  actual-secret-123456\n",
+    "PASSWORD: |-\n  actual-secret-123456\n",
+    "token: >\n  actual\n",
+    "secret: >+\n  a\n",
+    "api_key: |2\n  a\n",
+    "api_key: |2- # trailing comment\n  a\n",
+    "PASSWORD=abc\\\ndefghijklmnopq\n",
+    'TOKEN: "ab\\\n  cdefghijklmnop"\n',
+])
+def test_secret_assignment_recognises_quoted_hyphenated_prefixed_and_block_forms(text):
+    assert scan_blob(text.encode()) == "secret-assignment"
+
+
+@pytest.mark.parametrize("text", [
+    '{"password": "short"}\n',                         # 8 bytes with the brace: still under the minimum
+    "db-password: short\n",
+    "token: >x\n",                                     # not a block indicator, and under 12 bytes
+    "export PASSWORD=\n",
+])
+def test_recognised_forms_still_ignore_short_values(text):
     assert scan_blob(text.encode()) is None
 
 
