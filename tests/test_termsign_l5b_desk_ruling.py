@@ -325,6 +325,7 @@ def test_a_desk_click_on_the_linked_pick_signs_the_ruling_applies_it_then_record
     assert entry.kind == "authority" and json.loads(entry.ruling)["request_id"] == world["request"].id
     assert notes                                                           # the Touch ID notice was posted first
     assert band_view.answer_badge(world["store"], world["q"].id, key_dir=world["keydir"],
+                                  origins=("http://localhost:8765",),
                                   ctk=lambda pk: (None, "test")) == "signed: Touch ID, laptop (desk)"
     taken = world["queue"].take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"},
                                             cwd="/work/proj")
