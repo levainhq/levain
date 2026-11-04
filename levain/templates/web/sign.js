@@ -496,6 +496,7 @@
       reasonBox = el("input", "sheet-write-in");
       reasonBox.type = "text";
       reasonBox.id = "sheet-reason";
+      reasonBox.setAttribute("name", "sheetreason");        // dash-free, like the Drop box (Safari AutoFill Contact, 11-04)
       reasonBox.maxLength = Number(r.reason.max) || 256;
       reasonBox.placeholder = "reason for cancelling (optional)";
       controls.push(reasonBox);

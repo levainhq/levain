@@ -60,3 +60,27 @@ def test_the_other_dashed_text_fields_of_the_drop_flow_have_dash_free_names():
     assert 'repo.setAttribute("name", "droprepo")' in ef[ef.index('repo.id = "drop-repo"'):][:400]
     sj = (WEB / "sign.js").read_text()
     assert 'box.setAttribute("name", "writein")' in sj[sj.index('box.id = "sheet-write-in"'):][:400]
+
+
+def test_the_phone_and_shared_envelope_forms_both_name_their_repo_and_branch_boxes():
+    """L3 r1 (codex + complement): the sweep covered one of each pair. The phone page carries its own repo and branch inputs, the
+    shared envelope form builds the same two, and the signing sheet's cancellation reason is a free-text field too."""
+    phone = (WEB / "phone.html").read_text()
+    assert 'name="droprepo"' in re.search(r'<input[^>]*id="drop-repo"[^>]*>', phone, re.S).group(0)
+    assert 'name="droponto"' in re.search(r'<input[^>]*id="drop-onto"[^>]*>', phone, re.S).group(0)
+    ef = (WEB / "envelope_form.js").read_text()
+    assert 'onto.setAttribute("name", "droponto")' in ef[ef.index('onto.id = "drop-onto"'):][:300]
+    sj = (WEB / "sign.js").read_text()
+    assert 'reasonBox.setAttribute("name", "sheetreason")' in sj[sj.index('reasonBox.id = "sheet-reason"'):][:300]
+
+
+def test_no_drop_box_sits_in_a_form_that_a_name_could_submit():
+    """L3 r1 (deepseek MED, refuted by grep): a named control inside a submitting <form> would send its words; none of the Drop
+    boxes is in one (the web templates read them by id and never use FormData, getElementsByName or form.elements)."""
+    assert "<form" not in (WEB / "phone.html").read_text()
+    for fname in ("dashboard_core.js", "envelope_form.js", "sign.js"):
+        src = (WEB / fname).read_text()
+        assert 'el("form"' not in src and 'createElement("form")' not in src, fname
+    for fname in sorted(p.name for p in WEB.glob("*.js")):
+        src = (WEB / fname).read_text()
+        assert "FormData" not in src and "getElementsByName" not in src, fname

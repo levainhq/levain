@@ -238,6 +238,7 @@
     let landSel = "none";
     const onto = el("input");           // a bare branch name, for "Land onto another branch…"
     onto.id = "drop-onto";
+    onto.setAttribute("name", "droponto");        // dash-free, like the Drop box (Safari AutoFill Contact, 11-04)
     onto.type = "text";
     onto.placeholder = "branch name, e.g. release";
     onto.setAttribute("aria-label", "the branch to land onto");
