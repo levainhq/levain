@@ -49,6 +49,7 @@ def test_passes_only_the_askpass_names_through(monkeypatch, tmp_path):
     monkeypatch.setenv("SSH_ASKPASS", "/x/askpass.sh")
     monkeypatch.setenv("SSH_ASKPASS_REQUIRE", "force")
     monkeypatch.setenv("SOME_OTHER_SECRETISH", "nope")
+    monkeypatch.delenv("LEVAIN_HOME", raising=False)
     seen = {}
 
     def fake_main(argv):
@@ -64,3 +65,22 @@ def test_passes_only_the_askpass_names_through(monkeypatch, tmp_path):
     assert seen["env"]["SSH_ASKPASS"] == "/x/askpass.sh"
     assert seen["env"]["SSH_ASKPASS_REQUIRE"] == "force"
     assert "SOME_OTHER_SECRETISH" not in seen["env"]
+
+
+def test_refuses_what_is_not_confined_to_scratch(monkeypatch, tmp_path, capsys):
+    mod = _load()
+    monkeypatch.setattr(mod, "_real_home", lambda: str(tmp_path / "realhome"))
+    scratch = tmp_path / "scratch" / "home"
+    scratch.mkdir(parents=True)
+    monkeypatch.setattr(mod.tempfile, "gettempdir", lambda: str(tmp_path / "scratch"))
+    monkeypatch.setenv("HOME", str(scratch))
+    monkeypatch.delenv("LEVAIN_HOME", raising=False)
+    assert mod._refusal(["cockpit", "keys"]) is None
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "realhome" / ".levain"))      # points outside the scratch HOME
+    assert "LEVAIN_HOME" in mod._refusal(["cockpit", "keys"])
+    monkeypatch.delenv("LEVAIN_HOME")
+    assert "real home" in mod._refusal(["--signing-key", str(tmp_path / "realhome" / ".ssh" / "id_x")])
+    monkeypatch.setenv("HOME", "/")                                                    # not under the temp dir
+    assert mod._refusal([]) is not None
+    monkeypatch.setenv("HOME", str(tmp_path / "scratch"))                              # the temp dir itself
+    assert mod._refusal([]) is not None

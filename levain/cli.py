@@ -4302,7 +4302,7 @@ def _keep_prompt(fp: str, what: str, plan: object, signer_fp: str, signer_pub: s
     (a legacy row's custody is 'unstated'; the store holds no comment, only the fingerprint), then the ask."""
     key_type, custody = "?", "unstated"
     if fp == signer_fp:
-        key_type, custody = signer_pub.split()[0], signer_custody
+        key_type, custody = (signer_pub.split() or ["?"])[0], signer_custody
     else:
         for r in plan.rows:                                     # type: ignore[attr-defined]
             if r.fingerprint == fp:
