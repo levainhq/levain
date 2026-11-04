@@ -61,10 +61,16 @@ class TripwireContext(NamedTuple):
     ``T``. ``gate_allowed(tool_use_id, tool_input)`` is exemption 1's record: True only when ``queue.db`` holds Levain's
     gate request for this launch's session and that call, allowed by a verified answer (the launcher binds the agent,
     the session and the posture; D:5881's query). Anything but ``True`` from it, an exception included, is no
-    exemption."""
+    exemption.
+
+    ``rule_allow`` is the room's (tool, source) pairs, empty for a worker. A tool named in it is one whose allow list is
+    the launch's own argv: its ``accept`` decisions of reason ``rule`` from a listed source are expected (no
+    ``unexpected_rule``), and no PreToolUse count is owed for it (the stream carries no PreToolUse event, so a count
+    could never be met). Every other decision for it, and every other tool, is judged as a worker's is."""
     cwd: str
     expected_pre_hooks: Callable[[str], int]
     gate_allowed: Callable[[str, Any], bool]
+    rule_allow: frozenset = frozenset()
 
 
 class Trip(NamedTuple):
@@ -263,7 +269,8 @@ class TripwireWindow:
         if not isinstance(tool, str) or not tool:
             return Trip("deficit", "a tool_result whose tool cannot be named: its PreToolUse hooks cannot be counted")
         self.results[tool] = self.results.get(tool, 0) + 1
-        trip = self._deficit(tool)
+        ruled = self.ctx is not None and any(t == tool for t, _s in self.ctx.rule_allow)
+        trip = None if ruled else self._deficit(tool)
         if trip is not None:
             return trip
         d = e.decision_source
@@ -279,6 +286,8 @@ class TripwireWindow:
         if decision != "accept":
             return Trip("accepted_without_host", f"a {tool[:60]} tool_result with decision {str(decision)[:40]!r}")
         if reason == "rule":
+            if self.ctx is not None and isinstance(source, str) and (tool, source) in self.ctx.rule_allow:
+                return None                               # the room's own allow list answered, as its argv says
             return Trip("unexpected_rule", f"an allow rule from source {str(source)[:40]!r} answered a {tool[:60]} "
                                            "call; Levain rendered no allow rule")
         if host:
