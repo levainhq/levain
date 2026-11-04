@@ -111,7 +111,9 @@ def plain_preview(markdown: str, limit: int = PREVIEW_MAX) -> str:
 # rows are live only for a request this queue holds, in flow's namespace, naming this item, open and unexpired
 # (``sign_state``). The request file's options and Rec win over the ping's copy, and its asked and stopped lines fill in
 # what a flat body cut short or lacks.
-NEEDS_NAMESPACE = "flow-needs-phill"
+# flow's store name, compared with a request file's namespace: levain never signs in it, so it is not a levain SSHSIG
+# namespace (levain/contracts/namespaces.py registers only those; the *NAMESPACE* name is what the AST test reads).
+FLOW_NEEDS_STORE = "flow-needs-phill"
 _WIRE_HEAD = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]{0,79}): (\S.*)")
 _WIRE_SIGN = re.compile(r".*\(Face ID\): (\S+)")
 # the one sign link flow sends (its needs_phill_sign.deep_link): <origin>/sign/<id>#sign=<id>&v=<16 hex>, a pick adding
@@ -179,7 +181,7 @@ def _request(queue_dir: Path | None, request_id: str, item: str | None) -> tuple
         req = sign.read_request(Path(queue_dir), request_id)
         if req.refused is not None:
             return "unknown", None
-        if req.namespace != NEEDS_NAMESPACE:
+        if req.namespace != FLOW_NEEDS_STORE:
             return "unverified", None
         named = _signed_fields(req.message).get("item")
         if item is not None and named != item:
