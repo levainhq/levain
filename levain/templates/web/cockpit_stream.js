@@ -23,6 +23,7 @@
   var FAULT_RETRY_MS = [5000, 15000, 60000];
   var PENDING_RETRY_MS = [5000, 15000, 60000];   // the last step repeats while a reload is still pending
   var RELOAD_GAP_MS = 10000;
+  var HELLO_MS = 8000;               // a connection that has not said hello by now is dead: the chip says stale, the retry runs
   var DRAW_WAIT_MS = 30000;          // how long the stream waits for a first draw before saying it is not live
 
   var T = null, V = null;
@@ -150,9 +151,9 @@
     }
   }
 
-  function arm() {
+  function arm(ms) {
     root.clearTimeout(watchdog);
-    watchdog = root.setTimeout(function () { if (abort) abort.abort(); }, HEARTBEAT_MS * 2 + 2000);
+    watchdog = root.setTimeout(function () { if (abort) abort.abort(); }, ms || HEARTBEAT_MS * 2 + 2000);
   }
 
   function drop() {
@@ -173,7 +174,7 @@
     ensureChip();
     var ctl = new AbortController();
     abort = ctl;
-    arm();
+    arm(HELLO_MS);
     var headers = readHeaders();
     withPosition = !!lastId;
     if (lastId) headers["Last-Event-ID"] = lastId;
@@ -247,6 +248,18 @@
     if (gaveUp) { if (root.LevainCockpitHeld) { gaveUp = false; connect(); } else whenDrawn(Date.now() + DRAW_WAIT_MS); return; }
     connect();
   }
+
+  // the app came back to the front (pwa_resume.js) without the page having been hidden first (a frozen page, a restored one):
+  // a stream that is not live is dead or stuck, so it is replaced now rather than at its watchdog
+  document.addEventListener("levain:resume", function () {
+    if (!started || paused || document.hidden) return;
+    paintChip();
+    if (epoch && !staleSince) return;     // live: the heartbeat watchdog still owns it
+    root.clearTimeout(retryTimer);
+    if (abort) { var a = abort; abort = null; a.abort(); }
+    attempt = 0;
+    connect();
+  });
 
   // the first hello is compared with what the board was drawn from, so it waits for the first draw
   function whenDrawn(deadline) {

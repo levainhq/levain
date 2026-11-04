@@ -3369,3 +3369,9 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
   .nc-dtitle { font-size: 22px; overflow-wrap: anywhere; }
   .nc-foot .nc-btn { min-height: var(--hit-min); }
 }
+
+/* the update bar (pwa_update.js): a new app version is waiting; never silent, never over the home indicator */
+.pwa-update-bar { position: fixed; left: var(--sp-5); right: var(--sp-5); bottom: calc(var(--sp-5) + env(safe-area-inset-bottom, 0px)); z-index: 60;
+  min-height: var(--hit-min); padding: var(--sp-3) var(--sp-5); border: 1px solid var(--accent-line); border-radius: var(--r-lg);
+  background: var(--accent-soft); color: var(--text); font: var(--fw-semibold) var(--fs-lead)/var(--lh-tight) var(--sans);
+  text-align: center; box-shadow: var(--shadow-overlay); cursor: pointer; }

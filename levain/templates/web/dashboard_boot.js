@@ -20,6 +20,11 @@
   }
 
   let inflight = false;
+  // A foreground (pwa_resume.js) after a long freeze: iOS kills the sockets of a frozen page, so a read that was in flight may
+  // never settle, and `inflight` would then drop every later read. A read older than STUCK_MS is superseded: its generation is
+  // dead, its late result is discarded, and the next read starts.
+  let loadGen = 0, inflightAt = 0;
+  const STUCK_MS = 8000;
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
   // lands while a load is in flight, the shared `inflight` guard would drop it; latch it
   // here and re-fire when the current load settles, so a save's reload can't be swallowed by
@@ -879,11 +884,14 @@
     // Pre-fetch fast path: don't even fetch if we already know an edit is open.
     if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
     inflight = true;
+    inflightAt = Date.now();
+    const myGen = ++loadGen;
     let landed = false;
     if (btn) btn.disabled = true;
     try {
       if (useManifest) {
         const mview = await loadManifestView(passive);
+        if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
         window.LevainDashboard.render(mview, mview.writable
@@ -945,6 +953,7 @@
       status("read failed: " + (e && e.message ? e.message : e));
       return false;
     } finally {
+     if (myGen === loadGen) {
       inflight = false;
       if (btn) btn.disabled = false;
       // Run a reload that arrived (authoritative, non-passive) while we were in flight.
@@ -953,8 +962,17 @@
       // a passive read dropped because THIS load was in flight is still owed: flush once this one has rendered
       // (never after a failed read, which would loop on a dead server)
       else if (landed) flushIfIdle();
+     }
     }
   }
+
+  // The app came back to the front (pwa_resume.js): repaint from a fresh read now. The page keeps showing its last state meanwhile.
+  document.addEventListener("levain:resume", function (ev) {
+    // a read that began before the page went to the background crossed the freeze: its socket is not to be trusted
+    const away = ev && ev.detail && ev.detail.hiddenAt;
+    if (inflight && ((away && inflightAt <= away) || Date.now() - inflightAt > STUCK_MS)) { loadGen++; inflight = false; }
+    load({ passive: true }).finally(function () { if (storeEl && !inflight) storeEl.removeAttribute("data-cold"); });
+  });
 
   // The refresh button + visibilitychange are PASSIVE re-reads → load({passive:true}),
   // which defers (and reports) while an edit is open. The substrate only changes on a
