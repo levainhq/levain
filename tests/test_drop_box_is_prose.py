@@ -28,3 +28,11 @@ def test_cockpit_drop_textarea_is_prose():
 def test_code_and_repo_boxes_keep_their_attributes():
     assert 'autocapitalize="off" autocorrect="off"' in (WEB / "phone.html").read_text()
     assert 'input.autocomplete = "one-time-code"' in (WEB / "dashboard_boot.js").read_text()
+
+
+def test_envelope_sheet_drop_textarea_is_prose():
+    js = (WEB / "sign.js").read_text()
+    i = js.index('words.id = "drop-words"')
+    block = js[i:i + 900]
+    for k, v in PROSE.items():
+        assert f'["{k}", "{v}"]' in block, k
