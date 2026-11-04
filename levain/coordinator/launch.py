@@ -957,15 +957,24 @@ def launch_session(store: CoordStore, launch_id: str) -> Outcome:
     """:func:`_launch_session`, then the band is told when the launch that did not start made the coordinator
     ``stopped``. Each band import probe runs once for the launch (:func:`levain.doctor.band_probe_once`)."""
     from levain import doctor
+    from levain.coordinator import launch_slots
 
-    with doctor.band_probe_once():
-        out = _launch_session(store, launch_id)
+    holds: list[Any] = []
+    started = False
+    try:
+        with doctor.band_probe_once():
+            out = _launch_session(store, launch_id, holds)
+        started = out.started
+    finally:
+        if not started:                      # a launch that did not start keeps no slot it took (P6-3b)
+            for hold in holds:
+                launch_slots.release(hold)
     if not out.started:
         _note_stopped(store)
     return out
 
 
-def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
+def _launch_session(store: CoordStore, launch_id: str, holds: list[Any] | None = None) -> Outcome:
     """Start launch ``launch_id``'s session (see the module docstring for the steps). Every way it does not start is
     an :class:`Outcome` with ``started`` False and the refusal; the launch is written ``failed`` with that cause
     whenever this call held the spawn. The checks that need no spawn (its directory, the hook, the briefs directory)
@@ -1026,6 +1035,18 @@ def _launch_session(store: CoordStore, launch_id: str) -> Outcome:
     held = _handover_blocked(store, exe_, env_)
     if held:
         return left(f"{held}; retried when it is gone")
+    # the slot (P6-3b): taken before the spawn claim, so a full cap leaves the launch pending like every other refusal
+    # here; whoever does not start the launch releases it (launch_session), and the watcher's sweep renews or releases it
+    from levain.coordinator import launch_slots
+
+    try:
+        hold = launch_slots.take(store, launch_id)
+    except launch_slots.SlotFull as exc:
+        return left(f"{exc}; retried when one is free")
+    except launch_slots.SlotFault as exc:
+        return left(str(exc))
+    if hold is not None and holds is not None:
+        holds.append(hold)
     got, why = store.launch_claim_spawn(launch_id, os.getpid())
     if why is not None:
         return Outcome(launch_id, False, refusal=why)
@@ -1246,6 +1267,8 @@ def watch_once(store: CoordStore) -> list[str]:
       (f) every held question ping now due is sent (C5-1, :func:`levain.consent.band.release_held_pings`), on EVERY
           pass, whatever ended (a)-(e) early (no ``claude`` on PATH, an unreadable list, a fault): an install
           with no ``claude`` on PATH may have this pass as its only checker (L3 r3).
+      (g) the launch slots (P6-3b, :func:`levain.coordinator.launch_slots.sweep`): the slot of every launch that is over
+          is released and the lease of every other is renewed, on every pass, after (f).
 
     Any other row in the list is never read further. When the list cannot be read, (b)-(d) do nothing: an unread list
     is no evidence of anything. A list read with no row is a listing like any other (L3 r1 G2): an active launch
@@ -1265,7 +1288,15 @@ def watch_once(store: CoordStore) -> list[str]:
         finally:
             _note_stopped(store)                                   # never raises
             lines.extend(release_held_pings(store.directory))      # never raises
+            lines.extend(_sweep_slots(store))                      # never raises
     return lines
+
+
+def _sweep_slots(store: CoordStore) -> list[str]:
+    """The launch slots' renewal and release (:func:`levain.coordinator.launch_slots.sweep`), on every pass."""
+    from levain.coordinator import launch_slots
+
+    return launch_slots.sweep(store)
 
 
 # one in-process lock per store directory, beside the file lock: the file lock alone would leave two threads of one
