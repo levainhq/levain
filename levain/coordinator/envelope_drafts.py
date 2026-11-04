@@ -651,7 +651,8 @@ class HeadState:
     renewal repairs them all); ``live``. ``crossed`` is the gauge's crossed set as read; ``ref`` the budget SIGN
     record's ref_id (``<thread>/<head>``), ``reply_id`` that record once the coordinator has filed it; ``detail`` why a
     budget cannot be metered or a key no longer holds; ``note`` is NOT_IN_FORCE beside a live head (before S1 no row is
-    authority)."""
+    authority). ``thread_id`` is the thread it was read for: one envelope may head several threads, each with its own
+    gauge, so a rule refuses a state read for another thread (L3 h12 r1 codex)."""
     kind: str
     reason: str | None
     envelope_id: str | None
@@ -662,6 +663,7 @@ class HeadState:
     detail: str | None = None
     note: str | None = None
     reply_id: str | None = None
+    thread_id: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.__dict__.items()}
@@ -785,7 +787,10 @@ def _snapshot(store: EnvelopeStore, thread_id: str, queue_dir: Any, *, view: boo
                                     (head.envelope_id, thread_id)).fetchone()[0]
             kill_at = _first_end(conn, head.envelope_id, thread_id, "kill")
             done_at = _first_end(conn, head.envelope_id, thread_id, "thread_done")
-            gauge = budget.gauge(conn, queue_dir, thread_id)
+            if kill_at is None and done_at is None:
+                # a killed or ended head is never metered (_classify returns before the gauge), so a gauge that raises
+                # cannot fault its card; a key-revoked head is still metered, since the verifier runs after this read
+                gauge = budget.gauge(conn, queue_dir, thread_id)
             if thread.rev != bind_rev:
                 a, r = store.members_diff(conn, thread_id, bind_rev, thread.rev)
                 added, removed = _with_words(conn, a), _with_words(conn, r)
@@ -810,16 +815,16 @@ def _key_refusal(store: EnvelopeStore, s: _Snap, authority: AuthoritySnapshot) -
 
 def _classify(store: EnvelopeStore, s: _Snap, key_refused: str | None) -> HeadState:
     """First match wins (design r3 §5.1): none, killed, key, ended, then every lapse reason present, else live."""
-    h = s.head
+    h, tid = s.head, s.thread.thread_id
     if h is None:
-        return HeadState("none", None, None, None, None)
+        return HeadState("none", None, None, None, None, thread_id=tid)
     eid = h.envelope_id
     if s.kill_at is not None:
-        return HeadState("revoked", "killed", eid, s.kill_at, None)
+        return HeadState("revoked", "killed", eid, s.kill_at, None, thread_id=tid)
     if key_refused is not None:
-        return HeadState("revoked", "key", eid, None, None, detail=key_refused)
+        return HeadState("revoked", "key", eid, None, None, detail=key_refused, thread_id=tid)
     if s.done_at is not None:
-        return HeadState("ended", "thread_done", eid, s.done_at, None)
+        return HeadState("ended", "thread_done", eid, s.done_at, None, thread_id=tid)
     lapses: list[str] = []
     since = None
     if s.thread.rev != s.bind_rev:
@@ -835,10 +840,24 @@ def _classify(store: EnvelopeStore, s: _Snap, key_refused: str | None) -> HeadSt
     if g is not None and g.unreadable is not None:
         lapses.append("budget_unreadable")
     if lapses:
-        ref = f"{s.thread.thread_id}/{eid}" if "budget" in lapses else None
+        ref = f"{tid}/{eid}" if "budget" in lapses else None
         return HeadState("lapsed", lapses[0], eid, since, ref, tuple(lapses), crossed,
-                         None if g is None else g.unreadable, None, s.reply_id if ref else None)
-    return HeadState("live", None, eid, None, None, note=NOT_IN_FORCE)
+                         None if g is None else g.unreadable, None, s.reply_id if ref else None, tid)
+    return HeadState("live", None, eid, None, None, note=NOT_IN_FORCE, thread_id=tid)
+
+
+def _renew_refusal(hs: HeadState) -> str | None:
+    """Why ``renew/1`` may not repair this head, or None; the LAPSED card offers ``extend`` exactly when this is None,
+    so the card and the rule hold one rule. A revoked or ended head has no extend (a kill is never undone); a budget
+    that cannot be metered, wherever it sits among the lapses, has none either: a successor copies a budget that still
+    cannot be metered and lapses at once (L3 h12 r1: codex, deepseek, complement)."""
+    if hs.kind not in ("lapsed", "live"):
+        return (f"its head is {hs.kind}{'' if hs.reason is None else ' (' + hs.reason + ')'}: there is no extend "
+                "there; sign a replacement")
+    if "budget_unreadable" in hs.lapses:
+        return (f"its budget cannot be metered ({hs.detail}): there is no extend until the meter reads; close it, or "
+                "read its state again once it does")
+    return None
 
 
 def head_state(store: EnvelopeStore, thread_id: str, *, authority: AuthoritySnapshot, queue_dir: Any) -> HeadState:
@@ -908,7 +927,7 @@ def _envelope_card(store: EnvelopeStore, s: _Snap, hs: HeadState) -> Card:
 def cards(store: EnvelopeStore, thread_id: str, *, authority: AuthoritySnapshot, queue_dir: Any) -> list[Card]:
     """The card a thread shows now (none, or one): ENVELOPE while a draft is open; else REVOKED (killed, key, or a
     reopened thread whose head ended: ``replace`` and ``close``, NEVER ``extend``); else LAPSED (``extend`` and
-    ``close``; a budget that cannot be metered offers only ``close``). A done or closed thread shows none: its work
+    ``close``; a budget that cannot be metered, beside any other lapse, offers only ``close``). A done or closed thread shows none: its work
     facet is review. Reading creates nothing, and files no SIGN record (the budget lapse IS the existing one)."""
     s = _snapshot(store, thread_id, queue_dir, view=True)
     hs = _classify(store, s, _key_refusal(store, s, authority))
@@ -923,7 +942,7 @@ def cards(store: EnvelopeStore, thread_id: str, *, authority: AuthoritySnapshot,
                                   "reply_id": hs.reply_id, "crossed": list(hs.crossed)}
         if "thread_changed" in hs.lapses:
             detail["members_added"], detail["members_removed"] = s.members[0], s.members[1]
-        if hs.reason == "budget_unreadable":
+        if _renew_refusal(hs) is not None:     # an unmeterable budget, beside any other lapse: close only
             return [Card("LAPSED", f"the budget cannot be metered ({hs.detail})", ("close",), hs, detail)]
         return [Card("LAPSED", _LAPSE_LINES[hs.reason or ""], ("extend", "close"), hs, detail)]
     return []
@@ -945,8 +964,12 @@ def _rule_locked(store: EnvelopeStore, thread_id: str, derive: Any, *, by: str, 
 
 
 def _head_under_lock(store: EnvelopeStore, conn: sqlite3.Connection, thread_id: str, hs: HeadState) -> Any:
-    """The head the pre-read state described, re-read under the lock; :class:`DraftStale` when the thread's head is
-    another envelope now (the state was read before the lock and is not trusted past it)."""
+    """The head the pre-read state described, re-read under the lock; :class:`DraftStale` when the state was read for
+    another thread (one envelope may head several, each with its own gauge) or the thread's head is another envelope
+    now (the state was read before the lock and is not trusted past it)."""
+    if hs.thread_id != thread_id:
+        raise DraftStale(f"this state was read for another thread ({hs.thread_id}), not {thread_id}; read "
+                         f"{thread_id}'s state")
     head = store._head(conn, thread_id)
     if head is None or hs.envelope_id is None or head.envelope_id != hs.envelope_id:
         raise DraftStale(f"thread {thread_id}'s head is not the envelope this state was read for; read it again")
@@ -970,12 +993,12 @@ def renew_rule(store: EnvelopeStore, thread_id: str, hs: HeadState, *, by: str, 
     ``where``, effects and ``budget`` from the head's EFFECTIVE envelope (a narrowing counts), ``stop_at`` = now plus the
     SIGNED length, and every key in ``hs.crossed`` left unset (the crossed-budget default: he picks the number). It
     repairs every lapse present, not only the first. Refused on a head that is revoked or ended: a kill is never
-    undone, so there is no extend there (``replace/1`` is the way). ``hs`` is the state read BEFORE the lock; under the
-    lock the head must still be that envelope and still not killed or ended."""
-    if hs.kind not in ("lapsed", "live"):
-        raise CoordError(f"thread {thread_id}'s head is {hs.kind}"
-                         f"{'' if hs.reason is None else ' (' + hs.reason + ')'}: there is no extend there; sign a "
-                         "replacement")
+    undone, so there is no extend there (``replace/1`` is the way); refused too while the budget cannot be metered
+    (:func:`_renew_refusal`, the rule the LAPSED card holds). ``hs`` is the state read BEFORE the lock, for this
+    thread; under the lock the head must still be that envelope and still not killed or ended."""
+    refused = _renew_refusal(hs)
+    if refused is not None:
+        raise CoordError(f"thread {thread_id}: {refused}")
 
     def derive(conn: sqlite3.Connection, now: str) -> tuple[dict[str, Any], list[dict[str, str]], timedelta]:
         head = _head_under_lock(store, conn, thread_id, hs)
