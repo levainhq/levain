@@ -99,7 +99,7 @@ def test_the_decisions_panel_shows_the_band_by_number_and_a_tap_on_an_option_ans
     assert len(_views(store, "cockpit:browser")) >= 1                 # the Decisions panel being shown recorded this credential's view
 
 
-def test_neither_the_cockpit_nor_the_phone_app_ships_a_band_answer_box() -> None:
+def test_the_cockpit_ships_no_band_answer_box() -> None:
     # Phill 11-01 ("1a" twice): a decision is answered on its own card; freeform words go through the Drop
     from levain.web_server import load_web_asset
 
