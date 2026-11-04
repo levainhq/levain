@@ -117,6 +117,8 @@ from levain.cockpit.routes import EVENTS_PATH, is_cockpit_path
 from levain.cockpit import stream as cockpit_stream
 from levain.cockpit import board as cockpit_board
 from levain.cockpit import threads as cockpit_threads
+from levain.coordinator import chat_lease
+from levain.coordinator.store import CoordError
 from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb,
                                   record_served_verbs, retier)
 
@@ -134,6 +136,7 @@ from levain.writes import (
 )
 
 if TYPE_CHECKING:
+    from levain.coordinator.chat import ChatService
     from levain.consent.grant_phone import GrantPhone
     from levain.consent.sign import Signer
 
@@ -1664,6 +1667,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     consent_sheet: "ConsentSheet | None" = None
     # whether the cockpit draws levain's own Work board when no provider brings one (make_server's work_board)
     work_board: bool = True
+    # the ChatService the thread view's write routes act through (CH-U1b); None serves none of them
+    thread_chat: "ChatService | None" = None
     # the dispatch family's sign, cancel and authorise (OS-2), built by make_server beside the Signer; None serves no
     # dispatch signing route
     dispatch_sheet: "DispatchSheet | None" = None
@@ -3262,6 +3267,43 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
+    def _thread_owner(self) -> str:
+        """The authenticated client a thread composer acts as: ``cockpit:<surface token name>``, or ``phone:<device id>``
+        for a paired device (the credential's name, verified in ``_credential``, never anything a client claims). A
+        request with no full credential reads as the view's own read-only owner."""
+        cred = self._credential(required=False)
+        name = cred.get("name") if cred.get("class") == "token" else None
+        if not isinstance(name, str):
+            return cockpit_threads.VIEW_OWNER
+        owner = ("phone:" + name[len(PAIRED_PREFIX):]) if name.startswith(PAIRED_PREFIX) else "cockpit:" + name
+        try:
+            chat_lease.check_owner(owner)
+        except CoordError:
+            return cockpit_threads.VIEW_OWNER
+        return owner
+
+    def _thread_post(self, thread_id: str, action: str, req: Any) -> tuple[dict[str, Any], int]:
+        """``POST /cockpit/thread/<th-id>/{send,stop,mark}`` (CH-U1b): the operator's line to a running worker and the stop of
+        its turn, reached only past ``do_POST``'s write gate (a surface token on every bind). The dispatch store is
+        the consent directory's, as the thread reads resolve it."""
+        reader = self.server.consent_reader
+        if not hasattr(reader, "directory"):
+            return {"error": "not_found", "message": "no such thread recorded"}, 404
+        from levain.consent.queue import default_queue_dir
+
+        directory = reader.directory if reader.directory is not None else default_queue_dir()
+        service = self.server.thread_chat
+        # a send, a stop and a mark alike act only for a named credential (fail closed: the view's own owner acts for no one)
+        owner = self._thread_owner()
+        if owner == cockpit_threads.VIEW_OWNER:
+            return {"error": "forbidden", "message": f"a {action} needs a named credential"}, 403
+        if action in ("send", "mark"):
+            post = cockpit_threads.post_send if action == "send" else cockpit_threads.post_mark
+            status, payload = post(service, directory, thread_id, owner, req)
+        else:
+            status, payload = cockpit_threads.post_stop(service, directory, thread_id, req)
+        return payload, status
+
     def _serve_threads(self, path: str, *, head: bool) -> None:
         """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the coordinator's threads and
         one thread's stream, read-only (:func:`levain.cockpit.threads.serve_threads`). A thread carries the operator's
@@ -3284,7 +3326,8 @@ class _Handler(GuardedHandler):
                 return
             try:
                 status, payload = cockpit_threads.serve_threads(
-                    path, "", directory=reader.directory if reader.directory is not None else default_queue_dir())
+                    path, "", directory=reader.directory if reader.directory is not None else default_queue_dir(),
+                    service=self.server.thread_chat, owner=self._thread_owner())
             finally:
                 self.server.request_gate.release()
         self._send(cockpit_threads.encode(payload), "application/json; charset=utf-8", status=status, head=head,
@@ -3999,13 +4042,15 @@ class _Handler(GuardedHandler):
         # and the desk click (TERMSIGN L5a): the same gate, served beside a question store
         desk = (route in (_DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE)
                 and getattr(self.server, "question_store", None) is not None)
+        # and the thread view's write routes (CH-U1b): the same gate; served only beside a ChatService
+        thread = cockpit_threads.post_route(route) if self.server.thread_chat is not None else None
         # and web push (OS-4): a token on every bind
         push = route in _PUSH_POST and self.server.signer is not None
         if push:
             if not self._push_gate_ok(route):
                 return self._token_403("credential_required")
         elif (sign is not None or compose or grant is not None or consent is not None or dispatch is not None
-                or coord is not None or key_line or desk) and not self._off_box_token_valid():
+                or coord is not None or key_line or desk or thread is not None) and not self._off_box_token_valid():
             return self._token_403("credential_required")
         if self._write_token_required() and not (self._push_gate_ok(route) if push else self._off_box_token_valid()):
             return self._token_403("forbidden")
@@ -4021,7 +4066,7 @@ class _Handler(GuardedHandler):
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
                 and consent is None and dispatch is None and coord is None and not push and not key_line
-                and not desk):
+                and not desk and thread is None):
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -4153,6 +4198,17 @@ class _Handler(GuardedHandler):
                 # the laptop's own Touch ID signs the click: no read-only refusal applies to it
                 try:
                     payload, status = self._desk_post(req, route)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if thread is not None:
+                # the operator's own line or stop through the ChatService: the credential is the authority, the owner is
+                # derived from it, and no read-only refusal applies (it acts through the entity's floor, as chat does)
+                try:
+                    payload, status = self._thread_post(thread[0], thread[1], req)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -4398,6 +4454,7 @@ def make_server(
     compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None,
     coordinator_verbs: bool = False,
     work_board: bool = True,
+    thread_chat: "ChatService | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -4776,6 +4833,7 @@ def make_server(
     # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
     httpd.work_board = work_board
+    httpd.thread_chat = thread_chat
     httpd.verb_registry = verb_registry
     httpd._cockpit_lock = threading.Lock()
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
