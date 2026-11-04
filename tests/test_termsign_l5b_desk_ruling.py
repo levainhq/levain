@@ -524,7 +524,7 @@ def test_answer_text_desk_for_the_route_never_writes_a_line_unsigned(world):
     assert answers(store) == [] and state_of(world) == "undecided"
 
 
-# --- L5b r1 R2: a ruling applied whose answer did not record closes from the desk ---------------------------------
+# --- L5b r2: a ruling applied whose answer did not record is a KNOWN EDGE, never closed from the desk -------------
 
 def _apply_then_fail_the_record(world, monkeypatch):
     """Click the linked pick; the queue applies the ruling, then the answer's write fails (store busy)."""
@@ -543,8 +543,13 @@ def _apply_then_fail_the_record(world, monkeypatch):
     return len(world["queue"].receipts(world["request"].id))
 
 
-def test_a_retry_after_the_ruling_applied_records_the_answer_with_a_fresh_touch_and_no_second_ruling(world,
-                                                                                                    monkeypatch):
+def test_after_ruled_not_recorded_a_desk_retry_is_refused_by_click_and_typed_line(world, monkeypatch, own_queue):
+    """The honest known edge (as the terminal path): once the queue applied the ruling and the answer failed to
+    record, the item stays open and the desk cannot close it. A click retry is refused ``desk_authority_pending``
+    before any sheet; a typed retry builds no ruling entry, so nothing on the line is signed and it records nothing
+    (the band's ``signature needed, nothing recorded`` echo, as for any linked pick whose ruling cannot be built).
+    Neither raises a sheet or writes to the queue, and the request stays allowed once. Pinned so nobody "fixes" the
+    dead end by loosening the queue's judge."""
     receipts = _apply_then_fail_the_record(world, monkeypatch)
     asked = []
 
@@ -553,80 +558,29 @@ def test_a_retry_after_the_ruling_applied_records_the_answer_with_a_fresh_touch_
         return real_desk(path, timeout)
 
     body, status = click(world, txn="txn-0000002", factory=factory)
-    assert status == 200 and body["signed"] and body["ruled"] is True, body
-    assert asked == [1]                                                    # a fresh Touch ID signature
-    assert [v for _, v in answers(world["store"])] == ["push"]
-    assert len(world["queue"].receipts(world["request"].id)) == receipts  # the queue was not written again
-    rec = band_view.answer_sign_of(world["store"], world["q"].id)
-    (entry,) = ts.parse_desk_verified(rec["message"].encode()).entries
-    assert entry.kind == "authority" and json.loads(entry.ruling)["request_id"] == world["request"].id
-    assert band_view.answer_badge(world["store"], world["q"].id, key_dir=world["keydir"], origins=(ORIGIN,),
-                                  ctk=lambda pk: (None, "test")) == "signed: Touch ID, laptop (desk)"
-
-
-def test_a_typed_retry_after_the_ruling_applied_records_the_answer(world, monkeypatch, own_queue):
-    receipts = _apply_then_fail_the_record(world, monkeypatch)
-    body, status = _route_line(world, "1a", txn="txn-typed-09")
-    assert status == 200 and body["recorded"] == ["1a"] and body["signed"] is True, body
-    assert [v for _, v in answers(world["store"])] == ["push"]
-    assert len(world["queue"].receipts(world["request"].id)) == receipts
-
-
-def test_a_request_ruled_on_its_own_is_never_reconciled_into_an_answer(world):
-    """Allowed by the same laptop key, but by a ruling signed on its own (not carried for this item): the desk
-    still refuses the linked pick and raises no sheet."""
-    from levain.consent.record import RULING_NAMESPACE
-
-    queue, request, key = world["queue"], world["request"], world["key"]
-    payload = queue.ruling_payload(request.id, "allow", key.fp)
-    queue.answer_late(request.id, payload, key.sign(ruling_message(payload), RULING_NAMESPACE))
+    assert (status, body["error"]) == (422, "desk_authority_pending"), body
+    typed, status = _route_line(world, "1a", txn="txn-typed-09", factory=factory)
+    assert status == 200 and typed["recorded"] == [] and "nothing recorded" in typed["echo"], (status, typed)
+    assert asked == []                                                     # no Touch ID sheet on either route
+    assert answers(world["store"]) == [] and world["store"].get(world["q"].id).answer is None
+    assert len(world["queue"].receipts(world["request"].id)) == receipts  # no second queue write
     assert state_of(world) == "allowed"
+
+
+def test_a_line_on_a_gone_view_under_the_default_policy_is_stale_band_not_desk_unsigned(world, own_queue):
+    """A view the store no longer holds is a stale band (the page re-reads it), never ``desk_unsigned`` (the page
+    would resend the line down the ordinary path against a view that is gone). Nothing is asked or recorded."""
+    store = world["store"]
+    b = band_view.band_payload(store, "cockpit:web")
     asked = []
 
     def factory(path, timeout=None):
         asked.append(1)
         return real_desk(path, timeout)
 
-    body, status = click(world, factory=factory)
-    assert (status, body["error"]) == (422, "desk_authority_pending") and asked == []
-    assert answers(world["store"]) == []
-
-
-def test_a_ruling_carried_for_another_question_never_closes_this_one(world, monkeypatch):
-    """Two questions link the same request; the ruling was carried (and applied) for the first. The second's linked
-    pick is not reconciled from it."""
-    store, queue, request = world["store"], world["queue"], world["request"]
-    _apply_then_fail_the_record(world, monkeypatch)
-    q2 = store.file(agent="claude_code", agent_session_id="s2", what="Push it again?", options=OPTS, rec="push",
-                    blocks="the sweep", cwd="/w",
-                    link=Link(option="push", kind="push", request_id=request.id, queue_id=queue.queue_id))
-    asked = []
-
-    def factory(path, timeout=None):
-        asked.append(1)
-        return real_desk(path, timeout)
-
-    b = {"subject": {"id": q2.id, "version": band_view.subject_version(store.get(q2.id))}, "pick": "a",
-         "client_txn": "txn-0000003"}
-    body, status = desk_click.desk_answer(desk_click.DeskRequest(True, "web", ORIGIN, b),
-                                          desk_click.LevainDeskHost(store, queue_for=lambda _q: queue),
-                                          desk_click.DeskState(), policy="authority", signer_factory=factory,
-                                          key_dir=world["keydir"], notify=lambda t: None)
-    assert (status, body["error"]) == (422, "desk_authority_pending") and asked == []
-    assert store.get(q2.id).answer is None
-
-
-def test_a_ruling_by_another_key_is_never_reconciled(world, monkeypatch):
-    receipts = _apply_then_fail_the_record(world, monkeypatch)
-    real = world["queue"].carried_ruling
-    monkeypatch.setattr(world["queue"], "carried_ruling",
-                        lambda rid, item: (real(rid, item)[0], "SHA256:" + "B" * 43))
-    asked = []
-
-    def factory(path, timeout=None):
-        asked.append(1)
-        return real_desk(path, timeout)
-
-    body, status = click(world, txn="txn-0000004", factory=factory)
-    assert (status, body["error"]) == (422, "desk_authority_pending") and asked == []
-    assert answers(world["store"]) == [] and len(world["queue"].receipts(world["request"].id)) == receipts
+    body = {"text": "1a", "store_id": b["store_id"], "view_id": b["view_id"] + 999, "client_txn": "txn-gone-01"}
+    got, status = desk_click.desk_text(desk_click.DeskRequest(True, "web", ORIGIN, body), store,
+                                       desk_click.DeskState(), policy="authority", signer_factory=factory,
+                                       key_dir=world["keydir"], notify=lambda t: None)
+    assert (status, got.get("error")) == (409, "stale_band"), (status, got)
+    assert asked == [] and answers(store) == [] and state_of(world) == "undecided"
