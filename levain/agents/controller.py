@@ -1344,9 +1344,9 @@ def fire(store: AgentStore | Path | str, occurrence_id: str, *,
     return run(store, occurrence_id, launch_epoch)
 
 
-def _unwired_run(store: AgentStore, occurrence_id: str, launch_epoch: int) -> int:
-    print(f"levain agents _fire {occurrence_id}: no run body is wired for this agent; the occurrence ends by lapse "
-          "recovery", file=sys.stderr)
+def _unwired_run(store: AgentStore, occurrence_id: str, launch_epoch: int, why: str = "no executor was resolved") -> int:
+    print(f"levain agents _fire {occurrence_id}: no run body is wired for this agent ({why}); the occurrence ends by "
+          "lapse recovery", file=sys.stderr)
     return FIRE_UNWIRED
 
 
@@ -1359,28 +1359,68 @@ def _dream_body() -> RunBody:
     return dream_agent.dream_run
 
 
-# An agent name -> the resolver of its run body. A name absent here has no run body: its fire refuses unwired.
-RUN_BODIES: dict[str, Callable[[], RunBody]] = {DREAM: _dream_body}
+# The session executor's seam: ``factory(store, occurrence_id, epoch)`` builds :func:`levain.agents.session.run_session`'s
+# keyword arguments (``sup``, ``role``, ``values``, ``recall``, ``launcher``, ``exposure``). None until an install
+# supplies one, and a session occurrence's fire then ends unwired by name; the default launcher stays the one that
+# refuses (``session.UnwiredLauncher``), so nothing here starts a real session.
+SESSION_FACTORY: Callable[[AgentStore, str, int], Mapping[str, Any]] | None = None
 
 
-def _agent_name(store: AgentStore, agent_id: str) -> str | None:
-    with store.read() as conn:
-        row = conn.execute("SELECT name FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
-    return None if row is None else row[0]
+def _session_body() -> RunBody:
+    from levain.agents import session   # here: session imports this module
+    factory = SESSION_FACTORY
+    if factory is None:
+        return lambda store, oid, epoch: _unwired_run(store, oid, epoch, "the session executor has no factory installed")
+    return session.make_run(factory)
+
+
+# An executor (``role.EXECUTORS``) -> the resolver of its run body. An executor absent here has no run body: its fire
+# refuses unwired, naming it.
+RUN_BODIES: dict[str, Callable[[], RunBody]] = {DREAM: _dream_body, "session": _session_body}
+
+
+def _pinned_executor(store: AgentStore, occurrence_id: str) -> tuple[str | None, str | None]:
+    """``(agent name, executor)`` for an occurrence: the executor of the role its own signed spec pins. The spec text
+    is trusted only when it re-hashes to the occurrence's ``spec_hash`` in canonical form; an unreadable row, spec or
+    role has no executor (None), never a guess."""
+    from levain.agents import role as _role, spec as _spec
+    try:
+        with store.read() as conn:
+            row = conn.execute("SELECT a.name, o.agent_id, o.spec_hash, s.spec FROM agent_occurrences o"
+                               " JOIN agents a ON a.agent_id = o.agent_id"
+                               " JOIN agent_specs s ON s.spec_hash = o.spec_hash WHERE o.occurrence_id = ?",
+                               (occurrence_id,)).fetchone()
+        if row is None:
+            return None, None
+        name = row[0]
+        if not isinstance(row[3], str):
+            return name, None
+        spec = _spec.parse_spec_text(row[3])
+        if _spec.spec_hash(row[1], spec) != row[2] or _spec.canonical_spec(spec) != row[3]:
+            return name, None
+        pinned = (spec.get("role") or {}).get("role_hash")
+        role = _role.role_by_hash(store, pinned) if isinstance(pinned, str) else None
+    except Exception:  # noqa: BLE001 - an unreadable row signs nothing; the caller refuses unwired
+        return None, None
+    executor = None if role is None else role.get("executor")
+    return name, executor if isinstance(executor, str) else None
 
 
 def run_agent(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
               bodies: Mapping[str, Callable[[], RunBody]] | None = None) -> int:
-    """The fire's run body: the one registered for the occurrence's agent (:data:`RUN_BODIES`), else
-    :func:`_unwired_run`. The agent is read from the occurrence's own row, never from the fire's command line. A row
-    or agent that cannot be read has no run body."""
-    with store.read() as conn:
-        row = conn.execute("SELECT agent_id FROM agent_occurrences WHERE occurrence_id = ?",
-                           (occurrence_id,)).fetchone()
-    name = None if row is None else _agent_name(store, row[0])
-    resolve = (RUN_BODIES if bodies is None else bodies).get(name) if name is not None else None
+    """The fire's run body: the one registered for the executor of the role the occurrence's signed spec pins
+    (:data:`RUN_BODIES`), else :func:`_unwired_run` naming why. The executor is read from the occurrence's own row,
+    never from the fire's command line or the agent's name. The dream's body also needs the reserved name, so a
+    dream-executor role under any other name ends unwired."""
+    name, executor = _pinned_executor(store, occurrence_id)
+    if executor is None:
+        return _unwired_run(store, occurrence_id, launch_epoch, "its row, spec or pinned role is unreadable")
+    if executor == "dream" and name != DREAM:
+        return _unwired_run(store, occurrence_id, launch_epoch,
+                            f"the dream executor runs only the agent named {DREAM!r}, not {name!r}")
+    resolve = (RUN_BODIES if bodies is None else bodies).get(executor)
     if resolve is None:
-        return _unwired_run(store, occurrence_id, launch_epoch)
+        return _unwired_run(store, occurrence_id, launch_epoch, f"no run body for executor {executor!r}")
     return resolve()(store, occurrence_id, launch_epoch)
 
 

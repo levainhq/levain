@@ -17,13 +17,16 @@ from levain.agents import supervise
 from levain.autonomic.journal import RunJournal
 from levain.coordinator.store import CoordStore
 from levain.dream import agent as da
-from tests.test_agents_launch import ENV, Rig, _launched, rig  # noqa: F401
+from levain.agents.role import add_role, parse_role
+from tests.test_agents_launch import ENV, ROLES, SPECS, Rig, _launched, rig  # noqa: F401
 from tests.test_agents_supervise_fire import Ex  # noqa: F401
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
 
 def _rename(rig: Rig, name: str) -> None:
+    # the executor is read from the role the occurrence's spec pins, so that role (a dream executor) is in the store
+    add_role(rig.store, parse_role(ROLES[SPECS["job_push_check"]["role"]["name"]]))
     with rig.store.write() as c:
         c.execute("UPDATE agents SET name = ? WHERE agent_id = ?", (name, rig.agent))
 
@@ -59,7 +62,7 @@ def test_an_agent_with_no_run_body_still_refuses_unwired(tmp_path):
 
 
 def test_the_dream_occurrence_reaches_its_executor_once_and_ends_done(rig, tmp_path, monkeypatch):
-    # behaviour: run_agent resolves the dream's body by the agent's name; the body builds run_body's arguments from the
+    # behaviour: run_agent resolves the dream's body by the executor its role pins; the body builds run_body's arguments from the
     # install, runs the one consolidate under the supervisor, and the row ends done
     rig.link()
     oid = _fire_ready(rig, "dream")
@@ -79,13 +82,15 @@ def test_the_dream_occurrence_reaches_its_executor_once_and_ends_done(rig, tmp_p
     assert calls == [oid] and rig.row(oid)["state"] == "done"
 
 
-def test_run_agent_reads_the_agent_from_the_row_and_an_unknown_one_refuses_unwired(rig, capsys):
+def test_run_agent_reads_the_executor_from_the_row_and_an_unknown_one_refuses_unwired(rig, capsys):
     seen = []
     oid = rig.claim("k")
     bodies = {"someone-else": lambda: (lambda s, o, e: seen.append(o) or 0)}
     assert ctl.run_agent(rig.store, oid, 0, bodies=bodies) == ctl.FIRE_UNWIRED and seen == []
-    _rename(rig, "someone-else")
-    assert ctl.run_agent(rig.store, oid, 0, bodies=bodies) == 0 and seen == [oid]
+    add_role(rig.store, parse_role(ROLES["notify-role"]))         # a dream executor: the name is no longer consulted
+    assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": bodies["someone-else"]}) == ctl.FIRE_UNWIRED
+    _rename(rig, "dream")
+    assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": bodies["someone-else"]}) == 0 and seen == [oid]
     assert ctl.run_agent(rig.store, "oc-" + "0" * 32, 0, bodies=bodies) == ctl.FIRE_UNWIRED
     assert "no run body is wired" in capsys.readouterr().err
 

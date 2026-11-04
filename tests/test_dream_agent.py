@@ -54,7 +54,9 @@ def test_the_role_and_spec_pass_the_real_parsers_and_every_refusal_rule(astore):
     role = role_mod.parse_role(da.dream_role())
     assert role["executor"] == "dream" and role["harness"] == ""
     spec = spec_mod.parse_spec(da.dream_spec(role_mod.role_hash(role)))
-    assert refuse.check_spec(spec, role=role, default_zone=ZONE, names_held=frozenset()) == []
+    # the name "dream" is reserved: the dream's own registration passes it, an operator's registration does not
+    assert refuse.check_spec(spec, role=role, default_zone=ZONE, names_held=frozenset(), as_dream=True) == []
+    assert [r.rule for r in refuse.check_spec(spec, role=role, default_zone=ZONE, names_held=frozenset())] == ["name"]
     assert spec["stop_at"] == 3600 and spec["trigger"]["cron"] == "*/20 22-23,0-4 * * *"
     assert spec["trigger"]["window"] == {"start": "22:00", "end": "05:00"}
     assert spec["on_failure"] == {"pause_after": 2} and spec["overlap"] == "skip" and spec["missed"] == "skip"
