@@ -321,7 +321,7 @@ def test_a_start_that_raises_and_cannot_be_shown_undone_reads_the_caps_not_zero(
         ln.spawn(launch())
     assert L.SessionIndex(tmp_path / "idx").get(KEY)["state"] == "minted"
     u = ln.usage(KEY)
-    assert (u.actions, u.tunnel_bytes, u.seconds) == (7, 1000, 30)    # read from the sources, never a quiet zero
+    assert (u.actions, u.tunnel_bytes, u.seconds) == (7, None, None)    # no session recorded: bytes and seconds unreadable (the caps), never zero
     assert u != zero()
 
 
