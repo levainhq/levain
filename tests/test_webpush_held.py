@@ -435,8 +435,8 @@ def test_h5_a_flush_already_running_makes_a_second_one_stand_down(tmp_path, monk
 def test_h6_sleep_without_an_idle_reading_stands_until_a_word_or_a_typed_turn(tmp_path):
     set_word(tmp_path, "sleep", now=NOW)
     rec = intent.read(tmp_path)
-    assert intent.decide(NOW + 60, rec, None, class_name="other").push is False                     # no reading: it cannot see his input
-    assert intent.decide(NOW + 10 * 3600, rec, None, class_name="other").push is False             # ... and no bound ends it (np-a93deaf7 "2a")
+    assert intent.decide(NOW + 60, rec, None, class_name="other", desk_msg_at=None).push is False                     # no reading: it cannot see his input
+    assert intent.decide(NOW + 10 * 3600, rec, None, class_name="other", desk_msg_at=None).push is False             # ... and no bound ends it (np-a93deaf7 "2a")
     for idle in (lambda: None, lambda: 5000.0, lambda: 5.0):
         text = presence.describe(tmp_path, now=NOW + 60, idle=idle)
         assert "no input reading" not in text and "a message you type into a session" in text
