@@ -1035,6 +1035,12 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
                 if taken is not None:
                     return Decided(call, got_row[0], taken)
     hold = min(away_hold(settings, AGENT, idle, queue_dir=Path(queue.directory)), max(0.0, deadline - clock()))
+    if hold > 0 and settings.cockpit_data_root and not Path(settings.cockpit_data_root).is_dir():
+        # away mode is on by the operator's word, but the cockpit it names is not there: no answer can verify, so a
+        # hold would only stall the session. Hold nothing; Claude Code's own dialog asks (1104-8)
+        print(f"levain consent hook: not holding, cockpit_data_root {settings.cockpit_data_root} "
+              "does not exist; the native dialog stands", file=sys.stderr)
+        hold = 0.0
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER,

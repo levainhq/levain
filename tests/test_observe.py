@@ -92,3 +92,49 @@ def test_a_settings_symlink_into_the_live_dir_needs_live(tmp_path, monkeypatch):
     monkeypatch.setattr(observe, "_can_import", lambda py: True)
     assert cli.main(["observe", "install", "--settings-root", str(other)]) == 2
     assert (home / ".claude" / "settings.json").read_text() == "{}"
+
+
+# --- 1104-8: the attribution log -----------------------------------------------------------------------------
+
+def _events(d):
+    return [json.loads(x) for x in (d / observe.EVENTS_NAME).read_text().splitlines()]
+
+
+def test_event_log_attributes_and_never_holds_the_command(tmp_path):
+    ev = {**SECRET_EVENT, "tool_input": {"command": "export API_KEY=sk-LIVE-9f8e7d6c && curl -H 'Authorization: Bearer sk-LIVE-9f8e7d6c' https://x.example/p",
+                                         "file_path": "/Users/someone/private-cwd/.env"},
+          "session_id": "ac23b408-5e48-4b5c-a603-058ab01b91d7", "agent_id": "a9614e9e95ccaf22e",
+          "agent_type": "general-purpose"}
+    observe.record(tmp_path / "counts.json", ev)
+    text = (tmp_path / observe.EVENTS_NAME).read_text()
+    for leak in ("sk-LIVE", "API_KEY", "Bearer", "x.example", "private-cwd", ".env"):
+        assert leak not in text
+    (row,) = _events(tmp_path)
+    assert row["session_id"] == "ac23b408-5e48-4b5c-a603-058ab01b91d7" and row["agent_id"] == "a9614e9e95ccaf22e"
+    assert row["agent_type"] == "general-purpose" and row["permission_mode"] == "bypassPermissions"
+    assert row["tool_name"] == "Bash" and row["command"] == "export" and row["session"] == "subagent"
+    assert row["ts"].endswith("Z") and (tmp_path / observe.EVENTS_NAME).stat().st_mode & 0o777 == 0o600
+    # the counts file is unchanged in shape
+    assert set(json.loads((tmp_path / "counts.json").read_text())) == {"Bash|export|0|1|0|subagent|bypassPermissions"}
+
+
+def test_event_log_keeps_only_identifier_shaped_values_and_a_closed_tool_name(tmp_path):
+    observe.record(tmp_path / "c.json", {"tool_name": "mcp__secret-server__do", "session_id": "has space TOKEN=abc",
+                                         "agent_id": "x" * 200, "agent_type": "a/b", "permission_mode": "weird"})
+    (row,) = _events(tmp_path)
+    assert row["tool_name"] == "mcp" and row["session_id"] is None and row["agent_id"] is None
+    assert row["agent_type"] is None and row["permission_mode"] == "other"
+
+
+def test_event_log_is_bounded_by_rotation_and_refuses_a_symlink(tmp_path, monkeypatch):
+    monkeypatch.setattr(observe, "EVENTS_CAP", 600)
+    for _ in range(40):
+        observe.record(tmp_path / "c.json", SECRET_EVENT)
+    live, old = tmp_path / observe.EVENTS_NAME, tmp_path / (observe.EVENTS_NAME + ".1")
+    assert live.stat().st_size <= 600 and old.exists() and old.stat().st_size <= 600
+    live.unlink()
+    target = tmp_path / "elsewhere"
+    target.write_text("keep")
+    live.symlink_to(target)
+    observe.record(tmp_path / "c.json", SECRET_EVENT)   # counts still written, the symlink never followed
+    assert target.read_text() == "keep"

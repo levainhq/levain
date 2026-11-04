@@ -320,3 +320,30 @@ def test_a_chat_call_is_filed_with_the_chat_event_source(tmp_path):
     q = Q(None)
     ex(_event(tool_use_id="toolu_1"), q, tmp_path)
     assert "event_source" not in q.filed[0]
+
+
+# --- 1104-8: a hold whose cockpit is not there is refused, not stalled ---------------------------------------
+
+def test_missing_cockpit_root_refuses_the_hold_and_the_dialog_stands(tmp_path, capsys):
+    q = Q("allow")   # would be answered at once if a hold ran
+    out = ex(_event(), q, tmp_path, settings=replace(AWAY, cockpit_data_root=str(tmp_path / "no-such-cockpit")))
+    assert isinstance(out, cc.Abstained) and out.reason == "hold_expired" and out.held is False
+    assert q.withdrawn == [out.request.id]
+    err = capsys.readouterr().err
+    assert "not holding" in err and "no-such-cockpit" in err and err.count("\n") == 1
+
+
+def test_an_existing_cockpit_root_still_holds(tmp_path):
+    root = tmp_path / "cockpit"
+    root.mkdir()
+    out = ex(_event(), Q("allow"), tmp_path, settings=replace(AWAY, cockpit_data_root=str(root)))
+    assert isinstance(out, cc.Decided)
+
+
+def test_an_unwritable_queue_files_nothing_and_raises_to_the_native_dialog(tmp_path):
+    class Broken(Q):
+        def file(self, **kw):
+            raise OSError("queue root not writable")
+
+    with pytest.raises(OSError):   # main() turns this into "no decision": the dialog asks at once, no hold ran
+        ex(_event(), Broken("allow"), tmp_path)

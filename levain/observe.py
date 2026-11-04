@@ -3,7 +3,12 @@
 A separate, minimal, stdlib-only hook, independent of the consent hook. For one bypass day it counts what the
 harness would have asked about, by FAMILY only (tool family, command family, session kind, permission mode), into
 ``<levain home>/observe/counts-YYYY-MM-DD.json`` (UTC day). It prints nothing and exits 0 on every path, so the
-harness behaves exactly as without it. Never stored: command text, arguments, paths, URLs, tokens, cwd, session ids.
+harness behaves exactly as without it. Never stored: command text, arguments, paths, URLs, tokens, cwd.
+
+Beside the counts, a bounded append-only attribution log (``events.jsonl``, at most :data:`EVENTS_CAP` bytes, one
+rotation to ``events.jsonl.1``) answers "which event was that stop": per event a UTC time, the harness's session_id
+and agent_id/agent_type (each kept only when it is a short identifier), the permission mode, the tool name (a closed
+set; otherwise the tool class) and the same family shape the counts use. Never tool_input, in any form.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,6 +43,10 @@ FILE_READ = frozenset({"Read", "Grep", "Glob"})
 _CHAIN = re.compile(r"\|\||&&|[|;&\n]")
 _LOOP = re.compile(r"(?:^|[\s;&|(])(?:for|while|until)\s")
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+EVENTS_NAME = "events.jsonl"
+EVENTS_CAP = 256 * 1024   # the live log plus one rotated copy: at most twice this on disk
+_IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}")   # a harness identifier, never free text
+TOOL_NAMES = frozenset({"Bash", "Task", "Agent"}) | FILE_WRITE | FILE_READ
 _KEYS = ("tool", "command", "has_var", "has_pipe_or_chain", "has_loop", "session", "mode")
 
 
@@ -78,6 +88,42 @@ def family(event: Any) -> dict:
     mode = ev.get("permission_mode")
     out["mode"] = mode if isinstance(mode, str) and mode in MODES else "other"
     return out
+
+
+def _ident(value: Any) -> str | None:
+    return value if isinstance(value, str) and _IDENT.fullmatch(value) else None
+
+
+def event_row(event: Any, now: datetime | None = None) -> dict:
+    """One attribution row: identifiers and the closed-vocabulary family, never any part of ``tool_input``."""
+    ev = event if isinstance(event, dict) else {}
+    fam = family(ev)
+    name = ev.get("tool_name")
+    return {"ts": (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "session_id": _ident(ev.get("session_id")), "agent_id": _ident(ev.get("agent_id")),
+            "agent_type": _ident(ev.get("agent_type")), "permission_mode": fam["mode"],
+            "tool_name": name if isinstance(name, str) and name in TOOL_NAMES else fam["tool"],
+            **{k: v for k, v in fam.items() if k != "mode"}}   # the mode is permission_mode above
+
+
+def append_event(directory: Path, event: Any, now: datetime | None = None) -> None:
+    """Append one row to ``directory``/events.jsonl: O_NOFOLLOW, 0600, no temp file; at :data:`EVENTS_CAP` the log is
+    renamed over ``events.jsonl.1`` first. Called with the directory's lock held. A symlink or non-file is skipped."""
+    line = (json.dumps(event_row(event, now), sort_keys=True) + "\n").encode()
+    log = Path(directory) / EVENTS_NAME
+    try:
+        st = os.lstat(log)
+        if not stat.S_ISREG(st.st_mode):
+            return
+        if st.st_size + len(line) > EVENTS_CAP:
+            os.replace(log, Path(directory) / (EVENTS_NAME + ".1"))
+    except FileNotFoundError:
+        pass
+    fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
 
 
 def _key(fam: dict) -> str:
@@ -132,6 +178,10 @@ def record(path: Path, event: Any) -> None:
             except OSError:
                 pass
             raise
+        try:
+            append_event(path.parent, event)
+        except (OSError, ValueError):
+            pass   # attribution is best effort; the counts above are already written
 
 
 def load(path: Path) -> list[dict]:

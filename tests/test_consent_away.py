@@ -458,3 +458,10 @@ def test_the_recheck_reads_the_holds_own_queue_directory(qdir, tmp_path):
     elsewhere.mkdir()
     with pytest.raises(AssertionError):
         cc.still_away_from(elsewhere / cc.SETTINGS_NAME, s, queue=queue)
+
+
+def test_show_fails_plainly_when_the_configured_cockpit_root_does_not_exist(tmp_path, capsys):
+    qdir = _queue(tmp_path, tmp_path / "no-such-cockpit")
+    assert main(["consent", "away", "show", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL: the configured cockpit_data_root" in out and "does not exist" in out and "no-such-cockpit" in out

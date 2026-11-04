@@ -2681,7 +2681,13 @@ def _cmd_consent_away(args: argparse.Namespace) -> int:
                 " (Codex shows no dialog until the hold ends)"
         else:
             line = f"{agent}: away mode off"
-        line += f"; WARN: {reason}" if reason else f"; answers verify against {got.cockpit_data_root}"
+        if got.cockpit_data_root and not Path(got.cockpit_data_root).exists():
+            # a hold there queues nowhere an answer can verify: a failing status, not a warning (1104-8)
+            line += (f"; FAIL: the configured cockpit_data_root {got.cockpit_data_root} does not exist, so nothing "
+                     "can answer a held request (the hook will not hold)")
+            rc = 1
+        else:
+            line += f"; WARN: {reason}" if reason else f"; answers verify against {got.cockpit_data_root}"
         line += f"; set by {why}"
         if got.away_marked:
             try:
