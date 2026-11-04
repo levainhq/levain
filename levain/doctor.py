@@ -3154,7 +3154,7 @@ def _check_hands_login(install: Path) -> list[CheckResult]:
         last = outcomes.get(vendor, {})
         last_s = f"; last: {last.get('outcome', '?')} {last.get('at', '')}".rstrip() if last else "; last: none recorded"
         try:
-            cred = hands_login.credential_state(hands, vendor, entity_dir=install)
+            cred = hands_login.credential_state(hands, vendor, entity_dir=install, sweep=False)
         except Exception as exc:  # noqa: BLE001
             rows.append(CheckResult(name, True, f"unknown: not determinable ({exc}){last_s}",
                                     hint=f"`levain hands status {vendor}` asks the vendor", warn=True))

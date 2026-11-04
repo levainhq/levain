@@ -274,17 +274,19 @@ def _sweep_after(hands: HandsIdentity, entity_dir: Path | str, held: bool) -> st
 
 
 def run_as_hands_bounded(hands: HandsIdentity, argv: list[str], *, entity_dir: Path | str, held: bool, what: str,
-                         timeout: float | None = None, stdin: bytes | None = None) -> "subprocess.CompletedProcess[bytes]":
+                         timeout: float | None = None, stdin: bytes | None = None,
+                         sweep: bool = True) -> "subprocess.CompletedProcess[bytes]":
     """One run as the hands user, bounded by ``timeout`` (default :data:`STEP_TIMEOUT`). On a timeout, an error or an
     interrupt the child is killed (:func:`hands_live.run_bounded`) and then the hands account's processes are swept
     (:func:`_sweep_after`), since the program sudo started runs as the hands uid and can outlive the killed sudo. An
     ``Exception`` comes back as :class:`HandsLoginError` naming ``what`` and the sweep's result; an interrupt passes
-    through after the sweep."""
+    through after the sweep. ``sweep=False`` is for a read-only caller (the doctor row): the killed child is all that
+    is stopped, the hands account's other processes are never touched, and the error says so (L3 r1, levain 23)."""
     t = STEP_TIMEOUT if timeout is None else timeout
     try:
         return hands_live.run_bounded(argv, env=child_env(), timeout=t, stdin=stdin)
     except BaseException as exc:
-        left = _sweep_after(hands, entity_dir, held)
+        left = _sweep_after(hands, entity_dir, held) if sweep else "the hands account's other processes were not touched (a read-only check)"
         if not isinstance(exc, Exception):
             raise
         tail = left or "the hands account's processes were stopped"
@@ -296,13 +298,13 @@ def _as_hands_argv(hands: HandsIdentity, vendor: str, *argv: str) -> list[str]:
 
 
 def _lstat(hands: HandsIdentity, vendor: str, path: str, *, entity_dir: Path | str,
-           held: bool) -> tuple[str, int, str, str] | None:
+           held: bool, sweep: bool = True) -> tuple[str, int, str, str] | None:
     """``(type, uid, owner, mode)`` of ``path`` read AS the hands user, not following a symlink; None only when stat
     itself says the path does not exist. Anything else that fails (the sudo rule, the launcher, the program)
     raises :class:`HandsLoginError`: an absent file is never inferred from a failed read."""
     fmt = ("-f", "%HT|%u|%Su|%Lp") if platform.system() == "Darwin" else ("-c", "%F|%u|%U|%a")
     r = run_as_hands_bounded(hands, _as_hands_argv(hands, vendor, "/usr/bin/env", "LC_ALL=C", "/usr/bin/stat", *fmt, path),
-                             entity_dir=entity_dir, held=held, what=f"stat {path}")
+                             entity_dir=entity_dir, held=held, what=f"stat {path}", sweep=sweep)
     out = r.stdout.decode("utf-8", "replace").strip()
     err = r.stderr.decode("utf-8", "replace")
     if r.returncode == 0:
@@ -387,11 +389,13 @@ def ensure_config_home(hands: HandsIdentity, vendor: str, *, entity_dir: Path | 
             raise HandsLoginError(f"could not write {cfg} as {hands.user}: {_brief(_text(r))}")
 
 
-def credential_state(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str, held: bool = False) -> str | None:
+def credential_state(hands: HandsIdentity, vendor: str, *, entity_dir: Path | str, held: bool = False,
+                     sweep: bool = True) -> str | None:
     """``"<owner> <mode>"`` of the credential file, read AS the hands user, or None when stat says it is absent.
-    Raises :class:`HandsLoginError` when that cannot be told, or when the path is not a plain file."""
+    Raises :class:`HandsLoginError` when that cannot be told, or when the path is not a plain file. ``sweep=False``
+    (the doctor row) never stops the hands account's processes when the read times out."""
     path = credential_path(hands, vendor)
-    st = _lstat(hands, vendor, path, entity_dir=entity_dir, held=held)
+    st = _lstat(hands, vendor, path, entity_dir=entity_dir, held=held, sweep=sweep)
     if st is None:
         return None
     kind, _, owner, mode = st

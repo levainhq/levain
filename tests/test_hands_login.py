@@ -461,6 +461,24 @@ def test_a_status_that_runs_out_is_swept_under_the_lock_it_took(rig, monkeypatch
         os.kill(pid, 0)
 
 
+def test_a_read_only_credential_read_that_runs_out_sweeps_nothing(rig, monkeypatch):
+    """L3 r1 of the bundle4 merge (complement MED): the doctor row reads the credential file with ``sweep=False``. A read
+    that runs out then stops only its own killed child and never the hands account's other processes; the same read
+    with the default does sweep (the explicit verbs keep that)."""
+    swept = []
+    monkeypatch.setattr(hands_login, "_sweep_after", lambda hands, entity_dir, held: swept.append(held))
+
+    def hang(argv, **kw):
+        raise TimeoutError("stat ran out")
+    monkeypatch.setattr(hands_live, "run_bounded", hang)
+    with pytest.raises(hands_login.HandsLoginError, match="read-only check"):
+        hands_login.credential_state(rig.h, "claude", entity_dir=rig.entity, sweep=False)
+    assert swept == []
+    with pytest.raises(hands_login.HandsLoginError):
+        hands_login.credential_state(rig.h, "claude", entity_dir=rig.entity)
+    assert swept == [False]
+
+
 def test_a_config_refusal_does_not_overwrite_the_last_outcome(rig, capsys):
     """L3 r2 of V1/V2 (complement + codex MED, item 7 residual): a pre-flight refusal in the config home (here a
     keyring pin) changed nothing about the login, so it records nothing."""
