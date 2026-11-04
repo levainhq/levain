@@ -122,6 +122,13 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                          "<levain home>/cockpit).")
     en.add_argument("--coord-dir", type=Path, default=None,
                     help="The coordinator queue directory (default: <levain home>/coordinator).")
+    en.add_argument("--shadow-flow-root", type=Path, default=None,
+                    help="SHADOW install (the D1-3 recipe): flow's state/dream directory this install reads its input "
+                         "from. --store-dir is then the SCRATCH directory re-seeded each night (never ~/.anneal-memory); "
+                         "needs --flow-instructions.")
+    en.add_argument("--flow-instructions", type=Path, default=None,
+                    help="With --shadow-flow-root: flow's instructions file (global/CONTINUITY_MANAGEMENT.md), copied "
+                         "read-only into the agent store dir as the compose's instructions.")
     en.add_argument("--revise", action="store_true", help="Write a new version when the stored spec differs.")
     en.add_argument("--json", action="store_true")
     en.set_defaults(func=run_dream_enable)
@@ -154,6 +161,11 @@ def run_dream_enable(args: argparse.Namespace) -> int:
         print(f"levain dream enable: cannot register ({type(exc).__name__}: {exc})", file=sys.stderr)
         return 1
     install_path = None
+    if (args.shadow_flow_root is not None or args.flow_instructions is not None) and (
+            args.store_dir is None or args.shadow_flow_root is None or args.flow_instructions is None):
+        print("levain dream enable: a shadow install needs --store-dir (the scratch directory), --shadow-flow-root and "
+              "--flow-instructions together; the dream is registered but no install facts were written", file=sys.stderr)
+        return 1
     if args.store_dir is not None:
         try:
             install_path = _write_install_facts(args, store, str(zone), da)
@@ -184,6 +196,8 @@ def _write_install_facts(args: argparse.Namespace, store: object, zone: str, da:
     from levain.coordinator.launch import default_coordinator_dir
 
     base = Path(args.store_dir).expanduser().resolve()
+    if args.shadow_flow_root is not None:
+        return _write_shadow_install_facts(args, store, zone, da, base)
     db = next((c for c in (base / "memory.db", base / ".levain" / "memory.db") if c.is_file()), None)
     if db is None:
         raise da.InstallRefused(f"no memory.db under {base} (looked in the dir and in .levain/)")
@@ -193,6 +207,35 @@ def _write_install_facts(args: argparse.Namespace, store: object, zone: str, da:
     coord = args.coord_dir if args.coord_dir is not None else default_coordinator_dir()
     return da.write_install(store.directory, store_path=db.resolve(), cockpit_root=Path(cockpit).expanduser().resolve(),
                             coord_dir=Path(coord).expanduser().resolve(), zone=zone)
+
+
+def _write_shadow_install_facts(args: argparse.Namespace, store: object, zone: str, da: object, base: Path) -> Path:
+    """The shadow recipe: the scratch directory (created empty if absent; a seed marks it), the read-only copy of flow's
+    instructions beside the agent store, and the install facts naming flow's root. A scratch directory that resolves
+    inside the operator's live store is refused before anything is written."""
+    from levain.coordinator.launch import default_coordinator_dir
+
+    bad = _refused(base)
+    if bad:
+        raise da.InstallRefused(bad.replace("`levain dream run` is for a COPY", "a shadow install seeds a scratch COPY"))
+    src = Path(args.flow_instructions).expanduser().resolve()
+    if not src.is_file():
+        raise da.InstallRefused(f"--flow-instructions {src} is not a file")
+    base.mkdir(parents=True, exist_ok=True)
+    dest = Path(store.directory) / "shadow_instructions.md"
+    if dest.exists():
+        dest.chmod(0o600)
+    dest.write_bytes(src.read_bytes())
+    dest.chmod(0o444)
+    home = os.environ.get("LEVAIN_HOME")
+    levain_home = Path(home).expanduser() if home else Path.home() / ".levain"
+    cockpit = args.cockpit_root if args.cockpit_root is not None else levain_home / "cockpit"
+    coord = args.coord_dir if args.coord_dir is not None else default_coordinator_dir()
+    return da.write_install(store.directory, store_path=base / "memory.db",
+                            cockpit_root=Path(cockpit).expanduser().resolve(),
+                            coord_dir=Path(coord).expanduser().resolve(), zone=zone,
+                            shadow_flow_root=Path(args.shadow_flow_root).expanduser().resolve(),
+                            instructions_path=dest.resolve())
 
 
 def _refused(p: Path) -> str | None:

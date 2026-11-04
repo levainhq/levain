@@ -607,7 +607,8 @@ class RunReport:
 
 def run_body(sup: Any, occurrence_id: str, launch_epoch: int, *, store_path: Path | str, occ_dir: Path | str,
              executor: Any, consolidate: Callable[[], Any], review_store: Any, day: str | None = None,
-             manual: bool = False, slot: str | None = None, feed: str = CARD_FEED) -> RunReport:
+             manual: bool = False, slot: str | None = None, feed: str = CARD_FEED,
+             saved_card: Callable[[], _card.Card] | None = None) -> RunReport:
     """A dream occurrence's body, called by the fire after its claim. ``sup`` is a ``Supervisor``; ``consolidate()``
     returns a ``ConsolidateResult`` (``executor.consolidate_store`` with the hooks bound). In order: the one journaled
     effect under the fence (``sup.effect``), the typed result written to ``result.json``, the card filed as its own
@@ -637,7 +638,8 @@ def run_body(sup: Any, occurrence_id: str, launch_epoch: int, *, store_path: Pat
     outcome = str(result.get("outcome") or "unknown")
     card = "none"
     if outcome != "empty":
-        card = _file_run_card(outcome, result, occurrence_id, occ, store_path, review_store, day, manual, slot, feed)
+        card = _file_run_card(outcome, result, occurrence_id, occ, store_path, review_store, day, manual, slot, feed,
+                              saved_card)
     ok = (outcome == "saved" and card in ("filed", "duplicate")) or outcome == "empty"
     reason = None if ok else (outcome if outcome != "saved" else "card_not_filed")
     end = sup.finish(occurrence_id, executor, ok=ok, reason=reason)
@@ -645,8 +647,13 @@ def run_body(sup: Any, occurrence_id: str, launch_epoch: int, *, store_path: Pat
 
 
 def _file_run_card(outcome: str, result: Mapping[str, Any], occurrence_id: str, occ: Path, store_path: Path | str,
-                   review_store: Any, day: str | None, manual: bool, slot: str | None, feed: str) -> str:
+                   review_store: Any, day: str | None, manual: bool, slot: str | None, feed: str,
+                   saved_card: Callable[[], _card.Card] | None = None) -> str:
     try:
+        if outcome == "saved" and saved_card is not None:
+            # a shadow night's saved card is its comparison against flow's text (never the consolidated card)
+            _, new = _card.file_card(review_store, saved_card(), feed=feed)
+            return "filed" if new else "duplicate"
         spec: dict[str, Any] = {"kind": "consolidated" if outcome == "saved" else "failed", "occurrence": occurrence_id,
                                 "reason": "" if outcome == "saved" else f"{outcome}: {result.get('detail') or ''}".strip()}
         c = _card.from_spec(spec, occ_dir=occ, db_path=store_path if outcome == "saved" else None, day=day,
@@ -692,6 +699,11 @@ class DreamInstall:
     facts_path: Path | None = None
     model: str = "claude-opus-5-5"
     claude_bin: str = "claude"
+    #: a SHADOW install (D1_EXECUTOR section 8): flow's ``state/dream`` root this install reads as input. Set, the
+    #: install's ``store_path`` is a scratch copy re-seeded each night, and ``instructions_path`` is the read-only copy
+    #: of flow's instructions the compose is given.
+    shadow_flow_root: Path | None = None
+    instructions_path: Path | None = None
 
 
 INSTALL_SCHEMA = 1
@@ -737,7 +749,16 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
     zone = doc.get("zone")
     if not isinstance(zone, str) or not zone.strip():
         raise InstallRefused(f"{path} lacks zone")
-    store_path = _fact_path(doc, "store_path", path, kind="file")
+    shadow_raw = doc.get("shadow_flow_root")
+    shadow_root = None if shadow_raw is None else _fact_path(doc, "shadow_flow_root", path, kind="dir")
+    if shadow_root is None:
+        store_path = _fact_path(doc, "store_path", path, kind="file")
+    else:
+        # a shadow store is created by the first seed: its path must be absolute, never required to exist yet
+        raw = doc.get("store_path")
+        if not isinstance(raw, str) or not raw.strip() or not Path(raw).expanduser().is_absolute():
+            raise InstallRefused(f"{path}: store_path {raw!r} is not an absolute path")
+        store_path = Path(raw).expanduser()
     cockpit_root = _fact_path(doc, "cockpit_root", path, kind="dir")
     coord_dir = _fact_path(doc, "coord_dir", path, kind="dir")
     facts = doc.get("facts_path")
@@ -749,14 +770,24 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
         v = doc.get(key)
         if v is not None and (not isinstance(v, str) or not v.strip()):
             raise InstallRefused(f"{path}: {key} {v!r} is not a non-empty string")
+    instr = None
+    if doc.get("instructions_path") is not None:
+        if shadow_root is None:
+            raise InstallRefused(f"{path}: instructions_path is a shadow install fact, and this install is not a shadow")
+        instr = _fact_path(doc, "instructions_path", path, kind="file")
+    if shadow_root is not None and instr is None:
+        raise InstallRefused(f"{path} is a shadow install without instructions_path: the comparison needs flow's "
+                             "instructions, so a shadow never composes under Levain's own")
     return DreamInstall(store_path, cockpit_root, coord_dir, zone,
                         None if facts is None else Path(facts).expanduser(),
-                        doc.get("model") or "claude-opus-5-5", doc.get("claude_bin") or "claude")
+                        doc.get("model") or "claude-opus-5-5", doc.get("claude_bin") or "claude",
+                        shadow_root, instr)
 
 
 def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root: Path | str, coord_dir: Path | str,
                   zone: str, facts_path: Path | str | None = None, model: str | None = None,
-                  claude_bin: str | None = None) -> Path:
+                  claude_bin: str | None = None, shadow_flow_root: Path | str | None = None,
+                  instructions_path: Path | str | None = None) -> Path:
     """Write ``<agent_dir>/dream_install.json`` atomically (a temp file in the directory, fsynced, mode 0600, renamed
     over the old one) from absolute paths that must exist, and read it back through :func:`read_install`. Raises
     :class:`InstallRefused` before writing anything when a fact is not usable. The optional facts (``facts_path``,
@@ -775,12 +806,31 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
         prior = {}
     if not isinstance(prior, dict):
         prior = {}
-    for key, given in (("facts_path", facts_path), ("model", model), ("claude_bin", claude_bin)):
+    for key, given in (("facts_path", facts_path), ("model", model), ("claude_bin", claude_bin),
+                       ("shadow_flow_root", shadow_flow_root), ("instructions_path", instructions_path)):
         if given is not None:
             doc[key] = str(given)
         elif prior.get(key) is not None:
             doc[key] = prior[key]
-    for key, kind in (("store_path", "file"), ("cockpit_root", "dir"), ("coord_dir", "dir")):
+    shadow = "shadow_flow_root" in doc
+    if shadow:
+        _fact_path(doc, "shadow_flow_root", path, kind="dir", writing=True)
+        if "instructions_path" not in doc:
+            raise InstallRefused(f"{path}: a shadow install needs instructions_path (flow's instructions, read-only)")
+        _fact_path(doc, "instructions_path", path, kind="file", writing=True)
+        sp = Path(str(store_path)).expanduser()
+        if not sp.is_absolute():
+            raise InstallRefused(f"{path}: store_path {str(store_path)!r} is not an absolute path")
+        from levain.firing.isolation import _is_within_ci, flow_store_dir
+        if _is_within_ci(sp.resolve(), flow_store_dir().resolve()):
+            raise InstallRefused(f"{path}: a shadow store_path {str(store_path)!r} resolves inside the operator's live "
+                                 "store (~/.anneal-memory): a shadow only ever seeds a scratch copy")
+        keys = (("cockpit_root", "dir"), ("coord_dir", "dir"))
+    else:
+        if "instructions_path" in doc:
+            raise InstallRefused(f"{path}: instructions_path is a shadow install fact (pass shadow_flow_root too)")
+        keys = (("store_path", "file"), ("cockpit_root", "dir"), ("coord_dir", "dir"))
+    for key, kind in keys:
         _fact_path(doc, key, path, kind=kind, writing=True)
     if "facts_path" in doc:
         _fact_path(doc, "facts_path", path, kind="file", writing=True)
@@ -815,10 +865,28 @@ def install_on_input(agent_dir: Path | str, *, clock: Callable[[], datetime] | N
     ``missed`` past its grace), never as a quiet day."""
     def on_input(row: Mapping[str, Any]) -> bool:
         inst = read_install(agent_dir)
+        if inst.shadow_flow_root is not None:
+            return bool_on_input(_shadow_check(inst, agent_dir))(row)
         return bool_on_input(make_on_input(inst.store_path, zone=inst.zone, agent_dir=agent_dir,
                                            coord_dir=inst.coord_dir, clock=clock))(row)
 
     return on_input
+
+
+def _shadow_check(inst: DreamInstall, agent_dir: Path | str) -> Callable[[Mapping[str, Any]], InputVerdict]:
+    """A shadow install's input check: flow's committed day (and the seed and the episode check under the night lock)
+    in place of the six checks, which are about a live store a shadow does not have."""
+    from levain.dream import shadow as _shadow
+
+    def check(row: Mapping[str, Any]) -> InputVerdict:
+        try:
+            agent_id = _agent_id_of(row)
+        except ValueError as exc:
+            return InputVerdict(False, _ready.UNREADABLE, "unreadable", str(exc))
+        return _shadow.shadow_input(inst.shadow_flow_root, inst.store_path, row, zone=inst.zone,
+                                    occurrences=lambda: _ready._read_occurrences(Path(agent_dir)), agent_id=agent_id)
+
+    return check
 
 
 def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str, Any]:
@@ -858,8 +926,53 @@ def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str,
                                     budget=ex.Budget.for_model(inst.model), occurrence_dir=occ_dir,
                                     on_snapshot=on_snapshot, on_saved=on_saved, label="levain dream", handle_stop=True)
 
+    saved_card = None
+    if inst.shadow_flow_root is not None:
+        consolidate, saved_card = _shadow_run(inst, card_facts["day"], occurrence_id, occ_dir, consolidate)
+
     return {"sup": sup, "store_path": inst.store_path, "occ_dir": occ_dir, "executor": executor,
-            "consolidate": consolidate, "review_store": review_store, **card_facts}
+            "consolidate": consolidate, "review_store": review_store, "saved_card": saved_card, **card_facts}
+
+
+def _shadow_run(inst: DreamInstall, day: str, occurrence_id: str, occ_dir: Path, consolidate: Callable[[], Any]):
+    """``(consolidate, saved_card)`` for a shadow install: the consolidate runs under the scratch directory's night
+    lock and only on a store still seeded from THIS day's snapshot (the marker names the run), with flow's instructions
+    copy as the compose's instructions; the card is the comparison against flow's composed text. Raises before the
+    run exists when flow's day is not readable."""
+    from levain.dream import executor as ex
+    from levain.dream import shadow as _shadow
+    from levain.dream import usage as _usage
+
+    fd = _shadow.read_flow_day(inst.shadow_flow_root, day)
+    instr = inst.instructions_path
+
+    def guarded() -> Any:
+        try:
+            with _shadow.night_lock(fd, inst.store_path):
+                try:
+                    marker = json.loads((inst.store_path.parent / _shadow.MARKER).read_text(encoding="utf-8"))
+                except (OSError, ValueError, UnicodeDecodeError):
+                    marker = None
+                if not isinstance(marker, dict) or marker.get("run_id") != fd.run_id:
+                    return ex.ConsolidateResult("precondition", 2, f"the shadow store is not seeded from flow's {fd.run_id}")
+                return consolidate_with_instructions()
+        except _shadow.ShadowRefused as exc:
+            return ex.ConsolidateResult("precondition", 2, f"shadow store busy or refused: {exc.why}")
+
+    def consolidate_with_instructions() -> Any:
+        on_snapshot, on_saved = _snap.hooks()
+        mind = ex.ClaudeMind(inst.model, claude_bin=inst.claude_bin)
+        return ex.consolidate_store(inst.store_path, mind=mind, composer=inst.model, max_seconds=ex.DREAM_BUDGET_S,
+                                    budget=ex.Budget.for_model(inst.model), occurrence_dir=occ_dir,
+                                    instructions_path=instr, on_snapshot=on_snapshot, on_saved=on_saved,
+                                    label="levain dream shadow", handle_stop=True)
+
+    def saved_card() -> _card.Card:
+        _prior, saved = _card.texts_for(inst.store_path, occ_dir)
+        return _shadow.shadow_card(fd, saved, occurrence=occurrence_id, occ_dir=occ_dir,
+                                   usage_doc=_usage.read_doc(occ_dir))
+
+    return guarded, saved_card
 
 
 def dream_run(store: Any, occurrence_id: str, launch_epoch: int) -> int:
