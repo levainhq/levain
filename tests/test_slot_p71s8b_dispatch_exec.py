@@ -372,8 +372,10 @@ def test_09c_the_rendered_executor_layer_carries_the_mode_and_the_env_row(rig):
 
 def _slot_clone_to_operator_repo_writers() -> set[str]:
     """The modules under ``levain/slot`` and ``levain/dispatch`` that install refs or objects into a git repo, by an
-    AST walk for git's installing sub-commands as argv constants."""
-    verbs = {"update-ref", "unbundle", "fetch", "am", "cherry-pick", "pull", "commit-tree", "write-tree"}
+    AST walk for git's installing sub-commands as literal argv constants (a heuristic: an argv assembled from a
+    variable, a keyword or a split string is not seen, which is why a new writer is also a review question)."""
+    verbs = {"update-ref", "unbundle", "fetch", "am", "cherry-pick", "pull", "commit-tree", "write-tree",
+             "push", "rebase", "read-tree", "fast-import", "index-pack", "unpack-objects", "mktree"}
     found = set()
     for sub in ("slot", "dispatch"):
         for p in sorted((REPO_ROOT / "levain" / sub).rglob("*.py")):
