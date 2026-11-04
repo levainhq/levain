@@ -148,6 +148,11 @@ def test_vendor_env_exact():
     env = rd.render_env(blob, facts)["slot"]
     assert set(env) == BASE_KEYS | PROXY_KEYS | {"SSL_CERT_FILE"}
     assert rd.secret_env_names(blob, facts) == ("OPENAI_API_KEY",)
+    # p71 S8 D11: a claude dispatch executor gains the background-task switch, no other kind does
+    blob, facts = egress(kind="dispatch")
+    env = rd.render_env(blob, facts)["slot"]
+    assert set(env) == BASE_KEYS | PROXY_KEYS | {"ANTHROPIC_BASE_URL", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"}
+    assert env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
     # passthrough: no base URL, no token
     blob, facts = egress(auth="passthrough", kind="login")
     assert "ANTHROPIC_BASE_URL" not in rd.render_env(blob, facts)["slot"]

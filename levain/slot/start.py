@@ -168,17 +168,110 @@ def check_vendor_installed(host: str, vendor: str, *, prefix: Optional[Path] = N
 vendor_ready: Callable[[str, str], None] = check_vendor_installed
 
 
-def vendor_argv(host: str, vendor: str, session: str) -> Tuple[str, ...]:
+#: p71 S8 D4: the one prompt token of an executor's print-mode exec; the brief is a file, never a token.
+EXECUTOR_PROMPT = "Execute the task in your system prompt."
+
+
+def vendor_argv(host: str, vendor: str, session: str, *, kind: Optional[str] = None,
+                ticket_kind: Optional[str] = None) -> Tuple[str, ...]:
     """The vendor's exec: its binary under the root-owned vendor prefix (§2.1). Claude Code reads the rendered
     ``--settings`` layer (render's ``<S>/root/settings.json``); Codex reads ``CODEX_HOME/config.toml`` and takes
-    render's :data:`~levain.slot.render.CODEX_LAUNCH_ARGS` on its command line."""
+    render's :data:`~levain.slot.render.CODEX_LAUNCH_ARGS` on its command line.
+
+    p71 S8 D4: for alloc ``kind`` ``dispatch`` whose ticket's kind (``ticket_kind``, from alloc's ``ticket_facts``)
+    is ``executor``, on ``claude``, the print-mode exec: ``-p``, the project and local settings layers left out
+    (``--setting-sources user``), no MCP server (``--strict-mcp-config`` with no ``--mcp-config``), the brief as the
+    system prompt's addition from ``<S>/in/brief.md``, and stream-json output (``--verbose`` is its requirement).
+    Every token is a constant or derived from the session id; no brief byte is ever a token. No permission, tool or
+    model flag: those live in the rendered layer. A ``dispatch`` session whose ticket facts are absent is refused
+    ``ticket-facts-missing``: ``start`` never guesses the interactive form for a ticketed session. An executor
+    ticket on any other vendor is refused ``executor-vendor-unsupported`` (no brief would reach it). Every other input
+    returns what it returned before."""
     from levain.slot.layout import STORE
     from levain.slot.root_tree import VENDOR_PREFIX
 
     binary = f"{VENDOR_PREFIX[host]}/bin/{vendor}"
+    if kind == "dispatch" and ticket_kind is None:
+        raise Refused("ticket-facts-missing", "a dispatch session without its ticket's kind")
+    if kind == "dispatch" and ticket_kind == "executor" and vendor != "claude":
+        raise Refused("executor-vendor-unsupported", f"an executor ticket on {vendor!s:.16}: only claude has the "
+                                                     "print-mode exec that carries a brief")
     if vendor == "claude":
-        return (binary, "--settings", f"{STORE[host]}/live/{session}/root/settings.json")
+        S = f"{STORE[host]}/live/{session}"
+        if kind == "dispatch" and ticket_kind == "executor":
+            return (binary, "-p", "--settings", f"{S}/root/settings.json", "--setting-sources", "user",
+                    "--strict-mcp-config", "--append-system-prompt-file", f"{S}/in/brief.md",
+                    "--output-format", "stream-json", "--verbose", EXECUTOR_PROMPT)
+        return (binary, "--settings", f"{S}/root/settings.json")
     return (binary, *RD.CODEX_LAUNCH_ARGS)
+
+
+def is_executor(a: R.Alloc) -> bool:
+    """Whether ``a`` is an executor session on ``claude``: the one whose vendor runs in print mode, with its output
+    off the helper's stdout and its exit in the helper's exit status (c7.15 D7, D8)."""
+    return a.kind == "dispatch" and a.vendor == "claude" and (a.ticket_facts or {}).get("kind") == "executor"
+
+
+class VendorCapture:
+    """An executor vendor's two output pipes and the two root-owned log files they drain into
+    (``<S>/run/vendor.out`` and ``vendor.err``): the vendor gets the write ends, the helper the read ends. Every fd
+    is closed once, by :meth:`close_writers` (right after the spawn) and :meth:`close`."""
+
+    def __init__(self) -> None:
+        self.out_r = self.out_w = self.err_r = self.err_w = -1
+        self.out_f = self.err_f = -1
+
+    def streams(self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        return (self.out_r, self.out_f), (self.err_r, self.err_f)
+
+    def close_writers(self) -> None:
+        for name in ("out_w", "err_w"):
+            fd = getattr(self, name)
+            if fd >= 0:
+                setattr(self, name, -1)
+                os.close(fd)
+
+    def close(self) -> None:
+        self.close_writers()
+        for name in ("out_r", "err_r", "out_f", "err_f"):
+            fd = getattr(self, name)
+            if fd >= 0:
+                setattr(self, name, -1)
+                os.close(fd)
+
+
+#: c7.15: the names under ``<S>/run/`` and the directory itself (root : root 0700, the slot cannot enter it).
+RUN_DIR = "run"
+VENDOR_OUT, VENDOR_ERR = "vendor.out", "vendor.err"
+_O_LOG_NEW = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def open_capture(ctx: H.Ctx, a: R.Alloc, cap: VendorCapture) -> None:
+    """``<S>/run/`` made fresh (:meth:`~levain.slot.runtime_helper.Store.mkdir`: an existing name of any kind,
+    a link included, is ``session-exists``, so nothing is ever written through one), root : root 0700; its two log
+    files created ``O_CREAT|O_EXCL|O_NOFOLLOW`` there, root : root 0600; the two pipes. On a failure every fd made
+    here is closed."""
+    seams = ctx.seams
+    rel = f"live/{a.session}/{RUN_DIR}"
+    try:
+        with ctx.store.dir("live", a.session) as sfd:
+            ctx.store.mkdir(sfd, RUN_DIR, 0, 0, 0o700, rel)
+            seams.fsync(sfd)
+        with ctx.store.dir("live", a.session, RUN_DIR) as rfd:
+            for name, attr in ((VENDOR_OUT, "out_f"), (VENDOR_ERR, "err_f")):
+                try:
+                    fd = os.open(name, _O_LOG_NEW, 0o600, dir_fd=rfd)
+                except FileExistsError:
+                    raise Refused("render-dest-exists", f"{rel}/{name}") from None
+                setattr(cap, attr, fd)
+                seams.chown(fd, 0, 0, f"{rel}/{name}")
+                os.fchmod(fd, 0o600)
+            seams.fsync(rfd)
+        cap.out_r, cap.out_w = os.pipe()
+        cap.err_r, cap.err_w = os.pipe()
+    except BaseException:
+        cap.close()
+        raise
 
 
 def launch(ctx: H.Ctx, a: R.Alloc, spec: wall.Spec) -> Tuple[Tuple[str, ...], Optional[str]]:
@@ -632,6 +725,8 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     seams.at("kind")
     if a.kind == "verifier":
         raise Refused("verb-unbuilt:verifier", "a verifier session's start is §5.6, session 2f's")
+    # p71 S8 D4: a dispatch session whose ticket facts are absent is refused here, before any clone or spawn
+    vendor_argv(seams.host, a.vendor, a.session, kind=a.kind, ticket_kind=(a.ticket_facts or {}).get("kind"))
     seams.at("vendor")
     vendor_ready(seams.host, a.vendor)
     egress = a.slot.slot_class == "egress"
@@ -642,13 +737,28 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         seams.egress_ready(a.slot, H.slot_ids(ctx, a.slot))
 
     seams.at("repo")
+    executor = is_executor(a)
+    cap = VendorCapture() if executor else None
     try:
-        with H.session_lock(ctx, a.session):
-            pid = _start_fenced(ctx, a)
+        try:
+            with H.session_lock(ctx, a.session):
+                pid = _start_fenced(ctx, a, cap)
+        finally:
+            _wake(seams)        # every release: an END that waited on the lock, or refused end-busy, is retried now
+        seams.at("wait")
+        if cap is not None:
+            # c7.15 D7/D8: the vendor's output goes to root-held files, never the helper's stdout; the exit status
+            # the helper answers with is the vendor's (main reads it off the Answer)
+            code = seams.wait_capturing(pid, cap.streams()).code
+        else:
+            code = seams.wait(pid)
     finally:
-        _wake(seams)        # every release: an END that waited on the lock, or refused end-busy, is retried now
-    seams.at("wait")
-    code = seams.wait(pid)
+        if cap is not None:
+            cap.close()
+    if executor:
+        ans = H.Answer(exit=code)
+        ans.exit_status = H.EXIT_OK if code == 0 else H.EXIT_VENDOR
+        return ans
     if a.kind == "login":
         seams.at("identity")
         try:
@@ -716,7 +826,7 @@ def _park_back(facts: E.EndFacts, es: E.EndSeams, a: R.Alloc) -> None:
         _note(f"{a.session}: identity gate: the credential was not parked back: {_why(e)}")
 
 
-def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
+def _start_fenced(ctx: H.Ctx, a: R.Alloc, cap: Optional[VendorCapture] = None) -> int:
     """``start`` from the repo step through the ACTIVE CAS, under the session END lock (``L/alloc/<session>.lock``,
     the one render takes and END waits on; reaper DESIGN RH1, the spawn fence). Every spawn into the slot (the
     clone, its check children, the forwarder, the vendor) and every kill this start makes run under it, so an END
@@ -783,15 +893,24 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc) -> int:
     handles = secret_env(ctx, a)
 
     seams.at("exec")
-    spec = _spec(ctx, a, "vendor", argv=vendor_argv(seams.host, a.vendor, a.session), extra_env=handles,
-                 exec_fd=wall.EXEC_FD)
+    spawn_kw: Dict[str, object] = {}
+    if cap is not None:
+        # c7.15 D7: <S>/run and its two log files, the pipes; the vendor gets /dev/null on fd 0 and the write ends
+        # on fds 1 and 2. Nothing of the vendor's reaches the helper's stdout, the answer channel.
+        open_capture(ctx, a, cap)
+        spawn_kw = {"stdin_null": True, "stdout_w": cap.out_w, "stderr_w": cap.err_w}
+    spec = _spec(ctx, a, "vendor", extra_env=handles, exec_fd=wall.EXEC_FD,
+                 argv=vendor_argv(seams.host, a.vendor, a.session, kind=a.kind,
+                                  ticket_kind=(a.ticket_facts or {}).get("kind")))
     argv, cgroup = launch(ctx, a, spec)
     exec_r, exec_w = os.pipe()
     try:
         try:
-            pid = seams.spawn(argv, spec.to_json(), cgroup, exec_w, False)
+            pid = seams.spawn(argv, spec.to_json(), cgroup, exec_w, False, **spawn_kw)
         finally:
             os.close(exec_w)
+            if cap is not None:
+                cap.close_writers()     # the vendor holds its copies; the helper's would keep the pipes open
         got = await_exec(exec_r, bound_s=EXEC_MARKER_S)
     finally:
         os.close(exec_r)
@@ -1231,4 +1350,5 @@ __all__ = ["CheckFailed", "CheckStats", "EXEC_MARKER_S", "FORWARDER_READY_S", "F
            "check_vendor_installed", "clone_check",
            "discovery_listings", "end_facts", "end_seams", "front_lock", "hash_batches", "kill_domain",
            "launch", "parse_ls_files", "read_record", "remove_tree_at", "revoke", "revoke_front", "scrub_and_release",
-           "secret_env", "start", "teardown", "vendor_argv"]
+           "secret_env", "start", "teardown", "vendor_argv", "EXECUTOR_PROMPT", "VendorCapture", "is_executor",
+           "open_capture"]

@@ -41,6 +41,8 @@ __all__ = ["Refusal", "check_spec", "refinement_of", "derived_flags", "ceiling_p
            "AuditError", "ZONE_VERB", "all_spelling"]
 
 ZONE_VERB = "levain agents zone <IANA>"
+#: The agent name the dream executor owns. A registration reaches it only through the dream's own path (``as_dream``).
+DREAM_NAME = "dream"
 # rule 5: the words for "all", and the characters an entry may be made of and still name nothing in particular
 _ALL_WORDS = frozenset({"all", "everything", "any", "anything"})
 _ROOT_CHARS = frozenset("*?/\\.~")
@@ -191,12 +193,13 @@ def _cycle(name: str, lookup: Mapping[str, Mapping[str, Any]]) -> list[str] | No
 
 def check_spec(spec: Mapping[str, Any], *, role: Mapping[str, Any] | None, default_zone: str | None,
                names_held: frozenset[str] | set[str] = frozenset(),
-               lookup: Mapping[str, Mapping[str, Any]] | None = None) -> list[Refusal]:
+               lookup: Mapping[str, Mapping[str, Any]] | None = None, as_dream: bool = False) -> list[Refusal]:
     """Every refusal of a parsed spec (``spec.parse_spec``), in rule order; empty when it would be accepted.
 
     ``role`` is the resolved RoleSpec mapping (None: it did not resolve). ``names_held`` is the set of names of live
     agents that this registration may not take (the caller removes the spec's own name for a revision). ``lookup`` is
-    name -> parsed spec for the feeder group's other members (the spec itself is added)."""
+    name -> parsed spec for the feeder group's other members (the spec itself is added). ``as_dream`` is passed only by
+    the dream's own registration."""
     out: list[Refusal] = []
     name = spec["name"]
     group = {**(lookup or {}), name: spec}
@@ -240,6 +243,11 @@ def check_spec(spec: Mapping[str, Any], *, role: Mapping[str, Any] | None, defau
     if spec.get("stop_at") is None:
         out.append(Refusal("stop_at", "no stop_at: integer seconds after launch are required (the supervisor's "
                                       "deadline is launched_at + stop_at)"))
+
+    # the reserved name: ``dream`` belongs to the dream executor, registered by the dream's own path (``as_dream``)
+    if name == DREAM_NAME and not (as_dream and role is not None and role.get("executor") == "dream"):
+        out.append(Refusal("name", f"name {DREAM_NAME!r} is reserved for the dream executor: it is registered by "
+                                   f"`levain dream enable`, never by an operator's registration"))
 
     # rule 4
     if name in names_held:

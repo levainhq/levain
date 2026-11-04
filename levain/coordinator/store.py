@@ -894,6 +894,23 @@ class CoordStore:
             self._split_done(conn, drop_id, touched, now)
             return [self._thread(conn, t) for t in touched]
 
+    def bare_thread(self, conn: sqlite3.Connection, now: str, title: str, *, by: str = "operator") -> str:
+        """A ``note`` thread that holds no drop, inside the caller's write transaction (``with store._write() as (conn,
+        now)``): the room's own thread, which no drop made. It writes no drop and no receipt, and never wakes the
+        coordinator (only a drop's insert asks for one). It is an open thread with an empty first revision, so the
+        store's readers see it like any other. Returns the thread id. The caller's transaction is the thread's: a
+        caller that raises afterwards leaves nothing behind."""
+        by = self._actor(by, ("operator",))
+        title = _one_line("a thread's title", title, _TITLE_MAX)
+        thread_id = "th-" + secrets.token_hex(16)
+        conn.execute("INSERT INTO threads (thread_id, created_at, about, gseq) VALUES (?, ?, NULL, ?)",
+                     (thread_id, now, next_gseq(conn, now)))
+        self._revise(conn, thread_id, (), "split", now)
+        self._event(conn, thread_id, "state", "open", "bare", by, now)
+        self._event(conn, thread_id, "kind", "note", "bare", by, now)
+        self._event(conn, thread_id, "title", title, "bare", by, now)
+        return thread_id
+
     def note(self, drop_id: str, why: str, *, token: object) -> str:
         """The coordinator's terminal "read, nothing to do" for a drop: an append-only ``noted`` drop receipt carrying
         ``why`` (one line), written under the lease like a split. It stands in for a split everywhere a drop is

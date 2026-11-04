@@ -2439,6 +2439,11 @@ class ChatService:
         return self._chat._read(lambda conn: composer_state(conn, self._chat._opener._stamp(), launch_id, owner,
                                                             attached=attached))
 
+    def has_session(self, launch_id: str) -> bool:
+        """Whether this service holds a usable (attached, not wedged) session for the launch: the one case an
+        :meth:`interrupt` of it can be sent at all. A dict read; no driver call."""
+        return self._session(launch_id) is not None and launch_id not in self._wedged
+
     # --- public verbs for a surface that composes and sends (the cockpit used to reach ``_chat`` and ``_session``) ----
     def turn_view(self, launch_id: str, owner: str) -> TurnView:
         """What ``owner``'s composer shows for the launch's turn (yours, free or taken), through the store's own

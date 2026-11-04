@@ -132,7 +132,8 @@ def register_dream(store: Any, *, revise: bool = False, binding: str | None = No
     parsed = _spec.parse_spec(dream_spec(_role.role_hash(role), binding))
     if revise or _same(store, parsed, zone):
         held.discard(parsed["name"])
-    problems = [str(r) for r in refuse.check_spec(parsed, role=role, default_zone=zone, names_held=held)]
+    problems = [str(r) for r in refuse.check_spec(parsed, role=role, default_zone=zone, names_held=held,
+                                                              as_dream=True)]
     if problems:
         raise EnableRefused("; ".join(problems))
     _, role_hash, _, _ = _role.add_role(store, role)

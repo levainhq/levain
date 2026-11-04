@@ -36,8 +36,9 @@ def flag(name):
     return argv[argv.index(name) + 1] if name in argv else None
 
 base = os.environ["FAKE_DIR"]
-n = len([f for f in os.listdir(base) if f.startswith("spawn-")]) + 1
+n = len([f for f in os.listdir(base) if f.startswith("spawn-") and f.endswith(".argv")]) + 1
 open(os.path.join(base, "spawn-%d.argv" % n), "w").write(json.dumps(argv))
+open(os.path.join(base, "spawn-%d.env" % n), "w").write(json.dumps(sorted(os.environ)))
 mode = open(os.path.join(base, "mode")).read().split() if os.path.exists(os.path.join(base, "mode")) else ["ok"]
 mode, model = mode[0], (mode[1] if len(mode) > 1 else "fake-model")
 sid = flag("--session-id") or flag("--resume")
@@ -93,12 +94,17 @@ for line in sys.stdin:
     if mode in ("mute_after_open",) and inits > 1: continue
     init()
     if text.startswith("Open check"):
-        path = text.split(": ", 1)[1].strip()
-        if mode == "no_deny":
-            tool("toolu_c", "Read", path, "DECOY", RULE); say("done"); result()
-        else:
-            tool("toolu_c", "Read", path, "denied", DENY, error=True); say("done")
-            result([{{"tool_name": "Read", "tool_use_id": "toolu_c"}}])
+        paths = [p.strip() for p in text.split("done:", 1)[1].split("\n") if p.strip()]
+        open(os.path.join(base, "canary-%d.paths" % n), "w").write(json.dumps(paths))
+        denied = []
+        for i, path in enumerate(paths):
+            scope = path.endswith("scope-canary.txt")
+            if mode == "no_deny" or (mode == "scope_open" and scope):
+                tool("toolu_c%d" % i, "Read", path, "DECOY", RULE)
+            else:
+                tool("toolu_c%d" % i, "Read", path, "denied", DENY, error=True)
+                denied.append({{"tool_name": "Read", "tool_use_id": "toolu_c%d" % i}})
+        say("done"); result(denied)
         if mode == "deaf_after_open":
             time.sleep(600)
         if mode == "exit_after_open":
@@ -172,7 +178,7 @@ def launcher(w, *, service=None, **kw) -> RoomLauncher:
     lr = RoomLauncher(w["cs"], service or w["svc"], RoomSetting(str(w["cwd"]), model="sonnet",
                                                                 claude_bin=str(w["script"])),
                       run_dir=str(w["run"]), home=str(w["home"]),
-                      environ={**os.environ, "FAKE_DIR": str(w["fake"])}, **kw)
+                      environ={**os.environ, "FAKE_DIR": str(w["fake"])}, env_keep=("FAKE_DIR",), **kw)
     w["launchers"].append(lr)
     return lr
 
@@ -328,7 +334,7 @@ def test_item1_accepted_rule_reads_and_the_open_checks_own_turn_do_not_latch_the
     settle(world, h.launch_id, 3)
     assert trips(world, h.launch_id) == []
     assert world["cs"]._read(lambda conn: liveness(conn, h.launch_id)).enabled
-    assert kinds(world, h.launch_id).count("tool_result") == 3          # the canary's, and both accepted reads
+    assert kinds(world, h.launch_id).count("tool_result") == 4          # the two canaries', and both accepted reads
 
 
 def test_item1_the_workers_context_latches_the_same_room_stream(world):
@@ -987,3 +993,271 @@ def test_c8_a_spawn_that_fails_still_records_not_live(world):
     [launch] = world["cs"]._read(lambda conn: [r[0] for r in conn.execute(
         "SELECT launch_id FROM launches WHERE role = 'room'").fetchall()])
     assert ("not_live", "activation") in checks(world, launch) and state(world, launch) == "failed"
+
+
+# --- roomfix1 C2: the effective read scope; C3: the child's environment ------------------------------------------------
+def _paths(w, n=1):
+    return json.loads((w["fake"] / f"canary-{n}.paths").read_text())
+
+
+def test_c2_the_open_check_reads_a_rule_decoy_and_a_scope_decoy_outside_every_rule_and_removes_it(world):
+    lr = launcher(world)
+    lr.ensure()
+    rule, scope = _paths(world)
+    assert Path(rule).name == room_launch._CANARY_NAME
+    assert Path(scope).name == room_launch._SCOPE_NAME and not Path(scope).name.startswith(".env")
+    real = os.path.realpath(os.path.dirname(scope))
+    for root in (world["cwd"], world["home"], world["run"]):
+        r = os.path.realpath(root)
+        assert not (real == r or real.startswith(r + "/")), root
+    assert not os.path.exists(scope) and not os.path.exists(os.path.dirname(scope))     # removed after the open
+
+
+def test_c2_a_child_whose_read_scope_is_wider_than_its_cwd_does_not_open(world):
+    """Reproduced: the one canary matched the dotenv deny rule, so a child that could read outside its cwd (an
+    additionalDirectories, or an allow rule that outranks the outside-cwd block) still passed. The scope decoy matches
+    no rule; its Read returning content fails the open."""
+    mode(world, "scope_open")
+    with pytest.raises(RoomLaunchError, match="read scope wider than its cwd"):
+        launcher(world).ensure()
+    [launch] = world["cs"]._read(lambda conn: [r[0] for r in conn.execute(
+        "SELECT launch_id FROM launches WHERE role = 'room'").fetchall()])
+    assert state(world, launch) == "failed"
+    assert not os.path.exists(os.path.dirname(_paths(world)[1]))
+
+
+@pytest.mark.parametrize("where", ["user", "config_dir", "managed"])
+def test_c2_settings_naming_additional_directories_refuse_the_open_before_any_spawn(world, tmp_path, monkeypatch, where):
+    doc = json.dumps({"permissions": {"additionalDirectories": [str(tmp_path / "elsewhere")]}})
+    extra = {}
+    if where == "user":
+        (world["home"] / ".claude").mkdir()
+        (world["home"] / ".claude" / "settings.json").write_text(doc)
+    elif where == "config_dir":
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        (cfg / "settings.json").write_text(doc)
+        extra = {"CLAUDE_CONFIG_DIR": str(cfg)}
+    managed = tmp_path / "managed-settings.json"
+    if where == "managed":
+        managed.write_text(doc)
+    monkeypatch.setattr(room_launch, "MANAGED_SETTINGS", (str(managed),))
+    lr = RoomLauncher(world["cs"], world["svc"], RoomSetting(str(world["cwd"]), claude_bin=str(world["script"])),
+                      run_dir=str(world["run"]), home=str(world["home"]), env_keep=("FAKE_DIR",),
+                      environ={**os.environ, "FAKE_DIR": str(world["fake"]), **extra})
+    world["launchers"].append(lr)
+    with pytest.raises(RoomLaunchError, match="additionalDirectories"):
+        lr.ensure()
+    assert spawns(world) == []
+
+
+def test_c2_a_settings_file_that_cannot_be_read_refuses_and_a_missing_one_adds_nothing(tmp_path):
+    home = tmp_path / "h"
+    (home / ".claude").mkdir(parents=True)
+    assert room_launch.settings_scope_refusal({}, str(home), managed=()) is None
+    (home / ".claude" / "settings.json").write_text("{not json")
+    assert "cannot be read" in room_launch.settings_scope_refusal({}, str(home), managed=())
+    (home / ".claude" / "settings.json").write_text('{"permissions": {"allow": ["Read"], "additionalDirectories": []}}')
+    assert room_launch.settings_scope_refusal({}, str(home), managed=()) is None
+
+
+# --- roomfix2 K2: a relative CLAUDE_CONFIG_DIR; K3: path-specific allow rules ------------------------------------------
+def _scope_launcher(world, extra_env):
+    lr = RoomLauncher(world["cs"], world["svc"], RoomSetting(str(world["cwd"]), claude_bin=str(world["script"])),
+                      run_dir=str(world["run"]), home=str(world["home"]), env_keep=("FAKE_DIR",),
+                      environ={**os.environ, "FAKE_DIR": str(world["fake"]), **extra_env})
+    world["launchers"].append(lr)
+    return lr
+
+
+def test_k2_a_relative_config_dir_is_refused_before_any_spawn(world, monkeypatch):
+    """FINDINGS_room_r2 K2: a relative CLAUDE_CONFIG_DIR was joined against the SERVER's cwd, while the child (cwd = the
+    room's DIR) loads DIR/<rel>/settings.json. Reproduced here: the file the child would load widens the scope and the
+    server's cwd holds no such file, so the check passed."""
+    monkeypatch.setattr(room_launch, "MANAGED_SETTINGS", ())
+    (world["cwd"] / "cfg").mkdir()
+    (world["cwd"] / "cfg" / "settings.json").write_text(json.dumps({"permissions": {"additionalDirectories": ["/"]}}))
+    assert not os.path.exists(os.path.join(os.getcwd(), "cfg", "settings.json"))
+    lr = _scope_launcher(world, {"CLAUDE_CONFIG_DIR": "cfg"})
+    with pytest.raises(RoomLaunchError, match="CLAUDE_CONFIG_DIR 'cfg' is not an absolute path"):
+        lr.ensure()
+    assert spawns(world) == []
+    for rel in ("~/cfg", "./cfg"):
+        assert "not an absolute path" in room_launch.settings_scope_refusal({"CLAUDE_CONFIG_DIR": rel}, str(world["home"]),
+                                                                            managed=(), cwd=str(world["cwd"]))
+
+
+def test_k2_an_empty_config_dir_is_unset_for_the_child_as_it_is_for_the_check():
+    env = room_launch.room_env({"PATH": "/bin", "CLAUDE_CONFIG_DIR": ""})
+    assert "CLAUDE_CONFIG_DIR" not in env
+    assert room_launch.room_env({"CLAUDE_CONFIG_DIR": "/abs/cfg"})["CLAUDE_CONFIG_DIR"] == "/abs/cfg"
+
+
+def test_k5_relative_and_empty_search_path_entries_do_not_reach_the_child():
+    """FINDINGS_room_r2 K5: the child runs in the room's DIR, so '.', '' or 'bin' in PATH (or PYTHONPATH) would let a
+    file in DIR stand in for claude (or levain's room door)."""
+    env = room_launch.room_env({"PATH": "/bin:.:bin::/usr/bin", "PYTHONPATH": ":src:/abs/site"})
+    assert env["PATH"] == "/bin:/usr/bin" and env["PYTHONPATH"] == "/abs/site"
+    assert "PYTHONPATH" not in room_launch.room_env({"PATH": "/bin"})
+
+
+_OUTSIDE = ["Read(//{other}/**)", "Read(~/private/**)", "Read(~)", "Grep(/notes/**)", "Glob(../sibling/**)",
+            "Read(//**)", "Edit(//{other}/x)", "Read( //{other}/a*b )", "Read(//{cwd}-twin/**)"]
+_INSIDE = ["Read", "Grep", "Read(**)", "Read(*)", "Read(./src/**)", "Read(src/*.py)", "Read(//{cwd}/**)",
+           "Read(//{cwd})", "Bash(ls:*)", "WebFetch(domain:example.com)", "mcp__levain_room__drop"]
+
+
+def _rule_world(tmp_path):
+    home, cwd, other = tmp_path / "h", tmp_path / "proj", tmp_path / "other"
+    for d in (home / ".claude", cwd / "src", other):
+        d.mkdir(parents=True)
+    return home, cwd, other
+
+
+@pytest.mark.parametrize("rule", _OUTSIDE)
+def test_k3_a_path_specific_file_allow_rule_outside_the_room_refuses(tmp_path, rule):
+    """FINDINGS_room_r2 K3: the check saw only additionalDirectories; a path-specific Read allow outside the cwd widens
+    the read scope while the one scope decoy (a fresh temp dir) can still be denied."""
+    home, cwd, other = _rule_world(tmp_path)
+    r = rule.format(other=str(other).lstrip("/"), cwd=str(cwd).lstrip("/"))
+    (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Read", r]}}))
+    why = room_launch.settings_scope_refusal({}, str(home), managed=(), cwd=str(cwd))
+    assert why is not None and "allows" in why and "outside its directory" in why, (r, why)
+
+
+@pytest.mark.parametrize("rule", _INSIDE)
+def test_k3_a_bare_rule_another_tool_or_a_path_inside_the_room_adds_nothing(tmp_path, rule):
+    home, cwd, _other = _rule_world(tmp_path)
+    r = rule.format(cwd=str(cwd).lstrip("/"))
+    (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": [r], "ask": ["Read(//**)"]}}))
+    assert room_launch.settings_scope_refusal({}, str(home), managed=(), cwd=str(cwd)) is None, r
+
+
+def test_k3_a_managed_file_or_profile_with_an_outside_rule_refuses_and_allow_must_be_a_list(tmp_path):
+    import plistlib
+    home, cwd, other = _rule_world(tmp_path)
+    managed = tmp_path / "managed-settings.json"
+    managed.write_text(json.dumps({"permissions": {"allow": [f"Read(/{other}/**)"]}}))
+    assert "allows" in room_launch.settings_scope_refusal({}, str(home), managed=(str(managed),), cwd=str(cwd))
+    prof = tmp_path / "com.anthropic.claudecode.plist"
+    prof.write_bytes(plistlib.dumps({"permissions": {"allow": [f"Read(/{other}/**)"]}}))
+    assert "allows" in room_launch.settings_scope_refusal({}, str(home), managed=(str(prof),), cwd=str(cwd))
+    prof.write_bytes(b"not a plist")
+    assert "cannot be read" in room_launch.settings_scope_refusal({}, str(home), managed=(str(prof),), cwd=str(cwd))
+    (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": "Read"}}))
+    assert "not a list" in room_launch.settings_scope_refusal({}, str(home), managed=(), cwd=str(cwd))
+
+
+def test_k3_the_launcher_refuses_an_outside_rule_before_any_spawn(world, tmp_path, monkeypatch):
+    monkeypatch.setattr(room_launch, "MANAGED_SETTINGS", ())
+    (world["home"] / ".claude").mkdir()
+    (world["home"] / ".claude" / "settings.json").write_text(
+        json.dumps({"permissions": {"allow": [f"Read(/{tmp_path}/elsewhere/**)"]}}))
+    with pytest.raises(RoomLaunchError, match="outside its directory"):
+        _scope_launcher(world, {}).ensure()
+    assert spawns(world) == []
+
+
+# --- roomfix3 R3-1: the managed-settings.d drop-ins; R3-2: an all-relative search path; the LOWs ------------------------
+def _managed_dir(tmp_path):
+    """A managed system directory holding NO managed-settings.json, only a drop-in directory (Claude Code loads the
+    drop-ins alone: code.claude.com/docs/en/managed-settings.md, source label `(drop-ins)`)."""
+    sysdir = tmp_path / "ClaudeCode"
+    (sysdir / "managed-settings.d").mkdir(parents=True)
+    return sysdir, (str(sysdir / "managed-settings.json"),)
+
+
+def test_r3_1_a_drop_in_alone_with_an_outside_rule_or_directory_refuses(tmp_path):
+    """FINDINGS_room_r3 R3-1: MANAGED_SETTINGS named three files; the drop-ins Claude Code merges after
+    managed-settings.json (every *.json in managed-settings.d, even with no base file) were never read."""
+    home, cwd, other = _rule_world(tmp_path)
+    sysdir, managed = _managed_dir(tmp_path)
+    drop = sysdir / "managed-settings.d" / "x.json"
+    drop.write_text(json.dumps({"permissions": {"allow": [f"Read(/{other}/**)"]}}))
+    why = room_launch.settings_scope_refusal({}, str(home), managed=managed, cwd=str(cwd))
+    assert why is not None and "allows" in why and str(drop) in why, why
+    drop.write_text(json.dumps({"permissions": {"additionalDirectories": [str(other)]}}))
+    assert "additionalDirectories" in room_launch.settings_scope_refusal({}, str(home), managed=managed, cwd=str(cwd))
+
+
+def test_r3_1_hidden_and_non_json_drop_ins_are_not_read_and_a_bad_drop_in_refuses(tmp_path):
+    """Claude Code ignores hidden files and files not ending in .json (the same page); a drop-in it would refuse to
+    start on (not a JSON object) is refused here too."""
+    home, cwd, other = _rule_world(tmp_path)
+    sysdir, managed = _managed_dir(tmp_path)
+    outside = json.dumps({"permissions": {"allow": [f"Read(/{other}/**)"]}})
+    (sysdir / "managed-settings.d" / ".hidden.json").write_text(outside)
+    (sysdir / "managed-settings.d" / "notes.txt").write_text(outside)
+    (sysdir / "managed-settings.d" / "10-ok.json").write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
+    assert room_launch.settings_scope_refusal({}, str(home), managed=managed, cwd=str(cwd)) is None
+    (sysdir / "managed-settings.d" / "20-bad.json").write_text("[1, 2]")
+    assert "not a JSON object" in room_launch.settings_scope_refusal({}, str(home), managed=managed, cwd=str(cwd))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 000 directory")
+def test_r3_1_a_drop_in_directory_that_cannot_be_listed_refuses(tmp_path):
+    home, cwd, _other = _rule_world(tmp_path)
+    sysdir, managed = _managed_dir(tmp_path)
+    d = sysdir / "managed-settings.d"
+    d.chmod(0)
+    try:
+        why = room_launch.settings_scope_refusal({}, str(home), managed=managed, cwd=str(cwd))
+    finally:
+        d.chmod(0o700)
+    assert why is not None and "cannot be read" in why and str(d) in why, why
+
+
+def test_r3_1_the_launcher_refuses_a_drop_in_rule_before_any_spawn(world, tmp_path, monkeypatch):
+    sysdir, managed = _managed_dir(tmp_path)
+    (sysdir / "managed-settings.d" / "x.json").write_text(
+        json.dumps({"permissions": {"allow": [f"Read(/{tmp_path}/elsewhere/**)"]}}))
+    monkeypatch.setattr(room_launch, "MANAGED_SETTINGS", managed)
+    with pytest.raises(RoomLaunchError, match="outside its directory"):
+        _scope_launcher(world, {}).ensure()
+    assert spawns(world) == []
+
+
+def test_r3_2_an_all_relative_search_path_is_not_passed_as_the_empty_path():
+    """FINDINGS_room_r3 R3-2: every entry relative left PATH="" (and PYTHONPATH=""), and an empty entry is the child's
+    cwd, the room's DIR. The name is dropped instead, so the child gets its platform's default search path."""
+    env = room_launch.room_env({"PATH": "bin:.:", "PYTHONPATH": "src::"})
+    assert "PATH" not in env and "PYTHONPATH" not in env, env
+    assert "" not in os.get_exec_path(env)
+
+
+def test_r3_low_a_parent_segment_after_a_glob_counts_as_outside(tmp_path):
+    """FINDINGS_room_r3 LOW: the literal-prefix cut stopped at the first glob, so `..` after it climbed out unseen."""
+    home, cwd, _other = _rule_world(tmp_path)
+    for r in (f"Read(/{cwd}/*/../../other/**)", "Read(src/**/../../../other/x)"):
+        (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": [r]}}))
+        assert "outside its directory" in (room_launch.settings_scope_refusal({}, str(home), managed=(), cwd=str(cwd))
+                                           or ""), r
+
+
+def test_r3_low_a_malformed_xml_profile_refuses_rather_than_raising(tmp_path):
+    home, cwd, _other = _rule_world(tmp_path)
+    prof = tmp_path / "com.anthropic.claudecode.plist"
+    prof.write_bytes(b'<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>permissions</broken>')
+    why = room_launch.settings_scope_refusal({}, str(home), managed=(str(prof),), cwd=str(cwd))
+    assert why is not None and "cannot be read" in why, why
+
+
+def test_r3_low_xdg_config_home_does_not_reach_the_child():
+    """FINDINGS_room_r3 LOW: XDG_CONFIG_HOME was passed on but no file under it is checked; it is not passed, so the
+    child's config is the one the check reads."""
+    assert "XDG_CONFIG_HOME" not in room_launch.room_env({"PATH": "/bin", "XDG_CONFIG_HOME": "/elsewhere"})
+
+
+def test_c3_the_child_gets_an_allowlisted_environment(world):
+    secret = {"LEVAIN_TEST_SECRET": "s3cret", "AWS_SECRET_ACCESS_KEY": "x", "GITHUB_TOKEN": "y", "LC_ALL": "C"}
+    lr = RoomLauncher(world["cs"], world["svc"], RoomSetting(str(world["cwd"]), claude_bin=str(world["script"])),
+                      run_dir=str(world["run"]), home=str(world["home"]), env_keep=("FAKE_DIR",),
+                      environ={**os.environ, "FAKE_DIR": str(world["fake"]), **secret})
+    world["launchers"].append(lr)
+    lr.ensure()
+    got = set(json.loads((world["fake"] / "spawn-1.env").read_text()))
+    assert not got & {"LEVAIN_TEST_SECRET", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"}
+    assert {"PATH", "LEVAIN_ROOM", "FAKE_DIR", "LC_ALL"} <= got
+    env = room_launch.room_env({"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "k", "OPENAI_API_KEY": "o",
+                                "LEVAIN_HOME": "/lv", "LEVAIN_WRITE_TOKEN": "t"})
+    assert env == {"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "k", "LEVAIN_HOME": "/lv", "LEVAIN_ROOM": "1"}

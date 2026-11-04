@@ -1,0 +1,479 @@
+// levain room_view.js — the cockpit's one Claude room (RM-F).
+//
+// A conversation with the room over GET /cockpit/room.json and POST /cockpit/room/*: a draft box with Send, Drop and
+// Stop, the room's cards (a drop it proposed, which only YOUR tap commits), the reconcile of an ambiguous line, and a
+// dictation control where the browser has one. The page decides nothing: what may be sent, whether a line arrived and
+// whether a card became a drop are the server's words, drawn as given. Every word that came from the record is set with
+// textContent, never as markup. The stream is drawn in the order the server sent (gseq); nothing here sorts it.
+//
+// A card's words are bytes you sent: the field holds your quoted message (editable), and the room's own summary is a
+// separate, labelled note that is information and never your words. Dictation runs only while this page is in the
+// foreground: it fills the draft, you read it, and Send or Drop works exactly as typing. No audio reaches Levain.
+(function (root) {
+  "use strict";
+
+  var ROOM_PATH = "/cockpit/room.json";
+  var POST_PREFIX = "/cockpit/room/";
+  var SEND_WORDS = {
+    accepted: "Sent.",
+    ambiguous: "Sent, but it may not have arrived. It is not sent again; you can say whether it did."
+  };
+  var STOP_WORDS = {
+    confirmed: "Stopped.",
+    no_such_request: "Nothing was running to stop.",
+    ambiguous: "The stop was sent; it was not confirmed.",
+    rejected: "The stop was refused."
+  };
+  var MARK_WORDS = { accepted: "Marked: it arrived.", not_delivered: "Marked: it did not arrive." };
+  var COMPOSER_WORDS = {
+    none: "The room starts when you send the first line.",
+    ended: "The room starts again when you send a line.",
+    no_session: "The room starts again when you send a line.",
+    not_live: "The room is not available right now.",
+    checking: "The room is getting ready.",
+    writable: ""
+  };
+  var SEND_STATES = { none: 1, ended: 1, no_session: 1, writable: 1 };
+  var STOP_STATES = { writable: 1, checking: 1, not_live: 1 };
+  var COLLAPSED = { vendor_tool_call: 1, vendor_tool_result: 1 };
+  var HIDDEN = { vendor_echo: 1, vendor_turn_started: 1, vendor_turn_ended: 1, vendor_user_item: 1 };
+
+  function own(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+  function peek(text) {
+    var first = String(text || "").split("\n")[0].trim();
+    return first.length > 120 ? first.slice(0, 120) + "..." : first;
+  }
+
+  function lineModel(it) {
+    var you = it.kind === "message" && it.source === "operator";
+    var room = it.kind === "vendor_agent_text";
+    // the session reports its permission mode on every turn as an error-kind row; the expected mode is not an error, and a
+    // row that reads "Error" on every turn trains the eye past the one that is (any other mode is still drawn)
+    var modeNoise = it.kind === "vendor_error" && it.body === "dontAsk";
+    var text = it.body == null ? "" : String(it.body);
+    // a hook of the operator's own settings starting in the child (body e.g. "SessionStart:startup") and one that ended
+    // in success are recorded as error-kind rows too (claude_session._on_hook, ref "error:hook_started:<id>"); they are
+    // not errors (roomfix2, seen on a real open). A hook that ended any other way, and every other error, is drawn.
+    var ref = it.ref == null ? "" : String(it.ref);
+    var hookNoise = it.kind === "vendor_error" && (ref.indexOf("error:hook_started:") === 0 ||
+      (ref.indexOf("error:hook_response:") === 0 && / success$/.test(text)));
+    if (it.kind === "vendor_approval_request") text = "The room asked for something it cannot have; nothing was granted.";
+    if (it.kind === "vendor_approval_resolved") text = "";
+    return {
+      gseq: it.gseq, ref: ref, at: it.at || "",
+      who: you ? "You" : (room ? "The room" : ""), cls: you ? "rv-you" : (room ? "rv-room" : (it.kind === "vendor_error" ? "rv-error" : "")),
+      kind: String(it.kind), text: text, collapsible: own(COLLAPSED, it.kind), hidden: own(HIDDEN, it.kind) || modeNoise || hookNoise,
+      ambiguous: it.kind === "message" && it.status === "ambiguous",
+      truncated: it.truncated === true, tool: it.tool ? { open: it.tool.open === true } : null
+    };
+  }
+
+  function roomModel(body) {
+    var c = body.composer || null, st = c && own(COMPOSER_WORDS, c.state) ? c.state : "none";
+    var thread = typeof body.room_thread === "string" ? body.room_thread : null;
+    return {
+      thread: thread, open: thread !== null,
+      canSend: thread !== null && own(SEND_STATES, st), canStop: thread !== null && own(STOP_STATES, st),
+      state: st, words: thread === null ? "No room is open." : (c && c.why && st !== "writable" ? COMPOSER_WORDS[st] + " (" + c.why + ")" : COMPOSER_WORDS[st]),
+      model: typeof body.model === "string" && body.model ? "Model in use: " + body.model : "",
+      gap: body.gap === true,
+      error: typeof body.room_error === "string" ? body.room_error : "",
+      stream: (body.stream || []).map(lineModel).filter(function (l) { return !l.hidden; }),
+      proposals: (body.proposals || []).map(function (p) {
+        return { id: String(p.proposal_id), state: String(p.state), words: String(p.words == null ? "" : p.words),
+                 summary: String(p.summary == null ? "" : p.summary), about: p.about == null ? "" : String(p.about) };
+      })
+    };
+  }
+
+  function sendWords(status, j) {
+    if (status === 200 && j && j.receipt && own(SEND_WORDS, j.receipt.state)) return SEND_WORDS[j.receipt.state];
+    if (status >= 500) return "The server answered " + status + "; the line may or may not have been sent. Sending again will not duplicate it.";
+    if (status === 202) return (j && j.message) || "The line was sent; it is not settled.";
+    if (j && j.error === "room_rotated") return "This conversation was replaced; reading the new one. Your draft is kept.";
+    if (j && j.message) return "Not sent: " + j.message;
+    return "Not sent: the server answered " + status + ".";
+  }
+
+  function el(doc, tag, cls, text) {
+    var n = doc.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  // ordinary prose for the phone's keyboard (autocorrect, the dictation key); a dash-free name keeps Safari's AutoFill off it
+  function prose(node, name) {
+    [["name", name], ["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["autocomplete", "off"]]
+      .forEach(function (kv) { node.setAttribute(kv[0], kv[1]); });
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  // hooks: onMark(ref, delivered, note, done), onCommit(card, words, note, buttons), onDismiss(card, note, buttons); ui.open keyed by gseq
+  function renderLine(doc, l, hooks, ui) {
+    var row = el(doc, "div", "rv-line " + l.cls);
+    var fold = l.collapsible && !!ui, shown = fold && ui.open[l.gseq] === true;
+    var head = el(doc, fold ? "button" : "div", "rv-who");
+    if (fold) { head.setAttribute("type", "button"); head.setAttribute("aria-expanded", shown ? "true" : "false"); }
+    head.textContent = l.who || (l.tool ? (l.tool.open ? "A tool is running" : "A tool ran") : (l.kind === "vendor_error" ? "Error" : l.kind.replace(/_/g, " ")));
+    if (fold && !shown && l.text) head.textContent += " — " + peek(l.text);
+    row.appendChild(head);
+    var pre = l.text ? el(doc, "div", "rv-text", l.text) : null;
+    if (pre) {
+      if (fold) pre.hidden = !shown;
+      row.appendChild(pre);
+    }
+    if (fold && pre) {
+      head.addEventListener("click", function () {
+        var now = pre.hidden;
+        pre.hidden = !now; head.setAttribute("aria-expanded", now ? "true" : "false");
+        if (now) ui.open[l.gseq] = true; else delete ui.open[l.gseq];
+        head.textContent = l.who || (l.tool ? (l.tool.open ? "A tool is running" : "A tool ran") : l.kind.replace(/_/g, " "));
+        if (!now && l.text) head.textContent += " — " + peek(l.text);
+      });
+    }
+    if (l.truncated) row.appendChild(el(doc, "div", "rv-note", "Cut short; the vendor holds the rest."));
+    if (l.ambiguous && l.ref && hooks && hooks.onMark) {
+      var box = el(doc, "div", "rv-mark"), yes = el(doc, "button", "rv-mark-yes", "It arrived"),
+        no = el(doc, "button", "rv-mark-no", "It did not arrive"), note = el(doc, "span", "rv-marknote");
+      yes.setAttribute("type", "button"); no.setAttribute("type", "button"); note.setAttribute("role", "status");
+      box.appendChild(el(doc, "span", "rv-marklabel", "This line may not have arrived. You decide:"));
+      [[yes, true], [no, false]].forEach(function (p) {
+        p[0].addEventListener("click", function () { yes.disabled = true; no.disabled = true; hooks.onMark(l.ref, p[1], note, function () { yes.disabled = false; no.disabled = false; }); });
+      });
+      box.appendChild(yes); box.appendChild(no); box.appendChild(note);
+      row.appendChild(box);
+    }
+    return row;
+  }
+
+  // a proposal card: the field holds the words (yours, editable); the summary is the room's note, labelled information
+  function renderCard(doc, c, hooks, drafts) {
+    var card = el(doc, "div", "rv-card rv-card-" + c.state.replace(/[^a-z]/g, ""));
+    card.setAttribute("data-proposal", c.id);
+    if (c.state === "committed") { card.appendChild(el(doc, "div", "rv-note", "Dropped: these words went to the desk.")); card.appendChild(el(doc, "div", "rv-text", c.words)); return card; }
+    if (c.state === "dismissed") { card.appendChild(el(doc, "div", "rv-note", "Not dropped.")); return card; }
+    card.appendChild(el(doc, "div", "rv-note", c.state === "expired" ? "This card is from an earlier conversation and cannot be sent." : "The room can drop this to the desk. Nothing is sent until you tap."));
+    var ta = el(doc, "textarea", "rv-cardwords");
+    ta.setAttribute("rows", "3"); ta.setAttribute("aria-label", "The words to drop");
+    prose(ta, "roomcardwords");
+    ta.value = own(drafts, c.id) ? drafts[c.id] : c.words;     // an edit survives a redraw
+    ta.addEventListener("input", function () { drafts[c.id] = ta.value; if (hooks.saveCards) hooks.saveCards(); });
+    card.appendChild(ta);
+    card.appendChild(el(doc, "div", "rv-summary-label rv-note", "The room's summary (information, not your words)"));
+    card.appendChild(el(doc, "div", "rv-summary", c.summary));
+    var note = el(doc, "div", "rv-sendnote"), go = el(doc, "button", "rv-commit", "Drop these words"), no = el(doc, "button", "rv-dismiss", "Not now");
+    go.setAttribute("type", "button"); no.setAttribute("type", "button"); note.setAttribute("role", "status");
+    if (c.state === "expired") go.disabled = true;
+    go.addEventListener("click", function () { hooks.onCommit(c, ta.value, note, [go, no]); });
+    no.addEventListener("click", function () { hooks.onDismiss(c, note, [go, no]); });
+    card.appendChild(go); card.appendChild(no); card.appendChild(note);
+    return card;
+  }
+
+  // The stream is redrawn whole; the cards are kept: a card's element persists across redraws while its state, words and
+  // summary are unchanged, so a textarea keeps its focus and caret while the room streams. Order is reconciled by
+  // moving only the nodes that are out of place (a node already in its slot is never re-inserted, which would blur it).
+  function renderRoom(doc, host, m, hooks, ui, drafts) {
+    var st = host.__rv;
+    if (!st || st.streamBox.parentNode !== host || st.cardsBox.parentNode !== host) {
+      clear(host);
+      st = host.__rv = { streamBox: el(doc, "div", "rv-stream"), cardsBox: el(doc, "div", "rv-cards"), cards: {} };
+      host.appendChild(st.streamBox); host.appendChild(st.cardsBox);
+    }
+    clear(st.streamBox);
+    if (m.model) st.streamBox.appendChild(el(doc, "div", "rv-head", m.model));
+    if (m.error) st.streamBox.appendChild(el(doc, "div", "rv-note rv-error", "The room reported: " + m.error));
+    if (m.gap) st.streamBox.appendChild(el(doc, "div", "rv-gap", "Some lines may be missing from this conversation."));
+    if (!m.stream.length) st.streamBox.appendChild(el(doc, "div", "rv-note", m.open ? "Nothing has been said yet." : m.words));
+    m.stream.forEach(function (l) { st.streamBox.appendChild(renderLine(doc, l, hooks, ui)); });
+    var keep = {};
+    m.proposals.forEach(function (c, i) {
+      var key = c.state + "\u0000" + c.words + "\u0000" + c.summary, have = own(st.cards, c.id) ? st.cards[c.id] : null;
+      if (!have || have.key !== key) { st.cards[c.id] = have = { key: key, node: renderCard(doc, c, hooks, drafts) }; }
+      keep[c.id] = true;
+      if (st.cardsBox.children[i] !== have.node) st.cardsBox.insertBefore(have.node, st.cardsBox.children[i] || null);
+    });
+    Object.keys(st.cards).forEach(function (id) {
+      if (!own(keep, id)) { var n = st.cards[id].node; if (n.parentNode) n.parentNode.removeChild(n); delete st.cards[id]; }
+    });
+    while (st.cardsBox.children.length > m.proposals.length) st.cardsBox.removeChild(st.cardsBox.lastChild);
+  }
+
+  // mount(host, {fetch, headers, pollMs, speech, storage}): returns {stop, refresh, model}. Polls while mounted and redraws
+  // only when the body changed. The dock lives OUTSIDE the redrawn body, so a poll never takes the draft.
+  function mount(host, opts) {
+    opts = opts || {};
+    var doc = host.ownerDocument;
+    var f = opts.fetch || root.fetch.bind(root);
+    var headers = opts.headers || function () { return {}; };
+    var pollMs = opts.pollMs == null ? 2000 : opts.pollMs;
+    var Speech = opts.speech === undefined ? (root.SpeechRecognition || root.webkitSpeechRecognition) : opts.speech;
+    // Dictation is on-device or absent: a browser whose recognizer cannot be told to stay local (it would send the audio to
+    // the browser vendor's cloud) gets no control, and the keyboard's own dictation key fills the draft box instead.
+    if (Speech && !(Speech.prototype && "processLocally" in Speech.prototype)) Speech = null;
+    var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
+    var stopped = false, timer = 0, gen = 0, last = "", thread = null, current = null, ui = { open: {} }, drafts = {};
+    var wrap = el(doc, "div", "rv"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock");
+    wrap.appendChild(body); wrap.appendChild(dock); host.appendChild(wrap);
+    var ta = el(doc, "textarea", "rv-input"), actions = el(doc, "div", "rv-actions"),
+      sendB = el(doc, "button", "rv-send", "Send"), dropB = el(doc, "button", "rv-drop", "Drop"),
+      stopB = el(doc, "button", "rv-stop", "Stop"), note = el(doc, "div", "rv-sendnote"),
+      openB = el(doc, "button", "rv-open", "Open the room");
+    ta.setAttribute("rows", "3"); ta.setAttribute("aria-label", "Message to the room");
+    prose(ta, "roomdraft");
+    [sendB, dropB, stopB, openB].forEach(function (b) { b.setAttribute("type", "button"); });
+    openB.hidden = true;           // shown only once a read says no room is open: with none, every other control is dark
+    note.setAttribute("role", "status");
+    actions.appendChild(sendB); actions.appendChild(dropB); actions.appendChild(stopB);
+    var micB = null, rec = null;
+    if (Speech) {
+      micB = el(doc, "button", "rv-mic", "Dictate");
+      micB.setAttribute("type", "button");
+      micB.setAttribute("title", "On-device dictation where this browser provides it, and only while this page is open");
+      actions.appendChild(micB);
+    }
+    var rotB = null;
+    if (opts.rotate !== false) { rotB = el(doc, "button", "rv-rotate", "New conversation"); rotB.setAttribute("type", "button"); actions.appendChild(rotB); }
+    dock.appendChild(openB); dock.appendChild(ta); dock.appendChild(actions); dock.appendChild(note);
+    var flight = { send: false, drop: false, stop: false, open: false };
+    try { if (store && store.getItem("levain.room.draft")) ta.value = store.getItem("levain.room.draft"); } catch (e) { /* no storage */ }
+    ta.addEventListener("input", function () { try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ } });
+    // The outbox id a line or a drop was last tried under, and the cards' edits, are kept beside the draft (roomfix1 R2):
+    // the dashboard unmounts this view whenever the page is hidden (an app switch on the phone), and a remount that minted
+    // a new id would send a line twice after an unanswered try. The store is the truth across mounts of one tab; with no
+    // store they live in this mount only.
+    var mem = {};
+    function kept(key) {
+      if (store) { try { var raw = store.getItem(key); return raw === null ? null : JSON.parse(raw); } catch (e) { /* fall back */ } }
+      return own(mem, key) ? mem[key] : null;
+    }
+    // A stopped mount writes nothing kept (roomfix2 A1): its late answer to a send made before an app switch would clear
+    // the id and the draft the mount that replaced it is showing, and a Send there would mint a new id for the same words.
+    // The kept id stays; a resend under it is answered as the line it already is.
+    function keep(key, v) {
+      if (stopped) return;
+      mem[key] = v;
+      try { if (store) { if (v === null) store.removeItem(key); else store.setItem(key, JSON.stringify(v)); } } catch (e) { /* no storage */ }
+    }
+    // the id to try `text` under: the kept one when it was tried for these exact words, else a new one (kept at once)
+    function tryId(key, text) {
+      var p = kept(key);
+      var id = (p && typeof p.id === "string" && p.text === text) ? p.id : newId();
+      keep(key, { id: id, text: text });
+      return id;
+    }
+    function settle(key, id) { var p = kept(key); if (p && p.id === id) keep(key, null); }
+    var savedCards = kept("levain.room.cards");
+    if (!savedCards || typeof savedCards !== "object") savedCards = {};
+    var cardsThread = typeof savedCards.thread === "string" ? savedCards.thread : null;
+    drafts = savedCards.drafts && typeof savedCards.drafts === "object" ? savedCards.drafts : {};
+
+    function newId() {
+      var c = root.crypto;
+      return "ob-" + (c && c.randomUUID ? c.randomUUID().replace(/-/g, "") : String(Date.now()) + Math.random().toString(16).slice(2));
+    }
+    function paintDock() {
+      var m = current;
+      var can = !!m && m.canSend;
+      sendB.disabled = !can || flight.send;
+      dropB.disabled = !m || !m.open || flight.drop;
+      stopB.disabled = !m || !m.canStop || flight.stop;
+      ta.disabled = !m || !m.open;
+      if (rotB) rotB.disabled = !m || !m.open;
+      openB.hidden = !m || m.open;
+      openB.disabled = flight.open;
+    }
+    function post(path, payload) {
+      var h = Object.assign({ "Content-Type": "application/json" }, headers());
+      return f(POST_PREFIX + path, { method: "POST", headers: h, body: JSON.stringify(payload) })
+        .then(function (res) { return res.text().then(function (t) { var j = null; try { j = JSON.parse(t); } catch (e) { /* not JSON */ } return { status: res.status, json: j }; }); });
+    }
+    function clearDraft(text) {
+      if (!stopped && ta.value === text) { ta.value = ""; try { if (store) store.removeItem("levain.room.draft"); } catch (e) { /* no storage */ } }
+    }
+    sendB.addEventListener("click", function () {
+      endDictation();
+      var text = ta.value;
+      if (!current || !current.thread || !text.trim() || sendB.disabled || flight.send) return;
+      var sendId = tryId("levain.room.send", text);                     // one id per draft text: a resend reuses it
+      flight.send = true; paintDock(); note.textContent = "Sending...";
+      post("send", { room_thread_id: current.thread, body: text, outbox_id: sendId }).then(function (r) {
+        flight.send = false;
+        if (r.status === 200 && r.json && r.json.receipt) { clearDraft(text); settle("levain.room.send", sendId); }
+        else if (r.status < 500 && r.status !== 202) settle("levain.room.send", sendId);
+        note.textContent = sendWords(r.status, r.json);
+        last = ""; paintDock(); return pull();
+      }).catch(function () {
+        flight.send = false;
+        note.textContent = "The server could not be reached; the line may or may not have been sent. Sending again will not duplicate it.";
+        paintDock();
+      });
+    });
+    dropB.addEventListener("click", function () {
+      endDictation();
+      var text = ta.value;
+      if (!current || !text.trim() || dropB.disabled || flight.drop) return;
+      var dropId = tryId("levain.room.drop", text);
+      flight.drop = true; paintDock(); note.textContent = "Dropping...";
+      post("drop", { words: text, outbox_id: dropId }).then(function (r) {
+        flight.drop = false;
+        if (r.status === 200) { clearDraft(text); settle("levain.room.drop", dropId); note.textContent = "Dropped: your words went to the desk."; }
+        else { if (r.status < 500) settle("levain.room.drop", dropId); note.textContent = (r.json && r.json.message) ? "Not dropped: " + r.json.message : "Not dropped: the server answered " + r.status + "."; }
+        paintDock();
+      }).catch(function () { flight.drop = false; note.textContent = "The server could not be reached; the drop may or may not have gone. Dropping again will not duplicate it."; paintDock(); });
+    });
+    openB.addEventListener("click", function () {
+      if (openB.disabled || flight.open) return;
+      flight.open = true; paintDock(); note.textContent = "Opening the room...";
+      post("open", {}).then(function (r) {
+        note.textContent = r.status === 200 ? "The room is open." : ((r.json && r.json.message) ? "Not opened: " + r.json.message : "Not opened: the server answered " + r.status + ".");
+        last = ""; return pull();
+      }).catch(function () { note.textContent = "The server could not be reached; the room may or may not have opened."; })
+        .then(function () { flight.open = false; paintDock(); });
+    });
+    stopB.addEventListener("click", function () {
+      if (!current || !current.thread || stopB.disabled || flight.stop) return;
+      flight.stop = true; paintDock(); note.textContent = "Stopping...";
+      post("stop", { room_thread_id: current.thread }).then(function (r) {
+        var o = r.json && r.json.outcome;
+        note.textContent = o && own(STOP_WORDS, o) ? STOP_WORDS[o] : ((r.json && r.json.message) || "The stop was not sent.");
+        last = ""; return pull();
+      }).catch(function () { note.textContent = "The stop could not be sent: the server could not be reached."; })
+        .then(function () { flight.stop = false; paintDock(); });
+    });
+    if (rotB) rotB.addEventListener("click", function () {
+      if (rotB.disabled) return;
+      rotB.disabled = true; note.textContent = "Starting a new conversation...";
+      post("rotate", { room_thread_id: current && current.thread }).then(function (r) {
+        note.textContent = r.status === 200 ? "A new conversation is open." : ((r.json && r.json.message) || "No new conversation was started.");
+        last = ""; return pull();
+      }).catch(function () { note.textContent = "The server could not be reached."; }).then(paintDock);
+    });
+    // dictation state: dbase = the text before the transcript, heard = the transcript already placed in the box
+    var dbase = "", heard = "", lastHeard = "";
+    function endDictation() {
+      var r = rec; rec = null;
+      if (micB) micB.textContent = "Dictate";
+      if (r) { r.onresult = null; r.onend = null; r.onerror = null; try { r.stop(); } catch (e) { /* already stopped */ } }
+    }
+    if (micB) {
+      var lang = doc.documentElement.lang || (root.navigator && root.navigator.language) || "en-US";
+      micB.style.display = "none";                     // shown only once the browser says on-device dictation is available
+      // probe:false skips the availability question. MEASURED 2026-11-04 (RM-G2): SpeechRecognition.available({processLocally:true})
+      // froze the renderer of the installed headless Google Chrome on a bare page, so the cockpit page asks it nowhere; the mic
+      // is then shown on the prototype test alone and the click-time processLocally readback and onerror stay the guard.
+      if (opts.probe !== false && typeof Speech.available === "function") {
+        var asked;
+        try { asked = Speech.available({ langs: [lang], processLocally: true }); } catch (e) { asked = null; }
+        if (asked && asked.then) {
+          asked.then(function (st) {
+            if (st === "unavailable") { micB.remove(); }
+            else if (st === "downloadable" || st === "downloading") {
+              micB.remove();
+              if (!note.textContent) note.textContent = "On-device dictation is not installed on this browser; the keyboard dictation key works.";
+            } else micB.style.display = "";
+          }, function () { micB.style.display = ""; });
+        } else micB.style.display = "";
+      } else micB.style.display = "";
+      ta.addEventListener("input", function () { if (rec) { dbase = ta.value; heard = lastHeard; } });
+      micB.addEventListener("click", function () {
+        if (rec) { endDictation(); return; }
+        var r = new Speech();
+        dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
+        r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
+        if (r.processLocally !== true) { note.textContent = "This browser will not keep dictation on this device, so it is off; the keyboard dictation key works."; return; }
+        r.onresult = function (ev) {
+          if (rec !== r) return;                       // a late result from a recognizer that was ended
+          var t = "";
+          for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
+          lastHeard = t;
+          ta.value = dbase + (heard && t.indexOf(heard) === 0 ? t.slice(heard.length) : t);
+          try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ }
+        };
+        r.onend = function () { if (rec === r) endDictation(); };
+        r.onerror = function (ev) {
+          if (rec !== r) return;
+          endDictation();
+          var c = ev && ev.error;
+          note.textContent = c === "language-not-supported" ? "On-device dictation is not installed for this language; the keyboard's dictation key works here."
+            : (c === "not-allowed" || c === "service-not-allowed") ? "Dictation needs permission to use the microphone; allow it in the browser's site settings."
+            : c === "audio-capture" ? "No microphone was found for dictation."
+            : c === "no-speech" ? "Heard nothing."
+            : "Dictation stopped.";
+        };
+        rec = r; micB.textContent = "Stop dictating";
+        try { r.start(); } catch (e) { endDictation(); }
+      });
+      // foreground only: leaving the page ends dictation
+      var leave = function () { if (rec) endDictation(); };
+      doc.addEventListener("visibilitychange", function () { if (doc.visibilityState === "hidden") leave(); });
+      root.addEventListener && root.addEventListener("blur", leave);
+    }
+
+    var hooks = {
+      onMark: function (ref, delivered, mnote, done) {
+        mnote.textContent = "Marking...";
+        post("mark", { room_thread_id: thread, message_id: ref, delivered: delivered }).then(function (r) {
+          mnote.textContent = (r.status === 200 && r.json && own(MARK_WORDS, r.json.state)) ? MARK_WORDS[r.json.state] : "Not marked: " + ((r.json && r.json.message) || "the server answered " + r.status + ".");
+          if (r.status === 200) { last = ""; pull(); } else done();
+        }).catch(function () { mnote.textContent = "Not marked: the server could not be reached."; done(); });
+      },
+      onCommit: function (card, words, cnote, btns) {
+        if (!words.trim()) { cnote.textContent = "Nothing to drop: the field is empty."; return; }
+        btns.forEach(function (b) { b.disabled = true; });
+        var key = card.id + "|" + words;
+        if (!own(hooks.ids, key)) { hooks.ids[key] = newId(); saveCards(); }
+        cnote.textContent = "Dropping...";
+        post("proposal/" + encodeURIComponent(card.id) + "/commit", { words: words, outbox_id: hooks.ids[key] }).then(function (r) {
+          if (r.status === 200) { delete drafts[card.id]; saveCards(); last = ""; pull(); return; }
+          if (r.status < 500) { delete hooks.ids[key]; saveCards(); }
+          cnote.textContent = "Not dropped: " + ((r.json && r.json.message) || "the server answered " + r.status + ".");
+          btns.forEach(function (b) { b.disabled = card.state === "expired" && b.className === "rv-commit"; });
+        }).catch(function () { cnote.textContent = "The server could not be reached; dropping again will not duplicate it."; btns.forEach(function (b) { b.disabled = false; }); });
+      },
+      onDismiss: function (card, cnote, btns) {
+        btns.forEach(function (b) { b.disabled = true; });
+        post("proposal/" + encodeURIComponent(card.id) + "/dismiss", {}).then(function (r) {
+          if (r.status === 200) { delete drafts[card.id]; saveCards(); last = ""; pull(); return; }
+          cnote.textContent = "Not dismissed: " + ((r.json && r.json.message) || "the server answered " + r.status + ".");
+          btns.forEach(function (b) { b.disabled = false; });
+        }).catch(function () { cnote.textContent = "The server could not be reached."; btns.forEach(function (b) { b.disabled = false; }); });
+      },
+      ids: savedCards.ids && typeof savedCards.ids === "object" ? savedCards.ids : {},
+      saveCards: function () { saveCards(); }
+    };
+    // a stopped mount writes nothing: the mount that replaced it owns the kept cards
+    function saveCards() { if (!stopped) keep("levain.room.cards", { thread: cardsThread, drafts: drafts, ids: hooks.ids }); }
+
+    function pull() {
+      if (stopped) return Promise.resolve();
+      var mine = ++gen;       // a response older than the newest request is dropped, as the work-thread view does
+      return f(ROOM_PATH, { cache: "no-store", headers: headers() }).then(function (res) {
+        if (stopped || mine !== gen) return null;
+        if (!res.ok) { clear(body); body.appendChild(el(doc, "div", "rv-note", res.status === 403 ? "This page carries no token for the room." : "The room could not be read.")); last = ""; return null; }
+        return res.text().then(function (t) {
+          if (stopped || mine !== gen) return;
+          if (t !== last) {
+            last = t;
+            current = roomModel(JSON.parse(t));
+            if (current.thread !== thread) {
+              ui.open = {}; thread = current.thread;
+              // the kept edits belong to the room they were made in: another room starts with none
+              if (thread !== cardsThread) { drafts = {}; hooks.ids = {}; cardsThread = thread; saveCards(); }
+            }
+            renderRoom(doc, body, current, hooks, ui, drafts);
+          }
+          paintDock();
+        });
+      }).catch(function () { if (!stopped) { clear(body); body.appendChild(el(doc, "div", "rv-note", "The room could not be read.")); last = ""; } });
+    }
+    function loop() { if (!stopped && pollMs > 0) timer = setTimeout(function () { pull().then(loop); }, pollMs); }
+    paintDock();
+    pull().then(loop);
+    return { stop: function () { stopped = true; clearTimeout(timer); endDictation(); }, refresh: function () { last = ""; return pull(); }, model: function () { return current; } };
+  }
+
+  var api = { roomModel: roomModel, lineModel: lineModel, sendWords: sendWords, renderRoom: renderRoom, mount: mount };
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+  else root.LevainRoomView = api;
+})(typeof globalThis !== "undefined" ? globalThis : this);

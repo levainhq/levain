@@ -378,6 +378,9 @@ def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | Non
       ticket's kind requires (an executor's or planner's ``route`` and ``model_requested``, a verifier's
       ``verifier_steps``: 3c-8, so no gate below compares a field against an absent one); or a verifier ticket whose
       facts hold no resolved ``verifier`` entry (no driver is authorised without one);
+    - ``ticket-facts-missing`` also: an EXECUTOR ticket on the ``claude`` vendor (the blob's) whose facts hold no
+      ``brief_digest`` (p71 S8: its brief is the agent's whole instruction, so no session starts without one);
+      ``ticket-brief-forbidden``: a ``brief_digest`` in the facts of any session that is not an executor on ``claude``;
     - ``ticket-kind-mismatch``: the alloc's kind and class are not what the ticket's kind renders as;
     - ``ticket-routes-mismatch``: the blob's routes are not exactly the ticket's ``route`` + ``egress_routes``; for a
       PASSTHROUGH ticket (c7.14; ``auth`` is alloc's) exactly one route beside the ticket's ``egress_routes`` (the
@@ -424,6 +427,11 @@ def check_ticket(blob: RenderBlob, kind: str, slot_class: str, ticket: str | Non
             raise Refused("ticket-routes-mismatch", "the blob's routes are not the ticket's")
     if blob.model != ticket_facts.get("model_requested"):
         raise Refused("ticket-model-mismatch", "the blob's model is not the ticket's")
+    executor_claude = ticket_facts["kind"] == "executor" and blob.vendor == "claude"
+    if "brief_digest" in ticket_facts and not executor_claude:
+        raise Refused("ticket-brief-forbidden", f"a {ticket_facts['kind']} ticket on {blob.vendor!s:.16} carries a brief")
+    if executor_claude and "brief_digest" not in ticket_facts:
+        raise Refused("ticket-facts-missing", "an executor ticket on claude without brief_digest")
     if ticket_facts["kind"] != "verifier":
         return
     resolved = ticket_facts.get("verifier")
@@ -502,6 +510,14 @@ def _base_env(facts: RenderFacts, home: PurePosixPath, user: str) -> dict[str, s
     return env
 
 
+def is_print_executor(facts: RenderFacts) -> bool:
+    """Whether the session runs `claude -p` as a dispatch executor (p71 S8). RenderFacts holds the ALLOC's kind, not
+    the ticket's, so the test is alloc kind ``dispatch`` + vendor ``claude``: a planner renders as kind ``planner``
+    and a verifier as ``verifier`` (``RENDERS_AS``: executor -> ``dispatch``, planner -> ``planner``), so neither can
+    match."""
+    return facts.kind == "dispatch" and facts.vendor == "claude"
+
+
 def check_env_absent(vendor: str, names: Iterable[str], auth: str | None = None) -> None:
     """Refused ``env-forbidden`` when ``names`` holds one of :data:`ABSENT_ENV`'s for ``vendor``, so no later edit
     can put ``ANTHROPIC_API_KEY`` (and its blocking prompt) back in a Claude Code session; on a ``passthrough``
@@ -555,6 +571,10 @@ def _render_env(blob: RenderBlob, facts: RenderFacts) -> dict[str, dict[str, str
         env["SSL_CERT_FILE"] = CODEX_CA_FILE[facts.host]
     if "levain_queue" in blob.hooks:                  # §5.3: levain_queue = the queue grant
         env[QUEUE_SOCKET_ENV] = f"{facts.R}/qb/slot{facts.slot.index}/q.sock"
+    if is_print_executor(facts):
+        # p71 S8 D11: under `-p` the CLI may wait on background work after its last turn; off, so the run ends
+        # with its last turn and the reaper's deadline is never the thing that ends it.
+        env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     return {"slot": env}
 
 
@@ -602,6 +622,11 @@ def render_cc_settings(blob: RenderBlob, facts: RenderFacts) -> dict:
     if facts.host == "linux":
         sandbox.update({"failIfUnavailable": True, "bwrapPath": str(LEVAIN_BWRAP)})
         permissions["ask"] = [LINUX_ASK_RULE]
+    if is_print_executor(facts):
+        # NP-1 (Phill np-b8a7375b "15b"): edits inside the run's own clone (<S>/repo) auto-approve; Bash, network, MCP
+        # and anything outside the clone still go through levain_gate / levain_queue. Premise: adopt/review is the
+        # only path from <S>/repo to the operator's repo (pinned by tests/test_slot_p71s8b_dispatch_exec.py).
+        permissions["defaultMode"] = "acceptEdits"
     out: dict[str, Any] = {"sandbox": sandbox, "permissions": permissions, "disableAllHooks": False,
                            "disableClaudeAiConnectors": True}
     if facts.slot.slot_class == "egress":
@@ -901,6 +926,8 @@ def expected_effective_cc(blob: RenderBlob, facts: RenderFacts) -> dict[str, Any
     if facts.host == "linux":
         exp.update({"sandbox.failIfUnavailable": True, "sandbox.bwrapPath": str(LEVAIN_BWRAP),
                     "permissions.ask": Contains((LINUX_ASK_RULE,))})
+    if is_print_executor(facts):
+        exp["permissions.defaultMode"] = "acceptEdits"
     if facts.slot.slot_class == "egress":
         exp["skipWebFetchPreflight"] = True
         allow = tuple(f"WebFetch(domain:{h})" for h in egress_hosts(blob, facts))
@@ -1126,7 +1153,7 @@ __all__ = [
     "front_limit_fields", "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
     "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
-    "TOKEN_ENV", "ABSENT_ENV", "PASSTHROUGH_ABSENT_ENV", "PASSTHROUGH_TICKET_KEYS", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
+    "is_print_executor", "TOKEN_ENV", "ABSENT_ENV", "PASSTHROUGH_ABSENT_ENV", "PASSTHROUGH_TICKET_KEYS", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",
     "env_text", "render_cc_settings", "render_cc_onboarding", "codex_config", "codex_toml", "gitconfig_text",
     "assert_no_syscall", "check_driver_template", "profile_lines", "read_driver_template", "render_profile",
     "render_importer_profile", "render_verifier_profile",

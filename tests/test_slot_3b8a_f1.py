@@ -26,7 +26,7 @@ from levain.slot import runtime_helper as H
 from levain.slot import vendor_routes as VR
 from levain.slot.ids import SlotId
 from tests.test_slot_3b8a_front_wiring import BASE_DOC, GITHUB, _arg, _world
-from tests.test_slot_s2f2_runtime_helper import BOOT, DISPATCH_UID, OP_UID, _blob, _prepared
+from tests.test_slot_s2f2_runtime_helper import BOOT, BRIEF_DIGEST, DISPATCH_UID, OP_UID, _blob, _prepared
 
 GW0 = 898          # _levain_gw0 in the World's account table
 
@@ -38,7 +38,7 @@ def _ticketed(w, route: str, session: str = "s-00000000000000e1") -> str:
     slot = SlotId("egress", 1)
     facts = {"kind": "executor", "job_id": "job-1", "run_index": 0, "contract_digest": "sha256:" + "1" * 64,
              "route": route, "model_requested": "m-1", "egress_routes": ["github"], "reserved_microdollars": 1000,
-             "routemap_generation": 3, "route_policy_digest": "sha256:" + "4" * 64}
+             "routemap_generation": 3, "route_policy_digest": "sha256:" + "4" * 64, "brief_digest": BRIEF_DIGEST}
     a = R.Alloc(session=session, slot=slot, lease_seq=1, slot_rev=1, slot_uid=897, slot_gid=897, kind="dispatch",
                 vendor="claude", auth="brokered", operator_uid=OP_UID, supervisor_uid=DISPATCH_UID,
                 staging_uid=DISPATCH_UID, created_at="2026-10-20T00:00:00Z", boot_id=BOOT, ticket=C.new_handle(),
