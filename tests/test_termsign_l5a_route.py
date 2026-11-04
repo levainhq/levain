@@ -662,3 +662,58 @@ def test_a_line_typed_while_a_click_signs_is_sign_busy(rig, store, keydir):
     (busy, bstatus), = inner
     assert (bstatus, busy["error"]) == (409, "sign_busy") and calls_b.n == 0
     assert answers(store) == [(q1.id, "ship")]
+
+
+# --- L3 r1: the signed origin is the page's own; a surface outside the form keeps its own viewer ---------------
+
+def test_a_request_with_no_origin_of_this_server_asks_for_nothing(rig, store, keydir):
+    q = file_q(store)
+    calls = Calls()
+    for origin in (None, "http://evil.example"):
+        got, status = desk_click.desk_answer(desk_click.DeskRequest(True, "web", origin, body(q)),
+                                             desk_click.LevainDeskHost(store), rig.state, policy="all",
+                                             signer_factory=calls, key_dir=keydir, notify=lambda t: None)
+        assert (status, got["error"]) == (403, "desk_origin")
+        got, status = desk_click.desk_text(desk_click.DeskRequest(True, "web", origin, _text_req(store, "1a").body),
+                                           store, rig.state, policy="all", signer_factory=calls, key_dir=keydir,
+                                           notify=lambda t: None)
+        assert (status, got["error"]) == (403, "desk_origin")
+    assert calls.n == 0 and answers(store) == []
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_http_signs_the_origin_the_page_was_served_at(tmp_path, store, keydir, monkeypatch, host):
+    _STORE["s"] = store
+    q = file_q(store)
+    _root, src, _ids = _install(tmp_path)
+    monkeypatch.setattr(desk_click, "DESK_POLICY", "all")
+    monkeypatch.setattr(ts, "default_desk_signer_factory", real_desk)
+    monkeypatch.setattr(ts, "post_notice", lambda text, **kw: None)
+    good = {"subject": {"id": q.id, "version": band_view.subject_version(q)}, "pick": "b", "client_txn": "txn-http-0o1"}
+    with _serve(src, write_token=TOKEN) as (base, httpd):
+        port = httpd.server_address[1]
+        status, got = _http(f"{base}/cockpit/desk/answer", good, headers={"Host": f"{host}:{port}"})
+    assert status == 200 and got["signed"], got
+    msg = ts.parse_desk_verified(context(store, q.id)[4].encode())
+    assert msg.origin == f"http://{host}:{port}"
+
+
+def test_a_credential_named_outside_the_form_answers_under_its_own_viewer(store, keydir):
+    """A surface token named `work laptop`: the band box finds the view band.json recorded for `cockpit:work laptop`
+    (never `cockpit:web`), the answer is audited under that viewer, and the badge verifies it."""
+    q = file_q(store)
+    b = band_view.band_payload(store, "cockpit:work laptop")
+    request = desk_click.DeskRequest(True, "work laptop", ORIGIN, {"text": "1a", "store_id": b["store_id"],
+                                                                   "view_id": b["view_id"], "client_txn": "txn-wl-0001"})
+    got, status = desk_click.desk_text(request, store, desk_click.DeskState(), policy="all", signer_factory=Calls(),
+                                       key_dir=keydir, notify=lambda t: None)
+    assert status == 200 and got["signed"], got
+    via, viewer, state, _has, message = context(store, q.id)
+    assert viewer == "cockpit:work laptop" and state == "signed"
+    assert ts.parse_desk_verified(message.encode()).surface == ts.desk_surface("work laptop")
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok) == "signed: Touch ID, laptop (desk)"
+
+
+def test_a_duplicate_waits_longer_than_a_touch_can_take():
+    assert desk_click._WAIT_S > ts.SIGN_BOUND_S

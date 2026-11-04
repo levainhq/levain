@@ -183,7 +183,8 @@ def test_desk_signature_verifies_in_the_desk_namespace_only(world):
 # --- the classifier -------------------------------------------------------------------------------------
 
 ROW = {"id": "np-9b9b9662", "row_version": "rv-aaaa1111", "what": "Add a Levain 1.0 row?"}
-SCOPE = {"store": "levain-questions:abc123", "install": "abc123", "surface": "web", "view": "item"}
+SCOPE = {"store": "levain-questions:abc123", "install": "abc123", "surface": "web", "origin": "http://localhost:8765",
+         "view": "item"}
 TSCOPE = {"store": "flow-needs-phill", "install": "i-1", "session": "s-1", "view": "v-1"}
 
 
@@ -266,7 +267,7 @@ def test_a_desk_countersign_on_a_non_desk_via_confers_nothing(world):
     original = {"ts": "2026-11-03T20:00:00Z", "answer": "(a) Add a Levain 1.0 row", "via": "cockpit"}
     msg = _click(countersign_of="2026-11-03T20:00:00Z", countersign="confirm")
     cs = {"of_ts": "2026-11-03T20:00:00Z", "ts": "2026-11-03T21:04:30Z", "surface": "web", "view": "item",
-          "via": "phone", "signed": {"format": ts.DESK_FORMAT, "message": msg.decode(),
+          "origin": "http://localhost:8765", "via": "phone", "signed": {"format": ts.DESK_FORMAT, "message": msg.decode(),
                                      "sig": _sign(path, msg, ts.DESK_NAMESPACE), "entry": 1}}
     assert ts.answer_class(original, ROW, _ctx(signers, countersigns=[cs])).state == "agent-resolved"
 
@@ -308,7 +309,8 @@ def test_a_bare_cockpit_desk_label_is_failed_not_agent_resolved(world):
 
 
 @pytest.mark.parametrize("name,value", [("surface", "other"), ("view", "7"), ("store", "levain-questions:zzz"),
-                                        ("install", "zzz")])
+                                        ("install", "zzz"), ("origin", "http://127.0.0.1:8765"),
+                                        ("origin", "http://localhost:9999"), ("origin", None)])
 def test_desk_scope_binds_every_signed_field(world, name, value):
     path, signers = world
     got = ts.answer_class(_desk_event(path), ROW, _ctx(signers, **{name: value}))
@@ -329,7 +331,7 @@ def test_a_desk_countersign_confirms_late_and_a_disown_is_disowned(world):
     for kind, state in (("confirm", "signed-terminal"), ("disown", "disowned")):
         msg = _click(countersign_of="2026-11-03T20:00:00Z", countersign=kind)
         cs = {"of_ts": "2026-11-03T20:00:00Z", "ts": "2026-11-03T21:04:30Z", "surface": "web", "view": "item",
-              "via": "cockpit-desk", "signed": {"format": ts.DESK_FORMAT, "message": msg.decode(),
+              "origin": "http://localhost:8765", "via": "cockpit-desk", "signed": {"format": ts.DESK_FORMAT, "message": msg.decode(),
                                                  "sig": _sign(path, msg, ts.DESK_NAMESPACE), "entry": 1}}
         got = ts.answer_class(original, ROW, _ctx(signers, countersigns=[cs]))
         assert got.state == state and got.late and got.channel == "desk", (kind, got)
@@ -348,7 +350,7 @@ def test_a_disown_outranks_a_confirm(world):
     for kind in ("confirm", "disown"):
         msg = _click(countersign_of="2026-11-03T20:00:00Z", countersign=kind, nonce=("a" if kind == "confirm" else "b") * 16)
         css.append({"of_ts": "2026-11-03T20:00:00Z", "ts": "2026-11-03T21:04:30Z", "surface": "web", "view": "item",
-                    "signed": {"format": ts.DESK_FORMAT, "message": msg.decode(),
+                    "origin": "http://localhost:8765", "signed": {"format": ts.DESK_FORMAT, "message": msg.decode(),
                                "sig": _sign(path, msg, ts.DESK_NAMESPACE), "entry": 1}})
     assert ts.answer_class(original, ROW, _ctx(signers, countersigns=css)).state == "disowned"
 
@@ -371,3 +373,32 @@ def test_a_typed_desk_gesture_binds_its_entry_like_a_click(world):
 def test_the_namespace_is_registered_and_the_signers_line_lists_it():
     from levain.contracts.namespaces import is_registered
     assert is_registered(ts.DESK_NAMESPACE) and is_registered(ts.NAMESPACE)
+
+
+def test_a_desk_countersign_binds_its_own_origin(world):
+    path, signers = world
+    original = {"ts": "2026-11-03T20:00:00Z", "answer": "(a) Add a Levain 1.0 row", "via": "cockpit"}
+    msg = _click(countersign_of="2026-11-03T20:00:00Z", countersign="confirm")
+    cs = {"of_ts": "2026-11-03T20:00:00Z", "ts": "2026-11-03T21:04:30Z", "surface": "web", "view": "item",
+          "origin": "http://localhost:8765", "signed": {"format": ts.DESK_FORMAT, "message": msg.decode(),
+                                                      "sig": _sign(path, msg, ts.DESK_NAMESPACE), "entry": 1}}
+    assert ts.answer_class(original, ROW, _ctx(signers, countersigns=[cs])).state == "signed-terminal"
+    for origin in ("http://127.0.0.1:8765", None):
+        moved = {**cs, "origin": origin}
+        assert ts.answer_class(original, ROW, _ctx(signers, countersigns=[moved])).state == "agent-resolved", origin
+
+
+def test_the_desk_origin_is_the_validated_host_on_this_port():
+    assert ts.desk_origin("localhost:8765", 8765) == "http://localhost:8765"
+    assert ts.desk_origin("127.0.0.1:8765", 8765) == "http://127.0.0.1:8765"
+    assert ts.desk_origin("LocalHost:8765", 8765) == "http://localhost:8765"
+    for host in ("localhost:9999", "localhost", "evil.example:8765", "[::1]:8765", "", None, "127.0.0.1:8765\n"):
+        assert ts.desk_origin(host, 8765) is None, host
+
+
+def test_a_surface_outside_the_form_signs_as_its_own_digest_never_as_another():
+    assert ts.desk_surface("web") == "web" and ts.desk_surface("phone-2") == "phone-2"
+    a, b = ts.desk_surface("work laptop"), ts.desk_surface("work_laptop")
+    assert a != "web" and a != b and a.startswith("x--") and b == "work_laptop"
+    assert ts.desk_surface("x--abc") != "x--abc"                 # a name shaped like a digest is encoded too
+    assert ts.build_desk_message(**dict(BASE, surface=a), view="item", gesture="click", entries=[E])

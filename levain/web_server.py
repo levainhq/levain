@@ -3043,15 +3043,20 @@ class _Handler(GuardedHandler):
         """``POST /cockpit/desk/answer``: :func:`levain.desk_click.desk_answer` over this server's question store. The
         sign lock and the finished-request memory live on the server, so they are shared by every request thread."""
         from levain import band_view, desk_click
+        from levain.consent import terminal_sign as ts
 
         store = getattr(self.server, "question_store", None)
         if store is None:      # the route is not served without one; an explicit check survives `python -O`
             return {"error": "not_found", "message": "no such route"}, 404
-        state = self.server.__dict__.setdefault("_desk_state", desk_click.DeskState())
+        state = getattr(self.server, "_desk_state", None)
+        if state is None:
+            state = self.server.__dict__.setdefault("_desk_state", desk_click.DeskState())
         local = self._desk_local()
-        port = self.server.server_address[1]
+        # the origin the page was served at, from the Host the gate already validated (localhost or 127.0.0.1 on this
+        # server's port); anything else is None and the route refuses it
+        origin = ts.desk_origin(self.headers.get("Host"), self.server.server_address[1])
         request = desk_click.DeskRequest(
-            local, str(self._credential(required=True).get("name") or "web"), f"http://localhost:{port}", req)
+            local, str(self._credential(required=True).get("name") or "web"), origin, req)
         if route == _DESK_TEXT_ROUTE:
             return desk_click.desk_text(request, store, state, policy=desk_click.DESK_POLICY,
                                         deliver=lambda done: band_view.deliver_recorded(store, done))

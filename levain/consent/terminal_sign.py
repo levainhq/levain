@@ -49,6 +49,7 @@ __all__ = ["AnswerClass", "DESK_FORMAT", "DESK_NAMESPACE", "DESK_SCOPE_FIELDS", 
            "KEY_LABEL", "MessageError", "NAMESPACE", "FORMAT", "ParsedDesk", "ParsedMessage", "REASONS",
            "SCOPE_FIELDS", "SignOutcome", "StatusReport", "TERMINAL_VIAS", "TerminalKey", "VerifyResult", "answer_class",
            "build_desk_message", "build_message", "create", "default_desk_signer_factory", "default_signer_factory",
+           "desk_origin", "desk_surface",
            "enroll_command", "event_time", "find_key", "fresh", "is_remote", "parse_desk_verified", "parse_verified",
            "session_refusal", "sign", "status", "target_id", "verify"]
 
@@ -882,11 +883,32 @@ class AnswerClass:
         return ""
 
 
+def desk_origin(host: Any, port: int) -> str | None:
+    """The one origin a desk message signs: ``http://<host>`` for the request's validated ``Host`` when it names
+    this server's own port on ``localhost`` or ``127.0.0.1`` (case folded), else None (the route refuses)."""
+    if not isinstance(host, str) or not isinstance(port, int) or isinstance(port, bool):
+        return None
+    h = host.lower()
+    if h not in (f"localhost:{port}", f"127.0.0.1:{port}"):
+        return None
+    return f"http://{h}"
+
+
+def desk_surface(name: Any) -> str:
+    """The surface a desk message signs for a cockpit credential ``name``: the name itself when it is in the
+    message's form and does not start with ``x--``, else ``x--`` and the SHA-256 of its UTF-8 bytes (so two names
+    never sign as one, and a name outside the form is never collapsed to another credential's)."""
+    text = name if isinstance(name, str) else ""
+    if _ID.fullmatch(text) and not text.startswith("x--"):
+        return text
+    return "x--" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 # why a signed block is `failed` (machine-readable; `detail` says it in words)
 FAILED_REASONS = ("malformed", "verifier-unavailable", "bad-signature", "scope-mismatch", "countersign-mismatch",
                   "not-this-row", "answer-mismatch", "stale", "classifier-error", "channel-mismatch")
 SCOPE_FIELDS = ("store", "install", "session", "view")
-DESK_SCOPE_FIELDS = ("store", "install", "surface", "view")
+DESK_SCOPE_FIELDS = ("store", "install", "surface", "origin", "view")
 
 
 @dataclass(frozen=True)
@@ -1055,8 +1077,10 @@ def _scope_for(spec: _Spec, c: Mapping[str, Any], cs: Mapping[str, Any] | None =
     install and the event's own other fields."""
     if cs is None:
         return {name: c.get(name) for name in spec.scope_fields}
-    own = "surface" if spec.channel == "desk" else "session"
-    return {"store": c.get("store"), "install": c.get("install"), own: cs.get(own), "view": cs.get("view")}
+    if spec.channel == "desk":
+        return {"store": c.get("store"), "install": c.get("install"), "surface": cs.get("surface"),
+                "origin": cs.get("origin"), "view": cs.get("view")}
+    return {"store": c.get("store"), "install": c.get("install"), "session": cs.get("session"), "view": cs.get("view")}
 
 
 def _answer_class(answer: Any, row: Any, context: Any) -> AnswerClass:

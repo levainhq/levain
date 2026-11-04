@@ -1773,10 +1773,11 @@ def answer_badge(store: Any, question_id: str, *, key_dir: Path | None = None,
     (``signed: Touch ID, laptop`` / ``... (desk)``), ``signature failed (<reason>)`` for a signed claim that does not
     verify, and ``""`` for an unsigned answer, a store with no enrolled key, or anything unreadable. Never raises.
 
-    The reader's trust root is the enrolled terminal key. The store keeps no pre-answer row version, so the version,
-    view and (terminal) session the scope is checked against are the ones the signed message names; the store, install,
-    surface (from the recorded viewer), the question's id and words, the answer and the time are checked against
-    what the store holds."""
+    The reader's trust root is the enrolled terminal key. The store keeps no pre-answer row version and no page
+    origin, so the version, view, (terminal) session and (desk) origin the scope is checked against are the ones the
+    signed message names; the store, install, surface (from the recorded viewer, as
+    :func:`terminal_sign.desk_surface` signs it), the question's id and words, the answer and the time are checked
+    against what the store holds."""
     try:
         from levain.consent import terminal_sign as ts
 
@@ -1868,8 +1869,9 @@ def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple
     context: dict[str, Any] = {
         "signers": f'phill namespaces="{ts.SIGNERS_NAMESPACES}" {key.public_key}\n', "principal": "phill",
         "ctk": ctk, "store": f"levain-questions:{sid}", "install": sid, "view": parsed.view,
-        "session": getattr(parsed, "session", None),
-        "surface": (viewer or "").split(":", 1)[1] if str(viewer).startswith("cockpit:") else None}
+        "session": getattr(parsed, "session", None), "origin": getattr(parsed, "origin", None),
+        "surface": ts.desk_surface(viewer.split(":", 1)[1]) if isinstance(viewer, str) and viewer.startswith("cockpit:")
+        else None}
     a = q.answer
     if a.kind == "option":
         i = [k for k, _ in q.options].index(a.value)

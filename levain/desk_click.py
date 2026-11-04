@@ -27,7 +27,6 @@ __all__ = ["DESK_POLICY", "DeskHost", "DeskRequest", "DeskRow", "DeskState", "Le
 DESK_POLICY = "authority"          # NP-A (b): "authority" signs authority items; "all" (a) signs every desk answer
 POLICIES = ("authority", "all")
 _TXN = re.compile(r"[A-Za-z0-9._-]{8,64}")
-_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
 _TXN_KEEP = 64                     # finished requests remembered for replay
 
 
@@ -58,8 +57,8 @@ class DeskHost(Protocol):
 @dataclass(frozen=True)
 class DeskRequest:
     local: bool                    # routing only: False for any request that came through a proxy or off the box
-    surface: str                   # the cockpit credential's label, or "web"
-    origin: str                    # the page origin the server is pinned to
+    surface: str                   # the cockpit credential's name as the server knows it (its viewer), or "web"
+    origin: str | None             # the page's origin from the validated Host (terminal_sign.desk_origin); None refuses
     body: Any                      # the parsed JSON body
 
 
@@ -120,6 +119,12 @@ class DeskState:
             return done[1] if done is not None else None
 
 
+def _origin_ok(origin: Any) -> bool:
+    from levain.consent import terminal_sign as ts
+
+    return isinstance(origin, str) and ts._ORIGIN.fullmatch(origin) is not None
+
+
 def _reused() -> tuple[dict[str, Any], int]:
     return _refuse("txn_reused", "this request id was already used for a different answer; nothing was recorded", 409)
 
@@ -133,7 +138,7 @@ def _fingerprint(route: str, req: "DeskRequest") -> str:
     return hashlib.sha256(canon.encode("ascii")).hexdigest()
 
 
-_WAIT_S = 40.0          # how long a duplicate waits for its first request (above the sign bound)
+_WAIT_S = 40.0          # how long a duplicate waits for its first request (a test holds it above SIGN_BOUND_S)
 
 
 def requires_sign(kind: str, policy: str = DESK_POLICY) -> bool:
@@ -213,6 +218,8 @@ def _desk_answer(req: DeskRequest, host: DeskHost, state: DeskState, policy: str
                  find_key: Callable[..., Any] | None, at: Any, nonce: str | None) -> tuple[dict[str, Any], int]:
     if not req.local:
         return _refuse("desk_remote", "a click that did not come from the laptop's own cockpit never asks for Touch ID", 403)
+    if not _origin_ok(req.origin):
+        return _refuse("desk_origin", "the page's origin is not this server's own; nothing was asked or recorded", 403)
     if policy not in POLICIES:
         return _refuse("internal", "unknown desk policy", 500)
     got = _read_click(req.body)
@@ -261,7 +268,8 @@ def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, polic
     from levain.cockpit.keys import KeyError_
     from levain.consent import terminal_sign as ts
 
-    surface = req.surface if isinstance(req.surface, str) and _ID.fullmatch(req.surface) else "web"
+    viewer = f"cockpit:{req.surface if isinstance(req.surface, str) and req.surface else 'web'}"
+    surface = ts.desk_surface(req.surface)      # the signed identity; the viewer keeps the credential's own name
 
     def finish(result: tuple[dict[str, Any], int], done: Any = None) -> tuple[tuple[dict[str, Any], int], Any]:
         state.end(txn, result)          # remembered while the sign lock is still held
@@ -310,7 +318,7 @@ def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, polic
         signing = band_view.Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint,
                                     {row.id: row.version})
         try:
-            done = host.record(row, pick, text, f"cockpit:{surface}", signing)
+            done = host.record(row, pick, text, viewer, signing)
         except band_view.VersionMoved:
             return finish(_refuse("stale", "the item changed while you signed; the signature was discarded and "
                                            "nothing was recorded", 409))
@@ -351,6 +359,8 @@ def _desk_text(req: DeskRequest, store: Any, state: DeskState, policy: str, sign
                find_key: Callable[..., Any] | None) -> tuple[dict[str, Any], int]:
     if not req.local:
         return _refuse("desk_remote", "a click that did not come from the laptop's own cockpit never asks for Touch ID", 403)
+    if not _origin_ok(req.origin):
+        return _refuse("desk_origin", "the page's origin is not this server's own; nothing was asked or recorded", 403)
     b = req.body
     if (not isinstance(b, Mapping) or set(b) != {"text", "store_id", "view_id", "client_txn"}
             or not isinstance(b["text"], str) or not b["text"].strip() or len(b["text"]) > 2000
@@ -386,7 +396,8 @@ def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str
 
     if not requires_sign("information", policy):
         return _refuse("desk_unsigned", "this line is recorded unsigned; use the ordinary path", 422), None
-    surface = req.surface if isinstance(req.surface, str) and _ID.fullmatch(req.surface) else "web"
+    viewer = f"cockpit:{req.surface if isinstance(req.surface, str) and req.surface else 'web'}"
+    surface = ts.desk_surface(req.surface)      # the signed identity; the viewer keeps the credential's own name
     try:
         key = (find_key or ts.find_key)(key_dir)
     except Exception as exc:  # noqa: BLE001
@@ -399,7 +410,7 @@ def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str
         signings: list[Any] = []
         try:
             done = band_view.answer_text_desk(
-                store, b["text"], viewer=f"cockpit:{surface}", store_id=b["store_id"], view_id=b["view_id"],
+                store, b["text"], viewer=viewer, store_id=b["store_id"], view_id=b["view_id"],
                 surface=surface, origin=req.origin, signer_factory=signer_factory, key_dir=key_dir, notify=notify,
                 policy=policy, outcome=signings)
         except band_view.StaleBand as exc:       # before the prompt (no view) or inside the write after it
