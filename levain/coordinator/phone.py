@@ -346,8 +346,10 @@ class CoordPhone:
     def step(self, action: str, req: Any, *, device: str | None) -> dict[str, Any]:
         """``drop`` {words, outbox_id, sent_at, store_id[, envelope]} -> the drop delivered (or the stored one, on a
         resend); ``envelope-review`` {words, outbox_id, spec, signer_fp, store_id} -> the body to sign, kept under a
-        review id; ``envelope-challenge`` {review_id} -> its payload, signed_at now, and the WebAuthn challenge.
-        ``device`` is the
+        review id; ``envelope-challenge`` {review_id} -> its payload, signed_at now, and the WebAuthn challenge; the
+        ``draft-*`` actions (:data:`levain.coordinator.draft_sign.DRAFT_ACTIONS`, the sign flow of a draft envelope)
+        are :func:`levain.coordinator.draft_sign.handle`'s, whose module docstring names each request and reply; a
+        draft that moved is 409 ``draft_stale``. ``device`` is the
         paired device the request's token belongs to (None for any other credential: refused). Raises
         :class:`CoordRefused`: 400 a malformed request, 403 no paired device, 409 an outbox id already used otherwise or
         another store's item, 422 a refusal, 503 a fault on this machine (nothing written)."""

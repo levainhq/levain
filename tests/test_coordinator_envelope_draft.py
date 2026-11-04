@@ -307,6 +307,17 @@ def test_closed_series_take_no_revision(ctx):
         conn.close()
 
 
+def test_withdraw_of_an_expected_revision_is_checked_under_the_lock(ctx):
+    # H1-3 r1 F2: the caller names the revision it rendered; one that landed since is refused and nothing is withdrawn
+    d, _t, r1 = make(ctx)
+    f = fields_for(ctx, budget={**BUDGET, "hours": 1})
+    r2 = drafts.revise(ctx.store, r1.draft_id, f, cites_for(d, f), parent=r1.digest, by="operator")
+    with pytest.raises(DraftStale, match="moved on to revision 2"):
+        drafts.withdraw(ctx.store, r1.draft_id, expect_revision=r1.revision)
+    assert ctx.rows("SELECT revision FROM envelope_draft_withdrawals") == []
+    assert drafts.withdraw(ctx.store, r1.draft_id, expect_revision=r2.revision) == 2
+
+
 # 10 ----------------------------------------------------------------------------------------------------------------
 def test_lapsed_draft_refused_before_verify(ctx, spies):
     d, t, r1 = make(ctx)
