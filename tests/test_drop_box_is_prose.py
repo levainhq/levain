@@ -49,8 +49,8 @@ def test_the_other_dashed_text_fields_of_the_drop_flow_have_dash_free_names():
 
 
 def test_the_shared_envelope_form_names_its_repo_and_branch_boxes():
-    """L3 r1 (codex + complement): the shared envelope form builds the repo and branch inputs, and the signing sheet's
-    cancellation reason is a free-text field too."""
+    """L3 r1 (codex + complement): the sweep covered one of each pair. The
+    shared envelope form builds the same two, and the signing sheet's cancellation reason is a free-text field too."""
     ef = (WEB / "envelope_form.js").read_text()
     assert 'onto.setAttribute("name", "droponto")' in ef[ef.index('onto.id = "drop-onto"'):][:300]
     sj = (WEB / "sign.js").read_text()
