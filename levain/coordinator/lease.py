@@ -859,10 +859,12 @@ def activate(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_sess
 
 
 def open_room_launch(conn: sqlite3.Connection, now: str, *, harness: str, model: str | None, cwd: str | None,
-                     room_thread: str, pid: int) -> Launch:
+                     room_thread: str, pid: int, resumed_from: str | None = None) -> Launch:
     """A room's launch: ``pending``, its spawn claimed by ``pid`` (the process that is about to start the session), in
     the caller's one transaction, so :func:`unspawned` never lists it and the worker spawner never builds argv for it.
-    It holds ``[room_thread]``, carries :data:`ROOM_TOKEN`, and is outside the lease: nothing here reads or checks one."""
+    It holds ``[room_thread]``, carries :data:`ROOM_TOKEN`, and is outside the lease: nothing here reads or checks one.
+    ``resumed_from`` is the harness session id the spawn asks to resume, kept on the pending row (every reader of a
+    launch's session id reads the ``active`` row) for :func:`activate_room`."""
     if harness not in HARNESSES:
         raise _refused(f"a launch's harness is one of {', '.join(HARNESSES)}")
     if not isinstance(room_thread, str) or re.fullmatch(r"th-[0-9a-f]{32}", room_thread) is None \
@@ -880,7 +882,8 @@ def open_room_launch(conn: sqlite3.Connection, now: str, *, harness: str, model:
                  "placement, at, user_scope, role_ref) VALUES (?, ?, ?, ?, 'room', ?, ?, ?, ?, 'operator-uid', ?, 0, NULL)",
                  (launch_id, next_gseq(conn, now), "s-" + secrets.token_hex(8), harness, canonical([room_thread]),
                   _line("model", model), _line("cwd", cwd), ROOM_TOKEN, now))
-    _launch_event(conn, now, launch_id, "pending", "room opened", until=_plus(now, LAUNCH_TTL))
+    _launch_event(conn, now, launch_id, "pending", "room opened", until=_plus(now, LAUNCH_TTL),
+                  harness_session_id=_line("resumed session id", resumed_from))
     conn.execute("INSERT INTO launch_spawns (launch_id, gseq, pid, at) VALUES (?, ?, ?, ?)",
                  (launch_id, next_gseq(conn, now), pid, now))
     return _launch_row(conn, "launch_id", launch_id)
@@ -903,8 +906,18 @@ def activate_room(conn: sqlite3.Connection, now: str, launch_id: str, *, harness
     if now >= ln.until:
         _launch_event(conn, now, launch_id, "expired", "pending past until")
         return _launch_row(conn, "launch_id", launch_id), f"launch {launch_id} was pending past {ln.until}"
-    if conn.execute("SELECT 1 FROM launch_events WHERE kind = 'active' AND harness_session_id = ? AND launch_id != ?",
-                    (hsid, launch_id)).fetchone() is not None:
+    # a resumed conversation reports the id it was resumed from: when that is the id THIS launch asked to resume (its
+    # pending row), an ended room launch of the same harness sharing its room thread is no claim on it; any other
+    # launch, a room launch still running, or an id this launch did not ask for, is
+    asked = conn.execute("SELECT harness_session_id FROM launch_events WHERE launch_id = ? AND kind = 'pending' "
+                         "ORDER BY seq LIMIT 1", (launch_id,)).fetchone()
+    resumed = 1 if asked is not None and asked[0] == hsid else 0
+    if conn.execute(
+            "SELECT 1 FROM launch_events e JOIN launches o ON o.launch_id = e.launch_id WHERE e.kind = 'active' AND "
+            "e.harness_session_id = ? AND e.launch_id != ? AND NOT (? AND o.role = 'room' AND o.harness = ? AND "
+            "EXISTS (SELECT 1 FROM json_each(o.threads) a, json_each(?) b WHERE a.value = b.value) AND (SELECT k.kind "
+            "FROM launch_events k WHERE k.launch_id = o.launch_id ORDER BY k.seq DESC LIMIT 1) IN ('ended', 'failed', "
+            "'expired'))", (hsid, launch_id, resumed, ln.harness, canonical(list(ln.threads)))).fetchone() is not None:
         raise _refused(f"harness session id {hsid!r} is already recorded by another launch")
     _launch_event(conn, now, launch_id, "active", "spawned", harness_session_id=hsid,
                   argv_sha256=_line("argv sha256", argv_sha256))
