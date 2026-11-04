@@ -422,7 +422,7 @@ async function assetNetworkFirst(e, req, key, kind) {
   } catch (err) {
     try {
       // NOT serialized: a held or never-settling mutation must not hang an offline script/style request. KNOWN EDGE: this
-      // check-then-read can race a commit, so an offline request racing one may serve one old asset once.
+      // check-then-read can race a commit, so an offline request racing one may serve one old asset once, or answer a network error once when the commit's prune lands between the check and the read.
       const c = await caches.open(SHELL_CACHE);
       const page = await c.match(SHELL_KEY);
       const hit = page && shellAssets(await page.text()).some((a) => a.key === key) ? await c.match(key) : null;
