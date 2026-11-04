@@ -1093,6 +1093,14 @@ def test_k2_an_empty_config_dir_is_unset_for_the_child_as_it_is_for_the_check():
     assert room_launch.room_env({"CLAUDE_CONFIG_DIR": "/abs/cfg"})["CLAUDE_CONFIG_DIR"] == "/abs/cfg"
 
 
+def test_k5_relative_and_empty_search_path_entries_do_not_reach_the_child():
+    """FINDINGS_room_r2 K5: the child runs in the room's DIR, so '.', '' or 'bin' in PATH (or PYTHONPATH) would let a
+    file in DIR stand in for claude (or levain's room door)."""
+    env = room_launch.room_env({"PATH": "/bin:.:bin::/usr/bin", "PYTHONPATH": ":src:/abs/site"})
+    assert env["PATH"] == "/bin:/usr/bin" and env["PYTHONPATH"] == "/abs/site"
+    assert "PYTHONPATH" not in room_launch.room_env({"PATH": "/bin"})
+
+
 _OUTSIDE = ["Read(//{other}/**)", "Read(~/private/**)", "Read(~)", "Grep(/notes/**)", "Glob(../sibling/**)",
             "Read(//**)", "Edit(//{other}/x)", "Read( //{other}/a*b )", "Read(//{cwd}-twin/**)"]
 _INSIDE = ["Read", "Grep", "Read(**)", "Read(*)", "Read(./src/**)", "Read(src/*.py)", "Read(//{cwd}/**)",

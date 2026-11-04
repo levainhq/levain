@@ -141,6 +141,11 @@ def room_env(environ: Mapping[str, str], keep: tuple = ()) -> dict:
     env = {k: v for k, v in environ.items() if k in names or k.startswith(ENV_KEEP_PREFIXES)}
     if env.get("CLAUDE_CONFIG_DIR") == "":
         del env["CLAUDE_CONFIG_DIR"]           # read as unset by settings_scope_refusal: the child gets it unset too
+    # a relative or empty search-path entry is the child's cwd, the room's DIR: a `claude` or a `levain` package there
+    # would run in place of the real one (FINDINGS_room_r2 K5), so only absolute entries are passed on
+    for name in ("PATH", "PYTHONPATH"):
+        if name in env:
+            env[name] = os.pathsep.join(p for p in env[name].split(os.pathsep) if os.path.isabs(p))
     env[ROOM_ENV] = "1"
     return env
 
