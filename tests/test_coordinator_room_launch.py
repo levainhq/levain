@@ -744,6 +744,71 @@ def test_c7_the_fresh_retry_runs_once_never_a_loop(world):
     assert len(spawns(world)) == 3
 
 
+def exited_before_the_first_write(w, *, only_resume=True):
+    """A spawn seam that returns each (or each ``--resume``) child only after it has exited, so the open check's first
+    write meets a dead transport."""
+    procs = []
+
+    def spawn(argv, *, cwd, env, stderr):
+        p = room_launch._spawn(argv, cwd=cwd, env=env, stderr=stderr)
+        procs.append(p)
+        if not only_resume or "--resume" in argv:
+            p.wait(20)
+        return p
+    return procs, spawn
+
+
+def test_rme_fix2_r1_a_resumed_child_dead_at_the_first_write_retries_once_fresh(world):
+    """FAILS on the rme-fix1 tip (L3_rme_r2 codex OPEN 1): the dead transport at the open check's first write was a
+    plain RoomLaunchError, so no fresh retry ran and every ensure() picked the same resume id again."""
+    procs, spawn = exited_before_the_first_write(world)
+    lr = launcher(world, spawn=spawn)
+    h1 = lr.ensure()
+    lr.end(h1.launch_id, "test")
+    mode(world, "resume_rejected")
+    h2 = lr.ensure()
+    assert not h2.resumed and h2.resume_failed == h1.harness_session_id
+    assert h2.harness_session_id != h1.harness_session_id and state(world, h2.launch_id) == "active"
+    argvs = spawns(world)
+    assert len(argvs) == 3 and "--resume" in argvs[1] and "--session-id" in argvs[2]
+    probing = world["cs"]._read(lambda conn: conn.execute(
+        "SELECT detail FROM chat_launch_checks WHERE launch_id = ? AND kind = 'probing' ORDER BY seq LIMIT 1",
+        (h2.launch_id,)).fetchone()[0])
+    assert h1.harness_session_id in probing and "fresh" in probing
+
+
+def test_rme_fix2_r1_a_fresh_child_dead_at_the_first_write_is_a_plain_failure_never_retried(world):
+    procs, spawn = exited_before_the_first_write(world, only_resume=False)
+    mode(world, "exit_early")
+    with pytest.raises(RoomLaunchError, match="exited"):
+        launcher(world, spawn=spawn).ensure(fresh=True)
+    assert len(spawns(world)) == 1
+
+
+def test_rme_fix2_r1_a_resume_and_its_fresh_retry_both_dead_at_the_first_write_stop_after_one_retry(world):
+    lr = launcher(world)
+    h1 = lr.ensure()
+    lr.end(h1.launch_id, "test")
+    procs, spawn = exited_before_the_first_write(world, only_resume=False)
+    lr._spawn = spawn
+    mode(world, "exit_early")
+    with pytest.raises(RoomLaunchError, match="exited"):
+        lr.ensure()
+    assert len(spawns(world)) == 3
+
+
+def test_rme_fix2_r2_the_launchers_resume_pick_ignores_a_pending_rows_ask(world):
+    """L3_rme_r2 complement UNSETTLED: ``_resume_id`` reads only ``active`` rows, so a pending launch's ask (here an id
+    nothing ever recorded) is never picked as the room's newest conversation. A pin: passed on the rme-fix1 tip."""
+    lr = launcher(world)
+    h1 = lr.ensure()
+    lr.end(h1.launch_id, "test")
+    with world["store"]._write() as (conn, now):
+        lease.open_room_launch(conn, now, harness="claude", model=None, cwd=str(world["cwd"]),
+                               room_thread=world["thread"], pid=os.getpid(), resumed_from="sid-asked-only")
+    assert lr._resume_id(world["thread"]) == h1.harness_session_id
+
+
 def test_c8_an_already_active_resumed_launch_still_says_resumed(world):
     """FAILS on the RM-E tip (complement LOW 4)."""
     lr = launcher(world)

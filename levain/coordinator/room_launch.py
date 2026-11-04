@@ -47,12 +47,13 @@ follow-up.
 **Resume and lapse.** A new launch resumes the room thread's newest recorded conversation (``--resume <id>``, recorded
 as the pending launch's ``resumed_from``; the child reports the id it was resumed from, which
 :func:`~levain.coordinator.lease.activate_room` accepts only for an id the launch asked to resume). A resume whose
-child exits before its open check ends is retried once as a fresh session, and the handle's ``resume_failed`` and the
-launch's probing row name the abandoned id. :meth:`RoomLauncher.recycle_idle` ends a quiet child (no turn open, no
-unsettled line, nothing recorded for :data:`IDLE_SECONDS`); the next ``ensure`` resumes. ``ensure`` also replaces a
-launch whose child exited, one this process holds no session for (a restarted ``levain serve``), and one the service
-latched ``not_live``. Both ``ensure`` and ``recycle_idle`` end every held launch of a room that rotated. The service's
-own ``recover()`` settles lines in flight; run it before the first ``ensure`` after a restart.
+child exits before its open check ends (or is gone at its first write) is retried once as a fresh session, and the
+handle's ``resume_failed`` and the launch's probing row name the abandoned id. :meth:`RoomLauncher.recycle_idle` ends
+a quiet child (no turn open, no unsettled line, nothing recorded for :data:`IDLE_SECONDS`); the next ``ensure``
+resumes. ``ensure`` also replaces a launch whose child exited, one this process holds no session for (a restarted
+``levain serve``), and one the service latched ``not_live``. Both ``ensure`` and ``recycle_idle`` end every held
+launch of a room that rotated. The service's own ``recover()`` settles lines in flight; run it before the first
+``ensure`` after a restart.
 
 Stdlib plus levain. The spawn is a seam (``spawn``) so a test can supply a child of its own."""
 from __future__ import annotations
@@ -80,7 +81,7 @@ from levain.coordinator.chat_tripwires import TripwireContext
 from levain.coordinator.claude_session import (ROOM_DENIED_TOOLS, ROOM_MCP_SERVER, ROOM_MCP_TOOL, ROOM_TOOLS,
                                                ClaudeSession, PipeTransport, canary_denied, default_deny_paths,
                                                open_probe, room_argv, room_settings_json)
-from levain.coordinator.driver import LivenessEvidence, SendCommand
+from levain.coordinator.driver import LivenessEvidence, NotSent, SendCommand
 from levain.coordinator.room_mcp import LAUNCH_ENV
 from levain.coordinator.store import CoordError
 
@@ -108,7 +109,8 @@ class RoomLaunchError(CoordError):
 
 
 class _ChildExited(RoomLaunchError):
-    """The child exited before its open check ended (with ``--resume`` in its argv, the resume is the suspect)."""
+    """The child exited before its open check ended, or was gone at its first write (with ``--resume`` in its argv,
+    the resume is the suspect)."""
 
 
 @dataclass(frozen=True)
@@ -131,8 +133,8 @@ class RoomCanary:
 
 class RoomHandle(NamedTuple):
     """``resumed``: the launch was opened with ``--resume``. ``resume_failed``: the session id whose resume exited
-    before its open check ended, so this launch is a fresh start in its place (None otherwise). Both describe the
-    launch, whichever :meth:`RoomLauncher.ensure` call returns it."""
+    before its open check ended (or was gone at its first write), so this launch is a fresh start in its place (None
+    otherwise). Both describe the launch, whichever :meth:`RoomLauncher.ensure` call returns it."""
     launch_id: str
     room_thread: str
     harness_session_id: str
@@ -355,7 +357,8 @@ class RoomLauncher:
         the open check fails; the failed launch is ended and nothing stays attached. Every launch this process holds
         for a room thread that is no longer the open room is ended first (a rotation leaves no child behind). A resume
         whose child exits before its open check ends is retried ONCE as a fresh session (``resume_failed`` on the
-        handle names the abandoned id); a fresh open that fails is not retried."""
+        handle names the abandoned id); so is one whose child is gone at the open check's first write. A fresh open that
+        fails is not retried."""
         with self._lock:
             room_thread = self._store._read(_open_room)
             self._end_rotated(room_thread)
@@ -483,6 +486,12 @@ class RoomLauncher:
         :class:`RoomLaunchError` with the reason otherwise (:class:`_ChildExited` when the child exited first)."""
         try:
             sent = session.send(SendCommand("room-open-check", CANARY_PROMPT.format(path=decoy), (), "queue", None))
+        except NotSent as exc:
+            # the child is gone (or its stdin is) before the first line: the same suspect as an exit mid-check
+            # (L3_rme_r2 codex OPEN 1: this was a plain failure, so a rejected resume was never retried fresh)
+            raise _ChildExited(f"the room child exited or closed its stdin before its open check could be sent "
+                               f"(exit code {proc.poll()}): "
+                               f"{_one_line(str(exc))}{self._tail(stderr_path)}") from exc
         except Exception as exc:  # noqa: BLE001
             raise RoomLaunchError(f"the open check could not be sent: {_one_line(f'{type(exc).__name__}: {exc}')}"
                                   ) from exc
