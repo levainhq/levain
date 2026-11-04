@@ -8,7 +8,8 @@
   const DISMISS_KEY = "levain_install_coach_dismissed";   // sessionStorage: a dismissed banner stays away for this tab only
   const IOS_SAY = "Install Levain: tap Share, then Add to Home Screen.";
   const GATE_SAY = "Pairing and pings are offered in the installed Levain app. ";
-  let deferred = null, installed = false, banner = null;
+  let deferred = null, installedNow = false, banner = null;
+  const notes = new Set();   // the gate notes drawn into pairing and pings; re-rendered whenever the install state moves
 
   function standalone() {
     try { if (navigator.standalone === true) return true; } catch (_) { /* no such property */ }
@@ -16,16 +17,21 @@
   }
   function ua() { return String(navigator.userAgent || ""); }
   function ios() {
-    return /iPhone|iPod|iPad/.test(ua()) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);   // iPadOS desktop mode reports a Mac
+    const apple = /iPhone|iPod|iPad/.test(ua()) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);   // iPadOS desktop mode reports a Mac
+    return apple && !/CriOS|FxiOS|EdgiOS|OPiOS|GSA\//.test(ua());   // Safari only: the other iOS browsers keep the old controls
   }
   function androidChrome() {
     const u = ua();
-    return /Android/.test(u) && /Chrome\//.test(u) && !/EdgA|OPR\/|SamsungBrowser|Firefox|UCBrowser/.test(u);
+    // an install is offered only on a secure origin: on plain http Chrome never arms the prompt, so there the old controls stay
+    return window.isSecureContext !== false && /Android/.test(u) && /Chrome\//.test(u) && !/EdgA|OPR\/|SamsungBrowser|Firefox|UCBrowser/.test(u);
   }
   function kind() { return ios() ? "ios" : androidChrome() ? "android" : ""; }
   // the one question the other pages ask: is this a phone tab where the install must come first
-  function gated() { return !!kind() && !standalone() && !installed; }
-  function words() { return kind() === "ios" ? IOS_SAY : "Install Levain to your Home Screen from the browser menu or the Install button."; }
+  function gated() { return !!kind() && !standalone(); }   // appinstalled does not make THIS tab the app: only standalone lifts the gate
+  function words() {
+    if (installedNow) return "Levain is installed: open it from your Home Screen.";
+    return kind() === "ios" ? IOS_SAY : "Install Levain from the browser menu (Install app), then open it from your Home Screen.";
+  }
 
   function shareGlyph() {
     const ns = "http://www.w3.org/2000/svg";
@@ -46,23 +52,30 @@
     b.addEventListener("click", async () => {
       const d = deferred; if (!d) return;
       deferred = null; b.disabled = true;
+      // one prompt per event: whatever the answer, every Install button is re-drawn from the new state (the menu words after a dismissal)
       try { await d.prompt(); await d.userChoice; } catch (_) { /* the browser refused the prompt */ }
       refresh();
     });
     return b;
   }
   // the gate's note, in place of a pairing or pings control: the words, the glyph on iOS, the Install button on Android when armed
-  function note() {
-    const box = document.createElement("div");
-    box.className = "pwa-note";
+  function renderNote(box) {
+    box.replaceChildren();
     const t = document.createElement("span");
-    t.textContent = GATE_SAY + (kind() === "ios" ? "Tap Share" : words());
+    t.textContent = GATE_SAY + (kind() === "ios" && !installedNow ? "Tap Share" : words());
     box.appendChild(t);
+    if (installedNow) return;
     if (kind() === "ios") {
       box.append(" ", shareGlyph(), document.createTextNode(", then Add to Home Screen."));
     } else if (deferred) {
       box.append(" ", installBtn());
     }
+  }
+  function note() {
+    const box = document.createElement("div");
+    box.className = "pwa-note";
+    renderNote(box);
+    notes.add(box);
     return box;
   }
 
@@ -90,13 +103,14 @@
   }
   // the banner shows exactly when gated, a dismissal allows, and (Android) the browser has armed the prompt
   function refresh() {
-    const want = gated() && !dismissed() && (kind() === "ios" || !!deferred);
+    for (const n of [...notes]) { if (n.isConnected) renderNote(n); else notes.delete(n); }
+    const want = gated() && !installedNow && !dismissed() && (kind() === "ios" || !!deferred);
     if (!want) { if (banner) { banner.remove(); banner = null; } return; }
     if (!banner || !banner.isConnected) { if (banner) banner.remove(); banner = drawBanner(); }
   }
 
   window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); deferred = e; refresh(); });
-  window.addEventListener("appinstalled", () => { installed = true; deferred = null; refresh(); });
+  window.addEventListener("appinstalled", () => { installedNow = true; deferred = null; refresh(); });
   window.levainPwa = { standalone: standalone, gated: gated, kind: kind, note: note, words: words, refresh: refresh };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", refresh); else refresh();
 })();
