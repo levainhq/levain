@@ -35,7 +35,7 @@ store: the acceptance never reads it.
 from __future__ import annotations
 
 import secrets
-from typing import Any
+from typing import Any, Callable
 
 __all__ = ["DRAFT_ACTIONS", "handle"]
 
@@ -101,6 +101,12 @@ def _view_lines(against: Any) -> list[str]:
              "revoked": "the head no longer authorises anything (killed / its key revoked / its thread ended): every "
                         "value below is a new grant",
              "none": "no head"}
+    if against.base_kind not in heads:
+        # a kind the sheet has no words for: the builder grew one this page cannot describe, so it shows no Sign.
+        # Not DraftStale: reviewing again would meet the same kind.
+        from levain.coordinator.store import CoordError
+
+        raise CoordError(f"the head is of a kind this sheet cannot describe ({str(against.base_kind)[:40]})")
     lines = [heads[against.base_kind] + (f" ({against.reason})" if against.reason and against.base_kind == "revoked"
                                          else "")]
     if against.wider:
@@ -124,12 +130,15 @@ def _cards(store: Any, thread_id: str) -> list[dict[str, Any]]:
                                               queue_dir=store.directory)]
 
 
-def _cards_after(store: Any, thread_id: str) -> dict[str, Any]:
-    """The cards for a reply to a write that has COMMITTED. Reading them makes another verifier call; whatever it
-    raises, the write stands, so the reply says what was written and asks for the cards again rather than becoming a
-    refusal that claims nothing changed."""
+def _cards_after(store: Any, thread_id: Callable[[], str | None]) -> dict[str, Any]:
+    """The cards for a reply to a write that has COMMITTED. Finding the thread (a store read, or a field of the stored
+    body) and reading its cards (another verifier call) both run inside the one guard: whatever either raises, the
+    write stands, so the reply says what was written and asks for the cards again rather than becoming a refusal that
+    claims nothing changed. A thread of None answers no cards. The caller's ``store_id`` is the one ``_store`` already
+    matched before the write, never a fresh read after it."""
     try:
-        return {"cards": _cards(store, thread_id)}
+        tid = thread_id()
+        return {} if tid is None else {"cards": _cards(store, tid)}
     except Exception as exc:  # noqa: BLE001  (any fault here is after the commit; the reply must still report it)
         return {"cards": None, "cards_note": f"the cards could not be read just now ({type(exc).__name__}): "
                                               "read the cards again"}
@@ -181,7 +190,7 @@ def _rule(phone: Any, req: dict[str, Any]) -> dict[str, Any]:
     else:
         d = drafts.replace_rule(store, req["thread_id"], hs, prefill=req.get("prefill", True), by="operator")
     return {"draft": {"draft_id": d.draft_id, "revision": d.revision, "digest": d.digest, "thread_id": d.thread_id},
-            **_cards_after(store, req["thread_id"]), "store_id": store.store_id()}
+            **_cards_after(store, lambda: req["thread_id"]), "store_id": req["store_id"]}
 
 
 def _withdraw(phone: Any, req: dict[str, Any]) -> dict[str, Any]:
@@ -199,11 +208,13 @@ def _withdraw(phone: Any, req: dict[str, Any]) -> dict[str, Any]:
         raise
     except CoordError as exc:
         raise drafts.DraftStale(_not_withdrawn(store, req["draft_id"], exc)) from None
-    newest = drafts.latest(store, req["draft_id"])
-    out: dict[str, Any] = {"withdrawn": {"draft_id": req["draft_id"], "revision": revision}}
-    if newest is not None:
-        out.update(_cards_after(store, newest.thread_id))
-    return {**out, "store_id": store.store_id()}
+
+    def thread() -> str | None:
+        newest = drafts.latest(store, req["draft_id"])
+        return None if newest is None else newest.thread_id
+
+    return {"withdrawn": {"draft_id": req["draft_id"], "revision": revision}, **_cards_after(store, thread),
+            "store_id": req["store_id"]}
 
 
 def _not_withdrawn(store: Any, draft_id: str, exc: Exception) -> str:
@@ -236,7 +247,9 @@ def _review(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
             "signer_fp": key.fingerprint, "store_id": store.store_id(), "until": now + REVIEW_TTL, "minted": None}
     # the builder IS the check: it raises DraftStale before any verifier call or byte when the draft is not signable
     body_text, _payload, since, against = _built(phone, store, kept, key, now)
+    view = _view_lines(against)          # before the review is kept: a head the sheet cannot describe keeps nothing
     kept["against"] = _against(against)
+    kept["body_text"] = body_text
     review_id = "dv-" + secrets.token_hex(16)
     with phone._lock:
         for rid in [r for r, v in phone._draft_reviews.items() if v["until"] <= now]:
@@ -245,7 +258,7 @@ def _review(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
             del phone._draft_reviews[next(iter(phone._draft_reviews))]
         phone._draft_reviews[review_id] = kept
     return {"review_id": review_id, "body_text": body_text, "rp_id": phone.rp_id, "since_parent": since,
-            "against": kept["against"], "view": _view_lines(against), "store_id": kept["store_id"]}
+            "against": kept["against"], "view": view, "store_id": kept["store_id"]}
 
 
 def _kept(phone: Any, review_id: Any, device: str) -> dict[str, Any]:
@@ -275,15 +288,16 @@ def _challenge(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
     now = phone._clock()
     # again, with signed_at now: a long read of the sheet is never a stale signature, and a draft that moved is refused
     body_text, payload, _since, against = _built(phone, store, kept, key, now)
-    if _against(against) != kept["against"]:
+    if _against(against) != kept["against"] or body_text != kept["body_text"]:
         # the sheet said what this signature grants against the head (as narrowed, or every value new); a head whose
-        # key was revoked or that was narrowed since makes those words untrue for the same bytes, so no challenge
+        # key was revoked or that was narrowed since makes those words untrue for the same bytes, so no challenge.
+        # The body is compared too: the sheet showed it, and the challenge signs only the body the review showed
         raise drafts.DraftStale("what this signature grants against the head is no longer what the sheet showed (its "
                                 "key was revoked, or it was narrowed or ended, since the review): review it again")
     kept["minted"] = {"body_text": body_text, "payload": payload}
     return {"payload": payload, "rp_id": phone.rp_id,
             "challenge": _b64u(challenge(env.sign_message(payload), namespace=env.SIGN_NAMESPACE)),
-            "store_id": store.store_id()}
+            "store_id": kept["store_id"]}
 
 
 def _accept(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
@@ -321,7 +335,7 @@ def _accept(phone: Any, req: dict[str, Any], device: str) -> dict[str, Any]:
         phone._draft_reviews.pop(req["review_id"], None)
     return {"created": created, "envelope": {"envelope_id": stored.envelope_id, "signer_fp": stored.signer_fp,
                                               "signer_class": stored.signer_class},
-            **_cards_after(store, _bound_thread(stored)), "store_id": store.store_id()}
+            **_cards_after(store, lambda: _bound_thread(stored)), "store_id": kept["store_id"]}
 
 
 def _bound_thread(stored: Any) -> str:

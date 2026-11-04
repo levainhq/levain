@@ -317,6 +317,147 @@ def test_a_cards_fault_after_the_envelope_is_stored_answers_the_envelope(rig, mo
     assert refused(exc) == (409, "review_gone")
 
 
+def _store_id_down_after(monkeypatch, cls, name: str) -> None:
+    """`store_id()` raises sqlite3.Error once `cls.name` has returned (its write committed); reads before it answer."""
+    import sqlite3
+
+    real, real_id = getattr(cls, name), EnvelopeStore.store_id
+    committed: dict = {}
+
+    def write(*a, **k):
+        out = real(*a, **k)
+        committed["yes"] = True
+        return out
+
+    def store_id(self):
+        if committed:
+            raise sqlite3.OperationalError("database is locked")
+        return real_id(self)
+
+    monkeypatch.setattr(cls, name, write)
+    monkeypatch.setattr(EnvelopeStore, "store_id", store_id)
+
+
+def test_a_store_id_fault_after_the_envelope_is_stored_answers_the_envelope(rig, monkeypatch):
+    # G1: the store identity read after the commit is a store read that can fault; the reply must not say unsigned
+    d = rig.extend()
+    r = rig.review(d)
+    _c, req = rig.sign(r)
+    before = rig.envelopes()
+    want_sid = sid(rig.cp)
+    _store_id_down_after(monkeypatch, EnvelopeStore, "accept_envelope")
+    got = rig.accept(req)
+    assert got["created"] is True and got["store_id"] == want_sid
+    assert got["cards"] is not None or "read the cards again" in got["cards_note"]
+    assert got["envelope"]["envelope_id"] in rig.envelopes() and len(rig.envelopes()) == len(before) + 1
+    monkeypatch.undo()
+    with pytest.raises(CoordRefused) as exc:
+        rig.accept(req)
+    assert refused(exc) == (409, "review_gone")
+
+
+def test_a_stored_body_with_an_odd_binds_shape_answers_the_envelope(rig, monkeypatch):
+    # G1: the thread id is read from the stored body after the commit; a shape the reader does not expect is a fault
+    # of the reply, never of the signature
+    from dataclasses import replace
+
+    d = rig.extend()
+    r = rig.review(d)
+    _c, req = rig.sign(r)
+    before = rig.envelopes()
+    real = EnvelopeStore.accept_envelope
+
+    def odd(self, *a, **k):
+        stored, created = real(self, *a, **k)
+        try:
+            return replace(stored, body={**stored.body, "binds": []}), created
+        except TypeError:          # not a dataclass: a namespace carrying the same fields
+            return SimpleNamespace(**{**vars(stored), "body": {**stored.body, "binds": []}}), created
+
+    monkeypatch.setattr(EnvelopeStore, "accept_envelope", odd)
+    got = rig.accept(req)
+    assert got["created"] is True and got["cards"] is None and "read the cards again" in got["cards_note"]
+    assert got["store_id"] == sid(rig.cp)
+    assert len(rig.envelopes()) == len(before) + 1
+
+
+def test_a_store_id_fault_after_a_rule_answers_the_draft(rig, monkeypatch):
+    # G1 (the rule half, same class): the draft row committed; the reply names it
+    from levain.coordinator import envelope_drafts as drafts
+
+    rig.lapse()
+    assert rig.card()["kind"] == "LAPSED"
+    want_sid = sid(rig.cp)
+    _store_id_down_after(monkeypatch, drafts, "renew_rule")
+    got = rig.call("draft-rule", thread_id=rig.tid, rule="renew", head=rig.head, store_id=want_sid)
+    assert got["draft"]["revision"] >= 1 and got["store_id"] == want_sid
+    assert got["cards"] is not None or "read the cards again" in got["cards_note"]
+
+
+def test_a_fault_after_a_withdrawal_answers_the_withdrawal(rig, monkeypatch):
+    # G2: the withdrawal committed; reading the series back for the cards' thread id, or the store id, may fault
+    import sqlite3
+
+    from levain.coordinator import envelope_drafts as drafts
+
+    d = rig.extend()
+    want_sid = sid(rig.cp)
+
+    def latest_down(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(drafts, "latest", latest_down)
+    got = rig.call("draft-withdraw", draft_id=d["draft_id"], revision=d["revision"], store_id=want_sid)
+    assert got["withdrawn"]["revision"] == d["revision"]
+    assert got["cards"] is None and "read the cards again" in got["cards_note"] and got["store_id"] == want_sid
+    assert rig.rows("SELECT revision FROM envelope_draft_withdrawals") == [d["revision"]]
+    monkeypatch.undo()
+    d2 = rig.call("draft-rule", thread_id=rig.tid, rule="renew", head=rig.head)["draft"]
+    _store_id_down_after(monkeypatch, drafts, "withdraw")
+    got = rig.call("draft-withdraw", draft_id=d2["draft_id"], revision=d2["revision"], store_id=want_sid)
+    assert got["withdrawn"]["revision"] == d2["revision"] and got["store_id"] == want_sid
+    assert got["cards"] is not None or "read the cards again" in got["cards_note"]
+
+
+def test_a_head_kind_the_sheet_cannot_describe_keeps_no_review(rig, monkeypatch):
+    # G3: the builder answering a base_kind the sheet has no words for is refused in words, with no review to sign
+    from dataclasses import replace
+
+    from levain.coordinator import envelope_drafts as drafts
+
+    d = rig.extend()
+    real = drafts.draft_sign_bytes
+
+    def drifted(*a, **k):
+        body_text, payload, since, against = real(*a, **k)
+        return body_text, payload, since, replace(against, base_kind="partial")
+
+    monkeypatch.setattr(drafts, "draft_sign_bytes", drifted)
+    with pytest.raises(CoordRefused) as exc:
+        rig.review(d)
+    assert refused(exc) == (422, "refused") and "cannot describe" in exc.value.message
+    assert rig.cp._draft_reviews == {}
+
+
+def test_a_body_that_differs_from_the_review_mints_no_challenge(rig, monkeypatch):
+    # G4: the challenge signs only the body the review showed, compared as well as the diffs
+    from levain.coordinator import envelope_drafts as drafts
+
+    d = rig.extend()
+    r = rig.review(d)
+    real = drafts.draft_sign_bytes
+
+    def other_body(*a, **k):
+        body_text, payload, since, against = real(*a, **k)
+        return body_text + " ", payload, since, against
+
+    monkeypatch.setattr(drafts, "draft_sign_bytes", other_body)
+    with pytest.raises(CoordRefused) as exc:
+        rig.challenge(r)
+    assert refused(exc) == (409, "draft_stale")
+    assert rig.cp._draft_reviews[r["review_id"]]["minted"] is None
+
+
 def test_a_machine_fault_at_accept_keeps_the_review_for_the_retry(rig, monkeypatch):
     # F9: the spend/keep split: a verifier that cannot run is not a verdict, so the same request may be sent again
     from levain.authority import VerifierUnavailable
