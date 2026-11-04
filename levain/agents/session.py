@@ -24,17 +24,22 @@ The launcher is a seam (:class:`SessionLauncher`). :class:`UnwiredLauncher` is t
 in this module, and nothing here has launched a real session. ``tests/test_agents_session_launch.py`` drives the
 whole path against a stub.
 
-Not covered: the per-call fence and session supervision (P7-2); the real launcher; and a reaper-side stop. An
-in-process stop works (the fire's own executor holds the child). A reaper built from a row cannot stop a session:
-its executor holds no child and answers ``StopResult(False, ...)``, the supervisor raises one attention row and the
-row stays ``launched``, while the same reaper tick renews the lease of every launched row with a session key, so a
-dead session's lease is renewed and lapse takeover never fires, holding slot and reservation. Whether a production
-caller wires a reaper to session rows: ``git grep -n -e "Supervisor(" -e "sup.reap(" -- levain/agents levain/dream``
-(on 11-04, besides this docstring, it named the dream's supervisor only, and no ``Supervisor.reap`` caller); a fire-record stop like
-``DreamExecutor._stop`` is the prerequisite for wiring one [routed to STATUS_1_0.md by levain 24, 11-04].
+Not covered: the per-call fence and session supervision (P7-2) and the real launcher. A reaper-side stop is
+:class:`RowSessionExecutor` (P7-1 S3), built from a ``launched`` row by :func:`session_executor_of`: it stops only a
+row of its own agent whose pinned role is a session role, whose fire is PROVEN dead (the fire's identity record read
+against the process table; an alive, unreadable or missing one proves nothing), and only through the launcher's
+``end_session(session_key, deadline_s)`` (:class:`SessionEnder`), whose answer must be exactly ``StopResult(True, ...)``.
+Any other answer is "cannot stop": the supervisor raises one attention row and leaves the row ``launched``. Only a
+row whose fire that stop PROVED dead and whose ``end_session`` then failed to confirm is left unrenewed, so its lease
+lapses to takeover instead of being renewed for ever; a live or unreadable fire, a row no executor was asked for, and
+every refusal before the proof keep their lease, as before S3. Nothing about the ask is remembered between passes:
+each pass re-reads the fire record (r1 F2). The launcher's
+``end_session`` is the S1 END keyed on the session key; no launcher in this tree has one, and the real stop of a live
+uid group is VM-only. No production caller wires a reaper to session rows yet
+(``git grep -n -e "Supervisor(" -e "sup.reap(" -- levain/agents levain/dream``).
 
-Nothing imports this module from an entry point: ``controller.run_agent`` looks run bodies up by agent NAME
-(``RUN_BODIES``), so a session role's fire ends unwired until a real launcher exists [routed by levain 24, 11-04].
+``controller.run_agent`` selects the run body by the pinned role's executor (``RUN_BODIES``, P7-1 S1); the session body
+stays unwired until ``SESSION_FACTORY`` is installed.
 
 Which "dispatch run path" P7-1 waits on (P7-A section 6) is not settled by the design text. This module was built on
 the build lane's reading, NOT verified: P7-1 needs this launch effect, not ``jobs.py``'s dispatch-job run method, and
@@ -60,7 +65,8 @@ from levain.agents.supervise import STOP_DEADLINE_S as _STOP_DEADLINE_S   # the 
 
 __all__ = ["S1_DISPATCH", "AUTH_FOR_BILLING", "EFFECT_ID", "BRIEF_MAX_BYTES", "RECALL_MAX_BYTES", "SessionLaunch",
            "SessionLauncher", "UnwiredLauncher", "Reserved", "SessionExecutor", "SessionReport", "BriefRefused",
-           "render_brief", "new_session_key", "reserved_terms", "launch_refusal", "run_session", "make_run"]
+           "render_brief", "new_session_key", "reserved_terms", "launch_refusal", "run_session", "make_run",
+           "SessionEnder", "RowSessionExecutor", "session_executor_of"]
 
 _log = logging.getLogger("levain.agents.session")
 
@@ -515,3 +521,151 @@ def make_run(factory: Callable[[AgentStore, str, int], Mapping[str, Any]]) -> Ca
             return 1
 
     return run
+
+
+# --- the reaper-side stop (P7-1 S3) --------------------------------------------------------------------------------
+
+@runtime_checkable
+class SessionEnder(Protocol):
+    """What a launcher offers a reaper that holds no child: ``end_session(session_key, deadline_s)`` is the S1 END keyed
+    on the session key. It answers a :class:`StopResult` and never raises; ``terminated=True`` only for a stop it
+    PROVED (the session's group gone)."""
+
+    def end_session(self, session_key: str, deadline_s: float) -> StopResult: ...
+
+
+def _fire_state(rec: Mapping[str, Any], deadline_s: float) -> str:
+    """``ended`` only when the recorded fire is proven gone: no such process, a zombie, or another process holding the
+    pid (its start time and arguments differ from the record, or the occurrence id is not among them). ``matches``
+    (alive) and ``unreadable`` (``ps`` fails while the pid answers a probe) both prove nothing. Sends no signal."""
+    import os
+    from levain.consent.delivery import process_identity
+    pid = rec["pid"]
+    ident = process_identity(pid, timeout=max(0.1, min(5.0, deadline_s)))
+    if ident is None:
+        try:
+            os.kill(pid, 0)                     # a probe, never a signal
+        except ProcessLookupError:
+            return "ended"
+        except OSError:
+            pass
+        return "unreadable"
+    if "<defunct>" in ident[1]:
+        return "ended"
+    norm = lambda t: " ".join(str(t).split())   # noqa: E731
+    if norm(rec["started"]) != norm(ident[0]) or norm(rec["args"]) != norm(ident[1]) \
+            or rec["occurrence_id"] not in ident[1].split():
+        return "ended"
+    return "matches"
+
+
+class RowSessionExecutor:
+    """A session row's :class:`levain.agents.accounting.Executor` for a reaper that holds no child (built from a row
+    by :func:`session_executor_of`). ``stop()`` re-reads the row from the store and answers ``terminated=True`` only
+    when ALL of these hold: the row is still ``launched`` with the occurrence id, agent id and session key this
+    executor was built for; its pinned role is a session role; the fire's identity record proves the fire dead; and
+    the launcher's ``end_session`` for the STORE's session key answers exactly ``StopResult(True, ...)``. Anything
+    else is ``terminated=False`` with the reason, and nothing is signalled by this class itself.
+
+    Two answers for the supervisor's lease (r1 F1/F2), both derived on each call from the store, the fire's identity
+    record and the process table, never remembered: :meth:`fire_proven_dead` (every refusal before the end passes and
+    the fire is proven dead: the supervisor withholds the row's renewal until its stop answers), and, after
+    :meth:`stop`, ``end_unproven``, True only when that stop PROVED the fire dead and ``end_session`` then failed to
+    confirm (the one row whose lease is left to lapse)."""
+
+    def __init__(self, store: AgentStore, row: Mapping[str, Any], launcher: Any, *,
+                 fire_state: Callable[[Mapping[str, Any], float], str] | None = None) -> None:
+        self.store = store
+        self.occurrence_id, self.agent_id, self.session_key = row["occurrence_id"], row["agent_id"], row["session_key"]
+        self.launcher = launcher
+        self._fire_state = fire_state or _fire_state
+        self.max_exposure_usd_micros = 0
+        self.action_exposure = None
+        self.end_unproven = False
+
+    def usage(self) -> Usage:
+        try:
+            got = self.launcher.usage(self.session_key)
+            return got if type(got) is Usage else Usage(None, None, None, "session:unreadable")
+        except Exception:  # noqa: BLE001 - usage() never raises; unreadable debits the whole reservation
+            return Usage(None, None, None, "session:unreadable")
+
+    def stop(self, deadline_s: float) -> StopResult:
+        self.end_unproven = False
+        try:
+            return self._stop(float(deadline_s))
+        except Exception as exc:  # noqa: BLE001 - stop() never raises; one that fails confirmed nothing
+            return StopResult(False, f"stop could not complete ({type(exc).__name__}); nothing assumed ended")
+
+    def fire_proven_dead(self, deadline_s: float) -> bool:
+        """True only when every check :meth:`stop` makes before ``end_session`` passes: the row is this executor's and a
+        session role's, the launcher has ``end_session``, and the fire's identity record proves the fire dead. Asks
+        no end, sends no signal, never raises (a failure is False)."""
+        try:
+            return self._dead_fire(float(deadline_s))[0] is None
+        except Exception:  # noqa: BLE001 - a check that fails proved nothing
+            return False
+
+    def _row_refusal(self) -> str | None:
+        with self.store.read() as conn:
+            got = conn.execute("SELECT state, agent_id, session_key FROM agent_occurrences WHERE occurrence_id = ?",
+                               (self.occurrence_id,)).fetchone()
+        if got is None or got[0] != "launched":
+            return "the row is not launched"
+        if got[1] != self.agent_id or type(got[2]) is not str or got[2] != self.session_key \
+                or _ctl.SESSION_KEY_RE.fullmatch(got[2]) is None:
+            return "the row is not the one this executor was built for"
+        _stop_at, pinned = _signed_by_spec(self.store, self.occurrence_id)
+        role = _role.role_by_hash(self.store, pinned) if pinned else None
+        if role is None or role.get("executor") != "session":
+            return "the row's pinned role is not a session role"
+        return None
+
+    def _dead_fire(self, deadline_s: float) -> tuple[str | None, Callable[[str, float], Any] | None]:
+        """``(None, end_session)`` when the fire is proven dead and the end may be asked, else ``(why, None)``."""
+        why = self._row_refusal()
+        if why is not None:
+            return why, None
+        end = getattr(self.launcher, "end_session", None)
+        if not callable(end):
+            return "the launcher has no end_session: nothing can end the session", None
+        try:
+            rec = json.loads(_ctl.fire_record_path(self.store.directory, self.occurrence_id).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return "the fire's identity record cannot be read: its death is not proven", None
+        if not (isinstance(rec, dict) and type(rec.get("pid")) is int and rec["pid"] > 0
+                and isinstance(rec.get("started"), str) and isinstance(rec.get("args"), str)
+                and rec.get("occurrence_id") == self.occurrence_id):
+            return "the fire's identity record is malformed or another occurrence's", None
+        state = self._fire_state(rec, deadline_s)
+        if state != "ended":
+            return f"the fire is not proven dead ({state}): the session is not ended from here", None
+        return None, end
+
+    def _stop(self, deadline_s: float) -> StopResult:
+        why, end = self._dead_fire(deadline_s)
+        if why is not None:
+            return StopResult(False, why)
+        self.end_unproven = True        # the fire is proven dead; only a proven end below clears it (a raise keeps it)
+        got = end(self.session_key, max(0.0, deadline_s))
+        if type(got) is StopResult and got.terminated is True:
+            self.end_unproven = False
+            return StopResult(True, f"the fire is dead; the session ended: {got.detail}")
+        return StopResult(False, "the session end was not proven"
+                          + (f": {got.detail}" if type(got) is StopResult else " (the answer was not a StopResult)"))
+
+
+def session_executor_of(store: AgentStore, launcher: Any, *, agent_id: str,
+                        fire_state: Callable[[Mapping[str, Any], float], str] | None = None
+                        ) -> Callable[[Mapping[str, Any]], RowSessionExecutor | None]:
+    """The ``executor_of`` a reaper passes to ``Supervisor.reap`` for session rows of ONE agent. A row of another
+    agent, or one with no session key, gets None (the supervisor then asks nothing and raises its attention row)."""
+    if type(agent_id) is not str or not agent_id:
+        raise ValueError("agent_id is the agent whose session rows this reaper may stop")
+
+    def executor_of(row: Mapping[str, Any]) -> RowSessionExecutor | None:
+        if row.get("agent_id") != agent_id or type(row.get("session_key")) is not str:
+            return None
+        return RowSessionExecutor(store, row, launcher, fire_state=fire_state)
+
+    return executor_of

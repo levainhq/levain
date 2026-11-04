@@ -126,7 +126,9 @@ def test_a_revoke_mid_run_ends_stopped_only_after_a_confirmed_stop(rig):
 
 def test_a_never_confirming_stop_stays_launched_holds_the_slot_renews_the_lease_and_raises_one_attention_row(rig):
     # behaviour: terminated=False leaves the row launched with slot and reservation, the lease renewed every tick,
-    # stop() asked again each tick, and exactly one attention row naming the occurrence
+    # stop() asked again each tick, and exactly one attention row naming the occurrence. The row has a session key, but
+    # this executor never proves its fire dead, so P7-1 S3 does not freeze it (test_agents_session_reaper_stop pins the
+    # one row that is frozen)
     clock = Clock(rig)
     sup, journal = _sup(rig, clock)
     oid = _fire(rig, "a", journal)
