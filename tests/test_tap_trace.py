@@ -76,7 +76,7 @@ def test_the_worker_trace_ring_is_capped_and_activation_keeps_it() -> None:
     got = _run("navigate", "controlled+ack+two")
     assert 0 < len(got["trace"]) <= 60
     sw = Path(__file__).resolve().parent.parent / "levain" / "webpush" / "static" / "sw.js"
-    assert re.search(r"CACHES_KEEP = \[OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE\]", sw.read_text(encoding="utf-8"))   # activation keeps the ring
+    assert re.search(r"CACHES_KEEP = \[OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE, SHELL_CACHE\]", sw.read_text(encoding="utf-8"))   # activation keeps the ring
 
 
 @needs_node
