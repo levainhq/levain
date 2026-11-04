@@ -23,7 +23,7 @@
   // A foreground (pwa_resume.js) after a long freeze: iOS kills the sockets of a frozen page, so a read that was in flight may
   // never settle, and `inflight` would then drop every later read. A read older than STUCK_MS is superseded: its generation is
   // dead, its late result is discarded, and the next read starts.
-  let loadGen = 0, inflightAt = 0;
+  let loadGen = 0, inflightAt = 0, inflightPassive = true;
   const STUCK_MS = 8000;
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
   // lands while a load is in flight, the shared `inflight` guard would drop it; latch it
@@ -885,6 +885,7 @@
     if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
     inflight = true;
     inflightAt = Date.now();
+    inflightPassive = passive;
     const myGen = ++loadGen;
     let landed = false;
     if (btn) btn.disabled = true;
@@ -932,6 +933,7 @@
       }
       if (!res.ok) throw new Error("HTTP " + res.status);
       const view = await res.json();
+      if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
       // Post-fetch race re-check (codex L3 HIGH): a passive load that STARTED clean, then
       // the operator opened/typed an editor WHILE this fetch was in flight — rebuilding
       // now would still discard it. The save path (passive:false) always applies.
@@ -950,6 +952,7 @@
       landed = true;
       return true;
     } catch (e) {
+      if (myGen !== loadGen) return false;     // a superseded read's failure says nothing about the page now
       status("read failed: " + (e && e.message ? e.message : e));
       return false;
     } finally {
@@ -970,8 +973,12 @@
   document.addEventListener("levain:resume", function (ev) {
     // a read that began before the page went to the background crossed the freeze: its socket is not to be trusted
     const away = ev && ev.detail && ev.detail.hiddenAt;
-    if (inflight && ((away && inflightAt <= away) || Date.now() - inflightAt > STUCK_MS)) { loadGen++; inflight = false; }
-    load({ passive: true }).finally(function () { if (storeEl && !inflight) storeEl.removeAttribute("data-cold"); });
+    let passive = true;
+    if (inflight && ((away && inflightAt <= away) || Date.now() - inflightAt > STUCK_MS)) {
+      passive = inflightPassive;     // an authoritative (save) reload that crossed the freeze is replaced by an authoritative one
+      loadGen++; inflight = false;
+    }
+    load({ passive: passive }).finally(function () { if (storeEl && !inflight) storeEl.removeAttribute("data-cold"); });
   });
 
   // The refresh button + visibilitychange are PASSIVE re-reads → load({passive:true}),

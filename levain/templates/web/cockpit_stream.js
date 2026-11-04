@@ -30,7 +30,7 @@
   var chip = null;
   var abort = null, watchdog = 0, retryTimer = 0, pollTimer = 0, reloadTimer = 0;
   var attempt = 0, staleSince = null, epoch = null, started = false, paused = false, gaveUp = false;
-  var lastId = null, pollTag = null;
+  var lastId = null, pollTag = null, lastConnect = 0;
   var pending = false, pendingAttempt = 0, lastReload = 0, reloadGen = 0, reloading = false;
   var withPosition = false;           // this connection named a last event, so its hello may be a replay
   var faults = Object.create(null);   // panel id -> { n, timer }
@@ -171,6 +171,7 @@
 
   function connect() {
     if (paused) return;
+    lastConnect = Date.now();
     ensureChip();
     var ctl = new AbortController();
     abort = ctl;
@@ -254,7 +255,9 @@
   document.addEventListener("levain:resume", function () {
     if (!started || paused || document.hidden) return;
     paintChip();
-    if (epoch && !staleSince) return;     // live: the heartbeat watchdog still owns it
+    // the visible edge just opened a stream (resume() above): one is enough
+    if (Date.now() - lastConnect < 1500) return;
+    // otherwise whatever is open crossed a freeze nobody announced, and cannot be trusted as live
     root.clearTimeout(retryTimer);
     if (abort) { var a = abort; abort = null; a.abort(); }
     attempt = 0;
