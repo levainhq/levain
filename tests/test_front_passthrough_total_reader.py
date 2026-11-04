@@ -23,9 +23,53 @@ def test_last_tunnel_record_wins(tmp_path):
 
 def test_torn_and_foreign_lines_are_skipped(tmp_path):
     p = tmp_path / "f"
-    p.write_bytes((_t(7) + "\n" + "garbage\n" + '[1,2]\n' + "\xff\xfe\n".encode("latin-1").decode("latin-1")).encode("latin-1")
-                  + b'{"event": "tunnel", "passthrough_to')
+    p.write_bytes(_t(7).encode() + b"\ngarbage\n[1,2]\n\xff\xfe\n" + b'{"event": "tunnel", "passthrough_to')
     assert rd(p) == 7
+
+
+def test_odd_separator_bytes_inside_a_record_do_not_split_it(tmp_path):
+    p = tmp_path / "f"
+    for sep in ("\x0b", "\x1c", "\x85", "\u2028"):
+        rec = json.dumps({"event": "tunnel", "passthrough_total": 42, "host": "a" + sep + "b"}, ensure_ascii=False)
+        p.write_bytes(_t(1).encode() + b"\n" + rec.encode("utf-8") + b"\n")
+        assert rd(p) == 42, repr(sep)
+    # \r is JSON whitespace: a record containing one is ONE line (bytes.splitlines would tear it in two)
+    p.write_bytes(_t(1).encode() + b"\n" + b'{"event": "tunnel",\r"passthrough_total": 5}\n')
+    assert rd(p) == 5
+
+
+def test_fifo_and_symlink_return_none_without_blocking(tmp_path):
+    import time
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    t0 = time.monotonic()
+    assert rd(fifo) is None
+    assert time.monotonic() - t0 < 1
+    real = _w(tmp_path / "real", _t(9))
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert rd(real) == 9
+    assert rd(link) is None
+
+
+def test_only_the_tail_is_read(tmp_path):
+    p = tmp_path / "f"
+    pad = b'{"event": "other", "pad": "' + b"x" * 1000 + b'"}\n'
+    # a tunnel record far outside the last 1 MiB is not seen; one inside is
+    p.write_bytes(_t(3).encode() + b"\n" + pad * 1100)
+    assert rd(p) is None
+    p.write_bytes(_t(3).encode() + b"\n" + pad * 1100 + _t(8).encode() + b"\n")
+    assert rd(p) == 8
+    # the first (partial) line of the tail is dropped, never parsed as a record
+    big = b'{"event": "tunnel", "passthrough_total": 77, "pad": "' + b"y" * (1 << 20) + b'"}\n'
+    p.write_bytes(big)
+    assert rd(p) is None
+
+
+def test_int64_bound(tmp_path):
+    assert rd(_w(tmp_path / "a", _t(2**63 - 1))) == 2**63 - 1
+    assert rd(_w(tmp_path / "b", _t(5), _t(2**63))) == 5
+    assert rd(_w(tmp_path / "c", _t(2**200))) is None
 
 
 def test_no_tunnel_record_is_none(tmp_path):
