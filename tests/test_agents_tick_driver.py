@@ -255,3 +255,23 @@ def test_the_real_client_variant(rig):  # noqa: F811
     client = pytest.importorskip("levain.agents.session_client")
     assert callable(getattr(client.DispatchSessionLauncher, "end_session", None))
     pytest.skip("S10a/S11 integration: drive run_tick through the real client + in-process server (head, after both land)")
+
+
+def test_a_reaper_that_raised_is_not_a_clean_exit(rig, monkeypatch, capsys):  # noqa: F811
+    monkeypatch.setattr(supervise.Supervisor, "reap", lambda self, *a, **k: 1 / 0)
+    code = T.run_tick(rig.store, clock=rig.now, authority=rig.authority, launcher_of=lambda: None)
+    assert code == T.EXIT_REAPER_ERROR and "not clean" in capsys.readouterr().err
+
+
+def test_install_files_naming_two_cockpits_are_refused(rig, tmp_path):  # noqa: F811
+    from levain.agents import session_wire as W
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(), b.mkdir()
+    store = rig.store
+    W.write_install(store.directory, cockpit_root=a)
+    from levain.dream import agent as DA
+    (store.directory / DA.INSTALL_FILE).write_text(__import__("json").dumps(
+        {"schema": DA.INSTALL_SCHEMA, "zone": "UTC", "cockpit_root": str(b), "coord_dir": str(b), "store_path": str(b / "m.db")}))
+    (b / "m.db").write_text("")
+    with pytest.raises(W.InstallRefused, match="will not guess"):
+        T._cockpit_root(store)

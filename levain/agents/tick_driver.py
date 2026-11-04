@@ -48,9 +48,9 @@ TICK_SOFT_BOUND_S = 540
 #: the worst gap between two renewals of one row (the invariant the lease needs to exceed).
 WORST_RENEW_GAP_S = TICK_INTERVAL_S + TICK_HARD_BOUND_S
 #: exit codes: 0 a pass ran; 1 refused (store, install); 3 the graceful bound fired; 70 the watchdog took the process.
-EXIT_OK, EXIT_REFUSED, EXIT_SOFT_TIMEOUT, EXIT_HARD_TIMEOUT = 0, 1, 3, 70
+EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_HARD_TIMEOUT = 0, 1, 2, 3, 70
 
-__all__ = ["TICK_INTERVAL_S", "TICK_HARD_BOUND_S", "TICK_SOFT_BOUND_S", "WORST_RENEW_GAP_S", "EXIT_OK", "EXIT_REFUSED",
+__all__ = ["TICK_INTERVAL_S", "TICK_HARD_BOUND_S", "TICK_SOFT_BOUND_S", "WORST_RENEW_GAP_S", "EXIT_OK", "EXIT_REFUSED", "EXIT_REAPER_ERROR",
            "EXIT_SOFT_TIMEOUT", "EXIT_HARD_TIMEOUT", "bounded", "executor_of_factory", "binding_of_factory",
            "attention_sink", "run_tick"]
 
@@ -204,12 +204,29 @@ def _cockpit_root(store: AgentStore) -> Path:
     from levain.agents import session_wire as _wire
     from levain.dream import agent as _da
     try:
-        return _wire.read_install(store.directory).cockpit_root
+        root = _wire.read_install(store.directory).cockpit_root
     except _wire.InstallRefused as session_exc:
         try:
             return _da.read_install(store.directory).cockpit_root
         except _da.InstallRefused:
             raise session_exc from None
+    try:
+        other = _da.read_install(store.directory).cockpit_root
+    except _da.InstallRefused:
+        return root
+    if other.resolve() != root.resolve():
+        raise _wire.InstallRefused(f"the session install names cockpit {root} and the dream install {other}: one "
+                                   "store has one authority log, so the tick will not guess")
+    return root
+
+
+def _install_coord_dir(store: AgentStore) -> Path | None:
+    """The coordinator queue directory the dream install names (its dispatch.db feeds the slot-lease probes), else None."""
+    from levain.dream import agent as _da
+    try:
+        return _da.read_install(store.directory).coord_dir
+    except _da.InstallRefused:
+        return None
 
 
 def _utc() -> datetime:
@@ -227,21 +244,23 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
     from levain.firing.deadline import TurnTimeout
 
     clock = clock or _utc
-    if not isinstance(store, AgentStore):
-        store = open_agent_store(store)
-    if authority is None:
-        authority = AgentAuthority(_cockpit_root(store))
-    attention, resolve = attention_sink(stream)
-    sup = _sup.Supervisor(store, authority=authority, clock=clock)
-    executor_of = executor_of_factory(store, launcher_of=launcher_of or session_launcher_of(store),
-                                      dream_executor_of=dream_of or dream_executor_of(store))
-    probes: tuple = ()
-    if coord_dir is not None:
-        launch_over, session_alive = _ctl.dispatch_probes(coord_dir)   # (launch_over, session_alive)
-        probes = (session_alive, launch_over)                          # tick takes (session_alive, launch_over)
 
     def work() -> Any:
-        return _ctl.tick(store, clock, binding_of_factory(store, authority, clock), *probes,
+        # everything that can block (store open, install reads, the probes' dispatch.db) runs INSIDE the bound
+        nonlocal coord_dir
+        st = store if isinstance(store, AgentStore) else open_agent_store(store)
+        auth = authority if authority is not None else AgentAuthority(_cockpit_root(st))
+        attention, resolve = attention_sink(stream)
+        sup = _sup.Supervisor(st, authority=auth, clock=clock)
+        executor_of = executor_of_factory(st, launcher_of=launcher_of or session_launcher_of(st),
+                                          dream_executor_of=dream_of or dream_executor_of(st))
+        if coord_dir is None:
+            coord_dir = _install_coord_dir(st)
+        probes: tuple = ()
+        if coord_dir is not None:
+            launch_over, session_alive = _ctl.dispatch_probes(coord_dir)   # (launch_over, session_alive)
+            probes = (session_alive, launch_over)                          # tick takes (session_alive, launch_over)
+        return _ctl.tick(st, clock, binding_of_factory(st, auth, clock), *probes,
                          reaper=lambda: sup.reap(executor_of, attention=attention, resolve=resolve))
 
     try:
@@ -251,5 +270,7 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
               file=stream or sys.stderr, flush=True)
         return EXIT_SOFT_TIMEOUT
     if getattr(out, "reaper_error", None):
-        print(f"levain agents tick: the reaper raised {out.reaper_error}; claims ran.", file=stream or sys.stderr)
+        print(f"levain agents tick: the reaper raised {out.reaper_error}; claims ran, the pass is not clean.",
+              file=stream or sys.stderr, flush=True)
+        return EXIT_REAPER_ERROR
     return EXIT_OK
