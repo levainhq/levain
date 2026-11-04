@@ -107,6 +107,13 @@
   // a second link opened on this page (a fragment-only navigation does not reload it): read it afresh
   window.addEventListener("hashchange", () => { if (location.hash) location.reload(); });
 
+  // what a refused passkey ceremony says: a cancel and a timeout both raise NotAllowedError, so that name is said in words
+  function passkeyWhy(e) {
+    const n = e && e.name;
+    if (!n || n === "NotAllowedError") return "You cancelled, or the passkey prompt timed out, so the passkey did not sign";
+    return "The passkey did not sign (" + n + ")";
+  }
+
   // ---- the page's parts ----
   function say(text, kind) {
     const n = $("sheet-note");
@@ -789,7 +796,7 @@
           showOutcome(what, line);
           return "signed";
         });
-      }, (e) => unsigned("The passkey did not sign (" + ((e && e.name) || "cancelled") + ")"));
+      }, (e) => unsigned(passkeyWhy(e)));
     }).catch((e) => {
       const name = (e && e.name) || "error";
       if (sent) { say("Not sure this was signed (the page failed: " + name + ").", "bad"); return unsure(); }
@@ -825,7 +832,8 @@
     const body = $("sheet-body");
     body.replaceChildren();
     $("sheet-actions").replaceChildren();
-    head("Drop", "Say what you want done, where it may work and how big a job it is. You sign once, with your passkey.");
+    if (headThread) head("Head card", "Extend, replace or sign this thread's head here. Nothing is signed until you tap Sign this draft.");
+    else head("Drop", "Say what you want done, where it may work and how big a job it is. You sign once, with your passkey.");
     const origin = typeof got.origin === "string" ? got.origin : "";
     const rp = typeof got.rp_id === "string" && got.rp_id ? got.rp_id : window.location.hostname;
     const held = got.credentials && typeof got.credentials === "object" ? got.credentials : {};
@@ -1111,7 +1119,7 @@
           if (cred.rawId && mine(rp)[k.fp] !== b64u(cred.rawId)) remember(rp, k.fp, b64u(cred.rawId));
           signedLine = line;
           return sendDrop({ words: c.words, outbox_id: oid, sent_at: stamp(), store_id: storeId, envelope: envelope });
-        }, (e) => stop1("The passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed."))
+        }, (e) => stop1(passkeyWhy(e) + "; nothing was signed."))
           .catch((e) => {
             const name = (e && e.name) || "error";
             if (sent) { relabel("Not confirmed"); ended(); say("Not sure the signed drop was delivered (the page failed: " + name + ").", "bad"); return undefined; }
@@ -1120,75 +1128,65 @@
       }, () => stop1("The page failed (the cockpit did not answer); nothing was signed."));
     });
     // ---- the head card of a thread (CH-H1 H1-3): opened by `#thread=<id>`, drawn from the server's draft-cards ----
-    // A LAPSED card offers Extend, a REVOKED card Replace (each writes an UNSIGNED draft: it grants nothing), an ENVELOPE
-    // card offers Review and Withdraw. A review draws the diffs the server's builder returned (never the card's own), and
-    // Sign mints the challenge at the tap: draft-challenge, the passkey, draft-accept. Every word of the card, the diffs
-    // and the signed line is the server's; this page adds none of its own to what is signed.
+    // A LAPSED card offers a draft of an extension, a REVOKED card a draft of a replacement (each writes an UNSIGNED draft:
+    // it grants nothing), an ENVELOPE card offers Review and Withdraw. A review draws the diffs the server's builder
+    // returned (never the card's own), and Sign mints the challenge at the tap: draft-challenge, the passkey, draft-accept.
+    // The words that are signed are the server's (`body_text`); this page only puts the diffs in plain words.
+    // A head thread REPLACES the drop form (it is another act, a drop), so the form is taken out of the page at the end of
+    // this block, and this ceremony is independent of the drop sheet's own state: it never touches `busy`, `flight`,
+    // `ended()`, `signing()`, `relabel()` or `#sheet-signing`; every line it draws is its own element, below.
     if (headThread) {
       const sec = el("section", "head-card");
       sec.id = "head-card";
       body.prepend(sec);
-      const hnote = el("p", "env-hint");
-      hnote.id = "head-note";
-      hnote.setAttribute("role", "status");
-      let hbusy = false;          // a request or the passkey ceremony of THIS card is under way
+      const line = (id) => { const p = el("p", "env-hint head-line"); p.id = id; p.setAttribute("role", "status"); p.hidden = true; return p; };
+      const put = (p, text, bad) => { p.textContent = text; p.hidden = !text; p.dataset.kind = bad ? "bad" : ""; };
+      const cardsBox = el("div", "head-cards");
+      const hsigning = line("head-signing");   // the line the server says is being signed
+      const hnote = line("head-note");         // the outcome of the last action
+      const hunsure = line("head-unsure");     // an accept whose outcome is not known: its own element, no read ever overwrites it
+      const hreadl = line("head-read");        // a card read: its progress or its failure, beside the lines above, never instead of them
+      const hdet = el("details", "head-detail");
+      hdet.append(el("summary", "", "Details"));
+      const hdetText = el("p", "env-hint", "Thread " + headThread);
+      hdet.appendChild(hdetText);
+      sec.append(el("p", "env-label head-title", "Head card"), cardsBox, hsigning, hnote, hunsure, hreadl, hdet);
+      let hbusy = false;          // a request or the passkey ceremony of THIS card is under way (every verb guards itself with it)
       let hreview = null;         // the review the Sign control signs: {id, body_text, fp, draft_id, revision}
-      const hsay = (text, bad) => { hnote.textContent = text; hnote.dataset.kind = bad ? "bad" : ""; };
+      let hsignText = "";
+      const hsay = (text, bad) => put(hnote, text, bad);
+      const hline = (label) => { if (hsignText) put(hsigning, label + ": " + hsignText); };
+      const hmoved = () => { refuseOther(); hsay(MOVED, true); };
       const hstop = () => moved || (!storeId ? "this Levain has no coordinator store to read a head card from yet" : "");
       const hbtn = (label, id, fn, primary) => {
         const b = el("button", primary ? "dev-btn dev-primary" : "dev-btn", label);
         b.type = "button";
-        b.id = id;
-        b.addEventListener("click", () => { if (!hbusy) fn(); });
+        b.id = id;      // ids serve the tests; the page scopes by card (acts / box below), and a card list holds one card
+        b.addEventListener("click", fn);
         return b;
       };
-      const kindLine = (card) => el("p", "env-label", card.kind + ": " + String(card.line || ""));
+      const KIND = { ENVELOPE: "Draft to sign", REVOKED: "Revoked", LAPSED: "Lapsed" };
+      const FIELD = { where: "Where it may work", budget: "Size", stop_at: "Stops", lands: "Landings", pushes: "Pushes", publishes: "Publishes" };
+      const BUDGET = { tool_calls: "tool calls", tokens: "tokens", dollars_cents: "dollars", hours: "hours" };
+      const EFFECT = { lands: "landing", pushes: "push", publishes: "publish" };
+      const VERB = { "draft-rule": "Drafting", "draft-withdraw": "Withdrawing", "draft-review": "Reviewing" };
+      const unset = (v) => v === null || v === undefined;
+      const budgetVal = (k, v) => (unset(v) ? "not set" : k === "dollars_cents" ? "$" + (Number(v) / 100).toFixed(2) : String(v));
+      const hfield = (v) => (unset(v) ? "not set" : typeof v === "string" ? v : JSON.stringify(v));
+      // one field of the draft in plain words; a shape this does not know is shown as it came
+      const plainField = (name, v) => {
+        if (name === "where" && Array.isArray(v)) {
+          return v.length ? v.map((w) => "folder " + String(w && w.repo) + (w && Array.isArray(w.paths) && w.paths.length ? " (" + w.paths.join(", ") + ")" : "")).join("; ") : "nowhere";
+        }
+        if (name === "budget" && v && typeof v === "object" && !Array.isArray(v)) {
+          const parts = Object.keys(BUDGET).filter((k) => !unset(v[k])).map((k) => (k === "dollars_cents" ? budgetVal(k, v[k]) : v[k] + " " + BUDGET[k]));
+          return parts.length ? parts.join(", ") : "not set";
+        }
+        if (Object.prototype.hasOwnProperty.call(EFFECT, name) && Array.isArray(v)) return v.length ? v.length + " " + EFFECT[name] + (v.length === 1 ? "" : "s") : "none";
+        return hfield(v);
+      };
       const has = (card, a) => Array.isArray(card.actions) && card.actions.indexOf(a) >= 0;
-      const hcards = (cards) => {
-        hreview = null;
-        sec.replaceChildren();
-        sec.appendChild(el("p", "env-label", "Head card for " + headThread));
-        if (!Array.isArray(cards) || !cards.length) sec.appendChild(el("p", "env-hint", "This thread shows no head card: nothing to extend, replace or sign."));
-        else for (const card of cards) sec.appendChild(hdrawCard(card));
-        sec.appendChild(hnote);
-      };
-      const hrefresh = () => {
-        const s = hstop();
-        if (s) return hsay(s, true);
-        return post("draft-cards", { thread_id: headThread, store_id: storeId }).then((c) => {
-          if (!c.ok) return hsay("The head card could not be read: " + why(c), true);
-          if (otherStore(c.body.store_id)) return refuseOther();
-          hcards(c.body.cards);
-        }, () => hsay("The head card could not be read (the cockpit did not answer).", true));
-      };
-      // a card the server no longer holds as drawn (409 draft_stale, a changed thread): read again, say so
-      const hstale = (r) => { hsay("The card changed since it was shown (" + why(r) + "); read again, nothing was signed."); return hrefresh(); };
-      const hcall = (action, req, ok) => {
-        const s = hstop();
-        if (s) return hsay(s, true);
-        hbusy = true;
-        return post(action, Object.assign({ store_id: storeId }, req)).then((r) => {
-          hbusy = false;
-          if (r.ok && otherStore(r.body.store_id)) return refuseOther();
-          if (r.ok) return ok(r.body);
-          if (r.status === 409) return hstale(r);
-          return hsay(action + " refused: " + why(r), true);
-        }, () => { hbusy = false; hsay(action + ": the cockpit did not answer.", true); });
-      };
-      const hrule = (card, rule) => {
-        const head = card.head && typeof card.head.envelope_id === "string" ? card.head.envelope_id : "";
-        if (!head) return hsay("This card names no head to " + (rule === "renew" ? "extend" : "replace") + ".", true);
-        return hcall("draft-rule", { thread_id: headThread, rule: rule, head: head }, (b) => {
-          hcards(b.cards);
-          hsay("A draft is written. It grants nothing until you review it and sign.");
-        });
-      };
-      const hwithdraw = (d) => hcall("draft-withdraw", { draft_id: d.draft_id, revision: d.revision }, (b) => {
-        hcards(b.cards);
-        hsay("Draft withdrawn.");
-      });
-      const hfield = (v) => (v === null || v === undefined ? "unset" : typeof v === "string" ? v : JSON.stringify(v));
-      // the diffs as the builder returned them, one plain line each
+      // the diffs as the builder returned them, one plain line each; the exact text is in the disclosure below them
       const diffLines = (a) => {
         const out = [];
         const d = a && a.diff && typeof a.diff === "object" ? a.diff : {};
@@ -1197,44 +1195,107 @@
         for (const p of w.removed || []) out.push("removes where it may work: " + p);
         for (const kind of Object.keys(d.effects || {})) {
           const e = d.effects[kind] || {};
-          for (const x of e.added || []) out.push("adds " + kind + ": " + x);
-          for (const x of e.removed || []) out.push("removes " + kind + ": " + x);
-          for (const x of e.changed || []) out.push("changes " + kind + ": " + x);
+          const noun = EFFECT[kind] || kind;
+          for (let i = 0; i < (e.added || []).length; i++) out.push("adds a " + noun);
+          for (let i = 0; i < (e.removed || []).length; i++) out.push("removes a " + noun);
+          for (let i = 0; i < (e.changed || []).length; i++) out.push("changes a " + noun + ": same target, other limits");
         }
-        for (const k of Object.keys(d.budget || {})) out.push("budget " + k + ": " + hfield(d.budget[k][0]) + " -> " + hfield(d.budget[k][1]));
-        if (Array.isArray(d.stop_at)) out.push("stops: " + hfield(d.stop_at[0]) + " -> " + hfield(d.stop_at[1]));
+        for (const k of Object.keys(d.budget || {})) out.push((BUDGET[k] || k) + ": from " + budgetVal(k, d.budget[k][0]) + " to " + budgetVal(k, d.budget[k][1]));
+        if (Array.isArray(d.stop_at)) out.push("stops: from " + hfield(d.stop_at[0]) + " to " + hfield(d.stop_at[1]));
         return out;
       };
-      const hreviewTap = (card) => {
+      const hcards = (cards) => {
+        hreview = null;
+        cardsBox.replaceChildren();
+        if (!cards.length) cardsBox.appendChild(el("p", "env-hint", "This thread shows no head card: nothing to extend, replace or sign."));
+        else for (const card of cards) cardsBox.appendChild(hdrawCard(card));
+      };
+      // read the card; it answers with the cards (drawn) or null (said in `hreadl`, never in the outcome lines)
+      const hrefresh = () => {
+        const s = hstop();
+        if (s) { put(hreadl, s, true); return Promise.resolve(null); }
+        put(hreadl, "Reading the head card…");
+        return post("draft-cards", { thread_id: headThread, store_id: storeId }).then((c) => {
+          if (!c.ok) { put(hreadl, "The head card could not be read: " + why(c), true); return null; }
+          if (otherStore(c.body.store_id)) { hmoved(); return null; }
+          if (!Array.isArray(c.body.cards)) { put(hreadl, "The head card could not be read: the cockpit sent no list of cards.", true); return null; }
+          try { hcards(c.body.cards); } catch (e) { put(hreadl, "The head card could not be drawn (" + ((e && e.name) || "error") + ").", true); return null; }
+          put(hreadl, "");
+          return c.body.cards;
+        }, () => { put(hreadl, "The head card could not be read (the cockpit did not answer).", true); return null; })
+          .catch((e) => { put(hreadl, "The head card could not be read (the page failed: " + ((e && e.name) || "error") + ").", true); return null; });
+      };
+      // the cards a committed write answered with: a list is drawn; anything else means UNKNOWN (the write stands), never "no card"
+      const hset = (b) => {
+        if (Array.isArray(b.cards)) { hcards(b.cards); return Promise.resolve(); }
+        put(hreadl, typeof b.cards_note === "string" && b.cards_note ? b.cards_note : "The cockpit did not send the card back; reading it again.", true);
+        return hrefresh().then(() => undefined);
+      };
+      // a card the server no longer holds as drawn (409 draft_stale, a changed thread): read again, say so
+      const hstale = (r) => { hsay("The card changed since it was shown (" + why(r) + "); read again, nothing was signed."); return hrefresh(); };
+      const hcall = (action, req, ok) => {
+        if (hbusy) return undefined;
+        const s = hstop();
+        if (s) return hsay(s, true);
+        hbusy = true;
+        return post(action, Object.assign({ store_id: storeId }, req)).then((r) => {
+          hbusy = false;
+          if (r.ok && otherStore(r.body.store_id)) return hmoved();
+          if (r.ok) return ok(r.body);
+          if (r.status === 409) return hstale(r);
+          return hsay((VERB[action] || action) + " was refused: " + why(r), true);
+        }, () => { hbusy = false; hsay((VERB[action] || action) + ": the cockpit did not answer.", true); })
+          .catch((e) => { hbusy = false; hsay((VERB[action] || action) + ": the page failed (" + ((e && e.name) || "error") + ").", true); });
+      };
+      const hrule = (card, rule) => {
+        const head = card.head && typeof card.head.envelope_id === "string" ? card.head.envelope_id : "";
+        if (!head) return hsay("This card names no head to " + (rule === "renew" ? "extend" : "replace") + ".", true);
+        return hcall("draft-rule", { thread_id: headThread, rule: rule, head: head }, (b) => {
+          hsay("A draft is written. It grants nothing until you review it and sign.");
+          return hset(b);
+        });
+      };
+      const hwithdraw = (d) => hcall("draft-withdraw", { draft_id: d.draft_id, revision: d.revision }, (b) => {
+        hsay("Draft withdrawn.");
+        return hset(b);
+      });
+      const hreviewTap = (card, box, acts) => {
         const d = card.detail || {};
         if (cannot) return hsay("Envelope: " + cannot, true);
         const k = keyNow();
         return hcall("draft-review", { draft_id: d.draft_id, revision: d.revision, digest: d.digest, signer_fp: k.fp }, (b) => {
           if (!b.review_id || typeof b.body_text !== "string") return hsay("The cockpit sent no review to sign; nothing was signed.", true);
           hreview = { id: b.review_id, body_text: b.body_text, fp: k.fp, draft_id: d.draft_id, revision: d.revision };
-          const box = $("head-diffs") || el("div", "env-opt");
-          box.id = "head-diffs";
-          box.replaceChildren();
+          const old = box.querySelector(".head-diffs");
+          if (old) old.remove();
+          const dbox = el("div", "env-opt head-diffs");
+          dbox.id = "head-diffs";
           const t = el("div", "env-opt-t");
+          const ag = b.against || {};
+          // the widest claim first: a grant bigger than the head's, or no head left to extend; the two never both appear
+          if (ag.base_kind === "revoked") t.appendChild(el("div", "env-opt-name head-new", "This is a new grant, not an extension of the old head"));
+          else if (ag.wider) t.appendChild(el("div", "env-opt-name head-wider", "This signature grants MORE than the head it replaces"));
           for (const l of Array.isArray(b.view) ? b.view : []) t.appendChild(el("div", "env-hint", String(l)));
-          t.appendChild(el("div", "env-opt-name", b.against && b.against.wider ? "This signature grants MORE than the head it replaces" : "What this signature changes"));
-          const lines = diffLines(b.against);
-          const since = Array.isArray(b.since_parent) ? b.since_parent.map((x) => "since the last draft, " + x.field + ": " + hfield(x.before) + " -> " + hfield(x.after)) : [];
-          t.appendChild(el("pre", "sheet-message", lines.concat(since).join("\n") || "no change from the head"));
+          t.appendChild(el("div", "env-opt-name", "What this signature changes"));
+          const lines = diffLines(ag);
+          const since = Array.isArray(b.since_parent) ? b.since_parent.map((x) => "since the last draft, " + (FIELD[x.field] || x.field) + ": " + plainField(x.field, x.before) + " -> " + plainField(x.field, x.after)) : [];
+          const members = (Array.isArray(ag.members_added) && ag.members_added.length) || (Array.isArray(ag.members_removed) && ag.members_removed.length);
+          t.appendChild(el("pre", "sheet-message", lines.concat(since).join("\n") || (members ? "unchanged except members" : "no change from the head")));
           const det = el("details", "");
           det.appendChild(el("summary", "", "What exactly gets signed"));
           det.appendChild(el("pre", "sheet-message", b.body_text));
           t.appendChild(det);
-          box.appendChild(t);
-          const at = $("head-card-actions");
-          if (at) at.before(box); else sec.appendChild(box);
-          const sg = hbtn("Sign with your passkey", "head-sign", hsign, true);
-          const old = $("head-sign"); if (old) old.remove();
-          if (at) at.prepend(sg);
-          hsay("Read the changes above, then sign with your passkey. The challenge is made when you tap.");
+          dbox.appendChild(t);
+          acts.before(dbox);
+          const sg = hbtn("Sign this draft", "head-sign", hsign, true);
+          sg.dataset.headSign = "1";
+          const prior = acts.querySelector("[data-head-sign]");
+          if (prior) prior.remove();
+          acts.prepend(sg);
+          hsay("Read the changes above, then sign this draft with your passkey. The challenge is made when you tap.");
         });
       };
-      const hdone = () => { hbusy = false; busy = false; ended(); };
+      const hend = () => { hbusy = false; };
       const hsign = () => {
         const r = hreview;
         if (!r || hbusy) return;
@@ -1242,17 +1303,34 @@
         if (k.fp !== r.fp) return hsay("The signing key changed since this review; review again. Nothing was signed.", true);
         const s = hstop();
         if (s) return hsay(s, true);
-        hbusy = true; busy = true; flight = true;
-        const stop1 = (m, again) => { relabel("Not signed"); hdone(); hsay(m, true); if (again) hrefresh(); };
+        hbusy = true;
+        put(hunsure, "");
+        const stop1 = (m, again) => { hend(); hline("Not signed"); hsay(m, true); return again ? hrefresh() : undefined; };
+        // an accept whose outcome is not known: said in its own line, then settled by reading the card, in words either way
+        const unsure = (why1) => {
+          hend();
+          hreview = null;
+          hline("Not confirmed");
+          const noSign = document.querySelector("#head-card [data-head-sign]");
+          if (noSign) noSign.remove();
+          const base = "Not sure this was signed (" + why1 + ").";
+          put(hunsure, base + " Reading the card to see…", true);
+          return hrefresh().then((cards) => {
+            if (cards === null) { put(hunsure, base + " The card could not be read either, so it is not known: look at this thread before signing again.", true); return; }
+            const still = cards.some((c) => c && c.kind === "ENVELOPE" && c.detail && c.detail.draft_id === r.draft_id);
+            put(hunsure, base + " " + (still ? "Not signed: the card still shows the draft." : "Signed, as far as the card shows: the draft is no longer on it."), still);
+            hline(still ? "Not signed" : "Signed");
+          });
+        };
         hsay("Confirm with your passkey to sign…");
         // the challenge is minted now, at the tap: a draft that went stale while this was read is refused before any byte
         return post("draft-challenge", { review_id: r.id }).then((ch) => {
           if (!ch.ok) return stop1("Not signed: " + why(ch) + "; nothing was signed.", ch.status === 409);
-          if (otherStore(ch.body.store_id)) { stop1("Not signed: the challenge came from a different Levain store than this sheet was opened for; nothing was signed."); return refuseOther(); }
+          if (otherStore(ch.body.store_id)) { hend(); refuseOther(); return hsay("Not signed: the challenge came from a different Levain store than this sheet was opened for; nothing was signed. " + MOVED, true); }
           if (!decodable(ch.body.challenge)) return stop1("The cockpit sent a malformed challenge; nothing was signed.");
-          const line = typeof ch.body.line === "string" ? ch.body.line : "";
-          if (line) signing(line, "server", "Signing");
-          hsay("Confirm with your passkey to sign…" + (line ? " " + line : ""));
+          hsignText = typeof ch.body.line === "string" ? ch.body.line : "";
+          hline("Signing");
+          hsay("Confirm with your passkey to sign…" + (hsignText ? " " + hsignText : ""));
           const allow = k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
           const ask = (aid) => {
             const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
@@ -1262,54 +1340,62 @@
           let sent = false;
           return ask(allow).catch((e) => { if (!(e && e.name === "NotAllowedError" && allow && k.local)) throw e; return ask(null); }).then((cred) => {
             hsay("Sending the signature…");
+            // the key set is the server's own (draft_sign `_need`): the review id and the signed parts, no store id
             const req = { review_id: r.id, body_text: r.body_text, payload: ch.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
-                          client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature), store_id: storeId };
+                          client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
             sent = true;
             if (cred.rawId && mine(rp)[k.fp] !== b64u(cred.rawId)) remember(rp, k.fp, b64u(cred.rawId));
             return post("draft-accept", req).then((a) => {
               if (a.ok) {
-                relabel("Signed");
-                hdone();
-                hcards(a.body.cards);
-                hsay((a.body.created === false ? "Already signed: " : "Signed: ") + "envelope " + String((a.body.envelope && a.body.envelope.envelope_id) || ""));
-                return undefined;
+                hend();
+                hline("Signed");
+                const id = String((a.body.envelope && a.body.envelope.envelope_id) || "");
+                hsay(a.body.created === false ? "Already signed." : "Signed.");
+                if (id) hdetText.textContent = "Thread " + headThread + " · envelope " + id;
+                return hset(a.body);
               }
-              if (a.status >= 400 && a.status < 500) return stop1("Not signed: " + why(a) + ".", a.status === 409);
-              relabel("Not confirmed");
-              hdone();
-              hsay("Not sure this was signed (" + why(a) + "); reading the card to see.", true);
-              return hrefresh();
-            }, () => { relabel("Not confirmed"); hdone(); hsay("Not sure this was signed (the cockpit did not answer); reading the card to see.", true); return hrefresh(); });
-          }, (e) => stop1("The passkey did not sign (" + ((e && e.name) || "cancelled") + "); nothing was signed."))
+              // any 4xx spends the review (and may mean the card moved): the card is read again and the Sign button goes with it
+              if (a.status >= 400 && a.status < 500) return stop1("Not signed: " + why(a) + ".", true);
+              return unsure(why(a));
+            }, () => unsure("the cockpit did not answer"));
+          }, (e) => stop1(passkeyWhy(e) + "; nothing was signed."))
             .catch((e) => {
               const name = (e && e.name) || "error";
-              if (sent) { relabel("Not confirmed"); hdone(); hsay("Not sure this was signed (the page failed: " + name + ").", true); return undefined; }
+              if (sent) return unsure("the page failed: " + name);
               return stop1("The page failed (" + name + "); nothing was signed.");
             });
-        }, () => stop1("The page failed (the cockpit did not answer); nothing was signed."));
+        }, () => stop1("The page failed (the cockpit did not answer); nothing was signed."))
+          .catch((e) => { hend(); hsay("The page failed (" + ((e && e.name) || "error") + "); look at the card before signing again.", true); });
       };
       function hdrawCard(card) {
         const box = el("div", "head-card-box");
         box.dataset.kind = String(card.kind);
-        box.appendChild(kindLine(card));
+        box.appendChild(el("p", "env-label", (KIND[card.kind] || String(card.kind)) + ": " + String(card.line || "")));
         const d = card.detail || {};
         const acts = el("div", "pair-actions");
         acts.id = "head-card-actions";
-        if (card.kind === "LAPSED" && has(card, "extend")) acts.appendChild(hbtn("Extend", "head-extend", () => hrule(card, "renew"), true));
-        if (card.kind === "REVOKED" && has(card, "replace")) acts.appendChild(hbtn("Replace", "head-replace", () => hrule(card, "replace"), true));
+        const draftOnly = () => box.appendChild(el("p", "env-hint", "This only writes a draft. Nothing is signed until you review it and sign."));
+        if (card.kind === "LAPSED" && has(card, "extend")) { draftOnly(); acts.appendChild(hbtn("Draft an extension", "head-extend", () => hrule(card, "renew"), true)); }
+        if (card.kind === "REVOKED" && has(card, "replace")) { draftOnly(); acts.appendChild(hbtn("Draft a replacement", "head-replace", () => hrule(card, "replace"), true)); }
         if (card.kind === "ENVELOPE") {
-          const fl = Array.isArray(d.fields) ? d.fields.map((f) => f.field + ": " + hfield(f.value) + (Array.isArray(f.cites) && f.cites.length ? " (cited)" : " (no cite)")) : [];
+          const fl = Array.isArray(d.fields) ? d.fields.map((f) => (FIELD[f.field] || f.field) + ": " + plainField(f.field, f.value) + (Array.isArray(f.cites) && f.cites.length ? " (source given)" : " (no source given)")) : [];
           if (fl.length) box.appendChild(el("pre", "sheet-message", fl.join("\n")));
           if (typeof d.cite_note === "string" && d.cite_note) box.appendChild(el("p", "env-hint", d.cite_note));
-          if (has(card, "sign")) acts.appendChild(hbtn("Review the changes", "head-review", () => hreviewTap(card), false));
+          if (has(card, "sign")) acts.appendChild(hbtn("Review the changes", "head-review", () => hreviewTap(card, box, acts), false));
           if (has(card, "withdraw")) acts.appendChild(hbtn("Withdraw this draft", "head-withdraw", () => hwithdraw(d), false));
         }
         box.appendChild(acts);
         return box;
       }
-      sec.append(hnote);
-      hsay("Reading the head card…");
       hrefresh();
+      // the drop form is not this page's business here: out of the page, and its progress line (a shared element) put back
+      const noteHome = $("sheet-note");
+      if (noteHome) acts.after(noteHome);
+      grid.remove();
+      list.remove();
+      acts.replaceChildren();
+      acts.hidden = true;
+      return;
     }
     form.start();
     // a drop kept from an earlier visit whose answer never came: asked again now, unchanged (the outbox id files it once)

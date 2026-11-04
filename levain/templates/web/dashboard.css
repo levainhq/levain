@@ -2911,7 +2911,9 @@ body.ke .ck-drop .drop-more { align-self: flex-start; margin-top: var(--sp-3); }
 body.sheet-embedded #drop-words { min-height: 7em; }
 .head-card { margin: 0 0 var(--sp-5); }
 .head-card-box { display: flex; flex-direction: column; gap: var(--sp-3); margin: 0 0 var(--sp-3); }
-#head-note[data-kind="bad"] { color: var(--bad); }
+.head-line[data-kind="bad"] { color: var(--bad); }
+/* the claim that a signature reaches wider than the head it replaces is the one line of the review that must not read like the rest */
+.head-wider { color: var(--warn); font-weight: 600; padding-left: var(--sp-3); border-left: 3px solid var(--warn); }
 .tv-card-link { display: inline-block; margin: 0 0 var(--sp-3); }
 .env-opt-t { display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
 .env-opt-name { font-weight: var(--fw-semibold); }
