@@ -3374,12 +3374,13 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
             "act signed. The way out, `levain cockpit ledger re-genesis` (a new authority log, every grant void), "
             "is not in this build.")]
     if len(laptops) == 1:
+        # one signing key is a single point of loss (a Secure Enclave key dies with its laptop), so it FAILS until a
+        # co-root is enrolled; the fix is the independent offline passphrase key, enrolled by the key already there
         return rows + [CheckResult(
-            name, True, f"one {LAPTOP} key is enrolled ({laptops[0]})",
-            f"Enrol a second {LAPTOP} key now: make one with `levain cockpit key create`, then `levain cockpit "
-            "enroll <key.pub> --signing-key <the enrolled key>`; "
-            f"{recovery}.",
-            warn=True)]
+            name, False, f"only one {LAPTOP} key is enrolled ({laptops[0]}): lose it and nothing can enrol or revoke",
+            "Enrol a co-root now: `levain cockpit key create --custody passphrase --label laptop-presence`, then "
+            f"`levain cockpit enroll <that key.pub> --class {LAPTOP} --custody passphrase --signing-key <the enrolled "
+            f"key>`; keep its passphrase off this laptop. {recovery}.")]
     if not laptops:
         return rows + [CheckResult(name, True, f"no unrevoked {LAPTOP} key: nothing can enrol a key or sign a T3 act",
                                    "Recovery, `levain cockpit ledger re-genesis` (a new authority log, every grant "

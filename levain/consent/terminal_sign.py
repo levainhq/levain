@@ -556,6 +556,18 @@ def _after_failure(progress: _Progress, why: str) -> CreateReport:
     return CreateReport(False, f"not created: {why}")
 
 
+#: The third printed step: the ledger is not done at genesis. A Secure Enclave key dies with its laptop and the build has
+#: no re-root, so an independent offline passphrase key is enrolled by the genesis key in the same sitting
+#: (``levain doctor`` FAILS at exactly one signing laptop-presence key). Both commands are the ones run on a scratch root.
+_CO_ROOT_STEP = [
+    "3. Co-root, the same sitting, BEFORE the ledger counts as done (a lost laptop must not lose the ledger):",
+    "   first: levain cockpit key create --custody passphrase --label laptop-presence",
+    "   then, signed by the key above: levain cockpit enroll <that key's .pub> --class laptop-presence --custody passphrase --signing-key "
+    "<the enrolled key>",
+    "   keep that passphrase and key file off this laptop; the runbook is project_memory/1103-19/ENROL_SITTING.md",
+]
+
+
 def _created_report(path: Path, public_path: Path, public_key: str, note: str | None = None) -> CreateReport:
     """The created report, built piece by piece: a piece that cannot be built is named, never a lost key."""
     lines = [f"terminal key created: {path}"]
@@ -570,6 +582,7 @@ def _created_report(path: Path, public_path: Path, public_key: str, note: str | 
                   f"   {enroll_command(public_path)}"]
     except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - as above
         unprinted.append(f"the enroll command ({_one_line(exc)})")
+    lines += _CO_ROOT_STEP
     if note:
         lines.append(f"note: {note}")
     if unprinted:
