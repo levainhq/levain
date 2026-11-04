@@ -229,13 +229,23 @@ def test_unlistable_managed_dropin_dir_refuses_not_skipped(monkeypatch, tmp_path
     (dropins / "10.json").write_text("{}")
     monkeypatch.setitem(cc.MANAGED_BASES, "darwin", base)
     assert hg.load_managed_settings("darwin") == [(str(dropins / "10.json"), {})]   # control: listable
-    dropins.chmod(0)
-    try:
-        docs = hg.load_managed_settings("darwin")
-        assert docs and all(d is hg._MISSING for _, d in docs)
-        assert hg.check_managed_settings(docs, ())
-    finally:
-        dropins.chmod(0o755)
+    real = os.listdir
+
+    def denied(p="."):
+        if str(p) == str(dropins):
+            raise PermissionError(13, "denied")
+        return real(p)
+
+    monkeypatch.setattr(os, "listdir", denied)   # not chmod: root CI reads a 0-mode directory
+    docs = hg.load_managed_settings("darwin")
+    assert docs and all(d is hg._MISSING for _, d in docs)
+    assert hg.check_managed_settings(docs, ())
+
+    monkeypatch.undo()
+    monkeypatch.setitem(cc.MANAGED_BASES, "darwin", base)
+    fifo = base / "managed-settings.json"
+    os.mkfifo(fifo)   # a FIFO would block the read forever; it must refuse without opening it
+    assert (str(fifo), hg._MISSING) in hg.load_managed_settings("darwin")
 
 
 @pytest.mark.parametrize("sandbox", [

@@ -1499,11 +1499,19 @@ def load_managed_settings(platform: str = sys.platform) -> list[tuple[str, Any]]
         return []
     docs: list[tuple[str, Any]] = []
     for f in managed_settings_files(platform):
-        if os.path.lexists(f):
-            try:
-                docs.append((str(f), json.loads(f.read_text(encoding="utf-8"))))
-            except (OSError, ValueError):
-                docs.append((str(f), _MISSING))
+        try:
+            os.lstat(f)
+        except (FileNotFoundError, NotADirectoryError):
+            continue   # absent: sets nothing
+        except OSError:
+            docs.append((str(f), _MISSING))   # cannot even be looked at: refuse, never skip
+            continue
+        try:
+            if not stat.S_ISREG(os.stat(f).st_mode):   # a FIFO would block the read; a directory cannot parse
+                raise OSError("not a regular file")
+            docs.append((str(f), json.loads(f.read_text(encoding="utf-8"))))
+        except (OSError, ValueError, RecursionError):
+            docs.append((str(f), _MISSING))
     mcp = base / "managed-mcp.json"
     if mcp.exists():
         docs.append((str(mcp), {"__managed_mcp__": True}))

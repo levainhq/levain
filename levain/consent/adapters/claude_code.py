@@ -1184,10 +1184,12 @@ def managed_settings_files(platform: str = sys.platform) -> list[Path]:
     files = [base / "managed-settings.json"]
     dropins = base / "managed-settings.d"
     try:
-        if dropins.is_dir():
-            files += [dropins / n for n in sorted(os.listdir(dropins)) if n.endswith(".json")]
-        elif os.path.lexists(dropins):
-            files.append(dropins)
+        if os.path.lexists(dropins):
+            if dropins.is_dir():
+                files += [dropins / n for n in sorted(os.listdir(dropins))
+                          if n.endswith(".json") and not n.startswith(".")]
+            else:
+                files.append(dropins)   # not a directory: unreadable as a document, so it refuses
     except OSError:
         files.append(dropins)
     return files
@@ -1215,6 +1217,8 @@ def _settings_files(cwd: str | None, home: Path, codex_home: Path | None, *,
             + [home / ".codex"]:
         out.append(("toml", d / "config.toml"))
     out += list(SYSTEM_SETTINGS_FILES)
+    for plat in MANAGED_BASES:   # the drop-ins too (L3 r1): a managed-settings.d file can set an env var as well
+        out += [("json", p) for p in managed_settings_files(plat)]
     for start in (cwd, environ.get("CLAUDE_PROJECT_DIR")):
         if not isinstance(start, str) or not start:
             continue
