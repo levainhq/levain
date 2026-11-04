@@ -329,7 +329,7 @@ def test_install_precaches_the_css_and_js_the_shell_names_and_an_offline_asset_f
     entries = {e: b for _, es in got["shells"] for e, b in es}
     assert sorted(entries) == ["/", "/a.js", "/b.js?v=2", "/dashboard.css", "/q.css", "/q.js"], entries
     assert entries["/dashboard.css"] == "ASSET /dashboard.css", entries
-    off = _fetch(url="https://box.example/dashboard.css", mode="no-cors", destination="style", net="down", shell=True, cached="/dashboard.css")
+    off = _fetch(url="https://box.example/dashboard.css", mode="no-cors", destination="style", net="down", shell=True, shellHtml=SHELL_HTML, cached="/dashboard.css")
     assert off["responded"] is True and off["body"] == "CACHED /dashboard.css", off
     miss = _fetch(url="https://box.example/other.js", mode="no-cors", destination="script", net="down", shell=True)
     assert miss["responded"] is True and miss["status"] == 0, miss                               # a miss is a network error, as without a worker
@@ -347,7 +347,7 @@ def test_install_precaches_the_css_and_js_the_shell_names_and_an_offline_asset_f
 def test_a_query_versioned_shell_asset_is_cached_and_served_by_its_exact_url_and_any_other_query_stays_network_only() -> None:
     """N1: the install stores '/b.js?v=2' and the fetch handler must intercept that exact request (it used to refuse every
     query, so the cached copy was never served offline). A query the shell does not name is never cached."""
-    off = _fetch(url="https://box.example/b.js?v=2", mode="no-cors", destination="script", net="down", shell=True, cached="/b.js?v=2")
+    off = _fetch(url="https://box.example/b.js?v=2", mode="no-cors", destination="script", net="down", shell=True, shellHtml=SHELL_HTML, cached="/b.js?v=2")
     assert off["responded"] is True and off["body"] == "CACHED /b.js?v=2", off
     on = _fetch(url="https://box.example/b.js?v=2", mode="no-cors", destination="script", net="ok", shell=True, shellHtml=SHELL_HTML)
     assert [b for _, es in on["shells"] for e, b in es if e == "/b.js?v=2"] == ["LIVE /b.js?v=2"], on
@@ -363,7 +363,8 @@ def test_a_failed_or_soft_200_asset_commits_no_shell_and_a_prior_generation_is_c
         assert got["skipWaiting"] is False and all(not es for _, es in got["shells"]), (mode, got)   # install succeeds, nothing cached
         prior = {n: dict(es) for n, es in _run("install", mode + ":prior")["shells"]}
         cur = [v for n, v in prior.items() if n != "levain-shell-vOLD"]
-        assert cur == [{"/": "<html>old shell</html>", "/dashboard.css": "OLD CSS", "/a.js": "OLD A"}], (mode, prior)   # the whole old generation
+        assert cur == [{"/": "<html>old shell</html>"}], (mode, prior)   # the old '/' and exactly the assets it names (none here)
+        assert _run("install", mode)["cancelled"] == 1, mode                # the rejected response's body was cancelled, not held
 
 
 @needs_node
@@ -409,3 +410,36 @@ def test_activation_carries_the_last_good_shell_forward_when_the_new_install_cac
     got = _run("carry")
     assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1104-pwasw-1"], got   # the old shell cache is gone
     assert got["shells"][0][1] == [["/", "<html>old shell</html>"]], got          # its page was carried first
+
+
+@needs_node
+def test_activation_carries_only_the_old_shell_and_the_assets_it_names_each_revalidated_else_nothing() -> None:
+    """Reproduced red on 61196fff: activation copied EVERY entry of the old generation (strays, a query-mismatched asset,
+    an HTML body under a script key) and the old shell stayed whole regardless."""
+    good = {n: dict(es) for n, es in _run("install", "badasset:good")["shells"]}
+    cur = [v for n, v in good.items() if n != "levain-shell-vOLD"]
+    assert cur == [{"/": '<link rel="stylesheet" href="/dashboard.css"><script src="/b.js?v=2"></script>',
+                    "/dashboard.css": "OLD CSS", "/b.js?v=2": "OLD B"}], good                  # no /stray.js
+    stale = {n: dict(es) for n, es in _run("install", "badasset:stale")["shells"]}
+    cur = [v for n, v in stale.items() if n != "levain-shell-vOLD"]
+    assert all(not v for v in cur), stale            # a missing/mismatched/soft-200 asset: a half shell is never carried
+
+
+@needs_node
+def test_a_commit_prunes_keys_the_new_shell_does_not_name_and_a_failed_put_restores_the_previous_generation() -> None:
+    pruned = _fetch(url="https://box.example/", net="ok", shell=True, html='<link rel="stylesheet" href="/dashboard.css">N', stray=["/old.js", "/b.js?v=1"])
+    assert {e for _, es in pruned["shells"] for e, _b in es} == {"/", "/dashboard.css"}, pruned
+    # '/' fails to write after the asset overwrote a same-URL entry: the old asset and old '/' are put back
+    html = '<link rel="stylesheet" href="/dashboard.css">N'
+    got = _fetch(url="https://box.example/", net="ok", shell=True, shellHtml=SHELL_HTML, cached="/dashboard.css", html=html, putFail="/")
+    assert {e: b for _, es in got["shells"] for e, b in es} == {"/": SHELL_HTML, "/dashboard.css": "CACHED /dashboard.css"}, got
+
+
+@needs_node
+def test_an_offline_asset_is_served_only_when_the_cached_shell_names_that_exact_key() -> None:
+    named = _fetch(url="https://box.example/dashboard.css", mode="no-cors", destination="style", net="down", shell=True, shellHtml=SHELL_HTML,
+                   cached="/dashboard.css")
+    assert named["body"] == "CACHED /dashboard.css", named
+    unnamed = _fetch(url="https://box.example/old.js", mode="no-cors", destination="script", net="down", shell=True, shellHtml=SHELL_HTML,
+                     cached="/old.js")
+    assert unnamed.get("body") != "CACHED /old.js", unnamed

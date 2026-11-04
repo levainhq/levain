@@ -243,14 +243,22 @@ async function carryShellForward() {
   if (names.includes(SHELL_CACHE) && await (await caches.open(SHELL_CACHE)).match(SHELL_KEY)) return;
   for (const n of names.filter((x) => x.startsWith('levain-shell-v') && x !== SHELL_CACHE).sort().reverse()) {
     const from = await caches.open(n);
-    if (!await from.match(SHELL_KEY)) continue;
-    // the whole previous generation (the page and the assets it names), never just '/'
-    const to = await caches.open(SHELL_CACHE);
-    for (const k of await from.keys()) {
-      const u = new URL(k.url), key = u.pathname + u.search;
-      const hit = await from.match(key);
-      if (hit) await to.put(key, hit);
+    const page = await from.match(SHELL_KEY);
+    if (!page) continue;
+    // Only the old '/' and exactly the assets it names, each held to the same gate as a fresh write. An old generation
+    // that fails it (a missing or query-mismatched asset, an HTML body under a script key) carries NOTHING: the app falls
+    // to the network, honest, rather than a half shell. Everything else in the old cache is dropped with it.
+    if (!shellCacheable(page.clone())) return;
+    const html = await page.clone().text();
+    const staged = [];
+    for (const a of shellAssets(html)) {
+      const hit = await from.match(a.key);
+      if (!assetOk(hit, a.kind)) return;
+      staged.push([a.key, new Response(await hit.arrayBuffer(), { status: 200, headers: { 'content-type': hit.headers.get('content-type') } })]);
     }
+    const to = await caches.open(SHELL_CACHE);
+    for (const [k, r] of staged) await to.put(k, r);
+    await to.put(SHELL_KEY, page);
     return;
   }
 }
@@ -268,27 +276,46 @@ async function dropOldCaches() {
 async function precacheShell() {
   try {
     const r = await fetch(SHELL_KEY, { credentials: 'same-origin', cache: 'reload' });
-    if (!shellCacheable(r)) return;
+    if (!shellCacheable(r)) { drain(r); return; }
     await commitShell(r);
   } catch (_) { /* offline at install: the next successful navigation fills it */ }
 }
 // One coherent generation: '/' is committed only AFTER every CSS/JS its markup names has been fetched and validated, so a
 // cached '/' never points at an asset the cache lacks. Any failure commits nothing (the previous generation keeps serving;
 // a first install with a failing asset caches nothing and the app behaves as it did before the shell cache).
+function drain(r) { try { if (r && r.body) r.body.cancel().catch(() => {}); } catch (_) { /* nothing held */ } }
 async function commitShell(resp) {
   let html = '';
   try { html = await resp.clone().text(); } catch (_) { /* no markup: the shell alone */ }
-  const staged = await Promise.all(shellAssets(html).map(async (a) => {
-    const r = await fetch(a.key, { credentials: 'same-origin', cache: 'reload' });
-    if (!assetOk(r, a.kind)) return null;
-    // read the body now: an unread response holds its connection, and a shell of more assets than the browser's per-host
-    // limit would wait on itself
-    return [a.key, new Response(await r.arrayBuffer(), { status: 200, headers: { 'content-type': r.headers.get('content-type') } })];
+  const assets = shellAssets(html);
+  const staged = await Promise.all(assets.map(async (a) => {
+    try {
+      const r = await fetch(a.key, { credentials: 'same-origin', cache: 'reload' });
+      if (!assetOk(r, a.kind)) { drain(r); return null; }   // an unread body holds its connection
+      // read the body now: an unread response holds its connection, and a shell of more assets than the browser's per-host
+      // limit would wait on itself
+      return [a.key, new Response(await r.arrayBuffer(), { status: 200, headers: { 'content-type': r.headers.get('content-type') } })];
+    } catch (_) { return null; }
   }));
   if (staged.some((x) => !x)) return false;
   const cache = await caches.open(SHELL_CACHE);
-  for (const [k, r] of staged) await cache.put(k, r);
-  await cache.put(SHELL_KEY, resp);
+  // the live cache is written assets first, '/' last; a put that throws midway puts back what it overwrote (and removes
+  // what it added) so an old '/' is never left naming assets of another generation
+  const keys = [...staged.map(([k]) => k), SHELL_KEY];
+  const before = new Map();
+  for (const k of keys) { const h = await cache.match(k); before.set(k, h ? new Response(await h.arrayBuffer(), { status: 200, headers: { 'content-type': h.headers.get('content-type') || '' } }) : null); }
+  try {
+    for (const [k, r] of staged) await cache.put(k, r);
+    await cache.put(SHELL_KEY, resp);
+  } catch (err) {
+    for (const [k, old] of before) { try { if (old) await cache.put(k, old); else await cache.delete(k); } catch (_) { /* best effort */ } }
+    throw err;
+  }
+  // bound the cache: only '/' and the assets it names stay
+  try {
+    const keep = new Set(keys);
+    for (const k of await cache.keys()) { const u = new URL(k.url), key = u.pathname + u.search; if (!keep.has(key)) await cache.delete(key); }
+  } catch (_) { /* best effort */ }
   return true;
 }
 // Same-origin absolute URLs named by <script src> and <link rel=stylesheet href> in the shell html, as {key: path+query, kind}.
@@ -377,7 +404,9 @@ async function assetNetworkFirst(e, req, key, kind) {
     return r;
   } catch (err) {
     try {
-      const hit = await (await caches.open(SHELL_CACHE)).match(key);
+      const c = await caches.open(SHELL_CACHE);
+      const page = await c.match(SHELL_KEY);
+      const hit = page && shellAssets(await page.text()).some((a) => a.key === key) ? await c.match(key) : null;
       if (hit) return hit;
     } catch (_) { /* fall through */ }
     return Response.error();

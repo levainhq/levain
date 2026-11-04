@@ -50,6 +50,8 @@ const indexedDB = {
 
 // --- Cache Storage ---------------------------------------------------------------------------------------------------
 const cacheNames = new Set();
+const cacheCtypes = new Map();   // 'cache|key' -> content-type, when a test pins one
+let putFailKey = null;           // the next put to this key in a shell cache throws once
 const cacheStores = new Map();   // cache name -> Map(request key -> body text)
 const caches = {
   keys: async () => [...cacheNames],
@@ -59,9 +61,13 @@ const caches = {
     cacheNames.add(n);
     if (!cacheStores.has(n)) cacheStores.set(n, new Map());
     const m = cacheStores.get(n);
+    const guess = (k) => (k === '/' ? 'text/html' : /\.css(\?|$)/.test(k) ? 'text/css' : /\.js(\?|$)/.test(k) ? 'application/javascript' : '');
     return {
-      put: async (k, r) => { m.set(k, await r.text()); },
-      match: async (k) => (m.has(k) ? new Response(m.get(k)) : undefined),
+      put: async (k, r) => {
+        if (n.startsWith('levain-shell-v') && putFailKey === k) { putFailKey = null; throw new TypeError('quota'); }
+        cacheCtypes.set(n + '|' + k, r.headers.get('content-type') || guess(k)); m.set(k, await r.text());
+      },
+      match: async (k) => (m.has(k) ? new Response(m.get(k), { headers: { 'content-type': cacheCtypes.get(n + '|' + k) || guess(k) } }) : undefined),
       delete: async (k) => m.delete(k),
       keys: async () => [...m.keys()].map((k) => ({ url: 'https://box.example' + k })),
     };
@@ -259,7 +265,16 @@ function fire(type, ev) {
     // mode: ok | down | redirected | assets | badasset | softhtml, optionally ':prior' (an older generation exists; activation runs after)
     const [md, prior] = mode.split(':');
     const ctypeOf = (path) => (/\.css(\?|$)/.test(path) ? 'text/css' : 'application/javascript');
-    if (prior) {
+    if (prior === 'stale') {
+      // an older generation produced by the vulnerable worker: '/' names assets, one missing, one query-mismatched, one HTML under a script key, plus a stray
+      cacheStores.set('levain-shell-vOLD', new Map([['/', '<link rel="stylesheet" href="/dashboard.css"><script src="/b.js?v=2"></script><script src="/c.js"></script>'],
+        ['/dashboard.css', 'OLD CSS'], ['/b.js', 'OLD B NOQUERY'], ['/c.js', '<html>portal</html>'], ['/stray.js', 'STRAY']]));
+      cacheCtypes.set('levain-shell-vOLD|/c.js', 'text/html'); cacheNames.add('levain-shell-vOLD');
+    } else if (prior === 'good') {
+      cacheStores.set('levain-shell-vOLD', new Map([['/', '<link rel="stylesheet" href="/dashboard.css"><script src="/b.js?v=2"></script>'],
+        ['/dashboard.css', 'OLD CSS'], ['/b.js?v=2', 'OLD B'], ['/stray.js', 'STRAY']]));
+      cacheNames.add('levain-shell-vOLD');
+    } else if (prior) {
       cacheStores.set('levain-shell-vOLD', new Map([['/', '<html>old shell</html>'], ['/dashboard.css', 'OLD CSS'], ['/a.js', 'OLD A']]));
       cacheNames.add('levain-shell-vOLD');
     }
@@ -268,8 +283,9 @@ function fire(type, ev) {
       if (md === 'down') throw new TypeError('network down');
       const withAssets = ['assets', 'badasset', 'softhtml'].includes(md);
       if (withAssets && String(url) !== '/') {
-        if (md === 'badasset' && String(url) === '/dashboard.css') return new Response('nope', { status: 404, headers: { 'content-type': 'text/css' } });
-        if (md === 'softhtml' && String(url) === '/a.js') return new Response('<html>portal</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+        const spy = (r) => { Object.defineProperty(r, 'body', { value: { cancel: () => { log.cancelled = (log.cancelled || 0) + 1; return Promise.resolve(); } } }); return r; };
+        if (md === 'badasset' && String(url) === '/dashboard.css') return spy(new Response('nope', { status: 404, headers: { 'content-type': 'text/css' } }));
+        if (md === 'softhtml' && String(url) === '/a.js') return spy(new Response('<html>portal</html>', { status: 200, headers: { 'content-type': 'text/html' } }));
         return new Response('ASSET ' + url, { status: 200, headers: { 'content-type': ctypeOf(String(url)) } });
       }
       const html = withAssets
@@ -297,6 +313,8 @@ function fire(type, ev) {
     const m = JSON.parse(mode);
     const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
     if (m.shell) { cacheStores.set(shellName, new Map([['/', m.shellHtml || '<html>cached shell</html>']])); cacheNames.add(shellName); }
+    for (const k of m.stray || []) cacheStores.get(shellName).set(k, 'STRAY');
+    if (m.putFail) putFailKey = m.putFail;
     if (m.cached) { cacheStores.get(shellName).set(m.cached, 'CACHED ' + m.cached); }
     sandbox.fetch = async (req) => {
       log.fetchedNet = (log.fetchedNet || 0) + 1;
