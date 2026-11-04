@@ -129,3 +129,77 @@ def test_unknown_usage_exits_2():
     assert _run("--check", "4").returncode == 2
     assert _run("plan", "--shards", "2").returncode == 2
     assert _run("files").returncode == 2
+
+
+# ---- measured seconds -------------------------------------------------------------------------------------------
+
+
+def _w(measured, per_test=0.5):
+    return measured, per_test
+
+
+def test_a_slow_file_with_few_tests_gets_a_shard_to_itself(tmp_path):
+    (tmp_path / "many.py").write_text("def test_a(): pass\n" * 40)
+    (tmp_path / "many2.py").write_text("def test_a(): pass\n" * 40)
+    (tmp_path / "slow.py").write_text("def test_a(): pass\n")
+    weights = _w({"slow.py": 100.0, "many.py": 10.0, "many2.py": 10.0})
+    files = ["many.py", "many2.py", "slow.py"]
+    by_count, _ = shard.partition(files, 2, lambda f: shard.weight(f, tmp_path, ({}, 1.0)))
+    by_secs, loads = shard.partition(files, 2, lambda f: shard.weight(f, tmp_path, weights))
+    assert ["slow.py"] not in by_count          # the count proxy packs the slow file with others' worth of weight
+    assert ["slow.py"] in by_secs and sorted(loads) == [20.0, 100.0]
+
+
+def test_an_unmeasured_file_is_not_free_and_scales_with_its_test_count(tmp_path):
+    (tmp_path / "new.py").write_text("def test_a(): pass\nasync def test_b(): pass\n")
+    weights = _w({"old.py": 3.0}, per_test=0.5)
+    assert shard.weight("old.py", tmp_path, weights) == 3.0
+    assert shard.weight("new.py", tmp_path, weights) == 1.0     # 2 tests x 0.5 s
+    assert shard.weight("gone.py", tmp_path, weights) == 0.5    # not on disk: one test's worth
+    assert shard.weight("old.py", tmp_path, _w({"old.py": 0.0})) == shard.MIN_SECONDS
+
+
+def test_without_a_weights_file_the_weight_is_the_bare_test_count(tmp_path):
+    (tmp_path / "t.py").write_text("def test_a(): pass\ndef test_b(): pass\n")
+    assert shard.load_weights(tmp_path / "absent.json") == ({}, 1.0)
+    assert shard.weight("t.py", tmp_path, ({}, 1.0)) == 2
+
+
+@pytest.mark.parametrize("body", ["{", "{}", '{"files": [], "per_test": 1}', '{"files": {}, "per_test": 0}'])
+def test_a_malformed_weights_file_fails_loudly(tmp_path, body):
+    bad = tmp_path / "w.json"
+    bad.write_text(body)
+    with pytest.raises((ValueError, KeyError)):
+        shard.load_weights(bad)
+
+
+def test_the_committed_weights_load_and_name_repo_test_files():
+    files, per_test = shard.load_weights()
+    assert files and per_test > 0
+    assert all(k.startswith("tests/") and k.endswith(".py") and v >= 0 for k, v in files.items())
+
+
+def test_weighted_partition_is_deterministic_never_empty_and_covers_once():
+    names = [f"f{i}.py" for i in range(30)]
+    secs = {n: float((i * 7919) % 97 + 1) for i, n in enumerate(names)}
+    weigh = lambda f: secs[f]  # noqa: E731
+    first = shard.partition(names, 6, weigh)
+    assert first == shard.partition(list(reversed(names)), 6, weigh)
+    shard.check(first[0], names)
+    assert max(first[1]) - min(first[1]) <= max(secs.values())
+
+
+def test_measure_turns_progress_timestamps_into_per_file_seconds():
+    nodes = "tests/a.py::t1\ntests/a.py::t2\ntests/b.py::t1\ntests/b.py::t2\n"
+    # one shard, files a then b; the first chunk (a's two tests) took 2 s, the second (b's two) took 8 s
+    log = "2026-11-04T02:00:00.0Z collecting\n2026-11-04T02:00:02.0Z ..    [ 50%]\n2026-11-04T02:00:10.0Z ..    [100%]\n"
+    out = shard.measure(nodes, 1, [(log, 0)], run="9", sha="abc", root=Path("/nonexistent"))
+    assert out["files"] == {"tests/a.py": 2.0, "tests/b.py": 8.0}
+    assert out["measured_from"]["run"] == "9" and out["per_test"] == 2.5
+    with pytest.raises(AssertionError, match="log shows"):
+        shard.measure(nodes + "tests/c.py::t\n" * 50, 1, [(log, 0)], root=Path("/nonexistent"))
+
+
+def test_the_weights_command_rejects_a_bad_invocation():
+    assert _run("weights", "--nodes").returncode == 2
+    assert _run("weights", "--bogus", "x").returncode == 2
