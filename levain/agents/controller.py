@@ -1472,10 +1472,12 @@ def _default_input_check(store: AgentStore, occurrence_id: str) -> InputCheck | 
     """The ``on_input`` hook for an occurrence whose caller passed none: the dream's, for the dream; ``None`` (input
     present) for every other agent. A dream whose install facts are absent gets a hook that raises when run, which
     :func:`check_input` reads as dead input."""
-    with store.read() as conn:
-        row = conn.execute("SELECT a.name FROM agent_occurrences o JOIN agents a ON a.agent_id = o.agent_id"
-                           " WHERE o.occurrence_id = ?", (occurrence_id,)).fetchone()
-    if row is None or row[0] != DREAM:
+    name, _executor, why = _pinned_executor(store, occurrence_id)   # the SIGNED name, re-hashed, never the mutable row
+    if name is None:
+        def unknown_agent(row: Mapping) -> bool:
+            raise RuntimeError(f"the occurrence's agent cannot be read or verified from its spec: {why}")
+        return unknown_agent    # dead input: the row stays admitted, never launched unchecked
+    if name != DREAM:
         return None
     from levain.dream import agent as dream_agent
     return dream_agent.install_on_input(store.directory)
