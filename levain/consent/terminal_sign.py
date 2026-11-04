@@ -50,6 +50,8 @@ __all__ = ["AnswerClass", "Entry", "FAILED_REASONS", "KEY_LABEL", "MessageError"
 
 FORMAT = "levain-terminal-answer/1"
 NAMESPACE = "levain-terminal-answer"
+DESK_NAMESPACE = "levain-desk-answer"   # named in the signers line only; its format is L5a's
+SIGNERS_NAMESPACES = f"{NAMESPACE},{DESK_NAMESPACE}"
 KEY_LABEL = "levain-terminal"
 MAX_BYTES = 8 * 1024
 LINE_MAX = 2000                    # one typed line
@@ -360,7 +362,7 @@ class CreateReport:
 
 def signers_line(public_key: str, principal: str = "phill") -> str:
     """The line flow's ``scripts/needs_phill_signers`` takes for this key (DESIGN section 3, step 2)."""
-    return f'{principal} namespaces="{NAMESPACE}" {" ".join(public_key.split()[:2])}'
+    return f'{principal} namespaces="{SIGNERS_NAMESPACES}" {" ".join(public_key.split()[:2])}'
 
 
 def session_refusal() -> str:
