@@ -4,8 +4,8 @@
 arguments for one session occurrence, from the store and ONE install-fact source: ``<store dir>/session_install.json``
 (:func:`read_install`, :func:`write_install`). Nothing else supplies a launcher.
 
-* ``sup``: a ``Supervisor`` over the install's authority log (``cockpit_root``) and the agent ``RunJournal``, into which
-  the factory first admits the occurrence's run (``journal.start``, once; a replay is a no-op).
+* ``sup``: a ``Supervisor`` over the install's authority log (``cockpit_root``) and the agent ``RunJournal``; the occurrence's run
+  was admitted by the launch, so the factory admits nothing.
 * ``role``: the role the occurrence's signed spec pins (:func:`levain.agents.spec.occurrence_spec`), read from the
   store by hash. A refused spec or a pinned role that is not in the store raises (the run is not built;
   :func:`levain.agents.session.make_run` reads that as a run that did not start).
@@ -186,19 +186,13 @@ def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
         raise InstallRefused(f"occurrence {occurrence_id}: its signed spec is refused ({exc})") from exc
     role = _pinned_role(store, signed["role"]["role_hash"])
     with store.read() as conn:
-        row = conn.execute("SELECT agent_id, run_id, binding_id, state, launch_epoch, epoch FROM agent_occurrences"
+        row = conn.execute("SELECT agent_id FROM agent_occurrences"
                            " WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
     # memory is the SIGNED spec's: a stateless agent (the default) gets no retained episodes whatever the install names
     recall = None
     if signed["memory"] == "stateful" and install.episodic_path is not None:
         recall = _recall.recall_agent_episodes_at(install.episodic_path, row[0], now=datetime.now(timezone.utc))
-    journal = RunJournal(store.directory)
-    if row[3] == "launched" and row[4] == launch_epoch and row[5] == launch_epoch:
-        # the run's admission into the agent journal, before the effect: nothing else in the production fire path
-        # starts it (``sup.effect`` raises ``run ... was never started``). Only for the occurrence this fire holds
-        # (``run_session`` ends any other ``not_held`` before it settles anything); ``start`` is a no-op on a run
-        # already admitted, so a replay keeps its original admission.
-        journal.start(row[1], binding_id=row[2])
+    journal = RunJournal(store.directory)   # the run was admitted at the launch (controller._admit_run_in), not here
     sup = supervise.Supervisor(store, authority=AgentAuthority(install.cockpit_root), clock=clock, journal=journal)
     extra = {} if clock is None else {"clock": clock}   # a test seam: production passes none and both read real time
     return {**extra, "sup": sup, "role": role, "values": dict(install.values), "recall": recall, "launcher": launcher,

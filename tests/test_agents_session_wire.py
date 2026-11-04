@@ -33,16 +33,8 @@ def _factory(rig, monkeypatch):
     monkeypatch.setattr(ctl, "SESSION_FACTORY", lambda s, o, e: W.fire_factory(s, o, e, clock=rig.now))
 
 
-def _admit_run(rig, oid):
-    """The agent journal's admission of the run: nothing in the factory's closure does it (see RETURN observation 2),
-    the test stands in for the admitting path as ``test_agents_session_launch._sup`` does."""
-    from levain.autonomic.journal import RunJournal
-    from tests.test_agents_session_launch import BINDING
-    RunJournal(rig.store.directory).start(rig.row(oid)["run_id"], binding_id=BINDING)
-
-
 def _fire(rig, oid, monkeypatch):
-    _admit_run(rig, oid)
+    # no hand admission: the launch admitted the run
     from levain.consent import delivery
     monkeypatch.setattr(delivery, "process_identity", lambda pid: ("2026-11-04T00:00:00", f"levain agents _fire {oid}"))
     return ctl.fire(rig.store, oid, run=ctl.run_agent, clock=rig.now)

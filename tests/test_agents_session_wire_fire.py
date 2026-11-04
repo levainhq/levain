@@ -1,7 +1,6 @@
 """P7-1 S2b: a PRODUCTION fire of a session agent. No test sets ``controller.SESSION_FACTORY``: the default is
 ``session_wire.fire_factory`` (so no install ends `launcher-not-wired`, settled at zero, and a stub named in the install
-file ends `done`), and the factory itself admits the run into the agent journal before the effect (once; a replay
-keeps its admission)."""
+file ends `done`). The factory admits nothing: the run was admitted by the launch (1104-8)."""
 from __future__ import annotations
 
 import shutil
@@ -64,16 +63,9 @@ def test_a_production_fire_with_no_launcher_named_ends_launcher_not_wired_at_zer
 
 def test_a_production_fire_with_no_install_file_builds_no_run_and_stays_launched(rig, monkeypatch):
     oid = _session_occurrence(rig)
+    assert _journal_has(rig, oid)                      # admitted by the launch, before any factory
     assert _fire(rig, oid, monkeypatch) == 1
-    assert rig.row(oid)["state"] == "launched" and not _journal_has(rig, oid)
-
-
-def test_a_fire_that_is_not_this_epochs_admits_no_run(rig):
-    oid = _session_occurrence(rig)
-    _install(rig)
-    epoch = rig.row(oid)["launch_epoch"]
-    W.fire_factory(rig.store, oid, epoch + 1, clock=rig.now)
-    assert not _journal_has(rig, oid)
+    assert rig.row(oid)["state"] == "launched"
 
 
 # --- the production path ------------------------------------------------------------------------------------------
@@ -90,15 +82,13 @@ def test_a_production_fire_with_the_stub_named_ends_done(rig, monkeypatch):
     assert (code, row["state"], row["reason"]) == (0, "done", "completed") and len(stub.launches) == 1
 
 
-def test_the_factory_admits_the_run_once_and_a_second_build_keeps_the_admission(rig):
+def test_the_factory_admits_nothing_the_launch_admitted_the_run_once(rig):
     oid = _session_occurrence(rig)
     _install(rig)
     epoch = rig.row(oid)["launch_epoch"]
-    assert not _journal_has(rig, oid)
-    W.fire_factory(rig.store, oid, epoch, clock=rig.now)
     assert _journal_has(rig, oid)
-    W.fire_factory(rig.store, oid, epoch, clock=rig.now)   # a replay: start is a no-op on a known run
-    import sqlite3
+    for _ in range(2):                                 # two builds, one admission: the factory starts nothing
+        W.fire_factory(rig.store, oid, epoch, clock=rig.now)
     from levain.autonomic.journal import RunJournal
     with RunJournal(rig.store.directory)._read() as conn:
         n = conn.execute("SELECT COUNT(*) FROM runs WHERE run_id = ?", (rig.row(oid)["run_id"],)).fetchone()[0]
