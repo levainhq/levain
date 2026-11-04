@@ -189,31 +189,41 @@ def bound_usage_sources(*, queue_root: "Path | str", store: "Path | str", index_
     """:class:`levain.slot.dispatch_usage.DispatchUsageSources` bound to the real readers.
 
     * ``calls``: :func:`levain.qbroker.operator.run_state` over ``queue_root`` (``L/queue``).
-    * ``tunnel_bytes``: S10d's two-argument ``read_total(path, session)`` over every slot's tunnel log
-      ``<store>/gw/slot<n>/front.log``; a session id is unique, so the first slot whose log holds that session's final
-      total answers (the session's slot is not known to the server).
+    * ``tunnel_bytes``: the session's final total ROOT published at its END (CONTRACT §5.1, ``teardown``'s
+      ``tunnel_bytes``), stamped on the session's ended index record by the launcher. The server no longer walks
+      ``L/gw/`` (``_levain_gw<n>`` owns it, group root, no other access). None when the record is absent, not ``ended``
+      or carries no int: the settle then debits the reservation (a reaper-ENDed session lands here, over-debiting
+      and never under-debiting).
     * ``seconds`` [DEFINED HERE, S10d found no source]: whole seconds from the session's index record, ``started_s`` to
       ``ended_s`` rounded UP (both are this launcher's own clock and are written at the start and at the proven END);
       None when the record is absent, not ``ended`` or lacks either stamp."""
     from levain.qbroker import operator as _op
     from levain.slot import dispatch_usage as _du
-    from levain.slot.runtime_helper import FRONT_LOG_NAME
     index = SessionIndex(index_dir)
-    gw = Path(store) / "gw"
 
     def run_state(run_id: str) -> Any:
         return _op.run_state(queue_root, run_id)
 
-    def read_total(_dir: Any, session: str) -> Any:
+    def ended_record(session: str) -> Any:
         try:
-            slots = sorted(p for p in gw.iterdir() if p.name.startswith("slot"))
+            names = sorted(os.listdir(index.dir))
         except OSError:
             return None
-        for slot in slots:
-            got = _du._default_read_total(str(slot / FRONT_LOG_NAME), session)
-            if got is not None:
-                return got
+        for name in names:
+            if not name.endswith(".json") or name.startswith("."):
+                continue
+            try:
+                rec = index.get(name[:-5])
+            except Exception:  # noqa: BLE001
+                continue
+            if rec is not None and rec.get("session") == session:
+                return rec
         return None
+
+    def read_total(_dir: Any, session: str) -> Any:
+        rec = ended_record(session)
+        v = None if rec is None or rec.get("state") != "ended" else rec.get("tunnel_bytes")
+        return v if type(v) is int and 0 <= v <= 2**63 - 1 else None
 
     def seconds_of(session: str) -> Optional[int]:
         try:
@@ -235,7 +245,7 @@ def bound_usage_sources(*, queue_root: "Path | str", store: "Path | str", index_
             return int(-(-(b - a) // 1))
         return None
 
-    return _du.DispatchUsageSources(run_state=run_state, tunnel_log=lambda session: gw, seconds_of=seconds_of,
+    return _du.DispatchUsageSources(run_state=run_state, tunnel_log=lambda session: None, seconds_of=seconds_of,
                                     read_total=read_total)
 
 

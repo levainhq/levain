@@ -155,6 +155,7 @@ class HelperSlotRuntime:
         self._mu = threading.Lock()
         self._leases: "dict[str, Any]" = {}
         self._ended: "collections.OrderedDict[str, bool]" = collections.OrderedDict()
+        self._tunnel: "collections.OrderedDict[str, int]" = collections.OrderedDict()   # END's published tunnel_bytes
         self._drains: "dict[str, tuple[StreamDrain, StreamDrain]]" = {}
         self._end_locks: "dict[str, threading.Lock]" = {}
         self._closed = False
@@ -219,7 +220,24 @@ class HelperSlotRuntime:
         _log.warning("the runtime helper (pid %s) did not exit after SIGKILL", p.pid)
 
     def _teardown(self, session: str) -> "dict[str, object]":
-        return self._run("teardown", session)
+        ans = self._run("teardown", session)
+        # root's END publishes the session's final tunnel total (CONTRACT §5.1, ``tunnel_bytes``): kept only from a
+        # RETAINED answer, only an int in 0..2**63-1; the proof itself is ``end_by_teardown``'s and reads state /
+        # released / ok alone
+        if ans.get("state") == "RETAINED":
+            v = ans.get("tunnel_bytes")
+            if type(v) is int and 0 <= v <= 2**63 - 1:
+                with self._mu:
+                    self._tunnel[session] = v
+                    while len(self._tunnel) > _ENDED_KEEP:
+                        self._tunnel.popitem(last=False)
+        return ans
+
+    def final_tunnel_bytes(self, session: str) -> "int | None":
+        """The final tunnel total root's END published for ``session`` (None: not ended by this runtime, END did not
+        publish one, or it was dropped as malformed). The launcher stamps it on the session's ended record."""
+        with self._mu:
+            return self._tunnel.get(session)
 
     # -- the SlotRuntime ---------------------------------------------------------------------------------------------
 

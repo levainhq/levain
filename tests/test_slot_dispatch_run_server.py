@@ -406,20 +406,28 @@ def test_usage_by_an_unknown_key_is_the_caps(env):
 
 # --- the bound readers ------------------------------------------------------------------------------------------------------
 
-def test_the_bound_usage_readers_define_seconds_and_scan_every_slots_log(tmp_path, monkeypatch):
+def test_the_bound_usage_readers_read_the_published_bytes_and_define_seconds(tmp_path, monkeypatch):
+    """S10b C: ``tunnel_bytes`` is the figure root published at END (stamped on the ended record), never a walk of
+    ``L/gw/`` (a front log holding a different figure is not read at all)."""
     from levain.qbroker import operator as op
     from levain.slot.runtime_helper import FRONT_LOG_NAME
     store = tmp_path / "L"
     for n, session in ((0, "s-aaaaaaaaaaaaaaaa"), (1, "s-bbbbbbbbbbbbbbbb")):
         d = store / "gw" / f"slot{n}"
         d.mkdir(parents=True)
-        (d / FRONT_LOG_NAME).write_text(json.dumps({"event": "tunnel", "session": session, "passthrough_total": 100 + n}) + "\n")
+        (d / FRONT_LOG_NAME).write_text(json.dumps({"event": "tunnel", "session": session, "passthrough_total": 7}) + "\n")
     idx = L.SessionIndex(tmp_path / "idx")
-    idx.put("s-0000000000000001", "ended", session="s-bbbbbbbbbbbbbbbb", run_id="r-1", started_s=100.0, ended_s=161.2)
+    idx.put("s-0000000000000001", "ended", session="s-bbbbbbbbbbbbbbbb", run_id="r-1", started_s=100.0, ended_s=161.2,
+            tunnel_bytes=101)
+    idx.put("s-0000000000000003", "ended", session="s-aaaaaaaaaaaaaaaa", run_id="r-3", started_s=1.0, ended_s=2.0)
+    idx.put("s-0000000000000004", "ended", session="s-dddddddddddddddd", run_id="r-4", started_s=1.0, ended_s=2.0,
+            tunnel_bytes=True)
     idx.put("s-0000000000000002", "started", session="s-cccccccccccccccc", run_id="r-2", started_s=100.0)
     monkeypatch.setattr(op, "run_state", lambda root, run_id: {"known": True, "calls": 9} if root == store / "queue" else None)
     src = D.bound_usage_sources(queue_root=store / "queue", store=store, index_dir=tmp_path / "idx")
-    assert src.tunnel_bytes("s-bbbbbbbbbbbbbbbb") == 101 and src.tunnel_bytes("s-aaaaaaaaaaaaaaaa") == 100
+    assert src.tunnel_bytes("s-bbbbbbbbbbbbbbbb") == 101
+    assert src.tunnel_bytes("s-aaaaaaaaaaaaaaaa") is None          # ended, nothing published: the reservation settles
+    assert src.tunnel_bytes("s-dddddddddddddddd") is None          # a bool is no count
     assert src.tunnel_bytes("s-cccccccccccccccc") is None
     assert src.seconds("s-bbbbbbbbbbbbbbbb") == 62                 # 61.2 rounded UP
     assert src.seconds("s-cccccccccccccccc") is None and src.seconds("s-unknown0000000000") is None

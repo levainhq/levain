@@ -1332,12 +1332,33 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         raise Refused("end-cas-not-sent", str(e)[:256]) from None
     if out != R.RETAINED:
         return {"state": out}
+    # END's per-uid "no process left" proof returned: the front cannot append any more, so this is the one moment the
+    # session's final tunnel total is final. Read it before SCRUB can release the slot to another session.
+    tunnel = _final_tunnel_bytes(ctx, a)
     seams.at("scrub")
+    ans: Dict[str, object] = {"state": R.RETAINED}
     if scrub_and_release(ctx, a) is False:
         # The record is RETAINED either way; the slot stays leased to it (the pool TRY lost), and the reaper's pass
         # owns the next SCRUB.
-        return {"state": R.RETAINED, "released": False}
-    return {"state": R.RETAINED}
+        ans["released"] = False
+    if tunnel is not None:
+        ans["tunnel_bytes"] = tunnel
+    return ans
+
+
+def _final_tunnel_bytes(ctx: H.Ctx, a: R.Alloc) -> Optional[int]:
+    """``tunnel_bytes`` of ``teardown``'s answer (CONTRACT §5.1): the session's OWN last ``passthrough_total`` in its
+    slot's front log, read through the trusted walk (:func:`levain.slot.runtime_helper.read_session_tunnel_total`),
+    for an egress session only. None (the key is absent) when the slot has no front, the walk refuses, the log is
+    unreadable or holds no record of this session. Never raises: a reading that fails must not fail the END."""
+    try:
+        slot = a.slot
+        if slot.slot_class != "egress":
+            return None
+        front_uid = H.slot_ids(ctx, slot)[slot.accounts[1]]
+        return H.read_session_tunnel_total(ctx.store, slot, front_uid, a.session)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 __all__ = ["CheckFailed", "CheckStats", "EXEC_MARKER_S", "FORWARDER_READY_S", "FRONT_LOCK", "FRONT_LOCK_WAIT_S",

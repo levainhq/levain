@@ -749,11 +749,28 @@ class RealLauncher:
             if rec is None or rec["state"] not in ("pending", "minted", "started"):
                 return True
             fields = {k: v for k, v in rec.items() if k not in ("format", "key", "state")}
-            self.index.put(key, "ended", **{**fields, **known, "ended_s": self.clock()})
+            merged = {**fields, **known, "ended_s": self.clock()}
+            tunnel = self._final_tunnel_bytes(merged.get("session"))
+            if tunnel is not None:
+                merged["tunnel_bytes"] = tunnel
+            self.index.put(key, "ended", **merged)
             return True
         except Exception:  # noqa: BLE001
             _log.warning("the END of session %s could not be recorded", key)
             return False
+
+    def _final_tunnel_bytes(self, session: object) -> int | None:
+        """The final tunnel total root's END published for ``session``, when this launcher's runtime offers it
+        (``final_tunnel_bytes``; a runtime without it, or one that raises, gives None and the key is left off the
+        record, so usage settles at the reservation, the safe side)."""
+        reader = getattr(self.runtime, "final_tunnel_bytes", None)
+        if reader is None or type(session) is not str:
+            return None
+        try:
+            v = reader(session)
+        except Exception:  # noqa: BLE001
+            return None
+        return v if type(v) is int and 0 <= v <= 2**63 - 1 else None
 
     def _ended_on_record(self, key: str) -> bool:
         """Whether the durable record says a proven END (this launcher's or another's). Read through every time."""

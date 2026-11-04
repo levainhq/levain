@@ -657,6 +657,88 @@ def read_passthrough_total(log_path: object) -> Optional[int]:
         return None
 
 
+def _read_session_total_fd(fd: int, session: str) -> Optional[int]:
+    """The session's OWN final ``passthrough_total`` in an open tunnel log (``fd`` a regular file the caller judged).
+    The log (``L/gw/slot<n>/``) is per SLOT and append-only, so a reused slot holds several sessions' records and
+    :func:`read_passthrough_total` (the last tunnel line of ANY session) would hand back another session's total.
+    Same record format as that helper (last 1 MiB, first partial line dropped, ``event`` ``tunnel``, int
+    ``passthrough_total`` in 0..2**63-1), searched BACKWARD for the last record whose ``session`` equals ``session``.
+    The log is written by the front's lower uid: a tail of it is parsed with stdlib ``json`` (``RecursionError``
+    caught), nothing else. None when absent; never raises."""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        off = max(0, st.st_size - _PASSTHROUGH_TAIL_BYTES)
+        if off:
+            os.lseek(fd, off, os.SEEK_SET)
+        chunks: List[bytes] = []
+        left = _PASSTHROUGH_TAIL_BYTES + 1
+        while left > 0:
+            c = os.read(fd, min(left, 1 << 16))
+            if not c:
+                break
+            chunks.append(c)
+            left -= len(c)
+        lines = b"".join(chunks).split(b"\n")
+        if off:
+            lines = lines[1:]
+        for line in reversed(lines):
+            try:
+                rec = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(rec, dict) or rec.get("event") != "tunnel" or rec.get("session") != session:
+                continue
+            v = rec.get("passthrough_total")
+            if type(v) is int and 0 <= v <= _INT64_MAX:
+                return v
+    except Exception:
+        return None
+    return None
+
+
+def read_session_total(path: object, session: str) -> Optional[int]:
+    """:func:`_read_session_total_fd` over a path (``O_NOFOLLOW|O_NONBLOCK``: a symlink or a FIFO is None). The
+    dispatch usage reader (``levain.slot.dispatch_usage``) re-imports this one; root's END uses
+    :func:`read_session_tunnel_total`, the trusted walk."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)  # type: ignore[call-overload]
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        return _read_session_total_fd(fd, session)
+    finally:
+        os.close(fd)
+
+
+def read_session_tunnel_total(store: "Store", slot: SlotId, front_uid: int, session: str) -> Optional[int]:
+    """The session's final tunnel total for root's END (CONTRACT §5.1, ``teardown``'s ``tunnel_bytes``): the same
+    trusted walk :func:`prepare_front_log` makes (:func:`_open_front_log_dir`: ``L/gw/`` through ``trusted=True``,
+    ``L/gw/slot<n>/`` held to the front account's alone and opened ``O_NOFOLLOW|O_DIRECTORY`` only if it is the dir
+    judged), then ``front.log`` opened ``O_NOFOLLOW`` BELOW that fd and held to a regular file with one link owned by
+    the front account or root (what prepare left it). Any refusal of the walk, a link, a replaced or foreign file, an
+    unreadable log or no record of ``session``: None. Never raises."""
+    try:
+        dfd = _open_front_log_dir(store, slot, front_uid)
+        if dfd is None:
+            return None
+        try:
+            f = os.open(FRONT_LOG_NAME, _O_READ, dir_fd=dfd)
+            try:
+                st = os.fstat(f)
+                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 \
+                        or st.st_uid not in (store.seams.chowned_uid(front_uid), 0):
+                    return None
+                return _read_session_total_fd(f, session)
+            finally:
+                os.close(f)
+        finally:
+            os.close(dfd)
+    except Exception:
+        return None
+
+
 def front_session_routes(base: Mapping[str, object], routes: Sequence[str], *,
                          dispatch: bool = False) -> List[dict]:
     """The session's routes as the front reads them (§4.3 "the front's view"): each id's base-map entry, in the
@@ -3728,7 +3810,7 @@ __all__ = ["Answer", "BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ct
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",
            "session_lock_name", "session_owner_uid", "slot_owned_dir_ok", "spawn_front", "spawn_target", "status",
-           "front_policy_bytes", "front_session_routes", "read_passthrough_total", "gateway_front_args", "prepare_front_log",
+           "front_policy_bytes", "front_session_routes", "read_passthrough_total", "read_session_total", "read_session_tunnel_total", "gateway_front_args", "prepare_front_log",
            "account_in_range", "check_front_log_dirs",
            "refuse_ticketed_front", "stub_front_args", "wait_child", "write_front_policy"]
 
