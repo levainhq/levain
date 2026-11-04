@@ -346,3 +346,18 @@ def test_the_dashboard_never_asks_the_browser_whether_dictation_is_available(tmp
                                                  {"eval": "new Promise(r => setTimeout(() => r(window.__asked), 300))"}])
             asked[probe] = out["values"][1]
     assert asked == {"false": 0, "true": 1}, asked
+
+
+@needs_browser
+def test_the_expected_mode_report_is_not_drawn_as_an_error_and_any_other_mode_is(tmp_path, qdir):
+    """The session reports its permission mode on every turn as an error-kind row (claude_session ``mode:``); drawn as
+    "Error / dontAsk" at the top of every turn it would train the eye past a real error."""
+    from tests.test_room_phone import _STYLED
+    boot = 'window.__m = [LevainRoomView.lineModel({kind: "vendor_error", body: "dontAsk", gseq: 1}).hidden, ' \
+           'LevainRoomView.lineModel({kind: "vendor_error", body: "bypassPermissions", gseq: 2}).hidden, ' \
+           'LevainRoomView.lineModel({kind: "vendor_error", body: "the child exited", gseq: 3}).hidden];'
+    rs, _l, src = _rig(tmp_path, qdir)
+    assets = {"/rvc.html": ("text/html; charset=utf-8", _STYLED.encode()), "/rvc.js": ("text/javascript; charset=utf-8", boot.encode())}
+    with _serve(src, write_token=TOKEN, room_serve=rs, extra_assets=assets) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [{"until": "window.__m"}, {"eval": "JSON.stringify(window.__m)"}])
+    assert json.loads(out["values"][1]) == [True, False, False]
