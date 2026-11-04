@@ -27,6 +27,7 @@ import base64
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import re
 import selectors
@@ -496,6 +497,30 @@ def gateway_front_args(host: str, slot: SlotId, *, run: Path, store: Path, slot_
     return (*shape, "--policy", str(gw / FRONT_POLICY_NAME),
             "--log", str(store / "gw" / f"slot{slot.index}" / FRONT_LOG_NAME),
             "--keys", str(run / "keys" / "front.sock"), "--go-fd", str(GO_FD))
+
+
+def read_passthrough_total(log_path: object) -> Optional[int]:
+    """The front's cumulative passthrough byte total, read from its tunnel log: the ``passthrough_total`` of the LAST
+    line that is a JSON object with ``event`` ``tunnel`` and a non-negative int (not a bool) ``passthrough_total``.
+    Torn, non-JSON and other-event lines are skipped; a tunnel still open at the front's death has no line and
+    counts nowhere. ``None`` when the file is missing, unreadable or holds no such line. Never raises."""
+    try:
+        with open(log_path, "rb") as f:  # type: ignore[call-overload]
+            raw = f.read()
+    except (OSError, ValueError, TypeError):
+        return None
+    total: Optional[int] = None
+    for line in raw.splitlines():
+        try:
+            rec = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(rec, dict) or rec.get("event") != "tunnel":
+            continue
+        v = rec.get("passthrough_total")
+        if type(v) is int and v >= 0:
+            total = v
+    return total
 
 
 def front_session_routes(base: Mapping[str, object], routes: Sequence[str], *,
@@ -3546,7 +3571,7 @@ __all__ = ["BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ctx", "DirRo
            "parse_slot_state_of", "pick_slot", "prepare", "proc_identity", "read_view", "render",
            "render_layer_rows", "resume", "revert_lease", "run", "session_dir_rows", "session_lock",
            "session_lock_name", "session_owner_uid", "slot_owned_dir_ok", "spawn_front", "spawn_target", "status",
-           "front_policy_bytes", "front_session_routes", "gateway_front_args", "prepare_front_log",
+           "front_policy_bytes", "front_session_routes", "read_passthrough_total", "gateway_front_args", "prepare_front_log",
            "account_in_range", "check_front_log_dirs",
            "refuse_ticketed_front", "stub_front_args", "wait_child", "write_front_policy"]
 
