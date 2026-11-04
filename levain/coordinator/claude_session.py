@@ -38,6 +38,7 @@ import os
 import queue
 import re
 import secrets
+import signal
 import subprocess
 import threading
 import time
@@ -53,7 +54,7 @@ from levain.coordinator.driver import (APPROVAL_SUBTYPE, ApprovalAnswer, Capabil
                                        SendResult, SessionMeta, event)
 
 __all__ = [
-    "CONN_MAX", "ROOM_DENIED_TOOLS", "ROOM_MCP_SERVER", "ROOM_MCP_TOOL", "ROOM_TOOLS", "SEQ_MAX", "CanaryVerdict",
+    "CLOSE_BOUND", "CONN_MAX", "ROOM_DENIED_TOOLS", "ROOM_MCP_SERVER", "ROOM_MCP_TOOL", "ROOM_TOOLS", "SEQ_MAX", "CanaryVerdict",
     "ClaudeSession", "NotLive", "PipeTransport", "Probe", "Transport", "TransportClosed", "canary_denied",
     "default_deny_paths", "open_probe", "room_argv", "room_settings_json",
 ]
@@ -94,10 +95,44 @@ class Transport(Protocol):
     def close(self) -> None: ...
 
 
+_EOF_GRACE = 1.0        # an idle child's own exit after stdin EOF (node flushing the transcript, ending its MCP server)
+_BUSY_GRACE = 0.25      # a write in flight to a child that reads ends in well under this; one still going is hung
+_SIGNAL_WAIT = 3.0      # after each signal, for the child to exit
+_WRITER_DRAIN = 2.0     # after the child is gone, for a blocked write to fail with EPIPE (two halves, see close)
+CLOSE_BOUND = _BUSY_GRACE + _EOF_GRACE + 2 * _SIGNAL_WAIT + _WRITER_DRAIN + 1.0   # one close()'s waits, +1 s of slack
+_ATOMIC = 512           # POSIX _POSIX_PIPE_BUF: a blocking pipe write of at most this many bytes is all or nothing
+
+
+def _leads_own_group(proc: Any) -> bool:
+    """Whether ``proc`` (an unreaped child) leads a process group of its own, not this process's. Only then is its
+    group signalled; anything else (a stand-in with no pid, a child sharing our group) gets the plain signal."""
+    pid = getattr(proc, "pid", None)
+    if type(pid) is not int or not hasattr(os, "killpg") or getattr(proc, "returncode", None) is not None:
+        return False
+    try:
+        return os.getpgid(pid) == pid and pid != os.getpgrp()
+    except OSError:
+        return False
+
+
 class PipeTransport:
     """A :class:`Transport` over a ``Popen`` the caller spawned with ``stdin``/``stdout`` pipes in text mode. A reader
-    thread queues stdout lines; :meth:`close` ends stdin, then terminates, then kills the child. The caller owns the
-    spawn (argv, cwd, env).
+    thread queues stdout lines. The caller owns the spawn (argv, cwd, env) and SHOULD spawn with
+    ``start_new_session=True``: a child that leads its own process group is signalled as a GROUP, so a descendant
+    that inherited stdin (an MCP server, a tool) dies with it and cannot hold the pipe open under a blocked send.
+
+    :meth:`close` (bounded by :data:`CLOSE_BOUND`; a concurrent second call waits for the first, up to that bound):
+
+    * No write in flight (or one that ends within ``_BUSY_GRACE``): stdin is closed FIRST, and the child gets
+      ``_EOF_GRACE`` seconds to exit on that EOF by itself (a clean exit flushes its transcript). Only a child still
+      running after that is signalled. No write can start once close has begun, so closing stdin waits on nothing.
+    * A write still in flight (a child that stopped reading): the child (its group) is signalled first, terminate then
+      kill, each followed by a ``_SIGNAL_WAIT`` wait; the dead reader end fails the write with EPIPE. stdin is closed
+      only after that write has returned. If a write is still blocked after the child is gone, something still holds
+      the pipe's read end: the group is killed, and if the write is STILL blocked after ``_WRITER_DRAIN`` (a
+      descendant that left the group), stdin is ABANDONED, not closed: closing it would wait behind the write, or
+      close a descriptor a write is using. It closes when the blocked writer finally returns and the transport is
+      collected.
 
     stdout is read as BYTES when the text stream exposes ``.buffer`` and each line is decoded UTF-8 with
     ``errors="replace"``, so one bad byte costs that line's fidelity, never the rest of the output (L3 r2). When the
@@ -107,6 +142,10 @@ class PipeTransport:
         self._proc = proc
         self._q: queue.Queue[str | None] = queue.Queue()
         self._closed = False
+        self._wlock = threading.Condition()     # guards _closed and _writers; notified as each write ends
+        self._writers = 0
+        self._close_done = threading.Event()
+        self._group = _leads_own_group(proc)
         self.eof = False
         self.error: str | None = None
         threading.Thread(target=self._read, daemon=True, name="claude-session-reader").start()
@@ -127,17 +166,51 @@ class PipeTransport:
             self._q.put(None)
 
     def write(self, data: str) -> None:
-        """A dead reader end (``BrokenPipeError``) or a closed stdin (``ValueError``) is :class:`TransportClosed`: no
-        byte of the line can reach a child that is gone."""
-        if self._closed or self._proc.poll() is not None:
-            raise TransportClosed("the child has exited or the transport is closed")
+        """Write one line. :class:`TransportClosed` only when NO byte left: the transport is closed or the child has
+        exited, stdin is closed, or the FIRST chunk failed. That chunk is at most ``_ATOMIC`` bytes, and a blocking
+        pipe write that small is all or nothing, so its failure proves nothing was written (a larger write that hits
+        EPIPE part-way reports no count on macOS). Once it was written, any failure (a ``BrokenPipeError`` from a child
+        that died mid-line) propagates as itself: bytes left, so the send is ambiguous, never ``NotSent``.
+
+        stdin's descriptor is written directly (the text wrapper's buffers are never used), encoded with the stream's
+        encoding. A stand-in stream with no descriptor is written through ``write``/``flush``, every failure of which
+        is :class:`TransportClosed` (a stand-in only)."""
+        with self._wlock:
+            if self._closed or self._proc.poll() is not None:
+                raise TransportClosed("the child has exited or the transport is closed")
+            self._writers += 1
         try:
-            self._proc.stdin.write(data)
-            self._proc.stdin.flush()
-        except BrokenPipeError as exc:
-            raise TransportClosed("the child's stdin is gone (broken pipe)") from exc
-        except ValueError as exc:
-            raise TransportClosed(f"the child's stdin is closed ({exc})"[:200]) from exc
+            stdin = self._proc.stdin
+            try:
+                fd = stdin.fileno()
+            except ValueError as exc:
+                raise TransportClosed(f"the child's stdin is closed ({exc})"[:200]) from exc
+            except (AttributeError, OSError):
+                fd = None
+            if fd is None:
+                try:
+                    stdin.write(data)
+                    stdin.flush()
+                except BrokenPipeError as exc:
+                    raise TransportClosed("the child's stdin is gone (broken pipe)") from exc
+                except ValueError as exc:
+                    raise TransportClosed(f"the child's stdin is closed ({exc})"[:200]) from exc
+                return
+            raw = memoryview(data.encode(getattr(stdin, "encoding", None) or "utf-8"))
+            try:
+                sent = os.write(fd, raw[:_ATOMIC])
+            except OSError as exc:
+                raise TransportClosed(f"nothing written: the child's stdin failed ({type(exc).__name__})") from exc
+            while sent < len(raw):
+                try:
+                    sent += os.write(fd, raw[sent:])
+                except OSError as exc:
+                    raise type(exc)(exc.errno, f"the child's stdin failed after {sent} of {len(raw)} bytes were "
+                                               f"written ({exc.strerror})") from exc
+        finally:
+            with self._wlock:
+                self._writers -= 1
+                self._wlock.notify_all()
 
     def poll(self, wait: float) -> list[str]:
         out: list[str] = []
@@ -164,24 +237,74 @@ class PipeTransport:
         return self._proc.poll()
 
     def close(self) -> None:
-        if self._closed:
+        """End the child; the order is the class docstring's. Idempotent; a concurrent second call returns once the
+        first has finished (or :data:`CLOSE_BOUND` has passed)."""
+        with self._wlock:
+            if self._closed:
+                first = False
+            else:
+                first = self._closed = True     # from here no write starts
+                self._wlock.wait_for(lambda: self._writers == 0, _BUSY_GRACE)
+                busy = self._writers > 0
+        if not first:
+            self._close_done.wait(CLOSE_BOUND)
             return
-        self._closed = True
+        try:
+            stdin_open = True
+            if not busy:
+                self._close_stdin()             # EOF: an idle child's own clean exit
+                stdin_open = False
+                self._wait(_EOF_GRACE)
+            for sig, plain in ((signal.SIGTERM, self._proc.terminate), (signal.SIGKILL, self._proc.kill)):
+                if self._proc.poll() is not None:
+                    break
+                self._signal(sig, plain)
+                self._wait(_SIGNAL_WAIT)
+            if stdin_open:
+                with self._wlock:
+                    drained = self._wlock.wait_for(lambda: self._writers == 0, _WRITER_DRAIN / 2)
+                if not drained and self._group:
+                    # the leader is reaped, but a member still holding the read end keeps the group id in use, so it
+                    # names no other process; an empty group is ESRCH (pid reuse in that gap is a known edge)
+                    self._killpg(signal.SIGKILL)
+                    with self._wlock:
+                        drained = self._wlock.wait_for(lambda: self._writers == 0, _WRITER_DRAIN / 2)
+                if drained:
+                    self._close_stdin()
+                # else: abandoned, never closed under a blocked write (class docstring)
+        finally:
+            self._close_done.set()
+
+    def _close_stdin(self) -> None:
         try:
             self._proc.stdin.close()
         except (OSError, ValueError):
             pass
-        for stop in (lambda: self._proc.wait(3), self._proc.terminate, lambda: self._proc.wait(3), self._proc.kill):
-            if self._proc.poll() is not None:
-                return
-            try:
-                stop()
-            except Exception:  # noqa: BLE001 - a child that will not die is the caller's to find
-                pass
+
+    def _wait(self, timeout: float) -> None:
         try:
-            self._proc.wait(3)                  # reap the killed child, bounded
-        except (subprocess.TimeoutExpired, OSError):
+            self._proc.wait(timeout)
+        except Exception:  # noqa: BLE001 - TimeoutExpired, or a child that will not die: the next step handles it
             pass
+
+    def _signal(self, sig: int, plain: Callable[[], None]) -> None:
+        """Signal the child's group when it leads one (it is unreaped here, so its pid, and the group's id, are its
+        own), else the child alone."""
+        if self._group and self._killpg(sig):
+            return
+        try:
+            plain()
+        except Exception:  # noqa: BLE001 - a child that will not die is the caller's to find
+            pass
+
+    def _killpg(self, sig: int) -> bool:
+        try:
+            os.killpg(self._proc.pid, sig)
+        except ProcessLookupError:
+            return True                         # nothing left in the group
+        except OSError:
+            return False
+        return True
 
 
 def _str(value: Any) -> str:
@@ -275,6 +398,8 @@ class ClaudeSession:
         self._read_wait = read_wait
         self._interrupt_wait = interrupt_wait
         self._clock = clock
+        self._close_lock = threading.Lock()     # guards only the closed flag, so close() never waits behind a hung send
+        self._close_done = threading.Event()    # set once the first close() has finished; a second one waits on it
         self._io = threading.RLock()            # one writer or one pumper at a time: stream order is arrival order
         self._shown: list[Event] = []
         self._seq = 0
@@ -774,11 +899,20 @@ class ClaudeSession:
         return " ".join(unicodedata.normalize("NFC", text).split())
 
     def close(self) -> None:
-        with self._io:
-            if self.closed:
-                return
+        """Mark the session closed and stop the child. It never takes ``_io``: a send blocked writing to a child that no
+        longer reads holds that lock, and the transport's close is what ends that write (:class:`PipeTransport` holds
+        the order and its bound). The flag flips under its own short lock. Idempotent: a concurrent second call returns
+        only once the first call's transport close has finished, waiting at most :data:`CLOSE_BOUND` seconds."""
+        with self._close_lock:
+            first = not self.closed
             self.closed = True
-        self._t.close()
+        if not first:
+            self._close_done.wait(CLOSE_BOUND)
+            return
+        try:
+            self._t.close()
+        finally:
+            self._close_done.set()
 
     # --- accounting the launcher and tests read ----------------------------------------------------------------------
     def turn_lines(self, turn_id: str) -> int:
