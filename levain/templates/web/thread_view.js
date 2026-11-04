@@ -103,7 +103,8 @@
     if (/^[A-Za-z0-9._:-]{1,160}$/.test(m.id)) {
       // the head card (extend, replace or sign a successor) lives on the drop sheet, the one page the passkey signs on
       var card = el(doc, "a", "tv-card-link", "Head card: extend, replace or sign a successor");
-      card.setAttribute("href", "/sign/drop#thread=" + encodeURIComponent(m.id));
+      // the id unencoded: it already matched the sheet's own pattern above, and that pattern refuses "%" (an encoded ":" would be dropped)
+      card.setAttribute("href", "/sign/drop#thread=" + m.id);
       card.setAttribute("target", "_blank");
       card.setAttribute("rel", "noopener");
       host.appendChild(card);

@@ -52,7 +52,8 @@ def test_the_head_card_adds_no_text_field_so_there_is_no_name_to_classify() -> N
 
 def test_the_thread_view_links_the_card_by_a_safe_id_only() -> None:
     tv = (WEB / "thread_view.js").read_text()
-    assert '"/sign/drop#thread=" + encodeURIComponent(m.id)' in tv and "[A-Za-z0-9._:-]{1,160}" in tv
+    # unencoded (FINDINGS_h13b_r2 E1): the id matched the sheet's own pattern, which refuses "%", so th-a:b encoded is dropped
+    assert '"/sign/drop#thread=" + m.id' in tv and "encodeURIComponent(m.id)" not in tv and "[A-Za-z0-9._:-]{1,160}" in tv
     assert 'setAttribute("rel", "noopener")' in tv
 
 
@@ -146,6 +147,8 @@ class Stub:
         self.delay: dict[str, float] = {}
         self.against = against or _against("revoked", True, DIFF)
         self.origin = ""
+        self.signers = [FP]
+        self.body_text = "THE BODY THAT IS SIGNED"
 
     def reply(self, action: str, req: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         if not _keys_ok(action, req):
@@ -170,7 +173,7 @@ class Stub:
             self.cards = [REVOKED]
             return 200, {"withdrawn": {"draft_id": "dr-1", "revision": 1}, "cards": self.cards, **sid}
         if action == "draft-review":
-            return 200, {"review_id": "dv-" + "a" * 32, "body_text": "THE BODY THAT IS SIGNED", "rp_id": RP, "since_parent": [],
+            return 200, {"review_id": "dv-" + "a" * 32, "body_text": self.body_text, "rp_id": RP, "since_parent": [],
                          "against": self.against, "view": ["the head no longer authorises anything: every value below is a new grant"], **sid}
         if action == "draft-challenge":
             return 200, {"payload": {"digest": "sha256:" + "d" * 64}, "rp_id": RP, "challenge": _b64u(b"c" * 32), "line": "SIGNED LINE", **sid}
@@ -187,11 +190,29 @@ def _fail(status: int, error: str = "unavailable", **extra: Any) -> Step:
     return lambda _s: (status, {"error": error, "message": "the stub says no", **extra})
 
 
-def _signed_anyway(status: int) -> Step:
-    """A reply that FAILS although the write committed: the card then shows no draft."""
+def _signed_anyway(status: int, cards: list[dict[str, Any]] | None = None) -> Step:
+    """A reply that FAILS although the write committed: the card then shows ``cards`` (no draft by default)."""
     def go(s: Stub) -> tuple[int, dict[str, Any]]:
-        s.cards = []
+        s.cards = [] if cards is None else cards
         return status, {"error": "unavailable", "message": "the stub lost the reply"}
+    return go
+
+
+def _lost(cards: list[dict[str, Any]] | None = None) -> Step:
+    """No reply at all (status 0 on the page: the connection closes with nothing sent). With ``cards`` the write committed
+    first and the card now shows them; without, nothing was written."""
+    def go(s: Stub) -> tuple[int, dict[str, Any]]:
+        if cards is not None:
+            s.cards = cards
+        return 0, {}
+    return go
+
+
+def _slow(action: str, seconds: float) -> Step:
+    """The normal reply to ``action``, late."""
+    def go(s: Stub) -> tuple[int, dict[str, Any]]:
+        time.sleep(seconds)
+        return s.normal(action)
     return go
 
 
@@ -212,8 +233,8 @@ def _serve(stub: Stub):
             if path == "/__posts":
                 return self._send(200, json.dumps(stub.actions()).encode(), "application/json")
             if path == "/cockpit/coord/drops.json":
-                held = {FP: {"credential_id": _b64u(CRED)}}
-                return self._send(200, json.dumps({"origin": stub.origin, "rp_id": RP, "credentials": held, "coord_signers": [FP],
+                held = {fp: {"credential_id": _b64u(CRED if fp == FP else b"other-" + fp.encode()[-8:])} for fp in stub.signers}
+                return self._send(200, json.dumps({"origin": stub.origin, "rp_id": RP, "credentials": held, "coord_signers": stub.signers,
                                                    "coord_store_id": "st-1", "coord_store_read": True, "coord_drops": [], "coord_repos": []}).encode(),
                                   "application/json")
             name = FILES.get(path, path.lstrip("/"))
@@ -228,6 +249,9 @@ def _serve(stub: Stub):
             action = self.path.rsplit("/", 1)[-1]
             stub.posts.append((action, req))
             status, body = stub.reply(action, req)
+            if status == 0:              # a lost reply: the connection closes with nothing on it (HTTP/1.0, so no retry)
+                self.close_connection = True
+                return
             self._send(status, json.dumps(body).encode(), "application/json")
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
@@ -407,30 +431,67 @@ def test_a_head_thread_shows_one_sign_button_and_no_drop_form(tmp_path: Path) ->
 
 @needs_browser
 def test_unsure_stays_when_the_card_read_fails_too(tmp_path: Path) -> None:
-    """Reproduced on c22a0e3a: accept 503, then the card read failed, and the failure REPLACED the unsure line."""
+    """Reproduced on c22a0e3a: an accept with no known outcome, then the card read failed, and the failure REPLACED the unsure
+    line. (The outcome is unknown when no reply came back; a 503 is a definite "not signed", its own test below.)"""
     stub = Stub([ENVELOPE])
-    stub.script["draft-accept"] = [_fail(503)]
+    stub.script["draft-accept"] = [_lost()]
     stub.script["draft-cards"] = [None, _fail(503)]
     v = _run(tmp_path, stub, [*_review_then_sign(), _until("/could not be read/.test(" + READ + ")"),
                               _tag("unsure", UNSURE), _tag("read", READ), _tag("sign", "!!document.getElementById('head-sign')")])
     assert "Not sure this was signed" in v["unsure"] and "could not be read" in v["read"], v
-    assert v["sign"] == "false", v          # a spent review cannot be signed again from this page
+    assert v["sign"] == "false", v          # an unknown outcome is never signed again from this page
 
 
 @needs_browser
-def test_unsure_resolves_to_signed_when_the_card_no_longer_shows_the_draft(tmp_path: Path) -> None:
+def test_a_draft_simply_gone_after_a_lost_accept_is_not_called_signed(tmp_path: Path) -> None:
+    """FINDINGS_h13b_r2 S1, reproduced on 6022235c: the reply was lost and the card no longer showed the draft (it may have
+    been withdrawn on another device, or the head lapsed), and the page said 'Signed, as far as the card shows'."""
     stub = Stub([ENVELOPE])
-    stub.script["draft-accept"] = [_signed_anyway(503)]
-    v = _run(tmp_path, stub, [*_review_then_sign(), _until("/Signed/.test(" + UNSURE + ")"), _tag("unsure", UNSURE)])
-    assert "Not sure this was signed" in v["unsure"] and "Signed" in v["unsure"] and "Not signed" not in v["unsure"], v
+    stub.script["draft-accept"] = [_lost([REVOKED])]          # the card moved on; nothing on it names this signature's envelope
+    v = _run(tmp_path, stub, [*_review_then_sign(), _until("/no longer on the card/.test(" + UNSURE + ")"),
+                              _tag("unsure", UNSURE), _tag("signing", _text("head-signing"))])
+    assert "Not sure this was signed" in v["unsure"] and "may have been signed, or withdrawn" in v["unsure"], v
+    assert "Signed:" not in v["unsure"] and "as far as the card shows" not in v["unsure"], v
+    assert v["signing"].startswith("Not confirmed"), v
+
+
+@needs_browser
+def test_a_lost_accept_is_called_signed_only_when_the_card_names_this_envelope(tmp_path: Path) -> None:
+    eid = "ev-" + "3" * 32
+    stub = Stub([ENVELOPE])
+    stub.body_text = json.dumps({"envelope_id": eid, "format": "stub"})
+    after = dict(LAPSED, head={"envelope_id": eid, "kind": "lapsed", "thread_id": THREAD})
+    stub.script["draft-accept"] = [_lost([after])]
+    v = _run(tmp_path, stub, [*_review_then_sign(), _until("/Signed:/.test(" + UNSURE + ")"),
+                              _tag("unsure", UNSURE), _tag("signing", _text("head-signing")),
+                              _tag("detail", "document.querySelector('#head-card .head-detail').textContent")])
+    assert "Signed: the card shows this signature's envelope" in v["unsure"] and "Not signed" not in v["unsure"], v
+    assert v["signing"].startswith("Signed"), v
+    assert eid in v["detail"], v
 
 
 @needs_browser
 def test_unsure_resolves_to_not_signed_when_the_card_still_shows_the_draft(tmp_path: Path) -> None:
     stub = Stub([ENVELOPE])
-    stub.script["draft-accept"] = [_fail(503)]
+    stub.script["draft-accept"] = [_lost()]
     v = _run(tmp_path, stub, [*_review_then_sign(), _until("/Not signed/.test(" + UNSURE + ")"), _tag("unsure", UNSURE)])
     assert "Not sure this was signed" in v["unsure"] and "Not signed: the card still shows the draft" in v["unsure"], v
+
+
+@needs_browser
+def test_a_503_at_accept_is_not_signed_and_the_same_sign_button_signs_again(tmp_path: Path) -> None:
+    """FINDINGS_h13b_r2 S1: every 503 the cockpit answers is before the write (phone.py: '503 a fault on this machine (nothing
+    written)'), and the server keeps the review for a machine fault, so it is 'not signed', never 'not sure'."""
+    stub = Stub([ENVELOPE])
+    stub.script["draft-accept"] = [_fail(503, message="the coordinator store cannot answer now (OSError: disk): nothing was signed")]
+    v = _run(tmp_path, stub, [*_review_then_sign(), _until("/^Not signed/.test(" + NOTE + ")"),
+                              _tag("note", NOTE), _tag("unsure", UNSURE), _tag("sign", "!!document.getElementById('head-sign')"),
+                              _click("head-sign"), _until("/^Signed/.test(" + NOTE + ")"), _tag("note2", NOTE)])
+    assert "Not signed" in v["note"] and "tap Sign again" in v["note"] and v["unsure"] == "", v
+    assert v["sign"] == "true" and v["note2"].startswith("Signed"), v
+    acts = stub.actions()
+    assert acts.count("draft-challenge") == 2 and acts.count("draft-accept") == 2, acts
+    assert acts.count("draft-cards") == 1, acts          # the second accept's reply carried the cards; no read in between
 
 
 @needs_browser
@@ -541,3 +602,121 @@ def test_a_lapsed_card_offers_a_draft_of_an_extension_and_the_signed_note_hides_
     assert v["buttons"] == "head-extend=Draft an extension" and v["box"].startswith("Lapsed:"), v
     assert "ev-" not in v["note"], v
     assert dict(stub.posts)["draft-rule"]["rule"] == "renew"
+
+
+# ---- FINDINGS_h13b_r2 (L3 r1 on the glass diff), each from a reproduced failure on 6022235c ------------------------------
+
+FP2 = "SHA256:" + "B" * 43
+
+
+@needs_browser
+def test_a_review_the_server_refuses_with_422_shows_no_sign_button(tmp_path: Path) -> None:
+    """The G3 path: a head of a kind the sheet cannot describe is a 422 at review (draft_sign `_view_lines`), and the page
+    must offer nothing to sign."""
+    stub = Stub([ENVELOPE])
+    stub.script["draft-review"] = [_fail(422, "refused", message="the head is of a kind this sheet cannot describe (weird): nothing was signed")]
+    v = _run(tmp_path, stub, [_click("head-review"), _until("/refused/.test(" + NOTE + ")"), _tag("note", NOTE),
+                              _tag("sign", "!!document.getElementById('head-sign')"), _tag("diffs", "!!document.getElementById('head-diffs')")])
+    assert v["note"].startswith("Reviewing was refused: the head is of a kind this sheet cannot describe"), v
+    assert v["sign"] == "false" and v["diffs"] == "false", v
+    assert stub.actions() == ["draft-cards", "draft-review"], stub.actions()
+
+
+@needs_browser
+def test_with_two_passkeys_the_picker_stays_on_the_card_and_a_new_choice_retires_the_review(tmp_path: Path) -> None:
+    """S2, reproduced: `grid.remove()` took the #drop-key picker with it, so the operator could not choose the signer."""
+    stub = Stub([ENVELOPE])
+    stub.signers = [FP, FP2]
+    v = _run(tmp_path, stub, [
+        _tag("picker", "!!document.querySelector('#head-card #drop-key')"),
+        _click("head-review"), _until("!!document.getElementById('head-sign')"),
+        {"do": f"(() => {{ const s = document.getElementById('drop-key'); s.value = '{FP2}'; s.dispatchEvent(new Event('change')); }})()",
+         "until": "!document.getElementById('head-sign')", "ms": 5000},
+        _tag("note", NOTE), _tag("diffs", "!!document.getElementById('head-diffs')"),
+        _click("head-review"), _until("!!document.getElementById('head-sign')"),
+    ])
+    assert v["picker"] == "true", v
+    assert "signing key changed" in v["note"] and v["diffs"] == "false", v
+    reviews = [r["signer_fp"] for a, r in stub.posts if a == "draft-review"]
+    assert reviews == [FP, FP2], reviews
+    assert "draft-challenge" not in stub.actions()
+
+
+@needs_browser
+def test_another_store_on_withdraw_stops_the_sheet_instead_of_calling_the_card_stale(tmp_path: Path) -> None:
+    """S3, reproduced: a 409 other_store was read as a stale card ('changed since it was shown') and the card read again."""
+    stub = Stub([ENVELOPE])
+    stub.script["draft-withdraw"] = [_fail(409, "other_store", message="this was read from another Levain")]
+    v = _run(tmp_path, stub, [_click("head-withdraw"), _until("/different Levain store/.test(" + NOTE + ")"), _tag("note", NOTE)])
+    assert "changed since" not in v["note"], v
+    assert stub.actions() == ["draft-cards", "draft-withdraw"], stub.actions()
+
+
+@needs_browser
+def test_another_store_on_the_card_read_stops_the_sheet(tmp_path: Path) -> None:
+    stub = Stub([ENVELOPE])
+    stub.script["draft-cards"] = [_fail(409, "other_store", message="this was read from another Levain")]
+    httpd = _serve(stub)
+    try:
+        out = _drive(tmp_path, stub.origin + "/nope", [*_open(stub)[:3], _until("/different Levain store/.test(" + NOTE + ")"),
+                                                       _tag("note", NOTE), _tag("read", READ)])
+    finally:
+        httpd.shutdown()
+    v = _seen(out)
+    assert "different Levain store" in v["note"] and v["read"] == "", v
+
+
+@needs_browser
+def test_a_tap_while_a_write_asks_for_the_card_again_is_held_until_the_read_lands(tmp_path: Path) -> None:
+    """S4, reproduced: hbusy was released before the card read a write asked for, so a Review tapped meanwhile drew a Sign
+    button that the late redraw then wiped (a dead end). The tap is now held off until the read has landed."""
+    stub = Stub([ENVELOPE])
+    stub.script["draft-withdraw"] = [lambda s: (200, {"withdrawn": {"draft_id": "dr-1", "revision": 1}, "store_id": "st-1"})]
+    stub.script["draft-cards"] = [None, _slow("draft-cards", 1.5)]
+    v = _run(tmp_path, stub, [
+        _click("head-withdraw"), _until("/Reading the head card/.test(" + READ + ")"),
+        _click("head-review"),
+        _until(TWO_READS), _until("!/Reading/.test(" + READ + ")"),
+        _tag("sign", "!!document.getElementById('head-sign')"),
+    ])
+    assert "draft-review" not in stub.actions(), stub.actions()
+    assert v["sign"] == "false", v
+
+
+@needs_browser
+def test_a_lost_reply_to_a_rule_reads_the_card_and_offers_no_second_draft(tmp_path: Path) -> None:
+    """S5, reproduced: no reply (status 0) on draft-rule said 'was refused' and left 'Draft a replacement' live, so a retry
+    wrote another revision."""
+    stub = Stub([REVOKED])
+    stub.script["draft-rule"] = [_lost([ENVELOPE])]       # it committed; the reply was lost
+    v = _run(tmp_path, stub, [_click("head-replace"), _until("!!document.getElementById('head-review')"), _tag("note", NOTE),
+                              _tag("replace", "!!document.getElementById('head-replace')")])
+    assert "not known whether it was done" in v["note"] and "refused" not in v["note"], v
+    assert v["replace"] == "false", v
+    assert stub.actions() == ["draft-cards", "draft-rule", "draft-cards"], stub.actions()
+
+
+@needs_browser
+def test_a_lost_reply_to_a_withdraw_reads_the_card(tmp_path: Path) -> None:
+    stub = Stub([ENVELOPE])
+    stub.script["draft-withdraw"] = [_lost([REVOKED])]
+    v = _run(tmp_path, stub, [_click("head-withdraw"), _until("!!document.getElementById('head-replace')"), _tag("note", NOTE)])
+    assert "not known whether it was done" in v["note"], v
+    assert stub.actions() == ["draft-cards", "draft-withdraw", "draft-cards"], stub.actions()
+
+
+@needs_browser
+def test_the_signing_line_of_an_earlier_attempt_is_not_shown_beside_the_next(tmp_path: Path) -> None:
+    """E4, reproduced: after a cancelled passkey the next attempt's refusal showed 'Not signed: <the earlier line>'."""
+    stub = Stub([ENVELOPE])
+    stub.script["draft-challenge"] = [None, _fail(409, "draft_stale", message="the draft changed")]
+    v = _run(tmp_path, stub, [
+        _click("head-review"), _until("!!document.getElementById('head-sign')"),
+        {"eval": "window.__get = navigator.credentials.get.bind(navigator.credentials); "
+                 "navigator.credentials.get = () => Promise.reject(Object.assign(new Error('x'), {name: 'NotAllowedError'})); 1"},
+        _click("head-sign"), _until("/You cancelled/.test(" + NOTE + ")"), _tag("first", _text("head-signing")),
+        _click("head-sign"), _until("/the draft changed/.test(" + NOTE + ")"), _until(TWO_READS),
+        _tag("second", _text("head-signing")), _tag("hidden", "document.getElementById('head-signing').hidden"),
+    ])
+    assert v["first"] == "Not signed: SIGNED LINE", v
+    assert v["second"] == "" and v["hidden"] == "true", v

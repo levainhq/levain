@@ -1071,12 +1071,13 @@
     const known = signers.filter((fp) => Object.prototype.hasOwnProperty.call(localKeys, fp));
     const pool = known.length ? known : signers;
     let keyFp = pool[0];
+    let onKey = () => changed();     // a head thread puts its own here: the drop form is not on that page
     if (pool.length > 1) {
       ksel = el("select");
       ksel.id = "drop-key";
       ksel.setAttribute("aria-label", "the passkey to sign with");
       for (const fp of pool) { const o = el("option", "", fp.slice(0, 18) + "…"); o.value = fp; o.title = fp; ksel.appendChild(o); }
-      ksel.addEventListener("change", () => { keyFp = ksel.value; changed(); });
+      ksel.addEventListener("change", () => { keyFp = ksel.value; onKey(); });
       keyBox.append(el("span", "env-flabel", "Signing key"), ksel);
       keyBox.hidden = false;
     }
@@ -1157,6 +1158,8 @@
       const hsay = (text, bad) => put(hnote, text, bad);
       const hline = (label) => { if (hsignText) put(hsigning, label + ": " + hsignText); };
       const hmoved = () => { refuseOther(); hsay(MOVED, true); };
+      // a refusal because the store answering is not the one this sheet was opened for: the sheet stops, it is never a stale card
+      const hother = (r) => !!r && r.status === 409 && !!r.body && r.body.error === "other_store";
       const hstop = () => moved || (!storeId ? "this Levain has no coordinator store to read a head card from yet" : "");
       const hbtn = (label, id, fn, primary) => {
         const b = el("button", primary ? "dev-btn dev-primary" : "dev-btn", label);
@@ -1216,6 +1219,7 @@
         if (s) { put(hreadl, s, true); return Promise.resolve(null); }
         put(hreadl, "Reading the head card…");
         return post("draft-cards", { thread_id: headThread, store_id: storeId }).then((c) => {
+          if (hother(c)) { put(hreadl, ""); hmoved(); return null; }
           if (!c.ok) { put(hreadl, "The head card could not be read: " + why(c), true); return null; }
           if (otherStore(c.body.store_id)) { hmoved(); return null; }
           if (!Array.isArray(c.body.cards)) { put(hreadl, "The head card could not be read: the cockpit sent no list of cards.", true); return null; }
@@ -1238,14 +1242,23 @@
         const s = hstop();
         if (s) return hsay(s, true);
         hbusy = true;
+        const verb = VERB[action] || action;
+        // hbusy is held until the whole answer settles, the card read it may ask for included: a redraw that lands after
+        // it was released would wipe a control drawn in between
         return post(action, Object.assign({ store_id: storeId }, req)).then((r) => {
-          hbusy = false;
           if (r.ok && otherStore(r.body.store_id)) return hmoved();
           if (r.ok) return ok(r.body);
+          if (hother(r)) return hmoved();
           if (r.status === 409) return hstale(r);
-          return hsay((VERB[action] || action) + " was refused: " + why(r), true);
-        }, () => { hbusy = false; hsay((VERB[action] || action) + ": the cockpit did not answer.", true); })
-          .catch((e) => { hbusy = false; hsay((VERB[action] || action) + ": the page failed (" + ((e && e.name) || "error") + ").", true); });
+          // no whole reply: the write may have landed (another tap would write another revision), so the card is read
+          if (r.status === 0) {
+            hsay(verb + ": no answer came back (" + why(r) + "), so it is not known whether it was done; reading the card again.", true);
+            return hrefresh();
+          }
+          return hsay(verb + " was refused: " + why(r), true);
+        }, () => { hsay(verb + ": the cockpit did not answer.", true); })
+          .catch((e) => { hsay(verb + ": the page failed (" + ((e && e.name) || "error") + ").", true); })
+          .finally(() => { hbusy = false; });
       };
       const hrule = (card, rule) => {
         const head = card.head && typeof card.head.envelope_id === "string" ? card.head.envelope_id : "";
@@ -1295,7 +1308,18 @@
           hsay("Read the changes above, then sign this draft with your passkey. The challenge is made when you tap.");
         });
       };
-      const hend = () => { hbusy = false; };
+      // the envelope id the reviewed body names (the body is the envelope's canonical JSON); "" when it cannot be read
+      const bodyEnvelope = (text) => {
+        try { const b = JSON.parse(text); return b && typeof b.envelope_id === "string" ? b.envelope_id : ""; } catch (e) { return ""; }
+      };
+      // another signing key chosen after a review: that review was made for the old key, so it is retired here, not at the tap
+      onKey = () => {
+        if (!hreview) return;
+        hreview = null;
+        for (const n of document.querySelectorAll("#head-card [data-head-sign], #head-card .head-diffs")) n.remove();
+        hsay("The signing key changed; review the changes again to sign with it. Nothing was signed.", true);
+      };
+      if (ksel) sec.insertBefore(keyBox, cardsBox);     // the key picker lives on the card: the drop form leaves the page below
       const hsign = () => {
         const r = hreview;
         if (!r || hbusy) return;
@@ -1304,29 +1328,40 @@
         const s = hstop();
         if (s) return hsay(s, true);
         hbusy = true;
+        if (ksel) ksel.disabled = true;       // the key this signing uses is the one shown
         put(hunsure, "");
-        const stop1 = (m, again) => { hend(); hline("Not signed"); hsay(m, true); return again ? hrefresh() : undefined; };
-        // an accept whose outcome is not known: said in its own line, then settled by reading the card, in words either way
+        // a line the server gave for an earlier attempt is never shown beside this one
+        hsignText = "";
+        put(hsigning, "");
+        const stop1 = (m, again) => { hline("Not signed"); hsay(m, true); return again ? hrefresh() : undefined; };
+        // an accept whose outcome is not known: said in its own line, then settled by reading the card. Only what the card
+        // SHOWS is said: signed only when a card names this signature's envelope as the head; a draft that is simply gone
+        // may have been signed, withdrawn or replaced elsewhere, and the page says that, not a guess
         const unsure = (why1) => {
-          hend();
           hreview = null;
           hline("Not confirmed");
           const noSign = document.querySelector("#head-card [data-head-sign]");
           if (noSign) noSign.remove();
           const base = "Not sure this was signed (" + why1 + ").";
+          const eid = bodyEnvelope(r.body_text);
           put(hunsure, base + " Reading the card to see…", true);
           return hrefresh().then((cards) => {
             if (cards === null) { put(hunsure, base + " The card could not be read either, so it is not known: look at this thread before signing again.", true); return; }
-            const still = cards.some((c) => c && c.kind === "ENVELOPE" && c.detail && c.detail.draft_id === r.draft_id);
-            put(hunsure, base + " " + (still ? "Not signed: the card still shows the draft." : "Signed, as far as the card shows: the draft is no longer on it."), still);
-            hline(still ? "Not signed" : "Signed");
+            const signed = !!eid && cards.some((c) => c && c.head && c.head.envelope_id === eid);
+            const still = !signed && cards.some((c) => c && c.kind === "ENVELOPE" && c.detail && c.detail.draft_id === r.draft_id);
+            put(hunsure, base + " " + (signed ? "Signed: the card shows this signature's envelope as the thread's head."
+              : still ? "Not signed: the card still shows the draft."
+              : "The draft is no longer on the card: it may have been signed, or withdrawn or replaced elsewhere. Look at this thread before signing again."), !signed);
+            hline(signed ? "Signed" : still ? "Not signed" : "Not confirmed");
+            if (signed) hdetText.textContent = "Thread " + headThread + " · envelope " + eid;
           });
         };
         hsay("Confirm with your passkey to sign…");
         // the challenge is minted now, at the tap: a draft that went stale while this was read is refused before any byte
         return post("draft-challenge", { review_id: r.id }).then((ch) => {
+          if (hother(ch)) { hline("Not signed"); return hmoved(); }
           if (!ch.ok) return stop1("Not signed: " + why(ch) + "; nothing was signed.", ch.status === 409);
-          if (otherStore(ch.body.store_id)) { hend(); refuseOther(); return hsay("Not signed: the challenge came from a different Levain store than this sheet was opened for; nothing was signed. " + MOVED, true); }
+          if (otherStore(ch.body.store_id)) { refuseOther(); return hsay("Not signed: the challenge came from a different Levain store than this sheet was opened for; nothing was signed. " + MOVED, true); }
           if (!decodable(ch.body.challenge)) return stop1("The cockpit sent a malformed challenge; nothing was signed.");
           hsignText = typeof ch.body.line === "string" ? ch.body.line : "";
           hline("Signing");
@@ -1347,13 +1382,17 @@
             if (cred.rawId && mine(rp)[k.fp] !== b64u(cred.rawId)) remember(rp, k.fp, b64u(cred.rawId));
             return post("draft-accept", req).then((a) => {
               if (a.ok) {
-                hend();
                 hline("Signed");
                 const id = String((a.body.envelope && a.body.envelope.envelope_id) || "");
                 hsay(a.body.created === false ? "Already signed." : "Signed.");
                 if (id) hdetText.textContent = "Thread " + headThread + " · envelope " + id;
                 return hset(a.body);
               }
+              if (hother(a)) { hline("Not signed"); return hmoved(); }
+              // a 503 is a definite answer: every one the cockpit gives is before the write or a write that did not commit
+              // (the phone port's "503 a fault on this machine (nothing written)", the busy and closing gates), and the
+              // server keeps the review for a machine fault, so the same Sign button may be tapped again
+              if (a.status === 503) return stop1("Not signed: " + why(a) + ". The cockpit did not sign it; tap Sign again when it answers.", false);
               // any 4xx spends the review (and may mean the card moved): the card is read again and the Sign button goes with it
               if (a.status >= 400 && a.status < 500) return stop1("Not signed: " + why(a) + ".", true);
               return unsure(why(a));
@@ -1365,7 +1404,9 @@
               return stop1("The page failed (" + name + "); nothing was signed.");
             });
         }, () => stop1("The page failed (the cockpit did not answer); nothing was signed."))
-          .catch((e) => { hend(); hsay("The page failed (" + ((e && e.name) || "error") + "); look at the card before signing again.", true); });
+          .catch((e) => { hsay("The page failed (" + ((e && e.name) || "error") + "); look at the card before signing again.", true); })
+          // released only when the ceremony and any card read it asked for have settled (a late redraw never lands after it)
+          .finally(() => { hbusy = false; if (ksel) ksel.disabled = false; });
       };
       function hdrawCard(card) {
         const box = el("div", "head-card-box");
