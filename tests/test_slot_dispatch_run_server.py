@@ -46,14 +46,16 @@ class BlockingRuntime(FakeRuntime):
     def __init__(self):
         super().__init__()
         self.gate = threading.Event()
+        self.entered = 0
 
     def end(self, session):
+        self.entered += 1
         self.gate.wait(10)
         return super().end(session)
 
 
 class Env:
-    def __init__(self, rig, tmp_path, *, runtime=None, pool=True, peer=True, bar=None):
+    def __init__(self, rig, tmp_path, *, runtime=None, pool=True, peer=True, bar=None, **server_kw):
         self.rig = rig
         self.control, self.runtime = FakeControl(), runtime or FakeRuntime()
         self.launcher = L.RealLauncher(self.control, self.runtime, FakeSources(), L.SessionIndex(tmp_path / "idx"))
@@ -61,7 +63,7 @@ class Env:
         self.verified = 0
         self.pool, self.peer = pool, peer
         self.server = D.RunServer(self.launcher, verify=self._verify, pool_free=lambda: self.pool,
-                                  peer_ok=lambda s: self.peer, holder_idle_s=20)
+                                  peer_ok=lambda s: self.peer, holder_idle_s=20, **server_kw)
         self.threads: list[threading.Thread] = []
 
     def _verify(self, proof, exposure):
@@ -148,11 +150,13 @@ def test_a_proof_or_standing_that_does_not_hold_at_the_point_of_use_is_refused(r
     assert exc.value.name == name
 
 
-def test_the_check_is_one_named_function_called_once_before_the_spawn():
+def test_the_check_is_one_named_function_called_before_the_spawn_and_again_before_the_release():
     text = (Path(D.__file__)).read_text()
-    assert text.count("def verify_point_of_use(") == 1 and text.count("self._verify(") == 1
+    assert text.count("def verify_point_of_use(") == 1 and text.count("self._verify(") == 2
     launch = text[text.index('if op == "LAUNCH":'):]
     assert launch.index("self._verify(") < launch.index("self._pool()") < launch.index("self.launcher.spawn(")
+    release = text[text.index('if op == "RELEASE":'):]
+    assert release.index("self._verify(") < release.index("mine.child.release()")
 
 
 # --- over the wire ------------------------------------------------------------------------------------------------------------
@@ -161,7 +165,7 @@ def test_run_session_through_client_and_server_ends_one_occurrence_done(rig, env
     oid = _occurrence(rig, billing="subscription", exposure=EXP)
     _sup, report = _run(rig, oid, env.client(), exposure=EXP)
     assert (report.outcome, report.state, report.code) == ("exited", "done", 0), report
-    assert env.verified == 1 and len(env.control.minted) == 1
+    assert env.verified == 2 and len(env.control.minted) == 1      # judged at LAUNCH and again at RELEASE
     res = _reservation(rig, oid)
     assert res[0] == "settled" and res[2] == 7 and res[3] == 1000 and res[4] == 30     # USAGE keyed by the record
 
@@ -226,6 +230,94 @@ def test_end_is_async_and_idempotent_two_ends_one_teardown(rig, tmp_path):
     third = client.end_session(key, 5)
     assert third.terminated is True and client.end_session(key, 1).terminated is True
     assert runtime.ended == ["sess-1"]
+
+
+def test_a_link_that_dies_between_launch_and_release_is_refused_at_release_and_ended(rig, env):
+    """codex HIGH r1 :339: the authority is re-judged at the point the run actually starts, not only at the mint."""
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    child = env.client().spawn(S.SessionLaunch(oid, "s-00000000000000c1", "claude", "sonnet", "b", "passthrough", EXP))
+    env.bar_of = lambda agent: (True, 0)            # a revoke lands while the slot is prepared
+    with pytest.raises(RuntimeError, match="agent-barred"):
+        child.release()
+    assert env.verified == 2 and env.runtime.children[0].released is False and env.runtime.ended == ["sess-1"]
+    child.abort()                                    # start_run's abort after a refused release
+    child._conn.close()
+    env.drain()
+    assert env.runtime.children[0].released is False and env.runtime.ended == ["sess-1"]
+
+
+def test_holders_cannot_take_the_permits_usage_and_end_need(rig, tmp_path):
+    """codex MED r1 :266: holder connections are capped below the connection cap."""
+    env = Env(rig, tmp_path, max_connections=3, max_holders=2)
+    held = []
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)      # one occurrence, distinct session keys
+    for n in range(2):
+        held.append(env.client().spawn(S.SessionLaunch(oid, f"s-00000000000000e{n}", "claude", "sonnet", "b",
+                                                       "passthrough", EXP)))
+    with pytest.raises(L.LauncherRefused) as exc:
+        env.client().spawn(S.SessionLaunch(oid, "s-00000000000000e9", "claude", "sonnet", "b", "passthrough", EXP))
+    assert (exc.value.name, exc.value.reason_class) == ("no-holder-capacity", "transient")
+    sock = env.connect()
+    sock.sendall(C.encode_run_frame({"p": C.PROTOCOL, "op": "USAGE", "id": 1, "session_key": "s-00000000000000ff"}))
+    ans = C.read_run_frame(sock)
+    assert ans is not None and ans["ok"] is True
+    sock.close()
+    for child in held:
+        child._conn.close()
+    env.drain()
+
+
+def test_a_proven_end_is_never_evicted_and_never_rerun(rig, tmp_path, monkeypatch):
+    """codex MED r1 :397: a proven END answers every repeat, however many other keys were ENDed since."""
+    monkeypatch.setattr(D, "_JOBS_KEEP", 4)
+    env = Env(rig, tmp_path)
+    oid, key = _session_row(rig)
+    env.launcher.spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    monkeypatch.setattr(env.launcher, "_mark_ended", lambda k, **kw: False)   # the `ended` write fails: only the job knows
+    client = env.client()
+    assert client.end_session(key, 5).terminated is True
+    for n in range(6):
+        assert client.end_session(f"s-00000000000001{n:02x}", 1).terminated is False      # unrecorded keys, unproven
+    env.runtime.end_ok = False                       # a second teardown after SCRUB would not prove again
+    assert client.end_session(key, 5).terminated is True
+    assert env.runtime.ended == ["sess-1"]
+
+
+def test_shutdown_ends_every_live_session_and_refuses_new_launches(rig, env):
+    """complement MED r1: SIGTERM must not orphan a held session (daemon handler threads never run their finally)."""
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    child = env.client().spawn(S.SessionLaunch(oid, "s-00000000000000f1", "claude", "sonnet", "b", "passthrough", EXP))
+    child.release()
+    env.server.shutdown(5)
+    assert env.runtime.ended == ["sess-1"]
+    with pytest.raises(L.LauncherRefused) as exc:
+        env.client().spawn(S.SessionLaunch(oid,"s-00000000000000f2", "claude", "sonnet", "b", "passthrough", EXP))
+    assert (exc.value.name, exc.value.reason_class) == ("server-stopping", "transient")
+    child._conn.close()
+    env.drain()
+    assert env.runtime.ended == ["sess-1"]
+    text = Path(D.__file__).read_text()
+    body = text[text.index("def main("):]
+    assert body.index("server.shutdown(") < body.index("close()")
+
+
+def test_a_holder_eof_and_a_reaper_end_on_one_session_make_one_teardown(rig, tmp_path):
+    """complement MED r1: the holder's END and a short-connection END are one job, never two concurrent teardowns."""
+    runtime = BlockingRuntime()
+    env = Env(rig, tmp_path, runtime=runtime)
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    key = "s-00000000000000d1"
+    child = env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    child.release()
+    assert env.client().end_session(key, 0.05).terminated is False      # the reaper's END is in flight
+    child._conn.close()                                                  # and the fire dies at the same moment
+    for _ in range(50):
+        if runtime.entered >= 2:
+            break
+        threading.Event().wait(0.01)
+    runtime.gate.set()
+    env.drain()
+    assert runtime.ended == ["sess-1"] and runtime.entered == 1
 
 
 def test_usage_by_an_unknown_key_is_the_caps(env):

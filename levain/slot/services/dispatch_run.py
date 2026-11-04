@@ -5,21 +5,31 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
 * **Peer.** A connection whose kernel peer uid is not the operator's is closed unread and unanswered.
 * **LAUNCH** (a holder connection): decode, :func:`verify_point_of_use` (Q1, below), the pre-mint pool check (design port
   item 10: a transient ``no-free-slot`` when ``POOL`` shows no free egress slot, so the fire's next window retries; no
-  in-server retry), then ``RealLauncher.spawn`` unchanged. The answer is ``{session}``; no ticket, no run id.
+  in-server retry), then ``RealLauncher.spawn`` unchanged, under a holder permit (:data:`MAX_HOLDERS`, below the
+  connection cap so USAGE and END always find one; none free is a transient ``no-holder-capacity``). The answer is
+  ``{session}``; no ticket, no run id.
+* **RELEASE re-runs** :func:`verify_point_of_use` with the LAUNCH's proof and exposure: a link that expired, was revoked
+  or barred while the slot was prepared releases nothing, and the child is ABORTed and ENDed.
 * **The holder is the lifeline** (design 3.4): EOF before RELEASE is ABORT (nothing ran) then END, EOF after RELEASE is
-  END, each once; the server keeps no session whose holder is gone. RELEASE, WAIT, TERM, ABORT map onto the launched
-  child.
+  END, once; the server keeps no session whose holder is gone. The holder's END is the key's END job (below), so a
+  reaper's END on the same key joins it; every END attempt the child makes itself takes the same per-key lock. WAIT,
+  TERM, ABORT map onto the launched child. On SIGTERM/SIGINT (:meth:`RunServer.shutdown`) new LAUNCHes are refused and
+  every live session is ENDed within :data:`SHUTDOWN_BUDGET_S` before exit.
 * **USAGE / END** (short connections). USAGE is ``RealLauncher.usage`` by the recorded key. END is asynchronous and
   idempotent (T7): the first END for a key starts one ``RealLauncher.stop`` on a worker and answers within the
   caller's deadline with its result, else ``StopResult(False, "END in progress")``; a later END joins the same job, and a
-  proven result is never run twice. [Deviation from design section 2: a thread per connection, not one select loop,
-  because WAIT is a long poll and END runs on a worker either way; the server forks nothing (RH2 holds).]
+  proven result is kept for the process's life and never run twice. [Deviation from design section 2: a thread per
+  connection, not one select loop, because WAIT is a long poll and END runs on a worker either way; the server forks
+  nothing (RH2 holds).]
 
 **Q1, final (Phill 11-04, np-ed47d151, "8a").** The server verifies a valid enrolled signature over the agent's LINK
 that names the spec hash (his existing signature; no per-occurrence signature exists), and re-checks the link's expiry,
 revocation, the agent's bar and both signers' standing against ITS OWN replay of the authority ledger, plus the
-requested exposure inside the link's budgets, at the point of use: every fire. All of that is the one function
-:func:`verify_point_of_use`.
+requested exposure inside the link's budgets, at the point of use: every fire, at LAUNCH and again at RELEASE. All of
+that is the one function :func:`verify_point_of_use`. What it does NOT bind: the occurrence id (a process running as
+the operator may replay a valid proof for any occurrence of an already-signed spec; accepted by the ruling, bounded by
+what he signed) and the launch's brief, harness and model, which travel in the request (an open design question, the
+S10b fix-round RETURN).
 
 **Where the readers come from** (``main``): the operator's uid is the operator record's; the operator's home is that
 account's; the agent store is ``<home>/.levain/autonomic`` (the default every ``levain agents`` verb opens), and the
@@ -64,8 +74,17 @@ HOLDER_IDLE_S = 1800.0
 #: [judged] one WAIT is held at most this long whatever the client asked.
 WAIT_MAX_S = 30.0
 MAX_CONNECTIONS = 64
-#: finished END jobs remembered per key (a proven one answers a repeat END without a second teardown)
+#: [judged] holder connections are capped BELOW the connection cap, so USAGE and END always find a permit
+MAX_HOLDERS = 48
+#: [judged] how long a holder's own cleanup waits for its END job before its thread lets go (the job runs on)
+HOLDER_END_WAIT_S = 10.0
+#: [judged] on SIGTERM/SIGINT, the whole budget for ENDing every live session before exit (under launchd's 20 s)
+SHUTDOWN_BUDGET_S = 15.0
+#: past this many END jobs, the finished UNPROVEN ones are dropped (a retry re-runs them anyway); a PROVEN one is never
+#: dropped: it exists only for a key the index recorded, so they are bounded by the sessions this process served
 _JOBS_KEEP = 512
+#: END attempts on one key are serialized by one of these locks (by key hash; a fixed set, never one per key)
+_END_STRIPES = 64
 
 
 # --- Q1: the point-of-use check ---------------------------------------------------------------------------------------
@@ -221,22 +240,19 @@ def bound_usage_sources(*, queue_root: "Path | str", store: "Path | str", index_
 
 # --- the server ----------------------------------------------------------------------------------------------------------
 
-def _end_child(child: Any) -> None:
-    """One END attempt on a launched or held child, never raising."""
-    try:
-        (getattr(child, "end_once", None) or child.try_end)()
-    except Exception:  # noqa: BLE001
-        _log.warning("a holder's END raised")
-
-
 _log = logging.getLogger("levain.slot.services.dispatch_run")
 
 
 class _Holder:
-    """The launched child one holder connection owns, and whether its ABORT already ran."""
+    """The launched child one holder connection owns: its session key, the proof and exposure it was launched under
+    (re-judged before RELEASE), whether its ABORT already ran, and its END job once its cleanup started (``job``, set
+    once under ``lock``: the cleanup runs once whichever of EOF, a refused RELEASE or shutdown reaches it first)."""
 
-    def __init__(self, child: Any) -> None:
-        self.child, self.aborted = child, False
+    def __init__(self, key: str, child: Any, proof: C.LinkProof, exposure: Optional[ActionExposure]) -> None:
+        self.key, self.child, self.proof, self.exposure = key, child, proof, exposure
+        self.aborted = False
+        self.lock = threading.Lock()
+        self.job: Optional[_EndJob] = None
 
 
 class _EndJob:
@@ -252,12 +268,20 @@ class RunServer:
 
     def __init__(self, launcher: RealLauncher, *, verify: Callable[[C.LinkProof, Optional[ActionExposure]], None],
                  pool_free: Callable[[], bool], peer_ok: Callable[[socket.socket], bool],
-                 holder_idle_s: float = HOLDER_IDLE_S) -> None:
+                 holder_idle_s: float = HOLDER_IDLE_S, max_connections: int = MAX_CONNECTIONS,
+                 max_holders: int = MAX_HOLDERS) -> None:
+        if not 0 < max_holders < max_connections:
+            raise ValueError("holders must be capped below the connection cap (USAGE and END need a permit)")
         self.launcher, self._verify, self._pool_free, self._peer_ok = launcher, verify, pool_free, peer_ok
         self._idle = holder_idle_s
-        self._mu = threading.Lock()
+        self._mu = threading.Condition(threading.Lock())
         self._jobs: dict[str, _EndJob] = {}
-        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self._slots = threading.BoundedSemaphore(max_connections)
+        self._holder_slots = threading.BoundedSemaphore(max_holders)
+        self._stripes = tuple(threading.RLock() for _ in range(_END_STRIPES))
+        self._live: dict[str, _Holder] = {}
+        self._launching = 0
+        self._closing = False
 
     # -- connection ------------------------------------------------------------------------------------------------------
 
@@ -266,7 +290,7 @@ class RunServer:
         if not self._slots.acquire(blocking=False):
             sock.close()
             return
-        mine = None
+        mine: Optional[_Holder] = None
         try:
             try:
                 if not self._peer_ok(sock):
@@ -301,12 +325,7 @@ class RunServer:
                     return
         finally:
             if mine is not None:
-                try:
-                    if not mine.aborted and not getattr(mine.child, "released", False):
-                        mine.child.abort()
-                    _end_child(mine.child)
-                except Exception:  # noqa: BLE001
-                    _log.warning("a holder's cleanup raised")
+                self._finish(mine, HOLDER_END_WAIT_S)
             try:
                 sock.close()
             except OSError:
@@ -338,8 +357,12 @@ class RunServer:
             launch, proof = C.launch_from_wire(req)
             self._verify(proof, launch.exposure)
             self._pool()
-            child = self.launcher.spawn(launch)
-            return C.ok_answer(rid, session=child.session), _Holder(child)
+            holder = self._spawn(launch, proof)
+            try:
+                return C.ok_answer(rid, session=holder.child.session), holder
+            except BaseException:
+                self._finish(holder, 0.0)
+                raise
         if op == "USAGE":
             key = self._key(self._fields(req, "session_key")["session_key"])
             return C.ok_answer(rid, usage=C.usage_to_wire(self.launcher.usage(key))), mine
@@ -351,7 +374,17 @@ class RunServer:
             raise C.WireError(f"{op} before LAUNCH")
         if op == "RELEASE":
             self._fields(req)
-            mine.child.release()
+            # the point of use is here too: a link that expired, was revoked or barred while the slot was prepared
+            # starts nothing; the child is aborted and ENDed (codex r1 :339)
+            try:
+                self._verify(mine.proof, mine.exposure)
+            except LauncherRefused:
+                self._finish(mine, HOLDER_END_WAIT_S)
+                raise
+            with mine.lock:
+                if mine.job is not None:
+                    raise LauncherRefused("session-ended", "this session's END already started; nothing is released")
+                mine.child.release()
             return C.ok_answer(rid), mine
         if op == "TERM":
             self._fields(req)
@@ -385,23 +418,126 @@ class RunServer:
         if not free:
             raise LauncherRefused("no-free-slot", "no dispatch slot is free", reason_class="transient")
 
-    def _end(self, key: str, deadline_s: float) -> StopResult:
-        """T7: one in-flight teardown per key, on a worker; answer within ``deadline_s`` or say it is in progress. A
-        finished PROVEN job is the answer to a repeat END; a finished unproven one may be retried (never concurrently)."""
+    # -- holders -----------------------------------------------------------------------------------------------------
+
+    def _spawn(self, launch: Any, proof: C.LinkProof) -> _Holder:
+        """``RealLauncher.spawn`` under a holder permit (capped below the connection cap), registered as live so a
+        shutdown can END it; refused transient while the server is stopping."""
+        with self._mu:
+            if self._closing:
+                raise LauncherRefused("server-stopping", "the run server is stopping", reason_class="transient")
+            self._launching += 1
+        try:
+            if not self._holder_slots.acquire(blocking=False):
+                raise LauncherRefused("no-holder-capacity", "every holder slot is taken", reason_class="transient")
+            try:
+                child = self.launcher.spawn(launch)
+            except BaseException:
+                self._holder_slots.release()
+                raise
+            self._serialize_ends(launch.session_key, child)
+            holder = _Holder(launch.session_key, child, proof, launch.exposure)
+            with self._mu:
+                self._live[holder.key] = holder
+                closing = self._closing
+            if closing:                 # a shutdown began during the spawn: it waits on this, so END it now
+                self._finish(holder, 0.0)
+                raise LauncherRefused("server-stopping", "the run server is stopping", reason_class="transient")
+            return holder
+        finally:
+            with self._mu:
+                self._launching -= 1
+                self._mu.notify_all()
+
+    def _finish(self, h: _Holder, wait_s: float) -> None:
+        """The holder's cleanup, once (whichever of EOF, a refused RELEASE or shutdown comes first): ABORT if it was
+        never released, then END through the key's ONE END job (:meth:`_start_end`), so a reaper's END for the same
+        key joins it instead of racing it; wait up to ``wait_s`` for the job. Never raises."""
+        try:
+            with h.lock:
+                if h.job is None:
+                    try:
+                        if not h.aborted and not getattr(h.child, "released", False):
+                            h.child.abort()
+                            h.aborted = True
+                    except Exception:  # noqa: BLE001 - the END below is the proof
+                        _log.warning("a holder's ABORT raised")
+                    h.job = self._start_end(h.key)
+                    with self._mu:
+                        if self._live.get(h.key) is h:
+                            del self._live[h.key]
+                    self._holder_slots.release()
+                job = h.job
+            job.done.wait(max(0.0, wait_s))
+        except Exception:  # noqa: BLE001
+            _log.warning("a holder's cleanup raised")
+
+    def _stripe(self, key: str) -> "threading.RLock":
+        return self._stripes[int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16) % len(self._stripes)]
+
+    def _serialize_ends(self, key: str, child: Any) -> None:
+        """Every END attempt the launched child makes itself (WAIT's settle, ABORT, a poll: all go through its
+        ``_EndProof.attempt``, the one the launcher's ``_Launched`` and ``HeldChild`` share) takes the same key lock
+        the END job holds, so two teardowns of one session never run at once; the later one reads the ``ended``
+        record the first wrote."""
+        proof = getattr(child, "proof", None)
+        attempt = getattr(proof, "attempt", None)
+        if attempt is None:
+            return
+        lock = self._stripe(key)
+
+        def locked(*a: Any, **kw: Any) -> Any:
+            with lock:
+                return attempt(*a, **kw)
+        proof.attempt = locked
+
+    def shutdown(self, budget_s: float = SHUTDOWN_BUDGET_S) -> None:
+        """On SIGTERM/SIGINT, before exit (handler threads are daemons: their own cleanup never runs at exit): refuse
+        new LAUNCHes, let in-flight spawns land, then ABORT/END every live session and wait for every running END job,
+        all within ``budget_s``. Never raises."""
+        end_at = time.monotonic() + max(0.0, budget_s)
+        try:
+            with self._mu:
+                self._closing = True
+                while self._launching and time.monotonic() < end_at:
+                    self._mu.wait(max(0.0, end_at - time.monotonic()))
+                holders = list(self._live.values())
+            for h in holders:
+                self._finish(h, 0.0)
+            with self._mu:
+                jobs = [j for j in self._jobs.values() if not j.done.is_set()]
+            for j in jobs:
+                j.done.wait(max(0.0, end_at - time.monotonic()))
+        except Exception:  # noqa: BLE001
+            _log.warning("the shutdown END pass raised")
+
+    # -- END -----------------------------------------------------------------------------------------------------------
+
+    def _start_end(self, key: str) -> _EndJob:
+        """T7: the key's one END job, started if there is none or the last one finished UNPROVEN (a retry, never
+        concurrent with another). A PROVEN job is kept for good and answers every repeat; past :data:`_JOBS_KEEP` jobs
+        only finished unproven ones are dropped."""
         with self._mu:
             job = self._jobs.get(key)
             if job is None or (job.done.is_set() and job.result.terminated is not True):
                 job = self._jobs[key] = _EndJob()
                 threading.Thread(target=self._run_end, args=(key, job), daemon=True).start()
             if len(self._jobs) > _JOBS_KEEP:
-                for k in [k for k, j in self._jobs.items() if j.done.is_set() and k != key][:_JOBS_KEEP // 4]:
+                for k in [k for k, j in self._jobs.items()
+                          if k != key and j.done.is_set() and j.result.terminated is not True]:
                     del self._jobs[k]
+        return job
+
+    def _end(self, key: str, deadline_s: float) -> StopResult:
+        """Answer within ``deadline_s`` with the key's END job's result, else that it is in progress."""
+        job = self._start_end(key)
         job.done.wait(max(0.0, deadline_s))
         return job.result
 
     def _run_end(self, key: str, job: _EndJob) -> None:
         try:
-            got = self.launcher.stop(key, 0.0)
+            with self._stripe(key):
+                got = self.launcher.stop(key, 0.0)
         except Exception:  # noqa: BLE001
             got = StopResult(False, "END could not complete; nothing assumed ended")
         job.result = got
@@ -488,6 +624,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         serve(server, listener, stop)
     finally:
+        server.shutdown(SHUTDOWN_BUDGET_S)       # END every live session first: daemon handlers never clean up at exit
         listener.close()
         close = getattr(server.launcher.runtime, "close", None)
         if close is not None:
