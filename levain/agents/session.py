@@ -29,8 +29,11 @@ Not covered: the per-call fence and session supervision (P7-2) and the real laun
 row of its own agent whose pinned role is a session role, whose fire is PROVEN dead (the fire's identity record read
 against the process table; an alive, unreadable or missing one proves nothing), and only through the launcher's
 ``end_session(session_key, deadline_s)`` (:class:`SessionEnder`), whose answer must be exactly ``StopResult(True, ...)``.
-Any other answer is "cannot stop": the supervisor raises one attention row, leaves the row ``launched`` and no longer
-renews its lease, so a dead session's lease lapses to takeover instead of being renewed for ever. The launcher's
+Any other answer is "cannot stop": the supervisor raises one attention row and leaves the row ``launched``. Only a
+row whose fire that stop PROVED dead and whose ``end_session`` then failed to confirm is left unrenewed, so its lease
+lapses to takeover instead of being renewed for ever; a live or unreadable fire, a row no executor was asked for, and
+every refusal before the proof keep their lease, as before S3. Nothing about the ask is remembered between passes:
+each pass re-reads the fire record (r1 F2). The launcher's
 ``end_session`` is the S1 END keyed on the session key; no launcher in this tree has one, and the real stop of a live
 uid group is VM-only. No production caller wires a reaper to session rows yet
 (``git grep -n -e "Supervisor(" -e "sup.reap(" -- levain/agents levain/dream``).
@@ -562,7 +565,13 @@ class RowSessionExecutor:
     when ALL of these hold: the row is still ``launched`` with the occurrence id, agent id and session key this
     executor was built for; its pinned role is a session role; the fire's identity record proves the fire dead; and
     the launcher's ``end_session`` for the STORE's session key answers exactly ``StopResult(True, ...)``. Anything
-    else is ``terminated=False`` with the reason, and nothing is signalled by this class itself."""
+    else is ``terminated=False`` with the reason, and nothing is signalled by this class itself.
+
+    Two answers for the supervisor's lease (r1 F1/F2), both derived on each call from the store, the fire's identity
+    record and the process table, never remembered: :meth:`fire_proven_dead` (every refusal before the end passes and
+    the fire is proven dead: the supervisor withholds the row's renewal until its stop answers), and, after
+    :meth:`stop`, ``end_unproven``, True only when that stop PROVED the fire dead and ``end_session`` then failed to
+    confirm (the one row whose lease is left to lapse)."""
 
     def __init__(self, store: AgentStore, row: Mapping[str, Any], launcher: Any, *,
                  fire_state: Callable[[Mapping[str, Any], float], str] | None = None) -> None:
@@ -572,6 +581,7 @@ class RowSessionExecutor:
         self._fire_state = fire_state or _fire_state
         self.max_exposure_usd_micros = 0
         self.action_exposure = None
+        self.end_unproven = False
 
     def usage(self) -> Usage:
         try:
@@ -581,10 +591,20 @@ class RowSessionExecutor:
             return Usage(None, None, None, "session:unreadable")
 
     def stop(self, deadline_s: float) -> StopResult:
+        self.end_unproven = False
         try:
             return self._stop(float(deadline_s))
         except Exception as exc:  # noqa: BLE001 - stop() never raises; one that fails confirmed nothing
             return StopResult(False, f"stop could not complete ({type(exc).__name__}); nothing assumed ended")
+
+    def fire_proven_dead(self, deadline_s: float) -> bool:
+        """True only when every check :meth:`stop` makes before ``end_session`` passes: the row is this executor's and a
+        session role's, the launcher has ``end_session``, and the fire's identity record proves the fire dead. Asks
+        no end, sends no signal, never raises (a failure is False)."""
+        try:
+            return self._dead_fire(float(deadline_s))[0] is None
+        except Exception:  # noqa: BLE001 - a check that fails proved nothing
+            return False
 
     def _row_refusal(self) -> str | None:
         with self.store.read() as conn:
@@ -601,26 +621,35 @@ class RowSessionExecutor:
             return "the row's pinned role is not a session role"
         return None
 
-    def _stop(self, deadline_s: float) -> StopResult:
+    def _dead_fire(self, deadline_s: float) -> tuple[str | None, Callable[[str, float], Any] | None]:
+        """``(None, end_session)`` when the fire is proven dead and the end may be asked, else ``(why, None)``."""
         why = self._row_refusal()
         if why is not None:
-            return StopResult(False, why)
+            return why, None
         end = getattr(self.launcher, "end_session", None)
         if not callable(end):
-            return StopResult(False, "the launcher has no end_session: nothing can end the session")
+            return "the launcher has no end_session: nothing can end the session", None
         try:
             rec = json.loads(_ctl.fire_record_path(self.store.directory, self.occurrence_id).read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return StopResult(False, "the fire's identity record cannot be read: its death is not proven")
+            return "the fire's identity record cannot be read: its death is not proven", None
         if not (isinstance(rec, dict) and type(rec.get("pid")) is int and rec["pid"] > 0
                 and isinstance(rec.get("started"), str) and isinstance(rec.get("args"), str)
                 and rec.get("occurrence_id") == self.occurrence_id):
-            return StopResult(False, "the fire's identity record is malformed or another occurrence's")
+            return "the fire's identity record is malformed or another occurrence's", None
         state = self._fire_state(rec, deadline_s)
         if state != "ended":
-            return StopResult(False, f"the fire is not proven dead ({state}): the session is not ended from here")
+            return f"the fire is not proven dead ({state}): the session is not ended from here", None
+        return None, end
+
+    def _stop(self, deadline_s: float) -> StopResult:
+        why, end = self._dead_fire(deadline_s)
+        if why is not None:
+            return StopResult(False, why)
+        self.end_unproven = True        # the fire is proven dead; only a proven end below clears it (a raise keeps it)
         got = end(self.session_key, max(0.0, deadline_s))
         if type(got) is StopResult and got.terminated is True:
+            self.end_unproven = False
             return StopResult(True, f"the fire is dead; the session ended: {got.detail}")
         return StopResult(False, "the session end was not proven"
                           + (f": {got.detail}" if type(got) is StopResult else " (the answer was not a StopResult)"))

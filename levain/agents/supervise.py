@@ -26,11 +26,12 @@ What the fire side owns:
   (:func:`levain.agents.gauges.win_verifier`).
 
 The tick side is :meth:`Supervisor.reap` (P6-4b), the second writer of this module, called from
-:func:`levain.agents.controller.tick`: lease renewal first, the ``stop_at`` pass from ``autonomic.db`` and the clock
-alone, then the shared cover refresh and the STALE classification, then ``stop(STOP_DEADLINE_S)`` serially, each end
-through the guarded settle and only on ``StopResult(terminated=True)``. A stop's outcome is read only as that exact
-``StopResult`` (the executor applies :func:`levain.agents.controller.gate_proves_termination` to its own child; the
-result carries no returncode for the reaper to judge). Not covered: a row with neither ``session_key`` nor ``pid`` is
+:func:`levain.agents.controller.tick`: lease renewal first (a dead-fire session row's waits for its own stop, P7-1
+S3), the ``stop_at`` pass from ``autonomic.db`` and the clock alone, then the shared cover refresh and the STALE
+classification, then ``stop(STOP_DEADLINE_S)`` serially, each end through the guarded settle and only on
+``StopResult(terminated=True)``. A stop's outcome is read only as that exact ``StopResult`` (the executor applies
+:func:`levain.agents.controller.gate_proves_termination` to its own child; the result carries no returncode for the
+reaper to judge). Not covered: a row with neither ``session_key`` nor ``pid`` is
 asked nothing (lapse recovery's), and a dead supervisor is lapse recovery's too.
 """
 from __future__ import annotations
@@ -74,7 +75,8 @@ class Reaped:
     ``unconfirmed`` those left ``launched`` after an unconfirmed stop (or with no executor to ask), ``settle_errors`` a
     settle that raised, or wrote nothing while the row stayed ``launched`` (``not_settled``), after a confirmed stop
     (the next pass asks again), ``deferred`` the rows to stop that were not asked because the pass was past
-    :data:`STOP_BUDGET_S` (the next pass asks them first)."""
+    :data:`STOP_BUDGET_S` (the next pass asks them first), ``frozen`` the session rows whose stop this pass proved the
+    fire dead and whose end then failed to confirm: their lease was not renewed, so it lapses to takeover (P7-1 S3)."""
     renewed: list[str] = field(default_factory=list)
     due: list[str] = field(default_factory=list)
     stale: list[str] = field(default_factory=list)
@@ -84,6 +86,7 @@ class Reaped:
     unconfirmed: list[str] = field(default_factory=list)
     settle_errors: dict[str, str] = field(default_factory=dict)
     deferred: list[str] = field(default_factory=list)
+    frozen: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -170,7 +173,6 @@ class Supervisor:
         self._session_grace_s = session_grace_s  # what a row whose role is not read as a dream (sessionless) passes
         self._raised: set[str] = set()        # attention keys this process raised and has not resolved
         self._deferred: set[str] = set()      # rows the last pass left unasked past STOP_BUDGET_S
-        self._unstopped: set[str] = set()     # session rows whose stop was asked and not confirmed: not renewed (P7-1 S3)
 
     # --- the tick's shared refresh ---------------------------------------------------------------------------------
 
@@ -353,7 +355,11 @@ class Supervisor:
     def reap(self, executor_of: Callable[[dict], accounting.Executor | None], *,
              attention: Callable[[str, str], None] | None = None,
              resolve: Callable[[str], None] | None = None) -> Reaped:
-        """One tick's reaper (A0 r6 §2.3, §5.10), in this order: (1) renew the lease of every ``launched`` row;
+        """One tick's reaper (A0 r6 §2.3, §5.10), in this order: (1) renew the lease of every ``launched`` row, except
+        a session row whose executor proves its fire dead (P7-1 S3): that renewal is withheld until the row's own stop
+        has answered in this pass, given back when the row is not one to stop, is deferred, or its stop failed before
+        the end was asked, and kept back (``frozen``) only when the fire was proven dead and the end then failed to
+        confirm; nothing about it is remembered between passes;
         (2) pick the rows past ``stop_at``, from ``autonomic.db`` and the clock alone, so it holds while the cover is
         unreadable; (3) the shared refresh and the STALE classification (UNCLASSIFIED does nothing); (4) ``stop()``
         for each row to stop, serially, and the guarded settle only on ``StopResult(terminated=True)``.
@@ -368,11 +374,12 @@ class Supervisor:
         out = Reaped()
         rows = self._launched()
         graces: dict = {}
+        withheld: set[str] = set()   # P7-1 S3: session rows whose fire is proven dead; renewed after their stop answers
         for row in rows:
-            if row["session_key"] is not None and row["occurrence_id"] in self._unstopped:
-                continue   # a session this reaper was asked to stop and could not: its lease lapses to takeover, never renewed
-            if self._renew(row, self._session_grace(row, graces)):
-                out.renewed.append(row["occurrence_id"])
+            if self._fire_proven_dead(row, executor_of):
+                withheld.add(row["occurrence_id"])
+                continue
+            self._renew_into(row, graces, out)
         now = started = self._clock()
         reasons: dict[str, str] = {}
         for row in rows:
@@ -389,17 +396,28 @@ class Supervisor:
         else:
             out.unclassified.extend(r["occurrence_id"] for r in rows)
         wanted = set(out.due) | set(out.stale)
-        for row in sorted(rows, key=lambda r: r["occurrence_id"] not in self._deferred):  # stable: launched order
+        for row in rows:                  # a withheld row not to be stopped this pass is renewed now, as before S3
+            if row["occurrence_id"] in withheld and row["occurrence_id"] not in wanted:
+                self._renew_into(row, graces, out)
+        # stable sort, launched order within each group: last pass's deferred rows first, then the withheld ones
+        for row in sorted(rows, key=lambda r: (r["occurrence_id"] not in self._deferred,
+                                               r["occurrence_id"] not in withheld)):
             oid = row["occurrence_id"]
             if oid not in wanted or (row["session_key"] is None and row["pid"] is None):
                 continue
             if self._clock() - started >= timedelta(seconds=STOP_BUDGET_S):
                 out.deferred.append(oid)
+                if oid in withheld:       # nothing was asked: its renewal is given back
+                    self._renew_into(row, graces, out)
                 continue
-            self._stop_and_settle(row, reasons.get(oid), executor_of, attention, resolve, out)
+            unproven = self._stop_and_settle(row, reasons.get(oid), executor_of, attention, resolve, out)
+            if oid in withheld:
+                if unproven:
+                    out.frozen.append(oid)            # fire proven dead, end unconfirmed: the lease lapses to takeover
+                elif oid not in out.ended:
+                    self._renew_into(row, graces, out)
         self._deferred = set(out.deferred)
         live = {r["occurrence_id"] for r in rows}
-        self._unstopped &= live
         for key in sorted(self._raised):          # raised here, and its row left launched since (or a resolve raised)
             if key[len(ATTENTION_PREFIX):] not in live:
                 self._resolve(key, resolve)
@@ -418,7 +436,27 @@ class Supervisor:
             return
         self._raised.discard(key)
 
-    def _stop_and_settle(self, row: dict, reason: str | None, executor_of, attention, resolve, out: Reaped) -> None:
+    def _renew_into(self, row: dict, graces: dict, out: Reaped) -> None:
+        if self._renew(row, self._session_grace(row, graces)):
+            out.renewed.append(row["occurrence_id"])
+
+    def _fire_proven_dead(self, row: dict, executor_of) -> bool:
+        """P7-1 S3: True only for a session row (it has a key) whose executor offers ``fire_proven_dead`` and answers it
+        exactly True (:class:`levain.agents.session.RowSessionExecutor`). Read again on every pass from what that
+        executor reads (the store, the fire's identity record, the process table); nothing is remembered here, so a
+        Supervisor built per tick or a restarted reaper decides the same. Any failure is False: the row is renewed."""
+        if row["session_key"] is None:
+            return False
+        try:
+            probe = getattr(executor_of(row), "fire_proven_dead", None)
+            return callable(probe) and probe(self._stop_deadline_s) is True
+        except Exception:  # noqa: BLE001 - a probe that fails proved nothing
+            return False
+
+    def _stop_and_settle(self, row: dict, reason: str | None, executor_of, attention, resolve, out: Reaped) -> bool:
+        """Ask one row's stop and settle it on a confirmed one. True only when the executor says that stop PROVED the
+        fire dead and the end then failed to confirm (``end_unproven is True``); the reaper leaves only such a row's
+        lease unrenewed."""
         oid = row["occurrence_id"]
         key = ATTENTION_PREFIX + oid
         try:
@@ -433,8 +471,6 @@ class Supervisor:
             out.asked.append(oid)
         if stop.terminated is not True:
             out.unconfirmed.append(oid)
-            if row["session_key"] is not None:
-                self._unstopped.add(oid)
             if attention is not None and key not in self._raised:
                 self._raised.add(key)
                 try:
@@ -442,7 +478,7 @@ class Supervisor:
                 except Exception as exc:  # noqa: BLE001 - a missing row is retried next tick
                     self._raised.discard(key)
                     _log.warning("agent supervisor: the attention row for %s raised %s", oid, type(exc).__name__)
-            return
+            return executor is not None and getattr(executor, "end_unproven", None) is True
         try:
             occ = self._occurrence(oid)
             usage = _executor_usage(executor)
@@ -451,17 +487,17 @@ class Supervisor:
             _log.warning("agent supervisor: the settle after a confirmed stop of %s raised %s: %s; the row stays"
                          " launched", oid, type(exc).__name__, exc)
             out.settle_errors[oid] = type(exc).__name__
-            return
+            return False
         with self._store.read() as conn:
             still = conn.execute("SELECT 1 FROM agent_occurrences WHERE occurrence_id = ? AND state = 'launched'",
                                  (oid,)).fetchone()
         if still is not None:          # confirmed, yet the guarded settle wrote nothing: named, asked again next pass
             out.settle_errors[oid] = "not_settled"
-            return
+            return False
         if ended.ended:
             out.ended.append(oid)
-        self._unstopped.discard(oid)
         self._resolve(key, resolve)    # ended by this settle or by another path: the attention row is over either way
+        return False
 
     # --- the run's natural end: the hook points --------------------------------------------------------------------
 
