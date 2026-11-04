@@ -67,7 +67,7 @@ def _fire(rig: Rig, key: str, journal: RunJournal) -> str:
     """A launched occurrence with its journal run started."""
     oid = rig.claim(key)
     assert rig.launch(oid).outcome == "launched"
-    journal.start(rig.row(oid)["run_id"], binding_id=BINDING)
+    assert ctl.admit_run(rig.store, oid, 0, journal=journal)    # the fire path's own admission, not a hand start
     return oid
 
 
@@ -85,7 +85,7 @@ def _second_fire(rig: Rig, journal: RunJournal) -> str:
     assert outcome == ctl.CLAIMED
     assert ctl.launch(rig.store, oid, authority=rig.authority, executor=Exec(), window=WINDOW,
                       now=rig.now()).outcome == "launched"
-    journal.start(rig.row(oid)["run_id"], binding_id=BINDING)
+    assert ctl.admit_run(rig.store, oid, 0, journal=journal)    # the fire path's own admission, not a hand start
     return oid
 
 

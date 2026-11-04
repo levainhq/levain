@@ -1212,6 +1212,7 @@ def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_
 FIRES = "fires"
 FIRE_UNWIRED = 3       # the module entry's exit after its claim, for an agent no run body is registered for
 FIRE_NO_IDENTITY = 4   # the fire cannot read its own identity, or its command line does not name its occurrence
+FIRE_NOT_HELD = 5      # the occurrence is not the one this fire holds: no run was admitted, no effect was reached
 _OCCURRENCE_RE = re.compile(r"oc-[0-9a-f]{32}")
 
 
@@ -1369,6 +1370,23 @@ def _agent_name(store: AgentStore, agent_id: str) -> str | None:
     return None if row is None else row[0]
 
 
+def admit_run(store: AgentStore, occurrence_id: str, launch_epoch: int, *, journal=None) -> bool:
+    """Admit the occurrence's run in the agent ``RunJournal`` before any body runs, once, for the occurrence this fire
+    holds: ``launched`` at ``launch_epoch`` with no revoke since (the claim's own epoch guard). Returns False, having
+    started nothing, for any other row. Idempotent: ``RunJournal.start`` of a known run id is a no-op, so a replay (or
+    another admitter of the same run) keeps the first admission. ``journal`` defaults to the store's own, the one the
+    supervisor's default also opens."""
+    with store.read() as conn:
+        row = conn.execute("SELECT run_id, binding_id FROM agent_occurrences WHERE occurrence_id = ?"
+                           " AND state = 'launched' AND launch_epoch = ? AND epoch = launch_epoch",
+                           (occurrence_id, launch_epoch)).fetchone()
+    if row is None:
+        return False
+    from levain.autonomic.journal import RunJournal   # here: the journal is not the controller's import closure
+    (journal if journal is not None else RunJournal(store.directory)).start(row[0], binding_id=row[1])
+    return True
+
+
 def run_agent(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
               bodies: Mapping[str, Callable[[], RunBody]] | None = None) -> int:
     """The fire's run body: the one registered for the occurrence's agent (:data:`RUN_BODIES`), else
@@ -1381,6 +1399,10 @@ def run_agent(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
     resolve = (RUN_BODIES if bodies is None else bodies).get(name) if name is not None else None
     if resolve is None:
         return _unwired_run(store, occurrence_id, launch_epoch)
+    if not admit_run(store, occurrence_id, launch_epoch):
+        print(f"levain agents _fire {occurrence_id}: the occurrence is not launched at this fire's epoch; no run was "
+              "admitted and no effect was reached", file=sys.stderr)
+        return FIRE_NOT_HELD
     return resolve()(store, occurrence_id, launch_epoch)
 
 
