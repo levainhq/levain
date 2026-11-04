@@ -197,8 +197,8 @@ def test_secret_assignment_fails_closed_on_every_value_of_twelve_bytes_or_more(t
     "PASSWORD_HINT\n",                                 # no assignment at all
     "Please enter your password to continue with the setup\n",   # prose: no separator
     "the token is stored in the keychain and never in a file\n",
-    "Enter your password: then press return to continue\n",     # prose words before the name are not a prefix
-    "if token == 'abcdefghijklmnop':\n",               # `if` is not an assignment prefix
+    "Enter your password:\n",                          # a separator with no value
+    "if token == 'short':\n",                          # 9 bytes after the first `=`: under the minimum
 ])
 def test_secret_assignment_ignores_short_values_and_non_assignments(text):
     assert scan_blob(text.encode()) is None
@@ -259,21 +259,22 @@ _PAST_CAP = ",".join(f"k{i}=1" for i in range(70))          # 70 separators: mor
     # past the 64-separator cap, a secret word anywhere after it is a finding (fail closed)
     _PAST_CAP + " token\n",
     _PAST_CAP + ",password=x\n",
-    # (2) the prefix limit counts prefix-word bytes, never whitespace
+    # (2) whatever words come before the name, at any length
     "export" + " " * 59 + "PASSWORD=actual-secret-123456\n",
     "export" + " " * 300 + "PASSWORD=actual-secret-123456\n",
     "export \t readonly" + " " * 80 + "TOKEN=actual-secret-123456\n",
+    "export " * 11 + "PASSWORD=actual-secret-123456\n",
     # (3) the singular and a plural that is not the name's last word stay secret names
     "access_token=actual-secret-123456\n",
     "api-token: actual-secret-123456\n",
     "secret_tokens: actual-secret-123456\n",           # SECRET still names it
     "tokens_secret = actual-secret-123456\n",
-    # a later quoted value runs to its closing quote; with no closing quote or a backslash first, to the line end
+    # a later quoted value is the rest of the line too, whether or not it holds a closing quote or a backslash
     'db = connect(user="u", password="actual-secret-123456")\n',
     '{"a": 1, "password": "ab\\"cdefghijklmnop"}\n',
     'a=1 token="abcdefghijklmnop\n',
 ])
-def test_secret_assignment_examines_every_key_and_counts_prefix_words_only(text):
+def test_secret_assignment_examines_every_key_and_accepts_any_prefix(text):
     assert scan_blob(text.encode()) == "secret-assignment"
 
 
@@ -290,19 +291,32 @@ def test_secret_assignment_examines_every_key_and_counts_prefix_words_only(text)
     '{"user":"bob","password":"short"}\n',
     "{a: 1, token: short}\n",
     "export FOO=bar PASSWORD=short\n",
-    "user=bob, token=abc, region=us-east-1-and-more\n",   # the unquoted value ends at the `,`
-    "a=1 token=x and then some long trailing prose words\n",
-    "url=http://h.example/?a=1&token=abc\n",
-    # a later quoted value ends at its closing quote; an unquoted one also at `(` `)` `[` `]` (call arguments)
-    'rows = _get(url, token="T")["rows"]\n',
-    'sp = spec("darwin", extra_env={"ANTHROPIC_API_KEY": "tok", "TERM": "xterm-256color"})\n',
-    'done = store.set_state(tid, by="coordinator", token=_lease(store))\n',
-    'devs = _call(port, "GET", token=T)[1]["devices"]\n',
-    # (2) a prefix of more than 64 bytes of prefix WORDS is still not a prefix
-    "export " * 11 + "PASSWORD=actual-secret-123456\n",
+    "url=http://h.example/?a=1&token=abcdefghijklmnop\n",   # `&` is not a boundary
 ])
 def test_secret_assignment_later_keys_and_plurals_are_precise(text):
     assert scan_blob(text.encode()) is None
+
+
+@pytest.mark.parametrize("text", [
+    # (1) a later key's value is the rest of the line, as the first key's is: no cut at a quote or a bracket
+    "X=1 PASSWORD='hunter2'\"-actual-secret\"\n",       # adjacent quoted fragments are one shell word
+    "A=1 PASSWORD='ab'\\''cdefghijklmnop'\n",
+    *(f"export HOST=h DB_PASSWORD=Ab3{c}x9Qz2LmN8pW7vR\n" for c in "()[],;}"),
+    *(f"{{a: 1, password: Ab3{c}x9Qz2LmN8pW7vR}}\n" for c in "()[],;}"),
+    # so a short later value followed by more of the line fails closed (the role withholds the path)
+    "user=bob, token=abc, region=us-east-1-and-more\n",
+    "a=1 token=x and then some long trailing prose words\n",
+    'rows = _get(url, token="T")["rows"]\n',
+    'done = store.set_state(tid, by="coordinator", token=_lease(store))\n',
+    # (2) the first key follows the same rule as a later one: a boundary, or the line start, before the name
+    "docker run -e PASSWORD=actual-secret-123456\n",
+    "echo TOKEN=actual-secret-123456\n",
+    "sudo API_KEY=actual-secret-123456\n",
+    "if token == 'abcdefghijklmnop':\n",
+    "Enter your password: then press return to continue\n",
+])
+def test_every_key_takes_the_rest_of_the_line_and_one_name_rule(text):
+    assert scan_blob(text.encode()) == "secret-assignment"
 
 
 def test_scan_is_linear_on_pathological_many_separator_lines():
