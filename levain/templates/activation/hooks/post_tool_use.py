@@ -80,14 +80,15 @@ def main() -> int:
             hook.consent_observe("claude_code", "PostToolUse", payload)
         if hasattr(hook, "consent_ledger"):
             hook.consent_ledger("claude_code", payload, record=True)
-        # a masked sandbox denial is told to the agent whether or not the hook would log anything
-        if hasattr(hook, "consent_bound_sentence"):  # an older helper beside a newer script: silent
-            sentence = hook.consent_bound_sentence("claude_code", payload)
-            event = payload.get("hook_event_name")
-            if sentence and event in ("PostToolUse", "PostToolUseFailure"):
-                hook.emit(sentence, event)
         if not hook.should_fire():
             return 0
+        # a masked sandbox denial is told to the agent on a success event only: a failed call's nonzero exit
+        # status is already visible, and the sentence says the status was 0
+        # this script is the PostToolUse hook: a payload without an event name is that event
+        if hasattr(hook, "consent_bound_sentence") and payload.get("hook_event_name", "PostToolUse") == "PostToolUse":
+            sentence = hook.consent_bound_sentence("claude_code", {**payload, "hook_event_name": "PostToolUse"})
+            if sentence:
+                hook.emit(sentence, "PostToolUse")
         name = payload.get("tool_name")
         if not isinstance(name, str) or not name:
             return 0

@@ -809,7 +809,11 @@ def hook_record(agent: str, payload: Any, *, queue_dir: Path | str | None = None
             return None
         # the bound is read from the same payload; a hook cannot know whether a bound was in force, so it says None
         # (a measured refusal reads touched, nothing reads clean) and a classifier failure files no bound, never a row loss
-        bound = _bound.classify_payload(agent, payload, bound_active=None)
+        try:
+            bound = _bound.classify_payload(agent, payload, bound_active=None)
+        except Exception as exc:  # noqa: BLE001 - a classifier failure loses the bound, never the row
+            _hook_failed("bound not classified", exc)
+            bound = None
         return ledger.record_call(**_common(agent, payload, session, name, payload.get("tool_input"), cwd),
                                   phase=phase, bound=bound)
     except Exception as exc:  # noqa: BLE001 - the ledger is a record, never a gate

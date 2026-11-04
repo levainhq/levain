@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -26,12 +27,18 @@ def _home(tmp_path: Path) -> dict[str, str]:
     (tmp_path / "consent").mkdir(mode=0o700, exist_ok=True)
     # PYTHONPATH pins the hook's `import levain` to this checkout, not whatever the interpreter has installed
     return {"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path), "LEVAIN_HOME": str(tmp_path),
-            "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+            "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
+            "LEVAIN_SCOPE": "global"}
 
 
 def _run(hooks: Path, env: dict[str, str], payload: dict) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, str(hooks / "post_tool_use.py")], input=json.dumps(payload), text=True,
-                          env=env, capture_output=True, timeout=60, check=True)
+    # the hook files its session log under its own install root, so run a copy inside the test's home
+    root = Path(env["LEVAIN_HOME"]) / ("inst-" + hooks.parts[-4 if "adapters" in hooks.parts else -2])
+    copy = root / "activation" / "hooks"
+    if not copy.exists():
+        shutil.copytree(hooks, copy)
+    return subprocess.run([sys.executable, str(copy / "post_tool_use.py")], input=json.dumps(payload), text=True,
+                          env=env, cwd=root, capture_output=True, timeout=60, check=True)
 
 
 def _cc(tool_use_id: str, stderr: str, **kw) -> dict:
@@ -70,15 +77,42 @@ def test_a_quiet_call_prints_nothing_and_claims_no_bound(tmp_path, hooks):
     assert [r.bound for r in _rows(env) if r.tool_use_id == "t-quiet"] == ["unknown"]
 
 
-def test_failure_event_and_non_shell_tools(tmp_path):
+def test_failure_event_files_the_bound_and_prints_nothing(tmp_path):
     env = _home(tmp_path)
     fail = {"hook_event_name": "PostToolUseFailure", "session_id": "s1", "cwd": "/w", "tool_name": "Bash",
             "tool_input": {"command": "x"}, "tool_use_id": "t-fail", "error": "Exit code 1\n" + EPERM}
-    spec = json.loads(_run(CC_HOOKS, env, fail).stdout)["hookSpecificOutput"]
-    assert spec["hookEventName"] == "PostToolUseFailure" and spec["additionalContext"] == SENTENCE
+    # a failed call's exit status is visible, so the "status 0" sentence is not told; the bound is still filed
+    assert _run(CC_HOOKS, env, fail).stdout == ""
+    assert [r.bound for r in _rows(env) if r.tool_use_id == "t-fail"] == ["touched"]
+
+
+def test_non_shell_tool_is_silent(tmp_path):
+    env = _home(tmp_path)
     read = {"hook_event_name": "PostToolUse", "session_id": "s1", "cwd": "/w", "tool_name": "Read",
             "tool_input": {"file_path": "/w/a"}, "tool_use_id": "t-read", "tool_response": EPERM}
     assert _run(CC_HOOKS, env, read).stdout == ""
+
+
+@pytest.mark.parametrize("hooks", [CC_HOOKS, CX_HOOKS])
+def test_a_suppressed_session_is_told_nothing_but_the_bound_is_filed(tmp_path, hooks):
+    env = {**_home(tmp_path), "LEVAIN_HOOK_SUPPRESS": "1"}
+    payload = _cc("t-sup", EPERM)
+    if hooks is CX_HOOKS:
+        payload["tool_response"] = EPERM + "\ndone\n"
+    out = _run(hooks, env, payload)
+    assert out.stdout == ""
+    assert [r.bound for r in _rows(env) if r.tool_use_id == "t-sup"] == ["touched"]
+
+
+@pytest.mark.parametrize("hooks", [CC_HOOKS, CX_HOOKS])
+def test_an_absent_event_name_is_a_success_event(tmp_path, hooks):
+    env = _home(tmp_path)
+    payload = _cc("t-noev", EPERM)
+    del payload["hook_event_name"]
+    if hooks is CX_HOOKS:
+        payload["tool_response"] = EPERM + "\ndone\n"
+    spec = json.loads(_run(hooks, env, payload).stdout)["hookSpecificOutput"]
+    assert spec == {"hookEventName": "PostToolUse", "additionalContext": SENTENCE}
 
 
 def test_an_escaped_call_is_none_and_silent(tmp_path):
@@ -105,6 +139,8 @@ def test_a_classifier_failure_loses_the_bound_never_the_row(tmp_path, monkeypatc
     def boom(*a, **k):
         raise RuntimeError("x")
     monkeypatch.setattr(ledger_mod._bound, "classify_payload", boom)
-    # the library path: hook_record swallows everything and returns None, so assert the sentence side stays silent
     assert hook_bound_sentence("claude_code", _cc("t-b", EPERM)) is None
-    assert Path(env["LEVAIN_HOME"]).is_dir()
+    rid = hook_record("claude_code", _cc("t-b", EPERM), queue_dir=Path(env["LEVAIN_HOME"]) / "consent")
+    assert rid is not None
+    rows = [r for r in _rows(env) if r.tool_use_id == "t-b"]
+    assert len(rows) == 1 and rows[0].bound is None
