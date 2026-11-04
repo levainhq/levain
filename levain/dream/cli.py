@@ -209,7 +209,7 @@ def run_dream_enable(args: argparse.Namespace) -> int:
             card = da.shadow_signing_card_text(str(zone), flow_root=inst.shadow_flow_root,
                                                scratch=inst.store_path.parent, coord_dir=inst.coord_dir,
                                                agent_dir=store.directory, flow_instructions=inst.flow_instructions,
-                                               model=inst.model, per_run_usd=r, night_usd=2 * r, expires=expires)
+                                               facts_path=inst.facts_path, model=inst.model, per_run_usd=r, night_usd=2 * r, expires=expires)
         except da.InstallRefused as exc:
             card = f"The shadow install's facts cannot be read ({exc}); no fire runs until `levain dream enable` " \
                    "writes them again."

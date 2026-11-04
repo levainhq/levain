@@ -603,11 +603,13 @@ def test_a_same_kind_re_enable_with_other_facts_needs_revise_and_a_new_link(env,
 
 def test_every_bound_fact_moves_the_spec(env, flow, tmp_path):
     base = dict(shadow_flow_root=flow.root, store_path=env["kw"]["store_path"], coord_dir=env["kw"]["coord_dir"],
-                cockpit_root=env["kw"]["cockpit_root"], flow_instructions=env["instr"], model=None, claude_bin=None)
+                cockpit_root=env["kw"]["cockpit_root"], flow_instructions=env["instr"], zone=ZONE, facts_path=None, model=None,
+                claude_bin=None)
     b0 = da.shadow_binding(**base)
     for key, value in (("shadow_flow_root", tmp_path / "f2"), ("store_path", tmp_path / "s2" / "memory.db"),
                        ("coord_dir", tmp_path / "c2"), ("cockpit_root", tmp_path / "k2"),
-                       ("flow_instructions", tmp_path / "i2.md"), ("model", "claude-other"), ("claude_bin", "/x/claude")):
+                       ("flow_instructions", tmp_path / "i2.md"), ("zone", "Europe/London"),
+                       ("facts_path", tmp_path / "f.json"), ("model", "claude-other"), ("claude_bin", "/x/claude")):
         assert da.shadow_binding(**{**base, key: value}) != b0, key
     assert da.dream_spec("r" * 64)["input"]["source"] == da.LIVE_SOURCE
     assert da.dream_spec("r" * 64, b0)["input"]["source"] == da.SHADOW_SOURCE + b0
@@ -780,3 +782,78 @@ def test_a_re_seed_between_the_save_and_the_card_cannot_change_the_cards_text(en
     (occ / "composed.continuity.md").unlink()
     with pytest.raises(cd.CardError):
         cd.texts_for(inst.store_path, occ)
+
+
+# ------------------------------------------------------------------------------- 1104-8 dreamfix (two codex MEDs on main)
+
+def test_the_zone_and_the_facts_path_are_bound_into_the_spec(env, flow, tmp_path):
+    # reproduced on 239660c9: a re-enable with another zone or facts file kept the binding, so the link signed for the
+    # old facts ran another dream day (zone) or another executor-facts source (facts_path) with no new signature
+    facts = tmp_path / "first_run_facts.json"
+    facts.write_text("{}", encoding="utf-8")
+    _shadow(env, flow)
+    first = _row(env)
+    b0 = da.current_binding(env["ag"])
+    da.check_bound(env["ag"], first, da.read_install(env["ag"]))
+    _shadow(env, flow, zone="Europe/London")
+    assert da.current_binding(env["ag"]) != b0
+    with pytest.raises(da.InstallRefused, match="not the ones the occurrence's spec binds"):
+        da.check_bound(env["ag"], first, da.read_install(env["ag"]))
+    _shadow(env, flow)                                    # back to the signed facts: the old link covers them again
+    da.check_bound(env["ag"], first, da.read_install(env["ag"]))
+    _shadow(env, flow, facts_path=facts)
+    assert da.current_binding(env["ag"]) != b0
+    with pytest.raises(da.InstallRefused, match="not the ones the occurrence's spec binds"):
+        da.check_bound(env["ag"], first, da.read_install(env["ag"]))
+
+
+def test_the_shadow_signing_card_names_the_facts_file_the_link_signs(env, flow, tmp_path):
+    # L3 verify finding: the spec binds facts_path, the card said it binds "these paths" but never printed it
+    facts = tmp_path / "first_run_facts.json"
+    common = dict(flow_root="/f", scratch="/s", coord_dir="/c", agent_dir="/a", flow_instructions="/i", model="m",
+                  per_run_usd=1.0, night_usd=2.0, expires="x")
+    assert str(facts) in da.shadow_signing_card_text("UTC", facts_path=facts, **common)
+    none_card = da.shadow_signing_card_text("UTC", facts_path=None, **common)
+    assert "every fire refuses" in none_card and "first-run facts from" not in none_card
+    assert "It composes with m, a paid model call" in none_card and "a run and $2.00 a night" in none_card
+
+
+def _pair(ag):
+    return {n: (ag / n).read_bytes() if (ag / n).exists() else None for n in (da.SHADOW_INSTRUCTIONS, da.INSTALL_FILE)}
+
+
+@pytest.mark.parametrize("where", ["facts_temp_file", "final_rename"])
+@pytest.mark.parametrize("had_prior", [True, False])
+def test_a_failed_install_leaves_the_old_instructions_and_facts_pair_byte_identical(env, flow, monkeypatch, where,
+                                                                                    had_prior):
+    # reproduced on 239660c9: the instructions copy was swapped in before the facts file was created and renamed, so a
+    # failure between the two left the install with the new instructions and the old (or no) facts
+    import tempfile
+
+    if had_prior:
+        _shadow(env, flow)
+    before = _pair(env["ag"])
+    env["instr"].write_text("flow's NEW instructions", encoding="utf-8")
+    if where == "facts_temp_file":
+        real_mkstemp = tempfile.mkstemp
+
+        def mkstemp(*a, **kw):
+            if str(kw.get("prefix", "")).startswith(da.INSTALL_FILE):
+                raise OSError(28, "no space left on device")
+            return real_mkstemp(*a, **kw)
+
+        monkeypatch.setattr(tempfile, "mkstemp", mkstemp)
+    else:
+        real_replace = os.replace
+
+        def replace(src, dst, *a, **kw):
+            if Path(dst).name == da.INSTALL_FILE:
+                raise OSError(5, "injected rename failure")
+            return real_replace(src, dst, *a, **kw)
+
+        monkeypatch.setattr(os, "replace", replace)
+    with pytest.raises((OSError, da.InstallRefused)):
+        _shadow(env, flow, model="claude-other")
+    monkeypatch.undo()
+    assert _pair(env["ag"]) == before
+    assert not [p.name for p in env["ag"].iterdir() if p.name.endswith(".tmp") or p.name.startswith(da.INSTALL_FILE + ".")]
