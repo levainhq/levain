@@ -143,16 +143,6 @@ def test_a_forced_device_clear_of_a_yours_to_clear_item_is_refused_and_writes_no
     assert review.get_item(store, mine.item_id).state == "open"
 
 
-# --- the phone port: POST /coord/review/<item_id>/clear|reopen, a paired device only -------------------------------
-# (over a real `levain init` install: the phone's review writes go through the phone app's kernel write, which needs
-# the install its consent hook names; test_review_clear_fix1 holds the fixture)
-
-from tests.test_review_clear_fix1 import _drawn as _version, install  # noqa: E402,F401  (fixtures)
-
-
-def _drawn(base, token, item_id):
-    """The body a Clear or Reopen sends: the version the phone's queue drew for ``item_id``."""
-    return {"version": _version(base, token, item_id)}
 
 
 
