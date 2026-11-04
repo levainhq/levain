@@ -2924,7 +2924,7 @@ def _nonneg_int(v: Any) -> int | None:
         return None
     if isinstance(v, int):
         return v if 0 <= v <= 10**9 else None
-    if isinstance(v, float) and math.isfinite(v) and v >= 0 and v == int(v):
+    if isinstance(v, float) and math.isfinite(v) and 0 <= v <= 10**9 and v == int(v):
         return int(v)
     return None
 

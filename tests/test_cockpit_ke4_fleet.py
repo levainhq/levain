@@ -226,7 +226,7 @@ def test_the_fleet_card_heads_agents_and_roles_apart_and_reads_a_roles_last_run(
         {**ROLE, "kind": "role"},
         {**ROLE, "name": "ontime", "kind": "role", "digest": {**ROLE["digest"], "last_run_status": "ok"}},
         {**ROLE, "name": "late", "kind": "role", "digest": {**ROLE["digest"], "run_late": True, "available": False}},
-        {**ROLE, "name": "old", "digest": {"available": True, "episodes_24h": 3}},          # an older roster: no kind, no run fields
+        {**{k: v for k, v in ROLE.items() if k not in ("kind", "memory")}, "memory": "stateless", "name": "old", "digest": {"available": True, "episodes_24h": 3}},          # an older roster: no kind, no run fields
         {**OC, "last_call": {"at": datetime.now(timezone.utc).isoformat(), "outcome": "ok"}},
     ]
     _root, src, _ids = _install(tmp_path)
