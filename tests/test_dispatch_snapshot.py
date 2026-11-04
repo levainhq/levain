@@ -136,3 +136,97 @@ def test_dest_rules_and_bad_withhold_and_history_are_refused(tmp_path):
     import dataclasses
     with pytest.raises(SnapshotRefused):
         snapshot_commit(dataclasses.replace(man, history=3))
+
+
+def test_head_is_resolved_once_a_head_move_cannot_desync_manifest_head_from_entries(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path, FILES)
+    real_git = snap._git
+    moved = []
+
+    def git_then_move_head(r, *args, data=None):
+        out = real_git(r, *args, data=data)
+        if args[:1] == ("rev-parse",) and not moved:   # a commit lands between resolving HEAD and listing it
+            (repo / "late.txt").write_text("late\n")
+            git(repo, "add", "late.txt")
+            git(repo, "commit", "-q", "-m", "late")
+            moved.append(True)
+        return out
+    monkeypatch.setattr(snap, "_git", git_then_move_head)
+    man, _ = plan_snapshot(str(repo), [])
+    assert moved
+    listed = sorted(git(repo, "ls-tree", "-r", "--name-only", man.head).split())
+    assert [e[0] for e in man.entries] == listed and "late.txt" not in listed
+
+
+@pytest.mark.parametrize("text", [
+    "PASSWORD=p@ssword-is-definitely-secret\n",
+    'PASSWORD="!abcdef0123456789abcdef"\n',
+    "export DB_PASSWORD='#hash-leading-secret-value'\n",
+    "API_KEY = %percent-leading-key-0123\n",
+    "  secret_token=@at-leading-0123456789\n",
+])
+def test_secret_assignment_catches_values_that_begin_with_punctuation(text):
+    assert scan_blob(text.encode()) == "secret-assignment"
+
+
+@pytest.mark.parametrize("text", [
+    "A=1\n",                                           # not a secret-named assignment
+    "PASSWORD=short\n",                                # under the minimum length
+    'TOKEN=""\n',
+    "API_KEY=${API_KEY}\n",                            # a variable reference, not a value
+    "export SECRET_KEY=$SECRET_KEY_FROM_THE_VAULT\n",
+    "API_KEY=<your-api-key-goes-here>\n",              # an obvious placeholder
+    "PASSWORD=changeme-changeme-changeme\n",
+    "TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx\n",
+    'api_key = os.environ.get("API_KEY")\n',           # code reading a secret, not holding one
+    "token = self._load_token_from_keychain(name)\n",
+    "PASSWORD_HINT\n",                                 # no assignment at all
+])
+def test_secret_assignment_leaves_references_and_placeholders_alone(text):
+    assert scan_blob(text.encode()) is None
+
+
+def test_scan_is_linear_on_a_pathological_one_megabyte_line():
+    """One hostile or generated line must not hang the dispatcher. Run in a child with a hard timeout, so a
+    regression fails this test instead of hanging the suite."""
+    import sys
+    import textwrap
+    code = textwrap.dedent("""
+        import time
+        from levain.dispatch.snapshot import scan_blob
+        n = 1024 ** 2
+        lines = [b"SECRET" * (n // 6), b"A" * n + b"TOKEN", b"x" + b"SECRET_" * (n // 7),
+                 b"PASSWORD=" + b"!" * n, b"TOKEN" * (n // 5) + b" " * 10, b" " * n + b"=",
+                 b"-----BEGIN " + b"A " * (n // 2), b"ghp_" + b"a" * n + b"_"]
+        t = time.monotonic()
+        for line in lines:
+            scan_blob(line)
+        print(time.monotonic() - t)
+    """)
+    root = str(Path(snap.__file__).resolve().parents[2])
+    env = {**os.environ, "PYTHONPATH": root}
+    cp = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, env=env, cwd=root)
+    assert cp.returncode == 0, cp.stderr[-500:]
+    assert float(cp.stdout.strip()) < 2.0
+
+
+@pytest.mark.parametrize("name", ['"config', 'back\\slash', 'q"mid"dle.txt'])
+def test_a_path_with_a_quote_or_backslash_is_c_quoted_for_fast_import(tmp_path, name):
+    repo = make_repo(tmp_path, {**FILES, name: "ok\n"})
+    rs, man = build_snapshot(str(repo), str(tmp_path / "snap"), [])
+    paths = git(Path(rs.repo_dir), "ls-tree", "-r", "-z", "--name-only", rs.commit).split("\0")
+    assert name in paths and (rs.commit, rs.tree) == snapshot_commit(man)[:2]
+    assert git(Path(rs.repo_dir), "show", f"{rs.commit}:{name}") == "ok\n"
+
+
+def test_fast_import_path_quoting_escapes_every_special_byte():
+    assert snap._fi_path("plain/a.py") == b'"plain/a.py"'
+    assert snap._fi_path('"config') == b'"\\"config"'
+    assert snap._fi_path("a\\b") == b'"a\\\\b"'
+    assert snap._fi_path("a\nb\tc\x7f") == b'"a\\012b\\011c\\177"'
+    assert snap._fi_path("café") == b'"caf\xc3\xa9"'
+
+
+def test_total_bound_is_64_mib_per_file_8_mib_files_20000():
+    assert (snap.SNAPSHOT_MAX_BYTES, snap.BLOB_MAX_BYTES, snap.SNAPSHOT_MAX_FILES) == (64 * 1024 ** 2,
+                                                                                       8 * 1024 ** 2, 20_000)

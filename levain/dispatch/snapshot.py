@@ -45,11 +45,14 @@ __all__ = ["BLOB_MAX_BYTES", "FORMAT", "Manifest", "SNAPSHOT_MAX_BYTES", "SNAPSH
 FORMAT = "levain-dispatch-snapshot/1"
 #: Bounds ([judged]; to be set from the §7d proof's measured sizes). Over any one: the whole snapshot is refused.
 SNAPSHOT_MAX_FILES = 20_000
-SNAPSHOT_MAX_BYTES = 256 * 1024 ** 2
+# 64 MiB, not more: plan + build hold the snapshot about 4x over at peak (cat-file output, the blob map, the
+# fast-import stream and its bytes copy), so this bound is what keeps a worker's memory near 256 MiB without streaming.
+SNAPSHOT_MAX_BYTES = 64 * 1024 ** 2
 BLOB_MAX_BYTES = 8 * 1024 ** 2
 _WITHHOLD_MAX = 256
 
-#: (rule name, pattern). Rule names are what a refusal shows; the matched text never is.
+#: (rule name, pattern). Rule names are what a refusal shows; the matched text never is. Every pattern here is
+#: linear: no nested or overlapping quantifiers (the assignment rule is the separate parse below).
 _RULES: tuple[tuple[str, re.Pattern[bytes]], ...] = tuple((n, re.compile(p)) for n, p in (
     ("private-key-armor", rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
     ("aws-access-key-id", rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
@@ -57,9 +60,36 @@ _RULES: tuple[tuple[str, re.Pattern[bytes]], ...] = tuple((n, re.compile(p)) for
     ("anthropic-or-openai-key", rb"\bsk-ant-[A-Za-z0-9_-]{20,}|\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}"),
     ("slack-token", rb"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
     ("google-api-key", rb"\bAIza[0-9A-Za-z_-]{35}\b"),
-    ("secret-assignment", rb"(?im)^[ \t]*(?:export[ \t]+)?[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY"
-                          rb"|PRIVATE_KEY)[A-Z0-9_]*[ \t]*=[ \t]*['\"]?[A-Za-z0-9+/_.=-]{16,}"),
 ))
+#: The ``.env``-shaped assignment rule, in two linear steps: the NAME (one bounded character run anchored at a line
+#: start, then ``=``), then the VALUE parsed by hand from the rest of that line, whatever punctuation it begins with.
+_ASSIGN_NAME = re.compile(rb"(?m)^[ \t]*(?:export[ \t]+)?([A-Za-z0-9_]{1,256})[ \t]*=[ \t]*")
+_SECRET_NAME = re.compile(rb"SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY")
+_ASSIGN_MIN = 12
+#: Values that are not a secret's bytes: a variable reference (``$X``, ``${X}``), a ``<placeholder>``, one character
+#: repeated, a known placeholder word, or (unquoted only) a call or index expression in code (``os.environ[...]``).
+_VALUE_REFERENCE = re.compile(rb"\$\{[A-Za-z0-9_]+\}|\$[A-Za-z_][A-Za-z0-9_]*|<[^<>]*>")
+_VALUE_CODE = re.compile(rb"[A-Za-z_][A-Za-z0-9_.]*[(\[]")
+_PLACEHOLDER_WORDS = (b"changeme", b"placeholder", b"example", b"your-", b"your_")
+
+
+def _secret_value(body: bytes, start: int) -> bool:
+    """Whether the assignment value beginning at ``body[start]`` is a secret's bytes (see :data:`_VALUE_REFERENCE`)."""
+    end = body.find(b"\n", start)
+    line = body[start:] if end < 0 else body[start:end]
+    if line[:1] in (b'"', b"'"):
+        close = line.find(line[:1], 1)
+        value = line[1:] if close < 0 else line[1:close]
+        code = False
+    else:
+        parts = line.split(None, 1)
+        value = parts[0] if parts else b""
+        code = _VALUE_CODE.match(value) is not None
+    value = value.rstrip(b"\r")
+    if len(value) < _ASSIGN_MIN or code or _VALUE_REFERENCE.fullmatch(value) is not None:
+        return False
+    low = value.lower()
+    return len(set(value)) > 1 and not any(w in low for w in _PLACEHOLDER_WORDS)
 
 
 class SnapshotRefused(DispatchError):
@@ -76,7 +106,24 @@ def scan_blob(body: bytes) -> str | None:
     for name, rx in _RULES:
         if rx.search(body) is not None:
             return name
+    for m in _ASSIGN_NAME.finditer(body):
+        if _SECRET_NAME.search(m.group(1).upper()) is not None and _secret_value(body, m.end()):
+            return "secret-assignment"
     return None
+
+
+def _fi_path(path: str) -> bytes:
+    """``path`` C-quoted for ``git fast-import`` (always quoted, which git accepts in every case and requires for a
+    path that begins with ``"`` or holds a newline): ``\\`` and ``"`` escaped, control bytes as octal, UTF-8 as is."""
+    out = bytearray(b'"')
+    for b in path.encode("utf-8"):
+        if b in (0x22, 0x5C):
+            out += b"\\" + bytes([b])
+        elif b < 0x20 or b == 0x7F:
+            out += b"\\%03o" % b
+        else:
+            out.append(b)
+    return bytes(out + b'"')
 
 
 @dataclass(frozen=True)
@@ -166,7 +213,7 @@ def plan_snapshot(repo: str, withhold: Any = (), *, policy: ProviderPolicy | Non
     head = _git(repo, "rev-parse", "--verify", "-q", "HEAD^{commit}").decode("ascii", "replace").strip()
     if _SHA1.fullmatch(head) is None:
         raise SnapshotRefused("snapshot-repo", "HEAD is not a commit")
-    raw = _git(repo, "ls-tree", "-r", "-z", "-l", "HEAD")
+    raw = _git(repo, "ls-tree", "-r", "-z", "-l", head)      # the sha resolved once, never HEAD again
     kept: list[tuple[str, str, str, int]] = []
     withheld: list[str] = []
     for rec in raw.split(b"\0"):
@@ -293,7 +340,7 @@ def build_snapshot(repo: str, dest_dir: str, withhold: Any = (), *, policy: Prov
             BRANCH.encode(), _IDENTITY.encode(), _EMAIL.encode(), len(msg)) + msg)
         for path, mode, sha in manifest.entries:
             body = blobs[sha]
-            stream += b"M %s inline %s\ndata %d\n" % (mode.encode(), path.encode("utf-8"), len(body)) + body + b"\n"
+            stream += b"M %s inline %s\ndata %d\n" % (mode.encode(), _fi_path(path), len(body)) + body + b"\n"
         _git(dest_dir, "fast-import", "--quiet", data=bytes(stream))
         got = _git(dest_dir, "rev-parse", f"refs/heads/{BRANCH}").decode("ascii").strip()
         if got != want:
