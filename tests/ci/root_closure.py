@@ -371,6 +371,8 @@ LAZY_SITES = {
     'levain/consent/queue.py::ConsentQueue._terminal_ruling_refusal::from levain.authority_sig import _signers_line': 'operator',
     'levain/consent/queue.py::ConsentQueue._terminal_ruling_refusal::from levain.consent import terminal_sign as ts': 'operator',
     'levain/consent/queue.py::ConsentQueue.answer_terminal_ruling::from levain.consent import terminal_sign as ts': 'operator',
+    # operator: ``_carrier`` is called only by ``_terminal_ruling_refusal`` and ``answer_terminal_ruling`` (the two rows above), so it runs in the same operator processes
+    'levain/consent/queue.py::ConsentQueue._carrier::from levain.consent import terminal_sign as ts': 'operator',
     # operator: ``receipt_log.verify``'s one caller is ``levain/cli.py``'s ``_cmd_consent_receipts_verify`` (``levain consent receipts verify``); the broker reads ``head`` / ``head_refusal`` only
     'levain/consent/receipt_log.py::verify::from levain.authority import AuthorityError, VerifierUnavailable, anchor_path': 'operator',
     'levain/consent/receipt_log.py::verify::from levain.consent.answering import answer_root': 'operator',
