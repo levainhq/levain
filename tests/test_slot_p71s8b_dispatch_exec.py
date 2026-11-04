@@ -662,3 +662,30 @@ def test_17_a_vendor_capture_closes_every_fd_it_opened_once(tmp_path):
     cap.close()
     cap.close()                                              # idempotent
     assert not any(_fd_open(fd) for fd in fds)
+
+
+# --- coordinator additions from the S8a L3 ------------------------------------------------------------------------------
+
+def test_18_a_brokered_executor_on_codex_is_refused_at_the_point_of_use():
+    """D2: CONTROL cannot know a brokered executor's vendor at mint, so a brief on a brokered executor whose blob
+    is a codex one is refused in check_ticket; the same facts on claude pass, and a codex executor WITHOUT a brief
+    is not refused for want of one."""
+    brokered = _facts("executor", route="glm", model_requested="m", brief_digest=BRIEF_DIGEST)
+    with pytest.raises(Refused) as e:
+        RD.check_ticket(G.RenderBlob(vendor="codex", routes=("glm",), model="m"), "dispatch", "egress", "tk", brokered)
+    assert e.value.name == "ticket-brief-forbidden"
+    RD.check_ticket(G.RenderBlob(vendor="claude", routes=("glm",), model="m"), "dispatch", "egress", "tk", brokered)
+    bare = {k: v for k, v in brokered.items() if k != "brief_digest"}
+    RD.check_ticket(G.RenderBlob(vendor="codex", routes=("glm",), model="m"), "dispatch", "egress", "tk", bare)
+
+
+def test_19_write_brief_is_0600_under_a_restrictive_umask(tmp_path):
+    d = tmp_path / "staging"
+    d.mkdir()
+    old = os.umask(0o477)
+    try:
+        ST.write_brief(d, "a brief\n")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(os.stat(d / "brief.md").st_mode) == 0o600
+    assert (d / "brief.md").read_bytes() == b"a brief\n"

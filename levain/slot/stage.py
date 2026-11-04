@@ -490,6 +490,7 @@ def write_brief(staging_dir: int | str | os.PathLike[str], text: str) -> str:
                 raise Refused("staging-dest-exists", BRIEF_NAME) from None
             raise
         try:
+            os.fchmod(fd, 0o600)      # the umask must not narrow it: the same-uid reader opens this file
             write_all(fd, data)
             os.fsync(fd)
         except BaseException:
