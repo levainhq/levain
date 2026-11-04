@@ -359,23 +359,27 @@ def _desk_answer_owned(req: DeskRequest, host: DeskHost, state: DeskState, polic
 
 def desk_text(req: DeskRequest, store: Any, state: DeskState, *, policy: str = DESK_POLICY, signer_factory: Any = None,
               key_dir: Any = None, notify: Callable[[str], Any] | None = None,
-              deliver: Callable[[Any], None] | None = None, find_key: Callable[..., Any] | None = None
-              ) -> tuple[dict[str, Any], int]:
+              deliver: Callable[[Any], None] | None = None, find_key: Callable[..., Any] | None = None,
+              queue_for: Callable[[Any], Any] | None = None) -> tuple[dict[str, Any], int]:
     """``POST /cockpit/desk/text``: a line typed in the cockpit's band box, signed with the laptop key when the policy
-    signs information answers (``all``). Body exactly ``{text, store_id, view_id, client_txn}``. Same walls as
-    :func:`desk_answer`: not local 403 ``desk_remote``; the policy not signing information lines 422 ``desk_unsigned``
+    signs information answers (``all``), and, whatever the policy, when the line holds a LINKED pick (its ruling
+    ALLOW is signed in the same touch, TERMSIGN L5b). Body exactly ``{text, store_id, view_id, client_txn}``. Same
+    walls as :func:`desk_answer`: not local 403 ``desk_remote``; a line on which nothing would be signed (the policy
+    leaves information unsigned and the line holds no linked pick) 422 ``desk_unsigned``, nothing asked or recorded
     (the page uses the ordinary band path); no key 409 ``no_key``; a held lock 409 ``sign_busy``; a replayed request
     id returns its first result. A cancelled or timed-out touch records NOTHING (409 ``unsigned``, the box keeps his
-    words); a stale view is 409 ``stale_band``; a line that does not parse is 422. Never raises."""
+    words); a stale view is 409 ``stale_band``; a line that does not parse is 422. ``queue_for`` (tests): the consent
+    queue a linked question's request lives in; ``None`` is the install's own. Never raises."""
     try:
-        return _desk_text(req, store, state, policy, signer_factory, key_dir, notify, deliver, find_key)
+        return _desk_text(req, store, state, policy, signer_factory, key_dir, notify, deliver, find_key, queue_for)
     except Exception as exc:  # noqa: BLE001 - a route answers, it never leaks a traceback
         return _refuse("internal", type(exc).__name__, 500)
 
 
 def _desk_text(req: DeskRequest, store: Any, state: DeskState, policy: str, signer_factory: Any, key_dir: Any,
                notify: Callable[[str], Any] | None, deliver: Callable[[Any], None] | None,
-               find_key: Callable[..., Any] | None) -> tuple[dict[str, Any], int]:
+               find_key: Callable[..., Any] | None, queue_for: Callable[[Any], Any] | None = None
+               ) -> tuple[dict[str, Any], int]:
     if not req.local:
         return _refuse("desk_remote", "a click that did not come from the laptop's own cockpit never asks for Touch ID", 403)
     if not _origin_ok(req.origin):
@@ -393,14 +397,16 @@ def _desk_text(req: DeskRequest, store: Any, state: DeskState, policy: str, sign
     if first is not None:
         return first
     try:
-        return _desk_text_owned(req, store, state, policy, signer_factory, key_dir, notify, find_key, b, txn, deliver)
+        return _desk_text_owned(req, store, state, policy, signer_factory, key_dir, notify, find_key, b, txn, deliver,
+                                queue_for)
     finally:
         state.end(txn, None)
 
 
 def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str, signer_factory: Any, key_dir: Any,
                      notify: Callable[[str], Any] | None, find_key: Callable[..., Any] | None, b: Mapping[str, Any],
-                     txn: str, deliver: Callable[[Any], None] | None) -> tuple[dict[str, Any], int]:
+                     txn: str, deliver: Callable[[Any], None] | None,
+                     queue_for: Callable[[Any], Any] | None = None) -> tuple[dict[str, Any], int]:
     import sqlite3
 
     from levain import band_view
@@ -411,9 +417,13 @@ def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str
         state.end(txn, result)          # remembered while the sign lock is still held
         return result
 
-    if not requires_sign("information", policy):
-        return _refuse("desk_unsigned", "this line is recorded unsigned; use the ordinary path", 422)
     viewer = f"cockpit:{req.surface if isinstance(req.surface, str) and req.surface else 'web'}"
+    # a policy that leaves information unsigned still signs a LINKED pick (its ruling is the act): read the line
+    # first, and refuse only a line on which nothing would be signed (answer_text_desk re-checks it inside, so a line
+    # that changes between this read and the write is refused there, never written unsigned)
+    if not requires_sign("information", policy) and not band_view.desk_line_rules(
+            store, b["text"], viewer=viewer, view_id=b["view_id"]):
+        return _refuse("desk_unsigned", "this line is recorded unsigned; use the ordinary path", 422)
     surface = ts.desk_surface(req.surface)      # the signed identity; the viewer keeps the credential's own name
     try:
         key = (find_key or ts.find_key)(key_dir)
@@ -429,7 +439,9 @@ def _desk_text_owned(req: DeskRequest, store: Any, state: DeskState, policy: str
             done = band_view.answer_text_desk(
                 store, b["text"], viewer=viewer, store_id=b["store_id"], view_id=b["view_id"],
                 surface=surface, origin=req.origin, signer_factory=signer_factory, key_dir=key_dir, notify=notify,
-                policy=policy, outcome=signings)
+                policy=policy, outcome=signings, queue_for=queue_for, unsigned=False)
+        except band_view.DeskLineUnsigned as exc:  # raised before any sheet: the request id stays free to retry
+            return _refuse("desk_unsigned", str(exc), 422)
         except band_view.StaleBand as exc:       # before the prompt (no view) or inside the write after it
             got = _refuse("stale_band", str(exc), 409)
             return finish(got) if signings else got
@@ -491,9 +503,11 @@ class LevainDeskHost:
                        recordable=kind == "information", ruling_pick=linked)
 
     def ruling_entry(self, row: DeskRow, pick: str, key: Any) -> tuple[Any, Any]:
-        """The authority entry that carries the ruling ALLOW for ``row``'s linked request, and the
-        ``(request id, version, queue)`` :meth:`record_ruled` applies it with. Raises when the queue would not
-        build it now (the request is gone, decided, or in another queue)."""
+        """The authority entry that carries the ruling ALLOW for ``row``'s linked request, and what
+        :meth:`record_ruled` applies it with (:func:`~levain.band_view._desk_ruling`): ``(request id, version,
+        queue)``, or a reconcile when the queue already applied THIS question's ruling, carried and signed by this
+        install's key, and the answer did not record (the touch still signs the re-carried record; the queue is not
+        written again). Raises when neither holds (the request is gone, decided otherwise, or in another queue)."""
         import os
 
         from levain import band_view
@@ -502,8 +516,7 @@ class LevainDeskHost:
         if q is None or q.id != row.id or band_view.subject_version(q) != row.version:
             raise ValueError("the item changed")
         queue = (self._queue_for or band_view._default_queue_for(os.environ))(q)
-        entry, request_id, version = band_view._ruling_entry(q, pick, key, queue)
-        return entry, (request_id, version, queue)
+        return band_view._desk_ruling(q, pick, key, queue)
 
     def record_ruled(self, row: DeskRow, pick: str, viewer: str, signing: Any, carried: Any,
                      scope: Mapping[str, str]) -> Any:

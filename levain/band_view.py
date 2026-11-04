@@ -1596,7 +1596,7 @@ def _desk_typed_signer(store: QuestionStore, text: str, *, surface: str, origin:
         from levain.consent import terminal_sign as ts
 
         info_ids = {q.id: "" for _, q in pairs if sign_info and _question_kind(q) == "information"}
-        carried: dict[str, tuple[str, str, Any]] = {}
+        carried: dict[str, Any] = {}              # question id -> (request id, version, queue) | _Reconciled
         try:
             entries, versions = _info_entries(pairs, with_note=False) if sign_info else ([], {})
             if rulings:
@@ -1604,11 +1604,11 @@ def _desk_typed_signer(store: QuestionStore, text: str, *, surface: str, origin:
                 for sh, q in rulings if key is not None else ():
                     try:
                         queue = (queue_for or _default_queue_for(os.environ if environ is None else environ))(q)
-                        entry, request_id, version = _ruling_entry(q, sh.pick, key, queue)
+                        entry, carried_value = _desk_ruling(q, sh.pick, key, queue)
                     except Exception:  # noqa: BLE001 - this item keeps its sheet; the line's others are unaffected
                         continue
                     entries.append(entry)
-                    carried[q.id] = (request_id, version, queue)
+                    carried[q.id] = carried_value
             if not entries:
                 return None
             sid = _store_id_of(store)
@@ -1641,11 +1641,46 @@ def _desk_typed_signer(store: QuestionStore, text: str, *, surface: str, origin:
     return sign_with
 
 
+class DeskLineUnsigned(Exception):
+    """A desk line nothing on which would be signed (the policy leaves information unsigned and the line holds no
+    linked pick), raised by :func:`answer_text_desk` with ``unsigned=False`` BEFORE anything is recorded or asked:
+    the route answers ``desk_unsigned`` and the page uses the ordinary path."""
+
+
+def _linked_pick(q: Question | None, pick: str | None) -> bool:
+    """Whether ``pick`` on ``q`` is its Link's option: the one pick whose ruling ALLOW a signed answer can carry
+    (the predicate :func:`apply_plan` makes its ruling candidates by)."""
+    link = getattr(q, "link", None)
+    if q is None or link is None or not isinstance(pick, str) or len(pick) != 1 or pick not in _LETTERS:
+        return False
+    i = _LETTERS.index(pick)
+    return i < len(q.options) and q.options[i][0] == link.option
+
+
+def desk_line_rules(store: Any, text: str, *, viewer: str, view_id: int) -> bool:
+    """Whether a line typed in the cockpit's band box holds a linked pick (:func:`_linked_pick`), parsed against the
+    view it names exactly as :func:`answer_text_desk` parses it. Read-only, and ``False`` for anything that cannot
+    say (a foreign store, a gone view, a line that does not parse): the desk route uses it to decide whether a line
+    under a policy that leaves information unsigned has anything to sign. Never raises."""
+    try:
+        if _foreign(store):
+            return False
+        view = _view_by_id(store, viewer, view_id)
+        if view is None:
+            return False
+        plan, _view, questions, _extras = _plan_on(store, view, text)
+        if not plan.matched or plan.rest.strip():
+            return False
+        return any(_linked_pick(questions.get(sh.n), sh.pick) for sh in plan.sheets)
+    except Exception:  # noqa: BLE001 - nothing to sign is the answer that records nothing
+        return False
+
+
 def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: str, view_id: int, surface: str,
                      origin: str, signer_factory: Any = None, key_dir: Path | None = None, notify: Any = None,
                      deadline: float | None = None, policy: str | None = None,
-                     outcome: list[Signing] | None = None, queue_for: Callable[[Question], Any] | None = None
-                     ) -> Applied:
+                     outcome: list[Signing] | None = None, queue_for: Callable[[Question], Any] | None = None,
+                     unsigned: bool = True) -> Applied:
     """:func:`answer_text` for the cockpit's band box, signed with the laptop key where the desk ``policy``
     (:data:`levain.desk_click.DESK_POLICY` by default) signs an information answer (policy (a), ``all``): the plan is
     made from the view the text names, one desk message is signed over its information entries, and the answers are
@@ -1655,12 +1690,15 @@ def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: 
     leaves information unsigned (NP-A (b), ``authority``) the line is :func:`answer_text`, unsigned, raising no
     sheet, except that a LINKED pick of the line is signed with its ruling (TERMSIGN L5b) whatever the policy: it is
     an authority item, and the signature is the act. Each signing attempt is appended to
-    ``outcome``. A foreign store is ``ValueError`` as in :func:`answer_text`."""
+    ``outcome``. A foreign store is ``ValueError`` as in :func:`answer_text`. ``unsigned`` False (the desk route):
+    a line nothing on which would be signed is :class:`DeskLineUnsigned`, never the ordinary unsigned write."""
     from levain import desk_click
 
     signs_info = desk_click.requires_sign("information", desk_click.DESK_POLICY if policy is None else policy)
     if _foreign(store):
         if not signs_info:
+            if not unsigned:
+                raise DeskLineUnsigned("this line is recorded unsigned; use the ordinary path")
             return answer_text(store, text, viewer=viewer, channel="cockpit", store_id=store_id, view_id=view_id,
                                deadline=deadline)
         raise ValueError("this cockpit's questions are answered on their own cards, not by band shorthand; nothing was recorded")
@@ -1670,7 +1708,9 @@ def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: 
     plan, view, questions, extras = _plan_on(store, view, text)
     if not plan.matched or plan.rest.strip():
         raise ValueError(plan.hint or "the whole text must be band answers, e.g. `1a, 2: rec`; nothing was recorded")
-    if not signs_info and not any(getattr(questions.get(sh.n), "link", None) is not None for sh in plan.sheets):
+    if not signs_info and not any(_linked_pick(questions.get(sh.n), sh.pick) for sh in plan.sheets):
+        if not unsigned:
+            raise DeskLineUnsigned("this line is recorded unsigned; use the ordinary path")
         return answer_text(store, text, viewer=viewer, channel="cockpit", store_id=store_id, view_id=view_id,
                            deadline=deadline)             # nothing on the line is signed: the ordinary write
     inner = _desk_typed_signer(store, text, surface=surface, origin=origin, view_id=view_id,
@@ -1819,16 +1859,62 @@ def _ruling_entry(q: Question, letter: str, key: Any, queue: Any) -> tuple[Any, 
     return entry, link.request_id, version
 
 
-def _apply_carried(carried: Mapping[str, tuple[str, str, Any]], message: bytes, signature: str,
+class _Reconciled(NamedTuple):
+    """A desk answer's carried ruling that the queue ALREADY applied (:meth:`ConsentQueue.carried_ruling`): the new
+    signed message re-carries the same record so the answer can record, and nothing is written to the queue again."""
+    request_id: str
+    version: str
+
+
+def _desk_ruling(q: Question, letter: str, key: Any, queue: Any) -> tuple[Any, Any]:
+    """``(entry, carried)`` of a desk answer's linked pick: the ruling ALLOW the queue builds now
+    (:func:`_ruling_entry`; carried ``(request id, version, queue)``), or, when the queue would not build one because
+    the request is no longer undecided, the reconcile of a ruling ALREADY applied for this question (TERMSIGN L5b r1
+    R2: the ruling applied and the answer did not record). The reconcile holds only when the queue re-verifies now
+    that THIS question's linked request was allowed by a ruling carried in a signed answer whose entry for THIS
+    question held it, signed by ``key`` (this install's terminal key): the entry then re-carries that same record,
+    the touch still signs it, and the carried value is a :class:`_Reconciled` (no second queue write). Anything else
+    (another request, another queue, another item, another signer, a deny, a ruling made elsewhere) raises as the
+    first refusal did."""
+    from levain.cockpit.keys import fingerprint_of
+    from levain.consent import terminal_sign as ts
+
+    try:
+        entry, request_id, version = _ruling_entry(q, letter, key, queue)
+        return entry, (request_id, version, queue)
+    except Exception as first:
+        link = q.link
+        reader = getattr(queue, "carried_ruling", None)
+        if link is None or reader is None or queue.queue_id != link.queue_id or not _linked_pick(q, letter):
+            raise first
+        try:
+            got = reader(link.request_id, q.id)
+        except Exception:  # noqa: BLE001 - no reconcile: the first refusal stands
+            got = None
+        if got is None or got[1] != fingerprint_of(key.public_key):
+            raise first
+        version = subject_version(q)
+        entry = ts.Entry(q.id, version, q.what, "authority",
+                         answer=f"({letter}) {q.options[_LETTERS.index(letter)][1]}", ruling=got[0])
+        return entry, _Reconciled(link.request_id, version)
+
+
+def _apply_carried(carried: Mapping[str, Any], message: bytes, signature: str,
                    scope: Mapping[str, str], versions: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
     """Apply, through the queue and nowhere else, each ruling ALLOW ``carried`` in the signed ``message`` (terminal or
     desk format alike: the queue reads the format off the message). ``carried`` maps a question id to ``(request id,
-    row version, queue)``. Returns ``(ruled, refusals)``: the request each applied ruling was for, and why the
+    row version, queue)``, or to a :class:`_Reconciled` (the queue applied that ruling already: counted as ruled, and
+    nothing is written again). Returns ``(ruled, refusals)``: the request each applied ruling was for, and why the
     others were not (their items keep the signing sheet). An applied ruling's row version is added to ``versions``.
     Never raises."""
     ruled: dict[str, str] = {}
     refusals: dict[str, str] = {}
-    for qid, (request_id, version, queue) in carried.items():
+    for qid, value in carried.items():
+        if isinstance(value, _Reconciled):
+            ruled[qid] = value.request_id
+            versions[qid] = value.version
+            continue
+        request_id, version, queue = value
         try:
             queue.answer_terminal_ruling(request_id, message, signature, item=qid, row_version=version, scope=scope)
         except Exception as exc:  # noqa: BLE001 - not applied: the item keeps its sheet, and says why
@@ -1941,9 +2027,49 @@ def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mappin
 BADGE_BUDGET_S = 1.5          # the most a band render spends on history badges; a row not verified by then shows none
 _BADGE_CACHE_MAX = 256
 _badge_cache: "dict[tuple[str, str], str]" = {}     # (question id, :func:`_badge_digest`) -> verdict
-# the (question id, digest) pairs a worker is verifying now: a render that finds one starts no second verifier
-_badge_inflight: "set[tuple[str, str]]" = set()
+# the (question id, digest) pairs a worker is verifying now, each with its claim (a token and the monotonic time it
+# was taken): a render that finds a live claim starts no second verifier; a claim older than _BADGE_CLAIM_S is free
+_badge_inflight: "dict[tuple[str, str], tuple[object, float]]" = {}
+# ONE lock for the in-flight claims AND the verdict cache (lookup, eviction, insertion)
 _badge_inflight_lock = threading.Lock()
+# twice the slowest step one row can take (the CTK tool's 60 s bound, levain.cockpit.custody): a claim older than
+# this belongs to a worker that hung or died, and the row is verified afresh
+_BADGE_CLAIM_S = 120.0
+
+
+def _badge_cached(k: tuple[str, str]) -> str | None:
+    with _badge_inflight_lock:
+        return _badge_cache.get(k)
+
+
+def _badge_remember(k: tuple[str, str], verdict: str) -> None:
+    """Keep ``verdict`` for ``k``, evicting the oldest entries first, all under the badge lock: two workers never
+    evict the same key, and the cache never holds more than :data:`_BADGE_CACHE_MAX`."""
+    with _badge_inflight_lock:
+        if k not in _badge_cache:
+            while _badge_cache and len(_badge_cache) >= _BADGE_CACHE_MAX:
+                _badge_cache.pop(next(iter(_badge_cache)))
+        _badge_cache[k] = verdict
+
+
+def _badge_claim(k: tuple[str, str]) -> object | None:
+    """Claim ``k`` for one verifier: its token, or ``None`` while another live claim holds it."""
+    now = time.monotonic()
+    with _badge_inflight_lock:
+        held = _badge_inflight.get(k)
+        if held is not None and now - held[1] < _BADGE_CLAIM_S:
+            return None
+        token = object()
+        _badge_inflight[k] = (token, now)
+        return token
+
+
+def _badge_release(k: tuple[str, str], token: object) -> None:
+    """Free ``k`` if the claim is still ``token``'s (a claim that expired and was taken again stays its new owner's)."""
+    with _badge_inflight_lock:
+        held = _badge_inflight.get(k)
+        if held is not None and held[0] is token:
+            del _badge_inflight[k]
 
 
 def _badge_scope(store: Any, question_id: str) -> list[Any] | None:
@@ -1984,7 +2110,7 @@ def _installed_cockpit_port() -> int | None:
     for i, arg in enumerate(argv or ()):
         value = argv[i + 1] if arg == "--port" and i + 1 < len(argv) else (
             arg[len("--port="):] if arg.startswith("--port=") else None)
-        if value is not None and value.isdigit() and 0 < int(value) < 65536:
+        if value is not None and value.isascii() and value.isdigit() and 0 < int(value) < 65536:
             return int(value)
     return None
 
@@ -2043,82 +2169,87 @@ def answer_badge(store: Any, question_id: str, *, key_dir: Path | None = None,
 
 
 def _origins(origins: Collection[str] | None) -> frozenset[str]:
-    return _cockpit_origins() if origins is None else frozenset(o for o in origins if isinstance(o, str))
+    """The reader's accepted origins: the default when ``None``; a single ``str`` is ONE origin (never its letters)."""
+    if origins is None:
+        return _cockpit_origins()
+    if isinstance(origins, str):
+        return frozenset((origins,))
+    return frozenset(o for o in origins if isinstance(o, str))
 
 
 def answer_badges(store: Any, question_ids: Sequence[str], *, deadline: float | None = None,
                   key_dir: Path | None = None, ctk: Callable[[str], tuple[bool | None, str]] | None = None,
                   origins: Collection[str] | None = None) -> dict[str, str]:
     """:func:`answer_badge` for several answered items within ONE bound: ``deadline`` (``time.monotonic()``; default
-    now + :data:`BADGE_BUDGET_S`, never later than that). One key lookup and one CTK check serve every row; the
-    verifying runs on a worker thread, and a row not verified by the deadline is left out (no badge), so a slow
-    ssh-keygen or sc_auth never holds the caller. A verdict reached later is kept for the next render; a signature a
-    worker of an earlier render is still verifying gets no second verifier (that row shows no badge this time). Holds
-    no store transaction while it verifies (each read is its own). Never raises."""
+    now + :data:`BADGE_BUDGET_S`, never later than that). EVERYTHING that can be slow runs on one worker thread: the
+    key lookup, the reader's origins, each row's stored signature, scope read and digest, and the verifying (one key
+    lookup and one CTK check serve every row). The caller only starts it and waits until the deadline, so a slow key
+    directory, store, ssh-keygen or sc_auth never holds it; a row with no verdict (cached or verified) by then is left
+    out (no badge). A verdict reached later is kept for the next render; a signature a worker of an earlier render is
+    still verifying gets no second verifier (that row shows no badge this time) unless that claim is older than
+    :data:`_BADGE_CLAIM_S`. Every claim a worker takes is freed when it ends, however it ends. Holds no store
+    transaction while it verifies (each read is its own). Never raises."""
     ids = [q for q in dict.fromkeys(question_ids) if isinstance(q, str)]
     if not ids:
         return {}
     cap = time.monotonic() + BADGE_BUDGET_S
     until = cap if deadline is None else min(deadline, cap)
-    got: dict[str, str] = {}
-    try:
-        from levain.consent import terminal_sign as ts
-
-        key = ts.find_key(key_dir)
-        if key is None:
-            return {}
-        allowed = _origins(origins)
-    except Exception:  # noqa: BLE001 - a display aid never breaks the band
-        return {}
-    # the cheap part here (stored signature, digest, cache); a signature another render is verifying is skipped
-    claimed: list[tuple[str, tuple[str, str]]] = []
-    for qid in ids:
-        try:
-            sign = answer_sign_of(store, qid)
-            if not sign or sign.get("sign_state") != "signed" or not sign.get("message") or not sign.get("sig"):
-                continue
-            scope = _badge_scope(store, qid)
-            if scope is None:
-                continue
-            k = (qid, _badge_digest(key.public_key, sign["message"], sign["sig"], allowed, scope))
-        except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
-            continue
-        cached = _badge_cache.get(k)
-        if cached is not None:
-            if cached:
-                got[qid] = cached
-            continue
-        with _badge_inflight_lock:
-            if k in _badge_inflight:
-                continue
-            _badge_inflight.add(k)
-        claimed.append((qid, k))
-    if not claimed:
-        return got
     found = _Verdicts()
 
     def work() -> None:
-        shared = _shared_ctk(ctk)
-        for qid, k in claimed:
-            try:
-                verdict = _badge_of(store, qid, key, shared, allowed)
-            except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
-                verdict = ""
-            try:
-                found.put(qid, verdict)
-            finally:
-                with _badge_inflight_lock:
-                    _badge_inflight.discard(k)
+        claimed: list[tuple[str, tuple[str, str], object]] = []
+        try:
+            from levain.consent import terminal_sign as ts
+
+            key = ts.find_key(key_dir)
+            if key is None:
+                return
+            allowed = _origins(origins)
+            # the cheap pass (stored signature, scope, digest, cache); a signature another worker verifies is skipped
+            for qid in ids:
+                try:
+                    sign = answer_sign_of(store, qid)
+                    if not sign or sign.get("sign_state") != "signed" or not sign.get("message") \
+                            or not sign.get("sig"):
+                        continue
+                    scope = _badge_scope(store, qid)
+                    if scope is None:
+                        continue
+                    k = (qid, _badge_digest(key.public_key, sign["message"], sign["sig"], allowed, scope))
+                except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
+                    continue
+                cached = _badge_cached(k)
+                if cached is not None:
+                    found.put(qid, cached)
+                    continue
+                token = _badge_claim(k)
+                if token is not None:
+                    claimed.append((qid, k, token))
+            if not claimed:
+                return
+            shared = _shared_ctk(ctk)
+            for qid, k, token in claimed:
+                try:
+                    verdict = _badge_of(store, qid, key, shared, allowed)
+                except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
+                    verdict = ""
+                try:
+                    found.put(qid, verdict)
+                finally:
+                    _badge_release(k, token)
+        except Exception:  # noqa: BLE001 - a display aid never breaks the band, nor prints from its thread
+            pass
+        finally:
+            for _qid, k, token in claimed:      # whatever ended the worker: no claim outlives it
+                _badge_release(k, token)
 
     t = threading.Thread(target=work, name="levain-answer-badges", daemon=True)
     try:
         t.start()
-    except RuntimeError:
-        with _badge_inflight_lock:
-            _badge_inflight.difference_update(k for _, k in claimed)
-        return got
+    except RuntimeError:            # no thread: no claim was taken, no badge this render
+        return {}
     t.join(max(0.0, until - time.monotonic()))
-    got.update((qid, v) for qid, v in found.snapshot() if v)
+    got = dict(found.snapshot())
     return {qid: got[qid] for qid in ids if got.get(qid)}
 
 
@@ -2149,7 +2280,7 @@ def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple
     if scope is None:
         return ""
     digest = _badge_digest(key.public_key, message, sign["sig"], origins, scope)
-    cached = _badge_cache.get((question_id, digest))
+    cached = _badge_cached((question_id, digest))
     if cached is not None:
         return cached
     raw = message.encode("utf-8")
@@ -2161,7 +2292,7 @@ def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple
         if desk and parsed.gesture == "click":
             view = "item" if parsed.view == "item" else None
         else:
-            held = parsed.view.isdigit() and conn.execute(
+            held = parsed.view.isascii() and parsed.view.isdigit() and conn.execute(
                 "SELECT 1 FROM band_views WHERE seq = ? AND viewer = ?", (int(parsed.view), viewer)).fetchone()
             view = parsed.view if held else None
     sid = _store_id_of(store)
@@ -2190,9 +2321,7 @@ def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple
     else:
         verdict = f"signature failed ({got.reason})" if got.state == "failed" else ""
     if got.reason != "verifier-unavailable" and got.reason != "classifier-error":   # a passing failure is not kept
-        if len(_badge_cache) >= _BADGE_CACHE_MAX:
-            _badge_cache.pop(next(iter(_badge_cache)))
-        _badge_cache[(question_id, digest)] = verdict
+        _badge_remember((question_id, digest), verdict)
     return verdict
 
 
