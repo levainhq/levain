@@ -106,6 +106,12 @@ def scan_source(src, path="<scratch>"):
                 for st in ast.walk(child):
                     if isinstance(st, ast.Assign) and _mentions_clone(st.value, local):
                         local |= {t.id for t in st.targets if isinstance(t, ast.Name)}
+                    elif (isinstance(st, ast.AnnAssign) and st.value is not None
+                          and isinstance(st.target, ast.Name) and _mentions_clone(st.value, local)):
+                        local.add(st.target.id)
+                    elif (isinstance(st, ast.NamedExpr) and isinstance(st.target, ast.Name)
+                          and _mentions_clone(st.value, local)):
+                        local.add(st.target.id)
                 visit(child, local)
                 continue
             if isinstance(child, ast.Call) and _invokes_git(child):
@@ -143,11 +149,13 @@ def test_the_scanner_can_fail(tmp_path):
         "def c(h, s):\n    r = session_repo(h, s)\n    subprocess.run(['git', f'--git-dir={r}/.git', 'log'])\n"
         "def d(h, s):\n    _git(session_repo(h, s), 'diff')\n"
         "def e(slot_repo):\n    subprocess.run(['git', f'--work-tree={slot_repo}', 'status'])\n"
-        "def clean(operator_repo):\n    subprocess.run(['git', '-C', operator_repo, 'status'])\n")
+        "def clean(operator_repo):\n    subprocess.run(['git', '-C', operator_repo, 'status'])\n"
+        "def f(h, s):\n    repo: str = session_repo(h, s)\n    _git(repo, 'status')\n"
+        "def g(h, s):\n    if (r := session_repo(h, s)):\n        _git(r, 'status')\n")
     seen, bad = scan_source(scratch.read_text(), "scratch_op.py")
-    assert seen == 6
-    assert len(bad) == 5, bad
-    assert sorted(int(b.rsplit(":", 1)[1]) for b in bad) == [4, 6, 9, 11, 13]   # the clean call (line 15) is not flagged
+    assert seen == 8
+    assert len(bad) == 7, bad
+    assert sorted(int(b.rsplit(":", 1)[1]) for b in bad) == [4, 6, 9, 11, 13, 18, 21]   # the clean call (line 15) is not flagged
     # the limit, stated: an argv built elsewhere and passed as a plain variable is invisible
     _, hidden = scan_source("import subprocess\ndef f(argv):\n    subprocess.run(argv)\n")
     assert hidden == []
