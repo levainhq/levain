@@ -2192,11 +2192,17 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
                                 f"If {show(str(install or '?'))} is the install whose agents dispatch, reinstall the "
                                 "fence for it: `levain agents fence start --path <install>`; if not, run `levain "
                                 "doctor --path <that install>`.")]
-    for what, err in (("the agent store", val["store_error"]), ("the authority log", val["authority_error"])):
-        if err is not None:
-            return [CheckResult(name, False, f"running but cannot read {what} ({show(err, 120)}). Dispatch sessions "
-                                "are refused.", "Check that the fence service runs as you and names this install's "
-                                "store and cockpit root.")]
+    from levain.autonomic.db import DB_NAME as agent_db
+    from levain.cockpit.firejournal import DB_NAME as cockpit_db
+
+    gaps = [f"{what} {show(str(Path(base) / fname))} ({show(err, 120)})"
+            for what, base, fname, err in (("the agent store database", val["store"], agent_db, val["store_error"]),
+                                           ("the authority log", val["cockpit_root"], cockpit_db,
+                                            val["authority_error"])) if err is not None]
+    if gaps:
+        return [CheckResult(name, False, f"running on cockpit root {show(val['cockpit_root'])}, but cannot read "
+                            f"{' and '.join(gaps)}. Dispatch sessions are refused.", "Check that the fence service "
+                            "runs as you and names this install's store and cockpit root.")]
     return [CheckResult(name, True, f"running (store {show(val['store'])}, authority seq {val['seq']}). Dispatch "
                         "sessions are checked on every tool call.")]
 

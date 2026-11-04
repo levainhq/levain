@@ -79,14 +79,33 @@ def test_a_socket_of_the_wrong_shape_is_named(install, st):
     (("silent", "its answer was refused as frame-too-large"),
      "running but does not answer (its answer was refused as frame-too-large)"),
     (("answer", status(store_error="OperationalError: unable to open database file")),
-     "running but cannot read the agent store (OperationalError: unable to open database file). Dispatch sessions "
-     "are refused."),
+     "cannot read the agent store database /Users/x/.levain/autonomic/autonomic.db (OperationalError: unable to "
+     "open database file). Dispatch sessions are refused."),
     (("answer", status(seq=None, authority_error="no authority anchor")),
-     "running but cannot read the authority log (no authority anchor)"),
+     "cannot read the authority log /Users/x/entity/.levain/cockpit/"),
 ])
 def test_each_failure_says_dispatch_is_refused(install, answer, words):
     r = row(install, st=sock_stat(), ask=lambda p, u: answer)
     assert not r.ok and words in r.detail
+
+
+def test_a_missing_piece_names_the_cockpit_root_and_which_piece(install):
+    from levain.autonomic.db import DB_NAME as agent_db
+    from levain.cockpit.firejournal import DB_NAME as cockpit_db
+
+    store_p, log_p = f"{STORE / agent_db}", f"{COCKPIT / cockpit_db}"
+    only_store = status(store_error="OperationalError: unable to open database file")
+    only_log = status(seq=None, authority_error="no authority anchor")
+    both = status(seq=None, store_error="OperationalError: unable to open database file",
+                  authority_error="no authority anchor")
+    for answer, present, absent in ((only_store, log_p, store_p), (only_log, store_p, log_p),
+                                    (both, None, None)):
+        r = row(install, st=sock_stat(), ask=lambda p, u, a=answer: ("answer", a))
+        assert not r.ok and f"cockpit root {COCKPIT}" in r.detail
+        if absent is not None:
+            assert absent in r.detail and present not in r.detail
+        else:
+            assert store_p in r.detail and log_p in r.detail
 
 
 def test_running_and_reading(install):
