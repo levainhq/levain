@@ -177,6 +177,8 @@ def _add_p2_parsers(verbs: argparse._SubParsersAction) -> None:
     show = verbs.add_parser("show", help="Print an agent: axes, version, spec_hash, spec.", allow_abbrev=False)
     show.add_argument("agent", help="An agent name (not retired) or agent_id.")
     show.add_argument("--version", type=_version_arg, default=None, help="A version (default: the current one).")
+    show.add_argument("--json", action="store_true",
+                      help="One JSON object: the agent, its occurrences, and the episodes stored under its agent id.")
     show.set_defaults(func=run_show)
     for verb, fn, text in (("pause", run_pause, "Pause an agent and its feeder group (only resume clears it)."),
                            ("resume", run_resume, "Resume an agent and its feeder group (the only clear of a pause)."),
@@ -341,6 +343,8 @@ def run_show(args: argparse.Namespace) -> int:
         return _fail("show", str(exc))
     except (sqlite3.Error, StoreFormatError) as exc:
         return _fail("show", f"the store refused it: {exc}")
+    if args.json:
+        return _show_json(store, a)
     try:
         role, why = role_by_hash(store, a["spec"]["role"]["role_hash"]), "role not resolvable"
     except RoleError as exc:
@@ -356,6 +360,47 @@ def run_show(args: argparse.Namespace) -> int:
         print(head + json.dumps(a["spec"], indent=2, sort_keys=True, ensure_ascii=False))
     except UnicodeEncodeError as exc:
         return _fail("show", f"stdout cannot encode the spec ({exc.encoding}); set PYTHONIOENCODING=utf-8")
+    return 0
+
+
+def _show_json(store, a: dict) -> int:
+    """``show --json``: the agent, its occurrences (newest first), and the episodes stored under its agent id in the
+    install's episodic store (``session_install.json``). An install with no episodic store says why, never an empty
+    list that reads as "no episodes"."""
+    from datetime import datetime, timezone
+    from levain.agents import recall as _recall, session_wire
+    try:
+        with store.read() as conn:
+            occ = [dict(zip(("occurrence_id", "state", "reason", "kind", "launch_epoch", "launched_at", "ended_at"), r))
+                   for r in conn.execute("SELECT occurrence_id, state, reason, kind, launch_epoch, launched_at,"
+                                         " ended_at FROM agent_occurrences WHERE agent_id = ?"
+                                         " ORDER BY admitted_at DESC, occurrence_id", (a["agent_id"],))]
+    except sqlite3.Error as exc:
+        return _fail("show", f"the store refused it: {exc}")
+    episodes, note = None, None
+    try:
+        path = session_wire.read_install(store.directory).episodic_path
+    except session_wire.InstallRefused as exc:
+        path, note = None, f"no episodic store: {exc}"
+    if path is None and note is None:
+        note = "no episodic store: the install names no episodic_path"
+    if path is not None:
+        try:
+            found = _recall.recall_agent_episodes_at(path, a["agent_id"], now=datetime.now(timezone.utc))
+            episodes = [{"episode_id": getattr(e, "id", None), "type": str(getattr(getattr(e, "type", None), "value",
+                                                                                    getattr(e, "type", None))),
+                         "source": getattr(e, "source", None), "timestamp": getattr(e, "timestamp", None),
+                         "content": getattr(e, "content", None), "metadata": _recall._metadata_of(e)}
+                        for e in found.episodes]
+        except Exception as exc:  # noqa: BLE001 - an unreadable memory is said, not shown as empty
+            note = f"episodes unreadable ({type(exc).__name__})"
+    doc = {"agent": {k: a[k] for k in ("name", "agent_id", "version", "versions", "spec_hash", "registration",
+                                       "operation", "failure_streak") if k in a},
+           "spec": a["spec"], "occurrences": occ, "episodes": episodes, "episodes_note": note}
+    try:
+        print(json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False, default=str))
+    except UnicodeEncodeError as exc:
+        return _fail("show", f"stdout cannot encode the record ({exc.encoding}); set PYTHONIOENCODING=utf-8")
     return 0
 
 

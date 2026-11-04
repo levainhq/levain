@@ -25,6 +25,7 @@ malformed one raises (the occurrence stays ``launched`` for the reaper and lapse
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from collections.abc import Callable, Mapping
@@ -37,8 +38,10 @@ from levain.agents import session as _session
 from levain.agents.store import AgentStore
 
 __all__ = ["INSTALL_FILE", "INSTALL_SCHEMA", "InstallRefused", "SessionInstall", "LAUNCHERS", "register_launcher",
-           "read_install", "write_install", "resolve_launcher", "fire_factory"]
+           "read_install", "write_install", "resolve_launcher", "fire_factory", "SESSION_WIN_CHECK",
+           "session_win_check", "register_session_win_check"]
 
+_log = logging.getLogger("levain.agents.session_wire")
 INSTALL_FILE = "session_install.json"
 INSTALL_SCHEMA = 1
 
@@ -155,6 +158,51 @@ def _pinned_role(store: AgentStore, role_hash: str | None) -> Mapping[str, Any]:
     return found
 
 
+# The win check a session agent's spec names (``win: {kind: "verifier", check: "session_completed"}``). A session
+# run has no output of its own to inspect here (the child's work is the role's business); what the supervisor can
+# prove is that the child was started at all: the effect recorded a session key. A ``done`` with no key is a run
+# that never spawned, which is not a win. Registered by :func:`fire_factory` in the fire's own process.
+SESSION_WIN_CHECK = "session_completed"
+
+
+def session_win_check(ctx: Any) -> str | None:
+    """None when the session was started (the occurrence carries the key its effect recorded), else a reason."""
+    with ctx.store.read() as conn:
+        row = conn.execute("SELECT session_key FROM agent_occurrences WHERE occurrence_id = ?",
+                           (ctx.occurrence_id,)).fetchone()
+    if row is None or row[0] is None:
+        return "session_never_started"
+    return None
+
+
+def register_session_win_check() -> None:
+    """Register :func:`session_win_check` under :data:`SESSION_WIN_CHECK` (idempotent: the same function twice is fine)."""
+    from levain.agents import gauges
+    gauges.register_check(SESSION_WIN_CHECK, session_win_check)
+
+
+def _episode_hooks(store: AgentStore, install: SessionInstall, agent_id: str, role_hash: str | None):
+    """``Hooks(on_end=...)`` that appends one ``outcome`` episode per ended run to the install's episodic store, stamped
+    with the agent id (so P4's recall finds it), the occurrence as the run and the pinned role. Never raises: the end
+    is already committed, and a lost episode is logged by the firing."""
+    from levain.agents import supervise
+    from levain.firing.anneal import AnnealFiring
+    from levain.firing.contract import CaptureRequest
+
+    def on_end(end: Any) -> None:
+        try:
+            firing = AnnealFiring(episodic_path=install.episodic_path,
+                                  identity={"agent": agent_id, "run": end.occurrence_id,
+                                            **({"role": role_hash} if role_hash else {})})
+            firing.capture(CaptureRequest(
+                content=f"session run {end.occurrence_id} of agent {agent_id} ended {end.state}: {end.reason}",
+                episode_type="outcome", source="levain-agents", session_id=end.occurrence_id))
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("session episode for %s was not written: %s", end.occurrence_id, type(exc).__name__)
+
+    return supervise.Hooks(on_end=on_end)
+
+
 def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
                  clock: Callable[[], datetime] | None = None) -> dict[str, Any]:
     """The keyword arguments of :func:`levain.agents.session.run_session` for a session occurrence (see the module
@@ -183,7 +231,11 @@ def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
         # (``run_session`` ends any other ``not_held`` before it settles anything); ``start`` is a no-op on a run
         # already admitted, so a replay keeps its original admission.
         journal.start(row[1], binding_id=row[2])
-    sup = supervise.Supervisor(store, authority=AgentAuthority(install.cockpit_root), clock=clock, journal=journal)
+    register_session_win_check()
+    pinned = _session._signed_by_spec(store, occurrence_id)[1]
+    hooks = None if install.episodic_path is None else _episode_hooks(store, install, row[0], pinned)
+    sup = supervise.Supervisor(store, authority=AgentAuthority(install.cockpit_root), clock=clock, journal=journal,
+                               hooks=hooks)
     extra = {} if clock is None else {"clock": clock}   # a test seam: production passes none and both read real time
     return {**extra, "sup": sup, "role": role, "values": dict(install.values), "recall": recall, "launcher": launcher,
             "exposure": None if reserved is None else reserved.exposure,
