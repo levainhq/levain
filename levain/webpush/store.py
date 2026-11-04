@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import re
 import sqlite3
@@ -109,6 +110,21 @@ def live_rows(conn: sqlite3.Connection, *, first: bool = False, device: str | No
     return out
 
 
+DATA_MAX = 8 * 1024    # bytes of a ping's stored structured fields; the center's reader takes no more
+
+
+def data_text(data: object) -> str | None:
+    """``data`` as the JSON text a ping row keeps, or None when there is none or it is not a JSON object within
+    :data:`DATA_MAX` bytes: a sender's extra fields are dropped before its ping is."""
+    if not isinstance(data, dict):
+        return None
+    try:
+        text = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return text if len(text.encode("utf-8", "surrogatepass")) <= DATA_MAX else None
+
+
 def now_stamp() -> str:
     return datetime.now(timezone.utc).strftime(STAMP)
 
@@ -135,7 +151,7 @@ _SCHEMA: tuple[str, ...] = (
     "endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created TEXT NOT NULL, "
     "last_status INTEGER, last_at TEXT, retired_at TEXT, subscribed INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS pings (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, "
-    "ref TEXT, title TEXT NOT NULL, body TEXT NOT NULL, command INTEGER)",
+    "ref TEXT, title TEXT NOT NULL, body TEXT NOT NULL, command INTEGER, data TEXT)",
     "CREATE TABLE IF NOT EXISTS deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
     "REFERENCES pings(id), subscription_id INTEGER NOT NULL REFERENCES subscriptions(id), at TEXT NOT NULL, "
     "status INTEGER NOT NULL)",
@@ -231,7 +247,7 @@ class PushStore:
         if row is None or row[0] != STORE_FORMAT:
             return False
         for table, column in (("subscriptions", "subscribed"), ("subscriptions", "journal"), ("pings", "command"),
-                              ("held", "claimed_at"), ("notices", "origin")):
+                              ("pings", "data"), ("held", "claimed_at"), ("notices", "origin")):
             if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
                 return False
         if conn.execute("SELECT COUNT(*) FROM meta WHERE key IN ('center_floor_ping', 'center_floor_notice')"
@@ -262,6 +278,10 @@ class PushStore:
             # NULL none was set (and every ping recorded before the column existed)
             if "command" not in {r[1] for r in conn.execute("PRAGMA table_info(pings)")}:
                 conn.execute("ALTER TABLE pings ADD COLUMN command INTEGER")
+            # ``data``: a sender's structured fields beside the body, as JSON text (flow's needs fields, read by
+            # levain.webpush.center.needs_data); NULL when none came (and on every ping recorded before the column existed)
+            if "data" not in {r[1] for r in conn.execute("PRAGMA table_info(pings)")}:
+                conn.execute("ALTER TABLE pings ADD COLUMN data TEXT")
             if "claimed_at" not in {r[1] for r in conn.execute("PRAGMA table_info(held)")}:
                 conn.execute("ALTER TABLE held ADD COLUMN claimed_at TEXT")
             if "origin" not in {r[1] for r in conn.execute("PRAGMA table_info(notices)")}:
@@ -330,19 +350,21 @@ class PushStore:
 
     # --- the record ----------------------------------------------------------------------------------
     def add_ping(self, kind: str, ref: str | None, title: str, body: str, command: bool | None = None, *,
-                 hold: tuple[str, str] | None = None) -> int:
+                 hold: tuple[str, str] | None = None, data: dict[str, Any] | None = None) -> int:
         """Record one ping; ``command`` is whether the notify command started (None: none was set). ``hold`` is
         ``(url, reason)``: the ping is also queued for the phone in the same transaction, ``reason`` being the word that
-        muted it (``quiet``, ``sleep``) or ``active`` (the desk was in use)."""
+        muted it (``quiet``, ``sleep``) or ``active`` (the desk was in use). ``data`` is the sender's structured fields,
+        kept beside the body for the notification center and never pushed; one that is not a JSON object of at most
+        :data:`DATA_MAX` bytes is dropped, never the ping."""
         with self.write() as c:
-            return self._insert_ping(c, kind, ref, title, body, command, hold)
+            return self._insert_ping(c, kind, ref, title, body, command, hold, data)
 
     @staticmethod
     def _insert_ping(c: sqlite3.Connection, kind: str, ref: str | None, title: str, body: str, command: bool | None,
-                     hold: tuple[str, str] | None) -> int:
-        ping_id = int(c.execute("INSERT INTO pings (at, kind, ref, title, body, command) VALUES (?,?,?,?,?,?)",
+                     hold: tuple[str, str] | None, data: dict[str, Any] | None = None) -> int:
+        ping_id = int(c.execute("INSERT INTO pings (at, kind, ref, title, body, command, data) VALUES (?,?,?,?,?,?,?)",
                                 (now_stamp(), kind, ref, title, body,
-                                 None if command is None else int(bool(command)))).lastrowid)
+                                 None if command is None else int(bool(command)), data_text(data))).lastrowid)
         if hold is not None:
             c.execute("INSERT INTO held (ping_id, url, reason, held_at) VALUES (?,?,?,?)",
                       (ping_id, hold[0], hold[1], now_stamp()))
