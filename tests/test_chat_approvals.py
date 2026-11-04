@@ -894,3 +894,9 @@ def test_a_request_whose_tool_input_was_truncated_is_denied_on_a_live_launch(cs,
     assert events(cs, claude["launch"], got.row.vendor_request_key) == ["decision_observed", "answer_attempted"]
     whole = host(cs, claude["launch"], ctx(tmp_path), tool_use_id="toolu_2")      # an untruncated one still routes
     assert whole.disposition == "routed"
+
+
+def test_an_input_that_only_carries_the_marker_key_is_not_read_as_truncated(cs, claude, tmp_path):
+    # L3_rmd2_r1 complement LOW 4: the marker is the driver's whole shape, not one key a model can put in an input
+    got = host(cs, claude["launch"], ctx(tmp_path), tool_input={"command": "ls", "levain_truncated": True})
+    assert got.disposition == "routed"

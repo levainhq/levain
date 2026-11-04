@@ -80,7 +80,8 @@ __all__ = [
     "EVENT_KINDS", "INTERRUPT_DEADLINE", "MODES", "OUTBOX_STATES", "PROBE_GAP", "PROBE_TRIES", "READ_DEADLINE",
     "RECIPIENTS", "CHECK_KINDS", "CHECK_SOURCES", "SEND_FAULT_POINTS", "ChatEvent", "ChatMessage", "ChatService",
     "ChatStore", "Composer", "EventConflict", "Liveness", "MessageConflict", "MessageThread", "OutboxRefused",
-    "ROOM_PERMISSION_MODE", "RoomRotated", "SendReceipt", "TimelineRow", "TurnLease", "TurnRefused", "TurnView", "Verdict", "body_sha256", "canary_verdict_id",
+    "ROOM_PERMISSION_MODE", "RoomRotated", "SendReceipt", "TimelineRow", "TurnLease", "TurnRefused", "TurnView",
+    "Verdict", "body_sha256", "canary_verdict_id",
     "composer_state", "liveness", "outbox_state", "outbox_step", "record_check", "record_cursor", "record_event",
     "record_message", "timeline",
 ]
@@ -489,6 +490,9 @@ def record_message(conn: sqlite3.Connection, now: str, *, thread_id: str, recipi
     sha, norm, attached = body_sha256(body), body_sha256(normalized), canonical(list(shown))
     stored = _message(conn, "outbox_id", outbox_id)
     if stored is not None:
+        if (stored.author_surface, stored.client_id) != (author_surface, client_id):
+            # another client's id names nothing of its message (L3_rmd2_r1 deepseek MED 3)
+            raise MessageConflict(f"outbox_id {outbox_id} is already stored by another client; nothing was written")
         said = (stored.thread_id, stored.launch_id, stored.recipient, stored.author_kind, stored.author_surface,
                 stored.client_id, stored.mode, stored.expected_turn_id, stored.body_sha256,
                 canonical(list(stored.attachments)), stored.draft_ref)
@@ -1233,6 +1237,15 @@ def _room_target(conn: sqlite3.Connection, room_thread: object) -> str:
     return launch_id
 
 
+def _room_thread_of(conn: sqlite3.Connection, launch_id: str) -> str:
+    """The one thread a room launch holds (its room thread, as :func:`lease.open_room_launch` wrote it)."""
+    rows = conn.execute("SELECT j.value FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? AND "
+                        "l.role = 'room'", (launch_id,)).fetchall()
+    if len(rows) != 1:
+        raise CoordError(f"room launch {launch_id} does not hold exactly one room thread; nothing was written")
+    return rows[0][0]
+
+
 def _is_mode_line(e: Any) -> bool:
     """An event a driver gives a line that reports a permission mode (``error:mode:<id>``, its body the mode)."""
     return getattr(e, "kind", None) == "error" and isinstance(getattr(e, "vendor_id", None), str) \
@@ -1247,13 +1260,16 @@ def _room_mode_trip(permission_mode: Any) -> Trip | None:
                                 f"{ROOM_PERMISSION_MODE!r}")
 
 
-def _read_meta(session: Any) -> SessionMeta | None:
-    """A session's meta, bounded by :data:`READ_DEADLINE`, or None when it cannot be read as a :class:`SessionMeta`."""
+def _read_meta(session: Any) -> tuple[SessionMeta | None, bool]:
+    """``(meta, overdue)``: a session's meta, bounded by :data:`READ_DEADLINE`, or None when it cannot be read as a
+    :class:`SessionMeta`; ``overdue`` when the call had not returned by the deadline (it is still in flight)."""
     try:
         got = _bounded(session.meta, READ_DEADLINE)
-    except Exception:  # noqa: BLE001 - _Overdue included: an unread meta is None, never a guess
-        return None
-    return got if type(got) is SessionMeta else None
+    except _Overdue:
+        return None, True
+    except Exception:  # noqa: BLE001 - an unread meta is None, never a guess
+        return None, False
+    return (got if type(got) is SessionMeta else None), False
 
 
 def _anchor(conn: sqlite3.Connection, launch_id: str) -> str | None:
@@ -1575,7 +1591,9 @@ class ChatService:
     refuses new pins (``_detaching``) and waits for the pinned interrupts to return before it closes the session, so
     an interrupt never reaches a session that was closed or replaced under it. Both waits are bounded: an interrupt
     that has not answered within :data:`INTERRUPT_DEADLINE` is ``ambiguous`` to its caller, and detach waits at most
-    that long before it closes the session under it (closing is the stop that is always available, §4.3).
+    that long before it closes the session under it (closing is the stop that is always available, §4.3). A pin and
+    a send's driver call never overlap on one session: :meth:`_attempt_and_call` decides which goes first under
+    ``_guard``.
 
     A driver call that has not returned by its deadline (a read, an evidence read, an interrupt) WEDGES the session:
     the call is left in flight and nothing else is called on that session until it is detached (a new attach starts
@@ -1616,6 +1634,7 @@ class ChatService:
         self._sessions: dict[str, Any] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._pins: dict[int, int] = {}               # id(session) -> interrupts in flight on it
+        self._sending: dict[int, int] = {}  # id(session) -> sends past the arbiter until session.send returns
         self._detaching: set[str] = set()             # launches whose session takes no new pin
         self._wedged: set[str] = set()                # launches whose session left a read unanswered: used no more
         self._guard = threading.Lock()                 # held only to read or change the dicts and the sets
@@ -1650,16 +1669,21 @@ class ChatService:
         """The launch's one session. Refused while another is attached: :meth:`detach` it first. The refusal does
         not wait for a send in flight (a session in use is an attached one). The session's meta is read here, once,
         under the launch's mutex and bounded by :data:`READ_DEADLINE`, and kept for :meth:`session_meta` (None when it
-        could not be read): no reader calls the driver for it."""
+        could not be read): no reader calls the driver for it. A meta that had not answered by the deadline attaches
+        the session WEDGED, as any overdue driver call does (L3_rmd2_r1 codex MED 3): its call is still in flight, so
+        nothing else is called on it until it is detached. The ``permission_mode`` in the snapshot is as of attach."""
         with self._guard:
             self._refuse_second(launch_id)
         with self._launch_lock(launch_id):
-            meta = _read_meta(session)
+            meta, overdue = _read_meta(session)
             with self._guard:
                 self._refuse_second(launch_id)
                 self._sessions[launch_id] = session
                 self._metas[launch_id] = meta
-                self._wedged.discard(launch_id)       # a wedge belongs to the session that left a call unanswered
+                if overdue:
+                    self._wedged.add(launch_id)
+                else:
+                    self._wedged.discard(launch_id)   # a wedge belongs to the session that left a call unanswered
                 self._windows.pop(launch_id, None)    # so does a tripwire window: a new child is watched from zero
                 self._handled.pop(launch_id, None)
 
@@ -1728,14 +1752,22 @@ class ChatService:
         """One message to a running worker or room launch, sent at most once. ``author_surface:client_id`` is the
         AUTHENTICATED owner (the caller derives it from the client's session, never from a request body); an operator's
         send to a worker is fenced under ``expected_epoch``; a room's is queue-only and names no epoch (C3). A resend
-        of a stored ``outbox_id`` sends nothing again. A surface talking to the room calls :meth:`send_room`."""
+        of a stored ``outbox_id`` sends nothing again. A surface talking to the room calls :meth:`send_room`; a new
+        line sent here to a room launch is held to the same fence (L3_rmd2_r1 codex HIGH 1): its write checks that the
+        launch is still the open room's running launch, else :class:`RoomRotated` or CoordError, nothing written."""
         if not isinstance(launch_id, str) or _LAUNCH_ID.fullmatch(launch_id) is None:
-            raise CoordError(f"no worker launch {str(launch_id)[:40]!r}")
+            raise CoordError(f"no worker or room launch {str(launch_id)[:40]!r}")
         # a launch that does not exist gets no lock: the registry holds attached and real launches only
-        self._chat._read(lambda conn: self._need_chat_launch(conn, launch_id))
-        return self._send(launch_id, None, author_kind=author_kind, author_surface=author_surface,
-                          client_id=client_id, outbox_id=outbox_id, body=body, mode=mode,
-                          expected_turn_id=expected_turn_id, expected_epoch=expected_epoch, attachments=attachments)
+        role = self._chat._read(lambda conn: self._need_chat_launch(conn, launch_id))
+        room_thread = self._chat._read(lambda conn: _room_thread_of(conn, launch_id)) if role == "room" else None
+        try:
+            return self._send(launch_id, room_thread, author_kind=author_kind, author_surface=author_surface,
+                              client_id=client_id, outbox_id=outbox_id, body=body, mode=mode,
+                              expected_turn_id=expected_turn_id, expected_epoch=expected_epoch,
+                              attachments=attachments)
+        except _RoomMoved:
+            raise CoordError(f"launch {launch_id} is not its room's running launch; nothing was written; a line to the "
+                             "room goes through send_room") from None
 
     def send_room(self, room_thread: str, *, author_surface: str, client_id: str, outbox_id: str, body: str,
                   attachments: Sequence[dict[str, Any]] = ()) -> SendReceipt:
@@ -1744,13 +1776,22 @@ class ChatService:
         after a restart or a rotation sends nothing again. Otherwise the room thread must be the open room
         (:class:`RoomRotated`, nothing written) and its running room launch is resolved INSIDE the transaction that
         writes ``pending``: a launch replaced between the read and the write is re-resolved, and the row never names a
-        launch that was not the room's running one when it committed."""
-        stored = self._chat._read(lambda conn: _message(conn, "outbox_id", outbox_id)) \
-            if isinstance(outbox_id, str) else None
+        launch that was not the room's running one when it committed. A stored ``outbox_id`` replays only a line this
+        same client sent to a ROOM launch on this room thread; any other stored message is a conflict (L3_rmd2_r1:
+        codex MED 4, a worker's line on the same thread; deepseek MED 3, another client's id)."""
+        def stored_read(conn: sqlite3.Connection) -> tuple[ChatMessage | None, str | None]:
+            m = _message(conn, "outbox_id", outbox_id)
+            role = None if m is None or m.launch_id is None else _launch_state(conn, m.launch_id)[0]
+            return m, role
+
+        stored, stored_role = self._chat._read(stored_read) if isinstance(outbox_id, str) else (None, None)
         kw = dict(author_kind="operator", author_surface=author_surface, client_id=client_id, outbox_id=outbox_id,
                   body=body, mode="queue", expected_turn_id=None, expected_epoch=None, attachments=attachments)
         if stored is not None:
-            if stored.launch_id is None or stored.thread_id != room_thread:
+            if (stored.author_surface, stored.client_id) != (author_surface, client_id):
+                raise MessageConflict(f"outbox_id {outbox_id} is already stored by another client; nothing was "
+                                      "written")
+            if stored.launch_id is None or stored_role != "room" or stored.thread_id != room_thread:
                 raise MessageConflict(f"outbox_id {outbox_id} is already stored for a different message "
                                       f"({stored.message_id}); nothing was written")
             return self._send(stored.launch_id, None, **kw)
@@ -1782,15 +1823,26 @@ class ChatService:
                 caps = _caps_snapshot(session.capabilities())
                 normalized = _plain_norm(session.normalize(body)) if isinstance(body, str) else body
             with self._chat._write() as (conn, now):
-                self._need_chat_launch(conn, launch_id)
-                if room_thread is not None and _room_target(conn, room_thread) != launch_id:
-                    raise _RoomMoved(launch_id)
-                row = conn.execute("SELECT j.value FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? "
-                                   "LIMIT 1", (launch_id,)).fetchone()
-                if row is None:
-                    raise CoordError(f"worker launch {launch_id} holds no thread; nothing was written")
+                role = self._need_chat_launch(conn, launch_id)
+                replay = _message(conn, "outbox_id", outbox_id) if isinstance(outbox_id, str) else None
+                if role == "room":
+                    if replay is None:
+                        # every NEW room line is fenced here, whichever verb carried it (codex HIGH 1)
+                        if room_thread is None:
+                            raise CoordError(f"launch {launch_id} is a room launch; a line to the room goes through "
+                                             "send_room; nothing was written")
+                        if _room_target(conn, room_thread) != launch_id:
+                            raise _RoomMoved(launch_id)
+                    # the room thread the line names, never the launch's first thread in JSON order (deepseek MED 2)
+                    thread_id = room_thread if replay is None else replay.thread_id
+                else:
+                    row = conn.execute("SELECT j.value FROM launches l, json_each(l.threads) j WHERE l.launch_id = ? "
+                                       "LIMIT 1", (launch_id,)).fetchone()
+                    if row is None:
+                        raise CoordError(f"worker launch {launch_id} holds no thread; nothing was written")
+                    thread_id = row[0]
                 m, created = record_message(
-                    conn, now, thread_id=row[0], recipient="worker", author_kind=author_kind,
+                    conn, now, thread_id=thread_id, recipient="worker", author_kind=author_kind,
                     author_surface=author_surface, client_id=client_id, outbox_id=outbox_id, body=body,
                     normalized=body if normalized is None else normalized, launch_id=launch_id, mode=mode,
                     expected_turn_id=expected_turn_id,
@@ -1813,7 +1865,7 @@ class ChatService:
         """C1: the launch's role, a worker or a room; anything else is refused."""
         role, _state, _h = _launch_state(conn, launch_id)
         if role not in ("worker", "room"):
-            raise CoordError(f"no worker launch {launch_id!r}")
+            raise CoordError(f"no worker or room launch {launch_id!r}")
         return role
 
     def _interrupting(self, session: Any) -> bool:
@@ -1870,6 +1922,42 @@ class ChatService:
         return kinds == {"turn_started"}
 
     def _attempt_and_call(self, m: ChatMessage, session: Any, caps: Any, owner: str) -> SendReceipt:
+        """The send/interrupt arbiter (L3_rmd2_r1 codex HIGH 2), then the attempt and the one call. Under ``_guard``,
+        the lock :meth:`interrupt` pins under: an interrupt that already holds a pin cancels this send before its
+        attempt (no byte sent); otherwise the send is marked (``_sending``) from before its attempt commits until its
+        driver call returns, and an interrupt pinned meanwhile waits for that before it calls the session. A send and
+        an interrupt never overlap inside one session; which goes first is decided under that one lock."""
+        with self._guard:
+            blocked = session is not None and bool(self._pins.get(id(session)))
+            if not blocked:
+                self._sending[id(session)] = self._sending.get(id(session), 0) + 1
+        if blocked:
+            why = "an interrupt is waiting on this launch's session; send again once it has answered"
+            with self._chat._write() as (conn, now):
+                if outbox_state(conn, m.message_id) == "pending":
+                    outbox_step(conn, now, m.message_id, "cancelled", cause=why)
+                row = _latest_row(conn, m.message_id)
+            return SendReceipt(m.message_id, m.outbox_id, row[0], row[1], True)
+        marked = [True]
+
+        def unmark() -> None:
+            # once, as soon as the send's driver call returns (a probe after it is no send: an interrupt never waits
+            # on it), or on any way out before that
+            if marked[0]:
+                marked[0] = False
+                with self._guard:
+                    self._sending[id(session)] -= 1
+                    if not self._sending[id(session)]:
+                        del self._sending[id(session)]
+                    self._unpinned.notify_all()
+
+        try:
+            return self._attempt_and_call_marked(m, session, caps, owner, unmark)
+        finally:
+            unmark()
+
+    def _attempt_and_call_marked(self, m: ChatMessage, session: Any, caps: Any, owner: str,
+                                 unmark: Callable[[], None]) -> SendReceipt:
         op_id = "op-" + secrets.token_hex(16)
         with self._chat._write() as (conn, now):
             latest = outbox_state(conn, m.message_id)
@@ -1899,7 +1987,10 @@ class ChatService:
                 window.boundary()
         # only the transaction whose attempted row committed reaches this call (the partial unique index)
         self._fault("attempt_committed")
-        state, cause, turn, item, signal = self._call(session, _command(m, op_id))
+        try:
+            state, cause, turn, item, signal = self._call(session, _command(m, op_id))
+        finally:
+            unmark()
         if signal is None:
             self._fault("call_returned")
         with self._chat._write() as (conn, now):
@@ -2168,10 +2259,12 @@ class ChatService:
         caller and UNFENCED: it never reads the turn lease, so ``owner_epoch`` is accepted and checked against
         nothing. This half only calls ``session.interrupt`` with a fresh op_id and returns what the session said;
         it writes nothing (the in-flight approval rows a stop cancels are CH-D1c's). It does not wait on the launch's
-        mutex: a stop never queues behind a send in flight. A driver that raises, or returns anything but a
-        :class:`~levain.coordinator.driver.CommandResult`, is ``ambiguous``; so is one that has not answered within
-        :data:`INTERRUPT_DEADLINE`, and that one also wedges the session (no further call reaches it, an interrupt
-        included, until it is detached). The session is pinned until its call returns: :meth:`detach` refuses a new
+        mutex: a stop never queues behind a send's preflight or outcome. It waits only for a send already past the
+        arbiter (:meth:`_attempt_and_call`) to return from the session's send call, inside the same
+        :data:`INTERRUPT_DEADLINE` (past it: ``ambiguous``, nothing sent). A driver that raises, or returns
+        anything but a :class:`~levain.coordinator.driver.CommandResult`, is ``ambiguous``; so is one that has not
+        answered within :data:`INTERRUPT_DEADLINE`, and that one also wedges the session (no further call reaches it,
+        an interrupt included, until it is detached). The session is pinned until its call returns: :meth:`detach` refuses a new
         interrupt meanwhile and waits for the pin, at most :data:`INTERRUPT_DEADLINE`, before it closes the session
         (an interrupt reaches only the session it pinned; one stuck past the deadline is closed under it).
         ``turn_id`` is None or one line of plain text, as a recorded vendor turn id is (:func:`record_event`)."""
@@ -2205,8 +2298,18 @@ class ChatService:
             finally:
                 unpin()
 
+        deadline = time.monotonic() + INTERRUPT_DEADLINE
         try:
-            got = _bounded(call, INTERRUPT_DEADLINE)
+            # the arbiter's other half (see _attempt_and_call): a send marked before this pin is let out of the
+            # session's send call first; the pin already holds every later send off, so this wait only shortens
+            with self._guard:
+                clear = self._unpinned.wait_for(lambda: not self._sending.get(id(session)),
+                                                timeout=INTERRUPT_DEADLINE)
+            if not clear:
+                unpin()
+                return CommandResult("ambiguous", f"a send on this session had not returned within "
+                                                  f"{INTERRUPT_DEADLINE:g} s; the interrupt was not sent")
+            got = _bounded(call, max(0.0, deadline - time.monotonic()))
         except _Overdue:
             self._wedge(launch_id, session)
             return CommandResult("ambiguous", f"the driver did not answer the interrupt within "
@@ -2322,13 +2425,15 @@ class ChatService:
         with self._launch_lock(launch_id):
             self._chat.turn_release(launch_id, epoch, owner)
 
-    def message_thread(self, client_id: str, outbox_id: str) -> MessageThread | None:
-        """Where the message ``client_id`` stored under ``outbox_id`` went (thread, launch and the epoch it was sent
-        under), or None when that client stored none: another client's id answers nothing. A copy of four fields, not
-        the stored row."""
+    def message_thread(self, owner: str, outbox_id: str) -> MessageThread | None:
+        """Where the message ``owner`` stored under ``outbox_id`` went (thread, launch and the epoch it was sent
+        under), or None when that owner stored none. ``owner`` is the AUTHENTICATED ``author_surface:client_id``, as
+        :meth:`send` builds it, and both stored fields must match (L3_rmd2_r1 codex MED 5: a phone and a cockpit
+        client may share a client id): another owner's id answers nothing. A copy of four fields, not the stored
+        row."""
         m = self._chat._read(lambda conn: _message(conn, "outbox_id", outbox_id)) if isinstance(outbox_id, str) \
             else None
-        if m is None or m.client_id != client_id:
+        if m is None or not isinstance(owner, str) or f"{m.author_surface}:{m.client_id}" != owner:
             return None
         return MessageThread(m.message_id, m.thread_id, m.launch_id, m.owner_epoch)
 

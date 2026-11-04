@@ -388,9 +388,10 @@ def test_a_worker_send_while_an_interrupt_waits_is_refused_and_never_reaches_the
 # --- item 3: message_thread answers only the client that sent -------------------------------------------------
 def test_message_thread_is_scoped_by_client(world):
     r = say(world["svc"], world["thread"], client="tab-a")
-    got = world["svc"].message_thread("tab-a", "ob-00000001")
+    got = world["svc"].message_thread("cockpit:tab-a", "ob-00000001")
     assert got is not None and got.message_id == r.message_id
-    assert world["svc"].message_thread("tab-b", "ob-00000001") is None
+    assert world["svc"].message_thread("cockpit:tab-b", "ob-00000001") is None
+    assert world["svc"].message_thread("phone:tab-a", "ob-00000001") is None    # FIX 4: the surface is the owner's
 
 
 # --- item 5: a turn release never lands inside a send in flight ----------------------------------------------
@@ -418,3 +419,198 @@ def test_a_turn_release_waits_for_a_send_in_flight_on_its_launch(store, cs):
     seen["thread"].join(5)
     assert r.state == "accepted"
     assert seen["released_during_send"] is False and released.is_set()
+
+
+# --- RM-D2B: L3_rmd2_r1 fixes ------------------------------------------------------------------------------------
+def test_fix1_a_rotated_rooms_old_launch_refuses_send_and_writes_nothing(world, store, cs):
+    """codex HIGH 1: the old launch of a rotated room is still active; the public send() is fenced like send_room."""
+    nxt = _thread(store, title="next room")
+    with store._write() as (conn, _now):
+        room.rotate(conn, nxt)
+    before = count(cs, "SELECT COUNT(*) FROM chat_messages")
+    with pytest.raises(chat.RoomRotated):
+        world["svc"].send(world["launch"], author_kind="operator", author_surface="cockpit", client_id="tab-a",
+                          outbox_id="ob-00000011", body="to the stale room", mode="queue", expected_epoch=None)
+    assert count(cs, "SELECT COUNT(*) FROM chat_messages") == before and world["session"].sends == 0
+
+
+class SendWatched(Holding):
+    """A session whose interrupt blocks until released, and which records whether the interrupt had already reached
+    it when a send arrived."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_during_interrupt = False
+
+    def send(self, command):
+        if self.waiting.is_set() and not self.go.is_set():
+            self.send_during_interrupt = True
+        return super().send(command)
+
+
+def _held_room(store, cs, sid, fault=None):
+    thread = _thread(store)
+    _open_room_thread(store, thread)
+    launch = _room_launch(store, thread, sid)
+    svc = ChatService(cs, fault=fault, **LIVE)
+    return thread, launch, svc
+
+
+def test_fix2_an_interrupt_pinned_after_the_attempt_commits_waits_for_the_send(store, cs):
+    """codex HIGH 2: the send committed ``attempted``, then an interrupt pinned the session before session.send: the
+    interrupt never reaches the session while the send is still to enter it (it waits, bounded, for that call)."""
+    session = SendWatched()
+    seen = {}
+
+    def fault(point):
+        if point == "attempt_committed":
+            t = threading.Thread(target=lambda: seen.__setitem__("result", svc.interrupt(launch, None)))
+            t.start()
+            seen["thread"] = t
+            seen["reached_during_send"] = session.waiting.wait(0.5)
+
+    thread, launch, svc = _held_room(store, cs, "room-sid-a2", fault)
+    _attach(svc, cs, launch, session)
+    try:
+        r = say(svc, thread)
+        assert seen["reached_during_send"] is False and session.send_during_interrupt is False
+        assert r.state == "accepted" and session.sends == 1
+        assert session.waiting.wait(5)                  # once the send's call returned, the stop went in
+    finally:
+        session.go.set()
+        seen["thread"].join(5)
+    assert seen["result"].outcome == "confirmed"
+
+
+def test_fix2_an_interrupt_pinned_before_the_arbiter_cancels_the_send(store, cs):
+    """The arbiter's other branch: an interrupt pinned between the pending commit and the attempt cancels the send
+    before any attempt; no byte reaches the session."""
+    session = SendWatched()
+    seen = {}
+
+    def fault(point):
+        if point == "pending_committed":
+            t = threading.Thread(target=svc.interrupt, args=(launch, None))
+            t.start()
+            seen["thread"] = t
+            assert session.waiting.wait(5)
+
+    thread, launch, svc = _held_room(store, cs, "room-sid-b2", fault)
+    _attach(svc, cs, launch, session)
+    try:
+        r = say(svc, thread)
+        assert r.state == "cancelled" and "interrupt" in r.cause and session.sends == 0
+        assert count(cs, "SELECT COUNT(*) FROM chat_outbox_events WHERE message_id = ? AND state = 'attempted'",
+                     r.message_id) == 0
+    finally:
+        session.go.set()
+        seen["thread"].join(5)
+
+
+def test_fix3_a_worker_line_on_the_thread_is_no_room_replay(store, cs):
+    """codex MED 4: a message stored against a worker launch holding T, resent after T became the room, is a
+    conflict: it neither answers with the worker's receipt nor reaches the room."""
+    svc = ChatService(cs, **LIVE)
+    class WorkerCounting(ScriptedSession):              # a worker's own mode (Counting reports the room's)
+        sends = 0
+
+        def send(self, command):
+            self.sends += 1
+            return super().send(command)
+
+    worker_session = WorkerCounting()
+    token = store.coord_take()
+    thread = _thread(store, kind="work", title="fix it")
+    ln = store.launch_request(token, harness="claude", role="worker", threads=[thread])
+    store.launch_activate(ln.launch_id, harness_session_id="sess-w3")
+    _attach(svc, cs, ln.launch_id, worker_session)
+    epoch = svc.turn_claim(ln.launch_id, "cockpit:tab-a")
+    first = svc.send(ln.launch_id, author_kind="operator", author_surface="cockpit", client_id="tab-a",
+                     outbox_id="ob-00000031", body="hello room", expected_epoch=epoch)
+    assert first.state == "accepted"
+    _open_room_thread(store, thread)
+    room_launch = _room_launch(store, thread, "room-sid-3")
+    room_session = _attach(svc, cs, room_launch)
+    with pytest.raises(chat.MessageConflict):
+        say(svc, thread, outbox="ob-00000031", body="hello room")
+    assert room_session.sends == 0 and worker_session.sends == 1
+
+
+def test_fix3_another_clients_outbox_id_is_a_conflict_naming_nothing_of_its_message(world):
+    """deepseek MED 3: the stored-replay path is scoped to the caller; the refusal names no message id."""
+    r = say(world["svc"], world["thread"], client="tab-a")
+    with pytest.raises(chat.MessageConflict) as got:
+        say(world["svc"], world["thread"], client="tab-b")
+    assert r.message_id not in str(got.value) and "another client" in str(got.value)
+    with pytest.raises(chat.MessageConflict) as again:            # the same owner check on the worker path's writer
+        world["svc"].send(world["launch"], author_kind="operator", author_surface="phone", client_id="tab-a",
+                          outbox_id="ob-00000001", body="hello room")
+    assert r.message_id not in str(again.value) and world["session"].sends == 1
+
+
+def test_fix5_an_overdue_meta_at_attach_wedges_the_session(store, cs, monkeypatch):
+    """codex MED 3 / complement LOW 2: a meta() still running past READ_DEADLINE leaves the session wedged, so no
+    other driver method is called on it while that call is in flight."""
+    release = threading.Event()
+
+    class Hung(Counting):
+        def meta(self):
+            release.wait(5)
+            return super().meta()
+
+        def capabilities(self):
+            self.caps_calls = getattr(self, "caps_calls", 0) + 1
+            return super().capabilities()
+
+    monkeypatch.setattr(chat, "READ_DEADLINE", 0.05)
+    thread = _thread(store)
+    _open_room_thread(store, thread)
+    launch = _room_launch(store, thread, "room-sid-5")
+    svc = ChatService(cs, **LIVE)
+    _live(cs, launch)
+    session = Hung()
+    try:
+        svc.attach(launch, session)
+        assert svc.session_meta(launch) is None
+        r = say(svc, thread)
+        assert r.state == "refused" and "stopped answering" in r.cause
+        assert session.sends == 0 and getattr(session, "caps_calls", 0) == 0
+    finally:
+        release.set()
+
+
+_OLD_WORKER_TRIGGER = (
+    "CREATE TRIGGER chat_messages_worker BEFORE INSERT ON chat_messages WHEN NEW.launch_id IS NOT NULL "
+    "AND NOT EXISTS (SELECT 1 FROM launches l, json_each(l.threads) j WHERE l.launch_id = NEW.launch_id "
+    "AND l.role = 'worker' AND j.value = NEW.thread_id) "
+    "BEGIN SELECT RAISE(ABORT, 'a chat message to a worker names a worker launch of its thread'); END")
+
+
+def test_an_old_store_with_the_worker_only_trigger_is_migrated_on_open(store, cs):
+    """deepseek HIGH 1, REFUTED: a store written by the build before RM-D2 holds the worker-only trigger text;
+    _ensure drops a trigger whose stored text is not CHAT_SCHEMA's and recreates it, so a room line goes through."""
+    thread = _thread(store)
+    _open_room_thread(store, thread)
+    launch = _room_launch(store, thread, "room-sid-old")
+    raw = sqlite3.connect(store.path)
+    try:
+        raw.execute("DROP TRIGGER chat_messages_worker")
+        raw.execute(_OLD_WORKER_TRIGGER)
+        raw.commit()
+    finally:
+        raw.close()
+    # the control: this ChatStore ensured its schema before the old text went back in, so the old trigger bites
+    stale = ChatService(cs, **LIVE)
+    _attach(stale, cs, launch)
+    with pytest.raises(sqlite3.IntegrityError, match="names a worker launch of its thread"):
+        say(stale, thread, outbox="ob-000000a1")
+    stale.detach(launch)
+    # a process opening the old store: its first connection brings the trigger current
+    fresh_cs = ChatStore(store)
+    svc = ChatService(fresh_cs, **LIVE)
+    session = _attach(svc, fresh_cs, launch)
+    r = say(svc, thread, outbox="ob-000000a2")
+    assert r.state == "accepted" and session.sends == 1
+    sql = fresh_cs._read(lambda conn: conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chat_messages_worker'").fetchone()[0])
+    assert "'room'" in sql
