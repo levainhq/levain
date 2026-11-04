@@ -170,20 +170,44 @@ def test_secret_assignment_catches_values_that_begin_with_punctuation(text):
 
 
 @pytest.mark.parametrize("text", [
-    "A=1\n",                                           # not a secret-named assignment
-    "PASSWORD=short\n",                                # under the minimum length
-    'TOKEN=""\n',
-    "API_KEY=${API_KEY}\n",                            # a variable reference, not a value
+    "PASSWORD=$uperSecret123\n",                       # a `$`-leading password is not a variable reference
+    "PASSWORD=P4ss(word)1234\n",                       # an `identifier(` prefix is not code
+    "TOKEN=abc[12345678901]\n",                        # an `identifier[` prefix is not code
+    "PASSWORD=exampleRealSecret123456\n",              # a placeholder word inside a credential exempts nothing
+    "PASSWORD='<actual-secret-123456>'\n",             # angle brackets are not a placeholder
+    'PASSWORD="!short\\"actual-secret-123456"\n',      # an early escaped quote does not end the value
+    "API_KEY=${API_KEY_FROM_THE_VAULT}\n",             # fail closed: no exemptions, the role withholds instead
     "export SECRET_KEY=$SECRET_KEY_FROM_THE_VAULT\n",
-    "API_KEY=<your-api-key-goes-here>\n",              # an obvious placeholder
+    "API_KEY=<your-api-key-goes-here>\n",
     "PASSWORD=changeme-changeme-changeme\n",
     "TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx\n",
-    'api_key = os.environ.get("API_KEY")\n',           # code reading a secret, not holding one
+    'api_key = os.environ.get("API_KEY")\n',
     "token = self._load_token_from_keychain(name)\n",
+    "db_password: hunter2-hunter2-hunter2\n",          # the `:` separator too
+])
+def test_secret_assignment_fails_closed_on_every_value_of_twelve_bytes_or_more(text):
+    assert scan_blob(text.encode()) == "secret-assignment"
+
+
+@pytest.mark.parametrize("text", [
+    "A=1\n",                                           # not a secret-named assignment
+    "PASSWORD=short\n",                                # under the minimum length
+    "PASSWORD='elevenbytes'\n",                        # 11 bytes once one layer of quotes is stripped
+    'TOKEN=""\n',
     "PASSWORD_HINT\n",                                 # no assignment at all
 ])
-def test_secret_assignment_leaves_references_and_placeholders_alone(text):
+def test_secret_assignment_ignores_short_values_and_non_assignments(text):
     assert scan_blob(text.encode()) is None
+
+
+def test_a_false_positive_is_cleared_only_by_the_role_withholding_its_path(tmp_path):
+    repo = make_repo(tmp_path, {**FILES, "src/cfg.py": 'api_key = os.environ.get("API_KEY")\n'})
+    with pytest.raises(SnapshotRefused) as ei:
+        plan_snapshot(str(repo), [])
+    assert ei.value.name == "snapshot-secret" and "src/cfg.py" in ei.value.detail
+    assert "withhold" in ei.value.detail and "os.environ" not in ei.value.detail
+    man, _ = plan_snapshot(str(repo), ["src/cfg.py"])
+    assert man.withheld_paths == ("src/cfg.py",) and "src/cfg.py" not in [e[0] for e in man.entries]
 
 
 def test_scan_is_linear_on_a_pathological_one_megabyte_line():

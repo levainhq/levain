@@ -12,7 +12,8 @@ listed files) for the case where no contract lists the files: the files are ever
   and no partial snapshot is left behind.
 * The CONTENT of every included blob is scanned (private-key armor, common token prefixes, ``.env``-shaped
   assignments). A hit names the path and the rule, never the matched text. The scan is a floor, not a proof: it finds
-  the shapes it knows. A file a role cannot clear is withheld by name.
+  the shapes it knows. A false positive (a secret-named assignment of 12 bytes or more that holds no secret) is
+  cleared only by the role withholding that path: the scan has no exemptions, and a role can only withhold.
 * The :class:`Manifest` is a plain deterministic record: HEAD, the withhold list and its digest, and every included
   entry as (path, mode, blob). :func:`snapshot_commit` derives the snapshot's commit sha ``E``, tree and object count
   ``N`` from the manifest alone (pure: no git, no repo), so a later stage compares a sha and builds nothing to trust.
@@ -62,34 +63,21 @@ _RULES: tuple[tuple[str, re.Pattern[bytes]], ...] = tuple((n, re.compile(p)) for
     ("google-api-key", rb"\bAIza[0-9A-Za-z_-]{35}\b"),
 ))
 #: The ``.env``-shaped assignment rule, in two linear steps: the NAME (one bounded character run anchored at a line
-#: start, then ``=``), then the VALUE parsed by hand from the rest of that line, whatever punctuation it begins with.
-_ASSIGN_NAME = re.compile(rb"(?m)^[ \t]*(?:export[ \t]+)?([A-Za-z0-9_]{1,256})[ \t]*=[ \t]*")
+#: start, then ``=`` or ``:``), then the VALUE: the rest of that line. Fail closed, no exemptions: a reference, a
+#: placeholder or a line of code under a secret name is a finding like any other, and the role withholds its path.
+_ASSIGN_NAME = re.compile(rb"(?m)^[ \t]*(?:export[ \t]+)?([A-Za-z0-9_]{1,256})[ \t]*[=:]")
 _SECRET_NAME = re.compile(rb"SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY")
 _ASSIGN_MIN = 12
-#: Values that are not a secret's bytes: a variable reference (``$X``, ``${X}``), a ``<placeholder>``, one character
-#: repeated, a known placeholder word, or (unquoted only) a call or index expression in code (``os.environ[...]``).
-_VALUE_REFERENCE = re.compile(rb"\$\{[A-Za-z0-9_]+\}|\$[A-Za-z_][A-Za-z0-9_]*|<[^<>]*>")
-_VALUE_CODE = re.compile(rb"[A-Za-z_][A-Za-z0-9_.]*[(\[]")
-_PLACEHOLDER_WORDS = (b"changeme", b"placeholder", b"example", b"your-", b"your_")
 
 
 def _secret_value(body: bytes, start: int) -> bool:
-    """Whether the assignment value beginning at ``body[start]`` is a secret's bytes (see :data:`_VALUE_REFERENCE`)."""
+    """Whether the assignment value after the separator at ``body[start]`` is ``_ASSIGN_MIN`` bytes or more: the rest
+    of the line, surrounding whitespace and ONE layer of matching quotes stripped, no escapes read, nothing exempted."""
     end = body.find(b"\n", start)
-    line = body[start:] if end < 0 else body[start:end]
-    if line[:1] in (b'"', b"'"):
-        close = line.find(line[:1], 1)
-        value = line[1:] if close < 0 else line[1:close]
-        code = False
-    else:
-        parts = line.split(None, 1)
-        value = parts[0] if parts else b""
-        code = _VALUE_CODE.match(value) is not None
-    value = value.rstrip(b"\r")
-    if len(value) < _ASSIGN_MIN or code or _VALUE_REFERENCE.fullmatch(value) is not None:
-        return False
-    low = value.lower()
-    return len(set(value)) > 1 and not any(w in low for w in _PLACEHOLDER_WORDS)
+    value = (body[start:] if end < 0 else body[start:end]).strip()
+    if len(value) >= 2 and value[:1] in (b'"', b"'") and value[-1:] == value[:1]:
+        value = value[1:-1]
+    return len(value) >= _ASSIGN_MIN
 
 
 class SnapshotRefused(DispatchError):
@@ -255,7 +243,8 @@ def plan_snapshot(repo: str, withhold: Any = (), *, policy: ProviderPolicy | Non
     for path, _m, sha, _z in sorted(kept):
         rule = scan_blob(blobs[sha])
         if rule is not None:
-            raise SnapshotRefused("snapshot-secret", f"{path[:120]}: content rule {rule}")
+            raise SnapshotRefused("snapshot-secret", f"{path[:120]}: content rule {rule} (if it holds no secret, "
+                                  "the role withholds this path; the scan exempts nothing)")
     entries = tuple(sorted((p, m, s) for p, m, s, _z in kept))
     return Manifest(head=head, withhold=pats, withheld_paths=tuple(sorted(withheld)), entries=entries), blobs
 
