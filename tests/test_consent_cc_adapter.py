@@ -394,6 +394,10 @@ def test_real_core_grant_allow_through_main_carries_the_posture_and_says_so(tmp_
     qdir = tmp_path / "home" / "consent"
     qdir.mkdir(parents=True, mode=0o700)
     (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
+    # a record with no setting says follow, and follow with no desk message sends approvals to the devices (presence 1b), so
+    # the two requests below that no grant answers would hold for a signed answer: devices off keeps them the native dialog's
+    from levain.webpush import intent
+    intent.apply_settings(qdir, devices="off")
     write = event("Write", {"file_path": str(ws / "a.txt"), "content": "hi"}, cwd=str(ws))
 
     def run(e):
@@ -865,7 +869,8 @@ def _granted_mcp_hook(tmp_path, tool):
     qdir = tmp_path / "home" / "consent"
     qdir.mkdir(parents=True, mode=0o700)
     (qdir / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
-
+    from levain.webpush import intent
+    intent.apply_settings(qdir, devices="off")   # see the first use above: an unanswered request must not hold
     def run(e):
         out = io.StringIO()
         assert cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(e)), stdout=out) == 0
