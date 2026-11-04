@@ -7208,7 +7208,7 @@
     words.setAttribute("aria-label", "your words for the coordinator");
     // a plain prose box: iOS keys its field kind off the attributes, and a bare textarea beside the one-time-code pairing box
     // got payment/code treatment (no predictive text, autocorrect off); say "ordinary text" outright
-    for (const [k, v] of [["autocomplete", "off"], ["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["enterkeyhint", "enter"]]) words.setAttribute(k, v);
+    for (const [k, v] of [["autocomplete", "off"], ["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["enterkeyhint", "enter"], ["name", "dropwords"]]) words.setAttribute(k, v);
     words.addEventListener("input", () => { dropPrefillClear(); ui.handed = undefined; });      // words changed since a handoff: that handoff is stale
     const acts = el("div", "needs-actions drop-actions");
     const send = el("button", "needs-btn needs-primary", "Send");
