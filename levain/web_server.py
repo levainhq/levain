@@ -273,6 +273,10 @@ _SIGN_COMPOSE = "/cockpit/sign/compose"
 # credential's SPKI -> its OpenSSH line and the laptop commands that enrol it), by the phone port's OWN method, over the
 # Signer's queue and rpId, behind the sign routes' gate. Nothing is enrolled or recorded. Served beside a Signer only.
 _KEY_LINE_ROUTE = "/cockpit/passkey/key-line"
+# TERMSIGN L5a: POST /cockpit/desk/answer is a click on a card answered with the laptop's Touch ID key, served only to a
+# request that came from the laptop itself (levain.desk_click.desk_answer is the whole route). It rides the key-line
+# routes' gate: a surface token on every bind.
+_DESK_ANSWER_ROUTE = "/cockpit/desk/answer"
 _COMPOSE_WAIT_S = 30.0        # how long a second compose of one draft waits for the first's compose_signer call
 # GET /cockpit/sign/<id>.json: ONE request's listing row, behind the listing's gate, so a page never reads "no longer
 # open" off a listing that stopped at its cap (Signer.row)
@@ -1285,7 +1289,8 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
     _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, _COORD_LIST, _COORD_SHEET,
-    cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _PAIR_OFFER, _PAIR_REVOKE, _PAIR_LIST, _PAIR_CLAIM,
+    cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _PAIR_OFFER, _PAIR_REVOKE,
+    _PAIR_LIST, _PAIR_CLAIM,
     _NOTIFY_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
@@ -1866,11 +1871,19 @@ class _Handler(GuardedHandler):
         token-free (iPad/iPhone viewing; make_server allows that bind only for a no-install source). Writes are also
         gated by ``_writes_need_credential`` on every bind (K2a); the frontend's ``write_token_required`` signal is
         the OR of the two. Plain loopback with no proxy header stays token-free."""
-        if host_header_allowed(self.headers.get("Host"), self.server.proxied_hosts) or any(
-                k.lower() in _PROXY_HEADERS or k.lower().startswith(_PROXY_HEADER_PREFIX)
-                for k in self.headers.keys()):
+        if self._proxied():
             return True
         return not self.server.is_loopback_bind and self.server.levain_source.write_scope is not None
+
+    def _proxied(self) -> bool:
+        """True iff this request came through a proxy on this machine (an ``extra_hosts`` Host or a proxy header)."""
+        return host_header_allowed(self.headers.get("Host"), self.server.proxied_hosts) or any(
+            k.lower() in _PROXY_HEADERS or k.lower().startswith(_PROXY_HEADER_PREFIX) for k in self.headers.keys())
+
+    def _desk_local(self) -> bool:
+        """Routing only, never evidence (a same-user process can fake it and gets a sheet nobody touches): the request
+        reached a loopback-bound server unproxied, so it came from this laptop."""
+        return bool(self.server.is_loopback_bind) and not self._proxied()
 
     def _owner_key_accepted(self) -> bool:
         """Whether the owner key (the ``browser`` surface's token) is honoured on THIS request: only on a loopback
@@ -2236,6 +2249,9 @@ class _Handler(GuardedHandler):
             from levain import band_view
             viewer = f"cockpit:{self._credential(required=True).get('name') or 'web'}"
             status, payload = 200, band_view.band_payload(store, viewer)
+            if status == 200 and isinstance(payload, dict):
+                from levain import desk_click
+                payload["desk_sign"] = desk_click.desk_sign_available(self._desk_local())
         except _CredentialUnavailable:   # RU-5: only the outer catch answers it
             raise
         except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
@@ -3021,6 +3037,23 @@ class _Handler(GuardedHandler):
             return _PhoneServer.key_line(SimpleNamespace(rp_id=signer.rp_id, queue_dir=signer.queue_dir), req), 200
         except PhoneError as exc:
             return {"error": exc.error, "message": exc.message}, exc.status
+
+    def _desk_post(self, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/desk/answer``: :func:`levain.desk_click.desk_answer` over this server's question store. The
+        sign lock and the finished-request memory live on the server, so they are shared by every request thread."""
+        from levain import band_view, desk_click
+
+        store = getattr(self.server, "question_store", None)
+        if store is None:      # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        state = self.server.__dict__.setdefault("_desk_state", desk_click.DeskState())
+        local = self._desk_local()
+        port = self.server.server_address[1]
+        request = desk_click.DeskRequest(
+            local, str(self._credential(required=True).get("name") or "web"), f"http://localhost:{port}", req)
+        return desk_click.desk_answer(request, desk_click.LevainDeskHost(store), state,
+                                      policy=desk_click.DESK_POLICY,
+                                      deliver=lambda done: band_view.deliver_recorded(store, done))
 
     def _dispatch_post(self, job_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/dispatch/<job>/<action>`` (OS-2): the dispatch sheet's reply and status, or its refusal as
@@ -3954,13 +3987,15 @@ class _Handler(GuardedHandler):
         coord = _coord_route(route) if self.server.coord_sheet is not None else None
         # and the key-line family's key line (OS-2): the same gate
         key_line = route == _KEY_LINE_ROUTE and self.server.signer is not None
+        # and the desk click (TERMSIGN L5a): the same gate, served beside a question store
+        desk = route == _DESK_ANSWER_ROUTE and getattr(self.server, "question_store", None) is not None
         # and web push (OS-4): a token on every bind
         push = route in _PUSH_POST and self.server.signer is not None
         if push:
             if not self._push_gate_ok(route):
                 return self._token_403("credential_required")
         elif (sign is not None or compose or grant is not None or consent is not None or dispatch is not None
-                or coord is not None or key_line) and not self._off_box_token_valid():
+                or coord is not None or key_line or desk) and not self._off_box_token_valid():
             return self._token_403("credential_required")
         if self._write_token_required() and not (self._push_gate_ok(route) if push else self._off_box_token_valid()):
             return self._token_403("forbidden")
@@ -3975,7 +4010,8 @@ class _Handler(GuardedHandler):
         # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
-                and consent is None and dispatch is None and coord is None and not push and not key_line):
+                and consent is None and dispatch is None and coord is None and not push and not key_line
+                and not desk):
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -4097,6 +4133,16 @@ class _Handler(GuardedHandler):
                 # authority for an envelope): no read-only refusal applies to it
                 try:
                     payload, status = self._coord_post(coord, req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if desk:
+                # the laptop's own Touch ID signs the click: no read-only refusal applies to it
+                try:
+                    payload, status = self._desk_post(req)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client

@@ -1488,6 +1488,127 @@ def answer_item(store: Any, subject: Mapping[str, Any], *, pick: str | None, tex
     return Applied([label], [], format_echo([label], [], channel), (), (q.id,))
 
 
+def answer_item_desk(store: Any, subject: Mapping[str, Any], *, pick: str | None, text: str | None, viewer: str,
+                     signing: Signing) -> Applied:
+    """:func:`answer_item` for a click the laptop key SIGNED (TERMSIGN L5a): the same one-item write, channel
+    ``cockpit``, recorded with the signing columns. ``signing`` must be a signed attempt whose message names this
+    row at the version the write finds INSIDE its transaction (:func:`_still_version`), else the row is
+    :class:`VersionMoved` and nothing is recorded (the signature is discarded). An unsigned ``signing`` is
+    ``ValueError``: the desk records a click only with its signature. A foreign host store is ``ValueError`` too
+    (it takes a desk answer through its own capabilities, not built yet)."""
+    if signing.state != "signed" or not signing.sig or not signing.message:
+        raise ValueError("a desk answer is recorded only with its signature; nothing was recorded")
+    if (pick is None) == (text is None):
+        raise ValueError("an answer is exactly one of a pick or a text; nothing was recorded")
+    if subject.get("kind") != "question":
+        raise AuthorityItem("this item signs on its own card; nothing was recorded")
+    if _foreign(store):
+        raise ValueError("this store takes a desk answer through its own capabilities; nothing was recorded")
+    q = store.get(subject["id"])
+    if q is None or q.id != subject["id"] or subject_version(q) != subject["version"]:
+        raise VersionMoved("the item changed since it was shown to you, so nothing was recorded")
+    if _question_kind(q) == "authority":
+        raise AuthorityItem("this item signs on its own card; nothing was recorded")
+    option, said = _key_of(q, pick, text)
+    entry: dict[str, Any] = {"ref": q.id, "via": "cockpit", "viewer": viewer, "seen_through": None, "note": None,
+                             "sign": signing}
+    if option is not None:
+        entry["option"] = option
+    else:
+        entry["text"] = said
+    (result,) = _answer_signed(store, [entry], channel="cockpit", require=_still_version(subject),
+                               deadline=time.monotonic() + HOOK_BUSY_MS / 1000)
+    if isinstance(result, ConsentError):
+        raise result
+    label = pick if option is not None else "text"
+    return Applied([label], [], format_echo([label], [], "cockpit"), (), (q.id,))
+
+
+def _desk_typed_signer(store: QuestionStore, text: str, *, surface: str, origin: str, view_id: int,
+                       signer_factory: Any = None, key_dir: Path | None = None, notify: Any = None
+                       ) -> Callable[[list[tuple[Any, Question]]], Signing | None]:
+    """The ``sign_with`` of a line typed in the cockpit's band box (TERMSIGN L5a): after a full parse, ONE
+    ``levain-desk-answer/1`` message with ``gesture: typed`` naming every information entry about to be recorded,
+    signed once, outside any store lock, the notice posted first. It never raises: a message that cannot be built or
+    a signer that fails is an unsigned outcome naming why. ``view_id``: the view the plan was parsed against."""
+    def sign_with(pairs: list[tuple[Any, Question]]) -> Signing | None:
+        from levain.consent import terminal_sign as ts
+
+        info_ids = {q.id: "" for _, q in pairs if _question_kind(q) == "information"}
+        try:
+            entries, versions = _info_entries(pairs, with_note=False)
+            if not entries:
+                return None
+            sid = _store_id_of(store)
+            if sid is None:
+                return Signing("unsigned", "signer-error", "no store id to bind the message to", versions=info_ids)
+            message = ts.build_desk_message(store=f"levain-questions:{sid}", install=sid, surface=surface,
+                                            origin=origin, view=str(view_id), gesture="typed",
+                                            typed=" ".join(text.split()) or text, entries=entries)
+        except Exception as exc:  # noqa: BLE001 - signing never blocks recording
+            return Signing("unsigned", "signer-error", f"{type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}",
+                           versions=info_ids)
+        key = None
+        try:
+            key = ts.find_key(key_dir)
+            if key is not None:
+                (notify or ts.post_notice)(ts.notice_text(entries, channel="desk"))
+        except Exception:  # noqa: BLE001 - sign() below names whatever is wrong with the key
+            pass
+        out = ts.sign(message, key=key, key_dir=key_dir, signer_factory=signer_factory or ts.default_desk_signer_factory)
+        if out.state == "signed":
+            return Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint, versions)
+        return Signing("unsigned", out.reason, out.detail, versions=versions)
+
+    return sign_with
+
+
+def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: str, view_id: int, surface: str,
+                     origin: str, signer_factory: Any = None, key_dir: Path | None = None, notify: Any = None,
+                     deadline: float | None = None) -> Applied:
+    """:func:`answer_text` for the cockpit's band box when the line is SIGNED with the laptop key (L5a, policy (a)):
+    the plan is made from the view the text names, one desk message is signed over its information entries, and the
+    answers are recorded with the signature only if the view is still the viewer's newest, checked inside the write.
+    A signer that cancels or times out leaves the line UNRECORDED: the whole line is refused (``ValueError``,
+    nothing recorded) so the box keeps his words, unlike a seat's typed line, which records unsigned. A foreign
+    store is ``ValueError`` as in :func:`answer_text`."""
+    if _foreign(store):
+        raise ValueError("this cockpit's questions are answered on their own cards, not by band shorthand; nothing was recorded")
+    view = _view_by_id(store, viewer, view_id)
+    if view is None:
+        raise StaleBand(_STALE)
+    plan, view, questions, extras = _plan_on(store, view, text)
+    if not plan.matched or plan.rest.strip():
+        raise ValueError(plan.hint or "the whole text must be band answers, e.g. `1a, 2: rec`; nothing was recorded")
+    outcome: list[Signing] = []
+    inner = _desk_typed_signer(store, text, surface=surface, origin=origin, view_id=view_id,
+                               signer_factory=signer_factory, key_dir=key_dir, notify=notify)
+
+    def sign_with(pairs: list[tuple[Any, Question]]) -> Signing | None:
+        got = inner(pairs)
+        if got is not None:
+            outcome.append(got)
+            if got.state != "signed":
+                raise _DeskUnsigned(got)
+        return got
+    try:
+        return apply_plan(store, plan, questions, viewer=viewer, via="cockpit", seen_through=view.seen_through,
+                          deadline=deadline, extras=extras, channel="cockpit", sign_with=sign_with,
+                          require=_still_newest(viewer, store_id, view_id))
+    except _DeskUnsigned as stop:
+        raise ValueError(f"Touch ID {stop.signing.reason or 'did not sign'}: nothing was recorded") from None
+
+
+class _DeskUnsigned(BaseException):
+    """Raised from a desk line's ``sign_with`` to stop :func:`apply_plan` before its write. A ``BaseException`` on
+    purpose: ``apply_plan`` turns any ``Exception`` from a signer into an unsigned record, and a desk line records
+    nothing unless it is signed."""
+
+    def __init__(self, signing: "Signing") -> None:
+        super().__init__(signing.reason or "")
+        self.signing = signing
+
+
 def _answer_foreign(store: Any, subject: Mapping[str, Any], pick: str | None, text: str | None, channel: str) -> Applied:
     if not answerable(store):
         raise ValueError("this cockpit's questions are answered on their own cards; nothing was recorded")
@@ -1537,6 +1658,28 @@ def _is_relay(prompt: str, environ: Mapping[str, str]) -> bool:
     return environ.get("LEVAIN_TURN") == "relay" or prompt.lstrip().startswith("levain:")
 
 
+def _info_entries(pairs: list[tuple[Any, Question]], *, with_note: bool = True) -> tuple[list[Any], dict[str, str]]:
+    """The signed entries (and ``{question id: row version}``) of the information answers in ``pairs``, the rows as
+    read for the plan. Authority entries are not signed here. ``with_note`` False for a format with no note line."""
+    from levain.consent import terminal_sign as ts
+
+    entries: list[Any] = []
+    versions: dict[str, str] = {}
+    for act, q in pairs:
+        if _question_kind(q) != "information":
+            continue
+        version = subject_version(q)
+        note = act.note if with_note else None
+        if act.text is not None:
+            entries.append(ts.Entry(q.id, version, q.what, "information", text=act.text, note=note))
+        else:
+            letter = act.pick or ""
+            entries.append(ts.Entry(q.id, version, q.what, "information",
+                                    answer=f"({letter}) {q.options[_LETTERS.index(letter)][1]}", note=note))
+        versions[q.id] = version
+    return entries, versions
+
+
 def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse, session: str,
                      environ: Mapping[str, str], signer_factory: Any = None, key_dir: Path | None = None,
                      on_sign: Callable[[], None] | None = None, *, view_id: int | None = None
@@ -1552,22 +1695,9 @@ def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse
     def sign_with(pairs: list[tuple[Any, Question]]) -> Signing | None:
         from levain.consent import terminal_sign as ts
 
-        entries: list[Any] = []
-        versions: dict[str, str] = {}
         info_ids = {q.id: "" for _, q in pairs if _question_kind(q) == "information"}
         try:
-            for act, q in pairs:
-                if _question_kind(q) != "information":
-                    continue
-                version = subject_version(q)
-                if act.text is not None:
-                    entry = ts.Entry(q.id, version, q.what, "information", text=act.text, note=act.note)
-                else:
-                    letter = act.pick or ""
-                    entry = ts.Entry(q.id, version, q.what, "information",
-                                     answer=f"({letter}) {q.options[_LETTERS.index(letter)][1]}", note=act.note)
-                entries.append(entry)
-                versions[q.id] = version
+            entries, versions = _info_entries(pairs)
             if not entries:
                 return None
             sid = _store_id_of(store)
