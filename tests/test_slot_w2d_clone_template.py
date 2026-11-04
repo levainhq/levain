@@ -17,6 +17,7 @@ import pytest
 
 from levain.contracts import canon
 from levain.dispatch import contract as DC
+from levain.slot import control as C
 from levain.slot import render as RD
 from levain.slot import records as R
 from levain.slot import runtime_helper as H
@@ -112,6 +113,10 @@ class RealGit:
         return p.wait(timeout=60), out
 
 
+TICKET_FACTS = {"kind": "planner", "job_id": "j", "run_index": 0, "contract_digest": "sha256:" + "1" * 64,
+                "egress_routes": [], "reserved_microdollars": 0}
+
+
 def _dispatch_rendered(tmp_path, files=None):
     """A rendered ``dispatch`` session whose staged bundle is :data:`FILES`' read set (or ``files``')."""
     w, la, table = _world(tmp_path)
@@ -122,6 +127,10 @@ def _dispatch_rendered(tmp_path, files=None):
     (w.L / "alloc" / f"{s}.json").write_bytes(R.alloc_bytes(replace(a, kind="dispatch")))
     w.stage(s, _bundle(tmp_path) if files is None else _bundle_of(tmp_path, files))
     assert w.main(["render", s], _blob())[1]["ok"]
+    # start refuses a dispatch alloc with no ticket facts (p71 S8 D4); a planner ticket keeps the neutral exec this file
+    # is about, and start acts on alloc only (§7.1)
+    a = w.alloc(s)
+    (w.L / "alloc" / f"{s}.json").write_bytes(R.alloc_bytes(replace(a, ticket=C.new_handle(), ticket_facts=TICKET_FACTS)))
     return w, la, table, s
 
 
