@@ -227,9 +227,10 @@ def test_no_price_row_has_no_stated_exposure(world):
                          facts_path=facts, table=TABLE)
 
 
-def test_the_shipped_table_is_empty_so_the_default_launch_refuses(world):
+def test_the_shipped_table_prices_the_default_so_the_default_launch_stops_at_the_first_run_facts(world):
     store, occ, _, facts = world
-    with pytest.raises(ex.ExposureRefused, match="no price row"):
+    assert ex.one_call_ceiling(ex.DEFAULT_CLAUDE_MODEL) is not None
+    with pytest.raises(ex.ExposureRefused, match="first-run facts"):
         ex.DreamExecutor(agent_store_dir=store, occurrence_id=OCC_ID, occ_dir=occ, facts_path=facts)
 
 

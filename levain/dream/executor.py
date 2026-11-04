@@ -122,11 +122,16 @@ class PriceRow:
     read_on: str
 
 
-#: Keyed by the EXACT pinned model id. **Deliberately empty in D1-1a:** every row must cite the published price page
-#: and the date it was read, and this lane has no network and may not invent a price. The person who runs D1-1a's first
-#: Claude-route run adds the row for :data:`DEFAULT_CLAUDE_MODEL` (``PriceRow(..., source=<url>, read_on=<date>)``).
-#: A model id with no row has no ``M``: the Claude mind refuses to compose and the effect returns ``budget``.
-PRICE_TABLE: dict[str, PriceRow] = {}
+#: Keyed by the EXACT pinned model id. Every row cites the published price page and the date a person read it there; the
+#: table was empty in D1-1a because that lane had no network and could not invent a price. The row for
+#: :data:`DEFAULT_CLAUDE_MODEL` was signed by Phill (np-f16016c5 (a), 2026-11-03): its input rate is the 1h cache-write
+#: rate, the highest per-token input rate on the page, and a change to any figure needs his word. A model id with no row
+#: has no ``M``: the Claude mind refuses to compose and the effect returns ``budget``.
+PRICE_TABLE: dict[str, PriceRow] = {
+    "claude-opus-5-5": PriceRow(context_window=1_000_000, max_output=128_000, input_micros_per_mtok=8_000_000,
+                                output_micros_per_mtok=20_000_000,
+                                source="https://platform.claude.com/docs/en/about-claude/pricing", read_on="2026-11-03"),
+}
 
 
 def one_call_ceiling(model: str, table: Mapping[str, PriceRow] | None = None) -> int | None:
