@@ -45,7 +45,7 @@ from levain.webpush.presence import (ACTIVE_WINDOW_SECS, COORDINATOR_WORDS, MAX_
 
 __all__ = ["VERSION", "FILE_NAME", "BACKUP_DIR", "DEVICES", "LETS", "LETS_CLASSES", "lets_label", "lets_describe", "lets_options", "FOLLOW_DEFAULT", "FOLLOW_MIN",
            "FOLLOW_MAX", "PRESET_TABLE", "overlay_active", "overlay_ended", "devices_on_now", "decide", "read", "view",
-           "describe_line", "approvals_to_devices", "approvals_route", "approval_notice", "apply_preset", "apply_settings", "read_changes", "migrate",
+           "PRESETS_FILE", "PRESET_OPTION_KEYS", "set_preset_options", "reset_preset", "describe_line", "approvals_to_devices", "approvals_route", "approval_notice", "apply_preset", "apply_settings", "read_changes", "migrate",
            "unmigrate", "legacy_word", "from_legacy", "read_sample"]
 
 VERSION = 1
@@ -107,6 +107,12 @@ PRESET_TABLE = {"away": {"devices": "on", "lets_through": "everything", "until":
                 "sleep": {"devices": "on", "lets_through": "needs", "until": "input"},
                 "loud": {"devices": "on", "lets_through": "everything", "until": "timer"}}
 _TITLES = {"away": "Away", "quiet": "Quiet", "sleep": "Sleep", "loud": "Loud"}
+# What a preset may carry once the operator changes it (Phill np-8a2d86ca, 11-04): the three settings plus the ending TYPE
+# (``input`` or ``timer``). A time or a duration is never carried: it belongs to one activation. ``<queue>/webpush/presets.json``
+# holds only the fields that differ from PRESET_TABLE, per preset; no file is the system defaults.
+PRESETS_FILE = "presets.json"
+PRESET_OPTION_KEYS = ("devices", "follow_after", "lets_through", "until")
+_UNTIL_KINDS = ("input", "timer")
 _FAULT_WHY = "the presence record could not be read: pushing"
 _FAULT_LINE = ("Pings now: your devices (the presence record could not be read: pushing). Devices: unknown. "
                "Lets through: everything. Until: it is repaired (levain ping status --json says why).")
@@ -584,7 +590,7 @@ def view(queue_dir: Path | str | None, *, now: float | None = None, idle: Callab
     ``word`` (the deciding preset), ``remote``, ``you``, ``desk``; plus ``line`` and ``chip`` (:func:`describe_line`,
     DESIGN §7), ``status`` (``file|default|projection|fault``), ``reason_fault``, ``base``, ``overlay`` (standing, else
     ``None``), ``ended`` (why an overlay on file has ended), ``effective`` (the settings in force), ``on`` (devices on now),
-    ``where`` (``devices|desk``), ``lets`` (:func:`lets_options`), ``held`` and ``approvals`` (the consent clause, or ``None``). ``reading`` (the raw laptop
+    ``where`` (``devices|desk``), ``lets`` (:func:`lets_options`), ``presets`` (:func:`_presets_view`), ``held`` and ``approvals`` (the consent clause, or ``None``). ``reading`` (the raw laptop
     idle) lets a caller that sampled it once hand it in."""
     at = time.time() if now is None else now
     try:
@@ -621,7 +627,8 @@ def view(queue_dir: Path | str | None, *, now: float | None = None, idle: Callab
            "ended": None if st["fault"] else st["ended"],
            "effective": None if st["fault"] else {k: v for k, v in st["eff"].items() if k not in ("by", "said", "verified")},
            "on": True if st["fault"] else st["on"], "where": "devices" if st["fault"] or st["goes"] else "desk",
-           "held": held_n, "approvals": approvals, "lets": lets_options()}
+           "held": held_n, "approvals": approvals, "lets": lets_options(),
+           "presets": _presets_view(queue_dir, s["rec"]["base"])}
     return out
 
 
@@ -630,6 +637,125 @@ def describe_line(queue_dir: Path | str | None, *, now: float | None = None,
     """THE one sentence (DESIGN §7), printed verbatim by ``levain ping status``, the cockpit and flow's ``phone_bridge.py
     status``. No surface composes its own words."""
     return view(queue_dir, now=now, idle=idle)["line"]
+
+
+# --------------------------------------------------------------------------------------------------- per-preset options
+def _presets_path(queue_dir: Path | str) -> Path:
+    return Path(queue_dir) / "webpush" / PRESETS_FILE
+
+
+def _option_ok(key: str, v: object) -> bool:
+    if key == "devices":
+        return v in DEVICES
+    if key == "lets_through":
+        return v in LETS
+    if key == "follow_after":
+        return _follow_ok(v)
+    return v in _UNTIL_KINDS
+
+
+def _load_presets(queue_dir: Path | str | None) -> tuple[dict, str]:
+    """``({preset: {option: value}}, fault)``. No file, or ``queue_dir`` of ``None``, is the system defaults. A file that cannot
+    be read safely reads as the defaults too (a preset then does what the table says) and names why in ``fault``; a WRITE
+    refuses it, so the options on file are never replaced silently."""
+    if queue_dir is None:
+        return {}, ""
+    try:
+        fd = os.open(_presets_path(queue_dir), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {}, ""
+    except OSError as e:
+        return {}, f"unreadable ({type(e).__name__})"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {}, "not a regular file"
+        raw = os.read(fd, _MAX_BYTES + 1)
+    except OSError as e:
+        return {}, f"unreadable ({type(e).__name__})"
+    finally:
+        os.close(fd)
+    if len(raw) > _MAX_BYTES:
+        return {}, "file too large"
+    try:
+        got = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return {}, "not valid JSON"
+    if not isinstance(got, dict) or isinstance(got.get("version"), bool) or got.get("version") != VERSION \
+            or not isinstance(got.get("presets"), dict):
+        return {}, f"version is not {VERSION}"
+    out: dict = {}
+    for name, opts in got["presets"].items():
+        if name not in PRESET_TABLE or not isinstance(opts, dict) or set(opts) - set(PRESET_OPTION_KEYS):
+            return {}, f"{name!r} is not a preset I carry options for"
+        if not all(_option_ok(k, v) for k, v in opts.items()):
+            return {}, f"a bad option on {name!r}"
+        out[name] = {k: (_intify(v) if k == "follow_after" else v) for k, v in opts.items()}
+    return out, ""
+
+
+def _write_presets(queue_dir: Path | str, presets: dict) -> None:
+    """Atomic write (tmp + ``os.replace``, ``O_NOFOLLOW``). The caller holds the presence lock."""
+    d = Path(queue_dir) / "webpush"
+    data = json.dumps({"version": VERSION, "presets": presets}).encode("utf-8")
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise PresenceError(f"{d} is not a directory of this user's")
+        tmp = d / f".{PRESETS_FILE}.{os.getpid()}.{time.time_ns()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+            os.replace(tmp, _presets_path(queue_dir))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+    except OSError as e:
+        raise PresenceError(f"preset options not written: {e}") from e
+
+
+def _spec(word: str, custom: dict, base: dict) -> dict:
+    """What activating ``word`` writes: the table's row, then the operator's changes, with ``follow_after`` the base's unless
+    the preset carries its own."""
+    out = {**PRESET_TABLE[word], **custom.get(word, {})}
+    out.setdefault("follow_after", base["follow_after"])
+    return out
+
+
+def _prune(word: str, opts: dict) -> dict:
+    """``opts`` without the fields equal to the system default (a stored option is always a difference)."""
+    return {k: v for k, v in opts.items() if not (k != "follow_after" and PRESET_TABLE[word].get(k) == v)}
+
+
+def _opts_text(o: dict, *, ends: bool) -> str:
+    dev = {"on": "on", "off": "off"}.get(o["devices"]) or f"follow, after {_mins(o['follow_after'])}"
+    text = f"Devices: {dev}. Lets through: {lets_label(o['lets_through'])}."
+    if ends:
+        text += " Ends: " + ("after a time you set" if o["until"] == "timer" else "on another word of yours or a message you type")
+    return text.strip()
+
+
+def _presets_view(queue_dir: Path | str | None, base: dict) -> dict:
+    """``{preset: {options, defaults, custom, summary}}`` for ``back`` (the standing default, whose options ARE the base) and the
+    four presets, so the page keeps no copy of a default or a sentence. ``custom`` is true when the options differ from the
+    defaults; ``summary`` is the one line the page shows under a customised preset."""
+    custom, _fault = _load_presets(queue_dir)
+    dflt = _default_base()
+    keys = ("devices", "follow_after", "lets_through")
+    bo = {k: base[k] for k in keys}
+    do = {k: dflt[k] for k in keys}
+    out = {"back": {"options": bo, "defaults": do, "custom": bo != do, "summary": _opts_text(bo, ends=False)}}
+    for w in PRESET_TABLE:
+        o = _spec(w, custom, base)
+        d = _spec(w, {}, base)
+        out[w] = {"options": o, "defaults": d, "custom": bool(custom.get(w)), "summary": _opts_text(o, ends=True)}
+    return out
 
 
 # --------------------------------------------------------------------------------------------------- writing the record
@@ -732,8 +858,13 @@ def _until_arg(until: object, ts: float) -> dict | None:
 def apply_preset(queue_dir: Path | str, preset: str, *, duration: str | None = None, by: dict | None = None,
                  said: str | None = None, match: object = None, via: str | None = None, wait: float | None = None,
                  now: float | None = None, idle: Callable[[], float | None] | None = None,
-                 precheck: Callable[[], None] | None = None, after: Callable[[], None] | None = None) -> dict:
+                 precheck: Callable[[], None] | None = None, after: Callable[[], None] | None = None,
+                 ending: str | None = None) -> dict:
     """Write a preset (``away``, ``back``, ``quiet [dur]``, ``sleep``, ``loud [dur|off]``) and return :func:`view` after.
+
+    The preset writes its table row as the operator has changed it (:func:`set_preset_options`). ``ending`` (``input`` or
+    ``timer``; the operator's own call only) ends THIS activation that way and is remembered as the preset's ending type; a
+    ``timer`` ending takes ``duration`` (one hour by default), and the duration is never remembered.
 
     ``back`` clears the overlay and leaves the base (and a standing ``loud``); ``loud off`` clears a standing loud only. A seat
     may set ``away`` only, the coordinator ``away``, ``quiet`` and ``sleep`` (:func:`levain.webpush.presence.check_setter`):
@@ -755,13 +886,13 @@ def apply_preset(queue_dir: Path | str, preset: str, *, duration: str | None = N
                     row["via"] = presence._clean(via, presence._FIELD_MAX)
                 presence._log_best_effort(queue_dir, {**row, "outcome": "refused", "why": presence._clean(str(e), presence._WHY_MAX)})
                 raise
-        _apply_preset_locked(queue_dir, preset, duration, ts, by, said, match, via, idle)
+        _apply_preset_locked(queue_dir, preset, duration, ts, by, said, match, via, idle, ending)
         if after is not None:
             after()
     return view(queue_dir, now=ts, idle=idle)
 
 
-def _apply_preset_locked(queue_dir, word, duration, ts, by, said, match, via, idle) -> None:
+def _apply_preset_locked(queue_dir, word, duration, ts, by, said, match, via, idle, ending=None) -> None:
     try:
         rec = _current(queue_dir, ts)
     except PresenceError as e:
@@ -780,7 +911,7 @@ def _apply_preset_locked(queue_dir, word, duration, ts, by, said, match, via, id
         if ev[1] is not None:
             row["said_at"] = ev[1]
     try:
-        action, new, why = _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle)
+        action, new, why = _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle, ending)
         if action == "write" or (action == "clear" and rec["overlay"] is not None):
             rec = _materialize(queue_dir, rec, ts)   # validated and planned against the projection: only now migrate
     except PresenceError as e:
@@ -799,6 +930,8 @@ def _apply_preset_locked(queue_dir, word, duration, ts, by, said, match, via, id
     try:
         if action == "write":
             _write_record(queue_dir, {"base": rec["base"] if rec["status"] == "file" else _default_base(ts), "overlay": new})
+            if ending is not None:
+                _remember(queue_dir, word, {"until": ending})
         elif action == "clear" and rec["overlay"] is not None:
             _write_record(queue_dir, {"base": rec["base"] if rec["status"] == "file" else _default_base(ts), "overlay": None})
     except PresenceError as e:
@@ -808,7 +941,7 @@ def _apply_preset_locked(queue_dir, word, duration, ts, by, said, match, via, id
         presence._log_best_effort(queue_dir, row)
 
 
-def _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle) -> tuple[str, dict | None, str]:
+def _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle, ending=None) -> tuple[str, dict | None, str]:
     """What a preset call does, with nothing written: ``(action, overlay, note)``, action ``write``, ``clear`` or ``keep``.
     Raises :class:`PresenceError` for a refusal."""
     if word not in WORDS:
@@ -842,19 +975,128 @@ def _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle) -> tuple[str, 
         return "keep", None, "back leaves a standing loud"
     if word == "back":
         return "clear", None, ""
-    if word not in TIMED and duration:
-        raise PresenceError(f"`{word}` takes no duration")
-    spec = PRESET_TABLE[word]
+    if ending is not None:
+        if by is not None:
+            raise PresenceError("the ending of a preset is the operator's own to choose")
+        if ending not in _UNTIL_KINDS:
+            raise PresenceError("a preset ends on `input` or on a `timer`")
     base = rec["base"]
-    new: dict = {"preset": word, "devices": spec["devices"], "follow_after": base["follow_after"],
+    custom, _fault = _load_presets(queue_dir)   # an unreadable options file reads as the system defaults
+    spec = _spec(word, custom, base)
+    kind = ending or spec["until"]
+    if kind != "timer" and duration:
+        raise PresenceError(f"`{word}` takes no duration")
+    new: dict = {"preset": word, "devices": spec["devices"], "follow_after": spec["follow_after"],
                  "lets_through": spec["lets_through"], "ts": ts,
-                 "until": {"kind": "timer", "at": ts + parse_duration(duration)} if word in TIMED else {"kind": "input"}}
+                 "until": {"kind": "timer", "at": ts + parse_duration(duration)} if kind == "timer" else {"kind": "input"}}
     if quote is not None:
         new["by"] = {"agent": presence._clean(by.get("agent"), presence._FIELD_MAX),
                      "session": presence._clean(by.get("session"), presence._FIELD_MAX), "role": by["role"]}
         new["said"] = quote
         new["verified"] = ev[0]
     return "write", new, note
+
+
+def _remember(queue_dir: Path | str, word: str, changed: dict) -> None:
+    """Merge ``changed`` into the options ``word`` carries and write them (only the differences from the table stay). The caller
+    holds the presence lock; a file that cannot be read is refused, never replaced."""
+    custom, fault = _load_presets(queue_dir)
+    if fault:
+        raise PresenceError(f"presets.json is there but cannot be read ({fault}): nothing was changed; repair it, "
+                            "or move it aside (no file is the system defaults)")
+    opts = _prune(word, {**custom.get(word, {}), **changed})
+    if opts:
+        custom[word] = opts
+    else:
+        custom.pop(word, None)
+    _write_presets(queue_dir, custom)
+
+
+def _forget(queue_dir: Path | str, word: str) -> None:
+    custom, fault = _load_presets(queue_dir)
+    if fault:
+        raise PresenceError(f"presets.json is there but cannot be read ({fault}): nothing was changed; repair it, "
+                            "or move it aside (no file is the system defaults)")
+    if custom.pop(word, None) is not None:
+        _write_presets(queue_dir, custom)
+
+
+def _preset_edit(queue_dir: Path | str, word: str, changed: dict | None, *, reset: bool, via: str | None, wait: float | None,
+                 now: float | None, idle: Callable[[], float | None] | None, precheck: Callable[[], None] | None,
+                 after: Callable[[], None] | None) -> dict:
+    if word not in PRESET_TABLE:
+        raise PresenceError(f"{word!r} is not a preset that carries options (one of: {', '.join(PRESET_TABLE)})")
+    label = f"reset {word}" if reset else f"set {word} " + " ".join(sorted(changed or {}))
+    with presence._locked(queue_dir, strict=wait is not None or precheck is not None, wait=wait):
+        ts = time.time() if now is None else now
+        row = {**presence._log_row(ts, presence._clean(label, 60), None, None, None, None),
+               **({"via": presence._clean(via, presence._FIELD_MAX)} if via else {})}
+        try:
+            if precheck is not None:
+                precheck()
+            rec = _current(queue_dir, ts)
+            if reset:
+                _forget(queue_dir, word)
+            else:
+                _remember(queue_dir, word, changed or {})
+            ov = rec["overlay"]
+            reading, msg_at = _live(queue_dir, ts, idle, rec)
+            if ov is not None and ov["preset"] == word and overlay_active(rec, ts, _last_input(ts, reading), msg_at):
+                # the preset that stands takes its new options now, keeping when it began and how it ends
+                custom, _ = _load_presets(queue_dir)
+                spec = _spec(word, custom, rec["base"])
+                rec = _materialize(queue_dir, rec, ts)
+                new = {**rec["overlay"], **{k: spec[k] for k in ("devices", "follow_after", "lets_through")}}
+                _write_record(queue_dir, {"base": rec["base"], "overlay": new})
+        except PresenceError as e:
+            presence._log_best_effort(queue_dir, {**row, "outcome": "refused", "why": presence._clean(str(e), presence._WHY_MAX)})
+            raise
+        presence._log_best_effort(queue_dir, {**row, "outcome": "set"})
+        if after is not None:
+            after()
+    return view(queue_dir, now=ts, idle=idle)
+
+
+def set_preset_options(queue_dir: Path | str, preset: str, *, devices: str | None = None, follow_after: float | str | None = None,
+                       lets_through: str | None = None, until: str | None = None, via: str | None = None,
+                       wait: float | None = None, now: float | None = None, idle: Callable[[], float | None] | None = None,
+                       precheck: Callable[[], None] | None = None, after: Callable[[], None] | None = None) -> dict:
+    """Change what ``preset`` (away, quiet, sleep, loud) does from now on, and return :func:`view` after. The operator's own
+    call; the options stick until :func:`reset_preset`. ``until`` is the ending TYPE (``input`` or ``timer``) only. When the
+    preset stands, it takes the new settings now and keeps its start and its end."""
+    changed: dict = {}
+    if devices is not None:
+        changed["devices"] = devices
+    if lets_through is not None:
+        changed["lets_through"] = lets_through
+    if follow_after is not None:
+        if isinstance(follow_after, str):
+            changed["follow_after"] = _intify(parse_duration(follow_after))
+        else:
+            changed["follow_after"] = follow_after
+    if until is not None:
+        changed["until"] = until
+    if not changed:
+        raise PresenceError("set at least one of devices, follow_after, lets_through or until")
+    bad = [k for k, v in changed.items() if not _option_ok(k, v)]
+    if bad:
+        raise PresenceError(f"not a valid {', '.join(bad)} (devices: {', '.join(DEVICES)}; lets_through: {', '.join(LETS)}; "
+                            f"follow_after 1 minute to 24 hours; until: input or timer)")
+    return _preset_edit(queue_dir, preset, changed, reset=False, via=via, wait=wait, now=now, idle=idle, precheck=precheck,
+                        after=after)
+
+
+def reset_preset(queue_dir: Path | str, preset: str, *, via: str | None = None, wait: float | None = None,
+                 now: float | None = None, idle: Callable[[], float | None] | None = None,
+                 precheck: Callable[[], None] | None = None, after: Callable[[], None] | None = None) -> dict:
+    """Return ``preset`` to the system defaults (away, quiet, sleep, loud: its stored options go; ``back``: the standing default
+    returns to follow after 10 minutes, everything), and return :func:`view` after."""
+    if preset == "back":
+        return apply_settings(queue_dir, devices=_default_base()["devices"], follow_after=FOLLOW_DEFAULT,
+                              lets_through=_default_base()["lets_through"], until="switch", via=via, wait=wait, now=now,
+                              idle=idle, precheck=precheck, after=after)
+    return _preset_edit(queue_dir, preset, None, reset=True, via=via, wait=wait, now=now, idle=idle, precheck=precheck,
+                        after=after)
 
 
 def apply_settings(queue_dir: Path | str, *, devices: str | None = None, follow_after: float | str | None = None,

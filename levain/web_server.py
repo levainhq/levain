@@ -2483,7 +2483,8 @@ class _Handler(GuardedHandler):
         ``{preset, for?}`` (away, back, quiet, sleep, loud; ``for`` is a timed preset's duration, ``off`` for ``loud``),
         ``{word, for?}`` (the same, plus the tap aliases ``desk`` and ``devices``) or ``{devices?, follow_after?, lets_through?,
         until?}`` (``until`` is ``switch``, ``input`` or a duration; ``switch`` writes the standing default). The direct
-        settings are the full credential's alone: a tap token sends presets only. A refusal is a 422 with its words, a lock held
+        settings are the full credential's alone, as are ``{customize: <preset>, devices?, follow_after?, lets_through?, until?}``
+        (what a preset does from now on; ``until`` is its ending type), ``{reset: <preset>}`` and a preset's ``ending``: a tap token sends presets only. A refusal is a 422 with its words, a lock held
         past the bounded wait a 503; every write is followed by the held-ping flush, and the reply is the view after (the one
         the cockpit repaints from), so what it shows is what ``levain ping status`` prints at that instant."""
         from levain.webpush import intent, presence, route as route_mod
@@ -2499,8 +2500,15 @@ class _Handler(GuardedHandler):
             shape = "send an object"
         elif "preset" in req or "word" in req:
             key = "preset" if "preset" in req else "word"
-            if set(req) - {key, "for"} or not isinstance(req.get(key), str) or not isinstance(req.get("for", ""), str):
-                shape = "send preset (or word) as text, and for (a duration) as text if the preset is timed"
+            if (set(req) - {key, "for", "ending"} or not isinstance(req.get(key), str) or not isinstance(req.get("for", ""), str)
+                    or not isinstance(req.get("ending", ""), str)):
+                shape = "send preset (or word) as text, for (a duration) as text if the preset ends on a timer, and ending as text"
+        elif "customize" in req or "reset" in req:
+            key = "customize" if "customize" in req else "reset"
+            if (not isinstance(req.get(key), str) or set(req) - ({key, "devices", "follow_after", "lets_through", "until"} if key == "customize" else {key})
+                    or any(k in req and not isinstance(req[k], str) for k in ("devices", "lets_through", "until"))
+                    or ("follow_after" in req and not (num(req["follow_after"]) or isinstance(req["follow_after"], str)))):
+                shape = "send customize (or reset) as a preset name, with devices, follow_after, lets_through and until (input or timer) to change"
         elif not req or set(req) - setting_keys:
             shape = "send a preset, or devices, follow_after, lets_through and until"
         elif (any(k in req and not isinstance(req[k], str) for k in ("devices", "lets_through"))
@@ -2509,7 +2517,7 @@ class _Handler(GuardedHandler):
             shape = "devices and lets_through are text, follow_after a number of seconds or text like 15m, until switch, input or a duration"
         if shape:
             return {"error": "bad_request", "message": shape}, 400
-        direct = "preset" not in req and "word" not in req
+        direct = ("preset" not in req and "word" not in req) or "ending" in req
         word = req.get("preset") if "preset" in req else req.get("word")
         queue = self.server.signer.queue_dir
         tap = None if self._credential_is_full() else self._presence_credential()
@@ -2545,7 +2553,23 @@ class _Handler(GuardedHandler):
             def after() -> None:
                 presence_tokens.stamp(queue, name)
         try:
-            if direct:
+            if "customize" in req or "reset" in req:
+                name = req.get("customize", req.get("reset"))
+                common = dict(via=via, wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
+                if "reset" in req:
+                    intent.reset_preset(queue, name, **common)
+                elif name == "back":      # Back's options ARE the standing default
+                    if "until" in req:
+                        raise presence.PresenceError("Back has no ending: it is the standing default")
+                    intent.apply_settings(queue, devices=req.get("devices"), follow_after=req.get("follow_after"),
+                                          lets_through=req.get("lets_through"), until="switch", by=None, **common)
+                else:
+                    intent.set_preset_options(queue, name, devices=req.get("devices"), follow_after=req.get("follow_after"),
+                                              lets_through=req.get("lets_through"), until=req.get("until"), **common)
+            elif "ending" in req:
+                intent.apply_preset(queue, word, duration=req.get("for") or None, ending=req["ending"], by=None, via=via,
+                                    wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)
+            elif direct:
                 intent.apply_settings(queue, devices=req.get("devices"), follow_after=req.get("follow_after"),
                                       lets_through=req.get("lets_through"), until=req.get("until", "switch"), by=None,
                                       via=via, wait=_POLICY_LOCK_WAIT_SECS, precheck=precheck, after=after)

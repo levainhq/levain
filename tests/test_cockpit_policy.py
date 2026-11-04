@@ -71,4 +71,4 @@ def test_the_panel_script_no_longer_draws_the_policy_block():
     js = js[0].decode() if isinstance(js, tuple) else js
     for gone in ("buildPolicy", "/webpush/policy", "HOLD_WARN", "Reach me"):
         assert gone not in js, gone
-    assert "Lets through" in js and "Standing default" in js
+    assert "Lets through" in js
