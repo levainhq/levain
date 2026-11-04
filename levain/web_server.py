@@ -5377,7 +5377,30 @@ def _build_room_serve(room: Path) -> Any:
     if not cwd.is_dir():
         raise ValueError(f"{cwd} is not a directory (it is where the room's file tools see first)")
     queue = Path(default_queue_dir()).resolve()
+    _room_dir_refusal(cwd, queue)
     return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd)), run_dir=str(queue / "room-run"))
+
+
+def _room_dir_refusal(cwd: Path, queue: Path) -> None:
+    """Refuse a ``--room DIR`` that would make the room's read boundary too wide (roomfix1 C1): the user's home, any
+    ancestor of it (``/``, ``/Users``), a directory holding levain's own home or its consent queue (its stores, tokens and
+    keys), or one inside levain's home. Every side is compared resolved. The deny rules still cover the credential paths
+    inside an allowed DIR; this refuses the DIRs where they would be the only line. ``ValueError`` naming the reason."""
+    home = Path.home().resolve()                 # $HOME, else the password database's (os.path.expanduser)
+    levain_home = queue.parent
+
+    def inside(child: Path, root: Path) -> bool:
+        return child == root or root in child.parents
+
+    if inside(home, cwd):
+        what = "your home directory" if cwd == home else f"a directory that holds your home directory ({home})"
+        raise ValueError(f"{cwd} is {what}: the room's file tools would read all of it; pass a project directory")
+    for own, name in ((levain_home, "levain's home"), (queue, "levain's consent queue")):
+        if inside(own, cwd):
+            raise ValueError(f"{cwd} holds {name} ({own}): the room's file tools would read levain's own stores and "
+                             "keys; pass a directory outside it")
+    if inside(cwd, levain_home):
+        raise ValueError(f"{cwd} is inside levain's home ({levain_home}); pass a directory outside it")
 
 
 def _serve_signer(queue_dir: Path, host: str) -> "Signer":

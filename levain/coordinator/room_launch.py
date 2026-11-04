@@ -310,7 +310,7 @@ class RoomLauncher:
                  home: Optional[str] = None, python: Optional[str] = None, spawn: Callable[..., Any] = _spawn,
                  idle_seconds: float = IDLE_SECONDS, open_deadline: float = OPEN_DEADLINE,
                  now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 environ: Optional[dict] = None) -> None:
+                 environ: Optional[dict] = None, levain_home: Optional[str] = None) -> None:
         if setting.harness != "claude":
             raise RoomLaunchError(f"the room opens on claude here; a {str(setting.harness)[:20]} room profile is not "
                                   "built (RM-D3)")
@@ -331,9 +331,15 @@ class RoomLauncher:
         self._lock = threading.RLock()                 # one open, end or recycle at a time
         self._live: dict = {}
         self._conn = 0
+        if levain_home is None:
+            from levain.consent.queue import queue_dir_for     # lazy: the consent package is not this module's import
+
+            # levain's own home as the environment the child gets names it (the consent queue's parent)
+            levain_home = str(queue_dir_for(self._environ if self._environ is not None else os.environ).parent)
+        self._levain_home = levain_home
         # refused early, before any launch row: a bad cwd/deny pair is the operator's to fix
         try:
-            self._settings_json = room_settings_json(setting.cwd, default_deny_paths(self._home))
+            self._settings_json = room_settings_json(setting.cwd, default_deny_paths(self._home, levain_home))
         except ValueError as exc:
             raise RoomLaunchError(f"the room's settings could not be built: {exc}") from exc
 

@@ -112,6 +112,57 @@ def test_make_server_refuses_a_second_service_and_a_serve_over_another_directory
     assert not rs2._started                                                      # the refusal came before the start
 
 
+# --- roomfix1 C1: a --room DIR that would widen the read boundary is refused --------------------------------------------
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    """A HOME and a LEVAIN_HOME under tmp_path (his real home is never read or written)."""
+    home = tmp_path / "home"
+    (home / ".levain" / "consent").mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("LEVAIN_HOME", str(home / ".levain"))
+    return home
+
+
+@pytest.mark.parametrize("which, why", [
+    ("home", "your home directory"),
+    ("above_home", "holds your home directory"),
+    ("in_levain", "inside levain's home"),
+])
+def test_a_room_dir_that_is_home_above_it_or_in_levains_home_is_refused(fake_home, which, why):
+    from levain.web_server import _build_room_serve
+    d = {"home": fake_home, "above_home": fake_home.parent, "in_levain": fake_home / ".levain" / "x"}[which]
+    d.mkdir(exist_ok=True)
+    with pytest.raises(ValueError, match=why):
+        _build_room_serve(d)
+
+
+def test_a_room_dir_holding_levains_home_is_refused(tmp_path, monkeypatch):
+    from levain.web_server import _build_room_serve
+    home, proj = tmp_path / "home", tmp_path / "proj"
+    home.mkdir()
+    (proj / "lv" / "consent").mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("LEVAIN_HOME", str(proj / "lv"))
+    with pytest.raises(ValueError, match="holds levain's home"):
+        _build_room_serve(proj)
+
+
+def test_a_project_dir_is_served_and_its_launcher_denies_levains_home(fake_home):
+    from levain.web_server import _build_room_serve
+    proj = fake_home / "proj"
+    proj.mkdir()
+    rs = _build_room_serve(proj)
+    try:
+        deny = json.loads(rs.launcher._settings_json)["permissions"]["deny"]
+        lv = str((fake_home / ".levain").resolve())
+        assert f"Read(/{lv})" in deny and f"Read(/{lv}/**)" in deny
+        for name in (".netrc", ".npmrc", ".config/gh", ".claude.json", ".claude"):
+            assert f"Read(/{fake_home}/{name})" in deny, name
+    finally:
+        rs.stop()
+
+
 # --- d: the page can open the room -------------------------------------------------------------------------------------
 
 def test_with_no_room_open_a_send_names_none_and_the_serve_is_never_asked_to_open_on_a_none(tmp_path, qdir, monkeypatch):
