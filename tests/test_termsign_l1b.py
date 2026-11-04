@@ -318,3 +318,21 @@ def test_signers_line_carries_both_namespaces_as_one_option_string():
     line = ts.signers_line("ecdsa-sha2-nistp256 AAAAE2Vj comment")
     assert line == 'phill namespaces="levain-terminal-answer,levain-desk-answer" ecdsa-sha2-nistp256 AAAAE2Vj'
     assert line.count("namespaces=") == 1
+
+
+def test_created_report_prints_the_co_root_step(tmp_path, outside):
+    """The genesis key is not the end of the sitting: step 3 names the independent passphrase co-root and its enrol."""
+    def make(key_dir, label):
+        pub = Path(key_dir) / (label + ".pub")
+        pub.write_text(SK_PUB + "\n")
+        return CreatedKey(Path(key_dir) / label, pub, SK_PUB, "touch-id", label, "ab" * 20)
+
+    (tmp_path / "keys").mkdir(mode=0o700)
+    rep = ts.create(tmp_path / "keys", creator=make)
+    assert rep.created
+    lines = rep.text.splitlines()
+    [i3] = [i for i, x in enumerate(lines) if x.startswith("3. Co-root")]
+    assert i3 > max(i for i, x in enumerate(lines) if x.startswith("2. Levain"))
+    body = "\n".join(lines[i3:])
+    assert "levain cockpit key create --custody passphrase --label laptop-presence" in body
+    assert "--class laptop-presence --custody passphrase --signing-key" in body
