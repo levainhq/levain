@@ -28,8 +28,8 @@ in flight and a line naming no room lands on the room that was open
 when it began. The pump takes it to take its handle and to recycle (so an idle recycle never lands between a send's
 open and its recorded line), and never across a vendor read. The lock order is RoomServe, then the launcher, then the
 service, on every path. A rotation ends the old launch under the lock and the held handle is None until the next send,
-by design: the old child's late output is not read. :meth:`stop` waits behind a send in flight without bound, by
-design.
+by design: the old child's late output is not read. :meth:`stop` waits behind a send in flight, by design, and says
+so to its caller (``on_wait``). A page poll reads :meth:`status`, which takes no lock.
 
 NOT HERE: the HTTP routes and the page's token (the cockpit's room routes, RM-F, are the callers). A route calls the
 three methods above and maps the exceptions; ``levain serve`` builds one :class:`RoomServe` and calls :meth:`start`
@@ -52,6 +52,8 @@ __all__ = ["PUMP_INTERVAL", "RoomServe", "RoomServeError"]
 PUMP_INTERVAL = 0.25
 # [seat] how long :meth:`RoomServe.stop` waits for the pump thread
 _JOIN_WAIT = 10.0
+# [seat] how long :meth:`RoomServe.stop` waits for a send in flight before it says it is waiting
+_STOP_NOTE_AFTER = 1.0
 _TITLE = "the room"
 
 
@@ -119,15 +121,26 @@ class RoomServe:
             self._started = True
             return self.recovered
 
-    def stop(self) -> None:
-        """Stop the pump, end the room's child, close the service. Idempotent; never raises."""
-        with self._lock:
+    def stop(self, on_wait: Optional[Callable[[], None]] = None) -> None:
+        """Stop the pump, end the room's child, close the service. Idempotent; never raises (``on_wait`` aside).
+
+        The pump is told to stop first, with no lock taken. A send in flight holds the serve's lock (across the
+        launcher's open, bounded by the launcher's open deadline), and this waits for it: by design, a line is never
+        cut off mid-send. When the lock is not free within :data:`_STOP_NOTE_AFTER` seconds, ``on_wait()`` is called
+        once (``levain serve`` prints that it is waiting) and the wait goes on."""
+        self._stop_evt.set()                     # before _stopped: a step in between is a clean stop, not an error
+        if not self._lock.acquire(timeout=_STOP_NOTE_AFTER):
+            if on_wait is not None:
+                on_wait()
+            self._lock.acquire()
+        try:
             if self._stopped:
                 return
-            self._stop_evt.set()                 # before _stopped: a step in between is a clean stop, not an error
             self._stopped = True
             thread = self._thread
             self._handle = None
+        finally:
+            self._lock.release()
         if thread is not None and thread is not threading.current_thread():
             thread.join(_JOIN_WAIT)
             if thread.is_alive():
@@ -238,6 +251,13 @@ class RoomServe:
             held = self._handle
             return {"room_thread": thread, "launch_id": None if held is None else held.launch_id,
                     "last_error": self.last_error}
+
+    def status(self) -> dict[str, Any]:
+        """What a page POLL may read: the last pump, open or stop error, and whether the serve runs. It takes NO lock
+        and reads no store (roomfix1 R1: the poll called :meth:`view`, which waits for a send holding the lock across
+        the launcher's open, so every poll stalled and held a request slot until it ended). One attribute read each,
+        so it never blocks; it never raises."""
+        return {"last_error": self.last_error, "running": self._started and not self._stopped}
 
     def interrupt(self, launch_id: str) -> Any:
         """His Stop: the service's unfenced interrupt of ``launch_id`` (the room's newest launch, which the route reads

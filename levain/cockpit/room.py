@@ -71,7 +71,8 @@ class RoomHost:
     A host built from a :class:`~levain.coordinator.room_serve.RoomServe` (:func:`host_from`) also carries ``send``
     (``RoomServe.send``: ordered against recover, the open and the launch, called with ``room_thread=`` the page's),
     ``stop(launch_id)`` (``RoomServe.interrupt``), ``open()`` (the first-need open, ``RoomServe.ensure_room``) and
-    ``view()`` (the pump's last error). Without ``send`` a send is ``ensure()`` then ``service.send_room``; without
+    ``view()`` (the pump's last error; :func:`host_from` gives ``RoomServe.status``, which takes no lock, so a page poll
+    never waits for a send in flight). Without ``send`` a send is ``ensure()`` then ``service.send_room``; without
     ``stop`` a stop is ``service.interrupt``; without ``open`` the route serves none."""
     service: Any
     store: Any
@@ -87,7 +88,7 @@ def host_from(rs: Any) -> RoomHost:
     """The host a ``levain serve`` mounts over its :class:`~levain.coordinator.room_serve.RoomServe`: ONE ChatService
     (``rs.service``, the one ``make_server`` reads through), the store, and every verb the serve orders."""
     return RoomHost(rs.service, rs.store, rotate=rs.rotate, send=rs.send, stop=rs.interrupt, open=rs.ensure_room,
-                    view=rs.view)
+                    view=rs.status)
 
 
 def is_room_path(path: str) -> bool:

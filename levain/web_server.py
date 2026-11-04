@@ -1768,7 +1768,10 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.stream_stop.set()      # open streams end first: nothing is left holding a thread
         self.stream_watcher.stop()
         if self.room_serve is not None:
-            self.room_serve.stop()      # the pump and the room's child end; stop() never raises
+            # the pump and the room's child end. stop() waits for a send in flight (an open can take the launcher's
+            # open deadline), and says so here rather than leave a Ctrl-C silent
+            self.room_serve.stop(on_wait=lambda: print(
+                "  waiting for the room's line in flight to finish before the room stops...", file=sys.stderr, flush=True))
         if self.broker is not None:
             self.broker.stop()
         if self.coord_sheet is not None:

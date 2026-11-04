@@ -220,6 +220,58 @@ def test_a_stop_is_not_queued_behind_a_send_that_holds_the_serve(tmp_path, qdir)
         rs.stop()
 
 
+def test_the_page_read_answers_with_room_error_while_a_send_holds_the_serve(tmp_path, qdir):
+    """roomfix1 R1 (reproduced): GET /cockpit/room.json called RoomServe.view(), which takes the serve's lock that a send
+    holds across the launcher's open (up to OPEN_DEADLINE). Every poll stalled (and held a request slot) until the send
+    ended. The read takes no serve lock: it answers at once, room_error included."""
+    rs, _l, src = _rig(tmp_path, qdir)
+    with _serve(src, write_token=TOKEN, room_serve=rs) as (base, _h):
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with rs._lock:                       # what an open in a send does for as long as it runs
+                held.set()
+                release.wait(30)
+        t = threading.Thread(target=hold, daemon=True)
+        t.start()
+        try:
+            assert held.wait(5)
+            rs.last_error = "pump: OSError: the child's pipe closed"
+            begun = time.monotonic()
+            req = urllib.request.Request(base + "/cockpit/room.json", headers={"X-Levain-Write-Token": TOKEN})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                st, got = r.status, json.loads(r.read())
+            assert time.monotonic() - begun < 3, "the page read waited for the serve's lock"
+            assert st == 200 and got["room_error"] == "pump: OSError: the child's pipe closed"
+        finally:
+            release.set()
+            t.join(5)
+
+
+def test_a_stop_behind_a_send_in_flight_says_it_is_waiting(tmp_path, qdir):
+    """roomfix1 R1: server_close -> RoomServe.stop() waits for a send in flight (by design); the wait is named to the
+    caller (``on_wait``) instead of a silent Ctrl-C, and the pump is told to stop before the wait."""
+    rs, _l, _src = _rig(tmp_path, qdir)
+    rs.start()
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with rs._lock:
+            held.set()
+            release.wait(30)
+    t = threading.Thread(target=hold, daemon=True)
+    t.start()
+    assert held.wait(5)
+    said = []
+
+    def waiting():
+        said.append(rs._stop_evt.is_set())
+        release.set()                            # the send in flight ends
+    rs.stop(on_wait=waiting)
+    t.join(5)
+    assert said == [True] and rs._stopped
+
+
 def test_the_stop_route_acts_through_the_serve(tmp_path, qdir, monkeypatch):
     rs, launcher, src = _rig(tmp_path, qdir)
     seen = []
