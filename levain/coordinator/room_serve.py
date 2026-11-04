@@ -19,9 +19,18 @@ the pump never opens a room (a quiet serve stays quiet).
 refuses a rotated one (:class:`~levain.coordinator.chat.RoomRotated`); a surface that names none sends to the open room.
 Each send is its own outbox row, so two tabs never hold anything between requests.
 
-NOT HERE: the HTTP routes and the page's token (``levain/cockpit/room.py``, ``levain/web_server.py``, RM-F). A route
-calls the three methods above and maps the exceptions; ``levain serve`` builds one :class:`RoomServe` and calls
-:meth:`start` and :meth:`stop`.
+**The room's thread** is made with :meth:`~levain.coordinator.store.CoordStore.bare_thread`, never by a drop: a drop
+would wake the coordinator in the same transaction and would sit in the drop list. A new room is opened, and a rotation
+done, in one transaction with its thread.
+
+**One lock orders the seam.** :meth:`send` holds it across the service's send, so a stop or a rotate waits for a line
+in flight and a line naming no room lands on the room that was open
+when it began. The pump takes it only to drop a handle. After a rotation the held handle is None until the next send,
+by design: the old child's late output is not read.
+
+NOT HERE: the HTTP routes and the page's token (the cockpit's room routes, RM-F, are the callers). A route calls the
+three methods above and maps the exceptions; ``levain serve`` builds one :class:`RoomServe` and calls :meth:`start`
+and :meth:`stop`.
 
 Stdlib plus levain. The launcher is a seam (``launcher``) so a test can supply one of its own."""
 from __future__ import annotations
@@ -30,9 +39,9 @@ import threading
 from typing import Any, Callable, Mapping, Optional
 
 from levain.coordinator import room
-from levain.coordinator.chat import ChatService, ChatStore, SendReceipt, _open_room
+from levain.coordinator.chat import ChatService, ChatStore, SendReceipt, _message, _open_room
 from levain.coordinator.room_launch import (RoomHandle, RoomLauncher, RoomSetting, make_probe, make_tripwires)
-from levain.coordinator.store import CoordError, Part
+from levain.coordinator.store import CoordError
 
 __all__ = ["PUMP_INTERVAL", "RoomServe", "RoomServeError"]
 
@@ -40,6 +49,7 @@ __all__ = ["PUMP_INTERVAL", "RoomServe", "RoomServeError"]
 PUMP_INTERVAL = 0.25
 # [seat] how long :meth:`RoomServe.stop` waits for the pump thread
 _JOIN_WAIT = 10.0
+_TITLE = "the room"
 
 
 class RoomServeError(CoordError):
@@ -97,17 +107,20 @@ class RoomServe:
         with self._lock:
             if self._stopped:
                 return
+            self._stop_evt.set()                 # before _stopped: a step in between is a clean stop, not an error
             self._stopped = True
-            self._stop_evt.set()
             thread = self._thread
+            self._handle = None
         if thread is not None and thread is not threading.current_thread():
             thread.join(_JOIN_WAIT)
+            if thread.is_alive():
+                self.last_error = (f"stop: the pump did not stop within {_JOIN_WAIT:g}s; it may still run against a "
+                                   "closed launcher")
         for close in (self.launcher.close, self.service.close):
             try:
                 close()
             except Exception as exc:  # noqa: BLE001 - a stop that cannot finish one step still does the next
                 self.last_error = f"stop: {type(exc).__name__}: {str(exc)[:200]}"
-        self._handle = None
 
     def _ready(self) -> None:
         if self._stopped:
@@ -118,21 +131,47 @@ class RoomServe:
     # --- the pump --------------------------------------------------------------------------------------------------
     def pump_once(self) -> int:
         """One pump step (the loop's body, callable by a test): recycle an idle child, then read the held launch. The
-        count of new events. Raises what the step raised; the loop records it."""
+        count of new events. Raises what the step raised; the loop records it. A held launch whose child exited is
+        ended and dropped, and :attr:`last_error` says so; the next send resumes it."""
         self._ready()
         handle = self._handle
         ended = self.launcher.recycle_idle()
         if handle is not None and handle.launch_id in ended:
-            self._handle = handle = None
+            self._drop_handle(handle)
+            return 0
         if handle is None:
             return 0
-        return self.service.read_next(handle.launch_id)
+        if not self.launcher.child_alive(handle.launch_id):
+            with self._lock:
+                if self._handle is handle:
+                    self.launcher.end(handle.launch_id, "room child exited")
+                    self._handle = None
+                    self.last_error = (f"the room's child exited (launch {handle.launch_id}); the next send "
+                                       "resumes the conversation")
+            return 0
+        try:
+            got = self.service.read_next(handle.launch_id)
+        except Exception:
+            if self._handle is not handle:       # a send or rotate replaced the handle mid-step: not this step's fault
+                return 0
+            raise
+        if got:
+            self.last_error = None
+        return got
+
+    def _drop_handle(self, handle: RoomHandle) -> None:
+        with self._lock:
+            if self._handle is handle:
+                self._handle = None
 
     def _run(self) -> None:
         while not self._stop_evt.is_set():
             got = 0
             try:
                 got = self.pump_once()
+            except RoomServeError:
+                if not self._stop_evt.is_set():
+                    self.last_error = "pump: the room was asked for out of order"
             except Exception as exc:  # noqa: BLE001 - the pump outlives one bad step; the cause is on last_error
                 self.last_error = f"pump: {type(exc).__name__}: {str(exc)[:200]}"
             if not got:
@@ -142,30 +181,36 @@ class RoomServe:
     def ensure_room(self) -> RoomHandle:
         """The open room's running launch: a room is opened on the first need (a new thread, the store's own way) and
         its child opened or reopened (resuming) by the launcher. Raises :class:`RoomServeError` before start; the
-        launcher's :class:`~levain.coordinator.room_launch.RoomLaunchError` when the open check fails."""
+        launcher's :class:`~levain.coordinator.room_launch.RoomLaunchError` when the open check fails. A good open
+        clears :attr:`last_error`."""
         with self._lock:
             self._ready()
             if self.chat_store._read(_open_room) is None:
                 self._open_new_room()
             self._handle = self.launcher.ensure()
+            self.last_error = None
             return self._handle
 
     def send(self, *, author_surface: str, client_id: str, outbox_id: str, body: str,
              room_thread: Optional[str] = None, attachments: tuple = ()) -> SendReceipt:
         """Your line to the room. ``room_thread`` is the thread the surface drew (None: the open room); a rotated one
         is refused ``RoomRotated`` by the service with nothing written. A stored ``outbox_id`` is answered from its
-        record first (the service's replay), so a resend after a restart opens nothing."""
+        record before any room is resolved (it names the thread it was sent to unless the surface names one), so a
+        resend after a restart or a rotation opens nothing. The lock is held through the service's send."""
         with self._lock:
             self._ready()
+            send = dict(author_surface=author_surface, client_id=client_id, outbox_id=outbox_id, body=body,
+                        attachments=attachments)
+            stored = self.chat_store._read(lambda conn: _message(conn, "outbox_id", outbox_id)) \
+                if isinstance(outbox_id, str) else None
+            if stored is not None:
+                return self.service.send_room(room_thread if room_thread is not None else stored.thread_id, **send)
             if room_thread is not None and self.chat_store._read(_open_room) != room_thread:
                 # a surface that drew a room that is not the open one: the service refuses it, and a refusal opens
                 # nothing (no child is spawned for a line that will not be sent)
-                return self.service.send_room(room_thread, author_surface=author_surface, client_id=client_id,
-                                              outbox_id=outbox_id, body=body, attachments=attachments)
+                return self.service.send_room(room_thread, **send)
             handle = self.ensure_room()
-        return self.service.send_room(room_thread if room_thread is not None else handle.room_thread,
-                                      author_surface=author_surface, client_id=client_id, outbox_id=outbox_id,
-                                      body=body, attachments=attachments)
+            return self.service.send_room(room_thread if room_thread is not None else handle.room_thread, **send)
 
     def view(self) -> dict[str, Any]:
         """What a route hands the page, with no side effect (it opens nothing): the open room thread (None when no room
@@ -174,26 +219,25 @@ class RoomServe:
         thread = self.chat_store._read(_open_room)
         held = self._handle
         return {"room_thread": thread, "launch_id": None if held is None else held.launch_id,
-                "started": True, "last_error": self.last_error}
+                "last_error": self.last_error}
 
     def rotate(self) -> str:
-        """His "new conversation": a new room thread opened, the old one rotated. The next send opens the new room's
-        child (the launcher ends the old one). Returns the new room thread."""
+        """His "new conversation": a new room thread opened, the old one rotated, in one transaction. With no room
+        open it raises (:class:`RoomServeError`) before writing anything; the first send opens a room. The next send
+        opens the new room's child (the launcher ends the old one). Returns the new room thread."""
         with self._lock:
             self._ready()
-            new = self._new_thread()
-            with self._store._write() as (conn, _now):
+            with self._store._write() as (conn, now):
+                if room.current_room(conn) is None:
+                    raise RoomServeError("no room is open to rotate; nothing was done")
+                new = self._store.bare_thread(conn, now, _TITLE)
                 room.rotate(conn, new)
             self._handle = None
             return new
 
     # --- the thread -----------------------------------------------------------------------------------------------
-    def _new_thread(self) -> str:
-        d = self._store.accept_drop("the room", surface="cli")[0]
-        return self._store.split(d.drop_id, [Part("note", "the room")])[0].thread_id
-
     def _open_new_room(self) -> str:
-        thread = self._new_thread()
-        with self._store._write() as (conn, _now):
+        with self._store._write() as (conn, now):
+            thread = self._store.bare_thread(conn, now, _TITLE)
             room.open_room_thread(conn, thread)
         return thread

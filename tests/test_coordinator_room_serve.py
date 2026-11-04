@@ -82,12 +82,19 @@ class ScriptedLauncher:
     def recycle_idle(self):
         return []
 
+    def child_alive(self, _launch_id):
+        return True
+
+    def end(self, launch_id, _cause):
+        self.svc.detach(launch_id)
+        self.handle = None
+
     def close(self):
         self.closed = True
 
 
-def scripted(tmp_path, **kw):
-    store = make_store(tmp_path)
+def scripted(tmp_path, store=None, **kw):
+    store = store or make_store(tmp_path)
     holder = {}
 
     def build(cs, svc):
@@ -318,3 +325,264 @@ def test_a_restart_recovers_then_resumes_the_rooms_conversation_on_the_same_thre
         rs2.stop()
         rs1.launcher.close()
         rs1.service.close()
+
+
+# --- the fix lane (FINDINGS_rmg_r1) ----------------------------------------------------------------------------------
+import sqlite3
+import threading
+
+from levain.coordinator.store import CoordError
+
+
+def counts(rs):
+    """(chat_messages, chat_outbox_events, threads, room_events) as the store holds them (0 for a table not made yet)."""
+    def one(c, t):
+        try:
+            return c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        except sqlite3.OperationalError:
+            return 0
+    return rs.chat_store._read(lambda c: tuple(one(c, t) for t in (
+        "chat_messages", "chat_outbox_events", "threads", "room_events")))
+
+
+def coordinator_launches(store):
+    with store._write() as (conn, now):
+        return [ln for ln in lease.launches(conn, limit=20) if ln.role == "coordinator"]
+
+
+# F1: the room's thread is made without a drop and never wakes the coordinator
+def test_bare_thread_makes_a_thread_with_no_drop_no_receipt_and_no_wake(tmp_path):
+    store = make_store(tmp_path)
+    store.coord_set_agent("claude", cwd=str(tmp_path))
+    with store._write() as (conn, now):
+        tid = store.bare_thread(conn, now, "the room")
+    t = store.thread(tid)
+    assert (t.kind, t.state, t.members, t.title) == ("note", "open", (), "the room")
+    assert store.drops() == [] and coordinator_launches(store) == [] and store._woken == {}
+
+
+def test_bare_thread_refuses_a_bad_title_or_actor_and_a_raising_caller_leaves_nothing(tmp_path):
+    store = make_store(tmp_path)
+    before = len(store.threads(include_closed=True))
+    for bad in ("", "   ", "two\nlines", "x" * 5000, None):
+        with pytest.raises(CoordError):
+            with store._write() as (conn, now):
+                store.bare_thread(conn, now, bad)
+    with pytest.raises(CoordError, match="by is one of"):
+        with store._write() as (conn, now):
+            store.bare_thread(conn, now, "the room", by="coordinator")
+    with pytest.raises(RuntimeError):
+        with store._write() as (conn, now):
+            store.bare_thread(conn, now, "the room")
+            raise RuntimeError("the caller failed after the thread")
+    assert len(store.threads(include_closed=True)) == before
+
+
+def test_opening_the_room_with_a_claude_coordinator_writes_no_launch_and_a_real_drop_still_wakes(tmp_path):
+    store = make_store(tmp_path)
+    store.coord_set_agent("claude", cwd=str(tmp_path))
+    _s, rs, _l = scripted(tmp_path, store=store)
+    rs.start()
+    try:
+        rs.send(author_surface="cockpit", client_id="tab-a", outbox_id="ob-00000001", body="hello")
+        assert store.drops() == []                                  # the room made no drop
+        assert coordinator_launches(store) == [] and store._woken == {}
+        d, _ = store.accept_drop("a real drop from the phone", surface="phone")
+        assert store._woken.get(d.drop_id)                          # it woke the coordinator, normally
+        assert [ln.cause for ln in coordinator_launches(store)] == ["wake"]
+    finally:
+        rs.stop()
+
+
+# F2: a rotate with no open room writes nothing
+def test_rotate_with_no_open_room_refuses_before_any_write(tmp_path):
+    _store, rs, launcher = scripted(tmp_path)
+    rs.start()
+    try:
+        before = counts(rs)
+        for _ in range(2):
+            with pytest.raises(CoordError, match="no room is open"):
+                rs.rotate()
+        assert counts(rs) == before and launcher.ensures == 0
+    finally:
+        rs.stop()
+
+
+# F3: send holds the room against stop and rotate
+def test_a_send_racing_stop_finishes_first_and_a_send_after_stop_writes_nothing(tmp_path):
+    _store, rs, launcher = scripted(tmp_path)
+    rs.start()
+    rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="one")
+    inside, stopped = threading.Event(), threading.Event()
+    real = rs.service.send_room
+
+    def late(*a, **k):
+        t = threading.Thread(target=lambda: (rs.stop(), stopped.set()))
+        t.start()
+        inside.set()
+        assert not stopped.wait(0.3)               # stop waits on the send in flight
+        return real(*a, **k)
+    rs.service.send_room = late
+    r = rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000002", body="two")
+    assert r.state == "accepted", r.cause
+    assert stopped.wait(5) and launcher.closed
+    after = counts(rs)
+    with pytest.raises(RoomServeError, match="stopped"):
+        rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000003", body="three")
+    assert counts(rs) == after
+
+
+def test_a_send_naming_no_room_is_not_refused_by_a_rotate_racing_it(tmp_path):
+    _store, rs, launcher = scripted(tmp_path)
+    rs.start()
+    try:
+        rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="one")
+        old = rs.view()["room_thread"]
+        rotated, box = threading.Event(), {}
+        real = rs.service.send_room
+
+        def late(*a, **k):
+            def rot():
+                box["new"] = rs.rotate()
+                rotated.set()
+            threading.Thread(target=rot).start()
+            assert not rotated.wait(0.3)           # rotate waits for the send to land
+            return real(*a, **k)
+        rs.service.send_room = late
+        r = rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000002", body="two")
+        assert r.state == "accepted", r.cause
+        assert rotated.wait(5) and box["new"] != old and rs.view()["room_thread"] == box["new"]
+        rs.service.send_room = real
+        r = rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000003", body="three")
+        assert r.state == "accepted" and launcher.handle.room_thread == box["new"]
+    finally:
+        rs.stop()
+
+
+# F4 + F7: a stored line is answered before any room is resolved
+def test_a_resend_of_a_stored_line_after_a_restart_opens_nothing(tmp_path):
+    store, rs1, fake = fake_serve(tmp_path)
+    rs1.start()
+    r1 = rs1.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="before")
+    rs1._stop_evt.set()
+    rs1._thread.join(5)
+    for held in list(rs1.launcher._live.values()):
+        held.proc.kill()
+    _s2, rs2, _ = fake_serve(tmp_path, store=store)
+    n0 = len(list(fake.glob("spawn-*.argv")))
+    try:
+        rs2.start()
+        r2 = rs2.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="before")
+        assert r2.message_id == r1.message_id and r2.state == r1.state
+        assert len(list(fake.glob("spawn-*.argv"))) == n0 and rs2._handle is None
+    finally:
+        rs2.stop()
+        rs1.launcher.close()
+        rs1.service.close()
+
+
+def test_a_replay_naming_no_room_after_a_rotation_gets_the_stored_receipt(tmp_path):
+    _store, rs, launcher = scripted(tmp_path)
+    rs.start()
+    try:
+        a = rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="one")
+        rs.rotate()
+        n = launcher.ensures
+        again = rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="one")
+        assert again.message_id == a.message_id and launcher.ensures == n
+        with pytest.raises(CoordError):                                  # another client's id is still a conflict
+            rs.send(author_surface="cockpit", client_id="b", outbox_id="ob-00000001", body="one")
+    finally:
+        rs.stop()
+
+
+# F5: a child that dies while the server stays up is noticed
+def test_a_child_that_dies_while_serve_is_up_is_ended_and_said_and_the_next_send_resumes(tmp_path):
+    store, rs, fake = fake_serve(tmp_path)
+    rs.start()
+    try:
+        rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="one")
+        lid = rs._handle.launch_id
+        for held in list(rs.launcher._live.values()):
+            held.proc.kill()
+        assert wait(lambda: rs.view()["launch_id"] is None), rs.view()
+        assert "exited" in (rs.last_error or "") and lid not in rs.launcher._live
+        with store._write() as (conn, now):
+            assert lease._launch_state(conn, lid)[1] == "ended" if hasattr(lease, "_launch_state") else True
+        r = rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000002", body="two")
+        assert r.state == "accepted", r.cause
+        assert rs._handle.launch_id != lid and rs._handle.resumed and rs.last_error is None
+    finally:
+        rs.stop()
+
+
+# F6
+def test_last_error_clears_on_a_good_open_and_a_step_racing_a_stop_records_nothing(tmp_path, monkeypatch):
+    _store, rs, _l = scripted(tmp_path)
+    rs.start()
+    try:
+        rs.last_error = "pump: something old"
+        rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="one")
+        assert rs.last_error is None
+    finally:
+        rs.stop()
+    (tmp_path / "two").mkdir()
+    _store2, rs2, _l2 = scripted(tmp_path / "two")
+    monkeypatch.setattr(rs2, "pump_once", lambda: (_ for _ in ()).throw(RoomServeError("stopped")))
+    rs2._stop_evt.set()
+    rs2._run()
+    assert rs2.last_error is None
+    rs2._stop_evt.clear()
+    rs2.last_error = None
+
+
+def test_stop_says_when_the_pump_would_not_stop(tmp_path, monkeypatch):
+    import levain.coordinator.room_serve as mod
+    _store, rs, _l = scripted(tmp_path)
+    gate = threading.Event()
+    monkeypatch.setattr(mod, "_JOIN_WAIT", 0.1)
+    monkeypatch.setattr(rs, "pump_once", lambda: (gate.wait(5), 0)[1])
+    rs.start()
+    time.sleep(0.05)
+    rs.stop()
+    assert "pump" in (rs.last_error or "") and "did not stop" in rs.last_error
+    gate.set()
+
+
+# F8
+def test_view_carries_no_dead_key(tmp_path):
+    _store, rs, _l = scripted(tmp_path)
+    rs.start()
+    try:
+        assert set(rs.view()) == {"room_thread", "launch_id", "last_error"}
+    finally:
+        rs.stop()
+
+
+def test_a_stale_tab_writes_nothing_to_the_store_on_the_stub_and_the_fake_pipe(tmp_path):
+    (tmp_path / "a").mkdir()
+    _store, rs, launcher = scripted(tmp_path / "a")
+    rs.start()
+    try:
+        rs.send(author_surface="cockpit", client_id="t", outbox_id="ob-00000001", body="one")
+        old = rs.view()["room_thread"]
+        rs.rotate()
+        before = counts(rs)
+        with pytest.raises(RoomRotated):
+            rs.send(author_surface="cockpit", client_id="t", outbox_id="ob-00000002", body="stale", room_thread=old)
+        assert counts(rs) == before
+    finally:
+        rs.stop()
+    (tmp_path / "b").mkdir()
+    _s, rs2, fake = fake_serve(tmp_path / "b")
+    rs2.start()
+    try:
+        rs2.send(author_surface="cockpit", client_id="t", outbox_id="ob-00000001", body="one")
+        old = rs2.view()["room_thread"]
+        rs2.rotate()
+        before, spawns = counts(rs2), len(list(fake.glob("spawn-*.argv")))
+        with pytest.raises(RoomRotated):
+            rs2.send(author_surface="cockpit", client_id="t", outbox_id="ob-00000002", body="stale", room_thread=old)
+        assert counts(rs2) == before and len(list(fake.glob("spawn-*.argv"))) == spawns
+    finally:
+        rs2.stop()
