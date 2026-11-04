@@ -89,12 +89,39 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     dr.add_argument("--root", default=None, help="The occurrences dir (default dream/ beside the store's resolved memory.db).")
     dr.add_argument("--json", action="store_true")
     dr.set_defaults(func=run_dream_drill)
+    sh = sub.add_parser("shadow", allow_abbrev=False, help="Dry shadow night: read flow's snapshot, seed a scratch store, diff.",
+                        description="Read flow's committed pre-dream snapshot for a dream-day (read-only, hash-checked). "
+                                    "With --shadow-dir, seed it into that SCRATCH store and compare the episode set; "
+                                    "with --composed too, diff an already-composed shadow output against flow's and "
+                                    "write card_diff.txt. Composes nothing and files nothing.")
+    sh.add_argument("--flow-root", required=True, type=Path, help="Flow's state/dream directory (read only).")
+    sh.add_argument("--day", required=True, help="The dream-day YYYY-MM-DD.")
+    sh.add_argument("--shadow-dir", type=Path, default=None,
+                    help="A scratch directory to seed (created with a .levain-shadow marker; a non-empty directory "
+                         "without it is refused). Omitted: only the reader and the hash check run.")
+    sh.add_argument("--composed", type=Path, default=None, help="A file holding the shadow's composed neocortex text.")
+    sh.add_argument("--occurrence-dir", type=Path, default=None, help="Where card_diff.txt goes (needs --composed).")
+    sh.add_argument("--occurrence", default="shadow-dry", help="The occurrence id the card names.")
+    sh.add_argument("--agent-dir", default=None, help="The shadow's agent store dir, for the no-shadow-done check.")
+    sh.add_argument("--agent-id", default=None)
+    sh.add_argument("--zone", default=None, help="An IANA zone (needed with --agent-dir).")
+    sh.add_argument("--json", action="store_true")
+    sh.set_defaults(func=run_dream_shadow)
     en = sub.add_parser("enable", allow_abbrev=False, help="Register the dream as a named agent and print its signing card.",
                         description="Register the shipped `dream` role and AgentSpec in the agent store (idempotent) and "
                                     "print the words its link's signing card carries. It signs nothing: the link is "
                                     "his signature, and the dream launches only under a live signed link.")
     en.add_argument("--agent-store-dir", type=Path, default=None,
                     help="The autonomic store directory (default: $LEVAIN_HOME/autonomic).")
+    en.add_argument("--store-dir", type=Path, default=None,
+                    help="The anneal store the dream consolidates (a dir holding memory.db or .levain/memory.db). "
+                         "With it, the install facts the scheduled fire reads are written beside the agent store; "
+                         "without it none are, and a fire refuses naming the missing file.")
+    en.add_argument("--cockpit-root", type=Path, default=None,
+                    help="The cockpit root the authority log is replayed from (default: the home's, "
+                         "<levain home>/cockpit).")
+    en.add_argument("--coord-dir", type=Path, default=None,
+                    help="The coordinator queue directory (default: <levain home>/coordinator).")
     en.add_argument("--revise", action="store_true", help="Write a new version when the stored spec differs.")
     en.add_argument("--json", action="store_true")
     en.set_defaults(func=run_dream_enable)
@@ -126,19 +153,46 @@ def run_dream_enable(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - nothing was reported as registered
         print(f"levain dream enable: cannot register ({type(exc).__name__}: {exc})", file=sys.stderr)
         return 1
+    install_path = None
+    if args.store_dir is not None:
+        try:
+            install_path = _write_install_facts(args, store, str(zone), da)
+        except (da.InstallRefused, OSError) as exc:
+            print(f"levain dream enable: registered, but the install facts were not written: {exc}", file=sys.stderr)
+            return 1
     r = ex.PER_RUN_LIMIT_USD_MICROS / 1_000_000
     card = da.signing_card_text(str(zone), per_run_usd=r, night_usd=2 * r,
                                 expires="the link's expires_at (a link lasts at most 29 days)")
     doc = {"agent_id": reg.agent_id, "spec_hash": reg.spec_hash, "role_hash": reg.role_hash, "version": reg.version,
-           "created": reg.created, "zone": reg.zone, "signing_card": card}
+           "created": reg.created, "zone": reg.zone, "signing_card": card,
+           "install_facts": None if install_path is None else str(install_path)}
     if args.json:
         print(json.dumps(doc, sort_keys=True))
     else:
         print(f"{'registered' if reg.created else 'already registered'}: dream {reg.agent_id} v{reg.version} "
               f"spec_hash {reg.spec_hash[:12]} role_hash {reg.role_hash[:12]}")
+        print(f"install facts: {install_path}" if install_path else
+              "install facts: not written (pass --store-dir); a scheduled fire refuses without them")
         print(card)
         print("Not signed. The dream launches only under a live signed agent link for this spec_hash.")
     return 0
+
+
+def _write_install_facts(args: argparse.Namespace, store: object, zone: str, da: object) -> Path:
+    """Resolve the install this verb names to absolute paths and write the facts file in the agent store's directory.
+    The live store is allowed here (the scheduled dream targets it); only ``run`` is for copies."""
+    from levain.coordinator.launch import default_coordinator_dir
+
+    base = Path(args.store_dir).expanduser().resolve()
+    db = next((c for c in (base / "memory.db", base / ".levain" / "memory.db") if c.is_file()), None)
+    if db is None:
+        raise da.InstallRefused(f"no memory.db under {base} (looked in the dir and in .levain/)")
+    home = os.environ.get("LEVAIN_HOME")
+    levain_home = Path(home).expanduser() if home else Path.home() / ".levain"
+    cockpit = args.cockpit_root if args.cockpit_root is not None else levain_home / "cockpit"
+    coord = args.coord_dir if args.coord_dir is not None else default_coordinator_dir()
+    return da.write_install(store.directory, store_path=db.resolve(), cockpit_root=Path(cockpit).expanduser().resolve(),
+                            coord_dir=Path(coord).expanduser().resolve(), zone=zone)
 
 
 def _refused(p: Path) -> str | None:
@@ -402,3 +456,72 @@ def run_dream_ready(args: argparse.Namespace) -> int:
         for c in v.checks:
             print(f"  {c.n} {c.status:10s} {c.name}: {c.detail}")
     return 0 if v.ready else (3 if v.verdict == rd.UNREADABLE else 1)
+
+
+def run_dream_shadow(args: argparse.Namespace) -> int:
+    from levain.dream import card as card_mod
+    from levain.dream import ready as rd
+    from levain.dream import shadow as sh
+
+    if args.composed is not None and args.shadow_dir is None:
+        print("levain dream shadow: --composed needs --shadow-dir (without a seeded scratch store there is nothing to "
+              "compare it against)", file=sys.stderr)
+        return 2
+    if args.composed is not None and args.occurrence_dir is None:
+        print("levain dream shadow: --composed needs --occurrence-dir", file=sys.stderr)
+        return 2
+    if args.agent_dir and not args.agent_id:
+        print("levain dream shadow: --agent-dir needs --agent-id: the no-shadow-done check is scoped to the shadow "
+              "agent, and every agent's done rows would answer it otherwise", file=sys.stderr)
+        return 2
+    out: dict[str, object] = {"day": args.day}
+    zone = args.zone or (_host_zone() if args.agent_dir else None)
+    occurrences = None
+    if args.agent_dir:
+        agent_dir = Path(args.agent_dir)
+        occurrences = lambda: rd._read_occurrences(agent_dir)  # noqa: E731
+    v = sh.day_ready(args.flow_root, args.day, occurrences=occurrences, zone=zone, agent_id=args.agent_id)
+    out["day_ready"] = {"verdict": v.verdict, "kind": v.kind, "reason": v.reason}
+    code = 0 if v.ready else (3 if v.verdict == rd.UNREADABLE else 1)
+    if v.ready and args.shadow_dir is not None and v.flow_day is not None:
+        db = args.shadow_dir / "memory.db"
+        try:
+            with sh.night_lock(v.flow_day, db):
+                try:
+                    seeded = sh.seed(v.flow_day, db)
+                except sh.ShadowRefused as exc:
+                    out["seed"] = {"refused": exc.kind, "why": exc.why}
+                    code = 3
+                else:
+                    out["seed"] = {"db": str(seeded.db), "files": list(seeded.files)}
+                    ev = sh.episode_check(v.flow_day, db)
+                    out["episodes"] = {"verdict": ev.verdict, "kind": ev.kind, "reason": ev.reason}
+                    code = 0 if ev.ready else (3 if ev.verdict == rd.UNREADABLE else 1)
+                    if ev.ready and args.composed is not None:
+                        try:
+                            text = args.composed.read_text(encoding="utf-8")
+                            c = sh.shadow_card(v.flow_day, text, occurrence=args.occurrence,
+                                               occ_dir=args.occurrence_dir)
+                        except (OSError, UnicodeError, ValueError, sh.ShadowRefused, card_mod.CardError) as exc:
+                            print(f"levain dream shadow: {exc}", file=sys.stderr)
+                            return 3
+                        out["card"] = c.as_dict()
+        except sh.ShadowRefused as exc:
+            out["seed"] = {"refused": exc.kind, "why": exc.why}
+            code = 3
+        except OSError as exc:
+            out["seed"] = {"refused": sh.KIND_UNREADABLE, "why": f"{type(exc).__name__}: {exc}"}
+            code = 3
+    if args.json:
+        print(json.dumps(out, sort_keys=True, default=str))
+    else:
+        print(f"levain dream shadow: day-ready {v.verdict}{'/' + v.kind if v.kind else ''}: {v.reason}")
+        if "seed" in out:
+            print(f"  seed: {out['seed']}")
+        if "episodes" in out:
+            e = out["episodes"]
+            print(f"  episodes: {e['verdict']}{'/' + e['kind'] if e['kind'] else ''}: {e['reason']}")  # type: ignore[index]
+        if "card" in out:
+            for line in out["card"]["body"]["own"]:  # type: ignore[index]
+                print(f"  {line}")
+    return code

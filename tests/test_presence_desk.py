@@ -32,7 +32,7 @@ def test_a_desk_message_ends_away_and_sleep_never_quiet_or_loud_and_counts_as_in
     # the laptop has been still for an hour, yet a message sent 2 minutes ago holds an ordinary ping (a long message being composed)
     desk.note_desk_message(q, "test-hook", now=NOW - 120)
     held = presence.should_push(q, "ping", now=NOW, idle=HID_IDLE, suggest=False)
-    assert (held.push, held.state) == (False, "holding") and "input at the laptop" in held.why
+    assert (held.push, held.state) == (False, "holding") and "desk message 2 min ago" in held.why
     # ten minutes (the follow time) after it, with no further input, he reads away and the ping pushes
     later = presence.should_push(q, "ping", now=NOW + 700, idle=HID_IDLE, suggest=False)
     assert later.push is True
@@ -76,7 +76,7 @@ def test_the_desk_record_is_live_only_while_refreshed_and_a_closing_old_desk_lea
 def test_the_one_rule_never_calls_laptop_idle_the_desk_and_keeps_what_each_delivery_saw(tmp_path):
     q = tmp_path
     d = presence.should_push(q, "ping", now=NOW, idle=lambda: 900.0, suggest=True)      # a delivery decision
-    assert d.push is True and "desk" not in d.why.lower() and "no input for 15 min" in d.why
+    assert d.push is True and "laptop" not in d.why.lower() and d.why == "follow: no desk message"      # 1a: raw laptop idle is not the desk, and not a message
     rows = [json.loads(x) for x in (q / "webpush" / desk.DECISIONS_NAME).read_text().splitlines()]
     assert rows[-1]["push"] is True and rows[-1]["idle"] == 900.0 and rows[-1]["kind"] == "ping" and rows[-1]["word"] is None
     eff = presence.effective(q, NOW, idle=lambda: 900.0)

@@ -1293,6 +1293,16 @@ def consent_ledger(agent: str, payload, *, record: bool = False, fill: bool = Fa
         pass
 
 
+def consent_bound_sentence(agent: str, payload) -> str | None:
+    """The fixed sentence for a finished tool call whose sandbox refusal its exit status hid
+    (``levain.consent.ledger.hook_bound_sentence``), else None. Never raises."""
+    try:
+        from levain.consent import ledger
+        return ledger.hook_bound_sentence(agent, payload)
+    except Exception:
+        return None
+
+
 def read_stdin() -> dict:
     """Consume and parse the hook's stdin JSON payload.
 

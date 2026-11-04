@@ -370,3 +370,19 @@ def _reset_entity_process_latch():
     _reset()
     yield
     _reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_touch_id_notice(monkeypatch):
+    """No test shows a real macOS notification: the signer's ``post_notice`` is replaced by a recorder
+    (``posted``); the function under test is ``post_notice.real``."""
+    from levain.consent import terminal_sign as ts
+
+    posted: list[str] = []
+
+    def fake(text, **kw):
+        posted.append(text)
+
+    fake.real = ts.post_notice  # type: ignore[attr-defined]
+    fake.posted = posted        # type: ignore[attr-defined]
+    monkeypatch.setattr(ts, "post_notice", fake)

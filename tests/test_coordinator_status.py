@@ -335,3 +335,20 @@ def test_a_file_removed_between_the_probe_and_the_read_is_still_the_empty_read(s
     calls = _second_open_raises_absent(monkeypatch, remove_file=True)
     got = status_reader(lambda: qdir, clock)(ReadContext(T0))
     assert len(calls) > 1 and got.rows == ()
+
+
+def test_a_codex_setting_shows_its_removal_and_is_never_probed_as_a_claude_install(tmp_path, monkeypatch) -> None:
+    from levain.cockpit import coordinator_status as cs
+    from levain.coordinator import launch as cl
+
+    install = tmp_path / "codex-workspace"
+    install.mkdir()
+    (install / "CLAUDE.md").write_text("x")                # a Claude Code install, which the probe would take it for
+    probed: list = []
+    monkeypatch.setattr(cl, "band_failure", lambda *a: probed.append(a) or ("broken", "fix it"))
+    monkeypatch.setattr(cs, "_band_cache", {})
+    row = cs.band_row({"agent": "codex", "cwd": str(install), "model": None})
+    assert probed == [] and cs._band_install({"agent": "codex", "cwd": str(install)}) is None
+    assert row is not None and row.id == "band"
+    assert "Codex coordinator removed" in row.body and "levain coord agent claude" in row.body, row.body
+    assert cs.band_row({"agent": "claude", "cwd": str(install)}) is not None and probed  # a claude one still is

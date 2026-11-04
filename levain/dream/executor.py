@@ -122,11 +122,16 @@ class PriceRow:
     read_on: str
 
 
-#: Keyed by the EXACT pinned model id. **Deliberately empty in D1-1a:** every row must cite the published price page
-#: and the date it was read, and this lane has no network and may not invent a price. The person who runs D1-1a's first
-#: Claude-route run adds the row for :data:`DEFAULT_CLAUDE_MODEL` (``PriceRow(..., source=<url>, read_on=<date>)``).
-#: A model id with no row has no ``M``: the Claude mind refuses to compose and the effect returns ``budget``.
-PRICE_TABLE: dict[str, PriceRow] = {}
+#: Keyed by the EXACT pinned model id. Every row cites the published price page and the date a person read it there; the
+#: table was empty in D1-1a because that lane had no network and could not invent a price. The row for
+#: :data:`DEFAULT_CLAUDE_MODEL` was signed by Phill (np-f16016c5 (a), 2026-11-03): its input rate is the 1h cache-write
+#: rate, the highest per-token input rate on the page, and a change to any figure needs his word. A model id with no row
+#: has no ``M``: the Claude mind refuses to compose and the effect returns ``budget``.
+PRICE_TABLE: dict[str, PriceRow] = {
+    "claude-opus-5-5": PriceRow(context_window=1_000_000, max_output=128_000, input_micros_per_mtok=8_000_000,
+                                output_micros_per_mtok=20_000_000,
+                                source="https://platform.claude.com/docs/en/about-claude/pricing", read_on="2026-11-03"),
+}
 
 
 def one_call_ceiling(model: str, table: Mapping[str, PriceRow] | None = None) -> int | None:
@@ -821,6 +826,9 @@ class _Ctx:
         #: True once this run holds the store lock and owns the occurrence dir: before that, progress.json and
         #: usage.json may belong to a LIVE run and are never written (a lock-held exit writes neither).
         self.owns_occ = False
+        #: True once ``_consolidate_store``'s cleanup has opened its stop hold; ``consolidate_store`` closes it after
+        #: ``_write_usage``, so the usage record is written whatever the SIGTERM timing.
+        self.cleanup_held = False
 
 
 def _write_usage(ctx: _Ctx) -> None:
@@ -935,6 +943,7 @@ def consolidate_store(
     read_wrap_schema: Callable[[Any], Any] | None = None,
     remedies: Remedies | None = None,
     require_lock: bool = True,
+    handle_stop: bool = False,
 ) -> ConsolidateResult:
     """One consolidate on the store at ``store_path`` (a ``memory.db``). See the module docstring.
 
@@ -958,27 +967,44 @@ def consolidate_store(
     ``fcntl`` (the dream's single-writer is the lock); ``levain wrap`` passes False and keeps its documented
     best-effort proceed. ``progress.json`` and ``usage.json`` are written only once the store lock is held and the
     occurrence dir holds no live run record.
+
+    ``handle_stop`` installs :func:`fire_stop_handler` on the run's own :class:`Progress` for the whole call, so a
+    SIGTERM (an executor's ``stop()``) unwinds it: the compose child is ended through its handle, our wrap is
+    cancelled by token, the lock is released, and :class:`FireStopRequested` propagates to the caller. Only a dream
+    fire passes it; it is ignored off the main thread (``signal.signal`` raises there).
     """
     store_path = Path(store_path)
     occ_dir = None if occurrence_dir is None else Path(occurrence_dir).expanduser().resolve()
     ctx = _Ctx(occ_dir, mind, budget)
     progress = Progress(occ_dir)
-    try:
-        res = _consolidate_store(
-            ctx, progress, store_path, mind=mind, composer=composer, max_seconds=max_seconds,
-            save_reserve=save_reserve, budget=budget, instructions_path=instructions_path,
-            on_snapshot=on_snapshot or _no_snapshot, on_saved=on_saved or _no_saved, max_composes=max_composes,
-            dry_run=dry_run, reset=reset, unattended=unattended, own_deadline=own_deadline,
-            hard_exit_code=hard_exit_code, label=label, project_name=project_name or store_path.parent.name,
-            constitution=constitution, report=report or _default_report,
-            acquire_lock=acquire_lock, read_wrap_schema=read_wrap_schema,
-            remedies=remedies or DREAM_REMEDIES, require_lock=require_lock)
-        ctx.outcome = res.outcome
-        res.composes = list(ctx.composes)
-        res.spent_usd_micros = ctx.spent
-        return res
-    finally:
-        _write_usage(ctx)
+    with contextlib.ExitStack() as stop_scope:
+        if handle_stop and threading.current_thread() is threading.main_thread():
+            stop_scope.enter_context(fire_stop_handler(progress))
+        try:
+            res = _consolidate_store(
+                ctx, progress, store_path, mind=mind, composer=composer, max_seconds=max_seconds,
+                save_reserve=save_reserve, budget=budget, instructions_path=instructions_path,
+                on_snapshot=on_snapshot or _no_snapshot, on_saved=on_saved or _no_saved, max_composes=max_composes,
+                dry_run=dry_run, reset=reset, unattended=unattended, own_deadline=own_deadline,
+                hard_exit_code=hard_exit_code, label=label, project_name=project_name or store_path.parent.name,
+                constitution=constitution, report=report or _default_report,
+                acquire_lock=acquire_lock, read_wrap_schema=read_wrap_schema,
+                remedies=remedies or DREAM_REMEDIES, require_lock=require_lock)
+            ctx.outcome = res.outcome
+            res.composes = list(ctx.composes)
+            res.spent_usd_micros = ctx.spent
+            return res
+        finally:
+            # The stop stays held through the usage write (the spend record); a SIGTERM held meanwhile is raised at
+            # the closes below, after usage.json is on disk.
+            progress.hold_stop()
+            try:
+                _write_usage(ctx)
+            finally:
+                progress.release_stop()
+                if ctx.cleanup_held:
+                    ctx.cleanup_held = False
+                    progress.release_stop()
 
 
 def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind: Any, composer: str | None,
@@ -1163,9 +1189,11 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                 print(f"{L}: a prior wrap is still in progress (started {started_at}).\n"
                       + _remedy(remedies.prior_wrap, store_path, wrap_token) + extra)
                 return _fail("precondition", 2, "prior wrap in progress")
+            progress.hold_stop()          # a destructive discard is not aborted half-done; a held stop raises below
             try:
                 discarded = _w._discard_prior_wrap(store, prior_token)
             except WrapOwnershipError:
+                progress.release_stop()
                 from levain.manifest import anneal_invocation
 
                 print(f"{L}: the prior wrap was not cleared: another consolidate replaced it, or its metadata cannot "
@@ -1179,6 +1207,10 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                       "it straight after wrap-status and only if that wrap is the dead one. Keep the `--db` shown "
                       "here: without it anneal reads ~/.anneal-memory.")
                 return _fail("precondition", 2, "prior wrap not cleared")
+            except BaseException:
+                progress.release_stop()
+                raise
+            progress.release_stop()
             if not discarded:
                 print(f"{L}: the prior wrap was already gone; continuing.")
             elif unattended and not reset:
@@ -1196,12 +1228,18 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
         # Step 2: the snapshot hook, after any orphan is cleared and before anything is prepared.
         manifest = None
         if not dry_run:
+            progress.hold_stop()          # the snapshot hook writes files non-atomically; a stop waits for it
             try:
                 manifest = on_snapshot(store, occ_dir)
             except Exception as exc:  # noqa: BLE001 — a refused snapshot is a named outcome; this run's wrap was
                 # never opened (an orphan discarded above stays discarded: that discard did write the store)
+                progress.release_stop()
                 print(f"{L}: the snapshot was refused ({type(exc).__name__}: {exc}); nothing was prepared or saved.")
                 return _fail("snapshot-refused", 2, f"{type(exc).__name__}: {exc}")
+            except BaseException:
+                progress.release_stop()
+                raise
+            progress.release_stop()
 
         session_id = ANNEAL_SESSION_ID if store.consolidate_requires_baton() else None
         prepare_entered = True
@@ -1425,6 +1463,11 @@ def _consolidate_store(ctx: _Ctx, progress: Progress, store_path: Path, *, mind:
                 _journal_cancelled()
         raise
     finally:
+        # Held until consolidate_store has written usage.json (see there): a stop landing in this teardown or in the
+        # usage write must not abort it half-done. Opened here rather than at the call so every path that reached
+        # this try, refused/empty/dry-run included, is covered.
+        progress.hold_stop()
+        ctx.cleanup_held = True
         stack.close()
         store.close()
         _w._unlock_wrap(lock)

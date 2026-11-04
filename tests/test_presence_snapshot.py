@@ -57,7 +57,7 @@ def test_effective_works_from_a_given_snapshot(tmp_path):
     q.mkdir(mode=0o700)
     called = []
     e = presence.effective(q, reading=900.0, idle=lambda: called.append(1) or 5.0)
-    assert not called and e["state"] == "pushing" and e["reason"] == "follow: no input for 15 min"
+    assert not called and e["state"] == "pushing" and e["reason"] == "follow: no desk message"
 
 
 def test_a_status_read_writes_nothing_even_with_an_ended_overlay_and_a_crossing(tmp_path):

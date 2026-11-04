@@ -35,12 +35,14 @@ token (:func:`claim_spawn`); the primary key is the compare-and-set, so a second
 the service; an operator ``take`` holds the lease for ``LEASE_TTL`` unless told otherwise; your take or release is what
 "until you look" reads. (C3b, 1020+50): ``unset`` is checked after a live lease, a running coordinator and a pending
 launch (those still say what a drop would do), before the death count; a setting is a whole row, never a field
-update. (C3c, 1021+18): :func:`set_agent` takes codex now that a codex launch is built. (C3b fix 1): a thread
+update. (C3c, 1021+18): :func:`set_agent` took codex while a codex launch was built; since the Codex coordinator's
+removal it refuses it, and a codex row an older install still holds wakes nothing (:func:`wake_state`). (C3b fix 1): a thread
 or drop write the fence lets through is recorded as a ``beat`` row by coordinator that moves nothing
 (:func:`record_write`), so "it wrote as coordinator" is one question over ``lease_events``. Stdlib only.
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import secrets
@@ -56,18 +58,23 @@ from levain.contracts.canon import canonical
 from levain.coordinator.store import CoordError, _append_only, next_gseq
 
 __all__ = [
-    "BACKOFF", "HARNESSES", "MAX_SPAWNS_LIVE", "MAX_SPAWN_DEPTH", "SPAWN_PREFIX",
+    "BACKOFF", "CODEX_REMOVED", "CODEX_REMOVED_WHY", "HARNESSES", "MAX_SPAWNS_LIVE", "MAX_SPAWN_DEPTH", "SPAWN_PREFIX",
     "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
-    "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "beat",
+    "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "activate_room", "beat",
     "check_model", "claim", "by_harness_session", "claim_spawn", "end_done_worker", "end_launch", "end_unlisted", "fence", "launch",
-    "lease", "launches", "LaunchThread", "mark_swept", "over_unswept", "record_thread", "record_write", "release",
-    "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
+    "lease", "launches", "LaunchThread", "mark_swept", "migrate_launch_roles", "open_room_launch", "over_unswept", "record_thread", "record_write", "release",
+    "removed_coordinators", "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
     "wake_state", "HANDOFF_MAX", "refuse_unstarted_worker", "worker_handoff",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
 LAUNCH_KINDS = ("pending", "active", "failed", "expired", "ended")
-HARNESSES = ("claude", "codex")
+HARNESSES = ("claude", "codex")    # codex stays: launch rows and role specs written before its removal name it
+# the Codex coordinator was removed (1103-33): a codex coordinator launch an older install still holds is ended or
+# failed by the watcher with this cause (only a non-claude launch may carry it, so it relabels no claude death), and a
+# standing codex setting wakes nothing, for the reason below
+CODEX_REMOVED = "codex coordinator removed"
+CODEX_REMOVED_WHY = "the Codex coordinator was removed; run `levain coord agent claude` or `none`"
 # a worker refused at its spawn claim or activation because its thread's budget gauge is crossed (C6): a stop, never
 # a death
 BUDGET_CROSSED = "budget crossed"
@@ -82,7 +89,11 @@ REPLACED = "replaced while done"
 WORKER_DONE = "worker done"
 # a pending spawned worker whose record or thread no longer allows it (the thread merged away, closed or done)
 SPAWN_REFUSED = "spawn refused"
-ROLES = ("coordinator", "worker")
+# a room: the cockpit's one chat session (no hands, outside the coordinator lease). It is a launch so the chat tables, which
+# all key on a launch, serve it; every reader that means "a session that works" leaves it out (:func:`_in_state`)
+ROLES = ("coordinator", "worker", "room")
+# the lease token a room launch carries: no lease claim takes it (``lease_events.seq`` is AUTOINCREMENT from 1)
+ROOM_TOKEN = 0
 SETTING_AGENTS = (*HARNESSES, "none")
 _LEASE_BY = ("operator", "coordinator", "service")
 
@@ -654,6 +665,8 @@ def _pending(conn: sqlite3.Connection, now: str, *, token: int, harness: str, ro
         raise _refused(f"a launch's harness is one of {', '.join(HARNESSES)}")
     if role not in ROLES:
         raise _refused(f"a launch's role is one of {', '.join(ROLES)}")
+    if role == "room":
+        raise _refused("a room launch is opened by open_room_launch, never asked for under a lease")
     threads = list(threads)
     if role == "coordinator" and threads:
         raise _refused("the coordinator's own launch holds no threads (C0 §3.4)")
@@ -811,6 +824,8 @@ def activate(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_sess
     envelope authority); a pending worker holding several threads is refused here (:func:`refuse_several`). The pin is the head as bound, live or not: whether
     it is still in force is the predicate's question at each use (§4.5), never this one's."""
     ln = _must_launch(conn, launch_id)
+    if ln.role == "room":
+        raise _refused(f"launch {launch_id} is a room; a room activates through activate_room, under no lease")
     hsid = _line("harness session id", harness_session_id)
     if hsid is None:
         raise _refused("an active launch records the harness's own session id")
@@ -843,6 +858,72 @@ def activate(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_sess
     return _launch_row(conn, "launch_id", launch_id), None
 
 
+def open_room_launch(conn: sqlite3.Connection, now: str, *, harness: str, model: str | None, cwd: str | None,
+                     room_thread: str, pid: int, resumed_from: str | None = None) -> Launch:
+    """A room's launch: ``pending``, its spawn claimed by ``pid`` (the process that is about to start the session), in
+    the caller's one transaction, so :func:`unspawned` never lists it and the worker spawner never builds argv for it.
+    It holds ``[room_thread]``, carries :data:`ROOM_TOKEN`, and is outside the lease: nothing here reads or checks one.
+    ``resumed_from`` is the harness session id the spawn asks to resume, kept on the pending row (every reader of a
+    launch's session id reads the ``active`` row) for :func:`activate_room`."""
+    if harness not in HARNESSES:
+        raise _refused(f"a launch's harness is one of {', '.join(HARNESSES)}")
+    if not isinstance(room_thread, str) or re.fullmatch(r"th-[0-9a-f]{32}", room_thread) is None \
+            or conn.execute("SELECT 1 FROM threads WHERE thread_id = ?", (room_thread,)).fetchone() is None:
+        raise _refused(f"no room thread {str(room_thread)[:40]!r}")
+    state = conn.execute("SELECT value FROM thread_events WHERE thread_id = ? AND field = 'state' "
+                         "ORDER BY seq DESC LIMIT 1", (room_thread,)).fetchone()
+    if state is None or state[0] not in LIVE_THREAD_STATES:
+        raise _refused(f"room thread {room_thread} is {state[0] if state else 'stateless'}; a room opens on a live thread")
+    if type(pid) is not int or pid <= 0:
+        raise _refused("a room launch's spawn names the process that won it (a positive integer pid)")
+    model = check_model(model)
+    launch_id = "ln-" + secrets.token_hex(16)
+    conn.execute("INSERT INTO launches (launch_id, gseq, session_key, harness, role, threads, model, cwd, token, "
+                 "placement, at, user_scope, role_ref) VALUES (?, ?, ?, ?, 'room', ?, ?, ?, ?, 'operator-uid', ?, 0, NULL)",
+                 (launch_id, next_gseq(conn, now), "s-" + secrets.token_hex(8), harness, canonical([room_thread]),
+                  _line("model", model), _line("cwd", cwd), ROOM_TOKEN, now))
+    _launch_event(conn, now, launch_id, "pending", "room opened", until=_plus(now, LAUNCH_TTL),
+                  harness_session_id=_line("resumed session id", resumed_from))
+    conn.execute("INSERT INTO launch_spawns (launch_id, gseq, pid, at) VALUES (?, ?, ?, ?)",
+                 (launch_id, next_gseq(conn, now), pid, now))
+    return _launch_row(conn, "launch_id", launch_id)
+
+
+def activate_room(conn: sqlite3.Connection, now: str, launch_id: str, *, harness_session_id: str,
+                  argv_sha256: str | None = None) -> tuple[Launch, str | None]:
+    """A room launch ``pending`` -> ``active``: no lease is read (a room holds none) and no envelope is pinned (it
+    holds no authority). ``(launch, None)`` on activation; ``(launch, why)`` when it is not pending, and a launch past
+    its ``until`` is written ``expired`` (as :func:`activate` does) with the reason. A launch of another role is
+    refused: one activation path per role."""
+    ln = _must_launch(conn, launch_id)
+    if ln.role != "room":
+        raise _refused(f"launch {launch_id} is a {ln.role}, not a room; it activates through activate")
+    hsid = _line("harness session id", harness_session_id)
+    if hsid is None:
+        raise _refused("an active launch records the harness's own session id")
+    if ln.state != "pending":
+        return ln, f"launch {launch_id} is {ln.state}, not pending"
+    if now >= ln.until:
+        _launch_event(conn, now, launch_id, "expired", "pending past until")
+        return _launch_row(conn, "launch_id", launch_id), f"launch {launch_id} was pending past {ln.until}"
+    # a resumed conversation reports the id it was resumed from: when that is the id THIS launch asked to resume (its
+    # pending row), an ended room launch of the same harness sharing its room thread is no claim on it; any other
+    # launch, a room launch still running, or an id this launch did not ask for, is
+    asked = conn.execute("SELECT harness_session_id FROM launch_events WHERE launch_id = ? AND kind = 'pending' "
+                         "ORDER BY seq LIMIT 1", (launch_id,)).fetchone()
+    resumed = 1 if asked is not None and asked[0] == hsid else 0
+    if conn.execute(
+            "SELECT 1 FROM launch_events e JOIN launches o ON o.launch_id = e.launch_id WHERE e.kind = 'active' AND "
+            "e.harness_session_id = ? AND e.launch_id != ? AND NOT (? AND o.role = 'room' AND o.harness = ? AND "
+            "EXISTS (SELECT 1 FROM json_each(o.threads) a, json_each(?) b WHERE a.value = b.value) AND (SELECT k.kind "
+            "FROM launch_events k WHERE k.launch_id = o.launch_id ORDER BY k.seq DESC LIMIT 1) IN ('ended', 'failed', "
+            "'expired'))", (hsid, launch_id, resumed, ln.harness, canonical(list(ln.threads)))).fetchone() is not None:
+        raise _refused(f"harness session id {hsid!r} is already recorded by another launch")
+    _launch_event(conn, now, launch_id, "active", "spawned", harness_session_id=hsid,
+                  argv_sha256=_line("argv sha256", argv_sha256))
+    return _launch_row(conn, "launch_id", launch_id), None
+
+
 def end_launch(conn: sqlite3.Connection, now: str, launch_id: str, kind: str, cause: str) -> Launch:
     """Record a launch's end: ``failed`` or ``expired`` from pending, ``ended`` from active (cause ``0 turns`` for a
     session that died before doing anything). A coordinator that held the lease releases it with its end."""
@@ -851,6 +932,8 @@ def end_launch(conn: sqlite3.Connection, now: str, launch_id: str, kind: str, ca
     if cause in _SERVICE_CAUSES:
         raise _refused(f"cause {cause!r} is one the store writes itself")
     ln = _must_launch(conn, launch_id)
+    if cause == CODEX_REMOVED and ln.harness == "claude":
+        raise _refused(f"cause {cause!r} ends only a launch of a removed harness")
     if kind == "ended" and ln.state != "active" or kind != "ended" and ln.state != "pending":
         raise _refused(f"launch {launch_id} is {ln.state}; it cannot be {kind}")
     _launch_event(conn, now, launch_id, kind, _line("cause", cause) or kind)
@@ -926,25 +1009,39 @@ def unspawned(conn: sqlite3.Connection) -> list[Launch]:
         "SELECT 1 FROM launch_spawns WHERE launch_id = ?", (ln.launch_id,)).fetchone() is None]
 
 
+def removed_coordinators(conn: sqlite3.Connection) -> list[Launch]:
+    """Every coordinator launch not yet over (``pending``, its spawn claimed or not, or ``active``) whose harness is
+    not claude, the pending ones first: what the watcher's retirement pass ends (:data:`CODEX_REMOVED`)."""
+    return [ln for state in ("pending", "active") for ln in _in_state(conn, state, "coordinator")
+            if ln.harness != "claude"]
+
+
 def launch_dirs(conn: sqlite3.Connection) -> list[str]:
     """The distinct directories launches were asked to run in, in the order first asked for."""
     return [r[0] for r in conn.execute(
-        "SELECT cwd FROM launches WHERE cwd IS NOT NULL GROUP BY cwd ORDER BY MIN(gseq)").fetchall()]
+        "SELECT cwd FROM launches WHERE cwd IS NOT NULL AND role != 'room' GROUP BY cwd ORDER BY MIN(gseq)").fetchall()]
 
 
-def by_harness_session(conn: sqlite3.Connection, harness_session_id: str) -> Launch | None:
-    """The launch whose ``active`` row recorded ``harness_session_id`` (a session Levain started), or None."""
-    row = conn.execute("SELECT launch_id FROM launch_events WHERE kind = 'active' AND harness_session_id = ? "
-                       "ORDER BY gseq DESC LIMIT 1", (harness_session_id,)).fetchone()
+def by_harness_session(conn: sqlite3.Connection, harness_session_id: str, *, room: bool = False) -> Launch | None:
+    """The launch whose ``active`` row recorded ``harness_session_id`` (a session Levain started), or None. A room's
+    session answers None unless ``room`` is set: every caller that reads a launch to learn which worker or coordinator
+    a hook event came from sees a room as no launch at all, and only a room-aware caller asks for it."""
+    # the role is filtered before the newest is chosen: a room that shares a worker's session id must not hide it
+    row = conn.execute("SELECT e.launch_id FROM launch_events e JOIN launches l ON l.launch_id = e.launch_id "
+                       "WHERE e.kind = 'active' AND e.harness_session_id = ? AND (l.role = 'room') = ? "
+                       "ORDER BY e.gseq DESC LIMIT 1", (harness_session_id, 1 if room else 0)).fetchone()
     return None if row is None else _launch_row(conn, "launch_id", row[0])
 
 
 def _in_state(conn: sqlite3.Connection, state: str, role: str | None = None) -> list[Launch]:
     """The launches whose latest event is ``state`` (and of ``role``), oldest first: read by state, never by a scan
-    of every launch ever written."""
+    of every launch ever written. ``role=None`` is a coordinator or a worker, never a room: a takeover, an expiry, the
+    spawner's list and the status readers all mean a session that works, and a room is outside them by construction
+    (only ``role="room"`` names one)."""
     rows = conn.execute(
         "SELECT l.launch_id FROM launches l WHERE (SELECT e.kind FROM launch_events e WHERE e.launch_id = l.launch_id "
-        "ORDER BY e.seq DESC LIMIT 1) = ? AND (? IS NULL OR l.role = ?) ORDER BY l.gseq", (state, role, role))
+        "ORDER BY e.seq DESC LIMIT 1) = ? AND (CASE WHEN ? IS NULL THEN l.role != 'room' ELSE l.role = ? END) "
+        "ORDER BY l.gseq", (state, role, role))
     return [_launch_row(conn, "launch_id", r[0]) for r in rows.fetchall()]
 
 
@@ -992,7 +1089,7 @@ def over_unswept(conn: sqlite3.Connection, harness: str, *, limit: int = 20
     (:func:`mark_swept`), oldest first, each with its recorded thread: what the watcher checks for a turn still
     running. A launch leaves this list once marked, so the bound never hides an older one behind finished ones."""
     rows = conn.execute(
-        "SELECT l.launch_id FROM launches l WHERE l.harness = ? AND (EXISTS (SELECT 1 FROM launch_events a WHERE "
+        "SELECT l.launch_id FROM launches l WHERE l.harness = ? AND l.role != 'room' AND (EXISTS (SELECT 1 FROM launch_events a WHERE "
         "a.launch_id = l.launch_id AND a.kind = 'active') OR EXISTS (SELECT 1 FROM launch_threads t WHERE "
         "t.launch_id = l.launch_id)) AND NOT EXISTS (SELECT 1 FROM launch_sweeps w WHERE w.launch_id = l.launch_id) "
         "AND (SELECT e.kind FROM launch_events e WHERE e.launch_id = l.launch_id ORDER BY e.seq DESC LIMIT 1) "
@@ -1067,6 +1164,175 @@ def migrate_settings(conn: sqlite3.Connection) -> None:
                          "CHECK (user_scope IN (0, 1))")
     if not _has_column(conn, "launches", "role_ref"):
         conn.execute("ALTER TABLE launches ADD COLUMN role_ref TEXT")
+    migrate_launch_roles(conn)
+
+
+_LEGACY_ROLES = ("coordinator", "worker")      # the role CHECK of every table made before the room role
+
+
+# the columns an earlier release added with ALTER TABLE: a legacy table holds them inline or appended, so both are
+# removed before two definitions are compared
+_ADDED_COLUMNS = (", user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1))", ", role_ref TEXT")
+
+
+def _norm_table_sql(sql: str) -> str:
+    sql = " ".join(sql.split())
+    for frag in _ADDED_COLUMNS:
+        sql = sql.replace(frag, "")
+    return sql.replace("CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ", 1)
+
+
+def _legacy_create() -> str:
+    """The ``launches`` CREATE as every release before the room role wrote it: the current text with the older role CHECK."""
+    cur = next(stmt for stmt in LEASE_SCHEMA if stmt.startswith("CREATE TABLE IF NOT EXISTS launches "))
+    return cur.replace(_in("role", ROLES), _in("role", _LEGACY_ROLES), 1)
+
+
+def _launches_role_stale(conn: sqlite3.Connection) -> bool:
+    """Whether the file's ``launches`` table carries the known LEGACY ``role`` CHECK (the text of :data:`_LEGACY_ROLES`
+    exactly), the one shape this release rebuilds. No such table, or the current CHECK: False. Any other role CHECK
+    is a newer or hand-changed store (an extra role with no rows yet looks like a legacy table otherwise): refused by
+    name, never narrowed."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'launches'").fetchone()
+    if row is None or _in("role", ROLES) in row[0]:
+        return False
+    if _in("role", _LEGACY_ROLES) in row[0]:
+        return True
+    raise CoordError("launches carries a role CHECK this release does not know (a newer store); a rebuild would "
+                     "narrow it; nothing was changed")
+
+
+def _cascading_children(conn: sqlite3.Connection) -> list[str]:
+    """``table(column) ON DELETE <action>`` of every foreign key naming ``launches`` whose delete action is not NO ACTION or
+    RESTRICT: dropping the parent would run that action on the child's rows, and recreating the parent does not undo it."""
+    return sorted(f"{table}({fk[3]}) ON DELETE {fk[6]}"
+                  for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+                  if table != "launches"
+                  for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")')
+                  if fk[2].lower() == "launches" and fk[6].upper() not in ("NO ACTION", "RESTRICT"))
+
+
+@functools.lru_cache(maxsize=1)
+def _launch_shape() -> tuple[dict[str, str], dict[str, tuple], frozenset[tuple[str, tuple[str, ...]]]]:
+    """``({name: sql} of every trigger and index on launches, {column: table_xinfo row}, the UNIQUE and PRIMARY KEY
+    constraints as (origin, columns))``, as THIS SQLite stores them: read back from a scratch database that ran
+    :data:`LEASE_SCHEMA`, never a hand normalisation of the text."""
+    scratch = sqlite3.connect(":memory:")
+    try:
+        for stmt in LEASE_SCHEMA:
+            scratch.execute(stmt)
+        objects = {n: sql for n, sql in scratch.execute(
+            "SELECT name, sql FROM sqlite_master WHERE tbl_name = 'launches' AND type IN ('index', 'trigger') "
+            "AND sql IS NOT NULL")}
+        return objects, {r[1]: r for r in scratch.execute("PRAGMA table_xinfo(launches)")}, _auto_keys(scratch)
+    finally:
+        scratch.close()
+
+
+def _auto_keys(conn: sqlite3.Connection) -> frozenset[tuple[str, tuple[str, ...]]]:
+    """``(origin, columns)`` of every UNIQUE or PRIMARY KEY constraint ``launches`` carries (an index with no text)."""
+    return frozenset((origin, tuple(c[2] for c in conn.execute(f'PRAGMA index_info("{name}")')))
+                     for _seq, name, _unique, origin, _partial in conn.execute('PRAGMA index_list("launches")')
+                     if origin in ("u", "pk"))
+
+
+def _launches_references(conn: sqlite3.Connection) -> set[tuple]:
+    """``PRAGMA foreign_key_check`` rows (table, rowid, parent, fkid) of every foreign key that names ``launches``."""
+    return {row for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            if any(fk[2].lower() == "launches" for fk in conn.execute(f'PRAGMA foreign_key_list("{table}")'))
+            for row in conn.execute(f'PRAGMA foreign_key_check("{table}")') if row[2].lower() == "launches"}
+
+
+def migrate_launch_roles(conn: sqlite3.Connection) -> bool:
+    """``launches`` made before the ``room`` role (its ``role`` CHECK is the legacy text, the older roles) is rebuilt with the current
+    CHECK. The table is the parent of ``launch_events``, ``launch_spawns`` and every chat table's key, and this
+    runs in the opener's transaction, where the foreign-key pragma cannot be changed, so the usual new-table-then-rename
+    is not available: a rename rewrites every child's reference, and a dropped parent leaves them dangling at commit.
+    The rows are held in a temp table (``rowid`` and every column the old table holds, ``gseq`` among them), the old
+    table dropped, the new one created under its own name and refilled with the held rows; every child's deferred
+    check resolves as its parent row returns. The old table's triggers go with it and are recreated from
+    :data:`LEASE_SCHEMA`. The copy is counted before the drop; the foreign keys that name ``launches`` (and the store's, whole) must be no
+    worse than before, none may act on delete (a CASCADE or SET NULL child refuses the rebuild), and ``PRAGMA quick_check`` must answer ``ok``: any failure raises and the caller's
+    transaction rolls back. A table holding what this release does not know (a column the current ``CREATE`` lacks,
+    a generated column, an index or trigger outside :data:`LEASE_SCHEMA`, or one whose text differs) is a newer or
+    hand-changed store: the rebuild raises and changes nothing. Runs only inside the caller's ``BEGIN IMMEDIATE``.
+    True when it rebuilt."""
+    if not conn.in_transaction:
+        raise CoordError("migrate_launch_roles runs inside the caller's BEGIN IMMEDIATE; nothing was changed")
+    if not _launches_role_stale(conn):
+        return False
+    objects, new_cols, new_keys = _launch_shape()
+    stored = {n: sql for n, sql in conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE tbl_name = 'launches' AND type IN ('index', 'trigger') "
+        "AND sql IS NOT NULL")}
+    foreign = sorted(n for n, sql in stored.items() if objects.get(n) != sql)
+    if foreign:
+        raise CoordError(f"launches holds {', '.join(foreign)}, which this release does not know and a rebuild would "
+                         "drop; nothing was changed")
+    # table_xinfo, not table_info: table_info omits a GENERATED column, which a rebuild would drop unseen
+    old_x = list(conn.execute("PRAGMA table_xinfo(launches)"))
+    extra = sorted(r[1] for r in old_x if r[1] not in new_cols)
+    generated = sorted(r[1] for r in old_x if r[6] != 0)
+    if extra or generated:
+        raise CoordError(f"launches holds column(s) {', '.join(extra + generated)} this release does not know and a "
+                         "rebuild would drop; nothing was changed")
+    old_keys = _auto_keys(conn)
+    if old_keys - new_keys:
+        raise CoordError(f"launches holds a constraint on {'; '.join(', '.join(k[1]) for k in sorted(old_keys - new_keys))}"
+                         " this release does not know and a rebuild would drop; nothing was changed")
+    have = {r[1] for r in old_x}
+    unfillable = sorted(c for c, r in new_cols.items() if c not in have and r[3] and r[4] is None)
+    if unfillable:
+        raise CoordError(f"launches gains column(s) {', '.join(unfillable)} with no default for the rows it holds; "
+                         "nothing was changed")
+    # the catch-all after the named checks above: any other difference from the legacy CREATE (a table CHECK, a
+    # collation, a changed column) is something a rebuild to the current text would silently drop
+    if _norm_table_sql(conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'launches'")
+                       .fetchone()[0]) != _norm_table_sql(_legacy_create()):
+        raise CoordError("launches carries a table definition this release does not know (a newer or hand-changed "
+                         "store); a rebuild would drop what it adds; nothing was changed")
+    acting = _cascading_children(conn)
+    if acting:
+        raise CoordError(f"{', '.join(acting)} would act on its rows when launches is dropped and a rebuild cannot "
+                         "restore them; nothing was changed")
+    cols = ", ".join(r[1] for r in old_x)
+    create = next(stmt for stmt in LEASE_SCHEMA if stmt.startswith("CREATE TABLE IF NOT EXISTS launches ")) \
+        .replace("CREATE TABLE IF NOT EXISTS launches ", "CREATE TABLE launches ", 1)
+    before = _launches_references(conn)
+    before_all = set(conn.execute("PRAGMA foreign_key_check").fetchall())
+    deferred = conn.execute("PRAGMA defer_foreign_keys").fetchone()[0]
+    conn.execute("PRAGMA defer_foreign_keys = ON")
+    try:
+        held = conn.execute("SELECT COUNT(*) FROM launches").fetchone()[0]
+        conn.execute("DROP TABLE IF EXISTS temp.launches_hold")
+        conn.execute(f"CREATE TEMP TABLE launches_hold AS SELECT rowid AS rid, {cols} FROM launches")
+        conn.execute("DROP TABLE launches")
+        conn.execute(create)
+        conn.execute(f"INSERT INTO launches (rowid, {cols}) SELECT rid, {cols} FROM temp.launches_hold")
+        arrived = conn.execute("SELECT COUNT(*) FROM launches").fetchone()[0]
+        conn.execute("DROP TABLE temp.launches_hold")
+        if arrived != held:
+            raise CoordError("the launches rebuild did not copy every row; nothing was changed")
+        for stmt in LEASE_SCHEMA:
+            m = re.match(r"CREATE (?:TRIGGER|INDEX) IF NOT EXISTS (\w+) ", stmt)
+            if m is not None and m.group(1) in objects:
+                conn.execute(stmt)
+        broken = sorted(_launches_references(conn) - before)
+        if broken:
+            raise CoordError(f"the launches rebuild left a dangling reference ({str(broken[:3])[:200]}); "
+                             "nothing was changed")
+        after_all = sorted(set(conn.execute("PRAGMA foreign_key_check").fetchall()) - before_all)
+        if after_all:
+            raise CoordError(f"the launches rebuild left a foreign key broken ({str(after_all[:3])[:200]}); "
+                             "nothing was changed")
+        # quick_check, not integrity_check: this runs inside the opener's write lock, and a full scan held it
+        check = conn.execute("PRAGMA quick_check").fetchall()
+        if check != [("ok",)]:
+            raise CoordError(f"the launches rebuild left the store failing its integrity check "
+                             f"({str(check[:3])[:200]}); nothing was changed")
+    finally:
+        conn.execute(f"PRAGMA defer_foreign_keys = {'ON' if deferred else 'OFF'}")
+    return True
 
 
 def check_model(model: object) -> str | None:
@@ -1084,6 +1350,8 @@ def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | No
     """Record your coordinator setting (writer: you only). ``cwd`` is stored as given, which the caller has resolved
     (Claude Code keys a directory's trust on its real path); agent ``none`` takes neither model nor directory.
     ``user_scope`` None keeps the standing setting's (off when there is none); any agent but claude is always off."""
+    if agent == "codex":
+        raise _refused(CODEX_REMOVED_WHY)
     if agent not in SETTING_AGENTS:
         raise _refused(f"the coordinator agent is one of {', '.join(SETTING_AGENTS)}")
     if agent == "none":
@@ -1104,9 +1372,13 @@ def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | No
 def set_user_scope(conn: sqlite3.Connection, now: str, user_scope: bool, *, cwd: str | None = None) -> Setting:
     """``levain coord agent --user-scope on|off`` alone, in the caller's ONE write transaction: the latest setting is
     read and its replacement (same agent, model and directory) appended under the same lock, so a concurrent change
-    is never undone by a stale copy. Refused unless the standing agent is claude; ``cwd``, when given, must still be
+    is never undone by a stale copy. Refused unless the standing agent is claude (a codex one with
+    :data:`CODEX_REMOVED_WHY`); ``cwd``, when given, must still be
     the standing directory (the one the caller checked the hook in)."""
     was = setting(conn)
+    if was is not None and was.agent == "codex":
+        # a setting an install upgraded from 0.11.15 still holds: the refusal names why it launches nothing
+        raise _refused(CODEX_REMOVED_WHY)
     if was is None or was.agent != "claude":
         raise _refused(f"--user-scope alone changes a claude coordinator, and the standing agent is "
                        f"{'not set' if was is None else was.agent} (levain coord agent claude --user-scope on|off "
@@ -1157,12 +1429,16 @@ def _looked(conn: sqlite3.Connection) -> int:
 def launch_death(conn: sqlite3.Connection, ln: Launch) -> bool | None:
     """Did this launch die? ``True`` it died; ``None`` nobody tried to start it, so it says nothing either way (a watcher
     down, a refusal before the spawn claim; ruled L3 r1 G6); ``False`` it did not. The one rule: the wake backoff
-    (:func:`_deaths`) and the review queue's dead-seat feed both call it."""
+    (:func:`_deaths`) and the review queue's dead-seat feed both call it. A room never dies by this rule (``False``):
+    its end is the room service's to say, and a room that failed to start is not a seat that needs a review item."""
+    if ln.role == "room":
+        return False
     # a launch asked for under a lease its asker lost is not the launch's fault; one that lost the lease without ever
     # writing as coordinator died idle
     wrote = _wrote_since(conn, ln.session_key)
     died = ln.state in ("failed", "expired") and ln.cause not in ("lease lost before active", BUDGET_CROSSED,
-                                                                       SEVERAL_THREADS, REPLACED, SPAWN_REFUSED) \
+                                                                       SEVERAL_THREADS, REPLACED, SPAWN_REFUSED,
+                                                                       CODEX_REMOVED) \
         or ln.state == "ended" and (ln.cause == "0 turns" or ln.cause == "lost the lease" and not wrote)
     # REPLACED (ended): its session finished a turn and was ended to make room, never a death, written or not
     if not died:
@@ -1211,8 +1487,8 @@ def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
 def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
     """What a drop arriving now would do, without writing: ``(state, why)``, state one of ``held`` (a live lease),
     ``launching`` (a pending coordinator launch), ``idle`` (a coordinator still running without the lease),
-    ``unset`` (no coordinator setting, or agent none: a drop only queues), ``backoff``, ``stopped`` (you look), or
-    ``wake``."""
+    ``unset`` (no coordinator setting, agent none, or a codex setting written before the Codex coordinator's removal:
+    a drop only queues), ``backoff``, ``stopped`` (you look), or ``wake``."""
     held = lease(conn, now)
     if held is not None and held.live:
         holder = None if held.holder == "operator" else _launch_by_key(conn, held.holder)
@@ -1237,6 +1513,8 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
     if chosen is None or chosen.agent == "none":
         how = "no coordinator agent is set" if chosen is None else "the coordinator agent is none"
         return "unset", f"{how}; drops queue for you (levain coord agent claude sets one)"
+    if chosen.agent != "claude":
+        return "unset", f"{CODEX_REMOVED_WHY}; drops queue for you until then"
     count, latest = _deaths(conn)
     if count >= MAX_DEATHS:
         return "stopped", (f"{count} coordinator launches in a row died; nothing launches until you look "
@@ -1264,7 +1542,7 @@ def wake(conn: sqlite3.Connection, now: str) -> Launch | None:
     session_key = "s-" + secrets.token_hex(8)
     token = _event(conn, now, "claim", session_key, token=None, until=_plus(now, LAUNCH_TTL), cause="bootstrap",
                    by="service")
-    chosen = setting(conn)          # wake_state answered wake: a harness is set
+    chosen = setting(conn)          # wake_state answered wake: the agent is claude
     return _pending(conn, now, token=token, harness=chosen.agent, role="coordinator", threads=(), model=chosen.model,
                     cwd=chosen.cwd, cause="wake", session_key=session_key, user_scope=chosen.user_scope)
 

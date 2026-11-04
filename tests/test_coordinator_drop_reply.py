@@ -366,6 +366,10 @@ def test_an_integrity_failure_names_the_table_that_was_rebuilt(qdir, store) -> N
                 return sqlite3.connect(":memory:").execute("SELECT 'broken'")
             return c.execute(sql, *a)
 
+        def __getattr__(self, name):
+            # the launches-role migration (RM-D1) asks the connection whether the caller's transaction is open
+            return getattr(c, name)
+
     try:
         with pytest.raises(CoordError, match="the replies rebuild left .* integrity check"):
             CoordStore(qdir)._ensure(Bad(), create=False)

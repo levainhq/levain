@@ -25,7 +25,7 @@ class SeamClassError(Exception):
 #: whole tables the brief counts (``lease_events`` and ``launch_events`` by kind: :data:`KIND_CLASSES`)
 COUNTED: frozenset[str] = frozenset({
     "drops", "threads", "thread_revisions", "thread_events", "replies", "ready_journal",
-    "envelopes", "envelope_binds", "envelope_attenuations", "coord_settings",
+    "envelopes", "envelope_binds", "envelope_attenuations", "coord_settings", "envelope_drafts", "envelope_draft_withdrawals",
     "lease_events", "launch_events",
     "review_items", "review_events", "first_reads", "team_drafts", "team_draft_events",
     "chat_messages", "chat_anomalies", "chat_approvals", "chat_approval_events",

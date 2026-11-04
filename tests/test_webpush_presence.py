@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 
 import pytest
 
 from levain.consent.adapters import claude_code
-from levain.webpush import intent, presence, sender
+from levain.webpush import desk, intent, presence, sender
 from levain.webpush.presence import PresenceError, set_word
 from tests._push_fixtures import phone
 
@@ -42,7 +43,19 @@ QUIET = lambda secs=600, **kw: _ov("quiet", "needs", {"kind": "timer", "at": NOW
 LOUD = lambda secs=600, **kw: _ov("loud", "everything", {"kind": "timer", "at": NOW + secs}, **kw)   # noqa: E731
 
 
+def _typed(qdir, ago=ACTIVE, now=None):
+    """He sent a desk message ``ago`` s before ``now`` (the clock by default): 1a (Phill 11-03), the one thing that returns follow to
+    the desk. The laptop's own input, which these tests also set, decides nothing."""
+    desk._write(qdir, desk.DESK_MESSAGE_NAME, {"at": (time.time() if now is None else now) - ago, "source": "test", "desk": ""})
+
+
 def decide(rec, idle, cls="other", **kw):
+    """``idle`` is the laptop reading. 1a (Phill 11-03): follow reads the newest typed desk message, so with no overlay a reading
+    here also stands for a message that old; an overlay's tests keep the laptop's input out of it (sensed input never ends a word)."""
+    # an `until: input` overlay leaves desk_msg_at unset on purpose: its case is the word ended by sensed input, not the desk
+    if (rec["overlay"] is None or rec["overlay"]["until"]["kind"] != "input") and idle is not None:
+        kw.setdefault("desk_msg_at", NOW - idle)
+    kw.setdefault("desk_msg_at", None)       # required by the rule; None is no message
     return intent.decide(NOW, rec, idle, class_name=cls, **kw)
 
 
@@ -59,7 +72,7 @@ def test_follow_pushes_after_ten_minutes_of_no_input_and_not_before():
 
 def test_no_activity_source_reads_inactive():
     d = decide(_rec(), None)
-    assert d.push is True and d.why == "follow: no laptop input reading"
+    assert d.push is True and d.why == "follow: no desk message"
 
 
 def test_an_approval_at_an_active_laptop_stays_in_the_agents_dialog_and_its_notice_still_goes():
@@ -125,7 +138,8 @@ def test_remote_is_no_longer_a_presence_word(tmp_path):
     (tmp_path / "webpush").mkdir(mode=0o700, exist_ok=True)
     (tmp_path / "webpush" / presence.FILE_NAME).write_text(json.dumps({"word": "remote", "ts": NOW, "until": NOW + 3600}))
     assert presence.read_word(tmp_path, now=NOW) is None
-    # the rule then follows the measurement: an active laptop holds
+    # the rule then follows the measurement: a desk message just sent holds
+    _typed(tmp_path, now=NOW + 1)
     assert presence.should_push(tmp_path, "ping", now=NOW + 1, idle=lambda: ACTIVE).push is False
 
 
@@ -202,6 +216,7 @@ def test_the_route_words_are_aliases_for_the_settings(tmp_path):
     assert presence.should_push(tmp_path, "ping", now=NOW + 1, idle=lambda: ACTIVE).push is True
     assert intent.read(tmp_path)["overlay"]["preset"] is None
     set_word(tmp_path, "desk", now=NOW + 2)                                 # the measurement decides again: follow, as the base
+    _typed(tmp_path, now=NOW + 3)
     assert presence.should_push(tmp_path, "ping", now=NOW + 3, idle=lambda: ACTIVE).push is False
     with pytest.raises(PresenceError):
         set_word(tmp_path, "devices", by={"agent": "claude", "session": "s", "role": "seat"}, said="x")
@@ -258,6 +273,7 @@ def _notify(qdir, kind):
 def test_wiring_active_laptop_records_the_ping_without_pushing(tmp_path, monkeypatch):
     _phone(tmp_path)
     calls = _spy(monkeypatch, ACTIVE)
+    _typed(tmp_path)
     assert _notify(tmp_path, "ruling") is False
     assert [c["push"] for c in calls] == [False]   # recorded, not pushed
 
@@ -328,6 +344,7 @@ def test_an_approval_prompt_at_an_active_laptop_pings_the_devices_once_and_start
     q = _consent_queue(tmp_path)
     _phone(q.directory)
     calls = _spy(monkeypatch, ACTIVE)
+    _typed(q.directory)
     if decider == "a zero hold ran out":
         monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)
     assert intent.approvals_to_devices(q.directory, idle=lambda: ACTIVE)[0] is False   # the hold's question: unchanged
@@ -603,6 +620,7 @@ def test_a_filed_and_held_request_at_an_active_laptop_pushes_its_ping(tmp_path, 
     q = _consent_queue(tmp_path)
     _phone(q.directory)
     calls = _spy(monkeypatch, ACTIVE)
+    _typed(q.directory)
     monkeypatch.setattr(claude_code, "nothing_can_decide", lambda s, **kw: False)   # a key could sign
     assert intent.approvals_to_devices(q.directory, idle=lambda: ACTIVE)[0] is False   # the hold's question: unchanged
     settings = claude_code.AdapterSettings(gate_hold_seconds=0.2)
@@ -664,7 +682,7 @@ def test_a_held_approval_ping_is_released_at_an_active_laptop_once_the_mute_ends
     rec = intent.read(None, 0.0)
     items = [{"kind": "consent", "reason": "quiet"}, {"kind": "ruling", "reason": "quiet"},
              {"kind": "reping", "reason": "active"}]
-    active, muted = held.plan(items, rec, 5.0, 1000.0)
+    active, muted = held.plan(items, rec, 5.0, 1000.0, desk_msg_at=995.0)   # 1a: "at the laptop" is a typed desk message 5 s ago
     assert [i["kind"] for i in muted] == ["consent"] and [i["kind"] for i in active] == ["reping"]
 
 
@@ -683,6 +701,7 @@ def _cli(tmp_path, *argv):
 
 def test_cli_words_write_the_record_and_status_prints_the_one_line(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("levain.consent.auto_away.input_idle_seconds", lambda: ACTIVE)
+    _typed(tmp_path)
     assert _cli(tmp_path, "quiet", "20m") == 0
     assert presence.read_word(tmp_path)["word"] == "quiet"
     assert f"your devices, {intent.lets_label('needs')} (quiet)" in capsys.readouterr().out
@@ -821,3 +840,14 @@ def test_read_sample_is_the_one_public_reading_of_the_rules_inputs(tmp_path):
     q2 = tmp_path / "q2"
     (q2 / "webpush").mkdir(parents=True, mode=0o700)
     assert intent.read_sample(q2, NOW, lambda: None)["reading"] is None   # no sensor, no desk message: unknown
+
+
+def test_devices_on_now_refuses_a_caller_written_for_idle_seconds():
+    """The second slot once held idle seconds; ``desk_msg_at`` is keyword-only and required, so an old caller fails loudly
+    instead of reading a small number as a 1970 desk message and pushing."""
+    eff = {"devices": "follow", "follow_after": FOLLOW, "lets_through": "everything", "preset": None, "layer": "base"}
+    with pytest.raises(TypeError):
+        intent.devices_on_now(eff, 5.0, None, NOW)
+    with pytest.raises(TypeError):
+        intent.devices_on_now(eff, None, NOW)
+    assert intent.devices_on_now(eff, None, NOW, desk_msg_at=NOW - 5)[0] is False

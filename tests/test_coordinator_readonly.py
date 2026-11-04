@@ -296,3 +296,45 @@ def test_a_dispatch_only_store_reads_as_no_coordinator_store_and_nothing_changes
     got = json.loads(capsys.readouterr().out)
     assert got["store"] is None and got["lease"] is None and got["wake"] == "unset" and got["launches"] == []
     assert "no coordinator store here" in got["why"] and snap() == before
+
+
+def test_pre_h1_store_stays_read_only_current(tmp_path: Path) -> None:
+    """H1-1 test 8: a store made before drafts (the envelope tables, no draft tables) is still opened read-only, the draft
+    reader says there are no drafts and writes nothing; the first draft write makes both tables, earlier rows intact."""
+    from levain.coordinator import envelope_drafts as drafts
+    from levain.coordinator.envelopes import EnvelopeStore
+    from levain.coordinator.store import Part
+
+    d = _dir(tmp_path)
+    store = EnvelopeStore(d)
+    drop, _ = store.accept_drop("make the readme say hello", surface="cli")
+    (thread,) = store.split(drop.drop_id, [Part("work", "w")])
+    conn = sqlite3.connect(d / DB_NAME)
+    try:
+        conn.execute("DROP TABLE envelope_draft_withdrawals")          # the tables, and their triggers, go: pre-H1
+        conn.execute("DROP TABLE envelope_drafts")
+        conn.commit()
+        before = conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall()
+    finally:
+        conn.close()
+    reader = EnvelopeStore(d)
+    reader.open_readonly().close()                                     # still current for every read-only surface
+    assert drafts.unclosed_series(reader, thread.thread_id) is None
+    assert drafts.latest(reader, "ed-" + "0" * 32) is None
+    with pytest.raises(CoordError, match="no draft"):
+        drafts.state_of(reader, "ed-" + "0" * 32)
+    conn = sqlite3.connect(d / DB_NAME)
+    try:
+        assert conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall() == before
+    finally:
+        conn.close()
+    made = drafts.drop_rule(EnvelopeStore(d), thread.thread_id, by="operator")
+    conn = sqlite3.connect(d / DB_NAME)
+    try:
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert {"envelope_drafts", "envelope_draft_withdrawals"} <= names
+        assert conn.execute("SELECT drop_id FROM drops").fetchall() == [(drop.drop_id,)]
+        assert conn.execute("SELECT draft_id FROM envelope_drafts").fetchall() == [(made.draft_id,)]
+    finally:
+        conn.close()
+    assert drafts.unclosed_series(EnvelopeStore(d), thread.thread_id).draft_id == made.draft_id

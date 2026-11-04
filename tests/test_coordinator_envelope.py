@@ -92,7 +92,7 @@ class Ctx:
              "origin": "structured", "drop_id": drop_id, "words_sha256": _sha(words), "binds": [],
              "supersedes": None, "where": [{"repo": self.path, "paths": ["README"]}],
              "lands": [self.land("main", **{"from": "source", "onto_from": "drop"})], "pushes": [], "publishes": [],
-             "budget": dict(BUDGET), "stop_at": utc_stamp(NOW + 2 * HOUR), "issued_at": utc_stamp(NOW)}
+             "budget": dict(BUDGET), "stop_at": utc_stamp(NOW + 2 * HOUR), "issued_at": utc_stamp(NOW), "draft": None}
         b.update(over)
         return b
 
@@ -113,7 +113,13 @@ class Ctx:
                                           envelope=(text, payload, sig))
         return d, fresh, b, (text, payload, sig)
 
+    def seen(self):
+        """The store-wide sequence high-water a superseding body records (``supersedes.seen``)."""
+        return self.rows("SELECT COALESCE(MAX(gseq), 0) FROM gseq")[0][0]
+
     def worded(self, drop, thread, key="phone", *, supersedes=None, signed_at=NOW, **over):
+        if supersedes is not None and "seen" not in supersedes:
+            supersedes = {**supersedes, "seen": self.seen()}
         b = self.body(drop.drop_id, drop.words, origin="worded",
                       binds=[{"thread_id": thread.thread_id, "rev": thread.rev,
                               "members_sha256": thread.members_sha256}], supersedes=supersedes, **over)

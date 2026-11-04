@@ -35,7 +35,9 @@ from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.coordinator import envelope as env
 from levain.coordinator.door import door_ok, not_door
-from levain.coordinator.envelopes import EnvelopeStore
+from levain.coordinator.envelope_draft import MIN_LEFT as _MIN_LEFT
+from levain.coordinator.envelope_draft import empty_base
+from levain.coordinator.envelopes import EnvelopeStore, seen_past
 from levain.coordinator.store import (KINDS, STATES, WORDS_MAX, CoordError, Drop, Part, Source, Thread, check_source,
                                       check_words, words_sha256)
 from levain.dispatch.jobs import JobStoreError
@@ -425,22 +427,15 @@ def _effects(body: dict[str, Any], old: dict[str, Any] | None) -> list[str]:
     return L
 
 
-def _wider(old: dict[str, Any], new: dict[str, Any]) -> bool:
-    """True when ``new`` grants anything ``old`` did not: a later stop, a bigger budget, a repo or path outside old's, an
-    effect old did not hold, or the same target with other criteria."""
-    if parse_stamp(new["stop_at"]) > parse_stamp(old["stop_at"]):
-        return True
-    if any(new["budget"][k] > old["budget"][k] for k in env.BUDGET_KEYS):
-        return True
-    for w in new["where"]:
-        allowed = tuple(p for o in old["where"] if o["repo"] == w["repo"] for p in o["paths"])
-        if not allowed or any(not env.path_within(p, allowed) for p in w["paths"]):
-            return True
-    for kind in env.EFFECT_LISTS:
-        before = {env.effect_key(kind, e): e for e in old[kind]}
-        if any(before.get(env.effect_key(kind, e)) != e for e in new[kind]):
-            return True
-    return False
+_wider = env.widens          # the pure rule moved to envelope.py; this name stays for the call sites
+
+
+def _draft_line(body: dict[str, Any]) -> str:
+    """Whether a conversation draft sits behind this body. ``.get``: a stored /1 body has no ``draft`` key."""
+    d = body.get("draft")
+    if d is None:
+        return "  draft: none: no draft reviewed, you composed this body yourself"
+    return f"  draft: {d['draft_id']}#{d['revision']} (digest ...{d['digest'][-8:]})"
 
 
 def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds: bool = True,
@@ -448,7 +443,7 @@ def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds
     """An envelope body as the lines a human signs: where, each effect, the budget, the stop. One function for the
     echo, the sign view, the drop view and show, so what is signed is what was read."""
     now = now or _tick()
-    L = [f"  origin: {body['origin']}", "  where it may work:"]
+    L = [f"  origin: {body['origin']}", _draft_line(body), "  where it may work:"]
     for w in body["where"]:
         paths = ", ".join("the WHOLE repo (every file)" if p == "." else p for p in w["paths"])
         L.append(f"    {w['repo']}  paths: {paths}")
@@ -465,8 +460,12 @@ def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds
           f"    hours: {_allowed(b['hours'], str(b['hours']))}"]
     stop = (f"was to stop {_clock(parse_stamp(body['stop_at']))}" if ended else _stops(body['stop_at'], now))
     L.append(f"  issued {_clock(parse_stamp(body['issued_at']))}; {stop}")
-    if body["supersedes"] is not None:
-        L.append(f"  supersedes {body['supersedes']['envelope_id']}")
+    sup = body["supersedes"]
+    if sup is not None:
+        L.append(f"  supersedes {sup['envelope_id']}")
+        if sup.get("seen") is not None:          # a stored /1 body has no horizon
+            L.append(f"  as of store event {sup['seen']}; any narrowing of {sup['envelope_id']} after event "
+                     f"{sup['seen']} refuses this body")
     if binds:
         if body["binds"]:
             L.append("  threads it binds:")
@@ -474,16 +473,6 @@ def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds
         elif body["origin"] == "structured":
             L.append("  threads it binds: its own drop's thread, once the drop is split into exactly one")
     return L
-
-
-def _old_of(body: dict[str, Any], store: EnvelopeStore | None) -> Any:
-    sup = body["supersedes"]
-    if sup is None or store is None:
-        return None
-    try:
-        return store.envelope(sup["envelope_id"])
-    except _REFUSED:
-        return None
 
 
 def _request_line(body: dict[str, Any], store: EnvelopeStore, words: str | None) -> str:
@@ -499,13 +488,74 @@ def _request_line(body: dict[str, Any], store: EnvelopeStore, words: str | None)
     return f"  for your words: {_shown(words[:120])}"
 
 
-def _view(body: dict[str, Any], store: EnvelopeStore, *, words: str | None = None) -> str:
-    old = _old_of(body, store)
+def _bases(body: dict[str, Any], basis: Any, authority: Any, ssh_keygen: Any = None
+           ) -> list[tuple[Any, dict[str, Any], list[str], list[str]]]:
+    """Per bound thread, what the body is read against: ``(head, base, thread_ids, notes)``, one entry per distinct base
+    (threads whose bases are canonically equal share one), all from the one read of ``basis``
+    (:meth:`EnvelopeStore.sign_basis`). The base is the head AS NARROWED for that thread (what authority the thread
+    holds now), and the empty envelope, budget zeroed, when the head is killed or ended for it, or when ``authority``
+    is given and the head's own signature no longer verifies under it: every value is then a new grant."""
+    head = None if basis is None else basis.head
+    if head is None:
+        return [(None, None, [], [])]
+    out: list[tuple[Any, dict[str, Any], list[str], list[str]]] = []
+    for b in body["binds"]:
+        t = b["thread_id"]
+        tb = basis.threads[t]
+        base, note = tb.effective, ""
+        if tb.end is not None:
+            base = empty_base(head.body)
+            note = f"envelope {head.envelope_id} was {'killed' if tb.end[0] == 'kill' else 'ended (its thread is done)'} "\
+                   f"for thread {t}: every value below is a new grant"
+        elif authority is not None:
+            why = env.refusal(head.payload, head.signature, authority, head.body, ssh_keygen=ssh_keygen)
+            if why is not None:
+                base = empty_base(head.body)
+                note = (f"envelope {head.envelope_id} no longer holds for thread {t}: the key that signed it, "
+                        f"{head.signer_fp}, is not valid now ({why}); every value below is a new grant")
+        for entry in out:
+            if canonical(entry[1]) == canonical(base):
+                entry[2].append(t)
+                entry[3].append(note)
+                break
+        else:
+            out.append((head, base, [t], [note]))
+    return out or [(None, None, [], [])]
+
+
+def _member_lines(basis: Any, thread_id: str) -> tuple[list[str], bool]:
+    """The drops a thread gained or lost between the revision the head was signed for and the one this body binds."""
+    tb = basis.threads[thread_id]
+    lines = [f"  thread {thread_id} gained drops: {', '.join(tb.added)}" if tb.added else "",
+             f"  thread {thread_id} lost drops: {', '.join(tb.removed)}" if tb.removed else ""]
+    return [x for x in lines if x], bool(tb.added)
+
+
+def _view(body: dict[str, Any], store: EnvelopeStore, *, words: str | None = None, authority: Any = None,
+          basis: Any = None) -> str:
+    """What is shown before a signature. A body that supersedes is read PER THREAD against the head as narrowed for
+    that thread (never the head's signed body, which a kill or a drop would have made wider than what is in force);
+    sign and accept pass their ``authority`` snapshot, so a head whose key no longer holds is read as granting
+    nothing, and the ``basis`` their refusal was decided on, so the view and the refusal read one store point. Echo
+    and extend pass none, and what they print is not the signing view."""
+    if basis is None and body["supersedes"] is not None:          # a body that supersedes nothing reads no base
+        basis = store.sign_basis(body)
     L = [f"envelope {body['envelope_id']}  digest {env.envelope_digest(body)}", NOT_IN_FORCE_PLAIN,
-         _request_line(body, store, words), *_describe(body, store, old=None if old is None else old.body)]
-    if old is not None:
-        L.append(f"WIDER than {old.envelope_id}: that is why it needs your signature"
-                 if _wider(old.body, body) else f"not wider than {old.envelope_id}")
+         _request_line(body, store, words)]
+    sections = _bases(body, basis, authority, store._ssh_keygen)
+    for i, (head, base, threads, notes) in enumerate(sections):
+        if head is not None and len(sections) > 1:
+            L.append(f"read against {head.envelope_id} as narrowed for thread{'s' if len(threads) > 1 else ''} "
+                     f"{', '.join(threads)}:")
+        L += _describe(body, store, old=base if head is not None else None, binds=i == 0)
+        L += list(dict.fromkeys(n for n in notes if n))
+        if head is None:
+            continue
+        for t in threads:
+            members, gained = _member_lines(basis, t)
+            L += members
+            L.append(f"WIDER than {head.envelope_id} for thread {t}: that is why it needs your signature"
+                     if env.widens(base, body) or gained else f"not wider than {head.envelope_id} for thread {t}")
     L.append("if Levain later acts on it, it may do only this, nothing outside it.")
     return "\n".join(L)
 
@@ -612,17 +662,17 @@ def run_envelope_echo(args: argparse.Namespace, out: Any) -> int:
     if not shared:
         raise CoordError("these threads share no drop; one envelope covers threads that hold the same drop")
     drop = store.drop(shared[0])
-    heads = [store.head(t.thread_id) for t in threads]
-    first = heads[0]
-    if any((h is None) != (first is None) or (h is not None and h.envelope_id != first.envelope_id) for h in heads):
-        raise CoordError("these threads do not share one current envelope; echo them separately")
+    # the head, its effective envelope per thread and `seen` in ONE read: a seen read later could cover a narrowing
+    # the view never showed (store.basis raises the shared-head message)
+    first, _eff, seen = store.basis([t.thread_id for t in threads])
     where = _parse_where(args.where)
     now = _tick().replace(microsecond=0)
     body = {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
             "origin": "worded", "drop_id": drop.drop_id, "words_sha256": drop.words_sha256,
             "binds": [{"thread_id": t.thread_id, "rev": t.rev, "members_sha256": t.members_sha256} for t in threads],
-            "supersedes": None if first is None else {"envelope_id": first.envelope_id, "digest": first.digest},
-            "where": where, "lands": [_parse_land(s) for s in args.land], "pushes": [], "publishes": [],
+            "supersedes": None if first is None else {"envelope_id": first.envelope_id, "digest": first.digest,
+                                                       "seen": seen},
+            "draft": None, "where": where, "lands": [_parse_land(s) for s in args.land], "pushes": [], "publishes": [],
             "budget": _echo_budget(args.budget), "stop_at": utc_stamp(now + _parse_stop(args.stop)),
             "issued_at": utc_stamp(now)}
     text = canonical(body)
@@ -646,13 +696,13 @@ def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
 
     store = _store(args)
     t = store.thread(args.thread)
-    head = store.head(t.thread_id)
+    head, effs, seen = store.basis([t.thread_id])          # one read: the head, its effective envelope, `seen`
     if head is None:
         raise CoordError(f"thread {t.thread_id} has no envelope, so no budget to extend (levain envelope echo)")
     ended = store.end_of(head.envelope_id, t.thread_id)
     if ended is not None:
         raise CoordError(f"envelope {head.envelope_id} ended for this thread ({ended[0]}); a new one is an echo")
-    eff = store.effective(head.envelope_id, t.thread_id)
+    eff = effs[t.thread_id]
     now = _tick().replace(microsecond=0)
     if parse_stamp(eff["stop_at"]) - now < _MIN_LEFT:
         raise CoordError(f"envelope {head.envelope_id} has stopped or stops within 5 minutes; echo a new one")
@@ -673,8 +723,8 @@ def run_envelope_extend(args: argparse.Namespace, out: Any) -> int:
     body = {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
             "origin": "worded", "drop_id": drop.drop_id, "words_sha256": drop.words_sha256,
             "binds": [{"thread_id": t.thread_id, "rev": t.rev, "members_sha256": t.members_sha256}],
-            "supersedes": {"envelope_id": head.envelope_id, "digest": head.digest},
-            "where": eff["where"], "lands": eff["lands"], "pushes": eff["pushes"], "publishes": eff["publishes"],
+            "supersedes": {"envelope_id": head.envelope_id, "digest": head.digest, "seen": seen},
+            "draft": None, "where": eff["where"], "lands": eff["lands"], "pushes": eff["pushes"], "publishes": eff["publishes"],
             "budget": new_budget, "stop_at": eff["stop_at"], "issued_at": utc_stamp(now)}
     text = canonical(body)
     store.check_body(text)
@@ -707,7 +757,22 @@ def _accepted(args: argparse.Namespace, out: Any, store: EnvelopeStore, stored: 
                            "live": live, "authority_today": NOT_IN_FORCE, "signed_with_yes": yes}, "\n".join(text))
 
 
-_MIN_LEFT = timedelta(minutes=5)
+def _refuse_narrowed(body: dict[str, Any], basis: Any) -> None:
+    """Before a superseding body is shown for signing or accepting, on the one ``basis`` the view then renders: refuse a
+    ``seen`` past the store's high-water (no echo wrote it) and a narrowing of its head newer than ``seen`` on a bound
+    thread, so the view (which reads the head as it is at that point) is the base the signature will be held to. Only
+    the very body already accepted under its id is an exact retry, left to the store (L3 h11 r1: another body reusing
+    an accepted id is checked like any other)."""
+    sup = body["supersedes"]
+    if sup is None:
+        return
+    if basis.stored is not None and canonical(basis.stored.body) == canonical(body):
+        return
+    forged = seen_past(body, basis.high)
+    if forged is not None:
+        raise CoordError(forged)
+    if basis.narrowed:
+        raise CoordError(f"envelope {sup['envelope_id']} was narrowed after this body was echoed; echo again")
 
 
 def run_envelope_sign(args: argparse.Namespace, out: Any) -> int:
@@ -724,12 +789,15 @@ def run_envelope_sign(args: argparse.Namespace, out: Any) -> int:
         raise CoordError(f"envelope {stored.envelope_id} is already accepted; there is nothing to sign "
                          f"(levain envelope show {stored.envelope_id})")
     body = store.check_body(text)          # a body the store can only refuse is never shown for signing
+    basis = store.sign_basis(body)          # ONE store read: the refusal and the view are of the same point
+    _refuse_narrowed(body, basis)
     if parse_stamp(body["stop_at"]) - _tick() < _MIN_LEFT:
         raise CoordError(f"envelope {body['envelope_id']} has stopped or stops within 5 minutes; echo again")
-    print(_view(body, store), file=sys.stderr if args.json else out, flush=True)
+    snap = _snapshot(args, store)          # one authority read for the view and the prompt
+    print(_view(body, store, authority=snap, basis=basis), file=sys.stderr if args.json else out, flush=True)
     _need_terminal(args, "signing")
     signer_fp, sign = dcli._signer(args, env.SIGN_NAMESPACE, "envelope sign")
-    _confirm(args, "signing", _prompt(body, signer_fp, _signer_class(_snapshot(args, store), signer_fp)))
+    _confirm(args, "signing", _prompt(body, signer_fp, _signer_class(snap, signer_fp)))
     # the clock is read only now: the store refuses a signed_at far from its own, and a slow reader is not a stale one
     payload = env.sign_payload(body, signer_fp=signer_fp, signed_at=_tick())
     signature = dcli._sign_bytes(sign, env.sign_message(payload))
@@ -760,9 +828,12 @@ def run_envelope_accept(args: argparse.Namespace, out: Any) -> int:
         raise CoordError('the signature file is {"payload": ..., "signature": ...}')
     payload = sig["payload"]
     fp = payload.get("signer_fp") if isinstance(payload, dict) else None
-    print(_view(body, store), file=sys.stderr if args.json else out, flush=True)
+    basis = store.sign_basis(body)          # ONE store read: the refusal and the view are of the same point
+    _refuse_narrowed(body, basis)
+    snap = _snapshot(args, store)          # one authority read for the view and the signer line
+    print(_view(body, store, authority=snap, basis=basis), file=sys.stderr if args.json else out, flush=True)
     if isinstance(fp, str):
-        print(f"signed by {fp[:80]} ({_signer_class(_snapshot(args, store), fp)})"
+        print(f"signed by {fp[:80]} ({_signer_class(snap, fp)})"
               + (f", {str(sig['note'])[:80]}" if "note" in sig else ""), file=sys.stderr if args.json else out,
               flush=True)
     authority = _snapshot(args, store)          # read after the output, which can block, right before the write
@@ -823,7 +894,7 @@ def _spec_body(spec: Any, words: str, source: Source, store: EnvelopeStore) -> d
     now = _tick().replace(microsecond=0)
     return {"format": env.BODY_FORMAT, "store_id": store.store_id(), "envelope_id": "ev-" + secrets.token_hex(16),
             "origin": "structured", "drop_id": "dr-" + secrets.token_hex(16), "words_sha256": words_sha256(words),
-            "binds": [], "supersedes": None, "where": where, "lands": lands, "pushes": pushes,
+            "binds": [], "supersedes": None, "draft": None, "where": where, "lands": lands, "pushes": pushes,
             "publishes": publishes, "budget": budget, "stop_at": utc_stamp(now + _parse_stop(stop)),
             "issued_at": utc_stamp(now)}
 
@@ -1460,13 +1531,14 @@ def user_layer_text(setting: Any) -> str:
 
 def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
     """``levain coord agent``: for claude, the directory is made a Levain install for Claude Code first when it is not
-    one (``levain init``, non-interactive), and the setting is recorded only once its consent hook is live; codex is
-    :func:`_coord_agent_codex`. Either workspace goes in the coordinator record before the setting names it."""
+    one (``levain init``, non-interactive), and the setting is recorded only once its consent hook is live. The
+    workspace goes in the coordinator record before the setting names it. ``codex`` is refused: the Codex coordinator
+    was removed."""
     user_scope = None if args.user_scope is None else args.user_scope == "on"
     if args.agent is None:
         # `levain coord agent --user-scope on|off` alone: the standing setting is kept whole, only the layer choice moves
         if user_scope is None:
-            raise CoordError("name an agent (claude, codex or none), or give --user-scope on|off to change only that")
+            raise CoordError("name an agent (claude or none), or give --user-scope on|off to change only that")
         if args.cwd is not None or args.model is not None:
             raise CoordError("--user-scope alone keeps the agent, model and directory; name the agent to change them")
         checked = None
@@ -1495,11 +1567,12 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     from levain.coordinator import door
     from levain.coordinator.lease import check_model
 
+    if args.agent == "codex":        # before the model check: the removal is the reason, whatever the model says
+        raise CoordError("a Codex coordinator was removed: set claude or none. A Codex session you run yourself is "
+                         "still wrapped by the consent queue, and `levain session codex` runs one as a worker")
     check_model(args.model)          # before any install is made for it (the setting checks it again as it is written)
-    if args.agent == "codex":
-        return _coord_agent_codex(args, out, store)
     if args.agent != "claude":
-        raise CoordError(f"a {args.agent} coordinator cannot be launched yet; set claude, codex or none")
+        raise CoordError(f"a {args.agent} coordinator cannot be launched yet; set claude or none")
     from levain.coordinator.launch import default_coordinator_dir, setup_install, trust_remedy
 
     log = sys.stderr if args.json else out
@@ -1877,23 +1950,6 @@ def _record_workspace(target: Path) -> None:
         raise CoordError(f"not set: {target} could not be put in the coordinator record ({exc})") from exc
 
 
-def _coord_agent_codex(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> int:
-    """``levain coord agent codex``: :func:`levain.coordinator.codex_launch.setup` makes the workspace (never the
-    operator's own Codex install, never his hooks file), then it is recorded and the setting written."""
-    from levain.coordinator import codex_launch
-
-    if args.user_scope is not None:
-        raise CoordError("--user-scope is for a claude coordinator (a Codex coordinator loads its own config)")
-    target, ready, detail = codex_launch.setup(args.cwd)
-    if not ready:
-        raise CoordError(f"not set: {detail}")
-    _record_workspace(target)
-    got = store.coord_set_agent("codex", model=args.model, cwd=str(target), user_scope=False)
-    _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "detail": detail},
-          f"coordinator agent: codex{f' ({got.model})' if got.model else ''} in {got.cwd}\n{detail}")
-    return 0
-
-
 def review_feeds() -> tuple[str, ...]:
     from levain.coordinator import review
 
@@ -2074,13 +2130,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                                        "claude coordinator running without the lease whose session is done is "
                                        "ended and a fresh one started.")
     ca = c_sub.add_parser(
-        "agent", help="Choose the coordinator a drop launches: claude or codex (each in its own workspace), or none.",
+        "agent", help="Choose the coordinator a drop launches: claude (in its own workspace), or none.",
         description="claude: drops with no coordinator start a Claude Code session in DIR (default "
                     "<levain home>/coordinator), which is made a Levain install for Claude Code first when it is not "
-                    "one. codex: they start a thread on your Codex app-server daemon in DIR (default "
-                    "<levain home>/coordinator-codex); Codex's consent hook must already be live (levain init "
-                    "--adapter codex). Either workspace is put in Levain's coordinator record, which the coordinator's "
-                    "door reads. none: drops only queue for you. Levain never edits a harness's trust list: run the "
+                    "one. The workspace is put in Levain's coordinator record, which the coordinator's "
+                    "door reads. codex: removed (a Codex coordinator is no longer launched). none: drops only queue for you. Levain never edits a harness's trust list: run the "
                     "printed line once and trust the directory.")
     ca.add_argument("agent", nargs="?", default=None, choices=("claude", "codex", "none"))
     ca.add_argument("--user-scope", choices=("on", "off"), default=None, dest="user_scope",
@@ -2088,8 +2142,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                          "CLAUDE.md (default off: it loads the project and local layers only). Alone "
                          "(no agent) it changes only this and keeps the standing agent, model and directory.")
     ca.add_argument("--cwd", type=Path, default=None, metavar="DIR",
-                    help="The directory the coordinator runs in (default: <levain home>/coordinator, or "
-                         "coordinator-codex): a missing or empty one, which Levain sets up, or a coordinator "
+                    help="The directory the coordinator runs in (default: <levain home>/coordinator): "
+                         "a missing or empty one, which Levain sets up, or a coordinator "
                          "workspace Levain set up before. Your own Levain install is refused.")
     ca.add_argument("--model", default=None, help="The model the session runs (default: the harness's own).")
     cl = c_sub.add_parser("launch", help="Start a pending launch's session now (default: the pending coordinator's).")

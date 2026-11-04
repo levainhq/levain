@@ -837,6 +837,8 @@
     words.rows = 4;
     words.placeholder = "what you want done";
     words.setAttribute("aria-label", "your words");
+    for (const [k, v] of [["autocomplete", "off"], ["autocapitalize", "sentences"], ["autocorrect", "on"],
+                          ["spellcheck", "true"], ["inputmode", "text"], ["enterkeyhint", "enter"]]) words.setAttribute(k, v);
     // words typed in the cockpit's drop box and handed over by "Add an envelope" (dashboard_core.js openDropSheet): read once
     try {
       const pre = window.sessionStorage.getItem("levain-drop-prefill");

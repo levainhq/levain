@@ -25,7 +25,9 @@ def _ov(preset, lets, until, ts=NOW - 10):
 
 
 def decide(rec_or_none, idle, *, class_name="other", remote=None):
-    return intent.decide(NOW, rec_or_none or _rec(), idle, class_name=class_name, remote=remote)
+    # 1a (Phill 11-03): follow reads the newest typed desk message, not laptop input; `idle` here is that message's age
+    return intent.decide(NOW, rec_or_none or _rec(), idle, class_name=class_name, remote=remote,
+                         desk_msg_at=None if idle is None else NOW - idle)
 
 
 def _q(tmp_path):

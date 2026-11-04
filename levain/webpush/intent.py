@@ -6,7 +6,7 @@ one another, and the operator feeling in control of how residue and approvals re
 
 ``<queue_dir>/webpush/intent.json`` (0600, written only here) holds two layers, each carrying the same three settings:
 
-- ``devices``: ``on`` | ``off`` | ``follow`` (follow: devices on after ``follow_after`` seconds of no laptop input);
+- ``devices``: ``on`` | ``off`` | ``follow`` (follow: devices on after ``follow_after`` seconds without a typed desk message);
 - ``follow_after``: seconds, 60 to 86400 (default 600), used only under ``follow``;
 - ``lets_through``: ``everything`` ⊃ ``needs`` (approvals + attention) ⊃ ``approvals`` ⊃ ``nothing``.
 
@@ -19,10 +19,9 @@ stays on file, inert, until the next write replaces it.
 One lock (the presence lock, ``<queue>/webpush/.presence.lock``), one event stream (every write leaves one row in
 ``presence.log.jsonl``), one decider (:func:`should_push` in :mod:`levain.webpush.presence` calls :func:`_core` here) and one
 sentence (:func:`describe_line`), printed verbatim by every surface. Consent asks the same decider
-(:func:`approvals_route`), so a push and a hold diverge in two named cases only: a ``follow`` that pushes for want of a
-laptop input reading does not hold (the line's ``Approvals:`` clause says so), and the ping about a request already
+(:func:`approvals_route`), so a push and a hold diverge in one named case only: the ping about a request already
 filed (``filed``, :func:`decide`) pushes whatever the desk or devices setting is doing, where the hold's question never
-passes ``filed``. Both are pinned in ``tests/test_webpush_push_hold_cases.py``. A prompt left to the agent's own dialog
+passes ``filed``. It is pinned in ``tests/test_webpush_push_hold_cases.py``. A prompt left to the agent's own dialog
 still sends a NOTICE to the devices whenever ``lets_through`` admits approvals (:func:`approval_notice`): a notice, never
 a hold. A write against a record that cannot be read is refused, never replaced.
 
@@ -293,10 +292,12 @@ def _ago(secs: float) -> str:
     return "just now" if m < 1 else f"{m} min ago"
 
 
-def devices_on_now(eff: dict, reading: float | None, remote: dict | None, now: float) -> tuple[bool, str]:
-    """``(on, why)``: whether pings go to his devices under the effective settings ``eff`` at ``now``. ``reading`` is the
-    laptop's input idle seconds (a desk message counted as input), ``None`` when unknown. Remote input feeds ``follow`` only
-    and never counts as the desk. ``eff`` may carry ``preset`` and ``layer`` (``overlay``): they only name the reason."""
+def devices_on_now(eff: dict, remote: dict | None, now: float, *, desk_msg_at: float | None) -> tuple[bool, str]:
+    """``(on, why)``: whether pings go to his devices under the effective settings ``eff`` at ``now``. ``follow`` returns to the
+    desk ONLY on a typed desk message (Phill 11-03, "1a"): laptop keyboard or mouse input, a screen wake included, never counts.
+    ``desk_msg_at`` is the newest desk message's clock time, ``None`` when there is none. Remote input feeds ``follow``
+    only and never counts as the desk. ``desk_msg_at`` is keyword-only and has no default: the slot once held idle seconds, so a
+    caller written for that fails loudly instead of reading a small number as a 1970 desk message. ``eff`` may carry ``preset`` and ``layer`` (``overlay``): they only name the reason."""
     d = eff["devices"]
     if d == "on":
         if eff.get("preset"):
@@ -304,15 +305,16 @@ def devices_on_now(eff: dict, reading: float | None, remote: dict | None, now: f
         return True, "set for a while" if eff.get("layer") == "overlay" else "devices on"
     if d == "off":
         return False, "devices off"
-    if reading is None:
-        return True, "follow: no laptop input reading"
     rage = _remote_fresh(remote, now)
     if rage is not None:
         what = "remote terminal input" if remote["source"] == "remote-terminal" else "remote control turn"
         return True, f"follow: {what} {int(rage // 60)} min ago"
-    if reading >= eff["follow_after"]:
-        return True, f"follow: no input for {int(reading // 60)} min"
-    return False, f"follow: input at the laptop {_ago(reading)}"
+    if desk_msg_at is None:
+        return True, "follow: no desk message"
+    age = max(0.0, now - desk_msg_at)
+    if age >= eff["follow_after"]:
+        return True, f"follow: no desk message for {int(age // 60)} min"
+    return False, f"follow: desk message {_ago(age)}"
 
 
 def _eff(rec: dict, now: float, reading: float | None, desk_msg_at: float | None) -> tuple[dict, dict | None, str | None]:
@@ -325,9 +327,9 @@ def _eff(rec: dict, now: float, reading: float | None, desk_msg_at: float | None
 
 
 def decide(now: float, rec: dict, reading: float | None, *, class_name: str, remote: dict | None = None,
-           desk_msg_at: float | None = None, filed: bool = False) -> Decision:
+           desk_msg_at: float | None, filed: bool = False) -> Decision:
     """Whether a ping of ``class_name`` is pushed at ``now``. Pure. ``rec`` is a :func:`read` result; ``reading`` the laptop
-    idle seconds with a desk message counted as input. ``filed``: the ping is about a request already FILED and waiting
+    idle seconds (it feeds the ``until: input`` overlays only; ``follow`` reads ``desk_msg_at``, Phill 11-03 "1a"). ``filed``: the ping is about a request already FILED and waiting
     for a signed answer (an approval-class ping from a consent hook or gate), which goes whatever the desk or devices
     setting is doing (only a mute holds it). A fault reads as push (a ping he did not need costs one notification, one
     he needed and never got costs the day)."""
@@ -339,7 +341,7 @@ def _decide(now: float, rec: dict, reading: float | None, class_name: str, remot
     if rec["status"] == "fault":
         return Decision(True, "pushing", _FAULT_WHY), "measured"
     eff, ov, _ended = _eff(rec, now, reading, desk_msg_at)
-    on, why = devices_on_now(eff, reading, remote, now)
+    on, why = devices_on_now(eff, remote, now, desk_msg_at=desk_msg_at)
     preset = (ov or {}).get("preset") or ""
     source = "word" if ov is not None else "measured"
     if class_name not in LETS_CLASSES[eff["lets_through"]]:
@@ -424,22 +426,25 @@ def _core(queue_dir: Path | str | None, kind: str, now: float | None, idle: Call
 def approvals_to_devices(queue_dir: Path | str | None, *, now: float | None = None,
                          idle: Callable[[], float | None] | None = None) -> tuple[bool, str]:
     """Whether an approval reaches his devices for a signed answer right now, and why: literally ``should_push(queue_dir,
-    "consent")`` with ``suggest=False``, so it is the hold's question; a push differs from it only in the two cases the module docstring
+    "consent")`` with ``suggest=False``, so it is the hold's question; a push differs from it only in the case the module docstring
     names (consent reads this, DESIGN §4)."""
     d = presence.should_push(queue_dir, "consent", now=now, idle=idle, suggest=False)
     return d.push, d.why
 
 
 def _blind(s: dict, eff: dict) -> bool:
-    """Whether a ``follow`` decision in sample ``s`` under settings ``eff`` reads as "devices on" ONLY because there is no
-    laptop input reading (no fresh remote record either): the rule's fail-open, not a measurement that he is away."""
-    return eff["devices"] == "follow" and s["reading"] is None and _remote_fresh(s["remote"], s["now"]) is None
+    """Whether a ``follow`` decision in sample ``s`` under settings ``eff`` reads as "devices on" ONLY for want of a measurement.
+    ``follow`` reads the typed desk message alone (Phill 11-03, "1a"), and a missing message is the rule's answer, not a blind
+    spot: a fresh install sends approvals to the devices and consent holds for a signed answer there. So nothing the derivation
+    reads can be unmeasured, and this is false; the laptop's own input reading, which ``follow`` no longer reads, never makes
+    it true. Kept as the one place a future unmeasurable input would say so."""
+    return False
 
 
 def approvals_route(queue_dir: Path | str | None, *, now: float | None = None,
                     idle: Callable[[], float | None] | None = None) -> tuple[bool, str, bool]:
     """``(to_devices, why, blind)``: :func:`approvals_to_devices` from the same one sample, plus ``blind``, true when the
-    record sends approvals to the devices only because ``follow`` has no laptop input reading (:func:`_blind`). The push
+    record sends approvals to the devices only for want of a measurement (:func:`_blind`). The push
     keeps that fail-open (a ping he did not need costs one notification); consent's HOLD does not (it would block the
     agent on nothing measured), so consent reads ``blind`` and leaves the agent's own dialog to ask. A fault is
     ``(True, why, False)``, as :func:`presence.should_push` reads it."""
@@ -518,7 +523,7 @@ def _state(queue_dir: Path | str | None, s: dict) -> dict:
     if rec["status"] == "fault":
         return {"fault": True, "rec": rec}
     eff, ov, ended = _eff(rec, now, reading, s["msg_at"])
-    on, why = devices_on_now(eff, reading, s["remote"], now)
+    on, why = devices_on_now(eff, s["remote"], now, desk_msg_at=s["msg_at"])
     lets = eff["lets_through"]
     goes = on and lets != "nothing"
     if lets == "nothing":

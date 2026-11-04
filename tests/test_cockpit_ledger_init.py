@@ -389,12 +389,12 @@ def test_doctor_warns_at_exactly_one_laptop_presence_key(tmp_path):
     a = RealKey(tmp_path, "A")
     _init(root, a, {a.fingerprint})
     [r] = _check_cockpit_authority(install)
-    assert r.ok and r.warn and a.fingerprint in r.detail
-    assert "levain cockpit enroll" in r.hint and "not in this build" in r.hint
+    assert not r.ok and a.fingerprint in r.detail                              # one signing key FAILS (enrolment sitting)
+    assert "levain cockpit enroll" in r.hint and "--custody passphrase" in r.hint and "not in this build" in r.hint
     p = RealKey(tmp_path, "P")
     enroll(root, p.public, "display-phone", signer_fp=a.fingerprint, sign=a.sign_link, clock=lambda: NOW)
     [r] = _check_cockpit_authority(install)
-    assert r.warn                                   # a phone key is not a second laptop-presence key
+    assert not r.ok                                 # a phone key is not a second laptop-presence key
     b = RealKey(tmp_path, "B")
     enroll(root, b.public, "laptop-presence", custody="passphrase", signer_fp=a.fingerprint, sign=a.sign_link, clock=lambda: NOW)
     [r] = _check_cockpit_authority(install)
@@ -497,7 +497,7 @@ def test_f3_doctor_names_the_act_that_exists_and_says_re_genesis_is_not_in_this_
     a = RealKey(tmp_path, "A")
     _init(root, a, {a.fingerprint})
     [r] = _check_cockpit_authority(install)
-    assert r.warn and "levain cockpit enroll" in r.hint
+    assert not r.ok and "levain cockpit enroll" in r.hint
     assert "`levain cockpit ledger re-genesis`" in r.hint and "not in this build" in r.hint
     from levain.cockpit.keys import revoke
     revoke(root, a.fingerprint, signer_fp=a.fingerprint, sign=a.sign_link, clock=lambda: NOW,

@@ -229,6 +229,21 @@ def _patch_text(changes: Sequence[Sequence[str]]) -> str:
     return "\n".join(lines)
 
 
+_TRUNCATION_KEYS = frozenset({"levain_truncated", "sha256", "bytes", "head"})
+
+
+def _truncation_marker(tool_input: Any) -> bool:
+    """``tool_input`` is the driver's truncation marker (``claude_session``'s input cap): exactly its four keys and
+    their types, so a model's input that merely carries ``levain_truncated`` is not read as one (L3_rmd2_r1
+    complement LOW 4)."""
+    if not isinstance(tool_input, Mapping) or set(tool_input) != _TRUNCATION_KEYS:
+        return False
+    size = tool_input["bytes"]
+    return tool_input["levain_truncated"] is True and isinstance(tool_input["sha256"], str) \
+        and tool_input["sha256"].startswith("sha256:") and type(size) is int and size >= 0 \
+        and isinstance(tool_input["head"], str)
+
+
 def agent_config_tagged(harness: str, tool_name: str, tool_input: Any, ctx: ChatLaunchContext, *,
                         protected: tuple[Path, ...] = ()) -> bool:
     """Whether a request targets an agent's config, selected BY HARNESS with the launch's context and never
@@ -383,8 +398,7 @@ def _deny_reply(row: ApprovalRow, cause: str) -> tuple[Mapping[str, Any], str]:
     Codex's, by the request's method: ``item/permissions/requestApproval`` (kind ``permission``) is denied with
     ``{"permissions": {}}`` and carries no decision list; a command or file-change approval uses the first refusing
     decision among its ``available_decisions`` (the list is optional on the wire), else the pinned default
-    ``{"decision": "decline"}``. (``codex_wire.SERVER_REQUESTS`` holds these replies; the literals are unconfirmed
-    against a live Codex.)"""
+    ``{"decision": "decline"}`` (the literals are unconfirmed against a live Codex)."""
     if row.spawn_nonce is not None or row.kind == "quarantine":
         return {"behavior": "deny", "message": f"Levain: the gate is not live ({cause})"}, "deny"
     if row.kind == "permission":
@@ -485,6 +499,10 @@ def arrive(conn: sqlite3.Connection, now: str, *, launch_id: str, raw_vendor_key
                   approval_id=approval_id, kind=kind, route="core" if kind == "host" else "native",
                   decisions=tuple(available_decisions or ()), tool_name=tool_name, digest=digest, nonce=spawn_nonce,
                   tagged=agent_config_tagged(harness, tool_name, tool_input, ctx, protected=protected))
+    if _truncation_marker(tool_input):
+        # the driver kept only a marker for an input past its body cap: nobody can be shown what an allow would allow,
+        # and the digest and the agent-config tag were computed over the marker, so the one answer is a deny
+        return Arrival("denied", row, _deny_attempt(conn, now, row, cause="its tool input was truncated"))
     fold = chat.liveness(conn, launch_id)
     if not fold.enabled and not (fold.latest == "probing" and not fold.latched):
         return Arrival("denied", row, _deny_attempt(conn, now, row, cause="gate not live"))

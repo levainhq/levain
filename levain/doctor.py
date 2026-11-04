@@ -152,6 +152,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_host_awake())
     core.extend(_check_cockpit_authority(install))
     core.extend(_check_authority_signers(install))
+    core.extend(_guarded("terminal key", _check_terminal_key))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
@@ -301,6 +302,22 @@ _ACTIVATION_FILES = ("posture.md", "recency_directives.md")
 # these two base files carry the identity slots (OPERATOR_NAME/ENTITY_NAME) that
 # matter most, so it is the right minimum.
 _RENDER_TARGET_SEEDS = ("world.md", "origin.md")
+
+
+def _check_terminal_key(key_dir: Path | None = None, **look: Any) -> CheckResult:
+    """The ``terminal key`` row (TERMSIGN): what ``levain band terminal-key status`` prints. No key is a fact said in
+    words, not a failure; a key whose Secure Enclave identity is missing or not biometric-protected is a warning.
+    Read-only."""
+    from levain.consent import terminal_sign
+
+    rep = terminal_sign.status(key_dir, **look)
+    if rep.state == "enrolled":
+        return CheckResult("terminal key", True, rep.text.removeprefix("terminal key: "))
+    if rep.state == "not enrolled":
+        return CheckResult("terminal key", True, rep.text, "`levain band terminal-key create` enrols one.",
+                           neutral=True)
+    return CheckResult("terminal key", True, rep.text.removeprefix("WARNING: "),
+                       "Re-check with `levain band terminal-key status`.", warn=True)
 
 
 def _check_consent_hooks(install: Path) -> list[CheckResult]:
@@ -2176,11 +2193,17 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
                                 f"If {show(str(install or '?'))} is the install whose agents dispatch, reinstall the "
                                 "fence for it: `levain agents fence start --path <install>`; if not, run `levain "
                                 "doctor --path <that install>`.")]
-    for what, err in (("the agent store", val["store_error"]), ("the authority log", val["authority_error"])):
-        if err is not None:
-            return [CheckResult(name, False, f"running but cannot read {what} ({show(err, 120)}). Dispatch sessions "
-                                "are refused.", "Check that the fence service runs as you and names this install's "
-                                "store and cockpit root.")]
+    from levain.autonomic.db import DB_NAME as agent_db
+    from levain.cockpit.firejournal import DB_NAME as cockpit_db
+
+    gaps = [f"{what} {show(str(Path(base) / fname))} ({show(err, 120)})"
+            for what, base, fname, err in (("the agent store database", val["store"], agent_db, val["store_error"]),
+                                           ("the authority log", val["cockpit_root"], cockpit_db,
+                                            val["authority_error"])) if err is not None]
+    if gaps:
+        return [CheckResult(name, False, f"running on cockpit root {show(val['cockpit_root'])}, but cannot read "
+                            f"{' and '.join(gaps)}. Dispatch sessions are refused.", "Check that the fence service "
+                            "runs as you and names this install's store and cockpit root.")]
     return [CheckResult(name, True, f"running (store {show(val['store'])}, authority seq {val['seq']}). Dispatch "
                         "sessions are checked on every tool call.")]
 
@@ -3397,12 +3420,13 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
             "act signed. The way out, `levain cockpit ledger re-genesis` (a new authority log, every grant void), "
             "is not in this build.")]
     if len(laptops) == 1:
+        # one signing key is a single point of loss (a Secure Enclave key dies with its laptop), so it FAILS until a
+        # co-root is enrolled; the fix is the independent offline passphrase key, enrolled by the key already there
         return rows + [CheckResult(
-            name, True, f"one {LAPTOP} key is enrolled ({laptops[0]})",
-            f"Enrol a second {LAPTOP} key now: make one with `levain cockpit key create`, then `levain cockpit "
-            "enroll <key.pub> --signing-key <the enrolled key>`; "
-            f"{recovery}.",
-            warn=True)]
+            name, False, f"only one {LAPTOP} key is enrolled ({laptops[0]}): lose it and nothing can enrol or revoke",
+            "Enrol a co-root now: `levain cockpit key create --custody passphrase --label laptop-presence`, then "
+            f"`levain cockpit enroll <that key.pub> --class {LAPTOP} --custody passphrase --signing-key <the enrolled "
+            f"key>`; keep its passphrase off this laptop. {recovery}.")]
     if not laptops:
         return rows + [CheckResult(name, True, f"no unrevoked {LAPTOP} key: nothing can enrol a key or sign a T3 act",
                                    "Recovery, `levain cockpit ledger re-genesis` (a new authority log, every grant "

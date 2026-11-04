@@ -303,8 +303,10 @@ def test_every_levain_home_reader_is_named_for_the_fallback():
     reads = {k: v for k, v in reads.items() if v}
     # confinement.py: the floor's own resolution of the home, and grants_file(). cli.py: `daemon install-feeds` forwards
     # the home path itself into the launchd unit's environment and builds no directory under it, so it adds no name.
+    # dream/cli.py: `dream enable` reads the home only to name the default cockpit root in the install-facts file it
+    # writes into the agent store's directory; it builds nothing under the home, so it adds no name either.
     assert reads == {"autonomic/db.py": 1, "chat_egress/srt_pin.py": 1, "cli.py": 1, "cockpit/custody.py": 1,
-                     "consent/queue.py": 1, "coordinator/launch.py": 1, "firing/confinement.py": 2,
+                     "consent/queue.py": 1, "coordinator/launch.py": 1, "dream/cli.py": 1, "firing/confinement.py": 2,
                      "firing/ssh_agent.py": 1, "observe.py": 1}, reads
     names = {default_store_dir().name, default_key_dir().name, default_queue_dir().name, GRANTS_DIR,
              ssh_agent.RUN_DIR, ssh_agent.HOST_KEYS_DIR, default_coordinator_dir().name, default_prefix().name, OBSERVE_DIR}

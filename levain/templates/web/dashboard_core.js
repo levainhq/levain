@@ -7206,6 +7206,9 @@
     words.id = "ck-drop-words";
     words.placeholder = "words for the coordinator";
     words.setAttribute("aria-label", "your words for the coordinator");
+    // a plain prose box: iOS keys its field kind off the attributes, and a bare textarea beside the one-time-code pairing box
+    // got payment/code treatment (no predictive text, autocorrect off); say "ordinary text" outright
+    for (const [k, v] of [["autocomplete", "off"], ["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["enterkeyhint", "enter"]]) words.setAttribute(k, v);
     words.addEventListener("input", () => { dropPrefillClear(); ui.handed = undefined; });      // words changed since a handoff: that handoff is stale
     const acts = el("div", "needs-actions drop-actions");
     const send = el("button", "needs-btn needs-primary", "Send");
@@ -7268,7 +7271,7 @@
     ui.earlierLine = earlierLine;
     ui.resume = resume;
     const paint = (msg, bad) => { ui.receipt.textContent = msg; ui.receipt.classList.toggle("bad", !!bad); };
-    const lock = (on) => { ui.working = on; send.disabled = env.disabled = words.disabled = on || !ui.can; };
+    const lock = (on) => { ui.working = on; send.disabled = env.disabled = on || !ui.can; words.disabled = dropWordsOff(words, on, ui.can); };
     ui.paint = paint;
     ui.lock = lock;
     // (the handoff is marked after the sheet opens: opening closes any sheet first, and a close ends a handoff)
@@ -7337,6 +7340,14 @@
     return ui;
   }
   // one draw of the drop card from one read; the box and its words are never rebuilt under the reader
+  // The box is off while a send is in flight, and when the coordinator cannot be written to AND nobody is typing: a read that is
+  // not clean (404, 401/403, 5xx, a network blip, a poll) must not take the keyboard from a box he is in or drop a draft he holds.
+  // Send and the envelope button still follow `can`, so a blip never lets a send through.
+  function dropWordsOff(words, working, can) {
+    if (working) return true;
+    if (can) return false;
+    return !(document.activeElement === words || words.value.trim() !== "");
+  }
   function dropHeroDraw(host, r) {
     const ui = host._drop;
     const body = r && r.body ? r.body : null;
@@ -7349,7 +7360,8 @@
     ui.note = note;
     ui.say.textContent = note;
     ui.say.classList.toggle("bad", !ui.can);
-    ui.send.disabled = ui.env.disabled = ui.words.disabled = ui.working || !ui.can;
+    ui.send.disabled = ui.env.disabled = ui.working || !ui.can;
+    ui.words.disabled = dropWordsOff(ui.words, ui.working, ui.can);
     host.classList.toggle("drop-off", !ui.can);
     // A transient failure (network, 5xx, no store read) leaves the rows already drawn; the note above says why. A refused or
     // missing token leaves nothing of the thread: neither his drops nor the desk's cached rows outlive the authority to read them.

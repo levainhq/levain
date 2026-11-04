@@ -113,7 +113,7 @@ def step(cs, message_id, state, **kw):
 # --- the static import test (B4 (b)'s static half, complement F10) -------------------------------------------------
 _MODULES = [Path(chat.__file__), Path(chat_lease.__file__)]
 _FORBIDDEN_MODULES = ("levain.coordinator.lease", "levain.coordinator.envelopes", "levain.coordinator.envelope",
-                      "levain.coordinator.launch", "levain.coordinator.codex_launch", "levain.coordinator.budget",
+                      "levain.coordinator.launch", "levain.coordinator.budget",
                       "levain.coordinator.review", "levain.coordinator.first_reader", "levain.coordinator.cli",
                       "levain.consent", "levain.broker", "levain.slot", "levain.dispatch")
 _STORE_NAMES = {"WORDS_MAX", "CoordError", "_append_only", "_in", "next_gseq", "schema_present"}
@@ -227,7 +227,7 @@ def test_message_to_a_worker_names_a_worker_launch_of_its_thread(cs, world, stor
     d = store.accept_drop("another", surface="cli")[0]
     other = store.split(d.drop_id, [Part("work", "other")])[0].thread_id
     c = raw(qdir)
-    with pytest.raises(sqlite3.IntegrityError, match="worker launch of its thread"):
+    with pytest.raises(sqlite3.IntegrityError, match="worker or room launch of its thread"):
         c.execute("INSERT INTO chat_messages (message_id, gseq, thread_id, launch_id, recipient, author_kind, "
                   "author_surface, client_id, outbox_id, mode, body, body_sha256, body_norm_sha256, attachments, at) "
                   "VALUES (?, ?, ?, ?, 'worker', 'operator', 'cockpit', 'w', 'ob-other001', 'queue', 'x', 's', 's', "
@@ -820,9 +820,9 @@ def _coordinator_launch(store, world):
 def test_events_and_cursors_name_a_worker_launch(cs, world, store, qdir, clock):
     # codex MED 1: a coordinator launch holds no thread, so its events never reach a timeline while its cursor moves on
     coord = _coordinator_launch(store, world)
-    with pytest.raises(CoordError, match="worker launch"):
+    with pytest.raises(CoordError, match="worker or room launch"):
         ev(cs, {**world, "launch": coord})
-    with pytest.raises(CoordError, match="worker launch"):
+    with pytest.raises(CoordError, match="worker or room launch"):
         with cs._write() as (conn, now):
             chat.record_cursor(conn, now, launch_id=coord, vendor_cursor="c", complete_through=None, gap=False)
     c = raw(qdir)
@@ -866,11 +866,11 @@ def test_message_to_another_threads_launch_is_a_coord_error(cs, world, store, qd
     # complement LOW 2: the refusal is the module's, never a raw IntegrityError from the trigger
     d = store.accept_drop("another", surface="cli")[0]
     other = store.split(d.drop_id, [Part("work", "other")])[0].thread_id
-    with pytest.raises(CoordError, match="worker launch of its thread"):
+    with pytest.raises(CoordError, match="worker or room launch of its thread"):
         msg(cs, {**world, "thread": other})
-    with pytest.raises(CoordError, match="worker launch of its thread"):
+    with pytest.raises(CoordError, match="worker or room launch of its thread"):
         msg(cs, world, outbox="ob-00000002", launch_id=_coordinator_launch(store, world))
-    with pytest.raises(CoordError, match="worker launch of its thread"):
+    with pytest.raises(CoordError, match="worker or room launch of its thread"):
         msg(cs, world, outbox="ob-00000003", launch_id="ln-" + "0" * 32)
     assert raw(qdir).execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0] == 0
 

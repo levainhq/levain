@@ -634,11 +634,13 @@ def check_repo_layer(docs: Mapping[str, Any]) -> None:
 # --- the render blob's inputs (§5.3) ---------------------------------------------------------------------------------
 
 _AUTH_ROUTE = {"brokered": "brokered", "passthrough": "subscription_passthrough"}
-#: the host the Claude identity child's refresh goes to (:data:`levain.slot.identity_child.TOKEN_ORIGIN`)
+#: the OAuth token host (:data:`levain.slot.identity_child.TOKEN_ORIGIN`): the vendor binary's own refresh and revoke
+#: go there through the passthrough route's tunnel, including when the identity child runs its status command
 _TOKEN_HOST = IC.TOKEN_ORIGIN[1]
 #: the host the Claude identity child's profile call goes to (:data:`levain.slot.identity_child.ORIGIN`)
 _PROFILE_HOST = IC.ORIGIN[1]
-#: every host the identity child talks to through the passthrough route's tunnel, each with what needs it
+#: every host the vendor binary reaches through the passthrough route's tunnel for the identity check, each with what
+#: needs it (the label strings are quoted in the refusal text and are pinned, so they keep their wording)
 _IDENTITY_HOSTS = ((_TOKEN_HOST, "the login refresh"), (_PROFILE_HOST, "the login check"))
 _ROUTE_ID_SAID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
 
@@ -675,7 +677,7 @@ def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str) -> Tu
     route = mine[0]
     if vendor == "claude" and auth == "passthrough":
         # 1029 ruling (np-e5b2ebed (a)): refuse at route load and name the hosts; never merge a host into his route.
-        # The identity child POSTs the refresh to the token host and GETs the profile from the profile host, both
+        # The vendor binary's own token refresh goes to the token host and its profile call to the profile host, both
         # through this route's tunnel, so a route without either makes every launch fail its identity check.
         hs = _hosts(route)
         missing = [(h, why) for h, why in _IDENTITY_HOSTS if h not in hs]

@@ -42,6 +42,9 @@ def test_a_route_file_on_disk_decides_nothing_until_it_is_migrated(tmp_path):
     seen = presence.should_push(tmp_path, "ping", now=NOW, idle=lambda: 5.0, suggest=False)
     assert seen.push is True and intent.read(tmp_path, NOW)["status"] == "projection"
     assert intent.describe_line(tmp_path, now=NOW, idle=lambda: 5.0).endswith("Not migrated yet: levain ping migrate.")
+    from levain.webpush import desk
+
+    desk._write(tmp_path, desk.DESK_MESSAGE_NAME, {"at": NOW + 7190, "source": "test", "desk": ""})   # 1a (Phill 11-03): a typed desk message
     assert presence.should_push(tmp_path, "ping", now=NOW + 7200, idle=lambda: 5.0, suggest=False).push is False   # it has ended
 
 

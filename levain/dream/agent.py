@@ -6,7 +6,9 @@ What stands alone here, each part failing closed:
   judged by the real ``parse_role`` / ``parse_spec`` / ``check_spec`` before anything is written.
 * :func:`signing_card_text`: the words the link's signing card carries (§6).
 * :func:`day_ready` / :func:`make_on_input`: the day-ready predicate as the input check. Anything that raises is
-  ``unreadable``, never ready. The hook POINT is not on main: :func:`unwired_on_input` is the default and refuses.
+  ``unreadable``, never ready. The hook point is the controller's ``check_input`` (``launch(on_input=...)``), which
+  takes a plain ``bool``: :func:`bool_on_input` and :func:`install_on_input` adapt this verdict to it, and the
+  controller resolves the dream's hook by agent name when a caller passes none.
 * :func:`win_check`: the dream's win (§9, "Win verifier") in the shape of ``supervise.Hooks.verify``.
   :func:`register_win_check` hands it to P8b's ``gauges.register_check`` once that exists; until a caller passes one,
   nothing registers it.
@@ -14,6 +16,9 @@ What stands alone here, each part failing closed:
 * :func:`pause_notice`, :func:`renewal_check`, :func:`drill_tick`: the pause's attention row (§4.4), the expiry
   renewal card and expiry row (F14), and the drill on its own 7-day cadence (F12).
 * :func:`run_body` / :func:`make_run`: the fire's body for a dream occurrence, with every dependency passed in.
+* :func:`read_install` / :func:`fire_factory` / :func:`dream_run`: the install facts the fire reads from the agent
+  store's directory, the factory that builds :func:`run_body`'s arguments from them, and the ``fire(run=...)`` callable
+  the controller dispatches a dream occurrence to.
 
 An attention row is a callable ``attention(key, text)`` that upserts on its key (the shape ``Supervisor.reap`` takes);
 the agent store holds no attention table.
@@ -194,8 +199,11 @@ def day_ready(store_path: Path | str, row: Mapping[str, Any], *, now: datetime, 
         me = row.get("occurrence_id")
         if not isinstance(me, str) or not me.strip():
             raise ValueError("the occurrence row carries no occurrence_id")
-        day = _ready.occurrence_dream_day(row, zone)
         manual = row.get("kind") == "manual"
+        if manual and not row.get("launched_at"):
+            # a manual run is checked while still `admitted`, before it has a launched_at: its own day is now's
+            row = {**row, "launched_at": now}
+        day = _ready.occurrence_dream_day(row, zone)
         src, close = _ready.sources_for(store_path, agent_dir=agent_dir, coord_dir=coord_dir, now=now)
         # the occurrence under evaluation is itself an `admitted` row (the claim precedes the input check), and check 1
         # reads any admitted row of the agent as a dream in flight: it must not count itself
@@ -216,8 +224,8 @@ def day_ready(store_path: Path | str, row: Mapping[str, Any], *, now: datetime, 
 
 def make_on_input(store_path: Path | str, *, zone: str, agent_dir: Path | str | None, coord_dir: Path | str | None,
                   clock: Callable[[], datetime] | None = None) -> Callable[[Mapping[str, Any]], InputVerdict]:
-    """The dream's input check for the ``on_input`` hook point, as ``fn(occurrence_row) -> InputVerdict``. The hook
-    point's own signature is P6-5's; this is the dream's half."""
+    """The dream's input check, as ``fn(occurrence_row) -> InputVerdict``. The controller's hook point takes a plain
+    ``bool``: :func:`bool_on_input` is the adapter."""
     clk = clock or (lambda: datetime.now(timezone.utc))
 
     def on_input(row: Mapping[str, Any]) -> InputVerdict:
@@ -227,8 +235,31 @@ def make_on_input(store_path: Path | str, *, zone: str, agent_dir: Path | str | 
 
 
 def unwired_on_input(row: Mapping[str, Any]) -> InputVerdict:
-    """The seam's default until the ``on_input`` hook point exists: no occurrence is ever ready."""
+    """A verdict that never admits: no occurrence is ever ready."""
     return InputVerdict(False, _ready.UNREADABLE, "unwired", "the on_input hook point is not wired to the dream")
+
+
+class InputUnreadable(RuntimeError):
+    """The day's input could not be read (a corrupt or locked store, an unreadable coordinator source). The controller
+    reads a raising hook as dead input: the row stays retryable within its grace and ends ``missed`` past it, never
+    ``skipped-no-input``."""
+
+
+def bool_on_input(check: Callable[[Mapping[str, Any]], InputVerdict]) -> Callable[[Mapping[str, Any]], bool]:
+    """``check`` in the shape ``launch(on_input=...)`` takes: the verdict's ``ok``. The controller reads a ``bool`` as
+    present or absent input and anything else (or a raise) as dead input, so the verdict's state and reason do not
+    reach the row; they stay in :func:`day_ready` for ``levain dream ready``. A day that could not be READ is not a
+    quiet one: only a ready verdict answers True and only a quiet one answers False; any other raises
+    :class:`InputUnreadable` (dead input to the controller, retryable)."""
+    def on_input(row: Mapping[str, Any]) -> bool:
+        v = check(row)
+        if v.ok is True:
+            return True
+        if v.state == _ready.QUIET:
+            return False
+        raise InputUnreadable(f"{v.state}/{v.kind}: {v.reason}")
+
+    return on_input
 
 
 # ------------------------------------------------------------------------------------------------------- win check
@@ -637,7 +668,200 @@ def make_run(factory: Callable[[Any, str, int], Mapping[str, Any]]) -> Callable[
             sup = kw.pop("sup")
             return run_body(sup, occurrence_id, launch_epoch, **kw).code
         except Exception as exc:  # noqa: BLE001
-            _log.warning("dream run for %s could not be built or ran out: %s", occurrence_id, type(exc).__name__)
+            _log.warning("dream run for %s could not be built or ran out: %s: %s", occurrence_id, type(exc).__name__, exc)
             return 1
 
     return run
+
+
+# --------------------------------------------------------------------------------------------- the install, the dispatch
+
+INSTALL_FILE = "dream_install.json"
+_INSTALL_KEYS = ("store_path", "cockpit_root", "coord_dir", "zone")
+
+
+@dataclass(frozen=True)
+class DreamInstall:
+    """What a dream occurrence needs that the agent store does not hold: the install's anneal ``memory.db``, the cockpit
+    root its authority log is replayed from, the coordinator queue directory (the review store and the live-session
+    reads), the install's zone, and the first-run facts file the Claude route's exposure check reads."""
+    store_path: Path
+    cockpit_root: Path
+    coord_dir: Path
+    zone: str
+    facts_path: Path | None = None
+    model: str = "claude-opus-5-5"
+    claude_bin: str = "claude"
+
+
+INSTALL_SCHEMA = 1
+
+
+class InstallRefused(ValueError):
+    """The install facts cannot be written or trusted; the message names the file and the one fact at fault."""
+
+
+def _fact_path(doc: Mapping[str, Any], key: str, path: Path, *, kind: str, writing: bool = False) -> Path:
+    raw = doc.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        raise InstallRefused(f"{path} lacks {key}")
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        raise InstallRefused(f"{path}: {key} {raw!r} is not an absolute path")
+    exists = p.is_file() if kind == "file" else p.is_dir()
+    if not exists:
+        what = "a file" if kind == "file" else "a directory"
+        if writing and not p.exists():
+            raise InstallRefused(f"{path}: {key} {raw!r} does not exist (never created)")
+        if writing:
+            raise InstallRefused(f"{path}: {key} {raw!r} is not {what}")
+        raise InstallRefused(f"{path} is stale: {key} {raw!r} is no longer {what}")
+    return p
+
+
+def read_install(agent_dir: Path | str) -> DreamInstall:
+    """The install facts from ``<agent_dir>/dream_install.json``. A file that is absent, unreadable, of another schema,
+    missing a key, holding a relative path, or naming a path that no longer exists raises :class:`InstallRefused`
+    (a ``ValueError``) naming the file and the fact: a dream that cannot find its install does not run."""
+    path = Path(agent_dir) / INSTALL_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise InstallRefused(f"the dream install facts cannot be read from {path} ({type(exc).__name__}); "
+                             "run `levain dream enable --store-dir <dir>`") from exc
+    if not isinstance(doc, dict):
+        raise InstallRefused(f"{path} is not a JSON object")
+    if doc.get("schema") != INSTALL_SCHEMA:
+        raise InstallRefused(f"{path} has schema {doc.get('schema')!r}, not {INSTALL_SCHEMA}; "
+                             "run `levain dream enable --store-dir <dir>` again")
+    zone = doc.get("zone")
+    if not isinstance(zone, str) or not zone.strip():
+        raise InstallRefused(f"{path} lacks zone")
+    store_path = _fact_path(doc, "store_path", path, kind="file")
+    cockpit_root = _fact_path(doc, "cockpit_root", path, kind="dir")
+    coord_dir = _fact_path(doc, "coord_dir", path, kind="dir")
+    facts = doc.get("facts_path")
+    if facts is not None and (not isinstance(facts, str) or not facts.strip()):
+        raise InstallRefused(f"{path}: facts_path {facts!r} is not a path string")
+    if facts is not None and not Path(facts).expanduser().is_absolute():
+        raise InstallRefused(f"{path}: facts_path {facts!r} is not an absolute path")
+    for key in ("model", "claude_bin"):
+        v = doc.get(key)
+        if v is not None and (not isinstance(v, str) or not v.strip()):
+            raise InstallRefused(f"{path}: {key} {v!r} is not a non-empty string")
+    return DreamInstall(store_path, cockpit_root, coord_dir, zone,
+                        None if facts is None else Path(facts).expanduser(),
+                        doc.get("model") or "claude-opus-5-5", doc.get("claude_bin") or "claude")
+
+
+def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root: Path | str, coord_dir: Path | str,
+                  zone: str, facts_path: Path | str | None = None, model: str | None = None,
+                  claude_bin: str | None = None) -> Path:
+    """Write ``<agent_dir>/dream_install.json`` atomically (a temp file in the directory, fsynced, mode 0600, renamed
+    over the old one) from absolute paths that must exist, and read it back through :func:`read_install`. Raises
+    :class:`InstallRefused` before writing anything when a fact is not usable. The optional facts (``facts_path``,
+    ``model``, ``claude_bin``) are MERGED: one not passed keeps the value the existing file holds, so re-running
+    ``enable`` never erases what the operator set."""
+    import os
+    import tempfile
+
+    d = Path(agent_dir)
+    path = d / INSTALL_FILE
+    doc: dict[str, Any] = {"schema": INSTALL_SCHEMA, "store_path": str(store_path), "cockpit_root": str(cockpit_root),
+                           "coord_dir": str(coord_dir), "zone": zone}
+    try:
+        prior = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        prior = {}
+    if not isinstance(prior, dict):
+        prior = {}
+    for key, given in (("facts_path", facts_path), ("model", model), ("claude_bin", claude_bin)):
+        if given is not None:
+            doc[key] = str(given)
+        elif prior.get(key) is not None:
+            doc[key] = prior[key]
+    for key, kind in (("store_path", "file"), ("cockpit_root", "dir"), ("coord_dir", "dir")):
+        _fact_path(doc, key, path, kind=kind, writing=True)
+    if "facts_path" in doc:
+        _fact_path(doc, "facts_path", path, kind="file", writing=True)
+    if not isinstance(zone, str) or not zone.strip():
+        raise InstallRefused(f"{path} lacks zone")
+    for key in ("model", "claude_bin"):
+        v = doc.get(key)
+        if v is not None and (not isinstance(v, str) or not v.strip()):
+            raise InstallRefused(f"{path}: {key} {v!r} is not a non-empty string")
+    fd, tmp = tempfile.mkstemp(prefix=INSTALL_FILE + ".", dir=str(d))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    read_install(d)
+    return path
+
+
+def install_on_input(agent_dir: Path | str, *, clock: Callable[[], datetime] | None = None
+                     ) -> Callable[[Mapping[str, Any]], bool]:
+    """The ``launch(on_input=...)`` hook for the install in ``agent_dir``. The install is read when the hook runs, so a
+    missing file raises there, which the controller reads as dead input (the row stays ``admitted``, then ends
+    ``missed`` past its grace), never as a quiet day."""
+    def on_input(row: Mapping[str, Any]) -> bool:
+        inst = read_install(agent_dir)
+        return bool_on_input(make_on_input(inst.store_path, zone=inst.zone, agent_dir=agent_dir,
+                                           coord_dir=inst.coord_dir, clock=clock))(row)
+
+    return on_input
+
+
+def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str, Any]:
+    """The keyword arguments of :func:`run_body` for a dream occurrence, built from the install facts in the agent
+    store's directory: the supervisor over the install's authority log, the dream's executor, the consolidate with the
+    snapshot hooks bound, and the coordinator's review store. Nothing here runs the compose. A failure to build
+    raises, and :func:`make_run` reads that as a run that did not start."""
+    from levain.agent_authority import AgentAuthority
+    from levain.agents import supervise
+    from levain.coordinator.store import CoordStore
+    from levain.dream import executor as ex
+
+    inst = read_install(store.directory)
+    row = next((r for r in _ready._read_occurrences(Path(store.directory)) if r.get("occurrence_id") == occurrence_id),
+               None)
+    if row is None:
+        raise ValueError(f"occurrence {occurrence_id} is not in the agent store at {store.directory}")
+    is_manual = row.get("kind") == "manual"
+    card_facts = {"day": _ready.occurrence_dream_day(row, inst.zone).isoformat(), "manual": is_manual,
+                  "slot": None if is_manual else str(row.get("window_key") or "") or None}
+    occ_dir = inst.store_path.parent / "dream" / occurrence_id
+    review_store = CoordStore(inst.coord_dir)
+
+    def verify(end: Any) -> str | None:
+        return win_check(end, locate=lambda oid: (inst.store_path, inst.store_path.parent / "dream" / oid,
+                                                  review_store))
+
+    executor = ex.DreamExecutor(agent_store_dir=store.directory, occurrence_id=occurrence_id, occ_dir=occ_dir,
+                                route="claude", model=inst.model, facts_path=inst.facts_path)
+    sup = supervise.Supervisor(store, authority=AgentAuthority(inst.cockpit_root),
+                               hooks=supervise.Hooks(verify=verify))
+
+    def consolidate() -> Any:
+        on_snapshot, on_saved = _snap.hooks()
+        mind = ex.ClaudeMind(inst.model, claude_bin=inst.claude_bin)
+        return ex.consolidate_store(inst.store_path, mind=mind, composer=inst.model, max_seconds=ex.DREAM_BUDGET_S,
+                                    budget=ex.Budget.for_model(inst.model), occurrence_dir=occ_dir,
+                                    on_snapshot=on_snapshot, on_saved=on_saved, label="levain dream", handle_stop=True)
+
+    return {"sup": sup, "store_path": inst.store_path, "occ_dir": occ_dir, "executor": executor,
+            "consolidate": consolidate, "review_store": review_store, **card_facts}
+
+
+def dream_run(store: Any, occurrence_id: str, launch_epoch: int) -> int:
+    """The ``fire(run=...)`` callable for a dream occurrence: :func:`run_body` over :func:`fire_factory`."""
+    return make_run(fire_factory)(store, occurrence_id, launch_epoch)
