@@ -183,7 +183,9 @@
       n.textContent = installed;
       card.appendChild(n);
     }
-    card.appendChild(form);
+    // a phone tab where an install is possible (pwa_install.js): the coach in place of the code form; pairing is the installed app's
+    const pwa = window.levainPwa;
+    if (pwa && typeof pwa.gated === "function" && pwa.gated()) card.appendChild(pwa.note()); else card.appendChild(form);
     veil.appendChild(card);
     document.body.appendChild(veil);
     try { input.focus(); } catch (_) { /* no focus */ }

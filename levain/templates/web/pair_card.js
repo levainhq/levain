@@ -72,6 +72,8 @@
   // Returns true when this device is now paired.
   async function claim(typed, ui) {
     const say = (m) => { ui.message.textContent = m; ui.message.hidden = !m; };
+    // a phone tab where an install is possible: pairing is the installed app's (pwa_install.js); the card shows the coach instead
+    if (gatedTab()) { say(window.levainPwa.words()); return false; }
     const code = fold(typed);
     if (code.length !== 8) { say("Type all eight characters of the code."); return false; }
     let res;
@@ -120,7 +122,9 @@
       return res.status === 200 && typeof res.data.key === "string" ? res.data.key : "";
     } catch (_) { return ""; }
   }
+  function gatedTab() { const p = window.levainPwa; return !!(p && typeof p.gated === "function" && p.gated()); }
   async function pingsStep(ui) {
+    if (gatedTab()) { draw(ui, "Paired", "This device is paired. " + window.levainPwa.words(), [button("Continue", true, finish)]); return; }
     const key = PUSH_OK ? await pushKey() : "";
     if (!key) {
       let why = PUSH_OK ? "This cockpit does not send pings." : noPushWords();
