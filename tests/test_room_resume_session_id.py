@@ -136,3 +136,38 @@ def test_another_rooms_ended_launch_keeps_its_id(store):
     other = _open(store, b, resumed_from="sid-1")
     with pytest.raises(lease.LeaseRefused, match="already recorded"):
         _activate(store, other, "sid-1")
+
+
+def test_rme_fix2_r2_no_reader_takes_a_pending_rows_ask_for_the_launchs_own_session_id(store):
+    """L3_rme_r2 complement UNSETTLED (codex 6): the pending row carries the id the launch ASKED to resume. In the
+    pending window every reader of a launch's session id resolves the older launch that recorded it on its ``active``
+    row, or nothing, never the pending one. A pin: it passed on the rme-fix1 tip (each reader filters kind = 'active'
+    or takes the id from the active row)."""
+    thread = _thread(store)
+    with store._write() as (conn, _now):
+        room.open_room_thread(conn, thread)
+    # an ask with no launch behind it resolves nothing
+    lonely = _open(store, thread, resumed_from="sid-none")
+    with store._write() as (conn, _now):
+        assert lease.by_harness_session(conn, "sid-none", room=True) is None
+        assert lease.by_harness_session(conn, "sid-none") is None
+    assert store.launch(lonely).harness_session_id is None and store.launch_by_harness_session("sid-none") is None
+    _end(store, lonely, "failed")
+    first = _open(store, thread)
+    assert _activate(store, first, "sid-1")[1] is None
+    _end(store, first)
+    second = _open(store, thread, resumed_from="sid-1")               # pending, asking for sid-1
+    with store._write() as (conn, _now):
+        assert lease.by_harness_session(conn, "sid-1", room=True).launch_id == first
+        assert lease.by_harness_session(conn, "sid-1") is None
+        assert lease.launch(conn, second).harness_session_id is None
+        assert [ln.harness_session_id for ln in lease.launches(conn) if ln.launch_id == second] == [None]
+    assert store.launch(second).harness_session_id is None and store.launch(second).state == "pending"
+    assert store.launch_by_harness_session("sid-1") is None
+    # a chain: the newest ACTIVE holder answers while a third launch's ask is pending
+    assert _activate(store, second, "sid-1")[1] is None
+    _end(store, second)
+    third = _open(store, thread, resumed_from="sid-1")
+    with store._write() as (conn, _now):
+        assert lease.by_harness_session(conn, "sid-1", room=True).launch_id == second
+    assert store.launch(third).harness_session_id is None
