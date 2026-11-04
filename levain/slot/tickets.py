@@ -152,7 +152,8 @@ _VERIFIER_FIELDS = ("verifier_generation", "verifier_id", "verifier_steps", "inp
                     "driver_input_digest")
 #: §3.3 RUN-TICKET-MINT's fields beside `attempt_id`.
 MINT_FIELDS = frozenset({"job_id", "run_index", "contract_digest", "kind", "model_requested", "egress_routes",
-                         "reserved_microdollars", *_ROUTE_FIELDS, *_VERIFIER_FIELDS, "auth", *_PASSTHROUGH_FIELDS})
+                         "reserved_microdollars", *_ROUTE_FIELDS, *_VERIFIER_FIELDS, "auth", *_PASSTHROUGH_FIELDS,
+                         "brief_digest"})
 #: a journal `mint` line's keys, exactly (fix 2: the rebuild refuses any other set); a verifier ticket's line adds
 #: `verifier`, the entry CONTROL resolved at mint (3c-8, CONTRACT §3.5 VERIFIER IDENTITY), and no other line has it
 MINT_LINE_KEYS = frozenset({"op", "ticket", "attempt_id", "run_id", "request_digest", "facts", "minted_ms", "day"})
@@ -206,7 +207,7 @@ def check_facts(args: Mapping[str, object]) -> Dict[str, object]:
     if kind == "verifier":
         if auth != "brokered":
             raise _field("auth", "a verifier ticket is never passthrough")
-        for k in _PASSTHROUGH_FIELDS:
+        for k in (*_PASSTHROUGH_FIELDS, "brief_digest"):
             if k in args:
                 raise _field(k, "forbidden for a verifier ticket")
         for k in (*_ROUTE_FIELDS, "model_requested"):
@@ -237,6 +238,8 @@ def check_facts(args: Mapping[str, object]) -> Dict[str, object]:
     for k in _VERIFIER_FIELDS:
         if k in present:
             raise _field(k, f"forbidden for an {kind} ticket")
+    if kind == "planner" and "brief_digest" in args:
+        raise _field("brief_digest", "forbidden for a planner ticket")
     if auth == "passthrough":
         return _check_passthrough_facts(args, facts)
     for k in _PASSTHROUGH_FIELDS:
@@ -251,7 +254,15 @@ def check_facts(args: Mapping[str, object]) -> Dict[str, object]:
     facts["model_requested"] = _text(args["model_requested"], "model_requested", _NAME)
     if facts["reserved_microdollars"] <= 0:
         raise _field("reserved_microdollars", "must be > 0")
+    _check_brief_digest(args, facts)
     return facts
+
+
+def _check_brief_digest(args: Mapping[str, object], facts: Dict[str, object]) -> None:
+    """An executor ticket's OPTIONAL `brief_digest` (p71 S8 D2): the digest of the exact bytes staged as the agent's
+    task text. Absent stays absent from the facts (a journal line minted before the field re-checks to itself)."""
+    if "brief_digest" in args:
+        facts["brief_digest"] = _text(args["brief_digest"], "brief_digest", _DIGEST)
 
 
 def _check_passthrough_facts(args: Mapping[str, object], facts: Dict[str, object]) -> Dict[str, object]:
@@ -277,6 +288,10 @@ def _check_passthrough_facts(args: Mapping[str, object], facts: Dict[str, object
         facts[k] = _uint(args[k], k, low=1, high=high)
     if "model_requested" in args:
         facts["model_requested"] = _text(args["model_requested"], "model_requested", _NAME)
+    if "brief_digest" in args:
+        if facts["vendor"] == "codex":
+            raise _field("brief_digest", "no codex brief path is built")
+        _check_brief_digest(args, facts)
     return facts
 
 

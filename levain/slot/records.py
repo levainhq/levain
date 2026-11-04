@@ -311,7 +311,9 @@ TICKET_FACT_KEYS = frozenset({"job_id", "run_index", "contract_digest", "kind", 
                               "driver_input_digest", "input_bundle_digest",
                               # c7.14: a passthrough ticket's axis and per-run caps; `deadline` is ATTACH's absolute
                               # reading of `deadline_s` (CONTROL's clock at the bind), answered beside the facts
-                              "auth", "vendor", "max_calls", "max_tunnel_bytes", "deadline_s", "deadline"})
+                              "auth", "vendor", "max_calls", "max_tunnel_bytes", "deadline_s", "deadline",
+                              # p71 S8 D2: the digest of the brief bytes root stages as ``<S>/in/brief.md``
+                              "brief_digest"})
 TICKET_FACT_REQUIRED = frozenset({"job_id", "run_index", "contract_digest", "kind", "egress_routes",
                                   "reserved_microdollars"})
 TICKET_VERIFIER_KEYS = frozenset({"verifier_generation", "verifier_id", "verifier_artifact_digest",
