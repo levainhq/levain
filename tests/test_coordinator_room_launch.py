@@ -38,6 +38,7 @@ def flag(name):
 base = os.environ["FAKE_DIR"]
 n = len([f for f in os.listdir(base) if f.startswith("spawn-")]) + 1
 open(os.path.join(base, "spawn-%d.argv" % n), "w").write(json.dumps(argv))
+open(os.path.join(base, "spawn-%d.env" % n), "w").write(json.dumps(sorted(os.environ)))
 mode = open(os.path.join(base, "mode")).read().split() if os.path.exists(os.path.join(base, "mode")) else ["ok"]
 mode, model = mode[0], (mode[1] if len(mode) > 1 else "fake-model")
 sid = flag("--session-id") or flag("--resume")
@@ -93,12 +94,17 @@ for line in sys.stdin:
     if mode in ("mute_after_open",) and inits > 1: continue
     init()
     if text.startswith("Open check"):
-        path = text.split(": ", 1)[1].strip()
-        if mode == "no_deny":
-            tool("toolu_c", "Read", path, "DECOY", RULE); say("done"); result()
-        else:
-            tool("toolu_c", "Read", path, "denied", DENY, error=True); say("done")
-            result([{{"tool_name": "Read", "tool_use_id": "toolu_c"}}])
+        paths = [p.strip() for p in text.split("done:", 1)[1].split("\n") if p.strip()]
+        open(os.path.join(base, "canary-%d.paths" % n), "w").write(json.dumps(paths))
+        denied = []
+        for i, path in enumerate(paths):
+            scope = path.endswith("scope-canary.txt")
+            if mode == "no_deny" or (mode == "scope_open" and scope):
+                tool("toolu_c%d" % i, "Read", path, "DECOY", RULE)
+            else:
+                tool("toolu_c%d" % i, "Read", path, "denied", DENY, error=True)
+                denied.append({{"tool_name": "Read", "tool_use_id": "toolu_c%d" % i}})
+        say("done"); result(denied)
         if mode == "deaf_after_open":
             time.sleep(600)
         if mode == "exit_after_open":
@@ -172,7 +178,7 @@ def launcher(w, *, service=None, **kw) -> RoomLauncher:
     lr = RoomLauncher(w["cs"], service or w["svc"], RoomSetting(str(w["cwd"]), model="sonnet",
                                                                 claude_bin=str(w["script"])),
                       run_dir=str(w["run"]), home=str(w["home"]),
-                      environ={**os.environ, "FAKE_DIR": str(w["fake"])}, **kw)
+                      environ={**os.environ, "FAKE_DIR": str(w["fake"])}, env_keep=("FAKE_DIR",), **kw)
     w["launchers"].append(lr)
     return lr
 
@@ -328,7 +334,7 @@ def test_item1_accepted_rule_reads_and_the_open_checks_own_turn_do_not_latch_the
     settle(world, h.launch_id, 3)
     assert trips(world, h.launch_id) == []
     assert world["cs"]._read(lambda conn: liveness(conn, h.launch_id)).enabled
-    assert kinds(world, h.launch_id).count("tool_result") == 3          # the canary's, and both accepted reads
+    assert kinds(world, h.launch_id).count("tool_result") == 4          # the two canaries', and both accepted reads
 
 
 def test_item1_the_workers_context_latches_the_same_room_stream(world):
@@ -987,3 +993,84 @@ def test_c8_a_spawn_that_fails_still_records_not_live(world):
     [launch] = world["cs"]._read(lambda conn: [r[0] for r in conn.execute(
         "SELECT launch_id FROM launches WHERE role = 'room'").fetchall()])
     assert ("not_live", "activation") in checks(world, launch) and state(world, launch) == "failed"
+
+
+# --- roomfix1 C2: the effective read scope; C3: the child's environment ------------------------------------------------
+def _paths(w, n=1):
+    return json.loads((w["fake"] / f"canary-{n}.paths").read_text())
+
+
+def test_c2_the_open_check_reads_a_rule_decoy_and_a_scope_decoy_outside_every_rule_and_removes_it(world):
+    lr = launcher(world)
+    lr.ensure()
+    rule, scope = _paths(world)
+    assert Path(rule).name == room_launch._CANARY_NAME
+    assert Path(scope).name == room_launch._SCOPE_NAME and not Path(scope).name.startswith(".env")
+    real = os.path.realpath(os.path.dirname(scope))
+    for root in (world["cwd"], world["home"], world["run"]):
+        r = os.path.realpath(root)
+        assert not (real == r or real.startswith(r + "/")), root
+    assert not os.path.exists(scope) and not os.path.exists(os.path.dirname(scope))     # removed after the open
+
+
+def test_c2_a_child_whose_read_scope_is_wider_than_its_cwd_does_not_open(world):
+    """Reproduced: the one canary matched the dotenv deny rule, so a child that could read outside its cwd (an
+    additionalDirectories, or an allow rule that outranks the outside-cwd block) still passed. The scope decoy matches
+    no rule; its Read returning content fails the open."""
+    mode(world, "scope_open")
+    with pytest.raises(RoomLaunchError, match="read scope wider than its cwd"):
+        launcher(world).ensure()
+    [launch] = world["cs"]._read(lambda conn: [r[0] for r in conn.execute(
+        "SELECT launch_id FROM launches WHERE role = 'room'").fetchall()])
+    assert state(world, launch) == "failed"
+    assert not os.path.exists(os.path.dirname(_paths(world)[1]))
+
+
+@pytest.mark.parametrize("where", ["user", "config_dir", "managed"])
+def test_c2_settings_naming_additional_directories_refuse_the_open_before_any_spawn(world, tmp_path, monkeypatch, where):
+    doc = json.dumps({"permissions": {"additionalDirectories": [str(tmp_path / "elsewhere")]}})
+    extra = {}
+    if where == "user":
+        (world["home"] / ".claude").mkdir()
+        (world["home"] / ".claude" / "settings.json").write_text(doc)
+    elif where == "config_dir":
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        (cfg / "settings.json").write_text(doc)
+        extra = {"CLAUDE_CONFIG_DIR": str(cfg)}
+    managed = tmp_path / "managed-settings.json"
+    if where == "managed":
+        managed.write_text(doc)
+    monkeypatch.setattr(room_launch, "MANAGED_SETTINGS", (str(managed),))
+    lr = RoomLauncher(world["cs"], world["svc"], RoomSetting(str(world["cwd"]), claude_bin=str(world["script"])),
+                      run_dir=str(world["run"]), home=str(world["home"]), env_keep=("FAKE_DIR",),
+                      environ={**os.environ, "FAKE_DIR": str(world["fake"]), **extra})
+    world["launchers"].append(lr)
+    with pytest.raises(RoomLaunchError, match="additionalDirectories"):
+        lr.ensure()
+    assert spawns(world) == []
+
+
+def test_c2_a_settings_file_that_cannot_be_read_refuses_and_a_missing_one_adds_nothing(tmp_path):
+    home = tmp_path / "h"
+    (home / ".claude").mkdir(parents=True)
+    assert room_launch.settings_scope_refusal({}, str(home), managed=()) is None
+    (home / ".claude" / "settings.json").write_text("{not json")
+    assert "cannot be read" in room_launch.settings_scope_refusal({}, str(home), managed=())
+    (home / ".claude" / "settings.json").write_text('{"permissions": {"allow": ["Read"], "additionalDirectories": []}}')
+    assert room_launch.settings_scope_refusal({}, str(home), managed=()) is None
+
+
+def test_c3_the_child_gets_an_allowlisted_environment(world):
+    secret = {"LEVAIN_TEST_SECRET": "s3cret", "AWS_SECRET_ACCESS_KEY": "x", "GITHUB_TOKEN": "y", "LC_ALL": "C"}
+    lr = RoomLauncher(world["cs"], world["svc"], RoomSetting(str(world["cwd"]), claude_bin=str(world["script"])),
+                      run_dir=str(world["run"]), home=str(world["home"]), env_keep=("FAKE_DIR",),
+                      environ={**os.environ, "FAKE_DIR": str(world["fake"]), **secret})
+    world["launchers"].append(lr)
+    lr.ensure()
+    got = set(json.loads((world["fake"] / "spawn-1.env").read_text()))
+    assert not got & {"LEVAIN_TEST_SECRET", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"}
+    assert {"PATH", "LEVAIN_ROOM", "FAKE_DIR", "LC_ALL"} <= got
+    env = room_launch.room_env({"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "k", "OPENAI_API_KEY": "o",
+                                "LEVAIN_HOME": "/lv", "LEVAIN_WRITE_TOKEN": "t"})
+    assert env == {"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "k", "LEVAIN_HOME": "/lv", "LEVAIN_ROOM": "1"}

@@ -276,7 +276,7 @@ def fake_serve(tmp_path, store=None):
     cwd.mkdir(exist_ok=True)
     home.mkdir(exist_ok=True)
     rs = RoomServe(store, RoomSetting(str(cwd), model="sonnet", claude_bin=str(script)), run_dir=str(tmp_path / "run"),
-                   launcher_kw={"home": str(home), "environ": {**os.environ, "FAKE_DIR": str(fake)}},
+                   launcher_kw={"home": str(home), "environ": {**os.environ, "FAKE_DIR": str(fake)}, "env_keep": ("FAKE_DIR",)},
                    service_kw={"sleep": lambda _s: None}, pump_interval=0.02)
     return store, rs, fake
 
@@ -602,7 +602,7 @@ def test_a_pump_step_between_ensure_and_the_recorded_line_does_not_end_the_child
     cwd.mkdir()
     home.mkdir()
     rs = RoomServe(store, RoomSetting(str(cwd), model="sonnet", claude_bin=str(script)), run_dir=str(tmp_path / "run"),
-                   launcher_kw={"home": str(home), "environ": {**os.environ, "FAKE_DIR": str(fake)},
+                   launcher_kw={"home": str(home), "environ": {**os.environ, "FAKE_DIR": str(fake)}, "env_keep": ("FAKE_DIR",),
                                 "idle_seconds": 60.0,
                                 "now": lambda: datetime.now(timezone.utc) + timedelta(seconds=offset["s"])},
                    service_kw={"sleep": lambda _s: None}, pump_interval=0.02)

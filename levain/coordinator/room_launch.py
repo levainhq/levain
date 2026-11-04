@@ -8,7 +8,8 @@ message may do (that is the service's) and writes no drop (that is the room's do
 **The open.** :meth:`RoomLauncher.ensure` opens a launch on the open room thread (``lease.open_room_launch``), writes
 the room's MCP config (the door bound to THIS launch) and its ``--settings`` deny rules into a 0700 directory of its
 own, spawns ``claude`` through :func:`~levain.coordinator.claude_session.room_argv` and then runs the open check: one
-fixed turn asking the child to Read a decoy file the deny rules cover. That one turn is both the child's first
+fixed turn asking the child to Read two decoy files, one the deny rules cover and one (the scope decoy) outside the cwd
+that matches no rule. That one turn is both the child's first
 ``init`` (the child reports none before a turn starts, UNMEASURED beyond RM0's runs) and the canary
 (:func:`~levain.coordinator.claude_session.canary_denied`) the chat service requires of a Claude ``live`` row. The
 child is live only if :func:`~levain.coordinator.claude_session.open_probe` accepts that ``init``, its ``cwd``
@@ -18,9 +19,14 @@ The launch is attached, recorded ``live`` and given its vendor position while st
 resolves nothing to it until :func:`~levain.coordinator.lease.activate_room` makes it ``active``, the last step, in a
 transaction that also requires its room thread to still be the open room. Every later boundary probe
 (:func:`room_probe`) holds the child to the same cwd. The
-canary proves the ``--settings`` file took effect (the decoy is outside the room's cwd and matches the dotenv rule, so
-either the outside-cwd block or the deny rule answers it); it does not tell which, and it does not exercise each deny
-path. The check's own events (the canary Read, its denial, the child's reply) are in the room's stream like any turn.
+canary proves the ``--settings`` file took effect (the first decoy is outside the room's cwd and matches the dotenv
+rule, so either the outside-cwd block or the deny rule answers it; it does not tell which, and it does not exercise
+each deny path). The scope decoy (roomfix1 C2) can be answered only by the outside-cwd block: its Read refused is the
+proof that the read scope the child really runs with (his user settings, an allow rule) is no wider than the cwd AT THAT
+PATH; a widening that covers other places only is not seen by it, and :func:`settings_scope_refusal` refuses the one
+widening the settings files name (``permissions.additionalDirectories``) before any spawn. The child runs with
+:func:`room_env`, an allowlisted environment (roomfix1 C3). The check's own events (the canary Reads, their denials,
+the child's reply) are in the room's stream like any turn.
 
 **What the room's TripwireContext accepts**, exactly (:func:`room_tripwire_context`): for each of the room's four
 file/search tools and its one MCP tool, an ``accept`` decision of reason ``rule`` whose source is ``user_permanent``
@@ -65,6 +71,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -88,6 +95,7 @@ from levain.coordinator.store import CoordError
 __all__ = [
     "IDLE_SECONDS", "KILL_WAIT", "OPEN_DEADLINE", "RoomCanary", "RoomHandle", "RoomLaunchError", "RoomLauncher",
     "RoomSession", "RoomSetting", "cwd_refusal", "make_probe", "make_tripwires", "room_probe", "room_tripwire_context",
+    "ENV_KEEP", "MANAGED_SETTINGS", "room_env", "settings_scope_refusal",
 ]
 
 # [seat] the open check must finish well inside lease.LAUNCH_TTL (the launch is pending until it does)
@@ -99,9 +107,64 @@ KILL_WAIT = 3.0
 _POLL = 0.05
 _STDERR_TAIL = 400
 ROOM_ENV = "LEVAIN_ROOM"
-CANARY_PROMPT = "Open check. Use your Read tool once on this exact path, then reply with the single word done: {path}"
+CANARY_PROMPT = ("Open check. Use your Read tool once on each of these exact paths, one call per path, then reply with the "
+                 "single word done:\n{path}\n{scope}")
 _CANARY_NAME = ".env.levain-room-canary"
+# the scope decoy matches no deny rule: only the outside-the-cwd block can answer it (roomfix1 C2)
+_SCOPE_NAME = "levain-room-scope-canary.txt"
 _SOURCES = ("user_permanent", "config")
+# the settings files a child run with ``--setting-sources user`` still loads outside his user file: the managed (policy)
+# settings, per platform (a seam: a test points it at its own)
+MANAGED_SETTINGS = ("/Library/Application Support/ClaudeCode/managed-settings.json", "/etc/claude-code/managed-settings.json")
+# what of the serve's environment the room's child gets (roomfix1 C3): what a claude CLI needs to find his account, its
+# config and the network, what the room's MCP door (a python child of it) needs to import levain and find its store, and
+# nothing else. A name a caller adds is ``RoomLauncher(env_keep=...)``.
+ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "TZ", "LANG", "LANGUAGE",
+            "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+            "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+            "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+            "LEVAIN_HOME", "PYTHONPATH", "VIRTUAL_ENV")
+ENV_KEEP_PREFIXES = ("LC_", "ANTHROPIC_")
+
+
+def room_env(environ: Mapping[str, str], keep: tuple = ()) -> dict:
+    """The room child's environment: the names in :data:`ENV_KEEP`, those starting with :data:`ENV_KEEP_PREFIXES`, and
+    ``keep``, taken from ``environ``; then ``LEVAIN_ROOM=1``. Every other variable of the serve (a token, a key, a
+    path to another store) stays out of the child and the processes it starts."""
+    names = set(ENV_KEEP) | set(keep)
+    env = {k: v for k, v in environ.items() if k in names or k.startswith(ENV_KEEP_PREFIXES)}
+    env[ROOM_ENV] = "1"
+    return env
+
+
+def settings_scope_refusal(environ: Mapping[str, str], home: str,
+                           managed: Optional[tuple] = None) -> Optional[str]:
+    """Why the settings the room's child will load widen its read scope, or None (roomfix1 C2). ``--setting-sources user``
+    still loads his user ``settings.json`` (``$CLAUDE_CONFIG_DIR`` or ``<home>/.claude``) and the managed settings; a
+    ``permissions.additionalDirectories`` in any of them adds directories outside the room's cwd to what its file tools
+    may read, so the room refuses to open. A file that is present but cannot be read as a JSON object is refused too
+    (fail closed: what it would add cannot be said). A missing file adds nothing."""
+    config = environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude")
+    for path in (os.path.join(config, "settings.json"), *(MANAGED_SETTINGS if managed is None else managed)):
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            return _one_line(f"the settings file {path} the room's child loads cannot be read ({type(exc).__name__}); "
+                             "what it adds to the room's read scope cannot be said", 400)
+        perms = doc.get("permissions") if isinstance(doc, dict) else None
+        if not isinstance(doc, dict) or (perms is not None and not isinstance(perms, dict)):
+            return _one_line(f"the settings file {path} the room's child loads is not a JSON object with an object "
+                             "'permissions'", 400)
+        extra = (perms or {}).get("additionalDirectories")
+        if extra:
+            return _one_line(f"the settings file {path} the room's child loads names permissions.additionalDirectories "
+                             f"({len(extra) if isinstance(extra, list) else 'not a list'}): the room's file tools could "
+                             "read outside its cwd; remove them, or run the room under another CLAUDE_CONFIG_DIR", 400)
+    return None
 
 
 class RoomLaunchError(CoordError):
@@ -310,7 +373,8 @@ class RoomLauncher:
                  home: Optional[str] = None, python: Optional[str] = None, spawn: Callable[..., Any] = _spawn,
                  idle_seconds: float = IDLE_SECONDS, open_deadline: float = OPEN_DEADLINE,
                  now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 environ: Optional[dict] = None, levain_home: Optional[str] = None) -> None:
+                 environ: Optional[dict] = None, levain_home: Optional[str] = None, env_keep: tuple = (),
+                 scope_dir: Optional[str] = None) -> None:
         if setting.harness != "claude":
             raise RoomLaunchError(f"the room opens on claude here; a {str(setting.harness)[:20]} room profile is not "
                                   "built (RM-D3)")
@@ -337,9 +401,12 @@ class RoomLauncher:
             # levain's own home as the environment the child gets names it (the consent queue's parent)
             levain_home = str(queue_dir_for(self._environ if self._environ is not None else os.environ).parent)
         self._levain_home = levain_home
+        self._env_keep = tuple(env_keep)
+        self._scope_dir = scope_dir          # where the scope decoy's directory is made (None: the system temp dir)
         # refused early, before any launch row: a bad cwd/deny pair is the operator's to fix
+        self._deny = default_deny_paths(self._home, levain_home)
         try:
-            self._settings_json = room_settings_json(setting.cwd, default_deny_paths(self._home, levain_home))
+            self._settings_json = room_settings_json(setting.cwd, self._deny)
         except ValueError as exc:
             raise RoomLaunchError(f"the room's settings could not be built: {exc}") from exc
 
@@ -442,10 +509,14 @@ class RoomLauncher:
         workdir = self._run_dir / launch_id
         sid = resume or str(uuid.uuid4())             # the one id the child is given, and must report
         proc = session = None
+        scope_dir: Optional[str] = None
         try:
+            env = room_env(self._environ if self._environ is not None else os.environ, self._env_keep)
+            widened = settings_scope_refusal(env, self._home)
+            if widened is not None:
+                raise RoomLaunchError(widened)
+            scope_dir, scope = self._scope_decoy()
             argv, decoy, stderr_path = self._write_files(workdir, launch_id, resume, sid)
-            env = dict(self._environ if self._environ is not None else os.environ)
-            env[ROOM_ENV] = "1"
             with open(stderr_path, "ab") as errf:
                 proc = self._spawn(argv, cwd=self._setting.cwd, env=env, stderr=errf)
             session = RoomSession(PipeTransport(proc), conn=self._next_conn(), session_id=sid)
@@ -453,7 +524,7 @@ class RoomLauncher:
                                           resumed=resume is not None, resume_failed=resume_failed)
             self._svc.activate(launch_id, "probing", "room spawned" if resume_failed is None else _one_line(
                 f"room spawned as a fresh session after the resume of {resume_failed} exited", 200), spawn_nonce=nonce)
-            init = self._open_check(session, proc, decoy, stderr_path, sid)
+            init = self._open_check(session, proc, decoy, stderr_path, sid, scope)
             digest = "sha256:" + hashlib.sha256(json.dumps(argv, sort_keys=True).encode()).hexdigest()
             # the launch stays pending, so send_room resolves nothing to it, until it is attached, live and holds a
             # vendor position; activation is the last step (L3_rme_r1 codex HIGH 1: a send in between was stored
@@ -489,6 +560,31 @@ class RoomLauncher:
                 raise RoomLaunchError(f"the room could not be opened: {_one_line(f'{type(exc).__name__}: {exc}')}"
                                       ) from exc
             raise
+        finally:
+            if scope_dir is not None:
+                shutil.rmtree(scope_dir, ignore_errors=True)
+
+    def _scope_decoy(self) -> tuple:
+        """``(dir, path)``: a fresh 0700 directory holding a decoy file that is outside the room's cwd, outside every
+        absolute deny path (levain's home included) and matched by no deny glob, so only the outside-the-cwd block can
+        refuse its Read. Its Read being denied is the open check's proof that the effective read scope is no wider
+        than the cwd at that path (roomfix1 C2). Raises :class:`RoomLaunchError` when no such place can be made."""
+        d = tempfile.mkdtemp(prefix="levain-room-scope-", dir=self._scope_dir)
+        try:
+            real = os.path.realpath(d)
+            roots = [os.path.realpath(self._setting.cwd)] + [os.path.realpath(p) for p in self._deny
+                                                              if os.path.isabs(p)]
+            if any(real == r or real.startswith(r.rstrip("/") + "/") for r in roots):
+                raise RoomLaunchError(f"the open check's scope decoy {real[:120]!r} would be inside the room's cwd or a "
+                                      "deny path; nothing would test the read scope")
+            path = os.path.join(d, _SCOPE_NAME)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("SCOPE DECOY\n")
+            return d, path
+        except BaseException:
+            shutil.rmtree(d, ignore_errors=True)
+            raise
 
     def _write_files(self, workdir: Path, launch_id: str, resume: Optional[str], sid: str) -> tuple:
         self._run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -513,12 +609,14 @@ class RoomLauncher:
         return argv, str(decoy), stderr
 
     def _open_check(self, session: RoomSession, proc: Any, decoy: str, stderr_path: Path,
-                    sid: str) -> LivenessEvidence:
+                    sid: str, scope: str) -> LivenessEvidence:
         """Send the canary turn, wait for it to end, and return the ``init`` it produced once the probe, the launch's
-        cwd, the session id the child was given (``sid``) and the canary all accept it. Raises
-        :class:`RoomLaunchError` with the reason otherwise (:class:`_ChildExited` when the child exited first)."""
+        cwd, the session id the child was given (``sid``) and BOTH canaries accept it: ``decoy`` (a deny-rule match)
+        and ``scope`` (outside the cwd, matching no rule: :meth:`_scope_decoy`). Raises :class:`RoomLaunchError` with
+        the reason otherwise (:class:`_ChildExited` when the child exited first)."""
         try:
-            sent = session.send(SendCommand("room-open-check", CANARY_PROMPT.format(path=decoy), (), "queue", None))
+            sent = session.send(SendCommand("room-open-check", CANARY_PROMPT.format(path=decoy, scope=scope), (),
+                                            "queue", None))
         except NotSent as exc:
             # a dead transport is proof of a dead child only once the child is actually gone (a short grace catches
             # one mid-exit); a live child with a transient dead pipe is a plain failure, so the history is kept
@@ -567,6 +665,10 @@ class RoomLauncher:
         verdict = canary_denied(session.recent_frames(), decoy)
         if not verdict.denied:
             raise RoomLaunchError(f"the room's open check found its deny rules not holding: {verdict.reason}")
+        verdict = canary_denied(session.recent_frames(), scope)
+        if not verdict.denied:
+            raise RoomLaunchError(f"the room's open check found its read scope wider than its cwd (a file outside it "
+                                  f"matching no deny rule was not refused): {verdict.reason}")
         return init
 
     @staticmethod
