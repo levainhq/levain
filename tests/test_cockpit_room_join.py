@@ -210,6 +210,18 @@ def test_a_case_alias_in_home_still_refuses_home_and_writes_the_deny_rules_in_th
         rs.stop()
 
 
+def test_home_matched_by_identity_alone_is_named_as_home(fake_home, monkeypatch):
+    """FINDINGS_room_r3 LOW: a DIR that IS home but matched only by (st_dev, st_ino), not by spelling, was told it
+    "holds your home directory". The canonical layer is switched off here to reach the identity-only match."""
+    from pathlib import Path
+    import levain.web_server as ws
+    alias = _case_alias(fake_home)
+    monkeypatch.setattr(ws, "_canonical_path", lambda p: Path(p).resolve())
+    with pytest.raises(ValueError) as exc:
+        ws._room_dir_refusal(alias, ws._canonical_path(fake_home / ".levain" / "consent"))
+    assert "is your home directory" in str(exc.value) and "holds your home" not in str(exc.value), str(exc.value)
+
+
 def test_a_project_dir_is_served_and_its_launcher_denies_levains_home(fake_home):
     from levain.web_server import _build_room_serve
     proj = fake_home / "proj"

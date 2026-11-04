@@ -1158,6 +1158,96 @@ def test_k3_the_launcher_refuses_an_outside_rule_before_any_spawn(world, tmp_pat
     assert spawns(world) == []
 
 
+# --- roomfix3 R3-1: the managed-settings.d drop-ins; R3-2: an all-relative search path; the LOWs ------------------------
+def _managed_dir(tmp_path):
+    """A managed system directory holding NO managed-settings.json, only a drop-in directory (Claude Code loads the
+    drop-ins alone: code.claude.com/docs/en/managed-settings.md, source label `(drop-ins)`)."""
+    sysdir = tmp_path / "ClaudeCode"
+    (sysdir / "managed-settings.d").mkdir(parents=True)
+    return sysdir, (str(sysdir / "managed-settings.json"),)
+
+
+def test_r3_1_a_drop_in_alone_with_an_outside_rule_or_directory_refuses(tmp_path):
+    """FINDINGS_room_r3 R3-1: MANAGED_SETTINGS named three files; the drop-ins Claude Code merges after
+    managed-settings.json (every *.json in managed-settings.d, even with no base file) were never read."""
+    home, cwd, other = _rule_world(tmp_path)
+    sysdir, managed = _managed_dir(tmp_path)
+    drop = sysdir / "managed-settings.d" / "x.json"
+    drop.write_text(json.dumps({"permissions": {"allow": [f"Read(/{other}/**)"]}}))
+    why = room_launch.settings_scope_refusal({}, str(home), managed=managed, cwd=str(cwd))
+    assert why is not None and "allows" in why and str(drop) in why, why
+    drop.write_text(json.dumps({"permissions": {"additionalDirectories": [str(other)]}}))
+    assert "additionalDirectories" in room_launch.settings_scope_refusal({}, str(home), managed=managed, cwd=str(cwd))
+
+
+def test_r3_1_hidden_and_non_json_drop_ins_are_not_read_and_a_bad_drop_in_refuses(tmp_path):
+    """Claude Code ignores hidden files and files not ending in .json (the same page); a drop-in it would refuse to
+    start on (not a JSON object) is refused here too."""
+    home, cwd, other = _rule_world(tmp_path)
+    sysdir, managed = _managed_dir(tmp_path)
+    outside = json.dumps({"permissions": {"allow": [f"Read(/{other}/**)"]}})
+    (sysdir / "managed-settings.d" / ".hidden.json").write_text(outside)
+    (sysdir / "managed-settings.d" / "notes.txt").write_text(outside)
+    (sysdir / "managed-settings.d" / "10-ok.json").write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
+    assert room_launch.settings_scope_refusal({}, str(home), managed=managed, cwd=str(cwd)) is None
+    (sysdir / "managed-settings.d" / "20-bad.json").write_text("[1, 2]")
+    assert "not a JSON object" in room_launch.settings_scope_refusal({}, str(home), managed=managed, cwd=str(cwd))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a 000 directory")
+def test_r3_1_a_drop_in_directory_that_cannot_be_listed_refuses(tmp_path):
+    home, cwd, _other = _rule_world(tmp_path)
+    sysdir, managed = _managed_dir(tmp_path)
+    d = sysdir / "managed-settings.d"
+    d.chmod(0)
+    try:
+        why = room_launch.settings_scope_refusal({}, str(home), managed=managed, cwd=str(cwd))
+    finally:
+        d.chmod(0o700)
+    assert why is not None and "cannot be read" in why and str(d) in why, why
+
+
+def test_r3_1_the_launcher_refuses_a_drop_in_rule_before_any_spawn(world, tmp_path, monkeypatch):
+    sysdir, managed = _managed_dir(tmp_path)
+    (sysdir / "managed-settings.d" / "x.json").write_text(
+        json.dumps({"permissions": {"allow": [f"Read(/{tmp_path}/elsewhere/**)"]}}))
+    monkeypatch.setattr(room_launch, "MANAGED_SETTINGS", managed)
+    with pytest.raises(RoomLaunchError, match="outside its directory"):
+        _scope_launcher(world, {}).ensure()
+    assert spawns(world) == []
+
+
+def test_r3_2_an_all_relative_search_path_is_not_passed_as_the_empty_path():
+    """FINDINGS_room_r3 R3-2: every entry relative left PATH="" (and PYTHONPATH=""), and an empty entry is the child's
+    cwd, the room's DIR. The name is dropped instead, so the child gets its platform's default search path."""
+    env = room_launch.room_env({"PATH": "bin:.:", "PYTHONPATH": "src::"})
+    assert "PATH" not in env and "PYTHONPATH" not in env, env
+    assert "" not in os.get_exec_path(env)
+
+
+def test_r3_low_a_parent_segment_after_a_glob_counts_as_outside(tmp_path):
+    """FINDINGS_room_r3 LOW: the literal-prefix cut stopped at the first glob, so `..` after it climbed out unseen."""
+    home, cwd, _other = _rule_world(tmp_path)
+    for r in (f"Read(/{cwd}/*/../../other/**)", "Read(src/**/../../../other/x)"):
+        (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": [r]}}))
+        assert "outside its directory" in (room_launch.settings_scope_refusal({}, str(home), managed=(), cwd=str(cwd))
+                                           or ""), r
+
+
+def test_r3_low_a_malformed_xml_profile_refuses_rather_than_raising(tmp_path):
+    home, cwd, _other = _rule_world(tmp_path)
+    prof = tmp_path / "com.anthropic.claudecode.plist"
+    prof.write_bytes(b'<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>permissions</broken>')
+    why = room_launch.settings_scope_refusal({}, str(home), managed=(str(prof),), cwd=str(cwd))
+    assert why is not None and "cannot be read" in why, why
+
+
+def test_r3_low_xdg_config_home_does_not_reach_the_child():
+    """FINDINGS_room_r3 LOW: XDG_CONFIG_HOME was passed on but no file under it is checked; it is not passed, so the
+    child's config is the one the check reads."""
+    assert "XDG_CONFIG_HOME" not in room_launch.room_env({"PATH": "/bin", "XDG_CONFIG_HOME": "/elsewhere"})
+
+
 def test_c3_the_child_gets_an_allowlisted_environment(world):
     secret = {"LEVAIN_TEST_SECRET": "s3cret", "AWS_SECRET_ACCESS_KEY": "x", "GITHUB_TOKEN": "y", "LC_ALL": "C"}
     lr = RoomLauncher(world["cs"], world["svc"], RoomSetting(str(world["cwd"]), claude_bin=str(world["script"])),

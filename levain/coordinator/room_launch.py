@@ -117,18 +117,20 @@ _CANARY_NAME = ".env.levain-room-canary"
 _SCOPE_NAME = "levain-room-scope-canary.txt"
 _SOURCES = ("user_permanent", "config")
 # the settings files a child run with ``--setting-sources user`` still loads outside his user file: the managed (policy)
-# settings, per platform (a seam: a test points it at its own). The .plist is the macOS MDM profile's domain (roomfix2
-# K3, from the L3 finding; UNVERIFIED that the claude CLI reads it: reading one it does not load can only refuse more)
+# settings, per platform (a seam: a test points it at its own). Each managed-settings.json brings the managed-settings.d
+# drop-ins beside it (:func:`_loaded_settings`). The .plist is the macOS MDM profile's domain (roomfix2 K3, from the L3
+# finding; UNVERIFIED that the claude CLI reads this file: reading one it does not load can only refuse more)
 MANAGED_SETTINGS = ("/Library/Application Support/ClaudeCode/managed-settings.json", "/etc/claude-code/managed-settings.json",
                     "/Library/Managed Preferences/com.anthropic.claudecode.plist")
 # what of the serve's environment the room's child gets (roomfix1 C3): what a claude CLI needs to find his account, its
 # config and the network, what the room's MCP door (a python child of it) needs to import levain and find its store, and
-# nothing else. A name a caller adds is ``RoomLauncher(env_keep=...)``.
+# nothing else. A name a caller adds is ``RoomLauncher(env_keep=...)``. XDG_CONFIG_HOME is not kept (roomfix3): no
+# settings file under it is checked, so the child keeps to the config the check reads.
 ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "TZ", "LANG", "LANGUAGE",
             "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
             "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
             "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
-            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+            "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
             "LEVAIN_HOME", "PYTHONPATH", "VIRTUAL_ENV")
 ENV_KEEP_PREFIXES = ("LC_", "ANTHROPIC_")
 
@@ -142,10 +144,15 @@ def room_env(environ: Mapping[str, str], keep: tuple = ()) -> dict:
     if env.get("CLAUDE_CONFIG_DIR") == "":
         del env["CLAUDE_CONFIG_DIR"]           # read as unset by settings_scope_refusal: the child gets it unset too
     # a relative or empty search-path entry is the child's cwd, the room's DIR: a `claude` or a `levain` package there
-    # would run in place of the real one (FINDINGS_room_r2 K5), so only absolute entries are passed on
+    # would run in place of the real one (FINDINGS_room_r2 K5), so only absolute entries are passed on; with none left
+    # the name is not passed at all, since "" is itself one empty entry (FINDINGS_room_r3 R3-2)
     for name in ("PATH", "PYTHONPATH"):
         if name in env:
-            env[name] = os.pathsep.join(p for p in env[name].split(os.pathsep) if os.path.isabs(p))
+            kept = os.pathsep.join(p for p in env[name].split(os.pathsep) if os.path.isabs(p))
+            if kept:
+                env[name] = kept
+            else:
+                del env[name]
     env[ROOM_ENV] = "1"
     return env
 
@@ -154,7 +161,7 @@ def settings_scope_refusal(environ: Mapping[str, str], home: str,
                            managed: Optional[tuple] = None, cwd: Optional[str] = None) -> Optional[str]:
     """Why the settings the room's child will load widen its read scope, or None (roomfix1 C2, roomfix2 K2/K3).
     ``--setting-sources user`` still loads his user ``settings.json`` (``$CLAUDE_CONFIG_DIR`` or ``<home>/.claude``) and
-    the managed settings. The room refuses to open when any of them names ``permissions.additionalDirectories`` (it adds
+    the managed settings, their ``managed-settings.d`` drop-ins included (:func:`_loaded_settings`). The room refuses to open when any of them names ``permissions.additionalDirectories`` (it adds
     directories outside the room's cwd to what its file tools may read) or a path-specific ``permissions.allow`` rule for
     a file tool whose path reaches outside ``cwd`` (:func:`_allow_rule_outside`; a bare ``Read`` allow does not widen
     the scope: the open check's scope decoy was denied on a real claude with one, RETURN_land_room 2026-11-04). A
@@ -168,8 +175,11 @@ def settings_scope_refusal(environ: Mapping[str, str], home: str,
                          "directory and would read its settings from a different place than levain checks; set it absolute",
                          400)
     config = config or os.path.join(home, ".claude")
-    for path in (os.path.join(config, "settings.json"), *(MANAGED_SETTINGS if managed is None else managed)):
+    for path, unlisted in _loaded_settings(os.path.join(config, "settings.json"),
+                                           MANAGED_SETTINGS if managed is None else managed):
         try:
+            if unlisted is not None:
+                raise unlisted
             if path.endswith(".plist"):
                 with open(path, "rb") as fb:
                     doc = plistlib.load(fb)
@@ -178,7 +188,7 @@ def settings_scope_refusal(environ: Mapping[str, str], home: str,
                     doc = json.load(f)
         except FileNotFoundError:
             continue
-        except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+        except Exception as exc:  # noqa: BLE001 - any file the check cannot interpret fails closed (a bad XML plist is expat's)
             return _one_line(f"the settings file {path} the room's child loads cannot be read ({type(exc).__name__}); "
                              "what it adds to the room's read scope cannot be said", 400)
         perms = doc.get("permissions") if isinstance(doc, dict) else None
@@ -200,6 +210,32 @@ def settings_scope_refusal(environ: Mapping[str, str], home: str,
                                  "room's file tools read outside its directory; remove it, or run the room under another "
                                  "CLAUDE_CONFIG_DIR", 400)
     return None
+
+
+_DROP_INS = "managed-settings.d"
+
+
+def _loaded_settings(user: str, managed: tuple) -> list:
+    """``(path, error)`` for every settings file the room's child loads: ``user``, each of ``managed``, and, after each
+    ``managed-settings.json``, every ``*.json`` of the ``managed-settings.d`` directory beside it, in name order, hidden
+    files skipped (roomfix3 R3-1: Claude Code merges those drop-ins, with or without the base file,
+    code.claude.com/docs/en/managed-settings.md). A drop-in directory that exists but cannot be listed is one entry
+    whose ``error`` is the listing's, so the check refuses it; a missing one adds nothing."""
+    out = [(user, None)]
+    for path in managed:
+        out.append((path, None))
+        if os.path.basename(path) != "managed-settings.json":
+            continue
+        drop = os.path.join(os.path.dirname(path), _DROP_INS)
+        try:
+            names = sorted(os.listdir(drop))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            out.append((drop, exc))
+            continue
+        out.extend((os.path.join(drop, n), None) for n in names if n.endswith(".json") and not n.startswith("."))
+    return out
 
 
 # the file tools whose path-specific allow rules can widen what the room reads: its own (Read, Grep, Glob) and the edit
@@ -232,6 +268,8 @@ def _allow_rule_outside(rule: str, cwd: Optional[str], home: str, settings_dir: 
         path = os.path.join(cwd, spec)
     cut = min((i for i in (path.find(c) for c in _GLOB_CHARS) if i >= 0), default=-1)
     literal = path if cut < 0 else path[:path.rfind("/", 0, cut) + 1] or "/"
+    if ".." in path[len(literal):].split("/"):
+        return True                          # a `..` the literal cut leaves in the glob part climbs where realpath cannot see
     root, base = os.path.realpath(literal), os.path.realpath(cwd)
     if os.path.exists(root) and os.path.exists(base) and os.path.samefile(root, base):
         return False

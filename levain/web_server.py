@@ -5437,7 +5437,11 @@ def _room_dir_refusal(cwd: Path, queue: Path) -> None:
         return want is not None and any(ident(c) == want for c in (child, *child.parents))
 
     if inside(home, cwd):
-        what = "your home directory" if cwd == home else f"a directory that holds your home directory ({home})"
+        # named by identity too (roomfix3 LOW): a spelling only the (st_dev, st_ino) match catches is still home itself
+        own = ident(cwd)
+        same = cwd == home or (own is not None and own == ident(home))
+        what = ("your home directory" if same
+                else f"a directory that holds your home directory ({home})")
         raise ValueError(f"{cwd} is {what}: the room's file tools would read all of it; pass a project directory")
     for own, name in ((levain_home, "levain's home"), (queue, "levain's consent queue")):
         if inside(own, cwd):
