@@ -47,6 +47,11 @@ if mode == "exit_early" or (mode == "resume_rejected" and "--resume" in argv):
     sys.stderr.write("boom: the fake exits at once\n"); sys.exit(3)
 if mode == "deaf":
     time.sleep(600)
+if mode == "grandchild":
+    import subprocess
+    g = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(120)"])
+    open(os.path.join(base, "grand.pid"), "w").write(str(g.pid))
+    mode = "ok"
 RULE = {{"decision": "accept", "source": "user_permanent", "reason_type": "rule"}}
 CFG = {{"decision": "accept", "source": "config", "reason_type": "rule"}}
 DENY = {{"decision": "reject", "source": "config", "reason_type": "rule"}}
@@ -589,6 +594,60 @@ def test_item3_the_room_spawns_its_child_in_its_own_group_and_a_close_reaches_a_
                 kill()
             except (ProcessLookupError, PermissionError):
                 pass
+
+
+def _gone(pid, secs=5):
+    deadline = time.monotonic() + secs
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_r1_ending_an_idle_launch_reaches_a_grandchild_and_lets_the_child_exit_on_eof(world):
+    """FAILS on the tip (3 lineages): _end stopped only the group leader before the session close, which then saw a
+    reaped leader and never signalled the group, so a tool process survived rotation, idle recycle and shutdown. Idle,
+    the child now also gets the graceful EOF exit (returncode 0), not a SIGTERM."""
+    mode(world, "grandchild")
+    lr = launcher(world)
+    h = lr.ensure()
+    grand = int((world["fake"] / "grand.pid").read_text())
+    proc = lr._live[h.launch_id].proc
+    try:
+        assert os.getpgid(grand) == proc.pid
+        lr.end(h.launch_id, "test")
+        assert state(world, h.launch_id) == "ended"
+        assert proc.returncode == 0, "an idle child should leave on its own at EOF, not be signalled"
+        assert _gone(grand), "the grandchild outlived the launch end"
+    finally:
+        try:
+            os.kill(grand, 9)
+        except ProcessLookupError:
+            pass
+
+
+def test_r1_a_failed_open_before_attach_stops_the_whole_group(world):
+    """The group-aware fallback for a child no session holds: _stop_child signals the group, not just the leader."""
+    proc = room_launch._spawn([sys.executable, "-I", "-c", GRANDCHILD], cwd=str(world["fake"]), env=dict(os.environ),
+                              stderr=subprocess.DEVNULL)
+    grand = int(proc.stdout.readline())
+    try:
+        room_launch._stop_child(proc)
+        assert _gone(grand), "_stop_child left a member of the child's group alive"
+    finally:
+        try:
+            os.kill(grand, 9)
+        except ProcessLookupError:
+            pass
+
+
+def test_r1_roomsession_still_accepts_the_old_child_keyword(world):
+    room_launch.RoomSession(PipeTransport(subprocess.Popen([sys.executable, "-I", "-c", "pass"],
+                                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)),
+                            child=None)
 
 
 # --- rme-fix1: L3_rme_r1 findings, each reproduced on the RM-E tip --------------------------------------------------------

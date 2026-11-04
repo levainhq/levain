@@ -38,9 +38,10 @@ reuses a session.
 
 **Closing a hung send.** ``ClaudeSession.close`` takes no I/O lock and ``PipeTransport.close`` signals the child (its
 whole process group, since the room spawns with ``start_new_session=True``) before it closes stdin, so a send
-blocked in a full stdin pipe is freed by the plain session's close. :meth:`RoomLauncher._end` still stops the CHILD
-first, with no lock held, before it asks the service to detach, because ``detach`` waits for the launch's mutex and a
-hung send holds it.
+blocked in a full stdin pipe is freed by the plain session's close. :meth:`RoomLauncher._end` runs that close FIRST,
+with no lock held, before it asks the service to detach, because ``detach`` waits for the launch's mutex and a hung send
+holds it; an idle child leaves on EOF, a stuck one is signalled as a group. :func:`_stop_child` (group-aware) is only
+the fallback for a child no session holds, or a close that raised.
 
 **Resume and lapse.** A new launch resumes the room thread's newest recorded conversation (``--resume <id>``, recorded
 as the pending launch's ``resumed_from``; the child reports the id it was resumed from, which
@@ -61,6 +62,7 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -77,7 +79,7 @@ from levain.coordinator.chat import (ROOM_PERMISSION_MODE, ChatService, ChatStor
                                      liveness)
 from levain.coordinator.chat_tripwires import TripwireContext
 from levain.coordinator.claude_session import (ROOM_DENIED_TOOLS, ROOM_MCP_SERVER, ROOM_MCP_TOOL, ROOM_TOOLS,
-                                               ClaudeSession, PipeTransport, canary_denied, default_deny_paths,
+                                               ClaudeSession, PipeTransport, _leads_own_group, canary_denied, default_deny_paths,
                                                open_probe, room_argv, room_settings_json)
 from levain.coordinator.driver import LivenessEvidence, NotSent, SendCommand
 from levain.coordinator.room_mcp import LAUNCH_ENV
@@ -143,20 +145,53 @@ class RoomHandle(NamedTuple):
     resume_failed: Optional[str] = None
 
 
+def _sweep_group(pid: Any) -> None:
+    """SIGKILL what is left of the process group ``pid`` led (a leader that exited on its own leaves its tool
+    processes behind). An empty group is ESRCH; a pid reused in that gap is a known edge (as in claude_session)."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def _stop_child(proc: Any) -> None:
-    """Terminate, then kill, the child, each bounded by :data:`KILL_WAIT`. Takes no lock, so it works while another
-    thread is blocked writing to the child. Never raises."""
-    for step in (proc.terminate, lambda: proc.wait(KILL_WAIT), proc.kill, lambda: proc.wait(KILL_WAIT)):
+    """Terminate, then kill, the child, each bounded by :data:`KILL_WAIT`; when the child leads its own process group
+    (as a spawned room child does) the signals go to the GROUP, and a last kill sweeps it even after the leader is gone,
+    so a tool or MCP process holding the pipe does not outlive it. The fallback for a child no session holds (a failed
+    open); an ended launch goes through the session's own close. Takes no lock. Never raises."""
+    group = _leads_own_group(proc)
+    pid = getattr(proc, "pid", None)
+
+    def sig(num: int, plain: Callable[[], None]) -> Callable[[], None]:
+        def go() -> None:
+            if group:
+                try:
+                    os.killpg(pid, num)
+                    return
+                except ProcessLookupError:
+                    return
+                except OSError:
+                    pass
+            plain()
+        return go
+    for step in (sig(signal.SIGTERM, proc.terminate), lambda: proc.wait(KILL_WAIT), sig(signal.SIGKILL, proc.kill),
+                 lambda: proc.wait(KILL_WAIT)):
         try:
             if proc.poll() is not None:
-                return
+                break
             step()
         except Exception:  # noqa: BLE001 - a child that will not die is the caller's to find; this never raises
             pass
+    if group:
+        _sweep_group(pid)                            # the leader is gone; any member still in the group goes with it
 
 
 class RoomSession(ClaudeSession):
-    """A :class:`~levain.coordinator.claude_session.ClaudeSession` that reports when the child's output has ended."""
+    """A :class:`~levain.coordinator.claude_session.ClaudeSession` that reports when the child's output has ended.
+    ``child=`` is accepted and ignored (the old constructor's keyword; the transport owns the child)."""
+
+    def __init__(self, transport: Any, *, child: Any = None, **kw: Any) -> None:
+        super().__init__(transport, **kw)
 
     @property
     def output_ended(self) -> bool:
@@ -552,11 +587,15 @@ class RoomLauncher:
     def _end(self, launch_id: str, cause: str, *, note: Optional[str] = None, nonce: Optional[str] = None) -> None:
         held = self._live.pop(launch_id, None)
         if held is not None:
-            _stop_child(held.proc)                       # first, with no lock: it frees a send blocked in the pipe
+            group = _leads_own_group(held.proc)          # asked while the leader is unreaped: it names the group
             try:
-                held.session.close()                     # a session never attached is closed by nothing else
+                # first, before detach and with no lock: the session's own close is graceful (EOF) for an idle child,
+                # signals the child's whole group, and frees a send blocked in the pipe so detach can take the mutex
+                held.session.close()
             except Exception:  # noqa: BLE001 - the launch must still end
-                pass
+                _stop_child(held.proc)
+            if group:
+                _sweep_group(held.proc.pid)              # a leader that left on EOF leaves its tool processes behind
         try:
             self._svc.detach(launch_id)
         except Exception:  # noqa: BLE001 - the launch must still end
