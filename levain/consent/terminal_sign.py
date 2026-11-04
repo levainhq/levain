@@ -23,6 +23,7 @@ import os
 import pwd
 import re
 import secrets
+import shlex
 import stat
 import subprocess
 import unicodedata
@@ -42,8 +43,9 @@ from levain.trust_anchor import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_pr
 
 __all__ = ["AnswerClass", "Entry", "FAILED_REASONS", "KEY_LABEL", "MessageError", "NAMESPACE", "FORMAT",
            "ParsedMessage", "REASONS", "SCOPE_FIELDS", "SignOutcome", "StatusReport", "TerminalKey", "VerifyResult",
-           "answer_class", "build_message", "default_signer_factory", "event_time", "find_key", "fresh", "is_remote",
-           "parse_verified", "sign", "status", "target_id", "verify"]
+           "answer_class", "build_message", "create", "default_signer_factory", "enroll_command", "event_time",
+           "find_key", "fresh", "is_remote", "parse_verified", "session_refusal", "sign", "status", "target_id",
+           "verify"]
 
 FORMAT = "levain-terminal-answer/1"
 NAMESPACE = "levain-terminal-answer"
@@ -346,6 +348,143 @@ def status(key_dir: Path | None = None, *, sc_auth: Path | str = SC_AUTH, identi
     if ok is True:
         return StatusReport("enrolled", f"terminal key: enrolled ({fp}), {note}", key.public_key)
     return StatusReport("warning", f"WARNING: terminal key ({fp}): {note}", key.public_key)
+
+
+@dataclass(frozen=True)
+class CreateReport:
+    created: bool
+    text: str
+    public_key: str | None = None
+
+
+def signers_line(public_key: str, principal: str = "phill") -> str:
+    """The line flow's ``scripts/needs_phill_signers`` takes for this key (DESIGN section 3, step 2)."""
+    return f'{principal} namespaces="{NAMESPACE}" {" ".join(public_key.split()[:2])}'
+
+
+def session_refusal() -> str:
+    """The refusal of ``terminal-key create`` inside an agent session: one text, which :func:`create` returns and
+    the CLI prints, so the two never say different things."""
+    from levain.consent.band import AGENT_ANSWER_REFUSAL
+    return f"refused: run it from a fresh terminal, not inside an agent session ({AGENT_ANSWER_REFUSAL})"
+
+
+def enroll_command(public_path: Path | str) -> str:
+    """The ``levain cockpit enroll`` line for the terminal key, shell-quoted: that verb takes the public key FILE."""
+    from levain.authority import KEY_WORD
+    return shlex.join(["levain", "cockpit", "enroll", str(public_path), "--class", "laptop-presence",
+                       "--custody", TOUCH_ID, "--signing-key", KEY_WORD])
+
+
+def create(key_dir: Path | None = None, *, creator: Callable[..., Any] | None = None,
+           in_agent_session: Callable[[], bool] | None = None) -> CreateReport:
+    """``terminal-key create``: one Secure Enclave key labelled :data:`KEY_LABEL` whose every signature needs Touch
+    ID, in the real levain home's key directory. Refuses (nothing created) inside any agent session, judged by
+    ``in_agent_session`` (default ``levain.consent.band.agent_session_caller``, the band's one detector) before the
+    key directory is touched, and when a terminal key is already enrolled. ``creator`` is
+    ``custody.create_touch_id``'s door and the only place a real key is made; tests inject theirs.
+    Never raises: a refusal, a failed creation, any exception on the way and a Ctrl-C are a report. ``created`` is
+    True once ``creator`` has returned a key, even when printing the instructions then fails; an interrupt at the
+    moment ``creator`` returns is told apart by looking for the key again."""
+    progress = _Progress()
+    try:
+        return _create(key_dir, creator, in_agent_session, progress)
+    except KeyboardInterrupt:
+        return _after_failure(progress, "cancelled")
+    except Exception as exc:  # noqa: BLE001 - the CLI prints a report, never a traceback
+        return _after_failure(progress, _one_line(exc))
+
+
+@dataclass
+class _Progress:
+    """How far :func:`_create` got, read by :func:`create` when something escapes it."""
+    key_dir: Path | None = None
+    started: bool = False            # the creator was called
+    made: Any = None                 # what it returned: the key is persisted from here on
+
+
+def _after_failure(progress: _Progress, why: str) -> CreateReport:
+    if progress.made is not None:
+        m = progress.made
+        return _created_report(m.path, m.public_path, m.public_key, f"stopped while printing ({why})")
+    if progress.started:
+        # the interrupt or failure came at the creator's return: custody removed its key, or the key is committed
+        try:
+            key = find_key(progress.key_dir)
+        except Exception as exc:  # noqa: BLE001 - neither answer is known, so neither is claimed
+            return CreateReport(False, f"{why}; whether the key was created cannot be told ({_one_line(exc)}); "
+                                       "`levain band terminal-key status` shows it")
+        if key is not None:
+            return _created_report(key.path, key.path.with_name(key.path.name + ".pub"), key.public_key,
+                                   f"stopped as creation finished ({why})")
+    return CreateReport(False, f"not created: {why}")
+
+
+def _created_report(path: Path, public_path: Path, public_key: str, note: str | None = None) -> CreateReport:
+    """The created report, built piece by piece: a piece that cannot be built is named, never a lost key."""
+    lines = [f"terminal key created: {path}"]
+    unprinted: list[str] = []
+    try:
+        lines += ["1. Flow: commit this line to scripts/needs_phill_signers (a reviewed commit):",
+                  f"   {signers_line(public_key)}"]
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - the key exists; say what is missing
+        unprinted.append(f"the signers line ({_one_line(exc)})")
+    try:
+        lines += ["2. Levain (only for ruling compose and the desk click path; replace the signing key word):",
+                  f"   {enroll_command(public_path)}"]
+    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - as above
+        unprinted.append(f"the enroll command ({_one_line(exc)})")
+    if note:
+        lines.append(f"note: {note}")
+    if unprinted:
+        lines.append(f"could not print {' and '.join(unprinted)}; the public key file is {public_path}, and "
+                     "`levain band terminal-key status` shows the key")
+    return CreateReport(True, "\n".join(lines), public_key)
+
+
+_STALE = "; choose another --label"
+
+
+def _not_created(exc: KeyError_) -> str:
+    """Custody's refusal, except where it advises a ``--label`` this verb does not take (its label is fixed)."""
+    text = _one_line(exc)
+    if _STALE not in text:
+        return f"not created: {text}"
+    what = text.split(": ", 1)[-1].split(_STALE, 1)[0]
+    return (f"not created: {what}, a leftover of an earlier terminal key; remove it, then run create again "
+            "(`levain band terminal-key status` shows the detail)")
+
+
+def _create(key_dir: Path | None, creator: Callable[..., Any] | None,
+            in_agent_session: Callable[[], bool] | None, progress: _Progress) -> CreateReport:
+    if in_agent_session is None:
+        from levain.consent.band import agent_session_caller as in_agent_session
+    try:
+        inside = in_agent_session()
+    except Exception as exc:  # noqa: BLE001 - a session that cannot be told apart is refused (fail-closed)
+        return CreateReport(False, "refused: whether this runs inside an agent session cannot be told: "
+                                   f"{_one_line(exc)} (nothing was created)")
+    if inside:
+        return CreateReport(False, f"{session_refusal()} (nothing was created)")
+    try:
+        d = Path(key_dir) if key_dir is not None else _real_key_dir()
+        if find_key(d) is not None:
+            return CreateReport(False, "refused: a terminal key is already enrolled; `levain band terminal-key "
+                                       "status` shows it (nothing was created)")
+    except Exception as exc:  # noqa: BLE001 - a key directory that cannot be read is a refusal, never a creation
+        return CreateReport(False, f"refused: the key directory cannot be read: {_one_line(exc)} "
+                                   "(nothing was created)")
+    if creator is None:
+        from levain.cockpit.custody import create_touch_id as creator
+    progress.key_dir, progress.started = d, True
+    try:
+        progress.made = creator(d, KEY_LABEL)
+    except KeyError_ as exc:
+        return CreateReport(False, _not_created(exc))
+    except Exception as exc:  # noqa: BLE001 - as above
+        return CreateReport(False, f"not created: {_one_line(exc)}")
+    m = progress.made
+    return _created_report(m.path, m.public_path, m.public_key)
 
 
 # ---------------------------------------------------------------------------------------------------
