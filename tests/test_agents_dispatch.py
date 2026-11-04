@@ -207,3 +207,57 @@ def test_a_fire_with_the_enabled_facts_gets_past_install_to_its_next_refusal(tmp
     log = (rig.store.directory / "fires" / f"{oid}.log").read_text()
     assert "cannot be read" not in log and "stale" not in log
     assert code == 1 and "ExposureRefused" in log
+
+
+# --- D1 L3 r1 fixes (G1-G4) ------------------------------------------------------------------------------------------
+
+def test_bool_on_input_raises_on_an_unreadable_verdict_so_the_day_stays_retryable():
+    unread = da.InputVerdict(False, "unreadable", "unreadable", "OperationalError: locked")
+    with pytest.raises(da.InputUnreadable, match="locked"):
+        da.bool_on_input(lambda row: unread)({})
+    unwired = da.InputVerdict(False, "unreadable", "unwired", "not wired")
+    with pytest.raises(da.InputUnreadable):
+        da.bool_on_input(lambda row: unwired)({})
+
+
+def test_an_unreadable_memory_db_is_not_recorded_as_a_quiet_day(rig, tmp_path):
+    rig.link()
+    _rename(rig, "dream")
+    f = _facts(tmp_path)
+    f["store_path"].write_bytes(b"this is not a sqlite database" * 50)
+    da.write_install(rig.store.directory, **f)
+    oid = rig.claim("g1")
+    res = rig.launch(oid)
+    assert res.outcome == ctl.UNCLASSIFIED and rig.row(oid)["state"] == "admitted"
+    assert "input check failed" in res.reason
+
+
+def test_a_manual_dream_checked_while_admitted_is_judged_on_its_own_day_not_unreadable_for_launched_at(tmp_path):
+    f = _facts(tmp_path)
+    row = {"occurrence_id": "oc-" + "a" * 32, "agent_id": "ag-x", "kind": "manual", "state": "admitted",
+           "launched_at": None}
+    v = da.day_ready(f["store_path"], row, now=datetime(2026, 11, 3, 18, 0, tzinfo=timezone.utc),
+                     zone=f["zone"], agent_dir=tmp_path, coord_dir=f["coord_dir"])
+    assert "launched_at" not in v.reason
+
+
+def test_an_explicit_none_on_input_still_means_no_input_check(rig):
+    rig.link()
+    _rename(rig, "dream")
+    oid = rig.claim("g3")
+    assert callable(ctl._default_input_check(rig.store, oid))
+    res = rig.launch(oid, on_input=None)
+    assert res.outcome == "launched"
+
+
+def test_read_install_refuses_non_string_optional_facts_by_name(tmp_path):
+    f = _facts(tmp_path)
+    ad = tmp_path / "ag"
+    ad.mkdir()
+    da.write_install(ad, **f)
+    base = json.loads((ad / da.INSTALL_FILE).read_text())
+    for key, bad in (("facts_path", 5), ("facts_path", ["x"]), ("model", 5), ("claude_bin", ["claude"]),
+                     ("model", {"a": 1})):
+        (ad / da.INSTALL_FILE).write_text(json.dumps({**base, key: bad}))
+        with pytest.raises(da.InstallRefused, match=key):
+            da.read_install(ad)

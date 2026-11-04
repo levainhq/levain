@@ -199,8 +199,11 @@ def day_ready(store_path: Path | str, row: Mapping[str, Any], *, now: datetime, 
         me = row.get("occurrence_id")
         if not isinstance(me, str) or not me.strip():
             raise ValueError("the occurrence row carries no occurrence_id")
-        day = _ready.occurrence_dream_day(row, zone)
         manual = row.get("kind") == "manual"
+        if manual and not row.get("launched_at"):
+            # a manual run is checked while still `admitted`, before it has a launched_at: its own day is now's
+            row = {**row, "launched_at": now}
+        day = _ready.occurrence_dream_day(row, zone)
         src, close = _ready.sources_for(store_path, agent_dir=agent_dir, coord_dir=coord_dir, now=now)
         # the occurrence under evaluation is itself an `admitted` row (the claim precedes the input check), and check 1
         # reads any admitted row of the agent as a dream in flight: it must not count itself
@@ -236,12 +239,25 @@ def unwired_on_input(row: Mapping[str, Any]) -> InputVerdict:
     return InputVerdict(False, _ready.UNREADABLE, "unwired", "the on_input hook point is not wired to the dream")
 
 
+class InputUnreadable(RuntimeError):
+    """The day's input could not be read (a corrupt or locked store, an unreadable coordinator source). The controller
+    reads a raising hook as dead input: the row stays retryable within its grace and ends ``missed`` past it, never
+    ``skipped-no-input``."""
+
+
 def bool_on_input(check: Callable[[Mapping[str, Any]], InputVerdict]) -> Callable[[Mapping[str, Any]], bool]:
     """``check`` in the shape ``launch(on_input=...)`` takes: the verdict's ``ok``. The controller reads a ``bool`` as
     present or absent input and anything else (or a raise) as dead input, so the verdict's state and reason do not
-    reach the row; they stay in :func:`day_ready` for ``levain dream ready``."""
+    reach the row; they stay in :func:`day_ready` for ``levain dream ready``. A day that could not be READ is not a
+    quiet one: only a ready verdict answers True and only a quiet one answers False; any other raises
+    :class:`InputUnreadable` (dead input to the controller, retryable)."""
     def on_input(row: Mapping[str, Any]) -> bool:
-        return check(row).ok is True
+        v = check(row)
+        if v.ok is True:
+            return True
+        if v.state == _ready.QUIET:
+            return False
+        raise InputUnreadable(f"{v.state}/{v.kind}: {v.reason}")
 
     return on_input
 
@@ -720,6 +736,12 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
     cockpit_root = _fact_path(doc, "cockpit_root", path, kind="dir")
     coord_dir = _fact_path(doc, "coord_dir", path, kind="dir")
     facts = doc.get("facts_path")
+    if facts is not None and (not isinstance(facts, str) or not facts.strip()):
+        raise InstallRefused(f"{path}: facts_path {facts!r} is not a path string")
+    for key in ("model", "claude_bin"):
+        v = doc.get(key)
+        if v is not None and (not isinstance(v, str) or not v.strip()):
+            raise InstallRefused(f"{path}: {key} {v!r} is not a non-empty string")
     return DreamInstall(store_path, cockpit_root, coord_dir, zone,
                         None if facts is None else Path(facts).expanduser(),
                         doc.get("model") or "claude-opus-5-5", doc.get("claude_bin") or "claude")

@@ -599,6 +599,7 @@ class LaunchResult:
     launch_epoch: int | None = None
 
 
+DEFAULT_INPUT: object = object()   # launch(on_input=DEFAULT_INPUT): the agent's own hook; None stays "no check"
 InputCheck = Callable[[dict], bool]   # the on_input hook: the occurrence's identity in, "input present" out
 
 
@@ -788,11 +789,12 @@ def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authori
            window: Window, now: datetime,
            launch_over: Callable[[str], bool | None] | None = None,
            session_alive: Callable[[str], bool | None] | None = None,
-           on_input: InputCheck | None = None) -> LaunchResult:
+           on_input: InputCheck | None | object = DEFAULT_INPUT) -> LaunchResult:
     """The launch transaction (A0 §2.5 ``admitted -> launched``). ``authority`` is an
     :class:`~levain.agent_authority.AgentAuthority`; it is refreshed here, before the write lock.
 
-    ``on_input`` defaults to :func:`_default_input_check`: the dream's hook for the dream, none for any other agent.
+    ``on_input`` left at :data:`DEFAULT_INPUT` is :func:`_default_input_check`: the dream's hook for the dream, none
+    for any other agent. An explicit ``None`` is no input check, for any agent.
     With ``on_input``, the launch's refusals are judged first, in their own write transaction that takes nothing
     (:func:`_refusal_first`): a refusal ends the row with its own state and reason and the hook is never run. Only
     then is :func:`check_input` run, at the epoch those refusals were judged at; an answer there ends the call. A
@@ -809,7 +811,7 @@ def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authori
     opened the session."""
     if not isinstance(store, AgentStore):
         store = open_agent_store(store)
-    if on_input is None:
+    if on_input is DEFAULT_INPUT:
         on_input = _default_input_check(store, occurrence_id)
     at_dt = schedule._utc(now)
     at = _stamp(at_dt)
