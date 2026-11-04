@@ -5374,24 +5374,67 @@ def _build_room_serve(room: Path) -> Any:
     from levain.coordinator.room_launch import RoomSetting
     from levain.coordinator.room_serve import RoomServe
 
-    cwd = Path(room).expanduser().resolve()
+    cwd = _canonical_path(Path(room).expanduser())
     if not cwd.is_dir():
         raise ValueError(f"{cwd} is not a directory (it is where the room's file tools see first)")
-    queue = Path(default_queue_dir()).resolve()
+    queue = _canonical_path(Path(default_queue_dir()))
     _room_dir_refusal(cwd, queue)
-    return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd)), run_dir=str(queue / "room-run"))
+    # the deny rules are written from these spellings: the canonical ones the refusal checked (roomfix2 K1)
+    return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd)), run_dir=str(queue / "room-run"),
+                     launcher_kw={"home": str(_canonical_path(Path.home())), "levain_home": str(queue.parent)})
+
+
+def _canonical_path(p: Path) -> Path:
+    """``p`` resolved AND spelled as the filesystem spells it (roomfix2 K1). ``Path.resolve()`` follows links but keeps
+    the case it was given, so on a case-insensitive filesystem ``/USERS/me`` resolves to itself. The nearest existing
+    ancestor is asked for its own path (``F_GETPATH`` where the platform has it: macOS, which also answers a firmlink
+    alias with the canonical name); the part that does not exist yet is joined on as given."""
+    import fcntl
+    import os
+
+    p = p.resolve()
+    tail: list = []
+    base = p
+    while not base.exists() and base != base.parent:
+        tail.append(base.name)
+        base = base.parent
+    getpath = getattr(fcntl, "F_GETPATH", None)
+    if getpath is not None:
+        fd = os.open(base, os.O_RDONLY)
+        try:
+            base = Path(os.fsdecode(fcntl.fcntl(fd, getpath, bytes(1024)).split(b"\0", 1)[0]))
+        finally:
+            os.close(fd)
+    return base.joinpath(*reversed(tail))
 
 
 def _room_dir_refusal(cwd: Path, queue: Path) -> None:
     """Refuse a ``--room DIR`` that would make the room's read boundary too wide (roomfix1 C1): the user's home, any
     ancestor of it (``/``, ``/Users``), a directory holding levain's own home or its consent queue (its stores, tokens and
-    keys), or one inside levain's home. Every side is compared resolved. The deny rules still cover the credential paths
-    inside an allowed DIR; this refuses the DIRs where they would be the only line. ``ValueError`` naming the reason."""
-    home = Path.home().resolve()                 # $HOME, else the password database's (os.path.expanduser)
+    keys), or one inside levain's home. Every side is compared by identity (roomfix2 K1: a spelling the filesystem takes
+    as the same directory, a case alias or a second mount, is the same directory): each path and each of its parents
+    is matched by canonical spelling and, where both exist, by ``(st_dev, st_ino)``; a stat that fails refuses. The
+    deny rules still cover the credential paths inside an allowed DIR; this refuses the DIRs where they would be the
+    only line. ``ValueError`` naming the reason."""
+    import os
+
+    home = _canonical_path(Path.home())          # $HOME, else the password database's (os.path.expanduser)
     levain_home = queue.parent
 
+    def ident(p: Path):                          # (st_dev, st_ino), or None for a path that does not exist
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValueError(f"--room: {p} cannot be checked ({type(exc).__name__}); the room is not opened") from exc
+        return (st.st_dev, st.st_ino)
+
     def inside(child: Path, root: Path) -> bool:
-        return child == root or root in child.parents
+        if child == root or root in child.parents:
+            return True
+        want = ident(root)
+        return want is not None and any(ident(c) == want for c in (child, *child.parents))
 
     if inside(home, cwd):
         what = "your home directory" if cwd == home else f"a directory that holds your home directory ({home})"
