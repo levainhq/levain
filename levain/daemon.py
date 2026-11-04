@@ -439,6 +439,38 @@ def build_feeds_spec(
     )
 
 
+# --- the agent tick (P7-1 S11) ---
+DEFAULT_TICK_LABEL = "com.levainhq.levain.agents-tick"
+# The interval and the process's own bounds are defined once, in ``levain.agents.tick_driver`` (TICK_INTERVAL_S,
+# TICK_SOFT_BOUND_S, TICK_HARD_BOUND_S); the caller passes the interval so this stdlib-only leaf imports nothing of agents.
+
+
+def build_tick_spec(
+    *,
+    agent_store: Path,
+    interval: int,
+    levain_home: Path | None = None,
+    coord_dir: Path | None = None,
+    label: str = DEFAULT_TICK_LABEL,
+    log_dir: Path | None = None,
+) -> DaemonSpec:
+    """The periodic spec that runs ``levain agents --store-dir <store> tick`` and exits (the agent reaper and the
+    scheduled-window claims): operator uid, no keep-alive, not at login. launchd coalesces per label, so a tick still
+    running when the next is due delays it; the process bounds itself (``tick_driver``: graceful bound, then a hard
+    ``os._exit``), which is what makes "a hung tick" end."""
+    store = agent_store.expanduser().resolve()
+    invocation = _levain_invocation()
+    argv = [*invocation, "agents", "--store-dir", str(store), "tick"]
+    if coord_dir is not None:
+        argv += ["--coord-dir", str(coord_dir.expanduser().resolve())]
+    env = _daemon_env(invocation)
+    if levain_home is not None:
+        env["LEVAIN_HOME"] = str(levain_home.expanduser().resolve())
+    logs = (log_dir or _default_log_dir()).expanduser().resolve()
+    return DaemonSpec(label=label, argv=argv, working_dir=store, env=env, stdout_log=logs / f"{label}.log",
+                      stderr_log=logs / f"{label}.err", run_at_login=False, keep_alive=False, start_interval=interval)
+
+
 # --- the agent fence (P7-2 wiring, shape C) ---
 # A fourth unit: RESIDENT, like the cockpit, because the queue broker asks it on every dispatch GATE and refuses the
 # GATE when it is down.
