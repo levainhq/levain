@@ -24,6 +24,7 @@ from levain.slot import runtime_helper as H
 from levain.slot import tickets as T
 from levain.slot.ids import SlotId
 from tests.test_pool import F2_DISPATCH
+from tests.test_slot_s2f2_runtime_helper import BRIEF_DIGEST
 from tests.test_routemaps import DISPATCH_UID, st  # noqa: F401
 from tests.test_slot_s2a_control import ROLE_UID, Env, cas
 from tests.test_tickets import (PASSTHROUGH, Clock, Rig, mint_args, refused, rig, sync_free,  # noqa: F401
@@ -345,7 +346,8 @@ def test_confirm_identity_takes_dispatch_only_with_yes():
 
 TF = {"kind": "executor", "job_id": "j", "run_index": 0, "contract_digest": "sha256:" + "1" * 64,
       "egress_routes": ["github"], "reserved_microdollars": 0, "auth": "passthrough", "vendor": "claude",
-      "max_calls": 40, "max_tunnel_bytes": 2**20, "deadline_s": 600, "deadline": 1_900_000_000}
+      "max_calls": 40, "max_tunnel_bytes": 2**20, "deadline_s": 600, "deadline": 1_900_000_000,
+      "brief_digest": BRIEF_DIGEST}
 
 
 def rblob(routes, vendor="claude", model=None):
@@ -400,7 +402,8 @@ def test_check_ticket_passthrough_other_gates():
 def test_a_brokered_ticket_check_is_as_before():
     f = {"kind": "executor", "job_id": "j", "run_index": 0, "contract_digest": "sha256:" + "1" * 64,
          "egress_routes": ["github"], "reserved_microdollars": 5, "route": "glm", "model_requested": "m",
-         "routemap_generation": 1, "route_policy_digest": "sha256:" + "2" * 64}
+         "routemap_generation": 1, "route_policy_digest": "sha256:" + "2" * 64,
+         "brief_digest": BRIEF_DIGEST}
     RD.check_ticket(rblob(["glm", "github"], model="m"), "dispatch", "egress", "tk", f)                  # no auth given
     RD.check_ticket(rblob(["glm", "github"], model="m"), "dispatch", "egress", "tk", f, auth="brokered")
     with pytest.raises(Refused) as e:
@@ -537,6 +540,7 @@ class PTDispatch:
 
     def ticket(self, **over) -> str:
         self.n += 1
+        over = {"brief_digest": BRIEF_DIGEST, **over}
         facts = T.check_facts(pt_args(f"a-{self.n}", egress_routes=["github"], **over))
         return self.tickets.mint(f"a-{self.n}", facts, C.new_handle).ticket
 

@@ -63,6 +63,18 @@ PREPARE_RESULT_FORMAT = "levain-prepare-result/1"
 EXIT_OK = 0
 EXIT_REFUSED = 1       # DECISION: every refusal by name
 EXIT_INTERNAL = 70     # DECISION: an unexpected error (stdout still carries one line, ``internal``)
+#: c7.15 D8: an executor session's ``start`` whose vendor exited non-zero or by a signal. Distinct from the refusal
+#: (1) and internal (70) statuses; sudo returns it and the gate's ``returncode`` is the session's success test.
+EXIT_VENDOR = 2
+
+
+class Answer(dict):
+    """A verb's answer fields, carrying the process exit status the verb decides (``exit_status``, default
+    :data:`EXIT_OK`). The status is an attribute, never a key: the one stdout line is built from the fields alone,
+    so no private value reaches it. Only ``start`` of an executor session sets another status (:data:`EXIT_VENDOR`)."""
+
+    exit_status: int = EXIT_OK
+
 
 LOCK_WAIT_S = 10.0     # §11 V23: render's ``locked`` retry window; DECISION: also the pool / slot flock wait
 LOCK_SLICE_S = 0.02    # DECISION: the flock retry's first backoff (doubling to 0.5 s)
@@ -283,7 +295,8 @@ def _child_refused(marker: Optional[int], write: Callable[[int, bytes], int] = o
 
 
 def spawn_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], exec_w: Optional[int],
-                 detach: bool, *, stdout_w: Optional[int] = None) -> int:
+                 detach: bool, *, stdout_w: Optional[int] = None, stdin_null: bool = False,
+                 stderr_w: Optional[int] = None) -> int:
     """``start``'s fork through the wall (§5.1 start, §5.4 step 3, §9.1): the child keeps fds 0/1/2 (the helper's
     own stdio, sudo's pty; ``detach``: ``/dev/null`` + ``setsid``, the forwarder), the spec pipe (moved to
     ``SPEC_FD`` by :func:`wall.exec_launch`) and, when ``exec_w`` is given, that pipe's write end on
@@ -291,8 +304,9 @@ def spawn_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], e
     the forwarder's readiness pipe (:data:`wall.READY_FD`, the same fd). Every other fd is closed. A child that
     fails before its exec writes ``!`` on whichever fd holds the pipe at that moment (``exec_w`` itself until
     the dup2 onto ``EXEC_FD`` succeeded), so its failure is never only an EOF. ``stdout_w``: a pipe's write end put
-    on the child's fd 1 instead of the helper's (a post-clone check child, :func:`capture_target`). Only root can
-    run it (a VM row)."""
+    on the child's fd 1 instead of the helper's (a post-clone check child, :func:`capture_target`). ``stderr_w``: the same for fd 2;
+    ``stdin_null``: fd 0 on ``/dev/null`` (an executor's vendor, c7.15 D7: no stream of the helper's reaches it).
+    Only root can run it (a VM row)."""
     spec_r, spec_w = os.pipe()
     pid = os.fork()
     if pid == 0:   # pragma: no cover - the root child; exercised only in the VM (2g)
@@ -307,6 +321,13 @@ def spawn_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], e
                     os.close(null)
             if stdout_w is not None:
                 os.dup2(stdout_w, 1)
+            if stderr_w is not None:
+                os.dup2(stderr_w, 2)
+            if stdin_null:
+                null = os.open("/dev/null", os.O_RDONLY)
+                os.dup2(null, 0)
+                if null > 2:
+                    os.close(null)
             hi_spec = fcntl.fcntl(spec_r, fcntl.F_DUPFD, 32)
             keep = [hi_spec]
             if exec_w is not None:
@@ -415,6 +436,94 @@ def wait_child_within(pid: int, deadline_s: float) -> int:
     finally:
         for sig, h in old:
             signal.signal(sig, h)
+
+
+#: c7.15 V34 [judged, 11-04, against V21]: the most of each of an executor vendor's two streams written to its log
+#: file; the rest is counted, never an error and never kept.
+VENDOR_LOG_CAP = 16 * 1024 ** 2
+#: the most reads (65536 bytes each) of one stream after the vendor has exited.
+FINAL_READS = 16
+
+
+@dataclass
+class DrainResult:
+    """What :func:`wait_child_capturing` saw: the vendor's exit code (:func:`wait_child`'s convention) and, per
+    stream, the bytes written to its file and the bytes read past the cap (or past a failed write) and dropped."""
+
+    code: int
+    written: List[int]
+    dropped: List[int]
+
+
+def wait_child_capturing(pid: int, streams: Sequence[Tuple[int, int]], *, cap: int = VENDOR_LOG_CAP,
+                         waitpid: Callable[[int, int], Tuple[int, int]] = os.waitpid,
+                         sleep: Callable[[float], None] = time.sleep,
+                         fsync: Callable[[int], None] = os.fsync) -> DrainResult:
+    """Wait for the helper's own child ``pid`` while root drains each ``(read fd, file fd)`` of ``streams`` into its
+    file (c7.15 D7: an executor vendor's stdout and stderr), until the child EXITS (``waitpid`` ``WNOHANG``, polled),
+    never until the pipes' EOF: a process the vendor left behind can hold a write end open, as it can the
+    importer's result pipe (:func:`collect_export`). At the exit whatever is readable is read once more. At most
+    ``cap`` bytes go to a file; the rest is counted. A failed write to a file stops that stream's writes (the rest
+    counted as dropped) and keeps draining, so the vendor never blocks on a full pipe; the log is informing data,
+    nothing reads it as authority. Both files are fsynced at the end (a failure is noted, never the answer). The
+    read fds are set non-blocking; closing any fd is the caller's. SIGINT and SIGQUIT are ignored while waiting, as
+    in :func:`wait_child`. Returns the vendor's exit code, ``128 + signal`` when killed by one."""
+    n = len(streams)
+    written, dropped = [0] * n, [0] * n
+    live, broken = [True] * n, [False] * n
+    for r, _ in streams:
+        os.set_blocking(r, False)
+
+    def take(i: int) -> bool:           # one read; False at EOF or nothing ready
+        if not live[i]:
+            return False
+        r, f = streams[i]
+        try:
+            b = os.read(r, 65536)
+        except BlockingIOError:
+            return False
+        if not b:
+            live[i] = False
+            return False
+        room = 0 if broken[i] else max(0, min(len(b), cap - written[i]))
+        if room:
+            try:
+                write_all(f, b[:room])
+                written[i] += room
+            except OSError:
+                broken[i] = True
+                room = 0
+        dropped[i] += len(b) - room
+        return True
+
+    old = [(sig, signal.signal(sig, signal.SIG_IGN)) for sig in (signal.SIGINT, signal.SIGQUIT)]
+    try:
+        nap = 0.001
+        while True:
+            try:
+                done, status = waitpid(pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            if done:
+                for i in range(n):          # bounded: a left-behind writer may keep a pipe full
+                    for _ in range(FINAL_READS):
+                        if not take(i):
+                            break
+                break
+            if any([take(i) for i in range(n)]):
+                nap = 0.001
+                continue
+            sleep(nap)
+            nap = min(nap * 2, 0.05)
+    finally:
+        for sig, h in old:
+            signal.signal(sig, h)
+    for _, f in streams:
+        try:
+            fsync(f)
+        except OSError as e:
+            sys.stderr.write(f"levain runtime-helper: vendor log fsync failed: errno {e.errno}\n")
+    return DrainResult(_exit_code(status), written, dropped)
 
 
 def capture_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], bound: int) -> Tuple[int, bytes]:
@@ -907,8 +1016,13 @@ class Seams:
     lock_wait_s: float = LOCK_WAIT_S
     at: Callable[[str], None] = lambda step: None
     # start / teardown (levain.slot.start):
-    spawn: Callable[[Sequence[str], bytes, Optional[str], Optional[int], bool], int] = spawn_target
+    #: ``(argv, spec_json, cgroup, exec_w, detach, **kw) -> pid``; the keywords (``stdout_w``, ``stderr_w``,
+    #: ``stdin_null``) only an executor vendor's spawn passes (:func:`spawn_target`)
+    spawn: Callable[..., int] = spawn_target
     wait: Callable[[int], int] = wait_child
+    #: an executor vendor's wait that drains its two streams into files: ``(pid, ((read fd, file fd), ...)) ->``
+    #: :class:`DrainResult` (:func:`wait_child_capturing`)
+    wait_capturing: Callable[[int, Sequence[Tuple[int, int]]], "DrainResult"] = wait_child_capturing
     #: a child's wait bounded by its second argument, in seconds (:func:`wait_child_within`)
     wait_within: Callable[[int, float], int] = wait_child_within
     #: a post-clone check child: ``(argv, spec_json, cgroup, bound) -> (exit, stdout)`` (:func:`capture_target`)
@@ -1974,6 +2088,16 @@ def render_step3_files(run: RenderRun) -> None:
                                  run_as=seams.stage_run_as, fsync=seams.fsync, observe=obs.feed,
                                  chown=lambda fd, u, g: seams.chown(fd, u, g,
                                                                     f"live/{a.session}/in/{ST.BUNDLE_NAME}"))
+        # p71 S8 D1: an executor's brief, staged by the same path as the bundle (a fresh root inode, the ticket's
+        # digest checked before the content). check_ticket refused an executor on claude without the digest before
+        # anything rendered, so a session without it never gets here and stages no brief.
+        brief_digest = (a.ticket_facts or {}).get("brief_digest")
+        brief_staged = brief_digest is not None
+        if brief_staged:
+            ST.stage_brief(staging, dest, staging_uid=a.staging_uid, staging_gid=seams.user_gid(a.staging_uid),
+                           dest_gid=facts.slot_gid, brief_digest=brief_digest, run_as=seams.stage_run_as,
+                           fsync=seams.fsync,
+                           chown=lambda fd, u, g: seams.chown(fd, u, g, f"live/{a.session}/in/{ST.BRIEF_NAME}"))
     header = obs.finish()
     oid, ref = BF.base_of(header)
     owner = session_owner_uid(a)
@@ -2007,6 +2131,8 @@ def render_step3_files(run: RenderRun) -> None:
     # stage, so it is never removed here unstaged); the dir itself is END's ("staging deleted").
     with ctx.store.dir("staging", a.session, trusted=False) as staging:
         os.unlink(ST.BUNDLE_NAME, dir_fd=staging)
+        if brief_staged:        # DECISION: the brief is removed only when this render staged it, like the bundle
+            os.unlink(ST.BRIEF_NAME, dir_fd=staging)
         seams.fsync(staging)
     # alloc.base from the bytes root itself copied, written last: a base present means step (3) completed, so a
     # render refused or faulted anywhere earlier in this step leaves none and adopt answers base-unrecorded. It is
@@ -3553,7 +3679,13 @@ def run(argv: Sequence[str], *, stdin: bytes, env: Mapping[str, str], seams: Sea
 
 def main(argv: Sequence[str], *, stdin: bytes, env: Mapping[str, str], seams: Optional[Seams] = None,
          out=None, err=None) -> int:
-    """Exactly one canonical JSON line on ``out``; the refusal's detail (never on stdout) on ``err``."""
+    """Exactly one canonical JSON line on ``out``; the refusal's detail (never on stdout) on ``err``.
+
+    The process exit status: :data:`EXIT_OK` after an answer, :data:`EXIT_REFUSED` after a refusal,
+    :data:`EXIT_INTERNAL` after an unexpected error, and, for ``start`` of an executor session only, :data:`EXIT_VENDOR`
+    when the vendor did not exit 0 (the verb's :class:`Answer` carries it; c7.15 D8). The status is the authority
+    for the vendor's success, never the line: a slot process can write a line shaped like the answer to a shared
+    stdout, and cannot forge the helper's exit status."""
     out = out or sys.stdout
     err = err or sys.stderr
     try:
@@ -3571,7 +3703,7 @@ def main(argv: Sequence[str], *, stdin: bytes, env: Mapping[str, str], seams: Op
         return EXIT_INTERNAL
     out.write(line)
     out.flush()
-    return EXIT_OK
+    return fields.exit_status if isinstance(fields, Answer) else EXIT_OK
 
 
 def _read_stdin() -> bytes:
@@ -3587,7 +3719,7 @@ def _read_stdin() -> bytes:
     return bytes(data)
 
 
-__all__ = ["BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED",
+__all__ = ["Answer", "BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ctx", "DirRow", "EXIT_INTERNAL", "EXIT_OK", "EXIT_REFUSED", "EXIT_VENDOR",
            "FRONT_DROPPED_FIELDS", "FRONT_LOG_MODE", "FRONT_LOG_NAME", "FRONT_MODULE", "FRONT_POLICY_NAME", "GO_BYTE", "GO_FD", "GO_FD_ENV",
            "Leased", "LinkedNotDurable", "PREPARE_RESULT_FORMAT",
            "RENDER_STEPS", "RenderRun", "SLOT_OWNED_RENDER_DIRS", "Seams", "SlotView", "Store", "VERB_HANDLERS",

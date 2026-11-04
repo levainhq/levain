@@ -29,7 +29,7 @@ from levain.slot.ids import SlotId
 from tests.test_pool import EXEC_FACTS, F2_DISPATCH, attach, entry, pool, rig, sync  # noqa: F401 - fixtures
 from tests.test_pool import dispatch  # noqa: F401 - fixture
 from tests.test_routemaps import st  # noqa: F401 - the signed route-map store fixture
-from tests.test_slot_s2f2_runtime_helper import BOOT
+from tests.test_slot_s2f2_runtime_helper import BOOT, BRIEF_DIGEST
 from tests.test_tickets import SESSION, refused, root, ticket_of
 
 STEPS = [{"argv": ["pytest", "-q"], "wall_s": 60}]
@@ -38,7 +38,7 @@ VER_FACTS = {"job_id": "job-1", "run_index": 0, "contract_digest": "sha256:" + "
              "verifier_steps": STEPS, "input_bundle_digest": "sha256:" + "2" * 64,
              "driver_input_digest": "sha256:" + "3" * 64}
 #: an executor ticket whose routes lane F2's base map holds (`anthropic` brokered, `github` egress)
-F2_FACTS = dict(EXEC_FACTS, route="anthropic", model_requested="claude-opus-5-5")
+F2_FACTS = dict(EXEC_FACTS, route="anthropic", model_requested="claude-opus-5-5", brief_digest=BRIEF_DIGEST)
 
 
 def _blob(**kw) -> bytes:

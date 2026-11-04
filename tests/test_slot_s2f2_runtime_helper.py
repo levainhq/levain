@@ -41,6 +41,9 @@ GROUPS = {"levain-gwfronts": 789, "levain-slots": 788}
 BOOT = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
 #: A header render's bundlefmt parse accepts (HEAD naming the one branch ref), then stand-in pack bytes.
 BUNDLE_OID = b"0123456789abcdef0123456789abcdef01234567"
+#: the brief an executor ticket's fixtures name (p71 S8): `World.stage` stages it beside the bundle when alloc's ticket facts carry its digest
+BRIEF = "Brief for the fixture executor: plan the change, make it, commit.\n".encode()
+BRIEF_DIGEST = ST.brief_digest(BRIEF)
 BUNDLE = (b"# v2 git bundle\n" + BUNDLE_OID + b" HEAD\n" + BUNDLE_OID + b" refs/heads/main\n\n"
           + b"bundle-bytes " * 64)
 #: a base map the front's parser takes (render copies the session's entries into R/gw/slot<n>/session.json, 3b-8a)
@@ -214,6 +217,12 @@ class World:
 
     def stage(self, session: str, data: bytes = BUNDLE) -> None:
         (self.L / "staging" / session / "repo.bundle").write_bytes(data)
+        try:
+            facts = self.alloc(session).ticket_facts or {}
+        except FileNotFoundError:
+            facts = {}
+        if facts.get("brief_digest") == BRIEF_DIGEST:
+            (self.L / "staging" / session / "brief.md").write_bytes(BRIEF)
 
     def state(self, session: str) -> R.SessionState | None:
         return self.control.store.get(session)
