@@ -306,3 +306,72 @@ def test_inert_rows_a_whole_last_bullet_the_structured_fields_and_the_needs_card
     assert s["li"] == ["MX at the new host", "SPF and DKIM set"] and s["why"] == "the DMARC date is 11-16" and s["stop"] == "the MX switch", s
     assert [p[2] for p in s["picks"]] == [base + "&choice=a", base + "&choice=b"] and s["picks"][0][3] == "✓ Rec", s
     assert q["box"] is True and len(q["picks"]) == 2 and q["note"] == ["No sign page for this item: answer at the desk."], q
+
+
+# --- review r2 (L1-1..5, L2-1/2): a bad stored row never takes the list down, a lone surrogate keeps the ping -----------------
+def test_a_stored_row_that_cannot_be_read_never_takes_the_list_down(tmp_path: Path) -> None:
+    """Reproduced: expires_at=10**400 raised OverflowError and rec=["a"] / {} raised TypeError out of needs_data, and nothing
+    between it and list_items caught either, so one row failed the whole center list. Each shape now reads as no data and the
+    row draws from its body; a needs_item that raises anyway is caught at the row."""
+    body = "tao: Move the TAO mail to its own domain.\nNo listed options."
+    for over in ({"expires_at": 10 ** 400}, {"rec": ["a"]}, {"rec": {}}):
+        assert center.needs_data(json.dumps(_data("np-b1b1b1b1", None, **over)), "np-b1b1b1b1") is None, over
+    store = PushStore(tmp_path)
+    for over in ({"expires_at": 10 ** 400}, {"rec": ["a"]}, {"rec": {}}):
+        store.add_ping("attention", "np-b1b1b1b1", "levain", body, data=_data("np-b1b1b1b1", None, **over))
+    got = center.list_items(store)
+    assert len(got["items"]) == 3 and all(i["needs"]["from"] == "body" and i["needs"]["repo"] == "tao" for i in got["items"]), got
+    orig = center.needs_item
+    center.needs_item = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        again = center.list_items(store)
+    finally:
+        center.needs_item = orig
+    assert len(again["items"]) == 3 and all(i["needs"]["from"] == "body" for i in again["items"]), again
+
+
+def test_a_lone_surrogate_in_data_drops_the_data_and_keeps_the_ping(tmp_path: Path) -> None:
+    """Reproduced: ensure_ascii=False put the surrogate into the text and sqlite refused the bind, so add_ping raised and the
+    whole ping was lost. The data is what is dropped."""
+    assert data_text({"what": "\ud800"}) is None
+    store = PushStore(tmp_path)
+    pid = store.add_ping("attention", "np-1", "levain", "kept", data={"what": "\ud800"})
+    assert {r["id"]: (r["body"], r["data"]) for r in store.record()} == {pid: ("kept", None)}
+
+
+def test_a_needs_ping_with_no_ref_is_unverified_and_its_rows_are_inert(tmp_path: Path) -> None:
+    """Reproduced: with no ref there was no item to hold the request to, so any open flow-needs request was taken as live."""
+    _file(tmp_path, RID, "np-7121be43")
+    got = center.needs_wire(BODY, tmp_path, None)
+    assert got["sign_state"] == "unverified" and got["sign_id"] is None and got["sign_v"] is None, got
+    d = center.needs_item("x", json.dumps(_data("np-7121be43", RID)), tmp_path, None)
+    assert d["sign_state"] == "unverified" and d["sign_v"] is None, d
+    assert center.needs_wire(BODY, tmp_path, "np-7121be43")["sign_state"] == "open"     # with its ref the same request is live
+
+
+def _plain_file(q: Path, rid: str, item: str) -> None:
+    """An open PLAIN sign request (no ``options`` key), the one readable request that offers no options."""
+    _file(q, rid, item)
+    path = sign.sign_dir(q) / f"{rid}.json"
+    d = json.loads(path.read_text())
+    for k in ("format", "options", "recommended", "write_in"):
+        d.pop(k, None)
+    d["format"] = sign.REQUEST_FORMAT
+    path.write_text(json.dumps(d))
+
+
+def test_an_open_request_that_offers_no_options_leaves_no_live_rows(tmp_path: Path) -> None:
+    """Reproduced: a readable open request with no options kept the push's options, and the rows linked &choice=<key> to keys
+    the sign sheet does not offer."""
+    _plain_file(tmp_path, RID, "np-7121be43")
+    assert sign.read_request(tmp_path, RID).options == ()
+    got = center.needs_wire(BODY, tmp_path, "np-7121be43")
+    assert got["sign_state"] == "unverified" and got["sign_v"] is None, got
+    sid = "np-d4d4d4d4-00000002"
+    _plain_file(tmp_path, sid, "np-d4d4d4d4")
+    d = center.needs_item("x", json.dumps(_data("np-d4d4d4d4", sid)), tmp_path, "np-d4d4d4d4")
+    assert d["sign_state"] == "unverified" and d["sign_v"] is None, d
+    # a request that offers no options for a ping that listed none has no row to mislead: it stays open
+    _plain_file(tmp_path, "np-0a0a0a0a-00000001", "np-0a0a0a0a")
+    none = center.needs_item("x", json.dumps(_data("np-0a0a0a0a", "np-0a0a0a0a-00000001", options=[], rec=None)), tmp_path, "np-0a0a0a0a")
+    assert none["sign_state"] == "open" and none["options"] == [], none

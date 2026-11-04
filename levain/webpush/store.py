@@ -115,14 +115,15 @@ DATA_MAX = 8 * 1024    # bytes of a ping's stored structured fields; the center'
 
 def data_text(data: object) -> str | None:
     """``data`` as the JSON text a ping row keeps, or None when there is none or it is not a JSON object within
-    :data:`DATA_MAX` bytes: a sender's extra fields are dropped before its ping is."""
+    :data:`DATA_MAX` bytes of strict UTF-8 (a lone surrogate cannot be bound by sqlite, so it counts as not storable):
+    a sender's extra fields are dropped before its ping is."""
     if not isinstance(data, dict):
         return None
     try:
         text = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    except (TypeError, ValueError, RecursionError):
+        return text if len(text.encode("utf-8")) <= DATA_MAX else None
+    except (TypeError, ValueError, RecursionError):   # UnicodeEncodeError is a ValueError
         return None
-    return text if len(text.encode("utf-8", "surrogatepass")) <= DATA_MAX else None
 
 
 def now_stamp() -> str:

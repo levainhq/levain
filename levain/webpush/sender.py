@@ -223,7 +223,10 @@ def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body
     STDIN as JSON, so a body that begins with ``-`` is not an option and the consent text never sits in the process
     table. ``data`` is the sender's structured fields (a JSON object; flow's needs fields, levain.webpush.center.needs_data),
     stored with the ping row for the notification center and never put in the push; when the text with it would not fit
-    the child's stdin, ``data`` is what is dropped, before any of the body. True when the child started."""
+    the child's stdin, ``data`` is what is dropped, before any of the body. The two caps count differently: the data cap is
+    UTF-8 bytes of the stored text, but the stdin JSON is ASCII-escaped (``\\uXXXX`` per non-ASCII character), so data heavy
+    in non-ASCII text can pass the first and be dropped by the second; the center then draws the ping from its body.
+    True when the child started."""
     from levain.launch import child_env
 
     fields = {"title": title[:300], "body": body[:4000], "ref": None if ref is None else ref[:200], "url": url[:500],

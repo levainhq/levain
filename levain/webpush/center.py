@@ -255,12 +255,16 @@ def needs_data(raw: object, item: str | None = None) -> dict[str, Any] | None:
     if len({o["key"] for o in opts}) != len(opts):
         return None
     rec, sid, exp, dated = d.get("rec"), d.get("sign_id"), d.get("expires_at"), d.get("dated")
-    if rec is not None and rec not in {o["key"] for o in opts}:
+    if rec is not None and not (isinstance(rec, str) and rec in {o["key"] for o in opts}):
         return None
     if sid is not None and not (request_id_ok(sid) and _ties(iid, sid)):
         return None
-    if exp is not None and (isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp)):
-        return None
+    if exp is not None:
+        try:
+            if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
+                return None
+        except OverflowError:   # an integer too large for a float
+            return None
     if dated is not None and not (isinstance(dated, str) and _DATED.fullmatch(dated)):
         return None
     return {"kind": kind or "", "id": iid, "repo": repo, "what": what, "options": opts, "rec": rec,
@@ -271,6 +275,8 @@ def needs_data(raw: object, item: str | None = None) -> dict[str, Any] | None:
 def _finish(out: dict[str, Any], queue_dir: Path | None, item: str | None, expires_at: float | None = None) -> dict[str, Any]:
     """``out`` with its sign state read from the request it names, the request's own words over the push's, its title."""
     req = None
+    if out["sign_id"] is not None and out["sign_state"] is None and item is None:
+        out["sign_state"], out["sign_id"] = "unverified", None    # a ping with no ref names no item to hold the request to
     if out["sign_id"] is not None and out["sign_state"] is None:
         out["sign_state"], req = _request(queue_dir, out["sign_id"], item)
         if out["sign_state"] == "unknown" and expires_at is not None and expires_at <= time.time():
@@ -286,6 +292,8 @@ def _finish(out: dict[str, Any], queue_dir: Path | None, item: str | None, expir
                 out["rec_reason"] = None
             out["options"] = [{"key": k, "text": t} for k, t in req.options]
             out["rec"] = req.recommended
+        elif out["options"] and out["sign_state"] == "open":
+            out["sign_state"], out["sign_id"] = "unverified", None   # the sign page offers no keys: no row may link a pick
         out["stopped_known"] = True
         if out["sign_state"] == "open":
             out["sign_v"] = req.sha256[:16]     # the version the sign page lists now: a pick holds only on it
@@ -333,6 +341,8 @@ def needs_wire(body: str, queue_dir: Path | None = None, item: str | None = None
         if got is None:
             return None
         out["options"], out["rec"] = got
+        if out["sign_state"] == "open":      # the readable request offered none: the push's keys are not the sign page's
+            out["sign_state"], out["sign_id"], out["sign_v"] = "unverified", None, None
     return out
 
 
@@ -556,7 +566,15 @@ def _ping_item(rd: _Reader, num: int, read: bool, read_at: str | None) -> dict[s
         ref if ref and ref.startswith("question:") else None)
     body = r["body"] or ""
     data = r["data"] if "data" in r.keys() else None
-    needs = needs_item(body, data, rd.queue_dir, ref) if source == "needs" else None
+    needs = None
+    if source == "needs":
+        try:
+            needs = needs_item(body, data, rd.queue_dir, ref)
+        except Exception:  # noqa: BLE001 - one stored row that cannot be read draws from its body, never takes the list down
+            try:
+                needs = needs_wire(body, rd.queue_dir, ref)
+            except Exception:  # noqa: BLE001
+                needs = None
     title = _plain_line(needs["headline"], TITLE_MAX) if needs else _first_line(body, source)
     return {"id": f"p{num}", "origin": "levain", "source": source, "title": title, "body": body, "needs": needs,
             "preview": plain_preview(body), "at": _iso(r["at"]), "priority": "normal", "read": read,
