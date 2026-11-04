@@ -24,17 +24,29 @@ from tests.test_agents_supervise_fire import Ex  # noqa: F401
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
 
-def _rename(rig: Rig, name: str) -> None:
+def _dream_role(rig: Rig) -> None:
     # the executor is read from the role the occurrence's spec pins, so that role (a dream executor) is in the store
     add_role(rig.store, parse_role(ROLES[SPECS["job_push_check"]["role"]["name"]]))
+
+
+def _rename(rig: Rig, name: str) -> None:
+    # rewrites the mutable agents.name row only: that steers the launch-time input hook (which reads the row), but a
+    # RUN reads the signed spec's name and refuses a row that differs (1104-8 F1), so run-path tests sign "dream"
+    _dream_role(rig)
     with rig.store.write() as c:
         c.execute("UPDATE agents SET name = ? WHERE agent_id = ?", (name, rig.agent))
 
 
-def _fire_ready(rig: Rig, name: str):
+def _dream_rig(tmp_path) -> Rig:
+    """A rig whose agent's spec is SIGNED under the name ``dream``, its dream-executor role in the store."""
+    rig = Rig(tmp_path, name="dream")
+    _dream_role(rig)
+    return rig
+
+
+def _fire_ready(rig: Rig):
     oid = rig.claim("k")
-    assert rig.launch(oid).outcome == "launched"
-    _rename(rig, name)
+    assert rig.launch(oid, on_input=None).outcome == "launched"   # the dream's input hook is tested on its own below
     RunJournal(rig.store.directory).start(rig.row(oid)["run_id"], binding_id="bind-0123456789abcdef")
     return oid
 
@@ -42,12 +54,12 @@ def _fire_ready(rig: Rig, name: str):
 def test_a_scheduled_fire_of_the_dream_no_longer_ends_unwired(tmp_path):
     # behaviour: the module entry, run for a dream occurrence with no install facts, builds no run and exits 1 with
     # the row left launched; before the dispatch it exited FIRE_UNWIRED for every agent
-    rig = Rig(tmp_path)
+    rig = _dream_rig(tmp_path)
     rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
     rig.link()
     oid = rig.claim("k")
-    assert rig.launch(oid).outcome == "launched"
-    _rename(rig, "dream")        # launched under the stub's name: the dream's own launch needs its install (below)
+    # launched with no input check: the dream's own input hook needs its install (below)
+    assert rig.launch(oid, on_input=None).outcome == "launched"
     proc = ctl.spawn_fire(rig.store.directory, oid, env=ENV)
     assert proc.wait(60) == 1
     assert rig.row(oid)["state"] == "launched" and rig.row(oid)["pid"] == proc.pid
@@ -61,11 +73,12 @@ def test_an_agent_with_no_run_body_still_refuses_unwired(tmp_path):
     assert ctl.spawn_fire(rig.store.directory, oid, env=ENV).wait(60) == ctl.FIRE_UNWIRED
 
 
-def test_the_dream_occurrence_reaches_its_executor_once_and_ends_done(rig, tmp_path, monkeypatch):
+def test_the_dream_occurrence_reaches_its_executor_once_and_ends_done(tmp_path, monkeypatch):
     # behaviour: run_agent resolves the dream's body by the executor its role pins; the body builds run_body's arguments from the
     # install, runs the one consolidate under the supervisor, and the row ends done
+    rig = _dream_rig(tmp_path)
     rig.link()
-    oid = _fire_ready(rig, "dream")
+    oid = _fire_ready(rig)
     calls = []
 
     def factory(store, occurrence_id, epoch):
@@ -82,15 +95,19 @@ def test_the_dream_occurrence_reaches_its_executor_once_and_ends_done(rig, tmp_p
     assert calls == [oid] and rig.row(oid)["state"] == "done"
 
 
-def test_run_agent_reads_the_executor_from_the_row_and_an_unknown_one_refuses_unwired(rig, capsys):
+def test_run_agent_reads_the_executor_from_the_row_and_an_unknown_one_refuses_unwired(rig, tmp_path, capsys):
     seen = []
     oid = rig.claim("k")
     bodies = {"someone-else": lambda: (lambda s, o, e: seen.append(o) or 0)}
     assert ctl.run_agent(rig.store, oid, 0, bodies=bodies) == ctl.FIRE_UNWIRED and seen == []
     add_role(rig.store, parse_role(ROLES["notify-role"]))         # a dream executor: the name is no longer consulted
     assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": bodies["someone-else"]}) == ctl.FIRE_UNWIRED
-    _rename(rig, "dream")
-    assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": bodies["someone-else"]}) == 0 and seen == [oid]
+    _rename(rig, "dream")                                          # the row alone: the signed name still differs
+    assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": bodies["someone-else"]}) == ctl.FIRE_UNWIRED and seen == []
+    (tmp_path / "signed").mkdir()
+    dream = _dream_rig(tmp_path / "signed")                        # signed "dream": the dream's body runs
+    signed = dream.claim("k")
+    assert ctl.run_agent(dream.store, signed, 0, bodies={"dream": bodies["someone-else"]}) == 0 and seen == [signed]
     assert ctl.run_agent(rig.store, "oc-" + "0" * 32, 0, bodies=bodies) == ctl.FIRE_UNWIRED
     assert "no run body is wired" in capsys.readouterr().err
 
@@ -200,12 +217,11 @@ def test_enable_with_a_store_dir_writes_the_facts_a_fire_then_gets_past(tmp_path
 def test_a_fire_with_the_enabled_facts_gets_past_install_to_its_next_refusal(tmp_path):
     # behaviour: with the facts file `dream enable` writes, the fire no longer ends on the missing install; whatever
     # it meets next is named in its log (no Opus compose runs: the facts file's exposure check refuses first)
-    rig = Rig(tmp_path)
+    rig = _dream_rig(tmp_path)
     rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
     rig.link()
     oid = rig.claim("k")
-    assert rig.launch(oid).outcome == "launched"
-    _rename(rig, "dream")
+    assert rig.launch(oid, on_input=None).outcome == "launched"
     da.write_install(rig.store.directory, **_facts(tmp_path))
     proc = ctl.spawn_fire(rig.store.directory, oid, env=ENV)
     code = proc.wait(60)

@@ -58,7 +58,7 @@ from levain.authority import _canonical
 
 __all__ = ["AgentMoved", "SpecError", "SPEC_FIELDS", "parse_spec", "parse_spec_text", "load_json", "finalize_spec", "spec_hash",
            "canonical_spec", "register_spec", "register_specs", "mint_agent_id", "find_revert", "list_agents", "get_agent", "set_operation", "retire_agent",
-           "resolve_agent", "feeder_group", "stored_specs", "can_fire"]
+           "resolve_agent", "feeder_group", "stored_specs", "occurrence_spec", "can_fire"]
 
 SPEC_HASH_PREFIX = b"levain-agentspec/1\n"
 SPEC_FIELDS = ("name", "role", "input", "output", "win", "trigger", "stop_at", "overlap", "missed", "on_failure",
@@ -338,6 +338,21 @@ def _check_row(agent_id: str, name: str, digest: str, text: Any) -> dict[str, An
     if spec_hash(agent_id, spec) != digest or _canonical(spec) != text:
         raise SpecError(f"agent {agent_id}: the stored spec does not hash to its spec_hash")
     return spec
+
+
+def occurrence_spec(store: AgentStore, occurrence_id: str) -> dict[str, Any]:
+    """The spec an occurrence launched under, through the full row check (:func:`_check_row`): its text re-hashes to
+    the occurrence's ``spec_hash`` in canonical form AND the name it was signed under is the agent row's. Every
+    reader that acts on an occurrence's name, role or memory takes them from here, never from the mutable row.
+    Raises :class:`SpecError` naming why (a missing occurrence included)."""
+    with store.read() as conn:
+        row = conn.execute("SELECT o.agent_id, a.name, o.spec_hash, s.spec FROM agent_occurrences o"
+                           " JOIN agents a ON a.agent_id = o.agent_id"
+                           " LEFT JOIN agent_specs s ON s.spec_hash = o.spec_hash WHERE o.occurrence_id = ?",
+                           (occurrence_id,)).fetchone()
+    if row is None:
+        raise SpecError(f"occurrence {occurrence_id} is not in the agent store")
+    return _check_row(*row)
 
 
 def stored_specs(store: AgentStore) -> dict[str, dict[str, Any]]:

@@ -105,11 +105,16 @@ class KeyedStub(Stub):
         return Usage(None, None, None, "stub:no-record")
 
 
-def _occurrence(rig: Rig, *, billing="api_key", exposure=EXP, micros=100_000, role=None):
+def _occurrence(rig: Rig, *, billing="api_key", exposure=EXP, micros=100_000, role=None, name=None, memory=None):
     """A launched occurrence of a ``session`` role agent: its reservation carries ``billing``'s caps (``exposure``
-    on a subscription, ``micros`` on an api_key run); its spec pins ``role`` (default ROLE)."""
+    on a subscription, ``micros`` on an api_key run); its spec pins ``role`` (default ROLE) and is signed under
+    ``name`` and ``memory`` when given (default the fixture's own)."""
     d = copy.deepcopy(SPECS["job_feeder_downstream"])
     d["role"]["role_hash"] = role_hash(ROLE if role is None else role)
+    if name is not None:
+        d["name"] = name
+    if memory is not None:
+        d["memory"] = memory
     agent, spec_hash, *_ = register_spec(rig.store, parse_spec(d), "America/New_York")
     rig.n += 1
     over = SUB if billing == "subscription" else {}
@@ -121,7 +126,9 @@ def _occurrence(rig: Rig, *, billing="api_key", exposure=EXP, micros=100_000, ro
                                  window_key="m:2026-10-25", now=rig.now())
     assert outcome == ctl.CLAIMED
     ex = ApiExec(0, exposure) if billing == "subscription" else ApiExec(micros)
-    res = ctl.launch(rig.store, oid, authority=rig.authority, executor=ex, window=WINDOW, now=rig.now())
+    # a session agent has no input hook; None says so explicitly, so a spec signed "dream" (the S1 name tests) is not
+    # given the dream's hook at launch
+    res = ctl.launch(rig.store, oid, authority=rig.authority, executor=ex, window=WINDOW, now=rig.now(), on_input=None)
     assert res.outcome == "launched", res
     return oid
 

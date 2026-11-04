@@ -1380,42 +1380,34 @@ def _session_body() -> RunBody:
 RUN_BODIES: dict[str, Callable[[], RunBody]] = {DREAM: _dream_body, "session": _session_body}
 
 
-def _pinned_executor(store: AgentStore, occurrence_id: str) -> tuple[str | None, str | None]:
-    """``(agent name, executor)`` for an occurrence: the executor of the role its own signed spec pins. The spec text
-    is trusted only when it re-hashes to the occurrence's ``spec_hash`` in canonical form; an unreadable row, spec or
-    role has no executor (None), never a guess."""
+def _pinned_executor(store: AgentStore, occurrence_id: str) -> tuple[str | None, str | None, str]:
+    """``(agent name, executor, why)`` for an occurrence: the name its own SIGNED spec carries and the executor of
+    the role that spec pins, both read through :func:`levain.agents.spec.occurrence_spec` (re-hashed, and refused when
+    the mutable ``agents.name`` row differs from the signed name). Anything unreadable has no executor (None), with
+    ``why`` naming it, never a guess."""
     from levain.agents import role as _role, spec as _spec
     try:
-        with store.read() as conn:
-            row = conn.execute("SELECT a.name, o.agent_id, o.spec_hash, s.spec FROM agent_occurrences o"
-                               " JOIN agents a ON a.agent_id = o.agent_id"
-                               " JOIN agent_specs s ON s.spec_hash = o.spec_hash WHERE o.occurrence_id = ?",
-                               (occurrence_id,)).fetchone()
-        if row is None:
-            return None, None
-        name = row[0]
-        if not isinstance(row[3], str):
-            return name, None
-        spec = _spec.parse_spec_text(row[3])
-        if _spec.spec_hash(row[1], spec) != row[2] or _spec.canonical_spec(spec) != row[3]:
-            return name, None
-        pinned = (spec.get("role") or {}).get("role_hash")
-        role = _role.role_by_hash(store, pinned) if isinstance(pinned, str) else None
-    except Exception:  # noqa: BLE001 - an unreadable row signs nothing; the caller refuses unwired
-        return None, None
+        spec = _spec.occurrence_spec(store, occurrence_id)
+        role = _role.role_by_hash(store, spec["role"]["role_hash"])
+    except _spec.SpecError as exc:
+        return None, None, f"its signed spec is refused: {exc}"
+    except Exception as exc:  # noqa: BLE001 - an unreadable row signs nothing; the caller refuses unwired
+        return None, None, f"its row, spec or pinned role is unreadable ({type(exc).__name__})"
     executor = None if role is None else role.get("executor")
-    return name, executor if isinstance(executor, str) else None
+    if not isinstance(executor, str):
+        return spec["name"], None, "its pinned role is unreadable (not in the store, or no executor)"
+    return spec["name"], executor, ""
 
 
 def run_agent(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
               bodies: Mapping[str, Callable[[], RunBody]] | None = None) -> int:
     """The fire's run body: the one registered for the executor of the role the occurrence's signed spec pins
     (:data:`RUN_BODIES`), else :func:`_unwired_run` naming why. The executor is read from the occurrence's own row,
-    never from the fire's command line or the agent's name. The dream's body also needs the reserved name, so a
-    dream-executor role under any other name ends unwired."""
-    name, executor = _pinned_executor(store, occurrence_id)
+    never from the fire's command line or the agent's name. The dream's body also needs the reserved name, signed in
+    the spec, so a dream-executor role under any other name ends unwired."""
+    name, executor, why = _pinned_executor(store, occurrence_id)
     if executor is None:
-        return _unwired_run(store, occurrence_id, launch_epoch, "its row, spec or pinned role is unreadable")
+        return _unwired_run(store, occurrence_id, launch_epoch, why)
     if executor == "dream" and name != DREAM:
         return _unwired_run(store, occurrence_id, launch_epoch,
                             f"the dream executor runs only the agent named {DREAM!r}, not {name!r}")

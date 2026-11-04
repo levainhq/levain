@@ -12,20 +12,25 @@ from levain.agents import controller as ctl
 from levain.agents import refuse, session as S
 from levain.agents.role import add_role, parse_role, role_hash
 from levain.agents.spec import parse_spec
-from tests.test_agents_launch import ROLES, SPECS
+from tests.test_agents_launch import ROLES, SPECS, Rig
 from tests.test_agents_session_launch import ROLE, Stub, _occurrence, _sup, rig  # noqa: F401
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
 
-def _session_occurrence(rig, name="research-bot"):
-    """A launched occurrence of a session-executor agent called ``name``, its pinned role registered in the store."""
-    oid = _occurrence(rig)
+def _session_occurrence(rig, name="research-bot", **kw):
+    """A launched occurrence of a session-executor agent whose spec is SIGNED under ``name``, its pinned role
+    registered in the store."""
+    oid = _occurrence(rig, name=name, **kw)
     add_role(rig.store, parse_role(ROLE))
+    return oid
+
+
+def _rename_row(rig, oid, name):
+    """Rewrite the mutable ``agents.name`` row under a signed spec (a store writer's move): the run must not follow."""
     with rig.store.write() as c:
         c.execute("UPDATE agents SET name = ? WHERE agent_id = (SELECT agent_id FROM agent_occurrences"
                   " WHERE occurrence_id = ?)", (name, oid))
-    return oid
 
 
 def _factory(rig, oid, launcher):
@@ -83,17 +88,49 @@ def test_a_pinned_role_that_is_not_in_the_store_has_no_executor(rig, capsys):
     assert "is unreadable" in capsys.readouterr().err
 
 
-def test_the_dream_stays_reachable_by_its_own_executor(rig):
-    # a dream-executor role under the name "dream" gets the dream's body
+def test_the_dream_stays_reachable_by_its_own_executor(tmp_path):
+    # a dream-executor role (notify-role) signed under the name "dream" gets the dream's body
     seen = []
-    d = copy.deepcopy(SPECS["job_push_check"])      # notify-role: a dream executor
-    d["role"]["role_hash"] = role_hash(ROLES[d["role"]["name"]])
+    rig = Rig(tmp_path, name="dream")
     add_role(rig.store, parse_role(ROLES["notify-role"]))
+    oid = rig.claim("k")
+    assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": lambda: (lambda s, o, e: seen.append(o) or 0)}) == 0
+    assert seen == [oid]
+
+
+# --- 1104-8 F1: the name is the SIGNED spec's, never the mutable agents.name row ------------------------------------
+
+def test_a_row_renamed_dream_over_a_signed_non_dream_spec_does_not_run_the_dream(rig, capsys):
+    # reproduced first on 451b197c: the dream body ran (the name was read from agents.name)
+    add_role(rig.store, parse_role(ROLES["notify-role"]))     # the rig's spec pins this dream-executor role
     oid = rig.claim("k")
     with rig.store.write() as c:
         c.execute("UPDATE agents SET name = 'dream' WHERE agent_id = ?", (rig.agent,))
-    assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": lambda: (lambda s, o, e: seen.append(o) or 0)}) == 0
-    assert seen == [oid]
+    seen = []
+    assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": lambda: (lambda s, o, e: seen.append(o) or 0)}) \
+        == ctl.FIRE_UNWIRED and seen == []
+    err = capsys.readouterr().err
+    assert "its signed spec is refused" in err and "the stored spec names 'job_push_check', not 'dream'" in err
+
+
+def test_a_dream_spec_under_another_row_name_does_not_run_as_a_session(rig, monkeypatch, capsys):
+    # reproduced first on 451b197c: a spec signed "dream" pinning a session role, its row renamed, ran as a session
+    oid = _session_occurrence(rig, name="dream")
+    _rename_row(rig, oid, "research-bot")
+    launcher = Stub()
+    monkeypatch.setattr(ctl, "SESSION_FACTORY", _factory(rig, oid, launcher))
+    assert ctl.run_agent(rig.store, oid, rig.row(oid)["launch_epoch"]) == ctl.FIRE_UNWIRED
+    assert launcher.launches == [] and rig.row(oid)["state"] == "launched"
+    assert "the stored spec names 'dream', not 'research-bot'" in capsys.readouterr().err
+
+
+def test_a_renamed_session_row_does_not_run_either(rig, monkeypatch):
+    oid = _session_occurrence(rig)
+    _rename_row(rig, oid, "someone-else")
+    launcher = Stub()
+    monkeypatch.setattr(ctl, "SESSION_FACTORY", _factory(rig, oid, launcher))
+    assert ctl.run_agent(rig.store, oid, rig.row(oid)["launch_epoch"]) == ctl.FIRE_UNWIRED
+    assert launcher.launches == []
 
 
 def test_a_dream_executor_under_another_name_ends_unwired(rig, capsys):
