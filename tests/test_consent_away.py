@@ -458,3 +458,30 @@ def test_the_recheck_reads_the_holds_own_queue_directory(qdir, tmp_path):
     elsewhere.mkdir()
     with pytest.raises(AssertionError):
         cc.still_away_from(elsewhere / cc.SETTINGS_NAME, s, queue=queue)
+
+
+def _force_away(monkeypatch, on: bool) -> None:
+    real = cc.effective_away
+    monkeypatch.setattr(cc, "effective_away", lambda got, **kw: (on, "test", "test") if True else real(got, **kw))
+
+
+def test_show_fails_plainly_when_the_configured_cockpit_root_does_not_exist(tmp_path, capsys, monkeypatch):
+    _force_away(monkeypatch, True)
+    qdir = _queue(tmp_path, tmp_path / "no-such-cockpit")
+    assert main(["consent", "away", "show", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL: the configured cockpit_data_root" in out and "does not exist" in out and "no-such-cockpit" in out
+
+
+def test_show_does_not_fail_when_away_is_off_and_fails_when_the_root_is_a_file(tmp_path, capsys, monkeypatch):
+    """L3 r1 (complement, codex, deepseek): the FAIL is for an away mode that would hold, and is_dir like the hook."""
+    _force_away(monkeypatch, False)
+    qdir = _queue(tmp_path, tmp_path / "no-such-cockpit")
+    assert main(["consent", "away", "show", "--agent", "claude_code", "--queue-dir", str(qdir)]) == 0
+    assert "FAIL" not in capsys.readouterr().out
+    afile = tmp_path / "a-file"
+    afile.write_text("x")
+    qdir2 = _queue(tmp_path / "two", afile) if (tmp_path / "two").mkdir() is None else None
+    _force_away(monkeypatch, True)
+    assert main(["consent", "away", "show", "--agent", "claude_code", "--queue-dir", str(qdir2)]) == 1
+    assert "FAIL" in capsys.readouterr().out
