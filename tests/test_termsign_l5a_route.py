@@ -986,3 +986,129 @@ def test_a_store_error_before_any_prompt_leaves_the_request_free_to_retry(store,
     got, status = _text(store, keydir, request, factory=calls, state=state)
     assert status == 200 and got["signed"] and calls.n == 1, got
     assert answers(store) == [(q.id, "ship")]
+
+
+# --- L5b r1 R3-R6: the badge reader's deadline, claims, cache and inputs -------------------------------------------
+
+@pytest.mark.parametrize("slow", ["find_key", "answer_sign_of"])
+def test_a_slow_key_lookup_or_store_read_never_holds_the_render_past_its_deadline(rig, store, keydir, monkeypatch,
+                                                                                 slow):
+    """R3: the key lookup and each row's stored-signature read run under the deadline, not before it."""
+    import time
+
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    release = threading.Event()
+    target = (ts, "find_key") if slow == "find_key" else (band_view, "answer_sign_of")
+    real = getattr(*target)
+
+    def held(*a, **kw):
+        release.wait(10)
+        return real(*a, **kw)
+    monkeypatch.setattr(*target, held)
+    band_view._badge_cache.clear()
+    try:
+        t0 = time.monotonic()
+        got = band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=lambda pk: (True, "bio"),
+                                      deadline=time.monotonic() + 0.3)
+        took = time.monotonic() - t0
+    finally:
+        release.set()
+    assert took < 1.0 and got == {}, (took, got)
+    assert _wait_until(lambda: not band_view._badge_inflight)
+
+
+def test_a_worker_that_fails_before_its_first_row_frees_every_claim(rig, store, keydir, monkeypatch):
+    """R4: a raise outside the per-row try (here the shared CTK wrapper) leaves no row claimed for later renders."""
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    real = band_view._shared_ctk
+    calls = {"n": 0}
+
+    def once(ctk):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("the wrapper fell over")
+        return real(ctk)
+    monkeypatch.setattr(band_view, "_shared_ctk", once)
+    band_view._badge_cache.clear()
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    assert band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=ok) == {}
+    assert _wait_until(lambda: not band_view._badge_inflight)
+    assert band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=ok) == {q.id: "signed: Touch ID, laptop (desk)"}
+
+
+def test_a_claim_held_past_its_bound_is_free_for_the_next_render(rig, store, keydir, monkeypatch):
+    """R4: a verifier that hangs keeps its row from a second verifier only for _BADGE_CLAIM_S."""
+    import time
+
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    monkeypatch.setattr(band_view, "_BADGE_CLAIM_S", 0.2, raising=False)
+    hang = threading.Event()
+
+    def hung(pk):
+        hang.wait(10)
+        return True, "bio"
+    band_view._badge_cache.clear()
+    try:
+        assert band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=hung,
+                                       deadline=time.monotonic() + 0.05) == {}
+        time.sleep(0.3)
+        got = band_view.answer_badges(store, [q.id], key_dir=keydir, ctk=lambda pk: (True, "bio"))
+    finally:
+        hang.set()
+    assert got == {q.id: "signed: Touch ID, laptop (desk)"}
+    assert _wait_until(lambda: not band_view._badge_inflight)       # the late worker never frees the new claim twice
+
+
+def test_two_workers_evicting_at_once_never_lose_a_verdict_or_overfill_the_cache(rig, store, keydir, monkeypatch):
+    """R5: with a full cache, two verifiers that would both pick the same oldest key (held together at the
+    selection) both keep their verdict, and the cache stays within its bound."""
+    q1, q2 = file_q(store, "First?"), file_q(store, "Second?")
+    rig(body(q1, txn="txn-evict-01"), factory=Calls())
+    rig(body(q2, txn="txn-evict-02"), factory=Calls())
+    meet = threading.Barrier(2)
+
+    class Racing(dict):
+        def __iter__(self):
+            picked = list(super().__iter__())       # the selection is made here, before the two meet
+            try:
+                meet.wait(1.0)          # both evictors hold the same oldest key at once, unless a lock keeps one out
+            except threading.BrokenBarrierError:
+                pass
+            return iter(picked)
+    full = Racing({("q-old", str(i)): "" for i in range(band_view._BADGE_CACHE_MAX)})
+    monkeypatch.setattr(band_view, "_badge_cache", full)
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    got: dict = {}
+
+    def one(q):
+        got[q.id] = band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok)
+    ts_ = [threading.Thread(target=one, args=(q,)) for q in (q1, q2)]
+    for t in ts_:
+        t.start()
+    for t in ts_:
+        t.join(20)
+    assert got == {q1.id: "signed: Touch ID, laptop (desk)", q2.id: "signed: Touch ID, laptop (desk)"}, got
+    assert len(full) <= band_view._BADGE_CACHE_MAX
+
+
+def test_one_origin_given_as_a_string_is_one_origin(rig, store, keydir):
+    """R6: a str is one origin, never its letters."""
+    q = file_q(store)
+    rig(body(q), factory=Calls())
+    band_view._badge_cache.clear()
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=lambda pk: (True, "bio"),
+                                  origins=ORIGIN) == "signed: Touch ID, laptop (desk)"
+
+
+def test_an_installed_port_of_non_ascii_digits_leaves_the_default_origins(monkeypatch):
+    """R6 (same class): a unit naming a Unicode-digit port is no port, never a raise out of the origins."""
+    from levain import daemon
+
+    class _P:
+        def installed_argv(self, label):
+            return ["levain", "serve", "--port", "١٢٣"]
+    monkeypatch.setattr(daemon, "select_provider", lambda: _P())
+    assert band_view._installed_cockpit_port() is None
