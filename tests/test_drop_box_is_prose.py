@@ -85,3 +85,12 @@ def test_no_drop_box_sits_in_a_form_that_a_name_could_submit():
     for fname in sorted(p.name for p in WEB.glob("*.js")):
         src = (WEB / fname).read_text()
         assert "FormData" not in src and "getElementsByName" not in src and ".elements[" not in src, fname
+
+
+def test_the_room_text_boxes_are_prose_with_dash_free_names():
+    """RM-H: the room's draft box and a proposal card's words are Drop-class boxes too (the full pin is tests/test_room_phone.py)."""
+    js = (WEB / "room_view.js").read_text()
+    assert 'prose(ta, "roomdraft")' in js and 'prose(ta, "roomcardwords")' in js
+    block = js[js.index("function prose("):][:400]
+    for k, v in PROSE.items():
+        assert f'["{k}", "{v}"]' in block, k

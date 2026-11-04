@@ -91,6 +91,11 @@
     if (text != null) n.textContent = text;
     return n;
   }
+  // ordinary prose for the phone's keyboard (autocorrect, the dictation key); a dash-free name keeps Safari's AutoFill off it
+  function prose(node, name) {
+    [["name", name], ["autocapitalize", "sentences"], ["autocorrect", "on"], ["spellcheck", "true"], ["inputmode", "text"], ["autocomplete", "off"]]
+      .forEach(function (kv) { node.setAttribute(kv[0], kv[1]); });
+  }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
   // hooks: onMark(ref, delivered, note, done), onCommit(card, words, note, buttons), onDismiss(card, note, buttons); ui.open keyed by gseq
@@ -140,6 +145,7 @@
     card.appendChild(el(doc, "div", "rv-note", c.state === "expired" ? "This card is from an earlier conversation and cannot be sent." : "The room can drop this to the desk. Nothing is sent until you tap."));
     var ta = el(doc, "textarea", "rv-cardwords");
     ta.setAttribute("rows", "3"); ta.setAttribute("aria-label", "The words to drop");
+    prose(ta, "roomcardwords");
     ta.value = own(drafts, c.id) ? drafts[c.id] : c.words;     // an edit survives a redraw
     ta.addEventListener("input", function () { drafts[c.id] = ta.value; });
     card.appendChild(ta);
@@ -172,6 +178,9 @@
     var headers = opts.headers || function () { return {}; };
     var pollMs = opts.pollMs == null ? 2000 : opts.pollMs;
     var Speech = opts.speech === undefined ? (root.SpeechRecognition || root.webkitSpeechRecognition) : opts.speech;
+    // Dictation is on-device or absent: a browser whose recognizer cannot be told to stay local (it would send the audio to
+    // the browser vendor's cloud) gets no control, and the keyboard's own dictation key fills the draft box instead.
+    if (Speech && !(Speech.prototype && "processLocally" in Speech.prototype)) Speech = null;
     var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
     var stopped = false, timer = 0, last = "", thread = null, current = null, ui = { open: {} }, drafts = {};
     var wrap = el(doc, "div", "rv"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock");
@@ -180,6 +189,7 @@
       sendB = el(doc, "button", "rv-send", "Send"), dropB = el(doc, "button", "rv-drop", "Drop"),
       stopB = el(doc, "button", "rv-stop", "Stop"), note = el(doc, "div", "rv-sendnote");
     ta.setAttribute("rows", "3"); ta.setAttribute("aria-label", "Message to the room");
+    prose(ta, "roomdraft");
     [sendB, dropB, stopB].forEach(function (b) { b.setAttribute("type", "button"); });
     note.setAttribute("role", "status");
     actions.appendChild(sendB); actions.appendChild(dropB); actions.appendChild(stopB);
@@ -187,7 +197,7 @@
     if (Speech) {
       micB = el(doc, "button", "rv-mic", "Dictate");
       micB.setAttribute("type", "button");
-      micB.setAttribute("title", "Your browser's own speech service hears this, only while this page is open");
+      micB.setAttribute("title", "Heard on this device only, and only while this page is open");
       actions.appendChild(micB);
     }
     var rotB = null;
@@ -271,7 +281,7 @@
       micB.addEventListener("click", function () {
         if (rec) { rec.stop(); return; }
         var r = new Speech(), base = ta.value ? ta.value.replace(/\s*$/, " ") : "";
-        r.interimResults = true; r.continuous = false;
+        r.interimResults = true; r.continuous = false; r.processLocally = true;
         r.onresult = function (ev) {
           var t = "";
           for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
@@ -279,7 +289,10 @@
           try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ }
         };
         r.onend = function () { rec = null; micB.textContent = "Dictate"; };
-        r.onerror = function () { rec = null; micB.textContent = "Dictate"; };
+        r.onerror = function (ev) {
+          rec = null; micB.textContent = "Dictate";
+          note.textContent = ev && ev.error === "language-not-supported" ? "On-device dictation is not installed for this language; the keyboard's dictation key works here." : "Dictation stopped.";
+        };
         rec = r; micB.textContent = "Stop dictating";
         try { r.start(); } catch (e) { rec = null; micB.textContent = "Dictate"; }
       });
