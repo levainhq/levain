@@ -109,7 +109,8 @@ _DROP_KEYS = frozenset({"words", "outbox_id", "sent_at", "store_id"})
 _ENVELOPE_KEYS = frozenset({"body_text", "payload", "authenticator_data", "client_data_json", "signature"})
 _REVIEW_KEYS = frozenset({"words", "outbox_id", "spec", "signer_fp", "store_id"})
 _CHALLENGE_KEYS = frozenset({"review_id"})
-_ACTIONS = ("drop", "envelope-review", "envelope-challenge")
+_ACTIONS = ("drop", "envelope-review", "envelope-challenge", "draft-cards", "draft-rule", "draft-withdraw",
+            "draft-review", "draft-challenge", "draft-accept")   # the draft-* half: levain.coordinator.draft_sign
 # a reviewed body is kept this long for its Sign, and at most this many at once (oldest dropped first)
 REVIEW_TTL = timedelta(minutes=15)
 REVIEWS_KEPT = 32
@@ -149,6 +150,7 @@ class CoordPhone:
         self._launcher = launch_session if launcher is None else launcher
         self._lock = threading.Lock()
         self._reviews: dict[str, dict[str, Any]] = {}
+        self._draft_reviews: dict[str, dict[str, Any]] = {}          # H1-3: a draft's kept review (draft_sign)
         self._wakes: list[threading.Thread] = []
 
     # --- the store ---------------------------------------------------------------------------------------------------
@@ -353,6 +355,7 @@ class CoordPhone:
         from levain.consent.passkey import PasskeyError
         from levain.consent.sign import SignRefused
         from levain.coordinator.envelope import EnvelopeError
+        from levain.coordinator.envelope_drafts import DraftStale
         from levain.coordinator.envelopes import EnvelopeConflict, EnvelopeStale
         from levain.coordinator.store import CoordError, DropConflict
         from levain.dispatch.cli import CockpitUnnamed
@@ -367,11 +370,17 @@ class CoordPhone:
             raise CoordRefused(400, "bad_request", "the request is a JSON object")
         not_done = "the drop was not delivered" if action == "drop" else "nothing was signed"
         try:
+            if action.startswith("draft-"):
+                from levain.coordinator import draft_sign
+
+                return draft_sign.handle(self, action, req, device)
             if action == "envelope-review":
                 return self._review(req, device)
             if action == "envelope-challenge":
                 return self._challenge(req, device)
             return self._drop(req)
+        except DraftStale as exc:
+            raise CoordRefused(409, "draft_stale", f"{exc}: nothing was signed or changed") from None
         except (DropConflict, EnvelopeConflict) as exc:
             raise CoordRefused(409, "conflict", f"{exc}: {not_done}") from None
         except EnvelopeStale as exc:

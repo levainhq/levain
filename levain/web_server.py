@@ -795,10 +795,11 @@ class DispatchSheet:
 # ONESURFACE OS-2, the coordinator drop family: a drop (words, optionally with an envelope signed by a passkey) sent from the
 # cockpit, through the phone port's OWN class (levain.coordinator.phone.CoordPhone, the very object phone_server builds), over
 # the Signer's queue (the dispatch directory IS the consent directory), rpId, keys and pinned page. GET /cockpit/coord/drops.json
-# is the sheet's read (the phone's coord_* listing keys), POST /cockpit/coord/{drop,envelope-review,envelope-challenge} the
-# phone's /coord/<action> by name, behind the sign routes' gate exactly, and GET /sign/drop the sheet's page, whose envelope
+# is the sheet's read (the phone's coord_* listing keys), POST /cockpit/coord/<action> (the drop and envelope actions, and the draft-* sign flow of
+# levain.coordinator.draft_sign) the phone's /coord/<action> by name, behind the sign routes' gate exactly, and GET /sign/drop the sheet's page, whose envelope
 # signing is the sign sheet's own passkey ceremony. Served beside a Signer only; else every path here is 404.
-_COORD_ACTIONS = ("drop", "envelope-review", "envelope-challenge")
+_COORD_ACTIONS = ("drop", "envelope-review", "envelope-challenge", "draft-cards", "draft-rule", "draft-withdraw",
+                  "draft-review", "draft-challenge", "draft-accept")
 _COORD_PREFIX = "/cockpit/coord/"
 _COORD_LIST = "/cockpit/coord/drops.json"
 _COORD_SHEET = "/sign/drop"
@@ -858,9 +859,10 @@ class CoordSheet:
         """``POST /cockpit/coord/<action>``: :meth:`CoordPhone.step`'s reply (a challenge's also carries ``line``, the exact
         text signed). :class:`levain.coordinator.phone.CoordRefused` with the phone port's status, word and words."""
         from levain.coordinator import envelope as env
+        from levain.coordinator.draft_sign import SIGNING
         from levain.coordinator.phone import CoordRefused
 
-        signs = action in ("envelope-review", "envelope-challenge") or (
+        signs = action in ("envelope-review", "envelope-challenge", *SIGNING) or (
             action == "drop" and isinstance(req, dict) and req.get("envelope") is not None)
         problem = self.elsewhere() if signs else None
         if problem is not None:
@@ -876,7 +878,7 @@ class CoordSheet:
             with self._gate:
                 self._running -= 1
                 self._gate.notify_all()
-        if action == "envelope-challenge":
+        if action in ("envelope-challenge", "draft-challenge"):
             out["line"] = env.sign_message(out["payload"]).decode("utf-8")
         return out
 
@@ -4040,7 +4042,7 @@ class _Handler(GuardedHandler):
         waits = ((consent is not None and consent[1] in ("answer", "rule"))
                  or (dispatch is not None and dispatch[1] in ("answer", "cancel", "authorise"))
                  # a drop carrying a signed envelope holds a ceremony the person just made, as on the phone port
-                 or (coord is not None and coord == "drop")
+                 or (coord is not None and coord in ("drop", "draft-accept"))
                  or (sign is not None and sign[1] == "attempt"))
         if not (self.server.request_gate.acquire(timeout=5) if waits
                 else self.server.request_gate.acquire(blocking=False)):
