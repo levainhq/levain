@@ -265,7 +265,7 @@ LAZY_SITES = {
     'levain/slot/wall.py::macos_egress_ready::from levain.slot.pf import ANCHOR, IFCONFIG, PFCTL': 'root',
     'levain/slot/wall.py::stage_main::from levain.slot.keyring_join import join_session_keyring, real_keyctl': 'root',
     # --- what the queue broker (``levain.slot.services.qbroker``) brings into the closure ---
-    # operator: ``git grep -n '\.principal\b' -- levain`` finds it read in ``levain/cli.py``, ``levain/phone_app.py`` and ``levain/cockpit/{broker,engine,keys,labels,sign_client}.py`` only (engine's in a ``Cockpit`` panel)
+    # operator: ``git grep -n '\.principal\b' -- levain`` finds it read in ``levain/cli.py`` and ``levain/cockpit/{broker,engine,keys,labels,sign_client}.py`` only (engine's in a ``Cockpit`` panel)
     'levain/authority.py::AuthorityKey.principal::from levain.cockpit.keys import principal_of': 'operator',
     # operator: the authority replay (``_step`` <- ``_replay_entry`` <- ``snapshot``, run by ``consent.queue.AuthoritySource`` and ``cockpit.authority.RequestAuthority.capture``); the queue broker builds its ``AuthoritySnapshot`` from published signers (``qbroker.grants.contract_authority``) and runs neither (``git grep -n -e 'snapshot(' -e 'authority_source' -e 'RequestAuthority(' -- levain/qbroker`` finds none)
     'levain/authority.py::_enrolled_key::from levain.cockpit.keys import KeyError_, fingerprint_of, normalise_public_key': 'operator',
@@ -349,7 +349,7 @@ LAZY_SITES = {
     # operator: <- ``Cockpit._compose_decisions`` only; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``
     'levain/cockpit/engine.py::_note_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
     'levain/cockpit/engine.py::_question_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
-    # operator: <- ``CockpitDB._ensure_schema_txn`` <- ``_ensure_schema``; ``CockpitDB(`` is constructed in ``levain/cli.py``, ``cockpit/{broker,keys,sign_client}.py`` and ``phone_app.py`` only (``git grep -n 'CockpitDB(' -- levain``)
+    # operator: <- ``CockpitDB._ensure_schema_txn`` <- ``_ensure_schema``; ``CockpitDB(`` is constructed in ``levain/cli.py`` and ``cockpit/{broker,keys,sign_client}.py`` only (``git grep -n 'CockpitDB(' -- levain``)
     'levain/cockpit/firejournal.py::_take_store_lock::from levain.cockpit.broker import LOCK_NAME': 'operator',
     # operator: a ``FACETS`` validator, run by ``validate_facets``, whose one caller is ``levain/cockpit/engine.py`` (the ``Cockpit``)
     'levain/cockpit/registry.py::_is_sign_facet::from levain.sign_request_id import request_id_ok': 'operator',

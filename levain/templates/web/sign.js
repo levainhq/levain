@@ -5,7 +5,7 @@
 // signature is the challenge's own `line`, never this page's copy.
 //
 // The fragment: `v=<16 hex>` (the version the link was made on) and `choice=<key>` (the option already tapped elsewhere)
-// carry phone.js's rules exactly. The pick is one "Sign (<key>)" tap only while the listed version is the one in the link;
+// follow one rule. The pick is one "Sign (<key>)" tap only while the listed version is the one in the link;
 // anything else is a line saying why, and every option still signs on its own tap. Nothing is signed on load: the tap is the
 // gesture. The request id is the path's; a `sign=` in the fragment is ignored. The fragment is taken out of the bar first.
 //
@@ -25,25 +25,25 @@
 // reloaded. A write-in is frozen as typed (trimmed) from its click on.
 //
 // A consent request (OS-2) is the same sheet at /sign/consent/<id>: its read is GET /cockpit/consent/<id>/sheet.json (the
-// same row shape, its options allow and deny), and its ceremony the phone port's own: POST .../challenge and .../answer for
-// a pending request, .../rule-challenge and .../rule for an undecided one (the row's `mode`), with the phone's exact bodies
+// same row shape, its options allow and deny), and its ceremony: POST .../challenge and .../answer for
+// a pending request, .../rule-challenge and .../rule for an undecided one (the row's `mode`)
 // ({decision, signer_fp}, then the challenge's `payload` beside the assertion).
 //
 // A dispatch job (OS-2) is the same sheet at /sign/dispatch/<job>: its read is GET /cockpit/dispatch/<job>/sheet.json (the
 // same row shape; its options sign, cancel and authorise, each with the `signers` that may do THAT act), and its ceremony
-// the phone port's own by option: sign is .../challenge then .../answer ({signer_fp}), cancel is .../cancel-challenge then
+// by option: sign is .../challenge then .../answer ({signer_fp}), cancel is .../cancel-challenge then
 // .../cancel ({signer_fp, reason}, the reason typed in the box the row asks for), authorise is .../authorise-challenge then
 // .../authorise ({signer_fp}); each answer is the challenge's `payload` beside the assertion, nothing else. Each challenge
 // also carries `request_sha256`, the row's `sha256` this sheet showed (as a plain sign request's does): the cockpit refuses
 // it with a 409 when the job changed since, and the sheet then reads the job again and draws it afresh. Only the acts
 // DISPATCH_STEPS names are offered; any other key the row lists is not drawn and signs nothing.
 //
-// A coordinator drop (OS-2) is the same sheet at /sign/drop: its read is GET /cockpit/coord/drops.json (the phone's coord_*
+// A coordinator drop (OS-2) is the same sheet at /sign/drop: its read is GET /cockpit/coord/drops.json (the coord_*
 // listing keys), and it composes the drop's words and, optionally, an envelope. A plain drop is POST /cockpit/coord/drop. An
 // envelope is POST /cockpit/coord/envelope-review (the server keeps the body it shows), then POST .../envelope-challenge (the
 // payload, signed_at now, and the WebAuthn challenge), navigator.credentials.get, and POST .../drop carrying the envelope
-// {body_text, payload, authenticator_data, client_data_json, signature}: the phone port's /coord/<action> by name, bodies the
-// phone's own. The bytes signed are the server's; the line shown is the challenge's own `line`.
+// {body_text, payload, authenticator_data, client_data_json, signature}: POST /cockpit/coord/<action> by name.
+// The bytes signed are the server's; the line shown is the challenge's own `line`.
 //
 // A head card (CH-H1 H1-3) is the same sheet at /sign/drop#thread=<id> (the thread view links it): no new GET, only
 // POST /cockpit/coord/draft-cards, draft-rule, draft-withdraw, draft-review, draft-challenge and draft-accept. The LAPSED
@@ -78,7 +78,7 @@
 
   // ---- the link ----
   const consentPath = /^\/sign\/consent\/([^/]{1,480})$/.exec(location.pathname);
-  const dispatchPath = /^\/sign\/dispatch\/(dj-[0-9a-f]{32})$/.exec(location.pathname);     // the phone's job id shape
+  const dispatchPath = /^\/sign\/dispatch\/(dj-[0-9a-f]{32})$/.exec(location.pathname);     // the dispatch job id shape
   const coord = location.pathname === "/sign/drop";
   const pathId = consentPath || dispatchPath || coord ? null : /^\/sign\/([A-Za-z0-9_-]{8,64})$/.exec(location.pathname);
   let id = pathId ? pathId[1] : dispatchPath ? dispatchPath[1] : coord ? "drop" : "";
@@ -91,7 +91,7 @@
   const noun = consent ? "consent request" : dispatch ? "dispatch job" : coord ? "drop" : "sign request";
   const Noun = consent ? "Consent request" : dispatch ? "Dispatch job" : coord ? "Drop" : "Sign request";
   const routeOf = (rid) => (consent ? "/cockpit/consent/" : dispatch ? "/cockpit/dispatch/" : "/cockpit/sign/") + encodeURIComponent(rid);
-  // the dispatch ceremony's two routes by the act picked (the phone's own names)
+  // the dispatch ceremony's two routes by the act picked
   const DISPATCH_STEPS = { sign: ["challenge", "answer"], cancel: ["cancel-challenge", "cancel"],
                            authorise: ["authorise-challenge", "authorise"] };
   const dispatchAct = (key) => typeof key === "string" && Object.prototype.hasOwnProperty.call(DISPATCH_STEPS, key);
@@ -244,7 +244,7 @@
     const acts = $("sheet-actions");
     if (acts) acts.classList.remove("card-rows");
   }
-  // the nodes are card_format.js's (one builder for the sheet, the phone app and the cockpit); the ids are this page's
+  // the nodes are card_format.js's; the ids are this page's
   function drawCardHead(body, card, msg) {
     const box = window.LevainCardFormat.drawHead(card, msg);
     box.id = "sheet-card";
@@ -527,7 +527,7 @@
       }
       run(String(o.key), undefined, lineOf(o));
     };
-    // his pick from the link: one tap that signs that option, only on the version he tapped it on (phone.js's rule)
+    // his pick from the link: one tap that signs that option, only on the version he tapped it on
     const sameV = !!pickV && typeof r.sha256 === "string" && r.sha256.slice(0, 16) === pickV;
     const po = pick && sameV && /^[a-z0-9]{1,8}$/.test(pick) ? options.find((o) => o && o.key === pick) : null;
     if (po) {
@@ -707,9 +707,9 @@
   function ceremony(r, rp, k, choice, words) {
     const base = routeOf(r.id) + "/";
     const fp = k.fp;
-    // a consent request takes the phone port's own bodies, exactly their keys: {decision, signer_fp}, then the payload the
+    // a consent request takes the bodies: {decision, signer_fp}, then the payload the
     // challenge returned beside the assertion; an undecided one is ruled (its own pair of routes), never answered
-    // a dispatch job takes the phone port's own: the pair of routes of the act picked (sign, cancel, authorise), {signer_fp}
+    // a dispatch job takes the pair of routes of the act picked (sign, cancel, authorise), {signer_fp}
     // (a cancel's also {reason}), then the payload beside the assertion
     const unsigned = (m) => { say(/nothing was signed/.test(m) ? m : m + "; nothing was signed.", "bad"); return "unsigned"; };
     // an act with no routes here signs nothing (never another act's routes in its place)
@@ -810,7 +810,7 @@
     crypto.getRandomValues(b);
     return "ph-" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
   };
-  // the listing as the cockpit holds it now: the phone's coord_* keys, {unpaired} or {error}
+  // the listing as the cockpit holds it now: the coord_* keys, {unpaired} or {error}
   function readDrops() {
     return within("/cockpit/coord/drops.json", { headers: headers(false) }).then((g) => {
       if (g.status === 403) return { unpaired: true };
@@ -939,7 +939,7 @@
       words.disabled = on;
       form.lock(on);
     };
-    // a drop whose answer is not known is kept in this browser BEFORE it is posted (as the phone's outbox keeps it), so a
+    // a drop whose answer is not known is kept in this browser BEFORE it is posted, so a
     // closed sheet loses nothing: the next open sends it again, unchanged (the same outbox id files once), and it leaves
     // only on a definite answer
     // one record per outbox id, so a new drop never overwrites one whose answer is unknown (the cockpit's hero keeps the same way)
@@ -1390,7 +1390,7 @@
               }
               if (hother(a)) { hline("Not signed"); return hmoved(); }
               // a 503 is a definite answer: every one the cockpit gives is before the write or a write that did not commit
-              // (the phone port's "503 a fault on this machine (nothing written)", the busy and closing gates), and the
+              // ("503 a fault on this machine (nothing written)", the busy and closing gates), and the
               // server keeps the review for a machine fault, so the same Sign button may be tapped again
               if (a.status === 503) return stop1("Not signed: " + why(a) + ". The cockpit did not sign it; tap Sign again when it answers.", false);
               // any 4xx spends the review (and may mean the card moved): the card is read again and the Sign button goes with it
