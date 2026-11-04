@@ -4,13 +4,15 @@
 arguments for one session occurrence, from the store and ONE install-fact source: ``<store dir>/session_install.json``
 (:func:`read_install`, :func:`write_install`). Nothing else supplies a launcher.
 
-* ``sup``: a ``Supervisor`` over the install's authority log (``cockpit_root``) and the agent ``RunJournal``, into which
-  the factory first admits the occurrence's run (``journal.start``, once; a replay is a no-op).
-* ``role``: the role the occurrence's signed spec pins (:func:`session._signed_by_spec`), read from the store by hash. A pinned role that is not in the
-  store raises (the run is not built; :func:`levain.agents.session.make_run` reads that as a run that did not start).
+* ``sup``: a ``Supervisor`` over the install's authority log (``cockpit_root``) and the agent ``RunJournal``; the occurrence's run
+  was admitted by the launch, so the factory admits nothing.
+* ``role``: the role the occurrence's signed spec pins (:func:`levain.agents.spec.occurrence_spec`), read from the
+  store by hash. A refused spec or a pinned role that is not in the store raises (the run is not built;
+  :func:`levain.agents.session.make_run` reads that as a run that did not start).
 * ``exposure`` and ``max_exposure_usd_micros``: the open reservation's own terms (:func:`session.reserved_terms`), so
   no billing figure here is invented; ``launch_refusal`` still checks them against the role and the launcher.
-* ``recall``: P4's recall of the agent's episodes from the install's ``episodic_path``, or None when none is named.
+* ``recall``: P4's recall of the agent's episodes from the install's ``episodic_path``, only when the SIGNED spec's
+  ``memory`` is ``stateful``; None for a stateless agent (the default) or when the install names no path.
 * ``values``: the install's ``values`` (default none).
 * ``launcher``: the install's ``launcher`` NAME resolved through :data:`LAUNCHERS`, a registry only
   :func:`register_launcher` writes; no name is :class:`levain.agents.session.UnwiredLauncher`, so a store that has
@@ -78,6 +80,8 @@ def _abs(doc: Mapping[str, Any], key: str, path: Path, *, kind: str) -> Path:
     p = Path(v).expanduser()
     if kind == "dir" and not p.is_dir():
         raise InstallRefused(f"{path}: {key} {str(p)!r} is not a directory")
+    if kind == "file" and p.is_dir():       # a missing file is allowed (recall reads it as an empty memory)
+        raise InstallRefused(f"{path}: {key} {str(p)!r} is a directory, not a file")
     return p
 
 
@@ -89,6 +93,12 @@ def read_install(agent_dir: Path | str) -> SessionInstall:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, UnicodeDecodeError) as exc:
         raise InstallRefused(f"the session install facts cannot be read from {path} ({type(exc).__name__})") from exc
+    return _parse_install(doc, path)
+
+
+def _parse_install(doc: Any, path: Path) -> SessionInstall:
+    """The one check of an install document, for :func:`read_install` and, before it replaces anything,
+    :func:`write_install`."""
     if not isinstance(doc, dict):
         raise InstallRefused(f"{path} is not a JSON object")
     if doc.get("schema") != INSTALL_SCHEMA:
@@ -109,7 +119,9 @@ def read_install(agent_dir: Path | str) -> SessionInstall:
 
 def write_install(agent_dir: Path | str, *, cockpit_root: Path | str, launcher: str | None = None,
                   episodic_path: Path | str | None = None, values: Mapping[str, Any] | None = None) -> Path:
-    """Write the install file atomically (temp in the directory, fsync, mode 0600, rename) and read it back."""
+    """Write the install file atomically: the new document is checked FIRST (as :func:`read_install` would read it
+    back), then written to a temp in the directory (fsync, mode 0600) and renamed over the old one. A document that
+    fails the check raises :class:`InstallRefused` and leaves the working install as it was."""
     d = Path(agent_dir)
     doc: dict[str, Any] = {"schema": INSTALL_SCHEMA, "cockpit_root": str(Path(cockpit_root).expanduser())}
     if launcher is not None:
@@ -118,10 +130,12 @@ def write_install(agent_dir: Path | str, *, cockpit_root: Path | str, launcher: 
         doc["episodic_path"] = str(Path(episodic_path).expanduser())
     if values:
         doc["values"] = dict(values)
+    text = json.dumps(doc, sort_keys=True)
+    _parse_install(json.loads(text), d / INSTALL_FILE)     # the round trip: what a read will see, before any write
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".session_install.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(doc, sort_keys=True))
+            fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, 0o600)
@@ -129,7 +143,6 @@ def write_install(agent_dir: Path | str, *, cockpit_root: Path | str, launcher: 
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
-    read_install(d)
     return d / INSTALL_FILE
 
 
@@ -209,31 +222,28 @@ def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
     docstring). Nothing here starts a session. A failure to build raises; ``make_run`` reads that as a run that did
     not start. ``clock`` is a test seam (the supervisor's and the run's time)."""
     from levain.agent_authority import AgentAuthority
-    from levain.agents import recall as _recall, supervise
+    from levain.agents import recall as _recall, spec as _spec, supervise
     from levain.autonomic.journal import RunJournal
 
     install = read_install(store.directory)
     launcher = resolve_launcher(store, install)
     reserved = _session.reserved_terms(store, occurrence_id)
-    role = _pinned_role(store, _session._signed_by_spec(store, occurrence_id)[1])
+    try:
+        signed = _spec.occurrence_spec(store, occurrence_id)
+    except _spec.SpecError as exc:
+        raise InstallRefused(f"occurrence {occurrence_id}: its signed spec is refused ({exc})") from exc
+    role = _pinned_role(store, signed["role"]["role_hash"])
     with store.read() as conn:
-        row = conn.execute("SELECT agent_id, run_id, binding_id, state, launch_epoch, epoch FROM agent_occurrences"
+        row = conn.execute("SELECT agent_id FROM agent_occurrences"
                            " WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
-    if row is None:
-        raise InstallRefused(f"occurrence {occurrence_id} is not in the agent store")
+    # memory is the SIGNED spec's: a stateless agent (the default) gets no retained episodes whatever the install names
     recall = None
-    if install.episodic_path is not None:
+    if signed["memory"] == "stateful" and install.episodic_path is not None:
         recall = _recall.recall_agent_episodes_at(install.episodic_path, row[0], now=datetime.now(timezone.utc))
-    journal = RunJournal(store.directory)
-    if row[3] == "launched" and row[4] == launch_epoch and row[5] == launch_epoch:
-        # the run's admission into the agent journal, before the effect: nothing else in the production fire path
-        # starts it (``sup.effect`` raises ``run ... was never started``). Only for the occurrence this fire holds
-        # (``run_session`` ends any other ``not_held`` before it settles anything); ``start`` is a no-op on a run
-        # already admitted, so a replay keeps its original admission.
-        journal.start(row[1], binding_id=row[2])
+    journal = RunJournal(store.directory)   # the run was admitted at the launch (controller._admit_run_in), not here
     register_session_win_check()
-    pinned = _session._signed_by_spec(store, occurrence_id)[1]
-    hooks = None if install.episodic_path is None else _episode_hooks(store, install, row[0], pinned)
+    # the episode's agent id is the occurrence's own agent_id and the role the SIGNED spec pins, never agents.name
+    hooks = None if install.episodic_path is None else _episode_hooks(store, install, row[0], signed["role"]["role_hash"])
     sup = supervise.Supervisor(store, authority=AgentAuthority(install.cockpit_root), clock=clock, journal=journal,
                                hooks=hooks)
     extra = {} if clock is None else {"clock": clock}   # a test seam: production passes none and both read real time

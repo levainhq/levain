@@ -18,9 +18,10 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 from levain.webpush import ece, vapid
-from levain.webpush.store import PushStore, PushStoreError
+from levain.webpush.store import PushStore, PushStoreError, data_text
 
 TIMEOUT = 6.0            # per socket operation: connect and read each, so one request ends well inside the budget
 WALL_BUDGET = 20.0       # one dead push service never holds the rest of a send longer than this
@@ -149,17 +150,17 @@ def _post(req: urllib.request.Request) -> int:
 
 def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
          command: bool | None = None, push: bool = True, hold: str | None = None,
-         device: str | None = None) -> list[tuple[int, int]]:
+         device: str | None = None, data: dict[str, Any] | None = None) -> list[tuple[int, int]]:
     """Record the ping (``command``: whether the notify command started for it, None when none is set), push it to each live subscription concurrently; returns (subscription id, HTTP status)
     pairs (status 0: no answer; :data:`UNKNOWN`: none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription, and so does a refusal that names the key (:class:`_Dead`). Every
     store write happens in this thread; the workers only talk to the push services. ``push=False`` pushes nothing; with
     ``hold`` (the reason, see :meth:`PushStore.add_ping`) the recorded ping also waits in the held queue for
     :func:`levain.webpush.held.flush`. ``device`` (a ``paired-`` name) sends to that device's subscriptions only; the
-    default is every live one."""
+    default is every live one. ``data`` (the sender's structured fields) is kept with the ping row only, never pushed."""
     qdir = Path(queue_dir)
     store = PushStore(qdir)
     # the ping row and its held row are one transaction: a ping is never recorded as held-for-later and then lost
-    ping_id = store.add_ping(kind, ref, title, body, command, hold=(url, hold) if hold and not push else None)
+    ping_id = store.add_ping(kind, ref, title, body, command, hold=(url, hold) if hold and not push else None, data=data)
     if not push:   # the caller saw no live phone, or the presence rule held the push
         return []
     return deliver(qdir, store, ping_id, kind=kind, ref=ref, title=title, body=body, url=url, device=device)
@@ -215,19 +216,31 @@ def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str |
 
 
 def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
-          command: bool | None = None, push: bool = True, hold: str | None = None) -> bool:
+          command: bool | None = None, push: bool = True, hold: str | None = None,
+          data: dict[str, Any] | None = None) -> bool:
     """Start :func:`send` detached, never waited on. ``push=False`` records the ping and pushes it to no phone: how a
     ping that only the notify command carried gets its row, decided by the caller's own read of the phones. The text goes to the child on its
     STDIN as JSON, so a body that begins with ``-`` is not an option and the consent text never sits in the process
-    table. True when the child started."""
+    table. ``data`` is the sender's structured fields (a JSON object; flow's needs fields, levain.webpush.center.needs_data),
+    stored with the ping row for the notification center and never put in the push; when the text with it would not fit
+    the child's stdin, ``data`` is what is dropped, before any of the body. The two caps count differently: the data cap is
+    UTF-8 bytes of the stored text, but the stdin JSON is ASCII-escaped (``\\uXXXX`` per non-ASCII character), so data heavy
+    in non-ASCII text can pass the first and be dropped by the second; the center then draws the ping from its body.
+    True when the child started."""
     from levain.launch import child_env
 
     fields = {"title": title[:300], "body": body[:4000], "ref": None if ref is None else ref[:200], "url": url[:500],
               "command": command, "push": push, "hold": hold}
-    data = json.dumps(fields).encode("utf-8", "replace")
-    while len(data) > _SPAWN_STDIN_MAX and fields["body"]:
+    kept = data_text(data)
+    if kept is not None:
+        fields["data"] = json.loads(kept)
+    stdin = json.dumps(fields).encode("utf-8", "replace")
+    if len(stdin) > _SPAWN_STDIN_MAX and "data" in fields:
+        del fields["data"]
+        stdin = json.dumps(fields).encode("utf-8", "replace")
+    while len(stdin) > _SPAWN_STDIN_MAX and fields["body"]:
         fields["body"] = fields["body"][: len(fields["body"]) // 2]
-        data = json.dumps(fields).encode("utf-8", "replace")
+        stdin = json.dumps(fields).encode("utf-8", "replace")
     env = child_env()
     root = str(Path(__file__).resolve().parents[2])   # a source checkout: -P leaves the child no other way to import levain
     if not any(root == str(Path(d).resolve()) for d in site.getsitepackages() + [site.getusersitepackages()]):
@@ -239,7 +252,7 @@ def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body
         child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=True, close_fds=True, env=env, cwd=os.sep)
         try:
-            child.stdin.write(data)
+            child.stdin.write(stdin)
         finally:
             child.stdin.close()
     except Exception:   # noqa: BLE001 - a failed ping never fails the gate

@@ -795,10 +795,11 @@ class DispatchSheet:
 # ONESURFACE OS-2, the coordinator drop family: a drop (words, optionally with an envelope signed by a passkey) sent from the
 # cockpit, through the phone port's OWN class (levain.coordinator.phone.CoordPhone, the very object phone_server builds), over
 # the Signer's queue (the dispatch directory IS the consent directory), rpId, keys and pinned page. GET /cockpit/coord/drops.json
-# is the sheet's read (the phone's coord_* listing keys), POST /cockpit/coord/{drop,envelope-review,envelope-challenge} the
-# phone's /coord/<action> by name, behind the sign routes' gate exactly, and GET /sign/drop the sheet's page, whose envelope
+# is the sheet's read (the phone's coord_* listing keys), POST /cockpit/coord/<action> (the drop and envelope actions, and the draft-* sign flow of
+# levain.coordinator.draft_sign) the phone's /coord/<action> by name, behind the sign routes' gate exactly, and GET /sign/drop the sheet's page, whose envelope
 # signing is the sign sheet's own passkey ceremony. Served beside a Signer only; else every path here is 404.
-_COORD_ACTIONS = ("drop", "envelope-review", "envelope-challenge")
+_COORD_ACTIONS = ("drop", "envelope-review", "envelope-challenge", "draft-cards", "draft-rule", "draft-withdraw",
+                  "draft-review", "draft-challenge", "draft-accept")
 _COORD_PREFIX = "/cockpit/coord/"
 _COORD_LIST = "/cockpit/coord/drops.json"
 _COORD_SHEET = "/sign/drop"
@@ -858,9 +859,10 @@ class CoordSheet:
         """``POST /cockpit/coord/<action>``: :meth:`CoordPhone.step`'s reply (a challenge's also carries ``line``, the exact
         text signed). :class:`levain.coordinator.phone.CoordRefused` with the phone port's status, word and words."""
         from levain.coordinator import envelope as env
+        from levain.coordinator.draft_sign import SIGNING
         from levain.coordinator.phone import CoordRefused
 
-        signs = action in ("envelope-review", "envelope-challenge") or (
+        signs = action in ("envelope-review", "envelope-challenge", *SIGNING) or (
             action == "drop" and isinstance(req, dict) and req.get("envelope") is not None)
         problem = self.elsewhere() if signs else None
         if problem is not None:
@@ -876,7 +878,7 @@ class CoordSheet:
             with self._gate:
                 self._running -= 1
                 self._gate.notify_all()
-        if action == "envelope-challenge":
+        if action in ("envelope-challenge", "draft-challenge"):
             out["line"] = env.sign_message(out["payload"]).decode("utf-8")
         return out
 
@@ -1180,7 +1182,7 @@ _NOTIFY_TOKENS_REVOKE = "/webpush/notify/tokens/revoke"
 # the whole request body, refused on its declared length before it is read: in bytes, sized so a title and a body at
 # their character maxima in 4-byte UTF-8 still fit
 _NOTIFY_MAX_REQUEST = 8192
-_NOTIFY_KEYS = frozenset({"title", "body", "priority", "source"})
+_NOTIFY_KEYS = frozenset({"title", "body", "priority"})
 _NOTIFY_DEFAULT_TITLE = "Notice"            # a post with no title carries this; the source label is put in front of it
 _NOTIFY_MINT_KEYS = frozenset({"name", "source", "urgent", "max_priority", "rate_per_min", "rate_per_day",
                                "urgent_per_hour"})
@@ -1257,7 +1259,7 @@ def _deliver_notice(queue: Path, adm: Any) -> "dict[str, Any]":
     hold = (notify.NOTICES_URL, reason or "active") if decision == "held" else None
     # the ping, its held row and the notice are one transaction: a failure stores none of them, and the caller says so
     ping_id, nid = PushStore(queue).record_notice(adm.kind, ref, adm.display, adm.source, adm.title, adm.body,
-                                                  adm.priority, adm.token, decision, hold=hold, origin=adm.origin)
+                                                  adm.priority, adm.token, decision, hold=hold)
     if decision == "pushed":
         try:
             threading.Thread(target=_push_notice, args=(queue, ping_id, adm.kind, ref, adm.display, adm.body),
@@ -2696,7 +2698,7 @@ class _Handler(GuardedHandler):
         return raw if len(raw) <= 128 and _HEADER_SAFE_TOKEN.fullmatch(raw) else ""
 
     def _notify_post(self) -> None:
-        """``POST /notify {title?, body?, priority?, source?}`` (a title or a body; ``source`` only from a flow-origin token): a notice from a service, as a doorbell and nothing more. Every
+        """``POST /notify {title?, body?, priority?}`` (a title or a body): a notice from a service, as a doorbell and nothing more. Every
         refusal that does not need the body is sent before a byte of it is read, and closes the connection so the unread
         body is never taken for the next request (no route, a missing credential, a token that is not a live one, the
         content type, the length, a busy server). The token is checked from the header alone, with no lock and before a
@@ -2736,11 +2738,11 @@ class _Handler(GuardedHandler):
                 return self._send_json({"error": "bad_json", "message": "body is not valid JSON"}, 400)
             if not isinstance(req, dict) or not set(req) <= _NOTIFY_KEYS or not (req.keys() & {"body", "title"}):
                 return self._send_json({"error": "bad_request", "message": "send a title or a body, and only priority "
-                                        "(and, from flow's own token, source) besides: a notice is text, nothing else"}, 400)
+                                        "besides: a notice is text, nothing else"}, 400)
             queue = signer.queue_dir
             try:
                 adm = notify_tokens.admit(queue, supplied, req.get("title", _NOTIFY_DEFAULT_TITLE), req.get("body"),
-                                          req.get("priority"), source=req.get("source"), no_body="body" not in req)
+                                          req.get("priority"), no_body="body" not in req)
             except NotifyRefused as exc:
                 headers = [("Retry-After", str(int(exc.retry_after) + 1))] if exc.status == 429 else None
                 return self._send(json.dumps({"error": exc.error, "message": str(exc)}).encode("utf-8"),
@@ -4040,7 +4042,7 @@ class _Handler(GuardedHandler):
         waits = ((consent is not None and consent[1] in ("answer", "rule"))
                  or (dispatch is not None and dispatch[1] in ("answer", "cancel", "authorise"))
                  # a drop carrying a signed envelope holds a ceremony the person just made, as on the phone port
-                 or (coord is not None and coord == "drop")
+                 or (coord is not None and coord in ("drop", "draft-accept"))
                  or (sign is not None and sign[1] == "attempt"))
         if not (self.server.request_gate.acquire(timeout=5) if waits
                 else self.server.request_gate.acquire(blocking=False)):

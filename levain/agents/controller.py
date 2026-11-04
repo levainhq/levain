@@ -803,7 +803,8 @@ def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authori
     ``BEGIN IMMEDIATE`` the row is read, the agent's operation, spec and bar, the predicate (a live link), the
     reservation (:func:`accounting.reserve`, held to the admitted link's signed terms) and a slot
     (:func:`slots.take`) are checked in that order, and either the row becomes ``launched`` (its launch columns,
-    ``launched_at`` and a lease of :data:`LEASE_S`) or it ends with the refusal's state and reason. Every refusal is
+    ``launched_at`` and a lease of :data:`LEASE_S`) and its run is admitted in the journal at the binding's current
+    generation (:func:`_admit_run_in`), or it ends with the refusal's state and reason. Every refusal is
     written after the reservation and slot work is rolled back to a savepoint, so a refused launch takes nothing.
     A cover that cannot be read and a full cap write nothing; the row stays ``admitted`` for the next tick.
 
@@ -855,6 +856,7 @@ def launch(store: AgentStore | Path | str | None, occurrence_id: str, *, authori
                 (link_id, incarnation, at, _stamp(_expiry(at_dt, LEASE_S)), occurrence_id, occ["epoch"]))
             if cur.rowcount != 1:
                 raise RuntimeError(f"occurrence {occurrence_id} moved inside its own launch transaction")
+            _admit_run_in(conn, occurrence_id)
             return LaunchResult(LAUNCHED, None, slot, link_id, occ["epoch"])
     except _Retry as retry:   # raised inside the transaction: it rolled back, so nothing was written
         return LaunchResult(retry.outcome, retry.reason)
@@ -1213,6 +1215,7 @@ def start_run(store: AgentStore | Path | str | None, occurrence_id: str, launch_
 FIRES = "fires"
 FIRE_UNWIRED = 3       # the module entry's exit after its claim, for an agent no run body is registered for
 FIRE_NO_IDENTITY = 4   # the fire cannot read its own identity, or its command line does not name its occurrence
+FIRE_NOT_HELD = 5      # fire_refusal named a reason (a row this fire does not hold, a run fenced since launch): no body ran
 _OCCURRENCE_RE = re.compile(r"oc-[0-9a-f]{32}")
 
 
@@ -1380,48 +1383,88 @@ def _session_body() -> RunBody:
 RUN_BODIES: dict[str, Callable[[], RunBody]] = {DREAM: _dream_body, "session": _session_body}
 
 
-def _pinned_executor(store: AgentStore, occurrence_id: str) -> tuple[str | None, str | None]:
-    """``(agent name, executor)`` for an occurrence: the executor of the role its own signed spec pins. The spec text
-    is trusted only when it re-hashes to the occurrence's ``spec_hash`` in canonical form; an unreadable row, spec or
-    role has no executor (None), never a guess."""
+def _pinned_executor(store: AgentStore, occurrence_id: str) -> tuple[str | None, str | None, str]:
+    """``(agent name, executor, why)`` for an occurrence: the name its own SIGNED spec carries and the executor of
+    the role that spec pins, both read through :func:`levain.agents.spec.occurrence_spec` (re-hashed, and refused when
+    the mutable ``agents.name`` row differs from the signed name). Anything unreadable has no executor (None), with
+    ``why`` naming it, never a guess."""
     from levain.agents import role as _role, spec as _spec
     try:
-        with store.read() as conn:
-            row = conn.execute("SELECT a.name, o.agent_id, o.spec_hash, s.spec FROM agent_occurrences o"
-                               " JOIN agents a ON a.agent_id = o.agent_id"
-                               " JOIN agent_specs s ON s.spec_hash = o.spec_hash WHERE o.occurrence_id = ?",
-                               (occurrence_id,)).fetchone()
-        if row is None:
-            return None, None
-        name = row[0]
-        if not isinstance(row[3], str):
-            return name, None
-        spec = _spec.parse_spec_text(row[3])
-        if _spec.spec_hash(row[1], spec) != row[2] or _spec.canonical_spec(spec) != row[3]:
-            return name, None
-        pinned = (spec.get("role") or {}).get("role_hash")
-        role = _role.role_by_hash(store, pinned) if isinstance(pinned, str) else None
-    except Exception:  # noqa: BLE001 - an unreadable row signs nothing; the caller refuses unwired
-        return None, None
+        spec = _spec.occurrence_spec(store, occurrence_id)
+        role = _role.role_by_hash(store, spec["role"]["role_hash"])
+    except _spec.SpecError as exc:
+        return None, None, f"its signed spec is refused: {exc}"
+    except Exception as exc:  # noqa: BLE001 - an unreadable row signs nothing; the caller refuses unwired
+        return None, None, f"its row, spec or pinned role is unreadable ({type(exc).__name__})"
     executor = None if role is None else role.get("executor")
-    return name, executor if isinstance(executor, str) else None
+    if not isinstance(executor, str):
+        return spec["name"], None, "its pinned role is unreadable (not in the store, or no executor)"
+    return spec["name"], executor, ""
+
+
+NOT_LAUNCHED = "not_launched"   # fire_refusal: no such row, or it is not launched
+EPOCH_MOVED = "epoch_moved"     # fire_refusal: a revoke, bar or takeover raised the epoch, or the fire's is another
+RUN_NOT_ADMITTED = "run_not_admitted"   # fire_refusal: the launch admitted no run for this row (launched before it did)
+# (the run's own barriers name themselves: EffectStatus.FENCED "fenced", CANCELLED "cancelled", BARRED "barred")
+_ADMISSION_PROBE = "\x00admission"   # no body's effect id: the barrier peeked for the run, never for one of its effects
+
+
+def _admit_run_in(conn: sqlite3.Connection, occurrence_id: str) -> None:
+    """Admit the occurrence's run in the agent ``RunJournal``, in the caller's LAUNCH transaction: the one that judged
+    the agent fireable (its registration, operation, spec and bar, and a live link: :func:`_admit`). Like
+    :meth:`~levain.autonomic.binding.BindingStore.admit`, the fireability test and the start commit together, at the
+    binding's generation read in that transaction, so the run carries the generation current at launch and a fence
+    raised after it stops the run (the journal's barrier) rather than becoming its baseline. ``BindingStore.admit``
+    itself cannot judge it: a named Binding is never a ``bindings`` row (A0 r8 §2.3), so it would refuse every agent
+    run. A run id the journal knows is left as it is (``_start_in``)."""
+    from levain.autonomic.journal import RunJournal   # here: the journal is not the controller's import closure
+    run, binding = conn.execute("SELECT run_id, binding_id FROM agent_occurrences WHERE occurrence_id = ?",
+                                (occurrence_id,)).fetchone()
+    RunJournal._start_in(conn, run, binding, RunJournal._generation_in(conn, binding))
+
+
+def fire_refusal(store: AgentStore, occurrence_id: str, launch_epoch: int) -> str | None:
+    """Why the fire holding ``launch_epoch`` must not run its body, or ``None``. It admits nothing: the launch did
+    (:func:`_admit_run_in`). In order: the row must be ``launched`` (:data:`NOT_LAUNCHED`) at ``launch_epoch`` with no
+    epoch raised since (:data:`EPOCH_MOVED`, the claim's own guard); its run must be in the journal
+    (:data:`RUN_NOT_ADMITTED`: a row launched before the launch admitted runs is never admitted late, at whatever generation
+    is current); and the journal's own barrier for that run, the one every effect meets, must stop nothing (its
+    status's value: a fence past the launch generation is ``fenced``)."""
+    with store.read() as conn:
+        row = conn.execute("SELECT state, epoch, launch_epoch, run_id FROM agent_occurrences WHERE occurrence_id = ?",
+                           (occurrence_id,)).fetchone()
+    if row is None or row[0] != "launched":
+        return NOT_LAUNCHED
+    if row[2] != launch_epoch or row[1] != row[2]:
+        return EPOCH_MOVED
+    from levain.autonomic.journal import RunJournal   # here: the journal is not the controller's import closure
+    try:
+        barrier = RunJournal(store.directory).peek(row[3], _ADMISSION_PROBE)
+    except KeyError:
+        return RUN_NOT_ADMITTED
+    return None if barrier is None else barrier.status.value
 
 
 def run_agent(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
               bodies: Mapping[str, Callable[[], RunBody]] | None = None) -> int:
     """The fire's run body: the one registered for the executor of the role the occurrence's signed spec pins
     (:data:`RUN_BODIES`), else :func:`_unwired_run` naming why. The executor is read from the occurrence's own row,
-    never from the fire's command line or the agent's name. The dream's body also needs the reserved name, so a
-    dream-executor role under any other name ends unwired."""
-    name, executor = _pinned_executor(store, occurrence_id)
+    never from the fire's command line or the agent's name. The dream's body also needs the reserved name, signed in
+    the spec, so a dream-executor role under any other name ends unwired."""
+    name, executor, why = _pinned_executor(store, occurrence_id)
     if executor is None:
-        return _unwired_run(store, occurrence_id, launch_epoch, "its row, spec or pinned role is unreadable")
+        return _unwired_run(store, occurrence_id, launch_epoch, why)
     if executor == "dream" and name != DREAM:
         return _unwired_run(store, occurrence_id, launch_epoch,
                             f"the dream executor runs only the agent named {DREAM!r}, not {name!r}")
     resolve = (RUN_BODIES if bodies is None else bodies).get(executor)
     if resolve is None:
         return _unwired_run(store, occurrence_id, launch_epoch, f"no run body for executor {executor!r}")
+    why = fire_refusal(store, occurrence_id, launch_epoch)
+    if why is not None:
+        print(f"levain agents _fire {occurrence_id}: refused ({why}); no run body ran and no effect was reached",
+              file=sys.stderr)
+        return FIRE_NOT_HELD
     return resolve()(store, occurrence_id, launch_epoch)
 
 

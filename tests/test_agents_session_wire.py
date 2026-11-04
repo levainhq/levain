@@ -12,14 +12,12 @@ import pytest
 from levain.agents import controller as ctl
 from levain.agents import session as S
 from levain.agents import session_wire as W
-from tests.test_agents_run_by_executor import _session_occurrence as _renamed_occurrence
+from tests.test_agents_run_by_executor import _session_occurrence as _signed_occurrence
 from tests.test_agents_session_launch import Stub, rig  # noqa: F401
 
 
-def _session_occurrence(rig):
-    # keep the name the signed spec carries: a renamed agent no longer re-hashes, and the P8b win verifier ends it
-    # `win_unverified` (the S1 helper renames for its name-independence tests)
-    return _renamed_occurrence(rig, name="job_feeder_downstream")
+def _session_occurrence(rig, **kw):
+    return _signed_occurrence(rig, name="job_feeder_downstream", **kw)
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
@@ -35,16 +33,8 @@ def _factory(rig, monkeypatch):
     monkeypatch.setattr(ctl, "SESSION_FACTORY", lambda s, o, e: W.fire_factory(s, o, e, clock=rig.now))
 
 
-def _admit_run(rig, oid):
-    """The agent journal's admission of the run: nothing in the factory's closure does it (see RETURN observation 2),
-    the test stands in for the admitting path as ``test_agents_session_launch._sup`` does."""
-    from levain.autonomic.journal import RunJournal
-    from tests.test_agents_session_launch import BINDING
-    RunJournal(rig.store.directory).start(rig.row(oid)["run_id"], binding_id=BINDING)
-
-
 def _fire(rig, oid, monkeypatch):
-    _admit_run(rig, oid)
+    # no hand admission: the launch admitted the run
     from levain.consent import delivery
     monkeypatch.setattr(delivery, "process_identity", lambda pid: ("2026-11-04T00:00:00", f"levain agents _fire {oid}"))
     return ctl.fire(rig.store, oid, run=ctl.run_agent, clock=rig.now)
@@ -167,3 +157,54 @@ def test_the_factory_derives_exposure_and_dollars_from_the_reservation(rig):
     assert S.render_brief  # the keys are exactly run_session's keywords
     import inspect
     assert set(kw) - {"sup"} <= set(inspect.signature(S.run_session).parameters)
+
+
+# --- 1104-8 F3: recall follows the SIGNED spec's memory, never the install alone --------------------------------------
+
+@pytest.fixture
+def _recalled(monkeypatch):
+    """Every recall the factory asks for, answered with a sentinel (the recall itself is P4's, tested there)."""
+    from levain.agents import recall as R
+    asked = []
+    monkeypatch.setattr(R, "recall_agent_episodes_at", lambda path, agent, **kw: asked.append((path, agent)) or "EP")
+    return asked
+
+
+def test_a_stateless_agent_gets_no_recall_even_when_the_install_names_episodes(rig, tmp_path, _recalled):
+    # reproduced first on 451b197c: recall was "EP" (the install's episodic_path alone decided)
+    oid = _session_occurrence(rig)                       # the fixture's spec leaves memory at its default, stateless
+    _install(rig, episodic_path=tmp_path / "episodes.db")
+    kw = W.fire_factory(rig.store, oid, rig.row(oid)["launch_epoch"])
+    assert kw["recall"] is None and _recalled == []
+
+
+def test_a_stateful_agent_gets_its_recall_from_the_install(rig, tmp_path, _recalled):
+    oid = _session_occurrence(rig, memory="stateful")
+    _install(rig, episodic_path=tmp_path / "episodes.db")
+    kw = W.fire_factory(rig.store, oid, rig.row(oid)["launch_epoch"])
+    assert kw["recall"] == "EP" and _recalled == [(tmp_path / "episodes.db", rig.row(oid)["agent_id"])]
+
+
+def test_a_stateful_agent_with_no_episodes_named_gets_no_recall(rig, _recalled):
+    oid = _session_occurrence(rig, memory="stateful")
+    _install(rig)
+    assert W.fire_factory(rig.store, oid, rig.row(oid)["launch_epoch"])["recall"] is None
+
+
+# --- 1104-8: write_install validates before it replaces ---------------------------------------------------------------
+
+def test_a_bad_rewrite_leaves_the_working_install(rig, tmp_path):
+    # reproduced first on 451b197c: the bad file replaced the good one, then the read-back raised
+    path = _install(rig, launcher="stub")
+    before = path.read_bytes()
+    with pytest.raises(W.InstallRefused):
+        W.write_install(rig.store.directory, cockpit_root=tmp_path / "no-such-dir")
+    with pytest.raises(W.InstallRefused):
+        W.write_install(rig.store.directory, cockpit_root=rig.world.root, launcher="")
+    assert path.read_bytes() == before and W.read_install(rig.store.directory).launcher == "stub"
+    assert [p.name for p in rig.store.directory.iterdir() if p.name.startswith(".session_install.")] == []
+
+
+def test_an_episodic_path_that_is_a_directory_is_refused(rig, tmp_path):
+    with pytest.raises(W.InstallRefused, match="is a directory"):
+        _install(rig, episodic_path=tmp_path)

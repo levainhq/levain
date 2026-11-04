@@ -29,21 +29,44 @@ def _string_constants(path: Path) -> "list[tuple[int, str]]":
             if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs]
 
 
+def _regex_patterns(path: Path) -> "set[tuple[int, str]]":
+    """The string literals in ``path`` that are the pattern argument of a ``re.compile`` call: a reader's grammar,
+    which matches a link and never emits one."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return {(n.args[0].lineno, n.args[0].value) for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "compile"
+            and isinstance(n.func.value, ast.Name) and n.func.value.id == "re"
+            and n.args and isinstance(n.args[0], ast.Constant) and isinstance(n.args[0].value, str)}
+
+
 def test_no_emitted_link_carries_a_secret() -> None:
     """Reproduced red on a69ac9c8: ``phone_server.run_phone_server`` printed ``{page}#phone_token=...`` and wrote
     ``phone_token`` into the link file. The link builders now are ``deep_link`` (no credential), and the two startup
-    prints that put a ``write_token`` in a fragment (loopback binds only, the page strips it)."""
+    prints that put a ``write_token`` in a fragment (loopback binds only, the page strips it).
+
+    ``#sign=`` was the retired phone-origin link (``<origin>/#sign=<id>``, which carried the run's ``phone_token``
+    beside it until OS-4). levain builds no such link. The one reader allowed to hold the literal is the needs center's
+    grammar for FLOW's sign link (flow's ``needs_phill_sign.deep_link``: ``<origin>/sign/<id>#sign=<id>&v=<16 hex>``,
+    a request id and a request-file version, no credential: signing still takes the operator's passkey). It holds it
+    only as a ``re.compile`` pattern, so it parses that link and never emits one; any other ``#sign=`` literal fails."""
     link = deep_link("https://box.ts.net:8443", "np-sign-0001", choice="a", version="a" * 64)
     assert link == f"https://box.ts.net:8443/sign/np-sign-0001#v={'a' * 16}&choice=a"
     assert "token" not in link and "secret" not in link
     # no module builds a phone_token link or a #sign= fragment link; write_token= is built at exactly two sites
     sites: dict[str, set[str]] = {}
+    sign_readers: set[str] = set()
     for path in LEVAIN.rglob("*.py"):
-        for _line, text in _string_constants(path):
+        patterns = _regex_patterns(path)
+        rel = path.relative_to(LEVAIN).as_posix()
+        for line, text in _string_constants(path):
             for needle in ("phone_token=", "#sign=", "write_token="):
                 if needle in text:
-                    sites.setdefault(needle, set()).add(path.relative_to(LEVAIN).as_posix())
+                    if needle == "#sign=" and (line, text) in patterns:
+                        sign_readers.add(rel)
+                    else:
+                        sites.setdefault(needle, set()).add(rel)
     assert "phone_token=" not in sites and "#sign=" not in sites, sites
+    assert sign_readers <= {"webpush/center.py"}, sign_readers
     assert sites.get("write_token=", set()) <= {"web_server.py", "init_server.py"}, sites
 
 

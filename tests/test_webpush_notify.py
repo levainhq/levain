@@ -577,3 +577,19 @@ def test_an_empty_notice_summary_is_an_empty_string():
 
     assert held.notice_summary([]) == ""
     assert held.notice_summary([{"ref": "notify:a"}]) == "1 notice held: a"
+
+
+def test_a_stored_flow_origin_token_is_refused_not_mapped(tmp_path):
+    """The flow origin was deleted: a record still carrying it is malformed, so it does not verify, and a listing refuses
+    the file rather than reading the record as a plain token; create no longer takes an origin."""
+    _, tok = _mint(tmp_path, "Old")
+    path = nt._path(tmp_path)
+    doc = json.loads(path.read_text())
+    assert doc["tokens"][0]["origin"] == "token"
+    doc["tokens"][0]["origin"] = "flow"
+    path.write_text(json.dumps(doc))
+    assert nt.verify(tmp_path, tok) is None
+    with pytest.raises(nt.NotifyTokenError):
+        nt.list_public(tmp_path)
+    with pytest.raises(TypeError):
+        nt.create(tmp_path, "New", origin="flow")
