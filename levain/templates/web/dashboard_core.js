@@ -8859,8 +8859,13 @@
   function ncNeedsBody(n) {
     const host = el("div", "nc-body nc-nbody");
     const CF = window.LevainCardFormat;
-    if (n.from === "data" || !CF) host.appendChild(renderMarkdown(String(n.what || "").replace(/\r\n?/g, "\n")));   // real newlines: Markdown as written
-    else {
+    if (n.from === "data" || !CF) {
+      // real newlines: Markdown as written, less a first line that is the whole title (it is drawn above as the heading)
+      const lines = String(n.what || "").replace(/\r\n?/g, "\n").split("\n");
+      const i = lines.findIndex((x) => x.trim());
+      if (n.from === "data" && i >= 0 && lines[i].trim() === n.headline) lines.splice(i, 1);
+      host.appendChild(renderMarkdown(lines.join("\n").trim()));
+    } else {
       const rec = n.rec || "";
       for (const sec of CF.sections(n.what, n.headline)) {
         if (CF.repeatsRows(sec, n.options, rec)) continue;
