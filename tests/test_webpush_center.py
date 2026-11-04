@@ -202,17 +202,17 @@ def test_a_deleted_item_says_it_was_deleted_and_an_unknown_one_says_it_is_not_th
 
 def test_posted_sources_land_in_the_list_with_their_origin_and_the_raw_markdown(rig):
     """A token's notice keeps its token name and its Markdown body whole (the page enforces the full-URL rule from
-    ``origin``); flow's own token may name the source and a title-only post is fine; any other token naming a source is a
-    bad request; a plain-text preview is made by the server and never carries a link address."""
+    ``origin``); a title-only post is fine; a token naming a source is a bad request (the key is not
+    one any token may send); a plain-text preview is made by the server and never carries a link address."""
     src, q = rig
     backup = nt.create(q, "Backup", urgent=True)[1]
-    flow = nt.create(q, "flow poster", "flow", origin="flow")[1]
+    mailer = nt.create(q, "Mailer", "mailer")[1]
     body = "see [the board](https://evil.example/x) and **now**\n\n- one\n- two"
     with _signed(src, q) as (port, _):
         assert _post(port, backup, {"title": "Disk 90%", "body": body, "priority": "urgent"})[0] == 200
-        st, got = _post(port, flow, {"title": "Email digest", "body": "3 unread", "source": "email"})
+        st, got = _post(port, mailer, {"title": "Email digest", "body": "3 unread"})
         assert st == 200 and got["item"] == f"n{got['id']}"
-        assert _post(port, flow, {"title": "Title only"})[0] == 200
+        assert _post(port, mailer, {"title": "Title only"})[0] == 200
         st, got = _post(port, backup, {"title": "spoof", "body": "x", "source": "email"})
         assert st == 400 and got["error"] == "bad_request"
         _, doc, _ = _get(port, LIST)
@@ -221,8 +221,8 @@ def test_posted_sources_land_in_the_list_with_their_origin_and_the_raw_markdown(
     assert disk["origin"] == "token" and disk["token_name"] == "Backup" and disk["source"] == "backup"
     assert disk["body"] == body and disk["priority"] == "urgent"                      # the raw Markdown, nothing rendered
     assert disk["preview"] == "see the board and now one two" and "evil.example" not in disk["preview"]
-    assert (mail["origin"], mail["source"], mail["token_name"]) == ("flow", "email", None)
-    assert bare["body"] == "" and bare["origin"] == "flow" and bare["source"] == "flow"
+    assert (mail["origin"], mail["source"], mail["token_name"]) == ("token", "mailer", "Mailer")
+    assert bare["body"] == "" and bare["origin"] == "token" and bare["source"] == "mailer"
     for item in doc["items"]:
         assert set(item) == {"id", "origin", "source", "title", "body", "preview", "at", "priority", "read", "read_at",
                              "needs_ref", "needs_open", "token_name", "image_url", "delivery"}
@@ -310,3 +310,16 @@ def test_one_unreadable_store_or_ref_degrades_that_item_not_the_page(tmp_path, m
     monkeypatch.undo()
     monkeypatch.setattr(QuestionStore, "open_questions", lambda self: (_ for _ in ()).throw(RuntimeError("x")))
     assert needs.open_needs_count(q) is None       # nothing counted and a half unreadable: unknown, never 0
+
+
+def test_a_stored_notice_with_a_deleted_origin_is_refused_not_mapped(tmp_path):
+    """A notice row whose origin is the deleted ``flow`` is left out of the list; it is never shown as a token's."""
+    q = tmp_path / "q"
+    q.mkdir(mode=0o700)
+    s = PushStore(q)
+    nid = s.add_notice("email", "t", "b", "normal", "Mailer", "recorded")
+    keep = s.add_notice("mail", "t2", "b2", "normal", "Mailer", "recorded")
+    with s.write() as c:
+        c.execute("UPDATE notices SET origin = 'flow' WHERE id = ?", (nid,))
+    ids = [i["id"] for i in center.list_items(s)["items"]]
+    assert ids == [f"n{keep}"]

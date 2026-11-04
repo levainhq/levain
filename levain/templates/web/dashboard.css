@@ -2909,6 +2909,12 @@ body.ke .ck-drop .drop-more { align-self: flex-start; margin-top: var(--sp-3); }
 .env-opt input { flex: none; margin: 2px 0 0; }
 @media (pointer: coarse) { .env-opt { min-height: var(--hit-min); padding: var(--sp-3) var(--sp-4); } }
 body.sheet-embedded #drop-words { min-height: 7em; }
+.head-card { margin: 0 0 var(--sp-5); }
+.head-card-box { display: flex; flex-direction: column; gap: var(--sp-3); margin: 0 0 var(--sp-3); }
+.head-line[data-kind="bad"] { color: var(--bad); }
+/* the claim that a signature reaches wider than the head it replaces is the one line of the review that must not read like the rest */
+.head-wider { color: var(--warn); font-weight: 600; padding-left: var(--sp-3); border-left: 3px solid var(--warn); }
+.tv-card-link { display: inline-block; margin: 0 0 var(--sp-3); }
 .env-opt-t { display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
 .env-opt-name { font-weight: var(--fw-semibold); }
 .env-other { margin: var(--sp-3) 0 0; }
@@ -3140,7 +3146,6 @@ body.ke .dev-zone.pr-settings .zone-head { display: flex; }
 .nc-chip { padding: 2px var(--sp-3); border-radius: var(--r-pill); border: 1px solid var(--hair-2); font: var(--fw-semibold) var(--fs-micro)/1.2 var(--round);
   white-space: nowrap; max-width: 14em; overflow: hidden; text-overflow: ellipsis; }
 .nc-chip.o-levain { color: var(--accent); background: color-mix(in oklch, var(--accent) 14%, transparent); border-color: transparent; }
-.nc-chip.o-flow { color: var(--info); background: color-mix(in oklch, var(--info) 14%, transparent); border-color: transparent; }
 .nc-chip.o-token { color: var(--violet); background: color-mix(in oklch, var(--violet) 14%, transparent); border-color: transparent; }
 .nc-chip.p-urgent { background: var(--accent); color: var(--on-accent); border-color: var(--accent); text-transform: uppercase; letter-spacing: var(--track-caps); }
 .nc-chip.p-low { color: var(--meta); background: none; text-transform: uppercase; letter-spacing: var(--track-caps); }
@@ -3308,3 +3313,59 @@ body.ke .ck-zgrid .panel .nc-pbody { padding: 0 var(--sp-2) var(--sp-3) var(--sp
 .nf-checks { display: flex; flex-wrap: wrap; gap: var(--sp-3); flex: 1 1 100%; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); }
 .nf-new .dev-url { width: 100%; margin: var(--sp-3) 0; }
 @media (max-width: 720px) { .nf-form .dev-btn { flex: 1 1 100%; min-height: var(--hit-min); } }
+
+/* S4MD-2: a flow Needs-you ping's detail. The ask leads (option rows at the HIG 44pt hit height; the Rec one filled, with a
+   check and the word Rec, so it is never colour alone), Stopped follows as quiet metadata, the words fold under Detail when
+   they run long, and the housekeeping verbs sit last, ghosted. */
+.nc-repo { text-transform: none; letter-spacing: 0; font-family: var(--mono); }
+.nc-ask { margin: 0 0 var(--sp-6); }
+.nc-picks { display: flex; flex-direction: column; gap: var(--sp-3); margin: 0; padding: 0; list-style: none; }
+.nc-pickitem { min-width: 0; }
+.nc-pick { display: flex; align-items: center; gap: var(--sp-4); min-height: var(--hit-min); padding: var(--sp-4) var(--sp-5); box-sizing: border-box;
+  max-width: 100%; color: var(--text); text-decoration: none; background: var(--card-2, var(--card)); border: 1px solid var(--hair-2);
+  border-radius: var(--r-md); font: var(--fw-semibold) var(--fs-title)/1.35 var(--sans); overflow-wrap: anywhere; }
+a.nc-pick { cursor: pointer; }
+a.nc-pick:hover { border-color: var(--text); }
+a.nc-pick:focus-visible, .nc-signgo:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-line); }
+/* the Rec row is the filled primary: --base on --ok is the same pair as --on-bad on --bad, dark text on the light green in the
+   dark theme and light text on the dark green in the light one */
+.nc-pick.is-rec { background: var(--ok); border-color: var(--ok); color: var(--base); }
+a.nc-pick.is-rec:hover { border-color: var(--text); }
+.nc-pick.is-inert { opacity: .7; }
+.nc-pickkey { flex: none; display: inline-grid; place-items: center; width: 1.9em; height: 1.9em; border-radius: var(--r-sm); border: 1px solid var(--hair-2);
+  color: var(--label); font: var(--fw-bold) var(--fs-body) var(--mono); }
+.nc-pick.is-rec .nc-pickkey { color: var(--base); border-color: var(--base); }
+.nc-picktext { flex: 1 1 auto; min-width: 0; }
+.nc-pick .nc-recmark { flex: none; padding: 2px var(--sp-3); border: 1px solid currentColor; border-radius: var(--r-sm); font: var(--fw-bold) 13px var(--sans);
+  color: inherit; white-space: nowrap; }
+.nc-recwhy { margin: var(--sp-2) 0 0; padding: 0 var(--sp-2); font: var(--fw-regular) 14px/1.45 var(--sans); color: var(--label); overflow-wrap: anywhere; }
+.nc-signgo { display: flex; align-items: center; justify-content: center; min-height: var(--hit-min); margin-top: var(--sp-2); padding: var(--sp-3) var(--sp-5);
+  box-sizing: border-box; border-radius: var(--r-md); background: var(--ok); color: var(--base); text-decoration: none;
+  font: var(--fw-semibold) var(--fs-title) var(--sans); }
+.nc-ask .nc-note { margin-top: var(--sp-4); font-size: 13px; overflow-wrap: anywhere; }
+.nc-nsec { margin: 0 0 var(--sp-6); min-width: 0; }
+.nc-nsum { display: flex; align-items: baseline; gap: var(--sp-3); min-height: var(--hit-min); cursor: pointer; list-style: none; min-width: 0; }
+.nc-nsum::-webkit-details-marker { display: none; }
+.nc-nsum::before { content: "▸"; flex: none; color: var(--label); }
+.nc-ndetail[open] > .nc-nsum::before { content: "▾"; }
+.nc-nsum .nc-blabel { flex: none; margin: 0; }
+.nc-dfirst { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--label); font: 14px var(--sans); }
+.nc-ndetail[open] .nc-dfirst { display: none; }
+.nc-nbody { font-size: var(--fs-title); line-height: 1.55; overflow-wrap: anywhere; }
+.nc-nbody code { overflow-wrap: anywhere; word-break: break-word; }
+.nc-nbody .nc-blabel { margin-top: var(--sp-5); }
+.nc-nlist { margin: 0 0 var(--sp-4); padding-left: var(--sp-6); }
+.nc-nlist li { margin: 0 0 var(--sp-2); padding-left: var(--sp-1); }
+.nc-quiet { color: var(--meta); }
+.nc-nstop { margin: 0; font: var(--fw-regular) 14px/1.5 var(--sans); color: var(--label); overflow-wrap: anywhere; }
+.nc-quiet .nc-blabel { color: var(--meta); }
+.nc-nbody .nc-fullurl { font: 13px/1.4 var(--sans); }
+.nc-foot { margin: var(--sp-6) 0 0; padding: var(--sp-5) 0 0; border-bottom: 0; border-top: 1px solid var(--hair); }
+.nc-ghost { background: none; border-color: transparent; color: var(--label); font-size: 13px; }
+.nc-ghost.nc-delete { color: var(--bad); }
+@media (max-width: 720px) {
+  .nc-pick { font-size: 17px; padding: var(--sp-4); gap: var(--sp-3); }
+  .nc-nbody { font-size: 16px; }
+  .nc-dtitle { font-size: 22px; overflow-wrap: anywhere; }
+  .nc-foot .nc-btn { min-height: var(--hit-min); }
+}

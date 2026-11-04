@@ -114,7 +114,7 @@ def _well_formed(r: object) -> bool:
             return False
     if r.get("max_priority") is not None and r.get("max_priority") not in PRIORITIES:
         return False
-    if r.get("origin") not in (None, "token", "flow"):
+    if r.get("origin") not in (None, "token"):
         return False
     return r.get("urgent_times") is None or isinstance(r.get("urgent_times"), list)
 
@@ -221,15 +221,13 @@ def _cap(value: object, default: int, what: str) -> int:
 
 def create(queue_dir: Path | str, name: str, source: str | None = None, *, max_priority: str = "normal",
            urgent: bool = False, rate_per_min: int | None = None, rate_per_day: int | None = None,
-           urgent_per_hour: int | None = None, origin: str = "token", now: float | None = None) -> tuple[dict, str]:
+           urgent_per_hour: int | None = None, now: float | None = None) -> tuple[dict, str]:
     """Mint a token. Returns the public record and the token, which is kept nowhere and cannot be shown again. ``source``
     (the label every notice from it carries) defaults to the name lowercased when that is a valid slug; it is unique among
     live tokens and cannot change afterwards. ``urgent=True`` is the only way a token may post an urgent notice, and it
-    raises the ceiling to ``urgent``; ``max_priority="urgent"`` without it is a refusal. ``origin`` is ``token`` (a service
-    the operator gave a key: its links show in full) or ``flow`` (flow's own poster: it may name the notice's source, and
-    its links render as Levain's own); the HTTP mint route never takes it."""
-    if origin not in ("token", "flow"):
-        raise NotifyTokenError("a token's origin is token or flow")
+    raises the ceiling to ``urgent``; ``max_priority="urgent"`` without it is a refusal. Every token is a service the
+    operator gave a key, so its links show in full; a ``flow`` origin was deleted (no door minted one after SP1583), and a
+    stored record carrying it is refused by the reader as malformed."""
     if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name != name.strip():
         raise NotifyTokenError("a token's name is 1 to 40 letters, digits, spaces, dots, dashes or underscores")
     label = name.lower().replace(" ", "-") if source is None else source
@@ -256,7 +254,7 @@ def create(queue_dir: Path | str, name: str, source: str | None = None, *, max_p
         if len(recs) >= MAX_TOKENS:
             raise NotifyTokenError("too many notify tokens: revoke one first")
         rec = {"name": name, "source": label, "sha256": _hash(token), "created": time.time() if now is None else now,
-               "last_used": None, "origin": origin, "max_priority": max_priority, "urgent": bool(urgent), **caps, "revoked": False,
+               "last_used": None, "origin": "token", "max_priority": max_priority, "urgent": bool(urgent), **caps, "revoked": False,
                "day": None, "day_count": 0, "urgent_times": []}
         _write(queue_dir, recs + [rec])
     return _public(rec), token
@@ -340,7 +338,6 @@ class Admitted:
     body: str
     priority: str
     kind: str
-    origin: str = "token"
 
     @property
     def display(self) -> str:
@@ -348,15 +345,13 @@ class Admitted:
 
 
 def admit(queue_dir: Path | str, supplied: str, title: object, body: object, priority: object = None, *,
-          source: object = None, no_body: bool = False, now: float | None = None) -> Admitted:
+          no_body: bool = False, now: float | None = None) -> Admitted:
     """Decide one post. Under the notify lock: the token (unknown and revoked are one refusal, ``forbidden``), the
     priority against the token's ceiling (a request above it is refused with a named reason, never lowered), the
     sanitised text, then the caps (per minute, per day, urgent per hour). Only a post that passes everything counts toward
     a cap and stamps ``last_used``. Raises :class:`levain.webpush.notify.NotifyRefused`; a token file that cannot be read
     or written whole (a malformed record in it included: the stamp would rewrite the list without it) raises
-    :class:`NotifyTokenError`, and nothing is admitted. ``source`` names the notice's source (the chip) and only a
-    ``flow``-origin token may send one (any other token sending one is a bad request, as for any key it may not use);
-    ``no_body`` is a post that sent no body at all, stored with an empty one (a body that is sent must be non-empty)."""
+    :class:`NotifyTokenError`, and nothing is admitted. ``no_body`` is a post that sent no body at all, stored with an empty one (a body that is sent must be non-empty)."""
     t = time.time() if now is None else now
     with _locked(queue_dir):
         recs = _read(queue_dir)
@@ -370,14 +365,7 @@ def admit(queue_dir: Path | str, supplied: str, title: object, body: object, pri
             raise NotifyRefused("urgent_not_permitted", "this token is not marked urgent", 403)
         if RANK[want] > RANK.get(rec.get("max_priority"), RANK["normal"]):
             raise NotifyRefused("priority_above_token_max", f"this token's highest priority is {rec.get('max_priority')}", 403)
-        origin = rec.get("origin") or "token"
         label = rec["source"]
-        if source is not None:
-            if origin != "flow":
-                raise NotifyRefused("bad_request", "only flow's own token names a source: for any other it is the token's label")
-            if not isinstance(source, str) or not SOURCE_RE.fullmatch(source):
-                raise NotifyRefused("bad_source", "a source is 1 to 24 lowercase letters, digits, dots, dashes or underscores")
-            label = source
         clean_title = notify.clean_title(title)
         clean_body = "" if no_body else notify.clean_body(body)
         key = rec["sha256"]
@@ -396,5 +384,5 @@ def admit(queue_dir: Path | str, supplied: str, title: object, body: object, pri
         rec["urgent_times"] = hour + ([t] if want == "urgent" else [])
         _write(queue_dir, recs)
         MINUTE.record(key, t)
-        return Admitted(rec["name"], label, clean_title, clean_body, want, notify.kind_for(want), origin)
+        return Admitted(rec["name"], label, clean_title, clean_body, want, notify.kind_for(want))
 

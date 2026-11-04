@@ -8539,7 +8539,7 @@
   // ---- the row (one component: the panel's compact row and the focus view's full row) ----------------------------------
   function ncChips(it) {
     const f = document.createDocumentFragment();
-    f.appendChild(el("span", "nc-chip o-" + (it.origin === "token" || it.origin === "flow" ? it.origin : "levain"), it.source || it.origin || ""));
+    f.appendChild(el("span", "nc-chip o-" + (it.origin === "token" ? it.origin : "levain"), it.source || it.origin || ""));
     if (it.priority === "urgent" || it.priority === "low") f.appendChild(el("span", "nc-chip p-" + it.priority, it.priority));
     return f;
   }
@@ -8822,6 +8822,180 @@
       if (c) c.focus({ preventScroll: true });
     }
   }
+  // A flow Needs-you ping's detail (S4MD-2): the ask first, then the words. `it.needs` is the center's reading of the ping
+  // (levain/webpush/center.py needs_item): flow's structured fields when the ping carries them, else its push body read back.
+  // No link is taken from the ping: the center hands over a sign request id and a version only for a request it read as this
+  // item's and found open (`sign_state` "open"), and the page builds the link on its own origin, so an option row can only
+  // ever open this cockpit's own sign page, where Face ID signs. Any other state draws the rows inert with a line saying why.
+  // Text only; the words go through the same renderer, linkify and harden as every notification.
+  const NC_SIGN_ID = /^[A-Za-z0-9_-]{8,64}$/, NC_SIGN_V = /^[0-9a-f]{16}$/, NC_PICK = /^[a-z0-9]{1,8}$/;
+  // the cockpit sign page for request `id` on this page's origin, in the link form flow's pushes carry (/sign/<id>#sign=<id>
+  // &v=<version>, the pick adding &choice=<key>; sign.js reads v= and choice=); null for any part off its grammar
+  function ncSignHref(id, v, choice) {
+    if (!NC_SIGN_ID.test(id || "")) return null;
+    let h = location.origin + "/sign/" + id;
+    if (v === undefined || v === null) return h;
+    if (!NC_SIGN_V.test(v)) return null;
+    h += "#sign=" + id + "&v=" + v;
+    if (choice === undefined || choice === null) return h;
+    return NC_PICK.test(choice) ? h + "&choice=" + choice : null;
+  }
+  const NC_SIGN_NOTE = {
+    open: "An option opens the sign page for that option; you sign there with Face ID. Nothing is sent from here.",
+    closed: "This sign request is closed: it was answered or withdrawn.",
+    expired: "This sign request has expired.",
+    unknown: "Could not check this request; open it at the sign page.",
+    unverified: "Could not verify this request; open it on the Needs-you card.",
+  };
+  function ncDomain(href) { try { return new URL(href).hostname.replace(/^www\./, ""); } catch (_) { return ""; } }
+  // the one closing sentence a flat list may carry on its last item: split off only at a boundary that cannot be prose inside
+  // a bullet (a blank line, or a closing mark and then a sentence opening with flow's closer words); anything else stays whole
+  const NC_CLOSER = /(?:\n[ \t]*\n|[)\]`*.!?:][ \t]+)(?=(?:Then answer|Answer \(|Pick)\b)/;
+  function ncSplitCloser(last) {
+    const m = NC_CLOSER.exec(last);
+    if (!m) return null;
+    return [last.slice(0, m.index + m[0].length).trimEnd(), last.slice(m.index + m[0].length)];
+  }
+  function ncNeedsBody(n) {
+    const host = el("div", "nc-body nc-nbody");
+    const CF = window.LevainCardFormat;
+    if (n.from === "data" || !CF) {
+      // real newlines: Markdown as written, less a first line that is the whole title (it is drawn above as the heading)
+      const lines = String(n.what || "").replace(/\r\n?/g, "\n").split("\n");
+      const i = lines.findIndex((x) => x.trim());
+      if (n.from === "data" && i >= 0 && lines[i].trim() === n.headline) lines.splice(i, 1);
+      host.appendChild(renderMarkdown(lines.join("\n").trim()));
+    } else {
+      const rec = n.rec || "";
+      for (const sec of CF.sections(n.what, n.headline)) {
+        if (CF.repeatsRows(sec, n.options, rec)) continue;
+        if (sec.label) host.appendChild(el("div", "nc-blabel", sec.label.charAt(0) + sec.label.slice(1).toLowerCase()));
+        for (const b of sec.blocks) {
+          if (b.kind === "list") {
+            if (b.lead) host.appendChild(renderMarkdown(b.lead));
+            // the card format ends a list only at a "Label: ..." sentence, so a closing sentence rides on the last item
+            const items = b.items.slice();
+            const cut = items.length ? ncSplitCloser(items[items.length - 1]) : null;
+            if (cut) items[items.length - 1] = cut[0];
+            const ul = el("ul", "nc-nlist");
+            for (const t of items) { const li = el("li"); ncInline(li, t); ul.appendChild(li); }
+            host.appendChild(ul);
+            if (cut && cut[1]) host.appendChild(renderMarkdown(cut[1]));
+          } else host.appendChild(renderMarkdown(b.text));
+        }
+      }
+    }
+    ncLinkify(host);
+    ncHarden(host);
+    for (const sp of Array.from(host.querySelectorAll(".nc-fullurl"))) {      // his rule: a link shows its domain, the page shows the rest
+      const a = sp.previousElementSibling;
+      const dom = a && a.getAttribute("href") ? ncDomain(a.getAttribute("href")) : "";
+      if (dom) sp.textContent = " (" + dom + ")"; else sp.remove();
+    }
+    return host;
+  }
+  // the generic detail's tail, shared by the needs branch: the way to the Needs-you card while the item waits, and a token's note
+  function ncNeedsBox(it) {
+    if (!(it.needs_ref && it.needs_open)) return null;
+    const nd = el("div", "nc-needsbox");
+    const go = el("button", "nc-needsgo", "Answer on the Needs-you card →"); go.type = "button";
+    go.addEventListener("click", () => ncGoNeeds(it.needs_ref, go));
+    nd.appendChild(go);
+    nd.appendChild(el("p", "nc-note", "Still waiting on you. Deleting this ping does not close the item."));
+    return nd;
+  }
+  function ncTokenNote(it) {
+    return it.origin === "token" ? el("p", "nc-note nc-tokennote", "Posted by notify token " + (it.token_name || "") + ": every link shows its full address.") : null;
+  }
+  // the folded Detail's summary line: the body's first block as read (a list's first item; a section label kept as "Label: ")
+  function ncFirstLine(body) {
+    const kids = Array.from(body.children);
+    for (let i = 0; i < kids.length; i++) {
+      const k = kids[i];
+      if (k.classList.contains("nc-blabel")) continue;
+      const text = ((k.tagName === "UL" || k.tagName === "OL") && k.firstElementChild ? k.firstElementChild : k).textContent.trim().split("\n")[0];
+      if (!text) continue;
+      const lab = i > 0 && kids[i - 1].classList.contains("nc-blabel") ? kids[i - 1].textContent.trim() : "";
+      return lab ? lab + ": " + text : text;
+    }
+    return "";
+  }
+  const NC_FOLD_LINES = 12;     // a Detail longer than this many rendered lines starts folded, so the ask and Stopped stay on the first screen
+  function ncNeedsDetail(d, it, n) {
+    const meta = el("div", "nc-dmeta");
+    meta.appendChild(el("span", "nc-chip nc-repo", n.repo));
+    meta.appendChild(el("span", "nc-time", ncWhen(it.at, true)));
+    d.appendChild(meta);
+    d.appendChild(el("h2", "nc-dtitle", n.title || it.title || "(no title)"));
+    const ask = el("section", "nc-ask"); ask.setAttribute("aria-label", "Your answer");
+    const state = n.sign_state || null;
+    const live = state === "open" && !!ncSignHref(n.sign_id, n.sign_v);
+    const opts = Array.isArray(n.options) ? n.options : [];
+    if (opts.length) {
+      ask.appendChild(el("div", "nc-blabel", "Your answer"));
+      const list = el("ul", "nc-picks");
+      for (const o of opts) {
+        const isRec = !!n.rec && o.key === n.rec;
+        const href = live ? ncSignHref(n.sign_id, n.sign_v, o.key) : null;
+        const li = el("li", "nc-pickitem");
+        const row = el(href ? "a" : "div", "nc-pick" + (isRec ? " is-rec" : "") + (href ? "" : " is-inert"));
+        if (href) { row.setAttribute("href", href); row.setAttribute("rel", "noopener noreferrer"); }
+        row.appendChild(el("span", "nc-pickkey", o.key));
+        row.appendChild(el("span", "nc-picktext", o.text));
+        if (isRec) row.appendChild(el("span", "nc-recmark", "✓ Rec"));
+        li.appendChild(row);
+        if (isRec && n.rec_reason) li.appendChild(el("p", "nc-recwhy", n.rec_reason));
+        list.appendChild(li);
+      }
+      ask.appendChild(list);
+    } else if (live) {
+      const go = el("a", "nc-signgo", "Sign your answer");      // no options: the sign page is the one route, so it is the primary button
+      go.setAttribute("href", ncSignHref(n.sign_id, n.sign_v)); go.setAttribute("rel", "noopener noreferrer");
+      ask.appendChild(go);
+    }
+    const why = live ? (opts.length ? NC_SIGN_NOTE.open : "") : state ? (NC_SIGN_NOTE[state] || NC_SIGN_NOTE.unknown) : opts.length ? "No sign page for this item: answer at the desk." : "";
+    if (why) {
+      const p = el("p", "nc-note" + (live ? "" : " nc-signstate"), why);
+      const page = state === "unknown" ? ncSignHref(n.sign_id) : null;
+      if (page) { const a = el("a", "nc-link", "Open the sign page"); a.setAttribute("href", page); a.setAttribute("rel", "noopener noreferrer"); p.append(" ", a); }
+      ask.appendChild(p);
+    }
+    if (ask.childNodes.length) d.appendChild(ask);
+    if (n.stopped || (n.sign_id && !n.stopped_known)) {
+      const w = el("section", "nc-nsec nc-quiet"); w.appendChild(el("div", "nc-blabel", "Stopped"));
+      w.appendChild(el("p", "nc-nstop", n.stopped || "not available")); d.appendChild(w);
+    }
+    const body = ncNeedsBody(n);
+    if (body.childNodes.length) {
+      const det = el("details", "nc-nsec nc-ndetail");
+      const sum = el("summary", "nc-nsum");
+      sum.appendChild(el("span", "nc-blabel", "Detail"));
+      sum.appendChild(el("span", "nc-dfirst", ncFirstLine(body)));
+      det.append(sum, body);
+      det.open = true;
+      d.appendChild(det);
+      const kept = ncUi.nfold && ncUi.nfold.id === it.id ? ncUi.nfold.open : null;
+      if (kept !== null) det.open = kept;
+      else {
+        const lh = parseFloat(getComputedStyle(body).lineHeight) || 24, h = body.getBoundingClientRect().height;
+        const lines = h > 0 ? h / lh : (body.textContent || "").length / 45;
+        det.open = lines <= NC_FOLD_LINES;
+      }
+      sum.addEventListener("click", () => { ncUi.nfold = { id: it.id, open: !det.open }; });
+    }
+    for (const x of [ncNeedsBox(it), ncTokenNote(it)]) if (x) d.appendChild(x);
+    const dv = ncDelivery(it.delivery);
+    if (dv) d.appendChild(el("p", "nc-delivery", "Delivery: " + dv));
+    const foot = el("div", "nc-tools nc-foot");
+    const tg = el("button", "nc-btn nc-toggle nc-ghost"); tg.type = "button"; tg.dataset.tool = "toggle";
+    tg.append(ncIcon("mail"), document.createTextNode(it.read ? " Mark unread" : " Mark read"));
+    tg.addEventListener("click", () => { ncSetRead(it.id, !it.read); });
+    const dl = el("button", "nc-btn nc-delete nc-ghost"); dl.type = "button"; dl.dataset.tool = "delete";
+    dl.append(ncIcon("trash"), document.createTextNode(" Delete"));
+    dl.addEventListener("click", () => { ncDelete(it.id); });
+    foot.append(tg, dl);
+    d.appendChild(foot);
+  }
   function ncFillDetail() {
     if (!ncLive()) return;
     const r = ncRoot._nc, d = r.detail;
@@ -8832,6 +9006,11 @@
     d.replaceChildren();
     if (ncUi.gone) d.appendChild(el("p", "nc-gone", ncUi.gone));
     if (!it) { if (!ncUi.gone) d.appendChild(el("p", "nc-none", "Nothing selected.")); return; }
+    if (it.needs && Array.isArray(it.needs.options)) {
+      ncNeedsDetail(d, it, it.needs);
+      if (keepTool) { const c = d.querySelector('[data-tool="' + keepTool + '"]'); if (c) c.focus({ preventScroll: true }); }
+      return;
+    }
     const meta = el("div", "nc-dmeta");
     meta.appendChild(ncChips(it));
     meta.appendChild(el("span", "nc-time", ncWhen(it.at, true)));
@@ -8848,15 +9027,7 @@
     d.appendChild(tools);
     if (typeof it.image_url === "string" && /^\/[^/\\]/.test(it.image_url)) { const im = el("img", "nc-img"); im.src = it.image_url; im.alt = ""; d.appendChild(im); }
     if (it.body) d.appendChild(ncBody(it.body));
-    if (it.needs_ref && it.needs_open) {
-      const nd = el("div", "nc-needsbox");
-      const go = el("button", "nc-needsgo", "Answer on the Needs-you card →"); go.type = "button";
-      go.addEventListener("click", () => ncGoNeeds(it.needs_ref, go));
-      nd.appendChild(go);
-      nd.appendChild(el("p", "nc-note", "Still waiting on you. Deleting this ping does not close the item."));
-      d.appendChild(nd);
-    }
-    if (it.origin === "token") d.appendChild(el("p", "nc-note nc-tokennote", "Posted by notify token " + (it.token_name || "") + ": every link shows its full address."));
+    for (const x of [ncNeedsBox(it), ncTokenNote(it)]) if (x) d.appendChild(x);
     const dv = ncDelivery(it.delivery);
     if (dv) d.appendChild(el("p", "nc-delivery", "Delivery: " + dv));
     if (keepTool) { const c = d.querySelector('[data-tool="' + keepTool + '"]'); if (c) c.focus({ preventScroll: true }); }

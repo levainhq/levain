@@ -47,8 +47,7 @@ def _dream_rig(tmp_path) -> Rig:
 def _fire_ready(rig: Rig):
     oid = rig.claim("k")
     assert rig.launch(oid, on_input=None).outcome == "launched"   # the dream's input hook is tested on its own below
-    RunJournal(rig.store.directory).start(rig.row(oid)["run_id"], binding_id="bind-0123456789abcdef")
-    return oid
+    return oid    # no hand start: the launch admitted the run
 
 
 def test_a_scheduled_fire_of_the_dream_no_longer_ends_unwired(tmp_path):
@@ -97,7 +96,9 @@ def test_the_dream_occurrence_reaches_its_executor_once_and_ends_done(tmp_path, 
 
 def test_run_agent_reads_the_executor_from_the_row_and_an_unknown_one_refuses_unwired(rig, tmp_path, capsys):
     seen = []
+    rig.link()
     oid = rig.claim("k")
+    assert rig.launch(oid).outcome == "launched"    # a fire runs a body only for a launched row it holds
     bodies = {"someone-else": lambda: (lambda s, o, e: seen.append(o) or 0)}
     assert ctl.run_agent(rig.store, oid, 0, bodies=bodies) == ctl.FIRE_UNWIRED and seen == []
     add_role(rig.store, parse_role(ROLES["notify-role"]))         # a dream executor: the name is no longer consulted
