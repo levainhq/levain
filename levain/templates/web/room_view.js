@@ -51,12 +51,18 @@
     // row that reads "Error" on every turn trains the eye past the one that is (any other mode is still drawn)
     var modeNoise = it.kind === "vendor_error" && it.body === "dontAsk";
     var text = it.body == null ? "" : String(it.body);
+    // a hook of the operator's own settings starting in the child (body e.g. "SessionStart:startup") and one that ended
+    // in success are recorded as error-kind rows too (claude_session._on_hook, ref "error:hook_started:<id>"); they are
+    // not errors (roomfix2, seen on a real open). A hook that ended any other way, and every other error, is drawn.
+    var ref = it.ref == null ? "" : String(it.ref);
+    var hookNoise = it.kind === "vendor_error" && (ref.indexOf("error:hook_started:") === 0 ||
+      (ref.indexOf("error:hook_response:") === 0 && / success$/.test(text)));
     if (it.kind === "vendor_approval_request") text = "The room asked for something it cannot have; nothing was granted.";
     if (it.kind === "vendor_approval_resolved") text = "";
     return {
-      gseq: it.gseq, ref: it.ref == null ? "" : String(it.ref), at: it.at || "",
+      gseq: it.gseq, ref: ref, at: it.at || "",
       who: you ? "You" : (room ? "The room" : ""), cls: you ? "rv-you" : (room ? "rv-room" : (it.kind === "vendor_error" ? "rv-error" : "")),
-      kind: String(it.kind), text: text, collapsible: own(COLLAPSED, it.kind), hidden: own(HIDDEN, it.kind) || modeNoise,
+      kind: String(it.kind), text: text, collapsible: own(COLLAPSED, it.kind), hidden: own(HIDDEN, it.kind) || modeNoise || hookNoise,
       ambiguous: it.kind === "message" && it.status === "ambiguous",
       truncated: it.truncated === true, tool: it.tool ? { open: it.tool.open === true } : null
     };
@@ -241,7 +247,11 @@
       if (store) { try { var raw = store.getItem(key); return raw === null ? null : JSON.parse(raw); } catch (e) { /* fall back */ } }
       return own(mem, key) ? mem[key] : null;
     }
+    // A stopped mount writes nothing kept (roomfix2 A1): its late answer to a send made before an app switch would clear
+    // the id and the draft the mount that replaced it is showing, and a Send there would mint a new id for the same words.
+    // The kept id stays; a resend under it is answered as the line it already is.
     function keep(key, v) {
+      if (stopped) return;
       mem[key] = v;
       try { if (store) { if (v === null) store.removeItem(key); else store.setItem(key, JSON.stringify(v)); } } catch (e) { /* no storage */ }
     }
@@ -279,7 +289,7 @@
         .then(function (res) { return res.text().then(function (t) { var j = null; try { j = JSON.parse(t); } catch (e) { /* not JSON */ } return { status: res.status, json: j }; }); });
     }
     function clearDraft(text) {
-      if (ta.value === text) { ta.value = ""; try { if (store) store.removeItem("levain.room.draft"); } catch (e) { /* no storage */ } }
+      if (!stopped && ta.value === text) { ta.value = ""; try { if (store) store.removeItem("levain.room.draft"); } catch (e) { /* no storage */ } }
     }
     sendB.addEventListener("click", function () {
       endDictation();

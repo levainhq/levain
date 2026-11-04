@@ -600,3 +600,59 @@ def test_the_expected_mode_report_is_not_drawn_as_an_error_and_any_other_mode_is
     with _serve(src, write_token=TOKEN, room_serve=rs, extra_assets=assets) as (base, _h):
         out = _drive(tmp_path, base + "/rvc.html", [{"until": "window.__m"}, {"eval": "JSON.stringify(window.__m)"}])
     assert json.loads(out["values"][1]) == [True, False, False]
+
+
+@needs_browser
+def test_a_hook_report_is_not_drawn_as_an_error_and_a_real_error_or_failed_hook_is(tmp_path, qdir):
+    """roomfix2 (RETURN_land_room, a real open on his machine): his SessionStart hook's start came through as an
+    error-kind row, body "SessionStart:startup", ref "error:hook_started:<id>". A hook start or success is hidden by its
+    ref (the key claude_session gives hook events); a hook that failed and any other error still draw."""
+    from tests.test_room_phone import _STYLED
+    cases = [("error:hook_started:h1", "SessionStart:startup"), ("error:hook_response:h1", "SessionStart:startup success"),
+             ("error:hook_response:h2", "PreToolUse:Read error"), ("error:abc:3", "the child exited"),
+             ("error:abc:4", "SessionStart:startup")]
+    boot = "window.__m = %s.map((c, i) => LevainRoomView.lineModel({kind: 'vendor_error', ref: c[0], body: c[1], gseq: i}).hidden);" \
+        % json.dumps(cases)
+    rs, _l, src = _rig(tmp_path, qdir)
+    assets = {"/rvc.html": ("text/html; charset=utf-8", _STYLED.encode()), "/rvc.js": ("text/javascript; charset=utf-8", boot.encode())}
+    with _serve(src, write_token=TOKEN, room_serve=rs, extra_assets=assets) as (base, _h):
+        out = _drive(tmp_path, base + "/rvc.html", [{"until": "window.__m"}, {"eval": "JSON.stringify(window.__m)"}])
+    assert json.loads(out["values"][1]) == [True, True, False, False, False]
+
+
+@needs_browser
+def test_a_send_answered_after_an_app_switch_leaves_the_new_view_its_draft_and_id(tmp_path, qdir):
+    """roomfix2 A1 (FINDINGS_room_r2, the R2 fix's own hole): the OLD mount's answer to a send made before an app switch
+    cleared the kept draft and outbox id while the new mount still showed the draft, so a Send there minted a new id and
+    the line went twice. Here the first send's answer is held until after the switch; the second Send reuses the id."""
+    rs, launcher, src = _rig(tmp_path, qdir)
+    held = ("window.__ids = []; window.__released = 0; const real = window.fetch;"
+            " window.fetch = function (u, o) { if (String(u).endsWith('/cockpit/room/send')) {"
+            " window.__ids.push(JSON.parse(o.body).outbox_id);"
+            " if (window.__ids.length === 1) { const p = real.apply(this, arguments);"
+            " return new Promise(res => { window.__release = () => p.then(r => { res(r); window.__released = 1; }); }); } }"
+            " return real.apply(this, arguments); }; 1")
+    with _serve(src, write_token=TOKEN, room_serve=rs) as (base, _h):
+        out = _drive(tmp_path, base + "/", _TO_THE_ROOM + [
+            {"eval": held},
+            {"do": "document.querySelector('[data-mode-tab=build]').click(); 1",
+             "until": "document.querySelector('.rv-zone .rv-open') && !document.querySelector('.rv-zone .rv-open').hidden"},
+            {"eval": "document.querySelector('.rv-open').click(); 1"},
+            {"until": "!document.querySelector('.rv-input').disabled && document.querySelector('.rv-open').hidden"},
+            {"eval": "const ta = document.querySelector('.rv-input'); ta.value = 'hello once'; ta.dispatchEvent(new Event('input')); "
+                     "document.querySelector('.rv-send').click(); 1"},
+            {"until": "window.__ids.length === 1 && window.__release"},
+            {"eval": _HIDE_AND_SHOW},
+            {"until": "document.querySelectorAll('.rv-input').length === 1 && !document.querySelector('.rv-input').disabled"
+                      " && document.querySelector('.rv-input').value === 'hello once'"},
+            {"eval": "window.__release(); 1"},
+            {"until": "window.__released === 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 300))"},
+            {"eval": "document.querySelector('.rv-send').click(); 1"},
+            {"until": "window.__ids.length === 2 && document.querySelector('.rv-input').value === ''"},
+            {"eval": "JSON.stringify(window.__ids)"},
+        ])
+        mine = [i["body"] for i in _get(base)[1]["stream"] if i["kind"] == "message"]
+    ids = json.loads(out["values"][-1])
+    assert len(ids) == 2 and ids[0] == ids[1], ids
+    assert mine == ["hello once"]
