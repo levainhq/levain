@@ -26,8 +26,9 @@ supervisor does), so the wall's only check is the VM's.
 
 Obligations of the SlotRuntime protocol honoured here: (1) the brief is staged by ``stage_brief_for`` after ``prepare``
 and before ``render``; (2) the gated child's ``returncode`` is the helper's process status through sudo; (3) the
-child's stdout is drained and discarded in bounded memory by :class:`StreamDrain`, never parsed; (4) the ticket goes to
-CONTROL in the LEASE-OPEN frame and nowhere else (no log line, no refusal detail, no stdin).
+child's stdout is drained and discarded in bounded memory by :class:`StreamDrain`, never parsed; (4) the ticket is written
+nowhere: it goes to CONTROL in the LEASE-OPEN frame and to the helper's ``prepare`` stdin (the dispatch grammar requires
+it there, ``bind_stdin``: ``ticket-required``), and into no log line, refusal detail, argv or file.
 """
 from __future__ import annotations
 
@@ -144,6 +145,8 @@ class HelperSlotRuntime:
         self._leases: "dict[str, Any]" = {}
         self._ended: "collections.OrderedDict[str, bool]" = collections.OrderedDict()
         self._drains: "dict[str, tuple[StreamDrain, StreamDrain]]" = {}
+        self._end_locks: "dict[str, threading.Lock]" = {}
+        self._closed = False
 
     # -- the helper's verbs ----------------------------------------------------------------------------------------
 
@@ -158,22 +161,39 @@ class HelperSlotRuntime:
         except OSError as e:
             raise Refused("helper-unrunnable", f"{verb}: {e.strerror or e}") from None
         wall = self._deadlines.get(verb, HELPER_DEADLINE_DEFAULT_S)
+        out_d = StreamDrain(p.stdout, keep=_HELPER_OUT_MAX).start()
+        err_d = StreamDrain(p.stderr, keep=_ERR_TAIL).start()
         try:
-            out, err = p.communicate(input=stdin if stdin is not None else None, timeout=wall)
-        except subprocess.TimeoutExpired:
-            self._end_helper(p)
-            raise Refused("helper-timeout", f"{verb} did not answer in {wall}s") from None
-        except OSError as e:
-            self._end_helper(p)
-            raise Refused("helper-unrunnable", f"{verb}: {e.strerror or e}") from None
+            try:
+                if stdin is not None:
+                    p.stdin.write(stdin)          # type: ignore[union-attr]
+                    p.stdin.close()               # type: ignore[union-attr]
+            except OSError:
+                pass                              # it stopped reading: its answer says why
+            try:
+                p.wait(timeout=wall)
+            except subprocess.TimeoutExpired:
+                raise Refused("helper-timeout", f"{verb} did not answer in {wall}s") from None
+            for d in (out_d, err_d):
+                d.thread.join(wall)               # type: ignore[union-attr]
         finally:
             if p.poll() is None:
                 self._end_helper(p)
-        if err.strip():
-            _log.info("helper %s stderr: %s", verb, _safe(err))
-        if len(out) > _HELPER_OUT_MAX:
+            for f in (p.stdin, p.stdout, p.stderr):
+                if f is not None:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+        if err_d.tail.strip():
+            _log.info("helper %s stderr: %s", verb, _safe(err_d.tail))
+        if out_d.total > _HELPER_OUT_MAX:
             raise Refused("helper-output-malformed", f"{verb}: over {_HELPER_OUT_MAX} bytes")
-        return parse_helper_line(out, verb)
+        out = out_d.tail
+        ans = parse_helper_line(out, verb)
+        if p.returncode != 0:                     # an ok line from a helper that then failed is no success
+            raise Refused("helper-status", f"{verb}: exit {p.returncode}")
+        return ans
 
     def _end_helper(self, p: "subprocess.Popen[bytes]") -> None:
         for send in (p.terminate, p.kill):
@@ -216,13 +236,19 @@ class HelperSlotRuntime:
             if type(nonce) is not str or not nonce:
                 raise Refused("lease-nonce-missing", "LEASE-OPEN")
             prep = self._run("prepare", "egress", "dispatch", req.harness, "passthrough",
-                             stdin=canon.canonical_bytes({"lease_nonce": nonce}), lease=lease)
+                             stdin=canon.canonical_bytes({"lease_nonce": nonce, "ticket": req.ticket}), lease=lease)
             session, _slot = prepare_answer(prep, host=self.host, store=self._store)   # type: ignore[arg-type]
         except BaseException:
             lease.close()                    # the session is not known: CONTROL revokes on EOF, the root reaper ENDs
             raise
         with self._mu:
-            self._leases[session] = lease
+            shut = self._closed
+            if not shut:
+                self._leases[session] = lease
+        if shut:                                  # close() ran meanwhile: END it, refuse; the lease's EOF is the backstop
+            self.end(session)
+            lease.close()
+            raise LauncherRefused("runtime-closed", "the dispatch runtime is shutting down", reason_class="transient")
         child = None
         try:
             staging = self._store / "staging" / session
@@ -242,6 +268,9 @@ class HelperSlotRuntime:
                     child.abort()
                 except Exception:  # noqa: BLE001 - END below is the proof; the gate is closed best effort
                     pass
+                finally:
+                    self.end(session)
+                raise
             self.end(session)
             raise
 
@@ -249,17 +278,26 @@ class HelperSlotRuntime:
         with self._mu:
             if session in self._ended:
                 return True
-        proven = end_by_teardown(self._teardown, session)
-        if proven:
+            gate = self._end_locks.setdefault(session, threading.Lock())
+        with gate:                                # one teardown in flight per session; a second caller shares its result
             with self._mu:
-                lease = self._leases.pop(session, None)
-                self._drains.pop(session, None)
-                self._ended[session] = True
-                while len(self._ended) > _ENDED_KEEP:
-                    self._ended.popitem(last=False)
-            if lease is not None:
-                lease.close()
-        return proven
+                if session in self._ended:
+                    return True
+            proven = end_by_teardown(self._teardown, session)
+            if proven:
+                with self._mu:
+                    lease = self._leases.pop(session, None)
+                    self._drains.pop(session, None)
+                    self._ended[session] = True
+                    self._end_locks.pop(session, None)
+                    while len(self._ended) > _ENDED_KEEP:
+                        self._ended.popitem(last=False)
+                if lease is not None:
+                    try:
+                        lease.close()
+                    except Exception:  # noqa: BLE001 - END is proven; a failing close leaves nothing to retry
+                        _log.warning("closing the lease of ended session %s failed", session)
+            return proven
 
     def stderr_tail(self, session: str) -> bytes:
         """The vendor stderr's last bytes (for a log line), b"" when none is kept."""
@@ -270,6 +308,10 @@ class HelperSlotRuntime:
     def close(self) -> None:
         """Close every lease still held: each EOF revokes its session and the root reaper ENDs it (the shutdown backstop)."""
         with self._mu:
+            self._closed = True
             leases, self._leases = list(self._leases.values()), {}
         for lease in leases:
-            lease.close()
+            try:
+                lease.close()
+            except Exception:  # noqa: BLE001 - one failing close must not leave the rest open
+                _log.warning("closing a lease failed at shutdown")

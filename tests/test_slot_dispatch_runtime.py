@@ -138,7 +138,7 @@ def test_the_order_is_prepare_brief_render_start_and_there_is_no_probe(rt_rig):
         assert handle.session == SESSION and h.verbs() == ["prepare", "render"]        # start waits for the release
         prep, render = h.calls()
         assert prep["argv"] == ["prepare", "egress", "dispatch", "claude", "passthrough"]
-        assert json.loads(prep["stdin"]) == {"lease_nonce": NONCE}
+        assert json.loads(prep["stdin"]) == {"lease_nonce": NONCE, "ticket": "TICKET-SENTINEL-0001"}
         assert render["argv"] == ["render", SESSION] and render["brief_staged"] is True   # the brief BEFORE render
         blob = json.loads(render["stdin"])
         assert blob == {"format": "levain-session-render/1", "vendor": "claude", "routes": ["pypi", "pass-1"],
@@ -166,15 +166,47 @@ def test_the_workspace_seam_runs_between_the_brief_and_render(rt_rig):
     assert seen == [(["prepare"], True)]
 
 
-def test_the_ticket_is_in_the_lease_frame_and_nowhere_else(rt_rig):
+def test_the_ticket_is_in_the_lease_frame_and_prepare_stdin_only(rt_rig):
     h, lease, make = rt_rig
     rt = make()
     handle = rt.start(req())
     handle.child.release()
     handle.child.process.wait(30)
-    blob = json.dumps(h.calls()) + Path(str(h.script) + ".cfg").read_text()
+    others = [c for c in h.calls() if c["argv"][0] != "prepare"]
+    blob = json.dumps(others) + Path(str(h.script) + ".cfg").read_text() + json.dumps([c["argv"] for c in h.calls()])
     assert "TICKET-SENTINEL" not in blob
     assert [c for c in lease.calls if "TICKET-SENTINEL-0001" in json.dumps(c)] == lease.calls
+
+
+def test_prepare_stdin_satisfies_the_real_dispatch_grammar(rt_rig):
+    """Codex L3 HIGH: the fake helper applied no grammar. The real one refuses a dispatch prepare with no ticket."""
+    from levain.slot.runtime_grammar import DISPATCH, bind_stdin, parse_runtime_argv, parse_stdin
+    h, lease, make = rt_rig
+    lease.answer = {"lease_nonce": "Q" * 43}
+    handle = make().start(req("A" * 43))
+    handle.child.abort()
+    prep = h.calls()[0]
+    request = parse_runtime_argv(prep["argv"], configured_slots={"egress": 8, "none": 2}, caller=DISPATCH)
+    bind_stdin(request, parse_stdin("prepare", prep["stdin"].encode()))      # ticket-required would raise
+
+
+def test_an_ok_line_from_a_failing_helper_is_no_success(rt_rig):
+    h, lease, make = rt_rig
+    h.script_("prepare", line=line(ok=True, format=PREPARE_RESULT_FORMAT, session=SESSION,
+                                   slot={"class": "egress", "index": 1}, staging=str(h.staging), gwport=47101), rc=1)
+    with pytest.raises(Refused) as e:
+        make().start(req())
+    assert e.value.name == "helper-status" and lease.closed == 1
+
+
+def test_a_closed_runtime_refuses_a_start_and_ends_it(rt_rig):
+    h, lease, make = rt_rig
+    rt = make()
+    rt.close()
+    # the closed flag is read where the lease is published: a start after close() is refused
+    with pytest.raises(L.LauncherRefused) as e:
+        rt.start(req())
+    assert e.value.name == "runtime-closed" and h.verbs().count("teardown") == 1 and lease.closed >= 1
 
 
 # ---- a failure at each step -----------------------------------------------------------------------------------------
@@ -389,7 +421,7 @@ def test_start_opens_a_real_lease_on_the_ticket_and_holds_it(st, tmp_path):
     try:
         (lease,) = leases
         assert lease.conn.lease is not None and lease.conn.lease.ticket == ticket and lease.conn.lease.live
-        assert json.loads(h.calls()[0]["stdin"]) == {"lease_nonce": lease.conn.lease.nonce}   # the nonce CONTROL issued
+        assert json.loads(h.calls()[0]["stdin"]) == {"lease_nonce": lease.conn.lease.nonce, "ticket": ticket}   # the nonce CONTROL issued
         # one ticket, one lease: a second start on the same ticket is refused by CONTROL, before any helper verb
         with pytest.raises(Refused) as e:
             rt.start(req(ticket))
