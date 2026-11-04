@@ -38,13 +38,17 @@ def test_opening_an_older_item_after_load_older_keeps_the_loaded_pages_and_the_d
         out = _drive(tmp_path, _url(port), [WIDE, READY, OPEN, {"until": f"{ROWS}.length >= 50 && 1", "ms": 30000},
                                             {"eval": f"{MODAL}.querySelector('.nc-older').click(); 1"}, {"until": f"{ROWS}.length >= 100 && 1", "ms": 30000},
                                             {"eval": f"JSON.stringify({{ before: {ROWS}.length }})"},
+                                            {"eval": f"JSON.stringify({{ title: {ROWS}[90].querySelector('.nc-title').textContent }})"},
                                             {"eval": f"{ROWS}[90].querySelector('.nc-main').click(); 1"}, SETTLE, {"eval": state},
                                             {"eval": "window.LevainNotifyCenter.read(false).then(() => 1)"}, SETTLE, {"eval": state}])
         server = _call(port, "GET", "/webpush/center?limit=200", token=T)[1]
-    before, opened, polled = _json(out)
+    # the row's own title is read BEFORE the click: the seeded notices and the deep items share timestamps, so which title sits at
+    # index 90 is not fixed; the claim is "the row I opened stays open", not "it is a deep item"
+    before, row90, opened, polled = _json(out)
     assert before["before"] >= 100, before
+    assert row90["title"], row90
     for s in (opened, polled):
-        assert s["rows"] >= 100 and s["title"].startswith("Deep item") and s["older"] is True, s
+        assert s["rows"] >= 100 and s["title"] == row90["title"] and s["older"] is True, (s, row90)
     assert sum(1 for i in server["items"] if i["read"]) >= 1                          # the open really marked something read
 
 
