@@ -430,3 +430,75 @@ def test_desk_sign_is_false_without_a_key_and_off_the_laptop(tmp_path, keydir):
     def broken(_):
         raise KeyError_("unreadable")
     assert desk_click.desk_sign_available(True, find_key=broken) is False
+
+
+# --- the band-box route (desk_text) and the history badge --------------------------------------------------------
+
+def _text_req(store, text, txn="txn-text-001", local=True, **over):
+    sid, vid = _shown(store)
+    b = {"text": text, "store_id": sid, "view_id": vid, "client_txn": txn}
+    b.update(over)
+    return desk_click.DeskRequest(local, "web", ORIGIN, b)
+
+
+def _text(store, keydir, request, factory=None, policy="all", state=None):
+    return desk_click.desk_text(request, store, state or desk_click.DeskState(), policy=policy, signer_factory=factory,
+                                key_dir=keydir, notify=lambda t: None)
+
+
+def test_text_route_signs_a_line_and_policy_b_leaves_it_unsigned(store, keydir):
+    q = file_q(store)
+    calls = Calls()
+    got, status = _text(store, keydir, _text_req(store, "1a"), factory=calls, policy="authority")
+    assert (status, got["error"]) == (422, "desk_unsigned") and calls.n == 0 and answers(store) == []
+    got, status = _text(store, keydir, _text_req(store, "1a", txn="txn-text-002"), factory=calls)
+    assert status == 200 and got["signed"] and got["recorded"] == ["1a"] and calls.n == 1
+    assert answers(store) == [(q.id, "ship")]
+
+
+def test_text_route_walls(store, keydir, tmp_path):
+    q = file_q(store)
+    calls = Calls()
+    assert _text(store, keydir, _text_req(store, "1a", local=False), factory=calls)[1] == 403
+    assert _text(store, keydir, _text_req(store, "1a", message="x"), factory=calls)[1] == 400
+    got, status = _text(store, keydir, _text_req(store, "1a", txn="txn-text-003", view_id=999), factory=calls)
+    assert (status, got["error"]) == (409, "stale_band")
+    cancel = Calls(fail=KeyError_("Touch ID was cancelled"))
+    got, status = _text(store, keydir, _text_req(store, "1a", txn="txn-text-004"), factory=cancel)
+    assert (status, got["error"]) == (409, "unsigned") and "nothing was recorded" in got["message"]
+    nokey, status = desk_click.desk_text(_text_req(store, "1a", txn="txn-text-005"), store, desk_click.DeskState(),
+                                         policy="all", key_dir=tmp_path / "none", notify=lambda t: None)
+    assert (status, nokey["error"]) == (409, "no_key")
+    assert calls.n == 0 and answers(store) == [] and store.get(q.id).answer is None
+
+
+def test_the_history_badge_reads_the_signature_through_answer_class(rig, store, keydir, monkeypatch):
+    q = file_q(store)
+    rig(body(q, pick="b"), factory=Calls())
+    ok = lambda pk: (True, "bio")        # noqa: E731
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok) == "signed: Touch ID, laptop (desk)"
+    # a tampered stored message reads as a failed claim, never as signed
+    real = band_view.answer_sign_of(store, q.id)
+    monkeypatch.setattr(band_view, "answer_sign_of", lambda st, qid: {
+        **real, "message": real["message"].replace("Hold for the morning", "Ship it tonight")})
+    assert band_view.answer_badge(store, q.id, key_dir=keydir, ctk=ok).startswith("signature failed")
+
+
+def test_the_badge_is_empty_for_an_unsigned_answer_and_without_a_key(rig, store, keydir, tmp_path):
+    q = file_q(store)
+    band_view.answer_item(store, {"kind": "question", "id": q.id, "version": band_view.subject_version(q)},
+                          pick="a", text=None, channel="cockpit", viewer="cockpit:web")
+    assert band_view.answer_badge(store, q.id, key_dir=keydir) == ""
+    assert band_view.answer_badge(store, "q-nope", key_dir=keydir) == ""
+    assert band_view.answer_badge(store, q.id, key_dir=tmp_path / "none") == ""
+
+
+def test_the_delta_line_shows_the_badge(rig, store, keydir, monkeypatch):
+    q = file_q(store)
+    band_view.band_payload(store, "cockpit:web")
+    prev, _vid = band_view._newest_view(store, "cockpit:web")
+    rig(body(q), factory=Calls())
+    monkeypatch.setattr(ts, "_real_key_dir", lambda: keydir)
+    monkeypatch.setattr(ts, "ctk_status", lambda pk, **kw: (True, "bio"))
+    line = band_view._delta_line(store, prev, [])
+    assert "answered via cockpit, signed: Touch ID, laptop (desk)" in line, line

@@ -277,6 +277,7 @@ _KEY_LINE_ROUTE = "/cockpit/passkey/key-line"
 # request that came from the laptop itself (levain.desk_click.desk_answer is the whole route). It rides the key-line
 # routes' gate: a surface token on every bind.
 _DESK_ANSWER_ROUTE = "/cockpit/desk/answer"
+_DESK_TEXT_ROUTE = "/cockpit/desk/text"     # the same, for a line typed in the band box
 _COMPOSE_WAIT_S = 30.0        # how long a second compose of one draft waits for the first's compose_signer call
 # GET /cockpit/sign/<id>.json: ONE request's listing row, behind the listing's gate, so a page never reads "no longer
 # open" off a listing that stopped at its cap (Signer.row)
@@ -1289,8 +1290,8 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
     _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, _COORD_LIST, _COORD_SHEET,
-    cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _PAIR_OFFER, _PAIR_REVOKE,
-    _PAIR_LIST, _PAIR_CLAIM,
+    cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE,
+    _PAIR_OFFER, _PAIR_REVOKE, _PAIR_LIST, _PAIR_CLAIM,
     _NOTIFY_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
@@ -3038,7 +3039,7 @@ class _Handler(GuardedHandler):
         except PhoneError as exc:
             return {"error": exc.error, "message": exc.message}, exc.status
 
-    def _desk_post(self, req: Any) -> "tuple[dict[str, Any], int]":
+    def _desk_post(self, req: Any, route: str = _DESK_ANSWER_ROUTE) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/desk/answer``: :func:`levain.desk_click.desk_answer` over this server's question store. The
         sign lock and the finished-request memory live on the server, so they are shared by every request thread."""
         from levain import band_view, desk_click
@@ -3051,6 +3052,9 @@ class _Handler(GuardedHandler):
         port = self.server.server_address[1]
         request = desk_click.DeskRequest(
             local, str(self._credential(required=True).get("name") or "web"), f"http://localhost:{port}", req)
+        if route == _DESK_TEXT_ROUTE:
+            return desk_click.desk_text(request, store, state, policy=desk_click.DESK_POLICY,
+                                        deliver=lambda done: band_view.deliver_recorded(store, done))
         return desk_click.desk_answer(request, desk_click.LevainDeskHost(store), state,
                                       policy=desk_click.DESK_POLICY,
                                       deliver=lambda done: band_view.deliver_recorded(store, done))
@@ -3988,7 +3992,8 @@ class _Handler(GuardedHandler):
         # and the key-line family's key line (OS-2): the same gate
         key_line = route == _KEY_LINE_ROUTE and self.server.signer is not None
         # and the desk click (TERMSIGN L5a): the same gate, served beside a question store
-        desk = route == _DESK_ANSWER_ROUTE and getattr(self.server, "question_store", None) is not None
+        desk = (route in (_DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE)
+                and getattr(self.server, "question_store", None) is not None)
         # and web push (OS-4): a token on every bind
         push = route in _PUSH_POST and self.server.signer is not None
         if push:
@@ -4142,7 +4147,7 @@ class _Handler(GuardedHandler):
             if desk:
                 # the laptop's own Touch ID signs the click: no read-only refusal applies to it
                 try:
-                    payload, status = self._desk_post(req)
+                    payload, status = self._desk_post(req, route)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client

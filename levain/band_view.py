@@ -64,7 +64,7 @@ __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo
            "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed", "session_band_state",
            "run_band", "run_band_answer", "AnswerCommitted", "AuthorityItem", "BandSnapshot", "PickNotOffered",
            "QUESTION_VERSION_FIELDS", "VersionMoved", "VersionedQuestionStore", "answer_item", "answerable",
-           "subject_for", "subject_version", "summary", "Signing", "answer_sign_of", "allocate", "ALLOCATABLE_SOURCES"]
+           "subject_for", "subject_version", "summary", "Signing", "answer_sign_of", "answer_badge", "allocate", "ALLOCATABLE_SOURCES"]
 
 COMPACT_AFTER = 12
 _COMPACT_WHAT = 100
@@ -1753,6 +1753,57 @@ def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mappin
                       sign_with=sign_with).echo
 
 
+def answer_badge(store: Any, question_id: str, *, key_dir: Path | None = None,
+                 ctk: Callable[[str], tuple[bool | None, str]] | None = None) -> str:
+    """What a reader shows beside an answered item: the one :func:`terminal_sign.answer_class` verdict on its signature
+    (``signed: Touch ID, laptop`` / ``... (desk)``), ``signature failed (<reason>)`` for a signed claim that does not
+    verify, and ``""`` for an unsigned answer, a store with no enrolled key, or anything unreadable. Never raises.
+
+    The reader's trust root is the enrolled terminal key. The store keeps no pre-answer row version, so the version,
+    view and (terminal) session the scope is checked against are the ones the signed message names; the store, install,
+    surface (from the recorded viewer), the question's id and words, the answer and the time are checked against
+    what the store holds."""
+    try:
+        from levain.consent import terminal_sign as ts
+
+        sign = answer_sign_of(store, question_id)
+        if not sign or sign.get("sign_state") != "signed" or not sign.get("message") or not sign.get("sig"):
+            return ""
+        key = ts.find_key(key_dir)
+        q = store.get(question_id)
+        if key is None or q is None or q.answer is None:
+            return ""
+        with store._peek() as conn:
+            via, viewer = conn.execute("SELECT via, viewer FROM answer_context WHERE question_id = ?",
+                                       (question_id,)).fetchone()
+        message = sign["message"]
+        raw = message.encode("utf-8")
+        desk = message.startswith(ts.DESK_FORMAT + "\n")
+        parsed = ts.parse_desk_verified(raw) if desk else ts.parse_verified(raw)
+        sid = _store_id_of(store)
+        context: dict[str, Any] = {
+            "signers": f'phill namespaces="{ts.SIGNERS_NAMESPACES}" {key.public_key}\n', "principal": "phill",
+            "ctk": ctk, "store": f"levain-questions:{sid}", "install": sid, "view": parsed.view,
+            "session": getattr(parsed, "session", None),
+            "surface": (viewer or "").split(":", 1)[1] if str(viewer).startswith("cockpit:") else None}
+        a = q.answer
+        if a.kind == "option":
+            i = [k for k, _ in q.options].index(a.value)
+            event: dict[str, Any] = {"answer": f"({_LETTERS[i]}) {q.options[i][1]}"}
+        else:
+            event = {"text": a.value}
+        event.update({"ts": a.answered_at, "via": via, "signed": {
+            "format": ts.DESK_FORMAT if desk else ts.FORMAT, "message": message, "sig": sign["sig"],
+            "entry": next((n for n, e in enumerate(parsed.entries, 1) if e.item == q.id), 0)}})
+        row = {"id": q.id, "what": q.what, "row_version": parsed.entries[event["signed"]["entry"] - 1].row_version}
+        got = ts.answer_class(event, row, context)
+        if got.state == "signed-terminal":
+            return got.badge
+        return f"signature failed ({got.reason})" if got.state == "failed" else ""
+    except Exception:  # noqa: BLE001 - a display aid never breaks the band
+        return ""
+
+
 def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> str:
     """The viewer's delta since its last view: new numbers, closed ones with how (D4 §4)."""
     if prev is None:
@@ -1769,6 +1820,12 @@ def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> st
                     row = conn.execute("SELECT a.channel FROM band_items b JOIN answers a ON a.question_id = b.ref "
                                        "WHERE b.source = 'question' AND b.n = ?", (n,)).fetchone()
                     how[n] = f"answered via {row[0]}" if row else "gone"
+                    if row:
+                        ref = conn.execute("SELECT ref FROM band_items WHERE source = 'question' AND n = ?",
+                                           (n,)).fetchone()
+                        badge = answer_badge(store, ref[0]) if ref else ""
+                        if badge:
+                            how[n] += f", {badge}"
     parts = []
     if new:
         parts.append("new " + ", ".join(str(n) for n in new))

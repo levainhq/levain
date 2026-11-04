@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 __all__ = ["DESK_POLICY", "DeskHost", "DeskRequest", "DeskRow", "DeskState", "LevainDeskHost", "desk_answer",
-           "desk_sign_available", "requires_sign"]
+           "desk_sign_available", "desk_text", "requires_sign"]
 
 DESK_POLICY = "authority"          # NP-A (b): "authority" signs authority items; "all" (a) signs every desk answer
 POLICIES = ("authority", "all")
@@ -237,6 +237,84 @@ def _desk_answer(req: DeskRequest, host: DeskHost, state: DeskState, policy: str
     return finish(({"recorded": list(getattr(done, "recorded", [])), "signed": True, "channel": "desk",
                     "badge": "signed: Touch ID, laptop (desk)", "echo": getattr(done, "echo", ""),
                     "delivery": "started" if started else "none"}, 200))
+
+
+def desk_text(req: DeskRequest, store: Any, state: DeskState, *, policy: str = DESK_POLICY, signer_factory: Any = None,
+              key_dir: Any = None, notify: Callable[[str], Any] | None = None,
+              deliver: Callable[[Any], None] | None = None, find_key: Callable[..., Any] | None = None
+              ) -> tuple[dict[str, Any], int]:
+    """``POST /cockpit/desk/text``: a line typed in the cockpit's band box, signed with the laptop key when the policy
+    signs information answers (``all``). Body exactly ``{text, store_id, view_id, client_txn}``. Same walls as
+    :func:`desk_answer`: not local 403 ``desk_remote``; the policy not signing information lines 422 ``desk_unsigned``
+    (the page uses the ordinary band path); no key 409 ``no_key``; a held lock 409 ``sign_busy``; a replayed request
+    id returns its first result. A cancelled or timed-out touch records NOTHING (409 ``unsigned``, the box keeps his
+    words); a stale view is 409 ``stale_band``; a line that does not parse is 422. Never raises."""
+    try:
+        return _desk_text(req, store, state, policy, signer_factory, key_dir, notify, deliver, find_key)
+    except Exception as exc:  # noqa: BLE001 - a route answers, it never leaks a traceback
+        return _refuse("internal", type(exc).__name__, 500)
+
+
+def _desk_text(req: DeskRequest, store: Any, state: DeskState, policy: str, signer_factory: Any, key_dir: Any,
+               notify: Callable[[str], Any] | None, deliver: Callable[[Any], None] | None,
+               find_key: Callable[..., Any] | None) -> tuple[dict[str, Any], int]:
+    import sqlite3
+
+    from levain import band_view
+    from levain.consent import terminal_sign as ts
+    from levain.consent.questions import QuestionStoreError
+
+    if not req.local:
+        return _refuse("desk_remote", "a click that did not come from the laptop's own cockpit never asks for Touch ID", 403)
+    b = req.body
+    if (not isinstance(b, Mapping) or set(b) != {"text", "store_id", "view_id", "client_txn"}
+            or not isinstance(b["text"], str) or not b["text"].strip() or len(b["text"]) > 2000
+            or not isinstance(b["store_id"], str) or not isinstance(b["view_id"], int) or isinstance(b["view_id"], bool)
+            or not isinstance(b["client_txn"], str) or _TXN.fullmatch(b["client_txn"]) is None):
+        return _refuse("bad_request", "answer with exactly {text, store_id, view_id, client_txn}", 400)
+    txn = b["client_txn"]
+    first = state.finished(txn)
+    if first is not None:
+        return first
+    if policy not in POLICIES:
+        return _refuse("internal", "unknown desk policy", 500)
+    if not requires_sign("information", policy):
+        return _refuse("desk_unsigned", "this line is recorded unsigned; use the ordinary path", 422)
+    surface = req.surface if isinstance(req.surface, str) and _ID.fullmatch(req.surface) else "web"
+    try:
+        key = (find_key or ts.find_key)(key_dir)
+    except Exception as exc:  # noqa: BLE001
+        return _refuse("key_unreadable", f"the Touch ID key cannot be read: {type(exc).__name__}", 503)
+    if key is None:
+        return _refuse("no_key", "no Touch ID key is enrolled; use the ordinary path", 409)
+    if not state.lock.acquire(blocking=False):
+        return _refuse("sign_busy", "a Touch ID sheet is already open", 409)
+    try:
+        try:
+            done = band_view.answer_text_desk(
+                store, b["text"], viewer=f"cockpit:{surface}", store_id=b["store_id"], view_id=b["view_id"],
+                surface=surface, origin=req.origin, signer_factory=signer_factory, key_dir=key_dir, notify=notify)
+        except band_view.StaleBand as exc:
+            return _refuse("stale_band", str(exc), 409)
+        except ValueError as exc:
+            if str(exc).startswith("Touch ID"):
+                return state_remember(state, txn, _refuse("unsigned", str(exc), 409))
+            return _refuse("answer_refused", str(exc), 422)
+        except (QuestionStoreError, OSError, sqlite3.Error) as exc:
+            return _refuse("source_unavailable", f"the question store cannot answer now: {exc}", 503)
+    finally:
+        state.lock.release()
+    started = bool(done.answered) and deliver is not None
+    if started:
+        threading.Thread(target=deliver, args=(done,), name="levain-answer-delivery", daemon=True).start()
+    return state_remember(state, txn, ({"recorded": done.recorded, "refused": done.refused, "sheets": list(done.sheets),
+                                        "echo": done.echo, "signed": True, "channel": "desk",
+                                        "delivery": "started" if started else "none"}, 200))
+
+
+def state_remember(state: DeskState, txn: str, result: tuple[dict[str, Any], int]) -> tuple[dict[str, Any], int]:
+    state.remember(txn, result)
+    return result
 
 
 class LevainDeskHost:
