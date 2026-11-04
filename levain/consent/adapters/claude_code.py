@@ -45,6 +45,7 @@ import re
 import shlex
 import shutil
 import site
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -1247,7 +1248,15 @@ def _sets_unconfined(kind: str, path: Path, name: str = UNCONFINED_ENV) -> bool:
     an ``env`` block or not) or that cannot be ruled out: an unreadable file, one that does not parse, a JSON file
     that is not an object, a Claude Code ``env`` that is not an object. A missing file sets nothing."""
     try:
-        raw = path.read_bytes()
+        # O_NONBLOCK so a FIFO planted in the managed list cannot hang the gate; classify the OPENED descriptor
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return True   # a FIFO, device or directory: it cannot be ruled out
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                raw = fh.read()
+        finally:
+            os.close(fd)
     except (FileNotFoundError, NotADirectoryError):
         return False
     except Exception:  # noqa: BLE001 - unreadable: it cannot be ruled out

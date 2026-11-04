@@ -1513,7 +1513,13 @@ def load_managed_settings(platform: str = sys.platform) -> list[tuple[str, Any]]
         except (OSError, ValueError, RecursionError):
             docs.append((str(f), _MISSING))
     mcp = base / "managed-mcp.json"
-    if mcp.exists():
+    try:
+        os.lstat(mcp)
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except OSError:
+        docs.append((str(mcp), _MISSING))   # an unsearchable base: refuse, never raise
+    else:
         docs.append((str(mcp), {"__managed_mcp__": True}))
     return docs
 
