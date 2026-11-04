@@ -586,3 +586,165 @@ def test_a_stale_tab_writes_nothing_to_the_store_on_the_stub_and_the_fake_pipe(t
         assert counts(rs2) == before and len(list(fake.glob("spawn-*.argv"))) == spawns
     finally:
         rs2.stop()
+
+
+# --- the fix lane, round 2 (FINDINGS_rmg_r2) -------------------------------------------------------------------------
+# R1: a pump step landing between ensure() returning and the line being recorded must not end the child
+def test_a_pump_step_between_ensure_and_the_recorded_line_does_not_end_the_child(tmp_path):
+    offset = {"s": 0.0}
+    store = make_store(tmp_path)
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    script = tmp_path / "fake_claude"
+    script.write_text(FAKE.format(python=__import__("sys").executable))
+    script.chmod(0o700)
+    cwd, home = tmp_path / "cwd", tmp_path / "home"
+    cwd.mkdir()
+    home.mkdir()
+    rs = RoomServe(store, RoomSetting(str(cwd), model="sonnet", claude_bin=str(script)), run_dir=str(tmp_path / "run"),
+                   launcher_kw={"home": str(home), "environ": {**os.environ, "FAKE_DIR": str(fake)},
+                                "idle_seconds": 60.0,
+                                "now": lambda: datetime.now(timezone.utc) + timedelta(seconds=offset["s"])},
+                   service_kw={"sleep": lambda _s: None}, pump_interval=0.02)
+    rs.start()
+    rs._stop_evt.set()                      # the loop is not the actor here: the test drives the pump step by hand
+    rs._thread.join(5)
+    rs._stop_evt.clear()
+    real_ensure, real_send = rs.launcher.ensure, rs.service.send_room
+    steps = []
+
+    def ensure(**kw):
+        h = real_ensure(**kw)
+        offset["s"] = 86400.0               # the launch is now quiet far past the idle time: the window of the finding
+        return h
+
+    def send_room(*a, **k):
+        t = threading.Thread(target=lambda: steps.append(rs.pump_once()))
+        t.start()
+        t.join(0.5)                         # a pump step landing before the line is recorded (it waits, or it recycles)
+        out = real_send(*a, **k)
+        t.join(5)
+        return out
+    rs.launcher.ensure, rs.service.send_room = ensure, send_room
+    try:
+        r = rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="one")
+        assert r.state == "accepted", r.cause
+        assert rs._handle is not None and rs._handle.launch_id in rs.launcher._live
+        assert rs.launcher.child_alive(rs._handle.launch_id)
+    finally:
+        rs.stop()
+
+
+def test_the_lock_order_is_roomserve_then_launcher_and_a_busy_loop_of_sends_and_pumps_never_deadlocks(tmp_path):
+    _store, rs, launcher = scripted(tmp_path)
+    rs.start()
+    errs = []
+
+    def sender(n):
+        try:
+            for i in range(15):
+                rs.send(author_surface="cockpit", client_id=f"c{n}", outbox_id=f"ob-{n:04d}{i:04d}", body="x")
+        except Exception as exc:  # noqa: BLE001
+            errs.append(exc)
+    ts = [threading.Thread(target=sender, args=(n,)) for n in range(3)]
+    ts.append(threading.Thread(target=lambda: [rs.rotate() for _ in range(5)] and None))
+    try:
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(30)
+        assert not any(t.is_alive() for t in ts) and errs == []
+    finally:
+        rs.stop()
+
+
+# R2: a rotate ends the old launch under the lock; a pump step that held the old handle reads nothing from it
+def test_a_rotate_landing_after_the_pump_took_its_handle_ingests_nothing_from_the_old_launch(tmp_path):
+    _store, rs, launcher = scripted(tmp_path)
+    rs.start()
+    rs._stop_evt.set()
+    rs._thread.join(5)
+    rs._stop_evt.clear()
+    try:
+        rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="one")
+        old, old_session, old_launch = rs.view()["room_thread"], launcher.session, launcher.handle.launch_id
+        old_session.show("agent_text", "r-late", body="LATE-OLD-OUTPUT")
+        real_alive = launcher.child_alive
+
+        def alive(lid):
+            t = threading.Thread(target=rs.rotate)     # lands after the pump took its handle, before it reads
+            t.start()
+            t.join(5)
+            return real_alive(lid)
+        launcher.child_alive = alive
+        rs.pump_once()
+        launcher.child_alive = real_alive
+        new = rs.view()["room_thread"]
+        assert new != old and rs.view()["launch_id"] is None
+        assert old_launch not in launcher.svc._sessions if hasattr(launcher.svc, "_sessions") else True
+        for thread in (old, new):
+            assert not any("LATE-OLD-OUTPUT" in t for t in agent_texts(rs, thread))
+    finally:
+        rs.stop()
+
+
+def test_rotate_ends_the_old_launch_before_it_returns(tmp_path):
+    _store, rs, launcher = scripted(tmp_path)
+    rs.start()
+    try:
+        rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="one")
+        ended = []
+        real_end = launcher.end
+        launcher.end = lambda lid, cause: (ended.append((lid, cause)), real_end(lid, cause))[1]
+        lid = launcher.handle.launch_id
+        rs.rotate()
+        assert [e[0] for e in ended] == [lid]
+    finally:
+        rs.stop()
+
+
+# R3: view() is one snapshot, never a new room paired with the old launch
+def test_view_during_a_rotate_waits_and_never_pairs_the_new_room_with_the_old_launch(tmp_path):
+    _store, rs, launcher = scripted(tmp_path)
+    rs.start()
+    try:
+        rs.send(author_surface="cockpit", client_id="a", outbox_id="ob-00000001", body="one")
+        seen, box = [], {}
+        real_end = launcher.end
+
+        def end(lid, cause):
+            t = threading.Thread(target=lambda: seen.append(rs.view()))
+            t.start()
+            t.join(0.3)
+            box["blocked"] = t.is_alive()
+            box["t"] = t
+            return real_end(lid, cause)
+        launcher.end = end
+        new = rs.rotate()
+        box["t"].join(5)
+        assert box["blocked"] and seen == [{"room_thread": new, "launch_id": None, "last_error": rs.last_error}]
+    finally:
+        rs.stop()
+
+
+# R4: a pump thread that will not start leaves the serve not started, and stop() still closes
+def test_a_pump_thread_that_fails_to_start_leaves_not_started_and_stop_still_closes(tmp_path, monkeypatch):
+    import levain.coordinator.room_serve as mod
+    _store, rs, launcher = scripted(tmp_path)
+
+    class Boom:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+    real = mod.threading.Thread
+    monkeypatch.setattr(mod.threading, "Thread", Boom)
+    with pytest.raises(RuntimeError, match="can't start"):
+        rs.start()
+    monkeypatch.setattr(mod.threading, "Thread", real)
+    assert rs._started is False
+    with pytest.raises(RoomServeError, match="not started"):
+        rs.view()
+    rs.stop()                                # does not raise on an unstarted thread
+    assert launcher.closed and rs._stopped
