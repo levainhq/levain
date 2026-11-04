@@ -221,6 +221,68 @@ def test_a_terminal_signature_on_a_desk_answer_is_channel_mismatch(world):
     assert ts.answer_class({**ev, "via": "terminal"}, ROW, _ctx(signers, **TSCOPE)).state == "signed-terminal"   # today's path
 
 
+def _terminal_signed(path):
+    msg = ts.build_message(store="flow-needs-phill", install="i-1", session="s-1", view="v-1", typed="1a",
+                           entries=[E], nonce=NONCE, at=AT)
+    return msg, {"format": ts.FORMAT, "message": msg.decode(), "sig": _sign(path, msg, ts.NAMESPACE), "entry": 1}
+
+
+@pytest.mark.parametrize("via", ["phone", "cli", "agent", None])
+def test_a_terminal_signature_transplanted_onto_another_channel_is_channel_mismatch(world, via):
+    path, signers = world
+    _, block = _terminal_signed(path)
+    ev = {"ts": "2026-11-03T21:04:30Z", "answer": "(a) Add a Levain 1.0 row", "via": via, "signed": block}
+    if via is None:
+        del ev["via"]
+    got = ts.answer_class(ev, ROW, _ctx(signers, **TSCOPE))
+    assert (got.state, got.reason) == ("failed", "channel-mismatch"), got
+    assert ts.answer_class({**ev, "via": "seat"}, ROW, _ctx(signers, **TSCOPE)).state == "signed-terminal"
+
+
+def _terminal_countersign(path, **kw):
+    msg = ts.build_message(store="flow-needs-phill", install="i-1", session="s-2", view="v-2", typed="1a",
+                           entries=[E], nonce=NONCE, at=AT, countersign_of="2026-11-03T20:00:00Z")
+    cs = {"of_ts": "2026-11-03T20:00:00Z", "ts": "2026-11-03T21:04:30Z", "session": "s-2", "view": "v-2",
+          "signed": {"format": ts.FORMAT, "message": msg.decode(), "sig": _sign(path, msg, ts.NAMESPACE), "entry": 1}}
+    cs.update(kw)
+    return cs
+
+
+def test_a_terminal_countersign_on_another_channel_confers_nothing(world):
+    path, signers = world
+    original = {"ts": "2026-11-03T20:00:00Z", "answer": "(a) Add a Levain 1.0 row", "via": "cli"}
+    ctx = dict(_ctx(signers, **TSCOPE))
+    good = ts.answer_class(original, ROW, {**ctx, "countersigns": [_terminal_countersign(path)]})
+    assert good.state == "signed-terminal" and good.late
+    for via in ("phone", "cli", "cockpit"):
+        got = ts.answer_class(original, ROW, {**ctx, "countersigns": [_terminal_countersign(path, via=via)]})
+        assert got.state == "agent-resolved", (via, got)
+    assert ts.answer_class(original, ROW, {**ctx, "countersigns": [_terminal_countersign(path, via="seat")]}
+                           ).state == "signed-terminal"
+
+
+def test_a_desk_countersign_on_a_non_desk_via_confers_nothing(world):
+    path, signers = world
+    original = {"ts": "2026-11-03T20:00:00Z", "answer": "(a) Add a Levain 1.0 row", "via": "cockpit"}
+    msg = _click(countersign_of="2026-11-03T20:00:00Z", countersign="confirm")
+    cs = {"of_ts": "2026-11-03T20:00:00Z", "ts": "2026-11-03T21:04:30Z", "surface": "web", "view": "item",
+          "via": "phone", "signed": {"format": ts.DESK_FORMAT, "message": msg.decode(),
+                                     "sig": _sign(path, msg, ts.DESK_NAMESPACE), "entry": 1}}
+    assert ts.answer_class(original, ROW, _ctx(signers, countersigns=[cs])).state == "agent-resolved"
+
+
+def test_a_terminal_countersign_claiming_disown_never_confirms(world):
+    """The terminal format can only confirm: an event that names it a disown is a mismatch, never a confirmation."""
+    path, signers = world
+    original = {"ts": "2026-11-03T20:00:00Z", "answer": "(a) Add a Levain 1.0 row", "via": "cli"}
+    ctx = dict(_ctx(signers, **TSCOPE))
+    got = ts.answer_class(original, ROW, {**ctx, "countersigns": [_terminal_countersign(path, countersign="disown")]})
+    assert got.state != "signed-terminal", got
+    assert got.state == "agent-resolved"
+    named = ts.answer_class(original, ROW, {**ctx, "countersigns": [_terminal_countersign(path, countersign="confirm")]})
+    assert named.state == "signed-terminal" and named.late
+
+
 def test_a_desk_signature_on_a_terminal_or_unlabelled_answer_is_channel_mismatch(world):
     path, signers = world
     for via in ("terminal", "seat", None):

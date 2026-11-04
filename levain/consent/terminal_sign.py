@@ -47,7 +47,7 @@ from levain.trust_anchor import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_pr
 
 __all__ = ["AnswerClass", "DESK_FORMAT", "DESK_NAMESPACE", "DESK_SCOPE_FIELDS", "DESK_VIAS", "Entry", "FAILED_REASONS",
            "KEY_LABEL", "MessageError", "NAMESPACE", "FORMAT", "ParsedDesk", "ParsedMessage", "REASONS",
-           "SCOPE_FIELDS", "SignOutcome", "StatusReport", "TerminalKey", "VerifyResult", "answer_class",
+           "SCOPE_FIELDS", "SignOutcome", "StatusReport", "TERMINAL_VIAS", "TerminalKey", "VerifyResult", "answer_class",
            "build_desk_message", "build_message", "create", "default_desk_signer_factory", "default_signer_factory",
            "enroll_command", "event_time", "find_key", "fresh", "is_remote", "parse_desk_verified", "parse_verified",
            "session_refusal", "sign", "status", "target_id", "verify"]
@@ -57,6 +57,7 @@ NAMESPACE = "levain-terminal-answer"
 DESK_FORMAT = "levain-desk-answer/1"
 DESK_NAMESPACE = "levain-desk-answer"
 DESK_VIAS = ("cockpit", "cockpit-desk")    # Levain's answer_context.via 'cockpit'; flow's resolve-event label
+TERMINAL_VIAS = ("terminal", "seat")       # the seat hook records 'seat'; a resolve event labels it 'terminal'
 GESTURES = ("click", "typed")
 COUNTERSIGNS = ("confirm", "disown")
 SIGNERS_NAMESPACES = f"{NAMESPACE},{DESK_NAMESPACE}"
@@ -999,8 +1000,11 @@ def _signed(spec: _Spec, signed: Any, recorded: Mapping[str, Any], row: Mapping[
         return _failed("countersign-mismatch", "a countersign message presented as a direct answer"), parsed
     if countersign_of is not None and parsed.countersign_of != countersign_of:
         return _failed("countersign-mismatch", "the signed countersign-of does not name this answer"), parsed
-    if want is not None and getattr(parsed, "countersign", None) not in (None, want):
-        return _failed("countersign-mismatch", "the signed countersign is not the kind this event claims"), parsed
+    if countersign_of is not None:
+        # the kind a countersign SIGNED: the desk format names it; the terminal format can only confirm
+        kind = parsed.countersign if spec.channel == "desk" else "confirm"
+        if kind not in COUNTERSIGNS or (want is not None and want != kind):
+            return _failed("countersign-mismatch", "the signed countersign is not the kind this event claims"), parsed
     n = signed.get("entry")
     if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= len(parsed.entries):
         return _failed("not-this-row", "the event names no entry of the signed message"), parsed
@@ -1066,8 +1070,8 @@ def _answer_class(answer: Any, row: Any, context: Any) -> AnswerClass:
     if signed is not None:
         fmt = signed.get("format") if isinstance(signed, Mapping) else None
         if fmt == FORMAT:
-            if via in DESK_VIAS:
-                return _failed("channel-mismatch", "a terminal-namespace signature on a desk answer")
+            if via not in TERMINAL_VIAS:
+                return _failed("channel-mismatch", "a terminal-namespace signature on an answer not made at a terminal")
             spec = _TERMINAL
         elif fmt == DESK_FORMAT:
             if via not in DESK_VIAS:
@@ -1084,11 +1088,12 @@ def _answer_class(answer: Any, row: Any, context: Any) -> AnswerClass:
             continue
         block = cs.get("signed")
         fmt = block.get("format") if isinstance(block, Mapping) else None
-        # a countersign has its own channel: a terminal-format one is never a desk event; a desk-format one that names
-        # its via must name a desk label (one that names none is judged by its namespace alone)
-        if fmt == FORMAT and cs.get("via") not in DESK_VIAS:
+        # a countersign has its own channel: one that names its via must name a label of its format's channel; one
+        # that names none is judged by its namespace alone
+        cs_via = cs.get("via")
+        if fmt == FORMAT and (cs_via is None or cs_via in TERMINAL_VIAS):
             spec = _TERMINAL
-        elif fmt == DESK_FORMAT and cs.get("via", "cockpit") in DESK_VIAS:
+        elif fmt == DESK_FORMAT and (cs_via is None or cs_via in DESK_VIAS):
             spec = _DESK
         else:
             continue
