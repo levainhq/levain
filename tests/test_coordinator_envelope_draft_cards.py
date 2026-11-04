@@ -5,6 +5,7 @@ Synthetic words.
 Each test names the line it guards; the lane's return records the revert that made it fail."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 
@@ -343,7 +344,7 @@ def test_rule_reads_no_disk_under_the_lock(ctx, monkeypatch, spies):
     assert calls == {"gauge": 1, "q13": 1} and hs.kind == "live" and hs.crossed == ()
     calls.update(gauge=0, q13=0)
     spies.update(refusal=0)
-    given = drafts.HeadState(hs.kind, hs.reason, hs.envelope_id, hs.since, hs.ref, hs.lapses, ("hours",))
+    given = dataclasses.replace(hs, crossed=("hours",))
     r = drafts.renew_rule(ctx.store, t.thread_id, given, by="operator")
     assert calls == {"gauge": 0, "q13": 0} and spies["refusal"] == 0   # no gauge, no file, no verifier under the lock
     assert r.proposal["budget"]["hours"] is None and head["budget"]["hours"] == 2   # the crossed set is the ARGUMENT
@@ -364,3 +365,133 @@ def test_card_claims_no_author(ctx):
     assert cite["line"] == "in this thread" and "as reported by the sender" in cite["surface"]
     assert cite["words"] == d.words and "claim of relevance" in card.detail["cite_note"]
     assert card.detail["against"]["base_kind"] == "none" and card.detail["anchor"]["drop_id"] == d.drop_id
+
+
+# L3 h12 r1 ----------------------------------------------------------------------------------------------------------
+def _unreadable(monkeypatch):
+    def q13(*_a, **_k):
+        raise sqlite3.OperationalError("limits.db is corrupt (synthetic)")
+
+    monkeypatch.setattr(budget, "_q13", q13)
+
+
+@pytest.mark.parametrize("beside", [None, "stop", "thread_changed"])
+def test_an_unmeterable_budget_offers_only_close(ctx, monkeypatch, beside):
+    """codex MED + deepseek MED 3 + complement LOW 3: the fail-closed rule reads ``budget_unreadable`` anywhere in the
+    lapses, not only as the first reason; the card and ``renew/1`` refuse it alike."""
+    hd, head, t = head_thread(ctx)
+    if beside == "stop":
+        later(ctx)
+    elif beside == "thread_changed":
+        late = ctx.plain("a drop that moves the thread")
+        ctx.store.split(late.drop_id, [Part("work", attach=t.thread_id)])
+    _unreadable(monkeypatch)
+    hs = hstate(ctx, t)
+    assert hs.kind == "lapsed" and "budget_unreadable" in hs.lapses and hs.reason == (beside or "budget_unreadable")
+    (card,) = cards(ctx, t)
+    assert card.kind == "LAPSED" and card.actions == ("close",)
+    assert "cannot be metered" in card.line and "corrupt" in card.line
+    with pytest.raises(CoordError, match="cannot be metered"):
+        drafts.renew_rule(ctx.store, t.thread_id, hs, by="operator")
+    assert ctx.rows("SELECT COUNT(*) FROM envelope_drafts") == [(0,)]
+
+
+def test_a_head_state_is_bound_to_its_thread(ctx, monkeypatch):
+    """codex MED: one envelope heads two threads with different gauges; a state read for one thread is refused for the
+    other by both rules, so a crossed key is never copied from the wrong gauge."""
+    d = ctx.plain("two threads under one envelope")
+    ta, tb = ctx.store.split(d.drop_id, [Part("work", "a"), Part("work", "b")])
+    body = ctx.body(d.drop_id, d.words, origin="worded",
+                    binds=[{"thread_id": x.thread_id, "rev": x.rev, "members_sha256": x.members_sha256}
+                           for x in (ta, tb)])
+    _stored, created = ctx.accept(ctx.sign(body))
+    assert created
+    real = budget.gauge
+
+    def gauge(conn, queue_dir, thread_id):                             # thread A has crossed tool_calls, B has not
+        g = real(conn, queue_dir, thread_id)
+        return dataclasses.replace(g, crossed=("tool_calls",)) if g is not None and thread_id == ta.thread_id else g
+
+    monkeypatch.setattr(budget, "gauge", gauge)
+    ha, hb = hstate(ctx, ta), hstate(ctx, tb)
+    assert (ha.kind, ha.crossed, ha.thread_id) == ("lapsed", ("tool_calls",), ta.thread_id)
+    assert (hb.kind, hb.thread_id) == ("live", tb.thread_id) and ha.envelope_id == hb.envelope_id
+    with pytest.raises(DraftStale, match="another thread"):
+        drafts.renew_rule(ctx.store, ta.thread_id, hb, by="operator")
+    with pytest.raises(DraftStale, match="another thread"):
+        drafts.renew_rule(ctx.store, tb.thread_id, ha, by="operator")
+    assert ctx.rows("SELECT COUNT(*) FROM envelope_drafts") == [(0,)]
+    r = drafts.renew_rule(ctx.store, ta.thread_id, ha, by="operator")
+    assert r.proposal["budget"]["tool_calls"] is None and r.proposal["binds"][0]["thread_id"] == ta.thread_id
+    kill(ctx, body)
+    ka = hstate(ctx, ta)
+    assert (ka.kind, ka.reason) == ("revoked", "killed")
+    with pytest.raises(DraftStale, match="another thread"):
+        drafts.replace_rule(ctx.store, tb.thread_id, ka, by="operator")
+
+
+def test_an_ended_head_reads_no_gauge(ctx, monkeypatch):
+    """complement LOW 2: a killed or ended head is never metered, so a gauge that raises cannot turn its card into a
+    fault. (A key-revoked head is still metered: the verifier runs after the read.)"""
+    hd, head, t = head_thread(ctx)
+    kill(ctx, head)
+    hd2, head2, t2 = head_thread(ctx, "land the other readme change")
+    ctx.store.set_state(t2.thread_id, "done", by="coordinator", token=_lease(ctx.store))
+    ctx.store.set_state(t2.thread_id, "open", by="operator")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("a gauge that raises")
+
+    monkeypatch.setattr(budget, "gauge", boom)
+    assert (hstate(ctx, t).kind, [c.kind for c in cards(ctx, t)]) == ("revoked", ["REVOKED"])
+    assert (hstate(ctx, t2).kind, [c.kind for c in cards(ctx, t2)]) == ("ended", ["REVOKED"])
+
+
+def test_replace_without_prefill_leaves_every_value_unset(ctx):
+    """complement LOW 4: P2 option b. Every editable value but the stop is unset; only the stop is cited."""
+    hd, head, t = head_thread(ctx)
+    kill(ctx, head)
+    r = drafts.replace_rule(ctx.store, t.thread_id, hstate(ctx, t), prefill=False, by="operator")
+    assert all(r.proposal[k] is None for k in ed.EDITABLE if k != "stop_at")
+    assert r.proposal["stop_at"] == utc_stamp(ctx.clk[0] + 2 * HOUR)
+    assert [c["field"] for c in r.cites] == ["stop_at"] and not ed.is_complete(r.proposal)
+    (card,) = cards(ctx, t)
+    assert card.kind == "ENVELOPE" and card.actions == ("withdraw",)
+
+
+def test_replace_prefill_leaves_out_a_dropped_effect(ctx):
+    """complement LOW 4: the prefill is the signed body LESS its drop_effect narrowings."""
+    a, c = ctx.land("main"), ctx.land("other")
+    hd, head, t = head_with(ctx, "two lands", lands=[a, c])
+    assert ctx.store.attenuate(head["envelope_id"], "drop_effect", env.effect_identity("lands", c))
+    kill(ctx, head)
+    r = drafts.replace_rule(ctx.store, t.thread_id, hstate(ctx, t), by="operator")
+    assert [env.effect_identity("lands", e) for e in r.proposal["lands"]] == [env.effect_identity("lands", a)]
+
+
+def test_replace_refuses_a_state_the_head_no_longer_matches(ctx):
+    """complement LOW 4: a state that says killed over a head that is not killed (and not read as key-revoked) is
+    refused under the lock, and nothing is written."""
+    hd, head, t = head_thread(ctx)
+    forged = dataclasses.replace(hstate(ctx, t), kind="revoked", reason="killed")
+    with pytest.raises(DraftStale, match="not revoked or ended now"):
+        drafts.replace_rule(ctx.store, t.thread_id, forged, by="operator")
+    assert ctx.rows("SELECT COUNT(*) FROM envelope_drafts") == [(0,)]
+
+
+def test_renew_after_the_key_is_revoked_grants_nothing_unseen(ctx, tmp_path):
+    """complement LOW 1 / LOW 4, a known edge pinned: the key is revoked between the read and the lock. ``renew/1``
+    does not re-check the key and writes its draft; the builder re-runs the verifier, so the signer is shown the head
+    as granting nothing and every value as new."""
+    hd, head, t = head_thread(ctx)                                     # signed by the phone key
+    hs = hstate(ctx, t)
+    assert hs.kind == "live"
+    revoked = _revoked_phone(tmp_path, ctx.keys)                       # the key is revoked after the read
+    r = drafts.renew_rule(ctx.store, t.thread_id, hs, by="operator")
+    _text, _payload, _since, against = drafts.draft_sign_bytes(
+        ctx.store, r.draft_id, r.revision, r.digest, authority=revoked, signer_fp=ctx.keys["laptop"].fp,
+        signed_at=ctx.clk[0])
+    assert against.base_kind == "revoked" and "no longer holds" in against.reason and against.wider
+    assert against.diff["effects"]["lands"]["added"] and against.diff["where"]["added"]
+    (card,) = cards(ctx, t, revoked)
+    assert card.kind == "ENVELOPE" and card.detail["against"]["base_kind"] == "revoked"
