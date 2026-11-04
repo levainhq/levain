@@ -32,10 +32,15 @@ the operator may replay a valid proof for any occurrence of an already-signed sp
 what he signed) and the launch's brief, harness and model, which travel in the request (an open design question, the
 S10b fix-round RETURN).
 
-**Where the readers come from** (``main``): the operator's uid is the operator record's; the operator's home is that
-account's; the agent store is ``<home>/.levain/autonomic`` (the default every ``levain agents`` verb opens), and the
-cockpit root is the store's ``session_install.json``. The unit has fixed argv, so there is no flag for them in an
-install; the dispatch uid must be GIVEN read access to both (install step, UNVERIFIED here).
+**Where the readers come from** (``build_server``): the operator's uid is the operator record's (0644). The server reads
+NOTHING from the operator's home. The authority ledger is a dispatch-owned REPLICA (``L/dispatch/authority``,
+:class:`levain.agents.authority_replica.AuthorityReplica`) that the fire feeds over the run socket with ``SYNC`` (rows
+that strictly continue the replica's head); the server verifies every row itself (chain plus SSHSIG), commits only a
+verified continuation and never moves backward (its own anchor). ``LAUNCH`` and ``RELEASE`` carry ``ledger_head`` (the
+client's verified head, which must be the replica's, else a transient ``ledger-behind``: SYNC and retry) and ``LAUNCH``
+carries the agent's ``bar`` (open flag and highest closed bar's revoke seq, checked to lie inside the replica's seq;
+``RELEASE`` re-judges with the LAUNCH's bar). A false bar or a withheld row is the power a process running as the operator
+already had over the live files; it can forge no signature and cannot roll the replica back (design 1104-28 section 2.4).
 """
 from __future__ import annotations
 
@@ -54,12 +59,14 @@ import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 from urllib.parse import quote
 
 from levain import authority as _auth
 from levain.agents import controller as _ctl
 from levain.agents import session_client as C
+from levain.agents.authority_replica import AuthorityReplica, ReplicaRefused, ReplicaRow
 from levain.agents.accounting import ActionExposure, StopResult
 from levain.agents.session_launcher import LauncherRefused, RealLauncher, SessionIndex
 from levain.slot import Refused
@@ -165,6 +172,47 @@ def _default_verify_sig() -> Callable[..., bool]:
     return verify_link_sig
 
 
+@dataclass(frozen=True)
+class FrameClaims:
+    """What a LAUNCH or RELEASE frame says about the operator's side: ``ledger_head`` is the client's verified
+    ``(seq, hash)``; ``bar`` is ``(open bar?, highest closed bar's revoke_seq)`` of the agent. Neither is trusted beyond
+    this: the head must equal the replica's, the bar is only bounded by the replica's seq."""
+    ledger_head: tuple[int, str]
+    bar: tuple[bool, int]
+
+
+def replica_verifier(replica: AuthorityReplica, *,
+                     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                     verify_sig: Optional[Callable[..., bool]] = None
+                     ) -> Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], None]:
+    """The production ``verify`` of :class:`RunServer`: :func:`verify_point_of_use` over THIS server's replica, with
+    the ledger head and the bar taken from the frame. No second authority, no operator-home read."""
+    def verify(proof: C.LinkProof, exposure: Optional[ActionExposure], claims: Optional[FrameClaims]) -> None:
+        if claims is None:
+            raise LauncherRefused("ledger-head-missing", "the frame names no ledger head")
+        try:
+            head = replica.head()
+        except Exception:  # noqa: BLE001 - a replica that cannot be read authorises nothing
+            raise LauncherRefused("authority-unreadable", "the authority replica cannot be read",
+                                  reason_class="transient") from None
+        if head != claims.ledger_head:
+            raise LauncherRefused("ledger-behind", "the replica's ledger head is not the claimed head: SYNC, then retry",
+                                  reason_class="transient")
+        barred, closed = claims.bar
+        if not 0 <= closed <= head[0]:
+            raise LauncherRefused("bar-invalid", "the claimed closed bar lies outside the replica's ledger")
+
+        def replay() -> Any:
+            state = replica.replay()
+            if (state.seq, state.head_hash) != head:
+                raise LauncherRefused("ledger-behind", "the replica moved during the check", reason_class="transient")
+            return state
+
+        verify_point_of_use(proof, exposure, replay=replay, now=now, bar_of=lambda agent: (barred, closed),
+                            verify_sig=verify_sig)
+    return verify
+
+
 def agent_store_bar(db_path: "Path | str") -> Callable[[str], tuple[bool, int]]:
     """``bar_of`` over the agent store at ``db_path``, read-only: ``(has an open bar, highest closed bar's revoke_seq or
     0)``. A store that does not read raises (the caller refuses transient), never reads as "no bar"."""
@@ -251,8 +299,9 @@ class _Holder:
     cleanup started (``job``, set once under ``lock``: the cleanup runs once whichever of EOF, a refused RELEASE or
     shutdown reaches it first). It leaves ``_live`` only when an END for its key is PROVEN."""
 
-    def __init__(self, key: str, proof: C.LinkProof, exposure: Optional[ActionExposure]) -> None:
-        self.key, self.proof, self.exposure = key, proof, exposure
+    def __init__(self, key: str, proof: C.LinkProof, exposure: Optional[ActionExposure],
+                 claims: Optional[FrameClaims] = None) -> None:
+        self.key, self.proof, self.exposure, self.claims = key, proof, exposure, claims
         self.child: Any = None
         self.ready = threading.Event()
         self.aborted = False
@@ -269,15 +318,19 @@ class _EndJob:
 class RunServer:
     """The protocol and the per-key END jobs; the socket loop is :func:`serve`. ``verify(proof, exposure)`` raises
     :class:`LauncherRefused` (production: :func:`verify_point_of_use` bound to this server's readers);
-    ``pool_free()`` is whether a free egress slot exists; ``peer_ok(sock)`` is the peer-uid check."""
+    ``pool_free()`` is whether a free egress slot exists; ``peer_ok(sock)`` is the peer-uid check. With a ``replica``
+    (production) ``SYNC`` feeds it and LAUNCH/RELEASE must carry ``ledger_head`` (LAUNCH also ``bar``), passed to
+    ``verify`` as :class:`FrameClaims`; without one the frames carry neither and ``verify`` gets ``None``."""
 
-    def __init__(self, launcher: RealLauncher, *, verify: Callable[[C.LinkProof, Optional[ActionExposure]], None],
+    def __init__(self, launcher: RealLauncher, *,
+                 verify: Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], None],
                  pool_free: Callable[[], bool], peer_ok: Callable[[socket.socket], bool],
                  holder_idle_s: float = HOLDER_IDLE_S, max_connections: int = MAX_CONNECTIONS,
-                 max_holders: int = MAX_HOLDERS) -> None:
+                 max_holders: int = MAX_HOLDERS, replica: Optional[AuthorityReplica] = None) -> None:
         if not 0 < max_holders < max_connections:
             raise ValueError("holders must be capped below the connection cap (USAGE and END need a permit)")
         self.launcher, self._verify, self._pool_free, self._peer_ok = launcher, verify, pool_free, peer_ok
+        self._replica = replica
         self._idle = holder_idle_s
         self._mu = threading.Condition(threading.Lock())
         self._jobs: dict[str, _EndJob] = {}
@@ -358,15 +411,18 @@ class RunServer:
         if op == "LAUNCH":
             if mine is not None:
                 raise C.WireError("one launch per connection")
-            launch, proof = C.launch_from_wire(req)
-            self._verify(proof, launch.exposure)
+            claims = self._claims(req, bar=True)
+            launch, proof = C.launch_from_wire({k: v for k, v in req.items() if k not in ("ledger_head", "bar")})
+            self._verify(proof, launch.exposure, claims)
             self._pool()
-            holder = self._spawn(launch, proof)
+            holder = self._spawn(launch, proof, claims)
             try:
                 return C.ok_answer(rid, session=holder.child.session), holder
             except BaseException:
                 self._finish(holder, 0.0)
                 raise
+        if op == "SYNC":
+            return self._sync(rid, self._fields(req, "rows")["rows"]), mine
         if op == "USAGE":
             key = self._key(self._fields(req, "session_key")["session_key"])
             return C.ok_answer(rid, usage=C.usage_to_wire(self.launcher.usage(key))), mine
@@ -377,11 +433,11 @@ class RunServer:
         if mine is None:
             raise C.WireError(f"{op} before LAUNCH")
         if op == "RELEASE":
-            self._fields(req)
+            claims = self._release_claims(req, mine)
             # the point of use is here too: a link that expired, was revoked or barred while the slot was prepared
             # starts nothing; the child is aborted and ENDed (codex r1 :339)
             try:
-                self._verify(mine.proof, mine.exposure)
+                self._verify(mine.proof, mine.exposure, claims)
             except LauncherRefused:
                 self._finish(mine, HOLDER_END_WAIT_S)
                 raise
@@ -414,6 +470,54 @@ class RunServer:
             raise C.WireError("session_key is off the grammar")
         return v
 
+    def _claims(self, req: Mapping[str, object], *, bar: bool) -> Optional[FrameClaims]:
+        """The frame's ``ledger_head`` (and ``bar``), decoded; None on a server without a replica."""
+        if self._replica is None:
+            return None
+        head = C._exact(req.get("ledger_head"), ("seq", "hash"), "ledger_head")
+        seq, digest = C._int(head["seq"], "ledger_head.seq"), C._str(head["hash"], "ledger_head.hash", max_len=128)
+        if bar:
+            b = C._exact(req.get("bar"), ("open", "closed_revoke_seq"), "bar")
+            if type(b["open"]) is not bool:
+                raise C.WireError("bar.open is not a boolean")
+            return FrameClaims((seq, digest), (b["open"], C._int(b["closed_revoke_seq"], "bar.closed_revoke_seq")))
+        return FrameClaims((seq, digest), (False, 0))
+
+    def _release_claims(self, req: Mapping[str, object], holder: "_Holder") -> Optional[FrameClaims]:
+        """RELEASE: its own ``ledger_head`` (a fresh SYNC may have moved it), the LAUNCH's bar."""
+        if self._replica is None:
+            self._fields(req)
+            return None
+        self._fields(req, "ledger_head")
+        head = self._claims(req, bar=False)
+        assert head is not None
+        return FrameClaims(head.ledger_head, holder.claims.bar if holder.claims is not None else (False, 0))
+
+    def _sync(self, rid: int, rows: object) -> dict:
+        """``SYNC``: append the rows that continue the replica's head (none: just read it); answer the new head."""
+        if self._replica is None:
+            raise LauncherRefused("sync-unavailable", "this server holds no authority replica")
+        if type(rows) is not list:
+            raise C.WireError("rows is not a list")
+        keys = ("seq", "prev_hash", "record", "signer_fp", "signature", "hash")
+        decoded = []
+        for i, o in enumerate(rows):
+            o = C._exact(o, keys, f"rows[{i}]")
+            decoded.append(ReplicaRow(C._int(o["seq"], "seq", lo=1), C._str(o["prev_hash"], "prev_hash", max_len=128),
+                                      C._str(o["record"], "record", max_len=64 * 1024),
+                                      C._str(o["signer_fp"], "signer_fp", max_len=256),
+                                      C._str(o["signature"], "signature", max_len=16 * 1024),
+                                      C._str(o["hash"], "hash", max_len=128)))
+        try:
+            seq, digest = self._replica.append(decoded)
+        except ReplicaRefused as exc:
+            raise LauncherRefused(exc.name, exc.detail, reason_class=exc.reason_class) from None
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("SYNC failed (%s)", type(exc).__name__)
+            raise LauncherRefused("replica-unreadable", "the authority replica could not be updated",
+                                  reason_class="transient") from None
+        return C.ok_answer(rid, head={"seq": seq, "hash": digest})
+
     def _pool(self) -> None:
         try:
             free = self._pool_free()
@@ -424,7 +528,7 @@ class RunServer:
 
     # -- holders -----------------------------------------------------------------------------------------------------
 
-    def _spawn(self, launch: Any, proof: C.LinkProof) -> _Holder:
+    def _spawn(self, launch: Any, proof: C.LinkProof, claims: Optional[FrameClaims] = None) -> _Holder:
         """``RealLauncher.spawn`` under a holder permit (capped below the connection cap). The holder is registered in
         ``_live`` BEFORE the blocking spawn, in the same critical section that reads ``_closing``, so a shutdown's
         snapshot holds every spawn that can still produce a session; refused transient while the server is stopping."""
@@ -436,7 +540,7 @@ class RunServer:
                 raise LauncherRefused("session-key-already-used", "this server already holds a session under this key")
             if not self._holder_slots.acquire(blocking=False):
                 raise LauncherRefused("no-holder-capacity", "every holder slot is taken", reason_class="transient")
-            holder = self._live[key] = _Holder(key, proof, launch.exposure)
+            holder = self._live[key] = _Holder(key, proof, launch.exposure, claims)
         try:
             child = self.launcher.spawn(launch)
         except BaseException:
@@ -673,31 +777,27 @@ def _cockpit_root(store_dir: Path) -> Path:
     return Path(read_install(store_dir).cockpit_root)
 
 
-def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, agent_store_dir: Path,
-                 cockpit_root: Path) -> RunServer:
-    """The production wiring: the real ports behind :class:`RealLauncher`."""
-    from levain.agent_authority import AgentAuthority
-    from levain.autonomic.db import DB_NAME
+def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, agent_store_dir: Optional[Path] = None,
+                 cockpit_root: Optional[Path] = None) -> RunServer:
+    """The production wiring: the real ports behind :class:`RealLauncher`, and the authority REPLICA at
+    ``<store>/dispatch/authority`` behind :func:`replica_verifier`. ``agent_store_dir`` and ``cockpit_root`` are the
+    operator-home readers of the earlier shape: accepted and IGNORED (slice B2 drops them with ``main``'s flags)."""
     from levain.qbroker.peercred import peer_uid
     from levain.slot.dispatch_runtime import DispatchControlPort, HelperSlotRuntime
     index_dir = store / "dispatch" / "sessions"
-    authority = AgentAuthority(cockpit_root)
-    bar_of = agent_store_bar(agent_store_dir / DB_NAME)
+    replica = AuthorityReplica(store / "dispatch" / "authority")
     launcher = RealLauncher(DispatchControlPort(control_sock),
                             HelperSlotRuntime(host=host, control_socket=control_sock, store=store),
                             bound_usage_sources(queue_root=store / "queue", store=store, index_dir=index_dir),
                             SessionIndex(index_dir))
     pool = DispatchControlPort(control_sock, ops=frozenset({"POOL"}))
 
-    def verify(proof: C.LinkProof, exposure: Optional[ActionExposure]) -> None:
-        verify_point_of_use(proof, exposure, replay=authority.replay, now=lambda: datetime.now(timezone.utc),
-                            bar_of=bar_of)
-
     def pool_free() -> bool:
         ans = pool.call("POOL")
         return type(ans.get("egress_free")) is int and ans["egress_free"] > 0
 
-    return RunServer(launcher, verify=verify, pool_free=pool_free, peer_ok=lambda s: peer_uid(s) == operator_uid)
+    return RunServer(launcher, verify=replica_verifier(replica), pool_free=pool_free,
+                     peer_ok=lambda s: peer_uid(s) == operator_uid, replica=replica)
 
 
 def service_row():
@@ -710,7 +810,7 @@ def service_row():
     return Service(NAME, "dispatch run server", ACCOUNT, ("control", "keys"), "always")
 
 
-__all__ = ["ACCOUNT", "NAME", "RunServer", "service_row", "agent_store_bar", "bound_usage_sources", "build_server", "main", "serve",
+__all__ = ["ACCOUNT", "NAME", "FrameClaims", "RunServer", "replica_verifier", "service_row", "agent_store_bar", "bound_usage_sources", "build_server", "main", "serve",
            "verify_point_of_use"]
 
 

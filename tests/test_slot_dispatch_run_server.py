@@ -67,7 +67,7 @@ class Env:
                                   peer_ok=lambda s: self.peer, holder_idle_s=20, **server_kw)
         self.threads: list[threading.Thread] = []
 
-    def _verify(self, proof, exposure):
+    def _verify(self, proof, exposure, claims=None):
         self.verified += 1
         D.verify_point_of_use(proof, exposure, replay=self.rig.authority.replay, now=self.rig.now, bar_of=self.bar_of)
 
