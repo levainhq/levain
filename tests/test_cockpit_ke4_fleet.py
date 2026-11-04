@@ -257,3 +257,23 @@ def test_the_fleet_card_heads_agents_and_roles_apart_and_reads_a_roles_last_run(
     assert d["diogenes"][0].startswith("last run 02:56") and "running" not in d["diogenes"][0] and "bad" not in d["diogenes"][1]
     assert d["late"][0].startswith("run late") and "bad" in d["late"][1]
     assert d["old"][0].startswith("no run time reported")
+
+
+# ---- L3 r1 fixes: one classification, unreadable run flags, a huge count, a bounded status ----
+def test_a_run_flag_that_is_present_but_not_a_bool_is_unknown_not_ok() -> None:
+    for k in ("run_failed", "run_late"):
+        for bad in ("true", 1, "yes"):
+            h = _role(**{k: bad})
+            assert h["tone"] == "unknown" and "run state unreadable" in h["text"]
+
+
+def test_kind_decides_the_reading_and_memory_only_when_kind_is_absent() -> None:
+    r = _rows({**ROLE, "name": "rs", "memory": "stateful", "digest": {**ROLE["digest"], "run_failed": True}},
+              {**ROLE, "name": "as", "kind": "agent", "memory": "stateless", "digest": {"available": True, "episodes_24h": 4}})
+    assert r["rs"]["health"]["tone"] == "alarm" and "last run failed" in r["rs"]["health"]["text"]
+    assert r["as"]["health"]["tone"] == "ok" and "no run time reported" not in r["as"]["health"]["text"]
+
+
+def test_a_huge_count_and_a_long_status_do_not_break_the_row() -> None:
+    h = _role(episodes_24h=10 ** 1000, last_run_status="x\n" * 100)
+    assert h["tone"] == "ok" and "health unreadable" not in h["text"] and "episodes in 24 h" not in h["text"] and len(h["text"]) < 100

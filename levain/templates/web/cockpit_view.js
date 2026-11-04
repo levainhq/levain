@@ -1034,7 +1034,7 @@
   // an agent, stateless a role. A `job` kind is machine-checkable and belongs to a Jobs panel, not here.
   const FLEET_GROUPS = [["resident", "Agents \u00b7 judged by their writing"], ["role", "Roles \u00b7 run on a schedule"],
                         ["on_call", "On call \u00b7 judged by their last answer"], ["roundtable", "Roundtable"]];
-  const isRoleRow = (r) => r.kind === "role" || (r.kind !== "agent" && r.memory === "stateless");
+  const isRoleRow = (r) => r.kind === "role" || ((r.kind === undefined || r.kind === null) && r.memory !== "stateful");
   const fleetGroupOf = (r) => {
     const g = r.fleet_group || (r.group === "roundtable" ? "roundtable" : r.cadence === "resident" ? "resident" : "on_call");
     return g === "resident" && isRoleRow(r) ? "role" : g;
