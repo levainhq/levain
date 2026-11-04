@@ -126,6 +126,8 @@ def test_real_core_grant_answers_an_apply_patch_inside_its_workspace_only(tmp_pa
     qdir = tmp_path / "home" / "consent"
     qdir.mkdir(parents=True, mode=0o700)
     (qdir / cx.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
+    from levain.webpush import intent
+    intent.apply_settings(qdir, devices="off")   # presence 1b: an unanswered request must not hold for a signed answer here
 
     def patch(path):
         return {"command": f"*** Begin Patch\n*** Add File: {path}\n+hi\n*** End Patch\n"}
@@ -212,6 +214,8 @@ def _granted_codex_hook(tmp_path, tools):
     qdir = tmp_path / "home" / "consent"
     qdir.mkdir(parents=True, mode=0o700)
     (qdir / cx.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": str(root)}))
+    from levain.webpush import intent
+    intent.apply_settings(qdir, devices="off")   # presence 1b: an unanswered request must not hold for a signed answer here
 
     def run(tool_name, tool_input):
         e = {"session_id": "s-1", "turn_id": "t-1", "cwd": str(ws), "hook_event_name": "PermissionRequest",
