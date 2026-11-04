@@ -467,3 +467,127 @@ def test_the_parser_names_the_verbs_and_remove_takes_no_data_root():
     assert p.parse_args(["hands", "mcp", "list"]).hands_mcp_cmd == "list"
     with pytest.raises(SystemExit):
         p.parse_args(["hands", "mcp", "remove", "linear", "--data-root", "/d"])
+
+
+# --- the record is in a directory the entity's hands can write (L3 r1 F1) ------------------------------------------
+
+def _victim(rig, text='{"operator": "own"}'):
+    v = rig.operator_home / "victim.json"
+    v.write_text(text)
+    return v
+
+
+@pytest.mark.parametrize("record", [hml._record_path, lambda e: hands_login._outcome_path(e)])
+def test_a_symlink_planted_at_the_old_predictable_temp_is_never_opened(rig, record, capsys):
+    """The temp was ``<record>.<pid>.tmp`` written by write_text: a planted symlink there truncated its target."""
+    import os
+    victim = _victim(rig)
+    path = record(rig.entity)
+    os.symlink(victim, path.with_name(path.name + f".{os.getpid()}.tmp"))
+    if record is hml._record_path:
+        rig.register()
+        assert signin(rig) == 0
+    else:
+        hands_login.record_outcome(rig.entity, "claude", "logged-in")
+        assert hands_login.read_outcomes(rig.entity)["claude"]["outcome"] == "logged-in"
+    assert victim.read_text() == '{"operator": "own"}'
+    assert not [p for p in path.parent.iterdir() if p.name.endswith(".tmp") and not p.is_symlink()]
+
+
+def test_a_guessed_temp_name_is_refused_by_the_exclusive_open_never_followed(rig, monkeypatch):
+    import os
+    victim = _victim(rig)
+    monkeypatch.setattr(hands_login.secrets, "token_hex", lambda n: "guessed")
+    path = hml._record_path(rig.entity)
+    os.symlink(victim, path.with_name(path.name + ".guessed.tmp"))
+    with pytest.raises(hml.HandsMcpError, match="could not be written"):
+        hml._write_record(rig.entity, "linear", {"url": "u"})
+    assert victim.read_text() == '{"operator": "own"}' and not path.exists()
+    assert path.with_name(path.name + ".guessed.tmp").is_symlink()      # the plant is not ours to remove
+
+
+def test_the_record_temp_is_0600_and_the_record_is_replaced_by_a_rename(rig, monkeypatch):
+    import os
+    seen = []
+    real = os.replace
+
+    def spy(src, dst):
+        seen.append((Path(src).name, stat.S_IMODE(os.lstat(src).st_mode)))
+        return real(src, dst)
+    monkeypatch.setattr(os, "replace", spy)
+    old = os.umask(0)                              # the mode comes from the open, not the umask
+    try:
+        hml._write_record(rig.entity, "linear", {"url": "u"})
+    finally:
+        os.umask(old)
+    (name, mode), = seen
+    assert name.startswith("hands-mcp.json.") and name.endswith(".tmp") and str(os.getpid()) not in name
+    assert mode == 0o600 and hml.read_record(rig.entity) == {"linear": {"url": "u"}}
+
+
+def test_a_symlinked_record_is_refused_by_name_and_never_followed(rig, capsys):
+    import os
+    victim = _victim(rig, "{}")
+    os.symlink(victim, hml._record_path(rig.entity))
+    rig.register()
+    assert signin(rig) == 1
+    out = capsys.readouterr().out
+    assert "symlink" in out and "not followed" in out
+    assert rig.mutating() == [] and victim.read_text() == "{}"
+    assert hml._record_path(rig.entity).is_symlink()
+
+
+def test_a_fifo_at_the_record_is_refused_as_not_a_regular_file_and_never_hangs(rig):
+    import os
+    os.mkfifo(hml._record_path(rig.entity))
+    with pytest.raises(hml.HandsMcpError, match="not a regular file"):
+        hml.read_record(rig.entity)
+
+
+def test_the_record_is_not_a_crown_jewel_and_neither_is_its_sibling():
+    """Decided, not missed: the own-store write-deny is anneal's memory files only; the operator-side records
+    (hands-login.json, hands-mcp.json) are refused at read and never followed at write instead."""
+    assert hml.RECORD_FILE not in confinement._OWN_MEMORY_FILENAMES
+    assert hands_login.OUTCOME_FILE not in confinement._OWN_MEMORY_FILENAMES
+
+
+# --- a read-only verb never stops the hands account (L3 r1 F9) -----------------------------------------------------
+
+def test_list_whose_read_runs_out_never_sweeps_the_hands_account(rig, capsys, monkeypatch):
+    import subprocess
+    rig.register()
+    assert signin(rig) == 0
+    rig.log.write_text("")
+
+    def runs_out(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 1)
+    monkeypatch.setattr(hands_login.hands_live, "run_bounded", runs_out)
+    assert hml.cmd_list(rig.entity, rig.ck.root) == 1
+    assert "config: unknown" in capsys.readouterr().out
+    assert not any(c.startswith("SWEEP") for c in rig.calls())
+
+
+# --- a sign-in that raises leaves "failed", never "added" (L3 r1 F4) -----------------------------------------------
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, hands_login.HandsLoginError])
+def test_a_login_that_raises_is_recorded_failed(rig, monkeypatch, exc):
+    e = rig.register()
+
+    def raises(*a, **k):
+        raise exc("ran out")
+    monkeypatch.setattr(hands_login, "_run_login", raises)
+    with pytest.raises(exc):
+        hml.signin(rig.h, e, rig.entity)
+    assert hml.read_record(rig.entity)["linear"]["outcome"] == "failed"
+
+
+def test_a_signin_whose_held_callback_port_moved_asks_for_a_remove_first(rig, capsys):
+    rig.register()
+    assert signin(rig) == 0
+    capsys.readouterr()
+    doc = json.loads(rig.cfg.read_text())
+    doc["mcpServers"]["linear"]["oauth"]["callbackPort"] = 1
+    rig.cfg.write_text(json.dumps(doc))
+    rig.log.write_text("")
+    assert signin(rig) == 1
+    assert "callback port" in capsys.readouterr().out and rig.mutating() == []

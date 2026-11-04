@@ -19,8 +19,10 @@ server in that record: a server the hands account holds that sign-in did not add
 name in neither the record nor the vendor config changes nothing. A server whose entry has since expired or been
 revoked can still be removed (taking a login away needs no lease).
 
-The doctor rows read the vendor config's ``mcpServers`` names and urls as the hands user (never a token: the
-credential file is stat'ed for owner and mode only) and compare them with the record and the registry.
+The doctor rows read the vendor config's ``mcpServers`` names, urls and callback ports as the hands user (never a
+token: the credential file is stat'ed for owner and mode only) and compare them with the record and the registry
+in one function (:func:`server_status`), which ``list`` reads too. The record sits in ``.levain``, which the entity's
+hands can write: it is never followed through a symlink nor written through a predictable temp.
 
 Anything that runs as the hands account can use a server's login, and a remove is local: the card says so
 (:data:`REMOVE_NOTICE`)."""
@@ -44,6 +46,8 @@ from levain.hands_mcp import registration_problems
 
 VENDOR = "claude"
 RECORD_FILE = "hands-mcp.json"
+#: the record's outcome once the vendor login exited 0; every other outcome is not signed in
+SIGNED_IN = "login-exited-0"
 #: a server name as a command-line argument: never an option, never a path
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
@@ -110,21 +114,27 @@ def _record_path(entity_dir: Path | str) -> Path:
 
 def read_record(entity_dir: Path | str) -> dict[str, dict[str, Any]]:
     """The record, or ``{}`` when there is none. A record that exists and cannot be read raises
-    :class:`HandsMcpError`: an unreadable record is not an empty one."""
+    :class:`HandsMcpError`: an unreadable record is not an empty one. ``.levain`` is writable by the entity's hands,
+    so the record is read without following a symlink and only as a regular file (:func:`hl.read_record_json`); a
+    symlink or anything else at its path is refused by name, never followed."""
     p = _record_path(entity_dir)
     try:
-        data = json.loads(p.read_text())
-    except FileNotFoundError:
-        return {}
+        data = hl.read_record_json(p)
+    except hl.RecordFileRefused as exc:
+        raise HandsMcpError(f"{exc}; nothing was changed (remove it by hand)") from None
     except (OSError, ValueError) as exc:
         raise HandsMcpError(f"{p} cannot be read ({type(exc).__name__}); nothing was changed") from None
+    if data is None:
+        return {}
     if not isinstance(data, dict):
         raise HandsMcpError(f"{p} is not a record; nothing was changed")
     return {k: v for k, v in data.items() if isinstance(v, dict)}
 
 
 def _write_record(entity_dir: Path | str, name: str, value: dict[str, Any] | None) -> None:
-    """Set (or, with None, drop) one name, under a sidecar lock, by a rename. Raises :class:`HandsMcpError`."""
+    """Set (or, with None, drop) one name, under a sidecar lock, by :func:`hl.write_record_json` (a random 0600 temp
+    opened ``O_EXCL | O_NOFOLLOW``, fsync'd, renamed over the record). Raises :class:`HandsMcpError`; a record that
+    is a symlink or not a regular file is refused before anything is written."""
     p = _record_path(entity_dir)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -136,9 +146,7 @@ def _write_record(entity_dir: Path | str, name: str, value: dict[str, Any] | Non
                 data.pop(name, None)
             else:
                 data[name] = value
-            tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(data, sort_keys=True))
-            os.replace(tmp, p)
+            hl.write_record_json(p, data)
         finally:
             os.close(lk)
     except OSError as exc:
@@ -180,11 +188,18 @@ def vendor_config_path(hands: HandsIdentity) -> str:
     return f"{hl.config_home(hands, VENDOR)}/.claude.json"
 
 
+def _port_of(server: dict[str, Any]) -> str:
+    oauth = server.get("oauth")
+    port = oauth.get("callbackPort") if isinstance(oauth, dict) else None
+    return str(port) if isinstance(port, int) and not isinstance(port, bool) else ""
+
+
 def vendor_servers(hands: HandsIdentity, entity_dir: Path | str, *, held: bool = False,
                    sweep: bool = True) -> dict[str, dict[str, str]]:
-    """The hands account's Claude ``mcpServers`` as ``{name: {"type", "url"}}``, read as the hands user. Only those
-    two fields of each server are kept: a stdio server's env or an http server's headers are never held here. An
-    absent config is ``{}``; one that cannot be read or parsed raises :class:`hl.HandsLoginError`."""
+    """The hands account's Claude ``mcpServers`` as ``{name: {"type", "url", "port"}}``, read as the hands user
+    (``port`` is ``oauth.callbackPort`` as text, ``""`` when absent). Only those fields of each server are kept: a
+    stdio server's env or an http server's headers are never held here. An absent config is ``{}``; one that cannot
+    be read or parsed raises :class:`hl.HandsLoginError`."""
     path = vendor_config_path(hands)
     st = hl._lstat(hands, VENDOR, path, entity_dir=entity_dir, held=held, sweep=sweep)
     if st is None:
@@ -200,7 +215,7 @@ def vendor_servers(hands: HandsIdentity, entity_dir: Path | str, *, held: bool =
         servers = doc.get("mcpServers", {}) if isinstance(doc, dict) else None
         if not isinstance(servers, dict):
             raise ValueError("no mcpServers table")
-        return {str(k): {"type": str(v.get("type", "")), "url": str(v.get("url", ""))}
+        return {str(k): {"type": str(v.get("type", "")), "url": str(v.get("url", "")), "port": _port_of(v)}
                 for k, v in servers.items() if isinstance(v, dict)}
     except (ValueError, UnicodeDecodeError) as exc:
         raise hl.HandsLoginError(f"{path} is not readable as the vendor's config ({type(exc).__name__})") from None
@@ -284,9 +299,10 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
             if name in held and ours is None:
                 raise HandsMcpRefused(f"the hands account already holds a server named {name!r} that sign-in did not "
                                       "add; remove it by hand first. Nothing was changed")
-            if name in held and (held[name]["url"] != entry["url"] or (ours or {}).get("url") != entry["url"]):
-                raise HandsMcpRefused(f"the hands account's {name!r} points elsewhere than its registered entry; "
-                                      f"run `levain hands mcp remove {name}` first. Nothing was changed")
+            if name in held and (held[name]["url"] != entry["url"] or (ours or {}).get("url") != entry["url"]
+                                 or held[name].get("port") != str(entry["callback_port"])):
+                raise HandsMcpRefused(f"the hands account's {name!r} points elsewhere than its registered entry (url "
+                                      f"or callback port); run `levain hands mcp remove {name}` first. Nothing was changed")
             if name not in held:
                 _write_record(entity_dir, name, {"entry_id": entry["id"], "url": entry["url"], "at": _stamp(),
                                                  "outcome": "adding"})
@@ -297,17 +313,24 @@ def signin(hands: HandsIdentity, entry: dict[str, Any], entity_dir: Path | str, 
                     raise HandsMcpError(f"claude mcp add exited {r.returncode}: {hl._brief(hl._text(r))}")
             _write_record(entity_dir, name, {"entry_id": entry["id"], "url": entry["url"], "at": _stamp(),
                                              "outcome": "added"})
-            res = hl._run_login(hands, VENDOR, entity_dir, emit or hl._write_out,
-                                hl.LOGIN_TIMEOUT if timeout is None else timeout, argv=login_argv(hands, name))
+            failed = {"entry_id": entry["id"], "url": entry["url"], "outcome": "failed"}
+            try:
+                res = hl._run_login(hands, VENDOR, entity_dir, emit or hl._write_out,
+                                    hl.LOGIN_TIMEOUT if timeout is None else timeout, argv=login_argv(hands, name))
+            except BaseException:                      # a timeout, a fault or an interrupt: the record says failed
+                try:
+                    _write_record(entity_dir, name, {**failed, "at": _stamp()})
+                except HandsMcpError:
+                    pass                               # the login's own failure is the one raised
+                raise
             if res.returncode != 0:
-                _write_record(entity_dir, name, {"entry_id": entry["id"], "url": entry["url"], "at": _stamp(),
-                                                 "outcome": "failed"})
+                _write_record(entity_dir, name, {**failed, "at": _stamp()})
                 raise HandsMcpError(f"the login exited {res.returncode}")
             g = hl.run_as_hands_bounded(hands, get_argv(hands, name), entity_dir=entity_dir, held=True,
                                         what=f"{VENDOR} mcp get")
             view = hl._brief(hl._text(g)) or f"exit {g.returncode}"
             _write_record(entity_dir, name, {"entry_id": entry["id"], "url": entry["url"], "at": _stamp(),
-                                             "outcome": "login-exited-0"})
+                                             "outcome": SIGNED_IN})
             return view
     except hl.HandsRefused as exc:
         raise HandsMcpRefused(str(exc)) from None
@@ -424,9 +447,10 @@ def cmd_list(entity_dir: Path | str, cockpit_root: Path | str | None = None) -> 
 
 # --- status (CLI list and the doctor rows share it) -------------------------------------------------------------
 
-def status_rows(entity_dir: Path | str, cockpit_root: Path | str | None = None,
-                *, sweep: bool = True) -> tuple[list[tuple[bool, str]], int]:
-    """One ``(ok, line)`` per finding and the exit code. Every read that fails is its own line, never silence."""
+def status_rows(entity_dir: Path | str, cockpit_root: Path | str | None = None) -> tuple[list[tuple[bool, str]], int]:
+    """One ``(ok, line)`` per finding and the exit code. Every read that fails is its own line, never silence.
+    Read-only, for both callers (``list`` and the doctor): its reads run with ``sweep=False``, so one that runs out
+    kills only its own child and never the hands account's other processes (there is no sweeping variant)."""
     root = cockpit_root if cockpit_root is not None else cockpit_root_of(entity_dir)
     rows: list[tuple[bool, str]] = []
     try:
@@ -444,7 +468,7 @@ def status_rows(entity_dir: Path | str, cockpit_root: Path | str | None = None,
         record = {}
         rows.append((False, f"hands mcp record: unknown ({exc})"))
     try:
-        held: dict[str, dict[str, str]] | None = vendor_servers(hands, entity_dir, sweep=sweep)
+        held: dict[str, dict[str, str]] | None = vendor_servers(hands, entity_dir, sweep=False)
     except (hl.HandsLoginError, OSError, subprocess.SubprocessError) as exc:
         held = None
         rows.append((False, f"hands mcp config: unknown (the hands account's server list could not be read: {exc})"))
@@ -453,33 +477,52 @@ def status_rows(entity_dir: Path | str, cockpit_root: Path | str | None = None,
         rows.append((True, f"hands mcp entry {gid}: not live ({why})"))
     if held is not None:
         for name in sorted(set(record) | set(held) | set(live_names)):
-            rec, vend, reg = record.get(name), held.get(name), live_names.get(name)
-            if vend is not None and rec is None:
-                rows.append((False, f"hands mcp {name}: DRIFT, held by the hands account but not added by sign-in"))
-            elif rec is not None and vend is None:
-                rows.append((False, f"hands mcp {name}: DRIFT, recorded as added but missing from the hands account's config"))
-            elif rec is not None and reg is None:
-                rows.append((False, f"hands mcp {name}: DRIFT, signed in but no longer registered or live; "
-                                    f"`levain hands mcp remove {name}`"))
-            elif rec is not None and vend is not None and vend["url"] != rec.get("url"):
-                rows.append((False, f"hands mcp {name}: DRIFT, the hands account's url is not the one signed in"))
-            elif rec is not None:
-                rows.append((True, f"hands mcp {name}: in step with the registry; last: {rec.get('outcome', '?')} {rec.get('at', '')}".rstrip()))
-            else:
-                rows.append((True, f"hands mcp {name}: registered, not signed in"))
+            rows.append(server_status(name, record.get(name), held.get(name), live_names.get(name)))
     return rows, 0 if all(ok for ok, _ in rows) else 1
+
+
+def server_status(name: str, rec: dict[str, Any] | None, vend: dict[str, str] | None,
+                  reg: dict[str, Any] | None) -> tuple[bool, str]:
+    """The ONE comparison of a server's record (what sign-in did), the hands account's config (what the vendor
+    holds) and its live registration: ``(ok, line)``. In step means all three agree on the entry (the record's
+    ``entry_id`` is the live entry's id, so a revoked-then-re-registered name is not in step), the url and the
+    callback port, AND the last sign-in's login exited 0; any other outcome (``adding``, ``added``, ``failed``) is
+    a failing row. ``list`` and the doctor both read this, through :func:`status_rows`."""
+    remove = f"`levain hands mcp remove {name}`"
+    if rec is None and vend is not None:
+        return False, f"hands mcp {name}: DRIFT, held by the hands account but not added by sign-in"
+    if rec is None:
+        return True, f"hands mcp {name}: registered, not signed in"
+    if vend is None:
+        return False, f"hands mcp {name}: DRIFT, recorded as added but missing from the hands account's config"
+    if reg is None:
+        return False, f"hands mcp {name}: DRIFT, signed in but no longer registered or live; {remove}"
+    if rec.get("entry_id") != reg["id"]:
+        return False, (f"hands mcp {name}: DRIFT, signed in under entry {rec.get('entry_id')} but the live registration "
+                       f"is entry {reg['id']}; {remove}, then sign in again")
+    if not (vend["url"] == rec.get("url") == reg["url"]):
+        return False, f"hands mcp {name}: DRIFT, the hands account's url is not the one signed in or registered; {remove}"
+    if vend.get("port") != str(reg["callback_port"]):
+        return False, (f"hands mcp {name}: DRIFT, the hands account's callback port is not the registered "
+                       f"{reg['callback_port']}; {remove}, then sign in again")
+    last = f"{rec.get('outcome', '?')} {rec.get('at', '')}".rstrip()
+    if rec.get("outcome") != SIGNED_IN:
+        return False, f"hands mcp {name}: NOT SIGNED IN, the last sign-in ended {last}; sign in again or {remove}"
+    return True, f"hands mcp {name}: in step with the registry; last: {last}"
 
 
 def doctor_rows(install: Path) -> list[tuple[str, bool, str, str | None, bool]]:
     """``(name, ok, detail, hint, warn)`` for the doctor. Silent without a hands account. With one: the registry,
     record and config comparison (a fault reading any is a failing row), and the credential file's owner and mode
-    (read by ``stat`` as the hands user; wider than 0600 fails)."""
+    (read by ``stat`` as the hands user; wider than 0600 fails, and so does a stat that cannot be told). No file
+    says only that no login is held IN THAT FILE: a Keychain-held login is not checked, and the row warns when the
+    record says a server signed in."""
     try:
         hands = hl.load_hands_identity(install)
     except Exception:  # noqa: BLE001 - no hands account (the confinement rows report a broken config)
         return []
     out: list[tuple[str, bool, str, str | None, bool]] = []
-    rows, _ = status_rows(install, sweep=False)
+    rows, _ = status_rows(install)
     for ok, line in rows:
         out.append(("hands mcp", ok, line, None if ok else "`levain hands mcp list` shows the same read",
                     ok and "not live" in line))
@@ -487,12 +530,25 @@ def doctor_rows(install: Path) -> list[tuple[str, bool, str, str | None, bool]]:
         out.append(("hands mcp", True, "no hands MCP server is registered or signed in", None, False))
     try:
         cred = hl.credential_state(hands, VENDOR, entity_dir=install, sweep=False)
-    except Exception as exc:  # noqa: BLE001
-        out.append(("hands mcp tokens", True, f"unknown: the credential file could not be read ({exc})",
-                    "`levain hands status claude` asks the vendor", True))
+    except Exception as exc:  # noqa: BLE001 - a state that cannot be told fails: an unchecked mode is not a 0600 one
+        out.append(("hands mcp tokens", False, f"unknown: the credential file's owner and mode could not be read ({exc})",
+                    "`levain hands status claude` asks the vendor", False))
         return out
     if cred is None:
-        out.append(("hands mcp tokens", True, "no credential file (no MCP login is held)", None, False))
+        try:
+            signed = sorted(n for n, r in read_record(install).items() if r.get("outcome") == SIGNED_IN)
+        except HandsMcpError:
+            signed = []                                # the record's own row already fails
+        where = hl.credential_path(hands, VENDOR)
+        if signed:
+            out.append(("hands mcp tokens", True,
+                        f"no credential file at {where}, but {', '.join(signed)} signed in: the login is not held in "
+                        "that file; a login the vendor keeps in the macOS Keychain is not checked here",
+                        "`levain hands mcp list`, or the vendor's own `claude mcp get <name>` as the hands account", True))
+        else:
+            out.append(("hands mcp tokens", True,
+                        f"no credential file at {where}: no MCP login is held in a file; a login the vendor keeps in "
+                        "the macOS Keychain is not checked here", None, False))
         return out
     owner, _, mode = cred.partition(" ")
     wide = False

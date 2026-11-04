@@ -129,12 +129,79 @@ def test_a_token_file_at_0400_is_not_wider(rig, as_hands):
     assert tokens(rig).ok
 
 
-def test_an_unreadable_token_file_state_is_a_warning_row_never_ok_silence(rig, monkeypatch):
+def test_an_unreadable_token_file_state_is_a_failing_row_never_an_ok_warning(rig, monkeypatch):
     def boom(*a, **k):
         raise hands_login.HandsLoginError("stat refused")
     monkeypatch.setattr(hands_login, "credential_state", boom)
     t = tokens(rig)
-    assert t.ok and t.warn and "unknown" in t.detail and "stat refused" in t.detail
+    assert not t.ok and "unknown" in t.detail and "stat refused" in t.detail
+
+
+def test_no_credential_file_never_claims_no_login_is_held_and_names_the_keychain(rig):
+    t = tokens(rig)
+    assert t.ok and not t.warn and "Keychain" in t.detail and "not checked" in t.detail
+    assert "(no MCP login is held)" not in t.detail
+
+
+def test_no_credential_file_while_the_record_says_signed_in_warns(rig):
+    rig.register()
+    assert hml.cmd_signin(rig.entity, "linear", rig.ck.root) == 0
+    rig.cred.unlink()
+    t = tokens(rig)
+    assert t.ok and t.warn and "linear signed in" in t.detail and "Keychain" in t.detail
+
+
+# --- in step means the record, the account and the LIVE registration agree (L3 r1 F4) ------------------------------
+
+def test_a_revoked_then_re_registered_name_is_not_in_step(rig, monkeypatch):
+    rig.register()
+    assert hml.cmd_signin(rig.entity, "linear", rig.ck.root) == 0
+    again = rig.entry()                                   # same name, url and port; a new entry id
+    monkeypatch.setattr(hml, "load_registry", lambda root, now=None: ([again], []))
+    r = mcp(rig)
+    assert len(r) == 1 and not r[0].ok and "DRIFT" in r[0].detail and f"is entry {again['id']}" in r[0].detail
+
+
+def test_a_registered_url_that_moved_from_the_signed_in_one_is_drift(rig, monkeypatch):
+    rig.register()
+    assert hml.cmd_signin(rig.entity, "linear", rig.ck.root) == 0
+    rec = hml.read_record(rig.entity)["linear"]
+    moved = {**rig.entry(url="https://moved.example/mcp"), "id": rec["entry_id"]}
+    monkeypatch.setattr(hml, "load_registry", lambda root, now=None: ([moved], []))
+    r = mcp(rig)
+    assert len(r) == 1 and not r[0].ok and "url" in r[0].detail
+
+
+def test_a_callback_port_that_moved_in_the_accounts_config_is_drift(rig):
+    rig.register()
+    assert hml.cmd_signin(rig.entity, "linear", rig.ck.root) == 0
+    doc = json.loads(rig.cfg.read_text())
+    doc["mcpServers"]["linear"]["oauth"]["callbackPort"] = 1
+    rig.cfg.write_text(json.dumps(doc))
+    r = mcp(rig)
+    assert len(r) == 1 and not r[0].ok and "callback port" in r[0].detail
+
+
+@pytest.mark.parametrize("outcome", ["failed", "added", "adding"])
+def test_a_sign_in_that_did_not_finish_is_a_failing_row_never_green(rig, outcome):
+    rig.register()
+    assert hml.cmd_signin(rig.entity, "linear", rig.ck.root) == 0
+    rec = hml.read_record(rig.entity)["linear"]
+    hml._write_record(rig.entity, "linear", {**rec, "outcome": outcome})
+    r = mcp(rig)
+    assert len(r) == 1 and not r[0].ok and "NOT SIGNED IN" in r[0].detail and outcome in r[0].detail
+    assert hml.cmd_list(rig.entity, rig.ck.root) == 1
+
+
+def test_list_and_the_doctor_read_one_comparison(rig, monkeypatch):
+    rig.register()
+    assert hml.cmd_signin(rig.entity, "linear", rig.ck.root) == 0
+    seen = []
+    real = hml.server_status
+    monkeypatch.setattr(hml, "server_status", lambda *a: seen.append(a[0]) or real(*a))
+    mcp(rig)
+    hml.cmd_list(rig.entity, rig.ck.root)
+    assert seen == ["linear", "linear"]
 
 
 # --- a fault in reading is a visible row -----------------------------------------------------------------------------
