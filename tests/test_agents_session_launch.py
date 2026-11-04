@@ -105,11 +105,11 @@ class KeyedStub(Stub):
         return Usage(None, None, None, "stub:no-record")
 
 
-def _occurrence(rig: Rig, *, billing="api_key", exposure=EXP, micros=100_000):
+def _occurrence(rig: Rig, *, billing="api_key", exposure=EXP, micros=100_000, role=None):
     """A launched occurrence of a ``session`` role agent: its reservation carries ``billing``'s caps (``exposure``
-    on a subscription, ``micros`` on an api_key run)."""
+    on a subscription, ``micros`` on an api_key run); its spec pins ``role`` (default ROLE)."""
     d = copy.deepcopy(SPECS["job_feeder_downstream"])
-    d["role"]["role_hash"] = role_hash(ROLE)
+    d["role"]["role_hash"] = role_hash(ROLE if role is None else role)
     agent, spec_hash, *_ = register_spec(rig.store, parse_spec(d), "America/New_York")
     rig.n += 1
     over = SUB if billing == "subscription" else {}
@@ -157,8 +157,9 @@ def _reservation(rig, oid):
 
 # --- refusals first ------------------------------------------------------------------------------------------------
 
-API = S.Reserved("api_key", None, 100_000, 3600)
-SUBRES = S.Reserved("subscription", EXP, 0, 3600)
+PIN = role_hash(ROLE)
+API = S.Reserved("api_key", None, 100_000, 3600, PIN)
+SUBRES = S.Reserved("subscription", EXP, 0, 3600, PIN)
 NOBYTES = ActionExposure(actions=20, unit="tool_calls", seconds=3600, tunnel_bytes=None)
 SHORT = ActionExposure(actions=20, unit="tool_calls", seconds=1800, tunnel_bytes=5_000_000)
 
@@ -168,23 +169,26 @@ SHORT = ActionExposure(actions=20, unit="tool_calls", seconds=1800, tunnel_bytes
     ({**ROLE, "harness": "codex"}, API, Stub(), None, "harness-not-claude"),
     ({**ROLE, "model": ""}, API, Stub(), None, "no-model"),
     (ROLE, None, Stub(), None, "no-open-reservation"),
+    # the role run is the one the spec pins (r2 HIGH 1); a spec that cannot be read pins none
+    ({**ROLE, "model": "opus"}, API, Stub(), None, "role-not-the-pinned-role"),
+    (ROLE, S.Reserved("api_key", None, 100_000, 3600, None), Stub(), None, "role-not-the-pinned-role"),
     (ROLE, API, S.UnwiredLauncher(), None, "launcher-not-wired"),
     (ROLE, API, Stub(route="host-bg"), None, "route-not-s1-dispatch"),
     (ROLE, SUBRES, Stub(route="host-bg", auth="passthrough"), EXP, "route-not-s1-dispatch"),
     (ROLE, SUBRES, Stub(auth="brokered"), EXP, "ticket-auth-not-the-links-billing"),
     (ROLE, API, Stub(auth="passthrough"), None, "ticket-auth-not-the-links-billing"),
-    (ROLE, S.Reserved("rental", None), Stub(), None, "unknown-billing"),
+    (ROLE, S.Reserved("rental", None, role_hash=PIN), Stub(), None, "unknown-billing"),
     (ROLE, SUBRES, Stub(auth="passthrough"), None, "no-action-exposure"),
-    (ROLE, S.Reserved("subscription", None), Stub(auth="passthrough"), EXP, "no-action-exposure"),
+    (ROLE, S.Reserved("subscription", None, role_hash=PIN), Stub(auth="passthrough"), EXP, "no-action-exposure"),
     (ROLE, SUBRES, Stub(auth="passthrough"), ActionExposure(21, "tool_calls", 3600, 5_000_000),
      "exposure-not-the-reserved-caps"),
     (ROLE, API, Stub(), EXP, "exposure-on-an-api-key-run"),
     # a session role holds Bash, so a byte cap is the only bound on a tunnel it opens (P7-A sections 3.2, 5)
-    (ROLE, S.Reserved("subscription", NOBYTES, 0, 3600), Stub(auth="passthrough"), NOBYTES, "no-tunnel-byte-cap"),
+    (ROLE, S.Reserved("subscription", NOBYTES, 0, 3600, PIN), Stub(auth="passthrough"), NOBYTES, "no-tunnel-byte-cap"),
     # the reserved seconds are the spec's stop_at (P7-A section 4's ActionExposure: "the deadline, == spec stop_at")
-    (ROLE, S.Reserved("subscription", SHORT, 0, 3600), Stub(auth="passthrough"), SHORT,
+    (ROLE, S.Reserved("subscription", SHORT, 0, 3600, PIN), Stub(auth="passthrough"), SHORT,
      "cap-seconds-differs-from-stop-at"),
-    (ROLE, S.Reserved("subscription", EXP, 0, None), Stub(auth="passthrough"), EXP, "cap-seconds-differs-from-stop-at"),
+    (ROLE, S.Reserved("subscription", EXP, 0, None, PIN), Stub(auth="passthrough"), EXP, "cap-seconds-differs-from-stop-at"),
 ])
 def test_every_refusal_names_its_reason(role, reserved, launcher, exposure, why):
     usd = reserved.usd_micros if reserved is not None else 0
@@ -248,7 +252,8 @@ def test_reserved_terms_reads_no_stop_at_from_a_spec_that_does_not_hash(rig):
         c.execute("DROP TRIGGER agent_specs_frozen")
         c.execute("UPDATE agent_specs SET spec = replace(spec, '3600', '1800')")
         assert "1800" in c.execute("SELECT spec FROM agent_specs").fetchone()[0]
-    assert S.reserved_terms(rig.store, oid).stop_at is None
+    got = S.reserved_terms(rig.store, oid)
+    assert got.stop_at is None and got.role_hash is None
 
 
 def test_a_subscription_run_with_no_byte_cap_is_refused_and_frees_what_it_held(rig):
@@ -350,13 +355,6 @@ def test_a_template_that_does_not_format_is_a_refused_brief(template):
         S.render_brief(role, {"repo": "r"}, None, occurrence_id="oc-1", session_key="s-1")
 
 
-def test_a_run_whose_template_does_not_format_ends_failed(rig):
-    oid = _occurrence(rig)
-    launcher = Stub()
-    _, report = _run(rig, oid, launcher, role={**ROLE, "brief": {"template": "{nope}", "slots": {}}})
-    assert launcher.launches == [] and rig.row(oid)["reason"] == "session_refused:brief"
-
-
 def test_the_recall_budget_is_bytes_not_characters():
     # a 4-byte character counted as 1 lets 16384 characters through as ~64 KB, which then refuses the whole brief
     eps = tuple(SimpleNamespace(content="\U0001F600" * 240, timestamp=f"t{i}") for i in range(80))
@@ -364,7 +362,7 @@ def test_the_recall_budget_is_bytes_not_characters():
                           occurrence_id="oc-1", session_key="s-1")
     body = text.split(S._FENCE)[1]
     assert "older episodes cut" in body
-    assert len(body.encode("utf-8")) <= S.RECALL_MAX_BYTES + 200
+    assert len(body.encode("utf-8")) <= S.RECALL_MAX_BYTES + 1   # the block's leading newline; the marker is counted
 
 
 def test_a_recalled_stamp_cannot_close_the_fence():
@@ -434,8 +432,8 @@ def test_a_rerun_of_the_same_occurrence_spawns_nothing_twice(rig):
     again = S.run_session(sup, rig.store, oid, rig.row(oid)["launch_epoch"], role=ROLE, values={}, recall=None,
                           launcher=launcher, exposure=None, max_exposure_usd_micros=100_000, clock=rig.now)
     assert len(launcher.launches) == 1 and first.state == "done"
-    # the reservation is settled, so the rerun refuses before the journal: no second spawn, the end stands
-    assert (again.outcome, again.note, again.state) == ("refused", "no-open-reservation", "done")
+    # the row is no longer launched, so the rerun does nothing at all: no second spawn, the end stands
+    assert (again.outcome, again.state) == ("not_held", "done")
 
 
 def _crash_first_finish(sup):
@@ -505,14 +503,6 @@ def test_a_spawn_that_raises_ends_the_run_failed_and_frees_what_it_held(rig):
     assert len(launcher.launches) == 1 and report.state == "failed"
     assert rig.row(oid)["reason"] == "session_spawn_failed"
     assert rig.taken(oid) == ([], [("settled",)])
-
-
-def test_a_stale_epoch_records_no_key_and_never_spawns(rig):
-    oid = _occurrence(rig)
-    launcher = Stub()
-    _, report = _run(rig, oid, launcher, epoch=rig.row(oid)["launch_epoch"] + 1)
-    assert launcher.launches == [] and report.outcome == "not_started"
-    assert rig.row(oid)["session_key"] is None
 
 
 def test_a_child_released_after_the_lease_lapsed_is_aborted_unreleased(rig):
@@ -621,3 +611,145 @@ def test_make_run_runs_a_built_session(rig):
 
     assert S.make_run(factory)(rig.store, oid, rig.row(oid)["launch_epoch"]) == 0
     assert rig.row(oid)["state"] == "done"
+
+
+# --- FINDINGS_w3_r2: reproduced first, then closed -----------------------------------------------------------------
+
+def test_a_role_that_is_not_the_one_the_spec_pins_is_refused(rig):
+    # r2 HIGH 1: the occurrence's spec pins ROLE; a valid session role with another model is not that role
+    oid = _occurrence(rig)
+    launcher = Stub()
+    other = parse_role({**ROLE, "model": "opus"})
+    _, report = _run(rig, oid, launcher, role=other)
+    assert launcher.launches == []
+    assert rig.row(oid)["reason"] == "session_refused:role-not-the-pinned-role"
+    assert rig.taken(oid) == ([], [("settled",)])
+
+
+def test_a_role_that_does_not_parse_is_not_the_pinned_one(rig):
+    # an unparsed role cannot be hashed (role_hash validates first), so it can never be the one the spec pins
+    oid = _occurrence(rig)
+    launcher = Stub()
+    _, report = _run(rig, oid, launcher, role={**ROLE, "brief": {"template": "{nope}", "slots": {}}})
+    assert launcher.launches == [] and rig.row(oid)["reason"] == "session_refused:role-not-the-pinned-role"
+
+
+@pytest.mark.parametrize("launcher", [Stub(), Stub(route="host-bg")])
+def test_a_run_at_another_epoch_settles_nothing(rig, launcher):
+    # r2 HIGH 2: an epoch that is not the row's launch epoch neither spawns nor ends the row, on the run path and
+    # on a refusal path alike; the row keeps its slot and reservation for the fire that holds it
+    oid = _occurrence(rig)
+    _, report = _run(rig, oid, launcher, epoch=rig.row(oid)["launch_epoch"] + 1)
+    assert launcher.launches == [] and report.code == 1
+    row = rig.row(oid)
+    assert (row["state"], row["session_key"]) == ("launched", None)
+    assert _reservation(rig, oid)[0] == "open" and rig.taken(oid)[0]
+
+
+def test_a_start_that_did_not_happen_leaves_the_row_launched(rig):
+    # r2 HIGH 2 (the not_started branch at the right epoch): the key is not recorded (the lease lapsed at the
+    # fire's clock), so nothing ran; the end is lapse recovery's, never a zero settle written here
+    from datetime import timedelta
+    oid = _occurrence(rig)
+    launcher = Stub()
+    sup = _sup(rig, oid)
+    report = S.run_session(sup, rig.store, oid, rig.row(oid)["launch_epoch"], role=ROLE, values={}, recall=None,
+                           launcher=launcher, exposure=None, max_exposure_usd_micros=100_000,
+                           clock=lambda: rig.now(timedelta(days=2)))
+    assert launcher.launches == [] and (report.outcome, report.state) == ("not_started", "launched")
+    assert rig.row(oid)["state"] == "launched" and _reservation(rig, oid)[0] == "open"
+
+
+def test_a_start_run_that_raises_after_spawn_leaves_the_child_aborted(rig, monkeypatch):
+    # r2 HIGH 3: start_run itself aborts the child on any error after spawn returned (its except BaseException
+    # around the release transaction); this pins that, since run_session's re-raise relies on it
+    import sqlite3
+    oid = _occurrence(rig)
+    launcher = Stub()
+
+    def broken(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(ctl, "_still_ours", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        _run(rig, oid, launcher)
+    (child,) = launcher.children
+    assert child.aborted and not child.released
+    assert rig.row(oid)["state"] == "launched" and _reservation(rig, oid)[0] == "open"
+
+
+@pytest.mark.parametrize("rerun", [
+    {"launcher": KeyedStub(auth="passthrough", route="host-bg")},     # the launcher now refuses (route)
+    {"values": {"surprise": "x"}},                                     # the brief now refuses
+])
+def test_a_rerun_that_refuses_after_the_session_ran_never_settles_at_zero(rig, rerun):
+    # r2 MED 4: the effect committed (the key is recorded), then finish crashed; a refusing rerun settles at the
+    # caps (nothing readable under the recorded key from a refusing launcher), never the unstarted zero
+    oid = _occurrence(rig, billing="subscription")
+    first = KeyedStub(auth="passthrough", used=Usage(0, None, None, "stub", actions=7, tunnel_bytes=1000, seconds=30))
+    sup = _crash_first_finish(_sup(rig, oid))
+    with pytest.raises(KeyboardInterrupt):
+        _run(rig, oid, first, exposure=EXP, sup=sup)
+    assert rig.row(oid)["session_key"] is not None
+    launcher = rerun.get("launcher", first)
+    _, again = _run(rig, oid, launcher, exposure=EXP, sup=sup, values=rerun.get("values"))
+    assert again.outcome == "refused" and len(first.launches) == 1
+    got = _reservation(rig, oid)
+    if launcher is first:   # the same launcher reads the recorded key's usage
+        assert got == ("settled", "actual", 7, 1000, 30, 0)
+    else:
+        assert got == ("settled", "unreadable", 20, 5_000_000, 3600, 0)
+
+
+SLOT_ROLE = parse_role({**ROLE, "brief": {"template": "Review {repo}", "slots": {"repo": "str"}}})
+
+
+def test_a_rerun_with_other_values_does_not_replay_the_first_runs_result(rig):
+    # r2 MED 6: crash after the effect ran with values A; a rerun with values B is not a replay of A (the journal
+    # cancels a changed digest), so B's occurrence is never marked done off A's exit
+    oid = _occurrence(rig, role=SLOT_ROLE)
+    launcher = Stub()
+    sup = _crash_first_finish(_sup(rig, oid))
+    with pytest.raises(KeyboardInterrupt):
+        _run(rig, oid, launcher, role=SLOT_ROLE, values={"repo": "a"}, sup=sup)
+    _, again = _run(rig, oid, launcher, role=SLOT_ROLE, values={"repo": "b"}, sup=sup)
+    assert len(launcher.launches) == 1 and again.state == "launched"
+    assert rig.row(oid)["state"] == "launched"
+
+
+def test_a_rerun_whose_recall_moved_still_replays(rig):
+    # the recall is excluded from the digest on purpose: the crashed session writes episodes under its own agent,
+    # so the rerun's recall differs and must still replay (one spawn, done)
+    oid = _occurrence(rig, role=SLOT_ROLE)
+    launcher = Stub()
+    sup = _crash_first_finish(_sup(rig, oid))
+    with pytest.raises(KeyboardInterrupt):
+        _run(rig, oid, launcher, role=SLOT_ROLE, values={"repo": "a"}, sup=sup)
+    recall = SimpleNamespace(episodes=(SimpleNamespace(content="the first run wrote this", timestamp="t"),))
+    _, again = _run(rig, oid, launcher, role=SLOT_ROLE, values={"repo": "a"}, recall=recall, sup=sup)
+    assert len(launcher.launches) == 1 and again.state == "done"
+
+
+def test_a_lone_surrogate_slot_value_is_a_refused_brief(rig):
+    # r2 MED 7: an unencodable slot value is a clean refusal, not a UnicodeEncodeError that leaves the row launched
+    with pytest.raises(S.BriefRefused):
+        S.render_brief(SLOT_ROLE, {"repo": "a\ud800"}, None, occurrence_id="oc-1", session_key="s-1")
+    oid = _occurrence(rig, role=SLOT_ROLE)
+    launcher = Stub()
+    _, report = _run(rig, oid, launcher, role=SLOT_ROLE, values={"repo": "a\ud800"})
+    assert launcher.launches == [] and rig.row(oid)["reason"] == "session_refused:brief"
+
+
+def test_a_recalled_lone_surrogate_is_quoted_not_raised():
+    ep = SimpleNamespace(content="bad \ud800 byte", timestamp="t")
+    text = S.render_brief(SLOT_ROLE, {"repo": "a"}, SimpleNamespace(episodes=(ep,)), occurrence_id="oc-1",
+                          session_key="s-1")
+    text.encode("utf-8")
+    assert "bad" in text.split(S._FENCE)[1]
+
+
+@pytest.mark.parametrize("where", ["/w\r/x", "/w\t/x"])
+def test_a_path_slot_holds_no_control_character(where):
+    with pytest.raises(S.BriefRefused):
+        S.render_brief(SLOTTED, {"repo": "r", "depth": 1, "where": where}, None, occurrence_id="oc-1",
+                       session_key="s-1")

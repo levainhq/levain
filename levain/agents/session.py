@@ -43,6 +43,7 @@ dispatch wave 3 is the API-key route's work, gated on the OpenRouter credential 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -94,7 +95,13 @@ class SessionLauncher(Protocol):
     """Starts a session GATED (the :class:`levain.agents.controller.GatedChild` shape: ``release``, ``abort`` and a
     ``process`` whose ``poll``, ``wait`` and ``terminate`` are a Popen's). ``route`` must be :data:`S1_DISPATCH`;
     ``auth`` is the ticket's auth axis the launcher mints with. ``usage(session_key)`` is read once the session is
-    over and never raises."""
+    over and never raises.
+
+    ``spawn`` is FAILURE-ATOMIC: one that raises has left nothing of its own live (no S1 session, no process,
+    nothing it allocated) and released no child. :func:`run_session` reads a raising ``spawn`` as a known failure
+    and ends the run, freeing its slot; a launcher that cannot undo what it allocated before raising must not raise
+    but return a child, so the run's own stop and abort reach it. The gated child it returns has run nothing:
+    only ``controller.start_run`` releases it."""
     route: str
     auth: str
 
@@ -118,31 +125,36 @@ class UnwiredLauncher:
 @dataclass(frozen=True)
 class Reserved:
     """What the launch reserved for an occurrence, as the store holds it: the billing, the action caps (a
-    subscription's), the reserved dollars, and the deadline the occurrence's spec signs (``stop_at``, None when the
-    stored spec cannot be read or does not hash to the occurrence's ``spec_hash``)."""
+    subscription's), the reserved dollars, and what the occurrence's spec signs: its deadline (``stop_at``) and the
+    role it pins (``role_hash``), each None when the stored spec cannot be read or does not hash to the occurrence's
+    ``spec_hash``."""
     billing: str
     exposure: ActionExposure | None
     usd_micros: int | None = None
     stop_at: int | None = None
+    role_hash: str | None = None
 
 
-def _spec_stop_at(store: AgentStore, occurrence_id: str) -> int | None:
-    """The ``stop_at`` of the spec the occurrence launched under, trusted only when the stored text re-hashes to the
-    occurrence's ``spec_hash`` in canonical form (the check ``spec._check_row`` makes). None when it cannot be read."""
+def _signed_by_spec(store: AgentStore, occurrence_id: str) -> tuple[int | None, str | None]:
+    """``(stop_at, role_hash)`` of the spec the occurrence launched under, trusted only when the stored text
+    re-hashes to the occurrence's ``spec_hash`` in canonical form (the check ``spec._check_row`` makes). Each is None
+    when it cannot be read."""
     from levain.agents import spec as _spec
     try:
         with store.read() as conn:
             row = conn.execute("SELECT o.agent_id, o.spec_hash, s.spec FROM agent_occurrences o JOIN agent_specs s"
                                " ON s.spec_hash = o.spec_hash WHERE o.occurrence_id = ?", (occurrence_id,)).fetchone()
         if row is None or not isinstance(row[2], str):
-            return None
+            return None, None
         spec = _spec.parse_spec_text(row[2])
         if _spec.spec_hash(row[0], spec) != row[1] or _spec.canonical_spec(spec) != row[2]:
-            return None
-    except Exception:  # noqa: BLE001 - an unreadable spec signs no deadline; the caller refuses on None
-        return None
+            return None, None
+    except Exception:  # noqa: BLE001 - an unreadable spec signs nothing; the caller refuses on None
+        return None, None
     stop_at = spec.get("stop_at")
-    return stop_at if type(stop_at) is int and stop_at > 0 else None
+    pinned = (spec.get("role") or {}).get("role_hash")
+    return (stop_at if type(stop_at) is int and stop_at > 0 else None,
+            pinned if type(pinned) is str else None)
 
 
 def reserved_terms(store: AgentStore, occurrence_id: str) -> Reserved | None:
@@ -155,10 +167,10 @@ def reserved_terms(store: AgentStore, occurrence_id: str) -> Reserved | None:
     if row is None or row[4] != "open":
         return None
     billing = row[0] or "api_key"
-    stop_at = _spec_stop_at(store, occurrence_id)
+    stop_at, pinned = _signed_by_spec(store, occurrence_id)
     if billing != "subscription" or row[1] is None or row[3] is None:
-        return Reserved(billing, None, row[5], stop_at)
-    return Reserved(billing, ActionExposure(row[1], "tool_calls", row[3], row[2]), row[5], stop_at)
+        return Reserved(billing, None, row[5], stop_at, pinned)
+    return Reserved(billing, ActionExposure(row[1], "tool_calls", row[3], row[2]), row[5], stop_at, pinned)
 
 
 def new_session_key() -> str:
@@ -172,8 +184,13 @@ def _slot_value(name: str, kind: str, value: Any) -> str:
         return str(value)
     if type(value) is not str or not value:
         raise BriefRefused(f"slot {name} is a non-empty string")
-    if "\x00" in value or (kind == "path" and ("\n" in value or not Path(value).is_absolute())):
-        raise BriefRefused(f"slot {name}: not a {kind}" + (" (an absolute one-line path)" if kind == "path" else ""))
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:      # a lone surrogate: the brief could never be written out
+        raise BriefRefused(f"slot {name} is not encodable as UTF-8") from None
+    if "\x00" in value or (kind == "path" and (any(c < " " for c in value) or not Path(value).is_absolute())):
+        raise BriefRefused(f"slot {name}: not a {kind}" + (" (an absolute path, no control character)"
+                                                           if kind == "path" else ""))
     return value
 
 
@@ -187,14 +204,16 @@ def _recall_block(recall: Any) -> str:
     if not eps:
         return ""
     lines: list[str] = []
-    used = 0
+    cut = "(older episodes cut: the recall budget)"
+    used = len(cut) + 1                    # the cut marker's room is kept, so the block never passes the budget
     for ep in eps:
         line = _fence(" ".join(str(getattr(ep, "content", "")).split()))
         stamp = _fence(" ".join(str(getattr(ep, "timestamp", "") or "").split()))
-        line = f"{stamp} {line}".strip().encode("utf-8")[:_RECALL_EPISODE_MAX].decode("utf-8", "ignore")
-        size = len(line.encode("utf-8"))   # the budget is bytes: a 4-byte character is 4 of them
+        # recalled text is data: an unencodable character (a lone surrogate) is replaced, never raised
+        line = f"{stamp} {line}".strip().encode("utf-8", "replace")[:_RECALL_EPISODE_MAX].decode("utf-8", "ignore")
+        size = len(line.encode("utf-8")) + 1   # bytes, with its newline: a 4-byte character is 4 of them
         if used + size > RECALL_MAX_BYTES:
-            lines.append("(older episodes cut: the recall budget)")
+            lines.append(cut)
             break
         lines.append(line)
         used += size
@@ -227,6 +246,13 @@ def render_brief(role: Mapping[str, Any], values: Mapping[str, Any], recall: Any
     return text
 
 
+def _hash_or_none(role: Mapping[str, Any]) -> str | None:
+    try:
+        return _role.role_hash(dict(role))
+    except Exception:  # noqa: BLE001 - role_hash validates first; a role that does not parse has no hash
+        return None
+
+
 def launch_refusal(role: Mapping[str, Any], reserved: Reserved | None, launcher: Any,
                    exposure: ActionExposure | None, *, usd_micros: Any) -> str | None:
     """The reason this run may not start, or None. Order is the check order; the first failing check is the answer.
@@ -240,6 +266,10 @@ def launch_refusal(role: Mapping[str, Any], reserved: Reserved | None, launcher:
         return "no-model"
     if reserved is None:
         return "no-open-reservation"
+    # the role run is the one the occurrence's signed spec pins: its model, template and harness are what the
+    # reservation and the link were made for; a role that cannot be hashed (it does not parse) is never that one
+    if reserved.role_hash is None or _hash_or_none(role) != reserved.role_hash:
+        return "role-not-the-pinned-role"
     if getattr(launcher, "route", None) != S1_DISPATCH:
         return "launcher-not-wired" if isinstance(launcher, UnwiredLauncher) else "route-not-s1-dispatch"
     if reserved.billing not in AUTH_FOR_BILLING:
@@ -334,8 +364,10 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
                 max_exposure_usd_micros: int = 0, wait: Callable[[Any], int | None] | None = None,
                 clock: Callable[[], Any] | None = None, key: str | None = None) -> SessionReport:
     """A session occurrence's body, called by the fire after its claim. ``sup`` is a ``Supervisor``. In order: the
-    refusals (a refusal ends the occurrence ``failed`` with ``session_refused:<why>``, nothing spawned; an executor
-    that cannot be built from the checked terms is ``session_refused:executor``); the brief; then ONE journaled effect
+    row must be ``launched`` at ``launch_epoch`` (else nothing runs or settles: ``not_held``); the refusals (a
+    refusal ends the occurrence ``failed`` with ``session_refused:<why>``, nothing spawned, settled at zero unless the
+    row already names a session key, which is read as on a replay; an executor that cannot be built from the checked
+    terms is ``session_refused:executor``); the brief; then ONE journaled effect
     that records the key, spawns gated, releases and waits for the child's exit
     (:func:`levain.agents.controller.start_run`); then ``sup.finish``. ``wait(child)`` returns the gate's exit status
     (default: the child's own ``process.wait()``). A ``spawn`` that raises ends the run ``failed``
@@ -346,14 +378,29 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     The stop this process can make is in-process only: the executor holds the child it spawned, so a STALE at the
     effect stops it; a reaper in another process builds its executor from a row and cannot stop it (the module
     docstring). Left ``launched`` (holding slot and reservation, for the reaper and lapse recovery): a run whose
-    effect did not reach its end (cover unreadable, STALE, held); a run whose gate's exit proves nothing about its
-    group; and a run whose ``wait`` raised, after the child was stopped and aborted here, with the error
-    propagating."""
+    effect did not reach its end (cover unreadable, STALE unconfirmed, held, cancelled: a rerun whose launch inputs
+    differ from the recorded effect's); a run ``start_run`` did not start (``not_started``); a run whose gate's exit
+    proves nothing about its group; a run whose ``start_run`` raised after the spawn (``start_run`` aborts the child
+    before the error propagates); and a run whose ``wait`` raised, after the child was stopped and aborted here, with
+    the error propagating."""
     from datetime import datetime, timezone
     from levain.autonomic.journal import EffectStatus
 
     clock = clock or (lambda: datetime.now(timezone.utc))
-    unstarted = SessionExecutor(launcher)    # nothing spawned under it: its usage is the known zero a refusal settles
+    with store.read() as conn:
+        row = conn.execute("SELECT state, launch_epoch, epoch, session_key FROM agent_occurrences"
+                           " WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
+    if row is None or row[0] != "launched" or type(launch_epoch) is not int or row[1] != launch_epoch \
+            or row[2] != launch_epoch:
+        # not this fire's to end: another epoch's, or a row already ended or fenced. Nothing runs or settles here.
+        # launch_epoch never changes once a row is launched (the agent_occurrences_launch_immutable trigger), so
+        # past this check every sup.finish below settles under this fire's own epoch or, fenced since, not at all
+        return SessionReport(1, outcome="not_held", state="" if row is None else row[0],
+                             note="the occurrence is not launched at this epoch: nothing run, nothing settled")
+    # what a refusal settles: nothing spawned, unless an earlier attempt of this fire recorded a session key (its
+    # effect may have run): then, as on a replay, usage is read under that key and an unreadable one is the caps
+    unstarted = SessionExecutor(launcher, session_key=row[3])
+    unstarted.spawn_attempted = row[3] is not None
     reserved = reserved_terms(store, occurrence_id)
     why = launch_refusal(role, reserved, launcher, exposure, usd_micros=max_exposure_usd_micros)
     if why is None:
@@ -370,7 +417,7 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     try:
         brief = render_brief(role, values, recall, occurrence_id=occurrence_id, session_key=session_key)
     except BriefRefused as exc:
-        end = sup.finish(occurrence_id, executor, ok=False, reason="session_refused:brief")
+        end = sup.finish(occurrence_id, unstarted, ok=False, reason="session_refused:brief")
         return SessionReport(1, outcome="refused", state=end.state, note=str(exc))
     launch = SessionLaunch(occurrence_id, session_key, role["harness"], role["model"], brief,
                            AUTH_FOR_BILLING[reserved.billing], exposure)
@@ -379,6 +426,8 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
     spawn_failed: list[BaseException] = []
 
     def effect() -> dict[str, Any]:
+        spawn_failed.clear()          # only this call's own spawn error is the known failure below
+
         def spawn(k: str) -> Any:
             executor.spawn_attempted = True
             try:
@@ -415,10 +464,20 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
         return {"outcome": "exited", "returncode": rc, "session_key": session_key, "spawned": True,
                 "proven": _ctl.gate_proves_termination(rc)}
 
-    digest = hashlib.sha256(f"{occurrence_id}\0{_role.role_hash(dict(role))}".encode()).hexdigest()
+    # the digest is the launch as asked: a rerun asking for other work is not a replay of the first (the journal
+    # cancels a changed digest, and the row is left to lapse recovery). Two inputs are left out on purpose: the
+    # session key (each attempt mints one) and the recall, which the crashed session itself moves by writing
+    # episodes under its agent, so a true recovery must still replay
+    digest = hashlib.sha256(b"levain-session-launch/1\n" + json.dumps(
+        {"occurrence_id": occurrence_id, "role_hash": reserved.role_hash, "values": dict(values), "auth": launch.auth,
+         "exposure": None if exposure is None else [exposure.actions, exposure.unit, exposure.seconds,
+                                                    exposure.tunnel_bytes]},
+        sort_keys=True).encode("utf-8")).hexdigest()
     eff = sup.effect(occurrence_id, EFFECT_ID, digest=digest, fn=effect, executor=executor)
     status = eff.outcome.status
     if eff.waits or status not in (EffectStatus.DONE, EffectStatus.REPLAYED):
+        if eff.ended is not None and eff.ended.ended:    # a STALE the supervisor stopped and settled
+            return SessionReport(1, state=str(eff.ended.state), note=f"effect {status.value}: ended by the stop")
         return SessionReport(1, state="launched", note=f"effect {status.value}: the row stays launched")
     result = eff.outcome.result if isinstance(eff.outcome.result, dict) else {}
     if status is EffectStatus.REPLAYED:
@@ -428,6 +487,10 @@ def run_session(sup: Any, store: AgentStore, occurrence_id: str, launch_epoch: i
         recorded = result.get("session_key")
         executor.session_key = recorded if type(recorded) is str else None
     outcome = str(result.get("outcome") or "unknown")
+    if outcome == "not_started":
+        # start_run ran nothing: the key was not recorded, or the row moved before the release (the child was
+        # aborted unreleased). The end is not this fire's to write: the row stays launched for lapse recovery
+        return SessionReport(1, outcome=outcome, state="launched", note=str(result.get("reason") or ""))
     if outcome == "exited" and not result.get("proven"):
         # an exit status that proves nothing about the group: the row keeps its slot for the reaper's stop
         return SessionReport(1, outcome=outcome, state="launched", note="the exit does not prove the group gone")
