@@ -83,7 +83,8 @@ from levain.consent.record import AGENTS, tool_input_digest
 __all__ = ["DB_NAME", "DIGEST_STAMPS", "HOOK_BUSY_SECONDS", "HOOK_FILL_BUDGET", "LEDGER_ADDED_COLUMNS", "PHASES",
            "STORE_FORMAT",
            "SUBAGENT_MARK", "WINDOW_SCOPE", "Call", "Ledger", "LedgerStoreError",
-           "clean_detail", "gate_row", "hook_fill", "hook_record", "parse_when", "reconcile", "request_outcomes"]
+           "clean_detail", "gate_row", "hook_bound_sentence", "hook_fill", "hook_record", "parse_when", "reconcile",
+           "request_outcomes"]
 
 DB_NAME = "ledger.db"
 STORE_FORMAT = "levain-authority-ledger/1"
@@ -806,10 +807,26 @@ def hook_record(agent: str, payload: Any, *, queue_dir: Path | str | None = None
         ledger = _hook_ledger(queue_dir)
         if ledger is None:
             return None
+        # the bound is read from the same payload; a hook cannot know whether a bound was in force, so it says None
+        # (a measured refusal reads touched, nothing reads clean) and a classifier failure files no bound, never a row loss
+        bound = _bound.classify_payload(agent, payload, bound_active=None)
         return ledger.record_call(**_common(agent, payload, session, name, payload.get("tool_input"), cwd),
-                                  phase=phase)
+                                  phase=phase, bound=bound)
     except Exception as exc:  # noqa: BLE001 - the ledger is a record, never a gate
         _hook_failed("row not written", exc)
+        return None
+
+
+def hook_bound_sentence(agent: str, payload: Any) -> str | None:
+    """The one fixed sentence for the agent when this finished tool call hid a sandbox refusal (a masked denial,
+    :func:`levain.consent.bound.agent_sentence`), else None. Pure over the payload: it needs no ledger and files
+    nothing, so it holds even where the consent directory does not exist. Never raises."""
+    try:
+        if agent not in AGENTS or not isinstance(payload, Mapping):
+            return None
+        record = _bound.classify_payload(agent, payload, bound_active=None)
+        return None if record is None else _bound.agent_sentence(record, payload.get("tool_name"))
+    except Exception:  # noqa: BLE001 - a sentence is advice, never a gate
         return None
 
 

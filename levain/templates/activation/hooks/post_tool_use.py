@@ -14,8 +14,9 @@ left to the agent's own dialog is recorded, unsigned, as run (`levain.consent.di
 the authority ledger, its stamp pending: the transcript's `permissionDecision` is not on disk yet at this event, so the
 consent gate's next PreToolUse (or Stop) stamps it (`levain.consent.ledger`).
 
-Prints NOTHING and exits 0 always. FAIL-OPEN — the hook import is guarded and main() swallows
-everything.
+Prints nothing, except the one fixed sentence of a masked sandbox denial (`levain.consent.bound`: a call whose
+exit status hid a refused step, as `additionalContext`), and exits 0 always. FAIL-OPEN: the hook import is
+guarded and main() swallows everything.
 """
 
 from __future__ import annotations
@@ -79,6 +80,12 @@ def main() -> int:
             hook.consent_observe("claude_code", "PostToolUse", payload)
         if hasattr(hook, "consent_ledger"):
             hook.consent_ledger("claude_code", payload, record=True)
+        # a masked sandbox denial is told to the agent whether or not the hook would log anything
+        if hasattr(hook, "consent_bound_sentence"):  # an older helper beside a newer script: silent
+            sentence = hook.consent_bound_sentence("claude_code", payload)
+            event = payload.get("hook_event_name")
+            if sentence and event in ("PostToolUse", "PostToolUseFailure"):
+                hook.emit(sentence, event)
         if not hook.should_fire():
             return 0
         name = payload.get("tool_name")
