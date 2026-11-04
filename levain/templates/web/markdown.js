@@ -200,6 +200,17 @@
   }
 
   // Block parser: line-based, single forward pass. Returns a DocumentFragment.
+  // The fence rule, one home: renderMarkdown draws a fenced block by it and the notification detail's shape finder (ncFenced) skips
+  // the same lines, so the two cannot disagree on where code is. An opener is a run of 3+ backticks or tildes with an info string
+  // that holds neither; a closer is a line of at least the opener's run, of the same character, and nothing else.
+  function mdFenceOpen(line) {
+    const m = /^([ \t]*)(```+|~~~+)[ \t]*([^`~]*)$/.exec(line);
+    return m ? { marker: m[2][0], len: m[2].length } : null;
+  }
+  function mdFenceCloses(line, open) {
+    const c = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(line);
+    return !!c && c[1][0] === open.marker && c[1].length >= open.len;
+  }
   function renderMarkdown(text) {
     const frag = document.createDocumentFragment();
     const lines = String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n");
@@ -217,14 +228,12 @@
       if (!line.trim()) { i++; continue; }  // blank line = block separator
 
       // fenced code (``` / ~~~): collect verbatim until the matching closing fence
-      const fence = /^([ \t]*)(```+|~~~+)[ \t]*([^`~]*)$/.exec(line);
+      const fence = mdFenceOpen(line);
       if (fence) {
-        const marker = fence[2][0], minLen = fence[2].length;
         i++;
         const buf = [];
         while (i < N) {
-          const cl = /^[ \t]*(`{3,}|~{3,})[ \t]*$/.exec(lines[i]);
-          if (cl && cl[1][0] === marker && cl[1].length >= minLen) { i++; break; }
+          if (mdFenceCloses(lines[i], fence)) { i++; break; }
           buf.push(lines[i]); i++;
         }
         const pre = el("pre", "md-pre");

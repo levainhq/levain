@@ -320,6 +320,13 @@ def test_a_login_that_outlives_its_deadline_is_killed_and_swept(rig, monkeypatch
     assert sweeps == ["SWEEP levain-hands %d lock-held=True" % os.getuid()]
     assert hands_login.read_outcomes(rig.entity)["claude"]["outcome"] == "failed"
     pid = int(rig.pids.read_text().split()[0])
+    deadline = time.monotonic() + 3.0          # the killed child is reaped by init, not by this process (CI py3.13 read it as a zombie)
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
 

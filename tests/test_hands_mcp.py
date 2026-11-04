@@ -320,6 +320,9 @@ def _trusted(tmp_path, monkeypatch, name="npx", mode=0o755):
 
 def test_a_bare_name_resolves_through_the_trusted_dirs_and_the_signed_entry_holds_the_absolute_path(tmp_path, monkeypatch):
     _, exe = _trusted(tmp_path, monkeypatch)
+    # the directory rule refuses a sticky world-writable ancestor on purpose (a /tmp included); the Linux CI temp tree sits
+    # under /tmp, the macOS one does not, so this test is about the resolution and leaves that rule to its own tests
+    monkeypatch.setattr(hm, "_loose_dir", lambda path, uid: None)
     e = _entry(command="npx")
     assert e["command"] == exe and e["server_sha256"] == hm.server_sha256(e)
     assert hm.registration_problems(e, home=HOME) == []
