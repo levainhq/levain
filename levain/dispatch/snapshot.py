@@ -63,14 +63,25 @@ _RULES: tuple[tuple[str, re.Pattern[bytes]], ...] = tuple((n, re.compile(p)) for
     ("google-api-key", rb"\bAIza[0-9A-Za-z_-]{35}\b"),
 ))
 #: The assignment rule, one line at a time, every step linear and bounded. Only a line holding a secret word is
-#: parsed. Its first ``=`` or ``:`` is the separator. Before it, the NAME is the last run of name bytes
-#: (``[A-Za-z0-9_.-]``, at most 256), which may be quoted. Only these may come before the name: whitespace, one
-#: ``{`` / ``,`` / ``-`` marker, and up to 64 bytes of prefix words (``export``, ``ENV``, ``const``, ...). After it,
-#: the VALUE is the rest of that line. Fail closed, no exemptions: a reference, a placeholder or a line of code under
-#: a secret name is a finding like any other, and so is a value that is only a YAML block indicator or that ends in a
-#: ``\`` continuation, whose secret lies on lines this rule does not read. The role withholds the path.
+#: parsed, and only its first 64 ``=`` / ``:`` separators; on a line with more, a secret word anywhere after the
+#: 64th is a finding (fail closed). Before each separator, the NAME is the last run of name bytes
+#: (``[A-Za-z0-9_.-]``, at most 256), which may be quoted. A name is secret when it holds a secret word, except that
+#: the plural ``tokens`` as its last word (``tokens``, ``input_tokens``, ``max-tokens``) is a counter, not a secret.
+#: At the FIRST separator only these may come before the name: whitespace, one ``{`` / ``,`` / ``-`` marker, and up
+#: to 64 bytes of prefix words (``export``, ``ENV``, ``const``, ...; whitespace between them is not counted); its
+#: VALUE is the rest of the line. At a LATER separator the name must follow a ``,`` / ``{`` / whitespace boundary;
+#: a quoted value runs to its closing quote (to the end of the line when there is none or a ``\`` comes first), an
+#: unquoted one to the next ``,`` ``}`` ``;`` ``(`` ``)`` ``[`` ``]`` or whitespace. Fail closed, no exemptions: a
+#: reference, a placeholder or a line of code under a secret name is a finding like any other, and so is a value
+#: that is only a YAML block indicator or that ends in a ``\`` continuation, whose secret lies on lines this rule
+#: does not read. The role withholds the path.
 _SECRET_NAME = re.compile(rb"SECRET|TOKEN|PASSWORD|PASSWD|API[_.-]?KEY|PRIVATE[_.-]?KEY")
+_PLURAL_TOKENS = (b"_TOKENS", b"-TOKENS", b".TOKENS")
 _SEPARATOR = re.compile(rb"[=:]")
+_SEPARATOR_MAX = 64
+_VALUE_END = re.compile(rb"[,};()\[\]\s]")
+_NON_SPACE = re.compile(rb"\S")
+_BOUNDARY = frozenset(b",{ \t\r\f\v")
 _NAME_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
 _NAME_MAX = 256
 _PREFIX_MAX = 64
@@ -80,11 +91,8 @@ _BLOCK_INDICATOR = re.compile(rb"[|>][-+0-9]{0,2}")
 _ASSIGN_MIN = 12
 
 
-def _assignment_name(prefix: bytes) -> bytes | None:
-    """The assigned name in ``prefix`` (a line up to its first separator), or ``None`` when it is not an assignment."""
-    p = prefix.strip()
-    if p[:1] in (b"{", b",", b"-"):
-        p = p[1:].lstrip()
+def _trailing_name(p: bytes) -> tuple[bytes, bytes] | None:
+    """``(name, rest)`` for the name ending ``p`` (optionally quoted; the quotes are not in either part), else ``None``."""
     quote = p[-1:] if p[-1:] in (b'"', b"'") else b""
     if quote:
         p = p[:-1]
@@ -98,9 +106,39 @@ def _assignment_name(prefix: bytes) -> bytes | None:
         if rest[-1:] != quote:
             return None
         rest = rest[:-1]
-    if len(rest) > _PREFIX_MAX or any(w.lower() not in _PREFIX_WORDS for w in rest.split()):
+    return name, rest
+
+
+def _assignment_name(prefix: bytes) -> bytes | None:
+    """The assigned name in ``prefix`` (a line up to its first separator), or ``None`` when it is not an assignment."""
+    p = prefix.strip()
+    if p[:1] in (b"{", b",", b"-"):
+        p = p[1:].lstrip()
+    got = _trailing_name(p)
+    if got is None:
         return None
-    return name
+    used = 0
+    for w in got[1].split():
+        used += len(w)
+        if used > _PREFIX_MAX or w.lower() not in _PREFIX_WORDS:
+            return None
+    return got[0]
+
+
+def _later_name(segment: bytes) -> bytes | None:
+    """The name before a later separator (``segment`` runs from the previous separator to this one), or ``None``
+    unless it follows a ``,`` / ``{`` / whitespace boundary inside the segment."""
+    got = _trailing_name(segment.rstrip())
+    if got is None or not got[1] or got[1][-1] not in _BOUNDARY:
+        return None
+    return got[0]
+
+
+def _is_secret_name(name: bytes) -> bool:
+    upper = name.upper()
+    if upper == b"TOKENS" or upper.endswith(_PLURAL_TOKENS):
+        upper = upper[:-6]
+    return _SECRET_NAME.search(upper) is not None
 
 
 def _secret_value(value: bytes) -> bool:
@@ -118,9 +156,47 @@ def _secret_value(value: bytes) -> bool:
     return len(value) >= _ASSIGN_MIN
 
 
+def _later_value(body: bytes, pos: int, end: int) -> bool:
+    """Whether the value after a later separator (``body[pos:end]``) is a finding: a quoted value up to its closing
+    quote (the rest of the line when it has none or holds a ``\\``), else its first token up to ``,`` ``}`` ``;``
+    ``(`` ``)`` ``[`` ``]`` or whitespace."""
+    first = _NON_SPACE.search(body, pos, end)
+    if first is None:
+        return False
+    pos = first.start()
+    quote = body[pos:pos + 1]
+    if quote in (b'"', b"'"):
+        close = body.find(quote, pos + 1, end)
+        if close < 0 or body.find(b"\\", pos + 1, close) >= 0:
+            return _secret_value(body[pos:end])
+        return _secret_value(body[pos:close + 1])
+    stop = _VALUE_END.search(body, pos, end)
+    return _secret_value(body[pos:stop.start() if stop is not None else end])
+
+
+def _secret_line(body: bytes, upper: bytes, start: int, end: int) -> bool:
+    """Whether the line ``body[start:end]`` assigns a finding to a secret name, at any of its first
+    ``_SEPARATOR_MAX`` separators; past that cap, any secret word after the last parsed separator is a finding."""
+    prev = None
+    for k, sep in enumerate(_SEPARATOR.finditer(body, start, end)):
+        if k == _SEPARATOR_MAX:
+            return _SECRET_NAME.search(upper, prev.end(), end) is not None
+        if prev is None:
+            name = _assignment_name(body[start:sep.start()])
+            if name is not None and _is_secret_name(name) and _secret_value(body[sep.end():end]):
+                return True
+        else:
+            name = _later_name(body[prev.end():sep.start()])
+            if name is not None and _is_secret_name(name) and _later_value(body, sep.end(), end):
+                return True
+        prev = sep
+    return False
+
+
 def _secret_assignment(body: bytes) -> bool:
     """Whether any line of ``body`` assigns a value that is a finding to a secret-named name. Each line holding a
-    secret word is parsed once, so the scan stays linear in ``len(body)``."""
+    secret word is parsed once, at no more than ``_SEPARATOR_MAX`` separators, so the scan stays linear in
+    ``len(body)``."""
     upper = body.upper()
     line_end = -1
     for m in _SECRET_NAME.finditer(upper):
@@ -130,12 +206,7 @@ def _secret_assignment(body: bytes) -> bool:
         line_end = body.find(b"\n", m.start())
         if line_end < 0:
             line_end = len(body)
-        sep = _SEPARATOR.search(body, start, line_end)
-        if sep is None:
-            continue
-        name = _assignment_name(body[start:sep.start()])
-        if (name is not None and _SECRET_NAME.search(name.upper()) is not None
-                and _secret_value(body[sep.end():line_end])):
+        if _secret_line(body, upper, start, line_end):
             return True
     return False
 

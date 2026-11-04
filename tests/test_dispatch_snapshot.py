@@ -244,6 +244,90 @@ def test_recognised_forms_still_ignore_short_values(text):
     assert scan_blob(text.encode()) is None
 
 
+_PAST_CAP = ",".join(f"k{i}=1" for i in range(70))          # 70 separators: more than the 64 a line is parsed for
+
+
+@pytest.mark.parametrize("text", [
+    # (1) a secret that is not the line's first key: every separator is examined
+    '{"user":"bob","password":"actual-secret-123456"}\n',
+    "export FOO=bar PASSWORD=actual-secret-123456\n",
+    "{a: 1, token: xxxxxxxxxxxxx}\n",
+    "user=bob, api_key=actual-secret-123456, region=us-east-1\n",
+    '{"a": 1, "b": 2, "secret": "actual-secret-123456"}\n',
+    "a: 1, token: |\n  actual\n",                      # a later block indicator fails closed too
+    "A=1 TOKEN=abc\\\ndefghijklmnop\n",                # and a later trailing continuation
+    # past the 64-separator cap, a secret word anywhere after it is a finding (fail closed)
+    _PAST_CAP + " token\n",
+    _PAST_CAP + ",password=x\n",
+    # (2) the prefix limit counts prefix-word bytes, never whitespace
+    "export" + " " * 59 + "PASSWORD=actual-secret-123456\n",
+    "export" + " " * 300 + "PASSWORD=actual-secret-123456\n",
+    "export \t readonly" + " " * 80 + "TOKEN=actual-secret-123456\n",
+    # (3) the singular and a plural that is not the name's last word stay secret names
+    "access_token=actual-secret-123456\n",
+    "api-token: actual-secret-123456\n",
+    "secret_tokens: actual-secret-123456\n",           # SECRET still names it
+    "tokens_secret = actual-secret-123456\n",
+    # a later quoted value runs to its closing quote; with no closing quote or a backslash first, to the line end
+    'db = connect(user="u", password="actual-secret-123456")\n',
+    '{"a": 1, "password": "ab\\"cdefghijklmnop"}\n',
+    'a=1 token="abcdefghijklmnop\n',
+])
+def test_secret_assignment_examines_every_key_and_counts_prefix_words_only(text):
+    assert scan_blob(text.encode()) == "secret-assignment"
+
+
+@pytest.mark.parametrize("text", [
+    # (3) the plural TOKENS as the name's last word is a counter, not a secret
+    '"input_tokens": 123456789012345,\n',
+    '  "output_tokens": "abcdefghijklmnop"\n',
+    "cache_read_tokens = compute_the_count(usage)\n",
+    "tokens: abcdefghijklmnopq\n",
+    "usage.tokens = abcdefghijklmnopq\n",
+    "max-tokens: 1234567890123456\n",
+    '{"input_tokens": 1, "output_tokens": 2, "cache_read_tokens": 300000000000000}\n',
+    # (1) later keys keep the short-value floor, and a later name needs a `,` `{` or whitespace boundary
+    '{"user":"bob","password":"short"}\n',
+    "{a: 1, token: short}\n",
+    "export FOO=bar PASSWORD=short\n",
+    "user=bob, token=abc, region=us-east-1-and-more\n",   # the unquoted value ends at the `,`
+    "a=1 token=x and then some long trailing prose words\n",
+    "url=http://h.example/?a=1&token=abc\n",
+    # a later quoted value ends at its closing quote; an unquoted one also at `(` `)` `[` `]` (call arguments)
+    'rows = _get(url, token="T")["rows"]\n',
+    'sp = spec("darwin", extra_env={"ANTHROPIC_API_KEY": "tok", "TERM": "xterm-256color"})\n',
+    'done = store.set_state(tid, by="coordinator", token=_lease(store))\n',
+    'devs = _call(port, "GET", token=T)[1]["devices"]\n',
+    # (2) a prefix of more than 64 bytes of prefix WORDS is still not a prefix
+    "export " * 11 + "PASSWORD=actual-secret-123456\n",
+])
+def test_secret_assignment_later_keys_and_plurals_are_precise(text):
+    assert scan_blob(text.encode()) is None
+
+
+def test_scan_is_linear_on_pathological_many_separator_lines():
+    """Many separators on one long line: at most 64 are parsed per line, so a hostile line stays linear."""
+    import sys
+    import textwrap
+    code = textwrap.dedent("""
+        import time
+        from levain.dispatch.snapshot import scan_blob
+        n = 1024 ** 2
+        lines = [b"TOKEN" + b' ,token:"' * (n // 9), b"x " + b"token=" * (n // 6), b"a=1 " + b"password: " * (n // 10),
+                 b"{" + b'"k":1,' * (n // 6) + b"SECRET", b"export" + b" " * n + b"TOKEN=" + b"a" * n,
+                 (b"q=1 token=" + b"b" * 4096 + b" ") * 300]
+        t = time.monotonic()
+        for line in lines:
+            scan_blob(line)
+        print(time.monotonic() - t)
+    """)
+    root = str(Path(snap.__file__).resolve().parents[2])
+    env = {**os.environ, "PYTHONPATH": root}
+    cp = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, env=env, cwd=root)
+    assert cp.returncode == 0, cp.stderr[-500:]
+    assert float(cp.stdout.strip()) < 2.0
+
+
 def test_a_false_positive_is_cleared_only_by_the_role_withholding_its_path(tmp_path):
     repo = make_repo(tmp_path, {**FILES, "src/cfg.py": 'api_key = os.environ.get("API_KEY")\n'})
     with pytest.raises(SnapshotRefused) as ei:
