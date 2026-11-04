@@ -64,7 +64,7 @@ __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo
            "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed", "session_band_state",
            "run_band", "run_band_answer", "AnswerCommitted", "AuthorityItem", "BandSnapshot", "PickNotOffered",
            "QUESTION_VERSION_FIELDS", "VersionMoved", "VersionedQuestionStore", "answer_item", "answerable",
-           "subject_for", "subject_version", "summary", "Signing", "answer_sign_of", "answer_badge", "allocate", "ALLOCATABLE_SOURCES"]
+           "subject_for", "subject_version", "summary", "Signing", "answer_sign_of", "answer_badge", "answer_badges", "allocate", "ALLOCATABLE_SOURCES"]
 
 COMPACT_AFTER = 12
 _COMPACT_WHAT = 100
@@ -1753,6 +1753,11 @@ def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mappin
                       sign_with=sign_with).echo
 
 
+BADGE_BUDGET_S = 1.5          # the most a band render spends on history badges; a row not verified by then shows none
+_BADGE_CACHE_MAX = 256
+_badge_cache: "dict[tuple[str, str], str]" = {}     # (question id, digest of key + message + sig) -> verdict
+
+
 def answer_badge(store: Any, question_id: str, *, key_dir: Path | None = None,
                  ctk: Callable[[str], tuple[bool | None, str]] | None = None) -> str:
     """What a reader shows beside an answered item: the one :func:`terminal_sign.answer_class` verdict on its signature
@@ -1766,46 +1771,121 @@ def answer_badge(store: Any, question_id: str, *, key_dir: Path | None = None,
     try:
         from levain.consent import terminal_sign as ts
 
-        sign = answer_sign_of(store, question_id)
-        if not sign or sign.get("sign_state") != "signed" or not sign.get("message") or not sign.get("sig"):
-            return ""
         key = ts.find_key(key_dir)
-        q = store.get(question_id)
-        if key is None or q is None or q.answer is None:
+        if key is None:
             return ""
-        with store._peek() as conn:
-            via, viewer = conn.execute("SELECT via, viewer FROM answer_context WHERE question_id = ?",
-                                       (question_id,)).fetchone()
-        message = sign["message"]
-        raw = message.encode("utf-8")
-        desk = message.startswith(ts.DESK_FORMAT + "\n")
-        parsed = ts.parse_desk_verified(raw) if desk else ts.parse_verified(raw)
-        sid = _store_id_of(store)
-        context: dict[str, Any] = {
-            "signers": f'phill namespaces="{ts.SIGNERS_NAMESPACES}" {key.public_key}\n', "principal": "phill",
-            "ctk": ctk, "store": f"levain-questions:{sid}", "install": sid, "view": parsed.view,
-            "session": getattr(parsed, "session", None),
-            "surface": (viewer or "").split(":", 1)[1] if str(viewer).startswith("cockpit:") else None}
-        a = q.answer
-        if a.kind == "option":
-            i = [k for k, _ in q.options].index(a.value)
-            event: dict[str, Any] = {"answer": f"({_LETTERS[i]}) {q.options[i][1]}"}
-        else:
-            event = {"text": a.value}
-        event.update({"ts": a.answered_at, "via": via, "signed": {
-            "format": ts.DESK_FORMAT if desk else ts.FORMAT, "message": message, "sig": sign["sig"],
-            "entry": next((n for n, e in enumerate(parsed.entries, 1) if e.item == q.id), 0)}})
-        row = {"id": q.id, "what": q.what, "row_version": parsed.entries[event["signed"]["entry"] - 1].row_version}
-        got = ts.answer_class(event, row, context)
-        if got.state == "signed-terminal":
-            return got.badge
-        return f"signature failed ({got.reason})" if got.state == "failed" else ""
+        return _badge_of(store, question_id, key, _shared_ctk(ctk))
     except Exception:  # noqa: BLE001 - a display aid never breaks the band
         return ""
 
 
-def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> str:
-    """The viewer's delta since its last view: new numbers, closed ones with how (D4 §4)."""
+def answer_badges(store: Any, question_ids: Sequence[str], *, deadline: float | None = None,
+                  key_dir: Path | None = None, ctk: Callable[[str], tuple[bool | None, str]] | None = None
+                  ) -> dict[str, str]:
+    """:func:`answer_badge` for several answered items within ONE bound: ``deadline`` (``time.monotonic()``; default
+    now + :data:`BADGE_BUDGET_S`, never later than that). One key lookup and one CTK check serve every row; the
+    verifying runs on a worker thread, and a row not verified by the deadline is left out (no badge), so a slow
+    ssh-keygen or sc_auth never holds the caller. A verdict reached later is kept for the next render. Holds no
+    store transaction while it verifies (each read is its own). Never raises."""
+    import threading
+
+    ids = [q for q in dict.fromkeys(question_ids) if isinstance(q, str)]
+    if not ids:
+        return {}
+    cap = time.monotonic() + BADGE_BUDGET_S
+    until = cap if deadline is None else min(deadline, cap)
+    got: dict[str, str] = {}
+
+    def work() -> None:
+        try:
+            from levain.consent import terminal_sign as ts
+
+            key = ts.find_key(key_dir)
+            if key is None:
+                return
+            shared = _shared_ctk(ctk)
+            for qid in ids:
+                try:
+                    got[qid] = _badge_of(store, qid, key, shared)
+                except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
+                    got[qid] = ""
+        except Exception:  # noqa: BLE001
+            return
+
+    t = threading.Thread(target=work, name="levain-answer-badges", daemon=True)
+    try:
+        t.start()
+    except RuntimeError:
+        return {}
+    t.join(max(0.0, until - time.monotonic()))
+    return {qid: got[qid] for qid in ids if got.get(qid)}
+
+
+def _shared_ctk(ctk: Callable[[str], tuple[bool | None, str]] | None) -> Callable[[str], tuple[bool | None, str]]:
+    """``ctk`` (default the live :func:`terminal_sign.ctk_status`) asked at most once per public key."""
+    memo: dict[str, tuple[bool | None, str]] = {}
+
+    def check(public_key: str) -> tuple[bool | None, str]:
+        if public_key not in memo:
+            from levain.consent import terminal_sign as ts
+            memo[public_key] = (ctk or ts.ctk_status)(public_key)
+        return memo[public_key]
+    return check
+
+
+def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple[bool | None, str]]) -> str:
+    import hashlib
+
+    from levain.consent import terminal_sign as ts
+
+    sign = answer_sign_of(store, question_id)
+    if not sign or sign.get("sign_state") != "signed" or not sign.get("message") or not sign.get("sig"):
+        return ""
+    q = store.get(question_id)
+    if q is None or q.answer is None:
+        return ""
+    message = sign["message"]
+    digest = hashlib.sha256("\0".join((key.public_key, message, sign["sig"])).encode("utf-8")).hexdigest()
+    cached = _badge_cache.get((question_id, digest))
+    if cached is not None:
+        return cached
+    with store._peek() as conn:
+        via, viewer = conn.execute("SELECT via, viewer FROM answer_context WHERE question_id = ?",
+                                   (question_id,)).fetchone()
+    raw = message.encode("utf-8")
+    desk = message.startswith(ts.DESK_FORMAT + "\n")
+    parsed = ts.parse_desk_verified(raw) if desk else ts.parse_verified(raw)
+    sid = _store_id_of(store)
+    context: dict[str, Any] = {
+        "signers": f'phill namespaces="{ts.SIGNERS_NAMESPACES}" {key.public_key}\n', "principal": "phill",
+        "ctk": ctk, "store": f"levain-questions:{sid}", "install": sid, "view": parsed.view,
+        "session": getattr(parsed, "session", None),
+        "surface": (viewer or "").split(":", 1)[1] if str(viewer).startswith("cockpit:") else None}
+    a = q.answer
+    if a.kind == "option":
+        i = [k for k, _ in q.options].index(a.value)
+        event: dict[str, Any] = {"answer": f"({_LETTERS[i]}) {q.options[i][1]}"}
+    else:
+        event = {"text": a.value}
+    event.update({"ts": a.answered_at, "via": via, "signed": {
+        "format": ts.DESK_FORMAT if desk else ts.FORMAT, "message": message, "sig": sign["sig"],
+        "entry": next((n for n, e in enumerate(parsed.entries, 1) if e.item == q.id), 0)}})
+    row = {"id": q.id, "what": q.what, "row_version": parsed.entries[event["signed"]["entry"] - 1].row_version}
+    got = ts.answer_class(event, row, context)
+    if got.state == "signed-terminal":
+        verdict = got.badge
+    else:
+        verdict = f"signature failed ({got.reason})" if got.state == "failed" else ""
+    if got.reason != "verifier-unavailable" and got.reason != "classifier-error":   # a passing failure is not kept
+        if len(_badge_cache) >= _BADGE_CACHE_MAX:
+            _badge_cache.pop(next(iter(_badge_cache)))
+        _badge_cache[(question_id, digest)] = verdict
+    return verdict
+
+
+def _delta_line(store: QuestionStore, prev: View | None, shown: list[int], deadline: float | None = None) -> str:
+    """The viewer's delta since its last view: new numbers, closed ones with how (D4 §4). The signature badges are
+    read after the read transaction closes, within ``deadline`` (:func:`answer_badges`)."""
     if prev is None:
         return "first band on this seat"
     new = [n for n in shown if n > prev.seen_through or n not in prev.open_list]
@@ -1813,19 +1893,22 @@ def _delta_line(store: QuestionStore, prev: View | None, shown: list[int]) -> st
     if not new and not gone:
         return ""
     how: dict[int, str] = {}
+    refs: dict[int, str] = {}
     if gone:
         with store._peek() as conn:
             if conn is not None:
                 for n in gone:
-                    row = conn.execute("SELECT a.channel FROM band_items b JOIN answers a ON a.question_id = b.ref "
-                                       "WHERE b.source = 'question' AND b.n = ?", (n,)).fetchone()
+                    row = conn.execute("SELECT a.channel, b.ref FROM band_items b JOIN answers a "
+                                       "ON a.question_id = b.ref WHERE b.source = 'question' AND b.n = ?",
+                                       (n,)).fetchone()
                     how[n] = f"answered via {row[0]}" if row else "gone"
                     if row:
-                        ref = conn.execute("SELECT ref FROM band_items WHERE source = 'question' AND n = ?",
-                                           (n,)).fetchone()
-                        badge = answer_badge(store, ref[0]) if ref else ""
-                        if badge:
-                            how[n] += f", {badge}"
+                        refs[n] = row[1]
+        if refs:
+            badges = answer_badges(store, list(refs.values()), deadline=deadline)
+            for n, ref in refs.items():
+                if badges.get(ref):
+                    how[n] += f", {badges[ref]}"
     parts = []
     if new:
         parts.append("new " + ", ".join(str(n) for n in new))
@@ -1984,14 +2067,14 @@ def _hook_render(store: QuestionStore, directory: Path | str, session: str, view
         r = render_full(store, deadline=deadline)
         text = r.text
         if text:
-            delta = _delta_line(store, prev, r.shown)
+            delta = _delta_line(store, prev, r.shown, deadline)
             if delta:
                 head, _, body = text.partition("\n")
                 text = head + "\n" + delta + ("\n" + body if body else "")
         if not text and prev is not None and prev.open_list:
             # Everything this viewer last saw closed (perhaps its notice consumed by another seat): say so and let the
             # empty view be committed, or the old view stays active and the Stop verifier demands obsolete items.
-            delta = _delta_line(store, prev, r.shown)
+            delta = _delta_line(store, prev, r.shown, deadline)
             text = "NEEDS YOU · 0 open" + ("\n" + delta if delta else "")
     except Exception:
         return echo, _no_commit

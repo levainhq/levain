@@ -502,3 +502,65 @@ def test_the_delta_line_shows_the_badge(rig, store, keydir, monkeypatch):
     monkeypatch.setattr(ts, "ctk_status", lambda pk, **kw: (True, "bio"))
     line = band_view._delta_line(store, prev, [])
     assert "answered via cockpit, signed: Touch ID, laptop (desk)" in line, line
+
+
+def test_a_slow_verifier_never_holds_the_delta_line_past_its_deadline(rig, store, keydir, monkeypatch):
+    """Three closed signed rows behind a CTK check that takes 5 s each: the delta line returns within its deadline
+    with no badge, and the check never runs while the render's read transaction is open."""
+    import time
+
+    qs = [file_q(store, what=f"Ship fix {i}?") for i in range(3)]
+    band_view.band_payload(store, "cockpit:web")
+    prev, _vid = band_view._newest_view(store, "cockpit:web")
+    for i, q in enumerate(qs):
+        rig(body(q, txn=f"txn-slow-00{i}"), factory=Calls())
+    open_reads = [0]
+    real_peek = type(store)._peek
+
+    def counting_peek(self):
+        cm = real_peek(self)
+
+        class _C:
+            def __enter__(s):
+                open_reads[0] += 1
+                return cm.__enter__()
+
+            def __exit__(s, *a):
+                open_reads[0] -= 1
+                return cm.__exit__(*a)
+        return _C()
+    monkeypatch.setattr(type(store), "_peek", counting_peek)
+    seen_open: list[int] = []
+
+    def slow(pk, **kw):
+        seen_open.append(open_reads[0])
+        time.sleep(5)
+        return True, "bio"
+    monkeypatch.setattr(ts, "_real_key_dir", lambda: keydir)
+    monkeypatch.setattr(ts, "ctk_status", slow)
+    band_view._badge_cache.clear()
+    t0 = time.monotonic()
+    line = band_view._delta_line(store, prev, [], time.monotonic() + 0.4)
+    took = time.monotonic() - t0
+    assert took < 1.0, took
+    assert "answered via cockpit" in line and "signed:" not in line, line
+    deadline = time.monotonic() + 3
+    while not seen_open and time.monotonic() < deadline:      # the worker reaches the check after the render left
+        time.sleep(0.05)
+    assert seen_open and set(seen_open) == {0}, seen_open      # one shared check, no read transaction held
+
+
+def test_badges_share_one_ctk_check_and_cache_their_verdict(rig, store, keydir, monkeypatch):
+    qs = [file_q(store, what=f"Ship fix {i}?") for i in range(3)]
+    for i, q in enumerate(qs):
+        rig(body(q, txn=f"txn-share-0{i}"), factory=Calls())
+    asked: list[str] = []
+
+    def ctk(pk):
+        asked.append(pk)
+        return True, "bio"
+    band_view._badge_cache.clear()
+    got = band_view.answer_badges(store, [q.id for q in qs], key_dir=keydir, ctk=ctk)
+    assert got == {q.id: "signed: Touch ID, laptop (desk)" for q in qs} and len(asked) == 1
+    again = band_view.answer_badges(store, [q.id for q in qs], key_dir=keydir, ctk=ctk)
+    assert again == got and len(asked) == 1                    # cached per (row, signature digest)
