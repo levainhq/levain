@@ -53,6 +53,23 @@ def test_a_dream_spec_keeps_its_hook_and_body_when_its_name_row_is_renamed(tmp_p
     oid = rig.claim("k")
     _rename(rig, "something-else")
     assert callable(ctl._default_input_check(rig.store, oid))
+    seen = []
+    assert ctl.run_agent(rig.store, oid, 0, bodies={"dream": lambda: (lambda s, o, e: seen.append(o) or 0)}) == 0
+    assert seen == [oid]
+
+
+def test_a_spec_that_does_not_hash_to_its_spec_hash_names_no_agent_and_the_launch_is_held(rig, monkeypatch, capsys):
+    # behaviour: the spec is re-hashed on the way out; one that fails names no agent: no body (unwired) and the default
+    # hook is dead input, so the row stays admitted and is never launched unchecked
+    rig.link()
+    oid = rig.claim("k")
+    assert ctl._occurrence_agent_name(rig.store, oid) == "job_push_check"
+    monkeypatch.setattr(ctl, "_spec_hash", lambda agent_id, spec: "0" * 64)
+    assert ctl._occurrence_agent_name(rig.store, oid) is None
+    assert ctl.run_agent(rig.store, oid, 0) == ctl.FIRE_UNWIRED
+    res = rig.launch(oid)
+    assert res.outcome == ctl.UNCLASSIFIED and rig.row(oid)["state"] == "admitted"
+    assert "input check failed" in res.reason
 
 
 def test_a_scheduled_fire_of_the_dream_no_longer_ends_unwired(tmp_path):

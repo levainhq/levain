@@ -37,7 +37,8 @@ from urllib.parse import quote
 from levain import authority as _auth
 from levain.agent_authority import AgentCoverMoved
 from levain.agents import accounting, schedule, slots
-from levain.agents.spec import _check_row
+from levain.agents.spec import _check_row, parse_spec_text
+from levain.agents.spec import spec_hash as _spec_hash
 from levain.agents.store import AgentStore, open_agent_store
 
 _log = logging.getLogger("levain.agents.controller")
@@ -1366,13 +1367,22 @@ RUN_BODIES: dict[str, Callable[[], RunBody]] = {DREAM: _dream_body}
 def _occurrence_agent_name(store: AgentStore, occurrence_id: str) -> str | None:
     """The name of the agent an occurrence runs, read from the frozen spec its own ``spec_hash`` names (the hash binds
     the agent_id and the whole spec, and a stored spec cannot change), never from the ``agents.name`` row, which
-    nothing freezes. ``None`` when the row, its spec or the spec's name cannot be read: that is no agent."""
+    nothing freezes. The spec is re-hashed on the way out (``spec_hash(agent_id, spec)`` must equal the stored hash and
+    the canonical text must equal the stored text), so a stored text that does not belong to its hash names no agent.
+    ``None`` when the row, its spec or the spec's name cannot be read or verified: that is no agent."""
     with store.read() as conn:
-        row = conn.execute("SELECT s.spec FROM agent_occurrences o JOIN agent_specs s ON s.spec_hash = o.spec_hash"
-                           " AND s.agent_id = o.agent_id WHERE o.occurrence_id = ?", (occurrence_id,)).fetchone()
+        row = conn.execute("SELECT o.agent_id, s.spec_hash, s.spec FROM agent_occurrences o JOIN agent_specs s"
+                           " ON s.spec_hash = o.spec_hash AND s.agent_id = o.agent_id WHERE o.occurrence_id = ?",
+                           (occurrence_id,)).fetchone()
+    if row is None:
+        return None
+    agent_id, digest, text = row
     try:
-        name = None if row is None else json.loads(row[0])["name"]
-    except (ValueError, KeyError, TypeError):
+        spec = parse_spec_text(text)
+        if _spec_hash(agent_id, spec) != digest or _auth._canonical(spec) != text:
+            return None
+        name = spec["name"]
+    except Exception:  # noqa: BLE001 - a spec that cannot be parsed and verified (RecursionError included) is no agent
         return None
     return name if isinstance(name, str) else None
 
@@ -1393,7 +1403,12 @@ def _default_input_check(store: AgentStore, occurrence_id: str) -> InputCheck | 
     """The ``on_input`` hook for an occurrence whose caller passed none: the dream's, for the dream; ``None`` (input
     present) for every other agent. A dream whose install facts are absent gets a hook that raises when run, which
     :func:`check_input` reads as dead input."""
-    if _occurrence_agent_name(store, occurrence_id) != DREAM:
+    name = _occurrence_agent_name(store, occurrence_id)
+    if name is None:
+        def unknown_agent(row: Mapping) -> bool:
+            raise RuntimeError("the occurrence's agent cannot be read or verified from its spec")
+        return unknown_agent    # dead input: the row stays admitted, never launched unchecked
+    if name != DREAM:
         return None
     from levain.dream import agent as dream_agent
     return dream_agent.install_on_input(store.directory)
