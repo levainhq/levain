@@ -18,25 +18,29 @@ file that was never measured is not free. Without a weights file every weight is
 heaviest file first, onto the lightest shard, ties broken by shard index and file name, so the result is
 deterministic. A malformed weights file fails the plan (a quiet fallback would hide a broken refresh).
 
-Refresh the weights (measured seconds, not guesses): pytest's `-q` progress lines carry a CI timestamp per chunk of
-tests, and the node ids in collection order say which file each chunk's tests belong to. From a successful `test`
-run on main:
+Refresh the weights (measured seconds, not guesses; ONE Python per refresh, since each Python collects and so plans its
+own shards: run it once, for the primary Python, never mix Pythons' logs). pytest's `-q` progress lines carry a CI
+timestamp per chunk of tests, and the node ids in collection order say which file each chunk's tests belong to. From a
+successful `test` run on main:
     gh run list --repo levainhq/levain --workflow test --branch main --status success --limit 3
-    gh api repos/levainhq/levain/actions/jobs/<pytest job id>/logs > shard<K>.log     (every shard job of one Python)
-    python tests/ci/shard.py weights --nodes nodes.txt --shards N --run <run id> --sha <sha> --root <checkout of that sha> \
-        --log shard0.log:0 --log shard1.log:1 ...  > tests/ci/shard_weights.json
-`nodes.txt` is `pytest --collect-only -q` at that sha, and `N` the TEST_SHARDS the run used (the log:K pairing needs
-that run's own plan, which is planned from the files on disk, so `--root` is a checkout of that sha; a run that
-already used a weights file needs its plan reproduced, so refresh from a run made before the file changed or note the
-limit). Pass several logs of one shard (other Pythons) and
-their seconds are averaged. Seconds are smeared over each chunk's tests, so the figure is a balance proxy, not a
-profile. Read the per-shard durations in CI before changing TEST_SHARDS.
+    gh run view <run id> --repo levainhq/levain --json headSha -q .headSha                     (the run's sha)
+    gh api repos/levainhq/levain/actions/jobs/<pytest job id>/logs > shard<K>.log     (EVERY shard job of one Python)
+    git show <sha>:tests/ci/shard_weights.json > plan_weights.json     (the weights that run planned with; skip if none)
+    python tests/ci/shard.py weights --nodes nodes.txt --shards N --plan-weights plan_weights.json|none --run <run id> \
+        --sha <sha> --root <checkout of <sha>> --log 0:shard0.log --log 1:shard1.log ...  > tests/ci/shard_weights.json
+`nodes.txt` is `pytest --collect-only -q` at that sha under that Python, and `N` the TEST_SHARDS the run used. The log-to-
+file pairing needs the run's own plan, which is planned from the files on disk (`--root`, a checkout of that sha) and the
+weights file the run's checkout held: `--plan-weights` names it (`none` when that sha had no shard_weights.json), and it is
+what `git show <sha>:tests/ci/shard_weights.json` prints. A missing, repeated or out-of-range shard log refuses. Seconds are
+smeared over each chunk's tests, so the figure is a balance proxy, not a profile. Read the per-shard durations in CI before
+changing TEST_SHARDS.
 """
 import json
 import os
 import re
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -117,40 +121,74 @@ def plan(text, n, weigh=None):
     return shards
 
 
-# One `pytest -q` progress line in a GitHub job log: `<timestamp>Z <outcome chars>[   [ 12%]]`. A test that prints splits
-# the line, so a bare run of outcome chars counts too.
-_PROGRESS = re.compile(r"^(\S+)Z ([.sFExX]+)(?:\s+\[\s*\d+%\])?$")
+# One `pytest -q` progress line in a GitHub job log: `<timestamp>Z <outcome chars>[   [ 12%]]`, the stamp RFC3339 with
+# 7 fractional digits (`2026-11-04T02:00:24.1379513Z ss.... [  0%]`). A test that prints splits the line, so the
+# continuation can be a bare run of outcome chars with no stamp: its tests count, and its time is the span to the next
+# stamped progress line.
+_STAMP = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z(?: |$)")
+_PROGRESS = re.compile(r"^(?:(\S+Z) )?([.sFExX]+)(?:\s+\[\s*\d+%\])?$")
 
 
 def _seconds(stamp):
-    hh, mm, ss = stamp.split("T")[1].split(":")
-    return int(hh) * 3600 + int(mm) * 60 + float(ss)
+    """Epoch seconds of a full RFC3339 UTC stamp (date included, so a run across UTC midnight stays monotonic)."""
+    m = _STAMP.match(stamp if stamp.endswith(" ") else stamp + " ")
+    if not m:
+        raise ValueError(f"not an RFC3339 UTC timestamp: {stamp!r}")
+    when = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    return when.timestamp() + (float(m.group(2)) if m.group(2) else 0.0)
 
 
-def measure(nodes_text, n, logs, run="", sha="", root=ROOT, weights=None):
-    """Per-file seconds from CI job logs. `logs` is [(log text, shard index)]. The plan must be the one the run used:
-    `root` is a checkout of the run's sha and `weights` the weights it had (None: none, the bare test count)."""
+def _chunks(text, k):
+    """[(tests, seconds)] from one shard's log: each stamped progress line closes a chunk that began at the previous
+    stamped line (the first at the nearest stamped line before it). Refuses a log it cannot time."""
+    lines, out, prev, pending = text.splitlines(), [], None, 0
+    for i, line in enumerate(lines):
+        m = _PROGRESS.match(line.rstrip())
+        if not m:
+            continue
+        pending += len(m.group(2))
+        if not m.group(1):
+            continue                                  # bare continuation: timed by the next stamped line
+        now = _seconds(m.group(1))
+        if prev is None:
+            anchor = next((lines[j] for j in range(i - 1, -1, -1) if _STAMP.match(lines[j])), None)
+            if anchor is None:
+                raise ValueError(f"shard {k}: no timestamped line before the first progress line")
+            prev = _seconds(anchor.split(" ", 1)[0])
+        if now < prev:
+            raise ValueError(f"shard {k}: progress timestamps run backwards ({m.group(1)} before the previous line)")
+        out.append((pending, now - prev))
+        prev, pending = now, 0
+    return out
+
+
+def measure(nodes_text, n, logs, plan_weights, run="", sha="", root=ROOT):
+    """Per-file seconds from the CI job logs of ONE Python. `logs` is [(log text, shard index)] and must hold every shard
+    0..n-1 exactly once. The plan must be the one the run used: `root` is a checkout of the run's sha, `plan_weights`
+    the weights that run planned with (`load_weights` form; ({}, 1.0) when it had none)."""
+    if not logs:
+        raise ValueError("no logs given")
+    ks = [k for _, k in logs]
+    bad = sorted({k for k in ks if not 0 <= k < n})
+    if bad:
+        raise ValueError(f"shard index {bad} is not in 0..{n - 1}")
+    dup = sorted({k for k in ks if ks.count(k) > 1})
+    if dup:
+        raise ValueError(f"shard {dup} given more than once (one Python per refresh)")
+    missing = sorted(set(range(n)) - set(ks))
+    if missing:
+        raise ValueError(f"shard logs missing for {missing} of 0..{n - 1}: a partial set would drop those files' weights")
     count = defaultdict(int)
     for line in nodes_text.splitlines():
         head, sep, _ = line.rstrip().partition(".py::")
         if sep and head:
             count[head + ".py"] += 1
-    weights = ({}, 1.0) if weights is None else weights
     files_all = files_from_node_ids(nodes_text)
-    shards, _ = partition(files_all, n, lambda f: weight(f, root, weights))
-    seconds = defaultdict(list)
+    shards, _ = partition(files_all, n, lambda f: weight(f, root, plan_weights))
+    seconds = {}
     for text, k in logs:
         seq = [f for f in shards[k] for _ in range(count[f])]
-        lines, chunks, prev = text.splitlines(), [], None
-        for i, line in enumerate(lines):
-            m = _PROGRESS.match(line.rstrip())
-            if not m:
-                continue
-            if prev is None:
-                prev = _seconds(lines[i - 1].split("Z ")[0])
-            now = _seconds(m.group(1))
-            chunks.append((len(m.group(2)), max(0.0, now - prev)))
-            prev = now
+        chunks = _chunks(text, k)
         done = sum(c for c, _ in chunks)
         assert done and abs(done - len(seq)) <= 0.02 * len(seq), f"shard {k}: log shows {done} tests, plan has {len(seq)}"
         got, scale, cum = defaultdict(float), len(seq) / done, 0
@@ -159,9 +197,8 @@ def measure(nodes_text, n, logs, run="", sha="", root=ROOT, weights=None):
             cum += c
             for f in seq[a:b]:
                 got[f] += dt / max(1, b - a)
-        for f, v in got.items():
-            seconds[f].append(v)
-    files = {f: round(sum(v) / len(v), 1) for f, v in sorted(seconds.items())}
+        seconds.update(got)
+    files = {f: round(v, 1) for f, v in sorted(seconds.items())}
     tests = sum(count[f] for f in files)
     return {
         "measured_from": {"run": run, "sha": sha, "shards": n, "logs": len(logs)},
@@ -186,24 +223,38 @@ def _count(value):
     return n
 
 
+_WEIGHTS_USAGE = ("shard.py weights: --nodes F --shards N --plan-weights PATH|none --log SHARD:FILE ... "
+                  "[--run ID] [--sha SHA] [--root DIR]  (see the module docstring)")
+
+
 def _weights_cli(args):
     opts, logs = {}, []
     it = iter(args)
     for flag in it:
         value = next(it, None)
-        if value is None or flag not in ("--nodes", "--shards", "--run", "--sha", "--log", "--root"):
-            print("shard.py weights: --nodes F --shards N --run ID --sha SHA --log FILE:K ...", file=sys.stderr)
+        if value is None or flag not in ("--nodes", "--shards", "--run", "--sha", "--log", "--root", "--plan-weights"):
+            print(_WEIGHTS_USAGE, file=sys.stderr)
             return 2
         if flag == "--log":
-            path, _, k = value.rpartition(":")
-            logs.append((Path(path).read_text(encoding="utf-8"), int(k)))
+            k, _, path = value.partition(":")
+            logs.append((path, k))
         else:
             opts[flag] = value
     try:
-        out = measure(Path(opts["--nodes"]).read_text(encoding="utf-8"), _count(opts["--shards"]), logs,
+        for flag in ("--nodes", "--shards", "--plan-weights"):
+            if flag not in opts:
+                raise ValueError(f"{flag} is required")
+        if opts["--plan-weights"] == "none":
+            plan_weights = ({}, 1.0)
+        else:
+            if not Path(opts["--plan-weights"]).is_file():
+                raise ValueError(f"--plan-weights {opts['--plan-weights']}: no such file")
+            plan_weights = load_weights(opts["--plan-weights"])
+        out = measure(Path(opts["--nodes"]).read_text(encoding="utf-8"), _count(opts["--shards"]),
+                      [(Path(p).read_text(encoding="utf-8"), int(k)) for p, k in logs], plan_weights,
                       opts.get("--run", ""), opts.get("--sha", ""), Path(opts.get("--root", ROOT)))
-    except (KeyError, AssertionError, ValueError) as e:
-        print(f"shard.py weights: {e!r}", file=sys.stderr)
+    except (OSError, AssertionError, ValueError, KeyError, TypeError) as e:
+        print(f"shard.py weights: {e}", file=sys.stderr)
         return 1
     print(json.dumps(out, indent=1))
     return 0

@@ -189,15 +189,82 @@ def test_weighted_partition_is_deterministic_never_empty_and_covers_once():
     assert max(first[1]) - min(first[1]) <= max(secs.values())
 
 
+NODES2 = "tests/a.py::t1\ntests/a.py::t2\ntests/b.py::t1\ntests/b.py::t2\n"
+NONE = ({}, 1.0)
+GONE = Path("/nonexistent")
+
+
+def _log(*rows):
+    return "\n".join(rows) + "\n"
+
+
+# the shape of a real job log (run 41757446489 shard 0): a 7-digit fractional stamp, then outcome chars and a percent
+REAL = _log("2026-11-04T02:00:00.1000000Z shell: /usr/bin/bash -e {0}",
+            "2026-11-04T02:00:02.1000000Z ..    [ 50%]",
+            "2026-11-04T02:00:10.1000000Z ..    [100%]")
+
+
 def test_measure_turns_progress_timestamps_into_per_file_seconds():
-    nodes = "tests/a.py::t1\ntests/a.py::t2\ntests/b.py::t1\ntests/b.py::t2\n"
-    # one shard, files a then b; the first chunk (a's two tests) took 2 s, the second (b's two) took 8 s
-    log = "2026-11-04T02:00:00.0Z collecting\n2026-11-04T02:00:02.0Z ..    [ 50%]\n2026-11-04T02:00:10.0Z ..    [100%]\n"
-    out = shard.measure(nodes, 1, [(log, 0)], run="9", sha="abc", root=Path("/nonexistent"))
+    out = shard.measure(NODES2, 1, [(REAL, 0)], NONE, run="9", sha="abc", root=GONE)
     assert out["files"] == {"tests/a.py": 2.0, "tests/b.py": 8.0}
     assert out["measured_from"]["run"] == "9" and out["per_test"] == 2.5
     with pytest.raises(AssertionError, match="log shows"):
-        shard.measure(nodes + "tests/c.py::t\n" * 50, 1, [(log, 0)], root=Path("/nonexistent"))
+        shard.measure(NODES2 + "tests/c.py::t\n" * 50, 1, [(REAL, 0)], NONE, root=GONE)
+
+
+def test_measure_rebuilds_the_plan_with_the_weights_the_run_used():
+    # a (2 tests) and b (2 tests) split over 2 shards: which file lands on shard 0 depends on the weights the run had
+    log0 = _log("2026-11-04T02:00:00.0Z start", "2026-11-04T02:00:03.0Z ..    [100%]")
+    log1 = _log("2026-11-04T02:00:00.0Z start", "2026-11-04T02:00:07.0Z ..    [100%]")
+    logs = [(log0, 0), (log1, 1)]
+    bare = shard.measure(NODES2, 2, logs, NONE, root=GONE)["files"]
+    assert bare == {"tests/a.py": 3.0, "tests/b.py": 7.0}
+    flipped = shard.measure(NODES2, 2, logs, ({"tests/a.py": 1.0, "tests/b.py": 9.0}, 1.0), root=GONE)["files"]
+    assert flipped == {"tests/a.py": 7.0, "tests/b.py": 3.0}     # b is heaviest -> shard 0 first
+
+
+def test_measure_refuses_one_python_only_a_complete_exactly_once_log_set():
+    log = _log("2026-11-04T02:00:00.0Z start", "2026-11-04T02:00:03.0Z ..    [100%]")
+    for logs, why in (([], "no logs"), ([(log, 2), (log, 0)], r"\[2\] is not in 0"), ([(log, -1), (log, 0)], r"\[-1\]"),
+                      ([(log, 0)], r"missing for \[1\]"), ([(log, 0), (log, 0), (log, 1)], r"\[0\] given more than once")):
+        with pytest.raises(ValueError, match=why):
+            shard.measure(NODES2, 2, logs, NONE, root=GONE)
+
+
+def test_a_progress_interval_across_utc_midnight_is_kept_and_a_backwards_one_refuses():
+    over = _log("2026-11-04T23:59:58.0Z start", "2026-11-04T23:59:59.0Z ..    [ 50%]", "2026-11-05T00:00:07.0Z ..    [100%]")
+    assert shard.measure(NODES2, 1, [(over, 0)], NONE, root=GONE)["files"] == {"tests/a.py": 1.0, "tests/b.py": 8.0}
+    back = _log("2026-11-05T00:00:01.0Z start", "2026-11-05T00:00:09.0Z ..    [ 50%]", "2026-11-04T23:59:59.0Z ..    [100%]")
+    with pytest.raises(ValueError, match="backwards"):
+        shard.measure(NODES2, 1, [(back, 0)], NONE, root=GONE)
+
+
+def test_a_bare_continuation_line_counts_its_tests_and_the_first_chunk_needs_a_stamped_anchor():
+    # a test printed mid-line: the continuation has no stamp; its tests join the next stamped line's chunk
+    split = _log("2026-11-04T02:00:00.0Z start", "2026-11-04T02:00:02.0Z .    [ 25%]", ".", "2026-11-04T02:00:10.0Z ..    [100%]")
+    assert shard.measure(NODES2, 1, [(split, 0)], NONE, root=GONE)["files"] == {"tests/a.py": 4.7, "tests/b.py": 5.3}
+    # the first progress line is line 0, with nothing stamped before it: refuse (was lines[-1], a wrong anchor or a crash)
+    first = _log("2026-11-04T02:00:02.0Z ..    [ 50%]", "2026-11-04T02:00:10.0Z ..    [100%]")
+    with pytest.raises(ValueError, match="no timestamped line before"):
+        shard.measure(NODES2, 1, [(first, 0)], NONE, root=GONE)
+    # an unstamped line just before the first progress line: the anchor is the nearest stamped line above it
+    gap = _log("2026-11-04T02:00:00.0Z start", "", "collected 4 items", REAL.splitlines()[1], REAL.splitlines()[2])
+    assert shard.measure(NODES2, 1, [(gap, 0)], NONE, root=GONE)["files"] == {"tests/a.py": 2.1, "tests/b.py": 8.0}
+
+
+def test_the_weights_command_end_to_end_and_its_refusals(tmp_path):
+    nodes, log0 = tmp_path / "n.txt", tmp_path / "s0.log"
+    nodes.write_text(NODES2)
+    log0.write_text(REAL)
+    base = ["weights", "--nodes", str(nodes), "--shards", "1", "--root", str(tmp_path), "--log", f"0:{log0}"]
+    ok = _run(*base, "--plan-weights", "none")
+    assert ok.returncode == 0 and json.loads(ok.stdout)["files"] == {"tests/a.py": 2.0, "tests/b.py": 8.0}
+    for args, err in ((base, "--plan-weights is required"),
+                      (base + ["--plan-weights", str(tmp_path / "absent.json")], "no such file"),
+                      (["weights", "--nodes", str(nodes), "--shards", "1", "--plan-weights", "none"], "no logs"),
+                      (base[:-2] + ["--log", "9:x", "--plan-weights", "none"], "OSError|No such file|not in 0")):
+        r = _run(*args)
+        assert r.returncode == 1 and "Traceback" not in r.stderr, (args, r.stderr)
 
 
 def test_the_weights_command_rejects_a_bad_invocation():
