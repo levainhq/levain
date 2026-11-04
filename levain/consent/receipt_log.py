@@ -215,9 +215,10 @@ def verify(queue_dir: Path | str, *,
     """Recompute the log of the queue in ``queue_dir`` and check every signed answer and late ruling stored in it,
     read in one read-only snapshot (the store is never created, migrated or written). Each one is re-verified as
     delivery verifies it: its stored record must be canonical and name the row's decision and signer, and
-    :meth:`~levain.consent.queue.ConsentQueue._refusal` (an answer) or ``_ruling_refusal`` (a ruling, for the
-    request's gap) must pass under a fresh replay of the authority log ``authority_for(request)`` returns (default:
-    the cockpit the request's agent hook verifies against, :func:`levain.consent.answering.answer_root`). Then its
+    :meth:`~levain.consent.queue.ConsentQueue._refusal` (an answer) or ``_ruled_row_refusal`` (a ruling, for the
+    request's gap; one applied from a terminal answer against the message kept for it) must pass under a fresh
+    replay of the authority log ``authority_for(request)`` returns (default: the cockpit the request's agent hook
+    verifies against, :func:`levain.consent.answering.answer_root`). Then its
     ``receipts_head`` must be the head of its size over the log as it stands. Only a current-format store holding
     its ``requests`` and ``receipts`` tables (empty or not) has a log: an empty database, a store of
     :data:`~levain.consent.queue.MIGRATES_FROM` (not migrated: verify never migrates) or one lacking either table
@@ -251,6 +252,13 @@ def verify(queue_dir: Path | str, *,
             names = [d[0] for d in cur.description]
             signed_rows = [dict(zip(names, r)) for r in cur.fetchall()]
             gaps = {r["id"]: ConsentQueue._gap_of(conn, r["id"]) for r in signed_rows if r["via"] == "ruling"}
+            # the terminal answers late rulings were carried in (TERMSIGN L4), read in the same snapshot; a store made
+            # before that table holds none
+            has_terminal = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                                        "AND name = 'terminal_rulings'").fetchone() is not None
+            # as bytes: a kept message that is not text is a mismatch of its row, never a read that cannot decode
+            terminal = ({str(rid): bytes(msg) for rid, msg in conn.execute(
+                "SELECT request_id, CAST(message AS BLOB) FROM terminal_rulings")} if has_terminal else {})
     except StoreNotCurrent as exc:
         return Report(receipts=None, last_signed=None, unsigned_tail=0, unchained=(), mismatches=(), signed=0,
                       unreadable=str(exc))
@@ -304,8 +312,8 @@ def verify(queue_dir: Path | str, *,
             # the queue's own delivery check (an unchained record as its own format), never a copy of it
             if noun == "answer":
                 return reading._refusal(request, queue_id, payload, row["signature"], authority, unchained_ok=True)
-            return reading._ruling_refusal(request, queue_id, gaps[rid], payload, row["signature"], authority,
-                                           unchained_ok=True)
+            return reading._ruled_row_refusal(request, queue_id, gaps[rid], payload, row["signature"], authority,
+                                              terminal.get(rid))
 
         why = refusal(snap)
         was_revoked = False
