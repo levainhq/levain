@@ -854,6 +854,11 @@ def authority_source(cockpit_db: Path | str, *, anchor: Path | None, cache: Repl
     return AuthoritySource(cockpit_db, anchor=anchor, cache=cache, ssh_keygen=ssh_keygen)
 
 
+def _no_json_constant(name: str) -> Any:
+    """``json.loads``' ``parse_constant``: NaN and the infinities are no part of a record (TERMSIGN L4 r1)."""
+    raise ValueError(f"{name} is not a JSON value a record holds")
+
+
 def _no_live_check(public_key: str) -> tuple[bool | None, str]:
     """The re-reading of a stored terminal ruling asks the authority log, not the Secure Enclave, who the key is:
     the live check is made once, when the ruling is applied."""
@@ -2120,11 +2125,23 @@ class ConsentQueue:
         """The terminal answer a ruled request's ruling was carried in (:meth:`answer_terminal_ruling`), or ``None``
         for a ruling signed on its own."""
         with self._read() as conn:
-            row = conn.execute("SELECT message FROM terminal_rulings WHERE request_id = ?", (request_id,)).fetchone()
-        return None if row is None else row[0].encode("utf-8")
+            row = conn.execute("SELECT CAST(message AS BLOB) FROM terminal_rulings WHERE request_id = ?",
+                               (request_id,)).fetchone()
+        return None if row is None else bytes(row[0])   # as stored: bytes that are not text fail the row's verify
 
-    @staticmethod
-    def _terminal_ruling_refusal(request: ExternalGateRequest, queue_id: str, gap: tuple[int, str],
+    def _ruled_row_refusal(self, request: ExternalGateRequest, queue_id: str, gap: tuple[int, str], payload: Any,
+                           signature: Any, authority: AuthoritySnapshot, terminal: bytes | None) -> str | None:
+        """Why a STORED ruling (a ruled row's record and signature) does not verify; ``None`` when it does. One
+        judge for every reader of a ruled row (the take / claim / decision readers, ``levain consent receipts
+        verify``): a ruling applied from a terminal answer (``terminal``, the kept message) is judged as
+        :meth:`answer_terminal_ruling` judged it, bar the live Secure Enclave check made once at apply; any other
+        as :meth:`_ruling_refusal`, an unchained record included."""
+        if terminal is not None:
+            return self._terminal_ruling_refusal(request, queue_id, gap, payload, terminal, signature, authority,
+                                                 ctk=_no_live_check)
+        return self._ruling_refusal(request, queue_id, gap, payload, signature, authority, unchained_ok=True)
+
+    def _terminal_ruling_refusal(self, request: ExternalGateRequest, queue_id: str, gap: tuple[int, str],
                                  payload: Any, message: bytes, signature: Any, authority: AuthoritySnapshot, *,
                                  ctk: Callable[[str], tuple[bool | None, str]] | None = None) -> str | None:
         """Why ``payload`` is not a ruling ALLOW on ``request`` carried in the terminal answer ``message`` signed
@@ -2133,7 +2150,8 @@ class ConsentQueue:
         namespace by a ``laptop-presence`` key the authority log holds active, which is the ruling's own
         ``signer_fp``. The record's own bindings (queue, request, digest, gap, time, shape) are those of any
         ruling (:meth:`_ruling_record_refusal`); only an allow is carried. ``ctk`` is the live Secure Enclave
-        check of :func:`levain.consent.terminal_sign.verify` (default: the real one)."""
+        check of :func:`levain.consent.terminal_sign.verify` (default: the real one); the verifier binary is the
+        queue's own ``ssh_keygen``, as for every other signature it checks."""
         from levain.authority import LAPTOP, VerifierUnavailable
         from levain.authority_sig import _signers_line
         from levain.consent import terminal_sign as ts
@@ -2161,9 +2179,10 @@ class ConsentQueue:
         if problem is not None:
             return problem
         principal = "authority-signer"
+        keygen: dict[str, Any] = {} if self._ssh_keygen is None else {"ssh_keygen": self._ssh_keygen}
         try:
             got = ts.verify(message, signature, _signers_line(principal, ts.NAMESPACE, key.public_key), principal,
-                            ctk=ctk)
+                            ctk=ctk, **keygen)
         except (VerifierUnavailable, ts.KeyError_) as exc:
             return f"the terminal answer could not be verified: {exc}"
         if not got.ok:
@@ -2206,7 +2225,7 @@ class ConsentQueue:
                 or entries[0].ruling is None:
             raise AnswerRefused("the terminal answer holds no ruling for this question as it stands")
         try:
-            payload = json.loads(entries[0].ruling)
+            payload = json.loads(entries[0].ruling, parse_constant=_no_json_constant)
         except (ValueError, RecursionError):
             raise AnswerRefused("the embedded ruling is not a record") from None
         request, gap, queue_id = self._undecided(request_id)
@@ -2215,7 +2234,11 @@ class ConsentQueue:
             raise AnswerRefused("the authority log cannot be replayed now: no ruling is authority")
         if not ts.fresh(parsed, _now_utc(self._clock)):
             raise AnswerRefused("the terminal answer was not signed within ten minutes before now")
-        if not isinstance(payload, dict) or ruling_message(payload).decode("utf-8") != entries[0].ruling:
+        try:
+            canonical = isinstance(payload, dict) and ruling_message(payload).decode("utf-8") == entries[0].ruling
+        except (ConsentError, UnicodeError, ValueError, TypeError, RecursionError):
+            canonical = False                    # an unpaired surrogate, a value no record encodes: not a record
+        if not canonical:
             raise AnswerRefused("the embedded ruling is not the canonical encoding of a ruling record")
         why = self._terminal_ruling_refusal(request, queue_id, gap, payload, message, signature, authority, ctk=ctk)
         if why is not None:
@@ -2259,14 +2282,8 @@ class ConsentQueue:
         if gap is None or authority is None or not isinstance(named, str) or _STATE_OF.get(named) != row["state"] \
                 or payload.get("signer_fp") != row["signer_fp"] or not isinstance(row["decided_at"], str):
             return None
-        terminal = self._terminal_message(request.id)
-        if terminal is not None:
-            # applied from a terminal answer (TERMSIGN L4): its signature covers that message, not the record
-            if self._terminal_ruling_refusal(request, queue_id, gap, payload, terminal, row["signature"], authority,
-                                             ctk=_no_live_check) is not None:
-                return None
-        elif self._ruling_refusal(request, queue_id, gap, payload, row["signature"], authority,
-                                  unchained_ok=True) is not None:
+        if self._ruled_row_refusal(request, queue_id, gap, payload, row["signature"], authority,
+                                   self._terminal_message(request.id)) is not None:
             return None
         try:
             if parse_stamp(payload["signed_at"]) > parse_stamp(row["decided_at"]) + RULING_SKEW:

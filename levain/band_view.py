@@ -801,12 +801,16 @@ def _no_key_noted(store: QuestionStore, viewer: str) -> bool:
 
 
 def _sign_note(by_state: Mapping[str, Sequence[str]], signing: "Signing | None", quiet_no_key: bool,
-               ruled: Sequence[str] = ()) -> str | None:
+               ruled: Sequence[str] = (), ruled_unrecorded: Sequence[str] = ()) -> str | None:
     """The echo's sentence on the sign state, in plain words (``signed (Touch ID, laptop): 1a``), or ``None``.
-    ``ruled``: the labels whose signed ruling ALLOW the queue applied (TERMSIGN L4)."""
+    ``ruled``: the labels whose signed ruling ALLOW the queue applied and whose answer was recorded (TERMSIGN L4);
+    ``ruled_unrecorded``: those whose ruling was applied but whose answer the store did not record."""
     parts: list[str] = []
     if ruled:
         parts.append("ruling ALLOW signed in the same touch and applied: " + ", ".join(ruled))
+    if ruled_unrecorded:
+        parts.append("ruling ALLOW signed in the same touch and applied, the answer was not recorded: "
+                     + ", ".join(ruled_unrecorded))
     if by_state.get("signed"):
         parts.append("signed (Touch ID, laptop): " + ", ".join(by_state["signed"]))
     if by_state.get("unsigned") and signing is not None and not quiet_no_key:
@@ -1046,8 +1050,11 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
                 ids.append(entry["ref"])
                 if isinstance(entry.get("sign"), Signing):
                     by_state.setdefault(entry["sign"].state, []).append(act.label)
+    # the ruling's sentence comes from what the queue applied (Signing.ruled), never from what was recorded: a ruling
+    # applied whose answer the store then refused (its row moved, the lock busy) is still a ruling applied
     sign_note = _sign_note(by_state, next((e["sign"] for _, e in todo if isinstance(e.get("sign"), Signing)), None),
-                           quiet_no_key, [lb for lb in ruled_labels if lb in recorded])
+                           quiet_no_key, [lb for lb in ruled_labels if lb in recorded],
+                           [lb for lb in ruled_labels if lb not in recorded])
     try:
         echo = format_echo(recorded, refused, via, plan.hint, sheets, sign_note)
     except Exception:                                         # what was recorded is said, whatever the formatting
@@ -1665,7 +1672,8 @@ def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse
                 return None
             sid = _store_id_of(store)
             if view_id is None or sid is None:
-                return Signing("unsigned", "signer-error", "no view or store id to bind the message to", versions=info_ids)
+                return Signing("unsigned", "signer-error", "no view or store id to bind the message to", versions=info_ids,
+                               ruling_refusals={qid: "the answer was not signed" for qid in carried})
             rest = (plan.rest or "").strip()
             at = prompt.rfind(rest) if rest else -1
             block = (prompt[:at] if at >= 0 else prompt).strip()

@@ -286,3 +286,90 @@ def test_a_signer_that_is_not_a_fingerprint_is_refused(queue, keys):
     request, _ = undecided(queue)
     message, sig = carried(queue, request.id, keys["laptop"], payload_edit={"signer_fp": 5})
     assert refused(queue, request.id, message, sig) == "the signer is not an enrolled key"
+
+
+# --- L4 L3 r1 -----------------------------------------------------------------------------------------
+
+def _verify(queue, source):
+    from levain.consent.receipt_log import verify
+    return verify(queue.directory, authority_for=lambda request: source)
+
+
+def test_receipts_verify_reads_a_terminal_ruling_as_the_take_reads_it(queue, keys, authority):
+    """T1 (complement + codex): verify sent a terminal-applied ruling through the plain ruling check (another
+    namespace, over the record alone) and reported every valid one as a signature mismatch."""
+    request, _ = undecided(queue)
+    apply(queue, request.id, *carried(queue, request.id, keys["laptop"]))
+    report = _verify(queue, authority)
+    assert report.mismatches == () and report.ok
+    assert report.signed == 1 and report.last_signed.request_id == request.id
+
+
+def _raw(queue, *statements):
+    conn = sqlite3.connect(queue.path)
+    try:
+        for stmt, args in statements:
+            conn.execute(stmt, args)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("kept", ["other", "not text", "garbage"])
+def test_receipts_verify_reports_a_swapped_or_corrupt_kept_message(queue, keys, authority, kept):
+    request, _ = undecided(queue)
+    message, sig = carried(queue, request.id, keys["laptop"])
+    other, _ = carried(queue, request.id, keys["laptop"], at=NOW - timedelta(seconds=9))
+    apply(queue, request.id, message, sig)
+    value = {"other": other.decode("utf-8"), "not text": b"\xff\xfe" + message, "garbage": "x"}[kept]
+    _raw(queue, ("DROP TRIGGER terminal_rulings_frozen", ()), ("UPDATE terminal_rulings SET message = ?", (value,)))
+    report = _verify(queue, authority)
+    assert [rid for rid, _why in report.mismatches] == [request.id] and not report.ok
+
+
+def test_receipts_verify_reports_a_terminal_ruling_whose_signer_was_revoked_since(tmp_path, keys, clock):
+    from tests.test_consent_queue import Log
+    from tests._h4 import h4_home
+    from levain.consent import ConsentQueue
+
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", keys)
+    log.enrol("laptop", "laptop-presence")
+    log.enrol("presence", "laptop-presence")               # a second terminal key, revocable without the genesis
+    q = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock, home=h4_home())
+    request, _ = undecided(q)
+    apply(q, request.id, *carried(q, request.id, keys["presence"]))
+    log.revoke("presence")
+    report = _verify(q, log.source)
+    assert report.mismatches == () and [r.request_id for r in report.revoked] == [request.id]
+    assert report.revoked[0].head_checked
+
+
+def test_the_queues_own_verifier_checks_a_terminal_ruling(queue, keys, tmp_path, authority, clock):
+    """T4 (codex): a queue built with its own ssh-keygen verified answers with it but terminal rulings with the
+    default; a verifier levain may not trust (here a stub file in a scratch directory) now refuses both the apply
+    and every re-read."""
+    from tests._h4 import h4_home
+    from levain.consent import ConsentQueue
+
+    stub = tmp_path / "stub-ssh-keygen"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o700)
+    own = ConsentQueue(queue.directory, authority=authority, clock=clock, home=h4_home(), ssh_keygen=stub)
+    request, _ = undecided(queue)
+    message, sig = carried(queue, request.id, keys["laptop"])
+    assert "could not be verified" in refused(own, request.id, message, sig)
+    apply(queue, request.id, message, sig)                 # the default verifier applies it
+    assert own.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}, cwd="/work/proj") is None
+    taken = queue.take_ruled_allow("claude_code", "sess-1", "Edit", {"command": "touch /tmp/x"}, cwd="/work/proj")
+    assert taken is not None
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity", '"\\ud800"'])
+def test_a_non_standard_or_unencodable_embedded_ruling_is_refused_not_raised(queue, keys, bad):
+    """T6 (codex): NaN / Infinity parse under json.loads and an unpaired surrogate decodes, then the record's
+    canonical encoding raised ConsentError / UnicodeError past the caller instead of a refusal."""
+    request, _ = undecided(queue)
+    message, sig = carried(queue, request.id, keys["laptop"], ruling_edit=lambda t: t.replace('"allow"', bad))
+    assert "not a record" in refused(queue, request.id, message, sig) or \
+        "not the canonical encoding" in refused(queue, request.id, message, sig)
