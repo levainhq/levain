@@ -289,6 +289,7 @@ def test_an_offline_navigation_gets_the_cached_shell_or_the_offline_page_never_a
     # a navigation to anything but the shell page never shows a cached dashboard in its place
     other = _fetch(url="https://box.example/sign/9?x=1", net="down", shell=True)
     assert "Can't reach your cockpit" in other["body"], other
+    assert _fetch(url="https://box.example/webpush", net="down")["responded"] is False
     live = _fetch(url="https://box.example/", net="ok", shell=True)
     assert live["body"] == "<html>live</html>", live                                # online: the network wins
 
@@ -336,3 +337,10 @@ def test_no_notification_in_the_worker_carries_an_actions_key() -> None:
             if depth == 0:
                 break
         assert not re.search(r"\bactions\b", src[at:j]), src[at:j]
+
+
+@needs_node
+def test_activation_carries_the_last_good_shell_forward_when_the_new_install_cached_none() -> None:
+    got = _run("carry")
+    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1104-pwasw-1"], got   # the old shell cache is gone
+    assert got["shells"][0][1] == [["/", "<html>old shell</html>"]], got          # its page was carried first

@@ -235,8 +235,21 @@ function dropOldDatabase() {
   });
 }
 
+// A new worker whose install could not fetch '/' would otherwise delete the last good shell and leave nothing for an
+// outage: before the old caches go, the newest older shell's copy is carried into the current cache when that is empty.
+async function carryShellForward() {
+  if (typeof caches === 'undefined') return;
+  const names = await caches.keys();
+  if (names.includes(SHELL_CACHE) && await (await caches.open(SHELL_CACHE)).match(SHELL_KEY)) return;
+  for (const n of names.filter((x) => x.startsWith('levain-shell-v') && x !== SHELL_CACHE).sort().reverse()) {
+    const hit = await (await caches.open(n)).match(SHELL_KEY);
+    if (hit) { await (await caches.open(SHELL_CACHE)).put(SHELL_KEY, hit); return; }
+  }
+}
+
 async function dropOldCaches() {
   if (typeof caches === 'undefined') return;
+  try { await carryShellForward(); } catch (_) { /* the shell is a convenience; activation never fails on it */ }
   const names = await caches.keys();
   await Promise.all(names.filter((n) => n.startsWith('levain-') && !CACHES_KEEP.includes(n)).map((n) => caches.delete(n)));
 }
@@ -257,13 +270,14 @@ function shellCacheable(r) {
 self.addEventListener('install', (e) => e.waitUntil(precacheShell()));
 self.addEventListener('message', (e) => {
   const d = e.data;
-  if (d && typeof d === 'object' && d.type === 'levain-skip-waiting') self.skipWaiting();
+  if (d && typeof d === 'object' && d.type === 'levain-skip-waiting') e.waitUntil(self.skipWaiting());
 });
 
-// Navigations only: network first, the cached shell (or the offline page) when the network fails. Never cached and never
-// intercepted: anything but a same-origin GET navigation, /webpush/ and /cockpit/ (data), and any URL with a query. Only
-// the bare '/' (no query: a credential would ride there) is ever written; a fragment never reaches a worker.
-const NO_INTERCEPT = ['/webpush/', '/cockpit/'];
+// Navigations only: network first, the cached shell (or the offline page) when the network fails. Never intercepted:
+// anything but a same-origin GET navigation, and /webpush/ and /cockpit/ (data). Never cached: any response but the bare
+// '/' with no query (a credential would ride in a query; the offline page never echoes the URL); a fragment never reaches
+// a worker. A navigation to '/' with a query is still answered offline from the cached shell (reading it, not writing it).
+const NO_INTERCEPT = ['/webpush', '/cockpit'];
 const OFFLINE_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
   '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Levain</title>' +
   '<style>html,body{margin:0;height:100%;background:#14110f;color:#f1ebe3;font:17px/1.4 -apple-system,system-ui,sans-serif}' +
@@ -274,11 +288,13 @@ const OFFLINE_HTML = '<!doctype html><html lang="en"><head><meta charset="utf-8"
 function offlineResponse() {
   return new Response(OFFLINE_HTML, { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } });
 }
-async function navigateNetworkFirst(req, bare) {
+async function navigateNetworkFirst(e, req, bare) {
   try {
     const r = await fetch(req);
     if (bare && shellCacheable(r)) {
-      try { await (await caches.open(SHELL_CACHE)).put(SHELL_KEY, r.clone()); } catch (_) { /* a full cache never costs the page */ }
+      // off the critical path: the page never waits on Cache Storage (a slow or full cache costs the copy, not the page)
+      const copy = r.clone();
+      e.waitUntil((async () => { try { await (await caches.open(SHELL_CACHE)).put(SHELL_KEY, copy); } catch (_) { /* best effort */ } })());
     }
     return r;
   } catch (err) {
@@ -297,8 +313,8 @@ self.addEventListener('fetch', (e) => {
   let u;
   try { u = new URL(req.url); } catch (_) { return; }
   if (u.origin !== self.location.origin) return;
-  if (NO_INTERCEPT.some((p) => u.pathname.startsWith(p))) return;
-  e.respondWith(navigateNetworkFirst(req, u.pathname === SHELL_KEY && !u.search));
+  if (NO_INTERCEPT.some((p) => u.pathname === p || u.pathname.startsWith(p + '/'))) return;
+  e.respondWith(navigateNetworkFirst(e, req, u.pathname === SHELL_KEY && !u.search));
 });
 // the pre-fix4 pending target: ONE singleton key in the same cache; no claim path reads it any more, so it is deleted
 async function dropLegacyPending() {

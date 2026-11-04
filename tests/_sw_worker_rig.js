@@ -266,6 +266,12 @@ function fire(type, ev) {
     };
     await fire('install', {});
     log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v')).map(([n, m]) => [n, [...m.entries()]]);
+  } else if (scenario === 'carry') {
+    // an older shell exists, the current one is empty (its install fetch failed): activation carries it forward
+    cacheStores.set('levain-shell-vOLD', new Map([['/', '<html>old shell</html>']])); cacheNames.add('levain-shell-vOLD');
+    await fire('activate', {});
+    log.caches = [...cacheNames].sort();
+    log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v') && cacheNames.has(n)).map(([n, m]) => [n, [...m.entries()]]);
   } else if (scenario === 'message') {
     await fire('message', { data: JSON.parse(mode) });
   } else if (scenario === 'fetch') {
