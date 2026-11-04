@@ -81,7 +81,7 @@ def test_an_install_with_no_default_zone_refuses_and_names_the_verb(tmp_path):
 def test_a_changed_spec_needs_revise_and_never_overwrites(astore, monkeypatch):
     da.register_dream(astore)
     real = da.dream_spec
-    monkeypatch.setattr(da, "dream_spec", lambda h: {**real(h), "stop_at": 3000})
+    monkeypatch.setattr(da, "dream_spec", lambda h, binding=None: {**real(h, binding), "stop_at": 3000})
     with pytest.raises(da.EnableRefused, match="rule 4"):
         da.register_dream(astore)
     assert da.register_dream(astore, revise=True).version == 2
