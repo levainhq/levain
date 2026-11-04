@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from levain.chat_egress.records import EGRESS_SCHEMA, EgressRecords
+from levain.coordinator import room
 from levain.coordinator import seam_classes as sc
 from levain.coordinator.chat import CHAT_SCHEMA, ChatStore
 from levain.coordinator.envelopes import ENVELOPE_SCHEMA, EnvelopeStore
@@ -38,6 +39,12 @@ def maximal(tmp_path_factory: pytest.TempPathFactory) -> Path:
     store._connect().close()
     ChatStore(store)._connect().close()
     EgressRecords(store)._connect().close()
+    conn = sqlite3.connect(store.path)           # the room owns its schema (its own ensure) in this same file: a census that never ran it could not see its tables
+    try:
+        room.ensure(conn)
+        conn.commit()
+    finally:
+        conn.close()
     return store.path
 
 
@@ -66,7 +73,7 @@ def test_the_classes_do_not_overlap() -> None:
 def test_every_table_of_the_maximal_database_is_in_exactly_one_class(maximal: Path) -> None:
     tables = _tables(maximal)
     assert "sqlite_sequence" in tables and sc.EXEMPT["sqlite_sequence"] == "SQLite's own"
-    assert len(tables) == 69 and len(set(tables)) == 69           # the census's 54, SQLite's, S0, S1, S2b's five, P3, S5, CH-H2's three, H1-1's two (envelope_drafts, envelope_draft_withdrawals: each row takes a gseq, so COUNTED)
+    assert len(tables) == 73 and len(set(tables)) == 73           # the census's 54, SQLite's, S0, S1, S2b's five, P3, S5, CH-H2's three, the room's four, H1-1's two (envelope_drafts, envelope_draft_withdrawals: each row takes a gseq, so COUNTED)
     # `_r4` is the transient name of the review events' rebuild: gone by commit, so a finished store holds none
     assert not [t for t in tables if t.endswith("_r4")]
     known = sc.COUNTED | sc.INFRASTRUCTURE | set(sc.EXEMPT)

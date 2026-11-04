@@ -30,6 +30,9 @@ COUNTED: frozenset[str] = frozenset({
     "review_items", "review_events", "first_reads", "team_drafts", "team_draft_events",
     "chat_messages", "chat_anomalies", "chat_approvals", "chat_approval_events",
     "arrival_signals",
+    # the room (RM-A): each of these rows takes a gseq from next_gseq in its own transaction (room.py), so by the rule that
+    # classified the drafts' tables it is counted: an opened or rotated room, a proposed drop, a drop note
+    "room_events", "drop_proposals", "drop_notes",
 })
 
 #: bookkeeping the brief never reports (``lease_events`` kinds claim, beat, release and ``launch_events`` kinds pending,
@@ -41,6 +44,9 @@ INFRASTRUCTURE: frozenset[str] = frozenset({
     "turn_lease_events", "chat_egress_events",
     # missions (CH-H2): append-only records with no gseq; a mission closes through its threads' own counted events
     "missions", "mission_revisions", "mission_acceptances",
+    # the room (RM-A): a proposal's settling record, no gseq; a committed one names the drop it became, and that drop is
+    # counted in its own table
+    "proposal_events",
 })
 
 _DISPATCH = ("ordered by dispatch's own transitions; the open brief does not report dispatch jobs (the board and the "

@@ -135,6 +135,20 @@ def test_a_store_behind_head_counts_the_rows_since_the_cut(world):
     assert b.cursor_gseq > h.covers_gseq
 
 
+def test_an_opened_room_is_a_counted_row_in_since(world):
+    """Diogenes 11-04 (MEDIUM): the room's tables were in no seam class, so a room opened after the cut took a gseq the
+    brief then counted as nothing. The room's rows are counted through the same Since as every other."""
+    from levain.coordinator import room
+    from levain.coordinator.store import Part
+    h = _close(world)
+    drop = world.accept_drop("the room's thread", surface="cli")[0]
+    tid = world.split(drop.drop_id, [Part("note", "the room")])[0].thread_id
+    with world._write() as (conn, now):
+        room.open_room_thread(conn, tid, by="operator")
+    b = _brief(world)
+    assert "room_events: 1" in b.text and b.cursor_gseq > h.covers_gseq
+
+
 def test_a_crash_store_has_rows_and_no_handoff(world):
     b = _brief(world)
     assert b.handoff_id is None
