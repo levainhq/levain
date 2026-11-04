@@ -320,7 +320,7 @@ def test_a_start_that_raises_after_binding_ends_the_bound_session(tmp_path):
     with pytest.raises(OSError):
         ln.spawn(launch())
     assert runtime.ended == ["sess-9"]
-    assert L.SessionIndex(tmp_path / "idx").get(KEY)["state"] == "undone"
+    assert L.SessionIndex(tmp_path / "idx").get(KEY)["state"] == "ended"      # r3-2: a bound session may have spent
 
 
 def test_an_unconfirmed_cancel_leaves_the_record_minted(tmp_path):
@@ -344,7 +344,7 @@ def test_an_index_failure_after_the_start_ends_the_session_then_raises(tmp_path,
     with pytest.raises(OSError, match="disk full"):
         ln.spawn(launch())
     assert runtime.ended == ["sess-1"] and runtime.children[0].aborted == 1
-    assert real_put.__self__.get(KEY)["state"] == "undone"
+    assert real_put.__self__.get(KEY)["state"] == "ended"                     # r3-2: with its session, the sources
 
 
 def test_an_index_failure_with_an_unprovable_end_returns_a_held_child_not_a_raise(tmp_path, monkeypatch):
@@ -571,13 +571,14 @@ def test_l1_1_any_failed_cancel_consults_status_and_holds_a_live_session(tmp_pat
     assert "RUN-TICKET-STATUS" in control.ops() and runtime.ended == ["sess-9"]
 
 
-def test_l1_1_a_failed_cancel_with_a_proven_end_of_the_bound_session_raises_and_reads_zero(tmp_path):
+def test_l1_1_a_failed_cancel_with_a_proven_end_of_the_bound_session_raises_and_reads_the_sources(tmp_path):
     ctl_ = FakeControl(**{"RUN-TICKET-CANCEL": Refused("control-down"),
                           "RUN-TICKET-STATUS": BOUND9["RUN-TICKET-STATUS"]})
     ln, _, runtime = build(tmp_path, control=ctl_, runtime=FakeRuntime(fail=OSError("x")))
     with pytest.raises(OSError):
         ln.spawn(launch())
-    assert runtime.ended == ["sess-9"] and ln.index.get(KEY)["state"] == "undone" and ln.usage(KEY) == zero()
+    assert runtime.ended == ["sess-9"] and ln.index.get(KEY)["state"] == "ended"      # r3-2: never a quiet zero
+    assert (ln.usage(KEY).actions, ln.usage(KEY).tunnel_bytes) == (7, 1000)
 
 
 def test_l1_1_no_session_known_raises_honestly_and_the_record_stays_minted(tmp_path):
@@ -728,7 +729,7 @@ def test_f1_a_clean_exit_with_an_unproven_end_is_gate_unproven(tmp_path, end):
     child = ln.spawn(launch())
     assert ended(child) == ctl.GATE_UNPROVEN and child.process.poll() == ctl.GATE_UNPROVEN
     assert child.process.returncode == ctl.GATE_UNPROVEN
-    assert ln.index.get(KEY)["state"] == "started" and runtime.ended == ["sess-1", "sess-1"]
+    assert ln.index.get(KEY)["state"] == "started" and runtime.ended == ["sess-1"]   # r3-5: that poll made none
     runtime.end_ok = True                                        # one more attempt, from the next wait
     assert ended(child) == 0 and ln.index.get(KEY)["state"] == "ended"
 
@@ -827,3 +828,317 @@ def test_l1_1_an_unbound_ticket_whose_cancel_failed_stays_minted(tmp_path):
     with pytest.raises(OSError):
         ln.spawn(launch())
     assert ln.index.get(KEY)["state"] == "minted" and ln.usage(KEY).actions is None
+
+
+# --- p71s4 fix round 2 (FINDINGS_p71s4_r3.md) ---------------------------------------------------------------------------
+
+def caps(u):
+    return (u.actions, u.tunnel_bytes, u.seconds) == (None, None, None)
+
+
+# r3-1 HIGH: an END answer is proof only when it is exactly True. The helper's raw teardown answer is a dict, and a dict
+# is truthy: a runtime adapter that forwards it must not make an unproven END read as proven, at any of the sites.
+
+NOT_TRUE = [{"state": "HELD"}, {"state": "RETAINED"}, {"state": "RETAINED", "released": False}, {"ok": True},
+            1, "yes", None, object()]
+
+
+@pytest.mark.parametrize("answer", NOT_TRUE)
+def test_r3_1_a_normal_exit_whose_end_answers_anything_but_true_is_unproven(tmp_path, answer):
+    ln, _, runtime = build(tmp_path, runtime=FakeRuntime(end=answer))
+    child = ln.spawn(launch())
+    assert ended(child) == ctl.GATE_UNPROVEN and child.process.returncode == ctl.GATE_UNPROVEN
+    assert child.abort() == ctl.GATE_UNPROVEN
+    assert ln.index.get(KEY)["state"] == "started" and caps(ln.usage(KEY))
+
+
+@pytest.mark.parametrize("answer", NOT_TRUE)
+def test_r3_1_stop_whose_end_answers_anything_but_true_is_not_terminated(tmp_path, answer):
+    ln, _, runtime = build(tmp_path, runtime=FakeRuntime(end=answer))
+    ln.spawn(launch())
+    assert ln.stop(KEY).terminated is False and ln.index.get(KEY)["state"] == "started"
+
+
+@pytest.mark.parametrize("answer", NOT_TRUE)
+def test_r3_1_a_failed_start_with_a_bound_session_and_a_non_true_end_is_held(tmp_path, answer):
+    ln, _, runtime = build(tmp_path, control=FakeControl(**BOUND9), runtime=FakeRuntime(end=answer, fail=OSError("x")))
+    child = ln.spawn(launch())
+    assert isinstance(child, L.HeldChild) and child.abort() == ctl.GATE_UNPROVEN
+    assert child.process.wait() == ctl.GATE_UNPROVEN and ln.index.get(KEY)["state"] == "started"
+
+
+@pytest.mark.parametrize("answer", NOT_TRUE)
+def test_r3_1_an_index_failure_with_a_non_true_end_holds_the_session(tmp_path, monkeypatch, answer):
+    ln, _, _ = build(tmp_path, runtime=FakeRuntime(end=answer))
+    real_put = ln.index.put
+    monkeypatch.setattr(ln.index, "put", lambda k, s, **kw: (_ for _ in ()).throw(OSError("x")) if s == "started"
+                        else real_put(k, s, **kw))
+    child = ln.spawn(launch())
+    assert isinstance(child, L.HeldChild) and child.abort() == ctl.GATE_UNPROVEN
+
+
+def test_r3_1_every_end_call_in_the_module_goes_through_the_one_reader():
+    import pathlib
+    text = pathlib.Path(L.__file__).read_text()
+    assert text.count("runtime.end(") == 1 and "bool(self._runtime.end" not in text and "bool(self.runtime.end" not in text
+    assert "answer is True" in text
+
+
+class TeardownRuntime(FakeRuntime):
+    """A runtime adapter built the way the production one must be: its ``end`` is :func:`end_by_teardown` over the
+    helper's ``teardown`` call, here a fake that answers the helper's shapes."""
+
+    def __init__(self, answer, **kw):
+        super().__init__(**kw)
+        self.answer = answer
+
+    def _teardown(self, session):
+        self.ended.append(session)
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+    def end(self, session):
+        return L.end_by_teardown(self._teardown, session)
+
+
+@pytest.mark.parametrize("answer,proves", [
+    ({"state": "RETAINED"}, True), ({"state": "RETAINED", "released": False}, True),
+    ({"ok": True, "state": "RETAINED"}, True),
+    ({"state": "HELD"}, False), ({"state": "RETAINED", "released": "no"}, False), ({"state": "SCRUBBED"}, False),
+    ({"ok": False, "state": "RETAINED"}, False), ({"ok": 1, "state": "RETAINED"}, False), ({}, False), (None, False),
+    ("RETAINED", False), (True, False), (Refused("no-session", "sess-1"), False), (OSError("socket"), False)])
+def test_r3_1_through_the_adapter_only_a_retained_teardown_proves_the_end(tmp_path, answer, proves):
+    ln, _, runtime = build(tmp_path, runtime=TeardownRuntime(answer))
+    child = ln.spawn(launch())
+    assert ended(child) == (0 if proves else ctl.GATE_UNPROVEN) and runtime.ended == ["sess-1"]
+    assert ln.index.get(KEY)["state"] == ("ended" if proves else "started")
+    assert L.end_by_teardown(runtime._teardown, "sess-1") is proves
+
+
+# r3-2 MED: a failed start whose BOUND session END proved gone may still have spent: it records `ended` (the sources),
+# never `undone` (zero). `undone` is kept for a ticket that never bound.
+
+def test_r3_2_a_failed_start_with_a_proven_end_of_a_bound_session_reads_the_sources(tmp_path):
+    src = FakeSources(calls=3, bytes_=300, seconds=9)
+    ctl_ = FakeControl(**{"RUN-TICKET-CANCEL": Refused("ticket-bound"), "RUN-TICKET-STATUS": BOUND9["RUN-TICKET-STATUS"]})
+    ln, _, runtime = build(tmp_path, control=ctl_, runtime=FakeRuntime(fail=OSError("x")), sources=src)
+    with pytest.raises(OSError):
+        ln.spawn(launch())
+    rec = ln.index.get(KEY)
+    assert rec["state"] == "ended" and rec["run_id"] == RUN and rec["session"] == "sess-9"
+    u = ln.usage(KEY)
+    assert (u.actions, u.tunnel_bytes, u.seconds) == (3, 300, 9) and u != zero()
+    assert ("calls", RUN) in src.asked and ("bytes", "sess-9") in src.asked
+    assert ln.stop(KEY).terminated is True and runtime.ended == ["sess-9"]     # answered from the record
+
+
+def test_r3_2_through_run_session_a_bound_failed_start_settles_on_the_sources_not_zero(rig, tmp_path):
+    oid = _occurrence(rig, billing="subscription")
+    ctl_ = FakeControl(**{"RUN-TICKET-CANCEL": Refused("ticket-bound"), "RUN-TICKET-STATUS": BOUND9["RUN-TICKET-STATUS"]})
+    ln, _, _ = build(tmp_path, control=ctl_, runtime=FakeRuntime(fail=OSError("x")),
+                     sources=FakeSources(calls=5, bytes_=500, seconds=50))
+    _, report = _run(rig, oid, ln, exposure=EXP)
+    assert report.state == "failed" and rig.row(oid)["reason"] == "session_spawn_failed"
+    assert _reservation(rig, oid)[:5] == ("settled", "actual", 5, 500, 50)
+
+
+def test_r3_2_an_index_failure_after_a_start_with_a_proven_end_records_ended_with_its_session(tmp_path, monkeypatch):
+    ln, _, runtime = build(tmp_path, sources=FakeSources(calls=2, bytes_=20, seconds=4))
+    real_put = ln.index.put
+    monkeypatch.setattr(ln.index, "put", lambda k, s, **kw: (_ for _ in ()).throw(OSError("full")) if s == "started"
+                        else real_put(k, s, **kw))
+    with pytest.raises(OSError):
+        ln.spawn(launch())
+    rec = ln.index.get(KEY)
+    assert rec["state"] == "ended" and rec["session"] == "sess-1" and rec["run_id"] == RUN
+    assert (ln.usage(KEY).actions, ln.usage(KEY).tunnel_bytes) == (2, 20)
+
+
+# r3-3 MED: an index record is written whole or not at all; a record that does not parse reads unreadable
+
+def test_r3_3_a_short_os_write_still_writes_the_whole_record(tmp_path, monkeypatch):
+    import os
+    idx = L.SessionIndex(tmp_path / "idx")
+    real = os.write
+    with monkeypatch.context() as m:
+        m.setattr(os, "write", lambda fd, data: real(fd, bytes(data[:7])) if fd > 2 else real(fd, data))
+        idx.put(KEY, "started", run_id=RUN, session="sess-1", pad="x" * 500)
+        assert idx.create("s-other", "pending", pad="y" * 500) is True
+    assert idx.get(KEY)["pad"] == "x" * 500 and idx.get("s-other")["pad"] == "y" * 500
+    assert not list((tmp_path / "idx").glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("fail_on", ["write", "fsync"])
+def test_r3_3_a_failed_write_leaves_no_temp_and_the_old_record(tmp_path, monkeypatch, fail_on):
+    import errno
+    import os
+    idx = L.SessionIndex(tmp_path / "idx")
+    idx.put(KEY, "started", run_id=RUN, session="sess-1")
+    real = getattr(os, fail_on)
+
+    def boom(fd, *a):
+        if fd > 2:
+            raise OSError(errno.ENOSPC, "no space")
+        return real(fd, *a)
+
+    with monkeypatch.context() as m:
+        m.setattr(os, fail_on, boom)
+        with pytest.raises(OSError):
+            idx.put(KEY, "ended", run_id=RUN, session="sess-1")
+        with pytest.raises(OSError):
+            idx.create("s-other", "pending")
+    assert idx.get(KEY)["state"] == "started" and idx.get("s-other") is None
+    assert not list((tmp_path / "idx").glob(".*.tmp"))
+
+
+def test_r3_3_a_truncated_record_reads_unreadable_never_absent(tmp_path):
+    ln, control, runtime = build(tmp_path)
+    ln.spawn(launch())
+    path = tmp_path / "idx" / f"{KEY}.json"
+    path.write_bytes(path.read_bytes()[:20])
+    assert caps(ln.usage(KEY)) and ln.usage(KEY).source == "session:index-unreadable"
+    assert ln.stop(KEY).terminated is False and runtime.ended == []
+    with pytest.raises(L.LauncherRefused) as e:
+        ln.spawn(launch())
+    assert e.value.name == "session-index-unreadable"
+
+
+# r3-4 LOW-MED: a transient mint refusal does not burn the key; a standing one does
+
+def test_r3_4_a_transient_mint_refusal_leaves_the_key_retryable(tmp_path):
+    answers = [Refused("locked", "RUN-TICKET-MINT")]
+
+    def mint(f):
+        if answers:
+            raise answers.pop()
+        return {"ticket": "t" * 43, "run_id": RUN}
+
+    ln, control, runtime = build(tmp_path, control=FakeControl(**{"RUN-TICKET-MINT": mint}))
+    with pytest.raises(L.LauncherRefused) as e:
+        ln.spawn(launch())
+    assert e.value.reason_class == "transient" and ln.usage(KEY) == zero()
+    ln.spawn(launch())                                           # the same key again: minted and started
+    assert ln.index.get(KEY)["state"] == "started" and len(runtime.starts) == 1
+    with pytest.raises(L.LauncherRefused) as e2:
+        ln.spawn(launch())                                       # a started key is still held
+    assert e2.value.name == "session-key-already-used"
+
+
+def test_r3_4_a_refused_mint_journals_nothing_so_the_retaken_key_mints_through_the_real_control(st, tmp_path,
+                                                                                               monkeypatch):
+    """The retake rests on CONTROL journaling nothing for a refused mint: shown against the real handler. The refusal
+    used is one this test can lift (no /2 ceiling, then one), classed transient here for the test only."""
+    from tests.test_slot_p7a1_passthrough_ticket import write_ceiling2
+    from tests.test_tickets import Clock, Rig
+
+    real = Rig(st, Clock())
+
+    class ToControl:
+        def call(self, op, **fields):
+            ans = real.ask(op, **fields)
+            if ans.get("ok") is not True:
+                raise Refused(ans["refused"], op)
+            return {k: v for k, v in ans.items() if k not in ("id", "ok")}
+
+    monkeypatch.setattr(L, "_TRANSIENT", L._TRANSIENT | {"ceiling-lacks-subscription"})
+    ln = L.RealLauncher(ToControl(), FakeRuntime(), FakeSources(), L.SessionIndex(tmp_path / "idx"))
+    with pytest.raises(L.LauncherRefused) as e:
+        ln.spawn(launch(occurrence="job-1"))
+    assert e.value.name == "mint-refused:ceiling-lacks-subscription" and real.lines() == []
+    write_ceiling2(st.L)
+    ln.spawn(launch(occurrence="job-1"))
+    (line,) = real.lines()
+    assert line["attempt_id"] == KEY and ln.index.get(KEY)["state"] == "started"
+
+
+def test_r3_4_a_standing_mint_refusal_still_holds_the_key(tmp_path):
+    ln, _, runtime = build(tmp_path, control=FakeControl(**{"RUN-TICKET-MINT": Refused("ceiling-lacks-subscription")}))
+    with pytest.raises(L.LauncherRefused):
+        ln.spawn(launch())
+    with pytest.raises(L.LauncherRefused) as e:
+        ln.spawn(launch())
+    assert e.value.name == "session-key-already-used" and runtime.starts == []
+
+
+def test_r3_4_a_retake_is_exclusive(tmp_path):
+    idx = L.SessionIndex(tmp_path / "idx")
+    idx.create(KEY, "refused", reason="mint:locked", reason_class="transient")
+    retake = L.RealLauncher._retakable
+    assert idx.claim(KEY, "pending", retake, n=1) is True
+    assert idx.claim(KEY, "pending", retake, n=2) is False         # the record is now pending: not retakable
+    assert idx.get(KEY)["n"] == 1
+    assert not list((tmp_path / "idx").glob(".*.tmp"))
+
+
+# r3-5 LOW-MED: poll does not drive END at the caller's poll rate
+
+def test_r3_5_poll_makes_at_most_one_end_attempt_per_interval(tmp_path, monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(L, "_monotonic", lambda: now[0])
+    ln, _, runtime = build(tmp_path, runtime=FakeRuntime(end=False))
+    child = ln.spawn(launch())
+    child.process._p.wait()                                      # the gate exits; nothing has polled yet
+    for _ in range(5):
+        assert child.process.poll() == ctl.GATE_UNPROVEN
+    assert runtime.ended == ["sess-1"]
+    now[0] += L._POLL_END_INTERVAL_S
+    runtime.end_ok = True
+    assert child.process.poll() == 0 and runtime.ended == ["sess-1", "sess-1"]
+    assert ln.index.get(KEY)["state"] == "ended"
+
+
+# r3-6 LOW: an `ended` write that failed is retried by the next wait / poll / abort
+
+def test_r3_6_a_failed_ended_write_is_retried(tmp_path, monkeypatch):
+    ln, _, runtime = build(tmp_path)
+    child = ln.spawn(launch())
+    real_put = ln.index.put
+    fail = [True]
+
+    def put(k, s, **kw):
+        if s == "ended" and fail:
+            fail.pop()
+            raise OSError("full")
+        return real_put(k, s, **kw)
+
+    monkeypatch.setattr(ln.index, "put", put)
+    assert ended(child) == 0 and ln.index.get(KEY)["state"] == "started"
+    assert ended(child) == 0 and ln.index.get(KEY)["state"] == "ended" and runtime.ended == ["sess-1"]
+
+
+# r3-7 LOW: an `ended` another launcher recorded is read through before a second END
+
+def test_r3_7_an_end_another_launcher_proved_is_read_from_the_record(tmp_path):
+    ln, _, runtime = build(tmp_path)
+    child = ln.spawn(launch())
+    other = L.RealLauncher(FakeControl(), FakeRuntime(), FakeSources(), ln.index)
+    assert other.stop(KEY).terminated is True and ln.index.get(KEY)["state"] == "ended"
+    runtime.end_ok = Refused("no-session")                       # a second END after SCRUB refuses
+    assert ended(child) == 0 and runtime.ended == [] and child.abort() == 0
+
+
+def test_r3_7_a_held_child_reads_the_record_too(tmp_path):
+    ln, _, runtime = build(tmp_path, control=FakeControl(**BOUND9), runtime=FakeRuntime(end=False, fail=OSError("x")))
+    child = ln.spawn(launch())
+    assert isinstance(child, L.HeldChild)
+    other = L.RealLauncher(FakeControl(), FakeRuntime(), FakeSources(), ln.index)
+    assert other.stop(KEY).terminated is True
+    n = len(runtime.ended)
+    assert child.process.wait() == ctl.GATE_REFUSED and len(runtime.ended) == n
+
+
+# r3-8 LOW: the held child of an index-write failure records its END when one is proven
+
+def test_r3_8_the_held_child_of_an_index_failure_records_ended_with_its_session(tmp_path, monkeypatch):
+    rt = FakeRuntime(end=False)
+    ln, _, _ = build(tmp_path, runtime=rt, sources=FakeSources(calls=6, bytes_=60, seconds=6))
+    real_put = ln.index.put
+    monkeypatch.setattr(ln.index, "put", lambda k, s, **kw: (_ for _ in ()).throw(OSError("x")) if s == "started"
+                        else real_put(k, s, **kw))
+    child = ln.spawn(launch())
+    assert isinstance(child, L.HeldChild) and ln.index.get(KEY)["state"] == "minted"
+    rt.end_ok = True
+    assert child.abort() == ctl.GATE_REFUSED
+    rec = ln.index.get(KEY)
+    assert rec["state"] == "ended" and rec["session"] == "sess-1" and ln.usage(KEY).actions == 6

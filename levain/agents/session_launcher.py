@@ -9,8 +9,9 @@ three seams, so the whole of it runs in pytest against fakes:
   launcher mints through it (``RUN-TICKET-MINT``), and undoes a mint through it (``RUN-TICKET-STATUS`` /
   ``RUN-TICKET-CANCEL``). This module contains the one place that mints (:meth:`RealLauncher._mint`).
 * :class:`SlotRuntime`: the credential slot's start (lease, prepare, render, start under the ticket, the agent fence's
-  hooks) answering the gated child, and S1 END (``end(session)``: True only when the helper's teardown answer proves
-  the slot uid's group gone, read by :func:`teardown_proves`).
+  hooks) answering the gated child, and S1 END (``end(session)``: exactly True only when the helper's teardown answer
+  proves the slot uid's group gone; an adapter answers it with :func:`end_by_teardown`, and the launcher counts no
+  answer but ``True`` itself as proof, so a forwarded helper dict such as ``{"state": "HELD"}`` proves nothing).
 * :class:`UsageSources`: the three figures a subscription run settles on (P7-A section 3.3 item 4): the broker's call
   count by ``run_id``, the front's byte total and the session's seconds by slot session.
 
@@ -23,7 +24,8 @@ with ``attempt_id`` == the session key; the slot is started; the record is compl
 
 What a failing ``spawn`` leaves (the :class:`~levain.agents.session.SessionLauncher` contract: one that raises has left
 nothing of its own live). A start that raises is undone: an unbound ticket cancelled (``undone``, usage zero), or the
-session CONTROL's ``RUN-TICKET-STATUS`` names ENDed (``undone``). When STATUS names a session whose END is not proven,
+session CONTROL's ``RUN-TICKET-STATUS`` names ENDed (``ended`` with that session: it may have spent before END, so
+usage reads the sources, never zero). When STATUS names a session whose END is not proven,
 ``spawn`` does NOT raise: it returns a :class:`HeldChild` that owns that session, so the run keeps its slot and the
 run's own stop and abort reach it. It raises with the record left ``minted`` (usage reads the caps) only when no
 session is known; that raise claims only that nothing this launcher can name is live.
@@ -48,6 +50,7 @@ Nothing imports this module from an entry point, and :class:`~levain.agents.sess
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -62,13 +65,13 @@ from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 from levain.agents import controller as _ctl
 from levain.agents.accounting import StopResult, Usage
 from levain.agents.session import S1_DISPATCH, SessionLaunch
-from levain.slot import Refused
+from levain.slot import Refused, write_all
 from levain.slot import tickets as T
 from levain.slot.records import RETAINED
 from levain.slot.runtime_grammar import _MODEL_RE as _RENDER_MODEL_RE
 
 __all__ = ["VENDOR", "HOOKS", "LauncherRefused", "ControlPort", "SlotStart", "SlotHandle", "SlotRuntime",
-           "UsageSources", "SessionIndex", "RealLauncher", "HeldChild", "teardown_proves"]
+           "UsageSources", "SessionIndex", "RealLauncher", "HeldChild", "teardown_proves", "end_by_teardown"]
 
 _log = logging.getLogger("levain.agents.session_launcher")
 
@@ -94,11 +97,39 @@ def teardown_proves(answer: object) -> bool:
 
     * ``RETAINED`` -> True: END proved the slot uid's group gone. ``released: false`` does not change that; it says the
       slot is still leased to the session, which the reaper's SCRUB releases.
-    * ``HELD``, any other state, a ``released`` that is not a bool, anything not a dict -> False.
+    * ``HELD``, any other state, a ``released`` that is not a bool, an ``ok`` that is there and is not True (a raw
+      answer frame passed through), anything not a dict -> False.
     * a refusal (the helper answering ``ok: false``, raised as :class:`levain.slot.Refused`) is the caller's to read as
-      False. A second teardown after SCRUB need not answer RETAINED again (L2 review F9 read it as refusing), so a
-      launcher answers a later stop from its own ``ended`` record, never from a second END."""
-    return type(answer) is dict and answer.get("state") == RETAINED and type(answer.get("released", False)) is bool
+      False (:func:`end_by_teardown` does). A second teardown after SCRUB need not answer RETAINED again (L2 review F9
+      read it as refusing), so a launcher answers a later stop from the ``ended`` record, never from a second END."""
+    return type(answer) is dict and answer.get("state") == RETAINED and type(answer.get("released", False)) is bool \
+        and answer.get("ok", True) is True
+
+
+def end_by_teardown(teardown: Callable[[str], object], session: str) -> bool:
+    """THE adapter boundary for S1 END: a production :class:`SlotRuntime`'s ``end`` is this function over the runtime
+    helper's ``teardown`` call (``teardown(session)`` answering the helper's dict, or raising its refusal). It answers
+    exactly True or False: True only for an answer :func:`teardown_proves` reads as proof; a refusal, any other error
+    and any other answer are False. The helper's dict never reaches the launcher (a dict is truthy whatever it says)."""
+    try:
+        answer = teardown(session)
+    except Exception:  # noqa: BLE001 - a teardown that refused or failed proved nothing
+        return False
+    return teardown_proves(answer)
+
+
+def _end_proven(runtime: "SlotRuntime", session: str) -> bool:
+    """The launcher's ONE reading of ``SlotRuntime.end``: proven only when the answer is exactly True. Anything else (a
+    dict such as the helper's raw ``{"state": "HELD"}``, a truthy non-bool, None, a raise) proves nothing."""
+    try:
+        answer = runtime.end(session)
+    except Exception:  # noqa: BLE001 - an END that cannot complete proved nothing
+        _log.warning("S1 END for session %s raised; read as unproven", session)
+        return False
+    if answer is not True and answer is not False:
+        _log.warning("S1 END for session %s answered a %s, not a bool; read as unproven (the adapter must answer "
+                     "end_by_teardown's True or False)", session, type(answer).__name__)
+    return answer is True
 
 
 class LauncherRefused(RuntimeError):
@@ -144,8 +175,9 @@ class SlotHandle:
 @runtime_checkable
 class SlotRuntime(Protocol):
     """The credential slot's start and S1 END. ``start`` is failure-atomic like the launcher's ``spawn``: one that
-    raises has left no S1 session live. ``end(session)`` answers True only when the helper's teardown answer proves the
-    slot uid's group gone (:func:`teardown_proves`); anything else, a refusal or an error included, is False."""
+    raises has left no S1 session live. ``end(session)`` answers exactly True only when the helper's teardown answer
+    proves the slot uid's group gone, and False otherwise: an adapter implements it as :func:`end_by_teardown` over
+    the helper's teardown call. The launcher counts nothing but ``True`` itself as proof (:func:`_end_proven`)."""
 
     def start(self, req: SlotStart) -> SlotHandle: ...
 
@@ -211,10 +243,14 @@ class SessionIndex:
         tmp = path.with_name(f".{key}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+            try:
+                write_all(fd, data)         # os.write may write a prefix: a short record is never linked as a record
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except BaseException:
+            os.unlink(tmp)
+            raise
         return path, tmp
 
     def _sync_dir(self) -> None:
@@ -237,9 +273,32 @@ class SessionIndex:
         self._sync_dir()
         return True
 
+    def claim(self, key: str, state: str, retakable: Callable[[dict[str, Any]], bool], **fields: Any) -> bool:
+        """:meth:`create`, and when a record is already there, replace it only if ``retakable(record)`` says so: True
+        when this call wrote the record. A record that does not read is never retaken. Retakes of one key are
+        serialised by an exclusive ``flock`` on the key's lock file, so of two retakers of one record exactly one
+        wins (the other then reads the winner's record, which is not retakable)."""
+        if self.create(key, state, **fields):
+            return True
+        lock = os.open(self.dir / f".{key}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                rec = self.get(key)
+            except ValueError:
+                return False
+            if rec is None:
+                return self.create(key, state, **fields)
+            if not retakable(rec):
+                return False
+            self.put(key, state, **fields)
+            return True
+        finally:
+            os.close(lock)
+
     def put(self, key: str, state: str, **fields: Any) -> None:
-        """Write the record under ``key`` whole (replacing), durably. Only the spawn that CREATED a key's record, and
-        the END that proves its session gone, replace it."""
+        """Write the record under ``key`` whole (replacing), durably. Only the spawn that CREATED a key's record (or
+        retook it, :meth:`claim`), and the END that proves its session gone, replace it."""
         path, tmp = self._temp(key, state, fields)
         try:
             os.replace(tmp, path)
@@ -253,10 +312,51 @@ def _count(v: object) -> int | None:
     return v if type(v) is int and v >= 0 else None
 
 
+_monotonic = time.monotonic
+#: the least time between two END attempts that ``poll`` makes for a session whose END is unproven; ``wait``,
+#: ``terminate``, ``abort`` and the launcher's ``stop`` each make one whenever they are called
+_POLL_END_INTERVAL_S = 5.0
+
+
+class _EndProof:
+    """One session's S1 END proof, shared by the child a spawn answers and by a held child.
+
+    :meth:`attempt` answers True once END is proven. While it is not, it first reads the durable record through
+    (``recorded_ended``: True when any launcher's proven END recorded ``ended``, so a stop made elsewhere is seen and
+    no second END is sent; read every time, never cached as False), then makes one END attempt (:func:`_end_proven`).
+    Once proven, ``record`` (writing ``ended``, answering True when it is written) is retried by every later attempt
+    until it is written. An attempt made for ``poll`` is skipped when the last END attempt was under
+    :data:`_POLL_END_INTERVAL_S` ago."""
+
+    def __init__(self, runtime: "SlotRuntime", session: str, record: Callable[[], bool] | None = None,
+                 recorded_ended: Callable[[], bool] | None = None) -> None:
+        self.runtime, self.session = runtime, session
+        self._record, self._recorded_ended = record, recorded_ended
+        self.proven = False
+        self.written = record is None
+        self._last: float | None = None
+
+    def attempt(self, *, polling: bool = False) -> bool:
+        if not self.proven:
+            if self._recorded_ended is not None and self._recorded_ended() is True:
+                self.proven = self.written = True
+                return True
+            if polling and self._last is not None and _monotonic() - self._last < _POLL_END_INTERVAL_S:
+                return False
+            self._last = _monotonic()
+            if not _end_proven(self.runtime, self.session):
+                return False
+            self.proven = True
+        if not self.written:
+            assert self._record is not None
+            self.written = self._record() is True
+        return True
+
+
 class _Proc:
     """A stand-in gate for a session this process could not prove ENDed: ``wait`` and ``terminate`` make one END
-    attempt each, and the exit is :data:`levain.agents.controller.GATE_UNPROVEN` (the exit that proves nothing) until
-    one is proven."""
+    attempt each (:class:`_EndProof`), and the exit is :data:`levain.agents.controller.GATE_UNPROVEN` (the exit that
+    proves nothing) until one is proven."""
 
     def __init__(self, held: "HeldChild") -> None:
         self._held = held
@@ -273,7 +373,7 @@ class _Proc:
         return self.returncode if self.returncode is not None else _ctl.GATE_UNPROVEN
 
     def _try(self) -> None:
-        if self.returncode is None and self._held.try_end():
+        if self._held.try_end():                    # once proven, this only retries an unwritten `ended`
             self.returncode = _ctl.GATE_REFUSED     # nothing ran under it; a non-zero exit that proves the group gone
 
 
@@ -281,21 +381,18 @@ class HeldChild:
     """The gated child of a launch whose S1 session could not be proven ENDed. It runs nothing (``release`` does
     nothing), and each ``terminate``, ``wait`` and ``abort`` makes one END attempt (no retry loop), so the run's own
     stop and abort reach the session. Until END is proven its exit is :data:`~levain.agents.controller.GATE_UNPROVEN`:
-    the run is never ``done`` and keeps its slot for the reaper. ``on_end`` runs once, when END is proven."""
+    the run is never ``done`` and keeps its slot for the reaper. ``on_end`` records the proven END (True when
+    written; retried until it is); ``recorded_ended`` reads whether some launcher already recorded it."""
 
-    def __init__(self, runtime: SlotRuntime, session: str, on_end: Callable[[], None] | None = None) -> None:
-        self._runtime, self.session, self._on_end = runtime, session, on_end
+    def __init__(self, runtime: SlotRuntime, session: str, on_end: Callable[[], bool] | None = None,
+                 recorded_ended: Callable[[], bool] | None = None) -> None:
+        self.session = session
+        self.proof = _EndProof(runtime, session, on_end, recorded_ended)
         self.process = _Proc(self)
         self.released = False
 
     def try_end(self) -> bool:
-        try:
-            ok = bool(self._runtime.end(self.session))
-        except Exception:  # noqa: BLE001 - an END that cannot complete proved nothing
-            return False
-        if ok and self._on_end is not None:
-            self._on_end()
-        return ok
+        return self.proof.attempt()
 
     def release(self) -> None:
         """Nothing to release: this child holds no program."""
@@ -307,16 +404,17 @@ class HeldChild:
 
 class _SlotProc:
     """The inner gate's process with S1 END behind its exit: ``wait`` and ``poll`` answer the gate's status only once
-    END proved the slot uid's group gone (one END attempt per call while it is not), and
-    :data:`levain.agents.controller.GATE_UNPROVEN` until then. ``terminate`` is the gate's."""
+    END proved the slot uid's group gone (``wait`` makes one END attempt per call while it is not, ``poll`` at most
+    one per :data:`_POLL_END_INTERVAL_S`), and :data:`levain.agents.controller.GATE_UNPROVEN` until then.
+    ``terminate`` is the gate's."""
 
     def __init__(self, inner: Any, launched: "_Launched") -> None:
         self._p, self._l = inner, launched
 
-    def _settle(self, rc: int | None) -> int | None:
+    def _settle(self, rc: int | None, *, polling: bool) -> int | None:
         if rc is None:
             return None
-        return rc if self._l.end_once() else _ctl.GATE_UNPROVEN
+        return rc if self._l.end_once(polling=polling) else _ctl.GATE_UNPROVEN
 
     @property
     def returncode(self) -> int | None:
@@ -324,10 +422,10 @@ class _SlotProc:
         return None if rc is None else (rc if self._l.proven else _ctl.GATE_UNPROVEN)
 
     def poll(self) -> int | None:
-        return self._settle(self._p.poll())
+        return self._settle(self._p.poll(), polling=True)
 
     def wait(self, timeout: float | None = None) -> int | None:
-        return self._settle(self._p.wait(timeout))
+        return self._settle(self._p.wait(timeout), polling=False)
 
     def terminate(self) -> None:
         self._p.terminate()
@@ -343,24 +441,19 @@ class _Launched:
     (:class:`_SlotProc`) and behind ``abort`` (the run's own stop path), so a session is over only when the slot's END
     proved it, not when its local gate closed."""
 
-    def __init__(self, inner: Any, runtime: SlotRuntime, session: str, on_end: Callable[[], None]) -> None:
-        self._inner, self._runtime, self.session, self._on_end = inner, runtime, session, on_end
-        self.proven = False
+    def __init__(self, inner: Any, runtime: SlotRuntime, session: str, on_end: Callable[[], bool],
+                 recorded_ended: Callable[[], bool] | None = None) -> None:
+        self._inner, self.session = inner, session
+        self.proof = _EndProof(runtime, session, on_end, recorded_ended)
         self.process = _SlotProc(inner.process, self)
 
-    def end_once(self) -> bool:
-        """One S1 END attempt, unless one was already proven. Never raises."""
-        if self.proven:
-            return True
-        try:
-            ok = bool(self._runtime.end(self.session))
-        except Exception:  # noqa: BLE001 - an END that cannot complete proved nothing
-            _log.warning("S1 END for session %s failed", self.session)
-            ok = False
-        if ok:
-            self.proven = True
-            self._on_end()
-        return ok
+    @property
+    def proven(self) -> bool:
+        return self.proof.proven
+
+    def end_once(self, *, polling: bool = False) -> bool:
+        """One S1 END attempt (:meth:`_EndProof.attempt`), unless one was already proven. Never raises."""
+        return self.proof.attempt(polling=polling)
 
     @property
     def released(self) -> bool:
@@ -399,8 +492,11 @@ class RealLauncher:
         self._refuse_before_allocating(launch)
         facts = self._facts(launch)
         # the record exists before the mint (a crash from here on leaves a key usage reads as unreadable, the caps,
-        # never as nothing), and creating it is the existence check: a key already held is refused before any mint
-        if not self.index.create(key, "pending", occurrence_id=launch.occurrence_id, created_s=self.clock()):
+        # never as nothing), and creating it is the existence check: a key already held is refused before any mint.
+        # The one record a spawn may take over is a TRANSIENT mint refusal's: a refused mint journals nothing, so the
+        # same attempt id may mint again (test_r3_4_a_refused_mint_journals_nothing_..., against the real handler)
+        if not self.index.claim(key, "pending", self._retakable, occurrence_id=launch.occurrence_id,
+                                created_s=self.clock()):
             raise LauncherRefused("session-key-already-used", f"the index already holds state {self._existing(key)!r}")
         # AUTHORITY: whoever builds a launcher can mint for any occurrence_id and caps; run_session is the guard,
         # with CONTROL's ceiling behind it
@@ -415,11 +511,14 @@ class RealLauncher:
             _log.warning("the slot start for %s raised %s: %s; its session is held", key, type(exc).__name__, exc)
             return held
         except BaseException:
-            # an interrupt propagates (run_session does not read it as a known spawn failure); undone best effort
+            # an interrupt propagates (run_session does not read it as a known spawn failure); undone best effort.
+            # A HeldChild _undo answers is dropped here: its session is recorded `started` (or, that write failing,
+            # left `minted`, where stop() asks STATUS for the session), so stop() by the key still reaches it
             self._undo(key, ticket, run_id, launch.occurrence_id)
             raise
+        session = handle.session
         try:
-            self.index.put(key, "started", occurrence_id=launch.occurrence_id, run_id=run_id, session=handle.session,
+            self.index.put(key, "started", occurrence_id=launch.occurrence_id, run_id=run_id, session=session,
                            started_s=self.clock())
         except BaseException:
             # the session is live and the index cannot say so: end it, or hold it
@@ -427,11 +526,19 @@ class RealLauncher:
                 handle.child.abort()
             except Exception:  # noqa: BLE001 - END below is the proof; the local gate is closed best effort
                 pass
-            if self.runtime_end(handle.session):
-                self._tombstone(key, "undone", "index-write-failed")
+            if self.runtime_end(session):
+                # a bound session ran under the ticket: `ended` with its session, so usage reads the sources
+                self._mark_ended(key, run_id=run_id, session=session)
                 raise
-            return HeldChild(self.runtime, handle.session)
-        return _Launched(handle.child, self.runtime, handle.session, lambda: self._mark_ended(key))
+            return HeldChild(self.runtime, session, on_end=lambda: self._mark_ended(key, run_id=run_id, session=session),
+                             recorded_ended=lambda: self._ended_on_record(key))
+        return _Launched(handle.child, self.runtime, session, lambda: self._mark_ended(key),
+                         lambda: self._ended_on_record(key))
+
+    @staticmethod
+    def _retakable(rec: Mapping[str, Any]) -> bool:
+        """A record a new spawn of its key may replace: a mint CONTROL refused for a transient reason."""
+        return rec.get("state") == "refused" and rec.get("reason_class") == "transient"
 
     def _refuse_before_allocating(self, launch: SessionLaunch) -> None:
         why = None
@@ -539,9 +646,11 @@ class RealLauncher:
         return "no ticket or run id in the answer; the minted ticket was cancelled"
 
     def _undo(self, key: str, ticket: str, run_id: str, occurrence_id: str) -> "HeldChild | None":
-        """Undo a mint (and whatever the slot started) after a failed start. None: undone, or nothing this launcher
-        can name is live (the record then stays ``minted`` and usage reads the caps); the caller raises. A
-        :class:`HeldChild`: a session is bound to the ticket and its END is unproven; the caller returns it."""
+        """Undo a mint (and whatever the slot started) after a failed start. None: the caller raises, with the record
+        ``undone`` (the ticket never bound: nothing ran, zero), ``ended`` (a bound session END proved gone: it may have
+        spent before it did, so usage reads the sources), or ``minted`` (nothing this launcher can name is live; usage
+        reads the caps). A :class:`HeldChild`: a session is bound to the ticket and its END is unproven; the caller
+        returns it."""
         try:
             self.control.call("RUN-TICKET-CANCEL", ticket=ticket)
         except Exception as exc:  # noqa: BLE001 - any failed cancel asks CONTROL what the ticket is bound to
@@ -554,14 +663,17 @@ class RealLauncher:
                     _log.warning("the ticket for %s could not be cancelled (%s) and names no session", key, name)
                 return None
             if self.runtime_end(session):
-                self._tombstone(key, "undone", "spawn-failed")
+                self._mark_ended(key, occurrence_id=occurrence_id, run_id=run_id, session=session)
                 return None
             try:
                 self.index.put(key, "started", occurrence_id=occurrence_id, run_id=run_id, session=session,
                                started_s=self.clock())
             except Exception:  # noqa: BLE001 - the record stays minted: stop() still finds the session by STATUS
                 _log.warning("the held session of %s could not be recorded", key)
-            return HeldChild(self.runtime, session, on_end=lambda: self._mark_ended(key))
+            return HeldChild(self.runtime, session,
+                             on_end=lambda: self._mark_ended(key, occurrence_id=occurrence_id, run_id=run_id,
+                                                             session=session),
+                             recorded_ended=lambda: self._ended_on_record(key))
         self._tombstone(key, "undone", "spawn-failed")
         return None
 
@@ -576,23 +688,32 @@ class RealLauncher:
         s, state = ans.get("session"), ans.get("state")
         return (s if type(s) is str and s else None), (state if type(state) is str else None)
 
-    def _mark_ended(self, key: str) -> None:
-        """S1 END proved the session's group gone: record it, so usage reads the sources and a later stop needs no
-        second END. A record that cannot be written stays as it was (usage reads the caps, the safe side)."""
+    def _mark_ended(self, key: str, **known: Any) -> bool:
+        """S1 END proved the session's group gone: record it ``ended`` (the record's fields, with ``known`` ones such
+        as the run id and session over them), so usage reads the sources and a later stop needs no second END. True
+        when it is recorded, or there is nothing to record (an ``ended`` record, a zero record, no record); False when
+        the write failed (the record stays as it was, usage reads the caps; the caller retries)."""
         try:
             rec = self.index.get(key)
-            if rec is None or rec["state"] not in ("minted", "started"):
-                return
+            if rec is None or rec["state"] not in ("pending", "minted", "started"):
+                return True
             fields = {k: v for k, v in rec.items() if k not in ("format", "key", "state")}
-            self.index.put(key, "ended", **{**fields, "ended_s": self.clock()})
+            self.index.put(key, "ended", **{**fields, **known, "ended_s": self.clock()})
+            return True
         except Exception:  # noqa: BLE001
             _log.warning("the END of session %s could not be recorded", key)
+            return False
+
+    def _ended_on_record(self, key: str) -> bool:
+        """Whether the durable record says a proven END (this launcher's or another's). Read through every time."""
+        try:
+            rec = self.index.get(key)
+        except Exception:  # noqa: BLE001 - a record that does not read proves nothing
+            return False
+        return rec is not None and rec["state"] == "ended"
 
     def runtime_end(self, session: str) -> bool:
-        try:
-            return bool(self.runtime.end(session))
-        except Exception:  # noqa: BLE001
-            return False
+        return _end_proven(self.runtime, session)
 
     # -- usage and stop, keyed by the recorded session key ------------------------------------------------------------
 
@@ -647,6 +768,6 @@ class RealLauncher:
         if session is None:
             return StopResult(False, "the record names no slot session; nothing observed")
         if self.runtime_end(session):
-            self._mark_ended(session_key)
+            self._mark_ended(session_key, session=session)
             return StopResult(True, "S1 END proved the session's uid group gone")
         return StopResult(False, "S1 END did not prove the session's uid group gone")
