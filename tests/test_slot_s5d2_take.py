@@ -150,11 +150,11 @@ def test_take_create_only(ex, tmp_path, ref_format, monkeypatch):
     ref = f"refs/heads/levain/{S}"
     assert t.ref == ref and t.oid == ex["head"]
     rd = " ".join(SLOT.adopt_take.repo_args(repo))          # every call names his repository (L3 s4a r1 MED 2)
+    iso = " ".join(f"-c {c}" for c in SLOT.adopt_take.push.GIT_ISOLATION_CONFIG)    # the one shared isolation
     assert plog.read_text().splitlines() == [
-        f"-c core.hooksPath=/dev/null {rd} cat-file -e {ex['base']}",
-        f"-c core.hooksPath=/dev/null {rd} rev-parse --git-path objects",
-        "-c core.hooksPath=/dev/null -c hook.reference-transaction.enabled=false "
-        f"{rd} update-ref --no-deref --create-reflog {ref} {ex['head']} {'0' * 40}"]
+        f"{iso} {rd} cat-file -e {ex['base']}",
+        f"{iso} {rd} rev-parse --git-path objects",
+        f"{iso} {rd} update-ref --no-deref --create-reflog {ref} {ex['head']} {'0' * 40}"]
     assert not marker.exists()
     assert {k: v for k, v in post["refs"].items() if k != ref} == pre["refs"] and post["refs"][ref] == ex["head"]
     assert all(post["logs"][k] == v for k, v in pre["logs"].items())

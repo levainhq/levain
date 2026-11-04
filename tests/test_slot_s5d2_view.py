@@ -30,8 +30,10 @@ def _seams(answers):
 
     def spawn(argv, **kw):
         assert "env" in kw
-        assert argv[3:5] == [f"--git-dir={kw['cwd']}/.git", f"--work-tree={kw['cwd']}"]     # never discovered
-        words = tuple(argv[5:7])
+        i = argv.index(f"--git-dir={kw['cwd']}/.git")     # the shared isolation's -c pairs come first
+        assert argv[i + 1] == f"--work-tree={kw['cwd']}"     # never discovered
+        assert "core.hooksPath=/dev/null" in argv[:i]
+        words = tuple(argv[i + 2:i + 4])
         calls.append(words)
         rc, out, err = answers[words]
         return subprocess.CompletedProcess(argv, rc, out, err)
