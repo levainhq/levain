@@ -517,33 +517,23 @@ def blocked_send(session):
     return t, box
 
 
-def test_item3_the_plain_sessions_close_blocks_behind_a_hung_send(world):
-    """The defect the room works around (claude_session.py is untouched: RM-G follow-up). If this starts failing,
-    ClaudeSession.close no longer waits behind the send and RoomSession.close's kill-first step can go."""
+def test_item3_the_plain_sessions_close_frees_a_hung_send(world):
+    """The defect the room once worked around is gone from ClaudeSession.close: it takes no I/O lock, so a send blocked
+    in a full pipe no longer holds it. The send's bytes may have partly left, so it ends ambiguous (BrokenPipeError)."""
     proc = deaf_child(world)
     session = ClaudeSession(PipeTransport(proc))
-    send, _box = blocked_send(session)
-    closer = threading.Thread(target=session.close, daemon=True)
-    closer.start()
-    closer.join(2.0)
-    assert closer.is_alive()
-    proc.kill()                                   # release both so the test leaves no thread behind
-    send.join(10)
-    closer.join(10)
-    assert not send.is_alive() and not closer.is_alive()
-
-
-def test_item3_the_rooms_session_closes_at_once_and_frees_the_hung_send(world):
-    proc = deaf_child(world)
-    session = room_launch.RoomSession(PipeTransport(proc), child=proc)
     send, box = blocked_send(session)
-    t0 = time.monotonic()
     closer = threading.Thread(target=session.close, daemon=True)
     closer.start()
     closer.join(15)
-    assert not closer.is_alive() and time.monotonic() - t0 < 15
+    assert not closer.is_alive()
     send.join(10)
-    assert not send.is_alive() and box["end"] == "NotSent" and proc.poll() is not None
+    assert not send.is_alive() and box["end"] == "BrokenPipeError" and proc.poll() is not None
+
+
+def test_item3_the_room_session_is_the_plain_close(world):
+    """RoomSession adds no close of its own: the plain close does the job."""
+    assert "close" not in vars(room_launch.RoomSession)
 
 
 def test_item3_ending_a_launch_whose_send_is_hung_completes_and_ends_the_launch(world):
@@ -556,8 +546,49 @@ def test_item3_ending_a_launch_whose_send_is_hung_completes_and_ends_the_launch(
     done.join(20)
     assert not done.is_alive()
     send.join(10)
-    assert box["end"] == "NotSent" and state(world, h.launch_id) == "ended"
+    assert box["end"] == "BrokenPipeError" and state(world, h.launch_id) == "ended"
     assert world["svc"].session_meta(h.launch_id) is None
+
+
+GRANDCHILD = (
+    "import os, subprocess, sys, time\n"
+    "g = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(120)'])\n"
+    "print(g.pid, flush=True)\n"
+    "time.sleep(120)\n"
+)
+
+
+def test_item3_the_room_spawns_its_child_in_its_own_group_and_a_close_reaches_a_grandchild(world):
+    """The spawn leads its own process group (start_new_session), so the session close signals the group: a
+    descendant that inherited the pipe and sleeps is stopped with the child, and a hung send is freed."""
+    proc = room_launch._spawn([sys.executable, "-I", "-c", GRANDCHILD], cwd=str(world["fake"]), env=dict(os.environ),
+                              stderr=subprocess.DEVNULL)
+    grand = int(proc.stdout.readline())
+    try:
+        assert os.getpgid(proc.pid) == proc.pid and os.getpgid(grand) == proc.pid
+        session = room_launch.RoomSession(PipeTransport(proc))
+        send, box = blocked_send(session)
+        closer = threading.Thread(target=session.close, daemon=True)
+        closer.start()
+        closer.join(15)
+        assert not closer.is_alive()
+        send.join(10)
+        assert not send.is_alive() and box["end"] == "BrokenPipeError" and proc.poll() is not None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grand, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("the grandchild outlived the session close")
+    finally:
+        for kill in (lambda: os.killpg(proc.pid, 9), lambda: os.kill(grand, 9), proc.kill):
+            try:
+                kill()
+            except (ProcessLookupError, PermissionError):
+                pass
 
 
 # --- rme-fix1: L3_rme_r1 findings, each reproduced on the RM-E tip --------------------------------------------------------

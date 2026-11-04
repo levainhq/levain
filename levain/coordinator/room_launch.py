@@ -36,13 +36,11 @@ refreshes it in place, because there is nothing to refresh: a mode that changes 
 :meth:`RoomLauncher.ensure`, which is a new child, a new session and a new attach with a new snapshot. A reopen never
 reuses a session.
 
-**Closing without the session's lock.** ``ClaudeSession.close`` takes the session's I/O lock, which a ``send`` blocked
-in a full stdin pipe holds, and ``PipeTransport.close`` closes stdin before it signals the child, which also waits
-behind that write. :class:`RoomSession` therefore stops the CHILD first (terminate, then kill, bounded, touching no
-session lock), which ends the blocked write with a broken pipe, and only then runs the ordinary close.
-:meth:`RoomLauncher.end` does the same before it asks the service to detach, because ``detach`` waits for the launch's
-mutex and a hung send holds it. ``claude_session.py`` is untouched; its ``close`` taking the lock stays an RM-G
-follow-up.
+**Closing a hung send.** ``ClaudeSession.close`` takes no I/O lock and ``PipeTransport.close`` signals the child (its
+whole process group, since the room spawns with ``start_new_session=True``) before it closes stdin, so a send
+blocked in a full stdin pipe is freed by the plain session's close. :meth:`RoomLauncher._end` still stops the CHILD
+first, with no lock held, before it asks the service to detach, because ``detach`` waits for the launch's mutex and a
+hung send holds it.
 
 **Resume and lapse.** A new launch resumes the room thread's newest recorded conversation (``--resume <id>``, recorded
 as the pending launch's ``resumed_from``; the child reports the id it was resumed from, which
@@ -158,21 +156,12 @@ def _stop_child(proc: Any) -> None:
 
 
 class RoomSession(ClaudeSession):
-    """A :class:`~levain.coordinator.claude_session.ClaudeSession` whose :meth:`close` stops the child before it takes
-    the session's lock (see the module docstring)."""
-
-    def __init__(self, transport: Any, *, child: Any, **kw: Any) -> None:
-        super().__init__(transport, **kw)
-        self._child = child
+    """A :class:`~levain.coordinator.claude_session.ClaudeSession` that reports when the child's output has ended."""
 
     @property
     def output_ended(self) -> bool:
         """The transport has read the end of the child's output."""
         return bool(getattr(self._t, "eof", False))
-
-    def close(self) -> None:
-        _stop_child(self._child)
-        super().close()
 
 
 # ---- the service's two seams for a room launch ------------------------------------------------------------------------
@@ -264,7 +253,7 @@ def containment_digest(settings_json: str) -> str:
 
 def _spawn(argv: list, *, cwd: str, env: dict, stderr: Any) -> Any:
     return subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
-                            text=True, encoding="utf-8", errors="replace")
+                            text=True, encoding="utf-8", errors="replace", start_new_session=True)
 
 
 class _Live:
@@ -418,7 +407,7 @@ class RoomLauncher:
             env[ROOM_ENV] = "1"
             with open(stderr_path, "ab") as errf:
                 proc = self._spawn(argv, cwd=self._setting.cwd, env=env, stderr=errf)
-            session = RoomSession(PipeTransport(proc), child=proc, conn=self._next_conn(), session_id=sid)
+            session = RoomSession(PipeTransport(proc), conn=self._next_conn(), session_id=sid)
             self._live[launch_id] = _Live(launch_id, session, proc, workdir, room_thread=room_thread, session_id=sid,
                                           resumed=resume is not None, resume_failed=resume_failed)
             self._svc.activate(launch_id, "probing", "room spawned" if resume_failed is None else _one_line(
