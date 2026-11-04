@@ -1039,7 +1039,8 @@ def test_close_waits_with_a_bound_after_kill():
     # codex 10: close() killed and never reaped
     p = _StubbornProc()
     PipeTransport(p).close()
-    assert p.calls == ["terminate", "wait(3)", "kill", "wait(3)", "stdin.close"]    # signal first, stdin last
+    # no write in flight: EOF first and the child's own exit, then terminate and kill, each bounded
+    assert p.calls == ["stdin.close", "wait(1.0)", "terminate", "wait(3.0)", "kill", "wait(3.0)"]
 
 
 def test_room_argv_loads_only_the_user_setting_source():
