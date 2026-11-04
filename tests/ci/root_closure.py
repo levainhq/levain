@@ -366,6 +366,11 @@ LAZY_SITES = {
     'levain/consent/queue.py::ConsentQueue.file::from levain.chat_egress.cards import CardError, filed_display': 'operator',
     # the queue broker (``levain.slot.services.qbroker``, ROOT_PYTHON as ``_levain_qbroker``): ``qbroker.seam`` runs ``consent.queue.answer_refusal`` -> ``signer_refusal`` -> ``_signature_refusal``
     'levain/consent/queue.py::_signature_refusal::from levain.consent.passkey import answer_signature_problem': 'root',
+    # operator: ``_terminal_ruling_refusal`` and ``answer_terminal_ruling`` (TERMSIGN L4) are run by ``_verified_ruling`` (the take / claim / decision readers the agent hooks call) and by ``band_view._terminal_signer`` (the seat's UserPromptSubmit hook); the queue broker runs ``answer_refusal`` -> ``signer_refusal`` only, never a ruling
+    'levain/consent/queue.py::ConsentQueue._terminal_ruling_refusal::from levain.authority import LAPTOP, VerifierUnavailable': 'operator',
+    'levain/consent/queue.py::ConsentQueue._terminal_ruling_refusal::from levain.authority_sig import _signers_line': 'operator',
+    'levain/consent/queue.py::ConsentQueue._terminal_ruling_refusal::from levain.consent import terminal_sign as ts': 'operator',
+    'levain/consent/queue.py::ConsentQueue.answer_terminal_ruling::from levain.consent import terminal_sign as ts': 'operator',
     # operator: ``receipt_log.verify``'s one caller is ``levain/cli.py``'s ``_cmd_consent_receipts_verify`` (``levain consent receipts verify``); the broker reads ``head`` / ``head_refusal`` only
     'levain/consent/receipt_log.py::verify::from levain.authority import AuthorityError, VerifierUnavailable, anchor_path': 'operator',
     'levain/consent/receipt_log.py::verify::from levain.consent.answering import answer_root': 'operator',
