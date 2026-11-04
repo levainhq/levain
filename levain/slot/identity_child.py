@@ -49,6 +49,8 @@ CLAIM = "local-data"
 #: the origins the identity child's tunnel traffic may reach (the supervisor's allowlist names these hosts); the child
 #: itself makes no request.
 ORIGIN = ("https", "api.anthropic.com", 443)
+#: the OAuth token host: the vendor binary refreshes and revokes its own token there, through the same tunnel, so the
+#: passthrough route must reach it. Levain itself makes no refresh request.
 TOKEN_ORIGIN = ("https", "platform.claude.com", 443)
 #: the vendor binary root installed (``root_tree.VENDOR_PREFIX`` + ``bin/claude``); a test holds the two equal.
 VENDOR_BINARY = {"darwin": "/usr/local/lib/levain-vendor/bin/claude", "linux": "/usr/lib/levain-vendor/bin/claude"}
