@@ -808,3 +808,22 @@ def test_f11_a_mint_refusal_names_the_server_reason_and_its_class(tmp_path, name
     if name != "control-down":
         rec = ln.index.get(KEY)
         assert rec["reason"] == f"mint:{name}" and rec["reason_class"] == cls
+
+
+@pytest.mark.parametrize("state", ["cancelled", "expired"])
+def test_l1_1_a_ticket_closed_before_any_binding_is_undone_and_reads_zero(tmp_path, state):
+    ctl_ = FakeControl(**{"RUN-TICKET-CANCEL": Refused("attempt-closed", state),
+                          "RUN-TICKET-STATUS": lambda f: {"ticket": "t", "state": state}})
+    ln, _, runtime = build(tmp_path, control=ctl_, runtime=FakeRuntime(fail=OSError("x")))
+    with pytest.raises(OSError):
+        ln.spawn(launch())
+    assert runtime.ended == [] and ln.index.get(KEY)["state"] == "undone" and ln.usage(KEY) == zero()
+
+
+def test_l1_1_an_unbound_ticket_whose_cancel_failed_stays_minted(tmp_path):
+    ctl_ = FakeControl(**{"RUN-TICKET-CANCEL": Refused("control-down"),
+                          "RUN-TICKET-STATUS": lambda f: {"ticket": "t", "state": "unbound"}})
+    ln, _, _ = build(tmp_path, control=ctl_, runtime=FakeRuntime(fail=OSError("x")))
+    with pytest.raises(OSError):
+        ln.spawn(launch())
+    assert ln.index.get(KEY)["state"] == "minted" and ln.usage(KEY).actions is None
