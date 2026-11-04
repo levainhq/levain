@@ -228,6 +228,7 @@ def test_flows_structured_fields_are_read_before_the_body(tmp_path: Path) -> Non
     bad = [dict(_data("np-d4d4d4d4", sid), v=2), dict(_data("np-d4d4d4d4", sid), v=True), dict(_data("np-d4d4d4d4", sid), v="1"),
            _data("np-d4d4d4d4", sid, options=[{"key": "a", "text": "x"}, {"key": "b", "text": "y"}]),       # objects, not pairs
            _data("np-d4d4d4d4", sid, rec="z"), _data("np-d4d4d4d4", sid, id="np-11111111"),                  # another item
+           _data("np-11111111", "np-11111111-00000002"),                     # whole and self-consistent, but not this ping's item
            _data("np-d4d4d4d4", "np-11111111-00000002"), _data("np-d4d4d4d4", sid, what=""),
            _data("np-d4d4d4d4", sid, expires_at="soon"), _data("np-d4d4d4d4", sid, repo="two words"), [1, 2]]
     for b in bad:
