@@ -422,14 +422,18 @@ def revise(store: EnvelopeStore, draft_id: str, fields: Mapping[str, Any], cites
                                cites=cites, parent=parent, by=by)
 
 
-def withdraw(store: EnvelopeStore, draft_id: str, *, by: str = "operator") -> int:
+def withdraw(store: EnvelopeStore, draft_id: str, *, by: str = "operator", expect_revision: int | None = None) -> int:
     """Withdraw the series at its latest revision; the revision number. The one stored terminal, and a narrowing (it
-    grants nothing), so only the operator writes it. A signed series is refused by the table."""
+    grants nothing), so only the operator writes it. A signed series is refused by the table. ``expect_revision`` is
+    the revision the caller rendered: compared under the write lock, so a revision that landed since is
+    :class:`DraftStale` and nothing is written."""
     by = store._actor(by, ("operator",))
     with store._write(by) as (conn, now):
         newest = _row(conn, draft_id)
         if newest is None:
             raise CoordError(f"no draft {draft_id}")
+        if expect_revision is not None and newest.revision != expect_revision:
+            raise DraftStale(f"draft {draft_id} moved on to revision {newest.revision}; read the card again")
         try:
             conn.execute("INSERT INTO envelope_draft_withdrawals (draft_id, revision, gseq, by, at) "
                          "VALUES (?, ?, ?, ?, ?)", (draft_id, newest.revision, next_gseq(conn, now), by, now))
