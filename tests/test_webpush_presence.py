@@ -55,6 +55,7 @@ def decide(rec, idle, cls="other", **kw):
     # an `until: input` overlay leaves desk_msg_at unset on purpose: its case is the word ended by sensed input, not the desk
     if (rec["overlay"] is None or rec["overlay"]["until"]["kind"] != "input") and idle is not None:
         kw.setdefault("desk_msg_at", NOW - idle)
+    kw.setdefault("desk_msg_at", None)       # required by the rule; None is no message
     return intent.decide(NOW, rec, idle, class_name=cls, **kw)
 
 

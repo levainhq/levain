@@ -650,17 +650,19 @@ def test_an_open_page_follows_the_server_across_follow_after_without_a_reload(ri
     src, q = rig
     intent.apply_settings(q, devices="follow", follow_after=60)
     desk.note_desk_message(q, "test")                                    # just now: well inside follow_after
-    real, first, flipped = desk.read_desk_message, [], []
+    from levain import web_server
 
-    def reads(queue_dir, now=None):
+    real, first, flipped = web_server._Handler._presence_view, [], []
+
+    def reads(self, queue):      # the clock starts at the first presence request, not at any desk read inside it
         if not first:
             first.append(time.monotonic())
         elif not flipped and time.monotonic() - first[0] > 4.0:           # past the 2.5 s startup re-read, before the 6 s pulse
             desk._write(q, desk.DESK_MESSAGE_NAME, {"at": time.time() - 900, "source": "test", "desk": ""})
             flipped.append(True)
-        return real(queue_dir, now)
+        return real(self, queue)
 
-    monkeypatch.setattr(desk, "read_desk_message", reads)
+    monkeypatch.setattr(web_server._Handler, "_presence_view", reads)
     with _signed(src, q) as (port, _):
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
             {"until": _SHOWN, "ms": 20000},
@@ -680,23 +682,23 @@ def test_a_slow_presence_read_still_paints_and_is_never_asked_twice_at_once(rig,
     chip stayed hidden, with a new request piling on each tick. The page keeps ONE read in flight and paints its answer."""
     import threading
 
-    from levain.webpush import desk
-
     src, q = rig
-    real, lock, live, peak = desk.read_desk_message, threading.Lock(), [0], [0]
+    from levain import web_server
 
-    def slow(queue_dir, now=None):
+    real, lock, live, peak = web_server._Handler._presence_view, threading.Lock(), [0], [0]
+
+    def slow(self, queue):       # one 7 s delay per REQUEST (a request reads the desk message several times)
         with lock:
             live[0] += 1
             peak[0] = max(peak[0], live[0])
         try:
             time.sleep(7)
-            return real(queue_dir, now)
+            return real(self, queue)
         finally:
             with lock:
                 live[0] -= 1
 
-    monkeypatch.setattr(desk, "read_desk_message", slow)
+    monkeypatch.setattr(web_server._Handler, "_presence_view", slow)
     with _signed(src, q) as (port, _):
         out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
             {"until": _SHOWN, "ms": 30000}, {"eval": _CHIP_TEXT}])

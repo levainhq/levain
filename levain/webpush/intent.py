@@ -327,7 +327,7 @@ def _eff(rec: dict, now: float, reading: float | None, desk_msg_at: float | None
 
 
 def decide(now: float, rec: dict, reading: float | None, *, class_name: str, remote: dict | None = None,
-           desk_msg_at: float | None = None, filed: bool = False) -> Decision:
+           desk_msg_at: float | None, filed: bool = False) -> Decision:
     """Whether a ping of ``class_name`` is pushed at ``now``. Pure. ``rec`` is a :func:`read` result; ``reading`` the laptop
     idle seconds (it feeds the ``until: input`` overlays only; ``follow`` reads ``desk_msg_at``, Phill 11-03 "1a"). ``filed``: the ping is about a request already FILED and waiting
     for a signed answer (an approval-class ping from a consent hook or gate), which goes whatever the desk or devices
