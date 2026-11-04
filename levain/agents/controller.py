@@ -1417,9 +1417,10 @@ def dispatch_probes(directory: Path | str) -> tuple[Callable[[str], bool | None]
     """``(launch_over, session_alive)`` reading ``<directory>/dispatch.db`` read-only, one short connection per call.
 
     ``launch_over``: True when the launch row is gone or its latest event is failed, expired or ended; False while it
-    is pending or active; None when it has no event. "Gone" is safe to answer only because :func:`slots.probe_over`
-    is fed :func:`slots.expired_launches`: a launch is probed only after its own slot lease (taken plus
-    ``slots.LEASE_S``, renewed by its watcher) expired, never while its coordinator may not have committed the row. ``session_alive``: False only when the coordinator's watcher swept
+    is pending or active; None when it has no event. "Gone" is safe to answer for both callers, :func:`slots.take`
+    (fed :func:`slots.expired_launches`) and the coordinator's sweep (fed EVERY held launch): the coordinator takes a
+    launch's slot only after it read the launch row, and launch rows are append-only, so a missing row is a launch of
+    another store, never one not yet committed. ``session_alive``: False only when the coordinator's watcher swept
     the launch (``launch_sweeps``: it saw the session not running); otherwise None, because the store holds no live
     process; a dead session of an active launch is the watcher's to end, which ``launch_over`` then reads. A file or
     table that cannot be read raises, which :func:`slots.probe_over` reads as "cannot tell" (the slot is kept)."""
