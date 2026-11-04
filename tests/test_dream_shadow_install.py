@@ -85,6 +85,19 @@ def test_a_shadow_store_inside_the_live_store_is_refused_and_writes_nothing(env,
     assert not (env["ag"] / da.INSTALL_FILE).exists() and not (env["ag"] / da.SHADOW_INSTRUCTIONS).exists()
 
 
+def test_a_scratch_dir_in_the_live_store_is_refused_even_when_its_db_links_out(env, flow, tmp_path):
+    # the seed writes the marker, sidecars and lock in the DIRECTORY, so a db symlinked elsewhere does not excuse it
+    x = tmp_path / "home" / ".anneal-memory" / "x"
+    x.mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere" / "memory.db"
+    elsewhere.parent.mkdir()
+    elsewhere.write_bytes(b"")
+    (x / "memory.db").symlink_to(elsewhere)
+    (x / sh.MARKER).write_text("{}")
+    with pytest.raises(da.InstallRefused, match="live store"):
+        _shadow(env, flow, store_path=x / "memory.db")
+
+
 def test_a_relative_shadow_store_and_a_missing_flow_root_are_refused(env, flow, tmp_path):
     with pytest.raises(da.InstallRefused, match="absolute"):
         _shadow(env, flow, store_path="rel/memory.db")
