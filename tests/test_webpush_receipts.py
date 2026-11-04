@@ -404,7 +404,7 @@ def test_a_push_posts_received_then_shown_with_the_endpoint_hash_and_ids_only() 
     assert "secret body" not in json.dumps(got["posts"])
     assert got["shownCalls"] == [{"title": "T", "tag": "x"}] and got["queued"] == []
     assert _receipt_steps(got) == [("received", "ok", None), ("shown", "ok", None)]
-    assert any(e["step"] == "sw-version" and e["version"] == "1102-center-1" and e["on"] == "push" for e in got["trace"])
+    assert any(e["step"] == "sw-version" and e["version"] == "1104-pwasw-1" and e["on"] == "push" for e in got["trace"])
 
 
 @needs_node
@@ -558,7 +558,7 @@ def test_activation_keeps_the_receipts_cache() -> None:
     import re
 
     text = SW.read_text(encoding="utf-8")
-    assert re.search(r"CACHES_KEEP = \[OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE\]", text)
+    assert re.search(r"CACHES_KEEP = \[OPEN_CACHE, TRACE_CACHE, RECEIPT_CACHE, SHELL_CACHE\]", text)
     assert "RECEIPT_CACHE = 'levain-receipts'" in text and "'/__levain_receipt/'" in text
 
 

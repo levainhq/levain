@@ -23,7 +23,7 @@
 // (tests/_waits.py parses it by the same pattern); it is clamped to [1, 20]; anything else (2junk, inf, nan, 1e9999) is 1.
 // The fixed settle sleeps (emulate / scheme / motion / key) are not scaled.
 // A failing wait also saves timeout-step-<n>.png (+ .txt, the page text) beside the steps file and names it on stderr.
-//   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>}}   a device size, applied before the page is drawn again
+//   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>, "safe": {"top","bottom","left","right"} optional}}   a device size, applied before the page is drawn again
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
 //   {"motion": "reduce"|"no-preference"}    the phone's reduce-motion setting (prefers-reduced-motion); it keeps a scheme step's setting
 //   {"init": "<js source>"}                 runs before the page's own scripts on every later load, then reloads the page once (a
@@ -349,6 +349,7 @@ for (const s of steps) {
     }
   } else if (s.emulate !== undefined) {
     await send("Emulation.setDeviceMetricsOverride", { width: s.emulate.w, height: s.emulate.h, deviceScaleFactor: s.emulate.dpr || 1, mobile: !!s.emulate.mobile });
+    if (s.emulate.safe) await send("Emulation.setSafeAreaInsetsOverride", { insets: s.emulate.safe });   // the iPhone notch / status bar / home indicator
     await sleep(600);
   } else if (s.scheme !== undefined) {
     media["prefers-color-scheme"] = s.scheme;

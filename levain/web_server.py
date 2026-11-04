@@ -1137,8 +1137,12 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/pair.js": ("pair.js", "text/javascript; charset=utf-8"),
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
     "/pair_card.js": ("pair_card.js", "text/javascript; charset=utf-8"),
+    # The install coach, and the one gated() question pairing and pings ask (a phone tab where an install is possible).
+    "/pwa_install.js": ("pwa_install.js", "text/javascript; charset=utf-8"),
     # The page half of a push tap: every page a Home Screen window can show loads it (the cockpit, the sign sheet, /pair).
     "/sw_open.js": ("sw_open.js", "text/javascript; charset=utf-8"),
+    "/pwa_resume.js": ("pwa_resume.js", "text/javascript; charset=utf-8"),
+    "/pwa_update.js": ("pwa_update.js", "text/javascript; charset=utf-8"),
     # The on-device push-tap trace: a token-free shell (urls without fragments, counts and step names only) that reads the
     # trace ring from this origin's Cache Storage. It does not load sw_open.js, so opening it never claims a pending tap.
     "/tap_trace": ("tap_trace.html", "text/html; charset=utf-8"),
