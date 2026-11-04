@@ -119,16 +119,19 @@ def test_a_stopresult_subclass_is_not_the_exact_answer(rig):
 
 
 @pytest.mark.parametrize("state", [ALIVE, FOGGY], ids=["alive", "unreadable"])
-def test_a_fire_not_proven_dead_is_never_ended_from_here(rig, state):
-    oid, _ = _session_row(rig)
+def test_a_live_or_unreadable_fire_is_ended_through_end_session(rig, state):
+    # S11b (Q2 = a): the fire's state decides nothing about whether the session may be ended
+    oid, key = _session_row(rig)
     launcher = Ender()
-    result = _executor(rig, oid, launcher, state).stop(10)
-    assert result.terminated is False and "not proven dead" in result.detail
-    assert launcher.ended == []
+    ex = _executor(rig, oid, launcher, state)
+    assert ex.fire_proven_dead(10) is False            # the lease-withholding probe still needs the death proven
+    result = ex.stop(10)
+    assert result.terminated is True and "ended" in result.detail
+    assert launcher.ended == [(key, 10.0)] and ex.end_unproven is False
 
 
 @pytest.mark.parametrize("how", ["absent", "garbage", "other-occurrence", "no-pid"])
-def test_a_fire_record_that_cannot_prove_death_ends_nothing(rig, how):
+def test_a_fire_record_that_cannot_prove_death_still_ends_the_session(rig, how):
     oid, _ = _session_row(rig, fire_record=how != "absent")
     path = ctl.fire_record_path(rig.store.directory, oid)
     if how == "garbage":
@@ -138,8 +141,9 @@ def test_a_fire_record_that_cannot_prove_death_ends_nothing(rig, how):
     elif how == "no-pid":
         path.write_text(json.dumps({"occurrence_id": oid, "started": "x", "args": "y"}))
     launcher = Ender()
-    assert _executor(rig, oid, launcher).stop(10).terminated is False
-    assert launcher.ended == []
+    ex = _executor(rig, oid, launcher)
+    assert ex.stop(10).terminated is True
+    assert len(launcher.ended) == 1 and ex.end_unproven is False    # no dead-fire proof: nothing to freeze on
 
 
 def test_a_launcher_with_no_end_session_ends_nothing(rig):
@@ -203,8 +207,12 @@ def test_a_row_whose_pinned_role_is_not_a_session_role_is_not_ended(rig, monkeyp
 def test_a_stop_that_raises_inside_is_not_a_confirmation(rig):
     oid, _ = _session_row(rig)
     boom = lambda rec, deadline: (_ for _ in ()).throw(RuntimeError("ps exploded"))   # noqa: E731
-    result = _executor(rig, oid, Ender(), boom).stop(10)
+    launcher = Ender(StopResult(False, "not proven"))
+    result = _executor(rig, oid, launcher, boom).stop(10)       # a probe that raised proved no death: not frozen
     assert result.terminated is False
+    ex = _executor(rig, oid, Ender(RuntimeError("front down")), DEAD)
+    ex.stop(10)
+    assert ex.end_unproven is True
 
 
 def test_end_unproven_marks_only_a_dead_fire_whose_end_failed_and_every_stop_resets_it(rig):
@@ -216,7 +224,7 @@ def test_end_unproven_marks_only_a_dead_fire_whose_end_failed_and_every_stop_res
     assert ex.end_unproven is False and ex.fire_proven_dead(10) is True       # the probe asks no end
     assert launcher.ended == []
     assert ex.stop(10).terminated is False and ex.end_unproven is True        # proven dead, the end failed
-    assert ex.stop(10).terminated is False and ex.end_unproven is False       # a later stop refused (alive): reset
+    assert ex.stop(10).terminated is False and ex.end_unproven is False       # a later stop, fire alive: reset
     raising = S.RowSessionExecutor(rig.store, _row(rig, oid), Ender(RuntimeError("front down")), fire_state=DEAD)
     assert raising.stop(10).terminated is False and raising.end_unproven is True   # an end that raised proved nothing
     proven = S.RowSessionExecutor(rig.store, _row(rig, oid), Ender(), fire_state=DEAD)
@@ -302,17 +310,38 @@ def _held_through_three_passes(rig, oid, of, att):
 
 
 @pytest.mark.parametrize("state", [ALIVE, FOGGY], ids=["alive", "unreadable"])
-def test_a_session_whose_fire_is_not_proven_dead_keeps_its_lease_and_is_never_taken_over(rig, state):
-    # F1 (r1): head ruling (1). A live or unreadable fire is held exactly as before S3: renewed, one attention row,
-    # never frozen into a takeover that would free the slot under a session that may still run.
+def test_a_live_fire_whose_end_is_unproven_keeps_its_lease_and_is_never_taken_over(rig, state):
+    # S11b: the end is asked of a live fire too; when it is NOT proven, the fire may still run, so the lease is renewed
+    # (never frozen into a takeover that would free the slot under a session that may still run), one attention row.
     oid, _ = _session_row(rig)
-    launcher = Ender()
+    launcher = Ender(StopResult(False, "S1 END not proven"))
     of = S.session_executor_of(rig.store, launcher, agent_id=rig.row(oid)["agent_id"], fire_state=state)
     att = Attention()
     _revoke(rig, oid)
     outs = _held_through_three_passes(rig, oid, of, att)
     assert all(o.asked == [oid] and o.unconfirmed == [oid] for o in outs)
-    assert launcher.ended == [] and att.calls == 1
+    assert len(launcher.ended) == 3 and att.calls == 1
+
+
+def test_a_reaper_end_of_a_live_fire_leaves_the_fires_finish_nothing_to_write(rig):
+    # S11b: due row, fire alive; the reaper ENDs it and settles; the fire's WAIT then returns and its finish is a no-op
+    oid, key = _session_row(rig)
+    clock = Clock(rig)
+    sup = _sup(rig, clock)
+    launcher = Ender(used=Usage(0, 10, 20, "stub"))
+    of = S.session_executor_of(rig.store, launcher, agent_id=rig.row(oid)["agent_id"], fire_state=ALIVE)
+    with rig.store.read() as c:
+        stop_at = json.loads(c.execute("SELECT spec FROM agent_specs WHERE spec_hash = ?",
+                                       (rig.row(oid)["spec_hash"],)).fetchone()[0])["stop_at"]
+    clock.advance(stop_at + 1)
+    out = sup.reap(of)
+    assert out.due == [oid] and out.ended == [oid] and out.frozen == []
+    assert (rig.row(oid)["state"], rig.row(oid)["reason"]) == ("stopped", "stop_at")
+    assert launcher.ended == [(key, float(supervise.STOP_DEADLINE_S))]
+    before = dict(rig.row(oid))
+    end = sup.finish(oid, _executor(rig, oid, launcher, ALIVE), ok=True)
+    assert (end.state, end.reason) == ("stopped", "stop_at") and end.ended.ended is False
+    assert rig.row(oid) == before
 
 
 def test_another_agents_session_row_is_never_asked_and_keeps_its_lease(rig):
@@ -327,11 +356,10 @@ def test_another_agents_session_row_is_never_asked_and_keeps_its_lease(rig):
     assert launcher.ended == [] and att.calls == 1
 
 
-@pytest.mark.parametrize("why", ["no-end-session", "no-record"])
-def test_a_refusal_before_the_dead_fire_proof_keeps_the_lease(rig, why):
-    # F1 (r1): the launcher has no end_session, or the record cannot prove the death: refused before the proof, held
-    oid, _ = _session_row(rig, fire_record=why != "no-record")
-    launcher = Stub() if why == "no-end-session" else Ender()
+def test_a_refusal_before_the_end_keeps_the_lease(rig):
+    # F1 (r1): the launcher has no end_session: refused before any end is asked, held
+    oid, _ = _session_row(rig)
+    launcher = Stub()
     of = S.session_executor_of(rig.store, launcher, agent_id=rig.row(oid)["agent_id"], fire_state=DEAD)
     _revoke(rig, oid)
     _held_through_three_passes(rig, oid, of, Attention())
@@ -359,7 +387,7 @@ def test_a_withheld_row_whose_stop_did_not_re_prove_the_death_is_renewed_not_fro
     # the freeze follows the stop's proof, never the probe's
     oid, _ = _session_row(rig)
     reads = iter([DEAD, FOGGY])
-    launcher = Ender()
+    launcher = Ender(StopResult(False, "S1 END not proven"))
     of = S.session_executor_of(rig.store, launcher, agent_id=rig.row(oid)["agent_id"],
                                fire_state=lambda r, d: next(reads)(r, d))
     clock = Clock(rig)
@@ -368,7 +396,7 @@ def test_a_withheld_row_whose_stop_did_not_re_prove_the_death_is_renewed_not_fro
     clock.advance(60)
     out = sup.reap(of)
     assert out.asked == [oid] and out.unconfirmed == [oid] and out.renewed == [oid] and out.frozen == []
-    assert launcher.ended == []
+    assert len(launcher.ended) == 1         # S11b: asked anyway; the fire not re-proven dead, so not frozen
 
 
 def test_a_dead_session_deferred_past_the_stop_budget_is_renewed_not_frozen(rig, monkeypatch):
