@@ -1686,14 +1686,23 @@ def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: 
     """:func:`answer_text` for the cockpit's band box, signed with the laptop key where the desk ``policy``
     (:data:`levain.desk_click.DESK_POLICY` by default) signs an information answer (policy (a), ``all``): the plan is
     made from the view the text names, one desk message is signed over its information entries, and the answers are
-    recorded with the signature only if the view is still the viewer's newest, checked inside the write. A signer
-    that cancels or times out leaves the line UNRECORDED: the whole line is refused (``ValueError``, nothing
-    recorded) so the box keeps his words, unlike a seat's typed line, which records unsigned. Under a policy that
-    leaves information unsigned (NP-A (b), ``authority``) the line is :func:`answer_text`, unsigned, raising no
-    sheet, except that a LINKED pick of the line is signed with its ruling (TERMSIGN L5b) whatever the policy: it is
-    an authority item, and the signature is the act. Each signing attempt is appended to
-    ``outcome``. A foreign store is ``ValueError`` as in :func:`answer_text`. ``unsigned`` False (the desk route):
-    a line nothing on which would be signed is :class:`DeskLineUnsigned`, never the ordinary unsigned write."""
+    recorded with the signature only if the view is still the viewer's newest, checked inside the write. Under the
+    ``all`` policy a signer that cancels or times out leaves the line UNRECORDED: the whole line is refused
+    (``ValueError``, nothing recorded) so the box keeps his words, unlike a seat's typed line, which records
+    unsigned. Under a policy that leaves information unsigned (NP-A (b), ``authority``, the default) the line is
+    :func:`answer_text`, unsigned, raising no sheet, except that a LINKED pick of the line is signed with its ruling
+    (TERMSIGN L5b) whatever the policy: it is an authority item, and the signature is the act. Under that policy a
+    ruling sign that is cancelled or times out does NOT refuse the line: the information answers on the same line
+    are recorded UNSIGNED (they are unsigned by policy), the linked pick records nothing and keeps its signing sheet
+    (``Applied.sheets``), and the route's reply is 200 with that sheet still owed. Each signing attempt is appended
+    to ``outcome``.
+
+    A ruling the queue APPLIED from the signed message stands whatever happens to the line after it: if the line's
+    write then raises anything (the view moved during the sheet, :class:`StaleBand`; a store failure; a refusal),
+    :class:`RuledNotRecorded` is raised with that cause, never the cause itself, so the route says the ruling was
+    applied and the item is still open (``ruled_not_recorded``), never ``stale_band`` / "nothing was recorded".
+    A foreign store is ``ValueError`` as in :func:`answer_text`. ``unsigned`` False (the desk route): a line nothing
+    on which would be signed is :class:`DeskLineUnsigned`, never the ordinary unsigned write."""
     from levain import desk_click
 
     signs_info = desk_click.requires_sign("information", desk_click.DESK_POLICY if policy is None else policy)
@@ -1718,12 +1727,14 @@ def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: 
     inner = _desk_typed_signer(store, text, surface=surface, origin=origin, view_id=view_id,
                                signer_factory=signer_factory, key_dir=key_dir, notify=notify, queue_for=queue_for,
                                sign_info=signs_info)
+    ruled: list[str] = []                       # the question ids whose ruling the queue applied from this line
 
     def sign_with(pairs: list[tuple[Any, Question]], rulings: Sequence[tuple[Any, Question]] = ()) -> Signing | None:
         got = inner(pairs, rulings)
         if got is not None:
             if outcome is not None:
                 outcome.append(got)
+            ruled.extend(got.ruled)
             if signs_info and got.state != "signed":
                 raise _DeskUnsigned(got)
         return got
@@ -1733,6 +1744,10 @@ def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: 
                           require=_still_newest(viewer, store_id, view_id))
     except _DeskUnsigned as stop:
         raise ValueError(f"Touch ID {stop.signing.reason or 'did not sign'}: nothing was recorded") from None
+    except Exception as exc:
+        if ruled:                               # the ruling stands; the answer did not record
+            raise RuledNotRecorded(exc) from None
+        raise
 
 
 class _DeskUnsigned(BaseException):
@@ -1998,14 +2013,26 @@ def _badge_cached(k: tuple[str, str]) -> str | None:
         return _badge_cache.get(k)
 
 
-def _badge_remember(k: tuple[str, str], verdict: str) -> None:
+def _badge_remember(k: tuple[str, str], verdict: str, token: object | None = None) -> bool:
     """Keep ``verdict`` for ``k``, evicting the oldest entries first, all under the badge lock: two workers never
-    evict the same key, and the cache never holds more than :data:`_BADGE_CACHE_MAX`."""
+    evict the same key, and the cache never holds more than :data:`_BADGE_CACHE_MAX`. With ``token`` (a worker's
+    claim on ``k``) the verdict is kept only if that claim still holds ``k``, checked under the same lock: a worker
+    whose claim expired and was taken again never overwrites the newer worker's verdict. True when kept."""
     with _badge_inflight_lock:
+        if token is not None and not _badge_holds(k, token):
+            return False
         if k not in _badge_cache:
             while _badge_cache and len(_badge_cache) >= _BADGE_CACHE_MAX:
                 _badge_cache.pop(next(iter(_badge_cache)))
         _badge_cache[k] = verdict
+        return True
+
+
+def _badge_holds(k: tuple[str, str], token: object) -> bool:
+    """Whether ``token``'s claim still holds ``k`` (not freed, not taken again by another worker after it expired).
+    Call under the badge lock."""
+    held = _badge_inflight.get(k)
+    return held is not None and held[0] is token
 
 
 def _badge_claim(k: tuple[str, str]) -> object | None:
@@ -2143,7 +2170,9 @@ def answer_badges(store: Any, question_ids: Sequence[str], *, deadline: float | 
     directory, store, ssh-keygen or sc_auth never holds it; a row with no verdict (cached or verified) by then is left
     out (no badge). A verdict reached later is kept for the next render; a signature a worker of an earlier render is
     still verifying gets no second verifier (that row shows no badge this time) unless that claim is older than
-    :data:`_BADGE_CLAIM_S`. Every claim a worker takes is freed when it ends, however it ends. Holds no store
+    :data:`_BADGE_CLAIM_S`; a worker whose claim expired and was taken again publishes nothing (neither to the cache
+    nor to its render), so a delayed old verdict never overwrites the newer worker's. Every claim a worker takes is
+    freed when it ends, however it ends. Holds no store
     transaction while it verifies (each read is its own). Never raises."""
     ids = [q for q in dict.fromkeys(question_ids) if isinstance(q, str)]
     if not ids:
@@ -2186,11 +2215,15 @@ def answer_badges(store: Any, question_ids: Sequence[str], *, deadline: float | 
             shared = _shared_ctk(ctk)
             for qid, k, token in claimed:
                 try:
-                    verdict = _badge_of(store, qid, key, shared, allowed)
+                    verdict = _badge_of(store, qid, key, shared, allowed, claim=(k, token))
                 except Exception:  # noqa: BLE001 - one row's failure is that row's empty badge
                     verdict = ""
                 try:
-                    found.put(qid, verdict)
+                    # published only while this worker's claim still holds the row: a claim that expired and was
+                    # taken again belongs to a newer verifier, whose verdict this older one never overwrites
+                    with _badge_inflight_lock:
+                        if _badge_holds(k, token):
+                            found.put(qid, verdict)
                 finally:
                     _badge_release(k, token)
         except Exception:  # noqa: BLE001 - a display aid never breaks the band, nor prints from its thread
@@ -2222,7 +2255,10 @@ def _shared_ctk(ctk: Callable[[str], tuple[bool | None, str]] | None) -> Callabl
 
 
 def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple[bool | None, str]],
-              origins: frozenset[str]) -> str:
+              origins: frozenset[str], *, claim: tuple[tuple[str, str], object] | None = None) -> str:
+    """One row's verdict (see :func:`answer_badge`), cached by its digest. ``claim`` (the worker of
+    :func:`answer_badges`: the key it claimed and its token): the verdict is cached only under that key and only
+    while the claim still holds it (:func:`_badge_remember`); ``None`` caches as before (the single-row reader)."""
     from levain.consent import terminal_sign as ts
 
     sign = answer_sign_of(store, question_id)
@@ -2277,7 +2313,10 @@ def _badge_of(store: Any, question_id: str, key: Any, ctk: Callable[[str], tuple
     else:
         verdict = f"signature failed ({got.reason})" if got.state == "failed" else ""
     if got.reason != "verifier-unavailable" and got.reason != "classifier-error":   # a passing failure is not kept
-        _badge_remember((question_id, digest), verdict)
+        if claim is None:
+            _badge_remember((question_id, digest), verdict)
+        elif claim[0] == (question_id, digest):      # a row that moved since the claim is verified afresh next time
+            _badge_remember(claim[0], verdict, token=claim[1])
     return verdict
 
 
