@@ -76,14 +76,24 @@ def dream_role() -> dict[str, Any]:
         "executor": "dream"}
 
 
-def dream_spec(role_hash: str) -> dict[str, Any]:
+#: ``input.source`` of a live install's spec
+LIVE_SOURCE = "the install's anneal store: episodes since its last wrap"
+#: ``input.source`` of a shadow install's spec starts with this; the rest is :func:`shadow_binding` of its facts
+SHADOW_SOURCE = ("a SHADOW of flow's dream, bound to these install facts (a change is a new spec, which needs a new "
+                 "signed link): ")
+
+
+def dream_spec(role_hash: str, binding: str | None = None) -> dict[str, Any]:
     """The AgentSpec template (§1.2). The zone is left unset: the install's default zone fills it (rule 6), and an
     install with none refuses, naming ``levain agents zone``. One ``output`` is the spec's shape; it carries the
-    morning card (the push output). The corpus and recovery outputs of §1.3 have no field in a spec."""
+    morning card (the push output). The corpus and recovery outputs of §1.3 have no field in a spec.
+
+    ``binding`` (:func:`shadow_binding`) makes it a SHADOW install's spec: the install facts are part of the signed
+    object, so a link signed for one shadow install never covers another, nor a live one (and the reverse)."""
     return {
         "name": NAME,
         "role": {"name": NAME, "role_hash": role_hash},
-        "input": {"source": "the install's anneal store: episodes since its last wrap", "liveness": LIVENESS},
+        "input": {"source": LIVE_SOURCE if binding is None else SHADOW_SOURCE + binding, "liveness": LIVENESS},
         "output": {"class": "push",
                    "destination": "the coordinator review queue, feed agent: one card per consolidating occurrence",
                    "reader": "flow at /morning; Phill only for authority_relevant cards",
@@ -109,17 +119,17 @@ class Registered:
     zone: str
 
 
-def register_dream(store: Any, *, revise: bool = False) -> Registered:
+def register_dream(store: Any, *, revise: bool = False, binding: str | None = None) -> Registered:
     """Register the role and the spec in ``store`` (an :class:`~levain.agents.store.AgentStore`). Idempotent: the same
     content registers nothing twice. Raises :class:`EnableRefused` with every refusal; nothing is written when any
-    rule refuses the spec."""
+    rule refuses the spec. ``binding`` is a shadow install's :func:`shadow_binding` (None: a live install)."""
     from levain.agents import refuse, role as _role, spec as _spec
     from levain.agents.store import get_default_zone
 
     zone = get_default_zone(store)
     role = _role.parse_role(dream_role())
     held = {a["name"] for a in _spec.list_agents(store)}
-    parsed = _spec.parse_spec(dream_spec(_role.role_hash(role)))
+    parsed = _spec.parse_spec(dream_spec(_role.role_hash(role), binding))
     if revise or _same(store, parsed, zone):
         held.discard(parsed["name"])
     problems = [str(r) for r in refuse.check_spec(parsed, role=role, default_zone=zone, names_held=held)]
@@ -153,20 +163,27 @@ def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expire
             f"counted as consolidated and are not offered again. Until: {expires}, review by the same date.")
 
 
-def shadow_signing_card_text(zone: str, *, flow_root: Path | str, scratch: Path | str, model: str, per_run_usd: float,
+def shadow_signing_card_text(zone: str, *, flow_root: Path | str, scratch: Path | str, coord_dir: Path | str,
+                             agent_dir: Path | str, flow_instructions: Path | str, model: str, per_run_usd: float,
                              night_usd: float, expires: str) -> str:
-    """The signing card's words for a SHADOW install (D1_EXECUTOR section 8): what it reads, where it writes and what
-    it costs, from the install's own facts and the caller's ``R``. The link it describes is the same spec_hash as a
-    live install's; the words differ because what the dream does under it differs."""
+    """The signing card's words for a SHADOW install (D1_EXECUTOR section 8): what it reads, every place it writes and
+    what it costs, from the install's own facts and the caller's ``R``. The spec the link signs binds these facts
+    (:func:`shadow_binding`), so the card describes the object signed."""
     return (f"Dream runs as a SHADOW of flow's dream, once a night between 22:00 and 05:00 ({zone}), and only for a "
-            f"day flow's own dream has committed. Its input is flow's committed pre-dream snapshot, read from "
-            f"{flow_root} (read only, hashes checked) and copied into the scratch store {scratch}. Its output goes to "
-            "that scratch store only: it never writes ~/.anneal-memory, flow's memory text or anything under flow's "
-            "state, and it never sends, pushes or publishes. Each night it files one comparison card (its text against "
-            f"flow's). It composes with {model}, a paid model call at list price, and spends at most "
-            f"${per_run_usd:.2f} a run and ${night_usd:.2f} a night (2 runs), the same limits as a live dream. Undo: "
-            "nothing to undo, the scratch store is a copy. Stop it with `levain agents pause`, `retire` or `revoke`, "
-            f"or by deleting the install facts file. Until: {expires}, review by the same date.")
+            f"day flow's own dream has committed. Its input is flow's committed pre-dream snapshot under {flow_root}, "
+            "read only, each file checked against the hash that snapshot's own manifest records, and copied into the "
+            f"scratch store {scratch}. It writes: that scratch store; one comparison card a night in the coordinator "
+            f"queue {coord_dir} (its composed text against flow's composed text, which is read as is); and its own "
+            f"run state plus a read-only copy of flow's instructions file {flow_instructions} in its agent store "
+            f"{agent_dir}. None of these may sit inside ~/.anneal-memory or {flow_root}; it never writes flow's memory "
+            "text, and it never sends, pushes or publishes. The compose is given read tools (Read, Glob, Grep) and no "
+            "write tool; this card does not bound what those read tools can open. It composes with "
+            f"{model}, a paid model call at list price, and spends at most ${per_run_usd:.2f} a run and "
+            f"${night_usd:.2f} a night (2 runs), the same limits as a live dream. These paths and the model are bound "
+            "into the spec this link signs: an enable that changes one writes a new spec (--revise), which needs a new "
+            "signed link, and a fire whose facts differ from its spec's refuses. Undo: nothing to undo, the scratch "
+            "store is a copy. Stop it with `levain agents pause`, `retire` or `revoke`, or by deleting the install "
+            f"facts file. Until: {expires}, review by the same date.")
 
 
 # ------------------------------------------------------------------------------------------------------ input check
@@ -753,28 +770,125 @@ def _fact_path(doc: Mapping[str, Any], key: str, path: Path, *, kind: str, writi
     return p
 
 
-def shadow_store_refusal(store_path: Path | str, flow_root: Path | str | None = None) -> str | None:
-    """Why ``store_path`` may not be a shadow install's scratch store, or None. Refused: a relative path; a store or a
-    store directory that RESOLVES (symlinks followed) inside the operator's live store ``~/.anneal-memory``
-    (case-insensitive); and, given ``flow_root``, one inside flow's ``state/dream`` root (a seed would write under
-    flow's state). The one check the enable, the read of the facts and the fire all call."""
+def shadow_store_refusal(store_path: Path | str, flow_root: Path | str | None = None, *,
+                         coord_dir: Path | str | None = None, agent_dir: Path | str | None = None) -> str | None:
+    """Why a shadow install may not write where its facts say, or None. Every directory a shadow writes is judged:
+    the scratch store and its directory (``store_path``), the coordinator queue its card is filed in (``coord_dir``)
+    and the agent store that holds its run state and instructions copy (``agent_dir``). Refused: a relative path, and
+    any of them that RESOLVES (symlinks followed, a resolve that fails refusing) inside the operator's live store
+    ``~/.anneal-memory`` (case-insensitive) or, given ``flow_root``, inside flow's ``state/dream`` root. The one check
+    the enable, the read of the facts, the fire and the night lock all call."""
     from levain.firing.isolation import _is_within_ci, flow_store_dir
 
     sp = Path(store_path).expanduser()
     if not sp.is_absolute():
         return f"store_path {str(store_path)!r} is not an absolute path"
-    live = flow_store_dir().resolve()
-    for p in (sp, sp.parent):
-        if _is_within_ci(p.resolve(), live):
-            return (f"a shadow store_path {str(store_path)!r} resolves inside the operator's live store "
-                    "(~/.anneal-memory): a shadow only ever seeds a scratch copy")
-    if flow_root is not None:
-        root = Path(flow_root).expanduser().resolve()
-        for p in (sp, sp.parent):
-            if _is_within_ci(p.resolve(), root):
-                return (f"a shadow store_path {str(store_path)!r} resolves inside flow's dream root {root}: a seed "
-                        "would write under flow's state")
+    named: list[tuple[str, Path]] = [("store_path", sp), ("store_path", sp.parent)]
+    for key, given in (("coord_dir", coord_dir), ("agent store", agent_dir)):
+        if given is not None:
+            p = Path(given).expanduser()
+            if not p.is_absolute():
+                return f"{key} {str(given)!r} is not an absolute path"
+            named.append((key, p))
+    try:
+        live = flow_store_dir().resolve()
+        root = None if flow_root is None else Path(flow_root).expanduser().resolve()
+        resolved = [(key, p, p.resolve()) for key, p in named]
+    except (OSError, RuntimeError) as exc:
+        return f"a shadow install path cannot be resolved ({type(exc).__name__}: {exc}); refusing"
+    for key, p, r in resolved:
+        if _is_within_ci(r, live):
+            return (f"a shadow {key} {str(p)!r} resolves inside the operator's live store (~/.anneal-memory): a "
+                    "shadow writes only its scratch copy, its card queue and its own agent store")
+        if root is not None and _is_within_ci(r, root):
+            return f"a shadow {key} {str(p)!r} resolves inside flow's dream root {root}: it would write under flow's state"
     return None
+
+
+def shadow_binding(*, shadow_flow_root: Path | str, store_path: Path | str, coord_dir: Path | str,
+                   cockpit_root: Path | str, flow_instructions: Path | str, model: str | None = None,
+                   claude_bin: str | None = None) -> str:
+    """The install facts a shadow's spec binds (:data:`SHADOW_SOURCE` + this is its ``input.source``): every path it
+    reads or writes, the authority root, the instructions SOURCE and the compose's model and binary, canonical JSON.
+    The instructions are bound by path, not by content: each seed re-copies flow's file so the night composes with
+    what flow's own dream read, and the card names the sha256 each night composed with."""
+    def p(v: Path | str) -> str:
+        return str(Path(v).expanduser())
+
+    return json.dumps({"flow_root": p(shadow_flow_root), "scratch_store": p(store_path), "coord_dir": p(coord_dir),
+                       "cockpit_root": p(cockpit_root), "flow_instructions": p(flow_instructions),
+                       "instructions_policy": "re-copied read-only at each seed",
+                       "model": model or "claude-opus-5-5", "claude_bin": claude_bin or "claude"}, sort_keys=True)
+
+
+def _binding_of_doc(doc: Mapping[str, Any]) -> str | None:
+    """:func:`shadow_binding` of a facts document (as :func:`install_doc` builds it), or None for a live one."""
+    if doc.get("shadow_flow_root") is None:
+        return None
+    return shadow_binding(shadow_flow_root=doc["shadow_flow_root"], store_path=doc["store_path"],
+                          coord_dir=doc["coord_dir"], cockpit_root=doc["cockpit_root"],
+                          flow_instructions=doc.get("flow_instructions") or "", model=doc.get("model"),
+                          claude_bin=doc.get("claude_bin"))
+
+
+def current_binding(agent_dir: Path | str) -> str | None:
+    """The binding of the facts file in ``agent_dir`` as it stands (None: no file, unreadable, or a live install)."""
+    try:
+        doc = json.loads((Path(agent_dir) / INSTALL_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    try:
+        return _binding_of_doc(doc)
+    except (KeyError, TypeError):
+        return None
+
+
+def _spec_source(agent_dir: Path | str, spec_hash: object) -> str:
+    """``input.source`` of the spec stored under ``spec_hash`` in the agent store at ``agent_dir`` (read only).
+    Raises :class:`InstallRefused` when it cannot be read."""
+    import sqlite3
+    from urllib.parse import quote
+
+    from levain.autonomic.db import DB_NAME
+
+    if not isinstance(spec_hash, str) or not spec_hash:
+        raise InstallRefused("the occurrence carries no spec_hash, so its install facts cannot be matched to a spec")
+    path = Path(agent_dir) / DB_NAME
+    try:
+        conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=5.0, isolation_level=None)
+        try:
+            row = conn.execute("SELECT spec FROM agent_specs WHERE spec_hash = ?", (spec_hash,)).fetchone()
+        finally:
+            conn.close()
+        source = json.loads(row[0])["input"]["source"] if row else None
+    except (sqlite3.Error, ValueError, KeyError, TypeError) as exc:
+        raise InstallRefused(f"the spec {spec_hash[:12]} cannot be read from {path} ({type(exc).__name__}: {exc})") \
+            from exc
+    if not isinstance(source, str):
+        raise InstallRefused(f"no spec {spec_hash[:12]} with an input source in {path}")
+    return source
+
+
+def check_bound(agent_dir: Path | str, row: Mapping[str, Any], inst: DreamInstall) -> None:
+    """Refuse (:class:`InstallRefused`) an occurrence whose spec does not bind ``inst``: a shadow install runs only
+    under the spec whose source is :data:`SHADOW_SOURCE` + its own :func:`shadow_binding`, and a live install never
+    runs under a shadow spec. The link signs the spec, so this is what makes a signature cover these facts only."""
+    source = _spec_source(agent_dir, row.get("spec_hash"))
+    if inst.shadow_flow_root is None:
+        if source.startswith(SHADOW_SOURCE):
+            raise InstallRefused("this install's facts are a live install, and the occurrence runs under a shadow "
+                                 "install's spec: a link signed for a shadow never runs a live dream")
+        return
+    want = SHADOW_SOURCE + shadow_binding(shadow_flow_root=inst.shadow_flow_root, store_path=inst.store_path,
+                                          coord_dir=inst.coord_dir, cockpit_root=inst.cockpit_root,
+                                          flow_instructions=inst.flow_instructions or "", model=inst.model,
+                                          claude_bin=inst.claude_bin)
+    if source != want:
+        raise InstallRefused("the shadow install facts are not the ones the occurrence's spec binds (they changed "
+                             "after that spec was registered, or it is not a shadow spec): run `levain dream enable` "
+                             "with these facts and --revise, and sign the new link")
 
 
 def copy_instructions(src: Path | str, dest: Path | str) -> str:
@@ -839,6 +953,8 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
         raise InstallRefused(f"{path} lacks zone")
     shadow_raw = doc.get("shadow_flow_root")
     shadow_root = None if shadow_raw is None else _fact_path(doc, "shadow_flow_root", path, kind="dir")
+    cockpit_root = _fact_path(doc, "cockpit_root", path, kind="dir")
+    coord_dir = _fact_path(doc, "coord_dir", path, kind="dir")
     if shadow_root is None:
         store_path = _fact_path(doc, "store_path", path, kind="file")
     else:
@@ -846,12 +962,10 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
         raw = doc.get("store_path")
         if not isinstance(raw, str) or not raw.strip():
             raise InstallRefused(f"{path}: store_path {raw!r} is not an absolute path")
-        why = shadow_store_refusal(raw, shadow_root)
+        why = shadow_store_refusal(raw, shadow_root, coord_dir=coord_dir, agent_dir=Path(agent_dir).absolute())
         if why:
             raise InstallRefused(f"{path}: {why}")
         store_path = Path(raw).expanduser()
-    cockpit_root = _fact_path(doc, "cockpit_root", path, kind="dir")
-    coord_dir = _fact_path(doc, "coord_dir", path, kind="dir")
     facts = doc.get("facts_path")
     if facts is not None and (not isinstance(facts, str) or not facts.strip()):
         raise InstallRefused(f"{path}: facts_path {facts!r} is not a path string")
@@ -879,6 +993,39 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
                         shadow_root, instr, src)
 
 
+def _prior_doc(path: Path) -> dict[str, Any]:
+    try:
+        prior = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}
+    return prior if isinstance(prior, dict) else {}
+
+
+def install_doc(agent_dir: Path | str, *, store_path: Path | str, cockpit_root: Path | str, coord_dir: Path | str,
+                zone: str, facts_path: Path | str | None = None, model: str | None = None,
+                claude_bin: str | None = None, shadow_flow_root: Path | str | None = None,
+                flow_instructions: Path | str | None = None) -> dict[str, Any]:
+    """The facts document :func:`write_install` would write for these arguments over the file in ``agent_dir`` (the
+    merge of the mode-agnostic optional facts included), with no check made and nothing written."""
+    prior = _prior_doc(Path(agent_dir) / INSTALL_FILE)
+    doc: dict[str, Any] = {"schema": INSTALL_SCHEMA, "store_path": str(store_path), "cockpit_root": str(cockpit_root),
+                           "coord_dir": str(coord_dir), "zone": zone}
+    for key, given in (("facts_path", facts_path), ("model", model), ("claude_bin", claude_bin)):
+        if given is not None:
+            doc[key] = str(given)
+        elif prior.get(key) is not None:
+            doc[key] = prior[key]
+    for key, given in (("shadow_flow_root", shadow_flow_root), ("flow_instructions", flow_instructions)):
+        if given is not None:
+            doc[key] = str(given)
+    return doc
+
+
+def install_binding(doc: Mapping[str, Any]) -> str | None:
+    """The spec binding of an :func:`install_doc` document: :func:`shadow_binding` for a shadow, None for a live one."""
+    return _binding_of_doc(doc)
+
+
 def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root: Path | str, coord_dir: Path | str,
                   zone: str, facts_path: Path | str | None = None, model: str | None = None,
                   claude_bin: str | None = None, shadow_flow_root: Path | str | None = None,
@@ -898,26 +1045,15 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
     ``replace_install`` is passed, since both kinds answer to the same signed link. A shadow write copies
     ``flow_instructions`` read-only to :data:`SHADOW_INSTRUCTIONS` beside the facts file before writing them."""
     import os
+    import stat
     import tempfile
 
     d = Path(agent_dir)
     path = d / INSTALL_FILE
-    doc: dict[str, Any] = {"schema": INSTALL_SCHEMA, "store_path": str(store_path), "cockpit_root": str(cockpit_root),
-                           "coord_dir": str(coord_dir), "zone": zone}
-    try:
-        prior = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
-        prior = {}
-    if not isinstance(prior, dict):
-        prior = {}
-    for key, given in (("facts_path", facts_path), ("model", model), ("claude_bin", claude_bin)):
-        if given is not None:
-            doc[key] = str(given)
-        elif prior.get(key) is not None:
-            doc[key] = prior[key]
-    for key, given in (("shadow_flow_root", shadow_flow_root), ("flow_instructions", flow_instructions)):
-        if given is not None:
-            doc[key] = str(given)
+    prior = _prior_doc(path)
+    doc = install_doc(agent_dir, store_path=store_path, cockpit_root=cockpit_root, coord_dir=coord_dir, zone=zone,
+                      facts_path=facts_path, model=model, claude_bin=claude_bin, shadow_flow_root=shadow_flow_root,
+                      flow_instructions=flow_instructions)
     shadow = "shadow_flow_root" in doc
     if prior and not replace_install:
         was = "shadow" if prior.get("shadow_flow_root") is not None else "live"
@@ -934,9 +1070,17 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
         if "flow_instructions" not in doc:
             raise InstallRefused(f"{path}: a shadow install needs flow_instructions (flow's instructions file)")
         _fact_path(doc, "flow_instructions", path, kind="file", writing=True)
-        why = shadow_store_refusal(store_path, root)
+        why = shadow_store_refusal(store_path, root, coord_dir=coord_dir, agent_dir=d.absolute())
         if why:
             raise InstallRefused(f"{path}: {why}")
+        dest = d / SHADOW_INSTRUCTIONS
+        try:
+            st = os.lstat(dest)
+        except FileNotFoundError:
+            st = None
+        if st is not None and not stat.S_ISREG(st.st_mode):
+            raise InstallRefused(f"{path}: the instructions copy's place {dest} holds something that is not a regular "
+                                 "file, so the copy could not be written")
         from levain.dream import shadow as _shadow
         scratch = Path(store_path).expanduser().parent
         if scratch.exists() and not scratch.is_dir():
@@ -993,6 +1137,7 @@ def install_on_input(agent_dir: Path | str, *, clock: Callable[[], datetime] | N
     ``missed`` past its grace), never as a quiet day."""
     def on_input(row: Mapping[str, Any]) -> bool:
         inst = read_install(agent_dir)
+        check_bound(agent_dir, row, inst)          # before a shadow seeds anything under facts its link never signed
         if inst.shadow_flow_root is not None:
             return bool_on_input(_shadow_check(inst, agent_dir))(row)
         return bool_on_input(make_on_input(inst.store_path, zone=inst.zone, agent_dir=agent_dir,
@@ -1038,6 +1183,7 @@ def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str,
                None)
     if row is None:
         raise ValueError(f"occurrence {occurrence_id} is not in the agent store at {store.directory}")
+    check_bound(store.directory, row, inst)
     is_manual = row.get("kind") == "manual"
     card_facts = {"day": _ready.occurrence_dream_day(row, inst.zone).isoformat(), "manual": is_manual,
                   "slot": None if is_manual else str(row.get("window_key") or "") or None}
@@ -1062,18 +1208,22 @@ def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str,
 
     saved_card = None
     if inst.shadow_flow_root is not None:
-        consolidate, saved_card = _shadow_run(inst, card_facts["day"], occurrence_id, occ_dir, consolidate)
+        consolidate, saved_card = _shadow_run(inst, card_facts["day"], occurrence_id, occ_dir, consolidate,
+                                              agent_dir=store.directory)
 
     return {"sup": sup, "store_path": inst.store_path, "occ_dir": occ_dir, "executor": executor,
             "consolidate": consolidate, "review_store": review_store, "saved_card": saved_card, **card_facts}
 
 
-def _shadow_run(inst: DreamInstall, day: str, occurrence_id: str, occ_dir: Path, consolidate: Callable[[], Any]):
+def _shadow_run(inst: DreamInstall, day: str, occurrence_id: str, occ_dir: Path, consolidate: Callable[[], Any], *,
+                agent_dir: Path | str | None = None):
     """``(consolidate, saved_card)`` for a shadow install: the consolidate runs under the scratch directory's night
-    lock and only on a store still seeded from THIS day's snapshot (the marker names the run), with flow's instructions
-    copy as the compose's instructions; the card is the comparison against flow's composed text, stamped with the
-    sha256 of the instructions copy the compose was given. Raises before the run exists when the scratch store is
-    refused (:func:`shadow_store_refusal`) or flow's day is not readable."""
+    lock and only on a store still seeded from THIS day's snapshot (the marker names the run). Under that lock the
+    agent store's instructions copy is copied once more, into the occurrence's own directory, and the compose is given
+    THAT file; the card's sha256 is read back from it, so the sha shown is the bytes composed with, a later enable
+    that replaces the agent store's copy cannot move it, and a card built after a crash and replay reads the same file.
+    Raises before the run exists when a write destination is refused (:func:`shadow_store_refusal`; ``agent_dir``
+    defaults to the instructions copy's directory) or flow's day is not readable."""
     import hashlib
 
     from levain.dream import executor as ex
@@ -1084,12 +1234,14 @@ def _shadow_run(inst: DreamInstall, day: str, occurrence_id: str, occ_dir: Path,
     # must not reach the night lock (which creates the scratch directory) with the live store. That check is relative to
     # $HOME, so the night lock's own guard (the store flow's snapshot manifest names as `anneal_db`) stays as the second
     # check: it catches flow's store wherever it lives, under another $HOME included.
-    why = shadow_store_refusal(inst.store_path, inst.shadow_flow_root)
+    if agent_dir is None and inst.instructions_path is not None:
+        agent_dir = Path(inst.instructions_path).parent
+    why = shadow_store_refusal(inst.store_path, inst.shadow_flow_root, coord_dir=inst.coord_dir, agent_dir=agent_dir)
     if why:
         raise InstallRefused(why)
     fd = _shadow.read_flow_day(inst.shadow_flow_root, day)
     instr = inst.instructions_path
-    stamp: dict[str, str] = {}
+    used = Path(occ_dir) / SHADOW_INSTRUCTIONS
 
     def guarded() -> Any:
         try:
@@ -1101,10 +1253,11 @@ def _shadow_run(inst: DreamInstall, day: str, occurrence_id: str, occ_dir: Path,
                 if not isinstance(marker, dict) or marker.get("run_id") != fd.run_id:
                     return ex.ConsolidateResult("precondition", 2, f"the shadow store is not seeded from flow's {fd.run_id}")
                 try:
-                    stamp["sha256"] = hashlib.sha256(Path(instr).read_bytes()).hexdigest()
+                    used.parent.mkdir(parents=True, exist_ok=True)
+                    copy_instructions(instr, used)
                 except OSError as exc:
                     return ex.ConsolidateResult("precondition", 2, f"the shadow's instructions copy {instr} cannot be "
-                                                                   f"read ({type(exc).__name__}: {exc})")
+                                                                   f"read or copied to {used} ({type(exc).__name__}: {exc})")
                 return consolidate_with_instructions()
         except _shadow.ShadowRefused as exc:
             return ex.ConsolidateResult("precondition", 2, f"shadow store busy or refused: {exc.why}")
@@ -1114,14 +1267,17 @@ def _shadow_run(inst: DreamInstall, day: str, occurrence_id: str, occ_dir: Path,
         mind = ex.ClaudeMind(inst.model, claude_bin=inst.claude_bin)
         return ex.consolidate_store(inst.store_path, mind=mind, composer=inst.model, max_seconds=ex.DREAM_BUDGET_S,
                                     budget=ex.Budget.for_model(inst.model), occurrence_dir=occ_dir,
-                                    instructions_path=instr, on_snapshot=on_snapshot, on_saved=on_saved,
+                                    instructions_path=used, on_snapshot=on_snapshot, on_saved=on_saved,
                                     label="levain dream shadow", handle_stop=True)
 
     def saved_card() -> _card.Card:
         _prior, saved = _card.texts_for(inst.store_path, occ_dir)
+        try:
+            sha = hashlib.sha256(used.read_bytes()).hexdigest()
+        except OSError:
+            sha = None
         return _shadow.shadow_card(fd, saved, occurrence=occurrence_id, occ_dir=occ_dir,
-                                   usage_doc=_usage.read_doc(occ_dir),
-                                   instructions=(Path(instr), stamp.get("sha256")))
+                                   usage_doc=_usage.read_doc(occ_dir), instructions=(used, sha))
 
     return guarded, saved_card
 

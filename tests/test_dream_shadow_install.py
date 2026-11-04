@@ -240,14 +240,29 @@ def test_the_fire_refuses_a_live_store_install_however_it_was_built(env, flow, t
 
 # ------------------------------------------------------------------------------------------------------ the input hook
 
-def _row(day=date(2026, 11, 2)):
-    return {"occurrence_id": "oc-x", "agent_id": "ag-1", "kind": "scheduled", "window_key": rd.window_key_for(day),
-            "launched_at": "2026-11-03T06:00:00Z"}
+def _register(ag, binding=None, *, revise=True):
+    """Register the dream in the agent store at ``ag``, bound to its facts file as it stands (or ``binding``)."""
+    from levain.agents.store import open_agent_store, set_default_zone
+
+    store = open_agent_store(ag)
+    set_default_zone(store, ZONE)
+    return da.register_dream(store, revise=revise, binding=da.current_binding(ag) if binding is None else binding)
+
+
+def _row(env=None, day=date(2026, 11, 2), spec_hash=None):
+    """An occurrence row; given ``env``, it runs under the dream spec bound to the facts in env's agent store."""
+    row = {"occurrence_id": "oc-x", "agent_id": "ag-1", "kind": "scheduled", "window_key": rd.window_key_for(day),
+           "launched_at": "2026-11-03T06:00:00Z"}
+    if spec_hash is not None:
+        row["spec_hash"] = spec_hash
+    elif env is not None:
+        row["spec_hash"] = _register(env["ag"]).spec_hash
+    return row
 
 
 def test_the_hook_is_flows_committed_day_then_a_seed_and_the_episode_check(env, flow):
     _shadow(env, flow)
-    assert da.install_on_input(env["ag"])(_row()) is True
+    assert da.install_on_input(env["ag"])(_row(env)) is True
     marker = json.loads((env["scratch"] / sh.MARKER).read_text())
     assert marker["run_id"] == RUN and (env["scratch"] / "memory.db").is_file()
 
@@ -255,13 +270,13 @@ def test_the_hook_is_flows_committed_day_then_a_seed_and_the_episode_check(env, 
 def test_a_day_flow_did_not_commit_is_quiet_and_seeds_nothing(env, flow):
     _shadow(env, flow)
     flow.ledger([flow.end(RUN, DAY, committed=False)])
-    assert da.install_on_input(env["ag"])(_row()) is False
+    assert da.install_on_input(env["ag"])(_row(env)) is False
     assert not env["scratch"].exists() or not (env["scratch"] / "memory.db").exists()
 
 
 def test_a_row_without_an_agent_id_is_dead_input_not_a_quiet_day(env, flow):
     _shadow(env, flow)
-    row = {k: v for k, v in _row().items() if k != "agent_id"}
+    row = {k: v for k, v in _row(env).items() if k != "agent_id"}
     with pytest.raises(da.InputUnreadable, match="agent_id"):
         da.install_on_input(env["ag"])(row)
 
@@ -271,19 +286,19 @@ def test_a_seed_whose_instructions_cannot_be_copied_is_dead_input(env, flow):
     os.chmod(env["instr"], 0)                         # still a file (the read of the facts passes), no longer readable
     try:
         with pytest.raises(da.InputUnreadable, match="after the seed"):
-            da.install_on_input(env["ag"])(_row())
+            da.install_on_input(env["ag"])(_row(env))
     finally:
         os.chmod(env["instr"], 0o600)
     env["instr"].unlink()                             # gone altogether: the facts are stale, also dead input
     with pytest.raises(da.InstallRefused, match="stale: flow_instructions"):
-        da.install_on_input(env["ag"])(_row())
+        da.install_on_input(env["ag"])(_row(env))
 
 
 # ------------------------------------------------------------------------------------------------------- the run body
 
 def _seeded(env, flow):
     _shadow(env, flow)
-    assert da.install_on_input(env["ag"])(_row()) is True
+    assert da.install_on_input(env["ag"])(_row(env)) is True
     return da.read_install(env["ag"])
 
 
@@ -300,9 +315,12 @@ def test_the_consolidate_gets_flows_instructions_and_runs_under_the_night_lock(e
         return ex.ConsolidateResult("saved", 0)
 
     monkeypatch.setattr(ex, "consolidate_store", fake)
-    run, _card = da._shadow_run(inst, DAY, "oc-x", env["scratch"] / "dream" / "oc-x", lambda: None)
+    occ = env["scratch"] / "dream" / "oc-x"
+    run, _card = da._shadow_run(inst, DAY, "oc-x", occ, lambda: None)
     assert run().outcome == "saved"
-    assert seen == {"instr": env["ag"] / da.SHADOW_INSTRUCTIONS, "model": inst.model}
+    # the compose reads the occurrence's own copy, made under the lock from the agent store's copy
+    assert seen == {"instr": occ / da.SHADOW_INSTRUCTIONS, "model": inst.model}
+    assert (occ / da.SHADOW_INSTRUCTIONS).read_text() == "flow's instructions"
 
 
 def test_a_store_not_seeded_from_this_days_snapshot_is_a_precondition_never_a_compose(env, flow, monkeypatch):
@@ -367,7 +385,7 @@ def test_each_seed_re_copies_flows_instructions_and_the_card_carries_the_copys_s
     old = hashlib.sha256(b"flow's instructions").hexdigest()[:16]
     assert any(x.startswith("shadow: instructions ") and old in x for x in first.body["own"])
     env["instr"].write_text("flow's instructions, revised", encoding="utf-8")
-    assert da.install_on_input(env["ag"])(_row()) is True
+    assert da.install_on_input(env["ag"])(_row(env)) is True
     assert inst.instructions_path.read_text() == "flow's instructions, revised"
     assert inst.instructions_path.stat().st_mode & 0o777 == 0o444
     second = _night(env, flow, inst, env["scratch"] / "dream" / "oc-2", monkeypatch)
@@ -388,6 +406,16 @@ def test_a_shadow_fire_runs_the_shadow_body_and_files_only_the_comparison(rig, e
     ag = rig.store.directory
     _shadow(env, flow, ag=ag)
     monkeypatch.setattr(rd, "occurrence_dream_day", lambda row, zone: date.fromisoformat(DAY))
+    monkeypatch.setattr(ex, "DreamExecutor", lambda **kw: Ex())
+    # the rig's link signs the rig's own spec, which binds none of these shadow facts: the hook and the fire refuse
+    with pytest.raises(da.InstallRefused, match="not the ones the occurrence's spec binds"):
+        da.install_on_input(ag)(rig.row(oid))
+    with pytest.raises(da.InstallRefused, match="not the ones the occurrence's spec binds"):
+        da.fire_factory(rig.store, oid, 0)
+    assert not env["scratch"].exists()                                     # nothing seeded under an unsigned spec
+    # stand the rig's spec in for the shadow spec bound to these facts (the binding itself is tested on its own)
+    want = da.SHADOW_SOURCE + da.current_binding(ag)
+    monkeypatch.setattr(da, "_spec_source", lambda agent_dir, spec_hash: want)
     assert da.install_on_input(ag)(rig.row(oid)) is True                   # the seed
     seen = {}
 
@@ -397,13 +425,13 @@ def test_a_shadow_fire_runs_the_shadow_body_and_files_only_the_comparison(rig, e
 
     monkeypatch.setattr(ex, "consolidate_store", compose)
     monkeypatch.setattr(cd, "texts_for", lambda db, occ_dir: ("", SHADOW_TEXT))
-    monkeypatch.setattr(ex, "DreamExecutor", lambda **kw: Ex())
     kw = da.fire_factory(rig.store, oid, 0)
     kw.pop("sup")                                                          # the rig's own supervisor holds the link
     rep = da.run_body(sup, oid, 0, **kw)
     assert rep.outcome == "saved" and rep.card == "filed" and rep.state == "done"
     assert rig.row(oid)["state"] == "done"
-    assert seen["store_path"] == env["kw"]["store_path"] and seen["instructions_path"] == ag / da.SHADOW_INSTRUCTIONS
+    assert seen["store_path"] == env["kw"]["store_path"]
+    assert seen["instructions_path"] == kw["occ_dir"] / da.SHADOW_INSTRUCTIONS
     items = review.list_items(kw["review_store"], feed=da.CARD_FEED)
     assert len(items) == 1                                                 # no consolidated card beside it
     own = items[0].body["own"]
@@ -508,28 +536,228 @@ def test_the_verb_refuses_a_silent_switch_and_names_a_replaced_one(env, flow, tm
     assert _enable(env, tmp_path, *_shadow_args(env, flow)) == 1
     assert "--replace-install" in capsys.readouterr().err
     assert (env["ag"] / da.INSTALL_FILE).read_bytes() == before and not (env["ag"] / da.SHADOW_INSTRUCTIONS).exists()
-    assert _enable(env, tmp_path, *_shadow_args(env, flow), "--replace-install") == 0
+    # the kind is bound into the spec too: the switch is a new version, so --revise as well, else nothing is written
+    assert _enable(env, tmp_path, *_shadow_args(env, flow), "--replace-install") == 1
+    assert "new signed link" in capsys.readouterr().err
+    assert (env["ag"] / da.INSTALL_FILE).read_bytes() == before and not (env["ag"] / da.SHADOW_INSTRUCTIONS).exists()
+    assert _enable(env, tmp_path, *_shadow_args(env, flow), "--replace-install", "--revise") == 0
     assert "replaced the live install with a shadow install" in capsys.readouterr().out
     assert _enable(env, tmp_path, "--store-dir", str(live.parent)) == 1
     assert "--replace-install" in capsys.readouterr().err
-    assert _enable(env, tmp_path, "--store-dir", str(live.parent), "--replace-install") == 0
-    assert "replaced the shadow install with a live install" in capsys.readouterr().out
-    assert da.install_kind(env["ag"]) == "live"
+    # back to live is the content of version 1, a revert the spec store refuses: the operator retires and registers
+    assert _enable(env, tmp_path, "--store-dir", str(live.parent), "--replace-install", "--revise") == 1
+    assert "revert" in capsys.readouterr().err
+    assert da.install_kind(env["ag"]) == "shadow"
 
 
 def test_the_shadow_signing_card_says_what_it_reads_where_it_writes_and_what_it_costs(env, flow, tmp_path, capsys):
     # F2: the words come from the install's facts and the executor's R, never a number typed into prose
-    assert _enable(env, tmp_path, *_shadow_args(env, flow), "--json") == 0
+    live = _live_db(tmp_path)
+    assert _enable(env, tmp_path, "--store-dir", str(live.parent), "--json") == 0
+    live_doc = json.loads(capsys.readouterr().out)
+    assert "always-loaded memory text" in live_doc["signing_card"]
+    assert _enable(env, tmp_path, *_shadow_args(env, flow), "--replace-install", "--revise", "--json") == 0
     doc = json.loads(capsys.readouterr().out)
     card = doc["signing_card"]
     r = ex.PER_RUN_LIMIT_USD_MICROS / 1_000_000
     inst = da.read_install(env["ag"])
-    assert "SHADOW" in card and str(flow.root) in card and str(inst.store_path.parent) in card
+    # every place it writes, named from the facts: scratch, the card's queue, its own agent store, the instructions copy
+    for where in (flow.root, inst.store_path.parent, inst.coord_dir, env["ag"], inst.flow_instructions):
+        assert str(where) in card
+    assert "SHADOW" in card and "Read, Glob, Grep" in card and "bound into the spec" in card
+    assert "checked against the hash that snapshot's own manifest records" in card and "read as is" in card
     assert inst.model in card and f"${r:.2f} a run" in card and f"${2 * r:.2f} a night" in card
     assert "always-loaded memory text" not in card and "rollback" not in card
     assert doc["install_kind"] == "shadow"
-    # the link is the same spec_hash as a live install's: the words differ, the signed object does not
-    live = _live_db(tmp_path)
-    assert _enable(env, tmp_path, "--store-dir", str(live.parent), "--replace-install", "--json") == 0
-    live_doc = json.loads(capsys.readouterr().out)
-    assert live_doc["spec_hash"] == doc["spec_hash"] and "always-loaded memory text" in live_doc["signing_card"]
+    # the signed object differs from the live one: a live link never covers the shadow, nor the reverse
+    assert doc["spec_hash"] != live_doc["spec_hash"]
+
+
+# ---------------------------------------------------------- L3 r1 #1: the signed spec binds the shadow install's facts
+
+def _spec_hash_of(env):
+    from levain.agents import spec as _spec
+    from levain.agents.store import open_agent_store
+
+    return {a["name"]: a for a in _spec.list_agents(open_agent_store(env["ag"]))}["dream"]
+
+
+def test_a_same_kind_re_enable_with_other_facts_needs_revise_and_a_new_link(env, flow, tmp_path, capsys):
+    # reproduced on d300015b: the re-enable below exited 0 with the old spec_hash, the facts moved under the old link
+    assert _enable(env, tmp_path, *_shadow_args(env, flow), "--json") == 0
+    first = json.loads(capsys.readouterr().out)["spec_hash"]
+    before = (env["ag"] / da.INSTALL_FILE).read_bytes()
+    other = tmp_path / "scratch2"
+    assert _enable(env, tmp_path, *_shadow_args(env, flow, scratch=other)) == 1
+    assert "new signed link" in capsys.readouterr().err
+    assert (env["ag"] / da.INSTALL_FILE).read_bytes() == before                 # nothing moved under the old link
+    assert _enable(env, tmp_path, *_shadow_args(env, flow, scratch=other), "--revise", "--json") == 0
+    second = json.loads(capsys.readouterr().out)["spec_hash"]
+    assert second != first and da.read_install(env["ag"]).store_path == other / "memory.db"
+    # an occurrence of the old spec (the one the old link signs) no longer matches the facts: hook and fire refuse
+    with pytest.raises(da.InstallRefused, match="not the ones the occurrence's spec binds"):
+        da.install_on_input(env["ag"])(_row(spec_hash=first))
+    assert not other.exists()
+    assert da.install_on_input(env["ag"])(_row(spec_hash=second)) is True
+
+
+def test_every_bound_fact_moves_the_spec(env, flow, tmp_path):
+    base = dict(shadow_flow_root=flow.root, store_path=env["kw"]["store_path"], coord_dir=env["kw"]["coord_dir"],
+                cockpit_root=env["kw"]["cockpit_root"], flow_instructions=env["instr"], model=None, claude_bin=None)
+    b0 = da.shadow_binding(**base)
+    for key, value in (("shadow_flow_root", tmp_path / "f2"), ("store_path", tmp_path / "s2" / "memory.db"),
+                       ("coord_dir", tmp_path / "c2"), ("cockpit_root", tmp_path / "k2"),
+                       ("flow_instructions", tmp_path / "i2.md"), ("model", "claude-other"), ("claude_bin", "/x/claude")):
+        assert da.shadow_binding(**{**base, key: value}) != b0, key
+    assert da.dream_spec("r" * 64)["input"]["source"] == da.LIVE_SOURCE
+    assert da.dream_spec("r" * 64, b0)["input"]["source"] == da.SHADOW_SOURCE + b0
+
+
+def test_a_hand_edited_fact_is_refused_at_the_hook_and_the_fire(env, flow, tmp_path):
+    path = _shadow(env, flow)
+    row = _row(env)
+    doc = json.loads(path.read_text())
+    path.write_text(json.dumps({**doc, "model": "claude-other"}))       # changed after the spec was registered
+    with pytest.raises(da.InstallRefused, match="not the ones the occurrence's spec binds"):
+        da.install_on_input(env["ag"])(row)
+    assert not env["scratch"].exists()
+
+
+def test_live_facts_never_run_under_a_shadow_spec(env, flow, tmp_path):
+    _shadow(env, flow)
+    shadow_hash = _register(env["ag"]).spec_hash
+    da.write_install(env["ag"], **_live_kw(env, tmp_path), replace_install=True)   # facts now live, spec still shadow
+    with pytest.raises(da.InstallRefused, match="link signed for a shadow never runs a live dream"):
+        da.check_bound(env["ag"], {"spec_hash": shadow_hash}, da.read_install(env["ag"]))
+    with pytest.raises(da.InstallRefused, match="no spec_hash"):
+        da.check_bound(env["ag"], {}, da.read_install(env["ag"]))
+
+
+# ---------------------------------------------------- L3 r1 #2: every write destination is containment-checked
+
+@pytest.mark.parametrize("where", ["coord-live", "coord-flow", "agent-live", "agent-flow"])
+def test_a_card_queue_or_agent_store_inside_a_protected_root_is_refused(env, flow, tmp_path, where):
+    # reproduced on d300015b: each of these wrote the facts file (the card queue and agent store were never judged)
+    live = tmp_path / "home" / ".anneal-memory"
+    target = {"coord-live": live / "q", "coord-flow": flow.root / "q", "agent-live": live / "ag",
+              "agent-flow": flow.root / "ag"}[where]
+    target.mkdir(parents=True)
+    kw = dict(env["kw"])
+    ag = env["ag"]
+    if where.startswith("coord"):
+        kw["coord_dir"] = target
+    else:
+        ag = target
+    with pytest.raises(da.InstallRefused, match="live store|flow's dream root"):
+        da.write_install(ag, **kw, shadow_flow_root=flow.root)
+    assert not (ag / da.INSTALL_FILE).exists() and not (ag / da.SHADOW_INSTRUCTIONS).exists()
+
+
+def test_a_hand_written_card_queue_in_the_live_store_is_refused_at_read_and_fire(env, flow, tmp_path):
+    path = _shadow(env, flow)
+    q = tmp_path / "home" / ".anneal-memory" / "q"
+    q.mkdir(parents=True)
+    path.write_text(json.dumps({**json.loads(path.read_text()), "coord_dir": str(q)}))
+    with pytest.raises(da.InstallRefused, match="coord_dir.*live store"):
+        da.read_install(env["ag"])
+    with pytest.raises(da.InstallRefused, match="coord_dir.*live store"):
+        da.fire_factory(SimpleNamespace(directory=env["ag"]), "oc-x", 0)
+    assert list(q.iterdir()) == []
+
+
+# ------------------------------------------- L3 r1 #3: a scratch dir made after the check is judged again under the lock
+
+def test_a_scratch_dir_swapped_for_a_symlink_after_the_check_is_refused_under_the_lock(env, flow, tmp_path,
+                                                                                       monkeypatch):
+    # reproduced on d300015b: the hook seeded through the symlink, writing lock, marker and db into the live store
+    _shadow(env, flow)                                     # scratch absent: the install's checks pass
+    row = _row(env)
+    live = tmp_path / "home" / ".anneal-memory" / "x"
+    live.mkdir(parents=True)
+    real = sh.read_flow_day
+
+    def swap_after_the_checks(root, day):                  # runs after read_install, before the night lock
+        if not env["scratch"].exists():
+            env["scratch"].symlink_to(live, target_is_directory=True)
+        return real(root, day)
+
+    monkeypatch.setattr(sh, "read_flow_day", swap_after_the_checks)
+    with pytest.raises(da.InputUnreadable, match="live store"):
+        da.install_on_input(env["ag"])(row)
+    assert list(live.iterdir()) == []
+
+
+def test_a_scratch_dir_holding_a_symlink_is_refused_under_the_lock(env, flow, tmp_path):
+    _shadow(env, flow)
+    row = _row(env)
+    env["scratch"].mkdir()
+    elsewhere = tmp_path / "elsewhere.txt"                 # a file the seed's marker write would follow and overwrite
+    elsewhere.write_text("not the shadow's")
+    (env["scratch"] / sh.MARKER).symlink_to(elsewhere)
+    with pytest.raises(da.InputUnreadable, match="symlink"):
+        da.install_on_input(env["ag"])(row)
+    assert elsewhere.read_text() == "not the shadow's"
+
+
+# -------------------------------------------- L3 r1 #4: the sha on the card is the sha of the bytes the compose was given
+
+def test_the_card_sha_is_the_composes_bytes_even_after_a_re_enable_and_a_replay(env, flow, monkeypatch):
+    # reproduced on d300015b: the card read the sha from a dict filled only by this process's compose, so a replayed
+    # card said "not recorded", and a re-enable between stamp and compose moved the file the compose read
+    inst = _seeded(env, flow)
+    occ = env["scratch"] / "dream" / "oc-r"
+    composed_with = {}
+
+    def compose(store_path, **kw):
+        composed_with["bytes"] = Path(kw["instructions_path"]).read_bytes()
+        # an enable replaces the agent store's copy while the compose runs (write_install takes no night lock)
+        os.chmod(inst.instructions_path, 0o600)
+        inst.instructions_path.write_text("replaced mid-compose", encoding="utf-8")
+        return ex.ConsolidateResult("saved", 0)
+
+    monkeypatch.setattr(ex, "consolidate_store", compose)
+    monkeypatch.setattr(cd, "texts_for", lambda db, occ_dir: ("", SHADOW_TEXT))
+    occ.mkdir(parents=True)
+    run, saved_card = da._shadow_run(inst, DAY, "oc-r", occ, lambda: None)
+    assert run().outcome == "saved"
+    want = hashlib.sha256(composed_with["bytes"]).hexdigest()[:16]
+    assert composed_with["bytes"] == b"flow's instructions"
+    lines = [x for x in saved_card().body["own"] if x.startswith("shadow: instructions ")]
+    assert len(lines) == 1 and want in lines[0]
+    # a replay: a fresh closure (a new process after a crash) that never ran the compose builds the same card line
+    _, replayed = da._shadow_run(inst, DAY, "oc-r", occ, lambda: None)
+    again = [x for x in replayed().body["own"] if x.startswith("shadow: instructions ")]
+    assert again == lines
+
+
+# -------------------------------------------------- L3 r1 #5: check_only judges the instructions copy's destination
+
+def test_a_directory_where_the_instructions_copy_goes_is_refused_before_anything_is_registered(env, flow, tmp_path,
+                                                                                            capsys):
+    # reproduced on d300015b: check_only passed, the dream registered, then the copy failed ("registered, but ...")
+    (env["ag"] / da.SHADOW_INSTRUCTIONS).mkdir()
+    with pytest.raises(da.InstallRefused, match="not a regular file"):
+        _shadow(env, flow, check_only=True)
+    assert _enable(env, tmp_path, *_shadow_args(env, flow)) == 1
+    assert "nothing was registered or written" in capsys.readouterr().err
+    assert "dream" not in _registered(env) and not (env["ag"] / da.INSTALL_FILE).exists()
+
+
+# ----------------------------------------------- deepseek MED (r1 #6): the card's text after the lock is released
+
+def test_a_re_seed_between_the_save_and_the_card_cannot_change_the_cards_text(env, flow, tmp_path):
+    # the card reads the occurrence's own composed file, pinned by the sha the manifest recorded at the save; a re-seed
+    # replaces the store's text, not that file, and a store text that moved fails the pin (the card refuses, never lies)
+    from levain.dream import snapshot as sn
+
+    inst = _seeded(env, flow)
+    occ = env["scratch"] / "dream" / "oc-s"
+    (occ / sn.SNAP_DIR).mkdir(parents=True)
+    (occ / "composed.continuity.md").write_text(SHADOW_TEXT, encoding="utf-8")
+    sha = hashlib.sha256(SHADOW_TEXT.encode()).hexdigest()
+    (occ / sn.SNAP_DIR / sn.MANIFEST).write_text(json.dumps({"files": {}, "post_files": {"continuity": sha}}))
+    assert da.install_on_input(env["ag"])(_row(env)) is True                  # the next slot re-seeds the scratch store
+    assert cd.texts_for(inst.store_path, occ)[1] == SHADOW_TEXT
+    (occ / "composed.continuity.md").unlink()
+    with pytest.raises(cd.CardError):
+        cd.texts_for(inst.store_path, occ)

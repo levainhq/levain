@@ -168,16 +168,24 @@ def run_dream_enable(args: argparse.Namespace) -> int:
               "--flow-instructions together; nothing was registered or written", file=sys.stderr)
         return 1
     was = da.install_kind(store.directory)
+    # the spec binds a shadow install's facts (the facts this call writes, or the file as it stands without
+    # --store-dir), so a link signed for one install never covers changed facts
+    binding = da.current_binding(store.directory)
     if args.store_dir is not None:
         try:
             _write_install_facts(args, store, str(zone), da, check_only=True)
+            binding = da.install_binding(da.install_doc(store.directory, **_install_kwargs(args, str(zone), da)))
         except (da.InstallRefused, OSError) as exc:
             print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
             return 1
     try:
-        reg = da.register_dream(store, revise=args.revise)
+        reg = da.register_dream(store, revise=args.revise, binding=binding)
     except da.EnableRefused as exc:
-        print(f"levain dream enable: {exc}", file=sys.stderr)
+        why = str(exc)
+        if binding is not None:
+            why += ("; a shadow install's facts are bound into the dream's spec, so changed facts are a new version "
+                    "(--revise), which needs a new signed link; nothing was written")
+        print(f"levain dream enable: {why}", file=sys.stderr)
         return 1
     except Exception as exc:  # noqa: BLE001 - nothing was reported as registered
         print(f"levain dream enable: cannot register ({type(exc).__name__}: {exc})", file=sys.stderr)
@@ -199,8 +207,9 @@ def run_dream_enable(args: argparse.Namespace) -> int:
         try:
             inst = da.read_install(store.directory)
             card = da.shadow_signing_card_text(str(zone), flow_root=inst.shadow_flow_root,
-                                               scratch=inst.store_path.parent, model=inst.model, per_run_usd=r,
-                                               night_usd=2 * r, expires=expires)
+                                               scratch=inst.store_path.parent, coord_dir=inst.coord_dir,
+                                               agent_dir=store.directory, flow_instructions=inst.flow_instructions,
+                                               model=inst.model, per_run_usd=r, night_usd=2 * r, expires=expires)
         except da.InstallRefused as exc:
             card = f"The shadow install's facts cannot be read ({exc}); no fire runs until `levain dream enable` " \
                    "writes them again."
@@ -229,6 +238,16 @@ def _write_install_facts(args: argparse.Namespace, store: object, zone: str, da:
     """Resolve the install this verb names to absolute paths and write the facts file in the agent store's directory
     (``check_only``: make every check :func:`levain.dream.agent.write_install` makes and write nothing). The live store
     is allowed for a live install (the scheduled dream targets it); only ``run`` is for copies."""
+    return da.write_install(store.directory, **_install_kwargs(args, zone, da), replace_install=args.replace_install,
+                            check_only=check_only)
+
+
+def _install_kwargs(args: argparse.Namespace, zone: str, da: object) -> dict:
+    """The verb's install facts resolved to absolute paths, as :func:`levain.dream.agent.write_install` and
+    :func:`levain.dream.agent.install_doc` take them. The shadow recipe: the scratch directory is created by the first
+    seed, never here; write_install refuses a write destination inside ~/.anneal-memory or flow's root, a non-empty
+    scratch directory with no shadow marker and a flow root without its ledger, then copies flow's instructions
+    read-only beside the facts."""
     from levain.coordinator.launch import default_coordinator_dir
 
     base = Path(args.store_dir).expanduser().resolve()
@@ -237,18 +256,13 @@ def _write_install_facts(args: argparse.Namespace, store: object, zone: str, da:
     cockpit = Path(args.cockpit_root if args.cockpit_root is not None else levain_home / "cockpit").expanduser().resolve()
     coord = Path(args.coord_dir if args.coord_dir is not None else default_coordinator_dir()).expanduser().resolve()
     if args.shadow_flow_root is not None:
-        # The shadow recipe: the scratch directory is created by the first seed, never here; write_install refuses a
-        # scratch store inside ~/.anneal-memory or flow's root, a non-empty scratch directory with no shadow marker,
-        # and a flow root without its ledger, then copies flow's instructions read-only beside the facts.
-        return da.write_install(store.directory, store_path=base / "memory.db", cockpit_root=cockpit, coord_dir=coord,
-                                zone=zone, shadow_flow_root=Path(args.shadow_flow_root).expanduser().resolve(),
-                                flow_instructions=Path(args.flow_instructions).expanduser().resolve(),
-                                replace_install=args.replace_install, check_only=check_only)
+        return dict(store_path=base / "memory.db", cockpit_root=cockpit, coord_dir=coord, zone=zone,
+                    shadow_flow_root=Path(args.shadow_flow_root).expanduser().resolve(),
+                    flow_instructions=Path(args.flow_instructions).expanduser().resolve())
     db = next((c for c in (base / "memory.db", base / ".levain" / "memory.db") if c.is_file()), None)
     if db is None:
         raise da.InstallRefused(f"no memory.db under {base} (looked in the dir and in .levain/)")
-    return da.write_install(store.directory, store_path=db.resolve(), cockpit_root=cockpit, coord_dir=coord, zone=zone,
-                            replace_install=args.replace_install, check_only=check_only)
+    return dict(store_path=db.resolve(), cockpit_root=cockpit, coord_dir=coord, zone=zone)
 
 
 def _refused(p: Path) -> str | None:

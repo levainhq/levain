@@ -267,12 +267,33 @@ def night_lock(flow_day: FlowDay, shadow_db: Path | str):
     another process holds raises :class:`ShadowRefused` (unreadable) with the store busy."""
     shadow_db = Path(shadow_db)
     _guard_target(shadow_db, flow_day)
+    _contained(shadow_db, flow_day)
     shadow_db.parent.mkdir(parents=True, exist_ok=True)
     handle = _lock(shadow_db.parent, NIGHT_LOCK)
     try:
+        # again at the point of use, under the lock: a scratch directory absent when the install was checked may have
+        # been made since (a symlink into a protected root included), and every write of the night follows this
+        _contained(shadow_db, flow_day)
         yield
     finally:
         _unlock(handle)
+
+
+def _contained(shadow_db: Path, flow_day: FlowDay) -> None:
+    """Refuse a scratch store that resolves inside ``~/.anneal-memory`` or flow's dream root
+    (:func:`levain.dream.agent.shadow_store_refusal`), and a scratch directory holding a symlink (a planted name the
+    seed's marker, sidecar or lock writes would follow)."""
+    from levain.dream.agent import shadow_store_refusal
+
+    why = shadow_store_refusal(shadow_db, flow_day.snap_dir.parent.parent)
+    if why:
+        raise ShadowRefused(KIND_UNREADABLE, why)
+    d = shadow_db.parent
+    if d.is_dir():
+        links = sorted(x.name for x in d.iterdir() if x.is_symlink())
+        if links:
+            raise ShadowRefused(KIND_UNREADABLE, f"the scratch directory {d} holds symlink(s) {', '.join(links)}; a "
+                                                 "seed writes only real files there")
 
 
 def _guard_target(shadow_db: Path, flow_day: FlowDay) -> None:
