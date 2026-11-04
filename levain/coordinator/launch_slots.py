@@ -149,11 +149,11 @@ def take(coord, launch_id: str, *, clock: Callable[[], datetime] | None = None,
     directory = agent_dir(coord.directory)
     if directory is None or not slot_state(directory, attention):
         return None
-    now = _now(clock)
     try:
         store = _open(directory)
         if store is None:
             return None
+        now = _now(clock)                                          # after the open: a lock wait must not age it
         with store.read() as conn:
             expired = slots.expired_launches(conn, now)
         over = slots.probe_over(expired, *dispatch_probes(coord.directory))   # outside the write lock
