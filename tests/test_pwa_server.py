@@ -98,12 +98,9 @@ def _plaintext_sent(tmp_path, monkeypatch, endpoint):
     return json.loads(seen[0])
 
 
-def test_apple_subscriptions_get_a_declarative_payload_with_the_legacy_members_and_no_actions(tmp_path, monkeypatch):
+def test_apple_gets_the_legacy_payload_while_the_url_is_relative_because_webkit_drops_a_relative_navigate(tmp_path, monkeypatch):
     got = _plaintext_sent(tmp_path, monkeypatch, APPLE)
-    assert got["web_push"] == 8030
-    assert got["notification"]["title"] == "Needs you" and got["notification"]["navigate"] == got["url"]
-    assert got["url"].startswith("/?view=") and got["title"] == "Needs you" and "ping" in got   # the legacy reader still works
-    assert "actions" not in got and "actions" not in got["notification"]
+    assert "web_push" not in got and "notification" not in got and got["title"] == "Needs you"
 
 
 def test_other_push_services_get_the_existing_payload_unchanged(tmp_path, monkeypatch):
@@ -111,11 +108,23 @@ def test_other_push_services_get_the_existing_payload_unchanged(tmp_path, monkey
     assert "web_push" not in got and "notification" not in got and "actions" not in got
 
 
-def test_a_declarative_payload_always_fits_one_push_request():
-    legacy = sender.build_payload("T" * 400, "x" * 6000, "tag", "/?view=needs", 7, 3)
+def test_a_declarative_payload_needs_an_absolute_url_keeps_the_legacy_members_and_has_no_actions_or_mutable():
+    legacy = sender.build_payload("Needs you", "A question", "tag", "https://cockpit.example/?view=needs", 7, 3)
+    got = json.loads(sender.declarative_payload(legacy))
+    assert got["web_push"] == 8030 and got["app_badge"] == 3
+    assert got["notification"] == {"title": "Needs you", "body": "A question", "tag": "tag",
+                                   "navigate": "https://cockpit.example/?view=needs"}
+    assert got["title"] == "Needs you" and got["ping"] == 7          # the legacy reader still works
+    assert "actions" not in got and "actions" not in got["notification"] and "mutable" not in got
+    relative = sender.build_payload("T", "b", "tag", "/?view=needs", 7)
+    assert sender.declarative_payload(relative) == relative
+
+
+def test_a_body_is_never_clipped_for_the_declarative_members():
+    legacy = sender.build_payload("T", "x" * 3000, "tag", "https://cockpit.example/?view=needs", 7)
     out = sender.declarative_payload(legacy)
-    assert len(out) <= ece.MAX_PLAINTEXT and json.loads(out)["web_push"] == 8030
-    assert json.loads(out)["app_badge"] == 3
+    assert out == legacy or json.loads(out)["body"] == json.loads(legacy)["body"]
+    assert len(out) <= ece.MAX_PLAINTEXT
 
 
 # --- (6) the manifest ---------------------------------------------------------------------------------------------
@@ -128,7 +137,9 @@ def test_the_manifest_carries_every_field_the_plan_lists():
     m = _manifest()
     for key in ("id", "scope", "description", "launch_handler", "shortcuts", "screenshots", "icons"):
         assert m.get(key), key
-    assert m["launch_handler"] == {"client_mode": "focus-existing"}
+    # not focus-existing: with no launchQueue consumer on the page, a shortcut tapped while the app is open would only
+    # focus it and never open its view (L3 r1)
+    assert m["launch_handler"] == {"client_mode": ["navigate-existing", "auto"]}
     assert m["scope"] == "/" and m["id"].startswith("/")
     purposes = {(i["purpose"], i["sizes"]) for i in m["icons"]}
     assert {("any", "192x192"), ("any", "512x512"), ("maskable", "192x192"), ("maskable", "512x512")} <= purposes
@@ -143,8 +154,8 @@ def test_the_manifest_carries_every_field_the_plan_lists():
         im = Image.open(STATIC / f"icon-maskable-{size}.png").convert("RGB")
         ring = max(1, size // 10)
         bg = im.getpixel((0, 0))
-        assert all(im.getpixel((x, y)) == bg for x in range(size) for y in (0, ring - 1, size - 1, size - ring))
-        assert all(im.getpixel((x, y)) == bg for y in range(size) for x in (0, ring - 1, size - 1, size - ring))
+        assert all(im.getpixel((x, y)) == bg for x in range(size) for y in range(size)
+                   if min(x, y, size - 1 - x, size - 1 - y) < ring)
 
 
 def test_the_shortcuts_open_views_the_phone_page_has():

@@ -91,34 +91,29 @@ def supports_declarative(endpoint: str) -> bool:
 
 
 def declarative_payload(data: bytes) -> bytes:
-    """``data`` (the legacy payload :func:`build_payload` made) with the Declarative Web Push members added:
-    ``web_push: 8030`` and ``notification {title, body, navigate, tag}`` (the same text and the same relative url, so
-    nothing here hard-codes an origin), ``app_badge`` when the legacy payload has ``badge``, and ``mutable: true`` so the
-    worker still runs on a client that has one (the tap trace, receipts and the badge stay the worker's). There is NO
-    ``actions`` member: a notification here has no buttons, on any platform. The legacy members stay at the top level, so
-    a client that does not read declarative payloads shows the push exactly as before. Returns ``data`` unchanged when the
-    added members would not fit :data:`ece.MAX_PLAINTEXT` after the body is clipped by as much as it takes."""
+    """``data`` (the legacy payload :func:`build_payload` made) with the Declarative Web Push members added, or ``data``
+    unchanged when they cannot be added correctly. WebKit parses ``navigate`` as an ABSOLUTE url and DROPS a declarative
+    message whose ``navigate`` is relative (the push service still answers 201, so a wrong one is a silent loss); this
+    server holds no origin (the cockpit's origin is configuration it must not hard-code), so the members are added only
+    when the payload's own ``url`` is already an absolute https url. Until a sender supplies one this is the identity, and
+    every push stays the legacy payload. Added: ``web_push: 8030`` and ``notification {title, body, navigate, tag}``,
+    ``app_badge`` when the legacy payload has ``badge``. Not added: ``mutable`` (a mutable push reaches the worker with
+    ``event.data`` null, which the worker's reader would show as an empty notification) and NO ``actions``, ever. The
+    legacy members stay at the top level for a client that does not read declarative payloads. The body is never clipped
+    to make room: if the doubled payload does not fit :data:`ece.MAX_PLAINTEXT`, the legacy bytes go out whole."""
     try:
         legacy = json.loads(data.decode("utf-8"))
-        notif = {"title": legacy["title"], "body": legacy["body"], "navigate": legacy["url"]}
-        if legacy.get("tag"):
-            notif["tag"] = legacy["tag"]
-    except (ValueError, KeyError, TypeError, AttributeError):
-        return data
-    out = {"web_push": 8030, "notification": notif, **legacy, "mutable": True}
-    if isinstance(legacy.get("badge"), int):
-        out["app_badge"] = legacy["badge"]
-    # the body appears twice now: clip it (both copies) until the whole fits
-    body = legacy["body"]
-    for _ in range(40):
+        url = legacy["url"]
+        if not (isinstance(url, str) and url.startswith("https://") and urlsplit(url).hostname):
+            return data
+        notif = {"title": legacy["title"], "body": legacy["body"], "navigate": url, "tag": legacy.get("tag") or "levain"}
+        out = {**legacy, "web_push": 8030, "notification": notif}
+        if isinstance(legacy.get("badge"), int):
+            out["app_badge"] = legacy["badge"]
         enc = _dumps(out)
-        if len(enc) <= ece.MAX_PLAINTEXT:
-            return enc
-        if not body:
-            break
-        body = _fit(body, _jlen(body) // 2) if _jlen(body) > 8 else ""
-        out["body"] = notif["body"] = body
-    return data
+    except Exception:   # noqa: BLE001 - never fails a send: the legacy payload goes out
+        return data
+    return enc if len(enc) <= ece.MAX_PLAINTEXT else data
 
 
 def topic_for(ref: str | None) -> str | None:
