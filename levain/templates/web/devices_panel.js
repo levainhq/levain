@@ -462,6 +462,12 @@
     }
     if (!pushKey) return;                               // this cockpit serves no web push: no row
     pingRow.hidden = false;
+    // a phone tab where an install is possible: pings are the installed app's, so no Turn on here (pwa_install.js)
+    if (window.levainPwa && typeof window.levainPwa.gated === "function" && window.levainPwa.gated()) {
+      pingBtn.hidden = true; pingBtn.dataset.on = "";
+      pingState.textContent = window.levainPwa.words();
+      return;
+    }
     if (!PUSH_OK) {
       // no live Turn on without the push API: the words say what to do instead
       pingBtn.hidden = true; pingBtn.dataset.on = "";   // hidden, not disabled: a click that still arrives reaches turnOn(), which answers in words
@@ -479,7 +485,7 @@
       : "off: turn on to be pinged here when the cockpit needs you";
   }
   async function turnOn() {
-    if (!PUSH_OK) { pings(); return; }   // no Notification here: calling it would throw; the pings row already holds the words, once
+    if (!PUSH_OK || (window.levainPwa && typeof window.levainPwa.gated === "function" && window.levainPwa.gated())) { pings(); return; }   // no Notification here: calling it would throw; the pings row already holds the words, once
     pingBtn.disabled = true; say("");
     let sub = null;
     try {
