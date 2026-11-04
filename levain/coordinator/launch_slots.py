@@ -12,8 +12,8 @@ The slot is taken and released in the agent store's own transactions. What this 
   ``<levain home>/coordinator``. Only the install's own coordinator directory is slotted (:func:`agent_dir`): a
   coordinator store anywhere else (a test's, a copy's) has no agent store beside it and launches unslotted, so it never
   writes the operator's real ``autonomic.db``.
-* **The fallback.** The agent schema is checked once per process per store (:func:`slot_state`, a read that writes and
-  creates nothing). No agent schema, or a ``/3`` store, launches unslotted and silent. Any other reason launches
+* **The fallback.** The agent schema is checked per process per store (:func:`slot_state`, a read that writes and
+  creates nothing; a refusal or the no-schema answer is kept, any other fault is asked again). No agent schema, or a ``/3`` store, launches unslotted and silent. Any other reason launches
   unslotted with one attention row keyed ``agent-schema-refused``. The agent schema never refuses a launch.
 * **No slot free.** :class:`SlotFull`: the launch stays pending and the thread stays queued, as for every other
   refusal that leaves a launch pending.
@@ -22,7 +22,11 @@ The slot is taken and released in the agent store's own transactions. What this 
   :func:`levain.agents.controller.dispatch_probes`), and :func:`sweep` releases it once the launch is over.
 
 An unreadable slot table or a garbled cap is a refusal that leaves the launch pending (:class:`SlotFault`): the cap
-fails closed, as on the agent side. Only the agent SCHEMA fails open.
+fails closed, as on the agent side. Only the agent SCHEMA fails open. A garbled cap has no repair surface (no CLI
+writes ``max_slots``): it is repaired in the store by hand.
+
+Only a coordinator launch takes a slot here. A spawned worker is capped by ``levain.coordinator.lease.MAX_SPAWNS_LIVE``
+and takes none; "slot" in this module is always the agent slot of ``agent_slots``.
 """
 from __future__ import annotations
 
@@ -42,7 +46,8 @@ ATTENTION_KEY = "agent-schema-refused"
 _UNSLOTTED = "unslotted"
 _SLOTS = "slots"
 
-# per process, per agent store directory: (mode, reason). The answer of the first schema check is kept (A0 §2.4)
+# per process, per agent store directory: (mode, reason). A refusal and the no-schema answer are kept (A0 §2.4);
+# a transient fault is not (slot_state)
 _STATE: dict[str, tuple[str, str | None]] = {}
 _RAISED: set[str] = set()
 
@@ -90,22 +95,29 @@ def agent_dir(coordinator_dir: Path | str) -> Path | None:
 
 
 def slot_state(directory: Path, attention: Callable[[str, str], None] | None = None) -> bool:
-    """True when launches take slots on the agent store at ``directory``; False when they launch unslotted. The schema
-    check runs once per process per directory and its answer is kept; the attention row is raised at most once per
-    process."""
+    """True when launches take slots on the agent store at ``directory``; False when they launch unslotted. A refusal
+    (``AgentStoreRefused``) and the no-schema / ``/3`` answer are KEPT for the process, as A0 §2.4 says. Any other
+    fault (a locked database, an ``OSError``) says nothing about the schema: that call launches unslotted, the answer
+    is NOT kept, and the next call checks again.
+
+    The attention row is a line on stderr, ``attention [agent-schema-refused]: ...``, raised at most once per process
+    per directory (the agent store has no attention table and no coordinator-side writer exists; the shape is
+    ``levain.agents.cli._raise_attention``'s). A transient fault is therefore heard once, not on every launch it
+    touches."""
     from levain.agents.store import STORE_V3_REASON, AgentStoreRefused, open_agent_store_view
 
     key = str(directory)
-    if key not in _STATE:
+    answer = _STATE.get(key)
+    if answer is None:
         try:
             view = open_agent_store_view(directory)
         except AgentStoreRefused as exc:
-            _STATE[key] = (_UNSLOTTED, None if str(exc) == STORE_V3_REASON else str(exc))
+            answer = _STATE[key] = (_UNSLOTTED, None if str(exc) == STORE_V3_REASON else str(exc))
         except Exception as exc:  # noqa: BLE001 - nothing about the agent store may refuse a coordinator launch
-            _STATE[key] = (_UNSLOTTED, f"{type(exc).__name__}: {exc}"[:300])
+            answer = (_UNSLOTTED, f"{type(exc).__name__}: {exc}"[:300])        # this call only: not kept
         else:
-            _STATE[key] = (_UNSLOTTED, None) if view.path is None else (_SLOTS, None)
-    mode, reason = _STATE[key]
+            answer = _STATE[key] = (_UNSLOTTED, None) if view.path is None else (_SLOTS, None)
+    mode, reason = answer
     if reason is not None and key not in _RAISED:
         _RAISED.add(key)
         try:
@@ -137,11 +149,11 @@ def take(coord, launch_id: str, *, clock: Callable[[], datetime] | None = None,
     directory = agent_dir(coord.directory)
     if directory is None or not slot_state(directory, attention):
         return None
-    store = _open(directory)
-    if store is None:
-        return None
-    now = _now(clock)
     try:
+        store = _open(directory)
+        if store is None:
+            return None
+        now = _now(clock)                                          # after the open: a lock wait must not age it
         with store.read() as conn:
             expired = slots.expired_launches(conn, now)
         over = slots.probe_over(expired, *dispatch_probes(coord.directory))   # outside the write lock
@@ -161,10 +173,10 @@ def release(hold: Hold) -> bool:
     A hold this call did not take is not released."""
     if not hold.fresh:
         return False
-    store = _open(hold.directory)
-    if store is None:
-        return False
     try:
+        store = _open(hold.directory)
+        if store is None:
+            return False
         with store.write() as conn:
             return slots.release(conn, hold.launch_id)
     except Exception:  # noqa: BLE001 - see the docstring

@@ -5,6 +5,11 @@ A launch row (:mod:`levain.coordinator.lease`) is what was asked for; this modul
 (:func:`levain.coordinator.door.launch_refusal`; a refusal leaves the launch pending). For harness ``claude`` it then
 does, in order:
 
+  0. a coordinator launch (never a spawned worker, which :data:`levain.coordinator.lease.MAX_SPAWNS_LIVE` caps) takes
+     one AGENT slot of the table the named fires share (:mod:`levain.coordinator.launch_slots`, P6-3b); a full table
+     leaves the launch pending. It is taken after the checks of steps 2 and 3 and just before step 1's claim, so a
+     refused launch takes none; a launch that does not start releases it, except one whose claim another process
+     won, which the watcher's sweep frees once the launch is over;
   1. the one-spawner compare-and-set (:func:`levain.coordinator.lease.claim_spawn`): still pending, in time, under the
      live lease's token, and nobody else started it. A loser spawns nothing. The claim
      (:meth:`levain.coordinator.store.CoordStore.launch_claim_spawn`) also refuses a worker whose thread's budget
@@ -203,7 +208,7 @@ def _worker_check(ln: Any, store: Any = None) -> tuple[WorkerRefusal | None, str
 
 def _refuse_worker(store: Any, ln: Any) -> str:
     """A pending spawned worker :func:`worker_refusal` refused, before any spawn claim: written ``failed`` (cause
-    :data:`levain.coordinator.lease.SPAWN_REFUSED`) at once, so it stops holding a live-spawn slot; what happened, in
+    :data:`levain.coordinator.lease.SPAWN_REFUSED`) at once, so it stops counting against the live-spawn cap (MAX_SPAWNS_LIVE); what happened, in
     words. A process that claimed its spawn meanwhile keeps it (nothing is written)."""
     try:
         got = store.launch_refuse_worker(ln.launch_id)
@@ -211,7 +216,7 @@ def _refuse_worker(store: Any, ln: Any) -> str:
         return f"launch {ln.launch_id} could not be written failed ({exc}), left pending until {ln.until}"
     if got is None:
         return f"launch {ln.launch_id} moved on meanwhile, nothing written"
-    return f"launch {ln.launch_id} written failed: {got.cause}; it holds no spawn slot"
+    return f"launch {ln.launch_id} written failed: {got.cause}; it no longer counts against the live-spawn cap"
 
 
 def worker_kind(kind: str, requested: str | None = None) -> str | None:
@@ -981,7 +986,7 @@ def _launch_session(store: CoordStore, launch_id: str, holds: list[Any] | None =
     run BEFORE the spawn claim: a refusal there writes nothing and leaves the launch pending, to be started once it is
     fixed or to expire unspawned, which is no death (L3 r1 G7). The one exception is a spawned worker
     :func:`worker_refusal` refuses for a cause that is not transient: it can never start as asked, so it is written
-    ``failed`` at once (:func:`_refuse_worker`) and stops holding a spawn slot. A Ctrl-C after the spawn stops the session and
+    ``failed`` at once (:func:`_refuse_worker`) and stops counting against the live-spawn cap. A Ctrl-C after the spawn stops the session and
     propagates, leaving the launch pending until it expires at LAUNCH_TTL."""
     ln = store.launch(launch_id)
     if ln is None:
@@ -1035,20 +1040,28 @@ def _launch_session(store: CoordStore, launch_id: str, holds: list[Any] | None =
     held = _handover_blocked(store, exe_, env_)
     if held:
         return left(f"{held}; retried when it is gone")
-    # the slot (P6-3b): taken before the spawn claim, so a full cap leaves the launch pending like every other refusal
-    # here; whoever does not start the launch releases it (launch_session), and the watcher's sweep renews or releases it
+    # the AGENT slot (P6-3b; the table the named fires share, ``agent_slots``, not lease.MAX_SPAWNS_LIVE's cap on
+    # spawned workers): only a coordinator launch takes one, before the spawn claim, so a full cap leaves the launch
+    # pending like every other refusal here. A spawned worker is already capped by MAX_SPAWNS_LIVE and takes none.
+    # Whoever does not start the launch releases it (launch_session), and the watcher's sweep renews or releases it
     from levain.coordinator import launch_slots
 
-    try:
-        hold = launch_slots.take(store, launch_id)
-    except launch_slots.SlotFull as exc:
-        return left(f"{exc}; retried when one is free")
-    except launch_slots.SlotFault as exc:
-        return left(str(exc))
-    if hold is not None and holds is not None:
-        holds.append(hold)
+    hold = None
+    if ln.role == "coordinator":
+        try:
+            hold = launch_slots.take(store, launch_id)
+        except launch_slots.SlotFull as exc:
+            return left(f"{exc}; retried when one is free")
+        except launch_slots.SlotFault as exc:
+            return left(str(exc))
+        if hold is not None and holds is not None:
+            holds.append(hold)
     got, why = store.launch_claim_spawn(launch_id, os.getpid())
     if why is not None:
+        # a refused claim is not this call's to release over: another pass may hold the spawn (and rely on the slot
+        # this call took or found); a refusal that leaves the launch pending keeps the slot to the watcher's sweep
+        if hold is not None and holds is not None:
+            holds.remove(hold)
         return Outcome(launch_id, False, refusal=why)
     if checked is not None:
         got = dataclasses.replace(got, cwd=checked)
@@ -1239,7 +1252,7 @@ def watch_once(store: CoordStore) -> list[str]:
           its one-spawner compare-and-set makes a double start impossible), so a drop written from the phone or the
           cockpit, which start nothing themselves, still gets its coordinator. A claude worker launch that names a
           spawned role is started the same way; one :func:`worker_refusal` refuses for good is written ``failed``
-          (cause ``spawn refused``) at once, so it holds no spawn slot; one refused for a transient cause (a read that
+          (cause ``spawn refused``) at once, so it counts no more against the live-spawn cap; one refused for a transient cause (a read that
           failed just now), or a worker with no role, is left pending;
       (b) an ``active`` claude launch whose session ``claude agents --json`` lists in neither of two reads
           :data:`UNLISTED_RECHECK` seconds apart is written ``ended``: ``0 turns`` for a coordinator that wrote
@@ -1494,6 +1507,7 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
     # outright stays pending until someone writes it expired, and only then does (d) stop the session it left
     _retire_removed(store, lines)
     store.coord_status()
+    lines.extend(_sweep_slots(store))          # a launch that ended between passes frees its slot before a start needs it
     for ln in store.launches_unspawned():
         if ln.harness != "claude":
             lines.append(f"launch {ln.launch_id}: a {ln.harness} launch; only claude is built, left pending")
@@ -1579,6 +1593,9 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
                      f"{_stop(exe, hid, cwd=str(store.directory), env=env)}")
     # the fresh coordinators start after (d) stopped the done ones they replace; a fault starting one is a line, so
     # the briefs below are still removed
+    # the launch slots of the launches this pass ended are freed first: a replacement coordinator is started below
+    # while the one it replaces would otherwise still hold its slot, and a full table would refuse it for a pass
+    lines.extend(_sweep_slots(store))                          # never raises
     for launch_id in fresh:
         try:
             got = launch_session(store, launch_id)
