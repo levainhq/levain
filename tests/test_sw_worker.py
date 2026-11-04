@@ -475,3 +475,19 @@ def test_a_restore_after_a_failed_put_keeps_every_header_of_the_cached_shell() -
     got = _fetch(url="https://box.example/", net="ok", shell=True, shellHtml=SHELL_HTML, shellHeaders={"content-security-policy": csp},
                  cached="/dashboard.css", html=html, putFail="/")
     assert _whole(got)["/"] == SHELL_HTML and got["rootCsp"] == [csp], got
+
+
+@needs_node
+def test_an_offline_asset_request_answers_while_a_write_through_put_never_settles() -> None:
+    """Fix round 5: the offline lookup used to join the shell-mutation chain, so one never-settling put left every offline
+    script/style request pending (a hung page). Red on 39be06f7: the offline request times out."""
+    got = _run("hold", json.dumps({"shellHtml": SHELL_HTML, "key": "/dashboard.css", "hang": True}))
+    assert got["liveBody"] == "LIVE /dashboard.css", got
+    assert got["offline"] == {"status": 200, "body": "CACHED /dashboard.css"}, got
+
+
+@needs_node
+def test_a_failing_asset_write_through_drains_its_copy() -> None:
+    """Fix round 5: a put that throws left the tee branch unread. Red on 39be06f7: copyDrained is absent."""
+    got = _run("hold", json.dumps({"shellHtml": SHELL_HTML, "key": "/dashboard.css", "putFail": True}))
+    assert got["copyDrained"] is True, got

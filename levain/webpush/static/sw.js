@@ -259,12 +259,12 @@ async function carryShellForwardNow() {
     // Only the old '/' and exactly the assets it names, each held to the same gate as a fresh write. An old generation
     // that fails it (a missing or query-mismatched asset, an HTML body under a script key) carries NOTHING: the app falls
     // to the network, honest, rather than a half shell. Everything else in the old cache is dropped with it.
-    if (!shellCacheable(page.clone())) { drain(page); return; }
+    if (!shellCacheable(page)) { drain(page); return; }   // headers only; the body stays unread for the clone below
     const html = await page.clone().text();
     const staged = [];
     for (const a of shellAssets(html)) {
       const hit = await from.match(a.key);
-      if (!assetOk(hit, a.kind)) { drain(hit); return; }
+      if (!assetOk(hit, a.kind)) { drain(hit); drain(page); return; }
       staged.push([a.key, new Response(await hit.arrayBuffer(), { status: 200, headers: { 'content-type': hit.headers.get('content-type') } })]);
     }
     const to = await caches.open(SHELL_CACHE);
@@ -308,7 +308,7 @@ async function commitShell(resp) {
       return [a.key, new Response(await r.arrayBuffer(), { status: 200, headers: { 'content-type': r.headers.get('content-type') } })];
     } catch (_) { return null; }
   }));
-  if (staged.some((x) => !x)) return false;
+  if (staged.some((x) => !x)) { drain(resp); return false; }
   return serial(() => writeShell(resp, staged));
 }
 async function writeShell(resp, staged) {
@@ -415,18 +415,17 @@ async function assetNetworkFirst(e, req, key, kind) {
           const hit = await c.match(SHELL_KEY);
           if (hit && shellAssets(await hit.text()).some((a) => a.key === key)) await c.put(key, copy);
           else drain(copy);
-        } catch (_) { /* best effort */ }
+        } catch (_) { drain(copy); /* best effort; the unread tee branch is released */ }
       }));
     }
     return r;
   } catch (err) {
     try {
-      // check-and-read as one critical section: a commit cannot swap '/' between the two
-      const hit = await serial(async () => {
-        const c = await caches.open(SHELL_CACHE);
-        const page = await c.match(SHELL_KEY);
-        return page && shellAssets(await page.text()).some((a) => a.key === key) ? await c.match(key) : null;
-      });
+      // NOT serialized: a held or never-settling mutation must not hang an offline script/style request. KNOWN EDGE: this
+      // check-then-read can race a commit, so an offline request racing one may serve one old asset once.
+      const c = await caches.open(SHELL_CACHE);
+      const page = await c.match(SHELL_KEY);
+      const hit = page && shellAssets(await page.text()).some((a) => a.key === key) ? await c.match(key) : null;
       if (hit) return hit;
     } catch (_) { /* fall through */ }
     return Response.error();

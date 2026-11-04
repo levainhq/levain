@@ -51,7 +51,8 @@ const indexedDB = {
 // --- Cache Storage ---------------------------------------------------------------------------------------------------
 const cacheNames = new Set();
 const cacheCtypes = new Map();
-const cacheHeaders = new Map(); // 'cache|key' -> every header of the stored response   // 'cache|key' -> content-type, when a test pins one
+const cacheHeaders = new Map(); // 'cache|key' -> every header of the stored response
+// (cacheCtypes above: 'cache|key' -> content-type, when a test pins one)
 let putFailKey = null;           // the next put to this key in a shell cache throws once
 const cacheStores = new Map();   // cache name -> Map(request key -> body text)
 const caches = {
@@ -365,6 +366,45 @@ function fire(type, ev) {
     }
     await Promise.all(waits);
     log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v')).map(([n, mm]) => [n, [...mm.entries()]]);
+  } else if (scenario === 'hold') {
+    // mode: JSON {shellHtml, key, hang: bool, putFail: bool}. An ONLINE asset request writes through (its put hangs forever when
+    // `hang`, throws when `putFail`; the clone's body cancel is recorded), then the network drops and an OFFLINE request for
+    // the same asset must still answer while that write-through is pending.
+    const m = JSON.parse(mode);
+    const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
+    cacheStores.set(shellName, new Map([['/', m.shellHtml], [m.key, 'CACHED ' + m.key]])); cacheNames.add(shellName);
+    const realOpen = caches.open;
+    caches.open = async (n) => {
+      const c = await realOpen(n);
+      if (!n.startsWith('levain-shell-v')) return c;
+      const put = c.put;
+      return { ...c, put: async (k, r) => { if (k !== m.key) return put(k, r); if (m.hang) return new Promise(() => {}); if (m.putFail) throw new TypeError('quota'); return put(k, r); } };
+    };
+    let up = true;
+    sandbox.fetch = async () => {
+      if (!up) throw new TypeError('network down');
+      const r = new Response('LIVE ' + m.key, { status: 200, headers: { 'content-type': /\.css/.test(m.key) ? 'text/css' : 'application/javascript' } });
+      const realClone = r.clone.bind(r);
+      r.clone = () => { const c = realClone(); const cancel = c.body.cancel.bind(c.body); c.body.cancel = (...a) => { log.copyDrained = true; return cancel(...a); }; return c; };
+      return r;
+    };
+    const send = async () => {
+      const ev = { request: { url: 'https://box.example' + m.key, method: 'GET', mode: 'no-cors', destination: /\.css/.test(m.key) ? 'style' : 'script' } };
+      let handed = null; const waits = [];
+      ev.respondWith = (p) => { handed = Promise.resolve(p); };
+      ev.waitUntil = (p) => { waits.push(Promise.resolve(p)); };
+      for (const fn of listeners.fetch || []) fn(ev);
+      return { handed, waits };
+    };
+    const first = await send();
+    const live = await first.handed; log.liveBody = await live.text();
+    await new Promise((r) => setTimeout(r, 20));        // let the write-through reach its put
+    up = false;
+    const second = await send();
+    const off = await Promise.race([second.handed.then(async (r) => ({ status: r.status, body: await r.text() })), new Promise((r) => setTimeout(() => r({ timeout: true }), 500))]);
+    log.offline = off;
+    if (!m.hang) await Promise.all(first.waits);
   }
   console.log(JSON.stringify(log));
+  if (scenario === 'hold') process.exit(0);
 })().catch((e) => { console.log(JSON.stringify({ error: String(e && e.stack || e) })); process.exit(1); });
