@@ -161,9 +161,6 @@ class RoomServe:
                     self.last_error = (f"the room's child exited (launch {handle.launch_id}); the next send "
                                        "resumes the conversation")
             return 0
-        with self._lock:
-            if self._handle is not handle:       # a rotate or send replaced the handle since this step took it
-                return 0
         try:
             got = self.service.read_next(handle.launch_id)
         except Exception:
