@@ -98,17 +98,31 @@ class Entry:
     ruling: str | None = None
 
 
-def _hidden(value: str) -> str | None:
+# The fields the OPERATOR writes (the line he typed, his free-text answer, his note) and the ruling built for his
+# pick. In these alone the two joiners are accepted: U+200C ZERO WIDTH NON-JOINER (required in Persian and several
+# Indic scripts) and U+200D ZERO WIDTH JOINER (emoji sequences such as a family or a profession). The agent-controlled
+# fields (the question asked and the option label in ``answer``) and the fixed-form fields take no exception.
+_OPERATOR_FIELDS = frozenset({"typed", "text", "note", "ruling"})
+_OPERATOR_ALLOW = "‌‍"
+
+
+def _allow(field: str) -> str:
+    """The unshowable characters field ``field`` accepts: the two joiners in an operator field, none elsewhere."""
+    return _OPERATOR_ALLOW if field in _OPERATOR_FIELDS else ""
+
+
+def _hidden(value: str, field: str) -> str | None:
     """The first character of ``value`` a person cannot see, named (``U+202E (RIGHT-TO-LEFT OVERRIDE) at character
     3``), or ``None``. The one rule, :mod:`levain.unshowable`, the question store already holds every label and
     question to when it is filed: every control (C0, DEL, C1, newline and tab included), every format character (bidi
     embeddings, overrides and isolates, zero-width characters, U+FEFF), the line and paragraph separators, surrogates,
-    invisible spaces. Held here again, at build and at parse, so that a row which never passed filing (written before
-    that rule, or straight into the file) is refused rather than signed: the verifier binds an entry to its row by
-    equality, so the words signed must be the words shown."""
+    invisible spaces, with only :func:`_allow`'s joiners accepted in an operator field. Held here again, at build and
+    at parse, so that a row which never passed filing (written before that rule, or straight into the file) is
+    refused rather than signed: the verifier binds an entry to its row by equality, so the words signed must be the
+    words shown."""
     from levain import unshowable
 
-    return unshowable.describe(value)
+    return unshowable.describe(value, allow=_allow(field))
 
 
 def _line(value: Any, what: str, *, limit: int = LINE_MAX) -> str:
@@ -116,7 +130,7 @@ def _line(value: Any, what: str, *, limit: int = LINE_MAX) -> str:
         raise MessageError(f"{what} is empty or not text")
     if len(value) > limit:
         raise MessageError(f"{what} is longer than {limit} characters")
-    hidden = _hidden(value)
+    hidden = _hidden(value, what)
     if hidden is not None:
         raise MessageError(f"{what} holds a character that does not show as itself: {hidden}")
     return value
@@ -207,7 +221,7 @@ def _field(lines: list[str], i: int, name: str, rx: re.Pattern[str] | None = Non
     if i >= len(lines) or not lines[i].startswith(f"{prefix}{name}: "):
         raise MessageError(f"line {i + 1}: {name!r} is missing or out of place")
     value = lines[i][len(prefix) + len(name) + 2:]
-    if not value or (rx is not None and rx.fullmatch(value) is None) or _hidden(value) is not None:
+    if not value or (rx is not None and rx.fullmatch(value) is None) or _hidden(value, name) is not None:
         raise MessageError(f"line {i + 1}: {name!r} is not in its form")
     return value, i + 1
 
@@ -613,21 +627,72 @@ def notice_text(entries: Sequence[Entry], *, channel: str = "terminal") -> str:
     if not entries:
         return f"{prefix}Touch ID to sign"
     first = entries[0]
-    said = first.answer if first.answer is not None else (first.text or "")
-    said = _shown(said)[:NOTICE_CUT]
+    said = (_shown(first.answer, "answer", cut=NOTICE_CUT) if first.answer is not None
+            else _shown(first.text or "", "text", cut=NOTICE_CUT))
     more = f" (+{len(entries) - 1} more)" if len(entries) > 1 else ""
-    return f"{prefix}Touch ID to sign: {_shown(first.item)} {said}".rstrip() + more
+    return f"{prefix}Touch ID to sign: {_shown(first.item, 'item')} {said}".rstrip() + more
 
 
-def _shown(value: Any) -> str:
-    """``value`` as the notice may display it: every character :mod:`levain.unshowable` calls unshowable shown as a
-    visible ``⟨U+XXXX⟩`` marker (never dropped, so what he reads can only differ from the bytes visibly), and
-    whitespace runs collapsed. Every entry that reaches the notice has passed :func:`build_message`, which refuses
-    those characters, so on the signing path no marker is ever needed: the notice shows the signed words, with only
-    runs of whitespace collapsed (and the cut :func:`notice_text` makes)."""
+_MARKER = "⟨U+{:04X}⟩"
+_ELLIPSIS = "…"
+
+
+def _shown(value: Any, field: str, *, cut: int | None = None) -> str:
+    """``value`` as the notice displays it: the field's own text, character for character, with every character
+    :mod:`levain.unshowable` calls unshowable in that field (:func:`_allow`, the same rule :func:`build_message` and
+    :func:`parse_verified` apply to it) shown as a visible ``⟨U+XXXX⟩`` marker, never dropped. Every entry that
+    reaches the notice on the signing path has passed :func:`build_message`, so there no marker is ever needed and the
+    display is the signed words.
+
+    ``cut``: when the display would be longer than ``cut`` characters, the RAW text is cut first, at the last
+    boundary between two user-perceived characters (:func:`_cluster_ends`) whose display fits in ``cut - 1``, and
+    ``…`` is appended. So a cut never lands inside a marker, never parts a base from its combining marks, variation
+    selector or joined sequence, and the display is always a prefix of the signed text plus an explicit ellipsis."""
     from levain import unshowable
 
-    return " ".join(unshowable.mark(str(value), "⟨U+{:04X}⟩", allow="").split())
+    text = str(value)
+    allow = _allow(field)
+    hidden = unshowable.hidden(text, allow=allow)
+    marked = len(text) + sum(len(_MARKER.format(ord(text[i]))) - 1 for i in hidden)
+    if cut is None or marked <= cut:
+        return unshowable.mark(text, _MARKER, allow=allow)
+    extra = {i: len(_MARKER.format(ord(text[i]))) - 1 for i in hidden}
+    keep, width, start = 0, 0, 0
+    for end in _cluster_ends(text):
+        width += (end - start) + sum(extra.get(i, 0) for i in range(start, end))
+        if width > cut - 1:
+            break
+        keep, start = end, end
+    return unshowable.mark(text[:keep], _MARKER, allow=allow) + _ELLIPSIS
+
+
+def _extends(cp: int, cat: str) -> bool:
+    """Whether a character joins the one before it in a user-perceived character (UAX #29 Extend, SpacingMark, the
+    joiners, and Hangul vowel and final jamo), approximately: combining marks (Mn, Me, Mc), U+200C and U+200D,
+    variation selectors, emoji modifiers, tag characters."""
+    return (cat in ("Mn", "Me", "Mc") or cp in (0x200C, 0x200D) or 0xFE00 <= cp <= 0xFE0F
+            or 0xE0100 <= cp <= 0xE01EF or 0x1F3FB <= cp <= 0x1F3FF or 0xE0020 <= cp <= 0xE007F
+            or 0x1160 <= cp <= 0x11FF or 0xD7B0 <= cp <= 0xD7FF)
+
+
+def _cluster_ends(text: str) -> list[int]:
+    """The end index of each user-perceived character of ``text``, in order (the last is ``len(text)``). A stdlib
+    approximation of UAX #29 extended grapheme clusters, conservative in one direction only: it may keep two clusters
+    together, never part one. No break before an extending character (:func:`_extends`), after U+200D (an emoji ZWJ
+    sequence), or inside a pair of regional indicators (a flag)."""
+    ends: list[int] = []
+    ri_run = 0                  # regional indicators in a row ending at the previous character
+    for i, ch in enumerate(text):
+        cp = ord(ch)
+        ri = 0x1F1E6 <= cp <= 0x1F1FF
+        joined = i > 0 and (_extends(cp, unicodedata.category(ch)) or text[i - 1] == "‍"
+                            or (ri and ri_run % 2 == 1))
+        if i > 0 and not joined:
+            ends.append(i)
+        ri_run = ri_run + 1 if ri else 0
+    if text:
+        ends.append(len(text))
+    return ends
 
 
 def post_notice(text: str, *, runner: Callable[..., Any] = subprocess.Popen) -> Any:

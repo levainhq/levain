@@ -37,7 +37,7 @@ def test_text_from_a_free_text_entry_and_the_desk_prefix():
 
 def test_a_long_answer_is_cut_and_control_characters_marked():
     out = ts.notice_text([_entry(text="a" * 200)])
-    assert out == "Touch ID to sign: np-1 " + "a" * 80
+    assert out == "Touch ID to sign: np-1 " + "a" * 79 + "…"
     assert ts.notice_text([_entry(text="x\ny\x00z")]) == "Touch ID to sign: np-1 x⟨U+000A⟩y⟨U+0000⟩z"
 
 
