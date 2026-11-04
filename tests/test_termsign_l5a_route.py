@@ -316,13 +316,15 @@ def test_a_second_click_while_a_sign_is_pending_is_sign_busy_and_raises_no_secon
 def test_a_replayed_request_id_returns_its_first_result_without_a_second_prompt(rig, store):
     q = file_q(store)
     calls = Calls()
-    first = rig(body(q), factory=calls)
-    second = rig(body(q), factory=calls)
+    sent = body(q)                       # a replay is the same request, byte for byte
+    first = rig(sent, factory=calls)
+    second = rig(sent, factory=calls)
     assert first == second and calls.n == 1 and len(answers(store)) == 1
     cancelled = Calls(fail=KeyError_("Touch ID was cancelled"))
     q2 = file_q(store, "Another?")
-    one = rig(body(q2, txn="txn-0000077"), factory=cancelled)
-    two = rig(body(q2, txn="txn-0000077"), factory=cancelled)
+    sent2 = body(q2, txn="txn-0000077")
+    one = rig(sent2, factory=cancelled)
+    two = rig(sent2, factory=cancelled)
     assert one == two and cancelled.n == 1
 
 
@@ -338,7 +340,8 @@ def test_a_signed_line_in_the_band_box_is_one_typed_message_over_its_entries(sto
     sid, vid = _shown(store)
     notes: list[str] = []
     done = band_view.answer_text_desk(store, "1a, 2b", viewer="cockpit:web", store_id=sid, view_id=vid, surface="web",
-                                      origin=ORIGIN, signer_factory=real_desk, key_dir=keydir, notify=notes.append)
+                                      origin=ORIGIN, signer_factory=real_desk, key_dir=keydir, notify=notes.append,
+                                      policy="all")
     assert sorted(done.recorded) == ["1a", "2b"] and notes == ["Desk: Touch ID to sign: " + q1.id + " (a) Ship it tonight (+1 more)"]
     msg = ts.parse_desk_verified(band_view.answer_sign_of(store, q1.id)["message"].encode())
     assert msg.gesture == "typed" and msg.typed == "1a, 2b" and msg.view == str(vid) and len(msg.entries) == 2
@@ -350,7 +353,7 @@ def test_a_cancelled_line_records_nothing_and_keeps_the_card_open(store, keydir)
     sid, vid = _shown(store)
     with pytest.raises(ValueError, match="Touch ID cancelled: nothing was recorded"):
         band_view.answer_text_desk(store, "1a", viewer="cockpit:web", store_id=sid, view_id=vid, surface="web",
-                                   origin=ORIGIN, key_dir=keydir, notify=lambda t: None,
+                                   origin=ORIGIN, key_dir=keydir, notify=lambda t: None, policy="all",
                                    signer_factory=Calls(fail=KeyError_("Touch ID was cancelled")))
     assert answers(store) == [] and store.get(q.id).answer is None
 
@@ -564,3 +567,98 @@ def test_badges_share_one_ctk_check_and_cache_their_verdict(rig, store, keydir, 
     assert got == {q.id: "signed: Touch ID, laptop (desk)" for q in qs} and len(asked) == 1
     again = band_view.answer_badges(store, [q.id for q in qs], key_dir=keydir, ctk=ctk)
     assert again == got and len(asked) == 1                    # cached per (row, signature digest)
+
+
+# --- L3 r1: request-bound replay, one prompt per request, policy on the typed path, one lock -------------------
+
+def test_a_request_id_reused_for_a_different_answer_is_refused(rig, store, keydir):
+    q1, q2 = file_q(store, "First?"), file_q(store, "Second?")
+    calls = Calls()
+    sent = body(q1, txn="txn-reuse-01")
+    first, status = rig(sent, factory=calls)
+    assert status == 200
+    for other in (body(q2, txn="txn-reuse-01"), {**sent, "pick": "b"}):
+        got, status = rig(other, factory=calls)
+        assert (status, got["error"]) == (409, "txn_reused"), got
+    got, status = desk_click.desk_answer(req(sent, surface="phone"),
+                                         desk_click.LevainDeskHost(store), rig.state, policy="all", signer_factory=calls,
+                                         key_dir=keydir, notify=lambda t: None)
+    assert (status, got["error"]) == (409, "txn_reused")                   # another surface
+    text, status = _text(store, keydir, _text_req(store, "2a", txn="txn-reuse-01"), factory=calls, state=rig.state)
+    assert (status, text["error"]) == (409, "txn_reused")                  # the other route
+    assert rig(sent, factory=calls) == (first, 200)                         # the same request still replays
+    assert calls.n == 1 and answers(store) == [(q1.id, "ship")]
+
+
+def test_a_concurrent_duplicate_gets_one_prompt_and_the_first_result(rig, store):
+    q = file_q(store)
+    dup: list = []
+    threads: list[threading.Thread] = []
+    sent = body(q)
+
+    def during():
+        t = threading.Thread(target=lambda: dup.append(rig(sent, factory=calls)))
+        threads.append(t)
+        t.start()
+        t.join(0.3)                     # the duplicate is waiting on the first, not prompting
+        assert t.is_alive()
+    calls = Calls(during=during)
+    first = rig(sent, factory=calls)
+    threads[0].join(10)
+    assert first[1] == 200 and dup == [first] and calls.n == 1 and answers(store) == [(q.id, "ship")]
+
+
+def test_a_delivery_thread_that_cannot_start_leaves_the_answer_and_says_deferred(rig, store, monkeypatch):
+    q = file_q(store)
+
+    def no_thread(deliver, done):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(desk_click, "_start_delivery", no_thread)
+    sent = body(q)
+    got, status = rig(sent, factory=Calls(), delivered=lambda done: None)
+    assert status == 200 and got["signed"] and got["delivery"] == "deferred", got
+    assert answers(store) == [(q.id, "ship")]
+    assert rig(sent, factory=Calls()) == (got, 200)
+
+
+def test_an_unexpected_record_error_is_remembered_and_never_prompts_again(rig):
+    class Boom(FakeHost):
+        def record(self, row, pick, text, viewer, signing):
+            raise RuntimeError("disk on fire")
+    calls = Calls()
+    b = {"subject": {"id": "np-auth", "version": "rv-auth-1"}, "pick": "a", "client_txn": "txn-boom-001"}
+    one = rig(b, host=Boom(), factory=calls, policy="authority")
+    two = rig(b, host=Boom(), factory=calls, policy="authority")
+    assert one == two and one[1] == 500 and one[0]["error"] == "internal" and calls.n == 1
+
+
+def test_a_line_answered_elsewhere_during_the_touch_is_refused_not_signed(store, keydir):
+    q = file_q(store)
+    calls = Calls(during=lambda: store.answer(q.id, option="hold", channel="phone"))
+    got, status = _text(store, keydir, _text_req(store, "1a", txn="txn-text-gone"), factory=calls)
+    assert (status, got["error"]) == (422, "answer_refused") and "signed" not in got, got
+    assert calls.n == 1 and answers(store) == [(q.id, "hold")]
+
+
+def test_the_typed_path_follows_the_desk_policy(store, keydir):
+    """NP-A (b): an information line typed in the band box records unsigned and raises no sheet, as a click does."""
+    q = file_q(store)
+    sid, vid = _shown(store)
+    calls = Calls()
+    done = band_view.answer_text_desk(store, "1a", viewer="cockpit:web", store_id=sid, view_id=vid, surface="web",
+                                      origin=ORIGIN, signer_factory=calls, key_dir=keydir, notify=lambda t: None)
+    assert done.recorded == ["1a"] and calls.n == 0
+    assert context(store, q.id)[2] != "signed" and band_view.answer_sign_of(store, q.id)["sig"] is None
+
+
+def test_a_line_typed_while_a_click_signs_is_sign_busy(rig, store, keydir):
+    q1, q2 = file_q(store, "First?"), file_q(store, "Second?")
+    inner: list = []
+    calls_b = Calls()
+    calls = Calls(during=lambda: inner.append(
+        _text(store, keydir, _text_req(store, "2a", txn="txn-text-busy"), factory=calls_b, state=rig.state)))
+    got, status = rig(body(q1), factory=calls)
+    assert status == 200
+    (busy, bstatus), = inner
+    assert (bstatus, busy["error"]) == (409, "sign_busy") and calls_b.n == 0
+    assert answers(store) == [(q1.id, "ship")]

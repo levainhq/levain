@@ -1565,13 +1565,22 @@ def _desk_typed_signer(store: QuestionStore, text: str, *, surface: str, origin:
 
 def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: str, view_id: int, surface: str,
                      origin: str, signer_factory: Any = None, key_dir: Path | None = None, notify: Any = None,
-                     deadline: float | None = None) -> Applied:
-    """:func:`answer_text` for the cockpit's band box when the line is SIGNED with the laptop key (L5a, policy (a)):
-    the plan is made from the view the text names, one desk message is signed over its information entries, and the
-    answers are recorded with the signature only if the view is still the viewer's newest, checked inside the write.
-    A signer that cancels or times out leaves the line UNRECORDED: the whole line is refused (``ValueError``,
-    nothing recorded) so the box keeps his words, unlike a seat's typed line, which records unsigned. A foreign
-    store is ``ValueError`` as in :func:`answer_text`."""
+                     deadline: float | None = None, policy: str | None = None,
+                     outcome: list[Signing] | None = None) -> Applied:
+    """:func:`answer_text` for the cockpit's band box, signed with the laptop key where the desk ``policy``
+    (:data:`levain.desk_click.DESK_POLICY` by default) signs an information answer (policy (a), ``all``): the plan is
+    made from the view the text names, one desk message is signed over its information entries, and the answers are
+    recorded with the signature only if the view is still the viewer's newest, checked inside the write. A signer
+    that cancels or times out leaves the line UNRECORDED: the whole line is refused (``ValueError``, nothing
+    recorded) so the box keeps his words, unlike a seat's typed line, which records unsigned. Under a policy that
+    leaves information unsigned (NP-A (b), ``authority``) the line is :func:`answer_text`, unsigned, raising no
+    sheet; its authority entries open their own sheets either way. Each signing attempt is appended to
+    ``outcome``. A foreign store is ``ValueError`` as in :func:`answer_text`."""
+    from levain import desk_click
+
+    if not desk_click.requires_sign("information", desk_click.DESK_POLICY if policy is None else policy):
+        return answer_text(store, text, viewer=viewer, channel="cockpit", store_id=store_id, view_id=view_id,
+                           deadline=deadline)
     if _foreign(store):
         raise ValueError("this cockpit's questions are answered on their own cards, not by band shorthand; nothing was recorded")
     view = _view_by_id(store, viewer, view_id)
@@ -1580,14 +1589,14 @@ def answer_text_desk(store: QuestionStore, text: str, *, viewer: str, store_id: 
     plan, view, questions, extras = _plan_on(store, view, text)
     if not plan.matched or plan.rest.strip():
         raise ValueError(plan.hint or "the whole text must be band answers, e.g. `1a, 2: rec`; nothing was recorded")
-    outcome: list[Signing] = []
     inner = _desk_typed_signer(store, text, surface=surface, origin=origin, view_id=view_id,
                                signer_factory=signer_factory, key_dir=key_dir, notify=notify)
 
     def sign_with(pairs: list[tuple[Any, Question]]) -> Signing | None:
         got = inner(pairs)
         if got is not None:
-            outcome.append(got)
+            if outcome is not None:
+                outcome.append(got)
             if got.state != "signed":
                 raise _DeskUnsigned(got)
         return got
