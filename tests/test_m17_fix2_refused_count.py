@@ -10,7 +10,7 @@ from levain.consent.ledger import request_outcomes
 from levain.consent.listing import read_grant_evidence
 from tests.test_grant_phone import world  # noqa: F401  (world is a fixture)
 from tests.test_grant_phone import _now
-from tests.test_phone_grants_tab import _answered, _grant
+from tests._grant_helpers import _answered, _grant
 
 MATCH = ("via = 'grant' AND state = 'allowed' AND json_extract(answer, '$.grant_id') = ? "
          "AND json_extract(answer, '$.grant_seq') = ? AND json_extract(answer, '$.grant_hash') = ?")

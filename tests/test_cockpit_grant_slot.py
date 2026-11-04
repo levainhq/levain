@@ -11,7 +11,7 @@ from tests.test_cockpit_consent_rows import OPEN_DECISIONS, TILE
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_grant_phone import HOSTILE, world  # noqa: F401  (world is a fixture)
-from tests.test_phone_grants_tab import _answered, _grant
+from tests._grant_helpers import _answered, _grant
 
 _CARDS = "[...document.querySelectorAll('#levain-modal [data-consent-grant]')]"
 

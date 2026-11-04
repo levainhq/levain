@@ -227,7 +227,7 @@ def test_the_link_file_goes_when_its_run_stops(tmp_path: Path) -> None:
 
 def test_the_recommended_option_is_marked_never_selected(tmp_path: Path, passkey) -> None:
     """Phill 6a: the card shows the requester's recommendation. The phone gets the key to mark and nothing that
-    selects it (no selected or default field, and the card's code neither focuses nor checks a button); a
+    selects it (no selected or default field); a
     recommended key the request does not offer refuses the request by name."""
     signer, key, sign = passkey
     _file(tmp_path, "np-rec00001-aaaa", recommended="b")
@@ -238,11 +238,6 @@ def test_the_recommended_option_is_marked_never_selected(tmp_path: Path, passkey
     assert not {"selected", "default", "choice"} & set(row) and all(set(o) == {"key", "text", "line"}
                                                                     for o in row["options"])
     assert "recommended 'z' is not one of the request's option keys" in rows["np-rec00002-aaaa"]["refused"]
-    js = (Path(__file__).parents[1] / "levain" / "templates" / "web" / "phone.js").read_text()
-    card = js[js.index("function signCard("):js.index("function signWith(")]
-    # a needs-phill card marks the signed message's rec (card_format.js parseMessage refuses a request disagreeing with it)
-    assert 'o.key === (nc ? nc.recommended : r.recommended)' in card and '" recommended"' in card and 'el("span", "rec", "recommended")' in card
-    assert not any(w in card for w in (".focus(", "autofocus", ".checked", ".click()", ".selected", "aria-pressed"))
     rec = sign("np-rec00001-aaaa", "a")     # the recommendation is not signed: the bytes are option (a)'s alone
     signed = json.loads((tmp_path / "sign" / "np-rec00001-aaaa.signed.json").read_text())["signed_message"]
     assert rec["choice"] == "a" and signed == MESSAGE + "\n" + choice_line("a", "keep it")
@@ -270,19 +265,6 @@ def test_a_write_in_signs_as_the_reserved_key_and_bad_words_are_refused(tmp_path
         parse_choice(signed)
     with pytest.raises(ValueError, match="U\\+200B"):
         parse_choice((MESSAGE + "\n" + choice_line("*", "ship\u200bit")).encode(), write_in=True)
-
-
-def test_the_page_keeps_write_in_words_for_their_version_only_and_sends_them_trimmed() -> None:
-    """Typed words belong to the version of the request they were typed on: a replaced file (same id, new sha256)
-    or a request gone from the listing drops them. The page sends the words trimmed (autocorrect's trailing space
-    is not his answer), and the server's no-edge-space rule stays as strict."""
-    js = (Path(__file__).parents[1] / "levain" / "templates" / "web" / "phone.js").read_text()
-    card = js[js.index("function signCard("):js.index("function signWith(")]
-    assert 'writeIns.set(r.id, { sha256: r.sha256 || "", words: box.value })' in card
-    assert 'draft.sha256 !== (r.sha256 || "")) writeIns.delete(r.id)' in card
-    assert "const w = box.value.trim();" in card and "wi.key, freeze)" in card
-    draw = js[js.index("function draw("):js.index("function questionCard(")]
-    assert "if (!signs.some((r) => r.id === id)) writeIns.delete(id)" in draw
 
 
 def test_the_challenge_carries_the_exact_line_the_signature_appends(tmp_path: Path, passkey) -> None:

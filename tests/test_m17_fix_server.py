@@ -14,7 +14,7 @@ from levain.consent.grants import grant_view
 from levain.consent.passkey import challenge
 from tests.test_dispatch_phone import _b64u
 from tests.test_grant_phone import _now, world  # noqa: F401  (world is a fixture)
-from tests.test_phone_grants_tab import _answered, _grant
+from tests._grant_helpers import _answered, _grant
 
 
 def test_a_refusal_older_than_the_newest_calls_is_still_counted(world):
