@@ -410,12 +410,12 @@ def _write_out(s: str) -> None:
 
 
 def _run_login(hands: HandsIdentity, vendor: str, entity_dir: Path | str, emit: Callable[[str], None],
-               timeout: float) -> LoginResult:
+               timeout: float, argv: list[str] | None = None) -> LoginResult:
     """The vendor login as the hands user, under the caller's hands lock. The caller's stdin is inherited (Claude's
     paste-code prompt reads the code there); output goes to ``emit`` as it arrives, a prompt without a newline
     included. Reading and waiting share one deadline; on it, or on any exception or interrupt, sudo is killed and
     the hands account swept, then a :class:`HandsLoginError` is raised (an interrupt passes through)."""
-    proc = subprocess.Popen(login_argv(hands, vendor), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    proc = subprocess.Popen(login_argv(hands, vendor) if argv is None else argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             cwd="/", env=child_env())
     chunks: "queue.Queue[bytes | None]" = queue.Queue()
 

@@ -1498,6 +1498,19 @@ def build_parser() -> argparse.ArgumentParser:
     hs_p = hands_sub.add_parser("status", help="Show the entity's user's vendor logins (read-only).")
     hs_p.add_argument("vendor", nargs="?", choices=("claude", "codex"), default=None)
     hs_p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
+    hm_p = hands_sub.add_parser("mcp", help="Sign the entity's user in to a REGISTERED MCP server, take one out, "
+                                            "or list them (Claude; macOS).")
+    hm_sub = hm_p.add_subparsers(dest="hands_mcp_cmd", required=True)
+    for _verb, _help in (("signin", "Sign in to one registered remote MCP server as the entity's user."),
+                         ("remove", "Log out of and remove a server `signin` added (local only)."),
+                         ("list", "Show registered servers against what the entity's user holds (read-only).")):
+        _p = hm_sub.add_parser(_verb, help=_help)
+        if _verb != "list":
+            _p.add_argument("name", help="The registered server's name.")
+        _p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
+        if _verb != "remove":
+            _p.add_argument("--data-root", type=Path, default=None, help="The cockpit data root holding the authority "
+                                                                          "log (default: <path>/.levain/cockpit).")
     hands_p.set_defaults(func=_cmd_hands)
 
     wsg_p = subparsers.add_parser(
@@ -5004,6 +5017,13 @@ def _cmd_ssh_add(args: argparse.Namespace) -> int:
 def _cmd_hands(args: argparse.Namespace) -> int:
     from levain.firing import hands_login
 
+    if args.hands_cmd == "mcp":
+        from levain.firing import hands_mcp_login
+        if args.hands_mcp_cmd == "signin":
+            return hands_mcp_login.cmd_signin(args.path, args.name, args.data_root)
+        if args.hands_mcp_cmd == "remove":
+            return hands_mcp_login.cmd_remove(args.path, args.name)
+        return hands_mcp_login.cmd_list(args.path, args.data_root)
     if args.hands_cmd == "login":
         return hands_login.cmd_hands_login(args.path, args.vendor)
     if args.hands_cmd == "logout":

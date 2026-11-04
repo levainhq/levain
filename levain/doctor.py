@@ -145,6 +145,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
         core.extend(_check_unix_sockets(install))
         core.extend(_check_hands_isolation(install))
     core.extend(_check_hands_login(install))
+    core.extend(_guarded("hands mcp", lambda: _check_hands_mcp(install)))
     core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
     core.extend(_check_autonomic_store())
@@ -6487,3 +6488,13 @@ def _match_store(name: str, install: Path, args: list) -> CheckResult:
         f"store path mismatch: {configured} != {expected}",
         f"Re-run `levain init` to point at {expected}.",
     )
+
+
+def _check_hands_mcp(install: Path) -> list[CheckResult]:
+    """The hands account's own MCP servers (M4): registry against what the account holds, and the credential file's
+    owner and mode. The reads and rules are :func:`levain.firing.hands_mcp_login.doctor_rows`; silent without a hands
+    account, and a read that fails is a failing row."""
+    from levain.firing import hands_mcp_login
+
+    return [CheckResult(n, ok, detail, hint, warn=warn)
+            for n, ok, detail, hint, warn in hands_mcp_login.doctor_rows(install)]
