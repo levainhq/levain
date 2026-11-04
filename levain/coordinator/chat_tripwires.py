@@ -65,8 +65,9 @@ class TripwireContext(NamedTuple):
 
     ``rule_allow`` is the room's (tool, source) pairs, empty for a worker. A tool named in it is one whose allow list is
     the launch's own argv: its ``accept`` decisions of reason ``rule`` from a listed source are expected (no
-    ``unexpected_rule``), and no PreToolUse count is owed for it (the stream carries no PreToolUse event, so a count
-    could never be met). Every other decision for it, and every other tool, is judged as a worker's is."""
+    ``unexpected_rule``), and no PreToolUse count is owed for those or for a deny (the stream carries no PreToolUse
+    event, so a count could never be met). Every other decision for it owes the count and so latches as a ``deficit``;
+    every other tool is judged as a worker's is."""
     cwd: str
     expected_pre_hooks: Callable[[str], int]
     gate_allowed: Callable[[str, Any], bool]
@@ -269,11 +270,10 @@ class TripwireWindow:
         if not isinstance(tool, str) or not tool:
             return Trip("deficit", "a tool_result whose tool cannot be named: its PreToolUse hooks cannot be counted")
         self.results[tool] = self.results.get(tool, 0) + 1
-        ruled = self.ctx is not None and any(t == tool for t, _s in self.ctx.rule_allow)
-        trip = None if ruled else self._deficit(tool)
+        d = e.decision_source
+        trip = None if self._ruled(tool, d) else self._deficit(tool)
         if trip is not None:
             return trip
-        d = e.decision_source
         if not isinstance(d, Mapping):
             return Trip("accepted_without_host", f"a {tool[:60]} tool_result with no permission_decision")
         decision, source, reason = d.get("decision"), d.get("source"), d.get("reason_type")
@@ -298,6 +298,19 @@ class TripwireWindow:
             return None                                   # exemption 2: a Read the mode allows, inside the launch
         return Trip("accepted_without_host", f"a {tool[:60]} call accepted with no host request, source "
                                              f"{str(source)[:40]!r}, reason {str(reason)[:40]!r}")
+
+    def _ruled(self, tool: str, d: Any) -> bool:
+        """No PreToolUse count is owed for this result: ``tool`` is in the room's ``rule_allow`` AND the decision is an
+        ``accept`` of reason ``rule`` from a source listed for it, or a deny. Any other decision for a listed tool owes
+        the count, which the room never meets, so it latches as a ``deficit`` before any later branch is read
+        (L3_rme_r1 complement 6: a skip decided by the tool alone left those shapes to the branches after it)."""
+        if self.ctx is None or not isinstance(d, Mapping) or not any(t == tool for t, _s in self.ctx.rule_allow):
+            return False
+        if d.get("decision") == "reject":
+            return True
+        source = d.get("source")
+        return d.get("decision") == "accept" and d.get("reason_type") == "rule" and isinstance(source, str) \
+            and (tool, source) in self.ctx.rule_allow
 
     def _deficit(self, tool: str) -> Trip | None:
         if self.ctx is None:

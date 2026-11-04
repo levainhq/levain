@@ -46,18 +46,43 @@ def test_a_deny_of_an_in_set_tool_does_not_latch():
     assert _call_and_result(w, "Read", {"decision": "reject", "source": "config", "reason_type": "rule"}) is None
 
 
-@pytest.mark.parametrize("decision,name", [
-    ({"decision": "accept", "source": "projectSettings", "reason_type": "rule"}, "unexpected_rule"),
-    ({"decision": "accept", "source": "session", "reason_type": "rule"}, "unexpected_rule"),
-    ({"decision": "accept", "source": "hook", "reason_type": "hook"}, "accepted_without_host"),
-    ({"decision": "accept", "source": "config", "reason_type": "mode"}, "accepted_without_host"),
-    ({"decision": "accept", "source": "user_permanent", "reason_type": "other"}, "accepted_without_host"),
-    ({"decision": "ask", "source": "config", "reason_type": "rule"}, "accepted_without_host"),
-    (None, "accepted_without_host"),
-])
-def test_anything_but_an_allow_rule_from_a_listed_source_still_latches(decision, name):
+LATCHING = [
+    {"decision": "accept", "source": "projectSettings", "reason_type": "rule"},
+    {"decision": "accept", "source": "session", "reason_type": "rule"},
+    {"decision": "accept", "source": "hook", "reason_type": "hook"},
+    {"decision": "accept", "source": "config", "reason_type": "mode"},
+    {"decision": "accept", "source": "user_permanent", "reason_type": "other"},
+    {"decision": "ask", "source": "config", "reason_type": "rule"},
+    {"decision": "accept", "source": ["config"], "reason_type": "rule"},
+    None,
+]
+
+
+@pytest.mark.parametrize("decision", LATCHING)
+def test_anything_but_an_allow_rule_from_a_listed_source_still_latches_at_the_count(decision):
+    """L3_rme_r1 complement 6: the count is skipped only for the room's own allow rule (or a deny), so every other
+    shape latches as a ``deficit`` before any later branch is read; reordering those branches cannot open a hole."""
     trip = _call_and_result(TripwireWindow(_ctx(ROOM_PAIRS)), "Read", decision)
-    assert trip is not None and trip.name == name
+    assert trip is not None and trip.name == "deficit"
+
+
+def test_a_mode_shaped_read_inside_the_cwd_latches_the_room():
+    """FAILS on the RM-E tip: the tool-only skip let exemption 2 (a Read the mode allows, inside the launch) answer for
+    the room, a launch whose containment is its allow list, not a mode."""
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as root:
+        target = os.path.join(root, "f.txt")
+        open(target, "w").close()
+
+        def expected(tool):
+            raise ValueError(tool)
+        ctx = TripwireContext(root, expected, lambda _i, _t: False, ROOM_PAIRS)
+        w = TripwireWindow(ctx)
+        w.observe(event("tool_call", "c1", "p1a", call_id="c1", tool_name="Read", tool_input={"file_path": target}))
+        trip = w.observe(event("tool_result", "c1", "p1b", call_id="c1", tool_name="Read",
+                               decision_source={"decision": "accept", "source": "config", "reason_type": "mode"}))[0]
+    assert trip is not None and trip.name == "deficit"
 
 
 @pytest.mark.parametrize("tool", ["Bash", "Edit", "Write", "WebFetch", "Task"])
@@ -69,4 +94,4 @@ def test_a_tool_outside_the_rooms_set_latches_even_under_the_rooms_allow_rule(to
 def test_an_unhashable_source_is_a_trip_not_a_crash():
     trip = _call_and_result(TripwireWindow(_ctx(ROOM_PAIRS)), "Read",
                             {"decision": "accept", "source": ["config"], "reason_type": "rule"})
-    assert trip is not None and trip.name == "unexpected_rule"
+    assert trip is not None and trip.name == "deficit"
