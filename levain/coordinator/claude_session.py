@@ -164,23 +164,22 @@ class PipeTransport:
         return self._proc.poll()
 
     def close(self) -> None:
+        """Signal the child first (terminate, then kill, each bounded), then close the pipes. stdin is closed LAST: a
+        thread blocked writing to a child that no longer reads is inside the buffered writer, and closing stdin first
+        would wait behind that write; once the child is gone the write fails and the close cannot hang."""
         if self._closed:
             return
         self._closed = True
-        try:
-            self._proc.stdin.close()
-        except (OSError, ValueError):
-            pass
-        for stop in (lambda: self._proc.wait(3), self._proc.terminate, lambda: self._proc.wait(3), self._proc.kill):
+        for stop in (self._proc.terminate, lambda: self._proc.wait(3), self._proc.kill, lambda: self._proc.wait(3)):
             if self._proc.poll() is not None:
-                return
+                break
             try:
                 stop()
             except Exception:  # noqa: BLE001 - a child that will not die is the caller's to find
                 pass
         try:
-            self._proc.wait(3)                  # reap the killed child, bounded
-        except (subprocess.TimeoutExpired, OSError):
+            self._proc.stdin.close()
+        except (OSError, ValueError):
             pass
 
 
@@ -275,6 +274,7 @@ class ClaudeSession:
         self._read_wait = read_wait
         self._interrupt_wait = interrupt_wait
         self._clock = clock
+        self._close_lock = threading.Lock()     # guards only the closed flag, so close() never waits behind a hung send
         self._io = threading.RLock()            # one writer or one pumper at a time: stream order is arrival order
         self._shown: list[Event] = []
         self._seq = 0
@@ -774,7 +774,10 @@ class ClaudeSession:
         return " ".join(unicodedata.normalize("NFC", text).split())
 
     def close(self) -> None:
-        with self._io:
+        """Mark the session closed and stop the child. It never takes ``_io``: a send blocked writing to a child that no
+        longer reads holds that lock, and the transport's close (child signalled first) is what ends the write, which
+        then raises :class:`NotSent`. Idempotent; the flag flips under its own short lock."""
+        with self._close_lock:
             if self.closed:
                 return
             self.closed = True
