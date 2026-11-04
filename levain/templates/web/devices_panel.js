@@ -177,7 +177,6 @@
     sh.appendChild(el("h2", "zone-title", "Presence & notification settings"));
     prSetSec.appendChild(sh);
     const sgrid = el("div", "ck-zgrid dev-grid pr-settings-grid");
-    sgrid.appendChild(buildStanding());
     sgrid.appendChild(buildTaps());
     prSetSec.appendChild(sgrid);
     const main = document.querySelector("main.frame");
@@ -189,7 +188,7 @@
   // The devices section shows with its own read; the settings section holds two blocks (the standing default, tap tokens) and shows while either does, each with its own gone/refused state.
   function syncSection() {
     section.hidden = devPanel.hidden;
-    if (prSetSec) prSetSec.hidden = (!stPanel || stPanel.hidden) && (!prPanel || prPanel.hidden);
+    if (prSetSec) prSetSec.hidden = !prPanel || prPanel.hidden;
   }
   function devShown(on) { devPanel.hidden = !on; syncSection(); }
 
@@ -645,40 +644,32 @@
   // {word, tail, state}, the standing default `base`, the standing `overlay`, the settings in force `effective`, the sensing) and
   // every POST /webpush/presence/set returns the same view after the write. Nothing here composes the sentence or keeps a state of
   // its own: what the cockpit shows after a tap is what `levain ping status` prints at that instant.
-  // Writes: {preset, for?} (away back quiet sleep loud) or {devices?, follow_after?, lets_through?, until}; `until` is "switch"
-  // (the standing default, base), "input" (my next word, or a message I type into a session) or a duration (15m, 1h, 90m).
+  // Writes: {preset, for?, ending?} activates a preset (away back quiet sleep loud; `ending` "input" or "timer" ends THIS activation
+  // that way and is remembered as the preset's ending type, `for` is the timer's duration and is not remembered);
+  // {customize: <preset>, devices?, follow_after?, lets_through?} changes what that preset does from now on (Back's options are the
+  // standing default); {reset: <preset>} returns it to the system defaults. The options rows and the Until row belong to the SELECTED
+  // preset (the one that stands, else Back) and paint from the view's `presets` and `overlay` alone: no choice lives on the page.
   const PR_PRESETS = [["away", "Away"], ["back", "Back"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"]];
   const PR_GLOSS = { away: "devices on until your next word or a message you type into a session", back: "your standing default again",
                      quiet: "only what needs you reaches you, for a while", sleep: "only what needs you reaches you, until your next word or a message you type into a session",
                      loud: "everything reaches you, for a while" };
-  const PR_TIMED = ["quiet", "loud"];
   const PR_DURS = ["15m", "1h", "2h"];
   const PR_DEVICES = [["on", "On"], ["follow", "Follow"], ["off", "Off"]];
   const PR_REFRESH_EVERY = 5;                            // pulses between device-list refreshes
   const PR_PULSE_MS = 6000;                              // how often an open page re-reads the server's Follow line while visible
   const PR_AFTER = [5, 10, 15, 30, 60];                  // minutes without a typed desk message before follow turns devices on
-  const PR_UNTILS = [["switch", "I switch it"], ["for", "For…"], ["input", "Until I say or type"]];
+  const PR_ENDS = [["input", "Until I say or type"], ["timer", "For…"], ["switch", "I switch it"]];
   // the tap-token form names the words the server knows: the presets, and the two aliases (desk = follow, devices = on)
   const PR_TAP_WORDS = [["back", "Back"], ["away", "Away"], ["quiet", "Quiet"], ["sleep", "Sleep"], ["loud", "Loud"],
                         ["desk", "Desk (follow)"], ["devices", "Devices (on)"]];
   const PR_TAP_DEFAULT = ["away", "back", "quiet", "desk", "devices"];
-  const PR_DUR_KEY = "levain_presence_for";
   const PR_MIN = 1, PR_MAX = 1440;                        // custom minutes, as the server allows (1 minute to 24 hours)
-  let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prSheetWho = null, prBtns = {}, prDurBtns = {},
-      prEndLoud = null, prSheetNote = null, prLink = null, prDur = "1h", prSetSec = null, prTapList = null, prNote = null,
+  let prPanel = null, prChip = null, prChipText = null, prSheet = null, prSheetText = null, prSheetWho = null, prBtns = {},
+      prEndLoud = null, prSheetNote = null, prLink = null, prSetSec = null, prTapList = null, prNote = null,
       prNew = null, prName = null, prChecks = {}, prBusy = false, prGen = 0, prRunning = null, prRerun = false, prGone = false, prRefused = "", prCur = null,
       prDevBtns = {}, prAfterBtns = {}, prAfterCustom = null, prAfterRow = null, prLetsBtns = {}, prUntilBtns = {}, prForRow = null,
-      prForBtns = {}, prForCustom = null, prUntil = "switch", prForDur = "1h", prAfterOpen = false, prForOpen = false,
-      stPanel = null, stDevBtns = {}, stAfterBtns = {}, stLetsBtns = {}, stAfterCustom = null, stAfterRow = null, stNote = null, stBusy = false;
-
-  function loadDur() {
-    try {
-      const v = window.localStorage.getItem(PR_DUR_KEY);
-      if (v !== null && PR_DURS.indexOf(v) >= 0) return v;
-    } catch (_) { /* storage blocked: the default stands for this page only */ }
-    return "1h";
-  }
-  function saveDur(v) { try { window.localStorage.setItem(PR_DUR_KEY, v); } catch (_) { /* not remembered */ } }
+      prForBtns = {}, prForCustom = null, prAfterOpen = false, prForOpen = false,
+      prCustomLine = null, prCustomText = null, prResetBtn = null, prUntilLab = null, prFreeNote = null;
 
   // One segmented row of big buttons: [[value, label], ...] -> {value: button}; `onTap(value)` runs on a click.
   function segment(host, items, label, onTap, cls) {
@@ -750,7 +741,6 @@
   }
 
   function buildSheet() {
-    prDur = loadDur();
     prSheet = el("div", "pr-sheet");
     prSheet.id = "pr-sheet";
     prSheet.setAttribute("role", "dialog");
@@ -765,26 +755,26 @@
 
     labelled(prSheet, "Presets");
     prBtns = segment(prSheet, PR_PRESETS, "Set your presence", (w) => setPreset(w), "pr-sheet-word");
-    for (const [w] of PR_PRESETS) prBtns[w].title = PR_GLOSS[w];
-    const dseg = el("div", "pr-sheet-seg pr-sub");
-    dseg.setAttribute("role", "group");
-    dseg.setAttribute("aria-label", "How long Quiet and Loud last");
-    for (const v of PR_DURS) {
-      const b = el("button", "pr-big pr-dur", v);
-      b.type = "button"; b.dataset.value = v;
-      b.addEventListener("click", () => { prDur = v; saveDur(v); pressed(prDurBtns, prDur); });
-      prDurBtns[v] = b; dseg.appendChild(b);
-    }
-    dseg.appendChild(el("span", "pr-sheet-hint", "for Quiet and Loud"));
-    prSheet.appendChild(dseg);
-    pressed(prDurBtns, prDur);
     prEndLoud = el("button", "pr-big pr-endloud", "End Loud");
     prEndLoud.type = "button"; prEndLoud.hidden = true;
     prEndLoud.addEventListener("click", () => writePresence({ preset: "loud", for: "off" }));
     prSheet.appendChild(prEndLoud);
+    // a changed preset says so: a dot on its button (paintPresence) and, for the one selected, its settings in one line with Reset
+    prCustomLine = el("div", "pr-custom-line");
+    prCustomLine.hidden = true;
+    prCustomText = el("span", "pr-sheet-hint");
+    prResetBtn = el("button", "pr-big pr-reset", "Reset");
+    prResetBtn.type = "button";
+    prResetBtn.addEventListener("click", () => { const sel = selected(); if (sel) writePresence({ reset: sel }); });
+    prCustomLine.appendChild(prCustomText); prCustomLine.appendChild(prResetBtn);
+    prSheet.appendChild(prCustomLine);
+    prFreeNote = el("p", "pr-sheet-hint");
+    prFreeNote.textContent = "A command set this for a while. Tap a preset to replace it and change its options.";
+    prFreeNote.hidden = true;
+    prSheet.appendChild(prFreeNote);
 
     labelled(prSheet, "Devices");
-    prDevBtns = segment(prSheet, PR_DEVICES, "Whether pings reach your devices", (v) => setSetting({ devices: v }));
+    prDevBtns = segment(prSheet, PR_DEVICES, "Whether pings reach your devices", (v) => customize({ devices: v }));
     prAfterRow = el("div", "pr-sheet-seg pr-sub");
     prAfterRow.setAttribute("role", "group");
     prAfterRow.setAttribute("aria-label", "Follow: minutes without input before devices come on");
@@ -792,7 +782,7 @@
     for (const m of PR_AFTER) {
       const b = el("button", "pr-big pr-after", String(m));
       b.type = "button"; b.dataset.value = String(m);
-      b.addEventListener("click", () => { prAfterOpen = false; setSetting({ follow_after: m * 60 }); });
+      b.addEventListener("click", () => { prAfterOpen = false; customize({ follow_after: m * 60 }); });
       prAfterBtns[m] = b; prAfterRow.appendChild(b);
     }
     const cu = el("button", "pr-big pr-after", "Custom…");
@@ -801,22 +791,23 @@
     prAfterBtns.custom = cu; prAfterRow.appendChild(cu);
     prAfterRow.appendChild(el("span", "pr-sheet-hint", "min"));
     prSheet.appendChild(prAfterRow);
-    prAfterCustom = minutesField(prSheet, "Minutes without input before devices come on", (n) => { prAfterOpen = false; setSetting({ follow_after: n * 60 }); });
+    prAfterCustom = minutesField(prSheet, "Minutes without input before devices come on", (n) => { prAfterOpen = false; customize({ follow_after: n * 60 }); });
 
     labelled(prSheet, "Lets through");
-    prLetsBtns = segment(prSheet, [], "What reaches your devices", (v) => setSetting({ lets_through: v }));
+    prLetsBtns = segment(prSheet, [], "What reaches your devices", (v) => customize({ lets_through: v }));
 
-    labelled(prSheet, "Until");
-    prUntilBtns = segment(prSheet, PR_UNTILS, "How long the next setting you tap lasts", (v) => {
-      prUntil = v; prForOpen = false; paintPresence(prCur);
-    });
+    // Until: how THIS activation of the selected preset ends. It paints the record's own end (overlay.until), so it can never
+    // disagree with the line above it; a tap re-activates the preset with that ending, and the TYPE is remembered for next time.
+    prUntilLab = el("div", "pr-sheet-lab", "Until");
+    prSheet.appendChild(prUntilLab);
+    prUntilBtns = segment(prSheet, PR_ENDS, "How long this preset lasts", (v) => (v === "switch" ? setStanding() : setEnding(v)));
     prForRow = el("div", "pr-sheet-seg pr-sub");
     prForRow.setAttribute("role", "group");
     prForRow.setAttribute("aria-label", "How long");
     for (const v of PR_DURS) {
       const b = el("button", "pr-big pr-dur", v);
       b.type = "button"; b.dataset.value = v;
-      b.addEventListener("click", () => { prForDur = v; prForOpen = false; paintPresence(prCur); });
+      b.addEventListener("click", () => { prForOpen = false; setEnding("timer", v); });
       prForBtns[v] = b; prForRow.appendChild(b);
     }
     const fc = el("button", "pr-big pr-dur", "Custom…");
@@ -824,15 +815,15 @@
     fc.addEventListener("click", () => { prForOpen = !prForOpen; paintPresence(prCur); if (prForOpen) prForCustom.querySelector("input").focus(); });
     prForBtns.custom = fc; prForRow.appendChild(fc);
     prSheet.appendChild(prForRow);
-    prForCustom = minutesField(prSheet, "Minutes the next setting lasts", (n) => { prForDur = n + "m"; prForOpen = false; paintPresence(prCur); });
-    prSheet.appendChild(el("p", "pr-sheet-hint pr-until-note", "The choice applies to the next setting you tap, then goes back to I switch it."));
+    prForCustom = minutesField(prSheet, "Minutes this preset lasts", (n) => { prForOpen = false; setEnding("timer", n + "m"); });
+    prSheet.appendChild(el("p", "pr-sheet-hint pr-until-note", "A time applies to this activation only; Until I say or type or For… is what the preset remembers; I switch it keeps its options as your standing default."));
 
     prSheetWho = el("p", "pr-sheet-who");          // what is sensed: read only
     prSheet.appendChild(prSheetWho);
     prSheetNote = el("p", "pr-sheet-note"); prSheetNote.hidden = true;
     prSheetNote.setAttribute("role", "status");
     prSheet.appendChild(prSheetNote);
-    prLink = el("a", "pr-sheet-link", "Tap tokens and standing default →");
+    prLink = el("a", "pr-sheet-link", "Tap tokens →");
     prLink.href = "#presence-settings";
     prLink.addEventListener("click", (e) => { e.preventDefault(); closeSheet(false); toSettings(); });
     prSheet.appendChild(prLink);
@@ -888,45 +879,6 @@
     else if (!prSheet.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
   }
 
-  // The Standing default block (the settings section): the same three rows bound to `base` only, so "Back" always has
-  // somewhere to return to that he chose. A tap here writes the standing default and clears any overlay (until = switch).
-  function buildStanding() {
-    stPanel = el("div", "panel k-list dev-panel pr-standing");
-    stPanel.dataset.modes = ALL_MODES;
-    stPanel.hidden = true;
-    const ph = el("div", "phead");
-    ph.appendChild(el("h2", null, "Standing default"));
-    stPanel.appendChild(ph);
-    const body = el("div", "pbody dev-body");
-    body.appendChild(el("p", "dev-note pr-intro", "What Back returns to, and what holds when nothing else is set. Follow brings pings to your devices until you next type a message to a desk, once the time you choose has passed."));
-    labelled(body, "Devices");
-    stDevBtns = segment(body, PR_DEVICES, "Standing default: whether pings reach your devices", (v) => setStanding({ devices: v }));
-    const ar = el("div", "pr-sheet-seg pr-sub");
-    ar.setAttribute("role", "group");
-    ar.setAttribute("aria-label", "Standing default: minutes without input before devices come on");
-    stAfterRow = ar;
-    ar.appendChild(el("span", "pr-sheet-hint", "after"));
-    for (const m of PR_AFTER) {
-      const b = el("button", "pr-big pr-after", String(m));
-      b.type = "button"; b.dataset.value = String(m);
-      b.addEventListener("click", () => setStanding({ follow_after: m * 60 }));
-      stAfterBtns[m] = b; ar.appendChild(b);
-    }
-    ar.appendChild(el("span", "pr-sheet-hint", "min"));
-    body.appendChild(ar);
-    stAfterCustom = minutesField(body, "Standing default: custom minutes", (n) => setStanding({ follow_after: n * 60 }));
-    stAfterCustom.hidden = false;
-    labelled(body, "Lets through");
-    stLetsBtns = segment(body, [], "Standing default: what reaches your devices", (v) => setStanding({ lets_through: v }));
-    stNote = el("p", "dev-note"); stNote.hidden = true;
-    stNote.setAttribute("role", "status");
-    body.appendChild(stNote);
-    stPanel.appendChild(body);
-    return stPanel;
-  }
-  function stSay(msg) { stNote.textContent = msg; stNote.hidden = !msg; }
-
-
   // The tap-token block of the settings section (the word buttons moved to the sheet)
   function buildTaps() {
     prPanel = el("div", "panel k-list dev-panel pr-panel");
@@ -969,7 +921,7 @@
 
   // the chip and the sheet follow the read; a refusal or no web push takes the chip away quietly
   function prShow(on) {
-    prPanel.hidden = !on; stPanel.hidden = !on; syncSection();
+    prPanel.hidden = !on; syncSection();
     if (prChip) prChip.hidden = !on;
     if (!on) closeSheet(false);
   }
@@ -987,7 +939,6 @@
     parts.push(v.remote && v.remote.at ? "Remote: " + String(v.remote.source || "input").replace(/-/g, " ") + " " + agoText(v.remote.at) : "Remote: none");
     return parts.join(" · ");
   }
-  function untilValue() { return prUntil === "for" ? prForDur : prUntil; }
 
   function paintChip(v) {
     if (!prChip) return;
@@ -1017,42 +968,58 @@
     }
   }
 
+  // the selected preset: the one that stands, else Back; "" for an overlay a command made without a preset
+  function selected() {
+    const v = prCur;
+    if (!v) return "back";
+    const ov = v.overlay || null;
+    return ov ? (ov.preset || "") : "back";
+  }
   function paintPresence(v) {
     if (!v) return;
     prCur = v;
     paintChip(v);
     prSheetText.textContent = v.line || "";
-    const ov = v.overlay || null, eff = v.effective || v.base || {}, base = v.base || {};
-    pressed(prBtns, ov ? (ov.preset || "") : "back");
+    const ov = v.overlay || null, eff = v.effective || v.base || {};
+    const sel = selected();
+    const pv = v.presets || {};
+    const own = sel && pv[sel] ? pv[sel] : null;
+    const opts = own ? own.options : eff;          // a preset's rows read ITS options; a command's overlay reads what is in force
+    pressed(prBtns, sel);
+    for (const [w] of PR_PRESETS) {
+      const c = !!(pv[w] && pv[w].custom);
+      prBtns[w].classList.toggle("pr-custom", c);
+      prBtns[w].title = PR_GLOSS[w] + (c ? " (changed from the defaults)" : "");
+    }
     prEndLoud.hidden = !(ov && ov.preset === "loud");
-    pressed(prDevBtns, eff.devices);
-    prAfterRow.hidden = eff.devices !== "follow";
-    if (eff.devices !== "follow") prAfterOpen = false;
-    paintAfter(prAfterBtns, prAfterCustom, eff.follow_after, prAfterOpen && eff.devices === "follow");
-    paintLets(prLetsBtns, v.lets, (x) => setSetting({ lets_through: x }));
-    paintLets(stLetsBtns, v.lets, (x) => setStanding({ lets_through: x }));
-    pressed(prLetsBtns, eff.lets_through);
-    pressed(prUntilBtns, prUntil);
-    prForRow.hidden = prUntil !== "for";
-    if (prUntil !== "for") prForOpen = false;
-    const forMin = /^(\d+)m$/.exec(prForDur);
-    const forKnown = PR_DURS.indexOf(prForDur) >= 0;
-    for (const k of PR_DURS) prForBtns[k].setAttribute("aria-pressed", forKnown && k === prForDur ? "true" : "false");
-    prForBtns.custom.setAttribute("aria-pressed", !forKnown || prForOpen ? "true" : "false");
-    prForBtns.custom.textContent = !forKnown && !prForOpen && forMin ? "Custom " + forMin[1] : "Custom…";
-    prForCustom.hidden = !(prUntil === "for" && prForOpen);
+    prCustomLine.hidden = !(own && own.custom);
+    if (own && own.custom) prCustomText.textContent = own.summary;
+    prFreeNote.hidden = sel !== "";
+    pressed(prDevBtns, opts.devices);
+    prAfterRow.hidden = opts.devices !== "follow";
+    if (opts.devices !== "follow") prAfterOpen = false;
+    paintAfter(prAfterBtns, prAfterCustom, opts.follow_after, prAfterOpen && opts.devices === "follow");
+    paintLets(prLetsBtns, v.lets, (x) => customize({ lets_through: x }));
+    pressed(prLetsBtns, opts.lets_through);
+    // Until: the record's own end for the preset that stands (Back has none, a command's overlay is not ours to re-time)
+    // no overlay = the standing default holds until he switches it: "I switch it" is what the record says then, never a page state
+    const showUntil = !ov || !!ov.preset;
+    prUntilLab.hidden = !showUntil; prUntilBtns._seg.hidden = !showUntil;
+    const timer = !!(ov && ov.preset && ov.until && ov.until.kind === "timer");
+    pressed(prUntilBtns, !showUntil ? "" : !ov ? "switch" : timer ? "timer" : "input");
+    prForRow.hidden = !timer;
+    if (!timer) prForOpen = false;
+    const mins = timer ? Math.round((Number(ov.until.at) - Number(ov.ts)) / 60) : 0;
+    const forKey = mins === 60 ? "1h" : mins === 120 ? "2h" : mins + "m";
+    for (const k of PR_DURS) prForBtns[k].setAttribute("aria-pressed", timer && k === forKey ? "true" : "false");
+    const known = PR_DURS.indexOf(forKey) >= 0;
+    prForBtns.custom.setAttribute("aria-pressed", timer && (!known || prForOpen) ? "true" : "false");
+    prForBtns.custom.textContent = timer && !known && !prForOpen ? "Custom " + mins : "Custom…";
+    prForCustom.hidden = !(timer && prForOpen);
     prSheetWho.textContent = sensingText(v);
-    // the Standing default block: the same rows, bound to the base alone
-    pressed(stDevBtns, base.devices);
-    stAfterRow.hidden = base.devices !== "follow";
-    paintAfter(stAfterBtns, null, base.follow_after, false);
-    stAfterCustom.hidden = base.devices !== "follow";
-    if (document.activeElement !== stAfterCustom.querySelector("input")) stAfterCustom.querySelector("input").value = String(Math.round(Number(base.follow_after) / 60));
-    pressed(stLetsBtns, base.lets_through);
     if (Array.isArray(v.tokens)) paintTaps(v.tokens);
     prShow(true);
   }
-
 
   function paintTaps(tokens) {
     prTapList.replaceChildren();
@@ -1101,12 +1068,12 @@
   }
 
   function prDisable(on) {
-    for (const group of [prBtns, prDurBtns, prDevBtns, prAfterBtns, prLetsBtns, prUntilBtns, prForBtns, stDevBtns, stAfterBtns, stLetsBtns]) {
+    for (const group of [prBtns, prDevBtns, prAfterBtns, prLetsBtns, prUntilBtns, prForBtns]) {
       for (const b of Object.values(group)) b.disabled = on;
     }
-    prEndLoud.disabled = on;
+    prEndLoud.disabled = on; prResetBtn.disabled = on;
   }
-  // One write at a time. The reply is the server's view after the write, and the sheet, the chip and the Standing default all
+  // One write at a time. The reply is the server's view after the write, and the sheet, the chip and the options all
   // repaint from it (never from local state). A refusal says why and repaints from a fresh read, so nothing shows a setting that did
   // not land.
   async function writePresence(body, opts) {
@@ -1126,17 +1093,35 @@
     }
     return ok;
   }
-  function setPreset(w) {
-    const body = { preset: w };
-    if (PR_TIMED.indexOf(w) >= 0) body.for = prDur;
+  function setPreset(w) { return writePresence({ preset: w }); }
+  // the options rows belong to the selected preset; a command's overlay has none to change
+  function customize(partial) {
+    const sel = selected();
+    if (!sel) { sheetSay("A command set this for a while. Tap a preset to change its options."); return Promise.resolve(false); }
+    return writePresence(Object.assign({ customize: sel }, partial));
+  }
+  // "I switch it": the preset's own options become the standing default and the overlay clears (the direct write with until
+  // "switch", which the server already takes); nothing is added to the record's shape. Back's options ARE the standing default, so it is a no-op there.
+  function setStanding() {
+    const sel = selected();
+    const own = sel && prCur && prCur.presets && prCur.presets[sel];
+    if (!sel || sel === "back" || !own || !(prCur.overlay && prCur.overlay.preset)) return Promise.resolve(true);
+    const o = own.options;
+    return writePresence({ devices: o.devices, follow_after: o.follow_after, lets_through: o.lets_through, until: "switch" });
+  }
+  // a tap on Until re-activates the standing preset with that ending; the type is remembered, the time is not
+  function setEnding(kind, dur) {
+    const sel = selected();
+    if (!sel) return Promise.resolve(false);
+    if (sel === "back") { sheetSay("Back has no ending: it is your standing default, until you switch it."); return Promise.resolve(false); }
+    const ov = prCur && prCur.overlay;
+    const own = prCur && prCur.presets && prCur.presets[sel];
+    // already how it ends AND already what the preset remembers: nothing to write
+    if (!dur && ov && ov.until && ov.until.kind === kind && own && own.options.until === kind) return Promise.resolve(true);
+    const body = { preset: sel, ending: kind };
+    if (kind === "timer") body.for = dur || "1h";
     return writePresence(body);
   }
-  async function setSetting(partial) {
-    const ok = await writePresence(Object.assign({}, partial, { until: untilValue() }));
-    if (ok) { prUntil = "switch"; prForOpen = false; paintPresence(prCur); }   // the choice was for that one setting
-    return ok;
-  }
-  function setStanding(partial) { return writePresence(Object.assign({}, partial, { until: "switch" }), { say: stSay }); }
 
 
   let tapBusy = false;     // one tap-token change at a time: a second create would replace the first one's only shown secret

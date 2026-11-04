@@ -3066,12 +3066,17 @@ body.ke .masthead .indicators .pr-chip { gap: var(--sp-3); }
 .pr-sheet-seg[hidden], .pr-custom[hidden] { display: none; }
 .pr-sheet-hint { color: var(--label); font: var(--fw-regular) var(--fs-micro) var(--sans); }
 .pr-until-note { margin: var(--sp-2) 0 0; }
-.pr-custom { display: flex; gap: var(--sp-2); align-items: center; margin-top: var(--sp-2); }
+form.pr-custom { display: flex; gap: var(--sp-2); align-items: center; margin-top: var(--sp-2); }
 .pr-num { width: 5.5em; min-height: 36px; padding: 0 var(--sp-3); box-sizing: border-box; color: var(--text); background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-body) var(--sans); }
 .pr-num[aria-invalid="true"] { border-color: var(--bad); }
 .pr-custom-go { min-height: 36px; }
 .pr-big { min-height: 36px; padding: var(--sp-2) var(--sp-3); font: var(--fw-semibold) var(--fs-meta)/1.1 var(--sans); color: var(--text); background: none; border: 1px solid var(--hair-2); border-radius: var(--r-md); cursor: pointer; }
 .pr-big:hover { border-color: var(--text); }
+.pr-big { position: relative; }
+.pr-big.pr-custom::after { content: ""; position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent, currentColor); }
+.pr-custom-line { display: flex; align-items: center; gap: var(--sp-3); margin-top: var(--sp-2); }
+.pr-custom-line .pr-sheet-hint { flex: 1 1 auto; }
+.pr-custom-line .pr-reset { flex: 0 0 auto; }
 .pr-big:disabled { opacity: .5; cursor: default; }
 .pr-big[aria-pressed="true"] { background: var(--card-2); border-color: var(--text); }
 .pr-endloud { width: 100%; margin-top: var(--sp-2); }
@@ -3105,12 +3110,10 @@ body.ke .dev-zone.pr-settings .zone-head { display: flex; }
 .pr-settings .dev-row { padding: var(--sp-3) 0; }
 .pr-settings .pr-new-form { margin-top: var(--sp-3); }
 .pr-settings-grid { gap: var(--sp-4); }
-.pr-standing .pr-sheet-seg { max-width: 460px; }
 .pr-checks { display: flex; flex-wrap: wrap; gap: var(--sp-3); flex: 1 1 100%; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); }
 .pr-new .dev-url { width: 100%; margin: var(--sp-3) 0; }
 @media (max-width: 520px) {
   .pr-revoke { min-height: var(--hit-min, 44px); }
-  .pr-standing .pr-big { min-height: var(--hit-min, 44px); }
 }
 
 /* ---- The sign sheet and /pair at every size (Phill 11-01: "why is it this narrow little strip on a huge empty page"). One page, drawn for the

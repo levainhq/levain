@@ -358,7 +358,7 @@ def test_the_page_carries_the_chip_and_the_script_the_sheet_and_no_client_name()
     assert 'id="presencebtn"' in html and html.index('id="presencebtn"') < html.index('id="refresh"')
     js = _asset("devices_panel.js")
     for needle in ("/webpush/presence", "/webpush/presence/set", "/webpush/presence/token/new", "/webpush/presence/token/revoke",
-                   "Tap tokens", "X-Levain-Presence-Token", "Copy", "presence-settings", "pr-settings-grid", "Standing default",
+                   "Tap tokens", "X-Levain-Presence-Token", "Copy", "presence-settings", "pr-settings-grid",
                    "Lets through", "Until I say or type", "chip.word"):
         assert needle in js, needle
     for gone in ("Pings go to", "buildPolicy", "/webpush/policy", "route_source", "PR_ROUTES"):   # the route row and the policy block are gone
@@ -376,17 +376,17 @@ def test_the_chip_reads_the_record_and_the_sheet_posts_each_body_and_repaints_fr
             _opened(),
             {"eval": "document.getElementById('pr-sheet').contains(document.activeElement)"},
             {"eval": "document.querySelector('.pr-sheet-text').textContent"},
-            {"do": "document.querySelector('.pr-dur[data-value=\"2h\"]').click(); document.querySelector('.pr-sheet-word[data-value=\"quiet\"]').click()",
-             "until": f"{_CHIP_TEXT}.startsWith('Quiet 1')", "ms": 8000},
-            {"eval": "[document.getElementById('pr-sheet').hidden, localStorage.getItem('levain_presence_for'), document.querySelector('.pr-sheet-text').textContent]"},
-            {"do": "document.querySelector('.pr-sheet-word[data-value=\"away\"]').click()", "until": f"{_CHIP_TEXT}.startsWith('Away')", "ms": 8000},
-            # a setting with Until = Until I say or type: an overlay with no preset, then the choice goes back to I switch it
-            {"do": "document.querySelector('#pr-sheet [aria-label=\"How long the next setting you tap lasts\"] [data-value=\"input\"]').click(); "
-                   "document.querySelector('#pr-sheet [aria-label=\"What reaches your devices\"] [data-value=\"approvals\"]').click()",
-             "until": f"{_CHIP_TEXT}.startsWith('For a while')", "ms": 8000},
-            {"eval": "[document.querySelector('.pr-sheet-text').textContent, document.querySelector('#pr-sheet [aria-label=\"How long the next setting you tap lasts\"] [aria-pressed=true]').dataset.value]"},
-            # Devices Off with I switch it: the standing default, which clears the overlay
-            {"do": "document.querySelector('#pr-sheet [aria-label=\"Whether pings reach your devices\"] [data-value=\"off\"]').click()",
+            {"do": "document.querySelector('.pr-sheet-word[data-value=\\\"quiet\\\"]').click()",
+             "until": f"{_CHIP_TEXT}.startsWith('Quiet 6')", "ms": 8000},
+            {"eval": "[document.getElementById('pr-sheet').hidden, document.querySelector('.pr-sheet-text').textContent]"},
+            {"do": "document.querySelector('.pr-sheet-word[data-value=\\\"away\\\"]').click()", "until": f"{_CHIP_TEXT}.startsWith('Away')", "ms": 8000},
+            # the options rows belong to the standing preset: Away is changed to let approvals through, and keeps that
+            {"do": "document.querySelector('#pr-sheet [aria-label=\\\"What reaches your devices\\\"] [data-value=\\\"approvals\\\"]').click()",
+             "until": "document.querySelector('.pr-sheet-word[data-value=\\\"away\\\"]').classList.contains('pr-custom')", "ms": 8000},
+            {"eval": "[document.querySelector('.pr-sheet-text').textContent, document.querySelector('.pr-custom-line').hidden]"},
+            # Back's options are the standing default: Devices Off there, which clears the overlay
+            {"do": "document.querySelector('.pr-sheet-word[data-value=\\\"back\\\"]').click()", "until": f"!{_CHIP_TEXT}.startsWith('Away')", "ms": 8000},
+            {"do": "document.querySelector('#pr-sheet [aria-label=\\\"Whether pings reach your devices\\\"] [data-value=\\\"off\\\"]').click()",
              "until": f"{_CHIP_TEXT}.startsWith('Desk only')", "ms": 8000},
             {"do": "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))", "until": "document.getElementById('pr-sheet').hidden", "ms": 4000},
             {"eval": "[...document.querySelectorAll('#pr-sheet [aria-label=\"What reaches your devices\"] button')].map(b => [b.dataset.value, b.textContent, b.title])"},
@@ -396,15 +396,15 @@ def test_the_chip_reads_the_record_and_the_sheet_posts_each_body_and_repaints_fr
     assert v[1].startswith("Follow")                                       # no overlay: the standing default
     assert v[2] == ["Away", "Back", "Quiet", "Sleep", "Loud"]
     assert v[4] is True and v[5].startswith("Pings now: ")                 # focus in the sheet, which opens on the server's own line
-    assert v[7][0] is False and v[7][1] == "2h" and "quiet" in v[7][2]     # the sheet stays open to show the new line; the pick is remembered
+    assert v[7][0] is False and "quiet" in v[7][1]                         # the sheet stays open to show the new line
     from levain.webpush import intent
-    assert f"Lets through: {intent.lets_label('approvals')}" in v[10][0] and "a message you type into a session" in v[10][0] and v[10][1] == "switch"
+    assert f"Lets through: {intent.lets_label('approvals')}" in v[10][0] and "a message you type into a session" in v[10][0] and v[10][1] is False
     from levain.webpush import intent as _in
     assert v[-2] == [[o["value"], o["label"], o["describe"]] for o in _in.lets_options()]     # the buttons read the server's words
     assert v[-1] is True
     rows = [json.loads(l) for l in (q / "webpush" / presence.LOG_NAME).read_text().splitlines()]
-    assert [r["word"] for r in rows][:3] == ["quiet", "away", "set lets approvals until input"]
-    assert rows[3]["word"] == "set devices off"
+    assert [r["word"] for r in rows][:3] == ["quiet", "away", "set away lets_through"]
+    assert rows[3]["word"] == "back" and rows[4]["word"] == "set devices off"
 
 
 @needs_browser
@@ -461,9 +461,6 @@ def test_the_link_reveals_the_settings_and_a_tap_token_is_made_shown_once_and_re
             _opened(),
             {"do": "document.querySelector('.pr-sheet-link').click()", "until": "document.getElementById('pr-sheet').hidden", "ms": 4000},
             {"eval": f"[document.activeElement.id, Math.round({settings}.getBoundingClientRect().top) < window.innerHeight]"},
-            # the Standing default block: the same rows on the base alone; a tap writes the base and the line follows
-            {"do": f"{settings}.querySelector('.pr-standing [aria-label=\"Standing default: what reaches your devices\"] [data-value=\"needs\"]').click()",
-             "until": f"{settings}.querySelector('.pr-standing [aria-label=\"Standing default: what reaches your devices\"] [data-value=\"needs\"]').getAttribute('aria-pressed')==='true'", "ms": 8000},
             {"do": "document.querySelector('.pr-name').value='Door'; document.querySelector('.pr-new-form button[type=submit]').click()",
              "until": "!document.querySelector('.pr-new').hidden", "ms": 8000},
             {"eval": "document.querySelector('.pr-new .dev-url').value.length"},
@@ -475,10 +472,10 @@ def test_the_link_reveals_the_settings_and_a_tap_token_is_made_shown_once_and_re
     v = out["values"]
     assert v[1] == "Presence & notification settings"
     assert v[5][0] == "presence-settings" and v[5][1] is True
-    assert v[8] >= 40                                                       # the token was shown
-    assert v[11][0] is True and "away, back, quiet, desk, devices" in v[11][1]
+    assert v[7] >= 40                                                       # the token was shown
+    assert v[10][0] is True and "away, back, quiet, desk, devices" in v[10][1]
     assert presence_tokens.list_public(q) == []
-    assert intent.read(q)["base"]["lets_through"] == "needs" and intent.read(q)["overlay"] is None
+    assert intent.read(q)["overlay"] is None
 
 
 # ---- the record over HTTP ------------------------------------------------------------------------------------------
@@ -616,7 +613,7 @@ def test_the_chip_paints_the_servers_chip_not_a_state_of_its_own(rig, tmp_path, 
 
 def test_the_panel_copy_says_what_the_next_setting_does_and_what_the_standing_default_is():
     js = _asset("devices_panel.js")
-    assert "then goes back to I switch it" in js and "What Back returns to" in js
+    assert "A time applies to this activation only" in js and "Standing default" not in js     # the bottom panel is gone
     assert "paintChip" in js and "v.line" in js
 
 
@@ -710,3 +707,98 @@ def test_the_page_runs_one_timer_for_the_follow_line_and_the_device_list():
     """Shape only: the 6 s and the 30 s timers both read the line; one timer now carries both."""
     start = _asset("devices_panel.js").split("function start()")[1]
     assert start.count("setInterval(") == 1 and "clearInterval(pulse)" in start
+
+
+# ---- presets (Phill np-8a2d86ca, 11-04): the Until row paints the record, never a state of its own -----------------------
+
+_UNTIL_SEL = ("#pr-sheet [aria-label=\"How long this preset lasts\"] [aria-pressed=true], "
+              "#pr-sheet [aria-label=\"How long\"] [aria-pressed=true]")
+
+
+@needs_browser
+def test_the_until_row_shows_the_ending_the_record_holds_after_a_preset_is_tapped(rig, tmp_path, monkeypatch):
+    src, q = rig
+    pressed = "[...document.querySelectorAll('" + _UNTIL_SEL + "')].map(b => b.dataset.value)"
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000},
+            _opened(),
+            {"do": "document.querySelector('.pr-sheet-word[data-value=\"away\"]').click()", "until": f"{_CHIP_TEXT}.startsWith('Away')", "ms": 8000},
+            {"eval": pressed},
+            {"do": "document.querySelector('.pr-sheet-word[data-value=\"quiet\"]').click()", "until": f"{_CHIP_TEXT}.startsWith('Quiet')", "ms": 8000},
+            {"eval": pressed},
+        ])
+    rec = json.loads((q / "webpush" / intent.FILE_NAME).read_text())
+    assert rec["overlay"]["preset"] == "quiet" and rec["overlay"]["until"]["kind"] == "timer"
+    v = out["values"]
+    assert v[-3] == ["input"], v     # Away ends on his next word or a typed message: the row says so, not "I switch it"
+    assert v[-1] == ["timer", "1h"], v   # Quiet ends on a timer: the row says so and shows its duration
+
+
+@needs_browser
+def test_i_switch_it_makes_the_preset_the_standing_default_and_the_row_paints_the_record(rig, tmp_path, monkeypatch):
+    """Until offers I switch it again (no schema change: the direct write with until=switch). On Back it is pressed because no
+    overlay is on file; after Away + I switch it the overlay is gone and Away's options are the base."""
+    src, q = rig
+    pressed = "[...document.querySelectorAll('" + _UNTIL_SEL + "')].map(b => b.dataset.value)"
+    sw = "document.querySelector('#pr-sheet [aria-label=\"How long this preset lasts\"] [data-value=\"switch\"]')"
+    with _signed(src, q) as (port, _):
+        out = _drive(tmp_path, monkeypatch, f"http://127.0.0.1:{port}/#write_token={T}", [
+            {"until": _SHOWN, "ms": 20000},
+            _opened(),
+            {"eval": pressed},
+            {"do": "document.querySelector('.pr-sheet-word[data-value=\"away\"]').click()", "until": f"{_CHIP_TEXT}.startsWith('Away')", "ms": 8000},
+            {"eval": pressed},
+            {"do": f"{sw}.click()", "until": f"{pressed}[0] === 'switch'", "ms": 8000},
+            {"eval": pressed},
+        ])
+    rec = json.loads((q / "webpush" / intent.FILE_NAME).read_text())
+    assert rec["overlay"] is None and rec["base"]["devices"] == "on", rec
+    v = [x for x in out["values"] if isinstance(x, list)]      # the eval results (the do/until steps answer True)
+    assert v == [["switch"], ["input"], ["switch"]], out["values"]
+
+
+def _overlay(q) -> dict:
+    return json.loads((q / "webpush" / intent.FILE_NAME).read_text())["overlay"]
+
+
+def test_a_preset_keeps_the_options_it_was_changed_to_and_only_the_ending_type_outlives_an_activation(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        st, got, _ = _call(port, "POST", SET, {"customize": "away", "lets_through": "approvals"}, token=T)
+        assert st == 200 and got["presets"]["away"]["custom"] is True and got["presets"]["quiet"]["custom"] is False
+        assert "Lets through: Approvals" in got["presets"]["away"]["summary"]
+        _call(port, "POST", SET, {"preset": "back"}, token=T)
+        _call(port, "POST", SET, {"preset": "away"}, token=T)                 # a later tap starts from what Away was changed to
+        assert _overlay(q)["lets_through"] == "approvals" and _overlay(q)["until"] == {"kind": "input"}
+        _call(port, "POST", SET, {"preset": "quiet"}, token=T)
+        assert _overlay(q)["lets_through"] == "needs"                          # another preset is untouched
+        # this activation ends on a 2h timer; the type is remembered, the 2h is not
+        st, got, _ = _call(port, "POST", SET, {"preset": "away", "ending": "timer", "for": "2h"}, token=T)
+        assert st == 200 and abs(_overlay(q)["until"]["at"] - (time.time() + 7200)) < 30
+        _call(port, "POST", SET, {"preset": "back"}, token=T)
+        _call(port, "POST", SET, {"preset": "away"}, token=T)
+        assert _overlay(q)["until"]["kind"] == "timer" and abs(_overlay(q)["until"]["at"] - (time.time() + presence.DEFAULT_SECS)) < 30
+        # Quiet remembered to end on input still takes a duration a caller gives, and an ending Back cannot have is refused
+        _call(port, "POST", SET, {"preset": "quiet", "ending": "input"}, token=T)
+        assert _call(port, "POST", SET, {"preset": "quiet", "for": "30m"}, token=T)[0] == 200 and _overlay(q)["until"]["kind"] == "timer"
+        assert _call(port, "POST", SET, {"preset": "back", "ending": "garbage"}, token=T)[0] == 422
+        _call(port, "POST", SET, {"preset": "away"}, token=T)
+        # a change to the preset that stands lands now and keeps how it ends
+        end = _overlay(q)["until"]
+        _call(port, "POST", SET, {"customize": "away", "devices": "follow"}, token=T)
+        assert _overlay(q)["devices"] == "follow" and _overlay(q)["until"] == end
+
+
+def test_reset_returns_a_preset_and_back_to_the_system_defaults(rig):
+    src, q = rig
+    with _signed(src, q) as (port, _):
+        _call(port, "POST", SET, {"customize": "sleep", "lets_through": "nothing", "until": "timer"}, token=T)
+        _call(port, "POST", SET, {"customize": "back", "devices": "off"}, token=T)
+        st, got, _ = _call(port, "POST", SET, {"reset": "sleep"}, token=T)
+        assert st == 200 and got["presets"]["sleep"]["custom"] is False and got["presets"]["back"]["custom"] is True
+        _call(port, "POST", SET, {"preset": "sleep"}, token=T)
+        assert _overlay(q)["lets_through"] == "needs" and _overlay(q)["until"] == {"kind": "input"}
+        st, got, _ = _call(port, "POST", SET, {"reset": "back"}, token=T)
+        assert st == 200 and got["presets"]["back"]["custom"] is False and got["base"]["devices"] == "follow"
+        assert _call(port, "POST", SET, {"customize": "nowhere", "devices": "on"}, token=T)[0] == 422
