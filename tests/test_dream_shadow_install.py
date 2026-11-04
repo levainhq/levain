@@ -687,6 +687,24 @@ def test_a_scratch_dir_swapped_for_a_symlink_after_the_check_is_refused_under_th
     assert list(live.iterdir()) == []
 
 
+def test_a_swap_between_the_mkdir_and_the_lock_is_caught_by_the_check_under_the_lock(env, flow, tmp_path, monkeypatch):
+    live = tmp_path / "home" / ".anneal-memory" / "x"
+    live.mkdir(parents=True)
+    real = sh._lock
+
+    def swap_then_lock(store_dir, name="wrap.lock"):
+        if store_dir == env["scratch"] and not env["scratch"].is_symlink():
+            env["scratch"].rmdir()                         # the night lock just made it; replace it with a symlink
+            env["scratch"].symlink_to(live, target_is_directory=True)
+        return real(store_dir, name)
+
+    monkeypatch.setattr(sh, "_lock", swap_then_lock)
+    with pytest.raises(sh.ShadowRefused, match="live store"):
+        with sh.night_lock(sh.read_flow_day(flow.root, DAY), env["scratch"] / "memory.db"):
+            pytest.fail("the night ran in the live store")
+    assert [p.name for p in live.iterdir()] == [sh.NIGHT_LOCK]    # the lock file only; nothing the night writes
+
+
 def test_a_scratch_dir_holding_a_symlink_is_refused_under_the_lock(env, flow, tmp_path):
     _shadow(env, flow)
     row = _row(env)
