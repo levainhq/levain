@@ -463,6 +463,14 @@ def run_dream_shadow(args: argparse.Namespace) -> int:
     from levain.dream import ready as rd
     from levain.dream import shadow as sh
 
+    if args.composed is not None and args.shadow_dir is None:
+        print("levain dream shadow: --composed needs --shadow-dir (without a seeded scratch store there is nothing to "
+              "compare it against)", file=sys.stderr)
+        return 2
+    if args.agent_dir and not args.agent_id:
+        print("levain dream shadow: --agent-dir needs --agent-id: the no-shadow-done check is scoped to the shadow "
+              "agent, and every agent's done rows would answer it otherwise", file=sys.stderr)
+        return 2
     out: dict[str, object] = {"day": args.day}
     zone = args.zone or (_host_zone() if args.agent_dir else None)
     occurrences = None
@@ -478,6 +486,9 @@ def run_dream_shadow(args: argparse.Namespace) -> int:
             seeded = sh.seed(v.flow_day, db)
         except sh.ShadowRefused as exc:
             out["seed"] = {"refused": exc.kind, "why": exc.why}
+            code = 3
+        except OSError as exc:
+            out["seed"] = {"refused": sh.KIND_UNREADABLE, "why": f"{type(exc).__name__}: {exc}"}
             code = 3
         else:
             out["seed"] = {"db": str(seeded.db), "files": list(seeded.files)}

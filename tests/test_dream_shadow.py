@@ -167,7 +167,10 @@ def test_an_unreadable_ledger_line_blocks_only_when_it_could_be_the_day(flow):
     v = sh.day_ready(flow.root, DAY)
     assert (v.verdict, v.kind) == (rd.UNREADABLE, sh.KIND_UNREADABLE)       # cannot rule out that it was this day
     flow.ledger([Flow.end(RUN, DAY)], raw_extra="{torn\n")
-    assert sh.day_ready(flow.root, DAY).ready                                  # the day is there; the torn line is not it
+    assert sh.day_ready(flow.root, DAY).verdict == rd.UNREADABLE               # a torn TAIL is never read past (B3)
+    flow.ledger([Flow.end(RUN, DAY)])
+    (flow.root / sh.LEDGER).write_text("{torn\n" + (flow.root / sh.LEDGER).read_text(), encoding="utf-8")
+    assert sh.day_ready(flow.root, DAY).ready                                  # a torn line mid-file is not the day
     (flow.root / sh.LEDGER).unlink()
     assert sh.day_ready(flow.root, DAY).verdict == rd.UNREADABLE
 
@@ -436,6 +439,9 @@ def test_the_compose_notes_never_reach_his(flow, tmp_path):
 
 # -------------------------------------------------------------------------------------------------------- the night
 
+HIST = dict(occurrences=lambda: [], zone="America/New_York")
+
+
 def stub_compose(calls: list, text: str = SHADOW_TEXT):
     def compose(fd, db, occ):
         calls.append((fd.run_id, db, occ))
@@ -445,7 +451,7 @@ def stub_compose(calls: list, text: str = SHADOW_TEXT):
 
 def test_a_night_runs_the_pieces_in_order_and_builds_the_card(flow, shadow_db, tmp_path):
     calls: list = []
-    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="occ-1", compose=stub_compose(calls))
+    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="occ-1", compose=stub_compose(calls), **HIST)
     assert r.state == "composed" and r.card is not None and r.card.authority_relevant is False
     assert len(calls) == 1 and calls[0][0] == RUN
     assert (tmp_path / "occ" / cd.DIFF_FILE).is_file()
@@ -458,17 +464,17 @@ def test_a_diverged_input_never_reaches_the_compose(flow, shadow_db, tmp_path):
     pkg["package"] = {}
     (flow.run / sh.PACKAGE).write_text(json.dumps(pkg))
     calls: list = []
-    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="occ-1", compose=stub_compose(calls))
+    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="occ-1", compose=stub_compose(calls), **HIST)
     assert r.state == "skipped-no-input" and r.reason.startswith("quiet/input-diverged:") and calls == []
     assert fd.run_id == RUN
 
 
 def test_a_quiet_or_damaged_day_never_reaches_the_compose(flow, shadow_db, tmp_path):
     calls: list = []
-    r = sh.run_night(flow.root, "2026-11-09", shadow_db, tmp_path / "occ", occurrence="o", compose=stub_compose(calls))
+    r = sh.run_night(flow.root, "2026-11-09", shadow_db, tmp_path / "occ", occurrence="o", compose=stub_compose(calls), **HIST)
     assert r.state == "skipped-no-input" and r.reason.startswith("quiet/no-flow-dream") and calls == []
     (flow.snap / sn.DB_BACKUP).write_bytes(b"x")
-    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="o", compose=stub_compose(calls))
+    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="o", compose=stub_compose(calls), **HIST)
     assert r.reason.startswith("unreadable/snapshot-damaged") and calls == [] and not shadow_db.exists()
 
 
@@ -476,7 +482,7 @@ def test_a_compose_that_raises_ends_the_night_failed(flow, shadow_db, tmp_path):
     def boom(fd, db, occ):
         raise RuntimeError("the mind died")
 
-    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="o", compose=boom)
+    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="o", compose=boom, **HIST)
     assert r.state == "failed" and "the mind died" in r.reason and r.card is None
 
 
@@ -546,3 +552,143 @@ def test_the_verb_refuses_a_live_looking_directory(flow, tmp_path):
     code, out = run_verb("--flow-root", str(flow.root), "--day", DAY, "--shadow-dir", str(d))
     assert code == 3
     assert (d / "memory.db").read_bytes() == b"x"
+
+
+# --- D1 L3 r2 fixes, commit B (B1-B10) ---------------------------------------------------------------------------------
+
+def test_a_seed_that_dies_midway_leaves_a_dir_the_retry_can_reuse(flow, shadow_db, monkeypatch):
+    # B1: the marker was written last, so a crash after the db copy bricked the dir for every retry
+    fd = sh.read_flow_day(flow.root, DAY)
+    real, n = sh._put, {"n": 0}
+
+    def flaky(src, dest):
+        n["n"] += 1
+        if n["n"] == 2:
+            raise OSError("disk went away")
+        real(src, dest)
+
+    monkeypatch.setattr(sh, "_put", flaky)
+    with pytest.raises(OSError):
+        sh.seed(fd, shadow_db)
+    monkeypatch.setattr(sh, "_put", real)
+    sh.seed(fd, shadow_db)
+    assert sha(shadow_db) == flow.manifest()["db_backup_sha256"]
+
+
+def test_a_manifest_missing_a_required_tier_is_damaged(flow):
+    # B2
+    m = flow.manifest()
+    del m["files"]["crystal"]
+    flow.set_manifest(m)
+    v = sh.day_ready(flow.root, DAY)
+    assert (v.verdict, v.kind) == (rd.UNREADABLE, sh.KIND_DAMAGED) and "crystal" in v.reason
+
+
+def test_a_torn_ledger_tail_does_not_select_an_older_committed_end(flow):
+    # B3
+    flow.ledger([Flow.end("2026-11-02-old00000", DAY), Flow.end(RUN, DAY)], raw_extra='{"event": "end", "id": "x"')
+    v = sh.day_ready(flow.root, DAY)
+    assert (v.verdict, v.kind) == (rd.UNREADABLE, sh.KIND_UNREADABLE) and "tail unreadable" in v.reason
+
+
+def test_a_night_without_the_occurrence_history_is_refused_not_run(flow, shadow_db, tmp_path):
+    # B4: None meant "never shadowed", a second Opus night for the same day
+    calls: list = []
+    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="o", compose=stub_compose(calls))
+    assert r.state == "skipped-no-input" and "history" in r.reason and calls == [] and not shadow_db.exists()
+
+
+def test_the_verb_with_an_agent_dir_and_no_agent_id_is_refused(flow, tmp_path, capsys):
+    # B5: every agent's done row answered the shadow's no-shadow-done check
+    code, _ = run_verb("--flow-root", str(flow.root), "--day", DAY, "--agent-dir", str(tmp_path))
+    assert code == 2 and "--agent-id" in capsys.readouterr().err
+
+
+def test_a_missing_composed_text_is_refused_before_any_compose(flow, shadow_db, tmp_path):
+    # B6
+    (flow.run / sh.COMPOSED).unlink()
+    calls: list = []
+    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="o", compose=stub_compose(calls), **HIST)
+    assert r.state == "skipped-no-input" and "composed text" in r.reason and calls == [] and not shadow_db.exists()
+
+
+def test_an_unwritable_shadow_parent_is_a_typed_skip_not_a_traceback(flow, tmp_path):
+    # B7
+    blocker = tmp_path / "afile"
+    blocker.write_text("x")
+    calls: list = []
+    r = sh.run_night(flow.root, DAY, blocker / "sub" / "memory.db", tmp_path / "occ", occurrence="o",
+                     compose=stub_compose(calls), **HIST)
+    assert r.state == "skipped-no-input" and r.reason.startswith("unreadable/") and calls == []
+    code, _ = run_verb("--flow-root", str(flow.root), "--day", DAY, "--shadow-dir", str(blocker / "sub"))
+    assert code == 3
+
+
+def test_composed_without_a_shadow_dir_is_refused_by_name(flow, tmp_path, capsys):
+    # B8
+    composed = tmp_path / "c.md"
+    composed.write_text(SHADOW_TEXT)
+    code, _ = run_verb("--flow-root", str(flow.root), "--day", DAY, "--composed", str(composed))
+    assert code == 2 and "--composed needs --shadow-dir" in capsys.readouterr().err
+
+
+def test_composed_without_an_occurrence_dir_is_refused_by_name(flow, tmp_path, capsys):
+    composed = tmp_path / "c.md"
+    composed.write_text(SHADOW_TEXT)
+    code, _ = run_verb("--flow-root", str(flow.root), "--day", DAY, "--shadow-dir", str(tmp_path / "s"),
+                       "--composed", str(composed))
+    assert code == 2 and "--occurrence-dir" in capsys.readouterr().err
+
+
+def test_a_second_night_on_a_held_scratch_dir_does_not_interleave(flow, shadow_db, tmp_path):
+    # B9: while one night holds the night lock a second is refused as busy and never reaches seed or compose
+    shadow_db.parent.mkdir()
+    held = w._lock_wrap_file(shadow_db.parent / sh.NIGHT_LOCK)
+    try:
+        calls: list = []
+        r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="o", compose=stub_compose(calls), **HIST)
+        assert r.state == "skipped-no-input" and "busy" in r.reason and calls == [] and not shadow_db.exists()
+    finally:
+        w._unlock_wrap(held)
+    r = sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="o", compose=stub_compose(calls), **HIST)
+    assert r.state == "composed"                                  # the lock file alone does not trip the marker guard
+
+
+def test_the_compose_runs_under_the_night_lock(flow, shadow_db, tmp_path):
+    seen: list = []
+
+    def compose(fd, db, occ):
+        probe = w._lock_wrap_file(db.parent / sh.NIGHT_LOCK)
+        seen.append(probe is w._ANOTHER_WRAP_RUNNING)
+        w._unlock_wrap(probe)
+        return SHADOW_TEXT, None
+
+    assert sh.run_night(flow.root, DAY, shadow_db, tmp_path / "occ", occurrence="o", compose=compose, **HIST).state == "composed"
+    assert seen == [True]
+
+
+def test_episode_check_takes_the_wrap_lock(flow, shadow_db):
+    fd = sh.read_flow_day(flow.root, DAY)
+    sh.seed(fd, shadow_db)
+    held = w._lock_wrap_file(shadow_db.parent / "wrap.lock")
+    try:
+        v = sh.episode_check(fd, shadow_db)
+        assert not v.ready and "busy" in v.reason
+    finally:
+        w._unlock_wrap(held)
+    assert sh.episode_check(fd, shadow_db).ready
+
+
+def test_the_own_store_check_fails_closed_when_it_cannot_resolve(flow, shadow_db, monkeypatch):
+    # B10
+    fd = sh.read_flow_day(flow.root, DAY)
+    real = Path.resolve
+
+    def boom(self, *a, **k):
+        if str(self) == str(flow.db):
+            raise OSError("loop")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "resolve", boom)
+    with pytest.raises(sh.ShadowRefused, match="cannot tell"):
+        sh.seed(fd, shadow_db)

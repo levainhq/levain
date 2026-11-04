@@ -49,6 +49,9 @@ PACKAGE = "package.json"
 COMPOSED = "composed.continuity.md"
 STEPS_LOG = "steps.log"
 MARKER = ".levain-shadow"
+NIGHT_LOCK = "night.lock"
+#: the manifest tiers a seed needs: a manifest that omits one is damaged, never seeded short
+REQUIRED_TIERS = tuple(_snap.text_tier("x").keys())
 #: the kinds a verdict carries (``<state>/<kind>`` is what a ``skipped-no-input`` row records)
 KIND_NO_FLOW_DREAM = "no-flow-dream"
 KIND_SHADOWED = "already-shadowed"
@@ -105,6 +108,7 @@ def _ledger_rows(root: Path) -> tuple[list[dict[str, Any]], int]:
         raise ShadowRefused(KIND_UNREADABLE, f"flow's ledger {root / LEDGER} cannot be read ({type(exc).__name__}: {exc})")
     rows: list[dict[str, Any]] = []
     bad = 0
+    last_ok = True
     for line in text.splitlines():
         if not line.strip():
             continue
@@ -112,11 +116,18 @@ def _ledger_rows(root: Path) -> tuple[list[dict[str, Any]], int]:
             doc = json.loads(line)
         except ValueError:
             bad += 1
+            last_ok = False
             continue
         if isinstance(doc, dict):
             rows.append(doc)
+            last_ok = True
         else:
             bad += 1
+            last_ok = False
+    if not last_ok:
+        # the newest line is the one that would supersede an older committed end: a torn tail is not read past
+        raise ShadowRefused(KIND_UNREADABLE, f"flow's ledger {root / LEDGER} tail unreadable: its last line does not "
+                                             "parse, so the newest end row cannot be known")
     return rows, bad
 
 
@@ -131,6 +142,9 @@ def verify_snapshot(snap_dir: Path, run_id: str) -> dict[str, Any]:
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
         raise ShadowRefused(KIND_DAMAGED, "the manifest names no text-tier files")
+    missing = [k for k in REQUIRED_TIERS if k not in files]
+    if missing:
+        raise ShadowRefused(KIND_DAMAGED, f"the manifest lacks the required tier(s) {', '.join(missing)}")
     for key, entry in files.items():
         if not isinstance(entry, dict):
             raise ShadowRefused(KIND_DAMAGED, f"the manifest entry {key!r} is not an object")
@@ -230,12 +244,12 @@ class Seeded:
     files: tuple[str, ...]
 
 
-def _lock(store_dir: Path):
+def _lock(store_dir: Path, name: str = "wrap.lock"):
     from levain import wrap as _w
 
-    handle = _w._lock_wrap_file(store_dir / "wrap.lock")
+    handle = _w._lock_wrap_file(store_dir / name)
     if handle is _w._ANOTHER_WRAP_RUNNING:
-        raise ShadowRefused(KIND_UNREADABLE, f"another process holds {store_dir / 'wrap.lock'}; the shadow store is busy")
+        raise ShadowRefused(KIND_UNREADABLE, f"another process holds {store_dir / name}; the shadow store is busy")
     return handle
 
 
@@ -250,12 +264,14 @@ def _guard_target(shadow_db: Path, flow_day: FlowDay) -> None:
     anneal_db = flow_day.manifest.get("anneal_db")
     if isinstance(anneal_db, str) and anneal_db:
         try:
-            if Path(anneal_db).resolve() == shadow_db.resolve():
-                raise ShadowRefused(KIND_UNREADABLE, f"{shadow_db} is flow's own store; a shadow never seeds it")
-        except OSError:
-            pass
+            same = Path(anneal_db).resolve() == shadow_db.resolve()
+        except OSError as exc:
+            raise ShadowRefused(KIND_UNREADABLE, f"cannot tell whether {shadow_db} is flow's own store "
+                                                 f"({type(exc).__name__}: {exc}); refusing")
+        if same:
+            raise ShadowRefused(KIND_UNREADABLE, f"{shadow_db} is flow's own store; a shadow never seeds it")
     d = shadow_db.parent
-    if d.is_dir() and not (d / MARKER).exists() and any(d.iterdir()):
+    if d.is_dir() and not (d / MARKER).exists() and any(x.name != NIGHT_LOCK for x in d.iterdir()):
         raise ShadowRefused(KIND_UNREADABLE, f"{d} is not empty and carries no {MARKER} marker; refusing to seed over it")
 
 
@@ -286,6 +302,10 @@ def seed(flow_day: FlowDay, shadow_db: Path | str, *, claim_baton: bool = True,
     lock = _lock(d)
     try:
         manifest = verify_snapshot(flow_day.snap_dir, flow_day.run_id)
+        # the marker goes down FIRST: a seed that dies part-way leaves a marked scratch dir the retry may replace, never
+        # an unmarked half-written one the guard would refuse for good
+        (d / MARKER).write_text(json.dumps({"run_id": flow_day.run_id, "day": flow_day.day}, sort_keys=True),
+                                encoding="utf-8")
         stem = shadow_db.stem
         for p in list(d.iterdir()):
             if p.name.startswith(stem + ".") or p.name == shadow_db.name:
@@ -303,8 +323,6 @@ def seed(flow_day: FlowDay, shadow_db: Path | str, *, claim_baton: bool = True,
                 continue
             _put(flow_day.snap_dir / entry["name"], tier[key])
             put.append(tier[key].name)
-        (d / MARKER).write_text(json.dumps({"run_id": flow_day.run_id, "day": flow_day.day}, sort_keys=True),
-                                encoding="utf-8")
         if claim_baton:
             from anneal_memory import sessions
 
@@ -399,7 +417,11 @@ def episode_check(flow_day: FlowDay, shadow_db: Path | str) -> SourceVerdict:
     """The input-diverged check for a seeded shadow store. READY, or QUIET with kind ``input-diverged``."""
     try:
         flow = flow_episode_set(flow_day)
-        shadow = shadow_episode_set(shadow_db)
+        lock = _lock(Path(shadow_db).parent)
+        try:
+            shadow = shadow_episode_set(shadow_db)
+        finally:
+            _unlock(lock)
     except ShadowRefused as exc:
         return SourceVerdict(_ready.UNREADABLE, exc.kind, exc.why, flow_day)
     except Exception as exc:  # noqa: BLE001
@@ -525,29 +547,53 @@ def run_night(flow_root: Path | str, day: date | str, shadow_db: Path | str, occ
               zone: str | None = None, agent_id: str | None = None) -> NightResult:
     """One shadow night in order: day-ready, seed, episode check, the INJECTED compose, diff and card. An input that
     is not ready ends the night ``skipped-no-input`` with the verdict's ``<state>/<kind>`` and reason; the compose
-    is never reached then. A compose that raises ends ``failed``."""
+    is never reached then. A compose that raises ends ``failed``. ``occurrences`` (the shadow's own history) is
+    required: without it a day already shadowed cannot be told from a fresh one, and the night would spend a second
+    compose. Flow's composed text is read before anything is seeded or composed. One night-level lock is held from
+    the seed through the card, so two nights on one scratch directory cannot interleave."""
+    if occurrences is None:
+        return NightResult("skipped-no-input", f"{_ready.UNREADABLE}/{KIND_UNREADABLE}: no shadow occurrence history was "
+                                               "given, so an already-shadowed day cannot be ruled out")
     v = day_ready(flow_root, day, occurrences=occurrences, zone=zone, agent_id=agent_id)
     if not v.ready:
         return NightResult("skipped-no-input", f"{v.verdict}/{v.kind}: {v.reason}")
     fd = v.flow_day
     assert fd is not None
     try:
+        flow_text = (fd.run_dir / COMPOSED).read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        return NightResult("skipped-no-input", f"{_ready.UNREADABLE}/{KIND_UNREADABLE}: flow's composed text "
+                                               f"{fd.run_dir / COMPOSED} cannot be read ({type(exc).__name__}: {exc})",
+                           flow_day=fd)
+    shadow_db = Path(shadow_db)
+    night = None
+    try:
+        _guard_target(shadow_db, fd)
+        shadow_db.parent.mkdir(parents=True, exist_ok=True)
+        night = _lock(shadow_db.parent, NIGHT_LOCK)
         seed(fd, shadow_db)
+        v = episode_check(fd, shadow_db)
+        if not v.ready:
+            return NightResult("skipped-no-input", f"{v.verdict}/{v.kind}: {v.reason}", flow_day=fd)
+        try:
+            text, usage_doc = compose(fd, shadow_db, Path(occ_dir))
+        except Exception as exc:  # noqa: BLE001 — a compose that died is a failed night, not an input verdict
+            return NightResult("failed", f"compose raised {type(exc).__name__}: {exc}", flow_day=fd)
+        try:
+            card = shadow_card(fd, text, occurrence=occurrence, occ_dir=occ_dir, usage_doc=usage_doc,
+                               agent_id=agent_id or "dream", flow_text=flow_text)
+        except (ShadowRefused, _card.CardError, OSError) as exc:
+            return NightResult("failed", f"the comparison card could not be built: {exc}", flow_day=fd)
+        return NightResult("composed", "", card, fd)
     except ShadowRefused as exc:
         return NightResult("skipped-no-input", f"{_ready.UNREADABLE}/{exc.kind}: {exc.why}", flow_day=fd)
-    v = episode_check(fd, shadow_db)
-    if not v.ready:
-        return NightResult("skipped-no-input", f"{v.verdict}/{v.kind}: {v.reason}", flow_day=fd)
-    try:
-        text, usage_doc = compose(fd, Path(shadow_db), Path(occ_dir))
-    except Exception as exc:  # noqa: BLE001 — a compose that died is a failed night, not an input verdict
-        return NightResult("failed", f"compose raised {type(exc).__name__}: {exc}", flow_day=fd)
-    try:
-        card = shadow_card(fd, text, occurrence=occurrence, occ_dir=occ_dir, usage_doc=usage_doc,
-                           agent_id=agent_id or "dream")
-    except (ShadowRefused, _card.CardError) as exc:
-        return NightResult("failed", f"the comparison card could not be built: {exc}", flow_day=fd)
-    return NightResult("composed", "", card, fd)
+    except OSError as exc:
+        return NightResult("skipped-no-input", f"{_ready.UNREADABLE}/{KIND_UNREADABLE}: the shadow directory "
+                                               f"{shadow_db.parent} cannot be used ({type(exc).__name__}: {exc})",
+                           flow_day=fd)
+    finally:
+        if night is not None:
+            _unlock(night)
 
 
 def shadow_input(flow_root: Path | str, shadow_db: Path | str, row: Mapping[str, Any], *, zone: str,
@@ -570,6 +616,9 @@ def shadow_input(flow_root: Path | str, shadow_db: Path | str, row: Mapping[str,
                 seed(v.flow_day, shadow_db)
             except ShadowRefused as exc:
                 return InputVerdict(False, _ready.UNREADABLE, exc.kind, exc.why)
+            except OSError as exc:
+                return InputVerdict(False, _ready.UNREADABLE, KIND_UNREADABLE,
+                                    f"the shadow directory cannot be used ({type(exc).__name__}: {exc})")
             v = episode_check(v.flow_day, shadow_db)
     except Exception as exc:  # noqa: BLE001 — a check that cannot run has not said ready
         return InputVerdict(False, _ready.UNREADABLE, KIND_UNREADABLE, f"{type(exc).__name__}: {exc}")
