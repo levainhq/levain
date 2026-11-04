@@ -72,6 +72,7 @@
     }
   }
   function note() {
+    for (const n of [...notes]) if (!n.isConnected) notes.delete(n);   // a card redrawn on every refusal must not pile up detached nodes
     const box = document.createElement("div");
     box.className = "pwa-note";
     renderNote(box);
@@ -79,7 +80,8 @@
     return box;
   }
 
-  function dismissed() { try { return window.sessionStorage.getItem(DISMISS_KEY) === "1"; } catch (_) { return false; } }
+  let dismissedNow = false;   // "Not now" held in memory too: where sessionStorage throws, the dismissal still lasts this load
+  function dismissed() { if (dismissedNow) return true; try { return window.sessionStorage.getItem(DISMISS_KEY) === "1"; } catch (_) { return false; } }
   function drawBanner() {
     const b = document.createElement("div");
     b.id = "pwa-coach"; b.className = "pwa-coach"; b.setAttribute("role", "region"); b.setAttribute("aria-label", "Install Levain");
@@ -96,7 +98,7 @@
     if (kind() === "android") b.appendChild(installBtn());
     const x = document.createElement("button");
     x.type = "button"; x.className = "dev-btn"; x.textContent = "Not now"; x.setAttribute("aria-label", "Hide the install hint");
-    x.addEventListener("click", () => { try { window.sessionStorage.setItem(DISMISS_KEY, "1"); } catch (_) { /* kept for this load only */ } refresh(); });
+    x.addEventListener("click", () => { dismissedNow = true; try { window.sessionStorage.setItem(DISMISS_KEY, "1"); } catch (_) { /* kept for this load only */ } refresh(); });
     b.appendChild(x);
     document.body.appendChild(b);
     return b;

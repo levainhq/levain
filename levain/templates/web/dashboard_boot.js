@@ -979,8 +979,9 @@
     if (inflight && ((away && inflightAt <= away) || Date.now() - inflightAt > STUCK_MS)) {
       passive = inflightPassive;     // an authoritative (save) reload that crossed the freeze is replaced by an authoritative one
       loadGen++; inflight = false;
+      if (btn) btn.disabled = false;   // the superseded read's own finally is skipped: the button is freed here, whatever the new read does
     }
-    load({ passive: passive }).finally(function () { if (storeEl && !inflight) storeEl.removeAttribute("data-cold"); });
+    load({ passive: passive }).then(function (ok) { if (ok && storeEl && !inflight) storeEl.removeAttribute("data-cold"); });   // only a read that landed: a failed one leaves the placeholder
   });
 
   // The refresh button + visibilitychange are PASSIVE re-reads → load({passive:true}),

@@ -260,7 +260,12 @@ function fire(type, ev) {
     sandbox.fetch = async (url) => {
       log.fetched = (log.fetched || []).concat([String(url)]);
       if (mode === 'down') throw new TypeError('network down');
-      const r = new Response('<html>shell</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      if (mode === 'assets' && String(url) !== '/') return new Response('ASSET ' + url, { status: 200, headers: { 'content-type': 'text/plain' } });
+      const html = mode === 'assets'
+        ? '<link rel="stylesheet" href="/dashboard.css"><script src="/a.js"></script><script src="https://cdn.example/x.js"></script>' +
+          '<script src="/webpush/z.js"></script><link rel="icon" href="/icon.png"><script src="/b.js?v=2"></script>'
+        : '<html>shell</html>';
+      const r = new Response(html, { status: 200, headers: { 'content-type': 'text/html' } });
       if (mode === 'redirected') Object.defineProperty(r, 'redirected', { value: true });
       return r;
     };
@@ -279,12 +284,13 @@ function fire(type, ev) {
     const m = JSON.parse(mode);
     const shellName = 'levain-shell-v' + /SW_VERSION = '([^']+)'/.exec(fs.readFileSync(swPath, 'utf8'))[1];
     if (m.shell) { cacheStores.set(shellName, new Map([['/', '<html>cached shell</html>']])); cacheNames.add(shellName); }
+    if (m.cached) { cacheStores.get(shellName).set(m.cached, 'CACHED ' + m.cached); }
     sandbox.fetch = async (req) => {
       log.fetchedNet = (log.fetchedNet || 0) + 1;
       if (m.net === 'down') throw new TypeError('network down');
       return new Response('<html>live</html>', { status: m.net === '500' ? 500 : 200, headers: { 'content-type': 'text/html' } });
     };
-    const ev = { request: { url: m.url, method: m.method || 'GET', mode: m.mode || 'navigate' } };
+    const ev = { request: { url: m.url, method: m.method || 'GET', mode: m.mode || 'navigate', destination: m.destination || 'document' } };
     let handed = null;
     ev.respondWith = (p) => { handed = Promise.resolve(p); };
     ev.waitUntil = (p) => { (log.waits = log.waits || []).push(Promise.resolve(p)); };

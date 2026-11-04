@@ -261,8 +261,27 @@ async function precacheShell() {
   try {
     const r = await fetch(SHELL_KEY, { credentials: 'same-origin', cache: 'reload' });
     if (!shellCacheable(r)) return;
-    await (await caches.open(SHELL_CACHE)).put(SHELL_KEY, r);
+    let html = '';
+    try { html = await r.clone().text(); } catch (_) { /* the shell alone is still worth keeping */ }
+    const cache = await caches.open(SHELL_CACHE);
+    await cache.put(SHELL_KEY, r);
+    // The CSS/JS the shell page itself names (derived from its markup, never a list that can rot): without them an offline
+    // cold open is an unstyled, script-less page. Each is best effort; none can fail the install.
+    await Promise.allSettled(shellAssets(html).map(async (p) => {
+      const a = await fetch(p, { credentials: 'same-origin', cache: 'reload' });
+      if (a && a.status === 200 && !a.redirected) await cache.put(p, a);
+    }));
   } catch (_) { /* offline at install: the next successful navigation fills it */ }
+}
+// Same-origin absolute paths named by <script src> and <link rel=stylesheet href> in the shell html, query and fragment dropped.
+function shellAssets(html) {
+  const out = new Set();
+  const add = (v) => { if (/^\/(?!\/)/.test(v) && !NO_INTERCEPT.some((p) => v === p || v.startsWith(p + '/'))) out.add(v.split(/[?#]/)[0]); };
+  for (const m of html.matchAll(/<script\b[^>]*?\bsrc\s*=\s*"([^"]+)"/gi)) add(m[1]);
+  for (const m of html.matchAll(/<link\b[^>]*>/gi)) {
+    if (/\brel\s*=\s*"stylesheet"/i.test(m[0])) { const h = /\bhref\s*=\s*"([^"]+)"/i.exec(m[0]); if (h) add(h[1]); }
+  }
+  return [...out];
 }
 function shellCacheable(r) {
   return !!r && r.status === 200 && !r.redirected && /text\/html/i.test(r.headers.get('content-type') || '');
@@ -307,13 +326,37 @@ async function navigateNetworkFirst(e, req, bare) {
     return offlineResponse();
   }
 }
+// The shell's own scripts and styles: network first (a reload never sees a skewed page), written through to the shell cache
+// (the worker's cache.put ignores the server's no-store), answered from it when the network fails.
+async function assetNetworkFirst(req, path, done) {
+  try {
+    const r = await fetch(req);
+    if (r && r.status === 200 && !r.redirected) {
+      try { await (await caches.open(SHELL_CACHE)).put(path, r.clone()); } catch (_) { /* best effort */ }
+    }
+    return r;
+  } catch (err) {
+    try {
+      const hit = await (await caches.open(SHELL_CACHE)).match(path);
+      if (hit) return hit;
+    } catch (_) { /* fall through */ }
+    return Response.error();
+  } finally { done(); }
+}
 self.addEventListener('fetch', (e) => {
   const req = e.request;
-  if (!req || req.mode !== 'navigate' || req.method !== 'GET') return;
+  if (!req || req.method !== 'GET') return;
   let u;
   try { u = new URL(req.url); } catch (_) { return; }
   if (u.origin !== self.location.origin) return;
   if (NO_INTERCEPT.some((p) => u.pathname === p || u.pathname.startsWith(p + '/'))) return;
+  if (req.mode !== 'navigate') {
+    if ((req.destination === 'script' || req.destination === 'style') && !u.search) {
+      let done; e.waitUntil(new Promise((r) => { done = r; }));
+      e.respondWith(assetNetworkFirst(req, u.pathname, done));
+    }
+    return;
+  }
   e.respondWith(navigateNetworkFirst(e, req, u.pathname === SHELL_KEY && !u.search));
 });
 // the pre-fix4 pending target: ONE singleton key in the same cache; no claim path reads it any more, so it is deleted

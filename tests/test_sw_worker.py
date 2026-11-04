@@ -318,6 +318,27 @@ def test_install_precaches_the_shell_without_skipping_waiting_and_a_failed_fetch
 
 
 @needs_node
+def test_install_precaches_the_css_and_js_the_shell_names_and_an_offline_asset_fetch_is_answered_from_the_cache() -> None:
+    """Reproduced red before the fix: only '/' was cached, so an offline cold open was an unstyled page. The asset list is
+    derived from the shell's own markup (same-origin scripts and stylesheets; not /webpush/, not a cross-origin one, not an icon)."""
+    got = _run("install", "assets")
+    entries = {e: b for _, es in got["shells"] for e, b in es}
+    assert sorted(entries) == ["/", "/a.js", "/b.js", "/dashboard.css"], entries                # b.js: the query is dropped
+    assert entries["/dashboard.css"] == "ASSET /dashboard.css", entries
+    off = _fetch(url="https://box.example/dashboard.css", mode="no-cors", destination="style", net="down", shell=True, cached="/dashboard.css")
+    assert off["responded"] is True and off["body"] == "CACHED /dashboard.css", off
+    miss = _fetch(url="https://box.example/other.js", mode="no-cors", destination="script", net="down", shell=True)
+    assert miss["responded"] is True and miss["status"] == 0, miss                               # a miss is a network error, as without a worker
+    live = _fetch(url="https://box.example/dashboard.css", mode="no-cors", destination="style", net="ok", shell=True, cached="/dashboard.css")
+    assert live["body"] == "<html>live</html>", live                                              # online: the network wins
+    assert [e for _, es in live["shells"] for e, _b in es if e == "/dashboard.css"], live         # and is written through
+    for m in (dict(destination="image"), dict(destination="script", method="POST"), dict(destination="script", url="https://other.example/x.js"),
+              dict(destination="script", url="https://box.example/webpush/x.js"), dict(destination="script", url="https://box.example/x.js?t=SECRET")):
+        got = _fetch(**{"url": "https://box.example/x.js", "mode": "no-cors", "net": "down", **m})
+        assert got["responded"] is False, m
+
+
+@needs_node
 def test_only_the_page_message_skips_waiting() -> None:
     assert _run("message", json.dumps({"type": "levain-skip-waiting"}))["skipWaiting"] is True
     for junk in ({"type": "other"}, "levain-skip-waiting", None):

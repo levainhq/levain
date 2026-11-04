@@ -135,10 +135,11 @@ def _manifest():
 
 def test_the_manifest_carries_every_field_the_plan_lists():
     m = _manifest()
-    for key in ("id", "scope", "description", "launch_handler", "shortcuts", "screenshots", "icons"):
+    for key in ("id", "scope", "description", "launch_handler", "screenshots", "icons"):
         assert m.get(key), key
-    # not focus-existing: with no launchQueue consumer on the page, a shortcut tapped while the app is open would only
-    # focus it and never open its view (L3 r1)
+    # no shortcuts: /?view=needs and /?view=drop open nothing on the dashboard (L3 pwa2 r1), so none is offered
+    assert "shortcuts" not in m
+    # not focus-existing: with no launchQueue consumer on the page, a launch while the app is open would only focus it (L3 r1)
     assert m["launch_handler"] == {"client_mode": ["navigate-existing", "auto"]}
     assert m["scope"] == "/" and m["id"].startswith("/")
     purposes = {(i["purpose"], i["sizes"]) for i in m["icons"]}
@@ -156,16 +157,6 @@ def test_the_manifest_carries_every_field_the_plan_lists():
         bg = im.getpixel((0, 0))
         assert all(im.getpixel((x, y)) == bg for x in range(size) for y in range(size)
                    if min(x, y, size - 1 - x, size - 1 - y) < ring)
-
-
-def test_the_shortcuts_open_views_the_phone_page_has():
-    phone_js = (TEMPLATES / "phone_app.js").read_text()
-    views = set(re.findall(r'"(\w+)"', re.search(r'if \(!\[([^\]]+)\]\.includes\(view\)\)', phone_js).group(1)))
-    names = {}
-    for s in _manifest()["shortcuts"]:
-        assert s["url"].startswith("/?view=") and s["url"].split("=", 1)[1] in views
-        names[s["name"]] = s["url"]
-    assert names == {"Needs you": "/?view=needs", "Drop": "/?view=drop"}
 
 
 def test_the_dashboard_head_carries_the_ios_meta_tags():
