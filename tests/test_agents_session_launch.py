@@ -753,3 +753,28 @@ def test_a_path_slot_holds_no_control_character(where):
     with pytest.raises(S.BriefRefused):
         S.render_brief(SLOTTED, {"repo": "r", "depth": 1, "where": where}, None, occurrence_id="oc-1",
                        session_key="s-1")
+
+
+def test_the_recall_block_never_passes_its_budget_newlines_and_marker_included():
+    # one-byte episodes fill the budget exactly: each line's newline and the cut marker are bytes too
+    eps = tuple(SimpleNamespace(content="x", timestamp="") for _ in range(S.RECALL_MAX_BYTES))
+    text = S.render_brief(SLOT_ROLE, {"repo": "a"}, SimpleNamespace(episodes=eps), occurrence_id="oc-1",
+                          session_key="s-1")
+    body = text.split(S._FENCE)[1]
+    assert "older episodes cut" in body
+    assert len(body.encode("utf-8")) <= S.RECALL_MAX_BYTES + 1   # + the block's leading newline
+
+
+def test_a_stale_the_supervisor_settled_reports_the_state_it_wrote(rig, monkeypatch):
+    # r2 LOW: after _end_stale confirmed the stop and settled, the report names that end, not "launched"
+    from levain.autonomic.journal import EffectOutcome, EffectStatus
+    oid = _occurrence(rig)
+    sup = _sup(rig, oid)
+    stale = supervise.Effected(EffectOutcome(EffectStatus.STALE), 1, ended=ctl.Ended(True, "stopped", "fenced"))
+    monkeypatch.setattr(sup, "effect", lambda *a, **k: stale)
+    _, report = _run(rig, oid, Stub(), sup=sup)
+    assert (report.code, report.state) == (1, "stopped")
+    unsettled = supervise.Effected(EffectOutcome(EffectStatus.STALE), 1)
+    monkeypatch.setattr(sup, "effect", lambda *a, **k: unsettled)
+    _, report = _run(rig, oid, Stub(), sup=sup)
+    assert report.state == "launched"
