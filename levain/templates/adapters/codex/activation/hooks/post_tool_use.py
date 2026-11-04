@@ -11,8 +11,9 @@ left to the agent's own dialog is recorded, unsigned, as run (`levain.consent.di
 the authority ledger and stamped from its turn's `turn_context` in the rollout (`levain.consent.ledger`). The fill runs
 here, not in the consent gate's PreToolUse: a Codex hook that runs past its timeout fails open.
 
-Prints NOTHING and exits 0 always. FAIL-OPEN — the hook import is guarded and main() swallows
-everything.
+Prints nothing, except the one fixed sentence of a masked sandbox denial (`levain.consent.bound`: a call whose
+exit status hid a refused step, as `additionalContext`), and exits 0 always. FAIL-OPEN: the hook import is
+guarded and main() swallows everything.
 """
 
 from __future__ import annotations
@@ -78,6 +79,13 @@ def main() -> int:
             hook.consent_ledger("codex", payload, record=True, fill=True)
         if not hook.should_fire():
             return 0
+        # a masked sandbox denial is told to the agent on a success event only: a failed call's nonzero exit
+        # status is already visible, and the sentence says the status was 0
+        # this script is the PostToolUse hook: a payload without an event name is that event
+        if hasattr(hook, "consent_bound_sentence") and payload.get("hook_event_name", "PostToolUse") == "PostToolUse":
+            sentence = hook.consent_bound_sentence("codex", {**payload, "hook_event_name": "PostToolUse"})
+            if sentence:
+                hook.emit(sentence, "PostToolUse")
         name = payload.get("tool_name")
         if not isinstance(name, str) or not name:
             return 0
