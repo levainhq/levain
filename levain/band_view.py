@@ -1596,7 +1596,7 @@ def _desk_typed_signer(store: QuestionStore, text: str, *, surface: str, origin:
         from levain.consent import terminal_sign as ts
 
         info_ids = {q.id: "" for _, q in pairs if sign_info and _question_kind(q) == "information"}
-        carried: dict[str, Any] = {}              # question id -> (request id, version, queue) | _Reconciled
+        carried: dict[str, tuple[str, str, Any]] = {}
         try:
             entries, versions = _info_entries(pairs, with_note=False) if sign_info else ([], {})
             if rulings:
@@ -1604,11 +1604,11 @@ def _desk_typed_signer(store: QuestionStore, text: str, *, surface: str, origin:
                 for sh, q in rulings if key is not None else ():
                     try:
                         queue = (queue_for or _default_queue_for(os.environ if environ is None else environ))(q)
-                        entry, carried_value = _desk_ruling(q, sh.pick, key, queue)
+                        entry, request_id, version = _ruling_entry(q, sh.pick, key, queue)
                     except Exception:  # noqa: BLE001 - this item keeps its sheet; the line's others are unaffected
                         continue
                     entries.append(entry)
-                    carried[q.id] = carried_value
+                    carried[q.id] = (request_id, version, queue)
             if not entries:
                 return None
             sid = _store_id_of(store)
@@ -1660,14 +1660,16 @@ def _linked_pick(q: Question | None, pick: str | None) -> bool:
 def desk_line_rules(store: Any, text: str, *, viewer: str, view_id: int) -> bool:
     """Whether a line typed in the cockpit's band box holds a linked pick (:func:`_linked_pick`), parsed against the
     view it names exactly as :func:`answer_text_desk` parses it. Read-only, and ``False`` for anything that cannot
-    say (a foreign store, a gone view, a line that does not parse): the desk route uses it to decide whether a line
-    under a policy that leaves information unsigned has anything to sign. Never raises."""
+    say (a foreign store, a line that does not parse): the desk route uses it to decide whether a line under a policy
+    that leaves information unsigned has anything to sign. A view that is gone is ``True``, so the route goes on to
+    :func:`answer_text_desk`, which refuses it as :class:`StaleBand` (409 ``stale_band``, the page re-reads the band)
+    before anything is asked or recorded. Never raises."""
     try:
         if _foreign(store):
             return False
         view = _view_by_id(store, viewer, view_id)
         if view is None:
-            return False
+            return True
         plan, _view, questions, _extras = _plan_on(store, view, text)
         if not plan.matched or plan.rest.strip():
             return False
@@ -1859,62 +1861,16 @@ def _ruling_entry(q: Question, letter: str, key: Any, queue: Any) -> tuple[Any, 
     return entry, link.request_id, version
 
 
-class _Reconciled(NamedTuple):
-    """A desk answer's carried ruling that the queue ALREADY applied (:meth:`ConsentQueue.carried_ruling`): the new
-    signed message re-carries the same record so the answer can record, and nothing is written to the queue again."""
-    request_id: str
-    version: str
-
-
-def _desk_ruling(q: Question, letter: str, key: Any, queue: Any) -> tuple[Any, Any]:
-    """``(entry, carried)`` of a desk answer's linked pick: the ruling ALLOW the queue builds now
-    (:func:`_ruling_entry`; carried ``(request id, version, queue)``), or, when the queue would not build one because
-    the request is no longer undecided, the reconcile of a ruling ALREADY applied for this question (TERMSIGN L5b r1
-    R2: the ruling applied and the answer did not record). The reconcile holds only when the queue re-verifies now
-    that THIS question's linked request was allowed by a ruling carried in a signed answer whose entry for THIS
-    question held it, signed by ``key`` (this install's terminal key): the entry then re-carries that same record,
-    the touch still signs it, and the carried value is a :class:`_Reconciled` (no second queue write). Anything else
-    (another request, another queue, another item, another signer, a deny, a ruling made elsewhere) raises as the
-    first refusal did."""
-    from levain.cockpit.keys import fingerprint_of
-    from levain.consent import terminal_sign as ts
-
-    try:
-        entry, request_id, version = _ruling_entry(q, letter, key, queue)
-        return entry, (request_id, version, queue)
-    except Exception as first:
-        link = q.link
-        reader = getattr(queue, "carried_ruling", None)
-        if link is None or reader is None or queue.queue_id != link.queue_id or not _linked_pick(q, letter):
-            raise first
-        try:
-            got = reader(link.request_id, q.id)
-        except Exception:  # noqa: BLE001 - no reconcile: the first refusal stands
-            got = None
-        if got is None or got[1] != fingerprint_of(key.public_key):
-            raise first
-        version = subject_version(q)
-        entry = ts.Entry(q.id, version, q.what, "authority",
-                         answer=f"({letter}) {q.options[_LETTERS.index(letter)][1]}", ruling=got[0])
-        return entry, _Reconciled(link.request_id, version)
-
-
-def _apply_carried(carried: Mapping[str, Any], message: bytes, signature: str,
+def _apply_carried(carried: Mapping[str, tuple[str, str, Any]], message: bytes, signature: str,
                    scope: Mapping[str, str], versions: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
     """Apply, through the queue and nowhere else, each ruling ALLOW ``carried`` in the signed ``message`` (terminal or
     desk format alike: the queue reads the format off the message). ``carried`` maps a question id to ``(request id,
-    row version, queue)``, or to a :class:`_Reconciled` (the queue applied that ruling already: counted as ruled, and
-    nothing is written again). Returns ``(ruled, refusals)``: the request each applied ruling was for, and why the
+    row version, queue)``. Returns ``(ruled, refusals)``: the request each applied ruling was for, and why the
     others were not (their items keep the signing sheet). An applied ruling's row version is added to ``versions``.
     Never raises."""
     ruled: dict[str, str] = {}
     refusals: dict[str, str] = {}
-    for qid, value in carried.items():
-        if isinstance(value, _Reconciled):
-            ruled[qid] = value.request_id
-            versions[qid] = value.version
-            continue
-        request_id, version, queue = value
+    for qid, (request_id, version, queue) in carried.items():
         try:
             queue.answer_terminal_ruling(request_id, message, signature, item=qid, row_version=version, scope=scope)
         except Exception as exc:  # noqa: BLE001 - not applied: the item keeps its sheet, and says why

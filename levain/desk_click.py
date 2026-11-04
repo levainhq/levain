@@ -503,11 +503,9 @@ class LevainDeskHost:
                        recordable=kind == "information", ruling_pick=linked)
 
     def ruling_entry(self, row: DeskRow, pick: str, key: Any) -> tuple[Any, Any]:
-        """The authority entry that carries the ruling ALLOW for ``row``'s linked request, and what
-        :meth:`record_ruled` applies it with (:func:`~levain.band_view._desk_ruling`): ``(request id, version,
-        queue)``, or a reconcile when the queue already applied THIS question's ruling, carried and signed by this
-        install's key, and the answer did not record (the touch still signs the re-carried record; the queue is not
-        written again). Raises when neither holds (the request is gone, decided otherwise, or in another queue)."""
+        """The authority entry that carries the ruling ALLOW for ``row``'s linked request, and the
+        ``(request id, version, queue)`` :meth:`record_ruled` applies it with. Raises when the queue would not
+        build it now (the request is gone, decided, or in another queue)."""
         import os
 
         from levain import band_view
@@ -516,7 +514,8 @@ class LevainDeskHost:
         if q is None or q.id != row.id or band_view.subject_version(q) != row.version:
             raise ValueError("the item changed")
         queue = (self._queue_for or band_view._default_queue_for(os.environ))(q)
-        return band_view._desk_ruling(q, pick, key, queue)
+        entry, request_id, version = band_view._ruling_entry(q, pick, key, queue)
+        return entry, (request_id, version, queue)
 
     def record_ruled(self, row: DeskRow, pick: str, viewer: str, signing: Any, carried: Any,
                      scope: Mapping[str, str]) -> Any:

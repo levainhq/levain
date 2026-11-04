@@ -2286,34 +2286,6 @@ class ConsentQueue:
         return Ruling(request_id=request.id, ruling="allow", signer_fp=payload["signer_fp"], decided_at=stamp,
                       signed_at=payload["signed_at"], request_digest=request.digest, gap=gap[0])
 
-    def carried_ruling(self, request_id: str, item: str) -> tuple[str, str] | None:
-        """``(ruling record text, signer fingerprint)`` when ``request_id`` was ALLOWED by a ruling carried in a
-        signed answer (:meth:`answer_terminal_ruling`, terminal or desk format) whose entry for the Levain question
-        ``item`` held it, re-verified NOW exactly as every reader of a ruled row re-verifies it (:meth:`decision`);
-        ``None`` for anything else (undecided, denied, ruled on its own or by an answer, carried for another item, or
-        failing its verify). INFORMATION for reconciling that question's answer after the ruling applied and the
-        answer did not record (TERMSIGN L5b): never authority, and it writes nothing."""
-        from levain.consent import terminal_sign as ts
-
-        got = self.decision(request_id)
-        if not isinstance(got, Ruling) or got.ruling != "allow":
-            return None
-        message = self._terminal_message(request_id)
-        with self._read() as conn:
-            row = self._row(conn, request_id)
-        if message is None or row is None or row["via"] != "ruling" or row["state"] != "allowed" \
-                or row["signer_fp"] != got.signer_fp or not isinstance(row["answer"], str):
-            return None
-        parse, _namespace, _scope, _noun = self._carrier(message)
-        try:
-            parsed = parse(message)
-        except (ts.MessageError, ConsentError, UnicodeError):
-            return None
-        held = [e for e in parsed.entries if e.ruling == row["answer"]]
-        if len(held) != 1 or held[0].item != item or held[0].kind != "authority":
-            return None
-        return row["answer"], got.signer_fp
-
     def _verified_ruling(self, row: Mapping[str, Any], request: ExternalGateRequest, queue_id: str,
                          gap: tuple[int, str] | None, payload: Mapping[str, Any],
                          authority: AuthoritySnapshot | None, *, taken: bool = False) -> Ruling | None:
