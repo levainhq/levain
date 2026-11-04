@@ -42,7 +42,7 @@ def test_create_calls_the_one_door_with_the_fixed_label(tmp_path, outside):
     rep = ts.create(tmp_path / "keys", creator=_creator(calls))
     assert calls == [(tmp_path / "keys", "levain-terminal")]
     assert rep.created and rep.public_key == PUB
-    assert 'phill namespaces="levain-terminal-answer" ecdsa-sha2-nistp256 AAAAE2Vj' in rep.text
+    assert 'phill namespaces="levain-terminal-answer,levain-desk-answer" ecdsa-sha2-nistp256 AAAAE2Vj' in rep.text
     assert "scripts/needs_phill_signers" in rep.text and "levain cockpit enroll" in rep.text
     assert "levain-terminal\n" not in rep.text.split("namespaces=")[1].split("\n")[0]    # the comment is dropped
 
@@ -261,7 +261,7 @@ def test_r2fix2_interrupt_while_printing_still_reports_created(tmp_path, monkeyp
     monkeypatch.setattr(ts, "enroll_command", interrupted)
     rep = _no_raise(lambda: ts.create(tmp_path / "keys", creator=_creator([])))
     assert rep.created and "could not print the enroll command (KeyboardInterrupt)" in rep.text
-    assert 'namespaces="levain-terminal-answer"' in rep.text
+    assert 'namespaces="levain-terminal-answer,levain-desk-answer"' in rep.text
 
 
 def test_r2fix2_interrupt_at_the_creator_return_with_a_committed_key_is_created(tmp_path, monkeypatch, outside):
@@ -312,3 +312,27 @@ def test_r2low_a_leftover_names_what_the_operator_can_do(tmp_path, exc, outside)
 def test_r2low_b_creator_failure_names_the_error_type_once(tmp_path, outside):
     rep = ts.create(tmp_path / "keys", creator=_creator([], RuntimeError("boom")))
     assert rep == ts.CreateReport(False, "not created: RuntimeError: boom")
+
+
+def test_signers_line_carries_both_namespaces_as_one_option_string():
+    line = ts.signers_line("ecdsa-sha2-nistp256 AAAAE2Vj comment")
+    assert line == 'phill namespaces="levain-terminal-answer,levain-desk-answer" ecdsa-sha2-nistp256 AAAAE2Vj'
+    assert line.count("namespaces=") == 1
+
+
+def test_created_report_prints_the_co_root_step(tmp_path, outside):
+    """The genesis key is not the end of the sitting: step 3 names the independent passphrase co-root and its enrol."""
+    def make(key_dir, label):
+        pub = Path(key_dir) / (label + ".pub")
+        pub.write_text(SK_PUB + "\n")
+        return CreatedKey(Path(key_dir) / label, pub, SK_PUB, "touch-id", label, "ab" * 20)
+
+    (tmp_path / "keys").mkdir(mode=0o700)
+    rep = ts.create(tmp_path / "keys", creator=make)
+    assert rep.created
+    lines = rep.text.splitlines()
+    [i3] = [i for i, x in enumerate(lines) if x.startswith("3. Co-root")]
+    assert i3 > max(i for i, x in enumerate(lines) if x.startswith("2. Levain"))
+    body = "\n".join(lines[i3:])
+    assert "levain cockpit key create --custody passphrase --label laptop-presence" in body
+    assert "--class laptop-presence --custody passphrase --signing-key" in body

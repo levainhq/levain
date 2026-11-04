@@ -26,6 +26,7 @@ import secrets
 import shlex
 import stat
 import subprocess
+import sys
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -49,6 +50,8 @@ __all__ = ["AnswerClass", "Entry", "FAILED_REASONS", "KEY_LABEL", "MessageError"
 
 FORMAT = "levain-terminal-answer/1"
 NAMESPACE = "levain-terminal-answer"
+DESK_NAMESPACE = "levain-desk-answer"   # named in the signers line only; its format is L5a's
+SIGNERS_NAMESPACES = f"{NAMESPACE},{DESK_NAMESPACE}"
 KEY_LABEL = "levain-terminal"
 MAX_BYTES = 8 * 1024
 LINE_MAX = 2000                    # one typed line
@@ -359,7 +362,7 @@ class CreateReport:
 
 def signers_line(public_key: str, principal: str = "phill") -> str:
     """The line flow's ``scripts/needs_phill_signers`` takes for this key (DESIGN section 3, step 2)."""
-    return f'{principal} namespaces="{NAMESPACE}" {" ".join(public_key.split()[:2])}'
+    return f'{principal} namespaces="{SIGNERS_NAMESPACES}" {" ".join(public_key.split()[:2])}'
 
 
 def session_refusal() -> str:
@@ -420,6 +423,18 @@ def _after_failure(progress: _Progress, why: str) -> CreateReport:
     return CreateReport(False, f"not created: {why}")
 
 
+#: The third printed step: the ledger is not done at genesis. A Secure Enclave key dies with its laptop and the build has
+#: no re-root, so an independent offline passphrase key is enrolled by the genesis key in the same sitting
+#: (``levain doctor`` FAILS at exactly one signing laptop-presence key). Both commands are the ones run on a scratch root.
+_CO_ROOT_STEP = [
+    "3. Co-root, the same sitting, BEFORE the ledger counts as done (a lost laptop must not lose the ledger):",
+    "   first: levain cockpit key create --custody passphrase --label laptop-presence",
+    "   then, signed by the key above: levain cockpit enroll <that key's .pub> --class laptop-presence --custody passphrase --signing-key "
+    "<the enrolled key>",
+    "   keep that passphrase and key file off this laptop; the runbook is project_memory/1103-19/ENROL_SITTING.md",
+]
+
+
 def _created_report(path: Path, public_path: Path, public_key: str, note: str | None = None) -> CreateReport:
     """The created report, built piece by piece: a piece that cannot be built is named, never a lost key."""
     lines = [f"terminal key created: {path}"]
@@ -434,6 +449,7 @@ def _created_report(path: Path, public_path: Path, public_key: str, note: str | 
                   f"   {enroll_command(public_path)}"]
     except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 - as above
         unprinted.append(f"the enroll command ({_one_line(exc)})")
+    lines += _CO_ROOT_STEP
     if note:
         lines.append(f"note: {note}")
     if unprinted:
@@ -565,6 +581,61 @@ def sign(message: bytes, *, key: TerminalKey | None = None, key_dir: Path | None
     if not isinstance(signature, str) or not signature:
         return SignOutcome("unsigned", "signer-error", "the signer returned no signature")
     return SignOutcome("signed", None, "", signature, fp)
+
+
+# ---------------------------------------------------------------------------------------------------
+# the notice that names what the Touch ID sheet will sign (DESIGN section 5.4)
+
+NOTICE_TITLE = "Levain: Touch ID"
+NOTICE_CUT = 80                    # characters of the first entry's answer or text
+_OSASCRIPT = "/usr/bin/osascript"
+
+
+def notice_text(entries: Sequence[Entry], *, channel: str = "terminal") -> str:
+    """The one line the notification shows: ``Touch ID to sign: <item> <answer or text>`` for the first entry (cut at
+    :data:`NOTICE_CUT` characters) plus `` (+N more)``; channel ``desk`` prefixes ``Desk: ``. Pure, and rendered from
+    the entries the message holds, never from anything the agent says. It always begins with a letter, so as an
+    ``osascript`` argument it can never read as an option."""
+    prefix = "Desk: " if channel == "desk" else ""
+    if not entries:
+        return f"{prefix}Touch ID to sign"
+    first = entries[0]
+    said = first.answer if first.answer is not None else (first.text or "")
+    said = _shown(said)[:NOTICE_CUT]
+    more = f" (+{len(entries) - 1} more)" if len(entries) > 1 else ""
+    return f"{prefix}Touch ID to sign: {_shown(first.item)} {said}".rstrip() + more
+
+
+def _shown(value: Any) -> str:
+    """``value`` as the notice may display it: format characters (Unicode Cf: bidi embeddings, overrides and
+    isolates, zero-width characters, U+FEFF) removed, so an agent-filed label cannot reorder or hide what the
+    operator reads before he touches; control characters (Cc, C0 and C1) and line/paragraph separators become a
+    space; whitespace runs collapse. The display only: the signed entry keeps the row's words byte for byte,
+    because the verifier binds it to the row by equality."""
+    out = []
+    for ch in str(value):
+        cat = unicodedata.category(ch)
+        if cat == "Cf":
+            continue
+        out.append(" " if cat in ("Cc", "Zl", "Zp") else ch)
+    return " ".join("".join(out).split())
+
+
+def post_notice(text: str, *, runner: Callable[..., Any] = subprocess.Popen) -> Any:
+    """Show ``text`` as a macOS notification, macOS only; the process, or None when nothing was started. The text
+    travels as an ``osascript`` argument and never inside the script, so a row's words cannot become AppleScript.
+    The child is detached with no stdio and never waited on: the hook's time budget is not spent on a display aid.
+    Never raises."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        return runner([_OSASCRIPT, "-e", "on run argv",
+                       "-e", f'display notification (item 1 of argv) with title "{NOTICE_TITLE}"',
+                       "-e", "end run", str(text)],
+                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                      start_new_session=True)
+    except Exception:  # noqa: BLE001 - a notice is never worth the answer
+        return None
 
 
 # ---------------------------------------------------------------------------------------------------

@@ -757,7 +757,9 @@ class Signing:
     """One signing attempt over the entries of one typed line (TERMSIGN L2). ``state`` is ``signed`` or ``unsigned``
     (``reason`` then one of ``terminal_sign.REASONS``, ``detail`` its first line); ``message`` / ``sig`` /
     ``fp`` are what was signed and the signature; ``versions`` maps each SIGNED question id to the row version the
-    message names, which the write checks again inside its transaction."""
+    message names, which the write checks again inside its transaction. ``ruled`` (TERMSIGN L4) maps a question id
+    to the consent request whose ruling ALLOW the queue applied from this message; ``ruling_refusals`` says why a
+    carried ruling was not."""
     state: str
     reason: str | None = None
     detail: str = ""
@@ -765,10 +767,13 @@ class Signing:
     sig: str | None = None
     fp: str | None = None
     versions: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    ruled: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    ruling_refusals: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # read-only once built: the same object sits in every entry of the line, and the write checks against it
-        object.__setattr__(self, "versions", types.MappingProxyType(dict(self.versions)))
+        for name in ("versions", "ruled", "ruling_refusals"):
+            object.__setattr__(self, name, types.MappingProxyType(dict(getattr(self, name))))
 
 
 _SIGN_WORDS = {
@@ -795,9 +800,17 @@ def _no_key_noted(store: QuestionStore, viewer: str) -> bool:
         return False
 
 
-def _sign_note(by_state: Mapping[str, Sequence[str]], signing: "Signing | None", quiet_no_key: bool) -> str | None:
-    """The echo's sentence on the sign state, in plain words (``signed (Touch ID, laptop): 1a``), or ``None``."""
+def _sign_note(by_state: Mapping[str, Sequence[str]], signing: "Signing | None", quiet_no_key: bool,
+               ruled: Sequence[str] = (), ruled_unrecorded: Sequence[str] = ()) -> str | None:
+    """The echo's sentence on the sign state, in plain words (``signed (Touch ID, laptop): 1a``), or ``None``.
+    ``ruled``: the labels whose signed ruling ALLOW the queue applied and whose answer was recorded (TERMSIGN L4);
+    ``ruled_unrecorded``: those whose ruling was applied but whose answer the store did not record."""
     parts: list[str] = []
+    if ruled:
+        parts.append("ruling ALLOW signed in the same touch and applied: " + ", ".join(ruled))
+    if ruled_unrecorded:
+        parts.append("ruling ALLOW signed in the same touch and applied, the answer was not recorded: "
+                     + ", ".join(ruled_unrecorded))
     if by_state.get("signed"):
         parts.append("signed (Touch ID, laptop): " + ", ".join(by_state["signed"]))
     if by_state.get("unsigned") and signing is not None and not quiet_no_key:
@@ -918,6 +931,8 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
     sheets: list[str] = []
     fresh: dict[tuple[str, str], Extra] | None = None
     fresh_complete: set[str] = set()
+    ruling_cands: list[tuple[Any, Question]] = []           # the linked pick, when a signed terminal answer can carry it
+    cand_sheet: dict[str, str] = {}                         # a candidate's sheet line, which stands if the ruling does not
     for sh in plan.sheets:
         try:
             q = questions.get(sh.n)
@@ -930,7 +945,13 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
                 elif q.link is None:
                     refused.append(f"{sh.n} is no longer a signing item; nothing opened")
                 else:
-                    sheets.append(f"{sh.label}: {_question_sheet_text(q, sh.pick)}")
+                    line = f"{sh.label}: {_question_sheet_text(q, sh.pick)}"
+                    if sign_with is not None and _LETTERS.index(sh.pick) < len(q.options) \
+                            and q.options[_LETTERS.index(sh.pick)][0] == q.link.option:
+                        ruling_cands.append((sh, q))
+                        cand_sheet[q.id] = line
+                    else:
+                        sheets.append(line)
             elif e is not None:
                 if fresh is None:                             # once per apply, only when an authority item is named
                     try:
@@ -982,16 +1003,28 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
     ids: list[str] = []
     by_state: dict[str, list[str]] = {}
     quiet_no_key = False
-    if sign_with is not None and todo:
+    ruled_labels: list[str] = []
+    if sign_with is not None and (todo or ruling_cands):
         todo_pairs = [(act, questions[act.n]) for act, _ in todo]
         try:
-            signing = sign_with(todo_pairs)
+            signing = sign_with(todo_pairs, rulings=ruling_cands) if ruling_cands else sign_with(todo_pairs)
         except Exception as exc:                              # noqa: BLE001 - the answer is recorded whatever the signer did
             signing = Signing("unsigned", "signer-error", type(exc).__name__,
                               versions={q.id: "" for _, q in todo_pairs if _question_kind(q) == "information"})
+        for sh, q in ruling_cands:
+            # the linked pick is recorded only once its ruling was applied (the phone's order: ruling first); any
+            # other outcome leaves the item as it was, with its signing sheet named as before
+            if signing is not None and q.id in signing.ruled:
+                entry = {"ref": q.id, "via": via, "viewer": viewer, "seen_through": seen_through, "note": None,
+                         "option": q.link.option}
+                todo.append((sh, entry))
+                ruled_labels.append(sh.label)
+            else:
+                why = signing.ruling_refusals.get(q.id) if signing is not None else None
+                sheets.append(cand_sheet[q.id] + (f" (no signed ruling was applied: {why})" if why else ""))
         if signing is not None:
             for act, entry in todo:
-                if questions[act.n].id in signing.versions:
+                if entry["ref"] in signing.versions:
                     entry["sign"] = signing
             quiet_no_key = signing.reason == "no-key" and _no_key_noted(store, viewer)
             if deadline is not None:                          # the sign step may have run past the hook's bound: the write has its own
@@ -1017,8 +1050,11 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
                 ids.append(entry["ref"])
                 if isinstance(entry.get("sign"), Signing):
                     by_state.setdefault(entry["sign"].state, []).append(act.label)
+    # the ruling's sentence comes from what the queue applied (Signing.ruled), never from what was recorded: a ruling
+    # applied whose answer the store then refused (its row moved, the lock busy) is still a ruling applied
     sign_note = _sign_note(by_state, next((e["sign"] for _, e in todo if isinstance(e.get("sign"), Signing)), None),
-                           quiet_no_key)
+                           quiet_no_key, [lb for lb in ruled_labels if lb in recorded],
+                           [lb for lb in ruled_labels if lb not in recorded])
     try:
         echo = format_echo(recorded, refused, via, plan.hint, sheets, sign_note)
     except Exception:                                         # what was recorded is said, whatever the formatting
@@ -1537,23 +1573,77 @@ def _is_relay(prompt: str, environ: Mapping[str, str]) -> bool:
     return environ.get("LEVAIN_TURN") == "relay" or prompt.lstrip().startswith("levain:")
 
 
+def _one_line(exc: BaseException) -> str:
+    text = str(exc)
+    return text.splitlines()[0] if text else type(exc).__name__
+
+
+def _default_queue_for(environ: Mapping[str, str]) -> Callable[[Question], Any]:
+    """The consent queue a linked question's request lives in, with the authority log its hook verifies against
+    (the same roots ``levain consent rule`` uses); ``None`` for a question whose queue cannot be opened."""
+    def queue_for(q: Question) -> Any:
+        try:
+            from levain.authority import anchor_path
+            from levain.consent.answering import answer_root
+            from levain.consent.queue import ConsentQueue, authority_source, queue_dir_for
+
+            qdir = queue_dir_for(environ)
+            got = ConsentQueue(qdir, home=Path.home(), authority=authority_source(qdir, anchor=None)).get(
+                q.link.request_id)
+            if got is None:
+                return None
+            root = answer_root(qdir, got[0])
+            return ConsentQueue(qdir, home=Path.home(),
+                                authority=authority_source(root / "cockpit.db", anchor=anchor_path(root)))
+        except Exception:  # noqa: BLE001 - no queue: the item keeps its signing sheet
+            return None
+    return queue_for
+
+
+def _ruling_entry(q: Question, letter: str, key: Any, queue: Any) -> tuple[Any, str, str]:
+    """``(entry, request_id, version)`` of the authority entry that carries the ruling ALLOW for ``q``'s linked
+    request: the record ``queue`` builds now for the terminal key's fingerprint, as its JCS. Raises when the
+    request is not one this question links to, or is not undecided (the item then keeps its sheet)."""
+    from levain.cockpit.keys import fingerprint_of
+    from levain.consent import terminal_sign as ts
+    from levain.consent.record import ruling_message
+
+    link = q.link
+    if link is None or queue is None or queue.queue_id != link.queue_id:
+        raise ValueError("the question's request is not in this queue")
+    payload = queue.ruling_payload(link.request_id, "allow", fingerprint_of(key.public_key))
+    version = subject_version(q)
+    entry = ts.Entry(q.id, version, q.what, "authority", answer=f"({letter}) {q.options[_LETTERS.index(letter)][1]}",
+                     ruling=ruling_message(payload).decode("utf-8"))
+    return entry, link.request_id, version
+
+
 def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse, session: str,
                      environ: Mapping[str, str], signer_factory: Any = None, key_dir: Path | None = None,
-                     on_sign: Callable[[], None] | None = None, *, view_id: int | None = None
-                     ) -> Callable[[list[tuple[Any, Question]]], Signing | None]:
+                     on_sign: Callable[[], None] | None = None, *, view_id: int | None = None,
+                     queue_for: Callable[[Question], Any] | None = None
+                     ) -> Callable[..., Signing | None]:
     """The ``sign_with`` of a seat's typed answer (TERMSIGN L2): after a full parse, ONE message naming every
     information entry about to be recorded (item, row version as read for the plan, the question, the answer), signed
     once, outside any store lock. Authority entries are not signed here. It never raises: a message that cannot be
     built or a signer that fails is an unsigned outcome naming why (``terminal_sign.REASONS``).
 
+    ``rulings`` (TERMSIGN L4, the ``(sheet, question)`` pairs whose pick is a Link question's linked option): each
+    gets an AUTHORITY entry carrying the ruling ALLOW the question's queue builds for the terminal key, inside the
+    same message and so the same touch. After a successful sign the queue applies each one
+    (:meth:`~levain.consent.queue.ConsentQueue.answer_terminal_ruling`, which re-verifies everything and is the only
+    authority); ``Signing.ruled`` names those it applied and ``ruling_refusals`` says why for the rest. Without an
+    enrolled key, or when the sign step fails, no ruling is applied: the item keeps its signing sheet (D8).
+
     ``view_id``: the view (``band_views.seq``) the plan was PARSED against, which the message names (DESIGN §2). It
     is never re-read here: a view another hook of this viewer commits between the parse and the sign would otherwise
     scope the signature to a band the line was not read from. ``None`` (no view): unsigned, ``signer-error``."""
-    def sign_with(pairs: list[tuple[Any, Question]]) -> Signing | None:
+    def sign_with(pairs: list[tuple[Any, Question]], rulings: Sequence[tuple[Any, Question]] = ()) -> Signing | None:
         from levain.consent import terminal_sign as ts
 
         entries: list[Any] = []
         versions: dict[str, str] = {}
+        carried: dict[str, tuple[str, str, Any]] = {}      # question id -> (request id, version, queue)
         info_ids = {q.id: "" for _, q in pairs if _question_kind(q) == "information"}
         try:
             for act, q in pairs:
@@ -1568,11 +1658,22 @@ def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse
                                      answer=f"({letter}) {q.options[_LETTERS.index(letter)][1]}", note=act.note)
                 entries.append(entry)
                 versions[q.id] = version
+            if rulings:
+                key = ts.find_key(key_dir)
+                for sh, q in rulings if key is not None else ():
+                    try:
+                        queue = (queue_for or _default_queue_for(environ))(q)
+                        entry, request_id, version = _ruling_entry(q, sh.pick, key, queue)
+                    except Exception:  # noqa: BLE001 - this item keeps its sheet; the line's others are unaffected
+                        continue
+                    entries.append(entry)
+                    carried[q.id] = (request_id, version, queue)
             if not entries:
                 return None
             sid = _store_id_of(store)
             if view_id is None or sid is None:
-                return Signing("unsigned", "signer-error", "no view or store id to bind the message to", versions=info_ids)
+                return Signing("unsigned", "signer-error", "no view or store id to bind the message to", versions=info_ids,
+                               ruling_refusals={qid: "the answer was not signed" for qid in carried})
             rest = (plan.rest or "").strip()
             at = prompt.rfind(rest) if rest else -1
             block = (prompt[:at] if at >= 0 else prompt).strip()
@@ -1585,17 +1686,39 @@ def _terminal_signer(store: QuestionStore, viewer: str, prompt: str, plan: Parse
                            versions=info_ids)
         if on_sign is not None:
             on_sign()
-        out = ts.sign(message, key_dir=key_dir, signer_factory=signer_factory, remote=ts.is_remote(environ))
+        remote = ts.is_remote(environ)
+        if not remote:
+            try:
+                if ts.find_key(key_dir) is not None:    # a notice only where a Touch ID sheet is about to follow
+                    ts.post_notice(ts.notice_text(entries))
+            except Exception:  # noqa: BLE001 - sign() below names whatever is wrong with the key
+                pass
+        out = ts.sign(message, key_dir=key_dir, signer_factory=signer_factory, remote=remote)
         if out.state == "signed":
-            return Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint, versions)
-        return Signing("unsigned", out.reason, out.detail, versions=versions)
+            ruled: dict[str, str] = {}
+            refusals: dict[str, str] = {}
+            scope = {"store": f"levain-questions:{sid}", "install": sid, "session": session, "view": str(view_id)}
+            for qid, (request_id, version, queue) in carried.items():
+                try:
+                    queue.answer_terminal_ruling(request_id, message, out.signature, item=qid, row_version=version,
+                                                 scope=scope)
+                except Exception as exc:  # noqa: BLE001 - not applied: the item keeps its sheet, and says why
+                    refusals[qid] = _one_line(exc)
+                else:
+                    ruled[qid] = request_id
+                    versions[qid] = version
+            return Signing("signed", None, "", message.decode("utf-8"), out.signature, out.fingerprint, versions,
+                           ruled, refusals)
+        return Signing("unsigned", out.reason, out.detail, versions=versions,
+                       ruling_refusals={qid: "the answer was not signed" for qid in carried})
 
     return sign_with
 
 
 def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mapping[str, str],
                  deadline: float | None = None, session: str | None = None, signer_factory: Any = None,
-                 key_dir: Path | None = None, on_sign: Callable[[], None] | None = None) -> str:
+                 key_dir: Path | None = None, on_sign: Callable[[], None] | None = None,
+                 queue_for: Callable[[Question], Any] | None = None) -> str:
     """Parse the human's prompt text; on a full parse record it (via ``seat``, the lock waited for until
     ``deadline``) and return the echo. A prompt that is no answer line, a relay turn or an empty one: ``""``. Raises
     only before anything is recorded (a store that cannot be read); :func:`apply_plan` never raises.
@@ -1610,7 +1733,8 @@ def _seat_answer(store: QuestionStore, viewer: str, prompt: Any, environ: Mappin
     if not plan.matched:
         return format_echo([], [], "seat", plan.hint) if plan.hint else ""
     sign_with = (_terminal_signer(store, viewer, prompt, plan, session, environ, signer_factory, key_dir,
-                                  on_sign, view_id=got[1] if got is not None else None) if session else None)
+                                  on_sign, view_id=got[1] if got is not None else None,
+                                  queue_for=queue_for) if session else None)
     return apply_plan(store, plan, questions, viewer=viewer, via="seat",
                       seen_through=view.seen_through if view else 0, deadline=deadline, extras=extras,
                       sign_with=sign_with).echo

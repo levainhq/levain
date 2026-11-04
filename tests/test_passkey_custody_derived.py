@@ -701,7 +701,8 @@ def test_doctor_fails_on_a_quarantined_key_and_every_remedy_it_names_runs(tmp_pa
                                "class": "display-phone", "custody": auth.UNSTATED}, laptop)
     auth.PROCESS_CACHE.clear()
 
-    bad = [r for r in doctor._check_cockpit_authority(inst) if not r.ok]
+    # the lone laptop key also FAILS (the enrolment-sitting row); this test is about the quarantine row
+    bad = [r for r in doctor._check_cockpit_authority(inst) if not r.ok and "QUARANTINED" in r.detail]
     assert len(bad) == 1 and pk.fp in bad[0].detail and "QUARANTINED" in bad[0].detail, bad
     assert cli.main(["cockpit", "keys", "--data-root", str(root)]) == 0
     assert "QUARANTINED" in capsys.readouterr().out
@@ -715,7 +716,7 @@ def test_doctor_fails_on_a_quarantined_key_and_every_remedy_it_names_runs(tmp_pa
         argv = shlex.split(command.replace("YOUR_LAPTOP_PRESENCE_KEY", str(laptop.path))
                            .replace("<passkey .pub>", str(pub)))
         assert cli.main(argv[1:]) == 0, (command, capsys.readouterr())
-    assert all(r.ok for r in doctor._check_cockpit_authority(inst))
+    assert not [r for r in doctor._check_cockpit_authority(inst) if "QUARANTINED" in r.detail]
     snap = CockpitDB(root)
     with snap.read() as conn:
         now = auth.snapshot(conn, cache=auth.ReplayCache())
