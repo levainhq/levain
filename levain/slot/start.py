@@ -621,17 +621,27 @@ def _hash_ids(out: bytes, n: int) -> List[str]:
 
 
 def clone_check(sfd: int, kind: str, run: Callable[[Tuple[str, ...], int], bytes], no_process: Callable[[], bool],
-                *, spec_base: Callable[[], int], cap: int = wall.SPEC_CAP) -> Optional[CheckStats]:
+                *, spec_base: Callable[[], int], cap: int = wall.SPEC_CAP,
+                quiesce: Optional[Callable[[], None]] = None) -> Optional[CheckStats]:
     """§5.4 step 3 after a zero clone exit, in order: for kind ``dispatch`` the slot uid has no process (V4); for
     ``dispatch|planner|verifier`` (a) :func:`check_attributes`; for ``dispatch`` only (V3) (b): ``ls-files -s -z``
     run as the slot (``run(argv, bound)`` returns its stdout or raises :class:`CheckFailed`), parsed and checked
     here, every worktree entry lstat'ed fd-relative, then ``hash-object --no-filters`` in batches whose spec is at
     most ``cap`` bytes (``spec_base()``: :func:`hash_batches`' base), every id equal to its entry's blob, in order;
     then no slot-uid process again (V4). Any failure raises :class:`CheckFailed`. ``interactive|login``: no check
-    (None)."""
+    (None).
+
+    ``quiesce`` (macOS only; None on Linux): run ONCE, before the first window's proof, nothing verified yet so
+    ending the slot uid's launchd domain costs no evidence (launchd's per-uid agent, ``distnoted``, runs as the slot
+    uid after git's first notification). It raises :class:`CheckFailed` when the domain is not proven ended. The
+    predicate after it is unchanged: no slot-uid process. The window AFTER the last child gets no quiesce: it stays a
+    detection (a process alive while the check ran refuses); a second hash pass after a quiesce there waits on the
+    VM sampling (DESIGN_render_wiring Finding 4 (ii))."""
     if kind not in RD.READSET_KINDS:
         return None
     window = kind == "dispatch"
+    if window and quiesce is not None:
+        quiesce()
     if window and not no_process():
         raise CheckFailed("window: a slot-uid process is alive after the clone, before the check")
     check_attributes(sfd)
@@ -690,6 +700,21 @@ def _no_slot_process(ctx: H.Ctx, a: R.Alloc) -> bool:
     _, _, no_process = PR.end_seams(host, a.cgroup if host == "linux" else None,  # type: ignore[arg-type]
                                     seams.proc_seams)   # type: ignore[arg-type]
     return no_process(a.slot_uid)
+
+
+def _window_quiesce(ctx: H.Ctx, a: R.Alloc) -> Optional[Callable[[], None]]:
+    """The clone check's first-window quiesce: macOS only (Linux has no per-uid launchd agent, its window is the
+    session cgroup and stays byte-for-byte as it was). :func:`kill_domain` (``proc.end_domain``: the launchd domain
+    booted out), the same ending identity capture uses; unproven, or a bootout that raises (a Refused or OSError the
+    caller turns into ``clone-failed``), is a refusal, never a pass."""
+    if ctx.seams.host == "linux":
+        return None
+
+    def quiesce() -> None:
+        res, _ = kill_domain(ctx, a)
+        if not res.proven:
+            raise CheckFailed(f"window: the slot uid's launchd domain was not proven ended: {res.name}")
+    return quiesce
 
 
 def _discard_clone(ctx: H.Ctx, a: R.Alloc, what: str) -> Optional[str]:
@@ -870,7 +895,8 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc, cap: Optional[VendorCapture] = None) -
         try:
             with ctx.store.dir("live", a.session) as sfd:
                 clone_check(sfd, a.kind, lambda av, bound: _run_check(ctx, a, av, bound),
-                            lambda: _no_slot_process(ctx, a), spec_base=lambda: _hash_spec_base(ctx, a))
+                            lambda: _no_slot_process(ctx, a), spec_base=lambda: _hash_spec_base(ctx, a),
+                            quiesce=_window_quiesce(ctx, a))
             passed = True
         except (CheckFailed, Refused, OSError) as err:
             # A listing or launch refusal inside the check is a failed check too: the clone is never kept unproven.
