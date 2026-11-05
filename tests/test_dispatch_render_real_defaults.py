@@ -13,17 +13,31 @@ helper's templates; the staging seam vs its stub). Every runtime test injected `
 - the helper's seams leave ``hook_templates`` at ``None`` (the production producer);
 - ``render`` then runs ``check_ticket`` and ``render_facts`` -> ``check_facts`` for real, on the F2 helper world.
 
-The workspace seam is unwired by design (the stager is lane 3's). The one refusal this pipeline is EXPECTED to end on is
-therefore ``staging-missing`` at render step (3). :func:`test_KNOWN_NEXT_REFUSAL_staging_missing` pins that as a named
-marker: when the stager lands it goes RED on purpose, and the fix is to update it (stage through the default seam and
-assert the files step passes), never to skip it.
+The workspace seam was unwired when this file was written (the stager was a later lane), so the pipeline ended on
+``staging-missing`` at render step (3), and that end was pinned by a marker that was to go RED once the stager landed.
+It did not: ``HelperSlotRuntime``'s own default for ``workspace`` stayed ``None`` (the server wires the seam through
+``build_server``, not through the class default), so the marker kept passing while the production path had moved on.
+The marker was therefore split in two, never skipped or deleted:
+
+- :func:`test_the_production_wired_workspace_renders_every_step` builds the runtime through ``dispatch_run.build_server``
+  (the seam production wires), uploads a real snapshot of a real git repo through the operator half
+  (``stager.build_upload``) and the server half (``WorkspaceUploads`` begin / chunk / verify), and pins the whole
+  render: every step of ``H.RENDER_STEPS``, the verified bundle in the slot's ``in/``, staging emptied.
+- :func:`test_control_an_unwired_workspace_seam_still_ends_at_staging_missing` keeps the old end as a control: the
+  same pipeline with no seam must still refuse by name, which shows the wired test's pass is the seam's doing.
 """
 from __future__ import annotations
+
+import hashlib
+import os
+import shutil
 
 import pytest
 
 from levain.agents import session_launcher as L
 from levain.contracts import canon
+from levain.dispatch import stager
+from levain.dispatch.policy import ProviderPolicy
 from levain.slot import control as C
 from levain.slot import dispatch_runtime as DR
 from levain.slot import render as RD
@@ -31,16 +45,25 @@ from levain.slot import runtime_helper as H
 from levain.slot import stage
 from levain.slot import tickets as T
 from levain.slot import vendor_routes as VR
+from levain.slot import workspace as WS
+from levain.slot.services import dispatch_run as D
 from levain.slot.supervisor import pick_routes
 from levain.slot.ids import SlotId
 from tests.test_agents_session_launch import EXP
 from tests.test_agents_session_launcher import KEY, RUN, FakeControl, FakeRuntime, FakeSources, launch
 from tests.test_slot_p7a1_passthrough_ticket import mark, ptd  # noqa: F401 - the ticketed passthrough world fixture
 from tests.test_pool import F2_DISPATCH
+from tests.test_dispatch_stager_send import member, op_repo
 
-#: the refusal the pipeline ends on while the workspace seam is unwired, and the render steps it reaches before it
-KNOWN_NEXT = "staging-missing"
+#: the refusal a pipeline with NO workspace seam ends on, and the render steps it reaches before it
+UNWIRED_END = "staging-missing"
 STEPS_REACHED = ["cas-rendering", "policy", "files"]
+#: every render step, from the helper's own table: a step added or removed there changes what a complete render is
+ALL_STEPS = [name for name, _fn in H.RENDER_STEPS]
+#: the operator's NEVER list for the real-upload tests (the stager's policy argument; the signed store is not read)
+POLICY = ProviderPolicy.from_mapping({"never": ["**/.env", "**/*.pem"], "providers": {}})
+needs_git = pytest.mark.skipif(shutil.which("git") is None or shutil.which("ssh-keygen") is None,
+                               reason="needs git and ssh-keygen")
 
 TWO_EGRESS = {"format": VR.BASE_FORMAT, "routes": [
     {"route": "egress-operator", "type": "egress", "hosts": ["docs.example.org"]},
@@ -69,15 +92,42 @@ class Pipe:
         return H.Ctx(w.seams, store, F2_DISPATCH, "dispatch", w.control.operator_uid, {}), store
 
 
-def pipe(ptd, monkeypatch, tmp_path, doc=None):  # noqa: F811
+def wired_runtime(w, tmp_path):
+    """The runtime and uploads the dispatch run server builds in production (``build_server``), over this world's
+    store: the seam is whatever production wires, not a stand-in. Returns ``(runtime, uploads)``."""
+    srv = D.build_server("linux", w.L, tmp_path / "c.sock", os.getuid())
+    return srv.launcher.runtime, srv._uploads
+
+
+def upload_snapshot(uploads, tmp_path):
+    """A real operator repo, snapshotted and bundled by the operator half, then through the server half's WSBEGIN /
+    WSDATA / verify under ``KEY``. Returns ``(the verified Workspace member, the Upload the operator built)``."""
+    ws = member(op_repo(tmp_path))
+    up = stager.build_upload(ws, policy=POLICY)
+    dg = lambda b: "sha256:" + hashlib.sha256(b).hexdigest()  # noqa: E731
+    owner = WS.UploadOwner()
+    uploads.begin(KEY, owner, {"manifest": len(up.manifest), "bundle": len(up.bundle)},
+                  {"manifest": dg(up.manifest), "bundle": dg(up.bundle)})
+    uploads.chunk(KEY, owner, "manifest", 0, up.manifest)
+    uploads.chunk(KEY, owner, "bundle", 0, up.bundle)
+    return uploads.verify(KEY, owner, ws), up
+
+
+def pipe(ptd, monkeypatch, tmp_path, doc=None, wired=False):  # noqa: F811
     """Launcher facts -> real mint -> real prepare -> the runtime's default blob -> staged exactly as ``start`` stages
-    (the brief, then the workspace seam only if the runtime has a default one)."""
+    (the brief, then the workspace seam only if the runtime has one). ``wired`` builds the runtime as production does
+    and uploads a real snapshot first; the others use the class defaults, whose workspace seam is None."""
     d, w = ptd, ptd.w
     merged, _ids, _notes = VR.merge(doc)                      # setup's own merge; None = an absent map
     (w.L / "routes" / "base.json").write_bytes(canon.canonical_bytes(merged))
     base = w.L / "routes" / "base.json"
     monkeypatch.setattr(DR.layout, "base_routes_path", lambda host: base)
-    rt = DR.HelperSlotRuntime(host="linux", helper=("true",), store=w.L, control_socket=tmp_path / "c.sock")
+    upload = verified = None
+    if wired:
+        rt, uploads = wired_runtime(w, tmp_path)
+        verified, upload = upload_snapshot(uploads, tmp_path)
+    else:
+        rt = DR.HelperSlotRuntime(host="linux", helper=("true",), store=w.L, control_socket=tmp_path / "c.sock")
     assert rt._routes is None                                 # the default routes: never injected
 
     ln = L.RealLauncher(FakeControl(), FakeRuntime(), FakeSources(), L.SessionIndex(tmp_path / "idx"))
@@ -89,13 +139,15 @@ def pipe(ptd, monkeypatch, tmp_path, doc=None):  # noqa: F811
     line = d.prepare(ticket)
     assert line["ok"], (line, w.last_err)
     session = line["session"]
-    req = L.SlotStart(ticket, RUN, KEY, "claude", lau.model, lau.brief, str(facts["brief_digest"]), L.HOOKS)
+    req = L.SlotStart(ticket, RUN, KEY, "claude", lau.model, lau.brief, str(facts["brief_digest"]), L.HOOKS, verified)
     blob_bytes = rt._render_blob(req)
     staging = w.L / "staging" / session
     L.stage_brief_for(req, staging)                           # start()'s order: the brief ...
     if rt._workspace is not None:                             # ... then the workspace seam, when the runtime has one
         rt._workspace(req, staging)
-    return Pipe(d, w, rt, req, session, blob_bytes, ticket)
+    p = Pipe(d, w, rt, req, session, blob_bytes, ticket)
+    p.upload = upload
+    return p
 
 
 def _gates(p):
@@ -160,19 +212,38 @@ def test_control_the_old_blob_with_the_egress_routes_is_refused(ptd, monkeypatch
     assert p.steps == []
 
 
-def test_KNOWN_NEXT_REFUSAL_staging_missing(ptd, monkeypatch, tmp_path):  # noqa: F811
-    """THE NAMED MARKER. The workspace seam is unwired by design (``workspace=None`` is the runtime's default), so
-    nothing stages ``repo.bundle`` and render ends exactly at step (3) 'files', refused ``staging-missing``: past the
-    ticket gate, past ``render_facts`` -> ``check_facts``, past step (1)'s CAS and step (2)'s policy. It reaches no
-    later step.
-
-    WHEN THIS GOES RED the stager has landed (the runtime has a default workspace seam, or something now stages the
-    bundle) and the pipeline has moved past its last known refusal. That is progress, not a regression: update this
-    test to stage through the default seam and assert the files step now passes and the next refusal (if any) is the
-    new marker. Do NOT skip, xfail or delete it: the red is how the next lane learns where the pipeline now ends."""
+def test_control_an_unwired_workspace_seam_still_ends_at_staging_missing(ptd, monkeypatch, tmp_path):  # noqa: F811
+    """The old marker, kept as a control. A runtime built from the class defaults has no workspace seam, so nothing
+    stages ``repo.bundle`` and render ends exactly at step (3) 'files', refused ``staging-missing``: past the ticket
+    gate, past ``render_facts`` -> ``check_facts``, past step (1)'s CAS and step (2)'s policy, and short of every later
+    step. It exists so the wired test below cannot pass for any reason but the seam: with the seam removed the same
+    pipeline must end here, by name."""
     p = pipe(ptd, monkeypatch, tmp_path)
-    assert p.rt._workspace is None, "a default workspace seam is wired: the stager landed, update this marker"
+    assert p.rt._workspace is None                            # the class default: nothing wired
     code, ans = p.render()
-    assert (code, ans.get("refused")) == (H.EXIT_REFUSED, KNOWN_NEXT), (ans, p.w.last_err)
+    assert (code, ans.get("refused")) == (H.EXIT_REFUSED, UNWIRED_END), (ans, p.w.last_err)
     assert p.steps == STEPS_REACHED
     assert not (p.w.L / "live" / p.session / "in" / stage.BUNDLE_NAME).exists()
+
+
+@needs_git
+def test_the_production_wired_workspace_renders_every_step(ptd, monkeypatch, tmp_path):  # noqa: F811
+    """The pipeline's end once the stager was wired through ``build_server``. The first marker was to go red when the
+    stager landed and be updated to the NEW first refusal; measured on the merged tree there is none: a real snapshot
+    uploaded through both halves, staged by the server's own seam, passes ticket gate, ``check_facts`` and every render
+    step. The pin is the whole outcome: ``ok`` after every step of ``H.RENDER_STEPS``, the bytes the operator built
+    sitting in the slot's ``in/`` (the root-side copy), the staging file consumed, and the base the header named
+    recorded on the alloc from those same bytes. The next refusal this pipeline can meet is past ``render``
+    (``start``, in the VM), which nothing here drives."""
+    p = pipe(ptd, monkeypatch, tmp_path, wired=True)
+    assert p.rt._workspace is not None, "the production runtime has no workspace seam"
+    staging_file = p.w.L / "staging" / p.session / stage.BUNDLE_NAME
+    assert staging_file.read_bytes() == p.upload.bundle       # the server's seam staged what the operator built
+    code, ans = p.render()
+    assert (code, ans) == (0, {"ok": True}), (ans, p.w.last_err)
+    assert p.steps == ALL_STEPS
+    assert (p.w.L / "live" / p.session / "in" / stage.BUNDLE_NAME).read_bytes() == p.upload.bundle
+    assert not staging_file.exists()                          # step (3) emptied staging after the copy was durable
+    base = p.w.alloc(p.session).base
+    assert base is not None and base.bundle_bytes == len(p.upload.bundle)
+    assert base.bundle_sha256 == "sha256:" + hashlib.sha256(p.upload.bundle).hexdigest()
