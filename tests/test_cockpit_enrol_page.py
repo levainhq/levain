@@ -159,3 +159,40 @@ def test_the_cards_with_no_passkey_to_sign_with_link_to_the_page(tmp_path: Path,
     assert out["values"][1] == "/enrol", out["values"]
     assert out["values"][2].startswith("no passkey is enrolled for"), out["values"]
     assert sheet["values"][2] == "/enrol", sheet["values"]
+
+
+@needs_browser
+def test_a_failed_send_keeps_the_credential_and_the_retry_makes_no_second_passkey(tmp_path: Path, monkeypatch) -> None:
+    rig = _rig_with_no_passkey(tmp_path, monkeypatch)
+    fail_first = ("(() => { const real = window.fetch.bind(window); let n = 0; window.fetch = (u, o) => "
+                  "(String(u).includes('key-line') && n++ === 0 ? Promise.resolve(new Response('{}', {status: 503})) : real(u, o)); "
+                  "return 1; })()")
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            DESKTOP, rig.authenticator(), *_open(), {"eval": SPY}, {"eval": fail_first},
+            {"tap": "document.querySelector('#enrol-actions button')"},
+            {"until": "/^Passkey made, not sent/.test(document.getElementById('enrol-title').textContent) && 1", "ms": 30000},
+            {"eval": "[...document.querySelectorAll('#enrol-actions button')].map((b) => b.textContent).join('|')"},
+            {"tap": "document.querySelector('#enrol-actions button')"},
+            {"until": "document.querySelectorAll('#enrol-cmds .enrol-cmd').length > 0 && 1", "ms": 30000},
+            {"eval": "window.__creates"},
+        ])
+    v = out["values"]
+    assert v[6] == "Send the key again|Discard it and make another", v
+    assert v[9] == 1, v                                        # one creation across the failed send and its retry
+
+
+@needs_browser
+@needs_ssh
+def test_the_link_on_a_sheet_the_cockpit_overlay_frames_leaves_the_frame(tmp_path: Path, monkeypatch) -> None:
+    # /enrol refuses to be framed, so a link that navigated the overlay's frame would draw a blank "refused to connect"
+    rig = _rig_with_no_passkey(tmp_path, monkeypatch)
+    frame = (f"(() => {{ const f = document.createElement('iframe'); f.id = 'enrol-probe'; f.src = '/sign/{QRID}'; "
+             "document.body.appendChild(f); return 1; })()")
+    link = "(document.getElementById('enrol-probe').contentDocument || {querySelector: () => null}).querySelector('#sheet-escalate a.sign-enrol-link')"
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), {"eval": frame},
+            {"until": f"{link} && {link}.getAttribute('target')", "ms": 30000},
+        ])
+    assert out["values"][-1] == "_top", out["values"]

@@ -2644,7 +2644,7 @@ body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_d
 /* the passkey-making page (enrol.js): one command per row, wrapped whole, with its copy button under it */
 .enrol-cmd { margin: 0 0 var(--sp-4); }
 .enrol-cmd code { display: block; margin: 0 0 var(--sp-2); padding: var(--sp-3); background: var(--bg); border: 1px solid var(--hair); border-radius: var(--r-sm); color: var(--text); font: var(--fw-regular) var(--fs-meta)/1.5 var(--mono); overflow-wrap: anywhere; user-select: all; }
-.sign-enrol-link { margin-left: var(--sp-2); color: var(--text); }
+.sign-enrol-link { display: inline-block; min-height: var(--hit-min, 44px); line-height: var(--hit-min, 44px); margin-left: var(--sp-2); color: var(--text); }
 .pair-code { width: 100%; box-sizing: border-box; margin: 0 0 var(--sp-3); text-align: center; letter-spacing: .25em; text-transform: uppercase; font: var(--fw-bold) var(--fs-title)/1.2 var(--mono); }
 .pair-msg { margin: 0 0 var(--sp-3); color: var(--text); font: var(--fw-regular) var(--fs-body)/1.5 var(--sans); overflow-wrap: anywhere; }
 .pair-msg[hidden] { display: none; }

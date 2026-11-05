@@ -460,6 +460,8 @@
     card.appendChild(el("p", "", "Make a passkey on this device, enrol it at the laptop (levain cockpit enroll, signed by the laptop key), then open this link again."));
     const mk = el("a", "sign-enrol-link", "Make a passkey on this device");
     mk.href = "/enrol";
+    // the overlay frames this sheet and /enrol refuses to be framed: the link leaves the frame
+    if (framed) mk.target = "_top";
     card.appendChild(mk);
     $("sheet-body").appendChild(card);
   }

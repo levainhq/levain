@@ -18,8 +18,9 @@
   const $ = (id) => document.getElementById(id);
   const titleEl = $("enrol-title"), msgEl = $("enrol-msg"), actEl = $("enrol-actions"), cmdEl = $("enrol-cmds");
 
-  // the name a passkey is made for is the page's own host: a credential made for another name than the cockpit's is refused
-  // by the cockpit (its attested authenticatorData names the rpId), so a page opened on another host cannot enrol a dud
+  // the name a passkey is made for is the page's own host. Where the browser gives the creation's authenticatorData the
+  // cockpit refuses a credential made for another name (the data names the rpId); where it does not, the commands carry no
+  // --attested and this page says so
   const rpId = location.hostname;
   const usable = window.isSecureContext === true && typeof window.PublicKeyCredential === "function"
     && !!(navigator.credentials && navigator.credentials.create);
@@ -72,9 +73,10 @@
   }
   const why = (r) => ((r.body && typeof r.body.message === "string" && r.body.message.replace(/[.\s]+$/, "")) || ("refused (HTTP " + r.status + ")"));
 
-  function showCommands(r, name) {
+  function showCommands(r, c) {
+    const name = c.name;
     const fp = r.body.fingerprint;
-    say("Passkey made", "Fingerprint " + fp + (name ? ', named "' + name + '"' : "") + ". A passkey cannot enrol itself: on the laptop, run these "
+    say("Passkey made", (!c.authData ? "Not attested by this browser: the cockpit cannot check which name it was made for. " : "") + "Fingerprint " + fp + (name ? ', named "' + name + '"' : "") + ". A passkey cannot enrol itself: on the laptop, run these "
         + "in order (the second is signed by your laptop key), then open the cockpit again. Nothing is enrolled until you do."
         + (r.body.note ? " " + r.body.note : ""));
     const lines = Array.isArray(r.body.commands) ? r.body.commands : [];
@@ -104,12 +106,13 @@
         // a refused key (422) will never be accepted: drop it so the next tap makes a fresh passkey
         if (r.status === 422) { setMade(null); say("Not accepted", "The cockpit refused this passkey: " + why(r) + ". Nothing was enrolled; make another."); buttons([["Make a passkey", true, start]]); return; }
         say("Passkey made, not sent", "The cockpit did not take its key (" + why(r) + "). The passkey is kept: send it again.");
-        buttons([["Send the key again", true, () => { buttons([]); send(made || c); }]]);
+        buttons([["Send the key again", true, () => { buttons([]); send(made || c); }],
+                 ["Discard it and make another", false, () => { setMade(null); start(); }]]);
         return;
       }
       remember(r.body.fingerprint, c.rawId);
       setMade(null);
-      showCommands(r, c.name);
+      showCommands(r, c);
     });
   }
 
@@ -146,7 +149,8 @@
     say("This page cannot make a passkey here", "A passkey needs the cockpit's https page (" + (location.protocol === "https:" ? "this browser has no passkey support" : "this page is not https") + ").");
   } else if (made) {
     say("A passkey was made and not yet sent", "Its key is kept for " + rpId + ": send it again.");
-    buttons([["Send the key again", true, () => { buttons([]); send(made); }]]);
+    buttons([["Send the key again", true, () => { buttons([]); send(made); }],
+             ["Discard it and make another", false, () => { setMade(null); start(); }]]);
   } else {
     say("Make a passkey on this device", "This makes a passkey for " + rpId + " on this device. The laptop then enrols it with a command this page prints; until it is enrolled the passkey signs nothing.");
     buttons([["Make a passkey", true, start]]);
