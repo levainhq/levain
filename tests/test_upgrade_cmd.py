@@ -757,7 +757,7 @@ def test_a_live_session_prompts_before_the_installer_or_sudo(env, capsys):
 
 
 def test_zero_live_records_is_todays_output(env, capsys, tmp_path):
-    env.live = (True, [rec(S1, state="RETAINED"), rec(S2, state="HELD")])
+    env.live = (True, [rec(S1, state="RETAINED", lease_live=False), rec(S2, state="HELD", lease_live=False)])
     rc, out = env.run(capsys, no_pip=True)
     base = Env(tmp_path / "b")
     rc2, out2 = base.run(capsys, no_pip=True)
@@ -835,20 +835,36 @@ def test_a_direct_no_pip_cancel_says_nothing_was_changed(env, capsys, monkeypatc
 
 
 @pytest.mark.parametrize("how", ["flag", "prompt"])
-def test_end_on_a_status_that_does_not_answer_is_unknown_not_zero(env, capsys, how):
-    """L3 r2 N2: `e` / --end-sessions on a silent STATUS went on to root; it is unknown, so it stops and says so."""
+def test_end_on_a_status_that_does_not_answer_goes_on_and_says_so(env, capsys, how):
+    """L3 r3 HIGH: a host whose CONTROL is down is repaired by this command. `e` / --end-sessions on a silent STATUS
+    says plainly that it cannot tell and goes on; root refuses by itself under its lock if a lease is live."""
     env.live = (False, "no control socket")
     env.answers = ["e"] if how == "prompt" else []
     rc, out = env.run(capsys, end_sessions=(how == "flag"))
-    assert rc == 4 and "cannot tell" in out and "no control socket" in out
-    nothing_ran(env)
+    assert rc == 0 and "cannot tell" in out and "no control socket" in out
+    assert "Going on: the root step refuses by itself if a session still holds a live lease" in out
+    assert env.execs and len(env.runner.calls) == 1
+
+
+def test_no_control_socket_host_reaches_the_root_step(env, capsys):
+    env.live = (False, "no control socket")
+    rc, out = env.run(capsys, no_pip=True, end_sessions=True)
+    assert rc == 0 and "Going on" in out and len(sudo_calls(env)) == 1
+
+
+def test_a_revoked_or_held_record_with_a_live_lease_counts_in_both_checks():
+    """Root counts lease_live in ANY state; so do both checks."""
+    recs = [rec(S1, state="REVOKED", lease_live=True), rec(S2, state="HELD", lease_live=True),
+            rec(S3, state="HELD", lease_live=False)]
+    agents, own = U._live_split(recs)
+    assert sorted(agents + own) == sorted([S1, S2]) and U._leased(recs) == sorted([S1, S2])
 
 
 def test_off_shape_and_unknown_state_records_count_as_running():
     agents, own = U._live_split([rec(S1), "junk", {"session": S2, "state": ["x"]}, {"session": S3, "state": "NEW"},
-                                 rec(S1, state="RETAINED")])
+                                 rec(S1, state="RETAINED", lease_live=False)])
     assert len(agents) == 4 and not own
-    assert U._live_split([rec(S1, state="HELD"), rec(S2, state="PURGED")]) == ([], [])
+    assert U._live_split([rec(S1, state="HELD", lease_live=False), rec(S2, state="PURGED", lease_live=False)]) == ([], [])
 
 
 def test_wait_on_a_status_that_does_not_answer_prompts_at_once(env, capsys):

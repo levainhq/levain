@@ -493,8 +493,8 @@ def _live_split(recs: Any) -> tuple[list[str], list[str]]:
             continue
         st = r.get("state")
         known = type(st) is str and st in R.STATES      # an unhashable or unknown state is a session that may run
-        if known and st not in R.LIVE_STATES:
-            continue
+        if known and st not in R.LIVE_STATES and r.get("lease_live") is not True:
+            continue                # root counts lease_live in ANY state, so a REVOKED or HELD record with one runs
         sess = r.get("session")
         claims = r.get("claims")
         kind = claims.get("kind") if type(claims) is dict else None
@@ -574,7 +574,8 @@ def _leased(recs: Any) -> list[str]:
             out.append("?")
             continue
         st = r.get("state")
-        if type(st) is str and st in R.STATES and (st not in R.LIVE_STATES or r.get("lease_live") is False):
+        if type(st) is str and st in R.STATES and (r.get("lease_live") is False
+                                                   or (st not in R.LIVE_STATES and r.get("lease_live") is not True)):
             continue
         sess = r.get("session")
         out.append(sess if type(sess) is str and SESSION_RE.fullmatch(sess) else "?")
@@ -623,10 +624,9 @@ def _offer_loop(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: boo
         choice = preset or _choose(s, minutes, why)
         preset = None
         if choice == "end":
-            if not answered:        # unknown is not zero: nothing says no lease is live
-                print(f"{why} Levain will not go on to root without knowing. Try again, or use --wait.")
-                print(f"Stopped. {_cancel_words(phase)}")
-                return EXIT_WAITED_OUT
+            if not answered:        # a host whose CONTROL is down is what this command repairs; root decides under its lock
+                print(f"{why} Going on: the root step refuses by itself if a session still holds a live lease.")
+                return None
             blockers = _leased(recs)
             if not blockers:
                 return None             # nothing to end that the repair would refuse; root decides under its lock
