@@ -299,8 +299,8 @@ class Meter:
                     row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
                     if row is None:
                         conn.execute("INSERT INTO meta (key, value) VALUES ('format', ?)", (FORMAT,))
-                    elif row[0] != FORMAT:
-                        raise MeterError(f"voice ledger format {row[0]!r} is not {FORMAT!r}")
+                    else:
+                        _need_format(row[0])
                     conn.execute("COMMIT")
                 except BaseException:
                     _rollback(conn)
@@ -434,6 +434,11 @@ class Meter:
         try:
             uri = self.path.resolve().as_uri() + "?mode=ro"
             with closing(sqlite3.connect(uri, uri=True, timeout=_BUSY_WAIT_S, isolation_level=None)) as conn:
+                # the same format test the normal connection path runs (:meth:`_create`), but a missing row is a
+                # refusal here: this path never writes one, and a foreign database with a compatible ``calls``
+                # table must not read as a ledger
+                row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+                _need_format(row[0] if row is not None else None)
                 month, day, m0, d0 = self._sums(conn, now)
             return Spend(month, day, m0, d0, self.prices.as_of)
         except sqlite3.Error as exc:
@@ -453,6 +458,13 @@ class Meter:
         except sqlite3.Error as exc:
             failed = type(exc).__name__
         raise MeterError(f"the voice ledger could not be used: {failed}")
+
+
+def _need_format(found: object) -> None:
+    """The ledger's format stamp is :data:`FORMAT`, else a :class:`MeterError` (the one test both the creating path and
+    the read-only one run)."""
+    if found != FORMAT:
+        raise MeterError(f"voice ledger format {found!r} is not {FORMAT!r}")
 
 
 def _rollback(conn: sqlite3.Connection) -> None:

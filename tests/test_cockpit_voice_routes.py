@@ -961,3 +961,188 @@ def test_t_getro_voice_json_creates_no_ledger(rig):
         assert call(port, "HEAD", VOICE_JSON)[0] == 200
     assert not rig.ledger_path.exists()
     assert not any(p.name.startswith(cockpit_voice.LEDGER_NAME) for p in rig.qdir.iterdir())
+
+
+# --- voice14 round 1 fixes (FINDINGS_voice14_r1.md F1-F10) -----------------------------------------------------------
+
+def _spent(rig) -> voice_meter.Spend:
+    return voice_meter.Meter(rig.ledger_path).spent()
+
+
+def test_f2_a_reader_fault_custody_does_not_name_releases_the_reservation_and_logs_the_type_once(
+        rig, monkeypatch, caplog, capsys):
+    """F2 + F3 (the 'unexpected' reader-fault branch): read_key raising something custody does not name (a KeyError
+    quoting the key) means nothing went out, so the row must end ``released`` at cost zero. Left ``reserved`` it
+    counted toward both caps for good (the meter has no reaper). The log names the exception's TYPE once per fault.
+    Red with: the ``key_failure == "unexpected"`` branch of ``_call`` returning without ``_end(..., release=True)``."""
+    caplog.set_level(logging.DEBUG)
+    g = rig.reply("Hello there.")
+
+    def read_key(*a, **k):
+        raise KeyError(f"reader fault quoting {VALUE}")
+
+    monkeypatch.setattr(custody, "read_key", read_key)
+    with served(rig) as (port, httpd):
+        for _ in range(3):
+            for status, _h, body in (speak(port, rig, g), transcribe(port)):
+                out = js(body)
+                assert (status, out["error"], out["fallback"]) == (500, "internal", "on_device")
+                assert out["message"] == "Premium voice failed; reading uses the on-device voice."
+                no_leak(body.decode())
+    rows = rig.rows()
+    assert len(rows) == 6 and {(r.status, r.cost_micros) for r in rows} == {("released", 0)}
+    spend = _spent(rig)
+    assert (spend.day_micros, spend.month_micros) == (0, 0)
+    assert rig.transport.seen == []
+    lines = [r.getMessage() for r in caplog.records if "key reader" in r.getMessage()]
+    assert len(lines) == 6 and all("KeyError" in line for line in lines), lines
+    no_leak(caplog.text, *capsys.readouterr())
+
+
+def _trickle(port, head_text: str, body: bytes, gap: float, wait: float):
+    """Send ``head_text``, then ``body`` one byte every ``gap`` seconds; read whatever answer comes. Returns the status
+    line's code (or None when the server hung up with nothing) and the seconds until the answer or the hang-up."""
+    import time
+    s = socket.create_connection(("127.0.0.1", port), timeout=wait)
+    started = time.monotonic()
+    try:
+        s.sendall(head_text.encode("ascii"))
+        s.setblocking(False)
+        answered = b""
+        for i in range(len(body)):
+            try:
+                s.sendall(body[i:i + 1])
+            except OSError:
+                break
+            end = time.monotonic() + gap
+            while time.monotonic() < end:
+                try:
+                    got = s.recv(65536)
+                except BlockingIOError:
+                    time.sleep(0.02)
+                    continue
+                except OSError:
+                    got = b""
+                answered += got
+                if not got:
+                    break
+                if b"\r\n\r\n" in answered:
+                    break
+            if answered:
+                break
+        if not answered:
+            s.setblocking(True)
+            s.settimeout(wait)
+            try:
+                while b"\r\n\r\n" not in answered:
+                    got = s.recv(65536)
+                    if not got:
+                        break
+                    answered += got
+            except OSError:
+                pass
+        code = int(answered.split(b" ", 2)[1]) if answered.startswith(b"HTTP/") else None
+        return code, answered, time.monotonic() - started
+    finally:
+        s.close()
+
+
+def test_f10_a_body_that_trickles_is_cut_at_one_total_deadline_and_frees_the_slot(rig, monkeypatch):
+    """F10: the socket timeout is per recv, so a client sending a byte before each one fires held a voice slot for as
+    long as it liked; two of them made every later call ``voice_busy``. The body is read under ONE total deadline: 408 in
+    fixed words, the connection closed, the slot released. Red with: ``_voice_answer`` reading ``self.rfile.read(clen)``
+    in one call (the trickle runs to its end and the answer is not a 408)."""
+    monkeypatch.setattr(cockpit_voice, "BODY_DEADLINE_S", 1.0)
+    rig.add_key()
+    g = rig.reply("Hello there.")
+    with served(rig) as (port, httpd):
+        body = b"x" * 12
+        for path in (SPEAK, TRANSCRIBE + "?provider=openai"):
+            ctype = "application/json" if path == SPEAK else "audio/webm"
+            code, answered, seconds = _trickle(port, head(port, path, ctype=ctype, clen=str(len(body))), body, 0.4, 10)
+            assert code == 408, (path, answered[:200])
+            assert seconds < 3.5, seconds
+            payload = json.loads(answered.partition(b"\r\n\r\n")[2] or b"{}")
+            assert payload["error"] == "request_timeout" and payload["message"] == cockpit_voice.WORDS["body_timeout"]
+            assert b"connection: close" in answered.lower()
+        for _ in range(cockpit_voice.VOICE_INFLIGHT):                  # both slots are free again
+            assert httpd.voice_gate.acquire(blocking=False)
+        for _ in range(cockpit_voice.VOICE_INFLIGHT):
+            httpd.voice_gate.release()
+        assert speak(port, rig, g)[0] == 200
+    assert len(rig.transport.seen) == 1
+
+
+class _ValueErrorAdapter:
+    """An adapter whose call raises ValueError, as every adapter does for input it refuses BEFORE it sends."""
+
+    def speak(self, key, text, voice, speed):
+        raise ValueError("refused before sending")
+
+    def transcribe(self, key, audio, mime, lang=""):
+        raise ValueError("refused before sending")
+
+
+def test_f3_and_f8_an_adapter_valueerror_releases_the_row_and_answers_bad_call_with_the_fallback(rig, monkeypatch):
+    """F3 (the ``except ValueError`` release branch) + F8 (the refusal names ``fallback: on_device`` as every sibling
+    failure does). Nothing went out, so the row ends ``released`` at cost zero and last_read stays clear. Red with:
+    the ``except ValueError`` branch of ``_call`` deleted (it settles: status ``ok``, a 'internal' body) or the
+    ``fallback=True`` of the bad_call refusal removed."""
+    rig.add_key()
+    g = rig.reply("Hello there.")
+    monkeypatch.setattr(vprov, "provider_for", lambda name, transport: _ValueErrorAdapter())
+    with served(rig) as (port, httpd):
+        for status, _h, body in (speak(port, rig, g), transcribe(port)):
+            out = js(body)
+            assert (status, out["error"], out["message"], out["fallback"]) == (
+                500, "internal", "Premium voice could not use that request.", "on_device")
+        assert httpd.voice_last_read["openai"] is None
+    assert {(r.status, r.cost_micros) for r in rig.rows()} == {("released", 0)} and len(rig.rows()) == 2
+    spend = _spent(rig)
+    assert (spend.day_micros, spend.month_micros) == (0, 0)
+
+
+def test_f5_a_call_failure_after_a_refused_key_clears_the_refused_state(rig):
+    """F5(a): a key the provider refused sets last_read to ``refused``; once the key is read again the entry is cleared,
+    so a later rate limit (a failure that is not a shown state) leaves it clear, and a success leaves it clear.
+    Red with: the clear after a successful ``read_key`` in ``_call`` removed (``refused`` outlives the replaced key)."""
+    rig.add_key()
+    g = rig.reply("Hello there.")
+    with served(rig) as (port, httpd):
+        rig.transport.status, rig.transport.body = 401, b""
+        assert speak(port, rig, g)[0] == 502
+        assert httpd.voice_last_read["openai"] == "refused"
+        rig.transport.status, rig.transport.body = 429, _429(code="rate_limit_exceeded")
+        assert speak(port, rig, g)[0] == 503
+        assert httpd.voice_last_read["openai"] is None
+        _h = call(port, "GET", VOICE_JSON)
+        assert js(_h[2])["providers"][0]["last_read"] is None
+
+
+@pytest.mark.parametrize("later", ["not_set", "use_not_granted"])
+def test_f5_a_key_failure_that_is_not_a_shown_state_clears_an_earlier_one(rig, monkeypatch, later):
+    """F5(b): ``keychain_unreadable`` was shown; then the read answers ``not_set`` / ``use_not_granted``, which are not
+    states voice.json shows, so the earlier cause must not stay on the page. Red with: ``last_read`` written only when
+    the failure is one of ``LAST_READ_STATES`` (the old line)."""
+    g = rig.reply("Hello there.")
+    with served(rig) as (port, httpd):
+        monkeypatch.setattr(custody, "read_key", _raising("keychain_unreadable"))
+        assert speak(port, rig, g)[0] == 503
+        assert httpd.voice_last_read["openai"] == "keychain_unreadable"
+        monkeypatch.setattr(custody, "read_key", _raising(later))
+        assert speak(port, rig, g)[0] == 409
+        assert httpd.voice_last_read["openai"] is None
+
+
+def test_f7_a_speed_past_the_float_range_is_a_400_bad_speed_not_a_500(rig):
+    """F7: an int of 400 digits fits the 4 KiB speak body; ``math.isfinite`` raised OverflowError on it (a 500).
+    Red with: ``_number`` calling ``math.isfinite(value)`` on an int."""
+    rig.add_key()
+    g = rig.reply("Hello there.")
+    with served(rig) as (port, _httpd):
+        for speed in (10 ** 400, -(10 ** 400)):
+            status, _h, body = speak(port, rig, g, speed=speed)
+            out = js(body)
+            assert (status, out["error"], out["message"]) == (400, "bad_request",
+                                                              "That speed is outside what OpenAI accepts.")
+    assert rig.rows() == [] and rig.transport.seen == []

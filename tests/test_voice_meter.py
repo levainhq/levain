@@ -567,3 +567,22 @@ def test_spent_if_present_refuses_a_symlink_and_a_foreign_file(tmp_path):
     _foreign(meter.path)
     with pytest.raises(MeterError):
         meter.spent_if_present()
+
+
+@pytest.mark.parametrize("damage,pattern", [
+    ("UPDATE meta SET value = 'someone-elses-ledger/1' WHERE key = 'format'", "format"),    # a stamp that is not ours
+    ("DELETE FROM meta WHERE key = 'format'", "format"),                                    # no stamp at all
+    ("DROP TABLE meta", "OperationalError"),                                                # no meta table at all
+], ids=["foreign-stamp", "no-stamp", "no-meta"])
+def test_spent_if_present_requires_the_ledger_format_stamp_the_normal_path_requires(tmp_path, damage, pattern):
+    """voice14 F6: a SQLite file with a compatible ``calls`` table but not our stamp read as ``meter: ok`` with whatever
+    spend it held. Red with: the format read removed from ``spent_if_present``."""
+    meter, _clock = make(tmp_path)
+    meter.reserve("openai", "tts", "tts-1", 1000)
+    with sqlite3.connect(meter.path) as conn:
+        conn.execute(damage)
+    with pytest.raises(MeterError, match=pattern):
+        meter.spent_if_present()
+    if "someone-elses" in damage:
+        with pytest.raises(MeterError, match=pattern):
+            Meter(meter.path).spent()      # the creating path refuses the same wrong stamp (one shared test)

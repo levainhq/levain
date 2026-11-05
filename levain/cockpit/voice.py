@@ -3,8 +3,9 @@
 Three routes, served only beside a room host and a broker: ``GET /cockpit/voice.json`` (which providers have a key,
 the caps and the estimated spend), ``POST /cockpit/voice/speak`` (one chunk of a finished room reply, as mp3) and
 ``POST /cockpit/voice/transcribe?provider=`` (an audio upload, as text). This module is the orchestration with no socket:
-each function returns ``(status, content type, headers, body bytes)``; ``levain.web_server`` runs the gates (design
-section 2) and writes the answer.
+``speak`` and ``transcribe`` return an :class:`Answer` (status, content type, headers, body bytes) and ``serve_voice``
+returns the ``voice.json`` body as a dict; ``levain.web_server`` runs the gates (design section 2) and writes the
+answer.
 
 The call sequence is the design's section 3 and its order is the point:
 
@@ -15,10 +16,10 @@ The call sequence is the design's section 3 and its order is the point:
 5. the adapter call, with ``secret.reveal()`` written INLINE in its argument list, so no name in any frame of this
    module ever holds the key as a str (the adapter's own ``_Key`` takes it from there);
 6. settle or release, in a ``finally`` around 5. Release is for a call that never went out: a key that could not be
-   read (4, :class:`~levain.voice.custody.VoiceKeyUnavailable`) or an adapter ``ValueError`` (raised before it sends).
-   Every other outcome once the adapter was called settles, a provider refusal and an unexpected exception included,
-   because the provider may have billed it. A reader fault custody does not name (4 raising anything else) is neither:
-   the row stays ``reserved``, which counts, so the estimate errs high.
+   read (4: :class:`~levain.voice.custody.VoiceKeyUnavailable`, or any other fault of the reader, which is logged by
+   its type name) or an adapter ``ValueError`` (raised before it sends). Every other outcome once the adapter was
+   called settles, a provider refusal and an unexpected exception included, because the provider may have billed it.
+   A row left ``reserved`` counts toward the caps and nothing reaps it, so no path may leave one.
 
 What the operator sees is fixed words from :data:`WORDS` (or :data:`levain.voice.providers.WORDS` by code): never a
 provider body, a status line, an exception's text or a record field. Nothing here logs an exception's text or its
@@ -51,6 +52,9 @@ VOICE_PATHS = (SPEAK_PATH, TRANSCRIBE_PATH)
 VOICE_INFLIGHT = 2                      # voice POSTs in flight at once (the server's voice_gate), apart from request_gate
 SPEAK_MAX = 4 * 1024                    # a speak body is a few ids and numbers; the words come from the record
 UPLOAD_MAX = 4 * 1024 * 1024            # the transcribe body cap, checked on the declared length before a byte is read
+# One wall-clock budget, in seconds, for reading a voice POST's body while its slot is held. The server's socket timeout
+# is per recv, so on its own a client sending a byte before each one fires could keep a slot for as long as it liked.
+BODY_DEADLINE_S = 20.0
 # Estimated seconds of an upload: its bytes at a 32 kbps floor (4000 bytes a second). The browser picks the bitrate, so
 # the length cannot be known from the size (design F2); a floor this low prices the common Opus and AAC rates high.
 UPLOAD_BYTES_PER_SECOND = 4000
@@ -95,6 +99,7 @@ WORDS = {
     "no_owner": "Premium voice needs a named credential.",
     "too_long": "That recording is too long to transcribe (the limit is two minutes).",
     "voice_busy": "Voice is busy; try again in a moment.",
+    "body_timeout": "The request did not arrive in time; try again.",
     "unsupported_media_type": "Send the recording as audio/webm, audio/mp4, audio/mpeg or audio/wav.",
     "not_found": "Premium voice is not served here.",
     "bad_json": "The request is not valid JSON.",
@@ -291,21 +296,24 @@ def _call(provider: str, use: str, units: int, data_root: Path | str, *, meter: 
         return None, _refuse_check(check, provider)
     reservation = check.reservation_id
     key_failure = None
+    fault = ""
     try:
         secret = read_key(provider, use, authority=custody.authority_for(data_root))
     except custody.VoiceKeyUnavailable as exc:
         key_failure = exc.code
-    except Exception:            # noqa: BLE001 - a reader fault custody does not name: no call went out, and the
-        # reservation is neither released nor settled, so it stays counted (the meter errs high, never low)
-        key_failure = "unexpected"
-    if key_failure == "unexpected":
-        return None, internal_answer()
+    except Exception as exc:     # noqa: BLE001 - a reader fault custody does not name: no call went out
+        key_failure, fault = "unexpected", type(exc).__name__
     if key_failure is not None:
-        # no request went out: the reservation is released (counts nothing), and the page reads on device
+        # no request went out: the reservation is released (counts nothing; a row left ``reserved`` would count toward
+        # both caps for good, the meter has no reaper), and the page reads on device. last_read names the cause now
+        # in force, so an earlier one that no longer applies is cleared (the states that are not shown read as None)
         _end(meter, reservation, release=True)
-        if key_failure in LAST_READ_STATES:
-            last_read[provider] = key_failure
+        last_read[provider] = key_failure if key_failure in LAST_READ_STATES else None
+        if key_failure == "unexpected":
+            _log.warning("voice: the key reader failed (%s); nothing was sent", fault)   # the type name only
+            return None, internal_answer()
         return None, _key_refusal(key_failure, provider, use)
+    last_read[provider] = None      # the key was read: an earlier read failure no longer applies; a call failure sets its own
     # From here the adapter is called, so the reservation is settled on every outcome but one: an adapter ValueError,
     # which every adapter raises before it sends (the route's own checks are meant to make it unreachable), is released.
     release = False
@@ -325,12 +333,11 @@ def _call(provider: str, use: str, units: int, data_root: Path | str, *, meter: 
     finally:
         _end(meter, reservation, release=release)
     if failure is None:
-        last_read[provider] = None
         return result, None
     if failure in LAST_READ_STATES:
         last_read[provider] = failure
     if failure == "bad_call":
-        return None, refusal(500, "internal", "bad_call")
+        return None, refusal(500, "internal", "bad_call", fallback=True)
     if failure == "internal":
         return None, internal_answer()
     status, error = PROVIDER_FAILURES.get(failure, (502, "provider_rejected"))
@@ -341,7 +348,11 @@ def _call(provider: str, use: str, units: int, data_root: Path | str, *, meter: 
 # --- speak ------------------------------------------------------------------------------------------------------------
 
 def _number(value: Any) -> bool:
-    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+    """A JSON number that can be range-checked. An int is always finite, and ``math.isfinite`` raises OverflowError on
+    one past the float range (a 4 KiB body can carry such a digit string), so only a float is asked."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, int) or (isinstance(value, float) and math.isfinite(value))
 
 
 def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
