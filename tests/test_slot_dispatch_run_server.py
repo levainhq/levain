@@ -399,6 +399,51 @@ def test_a_holder_eof_and_a_reaper_end_on_one_session_make_one_teardown(rig, tmp
     assert runtime.ended == ["sess-1"] and runtime.entered == 1
 
 
+@pytest.mark.parametrize("proven", [False, True])
+def test_an_end_between_launch_and_release_makes_release_refuse_and_start_nothing(rig, tmp_path, proven):
+    """codex HIGH bundle L3 (dispatch_run.py:471): a short-connection END after LAUNCH and before RELEASE (teardown
+    running, or already proven) must make RELEASE refuse by name; the gated child is never released."""
+    runtime = BlockingRuntime()
+    env = Env(rig, tmp_path, runtime=runtime)
+    oid, key = _occurrence(rig, billing="subscription", exposure=EXP), "s-00000000000000d7"
+    child = env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    if proven:
+        runtime.gate.set()
+        assert env.client().end_session(key, 5).terminated is True
+    else:
+        assert env.client().end_session(key, 0.05).terminated is False      # the END is in flight
+    with pytest.raises(RuntimeError, match="session-ended"):
+        child.release()
+    assert env.runtime.children[0].released is False
+    runtime.gate.set()
+    child._conn.close()
+    env.drain()
+    assert env.runtime.children[0].released is False and runtime.ended == ["sess-1"]
+
+
+def test_an_end_while_the_launch_is_still_spawning_makes_release_refuse(rig, tmp_path):
+    """The same ordering one step earlier: an END that lands while the LAUNCH's spawn is in flight (the holder is
+    registered first) marks it ending, so the RELEASE that follows refuses and the child is never released."""
+    runtime = GatedStartRuntime()
+    env = Env(rig, tmp_path, runtime=runtime)
+    oid, key, got = _occurrence(rig, billing="subscription", exposure=EXP), "s-00000000000000d8", {}
+
+    def fire():
+        got["child"] = env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    t = threading.Thread(target=fire, daemon=True)
+    t.start()
+    assert runtime.entered.wait(5) and key in env.server._live
+    assert env.client().end_session(key, 0.05).terminated is False      # nothing to prove yet: answered unproven
+    runtime.gate.set()
+    t.join(10)
+    with pytest.raises(RuntimeError, match="session-ended"):
+        got["child"].release()
+    assert env.runtime.children[0].released is False
+    got["child"]._conn.close()
+    env.drain()
+    assert env.runtime.children[0].released is False and runtime.ended == ["sess-1"]
+
+
 def test_usage_by_an_unknown_key_is_the_caps(env):
     got = env.client().usage("s-00000000000000ff")
     assert got.actions is None and got.tunnel_bytes is None and got.seconds is None

@@ -324,7 +324,10 @@ class _Holder:
     launched child (None until the spawn answers; ``ready`` is set when it has, or when it failed), the proof and
     exposure it was launched under (re-judged before RELEASE), whether its ABORT already ran, and its END job once its
     cleanup started (``job``, set once under ``lock``: the cleanup runs once whichever of EOF, a refused RELEASE or
-    shutdown reaches it first). It leaves ``_live`` only when an END for its key is PROVEN."""
+    shutdown reaches it first). ``ending`` is THE one "an END began for this session" fact: set under ``lock`` before
+    any END job for the key starts (the holder's own cleanup, or a short-connection END while the holder is
+    registered), and RELEASE reads it under the same ``lock``, so a RELEASE either ran before every END or refuses.
+    It leaves ``_live`` only when an END for its key is PROVEN."""
 
     def __init__(self, key: str, proof: C.LinkProof, exposure: Optional[ActionExposure],
                  claims: Optional[FrameClaims] = None) -> None:
@@ -332,6 +335,7 @@ class _Holder:
         self.child: Any = None
         self.ready = threading.Event()
         self.aborted = False
+        self.ending = False
         self.lock = threading.Lock()
         self.job: Optional[_EndJob] = None
 
@@ -469,7 +473,7 @@ class RunServer:
                 self._finish(mine, HOLDER_END_WAIT_S)
                 raise
             with mine.lock:
-                if mine.job is not None:
+                if mine.ending:
                     raise LauncherRefused("session-ended", "this session's END already started; nothing is released")
                 mine.child.release()
             return C.ok_answer(rid), mine
@@ -604,6 +608,7 @@ class RunServer:
         try:
             with h.lock:
                 if h.job is None:
+                    h.ending = True
                     try:
                         if not h.aborted and not getattr(h.child, "released", False):
                             h.child.abort()
@@ -694,7 +699,14 @@ class RunServer:
         return job
 
     def _end(self, key: str, deadline_s: float) -> StopResult:
-        """Answer within ``deadline_s`` with the key's END job's result, else that it is in progress."""
+        """Answer within ``deadline_s`` with the key's END job's result, else that it is in progress. A holder registered
+        under the key (its spawn in flight included) is marked ``ending`` under its lock BEFORE the job starts, so its
+        RELEASE refuses from here on (codex HIGH, bundle L3 :471)."""
+        with self._mu:
+            h = self._live.get(key)
+        if h is not None:
+            with h.lock:
+                h.ending = True
         job = self._start_end(key)
         job.done.wait(max(0.0, deadline_s))
         return job.result
