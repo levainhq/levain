@@ -2829,6 +2829,9 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-banner .rv-detail { color: var(--label); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); overflow-wrap: anywhere; }
 .rv .rv-code { margin: var(--sp-2) 0 0; padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); overflow-x: auto; white-space: pre; }
 .rv .rv-code code { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); }
+.rv .rv-text strong { font-weight: var(--fw-semibold); }
+.rv .rv-ic { padding: 0 var(--sp-1); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
+.rv .rv-text strong .rv-ic { font-weight: var(--fw-regular); }
 @media (max-width: 720px) {
   body.ke .rv-zone .ck-zgrid .panel { height: auto; max-height: none; }
   body.ke .rv-zone .ck-zgrid .panel .pbody { overflow: visible; max-height: none; }
