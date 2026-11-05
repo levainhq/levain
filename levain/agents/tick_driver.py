@@ -128,7 +128,9 @@ def executor_of_factory(store: AgentStore, *, launcher_of: Callable[[], Any],
             try:
                 got = launcher_of()
                 why = ("no launcher was built" if got is None else
-                       "the install names no launcher (the unwired default)" if isinstance(got, UnwiredLauncher) else "")
+                       "the install names no launcher (the unwired default)" if isinstance(got, UnwiredLauncher) else
+                       "the launcher has no callable end_session, so nothing could stop the row"
+                       if not callable(getattr(got, "end_session", None)) else "")
                 launcher_cell.append((None if why else got, why))
             except Exception as exc:  # noqa: BLE001 - a launcher that cannot be built ends nothing
                 launcher_cell.append((None, f"{type(exc).__name__}: {exc}"))
@@ -256,25 +258,23 @@ def attention_sink(stream=None) -> tuple[Callable[[str, str], None], Callable[[s
 # --- one pass -----------------------------------------------------------------------------------------------------
 
 def _cockpit_root(store: AgentStore) -> Path:
-    """The install's cockpit root: the session install's, else the dream install's (a store with only a dream). Raises
-    ``ValueError`` (``InstallRefused`` is one) when neither file can be read."""
+    """The install's cockpit root: the session install's, else the dream install's (a store with only a dream). An
+    install is absent ONLY when its file does not exist; one that exists and cannot be read raises its refusal
+    (``InstallRefused``, a ``ValueError``), as does a store with neither file or two files naming two cockpits."""
     from levain.agents import session_wire as _wire
     from levain.dream import agent as _da
-    try:
-        root = _wire.read_install(store.directory).cockpit_root
-    except _wire.InstallRefused as session_exc:
-        try:
-            return _da.read_install(store.directory).cockpit_root
-        except _da.InstallRefused:
-            raise session_exc from None
-    try:
-        other = _da.read_install(store.directory).cockpit_root
-    except _da.InstallRefused:
-        return root
-    if other.resolve() != root.resolve():
-        raise _wire.InstallRefused(f"the session install names cockpit {root} and the dream install {other}: one "
+    d = Path(store.directory)
+    roots = []
+    if (d / _wire.INSTALL_FILE).exists():
+        roots.append(_wire.read_install(d).cockpit_root)
+    if (d / _da.INSTALL_FILE).exists():
+        roots.append(_da.read_install(d).cockpit_root)
+    if not roots:
+        raise _wire.InstallRefused(f"no install file ({_wire.INSTALL_FILE} or {_da.INSTALL_FILE}) in {d}")
+    if len(roots) == 2 and roots[0].resolve() != roots[1].resolve():
+        raise _wire.InstallRefused(f"the session install names cockpit {roots[0]} and the dream install {roots[1]}: one "
                                    "store has one authority log, so the tick will not guess")
-    return root
+    return roots[0]
 
 
 def _install_coord_dir(store: AgentStore, notes: list[str]) -> Path | None:
@@ -303,7 +303,7 @@ def _coord_dir_for(store: AgentStore, given: Path | str | None, notes: list[str]
     from levain.autonomic.db import default_store_dir
     from levain.consent.queue import default_queue_dir
     try:
-        if Path(store.directory).resolve() == default_store_dir():
+        if Path(store.directory).expanduser().resolve() == Path(default_store_dir()).expanduser().resolve():
             queue = default_queue_dir()
             if (queue / "dispatch.db").is_file():
                 return queue
@@ -419,8 +419,8 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
         unstoppable: list[str] = []
 
         def stoppable(row: dict) -> bool:
-            # the refused-install tick renews only a row it could stop: a renewal of a row nothing can stop would keep
-            # it launched forever, where an unrenewed lease lapses to takeover (the recovery the refusal had before)
+            # the tick renews only a row it could stop: a renewal of a row nothing can stop would keep it launched
+            # forever, where an unrenewed lease lapses to takeover (refused install or not)
             if executor_of(row) is not None:
                 return True
             unstoppable.append(row["occurrence_id"])
@@ -428,7 +428,7 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
 
         sup = _RotatingSupervisor(st, authority=auth, clock=clock,
                                   rotation=int(started.timestamp()) // TICK_INTERVAL_S,
-                                  keep=stoppable if refusal is not None else None)
+                                  keep=stoppable)
 
         def reaper() -> Any:
             lag = (clock() - started).total_seconds()
@@ -436,7 +436,13 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
                 notes.append(f"the renewals began {lag:.0f}s into the tick, past the {TICK_PRE_RENEW_BOUND_S}s the "
                              f"renewal-gap bound allows ({WORST_RENEW_GAP_S}s against the {_ctl.LEASE_S}s lease): a "
                              "lease the previous tick renewed may have lapsed")
-            return sup.reap(executor_of, attention=attention, resolve=resolve)
+            try:
+                return sup.reap(executor_of, attention=attention, resolve=resolve)
+            finally:                # named on the graceful bound too
+                if unstoppable:
+                    why = dict(executor_of.no_launcher).get(unstoppable[0], "no executor could be built for it")
+                    notes.append(f"{len(unstoppable)} launched row(s) have no executor that could stop them ({why}; "
+                                 f"first: {unstoppable[0]}): they were not renewed, and their leases lapse to takeover")
 
         if refusal is not None:
             # the install names no usable cockpit: renew the rows this process could stop and stop what the store
@@ -448,12 +454,6 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
             except Exception as exc:  # noqa: BLE001
                 _log.warning("agent tick: the reaper raised %s: %s", type(exc).__name__, exc)
                 seen["reaper_error"] = type(exc).__name__
-            finally:                # named on the graceful bound too
-                if unstoppable:
-                    why = dict(executor_of.no_launcher).get(unstoppable[0], "no executor could be built for it")
-                    notes.append(f"{len(unstoppable)} launched row(s) have no executor that could stop them while "
-                                 f"the install is refused ({why}; first: {unstoppable[0]}): they were not renewed, "
-                                 "and their leases lapse to takeover")
             return None
         session_alive, launch_over = _lazy_probes(st, coord_dir, notes)
         return _ctl.tick(st, clock, binding_of_factory(st, auth, clock), session_alive, launch_over, reaper=reaper)
@@ -462,14 +462,14 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
         print(f"levain agents tick: {text}", file=stream or sys.stderr, flush=True)
 
     def report() -> list:
-        """Every note, then the renewed-but-never-ENDed rows (exit 4's case). A refused-install tick renews no row it
-        cannot stop (its own note names them), so there exit 4's case cannot arise and 1 never hides a 4."""
+        """Every note, then the rows with no session launcher (exit 4's case). A refused-install tick names its own
+        unstoppable rows in the notes, so 1 never hides a 4."""
         for note in notes:
             say(note)
         rows = [] if seen.get("refused") else list(getattr(seen.get("executor_of"), "no_launcher", []))
         if rows:
-            say(f"{len(rows)} launched session row(s) have no session launcher, so they can be renewed but never "
-                f"ENDed ({rows[0][1]}; first: {rows[0][0]}). Name a launcher in the install file.")
+            say(f"{len(rows)} launched session row(s) have no session launcher, so they were not renewed (a "
+                f"row nothing can END lapses to takeover) ({rows[0][1]}; first: {rows[0][0]}). Name a launcher in the install file.")
         return rows
 
     try:

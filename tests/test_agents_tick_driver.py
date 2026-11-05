@@ -127,7 +127,7 @@ def _row(**over):
 
 
 def test_router_session_rows_get_a_row_session_executor(rig):  # noqa: F811
-    got = _router(rig.store, "session", launcher=SimpleNamespace())(_row())
+    got = _router(rig.store, "session", launcher=SimpleNamespace(end_session=lambda *a: None))(_row())
     assert type(got) is S.RowSessionExecutor and got.session_key == "s-0000000000000001"
 
 
@@ -141,12 +141,12 @@ def test_router_dream_rows_get_the_dreams_executor(rig):  # noqa: F811
 @pytest.mark.parametrize("kind", [None, "spawn", "model", ""], ids=["unreadable", "spawn", "model", "empty"])
 def test_router_anything_else_is_none(rig, kind):  # noqa: F811
     built = []
-    assert _router(rig.store, kind, launcher=SimpleNamespace(), dream=lambda r: 1 / 0, built=built)(_row()) is None
+    assert _router(rig.store, kind, launcher=SimpleNamespace(end_session=lambda *a: None), dream=lambda r: 1 / 0, built=built)(_row()) is None
     assert built == []                      # no launcher is built for a row that is not a session's
 
 
 def test_router_session_without_a_key_or_a_launcher_is_none(rig):  # noqa: F811
-    assert _router(rig.store, "session", launcher=SimpleNamespace())(_row(session_key=None)) is None
+    assert _router(rig.store, "session", launcher=SimpleNamespace(end_session=lambda *a: None))(_row(session_key=None)) is None
     assert _router(rig.store, "session", launcher=None)(_row()) is None
     assert _router(rig.store, "session", launcher=RuntimeError("not registered"))(_row()) is None
 
@@ -159,7 +159,7 @@ def test_router_a_dream_builder_that_raises_is_none(rig):  # noqa: F811
 
 def test_router_builds_the_launcher_once_per_driver(rig):  # noqa: F811
     built = []
-    of = _router(rig.store, "session", launcher=SimpleNamespace(), built=built)
+    of = _router(rig.store, "session", launcher=SimpleNamespace(end_session=lambda *a: None), built=built)
     of(_row()), of(_row(occurrence_id="oc-2"))
     assert built == [1]
 
@@ -167,7 +167,7 @@ def test_router_builds_the_launcher_once_per_driver(rig):  # noqa: F811
 def test_router_reads_the_signed_role_of_a_real_row(rig):  # noqa: F811
     oid, key = _session_row(rig)
     row = {"occurrence_id": oid, "agent_id": rig.row(oid)["agent_id"], "session_key": key, "pid": 4100}
-    of = T.executor_of_factory(rig.store, launcher_of=lambda: SimpleNamespace())
+    of = T.executor_of_factory(rig.store, launcher_of=lambda: SimpleNamespace(end_session=lambda *a: None))
     got = of(row)
     assert type(got) is S.RowSessionExecutor and got.occurrence_id == oid
 
@@ -541,3 +541,63 @@ def test_an_expired_newest_link_does_not_disarm_a_live_older_one(rig):  # noqa: 
     assert T.binding_of_factory(rig.store, rig.authority, rig.now)(rig.agent, rig.spec_hash) == "bind-fedcba9876543210"
     later = lambda: rig.now(timedelta(days=2))  # noqa: E731
     assert T.binding_of_factory(rig.store, rig.authority, later)(rig.agent, rig.spec_hash) == BINDING
+
+
+# --- fixtick: bundle L3 round ----------------------------------------------------------------------------------------
+
+def test_router_a_launcher_with_no_callable_end_session_is_no_launcher(rig):  # noqa: F811
+    """codex MED: a launcher that cannot END would get RowSessionExecutors that cannot stop: the row is named in
+    no_launcher (the refusal path), never given an executor."""
+    for bad in (SimpleNamespace(), SimpleNamespace(end_session="no")):
+        of = _router(rig.store, "session", launcher=bad)
+        assert of(_row()) is None
+        assert [oid for oid, _ in of.no_launcher] == ["oc-1"] and "end_session" in of.no_launcher[0][1]
+
+
+def test_an_existing_malformed_install_is_a_refusal_not_an_absent_one(rig, tmp_path):  # noqa: F811
+    """gemini MED: a session_install.json that EXISTS but is malformed must not be swallowed for the dream install's
+    cockpit (nor the reverse); only an absent file is absent."""
+    from levain.agents import session_wire as W
+    from levain.dream import agent as DA
+    good = tmp_path / "good"
+    good.mkdir()
+    (rig.store.directory / W.INSTALL_FILE).write_text("{not json")
+    (rig.store.directory / DA.INSTALL_FILE).write_text(__import__("json").dumps(
+        {"schema": DA.INSTALL_SCHEMA, "zone": "UTC", "cockpit_root": str(good), "coord_dir": str(good),
+         "store_path": str(good / "m.db")}))
+    (good / "m.db").write_text("")
+    with pytest.raises(W.InstallRefused):
+        T._cockpit_root(rig.store)
+    (rig.store.directory / W.INSTALL_FILE).unlink()
+    (rig.store.directory / DA.INSTALL_FILE).write_text("{not json")
+    W.write_install(rig.store.directory, cockpit_root=good)
+    with pytest.raises(DA.InstallRefused):
+        T._cockpit_root(rig.store)
+
+
+def test_a_launched_row_with_no_executor_is_never_renewed_even_unrefused(rig, monkeypatch):  # noqa: F811
+    """gemini MED: with refusal None the supervisor got keep=None, so a launched row with no buildable executor was
+    renewed forever. It is not renewed: its lease lapses to takeover."""
+    oid, _key = _session_row(rig)
+    renewed = []
+    real = supervise.Supervisor._renew
+    monkeypatch.setattr(supervise.Supervisor, "_renew",
+                        lambda self, row, grace: (renewed.append(row["occurrence_id"]), real(self, row, grace))[1])
+    clock = Clock(rig)
+    clock.advance(60)
+    T.run_tick(rig.store, clock=clock, authority=rig.authority, launcher_of=lambda: None)
+    assert renewed == []
+
+
+def test_the_default_store_is_compared_resolved_on_both_sides(rig, tmp_path, monkeypatch):  # noqa: F811
+    """gemini MED: a default_store_dir() that is a symlink to the store was never equal to the resolved store path."""
+    from levain.autonomic import db as adb
+    from levain.consent import queue as cq
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    (queue / "dispatch.db").write_text("")
+    link = tmp_path / "link"
+    link.symlink_to(rig.store.directory, target_is_directory=True)
+    monkeypatch.setattr(adb, "default_store_dir", lambda: link)
+    monkeypatch.setattr(cq, "default_queue_dir", lambda: queue)
+    assert T._coord_dir_for(rig.store, None, []) == queue
