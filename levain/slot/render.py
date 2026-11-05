@@ -161,11 +161,18 @@ def _refused(prefix: str, key: str, detail: str) -> Refused:
 class HookTemplate:
     """One of Levain's root-owned hook templates (session 4 owns the set): the executable's bytes and the Claude
     Code event + matcher it is wired under. ``render`` copies the bytes to ``<S>/root/hooks/<name>`` and wires the
-    absolute path; it never reads a template off disk."""
+    absolute path; it never reads a template off disk. ``timeout``: the handler's Claude Code ``timeout`` in whole
+    seconds (1..:data:`HOOK_TIMEOUT_MAX`), or none (Claude Code's default). Every handler is wired with
+    ``"onFailure": "block"`` whatever the template says (:func:`render_cc_settings`)."""
 
     body: bytes
     event: str
     matcher: str | None = None
+    timeout: int | None = None
+
+
+#: the longest ``HookTemplate.timeout`` render wires (an hour: a gate held longer is not a hold, it is a hang)
+HOOK_TIMEOUT_MAX = 3600
 
 
 @dataclass(frozen=True)
@@ -326,7 +333,9 @@ def check_facts(blob: RenderBlob, facts: RenderFacts) -> None:
     for name, t in facts.hook_templates.items():
         if not _HOOK_NAME_RE.fullmatch(name) or not isinstance(t, HookTemplate) or type(t.body) is not bytes \
                 or not _HOOK_EVENT_RE.fullmatch(t.event) \
-                or (t.matcher is not None and not _HOOK_MATCHER_RE.fullmatch(t.matcher)):
+                or (t.matcher is not None and not _HOOK_MATCHER_RE.fullmatch(t.matcher)) \
+                or (t.timeout is not None and (type(t.timeout) is not int
+                                               or not 1 <= t.timeout <= HOOK_TIMEOUT_MAX)):
             raise Refused("bad-hook-template", name[:64])
     # DECISION: Codex's hook wiring is not in this contract revision, so a Codex session asking for a hook is
     # refused by name rather than rendered with the hook silently unwired.
@@ -640,7 +649,16 @@ def render_cc_settings(blob: RenderBlob, facts: RenderFacts) -> dict:
         events: dict[str, list] = {}
         for name in sorted(blob.hooks):
             t = facts.hook_templates[name]
-            entry: dict[str, Any] = {"hooks": [{"type": "command", "command": f"{facts.S}/root/hooks/{name}"}]}
+            # onFailure block on EVERY slot hook: without it a hook that cannot start (no interpreter, no script, a
+            # lost exec bit), is killed, crashes or times out is a NON-blocking error and the call goes ahead
+            # (crash and timeout measured on PreToolUse, 1017-deadline/runs2 RUN C; can't-start, and a deny on
+            # PermissionRequest, are Claude Code's documented behaviour, 2.1.295+, not measured here). A slot hook is a
+            # gate, and a gate that opens when it breaks is not one.
+            handler: dict[str, Any] = {"type": "command", "command": f"{facts.S}/root/hooks/{name}",
+                                       "onFailure": "block"}
+            if t.timeout is not None:
+                handler["timeout"] = t.timeout
+            entry: dict[str, Any] = {"hooks": [handler]}
             if t.matcher is not None:
                 entry["matcher"] = t.matcher
             events.setdefault(t.event, []).append(entry)

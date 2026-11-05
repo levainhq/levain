@@ -187,6 +187,12 @@ LAZY_SITES = {
     'levain/slot/root_tree.py::_gc::from levain.launch import child_env': 'root',
     'levain/slot/root_tree.py::tree_steps::from levain.slot.generation import generation_id': 'root',
     'levain/slot/runtime_helper.py::_default_client::from levain.slot.control_client import ControlClient': 'root',
+    # root: ``render_facts`` (the runtime helper's render verb) builds the hook templates the blob names
+    'levain/slot/runtime_helper.py::hook_templates_for::from levain.slot.hook_templates import hook_templates': 'root',
+    # operator: ``hook_run.run`` is the SLOT HOOK's process (the slot uid, never root, like the queue broker's service): it runs the consent adapter, which imports the authority store and the hooks that the root closure keeps out (tests/test_ci_root_closure.py). Its 3.9 floor is held by tests/test_slot_hook_templates.py, not by this closure
+    'levain/slot/hook_run.py::_load_adapter::from levain.consent.adapters import claude_code': 'operator',
+    # operator: same slot hook process; ``in_slot`` of the broker client
+    'levain/slot/hook_run.py::run::from levain.consent.broker_client import in_slot': 'operator',
     'levain/slot/runtime_helper.py::_front_interlock::from levain.slot import start as SS': 'root',
     # root: render builds the front's policy file and reads it with the front's own parser (3b-8a)
     'levain/slot/runtime_helper.py::front_policy_bytes::from levain.broker import front as FR': 'root',

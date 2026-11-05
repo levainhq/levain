@@ -56,7 +56,7 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import IO, Any, Literal
+from typing import IO, Any, Literal, Union
 
 from levain.authority import anchor_path
 # FILE_TOOLS, MCP_PATH_FIELDS, PolicyNotEligible and guarded_policy are re-exported: this module's names since Q2
@@ -892,7 +892,7 @@ DECLINE_MESSAGES: Mapping[str, str] = MappingProxyType({
     "contained_launch_mismatch": "levain could not match this call to the launch it came from",
     "contained_delivery_refused": "this launch's containment changed since the answer was given; ask again"})
 
-CoreResult = Decided | Abstained | Declined
+CoreResult = Union[Decided, Abstained, Declined]   # not ``|``: evaluated at import, and a slot hook runs this on 3.9
 
 
 
@@ -1248,6 +1248,29 @@ def _key_anywhere(value: Any, name: str = UNCONFINED_ENV) -> bool:
     return False
 
 
+def _toml_unparsed_may_set(path: Path, raw: bytes, name: str) -> bool:
+    """:func:`_sets_unconfined` for a TOML file on a Python with no ``tomllib``, ``name`` (ASCII) NOT in ``raw``.
+    TOML spells a string or key only verbatim or through a backslash (a basic string's escapes, a line-ending
+    backslash that joins lines); it has no other concatenation, and no UTF-8 multi-byte sequence holds an ASCII byte.
+    So UTF-8 bytes with no backslash cannot parse to anything holding ``name``: ``False``. Anything else (a backslash,
+    a benign Windows path included, or bytes that are not UTF-8) cannot be ruled out without a parser: ``True``, and
+    the reason goes to stderr, so the deny reads as this interpreter's limit, not as an attack."""
+    try:
+        raw.decode("utf-8")
+        if b"\\" not in raw:
+            return False
+        why = "holds a backslash escape"
+    except UnicodeDecodeError:
+        why = "is not UTF-8"
+    try:
+        print(f"levain consent hook: the TOML file {str(path)[:300]} {why} and cannot be ruled out without tomllib "
+              "(Python 3.11+): "
+              f"treated as naming {name}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 - the answer stands without the note
+        pass
+    return True
+
+
 def _sets_unconfined(kind: str, path: Path, name: str = UNCONFINED_ENV) -> bool:
     """True when the settings file mentions ``name`` (default :data:`UNCONFINED_ENV`) anywhere (L3 r1 G3: in its raw text, or, once
     parsed, in any key or string value at any depth, which also catches an escaped spelling; JSON or TOML alike,
@@ -1271,8 +1294,10 @@ def _sets_unconfined(kind: str, path: Path, name: str = UNCONFINED_ENV) -> bool:
         return True
     try:
         if kind == "toml":
-            import tomllib
-
+            try:
+                import tomllib
+            except ImportError:   # < 3.11: the slot hook's /usr/bin/python3 is 3.9 (L3 r1 codex HIGH 2)
+                return _toml_unparsed_may_set(path, raw, name)
             return _key_anywhere(tomllib.loads(raw.decode("utf-8")), name)
         data = json.loads(raw)
         if not isinstance(data, Mapping):
@@ -2174,11 +2199,14 @@ def permission_context(queue_dir: Path, *, environ: Mapping[str, str], home: Pat
                              environ=environ, home=home)
 
 
-def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO[str] | None = None) -> int:
+def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO[str] | None = None, *,
+         environ: Mapping[str, str] | None = None) -> int:
     """The hook entry point, for both events the one script is wired to: ``PermissionRequest`` (:func:`decide`)
     and ``PreToolUse`` (:func:`gate`). Always exits 0. A PermissionRequest prints a decision only when the core
     verified one; a PreToolUse whose gate raised prints :func:`gate_failed` (a deny for a gated call). In a slot
-    session (:func:`levain.consent.broker_client.in_slot`) it is :func:`_slot_main` instead, and opens no queue."""
+    session (:func:`levain.consent.broker_client.in_slot`) it is :func:`_slot_main` instead, and opens no queue.
+    ``environ``: the process environment unless a caller that already checked one hands it (the slot hook's runner,
+    levain.slot.hook_run, so its slot check and this one read the same mapping)."""
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
     event: Any = None
@@ -2187,7 +2215,8 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
     # classifies the call (a store write denied, an ordinary call no decision), never with None
     started = time.monotonic()
     # H4: the one read of the process environment and home; everything below is handed them
-    environ: Mapping[str, str] = os.environ
+    if environ is None:
+        environ = os.environ
     home = _bound_home()
     if in_slot(environ):
         return _slot_main(stdin, stdout, home=home, environ=environ)
