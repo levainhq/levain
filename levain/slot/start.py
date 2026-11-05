@@ -951,10 +951,11 @@ slot_owner_ok: Optional[Callable[[os.stat_result], bool]] = None
 def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
     """The interactive passthrough session's keep/ return and §7.6 compare, before the clone (DESIGN g3 §1-§2), under
     the session END lock the caller holds: the slot's baseline read (:func:`levain.slot.identity.read_slot_baseline`),
-    for Claude the parked account record present (identseed prototype: else ``identity-seed-missing:<tag>``, before
-    any move), the vendor's parked credential moved from ``keep/`` into the session tree
-    (:func:`levain.slot.end.return_move`), then :func:`levain.slot.identity.gate_check`. A refusal of the baseline,
-    the missing record, and the return's three refusals before any move (:data:`_RETURN_UNMOVED`), move nothing.
+    for Claude the parked account record present (identseed, np-8645041e (a): else
+    ``identity-seed-missing:<tag>``, before any move), the vendor's parked credential moved from ``keep/`` into the
+    session tree (:func:`levain.slot.end.return_move`), then :func:`levain.slot.identity.gate_check`. A refusal of
+    the baseline, the missing record, and the return's three refusals before any move (:data:`_RETURN_UNMOVED`), move
+    nothing.
     Every other failure once the return was entered (its ``bad-root`` may come after its rename: L3 r1 F1), and
     every refusal after it, is followed by a best-effort :func:`levain.slot.end.park_move` of the credential back
     into ``keep/`` (a no-op when it never left): a failure there is noted and END's park is the backstop. No baseline
@@ -966,7 +967,7 @@ def _identity_gate(ctx: H.Ctx, a: R.Alloc) -> None:
     seams.at("identity-gate")
     baseline = ID.read_slot_baseline(ctx, a)
     if a.vendor in RD.SEEDED_VENDORS and H.read_identity_seed(ctx, a) is None:
-        # identseed (PROTOTYPE of np-3ccc8493 option (a)): render seeded nothing, so the binary would answer with no
+        # identseed (np-8645041e (a)): render seeded nothing, so the binary would answer with no
         # account (bad-shape); refused by name before any move, never a silent unseeded start
         raise Refused(f"identity-seed-missing:{a.slot.tag}",
                       "the slot's login was parked without its account block (a login parked before this change, or "

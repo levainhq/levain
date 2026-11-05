@@ -107,9 +107,11 @@ PROFILE_ANSWER_MAX = 64 * 1024
 _FIXED_NAME_RE = re.compile(r"[a-z\-]{1,32}", re.ASCII)
 #: the child's ``id_digest``: a SHA-256 in lower-case hex.
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
-#: the claim an identity answer makes: the unmodified binary's own report from its local data. It stays this until U-A5
-#: (does ``auth status`` ask the server?) is measured on a signed-in slot; the names ``matched`` / ``not-a-check`` /
-#: ``identity-changed`` are kept and say nothing stronger.
+#: the claim an identity answer makes: "local data says this sign-in", the unmodified binary's own report from its
+#: local data (U-A5 measured 2026-11-05: ``auth status`` reads local data). The names ``matched`` / ``not-a-check`` /
+#: ``identity-changed`` are kept and say nothing stronger. The account is a recorded LABEL (np-8645041e (a)): the
+#: parked record names an account, it does not tell which account the credential belongs to, and it does not see an
+#: expired login (loggedIn comes from the credential's access token, with no expiry check and no server call).
 CLAIM = IC.CLAIM
 
 
@@ -251,7 +253,9 @@ def baseline_vendor(data: Optional[bytes]) -> Optional[str]:
 
 #: DECISION: the most a baseline file may hold; ``baseline_bytes`` writes well under this.
 BASELINE_MAX_BYTES = 4096
-#: the record's ``identity.result`` for a gate that matched, that found another sign-in, and a vendor with no check.
+#: the record's ``identity.result`` for a gate whose account label equals the one recorded at login (``matched`` is a
+#: comparison of two recorded labels, not a check of which account the credential belongs to), that found another
+#: label, and a vendor with no label.
 GATE_MATCHED = "matched"
 GATE_CHANGED = "identity-changed"
 #: the record's ``identity.result`` for a login a sign-in repairs (the binary says it is not signed in), and for a
@@ -342,7 +346,8 @@ def gate_check(ctx: H.Ctx, a: R.Alloc, baseline: Mapping[str, str]) -> Dict[str,
              else GATE_CHANGED}
     _cas_gate_identity(ctx, a.session, ident)
     if not same:
-        raise Refused(GATE_CHANGED, f"{a.slot.tag}: the observed sign-in is not the slot's baseline")
+        raise Refused(GATE_CHANGED, f"{a.slot.tag}: the sign-in now names a different account than the one recorded "
+                                    "at this slot's login")
     return ident
 
 

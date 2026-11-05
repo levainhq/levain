@@ -206,7 +206,7 @@ class RenderFacts:
     driver_uid: int | None = None
     driver_gid: int | None = None
     hook_templates: Mapping[str, HookTemplate] = field(default_factory=dict)
-    #: identseed (PROTOTYPE of np-3ccc8493 option (a)): the whitelisted ``oauthAccount`` block root read from the
+    #: identseed (np-8645041e (a)): the whitelisted ``oauthAccount`` block root read from the
     #: slot's parked record (``runtime_helper.read_identity_seed``), for a gated Claude session; else None.
     oauth_account: Mapping[str, object] | None = None
 

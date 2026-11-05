@@ -2133,7 +2133,7 @@ _SEED_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_C
 
 
 def read_identity_seed(ctx: Ctx, a: R.Alloc) -> Optional[Dict[str, object]]:
-    """identseed (PROTOTYPE of np-3ccc8493 option (a)): the slot's parked account record,
+    """identseed (np-8645041e (a)): the slot's parked account record,
     ``L/slots/<tag>/keep/identity-seed.json`` (:data:`levain.slot.end.IDENTITY_SEED_NAME`), read by root by dirfd
     with ``O_NOFOLLOW``: a regular file with a trusted (root) owner, at most
     :data:`~levain.slot.end.IDENTITY_SEED_MAX_BYTES`, passing :func:`levain.slot.end.check_identity_seed` whole and

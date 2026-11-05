@@ -149,7 +149,7 @@ CREDENTIALS: Mapping[str, tuple[tuple[bytes, ...], bytes]] = {
     "codex": ((b"config", b"codex"), b"auth.json"),
 }
 CREDENTIAL_FILES = tuple(CREDENTIALS.values())
-#: identseed (PROTOTYPE of np-3ccc8493 option (a), not ruled): the per-vendor file in the session tree whose account
+#: identseed (np-8645041e (a), signed by Phill 11-05): the per-vendor file in the session tree whose account
 #: block a ``login`` session's END parks beside the credential, and that block's key. Claude Code 2.1.318's
 #: ``auth status`` reads ``email`` / ``orgId`` / ``orgName`` from ``oauthAccount`` in
 #: ``$CLAUDE_CONFIG_DIR/.claude.json`` (RETURN_c1p addendum, measured; the field mapping read from the binary's own
@@ -2281,7 +2281,10 @@ def _set_aside(facts: EndFacts, sfd: int, src: Path, name: bytes, dest: Path, oc
     fault(f"{point}:aside")
 
 
-# --- the identity seed (identseed, PROTOTYPE of np-3ccc8493 option (a)) -----------------------------------------------
+# --- the identity seed (identseed, np-8645041e (a)) -------------------------------------------------------------------
+# The claim stays "local data says this sign-in" (identity_child.CLAIM). Known edge: a different credential under the
+# same recorded account is not detected by this check (loggedIn comes from the credential, the id from the recorded
+# block).
 
 def check_seed_block(block: object) -> dict[str, object] | None:
     """The whitelisted account block (:data:`IDENTITY_SEED_KEYS` only) when ``block`` is a dict whose

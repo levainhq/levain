@@ -1,9 +1,9 @@
-"""identseed (levain 38, key 1105-21): a PROTOTYPE of np-3ccc8493 option (a), which Phill has not ruled. Nothing here
-ships. Claude Code's ``auth status`` reads the account (email, orgId, orgName) from ``oauthAccount`` in the session's
-``.claude.json``, not from the credential (RETURN_c1p addendum), and every session after the login renders a fresh
-``.claude.json``. So a ``login`` session's END parks a WHITELIST of that block beside the credential in
-``L/slots/e<n>/keep/``, and render seeds it into each gated session's ``.claude.json``; start's gate refuses
-``identity-seed-missing:<tag>`` (log this slot in again) when no record is parked.
+"""identseed (levain 38, key 1105-21): np-8645041e (a), signed by Phill 11-05. Claude Code's ``auth status`` reads
+the account (email, orgId, orgName) from ``oauthAccount`` in the session's ``.claude.json``, not from the credential
+(RETURN_c1p addendum), and every session after the login renders a fresh ``.claude.json``. So a ``login`` session's
+END parks a WHITELIST of that block beside the credential in ``L/slots/e<n>/keep/``, and render seeds it into each
+gated session's ``.claude.json``; start's gate refuses ``identity-seed-missing:<tag>`` (log this slot in again) when
+no record is parked.
 
 Two harnesses: the 2f start world (prepare, render, start, confirm, teardown through the helper's ``main``) for the
 round trip and the gate, and the 2c END world for the park's own cases."""
