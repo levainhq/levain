@@ -82,7 +82,8 @@ def run(name: str, *, stdin: Optional[TextIO] = None, stdout: Optional[TextIO] =
     except BaseException as exc:  # noqa: BLE001 - SystemExit included: an adapter that exits is not an answer
         return refuse(name, "hook-adapter-failed", "%s: %s" % (type(exc).__name__, exc), stderr)
     if type(code) is not int or code != 0:  # exactly the int 0: False / 0.0 / a zero-equal object is no success
-        return refuse(name, "hook-adapter-exit", "exit %r" % (code,), stderr)
+        # an invalid return is described by its type: formatting an arbitrary object can raise or allocate without bound
+        return refuse(name, "hook-adapter-exit", "exit %r" % (code,) if type(code) is int else "exit of type %s" % type(code).__name__, stderr)
     try:
         stdout.write(out.getvalue())
         stdout.flush()

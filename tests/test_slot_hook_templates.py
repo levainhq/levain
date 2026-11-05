@@ -185,7 +185,11 @@ def test_only_the_exact_int_zero_is_success_a_zero_equal_return_is_refused():
 
         __hash__ = None  # type: ignore[assignment]
 
-    for value in (False, 0.0, None, ZeroEq(), "0", 1):
+    class HostileRepr(ZeroEq):
+        def __repr__(self):
+            raise RuntimeError("repr must not be called on an invalid return")
+
+    for value in (False, 0.0, None, ZeroEq(), HostileRepr(), "0", 1):
         class Quiet:
             @staticmethod
             def main(argv, stdin=None, stdout=None, environ=None, _v=value):
