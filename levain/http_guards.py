@@ -43,6 +43,21 @@ LISTEN_BACKLOG = 128
 # POST anyway) — is an unexpected/hostile origin and is refused.
 _WRITE_SEC_FETCH_ALLOWED = "same-origin"
 _QUERY_STRING = re.compile(r"\?\S*")
+# RFC 9110 5.1: a field name is a token. Anything else (whitespace, parentheses, a colon-less fragment) is a name a
+# strict peer and a lenient one can read differently.
+_FIELD_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+# The methods no Levain route reads a body for. A body on one of them is never read, so its bytes would be parsed as
+# the next request on a kept-alive connection; a Content-Length other than 0 on them is refused at the boundary.
+_BODILESS_METHODS = frozenset({"GET", "HEAD"})
+
+
+def _plain_length(raw: str) -> bool:
+    """True iff ``raw`` is a Content-Length value made only of ASCII digits.
+
+    ⛔ ``isascii()`` IS LOAD-BEARING. ``str.isdigit()`` is True for characters ``int()`` refuses (``"²".isdigit()`` is
+    True and ``int("²")`` raises), so a ``Content-Length: ²`` header once passed the guard and blew up on the next
+    line. RFC 9110 8.6 makes Content-Length ASCII digits; a comma list (``2, 2``) is not one value and fails here too."""
+    return raw.isascii() and raw.isdigit()
 
 
 def _redact_query(text: str) -> str:
@@ -187,6 +202,74 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         self._send_json({"error": error, "message": message}, status)
 
+    # -- request framing: the one parse boundary ---------------------------------------------------------------------
+
+    def parse_request(self) -> bool:
+        """The stdlib's request-line and header parse, then the framing check, before ANY method's handler runs.
+
+        This is the one place every request passes once its headers are parsed, whatever its method or route; a
+        framing check inside a route helper (``_declared_length``) was reached only by the POST routes that read a
+        body, so a GET or HEAD carrying the same ambiguous framing was answered and its "body" parsed as the next
+        request (L3 2026-11-05, four lineages)."""
+        if not super().parse_request():
+            return False
+        return not self._refuse_framing()
+
+    def handle_expect_100(self) -> bool:
+        """``Expect: 100-continue`` is answered INSIDE the stdlib's ``parse_request``, before it returns; checking
+        the framing only afterwards would first tell the client to send the body of a request about to be refused
+        (codex L3 2026-11-05). So the check runs here first too; on a request without ``Expect`` it runs once, in
+        ``parse_request``."""
+        if self._refuse_framing():
+            return False
+        return super().handle_expect_100()
+
+    def _refuse_framing(self) -> bool:
+        """Refuse a request whose body framing a strict peer and a lenient one could read differently: answer in
+        fixed words (400; a single malformed Content-Length keeps its older 411 ``length_required``), close the
+        connection, read no body. Returns True when refused.
+
+        Levain sits behind ``tailscale serve`` (a proxy) and may sit behind others. When the proxy and this server
+        disagree on where a request's body ends, the leftover bytes become a second request the proxy never saw
+        (request smuggling). Every rule below closes one such disagreement, for any method (RFC 9112 6.1, 6.3):
+
+        - any ``Transfer-Encoding``: no Levain route reads a transfer-coded body, so every coding is one this
+          server does not speak; refusing all of them (not only beside a Content-Length) leaves one answer for one
+          shape, and a refused client is told to send a Content-Length body;
+        - ``Content-Length`` more than once or as a comma list (400), or a single value that is not a plain digit
+          string (411);
+        - a Content-Length other than 0 on a method no route reads a body for (GET, HEAD);
+        - a header block the parser could not read cleanly: a recorded defect (whitespace before a colon ends the
+          header block early and is recorded as one), a folded continuation line (obs-fold, kept inside the
+          previous value), a field name that is not a token, or a leading ``From `` line the parser swallows."""
+        headers = self.headers
+        if not hasattr(headers, "get_all"):
+            return False  # an HTTP/0.9 request: no header block, nothing framed
+        refusal: tuple[int, str, str] | None = None
+        if headers.defects or headers.get_unixfrom() is not None or any(
+            not _FIELD_NAME.fullmatch(name) or "\r" in value or "\n" in value for name, value in headers.items()
+        ):
+            refusal = (400, "malformed_header_refused", "the request's header block is malformed")
+        elif headers.get("Transfer-Encoding") is not None:
+            refusal = (400, "transfer_encoding_refused", "Transfer-Encoding is not accepted; send a Content-Length body")
+        else:
+            lengths = headers.get_all("Content-Length") or []
+            if len(lengths) > 1 or (lengths and "," in lengths[0]):  # repeated, or one field carrying a list
+                refusal = (400, "content_length_refused", "send one Content-Length")
+            elif lengths and not _plain_length(lengths[0]):
+                # ``_declared_length``'s long-standing word for a malformed length (411 ``length_required``), kept
+                # so its clients and tests see no change; now given for every method, before any route runs.
+                refusal = (411, "length_required", "Content-Length required")
+            elif lengths and self.command in _BODILESS_METHODS and lengths[0].strip("0"):  # not int(): no digit cap
+                refusal = (400, "content_length_refused", f"a {self.command} request carries no body")
+        if refusal is None:
+            return False
+        self.close_connection = True
+        status, error, message = refusal
+        self._send(json.dumps({"error": error, "message": message}).encode("utf-8"),
+                   "application/json; charset=utf-8", status=status, head=self.command == "HEAD")
+        return True
+
     def _drain(self, n: int) -> None:
         """Read and discard up to ``n`` bytes of the request body in bounded chunks, so a refused
         request's body does not dangle on a kept-alive connection."""
@@ -246,11 +329,12 @@ class GuardedHandler(BaseHTTPRequestHandler):
         """The request's Content-Length, or ``None`` after sending a 411 when it is missing or not
         ASCII digits.
 
-        ⛔ ``isascii()`` IS LOAD-BEARING. ``str.isdigit()`` is True for characters ``int()`` refuses
-        (``"²".isdigit()`` is True and ``int("²")`` raises), so a ``Content-Length: ²`` header used to
-        pass the guard and blow up on the next line. RFC 7230 makes Content-Length ASCII digits."""
+        Request FRAMING (a Transfer-Encoding, a repeated or malformed Content-Length, a malformed header) is
+        refused earlier, for every method, at the parse boundary (:meth:`_refuse_framing`); by the time a route
+        calls this, a Content-Length that is present is one plain digit string. The digit check stays here
+        because this is where ``int()`` runs, and a caller that reaches it another way must not crash it."""
         raw = self.headers.get("Content-Length")
-        if raw is None or not (raw.isascii() and raw.isdigit()):
+        if raw is None or not _plain_length(raw):
             self._reject(411, "length_required", "Content-Length required")
             return None
         try:
