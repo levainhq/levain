@@ -39,10 +39,10 @@ that strictly continue the replica's head); the server verifies every row itself
 verified continuation and never moves backward (its own anchor). ``LAUNCH`` and ``RELEASE`` carry ``ledger_head`` (the
 client's verified head, which the replica must HOLD: its row at that seq has that hash. The replica may be AHEAD of it,
 because another fire's SYNC can land between this fire's SYNC and its frame; a head past the replica is a transient
-``ledger-behind`` (SYNC and retry), a held seq with another hash a standing ``ledger-fork``) and ``LAUNCH`` carries the
-agent's ``bar`` (open flag and highest closed bar's revoke seq, checked to lie inside the claimed head's seq; ``RELEASE``
-re-judges with the LAUNCH's bar). The point-of-use check always judges the replica's WHOLE current replay, never the
-claimed prefix, so a revoke another fire SYNCed past the claimed head still refuses. A false bar or a withheld row is the power a process running as the operator
+``ledger-behind`` (SYNC and retry), a held seq with another hash a standing ``ledger-fork``) and the agent's ``bar``
+(open flag and highest closed bar's revoke seq, checked to lie inside the claimed head's seq), each read afresh by the
+client for that frame, so ``RELEASE`` judges the bar as it stands at RELEASE. The point-of-use check always judges
+the replica's WHOLE current replay, never the claimed prefix, so a revoke another fire SYNCed past the claimed head still refuses. A false bar or a withheld row is the power a process running as the operator
 already had over the live files; it can forge no signature and cannot roll the replica back (design 1104-28 section 2.4).
 """
 from __future__ import annotations
@@ -443,7 +443,7 @@ class RunServer:
         if mine is None:
             raise C.WireError(f"{op} before LAUNCH")
         if op == "RELEASE":
-            claims = self._release_claims(req, mine)
+            claims = self._release_claims(req)
             # the point of use is here too: a link that expired, was revoked or barred while the slot was prepared
             # starts nothing; the child is aborted and ENDed (codex r1 :339)
             try:
@@ -493,15 +493,14 @@ class RunServer:
             return FrameClaims((seq, digest), (b["open"], C._int(b["closed_revoke_seq"], "bar.closed_revoke_seq")))
         return FrameClaims((seq, digest), (False, 0))
 
-    def _release_claims(self, req: Mapping[str, object], holder: "_Holder") -> Optional[FrameClaims]:
-        """RELEASE: its own ``ledger_head`` (a fresh SYNC may have moved it), the LAUNCH's bar."""
+    def _release_claims(self, req: Mapping[str, object]) -> Optional[FrameClaims]:
+        """RELEASE: its own ``ledger_head`` (a fresh SYNC may have moved it) and its own ``bar``, read at RELEASE, so the
+        point of use judges the bar as it is now (L3 r1: the LAUNCH's bar missed a bar opened in between)."""
         if self._replica is None:
             self._fields(req)
             return None
-        self._fields(req, "ledger_head")
-        head = self._claims(req, bar=False)
-        assert head is not None
-        return FrameClaims(head.ledger_head, holder.claims.bar if holder.claims is not None else (False, 0))
+        self._fields(req, "ledger_head", "bar")
+        return self._claims(req, bar=True)
 
     def _sync(self, rid: int, rows: object) -> dict:
         """``SYNC``: append the rows that continue the replica's head (none: just read it); answer the new head."""

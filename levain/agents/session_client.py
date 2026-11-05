@@ -397,6 +397,8 @@ class AuthorityFeed:
                                       (row[0],)).fetchone() is not None
                 closed = conn.execute("SELECT MAX(revoke_seq) FROM agent_bars WHERE agent_id = ? AND closed_at IS NOT NULL",
                                       (row[0],)).fetchone()[0]
+                if closed is not None and type(closed) is not int:   # text or a blob in an INTEGER column: corrupt
+                    raise ProofUnavailable("the agent's closed bar names no integer revoke seq", standing=True)
         except ProofUnavailable:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -405,7 +407,7 @@ class AuthorityFeed:
             state = AgentAuthority(self._root).replay()
         except Exception as exc:  # noqa: BLE001 - a replay that fails proves nothing
             raise ProofUnavailable(f"the authority log does not replay ({type(exc).__name__})", standing=False) from None
-        return AuthorityRead((state.seq, state.head_hash), (opened, 0 if closed is None else int(closed)))
+        return AuthorityRead((state.seq, state.head_hash), (opened, 0 if closed is None else closed))
 
     def rows(self, after: int, upto: int) -> list[dict[str, object]]:
         """The next chunk of rows with ``after < seq <= upto``, in order, bounded by count and bytes (at least one)."""
@@ -616,14 +618,18 @@ class _RemoteChild:
         if self._conn is None:
             raise RuntimeError("the dispatch run server did not answer LAUNCH: nothing to release")
         try:
-            # the fire's fresh verified head, SYNCed first: the server re-judges the link against its replica at RELEASE
+            # the fire's fresh verified head and the agent's fresh bar, SYNCed first: the server re-judges the link and
+            # the bar against its replica at RELEASE (L3 r1: a bar opened after LAUNCH was not seen)
             fields = self._release_fields(self._conn) if self._release_fields is not None else {}
             self._conn.request("RELEASE", (), **fields)
         except LauncherRefused as exc:
             raise RuntimeError(f"the authority could not be synced for RELEASE: {exc.name}") from None
-        except _Down as exc:
+        except (_Down, WireError, KeyError) as exc:
+            # an off-shape SYNC answer (WireError, KeyError) leaves the connection open: closed here, as spawn does
+            self._conn.close()
             self.process._lose()
-            raise RuntimeError(f"the dispatch run server is unreachable at RELEASE ({exc})") from None
+            raise RuntimeError(f"the dispatch run server is unreachable at RELEASE ({type(exc).__name__}: {exc})") \
+                from None
         except _Refused as exc:
             raise RuntimeError(f"the dispatch run server refused RELEASE: {exc.name}") from None
         self.released = True
@@ -717,9 +723,9 @@ class DispatchSessionLauncher:
         self._feed = feed           # None: a server without a replica (its frames carry no ledger_head or bar)
 
     def _claims(self, conn: _Conn, occurrence_id: str, *, bar: bool) -> dict[str, object]:
-        """SYNC the server's replica up to the fire's verified ledger head, then the frame fields naming it (and, for
-        LAUNCH, the agent's bar). Raises :class:`LauncherRefused` (named; ``ledger-fork`` and the like are standing) or
-        :class:`_Down`."""
+        """SYNC the server's replica up to the fire's verified ledger head, then the frame fields naming it (and, with
+        ``bar``, the agent's bar as read now: LAUNCH and RELEASE both send it). Raises :class:`LauncherRefused`
+        (named; ``ledger-fork`` and the like are standing) or :class:`_Down`."""
         assert self._feed is not None
         try:
             read = self._feed.read(occurrence_id)
@@ -744,8 +750,10 @@ class DispatchSessionLauncher:
                                   reason_class="standing" if exc.standing else "transient") from None
         body = launch_to_wire(launch, proof)
         try:
-            extra = ({"ledger_head": {"seq": 1, "hash": "0" * 64}, "bar": {"open": False, "closed_revoke_seq": 1}}
-                     if self._feed is not None else {})
+            # worst-case claims (the largest seq and hash the wire admits), so a body that passes here cannot overflow
+            # once the real ones are added (L3 r1)
+            extra = ({"ledger_head": {"seq": _INT_MAX, "hash": "0" * 128},
+                      "bar": {"open": False, "closed_revoke_seq": _INT_MAX}} if self._feed is not None else {})
             encode_run_frame({**body, **extra, "p": PROTOCOL, "op": "LAUNCH", "id": 1})      # too big: refused before any connect
         except WireError as exc:
             raise LauncherRefused("launch-frame-refused", str(exc)) from None
@@ -760,7 +768,7 @@ class DispatchSessionLauncher:
             except LauncherRefused:
                 conn.close()
                 raise
-            except (_Down, WireError) as exc:       # nothing was launched yet: a plain transient refusal
+            except (_Down, WireError, KeyError) as exc:     # nothing was launched yet: a plain transient refusal
                 conn.close()
                 raise LauncherRefused("dispatch-unreachable", f"SYNC: {type(exc).__name__}", reason_class="transient") from None
         try:
@@ -769,15 +777,16 @@ class DispatchSessionLauncher:
         except _Refused as exc:
             conn.close()
             raise LauncherRefused(exc.name, exc.detail, reason_class=exc.reason_class) from None
-        except (_Down, WireError) as exc:
-            # the request may have been delivered: the server may hold a session, so this must not raise (a raising
-            # spawn promises nothing is live). The closed holder is the server's cue to END; this child proves nothing.
+        except (_Down, WireError, KeyError) as exc:
+            # a classified refusal (_Refused) was surfaced above; only these are a lost answer. The request may have
+            # been delivered: the server may hold a session, so this must not raise (a raising spawn promises nothing
+            # is live). The closed holder is the server's cue to END; this child proves nothing.
             _log.warning("LAUNCH for %s lost its answer (%s): returning a down child", launch.session_key, exc)
             conn.close()
             return _RemoteChild(None, None)
         occ = launch.occurrence_id
         return _RemoteChild(conn, session,
-                            (lambda c: self._claims(c, occ, bar=False)) if self._feed is not None else None)
+                            (lambda c: self._claims(c, occ, bar=True)) if self._feed is not None else None)
 
     # -- usage and end, keyed by the recorded session key -----------------------------------------------------------------
 
