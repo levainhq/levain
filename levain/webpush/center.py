@@ -458,6 +458,12 @@ def _counts(c: sqlite3.Connection) -> tuple[int, int]:
 
 
 # --- one item --------------------------------------------------------------------------------------------------------
+#: The :meth:`_Reader.standing` values on which a request still waits on him: answerable now (``pending``) or awaiting a
+#: late ruling (``undecided``, which ConsentSheet.row opens to a passkey as a ruling). The one place both the Needs-you
+#: card (``needs_open``) and the focus view's sheet link (``consent_sheet``) read it from.
+OPEN_STANDINGS = ("pending", "undecided")
+
+
 class _Reader:
     """The things an item's fields are read from, opened once for a page: the consent queue and the question store (for
     ``needs_open``) and each paired device's label."""
@@ -473,14 +479,15 @@ class _Reader:
     def needs_open(self, ref: Any) -> bool:
         """Whether the Needs-you item a ping was about still waits on him, read now; an unreadable store is False (the
         Needs-you card is the authority, and a wrong True would point at nothing). A request is the same reading the
-        focus view's sheet takes (:meth:`standing`), so the two cannot disagree about one request."""
+        focus view's sheet takes (:meth:`standing`), and both read it through :data:`OPEN_STANDINGS`, so the card and the
+        sheet link cannot disagree about one request (a request awaiting a late ruling waits on him in both)."""
         if not isinstance(ref, str) or ":" not in ref:
             return False
         from levain.webpush import record
 
         kind, _, key = ref.partition(":")
         if kind == "request":
-            return self.standing(key) == "pending"
+            return self.standing(key) in OPEN_STANDINGS
         try:
             if kind == "question" and self._questions is None:
                 from levain.consent.questions import QuestionStore
@@ -534,7 +541,7 @@ class _Reader:
             return None
         rid = ref[len("request:"):]
         got = self.standing(rid)
-        return {"id": rid, "state": "open" if got in ("pending", "undecided") else got}
+        return {"id": rid, "state": "open" if got in OPEN_STANDINGS else got}
 
     def label(self, journal: Any, device_id: str) -> str:
         key = (journal, device_id)

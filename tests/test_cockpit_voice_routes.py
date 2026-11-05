@@ -1466,3 +1466,14 @@ def test_f7_a_speed_past_the_float_range_is_a_400_bad_speed_not_a_500(rig):
             assert (status, out["error"], out["message"]) == (400, "bad_request",
                                                               "That speed is outside what OpenAI accepts.")
     assert rig.rows() == [] and rig.transport.seen == []
+
+
+def test_t_gate_the_too_long_sentence_names_the_size_cap_that_is_enforced_not_a_duration():
+    """land9e G2: the only cap on a transcribe upload is UPLOAD_MAX bytes, checked on the declared length (a 32 kbps
+    15-minute recording is under it and is sent), so the fixed sentence says "large" and never a length of time. The
+    key stays ``too_long`` (the code and tests key on it). Red with: "...too long to transcribe (the limit is two
+    minutes)." back in WORDS while only bytes are enforced."""
+    sentence = cockpit_voice.WORDS["too_long"]
+    assert sentence == "That recording is too large to transcribe."
+    assert not any(w in sentence.lower() for w in ("minute", "second", "hour", "duration", "long"))
+    assert isinstance(cockpit_voice.UPLOAD_MAX, int) and cockpit_voice.UPLOAD_MAX == 4 * 1024 * 1024

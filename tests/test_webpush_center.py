@@ -323,3 +323,20 @@ def test_a_stored_notice_with_a_deleted_origin_is_refused_not_mapped(tmp_path):
         c.execute("UPDATE notices SET origin = 'flow' WHERE id = ?", (nid,))
     ids = [i["id"] for i in center.list_items(s)["items"]]
     assert ids == [f"n{keep}"]
+
+
+def test_a_request_awaiting_a_late_ruling_is_open_to_both_the_ping_card_and_the_sheet_link(rig):
+    """land9e G1: an ``undecided`` request (its hold ended; a passkey may still RULE it, ConsentSheet.row's own
+    condition) draws an open sign sheet, so the same ping must say its Needs-you item still waits: the two readings
+    agree at each state of one request."""
+    src, q = rig
+    cq, req = _consent(q)
+    PushStore(q).add_ping("consent", f"request:{req.id}", "levain", "waits")
+    with _signed(src, q) as (port, _):
+        item = _get(port, LIST)[1]["items"][0]
+        assert (item["sheet"]["state"], item["needs_open"]) == ("open", True)          # pending: the baseline agrees
+        assert cq.mark_undecided(req.id).state == "undecided"
+        item = _get(port, LIST)[1]["items"][0]
+        assert item["sheet"] == {"id": req.id, "state": "open"}                        # the sheet link is open ...
+        assert item["needs_open"] is True                                              # ... so the card still waits
+        assert (item["sheet"]["state"] == "open") == item["needs_open"]                # the two readings, one answer

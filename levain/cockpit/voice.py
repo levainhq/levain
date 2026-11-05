@@ -100,7 +100,7 @@ UNSUPPORTED = {"elevenlabs": "ElevenLabs"}
 # The fixed words. ``{p}`` is the provider's display name (providers.NAMES), ``{cap}`` a dollar amount.
 WORDS = {
     "no_owner": "Premium voice needs a named credential.",
-    "too_long": "That recording is too long to transcribe (the limit is two minutes).",
+    "too_long": "That recording is too large to transcribe.",
     "voice_busy": "Voice is busy; try again in a moment.",
     "body_timeout": "The request did not arrive in time; try again.",
     "unsupported_media_type": "Send the recording as audio/webm, audio/mp4, audio/mpeg or audio/wav.",
