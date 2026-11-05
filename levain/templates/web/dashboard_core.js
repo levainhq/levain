@@ -6938,8 +6938,12 @@
   // off the newest calls it sends (a refusal older than those still counts)
   const grantRefusedShown = (g) => (g && g.answered && Array.isArray(g.answered.recent) ? g.answered.recent : [])
     .filter((c) => c && c.outcome === "refused").length;
-  const grantRefused = (g) => Math.max(g && g.answered && Number.isInteger(g.answered.refused_count) ? g.answered.refused_count : 0,
-                                       grantRefusedShown(g));
+  // a voice key answers no request, so it has no refusals to count: whatever its record carries, it is never demoted
+  const grantRefused = (g) => (g && g.kind === "voice-key" ? 0
+    : Math.max(g && g.answered && Number.isInteger(g.answered.refused_count) ? g.answered.refused_count : 0,
+               grantRefusedShown(g)));
+  // the speech providers' names as levain.voice.providers.NAMES spells them; a provider not listed shows as it is written
+  const VOICE_PROVIDER_NAMES = { openai: "OpenAI", deepgram: "Deepgram" };
   function grantCard(g, inertNote, signList) {
     const sv = (x) => (typeof x === "string" ? x : "");
     const state = sv(g.state);
@@ -6947,19 +6951,32 @@
     const row = el("div", "row consent-row grant-row" + (refused ? " ext-accent grant-demote" : "") + (state === "live" ? "" : " ext-dim"));
     row.setAttribute("data-consent-grant", sv(g.id));
     const head = el("div", "consent-head");
-    head.appendChild(el("span", "consent-agent", sv(g.agent) || sv(g.kind) || "grant"));
-    const tools = Array.isArray(g.tools) ? g.tools.filter((x) => typeof x === "string").join(", ") : "";
-    head.appendChild(el("b", "consent-tool", tools || sv(g.kind)));
-    head.appendChild(el("span", "ext-meta", "standing grant · " + state));
+    // A voice key (levain.voice.custody) is listed here to be revoked, but it is no consent grant: it has no expiry and
+    // answers no request. Its row names the provider and says it lives until revoked; the consent row's answered line and
+    // "until <date>" would be an empty date and a claim about answers it never makes
+    const voiceKey = sv(g.kind) === "voice-key";
     const a = g.answered && typeof g.answered === "object" ? g.answered : {};
     const count = Number.isInteger(a.count) ? a.count : 0;
-    head.appendChild(el("span", "consent-left", count ? "answered " + count + "×" + (refused ? " · " + refused + " refused" : "")
-                                                      : "answered nothing yet"));
+    if (voiceKey) {
+      const p = sv(g.provider);
+      head.appendChild(el("span", "consent-agent", (Object.prototype.hasOwnProperty.call(VOICE_PROVIDER_NAMES, p) ? VOICE_PROVIDER_NAMES[p] : p) + (p ? " " : "") + "voice key"));
+      head.appendChild(el("span", "ext-meta", "standing grant · " + state));
+    } else {
+      head.appendChild(el("span", "consent-agent", sv(g.agent) || sv(g.kind) || "grant"));
+      const tools = Array.isArray(g.tools) ? g.tools.filter((x) => typeof x === "string").join(", ") : "";
+      head.appendChild(el("b", "consent-tool", tools || sv(g.kind)));
+      head.appendChild(el("span", "ext-meta", "standing grant · " + state));
+      head.appendChild(el("span", "consent-left", count ? "answered " + count + "×" + (refused ? " · " + refused + " refused" : "")
+                                                        : "answered nothing yet"));
+    }
     row.appendChild(head);
     const facts = el("div", "consent-facts");
     if (sv(g.workspace)) facts.appendChild(el("span", "ext-meta", "in " + g.workspace));
     if (Array.isArray(g.postures) && g.postures.length) facts.appendChild(el("span", "ext-meta", g.postures.join(", ") + " mode"));
-    facts.appendChild(el("span", "ext-meta", (state === "expired" ? "expired " : "until ") + sv(g.expires_at)));
+    // a voice key has no date: it is live until revoked, and any other state is drawn as its bare word (the head says it too)
+    const untilText = voiceKey ? (state === "live" ? "Live until you revoke it" : state)
+                               : (state === "expired" ? "expired " : "until ") + sv(g.expires_at);
+    if (untilText) facts.appendChild(el("span", "ext-meta", untilText));
     facts.appendChild(el("span", "ext-meta", sv(g.kind) + " " + sv(g.id_shown)));
     row.appendChild(facts);
     if (state === "inert" && inertNote) row.appendChild(el("div", "consent-note ext-meta", inertNote));
