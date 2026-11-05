@@ -946,6 +946,14 @@ def test_a_renewal_signed_by_a_key_since_revoked_ends_the_session(rig, wire):
     sock.close()
 
 
+def _tamper(signature: str) -> str:
+    """Change ONE body character of an armored SSH signature, at a fixed place, to a different base64 character. A
+    ``str.replace`` of a letter that may be absent from a random base64 body changes nothing about a quarter of the
+    time (L3 lease r3, deepseek MED); this always changes the value, ten characters before the armor's footer."""
+    at = signature.index("-----END") - 10
+    return signature[:at] + ("B" if signature[at] == "A" else "A") + signature[at + 1:]
+
+
 @pytest.mark.parametrize("fault", ["seq-past", "genuine-before-born", "genuine-after-current", "record", "signature"])
 def test_a_rejudge_proof_whose_current_row_is_not_a_genuine_earlier_row_of_the_link_is_refused(rig, fault):
     """The re-judge accepts an EARLIER current row only as an authentic row of the ledger, at or after the link's born
@@ -970,10 +978,32 @@ def test_a_rejudge_proof_whose_current_row_is_not_a_genuine_earlier_row_of_the_l
     elif fault == "record":
         bad, name = dataclasses.replace(cur, record=cur.record + " "), "link-proof-mismatch"
     else:
-        bad, name = dataclasses.replace(cur, signature=cur.signature.replace("A", "B", 3)), "link-signature-invalid"
+        tampered = _tamper(cur.signature)
+        assert tampered != cur.signature, "the tamper changed nothing, so the case proves nothing"
+        bad, name = dataclasses.replace(cur, signature=tampered), "link-signature-invalid"
     with pytest.raises(L.LauncherRefused) as exc:
         _check(rig, dataclasses.replace(proof, current=bad), rejudge=True)
     assert exc.value.name == name
+
+
+def test_known_edge_pin_an_unrelated_authentic_row_between_born_and_current_is_accepted_as_the_proofs_current(rig):
+    """KNOWN-EDGE PIN (L3 lease r3, codex LOW / deepseek MED; the head judged it accepted): the re-judge takes any
+    authentic, active-signed ledger row at or after the link's born row and before its current one as the proof's
+    current row, even one that is not this link's (here an enrol of another key, appended between the link's born
+    row and its renewal). A production proof is the LAUNCH proof, verified exact then, so only a reconstructed proof
+    reaches this. It is pinned as it behaves today: tightening the check (the row must be a renew naming the link)
+    flips this test on purpose."""
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    proof = _proof(rig, oid)
+    rig.link()                                                        # U: an unrelated authentic row after the born row
+    _renew(rig, rig.row(oid)["link_id"])                              # R: the link's current row, past U
+    state, rows = rig.authority.replay(), {r.seq: r for r in _source(rig)}
+    u = rows[proof.born.seq + 1]
+    assert proof.born.seq < u.seq < state.grant_seqs[rig.row(oid)["link_id"]], "U is not strictly between born and current"
+    unrelated = C.LinkRow(u.seq, u.prev_hash, u.record, u.signer_fp, u.signature)
+    assert _check(rig, dataclasses.replace(proof, current=unrelated), rejudge=True) is None
+    with pytest.raises(L.LauncherRefused, match="link-proof-mismatch"):       # the exact check (LAUNCH, RELEASE) still refuses it
+        _check(rig, dataclasses.replace(proof, current=unrelated))
 
 
 def test_a_holder_with_no_claims_is_skipped_by_the_rejudge_not_ended(rig, wire):

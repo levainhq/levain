@@ -28,7 +28,11 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
   him (skipping the exposure check in the re-judge is the cheap alternative). Known edges (L3 r1 LOWs, accepted): a
   transient refusal in the last pass before the SYNCs stop waits for the operator tick, since nothing re-runs a pass on a
   timer. A re-judge END of a never-released child does not ABORT it first; RELEASE's refusal or the holder's EOF cleanup
-  ABORTs it later, and that ABORT on a child the END already stopped is caught and harmless.
+  ABORTs it later, and that ABORT on a child the END already stopped is caught and harmless. Known edge (L3 lease r3,
+  accepted by the head): the re-judge's range check was written to take ANY authentic, active-signed ledger row in
+  [born, current) as the proof's current row, not only this link's own, because the stored LAUNCH proof was verified
+  exact at LAUNCH and so was meant to name this link's row; only a reconstructed proof could name an unrelated row
+  there, and a test pins that, so a later tightening changes it on purpose.
 * **The holder is the lifeline** (design 3.4): EOF before RELEASE is ABORT (nothing ran) then END, EOF after RELEASE is
   END, once; a session whose holder is gone stays registered only while its END is unproven. The holder's END is the
   key's END job (below), so a reaper's END on the same key joins it; every END attempt the child makes itself takes the
