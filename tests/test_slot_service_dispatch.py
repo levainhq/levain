@@ -118,10 +118,20 @@ def test_dispatch_run_plist_names_a_stderr_path_inside_the_directory_its_account
 def test_a_logging_service_of_an_account_with_no_log_directory_is_refused():
     from levain.slot import Refused
     stray = units.Service("stray", "stray", "_levain_keys", (), "always", logs=True)
-    with pytest.raises(Refused):
+    with pytest.raises(Refused) as e:
         units.launchd_log_path(stray)
+    assert e.value.name == "bad-config"
     with pytest.raises(Refused):
         units.launchd_plist_text(stray)
+
+
+def test_a_non_logging_service_of_such_an_account_still_renders_and_asks_no_log_directory():
+    """L3 r2 deepseek MED: the refusal is for a service that LOGS; one that keeps no log never has the path opened."""
+    quiet = units.Service("quiet", "quiet", "_levain_keys", (), "always")
+    assert not quiet.logs
+    units.launchd_log_path(quiet)                                      # no raise
+    job = plistlib.loads(units.launchd_plist_text(quiet).encode())
+    assert "StandardErrorPath" not in job and "StandardOutPath" not in job
 
 
 def test_the_dispatch_run_linux_unit_keeps_its_exact_lines_and_names_no_log_file():
@@ -397,3 +407,84 @@ def test_the_program_as_its_own_process_holds_the_lock_and_dies_by_sigterm(sdir,
     # the lock is free again and was never replaced
     out, calls, _ = _main(sdir)
     assert len(calls) == 1
+
+
+# --- a log the dead account owned (L3 r2 of the stderr unit) -------------------------------------------------------------
+
+
+def _log_at(tmp_path, monkeypatch):
+    """dispatch_run's log path moved under ``tmp_path``; returns the service and the path."""
+    run = units.by_name("dispatch_run")
+    path = tmp_path / "com.levain.dispatch_run.log"
+    monkeypatch.setattr(units, "launchd_log_path", lambda svc: path)
+    return run, path
+
+
+def test_a_log_of_another_uid_is_deleted_so_launchd_recreates_it_as_the_new_account(tmp_path, monkeypatch):
+    """undo keeps the store, so a re-setup's NEW uid finds a 0644 log the old uid owns: launchd could not append (EACCES)."""
+    run, path = _log_at(tmp_path, monkeypatch)
+    path.write_bytes(b"old line\n")
+    os.chmod(path, 0o644)
+    ok, why = units._clear_stale_log(run, account_uid=lambda name: os.getuid() + 1)     # the file's owner is "not" the account
+    assert (ok, why) == (True, "") and not path.exists()
+
+
+def test_a_log_the_current_account_owns_is_kept(tmp_path, monkeypatch):
+    run, path = _log_at(tmp_path, monkeypatch)
+    path.write_bytes(b"live line\n")
+    assert units._clear_stale_log(run, account_uid=lambda name: os.getuid()) == (True, "")
+    assert path.read_bytes() == b"live line\n"
+
+
+def test_an_absent_log_is_nothing_to_do(tmp_path, monkeypatch):
+    run, path = _log_at(tmp_path, monkeypatch)
+    assert units._clear_stale_log(run, account_uid=lambda name: 1) == (True, "")
+
+
+def test_a_symlink_or_directory_at_the_log_name_is_refused_and_never_followed(tmp_path, monkeypatch):
+    run, path = _log_at(tmp_path, monkeypatch)
+    target = tmp_path / "precious"
+    target.write_bytes(b"keep me")
+    path.symlink_to(target)
+    ok, why = units._clear_stale_log(run, account_uid=lambda name: os.getuid() + 1)
+    assert not ok and "not a regular file" in why
+    assert path.is_symlink() and target.read_bytes() == b"keep me"
+    path.unlink()
+    path.mkdir()
+    ok, why = units._clear_stale_log(run, account_uid=lambda name: os.getuid() + 1)
+    assert not ok and path.is_dir()
+
+
+def test_an_account_that_does_not_exist_cannot_judge_the_owner(tmp_path, monkeypatch):
+    run, path = _log_at(tmp_path, monkeypatch)
+    path.write_bytes(b"x")
+
+    def gone(name):
+        raise KeyError(name)
+
+    ok, why = units._clear_stale_log(run, account_uid=gone)
+    assert not ok and "does not exist" in why and path.exists()
+
+
+def test_the_clear_runs_before_the_job_is_bootstrapped_and_only_for_a_non_root_logging_service():
+    steps = units.install_steps("darwin", units.services_for("darwin"), run=lambda *a, **k: None, read=lambda p: None)
+    whys = [s.why for s in steps]
+    clears = [i for i, w in enumerate(whys) if w.startswith("remove a stale ")]
+    assert len(clears) == 1 and "com.levain.dispatch_run.log" in whys[clears[0]] and steps[clears[0]].call is not None
+    boot = next(i for i, s in enumerate(steps) if s.argv[:3] == ("/bin/launchctl", "bootstrap", "system")
+                and s.argv[-1].endswith("com.levain.dispatch_run.plist"))
+    assert clears[0] < boot
+    assert not any("pf" in w for w in (whys[i] for i in clears))          # pf logs as root, in root's /var/log
+    assert not any(w.startswith("remove a stale ") for w in
+                   (s.why for s in units.install_steps("linux", units.services_for("linux"))))
+
+
+def test_setup_and_repair_both_carry_the_clear_before_the_start(tmp_path):
+    from tests.test_repair_plan import _plan as repair_plan, _pre_change
+    from tests.test_slot_l3_r1_fixes import _plan as setup_plan
+    facts, rf = _pre_change(tmp_path)
+    for plan in (setup_plan("darwin"), repair_plan(facts, rf)):
+        whys = [s.why for s in plan.steps]
+        clear = [i for i, w in enumerate(whys) if w.startswith("remove a stale ")]
+        start = [i for i, w in enumerate(whys) if w.startswith("start com.levain.dispatch_run")]
+        assert len(clear) == 1 and len(start) == 1 and clear[0] < start[0], (plan.verb, clear, start)

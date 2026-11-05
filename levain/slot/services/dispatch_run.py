@@ -75,7 +75,7 @@ from levain.agents.authority_replica import AuthorityReplica, ReplicaRefused, Re
 from levain.agents.accounting import ActionExposure, StopResult
 from levain.agents.session_launcher import LauncherRefused, RealLauncher, SessionIndex
 from levain.slot import Refused
-from levain.slot.layout import RUN, STORE
+from levain.slot.layout import RUN, STORE, dispatch_store_dir
 
 NAME = "dispatch_run"
 ACCOUNT = "_levain_dispatch"
@@ -350,34 +350,57 @@ class _Holder:
 #: [judged] the size past which the launchd log (the inherited stderr) is emptied before a line is written to it: a few
 #: MiB holds thousands of one-line causes, and the file under KeepAlive=always has no other bound.
 LOG_MAX_BYTES = 4 << 20
-#: serializes the size check and the truncate with the writes of the handler threads, which report concurrently
+#: serializes the size check, the truncate AND the failure line's write: the handler threads report concurrently, and a
+#: truncate between another thread's write and its flush would erase a line just written
 _LOG_LOCK = threading.Lock()
 
 
-def _bound_log(fd: int = 2) -> None:
-    """Empty ``fd``'s file when it is a regular file past :data:`LOG_MAX_BYTES`. launchd opens the unit's log for
-    appending and never trims it, and the account cannot replace it, so the program trims the descriptor it inherited.
-    A terminal, a pipe or a closed descriptor is left alone. (``pf.bound_log`` has this shape but no lock and a 1 MiB cap,
-    and importing the pf program here would pull in the install helper.)"""
+def _expected_log() -> Path:
+    """The file launchd opens as this unit's stderr (``units.launchd_log_path`` for ``dispatch_run``; a test pins the two
+    equal). Only a descriptor that IS this file is ever trimmed."""
+    return dispatch_store_dir(_host()) / f"com.levain.{NAME}.log"
+
+
+def _trim_if_over(fd: int, expected: Optional[Path] = None) -> None:
+    """The size check and the truncate, with :data:`_LOG_LOCK` HELD by the caller. A regular file past
+    :data:`LOG_MAX_BYTES` that is the unit's own log (same device and inode as :func:`_expected_log`) is emptied; a
+    terminal, a pipe, a closed descriptor, or a file redirected over fd 2 from a shell is left alone. A file of exactly
+    :data:`LOG_MAX_BYTES` is left alone too (the test is "past"), so the cap is a bound plus the lines written between
+    checks, not a quota."""
     try:
-        with _LOG_LOCK:
-            st = os.fstat(fd)
-            if stat.S_ISREG(st.st_mode) and st.st_size > LOG_MAX_BYTES:
-                os.ftruncate(fd, 0)
+        st = os.fstat(fd)
+        if not (stat.S_ISREG(st.st_mode) and st.st_size > LOG_MAX_BYTES):
+            return
+        mine = os.stat(_expected_log() if expected is None else expected)
+        if (st.st_dev, st.st_ino) != (mine.st_dev, mine.st_ino):
+            return
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)      # the descriptor is O_APPEND (launchd), but no stale offset is left to surprise a reader
     except OSError:
         pass
+
+
+def _bound_log(fd: int = 2, expected: Optional[Path] = None) -> None:
+    """Empty ``fd``'s file when it is the unit's log and past :data:`LOG_MAX_BYTES`. launchd opens the log for
+    appending and never trims it, and the account cannot replace it, so the program trims the descriptor it inherited.
+    (``pf.bound_log`` has this shape but no lock and a 1 MiB cap, and importing the pf program here would pull in the
+    install helper.)"""
+    with _LOG_LOCK:
+        _trim_if_over(fd, expected)
 
 
 def _report_failure(op: str, exc: BaseException) -> None:
     """ONE stderr line for an unexpected failure that is about to answer `internal-error`: the op, the exception's type
     and the file:line of its last frame. Never ``str(exc)``: it can carry a path, a key or a ticket from the request.
     Stderr is the unit's log (journald on Linux); it was `_log.warning` before, which reaches no stream unless a
-    handler is configured, so the cause appeared nowhere on the box (VM finding 5)."""
+    handler is configured, so the cause appeared nowhere on the box (VM finding 5). The bound and the write share ONE
+    :data:`_LOG_LOCK` span, so no other thread's truncate lands between this line's write and its flush."""
     try:
-        _bound_log()
         tb = traceback.extract_tb(exc.__traceback__)
         where = f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else "?"
-        print(f"levain dispatch-run: op {str(op)[:32]!r} failed: {type(exc).__name__} at {where}", file=sys.stderr, flush=True)
+        with _LOG_LOCK:
+            _trim_if_over(2)
+            print(f"levain dispatch-run: op {str(op)[:32]!r} failed: {type(exc).__name__} at {where}", file=sys.stderr, flush=True)
     except Exception:  # noqa: BLE001 - reporting must never turn a refusal into a crash
         pass
 
