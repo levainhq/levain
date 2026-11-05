@@ -56,22 +56,16 @@ def test_phills_line_on_an_authority_item_opens_its_sheet_and_records_nothing():
     ("1a! great", [(1, "a")]),                         # punctuation right after the entry
     ("1a->ok", [(1, "a")]),
     ("1a -- fine", [(1, "a")]),
-    ("1a (works great)", [(1, "a")]),
     ("1a, 2b -> both good", [(1, "a"), (2, "b")]),     # several leading tokens
     ("1a 2 rec => ok", [(1, "a"), (2, "b")]),
-    ("1: a -> fine", [(1, "a")]),                      # the colon form before punctuation stays a pick
-    ("2 rec. thanks", [(2, "b")]),
+    ("2 rec. thanks", [(2, "b")]),                     # a spaced answer carries words after a mark
+    ("1a... ok", [(1, "a")]),
 ])
 def test_leading_answers_then_commentary(text, want):
     p = run(text)
     assert p.matched and not p.refused, p
     assert [(a.n, a.pick) for a in p.actions] == want
     assert {a.note for a in p.actions} == {text}
-
-
-def test_a_sweep_then_commentary_puts_the_line_on_each_swept_item():
-    p = run("all recs please")
-    assert {a.n for a in p.actions} == {1, 2, 3, 4, 5} and {a.note for a in p.actions} == {"all recs please"}
 
 
 def test_the_recorded_note_is_the_line_as_typed_trimmed_at_its_ends_only():
@@ -143,6 +137,138 @@ def test_a_number_with_no_pick_before_commentary_is_named():
 
 def test_bare_pick_first_keeps_its_hint():
     assert "number in front" in run("(a) all recs").hint
+
+
+# --- fix round 2 (L3 r1, 4 lineages): fail closed by deletion ------------------------------------------------------
+# The leading run is ONLY well-formed entries. The first token that is not one ends the run; if it looks like an
+# answer attempt in any way, the whole line is refused (named, nothing recorded); only a plain word, `->`, `=>`, `--`,
+# `!` or `.` after the run is his words.
+@pytest.mark.parametrize("text", [
+    # HIGH (codex, gemini): a malformed entry after a good one recorded the good one silently
+    "1a 2-> explanation",
+    "1a, 5->ok",
+    "1a, 5--ok",
+    "1a, 2-b",
+    "1a, 2/b",
+    "1a, 0a",
+    "1a/b",
+    "1a-b",
+    "1a.b",
+    "1a, b",                       # a pick with no number after the run is an attempt, never words
+    "1a rec",
+    "1a (works great)",            # `(` after the run is an attempt
+    "1a 10% sure",                 # a digit after the run is an attempt
+    "1a?",                         # a mark that is not one of the word marks
+    # MED (complement): prose that opens "NUM letter" was recorded; a spaced answer needs a mark before words
+    "2 a.m. standup moved",
+    "1 a lot of work left",
+    "3 e.g. foo",
+    "2 b or not 2 b",
+    "2 rec looks good",
+    # MED (complement): a leading sweep followed by prose was an unconditional sweep
+    "all recs look wrong to me",
+    "rest rec'd later",
+    "all recs -> fine",
+    "1a, all recs looks fine",
+    "1a, all recs -> fine",
+])
+def test_round2_a_malformed_or_ambiguous_line_records_nothing_and_says_so(text):
+    p = run(text)
+    assert not p.matched and not p.actions and not p.refused and not p.sheets, p
+    assert p.rest == text
+    assert p.hint and "nothing was recorded" in p.hint, p.hint
+
+
+@pytest.mark.parametrize("text,token", [
+    ("1a 2-> explanation", "2->"),
+    ("1a, 0a", "0a"),
+    ("1a/b", "1a/b"),
+    ("1a, b", "b"),
+    ("1 a lot of work left", "lot"),
+    ("all recs look wrong to me", "sweep"),
+])
+def test_round2_the_refusal_names_what_stopped_it(text, token):
+    assert token in run(text).hint
+
+
+@pytest.mark.parametrize("text", [
+    # MED (gemini): malformed FIRST tokens the old attempt pattern missed now say so
+    "1ab", "2ab -> this works", "2ab, 1a", "1 rec, 2z", "1 recs, 2ab", "all others recs, 2z", "5, 1a",
+    "1 z -> this works", "5 because reasons", "0a -> x",
+])
+def test_round2_a_malformed_first_token_gets_a_hint(text):
+    p = run(text)
+    assert not p.matched and not p.actions and p.hint and "nothing was recorded" in p.hint, p.hint
+
+
+@pytest.mark.parametrize("text,want", [
+    # HIGH (deepseek, gemini): `NUM ":"` keeps its pre-change meaning, free text to the end of the line
+    ("3: 2nd option is best", "2nd option is best"),
+    ("3: 100 things", "100 things"),
+    ("3: (2) hmm", "(2) hmm"),
+    ("3: a 5 second timeout", "a 5 second timeout"),
+    ("3: a 'simple' fix", "a 'simple' fix"),
+    ("3: a $100 cap", "a $100 cap"),
+    ("3: a 5-minute delay", "a 5-minute delay"),
+    ("3: a (works)", "a (works)"),
+    ("1: a -> fine", "a -> fine"),                 # round 1's colon-into-pick reading is reverted
+    ("1: a->fine", "a->fine"),
+    ("1: a! fine", "a! fine"),
+])
+def test_round2_the_colon_form_is_free_text_to_the_end_of_the_line(text, want):
+    p = run(text)
+    assert p.matched and not p.refused, p
+    n = int(text.split(":")[0])
+    assert acts(p) == [(n, None, want, None, False)]
+
+
+def test_round2_a_colon_form_that_swallows_a_later_answer_names_it():
+    """`1: a, 2b this works` is free text to the end of the line (its pre-change meaning); the 2b inside it is said."""
+    p = run("1: a, 2b this works")
+    assert acts(p) == [(1, None, "a, 2b this works", None, False)]
+    assert "'2b'" in p.hint and "not read as an answer" in p.hint
+
+
+@pytest.mark.parametrize("text,names", [
+    # MED (codex): every valid entry shape in the words is named, through the lexer's own patterns
+    ("1a -> 2 b is better", ["'2 b'"]),
+    ("1a -> 2 rec is better", ["'2 rec'"]),
+    ("1a -> 2: b", ["'2: b'"]),
+    ("1a -> 2 (b) maybe", ["'2 (b)'"]),
+    ("1a -> all others recs too", ["'all others recs'"]),
+    # MED (deepseek): ALL of them, in one hint, across lines
+    ("1a -> 2b and 3c", ["'2b'", "'3c'"]),
+    ("1a -> 2b is better\n4a -> 3c too", ["'2b'", "'3c'"]),
+    # LOW (gemini): the old note forms are his words too
+    ("1a - 2b is better", ["'2b'"]),
+    ("1a because 2b is wrong", ["'2b'"]),
+])
+def test_round2_answer_shapes_in_his_words_are_all_named(text, names):
+    p = run(text)
+    assert p.matched and p.actions and p.actions[0].n == 1 and p.actions[0].pick == "a"
+    assert p.hint and "not read as an answer" in p.hint
+    for name in names:
+        assert name in p.hint, p.hint
+    assert p.hint.count("not read as an answer") == 1          # one hint, not one per shape
+
+
+@pytest.mark.parametrize("text", [
+    # MED (deepseek): versions, hex and scientific notation are not answer shapes
+    "1a -> the result is 3e-5",
+    "1a -> commit 7f3a2c",
+    "1a -> v1.2b shipped",
+    "1a -> 0x4b",
+    "1a -> 2am works",
+])
+def test_round2_numbers_that_are_no_answer_shape_raise_no_hint(text):
+    p = run(text)
+    assert acts(p) == [(1, "a", None, text, False)] and p.hint is None
+
+
+def test_round2_the_hint_survives_the_early_refusals():
+    """LOW (complement): no view / another store still says what in the words was not read."""
+    assert "'2b'" in parse("1a -> 2b is better", None, ITEMS, "qs-1").hint
+    assert "'2b'" in parse("1a -> 2b is better", VIEW, ITEMS, "qs-OTHER").hint
 
 
 # --- the recording path, signed with a tmp key --------------------------------------------------------------------

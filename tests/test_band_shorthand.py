@@ -131,6 +131,8 @@ def test_rec_on_an_item_with_no_rec_is_refused():
     "1 because",
     "0a",
     "1a, 2z, 2b",                    # a malformed token in the answer run spoils the whole line
+    "1 b because",                   # a note with no words
+    "all recs please",               # a leading sweep takes nothing after it but a note
     "2:",
     "hello there",
     "",
