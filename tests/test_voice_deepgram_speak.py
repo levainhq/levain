@@ -17,6 +17,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import re
 import socket
 import threading
 from pathlib import Path
@@ -154,6 +155,26 @@ def test_the_chosen_voice_is_the_model_parameter(server, voice):
     prov, _ = speaker(server)
     prov.speak(FAKE_KEY, "Hi.", voice)
     assert parse_qs(urlsplit(server.received[0]["target"]).query)["model"] == [voice]
+
+
+def test_the_offered_voices_are_english_aura_2_ids_sorted_without_duplicates_and_hold_the_default():
+    voices = P.DEEPGRAM_TTS_VOICES
+    assert all(re.fullmatch(r"aura-2-[a-z]+-en", v) for v in voices)
+    assert len(set(voices)) == len(voices) and list(voices) == sorted(voices)
+    assert P.DEEPGRAM_TTS_VOICE in voices
+    # the count of English Aura-2 rows in the "All Available Voices" table of https://developers.deepgram.com/docs/tts-models,
+    # read 2026-11-05; a number that moves when the page does is a reason to re-read the page, not to edit this line blind
+    assert len(voices) == 41
+
+
+def test_a_second_listed_voice_is_sent_as_the_model_and_a_voice_outside_the_list_is_refused_before_any_network_use(server):
+    prov, transport = speaker(server)
+    prov.speak(FAKE_KEY, "Hi.", "aura-2-zeus-en")
+    assert parse_qs(urlsplit(server.received[0]["target"]).query)["model"] == ["aura-2-zeus-en"]
+    for bad in ("aura-2-sirio-es", "aura-1-asteria-en", "aura-2-nobody-en", "aura-2-", "nova"):
+        with pytest.raises(ValueError):
+            prov.speak(FAKE_KEY, "Hi.", bad)
+    assert len(server.received) == 1 and len(transport.requests) == 1       # only the listed voice ever left the process
 
 
 @pytest.mark.parametrize("speed,wire", [(0.7, "0.7"), (1.5, "1.5"), (0.85, "0.85"), (1, None), (1.0, None),

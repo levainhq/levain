@@ -88,9 +88,10 @@ PROVIDERS: dict[str, ProviderData] = {
                            vprov.OPENAI_DEFAULT_VOICE, vprov.SPEED_MIN, vprov.SPEED_MAX,
                            "Speech: abuse logs kept up to 30 days. Transcription: no abuse-monitoring retention. "
                            "Not used to train unless opted in."),
-    # one voice listed; the speed range is the adapter's own (Aura-2's), and the adapter sends a speed other than 1.0
+    # the English Aura-2 voices Deepgram documents (vprov.DEEPGRAM_TTS_VOICES); the speed range is the adapter's own
+    # (Aura-2's), and the adapter sends a speed other than 1.0
     "deepgram": ProviderData("deepgram", vprov.DEEPGRAM_TTS_MODEL, vprov.DEEPGRAM_STT_MODEL,
-                             (vprov.DEEPGRAM_TTS_VOICE,), vprov.DEEPGRAM_TTS_VOICE,
+                             vprov.DEEPGRAM_TTS_VOICES, vprov.DEEPGRAM_TTS_VOICE,
                              vprov.DEEPGRAM_SPEED_MIN, vprov.DEEPGRAM_SPEED_MAX,
                              "Every call opts out of Deepgram's model-improvement programme (mip_opt_out). Retention "
                              "periods are not stated on Deepgram's pages."),

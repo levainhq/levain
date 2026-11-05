@@ -783,6 +783,22 @@ def _strings(node):
             yield from _strings(v)
 
 
+def test_t_the_deepgram_listing_is_the_adapters_voice_tuple_and_a_voice_outside_it_is_refused_unsent(rig):
+    """Red with: the deepgram ``ProviderData`` listing one voice again (or any list that is not the adapter's tuple)."""
+    rig.add_key()
+    g = rig.reply("Hello there.")
+    with served(rig) as (port, _httpd):
+        status, _h, body = call(port, "GET", VOICE_JSON)
+        deepgram = next(p for p in js(body)["providers"] if p["name"] == "deepgram")
+        assert status == 200 and deepgram["voices"] == list(vprov.DEEPGRAM_TTS_VOICES)
+        assert deepgram["default_voice"] == vprov.DEEPGRAM_TTS_VOICE == "aura-2-thalia-en"
+        for bad in ("aura-2-sirio-es", "aura-1-asteria-en", "aura-2-nobody-en", "nova"):
+            status, _h, out = speak(port, rig, g, provider="deepgram", voice=bad)
+            assert (status, js(out)["error"]) == (400, "bad_request"), bad
+            assert js(out)["message"] == "That voice is not offered for Deepgram.", bad
+    assert rig.transport.seen == []                                  # nothing was reserved or sent
+
+
 def test_t_json_voice_json_shows_the_record_id_and_uses_and_nothing_of_the_key(rig):
     """No value equals or holds the key, a 4-character prefix of it, its sha256, or the keychain names.
     Red with: the row carrying ``record["source"]`` (or ``account``)."""

@@ -80,7 +80,22 @@ OPENAI_TTS_MODEL = "tts-1"                      # DATA: announced to shut down 2
 OPENAI_STT_MODEL = "gpt-4o-mini-transcribe"
 OPENAI_DEFAULT_VOICE = "nova"
 DEEPGRAM_TTS_MODEL = "aura-2"                   # the priced family (levain.voice.meter.DEFAULT_PRICES)
-DEEPGRAM_TTS_VOICE = "aura-2-thalia-en"         # a model id; from the design's "Aura-2", the voice name is not fetched
+DEEPGRAM_TTS_VOICE = "aura-2-thalia-en"         # a model id, the default; one of DEEPGRAM_TTS_VOICES
+# Every English Aura-2 voice the table "All Available Voices" lists on https://developers.deepgram.com/docs/tts-models (read
+# 2026-11-05), by model id; the default is one of them. The other languages' ids on that page (`-es`, `-nl`, ...) are left
+# out on purpose: the cockpit's voice picker is English-only. How many there are is asserted by a test, not stated here.
+# Sorted, so a reader and a test can compare it by eye. A voice outside this tuple is refused before sending.
+DEEPGRAM_TTS_VOICES = (
+    "aura-2-amalthea-en", "aura-2-andromeda-en", "aura-2-apollo-en", "aura-2-arcas-en", "aura-2-aries-en",
+    "aura-2-asteria-en", "aura-2-athena-en", "aura-2-atlas-en", "aura-2-aurora-en", "aura-2-callista-en",
+    "aura-2-cora-en", "aura-2-cordelia-en", "aura-2-delia-en", "aura-2-draco-en", "aura-2-electra-en",
+    "aura-2-harmonia-en", "aura-2-helena-en", "aura-2-hera-en", "aura-2-hermes-en", "aura-2-hyperion-en",
+    "aura-2-iris-en", "aura-2-janus-en", "aura-2-juno-en", "aura-2-jupiter-en", "aura-2-luna-en",
+    "aura-2-mars-en", "aura-2-minerva-en", "aura-2-neptune-en", "aura-2-odysseus-en", "aura-2-ophelia-en",
+    "aura-2-orion-en", "aura-2-orpheus-en", "aura-2-pandora-en", "aura-2-phoebe-en", "aura-2-pluto-en",
+    "aura-2-saturn-en", "aura-2-selene-en", "aura-2-thalia-en", "aura-2-theia-en", "aura-2-vesta-en",
+    "aura-2-zeus-en",
+)
 DEEPGRAM_STT_MODEL = "nova-3"
 OPENAI_INPUT_CAP = API_CAP                      # OpenAI's speech input limit, the number the cap was first written for
 # Aura-2 and Aura-1: the table "Max Characters" on https://developers.deepgram.com/docs/text-to-speech (read 2026-11-05).
@@ -417,14 +432,15 @@ class DeepgramProvider:
 
     def speak(self, key: str, text: str, voice: str = DEEPGRAM_TTS_VOICE, speed: float = 1.0) -> bytes:
         """mp3 bytes for ``text`` (at most :data:`DEEPGRAM_INPUT_CAP` characters). ``voice`` is a voice of the
-        :attr:`tts_model` family (an Aura-2 model id), so the family the meter priced is the one billed. ``speed`` is
+        :data:`DEEPGRAM_TTS_VOICES` (an English Aura-2 model id, so the family the meter priced is the one billed; an id
+        outside it, another language's included, is refused before sending). ``speed`` is
         refused outside Aura-2's 0.7-1.5 and sent as the ``speed`` query parameter unless it is 1.0 (Deepgram's default)."""
         secret = _Key(key)
         del key
         with secret:
             _need_speech(text, speed, DEEPGRAM_INPUT_CAP, (DEEPGRAM_SPEED_MIN, DEEPGRAM_SPEED_MAX))
-            if not _need_voice(voice).startswith(f"{self.tts_model}-"):
-                raise ValueError("voice is not one of the priced model's voices")
+            if _need_voice(voice) not in DEEPGRAM_TTS_VOICES:
+                raise ValueError("voice is not one of the offered Aura-2 voices")
             query = {"model": voice, "encoding": "mp3"}
             if speed != 1.0:
                 query["speed"] = repr(float(speed))     # round-trips: a six-digit format would send 1.0000001 as the default
