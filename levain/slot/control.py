@@ -18,7 +18,7 @@ Three layers, each testable on its own:
   socket, one thread per connection. The CONNECTION is the lease (§3.1): ``LEASE-OPEN`` answers a nonce
   bound to that connection; its EOF revokes the session ``ATTACH`` bound to it.
 
-Session 2 builds the operator verbs (``LEASE-OPEN``, ``STATUS``) and root's (``ATTACH``, ``CAS``,
+Session 2 builds the operator verbs (``LEASE-OPEN``, ``STATUS``; 1104-30 X1 adds ``REVOKE-OWN``) and root's (``ATTACH``, ``CAS``,
 ``MINT``, ``FRONT-ARM``, ``SECRETS``, ``REVOKE``, ``REVOKED-SET``); session 3 the queue broker's
 ``QUEUE-RESOLVE`` (§3.3, §26 S1-c); S1 session 3b the keys peer's ``TOKEN-RESOLVE`` and CONTROL's side of keys'
 admin wire (:class:`KeysAdmin`, §4.9: ``FRONT-REGISTER`` fenced by the per-``front_uid`` registration counter in
@@ -83,11 +83,11 @@ ROOT_UID = 0
 
 #: §3.3's verbs per peer, as built so far (3c-6b adds keys' ``LINEAGE-APPEND``, 3c-7 root's ``SLOT-SYNC`` and dispatch's
 #: ``POOL``, 3c-8 dispatch's ``CONFIG-SUBMIT``, ``SESSION-EVENTS`` and ``ARTIFACT-ACK``, 3c-9 session D the operator's
-#: ``KEYS-STATUS``). The ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
+#: ``KEYS-STATUS``; 1104-30 X1 the operator's ``REVOKE-OWN {session}``, the stop for its own session, root still ENDs). The ``_levain_dispatch`` row (3c-4 builds its ``ROUTE-SUBMIT``, 3c-5 the three ticket verbs and ``LEASE-OPEN {ticket}``; the peer is ``dispatch`` when
 #: :meth:`Control.peer_kind` is given its uid, else ``foreign``). keys' ``FRONT-LOST`` / ``SPEND-OVERRUN`` / ``SESSIONS`` / ``LINEAGE-APPEND`` are answered only on the connection that
 #: holds the current ``KEYS-ATTACH`` (else ``not-attached``).
 PEER_VERBS: Mapping[str, frozenset[str]] = {
-    "operator": frozenset({"LEASE-OPEN", "STATUS", "KEYS-STATUS"}),
+    "operator": frozenset({"LEASE-OPEN", "STATUS", "KEYS-STATUS", "REVOKE-OWN"}),
     "root": frozenset({"ATTACH", "CAS", "MINT", "FRONT-ARM", "SECRETS", "REVOKE", "REVOKED-SET", "SLOT-SYNC"}),
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"}),
@@ -107,6 +107,7 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "FRONT-ARM": (frozenset({"session", "generation"}),) * 2,
     "SECRETS": (frozenset({"session"}),) * 2,
     "REVOKE": (frozenset({"session"}),) * 2,
+    "REVOKE-OWN": (frozenset({"session"}),) * 2,             # 1104-30 X1: the operator's stop for its own session
     "REVOKED-SET": (frozenset(), frozenset()),
     "SLOT-SYNC": (frozenset({"slots"}),) * 2,
     "POOL": (frozenset(), frozenset()),
@@ -2157,6 +2158,12 @@ class Control:
             out["queue_cap"] = h.queue_cap
         return out
 
+    def _revoke_record(self, session: str, rec: "R.SessionState") -> "R.SessionState":
+        """The one REVOKED write (``REVOKE`` and ``REVOKE-OWN`` share it, so they cannot drift): the caller holds the
+        session lock and the record is in a live state. ``lease_live`` stays as the lease says: only its holder closes it."""
+        return self._write(rec, state=R.REVOKED, event_kind="state",
+                           lease_live=rec.lease_live and self._lease_live(session))
+
     def _op_revoke(self, conn: Conn, args: dict) -> dict[str, object]:
         """§3.3 REVOKE: a live record -> REVOKED; no record -> created at REVOKED (§3.1: the alloc-only
         orphan); a record already past live -> a no-op answering its generation (§4.5)."""
@@ -2171,8 +2178,27 @@ class Control:
                 self._put(rec)                           # no claims, so no ticket: owes no event
                 revoked = True
             elif rec.state in R.LIVE_STATES:
-                rec = self._write(rec, state=R.REVOKED, event_kind="state",
-                                  lease_live=rec.lease_live and self._lease_live(session))
+                rec = self._revoke_record(session, rec)
+                revoked = True
+        if revoked:
+            self._after_revoke(session)
+        return {"generation": rec.generation}
+
+    def _op_revoke_own(self, conn: Conn, args: dict) -> dict[str, object]:
+        """1104-30 X1, the operator's ``REVOKE-OWN {session}``: the stop direction for the operator's OWN session. The
+        record must exist and name this peer as ``claims.operator_uid`` (anything else is ``session-unknown``, the
+        answer STATUS's omission implies, and no record is ever created). A live record moves to REVOKED by
+        :meth:`_revoke_record`, then :meth:`_after_revoke` (handles dropped, reaper woken, keys told); a record
+        already past live is a no-op answering its generation. Root's reaper ENDs; the lease is closed by its holder
+        on its own proof, never here."""
+        session = R.check_session(args["session"])
+        revoked = False
+        with self.store.lock(session):
+            rec = self.store.get(session)
+            if rec is None or rec.claims.get("operator_uid") != conn.peer_uid:
+                raise Refused("session-unknown")
+            if rec.state in R.LIVE_STATES:
+                rec = self._revoke_record(session, rec)
                 revoked = True
         if revoked:
             self._after_revoke(session)
