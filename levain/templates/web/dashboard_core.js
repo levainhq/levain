@@ -5016,8 +5016,26 @@
   // unpadded base64url with a length some bytes encode to; signUnb64u is only ever handed one from the server or storage
   const signDecodable = (t) => typeof t === "string" && /^[A-Za-z0-9_-]+$/.test(t) && t.length % 4 !== 1;
   // a cancelled Face ID and a passkey this device no longer holds both read NotAllowedError: one sentence for both
-  const signDeclined = (e, what) => "the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + what;
+  const signDeclined = (e, what) => "the passkey did not sign (" + ((e && e.name) || "cancelled") + "); " + what + ": tap to try again";
   const signWhy = (r) => (r.body && typeof r.body.message === "string" && r.body.message) || ("refused (HTTP " + r.status + ")");
+  // The one door to the authenticator. navigator.credentials.get is called from here and nowhere else in this file, and only
+  // while a tap is armed: a click or Enter/Space on a control arms it (the capture listeners below), one get() consumes it.
+  // A focus, visibility, pageshow, online, reconnect, render or timer never arms it, so a passkey sheet taking the window's
+  // focus (and the focus coming back) cannot ask for another. A refusal or cancel is never retried here: the card says so and
+  // the next tap asks again. The arm lapses after SIGN_ARM_MS (past the 60 s prompt timeout the challenge carries)
+  const SIGN_ARM_MS = 90000;
+  let signArmedAt = 0;
+  const signArm = () => { signArmedAt = Date.now(); };
+  document.addEventListener("click", signArm, true);
+  document.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") signArm(); }, true);
+  const signRefusedId = new Set();   // rp|fp whose remembered id the authenticator refused: the next tap asks for no id
+  function signGet(pk) {
+    if (!signArmedAt || Date.now() - signArmedAt > SIGN_ARM_MS) {
+      return Promise.reject(Object.assign(new Error("no tap asked for this passkey prompt"), { name: "NotAllowedError" }));
+    }
+    signArmedAt = 0;
+    return navigator.credentials.get({ publicKey: pk });
+  }
   const signNotes = new Map();     // request id -> [text, kind, sha256]: what the last ceremony said, kept across redraws
   const signWriteIns = new Map();  // request id -> {sha256, words}: a write-in being typed, kept for the version it was typed on
   // request id -> what a card drawn while that request's ceremony is in flight must undo when the ceremony gives its card back.
@@ -5091,14 +5109,15 @@
   // decode is forgotten; one the authenticator refuses (NotAllowedError, which a passkey since removed reads as, and a
   // cancel too) is asked once more with no id, and stays remembered until a passkey signs (signKeep replaces it)
   function signAsk(pk, rp, fp, rawId) {
+    const noId = rp + "|" + fp;
     const local = !!rawId && typeof rp === "string" && signMine(rp)[fp] === rawId;
-    const id = rawId && signDecodable(rawId) ? signUnb64u(rawId) : null;
-    if (rawId && !id && local) signForget(rp, fp);
-    const ask = (allow) => navigator.credentials.get({ publicKey: Object.assign({}, pk,
-      allow ? { allowCredentials: [{ type: "public-key", id: allow }] } : {}) });
-    return ask(id).catch((e) => {
-      if (!(e && e.name === "NotAllowedError" && id && local)) throw e;
-      return ask(null);
+    const id = rawId && signDecodable(rawId) && !signRefusedId.has(noId) ? signUnb64u(rawId) : null;
+    if (rawId && !signDecodable(rawId) && local) signForget(rp, fp);
+    return signGet(Object.assign({}, pk, id ? { allowCredentials: [{ type: "public-key", id: id }] } : {})).catch((e) => {
+      // a refusal of the remembered id (a passkey since removed, or only a cancel) is never asked again by the page: the
+      // card says so, and the NEXT TAP asks for no id (the OS's own list). The mapping is kept until a passkey signs
+      if (e && e.name === "NotAllowedError" && id && local) signRefusedId.add(noId);
+      throw e;
     });
   }
   function signHeaders(post) {

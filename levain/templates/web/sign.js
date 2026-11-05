@@ -107,6 +107,28 @@
   // a second link opened on this page (a fragment-only navigation does not reload it): read it afresh
   window.addEventListener("hashchange", () => { if (location.hash) location.reload(); });
 
+  // The one door to the authenticator in this page. navigator.credentials.get is called from pkGet and nowhere else, and only
+  // while a tap is armed: a click or Enter/Space arms it (the capture listeners), one get() consumes it. A focus, visibility,
+  // pageshow, online, reconnect, render or timer never arms it, so a passkey sheet taking the window's focus (and giving it
+  // back) cannot ask for another. A refusal or cancel is never retried here: the page says so and the next tap asks again.
+  // A remembered credential the authenticator refused is dropped for the NEXT tap's ask (the OS's own list), kept on disk.
+  const PK_ARM_MS = 90000;
+  let pkArmedAt = 0;
+  const pkArm = () => { pkArmedAt = Date.now(); };
+  document.addEventListener("click", pkArm, true);
+  document.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") pkArm(); }, true);
+  const pkRefused = new Set();
+  function pkGet(pk, id, k) {
+    if (!pkArmedAt || Date.now() - pkArmedAt > PK_ARM_MS) {
+      return Promise.reject(Object.assign(new Error("no tap asked for this passkey prompt"), { name: "NotAllowedError" }));
+    }
+    pkArmedAt = 0;
+    const key = String(pk.rpId) + "|" + String(k && k.fp);
+    const use = id && !pkRefused.has(key) ? id : null;
+    return navigator.credentials.get({ publicKey: use ? Object.assign({}, pk, { allowCredentials: [{ type: "public-key", id: use }] }) : pk })
+      .catch((e) => { if (e && e.name === "NotAllowedError" && use && k && k.local) pkRefused.add(key); throw e; });
+  }
+
   // what a refused passkey ceremony says: a cancel and a timeout both raise NotAllowedError, so that name is said in words
   function passkeyWhy(e) {
     const n = e && e.name;
@@ -756,17 +778,8 @@
       // the passkey asked for by its id when one decodes; an id that does not is dropped (the OS's own list), never a throw
       const allow = k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
       if (k.rawId && !allow && k.local) forget(rp, fp);
-      const ask = (id) => {
-        const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
-        if (id) pk.allowCredentials = [{ type: "public-key", id: id }];
-        return navigator.credentials.get({ publicKey: pk });
-      };
-      // a NotAllowedError for the id this browser remembered may be a passkey since removed, or only a cancel: ask once
-      // more with no id. The record is kept until a passkey signs with a different credential (remembered below)
-      const asked = ask(allow).catch((e) => {
-        if (!(e && e.name === "NotAllowedError" && allow && k.local)) throw e;
-        return ask(null);
-      });
+      const pk = { challenge: unb64u(c.body.challenge), rpId: c.body.rp_id, userVerification: "required", timeout: 60000 };
+      const asked = pkGet(pk, allow, k);
       return asked.then((cred) => {
         say("Verifying the signature…");
         const answer = { authenticator_data: b64u(cred.response.authenticatorData),
@@ -1106,13 +1119,9 @@
         if (line) signing(line, "server", "Signing");
         say("Confirm with your passkey to sign…" + (line ? " " + line : ""));
         const allow = k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
-        const ask = (aid) => {
-          const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
-          if (aid) pk.allowCredentials = [{ type: "public-key", id: aid }];
-          return navigator.credentials.get({ publicKey: pk });
-        };
+        const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
         let sent = false;
-        return ask(allow).catch((e) => { if (!(e && e.name === "NotAllowedError" && allow && k.local)) throw e; return ask(null); }).then((cred) => {
+        return pkGet(pk, allow, k).then((cred) => {
           say("Sending the signed drop…");
           const envelope = { body_text: c.body_text, payload: ch.body.payload, authenticator_data: b64u(cred.response.authenticatorData),
                              client_data_json: b64u(cred.response.clientDataJSON), signature: b64u(cred.response.signature) };
@@ -1367,13 +1376,9 @@
           hline("Signing");
           hsay("Confirm with your passkey to sign…" + (hsignText ? " " + hsignText : ""));
           const allow = k.rawId && decodable(k.rawId) ? unb64u(k.rawId) : null;
-          const ask = (aid) => {
-            const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
-            if (aid) pk.allowCredentials = [{ type: "public-key", id: aid }];
-            return navigator.credentials.get({ publicKey: pk });
-          };
+          const pk = { challenge: unb64u(ch.body.challenge), rpId: ch.body.rp_id, userVerification: "required", timeout: 60000 };
           let sent = false;
-          return ask(allow).catch((e) => { if (!(e && e.name === "NotAllowedError" && allow && k.local)) throw e; return ask(null); }).then((cred) => {
+          return pkGet(pk, allow, k).then((cred) => {
             hsay("Sending the signature…");
             // the key set is the server's own (draft_sign `_need`): the review id and the signed parts, no store id
             const req = { review_id: r.id, body_text: r.body_text, payload: ch.body.payload, authenticator_data: b64u(cred.response.authenticatorData),

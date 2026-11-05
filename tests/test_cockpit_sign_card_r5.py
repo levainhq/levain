@@ -151,20 +151,22 @@ def test_h7_a_remembered_id_that_does_not_decode_is_dropped_and_the_card_signs(t
 
 @needs_browser
 @needs_ssh
-def test_h7_a_remembered_id_the_authenticator_refuses_is_asked_once_more_without_it(tmp_path, monkeypatch) -> None:
+def test_h7_a_remembered_id_the_authenticator_refuses_is_asked_without_it_by_the_next_tap(tmp_path, monkeypatch) -> None:
     rig = _Rig(tmp_path, monkeypatch)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig, _remember(rig, OTHER)),
             {"eval": f"{OPTION_B}.click() || 1"},
-            {"until": f"/^signed|nothing was signed|not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 90000},
+            {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 90000},
+            {"eval": f"{OPTION_B}.click() || 1"},          # the page never asks again by itself: the retry is a tap
+            {"until": f"/^signed|not sure/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 90000},
             {"eval": "window.__gets"},
             {"eval": RECORD},
         ])
     v = out["values"]
-    assert str(v[5]).startswith("signed (b)"), v[5]
-    assert v[6] == [1, 0], v[6]                           # the remembered id, refused; then once with none
-    assert json.loads(v[7]) == {rig.pk.key.fingerprint: CRED}, v[7]
+    assert str(v[7]).startswith("signed (b)"), v[7]
+    assert v[8] == [1, 0], v[8]                           # the remembered id, refused; the next tap asks with none
+    assert json.loads(v[9]) == {rig.pk.key.fingerprint: CRED}, v[9]
     assert rig.verifies(QRID)
 
 
