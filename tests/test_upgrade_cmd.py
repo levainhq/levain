@@ -72,6 +72,10 @@ class Env:
         self.op_uid = OP_UID
         self.which_map = {"pipx": "/bin/pipx", "uv": "/bin/uv"}
         self.exe_exists = True
+        self.live = (True, [])                  # what STATUS answers; a list is consumed one answer per ask
+        self.asks, self.prompts, self.slept = 0, [], []
+        self.answers = []                       # the operator's typed answers, consumed in order
+        self.now = 0.0
 
     def lstat(self, p):
         if p not in self.fs:
@@ -95,7 +99,25 @@ class Env:
             run=self.runner, execv=self.exec_,
             held_row=lambda: self.held, held_lines=lambda h, p: self.held_lines(h, p),
             read_directory=lambda host: self.read_dir(host), check_writers=lambda *a: self.writers(*a),
-            gen_id=lambda a, b: GEN, current_gen=lambda h: self.current, version="9.9.9")
+            gen_id=lambda a, b: GEN, current_gen=lambda h: self.current, version="9.9.9",
+            live_sessions=lambda: self.ask_live(), prompt=self.ask_prompt, sleep=lambda x: self.do_sleep(x),
+            clock=lambda: self.now)
+
+    def ask_live(self):
+        self.asks += 1
+        if type(self.live) is list:
+            return self.live[min(self.asks, len(self.live)) - 1]
+        return self.live
+
+    def ask_prompt(self, text):
+        self.prompts.append(text)
+        if not self.answers:
+            raise EOFError
+        return self.answers.pop(0)
+
+    def do_sleep(self, secs):
+        self.slept.append(secs)
+        self.now += secs
 
     def run(self, capsys, **kw):
         rc = U.run_upgrade(seams=self.seams(), **kw)
@@ -709,3 +731,251 @@ def test_upgrade_holds_no_second_copy_of_the_recovery_note(monkeypatch):
     assert U._held_note() == "ONE TEXT"
     src = Path(U.__file__).read_text()
     assert "still run 4 and 5" not in src and "REAP_HELD_NOTE" in src
+
+
+# --- 1104-29 W1: the wait offer ----------------------------------------------------------------------------------
+
+S1, S2, S3 = "s-" + "1" * 16, "s-" + "2" * 16, "s-" + "3" * 16
+
+
+def rec(session, kind="dispatch", state="ACTIVE", lease_live=True):
+    return {"session": session, "state": state, "claims": {"kind": kind}, "lease_live": lease_live}
+
+
+def two_live():
+    return (True, [rec(S1), rec(S2), rec(S3, "interactive")])
+
+
+def test_a_live_session_prompts_before_the_installer_or_sudo(env, capsys):
+    env.live = two_live()
+    env.answers = ["c"]
+    rc, out = env.run(capsys)
+    assert rc == U.EXIT_WAITED_OUT == 4 and "Nothing was changed" in out
+    assert "2 agent sessions are running" in out and S1 in out and "1 session of yours" in out and S3 in out
+    assert "Their work is kept" in out and "[w]" in out and "[e]" in out and "[c]" in out
+    nothing_ran(env)
+
+
+def test_zero_live_records_is_todays_output(env, capsys, tmp_path):
+    env.live = (True, [rec(S1, state="RETAINED", lease_live=False), rec(S2, state="HELD", lease_live=False)])
+    rc, out = env.run(capsys, no_pip=True)
+    base = Env(tmp_path / "b")
+    rc2, out2 = base.run(capsys, no_pip=True)
+    assert rc == rc2 == 0 and out == out2 and env.prompts == [] and len(sudo_calls(env)) == 1
+
+
+def test_wait_polls_until_empty_then_runs_the_installer(env, capsys):
+    env.live = [two_live(), two_live(), two_live(), (True, [rec(S2)]), (True, [])]
+    env.answers = ["w"]
+    rc, out = env.run(capsys)
+    assert rc == 0 and env.runner.calls[0] == [PY, "-m", "pip", "install", "-U", SPEC]
+    assert "No sessions are running now." in out and "1 agent session is running" in out
+    assert len(env.slept) == 3 and env.execs and env.execs[0][1][-2:] == ["upgrade", "--no-pip"]
+    # the unchanged set printed once at the offer and once by the first poll, not once per poll
+    assert out.count("2 agent sessions are running") == 2
+
+
+def test_the_bound_returns_the_prompt_and_nothing_is_ended(env, capsys):
+    env.live = two_live()
+    env.answers = ["w", "c"]
+    rc, out = env.run(capsys)
+    assert rc == U.EXIT_WAITED_OUT and "30 min passed" in out and len(env.prompts) == 2
+    assert env.now >= 30 * 60
+    nothing_ran(env)
+
+
+def test_end_now_with_leases_live_refuses_and_names_them(env, capsys):
+    """L3 r1 HIGH-1: `end` printed "Ending them now" and went to sudo, where the helper refuses `live-lease`. Levain has
+    no operator verb that ends a session, so it names the ones holding a lease and runs nothing."""
+    env.live = two_live()
+    env.answers = ["e"]
+    rc, out = env.run(capsys)
+    assert rc == 4 and S1 in out and S2 in out and S3 in out and "End these first" in out
+    assert "Ending them now" not in out and "Nothing was changed" in out
+    nothing_ran(env)
+
+
+def test_end_now_proceeds_when_no_lease_is_live(env, capsys):
+    env.live = (True, [rec(S1, lease_live=False), rec(S2, lease_live=False)])
+    env.answers = ["e"]
+    rc, out = env.run(capsys)
+    assert rc == 0 and len(env.runner.calls) == 1 and env.execs
+
+
+def test_end_sessions_flag_refuses_the_same_way(env, capsys):
+    env.live = two_live()
+    rc, out = env.run(capsys, end_sessions=True)
+    assert rc == 4 and "End these first" in out and env.prompts == []
+    nothing_ran(env)
+
+
+def test_a_cancel_at_the_root_gate_says_what_stands(env, capsys, monkeypatch):
+    """L3 r1 HIGH-2: after the installer step, "Nothing was changed" was false. The words come from the phase."""
+    env.live = [(True, []), two_live()]
+    env.answers = ["c"]
+    rc, out = env.run(capsys)
+    assert rc == 0 and env.execs
+    env.live = two_live()
+    assert U._AFTER_INSTALLER in env.exec_envs[0]          # the re-exec carries the phase it is in
+    monkeypatch.setenv(U._AFTER_INSTALLER, env.exec_envs[0][U._AFTER_INSTALLER])
+    rc, out = env.run(capsys, no_pip=True)
+    assert rc == 4 and "Nothing was changed" not in out
+    assert "installer step is not undone" in out and "levain upgrade --no-pip" in out
+    assert sudo_calls(env) == []
+
+
+def test_a_direct_no_pip_cancel_says_nothing_was_changed(env, capsys, monkeypatch):
+    """L3 r2 N1: no installer step ran in this invocation, so the root-gate cancel must not claim one stands."""
+    monkeypatch.delenv(U._AFTER_INSTALLER, raising=False)
+    env.live = two_live()
+    env.answers = ["c"]
+    rc, out = env.run(capsys, no_pip=True)
+    assert rc == 4 and "Nothing was changed" in out and "installer step is not undone" not in out
+    assert sudo_calls(env) == []
+
+
+@pytest.mark.parametrize("how", ["flag", "prompt"])
+def test_end_on_a_status_that_does_not_answer_goes_on_and_says_so(env, capsys, how):
+    """L3 r3 HIGH: a host whose CONTROL is down is repaired by this command. `e` / --end-sessions on a silent STATUS
+    says plainly that it cannot tell and goes on; root refuses by itself under its lock if a lease is live."""
+    env.live = (False, "no control socket")
+    env.answers = ["e"] if how == "prompt" else []
+    rc, out = env.run(capsys, end_sessions=(how == "flag"))
+    assert rc == 0 and "cannot tell" in out and "no control socket" in out
+    assert "Going on: the root step refuses by itself if a session still holds a live lease" in out
+    assert env.execs and len(env.runner.calls) == 1
+
+
+def test_no_control_socket_host_reaches_the_root_step(env, capsys):
+    env.live = (False, "no control socket")
+    rc, out = env.run(capsys, no_pip=True, end_sessions=True)
+    assert rc == 0 and "Going on" in out and len(sudo_calls(env)) == 1
+
+
+def test_a_revoked_or_held_record_with_a_live_lease_counts_in_both_checks():
+    """Root counts lease_live in ANY state; so do both checks."""
+    recs = [rec(S1, state="REVOKED", lease_live=True), rec(S2, state="HELD", lease_live=True),
+            rec(S3, state="HELD", lease_live=False)]
+    agents, own = U._live_split(recs)
+    assert sorted(agents + own) == sorted([S1, S2]) and U._leased(recs) == sorted([S1, S2])
+
+
+def test_off_shape_and_unknown_state_records_count_as_running():
+    agents, own = U._live_split([rec(S1), "junk", {"session": S2, "state": ["x"]}, {"session": S3, "state": "NEW"},
+                                 rec(S1, state="RETAINED", lease_live=False)])
+    assert len(agents) == 4 and not own
+    assert U._live_split([rec(S1, state="HELD", lease_live=False), rec(S2, state="PURGED", lease_live=False)]) == ([], [])
+
+
+def test_wait_on_a_status_that_does_not_answer_prompts_at_once(env, capsys):
+    env.live = (False, "no control socket")
+    env.answers = ["c"]
+    rc, out = env.run(capsys, wait=True)
+    assert rc == 4 and len(env.prompts) == 1 and env.slept == []
+    nothing_ran(env)
+
+
+def test_ctrl_c_outside_the_offer_is_not_exit_4(env, capsys):
+    def boom(argv, **kw):
+        raise KeyboardInterrupt
+
+    env.runner = boom
+    rc, out = env.run(capsys)
+    assert rc == U.EXIT_INTERRUPTED == 130 and "partly applied" in out
+
+
+def test_an_empty_answer_asks_again_and_eof_is_cancel(env, capsys):
+    env.live = two_live()
+    env.answers = ["", "x", "c"]
+    rc, _ = env.run(capsys)
+    assert rc == 4 and len(env.prompts) == 3
+    env.answers = []
+    rc, _ = env.run(capsys)
+    assert rc == 4
+    nothing_ran(env)
+
+
+def test_ctrl_c_while_waiting_is_cancel(env, capsys):
+    env.live = two_live()
+    env.answers = ["w"]
+
+    def boom(secs):
+        raise KeyboardInterrupt
+
+    env.do_sleep = boom
+    rc, out = env.run(capsys)
+    assert rc == 4 and "Cancelled" in out
+    nothing_ran(env)
+
+
+def test_a_status_that_does_not_answer_is_not_zero(env, capsys):
+    env.live = (False, "no control socket")
+    env.answers = ["c"]
+    rc, out = env.run(capsys)
+    assert rc == 4 and "cannot tell" in out and "no control socket" in out and len(env.prompts) == 1
+    nothing_ran(env)
+
+
+def test_a_status_seam_that_raises_is_not_zero(env, capsys):
+    def boom():
+        raise RuntimeError("x")
+
+    env.ask_live = boom
+    env.answers = ["c"]
+    rc, out = env.run(capsys)
+    assert rc == 4 and "cannot tell" in out and "RuntimeError" in out
+    nothing_ran(env)
+
+
+def test_a_session_that_appears_during_the_wait_shows_and_blocks(env, capsys):
+    # the offer sees two, the wait sees none, then one appears before root: the second gate asks again
+    env.live = [two_live(), (True, []), (True, [rec(S1)])]
+    env.answers = ["w", "c"]
+    rc, out = env.run(capsys)
+    assert rc == 0 and env.execs                      # first half done: installer ran, exec'd
+    rc, out = env.run(capsys, no_pip=True)            # the re-exec'd half asks again and finds one
+    assert rc == 4 and S1 in out and sudo_calls(env) == []
+
+
+def test_flags_answer_in_advance_and_pass_through_the_reexec(env, capsys, tmp_path):
+    env.live = [two_live(), (True, [])]
+    rc, out = env.run(capsys, wait=True)
+    assert rc == 0 and env.prompts == [] and env.execs[0][1][-1] == "--wait"
+    e2 = Env(tmp_path / "m")
+    e2.live = [two_live(), (True, [])]
+    rc, out = e2.run(capsys, wait_max=7)
+    assert rc == 0 and e2.execs[0][1][-2:] == ["--wait-max", "7"] and "up to 7 min" in out
+    e3 = Env(tmp_path / "e")
+    e3.live = (True, [rec(S1, lease_live=False)])
+    rc, out = e3.run(capsys, end_sessions=True)
+    assert rc == 0 and e3.prompts == [] and e3.execs[0][1][-1] == "--end-sessions"
+
+
+def test_flags_are_mutually_exclusive():
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    U.register(ap.add_subparsers())
+    for bad in (["upgrade", "--wait", "--end-sessions"], ["upgrade", "--wait-max", "5", "--wait"]):
+        with pytest.raises(SystemExit):
+            ap.parse_args(bad)
+    assert ap.parse_args(["upgrade", "--wait-max", "5"]).wait_max == 5
+
+
+def test_dry_run_names_the_running_sessions_and_asks_nothing(env, capsys):
+    env.live = two_live()
+    rc, out = env.run(capsys, dry_run=True)
+    assert rc == 0 and "running sessions: 2 agent sessions are running" in out and "offer to wait" in out
+    nothing_ran(env)
+    assert env.prompts == []
+    env.live = (False, "no answer in time")
+    rc, out = env.run(capsys, dry_run=True)
+    assert "running sessions: cannot tell" in out
+
+
+def test_a_held_session_still_stops_ahead_of_the_offer(env, capsys):
+    env.held = SimpleNamespace(name="agent held sessions", ok=False, detail="stuck")
+    env.live = two_live()
+    rc, out = env.run(capsys, no_pip=True)
+    assert rc == 3 and env.prompts == [] and "Held sessions" in out
+    nothing_ran(env)

@@ -32,13 +32,27 @@ import shutil
 import stat
 import sys
 import sysconfig
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from levain.slot import SUDO
 
-EXIT_OK, EXIT_REFUSED, EXIT_HELD, EXIT_INTERNAL = 0, 1, 3, 70
+EXIT_OK, EXIT_REFUSED, EXIT_HELD, EXIT_WAITED_OUT, EXIT_INTERNAL = 0, 1, 3, 4, 70
+#: DECISION (1104-29 head ruling 2): the wait's bound, since a session record carries no deadline to read (STATUS
+#: answers ``claims`` without the ticket's facts). When it passes the choice returns to the operator; nothing is ended.
+_WAIT_DEFAULT_MIN = 30
+_POLL_S = 5.0
+_ASK_TRIES = 10
+_ANSWERS = {"w": "wait", "e": "end", "c": "cancel"}
+#: Where the offer runs: before the installer step (a cancel changes nothing) or before the root repair (it does not).
+_PHASE_INSTALLER, _PHASE_ROOT = "installer", "root"
+# Set in the re-exec's environment only: the installer step ran in the invocation that exec'd this one.
+_AFTER_INSTALLER = "LEVAIN_UPGRADE_AFTER_INSTALLER"
+EXIT_INTERRUPTED = 130
+#: The claim kinds that are the operator's own terminal sessions (``levain session``); every other kind is an agent's.
+_OWN_KINDS = frozenset({"interactive", "login"})
 _HELD_ROW = "agent held sessions"
 _STDERR_TAIL = 20
 _PENDING = "levain install-helper: pending:"
@@ -206,7 +220,9 @@ def reexec_env(environ: Optional[Any] = None) -> dict:
     from levain.launch import allowed_env
 
     env = allowed_env(os.environ if environ is None else environ)
-    return _anchored({k: v for k, v in env.items() if not k.startswith("PYTHON") or k in _REEXEC_PYTHON})
+    env = {k: v for k, v in env.items() if not k.startswith("PYTHON") or k in _REEXEC_PYTHON}
+    env[_AFTER_INSTALLER] = "1"
+    return _anchored(env)
 
 
 def _run(argv: Sequence[str], *, env: dict, cwd: str = _NEUTRAL_CWD, capture_stderr: bool = True,
@@ -297,6 +313,17 @@ def _user_site() -> str:
         return ""
 
 
+def _live_sessions(host: str) -> tuple[bool, Any]:
+    """(True, STATUS's records) or (False, why): doctor's own ask, so the answer's shape has one reader."""
+    from levain import doctor
+    from levain.slot import layout
+
+    run = layout.RUN.get(host)
+    if run is None:
+        return False, "no run directory for this host"
+    return doctor._ask_control_status(run, doctor._clock() + doctor._CONTROL_ASK_S)
+
+
 @dataclass
 class Seams:
     host: str = "darwin" if sys.platform == "darwin" else "linux"
@@ -330,6 +357,10 @@ class Seams:
     gen_id: Optional[Callable[[Path, Path], str]] = None
     current_gen: Callable[[str], Optional[str]] = _current_generation
     version: Optional[str] = None
+    live_sessions: Optional[Callable[[], tuple[bool, Any]]] = None     # default: CONTROL's STATUS for this host
+    prompt: Callable[[str], str] = input
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], float] = time.monotonic
 
 
 # --- the checks -------------------------------------------------------------------------------------------------
@@ -438,6 +469,186 @@ def _held_stop(s: Seams, pkg: str) -> Optional[Refusal]:
     return Refusal("\n".join(lines), EXIT_HELD)
 
 
+def _ask_live(s: Seams) -> tuple[bool, Any]:
+    try:
+        ans = (s.live_sessions or (lambda: _live_sessions(s.host)))()
+        if type(ans) is not tuple or len(ans) != 2 or type(ans[0]) is not bool:
+            raise ValueError("shape")
+    except Exception as e:  # noqa: BLE001 - a STATUS that raises is "did not answer", never zero
+        return False, type(e).__name__
+    return ans
+
+
+def _live_split(recs: Any) -> tuple[list[str], list[str]]:
+    """(agent labels, own labels) for the records whose state is live. A record off the shape still counts: an
+    unreadable one is a session that may be running."""
+    from levain.slot import records as R
+    from levain.slot.grammar import SESSION_RE
+
+    agents: list[str] = []
+    own: list[str] = []
+    for r in recs:
+        if type(r) is not dict:
+            agents.append("?")
+            continue
+        st = r.get("state")
+        known = type(st) is str and st in R.STATES      # an unhashable or unknown state is a session that may run
+        if known and st not in R.LIVE_STATES and r.get("lease_live") is not True:
+            continue                # root counts lease_live in ANY state, so a REVOKED or HELD record with one runs
+        sess = r.get("session")
+        claims = r.get("claims")
+        kind = claims.get("kind") if type(claims) is dict else None
+        label = sess if type(sess) is str and SESSION_RE.fullmatch(sess) else "?"
+        (own if kind in _OWN_KINDS else agents).append(label)
+    return sorted(agents), sorted(own)
+
+
+def _live_phrase(agents: list[str], own: list[str]) -> str:
+    def named(xs: list[str]) -> str:
+        return ", ".join(xs[:5]) + (f" and {len(xs) - 5} more" if len(xs) > 5 else "")
+
+    parts = []
+    if agents:
+        parts.append(f"{len(agents)} agent session{'s' if len(agents) != 1 else ''} "
+                     f"{'are' if len(agents) != 1 else 'is'} running ({named(agents)})")
+    if own:
+        parts.append(f"{len(own)} session{'s' if len(own) != 1 else ''} of yours (levain session) "
+                     f"{'are' if len(own) != 1 else 'is'} running ({named(own)})")
+    return ("; ".join(parts) if parts else "") + "."
+
+
+def _choose(s: Seams, minutes: int, why: str) -> str:
+    """'wait' | 'end' | 'cancel'. No default: an empty or unknown answer asks again, and EOF, Ctrl-C or too many
+    wrong answers is cancel."""
+    print(f"{why}")
+    print("The upgrade restarts Levain's services, which ends them. Their work is kept.")
+    print(f"  [w] wait until they finish (up to {minutes} min), then upgrade      "
+          "[e] upgrade now (names any you must end first)      [c] cancel")
+    for _ in range(_ASK_TRIES):
+        try:
+            ans = s.prompt("Choose [w/e/c]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "cancel"
+        if ans in _ANSWERS:
+            return _ANSWERS[ans]
+    return "cancel"
+
+
+def _wait(s: Seams, minutes: int) -> Optional[bool]:
+    """Poll until STATUS answers with nothing live (True), or ``minutes`` pass (False). One line per change in
+    the set. Ctrl-C is None (cancel)."""
+    end = s.clock() + minutes * 60
+    last: Any = None
+    try:
+        while True:
+            ok, recs = _ask_live(s)
+            if ok and type(recs) is list:
+                agents, own = _live_split(recs)
+                if not agents and not own:
+                    print("No sessions are running now.")
+                    return True
+                state: Any = (tuple(agents), tuple(own))
+                line = _live_phrase(agents, own)
+            else:
+                state = ("unknown", str(recs))
+                line = f"Cannot tell whether sessions are running (CONTROL: {recs if type(recs) is str else 'refused'})."
+            if state != last:
+                print(line)
+                last = state
+            if s.clock() >= end:
+                return False
+            s.sleep(_POLL_S)
+    except KeyboardInterrupt:
+        return None
+
+
+def _leased(recs: Any) -> list[str]:
+    """Labels of the records the root repair would refuse (`live-lease`): a live state whose ``lease_live`` is not
+    False. An off-shape record counts, as in :func:`_live_split`."""
+    from levain.slot import records as R
+    from levain.slot.grammar import SESSION_RE
+
+    out: list[str] = []
+    for r in recs:
+        if type(r) is not dict:
+            out.append("?")
+            continue
+        st = r.get("state")
+        if type(st) is str and st in R.STATES and (r.get("lease_live") is False
+                                                   or (st not in R.LIVE_STATES and r.get("lease_live") is not True)):
+            continue
+        sess = r.get("session")
+        out.append(sess if type(sess) is str and SESSION_RE.fullmatch(sess) else "?")
+    return sorted(out)
+
+
+def _cancel_words(phase: str) -> str:
+    """What a cancel changed, by the phase it came in: before the installer nothing; before root the installer step
+    stands and the root side is as it was."""
+    if phase == _PHASE_INSTALLER:
+        return "Nothing was changed."
+    return ("The installer step is not undone and the root side was not updated. "
+            "Run `levain upgrade --no-pip` to finish it.")
+
+
+def _live_offer(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: bool,
+                phase: str = _PHASE_INSTALLER) -> Optional[int]:
+    """The wait offer (1104-29 W1): None to go on, or the exit code of a cancel. Nothing running: silent. A STATUS
+    that does not answer is NOT zero: the same choices are offered. The flags answer the first ask only; when a wait
+    passes its bound the choice returns to the operator. ``phase`` words what a cancel left behind. Levain has no
+    operator verb that ends a session (CONTROL's operator verbs are LEASE-OPEN, STATUS, KEYS-STATUS; END is root's), so
+    "end" goes on only when no session holds a live lease, and otherwise names the ones that must be ended first."""
+    try:
+        return _offer_loop(s, wait, wait_max, end_sessions, phase)
+    except KeyboardInterrupt:
+        print(f"Cancelled. {_cancel_words(phase)}")
+        return EXIT_WAITED_OUT
+
+
+def _offer_loop(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: bool, phase: str) -> Optional[int]:
+    minutes = wait_max if wait_max is not None else _WAIT_DEFAULT_MIN
+    preset: Optional[str] = "end" if end_sessions else "wait" if (wait or wait_max is not None) else None
+    while True:
+        ok, recs = _ask_live(s)
+        answered = ok and type(recs) is list
+        if answered:
+            agents, own = _live_split(recs)
+            if not agents and not own:
+                return None
+            why = _live_phrase(agents, own)
+        else:
+            why = ("Levain cannot tell whether sessions are running (CONTROL did not answer: "
+                   f"{recs if type(recs) is str else 'refused'}).")
+            if preset == "wait":        # a wait on a STATUS that is not answering would burn its bound for nothing
+                preset = None
+        choice = preset or _choose(s, minutes, why)
+        preset = None
+        if choice == "end":
+            if not answered:        # a host whose CONTROL is down is what this command repairs; root decides under its lock
+                print(f"{why} Going on: the root step refuses by itself if a session still holds a live lease.")
+                return None
+            blockers = _leased(recs)
+            if not blockers:
+                return None             # nothing to end that the repair would refuse; root decides under its lock
+            print(f"{why} The root repair refuses while a session's lease is live, and Levain has no command that "
+                  f"ends a session for you. End these first: {', '.join(blockers[:5])}"
+                  f"{f' and {len(blockers) - 5} more' if len(blockers) > 5 else ''} (leave each `levain session` "
+                  "terminal; an agent session ends when its job does), or use --wait.")
+            print(f"Stopped. {_cancel_words(phase)}")
+            return EXIT_WAITED_OUT
+        if choice == "cancel":
+            print(f"Cancelled. {_cancel_words(phase)}")
+            return EXIT_WAITED_OUT
+        print(f"Waiting up to {minutes} min for them to finish (Ctrl-C cancels).")
+        done = _wait(s, minutes)
+        if done is None:
+            print(f"Cancelled. {_cancel_words(phase)}")
+            return EXIT_WAITED_OUT
+        if done:
+            return None
+        print(f"{minutes} min passed and sessions are still running.")
+
+
 def sudo_argv(s: Seams, pkg: str) -> list[str]:
     """Exactly this, with ``pkg`` as Python sees it: not realpath'd, so root's own link refusal still fires. No
     ``-n``, ``-A``, ``-S`` or ``-E``: it can neither hang on stdin nor reach an askpass."""
@@ -450,10 +661,14 @@ def sudo_argv(s: Seams, pkg: str) -> list[str]:
 
 
 def run_upgrade(*, no_pip: bool = False, dry_run: bool = False, verbose: bool = False,
-                seams: Optional[Seams] = None) -> int:
+                seams: Optional[Seams] = None, wait: bool = False, wait_max: Optional[int] = None,
+                end_sessions: bool = False) -> int:
     s = seams or Seams()
     try:
-        return _run_upgrade(s, no_pip, dry_run, verbose)
+        return _run_upgrade(s, no_pip, dry_run, verbose, (wait, wait_max, end_sessions))
+    except KeyboardInterrupt:       # outside the offer (which handles its own): a step may be half done
+        print("Interrupted. The upgrade may be partly applied; run `levain upgrade --no-pip`, then `levain doctor`.")
+        return EXIT_INTERRUPTED
     except Refusal as r:
         print(r.text)
         return r.code
@@ -462,7 +677,8 @@ def run_upgrade(*, no_pip: bool = False, dry_run: bool = False, verbose: bool = 
         return EXIT_INTERNAL
 
 
-def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
+def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool,
+                 offer: tuple[bool, Optional[int], bool] = (False, None, False)) -> int:
     import levain
 
     if s.geteuid() == 0:
@@ -503,6 +719,10 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
         return _dry_run(s, pkg, tool, argv, isolated, uid, no_pip)
 
     if argv is not None:
+        if isolated:        # before the installer: a cancel then means nothing changed at all
+            gone = _live_offer(s, *offer, phase=_PHASE_INSTALLER)
+            if gone is not None:
+                return gone
         print(f"Upgrading levain with {tool} (now {version})")
         rc, _, _ = s.run(argv, env=installer_env(), cwd=_NEUTRAL_CWD, capture_stderr=False)
         if rc != 0:
@@ -519,7 +739,10 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
         except (OSError, ValueError):       # the reader closed (`| head`): the exec must still happen
             pass
         s.execv(s.executable, [s.executable, "-P", "-m", "levain", "upgrade", "--no-pip",
-                               *(["--verbose"] if verbose else [])], reexec_env())
+                               *(["--verbose"] if verbose else []),
+                               *(["--wait"] if offer[0] else []),
+                               *(["--wait-max", str(offer[1])] if offer[1] is not None else []),
+                               *(["--end-sessions"] if offer[2] else [])], reexec_env())
         return EXIT_OK      # only reached where exec is a seam
 
     if not isolated:
@@ -533,6 +756,11 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool) -> int:
     if stop is not None:
         raise stop
     gen = _generation(s, pkg, h11)
+    # The installer step stands only when this is the re-exec of a run that did it; a direct `--no-pip` changed nothing.
+    phase = _PHASE_ROOT if os.environ.get(_AFTER_INSTALLER) == "1" else _PHASE_INSTALLER
+    gone = _live_offer(s, *offer, phase=phase)       # again, just before root: a session may have started since the first ask
+    if gone is not None:
+        return gone
     # No "already current" skip (L3 r1): matching generation and shape say nothing about the other root rows (units,
     # sudoers, membership) that repair re-applies, and three unlocked reads race a repair. Repair is idempotent and
     # decides under its own lock. The cost: every run asks for the password and restarts Levain's services, even
@@ -612,6 +840,14 @@ def _dry_run(s: Seams, pkg: str, tool: Optional[str], argv: Optional[list], isol
     print(f"{_HELD_ROW}: {'none that stop the run' if row is None or row.ok is not False else row.detail}")
     stop = _held_stop(s, pkg)
     gen = _generation(s, pkg, h11)
+    ok, recs = _ask_live(s)
+    if ok and type(recs) is list:
+        agents, own = _live_split(recs)
+        print("running sessions: " + (_live_phrase(agents, own) + f" The upgrade would offer to wait (up to "
+              f"{_WAIT_DEFAULT_MIN} min), go on if none must be ended first, or cancel." if agents or own else "none"))
+    else:
+        print(f"running sessions: cannot tell (CONTROL did not answer: {recs if type(recs) is str else 'refused'}); "
+              "the upgrade would offer the same three choices")
     print(f"package generation now: {gen}; root's current: {s.current_gen(s.host)} "
           "(after the pip step these can change)")
     print(f"sudo: {sudo_argv(s, pkg)}")
@@ -635,4 +871,14 @@ def register(subparsers: Any) -> None:
     p.add_argument("--no-pip", action="store_true", help="Skip the installer step (you already ran it).")
     p.add_argument("--dry-run", action="store_true", help="Print what would run; change nothing.")
     p.add_argument("--verbose", action="store_true", help="Stream the helper's stderr.")
-    p.set_defaults(func=lambda a: run_upgrade(no_pip=a.no_pip, dry_run=a.dry_run, verbose=a.verbose))
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--wait", action="store_true",
+                   help=f"If sessions are running, wait for them to finish (up to {_WAIT_DEFAULT_MIN} minutes), then "
+                        "upgrade. The wait ends in a question, never in a kill.")
+    g.add_argument("--wait-max", type=int, metavar="MINUTES", choices=range(1, 24 * 60 + 1),
+                   help="Like --wait, with your own bound in minutes (1 to 1440).")
+    g.add_argument("--end-sessions", action="store_true",
+                   help="If sessions are running, do not wait: go on when none holds a live lease, else name the "
+                        "ones you must end first (Levain has no command that ends a session for you).")
+    p.set_defaults(func=lambda a: run_upgrade(no_pip=a.no_pip, dry_run=a.dry_run, verbose=a.verbose, wait=a.wait,
+                                              wait_max=a.wait_max, end_sessions=a.end_sessions))
