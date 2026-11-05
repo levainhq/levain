@@ -34,7 +34,9 @@ store: the acceptance never reads it.
 
 Known edge: ``draft-challenge`` writes ``minted`` without the phone's lock, and a second challenge for the same review
 id (sequential or concurrent; the page's ``hbusy`` sends one) replaces the first, so an accept of the first payload is
-refused 422 "not the one this review's challenge was minted for": nothing is signed, and the Sign button is tapped again.
+refused 422 "not the one this review's challenge was minted for" when the two payloads differ (they differ in
+``signed_at``; two challenges on one clock value are identical and the first assertion stays acceptable): nothing is
+signed, and the page refreshes its cards, so the review is read again before the next Sign.
 """
 from __future__ import annotations
 

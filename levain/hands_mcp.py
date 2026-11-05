@@ -24,8 +24,8 @@ handed one refuses.
 
 Known edge: a stock Apple Silicon Homebrew tree (``/opt/homebrew/bin`` and the Cellar) is group-writable by ``admin``,
 so :func:`command_problems` refuses a command under it ("writable by group or world") although it is in
-:data:`TRUSTED_COMMAND_DIRS`. Only a root-owned binary directory can host a stdio server; no shipped verb builds a
-stdio entry yet."""
+:data:`TRUSTED_COMMAND_DIRS`. Only a root- or operator-owned directory outside the operator's home, writable by neither group nor world, can host a
+stdio server; no shipped verb builds a stdio entry yet."""
 from __future__ import annotations
 
 import hashlib
