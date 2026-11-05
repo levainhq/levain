@@ -335,7 +335,8 @@ def _send(text: str) -> dict:
     """The words typed, the box's send pressed by a person (a trusted tap: the passkey door opens only for one), and the
     confirm it draws pressed in the same turn (that click is evaluated; the send's tap is what armed the door)."""
     return {"tap": f"{BOX}.querySelector('.tray-dump-btn')",
-            "before": f"(() => {{ const t = {BOX}.querySelector('.tray-dump-ta'); t.value = {json.dumps(text)}; "
+            "before": f"(() => {{ const x = document.querySelector('#levain-modal .modal-close'); x && x.click(); "
+                      f"const t = {BOX}.querySelector('.tray-dump-ta'); t.value = {json.dumps(text)}; "
                       "t.dispatchEvent(new Event('input')); return 1; })()",
             "after": f"(() => {{ const y = {BOX}.querySelector('.verb-confirm'); if (y) y.click(); return 1; }})()"}
 
