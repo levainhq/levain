@@ -503,7 +503,7 @@ def test_the_cockpit_page_clears_a_yours_to_clear_item_with_the_passkey(tmp_path
             {"until": f"{SIGNED_BTN} && 1", "ms": 30000},
             {"eval": "[...document.querySelectorAll('.review-mine')].map(m => m.textContent)"},
             {"shot": str(shots / "c4mut2_cockpit_before.png"), "full": True},
-            {"eval": f"{SIGNED_BTN}.click() || 1"},
+            {"tap": f"{SIGNED_BTN}"},
             {"until": "[...document.querySelectorAll('[data-ck-verb]')].some(b => b.textContent === 'reopen') && 1",
              "ms": 30000},
             {"shot": str(shots / "c4mut2_cockpit_after.png"), "full": True},
