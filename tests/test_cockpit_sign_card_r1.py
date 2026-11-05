@@ -313,6 +313,8 @@ def test_past_the_listings_cap_the_card_signs_and_a_message_sends(tmp_path, monk
             {"until": STRIP_FACET + " && 1", "ms": 30000, "may_timeout": True},
             {"eval": "[...document.querySelectorAll('#levain-modal .needs-question .sign-option')].map(b => b.textContent)"},
             {"until": BOX + " && 1"},
+            # the focus view closed when it is open: the compose box is under it
+            {"eval": "((x) => (x && x.click(), 1))(document.querySelector('#levain-modal .modal-close'))"},
             _send("past the cap"),
             {"until": CLEARED, "ms": 30000, "may_timeout": True},
             {"eval": BOX_MSG},
