@@ -248,8 +248,20 @@ class GuardedHandler(BaseHTTPRequestHandler):
 
         ⛔ ``isascii()`` IS LOAD-BEARING. ``str.isdigit()`` is True for characters ``int()`` refuses
         (``"²".isdigit()`` is True and ``int("²")`` raises), so a ``Content-Length: ²`` header used to
-        pass the guard and blow up on the next line. RFC 7230 makes Content-Length ASCII digits."""
+        pass the guard and blow up on the next line. RFC 7230 makes Content-Length ASCII digits.
+
+        ⛔ ANY ``Transfer-Encoding`` ON A REQUEST WITH A ``Content-Length`` IS REFUSED (400, close, no body read).
+        No route here reads a chunked body, so a request that also declares one is two framings of the same
+        bytes: the server would read ``Content-Length`` of them and parse the rest as the NEXT request on the
+        kept-alive socket, which a proxy that frames by ``Transfer-Encoding`` reads differently (request
+        smuggling; RFC 9112 6.1 makes the pair an error and requires the close). It is not narrowed to
+        ``chunked``: ``identity`` is not a coding RFC 9112 defines, and any other coding is one this server
+        does not understand. Without a ``Content-Length`` the request is the 411 it always was."""
         raw = self.headers.get("Content-Length")
+        if raw is not None and self.headers.get("Transfer-Encoding") is not None:
+            self._reject(400, "transfer_encoding_refused",
+                         "Transfer-Encoding is not accepted; send a Content-Length body")
+            return None
         if raw is None or not (raw.isascii() and raw.isdigit()):
             self._reject(411, "length_required", "Content-Length required")
             return None
