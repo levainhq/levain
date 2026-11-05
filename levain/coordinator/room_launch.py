@@ -84,6 +84,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple, Optional
 
 from levain.cockpit.consent import parse_stamp
+from levain.consent.adapters import claude_code
 from levain.coordinator import lease
 from levain.coordinator.chat import (ROOM_PERMISSION_MODE, ChatService, ChatStore, Verdict, _launch_state, _open_room,
                                      liveness)
@@ -98,7 +99,7 @@ from levain.coordinator.store import CoordError
 __all__ = [
     "IDLE_SECONDS", "KILL_WAIT", "OPEN_DEADLINE", "RoomCanary", "RoomHandle", "RoomLaunchError", "RoomLauncher",
     "RoomSession", "RoomSetting", "cwd_refusal", "make_probe", "make_tripwires", "room_probe", "room_tripwire_context",
-    "ENV_KEEP", "MANAGED_SETTINGS", "room_env", "settings_scope_refusal",
+    "ENV_KEEP", "MANAGED_PROFILES", "room_env", "settings_scope_refusal",
 ]
 
 # [seat] the open check must finish well inside lease.LAUNCH_TTL (the launch is pending until it does)
@@ -116,12 +117,12 @@ _CANARY_NAME = ".env.levain-room-canary"
 # the scope decoy matches no deny rule: only the outside-the-cwd block can answer it (roomfix1 C2)
 _SCOPE_NAME = "levain-room-scope-canary.txt"
 _SOURCES = ("user_permanent", "config")
-# the settings files a child run with ``--setting-sources user`` still loads outside his user file: the managed (policy)
-# settings, per platform (a seam: a test points it at its own). Each managed-settings.json brings the managed-settings.d
-# drop-ins beside it (:func:`_loaded_settings`). The .plist is the macOS MDM profile's domain (roomfix2 K3, from the L3
-# finding; UNVERIFIED that the claude CLI reads this file: reading one it does not load can only refuse more)
-MANAGED_SETTINGS = ("/Library/Application Support/ClaudeCode/managed-settings.json", "/etc/claude-code/managed-settings.json",
-                    "/Library/Managed Preferences/com.anthropic.claudecode.plist")
+# the managed (policy) settings files a child run with ``--setting-sources user`` still loads outside his user file come
+# from ONE owner, ``consent.adapters.claude_code.managed_settings_files`` (managed-settings.json and the
+# managed-settings.d drop-ins, per platform; host_guard reads through it too; a test patches ITS seam, MANAGED_BASES).
+# The only line the room keeps of its own is the macOS MDM profile (roomfix2 K3, from the L3 finding; the owner does not
+# list it; UNVERIFIED that the claude CLI reads this file: reading one it does not load can only refuse more)
+MANAGED_PROFILES = ("/Library/Managed Preferences/com.anthropic.claudecode.plist",)
 # what of the serve's environment the room's child gets (roomfix1 C3): what a claude CLI needs to find his account, its
 # config and the network, what the room's MCP door (a python child of it) needs to import levain and find its store, and
 # nothing else. A name a caller adds is ``RoomLauncher(env_keep=...)``. XDG_CONFIG_HOME is not kept (roomfix3): no
@@ -158,10 +159,10 @@ def room_env(environ: Mapping[str, str], keep: tuple = ()) -> dict:
 
 
 def settings_scope_refusal(environ: Mapping[str, str], home: str,
-                           managed: Optional[tuple] = None, cwd: Optional[str] = None) -> Optional[str]:
+                           cwd: Optional[str] = None) -> Optional[str]:
     """Why the settings the room's child will load widen its read scope, or None (roomfix1 C2, roomfix2 K2/K3).
     ``--setting-sources user`` still loads his user ``settings.json`` (``$CLAUDE_CONFIG_DIR`` or ``<home>/.claude``) and
-    the managed settings, their ``managed-settings.d`` drop-ins included (:func:`_loaded_settings`). The room refuses to open when any of them names ``permissions.additionalDirectories`` (it adds
+    the managed settings, their ``managed-settings.d`` drop-ins included (listed by the one owner, :func:`_loaded_settings`). The room refuses to open when any of them names ``permissions.additionalDirectories`` (it adds
     directories outside the room's cwd to what its file tools may read) or a path-specific ``permissions.allow`` rule for
     a file tool whose path reaches outside ``cwd`` (:func:`_allow_rule_outside`; a bare ``Read`` allow does not widen
     the scope: the open check's scope decoy was denied on a real claude with one, RETURN_land_room 2026-11-04). A
@@ -175,11 +176,13 @@ def settings_scope_refusal(environ: Mapping[str, str], home: str,
                          "directory and would read its settings from a different place than levain checks; set it absolute",
                          400)
     config = config or os.path.join(home, ".claude")
-    for path, unlisted in _loaded_settings(os.path.join(config, "settings.json"),
-                                           MANAGED_SETTINGS if managed is None else managed):
+    try:
+        loaded = _loaded_settings(os.path.join(config, "settings.json"))
+    except Exception as exc:  # noqa: BLE001 - the owner's listing failed: what the child loads cannot be said, so refuse
+        return _one_line(f"the managed settings files the room's child loads cannot be listed ({type(exc).__name__}); "
+                         "what they add to the room's read scope cannot be said", 400)
+    for path in loaded:
         try:
-            if unlisted is not None:
-                raise unlisted
             if path.endswith(".plist"):
                 with open(path, "rb") as fb:
                     doc = plistlib.load(fb)
@@ -212,30 +215,13 @@ def settings_scope_refusal(environ: Mapping[str, str], home: str,
     return None
 
 
-_DROP_INS = "managed-settings.d"
-
-
-def _loaded_settings(user: str, managed: tuple) -> list:
-    """``(path, error)`` for every settings file the room's child loads: ``user``, each of ``managed``, and, after each
-    ``managed-settings.json``, every ``*.json`` of the ``managed-settings.d`` directory beside it, in name order, hidden
-    files skipped (roomfix3 R3-1: Claude Code merges those drop-ins, with or without the base file,
-    code.claude.com/docs/en/managed-settings.md). A drop-in directory that exists but cannot be listed is one entry
-    whose ``error`` is the listing's, so the check refuses it; a missing one adds nothing."""
-    out = [(user, None)]
-    for path in managed:
-        out.append((path, None))
-        if os.path.basename(path) != "managed-settings.json":
-            continue
-        drop = os.path.join(os.path.dirname(path), _DROP_INS)
-        try:
-            names = sorted(os.listdir(drop))
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            out.append((drop, exc))
-            continue
-        out.extend((os.path.join(drop, n), None) for n in names if n.endswith(".json") and not n.startswith("."))
-    return out
+def _loaded_settings(user: str) -> list:
+    """The path of every settings file the room's child loads: ``user``, the owner's managed files
+    (:func:`levain.consent.adapters.claude_code.managed_settings_files`: managed-settings.json then its
+    managed-settings.d drop-ins, which Claude Code merges with or without the base file, roomfix3 R3-1), then the
+    room's own :data:`MANAGED_PROFILES`. A drop-in directory the owner cannot list comes back as a path itself, so its
+    read fails and the check refuses. The call is made through the owner's module so a test's patch of its seam is seen."""
+    return [user, *(str(p) for p in claude_code.managed_settings_files()), *MANAGED_PROFILES]
 
 
 # the file tools whose path-specific allow rules can widen what the room reads: its own (Read, Grep, Glob) and the edit
