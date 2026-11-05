@@ -180,9 +180,16 @@ ROWS_STATE = ("JSON.stringify({rows: %s.length, drawn: %s.filter(r => r.querySel
               % ((ROWS,) * 5))
 
 
+# history() answers false and draws nothing until the cockpit's first view has arrived, so a single call made the moment the
+# function exists can be a no-op under load and the modal never opens (the same race test_cockpit_dispatch_sheet_page.py closed on
+# CI 11-04). The act-until step repeats this with its wait, and it opens the modal only while none is open, so a repeat never
+# redraws rows that are already being read.
+OPEN_HISTORY = "(document.getElementById('levain-modal') || window.LevainNeeds.history(null)) && 1"
+
+
 def _history_steps(settle: str) -> list[dict]:
     return [DESKTOP, {"until": "window.LevainNeeds && window.LevainNeeds.history && 1", "ms": 30000},
-            {"eval": "window.LevainNeeds.history(null) ? 1 : 0"}, {"until": f"{ROWS}.length === 7 && 1", "ms": 30000},
+            {"do": OPEN_HISTORY, "until": f"{ROWS}.length === 7 && 1", "ms": 30000},
             {"until": settle, "ms": 15000}, {"eval": ROWS_STATE}]
 
 
@@ -240,7 +247,7 @@ def test_a_details_click_during_the_eager_read_draws_one_body(tmp_path: Path, mo
              " r.querySelector('.consent-details').click(); return 1; })()")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         steps = [DESKTOP, {"until": "window.LevainNeeds && window.LevainNeeds.history && 1", "ms": 30000},
-                 {"eval": "window.LevainNeeds.history(null) ? 1 : 0"}, {"until": f"{ROWS}.length === 7 && 1", "ms": 30000},
+                 {"do": OPEN_HISTORY, "until": f"{ROWS}.length === 7 && 1", "ms": 30000},
                  {"eval": click},                                                     # right after the rows drew, eager reads in flight
                  {"until": f"{ROWS}.filter(r => r.querySelector('.consent-body')).length >= 5", "ms": 15000},
                  {"eval": "JSON.stringify({multi: " + ROWS + ".filter(r => r.querySelectorAll('.consent-body').length > 1).length, rowsstate: 1})"}]
@@ -305,8 +312,8 @@ def test_a_rejected_eager_read_leaves_the_details_button_working(tmp_path: Path,
     real = "window.__h = window.LevainCockpitTransport.headers"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         steps = [DESKTOP, {"until": "window.LevainNeeds && window.LevainNeeds.history && 1", "ms": 30000},
-                 {"eval": real + "; window.LevainCockpitTransport.headers = () => { if (new Error().stack.includes('questionBody')) throw new Error('boom'); return window.__h(); }; window.LevainNeeds.history(null) ? 1 : 0"},
-                 {"until": f"{ROWS}.length === 7 && 1", "ms": 30000},
+                 {"eval": real + "; window.LevainCockpitTransport.headers = () => { if (new Error().stack.includes('questionBody')) throw new Error('boom'); return window.__h(); }; 1"},
+                 {"do": OPEN_HISTORY, "until": f"{ROWS}.length === 7 && 1", "ms": 30000},
                  {"eval": "window.LevainCockpitTransport.headers = window.__h; " + ROWS + ".find(r => r.querySelector('.consent-details')).querySelector('.consent-details').click(); 1"},
                  {"until": f"{ROWS}.some(r => r.querySelector('.consent-body')) && 1", "ms": 15000},
                  {"eval": ROWS_STATE}]
