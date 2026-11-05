@@ -1189,7 +1189,9 @@
     if (d.pid === "decisions" && n && N && Array.isArray(d.lines)) {
       const items = N.items(d.lines);
       if (items.length) {
-        host.appendChild(el("div", "sub glance-top", N.name(items[0])));
+        const top = el("div", "sub glance-top", N.name(items[0]));
+        top._needsItem = items[0];     // a name learned after this paint (a question's words are fetched) is painted into this node (dashboard_core.js repaintNeedsNames)
+        host.appendChild(top);
         host.appendChild(el("div", "sub glance-sum", N.summary(items)));
       }
       return;
