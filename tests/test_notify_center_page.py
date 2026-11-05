@@ -94,6 +94,13 @@ OPENED = {"until": f"{ROWS}.length >= 6 && 1", "ms": 30000}
 SETTLE = {"eval": "new Promise(r => setTimeout(r, 400)).then(() => 1)"}
 
 
+def _strip_drawn_at(width: int) -> dict:
+    """Wait for the real condition the layout read depends on: the viewport really is `width` wide and the strip's rule for it has applied
+    (display flex). Without it the read can land after the emulation or the page's `body.ke` class but before the style recalculation."""
+    return {"until": f"(() => {{ const s = document.querySelector('#ck-phonetabs'); return s && innerWidth === {width}"
+                     f" && getComputedStyle(s).display === 'flex' && 1; }})()", "ms": 30000}
+
+
 def _row(title: str, sub: str = "") -> str:
     return f"[...{ROWS}].find(r => r.querySelector('.nc-title').textContent === {json.dumps(title)})" + (f".querySelector('{sub}')" if sub else "")
 
@@ -117,8 +124,8 @@ def test_the_strip_draws_at_every_width_with_its_unread_count_and_opens_the_cent
         r.seed(port)
         total, unread = len(_center(port)["items"]), _center(port)["unread"]
         out = _drive(tmp_path, _url(port), [
-            {"emulate": {"w": 1280, "h": 900, "dpr": 1}}, _ready(unread), {"eval": layout},
-            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, SETTLE, {"eval": layout},
+            {"emulate": {"w": 1280, "h": 900, "dpr": 1}}, _ready(unread), _strip_drawn_at(1280), {"eval": layout},
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, _strip_drawn_at(390), {"eval": layout},
             OPEN, OPENED, {"eval": opened}, {"eval": filtered}])
     wide, narrow, op, fl = _json(out)
     for lay in (wide, narrow):
