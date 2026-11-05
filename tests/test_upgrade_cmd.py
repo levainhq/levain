@@ -809,17 +809,39 @@ def test_end_sessions_flag_refuses_the_same_way(env, capsys):
     nothing_ran(env)
 
 
-def test_a_cancel_at_the_root_gate_says_what_stands(env, capsys):
+def test_a_cancel_at_the_root_gate_says_what_stands(env, capsys, monkeypatch):
     """L3 r1 HIGH-2: after the installer step, "Nothing was changed" was false. The words come from the phase."""
     env.live = [(True, []), two_live()]
     env.answers = ["c"]
     rc, out = env.run(capsys)
     assert rc == 0 and env.execs
     env.live = two_live()
+    assert U._AFTER_INSTALLER in env.exec_envs[0]          # the re-exec carries the phase it is in
+    monkeypatch.setenv(U._AFTER_INSTALLER, env.exec_envs[0][U._AFTER_INSTALLER])
     rc, out = env.run(capsys, no_pip=True)
     assert rc == 4 and "Nothing was changed" not in out
     assert "installer step is not undone" in out and "levain upgrade --no-pip" in out
     assert sudo_calls(env) == []
+
+
+def test_a_direct_no_pip_cancel_says_nothing_was_changed(env, capsys, monkeypatch):
+    """L3 r2 N1: no installer step ran in this invocation, so the root-gate cancel must not claim one stands."""
+    monkeypatch.delenv(U._AFTER_INSTALLER, raising=False)
+    env.live = two_live()
+    env.answers = ["c"]
+    rc, out = env.run(capsys, no_pip=True)
+    assert rc == 4 and "Nothing was changed" in out and "installer step is not undone" not in out
+    assert sudo_calls(env) == []
+
+
+@pytest.mark.parametrize("how", ["flag", "prompt"])
+def test_end_on_a_status_that_does_not_answer_is_unknown_not_zero(env, capsys, how):
+    """L3 r2 N2: `e` / --end-sessions on a silent STATUS went on to root; it is unknown, so it stops and says so."""
+    env.live = (False, "no control socket")
+    env.answers = ["e"] if how == "prompt" else []
+    rc, out = env.run(capsys, end_sessions=(how == "flag"))
+    assert rc == 4 and "cannot tell" in out and "no control socket" in out
+    nothing_ran(env)
 
 
 def test_off_shape_and_unknown_state_records_count_as_running():

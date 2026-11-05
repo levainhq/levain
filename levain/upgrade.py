@@ -48,6 +48,8 @@ _ASK_TRIES = 10
 _ANSWERS = {"w": "wait", "e": "end", "c": "cancel"}
 #: Where the offer runs: before the installer step (a cancel changes nothing) or before the root repair (it does not).
 _PHASE_INSTALLER, _PHASE_ROOT = "installer", "root"
+# Set in the re-exec's environment only: the installer step ran in the invocation that exec'd this one.
+_AFTER_INSTALLER = "LEVAIN_UPGRADE_AFTER_INSTALLER"
 EXIT_INTERRUPTED = 130
 #: The claim kinds that are the operator's own terminal sessions (``levain session``); every other kind is an agent's.
 _OWN_KINDS = frozenset({"interactive", "login"})
@@ -218,7 +220,9 @@ def reexec_env(environ: Optional[Any] = None) -> dict:
     from levain.launch import allowed_env
 
     env = allowed_env(os.environ if environ is None else environ)
-    return _anchored({k: v for k, v in env.items() if not k.startswith("PYTHON") or k in _REEXEC_PYTHON})
+    env = {k: v for k, v in env.items() if not k.startswith("PYTHON") or k in _REEXEC_PYTHON}
+    env[_AFTER_INSTALLER] = "1"
+    return _anchored(env)
 
 
 def _run(argv: Sequence[str], *, env: dict, cwd: str = _NEUTRAL_CWD, capture_stderr: bool = True,
@@ -619,7 +623,11 @@ def _offer_loop(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: boo
         choice = preset or _choose(s, minutes, why)
         preset = None
         if choice == "end":
-            blockers = _leased(recs) if answered else []
+            if not answered:        # unknown is not zero: nothing says no lease is live
+                print(f"{why} Levain will not go on to root without knowing. Try again, or use --wait.")
+                print(f"Stopped. {_cancel_words(phase)}")
+                return EXIT_WAITED_OUT
+            blockers = _leased(recs)
             if not blockers:
                 return None             # nothing to end that the repair would refuse; root decides under its lock
             print(f"{why} The root repair refuses while a session's lease is live, and Levain has no command that "
@@ -748,7 +756,9 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool,
     if stop is not None:
         raise stop
     gen = _generation(s, pkg, h11)
-    gone = _live_offer(s, *offer, phase=_PHASE_ROOT)       # again, just before root: a session may have started since the first ask
+    # The installer step stands only when this is the re-exec of a run that did it; a direct `--no-pip` changed nothing.
+    phase = _PHASE_ROOT if os.environ.get(_AFTER_INSTALLER) == "1" else _PHASE_INSTALLER
+    gone = _live_offer(s, *offer, phase=phase)       # again, just before root: a session may have started since the first ask
     if gone is not None:
         return gone
     # No "already current" skip (L3 r1): matching generation and shape say nothing about the other root rows (units,
