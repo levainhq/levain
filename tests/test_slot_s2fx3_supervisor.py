@@ -524,8 +524,9 @@ def test_a_launch_with_a_claude_route_lacking_the_token_host_is_refused_before_a
     r2 = g3rig(tmp_path / "b", monkeypatch, FAKE_START="idunr", FAKE_STATUS=unr)    # the rig's claude-sub has the host
     assert r2.run(auth="passthrough") == 1
     said2 = _said(r2)
-    assert ("the Claude binary gave no answer about slot 0's sign-in; nothing was launched; run `levain doctor` or "
-            "try again, and if it repeats, sign in again") in said2
+    assert ("the Claude binary gave no usable answer about slot 0's sign-in (it did not answer in time, or it is "
+            "older than Levain accepts); nothing was launched; run `levain doctor` or try again, and if it repeats, "
+            "sign in again") in said2
     assert "sign-in server" not in said2 and "stored login is kept" not in said2
 
 
@@ -591,7 +592,7 @@ def test_codex_line_is_printed_before_start_for_codex_interactive_passthrough(
     r = _codex_rig(tmp_path, monkeypatch, "chatgpt.com")
     SV.Supervisor(SV.Request(vendor="codex", repo=r.repo, auth="passthrough"), r.seams).run()
     err = r.stderr()
-    line = ("Codex has no server-checked identity, so Levain cannot tell which account this slot's stored login "
+    line = ("Levain reads no account for Codex, so it cannot tell which account this slot's stored login "
             "belongs to (not a check).")
     assert line in err and err.index(line) < err.index("codex exited")
     assert [v["verb"] for v in r.verbs()].index("start") >= 0
@@ -603,13 +604,13 @@ def test_codex_line_is_not_printed_for_other_sessions(tmp_path: Path, monkeypatc
         (tmp_path / d).mkdir()
     r = _codex_rig(tmp_path / "a", monkeypatch, "api.openai.com")
     SV.Supervisor(SV.Request(vendor="codex", repo=r.repo, auth="brokered"), r.seams).run()
-    assert "codex exited" in r.stderr() and "Codex has no server-checked" not in r.stderr()
+    assert "codex exited" in r.stderr() and "Levain reads no account for Codex" not in r.stderr()
     r = _codex_rig(tmp_path / "b", monkeypatch, "chatgpt.com")
     SV.Supervisor(SV.Request(vendor="codex", repo=r.repo, auth="passthrough", kind="login"), r.seams).run()
-    assert "codex exited" in r.stderr() and "Codex has no server-checked" not in r.stderr()
+    assert "codex exited" in r.stderr() and "Levain reads no account for Codex" not in r.stderr()
     r = rig(tmp_path / "c", monkeypatch)
     r.run(auth="passthrough")
-    assert "claude exited" in r.stderr() and "Codex has no server-checked" not in r.stderr()
+    assert "claude exited" in r.stderr() and "Levain reads no account for Codex" not in r.stderr()
 
 
 # --- g4-8: the prepare answer, whole ------------------------------------------------------------------------------------

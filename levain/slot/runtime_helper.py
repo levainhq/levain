@@ -1533,7 +1533,8 @@ def base_route_types(store: Store) -> Dict[str, str]:
 @dataclass(frozen=True)
 class SlotView:
     """What the pick reads of one slot under the pool lock: its state file, which vendors' credential ``keep/``
-    holds (by name: §2.1 keep files are moved, never opened), and its baseline's vendor (``"?"`` when the file
+    holds (by name: §2.1 keep's credential files are moved, never opened; root's account record there is read only
+    by :func:`read_identity_seed`), and its baseline's vendor (``"?"`` when the file
     exists but does not parse; ``None`` when absent)."""
 
     state: Optional[R.SlotState]
@@ -2173,6 +2174,9 @@ def read_identity_seed(ctx: Ctx, a: R.Alloc) -> Optional[Dict[str, object]]:
             if not chunk:
                 break
             buf += chunk
+    except OSError as e:
+        # identfix F-B (gemini): an fstat or read fault is this function's own refusal, never a raw OSError
+        raise Refused("bad-identity-seed", f"read: {e.strerror or e}") from None
     finally:
         os.close(fd)
     if len(buf) > E.IDENTITY_SEED_MAX_BYTES:
@@ -2207,7 +2211,10 @@ def render_facts(ctx: Ctx, alloc: R.Alloc, blob: RenderBlob) -> RD.RenderFacts:
         term = None
     route_types, route_hosts = base_routes(ctx.store)
     # identseed: a gated Claude session's .claude.json carries the slot's parked account block (absent: render seeds
-    # nothing and start's gate refuses identity-seed-missing before any move)
+    # nothing and start's gate refuses identity-seed-missing before any move). `egress and` drops no gated session:
+    # identity_gated needs auth passthrough, and prepare refuses any auth but none on a none-class slot
+    # (runtime_grammar class-auth-mismatch), so every gated session is egress (identfix F-C; pinned in
+    # tests/test_slot_identseed.py).
     account = None
     if egress and alloc.vendor in RD.SEEDED_VENDORS and identity_gated(alloc):
         rec = read_identity_seed(ctx, alloc)

@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from levain.contracts import canon
+from levain.slot import Refused
 from levain.slot import end as E
 from levain.slot import identity_child as IC
 from levain.slot import render as RD
@@ -425,3 +426,80 @@ def test_a_crash_around_the_record_converges(tmp_path, point):
     assert end_session(w.facts, w.seams(ctl), record_state=ctl.state, failed_step=ctl.failed_step) == RETAINED
     assert _seed_at(w)["organizationUuid"] == ORG and (w.facts.keep / ".credentials.json").exists()
     assert sorted(os.listdir(w.facts.keep)) == [".credentials.json", E.IDENTITY_SEED_NAME]
+
+
+# --- identfix (L1 + L3 r1 on 54cb907b) ------------------------------------------------------------------------------
+
+#: F-A: a lone surrogate, as ``json.loads`` admits it from ``"\ud800"`` (the slot writes its own .claude.json)
+_SURROGATE_BLOCKS = {
+    "emailAddress": {"emailAddress": "a\ud800@x", "organizationUuid": ORG},
+    "organizationName": {"emailAddress": EMAIL, "organizationUuid": ORG, "organizationName": "x\udfff"},
+    "organizationUuid": {"emailAddress": EMAIL, "organizationUuid": ORG[:-1] + "\ud800"},
+}
+
+
+@pytest.mark.parametrize("field", sorted(_SURROGATE_BLOCKS))
+def test_a_lone_surrogate_in_any_kept_field_is_no_usable_block(field):
+    """F-A (complement MED, codex HIGH, L1 F3 reproduced): before the fix the email and name cases passed
+    ``check_seed_block`` and ``identity_seed_bytes`` then raised ``UnicodeEncodeError``."""
+    assert E.check_seed_block(_SURROGATE_BLOCKS[field]) is None
+
+
+@pytest.mark.parametrize("field", ["emailAddress", "organizationName"])
+def test_a_lone_surrogate_in_the_login_config_parks_the_credential_and_drops_the_record(tmp_path, field):
+    """F-A end to end: END retains (never HELD at park), the credential is parked, an older record is dropped, so
+    the next session refuses ``identity-seed-missing`` by name."""
+    cfg = {"hasCompletedOnboarding": True, "oauthAccount": _SURROGATE_BLOCKS[field]}
+    assert "\\ud" in json.dumps(cfg)                         # the file carries the JSON escape, as a slot could write
+    w = _end_login(tmp_path, cfg, parked=b"{}", seed=_old_seed(), yes=True)
+    assert _seed_at(w) is None and (w.facts.keep / ".credentials.json").exists()
+
+
+@pytest.mark.parametrize("vendor", [[], {}, 3, None])
+def test_a_record_naming_a_non_string_vendor_is_bad_identity_seed(vendor):
+    """F-B (codex LOW): ``"vendor":[]`` raised ``TypeError: unhashable type`` before the fix."""
+    with pytest.raises(Refused) as e:
+        E.check_identity_seed({"format": E.IDENTITY_SEED_FORMAT, "vendor": vendor, "session": "s-0123456789abcdef",
+                               "account": {"emailAddress": EMAIL, "organizationUuid": ORG}})
+    assert e.value.name == "bad-identity-seed"
+
+
+def test_a_read_fault_on_the_record_is_bad_identity_seed(env, monkeypatch):
+    """F-B (gemini LOW): an OSError from the record's read is the reader's own refusal, never a raw OSError."""
+    w, la = env
+    w.give_credential(E0, "claude")
+    s = _prepared(w, "egress", "interactive", "claude", "passthrough")
+    w.session = s
+    real_read = os.read
+    first = E.IDENTITY_SEED_MAX_BYTES + 1                    # the reader's first request; nothing else asks for it
+
+    def read(fd, n):
+        if n == first:
+            raise OSError(5, "injected")
+        return real_read(fd, n)
+    monkeypatch.setattr(os, "read", read)
+    line = w.main(["render", s], _blob(vendor="claude", routes=PASS))[1]
+    assert line["refused"] == "bad-identity-seed", line
+
+
+def test_every_identity_gated_session_is_egress_class():
+    """F-C (complement LOW, gemini MED): render seeds only ``if egress and ... identity_gated``; start's gate has no
+    egress term. That holds only while no passthrough session can be prepared on a none-class slot: prepare's
+    grammar refuses ``class-auth-mismatch``. Every (caller, class, kind, vendor, auth) prepare that parses is checked,
+    so a grammar change that lets a gated session reach a none-class slot turns this red."""
+    from levain.slot import runtime_grammar as G
+    parsed_none = 0
+    for caller in G.CALLERS:
+        for cls in ("egress", "none"):
+            for kind in G.KINDS:
+                for vendor in G.VENDORS:
+                    for auth in G.AUTHS:
+                        try:
+                            req = G.parse_runtime_argv(["prepare", cls, kind, vendor, auth],
+                                                       configured_slots={"egress": 8, "none": 2}, caller=caller)
+                        except Refused:
+                            continue
+                        if req.slot_class == "none":
+                            parsed_none += 1
+                            assert req.auth != "passthrough", req
+    assert parsed_none > 0                                     # the none class is reachable at all

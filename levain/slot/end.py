@@ -35,7 +35,10 @@ tree, and any inode a session uid does not own whatever its link count, is hashe
 copied) by a reader dropped to a session uid, and one that uid cannot read is recorded and never copied;
 root never reads such an inode's metadata. ONE classification (:func:`classify`), computed by the manifest
 step and stored beside it, is what the meta and tree steps read. Metadata, strip and chown address every
-entry from its walk dirfd, never by a full path (L2 M2).
+entry from its walk dirfd, never by a full path (L2 M2). The one session-tree file root opens itself is a login
+session's vendor config, read at park for the account record (:func:`seed_from_tree`): only when it is regular, has one link and is
+owned by the slot uid (so its bytes are the slot's own), opened with ``O_NOFOLLOW``, size-capped and parsed as
+untrusted data.
 
 Every root-only act is an injected seam with a real default: the freeze, kill and process proof
 (the defaults here refuse, which lands HELD; the real ones are :func:`levain.slot.proc.end_seams`'s),
@@ -2285,23 +2288,35 @@ def _set_aside(facts: EndFacts, sfd: int, src: Path, name: bytes, dest: Path, oc
 # The claim string stays "local-data" (identity_child.CLAIM). The parked record is a LABEL: it names the account the
 # login recorded; it does not tell which account the credential belongs to, and it does not see an expired login.
 
+def _utf8(s: str) -> bool:
+    """``s`` encodes as UTF-8 (no lone surrogate: ``json.loads`` admits ``"\\ud800"``, the record's canonical bytes
+    cannot hold it)."""
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def check_seed_block(block: object) -> dict[str, object] | None:
     """The whitelisted account block (:data:`IDENTITY_SEED_KEYS` only) when ``block`` is a dict whose
     ``organizationUuid`` is a UUID string, whose ``emailAddress`` is a string of 1-320 characters holding ``@`` with no
     NUL and no edge whitespace (the identity child's own email rule), and whose ``organizationName``, when present, is
-    a string of at most 256 characters with no NUL, or null; else None. Every other key is dropped, never checked."""
+    a string of at most 256 characters with no NUL, or null; the email and the name encode as UTF-8 (identfix F-A: a
+    lone surrogate the slot wrote would otherwise pass here and fail the record's encoding at park); else None. Every
+    other key is dropped, never checked."""
     if type(block) is not dict:
         return None
     org, email = block.get("organizationUuid"), block.get("emailAddress")
-    if not (type(org) is str and _SEED_UUID_RE.fullmatch(org)):
+    if not (type(org) is str and _SEED_UUID_RE.fullmatch(org)):    # ASCII by the pattern: no surrogate passes
         return None
     if not (type(email) is str and 0 < len(email) <= 320 and "@" in email and "\0" not in email
-            and email.strip() == email):
+            and email.strip() == email and _utf8(email)):
         return None
     out: dict[str, object] = {"emailAddress": email, "organizationUuid": org}
     if "organizationName" in block:
         name = block["organizationName"]
-        if not (name is None or (type(name) is str and len(name) <= 256 and "\0" not in name)):
+        if not (name is None or (type(name) is str and len(name) <= 256 and "\0" not in name and _utf8(name))):
             return None
         out["organizationName"] = name
     return out
@@ -2313,7 +2328,7 @@ def check_identity_seed(obj: object) -> dict[str, object]:
     if type(obj) is not dict or set(obj) != {"format", "vendor", "session", "account"} \
             or obj["format"] != IDENTITY_SEED_FORMAT:
         raise Refused("bad-identity-seed", "keys or format")
-    if obj["vendor"] not in IDENTITY_SEED_SOURCE:
+    if type(obj["vendor"]) is not str or obj["vendor"] not in IDENTITY_SEED_SOURCE:
         raise Refused("bad-identity-seed", "vendor")
     if type(obj["session"]) is not str or not SESSION_RE.fullmatch(obj["session"]):
         raise Refused("bad-identity-seed", "session")
@@ -2403,8 +2418,13 @@ def _park_seed(facts: EndFacts, dfd: int, kfd: int, fault: Fault,
 
 def park_move(facts: EndFacts, *, owner_ok: Callable[[os.stat_result], bool] = _root_owned,
               fault: Fault = _no_fault, seed_owner_ok: "Callable[[os.stat_result], bool] | None" = None) -> None:
-    """Move the session vendor's credential file to ``keep/`` by rename, never opening it, on a
+    """Move the session vendor's credential file to ``keep/`` by rename, never opening the credential, on a
     passthrough session only (L1-F1): on any other, a file at a credential path is ordinary work, retained.
+    A ``login`` session's park first opens and reads one other file as root, the session's vendor config
+    (:func:`_park_seed` -> :func:`seed_from_tree`: no-follow, regular, one link, slot-owned, size-capped, parsed as
+    untrusted data), and writes or unlinks ``keep/``'s account record from it, after any set-aside and BEFORE the credential
+    rename: a death between the two leaves the new record in ``keep/`` and the new credential still in the session
+    tree, and the redo writes the same record again and parks.
     Only a non-directory is moved; absent = already parked or never made. A ``keep/`` entry already there
     is never replaced (``keep-occupied``, HELD park), so a planted file cannot overwrite a parked login;
     ``keep/`` is root-only, so the check and the rename cannot race. The one exception is a

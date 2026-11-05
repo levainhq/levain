@@ -639,9 +639,14 @@ _AUTH_ROUTE = {"brokered": "brokered", "passthrough": "subscription_passthrough"
 _TOKEN_HOST = IC.TOKEN_ORIGIN[1]
 #: the host the Claude identity child's profile call goes to (:data:`levain.slot.identity_child.ORIGIN`)
 _PROFILE_HOST = IC.ORIGIN[1]
-#: every host the vendor binary reaches through the passthrough route's tunnel for the identity check, each with what
-#: needs it (the label strings are quoted in the refusal text and are pinned, so they keep their wording)
-_IDENTITY_HOSTS = ((_TOKEN_HOST, "the login refresh"), (_PROFILE_HOST, "the login check"))
+#: the hosts a Claude passthrough route must carry, each with what reaches it (quoted in the refusal text and pinned).
+#: Levain's identity child makes no request to either: the Claude binary's own traffic goes there through the route's
+#: tunnel. Whether `claude auth status` itself needs them is not measured, so the requirement stays (identfix F-D2).
+_IDENTITY_HOSTS = ((_TOKEN_HOST, "the Claude binary's own token refresh"),
+                   (_PROFILE_HOST, "the Claude binary's API traffic"))
+#: said before a Codex interactive passthrough session starts (a module constant so the identwords pin reads it)
+CODEX_NO_ACCOUNT_SAID = ("Levain reads no account for Codex, so it cannot tell which account this slot's stored "
+                         "login belongs to (not a check).")
 _ROUTE_ID_SAID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
 
 
@@ -679,8 +684,8 @@ def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str, *, eg
     route = mine[0]
     if vendor == "claude" and auth == "passthrough":
         # 1029 ruling (np-e5b2ebed (a)): refuse at route load and name the hosts; never merge a host into his route.
-        # The vendor binary's own token refresh goes to the token host and its profile call to the profile host, both
-        # through this route's tunnel, so a route without either makes every launch fail its identity check.
+        # The Claude binary's own token refresh goes to the token host and its API traffic to the profile host, both
+        # through this route's tunnel; a route without either leaves the binary unable to reach them.
         hs = _hosts(route)
         missing = [(h, why) for h, why in _IDENTITY_HOSTS if h not in hs]
         if missing:
@@ -1414,8 +1419,7 @@ class Supervisor:
             self._launch_probe(session)
             self._check()
             if self.req.auth == "passthrough" and self.req.kind == "interactive" and self.req.vendor == "codex":
-                self.say("Codex has no server-checked identity, so Levain cannot tell which account this slot's "
-                         "stored login belongs to (not a check).")
+                self.say(CODEX_NO_ACCOUNT_SAID)
             ok = self._start(session)
             if not ok and self._start_refused == "identity-changed":
                 self._identity_refused(session)
@@ -1565,10 +1569,11 @@ class Supervisor:
                 pass
 
     def _identity_unreachable(self, session: str) -> None:
-        """``start`` refused ``identity-unreachable`` (the Claude binary did not answer in time, or is too old): routed
-        like :meth:`_identity_expired`, so the retry text is said only when root's ``status`` record also says
-        ``identity-unreachable``. The record carries no detail, so the text claims neither a cause nor a kept login;
-        it tells him to retry and, only if that repeats, to sign in again."""
+        """``start`` refused ``identity-unreachable`` (the Claude binary did not answer in time, or is older than the
+        identity child accepts, ``binary-too-old``): routed like :meth:`_identity_expired`, so the text is said only
+        when root's ``status`` record also says ``identity-unreachable``. The record carries no detail, so the text
+        names both causes and claims no kept login: an old binary needs `levain doctor`, a timeout a retry, and only
+        a repeat a new sign-in."""
         neutral = ("start refused identity-unreachable, but root's record could not be read ({why}). "
                    "Nothing was launched.")
         try:
@@ -1581,8 +1586,9 @@ class Supervisor:
                 self.say("start refused identity-unreachable, but root's record does not say so. "
                          "Nothing was launched.")
                 return
-            self.say(f"the Claude binary gave no answer about slot {self._slot_index}'s sign-in; nothing was launched; "
-                     "run `levain doctor` or try again, and if it repeats, sign in again")
+            self.say(f"the Claude binary gave no usable answer about slot {self._slot_index}'s sign-in (it did not "
+                     "answer in time, or it is older than Levain accepts); nothing was launched; run `levain doctor` "
+                     "or try again, and if it repeats, sign in again")
         except Exception as e:   # noqa: BLE001 - said, never raised over the teardown that follows
             try:
                 self.say(neutral.format(why=type(e).__name__))
@@ -1603,7 +1609,7 @@ class Supervisor:
                      "its login; root's record does not name an account, so none is shown. Nothing was launched.")
             return
         n = self._slot_index
-        self.say(f"slot {n}'s stored {name} login now names account {oid} (read from the Claude binary's local "
+        self.say(f"slot {n}'s stored {name} login now names account {oid} (read from the {name} binary's local "
                  f"data; Levain does not check it with the server), not the account recorded at this slot's login. "
                  f"Nothing was launched. To use another account on "
                  f"this slot, sign in again: levain session {vendor} "
@@ -1638,13 +1644,14 @@ class Supervisor:
             return
         name = {"claude": "Claude", "codex": "Codex"}.get(self.req.vendor, self.req.vendor)
         if oid == NOT_A_CHECK:
-            prompt = (f"levain: {name} has no server-validated identity call, so this login is recorded as not a "
-                      f"check: Levain cannot tell which account it is. Record it as this slot's {name} account "
+            prompt = (f"levain: Levain reads no account for {name}, so this login is recorded as not a check: "
+                      f"Levain cannot tell which account it is. Record it as this slot's {name} account "
                       "label? [y/N] ")
         else:
             prompt = (f"levain: this sign-in names {name} account {oid}. Levain will record that as this slot's "
-                      f"{name} account label; a later session whose sign-in names another account is refused. It "
-                      "does not check which account the login belongs to. Record it? [y/N] ")
+                      f"{name} account label. Levain does not see which account the stored login belongs to; a "
+                      "later session is refused only if the account it reports differs from the recorded one. "
+                      "Record it? [y/N] ")
         if self.req.dispatch:
             prompt = prompt.replace(" [y/N] ", f" A yes also lets unattended runs (dispatch) use this {name} login. [y/N] ")
         answer = (self.s.confirm or self._ask)(prompt)

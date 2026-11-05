@@ -655,7 +655,7 @@ def test_claude_passthrough_route_without_the_token_host_is_refused_naming_it() 
         SV.pick_routes(_lacking("claude.ai", "api.anthropic.com"), "claude", "passthrough")
     assert e.value.name == "passthrough-route-lacks-token-host"
     assert e.value.detail == ("add platform.claude.com to the hosts of route claude-sub in the base map: "
-                              "the login refresh needs it")
+                              "the Claude binary's own token refresh needs it")
     ok = SV.pick_routes(_lacking("claude.ai", "api.anthropic.com", "platform.claude.com"), "claude", "passthrough")
     assert ok == ("github", "pypi", "claude-sub")
     assert SV._PROFILE_HOST == "api.anthropic.com" and SV._TOKEN_HOST == "platform.claude.com"
@@ -663,7 +663,8 @@ def test_claude_passthrough_route_without_the_token_host_is_refused_naming_it() 
         SV.pick_routes(_lacking("claude.ai"), "claude", "passthrough")
     assert e.value.name == "passthrough-route-lacks-token-host"
     assert e.value.detail == ("add platform.claude.com and api.anthropic.com to the hosts of route claude-sub in the "
-                              "base map: the login refresh and the login check need them")
+                              "base map: the Claude binary's own token refresh and the Claude binary's API traffic "
+                              "need them")
 
 
 def test_a_token_host_only_claude_passthrough_route_is_refused_naming_the_profile_host() -> None:
@@ -673,7 +674,7 @@ def test_a_token_host_only_claude_passthrough_route_is_refused_naming_the_profil
         SV.pick_routes(_lacking("platform.claude.com"), "claude", "passthrough")
     assert e.value.name == "passthrough-route-lacks-token-host"
     assert e.value.detail == ("add api.anthropic.com to the hosts of route claude-sub in the base map: "
-                              "the login check needs it")
+                              "the Claude binary's API traffic needs it")
 
 
 def test_the_token_host_check_reads_the_selected_route_not_an_entry_sharing_its_id() -> None:

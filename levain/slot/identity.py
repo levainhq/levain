@@ -2,7 +2,7 @@
 IG-2, IG-3, IG-4 G1): the per-vendor identity call, the observed id root records for a ``login`` session, and the
 baseline ``confirm-identity yes`` writes.
 
-* The identity call (:func:`identity_call`): one function per vendor. Codex has no server-validated call, so its
+* The identity call (:func:`identity_call`): one function per vendor. Levain reads no account for Codex, so its
   observed id is the literal :data:`NOT_A_CHECK` (IG-2, published per §7.6 "not a check"). Claude's (IG-3, G1b):
   :mod:`levain.slot.identity_child` run AS THE SLOT through wall's ``identity`` target (start's
   :func:`levain.slot.start.identity_capture`), its line judged by root (:func:`parse_auth_answer`): a digest of the
@@ -55,7 +55,7 @@ BASELINE_DISPATCH_KEY = "dispatch"
 BASELINE_DISPATCH_YES = "yes"
 BASELINE_NAME = "baseline"
 BASELINE_MODE = 0o600
-#: IG-2: the observed id of a vendor with no server-validated identity call.
+#: IG-2: the observed id of a vendor Levain reads no account for (Codex).
 NOT_A_CHECK = "not-a-check"
 CONFIRMED = "confirmed"
 LOGIN_FAILED = "login-exit-nonzero"
