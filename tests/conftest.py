@@ -27,6 +27,18 @@ def _vendor_installed(monkeypatch):
     monkeypatch.setattr(_start, "vendor_ready", lambda host, vendor: None)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_terminal_key(monkeypatch, tmp_path):
+    """First wall of the keyguard: a test that forgot ``key_dir`` sees "no key" (a nonexistent per-test directory),
+    never the operator's Secure Enclave key whose Touch ID sheet opened on the live laptop during lane runs. The
+    second wall is ``refuse_real_key_in_tests`` in levain/cockpit/keys.py."""
+    try:
+        import levain.consent.terminal_sign as _ts
+    except ImportError:
+        return
+    monkeypatch.setattr(_ts, "_real_key_dir", lambda: tmp_path / "nokeys")
+
+
 LIVE_SEATBELT_ENV = "LEVAIN_LIVE_SEATBELT"
 LIVE_SEATBELT_REASON = (
     f"applies a LIVE macOS Seatbelt profile on this host, off unless {LIVE_SEATBELT_ENV}=1: a hand-written Seatbelt "

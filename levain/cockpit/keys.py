@@ -29,6 +29,7 @@ import re
 import sqlite3
 import struct
 import subprocess
+import sys
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -61,6 +62,34 @@ _FP = re.compile(r"\d+ (SHA256:[A-Za-z0-9+/]{43}) ")
 
 class KeyError_(Exception):      # noqa: N801 - not the builtin
     """A refused key act; the message is the operator-facing reason."""
+
+
+def pwd_key_dir() -> Path:
+    """``<real home>/.levain/keys`` from the password database, never ``$HOME`` or ``$LEVAIN_HOME``."""
+    import pwd
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".levain" / "keys"
+
+
+def under_test_run() -> bool:
+    """True inside a pytest run: the per-test variable pytest sets while a test runs, or pytest loaded at all."""
+    return "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules
+
+
+def refuse_real_key_in_tests(path: Path | str | None, what: str = "the key") -> None:
+    """Added after test runs raised the operator's Touch ID sheet on the live laptop: under a pytest run, any path
+    inside the real operator key directory (compared resolved, links followed) raises ``KeyError_``. A temp key
+    directory passed by a test is untouched. ``path`` None is the caller's default, which is judged by its resolver."""
+    if path is None or not under_test_run():
+        return
+    try:
+        real = pwd_key_dir().resolve()
+        target = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError, KeyError):
+        return
+    if target == real or real in target.parents:
+        raise KeyError_(f"refused: {what} ({target}) is inside the real operator key directory {real}, and a test "
+                        "run must never reach it (a Touch ID sheet would open on the live laptop); pass a temp key_dir "
+                        "and a fake signer")
 
 
 @dataclass(frozen=True)
@@ -778,6 +807,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
     caller that wants a shorter bound for its own signer does not have to change the module's global."""
     from levain.cockpit.custody import APPLE_PROVIDER, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
     key_path = Path(key_path).expanduser()
+    refuse_real_key_in_tests(key_path, "the signing key")
     public_key = signing_public_key(key_path)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
     sidecar = read_sidecar(key_path)
