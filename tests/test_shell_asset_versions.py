@@ -4,12 +4,17 @@ is matched. The worker half (cache-first by exact URL) is in ``test_sw_worker.py
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 from levain import web_server
 from levain.web_server import make_server
@@ -153,11 +158,92 @@ def test_the_startup_check_refuses_a_page_with_a_bare_shell_asset_reference_the_
         raise AssertionError("make_server started with a bare shell asset reference in the cockpit page")
 
 
+_SW = Path(__file__).resolve().parent.parent / "levain" / "webpush" / "static" / "sw.js"
+_NODE = shutil.which("node")
+needs_node = pytest.mark.skipif(_NODE is None, reason="node is not installed")
+
+
 def test_the_workers_attribute_boundary_is_the_servers() -> None:
-    """1105-17 fix2: the same fact in two languages must not drift. ``levain/webpush/static/sw.js`` holds the boundary as
-    ``ATTR_BOUNDARY = String.raw`...``` (no build step to share one source), and the server's ``_SHELL_ATTR`` opens with it."""
-    sw = (Path(__file__).resolve().parent.parent / "levain" / "webpush" / "static" / "sw.js").read_text(encoding="utf-8")
-    m = re.search(r"const ATTR_BOUNDARY = String\.raw`([^`]+)`;", sw)
+    """1105-17 fix2/fix3: the same fact in two languages must not drift. ``levain/webpush/static/sw.js`` holds the boundary as
+    ``ATTR_BOUNDARY = String.raw`...``` (no build step to share one source); the server's ``_ATTR_BOUNDARY`` is that text and
+    ``_SHELL_ATTR`` opens with it."""
+    m = re.search(r"const ATTR_BOUNDARY = String\.raw`([^`]+)`;", _SW.read_text(encoding="utf-8"))
     assert m, "sw.js no longer declares ATTR_BOUNDARY as a String.raw literal"
+    assert m.group(1) == web_server._ATTR_BOUNDARY, (m.group(1), web_server._ATTR_BOUNDARY)
     assert web_server._SHELL_ATTR.pattern.startswith(m.group(1)), (m.group(1), web_server._SHELL_ATTR.pattern)
-    assert m.group(1) in web_server._ANY_REF.pattern, (m.group(1), web_server._ANY_REF.pattern)
+
+
+def test_no_regex_lookbehind_in_the_worker_or_the_servers_shell_attribute_pattern() -> None:
+    """1105-17 fix3 (L3 r3 MED): ``new RegExp('(?<!...')`` THROWS in Safari before 16.4, so a lookbehind in the worker's shell
+    parse caches no shell on those devices. Old Safari cannot be run here: the guard is that no ``(?<`` (lookbehind or named
+    group, neither needed) is anywhere in sw.js, and none is in the server's half of the shared boundary."""
+    sw = _SW.read_text(encoding="utf-8")
+    assert "(?<" not in sw, [ln for ln in sw.splitlines() if "(?<" in ln]
+    assert "(?<" not in web_server._ATTR_BOUNDARY and "(?<" not in web_server._SHELL_ATTR.pattern, web_server._SHELL_ATTR.pattern
+
+
+_D = {"/a.js": "aaaaaaaaaaaa", "/b.js": "bbbbbbbbbbbb", "/c.css": "cccccccccccc"}
+# (tag html, the server's rewrite of it, the keys the worker's shell parse finds)
+_BOUNDARY_CASES = [
+    ('<script src="/a.js"></script>', '<script src="/a.js?v=aaaaaaaaaaaa"></script>', ["/a.js"]),
+    ("<script  src='/a.js'></script>", "<script  src='/a.js?v=aaaaaaaaaaaa'></script>", ["/a.js"]),            # two spaces, single quotes
+    ('<script src = "/a.js"></script>', '<script src = "/a.js?v=aaaaaaaaaaaa"></script>', ["/a.js"]),
+    ('<script\tsrc="/a.js"></script>', '<script\tsrc="/a.js?v=aaaaaaaaaaaa"></script>', ["/a.js"]),            # tab before the attribute
+    ('<script\nsrc="/a.js"></script>', '<script\nsrc="/a.js?v=aaaaaaaaaaaa"></script>', ["/a.js"]),            # newline before it
+    ('<script data-src="/a.js"></script>', '<script data-src="/a.js"></script>', []),                          # preceded by '-'
+    ('<script xsrc="/a.js"></script>', '<script xsrc="/a.js"></script>', []),                                  # preceded by a word char
+    ('<script src="/a.js" src="/b.js"></script>', '<script src="/a.js?v=aaaaaaaaaaaa" src="/b.js"></script>', ["/a.js"]),  # the first only
+    ('<script data-src="/a.js" src="/b.js"></script>', '<script data-src="/a.js" src="/b.js?v=bbbbbbbbbbbb"></script>', ["/b.js"]),
+    ('<link rel="stylesheet" href="/c.css">', '<link rel="stylesheet" href="/c.css?v=cccccccccccc">', ["/c.css"]),
+    ('<link data-href="/c.css" rel="stylesheet">', '<link data-href="/c.css" rel="stylesheet">', []),
+]
+
+
+@pytest.mark.parametrize("html,rewritten,_keys", _BOUNDARY_CASES)
+def test_the_servers_rewrite_follows_the_attribute_boundary_and_re_emits_the_boundary_character(html, rewritten, _keys) -> None:
+    assert web_server._version_shell_page(html, _D) == rewritten
+
+
+def test_the_servers_attribute_pattern_matches_at_the_string_start_and_re_emits_nothing_extra() -> None:
+    sub = lambda t: web_server._SHELL_ATTR.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}'X'", t, count=1)  # noqa: E731
+    assert sub('src="/a.js"') == "src='X'"                      # group 1 is empty: the start of the string is the boundary
+    assert sub(' src="/a.js"') == " src='X'"                    # a space is consumed and put back
+    assert sub('data-src="/a.js"') == 'data-src="/a.js"' and sub('xsrc="/a.js"') == 'xsrc="/a.js"'
+
+
+def test_the_servers_bound_under_the_rewrite_sees_the_same_attribute_boundary() -> None:
+    """``_ANY_REF`` keeps its own (Python-only) lookbehind; it must agree with the shared boundary on every case."""
+    for html, _out, keys in _BOUNDARY_CASES:
+        seen = [m.group(1) for m in web_server._ANY_REF.finditer(html)]
+        assert bool(seen) == bool(keys) and (not keys or keys[0] in seen), (html, seen, keys)
+
+
+_WORKER_SCRIPT = r"""
+const fs = require('fs'), vm = require('vm');
+const [swPath, casesPath] = process.argv.slice(2);
+const sandbox = { self: { addEventListener() {}, registration: {} }, URL, console, Promise, JSON, String, Array, Math, Date,
+  setTimeout, clearTimeout, TextEncoder, Response, Headers, caches: {}, indexedDB: {} };
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(swPath, 'utf8'), sandbox);
+const out = JSON.parse(fs.readFileSync(casesPath, 'utf8')).map((h) => {
+  sandbox.__html = h;
+  return vm.runInContext('shellAssets(__html).map((a) => a.key)', sandbox);
+});
+// the boundary alone, at the string start: group 1 is empty there
+const start = vm.runInContext("new RegExp(ATTR_BOUNDARY + 'src').exec('src=1')", sandbox);
+console.log(JSON.stringify({ out, start: start && [start.index, start[1]] }));
+"""
+
+
+@needs_node
+def test_the_workers_shell_parse_follows_the_same_attribute_boundary_cases(tmp_path: Path) -> None:
+    """The worker half of the table above, run in node against the real sw.js (``shellAssets``)."""
+    script, cases = tmp_path / "shell_assets.js", tmp_path / "cases.json"
+    script.write_text(_WORKER_SCRIPT, encoding="utf-8")
+    cases.write_text(json.dumps([c[0] for c in _BOUNDARY_CASES]), encoding="utf-8")
+    cp = subprocess.run([_NODE, str(script), str(_SW), str(cases)], capture_output=True, text=True, timeout=60)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    got = json.loads(cp.stdout)
+    for (html, _out, keys), found in zip(_BOUNDARY_CASES, got["out"]):
+        assert found == keys, (html, found, keys)
+    assert got["start"] == [0, ""], got

@@ -1345,9 +1345,14 @@ def load_web_asset(filename: str) -> str:
 # that is not exactly the current digest of that path is refused 404 (``_version_query_ok``), so an old page's
 # ``?v=OLD`` never receives the new bytes the worker would then cache under the old name.
 _SHELL_TAG = re.compile(r"<(?:script|link)\b[^>]*>", re.IGNORECASE)
-# ``(?<![\w-])`` so ``data-src`` / ``data-href`` are not the attribute (``\b`` matched them: the hyphen is a word boundary)
-_SHELL_ATTR = re.compile(r"""(?<![\w-])(src|href)(\s*=\s*)(?:"([^"]+)"|'([^']+)')""", re.IGNORECASE)
-# The bound under the rewrite: ANY src/href value (quoted, unquoted or backslash-escaped in a script string) in the page
+# The attribute-name boundary: ``data-src`` / ``data-href`` are not the attribute (``\b`` matched them: the hyphen is a word
+# boundary). It CONSUMES the character before the name (or the string start) and captures it as group 1, because a regex
+# lookbehind is a syntax error in Safari before 16.4 and the same boundary runs in the worker (sw.js ``ATTR_BOUNDARY``, which
+# tests/test_shell_asset_versions.py asserts is this text). The rewrite below re-emits group 1.
+_ATTR_BOUNDARY = r"(^|[^\w-])"
+_SHELL_ATTR = re.compile(_ATTR_BOUNDARY + r"""(src|href)(\s*=\s*)(?:"([^"]+)"|'([^']+)')""", re.IGNORECASE)
+# The bound under the rewrite: ANY src/href value (quoted, unquoted or backslash-escaped in a script string) in the page.
+# Server-only Python, never run by the worker, so it keeps a lookbehind: that also lets it see ``src="/a.js"src="/b.js"``.
 _ANY_REF = re.compile(r"""(?<![\w-])(?:src|href)\s*=\s*\\?["']?(/[^\s"'>\\]+)""", re.IGNORECASE)
 _SHELL_ASSET_EXT = (".js", ".css")
 
@@ -1361,12 +1366,13 @@ def _version_shell_page(page: str, digests: Mapping[str, str]) -> str:
     to ``<path>?v=<digest>``. A reference that already carries a query or fragment, or names another path, is left alone."""
 
     def attr(m: "re.Match[str]") -> str:
-        value = m.group(3) if m.group(3) is not None else m.group(4)
+        value = m.group(4) if m.group(4) is not None else m.group(5)
         digest = digests.get(value)
         if digest is None:
             return m.group(0)
-        quote = '"' if m.group(3) is not None else "'"
-        return f"{m.group(1)}{m.group(2)}{quote}{value}?v={digest}{quote}"
+        quote = '"' if m.group(4) is not None else "'"
+        # group 1 is the boundary character the match consumed: it goes back, or the tag loses it
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}{quote}{value}?v={digest}{quote}"
 
     def tag(m: "re.Match[str]") -> str:
         t = m.group(0)

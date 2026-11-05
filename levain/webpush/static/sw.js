@@ -6,7 +6,7 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1105-assethash-1';
+const SW_VERSION = '1105-assethash-3';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
@@ -352,9 +352,11 @@ async function writeShell(resp, staged) {
   } catch (_) { /* best effort */ }
   return true;
 }
-// The attribute-name boundary: `data-src` is not `src` (a plain \b matched it, the hyphen being a word boundary). The server's
-// _SHELL_ATTR (levain/web_server.py) opens with this exact source text; tests/test_shell_asset_versions.py asserts they are equal.
-const ATTR_BOUNDARY = String.raw`(?<![\w-])`;
+// The attribute-name boundary: `data-src` is not `src` (a plain \b matched it, the hyphen being a word boundary). It consumes the
+// character before the name (capture group 1) instead of looking behind: a regex lookbehind throws in Safari before 16.4, and a
+// throw here caches no shell. The server's _ATTR_BOUNDARY (levain/web_server.py) is this exact source text; tests/test_shell_asset_versions.py
+// asserts they are equal and that no lookbehind appears in the worker's regexes.
+const ATTR_BOUNDARY = String.raw`(^|[^\w-])`;
 // Same-origin absolute URLs named by <script src> and <link rel=stylesheet href> in the shell html, as {key: path+query, kind}.
 // The exact URL (query included) is what the worker caches and what it later intercepts.
 function shellAssets(html) {
@@ -366,7 +368,7 @@ function shellAssets(html) {
     const key = u.pathname + u.search;
     if (!out.has(key)) out.set(key, { key, kind });
   };
-  const attr = (tag, name) => { const m = new RegExp(ATTR_BOUNDARY + name + '\\s*=\\s*(?:"([^"]+)"|\'([^\']+)\')', 'i').exec(tag); return m ? (m[1] || m[2]) : null; };
+  const attr = (tag, name) => { const m = new RegExp(ATTR_BOUNDARY + name + '\\s*=\\s*(?:"([^"]+)"|\'([^\']+)\')', 'i').exec(tag); return m ? (m[2] || m[3]) : null; };
   for (const m of html.matchAll(/<script\b[^>]*>/gi)) { const v = attr(m[0], 'src'); if (v) add(v, 'script'); }
   for (const m of html.matchAll(/<link\b[^>]*>/gi)) {
     const rel = attr(m[0], 'rel');
