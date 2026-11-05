@@ -37,9 +37,12 @@ NOTHING from the operator's home. The authority ledger is a dispatch-owned REPLI
 :class:`levain.agents.authority_replica.AuthorityReplica`) that the fire feeds over the run socket with ``SYNC`` (rows
 that strictly continue the replica's head); the server verifies every row itself (chain plus SSHSIG), commits only a
 verified continuation and never moves backward (its own anchor). ``LAUNCH`` and ``RELEASE`` carry ``ledger_head`` (the
-client's verified head, which must be the replica's, else a transient ``ledger-behind``: SYNC and retry) and ``LAUNCH``
-carries the agent's ``bar`` (open flag and highest closed bar's revoke seq, checked to lie inside the replica's seq;
-``RELEASE`` re-judges with the LAUNCH's bar). A false bar or a withheld row is the power a process running as the operator
+client's verified head, which the replica must HOLD: its row at that seq has that hash. The replica may be AHEAD of it,
+because another fire's SYNC can land between this fire's SYNC and its frame; a head past the replica is a transient
+``ledger-behind`` (SYNC and retry), a held seq with another hash a standing ``ledger-fork``) and ``LAUNCH`` carries the
+agent's ``bar`` (open flag and highest closed bar's revoke seq, checked to lie inside the claimed head's seq; ``RELEASE``
+re-judges with the LAUNCH's bar). The point-of-use check always judges the replica's WHOLE current replay, never the
+claimed prefix, so a revoke another fire SYNCed past the claimed head still refuses. A false bar or a withheld row is the power a process running as the operator
 already had over the live files; it can forge no signature and cannot roll the replica back (design 1104-28 section 2.4).
 """
 from __future__ import annotations
@@ -176,7 +179,7 @@ def _default_verify_sig() -> Callable[..., bool]:
 class FrameClaims:
     """What a LAUNCH or RELEASE frame says about the operator's side: ``ledger_head`` is the client's verified
     ``(seq, hash)``; ``bar`` is ``(open bar?, highest closed bar's revoke_seq)`` of the agent. Neither is trusted beyond
-    this: the head must equal the replica's, the bar is only bounded by the replica's seq."""
+    this: the replica must hold the head (it may be ahead of it), the bar is only bounded by the head's seq."""
     ledger_head: tuple[int, str]
     bar: tuple[bool, int]
 
@@ -190,25 +193,32 @@ def replica_verifier(replica: AuthorityReplica, *,
     def verify(proof: C.LinkProof, exposure: Optional[ActionExposure], claims: Optional[FrameClaims]) -> None:
         if claims is None:
             raise LauncherRefused("ledger-head-missing", "the frame names no ledger head")
+        # The claimed head must be HELD by the replica (its row at that seq, same hash), not be its exact head: another
+        # fire's SYNC may append rows between this fire's SYNC and its frame (b2rel). The judgment below is always the
+        # replica's WHOLE current replay, so rows past the claimed head (a revoke of this agent included) still refuse.
+        seq, digest = claims.ledger_head
         try:
             head = replica.head()
         except Exception:  # noqa: BLE001 - a replica that cannot be read authorises nothing
             raise LauncherRefused("authority-unreadable", "the authority replica cannot be read",
                                   reason_class="transient") from None
-        if head != claims.ledger_head:
-            raise LauncherRefused("ledger-behind", "the replica's ledger head is not the claimed head: SYNC, then retry",
+        if not 1 <= seq <= head[0]:
+            raise LauncherRefused("ledger-behind", "the replica does not hold the claimed head: SYNC, then retry",
                                   reason_class="transient")
         barred, closed = claims.bar
-        if not 0 <= closed <= head[0]:
-            raise LauncherRefused("bar-invalid", "the claimed closed bar lies outside the replica's ledger")
-
-        def replay() -> Any:
+        if not 0 <= closed <= seq:          # the bar was read with the claimed head: it lies inside that ledger
+            raise LauncherRefused("bar-invalid", "the claimed closed bar lies outside the claimed ledger")
+        try:
             state = replica.replay()
-            if (state.seq, state.head_hash) != head:
-                raise LauncherRefused("ledger-behind", "the replica moved during the check", reason_class="transient")
-            return state
-
-        verify_point_of_use(proof, exposure, replay=replay, now=now, bar_of=lambda agent: (barred, closed),
+        except Exception as exc:  # noqa: BLE001 - a ledger that does not replay authorises nothing
+            raise LauncherRefused("authority-unreadable", f"the authority ledger does not replay ({type(exc).__name__})",
+                                  reason_class="transient") from None
+        held = state.hash_at(seq)
+        if held is None:                    # the replay is not the head just read: never a verdict on the claim
+            raise LauncherRefused("ledger-behind", "the replica moved during the check", reason_class="transient")
+        if held != digest:                  # the replica holds that seq (append-only, verified): another chain
+            raise LauncherRefused("ledger-fork", "the claimed head is not on the replica's chain")
+        verify_point_of_use(proof, exposure, replay=lambda: state, now=now, bar_of=lambda agent: (barred, closed),
                             verify_sig=verify_sig)
     return verify
 

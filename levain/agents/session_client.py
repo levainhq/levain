@@ -672,8 +672,9 @@ def _head_of(ans: dict) -> tuple[int, str]:
 
 def _sync_to(conn: _Conn, feed: AuthorityFeed, head: tuple[int, str]) -> None:
     """Bring the server's replica to ``head``: read its head (an empty SYNC), send the rows it lacks in chunks, and
-    require it to land exactly on ``head``. ``ledger-stale`` (another fire SYNCed first) is already-synced after ONE more
-    head read; ``ledger-fork`` / ``ledger-unverifiable`` / ``ledger-behind`` and the rest surface as :class:`_Refused`."""
+    require it to land on ``head`` or past it (another fire's SYNC; the server then judges that its replica HOLDS ``head``).
+    ``ledger-stale`` (another fire SYNCed first) is already-synced after ONE more head read; the same seq with another
+    hash is ``ledger-fork``; ``ledger-unverifiable`` / ``ledger-behind`` and the rest surface as :class:`_Refused`."""
     for attempt in (0, 1):
         try:
             try:
@@ -695,7 +696,9 @@ def _sync_to(conn: _Conn, feed: AuthorityFeed, head: tuple[int, str]) -> None:
     if have == head:
         return
     if have[0] > head[0]:
-        raise _Refused("ledger-behind", "the server's ledger is ahead of the head this fire read: retry", "transient")
+        # another fire SYNCed past this fire's read: the frame names this head and the SERVER judges whether its
+        # replica holds it (held: go on, against the whole replica; another chain: a standing ledger-fork). b2rel.
+        return
     raise _Refused("ledger-fork", "the server's ledger and the operator's differ at the same position", "standing")
 
 

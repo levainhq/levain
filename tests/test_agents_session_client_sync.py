@@ -111,7 +111,7 @@ def test_a_server_ledger_that_forked_is_a_named_standing_refusal(rig, wire):
     assert wire.runtime.children == []
 
 
-def test_a_server_ahead_of_the_client_is_ledger_behind_transient(rig, wire):
+def test_a_server_ahead_of_the_client_on_another_chain_is_a_standing_fork(rig, wire):
     oid = _occurrence(rig, billing="subscription", exposure=EXP)
     wire.sync()
     feed = C.AuthorityFeed(rig.store, rig.world.root)
@@ -124,7 +124,57 @@ def test_a_server_ahead_of_the_client_is_ledger_behind_transient(rig, wire):
     cl = C.DispatchSessionLauncher(wire.conn, lambda occ: C.link_proof(rig.store, rig.world.root, occ, now=rig.now()), feed)
     with pytest.raises(C.LauncherRefused) as exc:
         cl.spawn(_launch(oid))
-    assert exc.value.name == "ledger-behind" and exc.value.reason_class == "transient"
+    assert exc.value.name == "ledger-fork" and exc.value.reason_class == "standing"
+    assert wire.runtime.children == []
+
+
+def _other_fire_before_release(rig, wire, monkeypatch, record=None):
+    """Another fire signs ``record`` (None: a new, unrelated link that bars nothing) and SYNCs it after this fire's own SYNC, right before its RELEASE frame."""
+    real = C._Conn.request
+    state = {"n": 0}
+
+    def spy(self, op, expect, **kw):
+        if op == "RELEASE" and state["n"] == 0:
+            state["n"] = 1
+            rig.link() if record is None else rig.world.link(record)
+            assert wire.sync()["ok"] is True
+        return real(self, op, expect, **kw)
+    monkeypatch.setattr(C._Conn, "request", spy)
+    return state
+
+
+def test_another_fires_sync_between_this_fires_sync_and_release_does_not_end_its_session(rig, wire, monkeypatch):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    child = _client(rig, wire).spawn(_launch(oid))
+    state = _other_fire_before_release(rig, wire, monkeypatch)
+    child.release()
+    assert state["n"] == 1 and child.released is True and wire.runtime.ended == []
+    child._conn.close()
+
+
+def test_a_fire_whose_read_predates_another_fires_sync_still_releases(rig, wire):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    feed = C.AuthorityFeed(rig.store, rig.world.root)
+    cl = C.DispatchSessionLauncher(wire.conn, lambda occ: C.link_proof(rig.store, rig.world.root, occ, now=rig.now()), feed)
+    child = cl.spawn(_launch(oid))
+    before = feed.read(oid)
+    rig.link()                                                                  # the other fire's row, SYNCed by it
+    assert wire.sync()["ok"] is True
+    feed.read = lambda occ: before                                              # this fire read its head before them
+    child.release()
+    assert child.released is True and wire.runtime.ended == []
+    child._conn.close()
+
+
+def test_a_revoke_of_this_agent_synced_by_another_fire_before_release_still_refuses(rig, wire, monkeypatch):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    child = _client(rig, wire).spawn(_launch(oid))
+    _other_fire_before_release(rig, wire, monkeypatch, revoke_agent(rig.row(oid)["agent_id"], rig.sid))
+    with pytest.raises(RuntimeError, match="link-not-standing"):
+        child.release()
+    assert wire.runtime.children[0].released is False and wire.runtime.ended == ["sess-1"]
+    child.abort()
+    child._conn.close()
 
 
 def test_the_registered_launcher_builds_with_the_feed(rig):
