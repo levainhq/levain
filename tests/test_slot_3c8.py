@@ -69,6 +69,7 @@ def test_render_policy_refusal_comes_before_the_cas(dispatch):
     with nothing the CAS writes, so they refuse before step (1)'s CAS: the session stays ALLOCATED."""
     d, w = dispatch, dispatch.w
     s = _prepared(d)
+    w.seams.hook_templates = {}      # the helper's default is now the production set (1105-32); {} is "no template"
     calls = len(w.calls)
     line = _render(d, s, _blob(hooks=["levain_queue"]))
     assert line["refused"] == "hook-template-missing", line

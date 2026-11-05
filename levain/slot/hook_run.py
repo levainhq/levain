@@ -1,0 +1,86 @@
+"""levain.slot.hook_run — what a slot's root-owned hook script runs (``levain_gate``, ``levain_queue``).
+
+The script :mod:`levain.slot.hook_templates` renders into ``<S>/root/hooks/<name>`` puts the import tree on
+``sys.path`` and calls :func:`run`. This module is stdlib only and 3.9-valid (the slot's hook runs under
+``/usr/bin/python3``), and it holds the ONE decision the operator's own activation hook makes the other way:
+
+**FAIL CLOSED.** The operator's hook (``templates/activation/hooks/consent_claude_code.py``) exits 0 with no output
+when its adapter will not import, so the call passes. That is right on the operator's own machine and wrong for a
+gate inside an unattended slot: a gate that opens when it breaks is not a gate. Here every way the adapter cannot
+answer is exit 2 with a NAMED refusal on stderr (Claude Code blocks a PreToolUse and denies a PermissionRequest on
+exit 2), never exit 0 with no output:
+
+* ``hook-not-in-slot``: the slot's broker socket variable is not in the environment. The adapter would then take its
+  operator path (a local queue under the home directory), which a slot must never reach.
+* ``hook-adapter-unavailable``: the adapter or the broker client did not import.
+* ``hook-adapter-failed``: the adapter raised.
+* ``hook-adapter-exit``: the adapter returned non-zero.
+
+When the adapter answers, what it printed is what the hook prints, unchanged: its own deny, ask-nothing and
+no-decision outputs are its contract (a PermissionRequest in a slot gets no decision there; Claude Code's mode
+answers it). This module adds no allow of its own.
+"""
+from __future__ import annotations
+
+import io
+import os
+import sys
+from typing import Any, Callable, Mapping, Optional, TextIO
+
+REFUSED_EXIT = 2
+
+ADAPTER_MODULE = "levain.consent.adapters.claude_code"
+
+
+def refuse(name: str, why: str, detail: str, stderr: TextIO) -> int:
+    try:
+        stderr.write("levain hook %s: refused: %s (%s)\n" % (name, why, detail[:200]))
+        stderr.flush()
+    except Exception:
+        pass
+    return REFUSED_EXIT
+
+
+def _load_adapter() -> Any:
+    # a function-local import on purpose: a failure here is a named refusal, not a traceback (tests/ci/root_closure.py
+    # LAZY_SITES row "root": a slot hook process runs it, so the adapter is root-closure code)
+    from levain.consent.adapters import claude_code
+    return claude_code
+
+
+def run(name: str, *, stdin: Optional[TextIO] = None, stdout: Optional[TextIO] = None,
+        stderr: Optional[TextIO] = None, environ: Optional[Mapping[str, str]] = None,
+        load_adapter: Optional[Callable[[], Any]] = None) -> int:
+    """Run the hook ``name``: 0 with the adapter's output, or :data:`REFUSED_EXIT` with a named refusal."""
+    stdin = stdin if stdin is not None else sys.stdin
+    stdout = stdout if stdout is not None else sys.stdout
+    stderr = stderr if stderr is not None else sys.stderr
+    env = os.environ if environ is None else environ
+    try:
+        from levain.consent.broker_client import in_slot
+        adapter = (load_adapter or _load_adapter)()
+        main = adapter.main
+    except BaseException as exc:  # noqa: BLE001 - fail closed: nothing that cannot import is a gate
+        return refuse(name, "hook-adapter-unavailable", "%s: %s" % (type(exc).__name__, exc), stderr)
+    try:
+        slot = in_slot(env)
+    except BaseException as exc:  # noqa: BLE001
+        return refuse(name, "hook-adapter-failed", "%s: %s" % (type(exc).__name__, exc), stderr)
+    if not slot:
+        return refuse(name, "hook-not-in-slot", "no broker socket in the environment", stderr)
+    out = io.StringIO()
+    try:
+        code = main([], stdin=stdin, stdout=out)
+    except BaseException as exc:  # noqa: BLE001 - SystemExit included: an adapter that exits is not an answer
+        return refuse(name, "hook-adapter-failed", "%s: %s" % (type(exc).__name__, exc), stderr)
+    if code != 0:
+        return refuse(name, "hook-adapter-exit", "exit %r" % (code,), stderr)
+    try:
+        stdout.write(out.getvalue())
+        stdout.flush()
+    except BaseException as exc:  # noqa: BLE001
+        return refuse(name, "hook-adapter-failed", "writing the answer: %s" % type(exc).__name__, stderr)
+    return 0
+
+
+__all__ = ["ADAPTER_MODULE", "REFUSED_EXIT", "refuse", "run"]

@@ -56,7 +56,7 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import IO, Any, Literal
+from typing import IO, Any, Literal, Union
 
 from levain.authority import anchor_path
 # FILE_TOOLS, MCP_PATH_FIELDS, PolicyNotEligible and guarded_policy are re-exported: this module's names since Q2
@@ -892,7 +892,7 @@ DECLINE_MESSAGES: Mapping[str, str] = MappingProxyType({
     "contained_launch_mismatch": "levain could not match this call to the launch it came from",
     "contained_delivery_refused": "this launch's containment changed since the answer was given; ask again"})
 
-CoreResult = Decided | Abstained | Declined
+CoreResult = Union[Decided, Abstained, Declined]   # not ``|``: evaluated at import, and a slot hook runs this on 3.9
 
 
 
