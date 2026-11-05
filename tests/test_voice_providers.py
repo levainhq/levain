@@ -150,7 +150,7 @@ def test_the_fixed_words_are_the_designs_for_the_codes_it_names():
     assert P.WORDS["unavailable"].format(p="OpenAI") == "OpenAI did not answer. Nothing was charged that Levain knows of."
 
 
-def test_the_two_429s_are_told_apart_by_the_error_code_field_only():
+def test_the_429s_are_told_apart_by_the_error_code_and_type_fields_only():
     for body, code in [(b'{"error": {"code": "insufficient_quota"}}', "out_of_credit"),
                        (b'{"error": {"code": "rate_limit_exceeded"}}', "rate_limited"),
                        (b'{"error": {"message": "insufficient_quota"}}', "rate_limited"),   # the message is not the code
@@ -394,7 +394,7 @@ def test_the_real_transport_refuses_an_oversize_response(monkeypatch):
         status = 200
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def read(self, n): return b"x" * n
+        def read1(self, n): return b"x" * n
     class Opener:
         def open(self, req, timeout=None): return Resp()
     monkeypatch.setattr(P, "_OPENER", Opener())
@@ -406,7 +406,7 @@ def test_the_real_transport_reads_no_401_body_and_closes_every_error_response(mo
     class Body(io.BytesIO):
         reads = 0
 
-        def read(self, *a):
+        def read1(self, *a):
             self.reads += 1
             return super().read(*a)
 
@@ -513,3 +513,242 @@ def test_deepgram_positional_construction_keeps_its_older_field_order():
     prov = P.DeepgramProvider(P.urllib_transport, "nova-custom")
     assert prov.stt_model == "nova-custom"
     assert prov.tts_model == P.DEEPGRAM_TTS_MODEL
+
+
+# --- V1-4 (B4): OpenAI's 429 billing codes (design DESIGN_voice_v14.md F1) -------------------------------------------
+
+@pytest.mark.parametrize("error,code", [
+    # an empty balance: the new code, the broad type alone, and the old code
+    ({"type": "insufficient_quota", "code": "credit_balance_exhausted"}, "out_of_credit"),
+    ({"code": "credit_balance_exhausted"}, "out_of_credit"),
+    ({"type": "insufficient_quota"}, "out_of_credit"),
+    ({"code": "insufficient_quota"}, "out_of_credit"),
+    # a limit the account holder set: the code wins over the broad type the vendor says may still ride with it
+    ({"type": "insufficient_quota", "code": "organization_spend_limit_exceeded"}, "spend_limited"),
+    ({"code": "project_spend_limit_exceeded"}, "spend_limited"),
+    ({"type": "insufficient_quota", "code": "organization_usage_limit_exceeded"}, "spend_limited"),
+    # an ordinary rate limit stays one (a retry can help it)
+    ({"code": "rate_limit_exceeded"}, "rate_limited"),
+    ({"type": "requests", "code": "slow_down"}, "rate_limited"),
+    ({"message": "credit_balance_exhausted"}, "rate_limited"),        # a message is not a code
+])
+def test_a_429_is_out_of_credit_a_spend_limit_or_a_rate_limit_by_its_code(error, code):
+    body = json.dumps({"error": {**error, "message": f"{MARKER} quoting {FAKE_KEY}"}}).encode()
+    assert P._code_for(429, body) == code
+    t = Replay()
+    t.response = P.HttpResponse(429, body)
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=t).speak(FAKE_KEY, "Hi.", "nova", 1.0)
+    assert info.value.code == code
+    assert str(info.value) == P.WORDS[code].format(p="OpenAI")
+    assert_clean(info.value)
+
+
+def test_the_spend_limit_has_its_own_words_naming_the_dashboard_not_money():
+    assert P.WORDS["spend_limited"].format(p="OpenAI") == \
+        "Your OpenAI spend limit is reached. Raise it on OpenAI's site, or wait for it to reset."
+    assert P.WORDS["spend_limited"] != P.WORDS["out_of_credit"]
+
+
+# --- voice14 round 1 (FINDINGS_voice14_r1.md): F1 shapes, F3 pin, F4 deadline ----------------------------------------------
+
+@pytest.mark.parametrize("error", [
+    {"code": ["insufficient_quota"]}, {"code": {"x": "insufficient_quota"}}, {"code": 429}, {"code": None},
+    {"code": [["organization_spend_limit_exceeded"]]}, {"code": {"a": {"b": ["credit_balance_exhausted"]}}},
+    {"code": True}, {"code": 1.5},
+    {"type": ["insufficient_quota"]}, {"type": {"insufficient_quota": 1}}, {"type": 7}, {"type": None},
+    {"code": ["x"], "type": ["y"]}, {"code": {"a": 1}, "type": {"b": 2}},
+], ids=lambda e: json.dumps(e))
+def test_f1_a_429_whose_code_or_type_is_not_a_string_is_a_rate_limit_not_a_crash(error):
+    """voice14 F1: ``code in <frozenset>`` raised TypeError for a list or dict (unhashable), which escaped
+    ``_exchange`` and became a 500 at the route. Every malformed shape is an ordinary ``rate_limited``.
+    Red with: the ``isinstance(code, str)`` guard removed from ``_code_of_429``."""
+    body = json.dumps({"error": {**error, "message": f"{MARKER} quoting {FAKE_KEY}"}}).encode()
+    assert P._code_for(429, body) == "rate_limited"
+    t = Replay()
+    t.response = P.HttpResponse(429, body)
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=t).speak(FAKE_KEY, "Hi.", "nova", 1.0)
+    assert info.value.code == "rate_limited"
+    assert_clean(info.value)
+
+
+def test_f1_a_string_code_still_wins_beside_a_malformed_type():
+    body = json.dumps({"error": {"code": "organization_spend_limit_exceeded", "type": ["insufficient_quota"]}}).encode()
+    assert P._code_for(429, body) == "spend_limited"
+
+
+def _responses():
+    return [
+        P.HttpResponse(200, b""), P.HttpResponse(200, b"not json"), P.HttpResponse(200, b'{"nope": 1}'),
+        P.HttpResponse(200, b'{"text": 5}'), P.HttpResponse(200, b"\xff\xfe"), P.HttpResponse(200, b"[]"),
+        P.HttpResponse(200, b'{"results": {"channels": []}}'),
+        P.HttpResponse(401, b""), P.HttpResponse(429, b'{"error": {"code": ["x"]}}'), P.HttpResponse(500, b"x"),
+        "not a response", None,
+    ]
+
+
+@pytest.mark.parametrize("response", _responses(), ids=lambda r: repr(r)[:40])
+@pytest.mark.parametrize("make", [lambda t: P.OpenAIProvider(transport=t), lambda t: P.DeepgramProvider(transport=t)],
+                         ids=["openai", "deepgram"])
+@pytest.mark.parametrize("use", ["speak", "transcribe"])
+def test_f3_no_adapter_raises_a_valueerror_once_the_transport_has_been_called(response, make, use):
+    """voice14 F3: the route RELEASES a reservation on a ValueError (nothing went out) and settles on everything else,
+    which is only sound while every adapter turns a failure after the send into a VoiceError. Whatever the transport
+    returned, the outcome is a result or a VoiceError. Red with: ``_text_of`` or ``_exchange`` letting a ValueError
+    (a JSONDecodeError is one) through."""
+    prov = make(lambda req: response)
+    try:
+        if use == "speak":
+            prov.speak(FAKE_KEY, "Hi.")
+        else:
+            prov.transcribe(FAKE_KEY, b"audio", "audio/wav")
+    except P.VoiceError:
+        pass
+    except ValueError as exc:      # the one thing this test exists to refuse
+        pytest.fail(f"a ValueError escaped after the transport returned: {type(exc).__name__}")
+
+
+@pytest.mark.parametrize("make", [lambda t: P.OpenAIProvider(transport=t), lambda t: P.DeepgramProvider(transport=t)],
+                         ids=["openai", "deepgram"])
+def test_f3_a_transport_that_itself_raises_valueerror_is_unavailable(make):
+    """The real transport raises ValueError for 'response too large' AFTER the request went out; the adapter must turn
+    it into a VoiceError so the route settles the row. Red with: ``_exchange`` catching narrower than ``Exception``."""
+    def transport(req):
+        raise ValueError("response too large")
+    with pytest.raises(P.VoiceError) as info:
+        make(transport).speak(FAKE_KEY, "Hi.")
+    assert info.value.code == "unavailable"
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _TrickleResp:
+    """A response that gives one byte per ``read1`` and takes ``gap`` fake seconds to do it, ``n`` times, then ends."""
+    status = 200
+
+    def __init__(self, clock: _Clock, gap: float, n: int = 10_000) -> None:
+        self.clock, self.gap, self.left = clock, gap, n
+        self.reads = 0
+        self.closed = False
+
+    def __enter__(self): return self
+    def __exit__(self, *a):
+        self.closed = True
+        return False
+
+    def read1(self, n):
+        self.reads += 1
+        self.clock.now += self.gap
+        if self.left <= 0:
+            return b""
+        self.left -= 1
+        return b"x"
+
+
+def _trickling(monkeypatch, gap: float, n: int = 10_000):
+    clock = _Clock()
+    resp = _TrickleResp(clock, gap, n)
+
+    class Opener:
+        def open(self, req, timeout=None):
+            self.timeout = timeout
+            return resp
+    opener = Opener()
+    monkeypatch.setattr(P, "_monotonic", clock)
+    monkeypatch.setattr(P, "_OPENER", opener)
+    return clock, resp, opener
+
+
+def test_f4_a_provider_trickling_a_byte_inside_every_socket_timeout_is_cut_at_the_total_deadline(monkeypatch):
+    """voice14 F4: ``timeout`` is per socket operation, so a byte every 25 s never trips it and a call held a voice slot
+    for as long as the provider liked. One monotonic budget now covers the whole exchange, checked between reads, and
+    the connection is closed when it is spent; the adapter reports ``unavailable`` (the call went out: it settles).
+    Red with: the deadline check removed from ``_read_until`` (the trickle is read to its end and is an 'answer')."""
+    _clock, resp, opener = _trickling(monkeypatch, gap=25.0)
+    assert 25.0 < P.TIMEOUT < P.TOTAL_TIMEOUT
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=P.urllib_transport).speak(FAKE_KEY, "Hi.")
+    assert info.value.code == "unavailable"
+    assert_clean(info.value)
+    assert resp.closed
+    assert resp.reads <= int(P.TOTAL_TIMEOUT / 25.0) + 1, resp.reads
+    assert opener.timeout == P.TIMEOUT                      # the per-operation timeout is still the connect's
+
+
+def test_f4_the_budget_is_the_requests_and_a_connect_never_waits_longer_than_it(monkeypatch):
+    _clock, resp, opener = _trickling(monkeypatch, gap=0.5, n=40)
+    req = P.HttpRequest("POST", "https://api.openai.com/v1/audio/speech", {}, b"", total=5.0)
+    with pytest.raises(TimeoutError):
+        P.urllib_transport(req)
+    assert resp.closed and resp.reads == 10 and opener.timeout == 5.0
+    _clock2, resp2, _o = _trickling(monkeypatch, gap=0.01, n=40)
+    got = P.urllib_transport(dataclasses.replace(req, total=5.0))
+    assert (got.status, got.body) == (200, b"x" * 40) and resp2.closed
+
+
+def test_f4_a_429_body_trickled_past_the_deadline_is_an_ordinary_rate_limit_and_is_closed(monkeypatch):
+    clock = _Clock()
+    reads = []
+
+    class Err(urllib.error.HTTPError):
+        def read1(self, n):
+            reads.append(n)
+            clock.now += 25.0
+            return b" "
+
+    errs: list[Err] = []
+
+    class Opener:
+        def open(self, req, timeout=None):
+            errs.append(Err("https://api.openai.com/v1/audio/speech", 429, "x", {}, io.BytesIO(b"")))
+            raise errs[-1]
+
+    monkeypatch.setattr(P, "_monotonic", clock)
+    monkeypatch.setattr(P, "_OPENER", Opener())
+    with pytest.raises(P.VoiceError) as info:
+        P.OpenAIProvider(transport=P.urllib_transport).speak(FAKE_KEY, "Hi.")
+    assert info.value.code == "rate_limited"
+    assert 1 <= len(reads) <= int(P.TOTAL_TIMEOUT / 25.0) + 1 and errs[0].fp.closed
+
+
+def test_f4_a_normal_exchange_is_unaffected_by_the_clock(monkeypatch):
+    _clock, resp, _o = _trickling(monkeypatch, gap=0.0, n=3)
+    got = P.urllib_transport(P.HttpRequest("POST", "https://api.openai.com/v1/audio/speech", {}, b""))
+    assert (got.status, got.body) == (200, b"xxx")
+
+
+def test_r7_a_body_in_tiny_reads_costs_about_its_size_not_an_object_per_read(monkeypatch):
+    """voice14 r2 (deepseek MED): ``_read_until`` kept every ``read1`` result as its own bytes object, so a body sent in
+    millions of tiny reads inside the budget cost one object (~35 bytes of header) per read on top of its size. One
+    buffer now: N two-byte reads of fresh objects peak at a few times the body (the buffer, its over-allocation and the
+    final copy), well under the ~20 bytes per read a per-read list costs at the least. Red with: the list of pieces
+    back (``pieces.append`` then ``b"".join``)."""
+    import tracemalloc
+
+    n = 200_000
+
+    class Tiny:
+        left = n
+
+        def read1(self, size):
+            if self.left <= 0:
+                return b""
+            self.left -= 1
+            return bytes((65, 66))      # a new object each read (a 1-byte bytes is a cached singleton)
+
+    monkeypatch.setattr(P, "_monotonic", lambda: 0.0)
+    tracemalloc.start()
+    try:
+        got = P._read_until(Tiny(), 1.0, 10 * n)
+        _cur, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert got == b"AB" * n
+    assert peak < 3 * 2 * n + 256 * 1024, peak          # bound: 3x the body plus slack; a per-read list is ~8 MB here

@@ -60,7 +60,9 @@ _MAX_MICROS = 2 ** 62          # a cap or price above this could not be stored i
 
 
 class MeterError(Exception):
-    """The ledger could not be used: a bad path, a foreign file, or arguments that cannot be priced."""
+    """The ledger could not be used: a bad path, a foreign file, arguments that cannot be priced, or any SQLite error
+    on a read or a write (a lock held past the busy wait, a file that is not a ledger); the message names the SQLite
+    error's type only."""
 
 
 def usd_to_micros(usd: str | int) -> int:
@@ -297,8 +299,8 @@ class Meter:
                     row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
                     if row is None:
                         conn.execute("INSERT INTO meta (key, value) VALUES ('format', ?)", (FORMAT,))
-                    elif row[0] != FORMAT:
-                        raise MeterError(f"voice ledger format {row[0]!r} is not {FORMAT!r}")
+                    else:
+                        _need_format(row[0])
                     conn.execute("COMMIT")
                 except BaseException:
                     _rollback(conn)
@@ -347,6 +349,14 @@ class Meter:
         if isinstance(units, bool) or not isinstance(units, int) or units < 0:
             raise MeterError(f"units must be a non-negative int, got {units!r}")
         entry = self.prices.find(provider, use, model)
+        try:
+            return self._reserve(entry, provider=provider, use=use, model=model, units=units)
+        except sqlite3.Error as exc:
+            failed = type(exc).__name__
+        # raised outside the handler, so a caller's traceback shows no SQLite chain (HANDOFF_33: wrap raw sqlite errors)
+        raise MeterError(f"the voice ledger could not be used: {failed}")
+
+    def _reserve(self, entry: PriceEntry | None, *, provider: str, use: str, model: str, units: int) -> Check:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -385,23 +395,55 @@ class Meter:
                                          "WHERE id = ? AND status = 'reserved'")
 
     def _end(self, reservation_id: int, sql: str) -> bool:
-        with closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                changed = conn.execute(sql, (reservation_id,)).rowcount
-                conn.execute("COMMIT")
-                return changed == 1
-            except BaseException:
-                _rollback(conn)
-                raise
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    changed = conn.execute(sql, (reservation_id,)).rowcount
+                    conn.execute("COMMIT")
+                    return changed == 1
+                except BaseException:
+                    _rollback(conn)
+                    raise
+        except sqlite3.Error as exc:
+            failed = type(exc).__name__
+        raise MeterError(f"the voice ledger could not be used: {failed}")
 
     # --- reads --------------------------------------------------------------------------------------------------------
     def spent(self) -> Spend:
         """The counted totals for the current local month and day (an estimate, dated by ``prices_as_of``)."""
         now = self._clock()
-        with closing(self._connect()) as conn:
-            month, day, m0, d0 = self._sums(conn, now)
-        return Spend(month, day, m0, d0, self.prices.as_of)
+        try:
+            with closing(self._connect()) as conn:
+                month, day, m0, d0 = self._sums(conn, now)
+            return Spend(month, day, m0, d0, self.prices.as_of)
+        except sqlite3.Error as exc:
+            failed = type(exc).__name__
+        raise MeterError(f"the voice ledger could not be used: {failed}")
+
+    def spent_if_present(self) -> Spend:
+        """:meth:`spent` that creates nothing: with no ledger file yet the totals are zero and no file is made; an
+        existing file is opened read-only (``mode=ro``), so a page's poll never writes the ledger. A file that is not
+        a ledger, or a symlink, is a :class:`MeterError`."""
+        now = self._clock()
+        m0, _m1, d0, _d1 = self._periods(now)
+        if os.path.islink(self.path):
+            raise MeterError(f"voice ledger {self.path} is a symlink")
+        if not self.path.exists():
+            return Spend(0, 0, m0, d0, self.prices.as_of)
+        try:
+            uri = self.path.resolve().as_uri() + "?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True, timeout=_BUSY_WAIT_S, isolation_level=None)) as conn:
+                # the same format test the normal connection path runs (:meth:`_create`), but a missing row is a
+                # refusal here: this path never writes one, and a foreign database with a compatible ``calls``
+                # table must not read as a ledger
+                row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+                _need_format(row[0] if row is not None else None)
+                month, day, m0, d0 = self._sums(conn, now)
+            return Spend(month, day, m0, d0, self.prices.as_of)
+        except sqlite3.Error as exc:
+            failed = type(exc).__name__
+        raise MeterError(f"the voice ledger could not be read: {failed}")
 
     def ledger(self, limit: int | None = None) -> list[LedgerRow]:
         """Rows newest first, for checking the estimate against a provider's dashboard."""
@@ -410,8 +452,19 @@ class Meter:
         if limit is not None:
             sql += " LIMIT ?"
             args = (int(limit),)
-        with closing(self._connect()) as conn:
-            return [LedgerRow(*r) for r in conn.execute(sql, args)]
+        try:
+            with closing(self._connect()) as conn:
+                return [LedgerRow(*r) for r in conn.execute(sql, args)]
+        except sqlite3.Error as exc:
+            failed = type(exc).__name__
+        raise MeterError(f"the voice ledger could not be used: {failed}")
+
+
+def _need_format(found: object) -> None:
+    """The ledger's format stamp is :data:`FORMAT`, else a :class:`MeterError` (the one test both the creating path and
+    the read-only one run)."""
+    if found != FORMAT:
+        raise MeterError(f"voice ledger format {found!r} is not {FORMAT!r}")
 
 
 def _rollback(conn: sqlite3.Connection) -> None:

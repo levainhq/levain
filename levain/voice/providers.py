@@ -14,8 +14,8 @@ What an adapter holds and never holds:
   split a header, a pasted curly quote cannot be encoded) is refused as a rejected key, naming nothing.
 * **A provider's response body** is never surfaced. An OpenAI 401 body quotes part of the key it refused (design threat
   T2, still to be confirmed against a real dead key), so :func:`urllib_transport` reads an error body only for a 429,
-  and only to learn whether its ``error.code`` is ``insufficient_quota``; the adapter drops every non-2xx body before it
-  raises. What the operator sees is :class:`VoiceError`: a fixed code
+  and only for its ``error.code`` and ``error.type`` (an empty balance, a spend limit, or a rate limit); the adapter
+  drops every non-2xx body before it raises. What the operator sees is :class:`VoiceError`: a fixed code
   and a fixed sentence (:data:`WORDS`), raised outside the ``except`` that caught the failure so no transport exception
   (which may quote a header) is chained to it.
 * **The host** is a constant per provider (:data:`HOSTS`), https only, and a redirect is never followed (the
@@ -50,11 +50,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from levain.voice.text import API_CAP
 
@@ -68,9 +70,16 @@ DEEPGRAM_TTS_MODEL = "aura-2"                   # the priced family (levain.voic
 DEEPGRAM_TTS_VOICE = "aura-2-thalia-en"         # a model id; from the design's "Aura-2", the voice name is not fetched
 DEEPGRAM_STT_MODEL = "nova-3"
 
-# Seconds, applied by urllib to EACH blocking socket operation (connect, each read), not to the whole call: a provider
-# trickling bytes could hold a call longer. Known edge, not bounded here (the two hosts are constants we chose).
+# Seconds. TIMEOUT is urllib's per-socket-operation inactivity timeout (the connect, a send, each blocking recv): a
+# provider sending a byte before each one fires never trips it, and a call holds one of the server's two voice slots, so
+# the whole exchange also has TOTAL_TIMEOUT, a monotonic wall-clock budget that urllib_transport checks between reads.
+# A spent budget is an exchange that failed after the request went out, so it settles like any provider failure. What it
+# does not bound: a provider trickling the response HEADERS (urllib's open() returns only after them); a recv blocked
+# when the budget runs out waits at most TIMEOUT longer.
 TIMEOUT = 30.0
+TOTAL_TIMEOUT = 90.0
+_READ_CHUNK = 64 * 1024
+_monotonic = time.monotonic     # one name for the exchange clock, so a test can drive it
 MAX_RESPONSE = 16 * 1024 * 1024                 # a response past this is not read: it is not an answer
 MIME_ALLOW = {"audio/webm": "webm", "audio/mp4": "mp4", "audio/mpeg": "mp3", "audio/wav": "wav"}
 SPEED_MIN, SPEED_MAX = 0.25, 4.0
@@ -80,6 +89,7 @@ SPEED_MIN, SPEED_MAX = 0.25, 4.0
 WORDS = {
     "refused": "{p} refused the key. It may have been revoked or mistyped; set it again on the laptop.",
     "out_of_credit": "Your {p} account is out of credit.",
+    "spend_limited": "Your {p} spend limit is reached. Raise it on {p}'s site, or wait for it to reset.",
     "rate_limited": "{p} is limiting requests right now; try again in a moment.",
     "unavailable": "{p} did not answer. Nothing was charged that Levain knows of.",
     "rejected": "{p} could not use that request.",
@@ -103,7 +113,8 @@ class HttpRequest:
     url: str
     headers: dict[str, str] = field(repr=False)     # holds the key
     body: bytes = field(repr=False)
-    timeout: float = TIMEOUT
+    timeout: float = TIMEOUT                        # per socket operation
+    total: float = TOTAL_TIMEOUT                    # the whole exchange, wall clock
 
     def __repr__(self) -> str:
         return f"HttpRequest({self.method} {self.url})"
@@ -129,24 +140,42 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
+def _read_until(resp: Any, deadline: float, limit: int) -> bytes:
+    """Up to ``limit`` bytes of ``resp``, in single reads (``read1`` returns what one recv gave, where ``read(n)`` would
+    wait for all ``n``), with the monotonic ``deadline`` checked before each. A spent deadline raises TimeoutError; the
+    caller's ``with`` (or ``finally``) closes the connection. One growing buffer, never an object per read: a body
+    sent in millions of tiny reads costs about its own size, which ``limit`` bounds."""
+    buf = bytearray()
+    while len(buf) < limit:
+        if _monotonic() >= deadline:
+            raise TimeoutError("the voice exchange outlasted its deadline")
+        piece = resp.read1(min(_READ_CHUNK, limit - len(buf)))
+        if not piece:
+            break
+        buf += piece
+    return bytes(buf)
+
+
 def urllib_transport(req: HttpRequest) -> HttpResponse:
     """The real transport: https to one of :data:`ALLOWED_HOSTS` only, a redirect answered as its 3xx status and never
-    followed, a response read to at most :data:`MAX_RESPONSE` bytes. An error status is a response, not an exception;
+    followed, a response read to at most :data:`MAX_RESPONSE` bytes and within ``req.total`` seconds (a spent budget
+    raises, and the adapter maps that to ``unavailable``). An error status is a response, not an exception;
     an unreachable host raises, and the adapter maps that to ``unavailable``. An error body is read only for a 429 (its
-    ``error.code``); any other error status comes back with an empty body, and the error response is always closed."""
+    ``error.code`` and ``error.type``); any other error status comes back with an empty body, and the error response is always closed."""
     parts = urllib.parse.urlsplit(req.url)
     if parts.scheme != "https" or parts.hostname not in ALLOWED_HOSTS or parts.username or parts.password:
         raise ValueError("destination is not an allowed voice provider")
     request = urllib.request.Request(req.url, data=req.body, headers=dict(req.headers), method=req.method)
+    deadline = _monotonic() + req.total
     try:
-        with _OPENER.open(request, timeout=req.timeout) as resp:
-            body = resp.read(MAX_RESPONSE + 1)
+        with _OPENER.open(request, timeout=min(req.timeout, req.total)) as resp:
+            body = _read_until(resp, deadline, MAX_RESPONSE + 1)
             status = int(resp.status)
     except urllib.error.HTTPError as err:
         body = b""
         try:
             if err.code == 429:
-                body = err.read(64 * 1024)
+                body = _read_until(err, deadline, 64 * 1024)
         except Exception:   # noqa: BLE001 - an unreadable error body is an empty one
             body = b""
         finally:
@@ -157,13 +186,37 @@ def urllib_transport(req: HttpRequest) -> HttpResponse:
     return HttpResponse(status, body)
 
 
-def _is_insufficient_quota(body: bytes) -> bool:
-    """True when a 429's JSON body says ``error.code == "insufficient_quota"``. The only thing a body is read for."""
+# OpenAI's 429 billing rows, by ``error.code`` (https://developers.openai.com/api/docs/guides/error-codes, read
+# 2026-11-05): "For billing-related errors, inspect error.code to identify the specific cause. The broader error.type
+# can still be insufficient_quota." So a code naming a limit the account holder set wins over that broad type, and a
+# spend or usage limit is not told as an empty balance (the fix there is a dashboard limit, not money).
+_SPEND_LIMIT_CODES = frozenset({"organization_spend_limit_exceeded", "project_spend_limit_exceeded",
+                                "organization_usage_limit_exceeded"})
+_OUT_OF_CREDIT_CODES = frozenset({"credit_balance_exhausted", "insufficient_quota"})
+
+
+def _code_of_429(body: bytes) -> str:
+    """The :data:`WORDS` code a 429's JSON body names: ``spend_limited`` for a spend or usage limit code,
+    ``out_of_credit`` for an empty balance (``error.code`` in :data:`_OUT_OF_CREDIT_CODES`, or ``error.type`` of
+    ``insufficient_quota`` with no limit code), else ``rate_limited``. ``error.code`` and ``error.type`` are the only
+    things a body is read for, and only as strings: a provider body is untrusted, and any other shape (a list, an
+    object, a number) is an ordinary rate limit."""
     try:
         err = json.loads(body[:64 * 1024].decode("utf-8")).get("error")
-        return isinstance(err, dict) and err.get("code") == "insufficient_quota"
     except Exception:   # noqa: BLE001 - not JSON, not an object: an ordinary rate limit
-        return False
+        return "rate_limited"
+    if not isinstance(err, dict):
+        return "rate_limited"
+    code, kind = err.get("code"), err.get("type")
+    if not isinstance(code, str):
+        code = None
+    if not isinstance(kind, str):
+        kind = None
+    if code in _SPEND_LIMIT_CODES:
+        return "spend_limited"
+    if code in _OUT_OF_CREDIT_CODES or kind == "insufficient_quota":
+        return "out_of_credit"
+    return "rate_limited"
 
 
 def _code_for(status: int, body: bytes) -> str | None:
@@ -175,7 +228,7 @@ def _code_for(status: int, body: bytes) -> str | None:
     if status == 402:
         return "out_of_credit"
     if status == 429:
-        return "out_of_credit" if _is_insufficient_quota(body) else "rate_limited"
+        return _code_of_429(body)
     if status in (408, 425) or status < 200 or 300 <= status < 400 or status >= 500:
         return "unavailable"     # a timeout, a redirect (never followed), a server fault: the provider did not answer
     return "rejected"

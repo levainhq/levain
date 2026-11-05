@@ -8,12 +8,14 @@ at delivery (:mod:`levain.consent.queue`). These are the operations ``levain con
 signing keys and refusals are the cockpit key commands' own (:mod:`levain.cockpit.keys`). A revoke can also be
 signed by a passkey on the phone (:mod:`levain.consent.grant_phone`): the link is built here (:func:`prepare_revoke`),
 signed there, and appended here (:func:`append_revoke`). Both revoke paths take what a passkey may revoke
-(:func:`levain.authority.passkey_revocable`): a consent grant, an inert one, a graduation policy or the graduation
-opt-in; a revoke only narrows, so the laptop takes the same set.
-:func:`grant_view` is what the cockpit page and the phone show: each grant, what it answered, and its revoke line.
+(:func:`levain.authority.passkey_revocable`): a consent grant, an inert one, a graduation policy, the graduation
+opt-in or a voice key; a revoke only narrows, so the laptop takes the same set.
+:func:`grant_view` is what the cockpit page and the phone show: each grant, what it answered, and its revoke line; a
+voice key (:mod:`levain.voice.custody`) is listed beside them by provider and record id, so the phone can revoke it.
 """
 from __future__ import annotations
 
+import logging
 import secrets
 import shlex
 from collections.abc import Callable, Iterable, Mapping
@@ -22,10 +24,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, AuthorityError,
-                              StaleHead, UnsignedLink, VerifierUnavailable, anchor_path, append, consent_grant,
-                              consent_grant_tool_problem, consent_resolved_workspace, contained_shell_grant,
-                              inert_grant, passkey_revocable, prepare)
+from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, VOICE_KEY_KIND,
+                              AuthorityError, StaleHead, UnsignedLink, VerifierUnavailable, anchor_path, append,
+                              consent_grant, consent_grant_tool_problem, consent_resolved_workspace,
+                              contained_shell_grant, inert_grant, passkey_revocable, prepare, voice_key_record)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
@@ -33,6 +35,8 @@ from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, 
 __all__ = ["INERT_NOTE", "ConsentGrant", "GrantChanged", "append_revoke", "create_grant", "grant_instance",
            "grant_listing", "grant_view", "list_grants", "list_inert_grants", "prepare_revoke", "revoke_command",
            "revoke_grant"]
+
+_log = logging.getLogger(__name__)
 
 
 class GrantChanged(KeyError_):
@@ -144,7 +148,8 @@ def _revocable(data_root: Path | str, grant_id: str, clock: Callable[[], datetim
                marker_directory: Path | None) -> tuple[Any, Any]:
     """The journal at ``data_root`` and its replay, once that replay holds ``grant_id`` as a grant a passkey may
     revoke (:func:`levain.authority.passkey_revocable`, the rule the replay holds a passkey's revoke to): a consent
-    grant, an inert one, a graduation policy or the graduation opt-in. Never an egress grant or a setup record."""
+    grant, an inert one, a graduation policy, the graduation opt-in or a voice key. Never an egress grant or a setup
+    record."""
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, _now(clock), ssh_keygen))
     if not passkey_revocable(state.policy.grants.get(grant_id)):
@@ -225,16 +230,19 @@ INERT_NOTE = "held inert: a newer levain's kind, it answers nothing here; revoke
 
 def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
                ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> dict[str, Any]:
-    """Every grant the cockpit the consent hooks of ``queue_dir`` name holds (expired and inert ones included), each
-    with what it answered and the line that revokes it: ``{"root", "note", "grants", "inert_note"}``. ``root`` is the
-    ONE cockpit those hooks verify against (the log the queue finds a grant in at decision time); none or more than
-    one is a ``note`` and no rows. What a grant answered is read from the queue (the requests it allowed) and the
-    ledger (whether each such call then ran): ``answered`` is ``{"count", "last_at", "recent", "refused_count"}``,
-    ``recent`` the newest ``recent`` calls, each ``{"request_id", "at", "tool", "cwd", "outcome"}``,
-    ``refused_count`` how many of ALL its calls were then refused; both counted for this instance of the grant only (``instance``, :func:`grant_instance`: an answer by an earlier grant under the same id, or by
-    this one before a renew changed it, is not its own). Read-only: nothing is created. Every string a grant's
-    creator or an agent wrote is shown through ``visible``; ``id`` is also given as is, the name a revoke route
-    takes, and ``instance`` is what that route's challenge names."""
+    """Every grant the cockpit the consent hooks of ``queue_dir`` name holds (expired and inert ones included, and each
+    voice key: ``kind`` ``voice-key``, ``state`` ``live``, ``expires_at`` empty, ``provider`` and nothing of its
+    keychain item), each with what it answered and the line that revokes it: ``{"root", "note", "grants",
+    "inert_note"}``. ``root`` is the ONE cockpit those hooks verify against (the log the queue finds a grant in at
+    decision time); none or more than one is a ``note`` and no rows. A voice-key row that cannot be built is left
+    out and logged by its fault's type name, so one bad record never takes the page (and every other revoke) down.
+    What a grant answered is read from the queue (the requests it allowed) and the ledger (whether each such call
+    then ran): ``answered`` is ``{"count", "last_at", "recent", "refused_count"}``, ``recent`` the newest ``recent``
+    calls, each ``{"request_id", "at", "tool", "cwd", "outcome"}``, ``refused_count`` how many of ALL its calls were
+    then refused; both counted for this instance of the grant only (``instance``, :func:`grant_instance`: an answer by
+    an earlier grant under the same id, or by this one before a renew changed it, is not its own). Read-only: nothing
+    is created. Every string a grant's creator or an agent wrote is shown through ``visible``; ``id`` is also given
+    as is, the name a revoke route takes, and ``instance`` is what that route's challenge names."""
     from levain.cockpit.display_safe import visible
     from levain.consent.answering import hook_roots
     from levain.consent.listing import read_grant_evidence
@@ -250,9 +258,13 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     except KeyError_ as exc:        # no journal there, a governed root, a log that does not replay: said, not raised
         return {"root": visible(str(root)), "grants": [], "inert_note": INERT_NOTE, "note": visible(str(exc))}
     consent, inert = _split(state)
-    links = {gid: state.grant_link(gid) for gid in [g.id for g in consent] + [i[0] for i in inert]}
-    evidence = read_grant_evidence(queue_dir, [(gid, *link) for gid, link in links.items() if link is not None],
-                                   recent=recent)
+    # a voice key (levain.voice.custody) is passkey-revocable too, so it is listed for its revoke; it answers no consent
+    # request, so no evidence is read for it. Its row names the provider and the record id only: the keychain item the
+    # record names (source, account) is not shown, and the record holds no value to show.
+    voice = [gid for gid, g in sorted(state.policy.grants.items()) if voice_key_record(g)]
+    links = {gid: state.grant_link(gid) for gid in [g.id for g in consent] + [i[0] for i in inert] + voice}
+    evidence = read_grant_evidence(queue_dir, [(gid, *link) for gid, link in links.items()
+                                               if link is not None and gid not in voice], recent=recent)
     stamp = utc_stamp(now)
     rows: list[dict[str, Any]] = []
 
@@ -277,6 +289,13 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         rows.append(row)
     for gid, kind, expires_at, seq in inert:
         rows.append({**common(gid, kind, expires_at, seq), "state": "inert"})
+    for gid in voice:               # no expiry: a voice key is live until it is revoked or replaced
+        link = links[gid]
+        try:
+            rows.append({**common(gid, VOICE_KEY_KIND, "", None if link is None else link[0]), "state": "live",
+                         "provider": visible(str(state.policy.grants[gid].get("provider") or ""))})
+        except Exception as exc:    # noqa: BLE001 - one row's fault is that row's, never the whole page's
+            _log.warning("grants: a voice-key row could not be shown (%s); the others are", type(exc).__name__)
     return {"root": visible(str(root)), "note": "", "grants": rows, "inert_note": INERT_NOTE}
 
 
