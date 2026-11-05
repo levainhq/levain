@@ -247,12 +247,27 @@ function serial(fn) {
   shellChain = run.then(() => {}, () => {});
   return run;
 }
+// Cache names carry a version label ('0.11.10', '1104-pwasw-1'): compared run by run, digit runs as NUMBERS (so 0.11.10 is
+// newer than 0.11.9), other runs as text. A digit run outranks a text run at the same place, so a label with no digits at all
+// (malformed) sorts below every numbered one and is then ordered as plain text. Never throws.
+function versionRuns(v) { return String(v).match(/\d+|\D+/g) || []; }
+function compareVersions(a, b) {
+  const x = versionRuns(a), y = versionRuns(b);
+  for (let i = 0; i < Math.min(x.length, y.length); i++) {
+    if (x[i] === y[i]) continue;
+    const nx = /^\d/.test(x[i]), ny = /^\d/.test(y[i]);
+    if (nx && ny) { const d = Number(x[i]) - Number(y[i]); if (d !== 0 && !Number.isNaN(d)) return d < 0 ? -1 : 1; if (x[i].length !== y[i].length) return x[i].length < y[i].length ? -1 : 1; continue; }
+    if (nx !== ny) return nx ? 1 : -1;
+    return x[i] < y[i] ? -1 : 1;
+  }
+  return x.length === y.length ? 0 : (x.length < y.length ? -1 : 1);
+}
 function carryShellForward() { return serial(carryShellForwardNow); }
 async function carryShellForwardNow() {
   if (typeof caches === 'undefined') return;
   const names = await caches.keys();
   if (names.includes(SHELL_CACHE) && await (await caches.open(SHELL_CACHE)).match(SHELL_KEY)) return;
-  for (const n of names.filter((x) => x.startsWith('levain-shell-v') && x !== SHELL_CACHE).sort().reverse()) {
+  for (const n of names.filter((x) => x.startsWith('levain-shell-v') && x !== SHELL_CACHE).sort((p, q) => compareVersions(q.slice('levain-shell-v'.length), p.slice('levain-shell-v'.length)))) {
     const from = await caches.open(n);
     const page = await from.match(SHELL_KEY);
     if (!page) continue;

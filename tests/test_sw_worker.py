@@ -413,6 +413,20 @@ def test_activation_carries_the_last_good_shell_forward_when_the_new_install_cac
 
 
 @needs_node
+def test_the_carried_shell_is_the_numerically_newest_older_generation_and_a_malformed_label_falls_back_safely() -> None:
+    """Versions were sorted as strings, so 0.11.9 outranked 0.11.10 and the older page was carried. Numeric runs compare as
+    numbers; a label with no digits at all compares as text (after any numbered one) and never throws."""
+    def carried(*labels: str) -> str:
+        got = _run("carry", json.dumps(list(labels)))
+        return got["shells"][0][1][0][1]
+    assert carried("0.11.9", "0.11.10") == "<html>shell 0.11.10</html>"
+    assert carried("0.11.10", "0.11.9") == "<html>shell 0.11.10</html>"      # input order does not matter
+    assert carried("0.2.0", "0.10.0", "0.9.5") == "<html>shell 0.10.0</html>"
+    assert carried("abc", "zzz") == "<html>shell zzz</html>"                  # no digits: plain text order, no throw
+    assert carried("0.11.9", "garbage") == "<html>shell 0.11.9</html>"        # a numbered label outranks a malformed one
+
+
+@needs_node
 def test_activation_carries_only_the_old_shell_and_the_assets_it_names_each_revalidated_else_nothing() -> None:
     """Reproduced red on 61196fff: activation copied EVERY entry of the old generation (strays, a query-mismatched asset,
     an HTML body under a script key) and the old shell stayed whole regardless."""

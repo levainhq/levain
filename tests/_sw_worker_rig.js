@@ -305,6 +305,8 @@ function fire(type, ev) {
   } else if (scenario === 'carry') {
     // an older shell exists, the current one is empty (its install fetch failed): activation carries it forward
     cacheStores.set('levain-shell-vOLD', new Map([['/', '<html>old shell</html>']])); cacheNames.add('levain-shell-vOLD');
+    // mode: JSON list of extra older generations' version labels; each holds a page that names itself
+    for (const v of mode ? JSON.parse(mode) : []) { cacheStores.set('levain-shell-v' + v, new Map([['/', '<html>shell ' + v + '</html>']])); cacheNames.add('levain-shell-v' + v); }
     await fire('activate', {});
     log.caches = [...cacheNames].sort();
     log.shells = [...cacheStores.entries()].filter(([n]) => n.startsWith('levain-shell-v') && cacheNames.has(n)).map(([n, m]) => [n, [...m.entries()]]);

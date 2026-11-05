@@ -344,6 +344,18 @@ for (const s of steps) {
       if (Date.now() >= end) throw new Error("init: the first load did not complete");
       await sleep(100);
     }
+    // A page that registers a service worker at load (the cockpit's /sw.js) is still INSTALLING it when the load event fires. Reloading
+    // while it installs races the worker's install -> activate -> clients.claim against the reload's navigation: measured, under heavy
+    // machine load, the reload's document response arrived, the worker activated in that same instant, and the navigation never
+    // committed (no Page.frameNavigated, and every Runtime.evaluate queued behind it for 60 s). So the reload waits, bounded, until the
+    // worker the page registered has settled (activated and in control); a page with no registration passes at once. Not fatal: a worker
+    // that never takes control only costs this bounded wait, and the reload is then sent as before.
+    for (const end = Date.now() + scaled(5000);;) {
+      const settled = await evaluate("(async () => { const sw = navigator.serviceWorker; if (!sw) return true; const r = await sw.getRegistration();"
+        + " if (!r) return true; return !r.installing && !!r.active && r.active.state === 'activated' && !!sw.controller; })()");
+      if (settled === true || Date.now() >= end) break;
+      await sleep(50);
+    }
     await evaluate("window.__driveOldDocument = true");   // a mark the reloaded document will not carry
     const reloaded = await send("Page.reload", {});
     if (reloaded.error) throw new Error("init: the reload was refused: " + JSON.stringify(reloaded.error));
