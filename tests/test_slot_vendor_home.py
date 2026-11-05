@@ -91,7 +91,7 @@ def test_vendor_home_rows_are_root_0755_dirs_in_base_and_early_rows():
 
 
 def _setup_plan(host: str):
-    cmd = parse_install_argv(["setup", "--slots", "2", "--verifier-slots", "1", "--operator", OP])
+    cmd = parse_install_argv(["setup", "--slots", "3", "--verifier-slots", "1", "--operator", OP])
     facts = HostFacts(host, caller_uid=OP_UID, caller_name=OP, operator_uid=OP_UID, tool_present=lambda p: True,
                       xcode_ready=lambda: True)
     return plan_setup(cmd, facts, read_sysctl=lambda p: "1", program_exists=lambda p: True)
@@ -107,7 +107,7 @@ def test_setup_makes_the_vendor_home_before_any_account_names_it():
     for p in (HOME, f"{HOME}/Library", f"{HOME}/Library/Preferences"):    # owned and moded before any account, too
         assert whys.index(f"set {p} to 0755") < min(homes) and whys.index(f"own {p} as root:wheel") < min(homes)
     pointed = sorted(s.argv[3].rsplit("/", 1)[1] for s in steps if "NFSHomeDirectory" in s.argv and s.argv[-1] == HOME)
-    assert pointed == ["_levain_c0", "_levain_s0", "_levain_s1"]
+    assert pointed == ["_levain_c0", "_levain_s0", "_levain_s1", "_levain_s2"]
     assert not [w for w in _setup_plan("linux").steps if "vendorhome" in w.why]
 
 

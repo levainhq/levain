@@ -57,6 +57,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import traceback
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -345,6 +346,19 @@ class _Holder:
         self.job: Optional[_EndJob] = None
 
 
+def _report_failure(op: str, exc: BaseException) -> None:
+    """ONE stderr line for an unexpected failure that is about to answer `internal-error`: the op, the exception's type
+    and the file:line of its last frame. Never ``str(exc)``: it can carry a path, a key or a ticket from the request.
+    Stderr is the unit's log (journald on Linux); it was `_log.warning` before, which reaches no stream unless a
+    handler is configured, so the cause appeared nowhere on the box (VM finding 5)."""
+    try:
+        tb = traceback.extract_tb(exc.__traceback__)
+        where = f"{os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else "?"
+        print(f"levain dispatch-run: op {str(op)[:32]!r} failed: {type(exc).__name__} at {where}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 - reporting must never turn a refusal into a crash
+        pass
+
+
 class _EndJob:
     def __init__(self) -> None:
         self.done = threading.Event()
@@ -412,7 +426,7 @@ class RunServer:
                     self._send(sock, C.refused_answer(rid, "bad-request", str(exc)))
                     return
                 except Exception as exc:  # noqa: BLE001
-                    _log.warning("op %s failed (%s)", op, type(exc).__name__)
+                    _report_failure(op, exc)
                     ans = C.refused_answer(rid, "internal-error", reason_class="transient")
                 if not self._send(sock, ans):
                     return

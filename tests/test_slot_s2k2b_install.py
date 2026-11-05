@@ -239,8 +239,8 @@ def test_replenish_without_the_pool_record_refuses_by_name(tmp_path):
 def test_setup_writes_the_pool_record_and_undo_removes_it(host):
     plan = _PLAN(parse_install_argv(SETUP), Gathered(_facts(host)))
     writes = [s.write for s in plan.steps if s.write and s.write[0] == pool_config_path(host)]
-    assert writes == [(pool_config_path(host), pool_config_text(2, 1), 0o644)]
-    assert canon.parse(writes[0][1].encode()) == {"format": POOL_CONFIG_FORMAT, "slots": 2, "verifier_slots": 1}
+    assert writes == [(pool_config_path(host), pool_config_text(3, 1), 0o644)]
+    assert canon.parse(writes[0][1].encode()) == {"format": POOL_CONFIG_FORMAT, "slots": 3, "verifier_slots": 1}
     assert pool_config_path(host) in {r.path for r in plan.rows}
     undo = _PLAN(parse_install_argv(["undo"]), Gathered(_set_up(host),
                                                         accounts={"_levain_s0": RANGES[host].slots[0]}))

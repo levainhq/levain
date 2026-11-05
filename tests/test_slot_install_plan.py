@@ -250,7 +250,7 @@ def test_egress0_and_verifier0_disjoint():
     assert (e0.lock_path(store), v0.lock_path(store)) == (store / "slots/e0/lock", store / "slots/v0/lock")
     assert (e0.netns, v0.netns) == ("levain-e0", "levain-v0")
     assert (e0.cgroup, v0.cgroup) == ("e0.scope", "v0.scope")
-    plan = plan_setup(_setup(1, 1), _facts("linux"))
+    plan = plan_setup(_setup(3, 1), _facts("linux"))
     paths = {r.path for r in plan.rows}
     assert {e0.lock_path(store), v0.lock_path(store), e0.slot_dir(store), v0.slot_dir(store)} <= paths
     ids = plan.allocation.ids
@@ -283,7 +283,7 @@ def test_install_verbs_refuse_with_live_lease(verb):
 
 @pytest.mark.parametrize("host", HOSTS)
 def test_slot_account_shape(host):
-    plan = plan_setup(_setup(1, 1), _facts(host))
+    plan = plan_setup(_setup(3, 1), _facts(host))
     # §1.1's char bound is on the slot names (widest index); every name stays inside Linux's limit
     assert all(len(n) <= 15 for n in SlotId("egress", 63).accounts + SlotId("none", 63).accounts)
     assert all(len(n) <= 32 for n in SINGLETONS)
@@ -315,7 +315,7 @@ def test_slot_account_shape(host):
 
 @pytest.mark.parametrize("host", HOSTS)
 def test_slot_socket_group_inherited(host):
-    plan = plan_setup(_setup(2, 2), _facts(host))
+    plan = plan_setup(_setup(3, 2), _facts(host))
     R = RUN[host]
     by_path = {r.path: r for r in plan.rows}
     for n in range(2):
@@ -328,7 +328,7 @@ def test_slot_socket_group_inherited(host):
             assert idx["chown"] < idx["chmod"]          # mode (setgid) set after the chown
             assert plan.steps[idx["chmod"]].argv[1] == "2750"
     # verifier class has no socket dirs
-    assert not [p for p in by_path if p.parent in (R / "gw", R / "qb", R / "planner") and p.name not in ("slot0", "slot1")]
+    assert not [p for p in by_path if p.parent in (R / "gw", R / "qb", R / "planner") and p.name not in ("slot0", "slot1", "slot2")]
 
 
 #: CONTRACT §2.1, every DIRECTORY row not per-session, typed out (§20: install makes each one whoever
@@ -356,7 +356,7 @@ STORE_DIRS = {
 
 @pytest.mark.parametrize("host", HOSTS)
 def test_store_layout(host):
-    plan = plan_setup(_setup(1, 1), _facts(host))
+    plan = plan_setup(_setup(3, 1), _facts(host))
     L = STORE[host]
     root_grp = "wheel" if host == "darwin" else "root"
     rows = {r.path: (r.owner, r.group, r.mode, r.kind) for r in plan.rows}
@@ -397,7 +397,7 @@ def test_store_layout(host):
 def test_keys_dir_traversable_by_both_peers(host):
     """§2.2 (c7.2): R/keys/ is _levain_keys:_levain_keys 0711. Its two sockets' peers (every
     _levain_gw<n> via levain-gwfronts; _levain_control) are both OTHER to the dir: they traverse, none lists."""
-    plan = plan_setup(_setup(2, 1), _facts(host))
+    plan = plan_setup(_setup(3, 1), _facts(host))
     row = next(r for r in plan.rows if r.path == RUN[host] / "keys")
     assert (row.owner, row.group, row.mode) == ("_levain_keys", "_levain_keys", 0o711)
     groups = {a.name: set(a.groups) | {a.name} for a in plan.accounts}
@@ -439,7 +439,7 @@ def test_sudoers_text(host):
                 "cmnd_alias", "Host_ALIAS", "runas_alias", "x_alias"):
         assert _refusal(runtime_sudoers_text, host, bad) == "bad-operator"
         assert _refusal(install_sudoers_text, host, bad) == "bad-operator"
-    assert _refusal(parse_install_argv, ["setup", "--slots", "1", "--verifier-slots", "1", "--operator",
+    assert _refusal(parse_install_argv, ["setup", "--slots", "3", "--verifier-slots", "1", "--operator",
                                          "Defaults"]) == "bad-operator"
     for ok in ("alice", "default", "alias", "bob_aliases"):
         assert install_sudoers_text(host, ok)                 # positive control: the reserved words only
@@ -484,3 +484,51 @@ def test_base_map_formats_are_the_policy_readers_formats():
     from levain.slot import layout
     assert layout.BASE_ROUTES_FORMATS == policy.BASE_MAP_FORMATS
     assert layout.BASE_ROUTES_FORMAT == policy.BASE_MAP_FORMATS[-1] == "levain-routes-base/2"
+
+
+def test_parser_accepts_small_slot_counts_the_planner_decides():
+    """The minimum is state-aware, so it is not the parser's: a legacy install or an interrupted setup journal made
+    with `--slots 1|2` must still be able to name its exact original command. The grammar keeps its old range."""
+    from levain.slot import grammar
+    assert grammar.MIN_SETUP_SLOTS == 1 + grammar.EGRESS_RESERVE + 1 == 3
+    for n in (1, 2):
+        assert parse_install_argv(["setup", "--slots", str(n), "--verifier-slots", "5", "--operator", OP]).slots == n
+
+
+@pytest.mark.parametrize("host", HOSTS)
+@pytest.mark.parametrize("n", [1, 2])
+def test_fresh_planned_setup_refuses_fewer_egress_slots_than_a_launch_needs(host, n):
+    """VM finding 7: one marked dispatch slot + the pool's egress reserve + one free slot is three; a FRESH setup
+    (no journal, no slot accounts an interrupted setup made) with fewer is refused `too-few-slots`, and says why.
+    A hand-built InstallCommand takes the same road, since the check is in the planner, not the parser."""
+    from levain.slot.grammar import InstallCommand
+    cmd = InstallCommand("setup", slots=n, verifier_slots=5, operator=OP, roots=())
+    with pytest.raises(Refused) as ei:
+        plan_setup(cmd, _facts(host))
+    assert ei.value.name == "too-few-slots"
+    assert "3" in str(ei.value) and "dispatch" in str(ei.value) and "reserve" in str(ei.value)
+    plan_setup(_setup(3, 1), _facts(host))                      # positive control: exactly the minimum
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_interrupted_setup_with_two_slots_resumes_at_its_recorded_counts(host, monkeypatch):
+    """An interrupted setup journal written by the release that allowed `--slots 2` is resumed by its exact command
+    (the parser lets it through, and the planner does not apply the fresh-setup minimum to a journal)."""
+    from levain.slot import install_helper as IH
+    with monkeypatch.context() as m:                            # the old release's rule: no minimum
+        m.setattr(IH, "MIN_SETUP_SLOTS", 1)
+        journal = plan_setup(_setup(2, 1), _facts(host)).intent
+    assert [n for n in journal.accounts if "gw" in n or n.startswith("_levain_s")]    # a two-slot journal, not empty
+    resumed = plan_setup(_setup(2, 1), _facts(host, intent=journal))
+    assert len(resumed.allocation.slots) == 3                   # 2 egress + 1 verifier, at the journal's allocation
+    # a different count is still the existing re-run-as-it-was refusal, not the minimum
+    assert _refusal(plan_setup, _setup(3, 1), _facts(host, intent=journal)) == "install-interrupted"
+
+
+def test_other_argv_errors_come_before_the_slot_minimum():
+    """Refusal order: the grammar rejects a bad verifier count or operator before the planner ever sees the slot
+    count, so a user with several wrong arguments sees the argv error first (the minimum cannot mask it)."""
+    assert _refusal(parse_install_argv, ["setup", "--slots", "2", "--verifier-slots", "0", "--operator", OP]) \
+        == "out-of-range"
+    assert _refusal(parse_install_argv, ["setup", "--slots", "2", "--verifier-slots", "1", "--operator",
+                                         "Defaults"]) == "bad-operator"

@@ -70,6 +70,14 @@ KEY_TYPE_NAMES = frozenset({"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-ni
 MAX_PASSKEYS = 8                             # DECISION: rev 2 sets no cap
 SLOT_CLASSES = ("egress", "none")            # CONTRACT §5.1 class enum
 
+#: The egress slots the pool holds back for the operator (CONTRACT §3.5 Pool: ``egress_free`` = free - open tickets - this).
+#: ``levain.slot.tickets`` reads it from here; the setup minimum below is derived from it.
+EGRESS_RESERVE = 1
+#: The least ``--slots`` a setup can LAUNCH on: the one marked dispatch slot (it holds a credential, so it is never
+#: free) + the reserve + one free slot. Verifier slots are another class and do not count. (VM finding 7: 2 -> ``no-free-slot``.) NOT enforced by
+#: the parser: a legacy install or an interrupted setup journal made with fewer must still name its exact command;
+#: ``install_helper.plan_setup`` applies it to a fresh setup only.
+MIN_SETUP_SLOTS = 1 + EGRESS_RESERVE + 1
 MAX_SLOTS = 32                               # CONTRACT §1.1 N cap
 MAX_VERIFIER_SLOTS = 16                      # CONTRACT §1.1 M cap
 INDEX_SPACE = 64                             # CONTRACT §1.1 index space

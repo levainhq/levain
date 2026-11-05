@@ -75,7 +75,7 @@ def _refusal(fn, *a, **kw) -> str:
 
 
 def test_tmpfiles_conf_matches_run_dirs():
-    plan = _plan("linux", 2, 1)
+    plan = _plan("linux", 3, 1)
     w = [s for s in plan.steps if s.write and s.write[0] == TMPFILES_CONF]
     assert len(w) == 1 and w[0].write[2] == 0o644
     lines = [ln for ln in w[0].write[1].splitlines() if not ln.startswith("#")]
@@ -95,9 +95,9 @@ def test_tmpfiles_conf_matches_run_dirs():
     ids = dict(plan.allocation.ids)
     rep = plan_replenish(parse_install_argv(["replenish"]),
                          _set_up("linux", used_ids=frozenset(ids.values()), existing_names=frozenset(ids)),
-                         slots=3, verifier_slots=1, live={"egress": range(2), "none": range(1)})
+                         slots=4, verifier_slots=1, live={"egress": range(3), "none": range(1)})
     text = next(s.write[1] for s in rep.steps if s.write and s.write[0] == TMPFILES_CONF)
-    assert "d /run/levain/gw/slot2 2750 _levain_gw2 _levain_s2 -" in text
+    assert "d /run/levain/gw/slot3 2750 _levain_gw3 _levain_s3 -" in text
     assert "d /run/levain/gw/slot0 2750 _levain_gw0 _levain_s0 -" in text
     undo = _undo("linux", ids)
     assert [s for s in undo.steps if s.argv[-2:] == ("-f", str(TMPFILES_CONF))]
@@ -179,7 +179,7 @@ def test_partial_setup_reruns(host):
     bad = {**live, "_levain_control": 0}
     assert _refusal(_plan, host, 3, 2, existing_names=names, levain_live=bad) == "account-exists"
     # it made more slots than this run asks for: refused, never silently orphaned
-    assert _refusal(_plan, host, 2, 2, existing_names=names, levain_live=live) == "account-exists"
+    assert _refusal(_plan, host, 3, 1, existing_names=names, levain_live=live) == "account-exists"
     # a complete install (the record written last) is already-set-up
     assert _refusal(plan_setup, _setup(3, 2), _set_up(host)) == "already-set-up"
 
@@ -206,7 +206,7 @@ def test_reserve_and_lock_files_skip_when_present(tmp_path):
 def test_undo_reruns_after_failure(host):
     """The install rule is undo's last removal before the record: a failed undo re-runs through it,
     and the re-run (accounts already tombstoned, groups gone) plans and skips what is done."""
-    plan = _plan(host, 2, 1)
+    plan = _plan(host, 3, 1)
     ids = dict(plan.allocation.ids)
     undo = _undo(host, ids)
     def install_rule_at(p):   # the install rule's removal, then the journal, the record, the visudo -c (FIX1 M1)
@@ -244,7 +244,7 @@ def test_undo_refuses_out_of_range_uid(host):
 def test_undo_leaves_no_shared_gid_on_store(host):
     """Before a shared group is deleted, every store (and run) dir whose row names one is chgrp'd to
     the host's gid-0 group, so no deleted gid is left on a dir for a later group to inherit."""
-    plan = _plan(host, 1, 1)
+    plan = _plan(host, 3, 1)
     named = {r.path for r in plan.rows if r.group in SHARED_GROUPS}
     L = STORE[host]
     assert {L / "export/operator", L / "export/dispatch", L / "queue/requests", L / "queue/answers",
@@ -271,7 +271,7 @@ def _dirstat(uid):
 
 def test_roots_recorded_and_patterned():
     roots = ("/Users/alice/a", "/Users/alice/b")
-    plan = plan_setup(_setup(1, 1, *roots), _facts("darwin"), realpath=lambda p: p, lstat=lambda p: _dirstat(OP_UID))
+    plan = plan_setup(_setup(3, 1, *roots), _facts("darwin"), realpath=lambda p: p, lstat=lambda p: _dirstat(OP_UID))
     w = [s for s in plan.steps if s.write and s.write[0] == roots_path("darwin")]
     assert len(w) == 1 and w[0].write[1:] == ('{"format":"levain-roots/1","roots":["/Users/alice/a","/Users/alice/b"]}',
                                              0o644)
@@ -279,9 +279,9 @@ def test_roots_recorded_and_patterned():
     # the exact pattern: no control character, no quote
     for bad in ("/a\nb", "/a\tb", '/a"b', "/a'b", "/a\x7fb", "relative", "/a/../b"):
         assert _refusal(_setup, 1, 1, bad) == "bad-root", repr(bad)
-    _setup(1, 1, "/a b/c-d_e.f")                                         # positive control: spaces are fine
+    _setup(3, 1, "/a b/c-d_e.f")                                         # positive control: spaces are fine
     many = [f"/r{i}" for i in range(MAX_ROOTS)]
-    _setup(1, 1, *many)
+    _setup(3, 1, *many)
     assert _refusal(_setup, 1, 1, *many, "/one-more") == "out-of-range"
     # a resolved path is held to the same pattern
     assert _refusal(check_roots, ["/x"], OP_UID, realpath=lambda p: "/x\ny", lstat=lambda p: _dirstat(OP_UID)) == "bad-root"
@@ -298,7 +298,7 @@ def test_check_roots_oserror_is_root_missing():
 
 
 def test_store_single_filesystem():
-    plan = _plan("linux", 2, 1)
+    plan = _plan("linux", 3, 1)
     chk = [s for s in plan.steps if s.call and "one filesystem" in s.why]
     assert len(chk) == 1
     paths = single_filesystem_paths("linux", plan.allocation.slots)

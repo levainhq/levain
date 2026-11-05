@@ -58,7 +58,7 @@ from levain.slot.accounts import (SLOT_MARKER, SLOT_RETIRED_MARKER, Account, Gro
                                   shared_group_steps, shared_groups_of, member_state, group_state, uid_retires,
                                   account_state, remove_member_steps, remove_group_steps, remove_account_steps,
                                   vendor_home_steps)
-from levain.slot.grammar import (KEY_TYPE_NAMES, LEASE_EXEMPT, PUBLIC_KEY_RE, ROUTES_REPLACE_INTENT, SESSION_RE, VERBS,
+from levain.slot.grammar import (EGRESS_RESERVE, MIN_SETUP_SLOTS, KEY_TYPE_NAMES, LEASE_EXEMPT, PUBLIC_KEY_RE, ROUTES_REPLACE_INTENT, SESSION_RE, VERBS,
                                  InstallCommand, check_roots, parse_install_argv)
 from levain.slot.ids import (RANGES, RETIRED_IDS_PATH, SHARED_GROUPS, SINGLETONS, SLOT_NAME_RE, Allocation,
                              SlotClass, SlotId, allocate, check_capacity, choose_indices, in_own_range,
@@ -600,6 +600,13 @@ def plan_setup(cmd: InstallCommand, facts: HostFacts, *,
     roots = check_roots(cmd.roots, facts.operator_uid, realpath=realpath, lstat=lstat)
     reuse = _reuse(facts, cmd.slots, cmd.verifier_slots)
     check_capacity(host, cmd.slots, cmd.verifier_slots, facts.retired)
+    if journal is None and not any(s.slot_class == "egress" for s in reuse.kept_slots) and cmd.slots < MIN_SETUP_SLOTS:
+        # VM finding 7, a FRESH setup only (no journal, no slot an interrupted setup made): one marked dispatch slot +
+        # the pool's egress reserve + one free slot, or a launch is always `no-free-slot`. A resume or re-run at its
+        # recorded counts (a release that allowed fewer made them) is never refused for the count.
+        raise Refused("too-few-slots", f"--slots {cmd.slots}: a dispatch install needs at least {MIN_SETUP_SLOTS} egress "
+                      f"slots (the marked dispatch slot, the operator's reserve of {EGRESS_RESERVE}, and one free slot); "
+                      f"with fewer a launch is always refused no-free-slot. Verifier slots do not count toward it")
     chosen: dict[SlotClass, tuple[SlotId, ...]] = {}
     keep, keep_shared = dict(reuse.keep), dict(reuse.keep_shared)
     if journal is not None:

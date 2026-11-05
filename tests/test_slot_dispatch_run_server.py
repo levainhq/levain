@@ -635,3 +635,34 @@ def test_the_registered_launcher_answers_end_session_through_to_the_real_server(
     env.launcher.spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
     assert _executor(rig, oid, got, DEAD).stop(10).terminated is True
     assert env.runtime.ended == ["sess-1"]
+
+
+def test_an_unexpected_launch_failure_answers_internal_error_and_leaves_one_cause_line_on_stderr(rig, env, monkeypatch,
+                                                                                                 capsys):
+    """VM finding 5: a non-LauncherRefused failure reached the operator as a bare `internal-error` with its cause
+    nowhere on the box. The cause line names the type and the last frame, never a field of the request."""
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    key = "s-00000000000000c7"
+
+    def boom(launch):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(env.launcher, "spawn", boom)
+    with pytest.raises(L.LauncherRefused) as exc:
+        env.client().spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
+    assert (exc.value.name, exc.value.reason_class) == ("internal-error", "transient")
+    env.drain()
+    err = [ln for ln in capsys.readouterr().err.splitlines() if "RuntimeError" in ln]
+    assert len(err) == 1, err
+    assert "dispatch_run" in err[0] or "test_slot_dispatch_run_server" in err[0] or ".py:" in err[0]
+    for secret in (key, str(oid), "passthrough"):
+        assert secret not in err[0]
+
+
+def test_the_cause_line_stays_one_line_whatever_op_the_client_sent(capsys):
+    """L3 setupfix r2: `op` comes from the client frame; a newline in it must not forge a second journald line."""
+    D._report_failure("LAUNCH\nlevain dispatch-run: op END failed: forged\r" + "x" * 500, RuntimeError("boom"))
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1, lines
+    assert "forged" not in lines[0].split("failed:")[0][len("levain dispatch-run: op "):] or "\\n" in lines[0]
+    assert len(lines[0]) < 200
