@@ -659,15 +659,16 @@ def default_run_socket() -> Path:
 
 
 def unix_connector(path: Path | str, *, timeout: float = _CONNECT_S) -> Callable[[], socket.socket]:
-    def connect() -> socket.socket:
+    def connect(within: float | None = None) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sock.settimeout(timeout)
+            sock.settimeout(timeout if within is None else max(0.001, min(timeout, within)))
             sock.connect(str(path))
         except OSError:
             sock.close()
             raise
         return sock
+    connect.accepts_within = True  # type: ignore[attr-defined]  # end_session caps the connect to its remaining deadline
     return connect
 
 
@@ -817,8 +818,22 @@ class DispatchSessionLauncher:
             if type(session_key) is not str or _ctl.SESSION_KEY_RE.fullmatch(session_key) is None:
                 return StopResult(False, "the session key is off the grammar; nothing asked")
             deadline = max(0.0, float(deadline_s))
-            ans = self._short("END", ("terminated", "detail"), deadline + _ANSWER_MARGIN_S, session_key=session_key,
-                              deadline_ms=int(deadline * 1000))
+            if not deadline < float("inf"):
+                raise ValueError("deadline is not finite")
+            # ONE absolute deadline, set before the connect: the connect, the read and the server's hold all draw on
+            # it, and no answer margin extends it (the server is asked for a little less than is left)
+            end = time.monotonic() + deadline
+            sock = self._connect(max(0.001, deadline)) if getattr(self._connect, "accepts_within", False) \
+                else self._connect()
+            conn = _Conn(sock)
+            try:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return StopResult(False, "the deadline was spent connecting; nothing assumed ended")
+                ans = conn.request("END", ("terminated", "detail"), timeout=left, session_key=session_key,
+                                   deadline_ms=int(max(0.0, left - min(1.0, left * 0.2)) * 1000))
+            finally:
+                conn.close()
             if type(ans["detail"]) is not str:
                 raise WireError("detail is not text")
             detail = ans["detail"][:_DETAIL_MAX]            # a long detail never undoes a proven stop

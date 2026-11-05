@@ -574,3 +574,46 @@ def test_a_recorded_exit_is_never_downgraded_by_a_later_abort_or_terminate(rig, 
     assert kid.abort() == 0 and kid.abort(float("nan")) == 0
     kid.process.terminate()
     assert kid.process.poll() == 0 and kid.process.wait() == 0
+
+
+def test_an_end_never_outlives_its_one_absolute_deadline(rig):
+    """A slow connect spends the caller's deadline: the answer wait gets only what remains (no deadline+margin on top)."""
+    import time
+    seen = {}
+
+    class _Sock:
+        def settimeout(self, t):
+            seen["timeout"] = t
+
+        def sendall(self, b):
+            raise OSError("stop here")
+
+        def shutdown(self, how):
+            pass
+
+        def close(self):
+            pass
+
+    def slow_connect():
+        time.sleep(0.4)
+        return _Sock()
+
+    client = C.DispatchSessionLauncher(slow_connect, lambda occ: None)
+    t0 = time.monotonic()
+    got = client.end_session("s-0123456789abcdef", 1.0)
+    assert got.terminated is False
+    assert seen["timeout"] <= 0.61, seen
+    assert time.monotonic() - t0 < 1.2
+
+
+def test_an_end_whose_connect_spent_the_whole_deadline_asks_nothing(rig):
+    import time
+    asked = []
+
+    def slow_connect():
+        time.sleep(0.3)
+        asked.append("connected")
+        raise OSError("down")
+
+    client = C.DispatchSessionLauncher(slow_connect, lambda occ: None)
+    assert client.end_session("s-0123456789abcdef", 0.1).terminated is False
