@@ -719,7 +719,14 @@
       const nm = el("span", "dev-name", f.label || f.id);
       nm.dir = "auto";
       li.appendChild(nm);
-      if (f.id === caller) { hasSelf = true; li.appendChild(el("span", "pill dev-pill dev-self", "THIS DEVICE: you will be signed out")); }
+      // the sign-out words follow the action: the target itself is signed out by either button; a device it paired is
+      // signed out only by the family revoke ("Revoke only" hands it on, still signed in)
+      if (f.id === caller) {
+        hasSelf = true;
+        li.appendChild(el("span", "pill dev-pill dev-self", f.id === d.id
+          ? "THIS DEVICE: you will be signed out"
+          : "THIS DEVICE: signed out if you revoke all; “Revoke only” keeps it"));
+      }
       li.appendChild(el("div", "dev-meta", (f.paired_by ? "paired by " + pairedByWords(f.paired_by) + " · " : "") + "last seen " + when(f.last_seen, now)));
       ul.appendChild(li);
     }

@@ -173,6 +173,7 @@ CLICK_REVOKE = ("(() => { const b = [...document.querySelectorAll('.dev-list .de
                 " x.getAttribute('aria-label').includes('%s')); b.click(); return 1; })()")
 CARD = ("JSON.stringify({items: [...document.querySelectorAll('.dev-confirm-item .dev-name')].map((n) => n.textContent),"
         " self: [...document.querySelectorAll('.dev-self')].map((n) => n.closest('.dev-confirm-item').querySelector('.dev-name').textContent),"
+        " badge: [...document.querySelectorAll('.dev-self')].map((n) => n.textContent),"
         " btns: [...document.querySelectorAll('.dev-confirm-acts .dev-btn')].map((b) => b.textContent),"
         " focus: document.activeElement.textContent,"
         " overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth})")
@@ -215,6 +216,10 @@ def test_the_confirm_card_names_the_family_marks_this_device_and_focuses_the_saf
     assert sorted(four["items"]) == ["ipad", "iphone", "laptop", "pixel"], four
     assert four["self"] == ["iphone"], four
     assert four["btns"][0].startswith("Revoke only") and "sign this one out" in four["btns"][1], four
+    # the caller is a CHILD of the target: "Revoke only" re-parents it and it stays signed in, so neither that button nor
+    # the badge says it will be signed out (head 30, codex LOW r1)
+    assert "sign" not in four["btns"][0], four
+    assert "you will be signed out" not in four["badge"][0] and "Revoke only" in four["badge"][0], four
     assert four["focus"].startswith("Revoke only"), four
     assert four["overflow"] <= 0, four
     solo = json.loads([x for x in v if isinstance(x, str) and x.startswith("{")][1])
@@ -281,6 +286,8 @@ def test_the_card_follows_the_last_click_warns_on_this_device_and_closes_on_an_a
     card = json.loads(next(x for x in v if isinstance(x, str) and x.startswith("{")))
     assert card["self"] == ["laptop"], card
     assert card["btns"][0].startswith("Revoke only") and card["btns"][0].endswith("and sign this one out"), card
+    assert card["btns"][1].endswith("and sign this one out"), card
+    assert card["badge"] == ["THIS DEVICE: you will be signed out"], card          # the caller IS the target
     heads = [x for x in v if isinstance(x, str) and x.startswith("Revoke ")]
     assert len(heads) == 1 and "pixel" in heads[0], v
     assert False in v, v                     # no card reopened after Cancel
