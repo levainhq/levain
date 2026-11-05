@@ -7,8 +7,10 @@ from __future__ import annotations
 import json
 import os
 import stat
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -1121,6 +1123,26 @@ _INSIDE = ["Read", "Grep", "Read(**)", "Read(*)", "Read(./src/**)", "Read(src/*.
            "Read(//{cwd})", "Bash(ls:*)", "WebFetch(domain:example.com)", "mcp__levain_room__drop"]
 
 
+@pytest.fixture
+def short_tmp():
+    """A short base directory for a test whose assertion reads a refusal that names the path TWICE (the settings file and
+    the rule). ``settings_scope_refusal`` caps its message at 400 characters (``_one_line``), so under pytest's default
+    macOS base (``/private/var/folders/.../pytest-of-<user>/pytest-N/<test>``, ~116 characters before the test's own
+    names) the tail that holds "outside its directory" is cut and the assertion reads a message that real use (an
+    operator path of ~90 characters in all) never produces. The product still refuses: only the explanation is clipped."""
+    base = "/tmp" if os.path.isdir("/tmp") else None
+    d = Path(os.path.realpath(tempfile.mkdtemp(prefix="rl-", dir=base)))
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@pytest.fixture
+def short_world(short_tmp):
+    w = build(short_tmp)
+    yield w
+    teardown(w)
+
+
 def _rule_world(tmp_path):
     home, cwd, other = tmp_path / "h", tmp_path / "proj", tmp_path / "other"
     for d in (home / ".claude", cwd / "src", other):
@@ -1129,10 +1151,10 @@ def _rule_world(tmp_path):
 
 
 @pytest.mark.parametrize("rule", _OUTSIDE)
-def test_k3_a_path_specific_file_allow_rule_outside_the_room_refuses(tmp_path, rule):
+def test_k3_a_path_specific_file_allow_rule_outside_the_room_refuses(short_tmp, rule):
     """FINDINGS_room_r2 K3: the check saw only additionalDirectories; a path-specific Read allow outside the cwd widens
     the read scope while the one scope decoy (a fresh temp dir) can still be denied."""
-    home, cwd, other = _rule_world(tmp_path)
+    home, cwd, other = _rule_world(short_tmp)
     r = rule.format(other=str(other).lstrip("/"), cwd=str(cwd).lstrip("/"))
     (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Read", r]}}))
     why = room_launch.settings_scope_refusal({}, str(home), cwd=str(cwd))
@@ -1166,10 +1188,11 @@ def test_k3_a_managed_file_or_profile_with_an_outside_rule_refuses_and_allow_mus
     assert "not a list" in room_launch.settings_scope_refusal({}, str(home), cwd=str(cwd))
 
 
-def test_k3_the_launcher_refuses_an_outside_rule_before_any_spawn(world, tmp_path, monkeypatch):
+def test_k3_the_launcher_refuses_an_outside_rule_before_any_spawn(short_world, short_tmp, monkeypatch):
+    world = short_world
     (world["home"] / ".claude").mkdir()
     (world["home"] / ".claude" / "settings.json").write_text(
-        json.dumps({"permissions": {"allow": [f"Read(/{tmp_path}/elsewhere/**)"]}}))
+        json.dumps({"permissions": {"allow": [f"Read(/{short_tmp}/elsewhere/**)"]}}))
     with pytest.raises(RoomLaunchError, match="outside its directory"):
         _scope_launcher(world, {}).ensure()
     assert spawns(world) == []
@@ -1227,11 +1250,12 @@ def test_r3_1_a_drop_in_directory_that_cannot_be_listed_refuses(tmp_path, monkey
     assert why is not None and "cannot be read" in why and str(d) in why, why
 
 
-def test_r3_1_the_launcher_refuses_a_drop_in_rule_before_any_spawn(world, tmp_path, monkeypatch):
-    sysdir, managed = _managed_dir(tmp_path)
+def test_r3_1_the_launcher_refuses_a_drop_in_rule_before_any_spawn(short_world, short_tmp, monkeypatch):
+    world = short_world
+    sysdir, managed = _managed_dir(short_tmp)
     _point_owner_at(monkeypatch, managed)
     (sysdir / "managed-settings.d" / "x.json").write_text(
-        json.dumps({"permissions": {"allow": [f"Read(/{tmp_path}/elsewhere/**)"]}}))
+        json.dumps({"permissions": {"allow": [f"Read(/{short_tmp}/elsewhere/**)"]}}))
     with pytest.raises(RoomLaunchError, match="outside its directory"):
         _scope_launcher(world, {}).ensure()
     assert spawns(world) == []
@@ -1282,9 +1306,9 @@ def test_r3_2_an_all_relative_search_path_is_not_passed_as_the_empty_path():
     assert "" not in os.get_exec_path(env)
 
 
-def test_r3_low_a_parent_segment_after_a_glob_counts_as_outside(tmp_path):
+def test_r3_low_a_parent_segment_after_a_glob_counts_as_outside(short_tmp):
     """FINDINGS_room_r3 LOW: the literal-prefix cut stopped at the first glob, so `..` after it climbed out unseen."""
-    home, cwd, _other = _rule_world(tmp_path)
+    home, cwd, _other = _rule_world(short_tmp)
     for r in (f"Read(/{cwd}/*/../../other/**)", "Read(src/**/../../../other/x)"):
         (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": [r]}}))
         assert "outside its directory" in (room_launch.settings_scope_refusal({}, str(home), cwd=str(cwd))
