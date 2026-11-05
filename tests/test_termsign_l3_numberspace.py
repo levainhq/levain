@@ -422,8 +422,11 @@ def test_the_suite_cannot_reach_the_real_terminal_key():
     # 11-04: band-answer tests under a session reached `ssh-keygen -Y sign` on the real key (a Touch ID sheet per run);
     # conftest's autouse guard refuses the real key directory at both signer factories, before any signer exists.
     from levain.consent import terminal_sign as ts
+    from levain.cockpit import keys as K
 
-    real = ts._real_key_dir() / ts.KEY_LABEL
+    # keyguard r2: conftest redirects ``ts._real_key_dir`` to a no-key temp dir (first wall), so the REAL key is the one
+    # the guard itself judges, ``K.pwd_key_dir()`` (the passwd-database home, not the environment)
+    real = K.pwd_key_dir() / ts.KEY_LABEL
     with pytest.raises(AssertionError, match="real terminal key"):
         ts.default_signer_factory(real, 1.0)
     with pytest.raises(AssertionError, match="real terminal key"):
