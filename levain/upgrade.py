@@ -519,26 +519,39 @@ def _ask_live(s: Seams) -> tuple[bool, Any]:
     return ans
 
 
-def _live_split(recs: Any) -> tuple[list[str], list[str]]:
-    """(agent labels, own labels) for the records whose state is live. A record off the shape still counts: an
-    unreadable one is a session that may be running."""
+_SETTLING = frozenset({"REVOKED", "FROZEN", "DEAD", "CREDENTIAL_PARKED"})     # END is on its way
+
+
+def _ending(recs: Any) -> list[tuple[str, Any]]:
+    """The ONE predicate for "still running or ending": (label, record) for every record that is in a live state, holds
+    a lease in ANY state (root's reader counts that), or is in a state END is on its way from. Both the wait loop and
+    the offer read this, so a session mid-end is never "gone" to one and "running" to the other. A record off the
+    shape still counts, labelled "?" (record None): an unreadable one is a session that may be running. Root's own
+    preflight stays the oracle; this only decides what Levain waits for and names."""
     from levain.slot import records as R
     from levain.slot.grammar import SESSION_RE
 
-    agents: list[str] = []
-    own: list[str] = []
+    out: list[tuple[str, Any]] = []
     for r in recs:
         if type(r) is not dict:
-            agents.append("?")
+            out.append(("?", None))
             continue
         st = r.get("state")
         known = type(st) is str and st in R.STATES      # an unhashable or unknown state is a session that may run
-        if known and st not in R.LIVE_STATES and r.get("lease_live") is not True:
-            continue                # root counts lease_live in ANY state, so a REVOKED or HELD record with one runs
+        if known and st not in R.LIVE_STATES and st not in _SETTLING and r.get("lease_live") is not True:
+            continue
         sess = r.get("session")
-        claims = r.get("claims")
+        out.append((sess if type(sess) is str and SESSION_RE.fullmatch(sess) else "?", r))
+    return sorted(out, key=lambda x: x[0])
+
+
+def _live_split(recs: Any) -> tuple[list[str], list[str]]:
+    """(agent labels, own labels) of :func:`_ending`."""
+    agents: list[str] = []
+    own: list[str] = []
+    for label, r in _ending(recs):
+        claims = r.get("claims") if r is not None else None
         kind = claims.get("kind") if type(claims) is dict else None
-        label = sess if type(sess) is str and SESSION_RE.fullmatch(sess) else "?"
         (own if kind in _OWN_KINDS else agents).append(label)
     return sorted(agents), sorted(own)
 
@@ -602,29 +615,6 @@ def _wait(s: Seams, minutes: int) -> Optional[bool]:
         return None
 
 
-def _leased(recs: Any) -> list[str]:
-    """Labels of the records the root repair would refuse (`live-lease`): a live state whose ``lease_live`` is not
-    False. An off-shape record counts, as in :func:`_live_split`."""
-    from levain.slot import records as R
-    from levain.slot.grammar import SESSION_RE
-
-    out: list[str] = []
-    for r in recs:
-        if type(r) is not dict:
-            out.append("?")
-            continue
-        st = r.get("state")
-        if type(st) is str and st in R.STATES and (r.get("lease_live") is False
-                                                   or (st not in R.LIVE_STATES and r.get("lease_live") is not True)):
-            continue
-        sess = r.get("session")
-        out.append(sess if type(sess) is str and SESSION_RE.fullmatch(sess) else "?")
-    return sorted(out)
-
-
-_SETTLING = frozenset({"REVOKED", "FROZEN", "DEAD", "CREDENTIAL_PARKED"})     # END is on its way
-
-
 def _names(xs: list[str]) -> str:
     return ", ".join(xs[:5]) + (f" and {len(xs) - 5} more" if len(xs) > 5 else "")
 
@@ -646,14 +636,17 @@ def _step_of(r: dict) -> str:
     return f" at step {unshowable.mark(fs[:40], allow='')}" if type(fs) is str and fs else ""
 
 
-def _end_now(s: Seams, recs: Any, phase: str) -> str:
-    """[e]: "go" (nothing the root repair would refuse, or every session proven ended), "stop" (a refusal, a HELD
-    end: named, exit 4) or "back" (the bound passed with a lease still live: the choice returns). Revoke each live
-    session, then poll STATUS until no record holds a lease AND every session asked is past END; a session is called
-    ended only where STATUS shows its lease closed and its record RETAINED. Nothing here kills, signals or closes a
-    lease: CONTROL stops it, root's reaper ENDs it, the holder lets go on its own proof."""
-    if not _leased(recs):
-        return "go"                 # nothing to end that the repair would refuse; root decides under its lock
+def _end_now(s: Seams, recs: Any, phase: str, revoked: list[str]) -> str:
+    """[e]: "go" (nothing is running or ending, or every session proven ended), "stop" (a refusal, a HELD end: named,
+    exit 4) or "back" (the bound passed with a session still ending: the choice returns, and the offer counts that
+    session too, so the upgrade does not go on). Revoke each live session, then poll STATUS until :func:`_ending`
+    finds nothing: every session that was running or already ending when [e] started is tracked, a session is
+    called ended only where STATUS shows its lease closed and its record past END, and a HELD one stops at once.
+    ``revoked`` is every REVOKE-OWN sent in this upgrade, so each way out can say what was done. Nothing here kills,
+    signals or closes a lease: CONTROL stops it, root's reaper ENDs it, the holder lets go on its own proof."""
+    tracked = sorted({x for x, _ in _ending(recs) if x != "?"})
+    if not _ending(recs):
+        return "go"                 # nothing running or ending; root decides under its lock
     ask = s.revoke_own or (lambda sess: _revoke_own(s.host, sess))
     asked: list[str] = []
     for sess in _revocable(recs):
@@ -662,11 +655,11 @@ def _end_now(s: Seams, recs: Any, phase: str) -> str:
         except Exception as e:  # noqa: BLE001 - an ask that raises is "did not answer"
             ok, why = False, type(e).__name__
         if not ok:
-            more = f" ({len(asked)} already asked)" if asked else ""
-            print(f"Levain could not end {sess}: {why if type(why) is str else 'no answer'}{more}. "
-                  f"Nothing more was ended. {_cancel_words(phase)}")
+            print(f"Levain could not end {sess}: {why if type(why) is str else 'no answer'}. "
+                  f"Nothing more was ended. {_cancel_words(phase, revoked)}")
             return "stop"
         asked.append(sess)
+        revoked.append(sess)
     if asked:
         print(f"Asked CONTROL to end {_names(asked)}. Root's reaper keeps each one's work.")
     end = s.clock() + _END_WAIT_MIN * 60
@@ -674,12 +667,19 @@ def _end_now(s: Seams, recs: Any, phase: str) -> str:
     while True:
         ok, now = _ask_live(s)
         if ok and type(now) is list:
-            left = _leased(now)
             by = {r["session"]: r for r in now if type(r) is dict and type(r.get("session")) is str}
-            pend = [x for x in asked if by.get(x, {}).get("state") in _SETTLING or x not in by]
-            if not left and not pend:
+            held = [(x, by[x]) for x in tracked if by.get(x, {}).get("state") == "HELD"]
+            if held:        # HELD keeps its slot leased for good: no wait will change it, lease or not
+                for x, r in held:
+                    print(f"{x} ended HELD{_step_of(r)}: a step did not prove, so its slot stays leased and its work "
+                          "stays where it is. Run `levain doctor`; the upgrade did not go on.")
+                print(_cancel_words(phase, revoked))
+                return "stop"
+            left = dict(_ending(now))
+            left.update({x: by.get(x) for x in tracked if x not in by})      # a record STATUS no longer shows is not proof
+            if not left:
                 break
-            line = ("Waiting for " + _names(sorted(set(left) | set(pend))) + " to finish ending "
+            line = ("Waiting for " + _names(sorted(left)) + " to finish ending "
                     "(a lease is closed by the session that holds it).")
         else:
             left = None
@@ -688,35 +688,36 @@ def _end_now(s: Seams, recs: Any, phase: str) -> str:
             print(line)
             last = line
         if s.clock() >= end:
-            if left:
-                for x in left:
-                    if x in asked:
-                        print(f"{x} was told to end but still holds its lease; Levain cannot close it for you.")
-                    else:
-                        print(f"{x} still holds a lease.")
-            else:
+            if left is None:
                 print(f"{_END_WAIT_MIN} min passed and Levain cannot tell they ended.")
+            else:
+                for x, r in left.items():
+                    leased = type(r) is dict and r.get("lease_live") is True
+                    if leased and x in revoked:
+                        print(f"{x} was told to end but still holds its lease; Levain cannot close it for you.")
+                    elif leased:
+                        print(f"{x} still holds a lease.")
+                    else:
+                        print(f"{x} is still ending.")
             return "back"
         s.sleep(_POLL_S)
-    held = [(x, by[x]) for x in asked if by[x].get("state") == "HELD"]
-    if held:
-        for x, r in held:
-            print(f"{x} ended HELD{_step_of(r)}: a step did not prove, so its slot stays leased and its work stays "
-                  "where it is. Run `levain doctor`; the upgrade did not go on.")
-        print(_cancel_words(phase))
-        return "stop"
-    if asked:
-        print(f"Ended (work kept): {_names(asked)}.")
+    if tracked:
+        print(f"Ended (work kept): {_names(tracked)}.")
     return "go"
 
 
-def _cancel_words(phase: str) -> str:
+def _cancel_words(phase: str, revoked: Sequence[str] = ()) -> str:
     """What a cancel changed, by the phase it came in: before the installer nothing; before root the installer step
-    stands and the root side is as it was."""
+    stands and the root side is as it was. A session already told to end is never "nothing": it is named, its end is
+    not undone, and its work is kept."""
     if phase == _PHASE_INSTALLER:
-        return "Nothing was changed."
-    return ("The installer step is not undone and the root side was not updated. "
-            "Run `levain upgrade --no-pip` to finish it.")
+        words = "The upgrade itself changed nothing." if revoked else "Nothing was changed."
+    else:
+        words = ("The installer step is not undone and the root side was not updated. "
+                 "Run `levain upgrade --no-pip` to finish it.")
+    if revoked:
+        return f"Already told to end (work kept): {_names(sorted(revoked))}; that is not undone. {words}"
+    return words
 
 
 def _live_offer(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: bool,
@@ -725,14 +726,16 @@ def _live_offer(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: boo
     that does not answer is NOT zero: the same choices are offered. The flags answer the first ask only; when a wait
     passes its bound the choice returns to the operator. ``phase`` words what a cancel left behind. "End" asks CONTROL to ``REVOKE-OWN`` each live session (END stays root's), waits for the leases to close and goes
     on only when STATUS shows every one ended; see :func:`_end_now`."""
+    revoked: list[str] = []
     try:
-        return _offer_loop(s, wait, wait_max, end_sessions, phase)
+        return _offer_loop(s, wait, wait_max, end_sessions, phase, revoked)
     except KeyboardInterrupt:
-        print(f"Cancelled. {_cancel_words(phase)}")
+        print(f"Cancelled. {_cancel_words(phase, revoked)}")
         return EXIT_WAITED_OUT
 
 
-def _offer_loop(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: bool, phase: str) -> Optional[int]:
+def _offer_loop(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: bool, phase: str,
+                revoked: list[str]) -> Optional[int]:
     minutes = wait_max if wait_max is not None else _WAIT_DEFAULT_MIN
     preset: Optional[str] = "end" if end_sessions else "wait" if (wait or wait_max is not None) else None
     while True:
@@ -754,19 +757,19 @@ def _offer_loop(s: Seams, wait: bool, wait_max: Optional[int], end_sessions: boo
             if not answered:        # a host whose CONTROL is down is what this command repairs; root decides under its lock
                 print(f"{why} Going on: the root step refuses by itself if a session still holds a live lease.")
                 return None
-            verdict = _end_now(s, recs, phase)
+            verdict = _end_now(s, recs, phase, revoked)
             if verdict == "go":
                 return None
             if verdict == "stop":
                 return EXIT_WAITED_OUT
-            continue                # "back": the bound passed, the choice returns; nothing more is ended
+            continue                # "back": the bound passed, the choice returns; the offer counts what is still ending
         if choice == "cancel":
-            print(f"Cancelled. {_cancel_words(phase)}")
+            print(f"Cancelled. {_cancel_words(phase, revoked)}")
             return EXIT_WAITED_OUT
         print(f"Waiting up to {minutes} min for them to finish (Ctrl-C cancels).")
         done = _wait(s, minutes)
         if done is None:
-            print(f"Cancelled. {_cancel_words(phase)}")
+            print(f"Cancelled. {_cancel_words(phase, revoked)}")
             return EXIT_WAITED_OUT
         if done:
             return None

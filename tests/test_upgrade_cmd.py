@@ -863,23 +863,99 @@ def test_control_going_silent_during_the_end_wait_is_cannot_tell_never_ended(env
 
 
 def test_a_revoked_session_whose_lease_closed_but_is_not_yet_retained_is_not_ended(env, capsys):
-    """END still on its way (FROZEN) is not 'ended': the bound passes and the words say so. (What the offer does next
-    is `_live_split`'s, unchanged: a lease-free FROZEN record is not 'running' to it; residue in the RETURN.)"""
+    """H1: END still on its way (FROZEN, lease closed) is not 'ended', and the offer that follows the bound counts it
+    too (one predicate): the upgrade does not go on while it is mid-end; the choice returns and names it."""
     env.live = [(True, [rec(S1)]), (True, [settled(S1, "FROZEN", False)])]
+    env.answers = ["e", "c"]
+    rc, out = env.run(capsys)
+    assert rc == 4 and env.revoked == [S1] and "Ended" not in out
+    assert f"{S1} is still ending" in out and len(env.prompts) == 2
+    nothing_ran(env)
+
+
+def test_a_session_already_settling_at_the_start_is_waited_for_and_a_held_end_is_found(env, capsys):
+    """H2: a lease-free FROZEN record present when [e] starts is asked about too: if its END lands HELD, that is named
+    and the upgrade stops; if it never lands, the bound does not let the upgrade through."""
+    env.live = [(True, [settled(S1, "FROZEN", False), rec(S2)]),
+                (True, [settled(S1, "HELD", False, failed_step="freeze"), settled(S2)])]
     env.answers = ["e"]
     rc, out = env.run(capsys)
-    assert env.revoked == [S1] and "Ended" not in out and f"{U._END_WAIT_MIN} min passed" in out
+    assert rc == 4 and env.revoked == [S2] and S1 in out and "HELD" in out and "freeze" in out
+    nothing_ran(env)
+    env.live = [(True, [settled(S1, "FROZEN", False), rec(S2)]), (True, [settled(S1, "FROZEN", False), settled(S2)])]
+    env.answers = ["e", "c"]
+    rc, out = env.run(capsys)
+    assert rc == 4 and f"{S1} is still ending" in out and "Ended" not in out
+    nothing_ran(env)
 
 
-def test_end_now_proceeds_when_no_lease_is_live(env, capsys):
-    env.live = (True, [rec(S1, lease_live=False), rec(S2, lease_live=False)])
+def test_a_live_record_with_no_lease_is_ended_not_skipped(env, capsys):
+    """M1: ACTIVE with lease_live False is a running session to the offer; [e] must revoke it."""
+    env.live = [(True, [rec(S1, lease_live=False), rec(S2, lease_live=False)]),
+                (True, [settled(S1), settled(S2)])]
+    env.answers = ["e"]
+    rc, out = env.run(capsys)
+    assert rc == 0 and sorted(env.revoked) == [S1, S2] and "Ended (work kept)" in out and env.execs
+
+
+def test_retained_with_a_closed_lease_goes_to_root_whose_refusal_is_named(env, capsys):
+    """M2: a closed lease and RETAINED is ended for the words but clears nothing by itself: root's preflight decides
+    and a refusal from it is printed, not hidden."""
+    env.runner = Runner(sudo=(1, '{"ok":false,"refused":"live-lease"}\n', "levain install-helper: refused live-lease: 'slot still leased'\n"))
+    env.live = [(True, [rec(S1)]), (True, [settled(S1)])]
+    env.answers = ["e"]
+    rc, out = env.run(capsys, no_pip=True)
+    assert rc == 1 and "Ended (work kept)" in out and "refused live-lease" in out and "slot still leased" in out
+    assert len(sudo_calls(env)) == 1
+    env.live = [(True, [rec(S1)]), (True, [settled(S1, "RETAINED", True)])]     # a lease still open is not ended
+    env.runner = Runner()
+    env.answers = ["e", "c"]
+    rc, out = env.run(capsys, no_pip=True)
+    assert rc == 4 and "Ended" not in out and sudo_calls(env) == []
+
+
+def test_a_cancel_after_a_revoke_does_not_say_nothing_was_changed(env, capsys):
+    """M3: once a revoke went out, every cancel path says what was revoked."""
+    env.live = [(True, [rec(S1)]), (True, [settled(S1, "REVOKED", True)])]
+    env.answers = ["e", "c"]
+    rc, out = env.run(capsys)
+    assert rc == 4 and "Nothing was changed" not in out and f"told to end (work kept): {S1}" in out
+    env.asks = 0
+    env.live = two_live()
+    env.answers = ["e"]
+    env.revoke_answer = lambda sess: (True, 5) if len(env.revoked) < 2 else (False, "refused session-unknown")
+    env.revoked.clear()
+    rc, out = env.run(capsys)
+    assert rc == 4 and "Nothing more was ended" in out and "Nothing was changed" not in out
+    env.revoked.clear()
+    env.asks = 0
+    env.live = [(True, [rec(S1)]), (True, [settled(S1, "REVOKED", True)])]
+    env.revoke_answer = lambda sess: (True, 5)
+    env.answers = ["e"]
+    env.do_sleep = lambda secs: (_ for _ in ()).throw(KeyboardInterrupt())      # Ctrl-C in the wait
+    rc, out = env.run(capsys)
+    assert rc == 4 and "Nothing was changed" not in out and S1 in out
+
+
+def test_a_held_session_with_a_live_lease_stops_not_back(env, capsys):
+    """M4: HELD keeps its slot leased; it reaches 'stop' at once, not 'back' at the bound."""
+    env.live = [(True, [rec(S1)]), (True, [settled(S1, "HELD", True, failed_step="freeze")])]
+    env.answers = ["e"]
+    rc, out = env.run(capsys)
+    assert rc == 4 and f"{S1} ended HELD" in out and len(env.prompts) == 1 and env.now < U._END_WAIT_MIN * 60
+    nothing_ran(env)
+
+
+def test_end_now_proceeds_when_nothing_is_running_or_ending(env, capsys):
+    env.live = (True, [rec(S1, state="RETAINED", lease_live=False), rec(S2, state="HELD", lease_live=False)])
     env.answers = ["e"]
     rc, out = env.run(capsys)
     assert rc == 0 and len(env.runner.calls) == 1 and env.execs and env.revoked == []
 
 
-def test_leased_agrees_with_roots_live_lease_sessions_on_real_records(tmp_path):
-    """Two things that should be one: W1's `_leased` and root's `live_lease_sessions` read the same record files."""
+def test_ending_covers_everything_roots_live_lease_sessions_refuses_on_real_records(tmp_path):
+    """Two things that should be one: `_ending` (the one predicate) and root's `live_lease_sessions` read the same
+    record files; `_ending` also counts a live state with no lease (it is running) and a settling state."""
     from levain.contracts import canon
     from levain.slot import install_helper as IH
     from levain.slot import records as R
@@ -896,8 +972,8 @@ def test_leased_agrees_with_roots_live_lease_sessions_on_real_records(tmp_path):
         recs.append(R.state_record(sr, check=False))
     (d / ("s-" + "9" * 16 + ".json")).write_bytes(b"not json")        # unparsable: root counts it live
     root_set = set(IH.live_lease_sessions(d))
-    mine = set(U._leased(recs))
-    assert mine == root_set - {"s-" + "9" * 16}
+    mine = {l for l, _ in U._ending(recs)}
+    assert mine == root_set - {"s-" + "9" * 16} | {"s-" + "e" * 16}        # + ACTIVE with no lease: running
     assert root_set == {"s-" + c * 16 for c in "abd"} | {"s-" + "9" * 16}
 
 
@@ -949,7 +1025,7 @@ def test_a_revoked_or_held_record_with_a_live_lease_counts_in_both_checks():
     recs = [rec(S1, state="REVOKED", lease_live=True), rec(S2, state="HELD", lease_live=True),
             rec(S3, state="HELD", lease_live=False)]
     agents, own = U._live_split(recs)
-    assert sorted(agents + own) == sorted([S1, S2]) and U._leased(recs) == sorted([S1, S2])
+    assert sorted(agents + own) == sorted([S1, S2]) and sorted(l for l, _ in U._ending(recs)) == sorted([S1, S2])
 
 
 def test_off_shape_and_unknown_state_records_count_as_running():
@@ -957,6 +1033,7 @@ def test_off_shape_and_unknown_state_records_count_as_running():
                                  rec(S1, state="RETAINED", lease_live=False)])
     assert len(agents) == 4 and not own
     assert U._live_split([rec(S1, state="HELD", lease_live=False), rec(S2, state="PURGED", lease_live=False)]) == ([], [])
+    assert U._live_split([rec(S1, state="FROZEN", lease_live=False)]) == ([S1], [])      # END in flight is still ending
 
 
 def test_wait_on_a_status_that_does_not_answer_prompts_at_once(env, capsys):
@@ -1038,7 +1115,7 @@ def test_flags_answer_in_advance_and_pass_through_the_reexec(env, capsys, tmp_pa
     rc, out = e2.run(capsys, wait_max=7)
     assert rc == 0 and e2.execs[0][1][-2:] == ["--wait-max", "7"] and "up to 7 min" in out
     e3 = Env(tmp_path / "e")
-    e3.live = (True, [rec(S1, lease_live=False)])
+    e3.live = [(True, [rec(S1, lease_live=False)]), (True, [settled(S1)])]
     rc, out = e3.run(capsys, end_sessions=True)
     assert rc == 0 and e3.prompts == [] and e3.execs[0][1][-1] == "--end-sessions"
 
