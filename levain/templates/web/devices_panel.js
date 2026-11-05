@@ -549,12 +549,24 @@
       let timer = null;
       const wait = new Promise((_, no) => { timer = setTimeout(() => no(new Error("no answer")), TEST_WAIT_MS); });
       let res;
-      try { res = await Promise.race([api("POST", "/webpush/test", {}), wait]); } finally { clearTimeout(timer); }
+      const call = api("POST", "/webpush/test", {});
+      call.catch(() => { /* a late rejection after the wait gave up is already said below */ });
+      try { res = await Promise.race([call, wait]); } finally { clearTimeout(timer); }
       if (res.status === 200) {
+        // the ping goes to every live subscription of this DEVICE (its credential), which can be more than this browser's
+        // own (an older subscribe, another browser holding the same key), so the words count them and blame none of them
         const d = (res.data && res.data.deliveries) || [];
-        const gone = d.some((x) => x && (x.status === 410 || x.status === 404));
-        const words = typeof shared().testWords === "function" ? shared().testWords(res.data) : "The test ping was sent.";
-        say(gone ? "This browser's subscription is gone: turn pings on again." : words);
+        const ok = d.filter((x) => x && x.status >= 200 && x.status < 300).length;
+        const gone = d.filter((x) => x && (x.status === 410 || x.status === 404)).length;
+        let words = typeof shared().testWords === "function" ? shared().testWords(res.data) : "The test ping was sent.";
+        if (gone && ok) {
+          words = "A test ping was sent to " + ok + " of this device's " + d.length + " subscriptions; the push service had dropped " + gone + ", now removed.";
+        } else if (gone && gone === d.length) {
+          words = (d.length === 1 ? "This device's subscription is gone" : "All " + d.length + " of this device's subscriptions are gone") + ": turn pings on again.";
+        } else if (gone) {
+          words = "No subscription of this device took the test ping (" + gone + " gone, " + (d.length - gone) + " refused): turn pings on again.";
+        }
+        say(words);
       } else if (res.status === 403) {
         say("This browser is not paired as a device, so it cannot be pinged. Turn pings on to pair it.");
       } else say("The test ping was refused (" + ((res.data && res.data.message) || res.status) + ").");

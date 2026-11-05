@@ -272,6 +272,8 @@ def test_the_card_follows_the_last_click_warns_on_this_device_and_closes_on_an_a
             {"until": "document.querySelector('.dev-confirm .dev-danger')", "ms": 10000},
             {"eval": "document.querySelector('.dev-confirm .dev-danger').click() || 1"},
             {"until": "!document.querySelector('.dev-confirm') && document.querySelector('.dev-note').textContent", "ms": 20000},
+            {"eval": "document.querySelector('.dev-note').scrollIntoView({block: 'center'}) || 1"},
+            {"eval": "document.querySelector('.dev-note').textContent"},
             {"shot": str(shots / "revoke_already_revoked_close_390.png"), "full": False},
         ])
         live = _live(httpd)
