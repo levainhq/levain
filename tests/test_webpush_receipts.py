@@ -404,7 +404,7 @@ def test_a_push_posts_received_then_shown_with_the_endpoint_hash_and_ids_only() 
     assert "secret body" not in json.dumps(got["posts"])
     assert got["shownCalls"] == [{"title": "T", "tag": "x"}] and got["queued"] == []
     assert _receipt_steps(got) == [("received", "ok", None), ("shown", "ok", None)]
-    assert any(e["step"] == "sw-version" and e["version"] == "1105-assethash-1" and e["on"] == "push" for e in got["trace"])
+    assert any(e["step"] == "sw-version" and e["version"] == "1105-pushshown-1" and e["on"] == "push" for e in got["trace"])
 
 
 @needs_node
@@ -552,6 +552,43 @@ def test_a_show_that_fails_is_traced_and_posts_no_shown_receipt() -> None:
     got = _run("ok+showthrows")
     assert [p["body"]["kind"] for p in got["posts"]] == ["received"]
     assert any(e["step"] == "show-failed" for e in got["trace"])
+
+
+@needs_node
+def test_a_notification_the_agent_does_not_hold_posts_no_shown_receipt() -> None:
+    """2026-11-05, ping 409: showNotification resolved on four devices and none displayed it, yet each reported `shown`.
+    The rig's platform swallows the notification (the show resolves, getNotifications lists nothing): only `received`
+    goes, and the trace says show-missing with the tag's length and leading word, never its text."""
+    got = _run("ok+p409+swallowed")
+    assert [(p["body"]["ping"], p["body"]["kind"]) for p in got["posts"]] == [(409, "received")], got["posts"]
+    assert got["getNotificationsCalls"] == [{"tag": "request:pend-2026-11-05T19:54:58.556594Z-2690252d9c8e0d77"}]
+    miss = [e for e in got["trace"] if e["step"] == "show-missing"]
+    assert [(e["why"], e["tagLen"], e["tagKind"], e["count"]) for e in miss] == [("absent", 57, "request", 0)], miss
+    assert "secret body" not in json.dumps(got["trace"]) and "secret body" not in json.dumps(got["posts"])
+
+
+@needs_node
+def test_a_held_notification_still_posts_shown_and_the_p409_shape_is_listed_by_its_own_tag() -> None:
+    got = _run("ok+p409")
+    assert [(p["body"]["ping"], p["body"]["kind"]) for p in got["posts"]] == [(409, "received"), (409, "shown")]
+    assert not any(e["step"] == "show-missing" for e in got["trace"])
+
+
+@needs_node
+def test_only_a_notification_with_this_exact_tag_counts_as_held() -> None:
+    # another ping's notification is held and the UA ignores the filter (an older WebKit listed the app's every one)
+    got = _run("ok+swallowed+othertag+getnall")
+    assert [p["body"]["kind"] for p in got["posts"]] == ["received"], got["posts"]
+    assert [(e["why"], e["count"]) for e in got["trace"] if e["step"] == "show-missing"] == [("absent", 1)]
+
+
+@needs_node
+def test_no_way_to_list_notifications_means_no_shown_receipt_and_the_notification_still_shows() -> None:
+    for flag, why in (("nogetn", "no-api"), ("getnthrows", "error")):
+        got = _run("ok+" + flag)
+        assert got["shownCalls"] == [{"title": "T", "tag": "x"}] and got["order"][0] == "show", flag
+        assert [p["body"]["kind"] for p in got["posts"]] == ["received"], (flag, got["posts"])
+        assert [e["why"] for e in got["trace"] if e["step"] == "show-missing"] == [why], flag
 
 
 def test_activation_keeps_the_receipts_cache() -> None:
