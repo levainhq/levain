@@ -486,16 +486,49 @@ def test_base_map_formats_are_the_policy_readers_formats():
     assert layout.BASE_ROUTES_FORMAT == policy.BASE_MAP_FORMATS[-1] == "levain-routes-base/2"
 
 
-def test_setup_refuses_fewer_egress_slots_than_a_launch_needs():
-    """VM finding 7: one marked dispatch slot + the pool's egress reserve + one free slot is three; `--slots 2`
-    installs but can never LAUNCH (`no-free-slot`), so setup refuses it and says why. Verifier slots are a
-    separate class and do not count."""
+def test_parser_accepts_small_slot_counts_the_planner_decides():
+    """The minimum is state-aware, so it is not the parser's: a legacy install or an interrupted setup journal made
+    with `--slots 1|2` must still be able to name its exact original command. The grammar keeps its old range."""
     from levain.slot import grammar
-    from levain.slot.tickets import EGRESS_RESERVE
-    assert grammar.MIN_SETUP_SLOTS == 1 + EGRESS_RESERVE + 1 == 3
-    for n in ("1", "2"):
-        with pytest.raises(Refused) as ei:
-            parse_install_argv(["setup", "--slots", n, "--verifier-slots", "5", "--operator", OP])
-        assert ei.value.name == "too-few-slots"
-        assert "3" in str(ei.value) and "dispatch" in str(ei.value) and "reserve" in str(ei.value)
-    assert parse_install_argv(["setup", "--slots", "3", "--verifier-slots", "1", "--operator", OP]).slots == 3
+    assert grammar.MIN_SETUP_SLOTS == 1 + grammar.EGRESS_RESERVE + 1 == 3
+    for n in (1, 2):
+        assert parse_install_argv(["setup", "--slots", str(n), "--verifier-slots", "5", "--operator", OP]).slots == n
+
+
+@pytest.mark.parametrize("host", HOSTS)
+@pytest.mark.parametrize("n", [1, 2])
+def test_fresh_planned_setup_refuses_fewer_egress_slots_than_a_launch_needs(host, n):
+    """VM finding 7: one marked dispatch slot + the pool's egress reserve + one free slot is three; a FRESH setup
+    (no journal, no slot accounts an interrupted setup made) with fewer is refused `too-few-slots`, and says why.
+    A hand-built InstallCommand takes the same road, since the check is in the planner, not the parser."""
+    from levain.slot.grammar import InstallCommand
+    cmd = InstallCommand("setup", slots=n, verifier_slots=5, operator=OP, roots=())
+    with pytest.raises(Refused) as ei:
+        plan_setup(cmd, _facts(host))
+    assert ei.value.name == "too-few-slots"
+    assert "3" in str(ei.value) and "dispatch" in str(ei.value) and "reserve" in str(ei.value)
+    plan_setup(_setup(3, 1), _facts(host))                      # positive control: exactly the minimum
+
+
+@pytest.mark.parametrize("host", HOSTS)
+def test_interrupted_setup_with_two_slots_resumes_at_its_recorded_counts(host, monkeypatch):
+    """An interrupted setup journal written by the release that allowed `--slots 2` is resumed by its exact command
+    (the parser lets it through, and the planner does not apply the fresh-setup minimum to a journal)."""
+    from levain.slot import install_helper as IH
+    with monkeypatch.context() as m:                            # the old release's rule: no minimum
+        m.setattr(IH, "MIN_SETUP_SLOTS", 1)
+        journal = plan_setup(_setup(2, 1), _facts(host)).intent
+    assert [n for n in journal.accounts if "gw" in n or n.startswith("_levain_s")]    # a two-slot journal, not empty
+    resumed = plan_setup(_setup(2, 1), _facts(host, intent=journal))
+    assert len(resumed.allocation.slots) == 3                   # 2 egress + 1 verifier, at the journal's allocation
+    # a different count is still the existing re-run-as-it-was refusal, not the minimum
+    assert _refusal(plan_setup, _setup(3, 1), _facts(host, intent=journal)) == "install-interrupted"
+
+
+def test_other_argv_errors_come_before_the_slot_minimum():
+    """Refusal order: the grammar rejects a bad verifier count or operator before the planner ever sees the slot
+    count, so a user with several wrong arguments sees the argv error first (the minimum cannot mask it)."""
+    assert _refusal(parse_install_argv, ["setup", "--slots", "2", "--verifier-slots", "0", "--operator", OP]) \
+        == "out-of-range"
+    assert _refusal(parse_install_argv, ["setup", "--slots", "2", "--verifier-slots", "1", "--operator",
+                                         "Defaults"]) == "bad-operator"

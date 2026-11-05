@@ -74,7 +74,9 @@ SLOT_CLASSES = ("egress", "none")            # CONTRACT §5.1 class enum
 #: ``levain.slot.tickets`` reads it from here; the setup minimum below is derived from it.
 EGRESS_RESERVE = 1
 #: The least ``--slots`` a setup can LAUNCH on: the one marked dispatch slot (it holds a credential, so it is never
-#: free) + the reserve + one free slot. Verifier slots are another class and do not count. (VM finding 7: 2 -> ``no-free-slot``.)
+#: free) + the reserve + one free slot. Verifier slots are another class and do not count. (VM finding 7: 2 -> ``no-free-slot``.) NOT enforced by
+#: the parser: a legacy install or an interrupted setup journal made with fewer must still name its exact command;
+#: ``install_helper.plan_setup`` applies it to a fresh setup only.
 MIN_SETUP_SLOTS = 1 + EGRESS_RESERVE + 1
 MAX_SLOTS = 32                               # CONTRACT §1.1 N cap
 MAX_VERIFIER_SLOTS = 16                      # CONTRACT §1.1 M cap
@@ -183,14 +185,9 @@ def _parse_setup(rest: Sequence[str]) -> InstallCommand:
     for flag in ("--slots", "--verifier-slots", "--operator"):
         if flag not in seen:
             raise Refused("missing-argv", flag)
-    slots = _uint(seen["--slots"], "--slots", 1, MAX_SLOTS)
-    if slots < MIN_SETUP_SLOTS:
-        raise Refused("too-few-slots", f"--slots {slots}: a dispatch install needs at least {MIN_SETUP_SLOTS} egress slots "
-                      f"(the marked dispatch slot, the operator's reserve of {EGRESS_RESERVE}, and one free slot); with "
-                      f"fewer a launch is always refused no-free-slot. Verifier slots do not count toward it")
     return InstallCommand(
         "setup",
-        slots=slots,
+        slots=_uint(seen["--slots"], "--slots", 1, MAX_SLOTS),
         verifier_slots=_uint(seen["--verifier-slots"], "--verifier-slots", 1, MAX_VERIFIER_SLOTS),
         operator=check_operator_name(seen["--operator"]),
         roots=tuple(roots),
